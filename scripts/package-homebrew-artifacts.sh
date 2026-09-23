@@ -63,6 +63,10 @@ version="$(
 out_dir="${RUNFREE_ARTIFACT_DIR:-${repo_root}/dist/homebrew}"
 
 mkdir -p "${out_dir}"
+# The bun compile below runs from a scratch working directory, so every path
+# derived from this one has to be absolute: a relative --outfile would land in
+# that scratch directory and the archive step would then miss its binary.
+out_dir="$(cd "${out_dir}" && pwd)"
 
 shopt -s nullglob
 for stale_archive in "${out_dir}/runfree-${version}-"*.tar.gz; do

@@ -59,10 +59,13 @@ printf 'tar %s\\n' "$*" >> "$RUNFREE_FAKE_LOG"
 archive=""
 extract_dir=""
 mode="create"
+members=()
 while [ "$#" -gt 0 ]; do
   if [ "\${1:-}" = "-czf" ]; then
     archive="\${2:-}"
     mode="create"
+    shift 2
+    members=("$@")
     break
   fi
   if [ "\${1:-}" = "-xzf" ]; then
@@ -88,6 +91,14 @@ if [ "$mode" = "extract" ]; then
   chmod +x "$extract_dir/runfree"
   exit 0
 fi
+# Real tar refuses to archive a member it cannot stat. A fake that wrote the
+# archive regardless would report success for a build that produced no binary.
+for member in \${members[@]+"\${members[@]}"}; do
+  if [ ! -e "\${extract_dir:-.}/\$member" ]; then
+    printf 'tar: %s: Cannot stat: No such file or directory\\n' "\$member" >&2
+    exit 1
+  fi
+done
 mkdir -p "$(dirname "$archive")"
 printf 'fake archive\\n' > "$archive"
 `);
@@ -126,9 +137,14 @@ printf 'xcrun %s\\n' "$*" >> "$RUNFREE_FAKE_LOG"
 `);
 }
 
-function runScript(scriptPath: string, args: string[] = [], env: NodeJS.ProcessEnv = {}): childProcess.SpawnSyncReturns<string> {
-  return childProcess.spawnSync("bash", [scriptPath, ...args], {
-    cwd: repoRoot,
+function runScript(
+  scriptPath: string,
+  args: string[] = [],
+  env: NodeJS.ProcessEnv = {},
+  cwd: string = repoRoot,
+): childProcess.SpawnSyncReturns<string> {
+  return childProcess.spawnSync("bash", [path.resolve(repoRoot, scriptPath), ...args], {
+    cwd,
     encoding: "utf8",
     env: {
       ...process.env,
@@ -176,6 +192,23 @@ describe("release packaging scripts", () => {
 
     const log = fs.readFileSync(fakeLog, "utf8");
     expect(log).toContain("--target bun-darwin-arm64");
+  });
+
+  // The release workflow passes RUNFREE_ARTIFACT_DIR as a workspace-relative
+  // path. The bun compile runs from a scratch working directory, so an
+  // unresolved relative outfile wrote the binary there and left the build
+  // directory empty until tar failed on the missing member.
+  test("package script writes the binary under a relative RUNFREE_ARTIFACT_DIR", () => {
+    const result = runScript(
+      "scripts/package-homebrew-artifacts.sh",
+      ["darwin-arm64"],
+      { RUNFREE_ARTIFACT_DIR: path.basename(artifactDir), RUNFREE_SKIP_CHECKSUM: "1" },
+      tmp,
+    );
+
+    expect(result.status, result.stderr).toBe(0);
+    expect(fs.existsSync(path.join(artifactDir, "build", "darwin-arm64", "runfree"))).toBe(true);
+    expect(fs.existsSync(path.join(artifactDir, "runfree-0.1.0-darwin-arm64.tar.gz"))).toBe(true);
   });
 
   test("package script accepts RUNFREE_ARTIFACT_TARGETS", () => {
