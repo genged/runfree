@@ -1120,7 +1120,10 @@ export async function startRuntime(
       }
       const upgradeStatus = applyRuntimeUpgradePlan(existingContext, adapters.docker, upgradePlan);
       if (upgradeStatus !== 0) return result(upgradeStatus, false, existingContext);
-      if (upgradePlan.action === "token-sync") {
+      // Diagnostic only: the marker status picks between two verbose lines and
+      // validation replaces the marker right after, so a quiet start skips the
+      // two `ps` lookups and the root exec it costs.
+      if (verbose && upgradePlan.action === "token-sync") {
         const securityContract = createRuntimeSecurityContract(existingActivePlan);
         const marker = runtimeValidationMarkerStatus(existingContext, io, { contractHash: securityContract.contractHash });
         if (!marker.issue) {

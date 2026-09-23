@@ -3567,17 +3567,39 @@ describe("runtime command flow", () => {
       {
         "docker container inspect": 4,
         "docker container ls": 2,
-        "docker exec": 14,
+        "docker exec": 13,
         "docker image inspect": 9,
         "docker info": 1,
         "docker inspect": 5,
         "docker network inspect": 3,
-        "docker ps": 14,
+        "docker ps": 12,
         "docker run": 1,
         "docker volume create": 1,
         "docker volume inspect": 1,
       }
     `);
+  });
+
+  test("warm up reads the validation marker only for verbose output", async () => {
+    const projectRoot = path.join(tmp, "project");
+    const project = prepareProject(projectRoot);
+    const context: RuntimeContext = {
+      projectRoot, project, runtimeRoot: path.join(tmp, "runtime"),
+      env: { PATH: "/fake-bin" }, network: fixedNetwork,
+    };
+    const io = createRuntimeIO();
+    expect((await startRuntime(context, io, false, {})).status).toBe(0);
+    const markerReads = (from: number) => io.calls.slice(from).filter((call) => call.method === "capture"
+      && call.command === "docker" && call.args[0] === "exec"
+      && call.args.includes("/run/runfree-runtime-validation.json") && call.args.includes("cat")).length;
+
+    const quietStart = io.calls.length;
+    expect((await startRuntime(context, io, false, {})).status).toBe(0);
+    const verboseStart = io.calls.length;
+    expect((await startRuntime(context, io, false, { verbose: true })).status).toBe(0);
+
+    expect(markerReads(quietStart) - markerReads(verboseStart)).toBe(0);
+    expect(markerReads(verboseStart)).toBe(1);
   });
 
   test("up refuses token sync when the final session-admission base-set proof is non-empty", async () => {
