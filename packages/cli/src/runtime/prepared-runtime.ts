@@ -150,6 +150,11 @@ export function preparedRuntimeContext(prepared: PreparedRuntime): RuntimeContex
   return preparedBinding(prepared).context;
 }
 
+/** The proxy container the prepared runtime was selected against. Diagnostic use only; grants no authority. */
+export function preparedRuntimeProxyId(prepared: PreparedRuntime): string {
+  return preparedBinding(prepared).snapshot.effective.selection.proxyContainerId;
+}
+
 export class StalePreparedRuntimeError extends Error {
   constructor(message: string) {
     super(message);

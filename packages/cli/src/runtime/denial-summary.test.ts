@@ -212,4 +212,31 @@ describe("printSessionDenialSummary", () => {
     }), { sinceIso: "2026-06-10T12:00:00.000Z" })).not.toThrow();
     expect(console.log).not.toHaveBeenCalled();
   });
+
+  test("reads logs from a known proxy id without a lookup", () => {
+    const captured: string[][] = [];
+    const io = ioWith((command, args) => {
+      captured.push([command, ...args]);
+      if (args[0] === "logs") return { status: 0, stdout: denialLine({ host: "api.example.com" }), stderr: "" };
+      return { status: 1, stdout: "", stderr: "" };
+    });
+    printSessionDenialSummary(context, io, { sinceIso: "2026-06-10T12:00:00.000Z", proxyId: "known-proxy" });
+    expect(captured).toEqual([["docker", "logs", "--since", "2026-06-10T12:00:00.000Z", "known-proxy"]]);
+    expect(vi.mocked(console.log).mock.calls.map((call) => String(call[0]))[0]).toBe("Runfree blocked 1 host during this session:");
+  });
+
+  test("falls back to the current proxy when the known proxy's logs are unreadable", () => {
+    const captured: string[][] = [];
+    const io = ioWith((command, args) => {
+      captured.push([command, ...args]);
+      if (args[0] === "ps") return { status: 0, stdout: "replacement-proxy\n", stderr: "" };
+      if (args[0] === "logs" && args.at(-1) === "replacement-proxy") {
+        return { status: 0, stdout: denialLine({ host: "api.example.com" }), stderr: "" };
+      }
+      return { status: 1, stdout: "", stderr: "No such container" };
+    });
+    printSessionDenialSummary(context, io, { sinceIso: "2026-06-10T12:00:00.000Z", proxyId: "gone-proxy" });
+    expect(captured.filter((call) => call[1] === "logs").map((call) => call.at(-1))).toEqual(["gone-proxy", "replacement-proxy"]);
+    expect(console.log).toHaveBeenCalled();
+  });
 });

@@ -32,7 +32,7 @@ import {
   launchConfiguredAgentThroughAdmission,
   launchShellThroughAdmission,
 } from "./runtime/session-public-launch.ts";
-import { preparedRuntimeContext, type PreparedRuntime } from "./runtime/prepared-runtime.ts";
+import { preparedRuntimeContext, preparedRuntimeProxyId, type PreparedRuntime } from "./runtime/prepared-runtime.ts";
 import { createRuntimeAdapters } from "./runtime/adapters.ts";
 import { grantCoverageLabel, grantRemainingSeconds, readWriteApprovalsStatus } from "./runtime/approvals.ts";
 import {
@@ -634,7 +634,11 @@ async function runConfiguredAgent(
     }));
   // Agent sessions only (not `runfree shell`): summarize proxy denials seen
   // during this session. Best effort; never changes the exit status.
-  printSessionDenialSummary(activeContext, io, { sinceIso: sessionStartedAt, quiet: options.quiet });
+  printSessionDenialSummary(activeContext, io, {
+    sinceIso: sessionStartedAt,
+    quiet: options.quiet,
+    proxyId: preparedRuntimeProxyId(runtime.preparedRuntime),
+  });
   return status;
 }
 
@@ -1090,7 +1094,11 @@ export async function resumeRecoveryRuntime(
         return die(error instanceof Error ? error.message : String(error));
       }
     }));
-  printSessionDenialSummary(activeContext, io, { sinceIso: sessionStartedAt, quiet: options.quiet });
+  printSessionDenialSummary(activeContext, io, {
+    sinceIso: sessionStartedAt,
+    quiet: options.quiet,
+    proxyId: preparedRuntimeProxyId(runtime.preparedRuntime),
+  });
   return status;
 }
 

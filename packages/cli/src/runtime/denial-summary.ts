@@ -99,18 +99,25 @@ function readPolicyForSummary(context: RuntimeContext): PolicyJson {
 export function printSessionDenialSummary(
   context: RuntimeContext,
   io: RuntimeIO,
-  options: { sinceIso: string; quiet?: boolean },
+  options: { sinceIso: string; quiet?: boolean; proxyId?: string },
 ): void {
   if (options.quiet) return;
   try {
     const project = composeProjectName(context.projectRoot);
-    const proxyId = serviceContainerId(project, "proxy", context, io);
-    if (!proxyId) return;
-    const logs = io.capture(
+    const readLogs = (proxyId: string) => io.capture(
       "docker",
       ["logs", "--since", options.sinceIso, proxyId],
       { ...dockerClientEnvOptions(context), timeout: LOG_READ_TIMEOUT_MS },
     );
+    let proxyId = options.proxyId ?? serviceContainerId(project, "proxy", context, io);
+    if (!proxyId) return;
+    let logs = readLogs(proxyId);
+    if (logs.status !== 0 && options.proxyId) {
+      // The session can outlive a proxy replacement; summarize the current one.
+      proxyId = serviceContainerId(project, "proxy", context, io);
+      if (!proxyId || proxyId === options.proxyId) return;
+      logs = readLogs(proxyId);
+    }
     if (logs.status !== 0) return;
     const lines = buildSessionDenialSummary(`${logs.stdout}\n${logs.stderr}`, readPolicyForSummary(context), SUMMARY_HOST_LIMIT, combinedServiceRegistry(context.projectRoot, context.env));
     for (const line of lines) console.log(line);

@@ -28,6 +28,7 @@ import { createRuntimePlan } from "./plan.ts";
 import {
   consumePreparedRuntime,
   mintPreparedRuntime,
+  preparedRuntimeProxyId,
   StalePreparedRuntimeError,
   type PreparedRuntime,
 } from "./prepared-runtime.ts";
@@ -258,6 +259,21 @@ test("rejects forged, copied, and reused prepared authority before launch effect
     lifecycleLock: prepared.lifecycleLock,
     io: prepared.io,
   })).toThrow("already consumed");
+});
+
+test("preparedRuntimeProxyId reads the minted selection and survives consumption", () => {
+  const prepared = fixture();
+  const authority = mintPreparedRuntime({ plan: prepared.activePlan, validationProof: prepared.proof });
+
+  expect(preparedRuntimeProxyId(authority)).toBe(prepared.proof.proxyId);
+
+  consumePreparedRuntime({
+    preparedRuntime: authority,
+    lifecycleLock: prepared.lifecycleLock,
+    io: prepared.io,
+  });
+
+  expect(preparedRuntimeProxyId(authority)).toBe(prepared.proof.proxyId);
 });
 
 test("classifies a replaced live proxy as stale preparation", () => {
