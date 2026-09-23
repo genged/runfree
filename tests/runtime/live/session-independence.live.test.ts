@@ -38,6 +38,7 @@ import {
   PROVISION_TIMEOUT_MS,
   REPO_ROOT,
   TEST_TIMEOUT_MS,
+  awaitAgentStarted,
   clearFirstRequestResult,
   configureAttachedProject,
   enforcedSessionSetIps,
@@ -440,6 +441,7 @@ describe("session independence: a compatible replacement preserves and restores 
                 identity: processIdentity(String(record.containerId)),
                 key: servedSessionKey(currentProxyId(), record.sourceIp),
               }));
+              await awaitAgentStarted(String(record.containerId), `session ${record.sessionId}`);
             }
           }
         } catch (error) {
@@ -634,6 +636,10 @@ describe("session independence: a compatible replacement preserves and restores 
       secondIdentity = processIdentity(String(secondRecord.containerId));
       const peerIps = [firstRecord.sourceIp, secondRecord.sourceIp];
       assertConsumersAdmitExactly(originalProxyId, peerIps, "proof-failure recovery: while both peers are attached");
+      // Live sessions, not just recorded ones: each agent is running before the
+      // proxy goes away (see awaitAgentStarted).
+      await awaitAgentStarted(String(firstRecord.containerId), "proof-failure recovery: the first peer");
+      await awaitAgentStarted(String(secondRecord.containerId), "proof-failure recovery: the second peer");
 
       // 1. The rebind fails inside real startup validation.
       dockerOrThrow("proof-failure recovery: stop the proxy to classify the compatible replacement", ["stop", "--time", "2", originalProxyId]);
@@ -786,6 +792,10 @@ describe("session independence: a compatible replacement preserves and restores 
       secondIdentity = processIdentity(String(secondRecord.containerId));
       const peerIps = [firstRecord.sourceIp, secondRecord.sourceIp];
       assertConsumersAdmitExactly(originalProxyId, peerIps, "exhausted allowance: while both peers are attached");
+      // Live sessions, not just recorded ones: each agent is running before the
+      // proxy goes away (see awaitAgentStarted).
+      await awaitAgentStarted(String(firstRecord.containerId), "exhausted allowance: the first peer");
+      await awaitAgentStarted(String(secondRecord.containerId), "exhausted allowance: the second peer");
 
       // 1. Every candidate creation is refused, so the allowance runs out.
       dockerOrThrow("exhausted allowance: stop the proxy to classify the compatible replacement", ["stop", "--time", "2", originalProxyId]);

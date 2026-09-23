@@ -31,6 +31,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { runfreeStateRoot } from "../../../packages/cli/src/paths.ts";
 import { listSessionContainerRecordsV2 } from "../../../packages/cli/src/runtime/session-containers.ts";
+import { SESSION_ENTRY_PATH } from "../../../packages/cli/src/runtime/session-launch.ts";
 import {
   sessionAdmissionFirewallSetReadCommand,
   servedSetReadCommand,
@@ -205,6 +206,47 @@ export async function startAttachedLaunch(
     await completion.catch(() => undefined);
   };
   return Object.freeze({ completion, attached, output: () => output, killOwner });
+}
+
+/**
+ * Longer than the session entry's own activation bound (60 s by default,
+ * `RUNFREE_SESSION_ENTRY_TIMEOUT_MS`), so an entry that gives up is observed
+ * as the container exiting rather than as this wait running out first.
+ */
+export const AGENT_START_TIMEOUT_MS = 75_000;
+
+/**
+ * Waits until the session entry has handed PID 1 to the agent.
+ *
+ * `attached` is the host's record, and it can land before the entry's
+ * readiness probe has seen the session active. Until the probe does, the entry
+ * keeps polling and the agent has not started; a case that takes the proxy
+ * away in that window leaves the entry polling a proxy that no longer serves
+ * it, and after its activation bound it exits 111 — the session dies of the
+ * case's own disruption, not of the product behaviour under test. A case
+ * about *live* sessions therefore waits for the agent itself.
+ *
+ * Read with `docker top` from the host, never by exec into the container: the
+ * entry is gone from the process table exactly when it has exec'd the agent.
+ */
+export async function awaitAgentStarted(containerId: string, label: string): Promise<void> {
+  const deadline = Date.now() + AGENT_START_TIMEOUT_MS;
+  for (;;) {
+    const top = docker(["top", containerId]);
+    if (top.status === 0) {
+      const processes = top.stdout.trim().split("\n").slice(1);
+      if (processes.length > 0 && !processes.some((line) => line.includes(SESSION_ENTRY_PATH))) return;
+    } else {
+      const state = docker(["inspect", "-f", "{{.State.Status}} exit={{.State.ExitCode}}", containerId]);
+      if (state.status === 0 && !state.stdout.startsWith("running")) {
+        throw new Error(`${label}: the session container stopped before its agent started (${state.stdout.trim()})`);
+      }
+    }
+    if (Date.now() >= deadline) {
+      throw new Error(`${label}: the session entry never handed over to the agent: ${describeOutput(top.output)}`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
 }
 
 export function parseLaunchReport(run: Readonly<{ status: number | null; output: string }>): CrashLaunchReport {
