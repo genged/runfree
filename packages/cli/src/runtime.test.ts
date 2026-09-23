@@ -6156,6 +6156,35 @@ describe("runtime command flow", () => {
     }));
   });
 
+  test("up with RUNFREE_TIMINGS=1 emits startup-ops category lines that never carry the proxy container id", async () => {
+    const projectRoot = path.join(tmp, "project");
+    const runtimeRoot = path.join(tmp, "runtime");
+    writeRuntimeAssets(runtimeRoot);
+    const project = prepareProject(projectRoot);
+    const io = createRuntimeIO({
+      capture: (command, args) => {
+        if (command === "docker" && args[0] === "image" && args[1] === "inspect") return captureResult(0);
+        return captureResult(0);
+      },
+    });
+
+    const status = await up( {
+      projectRoot,
+      project,
+      runtimeRoot,
+      env: { PATH: "/fake-bin", RUNFREE_TIMINGS: "1" },
+      network: fixedNetwork,
+    }, io, false, {});
+
+    expect(status).toBe(0);
+    const emittedLines = vi.mocked(console.error).mock.calls.flat().map(String);
+    const timingLines = emittedLines.filter((line) => line.includes("timing: "));
+    expect(timingLines.some((line) => line.includes("timing: startup-ops docker exec count="))).toBe(true);
+    for (const line of timingLines) {
+      expect(line).not.toContain(FAKE_PROXY_CONTAINER_ID);
+    }
+  });
+
   test("up reports a missing project agent Dockerfile before building images", async () => {
     const projectRoot = path.join(tmp, "project");
     const runtimeRoot = path.join(tmp, "runtime");

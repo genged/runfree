@@ -618,6 +618,7 @@ async function runConfiguredAgent(
   });
   if (runtime.kind === "failed") return runtime.status;
   const activeContext = preparedRuntimeContext(runtime.preparedRuntime);
+  const proxyId = preparedRuntimeProxyId(runtime.preparedRuntime);
   const tokenResolutionReceipts = runtime.tokenResolutionReceipts;
   flushWarnings();
   const sessionStartedAt = new Date().toISOString();
@@ -637,7 +638,7 @@ async function runConfiguredAgent(
   printSessionDenialSummary(activeContext, io, {
     sinceIso: sessionStartedAt,
     quiet: options.quiet,
-    proxyId: preparedRuntimeProxyId(runtime.preparedRuntime),
+    proxyId,
   });
   return status;
 }
@@ -1078,6 +1079,7 @@ export async function resumeRecoveryRuntime(
   const runtime = await startRuntime(context, io, false, { verbose: options.verbose });
   if (runtime.kind === "failed") return runtime.status;
   const activeContext = preparedRuntimeContext(runtime.preparedRuntime);
+  const proxyId = preparedRuntimeProxyId(runtime.preparedRuntime);
   flushWarnings();
   const sessionStartedAt = new Date().toISOString();
   const status = await withWriteApprovalSession(activeContext, () =>
@@ -1097,7 +1099,7 @@ export async function resumeRecoveryRuntime(
   printSessionDenialSummary(activeContext, io, {
     sinceIso: sessionStartedAt,
     quiet: options.quiet,
-    proxyId: preparedRuntimeProxyId(runtime.preparedRuntime),
+    proxyId,
   });
   return status;
 }

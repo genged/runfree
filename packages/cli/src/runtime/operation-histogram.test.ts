@@ -11,6 +11,8 @@ test("categories keep only Docker subcommand verbs", () => {
   expect(subprocessCategory("docker", ["ps", "-q"])).toBe("docker ps");
   expect(subprocessCategory("docker", ["TOKEN=abc"])).toBe("docker ?");
   expect(subprocessCategory("git", ["config", "--get", "user.email"])).toBe("git");
+  expect(subprocessCategory("/usr/bin/git", ["config", "--get", "user.email"])).toBe("git");
+  expect(subprocessCategory("/opt/My Tools/Git.exe", [])).toBe("?");
 });
 
 test("the wrapper counts and times capture and run without changing results", () => {
