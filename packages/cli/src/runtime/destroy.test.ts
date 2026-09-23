@@ -124,6 +124,7 @@ function harness(options: {
   residueRunning?: boolean;
   failSessionRemove?: boolean;
   failProxyStop?: boolean;
+  failResidueStop?: boolean;
   agentSessions?: unknown[];
   composeNetworkRemains?: boolean;
   composeImageRemains?: boolean;
@@ -154,7 +155,14 @@ function harness(options: {
     const fail = (stderr: string): CaptureResult => ({ status: 1, stdout: "", stderr });
     if (command !== "docker") throw new Error(`unexpected command: ${command}`);
     if (args[0] === "container" && args[1] === "stop") {
-      return options.failProxyStop ? fail("simulated stop failure") : ok();
+      if (options.failProxyStop) return fail("simulated stop failure");
+      if (options.failResidueStop) {
+        const targets = args.slice(args.indexOf("--time") + 2);
+        if (targets.length > 0 && targets.every((id) => residueIds.includes(id))) {
+          return fail("simulated stop failure");
+        }
+      }
+      return ok();
     }
     if (args[0] === "container" && args[1] === "rm") {
       const id = args.at(-1) ?? "";
@@ -926,6 +934,41 @@ describe("fenced project destroy", () => {
     const removeIndex = calls.findIndex((call) => call[1] === "container" && call[2] === "rm" && call.at(-1) === SESSION_CONTAINER_ID);
     expect(stopIndex).toBeGreaterThan(-1);
     expect(removeIndex).toBeGreaterThan(stopIndex);
+  });
+
+  test("--force stops every running project container in one Docker call", () => {
+    // Docker stops the ids of a multi-id `stop` concurrently, so N live
+    // project-labeled containers share one grace period instead of paying
+    // for N sequential ones.
+    const ids = ["d".repeat(64), "e".repeat(64)];
+    const { input, stateDir, calls } = harness({ force: true, residueIds: ids });
+    writeRecord(stateDir, attachedRecord());
+
+    expect(runFencedProjectDestroy(input)).toBe(0);
+    const residueStops = calls.filter(
+      (call) => call[1] === "container" && call[2] === "stop" && ids.some((id) => call.includes(id)),
+    );
+    expect(residueStops).toEqual([["docker", "container", "stop", "--time", "10", ...ids]]);
+  });
+
+  test("a failed batch stop falls back to per-container stops and names the failure", () => {
+    // `failProxyStop` fails every `container stop`, including the proxy stop
+    // that runs before this sweep — so it would end the destroy before this
+    // call is reached. `failResidueStop` fails only stops whose ids are all
+    // residue ids, letting the proxy stop succeed and the batch residue stop
+    // fail, so the fallback per-id loop below is what this test exercises.
+    const ids = ["d".repeat(64), "e".repeat(64)];
+    const { input, stateDir, calls } = harness({ force: true, residueIds: ids, failResidueStop: true });
+    writeRecord(stateDir, attachedRecord());
+
+    expect(() => runFencedProjectDestroy(input)).toThrow(
+      `project container could not be stopped (${ids[0]})`,
+    );
+    const stopTargets = calls
+      .filter((call) => call[1] === "container" && call[2] === "stop")
+      .map((call) => call.slice(5));
+    expect(stopTargets).toContainEqual(ids);
+    expect(stopTargets).toContainEqual([ids[0]]);
   });
 
   test("--force recovers an over-limit registry that enumeration refuses to scan", () => {
