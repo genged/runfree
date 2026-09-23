@@ -1,0 +1,36 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022"],
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "types": ["node"],
+    "strict": true,
+    "esModuleInterop": true,
+    "forceConsistentCasingInFileNames": true,
+    "skipLibCheck": true,
+    "allowImportingTsExtensions": true,
+    "noEmit": true,
+    "baseUrl": ".",
+    "paths": {
+      "@runfree/proxy/firewall/nftables": ["packages/proxy/src/firewall/nftables.ts"],
+      "@runfree/proxy/policy": ["packages/proxy/src/policy.ts"],
+      "@runfree/runtime-contracts/*": ["packages/runtime-contracts/src/*"],
+      "@runfree/proxy/*": ["packages/proxy/src/*"]
+    }
+  },
+  "include": [
+    "src/**/*.ts",
+    "packages/**/*.ts",
+    "packages/**/*.cts",
+    "scripts/**/*.ts",
+    "tests/**/*.ts",
+    "e2e/**/*.ts",
+    "vitest.config.ts"
+  ],
+  "references": [
+    { "path": "packages/runtime-contracts" },
+    { "path": "packages/proxy" },
+    { "path": "packages/agent-runtime" }
+  ]
+}

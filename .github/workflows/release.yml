@@ -1,0 +1,56 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag, for example v0.5.0"
+        required: true
+        type: string
+      replace_assets:
+        description: "Manual recovery only: finish an existing draft release for the same commit"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  discover:
+    name: Find release tags
+    runs-on: ubuntu-latest
+    outputs:
+      targets: ${{ steps.release.outputs.targets }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Discover release requests
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/resolve-release-request.sh
+
+  release:
+    name: Release ${{ matrix.tag }}
+    needs: discover
+    if: needs.discover.outputs.targets != '[]'
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.discover.outputs.targets) }}
+    concurrency:
+      group: release-${{ matrix.tag }}
+      cancel-in-progress: false
+      queue: max
+    # The called lane narrows these permissions per job; only publish writes.
+    permissions:
+      contents: write
+    uses: ./.github/workflows/release-lane.yml
+    with:
+      tag: ${{ matrix.tag }}
+      sha: ${{ matrix.sha }}
+      replace_assets: ${{ github.event_name == 'workflow_dispatch' && inputs.replace_assets || false }}

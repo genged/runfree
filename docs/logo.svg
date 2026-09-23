@@ -1,0 +1,205 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">
+<svg width="100%" height="100%" viewBox="0 0 1024 1024" version="1.1" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" xml:space="preserve" xmlns:serif="http://www.serif.com/" style="fill-rule:evenodd;clip-rule:evenodd;">
+    <g transform="matrix(0.411621,0,0,0.411621,91,89)">
+        <path d="M1799.236,0C1865.212,-0 1928.486,26.209 1975.139,72.861C2021.791,119.514 2048,182.788 2048,248.764L2048,1799.589C2048,1865.472 2021.828,1928.656 1975.242,1975.242C1928.656,2021.828 1865.472,2048 1799.589,2048L254.307,2048C186.861,2048 122.177,2021.207 74.485,1973.515C26.793,1925.823 -0,1861.139 -0,1793.693L0,255.128C0,114.225 114.225,0 255.128,-0L1799.236,0Z" style="fill:rgb(250,243,231);"/>
+    </g>
+    <g transform="matrix(0.5,0,0,0.5,0,0)">
+        <circle cx="1024" cy="1024" r="682" style="fill:rgb(16,185,129);"/>
+    </g>
+    <g transform="matrix(0.5,0,0,0.501821,0,-2.345149)">
+        <path d="M211,1412.5C740.183,1246.295 1307.817,1246.295 1837,1412.5L1837,1691.445C1837,1730.049 1821.609,1767.071 1794.213,1794.368C1766.816,1821.665 1729.659,1837 1690.915,1837C1378.003,1837 646.992,1837 345.094,1837C271.036,1837 211,1777.182 211,1703.392L211,1412.5Z" style="fill:rgb(21,26,33);fill-rule:nonzero;"/>
+    </g>
+    <g transform="matrix(0.5,0,0,0.5,0,0)">
+        <rect x="1106.4" y="387.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1136.4" y="387.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1076.4" y="417.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1106.4" y="417.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1136.4" y="417.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1076.4" y="447.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1106.4" y="447.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1136.4" y="447.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1166.4" y="447.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1076.4" y="477.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1106.4" y="477.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1136.4" y="477.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1166.4" y="477.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1046.4" y="507.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1076.4" y="507.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1106.4" y="507.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1136.4" y="507.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="986.4" y="537.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1016.4" y="537.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1046.4" y="537.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1076.4" y="537.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1106.4" y="537.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1136.4" y="537.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="956.4" y="567.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="986.4" y="567.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1016.4" y="567.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1046.4" y="567.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1076.4" y="567.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1106.4" y="567.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1136.4" y="567.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="926.4" y="597.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="956.4" y="597.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1016.4" y="597.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1046.4" y="597.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1076.4" y="597.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1106.4" y="597.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1136.4" y="597.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="896.4" y="627.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="926.4" y="627.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="956.4" y="627.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1016.4" y="627.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1046.4" y="627.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1076.4" y="627.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1106.4" y="627.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1136.4" y="627.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="926.4" y="657.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="956.4" y="657.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="986.4" y="657.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1016.4" y="657.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1046.4" y="657.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1076.4" y="657.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1106.4" y="657.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1136.4" y="657.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1196.4" y="657.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1226.4" y="657.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="956.4" y="687.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="986.4" y="687.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1016.4" y="687.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1046.4" y="687.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1076.4" y="687.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1106.4" y="687.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1136.4" y="687.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1166.4" y="687.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1196.4" y="687.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1226.4" y="687.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="986.4" y="717.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1016.4" y="717.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1046.4" y="717.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1076.4" y="717.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1106.4" y="717.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1136.4" y="717.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1016.4" y="747.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1046.4" y="747.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1076.4" y="747.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1106.4" y="747.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="986.4" y="777.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1016.4" y="777.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1046.4" y="777.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1076.4" y="777.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1106.4" y="777.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="986.4" y="807.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1016.4" y="807.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1046.4" y="807.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1076.4" y="807.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1106.4" y="807.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="986.4" y="837.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1016.4" y="837.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1046.4" y="837.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1076.4" y="837.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1106.4" y="837.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="986.4" y="867.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1016.4" y="867.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1046.4" y="867.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1076.4" y="867.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1106.4" y="867.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1136.4" y="867.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="956.4" y="897.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="986.4" y="897.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1016.4" y="897.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1046.4" y="897.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1076.4" y="897.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1106.4" y="897.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1136.4" y="897.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="956.4" y="927.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="986.4" y="927.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1016.4" y="927.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1046.4" y="927.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1076.4" y="927.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1106.4" y="927.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1136.4" y="927.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1166.4" y="927.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="686.4" y="957.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="956.4" y="957.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="986.4" y="957.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1016.4" y="957.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1076.4" y="957.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1106.4" y="957.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1136.4" y="957.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1166.4" y="957.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="656.4" y="987.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="686.4" y="987.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="716.4" y="987.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="746.4" y="987.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="776.4" y="987.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="806.4" y="987.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="836.4" y="987.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="866.4" y="987.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="896.4" y="987.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="926.4" y="987.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="956.4" y="987.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="986.4" y="987.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1016.4" y="987.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1106.4" y="987.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1136.4" y="987.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1166.4" y="987.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1196.4" y="987.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="656.4" y="1017.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="686.4" y="1017.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="716.4" y="1017.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="746.4" y="1017.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="776.4" y="1017.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="806.4" y="1017.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="836.4" y="1017.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="866.4" y="1017.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="896.4" y="1017.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="926.4" y="1017.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="956.4" y="1017.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="986.4" y="1017.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1136.4" y="1017.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1166.4" y="1017.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1196.4" y="1017.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="626.4" y="1047.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="656.4" y="1047.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="686.4" y="1047.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="866.4" y="1047.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="896.4" y="1047.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="926.4" y="1047.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="956.4" y="1047.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1166.4" y="1047.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1196.4" y="1047.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="626.4" y="1077.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1166.4" y="1077.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1196.4" y="1077.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1166.4" y="1107.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1196.4" y="1107.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1166.4" y="1137.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1196.4" y="1137.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1196.4" y="1167.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1226.4" y="1167.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1196.4" y="1197.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1226.4" y="1197.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1226.4" y="1227.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1256.4" y="1227.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1226.4" y="1257.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1256.4" y="1257.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1286.4" y="1257.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1316.4" y="1257.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+        <rect x="1346.4" y="1257.8" width="27" height="27" style="fill:rgb(21,26,33);"/>
+    </g>
+    <g transform="matrix(0.5,0,0,0.5,0,0)">
+        <path d="M361,211L1687,211C1769.288,211 1837,278.712 1837,361L1837,1687C1837,1769.288 1769.288,1837 1687,1837L361,1837C278.712,1837 211,1769.288 211,1687L211,361C211,278.712 278.712,211 361,211Z" style="fill:none;fill-rule:nonzero;stroke:rgb(21,26,33);stroke-width:74px;"/>
+    </g>
+    <g transform="matrix(0.451724,0,0,0.451724,46.97931,9.731034)">
+        <circle cx="361" cy="213" r="30" style="fill:rgb(250,243,231);"/>
+    </g>
+    <g transform="matrix(0.451724,0,0,0.451724,46.97931,9.731034)">
+        <circle cx="476" cy="213" r="30" style="fill:rgb(250,243,231);"/>
+    </g>
+    <g transform="matrix(0.451724,0,0,0.451724,46.97931,9.731034)">
+        <circle cx="591" cy="213" r="30" style="fill:rgb(250,243,231);"/>
+    </g>
+</svg>

@@ -1,0 +1,478 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`output baseline: command transcripts > bare group command 1`] = `
+{
+  "status": 1,
+  "stderr": "<ts> runfree error: runfree host needs a subcommand
+
+runfree host
+
+Manage the exact-host network allowlist
+
+Commands:
+  runfree host add <host>      Allow an exact host and optionally restrict its requests
+  runfree host remove <host>   Remove a host from the allowlist
+  runfree host list            Print allowlisted hosts
+  runfree host explain <host>  Show a host's allowlist status, credentials, and request rules
+  runfree host rules <host>    Show or change a host's request rules
+
+Options:
+  -h, --help  Show help  [boolean]
+
+Examples:
+  runfree host add api.github.com                                Allow an exact host
+  runfree host add pypi.org --read-only                          Allow a host, GET/HEAD/OPTIONS only
+  runfree host rules api.example.com --method GET --method POST  Allow only specific methods (repeatable)
+  runfree host rules github.com --deny-git-push                  Allow the host but block git push
+  runfree host remove api.github.com                             Remove an unreferenced host
+  runfree host list                                              List allowlisted hosts
+  runfree host explain api.github.com                            Show allowlist status, credentials, and request rules
+  runfree host rules api.github.com                              Show the host's request rules (--clear removes them)
+  runfree host rules api.github.com --write ask                  Hold writes to this host for approval
+
+Hosts are exact hostnames; there are no wildcards. The allowlist is the proxy egress boundary.
+",
+  "stdout": "",
+}
+`;
+
+exports[`output baseline: command transcripts > credential add rejects the inert --no-sync flag 1`] = `
+{
+  "status": 1,
+  "stderr": "<ts> runfree error: Unknown argument: no-sync
+",
+  "stdout": "",
+}
+`;
+
+exports[`output baseline: command transcripts > init on a fresh project 1`] = `
+{
+  "status": 0,
+  "stderr": "",
+  "stdout": "project: <project>
+runfree config: <project>/.runfree/runfree.json
+network policy: <project>/.runfree/network-policy.json
+outbound services: none (deny-all)
+start Claude or Codex to review its required operational service
+after the first start, enable services with: runfree service enable <id>
+service ids are listed by: runfree service enable --help
+",
+}
+`;
+
+exports[`output baseline: command transcripts > policy mutation before the first start 1`] = `
+{
+  "status": 0,
+  "stderr": "",
+  "stdout": "scope: project
+pre.example updated
+updated .runfree/network-policy.json
+approved project desired policy: sha256:<digest> (approval record id)
+effective policy: saved; applies when the runtime starts
+",
+}
+`;
+
+exports[`output baseline: command transcripts > policy mutation before the first start 2`] = `
+{
+  "status": 0,
+  "stderr": "",
+  "stdout": "scope: project
+pre.example updated
+updated .runfree/network-policy.json
+approved project desired policy: sha256:<digest> (approval record id)
+effective policy: unchanged (--no-reload)
+",
+}
+`;
+
+exports[`output baseline: command transcripts > policy mutation before the first start 3`] = `
+{
+  "status": 0,
+  "stderr": "",
+  "stdout": "scope: project
+pre.example: methods=GET,HEAD,OPTIONS pathPrefixes=all gitPush=allow
+",
+}
+`;
+
+exports[`output baseline: command transcripts > post-init dead zone reads 1`] = `
+{
+  "status": 1,
+  "stderr": "<ts> runfree error: no effective policy generation is selected for this project yet
+  start the runtime to review and select controls: runfree up
+  inspect approval state with: runfree policy status
+",
+  "stdout": "",
+}
+`;
+
+exports[`output baseline: command transcripts > post-init dead zone reads 2`] = `
+{
+  "status": 1,
+  "stderr": "<ts> runfree error: approved project and local network controls are required before services can be listed or changed
+  start the runtime to review and select controls: runfree up
+  inspect approval state with: runfree policy status
+",
+  "stdout": "",
+}
+`;
+
+exports[`output baseline: command transcripts > post-init dead zone reads 3`] = `
+{
+  "status": 1,
+  "stderr": "<ts> runfree error: no effective policy generation is selected for this project yet
+  start the runtime to review and select controls: runfree up
+  inspect approval state with: runfree policy status
+",
+  "stdout": "",
+}
+`;
+
+exports[`output baseline: command transcripts > post-init dead zone reads 4`] = `
+{
+  "status": 0,
+  "stderr": "",
+  "stdout": "Network policy
+SOURCE          DESIRED                 APPROVED  STATE
+project         sha256:1c063433…134730  none      pending
+checkout-local  sha256:49052f70…20c495  none      pending
+runtime         sha256:32884949…b50578  none      pending
+image           none                    none      absent
+approval set: none
+effective policy generation: none
+proxy request: unacknowledged
+proxy firewall: unacknowledged
+",
+}
+`;
+
+exports[`output baseline: command transcripts > removed command shims 1`] = `
+{
+  "status": 1,
+  "stderr": "<ts> runfree error: \`runfree source\` has been removed.
+  use: runfree credential source ...
+",
+  "stdout": "",
+}
+`;
+
+exports[`output baseline: command transcripts > removed command shims 2`] = `
+{
+  "status": 1,
+  "stderr": "<ts> runfree error: \`runfree domain\` has been removed. Use \`runfree host add <host>\` for exact-host network policy.
+",
+  "stdout": "",
+}
+`;
+
+exports[`output baseline: command transcripts > unknown command 1`] = `
+{
+  "status": 1,
+  "stderr": "<ts> runfree error: unknown command: bogus-command (try 'runfree help')
+",
+  "stdout": "",
+}
+`;
+
+exports[`output baseline: command transcripts > unknown flag before a mutation 1`] = `
+{
+  "status": 1,
+  "stderr": "<ts> runfree error: Unknown argument: bogus
+",
+  "stdout": "",
+}
+`;
+
+exports[`output baseline: command transcripts > update placeholder 1`] = `
+{
+  "status": 0,
+  "stderr": "",
+  "stdout": "runfree update does not replace the running binary yet
+install the latest release with the same method you used for this binary
+project .runfree files were not changed
+",
+}
+`;
+
+exports[`output baseline: proxy denial bodies > every denial reason renders a stable body 1`] = `
+{
+  "connect-host-mismatch": "Runfree blocked this request.
+
+  host:   api.example.com
+  reason: the request host does not match the admitted CONNECT host
+
+This block is enforced by the Runfree proxy outside the agent container.
+The person operating Runfree can inspect recent denials by running
+\`runfree doctor\` on the host machine.
+",
+  "connect-sni-mismatch": "Runfree blocked this request.
+
+  host:   api.example.com
+  reason: TLS SNI does not match the admitted CONNECT host
+
+This block is enforced by the Runfree proxy outside the agent container.
+The person operating Runfree can inspect recent denials by running
+\`runfree doctor\` on the host machine.
+",
+  "git-push-denied": "Runfree blocked this request.
+
+  host:   api.example.com
+  method: POST
+  path:   /api/v1/things
+  reason: git push is denied for this host
+
+This host's policy denies git pushes. The person operating Runfree can
+review or replace the rule on the host machine:
+
+  runfree host rules api.example.com
+
+Current rules: runfree host explain api.example.com
+",
+  "host-not-allowlisted": "Runfree blocked this request.
+
+  host:   api.example.com
+  reason: host is not in the project network allowlist
+
+This block is enforced by the Runfree proxy outside the agent container.
+If this host should be reachable, the person operating Runfree can run
+on the host machine:
+
+  runfree host add api.example.com
+
+Policy reloads automatically; rerun the failed command afterwards.
+",
+  "malformed-connect": "Runfree blocked this request.
+
+  host:   api.example.com
+  reason: malformed CONNECT request
+
+This block is enforced by the Runfree proxy outside the agent container.
+The person operating Runfree can inspect recent denials by running
+\`runfree doctor\` on the host machine.
+",
+  "method-not-allowed": "Runfree blocked this request.
+
+  host:   api.example.com
+  method: POST
+  reason: method is not permitted for this host (allowed: GET, HEAD)
+
+The person operating Runfree can widen this on the host machine:
+
+  runfree host rules api.example.com --method GET --method HEAD --method POST --request-path-prefix /api/ --deny-git-push --write ask
+
+This replaces the host's request rule with: methods=GET,HEAD,POST pathPrefixes=/api/ gitPush=deny writeAction=ask
+
+Current rules: runfree host explain api.example.com
+",
+  "missing-admission-record": "Runfree blocked this request.
+
+  host:   api.example.com
+  reason: the connection did not pass the Runfree CONNECT admission boundary
+
+This block is enforced by the Runfree proxy outside the agent container.
+This connection was denied when it was opened and cannot be upgraded in
+place, even if the host has since been allowed. Retry on a new connection:
+rerun the failed command; a client that pools connections must reconnect.
+
+Current rules: runfree host explain api.example.com
+",
+  "missing-required-token": "Runfree blocked this request.
+
+  host:   api.example.com
+  reason: a required proxy-managed token is not configured for this host
+
+This block is enforced by the Runfree proxy outside the agent container.
+The person operating Runfree can inspect recent denials by running
+\`runfree doctor\` on the host machine.
+",
+  "non-https-port": "Runfree blocked this request.
+
+  host:   api.example.com
+  reason: CONNECT to a non-HTTPS port is not allowed
+
+This block is enforced by the Runfree proxy outside the agent container.
+The person operating Runfree can inspect recent denials by running
+\`runfree doctor\` on the host machine.
+",
+  "non-https-url": "Runfree blocked this request.
+
+  host:   api.example.com
+  reason: only HTTPS outbound requests are allowed
+
+This block is enforced by the Runfree proxy outside the agent container.
+The person operating Runfree can inspect recent denials by running
+\`runfree doctor\` on the host machine.
+",
+  "non-wss-url": "Runfree blocked this request.
+
+  host:   api.example.com
+  reason: only WSS (secure WebSocket) outbound requests are allowed
+
+This block is enforced by the Runfree proxy outside the agent container.
+The person operating Runfree can inspect recent denials by running
+\`runfree doctor\` on the host machine.
+",
+  "path-not-allowed": "Runfree blocked this request.
+
+  host:   api.example.com
+  method: POST
+  path:   /api/v1/things
+  reason: path is not permitted for this host (allowed prefixes: /api/)
+
+The person operating Runfree can widen this on the host machine:
+
+  runfree host rules api.example.com --method GET --method HEAD --request-path-prefix /api/ --request-path-prefix <prefix> --deny-git-push --write ask
+
+This replaces the host's request rule with: methods=GET,HEAD pathPrefixes=/api/,<prefix> gitPush=deny writeAction=ask
+
+Current rules: runfree host explain api.example.com
+",
+  "policy-denied": "Runfree blocked this request.
+
+  host:   api.example.com
+  reason: blocked by proxy policy
+
+This block is enforced by the Runfree proxy outside the agent container.
+The person operating Runfree can inspect recent denials by running
+\`runfree doctor\` on the host machine.
+",
+  "proxy-authorization-not-allowed": "Runfree blocked this request.
+
+  host:   api.example.com
+  reason: the proxy never accepts Proxy-Authorization from the agent
+
+This block is enforced by the Runfree proxy outside the agent container.
+The person operating Runfree can inspect recent denials by running
+\`runfree doctor\` on the host machine.
+",
+  "request-head-timeout": "Runfree blocked this request.
+
+  host:   api.example.com
+  reason: the request head was not completed before the proxy's timeout
+
+This block is enforced by the Runfree proxy outside the agent container.
+The person operating Runfree can inspect recent denials by running
+\`runfree doctor\` on the host machine.
+",
+  "request-head-too-large": "Runfree blocked this request.
+
+  host:   api.example.com
+  reason: the request head exceeds the proxy's size limit
+
+This block is enforced by the Runfree proxy outside the agent container.
+The person operating Runfree can inspect recent denials by running
+\`runfree doctor\` on the host machine.
+",
+  "unregistered-session-peer": "Runfree blocked this request.
+
+  host:   api.example.com
+  reason: the source peer has no active Runfree session admission
+
+This block is enforced by the Runfree proxy outside the agent container.
+The person operating Runfree can inspect recent denials by running
+\`runfree doctor\` on the host machine.
+",
+  "unsupported-client-protocol": "Runfree blocked this request.
+
+  host:   api.example.com
+  reason: the proxy only accepts HTTP/1.1 proxy requests on this port
+
+This block is enforced by the Runfree proxy outside the agent container.
+The person operating Runfree can inspect recent denials by running
+\`runfree doctor\` on the host machine.
+",
+  "websocket-host-not-allowlisted": "Runfree blocked this request.
+
+  host:   api.example.com
+  reason: websocket host is not in the project network allowlist
+
+This block is enforced by the Runfree proxy outside the agent container.
+If this host should be reachable, the person operating Runfree can run
+on the host machine:
+
+  runfree host add api.example.com
+
+Policy reloads automatically; rerun the failed command afterwards.
+",
+  "write-approval-capacity": "Runfree blocked this request.
+
+  host:   api.example.com
+  method: POST
+  path:   /api/v1/things
+  reason: too many writes already waiting for approval
+
+The person operating Runfree can decide the pending approvals with
+\`runfree approvals\`, then retry the request.
+Current rules: runfree host explain api.example.com
+",
+  "write-approval-required": "Runfree blocked this request.
+
+  host:   api.example.com
+  method: POST
+  path:   /api/v1/things
+  reason: writes need approval but no approver is attached
+
+Writes to this host need a human approval, and no approver is attached.
+The person operating Runfree can attach an approver on the host machine:
+
+  runfree approvals --watch
+
+or allow writes to this host in project policy:
+
+  runfree host rules api.example.com --write allow
+
+Current rules: runfree host explain api.example.com
+",
+  "write-approval-session-denied": "Runfree blocked this request.
+
+  host:   api.example.com
+  method: POST
+  path:   /api/v1/things
+  reason: the operator denied writes for this session until they clear the deny
+
+Current rules: runfree host explain api.example.com
+",
+  "write-approval-timeout": "Runfree blocked this request.
+
+  host:   api.example.com
+  method: POST
+  path:   /api/v1/things
+  reason: held for approval — no response before the hold timed out
+
+This write was held for approval and denied when nobody responded.
+The person operating Runfree can approve the next attempt:
+
+  runfree approvals
+
+then retry the request.
+Current rules: runfree host explain api.example.com
+",
+  "write-denied": "Runfree blocked this request.
+
+  host:   api.example.com
+  method: POST
+  path:   /api/v1/things
+  reason: writes to this host are blocked (read-only)
+
+This host's policy blocks writes. The person operating Runfree can
+switch writes to ask-for-approval on the host machine:
+
+  runfree host rules api.example.com --write ask
+
+Current rules: runfree host explain api.example.com
+",
+}
+`;
+
+exports[`output baseline: proxy denial bodies > unparseable host body 1`] = `
+"Runfree blocked this request.
+
+  host:   <unparseable>
+  reason: host is not in the project network allowlist
+
+This block is enforced by the Runfree proxy outside the agent container.
+The person operating Runfree can inspect recent denials by running
+\`runfree doctor\` on the host machine.
+"
+`;

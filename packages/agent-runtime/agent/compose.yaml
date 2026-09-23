@@ -1,0 +1,134 @@
+# Runtime topology: the fixed control plane is the proxy (trust boundary) plus
+# the internal-only agent_internal network. Agents are per-session containers,
+# admitted onto agent_internal by source IP at launch — they are not part of
+# this Compose file (see docs/architecture.md, docs/security.md).
+#
+# An agent holds no proxy-managed service credentials. Its only outbound network
+# path is the proxy on :8080 through the internal-only network. The proxy
+# receives token files in proxy-only tmpfs and injects them as HTTPS request
+# headers to whitelisted destination hosts. Agent auth uses Runfree-managed
+# per-project state directories. The MCP OAuth callback is a per-session
+# mcp-callback ingress forwarder minted at `runfree mcp auth`, not a Compose
+# sidecar.
+
+name: ${RUNFREE_COMPOSE_PROJECT_NAME:-runfree}
+
+services:
+  proxy:
+    image: ${RUNFREE_PROXY_IMAGE:?RUNFREE_PROXY_IMAGE is required}
+    networks:
+      proxy_egress:
+        ipv4_address: ${RUNFREE_PROXY_EGRESS_IP:-172.30.1.10}
+        gw_priority: 1
+      agent_internal:
+        ipv4_address: ${RUNFREE_PROXY_IP:-172.30.0.10}
+        gw_priority: 0
+    cap_add:
+      - NET_ADMIN
+    cap_drop:
+      - NET_RAW
+    security_opt:
+      - no-new-privileges:true
+    labels:
+      io.runfree.project-id: ${RUNFREE_PROJECT_ID:?RUNFREE_PROJECT_ID is required}
+      io.runfree.compose-project: ${RUNFREE_COMPOSE_PROJECT_NAME:?RUNFREE_COMPOSE_PROJECT_NAME is required}
+      io.runfree.digest-schema: "1"
+      io.runfree.managed: "true"
+      io.runfree.container-role: proxy
+      io.runfree.lifecycle-owner: compose
+      io.runfree.label-schema: "1"
+      io.runfree.proxy-image-input-digest: ${RUNFREE_PROXY_IMAGE_INPUT_DIGEST:?RUNFREE_PROXY_IMAGE_INPUT_DIGEST is required}
+      io.runfree.topology-digest: ${RUNFREE_TOPOLOGY_DIGEST:?RUNFREE_TOPOLOGY_DIGEST is required}
+      io.runfree.version: ${RUNFREE_VERSION:?RUNFREE_VERSION is required}
+    init: true
+    volumes:
+      - type: bind
+        source: ${RUNFREE_PROXY_CA_KEY_DIR:?RUNFREE_PROXY_CA_KEY_DIR is required}
+        target: /ca/private
+      - type: bind
+        source: ${RUNFREE_PROXY_CA_CERT_DIR:?RUNFREE_PROXY_CA_CERT_DIR is required}
+        target: /ca/public
+      - type: bind
+        source: ${RUNFREE_EFFECTIVE_PROXY_DIR:?RUNFREE_EFFECTIVE_PROXY_DIR is required}
+        target: /app/runfree-effective
+        read_only: true
+      - type: bind
+        source: ${RUNFREE_MCP_OPERATION_POLICY_HOST_PATH:?RUNFREE_MCP_OPERATION_POLICY_HOST_PATH is required}
+        target: /app/proxy/mcp-operation-policy.json
+        read_only: true
+      - type: volume
+        source: runfree-oauth-state
+        target: /run/runfree-oauth
+    tmpfs:
+      - /run/runfree-proxy-secrets:mode=0700,uid=1001,gid=1001
+      # Audit marker + audit resolved-host snapshot: root-owned on purpose
+      # (no uid/gid option) so the UID-1001 proxy server can read but never
+      # write here; only the host CLI's root docker-exec path creates the
+      # marker. The entrypoint re-asserts ownership and modes at startup.
+      - /run/runfree-proxy-audit:mode=0755
+      # Audit spool: the one intentional UID-1001 -> root channel. The request
+      # proxy appends observed hostnames; the root supervisor re-validates
+      # every line before acting.
+      - /run/runfree-proxy-audit-spool:mode=0755,uid=1001,gid=1001
+      # Policy-generation status files (root-owned dir; ownership split
+      # mirrors the audit paths): the root firewall supervisor writes
+      # firewall.json here, the UID-1001 request proxy writes into a
+      # uid-1001 subdirectory the entrypoint pre-creates. The host CLI polls
+      # these via docker exec for restart-free policy convergence and proxy
+      # readiness. Never mounted into the agent.
+      - /run/runfree-proxy-status:mode=0755
+      # Root-owned immutable source-IP/session generations. The host advances
+      # request-proxy and firewall pointers independently through root docker
+      # exec; the uid-1001 request proxy can read but cannot mint authority.
+      - /run/runfree-sessions:mode=0755
+      # Approve-on-write channel. Pending records are proxy-owned; decisions
+      # are root-owned on purpose (like the audit marker) so the UID-1001
+      # proxy server can read but never write them: only the host CLI's root
+      # docker-exec path mints a decision or the watcher heartbeat. Neither a
+      # prompt-injected agent (no exec into the proxy) nor a compromised
+      # UID-1001 proxy process can self-approve a held write.
+      - /run/runfree-approvals/pending:mode=0700,uid=1001,gid=1001
+      - /run/runfree-approvals/decisions:mode=0755
+    environment:
+      RUNFREE_EFFECTIVE_PROXY_ROOT: /app/runfree-effective
+      PROXY_SECRET_DIR: /run/runfree-proxy-secrets
+      PROXY_AUDIT_MARKER_PATH: /run/runfree-proxy-audit/active.json
+      PROXY_AUDIT_SPOOL_PATH: /run/runfree-proxy-audit-spool/spool.txt
+      PROXY_AUDIT_RESOLVED_HOSTS_PATH: /run/runfree-proxy-audit/resolved-hosts.json
+      RUNFREE_MCP_OPERATION_POLICY_PATH: /app/proxy/mcp-operation-policy.json
+      RUNFREE_OAUTH_STATE_DIR: /run/runfree-oauth
+      RUNFREE_APPROVALS_PENDING_DIR: /run/runfree-approvals/pending
+      RUNFREE_APPROVALS_DECISIONS_DIR: /run/runfree-approvals/decisions
+      RUNFREE_SESSION_IDENTITY_MODE: source-ip-v1
+      RUNFREE_SESSION_REGISTRY_DIR: /run/runfree-sessions
+      # Host-resolved hold window (validated 5-300s by the CLI and folded into
+      # the runtime security-contract hash; changing it recreates the runtime).
+      RUNFREE_WRITE_APPROVAL_HOLD_SECONDS: ${RUNFREE_WRITE_APPROVAL_HOLD_SECONDS:-120}
+      RUNFREE_PROJECT_ID: ${RUNFREE_PROJECT_ID:?RUNFREE_PROJECT_ID is required}
+      RUNFREE_PROXY_IP: ${RUNFREE_PROXY_IP:-172.30.0.10}
+      RUNFREE_SUBNET: ${RUNFREE_SUBNET:-172.30.0.0/24}
+      RUNFREE_PROXY_EGRESS_IP: ${RUNFREE_PROXY_EGRESS_IP:-172.30.1.10}
+      RUNFREE_PROXY_EGRESS_SUBNET: ${RUNFREE_PROXY_EGRESS_SUBNET:-172.30.1.0/24}
+      RUNFREE_PROXY_EGRESS_GATEWAY: ${RUNFREE_PROXY_EGRESS_GATEWAY:-172.30.1.1}
+      CA_CERT: /ca/public/proxy-ca.crt
+      CA_KEY: /ca/private/proxy-ca.key
+
+volumes:
+  runfree-commandhistory:
+  runfree-oauth-state:
+
+networks:
+  agent_internal:
+    internal: true
+    enable_ipv6: false
+    driver_opts:
+      com.docker.network.bridge.inhibit_ipv4: "true"
+    ipam:
+      config:
+        - subnet: ${RUNFREE_SUBNET:-172.30.0.0/24}
+  proxy_egress:
+    enable_ipv6: false
+    ipam:
+      config:
+        - subnet: ${RUNFREE_PROXY_EGRESS_SUBNET:-172.30.1.0/24}
+          gateway: ${RUNFREE_PROXY_EGRESS_GATEWAY:-172.30.1.1}

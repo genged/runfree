@@ -1,0 +1,67 @@
+Runfree
+Copyright (c) 2026 genged/runfree
+
+This product is licensed under the MIT License. See LICENSE for the full text.
+
+--------------------------------------------------------------------------------
+Third-party components
+--------------------------------------------------------------------------------
+
+This notice lists the third-party components Runfree redistributes or installs,
+so recipients can find the licenses that apply to them. It records what is
+bundled and where each component's license text lives. It is not legal advice
+and it is not a clearance opinion.
+
+Three distribution surfaces carry third-party code, and they are not the same
+set:
+
+1. The `runfree` executable in the release archive
+2. The container images Runfree builds on the user's machine
+3. The repository's development dependencies, which ship in neither of the above
+
+1. The `runfree` executable
+---------------------------
+
+The release archive contains a single executable compiled with Bun. It embeds
+the Bun runtime and the JavaScript dependencies the CLI imports.
+
+  Bun                     MIT (with bundled components under their own terms;
+                          see https://github.com/oven-sh/bun/blob/main/LICENSE.md)
+  @clack/prompts          MIT
+  yargs                   MIT, with its transitive dependencies
+  smol-toml               BSD-3-Clause
+
+Each package's license text is in its directory under `node_modules/` in a
+source checkout, and in the published package on npm.
+
+2. Container images
+-------------------
+
+Runfree builds the agent and proxy images on the user's machine from the pinned
+inputs in `packages/agent-runtime/runtime-inputs.lock.json`. These images are
+not published as release artifacts today. Anyone who publishes prebuilt Runfree
+images takes on the redistribution obligations of everything inside them, which
+this notice does not enumerate at the package level.
+
+  Base image            Ubuntu, pinned by digest. Ubuntu packages carry their
+                        own licenses, recorded under /usr/share/doc in the image.
+  Installed packages    The APT package set pinned in runtime-inputs.lock.json
+                        (bash, ca-certificates, curl, git, jq, nftables, nodejs,
+                        npm, ripgrep, zsh, and others), under their Debian/Ubuntu
+                        licenses.
+  GitHub CLI            MIT, installed from the pinned release .deb.
+  uv                    Apache-2.0 or MIT, from the pinned ghcr.io image.
+  mockttp               Apache-2.0 (proxy image)
+  read-tls-client-hello Apache-2.0 (proxy image)
+
+Runfree also installs coding-agent CLIs (Claude Code, Codex, Pi) into the agent
+image at pinned versions. Those are the vendors' own products under the vendors'
+own terms. Runfree does not relicense them, and using them requires an account
+with the respective vendor.
+
+3. Development dependencies
+---------------------------
+
+TypeScript, Biome, Vitest, tsx, and the other devDependencies in `package.json`
+are build- and test-time only. They are not part of the release archive or the
+container images.

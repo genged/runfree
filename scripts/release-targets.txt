@@ -1,0 +1,12 @@
+# The release target list. One source of truth for packaging, signing,
+# checksums, candidate acceptance, the GitHub Actions build matrix, and the
+# installer's supported-platform refusal.
+#
+# Format: <target> <runner-label>
+# Lines starting with "#" and blank lines are ignored.
+#
+# 0.5.0 publishes Apple Silicon macOS only. Intel macOS and Linux archives are
+# not built, not signed, not checksummed, and not claimed as supported. Adding a
+# row here is a support claim: it must come with recorded acceptance evidence on
+# that target.
+darwin-arm64 macos-15

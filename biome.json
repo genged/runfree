@@ -1,0 +1,78 @@
+{
+	"$schema": "https://biomejs.dev/schemas/2.4.16/schema.json",
+	"vcs": {
+		"enabled": true,
+		"clientKind": "git",
+		"useIgnoreFile": true
+	},
+	"files": {
+		"includes": [
+			"biome.json",
+			"package.json",
+			"packages/*/package.json",
+			"packages/agent-runtime/agent/agent-tools/package.json",
+			"packages/*/tsconfig.json",
+			"tsconfig.json",
+			"vitest.config.ts",
+			"bin/**/*.js",
+			"src/**/*.ts",
+			"packages/**/*.ts",
+			"packages/**/*.cts",
+			"scripts/**/*.ts",
+			"tests/**/*.ts",
+			"e2e/**/*.ts",
+			"!!packages/cli/src/embedded-assets.generated.ts",
+			"!!packages/**/dist",
+			"!!local",
+			"!!.worktrees",
+			"!!.playwright-mcp",
+			"!!.agentbox",
+			"!!.idea",
+			"!!.capshelf",
+			"!!.agents/skills",
+			"!!.claude/skills",
+			"!!.claude/agents"
+		]
+	},
+	"formatter": {
+		"enabled": false,
+		"indentStyle": "space",
+		"indentWidth": 2,
+		"lineWidth": 160
+	},
+	"linter": {
+		"enabled": true,
+		"rules": {
+			"recommended": true,
+			"complexity": {
+				"noAdjacentSpacesInRegex": "off",
+				"noUselessCatch": "off",
+				"noUselessEscapeInRegex": "off",
+				"useIndexOf": "off",
+				"useOptionalChain": "off"
+			},
+			"correctness": {
+				"noUnusedFunctionParameters": "off",
+				"noUnusedImports": "error",
+				"noUnusedVariables": "error"
+			},
+			"style": {
+				"useImportType": "off"
+			},
+			"suspicious": {
+				"noControlCharactersInRegex": "off",
+				"noExplicitAny": "off",
+				"noTemplateCurlyInString": "off",
+				"noUselessEscapeInString": "off"
+			}
+		}
+	},
+	"javascript": {
+		"formatter": {
+			"quoteStyle": "double"
+		}
+	},
+	"assist": {
+		"enabled": false
+	}
+}

@@ -1,0 +1,26 @@
+{
+  "name": "@runfree/proxy",
+  "version": "0.2.0",
+  "description": "Credential-injection proxy for Runfree. Holds tokens; boxed agents never see them.",
+  "private": true,
+  "type": "module",
+  "exports": {
+    "./firewall/nftables": "./src/firewall/nftables.ts",
+    "./policy": "./src/policy.ts"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "tsx src/server.ts",
+    "test": "pnpm --dir ../.. exec vitest run packages/proxy/src/policy.test.ts"
+  },
+  "dependencies": {
+    "@runfree/runtime-contracts": "workspace:*",
+    "mockttp": "4.4.2",
+    "read-tls-client-hello": "2.0.0"
+  },
+  "devDependencies": {
+    "tsx": "4.22.3"
+  }
+}

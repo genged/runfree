@@ -1,0 +1,40 @@
+node_modules/
+.deps-node_modules/
+dist/
+coverage/
+*.tsbuildinfo
+.pnpm-store/
+
+.tmp/
+logs/
+
+# Maintainer-only records: plans, specs, evidence, todo, research notes. Public
+# documentation must work without this directory, and nothing here is published.
+local/
+
+# Worktrees created for parallel work on this checkout.
+.worktrees/
+
+# Local agent tooling state. These are per-developer choices, not project
+# configuration: a contributor's plugin set, MCP servers, and permission
+# allowlists are theirs. The security-architect skill and agent are the
+# exception — they are tracked project guidance that AGENTS.md points at.
+.claude/settings.json
+.claude/settings.local.json
+.claude/projects/
+.capshelf/
+.codex/
+.pi/
+.superpowers/
+.mcp.json
+.agents/skills/*
+!.agents/skills/security-architect/
+.claude/skills/*
+!.claude/skills/security-architect
+
+# Editor and OS metadata.
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store

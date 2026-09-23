@@ -1,0 +1,24 @@
+{
+  "version": 4,
+  "agents": {
+    "default": "codex",
+    "claude": {
+      "command": "claude --dangerously-skip-permissions"
+    },
+    "codex": {
+      "command": "codex --dangerously-bypass-approvals-and-sandbox"
+    },
+    "pi": {
+      "command": "pi"
+    }
+  },
+  "runtime": {
+    "dependencyOverlays": "auto",
+    "agent": {
+      "build": {
+        "context": ".runfree/image",
+        "dockerfile": ".runfree/image/Dockerfile"
+      }
+    }
+  }
+}

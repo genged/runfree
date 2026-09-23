@@ -1,0 +1,4 @@
+interface:
+  display_name: "Security Architect"
+  short_description: "Review sandbox and trust-boundary designs"
+  default_prompt: "Use $security-architect to review this sandbox or trust-boundary design for security risks."

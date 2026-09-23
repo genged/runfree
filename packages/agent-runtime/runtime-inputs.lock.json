@@ -1,0 +1,78 @@
+{
+  "schemaVersion": 1,
+  "images": {
+    "agentBase": {
+      "ref": "ubuntu:26.04@sha256:f3d28607ddd78734bb7f71f117f3c6706c666b8b76cbff7c9ff6e5718d46ff64"
+    },
+    "uv": {
+      "ref": "ghcr.io/astral-sh/uv:0.5.27@sha256:5adf09a5a526f380237408032a9308000d14d5947eafa687ad6c6a2476787b4f"
+    },
+    "proxyBase": {
+      "ref": "ubuntu:26.04@sha256:f3d28607ddd78734bb7f71f117f3c6706c666b8b76cbff7c9ff6e5718d46ff64"
+    }
+  },
+  "apt": {
+    "family": "ubuntu",
+    "sources": {
+      "ubuntu": {
+        "url": "http://archive.ubuntu.com/ubuntu",
+        "suites": [
+          "resolute",
+          "resolute-updates"
+        ],
+        "components": [
+          "main",
+          "universe"
+        ],
+        "signedBy": "/usr/share/keyrings/ubuntu-archive-keyring.gpg"
+      },
+      "ubuntuSecurity": {
+        "url": "http://security.ubuntu.com/ubuntu",
+        "suites": [
+          "resolute-security"
+        ],
+        "components": [
+          "main",
+          "universe"
+        ],
+        "signedBy": "/usr/share/keyrings/ubuntu-archive-keyring.gpg"
+      }
+    },
+    "packages": {
+      "bash": "5.3-2ubuntu1",
+      "bind9-dnsutils": "1:9.20.24-1ubuntu0.3",
+      "ca-certificates": "20260223",
+      "curl": "8.18.0-1ubuntu2.5",
+      "dumb-init": "1.2.5-3build1",
+      "git": "1:2.53.0-1ubuntu1",
+      "iproute2": "6.19.0-1ubuntu1",
+      "jq": "1.8.1-4ubuntu2",
+      "netcat-openbsd": "1.234-1",
+      "nftables": "1.1.6-1",
+      "nodejs": "22.22.1+dfsg+~cs22.19.15-1ubuntu1",
+      "npm": "9.2.0~ds3-1",
+      "ripgrep": "15.1.0-1ubuntu1",
+      "sudo": "1.9.17p2-1ubuntu3",
+      "util-linux": "2.41.3-3ubuntu2",
+      "zsh": "5.9-8ubuntu3"
+    }
+  },
+  "releaseArtifacts": {
+    "githubCli": {
+      "version": "2.83.1",
+      "linuxAmd64Deb": {
+        "url": "https://github.com/cli/cli/releases/download/v2.83.1/gh_2.83.1_linux_amd64.deb",
+        "sha256": "835afbb0404889c5595929117eccb2681547c387f6a711b50b08288436de7b22"
+      },
+      "linuxArm64Deb": {
+        "url": "https://github.com/cli/cli/releases/download/v2.83.1/gh_2.83.1_linux_arm64.deb",
+        "sha256": "cc21469d749a88fdd53f9242dc3005bd4f8fe4dcd2a2d2a9adf1681c97827ef8"
+      }
+    }
+  },
+  "npm": {
+    "agentToolsPackageLock": "agent/agent-tools/package-lock.json",
+    "proxyPackageLock": "proxy/package-lock.json",
+    "pnpmVersion": "10.28.0"
+  }
+}

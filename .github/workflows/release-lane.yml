@@ -1,0 +1,252 @@
+name: Release lane
+
+# One tag resolves to one commit SHA, and every later job checks out that SHA.
+# Jobs that each re-resolve the tag can silently disagree when the tag moves
+# mid-run, which is how a release ends up publishing bytes that do not
+# correspond to the tagged source.
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: "Release tag, for example v0.5.0"
+        required: true
+        type: string
+      sha:
+        description: "Commit resolved by release discovery"
+        required: true
+        type: string
+      replace_assets:
+        description: "Manual recovery only: finish an existing draft release for the same commit"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+# The caller serializes this whole lane by tag, including completion events.
+
+env:
+  RUNFREE_BUN_VERSION: 1.3.14
+  RUNFREE_PNPM_VERSION: 10.28.0
+
+jobs:
+  resolve:
+    name: Resolve release tag
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+      version: ${{ steps.release.outputs.version }}
+      sha: ${{ steps.release.outputs.sha }}
+      targets: ${{ steps.release.outputs.targets }}
+      replace_assets: ${{ steps.release.outputs.replace_assets }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Resolve tag
+        id: release
+        env:
+          TAG: ${{ inputs.tag }}
+          EXPECTED_SHA: ${{ inputs.sha }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          REPLACE_ASSETS: ${{ inputs.replace_assets || 'false' }}
+        run: scripts/resolve-release-tag.sh
+
+  prepare:
+    name: Skip an already-published release
+    needs: resolve
+    runs-on: ubuntu-latest
+    outputs:
+      ready: ${{ steps.publication.outputs.ready }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+
+      - name: Check publication for this tag
+        id: publication
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ needs.resolve.outputs.sha }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+        run: bash scripts/prepare-release.sh
+
+  # Unit tests are the only test gate before release, run at the resolved SHA.
+  unit-tests:
+    name: Unit tests
+    needs: [resolve, prepare]
+    if: needs.prepare.outputs.ready == 'true'
+    # arm64 to match `supportedArchitectures` in pnpm-workspace.yaml; see verify.yml.
+    runs-on: ubuntu-24.04-arm
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          version: ${{ env.RUNFREE_PNPM_VERSION }}
+          run_install: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: ${{ env.RUNFREE_BUN_VERSION }}
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # A fresh clone has no `packages/*/dist` or `dist/runtime/**`, which the
+      # unit suite reads.
+      - name: Build runtime packages
+        run: pnpm run build:runtime
+
+      - name: Run unit tests
+        run: make test-unit
+
+  # Releases are ad-hoc signed, so this job needs no Apple credentials and no
+  # privileged environment.
+  build-macos:
+    name: Build and sign ${{ matrix.target }}
+    needs: [resolve, prepare, unit-tests]
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.resolve.outputs.targets) }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+
+      # Packaging runs pnpm build:runtime and generate:assets, which need the
+      # workspace dependencies. Node and Bun set up in another job do not supply
+      # them: this job installs its own.
+      - name: Set up pnpm
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          version: ${{ env.RUNFREE_PNPM_VERSION }}
+          run_install: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Set up Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: ${{ env.RUNFREE_BUN_VERSION }}
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Check package version matches tag
+        env:
+          EXPECTED_VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          package_version="$(node -e 'process.stdout.write(JSON.parse(require("fs").readFileSync("package.json", "utf8")).version)')"
+          if [ "${package_version}" != "${EXPECTED_VERSION}" ]; then
+            printf 'package.json version %s does not match release tag version %s\n' "${package_version}" "${EXPECTED_VERSION}" >&2
+            exit 1
+          fi
+
+      - name: Build macOS artifact
+        env:
+          RUNFREE_ARTIFACT_DIR: dist/release
+          RUNFREE_ARTIFACT_TARGETS: ${{ matrix.target }}
+          RUNFREE_SKIP_CHECKSUM: "1"
+        run: scripts/package-homebrew-artifacts.sh
+
+      - name: Ad-hoc sign and package macOS artifact
+        env:
+          RUNFREE_ARTIFACT_DIR: dist/release
+          RUNFREE_RELEASE_VERSION: ${{ needs.resolve.outputs.version }}
+          TARGET: ${{ matrix.target }}
+        run: scripts/sign-adhoc-macos-target.sh "${TARGET}"
+
+      # The archive and the hash of its exact bytes travel together, so the
+      # publication job can tell a repacked or substituted candidate from the
+      # one this job signed.
+      - name: Upload macOS artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release_${{ needs.resolve.outputs.tag }}_${{ matrix.target }}
+          path: |
+            dist/release/runfree-${{ needs.resolve.outputs.version }}-${{ matrix.target }}.tar.gz
+            dist/release/runfree-${{ needs.resolve.outputs.version }}-${{ matrix.target }}.tar.gz.sha256
+          if-no-files-found: error
+
+  publish:
+    name: Publish release artifacts
+    needs: [resolve, prepare, unit-tests, build-macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+
+      # Last check before anything becomes public: the tag must still name the
+      # commit this run built and signed.
+      - name: Require the tag still names the built commit
+        env:
+          TAG: ${{ needs.resolve.outputs.tag }}
+          EXPECTED_SHA: ${{ needs.resolve.outputs.sha }}
+        run: scripts/require-unmoved-tag.sh
+
+      - name: Download release artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: release_${{ needs.resolve.outputs.tag }}_*
+          path: dist/release
+          merge-multiple: true
+
+      # Re-hashes every archive and stops if it disagrees with what the signing
+      # job recorded, then writes the manifest the installer verifies against.
+      - name: Verify candidate hashes and write the checksum manifest
+        env:
+          RUNFREE_ARTIFACT_DIR: dist/release
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: scripts/checksum-release-artifacts.sh "${VERSION}"
+
+      - name: Publish GitHub release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUNFREE_ARTIFACT_DIR: ${{ github.workspace }}/dist/release
+          TAG: ${{ needs.resolve.outputs.tag }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+          SHA: ${{ needs.resolve.outputs.sha }}
+          REPLACE_ASSETS: ${{ needs.resolve.outputs.replace_assets }}
+        run: scripts/publish-release-assets.sh

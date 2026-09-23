@@ -1,0 +1,18 @@
+{
+  "version": 4,
+  "agents": {
+    "default": "claude",
+    "claude": {
+      "command": "claude --dangerously-skip-permissions --add-dir /runfree/inbox"
+    },
+    "codex": {
+      "command": "codex -c check_for_update_on_startup=false --dangerously-bypass-approvals-and-sandbox"
+    },
+    "pi": {
+      "command": "pi"
+    }
+  },
+  "runtime": {
+    "dependencyOverlays": "auto"
+  }
+}

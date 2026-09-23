@@ -1,0 +1,16 @@
+{
+  "name": "runfree-agent-tools",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-code": "2.1.280",
+    "@earendil-works/pi-coding-agent": "0.87.1",
+    "@openai/codex": "0.156.1",
+    "pnpm": "10.28.0",
+    "tsx": "4.22.3"
+  }
+}

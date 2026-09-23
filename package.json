@@ -1,0 +1,53 @@
+{
+  "name": "runfree",
+  "version": "0.5.0",
+  "private": true,
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/genged/runfree.git"
+  },
+  "bugs": {
+    "url": "https://github.com/genged/runfree/issues"
+  },
+  "homepage": "https://github.com/genged/runfree#readme",
+  "type": "module",
+  "bin": {
+    "runfree": "./bin/runfree.js"
+  },
+  "packageManager": "pnpm@10.28.0",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build:runtime": "tsx scripts/build-runtime.ts",
+    "generate:assets": "tsx scripts/generate-assets.ts",
+    "update:runtime-inputs": "tsx scripts/update-runtime-input-lock.ts",
+    "update:agent-tools": "tsx scripts/update-agent-tools.ts",
+    "build:bin": "pnpm build:runtime && pnpm run generate:assets && tsx scripts/build-bin.ts",
+    "package:homebrew": "scripts/package-homebrew-artifacts.sh",
+    "smoke:bin": "./dist/runfree help",
+    "install:bin": "pnpm install --frozen-lockfile && pnpm run build:bin && install -d -m 0755 \"${RUNFREE_INSTALL_DIR:-$HOME/.local/bin}\" && install -m 0755 dist/runfree \"${RUNFREE_INSTALL_DIR:-$HOME/.local/bin}/runfree\" && printf 'installed runfree to %s\\n' \"${RUNFREE_INSTALL_DIR:-$HOME/.local/bin}/runfree\"",
+    "check": "biome check .",
+    "test": "vitest run",
+    "test:coverage": "vitest run --coverage",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@clack/prompts": "^1.6.0",
+    "@runfree/proxy": "workspace:*",
+    "@runfree/runtime-contracts": "workspace:*",
+    "smol-toml": "^1.6.1",
+    "tsx": "^4.20.0",
+    "yargs": "^17.7.3"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.4.16",
+    "@types/node": "^22.0.0",
+    "@types/yargs": "^17.0.35",
+    "@vitest/coverage-v8": "4.1.11",
+    "typescript": "^5.9.0",
+    "vitest": "^4.1.11"
+  }
+}
