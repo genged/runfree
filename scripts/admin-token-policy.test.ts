@@ -601,6 +601,11 @@ function installTokenSyncDockerFake(options: { composeProject?: string; proxyId?
       if (env.FAKE_DOCKER_VALIDATION_MARKER === "missing") {
         return spawnResult({ status: 1, stderr: "missing runtime validation marker\n" });
       }
+      // Simulates the proxy's token store being replaced once the trigger file
+      // exists (the fake `op` creates its log on first resolution).
+      if (env.FAKE_DOCKER_MARKER_SWAP_AFTER && fs.existsSync(env.FAKE_DOCKER_MARKER_SWAP_AFTER)) {
+        return spawnResult({ stdout: JSON.stringify({ ...JSON.parse(validationMarkerJson), proofVersion: 999 }) });
+      }
       return spawnResult({ stdout: env.FAKE_DOCKER_VALIDATION_MARKER_JSON ?? validationMarkerJson });
     }
     if (env.FAKE_DOCKER_EXEC_STATUS) {
@@ -1507,6 +1512,30 @@ exit 0
       "npm_secret",
       "npm_secret",
     ]);
+  });
+
+  test("credential sync refuses the proxy write when the token store changes during resolution", async () => {
+    writeFixtureRepo({
+      hosts: ["api.github.com"],
+      tokens: { github: { description: "GitHub token", credentials: [{ host: "api.github.com", header: "Authorization", scheme: "bearer" }] } },
+    });
+    writeTokenConfig({ github: { source: "1password", ref: "op://Personal/GitHub/token" } });
+    const fakeDocker = installTokenSyncDockerFake();
+    const opLogPath = path.join(tmpBase, "swap-op.jsonl");
+    const hostOpBin = path.join(tmpBase, "swap-op-bin");
+    fs.mkdirSync(hostOpBin);
+    installFakeOp(hostOpBin, { logPath: opLogPath });
+
+    const result = await runAdmin(() => credentialSyncIntent({ verbose: false, watch: false, quiet: false, delayFirstSync: false, cacheSourceSecrets: true }), {
+      FAKE_DOCKER_LOG: fakeDocker.dockerLog,
+      FAKE_DOCKER_MARKER_SWAP_AFTER: opLogPath,
+      OP_SERVICE_ACCOUNT_TOKEN: "op-session",
+      PATH: `${fakeDocker.fakeBin}${path.delimiter}${hostOpBin}${path.delimiter}${process.env.PATH ?? ""}`,
+    });
+
+    expect(readJsonLines(opLogPath)).toHaveLength(1);
+    expect(dockerExecCalls(fakeDocker.dockerLog).map((entry) => entry.stdin)).not.toContain("onepassword-secret");
+    expect(result.status).not.toBe(0);
   });
 
   test("credential sync watch schedules non-multiple token intervals by each token's own due time", async () => {
