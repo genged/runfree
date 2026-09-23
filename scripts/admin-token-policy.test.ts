@@ -471,8 +471,9 @@ function verifyEs256Jwt(jwt: string, publicKeyPem: string): { header: Record<str
 // live proxy identity to be a real Docker object id (the control-plane rebind
 // journal only records 64-hex container ids and `runfree-<projectId>` compose
 // projects); every other caller keeps the short stand-ins.
-function installTokenSyncDockerFake(options: { composeProject?: string; proxyId?: string } = {}): { dockerLog: string; fakeBin: string } {
+function installTokenSyncDockerFake(options: { composeProject?: string; onMarkerSwap?: () => void; proxyId?: string } = {}): { dockerLog: string; fakeBin: string } {
   const proxyId = options.proxyId ?? "proxy-id";
+  const onMarkerSwap = options.onMarkerSwap;
   const composeProjectLabel = options.composeProject ?? "fake-project";
   const fakeBin = path.join(tmp, "fake-bin");
   const dockerLog = path.join(tmp, "docker-token-sync.jsonl");
@@ -480,6 +481,8 @@ function installTokenSyncDockerFake(options: { composeProject?: string; proxyId?
   // update this set, and the batched possession listing reads it, so
   // receipt-gated skips and keep-last-good behave like a real proxy.
   const fakeProxySecretStore = new Set<string>();
+  // Tmpfs writes seen per token, for FAKE_DOCKER_MARKER_SWAP_ON_WRITE.
+  const fakeProxyWriteCounts = new Map<string, number>();
   const validationMarkerJson = JSON.stringify({
     components: expectedTokenSyncComponents(),
     contractHash: expectedTokenSyncContractHash(),
@@ -555,7 +558,18 @@ function installTokenSyncDockerFake(options: { composeProject?: string; proxyId?
     }
     {
       const writeMatch = /mv '\/run\/runfree-proxy-secrets\/[^']*' '\/run\/runfree-proxy-secrets\/([^']+)'/.exec(text);
-      if (writeMatch) fakeProxySecretStore.add(writeMatch[1]);
+      if (writeMatch) {
+        fakeProxySecretStore.add(writeMatch[1]);
+        const writes = (fakeProxyWriteCounts.get(writeMatch[1]) ?? 0) + 1;
+        fakeProxyWriteCounts.set(writeMatch[1], writes);
+        // Simulates the proxy's token store being replaced right after the
+        // Nth write of the named token (default: its first write).
+        if (env.FAKE_DOCKER_MARKER_SWAP_FLAG && writeMatch[1] === env.FAKE_DOCKER_MARKER_SWAP_ON_WRITE
+          && writes === Number(env.FAKE_DOCKER_MARKER_SWAP_ON_WRITE_COUNT ?? "1")) {
+          onMarkerSwap?.();
+          fs.writeFileSync(env.FAKE_DOCKER_MARKER_SWAP_FLAG, "");
+        }
+      }
       const removeMatch = /rm -f '\/run\/runfree-proxy-secrets\/([^']+)' '\/run\/runfree-proxy-secrets\/[^']*'/.exec(text);
       if (removeMatch) fakeProxySecretStore.delete(removeMatch[1]);
     }
@@ -603,7 +617,8 @@ function installTokenSyncDockerFake(options: { composeProject?: string; proxyId?
       }
       // Simulates the proxy's token store being replaced once the trigger file
       // exists (the fake `op` creates its log on first resolution).
-      if (env.FAKE_DOCKER_MARKER_SWAP_AFTER && fs.existsSync(env.FAKE_DOCKER_MARKER_SWAP_AFTER)) {
+      const swapTrigger = env.FAKE_DOCKER_MARKER_SWAP_AFTER ?? env.FAKE_DOCKER_MARKER_SWAP_FLAG;
+      if (swapTrigger && fs.existsSync(swapTrigger)) {
         return spawnResult({ stdout: JSON.stringify({ ...JSON.parse(validationMarkerJson), proofVersion: 999 }) });
       }
       return spawnResult({ stdout: env.FAKE_DOCKER_VALIDATION_MARKER_JSON ?? validationMarkerJson });
@@ -773,6 +788,41 @@ function dockerExecCalls(logPath: string): Array<Record<string, unknown>> {
         && !args.includes("ls -1 '/run/runfree-proxy-secrets'")
         && !args.includes("request-proxy.json");
     });
+}
+
+function proxyTokenRemovalIndexes(logPath: string, tokenName?: string): number[] {
+  return readJsonLines(logPath).flatMap((entry, index) => {
+    if (!Array.isArray(entry.args) || entry.args[0] !== "exec") return [];
+    const script = String(entry.args.at(-1));
+    const removes = tokenName === undefined
+      ? script.includes("rm -f '/run/runfree-proxy-secrets/")
+      : script.includes(`rm -f '/run/runfree-proxy-secrets/${tokenName}'`);
+    return removes ? [index] : [];
+  });
+}
+
+function proxyTokenWriteIndexes(logPath: string, tokenName: string): number[] {
+  return readJsonLines(logPath).flatMap((entry, index) => Array.isArray(entry.args) && entry.args[0] === "exec"
+    && String(entry.args.at(-1)).includes(`'/run/runfree-proxy-secrets/${tokenName}'`)
+    && String(entry.args.at(-1)).includes("mv '/run/runfree-proxy-secrets/") ? [index] : []);
+}
+
+function tokenReceiptsFilePath(): string {
+  return path.join(adminStateDir(), `token-resolution-receipts-${projectHash(tmp)}.json`);
+}
+
+function tokenStatusFilePath(): string {
+  return path.join(adminStateDir(), "token-sync-status.json");
+}
+
+function exampleTokenPolicy(names: string[]): { hosts: string[]; tokens: Record<string, unknown> } {
+  return {
+    hosts: names.map((name) => `${name}.example.com`),
+    tokens: Object.fromEntries(names.map((name) => [name, {
+      description: `${name} token`,
+      credentials: [{ host: `${name}.example.com`, header: "Authorization", scheme: "bearer" }],
+    }])),
+  };
 }
 
 function expectProxyTokenRemoval(logPath: string, tokenName = "github"): void {
@@ -1536,6 +1586,130 @@ exit 0
     expect(readJsonLines(opLogPath)).toHaveLength(1);
     expect(dockerExecCalls(fakeDocker.dockerLog).map((entry) => entry.stdin)).not.toContain("onepassword-secret");
     expect(result.status).not.toBe(0);
+  });
+
+  test("credential sync watch persists nothing after the token store changes behind trailing skipped tokens", async () => {
+    // alpha is due every iteration; bravo and charlie are manual and skipped
+    // once populated. The store is replaced right after alpha's iteration-2
+    // write, so only the post-loop fence stands between the replaced store and
+    // the iteration-2 status/receipt persistence.
+    writeFixtureRepo(exampleTokenPolicy(["alpha", "bravo", "charlie"]));
+    writeTokenConfig({
+      alpha: { source: "env", env: "ALPHA_TOKEN", refreshEverySeconds: 1 },
+      bravo: { source: "1password", ref: "op://Personal/bravo/token" },
+      charlie: { source: "1password", ref: "op://Personal/charlie/token" },
+    });
+    let atSwap: { receipts: string; status: string } | undefined;
+    const fakeDocker = installTokenSyncDockerFake({
+      onMarkerSwap: () => {
+        atSwap = { receipts: fs.readFileSync(tokenReceiptsFilePath(), "utf8"), status: fs.readFileSync(tokenStatusFilePath(), "utf8") };
+      },
+    });
+    const opLogPath = path.join(tmpBase, "trailing-op.jsonl");
+    const hostOpBin = path.join(tmpBase, "trailing-op-bin");
+    fs.mkdirSync(hostOpBin);
+    installFakeOp(hostOpBin, { logPath: opLogPath });
+
+    const result = await runAdmin(() => credentialSyncIntent({ verbose: true, watch: true, quiet: false, delayFirstSync: false, cacheSourceSecrets: true }), {
+      ALPHA_TOKEN: "alpha_secret",
+      FAKE_DOCKER_LOG: fakeDocker.dockerLog,
+      FAKE_DOCKER_MARKER_SWAP_FLAG: path.join(tmpBase, "trailing-swap.flag"),
+      FAKE_DOCKER_MARKER_SWAP_ON_WRITE: "alpha",
+      FAKE_DOCKER_MARKER_SWAP_ON_WRITE_COUNT: "2",
+      OP_SERVICE_ACCOUNT_TOKEN: "op-session",
+      PATH: `${fakeDocker.fakeBin}${path.delimiter}${hostOpBin}${path.delimiter}${process.env.PATH ?? ""}`,
+      RUNFREE_TEST_TOKEN_SYNC_WATCH_ITERATIONS: "2",
+      RUNFREE_TEST_TOKEN_SYNC_WATCH_SLEEP_MS: "1",
+    });
+
+    expect(atSwap, result.stderr).toBeDefined();
+    expect(result.stderr).toContain("credential sync watch iteration failed: exact proxy or token store changed during credential resolution");
+    // bravo and charlie resolved once, in iteration 1 only.
+    expect(readJsonLines(opLogPath)).toHaveLength(2);
+    expect(fs.readFileSync(tokenStatusFilePath(), "utf8")).toBe(atSwap?.status);
+    expect(fs.readFileSync(tokenReceiptsFilePath(), "utf8")).toBe(atSwap?.receipts);
+    const swapWrite = proxyTokenWriteIndexes(fakeDocker.dockerLog, "alpha")[1];
+    expect(swapWrite).toBeDefined();
+    expect(proxyTokenRemovalIndexes(fakeDocker.dockerLog).filter((index) => index > swapWrite)).toEqual([]);
+  });
+
+  test("credential sync does not remove an unconfigured token after the token store changes", async () => {
+    writeFixtureRepo(exampleTokenPolicy(["alpha", "bravo"]));
+    writeTokenConfig({ alpha: { source: "env", env: "ALPHA_TOKEN" } });
+    const fakeDocker = installTokenSyncDockerFake();
+
+    const result = await runAdmin(() => credentialSyncIntent({ verbose: false, watch: false, quiet: false, delayFirstSync: false, cacheSourceSecrets: true }), {
+      ALPHA_TOKEN: "alpha_secret",
+      FAKE_DOCKER_LOG: fakeDocker.dockerLog,
+      FAKE_DOCKER_MARKER_SWAP_FLAG: path.join(tmpBase, "unconfigured-swap.flag"),
+      FAKE_DOCKER_MARKER_SWAP_ON_WRITE: "alpha",
+      PATH: `${fakeDocker.fakeBin}${path.delimiter}${process.env.PATH ?? ""}`,
+    });
+
+    expect(proxyTokenWriteIndexes(fakeDocker.dockerLog, "alpha")).toHaveLength(1);
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain("exact proxy or token store changed during credential resolution");
+    expect(proxyTokenRemovalIndexes(fakeDocker.dockerLog, "bravo")).toEqual([]);
+  });
+
+  test("credential sync does not remove a failed-source token after the token store changes", async () => {
+    // bravo's named source fails on the source-registry error path, which
+    // throws before the pre-resolution fence and lands in the per-token catch.
+    writeFixtureRepo(exampleTokenPolicy(["alpha", "bravo"]));
+    writeTokenConfig({
+      alpha: { source: "env", env: "ALPHA_TOKEN" },
+      bravo: { source: "named", name: "missing-cli" },
+    });
+    fs.mkdirSync(path.dirname(sourceRegistryPath()), { recursive: true });
+    fs.writeFileSync(sourceRegistryPath(), `${JSON.stringify({ "missing-cli": { type: "command" } })}\n`);
+    const fakeDocker = installTokenSyncDockerFake();
+
+    const result = await runAdmin(() => credentialSyncIntent({ verbose: false, watch: false, quiet: false, delayFirstSync: false, cacheSourceSecrets: true }), {
+      ALPHA_TOKEN: "alpha_secret",
+      FAKE_DOCKER_LOG: fakeDocker.dockerLog,
+      FAKE_DOCKER_MARKER_SWAP_FLAG: path.join(tmpBase, "failed-source-swap.flag"),
+      FAKE_DOCKER_MARKER_SWAP_ON_WRITE: "alpha",
+      PATH: `${fakeDocker.fakeBin}${path.delimiter}${process.env.PATH ?? ""}`,
+    });
+
+    expect(proxyTokenWriteIndexes(fakeDocker.dockerLog, "alpha")).toHaveLength(1);
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain("exact proxy or token store changed during credential resolution");
+    expect(proxyTokenRemovalIndexes(fakeDocker.dockerLog, "bravo")).toEqual([]);
+  });
+
+  test("credential sync observes the proxy only before token side effects", async () => {
+    writeFixtureRepo(exampleTokenPolicy(["one", "two", "three"]));
+    // three keeps the watch running (an all-manual set stops after one
+    // iteration); one and two are manual, so iteration 2 skips them.
+    writeTokenConfig({
+      one: { source: "1password", ref: "op://Personal/one/token" },
+      two: { source: "1password", ref: "op://Personal/two/token" },
+      three: { source: "env", env: "THREE_TOKEN", refreshEverySeconds: 1 },
+    });
+    const fakeDocker = installTokenSyncDockerFake();
+    const hostOpBin = path.join(tmpBase, "fence-op-bin");
+    fs.mkdirSync(hostOpBin);
+    installFakeOp(hostOpBin, { logPath: path.join(tmpBase, "fence-op.jsonl") });
+
+    const result = await runAdmin(() => credentialSyncIntent({ verbose: true, watch: true, quiet: false, delayFirstSync: false, cacheSourceSecrets: true }), {
+      FAKE_DOCKER_LOG: fakeDocker.dockerLog,
+      OP_SERVICE_ACCOUNT_TOKEN: "op-session",
+      PATH: `${fakeDocker.fakeBin}${path.delimiter}${hostOpBin}${path.delimiter}${process.env.PATH ?? ""}`,
+      RUNFREE_TEST_TOKEN_SYNC_WATCH_ITERATIONS: "2",
+      RUNFREE_TEST_TOKEN_SYNC_WATCH_SLEEP_MS: "1",
+      THREE_TOKEN: "three_secret",
+    });
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stderr).toContain("one: skipped (manual current token-store generation already populated)");
+    expect(result.stderr).toContain("two: skipped (manual current token-store generation already populated)");
+    expect(dockerExecCalls(fakeDocker.dockerLog).map((entry) => entry.stdin)).toEqual(["onepassword-secret", "onepassword-secret", "three_secret", "three_secret"]);
+    // Iteration 1 resolves all three; iteration 2 resolves three and skips one
+    // and two. A token that is not due takes no action, so it costs no proxy
+    // re-observation; each iteration pays one post-loop fence.
+    const markerReads = readJsonLines(fakeDocker.dockerLog).filter((entry) => Array.isArray(entry.args)
+      && entry.args[0] === "exec" && entry.args.join(" ").includes("cat /run/runfree-runtime-validation.json")).length;
+    expect(markerReads).toMatchInlineSnapshot(`12`);
   });
 
   test("credential sync watch schedules non-multiple token intervals by each token's own due time", async () => {
@@ -3037,6 +3211,7 @@ describe("convergent proxy token store", () => {
     installFakeOp(hostOpBin, { logPath: opLogPath, exitCode: 1, stderr: "item not found in vault\n" });
     const explicit = await runAdmin(() => credentialSyncIntent(syncInput), opEnv(fakeDocker, hostOpBin));
     expect(explicit.status).toBe(1);
+    // bravo and charlie resolved once, in iteration 1 only.
     expect(readJsonLines(opLogPath)).toHaveLength(2);
     expect(tokenRemovalCount(fakeDocker.dockerLog)).toBe(1);
   });
