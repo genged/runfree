@@ -2,6 +2,7 @@ import { performance } from "node:perf_hooks";
 import { firewallStatusPath, parseGenerationStatusLine } from "@runfree/runtime-contracts/proxy-status";
 import type { RuntimeIO } from "./types.ts";
 import { RuntimeObservationError } from "./observation-failure.ts";
+import { PROXY_CONTAINER_INSPECT_MAX_BYTES } from "./constants.ts";
 
 const READY_TIMEOUT_MS = 10_000;
 const POLL_MS = 100;
@@ -25,7 +26,7 @@ export async function waitForProxyFirewallReadiness(input: {
   let lastObservation = "no readable status";
   while (now() < deadline) {
     input.assertAuthority?.();
-    const options = { env: input.dockerEnv, shell: false as const, timeout: Math.max(1, Math.min(1000, deadline - now())), maxBuffer: 8192 };
+    const options = { env: input.dockerEnv, shell: false as const, timeout: Math.max(1, Math.min(1000, deadline - now())), maxBuffer: PROXY_CONTAINER_INSPECT_MAX_BYTES };
     const inspection = input.io.capture("docker", ["container", "inspect", input.proxyId], options);
     input.assertAuthority?.();
     let startedAt: string | undefined;

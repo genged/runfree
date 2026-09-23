@@ -16,6 +16,7 @@ import {
   type ControlPlaneEffectiveSelectionV2,
   type ControlPlaneMaterializationManifestV2,
 } from "./component-state-v2.ts";
+import { PROXY_CONTAINER_INSPECT_MAX_BYTES } from "./constants.ts";
 import { RuntimeObservationError } from "./observation-failure.ts";
 import { compileAllowedSessionAgentMaterializationsV2 } from "./session-materialization-eligibility.ts";
 import type { SessionContainerRecordV2 } from "./session-containers.ts";
@@ -24,10 +25,6 @@ import {
   executeSessionFileCommand,
   type SessionAdmissionDockerExecutor,
 } from "./session-file-publisher.ts";
-
-// One `docker container inspect` of one container; the readiness wait bounds
-// the same read at 8 KiB.
-const PROXY_INSPECT_MAX_BYTES = 64 * 1024;
 
 /**
  * The exact running incarnation of one proxy container. Read from the same
@@ -42,7 +39,7 @@ export function observeProxyStartedAt(
 ): string {
   const inspected = io.capture("docker", ["container", "inspect", proxyId], {
     ...dockerOptions,
-    maxBuffer: PROXY_INSPECT_MAX_BYTES,
+    maxBuffer: PROXY_CONTAINER_INSPECT_MAX_BYTES,
   });
   let startedAt: unknown;
   try {

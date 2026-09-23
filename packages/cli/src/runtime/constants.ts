@@ -29,3 +29,5 @@ export const SELECTED_AGENT_IMAGE_LABEL_NAMES = Object.freeze([
   RUNFREE_VERSION_LABEL,
 ] as const);
 export const RECENT_SESSION_START_MS = 5 * 60 * 1000;
+/** Upper bound for one `docker container inspect` of one proxy container. */
+export const PROXY_CONTAINER_INSPECT_MAX_BYTES = 64 * 1024;

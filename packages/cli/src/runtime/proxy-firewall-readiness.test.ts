@@ -38,6 +38,20 @@ test.each(["missing", "malformed", "stale", "wrong-generation", "unverified", "w
   expect(capture.mock.calls.flatMap(([, argv]) => argv)).not.toContain("nft");
 });
 
+test("readiness inspects the proxy under the shared 64 KiB bound", async () => {
+  const capture = vi.fn((_command: string, args: string[], _options?: { maxBuffer?: number }) => {
+    if (args[0] === "container") {
+      // A realistic Compose-labelled inspect is well past 8 KiB.
+      const labels = Object.fromEntries(Array.from({ length: 200 }, (_, index) => [`com.example.label-${index}`, "x".repeat(40)]));
+      return { status: 0, stdout: JSON.stringify([{ Id: proxyId, State: { Running: true, StartedAt: startedAt }, Config: { Labels: labels } }]), stderr: "" };
+    }
+    return { status: 0, stdout: JSON.stringify(ready), stderr: "" };
+  });
+  await expect(waitForProxyFirewallReadiness({ io: { capture }, proxyId, effectivePolicyGeneration, dockerEnv: {} })).resolves.toBeUndefined();
+  expect(capture.mock.calls[0][2]?.maxBuffer).toBe(64 * 1024);
+  expect(capture.mock.calls[0][1]).not.toContain("--format");
+});
+
 test("a lost fence stops polling before further Docker calls", async () => {
   let held = true;
   const capture = vi.fn(() => {
