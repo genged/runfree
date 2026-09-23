@@ -2,7 +2,7 @@ import { REBIND_ATTEMPT_LABEL, REBIND_TRANSACTION_LABEL } from "./container-inve
 
 import { resolveRuntimeNetwork } from "../network.ts";
 import { runfreeLog } from "../warnings.ts";
-import { runDockerExec, runDockerExecRoot } from "./attach.ts";
+import { runDockerExecRoot } from "./attach.ts";
 import { dockerClientEnvOptions, parseDockerJson, serviceContainerId } from "./docker.ts";
 import { composeProjectName, projectHash } from "./env.ts";
 import {
@@ -11,7 +11,6 @@ import {
   containerLogs,
   dockerNetworkGateways,
   dockerOptionIsTrue,
-  expectProbeSuccess,
   validateProxyFirewall,
 } from "./probes.ts";
 import {
@@ -483,12 +482,6 @@ export function validateRuntimeTopologyWithProof(
   topologyVerbose(options, "inspecting proxy PID 1 capability bounding set");
   validateProxyCapabilities(messages, context, io, proxy, proxyId, options.onBoundaryViolation);
 
-  topologyVerbose(options, "proxy egress route inspection");
-  const proxyRoute = runDockerExec(context, io, proxyId, ["ip", "-o", "route", "get", "1.1.1.1"]);
-  expectProbeSuccess(messages, "proxy egress route inspection", proxyRoute);
-  if (proxyRoute.status === 0 && proxyEgress?.IPAddress && !proxyRoute.stdout.includes(` src ${proxyEgress.IPAddress}`)) {
-    messages.push(`proxy default egress route must use proxy_egress address ${proxyEgress.IPAddress}; got ${compactDiagnostic(proxyRoute.stdout)}`);
-  }
   if (proxyEgress?.IPAddress !== runtimeNetwork.proxyEgressIp) {
     messages.push(`proxy egress IP must be ${runtimeNetwork.proxyEgressIp}; got ${proxyEgress?.IPAddress || "<none>"}`);
   }
@@ -544,6 +537,7 @@ export function validateRuntimeTopologyWithProof(
   const firewallProof = validateProxyFirewall(messages, context, io, proxyId, runtimeNetwork, {
     onProbe: (label) => topologyVerbose(options, label),
     onBoundaryViolation: options.onBoundaryViolation,
+    expectedEgressSource: proxyEgress?.IPAddress,
   });
 
   // A denied port-443 host is no longer rejected at the raw CONNECT guard: the

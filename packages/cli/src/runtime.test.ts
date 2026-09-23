@@ -3567,7 +3567,7 @@ describe("runtime command flow", () => {
       {
         "docker container inspect": 4,
         "docker container ls": 2,
-        "docker exec": 13,
+        "docker exec": 12,
         "docker image inspect": 9,
         "docker info": 1,
         "docker inspect": 5,

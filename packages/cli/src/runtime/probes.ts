@@ -15,6 +15,8 @@ export type RuntimeProbeProgressOptions = {
   onBoundaryViolation?(): void;
   onAttempt?(label: string, attempt: number, maxAttempts: number): void;
   onProbe?(label: string): void;
+  /** proxy_egress address the default route must use; checked on the batched route section. */
+  expectedEgressSource?: string;
 };
 
 function compactDiagnostic(value: string): string {
@@ -445,6 +447,9 @@ export function validateProxyFirewall(
         issues.push(`proxy egress route inspection failed: ${compactDiagnostic(egressRoute.body) || `exit ${egressRoute.exit}`}`);
       } else {
         egressIface = routeInterface(egressRoute.body);
+        if (options.expectedEgressSource && !egressRoute.body.includes(` src ${options.expectedEgressSource}`)) {
+          issues.push(`proxy default egress route must use proxy_egress address ${options.expectedEgressSource}; got ${compactDiagnostic(egressRoute.body)}`);
+        }
       }
     }
   }

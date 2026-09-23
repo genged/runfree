@@ -86,7 +86,8 @@ function firewallFixture(overrides: FirewallOverrides = {}) {
   return {
     execs,
     issues,
-    run: () => validateProxyFirewall(issues, context, io, PROXY_ID, NETWORK),
+    run: (options?: Parameters<typeof validateProxyFirewall>[5]) =>
+      validateProxyFirewall(issues, context, io, PROXY_ID, NETWORK, options),
   };
 }
 
@@ -113,6 +114,26 @@ test("firewall probes merge into one exec per identity group plus the dedicated 
   expect(proof.nftablesProofInput?.rawJson).toBe(proxyNftablesTableJson());
   expect(proof.nftablesProofInput?.internalIface).toBe("eth0");
   expect(proof.nftablesProofInput?.egressIface).toBe("eth1");
+});
+
+test("the route batch proves the default egress route uses the proxy_egress address", () => {
+  const fixture = firewallFixture({
+    routeBatch: captureResult(0, sectionOutput([
+      { exit: 0, body: `${NETWORK.agentIp} dev eth0 src ${NETWORK.proxyIp} uid 1001` },
+      { exit: 0, body: `1.1.1.1 via ${NETWORK.proxyEgressGateway} dev eth1 src 172.30.1.99 uid 1001` },
+    ])),
+  });
+  fixture.run({ expectedEgressSource: NETWORK.proxyEgressIp });
+  expect(fixture.issues).toContain(
+    `proxy default egress route must use proxy_egress address ${NETWORK.proxyEgressIp}; got 1.1.1.1 via ${NETWORK.proxyEgressGateway} dev eth1 src 172.30.1.99 uid 1001`,
+  );
+});
+
+test("a matching egress source adds no issue and no extra exec", () => {
+  const fixture = firewallFixture();
+  fixture.run({ expectedEgressSource: NETWORK.proxyEgressIp });
+  expect(fixture.issues).toEqual([]);
+  expect(fixture.execs).toHaveLength(4);
 });
 
 test("only the root Docker DNS probe retries, solo, after a lost query in the root batch", () => {
