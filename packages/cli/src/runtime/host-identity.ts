@@ -28,6 +28,11 @@ const PROCESS_START_RE = /^(?:linux:[0-9]+|darwin:[0-9]+)$/;
 
 let cachedPlatformBootId: { value: string | undefined } | undefined;
 
+// This process's own start time, once proved. A process's start never changes,
+// so only a successful own-pid probe is cached; other pids stay live questions
+// because pids are reused.
+let cachedOwnProcessStart: string | undefined;
+
 export function processAlive(pid: number): boolean {
   try {
     process.kill(pid, 0);
@@ -190,11 +195,14 @@ export function hostProcessStart(
       return PROCESS_START_RE.test(override) ? override : undefined;
     }
   }
-  return process.platform === "linux"
+  if (pid === process.pid && cachedOwnProcessStart !== undefined) return cachedOwnProcessStart;
+  const value = process.platform === "linux"
     ? readLinuxProcessStart(pid)
     : process.platform === "darwin"
       ? readDarwinProcessStart(pid, env)
       : undefined;
+  if (pid === process.pid && value !== undefined) cachedOwnProcessStart = value;
+  return value;
 }
 
 export function compareHostProcessStart(
