@@ -798,10 +798,6 @@ if (args[0] === "exec") {
     out(agentIp() + " dev eth0 src " + proxyIp() + " uid 1001\\n");
     process.exit(0);
   }
-  if (text.includes("ip -o route get 1.1.1.1")) {
-    out("1.1.1.1 via 172.31.91.1 dev eth1 src " + proxyEgressIp() + " uid 1001\\n");
-    process.exit(0);
-  }
   if (args.includes("1001:1001") && text.includes("nft list ruleset")) {
     process.stderr.write("Operation not permitted\\n");
     process.exit(1);
@@ -1851,9 +1847,6 @@ function createRuntimeIO(overrides: {
     const routeTarget = /ip -o route get ([^\s]+)/.exec(text)?.[1];
     if (args[0] === "exec" && args.includes(FAKE_PROXY_CONTAINER_ID) && routeTarget && routeTarget !== "1.1.1.1") {
       return captureResult(0, `${routeTarget} dev eth0 src ${fixedNetwork.proxyIp} uid 1001\n`);
-    }
-    if (args[0] === "exec" && args.includes(FAKE_PROXY_CONTAINER_ID) && text.includes("ip -o route get 1.1.1.1")) {
-      return captureResult(0, `1.1.1.1 via ${fixedNetwork.proxyEgressGateway} dev eth1 src ${fixedNetwork.proxyEgressIp} uid 1001\n`);
     }
     if (args[0] === "exec" && args.includes(FAKE_PROXY_CONTAINER_ID) && args.includes("1001:1001") && text.includes("nft list ruleset")) {
       return captureResult(1, "", "Operation not permitted\n");
@@ -5414,6 +5407,54 @@ describe("runtime command flow", () => {
     }, io, false, {});
 
     expect(status).toBe(1);
+    expect(io.calls.some((call) => call.command === "docker" && call.args.includes("down"))).toBe(false);
+    expect(io.calls.filter((call) => call.method === "admin").map((call) => call.args)).toEqual([["prepare"]]);
+  });
+
+  test("up rejects a proxy default egress route whose source address is not the proxy_egress address", async () => {
+    const projectRoot = path.join(tmp, "project");
+    const project = prepareProject(projectRoot);
+    const io = createRuntimeIO({
+      admin: async (args) => args[0] === "token" ? 31 : 0,
+      capture: (command, args) => {
+        const text = args.join(" ");
+        // Isolate the unprivileged route-inspection batch (no --user flag) from
+        // the root nftables/DNS batch and the server-uid denial probes, which
+        // both run under an explicit --user.
+        if (
+          command === "docker"
+          && args[0] === "exec"
+          && args.includes(FAKE_PROXY_CONTAINER_ID)
+          && !args.includes("--user")
+          && text.includes("RUNFREE_FIREWALL_SECTION")
+          && text.includes("ip -o route get 1.1.1.1")
+        ) {
+          const sections = [
+            { exit: 0, body: `${fixedNetwork.agentIp} dev eth0 src ${fixedNetwork.proxyIp} uid 1001` },
+            // Wrong source address: not fixedNetwork.proxyEgressIp.
+            { exit: 0, body: `1.1.1.1 via ${fixedNetwork.proxyEgressGateway} dev eth1 src 10.99.99.99 uid 1001` },
+          ];
+          return captureResult(0, `${sections.map((section, index) => [
+            `RUNFREE_FIREWALL_SECTION ${index} exit=${section.exit}`,
+            section.body,
+            `RUNFREE_FIREWALL_SECTION_END ${index}`,
+          ].join("\n")).join("\n")}\n`);
+        }
+        return undefined;
+      },
+    });
+
+    const status = await up( {
+      projectRoot,
+      project,
+      runtimeRoot: path.join(tmp, "runtime"),
+      env: { PATH: "/fake-bin" },
+      network: fixedNetwork,
+    }, io, false, {});
+
+    expect(status).toBe(1);
+    flushWarnings();
+    expect(vi.mocked(console.error).mock.calls.flat().join("\n")).toContain("must use proxy_egress address");
     expect(io.calls.some((call) => call.command === "docker" && call.args.includes("down"))).toBe(false);
     expect(io.calls.filter((call) => call.method === "admin").map((call) => call.args)).toEqual([["prepare"]]);
   });
