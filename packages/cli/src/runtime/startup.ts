@@ -151,6 +151,7 @@ import {
   type PreparedRuntime,
 } from "./prepared-runtime.ts";
 import { createRuntimeTimings } from "./timings.ts";
+import { createOperationHistogram, withOperationHistogram } from "./operation-histogram.ts";
 import { remedy } from "../remedies.ts";
 import { setMcpLogContext } from "./mcp.ts";
 
@@ -973,6 +974,8 @@ export async function startRuntime(
   const verbose = rebuildOptions.verbose === true;
   reportRuntimeStart(removeExisting ? "rebuilding runtime" : "starting runtime");
   const timings = createRuntimeTimings(context.env);
+  const operations = timings.enabled ? createOperationHistogram() : undefined;
+  if (operations) io = withOperationHistogram(io, operations);
   const containmentIO = io;
   const startupStartedAt = performance.now();
   const initialAdapters = createRuntimeAdapters(context, io);
@@ -1613,6 +1616,7 @@ export async function startRuntime(
     io.clearPreparedTokenSources?.(context);
     if (timings.enabled) {
       timings.report("startup-total", `${(performance.now() - startupStartedAt).toFixed(1)}ms`);
+      for (const line of operations?.lines() ?? []) timings.report("startup-ops", line);
     }
     try {
       lifecycleLock?.release();

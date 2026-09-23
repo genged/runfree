@@ -100,6 +100,7 @@ import {
 } from "./runtime/constants.ts";
 import { runtimeDryRun } from "./runtime/front.ts";
 import { repairWorktreeLinks } from "./runtime/git-layout.ts";
+import { subprocessCategory } from "./runtime/operation-histogram.ts";
 import { COMPOSE_UP_FAILURE_REMEDY, startRuntime, up } from "./runtime/startup.ts";
 import { flushWarnings, pendingWarningsForTest } from "./warnings.ts";
 
@@ -1293,6 +1294,16 @@ function runtimeIntentToArgs(intent: RuntimeAdminIntent): string[] {
     case "prepare":
       return ["prepare"];
   }
+}
+
+function dockerOperationProfile(calls: readonly RuntimeIoCall[]): Record<string, number> {
+  const profile: Record<string, number> = {};
+  for (const call of calls) {
+    if ((call.method !== "capture" && call.method !== "run") || call.command !== "docker") continue;
+    const category = subprocessCategory(call.command, call.args);
+    profile[category] = (profile[category] ?? 0) + 1;
+  }
+  return Object.fromEntries(Object.entries(profile).sort(([left], [right]) => left.localeCompare(right)));
 }
 
 function createRuntimeIO(overrides: {
@@ -3530,6 +3541,43 @@ describe("runtime command flow", () => {
       && call.command === "docker"
       && call.args[0] === "compose"
       && call.args.includes("up"))).toHaveLength(1);
+  });
+
+  // The Docker operations one warm `up` issues, by category. Each launch-cost
+  // task in local/plans/2026-09-23-launch-exit-docker-op-dedup.md shows its
+  // reduction as a diff of this snapshot; an unexplained increase is a
+  // regression, not a snapshot to refresh.
+  test("warm up Docker operation profile", async () => {
+    const projectRoot = path.join(tmp, "project");
+    const project = prepareProject(projectRoot);
+    const context: RuntimeContext = {
+      projectRoot,
+      project,
+      runtimeRoot: path.join(tmp, "runtime"),
+      env: { PATH: "/fake-bin" },
+      network: fixedNetwork,
+    };
+    const io = createRuntimeIO();
+    expect((await startRuntime(context, io, false, {})).status).toBe(0);
+    const warmStart = io.calls.length;
+    const warm = await startRuntime(context, io, false, {});
+    expect(warm.status).toBe(0);
+    expect(warm.fastPath).toBe(true);
+    expect(dockerOperationProfile(io.calls.slice(warmStart))).toMatchInlineSnapshot(`
+      {
+        "docker container inspect": 4,
+        "docker container ls": 2,
+        "docker exec": 14,
+        "docker image inspect": 9,
+        "docker info": 1,
+        "docker inspect": 5,
+        "docker network inspect": 3,
+        "docker ps": 14,
+        "docker run": 1,
+        "docker volume create": 1,
+        "docker volume inspect": 1,
+      }
+    `);
   });
 
   test("up refuses token sync when the final session-admission base-set proof is non-empty", async () => {
