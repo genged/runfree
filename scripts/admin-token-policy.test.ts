@@ -3211,7 +3211,6 @@ describe("convergent proxy token store", () => {
     installFakeOp(hostOpBin, { logPath: opLogPath, exitCode: 1, stderr: "item not found in vault\n" });
     const explicit = await runAdmin(() => credentialSyncIntent(syncInput), opEnv(fakeDocker, hostOpBin));
     expect(explicit.status).toBe(1);
-    // bravo and charlie resolved once, in iteration 1 only.
     expect(readJsonLines(opLogPath)).toHaveLength(2);
     expect(tokenRemovalCount(fakeDocker.dockerLog)).toBe(1);
   });

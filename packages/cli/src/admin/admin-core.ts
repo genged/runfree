@@ -2572,7 +2572,7 @@ function syncTokensUnderLock(
     for (const name of expectedNames) resolvePreparedRuntimeTokenSource(name, config[name], { quiet: true, sourceRegistry: config[name].source === "named" ? sourceRegistry : undefined });
   }
   const retryDelayMs = sourceRegistryError === undefined ? tokenRetryDelayMs(config, sourceRegistry) : 60_000;
-  // Fences sit directly before each side effect: the removal below, source
+  // Fences sit before each side-effect phase: the removal below, source
   // resolution, the proxy write, the failure removal, and the post-loop
   // cleanup and persistence. A token that is not due takes no action, so it
   // needs no proxy re-observation.

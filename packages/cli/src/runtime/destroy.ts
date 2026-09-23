@@ -316,7 +316,7 @@ function stopProjectLabeledContainers(input: FencedProjectDestroyInput): void {
   }
   const running = listed.stdout.trim().split(/\s+/).filter(Boolean);
   if (running.length === 0) return;
-  // One call: the daemon stops the listed containers concurrently, so N live
+  // One call: the Docker CLI issues the per-id stops concurrently, so N live
   // sessions share one grace period instead of paying for N sequential ones.
   // On any failure, fall back to exact per-container stops so each failure
   // is attributed and proven exactly as before.
