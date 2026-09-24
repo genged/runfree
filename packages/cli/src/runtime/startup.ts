@@ -1238,12 +1238,15 @@ export async function startRuntime(
     // lingering helper blocks admission as an unclaimed project container.
     // No residue costs one lstat and no Docker call.
     try {
-      reclaimHelperRunResidue({
+      const residue = reclaimHelperRunResidue({
         lifecycleLock: heldLifecycleLock,
         containmentIO,
         stateDir: preparedPlan.paths.stateDir,
         dockerEnv: dockerClientEnvOptions(preparedContext).env,
       }, preparedPlan.projectId);
+      if (residue.pending > 0) {
+        warn(`${residue.pending} killed ephemeral helper run(s) are kept until a late container create can no longer land; the next \`${remedy.up()}\` re-checks them`);
+      }
     } catch (error) {
       warn(error instanceof Error ? error.message : String(error));
       return result(1, false, preparedContext);

@@ -1271,7 +1271,7 @@ describe("helper-run records", () => {
     expect(runFencedProjectDestroy(forced.input)).toBe(0);
     expect(forced.calls).toContainEqual(["docker", "container", "rm", "--force", HELPER_ID]);
     expect(fs.existsSync(helperRunsRoot(forced.stateDir))).toBe(false);
-    expect(reclaimHelperRunResidue(fence, SESSION_TEST_PROJECT.projectId)).toBe(0);
+    expect(reclaimHelperRunResidue(fence, SESSION_TEST_PROJECT.projectId)).toEqual({ reclaimed: 0, pending: 0 });
   });
 
   test("a plain destroy that tore everything down clears the records", () => {

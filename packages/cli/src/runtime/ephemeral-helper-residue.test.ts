@@ -28,6 +28,10 @@ const NONCE = "d".repeat(32);
 const IMAGE_TAG = "runfree-agent:abc";
 const IMAGE_ID = `sha256:${"e".repeat(64)}`;
 
+// Past the pending-create grace, so an absent no-id helper is settled.
+const OLD_CREATED_AT = "2026-09-01T12:00:00.000Z";
+const NOW_MS = Date.parse("2026-09-24T12:00:00.000Z");
+
 let stateDir: string;
 
 beforeEach(() => {
@@ -47,7 +51,7 @@ function intent(overrides: Partial<HelperRunIntent> = {}): HelperRunIntent {
     network: NETWORK_ID,
     ip: "172.30.0.19",
     nonce: NONCE,
-    createdAt: "2026-09-24T12:00:00.000Z",
+    createdAt: OLD_CREATED_AT,
     ...overrides,
   } as HelperRunIntent;
 }
@@ -182,7 +186,7 @@ function fakeDocker(initial: Inspect[] = []) {
   };
 }
 
-const NO_WAIT = { sleep: () => {}, pollDeadlineMs: 0 } as const;
+const NO_WAIT = { sleep: () => {}, pollDeadlineMs: 0, wallClockMs: () => NOW_MS } as const;
 
 function runWithCid(run: HelperRun, content: string | undefined): void {
   if (content !== undefined) fs.writeFileSync(path.join(run.directory, "cid"), content);
@@ -511,7 +515,7 @@ describe("reclaimHelperRun", () => {
     expectUnconfirmed(run, docker);
 
     const next = fakeDocker([helperInspect()]);
-    expect(reclaimHelperRunResidue(next.fence(), PROJECT_ID, NO_WAIT)).toBe(1);
+    expect(reclaimHelperRunResidue(next.fence(), PROJECT_ID, NO_WAIT).reclaimed).toBe(1);
     expect(next.rmCalls()).toEqual([expect.objectContaining({ args: ["rm", "-f", HELPER_ID] })]);
     expect(fs.existsSync(run.directory)).toBe(false);
   });
@@ -653,6 +657,63 @@ describe("reclaimHelperRun", () => {
       expect(fs.existsSync(run.directory)).toBe(false);
     });
 
+    // The crash race: a client SIGKILLed while its create request is still in
+    // flight leaves no id, and the daemon can finish the create after the
+    // listing looked. So a killed client's empty listing does not settle the
+    // run until the pending-create grace has passed.
+    test.each([["empty", ""], ["absent", undefined]])(
+      "a killed client with an %s cidfile and an empty listing keeps its directory as pending",
+      (_name, content) => {
+        const docker = fakeDocker();
+        const run = createHelperRun(stateDir, intent({ createdAt: new Date(NOW_MS - 5_000).toISOString() }));
+        runWithCid(run, content);
+        expect(reclaimHelperRun(run, docker.fence(), "same-process", { ...NO_WAIT, clientKilled: true })).toBe("pending");
+        expect(docker.rmCalls()).toEqual([]);
+        expect(fs.existsSync(run.directory)).toBe(true);
+      },
+    );
+
+    test("a client that exited on its own with no id and an empty listing is settled at once", () => {
+      const docker = fakeDocker();
+      const run = createHelperRun(stateDir, intent({ createdAt: new Date(NOW_MS - 5_000).toISOString() }));
+      runWithCid(run, "");
+      expect(reclaimHelperRun(run, docker.fence(), "same-process", { ...NO_WAIT, clientKilled: false })).toBe("absent");
+      expect(fs.existsSync(run.directory)).toBe(false);
+    });
+
+    test("the next lock holder removes a late-created helper by its nonce and clears the directory", () => {
+      const run = createHelperRun(stateDir, intent({ createdAt: new Date(NOW_MS - 5_000).toISOString() }));
+      runWithCid(run, "");
+      expect(reclaimHelperRun(run, fakeDocker().fence(), "same-process", { ...NO_WAIT, clientKilled: true })).toBe("pending");
+
+      const late = fakeDocker([helperInspect({ status: "created", networks: {
+        internal: { NetworkID: "", IPAddress: "", IPAMConfig: { IPv4Address: "172.30.0.19" } },
+      } })]);
+      expect(reclaimHelperRunResidue(late.fence(), PROJECT_ID, NO_WAIT)).toEqual({ reclaimed: 1, pending: 0 });
+      expect(late.rmCalls()).toEqual([expect.objectContaining({ args: ["rm", "-f", HELPER_ID] })]);
+      expect(fs.existsSync(run.directory)).toBe(false);
+    });
+
+    test("the next lock holder keeps a young pending run without refusing, and settles it after the grace", () => {
+      const run = createHelperRun(stateDir, intent({ createdAt: new Date(NOW_MS - 5_000).toISOString() }));
+      runWithCid(run, "");
+      const young = fakeDocker();
+      expect(reclaimHelperRunResidue(young.fence(), PROJECT_ID, NO_WAIT)).toEqual({ reclaimed: 0, pending: 1 });
+      expect(young.docker().map((call) => call.args[0])).toEqual(["ps"]);
+      expect(fs.existsSync(run.directory)).toBe(true);
+
+      const later = fakeDocker();
+      expect(reclaimHelperRunResidue(later.fence(), PROJECT_ID, { ...NO_WAIT, wallClockMs: () => NOW_MS + 60 * 60_000 }))
+        .toEqual({ reclaimed: 1, pending: 0 });
+      expect(fs.existsSync(run.directory)).toBe(false);
+    });
+
+    test("a pending run whose createdAt is in the future stays pending", () => {
+      const run = createHelperRun(stateDir, intent({ createdAt: new Date(NOW_MS + 60 * 60_000).toISOString() }));
+      expect(reclaimHelperRunResidue(fakeDocker().fence(), PROJECT_ID, NO_WAIT)).toEqual({ reclaimed: 0, pending: 1 });
+      expect(fs.existsSync(run.directory)).toBe(true);
+    });
+
     test("a pre-change helper or another run's helper is never listed or removed", () => {
       const docker = fakeDocker([
         helperInspect({ id: OTHER_ID, labels: helperLabels({ "io.runfree.helper-run": undefined }) }),
@@ -684,14 +745,14 @@ describe("reclaimHelperRun", () => {
 describe("reclaimHelperRunResidue", () => {
   test("no helper-runs directory costs no Docker call and no lock assertion", () => {
     const docker = fakeDocker();
-    expect(reclaimHelperRunResidue(docker.fence(), PROJECT_ID, NO_WAIT)).toBe(0);
+    expect(reclaimHelperRunResidue(docker.fence(), PROJECT_ID, NO_WAIT).reclaimed).toBe(0);
     expect(docker.calls).toEqual([]);
   });
 
   test("an empty helper-runs directory costs no Docker call", () => {
     const docker = fakeDocker();
     fs.mkdirSync(helperRunsRoot(stateDir), { mode: 0o700 });
-    expect(reclaimHelperRunResidue(docker.fence(), PROJECT_ID, NO_WAIT)).toBe(0);
+    expect(reclaimHelperRunResidue(docker.fence(), PROJECT_ID, NO_WAIT).reclaimed).toBe(0);
     expect(docker.docker()).toEqual([]);
   });
 
@@ -699,7 +760,7 @@ describe("reclaimHelperRunResidue", () => {
     const docker = fakeDocker([helperInspect()]);
     const run = createHelperRun(stateDir, intent());
     runWithCid(run, HELPER_ID);
-    expect(reclaimHelperRunResidue(docker.fence(), PROJECT_ID, NO_WAIT)).toBe(1);
+    expect(reclaimHelperRunResidue(docker.fence(), PROJECT_ID, NO_WAIT).reclaimed).toBe(1);
     expect(docker.rmCalls()).toEqual([expect.objectContaining({ args: ["rm", "-f", HELPER_ID] })]);
     expect(fs.readdirSync(helperRunsRoot(stateDir))).toEqual([]);
   });
@@ -707,7 +768,7 @@ describe("reclaimHelperRunResidue", () => {
   test("a run directory with no intent yet (crash before the write) is removed with no Docker call", () => {
     const docker = fakeDocker();
     fs.mkdirSync(path.join(helperRunsRoot(stateDir), "run-AbC123"), { recursive: true, mode: 0o700 });
-    expect(reclaimHelperRunResidue(docker.fence(), PROJECT_ID, NO_WAIT)).toBe(0);
+    expect(reclaimHelperRunResidue(docker.fence(), PROJECT_ID, NO_WAIT).reclaimed).toBe(0);
     expect(docker.docker()).toEqual([]);
     expect(fs.readdirSync(helperRunsRoot(stateDir))).toEqual([]);
   });
@@ -779,7 +840,7 @@ describe("reclaimHelperRunResidue", () => {
     expect(fs.existsSync(run.directory)).toBe(true);
 
     const recovered = fakeDocker();
-    expect(reclaimHelperRunResidue(recovered.fence(), PROJECT_ID, NO_WAIT)).toBe(1);
+    expect(reclaimHelperRunResidue(recovered.fence(), PROJECT_ID, NO_WAIT).reclaimed).toBe(1);
     expect(recovered.rmCalls()).toEqual([]);
     expect(fs.existsSync(run.directory)).toBe(false);
   });

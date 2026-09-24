@@ -462,6 +462,34 @@ describe("runEphemeralHelper", () => {
     }
   });
 
+  test("a killed client with an empty cidfile and nothing listed keeps the run as pending; the result still fails", () => {
+    const harness = helperHarness((args) => {
+      fs.writeFileSync(args[args.indexOf("--cidfile") + 1], "");
+      return { status: 124, stdout: "", stderr: "", timedOut: true, signal: "SIGKILL" };
+    });
+    try {
+      const result = runEphemeralHelper(harness.context, harness.io, DENY_PROBE_REQUEST, harness.fence);
+      expect(result.status).toBe(124);
+      expect(harness.contained.map((args) => args[0])).toEqual(["ps"]);
+      expect(harness.runs()).toHaveLength(1);
+    } finally {
+      harness.cleanup();
+    }
+  });
+
+  test("a client that exited non-zero on its own with nothing listed clears the run", () => {
+    const harness = helperHarness((args) => {
+      fs.writeFileSync(args[args.indexOf("--cidfile") + 1], "");
+      return { status: 125, stdout: "", stderr: "Unable to find image locally" };
+    });
+    try {
+      expect(runEphemeralHelper(harness.context, harness.io, DENY_PROBE_REQUEST, harness.fence).status).toBe(125);
+      expect(harness.runs()).toEqual([]);
+    } finally {
+      harness.cleanup();
+    }
+  });
+
   test("a budget that ends during the helper still reclaims it, then rethrows the budget error", () => {
     const harness = helperHarness((_args, _options, create) => {
       create();
@@ -621,8 +649,10 @@ describe("the real-process bound", () => {
       const elapsed = performance.now() - startedAt;
       expect(elapsed).toBeLessThan(5_000);
       expect(result).toMatchObject({ status: 124, timedOut: true, signal: "SIGKILL" });
-      // The fake daemon lists nothing for the run, so absence is proven.
-      expect(state.runs()).toEqual([]);
+      // The fake daemon lists nothing for the run, but the client was killed
+      // with no container id: its create could still land, so the record is
+      // kept for the next lock holder to re-list (pending-create grace).
+      expect(state.runs()).toHaveLength(1);
     } finally {
       state.cleanup();
       bin.cleanup();

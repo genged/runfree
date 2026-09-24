@@ -270,7 +270,11 @@ export function runEphemeralHelper(
     removeHelperRunDirectory(run.directory);
   } else {
     try {
-      reclaimHelperRun(run, { ...fence, dockerEnv: fence.dockerEnv ?? dockerOptions.env }, "same-process");
+      // A client that exited on its own finished its create request; one that
+      // timed out, was signalled, or whose call threw may not have (see the
+      // pending-create grace in the reclaim).
+      const clientKilled = !outcome.ok || outcome.result.timedOut === true || outcome.result.signal !== undefined;
+      reclaimHelperRun(run, { ...fence, dockerEnv: fence.dockerEnv ?? dockerOptions.env }, "same-process", { clientKilled });
     } catch (error) {
       // Keep the run's own failure (a spent budget, a lost rebind allowance)
       // as the cause, so its failure kind survives the reclaim refusal.

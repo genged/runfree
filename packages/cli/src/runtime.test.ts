@@ -3715,6 +3715,21 @@ describe("runtime command flow", () => {
       expect(fs.existsSync(runDir)).toBe(true);
     });
 
+    test("a young pending run (killed client, no id, nothing listed) does not refuse up and is kept for re-listing", async () => {
+      const { context, runDir, lockPath } = residueContext();
+      const projectId = projectHash(context.projectRoot);
+      writeResidue(runDir, projectId, "");
+      const intentPath = path.join(runDir, "intent.json");
+      fs.writeFileSync(intentPath, JSON.stringify({ ...JSON.parse(fs.readFileSync(intentPath, "utf8")), createdAt: new Date().toISOString() }));
+      const { io } = residueDocker({ present: false, projectId, lockPath });
+
+      expect((await startRuntime(context, io, false, {})).status).toBe(0);
+      flushWarnings();
+      expect(vi.mocked(console.error).mock.calls.flat().join("\n")).toContain("killed ephemeral helper run(s) are kept");
+      expect(dockerArgs(io).some((args) => args.includes(`label=io.runfree.helper-run=${NONCE}`))).toBe(true);
+      expect(fs.existsSync(runDir)).toBe(true);
+    });
+
     test("no residue adds no Docker call: two warm starts issue the same operations", async () => {
       const { context, project } = residueContext();
       const io = createRuntimeIO();

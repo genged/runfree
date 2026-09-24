@@ -76,6 +76,10 @@ const REMOVE_TIMEOUT_MS = 10_000;
 const DEFAULT_POLL_DEADLINE_MS = 3_000;
 const POLL_INTERVAL_MS = 200;
 const MAX_BUFFER = 1024 * 1024;
+// How long after a run's createdAt a killed client's in-flight create is still
+// taken to be possible: the longest helper bound (120 s) plus a margin. Until
+// then an empty nonce listing does not settle a run that has no container id.
+export const PENDING_CREATE_GRACE_MS = 180_000;
 
 /**
  * What a helper run needs from its caller: the held lifecycle lock, the
@@ -119,7 +123,17 @@ export type HelperReclaimOptions = Readonly<{
   now?: () => number;
   /** The uid a cidfile and run directory must belong to; defaults to this process. */
   expectedUid?: number;
+  /**
+   * Whether the helper's `docker run` client may have died mid-request
+   * (timed out, signalled, or the CLI itself crashed). Defaults to true, the
+   * conservative answer; only a client that exited on its own is false.
+   */
+  clientKilled?: boolean;
+  /** Wall clock for the pending-create grace; defaults to `Date.now`. */
+  wallClockMs?: () => number;
 }>;
+
+export type HelperReclaimOutcome = "removed" | "absent" | "pending";
 
 /** Removal of a helper could not be proven; the directory was kept for the next `up`. */
 export class EphemeralHelperUnconfirmedError extends CliError {
@@ -499,7 +513,8 @@ export function removeHelperRunDirectory(directory: string): void {
 
 /**
  * Removes one run's helper, if any, by exact id, then its directory. Returns
- * whether a helper was removed or proven absent; throws
+ * whether a helper was removed or proven absent, or `pending` (directory kept)
+ * when a killed client left no id and the create may still land; throws
  * `EphemeralHelperUnconfirmedError` (directory kept) otherwise. Every failure,
  * a lost lock included, is unconfirmed: nothing is removed after it.
  */
@@ -508,7 +523,7 @@ export function reclaimHelperRun(
   fence: EphemeralHelperFence,
   mode: HelperReclaimMode,
   options: HelperReclaimOptions = {},
-): "removed" | "absent" {
+): HelperReclaimOutcome {
   const purpose = run.intent.purpose;
   let id: string | undefined;
   try {
@@ -536,6 +551,18 @@ export function reclaimHelperRun(
         id = candidate;
         if (removeProvenHelper(docker, run, candidate, mode, options) === "removed") outcome = "removed";
       }
+      // A client killed with its create request in flight leaves no id, and
+      // the daemon can still finish that create after this listing. Keep the
+      // record until the grace has passed, so the next lock holder re-lists
+      // by nonce and removes a late container. A future createdAt (clock
+      // skew) stays pending: it never settles early.
+      if (candidates.length === 0 && options.clientKilled !== false) {
+        const age = (options.wallClockMs ?? Date.now)() - Date.parse(run.intent.createdAt);
+        if (!(age > PENDING_CREATE_GRACE_MS)) {
+          fence.lifecycleLock.assertHeld();
+          return "pending";
+        }
+      }
     }
     fence.lifecycleLock.assertHeld();
     removeHelperRunDirectory(run.directory);
@@ -554,18 +581,22 @@ export function reclaimHelperRun(
  * Docker call, so a record that cannot be trusted refuses with none. Costs one
  * `lstat` and no Docker call when there is no residue.
  *
- * Returns how many run records were reclaimed.
+ * Returns how many run records were reclaimed, and how many stay pending: a
+ * killed run with no container id whose nonce listing is empty but that is
+ * younger than the pending-create grace. A pending record does not refuse the
+ * launch: it holds no authority, and a container created late carries its
+ * nonce, so a later reclaim removes it.
  */
 export function reclaimHelperRunResidue(
   fence: EphemeralHelperFence,
   expectedProjectId: string,
   options: HelperReclaimOptions = {},
-): number {
+): { reclaimed: number; pending: number } {
   const root = helperRunsRoot(fence.stateDir);
   try {
     fs.lstatSync(root);
   } catch (error) {
-    if (errorCode(error) === "ENOENT") return 0;
+    if (errorCode(error) === "ENOENT") return { reclaimed: 0, pending: 0 };
     throw untrusted(HELPER_RUNS_DIRECTORY, `unreadable: ${errorCode(error) ?? "error"}`);
   }
   const uid = currentUid(options);
@@ -575,7 +606,7 @@ export function reclaimHelperRunResidue(
     throw untrusted(HELPER_RUNS_DIRECTORY, error instanceof Error ? error.message : String(error));
   }
   const names = fs.readdirSync(root).sort();
-  if (names.length === 0) return 0;
+  if (names.length === 0) return { reclaimed: 0, pending: 0 };
   fence.lifecycleLock.assertHeld();
 
   const runs: HelperRun[] = [];
@@ -622,9 +653,10 @@ export function reclaimHelperRunResidue(
 
   for (const directory of emptyDirectories) removeHelperRunDirectory(directory);
   const failures: EphemeralHelperUnconfirmedError[] = [];
+  let pending = 0;
   for (const run of runs) {
     try {
-      reclaimHelperRun(run, fence, "crash", options);
+      if (reclaimHelperRun(run, fence, "crash", { ...options, clientKilled: true }) === "pending") pending += 1;
     } catch (error) {
       if (!(error instanceof EphemeralHelperUnconfirmedError)) throw error;
       failures.push(error);
@@ -634,5 +666,5 @@ export function reclaimHelperRunResidue(
   if (failures.length > 1) {
     throw new EphemeralHelperUnconfirmedError(failures.map((failure) => failure.message).join("\n"), { cause: failures[0] });
   }
-  return runs.length;
+  return { reclaimed: runs.length - pending, pending };
 }
