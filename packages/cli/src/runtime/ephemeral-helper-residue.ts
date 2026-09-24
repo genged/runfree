@@ -48,6 +48,7 @@ import {
   type EphemeralHelperPurpose,
 } from "./container-inventory.ts";
 import { PROJECT_ID_LABEL } from "./constants.ts";
+import { RuntimeObservationError, type RuntimeFailureKind } from "./observation-failure.ts";
 import { EPHEMERAL_HELPER_HOSTS } from "./session-container-reconciliation.ts";
 import type { ProjectLifecycleLock } from "./sessions.ts";
 import type { CaptureResult, RuntimeIO } from "./types.ts";
@@ -122,10 +123,24 @@ export type HelperReclaimOptions = Readonly<{
 
 /** Removal of a helper could not be proven; the directory was kept for the next `up`. */
 export class EphemeralHelperUnconfirmedError extends CliError {
+  /** The failure kind of the helper run's own error, when it was an observation failure. */
+  readonly failureKind?: RuntimeFailureKind;
+
   constructor(message: string, options: { cause?: unknown } = {}) {
     super(message);
     this.name = "EphemeralHelperUnconfirmedError";
     if (options.cause !== undefined) (this as { cause?: unknown }).cause = options.cause;
+    if (options.cause instanceof RuntimeObservationError) this.failureKind = options.cause.evidence.kind;
+  }
+
+  /**
+   * The same refusal, caused by the helper run's own failure (for example a
+   * spent lifecycle budget) rather than by the reclaim step, so the original
+   * error and its failure kind reach the caller.
+   */
+  withRunFailure(runFailure: unknown): EphemeralHelperUnconfirmedError {
+    const detail = runFailure instanceof Error ? runFailure.message : String(runFailure);
+    return new EphemeralHelperUnconfirmedError(`${this.message}; the helper run itself failed: ${detail}`, { cause: runFailure });
   }
 }
 

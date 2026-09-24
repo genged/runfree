@@ -486,6 +486,47 @@ describe("runEphemeralHelper", () => {
     }
   });
 
+  test("an unconfirmed reclaim after a budget failure keeps the budget error as its cause and failure kind", () => {
+    const harness = helperHarness((_args, _options, create) => {
+      create();
+      return { status: 124, stdout: "", stderr: "", timedOut: true, signal: "SIGKILL" };
+    });
+    let remaining = 90_000;
+    const budgeted = withLifecycleOperationBudget({
+      capture: (command: string, args: string[], options?: Record<string, unknown>) => {
+        const result = harness.io.capture(command, args, options);
+        remaining = 0;
+        return result;
+      },
+    } as unknown as RuntimeIO, () => remaining);
+    const fence: EphemeralHelperFence = {
+      ...harness.fence,
+      containmentIO: {
+        capture: (command: string, args: string[], options?: Record<string, unknown>) => (args[0] === "rm"
+          ? { status: 124, stdout: "", stderr: "", timedOut: true }
+          : harness.fence.containmentIO.capture(command, args, options)),
+      } as unknown as RuntimeIO,
+    };
+    try {
+      let caught: unknown;
+      try {
+        runEphemeralHelper(harness.context, budgeted, DENY_PROBE_REQUEST, fence);
+      } catch (error) {
+        caught = error;
+      }
+      expect(caught).toBeInstanceOf(EphemeralHelperUnconfirmedError);
+      const unconfirmed = caught as EphemeralHelperUnconfirmedError;
+      expect(unconfirmed.cause).toBeInstanceOf(RuntimeObservationError);
+      expect((unconfirmed.cause as RuntimeObservationError).evidence.kind).toBe("observation-unavailable");
+      expect(unconfirmed.failureKind).toBe("observation-unavailable");
+      expect(unconfirmed.message).toContain("runfree destroy --force");
+      expect(unconfirmed.message).toContain("lifecycle operation budget ended");
+      expect(harness.runs()).toHaveLength(1);
+    } finally {
+      harness.cleanup();
+    }
+  });
+
   test.each([
     ["the lifecycle budget", (io: RuntimeIO, _stateDir: string) => withLifecycleOperationBudget(io, () => 0)],
     ["the rebind allowance", (io: RuntimeIO, stateDir: string) => withRebindBudgetIO(io, stateDir,

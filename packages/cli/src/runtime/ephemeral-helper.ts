@@ -31,6 +31,7 @@ import {
 import { dockerClientEnvOptions } from "./docker.ts";
 import {
   createHelperRun,
+  EphemeralHelperUnconfirmedError,
   reclaimHelperRun,
   removeHelperRunDirectory,
   type EphemeralHelperFence,
@@ -268,7 +269,14 @@ export function runEphemeralHelper(
   if (!spawned || outcome.ok && isCleanHelperExit(outcome.result)) {
     removeHelperRunDirectory(run.directory);
   } else {
-    reclaimHelperRun(run, { ...fence, dockerEnv: fence.dockerEnv ?? dockerOptions.env }, "same-process");
+    try {
+      reclaimHelperRun(run, { ...fence, dockerEnv: fence.dockerEnv ?? dockerOptions.env }, "same-process");
+    } catch (error) {
+      // Keep the run's own failure (a spent budget, a lost rebind allowance)
+      // as the cause, so its failure kind survives the reclaim refusal.
+      if (!outcome.ok && error instanceof EphemeralHelperUnconfirmedError) throw error.withRunFailure(outcome.error);
+      throw error;
+    }
   }
   if (!outcome.ok) throw outcome.error;
   return outcome.result;
