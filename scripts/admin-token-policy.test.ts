@@ -1590,14 +1590,18 @@ exit 0
 
   test("credential sync watch persists nothing after the token store changes behind trailing skipped tokens", async () => {
     // alpha is due every iteration; bravo and charlie are manual and skipped
-    // once populated. The store is replaced right after alpha's iteration-2
-    // write, so only the post-loop fence stands between the replaced store and
-    // the iteration-2 status/receipt persistence.
+    // once populated. delta is dropped (kept in the token config but absent
+    // from the policy), so every iteration's post-loop cleanup tries to
+    // remove it. The store is replaced right after alpha's iteration-2
+    // write, so only the post-loop fence stands between the replaced store
+    // and both the iteration-2 dropped-token removal and the status/receipt
+    // persistence.
     writeFixtureRepo(exampleTokenPolicy(["alpha", "bravo", "charlie"]));
     writeTokenConfig({
       alpha: { source: "env", env: "ALPHA_TOKEN", refreshEverySeconds: 1 },
       bravo: { source: "1password", ref: "op://Personal/bravo/token" },
       charlie: { source: "1password", ref: "op://Personal/charlie/token" },
+      delta: { source: "env", env: "DELTA_TOKEN" },
     });
     let atSwap: { receipts: string; status: string } | undefined;
     const fakeDocker = installTokenSyncDockerFake({
