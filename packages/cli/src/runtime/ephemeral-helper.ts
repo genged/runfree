@@ -20,16 +20,18 @@
 
 import type { SpawnSyncOptions } from "node:child_process";
 
+import { isExactSessionSourceIpv4 } from "@runfree/runtime-contracts/session-registry";
+
 import {
   ephemeralHelperLabelArguments,
   type EphemeralHelperPurpose,
 } from "./container-inventory.ts";
 import { dockerClientEnvOptions } from "./docker.ts";
+import { EPHEMERAL_HELPER_HOSTS } from "./session-container-reconciliation.ts";
 import type { CaptureResult, RuntimeContext, RuntimeIO } from "./types.ts";
 
 const DOCKER_OBJECT_ID_PATTERN = /^[a-f0-9]{64}$/;
 const VOLUME_NAME_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/;
-const IPV4_PATTERN = /^\d{1,3}(\.\d{1,3}){3}$/;
 const DEFAULT_TIMEOUT_MS = 120_000;
 const DEFAULT_MAX_BUFFER = 4 * 1024 * 1024;
 
@@ -55,7 +57,11 @@ export type EphemeralHelperInput = Readonly<{
    * its purpose is the network.
    */
   networkId?: string;
-  /** Static IPv4 on the attached network; requires `networkId`. */
+  /**
+   * Static IPv4 on the attached network; requires `networkId`. Only a host of
+   * the reserved ephemeral-helper block is accepted, so a helper can never be
+   * pinned to a session-pool address, a fixed role, or the gateway.
+   */
   ip?: string;
   /** Named volumes to mount read-write — dependency preparation's targets. */
   volumes?: readonly Readonly<{ name: string; target: string }>[];
@@ -83,7 +89,11 @@ export function ephemeralHelperRunArguments(input: EphemeralHelperInput): string
   }
   if (input.ip !== undefined) {
     if (input.networkId === undefined) throw new Error("ephemeral helper static address requires a network");
-    if (!IPV4_PATTERN.test(input.ip)) throw new Error(`ephemeral helper address is not IPv4: ${input.ip}`);
+    if (!isExactSessionSourceIpv4(input.ip)) throw new Error(`ephemeral helper address is not IPv4: ${input.ip}`);
+    const host = Number(input.ip.slice(input.ip.lastIndexOf(".") + 1));
+    if (!(EPHEMERAL_HELPER_HOSTS as readonly number[]).includes(host)) {
+      throw new Error(`ephemeral helper address is outside the reserved ephemeral-helper block: ${input.ip}`);
+    }
   }
   for (const volume of input.volumes ?? []) {
     if (!VOLUME_NAME_PATTERN.test(volume.name)) {

@@ -20,10 +20,84 @@ import {
   type SessionContainerRecordV2,
 } from "./session-containers.ts";
 import type { CaptureResult } from "./types.ts";
+import { remedy } from "../remedies.ts";
 import { isRecord } from "../strict-primitives.ts";
 
 export const SESSION_SOURCE_IP_FIRST_HOST = 20;
 export const SESSION_CONTAINER_CONCURRENCY_CAP = 64;
+
+/**
+ * The reserved `agent_internal` hosts for the deny-probe helper, highest first
+ * so the pick stays away from the low addresses Docker hands to dynamically
+ * addressed containers. The block sits between the fixed roles (`.10`-`.12`)
+ * and the session pool, so the session allocator can never issue a helper
+ * address and no session file can name one: a helper that runs the untrusted
+ * agent image is never served as a session.
+ */
+export const EPHEMERAL_HELPER_HOSTS = [19, 18, 17, 16, 15, 14, 13] as const;
+
+if (Math.max(...EPHEMERAL_HELPER_HOSTS) >= SESSION_SOURCE_IP_FIRST_HOST
+  || (EPHEMERAL_HELPER_HOSTS as readonly number[]).some((host) => host >= 10 && host <= 12)) {
+  throw new Error("ephemeral-helper address block must sit below the session pool and clear of the fixed roles");
+}
+
+/**
+ * True only for an exact IPv4 whose host is inside the session pool
+ * (`.20` to `.20+cap-1`). Session admission refuses any other address before
+ * any side effect; this is the host-side form of the invariant that the
+ * allocator alone produces session addresses.
+ */
+export function isSessionPoolSourceIp(ip: string, cap: number = SESSION_CONTAINER_CONCURRENCY_CAP): boolean {
+  if (!Number.isSafeInteger(cap) || cap < 1 || cap > SESSION_CONTAINER_CONCURRENCY_CAP) {
+    throw new Error(`session-container cap must be between 1 and ${SESSION_CONTAINER_CONCURRENCY_CAP}`);
+  }
+  if (!isExactSessionSourceIpv4(ip)) return false;
+  const host = Number(ip.slice(ip.lastIndexOf(".") + 1));
+  return host >= SESSION_SOURCE_IP_FIRST_HOST && host <= SESSION_SOURCE_IP_FIRST_HOST + cap - 1;
+}
+
+export type EphemeralHelperAddressNetwork = Readonly<{
+  subnet: string;
+  proxyIp: string;
+  agentIp: string;
+  callbackSidecarIp: string;
+  gateways: readonly string[];
+}>;
+
+/**
+ * The deny-probe helper's pinned `agent_internal` address: the first host of
+ * the reserved block that is none of the fixed role addresses, a gateway, or
+ * an address the network inspection shows as attached. The fixed addresses are
+ * excluded explicitly because a manual runtime config may place them anywhere
+ * in the subnet. An attached address is skipped rather than refused, so a
+ * dynamically addressed ingress forwarder in the block costs nothing unless the
+ * whole block is taken.
+ */
+export function ephemeralHelperAddress(
+  network: EphemeralHelperAddressNetwork,
+  attachedIps: readonly string[],
+): string {
+  const prefix = subnet24Prefix(network.subnet);
+  for (const ip of attachedIps) {
+    if (!isExactSessionSourceIpv4(ip)) throw new Error(`agent_internal attached address is not exact IPv4: ${ip || "<empty>"}`);
+  }
+  const taken = new Set<string>([
+    network.proxyIp,
+    network.agentIp,
+    network.callbackSidecarIp,
+    ...network.gateways,
+    ...attachedIps,
+  ]);
+  for (const host of EPHEMERAL_HELPER_HOSTS) {
+    const candidate = `${prefix}.${host}`;
+    if (!taken.has(candidate)) return candidate;
+  }
+  throw new Error(
+    `no free ephemeral-helper address in ${prefix}.${Math.min(...EPHEMERAL_HELPER_HOSTS)}-.${Math.max(...EPHEMERAL_HELPER_HOSTS)} on agent_internal; `
+      + `close port forwards with \`${remedy.forwardStop()}\`, remove any other container holding those addresses, `
+      + `or run \`${remedy.destroyForce()}\``,
+  );
+}
 
 const DOCKER_OBJECT_ID_PATTERN = /^[a-f0-9]{64}$/;
 const SHA256_PATTERN = /^sha256:[a-f0-9]{64}$/;

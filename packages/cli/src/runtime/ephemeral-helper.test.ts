@@ -95,13 +95,13 @@ describe("ephemeral helper run arguments", () => {
       image: "runfree-agent:abc",
       user: "1000:1000",
       networkId: NETWORK_ID,
-      ip: "172.30.0.99",
+      ip: "172.30.0.19",
       command: ["true"],
     });
 
     expect(args).toContain(NETWORK_ID);
     expect(args.slice(args.indexOf("--network"))).toEqual(
-      expect.arrayContaining(["--network", NETWORK_ID, "--ip", "172.30.0.99"]),
+      expect.arrayContaining(["--network", NETWORK_ID, "--ip", "172.30.0.19"]),
     );
     // No capability sneaks in without being asked for.
     expect(args).not.toContain("--cap-add");
@@ -111,8 +111,17 @@ describe("ephemeral helper run arguments", () => {
     [{ image: "" }, /exact image reference/u],
     [{ image: "img with space" }, /exact image reference/u],
     [{ networkId: "abc" }, /exact 64-hex network id/u],
-    [{ ip: "172.30.0.99" }, /static address requires a network/u],
+    [{ ip: "172.30.0.19" }, /static address requires a network/u],
     [{ networkId: NETWORK_ID, ip: "not-an-ip" }, /not IPv4/u],
+    [{ networkId: NETWORK_ID, ip: "172.30.0.019" }, /not IPv4/u],
+    // A helper address is only ever one of the reserved block's hosts: never a
+    // session-pool address, a fixed role, or the gateway.
+    [{ networkId: NETWORK_ID, ip: "172.30.0.20" }, /reserved ephemeral-helper block/u],
+    [{ networkId: NETWORK_ID, ip: "172.30.0.83" }, /reserved ephemeral-helper block/u],
+    [{ networkId: NETWORK_ID, ip: "172.30.0.99" }, /reserved ephemeral-helper block/u],
+    [{ networkId: NETWORK_ID, ip: "172.30.0.10" }, /reserved ephemeral-helper block/u],
+    [{ networkId: NETWORK_ID, ip: "172.30.0.1" }, /reserved ephemeral-helper block/u],
+    [{ networkId: NETWORK_ID, ip: "172.30.0.12" }, /reserved ephemeral-helper block/u],
     [{ volumes: [{ name: "", target: "/x" }] }, /volume name is invalid/u],
     [{ volumes: [{ name: "ok", target: "relative" }] }, /volume target is invalid/u],
     [{ volumes: [{ name: "ok", target: "/x:ro" }] }, /volume target is invalid/u],

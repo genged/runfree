@@ -21,10 +21,14 @@ import {
   accountSessionAgentImageReferences,
   allocateSessionSourceIp,
   classifySessionContainerReconciliation,
+  EPHEMERAL_HELPER_HOSTS,
+  ephemeralHelperAddress,
   exactSessionContainerCleanupTarget,
   inspectSessionContainerInventory,
   parseSessionNetworkAttachments,
+  isSessionPoolSourceIp,
   SESSION_CONTAINER_CONCURRENCY_CAP,
+  SESSION_SOURCE_IP_FIRST_HOST,
   type SessionContainerSnapshot,
   type SessionNetworkAttachment,
   unreferencedSessionAgentImageIds,
@@ -208,6 +212,151 @@ describe("session source-IP allocation", () => {
       records: [provisioning()],
       attachments: [],
     })).toThrow("network attachment disagrees");
+  });
+});
+
+describe("the reserved ephemeral-helper address", () => {
+  const SUBNET = "172.31.90.0/24";
+  const DEFAULT_LAYOUT = {
+    subnet: SUBNET,
+    proxyIp: "172.31.90.10",
+    agentIp: "172.31.90.11",
+    callbackSidecarIp: "172.31.90.12",
+    gateways: ["172.31.90.1"],
+  };
+
+  test("the helper block sits wholly below the session pool and clear of the fixed roles", () => {
+    expect(Math.max(...EPHEMERAL_HELPER_HOSTS)).toBeLessThan(SESSION_SOURCE_IP_FIRST_HOST);
+    for (const reserved of [10, 11, 12]) expect(EPHEMERAL_HELPER_HOSTS).not.toContain(reserved);
+    expect([...EPHEMERAL_HELPER_HOSTS]).toEqual([19, 18, 17, 16, 15, 14, 13]);
+  });
+
+  test("the default layout gives .19", () => {
+    expect(ephemeralHelperAddress(DEFAULT_LAYOUT, [])).toBe("172.31.90.19");
+  });
+
+  test("a manual config that pins proxyIp or agentIp into the block is stepped over", () => {
+    expect(ephemeralHelperAddress({
+      ...DEFAULT_LAYOUT,
+      proxyIp: "172.31.90.19",
+      agentIp: "172.31.90.18",
+    }, [])).toBe("172.31.90.17");
+    expect(ephemeralHelperAddress({ ...DEFAULT_LAYOUT, callbackSidecarIp: "172.31.90.19" }, []))
+      .toBe("172.31.90.18");
+    expect(ephemeralHelperAddress({ ...DEFAULT_LAYOUT, gateways: ["172.31.90.19"] }, []))
+      .toBe("172.31.90.18");
+  });
+
+  test("addresses the network inspection shows as attached are skipped", () => {
+    expect(ephemeralHelperAddress(DEFAULT_LAYOUT, ["172.31.90.19", "172.31.90.18"])).toBe("172.31.90.17");
+    // An attachment in another subnet does not occupy this block.
+    expect(ephemeralHelperAddress(DEFAULT_LAYOUT, ["172.31.91.19"])).toBe("172.31.90.19");
+  });
+
+  test("an exhausted block throws naming the block and both remedies", () => {
+    const taken = EPHEMERAL_HELPER_HOSTS.map((host) => `172.31.90.${host}`);
+    let message = "";
+    try {
+      ephemeralHelperAddress(DEFAULT_LAYOUT, taken);
+    } catch (error) {
+      message = (error as Error).message;
+    }
+    expect(message).toContain("no free ephemeral-helper address in 172.31.90.13-.19 on agent_internal");
+    expect(message).toContain("runfree forward stop");
+    expect(message).toContain("runfree destroy --force");
+  });
+
+  test("refuses inputs it cannot reason about instead of guessing", () => {
+    expect(() => ephemeralHelperAddress({ ...DEFAULT_LAYOUT, subnet: "172.31.90.0/16" }, [])).toThrow();
+    expect(() => ephemeralHelperAddress(DEFAULT_LAYOUT, ["not-an-ip"])).toThrow(/attached address/);
+  });
+
+  test("property: the helper block and the session pool never intersect, for every cap", () => {
+    const layouts = [
+      DEFAULT_LAYOUT,
+      { ...DEFAULT_LAYOUT, proxyIp: "172.31.90.19", agentIp: "172.31.90.18" },
+      { ...DEFAULT_LAYOUT, agentIp: "172.31.90.20", callbackSidecarIp: "172.31.90.17" },
+      { ...DEFAULT_LAYOUT, gateways: ["172.31.90.254", "172.31.90.16"] },
+    ];
+    for (let cap = 1; cap <= SESSION_CONTAINER_CONCURRENCY_CAP; cap += 1) {
+      const poolEnd = SESSION_SOURCE_IP_FIRST_HOST + cap - 1;
+      // Every address the allocator can return: reserve the first k pool hosts
+      // so the allocator must hand out host 20+k, and leave the helper block free.
+      for (let k = 0; k < cap; k += 1) {
+        const reservedIps = Array.from({ length: k }, (_, index) => `172.31.90.${SESSION_SOURCE_IP_FIRST_HOST + index}`);
+        const ip = allocateSessionSourceIp({
+          expectedProject: PROJECT,
+          networkId: NETWORK_ID,
+          networkName: `${PROJECT.composeProject}_agent_internal`,
+          subnet: SUBNET,
+          reservedIps,
+          records: [],
+          attachments: [],
+          cap,
+        });
+        const host = Number(ip.split(".")[3]);
+        expect(EPHEMERAL_HELPER_HOSTS).not.toContain(host);
+        expect(host).toBeGreaterThanOrEqual(SESSION_SOURCE_IP_FIRST_HOST);
+        expect(host).toBeLessThanOrEqual(poolEnd);
+      }
+      // A full pool is exhaustion, never a spill into the helper block.
+      expect(() => allocateSessionSourceIp({
+        expectedProject: PROJECT,
+        networkId: NETWORK_ID,
+        networkName: `${PROJECT.composeProject}_agent_internal`,
+        subnet: SUBNET,
+        reservedIps: Array.from({ length: cap }, (_, index) => `172.31.90.${SESSION_SOURCE_IP_FIRST_HOST + index}`),
+        records: [],
+        attachments: [],
+        cap,
+      })).toThrow("pool is exhausted");
+
+      for (const layout of layouts) {
+        const fixed = new Set([layout.proxyIp, layout.agentIp, layout.callbackSidecarIp, ...layout.gateways]);
+        // Walk the block by attaching each result in turn until it is exhausted.
+        const attached: string[] = [];
+        for (;;) {
+          let ip: string;
+          try {
+            ip = ephemeralHelperAddress(layout, attached);
+          } catch {
+            break;
+          }
+          const host = Number(ip.split(".")[3]);
+          expect(host < SESSION_SOURCE_IP_FIRST_HOST || host > poolEnd).toBe(true);
+          expect(isSessionPoolSourceIp(ip, cap)).toBe(false);
+          expect(fixed.has(ip)).toBe(false);
+          expect(attached).not.toContain(ip);
+          attached.push(ip);
+        }
+        expect(attached.length).toBeGreaterThan(0);
+      }
+    }
+  });
+
+  test("the allocator's baseline still refuses an unrecorded attachment at the helper address", () => {
+    // The refusal half of I6: a helper lingering at .19 is an unknown
+    // participant for session allocation, never a reusable address.
+    const record = provisioning();
+    expect(() => allocateSessionSourceIp({
+      expectedProject: PROJECT,
+      networkId: NETWORK_ID,
+      networkName: `${PROJECT.composeProject}_agent_internal`,
+      subnet: SUBNET,
+      reservedIps: ["172.31.90.10"],
+      records: [],
+      attachments: [{ ...attachment(record), containerId: "7".repeat(64), sourceIp: "172.31.90.19" }],
+    })).toThrow("unknown Docker participant owns unreserved session-network IP 172.31.90.19");
+  });
+
+  test("isSessionPoolSourceIp accepts exactly .20 through .20+cap-1", () => {
+    expect(isSessionPoolSourceIp("172.31.90.20")).toBe(true);
+    expect(isSessionPoolSourceIp("172.31.90.83")).toBe(true);
+    for (const outside of ["172.31.90.19", "172.31.90.13", "172.31.90.1", "172.31.90.10", "172.31.90.84", "172.31.90.255", "172.31.90.020", "not-an-ip"]) {
+      expect(isSessionPoolSourceIp(outside), outside).toBe(false);
+    }
+    expect(isSessionPoolSourceIp("172.31.90.21", 1)).toBe(false);
+    expect(() => isSessionPoolSourceIp("172.31.90.20", 0)).toThrow();
   });
 });
 

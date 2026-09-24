@@ -1,6 +1,11 @@
 import { expect, test } from "vitest";
 
-import { applyDenyProbeBatchResult, denyProbeBatchScript, type DenyProbeSpec } from "./deny-probe-batch.ts";
+import {
+  applyDenyProbeBatchResult,
+  denyProbeBatchScript,
+  type DenyProbeSpec,
+  failDenyProbeBatch,
+} from "./deny-probe-batch.ts";
 import type { CaptureResult } from "./types.ts";
 
 const SPECS: DenyProbeSpec[] = [
@@ -102,4 +107,38 @@ test("oversized batch output fails closed", () => {
   applyDenyProbeBatchResult(issues, SPECS, result(0, `${records([1, 1, 1])}${"x".repeat(20_000)}`));
   expect(issues).toHaveLength(SPECS.length);
   expect(issues[0]).toContain("exceeded its bound");
+});
+
+test("a start refused for an address in use fails every probe and names the address and the remedy", () => {
+  const issues: string[] = [];
+  let violated = false;
+  applyDenyProbeBatchResult(issues, SPECS, result(
+    125,
+    "",
+    "docker: Error response from daemon: failed to set up container networking: Address already in use.",
+  ), () => { violated = true; }, "172.30.0.19");
+
+  expect(issues).toHaveLength(SPECS.length);
+  for (const [index, spec] of SPECS.entries()) {
+    const issue = issues[index] as string;
+    expect(issue.startsWith(`${spec.label} denial probe did not run: `)).toBe(true);
+    expect(issue).toContain("172.30.0.19");
+    expect(issue).toContain("agent_internal");
+    expect(issue).toContain("runfree up");
+    expect(issue).toContain("runfree destroy --force");
+  }
+  // Nothing was observed: the helper never ran, so containment must not fire.
+  expect(violated).toBe(false);
+});
+
+test("an unrelated nonzero exit keeps the raw diagnostic, not the address remedy", () => {
+  const issues: string[] = [];
+  applyDenyProbeBatchResult(issues, SPECS, result(96, "", "missing probe binary: dig"), undefined, "172.30.0.19");
+  expect(issues[0]).toBe(`${SPECS[0]?.label} denial probe did not run: missing probe binary: dig`);
+});
+
+test("a batch refused before docker run fails every probe as did-not-run with the reason", () => {
+  const issues: string[] = [];
+  failDenyProbeBatch(issues, SPECS, "no free ephemeral-helper address");
+  expect(issues).toEqual(SPECS.map((spec) => `${spec.label} denial probe did not run: no free ephemeral-helper address`));
 });
