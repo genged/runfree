@@ -71,6 +71,7 @@ import {
   removeValidatedIngressForwarders,
 } from "./runtime/ingress-forwarder-ownership.ts";
 import { createRuntimePlan } from "./runtime/plan.ts";
+import { failClosedSpawnStatus } from "./runtime/spawn-status.ts";
 import { planRuntimeUpgradeFromV2State, startRuntime } from "./runtime/startup.ts";
 import type {
   CaptureResult,
@@ -103,7 +104,7 @@ function capture(command: string, args: string[], options: childProcess.SpawnSyn
     ...options,
   });
   return {
-    status: result.status ?? 1,
+    ...failClosedSpawnStatus(result),
     stdout: typeof result.stdout === "string" ? result.stdout : "",
     stderr: typeof result.stderr === "string" ? result.stderr : "",
   };

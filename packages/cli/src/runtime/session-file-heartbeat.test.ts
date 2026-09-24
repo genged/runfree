@@ -507,6 +507,33 @@ describe("sealed inspect-and-write session file heartbeat", () => {
     }
   });
 
+  test("refuses a source IP outside the session pool before Docker is reached", async () => {
+    // C8: only the allocator's pool (.20 to .20+cap-1) may be named by a
+    // session file. The reserved helper block, the fixed roles, the gateway,
+    // and anything past the pool are refused with no inspect, write, or delete.
+    expect(attachedRecord.sourceIp).toBe("172.31.90.20");
+    for (const sourceIp of [
+      "172.31.90.19", // top of the helper block, just below the pool
+      "172.31.90.13", // bottom of the helper block
+      "172.31.90.16",
+      "172.31.90.12",
+      "172.31.90.10",
+      "172.31.90.1", // gateway
+      "172.31.90.84", // just above the pool
+      "172.31.90.254",
+    ]) {
+      const run = scripted();
+      await expect(heartbeat(run.io, { record: { ...attachedRecord, sourceIp } }), sourceIp)
+        .rejects.toThrow(/outside the session address pool/);
+      expect(run.effects, sourceIp).toEqual([]);
+    }
+
+    // The pool's top edge is not refused before Docker.
+    const edge = scripted();
+    await heartbeat(edge.io, { record: { ...attachedRecord, sourceIp: "172.31.90.83" } });
+    expect(edge.effects[0]).toBe("inspect-session-container");
+  });
+
   test("inspectedAt is read before the inspect, and Docker calls are bounded whatever the caller asks for", async () => {
     // A clock that advances on every capture: an inspectedAt read after the
     // inspection would land 1 s later and shorten nothing about the proof.

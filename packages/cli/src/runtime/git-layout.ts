@@ -7,6 +7,7 @@ import { die } from "../errors.ts";
 import type { RuntimeComposeMount } from "./compose.ts";
 import { envOptions } from "./docker.ts";
 import type { RuntimeContext, RuntimeIO } from "./types.ts";
+import { failClosedSpawnStatus } from "./spawn-status.ts";
 import { sha256Hex } from "../strict-primitives.ts";
 
 const WORKSPACE_ROOT = "/workspace";
@@ -134,8 +135,10 @@ function readGitConfigValue(filePath: string, key: string, boolean = false): str
     encoding: "utf8",
     timeout: 5_000,
   });
-  if (result.status === 1) return undefined;
-  if (result.error || result.status !== 0) {
+  // A timeout, kill or spawn error never maps to 1 here, so 1 is Git's own "not set".
+  const { status } = failClosedSpawnStatus(result);
+  if (status === 1) return undefined;
+  if (status !== 0) {
     throw new Error(`${filePath}: Git could not read ${key}: ${result.error?.message ?? result.stderr.trim()}`);
   }
   return result.stdout.replace(/\0$/, "");

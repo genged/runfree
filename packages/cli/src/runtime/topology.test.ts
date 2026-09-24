@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { expect, test } from "vitest";
+import { afterAll, expect, test } from "vitest";
 
 import {
   REQUIRED_TOPOLOGY_ASSERTIONS,
@@ -17,7 +17,12 @@ import {
   UTILITY_VERSION_LABEL,
 } from "./utility-containers.ts";
 import { projectHash } from "./env.ts";
+import type { EphemeralHelperFence } from "./ephemeral-helper.ts";
 import type { CaptureResult, RuntimeContext, RuntimeIO } from "./types.ts";
+
+// Host-owned state for the deny-probe helper's run directories.
+const HELPER_STATE_DIR = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "runfree-topology-state-")));
+afterAll(() => fs.rmSync(HELPER_STATE_DIR, { recursive: true, force: true }));
 
 function captureResult(status: number, stdout = "", stderr = ""): CaptureResult {
   return { status, stdout, stderr };
@@ -242,7 +247,7 @@ test("topology validation accepts an ActiveRuntimePlan", () => {
       subnet: "172.30.0.0/24",
     },
     paths: { policyPath: "/tmp/policy.json" },
-    project: { config: {}, paths: { policyPath: "/tmp/policy.json" } },
+    project: { config: {}, paths: { policyPath: "/tmp/policy.json", stateDir: HELPER_STATE_DIR } },
     projectId,
     projectRoot,
     projectRuntimeRoot: "/project-runtime",
@@ -442,7 +447,14 @@ test("the non-443 CONNECT probe targets a reserved non-resolving host, never a p
 });
 
 // L3: the agent-position deny probes run as ONE ephemeral helper batch.
-function denyProbeBatchPlanFixture(batch: (script: string) => CaptureResult) {
+function denyProbeBatchPlanFixture(
+  batch: (script: string) => CaptureResult,
+  internalNetworkShape: {
+    containers?: Record<string, { Name?: string; IPv4Address?: string }>;
+    ipam?: { Config: Array<{ Gateway?: string; Subnet?: string }> };
+  } = {},
+  fixtureOptions: { fence?: boolean } = {},
+) {
   const projectRoot = "/workspace/project";
   const projectId = projectHash(projectRoot);
   const project = `runfree-${projectId}`;
@@ -484,7 +496,7 @@ function denyProbeBatchPlanFixture(batch: (script: string) => CaptureResult) {
       subnet: "172.30.0.0/24",
     },
     paths: { policyPath: "/tmp/policy.json" },
-    project: { config: {}, paths: { policyPath: "/tmp/policy.json" } },
+    project: { config: {}, paths: { policyPath: "/tmp/policy.json", stateDir: HELPER_STATE_DIR } },
     projectId,
     projectRoot,
     projectRuntimeRoot: "/project-runtime",
@@ -522,7 +534,8 @@ function denyProbeBatchPlanFixture(batch: (script: string) => CaptureResult) {
       }
       if (args[0] === "network" && args[1] === "inspect" && args.includes(internalNetwork)) {
         return captureResult(0, JSON.stringify([{
-          Containers: { "proxy-id": { Name: proxyName } },
+          Containers: internalNetworkShape.containers ?? { "proxy-id": { Name: proxyName, IPv4Address: "172.30.0.10/24" } },
+          ...(internalNetworkShape.ipam ? { IPAM: internalNetworkShape.ipam } : {}),
           EnableIPv6: false,
           Id: networkId,
           Internal: true,
@@ -551,12 +564,21 @@ function denyProbeBatchPlanFixture(batch: (script: string) => CaptureResult) {
   // deny-probe batch is the only place that draws the distinction from a
   // helper's own exit codes.
   const observed = { boundaryViolated: false };
+  // The helper's fence. Its containment side answers the reclaim listing with
+  // "nothing", which is what Docker shows once a failed `--rm` helper is gone.
+  const helperFence: EphemeralHelperFence | undefined = fixtureOptions.fence === false ? undefined : {
+    lifecycleLock: { assertHeld: () => {} },
+    containmentIO: { capture: () => captureResult(0) } as unknown as RuntimeIO,
+    stateDir: HELPER_STATE_DIR,
+  };
   return {
     helperRuns,
     observed,
     run: () => validateRuntimeTopology(plan, io, {
       onBoundaryViolation: () => { observed.boundaryViolated = true; },
+      helperFence,
     }).map((issue) => issue.code),
+    messages: () => validateRuntimeTopology(plan, io, { helperFence }).map((issue) => issue.message),
   };
 }
 
@@ -573,6 +595,9 @@ test("agent-position deny probes run as one hardened helper batch", () => {
     "--user", "1000:1000", "--cap-drop", "ALL", "--network", "d".repeat(64),
   ]));
   expect(helper).not.toContain("--cap-add");
+  // Pinned to the reserved helper block, never left to Docker's dynamic pick.
+  expect(helper.slice(helper.indexOf("--network"), helper.indexOf("--network") + 4))
+    .toEqual(["--network", "d".repeat(64), "--ip", "172.30.0.19"]);
   expect(helper.join(" ")).toContain("io.runfree.helper-purpose=deny-probe");
   expect(helper.join(" ")).toContain("RUNFREE_DENY_PROBE");
   for (const code of [
@@ -635,4 +660,99 @@ test("a deny probe observed succeeding fails validation with that probe's code",
   expect(codes).not.toContain("agent-direct-dns-denied");
   // A live escape is the one deny-probe outcome that contains the proxy.
   expect(fixture.observed.boundaryViolated).toBe(true);
+});
+
+function allDeniedBatch(script: string): CaptureResult {
+  const probes = [...script.matchAll(/runfree_pid_(\d+)=\$!/g)].length;
+  return captureResult(0, `${Array.from({ length: probes }, (_, index) => `RUNFREE_DENY_PROBE ${index} exit=1`).join("\n")}\n`);
+}
+
+const DENY_PROBE_CODES = [
+  "agent-direct-tcp-denied",
+  "agent-direct-dns-denied",
+  "agent-default-route-denied",
+  "agent-host-gateway-denied",
+] as const;
+
+test("the deny-probe helper skips helper-block addresses the network inspection shows as attached", () => {
+  const fixture = denyProbeBatchPlanFixture(allDeniedBatch, {
+    containers: {
+      "proxy-id": { Name: "proxy", IPv4Address: "172.30.0.10/24" },
+      ["f".repeat(64)]: { Name: "forwarder-a", IPv4Address: "172.30.0.19/24" },
+      ["e".repeat(64)]: { Name: "forwarder-b", IPv4Address: "172.30.0.18/24" },
+    },
+    ipam: { Config: [{ Gateway: "172.30.0.17", Subnet: "172.30.0.0/24" }] },
+  });
+  fixture.run();
+
+  expect(fixture.helperRuns).toHaveLength(1);
+  const [helper] = fixture.helperRuns;
+  expect(helper[helper.indexOf("--ip") + 1]).toBe("172.30.0.16");
+});
+
+test("an exhausted helper address block fails every deny probe as did-not-run with no docker run", () => {
+  const containers: Record<string, { Name?: string; IPv4Address?: string }> = {
+    "proxy-id": { Name: "proxy", IPv4Address: "172.30.0.10/24" },
+  };
+  for (const host of [13, 14, 15, 16, 17, 18, 19]) {
+    containers[host.toString(16).padStart(64, "a")] = { Name: `squatter-${host}`, IPv4Address: `172.30.0.${host}/24` };
+  }
+  const fixture = denyProbeBatchPlanFixture(allDeniedBatch, { containers });
+  const codes = fixture.run();
+
+  expect(fixture.helperRuns).toHaveLength(0);
+  for (const code of DENY_PROBE_CODES) expect(codes).toContain(code);
+  expect(fixture.observed.boundaryViolated).toBe(false);
+});
+
+test("the exhausted-block refusal names the block and both remedies", () => {
+  const containers: Record<string, { Name?: string; IPv4Address?: string }> = {};
+  for (const host of [13, 14, 15, 16, 17, 18, 19]) {
+    containers[host.toString(16).padStart(64, "a")] = { Name: `squatter-${host}`, IPv4Address: `172.30.0.${host}/24` };
+  }
+  const fixture = denyProbeBatchPlanFixture(allDeniedBatch, { containers });
+  const messages = fixture.messages();
+
+  expect(fixture.helperRuns).toHaveLength(0);
+  const refusal = messages.find((message) => message.startsWith("agent-position direct TCP egress denial probe did not run"));
+  expect(refusal).toContain("no free ephemeral-helper address in 172.30.0.13-.19 on agent_internal");
+  expect(refusal).toContain("runfree forward stop");
+  expect(refusal).toContain("runfree destroy --force");
+});
+
+test("without the lifecycle fence the deny probes are did-not-run and no helper is started", () => {
+  const fixture = denyProbeBatchPlanFixture(allDeniedBatch, {}, { fence: false });
+  const codes = fixture.run();
+
+  expect(fixture.helperRuns).toHaveLength(0);
+  for (const code of DENY_PROBE_CODES) expect(codes).toContain(code);
+  expect(fixture.messages().some((message) => message.includes("requires the lifecycle fence"))).toBe(true);
+  expect(fixture.observed.boundaryViolated).toBe(false);
+});
+
+// Refusal, then its reclaim: with every helper-block address squatted there is
+// no `docker run` at all; once one squatter is gone the helper runs pinned to
+// exactly that freed address.
+test("an exhausted helper block refuses without docker run, and a freed address is where the helper then runs", () => {
+  const squatters = (hosts: readonly number[]) => {
+    const containers: Record<string, { Name?: string; IPv4Address?: string }> = {
+      "proxy-id": { Name: "proxy", IPv4Address: "172.30.0.10/24" },
+    };
+    for (const host of hosts) {
+      containers[host.toString(16).padStart(64, "a")] = { Name: `squatter-${host}`, IPv4Address: `172.30.0.${host}/24` };
+    }
+    return containers;
+  };
+
+  const exhausted = denyProbeBatchPlanFixture(allDeniedBatch, { containers: squatters([13, 14, 15, 16, 17, 18, 19]) });
+  const refused = exhausted.run();
+  expect(exhausted.helperRuns).toHaveLength(0);
+  for (const code of DENY_PROBE_CODES) expect(refused).toContain(code);
+
+  const freed = denyProbeBatchPlanFixture(allDeniedBatch, { containers: squatters([13, 14, 15, 17, 18, 19]) });
+  const codes = freed.run();
+  expect(freed.helperRuns).toHaveLength(1);
+  const [helper] = freed.helperRuns;
+  expect(helper[helper.indexOf("--ip") + 1]).toBe("172.30.0.16");
+  for (const code of DENY_PROBE_CODES) expect(codes).not.toContain(code);
 });

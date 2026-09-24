@@ -7,7 +7,7 @@ import { readControlApprovalSelection } from "../control/approvals.ts";
 import { containExactOwnedProxy, observeExactProxy } from "./proxy-containment.ts";
 import { withRebindBudgetIO } from "./control-plane-rebind-budget.ts";
 import { RuntimeObservationError, type RuntimeFailureKind } from "./observation-failure.ts";
-import { inspectRebindCreation } from "./control-plane-rebind-docker.ts";
+import { inspectRebindCreation, rebindParticipantIsAbsent } from "./control-plane-rebind-docker.ts";
 
 import { projectHash } from "../project-identity.ts";
 import { runfreeLog, warn } from "../warnings.ts";
@@ -114,6 +114,8 @@ import {
 import type { DenyByDefaultObservationV1 } from "./control-plane-deny-proof.ts";
 import { tokenSyncComponentEvidenceIssue } from "./upgrade-classification.ts";
 import { ensureAgentCaBundle, waitForProxyCaPublished } from "./ca-bundle.ts";
+import { EPHEMERAL_HELPER_FENCE_REQUIRED } from "./ephemeral-helper.ts";
+import { reclaimHelperRunResidue, type EphemeralHelperFence } from "./ephemeral-helper-residue.ts";
 import type {
   ActiveAgentSession,
   DockerContainerInspect,
@@ -313,7 +315,7 @@ function ensureDependencyVolumeOwnershipOrRemoveInvalid(
   context: RuntimeContext,
   io: RuntimeIO,
   docker: RuntimeDocker,
-  options: { verbose?: boolean } = {},
+  options: { verbose?: boolean; helperFence?: EphemeralHelperFence; helperImage?: string } = {},
 ): number {
   const status = ensureDependencyVolumeOwnership(context, io, docker, options);
   if (status === 0) return 0;
@@ -623,7 +625,14 @@ function validateRuntimeTopologyOrRemoveInvalid(
   context: RuntimeContext,
   io: RuntimeIO,
   docker: RuntimeDocker,
-  options: { verbose?: boolean; expectedProxyId?: string; lifecycleLock?: ProjectLifecycleLock; containmentIO?: RuntimeIO } = {},
+  options: {
+    verbose?: boolean;
+    expectedProxyId?: string;
+    lifecycleLock?: ProjectLifecycleLock;
+    containmentIO?: RuntimeIO;
+    helperFence?: EphemeralHelperFence;
+    helperImage?: string;
+  } = {},
 ): { denyByDefaultObservation?: DenyByDefaultObservationV1; status: number; failureKind?: RuntimeFailureKind } {
   let boundaryViolated = false;
   const validation = validateRuntimeTopologyWithProof(plan, io, {
@@ -631,6 +640,8 @@ function validateRuntimeTopologyOrRemoveInvalid(
     progress: options.verbose === true,
     verbose: options.verbose,
     expectedProxyId: options.expectedProxyId,
+    helperFence: options.helperFence,
+    helperImage: options.helperImage,
   });
   if (validation.issues.length === 0) {
     return {
@@ -831,6 +842,34 @@ function checkMcpOAuthCallbackPortAvailable(
   });
 }
 
+const SELECTED_IMAGE_ID_PATTERN = /^sha256:[a-f0-9]{64}$/u;
+
+/**
+ * The image an ephemeral helper runs: the bound selected image id when the
+ * plan carries the prepared session agent for this exact image reference, so
+ * the helper runs the image admission proves and its removal proof compares
+ * the immutable id (ruling D1). Otherwise the tag, authorized at removal by
+ * the reference string plus the run nonce.
+ */
+export function ephemeralHelperImage(plan: ActiveRuntimePlan): string {
+  const prepared = plan.activeRuntime.preparedSessionAgent;
+  if (prepared
+    && prepared.selectedAgentImageRef === plan.activeRuntime.agentImage
+    && SELECTED_IMAGE_ID_PATTERN.test(prepared.selectedAgentImageId)) {
+    return prepared.selectedAgentImageId;
+  }
+  return plan.activeRuntime.agentImage;
+}
+
+/** The fence every helper needs; undefined (helpers refuse) without the lock or containment IO. */
+function ephemeralHelperFence(
+  plan: ActiveRuntimePlan,
+  options: { lifecycleLock?: ProjectLifecycleLock; containmentIO?: RuntimeIO },
+): EphemeralHelperFence | undefined {
+  if (!options.lifecycleLock || !options.containmentIO) return undefined;
+  return { lifecycleLock: options.lifecycleLock, containmentIO: options.containmentIO, stateDir: plan.paths.stateDir };
+}
+
 async function prepareRuntimeForTokenSyncOrRemoveInvalid(
   activePlan: ActiveRuntimePlan,
   context: RuntimeContext,
@@ -876,6 +915,8 @@ async function prepareRuntimeForTokenSyncOrRemoveInvalid(
     return { status: 1 };
   }
   const securityContract = createRuntimeSecurityContract(activePlan);
+  const helperFence = ephemeralHelperFence(activePlan, options);
+  const helperImage = ephemeralHelperImage(activePlan);
   if (!options.readOnly) {
   const markerResetIssue = removeRuntimeValidationMarker(validationContext, io);
   if (markerResetIssue) {
@@ -897,6 +938,8 @@ async function prepareRuntimeForTokenSyncOrRemoveInvalid(
   const caBundle = timings.time("validation:ca-bundle", () => ensureAgentCaBundle(validationContext, io, {
     agentImage: activePlan.activeRuntime.agentImage,
     projectId: activePlan.projectId,
+    helperImage,
+    helperFence,
   }));
   if (caBundle !== 0) {
     warn("agent CA bundle rendering failed; new authority was refused; repair the reported inputs and retry");
@@ -919,7 +962,7 @@ async function prepareRuntimeForTokenSyncOrRemoveInvalid(
   reportRuntimeProgress("checking dependency volumes", options.verbose);
   const dependencyVolumeOwnership = timings.time(
     "validation:dependency-volumes",
-    () => ensureDependencyVolumeOwnershipOrRemoveInvalid(validationContext, io, docker, options),
+    () => ensureDependencyVolumeOwnershipOrRemoveInvalid(validationContext, io, docker, { verbose: options.verbose, helperFence, helperImage }),
   );
   if (dependencyVolumeOwnership !== 0) return { status: dependencyVolumeOwnership };
   }
@@ -942,7 +985,7 @@ async function prepareRuntimeForTokenSyncOrRemoveInvalid(
   }
   const validation = timings.time(
     "validation:topology",
-    () => validateRuntimeTopologyOrRemoveInvalid(activePlan, validationContext, io, docker, { ...options, expectedProxyId: readinessProxyId }),
+    () => validateRuntimeTopologyOrRemoveInvalid(activePlan, validationContext, io, docker, { ...options, expectedProxyId: readinessProxyId, helperFence, helperImage }),
   );
   if (validation.status !== 0) return validation;
   reportRuntimeProgress("validating runtime security contract", options.verbose);
@@ -1188,6 +1231,26 @@ export async function startRuntime(
       release() { lifecycleLock?.release(); lifecycleLock = undefined; },
     };
 
+    heldLifecycleLock.assertHeld();
+    // Design D-D: a helper-run directory present when the lock is newly
+    // acquired is residue of a run whose CLI died (invariant I5). Reclaim it
+    // before anything can run a new helper or admit a session, since a
+    // lingering helper blocks admission as an unclaimed project container.
+    // No residue costs one lstat and no Docker call.
+    try {
+      const residue = reclaimHelperRunResidue({
+        lifecycleLock: heldLifecycleLock,
+        containmentIO,
+        stateDir: preparedPlan.paths.stateDir,
+        dockerEnv: dockerClientEnvOptions(preparedContext).env,
+      }, preparedPlan.projectId);
+      if (residue.pending > 0) {
+        warn(`${residue.pending} killed ephemeral helper run(s) are kept until a late container create can no longer land; the next \`${remedy.up()}\` re-checks them`);
+      }
+    } catch (error) {
+      warn(error instanceof Error ? error.message : String(error));
+      return result(1, false, preparedContext);
+    }
     heldLifecycleLock.assertHeld();
     const currentConfig = readConfig(context.projectRoot);
     const currentPlan = createRuntimePlan(preparedContext,
@@ -1465,16 +1528,8 @@ export async function startRuntime(
             },
             proveCandidate,
             reproveCandidate,
-            participantIsAbsent: (record) => {
-              if (!record.containerId) return false;
-              heldLifecycleLock.assertHeld();
-              const found = rebindIO.capture("docker", ["ps", "--all", "--quiet", "--no-trunc", "--filter", `id=${record.containerId}`],
-                { env: activePlan.execution.dockerClientEnv, timeout: 1000, maxBuffer: 8192 });
-              heldLifecycleLock.assertHeld();
-              if (found.status !== 0 || found.stderr.trim()) throw new RuntimeObservationError({ kind: "observation-unavailable", subject: "session",
-                expectedIdentity: record.containerId, phase: "sessions-revalidated", observation: "session departure inventory is unavailable; preserve its participant receipt" });
-              return found.stdout.trim() === "";
-            },
+            participantIsAbsent: (record) => rebindParticipantIsAbsent({ containerId: record.containerId, io: rebindIO,
+              env: activePlan.execution.dockerClientEnv, assertAuthority: () => heldLifecycleLock.assertHeld() }),
             proveSession: (replacementRecord) => {
               heldLifecycleLock.assertHeld();
               const transactionCandidate = readControlPlaneRebindTransaction(
@@ -1646,6 +1701,11 @@ export async function restoreSameProxySessionAdmission(input: {
   lifecycleLock: ProjectLifecycleLock;
   proxyId: string;
   validation?: RuntimeTokenSyncPreparation;
+  /**
+   * Unbudgeted IO for helper reclaim. Required when no `validation` is given:
+   * the validation runs the ephemeral helpers, which refuse without it.
+   */
+  containmentIO?: RuntimeIO;
 }): Promise<void> {
   const { plan, io, lifecycleLock, proxyId } = input;
   const expectedProject = { projectId: plan.projectId, composeProject: plan.composeProjectName };
@@ -1672,7 +1732,19 @@ export async function restoreSameProxySessionAdmission(input: {
   }
   const context = runtimeContextFromActivePlan(plan);
   const { docker } = createRuntimeAdapters(context, io);
-  const validation = input.validation ?? await prepareRuntimeForTokenSyncOrRemoveInvalid(plan, context, io, docker, { lifecycleLock });
+  if (!input.validation) {
+    // The validation below runs ephemeral helpers, so this lock span needs the
+    // same residue reclaim `up` runs before its first helper (review C4).
+    if (!input.containmentIO) throw new Error(EPHEMERAL_HELPER_FENCE_REQUIRED);
+    reclaimHelperRunResidue({
+      lifecycleLock,
+      containmentIO: input.containmentIO,
+      stateDir: plan.paths.stateDir,
+      dockerEnv: dockerClientEnvOptions(context).env,
+    }, plan.projectId);
+  }
+  const validation = input.validation ?? await prepareRuntimeForTokenSyncOrRemoveInvalid(plan, context, io, docker,
+    { lifecycleLock, containmentIO: input.containmentIO });
   if (validation.status || !validation.proof || !validation.securityProof) {
     throw new Error("proxy restart validation failed; restore the reported runtime inputs and retry runtime reload-policy --force");
   }

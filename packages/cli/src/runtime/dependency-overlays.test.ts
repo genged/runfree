@@ -21,6 +21,7 @@ import {
   parseDependencyPrepProbeRecords,
 } from "./dependency-overlays.ts";
 import { composeProjectName } from "./env.ts";
+import type { EphemeralHelperFence } from "./ephemeral-helper.ts";
 
 let tmp: string;
 
@@ -642,9 +643,16 @@ function prepFixture(plan: ReturnType<typeof createDependencyOverlayPlan>, optio
     agentImage: "runfree-agent:selected",
     dependencyOverlayPlan: plan,
     gitLayoutPlan: { containerProjectRoot: "/workspaces/project" },
-    project: { config: { agents: { default: "claude" } } },
+    project: { config: { agents: { default: "claude" } }, paths: { stateDir: path.join(tmp, ".runfree-test-state") } },
   } as unknown as import("./types.ts").RuntimeContext;
-  return { captured, io, docker, context };
+  // The helper fence. Its containment side answers the reclaim listing with
+  // "nothing", which is what Docker shows once a failed `--rm` helper is gone.
+  const helperFence = {
+    lifecycleLock: { assertHeld: () => {} },
+    containmentIO: { capture: () => ({ status: 0, stdout: "", stderr: "" }) },
+    stateDir: path.join(tmp, ".runfree-test-state"),
+  } as unknown as EphemeralHelperFence;
+  return { captured, io, docker, context, fenced: { helperFence } };
 }
 
 describe("dependency volume ownership without an agent container", () => {
@@ -658,9 +666,9 @@ describe("dependency volume ownership without an agent container", () => {
     fs.mkdirSync(path.join(tmp, "node_modules"), { recursive: true });
     const plan = createDependencyOverlayPlan(tmp, { mode: "auto" });
     expect(plan.overlays.length).toBeGreaterThan(0);
-    const { captured, io, docker, context } = prepFixture(plan);
+    const { captured, io, docker, context, fenced } = prepFixture(plan);
 
-    const status = ensureDependencyVolumeOwnership(context, io, docker);
+    const status = ensureDependencyVolumeOwnership(context, io, docker, fenced);
 
     expect(status).toBe(0);
     // One batched volume inspection plus exactly two helper runs, no matter
@@ -711,9 +719,9 @@ describe("dependency volume ownership without an agent container", () => {
     const plan = createDependencyOverlayPlan(tmp, { mode: "auto" });
     const store = plan.storeVolumes.find((volume) => volume.target === "/home/agent/.local/share/pnpm/store");
     expect(store).toBeDefined();
-    const { captured, io, docker, context } = prepFixture(plan);
+    const { captured, io, docker, context, fenced } = prepFixture(plan);
 
-    expect(ensureDependencyVolumeOwnership(context, io, docker)).toBe(0);
+    expect(ensureDependencyVolumeOwnership(context, io, docker, fenced)).toBe(0);
     const storeVolume = `${composeProjectName(tmp)}_${store?.volume}`;
     const storeRuns = captured.filter((args) => args[0] === "run" && args.join(" ").includes(`${storeVolume}:`));
     expect(storeRuns).toHaveLength(2);
@@ -732,7 +740,7 @@ describe("dependency volume ownership without an agent container", () => {
     fs.writeFileSync(path.join(tmp, "package-lock.json"), "{}\n");
     fs.mkdirSync(path.join(tmp, "node_modules"), { recursive: true });
     const plan = createDependencyOverlayPlan(tmp, { mode: "auto" });
-    const { captured, io, docker, context } = prepFixture(plan, {
+    const { captured, io, docker, context, fenced } = prepFixture(plan, {
       volumeInspect: (names) => {
         const records = JSON.parse(validVolumeInspectJson(names)) as Record<string, unknown>[];
         records[0].Options = { device: "/host/secret", o: "bind", type: "none" };
@@ -740,7 +748,7 @@ describe("dependency volume ownership without an agent container", () => {
       },
     });
 
-    expect(ensureDependencyVolumeOwnership(context, io, docker)).toBe(1);
+    expect(ensureDependencyVolumeOwnership(context, io, docker, fenced)).toBe(1);
     expect(captured.filter((args) => args[0] === "run")).toHaveLength(0);
   });
 
@@ -749,11 +757,11 @@ describe("dependency volume ownership without an agent container", () => {
     fs.writeFileSync(path.join(tmp, "package-lock.json"), "{}\n");
     fs.mkdirSync(path.join(tmp, "node_modules"), { recursive: true });
     const plan = createDependencyOverlayPlan(tmp, { mode: "auto" });
-    const { io, docker, context } = prepFixture(plan, {
+    const { io, docker, context, fenced } = prepFixture(plan, {
       fixResult: () => ({ status: 22, stdout: "", stderr: "not-mountpoint 0\n" }),
     });
 
-    expect(ensureDependencyVolumeOwnership(context, io, docker)).toBe(22);
+    expect(ensureDependencyVolumeOwnership(context, io, docker, fenced)).toBe(22);
   });
 
   test("missing, duplicated, reordered, or extra prep records fail the launch", () => {
@@ -763,13 +771,24 @@ describe("dependency volume ownership without an agent container", () => {
     const plan = createDependencyOverlayPlan(tmp, { mode: "auto" });
     // A zero-exit fix run whose records are short one volume: no partial
     // "prepared" result may escape the strict indexed parse.
-    const { captured, io, docker, context } = prepFixture(plan, {
+    const { captured, io, docker, context, fenced } = prepFixture(plan, {
       fixResult: (count) => ({ status: 0, stdout: fixRecords(count - 1), stderr: "" }),
     });
 
-    expect(ensureDependencyVolumeOwnership(context, io, docker)).toBe(1);
+    expect(ensureDependencyVolumeOwnership(context, io, docker, fenced)).toBe(1);
     // The write probe never ran: rejection happened before the second helper.
     expect(captured.filter((args) => args[0] === "run")).toHaveLength(1);
+  });
+
+  test("refuses without the helper fence before any dependency-prep container runs", () => {
+    writeJson("package.json", { packageManager: "npm@10.0.0" });
+    fs.writeFileSync(path.join(tmp, "package-lock.json"), "{}\n");
+    fs.mkdirSync(path.join(tmp, "node_modules"), { recursive: true });
+    const plan = createDependencyOverlayPlan(tmp, { mode: "auto" });
+    const { captured, io, docker, context } = prepFixture(plan);
+
+    expect(ensureDependencyVolumeOwnership(context, io, docker)).toBe(1);
+    expect(captured.filter((args) => args[0] === "run")).toHaveLength(0);
   });
 
   test("strict record parsers reject every framing deviation", () => {

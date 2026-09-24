@@ -134,6 +134,32 @@ describe("post-mutation control activation", () => {
     expect(readActiveControlSelection(context.project)?.controlGeneration).toBe(previous.controlGeneration);
   });
 
+  test("a timed-out live-proxy discovery is not an absent proxy; a retry once Docker answers selects", async () => {
+    approveAll();
+    const previous = publishEffectivePolicyGeneration(root, context.project);
+    approveChangedProject(["example.com", "new.example.com"]);
+    // What capture returns for a Docker call that timed out even when the
+    // client itself exited 0: a non-zero status with empty output.
+    let wedged = true;
+    const io: RuntimeIO = {
+      ...unusedIo,
+      capture: (_command, args) => {
+        expect(args[0]).toBe("ps");
+        return wedged ? { status: 124, stdout: "", stderr: "", timedOut: true } : { status: 0, stdout: "", stderr: "" };
+      },
+    };
+
+    await expect(activateApprovedControlsAfterMutation(context, io))
+      .rejects.toThrow("could not identify the live proxy consumer");
+    expect(readActiveControlSelection(context.project)?.controlGeneration).toBe(previous.controlGeneration);
+
+    wedged = false;
+    const result = await activateApprovedControlsAfterMutation(context, io);
+    expect(result.kind).toBe("selected");
+    expect(result).not.toMatchObject({ controlGeneration: previous.controlGeneration });
+    expect(readActiveControlSelection(context.project)?.controlGeneration).not.toBe(previous.controlGeneration);
+  });
+
   test("can recover an invalid active selection only when explicitly requested", async () => {
     approveAll();
     const generation = publishEffectivePolicyGeneration(root, context.project);

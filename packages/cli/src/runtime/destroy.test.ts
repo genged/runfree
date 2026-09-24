@@ -25,6 +25,7 @@ import {
   type FencedProjectRebuildTeardownInput,
 } from "./destroy.ts";
 import type { RuntimeDocker } from "./docker.ts";
+import { helperRunsRoot, reclaimHelperRunResidue, type EphemeralHelperFence } from "./ephemeral-helper-residue.ts";
 import {
   SESSION_TEST_PROJECT,
   SESSION_TEST_PROJECT_ROOT,
@@ -1232,5 +1233,82 @@ describe("fenced project destroy", () => {
         expect(fs.existsSync(sessionContainerRecordsRoot(dead.stateDir))).toBe(false);
       },
     );
+  });
+});
+
+describe("helper-run records", () => {
+  const HELPER_ID = RESIDUE_CONTAINER_ID;
+  const HELPER_INTENT = JSON.stringify({
+    v: 1, projectId: SESSION_TEST_PROJECT.projectId, purpose: "deny-probe", image: "runfree-agent:crashed",
+    network: "d".repeat(64), ip: "172.30.0.19", nonce: "5".repeat(32), createdAt: "2026-09-24T12:00:00.000Z",
+  });
+
+  function writeRun(stateDir: string, name: string, files: Record<string, string>): string {
+    const runDir = path.join(helperRunsRoot(stateDir), name);
+    fs.mkdirSync(runDir, { recursive: true, mode: 0o700 });
+    for (const [file, content] of Object.entries(files)) fs.writeFileSync(path.join(runDir, file), content);
+    return runDir;
+  }
+
+  const noDocker = (): EphemeralHelperFence => ({
+    lifecycleLock: { assertHeld: () => {} },
+    containmentIO: { capture: () => { throw new Error("no Docker call expected"); } } as unknown as RuntimeIO,
+    stateDir: "",
+  });
+
+  test("--force clears untrusted records up refuses on, so the next up's reclaim is clean", () => {
+    // The refusals: an unparsable intent, and a symlinked or foreign cidfile,
+    // make up refuse with `runfree destroy --force` and no Docker call.
+    const forced = harness({ force: true, residueIds: [HELPER_ID] });
+    writeRun(forced.stateDir, "run-Torn01", { "intent.json": "{ torn" });
+    const symlinked = writeRun(forced.stateDir, "run-Link01", { "intent.json": HELPER_INTENT });
+    fs.symlinkSync(path.join(symlinked, "intent.json"), path.join(symlinked, "cid"));
+    const fence = { ...noDocker(), stateDir: forced.stateDir };
+    expect(() => reclaimHelperRunResidue(fence, SESSION_TEST_PROJECT.projectId)).toThrow(/runfree destroy --force/u);
+
+    // The reclaim: destroy --force removes every project container (the
+    // helper among them), then the records.
+    expect(runFencedProjectDestroy(forced.input)).toBe(0);
+    expect(forced.calls).toContainEqual(["docker", "container", "rm", "--force", HELPER_ID]);
+    expect(fs.existsSync(helperRunsRoot(forced.stateDir))).toBe(false);
+    expect(reclaimHelperRunResidue(fence, SESSION_TEST_PROJECT.projectId)).toEqual({ reclaimed: 0, pending: 0 });
+  });
+
+  test("a plain destroy that tore everything down clears the records", () => {
+    const { input, stateDir } = harness();
+    writeRun(stateDir, "run-Gone01", { "intent.json": HELPER_INTENT });
+
+    expect(runFencedProjectDestroy(input)).toBe(0);
+    expect(fs.existsSync(helperRunsRoot(stateDir))).toBe(false);
+  });
+
+  test("a destroy that leaves project residue keeps the records for the next up", () => {
+    const plain = harness({ residueIds: [HELPER_ID], residueRunning: false });
+    const plainRun = writeRun(plain.stateDir, "run-Kept01", { "intent.json": HELPER_INTENT, cid: HELPER_ID });
+    expect(runFencedProjectDestroy(plain.input)).toBe(1);
+    expect(fs.existsSync(plainRun)).toBe(true);
+
+    const forced = harness({ force: true, residueIds: [HELPER_ID] });
+    const forcedRun = writeRun(forced.stateDir, "run-Kept02", { "intent.json": HELPER_INTENT, cid: HELPER_ID });
+    const capture = forced.input.io.capture as ReturnType<typeof vi.fn>;
+    const original = capture.getMockImplementation() as (command: string, args: string[]) => CaptureResult;
+    capture.mockImplementation((command: string, args: string[]) => (
+      args[0] === "container" && args[1] === "rm" && args.at(-1) === HELPER_ID
+        ? { status: 1, stdout: "", stderr: "daemon busy" }
+        : original(command, args)
+    ));
+    expect(runFencedProjectDestroy(forced.input)).toBe(1);
+    expect(fs.existsSync(forcedRun)).toBe(true);
+  });
+
+  test("a symlinked helper-runs root is unlinked, never followed", () => {
+    const { input, stateDir } = harness({ force: true });
+    const elsewhere = temporaryState();
+    fs.writeFileSync(path.join(elsewhere, "keep"), "x");
+    fs.symlinkSync(elsewhere, helperRunsRoot(stateDir));
+
+    expect(runFencedProjectDestroy(input)).toBe(0);
+    expect(fs.existsSync(helperRunsRoot(stateDir))).toBe(false);
+    expect(fs.readFileSync(path.join(elsewhere, "keep"), "utf8")).toBe("x");
   });
 });

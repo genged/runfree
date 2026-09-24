@@ -26,6 +26,7 @@
 // shell — exactly like the per-probe helpers it replaces — so its stdout is
 // framing evidence for the host to judge, never authority.
 
+import { remedy } from "../remedies.ts";
 import type { CaptureResult } from "./types.ts";
 
 export type DenyProbeSpec = Readonly<{
@@ -82,24 +83,57 @@ function compactDiagnostic(value: string): string {
   return `${compact.slice(0, 497)}...`;
 }
 
+// The daemon's own refusal, as the Docker CLI prints it on stderr. Only the
+// run's stderr is read, and only with the CLI's own error status (125): the
+// helper's stdout is untrusted-image output. The helper also shares stderr,
+// so a spoofed line can at most change this diagnostic's wording; the batch
+// fails as did-not-run either way.
+const ADDRESS_IN_USE_PATTERN = /^(?:docker: )?Error response from daemon:.*address already in use/imu;
+const DOCKER_CLI_ERROR_STATUS = 125;
+
+/**
+ * Fails every probe of a batch as did-not-run: one issue PER probe, each
+ * keeping its probe's label so the topology issue codes stay per-probe. Also
+ * the refusal path for a batch that was never started (no helper address).
+ */
+export function failDenyProbeBatch(issues: string[], specs: readonly DenyProbeSpec[], detail: string): void {
+  for (const spec of specs) {
+    issues.push(`${spec.label} denial probe did not run${detail ? `: ${detail}` : ""}`);
+  }
+}
+
+function addressInUseDiagnostic(helperAddress: string | undefined): string {
+  const address = helperAddress ?? "the pinned ephemeral-helper address";
+  return `ephemeral-helper address ${address} on agent_internal is already in use; retry \`${remedy.up()}\`, `
+    + `or, if a container Runfree does not own holds ${address} on agent_internal, remove it or run \`${remedy.destroyForce()}\``;
+}
+
 /**
  * Judges one batch run. Batch-harness failures push one did-not-run issue PER
  * probe — every denial in the batch is unproven, and each issue keeps its
- * probe's label so the topology issue codes stay per-probe.
+ * probe's label so the topology issue codes stay per-probe. `helperAddress` is
+ * the helper's pinned `--ip`, named when Docker refused the start because
+ * another container holds it.
  */
 export function applyDenyProbeBatchResult(
   issues: string[],
   specs: readonly DenyProbeSpec[],
   result: CaptureResult,
   onBoundaryViolation?: () => void,
+  helperAddress?: string,
 ): void {
-  const batchFailure = (detail: string): void => {
-    for (const spec of specs) {
-      issues.push(`${spec.label} denial probe did not run${detail ? `: ${detail}` : ""}`);
+  const batchFailure = (detail: string): void => failDenyProbeBatch(issues, specs, detail);
+  if (result.status !== 0 || result.timedOut === true || result.signal !== undefined) {
+    if (result.status === DOCKER_CLI_ERROR_STATUS && ADDRESS_IN_USE_PATTERN.test(result.stderr)) {
+      batchFailure(addressInUseDiagnostic(helperAddress));
+      return;
     }
-  };
-  if (result.status !== 0) {
-    batchFailure(compactDiagnostic(`${result.stderr}\n${result.stdout}`) || `deny probe batch exited ${result.status}`);
+    if (result.timedOut === true || result.signal !== undefined) {
+      batchFailure(`deny probe batch did not finish (${result.timedOut === true ? "timed out" : `killed by ${result.signal}`})`);
+      return;
+    }
+    const diagnostic = `${result.stderr}\n${result.stdout}`;
+    batchFailure(compactDiagnostic(diagnostic) || `deny probe batch exited ${result.status}`);
     return;
   }
   if (Buffer.byteLength(result.stdout) > DENY_PROBE_OUTPUT_MAX_BYTES) {

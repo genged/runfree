@@ -17,6 +17,7 @@ import {
   applyDenyProbeBatchResult,
   denyProbeBatchScript,
   type DenyProbeSpec,
+  failDenyProbeBatch,
 } from "./deny-probe-batch.ts";
 import { mcpOAuthCallbackPort } from "./mcp.ts";
 import { validateInternalNetworkParticipants } from "./utility-containers.ts";
@@ -32,7 +33,8 @@ import {
   observeDenyByDefaultViaFirewallV1,
   type DenyByDefaultObservationV1,
 } from "./control-plane-deny-proof.ts";
-import { runEphemeralHelper } from "./ephemeral-helper.ts";
+import { EPHEMERAL_HELPER_FENCE_REQUIRED, runEphemeralHelper, type EphemeralHelperFence } from "./ephemeral-helper.ts";
+import { ephemeralHelperAddress } from "./session-container-reconciliation.ts";
 
 export type RuntimeTopologyIssue = {
   code: string;
@@ -51,6 +53,10 @@ export type RuntimeTopologyOptions = {
   verbose?: boolean;
   expectedProxyId?: string;
   onBoundaryViolation?(): void;
+  /** Required for the deny-probe helper; without it the probes do not run. */
+  helperFence?: EphemeralHelperFence;
+  /** The image the helper runs: the bound selected image id when known. */
+  helperImage?: string;
 };
 
 export type RuntimeTopologyValidationResult = Readonly<{
@@ -518,15 +524,41 @@ export function validateRuntimeTopologyWithProof(
       });
     }
     for (const spec of probeSpecs) topologyVerbose(options, `${spec.label} denial probe (batched)`);
-    const batch = runEphemeralHelper(context, io, {
-      purpose: "deny-probe",
-      projectId,
-      image: input.activeRuntime.agentImage,
-      user: "1000:1000",
-      networkId: network.Id as string,
-      command: ["bash", "-c", denyProbeBatchScript(probeSpecs)],
-    });
-    applyDenyProbeBatchResult(messages, probeSpecs, batch, options.onBoundaryViolation);
+    // The helper runs the untrusted agent image on agent_internal, so it is
+    // pinned to the reserved block below the session pool instead of taking
+    // Docker's dynamic pick, which could be a session's address. The attached
+    // addresses come from the network inspection above: no extra Docker call.
+    let helperIp: string | undefined;
+    try {
+      helperIp = ephemeralHelperAddress(
+        {
+          subnet: runtimeNetwork.subnet,
+          proxyIp: runtimeNetwork.proxyIp,
+          agentIp: runtimeNetwork.agentIp,
+          callbackSidecarIp: runtimeNetwork.callbackSidecarIp,
+          gateways: dockerNetworkGateways(network),
+        },
+        Object.values(network.Containers ?? {})
+          .map((endpoint) => endpoint.IPv4Address?.split("/")[0] ?? "")
+          .filter((address) => address !== ""),
+      );
+    } catch (error) {
+      failDenyProbeBatch(messages, probeSpecs, error instanceof Error ? error.message : String(error));
+    }
+    if (helperIp !== undefined && options.helperFence === undefined) {
+      failDenyProbeBatch(messages, probeSpecs, EPHEMERAL_HELPER_FENCE_REQUIRED);
+    } else if (helperIp !== undefined) {
+      const batch = runEphemeralHelper(context, io, {
+        purpose: "deny-probe",
+        projectId,
+        image: options.helperImage ?? input.activeRuntime.agentImage,
+        user: "1000:1000",
+        networkId: network.Id as string,
+        ip: helperIp,
+        command: ["bash", "-c", denyProbeBatchScript(probeSpecs)],
+      }, options.helperFence);
+      applyDenyProbeBatchResult(messages, probeSpecs, batch, options.onBoundaryViolation, helperIp);
+    }
   }
 
   // The firewall proof fetches and validates the live kernel nft table. It runs

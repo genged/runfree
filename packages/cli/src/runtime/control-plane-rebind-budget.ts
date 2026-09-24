@@ -1,3 +1,4 @@
+import { checkBeforeSpawn } from "./io-refusal.ts";
 import type { RuntimeIO } from "./types.ts";
 import { readControlPlaneRebindTransaction } from "./control-plane-rebind.ts";
 import { RebindRecoveryExhaustedError } from "./control-plane-rebind-recovery.ts";
@@ -38,15 +39,15 @@ export function withRebindBudgetIO(io: RuntimeIO, stateDir: string, project: Ses
       // defensive stop remains available for proved containment after expiry.
       if (command === "docker" && (["create", "run", "start", "restart", "rm", "cp", "compose"].includes(args[0])
         || args[0] === "container" && ["create", "start", "restart", "rm"].includes(args[1])
-        || ["network", "volume"].includes(args[0]) && ["create", "connect", "disconnect", "rm"].includes(args[1]))) assertMutationAllowance();
-      const budget = remaining();
+        || ["network", "volume"].includes(args[0]) && ["create", "connect", "disconnect", "rm"].includes(args[1]))) checkBeforeSpawn(assertMutationAllowance);
+      const budget = checkBeforeSpawn(remaining);
       const result = io.capture(command, args, { ...options, timeout: Math.min(options.timeout ?? budget, budget) });
       remaining();
       return result;
     },
     run(command, args, options = {}) {
-      assertMutationAllowance();
-      const budget = remaining();
+      checkBeforeSpawn(assertMutationAllowance);
+      const budget = checkBeforeSpawn(remaining);
       const result = io.run(command, args, { ...options, timeout: Math.min(options.timeout ?? budget, budget) });
       remaining();
       return result;

@@ -60,3 +60,44 @@ test.each(Object.keys(ownedLabels))("the expected id under a foreign %s is never
   expect(() => containExactOwnedProxy({ ...subject, io: { capture }, assertAuthority: () => undefined })).toThrow("ownership does not match");
   expect(capture.mock.calls.some(([, args]) => args[0] === "stop")).toBe(false);
 });
+
+// What capture returns for a Docker call that timed out (or was killed) even
+// when the client itself exited 0: a non-zero status with empty output.
+const timedOut = (): CaptureResult => ({ status: 124, stdout: "", stderr: "", timedOut: true });
+
+test.each(["inventory", "inspect", "stop", "re-observe"] as const)(
+  "a timed-out %s never reads as absent or contained; a retry once Docker answers contains the exact proxy", (stage) => {
+    let wedged = true;
+    let running = true;
+    let psCalls = 0;
+    const capture = vi.fn((_command: string, args: string[]): CaptureResult => {
+      if (args[0] === "ps") {
+        psCalls += 1;
+        if (wedged && (stage === "inventory" || stage === "re-observe" && psCalls > 1)) return timedOut();
+        return captureResult(proxyId);
+      }
+      if (args[0] === "container") {
+        if (wedged && stage === "inspect") return timedOut();
+        return captureResult(JSON.stringify([{ Id: proxyId, State: { Running: running }, Config: { Labels: ownedLabels } }]));
+      }
+      if (args[0] === "stop") {
+        if (wedged && stage === "stop") return timedOut();
+        running = false;
+        return captureResult(proxyId);
+      }
+      throw new Error(`unexpected effect: ${args.join(" ")}`);
+    });
+    const input = { ...subject, io: { capture }, assertAuthority: () => undefined };
+    expect(() => containExactOwnedProxy(input)).toThrow(stage === "stop" ? "proxy safety is unconfirmed" : "unavailable");
+    if (stage === "inventory" || stage === "inspect") {
+      expect(() => observeExactProxy(input)).toThrow("unavailable");
+      expect(capture.mock.calls.some(([, args]) => args[0] === "stop")).toBe(false);
+    }
+    if (stage !== "re-observe") expect(running).toBe(true);
+    wedged = false;
+    running = true;
+    containExactOwnedProxy(input);
+    expect(running).toBe(false);
+    expect(capture.mock.calls.filter(([, args]) => args[0] === "stop").at(-1)).toEqual(["docker", ["stop", "--time", "5", proxyId], expect.anything()]);
+  },
+);

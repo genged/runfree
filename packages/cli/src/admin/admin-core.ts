@@ -12,7 +12,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { LIFECYCLE_OPERATION_BUDGET_MS, withLifecycleOperationBudget } from "../runtime/lifecycle-operation-budget.ts";
 import { assertSessionDisruptionAuthorized } from "../runtime/session-disruption.ts";
-import { tryAcquireProjectLifecycleLockWithRetry } from "../runtime/sessions.ts";
+import { tryAcquireProjectLifecycleLockWithRetry, type ProjectLifecycleLock } from "../runtime/sessions.ts";
 import {
   type CredentialPolicyJson,
   type LoadedNetworkPolicy,
@@ -115,7 +115,8 @@ import {
   type RuntimeSecurityContract,
   type RuntimeSecurityContractEvidence,
 } from "../runtime/security-contract.ts";
-import type { DockerContainerInspect, RuntimeContext } from "../runtime/types.ts";
+import type { CaptureResult, DockerContainerInspect, RuntimeContext, RuntimeIO } from "../runtime/types.ts";
+import { failClosedSpawnStatus } from "../runtime/spawn-status.ts";
 import {
   effectiveControlPlaneComponentEvidenceIssue,
   runtimeComponentEvidenceIssue,
@@ -1120,14 +1121,14 @@ function commandExists(command: string): boolean {
   return result.status === 0;
 }
 
-export function runCapture(command: string, args: string[], options: childProcess.SpawnSyncOptions = {}): { status: number; stdout: string; stderr: string } {
+export function runCapture(command: string, args: string[], options: childProcess.SpawnSyncOptions = {}): CaptureResult {
   const result = adminSpawnSync(command, args, {
     encoding: "utf8",
     env: childEnvForCommand(command),
     ...options,
   });
   return {
-    status: result.status ?? 1,
+    ...failClosedSpawnStatus(result),
     stdout: typeof result.stdout === "string" ? result.stdout : "",
     stderr: typeof result.stderr === "string" ? result.stderr : "",
   };
@@ -1770,7 +1771,7 @@ function writeProxyRuntimeToken(proxyId: string, name: string, value: string): v
     encoding: "utf8",
     env: dockerChildEnv(),
   });
-  if ((result.status ?? 1) !== 0) {
+  if (failClosedSpawnStatus(result).status !== 0) {
     const stderr = typeof result.stderr === "string" ? result.stderr.trim() : "";
     throw new Error(stderr || `failed to write ${name} token into proxy tmpfs`);
   }
@@ -3441,6 +3442,30 @@ function reportRuntimeValidationRequired(runtime: ProxyRuntime, options: ProxyRe
   runQuietTokenSync("source-truth", options);
 }
 
+/**
+ * The restore half of `runtime reload-policy --force`. The restore runs the
+ * ephemeral helpers itself (it has no validation to reuse), so it gets the
+ * budgeted IO for its work and the unbudgeted base IO as the helpers'
+ * containment IO: helper reclaim must be able to run after the budget ends
+ * (security review C4).
+ */
+export async function restoreAdmissionAfterProxyRestart(input: {
+  plan: ActiveRuntimePlan;
+  lifecycleLock: ProjectLifecycleLock;
+  proxyId: string;
+  deadline: number;
+  baseIO: RuntimeIO;
+}): Promise<void> {
+  const { restoreSameProxySessionAdmission } = await import("../runtime/startup.ts");
+  await restoreSameProxySessionAdmission({
+    plan: input.plan,
+    io: withLifecycleOperationBudget(input.baseIO, () => input.deadline - performance.now()),
+    containmentIO: input.baseIO,
+    lifecycleLock: input.lifecycleLock,
+    proxyId: input.proxyId,
+  });
+}
+
 async function restartProxyAndSync(project: string, proxyId: string, policy: LoadedNetworkPolicy, options: ProxyReloadOptions): Promise<void> {
   const hostProject = currentAdminState().runtimeContext?.project ?? adminProjectInfo();
   const context: RuntimeContext = currentAdminState().runtimeContext ?? {
@@ -3478,9 +3503,8 @@ async function restartProxyAndSync(project: string, proxyId: string, policy: Loa
     if (readEffectiveControlPlaneV2(stateDir())) {
       const target = currentRuntimeValidationTarget();
       if (!target) die("proxy restart needs exact runtime inputs to restore sessions; restore the inputs and retry runtime reload-policy --force");
-      const { restoreSameProxySessionAdmission } = await import("../runtime/startup.ts");
       const { nodeRuntimeIO } = await import("../runtime.ts");
-      await restoreSameProxySessionAdmission({ plan: target.plan, io: withLifecycleOperationBudget(nodeRuntimeIO, () => deadline - performance.now()), lifecycleLock, proxyId });
+      await restoreAdmissionAfterProxyRestart({ plan: target.plan, lifecycleLock, proxyId, deadline, baseIO: nodeRuntimeIO });
     }
     lifecycleLock.assertHeld();
     console.log("proxy restart: pending requests interrupted; approval grants and remembered denials reset; audit observations may be lost");

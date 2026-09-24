@@ -156,9 +156,11 @@ vi.mock("./session-container-docker.ts", () => ({
 vi.mock("./session-container-lifecycle-authorization.ts", () => ({
   authorizeProvisioningRunningSessionContainer: mocks.authorizeProvisioning,
 }));
-vi.mock("./session-container-reconciliation.ts", () => ({
+vi.mock("./session-container-reconciliation.ts", async (importOriginal) => ({
   classifySessionContainerReconciliation: mocks.classify,
   inspectSessionContainerInventory: mocks.inventory,
+  // The pool-range refusal (C8) is a pure predicate; keep the real one.
+  isSessionPoolSourceIp: (await importOriginal<typeof import("./session-container-reconciliation.ts")>()).isSessionPoolSourceIp,
 }));
 vi.mock("./session-reconcile.ts", () => ({ reconcileSessions: mocks.reconcileSessions }));
 vi.mock("./session-container-running-proof.ts", () => ({

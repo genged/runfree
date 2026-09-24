@@ -280,6 +280,8 @@ A typical `runfree` invocation does the following:
 11. Create an admitted session container for the requested command; on exit, print blocked-host feedback
     unless `--quiet` is used.
 
+When `up` or a launch starts the runtime under the project lifecycle lock, and when `runtime reload-policy --force` restores admission, Runfree first reclaims ephemeral-helper runs that a dead CLI left behind. It removes each leftover helper container by its exact recorded id before any new helper runs or any session is admitted (see [Runtime Participants And Identity](security.md#runtime-participants-and-identity)).
+
 Agent-image or session-template changes select a new desired session materialization. Existing sessions keep their exact image and template until they end. New sessions use the new materialization without replacing the proxy.
 
 A compatible proxy change starts a deny-all candidate, revalidates each live session, rewrites each host lifecycle record with the candidate's control plane generation digest, and publishes the project's session eligibility into the candidate before it selects it. Nothing is republished on the sessions' behalf: each surviving session's own next heartbeat writes its file into the candidate. An incompatible admission epoch or control-plane topology blocks the rolling change while sessions remain. Explicit rebuild keeps its confirmation contract.

@@ -1,6 +1,6 @@
 SHELL := /bin/bash
 
-.PHONY: help test test-all test-static test-unit test-agent test-proxy test-security test-templates test-cli-e2e test-cli-e2e-live test-runtime test-runtime-smoke test-runtime-live test-runtime-live-topology test-runtime-live-managed-launch test-runtime-live-egress test-runtime-live-connect-guard test-runtime-live-request-shape test-runtime-live-audit test-runtime-live-allowlist test-runtime-live-policy-mutation test-live-session-admission-docker-desktop test-live-session-admission-orbstack test-live-session-admission-negative-docker-desktop test-live-session-admission-negative-orbstack test-live-session-admission-attached-docker-desktop test-live-session-admission-attached-orbstack test-live-session-renewal-docker-desktop test-live-session-renewal-orbstack test-live-session-independence-docker-desktop test-live-session-independence-orbstack test-live-session-admission-crash-docker-desktop test-live-session-admission-crash-orbstack test-live-session-admission-drift-docker-desktop test-live-session-admission-drift-orbstack reclaim-runtime-sandbox reclaim-runtime-sandbox-apply test-watch
+.PHONY: help test test-all test-static test-unit test-agent test-proxy test-security test-templates test-cli-e2e test-cli-e2e-live test-runtime test-runtime-smoke test-runtime-live test-runtime-live-topology test-runtime-live-managed-launch test-runtime-live-egress test-runtime-live-connect-guard test-runtime-live-request-shape test-runtime-live-audit test-runtime-live-allowlist test-runtime-live-policy-mutation test-runtime-live-helper-reclaim test-live-session-admission-docker-desktop test-live-session-admission-orbstack test-live-session-admission-negative-docker-desktop test-live-session-admission-negative-orbstack test-live-session-admission-attached-docker-desktop test-live-session-admission-attached-orbstack test-live-session-renewal-docker-desktop test-live-session-renewal-orbstack test-live-session-independence-docker-desktop test-live-session-independence-orbstack test-live-session-admission-crash-docker-desktop test-live-session-admission-crash-orbstack test-live-session-admission-drift-docker-desktop test-live-session-admission-drift-orbstack reclaim-runtime-sandbox reclaim-runtime-sandbox-apply test-watch
 
 help:
 	@printf '%s\n' \
@@ -20,6 +20,7 @@ help:
 		'  make test-runtime-smoke   One live tranche (runtime-topology: one fixture, one session, 24 read-only proofs) as a per-commit Docker check' \
 		'  make test-runtime-live    Run the migrated non-admission live tranches only (TEST_RUNTIME_BACKEND, default docker-desktop)' \
 		'  make test-runtime-live-<tranche>  One migrated tranche: topology|managed-launch|egress|connect-guard|request-shape|audit|allowlist|policy-mutation' \
+		'  make test-runtime-live-helper-reclaim  Ephemeral-helper tranche: bounded runs, exact-id reclaim, the pinned helper address' \
 		'  make test-live-session-admission-docker-desktop  Run every standalone admission tranche on Docker Desktop' \
 		'  make test-live-session-admission-orbstack  Run every standalone admission tranche on OrbStack' \
 		'  make test-live-session-admission-negative-<backend>  Negative refusal tranche only' \
@@ -271,6 +272,16 @@ test-runtime-live-allowlist:
 
 test-runtime-live-policy-mutation:
 	TEST_RUNTIME_BACKEND=$(TEST_RUNTIME_BACKEND) pnpm exec vitest run --project runtime-live live-policy-mutation
+
+# Ephemeral helpers only: a normal up pins the deny-probe helper in .13-.19 and
+# leaves no residue; a hung helper is SIGKILLed at a test-shortened bound and
+# removed by exact id; a CLI killed mid-helper leaves residue the next lock
+# holder reclaims; an exhausted helper block refuses with its remedies. It also
+# checks the daemon behaviour the removal proof assumes (image id, IPAM pin,
+# network id, cidfile shape, address-in-use status). Its own fixture; the full
+# path keeps the filter checked by scripts/check-test-inventory.ts.
+test-runtime-live-helper-reclaim:
+	TEST_RUNTIME_BACKEND=$(TEST_RUNTIME_BACKEND) pnpm exec vitest run --project runtime-live tests/runtime/live/ephemeral-helper-reclaim.live.test.ts
 
 reclaim-runtime-sandbox:
 	tests/runtime/reclaim-sandbox-runtimes.sh

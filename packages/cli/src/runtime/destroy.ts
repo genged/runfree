@@ -45,6 +45,7 @@ import {
   wholeProjectContainerFilters,
 } from "./container-inventory.ts";
 import { dockerClientEnvOptions, type RuntimeDocker } from "./docker.ts";
+import { helperRunsRoot } from "./ephemeral-helper-residue.ts";
 import {
   enumerateSessionContainerRecordsV2,
   listIllegibleSessionContainerRegistryAsidesV2,
@@ -1047,6 +1048,13 @@ export function runFencedProjectDestroy(input: FencedProjectDestroyInput): numbe
     // left by an interrupted earlier destroy are cleared too.
     removeIllegibleSessionContainerRegistryAsidesV2(stateDir);
   }
+
+  // Helper-run records exist only so the next `up` can reclaim a helper whose
+  // CLI died. Reaching here, every project-labelled container is gone, helpers
+  // included, so the records have nothing left to reclaim; a record `up` refuses
+  // to trust (torn intent, symlinked cidfile) is cleared by exactly this reset.
+  // `rmSync` unlinks a symlinked root rather than following it.
+  fs.rmSync(helperRunsRoot(stateDir), { recursive: true, force: true });
 
   console.log("destroyed");
   return 0;
