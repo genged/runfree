@@ -137,6 +137,35 @@ test("an unrelated nonzero exit keeps the raw diagnostic, not the address remedy
   expect(issues[0]).toBe(`${SPECS[0]?.label} denial probe did not run: missing probe binary: dig`);
 });
 
+// The address diagnostic is the daemon's refusal, read from stderr only: the
+// helper's own stdout is untrusted-image output and must never pick the
+// message, and a helper that merely prints the phrase and exits is not a
+// refused start.
+test.each([
+  ["the phrase on the helper's stdout", result(125, "docker: Error response from daemon: Address already in use", "")],
+  ["the phrase on stderr from a helper that exited 1", result(1, "", "docker: Error response from daemon: Address already in use")],
+  ["the phrase on stderr without the daemon's framing", result(125, "", "bind: address already in use")],
+])("%s is not the address-in-use diagnostic", (_name, batch) => {
+  const issues: string[] = [];
+  applyDenyProbeBatchResult(issues, SPECS, batch, undefined, "172.30.0.19");
+  expect(issues).toHaveLength(SPECS.length);
+  for (const issue of issues) {
+    expect(issue).toContain("denial probe did not run");
+    expect(issue).not.toContain("ephemeral-helper address 172.30.0.19");
+  }
+});
+
+test("a timed-out batch fails every probe as did-not-run even with status 0 and well-formed records", () => {
+  for (const unclean of [{ timedOut: true }, { signal: "SIGKILL" as const }]) {
+    const issues: string[] = [];
+    let violated = false;
+    applyDenyProbeBatchResult(issues, SPECS, { ...result(0, records([0, 1, 1])), ...unclean }, () => { violated = true; });
+    expect(issues).toHaveLength(SPECS.length);
+    for (const issue of issues) expect(issue).toContain("denial probe did not run");
+    expect(violated).toBe(false);
+  }
+});
+
 test("a batch refused before docker run fails every probe as did-not-run with the reason", () => {
   const issues: string[] = [];
   failDenyProbeBatch(issues, SPECS, "no free ephemeral-helper address");

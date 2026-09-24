@@ -83,7 +83,13 @@ function compactDiagnostic(value: string): string {
   return `${compact.slice(0, 497)}...`;
 }
 
-const ADDRESS_IN_USE_PATTERN = /address already in use/iu;
+// The daemon's own refusal, as the Docker CLI prints it on stderr. Only the
+// run's stderr is read, and only with the CLI's own error status (125): the
+// helper's stdout is untrusted-image output. The helper also shares stderr,
+// so a spoofed line can at most change this diagnostic's wording; the batch
+// fails as did-not-run either way.
+const ADDRESS_IN_USE_PATTERN = /^(?:docker: )?Error response from daemon:.*address already in use/imu;
+const DOCKER_CLI_ERROR_STATUS = 125;
 
 /**
  * Fails every probe of a batch as did-not-run: one issue PER probe, each
@@ -117,12 +123,16 @@ export function applyDenyProbeBatchResult(
   helperAddress?: string,
 ): void {
   const batchFailure = (detail: string): void => failDenyProbeBatch(issues, specs, detail);
-  if (result.status !== 0) {
-    const diagnostic = `${result.stderr}\n${result.stdout}`;
-    if (ADDRESS_IN_USE_PATTERN.test(diagnostic)) {
+  if (result.status !== 0 || result.timedOut === true || result.signal !== undefined) {
+    if (result.status === DOCKER_CLI_ERROR_STATUS && ADDRESS_IN_USE_PATTERN.test(result.stderr)) {
       batchFailure(addressInUseDiagnostic(helperAddress));
       return;
     }
+    if (result.timedOut === true || result.signal !== undefined) {
+      batchFailure(`deny probe batch did not finish (${result.timedOut === true ? "timed out" : `killed by ${result.signal}`})`);
+      return;
+    }
+    const diagnostic = `${result.stderr}\n${result.stdout}`;
     batchFailure(compactDiagnostic(diagnostic) || `deny probe batch exited ${result.status}`);
     return;
   }
