@@ -344,6 +344,10 @@ function projectHelperIds(projectId: string): readonly string[] {
  */
 type HelperEventStream = Readonly<{
   actionsFor(id: string): readonly string[];
+  /** False once the child has exited or failed to spawn — it should not, before `stop()`. */
+  isRunning(): boolean;
+  /** Spawn error, exit code/signal, and any stderr, for a failure message. */
+  diagnostics(): string;
   stop(): void;
 }>;
 
@@ -353,17 +357,20 @@ function startHelperEventStream(fixture: LiveFixture, identity: ProjectIdentity,
     [
       "events",
       "--since", String(sinceSeconds),
-      "--no-trunc",
       "--filter", "type=container",
       "--filter", `label=${PROJECT_ID_LABEL}=${identity.projectId}`,
       "--filter", `label=${CONTAINER_ROLE_LABEL}=ephemeral-helper`,
-      "--format", "{{.ID}} {{.Action}}",
+      // Actor.ID, not the top-level (deprecated) id field, is the stable
+      // full 64-hex container id.
+      "--format", "{{.Actor.ID}} {{.Action}}",
     ],
     { env: fixture.env, stdio: ["ignore", "pipe", "pipe"] },
   );
-  child.on("error", () => { /* surfaced only through an empty/missing action list at assertion time */ });
   const actions = new Map<string, string[]>();
   let buffer = "";
+  let stderr = "";
+  let spawnError: Error | undefined;
+  let exit: { code: number | null; signal: NodeJS.Signals | null } | undefined;
   const consume = (chunk: Buffer | string): void => {
     buffer += String(chunk);
     let newlineIndex = buffer.indexOf("\n");
@@ -381,9 +388,20 @@ function startHelperEventStream(fixture: LiveFixture, identity: ProjectIdentity,
     }
   };
   child.stdout?.on("data", consume);
+  child.stderr?.on("data", (chunk: Buffer | string) => { stderr += String(chunk); });
+  child.on("error", (error) => { spawnError = error; });
+  child.on("close", (code, signal) => { exit = { code, signal }; });
   let stopped = false;
   return Object.freeze({
     actionsFor: (id: string) => actions.get(id) ?? [],
+    isRunning: () => spawnError === undefined && exit === undefined,
+    diagnostics: () => {
+      const parts: string[] = [];
+      if (spawnError) parts.push(`spawn error: ${spawnError.message}`);
+      if (exit) parts.push(`exited: code=${exit.code} signal=${exit.signal}`);
+      if (stderr.trim()) parts.push(`stderr: ${stderr.trim()}`);
+      return parts.length > 0 ? parts.join("; ") : "the docker events process is still running with no reported failure";
+    },
     stop: () => {
       if (stopped) return;
       stopped = true;
@@ -813,9 +831,15 @@ describe("ephemeral helpers are bounded, reclaimed by exact id, and pinned outsi
       ).toBeLessThan(boundMs);
 
       expect(containerExists(helper.id), "the hung helper must be removed").toBe(false);
+      expect(
+        events.isRunning(),
+        `the docker events stream must still be running when up finished, not have exited early: ${events.diagnostics()}`,
+      ).toBe(true);
       const actions = await waitForHelperEvents(events, helper.id, ["kill", "destroy"], HELPER_EVENT_WAIT_TIMEOUT_MS);
-      expect(actions, `the hung helper must have been force-removed (kill then destroy), not exited on its own: ${actions.join(",")}`)
-        .toEqual(expect.arrayContaining(["kill", "destroy"]));
+      expect(
+        actions,
+        `the hung helper must have been force-removed (kill then destroy), not exited on its own: ${actions.join(",")} (event stream: ${events.diagnostics()})`,
+      ).toEqual(expect.arrayContaining(["kill", "destroy"]));
       expect(fs.existsSync(helper.runDirectory), "the removed helper's run record must be deleted").toBe(false);
       assertNoHelperResidue(identity, "after a timed-out helper");
     } finally {
