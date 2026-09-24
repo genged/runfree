@@ -951,6 +951,24 @@ describe("fenced project destroy", () => {
     expect(residueStops).toEqual([["docker", "container", "stop", "--time", "10", ...ids]]);
   });
 
+  test("--force stops running project-labeled containers in id-bounded chunks", () => {
+    // A single `docker container stop <ids...>` call has no bound on argv
+    // length. Chunk it at STOP_ID_CHUNK_SIZE (mirroring the 64-id chunking
+    // `session-container-reconciliation.ts` uses for `container inspect`),
+    // so a large stale generation cannot build an unbounded argv. Each chunk
+    // still shares one grace period; 65 ids split into a 64-id chunk and a
+    // 1-id chunk, in order.
+    const ids = Array.from({ length: 65 }, (_, index) => index.toString(16).padStart(2, "0").repeat(32));
+    const { input, stateDir, calls } = harness({ force: true, residueIds: ids });
+    writeRecord(stateDir, attachedRecord());
+
+    expect(runFencedProjectDestroy(input)).toBe(0);
+    const residueStopTargets = calls
+      .filter((call) => call[1] === "container" && call[2] === "stop" && ids.some((id) => call.includes(id)))
+      .map((call) => call.slice(5));
+    expect(residueStopTargets).toEqual([ids.slice(0, 64), ids.slice(64)]);
+  });
+
   test("a failed batch stop falls back to per-container stops and names the failure", () => {
     // `failProxyStop` fails every `container stop`, including the proxy stop
     // that runs before this sweep — so it would end the destroy before this

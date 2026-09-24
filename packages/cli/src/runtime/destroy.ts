@@ -72,6 +72,9 @@ import type { RuntimeContext, RuntimeIO } from "./types.ts";
 import { remedy } from "../remedies.ts";
 
 const SESSION_CONTAINER_STOP_SECONDS = 10;
+// Bounds a single `docker container stop` argv the same way
+// session-container-reconciliation.ts bounds `container inspect` chunks.
+const STOP_ID_CHUNK_SIZE = 64;
 
 export type FencedProjectDestroyInput = Readonly<{
   context: RuntimeContext;
@@ -316,28 +319,33 @@ function stopProjectLabeledContainers(input: FencedProjectDestroyInput): void {
   }
   const running = listed.stdout.trim().split(/\s+/).filter(Boolean);
   if (running.length === 0) return;
-  // One call: the Docker CLI issues the per-id stops concurrently, so N live
-  // sessions share one grace period instead of paying for N sequential ones.
-  // On any failure, fall back to exact per-container stops so each failure
-  // is attributed and proven exactly as before.
-  const batch = input.io.capture(
-    "docker",
-    ["container", "stop", "--time", String(SESSION_CONTAINER_STOP_SECONDS), ...running],
-    dockerClientEnvOptions(input.context),
-  );
-  if (batch.status === 0) return;
-  for (const containerId of running) {
-    const stopped = input.io.capture(
+  // Chunked batches: within a chunk, the Docker CLI issues the per-id stops
+  // concurrently, so N live sessions share one grace period instead of
+  // paying for N sequential ones. Chunking bounds a single call's argv the
+  // same way container-inspect chunking does. On a chunk failure, fall back
+  // to exact per-container stops for that chunk's ids so each failure is
+  // attributed and proven exactly as before.
+  for (let offset = 0; offset < running.length; offset += STOP_ID_CHUNK_SIZE) {
+    const chunk = running.slice(offset, offset + STOP_ID_CHUNK_SIZE);
+    const batch = input.io.capture(
       "docker",
-      ["container", "stop", "--time", String(SESSION_CONTAINER_STOP_SECONDS), containerId],
+      ["container", "stop", "--time", String(SESSION_CONTAINER_STOP_SECONDS), ...chunk],
       dockerClientEnvOptions(input.context),
     );
-    if (stopped.status === 0) continue;
-    if (containerProvenAbsent(input, containerId)) continue;
-    const detail = stopped.stderr.trim().slice(0, 512) || `exit ${stopped.status}`;
-    throw new Error(
-      `${operationName(input)} refused to remove session containers while a project container could not be stopped (${containerId}): ${detail}`,
-    );
+    if (batch.status === 0) continue;
+    for (const containerId of chunk) {
+      const stopped = input.io.capture(
+        "docker",
+        ["container", "stop", "--time", String(SESSION_CONTAINER_STOP_SECONDS), containerId],
+        dockerClientEnvOptions(input.context),
+      );
+      if (stopped.status === 0) continue;
+      if (containerProvenAbsent(input, containerId)) continue;
+      const detail = stopped.stderr.trim().slice(0, 512) || `exit ${stopped.status}`;
+      throw new Error(
+        `${operationName(input)} refused to remove session containers while a project container could not be stopped (${containerId}): ${detail}`,
+      );
+    }
   }
 }
 
