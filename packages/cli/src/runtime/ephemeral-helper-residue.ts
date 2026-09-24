@@ -56,6 +56,7 @@ import type { CaptureResult, RuntimeIO } from "./types.ts";
 export const HELPER_RUNS_DIRECTORY = "helper-runs";
 const RUN_DIRECTORY_PATTERN = /^run-[A-Za-z0-9]{6}$/u;
 const INTENT_FILE = "intent.json";
+const INTENT_TEMP_FILE = "intent.json.tmp";
 const CID_FILE = "cid";
 const MAX_INTENT_BYTES = 4096;
 // 64 hex characters plus an optional newline (docker/cli writes none).
@@ -209,8 +210,13 @@ export function createHelperRun(stateDir: string, intent: HelperRunIntent): Help
   assertOwnedDirectory(root, process.getuid?.());
   const directory = fs.mkdtempSync(path.join(root, "run-"));
   try {
+    // Temp name, fsync, rename: a crash leaves either no intent (only the
+    // temp file, which the residue reclaim clears) or the whole intent, so a
+    // short or empty intent.json can only mean tampering. The fresh mkdtemp
+    // directory gives the rename its exclusivity.
+    const temporary = path.join(directory, INTENT_TEMP_FILE);
     const descriptor = fs.openSync(
-      path.join(directory, INTENT_FILE),
+      temporary,
       fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW,
       0o600,
     );
@@ -219,6 +225,13 @@ export function createHelperRun(stateDir: string, intent: HelperRunIntent): Help
       fs.fsyncSync(descriptor);
     } finally {
       fs.closeSync(descriptor);
+    }
+    fs.renameSync(temporary, path.join(directory, INTENT_FILE));
+    const directoryDescriptor = fs.openSync(directory, fs.constants.O_RDONLY);
+    try {
+      fs.fsyncSync(directoryDescriptor);
+    } finally {
+      fs.closeSync(directoryDescriptor);
     }
   } catch (error) {
     fs.rmSync(directory, { recursive: true, force: true });
@@ -625,9 +638,11 @@ export function reclaimHelperRunResidue(
       intentStat = fs.lstatSync(intentPath);
     } catch (error) {
       if (errorCode(error) !== "ENOENT") throw untrusted(name, `intent is unreadable: ${errorCode(error) ?? "error"}`);
-      // The run died between mkdtemp and the intent write. The helper is
-      // spawned only after that write, so an empty directory has no helper.
-      if (fs.readdirSync(directory).length !== 0) throw untrusted(name, "run directory has no intent");
+      // The run died between mkdtemp and the intent rename. The helper is
+      // spawned only after the rename, so a directory holding nothing, or only
+      // the torn temp intent, has no helper.
+      const entries = fs.readdirSync(directory);
+      if (entries.some((entry) => entry !== INTENT_TEMP_FILE)) throw untrusted(name, "run directory has no intent");
       emptyDirectories.push(directory);
       continue;
     }

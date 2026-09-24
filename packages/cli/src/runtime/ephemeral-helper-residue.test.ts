@@ -202,6 +202,8 @@ describe("helper-run records", () => {
     expect(fs.statSync(intentPath).mode & 0o777).toBe(0o600);
     expect(parseHelperIntent(fs.readFileSync(intentPath, "utf8"))).toEqual(intent());
     expect(run.cidFile).toBe(path.join(run.directory, "cid"));
+    // Written to a temp name and renamed: nothing else is left behind.
+    expect(fs.readdirSync(run.directory)).toEqual(["intent.json"]);
   });
 
   test("createHelperRun refuses a symlinked helper-runs root", () => {
@@ -773,6 +775,16 @@ describe("reclaimHelperRunResidue", () => {
     expect(fs.readdirSync(helperRunsRoot(stateDir))).toEqual([]);
   });
 
+  test("a torn intent temp file (crash before the rename) is cleared with no Docker call, not refused", () => {
+    const docker = fakeDocker();
+    const runDir = path.join(helperRunsRoot(stateDir), "run-Torn99");
+    fs.mkdirSync(runDir, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(path.join(runDir, "intent.json.tmp"), '{"v":1,"proj');
+    expect(reclaimHelperRunResidue(docker.fence(), PROJECT_ID, NO_WAIT)).toEqual({ reclaimed: 0, pending: 0 });
+    expect(docker.docker()).toEqual([]);
+    expect(fs.existsSync(runDir)).toBe(false);
+  });
+
   test.each([
     ["an unparsable intent", (dir: string) => { fs.writeFileSync(path.join(dir, "intent.json"), "{"); }],
     ["another project's intent", (dir: string) => { fs.writeFileSync(path.join(dir, "intent.json"), JSON.stringify(intent({ projectId: OTHER_PROJECT_ID }))); }],
@@ -781,6 +793,11 @@ describe("reclaimHelperRunResidue", () => {
       fs.symlinkSync(path.join(dir, "..", "..", "decoy.json"), path.join(dir, "intent.json"));
     }],
     ["a cidfile with no intent", (dir: string) => { fs.writeFileSync(path.join(dir, "cid"), HELPER_ID); }],
+    ["a cidfile beside a torn intent temp file", (dir: string) => {
+      fs.writeFileSync(path.join(dir, "intent.json.tmp"), "{");
+      fs.writeFileSync(path.join(dir, "cid"), HELPER_ID);
+    }],
+    ["an empty intent (the rename makes it tampering)", (dir: string) => { fs.writeFileSync(path.join(dir, "intent.json"), ""); }],
   ])("%s is refused before any Docker call, naming destroy --force, and every directory is kept", (_name, arrange) => {
     const docker = fakeDocker([helperInspect()]);
     // A valid residue beside the bad one must not be acted on either.
