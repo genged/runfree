@@ -137,3 +137,23 @@ test("assignments remain readable to the request proxy under a restrictive umask
   expect(result.status, result.stderr).toBe(0);
   expect(fs.statSync(f.request).mode & 0o777).toBe(0o644);
 });
+
+test("the IP reuse fence refuses any address outside the session pool before a command exists", () => {
+  // C8: the fence is sealed and executed only from the returned command, so a
+  // throw here means no docker exec and no proxy-side write can happen.
+  for (const sourceIp of [
+    "172.31.90.19",
+    "172.31.90.13",
+    "172.31.90.16",
+    "172.31.90.11",
+    "172.31.90.1",
+    "172.31.90.84",
+    "172.31.90.255",
+  ]) {
+    expect(() => sessionIpReuseFenceCommand("a".repeat(64), sourceIp, KEY, "-"), sourceIp)
+      .toThrow(/outside the session address pool/);
+  }
+  for (const sourceIp of ["172.31.90.20", "172.31.90.83"]) {
+    expect(sessionIpReuseFenceCommand("a".repeat(64), sourceIp, KEY, "-").effect).toBe("fence-session-ip");
+  }
+});

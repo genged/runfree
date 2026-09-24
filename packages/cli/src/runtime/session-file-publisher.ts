@@ -23,6 +23,7 @@ import { sha256Digest } from "../strict-primitives.ts";
 import { ROOT_UID_GID } from "./constants.ts";
 import { isExactSessionSourceIpv4 } from "@runfree/runtime-contracts/session-registry";
 import { RuntimeObservationError } from "./observation-failure.ts";
+import { isSessionPoolSourceIp } from "./session-container-reconciliation.ts";
 import type { CaptureResult, RuntimeIO } from "./types.ts";
 
 // The host's only writer for the per-session file tree
@@ -496,6 +497,10 @@ try {
 
 export function sessionIpReuseFenceCommand(proxyId: string, sourceIp: string, sessionKey: string, expectedDigest: string): SessionAdmissionDockerCommand {
   if (!isExactSessionSourceIpv4(sourceIp)) throw new Error("session source IP must be exact IPv4");
+  // Only the allocator's pool may be assigned to a session. Refused before the
+  // command exists, so an out-of-pool address (the helper block, a fixed role,
+  // the gateway) never reaches the proxy's IP reuse state.
+  if (!isSessionPoolSourceIp(sourceIp)) throw new Error(`session source IP is outside the session address pool: ${sourceIp}`);
   sessionFilePath(sessionKey);
   if (!/^(?:-|[a-f0-9]{64})$/.test(expectedDigest)) throw new Error("invalid IP assignment precondition");
   const args = [...pinnedExec(proxyId, FENCE_SESSION_IP_SCRIPT, [SESSION_IP_REUSE_DIR, sourceIp, sessionKey, expectedDigest])];

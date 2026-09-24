@@ -19,6 +19,7 @@ import {
   NARROW_LIVENESS_UNREADABLE_INSPECT_MESSAGES,
 } from "./session-container-narrow-liveness.ts";
 import { SESSION_CONTAINER_INSPECT_MAX_BYTES } from "./session-container-proof.ts";
+import { isSessionPoolSourceIp } from "./session-container-reconciliation.ts";
 import type {
   SessionContainerProjectIdentity,
   SessionContainerRecordV2,
@@ -265,6 +266,12 @@ export async function inspectAndWriteSessionFile(
   }
   if (!Number.isSafeInteger(leaseMs) || leaseMs < 1 || leaseMs > SESSION_ADMISSION_LEASE_MAX_DURATION_MS) {
     throw new Error("session file heartbeat lease is invalid");
+  }
+  // A session's identity is its source IP, and only the allocator's pool may
+  // carry one. An address outside it (the ephemeral-helper block, a fixed
+  // role, the gateway) is never published, whatever the record says.
+  if (!isSessionPoolSourceIp(record.sourceIp)) {
+    throw new Error(`session file heartbeat source IP is outside the session address pool: ${record.sourceIp}`);
   }
   if (!DOCKER_OBJECT_ID_PATTERN.test(input.networkId)
     || !DOCKER_OBJECT_ID_PATTERN.test(anchor.networkEndpointId)
