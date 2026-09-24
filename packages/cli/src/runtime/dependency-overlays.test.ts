@@ -642,7 +642,7 @@ function prepFixture(plan: ReturnType<typeof createDependencyOverlayPlan>, optio
     agentImage: "runfree-agent:selected",
     dependencyOverlayPlan: plan,
     gitLayoutPlan: { containerProjectRoot: "/workspaces/project" },
-    project: { config: { agents: { default: "claude" } } },
+    project: { config: { agents: { default: "claude" } }, paths: { stateDir: path.join(tmp, ".runfree-test-state") } },
   } as unknown as import("./types.ts").RuntimeContext;
   return { captured, io, docker, context };
 }

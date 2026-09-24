@@ -19,6 +19,9 @@
 // its traffic like any unadmitted source.
 
 import type { SpawnSyncOptions } from "node:child_process";
+import { randomBytes } from "node:crypto";
+import fs from "node:fs";
+import path from "node:path";
 
 import { isExactSessionSourceIpv4 } from "@runfree/runtime-contracts/session-registry";
 
@@ -45,7 +48,8 @@ const DEFAULT_MAX_BUFFER = 4 * 1024 * 1024;
 export const EPHEMERAL_HELPER_CAPABILITIES = ["CHOWN"] as const;
 export type EphemeralHelperCapability = typeof EPHEMERAL_HELPER_CAPABILITIES[number];
 
-export type EphemeralHelperInput = Readonly<{
+/** What a caller asks for; `runEphemeralHelper` adds the run's own identity. */
+export type EphemeralHelperRequest = Readonly<{
   purpose: EphemeralHelperPurpose;
   projectId: string;
   /** The exact image to run — normally the selected agent image. */
@@ -73,6 +77,30 @@ export type EphemeralHelperInput = Readonly<{
   timeoutMs?: number;
 }>;
 
+export type EphemeralHelperInput = EphemeralHelperRequest & Readonly<{
+  /**
+   * `<stateDir>/helper-runs/run-XXXXXX/cid`: the Docker CLI writes the created
+   * container's exact id here, which is what lets a timed-out or crashed run be
+   * removed by id rather than by name or label.
+   */
+  cidFile: string;
+  /** The run's random nonce, stamped as `io.runfree.helper-run`. */
+  runNonce: string;
+}>;
+
+const HELPER_RUN_DIRECTORY_PATTERN = /^run-[A-Za-z0-9]{6}$/u;
+
+function assertHelperRunCidFile(cidFile: string): void {
+  const valid = path.isAbsolute(cidFile)
+    && path.resolve(cidFile) === cidFile
+    && path.basename(cidFile) === "cid"
+    && HELPER_RUN_DIRECTORY_PATTERN.test(path.basename(path.dirname(cidFile)))
+    && path.basename(path.dirname(path.dirname(cidFile))) === "helper-runs";
+  if (!valid) {
+    throw new Error(`ephemeral helper cidfile must be <state>/helper-runs/run-XXXXXX/cid, not ${cidFile || "<empty>"}`);
+  }
+}
+
 /**
  * The exact `docker run` argv for one helper, pure and testable.
  *
@@ -87,6 +115,7 @@ export function ephemeralHelperRunArguments(input: EphemeralHelperInput): string
   if (input.networkId !== undefined && !DOCKER_OBJECT_ID_PATTERN.test(input.networkId)) {
     throw new Error("ephemeral helper network must be an exact 64-hex network id");
   }
+  assertHelperRunCidFile(input.cidFile);
   if (input.ip !== undefined) {
     if (input.networkId === undefined) throw new Error("ephemeral helper static address requires a network");
     if (!isExactSessionSourceIpv4(input.ip)) throw new Error(`ephemeral helper address is not IPv4: ${input.ip}`);
@@ -112,8 +141,15 @@ export function ephemeralHelperRunArguments(input: EphemeralHelperInput): string
   return [
     "run",
     "--rm",
+    // A helper runs only an image that is already local: never a registry
+    // fetch under the lifecycle lock, and never a different image by the
+    // same reference.
+    "--pull",
+    "never",
+    "--cidfile",
+    input.cidFile,
     ...(input.stdin !== undefined ? ["-i"] : []),
-    ...ephemeralHelperLabelArguments(input.projectId, input.purpose),
+    ...ephemeralHelperLabelArguments(input.projectId, input.purpose, input.runNonce),
     "--user",
     input.user,
     "--cap-drop",
@@ -136,13 +172,25 @@ export function ephemeralHelperRunArguments(input: EphemeralHelperInput): string
 export function runEphemeralHelper(
   context: RuntimeContext,
   io: RuntimeIO,
-  input: EphemeralHelperInput,
+  request: EphemeralHelperRequest,
 ): CaptureResult {
-  const options: SpawnSyncOptions = {
-    ...dockerClientEnvOptions(context),
-    timeout: input.timeoutMs ?? DEFAULT_TIMEOUT_MS,
-    maxBuffer: DEFAULT_MAX_BUFFER,
-    ...(input.stdin !== undefined ? { input: input.stdin } : {}),
-  };
-  return io.capture("docker", ephemeralHelperRunArguments(input), options);
+  // Each run gets its own host-owned directory for the Docker CLI's cidfile.
+  const root = path.join(context.project.paths.stateDir, "helper-runs");
+  fs.mkdirSync(root, { recursive: true, mode: 0o700 });
+  const directory = fs.mkdtempSync(path.join(root, "run-"));
+  try {
+    const options: SpawnSyncOptions = {
+      ...dockerClientEnvOptions(context),
+      timeout: request.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+      maxBuffer: DEFAULT_MAX_BUFFER,
+      ...(request.stdin !== undefined ? { input: request.stdin } : {}),
+    };
+    return io.capture("docker", ephemeralHelperRunArguments({
+      ...request,
+      cidFile: path.join(directory, "cid"),
+      runNonce: randomBytes(16).toString("hex"),
+    }), options);
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
 }

@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { expect, test } from "vitest";
+import { afterAll, expect, test } from "vitest";
 
 import {
   REQUIRED_TOPOLOGY_ASSERTIONS,
@@ -18,6 +18,10 @@ import {
 } from "./utility-containers.ts";
 import { projectHash } from "./env.ts";
 import type { CaptureResult, RuntimeContext, RuntimeIO } from "./types.ts";
+
+// Host-owned state for the deny-probe helper's run directories.
+const HELPER_STATE_DIR = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "runfree-topology-state-")));
+afterAll(() => fs.rmSync(HELPER_STATE_DIR, { recursive: true, force: true }));
 
 function captureResult(status: number, stdout = "", stderr = ""): CaptureResult {
   return { status, stdout, stderr };
@@ -242,7 +246,7 @@ test("topology validation accepts an ActiveRuntimePlan", () => {
       subnet: "172.30.0.0/24",
     },
     paths: { policyPath: "/tmp/policy.json" },
-    project: { config: {}, paths: { policyPath: "/tmp/policy.json" } },
+    project: { config: {}, paths: { policyPath: "/tmp/policy.json", stateDir: HELPER_STATE_DIR } },
     projectId,
     projectRoot,
     projectRuntimeRoot: "/project-runtime",
@@ -490,7 +494,7 @@ function denyProbeBatchPlanFixture(
       subnet: "172.30.0.0/24",
     },
     paths: { policyPath: "/tmp/policy.json" },
-    project: { config: {}, paths: { policyPath: "/tmp/policy.json" } },
+    project: { config: {}, paths: { policyPath: "/tmp/policy.json", stateDir: HELPER_STATE_DIR } },
     projectId,
     projectRoot,
     projectRuntimeRoot: "/project-runtime",

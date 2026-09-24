@@ -1,3 +1,7 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+
 import { describe, expect, test, vi } from "vitest";
 
 import { ephemeralHelperRunArguments, runEphemeralHelper } from "./ephemeral-helper.ts";
@@ -5,6 +9,11 @@ import type { RuntimeContext, RuntimeIO } from "./types.ts";
 
 const PROJECT_ID = "0123456789ab";
 const NETWORK_ID = "c".repeat(64);
+const RUN_NONCE = "d".repeat(32);
+const CID_FILE = "/state/projects/0123456789ab/helper-runs/run-AbC123/cid";
+// What runEphemeralHelper adds to a caller's request: the run's own cidfile
+// and nonce, both minted under the host-owned helper-runs directory.
+const RUN = { cidFile: CID_FILE, runNonce: RUN_NONCE } as const;
 
 describe("ephemeral helper run arguments", () => {
   test("mints the exact hardened argv with no network by default", () => {
@@ -16,11 +25,16 @@ describe("ephemeral helper run arguments", () => {
       capabilities: ["CHOWN"],
       volumes: [{ name: "runfree-x_deps", target: "/workspace/node_modules" }],
       command: ["sh", "-c", "script", "name", "arg"],
+      ...RUN,
     });
 
     expect(args).toEqual([
       "run",
       "--rm",
+      "--pull",
+      "never",
+      "--cidfile",
+      CID_FILE,
       "--label",
       "io.runfree.managed=true",
       "--label",
@@ -33,6 +47,8 @@ describe("ephemeral helper run arguments", () => {
       `io.runfree.project-id=${PROJECT_ID}`,
       "--label",
       "io.runfree.helper-purpose=dependency-prep",
+      "--label",
+      `io.runfree.helper-run=${RUN_NONCE}`,
       "--user",
       "0:0",
       "--cap-drop",
@@ -72,6 +88,7 @@ describe("ephemeral helper run arguments", () => {
         { name: "runfree-x_store", target: "/mnt/runfree-dep-prep/2" },
       ],
       command: ["sh", "-c", "script"],
+      ...RUN,
     });
 
     const volumeSpecs = args
@@ -97,6 +114,7 @@ describe("ephemeral helper run arguments", () => {
       networkId: NETWORK_ID,
       ip: "172.30.0.19",
       command: ["true"],
+      ...RUN,
     });
 
     expect(args).toContain(NETWORK_ID);
@@ -127,6 +145,17 @@ describe("ephemeral helper run arguments", () => {
     [{ volumes: [{ name: "ok", target: "/x:ro" }] }, /volume target is invalid/u],
     [{ command: [] }, /requires a command/u],
     [{ capabilities: ["SYS_ADMIN" as never] }, /not in the closed set/u],
+    // The cidfile is the run's exact-id evidence, so it must be the host-owned
+    // run directory's own `cid`, never a caller-chosen path.
+    [{ cidFile: "relative/helper-runs/run-AbC123/cid" }, /cidfile/u],
+    [{ cidFile: "/state/helper-runs/run-AbC123/other" }, /cidfile/u],
+    [{ cidFile: "/state/not-helper-runs/run-AbC123/cid" }, /cidfile/u],
+    [{ cidFile: "/state/helper-runs/cid" }, /cidfile/u],
+    [{ cidFile: "/state/helper-runs/run-AbC123/../run-XyZ789/cid" }, /cidfile/u],
+    [{ cidFile: "/state/helper-runs/nope-AbC123/cid" }, /cidfile/u],
+    [{ runNonce: "" }, /run nonce/u],
+    [{ runNonce: "D".repeat(32) }, /run nonce/u],
+    [{ runNonce: "d".repeat(31) }, /run nonce/u],
     [{ projectId: "short" }, /exact project id/u],
     [{ purpose: "exfiltrate" as never }, /unknown ephemeral helper purpose/u],
   ])("refuses invalid input %#", (overrides, message) => {
@@ -136,8 +165,24 @@ describe("ephemeral helper run arguments", () => {
       image: "runfree-agent:abc",
       user: "0:0",
       command: ["true"],
+      ...RUN,
       ...overrides,
     })).toThrow(message);
+  });
+
+  test("never pulls: a helper runs only an image that is already local", () => {
+    const args = ephemeralHelperRunArguments({
+      purpose: "trust-bundle",
+      projectId: PROJECT_ID,
+      image: `sha256:${"e".repeat(64)}`,
+      user: "1000:1000",
+      command: ["true"],
+      ...RUN,
+    });
+    const image = args.indexOf(`sha256:${"e".repeat(64)}`);
+    expect(args.slice(0, image)).toEqual(expect.arrayContaining(["--pull", "never", "--cidfile", CID_FILE]));
+    expect(args.indexOf("--cidfile")).toBeLessThan(image);
+    expect(args.indexOf("--pull")).toBeLessThan(image);
   });
 });
 
@@ -145,7 +190,8 @@ describe("runEphemeralHelper", () => {
   test("pipes stdin, bounds the run, and threads the docker client environment", () => {
     const capture = vi.fn(() => ({ status: 0, stdout: "", stderr: "" }));
     const io = { capture } as unknown as RuntimeIO;
-    const context = { env: { PATH: "/usr/bin" }, projectRoot: "/p" } as unknown as RuntimeContext;
+    const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "runfree-helper-"));
+    const context = { env: { PATH: "/usr/bin" }, projectRoot: "/p", project: { paths: { stateDir } } } as unknown as RuntimeContext;
 
     runEphemeralHelper(context, io, {
       purpose: "deny-probe",
@@ -160,7 +206,10 @@ describe("runEphemeralHelper", () => {
     expect(capture).toHaveBeenCalledTimes(1);
     const [command, args, options] = capture.mock.calls[0] as unknown as [string, string[], Record<string, unknown>];
     expect(command).toBe("docker");
-    expect(args.slice(0, 3)).toEqual(["run", "--rm", "-i"]);
+    expect(args.slice(0, 2)).toEqual(["run", "--rm"]);
+    expect(args).toContain("-i");
+    const cidFile = args[args.indexOf("--cidfile") + 1];
+    expect(path.dirname(path.dirname(cidFile))).toBe(path.join(stateDir, "helper-runs"));
     expect(options.input).toBe("echo probe");
     expect(options.timeout).toBe(5_000);
     expect(options.env).toBeDefined();

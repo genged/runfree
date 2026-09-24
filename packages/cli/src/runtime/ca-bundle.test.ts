@@ -28,7 +28,7 @@ function context(): RuntimeContext {
   return {
     projectRoot: path.join(tmp, "project"),
     env: {},
-    project: { paths: { proxyCaCertDir: certDir } },
+    project: { paths: { proxyCaCertDir: certDir, stateDir: path.join(tmp, "state") } },
   } as unknown as RuntimeContext;
 }
 
