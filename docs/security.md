@@ -86,6 +86,62 @@ excluded from the session orphan refusal, and conflicts with session records
 still refuse. A failed utility proof is reclaimed by repairing or stopping the
 forwarder, or by `runfree destroy --force` for a whole-project reset.
 
+Ephemeral helpers are the other transient participant. Startup runs the
+deny-by-default probes, the trust-bundle render, and dependency-volume
+preparation as short `--rm` containers on the untrusted project agent image
+(`ephemeral-helper.ts`), so their lifetime and removal are part of the trust
+boundary:
+
+- **Bounded, under the lock.** A helper is started only while the project
+  lifecycle lock is held, with `--pull never` and hardened flags. The Docker
+  client is SIGKILLed at the helper timeout (30 s for the deny probes, 120 s
+  otherwise, both clamped by the startup budget), so a helper that ignores
+  SIGTERM cannot hold the lock open.
+- **Recorded host-side.** Before the spawn, each run writes an intent file into
+  a fresh 0700 directory under the host project state directory, with a random
+  per-run `io.runfree.helper-run` label. The Docker client writes the created
+  container's id into that directory's cidfile. The agent has no mount of this
+  path.
+- **Removed by exact id only.** A clean exit needs no Docker call. After a
+  timeout, a signal, or any other unclean exit, Runfree removes the container
+  by its full 64-hex id, and only after inspection proves that id carries every
+  minted helper label (this project, this purpose, this run), the intent's
+  image, and the intent's exact network and pinned address. A container that
+  fails any check is never removed; the run is reported as unconfirmed, its
+  record is kept, and the error names `runfree up` (retry) and
+  `runfree destroy --force`.
+- **Crash residue is reclaimed at the next lock acquisition.** Records left by a
+  CLI that died mid-helper are reclaimed by the same proof when the next `up`
+  or launch acquires the lock, before any new helper runs or any session is
+  admitted. A record that cannot be trusted (unparsable intent, symlinked or
+  foreign-owned cidfile) is refused with `runfree destroy --force`.
+- **Named residual.** If the client was killed before the create request
+  finished, the daemon can still create the container after Runfree listed
+  none. That run's record is kept pending for up to 180 s, and a later `up`
+  removes the late container by its run label. Until then it is an unclaimed
+  project container, which admission already refuses. Separately, `docker rm -f`
+  falls back to a name match if the proven container vanished between
+  inspection and removal and another container is named with that 64-hex
+  string. Arranging either needs Docker-socket access, which is outside the
+  agent's reach, so both are accepted. The remedies are `runfree destroy
+  --force` and, for a forwarder holding a helper address, `runfree forward
+  stop`.
+
+The deny-probe helper sits in the agent position on `agent_internal`, so it
+gets a pinned address from a reserved block, `.13`–`.19`, outside the session
+pool (`.20` and up). It skips the proxy, agent, and callback addresses, the
+gateway, and every address the network inspection shows as attached. When the
+block is exhausted, the deny probes fail as not run, and the refusal names
+`runfree forward stop` and `runfree destroy --force`. The session-file
+publisher and the IP-reuse fence refuse any address outside the session pool,
+so no session file can name a helper address.
+
+A Docker call that times out or is killed never reads as success, whatever
+exit code the child reports later (`spawn-status.ts`). The host maps a timeout
+to status 124, any other spawn error (such as an output overrun) to 125, and a
+terminating signal to 128 + N. So an empty listing from a timed-out
+`docker ps` is never taken as proof that a container is absent.
+
 ### Per-Session Admission
 
 Runfree admits one agent process per container, each with its own address on
