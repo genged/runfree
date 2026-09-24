@@ -5,6 +5,7 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
 import { ensureAgentCaBundle, waitForProxyCaPublished } from "./ca-bundle.ts";
+import type { EphemeralHelperFence } from "./ephemeral-helper.ts";
 import type { RuntimeContext, RuntimeIO } from "./types.ts";
 
 const PROJECT_ID = "0123456789ab";
@@ -32,6 +33,16 @@ function context(): RuntimeContext {
   } as unknown as RuntimeContext;
 }
 
+// The helper's fence. Its containment side answers the reclaim listing with
+// "nothing", which is what Docker shows once a failed `--rm` helper is gone.
+function fence(): EphemeralHelperFence {
+  return {
+    lifecycleLock: { assertHeld: () => {} },
+    containmentIO: { capture: () => ({ status: 0, stdout: "", stderr: "" }) } as unknown as RuntimeIO,
+    stateDir: path.join(tmp, "state"),
+  };
+}
+
 function extractionIo(stdout = ROOTS, status = 0) {
   const capture = vi.fn(() => ({ status, stdout, stderr: "" }));
   return { io: { capture } as unknown as RuntimeIO, capture };
@@ -42,7 +53,7 @@ describe("ensureAgentCaBundle", () => {
     fs.writeFileSync(path.join(certDir, "proxy-ca.crt"), CERT);
     const { io, capture } = extractionIo();
 
-    expect(ensureAgentCaBundle(context(), io, { agentImage: "runfree-agent:abc", projectId: PROJECT_ID })).toBe(0);
+    expect(ensureAgentCaBundle(context(), io, { agentImage: "runfree-agent:abc", projectId: PROJECT_ID, helperFence: fence() })).toBe(0);
 
     const bundle = fs.readFileSync(path.join(certDir, "ca-bundle.crt"), "utf8");
     expect(bundle.indexOf("systemroot")).toBeLessThan(bundle.indexOf("proxyca"));
@@ -65,21 +76,21 @@ describe("ensureAgentCaBundle", () => {
     ]));
 
     // Unchanged inputs: no second extraction.
-    expect(ensureAgentCaBundle(context(), io, { agentImage: "runfree-agent:abc", projectId: PROJECT_ID })).toBe(0);
+    expect(ensureAgentCaBundle(context(), io, { agentImage: "runfree-agent:abc", projectId: PROJECT_ID, helperFence: fence() })).toBe(0);
     expect(capture).toHaveBeenCalledTimes(1);
   });
 
   test("re-renders when the proxy CA rotates or the selected image changes", () => {
     fs.writeFileSync(path.join(certDir, "proxy-ca.crt"), CERT);
     const { io, capture } = extractionIo();
-    ensureAgentCaBundle(context(), io, { agentImage: "runfree-agent:abc", projectId: PROJECT_ID });
+    ensureAgentCaBundle(context(), io, { agentImage: "runfree-agent:abc", projectId: PROJECT_ID, helperFence: fence() });
 
     fs.writeFileSync(path.join(certDir, "proxy-ca.crt"), CERT.replace("proxyca", "rotatedca"));
-    expect(ensureAgentCaBundle(context(), io, { agentImage: "runfree-agent:abc", projectId: PROJECT_ID })).toBe(0);
+    expect(ensureAgentCaBundle(context(), io, { agentImage: "runfree-agent:abc", projectId: PROJECT_ID, helperFence: fence() })).toBe(0);
     expect(capture).toHaveBeenCalledTimes(2);
     expect(fs.readFileSync(path.join(certDir, "ca-bundle.crt"), "utf8")).toContain("rotatedca");
 
-    expect(ensureAgentCaBundle(context(), io, { agentImage: "runfree-agent:def", projectId: PROJECT_ID })).toBe(0);
+    expect(ensureAgentCaBundle(context(), io, { agentImage: "runfree-agent:def", projectId: PROJECT_ID, helperFence: fence() })).toBe(0);
     expect(capture).toHaveBeenCalledTimes(3);
   });
 
@@ -90,10 +101,10 @@ describe("ensureAgentCaBundle", () => {
     // trust; the digest check re-renders instead.
     fs.writeFileSync(path.join(certDir, "proxy-ca.crt"), CERT);
     const { io, capture } = extractionIo();
-    ensureAgentCaBundle(context(), io, { agentImage: "runfree-agent:abc", projectId: PROJECT_ID });
+    ensureAgentCaBundle(context(), io, { agentImage: "runfree-agent:abc", projectId: PROJECT_ID, helperFence: fence() });
     fs.writeFileSync(path.join(certDir, "ca-bundle.crt"), "-----BEGIN CERTIFICATE-----\ntorn\n-----END CERTIFICATE-----\n");
 
-    expect(ensureAgentCaBundle(context(), io, { agentImage: "runfree-agent:abc", projectId: PROJECT_ID })).toBe(0);
+    expect(ensureAgentCaBundle(context(), io, { agentImage: "runfree-agent:abc", projectId: PROJECT_ID, helperFence: fence() })).toBe(0);
     expect(capture).toHaveBeenCalledTimes(2);
     expect(fs.readFileSync(path.join(certDir, "ca-bundle.crt"), "utf8")).toContain("systemroot");
   });
@@ -101,20 +112,20 @@ describe("ensureAgentCaBundle", () => {
   test("re-renders when the bundle file was removed even though the meta survives", () => {
     fs.writeFileSync(path.join(certDir, "proxy-ca.crt"), CERT);
     const { io, capture } = extractionIo();
-    ensureAgentCaBundle(context(), io, { agentImage: "runfree-agent:abc", projectId: PROJECT_ID });
+    ensureAgentCaBundle(context(), io, { agentImage: "runfree-agent:abc", projectId: PROJECT_ID, helperFence: fence() });
     fs.rmSync(path.join(certDir, "ca-bundle.crt"));
 
-    expect(ensureAgentCaBundle(context(), io, { agentImage: "runfree-agent:abc", projectId: PROJECT_ID })).toBe(0);
+    expect(ensureAgentCaBundle(context(), io, { agentImage: "runfree-agent:abc", projectId: PROJECT_ID, helperFence: fence() })).toBe(0);
     expect(capture).toHaveBeenCalledTimes(2);
     expect(fs.existsSync(path.join(certDir, "ca-bundle.crt"))).toBe(true);
   });
 
   test("fails closed before any extraction when the proxy CA is missing or not a certificate", () => {
     const { io, capture } = extractionIo();
-    expect(ensureAgentCaBundle(context(), io, { agentImage: "runfree-agent:abc", projectId: PROJECT_ID })).toBe(1);
+    expect(ensureAgentCaBundle(context(), io, { agentImage: "runfree-agent:abc", projectId: PROJECT_ID, helperFence: fence() })).toBe(1);
 
     fs.writeFileSync(path.join(certDir, "proxy-ca.crt"), "not a pem\n");
-    expect(ensureAgentCaBundle(context(), io, { agentImage: "runfree-agent:abc", projectId: PROJECT_ID })).toBe(1);
+    expect(ensureAgentCaBundle(context(), io, { agentImage: "runfree-agent:abc", projectId: PROJECT_ID, helperFence: fence() })).toBe(1);
     expect(capture).not.toHaveBeenCalled();
     expect(fs.existsSync(path.join(certDir, "ca-bundle.crt"))).toBe(false);
   });
@@ -126,8 +137,30 @@ describe("ensureAgentCaBundle", () => {
     fs.writeFileSync(path.join(certDir, "proxy-ca.crt"), CERT);
     const { io } = extractionIo(stdout, status);
 
-    expect(ensureAgentCaBundle(context(), io, { agentImage: "runfree-agent:abc", projectId: PROJECT_ID })).toBe(1);
+    expect(ensureAgentCaBundle(context(), io, { agentImage: "runfree-agent:abc", projectId: PROJECT_ID, helperFence: fence() })).toBe(1);
     expect(fs.existsSync(path.join(certDir, "ca-bundle.crt"))).toBe(false);
+  });
+});
+
+describe("ensureAgentCaBundle without the helper fence", () => {
+  test("refuses before any docker run and writes no bundle", () => {
+    fs.writeFileSync(path.join(certDir, "proxy-ca.crt"), CERT);
+    const { io, capture } = extractionIo();
+    expect(ensureAgentCaBundle(context(), io, { agentImage: "runfree-agent:abc", projectId: PROJECT_ID })).toBe(1);
+    expect(capture).not.toHaveBeenCalled();
+    expect(fs.existsSync(path.join(certDir, "ca-bundle.crt"))).toBe(false);
+  });
+
+  test("runs the helper by the bound image id when one is given", () => {
+    fs.writeFileSync(path.join(certDir, "proxy-ca.crt"), CERT);
+    const { io, capture } = extractionIo();
+    const imageId = `sha256:${"e".repeat(64)}`;
+    expect(ensureAgentCaBundle(context(), io, {
+      agentImage: "runfree-agent:abc", projectId: PROJECT_ID, helperImage: imageId, helperFence: fence(),
+    })).toBe(0);
+    const [, args] = capture.mock.calls[0] as unknown as [string, string[]];
+    expect(args).toContain(imageId);
+    expect(args).not.toContain("runfree-agent:abc");
   });
 });
 

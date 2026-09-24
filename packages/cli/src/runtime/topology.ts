@@ -33,7 +33,7 @@ import {
   observeDenyByDefaultViaFirewallV1,
   type DenyByDefaultObservationV1,
 } from "./control-plane-deny-proof.ts";
-import { runEphemeralHelper } from "./ephemeral-helper.ts";
+import { EPHEMERAL_HELPER_FENCE_REQUIRED, runEphemeralHelper, type EphemeralHelperFence } from "./ephemeral-helper.ts";
 import { ephemeralHelperAddress } from "./session-container-reconciliation.ts";
 
 export type RuntimeTopologyIssue = {
@@ -53,6 +53,10 @@ export type RuntimeTopologyOptions = {
   verbose?: boolean;
   expectedProxyId?: string;
   onBoundaryViolation?(): void;
+  /** Required for the deny-probe helper; without it the probes do not run. */
+  helperFence?: EphemeralHelperFence;
+  /** The image the helper runs: the bound selected image id when known. */
+  helperImage?: string;
 };
 
 export type RuntimeTopologyValidationResult = Readonly<{
@@ -541,16 +545,18 @@ export function validateRuntimeTopologyWithProof(
     } catch (error) {
       failDenyProbeBatch(messages, probeSpecs, error instanceof Error ? error.message : String(error));
     }
-    if (helperIp !== undefined) {
+    if (helperIp !== undefined && options.helperFence === undefined) {
+      failDenyProbeBatch(messages, probeSpecs, EPHEMERAL_HELPER_FENCE_REQUIRED);
+    } else if (helperIp !== undefined) {
       const batch = runEphemeralHelper(context, io, {
         purpose: "deny-probe",
         projectId,
-        image: input.activeRuntime.agentImage,
+        image: options.helperImage ?? input.activeRuntime.agentImage,
         user: "1000:1000",
         networkId: network.Id as string,
         ip: helperIp,
         command: ["bash", "-c", denyProbeBatchScript(probeSpecs)],
-      });
+      }, options.helperFence);
       applyDenyProbeBatchResult(messages, probeSpecs, batch, options.onBoundaryViolation, helperIp);
     }
   }

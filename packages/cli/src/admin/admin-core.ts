@@ -3481,7 +3481,8 @@ async function restartProxyAndSync(project: string, proxyId: string, policy: Loa
       if (!target) die("proxy restart needs exact runtime inputs to restore sessions; restore the inputs and retry runtime reload-policy --force");
       const { restoreSameProxySessionAdmission } = await import("../runtime/startup.ts");
       const { nodeRuntimeIO } = await import("../runtime.ts");
-      await restoreSameProxySessionAdmission({ plan: target.plan, io: withLifecycleOperationBudget(nodeRuntimeIO, () => deadline - performance.now()), lifecycleLock, proxyId });
+      await restoreSameProxySessionAdmission({ plan: target.plan, io: withLifecycleOperationBudget(nodeRuntimeIO, () => deadline - performance.now()),
+        containmentIO: nodeRuntimeIO, lifecycleLock, proxyId });
     }
     lifecycleLock.assertHeld();
     console.log("proxy restart: pending requests interrupted; approval grants and remembered denials reset; audit observations may be lost");

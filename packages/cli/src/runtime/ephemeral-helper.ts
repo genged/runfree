@@ -20,7 +20,6 @@
 
 import type { SpawnSyncOptions } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import fs from "node:fs";
 import path from "node:path";
 
 import { isExactSessionSourceIpv4 } from "@runfree/runtime-contracts/session-registry";
@@ -30,12 +29,23 @@ import {
   type EphemeralHelperPurpose,
 } from "./container-inventory.ts";
 import { dockerClientEnvOptions } from "./docker.ts";
+import {
+  createHelperRun,
+  reclaimHelperRun,
+  removeHelperRunDirectory,
+  type EphemeralHelperFence,
+  type HelperRunIntent,
+} from "./ephemeral-helper-residue.ts";
+import { wasRefusedBeforeSpawn } from "./io-refusal.ts";
+
+export type { EphemeralHelperFence } from "./ephemeral-helper-residue.ts";
 import { EPHEMERAL_HELPER_HOSTS } from "./session-container-reconciliation.ts";
 import type { CaptureResult, RuntimeContext, RuntimeIO } from "./types.ts";
 
 const DOCKER_OBJECT_ID_PATTERN = /^[a-f0-9]{64}$/;
 const VOLUME_NAME_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/;
 const DEFAULT_TIMEOUT_MS = 120_000;
+const DENY_PROBE_TIMEOUT_MS = 30_000;
 const DEFAULT_MAX_BUFFER = 4 * 1024 * 1024;
 
 /**
@@ -169,28 +179,94 @@ export function ephemeralHelperRunArguments(input: EphemeralHelperInput): string
   ];
 }
 
+/** Test-only shortening of every helper's wall-time bound (ruling D3). */
+export const EPHEMERAL_HELPER_TIMEOUT_OVERRIDE_ENV = "RUNFREE_TEST_EPHEMERAL_HELPER_TIMEOUT_MS";
+const MINIMUM_OVERRIDE_TIMEOUT_MS = 1_000;
+
+/**
+ * The wall-time bound for one helper `docker run` client, before the lifecycle
+ * budget clamps it further. Deny probes bound themselves at about 3 s, so 30 s
+ * (ruling D4); the other purposes keep 120 s. The test override may only
+ * shorten it: digits only, clamped to [1 s, default]. It never touches the
+ * reclaim timeouts.
+ */
+export function ephemeralHelperTimeoutMs(
+  purpose: EphemeralHelperPurpose,
+  env: NodeJS.ProcessEnv,
+  requestedMs?: number,
+): number {
+  const base = requestedMs ?? (purpose === "deny-probe" ? DENY_PROBE_TIMEOUT_MS : DEFAULT_TIMEOUT_MS);
+  const override = env[EPHEMERAL_HELPER_TIMEOUT_OVERRIDE_ENV];
+  if (override === undefined || !/^[0-9]{1,9}$/u.test(override)) return base;
+  return Math.min(base, Math.max(MINIMUM_OVERRIDE_TIMEOUT_MS, Number(override)));
+}
+
+function isCleanHelperExit(result: CaptureResult): boolean {
+  return result.status === 0 && result.timedOut !== true && result.signal === undefined;
+}
+
+export const EPHEMERAL_HELPER_FENCE_REQUIRED =
+  "an ephemeral helper runs the untrusted agent image and requires the lifecycle fence (held lock, containment IO, state dir)";
+
+/**
+ * Runs one helper under the lifecycle fence, bounded and reclaimable.
+ *
+ * - The intent (with a random run nonce) is recorded in a fresh host-owned run
+ *   directory before the spawn; the Docker CLI writes the container id there.
+ * - The client is SIGKILLed at its bound: `spawnSync` sends one signal and then
+ *   waits, so a SIGTERM the client forwards into the untrusted container would
+ *   leave the lock held without limit (design D-A). SIGKILL is used for helper
+ *   runs only, never as a global default.
+ * - A clean exit (status 0, no timeout, no signal) means `--rm` already removed
+ *   the container, so the directory is deleted with no Docker call.
+ * - Anything else is reclaimed by exact id through the fence's unbudgeted
+ *   containment IO, even when the budgeted call itself threw after the spawn;
+ *   the original error is rethrown after the reclaim. A refusal before the
+ *   spawn deletes the directory with no Docker call. A reclaim that cannot be
+ *   confirmed throws `EphemeralHelperUnconfirmedError` and keeps the directory.
+ */
 export function runEphemeralHelper(
   context: RuntimeContext,
   io: RuntimeIO,
   request: EphemeralHelperRequest,
+  fence: EphemeralHelperFence | undefined,
 ): CaptureResult {
-  // Each run gets its own host-owned directory for the Docker CLI's cidfile.
-  const root = path.join(context.project.paths.stateDir, "helper-runs");
-  fs.mkdirSync(root, { recursive: true, mode: 0o700 });
-  const directory = fs.mkdtempSync(path.join(root, "run-"));
+  if (!fence) throw new Error(EPHEMERAL_HELPER_FENCE_REQUIRED);
+  fence.lifecycleLock.assertHeld();
+  const intent: HelperRunIntent = {
+    v: 1,
+    projectId: request.projectId,
+    purpose: request.purpose,
+    image: request.image,
+    network: request.networkId ?? "none",
+    ...(request.ip !== undefined ? { ip: request.ip } : {}),
+    nonce: randomBytes(16).toString("hex"),
+    createdAt: new Date().toISOString(),
+  };
+  const run = createHelperRun(fence.stateDir, intent);
+  const dockerOptions = dockerClientEnvOptions(context);
+  let spawned = false;
+  let outcome: { ok: true; result: CaptureResult } | { ok: false; error: unknown };
   try {
+    const args = ephemeralHelperRunArguments({ ...request, cidFile: run.cidFile, runNonce: intent.nonce });
     const options: SpawnSyncOptions = {
-      ...dockerClientEnvOptions(context),
-      timeout: request.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+      ...dockerOptions,
+      timeout: ephemeralHelperTimeoutMs(request.purpose, context.env ?? {}, request.timeoutMs),
+      killSignal: "SIGKILL",
       maxBuffer: DEFAULT_MAX_BUFFER,
       ...(request.stdin !== undefined ? { input: request.stdin } : {}),
     };
-    return io.capture("docker", ephemeralHelperRunArguments({
-      ...request,
-      cidFile: path.join(directory, "cid"),
-      runNonce: randomBytes(16).toString("hex"),
-    }), options);
-  } finally {
-    fs.rmSync(directory, { recursive: true, force: true });
+    spawned = true;
+    outcome = { ok: true, result: io.capture("docker", args, options) };
+  } catch (error) {
+    if (wasRefusedBeforeSpawn(error)) spawned = false;
+    outcome = { ok: false, error };
   }
+  if (!spawned || outcome.ok && isCleanHelperExit(outcome.result)) {
+    removeHelperRunDirectory(run.directory);
+  } else {
+    reclaimHelperRun(run, { ...fence, dockerEnv: fence.dockerEnv ?? dockerOptions.env }, "same-process");
+  }
+  if (!outcome.ok) throw outcome.error;
+  return outcome.result;
 }

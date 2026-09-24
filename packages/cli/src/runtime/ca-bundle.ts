@@ -26,7 +26,7 @@ import fs from "node:fs";
 import path from "node:path";
 
 import { warn } from "../warnings.ts";
-import { runEphemeralHelper } from "./ephemeral-helper.ts";
+import { EPHEMERAL_HELPER_FENCE_REQUIRED, runEphemeralHelper, type EphemeralHelperFence } from "./ephemeral-helper.ts";
 import type { RuntimeContext, RuntimeIO } from "./types.ts";
 import { sha256Digest as sha256 } from "../strict-primitives.ts";
 
@@ -95,7 +95,14 @@ function readMeta(metaPath: string): CaBundleMeta | undefined {
 export function ensureAgentCaBundle(
   context: RuntimeContext,
   io: RuntimeIO,
-  input: Readonly<{ agentImage: string; projectId: string }>,
+  input: Readonly<{
+    agentImage: string;
+    projectId: string;
+    /** The image the extraction helper runs: the bound selected image id when known. */
+    helperImage?: string;
+    /** Required to run the extraction helper; without it rendering fails closed. */
+    helperFence?: EphemeralHelperFence;
+  }>,
 ): number {
   const certDir = context.project.paths.proxyCaCertDir;
   const proxyCaPath = path.join(certDir, PROXY_CA_FILE);
@@ -127,13 +134,17 @@ export function ensureAgentCaBundle(
     if (existing !== undefined && sha256(existing) === meta.bundleSha256) return 0;
   }
 
+  if (!input.helperFence) {
+    warn(`agent CA bundle failed: ${EPHEMERAL_HELPER_FENCE_REQUIRED}`);
+    return 1;
+  }
   const extracted = runEphemeralHelper(context, io, {
     purpose: "trust-bundle",
     projectId: input.projectId,
-    image: input.agentImage,
+    image: input.helperImage ?? input.agentImage,
     user: "1000:1000",
     command: ["cat", "/etc/ssl/certs/ca-certificates.crt"],
-  });
+  }, input.helperFence);
   if (extracted.status !== 0) {
     const detail = extracted.stderr.trim().slice(0, 300);
     warn(`agent CA bundle failed: could not extract system roots from ${input.agentImage}${detail ? `: ${detail}` : ""}`);

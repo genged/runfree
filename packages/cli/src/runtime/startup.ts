@@ -114,6 +114,7 @@ import {
 import type { DenyByDefaultObservationV1 } from "./control-plane-deny-proof.ts";
 import { tokenSyncComponentEvidenceIssue } from "./upgrade-classification.ts";
 import { ensureAgentCaBundle, waitForProxyCaPublished } from "./ca-bundle.ts";
+import type { EphemeralHelperFence } from "./ephemeral-helper-residue.ts";
 import type {
   ActiveAgentSession,
   DockerContainerInspect,
@@ -313,7 +314,7 @@ function ensureDependencyVolumeOwnershipOrRemoveInvalid(
   context: RuntimeContext,
   io: RuntimeIO,
   docker: RuntimeDocker,
-  options: { verbose?: boolean } = {},
+  options: { verbose?: boolean; helperFence?: EphemeralHelperFence; helperImage?: string } = {},
 ): number {
   const status = ensureDependencyVolumeOwnership(context, io, docker, options);
   if (status === 0) return 0;
@@ -623,7 +624,14 @@ function validateRuntimeTopologyOrRemoveInvalid(
   context: RuntimeContext,
   io: RuntimeIO,
   docker: RuntimeDocker,
-  options: { verbose?: boolean; expectedProxyId?: string; lifecycleLock?: ProjectLifecycleLock; containmentIO?: RuntimeIO } = {},
+  options: {
+    verbose?: boolean;
+    expectedProxyId?: string;
+    lifecycleLock?: ProjectLifecycleLock;
+    containmentIO?: RuntimeIO;
+    helperFence?: EphemeralHelperFence;
+    helperImage?: string;
+  } = {},
 ): { denyByDefaultObservation?: DenyByDefaultObservationV1; status: number; failureKind?: RuntimeFailureKind } {
   let boundaryViolated = false;
   const validation = validateRuntimeTopologyWithProof(plan, io, {
@@ -631,6 +639,8 @@ function validateRuntimeTopologyOrRemoveInvalid(
     progress: options.verbose === true,
     verbose: options.verbose,
     expectedProxyId: options.expectedProxyId,
+    helperFence: options.helperFence,
+    helperImage: options.helperImage,
   });
   if (validation.issues.length === 0) {
     return {
@@ -831,6 +841,34 @@ function checkMcpOAuthCallbackPortAvailable(
   });
 }
 
+const SELECTED_IMAGE_ID_PATTERN = /^sha256:[a-f0-9]{64}$/u;
+
+/**
+ * The image an ephemeral helper runs: the bound selected image id when the
+ * plan carries the prepared session agent for this exact image reference, so
+ * the helper runs the image admission proves and its removal proof compares
+ * the immutable id (ruling D1). Otherwise the tag, authorized at removal by
+ * the reference string plus the run nonce.
+ */
+export function ephemeralHelperImage(plan: ActiveRuntimePlan): string {
+  const prepared = plan.activeRuntime.preparedSessionAgent;
+  if (prepared
+    && prepared.selectedAgentImageRef === plan.activeRuntime.agentImage
+    && SELECTED_IMAGE_ID_PATTERN.test(prepared.selectedAgentImageId)) {
+    return prepared.selectedAgentImageId;
+  }
+  return plan.activeRuntime.agentImage;
+}
+
+/** The fence every helper needs; undefined (helpers refuse) without the lock or containment IO. */
+function ephemeralHelperFence(
+  plan: ActiveRuntimePlan,
+  options: { lifecycleLock?: ProjectLifecycleLock; containmentIO?: RuntimeIO },
+): EphemeralHelperFence | undefined {
+  if (!options.lifecycleLock || !options.containmentIO) return undefined;
+  return { lifecycleLock: options.lifecycleLock, containmentIO: options.containmentIO, stateDir: plan.paths.stateDir };
+}
+
 async function prepareRuntimeForTokenSyncOrRemoveInvalid(
   activePlan: ActiveRuntimePlan,
   context: RuntimeContext,
@@ -876,6 +914,8 @@ async function prepareRuntimeForTokenSyncOrRemoveInvalid(
     return { status: 1 };
   }
   const securityContract = createRuntimeSecurityContract(activePlan);
+  const helperFence = ephemeralHelperFence(activePlan, options);
+  const helperImage = ephemeralHelperImage(activePlan);
   if (!options.readOnly) {
   const markerResetIssue = removeRuntimeValidationMarker(validationContext, io);
   if (markerResetIssue) {
@@ -897,6 +937,8 @@ async function prepareRuntimeForTokenSyncOrRemoveInvalid(
   const caBundle = timings.time("validation:ca-bundle", () => ensureAgentCaBundle(validationContext, io, {
     agentImage: activePlan.activeRuntime.agentImage,
     projectId: activePlan.projectId,
+    helperImage,
+    helperFence,
   }));
   if (caBundle !== 0) {
     warn("agent CA bundle rendering failed; new authority was refused; repair the reported inputs and retry");
@@ -919,7 +961,7 @@ async function prepareRuntimeForTokenSyncOrRemoveInvalid(
   reportRuntimeProgress("checking dependency volumes", options.verbose);
   const dependencyVolumeOwnership = timings.time(
     "validation:dependency-volumes",
-    () => ensureDependencyVolumeOwnershipOrRemoveInvalid(validationContext, io, docker, options),
+    () => ensureDependencyVolumeOwnershipOrRemoveInvalid(validationContext, io, docker, { verbose: options.verbose, helperFence, helperImage }),
   );
   if (dependencyVolumeOwnership !== 0) return { status: dependencyVolumeOwnership };
   }
@@ -942,7 +984,7 @@ async function prepareRuntimeForTokenSyncOrRemoveInvalid(
   }
   const validation = timings.time(
     "validation:topology",
-    () => validateRuntimeTopologyOrRemoveInvalid(activePlan, validationContext, io, docker, { ...options, expectedProxyId: readinessProxyId }),
+    () => validateRuntimeTopologyOrRemoveInvalid(activePlan, validationContext, io, docker, { ...options, expectedProxyId: readinessProxyId, helperFence, helperImage }),
   );
   if (validation.status !== 0) return validation;
   reportRuntimeProgress("validating runtime security contract", options.verbose);
@@ -1638,6 +1680,11 @@ export async function restoreSameProxySessionAdmission(input: {
   lifecycleLock: ProjectLifecycleLock;
   proxyId: string;
   validation?: RuntimeTokenSyncPreparation;
+  /**
+   * Unbudgeted IO for helper reclaim. Required when no `validation` is given:
+   * the validation runs the ephemeral helpers, which refuse without it.
+   */
+  containmentIO?: RuntimeIO;
 }): Promise<void> {
   const { plan, io, lifecycleLock, proxyId } = input;
   const expectedProject = { projectId: plan.projectId, composeProject: plan.composeProjectName };
@@ -1664,7 +1711,8 @@ export async function restoreSameProxySessionAdmission(input: {
   }
   const context = runtimeContextFromActivePlan(plan);
   const { docker } = createRuntimeAdapters(context, io);
-  const validation = input.validation ?? await prepareRuntimeForTokenSyncOrRemoveInvalid(plan, context, io, docker, { lifecycleLock });
+  const validation = input.validation ?? await prepareRuntimeForTokenSyncOrRemoveInvalid(plan, context, io, docker,
+    { lifecycleLock, containmentIO: input.containmentIO });
   if (validation.status || !validation.proof || !validation.securityProof) {
     throw new Error("proxy restart validation failed; restore the reported runtime inputs and retry runtime reload-policy --force");
   }

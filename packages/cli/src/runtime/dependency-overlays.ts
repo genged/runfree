@@ -24,7 +24,7 @@ import {
 import { dockerClientEnvOptions, envOptions, parseDockerJson, shellSingleQuote, type RuntimeDocker } from "./docker.ts";
 import { composeProjectName } from "./env.ts";
 import { prepareGitRepositoryLayoutResult, readPersistedGitLayoutPlan } from "./git-layout.ts";
-import { runEphemeralHelper } from "./ephemeral-helper.ts";
+import { EPHEMERAL_HELPER_FENCE_REQUIRED, runEphemeralHelper, type EphemeralHelperFence } from "./ephemeral-helper.ts";
 import { dependencyArtifactTarget, normalizeContainerPath } from "./mount-target-policy.ts";
 import { composeManagedVolumeName } from "./session-container-template.ts";
 import { assertComposeManagedLocalVolume } from "./session-named-volume-proof.ts";
@@ -1064,6 +1064,10 @@ function dependencyVolumeCommandIssue(label: string, target: string, result: Cap
 
 type DependencyVolumeOwnershipOptions = {
   verbose?: boolean;
+  /** Required to run the preparation helpers; without it preparation fails closed. */
+  helperFence?: EphemeralHelperFence;
+  /** The image the helpers run: the bound selected image id when known. */
+  helperImage?: string;
 };
 
 const AGENT_UID = AGENT_UID_GID.split(":")[0];
@@ -1373,7 +1377,7 @@ function ensureDependencyVolumeOwnershipWithoutAgent(
 ): number {
   const plan = context.dependencyOverlayPlan;
   if (!plan || plan.mode === "off") return 0;
-  const image = context.agentImage;
+  const image = options.helperImage ?? context.agentImage;
   if (!image) {
     warn("dependency volume ownership setup failed: no selected agent image is available");
     return 1;
@@ -1393,6 +1397,11 @@ function ensureDependencyVolumeOwnershipWithoutAgent(
   }
   const volumes: DependencyPrepVolume[] = [...volumesByName.values()];
   if (volumes.length === 0) return 0;
+  const fence = options.helperFence;
+  if (!fence) {
+    warn(`dependency volume ownership setup failed: ${EPHEMERAL_HELPER_FENCE_REQUIRED}`);
+    return 1;
+  }
 
   const volumeIssue = assertDependencyPrepVolumes(context, io, project, volumes);
   if (volumeIssue) {
@@ -1413,7 +1422,7 @@ function ensureDependencyVolumeOwnershipWithoutAgent(
     capabilities: ["CHOWN"],
     volumes: prepVolumes,
     command: ["sh", "-c", dependencyPrepFixScript(volumes.length), "runfree-dependency-volume-fix"],
-  });
+  }, fence);
   if (fix.status !== 0) {
     const target = dependencyPrepFailureTarget(volumes, fix.stderr);
     const issue = dependencyVolumeValidationIssue(target, fix);
@@ -1438,7 +1447,7 @@ function ensureDependencyVolumeOwnershipWithoutAgent(
     user: AGENT_UID_GID,
     volumes: prepVolumes,
     command: ["sh", "-c", dependencyPrepProbeScript(volumes.length, `.runfree-write-test-${process.pid}`), "runfree-dependency-volume-write-probe"],
-  });
+  }, fence);
   if (probeRun.status !== 0) {
     const target = dependencyPrepFailureTarget(volumes, probeRun.stderr);
     warn(dependencyVolumeCommandIssue("dependency volume write probe", target, probeRun)

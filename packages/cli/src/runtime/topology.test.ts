@@ -17,6 +17,7 @@ import {
   UTILITY_VERSION_LABEL,
 } from "./utility-containers.ts";
 import { projectHash } from "./env.ts";
+import type { EphemeralHelperFence } from "./ephemeral-helper.ts";
 import type { CaptureResult, RuntimeContext, RuntimeIO } from "./types.ts";
 
 // Host-owned state for the deny-probe helper's run directories.
@@ -452,6 +453,7 @@ function denyProbeBatchPlanFixture(
     containers?: Record<string, { Name?: string; IPv4Address?: string }>;
     ipam?: { Config: Array<{ Gateway?: string; Subnet?: string }> };
   } = {},
+  fixtureOptions: { fence?: boolean } = {},
 ) {
   const projectRoot = "/workspace/project";
   const projectId = projectHash(projectRoot);
@@ -562,13 +564,21 @@ function denyProbeBatchPlanFixture(
   // deny-probe batch is the only place that draws the distinction from a
   // helper's own exit codes.
   const observed = { boundaryViolated: false };
+  // The helper's fence. Its containment side answers the reclaim listing with
+  // "nothing", which is what Docker shows once a failed `--rm` helper is gone.
+  const helperFence: EphemeralHelperFence | undefined = fixtureOptions.fence === false ? undefined : {
+    lifecycleLock: { assertHeld: () => {} },
+    containmentIO: { capture: () => captureResult(0) } as unknown as RuntimeIO,
+    stateDir: HELPER_STATE_DIR,
+  };
   return {
     helperRuns,
     observed,
     run: () => validateRuntimeTopology(plan, io, {
       onBoundaryViolation: () => { observed.boundaryViolated = true; },
+      helperFence,
     }).map((issue) => issue.code),
-    messages: () => validateRuntimeTopology(plan, io).map((issue) => issue.message),
+    messages: () => validateRuntimeTopology(plan, io, { helperFence }).map((issue) => issue.message),
   };
 }
 
@@ -708,4 +718,14 @@ test("the exhausted-block refusal names the block and both remedies", () => {
   expect(refusal).toContain("no free ephemeral-helper address in 172.30.0.13-.19 on agent_internal");
   expect(refusal).toContain("runfree forward stop");
   expect(refusal).toContain("runfree destroy --force");
+});
+
+test("without the lifecycle fence the deny probes are did-not-run and no helper is started", () => {
+  const fixture = denyProbeBatchPlanFixture(allDeniedBatch, {}, { fence: false });
+  const codes = fixture.run();
+
+  expect(fixture.helperRuns).toHaveLength(0);
+  for (const code of DENY_PROBE_CODES) expect(codes).toContain(code);
+  expect(fixture.messages().some((message) => message.includes("requires the lifecycle fence"))).toBe(true);
+  expect(fixture.observed.boundaryViolated).toBe(false);
 });
