@@ -3536,10 +3536,10 @@ describe("runtime command flow", () => {
       && call.args.includes("up"))).toHaveLength(1);
   });
 
-  // The Docker operations one warm `up` issues, by category. Each launch-cost
-  // task in local/plans/2026-09-23-launch-exit-docker-op-dedup.md shows its
-  // reduction as a diff of this snapshot; an unexplained increase is a
-  // regression, not a snapshot to refresh.
+  // The Docker operations one warm `up` issues, by category. A change that
+  // removes a launch operation shows its reduction as a diff of this
+  // snapshot; an unexplained increase is a regression, not a snapshot to
+  // refresh.
   test("warm up Docker operation profile", async () => {
     const projectRoot = path.join(tmp, "project");
     const project = prepareProject(projectRoot);
