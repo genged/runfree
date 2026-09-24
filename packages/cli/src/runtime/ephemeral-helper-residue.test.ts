@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { afterEach, beforeEach, describe, expect, test } from "vitest";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
 import {
   createHelperRun,
@@ -257,6 +257,24 @@ describe("helper-run records", () => {
     expect(readHelperCid(run.directory).kind).toBe("tampered");
     expect(readHelperCid(run.directory, { expectedUid: (process.getuid?.() ?? 0) + 1 }).kind).toBe("tampered");
   });
+});
+
+test("readHelperCid refuses a cidfile swapped between its lstat and its open", () => {
+  const run = createHelperRun(stateDir, intent());
+  runWithCid(run, HELPER_ID);
+  const decoy = path.join(stateDir, "decoy");
+  fs.writeFileSync(decoy, HELPER_ID);
+  const decoyStat = fs.lstatSync(decoy);
+  const cidPath = path.join(run.directory, "cid");
+  const original = fs.lstatSync.bind(fs);
+  const spy = vi.spyOn(fs, "lstatSync").mockImplementation(((target: fs.PathLike, options?: fs.StatSyncOptions) => (
+    target === cidPath ? decoyStat : original(target, options as never)
+  )) as typeof fs.lstatSync);
+  try {
+    expect(readHelperCid(run.directory)).toEqual({ kind: "tampered", reason: "cidfile changed while it was read" });
+  } finally {
+    spy.mockRestore();
+  }
 });
 
 describe("validateEphemeralHelperRemovalCandidate", () => {

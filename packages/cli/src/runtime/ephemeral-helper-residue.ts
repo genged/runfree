@@ -332,8 +332,14 @@ export function readHelperCid(directory: string, options: HelperReclaimOptions =
   if (stat.size > MAX_CID_BYTES) return { kind: "tampered", reason: "cidfile is oversized" };
   if (stat.size === 0) return { kind: "empty" };
   let content: string;
-  const descriptor = fs.openSync(cidPath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+  // O_NONBLOCK: a FIFO swapped in after the lstat must not block the read.
+  // The fstat recheck binds the read to the file the lstat judged.
+  const descriptor = fs.openSync(cidPath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
   try {
+    const opened = fs.fstatSync(descriptor);
+    if (!opened.isFile() || opened.ino !== stat.ino || opened.dev !== stat.dev) {
+      return { kind: "tampered", reason: "cidfile changed while it was read" };
+    }
     const buffer = Buffer.alloc(MAX_CID_BYTES + 1);
     const length = fs.readSync(descriptor, buffer, 0, buffer.length, 0);
     content = buffer.subarray(0, length).toString("utf8");
@@ -590,9 +596,13 @@ export function reclaimHelperRun(
 /**
  * Reclaims every helper-run directory a previous lock holder left behind
  * (security invariant I5: any run directory present when the lock is newly
- * acquired is residue). Every record is validated locally before the first
- * Docker call, so a record that cannot be trusted refuses with none. Costs one
- * `lstat` and no Docker call when there is no residue.
+ * acquired is residue). Every record's directory and intent (name, owner,
+ * no symlink, strict parse, this project) are checked before the first Docker
+ * call, so an untrusted directory or intent refuses with none. Each record's
+ * cidfile is read only when that record is reclaimed, so a tampered cidfile in
+ * a later record is refused after earlier records' Docker calls (still before
+ * any Docker call for itself). Costs one `lstat` and no Docker call when there
+ * is no residue.
  *
  * Returns how many run records were reclaimed, and how many stay pending: a
  * killed run with no container id whose nonce listing is empty but that is
@@ -651,9 +661,13 @@ export function reclaimHelperRunResidue(
     if (intentStat.size > MAX_INTENT_BYTES) throw untrusted(name, "intent is oversized");
     let intent: HelperRunIntent;
     try {
-      const descriptor = fs.openSync(intentPath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+      const descriptor = fs.openSync(intentPath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
       let text: string;
       try {
+        const opened = fs.fstatSync(descriptor);
+        if (!opened.isFile() || opened.ino !== intentStat.ino || opened.dev !== intentStat.dev) {
+          throw new Error("intent changed while it was read");
+        }
         text = fs.readFileSync(descriptor, "utf8");
       } finally {
         fs.closeSync(descriptor);
