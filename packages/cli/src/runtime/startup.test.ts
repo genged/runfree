@@ -5,6 +5,7 @@ import path from "node:path";
 import { expect, test } from "vitest";
 
 import {
+  ephemeralHelperImage,
   mcpOAuthCallbackPortHeldByOwnIngressForwarder,
   planValidatedIngressForwardersForRebuild,
   planRuntimeUpgradeFromV2State,
@@ -555,4 +556,19 @@ test.each([
   ],
 ] as const)("callback port ownership rejects %s", (_label, options) => {
   expect(forwarderOwnershipCheck(options)).toBe(false);
+});
+
+// Ruling D1: a helper runs the bound selected image id when the plan carries
+// the prepared session agent for this exact reference, so its removal proof
+// compares the immutable id; otherwise it runs the tag.
+test("ephemeral helpers run the bound selected image id only when it belongs to the plan's image", () => {
+  const selectedAgentImageId = `sha256:${"e".repeat(64)}`;
+  const plan = (prepared?: { selectedAgentImageRef: string; selectedAgentImageId: string }) => ({
+    activeRuntime: { agentImage: "runfree-agent:abc", ...(prepared ? { preparedSessionAgent: prepared } : {}) },
+  }) as unknown as Parameters<typeof ephemeralHelperImage>[0];
+
+  expect(ephemeralHelperImage(plan({ selectedAgentImageRef: "runfree-agent:abc", selectedAgentImageId }))).toBe(selectedAgentImageId);
+  expect(ephemeralHelperImage(plan())).toBe("runfree-agent:abc");
+  expect(ephemeralHelperImage(plan({ selectedAgentImageRef: "runfree-agent:other", selectedAgentImageId }))).toBe("runfree-agent:abc");
+  expect(ephemeralHelperImage(plan({ selectedAgentImageRef: "runfree-agent:abc", selectedAgentImageId: "abc" }))).toBe("runfree-agent:abc");
 });

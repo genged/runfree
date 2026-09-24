@@ -405,3 +405,60 @@ test.each([
     expect(fixture.effects.filter((effect) => !PROOF_EFFECTS.includes(effect))).toEqual(expected);
   },
 );
+
+// Review C4: `runtime reload-policy --force` reaches the restore with no
+// validation, so the restore runs the ephemeral helpers itself. It must
+// reclaim helper-run residue first, through the unbudgeted containment IO.
+function writeHelperResidue(intent: string, cid?: string): string {
+  const runDir = path.join(stateDir, "helper-runs", "run-Crash1");
+  fs.mkdirSync(runDir, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(runDir, "intent.json"), intent, { mode: 0o600 });
+  if (cid !== undefined) fs.writeFileSync(path.join(runDir, "cid"), cid);
+  return runDir;
+}
+
+const HELPER_INTENT = JSON.stringify({
+  v: 1, projectId: SESSION_TEST_PROJECT.projectId, purpose: "trust-bundle", image: "runfree-agent:crashed",
+  network: "none", nonce: "5".repeat(32), createdAt: "2026-09-24T12:00:00.000Z",
+});
+
+test("reload-policy restore refuses untrusted helper residue before any Docker call", async () => {
+  const fixture = restoreFixture();
+  const runDir = writeHelperResidue("{ torn");
+  const containment = vi.fn(() => ({ status: 0, stdout: "", stderr: "" }));
+  const before = vi.mocked(fixture.io.capture).mock.calls.length;
+
+  await expect(restoreSameProxySessionAdmission({
+    plan: fixture.plan, io: fixture.io, lifecycleLock: lifecycleLock(), proxyId: PROXY_ID,
+    containmentIO: { capture: containment } as unknown as RuntimeIO,
+  })).rejects.toThrow(/runfree destroy --force/u);
+  expect(vi.mocked(fixture.io.capture).mock.calls.length).toBe(before);
+  expect(containment).not.toHaveBeenCalled();
+  expect(fs.existsSync(runDir)).toBe(true);
+});
+
+test("reload-policy restore reclaims helper residue through the containment IO before validating", async () => {
+  const fixture = restoreFixture();
+  const runDir = writeHelperResidue(HELPER_INTENT, "4".repeat(64));
+  const containment = vi.fn((_command: string, _args: string[]) => ({ status: 0, stdout: "", stderr: "" }));
+
+  // The validation that follows needs a full runtime; only its precondition is
+  // under test here.
+  await restoreSameProxySessionAdmission({
+    plan: fixture.plan, io: fixture.io, lifecycleLock: lifecycleLock(), proxyId: PROXY_ID,
+    containmentIO: { capture: containment } as unknown as RuntimeIO,
+  }).catch(() => undefined);
+  expect(containment.mock.calls.map(([, args]) => args)).toEqual([
+    ["ps", "--all", "--quiet", "--no-trunc", "--filter", `id=${"4".repeat(64)}`],
+  ]);
+  expect(fs.existsSync(runDir)).toBe(false);
+});
+
+test("reload-policy restore without validation refuses without the containment IO", async () => {
+  const fixture = restoreFixture();
+  const before = vi.mocked(fixture.io.capture).mock.calls.length;
+  await expect(restoreSameProxySessionAdmission({
+    plan: fixture.plan, io: fixture.io, lifecycleLock: lifecycleLock(), proxyId: PROXY_ID,
+  })).rejects.toThrow(/lifecycle fence/u);
+  expect(vi.mocked(fixture.io.capture).mock.calls.length).toBe(before);
+});
