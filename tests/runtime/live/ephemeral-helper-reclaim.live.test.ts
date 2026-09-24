@@ -112,6 +112,8 @@ const RECLAIM_BOUND_MS = 21_000;
 const EXIT_SLACK_MS = 30_000;
 /** The `slow` profile's sleep: long enough to inspect, far below the 30 s bound. */
 const SLOW_PROFILE_SECONDS = 6;
+/** Bound for the live event stream to show a helper's kill+destroy after `up` returns. */
+const HELPER_EVENT_WAIT_TIMEOUT_MS = 5_000;
 
 const SQUATTER_LABEL_VALUE = "ephemeral-helper-reclaim";
 const HELPER_PROFILE_FILENAME = "runfree-live-helper-profile.sh";
@@ -326,15 +328,84 @@ function projectHelperIds(projectId: string): readonly string[] {
   ]).split("\n").map((line) => line.trim()).filter(Boolean);
 }
 
-function containerActions(id: string, sinceSeconds: number): readonly string[] {
-  return dockerOrThrow("container events", [
-    "events",
-    "--since", String(sinceSeconds),
-    "--until", String(Math.floor(Date.now() / 1000)),
-    "--filter", "type=container",
-    "--filter", `container=${id}`,
-    "--format", "{{.Action}}",
-  ]).split("\n").map((line) => line.trim()).filter(Boolean);
+/**
+ * A live `docker events` subscription for this project's ephemeral helpers.
+ *
+ * The daemon replays past events only from a bounded in-memory buffer, not
+ * from disk. An `up` under test issues many `docker exec` calls for the deny
+ * probes (each an exec_create/exec_start/exec_die event), and those — plus
+ * unrelated host activity — can evict a helper's own kill/destroy from that
+ * buffer before a query made *after* `up` returns ever asks for them; a
+ * standalone reproduction showed a removed container's events gone after
+ * about 450 later events. Subscribing before `up` starts and reading the
+ * stream as events arrive (no `--until`) sidesteps the replay buffer
+ * entirely: `--since` only back-fills what happened between spawn and
+ * subscription, and everything after is delivered live.
+ */
+type HelperEventStream = Readonly<{
+  actionsFor(id: string): readonly string[];
+  stop(): void;
+}>;
+
+function startHelperEventStream(fixture: LiveFixture, identity: ProjectIdentity, sinceSeconds: number): HelperEventStream {
+  const child = childProcess.spawn(
+    "docker",
+    [
+      "events",
+      "--since", String(sinceSeconds),
+      "--no-trunc",
+      "--filter", "type=container",
+      "--filter", `label=${PROJECT_ID_LABEL}=${identity.projectId}`,
+      "--filter", `label=${CONTAINER_ROLE_LABEL}=ephemeral-helper`,
+      "--format", "{{.ID}} {{.Action}}",
+    ],
+    { env: fixture.env, stdio: ["ignore", "pipe", "pipe"] },
+  );
+  child.on("error", () => { /* surfaced only through an empty/missing action list at assertion time */ });
+  const actions = new Map<string, string[]>();
+  let buffer = "";
+  const consume = (chunk: Buffer | string): void => {
+    buffer += String(chunk);
+    let newlineIndex = buffer.indexOf("\n");
+    while (newlineIndex !== -1) {
+      const line = buffer.slice(0, newlineIndex).trim();
+      buffer = buffer.slice(newlineIndex + 1);
+      newlineIndex = buffer.indexOf("\n");
+      const spaceIndex = line.indexOf(" ");
+      if (spaceIndex !== -1) {
+        const id = line.slice(0, spaceIndex);
+        const action = line.slice(spaceIndex + 1);
+        const existing = actions.get(id);
+        if (existing) existing.push(action); else actions.set(id, [action]);
+      }
+    }
+  };
+  child.stdout?.on("data", consume);
+  let stopped = false;
+  return Object.freeze({
+    actionsFor: (id: string) => actions.get(id) ?? [],
+    stop: () => {
+      if (stopped) return;
+      stopped = true;
+      child.kill("SIGKILL");
+    },
+  });
+}
+
+/** Polls the live stream, bounded, until `id` has shown every action in `expected`. */
+async function waitForHelperEvents(
+  stream: HelperEventStream,
+  id: string,
+  expected: readonly string[],
+  timeoutMs: number,
+): Promise<readonly string[]> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const actions = stream.actionsFor(id);
+    if (expected.every((action) => actions.includes(action))) return actions;
+    if (Date.now() >= deadline) return actions;
+    await sleep(100);
+  }
 }
 
 function agentInternalEndpoint(inspect: HelperInspect, networkId: string) {
@@ -713,36 +784,43 @@ describe("ephemeral helpers are bounded, reclaimed by exact id, and pinned outsi
   test("L2: a helper past its bound is SIGKILLed and removed by exact id; up fails closed and the next up succeeds", async () => {
     restageHelperProfile(fixture, "hang");
     const startedSeconds = Math.floor(Date.now() / 1000) - 1;
-    const up = spawnRunfree(fixture, ["up"], { [EPHEMERAL_HELPER_TIMEOUT_OVERRIDE_ENV]: String(SHORTENED_HELPER_TIMEOUT_MS) });
-    let helper: ObservedHelper;
-    let exit: RunfreeExit;
+    // Subscribe live before `up` starts; see the stream's own doc comment for
+    // why a post-hoc `docker events` query cannot be trusted here.
+    const events = startHelperEventStream(fixture, identity, startedSeconds);
     try {
-      helper = await observeRunningHelper(identity, up);
-      exit = await up.completion;
-    } finally {
-      killProcessGroup(up);
-    }
-    const output = describeOutput(exit.output, 4000);
-    expect(exit.status, `up must fail closed when the deny probes did not finish: ${output}`).not.toBe(0);
-    expect(exit.output, "the refusal must name the unfinished deny-probe batch").toContain(TIMED_OUT_BATCH_TEXT);
-    expect(exit.output, "the refusal must be the agent-position deny probes").toMatch(/agent-position .* denial probe did not run/u);
-    expect(exit.output, `the reclaim must not be left unconfirmed: ${output}`).not.toMatch(/could not be confirmed removed|cannot be trusted/u);
-    const boundMs = SHORTENED_HELPER_TIMEOUT_MS + RECLAIM_BOUND_MS + EXIT_SLACK_MS;
-    const elapsedMs = exit.endedAt - helper.firstSeenAt;
-    process.stderr.write(
-      `ephemeral-helper-reclaim: I1 observed: up returned ${elapsedMs} ms after the hung helper appeared (bound ${boundMs} ms, helper timeout ${SHORTENED_HELPER_TIMEOUT_MS} ms)\n`,
-    );
-    expect(
-      elapsedMs,
-      `I1: up must return within the shortened helper bound plus the reclaim bound (${boundMs} ms) after the hung helper appeared`,
-    ).toBeLessThan(boundMs);
+      const up = spawnRunfree(fixture, ["up"], { [EPHEMERAL_HELPER_TIMEOUT_OVERRIDE_ENV]: String(SHORTENED_HELPER_TIMEOUT_MS) });
+      let helper: ObservedHelper;
+      let exit: RunfreeExit;
+      try {
+        helper = await observeRunningHelper(identity, up);
+        exit = await up.completion;
+      } finally {
+        killProcessGroup(up);
+      }
+      const output = describeOutput(exit.output, 4000);
+      expect(exit.status, `up must fail closed when the deny probes did not finish: ${output}`).not.toBe(0);
+      expect(exit.output, "the refusal must name the unfinished deny-probe batch").toContain(TIMED_OUT_BATCH_TEXT);
+      expect(exit.output, "the refusal must be the agent-position deny probes").toMatch(/agent-position .* denial probe did not run/u);
+      expect(exit.output, `the reclaim must not be left unconfirmed: ${output}`).not.toMatch(/could not be confirmed removed|cannot be trusted/u);
+      const boundMs = SHORTENED_HELPER_TIMEOUT_MS + RECLAIM_BOUND_MS + EXIT_SLACK_MS;
+      const elapsedMs = exit.endedAt - helper.firstSeenAt;
+      process.stderr.write(
+        `ephemeral-helper-reclaim: I1 observed: up returned ${elapsedMs} ms after the hung helper appeared (bound ${boundMs} ms, helper timeout ${SHORTENED_HELPER_TIMEOUT_MS} ms)\n`,
+      );
+      expect(
+        elapsedMs,
+        `I1: up must return within the shortened helper bound plus the reclaim bound (${boundMs} ms) after the hung helper appeared`,
+      ).toBeLessThan(boundMs);
 
-    expect(containerExists(helper.id), "the hung helper must be removed").toBe(false);
-    const actions = containerActions(helper.id, startedSeconds);
-    expect(actions, `the hung helper must have been force-removed (kill then destroy), not exited on its own: ${actions.join(",")}`)
-      .toEqual(expect.arrayContaining(["kill", "destroy"]));
-    expect(fs.existsSync(helper.runDirectory), "the removed helper's run record must be deleted").toBe(false);
-    assertNoHelperResidue(identity, "after a timed-out helper");
+      expect(containerExists(helper.id), "the hung helper must be removed").toBe(false);
+      const actions = await waitForHelperEvents(events, helper.id, ["kill", "destroy"], HELPER_EVENT_WAIT_TIMEOUT_MS);
+      expect(actions, `the hung helper must have been force-removed (kill then destroy), not exited on its own: ${actions.join(",")}`)
+        .toEqual(expect.arrayContaining(["kill", "destroy"]));
+      expect(fs.existsSync(helper.runDirectory), "the removed helper's run record must be deleted").toBe(false);
+      assertNoHelperResidue(identity, "after a timed-out helper");
+    } finally {
+      events.stop();
+    }
 
     // Load-bearing half: remove the hang, and the next up succeeds without
     // meeting a held lifecycle lock.
