@@ -96,8 +96,13 @@ const CAPTURE_MAX_BYTES = 8 * 1024 * 1024;
 
 /** How long an `up` may take to show its deny-probe helper (a rebuild included). */
 const HELPER_APPEAR_TIMEOUT_MS = 10 * 60_000;
-/** The test-shortened helper bound (ruling D3: digits only, may only shorten). */
-const SHORTENED_HELPER_TIMEOUT_MS = 8_000;
+/**
+ * The test-shortened helper bound (ruling D3: digits only, clamped to
+ * [1000, 30000], may only shorten). 12 s rather than lower so a loaded Docker
+ * Desktop host (the CA-bundle and dependency helpers share the override) does
+ * not produce a false timeout.
+ */
+const SHORTENED_HELPER_TIMEOUT_MS = 12_000;
 /**
  * The reclaim's own fixed bound: inspect, image inspect, rm, and the bounded
  * absence poll (about 21 s; design I1 as amended by C6). Never shortened.
@@ -560,9 +565,15 @@ describe("ephemeral helpers are bounded, reclaimed by exact id, and pinned outsi
 
   afterAll(() => {
     if (!fixture) return;
-    for (const host of EPHEMERAL_HELPER_HOSTS) forceRemoveContainer(squatterName(`${identity?.prefix ?? "0.0.0"}.${host}`));
-    // A helper this file created directly, or one a failed assertion left.
-    if (identity) for (const id of projectHelperIds(identity.projectId)) forceRemoveContainer(id);
+    // Best-effort sweep: a failing Docker listing here must never skip the
+    // fixture teardown below.
+    try {
+      for (const host of EPHEMERAL_HELPER_HOSTS) forceRemoveContainer(squatterName(`${identity?.prefix ?? "0.0.0"}.${host}`));
+      // A helper this file created directly, or one a failed assertion left.
+      if (identity) for (const id of projectHelperIds(identity.projectId)) forceRemoveContainer(id);
+    } catch (error) {
+      process.stderr.write(`ephemeral-helper-reclaim: helper sweep failed before teardown: ${error instanceof Error ? error.message : String(error)}\n`);
+    }
     destroyLiveFixture(fixture, { keepHostState: process.env.TEST_RUNTIME_KEEP_PROJECT === "1" });
   });
 
@@ -717,8 +728,12 @@ describe("ephemeral helpers are bounded, reclaimed by exact id, and pinned outsi
     expect(exit.output, "the refusal must be the agent-position deny probes").toMatch(/agent-position .* denial probe did not run/u);
     expect(exit.output, `the reclaim must not be left unconfirmed: ${output}`).not.toMatch(/could not be confirmed removed|cannot be trusted/u);
     const boundMs = SHORTENED_HELPER_TIMEOUT_MS + RECLAIM_BOUND_MS + EXIT_SLACK_MS;
+    const elapsedMs = exit.endedAt - helper.firstSeenAt;
+    process.stderr.write(
+      `ephemeral-helper-reclaim: I1 observed: up returned ${elapsedMs} ms after the hung helper appeared (bound ${boundMs} ms, helper timeout ${SHORTENED_HELPER_TIMEOUT_MS} ms)\n`,
+    );
     expect(
-      exit.endedAt - helper.firstSeenAt,
+      elapsedMs,
       `I1: up must return within the shortened helper bound plus the reclaim bound (${boundMs} ms) after the hung helper appeared`,
     ).toBeLessThan(boundMs);
 
@@ -734,6 +749,8 @@ describe("ephemeral helpers are bounded, reclaimed by exact id, and pinned outsi
     restageHelperProfile(fixture, "slow");
     const next = await runfreeAsync(fixture, ["up"]);
     expect(next.status, `the up after the hang was removed must succeed: ${describeOutput(next.output, 4000)}`).toBe(0);
+    // Weak by design: a stale lock from a dead owner is reclaimed anyway, so
+    // this only catches a live holder; the I1 timing above carries the proof.
     expect(next.output, "the failed up must have released the lifecycle lock").not.toContain(LOCK_CONTENTION_TEXT);
     assertNoHelperResidue(identity, "after the recovering up");
   }, TEST_TIMEOUT_MS);
