@@ -729,3 +729,30 @@ test("without the lifecycle fence the deny probes are did-not-run and no helper 
   expect(fixture.messages().some((message) => message.includes("requires the lifecycle fence"))).toBe(true);
   expect(fixture.observed.boundaryViolated).toBe(false);
 });
+
+// Refusal, then its reclaim: with every helper-block address squatted there is
+// no `docker run` at all; once one squatter is gone the helper runs pinned to
+// exactly that freed address.
+test("an exhausted helper block refuses without docker run, and a freed address is where the helper then runs", () => {
+  const squatters = (hosts: readonly number[]) => {
+    const containers: Record<string, { Name?: string; IPv4Address?: string }> = {
+      "proxy-id": { Name: "proxy", IPv4Address: "172.30.0.10/24" },
+    };
+    for (const host of hosts) {
+      containers[host.toString(16).padStart(64, "a")] = { Name: `squatter-${host}`, IPv4Address: `172.30.0.${host}/24` };
+    }
+    return containers;
+  };
+
+  const exhausted = denyProbeBatchPlanFixture(allDeniedBatch, { containers: squatters([13, 14, 15, 16, 17, 18, 19]) });
+  const refused = exhausted.run();
+  expect(exhausted.helperRuns).toHaveLength(0);
+  for (const code of DENY_PROBE_CODES) expect(refused).toContain(code);
+
+  const freed = denyProbeBatchPlanFixture(allDeniedBatch, { containers: squatters([13, 14, 15, 17, 18, 19]) });
+  const codes = freed.run();
+  expect(freed.helperRuns).toHaveLength(1);
+  const [helper] = freed.helperRuns;
+  expect(helper[helper.indexOf("--ip") + 1]).toBe("172.30.0.16");
+  for (const code of DENY_PROBE_CODES) expect(codes).not.toContain(code);
+});
