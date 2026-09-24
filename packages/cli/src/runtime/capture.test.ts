@@ -2,6 +2,7 @@ import { expect, test } from "vitest";
 
 import { runCapture } from "../admin/admin-core.ts";
 import { nodeRuntimeIO } from "../runtime.ts";
+import { failClosedSpawnStatus } from "./spawn-status.ts";
 
 // Real child processes, not Docker: the fault is in how a spawnSync result is
 // mapped to a status, so a `node -e` child that behaves like a wedged Docker
@@ -23,10 +24,39 @@ test.each(captures)("%s: a timed-out child that ignores SIGTERM and exits 0 is n
 });
 
 test.each(captures)("%s: an output flood past maxBuffer (ENOBUFS) is not success", (_name, capture) => {
-  expect(capture(FLOOD_IGNORING_TERM, { maxBuffer: 1024 }).status).not.toBe(0);
-  const killed = capture(FLOOD, { maxBuffer: 1024 });
-  expect(killed.status).not.toBe(0);
-  expect(killed.signal).toBe("SIGTERM");
+  // Whether Node's kill or the child's own exit ends the call depends on load,
+  // so assert only that the result is an unfinished call, never an answer.
+  for (const script of [FLOOD_IGNORING_TERM, FLOOD]) {
+    const result = capture(script, { maxBuffer: 1024 });
+    expect(result.status).not.toBe(0);
+    expect(result.status).not.toBe(1);
+  }
+});
+
+test.each(captures)("%s: a timed-out child that later exits 1 is a timeout, not a definite no", (_name, capture) => {
+  const result = capture("process.on('SIGTERM', () => {}); setTimeout(() => process.exit(1), 1500);", { timeout: 500 });
+  expect(result).toMatchObject({ status: 124, timedOut: true });
+});
+
+test.each([
+  ["runtime capture", () => nodeRuntimeIO.capture("/nonexistent/runfree-no-such-binary", [])],
+  ["admin runCapture", () => runCapture("/nonexistent/runfree-no-such-binary", [], { env: process.env })],
+] as const)("%s: a spawn error (ENOENT) is 125, never 1", (_name, capture) => {
+  expect(capture().status).toBe(125);
+});
+
+test.each([
+  ["timeout, then exit 0", { status: 0, signal: null, error: Object.assign(new Error("t"), { code: "ETIMEDOUT" }) }, { status: 124, timedOut: true }],
+  ["timeout, then exit 1", { status: 1, signal: null, error: Object.assign(new Error("t"), { code: "ETIMEDOUT" }) }, { status: 124, timedOut: true }],
+  ["timeout, then SIGTERM", { status: null, signal: "SIGTERM", error: Object.assign(new Error("t"), { code: "ETIMEDOUT" }) }, { status: 124, timedOut: true, signal: "SIGTERM" }],
+  ["ENOBUFS, then exit 0", { status: 0, signal: null, error: Object.assign(new Error("b"), { code: "ENOBUFS" }) }, { status: 125 }],
+  ["ENOBUFS, then exit 1", { status: 1, signal: null, error: Object.assign(new Error("b"), { code: "ENOBUFS" }) }, { status: 125 }],
+  ["ENOENT", { status: null, signal: null, error: Object.assign(new Error("n"), { code: "ENOENT" }) }, { status: 125 }],
+  ["SIGKILL", { status: null, signal: "SIGKILL", error: undefined }, { status: 137, signal: "SIGKILL" }],
+  ["clean exit 1", { status: 1, signal: null, error: undefined }, { status: 1 }],
+  ["clean exit 0", { status: 0, signal: null, error: undefined }, { status: 0 }],
+] as const)("failClosedSpawnStatus: %s", (_name, result, expected) => {
+  expect(failClosedSpawnStatus(result as Parameters<typeof failClosedSpawnStatus>[0])).toEqual(expected);
 });
 
 test.each(captures)("%s: a child killed by a signal is not success", (_name, capture) => {
