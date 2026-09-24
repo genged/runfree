@@ -58,7 +58,7 @@ import {
   sha256Digest,
   type RuntimeComponentState,
 } from "./runtime/component-state.ts";
-import { createRuntimePlan } from "./runtime/plan.ts";
+import { activeRuntimePlanFromContext, createRuntimePlan } from "./runtime/plan.ts";
 import { NON_RESOLVING_CONNECT_PROBE_HOST } from "./runtime/probes.ts";
 import {
   bindAllocatedSessionContainerIdV2,
@@ -101,9 +101,9 @@ import {
 import { runtimeDryRun } from "./runtime/front.ts";
 import { repairWorktreeLinks } from "./runtime/git-layout.ts";
 import { subprocessCategory } from "./runtime/operation-histogram.ts";
-import { COMPOSE_UP_FAILURE_REMEDY, startRuntime, up } from "./runtime/startup.ts";
+import { COMPOSE_UP_FAILURE_REMEDY, restoreSameProxySessionAdmission, startRuntime, up } from "./runtime/startup.ts";
 import { flushWarnings, pendingWarningsForTest } from "./warnings.ts";
-import { projectLifecycleLockPath } from "./runtime/sessions.ts";
+import { projectLifecycleLockPath, tryAcquireProjectLifecycleLockWithRetry } from "./runtime/sessions.ts";
 
 // Real `docker ps -q`/`-aq` prints 12-character short IDs unless `--no-trunc`
 // is passed, while `docker inspect` resolves a prefix but always reports the
@@ -3728,6 +3728,35 @@ describe("runtime command flow", () => {
       expect(vi.mocked(console.error).mock.calls.flat().join("\n")).toContain("killed ephemeral helper run(s) are kept");
       expect(dockerArgs(io).some((args) => args.includes(`label=io.runfree.helper-run=${NONCE}`))).toBe(true);
       expect(fs.existsSync(runDir)).toBe(true);
+    });
+
+    // Review C4, end to end: `runtime reload-policy --force` rebuilds the plan
+    // from the context (as admin does) and restores with no validation, so
+    // the restore runs the helpers itself. The fence must reach them.
+    test("the reload-policy restore runs its helpers under the fence and reclaims residue first", async () => {
+      const { context, runDir, lockPath } = residueContext();
+      const projectId = projectHash(context.projectRoot);
+      const io = createRuntimeIO();
+      expect((await startRuntime(context, io, false, {})).status).toBe(0);
+      writeResidue(runDir, projectId);
+      const plan = activeRuntimePlanFromContext(context);
+      const proxyId = readEffectiveControlPlaneV2(plan.paths.stateDir)?.selection.proxyContainerId as string;
+      const lock = await tryAcquireProjectLifecycleLockWithRetry(context);
+      if (!lock) throw new Error("lock not acquired");
+      const containment = residueDocker({ present: true, projectId, lockPath });
+      try {
+        const start = io.calls.length;
+        await restoreSameProxySessionAdmission({ plan, io, lifecycleLock: lock, proxyId, containmentIO: containment.io });
+        // Residue first, through the containment IO.
+        expect(dockerArgs(containment.io).some((args) => args[0] === "rm" && args[2] === HELPER_ID)).toBe(true);
+        expect(fs.existsSync(runDir)).toBe(false);
+        // Then the validation's helpers ran (the deny probe at least), fenced.
+        const helperRuns = io.calls.slice(start).filter((call) => call.command === "docker" && call.args[0] === "run");
+        expect(helperRuns.some((call) => call.args.includes("io.runfree.helper-purpose=deny-probe"))).toBe(true);
+        expect(helperRuns.every((call) => call.args.includes("--cidfile"))).toBe(true);
+      } finally {
+        lock.release();
+      }
     });
 
     test("no residue adds no Docker call: two warm starts issue the same operations", async () => {
