@@ -52,9 +52,14 @@ export type RuntimeContext = {
 };
 
 export type CaptureResult = {
+  // Non-zero whenever the call timed out, overran its buffer, or was killed,
+  // even if the child's own exit code was 0; see failClosedSpawnStatus.
   status: number;
   stdout: string;
   stderr: string;
+  // Diagnostics only; `status` already carries the failure.
+  timedOut?: boolean;
+  signal?: NodeJS.Signals;
 };
 
 // The fixed set of internal admin actions the runtime issues in-process. The

@@ -134,8 +134,9 @@ function readGitConfigValue(filePath: string, key: string, boolean = false): str
     encoding: "utf8",
     timeout: 5_000,
   });
-  if (result.status === 1) return undefined;
-  if (result.error || result.status !== 0) {
+  // A timeout or kill can still leave status 1 (or 0); only a clean exit is an answer.
+  if (!result.error && !result.signal && result.status === 1) return undefined;
+  if (result.error || result.signal || result.status !== 0) {
     throw new Error(`${filePath}: Git could not read ${key}: ${result.error?.message ?? result.stderr.trim()}`);
   }
   return result.stdout.replace(/\0$/, "");

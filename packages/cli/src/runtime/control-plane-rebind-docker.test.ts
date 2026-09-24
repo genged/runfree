@@ -1,6 +1,6 @@
 import { expect, test, vi } from "vitest";
 import { REBIND_ATTEMPT_LABEL, REBIND_TRANSACTION_LABEL } from "./container-inventory.ts";
-import { inspectRebindCreation } from "./control-plane-rebind-docker.ts";
+import { inspectRebindCreation, rebindParticipantIsAbsent } from "./control-plane-rebind-docker.ts";
 import type { ControlPlaneRebindTransaction } from "./control-plane-rebind.ts";
 import type { ActiveRuntimePlan } from "./plan.ts";
 import type { RuntimeIO } from "./types.ts";
@@ -63,3 +63,30 @@ test.each(["image", "network", "marker", "endpoint", "unavailable", "fence"] as 
     expect(inspectRebindCreation(state.input)).toEqual({ stoppedProxyId: state.proxy.Id });
   },
 );
+
+// What capture returns for a Docker call that timed out (or was killed) even
+// when the client itself exited 0: a non-zero status with empty output.
+const timedOut = { status: 124, stdout: "", stderr: "", timedOut: true };
+
+test("a timed-out creation inventory with empty output is not an absent candidate; a retry recovers", () => {
+  const state = fixture();
+  const answer = state.capture.getMockImplementation() as NonNullable<ReturnType<typeof state.capture.getMockImplementation>>;
+  state.capture.mockImplementation((command, args) => args[0] === "ps" ? timedOut : answer(command, args));
+  expect(() => inspectRebindCreation(state.input)).toThrow("proxy creation inventory is unavailable");
+  expect(state.capture.mock.calls.every(([, args]) => args[0] === "ps")).toBe(true);
+  state.capture.mockImplementation(answer);
+  expect(inspectRebindCreation(state.input)).toBe("recover");
+});
+
+test("a timed-out departure inventory never judges a participant absent; a retry answers from Docker", () => {
+  const containerId = "e".repeat(64);
+  let reply: { status: number; stdout: string; stderr: string; timedOut?: boolean } = timedOut;
+  const capture = vi.fn((_command: string, _args: string[]) => reply);
+  const input = { containerId, io: { capture }, assertAuthority: () => {} };
+  expect(() => rebindParticipantIsAbsent(input)).toThrow("session departure inventory is unavailable");
+  expect(capture.mock.calls[0][1]).toEqual(["ps", "--all", "--quiet", "--no-trunc", "--filter", `id=${containerId}`]);
+  reply = { status: 0, stdout: `${containerId}\n`, stderr: "" };
+  expect(rebindParticipantIsAbsent(input)).toBe(false);
+  reply = { status: 0, stdout: "", stderr: "" };
+  expect(rebindParticipantIsAbsent(input)).toBe(true);
+});

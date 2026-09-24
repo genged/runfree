@@ -63,3 +63,24 @@ export function inspectRebindCreation(input: {
   }
   return "create";
 }
+
+/**
+ * Whether a rebind participant's container is gone. Only a successful, clean
+ * inventory proves absence; a failed, timed-out or killed call refuses so the
+ * participant receipt is preserved.
+ */
+export function rebindParticipantIsAbsent(input: {
+  containerId: string | undefined;
+  io: Pick<RuntimeIO, "capture">;
+  env?: NodeJS.ProcessEnv;
+  assertAuthority(): void;
+}): boolean {
+  if (!input.containerId) return false;
+  input.assertAuthority();
+  const found = input.io.capture("docker", ["ps", "--all", "--quiet", "--no-trunc", "--filter", `id=${input.containerId}`],
+    { env: input.env, timeout: 1000, maxBuffer: 8192 });
+  input.assertAuthority();
+  if (found.status !== 0 || found.stderr.trim()) throw new RuntimeObservationError({ kind: "observation-unavailable", subject: "session",
+    expectedIdentity: input.containerId, phase: "sessions-revalidated", observation: "session departure inventory is unavailable; preserve its participant receipt" });
+  return found.stdout.trim() === "";
+}

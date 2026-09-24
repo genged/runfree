@@ -7,7 +7,7 @@ import { readControlApprovalSelection } from "../control/approvals.ts";
 import { containExactOwnedProxy, observeExactProxy } from "./proxy-containment.ts";
 import { withRebindBudgetIO } from "./control-plane-rebind-budget.ts";
 import { RuntimeObservationError, type RuntimeFailureKind } from "./observation-failure.ts";
-import { inspectRebindCreation } from "./control-plane-rebind-docker.ts";
+import { inspectRebindCreation, rebindParticipantIsAbsent } from "./control-plane-rebind-docker.ts";
 
 import { projectHash } from "../project-identity.ts";
 import { runfreeLog, warn } from "../warnings.ts";
@@ -1465,16 +1465,8 @@ export async function startRuntime(
             },
             proveCandidate,
             reproveCandidate,
-            participantIsAbsent: (record) => {
-              if (!record.containerId) return false;
-              heldLifecycleLock.assertHeld();
-              const found = rebindIO.capture("docker", ["ps", "--all", "--quiet", "--no-trunc", "--filter", `id=${record.containerId}`],
-                { env: activePlan.execution.dockerClientEnv, timeout: 1000, maxBuffer: 8192 });
-              heldLifecycleLock.assertHeld();
-              if (found.status !== 0 || found.stderr.trim()) throw new RuntimeObservationError({ kind: "observation-unavailable", subject: "session",
-                expectedIdentity: record.containerId, phase: "sessions-revalidated", observation: "session departure inventory is unavailable; preserve its participant receipt" });
-              return found.stdout.trim() === "";
-            },
+            participantIsAbsent: (record) => rebindParticipantIsAbsent({ containerId: record.containerId, io: rebindIO,
+              env: activePlan.execution.dockerClientEnv, assertAuthority: () => heldLifecycleLock.assertHeld() }),
             proveSession: (replacementRecord) => {
               heldLifecycleLock.assertHeld();
               const transactionCandidate = readControlPlaneRebindTransaction(

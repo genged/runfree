@@ -115,7 +115,8 @@ import {
   type RuntimeSecurityContract,
   type RuntimeSecurityContractEvidence,
 } from "../runtime/security-contract.ts";
-import type { DockerContainerInspect, RuntimeContext } from "../runtime/types.ts";
+import type { CaptureResult, DockerContainerInspect, RuntimeContext } from "../runtime/types.ts";
+import { failClosedSpawnStatus } from "../runtime/spawn-status.ts";
 import {
   effectiveControlPlaneComponentEvidenceIssue,
   runtimeComponentEvidenceIssue,
@@ -1120,14 +1121,14 @@ function commandExists(command: string): boolean {
   return result.status === 0;
 }
 
-export function runCapture(command: string, args: string[], options: childProcess.SpawnSyncOptions = {}): { status: number; stdout: string; stderr: string } {
+export function runCapture(command: string, args: string[], options: childProcess.SpawnSyncOptions = {}): CaptureResult {
   const result = adminSpawnSync(command, args, {
     encoding: "utf8",
     env: childEnvForCommand(command),
     ...options,
   });
   return {
-    status: result.status ?? 1,
+    ...failClosedSpawnStatus(result),
     stdout: typeof result.stdout === "string" ? result.stdout : "",
     stderr: typeof result.stderr === "string" ? result.stderr : "",
   };
@@ -1770,7 +1771,7 @@ function writeProxyRuntimeToken(proxyId: string, name: string, value: string): v
     encoding: "utf8",
     env: dockerChildEnv(),
   });
-  if ((result.status ?? 1) !== 0) {
+  if (failClosedSpawnStatus(result).status !== 0) {
     const stderr = typeof result.stderr === "string" ? result.stderr.trim() : "";
     throw new Error(stderr || `failed to write ${name} token into proxy tmpfs`);
   }
