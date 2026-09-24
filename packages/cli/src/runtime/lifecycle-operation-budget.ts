@@ -1,3 +1,4 @@
+import { checkBeforeSpawn } from "./io-refusal.ts";
 import { RuntimeObservationError } from "./observation-failure.ts";
 import type { RuntimeIO } from "./types.ts";
 
@@ -14,12 +15,12 @@ export function withLifecycleOperationBudget(io: RuntimeIO, remainingMs: () => n
   };
   return { ...io,
     capture(command, args, options = {}) {
-      const budget = remaining();
+      const budget = checkBeforeSpawn(remaining);
       const result = io.capture(command, args, budget === undefined ? options : { ...options, timeout: Math.min(options.timeout ?? budget, budget) });
       remaining(); return result;
     },
     run(command, args, options = {}) {
-      const budget = remaining();
+      const budget = checkBeforeSpawn(remaining);
       const result = io.run(command, args, budget === undefined ? options : { ...options, timeout: Math.min(options.timeout ?? budget, budget) });
       remaining(); return result;
     },
