@@ -314,7 +314,19 @@ function stopProjectLabeledContainers(input: FencedProjectDestroyInput): void {
     const detail = listed.stderr.trim().slice(0, 512) || `exit ${listed.status}`;
     throw new Error(`${operationName(input)} could not list running project containers before session removal: ${detail}`);
   }
-  for (const containerId of listed.stdout.trim().split(/\s+/).filter(Boolean)) {
+  const running = listed.stdout.trim().split(/\s+/).filter(Boolean);
+  if (running.length === 0) return;
+  // One call: the Docker CLI issues the per-id stops concurrently, so N live
+  // sessions share one grace period instead of paying for N sequential ones.
+  // On any failure, fall back to exact per-container stops so each failure
+  // is attributed and proven exactly as before.
+  const batch = input.io.capture(
+    "docker",
+    ["container", "stop", "--time", String(SESSION_CONTAINER_STOP_SECONDS), ...running],
+    dockerClientEnvOptions(input.context),
+  );
+  if (batch.status === 0) return;
+  for (const containerId of running) {
     const stopped = input.io.capture(
       "docker",
       ["container", "stop", "--time", String(SESSION_CONTAINER_STOP_SECONDS), containerId],

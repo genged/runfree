@@ -2572,10 +2572,14 @@ function syncTokensUnderLock(
     for (const name of expectedNames) resolvePreparedRuntimeTokenSource(name, config[name], { quiet: true, sourceRegistry: config[name].source === "named" ? sourceRegistry : undefined });
   }
   const retryDelayMs = sourceRegistryError === undefined ? tokenRetryDelayMs(config, sourceRegistry) : 60_000;
+  // Fences sit before each side-effect phase: the removal below, source
+  // resolution, the proxy write, the failure removal, and the post-loop
+  // cleanup and persistence. A token that is not due takes no action, so it
+  // needs no proxy re-observation.
   for (const [tokenName, tokenPolicy] of Object.entries(policy.tokens)) {
-    assertSelection();
     const source = config[tokenName];
     if (!source) {
+      assertSelection();
       // Intentional local state change (source removed): immediate delete and
       // receipt retraction, never receipt-gated.
       if (runtime.id) {
@@ -2693,6 +2697,9 @@ function syncTokensUnderLock(
         if (!options.quiet) console.error(`${tokenName}: sync failed (${staleMessage})`);
         continue;
       }
+      // The failure may precede the pre-resolution fence (source registry,
+      // refresh, or due checks), so fence the removal itself.
+      assertSelection();
       if (runtime.id) {
         try {
           removeProxyRuntimeToken(runtime.id, tokenName);
@@ -2711,6 +2718,9 @@ function syncTokensUnderLock(
     }
   }
 
+  // Skipped tokens take no fence, so re-observe before the dropped-token
+  // removals and the status/receipt persistence in finish().
+  assertSelection();
   for (const [tokenName, source] of Object.entries(config)) {
     if (policy.tokens[tokenName]) continue;
 
