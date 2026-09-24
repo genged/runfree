@@ -581,6 +581,33 @@ describe("reclaimHelperRun", () => {
     expect(sleeps.length).toBe(2);
   });
 
+  test("a failed poll observation counts as still present, and a later absence confirms the removal", () => {
+    const docker = fakeDocker([helperInspect()]);
+    let looks = 0;
+    docker.hooks.ps = () => {
+      if (docker.rmCalls().length === 0) return undefined;
+      looks += 1;
+      return looks === 1 ? { status: 124, stdout: "", stderr: "", timedOut: true } : { status: 0, stdout: "", stderr: "" };
+    };
+    const run = createHelperRun(stateDir, intent());
+    runWithCid(run, HELPER_ID);
+    expect(reclaimHelperRun(run, docker.fence(), "same-process", { sleep: () => {}, pollDeadlineMs: 5_000 })).toBe("removed");
+    expect(looks).toBe(2);
+    expect(fs.existsSync(run.directory)).toBe(false);
+  });
+
+  test("a poll that never observes stays unconfirmed at its deadline", () => {
+    const docker = fakeDocker([helperInspect()]);
+    docker.hooks.ps = () => (docker.rmCalls().length === 0 ? undefined : { status: 125, stdout: "", stderr: "daemon gone" });
+    const run = createHelperRun(stateDir, intent());
+    runWithCid(run, HELPER_ID);
+    let now = 0;
+    expect(() => reclaimHelperRun(run, docker.fence(), "same-process", {
+      sleep: (ms) => { now += ms; }, now: () => now, pollDeadlineMs: 1_000,
+    })).toThrow(/inventory is unavailable/u);
+    expect(fs.existsSync(run.directory)).toBe(true);
+  });
+
   test("the absence poll is bounded", () => {
     const docker = fakeDocker([helperInspect()]);
     docker.hooks.rm = () => ({ status: 0, stdout: "", stderr: "" });

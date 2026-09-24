@@ -412,9 +412,13 @@ type Observation = "absent" | "present";
 
 class ReclaimRefusal extends Error {}
 
+const INVENTORY_UNAVAILABLE = "the exact-id inventory is unavailable";
+
+class InventoryUnavailable extends ReclaimRefusal {}
+
 function observeExactId(docker: DockerStep, id: string, timeout = OBSERVE_TIMEOUT_MS): Observation {
   const inventory = docker(["ps", "--all", "--quiet", "--no-trunc", "--filter", `id=${id}`], timeout);
-  if (inventory.status !== 0 || inventory.stderr.trim()) throw new ReclaimRefusal("the exact-id inventory is unavailable");
+  if (inventory.status !== 0 || inventory.stderr.trim()) throw new InventoryUnavailable(INVENTORY_UNAVAILABLE);
   const ids = inventory.stdout.split(/\s+/u).filter(Boolean);
   if (ids.length === 0) return "absent";
   if (ids.length !== 1 || ids[0] !== id) throw new ReclaimRefusal("the exact-id inventory returned another identity");
@@ -466,8 +470,20 @@ function removeProvenHelper(
   const deadline = now() + (options.pollDeadlineMs ?? DEFAULT_POLL_DEADLINE_MS);
   for (;;) {
     const remaining = deadline - now();
-    if (observeExactId(docker, id, Math.min(OBSERVE_TIMEOUT_MS, Math.max(250, remaining))) === "absent") return "removed";
-    if (now() >= deadline) throw new ReclaimRefusal("the container is still present after rm");
+    // A failed look is not an answer: it counts as "still present" until the
+    // deadline, and only the final outcome decides. A contradiction (another
+    // identity) still refuses at once.
+    let observation: Observation | "unavailable";
+    try {
+      observation = observeExactId(docker, id, Math.min(OBSERVE_TIMEOUT_MS, Math.max(250, remaining)));
+    } catch (error) {
+      if (!(error instanceof InventoryUnavailable)) throw error;
+      observation = "unavailable";
+    }
+    if (observation === "absent") return "removed";
+    if (now() >= deadline) {
+      throw new ReclaimRefusal(observation === "unavailable" ? INVENTORY_UNAVAILABLE : "the container is still present after rm");
+    }
     sleep(Math.min(POLL_INTERVAL_MS, Math.max(1, deadline - now())));
   }
 }
