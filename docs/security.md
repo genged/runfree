@@ -95,8 +95,9 @@ boundary:
 - **Bounded, under the lock.** A helper is started only while the project
   lifecycle lock is held, with `--pull never` and hardened flags. The Docker
   client is SIGKILLed at the helper timeout (30 s for the deny probes, 120 s
-  otherwise, both clamped by the startup budget), so a helper that ignores
-  SIGTERM cannot hold the lock open.
+  otherwise), so a helper that ignores SIGTERM cannot hold the lock open. Where
+  the lifecycle operation budget wraps the Docker IO, it clamps that timeout
+  further; elsewhere the helper timeout alone applies.
 - **Recorded host-side.** Before the spawn, each run writes an intent file into
   a fresh 0700 directory under the host project state directory, with a random
   per-run `io.runfree.helper-run` label. The Docker client writes the created
@@ -110,22 +111,35 @@ boundary:
   fails any check is never removed; the run is reported as unconfirmed, its
   record is kept, and the error names `runfree up` (retry) and
   `runfree destroy --force`.
-- **Crash residue is reclaimed at the next lock acquisition.** Records left by a
-  CLI that died mid-helper are reclaimed by the same proof when the next `up`
-  or launch acquires the lock, before any new helper runs or any session is
-  admitted. A record that cannot be trusted (unparsable intent, symlinked or
-  foreign-owned cidfile) is refused with `runfree destroy --force`.
-- **Named residual.** If the client was killed before the create request
-  finished, the daemon can still create the container after Runfree listed
-  none. That run's record is kept pending for up to 180 s, and a later `up`
-  removes the late container by its run label. Until then it is an unclaimed
-  project container, which admission already refuses. Separately, `docker rm -f`
-  falls back to a name match if the proven container vanished between
-  inspection and removal and another container is named with that 64-hex
-  string. Arranging either needs Docker-socket access, which is outside the
-  agent's reach, so both are accepted. The remedies are `runfree destroy
-  --force` and, for a forwarder holding a helper address, `runfree forward
-  stop`.
+- **Reclaim time is bounded but outside the budget.** The reclaim runs under
+  the lock but outside the lifecycle operation budget, with fixed per-call
+  timeouts: about 19 s per candidate when the cidfile names an id, and about
+  21 s when it must first list candidates by run label. So a failed helper can
+  hold the lock for its own timeout plus that much.
+- **Crash residue is reclaimed when the runtime next starts.** Records left by
+  a CLI that died mid-helper are reclaimed by the same proof when `up` or a
+  launch starts the runtime under the lifecycle lock, and when
+  `runtime reload-policy --force` restores admission. This happens before any
+  new helper runs or any session is admitted. It is also outside the budget,
+  with the same bound once per record. A record whose reclaim is unconfirmed
+  refuses the launch until a later `runfree up` retries it successfully or
+  `runfree destroy --force` resets the project. A record that cannot be trusted
+  (unparsable intent, symlinked or foreign-owned cidfile) is refused with
+  `runfree destroy --force`.
+- **Residual: a late create.** If the client is killed while its create
+  request is in flight (a timeout or a CLI crash), the daemon can still create
+  the container after Runfree listed none. This needs no attacker. It is
+  accepted because the late container stays in state `created`: nothing ever
+  starts it, so it has no network endpoint and sends no traffic. Meanwhile the
+  unclaimed-container refusal covers it. The run's record is kept pending for
+  180 s, and each `up` in that window lists by the run label and removes the
+  late container once it appears. A wall-clock jump can end the grace early; a
+  container created after the record was cleared needs
+  `runfree destroy --force`.
+- **Residual: the removal name fallback.** `docker rm -f` falls back to a name
+  match if the proven container vanished between inspection and removal and
+  another container is named with that 64-hex string. Arranging that needs
+  Docker-socket access, which is outside the agent's reach, so it is accepted.
 
 The deny-probe helper sits in the agent position on `agent_internal`, so it
 gets a pinned address from a reserved block, `.13`–`.19`, outside the session
