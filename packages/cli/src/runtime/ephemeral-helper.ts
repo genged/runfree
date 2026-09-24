@@ -126,6 +126,9 @@ export function ephemeralHelperRunArguments(input: EphemeralHelperInput): string
     throw new Error("ephemeral helper network must be an exact 64-hex network id");
   }
   assertHelperRunCidFile(input.cidFile);
+  if (input.networkId !== undefined && input.ip === undefined) {
+    throw new Error("ephemeral helper on a network requires a pinned address in the reserved ephemeral-helper block");
+  }
   if (input.ip !== undefined) {
     if (input.networkId === undefined) throw new Error("ephemeral helper static address requires a network");
     if (!isExactSessionSourceIpv4(input.ip)) throw new Error(`ephemeral helper address is not IPv4: ${input.ip}`);

@@ -135,6 +135,9 @@ describe("ephemeral helper run arguments", () => {
     [{ image: "img with space" }, /exact image reference/u],
     [{ networkId: "abc" }, /exact 64-hex network id/u],
     [{ ip: "172.30.0.19" }, /static address requires a network/u],
+    // A helper on a network always has a pinned address: never Docker's
+    // dynamic pick, which could be a session's address.
+    [{ networkId: NETWORK_ID }, /requires a pinned address/u],
     [{ networkId: NETWORK_ID, ip: "not-an-ip" }, /not IPv4/u],
     [{ networkId: NETWORK_ID, ip: "172.30.0.019" }, /not IPv4/u],
     // A helper address is only ever one of the reserved block's hosts: never a
