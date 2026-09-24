@@ -122,8 +122,11 @@ describe("per-session admission refuses and its controls are load-bearing", () =
     const connections = (address: string) => dockerOrThrow("inspect queued TCP", [
       "exec", "--user", "0:0", proxyId, "ss", "-H", "-n", "-4", "-t", "state", "connected", "exclude", "time-wait", "dst", address, "sport", "=", ":8080",
     ]);
-    const readAssignment = () => dockerOrThrow("read fence precondition", sessionIpAssignmentReadCommand(proxyId, "127.0.0.1").args);
-    const command = sessionIpReuseFenceCommand(proxyId, "127.0.0.1", "a".repeat(64), readAssignment());
+    // Client addresses sit in the session pool (host .20/.21): the fence refuses
+    // out-of-pool addresses before building its command. All of 127/8 is
+    // loopback, so the proxy still sees queued connections from both.
+    const readAssignment = () => dockerOrThrow("read fence precondition", sessionIpAssignmentReadCommand(proxyId, "127.0.0.20").args);
+    const command = sessionIpReuseFenceCommand(proxyId, "127.0.0.20", "a".repeat(64), readAssignment());
     const clientPidPath = "/tmp/runfree-ip-fence-live-client.pid";
     let stopped = false;
     let fenceProcess: ReturnType<typeof spawn> | undefined;
@@ -134,14 +137,14 @@ describe("per-session admission refuses and its controls are load-bearing", () =
         const fs = require("node:fs");
         const net = require("node:net");
         fs.writeFileSync(${JSON.stringify(clientPidPath)}, String(process.pid));
-        for (const localAddress of ["127.0.0.1", "127.0.0.2"]) {
+        for (const localAddress of ["127.0.0.20", "127.0.0.21"]) {
           const socket = net.connect({ host: "127.0.0.1", port: 8080, localAddress });
           socket.on("error", () => {});
           socket.on("connect", () => socket.write("CONNECT example.com:443 HTTP/1.1\\r\\nHost:"));
         }
       `]);
       try {
-        waitUntil(() => connections("127.0.0.1") !== "" && connections("127.0.0.2") !== "", {
+        waitUntil(() => connections("127.0.0.20") !== "" && connections("127.0.0.21") !== "", {
           label: "queued sockets from both addresses", timeoutMs: 10_000,
         });
       } catch (error) {
@@ -157,23 +160,23 @@ describe("per-session admission refuses and its controls are load-bearing", () =
       // Some Linux versions cannot destroy unaccepted sockets with ss -K.
       // Either way, the stopped consumer cannot acknowledge retirement, so
       // the host must refuse and retain its fence until a later retry.
-      waitUntil(() => docker(["exec", proxyId, "test", "-f", "/run/runfree-sessions/ip-reuse/requests/127.0.0.1.json"]).status === 0, {
+      waitUntil(() => docker(["exec", proxyId, "test", "-f", "/run/runfree-sessions/ip-reuse/requests/127.0.0.20.json"]).status === 0, {
         label: "executor owns the assignment", timeoutMs: 10_000,
       });
       expect(docker(["exec", "--user", "0:0", proxyId, "flock", "--nonblock", "/run/runfree-sessions/ip-reuse", "true"]).status).toBe(1);
       expect(await finished).toBe(1);
       expect(docker(["exec", "--user", "0:0", proxyId, "flock", "--nonblock", "/run/runfree-sessions/ip-reuse", "true"]).status).toBe(0);
       expect(stderr).toContain("retry the launch");
-      expect(connections("127.0.0.2"), "the IP fence preserves the other address").not.toBe("");
-      const assignment = () => JSON.parse(dockerOrThrow("read IP assignment", ["exec", "--user", "0:0", proxyId, "cat", "/run/runfree-sessions/ip-reuse/requests/127.0.0.1.json"]));
+      expect(connections("127.0.0.21"), "the IP fence preserves the other address").not.toBe("");
+      const assignment = () => JSON.parse(dockerOrThrow("read IP assignment", ["exec", "--user", "0:0", proxyId, "cat", "/run/runfree-sessions/ip-reuse/requests/127.0.0.20.json"]));
       expect(assignment().state).toBe("draining");
       signal("SIGCONT");
       stopped = false;
-      const retried = docker(sessionIpReuseFenceCommand(proxyId, "127.0.0.1", "a".repeat(64), readAssignment()).args);
+      const retried = docker(sessionIpReuseFenceCommand(proxyId, "127.0.0.20", "a".repeat(64), readAssignment()).args);
       expect(retried.status, retried.output).toBe(0);
       expect(assignment()).toMatchObject({ state: "ready", sessionKey: "a".repeat(64) });
-      expect(connections("127.0.0.1")).toBe("");
-      expect(connections("127.0.0.2"), "the unrelated connection survives retry").not.toBe("");
+      expect(connections("127.0.0.20")).toBe("");
+      expect(connections("127.0.0.21"), "the unrelated connection survives retry").not.toBe("");
       const current = assignment();
       const delayed = docker(command.args);
       expect(delayed.status).toBe(1);
