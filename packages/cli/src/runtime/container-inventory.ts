@@ -227,6 +227,24 @@ export function projectEphemeralHelperFilters(projectId: string): string[] {
 }
 
 /**
+ * One helper run's containers: this project's helpers with the run's purpose
+ * and exact nonce. The no-cidfile reclaim lists only this set, so it can never
+ * select a helper another run (or a pre-change version) created.
+ */
+export function ephemeralHelperRunFilters(projectId: string, purpose: EphemeralHelperPurpose, runNonce: string): string[] {
+  if (!EPHEMERAL_HELPER_PURPOSES.includes(purpose)) {
+    throw new Error(`unknown ephemeral helper purpose: ${String(purpose)}`);
+  }
+  return [
+    ...projectEphemeralHelperFilters(projectId),
+    "--filter",
+    `label=${EPHEMERAL_HELPER_PURPOSE_LABEL}=${purpose}`,
+    "--filter",
+    `label=${EPHEMERAL_HELPER_RUN_LABEL}=${assertEphemeralHelperRunNonce(runNonce)}`,
+  ];
+}
+
+/**
  * What a given ingress forwarder is for. Diagnostic only, never a query key and
  * never dispatched on (ingress spec I1). One hardened socat shape, N purposes:
  * `vnc` (a headed agent UI), `port` (`runfree forward <port>`), `mcp-callback`
