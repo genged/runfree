@@ -20,9 +20,7 @@
 // Scope note: this file covers the refusals reachable without a public session
 // launch. Launch-path behavior is proven live by the attached, crash, and
 // drift tranches through the production admission launch. Session grant
-// separation still has no live proof anywhere (docs/security.md carries the
-// same caveat); it is not stubbed here, because a skipped test that looks like
-// coverage is the same failure mode as a vacuous one.
+// separation is proven by the attached tranche.
 
 import path from "node:path";
 import { spawn } from "node:child_process";

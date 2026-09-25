@@ -684,10 +684,8 @@ describe("attached per-session authority is exact and drift after the proof fail
   }, TEST_TIMEOUT_MS);
 
   test("a write grant issued to one session is not honoured for another session's address", async () => {
-    // The caveat `docs/security.md` records against Per-Session Admission: the
-    // live suites prove admission-set separation between sessions, but
-    // session-scoped approval-grant separation had unit-level proof only. This
-    // is that proof. Two sessions are served; A's identical write is approved
+    // The live suites prove admission-set separation between sessions; this
+    // proves session-scoped approval-grant separation. Two sessions are served; A's identical write is approved
     // with `--scope session`; B's is then held on its own, under its own
     // session identity, rather than being carried by A's grant.
     assertSessionAuthorityExactly([], "before the grant-separation case");

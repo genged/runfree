@@ -107,8 +107,8 @@ export type SessionAdmissionLaunchOutcome = Readonly<{
  * `runfree resume`, and `runfree mcp auth` all route here through
  * `session-public-launch.ts`. Source-IP attribution and session-keyed grants
  * must therefore hold together — several containers sharing one approval
- * subject would be strictly worse than the shared agent this replaced. Session
- * grant separation has no live proof yet; see `docs/security.md`.
+ * subject would be strictly worse than the shared agent this replaced. The
+ * attached live tranche proves session grant separation.
  */
 export async function runInternalSessionAdmissionLaunch(
   steps: SessionAdmissionLaunchSteps,
