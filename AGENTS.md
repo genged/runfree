@@ -64,7 +64,9 @@ project policy lives under `.runfree/`.
 - `make test-all` runs static and unit tests, Docker Compose template
   validation, the full live runtime suite, and packaged offline and live E2E.
 - `pnpm run build:runtime` compiles proxy/runtime-contract packages and assembles
-  `dist/runtime/**`.
+  `dist/runtime/**` for packaging. Tests and `pnpm typecheck` read workspace
+  sources and do not need it first; `scripts/workspace-source-exports.test.ts`
+  keeps package exports on `src/`.
 - `pnpm run generate:assets` regenerates
   `packages/cli/src/embedded-assets.generated.ts` from `dist/runtime/**`.
 - `pnpm run update:agent-tools -- [all|claude|codex|pi@<version>]` updates the
