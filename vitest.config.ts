@@ -1,5 +1,7 @@
 import { defineConfig, type TestProjectConfiguration } from "vitest/config";
 
+import { CORE_LIVE_FILES, MIXED_LIVE_FILES, selectedLiveTier } from "./tests/runtime/live/tiers.ts";
+
 // These files mutate shared repo state (dist/runtime/**, runtime-inputs.lock.json,
 // embedded-assets.generated.ts, packages/*/dist), so they must not run while any
 // other test file is running. They live in a separate project that runs after the
@@ -44,10 +46,25 @@ const cliE2eLiveTests = ["e2e/**/*.live.test.ts"];
  */
 const LIVE_RUNTIME_WORKERS_ENV = "TEST_RUNTIME_WORKERS";
 const DEFAULT_LIVE_RUNTIME_WORKERS = 4;
+// The core tier is the per-change gate, run on whatever laptop is at hand;
+// two files at a time keeps Docker Desktop clear of the memory pressure that
+// dropped the daemon mid-run under four (2026-09-25).
+const DEFAULT_CORE_LIVE_RUNTIME_WORKERS = 2;
+
+// Which live files the selected tier runs (`tests/runtime/live/tiers.ts`).
+// Core: the core files plus the mixed files, whose extended cases skip.
+// Extended: every live file except the core-only ones.
+const liveRuntimeTier = selectedLiveTier();
+const liveRuntimeInclude = liveRuntimeTier === "core"
+  ? [...CORE_LIVE_FILES, ...MIXED_LIVE_FILES]
+  : liveRuntimeTests;
+const liveRuntimeTierExclude: string[] = liveRuntimeTier === "extended" ? [...CORE_LIVE_FILES] : [];
 
 function liveRuntimeWorkers(): number {
   const configured = process.env[LIVE_RUNTIME_WORKERS_ENV];
-  if (configured === undefined || configured === "") return DEFAULT_LIVE_RUNTIME_WORKERS;
+  if (configured === undefined || configured === "") {
+    return liveRuntimeTier === "core" ? DEFAULT_CORE_LIVE_RUNTIME_WORKERS : DEFAULT_LIVE_RUNTIME_WORKERS;
+  }
   if (!/^[1-9][0-9]*$/u.test(configured)) {
     throw new Error(`${LIVE_RUNTIME_WORKERS_ENV} must be a positive integer, got ${JSON.stringify(configured)}`);
   }
@@ -76,8 +93,8 @@ const liveRuntimeProject: TestProjectConfiguration = {
   extends: true,
   test: {
     name: "runtime-live",
-    include: liveRuntimeTests,
-    exclude: commonExclude.filter((pattern) => !liveRuntimeTests.includes(pattern)),
+    include: liveRuntimeInclude,
+    exclude: [...commonExclude.filter((pattern) => !liveRuntimeTests.includes(pattern)), ...liveRuntimeTierExclude],
     // Forks, not threads: a live tranche spawns Docker work and must be
     // killable as a process.
     //

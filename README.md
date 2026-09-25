@@ -259,7 +259,7 @@ make test-cli-e2e
 Runtime, proxy, firewall, mount, or credential changes also need a Docker host:
 
 ```bash
-make test-runtime
+make test-runtime-core
 make test-cli-e2e-live
 # or
 make test-all

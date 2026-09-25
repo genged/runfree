@@ -76,7 +76,7 @@ OrbStack is outside this beta: `Makefile` names Docker Desktop as the gating bac
 
 The release target list lives in [`../scripts/release-targets.txt`](../scripts/release-targets.txt), which packaging, signing, checksums, and the CI build matrix all read.
 
-Runtime/security changes should be validated with `make test-runtime` or `make test-all` on a Docker-capable host.
+Runtime/security changes should be validated with `make test-runtime-core` on a Docker-capable host, and releases with the full `make test-runtime` or `make test-all`.
 
 ## Source Map
 

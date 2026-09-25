@@ -58,9 +58,12 @@ project policy lives under `.runfree/`.
 - `pnpm test` runs the Vitest suite.
 - `pnpm typecheck` runs `tsc --noEmit`.
 - `make test` runs static checks plus unit tests.
-- `make test-runtime` runs the live Docker sandbox test; it requires the Docker
-  CLI and a reachable Docker daemon. `make test-runtime-smoke` runs one tranche
-  of it as a per-commit check on a Docker host; it is a subset, not a substitute.
+- `make test-runtime` runs the whole live Docker suite (the release gate); it
+  requires the Docker CLI and a reachable Docker daemon. It has two tiers
+  (`tests/runtime/live/tiers.ts`): `make test-runtime-core` proves the trust
+  boundary, and `make test-runtime-extended` proves recovery, upgrades, load,
+  and optional features. `make test-runtime-smoke` runs one tranche as a
+  per-commit check on a Docker host.
 - `make test-all` runs static and unit tests, Docker Compose template
   validation, the full live runtime suite, and packaged offline and live E2E.
 - `pnpm run build:runtime` compiles proxy/runtime-contract packages and assembles
@@ -144,8 +147,9 @@ TypeScript changes, run the affected Vitest file plus `pnpm test` and
 `pnpm typecheck` before committing or reporting completion. For runtime asset
 changes, regenerate embedded assets and run tests that cover asset sync. For
 sandbox, proxy, firewall, Docker network, or credential-boundary changes, run
-`make test-runtime` or `make test-all` when the Docker CLI and a reachable
-Docker daemon are available.
+`make test-runtime-core` when the Docker CLI and a reachable Docker daemon are
+available. Before a release, or for lifecycle, recovery, upgrade, or cleanup
+changes, run the full `make test-runtime` or `make test-all`.
 
 
 ## Local only docs

@@ -5,7 +5,9 @@ Runfree separates tests by the boundary they prove.
 | Layer | Command | Boundary | Main faults found |
 | --- | --- | --- | --- |
 | Unit and integration | `pnpm test` | TypeScript modules and the source-backed CLI shim | Logic, parsing, state transitions, and component wiring |
-| Live runtime security | `make test-runtime` | Source-backed CLI plus real Docker | Container topology, capabilities, egress, proxy policy, credentials, and session admission |
+| Live runtime security (release gate) | `make test-runtime` | Source-backed CLI plus real Docker | Both tiers below |
+| Live runtime core | `make test-runtime-core` | The trust-boundary subset of the layer above | Topology, capabilities, egress, CONNECT guard, request shape and write approval, inert policy edits and live revocation, managed-launch file safety, exact session admission; run for every runtime, proxy, firewall, network, or credential change |
+| Live runtime extended | `make test-runtime-extended` | The rest of the live suite | Crash recovery, rolling upgrades and proxy replacement, renewal under load, session-entry ordering, helper cleanup, audit mode |
 | Live runtime smoke | `make test-runtime-smoke` | One tranche of the layer above (`runtime-topology`) | Fixture drift against the CLI, topology, capability floor, egress containment, and the CONNECT guard; a per-commit subset, not a substitute |
 | Packaged CLI end to end | `make test-cli-e2e` | The compiled `dist/runfree` executable | Compilation, embedded assets, entrypoint, first-run workflows, safe refusals, and filesystem compatibility |
 | Packaged runtime end to end | `make test-cli-e2e-live` | The compiled executable plus real Docker | First startup, exact approvals, image build, managed session launch, reuse, and teardown |
