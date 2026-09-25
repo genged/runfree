@@ -19,8 +19,6 @@
 // its traffic like any unadmitted source.
 
 import type { SpawnSyncOptions } from "node:child_process";
-import { randomBytes } from "node:crypto";
-import path from "node:path";
 
 import { isExactSessionSourceIpv4 } from "@runfree/runtime-contracts/session-registry";
 
@@ -30,12 +28,12 @@ import {
 } from "./container-inventory.ts";
 import { dockerClientEnvOptions } from "./docker.ts";
 import {
-  createHelperRun,
   EphemeralHelperUnconfirmedError,
-  reclaimHelperRun,
-  removeHelperRunDirectory,
+  markHelperRunPending,
+  readHelperMarker,
+  reclaimHelperResidue,
+  settleHelperRun,
   type EphemeralHelperFence,
-  type HelperRunIntent,
 } from "./ephemeral-helper-residue.ts";
 import { wasRefusedBeforeSpawn } from "./io-refusal.ts";
 
@@ -88,30 +86,6 @@ export type EphemeralHelperRequest = Readonly<{
   timeoutMs?: number;
 }>;
 
-export type EphemeralHelperInput = EphemeralHelperRequest & Readonly<{
-  /**
-   * `<stateDir>/helper-runs/run-XXXXXX/cid`: the Docker CLI writes the created
-   * container's exact id here, which is what lets a timed-out or crashed run be
-   * removed by id rather than by name or label.
-   */
-  cidFile: string;
-  /** The run's random nonce, stamped as `io.runfree.helper-run`. */
-  runNonce: string;
-}>;
-
-const HELPER_RUN_DIRECTORY_PATTERN = /^run-[A-Za-z0-9]{6}$/u;
-
-function assertHelperRunCidFile(cidFile: string): void {
-  const valid = path.isAbsolute(cidFile)
-    && path.resolve(cidFile) === cidFile
-    && path.basename(cidFile) === "cid"
-    && HELPER_RUN_DIRECTORY_PATTERN.test(path.basename(path.dirname(cidFile)))
-    && path.basename(path.dirname(path.dirname(cidFile))) === "helper-runs";
-  if (!valid) {
-    throw new Error(`ephemeral helper cidfile must be <state>/helper-runs/run-XXXXXX/cid, not ${cidFile || "<empty>"}`);
-  }
-}
-
 /**
  * The exact `docker run` argv for one helper, pure and testable.
  *
@@ -119,14 +93,13 @@ function assertHelperRunCidFile(cidFile: string): void {
  * agent image, which is untrusted, so the run must grant nothing the session
  * create plan would not.
  */
-export function ephemeralHelperRunArguments(input: EphemeralHelperInput): string[] {
+export function ephemeralHelperRunArguments(input: EphemeralHelperRequest): string[] {
   if (!input.image || /\s/u.test(input.image)) {
     throw new Error(`ephemeral helper requires an exact image reference, not ${input.image || "<empty>"}`);
   }
   if (input.networkId !== undefined && !DOCKER_OBJECT_ID_PATTERN.test(input.networkId)) {
     throw new Error("ephemeral helper network must be an exact 64-hex network id");
   }
-  assertHelperRunCidFile(input.cidFile);
   if (input.networkId !== undefined && input.ip === undefined) {
     throw new Error("ephemeral helper on a network requires a pinned address in the reserved ephemeral-helper block");
   }
@@ -160,10 +133,8 @@ export function ephemeralHelperRunArguments(input: EphemeralHelperInput): string
     // same reference.
     "--pull",
     "never",
-    "--cidfile",
-    input.cidFile,
     ...(input.stdin !== undefined ? ["-i"] : []),
-    ...ephemeralHelperLabelArguments(input.projectId, input.purpose, input.runNonce),
+    ...ephemeralHelperLabelArguments(input.projectId, input.purpose),
     "--user",
     input.user,
     "--cap-drop",
@@ -192,7 +163,7 @@ const MINIMUM_OVERRIDE_TIMEOUT_MS = 1_000;
  * budget clamps it further. Deny probes bound themselves at about 3 s, so 30 s
  * (ruling D4); the other purposes keep 120 s. The test override may only
  * shorten it: digits only, clamped to [1 s, default]. It never touches the
- * reclaim timeouts.
+ * sweep timeouts.
  */
 export function ephemeralHelperTimeoutMs(
   purpose: EphemeralHelperPurpose,
@@ -215,19 +186,19 @@ export const EPHEMERAL_HELPER_FENCE_REQUIRED =
 /**
  * Runs one helper under the lifecycle fence, bounded and reclaimable.
  *
- * - The intent (with a random run nonce) is recorded in a fresh host-owned run
- *   directory before the spawn; the Docker CLI writes the container id there.
+ * - A marker already present is swept first, whichever lock span left it.
+ * - The host marker is written before the spawn, so a CLI that dies mid-run
+ *   leaves the next lock holder a reason to sweep.
  * - The client is SIGKILLed at its bound: `spawnSync` sends one signal and then
  *   waits, so a SIGTERM the client forwards into the untrusted container would
  *   leave the lock held without limit (design D-A). SIGKILL is used for helper
  *   runs only, never as a global default.
  * - A clean exit (status 0, no timeout, no signal) means `--rm` already removed
- *   the container, so the directory is deleted with no Docker call.
- * - Anything else is reclaimed by exact id through the fence's unbudgeted
+ *   the container, so the marker is cleared with no Docker call.
+ * - Anything else sweeps this project's helpers through the fence's unbudgeted
  *   containment IO, even when the budgeted call itself threw after the spawn;
- *   the original error is rethrown after the reclaim. A refusal before the
- *   spawn deletes the directory with no Docker call. A reclaim that cannot be
- *   confirmed throws `EphemeralHelperUnconfirmedError` and keeps the directory.
+ *   the original error is rethrown after the sweep. A sweep that cannot be
+ *   confirmed throws `EphemeralHelperUnconfirmedError` and keeps the marker.
  */
 export function runEphemeralHelper(
   context: RuntimeContext,
@@ -237,22 +208,19 @@ export function runEphemeralHelper(
 ): CaptureResult {
   if (!fence) throw new Error(EPHEMERAL_HELPER_FENCE_REQUIRED);
   fence.lifecycleLock.assertHeld();
-  const intent: HelperRunIntent = {
-    v: 1,
-    projectId: request.projectId,
-    purpose: request.purpose,
-    image: request.image,
-    network: request.networkId ?? "none",
-    ...(request.ip !== undefined ? { ip: request.ip } : {}),
-    nonce: randomBytes(16).toString("hex"),
-    createdAt: new Date().toISOString(),
-  };
-  const run = createHelperRun(fence.stateDir, intent);
+  // Argument validation refuses before the marker or the spawn.
+  const args = ephemeralHelperRunArguments(request);
   const dockerOptions = dockerClientEnvOptions(context);
+  // A marker here was left by another lock span (a crashed CLI, or one that
+  // held the lock while this process released it). Sweep it first: this run's
+  // clean exit would otherwise clear a marker whose helper was never swept.
+  if (readHelperMarker(fence.stateDir)) {
+    reclaimHelperResidue({ ...fence, dockerEnv: fence.dockerEnv ?? dockerOptions.env }, request.projectId);
+  }
+  markHelperRunPending(fence.stateDir);
   let spawned = false;
   let outcome: { ok: true; result: CaptureResult } | { ok: false; error: unknown };
   try {
-    const args = ephemeralHelperRunArguments({ ...request, cidFile: run.cidFile, runNonce: intent.nonce });
     const options: SpawnSyncOptions = {
       ...dockerOptions,
       timeout: ephemeralHelperTimeoutMs(request.purpose, context.env ?? {}, request.timeoutMs),
@@ -266,21 +234,21 @@ export function runEphemeralHelper(
     if (wasRefusedBeforeSpawn(error)) spawned = false;
     outcome = { ok: false, error };
   }
-  if (!spawned || outcome.ok && isCleanHelperExit(outcome.result)) {
-    removeHelperRunDirectory(run.directory);
-  } else {
-    try {
-      // A client that exited on its own finished its create request; one that
-      // timed out, was signalled, or whose call threw may not have (see the
-      // pending-create grace in the reclaim).
-      const clientKilled = !outcome.ok || outcome.result.timedOut === true || outcome.result.signal !== undefined;
-      reclaimHelperRun(run, { ...fence, dockerEnv: fence.dockerEnv ?? dockerOptions.env }, "same-process", { clientKilled });
-    } catch (error) {
-      // Keep the run's own failure (a spent budget, a lost rebind allowance)
-      // as the cause, so its failure kind survives the reclaim refusal.
-      if (!outcome.ok && error instanceof EphemeralHelperUnconfirmedError) throw error.withRunFailure(outcome.error);
-      throw error;
-    }
+  const clean = !spawned || outcome.ok && isCleanHelperExit(outcome.result);
+  // A client that exited on its own finished its create request; one that
+  // timed out, was signalled, or whose call threw may not have.
+  const clientKilled = spawned && (!outcome.ok || outcome.result.timedOut === true || outcome.result.signal !== undefined);
+  try {
+    settleHelperRun(
+      { ...fence, dockerEnv: fence.dockerEnv ?? dockerOptions.env },
+      request.projectId,
+      { clean, clientKilled },
+    );
+  } catch (error) {
+    // Keep the run's own failure (a spent budget, a lost rebind allowance)
+    // as the cause, so its failure kind survives the sweep refusal.
+    if (!outcome.ok && error instanceof EphemeralHelperUnconfirmedError) throw error.withRunFailure(outcome.error);
+    throw error;
   }
   if (!outcome.ok) throw outcome.error;
   return outcome.result;

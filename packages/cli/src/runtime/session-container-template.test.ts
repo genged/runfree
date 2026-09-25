@@ -70,7 +70,6 @@ function project(): ProjectInfo {
       controlConvergedPath: path.join(STATE_ROOT, "control", "converged.json"),
       controlDir: path.join(STATE_ROOT, "control"),
       controlEffectiveDir: path.join(STATE_ROOT, "control", "effective"),
-      controlLegacyEnforcedNetworkPath: path.join(STATE_ROOT, "control", "legacy.json"),
       controlProxyActivePath: path.join(STATE_ROOT, "control", "proxy-active.json"),
       controlProxyDir: path.join(STATE_ROOT, "control", "effective", "proxy"),
       gitConfigPath: path.join(STATE_ROOT, "gitconfig"),

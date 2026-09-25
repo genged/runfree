@@ -4,7 +4,6 @@ import { isCancel, select } from "@clack/prompts";
 import type { ArgumentsCamelCase } from "yargs";
 
 import { assertProjectPolicy, projectInfo } from "../config.ts";
-import { assertConfigCurrent } from "../config-notice.ts";
 import { die } from "../errors.ts";
 import {
   formatRecoveryInventory,
@@ -35,7 +34,6 @@ function contextForRecoveryItem(context: RunfreeCommandContext, item: RecoveryIt
   if (!item.projectRoot) die(`recovery item ${item.id} has no valid project mapping`);
   const projectRoot = path.resolve(item.projectRoot);
   const project = projectInfo(projectRoot, context.env);
-  assertConfigCurrent(project);
   assertProjectPolicy(project);
   if (project.paths.stateDir !== item.stateDir) {
     die(`recovery item ${item.id} does not belong to the validated project state directory`);

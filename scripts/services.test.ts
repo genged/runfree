@@ -1226,7 +1226,7 @@ exit 0
 
   test("doctor reports a customized Claude command without the inbox grant", async () => {
     writeFixtureRepo({ hosts: [], tokens: {} }, {
-      version: 3,
+      version: 4,
       agents: {
         default: "claude",
         claude: { command: "claude --model opus --dangerously-skip-permissions" },

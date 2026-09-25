@@ -50,7 +50,7 @@ The packaged suite covers one scenario per major public contract area:
 - artifact, version, and hierarchical help;
 - first initialization, stable project identity, and a null second run;
 - paths with spaces, non-ASCII paths, and a restrictive `umask`;
-- supported config migration, legacy-writer refusal, and a null second migration;
+- pre-v4 config refusal with no owned-state change;
 - credential source plus curated service enablement;
 - user-defined service import and pinned definition evolution;
 - offline interrupted-session inventory and hostile evidence handling;
@@ -83,9 +83,8 @@ needing a maintainer disposition rather than as current evidence either way.
 
 The LH-10 refusal proves that `runfree image init` rejects a symlinked
 `.runfree/runfree.json` before it writes project, XDG config, XDG data, or XDG
-state. The LH-03 migration tests prove that legacy readers do not mutate state,
-version-4 writers refuse with migration guidance, and an explicit migration
-preserves custom legacy authority with a null second run.
+state. The LH-03 tests prove that every command, `init` included, refuses a
+pre-v4 config with the remedy and leaves owned state unchanged.
 
 ## Output Gates
 

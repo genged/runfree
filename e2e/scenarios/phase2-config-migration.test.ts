@@ -3,24 +3,10 @@ import path from "node:path";
 
 import { describe, expect } from "vitest";
 
-import { assertExit, assertOutputContains, readJson } from "../support/assertions.ts";
+import { assertExit, assertOutputContains } from "../support/assertions.ts";
 import { scenario } from "../support/evidence.ts";
 import { assertOwnedStateUnchanged, snapshotOwnedState } from "../support/snapshot.ts";
 import { withWorld } from "../support/world.ts";
-
-type RunfreeConfig = Readonly<{
-  version: number;
-  project?: unknown;
-  paths?: unknown;
-  services?: unknown;
-}>;
-
-type DesiredPolicy = Readonly<{
-  version: number;
-  hosts: readonly string[];
-  requests?: Readonly<Record<string, unknown>>;
-  services?: Readonly<Record<string, unknown>>;
-}>;
 
 const cleanup = "Remove the disposable project, home, and XDG roots after the test.";
 
@@ -32,21 +18,6 @@ const refusalMetadata = {
   evidence: { kind: "reproduced-user-workflow" },
   ownedStateAreas: ["project", "XDG config", "XDG data", "XDG state"],
   requiredPrograms: ["packaged Runfree executable"],
-  cleanup,
-} as const;
-
-const migrationMetadata = {
-  scenarioIds: ["LH-03"],
-  layer: "P",
-  cadence: "pull-request",
-  implementationStatus: "Partial",
-  evidence: {
-    kind: "modeled-external-step",
-    modeledSteps: ["Docker container inventory with no live project agents"],
-    proofLimits: "The Docker stub proves migration quiescence orchestration, not daemon compatibility or active-session handling.",
-  },
-  ownedStateAreas: ["project", "XDG config", "XDG data", "XDG state", "modeled Docker invocation log"],
-  requiredPrograms: ["packaged Runfree executable", "POSIX shell"],
   cleanup,
 } as const;
 
@@ -81,8 +52,8 @@ function writeLegacyProject(projectRoot: string): void {
   }, null, 2)}\n`, { mode: 0o600 });
 }
 
-describe("packaged phase 2 config migration", () => {
-  scenario("legacy readers and version-4 writers do not silently migrate or mutate owned state", refusalMetadata, async () => {
+describe("packaged phase 2 legacy config boundary", () => {
+  scenario("pre-v4 configs are refused with the init remedy, never migrated, and owned state is unchanged", refusalMetadata, async () => {
     await withWorld({}, async (world) => {
       writeLegacyProject(world.projectRoot);
       const selections = [
@@ -98,66 +69,21 @@ describe("packaged phase 2 config migration", () => {
       expect(projectId.stdout.trim()).toMatch(/^[a-f0-9]{12}$/u);
       assertOwnedStateUnchanged(before, snapshotOwnedState(selections));
 
-      const requiresMigration = [
+      const refusedCommands = [
+        ["init", "--yes"],
         ["policy", "status"],
         ["status"],
         ["host", "add", "new.example", "--no-reload"],
         ["service", "enable", "node", "--no-reload"],
         ["image", "approve-context"],
       ] as const;
-      for (const args of requiresMigration) {
+      for (const args of refusedCommands) {
         const refused = await world.runfree(args);
         assertExit(refused, 1);
-        assertOutputContains(
-          refused,
-          ".runfree/runfree.json uses legacy config version 3; run `runfree init` to migrate to version 4",
-        );
+        assertOutputContains(refused, ".runfree/runfree.json uses config version 3, which this release no longer migrates");
+        assertOutputContains(refused, "move .runfree aside and run `runfree init`");
         assertOwnedStateUnchanged(before, snapshotOwnedState(selections));
       }
-    });
-  });
-
-  scenario("init preserves custom legacy authority and has a null second migration run", migrationMetadata, async () => {
-    await withWorld({}, async (world) => {
-      writeLegacyProject(world.projectRoot);
-      world.installEmptyDockerInventory();
-      const legacyPolicyPath = path.join(world.projectRoot, "legacy-policy", "custom-policy.json");
-      const legacyPolicyBefore = fs.readFileSync(legacyPolicyPath, "utf8");
-
-      const migrated = await world.runfree(["init"]);
-      assertExit(migrated, 0);
-      assertOutputContains(migrated, "migrated .runfree/runfree.json from version 3 to 4");
-      assertOutputContains(migrated, "service retired-acme kept as direct hosts");
-      assertOutputContains(migrated, "runfree service enable retired-acme");
-
-      const runfreeDir = path.join(world.projectRoot, ".runfree");
-      const config = readJson<RunfreeConfig>(path.join(runfreeDir, "runfree.json"));
-      const policy = readJson<DesiredPolicy>(path.join(runfreeDir, "network-policy.json"));
-      expect(config.version).toBe(4);
-      expect(config.project).toBeUndefined();
-      expect(config.paths).toBeUndefined();
-      expect(config.services).toBeUndefined();
-      expect(policy).toEqual({
-        version: 2,
-        hosts: ["api.legacy.example", "custom.example"],
-        requests: {
-          "api.legacy.example": { methods: ["GET"] },
-        },
-      });
-      expect(fs.readFileSync(legacyPolicyPath, "utf8")).toBe(legacyPolicyBefore);
-      expect(fs.existsSync(path.join(world.projectRoot, "legacy-runtimes"))).toBe(false);
-
-      const selections = [
-        { name: "project", path: world.projectRoot },
-        { name: "config", path: world.configHome },
-        { name: "data", path: world.dataHome },
-        { name: "state", path: world.stateHome },
-        { name: "Docker invocation log", path: world.dockerLog },
-      ] as const;
-      const beforeSecondRun = snapshotOwnedState(selections);
-      const second = await world.runfree(["init"]);
-      assertExit(second, 0);
-      assertOwnedStateUnchanged(beforeSecondRun, snapshotOwnedState(selections));
     });
   });
 });

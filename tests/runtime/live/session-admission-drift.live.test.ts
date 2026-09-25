@@ -11,8 +11,8 @@
 // nondeterministic, and a drift test that sometimes acts too late is a test
 // that sometimes proves nothing.
 //
-// Not covered here: session grant separation, which still has no live proof
-// anywhere (docs/security.md carries the same caveat). Drift detected *after*
+// Not covered here: session grant separation, which the attached tranche
+// proves. Drift detected *after*
 // a container has been proven IS covered — by the attached tranche, which
 // drives the production launch path and proves lease renewal refuses
 // post-proof drift against a fresh exact Docker inspection.

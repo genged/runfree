@@ -273,25 +273,6 @@ export function approveNetworkCandidate(
   return selectSubjectApproval(projectRoot, project, subject, mechanism, now);
 }
 
-/** Import one exact, independently proven v3 project policy during migration. */
-export function importLegacyEnforcedNetworkPolicyApproval(
-  projectRoot: string,
-  project: ProjectInfo,
-  policyInput: DesiredNetworkPolicyJson,
-  now = new Date(),
-): ControlApprovalSelection {
-  const policy = validateDesiredNetworkPolicy(policyInput);
-  const subject = networkControlSubject("network-project", policy);
-  publishNetworkSnapshot(project, subject, policy);
-  return selectSubjectApproval(
-    projectRoot,
-    project,
-    subject,
-    "legacy-enforced-generation",
-    now,
-  );
-}
-
 export function readApprovedNetworkPolicy(
   projectRoot: string,
   project: ProjectInfo,

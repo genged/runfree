@@ -228,8 +228,6 @@ describe("quiesced project transaction", () => {
     // Every other importer takes the default refusal. A new importer trips this
     // and forces an explicit decision about which side it belongs on.
     expect(importers).toEqual([
-      "commands/image.ts",
-      "commands/init.ts",
       "control/desired-policy-transaction.ts",
       "control/local-host-mutation.ts",
       "control/workflow.ts",

@@ -21,25 +21,31 @@ HOST
 |   - resolves host-owned credential sources                                     |
 |   - materializes embedded runtime assets                                       |
 |   - starts Docker Compose project runfree-<project-id>                         |
+|   - admits, renews, and revokes per-session containers                         |
 |                                                                                |
 | XDG config/state/data                                                          |
 |   approvals, effective controls, sources, sessions, proxy CA, runtime assets    |
 +--------------------------------------+-----------------------------------------+
                                        |
                                        v
-DOCKER COMPOSE: runfree-<project-id>
+DOCKER: project runfree-<project-id>
 +--------------------------------------------------------------------------------+
-| agent (untrusted)                         proxy (trusted boundary)              |
-| +------------------------------------+    +-----------------------------------+  |
-| | /workspace project bind mount      |    | HTTPS/WSS proxy on :8080          |  |
-| | .runfree is untrusted desired input|    | host-owned effective controls     |  |
-| | Claude / Codex / Pi / shell tools  |    | request and write classification  |  |
-| | placeholders or OAuth handles only |    | credential injection              |  |
-| +------------------------------------+    | denial, audit, approval records    |  |
-|        |                                 +------------------+----------------+  |
-|        | agent_internal network only                        | proxy_egress      |
-|        | no direct Internet path                            v                   |
-+--------+--------------------------------------------- upstream HTTPS/WSS hosts --+
+| session containers (untrusted,         proxy (Compose, trusted boundary)       |
+|  one per agent process, not Compose)   +-----------------------------------+   |
+| +------------------------------------+ | root firewall (nftables sets)     |   |
+| | /workspace project bind mount      | | request proxy uid 1001 on :8080   |   |
+| | .runfree is untrusted desired input| | host-owned effective controls     |   |
+| | Claude / Codex / Pi / shell tools  | | root-owned session files          |   |
+| | placeholders or OAuth handles only | | credential injection              |   |
+| | own source IP .20+ = session id    | | denial, audit, approval records   |   |
+| +------------------------------------+ +-----------------+-----------------+   |
+|   | ... more sessions                                    |                     |
+|   |                                                      |                     |
+|   +------ agent_internal (internal: true, no egress) ----+                     |
+|   |                                                      | proxy_egress        |
+|   +-- ingress forwarders (optional: VNC, forward,        v                     |
+|       MCP OAuth callback) to host loopback only    upstream HTTPS/WSS hosts    |
++--------------------------------------------------------------------------------+
 ```
 
 ### Policy And Credential Flow
@@ -141,7 +147,7 @@ Docker Compose files, Dockerfiles, proxy bundle, templates used by runfree up
 The TypeScript CLI lives under `packages/cli/src/`. It is responsible for:
 
 - parsing typed yargs commands;
-- creating or migrating `.runfree/runfree.json`;
+- creating `.runfree/runfree.json`;
 - validating and safely writing desired `.runfree/network-policy.json`;
 - capturing stable candidates, recording exact approvals, and publishing
   paired immutable effective network/OAuth controls under XDG state;
@@ -259,8 +265,8 @@ admission authority nor implies a control plane replacement.
 A typical `runfree` invocation does the following:
 
 1. Resolve the project root and read `.runfree/runfree.json`.
-2. Require explicit migration for an older config; ordinary runtime commands do
-   not repair project control paths.
+2. Refuse a pre-v4 config or a removed legacy key with the remedy (move
+   `.runfree` aside and run `runfree init`); nothing repairs or migrates it.
 3. For built-in Claude/Codex launches, review any missing credentialless
    operational service without overwriting stricter user write rules.
 4. If a per-session agent is active, reuse the verified selected effective
@@ -280,7 +286,7 @@ A typical `runfree` invocation does the following:
 11. Create an admitted session container for the requested command; on exit, print blocked-host feedback
     unless `--quiet` is used.
 
-When `up` or a launch starts the runtime under the project lifecycle lock, and when `runtime reload-policy --force` restores admission, Runfree first reclaims ephemeral-helper runs that a dead CLI left behind. It removes each leftover helper container by its exact recorded id before any new helper runs or any session is admitted (see [Runtime Participants And Identity](security.md#runtime-participants-and-identity)).
+When `up` or a launch starts the runtime under the project lifecycle lock, and when `runtime reload-policy --force` restores admission, Runfree first sweeps ephemeral helpers that a dead CLI left behind, when the host helper marker says one may exist. It removes this project's helper-labeled containers before any new helper runs or any session is admitted (see [Ephemeral Helpers](#ephemeral-helpers)).
 
 Agent-image or session-template changes select a new desired session materialization. Existing sessions keep their exact image and template until they end. New sessions use the new materialization without replacing the proxy.
 
@@ -379,7 +385,7 @@ Heartbeats do not wait for acknowledgements. New container creation first
 waits for an IP fence. A kernel lock and exact prior-state check exclude stale
 executors. Retirement requires root firewall exclusion, kernel TCP drain, then fresh
 acknowledgements from both consumers. The root-owned assignment remains bound
-to the new session key. See [IP reuse](security.md#per-session-admission).
+to the new session key. See [IP Reuse Fence](#ip-reuse-fence).
 
 The root proxy process runs two independent loops. A 100 ms, single-flight,
 level-triggered admission loop reads only the root-owned session files, the
@@ -450,7 +456,7 @@ the attached wait ([driver](../packages/cli/src/runtime/session-admission-driver
 
 Image builds, build approvals, and credential-source resolution finish before
 startup takes the lifecycle lock. Startup and explicit reload bound held
-subprocess work to 90 seconds and refuse acquisition after 120 seconds.
+subprocess work to 90 seconds and refuse acquisition after about 60 seconds.
 Prepared credential values must be admitted within 120 seconds of preparation
 and used within a further 120 seconds; expired or changed preparation refuses
 before a credential write. Ordinary session-file heartbeats take no lock.
@@ -571,6 +577,26 @@ host suspension and filesystem stalls can exceed them
 ([queue](../packages/cli/src/runtime/session-renewal-queue.ts),
 [operation budget](../packages/cli/src/runtime/lifecycle-operation-budget.ts)).
 
+A proved proxy boundary violation permits exact proxy containment under the
+lifecycle fence. A failed observation does not authorize Compose teardown.
+Containment refuses a container that has the expected 64-hex id but not this
+project's id, container-role, and Compose project/service labels. Failed
+containment reports unconfirmed safety and stops recovery. Candidate creation
+checks the retained network, CA certificate/key identity, and exact project
+OAuth volume before it mounts them into the approved proxy image. Existing
+sockets and in-flight OAuth exchanges can end; recovery does not replay them.
+
+A record with a terminal host status stamp is an interrupted teardown, not a
+session. Plain destroy's record scan excludes it; the session-listing gate
+still protects alive or unknown owners. Positive owner-death evidence permits
+normal cleanup; for an uncertain owner, `destroy --force` reclaims it.
+
+A project whose control-plane materialization predates the admission contract
+cannot be read: `runfree up` refuses with an invalid-component-evidence error
+and names `runfree rebuild`. A pre-cutover rebind journal stopped at a retired
+acknowledgement phase reads as unreadable evidence; its remedy is
+`runfree destroy --force`.
+
 Rebuild confirmation enumerates live per-session lifecycle records. The
 post-confirmation check rejects only a newly appeared session; a session exit
 or a changing child-process count does not invalidate the confirmation.
@@ -610,6 +636,237 @@ Unexpected CLI failures render bounded nested `AggregateError.errors` and
 `Error.cause` name/message chains while retaining only the top-level stack.
 Expected `CliError` and `AdminExit` behavior is unchanged.
 
+#### Session File Contract
+
+```text
+/run/runfree-sessions/sessions/<sessionKey>.json    root-owned 0644  (one per session)
+/run/runfree-sessions/eligibility.json              root-owned 0644  (one per proxy)
+/run/runfree-sessions/ip-reuse/requests/<ip>.json   root-owned 0644  (IP fence state)
+```
+
+A session file carries:
+
+- identity: project, session key, session id and incarnation, source IP,
+  container id, internal network id;
+- bindings: control plane generation digest, admission contract epoch,
+  selected agent image ID, session-agent generation digest;
+- display fields for the approval prompt;
+- renewal fields: a fresh random `nonce` on every write, the `inspectedAt` of
+  the Docker inspection that authorized the write, and
+  `aliveUntil = inspectedAt + lease`.
+
+The wire contract is
+[session-file.ts](../packages/runtime-contracts/src/session-file.ts). The
+parse is exact. It refuses an unknown key, a missing key, a file name that is
+not the embedded `sessionKey`, a payload over 8 KiB, and an `aliveUntil` more
+than the five-minute maximum lease after `inspectedAt`. The lease is anchored
+to the inspection, not to the write, so `docker exec` latency cannot extend
+the time between proof and authority.
+
+Every write, delete, and read is one pinned
+`docker exec --user 0:0 -i <exact proxy id> node -e <sealed script>` argv. A
+sha256 of the exact stdin bytes is a separate argument. There is no shell and
+no interpolated path. The script proves the parent directory is root-owned and
+not group- or other-writable, writes a temp file with `O_EXCL|O_NOFOLLOW`,
+fsyncs it, renames it, fsyncs the directory, and reads the result back. The
+uid-1001 request proxy reads the files and cannot write them. The root
+firewall checks the owner uid, not the gid.
+
+The eligibility file names the project, control plane generation digest,
+admission contract epoch, internal network id, and the agent materializations
+that may be admitted. The host publishes it:
+
+- after the control plane is selected and proven, at `runfree up` and at launch;
+- after a same-container proxy restart (the restart empties the directory);
+- from every reconcile;
+- into a rebind candidate before the durable selection flips.
+
+Publication is idempotent. The host records the bytes it last published
+against the proxy container ID and its Docker `StartedAt`. Identical bytes cost
+no `docker exec`, and a restarted proxy with the same id is always
+republished.
+
+**Dual-clock validity.** Each consumer uses the file's wall deadline and a
+monotonic bound of `min(aliveUntil − guest now, five minutes)`. The monotonic
+bound is fixed when a given `nonce` is first observed, so replayed bytes extend
+neither clock. A new `nonce` is a new observation. If a new `nonce` replaces
+an observation that had already expired, the session is served again only
+after its old sockets and grants are destroyed. A rewrite that only advances
+the lease keeps established sockets and grants. Any change to the bound
+identity destroys them.
+
+**Clock caveats.** `performance.now()` is `CLOCK_MONOTONIC`. It does not
+advance while the Docker VM is suspended. The wall deadline does elapse, so
+after a long host sleep the proxy drops the session on wake and the next
+heartbeat re-admits it within seconds. A guest wall clock that is ahead of the
+host by more than the lease minus the cadence makes every file expired on
+arrival, and the session is not served. A guest clock that is behind keeps a
+file valid for longer, but the monotonic bound still caps it at five minutes.
+Keep the cadence at or below one third of the lease.
+
+#### Readiness Entry
+
+The container's first process is the base image's `session-entry`, and the
+agent launch is its argv. The entry sends one exact readiness request to the
+request proxy and execs the agent only on `200` with body `active`:
+
+```text
+before the session file   firewall drops the connection   probe: connect failure
+admitted, not yet served  request proxy answers 403        probe retries
+file served               200 "active"                     entry execs the agent
+```
+
+The readiness answer is local. It forwards nothing, resolves nothing, and
+grants nothing. The wait bound is `RUNFREE_SESSION_ENTRY_TIMEOUT_MS` (60 s),
+rendered by the host. An entry that gives up exits 111. The container stops,
+that code becomes the launch exit status, and normal teardown reclaims the
+file, container, and record. The entry is cooperation, not enforcement. A
+project image may replace it; it then loses only start ordering.
+
+#### IP Reuse Fence
+
+A new container must not inherit authority from an old session on the same
+address. Before Docker creates the container, the host runs this barrier under
+the lifecycle lock:
+
+```text
+host                                   proxy (root firewall + request proxy)
+ |  read current assignment for <ip>
+ |  write "draining" + nonce1 + new key --> both consumers exclude <ip>
+ |                                          firewall verifies nft set excludes <ip>
+ |  <-- firewall ack nonce1 --------------
+ |  ss -K old TCP sockets to proxy port
+ |  ss query: require zero remaining
+ |  write nonce2 -----------------------> request proxy drops old mapping,
+ |                                        grants, and accepted sockets
+ |  <-- ack nonce2 from both -------------
+ |  write "ready" (bound to new key)
+ |  docker create / start
+```
+
+- The executor takes a kernel `flock` on the root-owned IP-assignment
+  directory and requires that the assignment still matches the exact bytes
+  the host read. It holds the lock through retirement and publication, so a
+  delayed exec cannot replace a later assignment. A lock timeout refuses
+  creation; retry is safe.
+- The ingress listener binds IPv4 explicitly, so the IPv4 `ss` query covers
+  it. Linux can keep unaccepted sockets after `ss -K`; the request proxy keeps
+  destroying sockets from draining addresses, and the host retries the query
+  until its deadline. TIME_WAIT entries carry no stream and do not block reuse.
+- The retained assignment binds the IP to the new session key for the proxy
+  lifetime. A delayed old session file cannot regain authority.
+- A failed fence leaves the address draining and refuses creation. A later
+  launch writes a new nonce and repeats the barrier.
+- Missing or unsafe assignment directories deny all membership. Proxy startup
+  clears assignments together with session authority.
+
+See [publisher](../packages/cli/src/runtime/session-file-publisher.ts),
+[assignment reader](../packages/proxy/src/session-ip-reuse.ts), and the
+[negative live tests](../tests/runtime/live/session-admission-negative.live.test.ts).
+
+#### Admission Proofs
+
+- A proof exists only if `validateSessionContainerInspect` minted it from an
+  exact `docker container inspect`. A private registry holds it by identity,
+  so a caller cannot construct or copy one.
+- Every consumer re-checks that the proof names this project, session
+  incarnation, principal, container, image, control plane and session-agent
+  generation digests, source IP, and internal network. A proof that is too old
+  cannot authorize an effect.
+- The one post-start inspection holds the container to the create plan
+  exactly. The session file's renewal anchor (process id, start time, network
+  endpoint) is a projection of that inspection.
+- The proof reads Docker's answer through one normalization layer. Absent
+  zero-value fields resolve to the planned zero value, `CAP_` capability names
+  are canonicalized, and Docker Desktop `/host_mnt` bind sources are mapped
+  back. The comparison stays exact across daemon releases.
+- Between container start and the session file, nothing names the session.
+  Its address is in no kernel set and the request proxy refuses it. Docker
+  refuses a duplicate static address at start. Taking a session's address
+  would need Docker daemon access, which the agent does not have.
+
+#### Ephemeral Helpers
+
+Startup runs the direct-egress deny probes, the trust-bundle render, and
+dependency-volume preparation as short `--rm` containers on the untrusted
+project agent image ([ephemeral-helper.ts](../packages/cli/src/runtime/ephemeral-helper.ts)).
+
+- **Bounded, under the lock.** A helper starts only while the project lifecycle
+  lock is held, with `--pull never` and hardened flags. The Docker client is
+  SIGKILLed at the helper timeout: 30 s for the deny probes, 120 s otherwise.
+  The lifecycle operation budget can clamp this further.
+- **Marked on the host.** Before the spawn, each run writes
+  `helpers-pending.json` into the host project state directory. A clean exit
+  clears it with no Docker call. The agent has no mount of this path. The
+  marker grants nothing; it only tells the next lock holder to sweep.
+- **Swept by label under the lock.** After an unclean exit, and at the next
+  lock acquisition when the marker is present, Runfree lists containers with
+  this project's id and the `ephemeral-helper` role, runs `docker rm --force`
+  on them, and polls until the listing is empty. Helpers run only while the
+  lock is held, so any helper a lock holder sees is residue. A run that finds
+  a marker another lock span left sweeps before it spawns. Every container
+  Runfree creates sets its role and project labels explicitly, and an explicit
+  label overrides an inherited image `LABEL`, so a project image cannot make a
+  session look like a helper. A listing that fails or times out never counts
+  as empty; a warning on stderr does not refuse, because stdout is validated
+  id by id. An unconfirmed sweep keeps the marker, refuses the launch, and
+  names `runfree up` and `runfree destroy --force`.
+- **Sweep time.** The sweep runs under the lock but outside the operation
+  budget, with fixed per-call bounds: about 15 s, plus up to 2 s for the last
+  listing.
+- **Crash residue.** A marker left by a CLI that died is swept when `up` or a
+  launch starts the runtime, and when `runtime reload-policy --force` restores
+  admission, before any new helper runs or any session is admitted.
+- **Late create (accepted).** If the Docker client dies while its create
+  request is in flight, the daemon can still create the container after the
+  sweep found none. The marker is kept for 180 s after the killed client, or
+  after the spawn when the CLI died, and every lock holder in that window
+  sweeps again. A killed client's container stays `created`, with no network
+  endpoint. If only the CLI process died, its orphaned `docker run` client
+  has no timeout and can still start the helper, even after the window: the
+  firewall drops that unadmitted source, and a later deny probe that needs its
+  address fails closed. A wall-clock jump can end the window early, and
+  `destroy` clears the marker; a container created after that needs
+  `runfree destroy --force`.
+- **Label minting (accepted).** A process with Docker socket access can put
+  the helper labels on another container, which the sweep then removes. The
+  agent has no Docker socket, and the Docker daemon is trusted. Two Runfree
+  state roots driving the same project path (a development setup, or two users
+  on one Docker daemon) do not share the lock, so one can sweep the other's
+  running helper; that run then fails closed. A project Dockerfile can put the
+  helper labels on legacy-builder intermediate containers, so a concurrent
+  sweep can fail another CLI's in-progress build (BuildKit, the default,
+  creates no such containers).
+
+The deny-probe helper sits in the agent position on `agent_internal`, so it
+gets a pinned address from the reserved block `.13`–`.19`, outside the session
+pool (`.20` and up). It skips the proxy, agent, and callback addresses, the
+gateway, and every attached address. When the block is exhausted, the probes
+fail as not run, and the refusal names `runfree forward stop` and
+`runfree destroy --force`. The session-file publisher and the IP fence refuse
+any address outside the session pool.
+
+A Docker call that times out or is killed never reads as success
+([spawn-status.ts](../packages/cli/src/runtime/spawn-status.ts)): timeout maps
+to 124, other spawn errors to 125, a signal to 128 + N. An empty listing from a
+timed-out `docker ps` is never proof of absence.
+
+#### Utility Participants
+
+The internal network may also hold ingress forwarders (MCP OAuth callback,
+VNC, `runfree forward`). They are one-way host-to-agent transport sidecars on
+a loopback-only host bridge plus `agent_internal`. They are not credential or
+authorization boundaries. Runfree rejects unknown peers and checks each
+forwarder's command, networks, loopback publication, mounts, user,
+capabilities, and writable state. The MCP OAuth callback forwarder must target
+a live session address.
+
+Before it admits a session beside a forwarder, the host rechecks that shape,
+the resolved immutable image ID, and the exact internal and host network IDs
+under the lifecycle lock. The network baseline reserves the forwarder address;
+it grants no session-file authority. A failed utility proof is reclaimed by
+repairing or stopping the forwarder, or by `runfree destroy --force`.
+
 ### Interrupted Session Recovery
 
 Interactive attaches write host-owned session evidence under the per-project
@@ -626,11 +883,22 @@ exclusive host-owned claim, starts the normal validated runtime, and launches a
 descriptor-owned Claude or Codex resume argv. Failure releases only the claim;
 successful exit fingerprint-checks and consumes only the selected evidence.
 
+Claude registry files are untrusted agent state. Recovery reads only bounded,
+regular, single-link files from fixed directories, with no-follow open and
+inode checks, validates conversation ids before building argv, and sanitizes
+display strings. It never touches conversation transcripts. `--agent` filters
+only; it grants no resume authority.
+
+Host updates to the writable Codex state use a fixed-file operation at the
+mount root. It rejects symlinks, hard links, special files, oversized files,
+and concurrent changes, creates the new file with no-follow and exclusive-open
+flags, and replaces `config.toml` by rename. An unsafe entry is left in place
+for manual recovery.
+
 ## Network Policy Model
 
 The public file is strict desired policy v2. It is reviewable project input,
-not the proxy's runtime policy. Legacy v1 policy is converted only by explicit
-config-v4 migration.
+not the proxy's runtime policy. Legacy v1 policy is not converted.
 
 ```json
 {
@@ -668,7 +936,218 @@ Write action precedence is:
 2. merged desired-policy `writeApproval` (or a one-run host override);
 3. built-in default `ask`.
 
+For a small fixed set of first-party AI hosts (`IDENTITY_ACCEPT_ENCODING_HOSTS`
+in the proxy), streaming-shaped requests are forwarded with identity
+`Accept-Encoding` so intercepted event streams stay parseable. This changes
+response compression only, never authorization.
+
 For onboarding, `runfree up --audit-network` permits non-allowlisted HTTPS hosts for a short window and records what would have been blocked. `runfree audit report` suggests exact `runfree host add` commands but does not edit policy.
+
+### Proxy Enforcement Details
+
+The request proxy is [mockttp](../packages/proxy/package.json) running as the
+unprivileged `runfree-proxy` user (uid 1001). Checks run in this order
+([policy.ts](../packages/proxy/src/policy.ts)):
+
+```text
+host allowlist -> request shape -> write class -> write action -> credential -> OAuth -> upstream
+```
+
+A request that fails a step reads no token, does no OAuth mediation, and
+opens no upstream connection. One exception: for a non-read request to a
+declared GraphQL endpoint on an `ask`/`deny` host, and for MCP POST/DELETE,
+the proxy reads the request body locally before the shape check, because
+classification needs it.
+
+**Request shape.**
+
+- Denials carry `x-runfree-blocked: method-not-allowed`, `path-not-allowed`,
+  `git-push-denied`, `write-denied`, or a `write-approval-*` reason.
+- On method-ruled hosts, and on any host whose write action is not `allow`,
+  the proxy strips `X-HTTP-Method-Override`, `X-HTTP-Method`, and
+  `X-Method-Override`.
+- On path-ruled hosts, the path is decoded up to five times. Encoded dot,
+  slash, or backslash, a literal `\`, `//`, `..`, `..;param`, or a malformed
+  encoding fails closed, so the proxy and the origin cannot disagree about
+  the path.
+- WebSocket upgrades are checked as GET.
+
+**Write classification.** Anything not proven a read is a write. In order:
+WebSocket upgrades (under `ask`/`deny`), a method-override header, git push,
+`writePathPrefixes`, a GraphQL body that is not a pure query, and methods
+other than GET/HEAD/OPTIONS. `readPathPrefixes` and the git upload-pack
+exemption make some POSTs reads; path confusion cancels those exemptions. MCP
+tool calls are classified by operation policy.
+
+**Holds.** Under `ask` the proxy holds the request for
+`runtime.writeApprovalHoldSeconds` (default 120 s, range 5–300 s), with at
+most 16 holds. Without an attached approver (a root-owned heartbeat less than
+45 s old for the current approval epoch), the answer is an immediate 403.
+Pending records are in a uid-1001 0700 directory. Decision files, control
+files, and the heartbeat must be root-owned, and the host writes them with a
+root `docker exec`, so neither the agent nor the proxy process can approve
+itself. Approval ids are single-use. An approved request re-runs the full
+policy check. A policy change cancels holds that no longer pass. Mockttp
+cannot hold a WebSocket upgrade, so WSS approval is deny-then-retry, matched
+by a request-scoped grant.
+
+**Denial feedback.** A denied 443 CONNECT is terminated with one static
+`blocked.invalid` certificate and answered with a synthetic 403 that names the
+host and the `runfree host add` (or `host rules`, `approvals --watch`)
+remedy. At most 32 denied tunnels run at once; past that, and for non-443
+CONNECT, the answer is a raw pre-TLS 403. Idle denied tunnels close after 5 s.
+A certificate-validating client sees a TLS error, not the body, but the proxy
+still records a `proxy-denial:` event for `runfree doctor` and the session-end
+summary ([denial.ts](../packages/proxy/src/denial.ts)). Events are coalesced
+to 10 per minute per host and reason. Logs carry the path only: no query, no
+body, no credential values.
+
+**Audit mode.** `runfree up --audit-network[=<d>]` (default 60 min, maximum
+8 h) relaxes only the host allowlist. HTTPS-only, 443-only, and DNS answer
+classification still apply. Audited hosts get no token injection, and
+configured credential headers are stripped (except on WSS upgrades; see
+[security.md](security.md#residual-risks)). Shape rules and write
+classification do not apply to audited hosts. The host writes the audit
+marker with a root `docker exec` into a root-owned directory. The request
+proxy and the firewall use one clamp,
+`min(expiresAt, min(enabledAt, proxyNow) + 8h)`, so a skewed clock cannot
+extend the window. Audited IPs go to `audit_ipv4` (256 by default). At expiry
+or `runfree audit off`, audited IPs that are not also allowed move to
+`audit_draining_ipv4`, whose drop rule sits above the established-connection
+accept, so in-flight audited uploads are cut.
+
+**Firewall.** The root supervisor programs one nftables table
+([nftables.ts](../packages/proxy/src/firewall/nftables.ts)):
+
+```text
+input   :8080 accepted only from @session_ipv4
+output  default drop; allow loopback, established, TCP 443 to @allowed_ipv4
+        (and @audit_ipv4 in audit mode) on the egress interface
+dns     uid 1001 port 53 rejected before Docker DNS rewrite
+ipv6    loopback only
+```
+
+The supervisor resolves allowed hosts and rejects loopback, private,
+link-local, CGNAT, documentation, benchmark, multicast, reserved, broadcast,
+and runtime-subnet answers before they reach `allowed_ipv4` or the resolver
+snapshot. The request proxy answers `dns.lookup` only from that snapshot and
+does no DNS of its own.
+
+**Process hardening.** The proxy container adds `NET_ADMIN` and drops
+`NET_RAW`. The root entrypoint starts the server through `setpriv` as uid/gid
+1001 with no supplementary groups, no inheritable or ambient capabilities,
+`NET_ADMIN`/`NET_RAW` removed from the bounding set, and `no_new_privs`, and
+checks this at runtime ([entrypoint.ts](../packages/proxy/src/entrypoint.ts)).
+If the Docker backend picks the internal interface as the default route, the
+entrypoint replaces it with the egress gateway, and the host verifies the
+route ([route.ts](../packages/proxy/src/firewall/route.ts)).
+
+**Agent container.** Session containers run as uid/gid 1000, with
+`no-new-privileges` and `NET_ADMIN`/`NET_RAW` dropped. The agent trusts the
+proxy CA through a bundle the host renders with an ephemeral helper into the
+read-only `/etc/proxy-ca` mount; `SSL_CERT_FILE`, `NODE_EXTRA_CA_CERTS`, and
+similar variables point at it. The agent never needs root to install trust.
+
+**Runtime inputs lock.**
+[runtime-inputs.lock.json](../packages/agent-runtime/runtime-inputs.lock.json)
+pins base images by digest, exact apt package versions, and release artifact
+checksums. A missing or malformed lock fails before any build. The apt sources
+are the live Ubuntu archives, not snapshots, so transitive apt dependencies
+can still drift without a lock change.
+
+### Checkout Binding
+
+Each approvals record is scoped to a checkout by the project scope, the config
+generation, and a checkout binding: the root's resolved path and inode. The
+volume device number is recorded for diagnosis and never compared, so a reboot
+that renumbers the volume keeps every approval.
+
+The binding is a scope key, not an authorization. Approved subjects are content
+digests of the policy bytes, isolation fields, and image build inputs, so any
+change to approved content forces a review by itself. The inode adds only a
+consent hint for a directory replaced at the same path. Limits (accepted):
+
+- It does not cover per-project Claude, Codex, and Pi state. Those mounts are
+  keyed on path only, so a replacement checkout at the same path inherits them.
+- It sees the directory, not its contents. A branch checkout, `git pull`, or
+  agent edit keeps the same inode.
+- It is void when the project root is a filesystem mount root (dedicated
+  volume, CI workspace volume, loopback image, bind-mounted checkout). A new
+  filesystem gives its root a fixed inode, so the binding is path only.
+
+A different volume at the same path, or a reused inode, keeps approvals.
+Where an inode is unstable, the cost is one review. A binding that does not
+hold shows the normal policy review before any build, credential resolution,
+or attach. The old record is copied aside, not replaced in place.
+
+### Desired-Policy Mutation Beside Live Sessions
+
+The typed desired-policy mutations (`host add`/`remove`/`rules`, service and
+credential mutations, and the `init` wizard and pre-launch operational-service
+review that call them) run while sessions are live, with no pause or restart.
+Under the project lifecycle lock they:
+
+```text
+capture candidate -> verify against approved base -> atomic replace file
+  -> re-read -> require exact match to planned candidate -> approve candidate
+```
+
+**Invariant: a live desired-policy mutation approves the exact in-memory
+candidate it re-read and verified under the lock, never a fresh read of the
+worktree file.** Approval is content-addressed: clean bytes go into a
+digest-keyed snapshot store, and publication consumes the snapshot. An agent
+edit in any window is refused, or stays inert unapproved drift that the next
+transaction rejects. Any new caller of `withQuiescedProject` with
+`allowLiveSessions` must keep this chain. Extend
+[desired-mutation-drift-guard.test.ts](../packages/cli/src/control/desired-mutation-drift-guard.test.ts)
+for proof.
+
+All other control transactions (lifecycle rebuild/destroy, `runfree init`
+image rebuild, startup capture) still defer while a session is
+active. A concurrent launch reuses the selected effective generation and
+reads no desired input.
+
+Generation publication also accepts a host-only effective network policy
+substitution (`effectiveNetworkPolicy` on `publishEffectivePolicyGeneration`),
+used by host flows such as MCP projection. Project input cannot reach it. The
+request proxy and the nftables supervisor consume the selected generation
+independently. Activation waits for both status files and a verified firewall
+ruleset before credential convergence. Invalid generations keep the previous
+authority. `--no-reload` on host, credential, and service mutations changes
+desired input only and leaves the selected generation unchanged.
+
+### Write Approval Grants
+
+| Scope | Lifetime |
+| --- | --- |
+| `session` (no `--ttl`) | until that session's authority ends |
+| `session --ttl <d>` | `<d>`; the CLI rejects more than 8 h, the proxy clamps to 8 h |
+| `request` | 5 min; readmits once any write with the same `(host, method, path, category)` |
+| `deny` / `deny-session` | no expiry; cleared only by `runfree approvals --clear-deny` |
+
+- **Subject.** The subject is the session, keyed by its source IP. A grant is
+  dropped when that session's authority is revoked or it ends.
+- **Two clocks.** Each positive grant records a wall-clock and a monotonic
+  origin and expires when either bound is used up, checked at use time. A
+  wall-clock step back cannot extend it. A host sleep (monotonic clock stops)
+  cannot extend it. A forward wall jump expires it early.
+- **Clearing denies.** `--clear-deny` writes a root-minted, schema-validated
+  control record naming the proxy's current deny nonce. The proxy rotates the
+  nonce whenever negative authority changes, so a stale clear revokes nothing.
+  Clearing returns to *ask*, never to allow. A deny shadows broader allows, so
+  a clear drops standing grants of both signs and lists them first. A
+  session-wide deny drops that session's positive grants but keeps narrower
+  denies.
+- **Restart.** Grants, denies, pending holds, and unexported audit observations
+  are lost on proxy-process restart; the restart reports this. Each process
+  mints a new approval epoch. Decisions, control messages, and watcher
+  heartbeats must name it, and decisions must name an exact pending hold
+  ([approval manager](../packages/proxy/src/approvals.ts),
+  [host writer](../packages/cli/src/runtime/approvals.ts)).
+- **Policy activation.** A new effective generation drops positive grants
+  whose host rules changed. It never drops denies. Policy activation is not a
+  hidden second revocation path. Where a host moves to `allow`, the deny is
+  dormant and returns to effect if the host goes back to `ask`.
 
 ## Credentials
 
@@ -735,7 +1214,19 @@ The default runtime config uses `dependencyOverlays: "auto"`.
 
 `runfree image init` creates `.runfree/image/Dockerfile` and configures `runtime.agent.build`. Project Dockerfiles extend `RUNFREE_BASE_IMAGE`; full image overrides are not supported. Wide build contexts require explicit host-state approval with `runfree image approve-context`.
 
-A project image may replace the base image's session entry (`/usr/local/libexec/runfree/session-entry`). What it loses is only the start ordering: the agent may then send before activation and be refused, exactly as the proxy refuses any pre-activation request. Authority is unchanged, and the running proof still holds the container to the entry path. See `docs/security.md`, "Per-Session Admission".
+Project image builds run before the sandbox exists, on the host Docker daemon
+with normal build networking. Runfree stages narrow `.runfree/image` contexts
+itself after it rejects symlinks, hard links, special files, and context
+escapes. The narrow-context approval subject is the staged manifest (file bytes
+and modes), the Dockerfile, and the normalized build config. Embedded runtime
+identity (base image, version arguments) is outside the subject: a Runfree
+upgrade rebuilds without a new prompt. Builds use only a stored snapshot that
+re-verifies byte-for-byte against the approved manifest. A snapshot that fails
+verification is never built; the launch warns and asks again over freshly
+staged bytes. Older releases cannot read these approval records; a downgrade
+needs re-approval.
+
+A project image may replace the base image's session entry (`/usr/local/libexec/runfree/session-entry`). What it loses is only the start ordering: the agent may then send before activation and be refused, exactly as the proxy refuses any pre-activation request. Authority is unchanged, and the running proof still holds the container to the entry path. See [Readiness Entry](#readiness-entry).
 
 ## Optional Side Features
 

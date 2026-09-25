@@ -115,7 +115,7 @@ import type { DenyByDefaultObservationV1 } from "./control-plane-deny-proof.ts";
 import { tokenSyncComponentEvidenceIssue } from "./upgrade-classification.ts";
 import { ensureAgentCaBundle, waitForProxyCaPublished } from "./ca-bundle.ts";
 import { EPHEMERAL_HELPER_FENCE_REQUIRED } from "./ephemeral-helper.ts";
-import { reclaimHelperRunResidue, type EphemeralHelperFence } from "./ephemeral-helper-residue.ts";
+import { reclaimHelperResidue, type EphemeralHelperFence } from "./ephemeral-helper-residue.ts";
 import type {
   ActiveAgentSession,
   DockerContainerInspect,
@@ -1232,21 +1232,17 @@ export async function startRuntime(
     };
 
     heldLifecycleLock.assertHeld();
-    // Design D-D: a helper-run directory present when the lock is newly
-    // acquired is residue of a run whose CLI died (invariant I5). Reclaim it
-    // before anything can run a new helper or admit a session, since a
-    // lingering helper blocks admission as an unclaimed project container.
-    // No residue costs one lstat and no Docker call.
+    // Design D-D: a helper marker present when the lock is newly acquired
+    // means a helper may have outlived its run. Sweep this project's helpers
+    // before anything can run a new helper or admit a session. No marker costs
+    // two lstat calls and no Docker call.
     try {
-      const residue = reclaimHelperRunResidue({
+      reclaimHelperResidue({
         lifecycleLock: heldLifecycleLock,
         containmentIO,
         stateDir: preparedPlan.paths.stateDir,
         dockerEnv: dockerClientEnvOptions(preparedContext).env,
       }, preparedPlan.projectId);
-      if (residue.pending > 0) {
-        warn(`${residue.pending} killed ephemeral helper run(s) are kept until a late container create can no longer land; the next \`${remedy.up()}\` re-checks them`);
-      }
     } catch (error) {
       warn(error instanceof Error ? error.message : String(error));
       return result(1, false, preparedContext);
@@ -1734,9 +1730,9 @@ export async function restoreSameProxySessionAdmission(input: {
   const { docker } = createRuntimeAdapters(context, io);
   if (!input.validation) {
     // The validation below runs ephemeral helpers, so this lock span needs the
-    // same residue reclaim `up` runs before its first helper (review C4).
+    // same residue sweep `up` runs before its first helper (review C4).
     if (!input.containmentIO) throw new Error(EPHEMERAL_HELPER_FENCE_REQUIRED);
-    reclaimHelperRunResidue({
+    reclaimHelperResidue({
       lifecycleLock,
       containmentIO: input.containmentIO,
       stateDir: plan.paths.stateDir,

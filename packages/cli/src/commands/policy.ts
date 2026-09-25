@@ -3,7 +3,6 @@
 import type { ArgumentsCamelCase, Argv } from "yargs";
 
 import { nodeRuntimeIO } from "../runtime.ts";
-import { assertConfigCurrent } from "../config-notice.ts";
 import {
   inspectControlStatus,
   inspectNetworkPolicyReview,
@@ -102,7 +101,6 @@ function interactiveHost(): boolean {
 
 function approvedControlRuntimeContext(context: RunfreeCommandContext): RuntimeContext {
   const project = context.projectInfo();
-  assertConfigCurrent(project);
   return {
     projectRoot: context.projectRoot,
     project,

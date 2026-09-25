@@ -403,10 +403,10 @@ describe("runCommandApp parser", () => {
     await expect(runCommandApp(strictContext(), ["init", "--bogus"], runDefault)).rejects.toMatchObject({
       message: expect.stringContaining("Unknown argument: bogus"),
     });
-    // Valid `init` reaches project discovery (strictContext throws there), proving the
+    // Valid `init` reaches project setup (strictContext throws there), proving the
     // typed module runs without delegating to runDefault.
     await expect(runCommandApp(strictContext(), ["init", "--yes"], runDefault)).rejects.toThrow(
-      "projectInfo() must not be called",
+      "ensureProject() must not be called",
     );
     expect(runDefault).not.toHaveBeenCalled();
   });

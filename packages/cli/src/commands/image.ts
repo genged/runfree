@@ -14,20 +14,16 @@ import {
 } from "../agent-image.ts";
 import {
   ensureProjectAgentImage,
-  QUIESCED_CONFIG_MIGRATION,
   type AgentImageInitResult,
   type ProjectInfo,
 } from "../config.ts";
-import { assertConfigCurrent, configMigratedLines } from "../config-notice.ts";
 import {
   approveNarrowImageBuildCandidate,
   captureNarrowImageBuildCandidate,
   describeNarrowImageBuildCandidate,
   readApprovedNarrowImageBuild,
 } from "../control/image-approval.ts";
-import { withQuiescedProject } from "../control/quiesce.ts";
 import { die } from "../errors.ts";
-import { nodeRuntimeIO } from "../runtime.ts";
 import { withExamples } from "./examples.ts";
 import type { CommandModule } from "./types.ts";
 import { remedy } from "../remedies.ts";
@@ -36,9 +32,6 @@ function printImageInit(projectRoot: string, result: AgentImageInitResult): void
   console.log(`project: ${projectRoot}`);
   console.log(`agent Dockerfile: ${result.dockerfilePath}`);
   console.log(`agent build: ${result.project.config.runtime.agent?.build?.dockerfile ?? ".runfree/image/Dockerfile"}`);
-  if (result.project.configMigrated) {
-    for (const line of configMigratedLines(result.project.configMigrated)) console.log(line);
-  }
   if (!result.dockerfileCreated) {
     console.log("agent Dockerfile already exists");
   }
@@ -106,26 +99,13 @@ export const imageCommand: CommandModule = {
         ),
       handler(async (argv: ArgumentsCamelCase<ImageArgs>) => {
         if (argv.subcommand === "init") {
-          const initial = context.projectInfo();
-          const result = initial.configMigration
-            ? await withQuiescedProject(
-                {
-                  projectRoot: context.projectRoot,
-                  project: initial,
-                  runtimeRoot: context.assets().runtimeDir,
-                  env: context.env,
-                },
-                nodeRuntimeIO,
-                () => ensureProjectAgentImage(context.projectRoot, context.templatesDir(), context.env, {
-                  migrationProof: QUIESCED_CONFIG_MIGRATION,
-                }),
-              )
-            : ensureProjectAgentImage(context.projectRoot, context.templatesDir(), context.env);
+          // Validate the config before templatesDir() materializes assets.
+          context.projectInfo();
+          const result = ensureProjectAgentImage(context.projectRoot, context.templatesDir(), context.env);
           printImageInit(context.projectRoot, result);
           return;
         }
         const project = context.projectInfo();
-        assertConfigCurrent(project);
         approveImageContext(context.projectRoot, project);
       }),
     ),

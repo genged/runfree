@@ -156,8 +156,8 @@ runfree host rules <host> --clear
 `--read-only` is shorthand for `GET`, `HEAD`, and `OPTIONS`. Re-running `host add` or `host rules` with request-rule flags replaces that host's request rules. `host rules --write` sets the action for write-class requests to that host.
 
 `--local` writes the checkout-local ignored desired layer; project scope is the
-default. `runfree init` performs the explicit quiesced migration from supported
-legacy config/policy shapes.
+default. Pre-v4 configs are not migrated: move `.runfree` aside and run
+`runfree init` to start a current configuration.
 
 ### Audit network discovery
 

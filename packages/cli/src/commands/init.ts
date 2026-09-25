@@ -1,12 +1,12 @@
-// `runfree init [--yes]` — scaffold/migrate this project's `.runfree` config and
+// `runfree init [--yes]` — scaffold this project's `.runfree` config and
 // optionally run the interactive setup wizard.
 //
 // Typed command module: yargs validates the grammar (only --yes/-y), then the
-// handler ensures the project (migrating legacy config), prints the scaffold,
+// handler ensures the project, prints the scaffold,
 // and — only on a TTY without --yes — runs the wizard (exit 1 when any wizard
 // item failed to apply; the scaffold is complete either way). When the desired project
-// policy carries authority no approved base covers (a v3->v4 migration without
-// a legacy enforced proof, or desired drift), the handler first runs the same
+// policy carries authority no approved base covers (desired drift, or a
+// hand-written policy), the handler first runs the same
 // exact-review approval as `runfree policy approve --project`; declining skips
 // the wizard. The wizard's apply step runs through the typed `*Intent`
 // enforcement within a single admin state (see `dispatchDesiredWizardAdmin`);
@@ -32,14 +32,11 @@ import { serviceHostState } from "../admin/service-policy.ts";
 import type { AdminState } from "../admin/types.ts";
 import {
   type ProjectInfo,
-  QUIESCED_CONFIG_MIGRATION,
   resolveDefaultAgentName,
 } from "../config.ts";
-import { configMigratedLines } from "../config-notice.ts";
 import { readApprovedNetworkPolicy } from "../control/approvals.ts";
 import { mutateDesiredHost } from "../control/local-host-mutation.ts";
 import { mutateDesiredService } from "../control/service-mutation.ts";
-import { withQuiescedProject } from "../control/quiesce.ts";
 import { approveNetworkControl } from "../control/workflow.ts";
 import { runInitWizard, type WizardAdminIntent } from "../init-wizard.ts";
 import { nodeRuntimeIO } from "../runtime.ts";
@@ -112,8 +109,7 @@ export async function runWizardAdminIntent(
 const AUTHORITY_FREE_CANONICAL = canonicalDesiredNetworkPolicy({ version: 2, hosts: [] });
 
 /** True when the desired project policy carries authority that no approved
- * base covers — the state a v3->v4 migration without a recorded legacy
- * enforced proof leaves behind, and the state desired drift produces. The
+ * base covers — the state desired drift or a hand-written policy produces. The
  * authority-free scaffold never needs a review: the first typed mutation
  * approves it automatically. */
 export function projectPolicyNeedsExactApproval(context: RuntimeContext): boolean {
@@ -177,9 +173,6 @@ function printInit(projectRoot: string, project: ProjectInfo): void {
     console.log("after the first start, enable services with: runfree service enable <id>");
     console.log("service ids are listed by: runfree service enable --help");
   }
-  if (project.configMigrated) {
-    for (const line of configMigratedLines(project.configMigrated)) console.log(line);
-  }
 }
 
 export const initCommand: CommandModule = {
@@ -187,27 +180,17 @@ export const initCommand: CommandModule = {
   register: (parser, context: RunfreeCommandContext, handler: CommandHandlerFactory) =>
     parser.command(
       "init",
-      "Scaffold or migrate this project's Runfree configuration",
+      "Scaffold this project's Runfree configuration",
       (cmd) =>
         withExamples(
           cmd.option("yes", { type: "boolean", alias: "y", describe: "Skip the interactive wizard; produce only the scaffold" }),
           "init",
         ).epilogue(
-          "Scaffold or migrate this project's .runfree configuration. On a terminal without --yes, the interactive setup wizard runs afterward.",
+          "Scaffold this project's .runfree configuration. On a terminal without --yes, the interactive setup wizard runs afterward.",
         ),
       handler(async (argv: ArgumentsCamelCase<{ yes?: boolean }>) => {
         const { projectRoot, env } = context;
-        const initial = context.projectInfo();
-        const project = initial.configMigration
-          ? await withQuiescedProject(
-              { projectRoot, project: initial, runtimeRoot: context.assets().runtimeDir, env },
-              nodeRuntimeIO,
-              () => context.ensureProject({
-                migrateConfig: true,
-                migrationProof: QUIESCED_CONFIG_MIGRATION,
-              }),
-            )
-          : context.ensureProject({ migrateConfig: true });
+        const project = context.ensureProject();
         printInit(projectRoot, project);
         // The wizard runs only on a TTY without --yes; every other invocation
         // produces exactly the scaffold above. Declining everything in the wizard
@@ -215,7 +198,7 @@ export const initCommand: CommandModule = {
         if (!argv.yes && process.stdin.isTTY && process.stdout.isTTY) {
           const runtimeDir = context.assets().runtimeDir;
           const runtimeContext: RuntimeContext = { projectRoot, project, runtimeRoot: runtimeDir, env };
-          // A migrated (or drifted) project policy has no approved base, and
+          // A drifted project policy has no approved base, and
           // every typed wizard mutation refuses to extend an unapproved base.
           // Review and approve it here, exactly once, before the wizard runs.
           if (!(await ensureWizardApprovedBase(runtimeContext, nodeRuntimeIO))) return 0;
