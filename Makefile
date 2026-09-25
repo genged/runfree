@@ -1,6 +1,6 @@
 SHELL := /bin/bash
 
-.PHONY: help test test-all test-static test-unit test-agent test-proxy test-security test-templates test-cli-e2e test-cli-e2e-live test-runtime test-runtime-smoke test-runtime-live test-runtime-live-topology test-runtime-live-managed-launch test-runtime-live-egress test-runtime-live-connect-guard test-runtime-live-request-shape test-runtime-live-audit test-runtime-live-allowlist test-runtime-live-policy-mutation test-runtime-live-helper-reclaim test-live-session-admission-docker-desktop test-live-session-admission-orbstack test-live-session-admission-negative-docker-desktop test-live-session-admission-negative-orbstack test-live-session-admission-attached-docker-desktop test-live-session-admission-attached-orbstack test-live-session-renewal-docker-desktop test-live-session-renewal-orbstack test-live-session-independence-docker-desktop test-live-session-independence-orbstack test-live-session-admission-crash-docker-desktop test-live-session-admission-crash-orbstack test-live-session-admission-drift-docker-desktop test-live-session-admission-drift-orbstack reclaim-runtime-sandbox reclaim-runtime-sandbox-apply test-watch
+.PHONY: help test test-all test-static test-unit test-agent test-proxy test-security test-templates test-cli-e2e test-cli-e2e-live test-runtime test-runtime-core test-runtime-extended test-runtime-smoke test-runtime-live test-runtime-live-topology test-runtime-live-managed-launch test-runtime-live-egress test-runtime-live-connect-guard test-runtime-live-request-shape test-runtime-live-audit test-runtime-live-allowlist test-runtime-live-policy-mutation test-runtime-live-helper-reclaim test-live-session-admission-docker-desktop test-live-session-admission-orbstack test-live-session-admission-negative-docker-desktop test-live-session-admission-negative-orbstack test-live-session-admission-attached-docker-desktop test-live-session-admission-attached-orbstack test-live-session-renewal-docker-desktop test-live-session-renewal-orbstack test-live-session-independence-docker-desktop test-live-session-independence-orbstack test-live-session-admission-crash-docker-desktop test-live-session-admission-crash-orbstack test-live-session-admission-drift-docker-desktop test-live-session-admission-drift-orbstack reclaim-runtime-sandbox reclaim-runtime-sandbox-apply test-watch
 
 help:
 	@printf '%s\n' \
@@ -15,8 +15,10 @@ help:
 		'  make test-templates       Docker Compose template validation' \
 		'  make test-cli-e2e         Build dist/runfree and run packaged CLI scenarios' \
 		'  make test-cli-e2e-live    Build dist/runfree and run its real-Docker lifecycle scenario' \
-		'  make test-runtime         Run the whole live runtime security suite: every *.live.test.ts (TEST_RUNTIME_BACKEND, default docker-desktop)' \
+		'  make test-runtime         Release gate: the whole live suite, core and extended (TEST_RUNTIME_BACKEND, default docker-desktop)' \
 		'                            Files run 4 at a time; TEST_RUNTIME_WORKERS=1 makes it serial on a memory-tight host' \
+		'  make test-runtime-core    Per-change live gate: trust-boundary proofs only (tests/runtime/live/tiers.ts), 2 files at a time' \
+		'  make test-runtime-extended  The rest of the live suite: recovery, upgrades, load, helper cleanup, audit mode' \
 		'  make test-runtime-smoke   One live tranche (runtime-topology: one fixture, one session, 24 read-only proofs) as a per-commit Docker check' \
 		'  make test-runtime-live    Run the migrated non-admission live tranches only (TEST_RUNTIME_BACKEND, default docker-desktop)' \
 		'  make test-runtime-live-<tranche>  One migrated tranche: topology|managed-launch|egress|connect-guard|request-shape|audit|allowlist|policy-mutation' \
@@ -141,6 +143,17 @@ test-cli-e2e-live: test-cli-e2e-build
 # every live measurement before 2026-09-21 was taken under.
 test-runtime:
 	TEST_RUNTIME_BACKEND=$(TEST_RUNTIME_BACKEND) pnpm exec vitest run --project runtime-live
+
+# The live suite in two tiers (tests/runtime/live/tiers.ts). Core proves the
+# trust boundary and runs for every runtime, proxy, firewall, network, or
+# credential change; it defaults to two files at a time. Extended proves
+# availability, recovery, and optional features. `test-runtime` runs both and
+# is the release gate. A live file not listed as core is extended.
+test-runtime-core:
+	TEST_RUNTIME_BACKEND=$(TEST_RUNTIME_BACKEND) TEST_RUNTIME_TIER=core pnpm exec vitest run --project runtime-live
+
+test-runtime-extended:
+	TEST_RUNTIME_BACKEND=$(TEST_RUNTIME_BACKEND) TEST_RUNTIME_TIER=extended pnpm exec vitest run --project runtime-live
 
 # The smoke tier: one live tranche on a Docker host in a few minutes, meant to
 # run per commit so drift between the CLI and the live fixture surfaces in

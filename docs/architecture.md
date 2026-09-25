@@ -1249,7 +1249,8 @@ pnpm test
 For runtime, proxy, firewall, mount, or credential-boundary changes, also run on a Docker-capable host:
 
 ```bash
-make test-runtime
-# or
-make test-all
+make test-runtime-core
 ```
+
+Before a release, or for lifecycle, recovery, upgrade, or cleanup changes, run
+the full `make test-runtime` (or `make test-all`).

@@ -42,7 +42,8 @@ If your change touches runtime, proxy, firewall, Docker network, mount, or
 credential behavior, it also needs a Docker host:
 
 ```bash
-make test-runtime          # the whole live runtime security suite
+make test-runtime-core     # trust-boundary live proofs: run for every such change
+make test-runtime          # the whole live suite (core + extended): release gate
 make test-runtime-smoke    # one tranche, as a quick per-commit check
 make test-all              # everything, including packaged offline and live E2E
 ```

@@ -327,8 +327,10 @@ For Docker, proxy, firewall, mount, credential, CA, token, MCP runtime, or
 sandbox changes, also run on a Docker host:
 
 ```bash
-make test-runtime    # or: make test-all
+make test-runtime-core   # trust-boundary live proofs
 ```
+
+Before a release, run the full `make test-runtime` (core and extended).
 
 Security tests must prove the rejection happens **before** the side effect:
 before DNS lookup, upstream connect, credential injection, policy change, or

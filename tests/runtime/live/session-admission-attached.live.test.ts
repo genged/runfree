@@ -92,6 +92,14 @@ import {
   type HeldLaunch,
   type LaunchRun,
 } from "./attached-support.ts";
+import { liveTierSelected } from "./tiers.ts";
+
+// This file holds cases of both live tiers (see `tiers.ts`): the exact
+// authority of attached sessions is core; lifecycle recovery around it is
+// extended.
+const coreTest = liveTierSelected("core") ? test : test.skip;
+const extendedTest = liveTierSelected("extended") ? test : test.skip;
+
 describe("attached per-session authority is exact and drift after the proof fails closed", () => {
   // Called for its validation, not its value, exactly as the sibling describes
   // below do: this tranche drives launches directly and no longer runs an
@@ -142,7 +150,7 @@ describe("attached per-session authority is exact and drift after the proof fail
     assertFilesPathExercised(fixture, proxyId, expectedIps, label);
   }
 
-  test("an attached session's authority is exactly its source IP in both consumers, and ending it clears both", async () => {
+  coreTest("an attached session's authority is exactly its source IP in both consumers, and ending it clears both", async () => {
     // The empty precondition is asserted, not assumed: without it, "exactly
     // this session" below could pass while a leftover admission from an
     // earlier case was also enforced.
@@ -187,7 +195,7 @@ describe("attached per-session authority is exact and drift after the proof fail
     expect(inspected.status, "the revoked session container still exists").not.toBe(0);
   }, TEST_TIMEOUT_MS);
 
-  test("two concurrent sessions are served exactly by their own addresses, and each teardown clears only its own authority", async () => {
+  coreTest("two concurrent sessions are served exactly by their own addresses, and each teardown clears only its own authority", async () => {
     // One session pair, carrying what were three separate cases: concurrent
     // attachment with distinct identities, the served set read through both
     // consumers, and the ordered owner-exit teardown. They differed only in
@@ -284,7 +292,7 @@ describe("attached per-session authority is exact and drift after the proof fail
     }
   }, TEST_TIMEOUT_MS);
 
-  test("a dead owner's session file, container, and record are reclaimed by the next launch", async () => {
+  extendedTest("a dead owner's session file, container, and record are reclaimed by the next launch", async () => {
     // The residue an ordinary kill leaves under this source: nobody deletes the
     // file, nobody removes the record, and the container keeps running, because
     // the process that would have done all three is gone. The reclamation is
@@ -334,7 +342,7 @@ describe("attached per-session authority is exact and drift after the proof fail
     }
   }, TEST_TIMEOUT_MS);
 
-  test("a peer holding the lifecycle lock past the session-file lease neither gaps the heartbeat nor needs an operator", async () => {
+  extendedTest("a peer holding the lifecycle lock past the session-file lease neither gaps the heartbeat nor needs an operator", async () => {
     // The L1 incident, run forward under the source that answers it. The same
     // choreography as the generation-path case above — A served, a peer parked
     // after creation and before start, holding the project lifecycle
@@ -456,7 +464,7 @@ describe("attached per-session authority is exact and drift after the proof fail
     }
   }, TEST_TIMEOUT_MS);
 
-  test("a forced policy reload republishes eligibility and refills the served set", async () => {
+  extendedTest("a forced policy reload republishes eligibility and refills the served set", async () => {
     // A proxy holding no eligibility serves nothing (invariant 9), so a policy
     // restart that took the eligibility file with it would silently strand every
     // live session. The claim is that it does not: eligibility is republished,
@@ -535,7 +543,7 @@ describe("attached per-session authority is exact and drift after the proof fail
     }
   }, TEST_TIMEOUT_MS);
 
-  test("an ingress forwarder on the internal network is never served, and a launch beside it is", async () => {
+  extendedTest("an ingress forwarder on the internal network is never served, and a launch beside it is", async () => {
     // The MCP callback, VNC, and `runfree forward` all open the same hardened
     // ingress forwarder onto the project's internal network, so a container
     // that is emphatically not a session shares the session address space. Two
@@ -607,7 +615,7 @@ describe("attached per-session authority is exact and drift after the proof fail
     }
   }, TEST_TIMEOUT_MS);
 
-  test("an owner exiting while another launch is admitting leaves exactly the arriving session served", async () => {
+  extendedTest("an owner exiting while another launch is admitting leaves exactly the arriving session served", async () => {
     // Teardown and admission both take the project lifecycle lock, and under
     // this source teardown is one indivisible file-first sequence. Racing them
     // is what a real project does all day — one terminal closes while another
@@ -683,7 +691,7 @@ describe("attached per-session authority is exact and drift after the proof fail
     }
   }, TEST_TIMEOUT_MS);
 
-  test("a write grant issued to one session is not honoured for another session's address", async () => {
+  coreTest("a write grant issued to one session is not honoured for another session's address", async () => {
     // The live suites prove admission-set separation between sessions; this
     // proves session-scoped approval-grant separation. Two sessions are served; A's identical write is approved
     // with `--scope session`; B's is then held on its own, under its own
