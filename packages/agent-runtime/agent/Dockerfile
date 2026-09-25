@@ -138,7 +138,7 @@ RUN --network=none npm rebuild --prefix /opt/runfree-agent-tools --omit=dev
 COPY claude-runfree.sh /usr/local/libexec/runfree/claude
 # The session container's first process: waits for the proxy to report the
 # session active, then execs the typed agent argv. Cooperation, not
-# enforcement; see docs/security.md "Per-Session Admission".
+# enforcement; see docs/architecture.md "Readiness Entry".
 COPY session-entry.sh /usr/local/libexec/runfree/session-entry
 COPY session-ready-probe.cjs /usr/local/libexec/runfree/session-ready-probe
 RUN chmod 0755 /usr/local/libexec/runfree/claude \
