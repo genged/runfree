@@ -29,6 +29,7 @@ import {
 import type { RuntimeNetwork } from "./network.ts";
 import type { PiProviderChoice, PiProviderOption } from "./runtime/types.ts";
 import { composeProjectName, projectHash } from "./project-identity.ts";
+import { helperMarkerPath, legacyHelperRunsRoot, markHelperRunPending, readHelperMarker } from "./runtime/ephemeral-helper-residue.ts";
 import { proxyNftablesTableFixture, proxyNftablesTableJson } from "./proxy-nftables-proof.fixture.ts";
 import {
   createDependencyOverlayPlan,
@@ -3574,171 +3575,125 @@ describe("runtime command flow", () => {
     `);
   });
 
-  describe("helper-run residue at startup", () => {
+  describe("helper residue at startup", () => {
     const HELPER_ID = "4".repeat(64);
-    const NONCE = "5".repeat(32);
-    const NETWORK_ID = "6".repeat(64);
+    const HELPER_ROLE_FILTER = "label=io.runfree.container-role=ephemeral-helper";
 
-    function residueContext(): { context: RuntimeContext; project: ProjectInfo; runDir: string; lockPath: string } {
+    function residueContext(): { context: RuntimeContext; project: ProjectInfo; markerPath: string; lockPath: string } {
       const projectRoot = path.join(tmp, "project");
       const project = prepareProject(projectRoot);
       const context: RuntimeContext = {
         projectRoot, project, runtimeRoot: path.join(tmp, "runtime"),
         env: { PATH: "/fake-bin" }, network: fixedNetwork,
       };
-      const runDir = path.join(project.paths.stateDir, "helper-runs", "run-Crash1");
-      return { context, project, runDir, lockPath: projectLifecycleLockPath(context) };
+      return { context, project, markerPath: helperMarkerPath(project.paths.stateDir), lockPath: projectLifecycleLockPath(context) };
     }
 
-    function writeResidue(runDir: string, projectId: string, cid: string | undefined = HELPER_ID): void {
-      fs.mkdirSync(runDir, { recursive: true, mode: 0o700 });
-      fs.writeFileSync(path.join(runDir, "intent.json"), JSON.stringify({
-        v: 1, projectId, purpose: "deny-probe", image: "runfree-agent:crashed", network: NETWORK_ID,
-        ip: "172.30.0.19", nonce: NONCE, createdAt: "2026-09-24T12:00:00.000Z",
-      }), { mode: 0o600 });
-      if (cid !== undefined) fs.writeFileSync(path.join(runDir, "cid"), cid);
+    /** A marker a dead run left long ago: its late-create window has passed. */
+    function leaveOldMarker(stateDir: string): void {
+      markHelperRunPending(stateDir, { wallClockMs: () => Date.parse("2026-01-01T00:00:00.000Z") });
     }
 
-    function leftoverHelper(projectId: string): Record<string, unknown> {
-      return {
-        Id: HELPER_ID,
-        Image: `sha256:${"7".repeat(64)}`,
-        Config: { Image: "runfree-agent:crashed", Labels: {
-          "io.runfree.managed": "true", "io.runfree.container-role": "ephemeral-helper",
-          "io.runfree.lifecycle-owner": "utility", "io.runfree.label-schema": "1",
-          "io.runfree.project-id": projectId, "io.runfree.helper-purpose": "deny-probe",
-          "io.runfree.helper-run": NONCE,
-        } },
-        HostConfig: { NetworkMode: NETWORK_ID },
-        State: { Status: "running" },
-        NetworkSettings: { Networks: { internal: {
-          NetworkID: NETWORK_ID, IPAddress: "172.30.0.19", IPAMConfig: { IPv4Address: "172.30.0.19" },
-        } } },
-      };
-    }
-
-    /** A Docker double for the leftover helper; everything else is the default fake. */
+    /** A Docker double for one leftover helper; everything else is the default fake. */
     function residueDocker(options: { present: boolean; rmRemoves?: boolean; projectId: string; lockPath: string }) {
       let present = options.present;
-      const lockHeldAtReclaim: boolean[] = [];
+      const lockHeldAtSweep: boolean[] = [];
       const io = createRuntimeIO({
         capture: (command, args) => {
           if (command !== "docker") return undefined;
-          if (args[0] === "ps" && args.includes(`id=${HELPER_ID}`)) {
-            lockHeldAtReclaim.push(fs.existsSync(options.lockPath));
+          if (args[0] === "ps" && args.includes(HELPER_ROLE_FILTER)) {
+            lockHeldAtSweep.push(fs.existsSync(options.lockPath));
+            expect(args).toContain(`label=io.runfree.project-id=${options.projectId}`);
             return captureResult(0, present ? `${HELPER_ID}\n` : "");
           }
-          if (args[0] === "container" && args[1] === "inspect" && args[2] === HELPER_ID) {
-            return present ? captureResult(0, JSON.stringify([leftoverHelper(options.projectId)])) : captureResult(1, "[]", "No such container");
-          }
-          if (args[0] === "rm" && args[1] === "-f" && args[2] === HELPER_ID) {
+          if (args[0] === "rm" && args[1] === "--force" && args.includes(HELPER_ID)) {
             if (options.rmRemoves !== false) present = false;
             return options.rmRemoves === false ? captureResult(1, "", "daemon is busy") : captureResult(0, `${HELPER_ID}\n`);
           }
           return undefined;
         },
       });
-      return { io, lockHeldAtReclaim };
+      return { io, lockHeldAtSweep };
     }
 
     const dockerArgs = (io: ReturnType<typeof createRuntimeIO>) => io.calls
       .filter((call) => (call.method === "capture" || call.method === "run") && call.command === "docker")
       .map((call) => call.args);
 
-    test("a crashed run's helper is removed under the lock before any helper or Compose runs", async () => {
-      const { context, project, runDir, lockPath } = residueContext();
+    test("a crashed run's helper is swept under the lock before any helper or Compose runs", async () => {
+      const { context, project, markerPath, lockPath } = residueContext();
       const projectId = projectHash(context.projectRoot);
-      writeResidue(runDir, projectId);
-      const { io, lockHeldAtReclaim } = residueDocker({ present: true, projectId, lockPath });
+      leaveOldMarker(project.paths.stateDir);
+      const { io, lockHeldAtSweep } = residueDocker({ present: true, projectId, lockPath });
 
       expect((await startRuntime(context, io, false, {})).status).toBe(0);
 
       const calls = dockerArgs(io);
-      const removal = calls.findIndex((args) => args[0] === "rm" && args[2] === HELPER_ID);
+      const removal = calls.findIndex((args) => args[0] === "rm" && args.includes(HELPER_ID));
       expect(removal).toBeGreaterThanOrEqual(0);
-      expect(lockHeldAtReclaim.length).toBeGreaterThan(0);
-      expect(lockHeldAtReclaim.every(Boolean)).toBe(true);
+      expect(lockHeldAtSweep.length).toBeGreaterThan(0);
+      expect(lockHeldAtSweep.every(Boolean)).toBe(true);
       const firstHelperRun = calls.findIndex((args) => args[0] === "run");
-      const trustBundle = calls.findIndex((args) => args[0] === "run" && args.includes("io.runfree.helper-purpose=trust-bundle"));
       expect(firstHelperRun).toBeGreaterThan(removal);
-      expect(trustBundle).toBeGreaterThan(removal);
-      expect(fs.existsSync(runDir)).toBe(false);
-      expect(fs.readdirSync(path.join(project.paths.stateDir, "helper-runs"))).toEqual([]);
+      expect(fs.existsSync(markerPath)).toBe(false);
     });
 
-    test("an unconfirmed residue refuses up with both remedies and keeps the record; a later up reclaims it", async () => {
-      const { context, runDir, lockPath } = residueContext();
+    test("an unconfirmed sweep refuses up with both remedies and keeps the marker; a later up clears it", async () => {
+      const { context, project, markerPath, lockPath } = residueContext();
       const projectId = projectHash(context.projectRoot);
-      writeResidue(runDir, projectId);
+      leaveOldMarker(project.paths.stateDir);
       const stuck = residueDocker({ present: true, rmRemoves: false, projectId, lockPath });
 
       expect((await startRuntime(context, stuck.io, false, {})).status).toBe(1);
       flushWarnings();
       const refusal = vi.mocked(console.error).mock.calls.flat().join("\n");
-      expect(refusal).toContain(`ephemeral helper deny-probe ${HELPER_ID} could not be confirmed removed`);
+      expect(refusal).toContain("ephemeral helpers could not be confirmed removed");
       expect(refusal).toContain("runfree up");
       expect(refusal).toContain("runfree destroy --force");
-      expect(fs.existsSync(runDir)).toBe(true);
+      expect(fs.existsSync(markerPath)).toBe(true);
       // Refused before anything new: no helper, no Compose.
       expect(dockerArgs(stuck.io).some((args) => args[0] === "run")).toBe(false);
       expect(dockerArgs(stuck.io).some((args) => args[0] === "compose" && args.includes("up"))).toBe(false);
 
-      // Docker now shows the helper gone: the retried up clears the record.
+      // Docker now shows the helper gone: the retried up clears the marker.
       const recovered = residueDocker({ present: false, projectId, lockPath });
       expect((await startRuntime(context, recovered.io, false, {})).status).toBe(0);
-      expect(fs.existsSync(runDir)).toBe(false);
-      expect(dockerArgs(recovered.io).some((args) => args[0] === "rm" && args[2] === HELPER_ID)).toBe(false);
+      expect(fs.existsSync(markerPath)).toBe(false);
+      expect(dockerArgs(recovered.io).some((args) => args[0] === "rm" && args.includes(HELPER_ID))).toBe(false);
     });
 
-    test("an unparsable intent refuses up with no reclaim Docker call and names destroy --force", async () => {
-      const { context, runDir, lockPath } = residueContext();
-      fs.mkdirSync(runDir, { recursive: true, mode: 0o700 });
-      fs.writeFileSync(path.join(runDir, "intent.json"), "{ torn");
+    test("a legacy helper-runs directory is swept for and removed, whatever it holds", async () => {
+      const { context, project, lockPath } = residueContext();
+      const legacyRun = path.join(legacyHelperRunsRoot(project.paths.stateDir), "run-Crash1");
+      fs.mkdirSync(legacyRun, { recursive: true, mode: 0o700 });
+      fs.writeFileSync(path.join(legacyRun, "intent.json"), "{ torn");
       const { io } = residueDocker({ present: true, projectId: projectHash(context.projectRoot), lockPath });
 
-      expect((await startRuntime(context, io, false, {})).status).toBe(1);
-      flushWarnings();
-      expect(vi.mocked(console.error).mock.calls.flat().join("\n")).toContain("runfree destroy --force");
-      const calls = dockerArgs(io);
-      expect(calls.some((args) => args.some((arg) => arg.includes(HELPER_ID) || arg.includes("io.runfree.helper-run=")))).toBe(false);
-      expect(calls.some((args) => args[0] === "rm" || args[0] === "run")).toBe(false);
-      expect(fs.existsSync(runDir)).toBe(true);
+      expect((await startRuntime(context, io, false, {})).status).toBe(0);
+      expect(dockerArgs(io).some((args) => args[0] === "rm" && args.includes(HELPER_ID))).toBe(true);
+      expect(fs.existsSync(legacyHelperRunsRoot(project.paths.stateDir))).toBe(false);
     });
 
-    test("another project's intent refuses up before any reclaim Docker call", async () => {
-      const { context, runDir, lockPath } = residueContext();
-      writeResidue(runDir, "ba9876543210");
-      const { io } = residueDocker({ present: true, projectId: "ba9876543210", lockPath });
-
-      expect((await startRuntime(context, io, false, {})).status).toBe(1);
-      expect(dockerArgs(io).some((args) => args.includes(`id=${HELPER_ID}`) || args[0] === "rm")).toBe(false);
-      expect(fs.existsSync(runDir)).toBe(true);
-    });
-
-    test("a young pending run (killed client, no id, nothing listed) does not refuse up and is kept for re-listing", async () => {
-      const { context, runDir, lockPath } = residueContext();
+    test("an open late-create window does not refuse up and keeps the marker for the next sweep", async () => {
+      const { context, project, markerPath, lockPath } = residueContext();
       const projectId = projectHash(context.projectRoot);
-      writeResidue(runDir, projectId, "");
-      const intentPath = path.join(runDir, "intent.json");
-      fs.writeFileSync(intentPath, JSON.stringify({ ...JSON.parse(fs.readFileSync(intentPath, "utf8")), createdAt: new Date().toISOString() }));
+      fs.writeFileSync(markerPath, `${JSON.stringify({ v: 1, lateCreateUntil: new Date(Date.now() + 60_000).toISOString() })}\n`);
       const { io } = residueDocker({ present: false, projectId, lockPath });
 
       expect((await startRuntime(context, io, false, {})).status).toBe(0);
-      flushWarnings();
-      expect(vi.mocked(console.error).mock.calls.flat().join("\n")).toContain("killed ephemeral helper run(s) are kept");
-      expect(dockerArgs(io).some((args) => args.includes(`label=io.runfree.helper-run=${NONCE}`))).toBe(true);
-      expect(fs.existsSync(runDir)).toBe(true);
+      expect(dockerArgs(io).some((args) => args[0] === "ps" && args.includes(HELPER_ROLE_FILTER))).toBe(true);
+      expect(readHelperMarker(project.paths.stateDir)?.lateCreateUntil).toBeDefined();
     });
 
     // Review C4, end to end: `runtime reload-policy --force` rebuilds the plan
     // from the context (as admin does) and restores with no validation, so
     // the restore runs the helpers itself. The fence must reach them.
-    test("the reload-policy restore runs its helpers under the fence and reclaims residue first", async () => {
-      const { context, runDir, lockPath } = residueContext();
+    test("the reload-policy restore runs its helpers under the fence and sweeps residue first", async () => {
+      const { context, project, markerPath, lockPath } = residueContext();
       const projectId = projectHash(context.projectRoot);
       const io = createRuntimeIO();
       expect((await startRuntime(context, io, false, {})).status).toBe(0);
-      writeResidue(runDir, projectId);
+      leaveOldMarker(project.paths.stateDir);
       const plan = activeRuntimePlanFromContext(context);
       const proxyId = readEffectiveControlPlaneV2(plan.paths.stateDir)?.selection.proxyContainerId as string;
       const lock = await tryAcquireProjectLifecycleLockWithRetry(context);
@@ -3748,30 +3703,27 @@ describe("runtime command flow", () => {
         const start = io.calls.length;
         await restoreSameProxySessionAdmission({ plan, io, lifecycleLock: lock, proxyId, containmentIO: containment.io });
         // Residue first, through the containment IO.
-        expect(dockerArgs(containment.io).some((args) => args[0] === "rm" && args[2] === HELPER_ID)).toBe(true);
-        expect(fs.existsSync(runDir)).toBe(false);
-        // Then the validation's helpers ran (the deny probe at least), fenced.
+        expect(dockerArgs(containment.io).some((args) => args[0] === "rm" && args.includes(HELPER_ID))).toBe(true);
+        expect(fs.existsSync(markerPath)).toBe(false);
+        // Then the validation's helpers ran (the deny probe at least).
         const helperRuns = io.calls.slice(start).filter((call) => call.command === "docker" && call.args[0] === "run");
         expect(helperRuns.some((call) => call.args.includes("io.runfree.helper-purpose=deny-probe"))).toBe(true);
-        expect(helperRuns.every((call) => call.args.includes("--cidfile"))).toBe(true);
       } finally {
         lock.release();
       }
     });
 
     test("no residue adds no Docker call: two warm starts issue the same operations", async () => {
-      const { context, project } = residueContext();
+      const { context } = residueContext();
       const io = createRuntimeIO();
       expect((await startRuntime(context, io, false, {})).status).toBe(0);
       const firstWarm = io.calls.length;
       expect((await startRuntime(context, io, false, {})).status).toBe(0);
       const secondWarm = io.calls.length;
-      // An empty helper-runs directory (every earlier run cleaned up) is free too.
-      fs.mkdirSync(path.join(project.paths.stateDir, "helper-runs"), { recursive: true, mode: 0o700 });
       expect((await startRuntime(context, io, false, {})).status).toBe(0);
       expect(dockerOperationProfile(io.calls.slice(secondWarm)))
         .toEqual(dockerOperationProfile(io.calls.slice(firstWarm, secondWarm)));
-      expect(io.calls.slice(firstWarm).some((call) => call.args.some((arg) => arg.startsWith("label=io.runfree.helper-run=")))).toBe(false);
+      expect(io.calls.slice(firstWarm).some((call) => call.args.includes(HELPER_ROLE_FILTER))).toBe(false);
     });
   });
 

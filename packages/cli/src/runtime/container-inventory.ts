@@ -59,15 +59,6 @@ export const EPHEMERAL_HELPER_PURPOSE_LABEL = "io.runfree.helper-purpose";
 // system roots for the host-rendered CA bundle (D-4).
 export const EPHEMERAL_HELPER_PURPOSES = ["deny-probe", "dependency-prep", "trust-bundle"] as const;
 export type EphemeralHelperPurpose = typeof EPHEMERAL_HELPER_PURPOSES[number];
-/**
- * A random per-run nonce, recorded in the host-owned helper-run intent before
- * the helper is spawned. Unlike the other helper labels it binds one container
- * to one intent: the residue listing and the removal proof both require it,
- * so neither can reach a helper that another run (a pre-change version, or a
- * concurrent CLI on another state root) created.
- */
-export const EPHEMERAL_HELPER_RUN_LABEL = "io.runfree.helper-run";
-export const EPHEMERAL_HELPER_RUN_NONCE_PATTERN = /^[a-f0-9]{32}$/u;
 
 const COMPOSE_PROJECT_LABEL = "com.docker.compose.project";
 const COMPOSE_SERVICE_LABEL = "com.docker.compose.service";
@@ -178,15 +169,13 @@ export function projectImageFilters(projectId: string): string[] {
  *
  * Minted here because this module is the taxonomy's home (the same decision
  * the approved ingress-forwarder design records for its own labels). Helpers
- * are `--rm` and self-tearing. The labels select a helper for the destroy
- * residue scan and for exact-id helper reclaim; they never authorize on their
- * own — reclaim also requires the host-owned intent, its run nonce, and a
- * full inspection proof (`ephemeral-helper-residue.ts`).
+ * are `--rm` and self-tearing. The project-id and role labels together select
+ * a helper for the residue sweep, which runs only under the project lifecycle
+ * lock (`ephemeral-helper-residue.ts`).
  */
 export function ephemeralHelperLabelArguments(
   projectId: string,
   purpose: EphemeralHelperPurpose,
-  runNonce: string,
 ): string[] {
   if (!EPHEMERAL_HELPER_PURPOSES.includes(purpose)) {
     throw new Error(`unknown ephemeral helper purpose: ${String(purpose)}`);
@@ -204,16 +193,7 @@ export function ephemeralHelperLabelArguments(
     `${PROJECT_ID_LABEL}=${assertProjectId(projectId)}`,
     "--label",
     `${EPHEMERAL_HELPER_PURPOSE_LABEL}=${purpose}`,
-    "--label",
-    `${EPHEMERAL_HELPER_RUN_LABEL}=${assertEphemeralHelperRunNonce(runNonce)}`,
   ];
-}
-
-function assertEphemeralHelperRunNonce(runNonce: string): string {
-  if (!EPHEMERAL_HELPER_RUN_NONCE_PATTERN.test(runNonce)) {
-    throw new Error("ephemeral helper run nonce must be 32 lowercase hex characters");
-  }
-  return runNonce;
 }
 
 /** This project's ephemeral helpers — normally none, since helpers are `--rm`. */
@@ -223,24 +203,6 @@ export function projectEphemeralHelperFilters(projectId: string): string[] {
     `label=${PROJECT_ID_LABEL}=${assertProjectId(projectId)}`,
     "--filter",
     `label=${CONTAINER_ROLE_LABEL}=ephemeral-helper`,
-  ];
-}
-
-/**
- * One helper run's containers: this project's helpers with the run's purpose
- * and exact nonce. The no-cidfile reclaim lists only this set, so it can never
- * select a helper another run (or a pre-change version) created.
- */
-export function ephemeralHelperRunFilters(projectId: string, purpose: EphemeralHelperPurpose, runNonce: string): string[] {
-  if (!EPHEMERAL_HELPER_PURPOSES.includes(purpose)) {
-    throw new Error(`unknown ephemeral helper purpose: ${String(purpose)}`);
-  }
-  return [
-    ...projectEphemeralHelperFilters(projectId),
-    "--filter",
-    `label=${EPHEMERAL_HELPER_PURPOSE_LABEL}=${purpose}`,
-    "--filter",
-    `label=${EPHEMERAL_HELPER_RUN_LABEL}=${assertEphemeralHelperRunNonce(runNonce)}`,
   ];
 }
 

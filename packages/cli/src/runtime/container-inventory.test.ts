@@ -10,7 +10,6 @@ import {
   ephemeralHelperLabelArguments,
   ingressForwarderLabelArguments,
   projectEphemeralHelperFilters,
-  ephemeralHelperRunFilters,
   composeProjectNetworkFilters,
   composeProjectVolumeFilters,
   composeServiceContainerFilters,
@@ -129,9 +128,8 @@ describe("container inventory filters", () => {
     expect(() => ingressForwarderLabelArguments("bad", "vnc")).toThrow("exact project id");
   });
 
-  test("ephemeral helper labels mint exactly the taxonomy set with a validated purpose and run nonce", () => {
-    const nonce = "0123456789abcdef0123456789abcdef";
-    expect(ephemeralHelperLabelArguments("0123456789ab", "deny-probe", nonce)).toEqual([
+  test("ephemeral helper labels mint exactly the taxonomy set with a validated purpose", () => {
+    expect(ephemeralHelperLabelArguments("0123456789ab", "deny-probe")).toEqual([
       "--label",
       "io.runfree.managed=true",
       "--label",
@@ -144,32 +142,10 @@ describe("container inventory filters", () => {
       "io.runfree.project-id=0123456789ab",
       "--label",
       "io.runfree.helper-purpose=deny-probe",
-      "--label",
-      `io.runfree.helper-run=${nonce}`,
     ]);
-    expect(() => ephemeralHelperLabelArguments("0123456789ab", "anything" as never, nonce))
+    expect(() => ephemeralHelperLabelArguments("0123456789ab", "anything" as never))
       .toThrow("unknown ephemeral helper purpose");
-    expect(() => ephemeralHelperLabelArguments("nope", "deny-probe", nonce)).toThrow("exact project id");
-    for (const bad of ["", "0123456789ABCDEF0123456789ABCDEF", `${nonce}0`, nonce.slice(1), "g".repeat(32)]) {
-      expect(() => ephemeralHelperLabelArguments("0123456789ab", "deny-probe", bad)).toThrow("run nonce");
-    }
-  });
-
-  test("one helper run's enumeration adds the purpose and the exact run nonce", () => {
-    const nonce = "0123456789abcdef0123456789abcdef";
-    expect(ephemeralHelperRunFilters("0123456789ab", "trust-bundle", nonce)).toEqual([
-      "--filter",
-      "label=io.runfree.project-id=0123456789ab",
-      "--filter",
-      "label=io.runfree.container-role=ephemeral-helper",
-      "--filter",
-      "label=io.runfree.helper-purpose=trust-bundle",
-      "--filter",
-      `label=io.runfree.helper-run=${nonce}`,
-    ]);
-    expect(() => ephemeralHelperRunFilters("0123456789ab", "trust-bundle", "")).toThrow("run nonce");
-    expect(() => ephemeralHelperRunFilters("0123456789ab", "nope" as never, nonce)).toThrow("unknown ephemeral helper purpose");
-    expect(() => ephemeralHelperRunFilters("bad", "trust-bundle", nonce)).toThrow("exact project id");
+    expect(() => ephemeralHelperLabelArguments("nope", "deny-probe")).toThrow("exact project id");
   });
 
   test("ephemeral helper enumeration selects by project and role only", () => {
