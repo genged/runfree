@@ -213,9 +213,9 @@ describe("installable runfree CLI: init and image", () => {
     expect(fs.existsSync(path.join(repoRoot, `${workspaceName}/.runfree/network-policy.json`))).toBe(false);
   });
 
-  test("init removes legacy project and paths keys while copying a custom policy", () => {
+  test("init refuses a pre-v4 config with the remedy and changes nothing", () => {
     fs.mkdirSync(path.join(tmp, ".runfree"), { recursive: true });
-    fs.writeFileSync(path.join(tmp, ".runfree/runfree.json"), `${JSON.stringify({
+    const legacy = `${JSON.stringify({
       version: 3,
       project: { mount: "read-only" },
       paths: {
@@ -226,23 +226,16 @@ describe("installable runfree CLI: init and image", () => {
         default: "claude",
         claude: { command: "claude --dangerously-skip-permissions" },
       },
-    }, null, 2)}\n`);
-    fs.writeFileSync(path.join(tmp, "custom-policy.json"), `${JSON.stringify({ hosts: ["custom.example"], tokens: {} }, null, 2)}\n`);
+    }, null, 2)}\n`;
+    fs.writeFileSync(path.join(tmp, ".runfree/runfree.json"), legacy);
 
     const result = runCliInProject(["init"]);
 
-    expect(result.status, result.stderr).toBe(0);
-    expect(result.stdout).toContain("migrated .runfree/runfree.json from version 3 to 4");
-    const config = JSON.parse(fs.readFileSync(path.join(tmp, ".runfree/runfree.json"), "utf8")) as {
-      version?: number;
-      project?: unknown;
-      paths?: unknown;
-    };
-    expect(config.version).toBe(4);
-    expect(config.project).toBeUndefined();
-    expect(config.paths).toBeUndefined();
-    expect(fs.readFileSync(path.join(tmp, ".runfree/network-policy.json"), "utf8")).toContain("custom.example");
-    expect(fs.existsSync(path.join(tmp, "projects"))).toBe(false);
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("config version 3, which this release no longer migrates");
+    expect(result.stderr).toContain("move .runfree aside and run `runfree init`");
+    expect(fs.readFileSync(path.join(tmp, ".runfree/runfree.json"), "utf8")).toBe(legacy);
+    expect(fs.existsSync(path.join(tmp, ".runfree/network-policy.json"))).toBe(false);
   });
 
   test("init leaves an existing projects symlink untouched because it no longer manages that path", () => {
@@ -256,7 +249,7 @@ describe("installable runfree CLI: init and image", () => {
     expect(fs.lstatSync(path.join(tmp, "projects")).isSymbolicLink()).toBe(true);
   });
 
-  test("non-mutating project commands tell users to migrate legacy runfree config with init", () => {
+  test("non-mutating project commands refuse a legacy runfree config with the init remedy", () => {
     fs.mkdirSync(path.join(tmp, ".runfree"), { recursive: true });
     fs.writeFileSync(path.join(tmp, ".runfree/runfree.json"), `${JSON.stringify({
       version: 1,
@@ -274,7 +267,7 @@ describe("installable runfree CLI: init and image", () => {
     const result = runTsCli(["status"], { RUNFREE_RUNTIME_DRY_RUN: "1" });
 
     expect(result.status).toBe(1);
-    expect(result.stderr).toContain("run `runfree init` to migrate");
+    expect(result.stderr).toContain("move .runfree aside and run `runfree init`");
     const config = JSON.parse(fs.readFileSync(path.join(tmp, ".runfree/runfree.json"), "utf8")) as {
       version: number;
       agent?: unknown;
@@ -283,7 +276,7 @@ describe("installable runfree CLI: init and image", () => {
     expect(config.agent).toEqual({ command: "claude --model opus --dangerously-skip-permissions" });
   });
 
-  test("admin commands require migration before mutating legacy runfree config", () => {
+  test("admin commands refuse a legacy runfree config before any write", () => {
     fs.mkdirSync(path.join(tmp, ".runfree"), { recursive: true });
     fs.writeFileSync(path.join(tmp, ".runfree/runfree.json"), `${JSON.stringify({
       version: 3,
@@ -300,46 +293,9 @@ describe("installable runfree CLI: init and image", () => {
     const result = runTsCli(["host", "add", "example.org", "--no-reload"]);
 
     expect(result.status).toBe(1);
-    expect(result.stderr).toContain("uses legacy config version 3");
-    expect(result.stderr).toContain("run `runfree init` to migrate to version 4");
+    expect(result.stderr).toContain("config version 3, which this release no longer migrates");
     expect(fs.existsSync(path.join(tmp, ".runfree/config/agent.env"))).toBe(false);
     expect(fs.existsSync(path.join(tmp, ".runfree/network-policy.json"))).toBe(false);
-  });
-
-  test("init migrates legacy runfree config to the current agents shape", () => {
-    fs.mkdirSync(path.join(tmp, ".runfree"), { recursive: true });
-    fs.writeFileSync(path.join(tmp, ".runfree/runfree.json"), `${JSON.stringify({
-      version: 1,
-      project: { mount: "read-only" },
-      paths: {
-        projects: "projects",
-        networkPolicy: ".runfree/network-policy.json",
-      },
-      agent: {
-        command: "claude --model opus --dangerously-skip-permissions",
-      },
-    }, null, 2)}\n`);
-
-    const result = runTsCli(["init"]);
-
-    expect(result.status, result.stderr).toBe(0);
-    expect(result.stdout).toContain("migrated .runfree/runfree.json from version 1 to 4");
-    const config = JSON.parse(fs.readFileSync(path.join(tmp, ".runfree/runfree.json"), "utf8")) as {
-      version: number;
-      agent?: unknown;
-      agents?: Record<string, { command?: string } | string>;
-      project?: unknown;
-      paths?: unknown;
-    };
-    expect(config.version).toBe(4);
-    expect(config.agent).toBeUndefined();
-    expect(config.project).toBeUndefined();
-    expect(config.paths).toBeUndefined();
-    expect(config.agents?.default).toBe("claude");
-    expect(config.agents?.claude).toEqual({ command: "claude --model opus --dangerously-skip-permissions" });
-    expect(config.agents?.codex).toEqual({
-      command: "codex -c check_for_update_on_startup=false --dangerously-bypass-approvals-and-sandbox",
-    });
   });
 
   test("init ignores unrelated dot directories instead of migrating them", () => {

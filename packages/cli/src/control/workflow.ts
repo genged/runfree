@@ -9,7 +9,6 @@ import {
   validateNetworkPolicy,
   type PolicyJson,
 } from "@runfree/runtime-contracts/network-policy";
-import { assertConfigCurrent } from "../config-notice.ts";
 import {
   agentBuildConfig,
   classifyAgentBuildContext,
@@ -208,7 +207,6 @@ export async function captureQuiescedImageBuildCandidate(
     project: ReturnType<typeof projectInfo>;
   }> => {
     const project = projectInfo(context.projectRoot, context.env);
-    assertConfigCurrent(project);
     const build = agentBuildConfig(project.config);
     if (!build) throw new CliError(`runtime.agent.build is not configured; run \`${remedy.imageInit()}\` first`);
     if (classifyAgentBuildContext(context.projectRoot, build) !== "narrow") {
@@ -246,7 +244,6 @@ export async function captureQuiescedProjectControlCandidates(
     runtimeSubject: ControlSubject;
   }> => {
     const project = projectInfo(context.projectRoot, context.env);
-    assertConfigCurrent(project);
     const build = agentBuildConfig(project.config);
     const image = build && classifyAgentBuildContext(context.projectRoot, build) === "narrow"
       ? captureNarrowImageBuildCandidate(context.projectRoot, build, project.paths.controlCandidatesDir)
@@ -320,7 +317,6 @@ export async function captureQuiescedRuntimeIsolationSubject(
     subject: ControlSubject;
   }> => {
     const project = projectInfo(context.projectRoot, context.env);
-    assertConfigCurrent(project);
     return {
       checkoutFingerprint: checkoutFingerprint(context.projectRoot),
       value: { project, subject: runtimeIsolationControlSubject(project.config) },

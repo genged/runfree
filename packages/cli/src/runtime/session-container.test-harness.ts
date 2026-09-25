@@ -90,7 +90,6 @@ export function sessionTestProjectInfo(): ProjectInfo {
       controlConvergedPath: path.join(SESSION_TEST_STATE_ROOT, "control", "converged.json"),
       controlDir: path.join(SESSION_TEST_STATE_ROOT, "control"),
       controlEffectiveDir: path.join(SESSION_TEST_STATE_ROOT, "control", "effective"),
-      controlLegacyEnforcedNetworkPath: path.join(SESSION_TEST_STATE_ROOT, "control", "legacy.json"),
       controlProxyActivePath: path.join(SESSION_TEST_STATE_ROOT, "control", "proxy-active.json"),
       controlProxyDir: path.join(SESSION_TEST_STATE_ROOT, "control", "effective", "proxy"),
       gitConfigPath: path.join(SESSION_TEST_STATE_ROOT, "gitconfig"),

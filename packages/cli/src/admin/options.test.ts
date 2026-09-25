@@ -827,7 +827,7 @@ test("direct token sync rejects a stale runtime security contract before writing
   fs.mkdirSync(path.dirname(tokenConfigPath), { recursive: true });
   fs.mkdirSync(fakeBin, { recursive: true });
   ensureClaudeMcpConfigFile(path.join(stateDir, "mounts", "claude-mcp.json"));
-  fs.writeFileSync(path.join(projectRoot, ".runfree", "runfree.json"), `${JSON.stringify({ version: 3, runtime: { dependencyOverlays: "off" } }, null, 2)}\n`);
+  fs.writeFileSync(path.join(projectRoot, ".runfree", "runfree.json"), `${JSON.stringify({ version: 4, runtime: { dependencyOverlays: "off" } }, null, 2)}\n`);
   fs.writeFileSync(policyPath, `${JSON.stringify({
     hosts: ["api.github.com"],
     tokens: {

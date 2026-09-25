@@ -4,13 +4,12 @@ import path from "node:path";
 import { validateDesiredNetworkPolicy } from "@runfree/runtime-contracts/desired-network-policy";
 
 import { die } from "./errors.ts";
-import { runfreeConfigRoot, runfreeStateRoot, resolveProjectPath } from "./paths.ts";
+import { runfreeConfigRoot, runfreeStateRoot } from "./paths.ts";
 import { projectHash } from "./project-identity.ts";
 import {
   ensureSafeProjectDir,
   assertOptionalNormalProjectDirectory,
   isPathInsideByRealpath,
-  safeCopyProjectFile,
   safeReadProjectFile,
   safeReplaceProjectFile,
 } from "./safe-fs.ts";
@@ -20,14 +19,10 @@ import {
 } from "./runfree-consumer-registry.ts";
 import { builtinAgent, defaultBuiltinAgentCommands } from "./agents.ts";
 import type { DependencyOverlayMode } from "./runtime/dependency-overlays.ts";
-import { migrateLegacyDesiredPolicy } from "./control/legacy-migration.ts";
-import { importProvenLegacyNetworkApproval } from "./control/legacy-enforced-import.ts";
 import { isRecord } from "./strict-primitives.ts";
 
 export const RUNFREE_CONFIG_VERSION = 4;
-export const QUIESCED_CONFIG_MIGRATION = Symbol("runfree.quiesced-config-migration");
 
-const DEFAULT_NETWORK_POLICY_PATH = PROJECT_RUNFREE_PATHS.networkPolicy;
 const DEFAULT_AGENT_BUILD_CONTEXT = PROJECT_RUNFREE_PATHS.image;
 const DEFAULT_AGENT_DOCKERFILE_PATH = `${PROJECT_RUNFREE_PATHS.image}/Dockerfile`;
 const DEFAULT_AGENT_DOCKERIGNORE_PATH = ".runfree/image/.dockerignore";
@@ -63,8 +58,6 @@ export type RuntimeAgentConfig = {
   build?: AgentBuildConfig;
 };
 
-export type WriteApprovalMode = "allow" | "ask" | "deny";
-
 export type RunfreeConfig = {
   version: number;
   project: {
@@ -77,10 +70,6 @@ export type RunfreeConfig = {
     agentIp?: string;
     dependencyOverlays?: DependencyOverlayMode;
     agent?: RuntimeAgentConfig;
-    // Project-wide default for the write class of requests to hosts without a
-    // per-host writeAction rule. Compiled by the CLI into the policy file's
-    // top-level writeApproval; the proxy never reads this config.
-    writeApproval?: WriteApprovalMode;
     // How long an approve-on-write hold waits for a human decision. Validated
     // host-side (5-300s), passed to the proxy as runtime env, and folded into
     // the runtime security-contract hash — changing it recreates the runtime.
@@ -90,8 +79,6 @@ export type RunfreeConfig = {
 
 export type ProjectInfo = {
   config: RunfreeConfig;
-  configMigrated?: ConfigMigrationNotice;
-  configMigration?: ConfigMigrationNotice;
   paths: {
     runfreeDir: string;
     agentEnvPath: string;
@@ -108,7 +95,6 @@ export type ProjectInfo = {
     controlConvergedPath: string;
     controlDir: string;
     controlEffectiveDir: string;
-    controlLegacyEnforcedNetworkPath: string;
     controlProxyActivePath: string;
     controlProxyDir: string;
     gitConfigPath: string;
@@ -123,14 +109,6 @@ export type ProjectInfo = {
     stateDir: string;
     tokenConfigPath: string;
   };
-};
-
-export type ConfigMigrationNotice = {
-  fromVersion: number;
-  // Authority-preserving downgrades the migration had to make, phrased for the
-  // user (a service record it could not prove, kept as direct hosts).
-  notes?: string[];
-  toVersion: number;
 };
 
 export type AgentImageInitResult = {
@@ -153,16 +131,10 @@ export function projectControlPaths(stateDir: string) {
     controlConvergedPath: path.join(controlEffectiveDir, "converged.json"),
     controlDir,
     controlEffectiveDir,
-    controlLegacyEnforcedNetworkPath: path.join(controlDir, "legacy-enforced-network.json"),
     controlProxyActivePath: path.join(controlProxyDir, "active.json"),
     controlProxyDir,
   };
 }
-
-type ConfigReadResult = {
-  config: RunfreeConfig;
-  migration?: ConfigMigrationNotice;
-};
 
 export function defaultConfig(): RunfreeConfig {
   return {
@@ -206,10 +178,24 @@ function validateAgentCommandConfig(value: unknown, label: string): AgentCommand
   return { command, ...(typeof resumeCommand === "string" ? { resumeCommand } : {}) };
 }
 
+/**
+ * Pre-v4 configs are not migrated: v0.5.0 is the first public release and
+ * shipped config version 4. The remedy starts the project over.
+ */
+function unsupportedLegacyConfig(what: string): string {
+  return [
+    `.runfree/runfree.json uses ${what}, which this release no longer migrates`,
+    "move .runfree aside and run `runfree init` to create a current configuration, then re-add hosts and services",
+  ].join("\n");
+}
+
 function validateConfigVersion(value: unknown): number {
   if (value === undefined) return RUNFREE_CONFIG_VERSION;
   if (!Number.isInteger(value) || typeof value !== "number" || value < 1) {
     die("version must be a positive integer");
+  }
+  if (value < RUNFREE_CONFIG_VERSION) {
+    die(unsupportedLegacyConfig(`config version ${value}`));
   }
   if (value > RUNFREE_CONFIG_VERSION) {
     die([
@@ -293,10 +279,9 @@ function validateRuntimeAgentConfig(projectRoot: string, value: unknown): Runtim
   };
 }
 
-function normalizeAgentsConfig(defaults: AgentsConfig, value: unknown, legacyAgent: AgentCommandConfig | undefined): AgentsConfig {
+function normalizeAgentsConfig(defaults: AgentsConfig, value: unknown): AgentsConfig {
   const agents: AgentsConfig = { ...defaults };
   const configuredAgents = value === undefined ? undefined : value;
-  const explicitAgentNames = new Set<string>();
 
   if (configuredAgents !== undefined) {
     if (configuredAgents === null || Array.isArray(configuredAgents) || typeof configuredAgents !== "object") {
@@ -311,12 +296,7 @@ function normalizeAgentsConfig(defaults: AgentsConfig, value: unknown, legacyAge
         continue;
       }
       agents[name] = validateAgentCommandConfig(entry, `agents.${name}`);
-      explicitAgentNames.add(name);
     }
-  }
-
-  if (legacyAgent && !explicitAgentNames.has("claude")) {
-    agents.claude = legacyAgent;
   }
 
   if (!resolveAgentCommand({ agents }, agents.default)) {
@@ -328,7 +308,6 @@ function normalizeAgentsConfig(defaults: AgentsConfig, value: unknown, legacyAge
 function validateRuntimeConfig(
   projectRoot: string,
   runtime: RunfreeConfig["runtime"],
-  configVersion: number,
 ): RunfreeConfig["runtime"] {
   const supportedKeys = new Set([
     "subnet",
@@ -337,11 +316,10 @@ function validateRuntimeConfig(
     "dependencyOverlays",
     "agent",
     "writeApprovalHoldSeconds",
-    ...(configVersion < 4 ? ["writeApproval"] : []),
   ]);
   for (const key of Object.keys(runtime)) {
     if (!supportedKeys.has(key)) {
-      die(`runtime.${key} is not supported by config version ${configVersion}`);
+      die(`runtime.${key} is not supported by config version ${RUNFREE_CONFIG_VERSION}`);
     }
   }
   for (const key of ["subnet", "proxyIp", "agentIp"] as const) {
@@ -359,12 +337,6 @@ function validateRuntimeConfig(
     && runtime.dependencyOverlays !== "off") {
     die("runtime.dependencyOverlays must be either \"auto\" or \"off\"");
   }
-  if (runtime.writeApproval !== undefined
-    && runtime.writeApproval !== "allow"
-    && runtime.writeApproval !== "ask"
-    && runtime.writeApproval !== "deny") {
-    die("runtime.writeApproval must be \"allow\", \"ask\", or \"deny\"");
-  }
   if (runtime.writeApprovalHoldSeconds !== undefined
     && (!Number.isInteger(runtime.writeApprovalHoldSeconds)
       || runtime.writeApprovalHoldSeconds < 5
@@ -374,21 +346,19 @@ function validateRuntimeConfig(
   return runtime;
 }
 
-function validateProjectConfig(value: unknown): { config: RunfreeConfig["project"]; legacyKeys: string[] } {
-  if (value === undefined) return { config: {}, legacyKeys: [] };
+function validateProjectConfig(value: unknown): RunfreeConfig["project"] {
+  if (value === undefined) return {};
   if (!isRecord(value)) {
     die("project must be an object");
   }
 
   const config: RunfreeConfig["project"] = {};
-  const legacyKeys: string[] = [];
-  for (const key of Object.keys(value)) {
-    if (key !== "name") legacyKeys.push(key);
-  }
+  const legacyKeys = Object.keys(value).filter((key) => key !== "name");
+  if (legacyKeys.length > 0) die(unsupportedLegacyConfig(`removed legacy keys project.${legacyKeys.join(", project.")}`));
   if (value.name !== undefined) {
     config.name = validateNonEmptyString(value.name, "project.name");
   }
-  return { config, legacyKeys };
+  return config;
 }
 
 export function resolveAgentCommand(config: Pick<RunfreeConfig, "agents">, agentName: string): string | undefined {
@@ -423,9 +393,9 @@ function readConfigPath(projectRoot: string): string {
   return projectRunfreePath(projectRoot, "config");
 }
 
-function readConfigResultFromPath(projectRoot: string, configPath: string): ConfigReadResult {
+function readConfigFromPath(projectRoot: string, configPath: string): RunfreeConfig {
   const source = safeReadProjectFile(projectRoot, configPath);
-  if (source === undefined) return { config: defaultConfig() };
+  if (source === undefined) return defaultConfig();
   try {
     const defaults = defaultConfig();
     const parsed = JSON.parse(source) as Partial<RunfreeConfig> & {
@@ -436,52 +406,32 @@ function readConfigResultFromPath(projectRoot: string, configPath: string): Conf
       version?: unknown;
     };
     const version = validateConfigVersion(parsed.version);
-    const agent = parsed.agent === undefined
-      ? undefined
-      : validateAgentCommandConfig(parsed.agent, "agent");
-    const agents = normalizeAgentsConfig(defaults.agents, parsed.agents, agent);
+    for (const key of ["agent", "paths"] as const) {
+      if (parsed[key] !== undefined) die(unsupportedLegacyConfig(`the removed legacy key ${key}`));
+    }
+    const agents = normalizeAgentsConfig(defaults.agents, parsed.agents);
     const project = validateProjectConfig(parsed.project);
     const runtime = validateRuntimeConfig(
       projectRoot,
       mergeObjectConfig(defaults.runtime, parsed.runtime, "runtime") as RunfreeConfig["runtime"],
-      version,
     );
-    const config: RunfreeConfig = {
-      version,
-      project: project.config,
-      agents,
-      runtime,
-    };
-    const needsMigration = version < RUNFREE_CONFIG_VERSION
-      || parsed.agent !== undefined
-      || project.legacyKeys.length > 0
-      || parsed.paths !== undefined;
-    return {
-      config,
-      migration: needsMigration
-        ? { fromVersion: version, toVersion: RUNFREE_CONFIG_VERSION }
-        : undefined,
-    };
+    return { version, project, agents, runtime };
   } catch (error) {
     die(`invalid ${path.relative(projectRoot, configPath)}: ${error instanceof Error ? error.message : String(error)}`);
   }
 }
 
-function readConfigResult(projectRoot: string): ConfigReadResult {
+export function readConfig(projectRoot: string): RunfreeConfig {
   assertOptionalNormalProjectDirectory(
     projectRoot,
     projectRunfreePath(projectRoot, "root"),
     "project .runfree root",
   );
-  return readConfigResultFromPath(projectRoot, readConfigPath(projectRoot));
-}
-
-export function readConfig(projectRoot: string): RunfreeConfig {
-  return readConfigResult(projectRoot).config;
+  return readConfigFromPath(projectRoot, readConfigPath(projectRoot));
 }
 
 export function projectInfo(projectRoot: string, env: NodeJS.ProcessEnv = process.env): ProjectInfo {
-  const { config, migration } = readConfigResult(projectRoot);
+  const config = readConfig(projectRoot);
   const runfreeDir = projectRunfreePath(projectRoot, "root");
   const policyPath = projectRunfreePath(projectRoot, "networkPolicy");
   const stateDir = path.join(runfreeStateRoot(env), "projects", projectHash(projectRoot));
@@ -490,7 +440,6 @@ export function projectInfo(projectRoot: string, env: NodeJS.ProcessEnv = proces
   const mountsDir = path.join(stateDir, "mounts");
   return {
     config,
-    configMigration: migration,
     paths: {
       runfreeDir,
       agentEnvPath: projectRunfreePath(projectRoot, "agentEnv"),
@@ -515,66 +464,10 @@ export function projectInfo(projectRoot: string, env: NodeJS.ProcessEnv = proces
   };
 }
 
-function migrateProjectConfig(project: ProjectInfo, env: NodeJS.ProcessEnv, notes: string[]): boolean {
-  if (!project.configMigration || !fs.existsSync(project.paths.configPath)) return false;
-  const projectRoot = path.dirname(project.paths.runfreeDir);
-  const raw = JSON.parse(fs.readFileSync(project.paths.configPath, "utf8")) as Record<string, unknown>;
-  copyConfiguredPolicyIfPresent(projectRoot, raw, DEFAULT_NETWORK_POLICY_PATH, project.paths.policyPath);
-  const legacyPolicy = safeReadProjectFile(projectRoot, project.paths.policyPath);
-  const desiredPolicy = migrateLegacyDesiredPolicy({
-    configWriteApproval: project.config.runtime.writeApproval,
-    onNote: (note) => notes.push(note),
-    policy: legacyPolicy === undefined ? { hosts: [] } : JSON.parse(legacyPolicy) as unknown,
-    services: raw.services,
-  });
-  safeReplaceProjectFile(
-    projectRoot,
-    project.paths.policyPath,
-    `${JSON.stringify(desiredPolicy, null, 2)}\n`,
-    0o600,
-  );
-  const runtime = { ...project.config.runtime };
-  delete runtime.writeApproval;
-  const migrated: Record<string, unknown> = {
-    ...raw,
-    version: RUNFREE_CONFIG_VERSION,
-    agents: project.config.agents,
-    runtime,
-  };
-  delete migrated.agent;
-  delete migrated.project;
-  delete migrated.paths;
-  delete migrated.services;
-  if (Object.keys(project.config.project).length > 0) migrated.project = project.config.project;
-  safeReplaceProjectFile(projectRoot, project.paths.configPath, `${JSON.stringify(migrated, null, 2)}\n`, 0o600);
-  const migratedProject = projectInfo(projectRoot, env);
-  importProvenLegacyNetworkApproval(projectRoot, project, migratedProject, desiredPolicy);
-  return true;
-}
-
 function assertHostOwnedPathOutsideProject(projectRoot: string, filePath: string, label: string): void {
   if (isPathInsideByRealpath(projectRoot, filePath)) {
     die(`${label} must be outside the project: ${filePath}`);
   }
-}
-
-function configuredNetworkPolicyPath(raw: Record<string, unknown>, fallback: string): string {
-  if (!isRecord(raw.paths)) return fallback;
-  const configured = raw.paths.networkPolicy;
-  if (typeof configured !== "string" || configured.trim() === "") return fallback;
-  return configured;
-}
-
-function copyConfiguredPolicyIfPresent(
-  projectRoot: string,
-  raw: Record<string, unknown>,
-  fallbackPolicyPath: string,
-  destinationPath: string,
-): void {
-  const sourcePath = resolveProjectPath(projectRoot, configuredNetworkPolicyPath(raw, fallbackPolicyPath));
-  if (path.resolve(sourcePath) === path.resolve(destinationPath)) return;
-  if (!fs.existsSync(sourcePath) || fs.existsSync(destinationPath)) return;
-  safeCopyProjectFile(projectRoot, sourcePath, destinationPath, 0o600);
 }
 
 function ensureRunfreeLocalGitignore(project: ProjectInfo): void {
@@ -593,10 +486,8 @@ export function ensureProject(
   projectRoot: string,
   templatesDir: string,
   env: NodeJS.ProcessEnv = process.env,
-  options: { migrateConfig?: boolean; migrationProof?: typeof QUIESCED_CONFIG_MIGRATION } = {},
 ): ProjectInfo {
-  let project = projectInfo(projectRoot, env);
-  let configMigrated: ConfigMigrationNotice | undefined;
+  const project = projectInfo(projectRoot, env);
   fs.mkdirSync(projectRoot, { recursive: true, mode: 0o755 });
   ensureSafeProjectDir(projectRoot, project.paths.runfreeDir, 0o700);
   ensureSafeProjectDir(projectRoot, path.dirname(project.paths.configPath), 0o700);
@@ -613,24 +504,12 @@ export function ensureProject(
 
   if (!fs.existsSync(project.paths.configPath)) {
     safeReplaceProjectFile(projectRoot, project.paths.configPath, fs.readFileSync(path.join(templatesDir, "runfree.json")), 0o600);
-  } else if (options.migrateConfig && project.configMigration) {
-    if (options.migrationProof !== QUIESCED_CONFIG_MIGRATION) {
-      die("project config migration requires a quiesced runtime transaction; run: runfree init");
-    }
-    const notes: string[] = [];
-    if (migrateProjectConfig(project, env, notes)) {
-      configMigrated = notes.length > 0
-        ? { ...project.configMigration, notes }
-        : project.configMigration;
-    }
   }
   if (!fs.existsSync(project.paths.policyPath)) {
     safeReplaceProjectFile(projectRoot, project.paths.policyPath, fs.readFileSync(path.join(templatesDir, "network-policy.json")), 0o600);
   }
 
-  project = projectInfo(projectRoot, env);
-  project.configMigrated = configMigrated;
-  return project;
+  return projectInfo(projectRoot, env);
 }
 
 // Raw (unknown-key-preserving) read of .runfree/runfree.json. The typed
@@ -655,12 +534,8 @@ export function ensureProjectAgentImage(
   projectRoot: string,
   templatesDir: string,
   env: NodeJS.ProcessEnv = process.env,
-  options: { migrationProof?: typeof QUIESCED_CONFIG_MIGRATION } = {},
 ): AgentImageInitResult {
-  const project = ensureProject(projectRoot, templatesDir, env, {
-    migrateConfig: true,
-    migrationProof: options.migrationProof,
-  });
+  const project = ensureProject(projectRoot, templatesDir, env);
   const existingBuild = project.config.runtime.agent?.build;
   const usesDefaultDockerfile = existingBuild === undefined || existingBuild.dockerfile === DEFAULT_AGENT_DOCKERFILE_PATH;
   const dockerfilePath = path.resolve(projectRoot, existingBuild?.dockerfile ?? DEFAULT_AGENT_DOCKERFILE_PATH);

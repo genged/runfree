@@ -116,7 +116,7 @@ for exactly that.
 
 ## Compatibility
 
-- Project config version 4 is current. Legacy keys exist for migration only.
+- Project config version 4 is current. Older versions and legacy keys are refused, not migrated.
 - `.runfree/network-policy.json` is a fixed path. Do not move it.
 - Desired policy v2 is an exact-hostname allowlist plus per-host `requests`
   rules, `services`, `tokens`, and an optional `writeApproval` default. No

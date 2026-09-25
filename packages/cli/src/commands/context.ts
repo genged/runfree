@@ -14,18 +14,11 @@ import {
   assertProjectPolicy,
   ensureProject,
   projectInfo,
-  QUIESCED_CONFIG_MIGRATION,
   type ProjectInfo,
 } from "../config.ts";
-import { assertConfigCurrent } from "../config-notice.ts";
 import { readActiveEffectiveControl } from "../control/effective.ts";
 import { runtimeEnvironment } from "../runtime/env.ts";
 import type { RuntimeContext } from "../runtime/types.ts";
-
-export type EnsureProjectOptions = {
-  migrateConfig?: boolean;
-  migrationProof?: typeof QUIESCED_CONFIG_MIGRATION;
-};
 
 export type RunfreeCommandContext = {
   env: NodeJS.ProcessEnv;
@@ -37,7 +30,7 @@ export type RunfreeCommandContext = {
   assets(): MaterializedAssets;
   templatesDir(): string;
   projectInfo(): ProjectInfo;
-  ensureProject(options?: EnsureProjectOptions): ProjectInfo;
+  ensureProject(): ProjectInfo;
   adminContext(): AdminContext;
   sourceAdminContext(): AdminContext;
   runtimeContext(): RuntimeContext;
@@ -63,15 +56,18 @@ export function createCommandContext(input: {
     assets,
     templatesDir,
     projectInfo: () => projectInfo(input.projectRoot, input.env),
-    ensureProject: (options) =>
-      ensureProject(input.projectRoot, templatesDir(), input.env, options ?? {}),
-    // Build the AdminContext for admin command modules: assert the config is
-    // current on the read-only project, then ensure the project and derive the
-    // admin runtime env. The admin runtime env keeps host runtime-path leakage
-    // out of Docker reloads.
+    // Every ensure reads and validates the project config first, so an
+    // unsupported config refuses before asset materialization writes XDG data.
+    ensureProject: () => {
+      projectInfo(input.projectRoot, input.env);
+      return ensureProject(input.projectRoot, templatesDir(), input.env);
+    },
+    // Build the AdminContext for admin command modules: validate the config,
+    // then ensure the project and derive the admin runtime env. The admin
+    // runtime env keeps host runtime-path leakage out of Docker reloads.
     adminContext: (): AdminContext => {
-      assertConfigCurrent(projectInfo(input.projectRoot, input.env));
-      const project = ensureProject(input.projectRoot, templatesDir(), input.env, {});
+      projectInfo(input.projectRoot, input.env);
+      const project = ensureProject(input.projectRoot, templatesDir(), input.env);
       const effective = readActiveEffectiveControl(project);
       return {
         agentEnvPath: project.paths.controlAgentEnvPath,
@@ -107,13 +103,11 @@ export function createCommandContext(input: {
       env: input.env,
     }),
     // Build the RuntimeContext for runtime command modules: read the project,
-    // assert the config is current and the project policy is present, then
-    // materialize runtime assets
+    // assert the project policy is present, then materialize runtime assets
     // for the compose root. Runtime commands depend on a configured project, so
     // unlike `source` this asserts policy up front.
     runtimeContext: (): RuntimeContext => {
       const project = projectInfo(input.projectRoot, input.env);
-      assertConfigCurrent(project);
       assertProjectPolicy(project);
       return {
         projectRoot: input.projectRoot,

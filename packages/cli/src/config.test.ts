@@ -8,12 +8,10 @@ import {
   defaultConfig,
   ensureProject,
   projectInfo,
-  QUIESCED_CONFIG_MIGRATION,
   readConfig,
   readRawProjectConfig,
   resolveAgentCommand,
   resolveAgentResumeCommand,
-  resolveDefaultAgentCommand,
 } from "./config.ts";
 import { CliError } from "./errors.ts";
 
@@ -31,7 +29,7 @@ describe("runfree config", () => {
   test("rejects a symlinked .runfree root before reading config descendants", () => {
     const outside = fs.mkdtempSync(path.join(os.tmpdir(), "runfree-outside-config-"));
     try {
-      fs.writeFileSync(path.join(outside, "runfree.json"), `${JSON.stringify({ version: 3 })}\n`);
+      fs.writeFileSync(path.join(outside, "runfree.json"), `${JSON.stringify({ version: 4 })}\n`);
       fs.symlinkSync(outside, path.join(tmp, ".runfree"), "dir");
 
       expect(() => readConfig(tmp)).toThrow("project .runfree root is not a normal directory: .runfree (symlink)");
@@ -77,7 +75,7 @@ describe("runfree config", () => {
 
     fs.mkdirSync(path.join(tmp, ".runfree"), { recursive: true });
     fs.writeFileSync(path.join(tmp, ".runfree", "runfree.json"), `${JSON.stringify({
-      version: 3,
+      version: 4,
       agents: {
         default: "claude",
         claude: { command: "claude --dangerously-skip-permissions" },
@@ -88,7 +86,7 @@ describe("runfree config", () => {
     const config = readConfig(tmp);
 
     expect(resolveAgentCommand(config, "pi")).toBe("pi");
-    expect(config.version).toBe(3);
+    expect(config.version).toBe(4);
   });
 
   test("resolves former built-in defaults to the current managed command without changing custom commands", () => {
@@ -106,28 +104,44 @@ describe("runfree config", () => {
       .toBe("claude --model opus --dangerously-skip-permissions");
   });
 
-  test("normalizes legacy agent.command as the Claude agent command", () => {
+  test.each([
+    ["an old config version", { version: 3, agents: { default: "claude" } }, "config version 3"],
+    ["the legacy agent key", { version: 4, agent: { command: "claude" } }, "the removed legacy key agent"],
+    ["the legacy paths key", { version: 4, paths: { networkPolicy: "policy.json" } }, "the removed legacy key paths"],
+    ["legacy project keys", { version: 4, project: { mount: "read-only", name: "x" } }, "removed legacy keys project.mount"],
+  ])("refuses %s with the init remedy instead of migrating", (_name, config, what) => {
     fs.mkdirSync(path.join(tmp, ".runfree"), { recursive: true });
-    fs.writeFileSync(path.join(tmp, ".runfree", "runfree.json"), `${JSON.stringify({
-      version: 1,
-      agent: {
-        command: "claude --model opus --dangerously-skip-permissions",
-      },
-    }, null, 2)}\n`);
+    fs.writeFileSync(path.join(tmp, ".runfree", "runfree.json"), `${JSON.stringify(config, null, 2)}\n`);
 
-    const config = readConfig(tmp);
+    expect(() => readConfig(tmp)).toThrow(what);
+    expect(() => readConfig(tmp)).toThrow("move .runfree aside and run `runfree init`");
+  });
 
-    expect(resolveAgentCommand(config, "claude")).toBe("claude --model opus --dangerously-skip-permissions");
-    expect(resolveDefaultAgentCommand(config)).toBe("claude --model opus --dangerously-skip-permissions");
-    expect(resolveAgentCommand(config, "codex"))
-      .toBe("codex -c check_for_update_on_startup=false --dangerously-bypass-approvals-and-sandbox");
-    expect(resolveAgentCommand(config, "pi")).toBe("pi");
+  test("ensureProject refuses a pre-v4 config before any project write", () => {
+    const runfreeDir = path.join(tmp, ".runfree");
+    fs.mkdirSync(runfreeDir, { recursive: true });
+    const configPath = path.join(runfreeDir, "runfree.json");
+    const policyPath = path.join(runfreeDir, "network-policy.json");
+    fs.writeFileSync(configPath, '{"version":3,"agents":{"default":"claude"}}\n');
+    fs.writeFileSync(policyPath, '{"hosts":["example.com"]}\n');
+    const templatesDir = path.join(tmp, "templates");
+    fs.mkdirSync(templatesDir);
+    fs.writeFileSync(path.join(templatesDir, "network-policy.json"), '{"version":2,"hosts":[]}\n');
+    fs.writeFileSync(path.join(templatesDir, "runfree.json"), '{"version":4,"agents":{"default":"claude"}}\n');
+    const configBefore = fs.readFileSync(configPath, "utf8");
+    const policyBefore = fs.readFileSync(policyPath, "utf8");
+
+    expect(() => ensureProject(tmp, templatesDir, { XDG_STATE_HOME: path.join(tmp, "state") })).toThrow("config version 3");
+
+    expect(fs.readFileSync(configPath, "utf8")).toBe(configBefore);
+    expect(fs.readFileSync(policyPath, "utf8")).toBe(policyBefore);
+    expect(fs.existsSync(path.join(runfreeDir, ".gitignore"))).toBe(false);
   });
 
   test("rejects unsupported agent config keys", () => {
     fs.mkdirSync(path.join(tmp, ".runfree"), { recursive: true });
     fs.writeFileSync(path.join(tmp, ".runfree", "runfree.json"), `${JSON.stringify({
-      version: 3,
+      version: 4,
       agents: {
         default: "claude",
         claude: {
@@ -145,7 +159,7 @@ describe("runfree config", () => {
   test("accepts an explicit custom resume command without interpreting it", () => {
     fs.mkdirSync(path.join(tmp, ".runfree"), { recursive: true });
     fs.writeFileSync(path.join(tmp, ".runfree", "runfree.json"), `${JSON.stringify({
-      version: 3,
+      version: 4,
       agents: {
         default: "claude",
         claude: {
@@ -176,112 +190,18 @@ describe("runfree config", () => {
     const project = projectInfo(tmp, { XDG_STATE_HOME: path.join(tmp, "state") });
 
     expect(project.config.project).toEqual({ name: "  Client / API  " });
-    expect(project.configMigration).toBeUndefined();
-  });
-
-  test("refuses legacy migration outside a quiesced transaction before policy writes", () => {
-    const runfreeDir = path.join(tmp, ".runfree");
-    fs.mkdirSync(runfreeDir, { recursive: true });
-    const configPath = path.join(runfreeDir, "runfree.json");
-    const policyPath = path.join(runfreeDir, "network-policy.json");
-    fs.writeFileSync(configPath, '{"version":3,"agents":{"default":"claude"}}\n');
-    fs.writeFileSync(policyPath, '{"hosts":["example.com"]}\n');
-    const templatesDir = path.join(tmp, "templates");
-    fs.mkdirSync(templatesDir);
-    fs.writeFileSync(path.join(templatesDir, "network-policy.json"), '{"version":2,"hosts":[]}\n');
-    fs.writeFileSync(path.join(templatesDir, "runfree.json"), '{"version":4,"agents":{"default":"claude"}}\n');
-    const configBefore = fs.readFileSync(configPath, "utf8");
-    const policyBefore = fs.readFileSync(policyPath, "utf8");
-
-    expect(() => ensureProject(tmp, templatesDir, {
-      XDG_STATE_HOME: path.join(tmp, "state"),
-    }, { migrateConfig: true })).toThrow("requires a quiesced runtime transaction");
-
-    expect(fs.readFileSync(configPath, "utf8")).toBe(configBefore);
-    expect(fs.readFileSync(policyPath, "utf8")).toBe(policyBefore);
-  });
-
-  test("migrates legacy project keys while preserving project.name", () => {
-    fs.mkdirSync(path.join(tmp, ".runfree"), { recursive: true });
-    fs.writeFileSync(path.join(tmp, ".runfree", "runfree.json"), `${JSON.stringify({
-      version: 3,
-      project: { mount: "read-only", name: "visible-repo" },
-      agents: {
-        default: "claude",
-        claude: { command: "claude --dangerously-skip-permissions" },
-      },
-    }, null, 2)}\n`);
-
-    const templatesDir = path.join(tmp, "templates");
-    fs.mkdirSync(templatesDir);
-    fs.writeFileSync(path.join(templatesDir, "network-policy.json"), `${JSON.stringify({ hosts: [], tokens: {} }, null, 2)}\n`);
-    fs.writeFileSync(path.join(templatesDir, "runfree.json"), `${JSON.stringify({ version: 3, agents: { default: "claude" }, runtime: {} }, null, 2)}\n`);
-
-    const project = ensureProject(tmp, templatesDir, {
-      XDG_STATE_HOME: path.join(tmp, "state"),
-    }, { migrateConfig: true, migrationProof: QUIESCED_CONFIG_MIGRATION });
-    const stored = JSON.parse(fs.readFileSync(path.join(tmp, ".runfree", "runfree.json"), "utf8")) as {
-      project?: Record<string, unknown>;
-    };
-
-    expect(project.configMigrated).toEqual({ fromVersion: 3, toVersion: 4 });
-    expect(stored.project).toEqual({ name: "visible-repo" });
-  });
-
-  test("config v4 migration moves legacy service authority into desired policy", () => {
-    fs.mkdirSync(path.join(tmp, ".runfree"), { recursive: true });
-    fs.writeFileSync(path.join(tmp, ".runfree", "runfree.json"), `${JSON.stringify({
-      version: 1,
-      agent: { command: "claude --dangerously-skip-permissions" },
-      services: {
-        python: { revision: 1, hosts: ["pypi.org"] },
-      },
-    }, null, 2)}\n`);
-
-    const templatesDir = path.join(tmp, "templates");
-    fs.mkdirSync(templatesDir);
-    fs.writeFileSync(path.join(tmp, ".runfree", "network-policy.json"), `${JSON.stringify({
-      hosts: ["pypi.org"],
-      requests: { "pypi.org": { methods: ["GET"] } },
-    }, null, 2)}\n`);
-    fs.writeFileSync(path.join(templatesDir, "network-policy.json"), `${JSON.stringify({ version: 2, hosts: [] }, null, 2)}\n`);
-    fs.writeFileSync(path.join(templatesDir, "runfree.json"), `${JSON.stringify({ version: 4, agents: { default: "claude" }, runtime: {} }, null, 2)}\n`);
-
-    const project = ensureProject(tmp, templatesDir, {
-      XDG_STATE_HOME: path.join(tmp, "state"),
-    }, { migrateConfig: true, migrationProof: QUIESCED_CONFIG_MIGRATION });
-    const stored = JSON.parse(fs.readFileSync(path.join(tmp, ".runfree", "runfree.json"), "utf8")) as Record<string, unknown>;
-
-    const desired = JSON.parse(fs.readFileSync(path.join(tmp, ".runfree", "network-policy.json"), "utf8")) as {
-      services?: Record<string, unknown>;
-      version?: number;
-    };
-    expect(project.configMigrated).toEqual({ fromVersion: 1, toVersion: 4 });
-    expect(stored.version).toBe(4);
-    expect(stored.services).toBeUndefined();
-    expect(desired.version).toBe(2);
-    expect(desired.services?.python).toMatchObject({
-      revision: 1,
-      resolved: {
-        hosts: ["pypi.org"],
-      },
-    });
-    expect((desired as { requests?: unknown }).requests).toEqual({
-      "pypi.org": { methods: ["GET"] },
-    });
-    expect((stored as { config?: unknown }).config).toBeUndefined();
   });
 
   test("readRawProjectConfig exposes unknown keys the typed config drops", () => {
     fs.mkdirSync(path.join(tmp, ".runfree"), { recursive: true });
     const configPath = path.join(tmp, ".runfree", "runfree.json");
     fs.writeFileSync(configPath, `${JSON.stringify({
-      version: 3,
+      version: 4,
       services: { node: { revision: 1 } },
     }, null, 2)}\n`);
 
     expect(readRawProjectConfig(tmp, configPath)).toEqual({
-      version: 3,
+      version: 4,
       services: { node: { revision: 1 } },
     });
     expect((readConfig(tmp) as unknown as { services?: unknown }).services).toBeUndefined();
@@ -296,7 +216,7 @@ describe("runfree config", () => {
     const templatesDir = path.join(tmp, "templates");
     fs.mkdirSync(templatesDir);
     fs.writeFileSync(path.join(templatesDir, "network-policy.json"), `${JSON.stringify({ hosts: [], tokens: {} }, null, 2)}\n`);
-    fs.writeFileSync(path.join(templatesDir, "runfree.json"), `${JSON.stringify({ version: 3, agents: { default: "claude" }, runtime: {} }, null, 2)}\n`);
+    fs.writeFileSync(path.join(templatesDir, "runfree.json"), `${JSON.stringify({ version: 4, agents: { default: "claude" }, runtime: {} }, null, 2)}\n`);
 
     ensureProject(tmp, templatesDir, { XDG_STATE_HOME: path.join(tmp, "state") });
     expect(fs.readFileSync(policyPath, "utf8")).toBe(legacy);
@@ -306,7 +226,7 @@ describe("runfree config", () => {
     const templatesDir = path.join(tmp, "templates");
     fs.mkdirSync(templatesDir);
     fs.writeFileSync(path.join(templatesDir, "network-policy.json"), `${JSON.stringify({ hosts: [], tokens: {} }, null, 2)}\n`);
-    fs.writeFileSync(path.join(templatesDir, "runfree.json"), `${JSON.stringify({ version: 3, agents: { default: "claude" }, runtime: {} }, null, 2)}\n`);
+    fs.writeFileSync(path.join(templatesDir, "runfree.json"), `${JSON.stringify({ version: 4, agents: { default: "claude" }, runtime: {} }, null, 2)}\n`);
 
     ensureProject(tmp, templatesDir, {
       XDG_STATE_HOME: path.join(tmp, "state"),
@@ -323,7 +243,7 @@ describe("runfree config", () => {
   test("rejects blank project.name", () => {
     fs.mkdirSync(path.join(tmp, ".runfree"), { recursive: true });
     fs.writeFileSync(path.join(tmp, ".runfree", "runfree.json"), `${JSON.stringify({
-      version: 3,
+      version: 4,
       project: { name: "  " },
     }, null, 2)}\n`);
 
@@ -333,7 +253,7 @@ describe("runfree config", () => {
   test("accepts dependency overlay runtime policy", () => {
     fs.mkdirSync(path.join(tmp, ".runfree"), { recursive: true });
     fs.writeFileSync(path.join(tmp, ".runfree", "runfree.json"), `${JSON.stringify({
-      version: 3,
+      version: 4,
       runtime: {
         dependencyOverlays: "off",
       },
@@ -345,7 +265,7 @@ describe("runfree config", () => {
   test("rejects unsupported dependency overlay runtime policy", () => {
     fs.mkdirSync(path.join(tmp, ".runfree"), { recursive: true });
     fs.writeFileSync(path.join(tmp, ".runfree", "runfree.json"), `${JSON.stringify({
-      version: 3,
+      version: 4,
       runtime: {
         dependencyOverlays: "required",
       },
@@ -357,15 +277,11 @@ describe("runfree config", () => {
   test("validates the write-approval posture and hold window before any runtime startup", () => {
     fs.mkdirSync(path.join(tmp, ".runfree"), { recursive: true });
     const writeRuntime = (runtime: Record<string, unknown>) => {
-      fs.writeFileSync(path.join(tmp, ".runfree", "runfree.json"), `${JSON.stringify({ version: 3, runtime }, null, 2)}\n`);
+      fs.writeFileSync(path.join(tmp, ".runfree", "runfree.json"), `${JSON.stringify({ version: 4, runtime }, null, 2)}\n`);
     };
 
-    writeRuntime({ writeApproval: "allow", writeApprovalHoldSeconds: 60 });
-    expect(readConfig(tmp).runtime.writeApproval).toBe("allow");
+    writeRuntime({ writeApprovalHoldSeconds: 60 });
     expect(readConfig(tmp).runtime.writeApprovalHoldSeconds).toBe(60);
-
-    writeRuntime({ writeApproval: "block" });
-    expect(() => readConfig(tmp)).toThrow("runtime.writeApproval must be \"allow\", \"ask\", or \"deny\"");
 
     for (const value of [4, 301, 12.5, "120"]) {
       writeRuntime({ writeApprovalHoldSeconds: value });
@@ -397,27 +313,6 @@ describe("runfree config", () => {
     expect(fs.existsSync(path.join(tmp, ".runfree", "config", "agent.env"))).toBe(false);
   });
 
-  test("marks removed project and paths config keys for migration", () => {
-    fs.mkdirSync(path.join(tmp, ".runfree"), { recursive: true });
-    fs.writeFileSync(path.join(tmp, ".runfree", "runfree.json"), `${JSON.stringify({
-      version: 3,
-      project: { mount: "read-only" },
-      paths: {
-        projects: "reports",
-        networkPolicy: "network-policy.json",
-      },
-      agents: {
-        default: "claude",
-        claude: { command: "claude --dangerously-skip-permissions" },
-      },
-    }, null, 2)}\n`);
-
-    const project = projectInfo(tmp, { XDG_STATE_HOME: path.join(tmp, "state") });
-
-    expect(project.configMigration).toEqual({ fromVersion: 3, toVersion: 4 });
-    expect(project.paths.policyPath).toBe(path.join(tmp, ".runfree", "network-policy.json"));
-  });
-
   test("rejects host-owned token config paths that realpath into the project", () => {
     const projectRoot = path.join(tmp, "project");
     const projectOwnedConfig = path.join(projectRoot, "project-owned-config");
@@ -434,7 +329,7 @@ describe("runfree config", () => {
   test("normalizes project agent build config", () => {
     fs.mkdirSync(path.join(tmp, ".runfree"), { recursive: true });
     fs.writeFileSync(path.join(tmp, ".runfree", "runfree.json"), `${JSON.stringify({
-      version: 2,
+      version: 4,
       runtime: {
         agent: {
           build: {
@@ -463,7 +358,7 @@ describe("runfree config", () => {
   test("rejects unsupported runtime agent image override", () => {
     fs.mkdirSync(path.join(tmp, ".runfree"), { recursive: true });
     fs.writeFileSync(path.join(tmp, ".runfree", "runfree.json"), `${JSON.stringify({
-      version: 2,
+      version: 4,
       runtime: {
         agent: {
           image: "example/custom-agent:latest",
@@ -478,7 +373,7 @@ describe("runfree config", () => {
   test("rejects reserved project agent build args", () => {
     fs.mkdirSync(path.join(tmp, ".runfree"), { recursive: true });
     fs.writeFileSync(path.join(tmp, ".runfree", "runfree.json"), `${JSON.stringify({
-      version: 2,
+      version: 4,
       runtime: {
         agent: {
           build: {
@@ -497,7 +392,7 @@ describe("runfree config", () => {
   test("rejects project agent build paths outside the project root", () => {
     fs.mkdirSync(path.join(tmp, ".runfree"), { recursive: true });
     fs.writeFileSync(path.join(tmp, ".runfree", "runfree.json"), `${JSON.stringify({
-      version: 2,
+      version: 4,
       runtime: {
         agent: {
           build: {

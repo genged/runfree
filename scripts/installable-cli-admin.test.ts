@@ -93,7 +93,7 @@ describe("installable runfree CLI: admin policy", () => {
   test("honors project runtime network overrides", () => {
     fs.mkdirSync(path.join(tmp, ".runfree"), { recursive: true });
     fs.writeFileSync(path.join(tmp, ".runfree/runfree.json"), `${JSON.stringify({
-      version: 1,
+      version: 4,
       runtime: {
         subnet: "172.31.0.0/24",
         proxyIp: "172.31.0.10",
@@ -112,7 +112,7 @@ describe("installable runfree CLI: admin policy", () => {
   test("rejects invalid runtime network overrides", () => {
     fs.mkdirSync(path.join(tmp, ".runfree"), { recursive: true });
     fs.writeFileSync(path.join(tmp, ".runfree/runfree.json"), `${JSON.stringify({
-      version: 1,
+      version: 4,
       runtime: {
         proxyIp: "",
       },

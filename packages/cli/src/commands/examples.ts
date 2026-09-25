@@ -30,7 +30,7 @@ export const COMMAND_EXAMPLES = {
     { cmd: "runfree shell", blurb: "Open a shell in the agent container" },
   ],
   init: [
-    { cmd: "runfree init", blurb: "Scaffold or migrate this project's .runfree config (wizard on a TTY)" },
+    { cmd: "runfree init", blurb: "Scaffold this project's .runfree config (wizard on a TTY)" },
   ],
   image: [
     { cmd: "runfree image init", blurb: "Create .runfree/image/Dockerfile and configure runtime.agent.build" },
