@@ -28,23 +28,43 @@ import {
 const CLI_BUNDLE_ENTRY = path.join(repoRoot, "packages", "cli", "src", "cli.ts");
 const PROXY_SERVER_BUNDLE_ENTRY = path.join(repoRoot, "packages", "proxy", "src", "server.ts");
 
-export type BundleSpec = Readonly<{ entry: string; outfile: string; packages: "bundle" | "external" }>;
+export type BundleSpec = Readonly<{ entry: string; outfile: string; external: readonly string[] }>;
 
-// Fully bundled, mirroring the shipped binary. `@runfree/proxy` exports
+// Fully bundled, mirroring the shipped binary. Workspace package exports
 // point at TypeScript sources, so the CLI's dependencies cannot be
 // externalized anyway.
-const CLI_BUNDLE: BundleSpec = { entry: CLI_BUNDLE_ENTRY, outfile: CLI_BUNDLE_PATH, packages: "bundle" };
+const CLI_BUNDLE: BundleSpec = { entry: CLI_BUNDLE_ENTRY, outfile: CLI_BUNDLE_PATH, external: [] };
+
+/**
+ * A package's third-party dependencies, as `bun build --external` patterns.
+ *
+ * Workspace dependencies are left out, so they are bundled: their exports
+ * point at TypeScript sources that plain Node cannot load (NodeNext `.js`
+ * specifiers name files that exist only as `.ts`).
+ */
+function thirdPartyExternals(packageDir: string): readonly string[] {
+  const manifest = JSON.parse(fs.readFileSync(path.join(packageDir, "package.json"), "utf8")) as {
+    dependencies?: Record<string, string>;
+  };
+  return Object.entries(manifest.dependencies ?? {})
+    .filter(([, version]) => !version.startsWith("workspace:"))
+    .flatMap(([name]) => [name, `${name}/*`]);
+}
 
 /** What the ordinary (non-Docker) suite spawns. */
 export const UNIT_BUNDLES: readonly BundleSpec[] = [
   CLI_BUNDLE,
-  // Dependencies stay external: `mockttp-adapter.ts` pins mockttp internals
-  // through `createRequire`, and a bundled second mockttp instance would not
-  // share the trusted-socket metadata of the one loaded from disk (the server
-  // startup self-test catches exactly that). External resolution from the
-  // bundle's location reaches `packages/proxy/node_modules`, matching how the
-  // tsx-run server resolved the same modules.
-  { entry: PROXY_SERVER_BUNDLE_ENTRY, outfile: PROXY_SERVER_BUNDLE_PATH, packages: "external" },
+  // Third-party dependencies stay external: `mockttp-adapter.ts` pins mockttp
+  // internals through `createRequire`, and a bundled second mockttp instance
+  // would not share the trusted-socket metadata of the one loaded from disk
+  // (the server startup self-test catches exactly that). External resolution
+  // from the bundle's location reaches `packages/proxy/node_modules`, matching
+  // how the tsx-run server resolved the same modules.
+  {
+    entry: PROXY_SERVER_BUNDLE_ENTRY,
+    outfile: PROXY_SERVER_BUNDLE_PATH,
+    external: thirdPartyExternals(path.join(repoRoot, "packages", "proxy")),
+  },
 ];
 
 /**
@@ -55,8 +75,8 @@ export const UNIT_BUNDLES: readonly BundleSpec[] = [
  */
 export const LIVE_BUNDLES: readonly BundleSpec[] = [
   CLI_BUNDLE,
-  { entry: SESSION_ADMISSION_CRASH_ENTRY_SOURCE, outfile: SESSION_ADMISSION_CRASH_BUNDLE_PATH, packages: "bundle" },
-  { entry: SESSION_ADMISSION_MATRIX_ENTRY_SOURCE, outfile: SESSION_ADMISSION_MATRIX_BUNDLE_PATH, packages: "bundle" },
+  { entry: SESSION_ADMISSION_CRASH_ENTRY_SOURCE, outfile: SESSION_ADMISSION_CRASH_BUNDLE_PATH, external: [] },
+  { entry: SESSION_ADMISSION_MATRIX_ENTRY_SOURCE, outfile: SESSION_ADMISSION_MATRIX_BUNDLE_PATH, external: [] },
 ];
 
 function bunAvailable(): boolean {
@@ -64,7 +84,7 @@ function bunAvailable(): boolean {
   return !probe.error && probe.status === 0;
 }
 
-function buildBundle(entry: string, outfile: string, packages: "bundle" | "external"): void {
+function buildBundle(entry: string, outfile: string, external: readonly string[]): void {
   fs.mkdirSync(path.dirname(outfile), { recursive: true });
   // Build to a temporary name and rename into place: a concurrently running
   // Vitest invocation spawning the bundle must see the previous complete file
@@ -72,7 +92,15 @@ function buildBundle(entry: string, outfile: string, packages: "bundle" | "exter
   const staging = `${outfile}.building-${process.pid}`;
   const result = childProcess.spawnSync(
     "bun",
-    ["build", entry, "--target=node", `--packages=${packages}`, "--sourcemap=inline", `--outfile=${staging}`],
+    [
+      "build",
+      entry,
+      "--target=node",
+      "--packages=bundle",
+      ...external.map((pattern) => `--external=${pattern}`),
+      "--sourcemap=inline",
+      `--outfile=${staging}`,
+    ],
     { cwd: repoRoot, encoding: "utf8" },
   );
   if (result.error || result.status !== 0) {
@@ -97,7 +125,7 @@ function buildAll(bundles: readonly BundleSpec[]): void {
     );
     return;
   }
-  for (const { entry, outfile, packages } of bundles) buildBundle(entry, outfile, packages);
+  for (const { entry, outfile, external } of bundles) buildBundle(entry, outfile, external);
 }
 
 const builtThisInvocation = new Set<string>();

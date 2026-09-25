@@ -114,11 +114,6 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      # A fresh clone has no `packages/*/dist` or `dist/runtime/**`, which the
-      # unit suite reads.
-      - name: Build runtime packages
-        run: pnpm run build:runtime
-
       - name: Run unit tests
         run: make test-unit
 

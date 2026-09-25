@@ -72,8 +72,10 @@ describe("release workflow", () => {
 
   test("runs only the unit tests before release", () => {
     const unitTests = releaseJobs["unit-tests"];
-    expect(unitTests.indexOf("run: pnpm run build:runtime")).toBeGreaterThanOrEqual(0);
-    expect(unitTests.indexOf("run: make test-unit")).toBeGreaterThan(unitTests.indexOf("run: pnpm run build:runtime"));
+    expect(unitTests).toContain("run: make test-unit");
+    // The unit suite reads workspace sources, so it runs on a fresh clone with
+    // no `packages/*/dist` (guarded by scripts/workspace-source-exports.test.ts).
+    expect(unitTests).not.toContain("build:runtime");
     expect(releaseWorkflow).not.toContain("uses: ./.github/workflows/verify.yml");
     expect(releaseWorkflow).not.toContain("scripts/run-cli-e2e.sh");
     expect(releaseWorkflow).not.toContain("make test-static");

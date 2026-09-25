@@ -63,19 +63,17 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      # `pnpm install` does not build the composite packages, and a fresh clone
-      # has no `packages/*/dist`. Without this, the root `tsc --noEmit` inside
-      # `make test-static` fails TS6305 on every referenced output, and
-      # `generate:assets` later has no `dist/runtime/**` to read from. It passes
-      # on a developer machine only because those directories already exist.
-      - name: Build runtime packages
-        run: pnpm run build:runtime
-
       - name: Run static checks
         run: make test-static
 
       - name: Run unit tests
         run: make test-unit
+
+      # Static checks and unit tests read workspace sources, so they run above
+      # on a clone with no `packages/*/dist`, which proves they do not depend
+      # on it. `generate:assets` below reads `dist/runtime/**`.
+      - name: Build runtime packages
+        run: pnpm run build:runtime
 
       - name: Validate runtime templates
         run: make test-templates
