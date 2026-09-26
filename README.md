@@ -72,7 +72,7 @@ see [Limitations](#limitations).
 
 ### 1. Install
 
-Runfree 0.5.0 publishes **Apple Silicon macOS** binaries and is supported with
+Runfree 0.5.1 publishes **Apple Silicon macOS** binaries and is supported with
 **Docker Desktop**. You also need `git`.
 
 ```bash

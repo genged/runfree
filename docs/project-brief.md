@@ -63,16 +63,13 @@ The primary audience is individual developers using Claude Code, Codex, or Pi wh
 
 ## Supported Release Shape
 
-As of `0.5.0`:
+As of `0.5.1`:
 
 - published binary: `darwin-arm64` only, ad-hoc signed and not notarized, with a SHA-256 manifest;
 - host: Apple Silicon macOS;
 - container backend: Docker Desktop with Docker Compose;
 - package manager: Homebrew tap plus the GitHub release install script (`bash`, not `sh`);
 - source build: Node 22, pnpm 10.28.0, and Bun 1.3.14 for `pnpm run build:bin`;
-- support: the latest release only, best effort, with no response-time commitment.
-
-OrbStack is outside this beta: `Makefile` names Docker Desktop as the gating backend and defers OrbStack, so OrbStack gates nothing and is not claimed. The exact macOS and Docker Desktop versions the release candidate was accepted on are recorded in the release acceptance dossier; a wider range should not be inferred.
 
 The release target list lives in [`../scripts/release-targets.txt`](../scripts/release-targets.txt), which packaging, signing, checksums, and the CI build matrix all read.
 
