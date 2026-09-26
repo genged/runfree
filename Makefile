@@ -1,12 +1,13 @@
 SHELL := /bin/bash
 
-.PHONY: help test test-all test-static test-unit test-agent test-proxy test-security test-templates test-cli-e2e test-cli-e2e-live test-runtime test-runtime-core test-runtime-extended test-runtime-smoke test-runtime-live test-runtime-live-topology test-runtime-live-managed-launch test-runtime-live-egress test-runtime-live-connect-guard test-runtime-live-request-shape test-runtime-live-audit test-runtime-live-allowlist test-runtime-live-policy-mutation test-runtime-live-helper-reclaim test-live-session-admission-docker-desktop test-live-session-admission-orbstack test-live-session-admission-negative-docker-desktop test-live-session-admission-negative-orbstack test-live-session-admission-attached-docker-desktop test-live-session-admission-attached-orbstack test-live-session-renewal-docker-desktop test-live-session-renewal-orbstack test-live-session-independence-docker-desktop test-live-session-independence-orbstack test-live-session-admission-crash-docker-desktop test-live-session-admission-crash-orbstack test-live-session-admission-drift-docker-desktop test-live-session-admission-drift-orbstack reclaim-runtime-sandbox reclaim-runtime-sandbox-apply test-watch
+.PHONY: help test test-all test-release test-static test-unit test-agent test-proxy test-security test-templates test-cli-e2e test-cli-e2e-live test-runtime test-runtime-core test-runtime-extended test-runtime-smoke test-runtime-live test-runtime-live-topology test-runtime-live-managed-launch test-runtime-live-egress test-runtime-live-connect-guard test-runtime-live-request-shape test-runtime-live-audit test-runtime-live-allowlist test-runtime-live-policy-mutation test-runtime-live-helper-reclaim test-live-session-admission-docker-desktop test-live-session-admission-orbstack test-live-session-admission-negative-docker-desktop test-live-session-admission-negative-orbstack test-live-session-admission-attached-docker-desktop test-live-session-admission-attached-orbstack test-live-session-renewal-docker-desktop test-live-session-renewal-orbstack test-live-session-independence-docker-desktop test-live-session-independence-orbstack test-live-session-admission-crash-docker-desktop test-live-session-admission-crash-orbstack test-live-session-admission-drift-docker-desktop test-live-session-admission-drift-orbstack reclaim-runtime-sandbox reclaim-runtime-sandbox-apply test-watch
 
 help:
 	@printf '%s\n' \
 		'Targets:' \
 		'  make test                 Static checks + Vitest suites' \
 		'  make test-all             All static, unit, template, live runtime, and packaged offline/live tests (TEST_RUNTIME_BACKEND)' \
+		'  make test-release         Pre-tag gate: the Test workflow'"'"'s checks a release commit must pass (Docker CLI and Bun)' \
 		'  make test-static          Syntax/config checks only' \
 		'  make test-unit            All Vitest suites' \
 		'  make test-agent           Runfree bootstrap Vitest suite' \
@@ -36,6 +37,13 @@ help:
 		'  make test-watch           Vitest watch mode'
 
 test: test-static test-unit
+
+# The pre-tag release gate: what the Test workflow runs on the pushed release
+# commit, so a tag is never published from a commit that Test then fails. The
+# Release workflow gates on unit tests alone and never reads Test's result.
+# Asset freshness is left out: the release regenerates and commits the assets
+# itself. No live runtime; that stays in test-all.
+test-release: test-static test-unit test-templates test-cli-e2e
 
 # The backend the live runtime suite runs on when folded into test-all.
 # Docker Desktop is the gating backend for Item 4 (maintainer decision,

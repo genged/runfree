@@ -12,6 +12,11 @@ Runfree separates tests by the boundary they prove.
 | Packaged CLI end to end | `make test-cli-e2e` | The compiled `dist/runfree` executable | Compilation, embedded assets, entrypoint, first-run workflows, safe refusals, and filesystem compatibility |
 | Packaged runtime end to end | `make test-cli-e2e-live` | The compiled executable plus real Docker | First startup, exact approvals, image build, managed session launch, reuse, and teardown |
 
+`make test-release` is the pre-tag gate for a release commit. It runs what the
+Test workflow runs on that commit: static checks, unit tests, template
+validation, and the offline packaged end-to-end lane. It needs the Docker CLI
+and Bun, but not a Docker daemon.
+
 `make test-all` runs every layer in this table plus Docker Compose template
 validation. It requires the Docker CLI and a reachable daemon.
 
