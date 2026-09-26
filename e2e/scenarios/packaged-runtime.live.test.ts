@@ -67,7 +67,7 @@ describe("packaged executable against a real Docker runtime", () => {
     scenarioIds: ["LH-11", "LH-12", "LH-20"],
     layer: "Dp",
     cadence: "docker-pre-merge",
-    implementationStatus: "Implemented-failing",
+    implementationStatus: "Partial",
     evidence: {
       kind: "real-provider-compatibility",
       provider: `Docker (${process.env.TEST_RUNTIME_BACKEND ?? "unspecified backend"})`,

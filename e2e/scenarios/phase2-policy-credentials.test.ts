@@ -82,7 +82,7 @@ const evolutionMetadata = {
   scenarioIds: ["LH-09"],
   layer: "P",
   cadence: "pull-request",
-  implementationStatus: "Implemented-failing",
+  implementationStatus: "Partial",
   evidence: {
     kind: "modeled-external-step",
     modeledSteps: ["Docker container inventory with no live project agents"],

@@ -34,7 +34,7 @@ const inboxMetadata = {
   cleanup: packagedCleanup,
 } as const;
 
-const failingInboxMetadata = {
+const forgedInboxMetadata = {
   ...inboxMetadata,
   evidence: {
     kind: "modeled-external-step",
@@ -42,7 +42,6 @@ const failingInboxMetadata = {
     proofLimits:
       "This P-layer scenario proves packaged host refusal and cleanup only. It does not prove the Docker read-only /runfree/inbox mount, which remains Ds work.",
   },
-  implementationStatus: "Implemented-failing",
 } as const;
 
 async function git(world: E2EWorld, args: readonly string[]): Promise<string> {
@@ -165,7 +164,7 @@ describe("Phase 4 integrations through the packaged CLI", () => {
     });
   });
 
-  scenario("redirected and forged inbox entries cannot redirect import or cleanup", failingInboxMetadata, async () => {
+  scenario("redirected and forged inbox entries cannot redirect import or cleanup", forgedInboxMetadata, async () => {
     await withWorld({}, async (world) => {
       await initializeTrackedProject(world);
       const inbox = await projectInbox(world);

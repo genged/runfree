@@ -78,15 +78,16 @@ exact test name. The report includes all 38 program statuses and separately
 lists blocked work. Modeled steps name their limits. The required lane has no
 real service credentials.
 
-The offline lane has 25 tests. All 25 passed on 2026-09-16 (`make test-cli-e2e`,
-7 files, 25 tests). An earlier version of this page described 23 passing and 2
-intentionally failing; that is no longer what the lane does.
+The offline lane has 24 tests. All 24 passed on 2026-09-26 (`make test-cli-e2e`,
+7 files, 24 tests).
 
-The `Implemented-failing` status still carried by LH-09, LH-12, and LH-23 in
-`e2e/support/scenario-program.ts` therefore no longer corresponds to a failing
-test. A green run does not say whether the underlying defects were fixed or the
-scenarios were rewritten to assert something else, so treat those labels as
-needing a maintainer disposition rather than as current evidence either way.
+No scenario is `Implemented-failing`. LH-09, LH-12, and LH-23 carried that
+status for defects that are now fixed, and their tests still assert the
+original invariants. A second unchanged `service enable --no-reload` leaves
+owned state unchanged (LH-09). `inbox clean --all` keeps a forged hard link
+(LH-23). The packaged live lifecycle passed managed-session liveness on Docker
+Desktop on 2026-09-18 (LH-12). All three are `Partial`, because each still has
+unproved parts.
 
 The LH-10 refusal proves that `runfree image init` rejects a symlinked
 `.runfree/runfree.json` before it writes project, XDG config, XDG data, or XDG
