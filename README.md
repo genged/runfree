@@ -283,5 +283,6 @@ ask about.
 - [`docs/security.md`](docs/security.md) — threat model and verification
 - [`docs/cli.md`](docs/cli.md) — full command reference
 - [`docs/troubleshooting.md`](docs/troubleshooting.md) — refusals and recovery
-- [`docs/whats-new-0.5.0.md`](docs/whats-new-0.5.0.md) — current release
+- [`docs/whats-new-0.5.1.md`](docs/whats-new-0.5.1.md) — current release
+- [`docs/whats-new-0.5.0.md`](docs/whats-new-0.5.0.md) — initial release
 - [`AGENTS.md`](AGENTS.md) — guidance for coding agents working in this repo
