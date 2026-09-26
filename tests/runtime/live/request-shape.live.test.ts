@@ -35,6 +35,7 @@ import { composeProjectName, composeServiceContainerId, docker, dockerOrThrow } 
 import {
   admittedToUnresolvableHost,
   curlProbeCommand,
+  enableProxyVerboseLogging,
   parseProbeAnswer,
   proxyAdmittedEventCount,
 } from "./proxy-answer.ts";
@@ -142,7 +143,13 @@ describe("request-shape enforcement", () => {
 
     test("a read-only GET succeeds while a POST receives the in-tunnel method denial with no credential", () => {
       const admittedBefore = proxyAdmittedEventCount(proxyId, METHOD_HOST);
-      const get = sessionExec(sessionId, curlProbeCommand(`https://${METHOD_HOST}/rate_limit`, { maxTimeSeconds: 15 }));
+      const verbose = enableProxyVerboseLogging(proxyId, "shape-get");
+      let get: CaptureResult;
+      try {
+        get = sessionExec(sessionId, curlProbeCommand(`https://${METHOD_HOST}/rate_limit`, { maxTimeSeconds: 15 }));
+      } finally {
+        verbose.disable();
+      }
       expect(admittedToUnresolvableHost(parseProbeAnswer(get.stdout)), `read-only GET was not admitted: ${describeOutput(get.output)}`)
         .toBe(true);
       expect(proxyAdmittedEventCount(proxyId, METHOD_HOST), "the proxy logged no admission for the read-only GET")
@@ -186,7 +193,11 @@ describe("request-shape enforcement", () => {
       // GET, and the upload-pack POST, which the git rule classifies as a read
       // rather than a write.
       const admittedBefore = proxyAdmittedEventCount(proxyId, GIT_HOST);
-      const git = sessionExec(sessionId, `
+      const verbose = enableProxyVerboseLogging(proxyId, "shape-git");
+      let git: CaptureResult;
+      let uploadPack: CaptureResult;
+      try {
+        git = sessionExec(sessionId, `
         set -uo pipefail
         export GIT_TERMINAL_PROMPT=0
         rm -rf /tmp/shape-git && mkdir -p /tmp/shape-git && cd /tmp/shape-git
@@ -202,16 +213,19 @@ describe("request-shape enforcement", () => {
           echo "push-log: $(tr '\n' ' ' </tmp/shape-git-push.log)"
         fi
       `);
+        uploadPack = sessionExec(sessionId, curlProbeCommand(`https://${GIT_HOST}/probe.git/git-upload-pack`, {
+          method: "POST",
+          maxTimeSeconds: 15,
+        }));
+      } finally {
+        verbose.disable();
+      }
       expect(git.status, `gitPush probe failed: ${describeOutput(git.output)}`).toBe(0);
       const readLog = git.stdout.split("\n").find((line) => line.startsWith("read-log: ")) ?? "";
       const pushLog = git.stdout.split("\n").find((line) => line.startsWith("push-log: ")) ?? "";
       expect(readLog, `the ref advertisement was not forwarded: ${describeOutput(git.output)}`).toContain("error: 502");
       expect(pushLog, `git push was not denied by the proxy: ${describeOutput(git.output)}`).toContain("error: 403");
 
-      const uploadPack = sessionExec(sessionId, curlProbeCommand(`https://${GIT_HOST}/probe.git/git-upload-pack`, {
-        method: "POST",
-        maxTimeSeconds: 15,
-      }));
       expect(
         admittedToUnresolvableHost(parseProbeAnswer(uploadPack.stdout)),
         `the upload-pack POST was not admitted as a read: ${describeOutput(uploadPack.output)}`,

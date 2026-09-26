@@ -21,7 +21,7 @@
 // private, loopback and runtime-subnet answers for allowlisted hosts
 // (`classifyResolvedIpv4`), which is the SSRF guard working as designed.
 
-import { dockerOrThrow } from "./docker.ts";
+import { docker, dockerOrThrow } from "./docker.ts";
 
 /** What the proxy answers an admitted request whose upstream it cannot reach. */
 export const PROXY_UPSTREAM_FAILURE_CODE = "502";
@@ -94,10 +94,31 @@ export function admittedToUnresolvableHost(answer: ProbeAnswer): boolean {
   return answer.blocked === undefined && answer.code === PROXY_UPSTREAM_FAILURE_CODE;
 }
 
+const PROXY_VERBOSE_MARKER_DIR = "/run/runfree-proxy-verbose";
+
 /**
- * Counts the proxy's structured `admitted` events for `host`. Compare counts
- * across a probe rather than filtering by time, so host/daemon clock skew
- * cannot let an earlier event count as the probe's.
+ * Turns on the proxy's verbose request logging until `disable` is called. The
+ * proxy writes `admitted` events only while a marker file exists in its
+ * verbose directory; each caller uses its own marker name so overlapping
+ * windows do not end each other.
+ */
+export function enableProxyVerboseLogging(proxyId: string, marker: string): Readonly<{ disable(): void }> {
+  dockerOrThrow("enable proxy verbose logging", [
+    "exec", "--user", "0:0", proxyId, "sh", "-c",
+    `mkdir -p ${PROXY_VERBOSE_MARKER_DIR} && touch ${PROXY_VERBOSE_MARKER_DIR}/${marker}`,
+  ]);
+  return {
+    disable: () => {
+      docker(["exec", "--user", "0:0", proxyId, "rm", "-f", `${PROXY_VERBOSE_MARKER_DIR}/${marker}`]);
+    },
+  };
+}
+
+/**
+ * Counts the proxy's structured `admitted` events for `host`. The proxy logs
+ * them only while verbose logging is on (`enableProxyVerboseLogging`). Compare
+ * counts across a probe rather than filtering by time, so host/daemon clock
+ * skew cannot let an earlier event count as the probe's.
  */
 export function proxyAdmittedEventCount(proxyId: string, host: string): number {
   return countAdmittedEvents(dockerOrThrow("proxy logs", ["logs", proxyId]), host);

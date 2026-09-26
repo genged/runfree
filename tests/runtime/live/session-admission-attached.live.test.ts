@@ -41,7 +41,7 @@ import { PROJECT_ID_LABEL } from "../../../packages/cli/src/runtime/constants.ts
 import { tryAcquireProjectLifecycleLock } from "../../../packages/cli/src/runtime/sessions.ts";
 import type { PendingApprovalRecord } from "../../../packages/runtime-contracts/src/write-approvals.ts";
 import { FIRST_REQUEST_HOST } from "./agent-stub.ts";
-import { admittedToUnresolvableHost, proxyAdmittedEventCount } from "./proxy-answer.ts";
+import { admittedToUnresolvableHost, enableProxyVerboseLogging, proxyAdmittedEventCount } from "./proxy-answer.ts";
 import {
   composeProjectName,
   composeServiceContainerId,
@@ -160,7 +160,16 @@ describe("attached per-session authority is exact and drift after the proof fail
     assertSessionAuthorityExactly([], "before any session");
 
     const admittedBefore = proxyAdmittedEventCount(proxyId, FIRST_REQUEST_HOST);
-    const launch = await startAttachedLaunch(fixture);
+    // The first request is sent the moment the agent starts, so the proxy's
+    // `admitted` event logging must already be on when the launch begins.
+    const verbose = enableProxyVerboseLogging(proxyId, "attached-first-request");
+    let launch: LaunchRun;
+    try {
+      launch = await startAttachedLaunch(fixture);
+      await firstRequestResult(fixture);
+    } finally {
+      verbose.disable();
+    }
     const [record] = launch.attached.records;
     expect(record, `the launch observed no attached record: ${JSON.stringify(launch.attached)}`).toBeDefined();
     expect(record.state).toBe("attached");
