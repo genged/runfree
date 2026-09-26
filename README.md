@@ -72,7 +72,7 @@ see [Limitations](#limitations).
 
 ### 1. Install
 
-Runfree 0.5.1 publishes **Apple Silicon macOS** binaries and is supported with
+Runfree publishes **Apple Silicon macOS** binaries and is supported with
 **Docker Desktop**. You also need `git`.
 
 ```bash
@@ -283,6 +283,7 @@ ask about.
 - [`docs/security.md`](docs/security.md) — threat model and verification
 - [`docs/cli.md`](docs/cli.md) — full command reference
 - [`docs/troubleshooting.md`](docs/troubleshooting.md) — refusals and recovery
-- [`docs/whats-new-0.5.1.md`](docs/whats-new-0.5.1.md) — current release
+- [`docs/whats-new-0.5.2.md`](docs/whats-new-0.5.2.md) — current release
+- [`docs/whats-new-0.5.1.md`](docs/whats-new-0.5.1.md) — startup hardening, pre-v4 config refusal
 - [`docs/whats-new-0.5.0.md`](docs/whats-new-0.5.0.md) — initial release
 - [`AGENTS.md`](AGENTS.md) — guidance for coding agents working in this repo

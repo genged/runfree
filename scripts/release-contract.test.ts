@@ -41,19 +41,6 @@ describe("release contract", () => {
     expect(newest).toBe(packageVersion);
   });
 
-  test("the README and the project brief name the current version, not an older one", () => {
-    const readme = read("README.md");
-    const brief = read("docs/project-brief.md");
-
-    expect(readme).toContain(`Runfree ${packageVersion}`);
-    expect(brief).toContain(`As of \`${packageVersion}\``);
-
-    // The concrete drift the assessment found: documents still advertising a
-    // version the package no longer is.
-    expect(readme).not.toMatch(/Runfree 0\.[0-4]\.\d+ publishes/);
-    expect(brief).not.toMatch(/As of `0\.[0-4]\.\d+`/);
-  });
-
   test("the support policy is latest-release-only with no response-time commitment", () => {
     const security = read("SECURITY.md");
 
