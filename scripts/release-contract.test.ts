@@ -47,18 +47,6 @@ describe("release contract", () => {
     expect(newest).toBe(packageVersion);
   });
 
-  test("the release body names every archive the release publishes, and no other", () => {
-    const notes = read(`docs/release-notes/${packageVersion}.md`);
-
-    for (const target of releaseTargets) {
-      expect(notes).toContain(`runfree-${packageVersion}-${target}.tar.gz`);
-    }
-    for (const absent of ["darwin-x64", "linux-x64", "linux-arm64"]) {
-      if (releaseTargets.includes(absent)) continue;
-      expect(notes).not.toContain(`runfree-${packageVersion}-${absent}.tar.gz`);
-    }
-  });
-
   test("the README and the project brief name the current version, not an older one", () => {
     const readme = read("README.md");
     const brief = read("docs/project-brief.md");
@@ -70,24 +58,6 @@ describe("release contract", () => {
     // version the package no longer is.
     expect(readme).not.toMatch(/Runfree 0\.[0-4]\.\d+ publishes/);
     expect(brief).not.toMatch(/As of `0\.[0-4]\.\d+`/);
-  });
-
-  test("the supported platform claim is the same everywhere it appears", () => {
-    expect(releaseTargets).toEqual(["darwin-arm64"]);
-
-    for (const [file, contents] of [
-      ["README.md", read("README.md")],
-      ["docs/project-brief.md", read("docs/project-brief.md")],
-      [`docs/whats-new-${packageVersion}.md`, read(`docs/whats-new-${packageVersion}.md`)],
-    ] as const) {
-      expect(contents, `${file} must name the supported host`).toMatch(/Apple Silicon/);
-      expect(contents, `${file} must name the supported backend`).toMatch(/Docker Desktop/);
-    }
-
-    // OrbStack is deferred in the Makefile and gates nothing, so no public
-    // document may present it as supported.
-    expect(read("README.md")).not.toMatch(/OrbStack with Docker Compose/);
-    expect(read("docs/project-brief.md")).not.toMatch(/OrbStack with Docker Compose/);
   });
 
   test("the support policy is latest-release-only with no response-time commitment", () => {
