@@ -69,8 +69,16 @@ export function stageLongLivedAgentBinary(fixture: LiveFixture): void {
 
 /** Where the first-request stub records its first answer, relative to the project root. */
 export const FIRST_REQUEST_RESULT_RELATIVE_PATH = path.join(".runfree-first-request", "result");
-/** The allowlisted host the first-request stub sends its first request to. */
-export const FIRST_REQUEST_HOST = "api.github.com";
+/**
+ * The allowlisted host the first-request stub sends its first request to.
+ *
+ * Reserved under `.invalid` (RFC 6761), so it never resolves: the proxy admits
+ * and forwards the request, the upstream lookup fails, and the stub records the
+ * proxy's 502. What the tranches prove is that the proxy let the request
+ * through, not that some upstream answered it, so no public service — and no
+ * public service's rate limit — sits in the result.
+ */
+export const FIRST_REQUEST_HOST = "runfree-first-request.invalid";
 const FIRST_REQUEST_CONTAINER_DIR = "/workspace/.runfree-first-request";
 const FIRST_REQUEST_STUB_FILENAME = "first-request-claude.sh";
 
@@ -82,21 +90,26 @@ const FIRST_REQUEST_STUB_FILENAME = "first-request-claude.sh";
  * first request is issued by the container's first project-controlled process
  * with no retry, so the recorded code is exactly what a client that connects
  * at start sees. Behind the session entry it lands after activation and is
- * answered by the allowlisted upstream; without the entry it lands in the
- * pre-activation window and is refused 403. The stub stays up afterwards
+ * admitted and forwarded (answered 502, since the host never resolves);
+ * without the entry it lands in the pre-activation window and the proxy
+ * refuses it 403 with `x-runfree-blocked`. The stub stays up afterwards
  * rather than exiting so the attached tranche keeps a session to act on.
  *
  * The result is written to the workspace bind mount, where the host reads it
  * without `docker exec`, and renamed into place so a partial write is never
- * read as an answer.
+ * read as an answer. The response headers and body are kept beside it, so a
+ * failure can say whether the proxy refused the request (`x-runfree-blocked`)
+ * and why.
  */
 const FIRST_REQUEST_STUB = `#!/bin/sh
 # Live-fixture Claude stand-in. Not a production artifact.
 ${resumeStub()}
 dir="${FIRST_REQUEST_CONTAINER_DIR}"
 mkdir -p "$dir"
-code="$(curl -sS --max-time 30 -o /dev/null -w '%{http_code}' "https://${FIRST_REQUEST_HOST}/" 2>"$dir/stderr.tmp" || true)"
+code="$(curl -sS --max-time 30 -D "$dir/headers.tmp" -o "$dir/body.tmp" -w '%{http_code}' "https://${FIRST_REQUEST_HOST}/" 2>"$dir/stderr.tmp" || true)"
 mv "$dir/stderr.tmp" "$dir/stderr" 2>/dev/null
+mv "$dir/headers.tmp" "$dir/headers" 2>/dev/null
+mv "$dir/body.tmp" "$dir/body" 2>/dev/null
 printf '%s\\n' "$code" > "$dir/result.tmp" && mv "$dir/result.tmp" "$dir/result"
 exec sleep 3600
 `;
@@ -121,6 +134,12 @@ export function stageFirstRequestAgentBinary(fixture: LiveFixture): void {
 export const EARLY_ENTRY_RESPONSE_RELATIVE_PATH = path.join(".runfree-early-entry", "response");
 const EARLY_ENTRY_CONTAINER_DIR = "/workspace/.runfree-early-entry";
 const EARLY_ENTRY_STUB_FILENAME = "early-session-entry.sh";
+/**
+ * The early stub only establishes a CONNECT and never sends a request through
+ * it, so the proxy contacts no upstream; the host just has to be allowlisted by
+ * the base fixture for the CONNECT to be established.
+ */
+const EARLY_ENTRY_CONNECT_HOST = "api.github.com";
 
 /**
  * A project image that replaces the base image's session entry with one that
@@ -143,7 +162,7 @@ dir="${EARLY_ENTRY_CONTAINER_DIR}"
 mkdir -p "$dir"
 i=0
 while [ "$i" -lt 240 ]; do
-  printf 'CONNECT ${FIRST_REQUEST_HOST}:443 HTTP/1.1\\r\\nHost: ${FIRST_REQUEST_HOST}:443\\r\\nConnection: close\\r\\n\\r\\n' \\
+  printf 'CONNECT ${EARLY_ENTRY_CONNECT_HOST}:443 HTTP/1.1\\r\\nHost: ${EARLY_ENTRY_CONNECT_HOST}:443\\r\\nConnection: close\\r\\n\\r\\n' \\
     | nc -w 5 "$PROXY_IP" 8080 > "$dir/response.tmp" 2>/dev/null
   if [ -s "$dir/response.tmp" ]; then
     mv "$dir/response.tmp" "$dir/response"

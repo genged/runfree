@@ -22,8 +22,9 @@
 // long-lived stand-in that sends one real request to an allowlisted host the
 // moment it starts and records the answer. That first request is the
 // activation-gate design's positive live proof (T5): behind the session entry
-// it lands after activation and succeeds, where the real CLI used to be
-// answered 403 and exit. What runs inside the container beyond that is not
+// it lands after activation and the proxy forwards it, where the real CLI used
+// to be answered 403 and exit. The host is reserved and never resolves, so the
+// proof depends on no public service. What runs inside the container beyond that is not
 // what this tranche proves; the stub stays up so the attached window can be
 // read. The gate's reclaim proof (T7) lives here too, because only the
 // production launch activates.
@@ -40,6 +41,7 @@ import { PROJECT_ID_LABEL } from "../../../packages/cli/src/runtime/constants.ts
 import { tryAcquireProjectLifecycleLock } from "../../../packages/cli/src/runtime/sessions.ts";
 import type { PendingApprovalRecord } from "../../../packages/runtime-contracts/src/write-approvals.ts";
 import { FIRST_REQUEST_HOST } from "./agent-stub.ts";
+import { admittedToUnresolvableHost, proxyAdmittedEventCount } from "./proxy-answer.ts";
 import {
   composeProjectName,
   composeServiceContainerId,
@@ -78,6 +80,7 @@ import {
   containerExitState,
   enforcedSessionSetIps,
   firewallSetIpsThroughProductCommand,
+  firstRequestAnswer,
   firstRequestResult,
   parseLaunchReport,
   pollUntil,
@@ -156,6 +159,7 @@ describe("attached per-session authority is exact and drift after the proof fail
     // earlier case was also enforced.
     assertSessionAuthorityExactly([], "before any session");
 
+    const admittedBefore = proxyAdmittedEventCount(proxyId, FIRST_REQUEST_HOST);
     const launch = await startAttachedLaunch(fixture);
     const [record] = launch.attached.records;
     expect(record, `the launch observed no attached record: ${JSON.stringify(launch.attached)}`).toBeDefined();
@@ -166,13 +170,18 @@ describe("attached per-session authority is exact and drift after the proof fail
     try {
       assertSessionAuthorityExactly([record.sourceIp], "while attached");
       // T5 (activation-gate design): the stub's very first request — sent
-      // the moment the agent process started, with no retry — was answered
-      // by the allowlisted upstream. Without the session entry the agent's
-      // first request lands before activation and the proxy answers 403.
+      // the moment the agent process started, with no retry — was admitted
+      // and forwarded by the proxy. Without the session entry the agent's
+      // first request lands before activation and the proxy refuses it 403
+      // with `x-runfree-blocked`. The host never resolves, so a forwarded
+      // request comes back as the proxy's upstream-failure 502.
+      const first = firstRequestAnswer(fixture, await firstRequestResult(fixture));
+      expect(first.blocked, `the proxy refused the agent's first request at start: ${first.detail}`).toBeUndefined();
+      expect(admittedToUnresolvableHost(first), `the agent's first request was not forwarded: ${first.detail}`).toBe(true);
       expect(
-        await firstRequestResult(fixture),
-        "the agent's first request at start was not answered by the allowlisted upstream",
-      ).toBe("200");
+        proxyAdmittedEventCount(proxyId, FIRST_REQUEST_HOST),
+        "the proxy logged no admission for the agent's first request",
+      ).toBeGreaterThan(admittedBefore);
     } finally {
       // The session must end even when a readback assertion throws, or its
       // admitted source IP and container survive into the next case.

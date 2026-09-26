@@ -70,6 +70,7 @@ import {
   type LiveRuntimeBackend,
   type StandingSessionHandle,
 } from "./fixture.ts";
+import { answeredByUpstream, curlProbeCommand, parseProbeAnswer } from "./proxy-answer.ts";
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
 const PROVISION_TIMEOUT_MS = 30 * 60_000;
@@ -563,9 +564,13 @@ describe("egress containment inside a live per-session agent", () => {
   }, TEST_TIMEOUT_MS);
 
   test("an allowlisted host is reachable through the proxy", () => {
-    const probe = sessionExec(sessionId,
-      "curl -sS --retry 3 --retry-delay 1 --retry-all-errors --max-time 15 -o /dev/null -w '%{http_code}' https://api.github.com/rate_limit");
-    expect(probe.stdout.trim(), `allowlisted host was not reachable: ${describeOutput(probe.output)}`).toBe("200");
+    // End to end on purpose: the answer must come from the real upstream,
+    // through the firewall's resolved allowed_ipv4 set. Any answer the
+    // upstream gave counts (see `proxy-answer.ts`); example.net is IANA's and
+    // not rate-limited, and is allowlisted by the base fixture.
+    const probe = sessionExec(sessionId, curlProbeCommand("https://example.net/", { maxTimeSeconds: 15, retries: 3 }));
+    expect(answeredByUpstream(parseProbeAnswer(probe.stdout)), `allowlisted host was not reachable: ${describeOutput(probe.output)}`)
+      .toBe(true);
   }, TEST_TIMEOUT_MS);
 
   test("direct egress fails with the proxy environment unset", () => {

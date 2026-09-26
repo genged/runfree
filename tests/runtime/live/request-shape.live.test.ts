@@ -14,6 +14,13 @@
 // that state's behavioral probes; `afterAll` ends it before the next state
 // mutates. `runfree approvals`/`approve` do not quiesce, so approve-on-write
 // runs inside a held session.
+//
+// The rules under test live on reserved `.invalid` hosts that never resolve
+// (see `proxy-answer.ts`): every claim here is about the proxy's decision, so
+// an admitted request is read as the proxy's upstream-failure 502 plus an
+// `admitted` event, and no public service or its rate limit is involved. The
+// approve-on-write cases stay on `api.github.com` for its service-specific
+// approval wording; those writes are held and denied, never forwarded.
 
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -25,6 +32,12 @@ import { nodeRuntimeIO } from "../../../packages/cli/src/runtime.ts";
 import { readPendingApprovals, touchWatcherHeartbeat } from "../../../packages/cli/src/runtime/approvals.ts";
 
 import { composeProjectName, composeServiceContainerId, docker, dockerOrThrow } from "./docker.ts";
+import {
+  admittedToUnresolvableHost,
+  curlProbeCommand,
+  parseProbeAnswer,
+  proxyAdmittedEventCount,
+} from "./proxy-answer.ts";
 import {
   describeOutput,
   destroyLiveFixture,
@@ -39,6 +52,10 @@ import {
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
 const PROVISION_TIMEOUT_MS = 30 * 60_000;
 const TEST_TIMEOUT_MS = 12 * 60_000;
+/** Carries the method rules: read-only, then cleared, then `--write allow`. */
+const METHOD_HOST = "runfree-shape-methods.invalid";
+/** Carries the git-push deny rule. */
+const GIT_HOST = "runfree-shape-git.invalid";
 
 function requiredBackend(): LiveRuntimeBackend {
   const backend = process.env.TEST_RUNTIME_BACKEND;
@@ -54,6 +71,13 @@ function sessionExec(id: string, script: string): CaptureResult {
 
 function proxyStartedAt(proxyId: string): string {
   return dockerOrThrow("proxy start time", ["inspect", "-f", "{{.State.StartedAt}}", proxyId]);
+}
+
+/** Allowlists a probe host; converges live before any session starts. */
+function assertConvergedHostAdd(fixture: LiveFixture, host: string): void {
+  const added = fixture.runfree(["host", "add", host]);
+  expect(added.status, `host add ${host} failed: ${describeOutput(added.output)}`).toBe(0);
+  expect(added.stdout, `host add ${host} did not converge live`).toMatch(/effective policy: live now \(effective policy generation sha256:/u);
 }
 
 /** A desired-policy mutation that must converge live and not restart the proxy. */
@@ -83,6 +107,8 @@ describe("request-shape enforcement", () => {
     requiredBackend();
     fixture = provisionSandboxFixture(REPO_ROOT);
     proxyId = composeServiceContainerId(composeProjectName(fixture), "proxy");
+    assertConvergedHostAdd(fixture, METHOD_HOST);
+    assertConvergedHostAdd(fixture, GIT_HOST);
   }, PROVISION_TIMEOUT_MS);
 
   afterAll(() => {
@@ -95,17 +121,17 @@ describe("request-shape enforcement", () => {
 
     beforeAll(async () => {
       const startedAtBefore = proxyStartedAt(proxyId);
-      assertConvergedMutation(fixture.runfree(["host", "rules", "api.github.com", "--read-only"]), "api.github.com", "read-only rule");
-      assertConvergedMutation(fixture.runfree(["host", "rules", "github.com", "--deny-git-push"]), "github.com", "git-push deny rule");
+      assertConvergedMutation(fixture.runfree(["host", "rules", METHOD_HOST, "--read-only"]), METHOD_HOST, "read-only rule");
+      assertConvergedMutation(fixture.runfree(["host", "rules", GIT_HOST, "--deny-git-push"]), GIT_HOST, "git-push deny rule");
       // Null second run: re-applying a converged rule is a no-op that still exits
       // 0 and does not restart the proxy.
-      const second = fixture.runfree(["host", "rules", "api.github.com", "--read-only"]);
+      const second = fixture.runfree(["host", "rules", METHOD_HOST, "--read-only"]);
       expect(second.status, `re-applying the read-only rule failed: ${describeOutput(second.output)}`).toBe(0);
       expect(proxyStartedAt(proxyId), "applying request rules restarted the proxy").toBe(startedAtBefore);
       // The persisted rules read back authoritatively, not from the write log.
-      expect(fixture.runfree(["host", "rules", "api.github.com"]).output, "method rule not persisted")
+      expect(fixture.runfree(["host", "rules", METHOD_HOST]).output, "method rule not persisted")
         .toContain("methods=GET,HEAD,OPTIONS");
-      expect(fixture.runfree(["host", "rules", "github.com"]).output, "git-push deny not persisted").toContain("gitPush=deny");
+      expect(fixture.runfree(["host", "rules", GIT_HOST]).output, "git-push deny not persisted").toContain("gitPush=deny");
       standing = await startStandingSession(fixture);
       sessionId = standing.session.containerId;
     }, PROVISION_TIMEOUT_MS);
@@ -115,16 +141,19 @@ describe("request-shape enforcement", () => {
     }, PROVISION_TIMEOUT_MS);
 
     test("a read-only GET succeeds while a POST receives the in-tunnel method denial with no credential", () => {
-      const get = sessionExec(sessionId,
-        "curl -sS --retry 3 --retry-delay 1 --retry-all-errors --max-time 15 -o /dev/null -w '%{http_code}' https://api.github.com/rate_limit");
-      expect(get.stdout.trim(), `read-only GET failed: ${describeOutput(get.output)}`).toBe("200");
+      const admittedBefore = proxyAdmittedEventCount(proxyId, METHOD_HOST);
+      const get = sessionExec(sessionId, curlProbeCommand(`https://${METHOD_HOST}/rate_limit`, { maxTimeSeconds: 15 }));
+      expect(admittedToUnresolvableHost(parseProbeAnswer(get.stdout)), `read-only GET was not admitted: ${describeOutput(get.output)}`)
+        .toBe(true);
+      expect(proxyAdmittedEventCount(proxyId, METHOD_HOST), "the proxy logged no admission for the read-only GET")
+        .toBeGreaterThan(admittedBefore);
 
       // Verbose allowed-request logging, so a forwarded POST would be visible.
       docker(["exec", "--user", "0:0", proxyId, "sh", "-c", "mkdir -p /run/runfree-proxy-verbose && touch /run/runfree-proxy-verbose/sandbox"]);
       const post = sessionExec(sessionId, `
         set -euo pipefail
         rm -f /tmp/shape-headers.txt /tmp/shape-body.txt
-        http_code="$(curl -sS --max-time 10 -X POST -D /tmp/shape-headers.txt -o /tmp/shape-body.txt -w '%{http_code}' 'https://api.github.com/rate_limit?shape_probe_param=should-not-be-logged')"
+        http_code="$(curl -sS --max-time 10 -X POST -D /tmp/shape-headers.txt -o /tmp/shape-body.txt -w '%{http_code}' 'https://${METHOD_HOST}/rate_limit?shape_probe_param=should-not-be-logged')"
         printf 'http_code=%s\\n' "$http_code"
         cat /tmp/shape-headers.txt
         cat /tmp/shape-body.txt
@@ -137,48 +166,68 @@ describe("request-shape enforcement", () => {
       expect(out, "method denial does not name the method").toContain("method: POST");
       expect(out, "method denial does not name the allowed set").toContain("(allowed: GET, HEAD, OPTIONS)");
       expect(out, "method denial does not suggest the exact widening command")
-        .toContain("runfree host rules api.github.com --method GET --method HEAD --method OPTIONS --method POST");
+        .toContain(`runfree host rules ${METHOD_HOST} --method GET --method HEAD --method OPTIONS --method POST`);
       expect(out.toLowerCase(), "denial response carries an injected credential").not.toContain("authorization:");
       expect(out, "denial response carries a bearer value").not.toContain("Bearer ");
 
       const logs = dockerOrThrow("proxy logs", ["logs", "--tail", "400", proxyId]);
       expect(logs, "structured method-denial event missing")
-        .toContain('"reason":"method-not-allowed","host":"api.github.com","method":"POST"');
+        .toContain(`"reason":"method-not-allowed","host":"${METHOD_HOST}","method":"POST"`);
       expect(logs, "method denial event leaked the query string").not.toContain("shape_probe_param");
-      expect(logs, "the denied POST was forwarded upstream").not.toContain("proxy: allowed method=POST scheme=https host=api.github.com");
+      expect(logs, "the denied POST was forwarded upstream").not.toContain(`proxy: allowed method=POST scheme=https host=${METHOD_HOST}`);
     }, TEST_TIMEOUT_MS);
 
-    test("git clone and fetch succeed while push is denied in-tunnel", () => {
-      // The real github.com is the subject: the proxy's git-push denial is what
-      // is under test, so a local bare remote (unproxied) could not prove it.
+    test("git fetch negotiation is admitted while push is denied in-tunnel", () => {
+      // The proxy's git-push denial is the subject, so the remote must sit
+      // behind the proxy; an unresolvable one does, and every request to it
+      // ends at the proxy's decision. Reads are proven by what the proxy did
+      // with them — admitted and forwarded (the upstream-failure 502) — for
+      // both halves of fetch negotiation: the upload-pack ref advertisement
+      // GET, and the upload-pack POST, which the git rule classifies as a read
+      // rather than a write.
+      const admittedBefore = proxyAdmittedEventCount(proxyId, GIT_HOST);
       const git = sessionExec(sessionId, `
-        set -euo pipefail
-        rm -rf /tmp/shape-git-clone
-        git clone --depth 1 https://github.com/octocat/Hello-World.git /tmp/shape-git-clone >/tmp/shape-git-clone.log 2>&1
-        cd /tmp/shape-git-clone
-        git fetch origin >/tmp/shape-git-fetch.log 2>&1
-        echo clone-and-fetch-ok
-        if git push origin HEAD:refs/heads/runfree-shape-denied-push >/tmp/shape-git-push.log 2>&1; then
+        set -uo pipefail
+        export GIT_TERMINAL_PROMPT=0
+        rm -rf /tmp/shape-git && mkdir -p /tmp/shape-git && cd /tmp/shape-git
+        git init -q && git -c user.name=probe -c user.email=probe@${GIT_HOST} commit -q --allow-empty -m probe
+        if git ls-remote https://${GIT_HOST}/probe.git >/tmp/shape-git-read.log 2>&1; then
+          echo read-unexpectedly-succeeded
+        else
+          echo "read-log: $(tr '\n' ' ' </tmp/shape-git-read.log)"
+        fi
+        if git push https://${GIT_HOST}/probe.git HEAD:refs/heads/runfree-shape-denied-push >/tmp/shape-git-push.log 2>&1; then
           echo push-unexpectedly-succeeded
         else
-          echo push-denied
-          cat /tmp/shape-git-push.log
+          echo "push-log: $(tr '\n' ' ' </tmp/shape-git-push.log)"
         fi
       `);
       expect(git.status, `gitPush probe failed: ${describeOutput(git.output)}`).toBe(0);
-      expect(git.output, "git clone/fetch did not succeed under gitPush deny").toContain("clone-and-fetch-ok");
-      expect(git.output, "git push was not denied").toContain("push-denied");
-      expect(git.output, "git push unexpectedly succeeded").not.toContain("push-unexpectedly-succeeded");
-      expect(git.output, "git did not surface the proxy denial").toContain("403");
+      const readLog = git.stdout.split("\n").find((line) => line.startsWith("read-log: ")) ?? "";
+      const pushLog = git.stdout.split("\n").find((line) => line.startsWith("push-log: ")) ?? "";
+      expect(readLog, `the ref advertisement was not forwarded: ${describeOutput(git.output)}`).toContain("error: 502");
+      expect(pushLog, `git push was not denied by the proxy: ${describeOutput(git.output)}`).toContain("error: 403");
+
+      const uploadPack = sessionExec(sessionId, curlProbeCommand(`https://${GIT_HOST}/probe.git/git-upload-pack`, {
+        method: "POST",
+        maxTimeSeconds: 15,
+      }));
+      expect(
+        admittedToUnresolvableHost(parseProbeAnswer(uploadPack.stdout)),
+        `the upload-pack POST was not admitted as a read: ${describeOutput(uploadPack.output)}`,
+      ).toBe(true);
+      expect(proxyAdmittedEventCount(proxyId, GIT_HOST), "the proxy did not log admitting both fetch requests")
+        .toBeGreaterThanOrEqual(admittedBefore + 2);
+
       const logs = dockerOrThrow("proxy logs", ["logs", "--tail", "400", proxyId]);
-      expect(logs, "structured git-push denial event missing").toContain('"reason":"git-push-denied","host":"github.com"');
+      expect(logs, "structured git-push denial event missing").toContain(`"reason":"git-push-denied","host":"${GIT_HOST}"`);
     }, TEST_TIMEOUT_MS);
 
     test("runfree doctor suggests the exact method-widening command", () => {
       const doctor = fixture.runfree(["doctor"]);
-      expect(doctor.output, "doctor does not report the shape denial").toContain("api.github.com blocked by request rules");
+      expect(doctor.output, "doctor does not report the shape denial").toContain(`${METHOD_HOST} blocked by request rules`);
       expect(doctor.output, "doctor does not suggest method widening")
-        .toContain("runfree host rules api.github.com --method GET --method HEAD --method OPTIONS --method POST");
+        .toContain(`runfree host rules ${METHOD_HOST} --method GET --method HEAD --method OPTIONS --method POST`);
     }, TEST_TIMEOUT_MS);
   });
 
@@ -187,9 +236,9 @@ describe("request-shape enforcement", () => {
     let sessionId: string;
 
     beforeAll(async () => {
-      assertConvergedMutation(fixture.runfree(["host", "rules", "api.github.com", "--clear"]), "api.github.com", "clear api rules");
-      assertConvergedMutation(fixture.runfree(["host", "rules", "github.com", "--clear"]), "github.com", "clear git rules");
-      expect(fixture.runfree(["host", "rules", "api.github.com"]).output, "api rules not cleared")
+      assertConvergedMutation(fixture.runfree(["host", "rules", METHOD_HOST, "--clear"]), METHOD_HOST, "clear method rules");
+      assertConvergedMutation(fixture.runfree(["host", "rules", GIT_HOST, "--clear"]), GIT_HOST, "clear git rules");
+      expect(fixture.runfree(["host", "rules", METHOD_HOST]).output, "method rules not cleared")
         .toContain("none (all methods, all paths, git push allowed)");
       standing = await startStandingSession(fixture);
       sessionId = standing.session.containerId;
@@ -200,12 +249,12 @@ describe("request-shape enforcement", () => {
     }, PROVISION_TIMEOUT_MS);
 
     test("an unruled POST fails closed under the ask default with no approver", () => {
-      const probe = sessionExec(sessionId, "curl -sS --max-time 30 -X POST https://api.github.com/rate_limit");
+      const probe = sessionExec(sessionId, `curl -sS --max-time 30 -X POST https://${METHOD_HOST}/rate_limit`);
       expect(probe.output, "unruled POST did not fail closed under the ask default")
         .toContain("writes need approval but no approver is attached");
       const logs = dockerOrThrow("proxy logs", ["logs", "--tail", "400", proxyId]);
       expect(logs, "structured write-approval denial event missing")
-        .toContain('"reason":"write-approval-required","host":"api.github.com"');
+        .toContain(`"reason":"write-approval-required","host":"${METHOD_HOST}"`);
     }, TEST_TIMEOUT_MS);
 
     test("approve-on-write resolves a held write through the root-owned decision channel", async () => {
@@ -259,8 +308,8 @@ describe("request-shape enforcement", () => {
     let sessionId: string;
 
     beforeAll(async () => {
-      assertConvergedMutation(fixture.runfree(["host", "rules", "api.github.com", "--write", "allow"]), "api.github.com", "write allow");
-      expect(fixture.runfree(["host", "rules", "api.github.com"]).output, "write action not persisted").toContain("writeAction=allow");
+      assertConvergedMutation(fixture.runfree(["host", "rules", METHOD_HOST, "--write", "allow"]), METHOD_HOST, "write allow");
+      expect(fixture.runfree(["host", "rules", METHOD_HOST]).output, "write action not persisted").toContain("writeAction=allow");
       standing = await startStandingSession(fixture);
       sessionId = standing.session.containerId;
     }, PROVISION_TIMEOUT_MS);
@@ -269,14 +318,15 @@ describe("request-shape enforcement", () => {
       if (standing) await standing.release();
     }, PROVISION_TIMEOUT_MS);
 
-    test("a POST is no longer denied after --write allow", async () => {
-      let code = "";
+    test("a POST is admitted and forwarded after --write allow", async () => {
+      let output = "";
       await pollUntil(() => {
-        code = sessionExec(sessionId,
-          "curl -sS --max-time 10 -o /dev/null -w '%{http_code}' -X POST https://api.github.com/rate_limit").stdout.trim();
-        return code !== "" && code !== "403";
-      }, { timeoutMs: 20_000, label: "the POST to be allowed after --write allow" });
-      expect(code, "POST still denied after --write allow").not.toBe("403");
+        const probe = sessionExec(sessionId, curlProbeCommand(`https://${METHOD_HOST}/rate_limit`, { method: "POST", maxTimeSeconds: 10 }));
+        output = probe.output;
+        return admittedToUnresolvableHost(parseProbeAnswer(probe.stdout));
+      }, { timeoutMs: 20_000, label: "the POST to be admitted after --write allow" }).catch((error: unknown) => {
+        throw new Error(`${String(error)}; last answer: ${describeOutput(output)}`);
+      });
     }, TEST_TIMEOUT_MS);
   });
 });

@@ -52,6 +52,7 @@ import {
 } from "./agent-stub.ts";
 import { docker, dockerOrThrow } from "./docker.ts";
 import { describeOutput, type LiveFixture, type LiveRuntimeBackend } from "./fixture.ts";
+import { parseProbeAnswer, type ProbeAnswer } from "./proxy-answer.ts";
 import { cliEntryArgv, sessionAdmissionCrashEntryArgv } from "../../support/prebuilt-entry.ts";
 export const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
 export const PROVISION_TIMEOUT_MS = 30 * 60_000;
@@ -277,6 +278,25 @@ export async function firstRequestResult(fixture: LiveFixture): Promise<string> 
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
   return fs.readFileSync(resultPath, "utf8").trim();
+}
+
+/**
+ * What the proxy answered the first-request stub with, read from the headers
+ * the stub saved, plus a description of the saved response for a failure.
+ */
+export function firstRequestAnswer(fixture: LiveFixture, code: string): ProbeAnswer & Readonly<{ detail: string }> {
+  const dir = path.join(fixture.projectRoot, path.dirname(FIRST_REQUEST_RESULT_RELATIVE_PATH));
+  const read = (name: string): string | undefined => {
+    const file = path.join(dir, name);
+    return fs.existsSync(file) ? fs.readFileSync(file, "utf8") : undefined;
+  };
+  const answer = parseProbeAnswer(read("headers") ?? "", code);
+  const body = describeOutput((read("body") ?? "<no body>").slice(0, 400));
+  const stderr = describeOutput(read("stderr") ?? "<no stderr>");
+  return {
+    ...answer,
+    detail: `code ${answer.code}; x-runfree-blocked: ${answer.blocked ?? "<absent>"}; body: ${body}; curl stderr: ${stderr}`,
+  };
 }
 
 /** Removes a previous case's recorded first request so each launch is judged on its own. */

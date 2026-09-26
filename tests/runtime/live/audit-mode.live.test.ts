@@ -34,6 +34,7 @@ import {
   startStandingSession,
   type StandingSessionHandle,
 } from "./fixture.ts";
+import { answeredByUpstream, curlProbeCommand, parseProbeAnswer } from "./proxy-answer.ts";
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
 const PROVISION_TIMEOUT_MS = 30 * 60_000;
@@ -120,8 +121,10 @@ describe("network audit mode observes without enforcing", () => {
   }, TEST_TIMEOUT_MS);
 
   test("a non-allowlisted public host is observed and permitted, but never enters the enforce allowlist", async () => {
+    // The upstream itself must answer (any answer counts, see
+    // `proxy-answer.ts`): that is what proves audit_ipv4 let the proxy out.
     await pollUntil(
-      () => sessionExec(sessionId, `curl -sS --max-time 10 -o /tmp/audit-observed.html -w '%{http_code}' https://${AUDITED_HOST}/`).stdout.trim() === "200",
+      () => answeredByUpstream(parseProbeAnswer(sessionExec(sessionId, curlProbeCommand(`https://${AUDITED_HOST}/`, { maxTimeSeconds: 10 })).stdout)),
       { timeoutMs: 40_000, label: `${AUDITED_HOST} to become reachable under audit` },
     );
     const logs = dockerOrThrow("proxy logs", ["logs", "--tail", "600", proxyId]);

@@ -38,6 +38,7 @@ import {
   unexplainedAdmittedIps,
   type StandingSessionHandle,
 } from "./fixture.ts";
+import { answeredByUpstream, curlProbeCommand, parseProbeAnswer } from "./proxy-answer.ts";
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
 const PROVISION_TIMEOUT_MS = 30 * 60_000;
@@ -156,9 +157,14 @@ describe("empty allowlist is a fully enforced deny-all, not a startup failure", 
     }, PROVISION_TIMEOUT_MS);
 
     test("emptying the desired policy does not change live enforcement until approved", () => {
+      // Reachability is end to end (the upstream itself answered), so it
+      // proves the live firewall set as well as the proxy policy.
       const baseline = sessionExec(sessionId,
-        `curl -sS --retry 3 --retry-delay 1 --retry-all-errors --max-time 15 -o /dev/null -w '%{http_code}' https://${REFERENCE_HOST}${REFERENCE_PATH}`);
-      expect(baseline.stdout.trim(), `baseline: ${REFERENCE_HOST} was not reachable before emptying: ${describeOutput(baseline.output)}`).toBe("200");
+        curlProbeCommand(`https://${REFERENCE_HOST}${REFERENCE_PATH}`, { maxTimeSeconds: 15, retries: 3 }));
+      expect(
+        answeredByUpstream(parseProbeAnswer(baseline.stdout)),
+        `baseline: ${REFERENCE_HOST} was not reachable before emptying: ${describeOutput(baseline.output)}`,
+      ).toBe(true);
 
       preEmptyGeneration = firewallGeneration(proxyId);
       expect(preEmptyGeneration, "could not read the firewall generation before emptying").toBeTruthy();
@@ -171,8 +177,11 @@ describe("empty allowlist is a fully enforced deny-all, not a startup failure", 
       while (Date.now() - start < 2000) { /* settle */ }
       expect(firewallGeneration(proxyId), "an unapproved desired policy changed the live firewall generation").toBe(preEmptyGeneration);
       const stillReachable = sessionExec(sessionId,
-        `curl -sS --retry 2 --retry-delay 1 --retry-all-errors --max-time 15 -o /dev/null -w '%{http_code}' https://${REFERENCE_HOST}${REFERENCE_PATH}`);
-      expect(stillReachable.stdout.trim(), "an unapproved desired edit changed live egress").toBe("200");
+        curlProbeCommand(`https://${REFERENCE_HOST}${REFERENCE_PATH}`, { maxTimeSeconds: 15, retries: 2 }));
+      expect(
+        answeredByUpstream(parseProbeAnswer(stillReachable.stdout)),
+        `an unapproved desired edit changed live egress: ${describeOutput(stillReachable.output)}`,
+      ).toBe(true);
     }, TEST_TIMEOUT_MS);
   });
 

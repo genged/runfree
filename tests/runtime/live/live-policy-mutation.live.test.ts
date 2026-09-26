@@ -32,6 +32,7 @@ import {
   type LiveRuntimeBackend,
   type StandingSessionHandle,
 } from "./fixture.ts";
+import { answeredByUpstream, curlProbeCommand, parseProbeAnswer } from "./proxy-answer.ts";
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
 const PROVISION_TIMEOUT_MS = 30 * 60_000;
@@ -185,11 +186,17 @@ describe("typed desired-policy mutations converge live sessions without restart 
     assertIdentityUnchanged(proxyBefore, "proxy after host add");
     assertIdentityUnchanged(sessionBefore, "live session after host add");
 
-    const reachable = sessionCurl(session.containerId, MUTATION_HOST);
+    // End to end: the upstream itself answered, so the added host reached the
+    // live firewall set as well as the proxy policy. Any upstream answer
+    // counts (see `proxy-answer.ts`).
+    const reachable = docker([
+      "exec", session.containerId, "zsh", "-lc",
+      curlProbeCommand(`https://${MUTATION_HOST}/`, { maxTimeSeconds: 20, retries: 2, insecure: true }),
+    ]);
     expect(
-      reachable.stdout.trim(),
+      answeredByUpstream(parseProbeAnswer(reachable.stdout)),
       `the added host was not reachable from the live session: ${describeOutput(reachable.output)}`,
-    ).toBe("200");
+    ).toBe(true);
   }, TEST_TIMEOUT_MS);
 
   test("host remove with several live sessions converges to denial in place", async () => {
