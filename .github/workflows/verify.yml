@@ -1,7 +1,7 @@
 name: Verify
 
-# The one public verification lane, called by the per-commit Test workflow.
-# The Release workflow does not call it: releases gate on unit tests only.
+# The one public verification lane, called by the per-commit Test workflow and
+# by the release lane at the release SHA, so the two cannot drift apart.
 #
 # This lane is deliberately unprivileged. It runs on pull requests from forks,
 # so it must never have write permissions, secrets, or a signing environment.

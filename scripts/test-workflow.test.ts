@@ -1,7 +1,7 @@
 // The shared verification lane, and the per-commit workflow that calls it.
 //
-// This asserts what the verification lane actually runs. Releases do not call it;
-// they gate on unit tests only (see scripts/release-workflow.test.ts).
+// This asserts what the verification lane actually runs. The release lane calls
+// it too, at the release SHA (see scripts/release-workflow.test.ts).
 
 import fs from "node:fs";
 import path from "node:path";

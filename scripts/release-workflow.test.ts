@@ -48,7 +48,8 @@ describe("release workflow", () => {
     expect(releaseJobs.resolve).toContain("run: scripts/resolve-release-tag.sh");
     expect(releaseJobs.resolve).toContain("sha: ${{ steps.release.outputs.sha }}");
 
-    for (const jobId of ["prepare", "unit-tests", "build-macos", "publish"]) {
+    expect(releaseJobs.verify).toContain("ref: ${{ needs.resolve.outputs.sha }}");
+    for (const jobId of ["prepare", "build-macos", "publish"]) {
       expect(releaseJobs[jobId], `${jobId} must check out the resolved SHA`).toContain(
         "ref: ${{ needs.resolve.outputs.sha }}",
       );
@@ -59,26 +60,22 @@ describe("release workflow", () => {
     }
   });
 
-  test("orders the gates so nothing is built before unit tests pass", () => {
+  test("orders the gates so nothing is built before verification passes", () => {
     expect(releaseJobs.prepare).toContain("needs: resolve");
     expect(releaseJobs.prepare).toContain("run: bash scripts/prepare-release.sh");
-    expect(releaseJobs["unit-tests"]).toContain("needs: [resolve, prepare]");
-    expect(releaseJobs["unit-tests"]).toContain("if: needs.prepare.outputs.ready == 'true'");
+    expect(releaseJobs.verify).toContain("needs: [resolve, prepare]");
+    expect(releaseJobs.verify).toContain("if: needs.prepare.outputs.ready == 'true'");
     expect(releaseJobs.resolve).toContain("EXPECTED_SHA: ${{ inputs.sha }}");
 
-    expect(releaseJobs["build-macos"]).toContain("needs: [resolve, prepare, unit-tests]");
-    expect(releaseJobs.publish).toContain("needs: [resolve, prepare, unit-tests, build-macos]");
+    expect(releaseJobs["build-macos"]).toContain("needs: [resolve, prepare, verify]");
+    expect(releaseJobs.publish).toContain("needs: [resolve, prepare, verify, build-macos]");
   });
 
-  test("runs only the unit tests before release", () => {
-    const unitTests = releaseJobs["unit-tests"];
-    expect(unitTests).toContain("run: make test-unit");
-    // The unit suite reads workspace sources, so it runs on a fresh clone with
-    // no `packages/*/dist` (guarded by scripts/workspace-source-exports.test.ts).
-    expect(unitTests).not.toContain("build:runtime");
-    expect(releaseWorkflow).not.toContain("uses: ./.github/workflows/verify.yml");
-    expect(releaseWorkflow).not.toContain("scripts/run-cli-e2e.sh");
-    expect(releaseWorkflow).not.toContain("make test-static");
+  test("runs the Test workflow's verification lane before release", () => {
+    // One definition of "this commit works": the release cannot pass a commit
+    // that Test fails, as v0.5.1 did when the release ran unit tests alone.
+    expect(releaseJobs.verify).toContain("uses: ./.github/workflows/verify.yml");
+    expect(releaseJobs.verify).toContain("artifact-namespace: ${{ needs.resolve.outputs.tag }}");
   });
 
   test("takes the build matrix from the central release target list", () => {
@@ -91,12 +88,8 @@ describe("release workflow", () => {
   });
 
   test("installs pnpm and workspace dependencies in every job that builds or tests", () => {
-    for (const jobId of ["unit-tests", "build-macos"]) {
-      expect(releaseJobs[jobId], `${jobId} needs pnpm`).toContain("uses: pnpm/action-setup@");
-      expect(releaseJobs[jobId], `${jobId} needs its own dependencies`).toContain(
-        "run: pnpm install --frozen-lockfile",
-      );
-    }
+    expect(releaseJobs["build-macos"]).toContain("uses: pnpm/action-setup@");
+    expect(releaseJobs["build-macos"]).toContain("run: pnpm install --frozen-lockfile");
     // Packaging shells out to pnpm; Node and Bun from another job do not supply
     // the workspace.
     expect(releaseJobs["build-macos"].indexOf("pnpm install --frozen-lockfile")).toBeLessThan(

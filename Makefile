@@ -39,9 +39,8 @@ help:
 test: test-static test-unit
 
 # The pre-tag release gate: what the Test workflow runs on the pushed release
-# commit, so a tag is never published from a commit that Test then fails. The
-# Release workflow gates on unit tests alone and never reads Test's result.
-# Asset freshness is left out: the release regenerates and commits the assets
+# commit. The release lane runs the same checks in CI; this catches a failure
+# before the tag exists instead of after it is pushed. Asset freshness is left out: the release regenerates and commits the assets
 # itself. No live runtime; that stays in test-all.
 test-release: test-static test-unit test-templates test-cli-e2e
 

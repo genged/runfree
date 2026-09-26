@@ -274,7 +274,8 @@ Details: [Write Approval Grants](architecture.md#write-approval-grants).
   unit tests only.
 - **Audit set emptiness** in enforce mode is checked only by the proxy's own
   firewall supervisor. The host proof checks set shape, not members.
-- **The release pipeline** runs unit tests only. `make test-runtime` needs a
+- **The release pipeline** runs the Test workflow's checks (static, unit,
+  templates, packaged offline E2E), not the live runtime suite. `make test-runtime` needs a
   Docker host and runs by hand. A release has proven it only if its
   acceptance record says so.
 
