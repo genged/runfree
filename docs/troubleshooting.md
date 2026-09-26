@@ -76,6 +76,84 @@ Common cases:
 - **Docker is not reachable.** Runfree needs Docker Desktop running with Docker
   Compose. Check `docker version` first.
 
+## The config is refused as pre-v4
+
+```text
+runfree error: .runfree/runfree.json uses config version 3, which this release no longer migrates
+  move .runfree aside and run `runfree init` to create a current configuration, then re-add hosts and services
+```
+
+Since 0.5.1, a `.runfree/runfree.json` below version 4, or one that still has
+the removed `agent`, `paths`, or `project.*` keys (other than `project.name`),
+is refused by every command, `init` included. Only pre-release installs can
+have one: 0.5.0 already wrote version 4. The refusal happens before anything is
+written.
+
+```bash
+mv .runfree .runfree.pre-v4
+runfree init
+runfree host add <host>        # re-add what the old policy allowed
+```
+
+Use `.runfree.pre-v4/network-policy.json` as the list of hosts and services to
+re-add, then delete the old directory.
+
+## Leftover helpers could not be confirmed removed
+
+```text
+runfree error: ephemeral helpers could not be confirmed removed (...); run `runfree up` to retry, or `runfree destroy --force` to reset the project
+```
+
+Startup runs short-lived helper containers (deny probes, CA bundle render,
+dependency preparation). If an earlier run died while one was active, the next
+`up`, launch, or `runtime reload-policy --force` removes them before it admits
+any session. This refusal means that cleanup could not prove they are gone:
+Docker was slow or a listing failed. Nothing was started.
+
+```bash
+runfree up                 # retry; usually enough once Docker is responsive
+runfree destroy --force    # reset the project runtime if it keeps failing
+```
+
+`destroy --force` ends live sessions. See
+[Ephemeral Helpers](architecture.md#ephemeral-helpers) for the mechanism.
+
+## No free helper address
+
+```text
+runfree error: ... denial probe did not run: no free ephemeral-helper address in 172.x.y.13-.19 on agent_internal; close port forwards with `runfree forward stop`, remove any other container holding those addresses, or run `runfree destroy --force`
+```
+
+The startup deny-probe helper takes an address from a reserved block,
+`.13`–`.19` on `agent_internal`, outside the session pool. Port forwards and
+other containers attached to that network can fill the block. Startup refuses
+rather than let the helper use a session address.
+
+```bash
+runfree forward status
+runfree forward stop
+runfree resources          # other containers on this project's networks
+runfree up
+```
+
+If the message says a pinned address `is already in use` instead, another
+container holds that one address. Retry `runfree up`; if a container Runfree
+does not own holds it, remove that container or run `runfree destroy --force`.
+
+## Startup is slow
+
+`RUNFREE_TIMINGS=1` prints one `timing:` line per lifecycle phase to stderr,
+plus a `startup-ops` count and total time for each kind of subprocess:
+
+```bash
+RUNFREE_TIMINGS=1 runfree up 2>&1 | grep 'timing:'
+```
+
+The categories name the command and Docker subcommand only, never
+arguments, ids, or output, so the lines are safe to paste into an issue. The first start after an
+upgrade that changes the agent image inputs rebuilds the image and is expected
+to be slow.
+
 ## A write is being held
 
 With approve-on-write active, an outbound write waits for a host-side decision.

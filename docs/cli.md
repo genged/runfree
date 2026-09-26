@@ -40,6 +40,12 @@ during a command print before the command's result or its final error, with
 the time they were observed. Ctrl-C and SIGTERM restore the terminal and exit
 130 or 143.
 
+`RUNFREE_TIMINGS=1` adds `timing:` lines on stderr: one per lifecycle phase,
+and one `startup-ops` line per subprocess category with its count and total
+time. A category is the command name plus, for Docker, its subcommand; never
+arguments, ids, or output. See
+[`troubleshooting.md`](troubleshooting.md#startup-is-slow).
+
 A failure's last line states what did not happen in your nouns ("claude did
 not start", "nothing was destroyed"). A next step is always a complete
 `runfree ...` command you can paste; a widening suggestion for a host rule

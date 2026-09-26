@@ -131,6 +131,9 @@ RUNFREE_TIMINGS=1 runfree up 2>&1 | grep 'timing: startup-ops'
 timing: startup-ops docker exec count=14 total=...ms
 ```
 
+[`cli.md`](cli.md#output-conventions) documents the variable, and
+[`troubleshooting.md`](troubleshooting.md) has entries for each new refusal.
+
 ## Smaller improvements
 
 - The proxy inspect during readiness has the same time bound as eligibility
