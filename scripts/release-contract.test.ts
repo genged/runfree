@@ -19,12 +19,6 @@ function read(relativePath: string): string {
 
 const packageVersion = (JSON.parse(read("package.json")) as { version: string }).version;
 
-const releaseTargets = read("scripts/release-targets.txt")
-  .split("\n")
-  .map((line) => line.replace(/#.*$/, "").trim())
-  .filter((line) => line.length > 0)
-  .map((line) => line.split(/\s+/)[0]);
-
 describe("release contract", () => {
   test("the package version has a release body and a detailed page", () => {
     expect(fs.existsSync(path.join(repoRoot, "docs/release-notes", `${packageVersion}.md`))).toBe(true);
