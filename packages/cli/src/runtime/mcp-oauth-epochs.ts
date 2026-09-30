@@ -24,6 +24,7 @@ import fs from "node:fs";
 import path from "node:path";
 
 import { OAUTH_STATE_EPOCH_RE } from "@runfree/runtime-contracts/oauth-mediation-policy";
+import { parseStrictJson } from "../control/strict-json.ts";
 import { projectHash } from "../project-identity.ts";
 import { atomicReplaceFile, isPathInsideByRealpath } from "../safe-fs.ts";
 import { isRecord } from "../strict-primitives.ts";
@@ -31,7 +32,7 @@ import { isRecord } from "../strict-primitives.ts";
 export const MCP_OAUTH_EPOCHS_FILE = "mcp-oauth-epochs.json";
 const MAX_FILE_BYTES = 256 * 1024;
 // The shape `mcpOAuthProviderId` produces.
-const MCP_PROVIDER_ID_RE = /^mcp:[a-z0-9_-]{1,200}$/;
+const MCP_PROVIDER_ID_RE = /^mcp:[a-z0-9_-]+$/;
 const FILE_KEYS = new Set(["schemaVersion", "projectHash", "base", "providers"]);
 const ENTRY_KEYS = new Set(["epoch", "revokedAt"]);
 
@@ -81,7 +82,7 @@ function readFile(projectRoot: string, filePath: string): ReadResult {
   if (!stat.isFile() || stat.size > MAX_FILE_BYTES) return { status: "invalid" };
   let parsed: unknown;
   try {
-    parsed = JSON.parse(fs.readFileSync(filePath, "utf8")) as unknown;
+    parsed = parseStrictJson(fs.readFileSync(filePath, "utf8"));
   } catch {
     return { status: "invalid" };
   }

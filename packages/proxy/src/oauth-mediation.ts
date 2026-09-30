@@ -121,6 +121,7 @@ type StoredMcpOAuthState = {
 export type ProtocolReadMatch = {
   kind: ProtocolReadKind;
   provider: string;
+  resourceHost: string;
 };
 
 export type OAuthBeforeRequestOptions = {
@@ -155,6 +156,7 @@ const PENDING_MAX_ENTRIES = 1024;
 // Per-provider handle cap: repeated exchanges cannot grow the state file
 // without bound. The oldest handles go first.
 const MAX_HANDLES_PER_PROVIDER = 256;
+const MAX_REGISTRATION_HANDLES_PER_PROVIDER = 32;
 
 
 function firstHeader(value: HeaderValue): string | undefined {
@@ -546,13 +548,51 @@ function storeHandle(
     tokenEndpointPath: options.tokenEndpoint.path,
     type: options.type,
   };
-  const ownHandles = Object.values(state.handles)
-    .filter((token) => token.serverName === options.server.name && token.handle !== handle)
-    .sort((left, right) => left.createdAt.localeCompare(right.createdAt));
-  for (const stale of ownHandles.slice(0, Math.max(0, ownHandles.length + 1 - MAX_HANDLES_PER_PROVIDER))) {
-    delete state.handles[stale.handle];
-  }
+  capProviderHandles(state, options.server.name, handle, options.now);
   return handle;
+}
+
+// Bounds one provider's handles so repeated exchanges cannot grow the state
+// without limit, without breaking a long-lived client: expired access
+// handles go first; token-response handles are capped at 256, oldest first,
+// never the newest refresh handle; registration handles (the client secret
+// and registration access token a confidential client keeps using) have
+// their own cap of 32.
+function capProviderHandles(state: StoredMcpOAuthState, serverName: string, newHandle: string, now: Date): void {
+  const handles = state.handles ?? {};
+  const byAge = (left: StoredToken, right: StoredToken) => left.createdAt.localeCompare(right.createdAt);
+  for (const token of Object.values(handles)) {
+    if (token.serverName === serverName && token.handle !== newHandle && token.type === "access" && storedTokenExpired(token, now)) {
+      delete handles[token.handle];
+    }
+  }
+  const own = Object.values(handles).filter((token) => token.serverName === serverName);
+  const registration = own.filter((token) => token.endpointKind === "registration").sort(byAge);
+  const tokens = own.filter((token) => token.endpointKind !== "registration").sort(byAge);
+  const newestRefresh = tokens.filter((token) => token.type === "refresh").at(-1)?.handle;
+  const evict = (list: StoredToken[], max: number, keep: Set<string | undefined>) => {
+    let excess = list.length - max;
+    for (const token of list) {
+      if (excess <= 0) break;
+      if (keep.has(token.handle)) continue;
+      delete handles[token.handle];
+      excess -= 1;
+    }
+  };
+  evict(registration, MAX_REGISTRATION_HANDLES_PER_PROVIDER, new Set([newHandle]));
+  evict(tokens, MAX_HANDLES_PER_PROVIDER, new Set([newHandle, newestRefresh]));
+}
+
+// A response on the response-mediating rule that no server mediates now (a
+// revoke or reload landed while it was in flight). Real tokens in it must not
+// reach the agent.
+function unmediatedTokenResponse(text: string | undefined, headers: Record<string, HeaderValue> | undefined): OAuthResponseResult | undefined {
+  if (!text) return undefined;
+  const parsed = parseBodyAsJson(text);
+  const sensitive = parsed
+    ? sensitiveOauthResponseFields(parsed).length > 0
+    : /(?:^|&)(?:access_token|refresh_token|id_token|client_secret|registration_access_token)=/.test(text);
+  return sensitive ? blockedTokenEndpointResponse("OAuth token response from an endpoint that is no longer mediated", headers) : undefined;
 }
 
 function tokenTypeForSeed(seed: OAuthSeed): "refresh" | "secret" {
@@ -866,8 +906,14 @@ export class OAuthMediator {
       return this.authorizeBearerHandleRequest(req, url, state, handle, policy);
     }
     if (policy.servers.length === 0) return undefined;
-    this.rememberSensitiveRequest(req, policy, state, url);
-    return await this.replaceRefreshHandleRequest(req, url, policy, state);
+    if (!this.rememberSensitiveRequest(req, policy, state, url)) {
+      return forbidden("too many OAuth exchanges in flight; retry it");
+    }
+    const result = await this.replaceRefreshHandleRequest(req, url, policy, state);
+    // A refused request never reaches the upstream: drop its entry, so
+    // refused requests cannot fill the map and push out a real exchange.
+    if (result?.response && typeof req.id === "string") this.pendingSensitiveRequests.delete(req.id);
+    return result;
   };
 
   // True when this request targets an OAuth endpoint whose *response* the
@@ -907,12 +953,12 @@ export class OAuthMediator {
     req: OAuthProxyRequest,
   ): Promise<OAuthResponseResult | undefined> => {
     const pending = this.takeSensitiveRequest(req);
-    const policyState = this.currentPolicyState();
-    const policy = policyState.policy;
     const requestUrl = parseUrl(req.url);
     if (!requestUrl || requestUrl.protocol !== "https:") return undefined;
-    if ((!policyState.valid || policy.servers.length === 0) && !pending) return undefined;
     if (res.statusCode < 200 || res.statusCode >= 300) return undefined;
+    // Every response on the response-mediating rule is read, even when the
+    // policy no longer names a server: a token response that nothing mediates
+    // any more is blocked below rather than passed to the agent.
     const text = await res.body.getText();
     return await this.withStateLock(() => {
       // Re-read the policy after the body arrived: an activation (a revoke's
@@ -934,7 +980,7 @@ export class OAuthMediator {
       const registrationServer = pending?.kind === "registration"
         ? pending.server
         : live.valid ? matchingRegistrationServer(livePolicy, state, requestUrl) : undefined;
-      if (!server && !registrationServer && !couldBeMetadata) return undefined;
+      if (!server && !registrationServer && !couldBeMetadata) return unmediatedTokenResponse(text, res.headers);
       if (!text) {
         return server || registrationServer
           ? blockedTokenEndpointResponse("empty OAuth token response", res.headers)
@@ -1035,7 +1081,7 @@ export class OAuthMediator {
     if (isToken ? tokenServer !== server : tokenServer !== undefined || matchingRegistrationServer(policy, state, url) !== server) {
       return undefined;
     }
-    return { kind: isToken ? "token" : "registration", provider: server.name };
+    return { kind: isToken ? "token" : "registration", provider: server.name, resourceHost: server.resourceHost };
   }
 
   issuerDenialContext(rawHost: string): OAuthIssuerDenialContext | undefined {
@@ -1064,35 +1110,34 @@ export class OAuthMediator {
     return undefined;
   }
 
+  // False when the request is an exchange to remember but the map is full:
+  // the caller refuses it rather than evict another exchange's entry.
   private rememberSensitiveRequest(
     req: OAuthProxyRequest,
     policy: LoadedMcpOAuthPolicy,
     state: StoredMcpOAuthState,
     url: URL,
-  ): void {
-    if (typeof req.id !== "string" || req.id === "") return;
+  ): boolean {
+    if (typeof req.id !== "string" || req.id === "" || req.method !== "POST") return true;
     const tokenServer = matchingTokenServer(policy, state, url);
     const registrationServer = tokenServer ? undefined : matchingRegistrationServer(policy, state, url);
     const server = tokenServer ?? registrationServer;
-    if (!server) return;
+    if (!server) return true;
     this.prunePendingSensitiveRequests();
+    if (this.pendingSensitiveRequests.size >= PENDING_MAX_ENTRIES) return false;
     this.pendingSensitiveRequests.set(req.id, {
       createdAtMs: Date.now(),
       endpoint: safeTokenEndpoint(url),
       kind: tokenServer ? "token" : "registration",
       server,
     });
+    return true;
   }
 
   private prunePendingSensitiveRequests(): void {
     const cutoff = Date.now() - PENDING_MAX_AGE_MS;
     for (const [id, pending] of this.pendingSensitiveRequests) {
       if (pending.createdAtMs < cutoff) this.pendingSensitiveRequests.delete(id);
-    }
-    while (this.pendingSensitiveRequests.size >= PENDING_MAX_ENTRIES) {
-      const oldest = this.pendingSensitiveRequests.keys().next().value;
-      if (oldest === undefined) break;
-      this.pendingSensitiveRequests.delete(oldest);
     }
   }
 

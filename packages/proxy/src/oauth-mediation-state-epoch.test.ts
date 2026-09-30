@@ -287,6 +287,91 @@ describe("bounds on unattended OAuth exchanges", () => {
     expect(stateText()).toContain("real-access-token-refresh");
   });
 
+  test("refused requests leave no in-flight entry, so they cannot push out a real exchange", async () => {
+    const target = mediator(EPOCH_A);
+    const real = { id: "real-exchange", method: "POST", url: "https://auth.example.test/oauth/token" };
+    await target.beforeRequest(real);
+    for (let index = 0; index < 1100; index += 1) {
+      const refused = await target.beforeRequest({
+        id: `flood-${index}`,
+        body: { getText: async () => `grant_type=refresh_token&refresh_token=runfree_oauth_refresh_${String(index).padStart(32, "x")}` },
+        headers: { "content-type": "application/x-www-form-urlencoded" },
+        method: "POST",
+        url: "https://auth.example.test/oauth/token",
+      });
+      expect(refused?.response?.statusCode).toBe(403);
+    }
+    // A GET to the token endpoint is never recorded as an exchange at all.
+    await target.beforeRequest({ id: "get", method: "GET", url: "https://auth.example.test/oauth/token" });
+    // The real exchange is still tracked: a revoke mid-exchange blocks it.
+    target.activatePairedPolicy(policy(EPOCH_B));
+    const res = await target.beforeResponse({ body: body({ access_token: "late-real-token" }), statusCode: 200 }, real);
+    expect(res?.body).toContain("revoked during the exchange");
+  });
+
+  test("when 1024 exchanges are in flight, a new one is refused instead of evicting one", async () => {
+    const target = mediator(EPOCH_A);
+    for (let index = 0; index < 1024; index += 1) {
+      await target.beforeRequest({ id: `open-${index}`, method: "POST", url: "https://auth.example.test/oauth/token" });
+    }
+    const refused = await target.beforeRequest({ id: "one-more", method: "POST", url: "https://auth.example.test/oauth/token" });
+    expect(refused?.response?.statusCode).toBe(403);
+    expect(refused?.response?.body).toContain("too many OAuth exchanges in flight");
+    // The oldest exchange keeps its entry.
+    target.activatePairedPolicy(policy(EPOCH_B));
+    const res = await target.beforeResponse({ body: body({ access_token: "late" }), statusCode: 200 }, { id: "open-0", method: "POST", url: "https://auth.example.test/oauth/token" });
+    expect(res?.body).toContain("revoked during the exchange");
+  });
+
+  test("a token response on the mediating rule that nothing mediates any more is blocked, even without an entry", async () => {
+    const target = mediator(EPOCH_A);
+    target.activatePairedPolicy(validateOAuthMediationPolicy({ providers: {} }));
+    const res = await target.beforeResponse({
+      body: body({ access_token: "orphan-real-token", token_type: "Bearer" }),
+      statusCode: 200,
+    }, { id: "no-entry", method: "POST", url: "https://auth.example.test/oauth/token" });
+    expect(res?.body).toContain("no longer mediated");
+    expect(res?.body).not.toContain("orphan-real-token");
+    const formRes = await target.beforeResponse({
+      body: { getText: async () => "access_token=orphan-form-token&token_type=bearer" },
+      statusCode: 200,
+    }, { method: "POST", url: "https://auth.example.test/oauth/token" });
+    expect(formRes?.body).not.toContain("orphan-form-token");
+  });
+
+  test("a long refresh chain never evicts the registration client secret", async () => {
+    let tick = 0;
+    const target = new OAuthMediator({
+      log: () => {},
+      now: () => new Date(Date.UTC(2026, 8, 30, 0, 0, 0, tick++)),
+      pairedPolicy: policy(EPOCH_A, { registrationEndpoints: [{ host: "auth.example.test", path: "/oauth/register" }] }),
+      projectId: "project-under-test",
+      stateDir,
+    });
+    const registerReq = { id: "register", method: "POST", url: "https://auth.example.test/oauth/register" };
+    await target.beforeRequest(registerReq);
+    const registered = await target.beforeResponse({ body: body({ client_id: "c", client_secret: "real-client-secret" }), statusCode: 200 }, registerReq);
+    const secretHandle = (JSON.parse(registered?.body ?? "{}") as { client_secret: string }).client_secret;
+    let { refresh } = await login(target, "first");
+    for (let index = 0; index < 300; index += 1) {
+      const req = {
+        id: `refresh-${index}`,
+        body: { getText: async () => `grant_type=refresh_token&refresh_token=${refresh}&client_secret=${secretHandle}` },
+        headers: { "content-type": "application/x-www-form-urlencoded" },
+        method: "POST",
+        url: "https://auth.example.test/oauth/token",
+      };
+      const swapped = await target.beforeRequest(req);
+      expect(swapped?.body, `refresh ${index}`).toContain("client_secret=real-client-secret");
+      const res = await target.beforeResponse({
+        body: body({ access_token: `access-${index}`, refresh_token: `refresh-${index}`, id_token: `id-${index}`, expires_in: 3600 }),
+        statusCode: 200,
+      }, req);
+      refresh = (JSON.parse(res?.body ?? "{}") as { refresh_token: string }).refresh_token;
+    }
+    expect(stateText()).toContain("real-client-secret");
+  });
+
   test("each provider keeps at most 256 handles, dropping the oldest", async () => {
     let tick = 0;
     const target = new OAuthMediator({

@@ -13,9 +13,10 @@
 // write posture with no approver attached, while any other POST on that host,
 // a non-protocol body, and a POST to an `--oauth-host` host with no recorded
 // endpoint still need approval. And `mcp revoke` clears the server's proxy
-// OAuth state: a handle seeded into the proxy's OAuth volume survives an
-// unrelated policy activation, the revoke deletes it, and the revoke says
-// "cleared" only because the live proxy confirmed the generation.
+// OAuth state through its state epoch: a handle seeded into the proxy's OAuth
+// volume survives an unrelated policy activation (a stale-epoch one does not),
+// a revoke that leaves the server in the policy deletes it, and the revoke
+// says "cleared" only because the live proxy confirmed the generation.
 //
 // Discovery itself cannot run here: by design it refuses non-public addresses,
 // and every probe host is an unresolvable `.invalid` name (the proxy decision is
@@ -89,6 +90,8 @@ const OAUTH_STATE_FILE = "/run/runfree-oauth/handles.json";
 const NARROW_PROVIDER = `mcp:claude-${NARROW_SERVER.toLowerCase()}`;
 const SEEDED_TOKEN = "live-seeded-real-access-token";
 const SEEDED_HANDLE = `runfree_oauth_access_${"l".repeat(32)}`;
+const STALE_TOKEN = "live-stale-epoch-real-access-token";
+const STALE_HANDLE = `runfree_oauth_access_${"s".repeat(32)}`;
 
 function proxyContainerId(fixture: LiveFixture): string {
   return composeServiceContainerId(composeProjectName(fixture), "proxy");
@@ -277,51 +280,71 @@ describe("one-step MCP enable and exact revoke", () => {
     }, TEST_TIMEOUT_MS);
   });
 
-  describe("revoke clears the server's proxy OAuth state", () => {
+  describe("revoke clears the server's proxy OAuth state through its state epoch", () => {
+    type PreparedProvider = { resourceHost: string; resourcePathPrefix?: string; stateEpoch?: string };
     let proxyId: string;
     let revokeOutput: string;
     let afterUnrelatedActivation: string;
+    let before: PreparedProvider;
+    let after: PreparedProvider | undefined;
+
+    function preparedProvider(): PreparedProvider | undefined {
+      const prepared = JSON.parse(fs.readFileSync(path.join(stateDir, "oauth-mediation-policy.json"), "utf8")) as {
+        providers: Record<string, PreparedProvider>;
+      };
+      return prepared.providers[NARROW_PROVIDER];
+    }
+
+    function seededHandle(handle: string, token: string, stateEpoch: string | undefined): Record<string, unknown> {
+      return {
+        createdAt: new Date().toISOString(),
+        endpointKind: "token",
+        handle,
+        projectId: projectHash(fixture.projectRoot),
+        resourceHost: before.resourceHost,
+        resourcePathPrefix: before.resourcePathPrefix ?? "/",
+        serverName: NARROW_PROVIDER,
+        ...(stateEpoch ? { stateEpoch } : {}),
+        token,
+        tokenEndpointHost: NARROW_IDP_HOST,
+        tokenEndpointPath: "/oauth/token",
+        type: "access",
+      };
+    }
 
     beforeAll(() => {
       proxyId = proxyContainerId(fixture);
       // The provider as the prepared OAuth policy publishes it (resource and
-      // current state epoch), so only a revoke can make the handle stale.
-      const prepared = JSON.parse(fs.readFileSync(path.join(stateDir, "oauth-mediation-policy.json"), "utf8")) as {
-        providers: Record<string, { resourceHost: string; resourcePathPrefix?: string; stateEpoch?: string }>;
-      };
-      const provider = prepared.providers[NARROW_PROVIDER];
-      expect(provider?.stateEpoch, `the prepared OAuth policy publishes no state epoch for ${NARROW_PROVIDER}`).toMatch(/^[a-f0-9]{32}$/);
-      seedProxyOAuthHandle(proxyId, {
-        createdAt: new Date().toISOString(),
-        endpointKind: "token",
-        handle: SEEDED_HANDLE,
-        projectId: projectHash(fixture.projectRoot),
-        resourceHost: provider.resourceHost,
-        resourcePathPrefix: provider.resourcePathPrefix ?? "/",
-        serverName: NARROW_PROVIDER,
-        stateEpoch: provider.stateEpoch,
-        token: SEEDED_TOKEN,
-        tokenEndpointHost: NARROW_IDP_HOST,
-        tokenEndpointPath: "/oauth/token",
-        type: "access",
-      });
-      // An unrelated activation keeps the handle: the clear below is the revoke's.
+      // current state epoch), so only an epoch change can make the handle stale.
+      const current = preparedProvider();
+      expect(current?.stateEpoch, `the prepared OAuth policy publishes no state epoch for ${NARROW_PROVIDER}`).toMatch(/^[a-f0-9]{32}$/);
+      before = current as PreparedProvider;
+      seedProxyOAuthHandle(proxyId, seededHandle(SEEDED_HANDLE, SEEDED_TOKEN, before.stateEpoch));
+      // A handle from an older epoch of the same, still-published server.
+      seedProxyOAuthHandle(proxyId, seededHandle(STALE_HANDLE, STALE_TOKEN, "0".repeat(32)));
       const added = runOk(fixture, ["host", "add", "runfree-enable-unrelated.invalid"]);
       expect(added.stdout, "host add did not converge live").toContain("effective policy: live now");
       afterUnrelatedActivation = readProxyOAuthState(proxyId);
-      revokeOutput = runOk(fixture, ["mcp", "revoke", "claude", NARROW_SERVER]).output;
+      // `--source user` names no project approval and no enable record of this
+      // project server, so the server stays in the policy: the proxy can clear
+      // its state only through the new epoch, not because the server is gone.
+      revokeOutput = runOk(fixture, ["mcp", "revoke", "claude", NARROW_SERVER, "--source", "user"]).output;
+      after = preparedProvider();
     }, PROVISION_TIMEOUT_MS);
 
-    test("the seeded handle survives an unrelated activation", () => {
-      expect(afterUnrelatedActivation, "the seeded handle was pruned before the revoke").toContain(SEEDED_TOKEN);
+    test("an unrelated activation keeps the current-epoch handle and deletes the stale-epoch one", () => {
+      expect(afterUnrelatedActivation, "the current-epoch handle was pruned before the revoke").toContain(SEEDED_TOKEN);
+      expect(afterUnrelatedActivation, "a handle from another epoch survived an activation").not.toContain(STALE_TOKEN);
     }, TEST_TIMEOUT_MS);
 
-    test("the revoke deletes the handle and the real token, and says so only with proof", () => {
+    test("the revoke publishes a new epoch for the still-enabled server, deletes the handle, and proves it", () => {
+      expect(after?.stateEpoch, "the revoked server left the policy; the epoch path was not exercised").toMatch(/^[a-f0-9]{32}$/);
+      expect(after?.stateEpoch).not.toBe(before.stateEpoch);
       expect(revokeOutput).toContain(`proxy OAuth state for claude ${NARROW_SERVER}: clear requested`);
       expect(revokeOutput).toContain(`proxy OAuth state for claude ${NARROW_SERVER}: cleared (the proxy applied effective policy generation sha256:`);
-      const after = readProxyOAuthState(proxyId);
-      expect(after).not.toContain(SEEDED_TOKEN);
-      expect(after).not.toContain(SEEDED_HANDLE);
+      const state = readProxyOAuthState(proxyId);
+      expect(state).not.toContain(SEEDED_TOKEN);
+      expect(state).not.toContain(SEEDED_HANDLE);
     }, TEST_TIMEOUT_MS);
   });
 });

@@ -405,7 +405,8 @@ Login and refresh do not wait for write approval. On an `ask` host, a POST to
 exactly one of the token or registration endpoints that discovery recorded for
 this server is an OAuth protocol read, but only while the proxy mediates that
 endpoint for this server alone. The body must be a plain login or refresh
-(`authorization_code` or `refresh_token` form grant), or a client registration
+(`authorization_code` or `refresh_token` form grant, a `client_id` that is not
+a URL, and a `resource` only for the server itself), or a client registration
 whose redirect URIs are loopback `http` URLs only, with no other URL field. Any
 other method, path (sub-paths too), query, body, an endpoint that another
 server also uses, and an `--oauth-host` host with no recorded endpoint follow

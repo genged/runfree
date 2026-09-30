@@ -1462,7 +1462,10 @@ const protocolReadLimiter = new ProtocolReadRateLimiter();
 // mediator proves the exact endpoint is recorded and mediated for one server;
 // the body must be the protocol's own shape; a per-server budget bounds
 // unattended exchanges. Anything unproven stays a write.
-async function oauthProtocolReadForRequest(req: ProxyRequest, responseMediated: boolean): Promise<ProtocolReadMatch | undefined> {
+async function oauthProtocolReadForRequest(
+  req: ProxyRequest,
+  responseMediated: boolean,
+): Promise<{ grantType: string; match: ProtocolReadMatch } | undefined> {
   if (!responseMediated || req.method !== "POST") return undefined;
   let url: URL;
   try {
@@ -1484,17 +1487,18 @@ async function oauthProtocolReadForRequest(req: ProxyRequest, responseMediated: 
   } catch {
     return undefined;
   }
-  if (!protocolReadBodyAllowed({ bodyText, headers: req.headers, kind: match.kind })) return undefined;
+  if (!protocolReadBodyAllowed({ bodyText, headers: req.headers, kind: match.kind, resourceHost: match.resourceHost })) return undefined;
   // The body read awaited: a policy reload may have landed. Decide on the
   // policy that is current now, synchronously with the classification.
   const current = oauthMediator.protocolReadEndpoint(req);
   if (current?.provider !== match.provider || current.kind !== match.kind) return undefined;
-  if (!protocolReadLimiter.take(match.provider)) {
+  // Checked here, spent only once the request passes every policy check, so
+  // requests the policy refuses cannot drain the budget.
+  if (!protocolReadLimiter.available(match.provider)) {
     console.log(`proxy: oauth protocol-read budget exhausted name=${match.provider}; the request follows write approval`);
     return undefined;
   }
-  console.log(`proxy: oauth protocol-read name=${match.provider} kind=${match.kind} host=${url.hostname.toLowerCase()} path=${url.pathname} grant_type=${protocolReadGrantType(match.kind, bodyText ?? "")}`);
-  return match;
+  return { grantType: protocolReadGrantType(match.kind, bodyText ?? ""), match };
 }
 
 // The policed request path: policy checks, write classification (with grant
@@ -1543,9 +1547,13 @@ async function policedRequestMutation(
     ...req,
     headers: headers ?? req.headers,
   };
+  if (protocolRead) {
+    protocolReadLimiter.take(protocolRead.match.provider);
+    console.log(`proxy: oauth protocol-read name=${protocolRead.match.provider} kind=${protocolRead.match.kind} host=${admission.host} path=${url?.pathname ?? "?"} grant_type=${protocolRead.grantType}`);
+  }
   const oauthMutation = await oauthMediator.beforeRequest(nextReq, {
     responseMediated: options.responseMediated,
-    ...(protocolRead ? { protocolRead } : {}),
+    ...(protocolRead ? { protocolRead: protocolRead.match } : {}),
   });
   logAllowedRequest(req, { credential });
   return combineRequestMutations(headers ? { headers } : mutation, oauthMutation);

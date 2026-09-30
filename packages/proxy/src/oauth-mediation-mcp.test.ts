@@ -156,7 +156,9 @@ describe("MCP OAuth mediator", () => {
       method: "POST",
       url: "https://auth.example.test/oauth/token",
     });
-    expect(untrackedResponse).toBeUndefined();
+    // Nothing mediates it now, so a token response on the mediating rule is blocked, not passed on.
+    expect(untrackedResponse?.body).toContain("no longer mediated");
+    expect(untrackedResponse?.body).not.toContain("real-untracked-token");
     expect(fs.readFileSync(path.join(stateDir, "handles.json"), "utf8")).not.toContain("real-untracked-token");
     expect(logs.some((line) => line.includes("oauth policy reload failed"))).toBe(true);
   });
@@ -280,12 +282,14 @@ describe("MCP OAuth mediator", () => {
       statusCode: 200,
     }, { method: "GET", url: "https://evil.example.test/.well-known/oauth-authorization-server" });
 
-    // And a token exchange there is not mediated (real token passes through untouched).
+    // And a token exchange there is not mediated into handles.
     const tokenRewrite = await mediator.beforeResponse({
       body: responseBody({ access_token: "real-evil-token", token_type: "Bearer" }, 0),
       statusCode: 200,
     }, { id: "tok", method: "POST", url: "https://evil.example.test/token" });
-    expect(tokenRewrite).toBeUndefined();
+    // Not mediated into handles; on the mediating rule the unmediated token response is blocked.
+    expect(tokenRewrite?.body ?? "").not.toMatch(/runfree_oauth_/);
+    expect(tokenRewrite?.body ?? "").toContain("no longer mediated");
     const stateFile = path.join(stateDir, "handles.json");
     if (fs.existsSync(stateFile)) {
       const contents = fs.readFileSync(stateFile, "utf8");
@@ -324,7 +328,9 @@ describe("MCP OAuth mediator", () => {
       body: responseBody({ access_token: "real-mismatch-token", token_type: "Bearer" }, 0),
       statusCode: 200,
     }, { id: "tok", method: "POST", url: "https://auth.example.test/token" });
-    expect(tokenRewrite).toBeUndefined();
+    // Not mediated into handles; on the mediating rule the unmediated token response is blocked.
+    expect(tokenRewrite?.body ?? "").not.toMatch(/runfree_oauth_/);
+    expect(tokenRewrite?.body ?? "").toContain("no longer mediated");
   });
 
   test("fails closed when the configured MCP OAuth policy is unavailable before first load", async () => {

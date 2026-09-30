@@ -274,7 +274,8 @@ Details: [Write Approval Grants](architecture.md#write-approval-grants).
    is a token or registration endpoint that `mcp enable` recorded for one
    server, the proxy mediates it for that server alone, and the body is a
    plain login, refresh, or loopback-only client registration with no field
-   an issuer may fetch. Each server gets at most 30 a minute. Everything else
+   an issuer may fetch (no URL-valued `client_id`, no `resource` for another
+   host). Each server gets at most 30 a minute. Everything else
    on the host stays a write. A request that selected the unmediated proxy
    rule while its endpoint became mediated is refused, so a token never
    reaches the agent unmediated.

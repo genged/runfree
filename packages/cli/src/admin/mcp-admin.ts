@@ -687,6 +687,8 @@ export async function mcpConfigureIntent(input: McpConfigureInput): Promise<McpC
         label: `revoke project ${entry.agent}/${entry.name}`,
         apply: () => {
           mcpRevokeIntent({ agent: entry.agent, server: entry.name });
+          // configure does not apply the policy to a running proxy.
+          console.log(`proxy OAuth state for ${entry.agent} ${printable(entry.name)}: not cleared yet; the proxy clears it when it next applies this project's policy (runfree mcp revoke applies it now)`);
         },
       });
     }

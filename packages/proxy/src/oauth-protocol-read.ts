@@ -91,7 +91,21 @@ function stringSubset(value: unknown, allowed: Set<string>): boolean {
     && value.every((entry) => typeof entry === "string" && allowed.has(entry));
 }
 
-function tokenBodyAllowed(bodyText: string): boolean {
+// A `resource` (RFC 8707) must name this server's own resource host; a
+// `client_id` must not be a URL, because an authorization server that
+// supports client ID metadata documents fetches a URL-valued client_id.
+function resourceIndicatorAllowed(value: string, resourceHost: string): boolean {
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    return false;
+  }
+  return url.protocol === "https:" && url.username === "" && url.password === "" && url.port === ""
+    && url.hostname.toLowerCase() === resourceHost;
+}
+
+function tokenBodyAllowed(bodyText: string, resourceHost: string): boolean {
   const params = new URLSearchParams(bodyText);
   const seen = new Set<string>();
   for (const [key, value] of params) {
@@ -99,6 +113,10 @@ function tokenBodyAllowed(bodyText: string): boolean {
     seen.add(key);
   }
   if (!TOKEN_GRANTS.has(params.get("grant_type") ?? "")) return false;
+  const clientId = params.get("client_id");
+  if (clientId !== null && (clientId.length > 256 || !PRINTABLE_ASCII.test(clientId) || /[:/]/.test(clientId))) return false;
+  const resource = params.get("resource");
+  if (resource !== null && !resourceIndicatorAllowed(resource, resourceHost)) return false;
   const redirect = params.get("redirect_uri");
   return redirect === null || loopbackRedirect(redirect);
 }
@@ -135,12 +153,15 @@ function registrationBodyAllowed(bodyText: string): boolean {
  * loopback-only dynamic client registration for a registration endpoint. No
  * field an issuer may fetch (sector_identifier_uri, jwks_uri, logo_uri,
  * request_uris, software_statement, client assertions) is allowed, so the
- * issuer is never made to contact another host.
+ * issuer is never made to contact another host: a `client_id` may not be a
+ * URL, and a `resource` must name the server's own resource host.
  */
 export function protocolReadBodyAllowed(input: {
   bodyText: string | undefined;
   headers: Record<string, HeaderValue> | undefined;
   kind: ProtocolReadKind;
+  // The MCP server's resource host, the only host a `resource` may name.
+  resourceHost: string;
 }): boolean {
   const contentType = singleHeader(input.headers, "content-type");
   const contentEncoding = singleHeader(input.headers, "content-encoding");
@@ -152,7 +173,7 @@ export function protocolReadBodyAllowed(input: {
   const bodyText = input.bodyText;
   if (bodyText === undefined || Buffer.byteLength(bodyText) !== Number(contentLength)) return false;
   if (input.kind === "token") {
-    return mediaType(contentType) === "application/x-www-form-urlencoded" && tokenBodyAllowed(bodyText);
+    return mediaType(contentType) === "application/x-www-form-urlencoded" && tokenBodyAllowed(bodyText, input.resourceHost);
   }
   return mediaType(contentType) === "application/json" && registrationBodyAllowed(bodyText);
 }
@@ -173,16 +194,24 @@ export class ProtocolReadRateLimiter {
 
   constructor(private readonly options: { maxPerWindow?: number; now?: () => number; windowMs?: number } = {}) {}
 
-  take(provider: string): boolean {
-    const now = this.options.now?.() ?? Date.now();
+  private recent(provider: string, now: number): number[] {
     const windowMs = this.options.windowMs ?? RATE_WINDOW_MS;
     const recent = (this.windows.get(provider) ?? []).filter((at) => now - at < windowMs);
-    if (recent.length >= (this.options.maxPerWindow ?? RATE_MAX_PER_WINDOW)) {
-      this.windows.set(provider, recent);
-      return false;
-    }
-    recent.push(now);
     this.windows.set(provider, recent);
+    return recent;
+  }
+
+  /** Whether a read is still in budget; spends nothing. */
+  available(provider: string): boolean {
+    return this.recent(provider, this.options.now?.() ?? Date.now()).length < (this.options.maxPerWindow ?? RATE_MAX_PER_WINDOW);
+  }
+
+  /** Spends one read; false when the budget is already spent. */
+  take(provider: string): boolean {
+    const now = this.options.now?.() ?? Date.now();
+    const recent = this.recent(provider, now);
+    if (recent.length >= (this.options.maxPerWindow ?? RATE_MAX_PER_WINDOW)) return false;
+    recent.push(now);
     return true;
   }
 }

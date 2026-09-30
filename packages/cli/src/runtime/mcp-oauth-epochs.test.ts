@@ -75,6 +75,7 @@ describe("MCP OAuth state epochs (revoke tombstones)", () => {
     ["a bad provider epoch", JSON.stringify({ schemaVersion: 1, projectHash: "PH", base: nth(9), providers: { "mcp:claude-linear": { epoch: "short", revokedAt: "2026-09-30T00:00:00.000Z" } } })],
     ["a bad provider id", JSON.stringify({ schemaVersion: 1, projectHash: "PH", base: nth(9), providers: { "service:x": { epoch: nth(8), revokedAt: "2026-09-30T00:00:00.000Z" } } })],
     ["another project", JSON.stringify({ schemaVersion: 1, projectHash: "other", base: nth(9), providers: {} })],
+    ["a duplicate key", `{"schemaVersion":1,"projectHash":"PH","base":"${nth(9)}","base":"${nth(8)}","providers":{}}`],
   ])("fails closed on %s: a new base changes every provider's epoch, and the rewrite reclaims the store", (_label, contents) => {
     fs.writeFileSync(file(), contents.replace("PH", projectHash(projectRoot)));
     const result = updateMcpOAuthEpochs(projectRoot, file(), { random });
@@ -108,6 +109,12 @@ describe("MCP OAuth state epochs (revoke tombstones)", () => {
     const inside = path.join(projectRoot, "mcp-oauth-epochs.json");
     expect(() => updateMcpOAuthEpochs(projectRoot, inside, { revoke: ["mcp:claude-linear"], random })).toThrow(/outside the project/);
     expect(fs.existsSync(inside)).toBe(false);
+  });
+
+  test("revokes a server with a very long name (no length limit to wedge revoke)", () => {
+    const providerId = `mcp:claude-${"a".repeat(500)}`;
+    const result = updateMcpOAuthEpochs(projectRoot, file(), { revoke: [providerId], random });
+    expect(readMcpOAuthEpochs(projectRoot, file())?.revoked[providerId]).toBe(mcpOAuthStateEpoch(result, providerId));
   });
 
   test("refuses a provider id that is not an MCP provider id before writing", () => {

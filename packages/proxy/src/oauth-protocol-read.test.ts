@@ -61,16 +61,17 @@ describe("protocolReadBodyAllowed", () => {
   test.each([
     ["an authorization-code grant", code],
     ["a refresh grant", refresh],
+    ["a resource indicator for the server itself", `${code}&resource=https%3A%2F%2Fmcp.example.test%2Fmcp`],
   ])("allows %s", (_label, body) => {
-    expect(protocolReadBodyAllowed({ kind: "token", bodyText: body, headers: formHeaders(body) })).toBe(true);
+    expect(protocolReadBodyAllowed({ resourceHost: "mcp.example.test", kind: "token", bodyText: body, headers: formHeaders(body) })).toBe(true);
   });
 
   test("allows a media-type parameter", () => {
-    expect(protocolReadBodyAllowed({ kind: "token", bodyText: code, headers: formHeaders(code, { "content-type": `${FORM}; charset=UTF-8` }) })).toBe(true);
+    expect(protocolReadBodyAllowed({ resourceHost: "mcp.example.test", kind: "token", bodyText: code, headers: formHeaders(code, { "content-type": `${FORM}; charset=UTF-8` }) })).toBe(true);
   });
 
   test("allows a loopback-only dynamic client registration", () => {
-    expect(protocolReadBodyAllowed({ kind: "registration", bodyText: registration, headers: jsonHeaders(registration) })).toBe(true);
+    expect(protocolReadBodyAllowed({ resourceHost: "mcp.example.test", kind: "registration", bodyText: registration, headers: jsonHeaders(registration) })).toBe(true);
   });
 
   test.each([
@@ -81,8 +82,13 @@ describe("protocolReadBodyAllowed", () => {
     ["a duplicate field", `${code}&code=second`],
     ["a non-loopback redirect", "grant_type=authorization_code&code=abc&redirect_uri=https%3A%2F%2Fevil.example%2Fcb"],
     ["no grant type", "code=abc"],
+    ["a URL-valued client_id (fetched as a client metadata document)", `${code.replace("client_id=c", "client_id=https%3A%2F%2Fevil.example%2Fx")}`],
+    ["a client_id with a scheme", `${code.replace("client_id=c", "client_id=urn%3Ax")}`],
+    ["a resource on another host", `${code}&resource=https%3A%2F%2Fevil.example%2Fmcp`],
+    ["a resource with a port", `${code}&resource=https%3A%2F%2Fmcp.example.test%3A8443%2Fmcp`],
+    ["a non-URL resource", `${code}&resource=mcp`],
   ])("refuses a token body with %s", (_label, body) => {
-    expect(protocolReadBodyAllowed({ kind: "token", bodyText: body, headers: formHeaders(body) })).toBe(false);
+    expect(protocolReadBodyAllowed({ resourceHost: "mcp.example.test", kind: "token", bodyText: body, headers: formHeaders(body) })).toBe(false);
   });
 
   test.each([
@@ -96,7 +102,7 @@ describe("protocolReadBodyAllowed", () => {
   ])("refuses a token request with %s", (_label, extra) => {
     const headers = { ...formHeaders(code), ...extra } as Record<string, string | string[]>;
     if (headers["content-length"] === "") delete headers["content-length"];
-    expect(protocolReadBodyAllowed({ kind: "token", bodyText: code, headers })).toBe(false);
+    expect(protocolReadBodyAllowed({ resourceHost: "mcp.example.test", kind: "token", bodyText: code, headers })).toBe(false);
   });
 
   test.each([
@@ -113,16 +119,16 @@ describe("protocolReadBodyAllowed", () => {
     ["an unknown auth method", { token_endpoint_auth_method: "private_key_jwt" }],
   ])("refuses a registration with %s", (_label, extra) => {
     const body = JSON.stringify({ ...JSON.parse(registration) as object, ...extra });
-    expect(protocolReadBodyAllowed({ kind: "registration", bodyText: body, headers: jsonHeaders(body) })).toBe(false);
+    expect(protocolReadBodyAllowed({ resourceHost: "mcp.example.test", kind: "registration", bodyText: body, headers: jsonHeaders(body) })).toBe(false);
   });
 
   test("refuses a registration with a duplicate JSON key", () => {
     const body = `{"redirect_uris":["http://localhost/cb"],"redirect_uris":["https://evil.example/cb"]}`;
-    expect(protocolReadBodyAllowed({ kind: "registration", bodyText: body, headers: jsonHeaders(body) })).toBe(false);
+    expect(protocolReadBodyAllowed({ resourceHost: "mcp.example.test", kind: "registration", bodyText: body, headers: jsonHeaders(body) })).toBe(false);
   });
 
   test("refuses a registration sent as a form", () => {
-    expect(protocolReadBodyAllowed({ kind: "registration", bodyText: registration, headers: formHeaders(registration) })).toBe(false);
+    expect(protocolReadBodyAllowed({ resourceHost: "mcp.example.test", kind: "registration", bodyText: registration, headers: formHeaders(registration) })).toBe(false);
   });
 });
 
@@ -133,6 +139,11 @@ describe("ProtocolReadRateLimiter", () => {
     expect([limiter.take("a"), limiter.take("a"), limiter.take("a"), limiter.take("b")]).toEqual([true, true, false, true]);
     now = 1001;
     expect(limiter.take("a")).toBe(true);
+  });
+
+  test("checking the budget spends nothing", () => {
+    const limiter = new ProtocolReadRateLimiter({ maxPerWindow: 1, now: () => 0 });
+    expect([limiter.available("a"), limiter.available("a"), limiter.take("a"), limiter.available("a")]).toEqual([true, true, true, false]);
   });
 });
 
@@ -171,8 +182,8 @@ describe("OAuthMediator.protocolReadEndpoint", () => {
 
   test("matches a POST to an exact recorded token or registration endpoint", () => {
     const target = mediator();
-    expect(target.protocolReadEndpoint({ method: "POST", url: TOKEN_URL })).toEqual({ provider: "mcp:claude-linear", kind: "token" });
-    expect(target.protocolReadEndpoint({ method: "POST", url: REGISTER_URL })).toEqual({ provider: "mcp:claude-linear", kind: "registration" });
+    expect(target.protocolReadEndpoint({ method: "POST", url: TOKEN_URL })).toEqual({ provider: "mcp:claude-linear", kind: "token", resourceHost: "mcp.example.test" });
+    expect(target.protocolReadEndpoint({ method: "POST", url: REGISTER_URL })).toEqual({ provider: "mcp:claude-linear", kind: "registration", resourceHost: "mcp.example.test" });
   });
 
   test.each([
@@ -194,7 +205,7 @@ describe("OAuthMediator.protocolReadEndpoint", () => {
       "service:shared": { kind: "service", resourceHost: "api.example.test", tokenEndpoints: [{ host: "auth.example.test", path: "/oauth/token" }] },
     });
     expect(target.protocolReadEndpoint({ method: "POST", url: TOKEN_URL })).toBeUndefined();
-    expect(target.protocolReadEndpoint({ method: "POST", url: REGISTER_URL })).toEqual({ provider: "mcp:claude-linear", kind: "registration" });
+    expect(target.protocolReadEndpoint({ method: "POST", url: REGISTER_URL })).toEqual({ provider: "mcp:claude-linear", kind: "registration", resourceHost: "mcp.example.test" });
   });
 
   test("does not match an endpoint another server discovered at run time", async () => {
