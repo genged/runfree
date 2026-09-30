@@ -203,7 +203,7 @@ describe("launch latency: sub-second launch plan Phase B", () => {
       const startedAt = performance.now();
       const launched = launchClaude(fixture);
       const wallMs = performance.now() - startedAt;
-      const admission = ["admission:preflight", "admission:allocate", "admission:create-started", "admission:prove-running", "admission:activate"]
+      const admission = ["admission:preflight", "admission:allocate", "admission:create-started", "admission:prove-running", "admission:activate", "admission:await-handoff"]
         .reduce((sum, phase) => sum + (milliseconds(launched.output, phase) ?? 0), 0);
       samples.push({
         wallMs,
