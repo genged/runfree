@@ -3300,7 +3300,7 @@ describe("session admission under the per-session file source", () => {
       expect(mocks.transitionAttached).toHaveBeenCalledTimes(1);
     });
 
-    test("asserts the lifecycle lock on every poll and tears down, file first, when it is lost", async () => {
+    test("asserts the lifecycle lock on every poll and reports nothing attached once it is lost", async () => {
       const input = fixture();
       mocks.effectAnswers.set(TOP_LABEL, [topAnswer("entry")]);
       let polls = 0;
@@ -3366,14 +3366,50 @@ describe("session admission under the per-session file source", () => {
       const input = fixture();
       const hostile = "\u001b]0;pwned\u0007 PID PPID COMMAND";
       mocks.effectAnswers.set(TOP_LABEL, [{ status: 1, stdout: hostile, stderr: hostile }]);
+      const foreground = attachableForeground();
       try {
         const driver = createInternalSessionAdmissionDriver(input);
-        await expect(driver.launchBuiltin("codex")).resolves.toEqual({ status: 0, signal: null });
+        const launch = driver.launchBuiltin("codex");
+        await vi.waitFor(() => expect(mocks.transitionAttached).toHaveBeenCalled(), { timeout: 5_000 });
+        foreground.end({ kind: "exit", code: 0, signal: null });
+        await expect(launch).resolves.toEqual({ status: 0, signal: null });
         expect(tops()).toBe(1);
         expect(mocks.transitionAttached).toHaveBeenCalledTimes(1);
         const lines = output.drain();
         expect(lines.filter((line) => line.includes("could not observe the session entry"))).toHaveLength(1);
         expect(lines.join("\n")).not.toContain("pwned");
+      } finally {
+        output.restore();
+      }
+    });
+
+    test("cuts every daemon read off at the time left, so a hung daemon cannot stretch the hold", async () => {
+      const input = fixture();
+      await createInternalSessionAdmissionDriver(input).launchBuiltin("codex");
+      const topCalls = (input.io.capture as Mock).mock.calls
+        .filter(([, args]) => (args as string[])[0] === "container" && (args as string[])[1] === "top");
+      expect(topCalls.length).toBeGreaterThan(0);
+      for (const [, , options] of topCalls) {
+        expect(options).toMatchObject({ killSignal: "SIGKILL", maxBuffer: 64 * 1024 });
+        expect((options as { timeout: number }).timeout).toBeGreaterThan(0);
+        expect((options as { timeout: number }).timeout).toBeLessThanOrEqual(SESSION_HANDOFF_WAIT_CEILING_MS);
+      }
+    });
+
+    test("a container that stops as the listing fails is left to the attached wait, without a warning", async () => {
+      const output = captureOutput();
+      const input = fixture();
+      mocks.effectAnswers.set(TOP_LABEL, [{ status: 1, stdout: "", stderr: "container is not running" }]);
+      const foreground = attachableForeground();
+      mocks.topCommand.mockImplementation(() => {
+        // The agent exits just as the daemon is asked for its processes.
+        setTimeout(() => foreground.end({ kind: "exit", code: 3, signal: null }), 10);
+        return { executable: "docker", args: ["container", "top", CONTAINER_ID, "-o", "pid,ppid,args"] };
+      });
+      try {
+        const driver = createInternalSessionAdmissionDriver(input);
+        await expect(driver.launchBuiltin("codex")).resolves.toEqual({ status: 3, signal: null });
+        expect(output.drain().join("\n")).not.toContain("could not observe the session entry");
       } finally {
         output.restore();
       }

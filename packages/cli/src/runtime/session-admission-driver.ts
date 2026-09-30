@@ -295,7 +295,7 @@ const FOREGROUND_EXIT_BRIDGE_TIMEOUT_MS = 1_000;
 // daemon can take longer than 5 s to start one. Widening the window admits
 // nothing earlier: the proof still requires the same exact running assertion,
 // and no session is authorized before it returns.
-const RUNNING_PROOF_TIMEOUT_MS = 30_000;
+export const RUNNING_PROOF_TIMEOUT_MS = 30_000;
 /**
  * The longest a launch holds the project lifecycle lock after its grant while
  * waiting for the session entry to hand off to the agent (`awaitHandoff`).
@@ -309,6 +309,11 @@ const RUNNING_PROOF_TIMEOUT_MS = 30_000;
 export const SESSION_HANDOFF_WAIT_CEILING_MS = 10_000;
 /** How often the handoff wait asks the daemon for the container's processes. */
 const SESSION_HANDOFF_POLL_MS = 100;
+/**
+ * The least time one handoff read is given, so a read started just before the
+ * ceiling is not cut off before the daemon can answer at all.
+ */
+const SESSION_HANDOFF_MIN_READ_MS = 250;
 
 class PostCompletionAdmissionRecoveryError extends Error {
   readonly outcome: SessionAdmissionLaunchOutcome;
@@ -1664,21 +1669,22 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
 
   /**
    * One daemon-side read of whether the entry has handed off. Never throws:
-   * a failed read, an unparseable answer, and a missing anchor are all
-   * `unreadable`, which ends the wait at once rather than holding the lock
-   * over an observation that will not improve.
+   * a failed read, a read that outlived `timeoutMs`, an unparseable answer,
+   * and a missing anchor are all `unreadable`. The read is synchronous, so its
+   * own timeout is what keeps the ceiling a real bound on the lock hold: a
+   * hung daemon or CLI is killed, not waited out.
    */
-  #observeEntryHandoff(record: SessionContainerRecordV2): SessionContainerTopHandoff {
+  #observeEntryHandoff(record: SessionContainerRecordV2, timeoutMs: number): SessionContainerTopHandoff {
     try {
       const anchor = this.#require(this.#fileAnchor, "session-file anchor");
       const plan = this.#require(this.#plan, "session-container create plan");
       const result = executeSessionDockerCommand(
         sessionContainerTopCommand(record, this.#projectIdentity()),
-        (executable, args) => this.#gateway.io.capture(
-          executable,
-          [...args],
-          this.#dockerOptions(SESSION_CONTAINER_TOP_MAX_BYTES),
-        ),
+        (executable, args) => this.#gateway.io.capture(executable, [...args], {
+          ...this.#dockerOptions(SESSION_CONTAINER_TOP_MAX_BYTES),
+          timeout: timeoutMs,
+          killSignal: "SIGKILL",
+        }),
       );
       if (result.status !== 0) return "unreadable";
       return parseSessionContainerTopHandoff(result.stdout, {
@@ -1710,10 +1716,14 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
    *                attached wait's own lost-stream classification decides
    *                whether the container exited or only the stream was lost,
    *                exactly as it did before this step existed;
-   *   unreadable   the daemon's answer cannot say (reported once);
+   *   unreadable   the daemon's answer cannot say (reported once, unless the
+   *                foreground ends within the exit bridge: a container that
+   *                has just stopped has no process table to list);
    *   ceiling      `SESSION_HANDOFF_WAIT_CEILING_MS` (reported once) — the
    *                project image may replace the entry with one that never
    *                execs, and no launch may hold the project lock for long.
+   *                Every daemon read is itself cut off at the time remaining,
+   *                so a hung daemon cannot stretch the hold past it.
    *
    * The process table read is container-controlled data, so it only ever
    * decides *when* this launch reports; it grants nothing, and its text is
@@ -1727,35 +1737,43 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
     const record = this.#require(this.#admittedRecord, "admitted provisioning-running record");
     const foreground = this.#require(this.#foreground, "foreground attach handle");
     const startedAt = this.#nowMonotonicMs();
+    const remainingMs = (): number => SESSION_HANDOFF_WAIT_CEILING_MS - (this.#nowMonotonicMs() - startedAt);
     let foregroundEnded = false;
     void foreground.completion.then(() => { foregroundEnded = true; });
-    for (;;) {
-      this.#lock();
-      if (foregroundEnded || currentSessionContainerForegroundCompletion(foreground)) break;
-      const observed = this.#observeEntryHandoff(record);
-      this.#lock();
-      if (observed === "handed-off") break;
-      if (observed === "unreadable") {
-        warn("could not observe the session entry handing off to the agent; reporting the session attached now");
-        break;
-      }
-      const remaining = SESSION_HANDOFF_WAIT_CEILING_MS - (this.#nowMonotonicMs() - startedAt);
-      if (remaining <= 0) {
-        warn(`the session entry did not hand off to the agent within ${SESSION_HANDOFF_WAIT_CEILING_MS} ms; reporting the session attached now (the proxy has not served it yet, or the project image replaces the Runfree session entry)`);
-        break;
-      }
+    /** Waits up to `ms` for the foreground to end; true when it has. */
+    const foregroundEndsWithin = async (ms: number): Promise<boolean> => {
       let timer: ReturnType<typeof setTimeout> | undefined;
       try {
         await Promise.race([
           foreground.completion,
           new Promise<void>((resolve) => {
-            timer = setTimeout(resolve, Math.min(SESSION_HANDOFF_POLL_MS, remaining));
+            timer = setTimeout(resolve, Math.max(0, ms));
             timer.unref?.();
           }),
         ]);
       } finally {
         if (timer) clearTimeout(timer);
       }
+      return foregroundEnded || currentSessionContainerForegroundCompletion(foreground) !== undefined;
+    };
+    for (;;) {
+      this.#lock();
+      if (foregroundEnded || currentSessionContainerForegroundCompletion(foreground)) break;
+      const remaining = remainingMs();
+      if (remaining <= 0) {
+        warn(`the session entry did not hand off to the agent within ${SESSION_HANDOFF_WAIT_CEILING_MS} ms; reporting the session attached now (the proxy has not served it yet, or the project image replaces the Runfree session entry)`);
+        break;
+      }
+      const observed = this.#observeEntryHandoff(record, Math.max(remaining, SESSION_HANDOFF_MIN_READ_MS));
+      this.#lock();
+      if (observed === "handed-off") break;
+      if (observed === "unreadable") {
+        if (!await foregroundEndsWithin(FOREGROUND_EXIT_BRIDGE_TIMEOUT_MS)) {
+          warn("could not observe the session entry handing off to the agent; reporting the session attached now");
+        }
+        break;
+      }
+      if (await foregroundEndsWithin(Math.min(SESSION_HANDOFF_POLL_MS, remainingMs()))) break;
     }
     this.#lock();
     await this.#confirmAttached(record);
