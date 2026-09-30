@@ -296,6 +296,26 @@ The compatible active-session restart path is enabled: a compatible proxy replac
 
 A surviving session's launch process rebinds its own held authority after that transaction completes. Before each heartbeat it compares its held proxy container ID and control plane generation digest with the durable selection, and on a change it adopts exactly one completed compatible rebind of its own session — the durable candidate selection plus its registry record advanced only by the rebind writer's fields — and then beats and revokes against the new proxy. Any other divergence between held and durable authority refuses before any durable write, and the next launch reclaims the residue.
 
+A warm session launch can skip the full runtime validation. Every full
+validation ends by recording a warm-proof fingerprint in host state: the proxy
+container id, `StartedAt`, PID, image, and network endpoints; both networks
+and their participants; the session volumes; the agent image; both generation
+families; the security contract hash; the Git layout; the proxy CA and agent
+bundle digests; the validation marker digest; the nftables ruleset shape (set
+members excluded); the Docker daemon id, version, and kernel; and the VM boot
+id. A later launch, with an empty lifecycle registry, an unchanged runtime
+plan, and an unchanged selected control plane, re-reads all of these in one
+type-less `docker inspect` and one root batch inside the proxy, re-runs the
+same topology, capability, route, nftables, security-contract, firewall
+readiness, and marker validators over that fresh evidence, and compares the
+facts. Only an exact match within 24 hours skips the full validation; it does
+not re-run the agent-position deny-probe helper, the server-UID denial batch,
+or the root DNS liveness probe, whose inputs the fingerprint binds. A daemon
+with live-restore never takes this path. Anything else deletes the record and
+validates fully. `runfree up` always validates fully; `stop`, `destroy`, and
+`rebuild` remove the record. A launch also skips image cleanup when the
+host-side cleanup inputs have not changed since the last completed pass.
+
 Startup mints one in-memory `PreparedRuntime` after durable selection and live proof agree. Public launches consume that exact authority once. A changed container or selection causes one bounded re-prepare attempt. Credential sync occurs only after this prepared authority exists.
 
 Cleanup uses exact references from selections, lifecycle records, direct containers, and pending rebind state. The proxy's own session files are not a reference source; they gate the whole pass instead, so a session file no lifecycle record claims or a listing the host could not read stops the cleanup. It removes only inspected zero-reference image IDs and materialization paths. Ambiguous containers or unsafe state files stop cleanup. `runfree status` and verbose startup show effective, desired, retained, and pending generations.

@@ -412,14 +412,32 @@ export function applyServerUidDenialBatch(issues: string[], result: CaptureResul
   });
 }
 
+/**
+ * Firewall evidence a warm launch already fetched in its one root batch
+ * (sub-second launch plan Task 2). When given, `validateProxyFirewall` issues
+ * no Docker call: it judges these exact outputs with the same checks as the
+ * full path. Two probes do not run on a warm match — the root Docker DNS
+ * liveness probe and the server-UID denial batch; their inputs (proxy
+ * instance and image, network, ruleset shape) are bound by the warm proof.
+ */
+export type WarmFirewallEvidence = Readonly<{
+  /** The two framed route sections, exactly as `firewallSectionBatchScript` frames them. */
+  routes: readonly FirewallSectionResult[];
+  /** The raw `nft -j list table inet runfree_proxy` output. */
+  nftTable: FirewallSectionResult;
+  /** `nft list set inet runfree_proxy allowed_ipv4`. */
+  allowedSet: FirewallSectionResult;
+}>;
+
 export function validateProxyFirewall(
   issues: string[],
   context: RuntimeContext,
   io: RuntimeIO,
   proxyId: string,
   runtimeNetwork: RuntimeNetwork,
-  options: RuntimeProbeProgressOptions = {},
+  options: RuntimeProbeProgressOptions & { warm?: WarmFirewallEvidence } = {},
 ): ProxyFirewallProof {
+  const warm = options.warm;
   // Exec 1 (default daemon user): both route inspections, one framed batch.
   options.onProbe?.("proxy internal and egress route inspections");
   let internalIface: string | undefined;
@@ -427,11 +445,15 @@ export function validateProxyFirewall(
   if (!IPV4_LITERAL_PATTERN.test(runtimeNetwork.agentIp)) {
     issues.push(`proxy internal route inspection failed: agent address is not IPv4: ${runtimeNetwork.agentIp}`);
   } else {
-    const routeBatch = runDockerExec(context, io, proxyId, ["sh", "-c", firewallSectionBatchScript([
-      `ip -o route get ${runtimeNetwork.agentIp}`,
-      "ip -o route get 1.1.1.1",
-    ])]);
-    const routeSections = parseFirewallSectionBatch(routeBatch, 2);
+    const routeBatch: CaptureResult = warm
+      ? { status: 0, stdout: "", stderr: "" }
+      : runDockerExec(context, io, proxyId, ["sh", "-c", firewallSectionBatchScript([
+        `ip -o route get ${runtimeNetwork.agentIp}`,
+        "ip -o route get 1.1.1.1",
+      ])]);
+    const routeSections = warm
+      ? (warm.routes.length === 2 ? [...warm.routes] : undefined)
+      : parseFirewallSectionBatch(routeBatch, 2);
     if (!routeSections) {
       const detail = compactDiagnostic(`${routeBatch.stderr}\n${routeBatch.stdout}`);
       issues.push(`proxy internal route inspection failed: route batch was missing or garbled${detail ? `: ${detail}` : ""}`);
@@ -463,7 +485,9 @@ export function validateProxyFirewall(
   // Its stdout is minted verbatim into ProxyNftablesProofInput and reused for
   // the deny-by-default observation, so it never shares a framed batch.
   options.onProbe?.("proxy nftables owned-table inspection");
-  const proxyTable = runDockerExecRoot(context, io, proxyId, ["nft", "-j", "list", "table", "inet", "runfree_proxy"]);
+  const proxyTable: CaptureResult = warm
+    ? { status: warm.nftTable.exit, stdout: warm.nftTable.body, stderr: "" }
+    : runDockerExecRoot(context, io, proxyId, ["nft", "-j", "list", "table", "inet", "runfree_proxy"]);
   expectProbeSuccess(issues, "proxy nftables owned-table inspection", proxyTable);
   if (proxyTable.status !== 0) return {};
   let nftablesProofInput: ProxyNftablesProofInput | undefined;
@@ -482,6 +506,17 @@ export function validateProxyFirewall(
       } catch { /* Malformed evidence is not a proved violation. */ }
     }
     issues.push(...shapeIssues);
+  }
+
+  if (warm) {
+    // Warm match: the allowlist set is judged from the batch; the root DNS
+    // liveness probe and the server-UID denial batch are not re-run.
+    if (warm.allowedSet.exit !== 0) {
+      issues.push(`proxy nftables allowlist set inspection failed: ${compactDiagnostic(warm.allowedSet.body) || `exit ${warm.allowedSet.exit}`}`);
+    } else if (!warm.allowedSet.body.includes("set allowed_ipv4")) {
+      issues.push("proxy firewall must expose the allowed_ipv4 nftables set for live inspection");
+    }
+    return { nftablesProofInput };
   }
 
   // Exec 3 (root batch): allowlist-set inspection plus root Docker DNS.

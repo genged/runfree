@@ -170,7 +170,7 @@ export type DockerNetworkInspect = {
   Id?: string;
   Ingress?: boolean;
   Labels?: Record<string, string>;
-  Containers?: Record<string, { Name?: string; IPv4Address?: string }>;
+  Containers?: Record<string, { Name?: string; IPv4Address?: string; EndpointID?: string }>;
   EnableIPv6?: boolean;
   IPAM?: {
     Config?: Array<{

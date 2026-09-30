@@ -105,6 +105,7 @@ import { repairWorktreeLinks } from "./runtime/git-layout.ts";
 import { subprocessCategory } from "./runtime/operation-histogram.ts";
 import { COMPOSE_UP_FAILURE_REMEDY, restoreSameProxySessionAdmission, startRuntime, up } from "./runtime/startup.ts";
 import { TOKEN_SYNC_DEFERRED_STATUS } from "./runtime/constants.ts";
+import { preparedRuntimeProxyId } from "./runtime/prepared-runtime.ts";
 import { flushWarnings, pendingWarningsForTest } from "./warnings.ts";
 import { projectLifecycleLockPath, tryAcquireProjectLifecycleLockWithRetry } from "./runtime/sessions.ts";
 
@@ -1344,6 +1345,15 @@ function createRuntimeIO(overrides: {
     if (command === "git" && args[0] === "worktree" && args.at(-1) === "-h") return captureResult(129, "--relative-paths");
     if (command !== "docker") return captureResult(0);
     rememberProject(args);
+    // The availability check reads the daemon identity the warm proof binds.
+    if (args[0] === "info" && args.includes("{{json .}}")) {
+      return captureResult(0, JSON.stringify({
+        ID: process.env.FAKE_DOCKER_DAEMON_ID ?? "fake-daemon-id",
+        ServerVersion: "29.0.0",
+        KernelVersion: "6.10.14-linuxkit",
+        LiveRestoreEnabled: process.env.FAKE_DOCKER_LIVE_RESTORE === "1",
+      }));
+    }
     // The trust-setup exec's contract is that it returns 0 only after the
     // proxy published its CA into the shared host directory (the script waits
     // for it in-container). The double mirrors that side effect, because the
@@ -1634,6 +1644,52 @@ function createRuntimeIO(overrides: {
       if (runningOnly && !composeStarted && !process.env.FAKE_PREEXISTING_MCP_CALLBACK_ID) return captureResult(0);
       return captureResult(0, fakeListedContainerIds(args, [callbackSidecarId]));
     }
+    // The warm proof's one type-less inspect: proxy, both networks, the agent
+    // image, and the session volumes, by id or exact name, in request order.
+    if (args[0] === "inspect" && args[1] === FAKE_PROXY_CONTAINER_ID && args.includes(FAKE_AGENT_INTERNAL_NETWORK_ID)) {
+      const single = (request: string[]): Record<string, unknown> | undefined => {
+        const answer = defaultCapture("docker", request, env);
+        if (answer.status !== 0) return undefined;
+        const parsed = JSON.parse(answer.stdout) as Array<Record<string, unknown>>;
+        return parsed[0];
+      };
+      const containerView = single(["container", "inspect", FAKE_PROXY_CONTAINER_ID]) ?? {};
+      const objects = args.slice(1).map((target) => {
+        if (target === FAKE_PROXY_CONTAINER_ID) {
+          const proxy = single(["inspect", FAKE_PROXY_CONTAINER_ID]) ?? {};
+          return {
+            ...proxy,
+            Image: containerView.Image,
+            Config: { ...(proxy.Config as Record<string, unknown> | undefined) },
+            State: {
+              Status: "running",
+              Running: true,
+              Paused: false,
+              Restarting: false,
+              Pid: Number(process.env.FAKE_PROXY_PID ?? "4242"),
+              StartedAt: process.env.FAKE_PROXY_STARTED_AT ?? "2026-06-13T00:00:00.000Z",
+            },
+          };
+        }
+        const withEndpoints = (network: Record<string, unknown> | undefined) => network && {
+          ...network,
+          Containers: Object.fromEntries(Object.entries((network.Containers ?? {}) as Record<string, Record<string, unknown>>)
+            .map(([id, endpoint]) => [id, { ...endpoint, EndpointID: `endpoint-${id.slice(0, 12)}`, IPv4Address: `${fixedNetwork.proxyIp}/24` }])),
+        };
+        if (target === FAKE_AGENT_INTERNAL_NETWORK_ID) return withEndpoints(single(["network", "inspect", `${observedProject}_agent_internal`]));
+        if (target === FAKE_PROXY_EGRESS_NETWORK_ID) return withEndpoints(single(["network", "inspect", `${observedProject}_proxy_egress`]));
+        if (target.includes("_")) {
+          const volume = single(["volume", "inspect", target]);
+          return volume && { ...volume, CreatedAt: process.env.FAKE_VOLUME_CREATED_AT ?? "2026-06-12T00:00:00Z" };
+        }
+        const image = single(["image", "inspect", target]);
+        return image && { ...image, RootFS: { Type: "layers" } };
+      });
+      if (objects.some((object) => object === undefined)) {
+        return captureResult(1, JSON.stringify(objects.filter(Boolean)), "Error: No such object");
+      }
+      return captureResult(0, JSON.stringify(objects));
+    }
     if (args[0] === "inspect" && args.includes(FAKE_PROXY_CONTAINER_ID) && !args.includes("--format")) {
       const [agentInspect, proxyInspect] = securityContractInspectPair({
         containerProjectRoot: observedContainerProjectRoot,
@@ -1737,6 +1793,37 @@ function createRuntimeIO(overrides: {
         : captureResult(1, "", `Error response from daemon: network ${args.at(-1)} not found`);
     }
     const text = args.join(" ");
+    // The warm proof's one root batch: ten framed sections, answered with the
+    // same bytes the individual handlers give the full validation.
+    if (args[0] === "exec" && args.includes(FAKE_PROXY_CONTAINER_ID) && args.includes("0:0")
+      && text.includes("RUNFREE_FIREWALL_SECTION") && text.includes("/proc/sys/kernel/random/boot_id")) {
+      const body = (request: string[]): string => defaultCapture("docker", request, env).stdout.replace(/\n$/, "");
+      const allowedSet = [
+        "table inet runfree_proxy {",
+        "  set allowed_ipv4 {",
+        "    type ipv4_addr",
+        "    elements = { 140.82.112.5 }",
+        "  }",
+        "}",
+      ].join("\n");
+      const sections = [
+        { exit: 0, body: process.env.FAKE_WARM_BATCH_UID ?? "0" },
+        { exit: 0, body: `${fixedNetwork.agentIp} dev eth0 src ${fixedNetwork.proxyIp} uid 1001` },
+        { exit: 0, body: `1.1.1.1 via ${fixedNetwork.proxyEgressGateway} dev eth1 src ${fixedNetwork.proxyEgressIp} uid 1001` },
+        { exit: 0, body: process.env.FAKE_WARM_CAPBND ?? "0000000000001000" },
+        { exit: 0, body: process.env.FAKE_WARM_NFT_TABLE ?? proxyNftablesTableJson() },
+        { exit: 0, body: allowedSet },
+        { exit: 0, body: body(["exec", "--user", "0:0", FAKE_PROXY_CONTAINER_ID, "cat", "/run/runfree-runtime-validation.json"]) },
+        { exit: 0, body: body(["exec", "--user", "0:0", FAKE_PROXY_CONTAINER_ID, "cat", "/run/runfree-proxy-status/firewall.json"]) },
+        { exit: 0, body: securityContractProbeOutput("proxy").replace(/\n$/, "") },
+        { exit: 0, body: process.env.FAKE_WARM_BOOT_ID ?? "11111111-2222-3333-4444-555555555555" },
+      ];
+      return captureResult(0, `${sections.map((section, index) => [
+        `RUNFREE_FIREWALL_SECTION ${index} exit=${section.exit}`,
+        section.body,
+        `RUNFREE_FIREWALL_SECTION_END ${index}`,
+      ].join("\n")).join("\n")}\n`);
+    }
     if (args[0] === "exec"
       && args.includes(FAKE_PROXY_CONTAINER_ID)
       && args.includes(SESSION_ELIGIBILITY_PATH)
@@ -3565,14 +3652,17 @@ describe("runtime command flow", () => {
     const warm = await startRuntime(context, io, false, {});
     expect(warm.status).toBe(0);
     expect(warm.fastPath).toBe(true);
+    // `runfree up` always validates fully, and then records the warm-proof
+    // facts for the next launch: one type-less inspect and one root batch
+    // (+1 `docker inspect`, +1 `docker exec`; sub-second launch plan Task 2).
     expect(dockerOperationProfile(io.calls.slice(warmStart))).toMatchInlineSnapshot(`
       {
         "docker container inspect": 4,
         "docker container ls": 2,
-        "docker exec": 12,
+        "docker exec": 13,
         "docker image inspect": 9,
         "docker info": 1,
-        "docker inspect": 5,
+        "docker inspect": 6,
         "docker network inspect": 3,
         "docker ps": 12,
         "docker run": 1,
@@ -3580,6 +3670,227 @@ describe("runtime command flow", () => {
         "docker volume inspect": 1,
       }
     `);
+  });
+
+  // The same snapshot for a warm session launch whose warm proof matches and
+  // whose cleanup inputs are unchanged (sub-second launch plan Tasks 2 and 4):
+  // no deny-probe `docker run`, no marker reset or rewrite, no volume create,
+  // no readiness poll, no topology, security-contract, or cleanup inventory.
+  test("warm launch Docker operation profile", async () => {
+    const projectRoot = path.join(tmp, "project");
+    const project = prepareProject(projectRoot);
+    const context: RuntimeContext = {
+      projectRoot,
+      project,
+      runtimeRoot: path.join(tmp, "runtime"),
+      env: { PATH: "/fake-bin" },
+      network: fixedNetwork,
+    };
+    const io = createRuntimeIO();
+    expect((await startRuntime(context, io, false, { launch: true })).status).toBe(0);
+    expect((await startRuntime(context, io, false, { launch: true })).status).toBe(0);
+    const warmStart = io.calls.length;
+    const warm = await startRuntime(context, io, false, { launch: true });
+    expect(warm.status).toBe(0);
+    expect(dockerOperationProfile(io.calls.slice(warmStart))).toMatchInlineSnapshot(`
+      {
+        "docker container inspect": 1,
+        "docker container ls": 1,
+        "docker exec": 3,
+        "docker image inspect": 9,
+        "docker info": 1,
+        "docker inspect": 2,
+        "docker ps": 7,
+      }
+    `);
+  });
+
+  describe("warm-proof fingerprint (sub-second launch plan Task 2)", () => {
+    const warmEnvKeys = [
+      "FAKE_PROXY_STARTED_AT", "FAKE_PROXY_PID", "FAKE_DOCKER_DAEMON_ID", "FAKE_DOCKER_LIVE_RESTORE",
+      "FAKE_WARM_NFT_TABLE", "FAKE_WARM_CAPBND", "FAKE_WARM_BATCH_UID", "FAKE_WARM_BOOT_ID", "FAKE_VOLUME_CREATED_AT",
+    ] as const;
+    afterEach(() => {
+      for (const key of warmEnvKeys) delete process.env[key];
+    });
+    function launchContext(): RuntimeContext {
+      const projectRoot = path.join(tmp, "project");
+      const project = prepareProject(projectRoot);
+      return {
+        projectRoot,
+        project,
+        runtimeRoot: path.join(tmp, "runtime"),
+        env: { PATH: "/fake-bin" },
+        network: fixedNetwork,
+      };
+    }
+    const recordPath = (context: RuntimeContext): string =>
+      path.join(context.project.paths.stateDir, "runtime", "v2", "launch", "runtime-warm-proof.json");
+    const denyProbeRuns = (calls: readonly RuntimeIoCall[]): number => calls.filter((call) => call.command === "docker"
+      && call.args[0] === "run" && call.args.includes("io.runfree.helper-purpose=deny-probe")).length;
+    const markerResets = (calls: readonly RuntimeIoCall[]): number => calls.filter((call) => call.command === "docker"
+      && call.args[0] === "exec" && call.args.join(" ").includes("rm -f '/run/runfree-runtime-validation.json'")).length;
+    async function warmedUp(context: RuntimeContext, io: ReturnType<typeof createRuntimeIO>): Promise<void> {
+      expect((await startRuntime(context, io, false, { launch: true })).status).toBe(0);
+      expect((await startRuntime(context, io, false, { launch: true })).status).toBe(0);
+      expect(fs.existsSync(recordPath(context))).toBe(true);
+    }
+
+    test("a second warm launch skips runtime validation when the warm proof matches", async () => {
+      const context = launchContext();
+      const io = createRuntimeIO();
+      await warmedUp(context, io);
+      const start = io.calls.length;
+      const warm = await startRuntime(context, io, false, { launch: true });
+      expect(warm.status).toBe(0);
+      const calls = io.calls.slice(start);
+      // No deny-probe helper, no marker reset and rewrite, no volume create.
+      expect(denyProbeRuns(calls)).toBe(0);
+      expect(markerResets(calls)).toBe(0);
+      expect(dockerOperationProfile(calls)["docker volume create"]).toBeUndefined();
+      expect(dockerOperationProfile(calls)["docker run"]).toBeUndefined();
+      // The prepared runtime still carries an exact validation proof.
+      expect(warm.kind === "ready" && preparedRuntimeProxyId(warm.preparedRuntime)).toBe(FAKE_PROXY_CONTAINER_ID);
+    });
+
+    test("runfree up always runs the full validation and rewrites the record", async () => {
+      const context = launchContext();
+      const io = createRuntimeIO();
+      await warmedUp(context, io);
+      const before = JSON.parse(fs.readFileSync(recordPath(context), "utf8")) as { writtenAt: string };
+      const start = io.calls.length;
+      expect((await startRuntime(context, io, false, {})).status).toBe(0);
+      expect(denyProbeRuns(io.calls.slice(start))).toBe(1);
+      const after = JSON.parse(fs.readFileSync(recordPath(context), "utf8")) as { writtenAt: string };
+      expect(Date.parse(after.writtenAt)).toBeGreaterThanOrEqual(Date.parse(before.writtenAt));
+    });
+
+    test.each([
+      ["a restarted proxy (new StartedAt)", { FAKE_PROXY_STARTED_AT: "2026-06-13T06:00:00.000Z" }],
+      ["a new proxy process id", { FAKE_PROXY_PID: "5151" }],
+      ["another daemon", { FAKE_DOCKER_DAEMON_ID: "other-daemon-id" }],
+      ["a daemon with live-restore", { FAKE_DOCKER_LIVE_RESTORE: "1" }],
+      ["a rebooted Docker VM", { FAKE_WARM_BOOT_ID: "99999999-2222-3333-4444-555555555555" }],
+      ["a volume replaced under its name", { FAKE_VOLUME_CREATED_AT: "2026-06-13T09:00:00Z" }],
+    ])("a warm launch runs the full validation after %s", async (_label, env) => {
+      const context = launchContext();
+      const io = createRuntimeIO();
+      await warmedUp(context, io);
+      Object.assign(process.env, env);
+      const start = io.calls.length;
+      expect((await startRuntime(context, io, false, { launch: true })).status).toBe(0);
+      expect(denyProbeRuns(io.calls.slice(start))).toBe(1);
+      expect(markerResets(io.calls.slice(start))).toBe(1);
+    });
+
+    test("fresh evidence that fails a validator takes the full path even when every recorded fact matches", async () => {
+      const context = launchContext();
+      const io = createRuntimeIO();
+      await warmedUp(context, io);
+      // NET_RAW in the proxy's bounding set: the record cannot see it, the
+      // re-run capability validator does.
+      process.env.FAKE_WARM_CAPBND = "0000000000003000";
+      const start = io.calls.length;
+      await startRuntime(context, io, false, { launch: true });
+      expect(denyProbeRuns(io.calls.slice(start))).toBe(1);
+    });
+
+    test("a batch that did not run as root takes the full path", async () => {
+      const context = launchContext();
+      const io = createRuntimeIO();
+      await warmedUp(context, io);
+      process.env.FAKE_WARM_BATCH_UID = "1001";
+      const start = io.calls.length;
+      expect((await startRuntime(context, io, false, { launch: true })).status).toBe(0);
+      expect(denyProbeRuns(io.calls.slice(start))).toBe(1);
+    });
+
+    test("an unreadable or foreign-shaped record takes the full path and is replaced", async () => {
+      const context = launchContext();
+      const io = createRuntimeIO();
+      await warmedUp(context, io);
+      const valid = JSON.parse(fs.readFileSync(recordPath(context), "utf8")) as Record<string, unknown>;
+      for (const contents of ["{not json", JSON.stringify({ ...valid, extra: 1 }), JSON.stringify({ ...valid, version: 2 })]) {
+        fs.writeFileSync(recordPath(context), contents);
+        const start = io.calls.length;
+        expect((await startRuntime(context, io, false, { launch: true })).status).toBe(0);
+        expect(denyProbeRuns(io.calls.slice(start))).toBe(1);
+        expect(JSON.parse(fs.readFileSync(recordPath(context), "utf8")).version).toBe(1);
+      }
+    });
+
+    test("a record older than the warm bound takes the full path", async () => {
+      const context = launchContext();
+      const io = createRuntimeIO();
+      await warmedUp(context, io);
+      const record = JSON.parse(fs.readFileSync(recordPath(context), "utf8")) as Record<string, unknown>;
+      fs.writeFileSync(recordPath(context), JSON.stringify({ ...record, writtenAt: new Date(Date.now() - 25 * 60 * 60 * 1000).toISOString() }));
+      const start = io.calls.length;
+      expect((await startRuntime(context, io, false, { launch: true })).status).toBe(0);
+      expect(denyProbeRuns(io.calls.slice(start))).toBe(1);
+    });
+
+    test("a failed full validation leaves no record behind", async () => {
+      const context = launchContext();
+      let denyProbeEscapes = false;
+      const io = createRuntimeIO({
+        // One agent-position probe reaches the internet: a boundary failure.
+        capture: (command, args) => (denyProbeEscapes && command === "docker" && args[0] === "run"
+          && args.includes("io.runfree.helper-purpose=deny-probe") && args.join(" ").includes("RUNFREE_DENY_PROBE")
+          ? captureResult(0, `${[0, 1, 2, 3, 4, 5, 6].map((index) => `RUNFREE_DENY_PROBE ${index} exit=0`).join("\n")}\n`)
+          : undefined),
+      });
+      await warmedUp(context, io);
+      // A changed proxy forces the full path, and that validation now fails.
+      process.env.FAKE_PROXY_STARTED_AT = "2026-06-13T07:00:00.000Z";
+      denyProbeEscapes = true;
+      expect((await startRuntime(context, io, false, { launch: true })).status).not.toBe(0);
+      expect(fs.existsSync(recordPath(context))).toBe(false);
+    });
+
+    test("a launch with any lifecycle record takes the full path", async () => {
+      const context = launchContext();
+      const io = createRuntimeIO();
+      await warmedUp(context, io);
+      const desiredSessionAgent = readDesiredSessionAgentV2(context.project.paths.stateDir);
+      const effectiveControlPlane = readEffectiveControlPlaneV2(context.project.paths.stateDir);
+      if (!desiredSessionAgent || !effectiveControlPlane) throw new Error("warm-up did not publish the v2 selections");
+      const allocated = createAllocatedSessionContainerRecordV2({
+        sessionId: "rf-20260823-abcdef",
+        displayName: "other-session",
+        command: "codex",
+        launch: createSessionLaunchTarget({
+          path: "/usr/local/bin/codex",
+          args: ["--dangerously-bypass-approvals-and-sandbox"],
+          interactive: true,
+          tty: true,
+        }),
+        sourceIp: "172.31.90.20",
+        materialization: desiredSessionAgent.manifest,
+        effectiveControlPlane: effectiveControlPlane.selection,
+        hostPid: 99_999_999,
+        createdAt: "2026-08-23T19:00:00.000Z",
+      });
+      const attached = transitionProvisioningRunningSessionContainerToAttachedV2(
+        transitionBoundAllocatedSessionContainerToProvisioningRunningV2(
+          bindAllocatedSessionContainerIdV2(allocated, "7".repeat(64)),
+          {
+            admittedAt: "2026-08-23T19:00:00.000Z",
+            leaseGeneration: "8".repeat(32),
+            leaseExpiresAt: "2026-08-23T19:05:00.000Z",
+          },
+        ),
+      );
+      writeSessionContainerRecordV2(context.project.paths.stateDir, {
+        projectId: desiredSessionAgent.selection.projectId,
+        composeProject: desiredSessionAgent.selection.composeProject,
+      }, attached);
+      const start = io.calls.length;
+      expect((await startRuntime(context, io, false, { launch: true })).status).toBe(0);
+      // The record matched, but a registry with a session in it never takes
+      // the warm path: its restore re-proof must run.
+      expect(denyProbeRuns(io.calls.slice(start))).toBe(1);
+    });
   });
 
   describe("receipt-gated warm launch token sync (launch plan D4)", () => {

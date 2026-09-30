@@ -1112,11 +1112,8 @@ function dependencyVolumeValidationIssue(target: string, result: CaptureResult):
  * the one creation the removed service used to trigger. Idempotent and
  * fail-closed; the driver still re-proves each volume at launch.
  */
-export function ensureComposeManagedSessionVolumes(
-  context: RuntimeContext,
-  docker: RuntimeDocker,
-): number {
-  const project = composeProjectName(context.projectRoot);
+/** The logical names of every Compose-managed session volume this context's plan mounts. */
+export function composeManagedSessionVolumeLogicalNames(context: RuntimeContext): string[] {
   const logicalNames = ["runfree-commandhistory"];
   const plan = context.dependencyOverlayPlan;
   if (plan && plan.mode !== "off") {
@@ -1124,6 +1121,15 @@ export function ensureComposeManagedSessionVolumes(
       if (mount.type === "volume") logicalNames.push(mount.source);
     }
   }
+  return logicalNames;
+}
+
+export function ensureComposeManagedSessionVolumes(
+  context: RuntimeContext,
+  docker: RuntimeDocker,
+): number {
+  const project = composeProjectName(context.projectRoot);
+  const logicalNames = composeManagedSessionVolumeLogicalNames(context);
   for (const logicalName of logicalNames) {
     if (docker.createComposeManagedVolume(project, logicalName) !== 0) {
       warn(`could not ensure the Compose-managed session volume ${logicalName}`);

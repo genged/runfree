@@ -275,6 +275,12 @@ Details: [Write Approval Grants](architecture.md#write-approval-grants).
 - **Nothing from inside the container.** Session shape is proven by host-side
   `docker inspect` only. That shows what the daemon created, not what the
   process does.
+- **Agent-position egress on every launch.** A warm launch whose warm-proof
+  fingerprint matches does not re-run the agent-position deny probes, the
+  server-UID denial probes, or the root DNS probe. It re-validates the
+  topology, capabilities, routes, nftables ruleset, and security contract from
+  fresh evidence, and binds the rest to the proxy instance, networks, images,
+  ruleset shape, daemon, and VM boot. `runfree up` always runs every probe.
 - **Guest clock lag** is not tested live. The live fixture cannot shift the
   Docker VM clock. The rule that a lagging clock cannot extend a lease has
   unit tests only.

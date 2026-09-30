@@ -153,13 +153,59 @@ function runtimeEnvOptions(context: RuntimeContext): childProcess.SpawnSyncOptio
   };
 }
 
+/**
+ * The daemon a startup is talking to, as its own `docker info` reported it.
+ *
+ * Read from the one availability check every startup already runs (no extra
+ * Docker call). A warm launch binds its warm proof to it: a different daemon,
+ * version, or kernel means a different enforcement substrate, and a daemon
+ * with live-restore can restart under running containers without changing
+ * their `StartedAt`, so it never takes the warm path.
+ */
+export type DockerDaemonIdentity = Readonly<{
+  id: string;
+  serverVersion: string;
+  kernelVersion: string;
+  liveRestoreEnabled: boolean;
+}>;
+
+let lastDockerDaemonIdentity: DockerDaemonIdentity | undefined;
+
+export function parseDockerDaemonIdentity(stdout: string): DockerDaemonIdentity | undefined {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(stdout);
+  } catch {
+    return undefined;
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
+  const value = parsed as Record<string, unknown>;
+  const text = (key: string): string | undefined => {
+    const field = value[key];
+    return typeof field === "string" && field.length > 0 && field.length <= 256 ? field : undefined;
+  };
+  const id = text("ID");
+  const serverVersion = text("ServerVersion");
+  const kernelVersion = text("KernelVersion");
+  if (!id || !serverVersion || !kernelVersion || typeof value.LiveRestoreEnabled !== "boolean") return undefined;
+  return Object.freeze({ id, serverVersion, kernelVersion, liveRestoreEnabled: value.LiveRestoreEnabled });
+}
+
+/** The identity the most recent availability check in this process observed, if it parsed. */
+export function lastObservedDockerDaemonIdentity(): DockerDaemonIdentity | undefined {
+  return lastDockerDaemonIdentity;
+}
+
 function dockerAvailable(context: RuntimeContext, io: RuntimeIO): boolean {
   if (!io.commandExists("docker", dockerClientEnvOptions(context))) {
     die("docker not found - install Docker Desktop or OrbStack first");
   }
-  if (io.capture("docker", ["info"], dockerClientEnvOptions(context)).status !== 0) {
+  lastDockerDaemonIdentity = undefined;
+  const info = io.capture("docker", ["info", "--format", "{{json .}}"], dockerClientEnvOptions(context));
+  if (info.status !== 0) {
     die("docker daemon not running - start Docker / OrbStack first");
   }
+  lastDockerDaemonIdentity = parseDockerDaemonIdentity(info.stdout);
   return true;
 }
 

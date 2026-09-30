@@ -160,9 +160,26 @@ export function runtimeValidationMarkerStatus(
     dockerClientEnvOptions(context),
   );
   if (result.status !== 0) return { issue: "runtime validation marker is missing" };
+  return runtimeValidationMarkerProof(context, result.stdout, proxyId, { ...options, components });
+}
+
+/**
+ * Judges the exact bytes of one proxy's validation marker, without Docker.
+ *
+ * The same checks `runtimeValidationMarkerStatus` applies after its read; a
+ * warm launch reads the marker inside its one root batch and judges it here.
+ */
+export function runtimeValidationMarkerProof(
+  context: RuntimeContext,
+  markerBytes: string,
+  proxyId: string,
+  options: RuntimeValidationMarkerOptions & { components?: ControlPlaneGenerationV2 } = {},
+): RuntimeValidationMarkerResult {
+  const components = options.components ?? runtimeValidationComponents(context);
+  if (!components) return { issue: "runtime component state is unavailable for validation marker" };
   let parsed: unknown;
   try {
-    parsed = JSON.parse(result.stdout) as unknown;
+    parsed = JSON.parse(markerBytes) as unknown;
   } catch {
     return { issue: "runtime validation marker is malformed" };
   }

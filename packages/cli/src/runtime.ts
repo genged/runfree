@@ -27,6 +27,8 @@ import {
 import { die } from "./errors.ts";
 import { composeProjectName, projectHash, runtimeEnvironment } from "./runtime/env.ts";
 import { resumeInterruptedSessionThroughAdmission } from "./runtime/session-admission-resume.ts";
+import { removeWarmProofRecord } from "./runtime/warm-proof.ts";
+import { removeImageCleanupStamp } from "./runtime/image-cleanup-stamp.ts";
 import {
   assertBuiltinLaunchAgent,
   launchConfiguredAgentThroughAdmission,
@@ -1127,6 +1129,21 @@ export async function resumeRecoveryRuntime(
   return status;
 }
 
+/**
+ * Removes the warm-launch host records (sub-second launch plan Tasks 2 and 4)
+ * before a lifecycle change that ends the runtime they describe. Best effort:
+ * a record that outlives its runtime can only fail to match.
+ */
+function forgetWarmLaunchRecords(context: RuntimeContext): void {
+  for (const remove of [removeWarmProofRecord, removeImageCleanupStamp]) {
+    try {
+      remove(context.project.paths.stateDir);
+    } catch {
+      // The next start deletes or replaces it before it could matter.
+    }
+  }
+}
+
 export async function stopRuntime(context: RuntimeContext, io: RuntimeIO, options: { force?: boolean } = {}): Promise<number> {
   const stopAdapters = existingRuntimeAdapters(context, io);
   stopAdapters.docker.assertAvailable();
@@ -1139,6 +1156,8 @@ export async function stopRuntime(context: RuntimeContext, io: RuntimeIO, option
     lifecycleLock, operation: "stop", force: options.force, env: context.env,
   });
   clearRetiredWriteApprovalOverride(context);
+  // A stopped runtime has no warm launch to serve; the next start re-proves.
+  forgetWarmLaunchRecords(context);
   removeValidatedIngressForwarders(context, io, projectHash(context.projectRoot));
   const project = stopAdapters.docker.projectForWorkspace();
   if (project) return stopAdapters.docker.composeDown(project);
@@ -1166,6 +1185,7 @@ export async function destroyRuntime(
     return die(`nothing was destroyed: a Runfree runtime lifecycle change is in progress (lock: ${projectLifecycleLockPath(destroyContext)}); retry when it finishes`);
   }
   try {
+    forgetWarmLaunchRecords(destroyContext);
     return runFencedProjectDestroy({
       context: destroyContext,
       io,

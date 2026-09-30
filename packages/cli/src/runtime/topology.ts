@@ -12,6 +12,7 @@ import {
   dockerNetworkGateways,
   dockerOptionIsTrue,
   validateProxyFirewall,
+  type WarmFirewallEvidence,
 } from "./probes.ts";
 import {
   applyDenyProbeBatchResult,
@@ -57,7 +58,27 @@ export type RuntimeTopologyOptions = {
   helperFence?: EphemeralHelperFence;
   /** The image the helper runs: the bound selected image id when known. */
   helperImage?: string;
+  /**
+   * Evidence a warm launch already fetched (sub-second launch plan Task 2):
+   * with it the validator issues no Docker call and judges exactly these
+   * objects and outputs with the same checks as the full path. The deny-probe
+   * helper, the server-UID denial batch, and the root DNS liveness probe do
+   * not run on this path.
+   */
+  warmEvidence?: WarmTopologyEvidence;
 };
+
+export type WarmTopologyEvidence = Readonly<{
+  proxyId: string;
+  proxy: DockerContainerInspect;
+  internalNetwork: DockerNetworkInspect;
+  /** Every container the internal network names, the proxy included, inspected. */
+  participants: readonly DockerContainerInspect[];
+  egressNetwork: DockerNetworkInspect;
+  /** `awk '/CapBnd/ { print $2 }' /proc/1/status` as root. */
+  capBnd: Readonly<{ exit: number; body: string }>;
+  firewall: WarmFirewallEvidence;
+}>;
 
 export type RuntimeTopologyValidationResult = Readonly<{
   issues: RuntimeTopologyIssue[];
@@ -265,6 +286,7 @@ function validateProxyCapabilities(
   proxy: DockerContainerInspect,
   proxyId: string,
   onBoundaryViolation?: () => void,
+  warmCapBnd?: Readonly<{ exit: number; body: string }>,
 ): void {
   const initialIssues = issues.length;
   const capAdd = proxy.HostConfig?.CapAdd;
@@ -280,7 +302,9 @@ function validateProxyCapabilities(
   }
   if (issues.length > initialIssues) onBoundaryViolation?.();
 
-  const result = runDockerExecRoot(context, io, proxyId, ["awk", "/CapBnd/ { print $2 }", "/proc/1/status"]);
+  const result = warmCapBnd
+    ? { status: warmCapBnd.exit, stdout: warmCapBnd.body, stderr: "" }
+    : runDockerExecRoot(context, io, proxyId, ["awk", "/CapBnd/ { print $2 }", "/proc/1/status"]);
   if (result.status !== 0) {
     const detail = compactDiagnostic(`${result.stderr}\n${result.stdout}`);
     issues.push(`proxy PID 1 capability inspection failed${detail ? `: ${detail}` : ""}`);
@@ -368,7 +392,8 @@ export function validateRuntimeTopologyWithProof(
   // covers the fixed control plane (proxy + optional callback) and the agent
   // *position* on the internal network via an ephemeral helper; each session's
   // own container is validated by admission's running proof, not here.
-  const proxyId = serviceContainerId(project, "proxy", context, io);
+  const warm = options.warmEvidence;
+  const proxyId = warm ? warm.proxyId : serviceContainerId(project, "proxy", context, io);
   const runtimeNetwork = isActiveRuntimePlan(input)
     ? input.network
     : context.network ?? resolveRuntimeNetwork(context.projectRoot, context.project, [], { persist: false });
@@ -383,10 +408,12 @@ export function validateRuntimeTopologyWithProof(
 
   topologyProgress(options, "inspecting runtime containers");
   topologyVerbose(options, `docker inspect ${proxyId}`);
-  const inspect = parseDockerJson<DockerContainerInspect[]>(
-    io.capture("docker", ["inspect", proxyId], dockerClientEnvOptions(context)),
-    "docker inspect runtime containers",
-  );
+  const inspect = warm
+    ? [warm.proxy]
+    : parseDockerJson<DockerContainerInspect[]>(
+      io.capture("docker", ["inspect", proxyId], dockerClientEnvOptions(context)),
+      "docker inspect runtime containers",
+    );
   if (!inspect || inspect.length !== 1) {
     messages.push("could not inspect runtime containers");
     return topologyValidationResult(messages);
@@ -399,7 +426,7 @@ export function validateRuntimeTopologyWithProof(
 
   const proxyStateIssue = containerStateIssue("proxy", proxy);
   if (proxyStateIssue) {
-    const logs = containerLogs(context, io, proxyId);
+    const logs = warm ? "" : containerLogs(context, io, proxyId);
     messages.push(`${proxyStateIssue}${logs ? `; recent logs: ${logs}` : ""}`);
   }
 
@@ -417,10 +444,12 @@ export function validateRuntimeTopologyWithProof(
 
   topologyProgress(options, "inspecting internal Docker network");
   topologyVerbose(options, `docker network inspect ${internalNetwork}`);
-  const networkInspect = parseDockerJson<DockerNetworkInspect[]>(
-    io.capture("docker", ["network", "inspect", internalNetwork], dockerClientEnvOptions(context)),
-    "docker network inspect agent_internal",
-  );
+  const networkInspect = warm
+    ? [warm.internalNetwork]
+    : parseDockerJson<DockerNetworkInspect[]>(
+      io.capture("docker", ["network", "inspect", internalNetwork], dockerClientEnvOptions(context)),
+      "docker network inspect agent_internal",
+    );
   const network = networkInspect?.[0];
   if (!network) {
     messages.push("could not inspect agent_internal network");
@@ -437,10 +466,14 @@ export function validateRuntimeTopologyWithProof(
     topologyVerbose(options, `inspecting ${attachedIds.length} internal-network participant container(s)`);
     const attachedInspect = attachedIds.length === 0
       ? []
-      : parseDockerJson<DockerContainerInspect[]>(
-        io.capture("docker", ["inspect", ...attachedIds], dockerClientEnvOptions(context)),
-        "docker inspect agent_internal participants",
-      );
+      : warm
+        // The warm batch inspected every id the network names; one it did not
+        // is a missing participant, which the length check below refuses.
+        ? attachedIds.flatMap((id) => warm.participants.filter((participant) => participant.Id === id))
+        : parseDockerJson<DockerContainerInspect[]>(
+          io.capture("docker", ["inspect", ...attachedIds], dockerClientEnvOptions(context)),
+          "docker inspect agent_internal participants",
+        );
     if (!attachedInspect || attachedInspect.length !== attachedIds.length) {
       messages.push("could not inspect agent_internal participants");
     } else {
@@ -461,10 +494,12 @@ export function validateRuntimeTopologyWithProof(
 
   topologyProgress(options, "inspecting proxy egress Docker network");
   topologyVerbose(options, `docker network inspect ${egressNetwork}`);
-  const egressNetworkInspect = parseDockerJson<DockerNetworkInspect[]>(
-    io.capture("docker", ["network", "inspect", egressNetwork], dockerClientEnvOptions(context)),
-    "docker network inspect proxy_egress",
-  );
+  const egressNetworkInspect = warm
+    ? [warm.egressNetwork]
+    : parseDockerJson<DockerNetworkInspect[]>(
+      io.capture("docker", ["network", "inspect", egressNetwork], dockerClientEnvOptions(context)),
+      "docker network inspect proxy_egress",
+    );
   const inspectedEgressNetwork = egressNetworkInspect?.[0];
   if (!inspectedEgressNetwork) {
     messages.push("could not inspect proxy_egress network");
@@ -486,13 +521,13 @@ export function validateRuntimeTopologyWithProof(
 
   topologyProgress(options, "checking proxy capabilities and egress route");
   topologyVerbose(options, "inspecting proxy PID 1 capability bounding set");
-  validateProxyCapabilities(messages, context, io, proxy, proxyId, options.onBoundaryViolation);
+  validateProxyCapabilities(messages, context, io, proxy, proxyId, options.onBoundaryViolation, warm?.capBnd);
 
   if (proxyEgress?.IPAddress !== runtimeNetwork.proxyEgressIp) {
     messages.push(`proxy egress IP must be ${runtimeNetwork.proxyEgressIp}; got ${proxyEgress?.IPAddress || "<none>"}`);
   }
 
-  if (isActiveRuntimePlan(input) && network?.Id !== undefined) {
+  if (isActiveRuntimePlan(input) && network?.Id !== undefined && !warm) {
     // Per-session confinement of the agent *position*: the same direct-egress
     // denial probes, run in ONE ephemeral helper on agent_internal rather than
     // one container per probe (L3). These prove properties of the network
@@ -570,6 +605,7 @@ export function validateRuntimeTopologyWithProof(
     onProbe: (label) => topologyVerbose(options, label),
     onBoundaryViolation: options.onBoundaryViolation,
     expectedEgressSource: proxyEgress?.IPAddress,
+    ...(warm ? { warm: warm.firewall } : {}),
   });
 
   // A denied port-443 host is no longer rejected at the raw CONNECT guard: the

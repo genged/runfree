@@ -26,6 +26,7 @@ import {
   readConvergedPolicyReceipt,
 } from "../control/effective.ts";
 import {
+  composeManagedSessionVolumeLogicalNames,
   emptyDependencyOverlayPlan,
   ensureComposeManagedSessionVolumes,
   ensureDependencyVolumeOwnership,
@@ -36,6 +37,7 @@ import {
   containerMissingNetwork,
   createRuntimeDocker,
   dockerClientEnvOptions,
+  lastObservedDockerDaemonIdentity,
   parseDockerJson,
   type RuntimeDocker,
 } from "./docker.ts";
@@ -128,6 +130,7 @@ import type {
   TokenResolutionReceipt,
 } from "./types.ts";
 import {
+  listQuarantinedSessionContainerRecordNamesV2,
   listSessionContainerRecordsV2,
   type SessionContainerProjectIdentity,
   type SessionContainerRecordV2,
@@ -155,6 +158,14 @@ import {
   type PreparedRuntime,
 } from "./prepared-runtime.ts";
 import { createRuntimeTimings, type RuntimeTimings } from "./timings.ts";
+import {
+  assertWarmValidation,
+  recordWarmRuntimeProof,
+  removeWarmProofRecord,
+  tryWarmRuntimeValidation,
+  type WarmProofInput,
+  type WarmValidation,
+} from "./warm-proof.ts";
 import { TOKEN_SYNC_DEFERRED_STATUS } from "./constants.ts";
 import { imageCleanupStampMatches, writeImageCleanupStamp } from "./image-cleanup-stamp.ts";
 import { createOperationHistogram, withOperationHistogram } from "./operation-histogram.ts";
@@ -1226,6 +1237,7 @@ export async function startRuntime(
     adapters = createRuntimeAdapters(existingContext, io);
 
     ensureDockerAvailable();
+    const startupDaemonIdentity = lastObservedDockerDaemonIdentity();
     // Capture the proxy container id before any lifecycle change. The proxy
     // loads the on-disk policy at boot, so a changed id afterwards means it
     // already reflects the merged policy and a follow-up policy reload is moot.
@@ -1375,6 +1387,58 @@ export async function startRuntime(
     adapters = createRuntimeAdapters(activeContext, io);
 
     const project = activePlan.composeProjectName;
+    const warmProofInput = (): WarmProofInput | undefined => {
+      const effective = readEffectiveControlPlaneV2(activePlan.paths.stateDir);
+      const policy = readActiveControlSelection(context.project);
+      if (!effective || !policy) return undefined;
+      return {
+        plan: activePlan,
+        context: activeContext,
+        io,
+        effective: effective.selection,
+        effectivePolicyGeneration: policy.controlGeneration,
+        daemon: startupDaemonIdentity,
+        agentImage: ephemeralHelperImage(activePlan),
+        volumeLogicalNames: composeManagedSessionVolumeLogicalNames(activeContext),
+        gitLayout: serializeGitLayoutPlan(activePlan.gitLayout),
+      };
+    };
+    // Why this start may not even ask the warm proof, or undefined when it may.
+    const warmIneligibility = (): string | undefined => {
+      if (rebuildOptions.launch !== true) return "not-a-launch";
+      if (removeExisting) return "rebuild";
+      if (upgradePlan.action !== "token-sync") return `upgrade-${upgradePlan.action}`;
+      if (dependencyPlan.changed || gitLayout.changed) return "inputs-changed";
+      const identity = { projectId: activePlan.projectId, composeProject: project };
+      if (listSessionContainerRecordsV2(activePlan.paths.stateDir, identity).length > 0) return "live-sessions";
+      if (listQuarantinedSessionContainerRecordNamesV2(activePlan.paths.stateDir).length > 0) return "quarantined-records";
+      if (readControlPlaneRebindTransaction(activePlan.paths.stateDir, identity)) return "pending-rebind";
+      return undefined;
+    };
+    const warmValidationForLaunch = (): WarmValidation | undefined => {
+      let reason: string | undefined;
+      try {
+        reason = warmIneligibility();
+      } catch (error) {
+        reason = `unreadable: ${error instanceof Error ? error.message : String(error)}`;
+      }
+      if (reason !== undefined) {
+        if (rebuildOptions.launch === true) timings.report("validation:warm-proof", `skipped ${reason}`);
+        return undefined;
+      }
+      const input = warmProofInput();
+      if (!input) {
+        timings.report("validation:warm-proof", "unavailable");
+        return undefined;
+      }
+      const verdict = timings.time("validation:warm-proof-check", () => tryWarmRuntimeValidation(input));
+      timings.report("validation:warm-proof", verdict.kind === "mismatch" ? `mismatch:${verdict.field}` : verdict.kind);
+      if (verdict.kind !== "match") {
+        if (verdict.kind === "unavailable") reportRuntimeVerbose(verbose, `warm-proof unavailable: ${verdict.reason}`);
+        return undefined;
+      }
+      return verdict.validation;
+    };
     const validateSelectAndSync = async (): Promise<RuntimeStartResult> => {
       runImageCleanupUnlessUnchanged({
         context: activeContext,
@@ -1389,15 +1453,37 @@ export async function startRuntime(
           )?.selection.sessionAgentMaterializationDigest,
         },
       });
-      const validation = await timings.timeAsync(
-        "runtime-validation",
-        () => prepareRuntimeForTokenSyncOrRemoveInvalid(activePlan, activeContext, io, adapters.docker, { verbose, lifecycleLock: heldLifecycleLock, containmentIO }),
-      );
-      if (validation.status !== 0) return result(validation.status, false, activeContext);
-      const runtimeProof = validation.proof;
-      const securityProof = validation.securityProof;
-      const denyByDefaultObservation = validation.denyByDefaultObservation;
-      if (!runtimeProof || !securityProof || !denyByDefaultObservation) {
+      // Sub-second launch plan Task 2: a warm session launch whose warm-proof
+      // fingerprint matches skips the full validation. The verdict carries only
+      // the re-judged marker proof, so the control-plane selection below is
+      // never asked to prove or select from warm evidence.
+      heldLifecycleLock.assertHeld();
+      const warm = warmValidationForLaunch();
+      let validation: RuntimeTokenSyncPreparation | undefined;
+      let runtimeProof: RuntimeValidationProof | undefined;
+      if (warm) {
+        assertWarmValidation(warm);
+        runtimeProof = warm.runtimeProof;
+      } else {
+        // The record goes before the full path runs, so a validation that
+        // fails anywhere below leaves no record a later launch could match.
+        try {
+          removeWarmProofRecord(activePlan.paths.stateDir);
+        } catch (error) {
+          warn(`the warm-proof record could not be removed before full runtime validation: ${error instanceof Error ? error.message : String(error)}`);
+          return result(1, false, activeContext);
+        }
+        const full = await timings.timeAsync(
+          "runtime-validation",
+          () => prepareRuntimeForTokenSyncOrRemoveInvalid(activePlan, activeContext, io, adapters.docker, { verbose, lifecycleLock: heldLifecycleLock, containmentIO }),
+        );
+        if (full.status !== 0) return result(full.status, false, activeContext);
+        validation = full;
+        runtimeProof = full.proof;
+      }
+      const securityProof = validation?.securityProof;
+      const denyByDefaultObservation = validation?.denyByDefaultObservation;
+      if (!runtimeProof || (!warm && (!securityProof || !denyByDefaultObservation))) {
         warn("validated control-plane proof is incomplete before credential sync");
         return result(1, false, activeContext);
       }
@@ -1406,7 +1492,7 @@ export async function startRuntime(
         heldLifecycleLock.assertHeld();
         selectedPlan = selectEffectiveRuntimePlan(activePlan);
         heldLifecycleLock.assertHeld();
-        timings.time("control-plane-selection", () => {
+        if (!warm) timings.time("control-plane-selection", () => {
           const alreadySelected = readEffectiveControlPlaneV2(activePlan.paths.stateDir);
           const reusesExactControlPlane = alreadySelected !== undefined
             && alreadySelected.manifest.generation.controlPlaneGenerationDigest
@@ -1415,6 +1501,9 @@ export async function startRuntime(
               === activePlan.activeRuntime.controlPlaneMaterializationDigest
             && effectiveControlPlaneMatchesLiveRuntimeValidationV2(activePlan, runtimeProof, io);
           if (!reusesExactControlPlane) {
+            if (!securityProof || !denyByDefaultObservation) {
+              throw new Error("control-plane selection requires the full validation's proofs");
+            }
             proveAndSelectEffectiveControlPlaneV2({
               plan: activePlan,
               runtimeProof,
@@ -1429,6 +1518,15 @@ export async function startRuntime(
       } catch (error) {
         warn(error instanceof Error ? error.message : String(error));
         return result(1, false, activeContext);
+      }
+      // A full validation just proved the runtime and the selection matches
+      // it: record the warm-proof facts for the next launch (runfree up and
+      // launches alike; never a rebuild). Best effort.
+      if (!warm && !removeExisting) {
+        const input = warmProofInput();
+        const recorded = input ? recordWarmRuntimeProof(input) : "the warm-proof inputs are unavailable";
+        timings.report("validation:warm-proof", recorded === "written" ? "recorded" : "not-recorded");
+        if (recorded !== "written") reportRuntimeVerbose(verbose, `warm-proof record not written: ${recorded}`);
       }
       // Invariant 9, widen-before-new-files: the proxy is proven ready and the
       // control plane is selected, so publish the project's session eligibility
@@ -1445,7 +1543,7 @@ export async function startRuntime(
         ensureSessionEligibilityPublished({
           io,
           proxyId: runtimeProof.proxyId,
-          proxyStartedAt: observeProxyStartedAt(io, runtimeProof.proxyId, dockerClientEnvOptions(activeContext)),
+          proxyStartedAt: warm?.proxyStartedAt ?? observeProxyStartedAt(io, runtimeProof.proxyId, dockerClientEnvOptions(activeContext)),
           stateDir: activePlan.paths.stateDir,
           effective,
           desired,
@@ -1486,6 +1584,13 @@ export async function startRuntime(
       // eligibility unconditionally, so it runs whenever this project still has
       // lifecycle records to restore.
       if (listSessionContainerRecordsV2(activePlan.paths.stateDir, { projectId: activePlan.projectId, composeProject: project }).length) {
+        // The warm path runs only with an empty registry, checked under this
+        // same held lock, and reconcile adds no records; a record here means
+        // that premise broke, so nothing is restored from warm evidence.
+        if (!validation) {
+          warn("a lifecycle record appeared during a warm launch; retry the command to validate the runtime fully");
+          return result(1, false, activeContext);
+        }
         await restoreSameProxySessionAdmission({ plan: activePlan, io, lifecycleLock: heldLifecycleLock, proxyId: runtimeProof.proxyId, validation });
       }
       const proxyRecreated = proxyRecreatedSinceStart(adapters.docker);

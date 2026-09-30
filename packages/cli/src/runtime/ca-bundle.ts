@@ -33,7 +33,7 @@ import { sha256Digest as sha256 } from "../strict-primitives.ts";
 export const CA_BUNDLE_FILE = "ca-bundle.crt";
 export const CA_BUNDLE_CONTAINER_PATH = "/etc/proxy-ca/ca-bundle.crt";
 const CA_BUNDLE_META_FILE = "ca-bundle.meta.json";
-const PROXY_CA_FILE = "proxy-ca.crt";
+export const PROXY_CA_FILE = "proxy-ca.crt";
 const CA_BUNDLE_META_VERSION = 1;
 const MAX_SYSTEM_ROOTS_BYTES = 2 * 1024 * 1024;
 const CERTIFICATE_MARKER = "-----BEGIN CERTIFICATE-----";
