@@ -351,6 +351,15 @@ filter is repeatable; omit it to include both agents.
 
 Project `.mcp.json` and `.codex/config.toml` entries are imported only after approval. Static headers require a host-owned credential source.
 
+Local STDIO servers run inside the agent container, never on the host. A
+command that is a host path is skipped with `local STDIO command is not a
+portable capability; install it in the agent image`. One exception is Codex
+Desktop's `node_repl`: Runfree replaces it with its own portable `node-repl`
+server in the agent image (`runfree mcp list` shows `stdio (node-repl)`), and
+`runfree mcp explain codex node_repl` prints what runs instead of the host
+command. Codex `computer-use` controls host desktop apps, so Runfree skips it.
+See [Portable compute MCP](architecture.md#portable-compute-mcp).
+
 ## Dependency Overlays
 
 ```bash

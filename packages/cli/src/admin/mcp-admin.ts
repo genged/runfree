@@ -82,7 +82,7 @@ export function mcpListIntent(input: { json: boolean }): void {
       entry.source,
       entry.agent,
       entry.name,
-      entry.transport,
+      entry.portable ? `${entry.transport} (${entry.portable.capability})` : entry.transport,
       entry.auth,
       entry.decision.status,
       entry.mcpPolicy?.summary ?? "-",
@@ -182,6 +182,15 @@ export function mcpExplainIntent(input: McpExplainInput): void {
   if (entry.decision.reason) console.log(`reason: ${entry.decision.reason}`);
   console.log(`target: ${entry.target}`);
   if (entry.endpoint) console.log(`endpoint: ${entry.endpoint.host}${entry.endpoint.path}`);
+  if (entry.portable) {
+    // Shape and catalog facts only: nothing here ran the server in the selected
+    // agent image or in a live session.
+    console.log(`execution: portable container capability ${entry.portable.capability} (contract ${entry.portable.contractVersion})`);
+    console.log("source path: ignored; no host executable runs");
+    console.log(`bundle: runfree-mcp ${entry.portable.bundleVersion} from the Runfree base agent image`);
+    console.log("image check: not run against the selected agent image");
+    console.log("MCP tool calls: STDIO inside the agent container; not covered by proxy MCP operation policy or write approval");
+  }
   if (entry.mcpPolicy) {
     console.log(`server id: ${entry.mcpPolicy.operationServerId}`);
     console.log(`MCP tool default: ${entry.mcpPolicy.defaultToolWriteAction ?? "ask"}`);

@@ -1208,7 +1208,71 @@ Runfree imports supported Claude and Codex MCP entries into sanitized per-agent 
 - Project `.mcp.json` and `.codex/config.toml` entries are imported only after `runfree mcp approve`.
 - Static headers require a host-owned credential source.
 - OAuth login runs through `runfree mcp auth` or `runfree mcp approve --login` inside a validated runtime.
-- Side-effecting MCP tool calls use the same write-approval posture as outbound writes and can be governed with `runfree mcp rules`.
+- Side-effecting MCP tool calls use the same write-approval posture as outbound writes and can be governed with `runfree mcp rules`. This covers HTTP MCP servers, whose calls pass the proxy. STDIO servers run inside the agent container and their calls do not pass the proxy.
+
+### Portable Compute MCP
+
+Some Codex Desktop MCP servers do compute work with a host executable. Runfree
+never runs an imported command on the host and never mounts a host executable.
+Instead, a small Runfree catalog maps known compute descriptors to Runfree-owned
+servers that ship in the agent image (`packages/cli/src/runtime/portable-mcp.ts`).
+
+```text
+host ~/.codex/config.toml                      generated agent Codex config
+[mcp_servers.node_repl]                        [mcp_servers.node_repl]
+command = "/Applications/Codex.app/        ->  command = "/usr/local/bin/runfree-mcp"
+  Contents/Resources/node_repl"                args = ["node-repl"]
+env = { CODEX_HOME = "...", ... }              (host command, args, env, cwd discarded)
+```
+
+- Classification runs before the generic STDIO rules. Phase 1 matches only a
+  Codex descriptor named `node_repl` whose command is `Codex.app/Contents/Resources/node_repl`
+  or `.../cua_node/bin/node_repl` (any parent directory), with `args` empty or
+  `["--disable-sandbox"]`, only known env keys, and no `cwd` or `env_vars`.
+  These shapes come from public Codex issue reports.
+- A descriptor that looks like `node_repl` but fails a rule is skipped with
+  `portable descriptor changed and is not supported by this Runfree version`.
+  A `node_repl` with a bare command name keeps the generic STDIO rules.
+- A Codex Computer Use descriptor (`computer-use`, `unified-computer-use`,
+  `SkyComputerUseClient`, or the `openai-bundled/computer-use` plugin cache)
+  controls host desktop apps and is skipped. Isolated-display computer use is
+  not supported yet.
+- The generated entry keeps only safe scalar options (`startup_timeout_sec`,
+  `tool_timeout_sec`, `enabled`, `enabled_tools`, `disabled_tools`). It never
+  sets `required`, so a missing server cannot stop the agent session.
+- A project `.codex/config.toml` entry still needs `runfree mcp approve`. The
+  approval digest binds the capability id and its contract version, not the
+  host path. A contract change needs a new approval.
+- `runfree-mcp` accepts exactly one compiled capability id. The `node-repl`
+  server exposes `js` (with `code`, optional `timeout_ms` and `title`) and
+  `js_reset`. JavaScript runs in a child kernel process as the agent user, in
+  the session working directory, with the agent's mounts and network policy.
+  Limits: 256 KiB of code, 1 MiB of output per call, a 30 s default and 600 s
+  maximum time limit. A timeout or `js_reset` kills the kernel's process
+  group and discards its state (a process the cell moves to its own session
+  or group escapes that kill). The semantics are a compatible subset of Codex
+  Desktop's `node_repl`: a cell that uses top-level `await` runs as an async
+  function body, so its declarations do not persist and its last expression is
+  not returned (use `globalThis`, `return`, or `nodeRepl.write`); redeclaring a
+  top-level `let` or `const` from an earlier call is a `SyntaxError`; there is
+  no `js_add_node_module_dir`. Browser Use and Computer Use bootstraps that
+  import host plugin scripts do not work, because those scripts are not in the
+  container.
+- The server is built from `packages/agent-runtime/src/mcp/` with
+  `@modelcontextprotocol/sdk`, pinned in `pnpm-lock.yaml`. `pnpm run
+  bundle:agent-mcp` bundles only the STDIO server path with the pinned Bun
+  (1.3.14) into the committed `packages/agent-runtime/agent/mcp/`, with a
+  `manifest.json` of source hashes, file hashes, and each bundled package's
+  version, license, and lockfile integrity. CI rebuilds and byte-compares it
+  (`pnpm run bundle:agent-mcp -- --check`). The files are agent-image runtime
+  assets, so they feed the agent image input digest and the session agent
+  materialization.
+- The image build runs `self-check.mjs` as the agent user with no network. It
+  checks the files against the manifest, that the dispatcher refuses unknown
+  input, and one `js` call. Runfree does not yet run this check against the
+  selected image at session start, so `runfree mcp explain` says the selected
+  image was not checked. A project image that removes the bundle makes only
+  that server fail to start.
 
 ## Dependency Overlays
 
