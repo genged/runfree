@@ -55,6 +55,7 @@ const proxyImage = (assetPath: string): RuntimeAssetDescriptor => ({ path: asset
 export const RUNTIME_ASSET_DESCRIPTORS: readonly RuntimeAssetDescriptor[] = [
   agentImage("agent/Dockerfile"),
   agentImage("agent/claude-runfree.sh"),
+  agentImage("agent/codex-runfree.sh"),
   agentImage("agent/session-entry.sh"),
   agentImage("agent/session-ready-probe.cjs"),
   agentImage("agent/agent-tools/package-lock.json"),

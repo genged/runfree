@@ -72,6 +72,7 @@ describe("runtime bundle build", () => {
     expect(paths).toContain("agent/compose.yaml");
     expect(paths).toContain("agent/Dockerfile");
     expect(paths).toContain("agent/claude-runfree.sh");
+    expect(paths).toContain("agent/codex-runfree.sh");
     expect(paths).toContain("agent/session-entry.sh");
     expect(paths).toContain("agent/session-ready-probe.cjs");
     expect(paths).not.toContain("agent/session-finalizer.Dockerfile");
@@ -192,6 +193,8 @@ describe("runtime bundle build", () => {
 
     const agentDockerfile = read("agent/Dockerfile");
     expect(agentDockerfile).toContain("COPY claude-runfree.sh /usr/local/libexec/runfree/claude");
+    expect(agentDockerfile).toContain("COPY codex-runfree.sh /usr/local/libexec/runfree/codex");
+    expect(agentDockerfile).toContain("ln -s /usr/local/libexec/runfree/codex /usr/local/bin/codex");
     // The image must install the entry at the path every typed launch target
     // names as the container's `Path`, and the probe beside it where the entry
     // resolves it.

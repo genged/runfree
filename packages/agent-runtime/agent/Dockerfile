@@ -136,17 +136,20 @@ RUN npm ci --prefix /opt/runfree-agent-tools --omit=dev --ignore-scripts \
  && npm cache clean --force
 RUN --network=none npm rebuild --prefix /opt/runfree-agent-tools --omit=dev
 COPY claude-runfree.sh /usr/local/libexec/runfree/claude
+COPY codex-runfree.sh /usr/local/libexec/runfree/codex
 # The session container's first process: waits for the proxy to report the
 # session active, then execs the typed agent argv. Cooperation, not
 # enforcement; see docs/architecture.md "Readiness Entry".
 COPY session-entry.sh /usr/local/libexec/runfree/session-entry
 COPY session-ready-probe.cjs /usr/local/libexec/runfree/session-ready-probe
 RUN chmod 0755 /usr/local/libexec/runfree/claude \
+      /usr/local/libexec/runfree/codex \
       /usr/local/libexec/runfree/session-entry \
       /usr/local/libexec/runfree/session-ready-probe \
  && ln -s /opt/runfree-agent-tools/node_modules/.bin/claude /usr/local/libexec/runfree/claude-real \
  && ln -s /usr/local/libexec/runfree/claude /usr/local/bin/claude \
- && ln -s /opt/runfree-agent-tools/node_modules/.bin/codex /usr/local/bin/codex \
+ && ln -s /opt/runfree-agent-tools/node_modules/.bin/codex /usr/local/libexec/runfree/codex-real \
+ && ln -s /usr/local/libexec/runfree/codex /usr/local/bin/codex \
  && ln -s /opt/runfree-agent-tools/node_modules/.bin/pi /usr/local/bin/pi \
  && ln -s /opt/runfree-agent-tools/node_modules/.bin/pnpm /usr/local/bin/pnpm \
  && ln -s /opt/runfree-agent-tools/node_modules/.bin/tsx /usr/local/bin/tsx
