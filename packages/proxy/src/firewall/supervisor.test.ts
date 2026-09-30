@@ -20,6 +20,7 @@ import {
   type SessionIpAssignment,
 } from "@runfree/runtime-contracts/session-file";
 import { scanSessionFiles } from "../session-files.ts";
+import { createSessionAdmissionScheduler } from "../entrypoint.ts";
 
 // Default the generation status publisher to a no-op so unit tests never touch
 // the real /run tmpfs path; status-file tests override it explicitly.
@@ -1450,6 +1451,59 @@ describe("proxy firewall session file admission", () => {
     // or make the new owner ambiguous after the fence completes.
     await harness.controller.reconcileSessionAdmission();
     expect(harness.replacements.at(-1)).toEqual([SESSION_IP_A, SESSION_IP_B]);
+  });
+
+  test("events during a fence's kernel verification never acknowledge before it, and cost one more pass (I4)", async () => {
+    // Launch plan Task 7: input events now trigger reconciles within
+    // milliseconds, so they arrive while a reconcile is still verifying the
+    // kernel set. The acknowledgement must still follow that verification,
+    // and the events must not start an overlapping reconcile.
+    const assignments = new Map<string, SessionIpAssignment>();
+    const events: string[] = [];
+    let releaseVerification: (() => void) | undefined;
+    const harness = await filesHarness({
+      readIpAssignments: () => assignments,
+      verifySessionAdmissionSet: async (ips) => {
+        events.push(`verify-start:${ips.join(",")}`);
+        if (assignments.size > 0 && events.filter((event) => event.startsWith("verify-start")).length === 1) {
+          await new Promise<void>((resolve) => {
+            releaseVerification = resolve;
+          });
+        }
+        events.push(`verified:${ips.join(",")}`);
+      },
+      acknowledgeIpAssignment: (assignment) => events.push(`ack:${assignment.nonce}`),
+    });
+    writeSessionFile(harness.root, sessionFile(SESSION_IP_A, "1"));
+    writeSessionFile(harness.root, sessionFile(SESSION_IP_B, "2"));
+    await harness.controller.reconcileSessionAdmission();
+    events.length = 0;
+
+    let fire: () => void = () => {};
+    const scheduler = createSessionAdmissionScheduler({
+      controller: harness.controller,
+      intervalMs: 60_000,
+      log: () => {},
+      createWatch: (onChange) => {
+        fire = onChange;
+        return { rearm: () => {}, close: () => {}, armedCount: () => 3 };
+      },
+    });
+    const assignment: SessionIpAssignment = {
+      v: 1, sourceIp: SESSION_IP_A, sessionKey: "3".repeat(64), nonce: "a".repeat(32), state: "draining",
+    };
+    assignments.set(SESSION_IP_A, assignment);
+    scheduler.start();
+    await vi.waitFor(() => expect(releaseVerification).toBeDefined());
+    for (let index = 0; index < 20; index += 1) fire();
+    expect(events).toEqual([`verify-start:${SESSION_IP_B}`]);
+    releaseVerification?.();
+    await vi.waitFor(() => expect(events.filter((event) => event.startsWith("ack:"))).toHaveLength(2));
+    scheduler.stop();
+    // The first acknowledgement follows the verification it depends on; the
+    // coalesced follow-up pass finds the set unchanged and only re-acknowledges.
+    expect(events.slice(0, 3)).toEqual([`verify-start:${SESSION_IP_B}`, `verified:${SESSION_IP_B}`, `ack:${assignment.nonce}`]);
+    expect(events.filter((event) => event.startsWith("verify-start"))).toHaveLength(1);
   });
 
   test("never installs a file that fails eligibility", async () => {

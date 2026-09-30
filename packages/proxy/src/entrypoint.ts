@@ -15,6 +15,12 @@ import {
   type FirewallController,
 } from "./firewall/index.js";
 import { loadProxyPolicy } from "./policy.js";
+import {
+  createSessionAdmissionWatch,
+  sessionAdmissionWatchEnabled,
+  sessionAdmissionWatchTargets,
+  type SessionAdmissionWatch,
+} from "./session-admission-watch.js";
 import { assertSourceIpSessionIdentityConfig } from "./session-identity-config.js";
 import {
   effectiveProxyRootFromEnv,
@@ -86,6 +92,12 @@ type SessionAdmissionSchedulerInput = {
   controller: SessionAdmissionReconciliationController;
   intervalMs?: number;
   log?: (line: string) => void;
+  /**
+   * Arms the input watcher (launch plan Task 7). Called by `start()`, after
+   * the controller is initialized, so an event can never reach a controller
+   * that has no plan yet; closed by `stop()`.
+   */
+  createWatch?: (onChange: () => void) => SessionAdmissionWatch;
 };
 
 export function serverLaunchCommand(): ServerLaunchCommand {
@@ -243,11 +255,16 @@ export function createSessionAdmissionScheduler(input: SessionAdmissionScheduler
   const log = input.log ?? ((line: string) => console.error(line));
   const intervalMs = input.intervalMs ?? 100;
   let timer: ReturnType<typeof setInterval> | undefined;
+  let watch: SessionAdmissionWatch | undefined;
   let inFlight = false;
   let pending = false;
   let stopped = false;
+  let lastError: string | undefined;
 
+  // One reconcile at a time; any number of triggers while one runs (events,
+  // interval ticks) cost exactly one more pass over the latest state.
   const tick = async () => {
+    if (stopped) return;
     if (inFlight) {
       pending = true;
       return;
@@ -259,8 +276,13 @@ export function createSessionAdmissionScheduler(input: SessionAdmissionScheduler
         pending = false;
         try {
           await input.controller.reconcileSessionAdmission();
+          lastError = undefined;
         } catch (error) {
-          log(`proxy-firewall: session admission reconciliation failed: ${formatError(error)}`);
+          // Once per distinct failure: events can now retry a failing
+          // reconcile many times a second.
+          const detail = formatError(error);
+          if (detail !== lastError) log(`proxy-firewall: session admission reconciliation failed: ${detail}`);
+          lastError = detail;
         }
       } while (pending && !stopped);
     } finally {
@@ -272,7 +294,17 @@ export function createSessionAdmissionScheduler(input: SessionAdmissionScheduler
     tick,
     start() {
       stopped = false;
+      // Watch, then list: the watcher is armed before the first reconcile, so
+      // a write that lands between the two is seen by one or the other.
+      watch = input.createWatch?.(() => {
+        void tick();
+      });
+      watch?.rearm();
+      void tick();
+      // The interval is the backstop: lease expiry changes no file, and a
+      // lost event or failed watcher must not stall admission or revocation.
       timer = setInterval(() => {
+        watch?.rearm();
         void tick();
       }, intervalMs);
       return timer;
@@ -280,6 +312,8 @@ export function createSessionAdmissionScheduler(input: SessionAdmissionScheduler
     stop() {
       stopped = true;
       pending = false;
+      watch?.close();
+      watch = undefined;
       if (timer !== undefined) {
         clearInterval(timer);
         timer = undefined;
@@ -326,7 +360,16 @@ export async function main(): Promise<number> {
     policyIntervalMs: refreshIntervalMs,
     dnsIntervalMs,
   });
-  const sessionAdmissionScheduler = createSessionAdmissionScheduler({ controller });
+  const sessionAdmissionScheduler = createSessionAdmissionScheduler({
+    controller,
+    ...(sessionAdmissionWatchEnabled() ? {
+      createWatch: (onChange: () => void) => createSessionAdmissionWatch({
+        targets: sessionAdmissionWatchTargets(SESSION_ADMISSION_ROOT),
+        onChange,
+        label: "proxy-firewall",
+      }),
+    } : {}),
+  });
   refreshScheduler.start();
   sessionAdmissionScheduler.start();
 

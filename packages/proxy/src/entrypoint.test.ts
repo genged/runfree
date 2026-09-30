@@ -344,3 +344,137 @@ describe("proxy entrypoint", () => {
     expect(reconcileSessionAdmission).toHaveBeenCalledTimes(4);
   });
 });
+
+// Launch plan Task 7 is a cadence change: the firewall's session set is now
+// rebuilt on an input event as well as on the 100 ms interval. These cases
+// re-prove what the old loop gave for free (AGENTS.md: coverage that only held
+// because the system was slow is not proof).
+describe("event-driven session admission scheduler", () => {
+  type FakeWatch = {
+    fire: () => void;
+    rearms: number;
+    closed: boolean;
+  };
+
+  function schedulerWithFakeWatch(reconcileSessionAdmission: () => Promise<void>, log: (line: string) => void = () => {}) {
+    const fake: FakeWatch = { fire: () => {}, rearms: 0, closed: false };
+    const scheduler = createSessionAdmissionScheduler({
+      controller: { reconcileSessionAdmission },
+      intervalMs: 100,
+      log,
+      createWatch: (onChange) => {
+        fake.fire = onChange;
+        return {
+          rearm: () => {
+            fake.rearms += 1;
+          },
+          close: () => {
+            fake.closed = true;
+          },
+          armedCount: () => (fake.closed ? 0 : 3),
+        };
+      },
+    });
+    return { scheduler, fake };
+  }
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  test("an input event rebuilds the set before the interval would (I1)", async () => {
+    vi.useFakeTimers();
+    const reconcile = vi.fn(async () => {});
+    const { scheduler, fake } = schedulerWithFakeWatch(reconcile);
+    scheduler.start();
+    // Watch-then-list: start arms and reconciles once, so a file written
+    // before the watcher existed is not left to the interval.
+    await vi.advanceTimersByTimeAsync(0);
+    expect(fake.rearms).toBe(1);
+    expect(reconcile).toHaveBeenCalledTimes(1);
+
+    await vi.advanceTimersByTimeAsync(10);
+    fake.fire();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(reconcile).toHaveBeenCalledTimes(2);
+    scheduler.stop();
+  });
+
+  test("with the watcher armed and no event, the interval still rebuilds every tick (I2: lease expiry)", async () => {
+    // A lease runs out with no file change, so no event can ever report it.
+    vi.useFakeTimers();
+    const reconcile = vi.fn(async () => {});
+    const { scheduler, fake } = schedulerWithFakeWatch(reconcile);
+    scheduler.start();
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(500);
+    expect(reconcile).toHaveBeenCalledTimes(6);
+    // Every backstop tick also re-arms a failed or replaced watcher (I5).
+    expect(fake.rearms).toBe(6);
+    scheduler.stop();
+  });
+
+  test("a burst of events during a rebuild costs exactly one more rebuild (I6)", async () => {
+    let release!: () => void;
+    let calls = 0;
+    const reconcile = vi.fn(() => {
+      calls += 1;
+      if (calls !== 2) return Promise.resolve();
+      return new Promise<void>((resolve) => {
+        release = resolve;
+      });
+    });
+    const { scheduler, fake } = schedulerWithFakeWatch(reconcile);
+    vi.useFakeTimers();
+    scheduler.start();
+    await vi.advanceTimersByTimeAsync(0);
+    fake.fire();
+    for (let index = 0; index < 50; index += 1) fake.fire();
+    release();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(reconcile).toHaveBeenCalledTimes(3);
+    scheduler.stop();
+  });
+
+  test("no event rebuilds before start or after stop, and stop closes the watcher (I9)", async () => {
+    vi.useFakeTimers();
+    const reconcile = vi.fn(async () => {});
+    const { scheduler, fake } = schedulerWithFakeWatch(reconcile);
+    fake.fire();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(reconcile).not.toHaveBeenCalled();
+
+    scheduler.start();
+    await vi.advanceTimersByTimeAsync(0);
+    const started = reconcile.mock.calls.length;
+    scheduler.stop();
+    expect(fake.closed).toBe(true);
+    fake.fire();
+    await scheduler.tick();
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(reconcile).toHaveBeenCalledTimes(started);
+  });
+
+  test("a repeating reconcile failure is logged once, not once per event", async () => {
+    const logs: string[] = [];
+    const reconcile = vi.fn<() => Promise<void>>(async () => {
+      throw new Error("nft set verification failed");
+    });
+    const { scheduler, fake } = schedulerWithFakeWatch(reconcile, (line) => logs.push(line));
+    vi.useFakeTimers();
+    scheduler.start();
+    for (let index = 0; index < 5; index += 1) {
+      fake.fire();
+      await vi.advanceTimersByTimeAsync(0);
+    }
+    expect(logs.filter((line) => line.includes("nft set verification failed"))).toHaveLength(1);
+    reconcile.mockResolvedValueOnce(undefined);
+    fake.fire();
+    await vi.advanceTimersByTimeAsync(0);
+    fake.fire();
+    await vi.advanceTimersByTimeAsync(0);
+    // A recovery resets the dedupe, so the next failure is reported again.
+    expect(logs.filter((line) => line.includes("nft set verification failed"))).toHaveLength(2);
+    scheduler.stop();
+  });
+});

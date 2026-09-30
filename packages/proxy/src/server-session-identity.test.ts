@@ -530,3 +530,111 @@ describe("proxy server source-IP session identity", () => {
     expect(fs.readdirSync(testState.pendingDir).filter((name) => name.endsWith(".json"))).toEqual([]);
   }, 20_000);
 });
+
+// Launch plan Task 7 is a cadence change: the request proxy now reconciles on
+// an inotify event as well as on its 100 ms interval. The revocation cases run
+// twice — with the watcher, and with only the backstop interval (the
+// host-controlled `RUNFREE_SESSION_ADMISSION_WATCH=off` test switch) — so a
+// regression in either path cannot hide behind the other (I10).
+const ADMISSION_PATHS = [
+  ["with the input watcher", {}],
+  ["with the backstop interval alone", { RUNFREE_SESSION_ADMISSION_WATCH: "off" }],
+] as const;
+
+describe("proxy server session admission at the event-driven cadence", () => {
+  test.each(ADMISSION_PATHS)("removing the session file closes the open tunnel and refuses the next CONNECT %s (I1)", async (_label, watchEnv) => {
+    const testState = state();
+    writeSessionFiles(testState, [sessionFile(KEY_A)]);
+    const upstream = await startHttpsUpstream();
+    const proxy = await startProxy({
+      extraEnv: { ...sourceIdentityEnv(testState), ...watchEnv, NODE_EXTRA_CA_CERTS: upstream.certPath },
+      policy: { hosts: ["127.0.0.1"], tokens: {}, writeApproval: "allow" },
+    });
+    await waitUntilServed(proxy.port);
+    const tunnel = await openConnectTunnel({ authority: "127.0.0.1:443", proxyPort: proxy.port });
+    expect(tunnel.head.statusCode).toBe(200);
+    const tlsSocket = await tlsHandshakeOverTunnel(tunnel.socket);
+    // The tunnel is live before the revocation, so its closure below is the
+    // revocation's doing.
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    expect(tlsSocket.destroyed).toBe(false);
+
+    writeSessionFiles(testState, []);
+    await waitUntil(() => tlsSocket.destroyed, "revoked session tunnel closure", 2_000);
+    await waitUntilServed(proxy.port, false);
+    const refused = await rawConnectViaProxy({ authority: "127.0.0.1:443", proxyPort: proxy.port });
+    expect(refused.statusCode).toBe(403);
+    expect(upstream.acceptedConnections()).toBe(0);
+  }, 20_000);
+
+  test.each(ADMISSION_PATHS)("a lease that lapses with no file change is refused %s (I2)", async (_label, watchEnv) => {
+    // Time passes and no file changes, so no event can ever report this: the
+    // backstop interval is the only path, with or without the watcher.
+    const testState = state();
+    const inspectedAt = new Date();
+    writeSessionFiles(testState, [sessionFile(KEY_A, {
+      inspectedAt: inspectedAt.toISOString(),
+      aliveUntil: new Date(inspectedAt.getTime() + 2_500).toISOString(),
+    })]);
+    const proxy = await startSessionProxy(testState, watchEnv);
+    await waitUntilServed(proxy.port);
+    await waitUntilServed(proxy.port, false);
+    // Refused on the lease's own clock, well inside the served wait's bound.
+    expect(Date.now() - inspectedAt.getTime()).toBeLessThan(8_000);
+    const refused = await rawConnectViaProxy({ authority: "127.0.0.1:443", proxyPort: proxy.port });
+    expect(refused.statusCode).toBe(403);
+    expect(refused.body).toContain("expired");
+  }, 20_000);
+
+  test("host publications for other sessions never drop a served session's tunnel (I8)", async () => {
+    // Every host publication creates a temp file in a watched directory and
+    // renames it into place, so with the watcher a reconcile lands inside the
+    // write window each time. None of it may read as a contradiction: the
+    // served session keeps its open tunnel and stays served throughout.
+    const testState = state();
+    writeSessionFiles(testState, [sessionFile(KEY_A)]);
+    const upstream = await startHttpsUpstream();
+    const proxy = await startProxy({
+      extraEnv: { ...sourceIdentityEnv(testState), NODE_EXTRA_CA_CERTS: upstream.certPath },
+      policy: { hosts: ["127.0.0.1"], tokens: {}, writeApproval: "allow" },
+    });
+    await waitUntilServed(proxy.port);
+    const tunnel = await openConnectTunnel({ authority: "127.0.0.1:443", proxyPort: proxy.port });
+    expect(tunnel.head.statusCode).toBe(200);
+    const tlsSocket = await tlsHandshakeOverTunnel(tunnel.socket);
+
+    const requestsDir = path.join(testState.registryDir, "ip-reuse", "requests");
+    fs.mkdirSync(requestsDir, { recursive: true, mode: 0o755 });
+    const otherSession = { ...sessionFile(KEY_B), sourceIp: "127.0.0.2" };
+    try {
+      for (let round = 0; round < 100; round += 1) {
+        // Another launch's fence (draining, then ready), an eligibility
+        // rewrite, and the served session's own heartbeat (a fresh nonce per
+        // publication).
+        replaceFileAtomically(path.join(requestsDir, "127.0.0.2.json"), JSON.stringify({
+          v: 1,
+          sourceIp: "127.0.0.2",
+          sessionKey: KEY_B,
+          nonce: round.toString(16).padStart(32, "0"),
+          state: round % 2 === 0 ? "draining" : "ready",
+        }));
+        writeSessionFiles(testState, [
+          sessionFile(KEY_A, { nonce: (round + 1).toString(16).padStart(32, "a") }),
+          otherSession,
+        ]);
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      await waitUntilServed(proxy.port);
+      expect(tlsSocket.destroyed).toBe(false);
+      const after = await httpsRequestOverTunnel(tlsSocket, {
+        host: "127.0.0.1",
+        path: "/after-publications",
+        targetPort: upstream.port,
+      });
+      expect(after.statusCode).toBe(200);
+      expect(proxy.output()).not.toMatch(/session admission reconciliation failed/);
+    } finally {
+      tlsSocket.destroy();
+    }
+  }, 30_000);
+});
