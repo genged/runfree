@@ -147,6 +147,10 @@ import {
   observeProxyStartedAt,
 } from "./session-eligibility-publication.ts";
 import { reconcileSessions } from "./session-reconcile.ts";
+import {
+  pendingSessionFileAdmissionRecords,
+  reclaimPendingSessionAdmissions,
+} from "./session-admission-pending-reclaim.ts";
 import { waitForSessionAdmissionFirewallSetEmpty } from "./session-file-publisher.ts";
 import {
   mintPreparedRuntime,
@@ -353,43 +357,6 @@ function hasNewActiveSessions(
 const LIVE_ADMISSION_WAIT_ATTEMPTS = 20;
 const LIVE_ADMISSION_WAIT_DELAY_MS = 250;
 
-// How long an allocation may sit without a container before it stops being an
-// admission in flight and becomes one that needs recovery. Allocation binds a
-// created container within one Docker create; a minute is far outside that and
-// far inside any human's retry.
-const SESSION_FILE_ALLOCATION_WINDOW_MS = 60_000;
-
-/**
- * What "a session admission is pending" means under the session-file source.
- *
- * There is no admission journal here, so the evidence is the registry itself,
- * in the two shapes that say a session's admission is unfinished:
- *
- *   - a record its owner stamped `terminal`: revocation started and did not
- *     finish, so the address is still reserved and the proxy may still hold the
- *     file;
- *   - an `allocated` record with no container id, older than the allocation
- *     window: the address was reserved and the container never appeared.
- *
- * Everything else — a young allocation, a bound record, a record beating
- * normally — is ordinary concurrent state that no runtime upgrade may be
- * refused over. Reading the stamp never throws; an unreadable one is absent,
- * which leaves only the allocation rule.
- */
-function pendingSessionFileAdmissionRecords(input: Readonly<{
-  stateDir: string;
-  records: readonly SessionContainerRecordV2[];
-  nowEpochMs: number;
-}>): readonly SessionContainerRecordV2[] {
-  return input.records.filter((record) => {
-    if (readSessionHostStatus(input.stateDir, record.sessionId)?.terminal === "revoking") return true;
-    if (record.state !== "allocated" || record.containerId !== undefined) return false;
-    const createdAtMs = Date.parse(record.createdAt);
-    return Number.isFinite(createdAtMs)
-      && input.nowEpochMs - createdAtMs > SESSION_FILE_ALLOCATION_WINDOW_MS;
-  });
-}
-
 /**
  * Waits briefly for another launch's in-flight session admission to finish
  * before the pre-lock evidence read. The session container is already running
@@ -430,6 +397,18 @@ export function planRuntimeUpgradeFromV2State(
   desiredPlan: RuntimePlan,
   context: RuntimeContext,
   docker: RuntimeDocker,
+  options: Readonly<{
+    /**
+     * Leave a pending session admission to the locked reclaim that follows.
+     *
+     * Only the unlocked pre-plan of a start passes this: under the lifecycle
+     * lock, `reclaimPendingSessionAdmissions` finishes every interrupted
+     * teardown Docker proves safe and refuses the rest with its own remedy,
+     * and the locked plan after it is strict again. Every other caller —
+     * `runfree status`, the locked plan — still reports the pending record.
+     */
+    deferPendingSessionAdmission?: boolean;
+  }> = {},
 ): RuntimeUpgradePlan {
   try {
     const expectedProject = {
@@ -439,7 +418,7 @@ export function planRuntimeUpgradeFromV2State(
     const effectiveControlPlane = readEffectiveControlPlaneV2(desiredPlan.paths.stateDir);
     const retainedDesiredSessionAgent = readRetainedDesiredSessionAgentV2(desiredPlan.paths.stateDir);
     const lifecycleRecords = listSessionContainerRecordsV2(desiredPlan.paths.stateDir, expectedProject);
-    const pendingAdmission = pendingSessionFileAdmissionRecords({
+    const pendingAdmission = !options.deferPendingSessionAdmission && pendingSessionFileAdmissionRecords({
       stateDir: desiredPlan.paths.stateDir,
       records: lifecycleRecords,
       nowEpochMs: Date.now(),
@@ -1152,7 +1131,8 @@ export async function startRuntime(
         projectId: preparedPlan.projectId,
         composeProject: preparedPlan.composeProjectName,
       });
-      upgradePlan = planRuntimeUpgradeFromV2State(preparedPlan, existingContext, adapters.docker);
+      upgradePlan = planRuntimeUpgradeFromV2State(preparedPlan, existingContext, adapters.docker,
+        { deferPendingSessionAdmission: true });
       reportRuntimeVerbose(verbose, `runtime upgrade plan is ${upgradePlan.action}`);
       if (verbose) {
         for (const line of runtimeComponentDiagnosticLines({
@@ -1262,6 +1242,40 @@ export async function startRuntime(
       && hasNewActiveSessions(confirmedRebuildSessions, activeOrStartingAgentSessions(preparedContext, adapters.docker))) {
       warn("a new active session appeared during preparation; retry rebuild to review the current sessions");
       return result(1, false, preparedContext);
+    }
+    if (!removeExisting) {
+      // An interrupted session teardown — a daemon that died under a live
+      // session is the ordinary cause — is finished here, under the lock and
+      // before the strict plan below, once Docker proves it safe; otherwise
+      // the start refuses with the reason and the remedy for that record.
+      let reclaim: ReturnType<typeof reclaimPendingSessionAdmissions>;
+      try {
+        reclaim = reclaimPendingSessionAdmissions({
+          stateDir: preparedPlan.paths.stateDir,
+          expectedProject: { projectId: preparedPlan.projectId, composeProject: preparedPlan.composeProjectName },
+          io,
+          lifecycleLock: heldLifecycleLock,
+          env: preparedContext.env,
+          dockerOptions: dockerClientEnvOptions(preparedContext),
+          nowEpochMs: Date.now(),
+        });
+      } catch (error) {
+        // A lost lock is not a refusal to report; it ends the start.
+        heldLifecycleLock.assertHeld();
+        // What escapes the per-record refusals is an unreadable registry,
+        // selection, or rebind journal. The strict plan below reads the same
+        // state and refuses it with its own remedy; nothing was changed.
+        reportRuntimeVerbose(verbose, `pending session admission reclaim skipped: ${error instanceof Error ? error.message : String(error)}`);
+        reclaim = { kind: "none" };
+      }
+      if (reclaim.kind === "refused") {
+        warn("the runtime did not start: an interrupted session teardown could not be finished");
+        for (const reason of reclaim.reasons) warn(reason);
+        return result(1, false, existingContext);
+      }
+      if (reclaim.kind === "reclaimed") {
+        runfreeLog(`finished the interrupted teardown of session ${reclaim.sessionIds.join(", ")}`);
+      }
     }
     io.admitPreparedTokenSources?.(runtimeContextFromActivePlan(activePlan));
     selectPreparedSessionAgent(activePlan, adapters.docker);

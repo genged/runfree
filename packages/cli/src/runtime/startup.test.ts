@@ -420,6 +420,45 @@ test.each([
   }
 });
 
+// The unlocked pre-plan of a start leaves a pending admission to the locked
+// reclaim (`session-admission-pending-reclaim.ts`), which finishes it on
+// Docker's proof or refuses with its own remedy. Every other caller still sees
+// the pending record.
+test("the start pre-plan defers a terminal-stamped record to the locked reclaim; the strict plan does not", () => {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "runfree-files-plan-defer-"));
+  try {
+    const target = sessionGenerationFixture().target;
+    publishControlPlaneMaterializationV2(stateDir, controlPlaneMaterializationFixture({ target }));
+    const selection = effectiveControlPlaneFixture({ target });
+    selectEffectiveControlPlaneV2(stateDir, selection);
+    const record = sessionContainerRecordFixture({ target, containerId: "a".repeat(64) });
+    writeSessionContainerRecordV2(stateDir, SESSION_TEST_PROJECT, record);
+    writeSessionHostStatus(stateDir, {
+      v: 1,
+      sessionId: record.sessionId,
+      lastHeartbeatAt: "2026-09-29T20:00:00.000Z",
+      aliveUntil: "2026-09-29T20:00:00.000Z",
+      served: "unknown",
+      terminal: "revoking",
+    });
+    const desiredPlan = {
+      projectId: SESSION_TEST_PROJECT.projectId,
+      composeProjectName: SESSION_TEST_PROJECT.composeProject,
+      paths: { stateDir },
+      generationV2: target,
+    } as RuntimePlan;
+    const context = { projectRoot: "/workspace/files-plan", project: { paths: { stateDir } }, env: {} } as RuntimeContext;
+    // The daemon restarted: no proxy is running.
+    const docker = { serviceContainerIds: () => [], activeAgentSessions: () => [] } as never;
+
+    expect(planRuntimeUpgradeFromV2State(desiredPlan, context, docker)).toEqual(PENDING_ADMISSION_REFUSAL);
+    expect(planRuntimeUpgradeFromV2State(desiredPlan, context, docker, { deferPendingSessionAdmission: true }))
+      .toEqual({ action: "proxy-restart", services: ["proxy"] });
+  } finally {
+    fs.rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
 // The MCP OAuth callback port guard stops Runfree publishing that port while a
 // foreign process holds it — such a process would receive authorization codes
 // meant for the agent. Post-cutover the benign owner is the per-session

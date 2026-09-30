@@ -263,6 +263,11 @@ Details: [Write Approval Grants](architecture.md#write-approval-grants).
    nothing.
 4. `runfree stop` and `runtime reload-policy` need `--force` while live or
    unknown sessions, a pending rebind, or an interrupted teardown exist.
+5. A start finishes an interrupted teardown only on Docker's proof: the owner
+   is dead, the session container is absent or stopped, and no proxy can
+   serve the session file. The record goes only after Docker proves the
+   container absent. Anything Docker cannot prove keeps the record and refuses
+   with the reason and its remedy.
 
 ## What Runfree Does Not Prove
 

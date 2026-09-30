@@ -88,6 +88,17 @@ export type SessionFileTeardownInput = Readonly<{
    * `removeExactSessionContainerRecordV2` itself.
    */
   removeRecord: () => boolean;
+  /**
+   * Replaces step 1's `docker exec` delete, for a caller that proves the file
+   * cannot exist rather than deleting it.
+   *
+   * Startup's reclaim of an interrupted teardown passes a fresh proof that the
+   * selected proxy is absent or stopped: session files live on its tmpfs, so a
+   * proxy with no running process holds none, and there is nothing to `exec`
+   * into. Throwing blocks exactly like a failed delete — nothing after step 1
+   * runs and the record is kept. Omitted, the ordinary delete runs.
+   */
+  removeSessionFile?: () => void;
   dockerOptions?: childProcess.SpawnSyncOptions;
 }>;
 
@@ -147,11 +158,15 @@ export function teardownSessionRecord(input: SessionFileTeardownInput): SessionF
   // of the steps below to run.
   input.lock();
   try {
-    executeSessionFileCommand(
-      input.io,
-      sessionFileDeleteCommand(input.proxyId, input.record.sessionPrincipal),
-      input.dockerOptions ?? {},
-    );
+    if (input.removeSessionFile) {
+      input.removeSessionFile();
+    } else {
+      executeSessionFileCommand(
+        input.io,
+        sessionFileDeleteCommand(input.proxyId, input.record.sessionPrincipal),
+        input.dockerOptions ?? {},
+      );
+    }
   } catch (error) {
     return Object.freeze({ completed: false, blockedAt: "delete-session-file" as const, error });
   }

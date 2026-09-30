@@ -591,6 +591,21 @@ session. Plain destroy's record scan excludes it; the session-listing gate
 still protects alive or unknown owners. Positive owner-death evidence permits
 normal cleanup; for an uncertain owner, `destroy --force` reclaims it.
 
+The ordinary way to get one is a Docker daemon that dies under a live session:
+the owner stamps its record, cannot delete the session file, keeps the record,
+and exits, and the restarted daemon has stopped both the session container and
+the proxy. A start finishes that teardown under the lifecycle lock, before it
+plans the runtime
+([pending reclaim](../packages/cli/src/runtime/session-admission-pending-reclaim.ts)).
+It requires a provably dead owner, a session container that is absent or
+stopped, and a session file no proxy can serve. A running selected proxy gets
+the ordinary delete. An absent or stopped one holds no file, because session
+files live on its tmpfs, and no other proxy for the project may be running.
+The container's absence is proved again before the record is dropped. Anything
+Docker cannot prove refuses with the reason and the remedy: retry once Docker
+answers or the owner exits, `runfree destroy --force` for an unprovable owner,
+`runfree rebuild` for a container that is still running.
+
 A project whose control-plane materialization predates the admission contract
 cannot be read: `runfree up` refuses with an invalid-component-evidence error
 and names `runfree rebuild`. A pre-cutover rebind journal stopped at a retired

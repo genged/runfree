@@ -176,6 +176,35 @@ describe("ordered session-file teardown", () => {
     expect(fixture.removed()).toBe(0);
   });
 
+  // Startup's reclaim of an interrupted teardown proves the file gone from a
+  // stopped or absent proxy instead of exec'ing into it. The proof takes the
+  // delete's place in the order, under the same lock assertion, and a proof
+  // that fails blocks exactly like a failed delete.
+  test("a caller-supplied file removal takes the delete's place in the order", () => {
+    const fixture = harness();
+
+    expect(teardownSessionRecord(fixture.input({
+      removeSessionFile: () => { fixture.events.push("prove-file-gone"); },
+    }))).toEqual({ completed: true });
+
+    expect(fixture.events.slice(0, 4)).toEqual(["lock", "mark-terminal", "lock", "prove-file-gone"]);
+    expect(fixture.effects()).not.toContain("delete-session-file");
+    expect(fixture.events.at(-2)).toBe("remove-record");
+  });
+
+  test("a caller-supplied file removal that throws keeps the record", () => {
+    const fixture = harness();
+    const refusal = new Error("the selected proxy started during reclaim");
+
+    const result = teardownSessionRecord(fixture.input({
+      removeSessionFile: () => { throw refusal; },
+    }));
+
+    expect(result).toEqual({ completed: false, blockedAt: "delete-session-file", error: refusal });
+    expect(fixture.effects()).toEqual([]);
+    expect(fixture.removed()).toBe(0);
+  });
+
   test("a rerun after a blocked delete completes the whole sequence", () => {
     const blocked: CaptureResult = { status: 1, stdout: "", stderr: "proxy exec failed" };
     let attempt = 0;
