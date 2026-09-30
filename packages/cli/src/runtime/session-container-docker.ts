@@ -440,6 +440,47 @@ export function sessionContainerObservedExitStatus(stdout: string, containerId: 
   return code;
 }
 
+// The three teardown effects (`session-file-teardown.ts`). They are receipt
+// free on purpose — a reconciling host holds no creation receipt — so their
+// only gates are the exact object ids, checked here before a command exists,
+// and the caller's record-plus-lock authority. Built through the same
+// validated-command wrapper as every other session Docker effect, so no
+// teardown argv can be assembled anywhere else.
+
+export function sessionContainerNetworkDisconnectCommand(networkId: string, containerId: string): SessionDockerCommand {
+  validDockerObjectId(networkId, "session network id");
+  validDockerObjectId(containerId, "session container id");
+  return validatedCommand({
+    executable: "docker",
+    effect: "disconnect-session-network",
+    exactTarget: containerId,
+    args: ["network", "disconnect", networkId, containerId],
+  });
+}
+
+export function sessionContainerStopCommand(containerId: string, graceSeconds: number): SessionDockerCommand {
+  validDockerObjectId(containerId, "session container id");
+  if (!Number.isSafeInteger(graceSeconds) || graceSeconds < 0 || graceSeconds > 300) {
+    throw new Error("session container stop grace must be a bounded whole number of seconds");
+  }
+  return validatedCommand({
+    executable: "docker",
+    effect: "stop-session-container",
+    exactTarget: containerId,
+    args: ["container", "stop", "--time", String(graceSeconds), containerId],
+  });
+}
+
+export function sessionContainerRemoveCommand(containerId: string): SessionDockerCommand {
+  validDockerObjectId(containerId, "session container id");
+  return validatedCommand({
+    executable: "docker",
+    effect: "remove-session-container",
+    exactTarget: containerId,
+    args: ["container", "rm", "--force", containerId],
+  });
+}
+
 export function executeSessionDockerCommand<T>(
   command: SessionDockerCommand,
   executor: SessionDockerExecutor<T>,

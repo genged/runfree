@@ -59,14 +59,11 @@ const mocks = vi.hoisted(() => ({
   orphanRemove: vi.fn(),
   executeDocker: vi.fn(),
   createCommand: vi.fn(),
-  disconnectCommand: vi.fn(),
   attachCommand: vi.fn(),
   inspectCommand: vi.fn(),
   observedExited: vi.fn(),
   observedExitStatus: vi.fn(),
-  removeCommand: vi.fn(),
   startCommand: vi.fn(),
-  stopCommand: vi.fn(),
   networkInspectCommand: vi.fn(),
   authorizeProvisioning: vi.fn(),
   classify: vi.fn(),
@@ -140,19 +137,24 @@ vi.mock("./session-container-cleanup.ts", () => ({
   orphanSessionContainerStopCommand: mocks.orphanStop,
   orphanSessionContainerRemoveCommand: mocks.orphanRemove,
 }));
-vi.mock("./session-container-docker.ts", () => ({
-  executeSessionDockerCommand: mocks.executeDocker,
-  sessionContainerAttachCommand: mocks.attachCommand,
-  sessionContainerCreateCommand: mocks.createCommand,
-  sessionContainerInspectCommand: mocks.inspectCommand,
-  sessionContainerNetworkDisconnectCommand: mocks.disconnectCommand,
-  sessionContainerObservedExited: mocks.observedExited,
-  sessionContainerObservedExitStatus: mocks.observedExitStatus,
-  sessionContainerRemoveCommand: mocks.removeCommand,
-  sessionContainerStartAttachCommand: mocks.startCommand,
-  sessionContainerStopCommand: mocks.stopCommand,
-  sessionNetworkInspectCommand: mocks.networkInspectCommand,
-}));
+// The three teardown builders stay real: they only validate exact ids and
+// build argv, and the teardown events below assert that exact argv.
+vi.mock("./session-container-docker.ts", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./session-container-docker.ts")>();
+  return {
+    executeSessionDockerCommand: mocks.executeDocker,
+    sessionContainerAttachCommand: mocks.attachCommand,
+    sessionContainerCreateCommand: mocks.createCommand,
+    sessionContainerInspectCommand: mocks.inspectCommand,
+    sessionContainerNetworkDisconnectCommand: actual.sessionContainerNetworkDisconnectCommand,
+    sessionContainerObservedExited: mocks.observedExited,
+    sessionContainerObservedExitStatus: mocks.observedExitStatus,
+    sessionContainerRemoveCommand: actual.sessionContainerRemoveCommand,
+    sessionContainerStartAttachCommand: mocks.startCommand,
+    sessionContainerStopCommand: actual.sessionContainerStopCommand,
+    sessionNetworkInspectCommand: mocks.networkInspectCommand,
+  };
+});
 vi.mock("./session-container-lifecycle-authorization.ts", () => ({
   authorizeProvisioningRunningSessionContainer: mocks.authorizeProvisioning,
 }));
@@ -238,6 +240,7 @@ vi.mock("./sessions.ts", () => ({
 import { parseSessionFileV1, SESSION_ELIGIBILITY_PATH, SESSION_FILES_DIR } from "@runfree/runtime-contracts/session-file";
 import { SESSION_ADMISSION_LEASE_MAX_DURATION_MS } from "@runfree/runtime-contracts/session-registry";
 
+import { SessionFileTeardownBlockedError } from "./session-file-teardown.ts";
 import { createInternalSessionAdmissionDriver } from "./session-admission-driver.ts";
 import { flushWarnings, setOutputWriterForTest } from "../warnings.ts";
 import type { ActiveRuntimePlan } from "./plan.ts";
@@ -565,13 +568,6 @@ beforeEach(() => {
     if (mocks.failRunningProof) throw new Error("running proof failed closed");
     return { record: provisioning };
   });
-  for (const [mock, effect] of [
-    [mocks.disconnectCommand, "disconnect"],
-    [mocks.stopCommand, "stop"],
-    [mocks.removeCommand, "remove"],
-  ] as const) {
-    mock.mockImplementation(() => ({ executable: "docker", args: [effect] }));
-  }
   mocks.creationAuthorizedStop.mockReturnValue({
     executable: "docker",
     args: ["container", "stop", "--time", "10", CONTAINER_ID],
@@ -1763,6 +1759,49 @@ describe("session admission under the per-session file source", () => {
     expect(mocks.transitionAttached).not.toHaveBeenCalled();
   });
 
+  test("the exit bridge waits at most its bound: a late exit event loses to the timeout (todo 35 fix 7)", async () => {
+    for (const [arrivesAfterMs, expectExit] of [[999, true], [1_001, false]] as const) {
+      vi.useFakeTimers();
+      mocks.events.length = 0;
+      const input = fixture();
+      // The admitting inspection already reads the container as stopped, but
+      // the attach child's exit event has not arrived yet: the one verdict
+      // the bridge may wait on.
+      mocks.containerInspect = {
+        status: 0,
+        stdout: runningInspect({ Running: false, Status: "exited", ExitCode: 3, Pid: 0 }),
+        stderr: "",
+      };
+      const finishForeground = heldForeground();
+      const driver = createInternalSessionAdmissionDriver({
+        ...input,
+        nowEpochMs: () => Date.parse("2026-08-09T00:10:00.000Z"),
+      });
+      try {
+        const launch = driver.launchBuiltin("codex").then(
+          (outcome) => ({ outcome }),
+          (error: unknown) => ({ error }),
+        );
+        await vi.advanceTimersByTimeAsync(arrivesAfterMs);
+        finishForeground({ kind: "exit", code: 3, signal: null });
+        await vi.advanceTimersByTimeAsync(0);
+        const settled = await launch;
+        if (expectExit) {
+          // Inside the bound, the exit event is what the inspection meant.
+          expect(settled).toEqual({ outcome: { status: 3, signal: null } });
+        } else {
+          // Past the bound the verdict is identity drift, whatever arrives
+          // later: a genuine mismatch is never delayed by more than the bound.
+          expect("error" in settled && flattenCauses(settled.error))
+            .toContain("session admission inspected a different container before granting authority");
+        }
+        expect(mocks.events).not.toContain("session-file:write");
+      } finally {
+        vi.useRealTimers();
+      }
+    }
+  });
+
   test("refuses a mismatched inspection as an error while the foreground is still running", async () => {
     const input = fixture();
     mocks.containerInspect = { status: 0, stdout: runningInspect({ Pid: DOCKER_PID + 1 }), stderr: "" };
@@ -2632,6 +2671,9 @@ describe("session admission under the per-session file source", () => {
     expect(teardownEvents()).toEqual([
       "stamp-revoking",
       "session-file:delete",
+      // A numeric exit asks one exact inspection, after the file is gone, whether
+      // the stop can be skipped; this container still reads as running.
+      `docker:container inspect ${CONTAINER_ID}`,
       `docker:network disconnect ${NETWORK_ID} ${CONTAINER_ID}`,
       `docker:container stop --time 10 ${CONTAINER_ID}`,
       `docker:container rm --force ${CONTAINER_ID}`,
@@ -2667,9 +2709,15 @@ describe("session admission under the per-session file source", () => {
 
     const failure = await driver.launchBuiltin("codex").catch((error: unknown) => error);
 
-    // The blocked delete is what the launch reports, nested inside the
-    // ladder's own cleanup-failed aggregate.
+    // The blocked delete is what the launch reports: one plain refusal with
+    // its remedy and the cause chained, not an aggregate of the two identical
+    // cleanup attempts (todo 35 fix 6).
+    expect(failure).toBeInstanceOf(SessionFileTeardownBlockedError);
+    expect(failure).not.toBeInstanceOf(AggregateError);
+    expect((failure as Error).message).toContain("runfree up");
     expect(flattenCauses(failure)).toContain("observation-unavailable during delete-session-file");
+    // The terminal stamp was written, so the record itself is left untouched.
+    expect(mocks.transitionRevoking).not.toHaveBeenCalled();
 
     // A file this host could not remove may still be serving the session, so
     // nothing past the delete may run and the record keeps the address
@@ -2683,6 +2731,33 @@ describe("session admission under the per-session file source", () => {
     ]);
     expect(mocks.removeExactRecord).not.toHaveBeenCalled();
     expect(mocks.removeHostStatus).not.toHaveBeenCalled();
+  });
+
+  test("a blocked delete whose terminal stamp is unwritable marks the durable record revoking instead", async () => {
+    const input = fixture();
+    mocks.containerInspect = { status: 0, stdout: runningInspect(), stderr: "" };
+    mocks.effectAnswers.set("session-file:delete", [
+      { status: 1, stdout: "", stderr: "proxy exec failed" },
+    ]);
+    // Only the terminal stamp is unwritable; the served stamps succeed.
+    mocks.writeHostStatus.mockImplementation((_stateDir: string, status: { terminal?: string }) => {
+      if (status.terminal === "revoking") throw new Error("state directory is read-only");
+      mocks.events.push("write-host-status");
+    });
+    mocks.transitionRevoking.mockImplementation((record: FakeRecord) => ({ ...record, state: "revoking" }));
+    const driver = createInternalSessionAdmissionDriver({
+      ...input,
+      nowEpochMs: () => Date.parse("2026-08-09T00:10:00.000Z"),
+    });
+
+    const failure = await driver.launchBuiltin("codex").catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(SessionFileTeardownBlockedError);
+    // Without either marker a peer would read the record as a live session.
+    expect(mocks.transitionRevoking).toHaveBeenCalledTimes(1);
+    const replaced = mocks.replaceRecord.mock.calls.map((call) => (call[3] as FakeRecord).state);
+    expect(replaced).toContain("revoking");
+    expect(mocks.removeExactRecord).not.toHaveBeenCalled();
   });
 
   test("a rerun of a blocked teardown completes the sequence it was not allowed to start", async () => {
@@ -2708,6 +2783,9 @@ describe("session admission under the per-session file source", () => {
       "session-file:delete",
       "stamp-revoking",
       "session-file:delete",
+      // A numeric exit asks one exact inspection, after the file is gone, whether
+      // the stop can be skipped; this container still reads as running.
+      `docker:container inspect ${CONTAINER_ID}`,
       `docker:network disconnect ${NETWORK_ID} ${CONTAINER_ID}`,
       `docker:container stop --time 10 ${CONTAINER_ID}`,
       `docker:container rm --force ${CONTAINER_ID}`,
@@ -2738,6 +2816,9 @@ describe("session admission under the per-session file source", () => {
     expect(teardownEvents()).toEqual([
       "stamp-revoking",
       "session-file:delete",
+      // A numeric exit asks one exact inspection, after the file is gone, whether
+      // the stop can be skipped; this container still reads as running.
+      `docker:container inspect ${CONTAINER_ID}`,
       `docker:network disconnect ${NETWORK_ID} ${CONTAINER_ID}`,
       `docker:container stop --time 10 ${CONTAINER_ID}`,
       `docker:container rm --force ${CONTAINER_ID}`,
@@ -2745,6 +2826,96 @@ describe("session admission under the per-session file source", () => {
       "clear-host-status",
     ]);
     expect(mocks.removeExactRecord).toHaveBeenCalledTimes(1);
+  });
+
+  test("a normal exit the teardown inspection proves skips the disconnect and the stop grace", async () => {
+    vi.useFakeTimers();
+    const input = fixture();
+    mocks.containerInspect = { status: 0, stdout: runningInspect(), stderr: "" };
+    const finishForeground = heldForeground();
+    const driver = createInternalSessionAdmissionDriver({
+      ...input,
+      nowEpochMs: () => Date.parse("2026-08-09T00:10:00.000Z"),
+    });
+
+    try {
+      const launch = driver.launchBuiltin("codex");
+      await vi.advanceTimersByTimeAsync(0);
+      expect(mocks.events).toContain("session-file:write");
+      // The agent exits by itself: the container is stopped, same incarnation,
+      // with the code the foreground reports.
+      mocks.containerInspect = {
+        status: 0,
+        stdout: JSON.stringify([{
+          Id: CONTAINER_ID,
+          State: {
+            Status: "exited",
+            Running: false,
+            Paused: false,
+            Restarting: false,
+            Pid: 0,
+            ExitCode: 0,
+            StartedAt: DOCKER_STARTED_AT,
+            FinishedAt: "2026-08-09T00:20:00.000000000Z",
+          },
+          HostConfig: { RestartPolicy: { Name: "no", MaximumRetryCount: 0 } },
+        }]),
+        stderr: "",
+      };
+      finishForeground({ kind: "exit", code: 0, signal: null });
+      await vi.advanceTimersByTimeAsync(0);
+      await expect(launch).resolves.toEqual({ status: 0, signal: null });
+    } finally {
+      vi.useRealTimers();
+    }
+
+    expect(teardownEvents()).toEqual([
+      "stamp-revoking",
+      "session-file:delete",
+      `docker:container inspect ${CONTAINER_ID}`,
+      `docker:container rm --force ${CONTAINER_ID}`,
+      "remove-exact-record:rf-20260809-abcdef",
+      "clear-host-status",
+    ]);
+  });
+
+  test("a numeric exit whose container still runs, or another incarnation, keeps the full sequence", async () => {
+    for (const state of [
+      { Status: "running", Running: true, StartedAt: DOCKER_STARTED_AT },
+      { Status: "exited", Running: false, StartedAt: "2026-08-09T00:15:00.000000000Z" },
+    ]) {
+      mocks.events.length = 0;
+      vi.useFakeTimers();
+      const input = fixture();
+      mocks.containerInspect = { status: 0, stdout: runningInspect(), stderr: "" };
+      const finishForeground = heldForeground();
+      const driver = createInternalSessionAdmissionDriver({
+        ...input,
+        nowEpochMs: () => Date.parse("2026-08-09T00:10:00.000Z"),
+      });
+      try {
+        const launch = driver.launchBuiltin("codex");
+        await vi.advanceTimersByTimeAsync(0);
+        mocks.containerInspect = {
+          status: 0,
+          stdout: JSON.stringify([{
+            Id: CONTAINER_ID,
+            State: { ...state, Paused: false, Restarting: false, Pid: 0, ExitCode: 0, FinishedAt: "2026-08-09T00:20:00.000000000Z" },
+            HostConfig: { RestartPolicy: { Name: "no", MaximumRetryCount: 0 } },
+          }]),
+          stderr: "",
+        };
+        // A Docker CLI that exits 0 while the container it showed is still
+        // running (or was replaced) must not be read as the agent's own exit.
+        finishForeground({ kind: "exit", code: 0, signal: null });
+        await vi.advanceTimersByTimeAsync(0);
+        await launch;
+      } finally {
+        vi.useRealTimers();
+      }
+      expect(teardownEvents()).toContain(`docker:network disconnect ${NETWORK_ID} ${CONTAINER_ID}`);
+      expect(teardownEvents()).toContain(`docker:container stop --time 10 ${CONTAINER_ID}`);
+    }
   });
 
   test("every teardown step is fenced by the lifecycle lock", async () => {

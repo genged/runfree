@@ -29,17 +29,31 @@
 // a peer that observed it half-done would see a record it may neither admit
 // beside nor reclaim.
 //
-// The three Docker commands are built and spent inside this function and never
-// cross a boundary, so unlike the receipt-gated builders in
-// `session-container-docker.ts` there is nothing here for a caller to smuggle
-// argv through. They are receipt-free on purpose: a reconciling host that never
-// created this container holds no creation receipt and, since this source
-// publishes no snapshot, there is no revocation receipt for anyone to hold. The
-// authority is the exact record plus the lock, checked before the first effect.
+// The three Docker commands come from the validated builders in
+// `session-container-docker.ts` and are spent inside this function, so there
+// is nothing here for a caller to smuggle argv through. They are receipt-free
+// on purpose: a reconciling host that never created this container holds no
+// creation receipt and, since this source publishes no snapshot, there is no
+// revocation receipt for anyone to hold. The authority is the exact record plus
+// the lock, checked before the first effect.
+//
+// A normal exit takes a shorter path: with an exact proof that the anchored
+// incarnation has already exited, the disconnect and the stop grace are
+// skipped and the file delete is followed directly by the forced removal. The
+// order that matters — file first, record last — is the same on both paths.
 
 import type * as childProcess from "node:child_process";
 
+import { CliError } from "../errors.ts";
+import { remedy } from "../remedies.ts";
 import { SESSION_CONTAINER_STOP_SECONDS } from "./session-container-contract.ts";
+import {
+  executeSessionDockerCommand,
+  sessionContainerNetworkDisconnectCommand,
+  sessionContainerRemoveCommand,
+  sessionContainerStopCommand,
+  type SessionDockerCommand,
+} from "./session-container-docker.ts";
 import type {
   SessionContainerProjectIdentity,
   SessionContainerRecordV2,
@@ -88,8 +102,125 @@ export type SessionFileTeardownInput = Readonly<{
    * `removeExactSessionContainerRecordV2` itself.
    */
   removeRecord: () => boolean;
+  /**
+   * How the session ended, as far as this caller can prove it.
+   *
+   * Asked once, under the lock, right after the session file is proved gone,
+   * so the observation that picks the short path is taken with no authority
+   * left to lose and never delays the revocation. Required, so no caller can
+   * reach the short path by omission. Only the launch owner can return an
+   * `exited` proof (minted from one exact inspection by
+   * `proveSessionContainerExited`); reconcile always answers
+   * `UNCERTAIN_SESSION_COMPLETION`. A throw reads as uncertain.
+   */
+  completion: () => SessionTeardownCompletion;
   dockerOptions?: childProcess.SpawnSyncOptions;
 }>;
+
+declare const sessionContainerExitProofBrand: unique symbol;
+
+/**
+ * Proof, from one exact `docker container inspect`, that the anchored
+ * container incarnation has exited on its own with the status the foreground
+ * reported. Minted only by `proveSessionContainerExited`; a copy or a
+ * hand-built object is not one.
+ */
+export type SessionContainerExitProof = Readonly<{
+  readonly [sessionContainerExitProofBrand]: true;
+  containerId: string;
+  startedAt: string;
+  exitCode: number;
+}>;
+
+export type SessionTeardownCompletion =
+  | Readonly<{ kind: "exited"; proof: SessionContainerExitProof }>
+  | Readonly<{ kind: "uncertain" }>;
+
+export const UNCERTAIN_SESSION_COMPLETION: SessionTeardownCompletion = Object.freeze({ kind: "uncertain" });
+
+const exitProofs = new WeakSet<object>();
+
+function exactIsoTime(value: unknown): number | undefined {
+  if (typeof value !== "string") return undefined;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+/**
+ * Judges one inspection as proof that this exact incarnation exited by itself.
+ *
+ * Every condition must hold, or there is no proof and teardown keeps the full
+ * sequence with its stop grace (sub-second launch plan Task 8; review Q6): one
+ * object; the exact id; the admitted `StartedAt` (a restarted or recreated
+ * container is a different incarnation); not running, restarting, or paused;
+ * `Status` exited or dead; `FinishedAt` not before `StartedAt`; the exit code
+ * the foreground reported; and restart policy `no`, so nothing will start it
+ * again between this read and the removal.
+ */
+export function proveSessionContainerExited(
+  inspectStdout: string,
+  expected: Readonly<{ containerId: string; startedAt: string; exitCode: number }>,
+): SessionContainerExitProof | undefined {
+  if (!DOCKER_OBJECT_ID_PATTERN.test(expected.containerId)) return undefined;
+  if (!Number.isSafeInteger(expected.exitCode) || expected.exitCode < 0 || expected.exitCode > 255) return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(inspectStdout);
+  } catch {
+    return undefined;
+  }
+  if (!Array.isArray(parsed) || parsed.length !== 1) return undefined;
+  const container: unknown = parsed[0];
+  if (!container || typeof container !== "object") return undefined;
+  if (Reflect.get(container, "Id") !== expected.containerId) return undefined;
+  const state: unknown = Reflect.get(container, "State");
+  if (!state || typeof state !== "object") return undefined;
+  if (Reflect.get(state, "Running") !== false
+    || Reflect.get(state, "Restarting") === true
+    || Reflect.get(state, "Paused") === true) {
+    return undefined;
+  }
+  const status = Reflect.get(state, "Status");
+  if (status !== "exited" && status !== "dead") return undefined;
+  if (Reflect.get(state, "StartedAt") !== expected.startedAt) return undefined;
+  const startedAt = exactIsoTime(expected.startedAt);
+  const finishedAt = exactIsoTime(Reflect.get(state, "FinishedAt"));
+  if (startedAt === undefined || finishedAt === undefined || finishedAt < startedAt) return undefined;
+  if (Reflect.get(state, "ExitCode") !== expected.exitCode) return undefined;
+  const hostConfig: unknown = Reflect.get(container, "HostConfig");
+  const restartPolicy: unknown = hostConfig && typeof hostConfig === "object"
+    ? Reflect.get(hostConfig, "RestartPolicy")
+    : undefined;
+  if (!restartPolicy || typeof restartPolicy !== "object" || Reflect.get(restartPolicy, "Name") !== "no") {
+    return undefined;
+  }
+  const proof = Object.freeze({
+    containerId: expected.containerId,
+    startedAt: expected.startedAt,
+    exitCode: expected.exitCode,
+  }) as SessionContainerExitProof;
+  exitProofs.add(proof);
+  return proof;
+}
+
+/**
+ * The launch-facing refusal for a session file this host could not delete.
+ *
+ * A plain status with the remedy, not an aggregate of internal failures: the
+ * address stays reserved by the record, and the next `runfree up` (or the next
+ * launch's reconcile, once this owner is gone) finishes the teardown.
+ */
+export class SessionFileTeardownBlockedError extends CliError {
+  constructor(cause: unknown) {
+    const detail = cause instanceof Error ? cause.message : String(cause);
+    super(
+      "the session's network authority could not be revoked: its proxy session file was not deleted "
+      + `(${detail}); the session record and its address stay reserved; run \`${remedy.up()}\` to finish the teardown`,
+    );
+    this.name = "SessionFileTeardownBlockedError";
+    this.cause = cause;
+  }
+}
 
 export type SessionFileTeardownResult =
   | Readonly<{ completed: true }>
@@ -122,8 +253,23 @@ function exactTeardownTarget(input: SessionFileTeardownInput): Readonly<{
   return Object.freeze({ containerId, networkId: input.networkId });
 }
 
-function capture(input: SessionFileTeardownInput, args: readonly string[]): CaptureResult {
-  return input.io.capture("docker", [...args], input.dockerOptions ?? {});
+function execute(input: SessionFileTeardownInput, command: SessionDockerCommand): CaptureResult {
+  return executeSessionDockerCommand(
+    command,
+    (executable, args) => input.io.capture(executable, [...args], input.dockerOptions ?? {}),
+  );
+}
+
+function exitedProofFor(input: SessionFileTeardownInput, containerId: string): SessionContainerExitProof | undefined {
+  let completion: SessionTeardownCompletion;
+  try {
+    completion = input.completion();
+  } catch {
+    return undefined;
+  }
+  if (completion.kind !== "exited") return undefined;
+  const proof = completion.proof;
+  return exitProofs.has(proof) && proof.containerId === containerId ? proof : undefined;
 }
 
 /**
@@ -156,26 +302,34 @@ export function teardownSessionRecord(input: SessionFileTeardownInput): SessionF
     return Object.freeze({ completed: false, blockedAt: "delete-session-file" as const, error });
   }
 
-  // Step 2. Defense in depth, and tolerant of its own failure: the session has
-  // no authority left whatever the endpoint says, and the removal below takes
-  // the endpoint with the container. An already-disconnected or already-removed
-  // container is exactly the state a rerun meets.
-  input.lock();
-  capture(input, ["network", "disconnect", target.networkId, target.containerId]);
+  // Steps 2 and 3 exist for a container that may still be running. An exact
+  // proof that this incarnation already exited (a normal exit, sub-second
+  // launch plan Task 8) skips both: there is no process left to give a grace
+  // period to, and the removal below takes the endpoint with the container.
+  // Anything short of that proof keeps the full sequence.
+  if (exitedProofFor(input, target.containerId) === undefined) {
+    // Step 2. Defense in depth, and tolerant of its own failure: the session
+    // has no authority left whatever the endpoint says, and the removal below
+    // takes the endpoint with the container. An already-disconnected or
+    // already-removed container is exactly the state a rerun meets.
+    input.lock();
+    execute(input, sessionContainerNetworkDisconnectCommand(target.networkId, target.containerId));
 
-  // Step 3. The agent's grace period. Tolerant for the same reason: a container
-  // that has already exited, or that is already gone, is the state this step
-  // was trying to reach.
-  input.lock();
-  capture(input, ["container", "stop", "--time", String(SESSION_CONTAINER_STOP_SECONDS), target.containerId]);
+    // Step 3. The agent's grace period. Tolerant for the same reason: a
+    // container that has already exited, or that is already gone, is the state
+    // this step was trying to reach.
+    input.lock();
+    execute(input, sessionContainerStopCommand(target.containerId, SESSION_CONTAINER_STOP_SECONDS));
+  }
 
   // Step 4. The one container step that must succeed. `--force` because the
-  // stop above already spent the SIGTERM grace, and a container that ignored it
-  // must not be able to hold this session's record — and therefore its
-  // address — forever. Docker's definitive "no such container" is success:
-  // absence is the state this step exists to prove.
+  // stop above already spent the SIGTERM grace (or the container had already
+  // exited), and a container that ignored it must not be able to hold this
+  // session's record — and therefore its address — forever. Docker's
+  // definitive "no such container" is success: absence is the state this step
+  // exists to prove.
   input.lock();
-  const removed = capture(input, ["container", "rm", "--force", target.containerId]);
+  const removed = execute(input, sessionContainerRemoveCommand(target.containerId));
   if (removed.status !== 0 && !provesContainerAbsent(removed.stderr, target.containerId)) {
     throw new Error(
       `Docker failed to remove the torn-down session container: ${removed.stderr.trim() || removed.stdout.trim() || `exit ${removed.status}`}`,

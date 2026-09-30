@@ -1,3 +1,5 @@
+import { SessionFileTeardownBlockedError } from "./session-file-teardown.ts";
+
 export const BUILTIN_SESSION_ADMISSION_PROBE_AGENTS = ["claude", "codex", "pi"] as const;
 
 export type SessionAdmissionProbeAgent = typeof BUILTIN_SESSION_ADMISSION_PROBE_AGENTS[number];
@@ -171,6 +173,12 @@ async function throwWithCleanupFailure(failure: unknown, cleanup: () => Promise<
   try {
     await cleanup();
   } catch (cleanupFailure) {
+    // The same blocked revocation twice is one fact, not two failures: the
+    // launch reports it as the plain refusal it is, with its remedy, rather
+    // than as an aggregate of identical internal errors (todo 35 fix 6).
+    if (failure instanceof SessionFileTeardownBlockedError && cleanupFailure instanceof SessionFileTeardownBlockedError) {
+      throw cleanupFailure;
+    }
     throw new AggregateError(
       [failure, cleanupFailure],
       "session admission probe failed and fail-closed cleanup also failed",

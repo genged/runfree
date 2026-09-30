@@ -53,8 +53,12 @@ import {
   sessionFileDeleteCommand,
 } from "./session-file-publisher.ts";
 import {
+  proveSessionContainerExited,
+  SessionFileTeardownBlockedError,
   teardownSessionRecord,
+  UNCERTAIN_SESSION_COMPLETION,
   type SessionFileTeardownResult,
+  type SessionTeardownCompletion,
 } from "./session-file-teardown.ts";
 
 import {
@@ -137,6 +141,7 @@ import {
   serializeSessionContainerRecordV2,
   transitionBoundAllocatedSessionContainerToProvisioningRunningV2,
   transitionProvisioningRunningSessionContainerToAttachedV2,
+  transitionSessionContainerToRevokingV2,
   writeSessionContainerRecordV2,
   type SessionContainerRecordV2,
 } from "./session-containers.ts";
@@ -705,7 +710,7 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
     file: Readonly<{ sessionId: string; inspectedAt: string; aliveUntil: string }>,
     served: SessionHostStatusServed,
     terminal?: "revoking",
-  ): void {
+  ): boolean {
     try {
       writeSessionHostStatus(this.#input.plan.paths.stateDir, {
         v: 1,
@@ -715,10 +720,12 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
         served,
         ...(terminal === undefined ? {} : { terminal }),
       });
+      return true;
     } catch (error) {
-      if (this.#stampFailureWarned) return;
+      if (this.#stampFailureWarned) return false;
       this.#stampFailureWarned = true;
       warn(`session status stamp unwritable: ${error instanceof Error ? error.message : String(error)}; the session is unaffected; the last stamp may be stale and owner liveness remains authoritative`);
+      return false;
     }
   }
 
@@ -735,13 +742,78 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
    * away. Written through the advisory stamp writer, so a state directory this
    * host cannot write cannot stop a teardown.
    */
-  #stampSessionTerminal(record: SessionContainerRecordV2): void {
+  #stampSessionTerminal(record: SessionContainerRecordV2): boolean {
     const now = new Date(this.#nowEpochMs()).toISOString();
-    this.#stampSessionHostStatus(
+    return this.#stampSessionHostStatus(
       { sessionId: record.sessionId, inspectedAt: now, aliveUntil: now },
       "unknown",
       "revoking",
     );
+  }
+
+  /**
+   * How this session ended, as far as one exact inspection can prove it.
+   *
+   * Only a numeric exit this launch reported (the foreground's own code, or a
+   * code a confirming inspection proved) is even considered, and only an
+   * inspection taken now — after the stream closed, the heartbeat stopped, the
+   * lock was reacquired, and the session file was proved gone — that shows
+   * this exact incarnation stopped with that code mints the proof. Everything else, including an inspection that
+   * could not be made, is `uncertain`, which keeps the full teardown with its
+   * stop grace. Never throws: this only chooses between two revocation orders
+   * that both delete the file first.
+   */
+  #teardownCompletion(record: SessionContainerRecordV2): SessionTeardownCompletion {
+    const outcome = this.#foregroundOutcome ?? this.#preAttachCompletion;
+    const anchor = this.#fileAnchor;
+    const containerId = record.containerId;
+    if (!outcome || typeof outcome.status !== "number" || outcome.signal !== null
+      || !anchor || containerId === undefined) {
+      return UNCERTAIN_SESSION_COMPLETION;
+    }
+    try {
+      this.#lock();
+      const inspected = this.#captureCommand(sessionContainerInspectCommand(record, this.#projectIdentity()));
+      if (inspected.status !== 0) return UNCERTAIN_SESSION_COMPLETION;
+      const proof = proveSessionContainerExited(inspected.stdout, {
+        containerId,
+        startedAt: anchor.dockerStartedAt,
+        exitCode: outcome.status,
+      });
+      return proof ? Object.freeze({ kind: "exited" as const, proof }) : UNCERTAIN_SESSION_COMPLETION;
+    } catch {
+      return UNCERTAIN_SESSION_COMPLETION;
+    }
+  }
+
+  /**
+   * Marks a blocked teardown in the durable record itself when its terminal
+   * stamp could not be written either (todo 35 fix 6).
+   *
+   * Without either marker a peer would read this record as a live session: the
+   * address stays reserved through the attachment baseline, but `runfree
+   * sessions` and preflight would not see cleanup in progress. The record's own
+   * `revoking` state says the same thing the stamp would have said, and every
+   * peer (preflight, destroy, reconcile) already reads it as cleanup. Best
+   * effort: the blocked delete is the news, and this cannot make it worse.
+   */
+  #markBlockedTeardownRevoking(record: SessionContainerRecordV2): void {
+    if (record.state === "revoking") return;
+    try {
+      this.#lock();
+      const revoking = transitionSessionContainerToRevokingV2(record);
+      replaceExactSessionContainerRecordV2(
+        this.#input.plan.paths.stateDir,
+        this.#projectIdentity(),
+        record,
+        revoking,
+      );
+      this.#record = revoking;
+      this.#persistedRecord = revoking;
+      if (this.#fileRecord) this.#fileRecord = revoking;
+    } catch {
+      // The record stays as it was; the address is still reserved by it.
+    }
   }
 
   /**
@@ -768,6 +840,7 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
     const expectedProject = this.#projectIdentity();
     const failures: unknown[] = [];
     let blockedOnDelete = false;
+    let terminalStamped = true;
     try {
       const result: SessionFileTeardownResult = teardownSessionRecord({
         io: this.#gateway.io,
@@ -776,9 +849,10 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
         expectedProject,
         networkId: this.#controlPlane().networkIds.agentInternal,
         lock: () => this.#lock(),
-        markTerminal: () => this.#stampSessionTerminal(record),
+        markTerminal: () => { terminalStamped = this.#stampSessionTerminal(record); },
         clearStamp: () => removeSessionHostStatus(stateDir, record.sessionId),
         removeRecord: () => removeExactSessionContainerRecordV2(stateDir, expectedProject, record),
+        completion: () => this.#teardownCompletion(record),
         dockerOptions: this.#dockerOptions(),
       });
       if (result.completed) {
@@ -786,7 +860,8 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
         this.#persistedRecord = undefined;
       } else {
         blockedOnDelete = true;
-        failures.push(result.error);
+        if (!terminalStamped) this.#markBlockedTeardownRevoking(record);
+        failures.push(new SessionFileTeardownBlockedError(result.error));
       }
     } catch (error) {
       failures.push(error);

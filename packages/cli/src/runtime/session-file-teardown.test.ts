@@ -20,7 +20,14 @@ import {
   type SessionContainerRecordV2,
 } from "./session-containers.ts";
 import type { SessionAdmissionDockerExecutor } from "./session-file-publisher.ts";
-import { teardownSessionRecord, type SessionFileTeardownInput } from "./session-file-teardown.ts";
+import {
+  proveSessionContainerExited,
+  teardownSessionRecord,
+  UNCERTAIN_SESSION_COMPLETION,
+  type SessionContainerExitProof,
+  type SessionFileTeardownInput,
+  type SessionTeardownCompletion,
+} from "./session-file-teardown.ts";
 import type { CaptureResult } from "./types.ts";
 
 const CONTAINER_ID = "c".repeat(64);
@@ -79,6 +86,7 @@ function harness(options: {
   record?: SessionContainerRecordV2;
   removeRecord?: () => boolean;
   lock?: () => void;
+  completion?: SessionTeardownCompletion;
 } = {}): Harness {
   const events: string[] = [];
   const argv: string[][] = [];
@@ -113,6 +121,7 @@ function harness(options: {
         removals += 1;
         return true;
       }),
+      completion: () => options.completion ?? UNCERTAIN_SESSION_COMPLETION,
       ...overrides,
     }),
   });
@@ -200,6 +209,7 @@ describe("ordered session-file teardown", () => {
       markTerminal: () => {},
       clearStamp: () => { events.push("clear-stamp"); },
       removeRecord: () => { removals += 1; return true; },
+      completion: () => UNCERTAIN_SESSION_COMPLETION,
     };
 
     expect(teardownSessionRecord(input).completed).toBe(false);
@@ -243,25 +253,33 @@ describe("ordered session-file teardown", () => {
     ]);
   });
 
-  test("a lock that has been lost stops the sequence at that step", () => {
-    for (const [index, remaining] of [
-      [0, [] as Effect[]],
-      [1, ["delete-session-file"] as Effect[]],
-      [2, ["delete-session-file", "disconnect"] as Effect[]],
-      [3, ["delete-session-file", "disconnect", "stop"] as Effect[]],
+  test("a lock that has been lost stops the sequence at that step, at every one of the six lock sites", () => {
+    // Index n: the (n+1)th lock assertion is the first that fails. The six sites
+    // guard, in order: the terminal stamp, the file delete, the disconnect, the
+    // stop, the removal, and the record removal (todo 37 item 1: the stamp and
+    // record sites were the two the earlier four-case table did not reach).
+    for (const [index, remaining, stamped] of [
+      [0, [] as Effect[], false],
+      [1, [] as Effect[], true],
+      [2, ["delete-session-file"] as Effect[], true],
+      [3, ["delete-session-file", "disconnect"] as Effect[], true],
+      [4, ["delete-session-file", "disconnect", "stop"] as Effect[], true],
+      [5, ["delete-session-file", "disconnect", "stop", "remove"] as Effect[], true],
     ] as const) {
       let calls = 0;
       const fixture = harness({
         lock: () => {
           calls += 1;
-          if (calls > index + 1) throw new Error("project lifecycle lock is not held");
+          if (calls > index) throw new Error("project lifecycle lock is not held");
         },
       });
 
       expect(() => teardownSessionRecord(fixture.input())).toThrow("project lifecycle lock is not held");
 
       expect(fixture.effects()).toEqual(remaining);
+      expect(fixture.events.includes("mark-terminal")).toBe(stamped);
       expect(fixture.events).not.toContain("remove-record");
+      expect(fixture.events).not.toContain("clear-stamp");
     }
   });
 
@@ -295,5 +313,155 @@ describe("ordered session-file teardown", () => {
     expect(wedged.events).not.toContain("remove-record");
     expect(wedged.events).not.toContain("clear-stamp");
     expect(wedged.removed()).toBe(0);
+  });
+});
+
+const STARTED_AT = "2026-08-08T12:00:00.500000000Z";
+
+function exitedInspect(overrides: {
+  id?: string;
+  running?: boolean;
+  restarting?: boolean;
+  paused?: boolean;
+  status?: string;
+  startedAt?: string;
+  finishedAt?: string;
+  exitCode?: number;
+  restartPolicy?: string;
+  extraObject?: boolean;
+} = {}): string {
+  const container = {
+    Id: overrides.id ?? CONTAINER_ID,
+    State: {
+      Status: overrides.status ?? "exited",
+      Running: overrides.running ?? false,
+      Paused: overrides.paused ?? false,
+      Restarting: overrides.restarting ?? false,
+      Pid: 0,
+      ExitCode: overrides.exitCode ?? 0,
+      StartedAt: overrides.startedAt ?? STARTED_AT,
+      FinishedAt: overrides.finishedAt ?? "2026-08-08T12:05:00.000000000Z",
+    },
+    HostConfig: { RestartPolicy: { Name: overrides.restartPolicy ?? "no", MaximumRetryCount: 0 } },
+  };
+  return JSON.stringify(overrides.extraObject ? [container, container] : [container]);
+}
+
+function exitedCompletion(exitCode = 0): SessionTeardownCompletion {
+  const proof = proveSessionContainerExited(exitedInspect({ exitCode }), {
+    containerId: CONTAINER_ID,
+    startedAt: STARTED_AT,
+    exitCode,
+  });
+  if (!proof) throw new Error("fixture inspection must prove the exit");
+  return { kind: "exited", proof };
+}
+
+describe("fast teardown after a proved exit (sub-second launch plan Task 8)", () => {
+  test("a proved exit deletes the file, then removes the container, and drops the record last: no disconnect, no stop", () => {
+    const fixture = harness({ completion: exitedCompletion() });
+
+    expect(teardownSessionRecord(fixture.input())).toEqual({ completed: true });
+
+    expect(fixture.events).toEqual([
+      "lock",
+      "mark-terminal",
+      "lock",
+      "delete-session-file",
+      "lock",
+      "remove",
+      "lock",
+      "remove-record",
+      "clear-stamp",
+    ]);
+    expect(fixture.argv[1]).toEqual(["container", "rm", "--force", CONTAINER_ID]);
+    expect(fixture.removed()).toBe(1);
+  });
+
+  test("the proof is refused for every condition it does not meet", () => {
+    const expected = { containerId: CONTAINER_ID, startedAt: STARTED_AT, exitCode: 0 };
+    expect(proveSessionContainerExited(exitedInspect(), expected)).toBeDefined();
+    for (const [label, stdout, want] of [
+      ["still running", exitedInspect({ running: true, status: "running" }), expected],
+      ["restarting", exitedInspect({ restarting: true }), expected],
+      ["paused", exitedInspect({ paused: true }), expected],
+      ["created, never ran", exitedInspect({ status: "created" }), expected],
+      ["another container", exitedInspect({ id: "f".repeat(64) }), expected],
+      ["another incarnation", exitedInspect({ startedAt: "2026-08-08T12:03:00.000000000Z" }), expected],
+      ["finished before it started", exitedInspect({ finishedAt: "2026-08-08T11:00:00.000000000Z" }), expected],
+      ["a different exit code", exitedInspect({ exitCode: 1 }), expected],
+      ["a restart policy", exitedInspect({ restartPolicy: "on-failure" }), expected],
+      ["two objects", exitedInspect({ extraObject: true }), expected],
+      ["malformed", "{", expected],
+      ["an exit code out of range", exitedInspect(), { ...expected, exitCode: 256 }],
+    ] as const) {
+      expect(proveSessionContainerExited(stdout, want), label).toBeUndefined();
+    }
+  });
+
+  test("a forged proof, or a proof for another container, keeps the full sequence", () => {
+    const forged = { kind: "exited", proof: { containerId: CONTAINER_ID, startedAt: STARTED_AT, exitCode: 0 } as SessionContainerExitProof } as const;
+    const other = proveSessionContainerExited(exitedInspect({ id: "f".repeat(64) }), {
+      containerId: "f".repeat(64),
+      startedAt: STARTED_AT,
+      exitCode: 0,
+    });
+    if (!other) throw new Error("fixture proof for another container");
+    for (const completion of [forged, { kind: "exited", proof: other } as const]) {
+      const fixture = harness({ completion });
+      expect(teardownSessionRecord(fixture.input())).toEqual({ completed: true });
+      expect(fixture.effects()).toEqual(["delete-session-file", "disconnect", "stop", "remove"]);
+    }
+  });
+
+  test("a delete failure after a proved exit still stops everything before any container effect", () => {
+    const fixture = harness({
+      completion: exitedCompletion(),
+      answers: { "delete-session-file": { status: 1, stdout: "", stderr: "proxy exec failed" } },
+    });
+
+    const result = teardownSessionRecord(fixture.input());
+
+    expect(result).toMatchObject({ completed: false, blockedAt: "delete-session-file" });
+    expect(fixture.effects()).toEqual(["delete-session-file"]);
+    expect(fixture.removed()).toBe(0);
+  });
+
+  test("a removal failure after a proved exit keeps the record; an absent container is success", () => {
+    const refused = harness({
+      completion: exitedCompletion(),
+      answers: { remove: { status: 1, stdout: "", stderr: "Error response from daemon: removal in progress" } },
+    });
+    expect(() => teardownSessionRecord(refused.input())).toThrow("Docker failed to remove");
+    expect(refused.events).toContain("mark-terminal");
+    expect(refused.events).not.toContain("remove-record");
+    expect(refused.events).not.toContain("clear-stamp");
+
+    const absent = harness({
+      completion: exitedCompletion(),
+      answers: { remove: { status: 1, stdout: "", stderr: `Error response from daemon: No such container: ${CONTAINER_ID}` } },
+    });
+    expect(teardownSessionRecord(absent.input())).toEqual({ completed: true });
+    expect(absent.removed()).toBe(1);
+  });
+
+  test("a lost lock on the short path stops it at that step", () => {
+    for (const [index, remaining] of [
+      [1, [] as Effect[]],
+      [2, ["delete-session-file"] as Effect[]],
+      [3, ["delete-session-file", "remove"] as Effect[]],
+    ] as const) {
+      let calls = 0;
+      const fixture = harness({
+        completion: exitedCompletion(),
+        lock: () => {
+          calls += 1;
+          if (calls > index) throw new Error("project lifecycle lock is not held");
+        },
+      });
+      expect(() => teardownSessionRecord(fixture.input())).toThrow("project lifecycle lock is not held");
+      expect(fixture.effects()).toEqual(remaining);
+      expect(fixture.events).not.toContain("remove-record");
+    }
   });
 });

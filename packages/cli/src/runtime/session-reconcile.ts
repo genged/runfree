@@ -86,7 +86,7 @@ import {
   sessionFileDeleteCommand,
   type SessionAdmissionDockerExecutor,
 } from "./session-file-publisher.ts";
-import { teardownSessionRecord } from "./session-file-teardown.ts";
+import { teardownSessionRecord, UNCERTAIN_SESSION_COMPLETION } from "./session-file-teardown.ts";
 import { removeSessionHostStatus, writeSessionHostStatus } from "./session-host-status.ts";
 import { sessionRecordOwnerLiveness } from "./session-record-liveness.ts";
 import type { ProjectLifecycleLock } from "./sessions.ts";
@@ -589,6 +589,9 @@ export async function reconcileSessions(input: SessionReconcileInput): Promise<S
         markTerminal: () => stampTerminal(input, record),
         clearStamp: () => removeSessionHostStatus(input.stateDir, record.sessionId),
         removeRecord: () => removeExactSessionContainerRecordV2(input.stateDir, input.expectedProject, record),
+        // A dead owner's session ended in a way this host never observed:
+        // always the full sequence with the stop grace.
+        completion: () => UNCERTAIN_SESSION_COMPLETION,
         dockerOptions: input.dockerOptions ?? {},
       });
       if (teardown.completed) deadOwnersRevoked.push(record.sessionId);

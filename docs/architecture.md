@@ -446,7 +446,9 @@ directory, and the driver's ladder is:
 6. **Await completion** releases the lifecycle lock and runs the heartbeat for
    the life of the attached process.
 7. **Teardown** stamps the record terminal, deletes the file, disconnects,
-   stops, removes the container, and only then removes the record.
+   stops, removes the container, and only then removes the record. After a
+   normal exit that one exact inspection proves, it skips the disconnect and
+   the stop (see **Revoke** below).
 
 The project lifecycle lock covers steps 1–5 and teardown. It is released once
 the session is `attached`; it is not held for the interactive process lifetime.
@@ -499,7 +501,15 @@ remove with `--force`, delete the record, clear the stamp. The file goes first
 because it is the authority; the record goes last because it is what reserves
 the address. A file delete this host could not perform stops the sequence
 there and keeps the record, so the address stays reserved until a later pass
-finishes the job. The next container cannot reuse the address until the IP
+finishes the job; the launch reports it as one refusal naming `runfree up`, and
+when the terminal stamp could not be written either, the record itself is
+marked `revoking` so peers still read it as cleanup. A launch owner whose
+session ended with a numeric exit takes a shorter path: once the file is
+deleted, one exact `docker container inspect` must show the admitted
+incarnation (same id and `StartedAt`) stopped with that exit code, not
+restarting or paused, and with restart policy `no`; only then are the
+disconnect and the stop grace skipped and the container removed directly.
+Any other answer, and every reconcile, keeps the full sequence. The next container cannot reuse the address until the IP
 fence verifies old kernel sockets and consumer authority are gone. Teardown
 latency is not a security guard.
 
