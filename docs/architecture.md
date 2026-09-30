@@ -157,6 +157,71 @@ The TypeScript CLI lives under `packages/cli/src/`. It is responsible for:
 
 Command modules under `packages/cli/src/commands/` build typed intents. Shared enforcement lives under `packages/cli/src/admin/`, `packages/cli/src/runtime*`, and runtime contract packages.
 
+#### Docker Access
+
+Runtime code issues Docker operations as `docker` argv through one
+`capture` function (`packages/cli/src/runtime.ts`). A fixed allowlist of hot
+argv shapes is answered over the Docker Engine API Unix socket instead of by
+spawning the Docker CLI (`packages/cli/src/runtime/docker-api/`). The answer
+has the same status, stdout, and stderr bytes the CLI would print, so every
+caller, budget wrapper, operation histogram, and test fake still sees the
+argv and reads the same output.
+
+```text
+caller -> budget wrapper -> histogram -> capture(argv)
+                                            |
+                        routed argv shape? --no--> spawnSync docker
+                                            | yes
+                calling thread waits (Atomics.wait, the call's budget)
+                                            |
+                   worker thread: one HTTP request on the Unix socket
+                                            |
+                 CLI-identical CaptureResult {status, stdout, stderr}
+```
+
+- **Routes.** Raw `container inspect` / `inspect` / `image inspect` /
+  `network inspect` / `volume inspect`, the `{{.Id}}` and
+  `{{.State.Running}}` inspect templates, quiet `ps` with `label`, `name`,
+  `id`, and `network` filters, and non-TTY `exec [--user uid:gid] [-i]
+  <64-hex id> cmd…`. Matching is exact per token; an object reference must
+  match a strict character set, so no argv value can add a path segment or a
+  query parameter. Everything else (`compose`, `run`, `create`, `start`,
+  `rm`, other flags or templates) stays on the CLI.
+- **Endpoint.** Resolved on every call from the call's environment and the
+  user's Docker config exactly as the CLI resolves it (`DOCKER_HOST`,
+  `DOCKER_CONTEXT`, `currentContext`, context metadata;
+  `packages/cli/src/runtime/docker-endpoint.ts`). Only a local Unix socket
+  is used; TCP, SSH, TLS, both overrides set, custom config headers, or an
+  unreadable config keep the call on the CLI.
+- **Binding.** Once per process for each Docker CLI binary, socket file,
+  and context, the transport runs `docker version` with the call's
+  environment and requires the CLI's context and its view of the server
+  (version, API range, commit, OS, architecture, kernel, build time) to
+  match what the socket's daemon reports, and the daemon to say Docker in
+  `/_ping`. It then speaks the API version the CLI negotiated, so the daemon
+  shapes every body as it would for the CLI. A mismatch keeps the process on
+  the CLI. A replaced `docker` binary or a re-created or re-pointed socket
+  binds again. Type-less `inspect` is answered only while swarm is inactive.
+- **Opt-in for now.** The transport runs only with
+  `RUNFREE_DOCKER_TRANSPORT=api`; unset, empty, or `cli` keeps every call on
+  the Docker CLI. The default flips to on once
+  `make test-runtime-live-docker-transport` and the full live gate pass with
+  the transport on and off on a Docker host.
+- **Doubt stays on the CLI.** A `docker` on `PATH` that is not a native
+  binary (a shim or a test fake), `RUNFREE_TEST_FAKE_DOCKER=1`, an
+  unexpected spawn option, a refused connection, a missing object, or any
+  daemon refusal before an exec starts: the CLI answers, with the remaining
+  budget.
+- **Failures.** A routed call ends at its budget with status 124
+  (`timedOut`); there is no child process that could ignore SIGTERM. A call
+  with no budget ends at 60 s; Ctrl-C during a stuck routed call waits for
+  that bound, because the waiting thread cannot run a signal handler. A
+  socket error after connecting, an output over `maxBuffer`, or a lost
+  worker thread is status 125 (the last also sends the rest of the process
+  to the CLI). Once an exec has started, no failure hands it to the CLI, so
+  a command never runs twice: a refused start is the CLI's status 1, and an
+  exec whose exit code the daemon never records is 124 at the budget.
+
 ### Agent Container
 
 The `agent` service is the workspace where Claude Code, Codex, Pi, shells, build tools, package managers, MCP clients, and project commands run. The project is mounted at `/workspace`.
