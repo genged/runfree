@@ -228,7 +228,19 @@ Details: [Write Approval Grants](architecture.md#write-approval-grants).
    passive project descriptors at startup. It does not stop code already
    running in the agent from starting another binary or config.
 3. Static headers need a host-owned credential source.
-4. MCP tool calls follow the write-approval rules (`runfree mcp rules`).
+4. HTTP MCP tool calls follow the write-approval rules (`runfree mcp rules`).
+   STDIO MCP servers run inside the agent container; their calls do not pass
+   the proxy, so `runfree mcp rules` refuses them.
+5. No imported MCP descriptor starts a host process. Local STDIO commands run
+   only in the agent container. A known portable descriptor (Codex Desktop
+   `node_repl`) is replaced by the fixed `runfree-mcp` command from the agent
+   image; its host command, args, env values, and working directory are
+   discarded and never enter the container or the approval digest. Codex
+   `computer-use` (host desktop control) is skipped. See
+   [Portable Compute MCP](architecture.md#portable-compute-mcp).
+6. A portable server has the agent's authority, no more: it runs as the agent
+   user with the agent's mounts, network policy, and placeholder-only
+   environment. It gets no proxy-managed credential.
 
 ### Agent Container
 
