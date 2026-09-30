@@ -7,6 +7,7 @@
 
 import type * as childProcess from "node:child_process";
 
+import { remedy } from "../remedies.ts";
 import { PROJECT_ID_LABEL } from "./constants.ts";
 import {
   CONTAINER_ROLE_LABEL,
@@ -133,7 +134,8 @@ function removeExactForwarders(input: CaptureInput, forwarders: readonly DockerC
     const issues = validateIngressForwarderTeardownCandidate({ container: forwarder, expectedImageId: imageId, projectId: input.projectId });
     if (!FULL_DOCKER_ID_PATTERN.test(id) || issues.length > 0) {
       failures.push(`refusing to remove unverified MCP OAuth callback forwarder ${forwarder.Name ?? id}: ${
-        issues.map((issue) => issue.message).join("; ") || "no exact container id"}`);
+        issues.map((issue) => issue.message).join("; ") || "no exact container id"}; `
+        + `inspect it, or run \`${remedy.destroyForce()}\` to clear the project runtime and all its sessions`);
       continue;
     }
     const removed = capture(input, ["rm", "-f", id]);

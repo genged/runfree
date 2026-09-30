@@ -34,6 +34,9 @@
 //   ext   Recovery (a): the owner of an eligible session is SIGKILLed; the next
 //         launch's reconciliation removes the dead session's forwarder, and no
 //         forwarder carrying the dead identity ever targets the new session.
+//   ext   Recovery (a'): the dead owner's session container has also
+//         stopped, so warm-launch topology validation meets the dead route
+//         first; startup reclaims it and the next launch succeeds.
 //   ext   Recovery (b): a compatible proxy replacement leaves a live callback
 //         forwarder and a port forward in place, loopback-only and reaching.
 //   core  `runfree stop` and `runfree destroy` each remove a port forward
@@ -512,6 +515,24 @@ describe("ingress forwarders are loopback-only, one-way, per-session, and torn d
     expect(callbackForwardersForSession(projectId, dead.session.sessionId), "a forwarder still names the dead session").toEqual([]);
     const { forwarder } = await assertCallbackTwoHop(next);
     assertNeverAimedAtNext();
+    await endAndAssertCallbackGone(next, forwarder);
+  }, TEST_TIMEOUT_MS);
+
+  extendedTest("a dead owner whose session container has also stopped does not wedge the next launch", async () => {
+    // The warm-launch topology validation meets the dead route before
+    // admission does: its forwarder now targets a stopped container. Startup
+    // must reclaim it under the lock and launch, not refuse every later launch.
+    ensureMcpOAuthEligible();
+    const dead = await launch(["claude"], "stopped-owner session");
+    const { forwarder: deadForwarder } = await assertCallbackTwoHop(dead);
+    await dead.killOwner();
+    const stopped = docker(["container", "stop", "--time", "1", dead.session.containerId]);
+    expect(stopped.status, `docker stop of the dead session failed: ${stopped.stderr}`).toBe(0);
+    expect(inspectContainer(deadForwarder.id), "the forwarder vanished before the next launch").toBeDefined();
+
+    const next = await launch(["claude"], "launch after a stopped dead session");
+    expect(inspectContainer(deadForwarder.id), "the dead route survived the next launch").toBeUndefined();
+    const { forwarder } = await assertCallbackTwoHop(next);
     await endAndAssertCallbackGone(next, forwarder);
   }, TEST_TIMEOUT_MS);
 

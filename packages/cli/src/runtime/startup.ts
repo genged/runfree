@@ -12,6 +12,7 @@ import { projectHash } from "../project-identity.ts";
 import { runfreeLog, warn } from "../warnings.ts";
 import { waitForProxyFirewallReadiness } from "./proxy-firewall-readiness.ts";
 import { planValidatedIngressForwardersForRebuild } from "./ingress-forwarder-ownership.ts";
+import { reclaimStaleSessionMcpCallbackForwarders } from "./session-callback-ingress.ts";
 import { prepareEffectiveControlsForStartup } from "../control/workflow.ts";
 import {
   convergeEffectivePolicyGeneration,
@@ -598,7 +599,7 @@ function containValidationProxy(plan: ActiveRuntimePlan, io: RuntimeIO, proxyId:
   warn(`proxy ${proxyId} was contained; session resources were preserved; repair the reported boundary and resume runtime recovery`);
 }
 
-function validateRuntimeTopologyOrRemoveInvalid(
+export function validateRuntimeTopologyOrRemoveInvalid(
   plan: ActiveRuntimePlan,
   context: RuntimeContext,
   io: RuntimeIO,
@@ -610,10 +611,11 @@ function validateRuntimeTopologyOrRemoveInvalid(
     containmentIO?: RuntimeIO;
     helperFence?: EphemeralHelperFence;
     helperImage?: string;
+    readOnly?: boolean;
   } = {},
 ): { denyByDefaultObservation?: DenyByDefaultObservationV1; status: number; failureKind?: RuntimeFailureKind } {
   let boundaryViolated = false;
-  const validation = validateRuntimeTopologyWithProof(plan, io, {
+  const validate = () => validateRuntimeTopologyWithProof(plan, io, {
     onBoundaryViolation: () => { boundaryViolated = true; },
     progress: options.verbose === true,
     verbose: options.verbose,
@@ -621,6 +623,15 @@ function validateRuntimeTopologyOrRemoveInvalid(
     helperFence: options.helperFence,
     helperImage: options.helperImage,
   });
+  let validation = validate();
+  if (validation.issues.length > 0 && reclaimDeadCallbackRoutes(plan, context, io, options)) {
+    // A dead session's callback forwarder (a killed launcher's leftover, or
+    // an unbound one from before session-owned callbacks) fails the
+    // participant check on every later launch; it is reclaimed here, under
+    // the held lock, and the topology proved once more from scratch.
+    boundaryViolated = false;
+    validation = validate();
+  }
   if (validation.issues.length === 0) {
     return {
       status: 0,
@@ -635,6 +646,33 @@ function validateRuntimeTopologyOrRemoveInvalid(
     containValidationProxy(plan, options.containmentIO ?? io, options.expectedProxyId, options.lifecycleLock);
   }
   return { status: 1, failureKind: boundaryViolated ? "boundary-violation" : "observation-unavailable" };
+}
+
+/**
+ * Removes MCP OAuth callback forwarders that route to no running session, when
+ * this caller may mutate under the held lifecycle lock. True when anything was
+ * removed. A failure to prove what is stale removes nothing and reports the
+ * original refusal unchanged.
+ */
+function reclaimDeadCallbackRoutes(
+  plan: ActiveRuntimePlan,
+  context: RuntimeContext,
+  io: RuntimeIO,
+  options: Readonly<{ lifecycleLock?: ProjectLifecycleLock; readOnly?: boolean }>,
+): boolean {
+  if (options.readOnly || !options.lifecycleLock) return false;
+  options.lifecycleLock.assertHeld();
+  try {
+    return reclaimStaleSessionMcpCallbackForwarders({
+      io,
+      dockerOptions: dockerClientEnvOptions(context),
+      projectId: plan.projectId,
+      internalNetwork: `${plan.composeProjectName}_agent_internal`,
+    }) > 0;
+  } catch (error) {
+    warn(`could not reclaim stale MCP OAuth callback forwarders: ${error instanceof Error ? error.message : String(error)}`);
+    return false;
+  }
 }
 
 function inspectById(inspects: DockerContainerInspect[] | undefined, id: string): DockerContainerInspect | undefined {

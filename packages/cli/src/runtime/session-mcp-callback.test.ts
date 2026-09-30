@@ -224,6 +224,15 @@ describe("prepareSessionMcpCallback", () => {
 });
 
 describe("sessionMcpCallbackLifecycle", () => {
+  test("a current-config project without a selected effective generation refuses rather than guessing", () => {
+    const context = {
+      projectRoot: PROJECT_ROOT,
+      project: { config: { version: 4 }, paths: { controlProxyDir: path.join(tmp, "absent-control") } },
+      env: {},
+    } as unknown as RuntimeContext;
+    expect(() => sessionMcpCallbackLifecycle(context, fake().io)).toThrow("selected effective controls are required");
+  });
+
   test("is absent when no OAuth-capable MCP server needs a callback", () => {
     expect(sessionMcpCallbackLifecycle(contextWith(false), fake().io)).toBeUndefined();
     expect(sessionMcpCallbackLifecycle(contextWith(true), fake().io)).toBeDefined();

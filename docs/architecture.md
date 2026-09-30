@@ -892,10 +892,12 @@ host 127.0.0.1:P -> forwarder (bound to session S) -> S's address:P
   after the session file and before the record, so the address is never
   released while a route to it survives. A failure keeps the record for the
   next reconcile. Unadmitted cleanup does the same.
-- **Reclaim.** When the participant proof refuses, admission removes callback
-  forwarders that route to no running owner (a killed launcher's leftover, a
-  half-started forwarder, an unbound one) under the lifecycle lock and proves
-  once more. The healthy path spends no Docker call on this.
+- **Reclaim.** When startup's topology validation or admission's participant
+  proof refuses, the refusing step removes callback forwarders that route to
+  no running owner (a killed launcher's leftover, a half-started forwarder, an
+  unbound one) under the lifecycle lock and proves once more. A forwarder whose
+  state cannot be read is never counted as dead. The healthy path spends no
+  Docker call on this.
 - **Failure.** A setup failure removes what it created and fails the launch
   with a retry instruction. Sessions without an OAuth-capable server create
   nothing.

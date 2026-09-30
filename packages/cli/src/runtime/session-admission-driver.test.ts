@@ -1827,7 +1827,10 @@ describe("session admission under the per-session file source", () => {
     await expect(driver.launchBuiltin("codex")).rejects.toBeDefined();
 
     expect(mocks.events).toContain("remove-session-ingress");
-    expect(mocks.events.slice(mocks.events.indexOf("remove-session-ingress"))).not.toContain("remove-record");
+    const after = mocks.events.slice(mocks.events.indexOf("remove-session-ingress"));
+    expect(after).not.toContain("remove-record");
+    expect(after).not.toContain("prove-absent");
+    expect(after.some((event) => event.startsWith("remove-exact-record:") || event.startsWith("remove-record:"))).toBe(false);
   });
 
   test("an unavailable inspection at activation writes no session file and tears the session down", async () => {
