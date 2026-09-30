@@ -148,10 +148,12 @@ export const COMMAND_EXAMPLES = {
     { cmd: "runfree mcp configure", blurb: "Configure MCP imports and tool-call rules interactively" },
     { cmd: "runfree mcp configure --agent claude", blurb: "Configure only Claude Code MCP entries" },
     { cmd: "runfree mcp explain claude my-server", blurb: "Show the normalized descriptor and import decision" },
+    { cmd: "runfree mcp enable claude my-server", blurb: "Approve a server, its OAuth hosts, and its login in one review" },
+    { cmd: "runfree mcp enable claude my-server --no-discover --oauth-host auth.example.com", blurb: "Name the OAuth hosts yourself; no network call" },
     { cmd: "runfree mcp approve claude my-server --from-source op-token", blurb: "Approve a project-local server" },
     { cmd: "runfree mcp auth claude my-server", blurb: "Run MCP OAuth login inside the validated runtime" },
     { cmd: "runfree mcp rules claude my-server --tool create_issue --write ask", blurb: "Hold one side-effecting tool for approval" },
-    { cmd: "runfree mcp revoke claude my-server", blurb: "Remove a project-local MCP approval" },
+    { cmd: "runfree mcp revoke claude my-server", blurb: "Remove the approval and the OAuth hosts mcp enable added" },
   ],
   doctor: [
     { cmd: "runfree doctor", blurb: "Diagnose blocked proxy hosts from recent proxy logs" },
