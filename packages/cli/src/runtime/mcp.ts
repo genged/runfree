@@ -37,6 +37,12 @@ import {
   type PortableClassification,
   portableCodexConfig,
 } from "./portable-mcp.ts";
+import {
+  projectEnabledOAuthEndpoints,
+  projectEnabledOAuthHosts,
+  readMcpEnabled,
+  withoutSharedEnabledEndpoints,
+} from "./mcp-enabled.ts";
 import { RUNFREE_RUNTIME_TARGETS, workspaceMetadataTarget } from "./mount-target-policy.ts";
 import { sha256Hex, isRecord } from "../strict-primitives.ts";
 
@@ -205,6 +211,7 @@ type McpOAuthServerPolicyJson = {
     authServerMetadataUrl?: string;
   };
   tokenEndpoints?: OAuthTokenEndpointJson[];
+  registrationEndpoints?: OAuthTokenEndpointJson[];
   seeds?: OAuthSeedJson[];
 };
 
@@ -229,6 +236,9 @@ export type McpPrepareOptions = {
   claudeMcpConfigPath: string;
   codexDir: string;
   env: NodeJS.ProcessEnv;
+  // Host-owned `runfree mcp enable` records: their OAuth hosts are projected
+  // beside the matching server's endpoint host.
+  mcpEnabledPath?: string;
   mcpOperationPolicyPath?: string;
   mcpOAuthPolicyPath: string;
   mcpRulesPath?: string;
@@ -1791,12 +1801,38 @@ export function prepareMcpRuntime(options: McpPrepareOptions): McpPrepareResult 
 
   writeClaudeRuntimeConfig(options.claudeConfigPath, options.claudeMcpConfigPath, servers);
   writeCodexRuntimeConfig(options.codexDir, servers);
+  applyPolicyAndTokens(options.policy, options.tokenConfig, servers);
+  // `runfree mcp enable` records join the servers prepared in this pass by the
+  // MCP rules identity (descriptor digest for project servers, endpoint for
+  // user/local servers): a changed or deleted server matches no record. Their
+  // hosts are projected after the servers' own hosts, so only hosts nothing
+  // else allows get narrowed request rules; their endpoints then join the
+  // OAuth mediation policy written below.
+  const enabled = options.mcpEnabledPath ? readMcpEnabled(options.projectRoot, options.mcpEnabledPath).file : undefined;
+  const claimants = servers.map((server) => {
+    const identity = enabled
+      ? mcpRuleKey({ agent: server.agent, descriptorDigest: server.descriptorDigest, endpoint: server.endpoint, server: server.name, source: server.source })
+      : undefined;
+    const record = identity ? enabled?.records[identity] : undefined;
+    return {
+      serverKey: `${server.agent}\0${server.source}\0${server.name}`,
+      label: `${server.agent} server ${server.name}`,
+      ...(server.oauthPolicy ? { policy: server.oauthPolicy } : {}),
+      ...(record ? { record } : {}),
+    };
+  });
+  const mediation = withoutSharedEnabledEndpoints(claimants);
+  for (const message of mediation.dropped) warn(message);
+  servers.forEach((server, index) => {
+    const record = mediation.records[index];
+    if (record && server.oauthPolicy) projectEnabledOAuthEndpoints(server.oauthPolicy, record);
+  });
+  projectEnabledOAuthHosts(options.policy, claimants.flatMap((claimant) => claimant.record ? [claimant.record] : []));
   writeMcpOAuthPolicy(options.mcpOAuthPolicyPath, servers, callbackPort);
   writeMcpOperationPolicy(
     options.mcpOperationPolicyPath ?? mcpOperationPolicyPath(path.dirname(options.mcpOAuthPolicyPath)),
     mcpOperationPolicyJson(servers, mcpOperationRulesForServers(servers, readMcpRules(options.projectRoot, options.mcpRulesPath))),
   );
-  applyPolicyAndTokens(options.policy, options.tokenConfig, servers);
 
   // Import/skip lines: only the launched agent's servers, and one line per
   // server when both agents import it with the same outcome.
