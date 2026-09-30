@@ -381,8 +381,8 @@ first asks before it contacts the host that the project file names.
 
 Discovery adds a host only when valid metadata names a token endpoint that the
 proxy mediates for this server. When nothing else allows it, a host found by
-discovery is limited to `/.well-known` and its exact OAuth endpoints (GET,
-HEAD, OPTIONS, and POST). The
+discovery is limited to GET, HEAD, OPTIONS, and POST on paths that start with
+`/.well-known` or one of its OAuth endpoint paths. The
 proxy mediates those endpoints, so the agent sees only `runfree_oauth_*`
 handles. The browser sign-in page opens on your computer and is never
 allowlisted. Token requests follow the project's write approval setting
