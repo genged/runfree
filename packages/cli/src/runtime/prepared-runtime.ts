@@ -82,6 +82,13 @@ export type LaunchHandoff = Readonly<{
   inventoryClean: boolean;
   /** Every address a proxy session file named in that reconcile. */
   reservedSourceIps: readonly string[];
+  /**
+   * Every IP assignment file's digest, read inside the proxy under this same
+   * held lock and proxy incarnation (sub-second launch plan Task 6). The IP
+   * fence's CAS precondition for an allocated address: its digest, or `-`
+   * when the listing named none. Absent: admission reads the one address.
+   */
+  ipAssignmentDigests?: Readonly<Record<string, string>>;
 }>;
 
 type HandoffSlot = { handoff: LaunchHandoff | undefined };

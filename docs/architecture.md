@@ -794,7 +794,10 @@ host                                   proxy (root firewall + request proxy)
   directory and requires that the assignment still matches the exact bytes
   the host read. It holds the lock through retirement and publication, so a
   delayed exec cannot replace a later assignment. A lock timeout refuses
-  creation; retry is safe.
+  creation; retry is safe. A launch holding a warm startup's lock handoff
+  takes those bytes' digest from the full assignment listing its startup read
+  under the same lock and proxy incarnation (absent means no assignment)
+  instead of a separate read; the fence's comparison is unchanged.
 - The ingress listener binds IPv4 explicitly, so the IPv4 `ss` query covers
   it. Linux can keep unaccepted sockets after `ss -K`; the request proxy keeps
   destroying sockets from draining addresses, and the host retries the query

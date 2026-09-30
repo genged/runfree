@@ -1817,6 +1817,7 @@ function createRuntimeIO(overrides: {
         { exit: 0, body: body(["exec", "--user", "0:0", FAKE_PROXY_CONTAINER_ID, "cat", "/run/runfree-proxy-status/firewall.json"]) },
         { exit: 0, body: securityContractProbeOutput("proxy").replace(/\n$/, "") },
         { exit: 0, body: process.env.FAKE_WARM_BOOT_ID ?? "11111111-2222-3333-4444-555555555555" },
+        { exit: 0, body: process.env.FAKE_WARM_IP_ASSIGNMENTS ?? "{}" },
       ];
       return captureResult(0, `${sections.map((section, index) => [
         `RUNFREE_FIREWALL_SECTION ${index} exit=${section.exit}`,
@@ -3734,6 +3735,10 @@ describe("runtime command flow", () => {
       const handoff = takeLaunchHandoff(warm.preparedRuntime);
       expect(handoff?.proxy.id).toBe(FAKE_PROXY_CONTAINER_ID);
       expect(handoff?.inventoryClean).toBe(true);
+      // A warm proof matched, so the handoff carries the batch's IP listing
+      // and the observed incarnation.
+      expect(handoff?.ipAssignmentDigests).toEqual({});
+      expect(handoff?.proxy.pid).toBe(4242);
       expect(takeLaunchHandoff(warm.preparedRuntime)).toBeUndefined();
       handoff?.lifecycleLock.release();
       expect(lockIsFree(context)).toBe(true);

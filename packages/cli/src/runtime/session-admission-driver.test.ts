@@ -2684,6 +2684,50 @@ describe("session admission under the per-session file source", () => {
       expect(mocks.inventory).toHaveBeenCalled();
     });
 
+    test("the handoff's IP assignment listing replaces the separate read as the fence's CAS precondition", async () => {
+      for (const [digests, expected] of [
+        [{ "172.31.90.20": "d".repeat(64) }, "d".repeat(64)],
+        [{ "172.31.90.44": "d".repeat(64) }, "-"],
+      ] as const) {
+        mocks.events.length = 0;
+        const input = fixture();
+        mocks.containerInspect = { status: 0, stdout: runningInspect(), stderr: "" };
+        proxyInspectAnswer(PROXY_STARTED_AT);
+        let fenceArgs: readonly string[] | undefined;
+        const capture = input.io.capture as ReturnType<typeof vi.fn>;
+        const base = capture.getMockImplementation() as (command: string, args: string[], options: unknown) => unknown;
+        capture.mockImplementation((command: string, args: string[], options: unknown) => {
+          if (effectLabel(args) === "session-file:ip-reuse-fence") fenceArgs = [...args];
+          return base(command, args, options);
+        });
+        const driver = createInternalSessionAdmissionDriver({
+          ...input,
+          handoff: handoffFor(input, { ipAssignmentDigests: digests }),
+          nowEpochMs: () => Date.parse("2026-08-09T00:10:00.000Z"),
+        });
+
+        await expect(driver.launchBuiltin("codex")).resolves.toEqual({ status: 0, signal: null });
+
+        expect(mocks.events).not.toContain("session-file:read-ip-assignment");
+        expect(fenceArgs?.at(-1)).toBe(expected);
+      }
+    });
+
+    test("without a listing the handoff path still reads the one address", async () => {
+      const input = fixture();
+      mocks.containerInspect = { status: 0, stdout: runningInspect(), stderr: "" };
+      proxyInspectAnswer(PROXY_STARTED_AT);
+      const driver = createInternalSessionAdmissionDriver({
+        ...input,
+        handoff: handoffFor(input),
+        nowEpochMs: () => Date.parse("2026-08-09T00:10:00.000Z"),
+      });
+
+      await expect(driver.launchBuiltin("codex")).resolves.toEqual({ status: 0, signal: null });
+
+      expect(mocks.events).toContain("session-file:read-ip-assignment");
+    });
+
     test("a proxy restarted since startup refuses as stale before allocation", async () => {
       const input = fixture();
       proxyInspectAnswer("2026-08-09T00:05:00.000Z");

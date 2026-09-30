@@ -19,6 +19,7 @@ import {
   SESSION_ELIGIBILITY_PATH,
   SESSION_FILES_DIR,
   SESSION_FILE_MAX_BYTES,
+  SESSION_IP_REUSE_DIR,
   type SessionFileV1,
 } from "@runfree/runtime-contracts/session-file";
 
@@ -28,6 +29,9 @@ import { readProxySessionFiles } from "./session-reconcile.ts";
 import {
   eligibilityPublishCommand,
   executeSessionFileCommand,
+  listIpAssignmentsScript,
+  parseIpAssignmentListing,
+  sessionIpAssignmentReadCommand,
   sealCommand,
   servedSetReadCommand,
   sessionFileDeleteCommand,
@@ -844,5 +848,76 @@ describe("session-file command sealing stays private", () => {
       .map((file) => path.relative(sourceRoot, file))
       .sort();
     expect(referencing).toEqual(["runtime/session-file-publisher.ts"]);
+  });
+});
+
+describe("IP assignment listing (sub-second launch plan Task 6)", () => {
+  function reuseSandbox(): { root: string; requests: string; localize(script: string): string; cleanup(): void } {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "ip-reuse-listing-"));
+    const requests = path.join(root, "requests");
+    fs.mkdirSync(requests, { mode: 0o755 });
+    fs.chmodSync(root, 0o755);
+    return {
+      root,
+      requests,
+      localize: (script) => {
+        expect(script.split("const ownerUid = 0;")).toHaveLength(2);
+        const localized = script
+          .split("const ownerUid = 0;").join(`const ownerUid = ${process.getuid?.() ?? 0};`)
+          .split(JSON.stringify(SESSION_IP_REUSE_DIR)).join(JSON.stringify(root))
+          .split(JSON.stringify(SESSION_FILES_DIR)).join(JSON.stringify(path.join(root, "sessions")))
+          .split(JSON.stringify(SESSION_ELIGIBILITY_PATH)).join(JSON.stringify(path.join(root, "eligibility.json")));
+        expect(localized).not.toContain("/run/runfree-sessions");
+        return localized;
+      },
+      cleanup: () => fs.rmSync(root, { recursive: true, force: true }),
+    };
+  }
+
+  test("lists every assignment with the digest the single read would answer", () => {
+    const sandbox = reuseSandbox();
+    try {
+      fs.writeFileSync(path.join(sandbox.requests, "172.31.90.20.json"), '{"v":1,"state":"ready"}\n');
+      fs.writeFileSync(path.join(sandbox.requests, "172.31.90.21.json"), '{"v":1,"state":"draining"}\n');
+      const listed = runScript(sandbox.localize(listIpAssignmentsScript()), []);
+      expect(listed.status, listed.stderr).toBe(0);
+      const digests = parseIpAssignmentListing(listed.stdout);
+      expect(Object.keys(digests ?? {})).toEqual(["172.31.90.20", "172.31.90.21"]);
+      // Byte-for-byte the digest the fence's CAS compares, as the per-address
+      // read reports it.
+      for (const ip of ["172.31.90.20", "172.31.90.21", "172.31.90.22"]) {
+        const args = sessionIpAssignmentReadCommand("a".repeat(64), ip).args;
+        const readScript = sandbox.localize(args[args.indexOf("-e") + 1] as string);
+        const single = runScript(readScript, [sandbox.root, ip]);
+        expect(single.status, single.stderr).toBe(0);
+        expect(digests?.[ip] ?? "-").toBe(single.stdout);
+      }
+    } finally {
+      sandbox.cleanup();
+    }
+  });
+
+  test.each([
+    ["an in-flight temp file", (requests: string) => fs.writeFileSync(path.join(requests, "172.31.90.20.json.abc.tmp"), "x")],
+    ["a symlinked assignment", (requests: string) => fs.symlinkSync("/etc/hostname", path.join(requests, "172.31.90.20.json"))],
+    ["an oversize assignment", (requests: string) => fs.writeFileSync(path.join(requests, "172.31.90.20.json"), "x".repeat(513))],
+    ["a group-writable directory", (requests: string) => fs.chmodSync(requests, 0o775)],
+  ])("refuses the whole listing on %s", (_label, damage) => {
+    const sandbox = reuseSandbox();
+    try {
+      fs.writeFileSync(path.join(sandbox.requests, "172.31.90.21.json"), '{"v":1}\n');
+      damage(sandbox.requests);
+      const listed = runScript(sandbox.localize(listIpAssignmentsScript()), []);
+      expect(listed.status).not.toBe(0);
+    } finally {
+      sandbox.cleanup();
+    }
+  });
+
+  test("a malformed listing parses as unavailable, never as empty", () => {
+    for (const stdout of ["", "{", "[]", JSON.stringify({ "not-an-ip": "a".repeat(64) }), JSON.stringify({ "172.31.90.20": "short" })]) {
+      expect(parseIpAssignmentListing(stdout)).toBeUndefined();
+    }
+    expect(parseIpAssignmentListing("{}")).toEqual({});
   });
 });

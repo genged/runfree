@@ -47,6 +47,7 @@ import {
   validateRuntimeSecurityContractEvidence,
 } from "./security-contract.ts";
 import { assertComposeManagedLocalVolume } from "./session-named-volume-proof.ts";
+import { listIpAssignmentsScript, parseIpAssignmentListing } from "./session-file-publisher.ts";
 import { runtimeValidationMarkerProof, type RuntimeValidationProof } from "./state.ts";
 import { validateRuntimeTopologyWithProof, type WarmTopologyEvidence } from "./topology.ts";
 import type { DockerContainerInspect, DockerNetworkInspect, RuntimeContext, RuntimeIO } from "./types.ts";
@@ -130,6 +131,8 @@ export type WarmValidation = Readonly<{
   proxyPid: number;
   /** The Docker VM boot id the proxy reported. */
   bootId: string;
+  /** `ip -> sha256 hex` of every IP assignment file the batch read; absent means none. */
+  ipAssignmentDigests?: Readonly<Record<string, string>>;
 }>;
 
 /**
@@ -200,6 +203,7 @@ function warmBatchCommands(plan: ActiveRuntimePlan, securityProbe: string): stri
     `cat ${firewallStatusPath()}`,
     `sh -c ${quoted}`,
     "cat /proc/sys/kernel/random/boot_id",
+    `node -e ${`'${listIpAssignmentsScript().replaceAll("'", "'\\''")}'`}`,
   ];
 }
 
@@ -312,7 +316,7 @@ type WarmJudgement =
 function judgeWarmObservation(input: WarmProofInput, observation: WarmObservation): WarmJudgement {
   const invalid = (field: string): WarmJudgement => Object.freeze({ kind: "invalid", field });
   const { plan, effective } = input;
-  const [uid, routeInternal, routeEgress, capBnd, nftTable, allowedSet, marker, firewallStatus, securityProbe, bootId] =
+  const [uid, routeInternal, routeEgress, capBnd, nftTable, allowedSet, marker, firewallStatus, securityProbe, bootId, ipAssignments] =
     observation.sections as FirewallSectionResult[];
   if (uid.exit !== 0 || uid.body.trim() !== "0") return invalid("batch-identity");
   const daemon = input.daemon;
@@ -452,6 +456,12 @@ function judgeWarmObservation(input: WarmProofInput, observation: WarmObservatio
     proxyStartedAt: startedAt,
     proxyPid: pid,
     bootId: bootId.body.trim(),
+    // Not a fact the proof compares: the IP assignments this batch read, for
+    // the launch's IP fence to use as its CAS precondition under the same held
+    // lock (Task 6). A listing that failed is simply absent.
+    ...(ipAssignments?.exit === 0 && parseIpAssignmentListing(ipAssignments.body)
+      ? { ipAssignmentDigests: parseIpAssignmentListing(ipAssignments.body) }
+      : {}),
   });
   sealedValidations.add(validation);
   return Object.freeze({ kind: "valid", facts, validation });

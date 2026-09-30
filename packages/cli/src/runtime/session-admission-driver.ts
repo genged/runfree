@@ -457,6 +457,8 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
    * in time" into an ordering property.
    */
   #reservedSessionFileIps: readonly string[] = [];
+  /** The handoff's IP assignment listing, until the one fence that may use it. */
+  #handoffIpAssignments?: Readonly<Record<string, string>>;
   /** Present only in launch mode; probes must never leave user-facing session evidence. */
   #launch?: SessionAdmissionLaunchOptions;
   #displayIdentity?: Readonly<{ displayName: string; command: string; agentCommand: string }>;
@@ -1195,6 +1197,22 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
    * refuses as stale, which the launch frame answers with one bounded
    * re-preparation.
    */
+  /**
+   * The fence's CAS precondition from the handoff's listing, once (Task 6).
+   *
+   * Only when the preflight relied on the handoff (so the same held lock and
+   * the same proxy incarnation were proved), and only for the one allocation
+   * that follows it. The fence still takes its kernel lock and compares: a
+   * delayed executor that wrote after the listing makes it refuse, exactly as
+   * it would against a separate read.
+   */
+  #takeHandoffIpAssignment(sourceIp: string): string | undefined {
+    const digests = this.#handoffIpAssignments;
+    this.#handoffIpAssignments = undefined;
+    if (!digests) return undefined;
+    return digests[sourceIp] ?? "-";
+  }
+
   #settledByHandoff(): LaunchHandoff | undefined {
     const handoff = this.#input.handoff;
     if (!handoff || !handoff.inventoryClean) return undefined;
@@ -1300,6 +1318,7 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
     const settledByHandoff = this.#settledByHandoff();
     if (settledByHandoff) {
       this.#reservedSessionFileIps = settledByHandoff.reservedSourceIps;
+      this.#handoffIpAssignments = settledByHandoff.ipAssignmentDigests;
       this.#lock();
       this.#assertNoQuarantinedSessionRecords();
     } else {
@@ -1467,11 +1486,12 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
     );
     const namedVolumeProof = validateSessionNamedVolumeInspect(volumeResult.stdout, plan);
     this.#lock();
-    const assignment = executeSessionFileCommand(
-      this.#gateway.io,
-      sessionIpAssignmentReadCommand(this.#controlPlane().proxyContainerId, plan.record.sourceIp),
-      this.#dockerOptions(),
-    ).stdout.trim();
+    const assignment = this.#takeHandoffIpAssignment(plan.record.sourceIp)
+      ?? executeSessionFileCommand(
+        this.#gateway.io,
+        sessionIpAssignmentReadCommand(this.#controlPlane().proxyContainerId, plan.record.sourceIp),
+        this.#dockerOptions(),
+      ).stdout.trim();
     this.#lock();
     executeSessionFileCommand(
       this.#gateway.io,

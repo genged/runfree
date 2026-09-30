@@ -404,6 +404,58 @@ try {
 }
 `;
 
+// Every IP assignment at once, with exactly the per-file checks of
+// READ_IP_ASSIGNMENT_SCRIPT (sub-second launch plan Task 6). The directory is
+// read in full: an address absent from it has no assignment, which is the
+// `-` the single read would answer. Any entry that is not a `<ipv4>.json`
+// regular, root-owned, single-link file of at most 512 bytes — including an
+// in-flight publish's temp file — fails the whole listing, so the caller falls
+// back to the single read rather than to a guess.
+const LIST_IP_ASSIGNMENTS_SCRIPT = `
+const fs = require("node:fs");
+const path = require("node:path");
+const crypto = require("node:crypto");
+${SCRIPT_PREAMBLE}
+const root = ${JSON.stringify(SESSION_IP_REUSE_DIR)};
+assertSafeDir(root);
+assertSafeDir(path.join(root, "requests"));
+const digests = {};
+for (const entry of fs.readdirSync(path.join(root, "requests")).sort()) {
+  const match = /^(\\d{1,3}(?:\\.\\d{1,3}){3})\\.json$/.exec(entry);
+  if (!match || require("node:net").isIP(match[1]) !== 4) fail("unexpected IP assignment entry");
+  const target = path.join(root, "requests", entry);
+  const stat = fs.lstatSync(target);
+  if (!stat.isFile() || stat.isSymbolicLink() || stat.uid !== ownerUid || stat.nlink !== 1 || stat.size > 512) fail("unsafe IP assignment");
+  digests[match[1]] = crypto.createHash("sha256").update(fs.readFileSync(target)).digest("hex");
+}
+process.stdout.write(JSON.stringify(digests));
+`;
+
+/** The listing script, for a root batch that already runs as `--user 0:0` in the exact proxy. */
+export function listIpAssignmentsScript(): string {
+  return LIST_IP_ASSIGNMENTS_SCRIPT;
+}
+
+/**
+ * Parses the listing into `ip -> digest`; undefined for anything malformed.
+ * An address the listing does not name has no assignment (`-`).
+ */
+export function parseIpAssignmentListing(stdout: string): Readonly<Record<string, string>> | undefined {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(stdout);
+  } catch {
+    return undefined;
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
+  const digests: Record<string, string> = {};
+  for (const [ip, digest] of Object.entries(parsed as Record<string, unknown>)) {
+    if (!isExactSessionSourceIpv4(ip) || typeof digest !== "string" || !/^[a-f0-9]{64}$/.test(digest)) return undefined;
+    digests[ip] = digest;
+  }
+  return Object.freeze(digests);
+}
+
 export function sessionIpAssignmentReadCommand(proxyId: string, sourceIp: string): SessionAdmissionDockerCommand {
   if (!isExactSessionSourceIpv4(sourceIp)) throw new Error("session source IP must be exact IPv4");
   return sealCommand({ executable: "docker", effect: "read-ip-assignment", args: pinnedExec(proxyId, READ_IP_ASSIGNMENT_SCRIPT, [SESSION_IP_REUSE_DIR, sourceIp]) });
