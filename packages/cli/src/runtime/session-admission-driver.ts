@@ -480,6 +480,7 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
 
   nowMs = (): number => this.#nowMonotonicMs();
   dockerOperationCount = (): number => this.#gateway.dockerOperationCount();
+  #teardownPath: "exited" | "full" = "full";
 
   // Locking invariant: every step asserts the lifecycle lock at entry (and
   // per-iteration around direct registry writes). Coordinator interiors are
@@ -793,11 +794,15 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
         startedAt: anchor.dockerStartedAt,
         exitCode: outcome.status,
       });
+      if (proof) this.#teardownPath = "exited";
       return proof ? Object.freeze({ kind: "exited" as const, proof }) : UNCERTAIN_SESSION_COMPLETION;
     } catch {
       return UNCERTAIN_SESSION_COMPLETION;
     }
   }
+
+  /** Which revocation order the last teardown took; timing diagnostics only. */
+  teardownPath = (): "exited" | "full" => this.#teardownPath;
 
   /**
    * Marks a blocked teardown in the durable record itself when its terminal
@@ -2165,6 +2170,7 @@ export function createInternalSessionAdmissionDriver(
     } finally {
       if (timings.enabled && steps) {
         timings.report("session-admission", `docker-operations=${steps.dockerOperationCount()}`);
+        timings.report("teardown-path", steps.teardownPath());
       }
       inFlight = false;
     }

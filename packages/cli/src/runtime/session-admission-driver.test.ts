@@ -2610,6 +2610,9 @@ describe("session admission under the per-session file source", () => {
       // verbs only: no container id, proxy id, or script text.
       const total = lines.findIndex((line) => line.startsWith("timing: session-admission docker-operations="));
       expect(total).toBeGreaterThan(lines.indexOf(before ?? ""));
+      // A container the teardown inspection still reads as running took the
+      // full revocation order.
+      expect(lines).toContain("timing: teardown-path full");
       for (const line of opsLines) {
         expect(line).not.toContain(CONTAINER_ID);
         expect(line).not.toContain("node");
