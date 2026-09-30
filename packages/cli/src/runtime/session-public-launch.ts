@@ -23,8 +23,10 @@ import {
   type SessionRunningHook,
 } from "./session-admission-driver.ts";
 import {
+  disposeLaunchHandoff,
   preparedRuntimeContext,
   StalePreparedRuntimeError,
+  takeLaunchHandoff,
   type PreparedRuntime,
 } from "./prepared-runtime.ts";
 import {
@@ -146,39 +148,63 @@ async function withSessionLaunchFrame(
   launch: (driver: SessionLaunchDriver) => Promise<Readonly<{ status: number | null }>>,
 ): Promise<number> {
   let preparedRuntime = input.preparedRuntime;
-  for (let attempt = 0; attempt < 2; attempt += 1) {
-    const context = preparedRuntimeContext(preparedRuntime);
-    // Bounded lock acquisition avoids random refusal behind another process's
-    // short critical section. A lock held for the complete window is a real
-    // lifecycle operation, so this launch defers.
-    const initialLifecycleLock = await tryAcquireProjectLifecycleLockWithRetry(context);
-    if (!initialLifecycleLock) {
-      throw new CliError(
-        `per-session launch deferred because a runtime lifecycle change is in progress (lock: ${projectLifecycleLockPath(context)})`,
-      );
-    }
-    const sessionLockManager = createSessionLockManager(context, initialLifecycleLock);
-    try {
-      const driver = createInternalSessionAdmissionDriver({
-        preparedRuntime,
-        sessionLockManager,
-        io: input.io,
-        ...(input.foregroundSpawner ? { foregroundSpawner: input.foregroundSpawner } : {}),
-        ...(input.onSessionRunning ? { onSessionRunning: input.onSessionRunning } : {}),
-      });
-      const outcome = await launch(driver);
-      return typeof outcome.status === "number" ? outcome.status : 1;
-    } catch (error) {
-      if (!(error instanceof StalePreparedRuntimeError)) throw error;
-      if (attempt !== 0 || !input.reprepare) {
+  try {
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const context = preparedRuntimeContext(preparedRuntime);
+      // Sub-second launch plan Task 3: when startup still holds the lifecycle
+      // lock for this launch, admission runs under that exact lock instead of
+      // releasing and re-taking it. The handoff is taken once; from here the
+      // session lock manager owns the lock and closes it on every path.
+      const handoff = takeLaunchHandoff(preparedRuntime);
+      // Bounded lock acquisition avoids random refusal behind another process's
+      // short critical section. A lock held for the complete window is a real
+      // lifecycle operation, so this launch defers.
+      const initialLifecycleLock = handoff?.lifecycleLock ?? await tryAcquireProjectLifecycleLockWithRetry(context);
+      if (!initialLifecycleLock) {
         throw new CliError(
-          "per-session launch could not converge because runtime lifecycle state changed repeatedly; retry the command",
+          `per-session launch deferred because a runtime lifecycle change is in progress (lock: ${projectLifecycleLockPath(context)})`,
         );
       }
-    } finally {
-      sessionLockManager.close();
+      let sessionLockManager: ReturnType<typeof createSessionLockManager>;
+      try {
+        sessionLockManager = createSessionLockManager(context, initialLifecycleLock);
+      } catch (error) {
+        if (handoff) {
+          try {
+            initialLifecycleLock.release();
+          } catch {
+            // A lock this process no longer owns is not this frame's to release.
+          }
+        }
+        throw error;
+      }
+      try {
+        const driver = createInternalSessionAdmissionDriver({
+          preparedRuntime,
+          sessionLockManager,
+          io: input.io,
+          ...(input.foregroundSpawner ? { foregroundSpawner: input.foregroundSpawner } : {}),
+          ...(input.onSessionRunning ? { onSessionRunning: input.onSessionRunning } : {}),
+          ...(handoff ? { handoff } : {}),
+        });
+        const outcome = await launch(driver);
+        return typeof outcome.status === "number" ? outcome.status : 1;
+      } catch (error) {
+        if (!(error instanceof StalePreparedRuntimeError)) throw error;
+        if (attempt !== 0 || !input.reprepare) {
+          throw new CliError(
+            "per-session launch could not converge because runtime lifecycle state changed repeatedly; retry the command",
+          );
+        }
+      } finally {
+        sessionLockManager.close();
+      }
+      preparedRuntime = await input.reprepare();
     }
-    preparedRuntime = await input.reprepare();
+    throw new Error("per-session launch preparation retry bound was exceeded");
+  } finally {
+    // A re-prepared runtime whose handoff this frame never took (its own
+    // attempt threw first) must not keep the lock past the launch.
+    if (preparedRuntime !== input.preparedRuntime) disposeLaunchHandoff(preparedRuntime);
   }
-  throw new Error("per-session launch preparation retry bound was exceeded");
 }

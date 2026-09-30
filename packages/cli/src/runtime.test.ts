@@ -105,9 +105,9 @@ import { repairWorktreeLinks } from "./runtime/git-layout.ts";
 import { subprocessCategory } from "./runtime/operation-histogram.ts";
 import { COMPOSE_UP_FAILURE_REMEDY, restoreSameProxySessionAdmission, startRuntime, up } from "./runtime/startup.ts";
 import { TOKEN_SYNC_DEFERRED_STATUS } from "./runtime/constants.ts";
-import { preparedRuntimeProxyId } from "./runtime/prepared-runtime.ts";
+import { disposeLaunchHandoff, preparedRuntimeProxyId, takeLaunchHandoff } from "./runtime/prepared-runtime.ts";
 import { flushWarnings, pendingWarningsForTest } from "./warnings.ts";
-import { projectLifecycleLockPath, tryAcquireProjectLifecycleLockWithRetry } from "./runtime/sessions.ts";
+import { projectLifecycleLockPath, tryAcquireProjectLifecycleLock, tryAcquireProjectLifecycleLockWithRetry } from "./runtime/sessions.ts";
 
 // Real `docker ps -q`/`-aq` prints 12-character short IDs unless `--no-trunc`
 // is passed, while `docker inspect` resolves a prefix but always reports the
@@ -3703,6 +3703,88 @@ describe("runtime command flow", () => {
         "docker ps": 7,
       }
     `);
+  });
+
+  describe("held-lock launch handoff minting (sub-second launch plan Task 3)", () => {
+    function launchContext(): RuntimeContext {
+      const projectRoot = path.join(tmp, "project");
+      const project = prepareProject(projectRoot);
+      return {
+        projectRoot,
+        project,
+        runtimeRoot: path.join(tmp, "runtime"),
+        env: { PATH: "/fake-bin" },
+        network: fixedNetwork,
+      };
+    }
+    const lockIsFree = (context: RuntimeContext): boolean => {
+      const lock = tryAcquireProjectLifecycleLock(context);
+      lock?.release();
+      return lock !== undefined;
+    };
+
+    test("a warm launch that asked for it keeps the lock and hands it off exactly once", async () => {
+      const context = launchContext();
+      const io = createRuntimeIO();
+      expect((await startRuntime(context, io, false, { launch: true })).status).toBe(0);
+      const warm = await startRuntime(context, io, false, { launch: true, launchHandoff: true });
+      if (warm.kind !== "ready") throw new Error("warm launch failed");
+      // Startup returned without releasing: the lock is the launch's now.
+      expect(lockIsFree(context)).toBe(false);
+      const handoff = takeLaunchHandoff(warm.preparedRuntime);
+      expect(handoff?.proxy.id).toBe(FAKE_PROXY_CONTAINER_ID);
+      expect(handoff?.inventoryClean).toBe(true);
+      expect(takeLaunchHandoff(warm.preparedRuntime)).toBeUndefined();
+      handoff?.lifecycleLock.release();
+      expect(lockIsFree(context)).toBe(true);
+    });
+
+    test("an untaken handoff is released by its caller's dispose", async () => {
+      const context = launchContext();
+      const io = createRuntimeIO();
+      expect((await startRuntime(context, io, false, { launch: true })).status).toBe(0);
+      const warm = await startRuntime(context, io, false, { launch: true, launchHandoff: true });
+      if (warm.kind !== "ready") throw new Error("warm launch failed");
+      expect(lockIsFree(context)).toBe(false);
+      disposeLaunchHandoff(warm.preparedRuntime);
+      expect(lockIsFree(context)).toBe(true);
+    });
+
+    test("runfree up, a cold launch, and a launch that did not ask never hand off", async () => {
+      const context = launchContext();
+      const io = createRuntimeIO();
+      const cold = await startRuntime(context, io, false, { launch: true, launchHandoff: true });
+      if (cold.kind !== "ready") throw new Error("cold launch failed");
+      expect(takeLaunchHandoff(cold.preparedRuntime)).toBeUndefined();
+      expect(lockIsFree(context)).toBe(true);
+      const upResult = await startRuntime(context, io, false, { launchHandoff: true });
+      if (upResult.kind !== "ready") throw new Error("up failed");
+      expect(takeLaunchHandoff(upResult.preparedRuntime)).toBeUndefined();
+      const unasked = await startRuntime(context, io, false, { launch: true });
+      if (unasked.kind !== "ready") throw new Error("launch failed");
+      expect(takeLaunchHandoff(unasked.preparedRuntime)).toBeUndefined();
+      expect(lockIsFree(context)).toBe(true);
+    });
+
+    test("a deferred token sync releases the lock before reading sources and hands nothing off", async () => {
+      const context = launchContext();
+      let lockHeldDuringFallback: boolean | undefined;
+      const io = createRuntimeIO({
+        admin: async (args) => (args.includes("--startup-convergence") ? TOKEN_SYNC_DEFERRED_STATUS : 0),
+      });
+      io.prepareTokenSources = async (_context, options) => {
+        if (options === undefined && lockHeldDuringFallback === undefined && _context.projectRoot === context.projectRoot) {
+          lockHeldDuringFallback = !lockIsFree(context);
+        }
+      };
+      expect((await startRuntime(context, io, false, { launch: true })).status).toBe(0);
+      lockHeldDuringFallback = undefined;
+      const warm = await startRuntime(context, io, false, { launch: true, launchHandoff: true });
+      if (warm.kind !== "ready") throw new Error("warm launch failed");
+      expect(lockHeldDuringFallback).toBe(false);
+      expect(takeLaunchHandoff(warm.preparedRuntime)).toBeUndefined();
+      expect(lockIsFree(context)).toBe(true);
+    });
   });
 
   describe("warm-proof fingerprint (sub-second launch plan Task 2)", () => {

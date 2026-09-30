@@ -145,6 +145,15 @@ export type SessionReconcileResult = Readonly<{
    * quarantined record. Reported, never acted on; `repair` only.
    */
   quarantinedFiles: readonly string[];
+  /**
+   * Whether this pass saw nothing but settled state: no file, record, or
+   * container to repair, and every container the inventory classified was a
+   * record's exact container (or a record had none yet). `repair` only; a
+   * report is never clean. A launch that holds the same lifecycle lock from
+   * this pass to its allocation may skip repeating it only when this is true
+   * (sub-second launch plan Task 3).
+   */
+  inventoryClean: boolean;
 }>;
 
 /**
@@ -485,6 +494,7 @@ function describeSessions(
     // states a quarantined record produces are already reported here as an
     // orphan file and an unreadable record.
     quarantinedFiles: Object.freeze([]),
+    inventoryClean: false,
   });
 }
 
@@ -615,6 +625,9 @@ export async function reconcileSessions(input: SessionReconcileInput): Promise<S
       input.dockerOptions ?? {},
     ),
   });
+  const inventorySettled = classifications.every((classification) => (
+    classification.kind === "matching" || classification.kind === "record-only"
+  ));
   // Only `container-only` is acted on. An uncertain classification is a live
   // container this pass cannot account for, and destroying it would be worse
   // than carrying it: the launch path's own orphan cleanup still refuses to
@@ -660,5 +673,11 @@ export async function reconcileSessions(input: SessionReconcileInput): Promise<S
       .filter((record) => !initialFileKeys.has(record.sessionPrincipal))
       .map((record) => record.sessionId)),
     quarantinedFiles: Object.freeze(quarantinedFiles),
+    inventoryClean: inventorySettled
+      && orphanFiles.length === 0
+      && deadOwnersRevoked.length === 0
+      && orphanContainersRemoved.length === 0
+      && quarantinedRecords.length === 0
+      && unknownOwners.length === 0,
   });
 }

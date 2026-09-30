@@ -13,7 +13,7 @@ import {
   type McpSourceScope,
 } from "./mcp.ts";
 import { startRuntime, type RuntimeStartResult } from "./startup.ts";
-import { preparedRuntimeContext } from "./prepared-runtime.ts";
+import { disposeLaunchHandoff, preparedRuntimeContext } from "./prepared-runtime.ts";
 import type { RuntimeContext, RuntimeIO } from "./types.ts";
 
 export type McpAuthInput = {
@@ -134,8 +134,26 @@ export async function mcpAuthRuntime(
 ): Promise<number> {
   const entry = resolveMcpAuthEntry(input, context);
   const start = deps.start ?? startRuntime;
-  const runtime: RuntimeStartResult = await start(context, io, false, { verbose: input.verbose, launch: true });
+  const runtime: RuntimeStartResult = await start(context, io, false, { verbose: input.verbose, launch: true, launchHandoff: true });
   if (runtime.kind === "failed") return runtime.status;
+  try {
+    return await launchMcpAuthSession(input, context, io, deps, entry, runtime);
+  } finally {
+    // The held-lock handoff belongs to the launch; released here if the launch
+    // never took it.
+    disposeLaunchHandoff(runtime.preparedRuntime);
+  }
+}
+
+async function launchMcpAuthSession(
+  input: McpAuthInput,
+  context: RuntimeContext,
+  io: RuntimeIO,
+  deps: McpAuthRuntimeDependencies,
+  entry: ReturnType<typeof resolveMcpAuthEntry>,
+  runtime: Extract<RuntimeStartResult, { kind: "ready" }>,
+): Promise<number> {
+  const start = deps.start ?? startRuntime;
   const activeContext = preparedRuntimeContext(runtime.preparedRuntime);
   flushWarnings();
   const watcher = io.startTokenAutoRefresh?.(activeContext, runtime.tokenResolutionReceipts, {
@@ -157,7 +175,7 @@ export async function mcpAuthRuntime(
         io,
         agentName: entry.agent,
         reprepare: async () => {
-          const refreshed = await start(context, io, false, { verbose: input.verbose, launch: true });
+          const refreshed = await start(context, io, false, { verbose: input.verbose, launch: true, launchHandoff: true });
           if (refreshed.kind === "failed") {
             throw new Error(`runtime re-preparation failed with status ${refreshed.status}`);
           }

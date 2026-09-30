@@ -476,6 +476,22 @@ The foreground admission driver requires a `SessionLockManager`; it has no
 raw-lock or optional lock-lease input that can retain the project lock across
 the attached wait ([driver](../packages/cli/src/runtime/session-admission-driver.ts)).
 
+A warm `claude`, `codex`, `pi`, `shell`, or `mcp auth` launch does not release
+the lock between startup and admission. When its credential sync needed no
+source read, startup hands the exact held lock to the launch, in process memory
+and at most once, with what it proved under it: the proxy id and `StartedAt`,
+the registry digest after its reconcile, whether that reconcile saw only
+settled state, and the addresses the proxy's session files reserved. Admission
+then skips repeating the reconcile and the orphan sweep only if that reconcile
+was settled, the registry on disk is unchanged, and one inspection shows the
+same proxy incarnation (a restarted proxy refuses as stale and the launch
+re-prepares once). It still checks quarantine and unreclaimed records, reads a
+fresh network baseline, fences the address, and holds the started container to
+the one post-start inspection. Every launch caller releases a handoff nobody
+took; a crashed process leaves an ordinary stale lock. `runfree up` and
+`runfree resume` never hand off (the recovery claim takes the lifecycle lock
+itself).
+
 Image builds, build approvals, and credential-source resolution finish before
 startup takes the lifecycle lock. Startup and explicit reload bound held
 subprocess work to 90 seconds and refuse acquisition after about 60 seconds.
@@ -533,7 +549,7 @@ Any other answer, and every reconcile, keeps the full sequence. The next contain
 fence verifies old kernel sockets and consumer authority are gone. Teardown
 latency is not a security guard.
 
-**Reconcile** runs at every launch preflight and at `runfree up`, under the
+**Reconcile** runs at every launch preflight (or, for a held-lock handoff, in the startup that handed the lock over) and at `runfree up`, under the
 same held lock as the allocation that follows
 ([reconcile](../packages/cli/src/runtime/session-reconcile.ts)): delete proxy
 files no lifecycle record claims, tear down records whose owner is provably

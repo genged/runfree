@@ -214,7 +214,10 @@ vi.mock("./session-named-volume-proof.ts", () => ({
   sessionNamedVolumeInspectRequest: mocks.namedVolumeRequest,
   validateSessionNamedVolumeInspect: mocks.validateNamedVolumes,
 }));
-vi.mock("./prepared-runtime.ts", () => ({ consumePreparedRuntime: mocks.consumePreparedRuntime }));
+vi.mock("./prepared-runtime.ts", async (importOriginal) => ({
+  ...await importOriginal<typeof import("./prepared-runtime.ts")>(),
+  consumePreparedRuntime: mocks.consumePreparedRuntime,
+}));
 vi.mock("./session-materialization-eligibility.ts", () => ({
   classifySessionAgentMaterializationEligibilityV2: mocks.compileMaterializationEligibility,
 }));
@@ -241,6 +244,8 @@ import { parseSessionFileV1, SESSION_ELIGIBILITY_PATH, SESSION_FILES_DIR } from 
 import { SESSION_ADMISSION_LEASE_MAX_DURATION_MS } from "@runfree/runtime-contracts/session-registry";
 
 import { SessionFileTeardownBlockedError } from "./session-file-teardown.ts";
+import { sessionRegistryDigest } from "./launch-handoff.ts";
+import { StalePreparedRuntimeError, type LaunchHandoff } from "./prepared-runtime.ts";
 import { createInternalSessionAdmissionDriver } from "./session-admission-driver.ts";
 import { flushWarnings, setOutputWriterForTest } from "../warnings.ts";
 import type { ActiveRuntimePlan } from "./plan.ts";
@@ -2613,6 +2618,96 @@ describe("session admission under the per-session file source", () => {
     } finally {
       output.restore();
     }
+  });
+
+  describe("held-lock launch handoff (sub-second launch plan Task 3)", () => {
+    const PROXY_STARTED_AT = "2026-08-09T00:00:00.000Z";
+    function handoffFor(input: ReturnType<typeof fixture>, overrides: Partial<LaunchHandoff> = {}): LaunchHandoff {
+      return {
+        lifecycleLock: input.sessionLockManager.lock,
+        lockOwnerToken: input.sessionLockManager.lock.ownerToken,
+        proxy: { id: PROXY_ID, startedAt: PROXY_STARTED_AT },
+        registryDigest: sessionRegistryDigest("/state", EXPECTED_PROJECT),
+        inventoryClean: true,
+        reservedSourceIps: ["172.31.90.33"],
+        ...overrides,
+      };
+    }
+    function proxyInspectAnswer(startedAt: string): void {
+      mocks.effectAnswers.set(`docker:container inspect ${PROXY_ID}`, [{
+        status: 0,
+        stdout: JSON.stringify([{ Id: PROXY_ID, State: { Running: true, StartedAt: startedAt } }]),
+        stderr: "",
+      }]);
+    }
+
+    test("admission with a valid handoff issues no reconcile and no orphan inventory", async () => {
+      const input = fixture();
+      mocks.containerInspect = { status: 0, stdout: runningInspect(), stderr: "" };
+      proxyInspectAnswer(PROXY_STARTED_AT);
+      const driver = createInternalSessionAdmissionDriver({
+        ...input,
+        handoff: handoffFor(input),
+        nowEpochMs: () => Date.parse("2026-08-09T00:10:00.000Z"),
+      });
+
+      await expect(driver.launchBuiltin("codex")).resolves.toEqual({ status: 0, signal: null });
+
+      expect(mocks.reconcileSessions).not.toHaveBeenCalled();
+      expect(mocks.inventory).not.toHaveBeenCalled();
+      // The fresh network baseline, the fence, and the post-start proof stay.
+      expect(mocks.events).toContain(`docker:network inspect ${NETWORK_ID}`);
+      expect(mocks.events).toContain("session-file:ip-reuse-fence");
+      expect(mocks.events).toContain("session-file:write");
+      // The addresses startup's reconcile reserved still reach the allocator.
+      expect(mocks.allocateIp).toHaveBeenCalledWith(expect.objectContaining({ reservedIps: ["172.31.90.33"] }));
+    });
+
+    test.each([
+      ["no handoff", undefined],
+      ["an unsettled startup reconcile", { inventoryClean: false }],
+      ["a registry changed since startup", { registryDigest: `sha256:${"1".repeat(64)}` }],
+      ["another proxy", { proxy: { id: "9".repeat(64), startedAt: PROXY_STARTED_AT } }],
+    ] as const)("admission with %s runs the current preflight", async (_label, overrides) => {
+      const input = fixture();
+      mocks.containerInspect = { status: 0, stdout: runningInspect(), stderr: "" };
+      proxyInspectAnswer(PROXY_STARTED_AT);
+      const driver = createInternalSessionAdmissionDriver({
+        ...input,
+        ...(overrides === undefined ? {} : { handoff: handoffFor(input, overrides) }),
+        nowEpochMs: () => Date.parse("2026-08-09T00:10:00.000Z"),
+      });
+
+      await expect(driver.launchBuiltin("codex")).resolves.toEqual({ status: 0, signal: null });
+
+      expect(mocks.reconcileSessions).toHaveBeenCalledTimes(1);
+      expect(mocks.inventory).toHaveBeenCalled();
+    });
+
+    test("a proxy restarted since startup refuses as stale before allocation", async () => {
+      const input = fixture();
+      proxyInspectAnswer("2026-08-09T00:05:00.000Z");
+      const driver = createInternalSessionAdmissionDriver({
+        ...input,
+        handoff: handoffFor(input),
+        nowEpochMs: () => Date.parse("2026-08-09T00:10:00.000Z"),
+      });
+
+      await expect(driver.launchBuiltin("codex")).rejects.toBeInstanceOf(StalePreparedRuntimeError);
+
+      expect(mocks.events).not.toContain("allocate");
+      expect(mocks.createContainer).not.toHaveBeenCalled();
+      expect(mocks.reconcileSessions).not.toHaveBeenCalled();
+    });
+
+    test("a handoff under another lock is refused before any effect", () => {
+      const input = fixture();
+      expect(() => createInternalSessionAdmissionDriver({
+        ...input,
+        handoff: { ...handoffFor(input), lockOwnerToken: "someone-else" },
+      })).toThrow("must be admitted under its own lifecycle lock");
+      expect(mocks.events).toEqual([]);
+    });
   });
 
   test("takes back a file it wrote but could not finish granting", async () => {

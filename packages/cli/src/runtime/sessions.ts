@@ -103,6 +103,13 @@ export type RebuildOptions = {
    * from scratch.
    */
   launch?: boolean;
+  /**
+   * The launch will take the lifecycle lock this start holds, together with
+   * what the start proved under it (sub-second launch plan Task 3). Requires
+   * `launch`; `resume` never asks, because its recovery claim takes the
+   * lifecycle lock itself. The caller must dispose an untaken handoff.
+   */
+  launchHandoff?: boolean;
 };
 
 export type CreateSessionMetadataOptions = {

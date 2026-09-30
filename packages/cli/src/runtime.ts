@@ -34,7 +34,7 @@ import {
   launchConfiguredAgentThroughAdmission,
   launchShellThroughAdmission,
 } from "./runtime/session-public-launch.ts";
-import { preparedRuntimeContext, preparedRuntimeProxyId, type PreparedRuntime } from "./runtime/prepared-runtime.ts";
+import { disposeLaunchHandoff, preparedRuntimeContext, preparedRuntimeProxyId, type PreparedRuntime } from "./runtime/prepared-runtime.ts";
 import { createRuntimeAdapters } from "./runtime/adapters.ts";
 import { grantCoverageLabel, grantRemainingSeconds, readWriteApprovalsStatus } from "./runtime/approvals.ts";
 import {
@@ -637,23 +637,36 @@ async function runConfiguredAgent(
     useApprovedPolicy: options.useApprovedPolicy,
     verbose: options.verbose,
     launch: true,
+    launchHandoff: true,
   });
   if (runtime.kind === "failed") return runtime.status;
-  const activeContext = preparedRuntimeContext(runtime.preparedRuntime);
-  const proxyId = preparedRuntimeProxyId(runtime.preparedRuntime);
-  flushWarnings();
-  const sessionStartedAt = new Date().toISOString();
-  const status = await withWriteApprovalSession(activeContext, () =>
-    withTokenAutoRefresh(activeContext, io, runtime, () => {
-      // Every foreground launch uses per-session admission. Custom-command
-      // refusal and legacy-default normalization live in the session path.
-      return launchConfiguredAgentThroughAdmission({
-        preparedRuntime: runtime.preparedRuntime,
-        io,
-        agentName,
-        reprepare: () => repreparePublicLaunchRuntime(context, io, options.verbose),
-      });
-    }));
+  let status: number;
+  let activeContext: RuntimeContext;
+  let proxyId: string;
+  let sessionStartedAt: string;
+  try {
+    activeContext = preparedRuntimeContext(runtime.preparedRuntime);
+    proxyId = preparedRuntimeProxyId(runtime.preparedRuntime);
+    flushWarnings();
+    sessionStartedAt = new Date().toISOString();
+    const launchContext = activeContext;
+    status = await withWriteApprovalSession(launchContext, () =>
+      withTokenAutoRefresh(launchContext, io, runtime, () => {
+        // Every foreground launch uses per-session admission. Custom-command
+        // refusal and legacy-default normalization live in the session path.
+        return launchConfiguredAgentThroughAdmission({
+          preparedRuntime: runtime.preparedRuntime,
+          io,
+          agentName,
+          reprepare: () => repreparePublicLaunchRuntime(context, io, options.verbose, true),
+        });
+      }));
+  } finally {
+    // The held-lock handoff belongs to the launch; if anything above ended
+    // before the launch took it, the lock is released here, not left to the
+    // process's exit.
+    disposeLaunchHandoff(runtime.preparedRuntime);
+  }
   // Agent sessions only (not `runfree shell`): summarize proxy denials seen
   // during this session. Best effort; never changes the exit status.
   printSessionDenialSummary(activeContext, io, {
@@ -1217,25 +1230,30 @@ export async function destroyRuntime(
 }
 
 export async function shellRuntime(context: RuntimeContext, io: RuntimeIO, options: { verbose: boolean }): Promise<number> {
-  const runtime = await startRuntime(context, io, false, { verbose: options.verbose, launch: true });
+  const runtime = await startRuntime(context, io, false, { verbose: options.verbose, launch: true, launchHandoff: true });
   if (runtime.kind === "failed") return runtime.status;
-  const activeContext = preparedRuntimeContext(runtime.preparedRuntime);
-  flushWarnings();
-  return await withWriteApprovalSession(activeContext, () =>
-    withTokenAutoRefresh(activeContext, io, runtime, () => {
-      return launchShellThroughAdmission({
-        preparedRuntime: runtime.preparedRuntime,
-        io,
-        reprepare: () => repreparePublicLaunchRuntime(context, io, options.verbose),
-      });
-    }));
+  try {
+    const activeContext = preparedRuntimeContext(runtime.preparedRuntime);
+    flushWarnings();
+    return await withWriteApprovalSession(activeContext, () =>
+      withTokenAutoRefresh(activeContext, io, runtime, () => {
+        return launchShellThroughAdmission({
+          preparedRuntime: runtime.preparedRuntime,
+          io,
+          reprepare: () => repreparePublicLaunchRuntime(context, io, options.verbose, true),
+        });
+      }));
+  } finally {
+    disposeLaunchHandoff(runtime.preparedRuntime);
+  }
 }
 async function repreparePublicLaunchRuntime(
   context: RuntimeContext,
   io: RuntimeIO,
   verbose: boolean | undefined,
+  launchHandoff = false,
 ): Promise<PreparedRuntime> {
-  const result = await startRuntime(context, io, false, { verbose, launch: true });
+  const result = await startRuntime(context, io, false, { verbose, launch: true, launchHandoff });
   if (result.kind === "failed") {
     throw new Error(`runtime re-preparation failed with status ${result.status}`);
   }

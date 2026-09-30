@@ -151,10 +151,12 @@ import {
   ensureSessionEligibilityPublished,
   observeProxyStartedAt,
 } from "./session-eligibility-publication.ts";
-import { reconcileSessions } from "./session-reconcile.ts";
+import { reconcileSessions, type SessionReconcileResult } from "./session-reconcile.ts";
 import { waitForSessionAdmissionFirewallSetEmpty } from "./session-file-publisher.ts";
 import {
+  attachLaunchHandoff,
   mintPreparedRuntime,
+  type LaunchHandoff,
   type PreparedRuntime,
 } from "./prepared-runtime.ts";
 import { createRuntimeTimings, type RuntimeTimings } from "./timings.ts";
@@ -170,6 +172,7 @@ import { TOKEN_SYNC_DEFERRED_STATUS } from "./constants.ts";
 import { imageCleanupStampMatches, writeImageCleanupStamp } from "./image-cleanup-stamp.ts";
 import { createOperationHistogram, withOperationHistogram } from "./operation-histogram.ts";
 import { remedy } from "../remedies.ts";
+import { sessionRegistryDigest } from "./launch-handoff.ts";
 import { setMcpLogContext } from "./mcp.ts";
 
 const RETAINED_AGENT_TEMPLATE_REMEDY =
@@ -202,6 +205,19 @@ export type RuntimeStartResult =
       status: number;
       fastPath: false;
     };
+
+/**
+ * What startup needs to hand its held lifecycle lock to the launch that asked
+ * for it (sub-second launch plan Task 3). `build` runs only after the last
+ * fallible startup step, with the lock still held.
+ */
+type LaunchHandoffRequest = Readonly<{
+  build: () => LaunchHandoff;
+  /** Releases the lock before a deferred sync reads a source. */
+  releaseLock: () => void;
+  /** Marks the lock as the launch's: startup's `finally` no longer releases it. */
+  onHandedOff: () => void;
+}>;
 
 type RuntimeStartupAdapters = {
   admin(intent: RuntimeAdminIntent): Promise<number>;
@@ -260,11 +276,14 @@ async function syncWarmLaunchTokens(input: Readonly<{
   io: RuntimeIO;
   verbose?: boolean;
   timings: RuntimeTimings;
+  /** Runs before any source is read (releases a held lifecycle lock). */
+  beforeSourceResolution?: () => void;
 }>): Promise<Readonly<{ status: number; freshness: "source-truth" | "receipt-gated" }>> {
   const admin = (intent: RuntimeAdminIntent) => input.io.admin(intent, input.context);
   const gated = await syncProxyManagedTokens(admin, input.verbose, "startup-convergence");
   if (gated !== TOKEN_SYNC_DEFERRED_STATUS) return { status: gated, freshness: "receipt-gated" };
   input.timings.report("token-sync", "deferred source-truth");
+  input.beforeSourceResolution?.();
   await input.io.prepareTokenSources?.(input.context);
   return { status: await syncProxyManagedTokens(admin, input.verbose), freshness: "source-truth" };
 }
@@ -278,6 +297,7 @@ async function finalizeValidatedRuntime(
   lifecycleLock?: ProjectLifecycleLock,
   withCredentialResolution: (work: () => Promise<number>) => Promise<number> = (work) => work(),
   credentialMode: "source-truth" | "receipt-gated" = "source-truth",
+  launchHandoff?: LaunchHandoffRequest,
 ): Promise<RuntimeStartResult> {
   const context = runtimeContextFromActivePlan(plan);
   const activeContext = { ...context, validatedRuntime: proof };
@@ -342,17 +362,47 @@ async function finalizeValidatedRuntime(
     return { kind: "failed", fastPath: false, status: 1 };
   }
   let credentialFreshness: "source-truth" | "receipt-gated" = "source-truth";
+  // A held-lock handoff (sub-second launch plan Task 3) keeps the lifecycle
+  // lock through the receipt-gated sync, which resolves no source; a deferral
+  // releases it before any source is read, and then there is no handoff.
+  const holdLockThroughSync = launchHandoff !== undefined && credentialMode === "receipt-gated";
+  let lockReleasedForSync = !holdLockThroughSync;
+  const runCredentialSync = holdLockThroughSync
+    ? (work: () => Promise<number>) => work()
+    : withCredentialResolution;
   const tokenSync = await timings.timeAsync(
     "token-sync",
-    () => withCredentialResolution(async () => {
+    () => runCredentialSync(async () => {
       if (credentialMode !== "receipt-gated") {
         return await syncProxyManagedTokens((intent) => io.admin(intent, activeContext), verbose);
       }
-      const warm = await syncWarmLaunchTokens({ context: activeContext, io, verbose, timings });
+      const warm = await syncWarmLaunchTokens({
+        context: activeContext,
+        io,
+        verbose,
+        timings,
+        ...(holdLockThroughSync
+          ? { beforeSourceResolution: () => { lockReleasedForSync = true; launchHandoff.releaseLock(); } }
+          : {}),
+      });
       credentialFreshness = warm.freshness;
       return warm.status;
     }),
   );
+  if (tokenSync === 0 && launchHandoff && !lockReleasedForSync) {
+    try {
+      lifecycleLock?.assertHeld();
+      attachLaunchHandoff(preparedRuntime, launchHandoff.build());
+      launchHandoff.onHandedOff();
+      timings.report("launch-handoff", "minted");
+    } catch (error) {
+      // No handoff is not a failure: the launch takes its own lock and runs
+      // the full preflight. The lock is still startup's to release.
+      reportRuntimeVerbose(verbose, `launch handoff not minted: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  } else if (launchHandoff) {
+    timings.report("launch-handoff", lockReleasedForSync ? "skipped token-resolution" : "skipped");
+  }
   const tokenResolutionReceipts = tokenSync === 0 ? io.takeTokenResolutionReceipts?.() ?? [] : [];
   if (tokenSync === 0) reportRuntimeProgress("runtime startup complete", verbose);
   return tokenSync === 0 ? {
@@ -1137,6 +1187,10 @@ export async function startRuntime(
   };
 
   let lifecycleLock: ProjectLifecycleLock | undefined;
+  // The exact lock object this start acquired, for a held-lock launch handoff,
+  // and whether that handoff now owns it.
+  let acquiredLifecycleLock: ProjectLifecycleLock | undefined;
+  let lockHandedOff = false;
   let confirmedRebuildSessions: readonly ActiveAgentSession[] = [];
   try {
     const capturedConfig = readConfig(context.projectRoot);
@@ -1322,6 +1376,7 @@ export async function startRuntime(
     // and passes the comparison below — the recovery gate ran long before here.
     const preparedApproval = readControlApprovalSelection(context.projectRoot, context.project);
     lifecycleLock ??= await tryAcquireProjectLifecycleLockWithRetry(preparedContext);
+    acquiredLifecycleLock = lifecycleLock;
     if (!lifecycleLock) {
       warn(`the runtime did not start: another Runfree runtime lifecycle change is in progress (lock: ${projectLifecycleLockPath(preparedContext)}); retry when it finishes`);
       return result(1, false, preparedContext);
@@ -1528,6 +1583,8 @@ export async function startRuntime(
         timings.report("validation:warm-proof", recorded === "written" ? "recorded" : "not-recorded");
         if (recorded !== "written") reportRuntimeVerbose(verbose, `warm-proof record not written: ${recorded}`);
       }
+      let proxyStartedAt: string | undefined;
+      let reconciled: SessionReconcileResult | undefined;
       // Invariant 9, widen-before-new-files: the proxy is proven ready and the
       // control plane is selected, so publish the project's session eligibility
       // before anything waits on session admission. A proxy holding no
@@ -1540,10 +1597,11 @@ export async function startRuntime(
         if (!effective || !desired) {
           throw new Error("session eligibility requires the selected control plane and the retained current agent template");
         }
+        proxyStartedAt = warm?.proxyStartedAt ?? observeProxyStartedAt(io, runtimeProof.proxyId, dockerClientEnvOptions(activeContext));
         ensureSessionEligibilityPublished({
           io,
           proxyId: runtimeProof.proxyId,
-          proxyStartedAt: warm?.proxyStartedAt ?? observeProxyStartedAt(io, runtimeProof.proxyId, dockerClientEnvOptions(activeContext)),
+          proxyStartedAt,
           stateDir: activePlan.paths.stateDir,
           effective,
           desired,
@@ -1558,7 +1616,7 @@ export async function startRuntime(
         // held and before any session can be admitted. It follows the
         // publication above, which widened the admitted set; step 5 of the
         // reconcile narrows it again once the residue is gone.
-        await reconcileSessions({
+        reconciled = await reconcileSessions({
           stateDir: activePlan.paths.stateDir,
           expectedProject: { projectId: activePlan.projectId, composeProject: project },
           io,
@@ -1594,6 +1652,32 @@ export async function startRuntime(
         await restoreSameProxySessionAdmission({ plan: activePlan, io, lifecycleLock: heldLifecycleLock, proxyId: runtimeProof.proxyId, validation });
       }
       const proxyRecreated = proxyRecreatedSinceStart(adapters.docker);
+      const credentialMode = receiptGatedCredentials && !proxyRecreated ? "receipt-gated" : "source-truth";
+      // Sub-second launch plan Task 3: a launch that asked for it gets this
+      // lock, still held, with what this startup proved under it. Not for
+      // `up`, a rebuild, or `resume` (whose recovery claim takes the lifecycle
+      // lock itself).
+      const handoffLock = acquiredLifecycleLock;
+      const launchHandoff: LaunchHandoffRequest | undefined = rebuildOptions.launchHandoff === true
+        && rebuildOptions.launch === true && !removeExisting && handoffLock !== undefined
+        && proxyStartedAt !== undefined && reconciled !== undefined
+        ? {
+            build: () => {
+              heldLifecycleLock.assertHeld();
+              if (lifecycleLock !== handoffLock) throw new Error("the startup lock was replaced before the handoff");
+              return {
+                lifecycleLock: handoffLock,
+                lockOwnerToken: handoffLock.ownerToken,
+                proxy: { id: runtimeProof.proxyId, startedAt: proxyStartedAt as string },
+                registryDigest: sessionRegistryDigest(activePlan.paths.stateDir, { projectId: activePlan.projectId, composeProject: project }),
+                inventoryClean: (reconciled as SessionReconcileResult).inventoryClean,
+                reservedSourceIps: [...(reconciled as SessionReconcileResult).reservedSourceIps],
+              };
+            },
+            releaseLock: () => heldLifecycleLock.release(),
+            onHandedOff: () => { lockHandedOff = true; },
+          }
+        : undefined;
       return finalizeValidatedRuntime(
         selectedPlan,
         io,
@@ -1602,7 +1686,8 @@ export async function startRuntime(
         proxyRecreated,
         heldLifecycleLock,
         async (work) => { heldLifecycleLock.release(); return await work(); },
-        receiptGatedCredentials && !proxyRecreated ? "receipt-gated" : "source-truth",
+        credentialMode,
+        launchHandoff,
       );
     };
     if (upgradePlan.action === "component-select" && runningWarmRuntime(activeContext, adapters.docker)) {
@@ -1885,7 +1970,7 @@ export async function startRuntime(
       for (const line of operations?.lines() ?? []) timings.report("startup-ops", line);
     }
     try {
-      lifecycleLock?.release();
+      if (!lockHandedOff) lifecycleLock?.release();
     } catch (error) {
       warn(error instanceof Error ? error.message : String(error));
     }

@@ -161,8 +161,11 @@ import {
 import type { ActiveRuntimePlan } from "./plan.ts";
 import {
   consumePreparedRuntime,
+  StalePreparedRuntimeError,
+  type LaunchHandoff,
   type PreparedRuntime,
 } from "./prepared-runtime.ts";
+import { sessionRegistryDigest } from "./launch-handoff.ts";
 import { createRuntimeDocker } from "./docker.ts";
 import {
   createSessionId,
@@ -348,6 +351,14 @@ export type InternalSessionAdmissionDriverInput = Readonly<{
   onSessionRunning?: SessionRunningHook;
   nowEpochMs?: () => number;
   nowMonotonicMs?: () => number;
+  /**
+   * The held-lock handoff this launch took (sub-second launch plan Task 3). Its
+   * lock must be the manager's lock. With it, preflight may skip repeating
+   * startup's reconcile and orphan cleanup when both still describe the
+   * registry and the proxy incarnation; it never skips the network baseline,
+   * the fence, or the post-start proof.
+   */
+  handoff?: LaunchHandoff;
 }>;
 
 type ResolvedInternalSessionAdmissionDriverInput = InternalSessionAdmissionDriverInput & Readonly<{
@@ -1172,6 +1183,46 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
     }
   }
 
+  /**
+   * The handoff's reconcile snapshot, when admission may rely on it instead of
+   * reconciling again; undefined runs today's full preflight.
+   *
+   * Requires the startup reconcile to have been clean, the registry on disk to
+   * be byte-for-byte what startup left, the handoff to name the selected proxy,
+   * and one exact inspection to show that proxy is still the incarnation
+   * startup proved (the validation marker survives `docker restart`, so
+   * nothing else would notice an in-place restart). A different incarnation
+   * refuses as stale, which the launch frame answers with one bounded
+   * re-preparation.
+   */
+  #settledByHandoff(): LaunchHandoff | undefined {
+    const handoff = this.#input.handoff;
+    if (!handoff || !handoff.inventoryClean) return undefined;
+    this.#lock();
+    const proxyId = this.#controlPlane().proxyContainerId;
+    if (handoff.proxy.id !== proxyId) return undefined;
+    if (sessionRegistryDigest(this.#input.plan.paths.stateDir, this.#projectIdentity()) !== handoff.registryDigest) {
+      return undefined;
+    }
+    const inspected = this.#gateway.io.capture("docker", ["container", "inspect", proxyId], this.#dockerOptions());
+    let startedAt: unknown;
+    let running: unknown;
+    try {
+      const parsed = JSON.parse(inspected.stdout) as unknown;
+      const proxy = Array.isArray(parsed) && parsed.length === 1 ? parsed[0] as Record<string, unknown> : undefined;
+      const state = proxy?.Id === proxyId ? proxy.State as Record<string, unknown> | undefined : undefined;
+      startedAt = state?.StartedAt;
+      running = state?.Running;
+    } catch {
+      // An unreadable inspection proves nothing: the full preflight decides.
+    }
+    if (inspected.status !== 0 || typeof startedAt !== "string") return undefined;
+    if (running !== true || startedAt !== handoff.proxy.startedAt) {
+      throw new StalePreparedRuntimeError("the proxy restarted after startup prepared this launch");
+    }
+    return handoff;
+  }
+
   preflight = async (): Promise<void> => {
     this.#lock();
     const docker = createRuntimeDocker(this.#input.context, this.#gateway.io);
@@ -1242,25 +1293,37 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
       networkName: authority.networkName,
       subnet: authority.subnet,
     });
-    // The whole recovery region, in one pass: reconcile ends the records whose
-    // owners are gone through the shared ordered teardown, sweeps the files and
-    // containers that answer to nobody, and republishes eligibility from what
-    // survived — all before the allocation below, inside this same held lock.
-    const reconciled = await reconcileSessions({
-      stateDir: this.#input.plan.paths.stateDir,
-      expectedProject: this.#projectIdentity(),
-      io: this.#gateway.io,
-      proxyId: this.#controlPlane().proxyContainerId,
-      network: this.#network(),
-      env: this.#input.context.env,
-      lifecycleLock: this.#input.lifecycleLock,
-      mode: "repair",
-      dockerOptions: this.#dockerOptions(),
-    });
-    this.#reservedSessionFileIps = reconciled.reservedSourceIps;
-    this.#lock();
-    this.#assertNoQuarantinedSessionRecords();
-    this.#cleanPreexistingOrphans();
+    // Sub-second launch plan Task 3: startup ran this same reconcile under the
+    // lock this launch still holds. When nothing it saw needed repair and the
+    // registry and proxy incarnation are still exactly what it left, repeating
+    // it (and the orphan sweep) would observe the same state again.
+    const settledByHandoff = this.#settledByHandoff();
+    if (settledByHandoff) {
+      this.#reservedSessionFileIps = settledByHandoff.reservedSourceIps;
+      this.#lock();
+      this.#assertNoQuarantinedSessionRecords();
+    } else {
+      // The whole recovery region, in one pass: reconcile ends the records
+      // whose owners are gone through the shared ordered teardown, sweeps the
+      // files and containers that answer to nobody, and republishes
+      // eligibility from what survived — all before the allocation below,
+      // inside this same held lock.
+      const reconciled = await reconcileSessions({
+        stateDir: this.#input.plan.paths.stateDir,
+        expectedProject: this.#projectIdentity(),
+        io: this.#gateway.io,
+        proxyId: this.#controlPlane().proxyContainerId,
+        network: this.#network(),
+        env: this.#input.context.env,
+        lifecycleLock: this.#input.lifecycleLock,
+        mode: "repair",
+        dockerOptions: this.#dockerOptions(),
+      });
+      this.#reservedSessionFileIps = reconciled.reservedSourceIps;
+      this.#lock();
+      this.#assertNoQuarantinedSessionRecords();
+      this.#cleanPreexistingOrphans();
+    }
     const records = listSessionContainerRecordsV2(
       this.#input.plan.paths.stateDir,
       this.#require(this.#preflight, "canonical preflight").expectedProject,
@@ -2011,10 +2074,16 @@ export function createInternalSessionAdmissionDriver(
   if (!sessionLockManager) throw new Error("session admission requires a SessionLockManager");
   const lifecycleLock = sessionLockManager.lock;
   lifecycleLock.assertHeld();
+  // The manager wraps the lock it was built from; the owner token is what
+  // proves it is the handed-off lock rather than a lock taken since.
+  if (input.handoff && input.handoff.lockOwnerToken !== lifecycleLock.ownerToken) {
+    throw new Error("a launch handoff must be admitted under its own lifecycle lock");
+  }
   const prepared = consumePreparedRuntime({
     preparedRuntime: input.preparedRuntime,
     lifecycleLock,
     io: input.io,
+    ...(input.handoff ? { handoff: input.handoff } : {}),
   });
   const resolvedInput = Object.freeze({
     ...input,

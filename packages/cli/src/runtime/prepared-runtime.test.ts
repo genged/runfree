@@ -26,10 +26,14 @@ import { withActiveRuntime } from "./images.ts";
 import { mcpOAuthCallbackPort } from "./mcp.ts";
 import { createRuntimePlan } from "./plan.ts";
 import {
+  attachLaunchHandoff,
   consumePreparedRuntime,
+  disposeLaunchHandoff,
   mintPreparedRuntime,
   preparedRuntimeProxyId,
   StalePreparedRuntimeError,
+  takeLaunchHandoff,
+  type LaunchHandoff,
   type PreparedRuntime,
 } from "./prepared-runtime.ts";
 import { createRuntimeSecurityContract } from "./security-contract.ts";
@@ -331,4 +335,94 @@ test("rejects post-mint durable template corruption without consuming authority"
     lifecycleLock: prepared.lifecycleLock,
     io: prepared.io,
   })).toThrow("artifact hash does not match");
+});
+
+function handoffFor(prepared: ReturnType<typeof fixture>, lock: ProjectLifecycleLock): LaunchHandoff {
+  return {
+    lifecycleLock: lock,
+    lockOwnerToken: lock.ownerToken,
+    proxy: { id: prepared.proof.proxyId, startedAt: "2026-06-13T00:00:00.000Z" },
+    registryDigest: `sha256:${"0".repeat(64)}`,
+    inventoryClean: true,
+    reservedSourceIps: [],
+  };
+}
+
+function countingLock(): ProjectLifecycleLock & { releases: number } {
+  const lock = {
+    ownerToken: "e".repeat(64),
+    releases: 0,
+    assertHeld: () => undefined,
+    release: () => { lock.releases += 1; },
+  };
+  return lock;
+}
+
+test("a launch handoff is taken exactly once and a disposed untaken handoff releases its lock", () => {
+  const prepared = fixture();
+  const taken = mintPreparedRuntime({ plan: prepared.activePlan, validationProof: prepared.proof });
+  const lock = countingLock();
+  const handoff = handoffFor(prepared, lock);
+  attachLaunchHandoff(taken, handoff);
+  expect(() => attachLaunchHandoff(taken, handoff)).toThrow("already carries a launch handoff");
+  expect(takeLaunchHandoff(taken)?.lockOwnerToken).toBe(lock.ownerToken);
+  expect(takeLaunchHandoff(taken)).toBeUndefined();
+  // Disposal after a take is a no-op: the taker owns the lock.
+  disposeLaunchHandoff(taken);
+  expect(lock.releases).toBe(0);
+
+  const untaken = mintPreparedRuntime({ plan: prepared.activePlan, validationProof: prepared.proof });
+  const other = countingLock();
+  attachLaunchHandoff(untaken, handoffFor(prepared, other));
+  disposeLaunchHandoff(untaken);
+  disposeLaunchHandoff(untaken);
+  expect(other.releases).toBe(1);
+  expect(takeLaunchHandoff(untaken)).toBeUndefined();
+});
+
+test("a handoff whose lock owner changed is refused at attach", () => {
+  const prepared = fixture();
+  const authority = mintPreparedRuntime({ plan: prepared.activePlan, validationProof: prepared.proof });
+  const lock = countingLock();
+  expect(() => attachLaunchHandoff(authority, { ...handoffFor(prepared, lock), lockOwnerToken: "d".repeat(64) }))
+    .toThrow("lock owner changed");
+});
+
+test("consumption under the handed-off lock skips the in-proxy marker re-read but still checks the durable snapshot", () => {
+  const prepared = fixture();
+  const authority = mintPreparedRuntime({ plan: prepared.activePlan, validationProof: prepared.proof });
+  const lock = countingLock();
+  const handoff = handoffFor(prepared, lock);
+  let dockerCalls = 0;
+  const countingIo = { capture: (...args: Parameters<RuntimeIO["capture"]>) => { dockerCalls += 1; return prepared.io.capture(...args); } } as RuntimeIO;
+  // A marker the proxy could no longer serve would refuse today's consume;
+  // under the continuously held lock it is not re-read at all.
+  prepared.corruptMarker();
+
+  const consumed = consumePreparedRuntime({ preparedRuntime: authority, lifecycleLock: lock, io: countingIo, handoff });
+
+  expect(consumed.plan).toBe(prepared.activePlan);
+  expect(dockerCalls).toBe(0);
+});
+
+test("consumption refuses a handoff under a different lock, and a durable selection change stays stale", () => {
+  const prepared = fixture();
+  const authority = mintPreparedRuntime({ plan: prepared.activePlan, validationProof: prepared.proof });
+  const handoff = handoffFor(prepared, countingLock());
+  expect(() => consumePreparedRuntime({
+    preparedRuntime: authority,
+    lifecycleLock: prepared.lifecycleLock,
+    io: prepared.io,
+    handoff,
+  })).toThrow("does not hold the lock");
+
+  const drifted = mintPreparedRuntime({ plan: prepared.activePlan, validationProof: prepared.proof });
+  const lock = countingLock();
+  prepared.selectReplacementSession();
+  expect(() => consumePreparedRuntime({
+    preparedRuntime: drifted,
+    lifecycleLock: lock,
+    io: prepared.io,
+    handoff: handoffFor(prepared, lock),
+  })).toThrow(StalePreparedRuntimeError);
 });

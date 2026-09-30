@@ -6,6 +6,7 @@ import { afterEach, describe, expect, test, vi } from "vitest";
 
 vi.mock("./prepared-runtime.ts", () => ({
   preparedRuntimeContext: (prepared: { context: unknown }) => prepared.context,
+  disposeLaunchHandoff: () => {},
 }));
 
 import { projectInfo } from "../config.ts";

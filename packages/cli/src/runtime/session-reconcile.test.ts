@@ -373,6 +373,9 @@ describe("reconcile before allocation", () => {
     const result = await repair(fake);
 
     expect(result.orphanFilesDeleted).toEqual(["c".repeat(64)]);
+    // A pass that had to repair something is not settled state a held-lock
+    // launch may skip repeating.
+    expect(result.inventoryClean).toBe(false);
     // The delete is the first effect of the sweep, and it happens after the
     // one read that is reconcile's only view of the files.
     expect(fake.events[0]).toBe("read-served-set");
@@ -619,6 +622,8 @@ describe("reconcile before allocation", () => {
       deadOwnersRevoked: [],
       orphanContainersRemoved: [],
       unknownOwners: [],
+      // Every container is its record's exact container: settled.
+      inventoryClean: true,
     });
     // Nothing but the eligibility publication, which names the live session's
     // own materialization and takes nothing away.
@@ -633,6 +638,7 @@ describe("reconcile before allocation", () => {
     const result = await repair(fake);
 
     expect(result.unknownOwners).toEqual([unknown.sessionId]);
+    expect(result.inventoryClean).toBe(false);
     expect(result.deadOwnersRevoked).toEqual([]);
     expect(fake.effects()).toEqual(["publish-eligibility"]);
     expect(listSessionContainerRecordsV2(stateDir, SESSION_TEST_PROJECT)).toHaveLength(1);
@@ -654,6 +660,7 @@ describe("reconcile before allocation", () => {
     const result = await repair(fake);
 
     expect(result.orphanContainersRemoved).toEqual(["b".repeat(64)]);
+    expect(result.inventoryClean).toBe(false);
     expect(fake.effects()).toEqual([
       `docker:container stop --time 10 ${"b".repeat(64)}`,
       `docker:container rm ${"b".repeat(64)}`,

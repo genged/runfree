@@ -8,6 +8,8 @@ const mocks = vi.hoisted(() => ({
   createDriver: vi.fn(),
   launchBuiltin: vi.fn(),
   launchShell: vi.fn(),
+  // The held-lock handoffs startup attached, keyed by prepared runtime.
+  handoffs: new Map<object, { lifecycleLock: { release(): void }; lockOwnerToken: string }>(),
 }));
 
 vi.mock("./session-admission-driver.ts", () => ({
@@ -16,6 +18,16 @@ vi.mock("./session-admission-driver.ts", () => ({
 vi.mock("./prepared-runtime.ts", () => ({
   preparedRuntimeContext: (prepared: { context: unknown }) => prepared.context,
   StalePreparedRuntimeError: class StalePreparedRuntimeError extends Error {},
+  takeLaunchHandoff: (prepared: object) => {
+    const handoff = mocks.handoffs.get(prepared);
+    mocks.handoffs.delete(prepared);
+    return handoff;
+  },
+  disposeLaunchHandoff: (prepared: object) => {
+    const handoff = mocks.handoffs.get(prepared);
+    mocks.handoffs.delete(prepared);
+    handoff?.lifecycleLock.release();
+  },
 }));
 
 import { defaultConfig } from "../config.ts";
@@ -35,6 +47,7 @@ let env: NodeJS.ProcessEnv;
 
 beforeEach(() => {
   vi.clearAllMocks();
+  mocks.handoffs.clear();
   tmp = fs.mkdtempSync(path.join(os.tmpdir(), "runfree-public-launch-"));
   projectRoot = path.join(tmp, "project");
   fs.mkdirSync(projectRoot, { recursive: true });
@@ -183,6 +196,67 @@ describe("public launch through session admission", () => {
     });
 
     expect(mocks.createDriver).toHaveBeenCalledWith(expect.objectContaining({ foregroundSpawner }));
+  });
+
+  test("admits under the lock startup handed off: no second acquisition, and the lock is free afterwards", async () => {
+    const prepared = preparedRuntime();
+    const held = tryAcquireProjectLifecycleLock(runtimeContext());
+    if (!held) throw new Error("fixture lock");
+    const handoff = { lifecycleLock: held, lockOwnerToken: held.ownerToken };
+    mocks.handoffs.set(prepared, handoff);
+
+    const status = await launchConfiguredAgentThroughAdmission({ preparedRuntime: prepared, io, agentName: "claude" });
+
+    expect(status).toBe(0);
+    const driverInput = mocks.createDriver.mock.calls[0]?.[0] as { handoff?: unknown; sessionLockManager: { lock: { ownerToken: string } } };
+    // The driver runs under the exact handed-off lock and receives the handoff.
+    expect(driverInput.handoff).toBe(handoff);
+    expect(driverInput.sessionLockManager.lock.ownerToken).toBe(held.ownerToken);
+    // Taken once: nothing is left for a second consumer.
+    expect(mocks.handoffs.has(prepared)).toBe(false);
+    const reacquired = tryAcquireProjectLifecycleLock(runtimeContext());
+    expect(reacquired).toBeDefined();
+    reacquired?.release();
+  });
+
+  test("releases a handed-off lock when the launch fails", async () => {
+    const prepared = preparedRuntime();
+    const held = tryAcquireProjectLifecycleLock(runtimeContext());
+    if (!held) throw new Error("fixture lock");
+    mocks.handoffs.set(prepared, { lifecycleLock: held, lockOwnerToken: held.ownerToken });
+    mocks.launchBuiltin.mockRejectedValueOnce(new Error("admission failed closed"));
+
+    await expect(launchConfiguredAgentThroughAdmission({ preparedRuntime: prepared, io, agentName: "codex" }))
+      .rejects.toThrow("admission failed closed");
+
+    const reacquired = tryAcquireProjectLifecycleLock(runtimeContext());
+    expect(reacquired).toBeDefined();
+    reacquired?.release();
+  });
+
+  test("a stale handed-off launch re-prepares once under a fresh lock and leaves no lock behind", async () => {
+    const first = preparedRuntime();
+    const second = preparedRuntime();
+    const held = tryAcquireProjectLifecycleLock(runtimeContext());
+    if (!held) throw new Error("fixture lock");
+    mocks.handoffs.set(first, { lifecycleLock: held, lockOwnerToken: held.ownerToken });
+    mocks.createDriver.mockImplementationOnce(() => {
+      throw new StalePreparedRuntimeError("the proxy restarted after startup prepared this launch");
+    });
+
+    const status = await launchConfiguredAgentThroughAdmission({
+      preparedRuntime: first,
+      io,
+      agentName: "pi",
+      reprepare: async () => second,
+    });
+
+    expect(status).toBe(0);
+    expect(mocks.createDriver).toHaveBeenCalledTimes(2);
+    expect((mocks.createDriver.mock.calls[1]?.[0] as { handoff?: unknown }).handoff).toBeUndefined();
+    const reacquired = tryAcquireProjectLifecycleLock(runtimeContext());
+    expect(reacquired).toBeDefined();
+    reacquired?.release();
   });
 
   test("re-prepares once when durable lifecycle state changes before container creation", async () => {
