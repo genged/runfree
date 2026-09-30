@@ -25,6 +25,7 @@ import {
   normalizeSessionName,
   parseActiveAgentSessionsForTest,
   printSessions,
+  PROJECT_LIFECYCLE_LOCK_RETRY_DELAY_MS,
   PROJECT_LIFECYCLE_LOCK_RETRY_WINDOW_MS,
   projectLifecycleLockPath,
   warnDeferredRuntimeUpgrade,
@@ -42,6 +43,14 @@ import {
 } from "./sessions.ts";
 import { flushWarnings } from "../warnings.ts";
 import { RUNNING_PROOF_TIMEOUT_MS, SESSION_HANDOFF_WAIT_CEILING_MS } from "./session-admission-driver.ts";
+import {
+  LAUNCH_HANDOFF_STARTUP_SPAN_MAX_MS,
+  LAUNCH_LOCK_HOLD_BUDGET_MS,
+  launchHandoffSpanFits,
+  LIFECYCLE_LOCK_WAITER_YIELD_MS,
+  launchLockHoldDeadline,
+  SESSION_CALLBACK_SETUP_BUDGET_MS,
+} from "./launch-lock-hold.ts";
 import { WARM_TOKEN_SYNC_CALL_TIMEOUT_MS, WARM_TOKEN_SYNC_TOTAL_TIMEOUT_MS } from "./constants.ts";
 import type { RuntimeContext, RuntimeIO } from "./types.ts";
 
@@ -1357,13 +1366,30 @@ test("a launch's entry-handoff wait holds the lifecycle lock for at most a third
   // gives up waiting for it.
   expect(PROJECT_LIFECYCLE_LOCK_RETRY_WINDOW_MS).toBe(60_000);
   expect(SESSION_HANDOFF_WAIT_CEILING_MS * 3).toBeLessThanOrEqual(PROJECT_LIFECYCLE_LOCK_RETRY_WINDOW_MS);
-  // The launch's longest deliberate waits under that lock, together: the
-  // running proof, then the handoff.
-  expect(RUNNING_PROOF_TIMEOUT_MS + SESSION_HANDOFF_WAIT_CEILING_MS).toBeLessThan(PROJECT_LIFECYCLE_LOCK_RETRY_WINDOW_MS);
-  // A launch handoff (sub-second launch plan Task 3) keeps startup's lock
-  // through its receipt-gated token sync into admission, so that sync's own
-  // bound joins the same continuous hold.
+});
+
+test("one launch's whole continuous lifecycle-lock hold fits inside another command's lock wait", () => {
+  // The chain a handed-off lock is held through (sub-second launch plan Task
+  // 3), from startup's acquisition to the entry handoff: the startup span
+  // (warm token sync included) is at most what the handoff may carry, then
+  // admission's running proof and callback setup, each cut off at its bound.
+  // The entry-handoff wait needs no term: it ends at the hold deadline.
+  expect(RUNNING_PROOF_TIMEOUT_MS).toBe(30_000);
+  expect(LAUNCH_HANDOFF_STARTUP_SPAN_MAX_MS).toBeGreaterThan(0);
+  expect(LAUNCH_HANDOFF_STARTUP_SPAN_MAX_MS + RUNNING_PROOF_TIMEOUT_MS + SESSION_CALLBACK_SETUP_BUDGET_MS)
+    .toBeLessThanOrEqual(LAUNCH_LOCK_HOLD_BUDGET_MS);
+  // What is left of the 60 s window is the allowance for the short daemon
+  // round-trips between those steps, which carry no timeout of their own.
+  expect(PROJECT_LIFECYCLE_LOCK_RETRY_WINDOW_MS - LAUNCH_LOCK_HOLD_BUDGET_MS).toBeGreaterThanOrEqual(10_000);
+  // A warm token sync is part of the startup span; one that runs to its own
+  // bound makes the launch take its own lock rather than stretch the hold.
   expect(WARM_TOKEN_SYNC_CALL_TIMEOUT_MS).toBeLessThanOrEqual(WARM_TOKEN_SYNC_TOTAL_TIMEOUT_MS);
-  expect(WARM_TOKEN_SYNC_TOTAL_TIMEOUT_MS + RUNNING_PROOF_TIMEOUT_MS + SESSION_HANDOFF_WAIT_CEILING_MS)
-    .toBeLessThan(PROJECT_LIFECYCLE_LOCK_RETRY_WINDOW_MS);
+  expect(launchHandoffSpanFits(0, WARM_TOKEN_SYNC_TOTAL_TIMEOUT_MS)).toBe(false);
+  expect(launchHandoffSpanFits(0, LAUNCH_HANDOFF_STARTUP_SPAN_MAX_MS)).toBe(true);
+  expect(launchHandoffSpanFits(0, LAUNCH_HANDOFF_STARTUP_SPAN_MAX_MS + 1)).toBe(false);
+  expect(launchHandoffSpanFits(10, 5)).toBe(false);
+  expect(launchLockHoldDeadline(1_000)).toBe(1_000 + LAUNCH_LOCK_HOLD_BUDGET_MS);
+  // A launch that releases a long-held lock yields long enough for every
+  // waiter's next try before it takes the lock again.
+  expect(LIFECYCLE_LOCK_WAITER_YIELD_MS).toBeGreaterThan(2 * PROJECT_LIFECYCLE_LOCK_RETRY_DELAY_MS);
 });

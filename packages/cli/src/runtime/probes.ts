@@ -99,18 +99,26 @@ function sleepForMcpCallbackBridgeRetry(): void {
   Atomics.wait(MCP_CALLBACK_BRIDGE_PROBE_SLEEP_BUFFER, 0, 0, MCP_CALLBACK_BRIDGE_PROBE_DELAY_MS);
 }
 
-function probeMcpCallbackHostPath(port: number, challenge: string): Promise<CaptureResult> {
+function probeMcpCallbackHostPath(
+  port: number,
+  challenge: string,
+  timeoutMs = MCP_CALLBACK_BRIDGE_PROBE_TIMEOUT_MS,
+): Promise<CaptureResult> {
   return new Promise((resolve) => {
     const socket = net.connect({ host: "127.0.0.1", port });
     let data = "";
     let done = false;
+    // A whole-try bound, not only an idle one: the far end is in the session
+    // container, and a peer that trickles bytes must not keep a try open.
+    const deadline = setTimeout(() => finish(captureResult(1, data, "callback host probe timed out")), timeoutMs);
     const finish = (result: CaptureResult) => {
       if (done) return;
       done = true;
+      clearTimeout(deadline);
       socket.destroy();
       resolve(result);
     };
-    socket.setTimeout(MCP_CALLBACK_BRIDGE_PROBE_TIMEOUT_MS, () => finish(captureResult(1, data, "callback host probe timed out")));
+    socket.setTimeout(timeoutMs, () => finish(captureResult(1, data, "callback host probe timed out")));
     socket.once("connect", () => socket.write(`${challenge}\n`));
     socket.on("data", (chunk) => {
       data += chunk.toString("utf8");
@@ -164,11 +172,18 @@ export function startMcpCallbackBridgeInContainer(
 export async function probeMcpCallbackPathWithRetries(
   port: number,
   challenge: string,
+  deadlineMs = Number.POSITIVE_INFINITY,
+  nowMs: () => number = () => performance.now(),
 ): Promise<CaptureResult> {
-  let probe = await probeMcpCallbackHostPath(port, challenge);
+  // Each try is cut off at the setup deadline too, and no try starts after it.
+  const timeoutMs = (): number => Math.min(MCP_CALLBACK_BRIDGE_PROBE_TIMEOUT_MS, Math.floor(deadlineMs - nowMs()));
+  if (timeoutMs() <= 0) return captureResult(1, "", "the callback setup budget ended before the host path was probed");
+  let probe = await probeMcpCallbackHostPath(port, challenge, timeoutMs());
   for (let attempt = 2; probe.status !== 0 && attempt <= MCP_CALLBACK_BRIDGE_PROBE_ATTEMPTS; attempt += 1) {
+    if (deadlineMs - nowMs() <= MCP_CALLBACK_BRIDGE_PROBE_DELAY_MS) break;
     sleepForMcpCallbackBridgeRetry();
-    probe = await probeMcpCallbackHostPath(port, challenge);
+    if (timeoutMs() <= 0) break;
+    probe = await probeMcpCallbackHostPath(port, challenge, timeoutMs());
   }
   return probe;
 }

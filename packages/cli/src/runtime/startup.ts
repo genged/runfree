@@ -1,4 +1,5 @@
 import { LIFECYCLE_OPERATION_BUDGET_MS, withLifecycleOperationBudget } from "./lifecycle-operation-budget.ts";
+import { launchHandoffSpanFits } from "./launch-lock-hold.ts";
 import { captureRebindTrustReceipt } from "./rebind-trust-receipt.ts";
 import { isDeepStrictEqual } from "node:util";
 import { readConfig } from "../config.ts";
@@ -150,6 +151,7 @@ import {
 import { waitForSessionAdmissionFirewallSetEmpty } from "./session-file-publisher.ts";
 import {
   attachLaunchHandoff,
+  markLaunchHandoffDeclined,
   mintPreparedRuntime,
   type LaunchHandoff,
   type PreparedRuntime,
@@ -207,6 +209,13 @@ export type RuntimeStartResult =
  * for it (sub-second launch plan Task 3). `build` runs only after the last
  * fallible startup step, with the lock still held.
  */
+/** Startup held the lock too long to hand it to admission (launch-lock-hold.ts). */
+class LaunchHandoffSpanExceededError extends Error {
+  constructor() {
+    super("startup already held the lifecycle lock longer than a handoff may carry");
+  }
+}
+
 type LaunchHandoffRequest = Readonly<{
   build: () => LaunchHandoff;
   /** Releases the lock before a deferred sync reads a source. */
@@ -399,6 +408,10 @@ async function finalizeValidatedRuntime(
     } catch (error) {
       // No handoff is not a failure: the launch takes its own lock and runs
       // the full preflight. The lock is still startup's to release.
+      if (error instanceof LaunchHandoffSpanExceededError) {
+        markLaunchHandoffDeclined(preparedRuntime);
+        timings.report("launch-handoff", "skipped hold-span");
+      }
       reportRuntimeVerbose(verbose, `launch handoff not minted: ${error instanceof Error ? error.message : String(error)}`);
     }
   } else if (launchHandoff) {
@@ -1319,6 +1332,8 @@ export async function startRuntime(
     const preparedApproval = readControlApprovalSelection(context.projectRoot, context.project);
     lifecycleLock ??= await tryAcquireProjectLifecycleLockWithRetry(preparedContext);
     acquiredLifecycleLock = lifecycleLock;
+    // Where a handed-off lock's one continuous hold starts (launch-lock-hold.ts).
+    const lockAcquiredAtMonotonicMs = performance.now();
     if (!lifecycleLock) {
       warn(`the runtime did not start: another Runfree runtime lifecycle change is in progress (lock: ${projectLifecycleLockPath(preparedContext)}); retry when it finishes`);
       return result(1, false, preparedContext);
@@ -1646,9 +1661,16 @@ export async function startRuntime(
             build: () => {
               heldLifecycleLock.assertHeld();
               if (lifecycleLock !== handoffLock) throw new Error("the startup lock was replaced before the handoff");
+              // A start that already held the lock this long hands nothing
+              // off: admission takes its own lock, so the one continuous hold
+              // stays inside another command's lock wait.
+              if (!launchHandoffSpanFits(lockAcquiredAtMonotonicMs, performance.now())) {
+                throw new LaunchHandoffSpanExceededError();
+              }
               return {
                 lifecycleLock: handoffLock,
                 lockOwnerToken: handoffLock.ownerToken,
+                lockAcquiredAtMonotonicMs,
                 proxy: {
                   id: runtimeProof.proxyId,
                   startedAt: proxyStartedAt as string,

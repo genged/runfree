@@ -551,7 +551,13 @@ directory, and the driver's ladder is:
    still-gated entry polling a proxy that no longer serves it. The wait also
    ends when the foreground stream ends (the next step classifies that), when
    the listing is unreadable, or at a fixed 10 s ceiling, well inside the
-   one-minute window other commands wait for the lock. The process table is
+   one-minute window other commands wait for the lock. The ceiling is lowered
+   to what is left of the launch's lock-hold budget (below), so a slow start
+   shortens this wait rather than lengthening the hold, down to no wait at
+   all. A wait that ends at the ceiling or the budget before the entry has
+   handed off gives up the ordering above for that launch: a proxy
+   replacement can then land before the exec, as it could before this step
+   existed, and the entry's own bound still applies. The process table is
    container-controlled, so it only decides when the launch reports; it
    grants nothing.
 7. **Await completion** releases the lifecycle lock and runs the heartbeat for
@@ -582,6 +588,33 @@ the one post-start inspection. Every launch caller releases a handoff nobody
 took; a crashed process leaves an ordinary stale lock. `runfree up` and
 `runfree resume` never hand off (the recovery claim takes the lifecycle lock
 itself).
+
+One launch's continuous hold of the lock — from startup's acquisition when
+the lock is handed off, otherwise from admission's own — is planned against a
+50 s budget, so another command's one-minute wait for the lock outlasts it
+([launch-lock-hold](../packages/cli/src/runtime/launch-lock-hold.ts)).
+Startup hands the lock off only if it has held it for at most 8 s, and the
+launch frame checks that again when it takes the handoff; past it, the lock is
+released and admission takes its own, running the full preflight. Admission's
+bounded steps fill the rest: the running proof (30 s), the MCP OAuth callback
+setup (12 s in total, every Docker call in it cut off at the time left and
+the host probe stopped at the deadline), and the handoff wait, which ends by
+the budget's deadline. The 10 s between the budget and the minute is the
+allowance for the short daemon round-trips between those steps, which carry
+no timeout of their own. A unit test pins that arithmetic. A launch that
+releases a lock startup held too long waits about half a second before taking
+its own, so a command already waiting gets the lock first.
+
+The budget covers the steps that are slow in ordinary use. It does not bound
+their fault cases, which can still stretch one hold past the minute: the IP
+reuse fence (a 20 s lock wait, then up to 20 s for consumer acknowledgements,
+about 40 s in all); the first session-file write (a 5 s inspection plus a 10 s write); the
+cleanup of an admission that failed under the lock (for example a callback
+setup that used its budget, followed by a stop with a 10 s grace); a
+non-handoff preflight whose reconcile tears down dead owners; and a daemon
+call that hangs, which has no bound of its own. In those cases a concurrent
+command defers with a retry instruction; nothing is admitted or removed
+because of it.
 
 Image builds, build approvals, and credential-source resolution finish before
 startup takes the lifecycle lock. Startup and explicit reload bound held
@@ -1050,7 +1083,14 @@ host 127.0.0.1:P -> forwarder (bound to session S) -> S's address:P
 - **Teardown.** The ordered session teardown removes the session's forwarder
   after the session file and before the record, so the address is never
   released while a route to it survives. A failure keeps the record for the
-  next reconcile. Unadmitted cleanup does the same.
+  next reconcile. Unadmitted cleanup does the same. Removing a session
+  container no record claims (reconcile's orphan sweep, or a launch's own)
+  first removes the forwarders bound to that orphan's session id (and, only
+  while the orphan runs and its address is its own, any that target that
+  address); a failure keeps the container, and with it the address, for the
+  next reconcile, with `runfree destroy --force` as the named remedy.
+  Admission then takes its participant proof again before the network
+  baseline, as it does after ending a dead owner's session.
 - **Reclaim.** When startup's topology validation or admission's participant
   proof refuses, the refusing step removes callback forwarders that route to
   no running owner (a killed launcher's leftover, a half-started forwarder, an

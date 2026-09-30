@@ -18,12 +18,15 @@
 // bounded retry, and the outcome-to-exit-status mapping.
 
 import { CliError } from "../errors.ts";
+import { warn } from "../warnings.ts";
+import { LIFECYCLE_LOCK_WAITER_YIELD_MS, launchHandoffSpanFits } from "./launch-lock-hold.ts";
 import { createInternalSessionAdmissionDriver } from "./session-admission-driver.ts";
 import {
   disposeLaunchHandoff,
   preparedRuntimeContext,
   StalePreparedRuntimeError,
   takeLaunchHandoff,
+  takeLaunchHandoffDeclined,
   type PreparedRuntime,
 } from "./prepared-runtime.ts";
 import {
@@ -149,7 +152,30 @@ async function withSessionLaunchFrame(
       // lock for this launch, admission runs under that exact lock instead of
       // releasing and re-taking it. The handoff is taken once; from here the
       // session lock manager owns the lock and closes it on every path.
-      const handoff = takeLaunchHandoff(preparedRuntime);
+      let handoff = takeLaunchHandoff(preparedRuntime);
+      // Startup that held the lock too long released it instead of handing it
+      // off; a waiting command should get it before this launch does.
+      let yieldToWaiters = takeLaunchHandoffDeclined(preparedRuntime);
+      // A handoff whose startup span has since outgrown what admission may
+      // add to it is released here, and admission takes its own lock below:
+      // the non-handoff path, whose full preflight re-proves everything the
+      // handoff would have let it skip. The launch's one continuous hold then
+      // starts again, inside the budget (launch-lock-hold.ts).
+      if (handoff && !launchHandoffSpanFits(handoff.lockAcquiredAtMonotonicMs, performance.now())) {
+        const expired = handoff;
+        handoff = undefined;
+        yieldToWaiters = true;
+        try {
+          expired.lifecycleLock.release();
+        } catch (error) {
+          // A lock this process no longer owns is not this frame's to
+          // release; the acquisition below waits for whoever holds it.
+          warn(`could not release the handed-off lifecycle lock: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      }
+      if (!handoff && yieldToWaiters) {
+        await new Promise((resolve) => setTimeout(resolve, LIFECYCLE_LOCK_WAITER_YIELD_MS));
+      }
       // Bounded lock acquisition avoids random refusal behind another process's
       // short critical section. A lock held for the complete window is a real
       // lifecycle operation, so this launch defers.
@@ -159,6 +185,7 @@ async function withSessionLaunchFrame(
           `per-session launch deferred because a runtime lifecycle change is in progress (lock: ${projectLifecycleLockPath(context)})`,
         );
       }
+      const lockHeldSinceMonotonicMs = handoff?.lockAcquiredAtMonotonicMs ?? performance.now();
       let sessionLockManager: ReturnType<typeof createSessionLockManager>;
       try {
         sessionLockManager = createSessionLockManager(context, initialLifecycleLock);
@@ -179,6 +206,7 @@ async function withSessionLaunchFrame(
           io: input.io,
           ...(input.foregroundSpawner ? { foregroundSpawner: input.foregroundSpawner } : {}),
           ...(handoff ? { handoff } : {}),
+          lockHeldSinceMonotonicMs,
         });
         const outcome = await launch(driver);
         return typeof outcome.status === "number" ? outcome.status : 1;

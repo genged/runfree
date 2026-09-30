@@ -105,7 +105,8 @@ import { repairWorktreeLinks } from "./runtime/git-layout.ts";
 import { subprocessCategory } from "./runtime/operation-histogram.ts";
 import { COMPOSE_UP_FAILURE_REMEDY, restoreSameProxySessionAdmission, startRuntime, up } from "./runtime/startup.ts";
 import { TOKEN_SYNC_DEFERRED_STATUS } from "./runtime/constants.ts";
-import { disposeLaunchHandoff, preparedRuntimeProxyId, takeLaunchHandoff } from "./runtime/prepared-runtime.ts";
+import { disposeLaunchHandoff, preparedRuntimeProxyId, takeLaunchHandoff, takeLaunchHandoffDeclined } from "./runtime/prepared-runtime.ts";
+import { LAUNCH_HANDOFF_STARTUP_SPAN_MAX_MS } from "./runtime/launch-lock-hold.ts";
 import { flushWarnings, pendingWarningsForTest } from "./warnings.ts";
 import { projectLifecycleLockPath, tryAcquireProjectLifecycleLock, tryAcquireProjectLifecycleLockWithRetry } from "./runtime/sessions.ts";
 
@@ -3817,6 +3818,46 @@ describe("runtime command flow", () => {
       expect(takeLaunchHandoff(warm.preparedRuntime)).toBeUndefined();
       handoff?.lifecycleLock.release();
       expect(lockIsFree(context)).toBe(true);
+    });
+
+    test("a start that held the lock longer than a handoff may carry releases it and hands nothing off", async () => {
+      const context = launchContext();
+      // The warm token sync is the last startup step under the lock; it runs
+      // one span past the handoff's allowance here.
+      const realNow = performance.now.bind(performance);
+      let skew = 0;
+      const clock = vi.spyOn(performance, "now").mockImplementation(() => realNow() + skew);
+      const io = createRuntimeIO({
+        admin: async (args) => {
+          if (args.includes("--startup-convergence")) skew += LAUNCH_HANDOFF_STARTUP_SPAN_MAX_MS + 1;
+          return 0;
+        },
+      });
+      try {
+        expect((await startRuntime(context, io, false, { launch: true })).status).toBe(0);
+        const warm = await startRuntime(context, io, false, { launch: true, launchHandoff: true });
+        if (warm.kind !== "ready") throw new Error("warm launch failed");
+        expect(takeLaunchHandoff(warm.preparedRuntime)).toBeUndefined();
+        // The launch frame is told to yield to a waiting command first.
+        expect(takeLaunchHandoffDeclined(warm.preparedRuntime)).toBe(true);
+        expect(lockIsFree(context)).toBe(true);
+      } finally {
+        clock.mockRestore();
+      }
+    });
+
+    test("a handoff carries when startup took its lock", async () => {
+      const context = launchContext();
+      const io = createRuntimeIO();
+      expect((await startRuntime(context, io, false, { launch: true })).status).toBe(0);
+      const before = performance.now();
+      const warm = await startRuntime(context, io, false, { launch: true, launchHandoff: true });
+      const after = performance.now();
+      if (warm.kind !== "ready") throw new Error("warm launch failed");
+      const handoff = takeLaunchHandoff(warm.preparedRuntime);
+      expect(handoff?.lockAcquiredAtMonotonicMs).toBeGreaterThanOrEqual(before);
+      expect(handoff?.lockAcquiredAtMonotonicMs).toBeLessThanOrEqual(after);
+      handoff?.lifecycleLock.release();
     });
 
     test("an untaken handoff is released by its caller's dispose", async () => {

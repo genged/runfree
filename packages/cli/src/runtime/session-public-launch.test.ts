@@ -9,7 +9,9 @@ const mocks = vi.hoisted(() => ({
   launchBuiltin: vi.fn(),
   launchShell: vi.fn(),
   // The held-lock handoffs startup attached, keyed by prepared runtime.
-  handoffs: new Map<object, { lifecycleLock: { release(): void }; lockOwnerToken: string }>(),
+  handoffs: new Map<object, { lifecycleLock: { release(): void }; lockOwnerToken: string; lockAcquiredAtMonotonicMs: number }>(),
+  // Prepared runtimes whose startup declined the handoff for its hold span.
+  declined: new Set<object>(),
 }));
 
 vi.mock("./session-admission-driver.ts", () => ({
@@ -28,6 +30,7 @@ vi.mock("./prepared-runtime.ts", () => ({
     mocks.handoffs.delete(prepared);
     handoff?.lifecycleLock.release();
   },
+  takeLaunchHandoffDeclined: (prepared: object) => mocks.declined.delete(prepared),
 }));
 
 import { defaultConfig } from "../config.ts";
@@ -37,7 +40,8 @@ import {
   launchShellThroughAdmission,
 } from "./session-public-launch.ts";
 import { StalePreparedRuntimeError } from "./prepared-runtime.ts";
-import { tryAcquireProjectLifecycleLock } from "./sessions.ts";
+import { tryAcquireProjectLifecycleLock, tryAcquireProjectLifecycleLockWithRetry } from "./sessions.ts";
+import { LAUNCH_HANDOFF_STARTUP_SPAN_MAX_MS } from "./launch-lock-hold.ts";
 import type { RuntimeContext, RuntimeIO } from "./types.ts";
 
 let tmp: string;
@@ -48,6 +52,7 @@ let env: NodeJS.ProcessEnv;
 beforeEach(() => {
   vi.clearAllMocks();
   mocks.handoffs.clear();
+  mocks.declined.clear();
   tmp = fs.mkdtempSync(path.join(os.tmpdir(), "runfree-public-launch-"));
   projectRoot = path.join(tmp, "project");
   fs.mkdirSync(projectRoot, { recursive: true });
@@ -202,7 +207,7 @@ describe("public launch through session admission", () => {
     const prepared = preparedRuntime();
     const held = tryAcquireProjectLifecycleLock(runtimeContext());
     if (!held) throw new Error("fixture lock");
-    const handoff = { lifecycleLock: held, lockOwnerToken: held.ownerToken };
+    const handoff = { lifecycleLock: held, lockOwnerToken: held.ownerToken, lockAcquiredAtMonotonicMs: performance.now() };
     mocks.handoffs.set(prepared, handoff);
 
     const status = await launchConfiguredAgentThroughAdmission({ preparedRuntime: prepared, io, agentName: "claude" });
@@ -219,11 +224,94 @@ describe("public launch through session admission", () => {
     reacquired?.release();
   });
 
+  test("a handoff whose startup span outgrew the budget is released, and admission takes its own lock", async () => {
+    const prepared = preparedRuntime();
+    const held = tryAcquireProjectLifecycleLock(runtimeContext());
+    if (!held) throw new Error("fixture lock");
+    const release = vi.spyOn(held, "release");
+    mocks.handoffs.set(prepared, {
+      lifecycleLock: held,
+      lockOwnerToken: held.ownerToken,
+      lockAcquiredAtMonotonicMs: performance.now() - LAUNCH_HANDOFF_STARTUP_SPAN_MAX_MS - 1,
+    });
+    const before = performance.now();
+
+    const status = await launchConfiguredAgentThroughAdmission({ preparedRuntime: prepared, io, agentName: "claude" });
+
+    expect(status).toBe(0);
+    expect(release).toHaveBeenCalledTimes(1);
+    const driverInput = mocks.createDriver.mock.calls[0]?.[0] as {
+      handoff?: unknown;
+      lockHeldSinceMonotonicMs: number;
+      sessionLockManager: { lock: { ownerToken: string } };
+    };
+    // The non-handoff path: no handoff reaches the driver, it runs under a
+    // freshly taken lock, and its hold is planned from that acquisition.
+    expect(driverInput.handoff).toBeUndefined();
+    expect(driverInput.sessionLockManager.lock.ownerToken).not.toBe(held.ownerToken);
+    expect(driverInput.lockHeldSinceMonotonicMs).toBeGreaterThanOrEqual(before);
+    const reacquired = tryAcquireProjectLifecycleLock(runtimeContext());
+    expect(reacquired).toBeDefined();
+    reacquired?.release();
+  });
+
+  test.each([
+    ["a handoff that outgrew the budget at take", "expired"],
+    ["a handoff startup declined for its hold span", "declined"],
+  ] as const)("after %s, a command already waiting gets the lock before admission retakes it", async (_label, cause) => {
+    const prepared = preparedRuntime();
+    const held = tryAcquireProjectLifecycleLock(runtimeContext());
+    if (!held) throw new Error("fixture lock");
+    const order: string[] = [];
+    // A concurrent command waiting the ordinary way: a try every 200 ms.
+    const waiter = tryAcquireProjectLifecycleLockWithRetry(runtimeContext()).then(async (lock) => {
+      order.push("waiter-acquired");
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      lock?.release();
+    });
+    // Let the waiter make its first, failed, try.
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    if (cause === "expired") {
+      mocks.handoffs.set(prepared, {
+        lifecycleLock: held,
+        lockOwnerToken: held.ownerToken,
+        lockAcquiredAtMonotonicMs: performance.now() - LAUNCH_HANDOFF_STARTUP_SPAN_MAX_MS - 1,
+      });
+    } else {
+      // Startup's own `finally` released the lock it declined to hand off.
+      held.release();
+      mocks.declined.add(prepared);
+    }
+    mocks.createDriver.mockImplementationOnce((input: { sessionLockManager: { lock: { assertHeld(): void } } }) => {
+      input.sessionLockManager.lock.assertHeld();
+      order.push("admission-acquired");
+      return { launchBuiltin: mocks.launchBuiltin, launchShell: mocks.launchShell };
+    });
+
+    await expect(launchConfiguredAgentThroughAdmission({ preparedRuntime: prepared, io, agentName: "claude" })).resolves.toBe(0);
+    await waiter;
+
+    expect(order).toEqual(["waiter-acquired", "admission-acquired"]);
+  });
+
+  test("a handoff inside the budget plans the hold from startup's acquisition", async () => {
+    const prepared = preparedRuntime();
+    const held = tryAcquireProjectLifecycleLock(runtimeContext());
+    if (!held) throw new Error("fixture lock");
+    const acquiredAt = performance.now() - 1_000;
+    mocks.handoffs.set(prepared, { lifecycleLock: held, lockOwnerToken: held.ownerToken, lockAcquiredAtMonotonicMs: acquiredAt });
+
+    await launchConfiguredAgentThroughAdmission({ preparedRuntime: prepared, io, agentName: "claude" });
+
+    const driverInput = mocks.createDriver.mock.calls[0]?.[0] as { lockHeldSinceMonotonicMs: number };
+    expect(driverInput.lockHeldSinceMonotonicMs).toBe(acquiredAt);
+  });
+
   test("releases a handed-off lock when the launch fails", async () => {
     const prepared = preparedRuntime();
     const held = tryAcquireProjectLifecycleLock(runtimeContext());
     if (!held) throw new Error("fixture lock");
-    mocks.handoffs.set(prepared, { lifecycleLock: held, lockOwnerToken: held.ownerToken });
+    mocks.handoffs.set(prepared, { lifecycleLock: held, lockOwnerToken: held.ownerToken, lockAcquiredAtMonotonicMs: performance.now() });
     mocks.launchBuiltin.mockRejectedValueOnce(new Error("admission failed closed"));
 
     await expect(launchConfiguredAgentThroughAdmission({ preparedRuntime: prepared, io, agentName: "codex" }))
@@ -239,7 +327,7 @@ describe("public launch through session admission", () => {
     const second = preparedRuntime();
     const held = tryAcquireProjectLifecycleLock(runtimeContext());
     if (!held) throw new Error("fixture lock");
-    mocks.handoffs.set(first, { lifecycleLock: held, lockOwnerToken: held.ownerToken });
+    mocks.handoffs.set(first, { lifecycleLock: held, lockOwnerToken: held.ownerToken, lockAcquiredAtMonotonicMs: performance.now() });
     mocks.createDriver.mockImplementationOnce(() => {
       throw new StalePreparedRuntimeError("the proxy restarted after startup prepared this launch");
     });

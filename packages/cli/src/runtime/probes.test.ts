@@ -1,3 +1,5 @@
+import net from "node:net";
+
 import { expect, test } from "vitest";
 
 import type { RuntimeNetwork } from "../network.ts";
@@ -8,6 +10,7 @@ import {
   applyServerUidDenialBatch,
   firewallSectionBatchScript,
   parseFirewallSectionBatch,
+  probeMcpCallbackPathWithRetries,
   validateProxyFirewall,
 } from "./probes.ts";
 import type { CaptureResult, RuntimeContext, RuntimeIO } from "./types.ts";
@@ -274,4 +277,35 @@ test.each([
   applyServerUidDenialBatch(issues, captureResult(0, stdout));
   expect(issues).toHaveLength(1);
   expect(issues[0]).toContain("denial batch could not run");
+});
+
+test("the callback host probe starts no try once the setup deadline has passed", async () => {
+  const started = performance.now();
+  const result = await probeMcpCallbackPathWithRetries(1, "challenge", started, () => started + 1);
+  expect(result.status).toBe(1);
+  expect(result.stderr).toContain("budget ended before the host path was probed");
+});
+
+test("a peer that trickles bytes cannot hold a callback host probe past the setup deadline", async () => {
+  // The far end of the probe is the in-session bridge: container-controlled.
+  // An idle timeout alone would never fire against a byte every 20 ms.
+  const sockets = new Set<net.Socket>();
+  const server = net.createServer((socket) => {
+    sockets.add(socket);
+    const timer = setInterval(() => socket.write("x"), 20);
+    socket.on("close", () => clearInterval(timer));
+    socket.on("error", () => clearInterval(timer));
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const port = (server.address() as net.AddressInfo).port;
+  try {
+    const started = performance.now();
+    const result = await probeMcpCallbackPathWithRetries(port, "challenge", started + 300);
+    const elapsed = performance.now() - started;
+    expect(result.status).toBe(1);
+    expect(elapsed).toBeLessThan(2_000);
+  } finally {
+    for (const socket of sockets) socket.destroy();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
 });

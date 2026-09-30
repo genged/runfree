@@ -186,9 +186,11 @@ import {
 import type { CaptureResult, RuntimeContext, RuntimeIO, SessionMetadata } from "./types.ts";
 import {
   reclaimStaleSessionMcpCallbackForwarders,
+  removeOrphanSessionMcpCallbackIngress,
   removeSessionMcpCallbackIngress,
 } from "./session-callback-ingress.ts";
 import { sessionMcpCallbackLifecycle, type SessionIngressLifecycle } from "./session-mcp-callback.ts";
+import { launchLockHoldDeadline, RUNNING_PROOF_TIMEOUT_MS } from "./launch-lock-hold.ts";
 import { remedy } from "../remedies.ts";
 
 const DEFAULT_INTERNAL_PROBE_LEASE_DURATION_MS = SESSION_ADMISSION_LEASE_MAX_DURATION_MS;
@@ -266,8 +268,9 @@ const SESSION_CONTAINER_NOT_EXACT_RUNNING_OBSERVATION = "session container is no
 // is not delayed, long enough that the race resolves.
 const FOREGROUND_EXIT_BRIDGE_TIMEOUT_MS = 1_000;
 // How long the running proof may wait for the started container to reach
-// Docker's running state. This is the helper's maximum, and it is deliberate:
-// the running proof is now the *first* observation taken after
+// Docker's running state (`RUNNING_PROOF_TIMEOUT_MS`, defined beside the
+// launch lock-hold budget it is part of). This is the helper's maximum, and it
+// is deliberate: the running proof is now the *first* observation taken after
 // `docker start --attach` is issued. Under the pre-file admission source,
 // `register` (snapshot publish, selection, acknowledgement) ran in between and
 // its Docker round-trips padded the window, so the helper's 5 s fallback was
@@ -276,7 +279,7 @@ const FOREGROUND_EXIT_BRIDGE_TIMEOUT_MS = 1_000;
 // daemon can take longer than 5 s to start one. Widening the window admits
 // nothing earlier: the proof still requires the same exact running assertion,
 // and no session is authorized before it returns.
-export const RUNNING_PROOF_TIMEOUT_MS = 30_000;
+export { RUNNING_PROOF_TIMEOUT_MS };
 /**
  * The longest a launch holds the project lifecycle lock after its grant while
  * waiting for the session entry to hand off to the agent (`awaitHandoff`).
@@ -383,6 +386,13 @@ export type InternalSessionAdmissionDriverInput = Readonly<{
    * the fence, or the post-start proof.
    */
   handoff?: LaunchHandoff;
+  /**
+   * When the caller took the lifecycle lock this admission runs under, on the
+   * `nowMonotonicMs` clock. The launch's one continuous hold ends by
+   * `launchLockHoldDeadline` of it (or of the handoff's acquisition). Omitted:
+   * the driver's construction time.
+   */
+  lockHeldSinceMonotonicMs?: number;
 }>;
 
 type ResolvedInternalSessionAdmissionDriverInput = InternalSessionAdmissionDriverInput & Readonly<{
@@ -412,6 +422,9 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
   readonly #gateway: SessionAdmissionDockerGateway;
   readonly #nowEpochMs: () => number;
   readonly #nowMonotonicMs: () => number;
+  /** When this launch's continuous hold of the lifecycle lock must end. */
+  readonly #lockHoldDeadlineMs: number;
+  readonly #lockHeldSinceMs: number;
   #preflight?: SessionAdmissionDriverPreflight;
   #participantNetwork?: SessionContainerNetworkIdentity;
   #ingressParticipants: readonly ExactIngressInternalParticipant[] = [];
@@ -511,10 +524,14 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
     this.#launch = launch;
     this.#nowEpochMs = input.nowEpochMs ?? Date.now;
     this.#nowMonotonicMs = input.nowMonotonicMs ?? (() => performance.now());
+    this.#lockHeldSinceMs = input.handoff?.lockAcquiredAtMonotonicMs ?? input.lockHeldSinceMonotonicMs ?? this.#nowMonotonicMs();
+    this.#lockHoldDeadlineMs = launchLockHoldDeadline(this.#lockHeldSinceMs);
   }
 
   nowMs = (): number => this.#nowMonotonicMs();
   dockerOperationCount = (): number => this.#gateway.dockerOperationCount();
+  /** How long this launch has held the lifecycle lock in its one continuous hold. */
+  lockHoldMs = (): number => this.#nowMonotonicMs() - this.#lockHeldSinceMs;
   #teardownPath: "exited" | "full" = "full";
 
   // Locking invariant: every step asserts the lifecycle lock at entry (and
@@ -1081,6 +1098,20 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
       this.#input.plan.paths.stateDir,
       this.#input.lifecycleLock,
     );
+    // The orphan's callback route goes before the container that holds its
+    // address (the same order as the ordered teardown); unproved, the
+    // container is kept and the launch refuses before any allocation.
+    this.#lock();
+    removeOrphanSessionMcpCallbackIngress({
+      io: this.#gateway.io,
+      dockerOptions: this.#dockerOptions(),
+      projectId: preflight.expectedProject.projectId,
+      containerId: authority.containerId,
+      sessionId: classification.identity.sessionId,
+      running: classification.container.running,
+      ...(classification.container.sourceIp ? { sourceIp: classification.container.sourceIp } : {}),
+    });
+    this.#lock();
     const failures: unknown[] = [];
     if (classification.container.running) {
       try {
@@ -1141,7 +1172,8 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
     });
   }
 
-  #cleanPreexistingOrphans(): void {
+  /** Returns how many orphan containers (and their callback routes) it removed. */
+  #cleanPreexistingOrphans(): number {
     const preflight = this.#require(this.#preflight, "canonical preflight");
     let records = listSessionContainerRecordsV2(
       this.#input.plan.paths.stateDir,
@@ -1177,10 +1209,13 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
         throw new Error("unbound created session-container remained after record-first recovery");
       }
     }
+    let removed = 0;
     for (const classification of classifications) {
-      if (classification.kind === "container-only") this.#cleanExactOrphan(classification);
+      if (classification.kind !== "container-only") continue;
+      this.#cleanExactOrphan(classification);
+      removed += 1;
     }
-    if (classifications.some((classification) => classification.kind === "container-only")) {
+    if (removed > 0) {
       records = listSessionContainerRecordsV2(
         this.#input.plan.paths.stateDir,
         preflight.expectedProject,
@@ -1195,6 +1230,7 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
         throw new Error("session-container reconciliation remained uncertain after exact orphan cleanup");
       }
     }
+    return removed;
   }
 
   /**
@@ -1351,8 +1387,8 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
     // lock this launch still holds. When nothing it saw needed repair and the
     // registry and proxy incarnation are still exactly what it left, repeating
     // it (and the orphan sweep) would observe the same state again. A settled
-    // reconcile revoked no dead owner, so no callback forwarder went away
-    // since the participant proof above was taken.
+    // reconcile revoked no dead owner and removed no orphan container, so no
+    // callback forwarder went away since the participant proof above was taken.
     const settledByHandoff = this.#settledByHandoff();
     if (settledByHandoff) {
       this.#reservedSessionFileIps = settledByHandoff.reservedSourceIps;
@@ -1379,11 +1415,14 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
       this.#reservedSessionFileIps = reconciled.reservedSourceIps;
       this.#lock();
       this.#assertNoQuarantinedSessionRecords();
-      this.#cleanPreexistingOrphans();
-      if (reconciled.deadOwnersRevoked.length > 0) {
-        // Ending a dead owner's session also removed its callback forwarder, so
-        // the participant proof taken before reconcile names an endpoint that
-        // is gone. Take it again, under the same held lock, before the baseline.
+      const orphansCleaned = this.#cleanPreexistingOrphans();
+      if (reconciled.deadOwnersRevoked.length > 0
+        || reconciled.orphanContainersRemoved.length > 0
+        || orphansCleaned > 0) {
+        // Ending a dead owner's session, or removing an orphan container, also
+        // removed its callback forwarder, so the participant proof taken before
+        // reconcile names an endpoint that is gone. Take it again, under the
+        // same held lock, before the baseline.
         this.#lock();
         authority = createControlPlaneInternalParticipantAuthority({
           plan: this.#input.plan,
@@ -1908,7 +1947,11 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
    *                project image may replace the entry with one that never
    *                execs, and no launch may hold the project lock for long.
    *                Every daemon read is itself cut off at the time remaining,
-   *                so a hung daemon cannot stretch the hold past it.
+   *                so a hung daemon cannot stretch the hold past it. The
+   *                ceiling is lowered to what is left of the launch's
+   *                lock-hold budget (`launch-lock-hold.ts`), so a slow start
+   *                or admission shortens this wait instead of the hold
+   *                outgrowing another command's lock wait.
    *
    * The process table read is container-controlled data, so it only ever
    * decides *when* this launch reports; it grants nothing, and its text is
@@ -1922,7 +1965,13 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
     const record = this.#require(this.#admittedRecord, "admitted provisioning-running record");
     const foreground = this.#require(this.#foreground, "foreground attach handle");
     const startedAt = this.#nowMonotonicMs();
-    const remainingMs = (): number => SESSION_HANDOFF_WAIT_CEILING_MS - (this.#nowMonotonicMs() - startedAt);
+    // The wait never carries this launch's one continuous lock hold past its
+    // deadline: when admission (or startup before it, under a handed-off lock)
+    // has used most of the budget, the wait is shorter than the ceiling, and
+    // ends the way the ceiling does.
+    const holdLeftMs = Math.max(0, this.#lockHoldDeadlineMs - startedAt);
+    const ceilingMs = Math.min(SESSION_HANDOFF_WAIT_CEILING_MS, holdLeftMs);
+    const remainingMs = (): number => ceilingMs - (this.#nowMonotonicMs() - startedAt);
     let foregroundEnded = false;
     void foreground.completion.then(() => { foregroundEnded = true; });
     /** Waits up to `ms` for the foreground to end; true when it has. */
@@ -1946,7 +1995,11 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
       if (foregroundEnded || currentSessionContainerForegroundCompletion(foreground)) break;
       const remaining = remainingMs();
       if (remaining <= 0) {
-        warn(`the session entry did not hand off to the agent within ${SESSION_HANDOFF_WAIT_CEILING_MS} ms; reporting the session attached now (the proxy has not served it yet, or the project image replaces the Runfree session entry)`);
+        if (ceilingMs < SESSION_HANDOFF_WAIT_CEILING_MS) {
+          warn("the session entry did not hand off to the agent before this launch had to release the project lifecycle lock; reporting the session attached now");
+        } else {
+          warn(`the session entry did not hand off to the agent within ${SESSION_HANDOFF_WAIT_CEILING_MS} ms; reporting the session attached now (the proxy has not served it yet, or the project image replaces the Runfree session entry)`);
+        }
         break;
       }
       const observed = this.#observeEntryHandoff(record, Math.max(remaining, SESSION_HANDOFF_MIN_READ_MS));
@@ -2310,6 +2363,7 @@ function timedSessionAdmissionLaunchSteps(
   steps: SessionAdmissionLaunchSteps,
   timings: RuntimeTimings,
   histogram: OperationHistogram,
+  lockHoldMs: () => number,
 ): SessionAdmissionLaunchSteps {
   const timed = (phase: string, fn: () => Promise<void>) => (): Promise<void> => timings.timeAsync(phase, fn);
   // The handoff wait is the last step before the session entry execs the
@@ -2321,6 +2375,10 @@ function timedSessionAdmissionLaunchSteps(
     await timings.timeAsync("admission:await-handoff", steps.awaitHandoff);
     for (const line of histogram.lines()) timings.report("admission-ops", line);
     timings.report("session-admission", `docker-operations-before-agent=${steps.dockerOperationCount()}`);
+    // The launch's one continuous lifecycle-lock hold, measured where it ends
+    // (the attached wait releases the lock next): the live suite's evidence
+    // that the hold stayed inside its budget.
+    timings.report("session-admission", `lifecycle-lock-hold-ms=${Math.round(lockHoldMs())}`);
   };
   return Object.freeze({
     agent: steps.agent,
@@ -2409,7 +2467,7 @@ export function createInternalSessionAdmissionDriver(
     let steps: InternalBuiltinAdmissionProbeSteps | undefined;
     try {
       steps = stepsFor(kind, options, histogram);
-      const launchSteps = histogram ? timedSessionAdmissionLaunchSteps(steps, timings, histogram) : steps;
+      const launchSteps = histogram ? timedSessionAdmissionLaunchSteps(steps, timings, histogram, steps.lockHoldMs) : steps;
       try {
         const outcome = await runInternalSessionAdmissionLaunch(launchSteps);
         steps.finalizeSessionEvidence(outcome);

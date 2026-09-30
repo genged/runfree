@@ -61,7 +61,9 @@ export type ConsumedPreparedRuntime = PreparedRuntimeBinding;
  * Process memory only: never serialized, never written, bound to one prepared
  * runtime, taken at most once. Its freshness is the lock itself — held
  * continuously from startup's acquisition through the reconcile that produced
- * this snapshot to the admission that consumes it — so it carries no expiry.
+ * this snapshot to the admission that consumes it — so its evidence carries no
+ * expiry. Its lock hold does: `lockAcquiredAtMonotonicMs` bounds how long the
+ * one continuous hold may last, which is an availability bound, not a proof.
  * It selects a path and authorizes nothing: admission still allocates against
  * a fresh network baseline, fences the address, creates, and holds the
  * started container to one exact post-start inspection before any session
@@ -71,6 +73,14 @@ export type LaunchHandoff = Readonly<{
   /** The exact lock object startup acquired, never released or replaced since. */
   lifecycleLock: ProjectLifecycleLock;
   lockOwnerToken: string;
+  /**
+   * When startup acquired that lock, on the `performance.now()` clock. The
+   * launch's one continuous hold is planned from here
+   * (`launch-lock-hold.ts`): the launch frame refuses to run admission under
+   * a handoff whose startup span has outgrown `launchHandoffSpanFits`, and
+   * the entry-handoff wait ends by `launchLockHoldDeadline` of it.
+   */
+  lockAcquiredAtMonotonicMs: number;
   /**
    * The proxy incarnation startup proved. `pid` and `bootId` are present when
    * a warm proof observed them; later work (sub-second launch plan Phase E)
@@ -110,6 +120,24 @@ export function attachLaunchHandoff(prepared: PreparedRuntime, handoff: LaunchHa
     throw new Error("launch handoff lock owner changed before it was attached");
   }
   handoffs.set(prepared, { handoff: Object.freeze({ ...handoff }) });
+}
+
+const declinedHandoffs = new WeakSet<object>();
+
+/**
+ * Records that startup held the lock too long to hand it off and released it
+ * instead (launch-lock-hold.ts). The launch frame then yields before taking
+ * its own lock, so a command that has been waiting since startup began gets
+ * the lock first rather than waiting through the admission as well.
+ */
+export function markLaunchHandoffDeclined(prepared: PreparedRuntime): void {
+  preparedBinding(prepared);
+  declinedHandoffs.add(prepared);
+}
+
+/** One-shot: whether startup declined this prepared runtime's handoff for its hold span. */
+export function takeLaunchHandoffDeclined(prepared: PreparedRuntime): boolean {
+  return declinedHandoffs.delete(prepared);
 }
 
 /** One-shot: the handoff, or undefined when there is none or it was already taken. */

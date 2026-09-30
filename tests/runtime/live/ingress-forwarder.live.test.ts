@@ -40,7 +40,12 @@
 //   ext   Recovery (b): a compatible proxy replacement leaves a live callback
 //         forwarder and a port forward in place, loopback-only and reaching.
 //   core  `runfree stop` and `runfree destroy` each remove a port forward
-//         (destroy is the file's last case and also takes the host network).
+//         (destroy also takes the host network).
+//   ext   Lock-hold budget: a warm launch that took the held-lock handoff,
+//         whose session's callback bridge is throttled to a sliver of a CPU,
+//         never makes a `destroy --force` started meanwhile give up on the
+//         lifecycle lock. It brings the runtime back first and is the file's
+//         last case.
 //
 // Contract points marked "contract: session MCP OAuth callback decisions
 // 2026-09-30" pin the per-launch callback being implemented alongside this
@@ -59,6 +64,8 @@
 //   - A browser: the host GET is the browser's redirect request.
 //   - VNC on the stock base image, which ships no x11vnc (the case reports
 //     that as a skip, not a pass).
+
+import childProcess from "node:child_process";
 
 import { afterAll, afterEach, beforeAll, describe, expect, test } from "vitest";
 import { CONTAINER_ROLE_LABEL, INGRESS_PURPOSE_LABEL } from "../../../packages/cli/src/runtime/container-inventory.ts";
@@ -119,6 +126,8 @@ import {
   type SessionListener,
 } from "./ingress-support.ts";
 import { liveTierSelected } from "./tiers.ts";
+import { LAUNCH_LOCK_HOLD_BUDGET_MS } from "../../../packages/cli/src/runtime/launch-lock-hold.ts";
+import { cliEntryArgv } from "../../support/prebuilt-entry.ts";
 
 // Mixed file (see `tiers.ts`): loopback publication, the one-way refusal, the
 // callback two-hop and peer refusal, and teardown are trust-boundary proofs;
@@ -583,7 +592,8 @@ describe("ingress forwarders are loopback-only, one-way, per-session, and torn d
   }, TEST_TIMEOUT_MS);
 
   // -------------------------------------------------------------------------
-  // Runtime teardown. Destroy is last: nothing after it has a runtime.
+  // Runtime teardown. Only the lock-hold case below runs after destroy, and it
+  // brings the runtime back itself.
   // -------------------------------------------------------------------------
 
   /** Opens a port forward to a session, then ends the session, leaving the forward behind. */
@@ -621,5 +631,122 @@ describe("ingress forwarders are loopback-only, one-way, per-session, and torn d
       docker(["ps", "-a", "--filter", `label=${PROJECT_ID_LABEL}=${projectId}`, "--format", "{{.Names}}"]).stdout.trim(),
       "runfree destroy left project containers",
     ).toBe("");
+  }, TEST_TIMEOUT_MS);
+
+  // -------------------------------------------------------------------------
+  // Lock-hold budget (extended). Runs after the destroy case: it brings the
+  // runtime back, and ends by destroying it again.
+  // -------------------------------------------------------------------------
+
+  /** Brings the runtime back after a destroy, approving each exact subject startup names. */
+  function upAfterDestroy(): void {
+    for (let round = 0; round < 3; round += 1) {
+      const up = fixture.runfree(["up"]);
+      if (up.status === 0) return;
+      if (up.output.includes("desired controls require exact approval before startup")) {
+        upWithExactApprovals(fixture);
+        return;
+      }
+      if (up.output.includes("exact pre-sandbox Docker build approval is required")) {
+        const approved = fixture.runfree(["image", "approve-context"]);
+        expect(approved.status, `image approve-context failed: ${describeOutput(approved.output, 4000)}`).toBe(0);
+        continue;
+      }
+      throw new Error(`runfree up after destroy failed: ${describeOutput(up.output, 4000)}`);
+    }
+    throw new Error("runfree up after destroy did not converge in three rounds");
+  }
+
+  /** One CLI invocation as a child process, so two can overlap. */
+  function spawnCli(args: readonly string[], extraEnv: NodeJS.ProcessEnv = {}) {
+    const startedAt = Date.now();
+    const child = childProcess.spawn(
+      process.execPath,
+      [...cliEntryArgv(), "--workspace", fixture.projectRoot, ...args],
+      {
+        cwd: REPO_ROOT,
+        env: { ...fixture.env, RUNFREE_INVOCATION_CWD: REPO_ROOT, RUNFREE_PROJECT_ROOT: REPO_ROOT, ...extraEnv },
+        stdio: ["pipe", "pipe", "pipe"],
+      },
+    );
+    let output = "";
+    const collect = (chunk: Buffer | string): void => {
+      output += String(chunk);
+    };
+    child.stdout?.on("data", collect);
+    child.stderr?.on("data", collect);
+    child.stdin?.on("error", () => undefined);
+    const completion = new Promise<Readonly<{ status: number | null; output: string; elapsedMs: number }>>((resolve, reject) => {
+      child.once("error", reject);
+      child.once("close", (status) => resolve({ status, output, elapsedMs: Date.now() - startedAt }));
+    });
+    return { child, completion, output: () => output };
+  }
+
+  extendedTest("a handed-off launch with a slow callback bridge never makes a concurrent destroy give up on the lifecycle lock", async () => {
+    // Todo: launch-lock-hold budget (cross-lane review finding 1). A warm launch
+    // hands startup's lifecycle lock to admission, which then sets up the
+    // session's MCP OAuth callback under the same hold. The session container
+    // is throttled to a sliver of one CPU as soon as it runs, so the bridge's
+    // `node` and the host probe are slow. A destroy started meanwhile waits
+    // for the lock for up to 60 s; the launch's one continuous hold must end
+    // inside that, whether the callback setup finishes or runs out its budget.
+    upAfterDestroy();
+    runtimeDestroyed = false;
+    mcpEligible = false;
+    ensureMcpOAuthEligible();
+    // A first launch after `up` settles the warm-proof record the next one matches.
+    const warm = await launch(["claude"], "warm-up session");
+    await warm.end();
+
+    // Every session-agent container, created or running: the throttle must
+    // land before the callback setup, so it is applied as soon as `docker
+    // create` has returned, not once the container runs.
+    const sessionContainers = (): string[] => dockerOrThrow("list session containers", [
+      "ps", "-a", "--no-trunc",
+      "--filter", `label=com.docker.compose.project=${project}`,
+      "--filter", "label=io.runfree.container-role=session-agent",
+      "--format", "{{.ID}}",
+    ]).split("\n").map((line) => line.trim()).filter(Boolean);
+    const before = new Set(sessionContainers());
+    const launched = spawnCli(["claude"], { RUNFREE_TIMINGS: "1" });
+    let sessionId: string | undefined;
+    const deadline = Date.now() + 120_000;
+    while (!sessionId && Date.now() < deadline) {
+      sessionId = sessionContainers().find((id) => !before.has(id));
+      if (!sessionId) await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    expect(sessionId, `no session container appeared: ${describeOutput(launched.output(), 4000)}`).toBeDefined();
+    const throttled = docker(["update", "--cpus", "0.01", sessionId as string]);
+    expect(throttled.status, `docker update --cpus failed: ${throttled.stderr}`).toBe(0);
+
+    const destroyed = spawnCli(["destroy", "--force"]);
+    runtimeDestroyed = true;
+    const destroy = await destroyed.completion;
+    const launchResult = await Promise.race([
+      launched.completion,
+      new Promise<undefined>((resolve) => setTimeout(() => resolve(undefined), 60_000)),
+    ]);
+    if (!launchResult) launched.child.kill("SIGKILL");
+    const launchOutput = launched.output();
+
+    expect(launchOutput, "the measured launch did not take the held-lock handoff").toMatch(/timing: launch-handoff minted/u);
+    expect(destroy.output, `destroy gave up waiting for the lifecycle lock: ${describeOutput(destroy.output, 4000)}`)
+      .not.toContain("lifecycle change is in progress");
+    expect(destroy.status, `destroy --force failed: ${describeOutput(destroy.output, 4000)}`).toBe(0);
+    // The launch either attached, and reported the one continuous hold it
+    // ended, or its callback setup ran out of budget and it failed. Either
+    // way the hold stayed inside the budget plus the round-trip allowance.
+    const hold = /timing: session-admission lifecycle-lock-hold-ms=(\d+)/u.exec(launchOutput);
+    if (hold) {
+      expect(Number(hold[1]), `the launch held the lifecycle lock too long: ${describeOutput(launchOutput, 4000)}`)
+        .toBeLessThanOrEqual(LAUNCH_LOCK_HOLD_BUDGET_MS + 10_000);
+    } else {
+      expect(launchOutput, `the launch neither attached nor failed its callback setup: ${describeOutput(launchOutput, 4000)}`)
+        .toContain("the MCP OAuth callback for this session could not be set up");
+    }
+    // Nothing the launch or its callback created survives the destroy.
+    expect(sessionContainers(), "a session container survived destroy --force").toEqual([]);
+    expect(projectIngressForwarders(projectId), "a callback forwarder survived destroy --force").toEqual([]);
   }, TEST_TIMEOUT_MS);
 });

@@ -97,6 +97,7 @@ const mocks = vi.hoisted(() => ({
   consumePreparedRuntime: vi.fn(),
   compileMaterializationEligibility: vi.fn(),
   removeSessionIngress: vi.fn(),
+  removeOrphanIngress: vi.fn(),
   reclaimStaleCallbacks: vi.fn(),
   sessionMcpCallbackLifecycle: vi.fn(),
 }));
@@ -104,6 +105,7 @@ const mocks = vi.hoisted(() => ({
 vi.mock("../agents.ts", () => ({ builtinAgent: mocks.builtinAgent }));
 vi.mock("./session-callback-ingress.ts", () => ({
   removeSessionMcpCallbackIngress: mocks.removeSessionIngress,
+  removeOrphanSessionMcpCallbackIngress: mocks.removeOrphanIngress,
   reclaimStaleSessionMcpCallbackForwarders: mocks.reclaimStaleCallbacks,
 }));
 vi.mock("./session-mcp-callback.ts", () => ({ sessionMcpCallbackLifecycle: mocks.sessionMcpCallbackLifecycle }));
@@ -262,6 +264,7 @@ import { SessionFileTeardownBlockedError } from "./session-file-teardown.ts";
 import { sessionRegistryDigest } from "./launch-handoff.ts";
 import { StalePreparedRuntimeError, type LaunchHandoff } from "./prepared-runtime.ts";
 import { createInternalSessionAdmissionDriver, SESSION_HANDOFF_WAIT_CEILING_MS } from "./session-admission-driver.ts";
+import { LAUNCH_LOCK_HOLD_BUDGET_MS } from "./launch-lock-hold.ts";
 import { SessionTeardownIncompleteError } from "./session-admission-probe.ts";
 import { flushWarnings, setOutputWriterForTest } from "../warnings.ts";
 import type { ActiveRuntimePlan } from "./plan.ts";
@@ -424,6 +427,10 @@ beforeEach(() => {
   vi.clearAllMocks();
   mocks.removeSessionIngress.mockImplementation(() => {
     mocks.events.push("remove-session-ingress");
+    return 0;
+  });
+  mocks.removeOrphanIngress.mockImplementation(() => {
+    mocks.events.push("remove-orphan-ingress");
     return 0;
   });
   mocks.reclaimStaleCallbacks.mockImplementation(() => {
@@ -1364,6 +1371,111 @@ describe("internal session admission driver", () => {
     expect(mocks.createParticipantAuthority).toHaveBeenCalledTimes(2);
     expect(mocks.events.indexOf("reconcile-sessions")).toBeLessThan(mocks.events.lastIndexOf("participant-authority"));
     expect(mocks.events.lastIndexOf("participant-authority")).toBeLessThan(mocks.events.indexOf("baseline"));
+  });
+
+  test("a reconcile that removed an orphan container re-proves the participants before the baseline", async () => {
+    mocks.reconcileSessions.mockImplementation(async () => {
+      mocks.events.push("reconcile-sessions");
+      return {
+        orphanFilesDeleted: [],
+        deadOwnersRevoked: [],
+        orphanContainersRemoved: ["e".repeat(64)],
+        unknownOwners: [],
+        reservedSourceIps: [],
+        orphanFiles: [],
+        recordsWithoutFiles: [],
+      };
+    });
+    const driver = createInternalSessionAdmissionDriver({
+      ...fixture(),
+      nowEpochMs: () => Date.parse("2026-08-09T00:00:00.000Z"),
+    });
+
+    await driver.launchBuiltin("codex");
+    expect(mocks.createParticipantAuthority).toHaveBeenCalledTimes(2);
+    expect(mocks.events.indexOf("reconcile-sessions")).toBeLessThan(mocks.events.lastIndexOf("participant-authority"));
+    expect(mocks.events.lastIndexOf("participant-authority")).toBeLessThan(mocks.events.indexOf("baseline"));
+  });
+
+  describe("an orphan session container found by the launch's own sweep", () => {
+    const ORPHAN_ID = "e".repeat(64);
+    const orphan = Object.freeze({
+      kind: "container-only",
+      container: { containerId: ORPHAN_ID, running: true, sourceIp: "172.31.90.44" },
+      identity: { sessionId: "rf-20260809-orphan1", sessionIncarnation: "1".repeat(64) },
+    });
+    beforeEach(() => {
+      mocks.authorizeOrphan.mockImplementation(() => {
+        mocks.events.push("authorize-container-only");
+        return { containerId: ORPHAN_ID };
+      });
+      mocks.orphanStop.mockReturnValue({ executable: "docker", args: ["container", "stop", ORPHAN_ID] });
+      mocks.orphanRemove.mockReturnValue({ executable: "docker", args: ["container", "rm", ORPHAN_ID] });
+      mocks.classify.mockReturnValueOnce([orphan]).mockReturnValue([]);
+    });
+
+    test("has its callback route removed before the container, then the participants are proved again", async () => {
+      const driver = createInternalSessionAdmissionDriver({
+        ...fixture(),
+        nowEpochMs: () => Date.parse("2026-08-09T00:00:00.000Z"),
+      });
+
+      await driver.launchBuiltin("codex");
+
+      expect(mocks.removeOrphanIngress).toHaveBeenCalledWith(expect.objectContaining({
+        projectId: "0123456789ab",
+        containerId: ORPHAN_ID,
+        sessionId: "rf-20260809-orphan1",
+        running: true,
+        sourceIp: "172.31.90.44",
+      }));
+      const route = mocks.events.indexOf("remove-orphan-ingress");
+      expect(route).toBeGreaterThan(mocks.events.indexOf("authorize-container-only"));
+      expect(route).toBeLessThan(mocks.events.indexOf(`docker:container stop ${ORPHAN_ID}`));
+      expect(route).toBeLessThan(mocks.events.indexOf(`docker:container rm ${ORPHAN_ID}`));
+      // The participant proof taken before the sweep named the removed
+      // forwarder: it is taken again before the baseline.
+      expect(mocks.createParticipantAuthority).toHaveBeenCalledTimes(2);
+      expect(mocks.events.lastIndexOf("participant-authority")).toBeGreaterThan(mocks.events.indexOf(`docker:container rm ${ORPHAN_ID}`));
+      expect(mocks.events.lastIndexOf("participant-authority")).toBeLessThan(mocks.events.indexOf("baseline"));
+    });
+
+    test("keeps the container when its route cannot be proved removed, and refuses before any allocation", async () => {
+      mocks.removeOrphanIngress.mockImplementation(() => {
+        throw new Error("the MCP OAuth callback route of orphan session container could not be proved removed");
+      });
+      const driver = createInternalSessionAdmissionDriver({
+        ...fixture(),
+        nowEpochMs: () => Date.parse("2026-08-09T00:00:00.000Z"),
+      });
+
+      await expect(driver.launchBuiltin("codex")).rejects.toThrow("could not be proved removed");
+
+      expect(mocks.events).not.toContain(`docker:container stop ${ORPHAN_ID}`);
+      expect(mocks.events).not.toContain(`docker:container rm ${ORPHAN_ID}`);
+      expect(mocks.allocateIp).not.toHaveBeenCalled();
+    });
+
+    test("is reclaimed by the next launch once the route can be removed", async () => {
+      mocks.removeOrphanIngress.mockImplementationOnce(() => {
+        throw new Error("the MCP OAuth callback route of orphan session container could not be proved removed");
+      });
+      const first = createInternalSessionAdmissionDriver({
+        ...fixture(),
+        nowEpochMs: () => Date.parse("2026-08-09T00:00:00.000Z"),
+      });
+      await expect(first.launchBuiltin("codex")).rejects.toThrow("could not be proved removed");
+
+      mocks.events.length = 0;
+      mocks.classify.mockReset();
+      mocks.classify.mockReturnValueOnce([orphan]).mockReturnValue([]);
+      const second = createInternalSessionAdmissionDriver({
+        ...fixture(),
+        nowEpochMs: () => Date.parse("2026-08-09T00:00:00.000Z"),
+      });
+      await expect(second.launchBuiltin("codex")).resolves.toEqual({ status: 0, signal: null });
+      expect(mocks.events.indexOf("remove-orphan-ingress")).toBeLessThan(mocks.events.indexOf(`docker:container rm ${ORPHAN_ID}`));
+    });
   });
 
   test("launch prepares the session ingress after the running proof and before the grant, then removes it first in teardown", async () => {
@@ -2762,6 +2874,28 @@ describe("session admission under the per-session file source", () => {
     }
   });
 
+  test("with timings on, reports the launch's lifecycle-lock hold from where the lock was taken", async () => {
+    const input = fixture();
+    (input.context.env as Record<string, string>).RUNFREE_TIMINGS = "1";
+    mocks.containerInspect = { status: 0, stdout: runningInspect(), stderr: "" };
+    const output = captureOutput();
+    const clock = 500_000;
+    const driver = createInternalSessionAdmissionDriver({
+      ...input,
+      nowEpochMs: () => Date.parse("2026-08-09T00:10:00.000Z"),
+      nowMonotonicMs: () => clock,
+      lockHeldSinceMonotonicMs: clock - 4_321,
+    });
+
+    try {
+      await expect(driver.launchBuiltin("codex")).resolves.toEqual({ status: 0, signal: null });
+      const lines = output.drain().map((line) => line.slice(Math.max(0, line.indexOf("timing: "))));
+      expect(lines).toContain("timing: session-admission lifecycle-lock-hold-ms=4321");
+    } finally {
+      output.restore();
+    }
+  });
+
   test("with timings on, reports admission-ops categories that sum to the docker operations before the agent", async () => {
     const input = fixture();
     (input.context.env as Record<string, string>).RUNFREE_TIMINGS = "1";
@@ -2809,6 +2943,7 @@ describe("session admission under the per-session file source", () => {
       return {
         lifecycleLock: input.sessionLockManager.lock,
         lockOwnerToken: input.sessionLockManager.lock.ownerToken,
+        lockAcquiredAtMonotonicMs: performance.now(),
         proxy: { id: PROXY_ID, startedAt: PROXY_STARTED_AT },
         registryDigest: sessionRegistryDigest("/state", EXPECTED_PROJECT),
         inventoryClean: true,
@@ -3987,6 +4122,95 @@ describe("session admission under the per-session file source", () => {
         const lines = output.drain();
         expect(lines.filter((line) => line.includes(`did not hand off to the agent within ${SESSION_HANDOFF_WAIT_CEILING_MS} ms`)))
           .toHaveLength(1);
+      } finally {
+        output.restore();
+      }
+    });
+
+    test.each([
+      ["a lock this launch took itself", "lockHeldSinceMonotonicMs"],
+      ["a lock startup handed off", "handoff"],
+    ] as const)("under %s, the entry-handoff wait ends at the launch's lock-hold deadline, before the ceiling", async (_label, source) => {
+      const output = captureOutput();
+      const input = fixture();
+      mocks.containerInspect = { status: 0, stdout: runningInspect(), stderr: "" };
+      mocks.effectAnswers.set(`docker:container inspect ${PROXY_ID}`, [{
+        status: 0,
+        stdout: JSON.stringify([{ Id: PROXY_ID, State: { Running: true, StartedAt: "2026-08-09T00:00:00.000Z" } }]),
+        stderr: "",
+      }]);
+      mocks.effectAnswers.set(TOP_LABEL, [topAnswer("entry")]);
+      // The clock stands still until the first poll, so the whole admission
+      // before the wait appears to take no time; the hold started long ago,
+      // leaving 3 s of the budget for the wait.
+      let clock = 1_000_000;
+      const heldSince = clock - (LAUNCH_LOCK_HOLD_BUDGET_MS - 3_000);
+      mocks.topCommand.mockImplementation(() => {
+        clock += 1_000;
+        return { executable: "docker", args: ["container", "top", CONTAINER_ID, "-o", "pid,ppid,args"] };
+      });
+      const foreground = attachableForeground();
+      const driver = createInternalSessionAdmissionDriver({
+        ...input,
+        sessionLockManager: orderedSessionLockManager(input.sessionLockManager),
+        nowEpochMs: () => Date.parse("2026-08-09T00:10:00.000Z"),
+        nowMonotonicMs: () => clock,
+        ...(source === "handoff"
+          ? {
+              handoff: {
+                lifecycleLock: input.sessionLockManager.lock,
+                lockOwnerToken: input.sessionLockManager.lock.ownerToken,
+                lockAcquiredAtMonotonicMs: heldSince,
+                proxy: { id: PROXY_ID, startedAt: "2026-08-09T00:00:00.000Z" },
+                registryDigest: sessionRegistryDigest("/state", EXPECTED_PROJECT),
+                inventoryClean: true,
+                reservedSourceIps: [],
+              },
+            }
+          : { lockHeldSinceMonotonicMs: heldSince }),
+      });
+      try {
+        const launch = driver.launchBuiltin("codex");
+        await vi.waitFor(() => expect(mocks.events).toContain("release-attached-lock"));
+        foreground.end({ kind: "exit", code: 0, signal: null });
+        await expect(launch).resolves.toEqual({ status: 0, signal: null });
+        // Three 1 s polls use the 3 s that were left; the 10 s ceiling was
+        // never reached.
+        expect(tops()).toBe(3);
+        const topTimeouts = (input.io.capture as Mock).mock.calls
+          .filter(([, args]) => (args as string[])[0] === "container" && (args as string[])[1] === "top")
+          .map(([, , options]) => (options as { timeout: number }).timeout);
+        expect(Math.max(...topTimeouts)).toBeLessThanOrEqual(3_000);
+        expect(mocks.events.indexOf("transition-attached")).toBeGreaterThan(mocks.events.lastIndexOf(TOP_LABEL));
+        expect(mocks.events.indexOf("release-attached-lock")).toBeGreaterThan(mocks.events.indexOf("transition-attached"));
+        const lines = output.drain();
+        expect(lines.filter((line) => line.includes("had to release the project lifecycle lock"))).toHaveLength(1);
+        expect(lines.join("\n")).not.toContain(`within ${SESSION_HANDOFF_WAIT_CEILING_MS} ms`);
+      } finally {
+        output.restore();
+      }
+    });
+
+    test("a hold budget already spent reports attached without waiting on the entry", async () => {
+      const output = captureOutput();
+      const input = fixture();
+      mocks.effectAnswers.set(TOP_LABEL, [topAnswer("entry")]);
+      const clock = 1_000_000;
+      const foreground = attachableForeground();
+      const driver = createInternalSessionAdmissionDriver({
+        ...input,
+        sessionLockManager: orderedSessionLockManager(input.sessionLockManager),
+        nowMonotonicMs: () => clock,
+        lockHeldSinceMonotonicMs: clock - LAUNCH_LOCK_HOLD_BUDGET_MS - 1,
+      });
+      try {
+        const launch = driver.launchBuiltin("codex");
+        await vi.waitFor(() => expect(mocks.events).toContain("release-attached-lock"));
+        foreground.end({ kind: "exit", code: 0, signal: null });
+        await expect(launch).resolves.toEqual({ status: 0, signal: null });
+        expect(tops()).toBe(0);
+        expect(mocks.transitionAttached).toHaveBeenCalledTimes(1);
+        expect(output.drain().filter((line) => line.includes("had to release the project lifecycle lock"))).toHaveLength(1);
       } finally {
         output.restore();
       }

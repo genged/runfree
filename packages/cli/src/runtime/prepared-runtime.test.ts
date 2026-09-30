@@ -341,6 +341,7 @@ function handoffFor(prepared: ReturnType<typeof fixture>, lock: ProjectLifecycle
   return {
     lifecycleLock: lock,
     lockOwnerToken: lock.ownerToken,
+    lockAcquiredAtMonotonicMs: performance.now(),
     proxy: { id: prepared.proof.proxyId, startedAt: "2026-06-13T00:00:00.000Z" },
     registryDigest: `sha256:${"0".repeat(64)}`,
     inventoryClean: true,

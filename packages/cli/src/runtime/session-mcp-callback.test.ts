@@ -4,7 +4,7 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 
-import { afterEach, beforeEach, describe, expect, test } from "vitest";
+import { afterEach, beforeEach, describe, expect, test, vi, type Mock } from "vitest";
 
 import { CliError } from "../errors.ts";
 import { projectHash } from "./env.ts";
@@ -206,6 +206,81 @@ describe("prepareSessionMcpCallback", () => {
       probe: probeOk,
     })).rejects.toThrow("pull access denied");
     expect(docker.dockerRuns()).toHaveLength(1);
+  });
+
+  test("cuts every setup Docker call off at what is left of its budget, and hands the probe the same deadline", async () => {
+    const docker = fake();
+    let clock = 5_000;
+    const probe = vi.fn(async () => ({ status: 0, stdout: "", stderr: "" }));
+    await prepareSessionMcpCallback(contextWith(true), docker.io, OWNER, {
+      hostPortFree: allFree,
+      probe,
+      budgetMs: 12_000,
+      nowMs: () => (clock += 100),
+    });
+
+    const calls = [
+      ...(docker.io.capture as Mock).mock.calls,
+      ...(docker.io.run as Mock).mock.calls,
+    ] as Array<[string, string[], { timeout?: number; killSignal?: string }]>;
+    const setupCalls = calls.filter(([, args]) => args[0] !== "rm");
+    expect(setupCalls.map(([, args]) => args[0])).toEqual(expect.arrayContaining(["ps", "run", "exec"]));
+    for (const [, , options] of setupCalls) {
+      expect(options.killSignal).toBe("SIGKILL");
+      expect(options.timeout).toBeGreaterThan(0);
+      expect(options.timeout).toBeLessThanOrEqual(12_000);
+    }
+    // The deadline was fixed when the setup started.
+    expect(probe).toHaveBeenCalledWith(expect.any(Number), expect.any(String), 5_100 + 12_000, expect.any(Function));
+  });
+
+  test("a docker run the budget cuts off still has its forwarder removed by owner binding, and the launch fails", async () => {
+    const docker = fake();
+    let clock = 0;
+    const base = (docker.io.capture as Mock).getMockImplementation() as (command: string, args: string[]) => unknown;
+    (docker.io.capture as Mock).mockImplementation((command: string, args: string[], options: { timeout?: number }) => {
+      if (args[0] !== "run") return base(command, args);
+      // The daemon creates the forwarder, but the CLI is killed at the
+      // deadline before it reports the container id.
+      base(command, args);
+      clock += options.timeout ?? 0;
+      return { status: 124, stdout: "", stderr: "" };
+    });
+    const failure = await prepareSessionMcpCallback(contextWith(true), docker.io, OWNER, {
+      hostPortFree: allFree,
+      probe: probeOk,
+      budgetMs: 12_000,
+      nowMs: () => clock,
+    }).catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(CliError);
+    expect((failure as Error).message).toContain("retry the command");
+    // One try only: a cut-off run is not a publication conflict.
+    expect(docker.dockerRuns()).toHaveLength(1);
+    expect(docker.removed()).toHaveLength(1);
+    expect(docker.containers.filter((container) => container.Config?.Labels?.["io.runfree.ingress-purpose"] === "mcp-callback")).toEqual([]);
+    // The removal ran after the budget was spent, so it was not cut off.
+    const removal = (docker.io.capture as Mock).mock.calls.find(([, args]) => (args as string[])[0] === "rm");
+    expect((removal?.[2] as { killSignal?: string } | undefined)?.killSignal).toBeUndefined();
+  });
+
+  test("a spent budget ends the port search before another forwarder is created", async () => {
+    const docker = fake();
+    let clock = 0;
+    const failure = await prepareSessionMcpCallback(contextWith(true), docker.io, OWNER, {
+      // Every port the host already uses, each check slow.
+      hostPortFree: async () => {
+        clock += 5_000;
+        return false;
+      },
+      probe: probeOk,
+      budgetMs: 12_000,
+      nowMs: () => clock,
+    }).catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(CliError);
+    expect((failure as Error).message).toContain("used its whole 12000 ms budget before a port was reserved");
+    expect(docker.dockerRuns()).toEqual([]);
   });
 
   test.each([

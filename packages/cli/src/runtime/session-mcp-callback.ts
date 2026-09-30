@@ -15,13 +15,15 @@
 // session id and the exact session container id in its environment — so no
 // forwarder ever exists without it, and crash recovery finds it by listing.
 // The session's lifecycle record keeps reserving the target address; the
-// shared ordered teardown removes the forwarder before that record, so an
-// address is never released while a route to it survives.
+// shared ordered teardown removes the forwarder before that record, and the
+// orphan sweeps remove it before a container no record claims, so an address
+// is never released while a route to it survives.
 //
 // The port is a routing value, not an authority. The client keeps OAuth
 // state, PKCE, and issuer validation; the proxy keeps egress and tokens. A
 // session that damages its own bridge or port file only breaks its own login.
 
+import type * as childProcess from "node:child_process";
 import crypto from "node:crypto";
 import net from "node:net";
 
@@ -29,6 +31,7 @@ import { CliError } from "../errors.ts";
 import { dockerClientEnvOptions, parseDockerJson } from "./docker.ts";
 import { projectHash } from "./env.ts";
 import { ingressForwarderName, startIngressForwarder } from "./ingress-forwarder.ts";
+import { SESSION_CALLBACK_SETUP_BUDGET_MS } from "./launch-lock-hold.ts";
 import { removeValidatedIngressForwarders } from "./ingress-forwarder-ownership.ts";
 import { mcpOAuthCallbackPort, runtimeMcpOAuthPolicyHasServers } from "./mcp.ts";
 import { probeMcpCallbackPathWithRetries, startMcpCallbackBridgeInContainer } from "./probes.ts";
@@ -151,8 +154,32 @@ function sessionCallbackRetry(detail: string): CliError {
 
 type PrepareDependencies = Readonly<{
   hostPortFree?: (port: number) => Promise<boolean>;
-  probe?: (port: number, challenge: string) => Promise<CaptureResult>;
+  probe?: (port: number, challenge: string, deadlineMs: number, nowMs: () => number) => Promise<CaptureResult>;
+  /** Monotonic clock for the setup budget; defaults to `performance.now`. */
+  nowMs?: () => number;
+  /** The whole setup's budget; defaults to `SESSION_CALLBACK_SETUP_BUDGET_MS`. */
+  budgetMs?: number;
 }>;
+
+/**
+ * The setup's Docker calls, each cut off (SIGKILL) at the time left in the
+ * setup budget, and refused once it is spent, so the setup never stretches a
+ * launch's hold of the lifecycle lock (`launch-lock-hold.ts`). Only the setup
+ * steps use it: removing what the setup created runs on the caller's io, so a
+ * spent budget never leaves a forwarder behind for want of time to remove it.
+ */
+function withSetupDeadline(io: RuntimeIO, remainingMs: () => number, budgetMs: number): RuntimeIO {
+  const bounded = (options: childProcess.SpawnSyncOptions | undefined): childProcess.SpawnSyncOptions => {
+    const left = Math.floor(remainingMs());
+    if (left <= 0) throw new Error(`the callback setup used its whole ${budgetMs} ms budget`);
+    return { ...(options ?? {}), timeout: Math.min(options?.timeout ?? left, left), killSignal: "SIGKILL" };
+  };
+  return {
+    ...io,
+    capture: (command, args, options) => io.capture(command, args, bounded(options)),
+    run: (command, args, options) => io.run(command, args, bounded(options)),
+  };
+}
 
 function removeCreatedResidue(context: RuntimeContext, io: RuntimeIO, projectId: string, name: string): void {
   // A publication conflict can leave the created, never-started container
@@ -192,12 +219,18 @@ export async function prepareSessionMcpCallback(
   assertOwner(owner);
   const projectId = projectHash(context.projectRoot);
   const { internalNetwork } = owner;
+  // Cleanup (removing what this call created) uses the caller's io; every
+  // setup step uses the deadline-bound one.
   const dockerInput = { io, dockerOptions: dockerClientEnvOptions(context), projectId } as const;
   const hostPortFree = deps.hostPortFree ?? hostLoopbackPortFree;
+  const nowMs = deps.nowMs ?? (() => performance.now());
+  const budgetMs = deps.budgetMs ?? SESSION_CALLBACK_SETUP_BUDGET_MS;
+  const deadlineMs = nowMs() + budgetMs;
+  const setupIo = withSetupDeadline(io, () => deadlineMs - nowMs(), budgetMs);
 
   // Ports this project's forwarders already publish are never candidates;
   // Docker's publication conflict covers every other process on the host.
-  const held = new Set(inspectCallbackForwarders(dockerInput).forwarders
+  const held = new Set(inspectCallbackForwarders({ ...dockerInput, io: setupIo }).forwarders
     .map(forwarderHostPort)
     .filter((port): port is number => port !== undefined));
   const candidates = sessionCallbackPortCandidates(context.projectRoot, owner.sessionId, held);
@@ -205,10 +238,13 @@ export async function prepareSessionMcpCallback(
   let endpoint: SessionCallbackEndpoint | undefined;
   let lastConflict = "";
   for (const port of candidates) {
+    if (nowMs() >= deadlineMs) {
+      throw sessionCallbackRetry(`the callback setup used its whole ${budgetMs} ms budget before a port was reserved`);
+    }
     if (!(await hostPortFree(port))) continue;
     const name = ingressForwarderName(projectId, MCP_CALLBACK_PURPOSE, String(port));
     try {
-      startIngressForwarder(context, io, {
+      startIngressForwarder(context, setupIo, {
         purpose: MCP_CALLBACK_PURPOSE,
         projectId,
         hostPort: String(port),
@@ -248,9 +284,9 @@ export async function prepareSessionMcpCallback(
   }
 
   try {
-    const allowedPeerIp = forwarderInternalAddress(context, io, endpoint.forwarderName, internalNetwork);
+    const allowedPeerIp = forwarderInternalAddress(context, setupIo, endpoint.forwarderName, internalNetwork);
     const challenge = crypto.randomBytes(24).toString("base64url");
-    const bridge = startMcpCallbackBridgeInContainer(context, io, {
+    const bridge = startMcpCallbackBridgeInContainer(context, setupIo, {
       containerId: owner.containerId,
       bindIp: owner.sourceIp,
       port: endpoint.port,
@@ -258,7 +294,7 @@ export async function prepareSessionMcpCallback(
       allowedPeerIp,
     });
     if (bridge !== 0) throw new Error(`the in-session callback bridge did not start (exit ${bridge})`);
-    const probe = await (deps.probe ?? probeMcpCallbackPathWithRetries)(endpoint.port, challenge);
+    const probe = await (deps.probe ?? probeMcpCallbackPathWithRetries)(endpoint.port, challenge, deadlineMs, nowMs);
     if (probe.status !== 0) {
       throw new Error(`http://127.0.0.1:${endpoint.port} did not reach the session (${probe.stderr || "no echo"})`);
     }
