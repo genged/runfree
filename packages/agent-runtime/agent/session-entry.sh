@@ -29,7 +29,9 @@ set -u
 RUNFREE_SESSION_ENTRY_TIMEOUT_EXIT=111
 RUNFREE_SESSION_ENTRY_USAGE_EXIT=64
 RUNFREE_SESSION_ENTRY_DEFAULT_TIMEOUT_MS=60000
-RUNFREE_SESSION_ENTRY_POLL_SLEEP=0.25
+# Between probe runs. A run itself retries for up to 2 s (see
+# session-ready-probe), so this pause only spaces runs out.
+RUNFREE_SESSION_ENTRY_POLL_SLEEP=0.02
 RUNFREE_SESSION_ENTRY_NOTICE_AFTER_S=2
 
 if [ "$#" -eq 0 ]; then
@@ -74,10 +76,11 @@ probe="$entry_dir/session-ready-probe"
 # PID 1 entry would ignore `docker stop` until the SIGKILL.
 #
 # Children run in the background and are awaited: a shell whose `wait` is
-# interruptible runs the trap at once, and one that is not (dash) runs it as
-# soon as the current child returns. Every child is bounded (the
-# probe by its own 2 s total timeout, the pause by its 250 ms sleep), so a stop
-# lands within one poll cycle either way. The handler ends the child first.
+# interruptible (dash and bash both are) runs the trap at once, and one that
+# is not would run it as soon as the current child returns. Every child is
+# bounded (a probe run by its own 2 s total budget, the pause by its 20 ms
+# sleep), so a stop lands within one probe run either way. The handler ends
+# the child first.
 child=""
 on_term() {
   [ -n "$child" ] && kill "$child" 2>/dev/null

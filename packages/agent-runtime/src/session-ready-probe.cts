@@ -10,8 +10,8 @@
 // is the entrypoint test at the bottom: `import.meta` is not available in a
 // file that compiles to CommonJS, so `require.main === module` stays.
 //
-// Opens one TCP connection to the request proxy at `PROXY_IP` and sends the
-// exact admission readiness request from
+// Each attempt opens one TCP connection to the request proxy at `PROXY_IP` and
+// sends the exact admission readiness request from
 // `packages/runtime-contracts/src/session-admission.ts`
 // (`SESSION_ADMISSION_PROVISIONING_REQUEST`), byte for byte. The bytes are
 // embedded here because the agent image carries no contracts package; a unit
@@ -20,24 +20,40 @@
 // The proxy answers the request locally in every state and forwards nothing:
 //   200 with the body `active` once this session's file is served;
 //   403 for an unknown, expired, or removed peer.
-// Before the session file lands the firewall drops the connection outright, so
-// the ordinary sequence a session sees is exit 4 (dropped) until exit 0.
+// Before the session file lands the firewall drops the SYN outright (no RST),
+// so the ordinary sequence a session sees is "dropped" until `active`. Between
+// the firewall admitting the address and the request proxy serving the file
+// the answer can be a 403, since the two consumers reconcile independently.
 //
-// Exit codes (for logs; the entry treats every non-zero code the same):
+// One run retries (launch plan Task 7). A dropped SYN is only retransmitted
+// after Linux's 1 s initial RTO, so a single attempt started before the file
+// landed used to hold the entry for its whole 1 s connect timeout. A run now
+// makes attempts with short connect timeouts (`ATTEMPT_CONNECT_TIMEOUTS_MS`,
+// escalating so a loaded host still connects) and a `RETRY_PAUSE_MS` pause,
+// retrying every answer except `active`, until one `TOTAL_TIMEOUT_MS` budget
+// for the whole run is spent. A connected attempt may use the rest of that
+// budget for its answer.
+//
+// Exit codes (for logs; the entry treats every non-zero code the same). A
+// run's code is its last attempt's:
 //   0  active
 //   3  refused (403)
 //   4  connect failure or timeout
 //   5  any other answer
 //  64  PROXY_IP is not an IPv4 literal (refused before any connection)
 //
-// The probe performs no DNS lookup, opens no other connection, reads no file,
-// and sends no other bytes.
+// The probe performs no DNS lookup, reads no file, connects only to
+// `PROXY_IP`, and sends no bytes but the readiness request, once per
+// connection.
 
 import net from "node:net";
 
 export const PROXY_PORT = 8080;
-const CONNECT_TIMEOUT_MS = 1_000;
-const TOTAL_TIMEOUT_MS = 2_000;
+/** Per-attempt connect timeouts; attempts past the list use the remaining budget. */
+export const ATTEMPT_CONNECT_TIMEOUTS_MS: readonly number[] = Object.freeze([150, 150, 300, 300, 600]);
+export const RETRY_PAUSE_MS = 20;
+/** The whole run's budget, every attempt and pause included. */
+export const TOTAL_TIMEOUT_MS = 2_000;
 const RESPONSE_LIMIT_BYTES = 4_096;
 const READINESS_HOST = "runfree-provisioning.invalid";
 const READINESS_PATH = "/.well-known/runfree/session-ready";
@@ -72,7 +88,18 @@ function classifyResponse(raw: Buffer): number {
   return EXIT_UNEXPECTED;
 }
 
-function probe(options: Readonly<{ host: string; port: number }>): Promise<number> {
+/** Opens one connection, like `net.connect`; a test seam for a dropped SYN. */
+export type ProbeConnect = (options: Readonly<{ host: string; port: number; family: 4 }>) => net.Socket;
+
+type AttemptOptions = Readonly<{
+  host: string;
+  port: number;
+  connect: ProbeConnect;
+  connectTimeoutMs: number;
+  totalTimeoutMs: number;
+}>;
+
+function attempt(options: AttemptOptions): Promise<number> {
   return new Promise((resolve) => {
     const chunks: Buffer[] = [];
     let received = 0;
@@ -87,9 +114,9 @@ function probe(options: Readonly<{ host: string; port: number }>): Promise<numbe
     };
     const answer = (): number => (chunks.length === 0 ? EXIT_UNREACHABLE : classifyResponse(Buffer.concat(chunks)));
     // An IPv4 literal with `family: 4` never enters a resolver.
-    const socket = net.connect({ host: options.host, port: options.port, family: 4 });
-    const connectTimer = setTimeout(() => finish(EXIT_UNREACHABLE), CONNECT_TIMEOUT_MS);
-    const totalTimer = setTimeout(() => finish(EXIT_UNREACHABLE), TOTAL_TIMEOUT_MS);
+    const socket = options.connect({ host: options.host, port: options.port, family: 4 });
+    const connectTimer = setTimeout(() => finish(EXIT_UNREACHABLE), options.connectTimeoutMs);
+    const totalTimer = setTimeout(() => finish(EXIT_UNREACHABLE), options.totalTimeoutMs);
     socket.once("connect", () => {
       clearTimeout(connectTimer);
       socket.write(READINESS_REQUEST, "latin1");
@@ -106,6 +133,35 @@ function probe(options: Readonly<{ host: string; port: number }>): Promise<numbe
     socket.once("close", () => finish(answer()));
     socket.once("error", () => finish(answer()));
   });
+}
+
+/**
+ * One probe run: attempts until the proxy answers `active` or the run's one
+ * total budget is spent, and returns the last attempt's code.
+ */
+export async function probeUntilActive(options: Readonly<{
+  host: string;
+  port: number;
+  connect?: ProbeConnect;
+  nowMs?: () => number;
+}>): Promise<number> {
+  const connect = options.connect ?? ((connectOptions) => net.connect(connectOptions));
+  const nowMs = options.nowMs ?? (() => performance.now());
+  const deadline = nowMs() + TOTAL_TIMEOUT_MS;
+  let code = EXIT_UNREACHABLE;
+  for (let index = 0; ; index += 1) {
+    const remaining = deadline - nowMs();
+    if (remaining <= 0) return code;
+    code = await attempt({
+      host: options.host,
+      port: options.port,
+      connect,
+      connectTimeoutMs: Math.min(ATTEMPT_CONNECT_TIMEOUTS_MS[index] ?? remaining, remaining),
+      totalTimeoutMs: remaining,
+    });
+    if (code === EXIT_ACTIVE || deadline - nowMs() <= RETRY_PAUSE_MS) return code;
+    await new Promise((resolve) => setTimeout(resolve, RETRY_PAUSE_MS));
+  }
 }
 
 function parsePort(value: string | undefined): number | undefined {
@@ -128,7 +184,7 @@ async function main(): Promise<number> {
     process.stderr.write("session-ready-probe: RUNFREE_SESSION_READY_PROBE_PORT must be a TCP port\n");
     return EXIT_USAGE;
   }
-  return await probe({ host, port });
+  return await probeUntilActive({ host, port });
 }
 
 if (require.main === module) {
