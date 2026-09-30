@@ -42,6 +42,7 @@ import {
 } from "./sessions.ts";
 import { flushWarnings } from "../warnings.ts";
 import { RUNNING_PROOF_TIMEOUT_MS, SESSION_HANDOFF_WAIT_CEILING_MS } from "./session-admission-driver.ts";
+import { WARM_TOKEN_SYNC_CALL_TIMEOUT_MS, WARM_TOKEN_SYNC_TOTAL_TIMEOUT_MS } from "./constants.ts";
 import type { RuntimeContext, RuntimeIO } from "./types.ts";
 
 const BOOT_A = "linux:11111111-2222-3333-4444-555555555555";
@@ -1359,4 +1360,10 @@ test("a launch's entry-handoff wait holds the lifecycle lock for at most a third
   // The launch's longest deliberate waits under that lock, together: the
   // running proof, then the handoff.
   expect(RUNNING_PROOF_TIMEOUT_MS + SESSION_HANDOFF_WAIT_CEILING_MS).toBeLessThan(PROJECT_LIFECYCLE_LOCK_RETRY_WINDOW_MS);
+  // A launch handoff (sub-second launch plan Task 3) keeps startup's lock
+  // through its receipt-gated token sync into admission, so that sync's own
+  // bound joins the same continuous hold.
+  expect(WARM_TOKEN_SYNC_CALL_TIMEOUT_MS).toBeLessThanOrEqual(WARM_TOKEN_SYNC_TOTAL_TIMEOUT_MS);
+  expect(WARM_TOKEN_SYNC_TOTAL_TIMEOUT_MS + RUNNING_PROOF_TIMEOUT_MS + SESSION_HANDOFF_WAIT_CEILING_MS)
+    .toBeLessThan(PROJECT_LIFECYCLE_LOCK_RETRY_WINDOW_MS);
 });

@@ -23,6 +23,18 @@ export const PROXY_SERVER_UID_GID = `${PROXY_SERVER_UID}:${PROXY_SERVER_GID}`;
  */
 export const TOKEN_SYNC_DEFERRED_STATUS = 75;
 
+/**
+ * Bounds on the receipt-gated warm-launch sync, which runs while the project
+ * lifecycle lock is held and, with a launch handoff, keeps holding it into
+ * admission (sub-second launch plan Tasks 3 and 5). It resolves no source, so
+ * only Docker calls count against these. Per child process, and for the whole
+ * sync: past the total the next call is not started and the sync defers to
+ * the unlocked source-truth order. Sized so this sync, the running proof, and
+ * the entry-handoff wait together stay inside another command's lock wait.
+ */
+export const WARM_TOKEN_SYNC_CALL_TIMEOUT_MS = 10_000;
+export const WARM_TOKEN_SYNC_TOTAL_TIMEOUT_MS = 12_000;
+
 export const RUNTIME_VALIDATION_MARKER_PATH = "/run/runfree-runtime-validation.json";
 export const AGENT_BASE_IMAGE_ROLE = "agent-base";
 export const AGENT_RUNTIME_IMAGE_ROLE = "agent-runtime";
