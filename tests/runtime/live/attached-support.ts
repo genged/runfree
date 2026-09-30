@@ -233,7 +233,7 @@ export const AGENT_START_TIMEOUT_MS = 75_000;
 export async function awaitAgentStarted(containerId: string, label: string): Promise<void> {
   const deadline = Date.now() + AGENT_START_TIMEOUT_MS;
   for (;;) {
-    const state = docker(["inspect", "-f", "{{.State.Pid}} {{.HostConfig.Init}} {{.State.Status}} exit={{.State.ExitCode}}", containerId]);
+    const state = docker(["inspect", "-f", "{{.State.Pid}} {{json .HostConfig.Init}} {{.State.Status}} exit={{.State.ExitCode}}", containerId]);
     const [pid, init, status] = state.stdout.trim().split(/\s+/u);
     if (state.status === 0 && status !== "running") {
       throw new Error(`${label}: the session container stopped before its agent started (${state.stdout.trim()})`);

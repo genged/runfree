@@ -460,7 +460,7 @@ directory, and the driver's ladder is:
 8. **Teardown** stamps the record terminal, deletes the file, disconnects,
    stops, removes the container, and only then removes the record.
 
-The project lifecycle lock covers steps 1–5 and teardown. It is released once
+The project lifecycle lock covers steps 1–6 and teardown. It is released once
 the session is `attached`; it is not held for the interactive process lifetime.
 The foreground admission driver requires a `SessionLockManager`; it has no
 raw-lock or optional lock-lease input that can retain the project lock across

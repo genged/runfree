@@ -120,9 +120,10 @@ done
 
 # The handoff. The host keeps the launch's lifecycle lock, and reports the
 # session `attached`, until it observes (with a daemon-side `docker container
-# top`, never an exec) that no process runs this entry any more. So this exec
-# must stay the entry's last act once the probe has answered active: anything
-# the entry did in between would run while the session is already served but
-# not yet reported attached. Changing the poll above (its sleep, its probe)
+# top`, never an exec) that the container's anchored process — the init's
+# child, or PID 1 in a container without the init — no longer runs this
+# entry, or until a 10 s ceiling. So this exec must stay the entry's last act
+# once the probe has answered active: anything the entry did in between would
+# run while the session is already served but not yet reported attached. Changing the poll above (its sleep, its probe)
 # only changes how soon this line is reached.
 exec "$@"

@@ -14,10 +14,11 @@
 //     exec'd the agent, and a proxy lost inside that window is recovered after
 //     it, with the agent still starting.
 //
-// The project image slows the readiness probe (every poll sleeps first), which
-// widens the window between the grant and the entry's exec from well under a
-// second to seconds. That makes "attached before the handoff" observable,
-// rather than a race the test would usually lose.
+// The project image slows the readiness probe: once the real probe answers
+// `active`, the wrapper sleeps before returning, so the entry execs the agent
+// a fixed few seconds after the grant instead of well under a second. That
+// makes "attached before the handoff" observable rather than a race the test
+// would usually lose, and it stays inside the launch's 10 s handoff ceiling.
 //
 // Process state is read from the daemon (`docker container top`, `inspect`),
 // never by exec into the untrusted container, except where a case needs a
@@ -30,6 +31,7 @@ import path from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, test } from "vitest";
 
 import { parseSessionContainerTopHandoff } from "../../../packages/cli/src/runtime/session-container-docker.ts";
+import { SESSION_ENTRY_PATH } from "../../../packages/cli/src/runtime/session-launch.ts";
 import { stageLongLivedAgentBinary } from "./agent-stub.ts";
 import {
   FAST_HEARTBEAT_ENV,
@@ -56,8 +58,12 @@ import {
   type LiveFixture,
 } from "./fixture.ts";
 
-/** How long each readiness poll of the staged image waits before probing. */
-const SLOW_PROBE_DELAY_S = 3;
+/**
+ * How long the staged probe holds a successful answer before returning it —
+ * the minimum gap between the grant and the entry's exec. Below the launch's
+ * 10 s handoff ceiling with room for a slow daemon.
+ */
+const SLOW_PROBE_HOLD_S = 6;
 /** "Well under" Docker's 10 s stop timeout: an init that forwards SIGTERM. */
 const FAST_STOP_BOUND_MS = 5_000;
 /** The entry's own bound (60 s) plus a margin for a slow daemon. */
@@ -67,16 +73,26 @@ const SIGINT_EXIT = 130;
 const ENTRY_TIMEOUT_EXIT = 111;
 
 /**
- * Wraps the base image's readiness probe so each poll sleeps first.
+ * Wraps the base image's readiness probe so a successful poll is held before
+ * it is returned.
  *
  * The entry resolves the probe next to itself, so replacing the file in place
- * keeps the stock entry, which is the one under test.
+ * keeps the stock entry, which is the one under test. A failed poll returns at
+ * once, so the entry's own give-up bound is unchanged.
  */
 function stageSlowReadinessProbe(fixture: LiveFixture): void {
   const imageDir = path.join(fixture.projectRoot, ".runfree", "image");
   fs.writeFileSync(
     path.join(imageDir, "slow-session-ready-probe.sh"),
-    `#!/bin/sh\n# Live-fixture probe wrapper. Not a production artifact.\nsleep ${SLOW_PROBE_DELAY_S}\nexec /usr/local/libexec/runfree/session-ready-probe-real "$@"\n`,
+    [
+      "#!/bin/sh",
+      "# Live-fixture probe wrapper. Not a production artifact.",
+      '/usr/local/libexec/runfree/session-ready-probe-real "$@"',
+      "status=$?",
+      `if [ "$status" -eq 0 ]; then sleep ${SLOW_PROBE_HOLD_S}; fi`,
+      'exit "$status"',
+      "",
+    ].join("\n"),
     { mode: 0o755 },
   );
   fs.appendFileSync(path.join(imageDir, "Dockerfile"), [
@@ -95,10 +111,30 @@ function configureInitProject(fixture: LiveFixture): void {
   stageSlowReadinessProbe(fixture);
 }
 
+/**
+ * The in-container pid of the one child of PID 1 (Docker's init): the entry,
+ * then the agent. A `docker exec` process has parent 0 in the container's
+ * namespace, so it is never counted.
+ */
+function initChildArgv(containerId: string): readonly string[] {
+  const listed = docker([
+    "exec", "--user", "1000:1000", containerId, "sh", "-c",
+    'for d in /proc/[0-9]*; do [ "$(awk \'/^PPid:/ { print $2 }\' "$d/status" 2>/dev/null)" = 1 ] && echo "${d#/proc/}"; done; true',
+  ]);
+  const pids = listed.stdout.split("\n").map((line) => line.trim()).filter(Boolean);
+  if (listed.status !== 0 || pids.length !== 1) {
+    throw new Error(`expected exactly one child of the session init: ${describeOutput(listed.output)}`);
+  }
+  const cmdline = dockerOrThrow("read the init child's argv", [
+    "exec", "--user", "1000:1000", containerId, "cat", `/proc/${pids[0]}/cmdline`,
+  ]);
+  return cmdline.split("\0").filter(Boolean);
+}
+
 /** The daemon's handoff answer for one session container, the product's own read. */
 function handoffOf(containerId: string): string {
   const [pid, init] = dockerOrThrow("inspect the session anchor", [
-    "inspect", "-f", "{{.State.Pid}} {{.HostConfig.Init}}", containerId,
+    "inspect", "-f", "{{.State.Pid}} {{json .HostConfig.Init}}", containerId,
   ]).trim().split(/\s+/u);
   const top = dockerOrThrow("list the session processes", ["container", "top", containerId, "-o", "pid,ppid,args"]);
   return parseSessionContainerTopHandoff(top, { anchorPid: Number(pid), init: init === "true" });
@@ -160,6 +196,11 @@ describe("agent session containers run under Docker's init", () => {
       // entry still polling; the handoff-gated report finds the agent.
       expect(handoffOf(containerId), "the entry had not handed off when the launch reported attached")
         .toBe("handed-off");
+      // The same fact read independently of the product's parser: the init's
+      // child is no longer the entry.
+      expect(initChildArgv(containerId).slice(0, 2), "the init's child still runs the entry")
+        .not.toContain(SESSION_ENTRY_PATH);
+      expect(run.output(), "the handoff was observed, not assumed at the ceiling").not.toContain("did not hand off");
       expect(dockerOrThrow("inspect Init", ["inspect", "-f", "{{json .HostConfig.Init}}", containerId]).trim())
         .toBe("true");
     } finally {
@@ -230,6 +271,55 @@ describe("agent session containers run under Docker's init", () => {
     expect(parseLaunchReport(ended).outcome?.status ?? null, "the entry's exit is the launch outcome").toBe(ENTRY_TIMEOUT_EXIT);
   }, TEST_TIMEOUT_MS);
 
+  test("a lifecycle command started inside the handoff window runs only after the handoff", async () => {
+    const proxyId = composeServiceContainerId(project, "proxy");
+    const launch = startAttachedLaunch(fixture);
+    // The grant: the proxy serves the new session's file. The held probe keeps
+    // the entry from exec'ing the agent for several seconds after that.
+    await pollUntil(() => servedSourceIps(proxyId).length === 1, 180_000, "the session file to be served");
+    const upStarted = Date.now();
+    const up = startRunfree(fixture, ["up"]);
+    // Sample the handoff from the test's side while `up` waits for the lock.
+    let handedOffAt: number | undefined;
+    let containerId: string | undefined;
+    const sampler = (async () => {
+      while (handedOffAt === undefined) {
+        const ids = dockerOrThrow("list session containers", [
+          "ps", "-q", "--no-trunc", "--filter", "label=io.runfree.session-id",
+          "--filter", `label=io.runfree.compose-project=${project}`,
+        ]).trim().split("\n").filter(Boolean);
+        if (ids.length === 1) {
+          containerId = ids[0];
+          if (handoffOf(ids[0] as string) === "handed-off") handedOffAt = Date.now();
+        }
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+    })();
+    const upDone = await up.completion;
+    const upFinishedAt = Date.now();
+    await sampler;
+    expect(upDone.status, `up failed: ${describeOutput(upDone.output, 4000)}`).toBe(0);
+    // Without the handoff wait, `up` takes the lock at once and a warm `up`
+    // finishes inside the held window; with it, `up` cannot finish before the
+    // entry has handed off.
+    expect(handedOffAt, "the entry never handed off").toBeDefined();
+    expect(upFinishedAt, "up finished before the entry handed off").toBeGreaterThanOrEqual(handedOffAt as number);
+    expect(upFinishedAt - upStarted, "up waited out the held window").toBeGreaterThanOrEqual((SLOW_PROBE_HOLD_S - 1) * 1_000);
+    const run = await launch;
+    try {
+      expect(run.output(), "the handoff was observed, not assumed at the ceiling").not.toContain("did not hand off");
+    } finally {
+      if (containerId) docker(["kill", containerId]);
+      await launchEnded(run);
+    }
+  }, TEST_TIMEOUT_MS);
+
+  // Availability, not discrimination: once the proxy is gone the entry cannot
+  // hand off, so the launch reaches its handoff ceiling (or the entry's held
+  // probe was already past the proxy) and releases the lock; the recovery then
+  // restores the proxy and the heartbeat refills the file inside the entry's
+  // own 60 s bound. The case above is the one that tells the handoff wait
+  // apart from the old grant-time release.
   test("a proxy lost between the grant and the handoff is recovered after it, and the agent still starts", async () => {
     const proxyBefore = composeServiceContainerId(project, "proxy");
     const run = startAttachedLaunch(fixture, { extraEnv: FAST_HEARTBEAT_ENV });

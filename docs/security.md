@@ -244,8 +244,9 @@ Details: [Write Approval Grants](architecture.md#write-approval-grants).
 4. **Docker's init is PID 1, not a boundary.** A session container is created
    with `--init`, so PID 1 is Docker's `docker-init` (tini) and the session
    entry, then the agent, is its child. The init forwards the stop signal, so
-   `docker stop` ends a live agent at once (exit 143) instead of waiting out
-   the stop timeout for a PID 1 that ignores SIGTERM. It runs as the same
+   `docker stop` reaches a live agent at once (exit 143 when the agent dies
+   of the signal; an agent that handles it exits with its own status) instead
+   of waiting out the stop timeout for a PID 1 that ignores SIGTERM. It runs as the same
    uid 1000 with the same capabilities and `no-new-privileges`, so the agent
    gains nothing by reaching it. Its bind mount is added by the daemon and is
    outside the inspection proof; a project image can make PID 1 something
