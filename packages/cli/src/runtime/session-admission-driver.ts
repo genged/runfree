@@ -100,8 +100,12 @@ import {
   sessionContainerCreateCommand,
   sessionContainerInspectCommand,
   sessionContainerObservedExitStatus,
+  parseSessionContainerTopHandoff,
+  SESSION_CONTAINER_TOP_MAX_BYTES,
   sessionContainerStartAttachCommand,
+  sessionContainerTopCommand,
   sessionNetworkInspectCommand,
+  type SessionContainerTopHandoff,
   type SessionDockerCommand,
 } from "./session-container-docker.ts";
 import {
@@ -127,6 +131,7 @@ import {
 } from "./session-container-start.ts";
 import {
   bindSessionContainerCreatePlanRecord,
+  sessionContainerTemplateInit,
   type SessionContainerCreatePlan,
 } from "./session-container-template.ts";
 import {
@@ -179,6 +184,11 @@ import {
   type SessionLockManager,
 } from "./sessions.ts";
 import type { CaptureResult, RuntimeContext, RuntimeIO, SessionMetadata } from "./types.ts";
+import {
+  reclaimStaleSessionMcpCallbackForwarders,
+  removeSessionMcpCallbackIngress,
+} from "./session-callback-ingress.ts";
+import { sessionMcpCallbackLifecycle, type SessionIngressLifecycle } from "./session-mcp-callback.ts";
 import { remedy } from "../remedies.ts";
 
 const DEFAULT_INTERNAL_PROBE_LEASE_DURATION_MS = SESSION_ADMISSION_LEASE_MAX_DURATION_MS;
@@ -266,7 +276,25 @@ const FOREGROUND_EXIT_BRIDGE_TIMEOUT_MS = 1_000;
 // daemon can take longer than 5 s to start one. Widening the window admits
 // nothing earlier: the proof still requires the same exact running assertion,
 // and no session is authorized before it returns.
-const RUNNING_PROOF_TIMEOUT_MS = 30_000;
+export const RUNNING_PROOF_TIMEOUT_MS = 30_000;
+/**
+ * The longest a launch holds the project lifecycle lock after its grant while
+ * waiting for the session entry to hand off to the agent (`awaitHandoff`).
+ *
+ * Fixed, and far inside the window another command waits for the same lock
+ * (`PROJECT_LIFECYCLE_LOCK_RETRY_WINDOW_MS`, pinned by a unit test at no more
+ * than a third of it): an entry that never hands off — the project image may
+ * replace it — must never make a concurrent launch, `up`, or `destroy` in the
+ * same project give up. A healthy handoff takes well under a second.
+ */
+export const SESSION_HANDOFF_WAIT_CEILING_MS = 10_000;
+/** How often the handoff wait asks the daemon for the container's processes. */
+const SESSION_HANDOFF_POLL_MS = 100;
+/**
+ * The least time one handoff read is given, so a read started just before the
+ * ceiling is not cut off before the daemon can answer at all.
+ */
+const SESSION_HANDOFF_MIN_READ_MS = 250;
 
 class PostCompletionAdmissionRecoveryError extends Error {
   readonly outcome: SessionAdmissionLaunchOutcome;
@@ -332,23 +360,19 @@ export type InternalSessionAdmissionDriver = Readonly<{
   recoverPending(agent: SessionAdmissionProbeAgent): Promise<void>;
 }>;
 
-/**
- * Fired once a launched session holds authority and is running, before the
- * attached process is awaited. Generic and additive: the driver knows nothing
- * of what a caller does with it. `runfree mcp auth` uses it to stand up the
- * per-session OAuth callback against the session's now-known IP; other launches
- * pass nothing. It must not throw — a caller's side effect failing may not cost
- * the session its authority — so a hook owns its own error handling.
- */
-export type SessionRunningHook = (session: Readonly<{ containerId: string; sourceIp: string }>) => Promise<void> | void;
-
 export type InternalSessionAdmissionDriverInput = Readonly<{
   preparedRuntime: PreparedRuntime;
   /** The only lifecycle-lock authority accepted by a session driver. */
   sessionLockManager: SessionLockManager;
   io: RuntimeIO;
   foregroundSpawner?: SessionContainerForegroundSpawner;
-  onSessionRunning?: SessionRunningHook;
+  /**
+   * The session-owned ingress a launch sets up before activation (today the
+   * MCP OAuth callback path). Omitted: derived from the project — present only
+   * when an OAuth-capable MCP server needs a callback. `null`: none. Probes
+   * never set any up.
+   */
+  sessionIngress?: SessionIngressLifecycle | null;
   nowEpochMs?: () => number;
   nowMonotonicMs?: () => number;
   /**
@@ -412,6 +436,11 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
    */
   #fileRecord?: SessionContainerRecordV2;
   /**
+   * The provisioning-running record whose session file `activate` wrote, held
+   * until `awaitHandoff` reports it `attached`.
+   */
+  #admittedRecord?: SessionContainerRecordV2;
+  /**
    * The last session file this host actually published.
    *
    * The only evidence a failing beat has: a `retrying` stamp reports the
@@ -461,6 +490,12 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
   #handoffIpAssignments?: Readonly<Record<string, string>>;
   /** Present only in launch mode; probes must never leave user-facing session evidence. */
   #launch?: SessionAdmissionLaunchOptions;
+  /**
+   * Set before this launch starts creating its session-owned ingress, so
+   * unadmitted cleanup knows to prove that ingress absent before it releases
+   * the record — and with it the address the ingress targets.
+   */
+  #ingressMayExist = false;
   #displayIdentity?: Readonly<{ displayName: string; command: string; agentCommand: string }>;
   #sessionEvidence?: SessionMetadata;
 
@@ -619,7 +654,8 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
    *
    * The whole point of the confirmation: a `docker start
    * --attach` child can die on its own while the agent it was showing keeps
-   * running as PID 1 of a container this host can still inspect. So nothing is
+   * running (under Docker's init, or as PID 1 of a session created before the
+   * init wrapper) in a container this host can still inspect. So nothing is
    * concluded from the stream ending — one pinned inspection is spent, and only
    * what it proves decides. Never throws: a failed observation is a `wait`, the
    * same way the heartbeat treats one, because "this host could not look" is
@@ -1304,12 +1340,7 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
     // the state vanished under the held lifecycle lock.
     const effective = readEffectiveControlPlaneV2(this.#input.plan.paths.stateDir);
     if (!effective) throw new Error("session admission requires a durable effective control plane");
-    const authority = createControlPlaneInternalParticipantAuthority({
-      plan: this.#input.plan,
-      context: this.#input.context,
-      lifecycleLock: this.#input.lifecycleLock,
-      io: this.#gateway.io,
-    });
+    let authority = this.#participantAuthorityReclaimingStaleCallbacks();
     this.#ingressParticipants = authority.ingressParticipants;
     this.#participantNetwork = Object.freeze({
       networkId: authority.networkId,
@@ -1319,7 +1350,9 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
     // Sub-second launch plan Task 3: startup ran this same reconcile under the
     // lock this launch still holds. When nothing it saw needed repair and the
     // registry and proxy incarnation are still exactly what it left, repeating
-    // it (and the orphan sweep) would observe the same state again.
+    // it (and the orphan sweep) would observe the same state again. A settled
+    // reconcile revoked no dead owner, so no callback forwarder went away
+    // since the participant proof above was taken.
     const settledByHandoff = this.#settledByHandoff();
     if (settledByHandoff) {
       this.#reservedSessionFileIps = settledByHandoff.reservedSourceIps;
@@ -1347,6 +1380,19 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
       this.#lock();
       this.#assertNoQuarantinedSessionRecords();
       this.#cleanPreexistingOrphans();
+      if (reconciled.deadOwnersRevoked.length > 0) {
+        // Ending a dead owner's session also removed its callback forwarder, so
+        // the participant proof taken before reconcile names an endpoint that
+        // is gone. Take it again, under the same held lock, before the baseline.
+        this.#lock();
+        authority = createControlPlaneInternalParticipantAuthority({
+          plan: this.#input.plan,
+          context: this.#input.context,
+          lifecycleLock: this.#input.lifecycleLock,
+          io: this.#gateway.io,
+        });
+        this.#ingressParticipants = authority.ingressParticipants;
+      }
     }
     const records = listSessionContainerRecordsV2(
       this.#input.plan.paths.stateDir,
@@ -1396,6 +1442,43 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
   };
 
   /**
+   * The internal participant proof, after reclaiming dead callback routes.
+   *
+   * A callback forwarder whose session is gone (a killed launcher's leftover)
+   * makes the proof refuse. Only then — so the healthy path spends no Docker
+   * call on it — are forwarders that route to no running session removed under
+   * the held lock, and the proof is taken once more. With nothing to reclaim,
+   * the original refusal stands.
+   */
+  #participantAuthorityReclaimingStaleCallbacks(): ReturnType<typeof createControlPlaneInternalParticipantAuthority> {
+    const create = () => createControlPlaneInternalParticipantAuthority({
+      plan: this.#input.plan,
+      context: this.#input.context,
+      lifecycleLock: this.#input.lifecycleLock,
+      io: this.#gateway.io,
+    });
+    try {
+      return create();
+    } catch (refusal) {
+      let reclaimed = 0;
+      try {
+        this.#lock();
+        reclaimed = reclaimStaleSessionMcpCallbackForwarders({
+          io: this.#gateway.io,
+          dockerOptions: this.#dockerOptions(),
+          projectId: this.#input.plan.projectId,
+          internalNetwork: `${this.#input.plan.composeProjectName}_agent_internal`,
+        });
+      } catch (reclaimFailure) {
+        throw new AggregateError([refusal, reclaimFailure], refusal instanceof Error ? refusal.message : String(refusal));
+      }
+      if (reclaimed === 0) throw refusal;
+      this.#lock();
+      return create();
+    }
+  }
+
+  /**
    * The record's user-facing identity for this session kind.
    *
    * `command` is the short registry/display kind shared with proxy session
@@ -1424,10 +1507,17 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
    * into a permanent refusal instead of reserving anything.
    */
   #reservedSessionPoolAddresses(): readonly string[] {
-    if (this.#reservedSessionFileIps.length === 0) return [];
+    // Every address an ingress forwarder still splices to is reserved too, for
+    // any purpose and whatever its session's state: a forward or callback
+    // route that outlived its session must not reach the next session given
+    // that address.
+    const forwarderTargets = this.#ingressParticipants
+      .flatMap((participant) => participant.targetIp === undefined ? [] : [participant.targetIp]);
+    const candidates = [...new Set([...this.#reservedSessionFileIps, ...forwarderTargets])];
+    if (candidates.length === 0) return [];
     const prefix = this.#network().subnet.split("/")[0]?.split(".").slice(0, 3).join(".");
     if (prefix === undefined || prefix.length === 0) return [];
-    return this.#reservedSessionFileIps.filter((address) => address.startsWith(`${prefix}.`));
+    return candidates.filter((address) => address.startsWith(`${prefix}.`));
   }
 
   allocate = async (): Promise<void> => {
@@ -1692,7 +1782,8 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
    * leaves this session in the state its evidence supports:
    *
    *   written      authority granted; the durable record follows the file to
-   *                `attached` and the host stamps the lease it handed out;
+   *                `attached`, and the host stamps the lease it handed out,
+   *                once the entry has handed off (`awaitHandoff`);
    *   unavailable  the observation could not be made, so nothing was written
    *                and nothing is claimed — raised as the typed observation
    *                failure the launch ladder already fails closed on;
@@ -1722,10 +1813,25 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
         `session admission inspected a different container before granting authority: ${outcome.observation}`,
       );
     }
-    // The file now exists. Everything below it can still fail, and a failure
-    // that left the file behind would be a session the proxy serves under a
-    // record this launch is about to tear down — so the window is closed here
-    // rather than left to the caller's teardown to notice.
+    // The file now exists, and from here every failure takes it back through
+    // the ordered teardown (file first): `#fileMayExist` already routes the
+    // ladder there. The durable record stays provisioning-running until the
+    // entry has handed off (`awaitHandoff`).
+    this.#fileWritten = outcome.file;
+    this.#admittedRecord = record;
+  };
+
+  /**
+   * Reports the admitted session `attached`: the durable record, the plan
+   * bound to it, the host status stamp,.
+   *
+   * Called once, by `awaitHandoff`, after the entry has handed off (or the
+   * wait has ended without that answer). A failure here would leave a file the
+   * proxy serves under a record this launch is about to tear down, so the
+   * window is closed here rather than left to the caller's teardown to notice.
+   */
+  #confirmAttached = async (record: SessionContainerRecordV2): Promise<void> => {
+    const file = this.#require(this.#fileWritten, "admitted session file");
     try {
       const attached = transitionProvisioningRunningSessionContainerToAttachedV2(record);
       replaceExactSessionContainerRecordV2(
@@ -1737,19 +1843,125 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
       this.#advanceDurableRecord(attached, "provisioning create plan");
       // From here every beat re-proves the record the session actually holds.
       this.#fileRecord = attached;
-      this.#fileWritten = outcome.file;
+      this.#admittedRecord = undefined;
       this.#lock();
-      this.#stampSessionHostStatus(outcome.file, "served");
-      // The hook fires at the one moment it means something: the session holds
-      // authority and is running with a known container id and source IP.
-      const containerId = attached.containerId;
-      if (containerId !== undefined && this.#input.onSessionRunning !== undefined) {
-        await this.#input.onSessionRunning({ containerId, sourceIp: attached.sourceIp });
-      }
+      this.#stampSessionHostStatus(file, "served");
     } catch (error) {
       this.#deleteSessionFileBestEffort(record);
       throw error;
     }
+  };
+
+  /**
+   * One daemon-side read of whether the entry has handed off. Never throws:
+   * a failed read, a read that outlived `timeoutMs`, an unparseable answer,
+   * and a missing anchor are all `unreadable`. The read is synchronous, so its
+   * own timeout is what keeps the ceiling a real bound on the lock hold: a
+   * hung daemon or CLI is killed, not waited out.
+   */
+  #observeEntryHandoff(record: SessionContainerRecordV2, timeoutMs: number): SessionContainerTopHandoff {
+    try {
+      const anchor = this.#require(this.#fileAnchor, "session-file anchor");
+      const plan = this.#require(this.#plan, "session-container create plan");
+      const result = executeSessionDockerCommand(
+        sessionContainerTopCommand(record, this.#projectIdentity()),
+        (executable, args) => this.#gateway.io.capture(executable, [...args], {
+          ...this.#dockerOptions(SESSION_CONTAINER_TOP_MAX_BYTES),
+          timeout: timeoutMs,
+          killSignal: "SIGKILL",
+        }),
+      );
+      if (result.status !== 0) return "unreadable";
+      return parseSessionContainerTopHandoff(result.stdout, {
+        anchorPid: anchor.dockerPid,
+        init: sessionContainerTemplateInit(plan.template),
+      });
+    } catch {
+      return "unreadable";
+    }
+  }
+
+  /**
+   * Waits, still holding the lifecycle lock `activate` held, until the session
+   * entry has handed off to the agent, and only then reports `attached`.
+   *
+   * The gap this closes: the proxy serves the session from the moment its file
+   * is written, but the entry execs the agent only once its readiness probe
+   * has seen that. A proxy replacement landing in between — possible as soon
+   * as this launch released the lock — left the entry polling a proxy that no
+   * longer served it, and a recovery slower than the entry's own bound ended
+   * the session with exit 111 before the agent ever ran. Every lifecycle writer
+   * that could replace the proxy needs this lock, so holding it here moves the
+   * replacement after the handoff.
+   *
+   * The wait ends, and `attached` is reported, on the first of:
+   *
+   *   handed-off   the anchored process no longer runs the entry;
+   *   foreground   the foreground stream ended. Nothing is concluded here: the
+   *                attached wait's own lost-stream classification decides
+   *                whether the container exited or only the stream was lost,
+   *                exactly as it did before this step existed;
+   *   unreadable   the daemon's answer cannot say (reported once, unless the
+   *                foreground ends within the exit bridge: a container that
+   *                has just stopped has no process table to list);
+   *   ceiling      `SESSION_HANDOFF_WAIT_CEILING_MS` (reported once) — the
+   *                project image may replace the entry with one that never
+   *                execs, and no launch may hold the project lock for long.
+   *                Every daemon read is itself cut off at the time remaining,
+   *                so a hung daemon cannot stretch the hold past it.
+   *
+   * The process table read is container-controlled data, so it only ever
+   * decides *when* this launch reports; it grants nothing, and its text is
+   * never echoed.
+   */
+  awaitHandoff = async (): Promise<void> => {
+    this.#lock();
+    // The foreground ended before the grant: there is nothing to attach, and
+    // the attached wait returns that outcome.
+    if (this.#preAttachCompletion) return;
+    const record = this.#require(this.#admittedRecord, "admitted provisioning-running record");
+    const foreground = this.#require(this.#foreground, "foreground attach handle");
+    const startedAt = this.#nowMonotonicMs();
+    const remainingMs = (): number => SESSION_HANDOFF_WAIT_CEILING_MS - (this.#nowMonotonicMs() - startedAt);
+    let foregroundEnded = false;
+    void foreground.completion.then(() => { foregroundEnded = true; });
+    /** Waits up to `ms` for the foreground to end; true when it has. */
+    const foregroundEndsWithin = async (ms: number): Promise<boolean> => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([
+          foreground.completion,
+          new Promise<void>((resolve) => {
+            timer = setTimeout(resolve, Math.max(0, ms));
+            timer.unref?.();
+          }),
+        ]);
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+      return foregroundEnded || currentSessionContainerForegroundCompletion(foreground) !== undefined;
+    };
+    for (;;) {
+      this.#lock();
+      if (foregroundEnded || currentSessionContainerForegroundCompletion(foreground)) break;
+      const remaining = remainingMs();
+      if (remaining <= 0) {
+        warn(`the session entry did not hand off to the agent within ${SESSION_HANDOFF_WAIT_CEILING_MS} ms; reporting the session attached now (the proxy has not served it yet, or the project image replaces the Runfree session entry)`);
+        break;
+      }
+      const observed = this.#observeEntryHandoff(record, Math.max(remaining, SESSION_HANDOFF_MIN_READ_MS));
+      this.#lock();
+      if (observed === "handed-off") break;
+      if (observed === "unreadable") {
+        if (!await foregroundEndsWithin(FOREGROUND_EXIT_BRIDGE_TIMEOUT_MS)) {
+          warn("could not observe the session entry handing off to the agent; reporting the session attached now");
+        }
+        break;
+      }
+      if (await foregroundEndsWithin(Math.min(SESSION_HANDOFF_POLL_MS, remainingMs()))) break;
+    }
+    this.#lock();
+    await this.#confirmAttached(record);
   };
 
   /**
@@ -1784,7 +1996,31 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
   activate = async (): Promise<void> => {
     this.#lock();
     const provisioning = this.#require(this.#provisioningAuthorization, "provisioning-running authority");
+    await this.#prepareSessionIngress(provisioning.record);
+    this.#lock();
     await this.#admitThroughSessionFile(provisioning.record);
+  };
+
+  /**
+   * Sets up the session-owned ingress (the MCP OAuth callback path) while the
+   * session entry still waits, so no client starts before its callback port
+   * exists. Launch mode only; a failure fails the launch and the unadmitted
+   * cleanup that follows proves the ingress gone before the record goes.
+   */
+  #prepareSessionIngress = async (record: SessionContainerRecordV2): Promise<void> => {
+    if (!this.#launch) return;
+    const lifecycle = this.#input.sessionIngress === undefined
+      ? sessionMcpCallbackLifecycle(this.#input.context, this.#gateway.io)
+      : this.#input.sessionIngress;
+    if (!lifecycle) return;
+    const containerId = this.#require(record.containerId, "session container id");
+    this.#ingressMayExist = true;
+    await lifecycle.prepare({
+      sessionId: record.sessionId,
+      containerId,
+      sourceIp: record.sourceIp,
+      internalNetwork: this.#network().networkName,
+    });
   };
 
   /**
@@ -1901,6 +2137,27 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
         this.#foreground = undefined;
       } catch (error) {
         failures.push(error);
+      }
+    }
+    if (this.#ingressMayExist) {
+      // A route to this session's address must be proved gone before the
+      // record that reserves the address is released. When it cannot be, the
+      // record stays: this owner exits, and the next launch's reconcile runs
+      // the shared teardown, which retries the same removal first.
+      try {
+        removeSessionMcpCallbackIngress({
+          io: this.#gateway.io,
+          dockerOptions: this.#dockerOptions(),
+          projectId: preflight.expectedProject.projectId,
+          sessionId: record.sessionId,
+          sourceIp: record.sourceIp,
+        });
+        this.#ingressMayExist = false;
+      } catch (error) {
+        throw new AggregateError(
+          [...failures, error],
+          "unadmitted session cleanup kept its record because its MCP OAuth callback forwarder could not be proved removed",
+        );
       }
     }
     if (record.containerId && this.#creationReceipt) {
@@ -2055,12 +2312,13 @@ function timedSessionAdmissionLaunchSteps(
   histogram: OperationHistogram,
 ): SessionAdmissionLaunchSteps {
   const timed = (phase: string, fn: () => Promise<void>) => (): Promise<void> => timings.timeAsync(phase, fn);
-  // Activation is the last step before the session entry execs the agent, so
-  // the histogram at that point is exactly the admission's Docker work before
-  // agent start (plan Phase 0). The categories are verbs only and always sum
-  // to the gateway count printed beside them.
-  const activate = async (): Promise<void> => {
-    await timings.timeAsync("admission:activate", steps.activate);
+  // The handoff wait is the last step before the session entry execs the
+  // agent (it ends once the entry has handed off), so the histogram at that
+  // point is exactly the admission's Docker work before agent start (plan
+  // Phase 0), the handoff polls included. The categories are verbs only and
+  // always sum to the gateway count printed beside them.
+  const awaitHandoff = async (): Promise<void> => {
+    await timings.timeAsync("admission:await-handoff", steps.awaitHandoff);
     for (const line of histogram.lines()) timings.report("admission-ops", line);
     timings.report("session-admission", `docker-operations-before-agent=${steps.dockerOperationCount()}`);
   };
@@ -2072,7 +2330,8 @@ function timedSessionAdmissionLaunchSteps(
     allocate: timed("admission:allocate", steps.allocate),
     createStarted: timed("admission:create-started", steps.createStarted),
     proveRunning: timed("admission:prove-running", steps.proveRunning),
-    activate,
+    activate: timed("admission:activate", steps.activate),
+    awaitHandoff,
     cleanupUnadmitted: timed("admission:cleanup-unadmitted", steps.cleanupUnadmitted),
     awaitCompletion: steps.awaitCompletion,
     tearDown: timed("teardown:session-file", steps.tearDown),

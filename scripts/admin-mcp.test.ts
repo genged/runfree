@@ -6,9 +6,13 @@ import { afterEach, beforeEach, describe, expect, test } from "vitest";
 
 import type { PolicyJson } from "@runfree/runtime-contracts/network-policy";
 import { createAdminState } from "../packages/cli/src/admin/context.ts";
+import type { McpEnableInput } from "../packages/cli/src/admin/admin-core.ts";
+import { printable } from "../packages/cli/src/admin/mcp-admin.ts";
+import type { DiscoveryDeps } from "../packages/cli/src/admin/mcp-discovery.ts";
 import {
   mcpApproveIntent,
   mcpConfigureIntent,
+  mcpEnableIntent,
   mcpExplainIntent,
   mcpListIntent,
   mcpRulesIntent,
@@ -19,7 +23,6 @@ import {
   runAdminAction,
 } from "../packages/cli/src/admin/options.ts";
 import { projectHash } from "../packages/cli/src/project-identity.ts";
-import { mcpOAuthCallbackPort } from "../packages/cli/src/runtime/mcp.ts";
 import { flushWarnings } from "../packages/cli/src/warnings.ts";
 
 const repoRoot = path.resolve(new URL("..", import.meta.url).pathname);
@@ -655,6 +658,38 @@ describe("admin MCP runtime preparation", () => {
     expect(result.stdout).toContain("repo.example.com");
   });
 
+  test("mcp list and explain show a portable node_repl without claiming an image or live check", async () => {
+    writeCodexNative([
+      "[mcp_servers.node_repl]",
+      'command = "/Applications/Codex.app/Contents/Resources/node_repl"',
+      "args = []",
+      "startup_timeout_sec = 120",
+      "",
+      "[mcp_servers.node_repl.env]",
+      'NODE_REPL_NODE_PATH = "/Applications/Codex.app/Contents/Resources/node"',
+      "",
+    ].join("\n"));
+
+    const list = await runAdmin(() => mcpListIntent({ json: false }));
+    expect(list.status, list.stderr).toBe(0);
+    expect(list.stdout).toMatch(/node_repl\s+stdio \(node-repl\)\s+none\s+imported/);
+
+    const explain = await runAdmin(() => mcpExplainIntent({ agent: parseMcpAgent("codex"), server: "node_repl", source: parseMcpSource("user"), json: false }));
+    expect(explain.status, explain.stderr).toBe(0);
+    expect(explain.stdout).toContain("execution: portable container capability node-repl (contract 1)");
+    expect(explain.stdout).toContain("source path: ignored; no host executable runs");
+    expect(explain.stdout).toContain("image check: not run against the selected agent image");
+    expect(explain.stdout).toContain("not covered by proxy MCP operation policy or write approval");
+    expect(explain.stdout).not.toContain("NODE_REPL_NODE_PATH");
+    expect(explain.stdout).not.toContain("Codex.app");
+
+    // STDIO tool calls never pass the proxy, so MCP rules are refused before any write.
+    const rules = await runAdmin(() => mcpRulesIntent({ agent: parseMcpAgent("codex"), server: "node_repl", source: parseMcpSource("user"), write: "allow" }));
+    expect(rules.status).toBe(1);
+    expect(rules.stderr).toContain("MCP rules apply only to HTTP MCP servers imported through the proxy");
+    expect(fs.existsSync(path.join(stateDir, "mcp-rules.json"))).toBe(false);
+  });
+
   test("mcp revoke removes project approval", async () => {
     fs.writeFileSync(path.join(projectRoot, ".mcp.json"), JSON.stringify({
       mcpServers: {
@@ -706,7 +741,7 @@ describe("admin MCP runtime preparation", () => {
     expect(approve.stderr).toContain("conflicts with an imported user MCP server");
   });
 
-  test("prepare pins the deterministic callback port for OAuth-capable Claude servers and registers public servers as OAuth resources", async () => {
+  test("prepare leaves the callback port to the session for OAuth-capable Claude servers and registers public servers as OAuth resources", async () => {
     writeClaudeNative({
       mcpServers: {
         // Public remote HTTP server that advertises OAuth dynamically at runtime.
@@ -729,16 +764,17 @@ describe("admin MCP runtime preparation", () => {
     const result = await runAdmin(() => prepareRuntime());
     expect(result.status, result.stderr).toBe(0);
 
-    const port = mcpOAuthCallbackPort(projectRoot);
     const generated = readClaudeGenerated().mcpServers as Record<string, {
       oauth?: { callbackPort?: number; authServerMetadataUrl?: string };
     }>;
 
-    // Public + declared-OAuth servers pin the Runfree-computed callback port so
-    // Claude does not fall back to a random loopback port the bridge can't reach.
-    expect(generated.posthog.oauth?.callbackPort).toBe(port);
-    expect(generated.sentryClaude.oauth?.callbackPort).toBe(port);
-    // Declared OAuth metadata is preserved alongside the pinned port.
+    // No shared callback port: the pinned Claude prefers `oauth.callbackPort`
+    // over the session adapter's MCP_OAUTH_CALLBACK_PORT, and each session owns
+    // its own forwarded port, so a projected port would route every session's
+    // login to one port.
+    expect(generated.posthog.oauth?.callbackPort).toBeUndefined();
+    expect(generated.sentryClaude.oauth?.callbackPort).toBeUndefined();
+    // Declared OAuth metadata is preserved.
     expect(generated.sentryClaude.oauth?.authServerMetadataUrl).toBe("https://sentry.io/.well-known/oauth-authorization-server");
     // Static-header servers never run OAuth: no callback port, no leaked token.
     expect(generated.staticMcp.oauth).toBeUndefined();
@@ -994,8 +1030,8 @@ describe("admin MCP runtime preparation", () => {
       },
     });
     const codex = readCodexGenerated();
-    expect(codex).toContain("mcp_oauth_callback_port = ");
-    expect(codex).toContain('mcp_oauth_callback_url = "http://localhost:');
+    expect(codex).not.toContain("mcp_oauth_callback_port");
+    expect(codex).not.toContain("mcp_oauth_callback_url");
     expect(codex).toContain("[mcp_servers.sentry]");
     expect(codex).toContain("oauth = true");
     expect(codex).toContain('oauth_resource = "https://mcp.sentry.dev/mcp"');
@@ -1052,5 +1088,419 @@ describe("admin MCP runtime preparation", () => {
     expect(generated).not.toContain("real-client-secret");
     expect(generated).not.toContain("real-registration-token");
     expect(JSON.stringify(readMcpOAuthPolicy())).not.toContain("real-client-secret");
+  });
+});
+
+// --- runfree mcp enable -------------------------------------------------------
+
+type FakeNetwork = { deps: DiscoveryDeps; calls: string[] };
+
+// Discovery against a fake network: every resolve and request is recorded, so a
+// test can prove that no lookup or connection happened.
+function fakeDiscovery(routes: Record<string, Record<string, unknown>>): FakeNetwork {
+  const calls: string[] = [];
+  return {
+    calls,
+    deps: {
+      resolve: async (host) => {
+        calls.push(`resolve ${host}`);
+        return [{ address: "93.184.216.34", family: 4 }];
+      },
+      request: async (url) => {
+        calls.push(`GET ${url.href}`);
+        const route = routes[url.href];
+        return route
+          ? { kind: "response", status: 200, contentType: "application/json", body: Buffer.from(JSON.stringify(route)) }
+          : { kind: "response", status: 404, contentType: "text/plain", body: Buffer.alloc(0) };
+      },
+    },
+  };
+}
+
+const NO_NETWORK: DiscoveryDeps = {
+  resolve: async (host) => {
+    throw new Error(`unexpected DNS lookup of ${host}`);
+  },
+  request: async (url) => {
+    throw new Error(`unexpected request to ${url.href}`);
+  },
+};
+
+function oauthRoutes(resource = "https://repo-oauth.example.com/mcp"): Record<string, Record<string, unknown>> {
+  return {
+    "https://repo-oauth.example.com/.well-known/oauth-protected-resource/mcp": {
+      resource,
+      authorization_servers: ["https://auth.oauth-idp.example"],
+    },
+    "https://auth.oauth-idp.example/.well-known/oauth-authorization-server": {
+      issuer: "https://auth.oauth-idp.example",
+      authorization_endpoint: "https://auth.oauth-idp.example/authorize",
+      token_endpoint: "https://auth.oauth-idp.example/oauth/token",
+      registration_endpoint: "https://auth.oauth-idp.example/oauth/register",
+    },
+  };
+}
+
+function writeProjectOauthServer(name = "repoOauth", url = "https://repo-oauth.example.com/mcp"): void {
+  const mcpPath = path.join(projectRoot, ".mcp.json");
+  const existing = fs.existsSync(mcpPath)
+    ? JSON.parse(fs.readFileSync(mcpPath, "utf8")) as { mcpServers: Record<string, unknown> }
+    : { mcpServers: {} };
+  existing.mcpServers[name] = { type: "http", url };
+  fs.writeFileSync(mcpPath, JSON.stringify(existing));
+}
+
+function enableInput(overrides: Partial<McpEnableInput> = {}): McpEnableInput {
+  return {
+    agent: parseMcpAgent("claude"),
+    server: "repoOauth",
+    tokenSource: { kind: "none" },
+    replaceSource: false,
+    oauthHosts: [],
+    discover: true,
+    interactive: true,
+    ...overrides,
+  };
+}
+
+function answers(...values: boolean[]): { confirm: (message: string) => Promise<boolean>; asked: string[] } {
+  const asked: string[] = [];
+  return {
+    asked,
+    confirm: async (message) => {
+      asked.push(message);
+      const next = values.shift();
+      if (next === undefined) throw new Error(`unexpected prompt: ${message}`);
+      return next;
+    },
+  };
+}
+
+function enabledFilePath(): string {
+  return path.join(stateDir, "mcp-enabled.json");
+}
+
+function approvalFilePath(): string {
+  return path.join(stateDir, "approved-mcp.json");
+}
+
+describe("runfree mcp enable", () => {
+  test("one review enables a project OAuth server: approval, discovered hosts, mediated endpoints", async () => {
+    writeProjectOauthServer();
+    const network = fakeDiscovery(oauthRoutes());
+    const prompts = answers(true, true);
+
+    const result = await runAdmin(async () => {
+      const outcome = await mcpEnableIntent(enableInput(), { discovery: network.deps, confirm: prompts.confirm });
+      expect(outcome).toEqual({
+        applied: true,
+        login: { agent: "claude", server: "repoOauth", source: "project" },
+        loginCommand: "runfree mcp auth claude repoOauth --source project",
+      });
+    });
+
+    expect(result.status, result.stderr).toBe(0);
+    // One consent to contact the untrusted endpoint, then one approval.
+    expect(prompts.asked).toEqual(["Contact repo-oauth.example.com to discover OAuth hosts?", "Enable this MCP server?"]);
+    expect(result.stdout).toContain("allow host repo-oauth.example.com  [MCP endpoint]");
+    expect(result.stdout).toContain("allow host auth.oauth-idp.example  [OAuth, discovered]");
+    expect(result.stdout).toContain("limited to GET, HEAD, OPTIONS, and POST on paths starting with /.well-known, /.well-known/oauth-authorization-server, /oauth/register, /oauth/token");
+    expect(result.stdout).toContain("browser sign-in at https://auth.oauth-idp.example (opened on this computer; not allowlisted)");
+    expect(result.stdout).toContain("approved project MCP server: claude repoOauth");
+
+    const prepare = await runAdmin(() => prepareRuntime());
+    expect(prepare.status, prepare.stderr).toBe(0);
+    const policy = readPolicy();
+    expect(policy.hosts).toEqual(["auth.oauth-idp.example", "repo-oauth.example.com"]);
+    expect(policy.requests?.["auth.oauth-idp.example"]).toEqual({
+      methods: ["GET", "HEAD", "OPTIONS", "POST"],
+      pathPrefixes: ["/.well-known", "/.well-known/oauth-authorization-server", "/oauth/register", "/oauth/token"],
+    });
+    // The proxy mediates the validated endpoints statically.
+    expect(readMcpOAuthPolicy()).toMatchObject({
+      providers: {
+        "mcp:claude-repooauth": {
+          resourceHost: "repo-oauth.example.com",
+          tokenEndpoints: [{ host: "auth.oauth-idp.example", path: "/oauth/token" }],
+          registrationEndpoints: [{ host: "auth.oauth-idp.example", path: "/oauth/register" }],
+        },
+      },
+    });
+  });
+
+  test("no DNS lookup or request happens for an unknown, unsupported, static, or stdio entry", async () => {
+    fs.writeFileSync(path.join(projectRoot, ".mcp.json"), JSON.stringify({
+      mcpServers: {
+        repoStatic: { type: "http", url: "https://static.example.com/mcp", headers: { Authorization: "Bearer ${STATIC_TOKEN}" } },
+        repoStdio: { command: "repo-mcp", args: [] },
+        repoBad: { type: "http", url: "http://insecure.example.com/mcp" },
+      },
+    }));
+
+    const unknown = await runAdmin(() => mcpEnableIntent(enableInput({ server: "missing" }), { discovery: NO_NETWORK }).then(() => {}));
+    expect(unknown.status).not.toBe(0);
+    expect(unknown.stderr).toContain("unknown MCP server: claude missing");
+
+    const bad = await runAdmin(() => mcpEnableIntent(enableInput({ server: "repoBad" }), { discovery: NO_NETWORK }).then(() => {}));
+    expect(bad.status).not.toBe(0);
+    expect(bad.stderr).toContain("cannot enable MCP server claude repoBad");
+
+    const stdio = await runAdmin(() => mcpEnableIntent(enableInput({ server: "repoStdio" }), { discovery: NO_NETWORK, confirm: answers(true).confirm }).then(() => {}));
+    expect(stdio.status, stdio.stderr).toBe(0);
+
+    const staticMissing = await runAdmin(() => mcpEnableIntent(enableInput({ server: "repoStatic" }), { discovery: NO_NETWORK }).then(() => {}));
+    expect(staticMissing.status).not.toBe(0);
+    expect(staticMissing.stderr).toContain("static project MCP credentials require --from-env");
+    expect(fs.existsSync(enabledFilePath())).toBe(false);
+  });
+
+  test("declining to contact the endpoint makes no lookup and writes nothing", async () => {
+    writeProjectOauthServer();
+    const prompts = answers(false);
+    const result = await runAdmin(async () => {
+      expect(await mcpEnableIntent(enableInput(), { discovery: NO_NETWORK, confirm: prompts.confirm })).toEqual({ applied: false });
+    });
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout).toContain("No hosts contacted and no changes saved.");
+    expect(fs.existsSync(approvalFilePath())).toBe(false);
+    expect(fs.existsSync(enabledFilePath())).toBe(false);
+  });
+
+  test("without a terminal, discovery is refused before any lookup and nothing is written", async () => {
+    writeProjectOauthServer();
+    const result = await runAdmin(() => mcpEnableIntent(enableInput({ interactive: false }), { discovery: NO_NETWORK }).then(() => {}));
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain("mcp enable discovers OAuth hosts only on a terminal");
+    expect(result.stderr).toContain("runfree mcp enable claude repoOauth --source project --no-discover --oauth-host <host>");
+    expect(fs.existsSync(approvalFilePath())).toBe(false);
+    expect(fs.existsSync(enabledFilePath())).toBe(false);
+  });
+
+  test("declining the review writes nothing even after discovery", async () => {
+    writeProjectOauthServer();
+    const network = fakeDiscovery(oauthRoutes());
+    const result = await runAdmin(async () => {
+      expect(await mcpEnableIntent(enableInput(), { discovery: network.deps, confirm: answers(true, false).confirm })).toEqual({ applied: false });
+    });
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout).toContain("No changes saved.");
+    expect(fs.existsSync(approvalFilePath())).toBe(false);
+    expect(fs.existsSync(enabledFilePath())).toBe(false);
+  });
+
+  test("--no-discover without a terminal applies exactly the named hosts and makes no network call", async () => {
+    writeProjectOauthServer();
+    const result = await runAdmin(async () => {
+      const outcome = await mcpEnableIntent(enableInput({ interactive: false, discover: false, oauthHosts: ["SSO.Example.org", "repo-oauth.example.com"] }), { discovery: NO_NETWORK });
+      expect(outcome.applied).toBe(true);
+    });
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout).toContain("allow host sso.example.org  [OAuth, --oauth-host]");
+    expect(result.stdout).toContain("note: repo-oauth.example.com is the MCP endpoint host");
+
+    const prepare = await runAdmin(() => prepareRuntime());
+    expect(prepare.status, prepare.stderr).toBe(0);
+    expect(readPolicy().hosts).toEqual(["repo-oauth.example.com", "sso.example.org"]);
+    // A user-named host is allowed as given, like `runfree host add`.
+    expect(readPolicy().requests?.["sso.example.org"]).toBeUndefined();
+  });
+
+  test("invalid --oauth-host values are refused before any write", async () => {
+    writeProjectOauthServer();
+    for (const bad of ["10.0.0.1", "*.example.com", "https://auth.example.com/", "auth.example.com:444", "1.2.3.0x4", "localhost"]) {
+      const result = await runAdmin(() => mcpEnableIntent(enableInput({ discover: false, oauthHosts: [bad] }), { discovery: NO_NETWORK, confirm: answers().confirm }).then(() => {}));
+      expect(result.status, bad).not.toBe(0);
+      expect(result.stderr).toContain("--oauth-host");
+    }
+    expect(fs.existsSync(approvalFilePath())).toBe(false);
+    expect(fs.existsSync(enabledFilePath())).toBe(false);
+  });
+
+  test("an unbound token endpoint in discovery output adds no host and no endpoint", async () => {
+    writeProjectOauthServer();
+    const routes = oauthRoutes();
+    routes["https://auth.oauth-idp.example/.well-known/oauth-authorization-server"] = {
+      issuer: "https://auth.oauth-idp.example",
+      token_endpoint: "https://tokens.elsewhere.example/token",
+    };
+    const result = await runAdmin(() => mcpEnableIntent(enableInput(), { discovery: fakeDiscovery(routes).deps, confirm: answers(true, true).confirm }).then(() => {}));
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout).toContain("not added: token_endpoint https://tokens.elsewhere.example/token");
+    expect(fs.existsSync(enabledFilePath())).toBe(false);
+    const prepare = await runAdmin(() => prepareRuntime());
+    expect(prepare.status, prepare.stderr).toBe(0);
+    expect(readPolicy().hosts).toEqual(["repo-oauth.example.com"]);
+  });
+
+  test("revoke removes exactly the hosts enable added; desired and shared hosts stay", async () => {
+    writeFixtureRepo({ hosts: ["sso.example.org"], tokens: {} });
+    writeProjectOauthServer("serverA", "https://a.example.com/mcp");
+    writeProjectOauthServer("serverB", "https://b.example.com/mcp");
+    for (const server of ["serverA", "serverB"]) {
+      const result = await runAdmin(() => mcpEnableIntent(enableInput({
+        server,
+        interactive: false,
+        discover: false,
+        oauthHosts: ["shared-idp.example.com", "sso.example.org", `only-${server.toLowerCase()}.example.com`],
+      }), { discovery: NO_NETWORK }).then(() => {}));
+      expect(result.status, result.stderr).toBe(0);
+    }
+    expect((await runAdmin(() => prepareRuntime())).status).toBe(0);
+    expect(readPolicy().hosts).toEqual([
+      "a.example.com", "b.example.com", "only-servera.example.com", "only-serverb.example.com", "shared-idp.example.com", "sso.example.org",
+    ]);
+
+    const revoke = await runAdmin(() => mcpRevokeIntent({ agent: parseMcpAgent("claude"), server: "serverA" }));
+    expect(revoke.status, revoke.stderr).toBe(0);
+    expect(revoke.stdout).toContain("OAuth hosts no longer allowed for this server: only-servera.example.com, shared-idp.example.com, sso.example.org");
+
+    expect((await runAdmin(() => prepareRuntime())).status).toBe(0);
+    // serverA's endpoint and its only host are gone; the desired-policy host and
+    // the host serverB also named stay.
+    expect(readPolicy().hosts).toEqual(["b.example.com", "only-serverb.example.com", "shared-idp.example.com", "sso.example.org"]);
+  });
+
+  test("a changed project descriptor stops projecting the hosts enable added", async () => {
+    writeProjectOauthServer();
+    expect((await runAdmin(() => mcpEnableIntent(enableInput({ interactive: false, discover: false, oauthHosts: ["sso.example.org"] }), { discovery: NO_NETWORK }).then(() => {}))).status).toBe(0);
+    writeProjectOauthServer("repoOauth", "https://repo-oauth.example.com/mcp/v2");
+
+    const prepare = await runAdmin(() => prepareRuntime());
+    expect(prepare.status, prepare.stderr).toBe(0);
+    expect(readPolicy().hosts).toEqual([]);
+  });
+
+  test("a user server enabled for OAuth hosts stops projecting when it is deleted", async () => {
+    writeClaudeNative({ mcpServers: { linear: { type: "http", url: "https://mcp.linear.example/mcp" } } });
+    const enable = await runAdmin(() => mcpEnableIntent(enableInput({ server: "linear", interactive: false, discover: false, oauthHosts: ["auth.linear.example"] }), { discovery: NO_NETWORK }).then(() => {}));
+    expect(enable.status, enable.stderr).toBe(0);
+    expect(enable.stdout).not.toContain("approve project MCP server");
+    expect((await runAdmin(() => prepareRuntime())).status).toBe(0);
+    expect(readPolicy().hosts).toEqual(["auth.linear.example", "mcp.linear.example"]);
+
+    writeClaudeNative({ mcpServers: {} });
+    expect((await runAdmin(() => prepareRuntime())).status).toBe(0);
+    expect(readPolicy().hosts).toEqual([]);
+  });
+
+  test("an invalid enable record grants nothing, and the next revoke reclaims the file", async () => {
+    writeProjectOauthServer();
+    expect((await runAdmin(() => mcpEnableIntent(enableInput({ interactive: false, discover: false, oauthHosts: ["sso.example.org"] }), { discovery: NO_NETWORK }).then(() => {}))).status).toBe(0);
+    const file = JSON.parse(fs.readFileSync(enabledFilePath(), "utf8")) as { records: Record<string, { oauthHosts: Array<{ host: string }> }> };
+    const [identity] = Object.keys(file.records);
+    if (!identity) throw new Error("expected a record");
+    const record = file.records[identity];
+    if (!record) throw new Error("expected a record");
+    record.oauthHosts.push({ host: "10.0.0.1" });
+    fs.writeFileSync(enabledFilePath(), JSON.stringify(file));
+
+    const prepare = await runAdmin(() => prepareRuntime());
+    expect(prepare.status, prepare.stderr).toBe(0);
+    expect(prepare.stderr).toContain("mcp: ignored an invalid MCP enable record (claude repoOauth)");
+    expect(readPolicy().hosts).toEqual(["repo-oauth.example.com"]);
+
+    const revoke = await runAdmin(() => mcpRevokeIntent({ agent: parseMcpAgent("claude"), server: "other" }));
+    expect(revoke.status, revoke.stderr).toBe(0);
+    expect(revoke.stdout).toContain("dropped 1 invalid MCP enable record(s)");
+    expect((JSON.parse(fs.readFileSync(enabledFilePath(), "utf8")) as { records: object }).records).toEqual({});
+  });
+
+  test("a malformed enable file grants nothing, and the next enable rewrites it", async () => {
+    writeProjectOauthServer();
+    fs.mkdirSync(stateDir, { recursive: true });
+    fs.writeFileSync(enabledFilePath(), "{not json");
+    const prepare = await runAdmin(() => prepareRuntime());
+    expect(prepare.status, prepare.stderr).toBe(0);
+    expect(prepare.stderr).toContain("mcp: ignored malformed MCP enable file");
+
+    const enable = await runAdmin(() => mcpEnableIntent(enableInput({ interactive: false, discover: false, oauthHosts: ["sso.example.org"] }), { discovery: NO_NETWORK }).then(() => {}));
+    expect(enable.status, enable.stderr).toBe(0);
+    expect((await runAdmin(() => prepareRuntime())).status).toBe(0);
+    expect(readPolicy().hosts).toEqual(["repo-oauth.example.com", "sso.example.org"]);
+  });
+
+  test("re-enabling with fewer hosts stops projecting the dropped ones", async () => {
+    writeProjectOauthServer();
+    expect((await runAdmin(() => mcpEnableIntent(enableInput({ interactive: false, discover: false, oauthHosts: ["a-idp.example.com", "b-idp.example.com"] }), { discovery: NO_NETWORK }).then(() => {}))).status).toBe(0);
+    const again = await runAdmin(() => mcpEnableIntent(enableInput({ interactive: false, discover: false, oauthHosts: ["a-idp.example.com"] }), { discovery: NO_NETWORK }).then(() => {}));
+    expect(again.status, again.stderr).toBe(0);
+    expect(again.stdout).toContain("stop allowing host b-idp.example.com");
+    expect((await runAdmin(() => prepareRuntime())).status).toBe(0);
+    expect(readPolicy().hosts).toEqual(["a-idp.example.com", "repo-oauth.example.com"]);
+  });
+
+  test("mcp explain shows the hosts and endpoints enable recorded", async () => {
+    writeProjectOauthServer();
+    const network = fakeDiscovery(oauthRoutes());
+    expect((await runAdmin(() => mcpEnableIntent(enableInput(), { discovery: network.deps, confirm: answers(true, true).confirm }).then(() => {}))).status).toBe(0);
+    const explain = await runAdmin(() => mcpExplainIntent({ agent: parseMcpAgent("claude"), server: "repoOauth", json: false }));
+    expect(explain.status, explain.stderr).toBe(0);
+    expect(explain.stdout).toContain("OAuth host: auth.oauth-idp.example (discovered; added by mcp enable)");
+    expect(explain.stdout).toContain("OAuth token endpoint: https://auth.oauth-idp.example/oauth/token");
+  });
+
+  test("an authorization server on the endpoint host adds no host but its endpoints are still mediated", async () => {
+    writeProjectOauthServer();
+    const network = fakeDiscovery({
+      "https://repo-oauth.example.com/.well-known/oauth-protected-resource/mcp": {
+        resource: "https://repo-oauth.example.com/mcp",
+        authorization_servers: ["https://repo-oauth.example.com"],
+      },
+      "https://repo-oauth.example.com/.well-known/oauth-authorization-server": {
+        issuer: "https://repo-oauth.example.com",
+        token_endpoint: "https://repo-oauth.example.com/token",
+      },
+    });
+    const result = await runAdmin(() => mcpEnableIntent(enableInput(), { discovery: network.deps, confirm: answers(true, true).confirm }).then(() => {}));
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout).toContain("proxy mediates token endpoint https://repo-oauth.example.com/token");
+    expect(result.stdout).toContain("OAuth hosts: none");
+
+    expect((await runAdmin(() => prepareRuntime())).status).toBe(0);
+    expect(readPolicy().hosts).toEqual(["repo-oauth.example.com"]);
+    expect(readPolicy().requests).toBeUndefined();
+    expect(readMcpOAuthPolicy()).toMatchObject({
+      providers: { "mcp:claude-repooauth": { tokenEndpoints: [{ host: "repo-oauth.example.com", path: "/token" }] } },
+    });
+  });
+
+  test("the review says when a discovered host is already allowed and keeps its rules", async () => {
+    writeFixtureRepo({ hosts: ["auth.oauth-idp.example"], tokens: {} });
+    writeProjectOauthServer();
+    const result = await runAdmin(() => mcpEnableIntent(enableInput(), { discovery: fakeDiscovery(oauthRoutes()).deps, confirm: answers(true, true).confirm }).then(() => {}));
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout).toContain("already allowed by the current policy; its existing rules stay");
+    expect(result.stdout).not.toContain("limited to GET");
+    expect((await runAdmin(() => prepareRuntime())).status).toBe(0);
+    expect(readPolicy().requests).toBeUndefined();
+  });
+
+  test("a token endpoint two enabled servers share is not mediated statically for either", async () => {
+    writeProjectOauthServer("serverA", "https://a.example.com/mcp");
+    writeProjectOauthServer("serverB", "https://b.example.com/mcp");
+    for (const [server, host] of [["serverA", "a.example.com"], ["serverB", "b.example.com"]] as const) {
+      const routes = {
+        [`https://${host}/.well-known/oauth-protected-resource/mcp`]: { resource: `https://${host}/mcp`, authorization_servers: ["https://shared-idp.example.com"] },
+        "https://shared-idp.example.com/.well-known/oauth-authorization-server": {
+          issuer: "https://shared-idp.example.com",
+          token_endpoint: "https://shared-idp.example.com/oauth/token",
+        },
+      };
+      const result = await runAdmin(() => mcpEnableIntent(enableInput({ server }), { discovery: fakeDiscovery(routes).deps, confirm: answers(true, true).confirm }).then(() => {}));
+      expect(result.status, result.stderr).toBe(0);
+    }
+    const prepare = await runAdmin(() => prepareRuntime());
+    expect(prepare.status, prepare.stderr).toBe(0);
+    expect(prepare.stderr).toContain("token endpoint https://shared-idp.example.com/oauth/token is also used by another MCP server");
+    const providers = (readMcpOAuthPolicy() as { providers: Record<string, { tokenEndpoints?: unknown[] }> }).providers;
+    expect(providers["mcp:claude-servera"]?.tokenEndpoints ?? []).toEqual([]);
+    expect(providers["mcp:claude-serverb"]?.tokenEndpoints ?? []).toEqual([]);
+    // The path stays reachable for the login, as with `host add`.
+    expect(readPolicy().requests?.["shared-idp.example.com"]?.pathPrefixes).toContain("/oauth/token");
+  });
+
+  test("printable escapes control, C1, and bidi characters from MCP config and metadata", () => {
+    expect(printable("repo\u001b[2Jname‮\u0085")).toBe("repo\\u{1b}[2Jname\\u{202e}\\u{85}");
+    expect(printable("plain-name_1")).toBe("plain-name_1");
   });
 });

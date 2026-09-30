@@ -61,6 +61,8 @@ const mocks = vi.hoisted(() => ({
   createCommand: vi.fn(),
   attachCommand: vi.fn(),
   inspectCommand: vi.fn(),
+  topCommand: vi.fn(),
+  templateInit: vi.fn(),
   observedExited: vi.fn(),
   observedExitStatus: vi.fn(),
   startCommand: vi.fn(),
@@ -94,9 +96,17 @@ const mocks = vi.hoisted(() => ({
   createSessionId: vi.fn(),
   consumePreparedRuntime: vi.fn(),
   compileMaterializationEligibility: vi.fn(),
+  removeSessionIngress: vi.fn(),
+  reclaimStaleCallbacks: vi.fn(),
+  sessionMcpCallbackLifecycle: vi.fn(),
 }));
 
 vi.mock("../agents.ts", () => ({ builtinAgent: mocks.builtinAgent }));
+vi.mock("./session-callback-ingress.ts", () => ({
+  removeSessionMcpCallbackIngress: mocks.removeSessionIngress,
+  reclaimStaleSessionMcpCallbackForwarders: mocks.reclaimStaleCallbacks,
+}));
+vi.mock("./session-mcp-callback.ts", () => ({ sessionMcpCallbackLifecycle: mocks.sessionMcpCallbackLifecycle }));
 vi.mock("./host-identity.ts", () => ({
   hostBootId: mocks.hostBootId,
   hostProcessStart: mocks.hostProcessStart,
@@ -138,10 +148,14 @@ vi.mock("./session-container-cleanup.ts", () => ({
   orphanSessionContainerRemoveCommand: mocks.orphanRemove,
 }));
 // The three teardown builders stay real: they only validate exact ids and
-// build argv, and the teardown events below assert that exact argv.
+// build argv, and the teardown events below assert that exact argv. The
+// handoff answer is parsed by the shipped parser; only Docker is faked.
 vi.mock("./session-container-docker.ts", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./session-container-docker.ts")>();
   return {
+    parseSessionContainerTopHandoff: actual.parseSessionContainerTopHandoff,
+    SESSION_CONTAINER_TOP_MAX_BYTES: 64 * 1024,
+    sessionContainerTopCommand: mocks.topCommand,
     executeSessionDockerCommand: mocks.executeDocker,
     sessionContainerAttachCommand: mocks.attachCommand,
     sessionContainerCreateCommand: mocks.createCommand,
@@ -189,6 +203,7 @@ vi.mock("./session-host-status.ts", () => ({
 }));
 vi.mock("./session-container-template.ts", () => ({
   bindSessionContainerCreatePlanRecord: mocks.bindPlan,
+  sessionContainerTemplateInit: mocks.templateInit,
 }));
 vi.mock("./session-containers.ts", () => ({
   bindAllocatedSessionContainerIdV2: mocks.bindAllocatedRecord,
@@ -246,7 +261,8 @@ import { SESSION_ADMISSION_LEASE_MAX_DURATION_MS } from "@runfree/runtime-contra
 import { SessionFileTeardownBlockedError } from "./session-file-teardown.ts";
 import { sessionRegistryDigest } from "./launch-handoff.ts";
 import { StalePreparedRuntimeError, type LaunchHandoff } from "./prepared-runtime.ts";
-import { createInternalSessionAdmissionDriver } from "./session-admission-driver.ts";
+import { createInternalSessionAdmissionDriver, SESSION_HANDOFF_WAIT_CEILING_MS } from "./session-admission-driver.ts";
+import { SessionTeardownIncompleteError } from "./session-admission-probe.ts";
 import { flushWarnings, setOutputWriterForTest } from "../warnings.ts";
 import type { ActiveRuntimePlan } from "./plan.ts";
 import {
@@ -378,6 +394,26 @@ function ordered(name: string) {
   };
 }
 
+/** The captured label of the handoff wait's daemon-side process listing. */
+const TOP_LABEL = `docker:container top ${CONTAINER_ID} -o pid,ppid,args`;
+
+/**
+ * One `docker container top -o pid,ppid,args` answer for this session: Docker's
+ * init as the anchor (`State.Pid`, `DOCKER_PID`) and, under it, the entry, the
+ * agent, or nothing yet.
+ */
+function topListing(child: "entry" | "agent" | "none"): string {
+  const rows = [
+    "PID     PPID    COMMAND",
+    `${DOCKER_PID}    4200    /sbin/docker-init -- /usr/local/libexec/runfree/session-entry /usr/local/bin/codex`,
+  ];
+  if (child === "entry") {
+    rows.push(`4300    ${DOCKER_PID}    /bin/sh /usr/local/libexec/runfree/session-entry /usr/local/bin/codex`);
+  }
+  if (child === "agent") rows.push(`4300    ${DOCKER_PID}    /usr/local/bin/codex`);
+  return `${rows.join("\n")}\n`;
+}
+
 /** The durable effective control plane this project's proxy was started from. */
 let effectiveControlPlane: {
   selection: Record<string, unknown>;
@@ -386,6 +422,15 @@ let effectiveControlPlane: {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  mocks.removeSessionIngress.mockImplementation(() => {
+    mocks.events.push("remove-session-ingress");
+    return 0;
+  });
+  mocks.reclaimStaleCallbacks.mockImplementation(() => {
+    mocks.events.push("reclaim-stale-callbacks");
+    return 0;
+  });
+  mocks.sessionMcpCallbackLifecycle.mockReturnValue(undefined);
   mocks.events.length = 0;
   mocks.dockerInputs.length = 0;
   mocks.failRunningProof = false;
@@ -492,6 +537,11 @@ beforeEach(() => {
   mocks.classify.mockReturnValue([]);
   mocks.networkInspectCommand.mockReturnValue({ executable: "docker", args: ["network", "inspect", NETWORK_ID] });
   mocks.inspectCommand.mockReturnValue({ executable: "docker", args: ["container", "inspect", CONTAINER_ID] });
+  mocks.topCommand.mockReturnValue({ executable: "docker", args: ["container", "top", CONTAINER_ID, "-o", "pid,ppid,args"] });
+  mocks.templateInit.mockReturnValue(true);
+  // Default: the entry has already handed off by the first look, which is what
+  // a healthy launch sees; the handoff cases below script the other answers.
+  mocks.effectAnswers.set(TOP_LABEL, [{ status: 0, stdout: topListing("agent"), stderr: "" }]);
   // Default: the pre-stop inspection does NOT prove the container exited, so
   // every existing teardown expectation keeps the SIGTERM+grace stop path,
   // and no inspection carries a proved exit status.
@@ -1157,6 +1207,15 @@ describe("internal session admission driver", () => {
       ? [value.message, ...value.errors.flatMap(messages)]
       : [String(value)]);
     expect(messages(failure).join("\n")).toContain("observation-unavailable during delete-session-file");
+    // The 2026-09-29 transcript: the teardown and its one retry fail
+    // identically when Docker is unreachable. That is one failure, reported
+    // once, as a teardown that did not complete — not as an admission probe
+    // failure paired with its own repeat.
+    expect(failure).toBeInstanceOf(SessionTeardownIncompleteError);
+    const aggregate = failure as SessionTeardownIncompleteError;
+    expect(aggregate.message).not.toContain("probe");
+    expect(aggregate.message).toContain("runfree up");
+    expect(aggregate.errors).toHaveLength(1);
 
     expect(mocks.removeSessionMetadata).toHaveBeenCalled();
     expect(mocks.markSessionInterrupted).not.toHaveBeenCalled();
@@ -1181,7 +1240,7 @@ describe("internal session admission driver", () => {
     });
 
     await expect(driver.launchBuiltin("codex")).rejects.toThrow(
-      "session admission probe failed and fail-closed cleanup also failed",
+      "session admission launch failed and fail-closed cleanup also failed",
     );
 
     expect(mocks.removeSessionMetadata).toHaveBeenCalledOnce();
@@ -1237,19 +1296,115 @@ describe("internal session admission driver", () => {
     expect(sessionLockManager.withLock).not.toHaveBeenCalled();
   });
 
-  test("launch fires onSessionRunning with the session identity, after the grant and before teardown", async () => {
-    const onSessionRunning = vi.fn(() => { mocks.events.push("session-running"); });
+  test("a participant refusal reclaims dead callback routes under the lock and proves once more", async () => {
+    mocks.createParticipantAuthority.mockImplementationOnce(() => {
+      mocks.events.push("participant-authority:refused");
+      throw new Error("refusing ingress participants: stale mcp-callback forwarder");
+    });
+    mocks.reclaimStaleCallbacks.mockImplementation(() => {
+      mocks.events.push("reclaim-stale-callbacks");
+      return 1;
+    });
     const driver = createInternalSessionAdmissionDriver({
       ...fixture(),
       nowEpochMs: () => Date.parse("2026-08-09T00:00:00.000Z"),
-      onSessionRunning,
     });
 
     await driver.launchBuiltin("codex");
 
-    expect(onSessionRunning).toHaveBeenCalledWith({ containerId: CONTAINER_ID, sourceIp: SOURCE_IP });
-    expect(mocks.events.indexOf("session-file:write")).toBeLessThan(mocks.events.indexOf("session-running"));
-    expect(mocks.events.indexOf("session-running")).toBeLessThan(mocks.events.indexOf("stamp-revoking"));
+    expect(mocks.events.indexOf("participant-authority:refused")).toBeLessThan(mocks.events.indexOf("reclaim-stale-callbacks"));
+    expect(mocks.events.indexOf("reclaim-stale-callbacks")).toBeLessThan(mocks.events.indexOf("participant-authority"));
+    expect(mocks.events.indexOf("participant-authority")).toBeLessThan(mocks.events.indexOf("allocate"));
+  });
+
+  test("a participant refusal with nothing to reclaim stands, before any allocation", async () => {
+    mocks.createParticipantAuthority.mockImplementationOnce(() => {
+      throw new Error("refusing ingress participants: unknown forwarder");
+    });
+    const driver = createInternalSessionAdmissionDriver({
+      ...fixture(),
+      nowEpochMs: () => Date.parse("2026-08-09T00:00:00.000Z"),
+    });
+
+    await expect(driver.launchBuiltin("codex")).rejects.toThrow("refusing ingress participants: unknown forwarder");
+    expect(mocks.reclaimStaleCallbacks).toHaveBeenCalledTimes(1);
+    expect(mocks.events).not.toContain("allocate");
+  });
+
+  test("a healthy launch spends nothing on callback reclaim", async () => {
+    const driver = createInternalSessionAdmissionDriver({
+      ...fixture(),
+      nowEpochMs: () => Date.parse("2026-08-09T00:00:00.000Z"),
+    });
+
+    await driver.launchBuiltin("codex");
+    expect(mocks.reclaimStaleCallbacks).not.toHaveBeenCalled();
+    expect(mocks.createParticipantAuthority).toHaveBeenCalledTimes(1);
+  });
+
+  test("a reconcile that ended a dead owner re-proves the participants before the baseline", async () => {
+    mocks.reconcileSessions.mockImplementation(async () => {
+      mocks.events.push("reconcile-sessions");
+      return {
+        orphanFilesDeleted: [],
+        deadOwnersRevoked: ["rf-20260809-dead01"],
+        orphanContainersRemoved: [],
+        unknownOwners: [],
+        reservedSourceIps: [],
+        orphanFiles: [],
+        recordsWithoutFiles: [],
+      };
+    });
+    const driver = createInternalSessionAdmissionDriver({
+      ...fixture(),
+      nowEpochMs: () => Date.parse("2026-08-09T00:00:00.000Z"),
+    });
+
+    await driver.launchBuiltin("codex");
+    expect(mocks.createParticipantAuthority).toHaveBeenCalledTimes(2);
+    expect(mocks.events.indexOf("reconcile-sessions")).toBeLessThan(mocks.events.lastIndexOf("participant-authority"));
+    expect(mocks.events.lastIndexOf("participant-authority")).toBeLessThan(mocks.events.indexOf("baseline"));
+  });
+
+  test("launch prepares the session ingress after the running proof and before the grant, then removes it first in teardown", async () => {
+    const prepare = vi.fn(async () => {
+      mocks.events.push("prepare-session-ingress");
+      return undefined;
+    });
+    const driver = createInternalSessionAdmissionDriver({
+      ...fixture(),
+      nowEpochMs: () => Date.parse("2026-08-09T00:00:00.000Z"),
+      sessionIngress: { prepare },
+    });
+
+    await driver.launchBuiltin("codex");
+
+    expect(prepare).toHaveBeenCalledWith({
+      sessionId: "rf-20260809-abcdef",
+      containerId: CONTAINER_ID,
+      sourceIp: SOURCE_IP,
+      internalNetwork: expect.any(String),
+    });
+    expect(mocks.events.indexOf("running-proof")).toBeLessThan(mocks.events.indexOf("prepare-session-ingress"));
+    expect(mocks.events.indexOf("prepare-session-ingress")).toBeLessThan(mocks.events.indexOf("session-file:write"));
+    // The shared teardown proves the route gone right after the file delete
+    // and before the record — the address reservation — is released.
+    expect(mocks.events.indexOf("session-file:delete")).toBeLessThan(mocks.events.indexOf("remove-session-ingress"));
+    expect(mocks.events.indexOf("remove-session-ingress"))
+      .toBeLessThan(mocks.events.indexOf("remove-exact-record:rf-20260809-abcdef"));
+  });
+
+  test("the project decides the session ingress when the caller passes none, and a probe never sets it up", async () => {
+    const prepare = vi.fn(async () => undefined);
+    mocks.sessionMcpCallbackLifecycle.mockReturnValue({ prepare });
+    const driver = createInternalSessionAdmissionDriver({
+      ...fixture(),
+      nowEpochMs: () => Date.parse("2026-08-09T00:00:00.000Z"),
+    });
+
+    await driver.launchBuiltin("codex");
+    expect(prepare).toHaveBeenCalledTimes(1);
+    expect(mocks.sessionMcpCallbackLifecycle).toHaveBeenCalledTimes(1);
   });
 
   test("launch preserves interrupted session evidence when the attached process does not exit 0", async () => {
@@ -1612,6 +1767,8 @@ describe("session admission under the per-session file source", () => {
       "docker:container create",
       `docker:container inspect ${CONTAINER_ID}`,
       "session-file:write",
+      // One daemon-side read of the process table: the entry has handed off.
+      TOP_LABEL,
     ]);
     expect(mocks.events.indexOf("start-foreground"))
       .toBeLessThan(mocks.events.indexOf(`docker:container inspect ${CONTAINER_ID}`));
@@ -1679,23 +1836,46 @@ describe("session admission under the per-session file source", () => {
     });
   });
 
-  test("fires onSessionRunning with the session identity once the file is written", async () => {
+  test("a failed session ingress fails the launch with no session file, removing the ingress before the record", async () => {
     const input = fixture();
     mocks.containerInspect = { status: 0, stdout: runningInspect(), stderr: "" };
-    const onSessionRunning = vi.fn(() => {
-      mocks.events.push("on-session-running");
+    const prepare = vi.fn(async () => {
+      mocks.events.push("prepare-session-ingress");
+      throw new Error("the MCP OAuth callback for this session could not be set up");
     });
     const driver = createInternalSessionAdmissionDriver({
       ...input,
-      onSessionRunning,
+      sessionIngress: { prepare },
       nowEpochMs: () => Date.parse("2026-08-09T00:10:00.000Z"),
     });
 
-    await driver.launchBuiltin("codex");
+    await expect(driver.launchBuiltin("codex")).rejects.toThrow("could not be set up");
 
-    expect(onSessionRunning).toHaveBeenCalledWith({ containerId: CONTAINER_ID, sourceIp: SOURCE_IP });
-    expect(mocks.events.indexOf("session-file:write"))
-      .toBeLessThan(mocks.events.indexOf("on-session-running"));
+    expect(mocks.events).not.toContain("session-file:write");
+    expect(mocks.events.indexOf("prepare-session-ingress")).toBeLessThan(mocks.events.indexOf("remove-session-ingress"));
+    expect(mocks.events.indexOf("remove-session-ingress")).toBeLessThan(mocks.events.lastIndexOf("remove-record"));
+  });
+
+  test("an ingress that cannot be proved removed keeps the unadmitted record for reconcile", async () => {
+    const input = fixture();
+    mocks.containerInspect = { status: 0, stdout: runningInspect(), stderr: "" };
+    mocks.removeSessionIngress.mockImplementation(() => {
+      mocks.events.push("remove-session-ingress");
+      throw new Error("Cannot connect to the Docker daemon");
+    });
+    const driver = createInternalSessionAdmissionDriver({
+      ...input,
+      sessionIngress: { prepare: async () => { throw new Error("probe failed"); } },
+      nowEpochMs: () => Date.parse("2026-08-09T00:10:00.000Z"),
+    });
+
+    await expect(driver.launchBuiltin("codex")).rejects.toBeDefined();
+
+    expect(mocks.events).toContain("remove-session-ingress");
+    const after = mocks.events.slice(mocks.events.indexOf("remove-session-ingress"));
+    expect(after).not.toContain("remove-record");
+    expect(after).not.toContain("prove-absent");
+    expect(after.some((event) => event.startsWith("remove-exact-record:") || event.startsWith("remove-record:"))).toBe(false);
   });
 
   test("an unavailable inspection at activation writes no session file and tears the session down", async () => {
@@ -2864,13 +3044,16 @@ describe("session admission under the per-session file source", () => {
 
     const failure = await driver.launchBuiltin("codex").catch((error: unknown) => error);
 
-    // The blocked delete is what the launch reports: one plain refusal with
-    // its remedy and the cause chained, not an aggregate of the two identical
-    // cleanup attempts (todo 35 fix 6).
-    expect(failure).toBeInstanceOf(SessionFileTeardownBlockedError);
-    expect(failure).not.toBeInstanceOf(AggregateError);
+    // The launch reports one incomplete teardown naming its remedy, and the
+    // two identical blocked attempts collapse into its single cause, never a
+    // pair (todo 35 fix 6).
+    expect(failure).toBeInstanceOf(SessionTeardownIncompleteError);
     expect((failure as Error).message).toContain("runfree up");
-    expect(flattenCauses(failure)).toContain("observation-unavailable during delete-session-file");
+    const causes = (failure as AggregateError).errors;
+    expect(causes).toHaveLength(1);
+    expect(causes[0]).toBeInstanceOf(SessionFileTeardownBlockedError);
+    expect((causes[0] as Error).message).toContain("runfree up");
+    expect(flattenCauses(causes[0])).toContain("observation-unavailable during delete-session-file");
     // The terminal stamp was written, so the record itself is left untouched.
     expect(mocks.transitionRevoking).not.toHaveBeenCalled();
 
@@ -2907,7 +3090,8 @@ describe("session admission under the per-session file source", () => {
 
     const failure = await driver.launchBuiltin("codex").catch((error: unknown) => error);
 
-    expect(failure).toBeInstanceOf(SessionFileTeardownBlockedError);
+    expect(failure).toBeInstanceOf(SessionTeardownIncompleteError);
+    expect((failure as AggregateError).errors[0]).toBeInstanceOf(SessionFileTeardownBlockedError);
     // Without either marker a peer would read the record as a live session.
     expect(mocks.transitionRevoking).toHaveBeenCalledTimes(1);
     const replaced = mocks.replaceRecord.mock.calls.map((call) => (call[3] as FakeRecord).state);
@@ -3228,6 +3412,45 @@ describe("session admission under the per-session file source", () => {
     expect(mocks.allocateIp).toHaveBeenCalledWith(expect.objectContaining({
       reservedIps: expect.arrayContaining([SOURCE_IP]),
     }));
+    expect(mocks.createAllocated).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ sourceIp: "172.31.90.21" }),
+    );
+  });
+
+  test("never allocates an address an ingress forwarder still splices to", async () => {
+    const input = fixture();
+    mocks.containerInspect = { status: 0, stdout: runningInspect(), stderr: "" };
+    const withForwarder = {
+      ...(mocks.createParticipantAuthority() as Record<string, unknown>),
+      ingressParticipants: [
+        { containerId: "f".repeat(64), containerName: "runfree-ingress-port-x-3000", sourceIp: "172.31.90.5", imageId: "sha256:x", targetIp: "172.31.90.20" },
+        { containerId: "e".repeat(64), containerName: "runfree-ingress-vnc-x-5901", sourceIp: "172.31.90.6", imageId: "sha256:x", targetIp: "10.9.9.9" },
+      ],
+    };
+    mocks.events.length = 0;
+    mocks.createParticipantAuthority.mockImplementation(() => {
+      mocks.events.push("participant-authority");
+      return withForwarder;
+    });
+    mocks.allocateIp.mockImplementation((request: { reservedIps?: readonly string[] }) => {
+      const reserved = new Set(request.reservedIps ?? []);
+      for (let host = 20; host <= 30; host += 1) {
+        const candidate = `172.31.90.${host}`;
+        if (!reserved.has(candidate)) return candidate;
+      }
+      throw new Error("session-container source IP pool is exhausted");
+    });
+    const driver = createInternalSessionAdmissionDriver({
+      ...input,
+      nowEpochMs: () => Date.parse("2026-08-09T00:00:00.000Z"),
+    });
+
+    await driver.launchBuiltin("codex");
+
+    const request = mocks.allocateIp.mock.calls[0]?.[0] as { reservedIps?: readonly string[] };
+    expect(request.reservedIps).toContain("172.31.90.20");
+    expect(request.reservedIps).not.toContain("10.9.9.9");
     expect(mocks.createAllocated).toHaveBeenCalledWith(
       expect.anything(),
       expect.objectContaining({ sourceIp: "172.31.90.21" }),
@@ -3585,5 +3808,188 @@ describe("session admission under the per-session file source", () => {
       output.restore();
       vi.useRealTimers();
     }
+  });
+
+  describe("attached only after the entry hands off to the agent", () => {
+    const topAnswer = (child: "entry" | "agent" | "none") => ({ status: 0, stdout: topListing(child), stderr: "" });
+    const tops = (): number => mocks.events.filter((event) => event === TOP_LABEL).length;
+
+    beforeEach(() => {
+      mocks.transitionAttached.mockImplementation((value: FakeRecord) => {
+        mocks.events.push("transition-attached");
+        return { ...value, state: "attached" };
+      });
+    });
+
+    test("keeps the lock and the attached record until a poll sees the handoff", async () => {
+      const input = fixture();
+      mocks.effectAnswers.set(TOP_LABEL, [topAnswer("none"), topAnswer("entry"), topAnswer("entry"), topAnswer("agent")]);
+      const foreground = attachableForeground();
+      const driver = createInternalSessionAdmissionDriver({
+        ...input,
+        sessionLockManager: orderedSessionLockManager(input.sessionLockManager),
+        nowEpochMs: () => Date.parse("2026-08-09T00:10:00.000Z"),
+      });
+
+      const launch = driver.launchBuiltin("codex");
+      await vi.waitFor(() => expect(mocks.events).toContain("release-attached-lock"));
+      foreground.end({ kind: "exit", code: 0, signal: null });
+      await expect(launch).resolves.toEqual({ status: 0, signal: null });
+
+      const write = mocks.events.indexOf("session-file:write");
+      const attached = mocks.events.indexOf("transition-attached");
+      const handedOff = mocks.events.lastIndexOf(TOP_LABEL);
+      expect(tops()).toBe(4);
+      expect(write).toBeLessThan(mocks.events.indexOf(TOP_LABEL));
+      // Every poll ran under the grant's lock, and nothing was reported before
+      // the one that saw the agent.
+      expect(handedOff).toBeLessThan(attached);
+      expect(mocks.events.indexOf("write-host-status")).toBeGreaterThan(handedOff);
+      expect(mocks.events.indexOf("release-attached-lock")).toBeGreaterThan(mocks.events.indexOf("write-host-status"));
+      expect(mocks.transitionAttached).toHaveBeenCalledTimes(1);
+    });
+
+    test("asserts the lifecycle lock on every poll and reports nothing attached once it is lost", async () => {
+      const input = fixture();
+      mocks.effectAnswers.set(TOP_LABEL, [topAnswer("entry")]);
+      let polls = 0;
+      mocks.topCommand.mockImplementation(() => {
+        polls += 1;
+        // The second poll finds the lock gone.
+        if (polls === 2) (input.sessionLockManager.lock.assertHeld as Mock).mockImplementation(() => {
+          throw new Error("test lifecycle lock is not held");
+        });
+        return { executable: "docker", args: ["container", "top", CONTAINER_ID, "-o", "pid,ppid,args"] };
+      });
+      attachableForeground();
+      const driver = createInternalSessionAdmissionDriver(input);
+
+      await expect(driver.launchBuiltin("codex")).rejects.toThrow();
+
+      expect(polls).toBe(2);
+      expect(mocks.transitionAttached).not.toHaveBeenCalled();
+      expect(input.sessionLockManager.releaseForWait).not.toHaveBeenCalled();
+    });
+
+    test("a foreground that ends during the wait is classified by the attached wait, never torn down there", async () => {
+      vi.useFakeTimers();
+      const output = captureOutput();
+      const input = fixture();
+      mocks.containerInspect = { status: 0, stdout: runningInspect(), stderr: "" };
+      mocks.effectAnswers.set(TOP_LABEL, [topAnswer("entry")]);
+      const foreground = attachableForeground();
+      const driver = createInternalSessionAdmissionDriver({
+        ...input,
+        nowEpochMs: () => Date.parse("2026-08-09T00:10:00.000Z"),
+        nowMonotonicMs: () => Date.now(),
+      });
+
+      try {
+        const launch = driver.launchBuiltin("codex");
+        await vi.advanceTimersByTimeAsync(0);
+        expect(tops()).toBe(1);
+        expect(mocks.transitionAttached).not.toHaveBeenCalled();
+
+        // Only the stream is lost; the container is still the proved one.
+        foreground.end({ kind: "exit", code: null, signal: "SIGHUP" });
+        await vi.advanceTimersByTimeAsync(0);
+
+        expect(mocks.transitionAttached).toHaveBeenCalledTimes(1);
+        expect(foreground.reattaches()).toBe(1);
+        expect(mocks.events).not.toContain("stamp-revoking");
+        expect(output.drain().join("\n")).not.toContain("hand off");
+
+        foreground.end({ kind: "exit", code: 0, signal: null });
+        await vi.advanceTimersByTimeAsync(0);
+        await expect(launch).resolves.toEqual({ status: 0, signal: null });
+      } finally {
+        output.restore();
+        vi.useRealTimers();
+      }
+    });
+
+    test("an unreadable listing reports attached at once, once, without echoing what the container wrote", async () => {
+      const output = captureOutput();
+      const input = fixture();
+      const hostile = "\u001b]0;pwned\u0007 PID PPID COMMAND";
+      mocks.effectAnswers.set(TOP_LABEL, [{ status: 1, stdout: hostile, stderr: hostile }]);
+      const foreground = attachableForeground();
+      try {
+        const driver = createInternalSessionAdmissionDriver(input);
+        const launch = driver.launchBuiltin("codex");
+        await vi.waitFor(() => expect(mocks.transitionAttached).toHaveBeenCalled(), { timeout: 5_000 });
+        foreground.end({ kind: "exit", code: 0, signal: null });
+        await expect(launch).resolves.toEqual({ status: 0, signal: null });
+        expect(tops()).toBe(1);
+        expect(mocks.transitionAttached).toHaveBeenCalledTimes(1);
+        const lines = output.drain();
+        expect(lines.filter((line) => line.includes("could not observe the session entry"))).toHaveLength(1);
+        expect(lines.join("\n")).not.toContain("pwned");
+      } finally {
+        output.restore();
+      }
+    });
+
+    test("cuts every daemon read off at the time left, so a hung daemon cannot stretch the hold", async () => {
+      const input = fixture();
+      await createInternalSessionAdmissionDriver(input).launchBuiltin("codex");
+      const topCalls = (input.io.capture as Mock).mock.calls
+        .filter(([, args]) => (args as string[])[0] === "container" && (args as string[])[1] === "top");
+      expect(topCalls.length).toBeGreaterThan(0);
+      for (const [, , options] of topCalls) {
+        expect(options).toMatchObject({ killSignal: "SIGKILL", maxBuffer: 64 * 1024 });
+        expect((options as { timeout: number }).timeout).toBeGreaterThan(0);
+        expect((options as { timeout: number }).timeout).toBeLessThanOrEqual(SESSION_HANDOFF_WAIT_CEILING_MS);
+      }
+    });
+
+    test("a container that stops as the listing fails is left to the attached wait, without a warning", async () => {
+      const output = captureOutput();
+      const input = fixture();
+      mocks.effectAnswers.set(TOP_LABEL, [{ status: 1, stdout: "", stderr: "container is not running" }]);
+      const foreground = attachableForeground();
+      mocks.topCommand.mockImplementation(() => {
+        // The agent exits just as the daemon is asked for its processes.
+        setTimeout(() => foreground.end({ kind: "exit", code: 3, signal: null }), 10);
+        return { executable: "docker", args: ["container", "top", CONTAINER_ID, "-o", "pid,ppid,args"] };
+      });
+      try {
+        const driver = createInternalSessionAdmissionDriver(input);
+        await expect(driver.launchBuiltin("codex")).resolves.toEqual({ status: 3, signal: null });
+        expect(output.drain().join("\n")).not.toContain("could not observe the session entry");
+      } finally {
+        output.restore();
+      }
+    });
+
+    test("an entry that never hands off holds the lock no longer than the ceiling", async () => {
+      const output = captureOutput();
+      const input = fixture();
+      mocks.effectAnswers.set(TOP_LABEL, [topAnswer("entry")]);
+      // A monotonic clock that advances 4 s per read, so the ceiling is reached
+      // in a few polls without waiting it out.
+      let clock = 0;
+      const foreground = attachableForeground();
+      const driver = createInternalSessionAdmissionDriver({
+        ...input,
+        sessionLockManager: orderedSessionLockManager(input.sessionLockManager),
+        nowMonotonicMs: () => (clock += 4_000),
+      });
+      try {
+        const launch = driver.launchBuiltin("codex");
+        await vi.waitFor(() => expect(mocks.events).toContain("release-attached-lock"));
+        foreground.end({ kind: "exit", code: 0, signal: null });
+        await expect(launch).resolves.toEqual({ status: 0, signal: null });
+        expect(tops()).toBeGreaterThan(0);
+        expect(tops()).toBeLessThanOrEqual(Math.ceil(SESSION_HANDOFF_WAIT_CEILING_MS / 4_000) + 1);
+        expect(mocks.events.indexOf("transition-attached")).toBeGreaterThan(mocks.events.lastIndexOf(TOP_LABEL));
+        expect(mocks.events.indexOf("release-attached-lock")).toBeGreaterThan(mocks.events.indexOf("transition-attached"));
+        const lines = output.drain();
+        expect(lines.filter((line) => line.includes(`did not hand off to the agent within ${SESSION_HANDOFF_WAIT_CEILING_MS} ms`)))
+          .toHaveLength(1);
+      } finally {
+        output.restore();
+      }
+    });
   });
 });

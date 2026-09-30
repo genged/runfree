@@ -98,9 +98,6 @@ function legacyVncSidecar(overrides: Partial<DockerContainerInspect> = {}): Dock
 function validate(attached: DockerContainerInspect[]) {
   return validateInternalNetworkParticipants({
     attached,
-    callbackRelay: {
-      port: "47123",
-    },
     internalNetwork,
     projectId,
     proxy: container(proxyName, [internalNetwork, `${project}_proxy_egress`]),
@@ -418,50 +415,110 @@ test("per-session shape accepts a valid ingress forwarder", () => {
   ])).toEqual([]);
 });
 
-// The mcp-callback forwarder (hop 1 of the two-hop callback) publishes the
-// callback port and targets a live session's internal IPv4. roleContainer's
-// session-agent IP is 172.30.0.30; validatePerSession's callbackRelay.port is
-// 47123.
-function mcpCallbackForwarder(target: string, port = "47123", hostPort = "47123"): DockerContainerInspect {
+// The mcp-callback forwarder (hop 1 of a session's callback) is bound to
+// exactly one live session (session MCP OAuth callback decisions, 2026-09-30):
+// env RUNFREE_CALLBACK_SESSION_ID/_CONTAINER name the owner, and the owner must
+// be a running session container of this project carrying that session id and
+// holding the forwarder's target address. sessionAgent below is that owner.
+const SESSION_ID = "rf-20260930-abcdef";
+const SESSION_CONTAINER_ID = "c".repeat(64);
+const SESSION_IP = "172.30.0.30";
+
+function sessionAgent(overrides: { id?: string; sessionId?: string; ip?: string; running?: boolean } = {}): DockerContainerInspect {
+  const id = overrides.id ?? SESSION_CONTAINER_ID;
+  return {
+    Config: {
+      Labels: {
+        [PROJECT_ID_LABEL]: projectId,
+        [CONTAINER_ROLE_LABEL]: "session-agent",
+        "io.runfree.session-id": overrides.sessionId ?? SESSION_ID,
+      },
+      User: "1000:1000",
+    },
+    Id: id,
+    Name: `/session-${id.slice(0, 8)}`,
+    State: { Running: overrides.running ?? true },
+    HostConfig: { NetworkMode: internalNetwork, PortBindings: {}, SecurityOpt: ["no-new-privileges:true"] },
+    NetworkSettings: { Networks: { [internalNetwork]: { IPAddress: overrides.ip ?? SESSION_IP } }, Ports: {} },
+  };
+}
+
+function mcpCallbackForwarder(options: {
+  target?: string;
+  hostPort?: string;
+  targetPort?: string;
+  sessionId?: string | null;
+  containerId?: string | null;
+  extraEnv?: readonly string[];
+  id?: string;
+} = {}): DockerContainerInspect {
+  const hostPort = options.hostPort ?? "47123";
+  const env = [
+    `INGRESS_HOST_PORT=${hostPort}`,
+    `INGRESS_TARGET=${options.target ?? SESSION_IP}`,
+    `INGRESS_TARGET_PORT=${options.targetPort ?? hostPort}`,
+    ...(options.sessionId === null ? [] : [`RUNFREE_CALLBACK_SESSION_ID=${options.sessionId ?? SESSION_ID}`]),
+    ...(options.containerId === null ? [] : [`RUNFREE_CALLBACK_SESSION_CONTAINER=${options.containerId ?? SESSION_CONTAINER_ID}`]),
+    ...(options.extraEnv ?? []),
+  ];
   return ingressForwarder("mcp-callback", hostPort, {
-    Config: { Env: [`INGRESS_HOST_PORT=${hostPort}`, `INGRESS_TARGET=${target}`, `INGRESS_TARGET_PORT=${port}`] },
+    ...(options.id ? { Id: options.id } : {}),
+    Config: { Env: env },
   });
 }
 
-test("accepts an mcp-callback forwarder targeting a live session's internal IP", () => {
+const proxyParticipant = () => container(proxyName, [internalNetwork, `${project}_proxy_egress`]);
+
+test("accepts an mcp-callback forwarder bound to the live session it targets", () => {
+  expect(validatePerSession([proxyParticipant(), sessionAgent(), mcpCallbackForwarder()])).toEqual([]);
+});
+
+test("accepts two sessions' forwarders on different ports", () => {
+  const otherContainer = "d".repeat(64);
   expect(validatePerSession([
-    container(proxyName, [internalNetwork, `${project}_proxy_egress`]),
-    roleContainer("session-agent", "session-1"),
-    mcpCallbackForwarder("172.30.0.30"),
+    proxyParticipant(),
+    sessionAgent(),
+    sessionAgent({ id: otherContainer, sessionId: "rf-20260930-ghijkl", ip: "172.30.0.32" }),
+    mcpCallbackForwarder(),
+    mcpCallbackForwarder({
+      hostPort: "47555",
+      target: "172.30.0.32",
+      sessionId: "rf-20260930-ghijkl",
+      containerId: otherContainer,
+      id: "second-forwarder",
+    }),
   ])).toEqual([]);
 });
 
-test("rejects an mcp-callback forwarder targeting a hardwired non-session IP (the legacy bug)", () => {
-  const issues = validatePerSession([
-    container(proxyName, [internalNetwork, `${project}_proxy_egress`]),
-    roleContainer("session-agent", "session-1"),
-    mcpCallbackForwarder("172.30.0.20"),
-  ]);
+test.each([
+  ["an unbound (pre-session-owned) forwarder, even targeting a live session", { sessionId: null, containerId: null }, /must be bound to its owning session/u],
+  ["a hardwired non-session target (the legacy bug)", { target: "172.30.0.20" }, /its own live session's internal IP/u],
+  ["a container name target", { target: agentName }, /IPv4 address, not a name/u],
+  ["a binding to another container", { containerId: "e".repeat(64) }, /its own live session's internal IP/u],
+  ["a binding to another session id", { sessionId: "rf-20260930-zzzzzz" }, /its own live session's internal IP/u],
+  ["a malformed session binding", { sessionId: "../../x" }, /malformed session binding/u],
+  ["different ports on the two hops", { targetPort: "47124" }, /forward to the port it publishes/u],
+  ["a port outside the callback block", { hostPort: "5000" }, /callback port in 47100-48099/u],
+  ["a duplicated binding entry", { extraEnv: ["RUNFREE_CALLBACK_SESSION_ID=rf-20260930-zzzzzz"] }, /must set RUNFREE_CALLBACK_SESSION_ID once/u],
+] as const)("rejects an mcp-callback forwarder with %s", (_label, options, message) => {
+  const issues = validatePerSession([proxyParticipant(), sessionAgent(), mcpCallbackForwarder(options)]);
   expect(issues.map((issue) => issue.code)).toContain("utility-ingress-forwarder-shape");
-  expect(issues.some((issue) => /live session/u.test(issue.message))).toBe(true);
+  expect(issues.some((issue) => message.test(issue.message))).toBe(true);
 });
 
-test("rejects an mcp-callback forwarder targeting a container name rather than an IP", () => {
-  const issues = validatePerSession([
-    container(proxyName, [internalNetwork, `${project}_proxy_egress`]),
-    roleContainer("session-agent", "session-1"),
-    mcpCallbackForwarder(agentName),
-  ]);
-  expect(issues.some((issue) => /IPv4 address, not a name/u.test(issue.message))).toBe(true);
+test("rejects an mcp-callback forwarder whose bound session container has stopped", () => {
+  const issues = validatePerSession([proxyParticipant(), sessionAgent({ running: false }), mcpCallbackForwarder()]);
+  expect(issues.some((issue) => /its own live session's internal IP/u.test(issue.message))).toBe(true);
 });
 
-test("rejects an mcp-callback forwarder that does not publish the callback port", () => {
+test("rejects a second mcp-callback forwarder for the same session", () => {
   const issues = validatePerSession([
-    container(proxyName, [internalNetwork, `${project}_proxy_egress`]),
-    roleContainer("session-agent", "session-1"),
-    mcpCallbackForwarder("172.30.0.30", "5000", "5000"),
+    proxyParticipant(),
+    sessionAgent(),
+    mcpCallbackForwarder(),
+    mcpCallbackForwarder({ hostPort: "47555", id: "second-forwarder" }),
   ]);
-  expect(issues.some((issue) => /must publish the callback port 47123/u.test(issue.message))).toBe(true);
+  expect(issues.some((issue) => /must own at most one mcp-callback forwarder/u.test(issue.message))).toBe(true);
 });
 
 function roleContainer(role: string, id: string, project = projectId): DockerContainerInspect {
@@ -479,9 +536,6 @@ function validatePerSession(attached: DockerContainerInspect[]) {
   return validateInternalNetworkParticipants({
     // No agent/agentName: the per-session runtime shape.
     attached,
-    callbackRelay: {
-      port: "47123",
-    },
     internalNetwork,
     projectId,
     proxy: container(proxyName, [internalNetwork, `${project}_proxy_egress`]),

@@ -1,4 +1,4 @@
-// `runfree mcp <list|explain|approve|revoke>` — Runfree import and project-local
+// `runfree mcp <list|explain|approve|enable|revoke>` — Runfree import and project-local
 // approval of MCP servers.
 //
 // Typed end-to-end: the yargs module converts argv into a typed intent and calls
@@ -9,12 +9,17 @@ import type { ArgumentsCamelCase, Argv } from "yargs";
 
 import { MCP_AGENT_IDS } from "../../agents.ts";
 import { createAdminState } from "../../admin/context.ts";
+import { activateApprovedControlsAfterMutation } from "../../control/activation.ts";
+import { activationReportLine } from "../../control/activation-report.ts";
 import {
   type McpApproveInput,
   type McpConfigureInput,
+  type McpEnableInput,
+  type McpEnableResult,
   type McpRulesInput,
   mcpApproveIntent,
   mcpConfigureIntent,
+  mcpEnableIntent,
   mcpExplainIntent,
   mcpListIntent,
   mcpRulesIntent,
@@ -37,6 +42,18 @@ type ConfigureArgs = { agent?: string[]; server?: string };
 type ExplainArgs = AgentServerArgs & { source?: string; json?: boolean };
 type RulesArgs = AgentServerArgs & { source?: string; tool?: string; write?: "allow" | "ask" | "deny" };
 type AuthArgs = AgentServerArgs & { source?: string };
+type RevokeArgs = AgentServerArgs & { source?: string };
+type EnableArgs = AgentServerArgs & {
+  source?: string;
+  "oauth-host"?: string[];
+  "no-discover"?: boolean;
+  "no-login"?: boolean;
+  "from-env"?: string;
+  "from-1password"?: string;
+  "from-source"?: string;
+  "from-stdin"?: boolean;
+  "replace-source"?: boolean;
+};
 type ApproveArgs = AgentServerArgs & {
   "from-env"?: string;
   "from-1password"?: string;
@@ -51,7 +68,7 @@ const agentServerPositionals = (cmd: Argv): Argv =>
     .positional("agent", { type: "string", demandOption: true, describe: `Agent ID that owns the server (${MCP_AGENT_IDS.join(" or ")})` })
     .positional("server", { type: "string", demandOption: true, describe: "MCP server name" });
 
-function approveTokenSource(argv: ArgumentsCamelCase<ApproveArgs>): McpApproveInput["tokenSource"] {
+function approveTokenSource(argv: ArgumentsCamelCase<ApproveArgs | EnableArgs>): McpApproveInput["tokenSource"] {
   return credentialSourceSelectionFromArgs({
     env: argv["from-env"],
     onePassword: argv["from-1password"],
@@ -160,6 +177,59 @@ export const mcpCommand: CommandModule = {
             }),
           )
           .command(
+            "enable <agent> <server>",
+            "Enable an MCP server in one review: approval, OAuth hosts, and credential source",
+            (cmd) =>
+              agentServerPositionals(cmd)
+                .option("source", { type: "string", requiresArg: true, describe: "Limit to a config source (user | local | project)" })
+                .option("oauth-host", {
+                  type: "string",
+                  array: true,
+                  requiresArg: true,
+                  nargs: 1,
+                  describe: "Also allow this exact OAuth host for the server (repeatable)",
+                })
+                .option("no-discover", {
+                  type: "boolean",
+                  describe: "Make no network call: skip OAuth metadata discovery and use only --oauth-host hosts",
+                })
+                .option("no-login", { type: "boolean", describe: "Do not run the OAuth login after enabling" })
+                .option("from-env", { type: "string", requiresArg: true, group: TOKEN_SOURCE_GROUP, describe: "Read the token from this host env var" })
+                .option("from-1password", { type: "string", requiresArg: true, group: TOKEN_SOURCE_GROUP, describe: "Read the token from a 1Password secret ref (op://...)" })
+                .option("from-source", { type: "string", requiresArg: true, group: TOKEN_SOURCE_GROUP, describe: "Bind a previously-saved host-owned source" })
+                .option("from-stdin", { type: "boolean", group: TOKEN_SOURCE_GROUP, describe: "Read the token from stdin" })
+                .option("replace-source", { type: "boolean", describe: "Overwrite an existing credential source for this server" })
+                .epilogue("OAuth hosts are allowed only while this server stays enabled, and only through the proxy. Revoke with runfree mcp revoke <agent> <server>; it removes exactly those hosts."),
+            handler((argv: ArgumentsCamelCase<EnableArgs>) => {
+              const interactive = process.stdin.isTTY === true && process.stdout.isTTY === true;
+              const intent: McpEnableInput = {
+                agent: parseMcpAgent(argv.agent),
+                server: argv.server,
+                source: parseMcpSource(argv.source),
+                tokenSource: approveTokenSource(argv),
+                replaceSource: Boolean(argv["replace-source"]),
+                oauthHosts: argv["oauth-host"] ?? [],
+                discover: !argv["no-discover"],
+                interactive,
+              };
+              return (async () => {
+                let result: McpEnableResult = { applied: false };
+                const status = await run(async () => {
+                  result = await mcpEnableIntent(intent);
+                });
+                if (status !== 0 || !result.applied) return status;
+                const activation = await activateApprovedControlsAfterMutation(context.runtimeContext(), nodeRuntimeIO);
+                console.log(activationReportLine(activation));
+                if (!result.login) return 0;
+                if (argv["no-login"] || !interactive) {
+                  if (result.loginCommand) console.log(`log in with: ${result.loginCommand}`);
+                  return 0;
+                }
+                return mcpAuthRuntime(result.login, context.runtimeContext(), nodeRuntimeIO);
+              })();
+            }),
+          )
+          .command(
             "auth <agent> <server>",
             "Run agent-native MCP OAuth login inside the validated runtime",
             (cmd) =>
@@ -201,11 +271,19 @@ export const mcpCommand: CommandModule = {
           )
           .command(
             "revoke <agent> <server>",
-            "Remove project-local MCP approval",
-            (cmd) => agentServerPositionals(cmd),
-            handler((argv: ArgumentsCamelCase<AgentServerArgs>) => {
-              const intent = { agent: parseMcpAgent(argv.agent), server: argv.server };
-              return run(() => mcpRevokeIntent(intent));
+            "Remove project-local MCP approval and the OAuth hosts mcp enable added",
+            (cmd) =>
+              agentServerPositionals(cmd)
+                .option("source", { type: "string", requiresArg: true, describe: "Limit to a config source (user | local | project)" }),
+            handler((argv: ArgumentsCamelCase<RevokeArgs>) => {
+              const intent = { agent: parseMcpAgent(argv.agent), server: argv.server, source: parseMcpSource(argv.source) };
+              return (async () => {
+                const status = await run(() => mcpRevokeIntent(intent));
+                if (status !== 0) return status;
+                const activation = await activateApprovedControlsAfterMutation(context.runtimeContext(), nodeRuntimeIO);
+                console.log(activationReportLine(activation));
+                return 0;
+              })();
             }),
           );
         return withExamples(built, "mcp")

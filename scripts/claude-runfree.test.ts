@@ -11,6 +11,8 @@ let fakeClaudePath: string;
 let installedAdapterPath: string;
 let argvPath: string;
 let countPath: string;
+let envPath: string;
+let portFilePath: string;
 
 beforeEach(() => {
   tmp = fs.mkdtempSync(path.join(os.tmpdir(), "runfree-claude-adapter-"));
@@ -26,11 +28,14 @@ beforeEach(() => {
   fakeClaudePath = path.join(libexecDir, "claude-real");
   argvPath = path.join(tmp, "argv.json");
   countPath = path.join(tmp, "count.txt");
+  envPath = path.join(tmp, "env.json");
+  portFilePath = path.join(tmp, "callback-port");
   fs.writeFileSync(fakeClaudePath, [
     "#!/usr/bin/env node",
     'const fs = require("node:fs");',
     'fs.writeFileSync(process.env.RUNFREE_TEST_ARGV_PATH, JSON.stringify(process.argv.slice(2)));',
     'fs.appendFileSync(process.env.RUNFREE_TEST_COUNT_PATH, "1\\n");',
+    'fs.writeFileSync(process.env.RUNFREE_TEST_ENV_PATH, JSON.stringify({ port: process.env.MCP_OAUTH_CALLBACK_PORT ?? null }));',
     "process.exit(Number(process.env.RUNFREE_TEST_EXIT_STATUS || 0));",
     "",
   ].join("\n"), { mode: 0o755 });
@@ -41,11 +46,14 @@ afterEach(() => {
 });
 
 function runAdapter(args: string[], exitStatus = 0): childProcess.SpawnSyncReturns<string> {
+  const { MCP_OAUTH_CALLBACK_PORT: _inherited, ...inheritedEnv } = process.env;
   return childProcess.spawnSync(installedAdapterPath, args, {
     encoding: "utf8",
     env: {
-      ...process.env,
+      ...inheritedEnv,
       RUNFREE_CLAUDE_MCP_CONFIG: "/runfree/mcp/claude.json",
+      RUNFREE_MCP_OAUTH_CALLBACK_PORT_FILE: portFilePath,
+      RUNFREE_TEST_ENV_PATH: envPath,
       RUNFREE_TEST_ARGV_PATH: argvPath,
       RUNFREE_TEST_COUNT_PATH: countPath,
       RUNFREE_TEST_EXIT_STATUS: String(exitStatus),
@@ -105,4 +113,41 @@ describe("Runfree Claude launch adapter", () => {
     expect(fs.readFileSync(countPath, "utf8").trim().split("\n")).toHaveLength(1);
     expect(capturedArgv()).toContain("--strict-mcp-config");
   });
+
+  test("exports the session callback port from the session file", () => {
+    fs.writeFileSync(portFilePath, "47612\n");
+    const result = runAdapter(["--dangerously-skip-permissions"]);
+
+    expect(result.status, result.stderr).toBe(0);
+    expect(capturedPort()).toBe("47612");
+  });
+
+  test.each([
+    ["absent", undefined],
+    ["empty", ""],
+    ["non-numeric", "47612; rm -rf /"],
+    ["leading zero", "047612"],
+    ["privileged", "80"],
+    ["out of range", "70000"],
+  ])("leaves the callback port unset when the session file is %s", (_label, contents) => {
+    if (contents !== undefined) fs.writeFileSync(portFilePath, contents);
+    const result = runAdapter(["--dangerously-skip-permissions"]);
+
+    expect(result.status, result.stderr).toBe(0);
+    expect(capturedPort()).toBeNull();
+  });
+
+  test("ignores a symlinked session callback port file", () => {
+    const target = path.join(tmp, "elsewhere");
+    fs.writeFileSync(target, "47612\n");
+    fs.symlinkSync(target, portFilePath);
+    const result = runAdapter(["--dangerously-skip-permissions"]);
+
+    expect(result.status, result.stderr).toBe(0);
+    expect(capturedPort()).toBeNull();
+  });
 });
+
+function capturedPort(): string | null {
+  return (JSON.parse(fs.readFileSync(envPath, "utf8")) as { port: string | null }).port;
+}

@@ -712,6 +712,19 @@ export function tryAcquireProjectLifecycleLock(context: RuntimeContext, renewalT
   return undefined;
 }
 
+/** Default tries of `tryAcquireProjectLifecycleLockWithRetry`. */
+export const PROJECT_LIFECYCLE_LOCK_RETRY_ATTEMPTS = 301;
+/** Default pause between those tries. */
+export const PROJECT_LIFECYCLE_LOCK_RETRY_DELAY_MS = 200;
+/**
+ * How long another command waits for the project lifecycle lock before it
+ * gives up. Anything that holds the lock on purpose while it waits for
+ * something outside the host (the launch's entry-handoff wait) must stay well
+ * inside this.
+ */
+export const PROJECT_LIFECYCLE_LOCK_RETRY_WINDOW_MS =
+  (PROJECT_LIFECYCLE_LOCK_RETRY_ATTEMPTS - 1) * PROJECT_LIFECYCLE_LOCK_RETRY_DELAY_MS;
+
 /**
  * Acquires the project lifecycle lock, retrying for one bounded renewal-sized
  * window before giving up.
@@ -725,8 +738,8 @@ export async function tryAcquireProjectLifecycleLockWithRetry(
   context: RuntimeContext,
   options: { attempts?: number; delayMs?: number } = {},
 ): Promise<ProjectLifecycleLock | undefined> {
-  const attempts = options.attempts ?? 301;
-  const delayMs = options.delayMs ?? 200;
+  const attempts = options.attempts ?? PROJECT_LIFECYCLE_LOCK_RETRY_ATTEMPTS;
+  const delayMs = options.delayMs ?? PROJECT_LIFECYCLE_LOCK_RETRY_DELAY_MS;
   if (!Number.isSafeInteger(attempts) || attempts < 1) {
     throw new Error("project lifecycle lock retry attempts must be a positive integer");
   }

@@ -74,6 +74,8 @@ import {
 } from "./runtime/ingress-forwarder-ownership.ts";
 import { createRuntimePlan } from "./runtime/plan.ts";
 import { failClosedSpawnStatus } from "./runtime/spawn-status.ts";
+import { createDockerApiCapture, type DockerApiCapture } from "./runtime/docker-api/transport.ts";
+import { runtimeTimingsEnabled } from "./runtime/timings.ts";
 import { planRuntimeUpgradeFromV2State, startRuntime } from "./runtime/startup.ts";
 import type {
   CaptureResult,
@@ -84,7 +86,7 @@ import type {
   RuntimeIO,
   TokenResolutionReceipt,
 } from "./runtime/types.ts";
-import { flushWarnings } from "./warnings.ts";
+import { flushWarnings, runfreeLog } from "./warnings.ts";
 import { remedy } from "./remedies.ts";
 import { setMcpLogContext } from "./runtime/mcp.ts";
 
@@ -100,10 +102,39 @@ function run(command: string, args: string[], options: childProcess.SpawnSyncOpt
   return result.status ?? 1;
 }
 
+let dockerApiCapture: DockerApiCapture | undefined;
+const dockerTransportCounts = { routed: 0, cli: 0 };
+
+function dockerTransport(): DockerApiCapture {
+  if (dockerApiCapture) return dockerApiCapture;
+  dockerApiCapture = createDockerApiCapture();
+  // Proof and measurement: how many capture calls the transport answered.
+  // Counts only; never argv or output.
+  if (runtimeTimingsEnabled(process.env)) {
+    process.once("exit", () => {
+      runfreeLog(`timing: docker-transport routed=${dockerTransportCounts.routed} cli=${dockerTransportCounts.cli}`);
+    });
+  }
+  return dockerApiCapture;
+}
+
 function capture(command: string, args: string[], options: childProcess.SpawnSyncOptions = {}): CaptureResult {
+  // A fixed allowlist of hot `docker` argv shapes is answered over the Engine
+  // API socket with CLI-identical output; every other call, and every doubt,
+  // stays on the CLI below (see runtime/docker-api/transport.ts).
+  let spawnOptions = options;
+  if (command === "docker") {
+    const outcome = dockerTransport()(command, args, options);
+    if (outcome.routed) {
+      dockerTransportCounts.routed += 1;
+      return outcome.result;
+    }
+    dockerTransportCounts.cli += 1;
+    if (outcome.timeout !== undefined) spawnOptions = { ...options, timeout: outcome.timeout };
+  }
   const result = childProcess.spawnSync(command, args, {
     encoding: "utf8",
-    ...options,
+    ...spawnOptions,
   });
   return {
     ...failClosedSpawnStatus(result),

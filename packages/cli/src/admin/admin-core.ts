@@ -3344,7 +3344,20 @@ export type ServiceConfigureInput = { id: string; reloadProxy: boolean };
 export type McpExplainInput = { agent: McpAgent; server: string; source?: McpSourceScope; json: boolean };
 export type McpApproveInput = { agent: McpAgent; server: string; tokenSource: TokenSourceSelection; replaceSource: boolean };
 export type McpConfigureInput = { agents?: McpAgent[]; server?: string };
-export type McpRevokeInput = { agent: McpAgent; server: string };
+export type McpRevokeInput = { agent: McpAgent; server: string; source?: McpSourceScope };
+export type McpEnableInput = {
+  agent: McpAgent;
+  server: string;
+  source?: McpSourceScope;
+  tokenSource: TokenSourceSelection;
+  replaceSource: boolean;
+  // `--oauth-host` values, validated by the intent.
+  oauthHosts: string[];
+  // false with `--no-discover`: no network call is made.
+  discover: boolean;
+  // Whether a person can answer the one review prompt (TTY on stdin and stdout).
+  interactive: boolean;
+};
 export type McpRulesInput = { agent: McpAgent; server: string; source?: McpSourceScope; tool?: string; write?: WriteAction };
 
 // --- Services ----------------------------------------------------------------

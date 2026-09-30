@@ -12,9 +12,10 @@ import {
   SESSION_FILE_MAX_BYTES,
   type SessionFileV1,
 } from "@runfree/runtime-contracts/session-file";
-import { afterEach, expect, test } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 
 import { scanSessionFiles } from "./session-files.ts";
+import { SessionIpAssignments } from "./session-ip-reuse.ts";
 
 const PROJECT_ID = "abcdef012345";
 const NETWORK_ID = "e".repeat(64);
@@ -279,4 +280,123 @@ test("presentKeys holds every well-formed key on disk, served or dropped by rule
   // under, name no key this scan may trust: neither is present.
   expect(scan.presentKeys.has(malformed.sessionKey)).toBe(false);
   expect(scan.presentKeys.has(misnamed.sessionKey)).toBe(false);
+});
+
+// I8 (launch plan Task 7, cadence change): the consumers now rescan on an
+// inotify event, and the host's atomic write creates its temp file in the
+// watched directory before the rename, so a scan lands inside the write window
+// on every publication. A rename between the scanner's `lstat` and its `open`
+// is the host replacing the file, not an attack on it: the scan must read the
+// replacement, and must neither drop the session nor fail the whole scan.
+function renameBeforeOpen(target: string, replacement: () => string, times: number): void {
+  const realOpen = fs.openSync.bind(fs) as (...args: unknown[]) => number;
+  let remaining = times;
+  vi.spyOn(fs, "openSync").mockImplementation(((filePath: fs.PathLike, ...rest: unknown[]) => {
+    if (remaining > 0 && String(filePath) === target) {
+      remaining -= 1;
+      const temporary = `${target}.${remaining}.tmp`;
+      fs.writeFileSync(temporary, replacement(), { mode: 0o644 });
+      fs.renameSync(temporary, target);
+    }
+    return realOpen(filePath, ...rest);
+  }) as typeof fs.openSync);
+}
+
+describe("a host rename between lstat and open (I8)", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  test("a session file replaced mid-read is read again, served, and kept present", () => {
+    const root = makeRoot();
+    writeEligibility(root);
+    const file = makeFile({ sessionKey: "a".repeat(64), sourceIp: "172.30.194.41" });
+    const target = writeSessionFile(root, file);
+    const renewed = { ...file, nonce: mintSessionFileNonce() };
+    renameBeforeOpen(target, () => serializeSessionFileV1(renewed), 1);
+
+    const scan = scanSessionFiles({ root, ownerUid: OWNER_UID, projectId: PROJECT_ID });
+    expect(scan.kind).toBe("ok");
+    if (scan.kind !== "ok") throw new Error("unreachable");
+    expect(scan.dropped).toEqual([]);
+    expect(scan.files.get(file.sessionKey)?.nonce).toBe(renewed.nonce);
+    expect(scan.presentKeys.has(file.sessionKey)).toBe(true);
+  });
+
+  test("eligibility.json replaced mid-read does not make the scan unreadable", () => {
+    const root = makeRoot();
+    writeEligibility(root);
+    const file = makeFile({ sessionKey: "b".repeat(64), sourceIp: "172.30.194.42" });
+    writeSessionFile(root, file);
+    renameBeforeOpen(path.join(root, "eligibility.json"), () => serializeSessionAdmissionEligibility(eligibility()), 1);
+
+    const scan = scanSessionFiles({ root, ownerUid: OWNER_UID, projectId: PROJECT_ID });
+    expect(scan.kind).toBe("ok");
+    if (scan.kind !== "ok") throw new Error("unreachable");
+    expect(Array.from(scan.files.keys())).toEqual([file.sessionKey]);
+  });
+
+  test("an IP assignment replaced mid-read still yields the assignment map", () => {
+    const root = makeRoot();
+    const requests = path.join(root, "ip-reuse", "requests");
+    fs.mkdirSync(requests, { recursive: true, mode: 0o755 });
+    fs.chmodSync(path.join(root, "ip-reuse"), 0o755);
+    fs.chmodSync(requests, 0o755);
+    const target = path.join(requests, "172.30.194.43.json");
+    const assignment = (nonce: string, state: "draining" | "ready") => `${JSON.stringify({
+      v: 1,
+      sourceIp: "172.30.194.43",
+      sessionKey: "c".repeat(64),
+      nonce,
+      state,
+    })}\n`;
+    fs.writeFileSync(target, assignment("1".repeat(32), "draining"), { mode: 0o644 });
+    renameBeforeOpen(target, () => assignment("2".repeat(32), "ready"), 1);
+
+    const read = new SessionIpAssignments(root, OWNER_UID).read();
+    expect(read).toBeDefined();
+    expect(read?.get("172.30.194.43")).toMatchObject({ nonce: "2".repeat(32), state: "ready" });
+  });
+
+  test("a link count caught mid-replace (the old inode being unlinked) is read again", () => {
+    // Measured on tmpfs and overlayfs: a reader racing `rename(tmp, name)`
+    // sees `nlink` 0 or 2 on the name for a moment.
+    const root = makeRoot();
+    writeEligibility(root);
+    const file = makeFile({ sessionKey: "e".repeat(64), sourceIp: "172.30.194.45" });
+    const target = writeSessionFile(root, file);
+    const realLstat = fs.lstatSync.bind(fs) as (...args: unknown[]) => fs.Stats;
+    let transient = 1;
+    vi.spyOn(fs, "lstatSync").mockImplementation(((filePath: fs.PathLike, ...rest: unknown[]) => {
+      const stat = realLstat(filePath, ...rest);
+      if (transient > 0 && String(filePath) === target) {
+        transient -= 1;
+        return Object.assign(Object.create(Object.getPrototypeOf(stat)), stat, { nlink: 0 });
+      }
+      return stat;
+    }) as typeof fs.lstatSync);
+
+    const scan = scanSessionFiles({ root, ownerUid: OWNER_UID, projectId: PROJECT_ID });
+    expect(scan.kind).toBe("ok");
+    if (scan.kind !== "ok") throw new Error("unreachable");
+    expect(scan.dropped).toEqual([]);
+    expect(Array.from(scan.files.keys())).toEqual([file.sessionKey]);
+  });
+
+  test("a file that keeps changing under every bounded re-read still fails closed", () => {
+    const root = makeRoot();
+    writeEligibility(root);
+    const file = makeFile({ sessionKey: "d".repeat(64), sourceIp: "172.30.194.44" });
+    const target = writeSessionFile(root, file);
+    let generation = 0;
+    renameBeforeOpen(target, () => `${serializeSessionFileV1(file)}${" ".repeat(++generation)}`, 100);
+
+    const scan = scanSessionFiles({ root, ownerUid: OWNER_UID, projectId: PROJECT_ID });
+    expect(scan.kind).toBe("ok");
+    if (scan.kind !== "ok") throw new Error("unreachable");
+    expect(scan.files.size).toBe(0);
+    expect(scan.dropped).toEqual([{ name: `${file.sessionKey}.json`, reason: "not-regular" }]);
+    // Bounded: the scanner gave up rather than chasing the writer.
+    expect(generation).toBeLessThanOrEqual(4);
+  });
 });

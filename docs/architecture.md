@@ -157,6 +157,71 @@ The TypeScript CLI lives under `packages/cli/src/`. It is responsible for:
 
 Command modules under `packages/cli/src/commands/` build typed intents. Shared enforcement lives under `packages/cli/src/admin/`, `packages/cli/src/runtime*`, and runtime contract packages.
 
+#### Docker Access
+
+Runtime code issues Docker operations as `docker` argv through one
+`capture` function (`packages/cli/src/runtime.ts`). A fixed allowlist of hot
+argv shapes is answered over the Docker Engine API Unix socket instead of by
+spawning the Docker CLI (`packages/cli/src/runtime/docker-api/`). The answer
+has the same status, stdout, and stderr bytes the CLI would print, so every
+caller, budget wrapper, operation histogram, and test fake still sees the
+argv and reads the same output.
+
+```text
+caller -> budget wrapper -> histogram -> capture(argv)
+                                            |
+                        routed argv shape? --no--> spawnSync docker
+                                            | yes
+                calling thread waits (Atomics.wait, the call's budget)
+                                            |
+                   worker thread: one HTTP request on the Unix socket
+                                            |
+                 CLI-identical CaptureResult {status, stdout, stderr}
+```
+
+- **Routes.** Raw `container inspect` / `inspect` / `image inspect` /
+  `network inspect` / `volume inspect`, the `{{.Id}}` and
+  `{{.State.Running}}` inspect templates, quiet `ps` with `label`, `name`,
+  `id`, and `network` filters, and non-TTY `exec [--user uid:gid] [-i]
+  <64-hex id> cmd…`. Matching is exact per token; an object reference must
+  match a strict character set, so no argv value can add a path segment or a
+  query parameter. Everything else (`compose`, `run`, `create`, `start`,
+  `rm`, other flags or templates) stays on the CLI.
+- **Endpoint.** Resolved on every call from the call's environment and the
+  user's Docker config exactly as the CLI resolves it (`DOCKER_HOST`,
+  `DOCKER_CONTEXT`, `currentContext`, context metadata;
+  `packages/cli/src/runtime/docker-endpoint.ts`). Only a local Unix socket
+  is used; TCP, SSH, TLS, both overrides set, custom config headers, or an
+  unreadable config keep the call on the CLI.
+- **Binding.** Once per process for each Docker CLI binary, socket file,
+  and context, the transport runs `docker version` with the call's
+  environment and requires the CLI's context and its view of the server
+  (version, API range, commit, OS, architecture, kernel, build time) to
+  match what the socket's daemon reports, and the daemon to say Docker in
+  `/_ping`. It then speaks the API version the CLI negotiated, so the daemon
+  shapes every body as it would for the CLI. A mismatch keeps the process on
+  the CLI. A replaced `docker` binary or a re-created or re-pointed socket
+  binds again. Type-less `inspect` is answered only while swarm is inactive.
+- **Opt-in for now.** The transport runs only with
+  `RUNFREE_DOCKER_TRANSPORT=api`; unset, empty, or `cli` keeps every call on
+  the Docker CLI. The default flips to on once
+  `make test-runtime-live-docker-transport` and the full live gate pass with
+  the transport on and off on a Docker host.
+- **Doubt stays on the CLI.** A `docker` on `PATH` that is not a native
+  binary (a shim or a test fake), `RUNFREE_TEST_FAKE_DOCKER=1`, an
+  unexpected spawn option, a refused connection, a missing object, or any
+  daemon refusal before an exec starts: the CLI answers, with the remaining
+  budget.
+- **Failures.** A routed call ends at its budget with status 124
+  (`timedOut`); there is no child process that could ignore SIGTERM. A call
+  with no budget ends at 60 s; Ctrl-C during a stuck routed call waits for
+  that bound, because the waiting thread cannot run a signal handler. A
+  socket error after connecting, an output over `maxBuffer`, or a lost
+  worker thread is status 125 (the last also sends the rest of the process
+  to the CLI). Once an exec has started, no failure hands it to the CLI, so
+  a command never runs twice: a refused start is the CLI's status 1, and an
+  exec whose exit code the daemon never records is 124 at the budget.
+
 ### Agent Container
 
 The `agent` service is the workspace where Claude Code, Codex, Pi, shells, build tools, package managers, MCP clients, and project commands run. The project is mounted at `/workspace`.
@@ -407,7 +472,7 @@ executors. Retirement requires root firewall exclusion, kernel TCP drain, then f
 acknowledgements from both consumers. The root-owned assignment remains bound
 to the new session key. See [IP Reuse Fence](#ip-reuse-fence).
 
-The root proxy process runs two independent loops. A 100 ms, single-flight,
+The root proxy process runs two independent loops. A single-flight,
 level-triggered admission loop reads only the root-owned session files, the
 eligibility file, IP assignments, local time, and the `session_ipv4` set. It never loads
 policy, resolves DNS, handles audit state, or performs upstream I/O. The
@@ -416,13 +481,24 @@ allowed-host addresses, and maintains the allowed and audit sets. A blocked DNS
 lookup therefore cannot delay admission, expiry, or revocation, and concurrent
 ticks coalesce into one pass over the current directory contents.
 
-The uid-1001 request proxy runs the same rule on its own 100 ms loop over its
+The uid-1001 request proxy runs the same rule on its own loop over its
 own observation map, and serves each connection from the map that loop built
 rather than re-reading the directory per connection
 ([validity rule](../packages/proxy/src/session-file-validity.ts),
 [scanner](../packages/proxy/src/session-files.ts)). Neither consumer reads the
-other's decision. Their target cadence is 100 ms, but scheduling can delay
-either process. Container creation waits for explicit retirement proof and
+other's decision.
+
+Each consumer's loop runs when an admission input changes and every 100 ms
+([watch](../packages/proxy/src/session-admission-watch.ts)). An inotify event
+naming a `.json` file in the admission root, `sessions/`, or
+`ip-reuse/requests/` schedules one coalesced pass; neither consumer watches
+its own acknowledgement directory. The event only moves the pass earlier and
+grants nothing. The 100 ms interval stays: it alone sees a lease run out
+(no file changes), and it covers a lost event or a watcher that failed or
+never armed, which it re-arms. A scan that lands inside the host's atomic
+replace (a changed inode or a link count other than 1 on the name) reads the
+file again, three reads in all, instead of dropping it. Scheduling can still
+delay either process. Container creation waits for explicit retirement proof and
 does not assume a maximum consumer delay.
 
 Proxy startup clears the session and IP assignment directories and removes the eligibility file,
@@ -446,11 +522,12 @@ directory, and the driver's ladder is:
    capability drops, mounts, `--restart no`, and a static address, then starts it
    attached — which is where Docker assigns the address and refuses a
    duplicate. A crash anywhere here leaves one inert record-and-container pair
-   the next reconcile reclaims exactly. The container's first process is the
-   base image's session entry
-   (`/usr/local/libexec/runfree/session-entry`), with the agent launch as its
-   argv; it polls the request proxy with the exact readiness request and does
-   not exec the agent until the proxy answers `200 active`.
+   the next reconcile reclaims exactly. The container runs under Docker's init
+   (`--init`, recorded in the session's template), and the init's child — the
+   container's first project-controlled process — is the base image's session
+   entry (`/usr/local/libexec/runfree/session-entry`), with the agent launch
+   as its argv; it polls the request proxy with the exact readiness request
+   and does not exec the agent until the proxy answers `200 active`.
 4. **Prove running** takes one post-start inspection, held byte-exact to the
    create plan — image, entrypoint and argv, user, capability drops,
    no-new-privileges, restart policy, every mount and its flags, environment,
@@ -458,19 +535,33 @@ directory, and the driver's ladder is:
    allocated address. It is the whole admission's only shape proof, and the
    session file's renewal anchor (process id, start time, network endpoint) is
    a projection of it.
-5. **Activate** writes the session file and advances the record to `attached`.
-   This is the first step that widens what the container may do; within one
-   consumer loop the firewall admits the address, the readiness probe gets
-   `200 active`, and the agent execs. A failure after the write deletes the
-   file again rather than leaving authority behind.
-6. **Await completion** releases the lifecycle lock and runs the heartbeat for
+5. **Activate** writes the session file. This is the first step that widens
+   what the container may do; on the file's own event (or within one 100 ms
+   loop) the firewall admits the address, the readiness probe gets `200
+   active`, and the agent execs. The probe retries 250 ms connect attempts
+   inside one 2 s run, because the firewall drops a not-yet-admitted SYN
+   without a reset and Linux resends it only after 1 s.
+   A failure after the write deletes the file again rather than leaving
+   authority behind.
+6. **Await handoff** keeps the lifecycle lock while it polls a daemon-side
+   `docker container top` (never an exec), anchored on the container's
+   `State.Pid`, until the entry has exec'd the agent. Only then is the record
+   advanced to `attached`, the status stamped, and the lock released, so no
+   proxy replacement can land between the grant and the exec and leave a
+   still-gated entry polling a proxy that no longer serves it. The wait also
+   ends when the foreground stream ends (the next step classifies that), when
+   the listing is unreadable, or at a fixed 10 s ceiling, well inside the
+   one-minute window other commands wait for the lock. The process table is
+   container-controlled, so it only decides when the launch reports; it
+   grants nothing.
+7. **Await completion** releases the lifecycle lock and runs the heartbeat for
    the life of the attached process.
-7. **Teardown** stamps the record terminal, deletes the file, disconnects,
+8. **Teardown** stamps the record terminal, deletes the file, disconnects,
    stops, removes the container, and only then removes the record. After a
    normal exit that one exact inspection proves, it skips the disconnect and
    the stop (see **Revoke** below).
 
-The project lifecycle lock covers steps 1–5 and teardown. It is released once
+The project lifecycle lock covers steps 1–6 and teardown. It is released once
 the session is `attached`; it is not held for the interactive process lifetime.
 The foreground admission driver requires a `SessionLockManager`; it has no
 raw-lock or optional lock-lease input that can retain the project lock across
@@ -637,6 +728,21 @@ session. Plain destroy's record scan excludes it; the session-listing gate
 still protects alive or unknown owners. Positive owner-death evidence permits
 normal cleanup; for an uncertain owner, `destroy --force` reclaims it.
 
+The ordinary way to get one is a Docker daemon that dies under a live session:
+the owner stamps its record, cannot delete the session file, keeps the record,
+and exits, and the restarted daemon has stopped both the session container and
+the proxy. A start finishes that teardown under the lifecycle lock, before it
+plans the runtime
+([pending reclaim](../packages/cli/src/runtime/session-admission-pending-reclaim.ts)).
+It requires a provably dead owner, a session container that is absent or
+stopped, and a session file no proxy can serve. A running selected proxy gets
+the ordinary delete. An absent or stopped one holds no file, because session
+files live on its tmpfs, and no other proxy for the project may be running.
+The container's absence is proved again before the record is dropped. Anything
+Docker cannot prove refuses with the reason and the remedy: retry once Docker
+answers or the owner exits, `runfree destroy --force` for an unprovable owner,
+`runfree rebuild` for a container that is still running.
+
 A project whose control-plane materialization predates the admission contract
 cannot be read: `runfree up` refuses with an invalid-component-evidence error
 and names `runfree rebuild`. A pre-cutover rebind journal stopped at a retired
@@ -752,9 +858,10 @@ Keep the cadence at or below one third of the lease.
 
 #### Readiness Entry
 
-The container's first process is the base image's `session-entry`, and the
-agent launch is its argv. The entry sends one exact readiness request to the
-request proxy and execs the agent only on `200` with body `active`:
+The container's first project-controlled process (the child of Docker's init)
+is the base image's `session-entry`, and the agent launch is its argv. The
+entry sends one exact readiness request to the request proxy and execs the
+agent only on `200` with body `active`:
 
 ```text
 before the session file   firewall drops the connection   probe: connect failure
@@ -766,8 +873,11 @@ The readiness answer is local. It forwards nothing, resolves nothing, and
 grants nothing. The wait bound is `RUNFREE_SESSION_ENTRY_TIMEOUT_MS` (60 s),
 rendered by the host. An entry that gives up exits 111. The container stops,
 that code becomes the launch exit status, and normal teardown reclaims the
-file, container, and record. The entry is cooperation, not enforcement. A
-project image may replace it; it then loses only start ordering.
+file, container, and record. The launch reports the session `attached` only
+after the entry has exec'd the agent (see "Await handoff" above). The entry is
+cooperation, not enforcement. A project image may replace it; it then loses
+only start ordering, and a replacement that never execs delays its own
+`attached` report by the 10 s handoff ceiling.
 
 #### IP Reuse Fence
 
@@ -907,8 +1017,49 @@ VNC, `runfree forward`). They are one-way host-to-agent transport sidecars on
 a loopback-only host bridge plus `agent_internal`. They are not credential or
 authorization boundaries. Runfree rejects unknown peers and checks each
 forwarder's command, networks, loopback publication, mounts, user,
-capabilities, and writable state. The MCP OAuth callback forwarder must target
-a live session address.
+capabilities, and writable state. The allocator never hands out an address an
+ingress forwarder still targets, whatever its purpose.
+
+#### Session MCP OAuth Callbacks
+
+When the selected OAuth policy names an MCP server, every launched session —
+agent, shell, resume, or `mcp auth` — gets its own callback path, set up after
+the running proof and before activation, so no client starts first
+([session-mcp-callback.ts](../packages/cli/src/runtime/session-mcp-callback.ts)):
+
+```text
+host 127.0.0.1:P -> forwarder (bound to session S) -> S's address:P
+                 -> in-session bridge (forwarder only) -> S's 127.0.0.1:P
+```
+
+- **Port.** The project's legacy callback port first, then up to 31
+  alternatives in the same block. A port another forwarder or host process
+  holds is skipped; Docker's loopback publication is the reservation.
+- **Binding.** The forwarder's `docker run` mints `RUNFREE_CALLBACK_SESSION_ID`
+  and `RUNFREE_CALLBACK_SESSION_CONTAINER`, so no forwarder exists without its
+  owner. Topology validation accepts it only when that container is a running
+  session carrying that session id at the forwarder's target address. An
+  unbound forwarder from before this design is refused.
+- **Clients.** The bridge writes the port to
+  `/tmp/runfree-mcp-oauth-callback-port`. The `claude` adapter exports
+  `MCP_OAUTH_CALLBACK_PORT`, and the `codex` adapter adds
+  `-c mcp_oauth_callback_port=<port>`, including for `codex mcp login` run from
+  a shell. Generated config carries no shared port or callback URL: Claude
+  prefers a configured `oauth.callbackPort` over the environment, and Codex
+  advertises a configured URL's port while listening on the override.
+- **Teardown.** The ordered session teardown removes the session's forwarder
+  after the session file and before the record, so the address is never
+  released while a route to it survives. A failure keeps the record for the
+  next reconcile. Unadmitted cleanup does the same.
+- **Reclaim.** When startup's topology validation or admission's participant
+  proof refuses, the refusing step removes callback forwarders that route to
+  no running owner (a killed launcher's leftover, a half-started forwarder, an
+  unbound one) under the lifecycle lock and proves once more. A forwarder whose
+  state cannot be read is never counted as dead. The healthy path spends no
+  Docker call on this.
+- **Failure.** A setup failure removes what it created and fails the launch
+  with a retry instruction. Sessions without an OAuth-capable server create
+  nothing.
 
 Before it admits a session beside a forwarder, the host rechecks that shape,
 the resolved immutable image ID, and the exact internal and host network IDs
@@ -1258,8 +1409,73 @@ Runfree imports supported Claude and Codex MCP entries into sanitized per-agent 
 - Host/user/local MCP entries can be inspected with `runfree mcp list` and `runfree mcp explain`.
 - Project `.mcp.json` and `.codex/config.toml` entries are imported only after `runfree mcp approve`.
 - Static headers require a host-owned credential source.
-- OAuth login runs through `runfree mcp auth` or `runfree mcp approve --login` inside a validated runtime.
-- Side-effecting MCP tool calls use the same write-approval posture as outbound writes and can be governed with `runfree mcp rules`.
+- OAuth login works from any session: every session with an OAuth-capable approved server gets its own loopback callback path ([Session MCP OAuth Callbacks](#session-mcp-oauth-callbacks)). `runfree mcp auth` and `runfree mcp approve --login` are shortcuts that launch a session and print the login steps.
+- `runfree mcp enable` combines the approval, the credential source, and the server's OAuth hosts in one review. OAuth hosts come from host-side discovery ([mcp-discovery.ts](../packages/cli/src/admin/mcp-discovery.ts): HTTPS GET to public, checked addresses only, pinned connection, no redirects, credentials, or proxy) or from `--oauth-host`. They are stored in a host-owned record (`mcp-enabled.json` in project state, [mcp-enabled.ts](../packages/cli/src/runtime/mcp-enabled.ts)), keyed like MCP rules: the descriptor digest for project entries, the endpoint for user and local entries. The effective preparation projects each matching record beside the server's endpoint host, into the same host-only policy copy, never into desired policy. A host that only a discovered record allows gets request rules for `/.well-known` and the record's endpoint paths (prefix match), and those endpoints join the server's OAuth mediation policy as static token and registration endpoints, except an endpoint another server also claims: the proxy files tokens under the first matching server, so a shared endpoint is left to run-time mediation. An invalid record grants nothing; the next `enable` or `revoke` rewrites the file without it. `runfree mcp revoke` deletes the server's records, so the projection, a union over records, drops exactly its hosts.
+- Side-effecting MCP tool calls use the same write-approval posture as outbound writes and can be governed with `runfree mcp rules`. This covers HTTP MCP servers, whose calls pass the proxy. STDIO servers run inside the agent container and their calls do not pass the proxy.
+
+### Portable Compute MCP
+
+Some Codex Desktop MCP servers do compute work with a host executable. Runfree
+never runs an imported command on the host and never mounts a host executable.
+Instead, a small Runfree catalog maps known compute descriptors to Runfree-owned
+servers that ship in the agent image (`packages/cli/src/runtime/portable-mcp.ts`).
+
+```text
+host ~/.codex/config.toml                      generated agent Codex config
+[mcp_servers.node_repl]                        [mcp_servers.node_repl]
+command = "/Applications/Codex.app/        ->  command = "/usr/local/bin/runfree-mcp"
+  Contents/Resources/node_repl"                args = ["node-repl"]
+env = { CODEX_HOME = "...", ... }              (host command, args, env, cwd discarded)
+```
+
+- Classification runs before the generic STDIO rules. Phase 1 matches only a
+  Codex descriptor named `node_repl` whose command is `Codex.app/Contents/Resources/node_repl`
+  or `.../cua_node/bin/node_repl` (any parent directory), with `args` empty or
+  `["--disable-sandbox"]`, only known env keys, and no `cwd` or `env_vars`.
+  These shapes come from public Codex issue reports.
+- A descriptor that looks like `node_repl` but fails a rule is skipped with
+  `portable descriptor changed and is not supported by this Runfree version`.
+  A `node_repl` with a bare command name keeps the generic STDIO rules.
+- A Codex Computer Use descriptor (`computer-use`, `unified-computer-use`,
+  `SkyComputerUseClient`, or the `openai-bundled/computer-use` plugin cache)
+  controls host desktop apps and is skipped. Isolated-display computer use is
+  not supported yet.
+- The generated entry keeps only safe scalar options (`startup_timeout_sec`,
+  `tool_timeout_sec`, `enabled`, `enabled_tools`, `disabled_tools`). It never
+  sets `required`, so a missing server cannot stop the agent session.
+- A project `.codex/config.toml` entry still needs `runfree mcp approve`. The
+  approval digest binds the capability id and its contract version, not the
+  host path. A contract change needs a new approval.
+- `runfree-mcp` accepts exactly one compiled capability id. The `node-repl`
+  server exposes `js` (with `code`, optional `timeout_ms` and `title`) and
+  `js_reset`. JavaScript runs in a child kernel process as the agent user, in
+  the session working directory, with the agent's mounts and network policy.
+  Limits: 256 KiB of code, 1 MiB of output per call, a 30 s default and 600 s
+  maximum time limit. A timeout or `js_reset` kills the kernel's process
+  group and discards its state (a process the cell moves to its own session
+  or group escapes that kill). The semantics are a compatible subset of Codex
+  Desktop's `node_repl`: a cell that uses top-level `await` runs as an async
+  function body, so its declarations do not persist and its last expression is
+  not returned (use `globalThis`, `return`, or `nodeRepl.write`); redeclaring a
+  top-level `let` or `const` from an earlier call is a `SyntaxError`; there is
+  no `js_add_node_module_dir`. Browser Use and Computer Use bootstraps that
+  import host plugin scripts do not work, because those scripts are not in the
+  container.
+- The server is built from `packages/agent-runtime/src/mcp/` with
+  `@modelcontextprotocol/sdk`, pinned in `pnpm-lock.yaml`. `pnpm run
+  bundle:agent-mcp` bundles only the STDIO server path with the pinned Bun
+  (1.3.14) into the committed `packages/agent-runtime/agent/mcp/`, with a
+  `manifest.json` of source hashes, file hashes, and each bundled package's
+  version, license, and lockfile integrity. CI rebuilds and byte-compares it
+  (`pnpm run bundle:agent-mcp -- --check`). The files are agent-image runtime
+  assets, so they feed the agent image input digest and the session agent
+  materialization.
+- The image build runs `self-check.mjs` as the agent user with no network. It
+  checks the files against the manifest, that the dispatcher refuses unknown
+  input, and one `js` call. Runfree does not yet run this check against the
+  selected image at session start, so `runfree mcp explain` says the selected
+  image was not checked. A project image that removes the bundle makes only
+  that server fail to start.
 
 ## Dependency Overlays
 

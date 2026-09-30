@@ -28,13 +28,19 @@ export const CORE_LIVE_FILES = [
   "tests/runtime/live/allowlist-lifecycle.live.test.ts",
   "tests/runtime/live/live-policy-mutation.live.test.ts",
   "tests/runtime/live/managed-launch.live.test.ts",
+  "tests/runtime/live/mcp-enable.live.test.ts",
   "tests/runtime/live/session-admission-negative.live.test.ts",
   "tests/runtime/live/session-admission-drift.live.test.ts",
+  // Every admission and startup observation of a routed argv now reads the
+  // Engine API transport's answer, so its equality with the CLI is part of
+  // the trust boundary's proof.
+  "tests/runtime/live/docker-transport-equivalence.live.test.ts",
 ] as const;
 
 /** Files that hold cases of both tiers, split per case with `liveTierTest`. */
 export const MIXED_LIVE_FILES = [
   "tests/runtime/live/session-admission-attached.live.test.ts",
+  "tests/runtime/live/ingress-forwarder.live.test.ts",
   "tests/runtime/live/launch-latency.live.test.ts",
 ] as const;
 

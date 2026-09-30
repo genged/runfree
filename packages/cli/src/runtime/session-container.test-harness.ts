@@ -47,6 +47,8 @@ import {
   bindSessionContainerTemplateGenerationV2,
   createSessionContainerCreatePlan,
   createSessionContainerTemplate,
+  createSessionContainerTemplateFromArtifact,
+  sessionContainerTemplateInit,
   type SessionContainerCreatePlan,
   type SessionContainerTemplate,
 } from "./session-container-template.ts";
@@ -149,7 +151,9 @@ export function sessionContainerInspectJsonFixture(
     HostConfig: {
       NetworkMode: plan.effectiveControlPlane.networkIds.agentInternal,
       Privileged: false,
-      Init: false,
+      // Docker omits `Init` when no `--init` was requested; a version 1
+      // (pre-init) template's container is modelled with the explicit false.
+      Init: sessionContainerTemplateInit(plan.template),
       AutoRemove: false,
       PublishAllPorts: false,
       RestartPolicy: { Name: SESSION_CONTAINER_RESTART_POLICY, MaximumRetryCount: 0 },
@@ -282,6 +286,16 @@ export function sessionContainerTemplateFixture(input: {
       source: "GH_TOKEN=raw-secret\nTERM=xterm-256color\n",
     },
   });
+}
+
+/**
+ * The same template as a runfree release before 2026-09-30 stored it: version
+ * 1, no `init` key, so its containers run without Docker's init wrapper. Only
+ * the durable-artifact restore can mint one; this fixture goes through it.
+ */
+export function sessionContainerLegacyTemplateFixture(): SessionContainerTemplate {
+  const { init: _init, ...current } = JSON.parse(JSON.stringify(sessionContainerTemplateFixture())) as Record<string, unknown>;
+  return createSessionContainerTemplateFromArtifact({ ...current, version: 1 }, SESSION_TEST_PROJECT);
 }
 
 export function sessionGenerationFixture(): {

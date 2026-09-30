@@ -185,7 +185,7 @@ host: allocate IP -> fence IP -> create+start container -> inspect once
                                                               |
       <- heartbeat every 30 s: inspect, rewrite file  <- write session file
                                                               |
-proxy: firewall + request proxy read the file (100 ms loops) -> serve IP
+proxy: firewall + request proxy read the file (on change; 100 ms backstop) -> serve IP
 ```
 
 1. **No file, no traffic.** An IP is served only while a root-owned,
@@ -238,7 +238,32 @@ Details: [Write Approval Grants](architecture.md#write-approval-grants).
    passive project descriptors at startup. It does not stop code already
    running in the agent from starting another binary or config.
 3. Static headers need a host-owned credential source.
-4. MCP tool calls follow the write-approval rules (`runfree mcp rules`).
+4. HTTP MCP tool calls follow the write-approval rules (`runfree mcp rules`).
+   STDIO MCP servers run inside the agent container; their calls do not pass
+   the proxy, so `runfree mcp rules` refuses them.
+5. No imported MCP descriptor starts a host process. Local STDIO commands run
+   only in the agent container. A known portable descriptor (Codex Desktop
+   `node_repl`) is replaced by the fixed `runfree-mcp` command from the agent
+   image; its host command, args, env values, and working directory are
+   discarded and never enter the container or the approval digest. Codex
+   `computer-use` (host desktop control) is skipped. See
+   [Portable Compute MCP](architecture.md#portable-compute-mcp).
+6. A portable server has the agent's authority, no more: it runs as the agent
+   user with the agent's mounts, network policy, and placeholder-only
+   environment. It gets no proxy-managed credential.
+7. **Each session owns its OAuth callback path.** When an approved MCP server
+   can use OAuth, every session gets its own loopback port, forwarder, and
+   in-session bridge before it starts. The forwarder is bound to that session
+   and removed before the session's record releases its address. The bridge
+   accepts only its forwarder. The port is a routing value, not an
+   authorization secret: the client keeps state, PKCE, and issuer checks.
+8. `runfree mcp enable` adds OAuth hosts only after one host-side review.
+   Discovery contacts a project-named host only after the user agrees, on a
+   terminal, and only public, checked addresses over a pinned HTTPS
+   connection. It adds a host only when valid metadata names a token endpoint
+   the proxy mediates for that server. The hosts live in host-owned state, not
+   in desired policy, and stop applying when the reviewed server config
+   changes. `runfree mcp revoke` removes exactly them.
 
 ### Agent Container
 
@@ -251,6 +276,27 @@ Details: [Write Approval Grants](architecture.md#write-approval-grants).
 3. Agent CLIs run with their own sandbox off (`--dangerously-skip-permissions`,
    `--dangerously-bypass-approvals-and-sandbox`). The container is the
    sandbox, so agent-side permission rules add nothing to it.
+4. **Docker's init is PID 1, not a boundary.** A session container is created
+   with `--init`, so PID 1 is Docker's `docker-init` (tini) and the session
+   entry, then the agent, is its child. The init forwards the stop signal, so
+   `docker stop` reaches a live agent at once (exit 143 when the agent dies
+   of the signal; an agent that handles it exits with its own status) instead
+   of waiting out the stop timeout for a PID 1 that ignores SIGTERM. It runs as the same
+   uid 1000 with the same capabilities and `no-new-privileges`, so the agent
+   gains nothing by reaching it. Its bind mount is added by the daemon and is
+   outside the inspection proof; a project image can make PID 1 something
+   else, which costs only the fast stop. Project `TINI_*` variables
+   (`TINI_SUBREAPER`, `TINI_KILL_PROCESS_GROUP`, `TINI_VERBOSITY`) are honored:
+   none changes identity, capabilities, mounts, or network, and Docker's
+   SIGKILL after the stop timeout is the real stop bound. The engine must ship
+   Docker's init (`docker-init`); Docker Desktop, OrbStack, and Docker Engine
+   packages do. Without it, the container fails to start, the daemon's error
+   is shown, and nothing is left behind.
+   The init is recorded in each session's stored template: a session started
+   by an older release keeps its template, runs without the init, and is
+   proven that way (across proxy replacements too) until it ends.
+   Downgrading Runfree while sessions from a newer release are live is not
+   supported: run `runfree destroy --force` first.
 
 ### Host Files
 
@@ -273,6 +319,19 @@ Details: [Write Approval Grants](architecture.md#write-approval-grants).
    nothing.
 4. `runfree stop` and `runtime reload-policy` need `--force` while live or
    unknown sessions, a pending rebind, or an interrupted teardown exist.
+5. A start finishes an interrupted teardown only on Docker's proof: the owner
+   is dead, the session container is absent or stopped, and no proxy can
+   serve the session file. The record goes only after Docker proves the
+   container absent. Anything Docker cannot prove keeps the record and refuses
+   with the reason and its remedy.
+6. The Docker Engine API transport contacts only the daemon the Docker CLI
+   would contact, over a local Unix socket, and only with the fixed read and
+   exec requests its routes build. No argv value, project file, or agent
+   output selects the socket, the method, or the endpoint. An answer it
+   cannot give exactly as the CLI would goes to the CLI, and a started exec
+   is never re-run. It is opt-in (`RUNFREE_DOCKER_TRANSPORT=api`) until its
+   live equivalence proof has passed. See
+   [Docker Access](architecture.md#docker-access).
 
 ## What Runfree Does Not Prove
 
@@ -297,6 +356,21 @@ Details: [Write Approval Grants](architecture.md#write-approval-grants).
 
 ## Residual Risks
 
+- **The OAuth callback page reaches the host browser.** An eligible session
+  answers its own callback URL, and the operator's browser renders that answer
+  on `localhost`. A compromised session can use the page to send data out
+  through the browser, or to reach other localhost services with same-site
+  requests. This is the same channel `runfree forward` and `runfree vnc` open,
+  but it exists in every eligible session. Open callback URLs only for logins
+  you started.
+- **A callback forwarder that dies mid-session frees its address.** The
+  forwarder's `agent_internal` address is dynamic. If the forwarder exits while
+  its session runs, that address can go to a later session, which then passes
+  the bridge's peer check. It can only reach the first session's loopback
+  callback listener, which still checks OAuth state. The host port is also
+  freed and could be taken by another project; PKCE stops the code from being
+  redeemed there.
+
 Accepted, known risks:
 
 | Risk | Why it remains |
@@ -308,6 +382,8 @@ Accepted, known risks:
 | Native Claude, Codex, and Pi login state is readable by agent code | Agents need it to log in; it is per project |
 | Credentialless operational services (`agent-claude`, `agent-codex`) are open to any process in the agent | The user confirms them at launch; they carry no proxy credential |
 | Project image builds run before the sandbox exists | The build uses host Docker networking; review Dockerfiles and wide contexts (`runfree image approve-context`) |
+| `mcp enable` discovery tells the named host that you ran it (your IP and the time) | It asks first for project entries and sends no credentials; `--no-discover` makes no call |
+| An `--oauth-host` host is allowed like `host add`, and a request rule path prefix also admits sub-paths the proxy does not mediate (for example `/oauth/token/`) | The user named the host; discovered hosts get exact-endpoint rules, and token requests still follow write approval |
 | Audit mode allows non-listed hosts for a time window | It is explicit (`up --audit-network`) and never edits policy |
 | Audited WSS upgrades pass configured credential headers as-is | The WebSocket passthrough cannot rewrite upgrade headers; enforce mode is not affected |
 | Checkout binding cannot tell apart volumes mounted at the same path | It is a scope key, not an authority; see [Checkout Binding](architecture.md#checkout-binding) |

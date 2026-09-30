@@ -1,0 +1,77 @@
+{
+  "schemaVersion": 1,
+  "bundleVersion": "1.0.0",
+  "bundler": {
+    "name": "bun",
+    "version": "1.3.14"
+  },
+  "capabilities": [
+    {
+      "id": "node-repl",
+      "contractVersion": 1
+    }
+  ],
+  "files": {
+    "runfree-mcp.mjs": "sha256:cab357893192f33ea18acb2c76b86f1b9f64ea2de719f8f480bcfd4f74f22e65",
+    "node-repl-kernel.mjs": "sha256:20c92d4d75d1e57a86a4a9b77f7258536472bd4161608ffee3d8f896bc14ba0d",
+    "self-check.mjs": "sha256:580223ee517b7c303b2dadb8cafd0c785fa1a3a97cc3515fcac58244d6835925"
+  },
+  "packages": [
+    {
+      "integrity": "sha512-UvTMgnNlnIBO/22ob2RcVGDlcvOslQs8T59+FTGdA0L27a39fdGF/EDETNtDVK4DZGpwomlsYpRdA8UXcVL/pw==",
+      "license": "MIT",
+      "name": "@modelcontextprotocol/sdk",
+      "version": "1.31.0"
+    },
+    {
+      "integrity": "sha512-Thbli+OlOj+iMPYFBVBfJ3OmCAnaSyNn4M1vz9T6Gka5Jt9ba/HIR56joy65tY6kx/FCF5VXNB819Y7/GUrBGA==",
+      "license": "MIT",
+      "name": "ajv",
+      "version": "8.20.0"
+    },
+    {
+      "integrity": "sha512-8iUql50EUR+uUcdRQ3HDqa6EVyo3docL8g5WJ3FNcWmu62IbkGUue/pEyLBW8VGKKucTPgqeks4fIU1DA4yowQ==",
+      "license": "MIT",
+      "name": "ajv-formats",
+      "version": "3.0.1"
+    },
+    {
+      "integrity": "sha512-f3qQ9oQy9j2AhBe/H9VC91wLmKBCCU/gDOnKNAYG5hswO7BLKj09Hc5HYNz9cGI++xlpDCIgDaitVs03ATR84Q==",
+      "license": "MIT",
+      "name": "fast-deep-equal",
+      "version": "3.1.3"
+    },
+    {
+      "integrity": "sha512-GZMtZUTNRpOVIECoXwLNZS5xUGE+mVNbTB8h/7Rwh2TFWcBQiPzTgyZi05BF9UMZKkLJv8XBRJTlU7zg8+ZfMg==",
+      "license": "BSD-3-Clause",
+      "name": "fast-uri",
+      "version": "3.1.8"
+    },
+    {
+      "integrity": "sha512-NM8/P9n3XjXhIZn1lLhkFaACTOURQXjWhV4BA/RnOv8xvgqtqpAX9IO4mRQxSx1Rlo4tqzeqb0sOlruaOy3dug==",
+      "license": "MIT",
+      "name": "json-schema-traverse",
+      "version": "1.0.0"
+    },
+    {
+      "integrity": "sha512-v5l/aFXZQeai4awLbOpSoHecE9UiMrnfx75tEXLjNonXVARxQ5mOeipTjROUchszUNCqnE+hqAMujRsRHsut2Q==",
+      "license": "MIT",
+      "name": "zod",
+      "version": "4.6.5"
+    },
+    {
+      "integrity": "sha512-O/PgfnpT1xKSDeQYSCfRI5Gy3hPf91mKVDuYLUHZJMiDFptvP41MSnWofm8dnCm0256ZNfZIM7DSzuSMAFnjHA==",
+      "license": "ISC",
+      "name": "zod-to-json-schema",
+      "version": "3.25.2"
+    }
+  ],
+  "sources": {
+    "capabilities.ts": "sha256:89394b36c98b9fe0ccd1c9f781d011ad291b9a5766642080bfc7d044c14527e9",
+    "kernel-protocol.ts": "sha256:51dbbf266419597911d8698a130b292d3bdf9a0faa3534bbdaab5aee63dddd0a",
+    "node-repl-kernel.ts": "sha256:c6a4d0379a0e2cba154bba0f1f3900438e2c484738700101801cf0ba66ca5656",
+    "node-repl-server.ts": "sha256:55a6df4ef52827dbb8ade8ddba2a3a1966da45336c7361169f0b5c83a41b77c4",
+    "runfree-mcp.ts": "sha256:ef90aa09b314cb2bf56f8b7e18f27bbb984a6bb2d43432a87093c5e1e3c4c49c",
+    "self-check.ts": "sha256:4215b6a48b94ae7407ec28c1a5e19453f8feb93e03fa65952eb3eba7f5e05aed"
+  }
+}

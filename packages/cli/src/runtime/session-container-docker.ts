@@ -11,12 +11,14 @@ import {
 } from "./session-container-contract.ts";
 import {
   assertSessionContainerCreatePlan,
+  sessionContainerTemplateInit,
   type SessionContainerCreatePlan,
 } from "./session-container-template.ts";
 import {
   assertSessionNamedVolumeProof,
   type SessionNamedVolumeProof,
 } from "./session-named-volume-proof.ts";
+import { SESSION_ENTRY_PATH } from "./session-launch.ts";
 import {
   assertSessionContainerRecordProject,
   parseSessionContainerRecordV2,
@@ -57,6 +59,7 @@ export type SessionDockerCommand = {
   effect:
     | "create-session-container"
     | "inspect-session-container"
+    | "top-session-container"
     | "start-attach-session-container"
     | "attach-session-container"
     | "inspect-session-network"
@@ -208,6 +211,11 @@ export function sessionContainerCreateCommand(
       ...(plan.launch.tty ? ["--tty"] : []),
       ...SESSION_CONTAINER_SECURITY_OPTIONS.flatMap((option) => ["--security-opt", option]),
       ...SESSION_CONTAINER_CAPABILITY_DROPS.flatMap((capability) => ["--cap-drop", capability]),
+      // Docker's init as PID 1 forwards the stop signal to the entry and then
+      // the agent; a PID 1 agent without a SIGTERM handler drops it and waits
+      // out the stop timeout. Per template: a pre-init (version 1) template's
+      // container is created exactly as it was proven, without the wrapper.
+      ...(sessionContainerTemplateInit(plan.template) ? ["--init"] : []),
       "--stop-signal",
       SESSION_CONTAINER_STOP_SIGNAL,
       "--entrypoint",
@@ -386,6 +394,116 @@ export function sessionNetworkInspectCommand(networkId: string): SessionDockerCo
     exactTarget: networkId,
     args: ["network", "inspect", networkId],
   });
+}
+
+/**
+ * A daemon-side process listing of the exact session container.
+ *
+ * Read-only and outside the container: the daemon lists the container's
+ * processes with its own `ps`, so nothing runs in the untrusted namespace
+ * (never an exec). The columns are explicit — `pid,ppid,args` — so the answer
+ * can be anchored on the container's `State.Pid` rather than on process names.
+ * Its only consumer is the handoff wait, which decides when a launch reports
+ * `attached`; see `parseSessionContainerTopHandoff` for what it may conclude.
+ */
+export function sessionContainerTopCommand(
+  record: SessionContainerRecordV2,
+  expected: SessionContainerProjectIdentity,
+): SessionDockerCommand {
+  assertRecord(record, expected);
+  const containerId = exactContainerId(record);
+  return validatedCommand({
+    executable: "docker",
+    effect: "top-session-container",
+    exactTarget: containerId,
+    args: ["container", "top", containerId, "-o", "pid,ppid,args"],
+  });
+}
+
+/** Upper bound on a `docker container top` answer this host will read. */
+export const SESSION_CONTAINER_TOP_MAX_BYTES = 64 * 1024;
+/** Upper bound on the processes one answer may list. */
+const SESSION_CONTAINER_TOP_MAX_PROCESSES = 4_096;
+
+export type SessionContainerTopHandoff = "entry-running" | "handed-off" | "not-started" | "unreadable";
+
+export type SessionContainerTopAnchor = Readonly<{
+  /** The container's `State.Pid` from the running proof (daemon pid namespace). */
+  anchorPid: number;
+  /** Whether the session's own template runs the container under Docker's init. */
+  init: boolean;
+}>;
+
+function processId(value: string | undefined): number | undefined {
+  if (value === undefined || !/^[0-9]{1,10}$/u.test(value)) return undefined;
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) ? parsed : undefined;
+}
+
+/**
+ * Whether the session entry has handed off to the agent, read from one
+ * `docker container top <id> -o pid,ppid,args` answer.
+ *
+ * Anchored on the host-trusted `State.Pid` of the running proof, never on a
+ * process name the container could spell:
+ *
+ *   with init     the anchor is Docker's init; its children are the entry
+ *                 and, once the entry has exec'd, the agent;
+ *   without init  the anchor itself is the entry, then the agent.
+ *
+ * The anchored process runs the entry when `SESSION_ENTRY_PATH` is the first
+ * or second word of its command (a binary, or a script under its
+ * interpreter, `/bin/sh <entry>`).
+ *
+ *   entry-running  an anchored process still runs the entry;
+ *   handed-off     anchored processes exist and none runs the entry;
+ *   not-started    the init has no child yet;
+ *   unreadable     anything else: no `PID`/`PPID` columns, a command column
+ *                  that is not last, a malformed row, the anchor missing, no
+ *                  row, or an answer over the size or row bound.
+ *
+ * Never throws. The process table is container-controlled data: the answer
+ * decides only when one launch stops holding its own lifecycle lock and
+ * reports `attached`, and it grants and withholds no authority. Callers must
+ * never echo the text, which can carry terminal escape sequences.
+ */
+export function parseSessionContainerTopHandoff(
+  stdout: string,
+  anchor: SessionContainerTopAnchor,
+): SessionContainerTopHandoff {
+  try {
+    if (typeof stdout !== "string" || stdout.length > SESSION_CONTAINER_TOP_MAX_BYTES) return "unreadable";
+    if (!Number.isSafeInteger(anchor.anchorPid) || anchor.anchorPid < 1) return "unreadable";
+    const lines = stdout.split("\n").filter((line) => line.trim() !== "");
+    if (lines.length - 1 > SESSION_CONTAINER_TOP_MAX_PROCESSES) return "unreadable";
+    const header = (lines.shift() ?? "").trim().split(/\s+/u);
+    const pidColumn = header.indexOf("PID");
+    const ppidColumn = header.indexOf("PPID");
+    const commandColumn = header.findIndex((title) => title === "COMMAND" || title === "CMD" || title === "ARGS");
+    if (pidColumn < 0 || ppidColumn < 0 || commandColumn !== header.length - 1 || lines.length === 0) {
+      return "unreadable";
+    }
+    let anchorSeen = false;
+    let anchored = 0;
+    let entryRunning = false;
+    for (const line of lines) {
+      const words = line.trim().split(/\s+/u);
+      const pid = processId(words[pidColumn]);
+      const ppid = processId(words[ppidColumn]);
+      if (pid === undefined || ppid === undefined || words.length <= commandColumn) return "unreadable";
+      if (pid === anchor.anchorPid) anchorSeen = true;
+      const isAnchored = anchor.init ? ppid === anchor.anchorPid : pid === anchor.anchorPid;
+      if (!isAnchored) continue;
+      anchored += 1;
+      const command = words.slice(commandColumn);
+      if (command[0] === SESSION_ENTRY_PATH || command[1] === SESSION_ENTRY_PATH) entryRunning = true;
+    }
+    if (!anchorSeen) return "unreadable";
+    if (entryRunning) return "entry-running";
+    return anchored > 0 ? "handed-off" : "not-started";
+  } catch {
+    return "unreadable";
+  }
 }
 
 /**

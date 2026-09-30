@@ -6,17 +6,16 @@ import { expect, test } from "vitest";
 
 import {
   ephemeralHelperImage,
-  mcpOAuthCallbackPortHeldByOwnIngressForwarder,
   planValidatedIngressForwardersForRebuild,
   planRuntimeUpgradeFromV2State,
 } from "./startup.ts";
 import { planValidatedIngressForwarders } from "./ingress-forwarder-ownership.ts";
-import { projectHash } from "../project-identity.ts";
 import type { RuntimePlan } from "./plan.ts";
 import type { CaptureResult, DockerContainerInspect, RuntimeContext, RuntimeIO } from "./types.ts";
 import { sha256Digest } from "./component-state.ts";
 import {
   createControlPlaneGenerationV2,
+  createRuntimeTopologyGenerationV2,
   publishControlPlaneMaterializationV2,
   selectEffectiveControlPlaneV2,
 } from "./component-state-v2.ts";
@@ -420,142 +419,67 @@ test.each([
   }
 });
 
-// The MCP OAuth callback port guard stops Runfree publishing that port while a
-// foreign process holds it — such a process would receive authorization codes
-// meant for the agent. Post-cutover the benign owner is the per-session
-// mcp-callback ingress forwarder (see below); the legacy Compose-sidecar owner
-// path is dead and retires with the relay in the cleanup commit.
-const OWNER_PROJECT_ROOT = "/workspace/callback-port-owner";
-const CALLBACK_PORT = 47499;
+// The unlocked pre-plan of a start leaves a pending admission to the locked
+// reclaim (`session-admission-pending-reclaim.ts`), which finishes it on
+// Docker's proof or refuses with its own remedy. Every other caller still sees
+// the pending record.
+test("the start pre-plan defers a terminal-stamped record to the locked reclaim; the strict plan does not", () => {
+  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "runfree-files-plan-defer-"));
+  try {
+    const target = sessionGenerationFixture().target;
+    publishControlPlaneMaterializationV2(stateDir, controlPlaneMaterializationFixture({ target }));
+    const selection = effectiveControlPlaneFixture({ target });
+    selectEffectiveControlPlaneV2(stateDir, selection);
+    const record = sessionContainerRecordFixture({ target, containerId: "a".repeat(64) });
+    writeSessionContainerRecordV2(stateDir, SESSION_TEST_PROJECT, record);
+    writeSessionHostStatus(stateDir, {
+      v: 1,
+      sessionId: record.sessionId,
+      lastHeartbeatAt: "2026-09-29T20:00:00.000Z",
+      aliveUntil: "2026-09-29T20:00:00.000Z",
+      served: "unknown",
+      terminal: "revoking",
+    });
+    const desiredPlan = {
+      projectId: SESSION_TEST_PROJECT.projectId,
+      composeProjectName: SESSION_TEST_PROJECT.composeProject,
+      paths: { stateDir },
+      generationV2: target,
+    } as RuntimePlan;
+    const context = { projectRoot: "/workspace/files-plan", project: { paths: { stateDir } }, env: {} } as RuntimeContext;
+    // The daemon restarted: no proxy is running.
+    const docker = { serviceContainerIds: () => [], activeAgentSessions: () => [] } as never;
 
-// Post-flip the callback port is published by the per-session mcp-callback
-// ingress forwarder (hop 1) instead of the Compose relay sidecar. The guard
-// must recognize that forwarder — our own, for this project, running, and
-// publishing exactly 127.0.0.1:<port> — as the sole benign owner. The flag is
-// false in tests, so the forwarder branch is exercised through its exported
-// function directly.
-function forwarderInspect(overrides: {
-  running?: boolean;
-  labels?: Record<string, string>;
-  hostConfigPorts?: unknown;
-  networkPorts?: unknown;
-} = {}): string {
-  return JSON.stringify([{
-    Config: {
-      Labels: overrides.labels ?? {
-        "io.runfree.project-id": projectHash(OWNER_PROJECT_ROOT),
-        "io.runfree.container-role": "ingress-forwarder",
-        "io.runfree.ingress-purpose": "mcp-callback",
+    expect(planRuntimeUpgradeFromV2State(desiredPlan, context, docker)).toEqual(PENDING_ADMISSION_REFUSAL);
+    expect(planRuntimeUpgradeFromV2State(desiredPlan, context, docker, { deferPendingSessionAdmission: true }))
+      .toEqual({ action: "proxy-restart", services: ["proxy"] });
+
+    // An incompatible upgrade installed after the daemon died. Counted as a
+    // live record, the dead owner's record would ask the operator to wait for
+    // a session that can never drain; deferred, it is the reclaim's to decide.
+    const topology = createRuntimeTopologyGenerationV2({
+      controlPlaneTopologyDigest: sha256Digest("topology-after-daemon-death"),
+      sessionTemplateDigest: target.topology.sessionTemplateDigest,
+    });
+    const incompatiblePlan = {
+      ...desiredPlan,
+      generationV2: {
+        ...target,
+        topology,
+        controlPlane: createControlPlaneGenerationV2({
+          ...SESSION_TEST_PROJECT,
+          proxyImageInputDigest: target.controlPlane.proxyImageInputDigest,
+          controlPlaneTopologyDigest: topology.controlPlaneTopologyDigest,
+          admissionContractEpoch: target.controlPlane.admissionContractEpoch,
+        }),
       },
-    },
-    State: { Running: overrides.running ?? true },
-    HostConfig: {
-      PortBindings: overrides.hostConfigPorts ?? {
-        [`${CALLBACK_PORT}/tcp`]: [{ HostIp: "127.0.0.1", HostPort: String(CALLBACK_PORT) }],
-      },
-    },
-    NetworkSettings: {
-      Ports: overrides.networkPorts ?? {
-        [`${CALLBACK_PORT}/tcp`]: [{ HostIp: "127.0.0.1", HostPort: String(CALLBACK_PORT) }],
-      },
-    },
-  }]);
-}
-
-function forwarderOwnershipCheck(options: {
-  inspectStatus?: number;
-  inspectStdout?: string;
-} = {}): boolean {
-  const context = {
-    projectRoot: OWNER_PROJECT_ROOT,
-    project: { config: {}, paths: {} },
-    env: {},
-  } as never;
-  const io = {
-    capture: () => ({
-      status: options.inspectStatus ?? 0,
-      stdout: options.inspectStdout ?? forwarderInspect(),
-      stderr: "",
-    }),
-  } as never;
-  return mcpOAuthCallbackPortHeldByOwnIngressForwarder(context, io, CALLBACK_PORT);
-}
-
-test("callback port ownership accepts this project's live mcp-callback ingress forwarder", () => {
-  expect(forwarderOwnershipCheck()).toBe(true);
-});
-
-test.each([
-  ["a missing or failed inspection", { inspectStatus: 1 }],
-  ["a malformed inspection", { inspectStdout: "not json" }],
-  ["an empty inspection", { inspectStdout: "[]" }],
-  ["a stopped forwarder", { inspectStdout: forwarderInspect({ running: false }) }],
-  [
-    "a forwarder labelled for another project",
-    {
-      inspectStdout: forwarderInspect({
-        labels: {
-          "io.runfree.project-id": "0".repeat(12),
-          "io.runfree.container-role": "ingress-forwarder",
-          "io.runfree.ingress-purpose": "mcp-callback",
-        },
-      }),
-    },
-  ],
-  [
-    "a container without the ingress-forwarder role",
-    {
-      inspectStdout: forwarderInspect({
-        labels: {
-          "io.runfree.project-id": projectHash(OWNER_PROJECT_ROOT),
-          "io.runfree.container-role": "session-agent",
-          "io.runfree.ingress-purpose": "mcp-callback",
-        },
-      }),
-    },
-  ],
-  [
-    "a forwarder for a different ingress purpose",
-    {
-      inspectStdout: forwarderInspect({
-        labels: {
-          "io.runfree.project-id": projectHash(OWNER_PROJECT_ROOT),
-          "io.runfree.container-role": "ingress-forwarder",
-          "io.runfree.ingress-purpose": "vnc",
-        },
-      }),
-    },
-  ],
-  [
-    "a forwarder published on all interfaces rather than loopback",
-    {
-      inspectStdout: forwarderInspect({
-        hostConfigPorts: { [`${CALLBACK_PORT}/tcp`]: [{ HostIp: "0.0.0.0", HostPort: String(CALLBACK_PORT) }] },
-        networkPorts: { [`${CALLBACK_PORT}/tcp`]: [{ HostIp: "0.0.0.0", HostPort: String(CALLBACK_PORT) }] },
-      }),
-    },
-  ],
-  [
-    "a live binding that contradicts the requested publication",
-    {
-      inspectStdout: forwarderInspect({
-        networkPorts: { [`${CALLBACK_PORT}/tcp`]: [{ HostIp: "0.0.0.0", HostPort: String(CALLBACK_PORT) }] },
-      }),
-    },
-  ],
-  [
-    "a forwarder publishing an extra port alongside the callback port",
-    {
-      inspectStdout: forwarderInspect({
-        hostConfigPorts: {
-          [`${CALLBACK_PORT}/tcp`]: [{ HostIp: "127.0.0.1", HostPort: String(CALLBACK_PORT) }],
-          "8080/tcp": [{ HostIp: "127.0.0.1", HostPort: "8080" }],
-        },
-      }),
-    },
-  ],
-] as const)("callback port ownership rejects %s", (_label, options) => {
-  expect(forwarderOwnershipCheck(options)).toBe(false);
+    } as RuntimePlan;
+    expect(planRuntimeUpgradeFromV2State(incompatiblePlan, context, docker, { deferPendingSessionAdmission: true }))
+      .toEqual({ action: "proxy-restart", services: ["proxy"] });
+    expect(planRuntimeUpgradeFromV2State(incompatiblePlan, context, docker)).toEqual(PENDING_ADMISSION_REFUSAL);
+  } finally {
+    fs.rmSync(stateDir, { recursive: true, force: true });
+  }
 });
 
 // Ruling D1: a helper runs the bound selected image id when the plan carries

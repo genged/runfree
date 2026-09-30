@@ -1,145 +1,317 @@
+import childProcess from "node:child_process";
 import fs from "node:fs";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 
-import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, test } from "vitest";
 
+import { CliError } from "../errors.ts";
 import { projectHash } from "./env.ts";
-import {
-  INGRESS_HOST_NETWORK_TEST_ID,
-  INGRESS_FORWARDER_TEST_IMAGE_ID,
-  ingressForwarderInspectFixture,
-  ingressHostNetworkInspectFixture,
-  missingContainerResult,
-  missingNetworkResult,
-} from "./ingress-forwarder.test-harness.ts";
 import { mcpOAuthCallbackPort } from "./mcp.ts";
-import { startSessionMcpCallback, stopSessionMcpCallback } from "./session-mcp-callback.ts";
-import type { RuntimeContext, RuntimeIO } from "./types.ts";
+import { MCP_CALLBACK_BRIDGE_SOURCE, SESSION_MCP_CALLBACK_PORT_FILE } from "./probes.ts";
+import {
+  boundCallbackForwarder,
+  createFakeDocker,
+  TEST_FORWARDER_INTERNAL_IP,
+  TEST_SESSION_CONTAINER_ID,
+  TEST_SESSION_ID,
+  TEST_SESSION_IP,
+  type FakeDockerOptions,
+} from "./session-callback-ingress.test-harness.ts";
+import {
+  prepareSessionMcpCallback,
+  SESSION_CALLBACK_PORT_ATTEMPTS,
+  sessionCallbackPortCandidates,
+  sessionMcpCallbackLifecycle,
+} from "./session-mcp-callback.ts";
+import type { DockerContainerInspect, RuntimeContext } from "./types.ts";
 
 const PROJECT_ROOT = "/workspace/project";
 const PROJECT_ID = projectHash(PROJECT_ROOT);
 const COMPOSE_PROJECT = `runfree-${PROJECT_ID}`;
-const PORT = String(mcpOAuthCallbackPort(PROJECT_ROOT));
-const SESSION = { containerId: "session-abc", sourceIp: "172.30.0.40" } as const;
-const FORWARDER = `runfree-ingress-mcp-callback-${PROJECT_ID}-${PORT}`;
-const FORWARDER_ID = "f".repeat(64);
+const INTERNAL_NETWORK = `${COMPOSE_PROJECT}_agent_internal`;
+const LEGACY_PORT = mcpOAuthCallbackPort(PROJECT_ROOT);
+const OWNER = Object.freeze({
+  sessionId: TEST_SESSION_ID,
+  containerId: TEST_SESSION_CONTAINER_ID,
+  sourceIp: TEST_SESSION_IP,
+  internalNetwork: INTERNAL_NETWORK,
+});
 
 let tmp: string;
 
-function contextWith(hasServers: boolean): RuntimeContext {
-  const policyPath = path.join(tmp, "oauth-mediation-policy.json");
-  fs.writeFileSync(policyPath, hasServers ? JSON.stringify({ providers: { p: { kind: "mcp" } } }) : JSON.stringify({ servers: [] }));
-  return {
-    projectRoot: PROJECT_ROOT,
-    project: { config: { version: 3 }, paths: { mcpOAuthPolicyPath: policyPath } },
-    env: { RUNFREE_TEST_MCP_CALLBACK_HOST_PROBE: "success" },
-  } as unknown as RuntimeContext;
-}
-
-function fakeIo() {
-  const captures: string[][] = [];
-  const runs: string[][] = [];
-  let networkCreated = false;
-  const capture = vi.fn((_cmd: string, args: string[]) => {
-    captures.push(args);
-    // Fail the two existence probes so the forwarder creates its network and
-    // does not try to remove a stale container; everything else succeeds.
-    if (args[0] === "container" && args[1] === "inspect") return missingContainerResult(args[2] as string);
-    if (args[0] === "network" && args[1] === "inspect") {
-      return networkCreated
-        ? { status: 0, stdout: JSON.stringify([ingressHostNetworkInspectFixture(PROJECT_ID)]), stderr: "" }
-        : missingNetworkResult(args[2] as string);
-    }
-    if (args[0] === "network" && args[1] === "create") {
-      networkCreated = true;
-      return { status: 0, stdout: INGRESS_HOST_NETWORK_TEST_ID, stderr: "" };
-    }
-    if (args[0] === "run") return { status: 0, stdout: `${FORWARDER_ID}\n`, stderr: "" };
-    return { status: 0, stdout: "", stderr: "" };
-  });
-  const run = vi.fn((_cmd: string, args: string[]) => {
-    runs.push(args);
-    return 0;
-  });
-  return { io: { capture, run } as unknown as RuntimeIO, captures, runs };
-}
-
 beforeEach(() => {
-  tmp = fs.mkdtempSync(path.join(os.tmpdir(), "runfree-mcp-cb-"));
+  tmp = fs.mkdtempSync(path.join(os.tmpdir(), "runfree-session-callback-"));
 });
 afterEach(() => {
   fs.rmSync(tmp, { recursive: true, force: true });
 });
 
-describe("startSessionMcpCallback", () => {
-  test("is a no-op when the OAuth policy has no servers", async () => {
-    const { io, captures, runs } = fakeIo();
-    expect(await startSessionMcpCallback(contextWith(false), io, SESSION)).toBe(0);
-    expect(captures).toHaveLength(0);
-    expect(runs).toHaveLength(0);
+function contextWith(hasServers: boolean): RuntimeContext {
+  const policyPath = path.join(tmp, "oauth-mediation-policy.json");
+  fs.writeFileSync(policyPath, JSON.stringify(hasServers ? { providers: { p: { kind: "mcp" } } } : { servers: [] }));
+  return {
+    projectRoot: PROJECT_ROOT,
+    project: { config: { version: 3 }, paths: { mcpOAuthPolicyPath: policyPath } },
+    env: {},
+  } as unknown as RuntimeContext;
+}
+
+function fake(containers: DockerContainerInspect[] = [], options: FakeDockerOptions = {}) {
+  return createFakeDocker({ projectId: PROJECT_ID, composeProject: COMPOSE_PROJECT, containers, options });
+}
+
+const allFree = async () => true;
+const probeOk = async () => ({ status: 0, stdout: "", stderr: "" });
+
+describe("sessionCallbackPortCandidates", () => {
+  test("starts with the legacy project port and stays inside the callback block", () => {
+    const candidates = sessionCallbackPortCandidates(PROJECT_ROOT, TEST_SESSION_ID);
+    expect(candidates[0]).toBe(LEGACY_PORT);
+    expect(candidates).toHaveLength(SESSION_CALLBACK_PORT_ATTEMPTS);
+    expect(new Set(candidates).size).toBe(candidates.length);
+    expect(candidates.every((port) => port >= 47100 && port <= 48099)).toBe(true);
   });
 
-  test("creates hop 1 targeting the live session IP and hop 2 bound to it", async () => {
-    const { io, captures, runs } = fakeIo();
-    expect(await startSessionMcpCallback(contextWith(true), io, SESSION)).toBe(0);
-
-    // hop 1: an ingress-forwarder run for the mcp-callback purpose, targeting
-    // the session's internal IP and publishing the callback port on loopback.
-    const forwarderRun = captures.find((args) => args[0] === "run");
-    expect(forwarderRun).toBeDefined();
-    expect(forwarderRun).toEqual(expect.arrayContaining([
-      "--name",
-      FORWARDER,
-      "--label",
-      "io.runfree.ingress-purpose=mcp-callback",
-      "-e",
-      `INGRESS_TARGET=${SESSION.sourceIp}`,
-      "-p",
-      `127.0.0.1:${PORT}:${PORT}`,
-    ]));
-
-    // hop 2: a detached bridge exec into the session container, bound to its IP.
-    const bridgeExec = runs.find((args) => args[0] === "exec" && args.includes("-d"));
-    expect(bridgeExec).toBeDefined();
-    expect(bridgeExec).toContain(SESSION.containerId);
-    expect(bridgeExec).toContain(SESSION.sourceIp);
-    expect(bridgeExec?.join(" ")).toContain("runfree_mcp_callback_bridge");
-  });
-
-  test("reports a hop-1 failure without throwing", async () => {
-    // An invalid session IP makes startIngressForwarder reject the input.
-    const { io } = fakeIo();
-    const status = await startSessionMcpCallback(contextWith(true), io, { containerId: "s", sourceIp: "evil; rm" });
-    expect(status).toBe(1);
+  test("never offers a port already held, and two sessions try different alternatives", () => {
+    const held = new Set([LEGACY_PORT]);
+    const first = sessionCallbackPortCandidates(PROJECT_ROOT, TEST_SESSION_ID, held);
+    const second = sessionCallbackPortCandidates(PROJECT_ROOT, "rf-20260930-zzzzzz", held);
+    expect(first).not.toContain(LEGACY_PORT);
+    expect(first).toEqual(sessionCallbackPortCandidates(PROJECT_ROOT, TEST_SESSION_ID, held));
+    expect(first).not.toEqual(second);
   });
 });
 
-describe("stopSessionMcpCallback", () => {
-  test("removes the mcp-callback forwarder for this project", () => {
-    const candidate = ingressForwarderInspectFixture({
+describe("prepareSessionMcpCallback", () => {
+  test("creates a forwarder bound to the session, then the peer-only bridge, then proves the path", async () => {
+    const docker = fake();
+    const endpoint = await prepareSessionMcpCallback(contextWith(true), docker.io, OWNER, {
+      hostPortFree: allFree,
+      probe: probeOk,
+    });
+
+    expect(endpoint.port).toBe(LEGACY_PORT);
+    const [run] = docker.dockerRuns();
+    expect(run).toEqual(expect.arrayContaining([
+      "--name",
+      `runfree-ingress-mcp-callback-${PROJECT_ID}-${LEGACY_PORT}`,
+      "-p",
+      `127.0.0.1:${LEGACY_PORT}:${LEGACY_PORT}`,
+      "-e",
+      `INGRESS_TARGET=${TEST_SESSION_IP}`,
+      `INGRESS_TARGET_PORT=${LEGACY_PORT}`,
+      `RUNFREE_CALLBACK_SESSION_ID=${TEST_SESSION_ID}`,
+      `RUNFREE_CALLBACK_SESSION_CONTAINER=${TEST_SESSION_CONTAINER_ID}`,
+    ]));
+    const bridge = docker.runs.find((args) => args[0] === "exec" && args.includes("-d"));
+    expect(bridge?.slice(-5)).toEqual([
+      TEST_SESSION_IP,
+      String(LEGACY_PORT),
+      expect.any(String),
+      TEST_FORWARDER_INTERNAL_IP,
+      SESSION_MCP_CALLBACK_PORT_FILE,
+    ]);
+    expect(bridge).toContain(TEST_SESSION_CONTAINER_ID);
+    expect(docker.removed()).toEqual([]);
+  });
+
+  test("leaves a port another session's forwarder holds, and that forwarder, untouched", async () => {
+    const peer = boundCallbackForwarder({
       composeProject: COMPOSE_PROJECT,
-      containerId: FORWARDER_ID,
-      hostPort: PORT,
       projectId: PROJECT_ID,
-      purpose: "mcp-callback",
-      target: SESSION.sourceIp,
+      hostPort: String(LEGACY_PORT),
+      containerId: "b".repeat(64),
+      sessionId: "rf-20260930-peer01",
+      sessionContainerId: "9".repeat(64),
+      target: "172.30.0.41",
     });
-    const capture = vi.fn((_cmd: string, args: string[]) => {
-      if (args[0] === "ps") return { status: 0, stdout: "", stderr: "" };
-      if (args[0] === "container" && args[1] === "inspect") return { status: 0, stdout: JSON.stringify([candidate]), stderr: "" };
-      if (args[0] === "image" && args[1] === "inspect") {
-        return { status: 0, stdout: `${INGRESS_FORWARDER_TEST_IMAGE_ID}\n`, stderr: "" };
-      }
-      if (args[0] === "network" && args[1] === "inspect") {
-        return { status: 0, stdout: JSON.stringify([ingressHostNetworkInspectFixture(PROJECT_ID)]), stderr: "" };
-      }
-      return { status: 0, stdout: "", stderr: "" };
+    const docker = fake([peer]);
+    const endpoint = await prepareSessionMcpCallback(contextWith(true), docker.io, OWNER, {
+      hostPortFree: allFree,
+      probe: probeOk,
     });
-    const io = { capture } as unknown as RuntimeIO;
-    stopSessionMcpCallback({ projectRoot: PROJECT_ROOT } as unknown as RuntimeContext, io);
-    const calls = capture.mock.calls.map((c) => (c as unknown as [string, string[]])[1]);
-    expect(calls.some((args) => args[0] === "rm" && args.includes(FORWARDER_ID))).toBe(true);
-    expect(calls.some((args) => args[0] === "network" && args[1] === "rm" && args[2] === INGRESS_HOST_NETWORK_TEST_ID)).toBe(true);
+
+    expect(endpoint.port).not.toBe(LEGACY_PORT);
+    expect(docker.dockerRuns().some((args) => args.includes(`127.0.0.1:${LEGACY_PORT}:${LEGACY_PORT}`))).toBe(false);
+    expect(docker.removed()).toEqual([]);
+    expect(docker.containers).toContain(peer);
+  });
+
+  test("skips a port the host already uses without creating anything for it", async () => {
+    const docker = fake();
+    const endpoint = await prepareSessionMcpCallback(contextWith(true), docker.io, OWNER, {
+      hostPortFree: async (port) => port !== LEGACY_PORT,
+      probe: probeOk,
+    });
+
+    expect(endpoint.port).not.toBe(LEGACY_PORT);
+    expect(docker.dockerRuns()).toHaveLength(1);
+  });
+
+  test("moves on after a publication conflict and removes the created residue by exact identity", async () => {
+    const docker = fake([], { conflictingPorts: new Set([LEGACY_PORT]), conflictLeavesResidue: true });
+    const endpoint = await prepareSessionMcpCallback(contextWith(true), docker.io, OWNER, {
+      hostPortFree: allFree,
+      probe: probeOk,
+    });
+
+    expect(endpoint.port).not.toBe(LEGACY_PORT);
+    expect(docker.dockerRuns()).toHaveLength(2);
+    expect(docker.removed()).toHaveLength(1);
+    expect(docker.removed()[0]).toMatch(/^[a-f0-9]{64}$/u);
+    expect(docker.containers.filter((container) => container.State?.Running !== true)).toEqual([]);
+  });
+
+  test("fails the launch with nothing created when every candidate is busy", async () => {
+    const docker = fake();
+    const failure = await prepareSessionMcpCallback(contextWith(true), docker.io, OWNER, {
+      hostPortFree: async () => false,
+      probe: probeOk,
+    }).catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(CliError);
+    expect((failure as Error).message).toContain(`no free loopback port among ${SESSION_CALLBACK_PORT_ATTEMPTS} candidates`);
+    expect((failure as Error).message).toContain("retry the command");
+    expect(docker.dockerRuns()).toEqual([]);
+  });
+
+  test("removes its forwarder and fails the launch when the host path does not answer", async () => {
+    const docker = fake();
+    const failure = await prepareSessionMcpCallback(contextWith(true), docker.io, OWNER, {
+      hostPortFree: allFree,
+      probe: async () => ({ status: 1, stdout: "", stderr: "ECONNREFUSED" }),
+    }).catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(CliError);
+    expect((failure as Error).message).toContain("did not reach the session (ECONNREFUSED)");
+    expect(docker.removed()).toHaveLength(1);
+    expect(docker.containers.filter((container) => container.Config?.Labels?.["io.runfree.ingress-purpose"] === "mcp-callback")).toEqual([]);
+  });
+
+  test("removes its forwarder when the in-session bridge does not start", async () => {
+    const docker = fake([], { bridgeStatus: 1 });
+    await expect(prepareSessionMcpCallback(contextWith(true), docker.io, OWNER, {
+      hostPortFree: allFree,
+      probe: probeOk,
+    })).rejects.toThrow("the in-session callback bridge did not start");
+    expect(docker.removed()).toHaveLength(1);
+  });
+
+  test("does not try another port after a failure that is not a publication conflict", async () => {
+    const docker = fake([], { runFailure: "Error response from daemon: pull access denied" });
+    await expect(prepareSessionMcpCallback(contextWith(true), docker.io, OWNER, {
+      hostPortFree: allFree,
+      probe: probeOk,
+    })).rejects.toThrow("pull access denied");
+    expect(docker.dockerRuns()).toHaveLength(1);
+  });
+
+  test.each([
+    ["session id", { sessionId: "../x" }],
+    ["container id", { containerId: "short" }],
+    ["address", { sourceIp: "evil; rm" }],
+    ["network", { internalNetwork: "bad network" }],
+  ])("refuses an owner with an inexact %s before any Docker call", async (_label, override) => {
+    const docker = fake();
+    await expect(prepareSessionMcpCallback(contextWith(true), docker.io, { ...OWNER, ...override }, {
+      hostPortFree: allFree,
+      probe: probeOk,
+    })).rejects.toThrow("session callback owner");
+    expect(docker.captures).toEqual([]);
+  });
+});
+
+describe("sessionMcpCallbackLifecycle", () => {
+  test("a current-config project without a selected effective generation refuses rather than guessing", () => {
+    const context = {
+      projectRoot: PROJECT_ROOT,
+      project: { config: { version: 4 }, paths: { controlProxyDir: path.join(tmp, "absent-control") } },
+      env: {},
+    } as unknown as RuntimeContext;
+    expect(() => sessionMcpCallbackLifecycle(context, fake().io)).toThrow("selected effective controls are required");
+  });
+
+  test("is absent when no OAuth-capable MCP server needs a callback", () => {
+    expect(sessionMcpCallbackLifecycle(contextWith(false), fake().io)).toBeUndefined();
+    expect(sessionMcpCallbackLifecycle(contextWith(true), fake().io)).toBeDefined();
+  });
+});
+
+// The bridge source runs as-is: records the port file, then relays only its
+// allowed peer's connections and answers the host probe challenge.
+describe("in-session callback bridge", () => {
+  async function freePort(): Promise<number> {
+    return await new Promise((resolve) => {
+      const server = net.createServer();
+      server.listen(0, "127.0.0.1", () => {
+        const address = server.address();
+        const port = typeof address === "object" && address ? address.port : 0;
+        server.close(() => resolve(port));
+      });
+    });
+  }
+
+  function startBridge(port: number, allowedPeer: string, portFile: string): childProcess.ChildProcess {
+    return childProcess.spawn(process.execPath, ["-e", MCP_CALLBACK_BRIDGE_SOURCE, "127.0.0.1", String(port), "challenge-token", allowedPeer, portFile], {
+      stdio: "ignore",
+    });
+  }
+
+  async function exchange(port: number, payload: string): Promise<string> {
+    for (let attempt = 0; attempt < 50; attempt += 1) {
+      const answer = await new Promise<string | undefined>((resolve) => {
+        const socket = net.connect({ host: "127.0.0.1", port });
+        let data = "";
+        socket.once("connect", () => socket.write(payload));
+        socket.on("data", (chunk) => { data += chunk.toString("utf8"); });
+        socket.once("error", () => resolve(undefined));
+        socket.once("close", () => resolve(data));
+        socket.setTimeout(2000, () => socket.destroy());
+      });
+      if (answer !== undefined) return answer;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    throw new Error("bridge never accepted a connection");
+  }
+
+  test("writes the port file and answers the forwarder's probe", async () => {
+    const port = await freePort();
+    const portFile = path.join(tmp, "callback-port");
+    const bridge = startBridge(port, "127.0.0.1", portFile);
+    try {
+      expect(await exchange(port, "challenge-token\n")).toBe("challenge-token\n");
+      expect(fs.readFileSync(portFile, "utf8")).toBe(`${port}\n`);
+      expect(fs.statSync(portFile).mode & 0o777).toBe(0o644);
+    } finally {
+      bridge.kill();
+    }
+  });
+
+  test("closes a connection from any address other than its forwarder", async () => {
+    const port = await freePort();
+    const bridge = startBridge(port, "172.30.0.99", path.join(tmp, "callback-port"));
+    try {
+      expect(await exchange(port, "challenge-token\n")).toBe("");
+    } finally {
+      bridge.kill();
+    }
+  });
+
+  test("replaces a planted symlink at the port file instead of writing through it", async () => {
+    const port = await freePort();
+    const portFile = path.join(tmp, "callback-port");
+    const elsewhere = path.join(tmp, "elsewhere");
+    fs.writeFileSync(elsewhere, "untouched");
+    fs.symlinkSync(elsewhere, portFile);
+    const bridge = startBridge(port, "127.0.0.1", portFile);
+    try {
+      expect(await exchange(port, "challenge-token\n")).toBe("challenge-token\n");
+      expect(fs.lstatSync(portFile).isSymbolicLink()).toBe(false);
+      expect(fs.readFileSync(elsewhere, "utf8")).toBe("untouched");
+    } finally {
+      bridge.kill();
+    }
   });
 });

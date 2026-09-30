@@ -49,7 +49,7 @@ const SESSION_KEY = RECORD.sessionPrincipal;
 
 const OK: CaptureResult = { status: 0, stdout: "", stderr: "" };
 
-type Effect = "delete-session-file" | "disconnect" | "stop" | "remove" | "unknown";
+type Effect = "delete-session-file" | "list-callback-ingress" | "disconnect" | "stop" | "remove" | "unknown";
 
 /**
  * The effect one captured argv performs.
@@ -62,6 +62,7 @@ function effectOf(args: readonly string[]): Effect {
   if (args[0] === "exec" && args[6] === "-e") {
     return args[8]?.startsWith(`${SESSION_FILES_DIR}/`) ? "delete-session-file" : "unknown";
   }
+  if (args[0] === "ps" && args.includes("label=io.runfree.ingress-purpose=mcp-callback")) return "list-callback-ingress";
   if (args[0] === "network" && args[1] === "disconnect") return "disconnect";
   if (args[0] === "container" && args[1] === "stop") return "stop";
   if (args[0] === "container" && args[1] === "rm") return "remove";
@@ -142,6 +143,8 @@ describe("ordered session-file teardown", () => {
       "lock",
       "delete-session-file",
       "lock",
+      "list-callback-ingress",
+      "lock",
       "disconnect",
       "lock",
       "stop",
@@ -151,15 +154,16 @@ describe("ordered session-file teardown", () => {
       "remove-record",
       "clear-stamp",
     ]);
-    expect(fixture.argv[1]).toEqual(["network", "disconnect", NETWORK_ID, CONTAINER_ID]);
-    expect(fixture.argv[2]).toEqual([
+    expect(fixture.argv[1]?.slice(0, 2)).toEqual(["ps", "-a"]);
+    expect(fixture.argv[2]).toEqual(["network", "disconnect", NETWORK_ID, CONTAINER_ID]);
+    expect(fixture.argv[3]).toEqual([
       "container",
       "stop",
       "--time",
       String(SESSION_CONTAINER_STOP_SECONDS),
       CONTAINER_ID,
     ]);
-    expect(fixture.argv[3]).toEqual(["container", "rm", "--force", CONTAINER_ID]);
+    expect(fixture.argv[4]).toEqual(["container", "rm", "--force", CONTAINER_ID]);
     // The delete names this session's file and nothing else.
     expect(fixture.argv[0]?.[8]).toBe(`${SESSION_FILES_DIR}/${SESSION_KEY}.json`);
     expect(fixture.argv[0]?.[4]).toBe(PROXY_ID);
@@ -182,6 +186,35 @@ describe("ordered session-file teardown", () => {
     expect(fixture.effects()).toEqual(["delete-session-file"]);
     expect(fixture.events).not.toContain("remove-record");
     expect(fixture.events).not.toContain("clear-stamp");
+    expect(fixture.removed()).toBe(0);
+  });
+
+  // Startup's reclaim of an interrupted teardown proves the file gone from a
+  // stopped or absent proxy instead of exec'ing into it. The proof takes the
+  // delete's place in the order, under the same lock assertion, and a proof
+  // that fails blocks exactly like a failed delete.
+  test("a caller-supplied file removal takes the delete's place in the order", () => {
+    const fixture = harness();
+
+    expect(teardownSessionRecord(fixture.input({
+      removeSessionFile: () => { fixture.events.push("prove-file-gone"); },
+    }))).toEqual({ completed: true });
+
+    expect(fixture.events.slice(0, 4)).toEqual(["lock", "mark-terminal", "lock", "prove-file-gone"]);
+    expect(fixture.effects()).not.toContain("delete-session-file");
+    expect(fixture.events.at(-2)).toBe("remove-record");
+  });
+
+  test("a caller-supplied file removal that throws keeps the record", () => {
+    const fixture = harness();
+    const refusal = new Error("the selected proxy started during reclaim");
+
+    const result = teardownSessionRecord(fixture.input({
+      removeSessionFile: () => { throw refusal; },
+    }));
+
+    expect(result).toEqual({ completed: false, blockedAt: "delete-session-file", error: refusal });
+    expect(fixture.effects()).toEqual([]);
     expect(fixture.removed()).toBe(0);
   });
 
@@ -222,6 +255,7 @@ describe("ordered session-file teardown", () => {
     expect(events).toEqual([
       "delete-session-file",
       "delete-session-file",
+      "list-callback-ingress",
       "disconnect",
       "stop",
       "remove",
@@ -243,28 +277,32 @@ describe("ordered session-file teardown", () => {
     expect(teardownSessionRecord(fixture.input())).toEqual({ completed: true });
     expect(fixture.effects()).toEqual([
       "delete-session-file",
+      "list-callback-ingress",
       "disconnect",
       "stop",
       "remove",
       "delete-session-file",
+      "list-callback-ingress",
       "disconnect",
       "stop",
       "remove",
     ]);
   });
 
-  test("a lock that has been lost stops the sequence at that step, at every one of the six lock sites", () => {
-    // Index n: the (n+1)th lock assertion is the first that fails. The six sites
-    // guard, in order: the terminal stamp, the file delete, the disconnect, the
-    // stop, the removal, and the record removal (todo 37 item 1: the stamp and
-    // record sites were the two the earlier four-case table did not reach).
+  test("a lock that has been lost stops the sequence at that step, at every one of the seven lock sites", () => {
+    // Index n: the (n+1)th lock assertion is the first that fails. The seven
+    // sites guard, in order: the terminal stamp, the file delete, the callback
+    // ingress removal, the disconnect, the stop, the removal, and the record
+    // removal (todo 37 item 1: the stamp and record sites were the two the
+    // earlier table did not reach).
     for (const [index, remaining, stamped] of [
       [0, [] as Effect[], false],
       [1, [] as Effect[], true],
       [2, ["delete-session-file"] as Effect[], true],
-      [3, ["delete-session-file", "disconnect"] as Effect[], true],
-      [4, ["delete-session-file", "disconnect", "stop"] as Effect[], true],
-      [5, ["delete-session-file", "disconnect", "stop", "remove"] as Effect[], true],
+      [3, ["delete-session-file", "list-callback-ingress"] as Effect[], true],
+      [4, ["delete-session-file", "list-callback-ingress", "disconnect"] as Effect[], true],
+      [5, ["delete-session-file", "list-callback-ingress", "disconnect", "stop"] as Effect[], true],
+      [6, ["delete-session-file", "list-callback-ingress", "disconnect", "stop", "remove"] as Effect[], true],
     ] as const) {
       let calls = 0;
       const fixture = harness({
@@ -314,6 +352,74 @@ describe("ordered session-file teardown", () => {
     expect(wedged.events).not.toContain("clear-stamp");
     expect(wedged.removed()).toBe(0);
   });
+
+  test("an unprovable callback route stops the sequence before the container and keeps the record", () => {
+    // The refusal: the forwarder inventory cannot be read, so a route to this
+    // record's address may survive. Nothing past it runs — above all not the
+    // record removal that would release the address to a peer.
+    const unreadable = harness({
+      answers: { "list-callback-ingress": { status: 1, stdout: "", stderr: "Cannot connect to the Docker daemon" } },
+    });
+
+    expect(() => teardownSessionRecord(unreadable.input())).toThrow("could not list MCP OAuth callback forwarders");
+    expect(unreadable.effects()).toEqual(["delete-session-file", "list-callback-ingress"]);
+    expect(unreadable.events).not.toContain("remove-record");
+    expect(unreadable.removed()).toBe(0);
+
+    // The reclamation: the same call, once Docker answers, finishes the sequence.
+    const recovered = harness();
+    expect(teardownSessionRecord(recovered.input())).toEqual({ completed: true });
+    expect(recovered.removed()).toBe(1);
+  });
+
+  test("removes this session's callback forwarder by exact id before the record", () => {
+    const forwarderId = "f".repeat(64);
+    const events: string[] = [];
+    const forwarder = {
+      Id: forwarderId,
+      Image: `sha256:${"a".repeat(64)}`,
+      Name: "/runfree-ingress-mcp-callback-x-47200",
+      State: { Running: true },
+      Config: {
+        Env: [
+          "INGRESS_HOST_PORT=47200",
+          `INGRESS_TARGET=${RECORD.sourceIp}`,
+          "INGRESS_TARGET_PORT=47200",
+          `RUNFREE_CALLBACK_SESSION_ID=${RECORD.sessionId}`,
+          `RUNFREE_CALLBACK_SESSION_CONTAINER=${CONTAINER_ID}`,
+        ],
+        Labels: {
+          "io.runfree.project-id": SESSION_TEST_PROJECT.projectId,
+          "io.runfree.container-role": "ingress-forwarder",
+          "io.runfree.ingress-purpose": "mcp-callback",
+        },
+      },
+    };
+    const io: SessionAdmissionDockerExecutor = {
+      capture: vi.fn((_executable, args) => {
+        if (args[0] === "ps") return { status: 0, stdout: `${forwarderId}\n`, stderr: "" };
+        if (args[0] === "container" && args[1] === "inspect") return { status: 0, stdout: JSON.stringify([forwarder]), stderr: "" };
+        if (args[0] === "image") return { status: 0, stdout: `sha256:${"a".repeat(64)}\n`, stderr: "" };
+        if (args[0] === "rm") events.push(`rm:${args[2]}`);
+        return { ...OK };
+      }),
+    };
+    const input: SessionFileTeardownInput = {
+      io,
+      proxyId: PROXY_ID,
+      record: RECORD,
+      expectedProject: SESSION_TEST_PROJECT,
+      networkId: NETWORK_ID,
+      lock: () => {},
+      markTerminal: () => {},
+      clearStamp: () => {},
+      removeRecord: () => { events.push("remove-record"); return true; },
+      completion: () => UNCERTAIN_SESSION_COMPLETION,
+    };
+
+    expect(teardownSessionRecord(input)).toEqual({ completed: true });
+    expect(events).toEqual([`rm:${forwarderId}`, "remove-record"]);
+  });
 });
 
 const STARTED_AT = "2026-08-08T12:00:00.500000000Z";
@@ -358,23 +464,27 @@ function exitedCompletion(exitCode = 0): SessionTeardownCompletion {
 }
 
 describe("fast teardown after a proved exit (sub-second launch plan Task 8)", () => {
-  test("a proved exit deletes the file, then removes the container, and drops the record last: no disconnect, no stop", () => {
+  test("a proved exit deletes the file, removes the callback ingress and then the container, and drops the record last: no disconnect, no stop", () => {
     const fixture = harness({ completion: exitedCompletion() });
 
     expect(teardownSessionRecord(fixture.input())).toEqual({ completed: true });
 
+    // The callback forwarder outlives the container, so the short path still
+    // proves it gone after the file and before the record releases the address.
     expect(fixture.events).toEqual([
       "lock",
       "mark-terminal",
       "lock",
       "delete-session-file",
       "lock",
+      "list-callback-ingress",
+      "lock",
       "remove",
       "lock",
       "remove-record",
       "clear-stamp",
     ]);
-    expect(fixture.argv[1]).toEqual(["container", "rm", "--force", CONTAINER_ID]);
+    expect(fixture.argv.at(-1)).toEqual(["container", "rm", "--force", CONTAINER_ID]);
     expect(fixture.removed()).toBe(1);
   });
 
@@ -410,7 +520,7 @@ describe("fast teardown after a proved exit (sub-second launch plan Task 8)", ()
     for (const completion of [forged, { kind: "exited", proof: other } as const]) {
       const fixture = harness({ completion });
       expect(teardownSessionRecord(fixture.input())).toEqual({ completed: true });
-      expect(fixture.effects()).toEqual(["delete-session-file", "disconnect", "stop", "remove"]);
+      expect(fixture.effects()).toEqual(["delete-session-file", "list-callback-ingress", "disconnect", "stop", "remove"]);
     }
   });
 
@@ -449,7 +559,8 @@ describe("fast teardown after a proved exit (sub-second launch plan Task 8)", ()
     for (const [index, remaining] of [
       [1, [] as Effect[]],
       [2, ["delete-session-file"] as Effect[]],
-      [3, ["delete-session-file", "remove"] as Effect[]],
+      [3, ["delete-session-file", "list-callback-ingress"] as Effect[]],
+      [4, ["delete-session-file", "list-callback-ingress", "remove"] as Effect[]],
     ] as const) {
       let calls = 0;
       const fixture = harness({

@@ -16,6 +16,7 @@ export {
   type DomainRulesInput,
   type McpApproveInput,
   type McpConfigureInput,
+  type McpEnableInput,
   type McpExplainInput,
   type McpRulesInput,
   type McpRevokeInput,
@@ -76,6 +77,9 @@ export {
 export {
   mcpApproveIntent,
   mcpConfigureIntent,
+  type McpEnableDeps,
+  mcpEnableIntent,
+  type McpEnableResult,
   mcpExplainIntent,
   mcpListIntent,
   mcpRulesIntent,

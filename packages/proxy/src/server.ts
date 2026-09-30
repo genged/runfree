@@ -72,6 +72,12 @@ import { createWriteApprovalManager } from "./approvals.js";
 import { assertSourceIpSessionIdentityConfig } from "./session-identity-config.js";
 import { SessionFileRegistry } from "./session-file-registry.js";
 import { SessionIpAssignments } from "./session-ip-reuse.js";
+import {
+  createSessionAdmissionWatch,
+  sessionAdmissionWatchEnabled,
+  sessionAdmissionWatchTargets,
+  type SessionAdmissionWatch,
+} from "./session-admission-watch.js";
 import { SESSION_ADMISSION_PROVISIONING_REQUEST } from "@runfree/runtime-contracts/session-admission";
 import {
   isExactSessionSourceIpv4,
@@ -222,6 +228,7 @@ const sessionRegistry = new SessionFileRegistry({
 const ipAssignments = new SessionIpAssignments(sessionIdentityConfig.registryRoot, testSessionOwnerUid);
 const acceptedSocketsByIp = new Map<string, Set<net.Socket>>();
 let sessionAdmissionWatchTimer: NodeJS.Timeout | undefined;
+let sessionAdmissionWatch: SessionAdmissionWatch | undefined;
 let lastSessionAdmissionWatchError: string | undefined;
 
 function reconcileSessionAdmission(): void {
@@ -717,6 +724,7 @@ for (const signal of ["SIGINT", "SIGTERM"] as const) {
   process.once(signal, () => {
     clearInterval(policyWatchTimer);
     if (sessionAdmissionWatchTimer) clearInterval(sessionAdmissionWatchTimer);
+    sessionAdmissionWatch?.close();
     process.kill(process.pid, signal);
   });
 }
@@ -2320,6 +2328,30 @@ await new Promise<void>((resolve, reject) => {
 const listenAddress = guardedServer.address();
 const listenPort = listenAddress && typeof listenAddress !== "string" ? listenAddress.port : PORT;
 
+// Event-driven admission (launch plan Task 7): an inotify event on an
+// admission input runs the same reconcile the interval runs, coalesced to one
+// pass per turn of the event loop. Armed before the priming reconcile (watch,
+// then list), so a write between the two is seen by one or the other. The
+// interval below stays the backstop: lease expiry changes no file, and a lost
+// event or failed watcher must not stall admission or revocation.
+let sessionAdmissionReconcileQueued = false;
+function scheduleSessionAdmissionReconcile(): void {
+  if (sessionAdmissionReconcileQueued) return;
+  sessionAdmissionReconcileQueued = true;
+  setImmediate(() => {
+    sessionAdmissionReconcileQueued = false;
+    reconcileSessionAdmission();
+  });
+}
+sessionAdmissionWatch = sessionAdmissionWatchEnabled()
+  ? createSessionAdmissionWatch({
+    targets: sessionAdmissionWatchTargets(sessionIdentityConfig.registryRoot),
+    onChange: scheduleSessionAdmissionReconcile,
+    label: "proxy",
+  })
+  : undefined;
+sessionAdmissionWatch?.rearm();
+
 // The served map is the whole request-path authority and it is empty until the
 // first refresh, so prime it BEFORE announcing readiness: otherwise the first
 // connections after the status file appears are rejected `registry-unavailable`
@@ -2330,7 +2362,10 @@ reconcileSessionAdmission();
 // has been refreshed at least once.
 publishRequestProxyStatus();
 publishWriteApprovalsStatus();
-sessionAdmissionWatchTimer = setInterval(reconcileSessionAdmission, SESSION_ADMISSION_WATCH_MS);
+sessionAdmissionWatchTimer = setInterval(() => {
+  sessionAdmissionWatch?.rearm();
+  reconcileSessionAdmission();
+}, SESSION_ADMISSION_WATCH_MS);
 sessionAdmissionWatchTimer.unref();
 
 // One-line startup log so `docker compose logs proxy` shows what's loaded.

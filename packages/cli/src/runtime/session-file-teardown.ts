@@ -58,6 +58,7 @@ import type {
   SessionContainerProjectIdentity,
   SessionContainerRecordV2,
 } from "./session-containers.ts";
+import { removeSessionMcpCallbackIngress } from "./session-callback-ingress.ts";
 import { provesContainerAbsent } from "./session-file-heartbeat.ts";
 import {
   executeSessionFileCommand,
@@ -114,6 +115,17 @@ export type SessionFileTeardownInput = Readonly<{
    * `UNCERTAIN_SESSION_COMPLETION`. A throw reads as uncertain.
    */
   completion: () => SessionTeardownCompletion;
+  /**
+   * Replaces step 1's `docker exec` delete, for a caller that proves the file
+   * cannot exist rather than deleting it.
+   *
+   * Startup's reclaim of an interrupted teardown passes a fresh proof that the
+   * selected proxy is absent or stopped: session files live on its tmpfs, so a
+   * proxy with no running process holds none, and there is nothing to `exec`
+   * into. Throwing blocks exactly like a failed delete — nothing after step 1
+   * runs and the record is kept. Omitted, the ordinary delete runs.
+   */
+  removeSessionFile?: () => void;
   dockerOptions?: childProcess.SpawnSyncOptions;
 }>;
 
@@ -293,14 +305,33 @@ export function teardownSessionRecord(input: SessionFileTeardownInput): SessionF
   // of the steps below to run.
   input.lock();
   try {
-    executeSessionFileCommand(
-      input.io,
-      sessionFileDeleteCommand(input.proxyId, input.record.sessionPrincipal),
-      input.dockerOptions ?? {},
-    );
+    if (input.removeSessionFile) {
+      input.removeSessionFile();
+    } else {
+      executeSessionFileCommand(
+        input.io,
+        sessionFileDeleteCommand(input.proxyId, input.record.sessionPrincipal),
+        input.dockerOptions ?? {},
+      );
+    }
   } catch (error) {
     return Object.freeze({ completed: false, blockedAt: "delete-session-file" as const, error });
   }
+
+  // Step 1b. The session's host ingress. Its MCP OAuth callback forwarder
+  // routes host loopback to this record's address, so it must be proved gone
+  // before step 5 releases that address to a peer. A failure throws: the
+  // record stays, the address stays reserved, and the same call run again
+  // (this owner's second pass, or the next launch's reconcile) retries it.
+  // The short path below runs it too: the forwarder outlives the container.
+  input.lock();
+  removeSessionMcpCallbackIngress({
+    io: input.io,
+    ...(input.dockerOptions ? { dockerOptions: input.dockerOptions } : {}),
+    projectId: input.expectedProject.projectId,
+    sessionId: input.record.sessionId,
+    sourceIp: input.record.sourceIp,
+  });
 
   // Steps 2 and 3 exist for a container that may still be running. An exact
   // proof that this incarnation already exited (a normal exit, sub-second

@@ -52,6 +52,7 @@ describe("runtime asset materialization", () => {
     expect(containerPaths).toContain("runtime/runtime-inputs.lock.json");
     expect(containerPaths).toContain("runtime/agent/agent-tools/package-lock.json");
     expect(containerPaths).toContain("runtime/agent/claude-runfree.sh");
+    expect(containerPaths).toContain("runtime/agent/codex-runfree.sh");
     expect(containerPaths).toContain("runtime/agent/session-entry.sh");
     expect(containerPaths).toContain("runtime/agent/session-ready-probe.cjs");
     expect(containerPaths).toContain("runtime/proxy/package-lock.json");
