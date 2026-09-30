@@ -372,9 +372,9 @@ describe("session readiness probe against the real request proxy", () => {
     );
   });
 
-  test("an attempt cut short by the run's budget does not replace the last answer", async () => {
-    // A loaded host can leave the run's final attempt waiting when the budget
-    // runs out; the run still reports what the proxy last said.
+  test("a failed or cut-short attempt does not replace the proxy's last answer", async () => {
+    // A loaded host can time out an attempt, and the run's budget can cut the
+    // final one short; the run still reports what the proxy last said.
     const answered = await fakeProxy(["HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"]);
     const stalled = new Set<net.Socket>();
     const stallServer = net.createServer((socket) => {

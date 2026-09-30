@@ -37,8 +37,8 @@
 // and one pause, plus one Node start when the file lands between two runs.
 //
 // Exit codes (for logs; the entry treats every non-zero code the same). A
-// run's code is its last attempt's, except that an attempt cut short by the
-// run's budget keeps the previous attempt's code:
+// run's code is its last answer's (0, 3, 5); 4 only when no attempt was
+// answered:
 //   0  active
 //   3  refused (403)
 //   4  connect failure or timeout
@@ -152,7 +152,7 @@ export async function probeUntilActive(options: Readonly<{
   const nowMs = options.nowMs ?? (() => performance.now());
   const deadline = nowMs() + TOTAL_TIMEOUT_MS;
   let code = EXIT_UNREACHABLE;
-  for (let index = 0; ; index += 1) {
+  for (;;) {
     const remaining = deadline - nowMs();
     if (remaining <= 0) return code;
     const result = await attempt({
@@ -162,9 +162,10 @@ export async function probeUntilActive(options: Readonly<{
       connectTimeoutMs: Math.min(ATTEMPT_CONNECT_TIMEOUT_MS, remaining),
       totalTimeoutMs: remaining,
     });
-    // An attempt the run's own budget cut short says nothing about the proxy,
-    // so it never replaces an earlier attempt's answer.
-    if (!(result === EXIT_UNREACHABLE && index > 0 && deadline - nowMs() <= 0)) code = result;
+    // A failed or timed-out connection says less than an answer: on a loaded
+    // host, or when the run's budget cuts the last attempt short, it would
+    // otherwise hide what the proxy last said. So it never replaces one.
+    if (result !== EXIT_UNREACHABLE || code === EXIT_UNREACHABLE) code = result;
     if (code === EXIT_ACTIVE || deadline - nowMs() <= RETRY_PAUSE_MS) return code;
     await new Promise((resolve) => setTimeout(resolve, RETRY_PAUSE_MS));
   }
