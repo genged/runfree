@@ -614,6 +614,9 @@ function publishRequestProxyStatus(): void {
         policyGeneration: currentPolicy.generation,
       } : { generation: currentPolicy.generation }),
       appliedAt: new Date().toISOString(),
+      // activatePairedPolicy prunes OAuth state from other state epochs and
+      // throws (failing the reload before this publish) if it cannot.
+      oauthStateEpochs: 1,
     });
   } catch (error) {
     console.error(`proxy: failed to publish generation status: ${error instanceof Error ? error.message : String(error)}`);

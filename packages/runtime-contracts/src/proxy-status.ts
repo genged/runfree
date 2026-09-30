@@ -41,11 +41,17 @@ export type FirewallGenerationStatus = GenerationStatusIdentity & {
 
 export type RequestProxyGenerationStatus = GenerationStatusIdentity & {
   appliedAt: string;
+  // This request proxy deletes OAuth state stamped with a provider state
+  // epoch other than the applied policy's before it publishes the status, so
+  // a status naming a generation proves that generation's clears happened.
+  // A proxy without the marker predates epochs and proves nothing.
+  oauthStateEpochs?: 1;
 };
 
 export type ParsedGenerationStatus = {
   controlGeneration?: string;
   generation: string;
+  oauthStateEpochs?: true;
   policyGeneration?: string;
   rulesetVerified?: boolean;
 };
@@ -81,6 +87,7 @@ export function parseGenerationStatusLine(raw: string): ParsedGenerationStatus |
       policyGeneration: record.policyGeneration as string,
     } : {}),
     ...(typeof record.rulesetVerified === "boolean" ? { rulesetVerified: record.rulesetVerified } : {}),
+    ...(record.oauthStateEpochs === 1 ? { oauthStateEpochs: true as const } : {}),
   };
 }
 

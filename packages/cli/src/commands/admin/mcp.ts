@@ -29,6 +29,8 @@ import {
   runAdminAction,
   credentialSourceSelectionFromArgs,
 } from "../../admin/options.ts";
+import { printable, type McpRevokeResult } from "../../admin/mcp-admin.ts";
+import { gatherOAuthStateClearEvidence, oauthStateClearLine } from "../../admin/mcp-oauth-clear.ts";
 import { mcpAuthRuntime } from "../../runtime/mcp-auth.ts";
 import { nodeRuntimeIO } from "../../runtime.ts";
 import type { RunfreeCommandContext } from "../context.ts";
@@ -278,10 +280,20 @@ export const mcpCommand: CommandModule = {
             handler((argv: ArgumentsCamelCase<RevokeArgs>) => {
               const intent = { agent: parseMcpAgent(argv.agent), server: argv.server, source: parseMcpSource(argv.source) };
               return (async () => {
-                const status = await run(() => mcpRevokeIntent(intent));
-                if (status !== 0) return status;
-                const activation = await activateApprovedControlsAfterMutation(context.runtimeContext(), nodeRuntimeIO);
+                let revoked: McpRevokeResult | undefined;
+                const status = await run(() => {
+                  revoked = mcpRevokeIntent(intent);
+                });
+                if (status !== 0 || !revoked) return status;
+                const runtimeContext = context.runtimeContext();
+                const activation = await activateApprovedControlsAfterMutation(runtimeContext, nodeRuntimeIO);
                 console.log(activationReportLine(activation));
+                console.log(oauthStateClearLine({
+                  agent: intent.agent,
+                  server: printable(intent.server),
+                  expectedEpoch: revoked.oauthStateEpoch,
+                  evidence: gatherOAuthStateClearEvidence(runtimeContext, nodeRuntimeIO, activation, revoked.oauthProviderId),
+                }));
                 return 0;
               })();
             }),

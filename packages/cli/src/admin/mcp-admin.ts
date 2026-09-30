@@ -15,6 +15,7 @@ import {
   mcpInventory,
   type McpInventoryEntry,
   mcpOAuthCallbackPort,
+  mcpOAuthProviderId,
   mcpRuleKeyForEntry,
   mcpRulesPath,
   readMcpRules,
@@ -35,6 +36,7 @@ import {
   removeMcpEnabledRecords,
   saveMcpEnabledRecord,
 } from "../runtime/mcp-enabled.ts";
+import { mcpOAuthEpochsPath, mcpOAuthStateEpoch, updateMcpOAuthEpochs } from "../runtime/mcp-oauth-epochs.ts";
 import { atomicReplaceFile } from "../safe-fs.ts";
 import {
   checkPolicyHostname,
@@ -683,7 +685,9 @@ export async function mcpConfigureIntent(input: McpConfigureInput): Promise<McpC
       selectedEntryWillRemain = false;
       changes.push({
         label: `revoke project ${entry.agent}/${entry.name}`,
-        apply: () => mcpRevokeIntent({ agent: entry.agent, server: entry.name }),
+        apply: () => {
+          mcpRevokeIntent({ agent: entry.agent, server: entry.name });
+        },
       });
     }
   }
@@ -764,9 +768,26 @@ export async function mcpConfigureIntent(input: McpConfigureInput): Promise<McpC
   return auth ? { auth } : {};
 }
 
-export function mcpRevokeIntent(input: McpRevokeInput): void {
+export type McpRevokeResult = {
+  // The proxy OAuth provider whose state this revoke clears, and the new
+  // state epoch the next effective policy generation publishes for it.
+  oauthProviderId: string;
+  oauthStateEpoch: string;
+};
+
+export function mcpRevokeIntent(input: McpRevokeInput): McpRevokeResult {
   const { agent, server: serverName } = input;
   const shownName = printable(serverName);
+  // The OAuth state clear comes first: if its tombstone cannot be written,
+  // revoke fails before it changes anything else. The proxy keys OAuth state
+  // by agent and server name, so this covers every source of that name.
+  const oauthProviderId = mcpOAuthProviderId(agent, serverName);
+  const epochs = updateMcpOAuthEpochs(projectRoot(), mcpOAuthEpochsPath(stateDir()), { revoke: [oauthProviderId] });
+  const oauthStateEpoch = mcpOAuthStateEpoch(epochs, oauthProviderId);
+  if (epochs.reset === "reclaimed") {
+    console.log("the MCP OAuth state epoch store was invalid and was replaced; the proxy clears all MCP OAuth state, so every MCP server needs a new OAuth login");
+  }
+  console.log(`proxy OAuth state for ${agent} ${shownName}: clear requested`);
   const approvalFile = mcpApprovalPath(stateDir());
   const entry = mcpInventory({ projectRoot: projectRoot(), env: childEnv(), approvalPath: approvalFile })
     .entries.find((candidate) => candidate.source === "project" && candidate.agent === agent && candidate.name === serverName);
@@ -797,6 +818,7 @@ export function mcpRevokeIntent(input: McpRevokeInput): void {
       console.log(`credential source left configured: runfree credential clear-source ${binding.tokenName}`);
     }
   }
+  return { oauthProviderId, oauthStateEpoch };
 }
 
 /**
@@ -822,6 +844,7 @@ export function prepareEffectiveRuntimeIntent(input: {
     mcpOAuthPolicyPath: oauthMediationPolicyPath(),
     mcpRulesPath: mcpRulesPath(stateDir()),
     mcpEnabledPath: mcpEnabledPath(stateDir()),
+    mcpOAuthEpochsPath: mcpOAuthEpochsPath(stateDir()),
     policy: structuredClone(base.raw),
     projectRoot: projectRoot(),
     tokenConfig: loadTokenConfig(),

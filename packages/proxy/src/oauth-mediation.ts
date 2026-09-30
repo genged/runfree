@@ -60,10 +60,12 @@ type McpOAuthServerPolicy = {
   kind: "mcp" | "service";
   metadataEndpoints: TokenEndpoint[];
   name: string;
+  protocolReadEndpoints: TokenEndpoint[];
   registrationEndpoints: TokenEndpoint[];
   resourceHost: string;
   resourcePathPrefix: string;
   seeds: OAuthSeed[];
+  stateEpoch?: string;
   tokenEndpoints: TokenEndpoint[];
 };
 
@@ -88,17 +90,24 @@ type StoredToken = {
   resourcePathPrefix: string;
   secretRef?: string;
   serverName: string;
+  // The provider's state epoch when the handle was minted. A handle whose
+  // epoch differs from the current policy's is deleted at activation and
+  // refused at use (`runfree mcp revoke` publishes a new epoch).
+  stateEpoch?: string;
   token?: string;
   tokenEndpointHost: string;
   tokenEndpointPath: string;
   type: "access" | "refresh" | "secret";
 };
 
-type StoredDiscovery = Record<string, {
+type StoredDiscoveryEntry = {
   issuerHosts?: string[];
   registrationEndpoints?: TokenEndpoint[];
+  stateEpoch?: string;
   tokenEndpoints?: TokenEndpoint[];
-}>;
+};
+
+type StoredDiscovery = Record<string, StoredDiscoveryEntry>;
 
 type StoredMcpOAuthState = {
   discovered?: StoredDiscovery;
@@ -111,10 +120,21 @@ export type OAuthIssuerDenialContext = {
 };
 
 type SensitiveOAuthRequest = {
+  createdAtMs: number;
   endpoint: TokenEndpoint;
   kind: "registration" | "token";
+  // The refresh handle swapped into this request, retired on rotation.
+  refreshHandle?: string;
   server: McpOAuthServerPolicy;
 };
+
+// A request whose response never arrives (upstream error, client abort)
+// leaves its entry behind; bound the map by age and size.
+const PENDING_MAX_AGE_MS = 10 * 60 * 1000;
+const PENDING_MAX_ENTRIES = 1024;
+// Per-provider handle cap: repeated exchanges cannot grow the state file
+// without bound. The oldest handles go first.
+const MAX_HANDLES_PER_PROVIDER = 256;
 
 
 function firstHeader(value: HeaderValue): string | undefined {
@@ -172,10 +192,12 @@ function serverPolicyFromProvider(provider: OAuthProviderPolicy): McpOAuthServer
     kind: provider.kind,
     metadataEndpoints: provider.metadataEndpoints,
     name: provider.providerId,
+    protocolReadEndpoints: provider.protocolReadEndpoints,
     registrationEndpoints: provider.registrationEndpoints,
     resourceHost: provider.resourceHost,
     resourcePathPrefix: provider.resourcePathPrefix,
     seeds: provider.seeds,
+    ...(provider.stateEpoch !== undefined ? { stateEpoch: provider.stateEpoch } : {}),
     tokenEndpoints: provider.tokenEndpoints,
   };
 }
@@ -267,9 +289,23 @@ function storedTokenEndpointMatches(token: StoredToken, endpoint: TokenEndpoint)
   return token.tokenEndpointHost === endpoint.host && token.tokenEndpointPath === endpoint.path;
 }
 
+// Absent epochs compare equal, so state from before epochs existed survives
+// until its provider's first revoke publishes one.
+function sameStateEpoch(stored: string | undefined, current: string | undefined): boolean {
+  return (stored ?? "") === (current ?? "");
+}
+
 function storedTokenMatchesCurrentServer(token: StoredToken, server: McpOAuthServerPolicy): boolean {
   return token.resourceHost === server.resourceHost
-    && token.resourcePathPrefix === server.resourcePathPrefix;
+    && token.resourcePathPrefix === server.resourcePathPrefix
+    && sameStateEpoch(token.stateEpoch, server.stateEpoch);
+}
+
+// The discovered entry for a server, only when it was recorded under the
+// server's current state epoch: an entry from before a revoke never binds.
+function discoveredEntry(server: McpOAuthServerPolicy, state: StoredMcpOAuthState): StoredDiscoveryEntry | undefined {
+  const entry = state.discovered?.[server.name];
+  return entry && sameStateEpoch(entry.stateEpoch, server.stateEpoch) ? entry : undefined;
 }
 
 function pruneStateForPolicy(state: StoredMcpOAuthState, policy: LoadedMcpOAuthPolicy): boolean {
@@ -282,13 +318,19 @@ function pruneStateForPolicy(state: StoredMcpOAuthState, policy: LoadedMcpOAuthP
       changed = true;
     }
   }
-  for (const name of Object.keys(state.discovered ?? {})) {
-    if (!servers.has(name)) {
+  for (const [name, entry] of Object.entries(state.discovered ?? {})) {
+    const server = servers.get(name);
+    if (!server || !sameStateEpoch(entry.stateEpoch, server.stateEpoch)) {
       delete state.discovered?.[name];
       changed = true;
     }
   }
   return changed;
+}
+
+function pendingServerStillCurrent(pending: McpOAuthServerPolicy, policy: LoadedMcpOAuthPolicy): boolean {
+  const current = policy.servers.find((server) => server.name === pending.name);
+  return current !== undefined && sameStateEpoch(pending.stateEpoch, current.stateEpoch);
 }
 
 function resourceMatches(server: McpOAuthServerPolicy, url: URL): boolean {
@@ -326,7 +368,7 @@ function safeTokenEndpoint(url: URL): TokenEndpoint {
 }
 
 function tokenEndpointList(server: McpOAuthServerPolicy, state: StoredMcpOAuthState): TokenEndpoint[] {
-  const discovered = state.discovered?.[server.name]?.tokenEndpoints ?? [];
+  const discovered = discoveredEntry(server, state)?.tokenEndpoints ?? [];
   return [
     ...server.tokenEndpoints,
     ...discovered,
@@ -334,7 +376,7 @@ function tokenEndpointList(server: McpOAuthServerPolicy, state: StoredMcpOAuthSt
 }
 
 function registrationEndpointList(server: McpOAuthServerPolicy, state: StoredMcpOAuthState): TokenEndpoint[] {
-  const discovered = state.discovered?.[server.name]?.registrationEndpoints ?? [];
+  const discovered = discoveredEntry(server, state)?.registrationEndpoints ?? [];
   return [
     ...server.registrationEndpoints,
     ...discovered,
@@ -360,7 +402,7 @@ function serverBindingHosts(server: McpOAuthServerPolicy): Set<string> {
 // so a legitimately-delegated, off-resource-host authorization server's endpoints
 // can be mediated — but only because the resource server itself named them.
 function discoveredIssuerHosts(server: McpOAuthServerPolicy, state: StoredMcpOAuthState): string[] {
-  return state.discovered?.[server.name]?.issuerHosts ?? [];
+  return discoveredEntry(server, state)?.issuerHosts ?? [];
 }
 
 function effectiveBindingHosts(server: McpOAuthServerPolicy, state: StoredMcpOAuthState): Set<string> {
@@ -403,13 +445,22 @@ function matchingMetadataServer(policy: LoadedMcpOAuthPolicy, state: StoredMcpOA
   });
 }
 
-function rememberIssuerHost(state: StoredMcpOAuthState, serverName: string, host: string): boolean {
+// The server's discovered entry for writing: an entry from another state
+// epoch is replaced, never extended.
+function writableDiscoveredEntry(state: StoredMcpOAuthState, server: McpOAuthServerPolicy): StoredDiscoveryEntry {
   state.discovered ??= {};
-  const entry = state.discovered[serverName] ?? {};
+  const current = discoveredEntry(server, state);
+  if (current) return current;
+  const fresh: StoredDiscoveryEntry = server.stateEpoch !== undefined ? { stateEpoch: server.stateEpoch } : {};
+  state.discovered[server.name] = fresh;
+  return fresh;
+}
+
+function rememberIssuerHost(state: StoredMcpOAuthState, server: McpOAuthServerPolicy, host: string): boolean {
+  const entry = writableDiscoveredEntry(state, server);
   const hosts = entry.issuerHosts ?? [];
   if (hosts.includes(host)) return false;
   entry.issuerHosts = [...hosts, host].sort();
-  state.discovered[serverName] = entry;
   return true;
 }
 
@@ -419,16 +470,14 @@ function sameEndpoint(left: TokenEndpoint, right: TokenEndpoint): boolean {
 
 function rememberEndpoint(
   state: StoredMcpOAuthState,
-  serverName: string,
+  server: McpOAuthServerPolicy,
   endpoint: TokenEndpoint,
   field: "registrationEndpoints" | "tokenEndpoints",
 ): boolean {
-  state.discovered ??= {};
-  const entry = state.discovered[serverName] ?? {};
+  const entry = writableDiscoveredEntry(state, server);
   const endpoints = entry[field] ?? [];
   if (endpoints.some((existing) => sameEndpoint(existing, endpoint))) return false;
   entry[field] = [...endpoints, endpoint].sort((left, right) => `${left.host}\0${left.path}`.localeCompare(`${right.host}\0${right.path}`));
-  state.discovered[serverName] = entry;
   return true;
 }
 
@@ -471,11 +520,18 @@ function storeHandle(
     resourceHost: options.server.resourceHost,
     resourcePathPrefix: options.server.resourcePathPrefix,
     serverName: options.server.name,
+    ...(options.server.stateEpoch !== undefined ? { stateEpoch: options.server.stateEpoch } : {}),
     token: options.token,
     tokenEndpointHost: options.tokenEndpoint.host,
     tokenEndpointPath: options.tokenEndpoint.path,
     type: options.type,
   };
+  const ownHandles = Object.values(state.handles)
+    .filter((token) => token.serverName === options.server.name && token.handle !== handle)
+    .sort((left, right) => left.createdAt.localeCompare(right.createdAt));
+  for (const stale of ownHandles.slice(0, Math.max(0, ownHandles.length + 1 - MAX_HANDLES_PER_PROVIDER))) {
+    delete state.handles[stale.handle];
+  }
   return handle;
 }
 
@@ -826,14 +882,25 @@ export class OAuthMediator {
     if (res.statusCode < 200 || res.statusCode >= 300) return undefined;
     const text = await res.body.getText();
     return await this.withStateLock(() => {
+      // Re-read the policy after the body arrived: an activation (a revoke's
+      // new state epoch) may have pruned this server's state meanwhile, and
+      // nothing from before it may be written back.
+      const live = this.currentPolicyState();
+      const livePolicy = live.policy;
+      // An exchange that began before its server was removed or revoked must
+      // not store tokens into the new state, and its real tokens must not
+      // reach the agent: block the response.
+      if (pending && live.valid && !pendingServerStillCurrent(pending.server, livePolicy)) {
+        return blockedTokenEndpointResponse("MCP OAuth server was revoked during the exchange", res.headers);
+      }
       const state = this.currentState();
-      const couldBeMetadata = policyState.valid && matchingMetadataServer(policy, state, requestUrl) !== undefined;
+      const couldBeMetadata = live.valid && matchingMetadataServer(livePolicy, state, requestUrl) !== undefined;
       const server = pending?.kind === "token"
         ? pending.server
-        : policyState.valid ? matchingTokenServer(policy, state, requestUrl) : undefined;
+        : live.valid ? matchingTokenServer(livePolicy, state, requestUrl) : undefined;
       const registrationServer = pending?.kind === "registration"
         ? pending.server
-        : policyState.valid ? matchingRegistrationServer(policy, state, requestUrl) : undefined;
+        : live.valid ? matchingRegistrationServer(livePolicy, state, requestUrl) : undefined;
       if (!server && !registrationServer && !couldBeMetadata) return undefined;
       if (!text) {
         return server || registrationServer
@@ -846,7 +913,7 @@ export class OAuthMediator {
           ? blockedTokenEndpointResponse("malformed OAuth token response", res.headers)
           : undefined;
       }
-      if (policyState.valid && this.captureMetadataEndpoint(policy, state, requestUrl, parsed)) return undefined;
+      if (live.valid && this.captureMetadataEndpoint(livePolicy, state, requestUrl, parsed)) return undefined;
       if (registrationServer) {
         const next = this.replaceRegistrationResponse(
           state,
@@ -871,6 +938,12 @@ export class OAuthMediator {
       );
       if (!next) return undefined;
       if ("error" in next) return blockedTokenEndpointResponse(next.error, res.headers);
+      // A rotated refresh token retires the handle that was swapped for the
+      // old one, so the agent cannot replay the old token (which can trip the
+      // issuer's reuse detection and revoke the whole grant).
+      if (next.refreshStatus === "handle" && pending?.refreshHandle && state.handles?.[pending.refreshHandle]) {
+        delete state.handles[pending.refreshHandle];
+      }
       writeState(this.stateFile(), state);
       this.log(`proxy: oauth token_exchange ok name=${server.name} access=handle refresh=${next.refreshStatus}`);
       return {
@@ -914,21 +987,27 @@ export class OAuthMediator {
   ): void {
     if (typeof req.id !== "string" || req.id === "") return;
     const tokenServer = matchingTokenServer(policy, state, url);
-    if (tokenServer) {
-      this.pendingSensitiveRequests.set(req.id, {
-        endpoint: safeTokenEndpoint(url),
-        kind: "token",
-        server: tokenServer,
-      });
-      return;
+    const registrationServer = tokenServer ? undefined : matchingRegistrationServer(policy, state, url);
+    const server = tokenServer ?? registrationServer;
+    if (!server) return;
+    this.prunePendingSensitiveRequests();
+    this.pendingSensitiveRequests.set(req.id, {
+      createdAtMs: Date.now(),
+      endpoint: safeTokenEndpoint(url),
+      kind: tokenServer ? "token" : "registration",
+      server,
+    });
+  }
+
+  private prunePendingSensitiveRequests(): void {
+    const cutoff = Date.now() - PENDING_MAX_AGE_MS;
+    for (const [id, pending] of this.pendingSensitiveRequests) {
+      if (pending.createdAtMs < cutoff) this.pendingSensitiveRequests.delete(id);
     }
-    const registrationServer = matchingRegistrationServer(policy, state, url);
-    if (registrationServer) {
-      this.pendingSensitiveRequests.set(req.id, {
-        endpoint: safeTokenEndpoint(url),
-        kind: "registration",
-        server: registrationServer,
-      });
+    while (this.pendingSensitiveRequests.size >= PENDING_MAX_ENTRIES) {
+      const oldest = this.pendingSensitiveRequests.keys().next().value;
+      if (oldest === undefined) break;
+      this.pendingSensitiveRequests.delete(oldest);
     }
   }
 
@@ -1039,6 +1118,8 @@ export class OAuthMediator {
       if (!refreshed) return headersChanged ? { headers } : undefined;
       body = refreshed;
       bodyChanged = true;
+      const pending = typeof req.id === "string" ? this.pendingSensitiveRequests.get(req.id) : undefined;
+      if (pending) pending.refreshHandle = token.handle;
     }
 
     let secretReplacement: SecretHandleReplacement = {};
@@ -1191,7 +1272,7 @@ export class OAuthMediator {
     if (host === server.resourceHost && Array.isArray(parsed.authorization_servers)) {
       for (const entry of parsed.authorization_servers) {
         const issuer = tokenEndpointFromUrl(entry);
-        if (issuer && rememberIssuerHost(state, server.name, issuer.host)) {
+        if (issuer && rememberIssuerHost(state, server, issuer.host)) {
           changed = true;
           this.log(`proxy: mcp oauth issuer bound name=${server.name} issuer_host=${issuer.host}`);
         }
@@ -1210,10 +1291,10 @@ export class OAuthMediator {
       const registrationEndpoint = tokenEndpointFromUrl(parsed.registration_endpoint);
       let endpointChanged = false;
       if (tokenEndpoint && this.assertBoundDiscoveredEndpoint(server, bindingHosts, tokenEndpoint, "token_endpoint")) {
-        endpointChanged = rememberEndpoint(state, server.name, tokenEndpoint, "tokenEndpoints") || endpointChanged;
+        endpointChanged = rememberEndpoint(state, server, tokenEndpoint, "tokenEndpoints") || endpointChanged;
       }
       if (registrationEndpoint && this.assertBoundDiscoveredEndpoint(server, bindingHosts, registrationEndpoint, "registration_endpoint")) {
-        endpointChanged = rememberEndpoint(state, server.name, registrationEndpoint, "registrationEndpoints") || endpointChanged;
+        endpointChanged = rememberEndpoint(state, server, registrationEndpoint, "registrationEndpoints") || endpointChanged;
       }
       if (endpointChanged) {
         this.log(`proxy: mcp oauth discovery ok name=${server.name}${tokenEndpoint ? ` token_host=${tokenEndpoint.host}` : ""}${registrationEndpoint ? ` registration_host=${registrationEndpoint.host}` : ""}`);
@@ -1257,10 +1338,13 @@ export class OAuthMediator {
       return { policy: this.loadedPolicy, valid: true };
     }
     try {
-      this.loadedPolicy = loadPolicy(policyPath);
+      // Prune before committing, so a failed prune is retried on the next
+      // request instead of leaving a committed policy with unpruned state.
+      const next = loadPolicy(policyPath);
+      this.pruneStateForLoadedPolicy(next);
+      this.loadedPolicy = next;
       this.loadedPolicyMtimeMs = stat.mtimeMs;
       this.lastPolicyReloadFailure = undefined;
-      this.pruneStateForLoadedPolicy(this.loadedPolicy);
     } catch (error) {
       return this.invalidPolicyState(policyPath, error);
     }

@@ -38,6 +38,7 @@ import {
   readMcpEnabled,
   withoutSharedEnabledEndpoints,
 } from "./mcp-enabled.ts";
+import { mcpOAuthStateEpoch, updateMcpOAuthEpochs } from "./mcp-oauth-epochs.ts";
 import { RUNFREE_RUNTIME_TARGETS, workspaceMetadataTarget } from "./mount-target-policy.ts";
 import { sha256Hex, isRecord } from "../strict-primitives.ts";
 
@@ -200,7 +201,11 @@ type McpOAuthServerPolicyJson = {
   };
   tokenEndpoints?: OAuthTokenEndpointJson[];
   registrationEndpoints?: OAuthTokenEndpointJson[];
+  // Set only by the effective preparation, never from MCP config: the
+  // recorded mediated endpoints (`mcp enable`) and the revoke epoch.
+  protocolReadEndpoints?: Array<{ host: string; path: string }>;
   seeds?: OAuthSeedJson[];
+  stateEpoch?: string;
 };
 
 export type McpMaskPaths = {
@@ -227,6 +232,9 @@ export type McpPrepareOptions = {
   // Host-owned `runfree mcp enable` records: their OAuth hosts are projected
   // beside the matching server's endpoint host.
   mcpEnabledPath?: string;
+  // Host-owned OAuth state epochs (`runfree mcp revoke` tombstones): each MCP
+  // OAuth provider publishes its epoch so the proxy clears older state.
+  mcpOAuthEpochsPath?: string;
   mcpOperationPolicyPath?: string;
   mcpOAuthPolicyPath: string;
   mcpRulesPath?: string;
@@ -1776,8 +1784,20 @@ export function prepareMcpRuntime(options: McpPrepareOptions): McpPrepareResult 
   for (const message of mediation.dropped) warn(message);
   servers.forEach((server, index) => {
     const record = mediation.records[index];
-    if (record && server.oauthPolicy) projectEnabledOAuthEndpoints(server.oauthPolicy, record);
+    if (!record || !server.oauthPolicy) return;
+    const applied = projectEnabledOAuthEndpoints(server.oauthPolicy, record);
+    if (applied.length > 0) server.oauthPolicy.protocolReadEndpoints = applied;
   });
+  const oauthCapable = servers.filter((server) => server.oauthPolicy !== undefined);
+  if (options.mcpOAuthEpochsPath && oauthCapable.length > 0) {
+    const epochs = updateMcpOAuthEpochs(options.projectRoot, options.mcpOAuthEpochsPath);
+    if (epochs.reset === "reclaimed") {
+      warn(`mcp: the MCP OAuth state epoch store ${options.mcpOAuthEpochsPath} was invalid; Runfree replaced it, so the proxy clears all MCP OAuth state and every MCP server needs a new OAuth login`);
+    }
+    for (const server of oauthCapable) {
+      if (server.oauthPolicy) server.oauthPolicy.stateEpoch = mcpOAuthStateEpoch(epochs, mcpOAuthProviderId(server.agent, server.name));
+    }
+  }
   projectEnabledOAuthHosts(options.policy, claimants.flatMap((claimant) => claimant.record ? [claimant.record] : []));
   writeMcpOAuthPolicy(options.mcpOAuthPolicyPath, servers, callbackPort);
   writeMcpOperationPolicy(

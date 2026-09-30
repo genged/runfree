@@ -257,8 +257,14 @@ function hasEndpoint(list: OAuthEndpointJson[], host: string, pathName: string):
  * only after it captures metadata the agent chose to fetch. Only endpoints on
  * a host the mediator binds for this server are applied: the resource host,
  * declared metadata/token hosts, and the record's hosts.
+ *
+ * Returns the record's token and registration endpoints that are now static
+ * mediated endpoints of this server. Those, and only those, become the
+ * server's protocol-read endpoints: a POST to exactly one of them is an OAuth
+ * protocol read while the proxy mediates it.
  */
-export function projectEnabledOAuthEndpoints(policy: EnabledOAuthPolicyTarget, record: McpEnabledRecord): void {
+export function projectEnabledOAuthEndpoints(policy: EnabledOAuthPolicyTarget, record: McpEnabledRecord): Array<{ host: string; path: string }> {
+  const applied: Array<{ host: string; path: string }> = [];
   const bound = new Set<string>([policy.resourceHost]);
   const metadataUrl = policy.oauth?.authServerMetadataUrl;
   if (metadataUrl) {
@@ -284,8 +290,14 @@ export function projectEnabledOAuthEndpoints(policy: EnabledOAuthPolicyTarget, r
     } else if (endpoint.kind === "registration") {
       policy.registrationEndpoints ??= [];
       if (!hasEndpoint(policy.registrationEndpoints, endpoint.host, endpoint.path)) policy.registrationEndpoints.push({ host: endpoint.host, path: endpoint.path });
+    } else {
+      continue;
+    }
+    if (!applied.some((entry) => entry.host === endpoint.host && entry.path === endpoint.path)) {
+      applied.push({ host: endpoint.host, path: endpoint.path });
     }
   }
+  return applied;
 }
 
 export type EnabledEndpointClaimant = {

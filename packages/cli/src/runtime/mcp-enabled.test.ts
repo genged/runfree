@@ -193,7 +193,7 @@ describe("projection", () => {
       resourceHost: "mcp.example.com",
       tokenEndpoints: [{ host: "declared.example.com", path: "/t" }],
     };
-    projectEnabledOAuthEndpoints(oauthPolicy, record({
+    const applied = projectEnabledOAuthEndpoints(oauthPolicy, record({
       oauthEndpoints: [
         { kind: "token", host: "auth.example.com", path: "/token" },
         { kind: "token", host: "mcp.example.com", path: "/oauth/token" },
@@ -203,6 +203,14 @@ describe("projection", () => {
         { kind: "metadata", host: "auth.example.com", path: "/.well-known/oauth-authorization-server" },
       ],
     }));
+    // Only the recorded token and registration endpoints now mediated
+    // statically: never a metadata endpoint, never an unbound host.
+    expect(applied).toEqual([
+      { host: "auth.example.com", path: "/token" },
+      { host: "mcp.example.com", path: "/oauth/token" },
+      { host: "declared.example.com", path: "/t" },
+      { host: "auth.example.com", path: "/register" },
+    ]);
     expect(oauthPolicy.tokenEndpoints).toEqual([
       { host: "declared.example.com", path: "/t" },
       { host: "auth.example.com", path: "/token" },

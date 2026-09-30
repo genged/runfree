@@ -692,7 +692,7 @@ describe("admin MCP runtime preparation", () => {
       },
     }));
     expect((await runAdmin(() => mcpApproveIntent({ agent: parseMcpAgent("claude"), server: "repoTools", tokenSource: { kind: "none" }, replaceSource: false }))).status).toBe(0);
-    const revoke = await runAdmin(() => mcpRevokeIntent({ agent: parseMcpAgent("claude"), server: "repoTools" }));
+    const revoke = await runAdmin(() => { mcpRevokeIntent({ agent: parseMcpAgent("claude"), server: "repoTools" }); });
     expect(revoke.status, revoke.stderr).toBe(0);
     expect(revoke.stdout).toContain("revoked project MCP server: claude repoTools");
 
@@ -712,7 +712,7 @@ describe("admin MCP runtime preparation", () => {
     expect((await runAdmin(() => mcpApproveIntent({ agent: parseMcpAgent("claude"), server: "repoTools", tokenSource: { kind: "none" }, replaceSource: false }))).status).toBe(0);
     fs.rmSync(mcpPath);
 
-    const revoke = await runAdmin(() => mcpRevokeIntent({ agent: parseMcpAgent("claude"), server: "repoTools" }));
+    const revoke = await runAdmin(() => { mcpRevokeIntent({ agent: parseMcpAgent("claude"), server: "repoTools" }); });
 
     expect(revoke.status, revoke.stderr).toBe(0);
     expect(revoke.stdout).toContain("revoked project MCP server: claude repoTools");
@@ -1211,16 +1211,66 @@ describe("runfree mcp enable", () => {
       methods: ["GET", "HEAD", "OPTIONS", "POST"],
       pathPrefixes: ["/.well-known", "/.well-known/oauth-authorization-server", "/oauth/register", "/oauth/token"],
     });
-    // The proxy mediates the validated endpoints statically.
+    // The proxy mediates the validated endpoints statically, and a POST to
+    // exactly those recorded, mediated endpoints is an OAuth protocol read.
     expect(readMcpOAuthPolicy()).toMatchObject({
       providers: {
         "mcp:claude-repooauth": {
           resourceHost: "repo-oauth.example.com",
           tokenEndpoints: [{ host: "auth.oauth-idp.example", path: "/oauth/token" }],
           registrationEndpoints: [{ host: "auth.oauth-idp.example", path: "/oauth/register" }],
+          protocolReadEndpoints: [
+            { host: "auth.oauth-idp.example", path: "/oauth/register" },
+            { host: "auth.oauth-idp.example", path: "/oauth/token" },
+          ],
+          stateEpoch: expect.stringMatching(/^[a-f0-9]{32}$/),
         },
       },
     });
+  });
+
+  test("revoke publishes a new OAuth state epoch for the server and leaves other servers' epochs", async () => {
+    writeProjectOauthServer("serverA", "https://a.example.com/mcp");
+    writeClaudeNative({ mcpServers: { linear: { type: "http", url: "https://mcp.linear.example/mcp" } } });
+    expect((await runAdmin(() => mcpEnableIntent(enableInput({ server: "serverA", interactive: false, discover: false, oauthHosts: [] }), { discovery: NO_NETWORK }).then(() => {}))).status).toBe(0);
+    expect((await runAdmin(() => prepareRuntime())).status).toBe(0);
+    type Providers = { providers: Record<string, { stateEpoch?: string }> };
+    const before = (readMcpOAuthPolicy() as Providers).providers;
+    expect(before["mcp:claude-linear"]?.stateEpoch).toBe(before["mcp:claude-servera"]?.stateEpoch);
+
+    // A user server has no project approval, but revoke still clears its
+    // proxy OAuth state.
+    const revokeUser = await runAdmin(() => { mcpRevokeIntent({ agent: parseMcpAgent("claude"), server: "linear" }); });
+    expect(revokeUser.status, revokeUser.stderr).toBe(0);
+    expect(revokeUser.stdout).toContain("proxy OAuth state for claude linear: clear requested");
+    expect((await runAdmin(() => prepareRuntime())).status).toBe(0);
+    const afterUser = (readMcpOAuthPolicy() as Providers).providers;
+    expect(afterUser["mcp:claude-linear"]?.stateEpoch).not.toBe(before["mcp:claude-linear"]?.stateEpoch);
+    expect(afterUser["mcp:claude-servera"]?.stateEpoch).toBe(before["mcp:claude-servera"]?.stateEpoch);
+
+    // Revoking the project server and enabling it again starts a new epoch,
+    // so the proxy state from before the revoke never applies again.
+    expect((await runAdmin(() => { mcpRevokeIntent({ agent: parseMcpAgent("claude"), server: "serverA" }); })).status).toBe(0);
+    expect((await runAdmin(() => mcpEnableIntent(enableInput({ server: "serverA", interactive: false, discover: false, oauthHosts: [] }), { discovery: NO_NETWORK }).then(() => {}))).status).toBe(0);
+    expect((await runAdmin(() => prepareRuntime())).status).toBe(0);
+    const again = (readMcpOAuthPolicy() as Providers).providers;
+    expect(again["mcp:claude-servera"]?.stateEpoch).toMatch(/^[a-f0-9]{32}$/);
+    expect(again["mcp:claude-servera"]?.stateEpoch).not.toBe(before["mcp:claude-servera"]?.stateEpoch);
+  });
+
+  test("an invalid OAuth epoch store fails closed: every MCP server gets a new epoch, with a warning", async () => {
+    writeClaudeNative({ mcpServers: { linear: { type: "http", url: "https://mcp.linear.example/mcp" } } });
+    expect((await runAdmin(() => prepareRuntime())).status).toBe(0);
+    type Providers = { providers: Record<string, { stateEpoch?: string }> };
+    const before = (readMcpOAuthPolicy() as Providers).providers["mcp:claude-linear"]?.stateEpoch;
+    fs.writeFileSync(path.join(stateDir, "mcp-oauth-epochs.json"), "{ corrupt");
+    const prepare = await runAdmin(() => prepareRuntime());
+    expect(prepare.status, prepare.stderr).toBe(0);
+    expect(prepare.stderr).toContain("every MCP server needs a new OAuth login");
+    expect((readMcpOAuthPolicy() as Providers).providers["mcp:claude-linear"]?.stateEpoch).not.toBe(before);
+    // Reclaimed: the next preparation is quiet and stable.
+    const next = await runAdmin(() => prepareRuntime());
+    expect(next.stderr).not.toContain("new OAuth login");
   });
 
   test("no DNS lookup or request happens for an unknown, unsupported, static, or stdio entry", async () => {
@@ -1298,6 +1348,9 @@ describe("runfree mcp enable", () => {
     expect(readPolicy().hosts).toEqual(["repo-oauth.example.com", "sso.example.org"]);
     // A user-named host is allowed as given, like `runfree host add`.
     expect(readPolicy().requests?.["sso.example.org"]).toBeUndefined();
+    // No recorded endpoint, so no POST on it is ever an OAuth protocol read.
+    const provider = (readMcpOAuthPolicy() as { providers: Record<string, { protocolReadEndpoints?: unknown }> }).providers["mcp:claude-repooauth"];
+    expect(provider?.protocolReadEndpoints).toBeUndefined();
   });
 
   test("invalid --oauth-host values are refused before any write", async () => {
@@ -1345,7 +1398,7 @@ describe("runfree mcp enable", () => {
       "a.example.com", "b.example.com", "only-servera.example.com", "only-serverb.example.com", "shared-idp.example.com", "sso.example.org",
     ]);
 
-    const revoke = await runAdmin(() => mcpRevokeIntent({ agent: parseMcpAgent("claude"), server: "serverA" }));
+    const revoke = await runAdmin(() => { mcpRevokeIntent({ agent: parseMcpAgent("claude"), server: "serverA" }); });
     expect(revoke.status, revoke.stderr).toBe(0);
     expect(revoke.stdout).toContain("OAuth hosts no longer allowed for this server: only-servera.example.com, shared-idp.example.com, sso.example.org");
 
@@ -1394,7 +1447,7 @@ describe("runfree mcp enable", () => {
     expect(prepare.stderr).toContain("mcp: ignored an invalid MCP enable record (claude repoOauth)");
     expect(readPolicy().hosts).toEqual(["repo-oauth.example.com"]);
 
-    const revoke = await runAdmin(() => mcpRevokeIntent({ agent: parseMcpAgent("claude"), server: "other" }));
+    const revoke = await runAdmin(() => { mcpRevokeIntent({ agent: parseMcpAgent("claude"), server: "other" }); });
     expect(revoke.status, revoke.stderr).toBe(0);
     expect(revoke.stdout).toContain("dropped 1 invalid MCP enable record(s)");
     expect((JSON.parse(fs.readFileSync(enabledFilePath(), "utf8")) as { records: object }).records).toEqual({});
@@ -1487,9 +1540,12 @@ describe("runfree mcp enable", () => {
     const prepare = await runAdmin(() => prepareRuntime());
     expect(prepare.status, prepare.stderr).toBe(0);
     expect(prepare.stderr).toContain("token endpoint https://shared-idp.example.com/oauth/token is also used by another MCP server");
-    const providers = (readMcpOAuthPolicy() as { providers: Record<string, { tokenEndpoints?: unknown[] }> }).providers;
+    const providers = (readMcpOAuthPolicy() as { providers: Record<string, { protocolReadEndpoints?: unknown[]; tokenEndpoints?: unknown[] }> }).providers;
     expect(providers["mcp:claude-servera"]?.tokenEndpoints ?? []).toEqual([]);
     expect(providers["mcp:claude-serverb"]?.tokenEndpoints ?? []).toEqual([]);
+    // A shared endpoint is never an OAuth protocol read for either server.
+    expect(providers["mcp:claude-servera"]?.protocolReadEndpoints).toBeUndefined();
+    expect(providers["mcp:claude-serverb"]?.protocolReadEndpoints).toBeUndefined();
     // The path stays reachable for the login, as with `host add`.
     expect(readPolicy().requests?.["shared-idp.example.com"]?.pathPrefixes).toContain("/oauth/token");
   });
