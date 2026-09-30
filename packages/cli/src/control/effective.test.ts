@@ -96,6 +96,31 @@ describe("effective control generations", () => {
     expect(readEffectiveControlProvenance(project, generation.controlGeneration)).toEqual(provenance);
   });
 
+  test("carries an MCP provider's state epoch and protocol-read endpoints into the proxy payload, and a new epoch is a new generation", () => {
+    const project = approvedProject();
+    const provider = (stateEpoch: string) => ({
+      providers: {
+        "mcp:claude-linear": {
+          kind: "mcp" as const,
+          resourceHost: "mcp.example.com",
+          stateEpoch,
+          tokenEndpoints: [{ host: "auth.example.com", path: "/oauth/token" }],
+          protocolReadEndpoints: [{ host: "auth.example.com", path: "/oauth/token" }],
+        },
+      },
+    });
+    const first = publishEffectivePolicyGeneration(root, project, { baseOAuthPolicy: provider("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa") });
+    const payload = JSON.parse(fs.readFileSync(first.oauthPolicyPath, "utf8")) as {
+      providers: Record<string, { protocolReadEndpoints?: unknown; stateEpoch?: string }>;
+    };
+    expect(payload.providers["mcp:claude-linear"]).toMatchObject({
+      stateEpoch: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      protocolReadEndpoints: [{ host: "auth.example.com", path: "/oauth/token" }],
+    });
+    const second = publishEffectivePolicyGeneration(root, project, { baseOAuthPolicy: provider("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb") });
+    expect(second.controlGeneration).not.toBe(first.controlGeneration);
+  });
+
   test("changes generation when a host-only runtime payload changes", () => {
     const project = approvedProject();
     const first = publishEffectivePolicyGeneration(root, project, { runtimeNetwork: { subnet: "172.30.1.0/24" } });

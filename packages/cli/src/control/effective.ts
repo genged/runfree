@@ -7,9 +7,9 @@ import {
   type PolicyJson,
 } from "@runfree/runtime-contracts/network-policy";
 import {
+  oauthProviderPolicyJson,
   validateOAuthMediationPolicy,
   type OAuthMediationPolicyJson,
-  type OAuthProviderPolicy,
   type OAuthProviderPolicyJson,
 } from "@runfree/runtime-contracts/oauth-mediation-policy";
 import type { ParsedGenerationStatus } from "@runfree/runtime-contracts/proxy-status";
@@ -143,25 +143,13 @@ function generationName(digest: string): string {
   return digest.slice("sha256:".length);
 }
 
-function normalizedProvider(provider: OAuthProviderPolicy): OAuthProviderPolicyJson {
-  return {
-    kind: provider.kind,
-    resourceHost: provider.resourceHost,
-    resourcePathPrefix: provider.resourcePathPrefix,
-    tokenEndpoints: provider.tokenEndpoints,
-    registrationEndpoints: provider.registrationEndpoints,
-    metadataEndpoints: provider.metadataEndpoints,
-    seeds: provider.seeds,
-  };
-}
-
 function effectiveOAuthPolicy(
   compiled: ReturnType<typeof compileDesiredPolicies>,
   input: PublishEffectiveControlInput,
 ): OAuthMediationPolicyJson {
   const base = validateOAuthMediationPolicy(input.baseOAuthPolicy ?? { providers: {} });
   const providers: Record<string, OAuthProviderPolicyJson> = Object.fromEntries(
-    base.providers.map((provider) => [provider.providerId, normalizedProvider(provider)]),
+    base.providers.map((provider) => [provider.providerId, oauthProviderPolicyJson(provider)]),
   );
   for (const [providerId, provider] of Object.entries(compiled.oauth)) {
     if (providers[providerId]) throw new Error(`OAuth provider ${providerId} conflicts with host-owned OAuth policy`);

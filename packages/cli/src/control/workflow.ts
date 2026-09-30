@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 
 import {
+  oauthProviderPolicyJson,
   validateOAuthMediationPolicy,
   type OAuthMediationPolicyJson,
 } from "@runfree/runtime-contracts/oauth-mediation-policy";
@@ -355,19 +356,7 @@ export function useApprovedPolicyGeneration(context: RuntimeContext): EffectiveP
       parseStrictJson(source),
     );
     baseOAuthPolicy = {
-      providers: Object.fromEntries(loaded.providers.map((provider) => [provider.providerId, {
-        kind: provider.kind,
-        resourceHost: provider.resourceHost,
-        ...(provider.resourcePathPrefix ? { resourcePathPrefix: provider.resourcePathPrefix } : {}),
-        tokenEndpoints: provider.tokenEndpoints.map(({ host, path }) => ({ host, path })),
-        ...(provider.registrationEndpoints.length > 0
-          ? { registrationEndpoints: provider.registrationEndpoints.map(({ host, path }) => ({ host, path })) }
-          : {}),
-        ...(provider.metadataEndpoints.length > 0
-          ? { metadataEndpoints: provider.metadataEndpoints.map(({ host, path }) => ({ host, path })) }
-          : {}),
-        ...(provider.seeds.length > 0 ? { seeds: provider.seeds } : {}),
-      }])),
+      providers: Object.fromEntries(loaded.providers.map((provider) => [provider.providerId, oauthProviderPolicyJson(provider)])),
     };
   } catch (error) {
     if (!(error && typeof error === "object" && "code" in error && error.code === "ENOENT")) throw error;

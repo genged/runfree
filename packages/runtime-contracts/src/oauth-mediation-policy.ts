@@ -20,12 +20,21 @@ export type OAuthProviderPolicyJson = {
   kind?: OAuthProviderKind;
   metadataEndpoints?: OAuthTokenEndpointJson[];
   oauth?: Record<string, unknown>;
+  // Exact token/registration endpoints (a subset of this provider's static
+  // tokenEndpoints/registrationEndpoints) whose POSTs the proxy classifies as
+  // OAuth protocol reads while it mediates them. MCP providers only.
+  protocolReadEndpoints?: OAuthTokenEndpointJson[];
   registrationEndpoints?: OAuthTokenEndpointJson[];
   registrationHost?: string;
   registrationPath?: string;
   resourceHost: string;
   resourcePathPrefix?: string;
   seeds?: OAuthSeedJson[];
+  // Host-owned revocation epoch. The proxy stamps handles and discovered
+  // endpoints with it and deletes state stamped with any other epoch, so
+  // `runfree mcp revoke` clears a server's OAuth state by writing a new one.
+  // MCP providers only.
+  stateEpoch?: string;
   tokenEndpoints?: OAuthTokenEndpointJson[];
   tokenHost?: string;
   tokenPath?: string;
@@ -49,11 +58,13 @@ export type OAuthSeed = {
 export type OAuthProviderPolicy = {
   kind: OAuthProviderKind;
   metadataEndpoints: OAuthTokenEndpoint[];
+  protocolReadEndpoints: OAuthTokenEndpoint[];
   providerId: string;
   registrationEndpoints: OAuthTokenEndpoint[];
   resourceHost: string;
   resourcePathPrefix: string;
   seeds: OAuthSeed[];
+  stateEpoch?: string;
   tokenEndpoints: OAuthTokenEndpoint[];
 };
 
@@ -73,6 +84,7 @@ export class OAuthMediationPolicyValidationError extends Error {
 }
 
 const HANDLE_RE = /^runfree_oauth_(?:access|refresh|secret)_[A-Za-z0-9_-]{32,}$/;
+export const OAUTH_STATE_EPOCH_RE = /^[A-Za-z0-9_-]{16,128}$/;
 
 
 function parseUrl(value: string): URL | undefined {
@@ -133,8 +145,12 @@ function normalizeEndpointEntry(issues: string[], prefix: string, value: unknown
   return endpointFromUrl(issues, prefix, value);
 }
 
+function endpointKey(endpoint: OAuthTokenEndpoint): string {
+  return `${endpoint.host}\0${endpoint.path}`;
+}
+
 function dedupeEndpoints(endpoints: OAuthTokenEndpoint[]): OAuthTokenEndpoint[] {
-  return Array.from(new Map(endpoints.map((endpoint) => [`${endpoint.host}\0${endpoint.path}`, endpoint])).values());
+  return Array.from(new Map(endpoints.map((endpoint) => [endpointKey(endpoint), endpoint])).values());
 }
 
 function normalizeEndpointArray(
@@ -260,21 +276,81 @@ function normalizeProvider(
   const oauth = isRecord(value.oauth) ? value.oauth : undefined;
   const authMetadata = oauth?.authServerMetadataUrl === undefined ? undefined : endpointFromUrl(issues, `${prefix}.oauth.authServerMetadataUrl`, oauth.authServerMetadataUrl);
   if (authMetadata) metadataEndpoints.push(authMetadata);
+  // The host re-emits a loaded policy with its metadata endpoints as a list
+  // (oauthProviderPolicyJson); read them back so they survive publication.
+  metadataEndpoints.push(...normalizeEndpointArray(issues, `${prefix}.metadataEndpoints`, value.metadataEndpoints));
   const oauthRegistration = oauth?.registrationEndpoint ?? oauth?.registration_endpoint;
   const oauthRegistrationEndpoint = oauthRegistration === undefined ? undefined : endpointFromUrl(issues, `${prefix}.oauth.registrationEndpoint`, oauthRegistration);
   if (oauthRegistrationEndpoint) registrationEndpoints.push(oauthRegistrationEndpoint);
 
   const seeds = normalizeSeeds(issues, prefix, kind, value.seeds);
 
+  let stateEpoch: string | undefined;
+  if (value.stateEpoch !== undefined) {
+    if (kind !== "mcp") {
+      issues.push(`${prefix}.stateEpoch is only supported for mcp providers`);
+    } else if (typeof value.stateEpoch !== "string" || !OAUTH_STATE_EPOCH_RE.test(value.stateEpoch)) {
+      issues.push(`${prefix}.stateEpoch must match ${OAUTH_STATE_EPOCH_RE.source}`);
+    } else {
+      stateEpoch = value.stateEpoch;
+    }
+  }
+
+  // A protocol-read endpoint must be one of this provider's static mediated
+  // token or registration endpoints, exactly: the proxy classifies a POST to
+  // it as a read only while it mediates it, and never by prefix.
+  const protocolReadEndpoints: OAuthTokenEndpoint[] = [];
+  if (value.protocolReadEndpoints !== undefined) {
+    if (kind !== "mcp") {
+      issues.push(`${prefix}.protocolReadEndpoints are only supported for mcp providers`);
+    } else {
+      const mediated = new Set([...tokenEndpoints, ...registrationEndpoints].map(endpointKey));
+      const declared = normalizeEndpointArray(issues, `${prefix}.protocolReadEndpoints`, value.protocolReadEndpoints);
+      for (const [index, endpoint] of declared.entries()) {
+        if (endpoint.path === "/") {
+          issues.push(`${prefix}.protocolReadEndpoints[${index}] must not be the root path`);
+        } else if (!mediated.has(endpointKey(endpoint))) {
+          issues.push(`${prefix}.protocolReadEndpoints[${index}] must be a static token or registration endpoint of the same provider`);
+        } else {
+          protocolReadEndpoints.push(endpoint);
+        }
+      }
+    }
+  }
+
   return {
     kind,
     metadataEndpoints: dedupeEndpoints(metadataEndpoints),
+    protocolReadEndpoints: dedupeEndpoints(protocolReadEndpoints),
     providerId,
     registrationEndpoints: dedupeEndpoints(registrationEndpoints),
     resourceHost,
     resourcePathPrefix,
     seeds,
+    ...(stateEpoch !== undefined ? { stateEpoch } : {}),
     tokenEndpoints: dedupeEndpoints(tokenEndpoints),
+  };
+}
+
+/**
+ * The one JSON form of a validated provider, used wherever the host re-emits
+ * a loaded policy (the effective generation input and payload). The new
+ * optional fields appear only when set, so a provider without them serializes
+ * exactly as it did before they existed.
+ */
+export function oauthProviderPolicyJson(provider: OAuthProviderPolicy): OAuthProviderPolicyJson {
+  return {
+    kind: provider.kind,
+    resourceHost: provider.resourceHost,
+    resourcePathPrefix: provider.resourcePathPrefix,
+    tokenEndpoints: provider.tokenEndpoints.map(({ host, path }) => ({ host, path })),
+    registrationEndpoints: provider.registrationEndpoints.map(({ host, path }) => ({ host, path })),
+    metadataEndpoints: provider.metadataEndpoints.map(({ host, path }) => ({ host, path })),
+    seeds: provider.seeds.map((seed) => ({ ...seed })),
+    ...(provider.protocolReadEndpoints.length > 0
+      ? { protocolReadEndpoints: provider.protocolReadEndpoints.map(({ host, path }) => ({ host, path })) }
+      : {}),
+    ...(provider.stateEpoch !== undefined ? { stateEpoch: provider.stateEpoch } : {}),
   };
 }
 
