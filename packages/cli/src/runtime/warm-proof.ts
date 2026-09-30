@@ -127,6 +127,9 @@ export type WarmValidation = Readonly<{
   /** The marker proof, re-judged from this launch's bytes. */
   runtimeProof: RuntimeValidationProof;
   proxyStartedAt: string;
+  proxyPid: number;
+  /** The Docker VM boot id the proxy reported. */
+  bootId: string;
 }>;
 
 /**
@@ -444,7 +447,12 @@ function judgeWarmObservation(input: WarmProofInput, observation: WarmObservatio
     markerSha256: sha256(marker.body),
     nftShapeSha256: nftShape,
   });
-  const validation = Object.freeze({ runtimeProof: markerProof.proof, proxyStartedAt: startedAt });
+  const validation = Object.freeze({
+    runtimeProof: markerProof.proof,
+    proxyStartedAt: startedAt,
+    proxyPid: pid,
+    bootId: bootId.body.trim(),
+  });
   sealedValidations.add(validation);
   return Object.freeze({ kind: "valid", facts, validation });
 }

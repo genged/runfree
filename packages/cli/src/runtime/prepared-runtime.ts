@@ -70,7 +70,12 @@ export type LaunchHandoff = Readonly<{
   /** The exact lock object startup acquired, never released or replaced since. */
   lifecycleLock: ProjectLifecycleLock;
   lockOwnerToken: string;
-  proxy: Readonly<{ id: string; startedAt: string }>;
+  /**
+   * The proxy incarnation startup proved. `pid` and `bootId` are present when
+   * a warm proof observed them; later work (sub-second launch plan Phase E)
+   * re-compares them.
+   */
+  proxy: Readonly<{ id: string; startedAt: string; pid?: number; bootId?: string }>;
   /** sha256 of the lifecycle registry as startup left it. */
   registryDigest: string;
   /** Startup's reconcile under this lock saw only settled state. */

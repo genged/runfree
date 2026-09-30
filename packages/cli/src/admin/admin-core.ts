@@ -1133,6 +1133,15 @@ function childEnvForCommand(command: string): NodeJS.ProcessEnv {
 }
 
 const adminLifecycleDeadline = new AsyncLocalStorage<number>();
+// A per-call bound for a sync that runs while the project lifecycle lock is
+// held (the receipt-gated warm-launch sync): each child process gets at most
+// this long, and a timed-out call is a failed observation, never a success.
+const adminCallTimeoutMs = new AsyncLocalStorage<number>();
+
+/** Runs `action` with every admin child process bounded to `timeoutMs`. */
+export function withAdminCallTimeout<T>(timeoutMs: number, action: () => T): T {
+  return adminCallTimeoutMs.run(timeoutMs, action);
+}
 
 function adminSpawnSync(
   command: string,
@@ -1142,7 +1151,11 @@ function adminSpawnSync(
   const deadline = adminLifecycleDeadline.getStore();
   const remaining = deadline === undefined ? undefined : deadline - performance.now();
   if (remaining !== undefined && remaining <= 0) throw new Error("proxy reload lifecycle budget ended; sessions were preserved; retry runtime reload-policy --force");
-  const bounded = remaining === undefined ? options : { ...options, timeout: Math.max(1, Math.floor(Math.min(options.timeout || remaining, remaining))) };
+  const deadlineBounded = remaining === undefined ? options : { ...options, timeout: Math.max(1, Math.floor(Math.min(options.timeout || remaining, remaining))) };
+  const callLimit = adminCallTimeoutMs.getStore();
+  const bounded = callLimit === undefined
+    ? deadlineBounded
+    : { ...deadlineBounded, timeout: Math.max(1, Math.min(deadlineBounded.timeout || callLimit, callLimit)) };
   const result = currentAdminState().processRunner?.(command, args, bounded)
     ?? childProcess.spawnSync(command, args, bounded) as childProcess.SpawnSyncReturns<string>;
   if (deadline !== undefined && performance.now() >= deadline) throw new Error("proxy reload lifecycle budget ended; sessions were preserved; retry runtime reload-policy --force");

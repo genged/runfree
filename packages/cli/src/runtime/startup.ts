@@ -1668,7 +1668,11 @@ export async function startRuntime(
               return {
                 lifecycleLock: handoffLock,
                 lockOwnerToken: handoffLock.ownerToken,
-                proxy: { id: runtimeProof.proxyId, startedAt: proxyStartedAt as string },
+                proxy: {
+                  id: runtimeProof.proxyId,
+                  startedAt: proxyStartedAt as string,
+                  ...(warm ? { pid: warm.proxyPid, bootId: warm.bootId } : {}),
+                },
                 registryDigest: sessionRegistryDigest(activePlan.paths.stateDir, { projectId: activePlan.projectId, composeProject: project }),
                 inventoryClean: (reconciled as SessionReconcileResult).inventoryClean,
                 reservedSourceIps: [...(reconciled as SessionReconcileResult).reservedSourceIps],
