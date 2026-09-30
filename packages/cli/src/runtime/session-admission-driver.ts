@@ -2108,7 +2108,9 @@ export function createInternalSessionAdmissionDriver(
     preparedRuntime: input.preparedRuntime,
     lifecycleLock,
     io: input.io,
-    ...(input.handoff ? { handoff: input.handoff } : {}),
+    // Only a clean handoff settles admission (`#settledByHandoff`); an
+    // unclean one runs the full preflight, so it re-reads the marker too.
+    ...(input.handoff?.inventoryClean ? { handoff: input.handoff } : {}),
   });
   const resolvedInput = Object.freeze({
     ...input,

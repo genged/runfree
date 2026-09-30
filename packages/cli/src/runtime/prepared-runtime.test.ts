@@ -380,6 +380,15 @@ test("a launch handoff is taken exactly once and a disposed untaken handoff rele
   expect(takeLaunchHandoff(untaken)).toBeUndefined();
 });
 
+test("disposing a handoff whose release fails does not throw over the caller's own error", () => {
+  const prepared = fixture();
+  const runtime = mintPreparedRuntime({ plan: prepared.activePlan, validationProof: prepared.proof });
+  const failing = { ...countingLock(), release: () => { throw new Error("lock directory vanished"); } };
+  attachLaunchHandoff(runtime, handoffFor(prepared, failing));
+  expect(() => disposeLaunchHandoff(runtime)).not.toThrow();
+  expect(takeLaunchHandoff(runtime)).toBeUndefined();
+});
+
 test("a handoff whose lock owner changed is refused at attach", () => {
   const prepared = fixture();
   const authority = mintPreparedRuntime({ plan: prepared.activePlan, validationProof: prepared.proof });

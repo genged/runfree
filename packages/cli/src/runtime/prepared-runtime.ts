@@ -19,6 +19,7 @@ import { runtimeValidationMarkerStatus, type RuntimeValidationProof } from "./st
 import type { ProjectLifecycleLock } from "./sessions.ts";
 import type { RuntimeContext, RuntimeIO } from "./types.ts";
 import { stableJson } from "../strict-primitives.ts";
+import { warn } from "../warnings.ts";
 
 declare const preparedRuntimeBrand: unique symbol;
 
@@ -129,7 +130,13 @@ export function disposeLaunchHandoff(prepared: PreparedRuntime | undefined): voi
   if (!prepared) return;
   const handoff = takeLaunchHandoff(prepared);
   if (!handoff) return;
-  handoff.lifecycleLock.release();
+  // Callers dispose in `finally`: a failed release is reported, never allowed
+  // to replace the error the launch is already propagating.
+  try {
+    handoff.lifecycleLock.release();
+  } catch (error) {
+    warn(`could not release the handed-off lifecycle lock: ${error instanceof Error ? error.message : String(error)}`);
+  }
 }
 
 

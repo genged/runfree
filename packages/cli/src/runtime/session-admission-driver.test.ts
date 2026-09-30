@@ -2687,6 +2687,19 @@ describe("session admission under the per-session file source", () => {
       expect(mocks.inventory).toHaveBeenCalled();
     });
 
+    test("only a clean handoff skips the prepared runtime's marker re-read", () => {
+      for (const inventoryClean of [true, false]) {
+        mocks.consumePreparedRuntime.mockClear();
+        const input = fixture();
+        const handoff = handoffFor(input, { inventoryClean });
+        createInternalSessionAdmissionDriver({ ...input, handoff });
+        const consumed = mocks.consumePreparedRuntime.mock.calls[0]?.[0] as { handoff?: LaunchHandoff };
+        // An unclean handoff runs the full preflight, and with it the full
+        // consumption: the in-proxy marker is proved again under this lock.
+        expect(consumed.handoff).toBe(inventoryClean ? handoff : undefined);
+      }
+    });
+
     test("the handoff's IP assignment listing replaces the separate read as the fence's CAS precondition", async () => {
       for (const [digests, expected] of [
         [{ "172.31.90.20": "d".repeat(64) }, "d".repeat(64)],
