@@ -39,6 +39,8 @@ import type { ProjectLifecycleLock } from "./sessions.ts";
 import type { CaptureResult } from "./types.ts";
 
 const CONTAINER_ID = "c".repeat(64);
+const FORWARDER_ID = "a".repeat(64);
+const INGRESS_IMAGE_ID = `sha256:${"b".repeat(64)}`;
 const OTHER_PROXY_ID = "f".repeat(64);
 const SELECTION = effectiveControlPlaneFixture({ target: sessionGenerationFixture().target });
 const PROXY_ID = SELECTION.proxyContainerId;
@@ -123,6 +125,12 @@ type Scenario = {
   removeFails?: boolean;
   bound?: boolean;
   stamped?: boolean;
+  /**
+   * The session's MCP OAuth callback forwarder after the daemon death: none,
+   * left running, left stopped, or one whose inventory or removal Docker
+   * cannot complete. Default none.
+   */
+  callback?: "none" | "running" | "stopped" | "list-fails" | "remove-fails";
 };
 
 type Harness = {
@@ -187,9 +195,48 @@ function build(scenario: Scenario): Harness {
       default: return DAEMON_DOWN;
     }
   };
+  const callback = scenario.callback ?? "none";
+  let forwarderPresent = callback !== "none";
+  const forwarder = () => ({
+    Id: FORWARDER_ID,
+    Image: INGRESS_IMAGE_ID,
+    Name: "/runfree-ingress-mcp-callback-x-47200",
+    State: { Running: callback !== "stopped", Status: callback === "stopped" ? "exited" : "running" },
+    Config: {
+      Env: [
+        "INGRESS_HOST_PORT=47200",
+        `INGRESS_TARGET=${record.sourceIp}`,
+        "INGRESS_TARGET_PORT=47200",
+        `RUNFREE_CALLBACK_SESSION_ID=${record.sessionId}`,
+        `RUNFREE_CALLBACK_SESSION_CONTAINER=${CONTAINER_ID}`,
+      ],
+      Labels: {
+        "io.runfree.project-id": SESSION_TEST_PROJECT.projectId,
+        "io.runfree.container-role": "ingress-forwarder",
+        "io.runfree.ingress-purpose": "mcp-callback",
+      },
+    },
+  });
   const io = {
     capture(command: string, args: string[]): CaptureResult {
       expect(command).toBe("docker");
+      if (args[0] === "ps" && args.includes("label=io.runfree.ingress-purpose=mcp-callback")) {
+        expect(args).toContain("-a");
+        events.push("list-callback-forwarders");
+        if (callback === "list-fails") return DAEMON_DOWN;
+        return { ...OK, stdout: forwarderPresent ? `${FORWARDER_ID}\n` : "" };
+      }
+      if (args[0] === "container" && args[1] === "inspect" && args[2] === FORWARDER_ID) {
+        events.push("inspect-callback-forwarder");
+        return forwarderPresent ? { ...OK, stdout: JSON.stringify([forwarder()]) } : noSuch(FORWARDER_ID);
+      }
+      if (args[0] === "image" && args[1] === "inspect") return { ...OK, stdout: `${INGRESS_IMAGE_ID}\n` };
+      if (args[0] === "rm" && args.at(-1) === FORWARDER_ID) {
+        events.push("remove-callback-forwarder");
+        if (callback === "remove-fails") return DAEMON_DOWN;
+        forwarderPresent = false;
+        return OK;
+      }
       if (args[0] === "container" && args[1] === "inspect" && args[2] === reference) {
         events.push("inspect-session");
         return answerContainer();
@@ -306,6 +353,8 @@ describe("the daemon-death residue is reclaimed on Docker's proof", () => {
       "inventory-proxy", "inspect-proxy", "list-running-proxies",
       // Step 1 re-proves the proxy at the step itself.
       "inventory-proxy", "inspect-proxy", "list-running-proxies",
+      // The session's callback route is proved absent before its container.
+      "list-callback-forwarders",
       "disconnect", "stop", "remove",
       // Step 4: absence, proved while the record still exists.
       "inspect-session",
@@ -333,12 +382,67 @@ describe("the daemon-death residue is reclaimed on Docker's proof", () => {
     expect(harness.events).not.toContain("remove");
   });
 
+  test.each(["running", "stopped"] as const)(
+    "a %s callback forwarder left by the daemon death is removed before the record releases its address",
+    (callback) => {
+      const harness = build({ owner: "dead", container: ["exited", "absent"], proxy: "exited", callback });
+      let recordsWhenForwarderRemoved: number | undefined;
+      const capture = harness.input.io.capture.bind(harness.input.io);
+      const input: PendingSessionAdmissionReclaimInput = {
+        ...harness.input,
+        io: {
+          capture(command, args, options) {
+            if (args[0] === "rm" && args.at(-1) === FORWARDER_ID) recordsWhenForwarderRemoved = harness.records().length;
+            return capture(command, args, options);
+          },
+        },
+      };
+
+      expect(reclaimPendingSessionAdmissions(input).kind).toBe("reclaimed");
+
+      const effects = dockerEffects(harness.events);
+      expect(effects).toContain("remove-callback-forwarder");
+      expect(effects.indexOf("remove-callback-forwarder")).toBeLessThan(effects.indexOf("remove"));
+      expect(recordsWhenForwarderRemoved).toBe(1);
+      expect(harness.records()).toEqual([]);
+    },
+  );
+
+  test("a stale allocation's legacy callback route to its address is removed too", () => {
+    const harness = build({
+      owner: "dead", container: ["absent"], proxy: "absent", bound: false, stamped: false, callback: "running",
+    });
+
+    expect(reclaimPendingSessionAdmissions(harness.input).kind).toBe("reclaimed");
+    expect(harness.events).toContain("remove-callback-forwarder");
+    expect(harness.records()).toEqual([]);
+  });
+
   test("nothing pending is nothing to do, and touches no Docker state", () => {
     const harness = build({ owner: "dead", container: ["absent"], proxy: "exited", stamped: false });
 
     expect(reclaimPendingSessionAdmissions(harness.input)).toEqual({ kind: "none" });
     expect(dockerEffects(harness.events)).toEqual([]);
     expect(harness.records()).toHaveLength(1);
+  });
+});
+
+describe("a callback route Docker cannot prove gone keeps the record", () => {
+  test.each(["list-fails", "remove-fails"] as const)("refuses when the forwarder %s, and a later pass reclaims it", (callback) => {
+    const refused = build({ owner: "dead", container: ["exited"], proxy: "exited", callback });
+
+    const result = reclaimPendingSessionAdmissions(refused.input);
+
+    expect(result.kind).toBe("refused");
+    expect(refused.records()).toHaveLength(1);
+    expect(refused.events).not.toContain("remove");
+    fs.rmSync(stateDir, { recursive: true, force: true });
+    stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "runfree-pending-reclaim-"));
+
+    // Reclamation: once Docker answers, the same pass finishes.
+    const recovered = build({ owner: "dead", container: ["exited", "absent"], proxy: "exited", callback: "running" });
+    expect(reclaimPendingSessionAdmissions(recovered.input).kind).toBe("reclaimed");
+    expect(recovered.records()).toEqual([]);
   });
 });
 

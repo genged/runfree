@@ -66,6 +66,7 @@ import {
   sessionFileDeleteCommand,
   type SessionAdmissionDockerExecutor,
 } from "./session-file-publisher.ts";
+import { removeSessionMcpCallbackIngress } from "./session-callback-ingress.ts";
 import { teardownSessionRecord } from "./session-file-teardown.ts";
 import {
   readSessionHostStatus,
@@ -367,6 +368,23 @@ function stampTerminal(input: PendingSessionAdmissionReclaimInput, record: Sessi
 /**
  * Finishes one pending record's teardown, or throws the refusal that keeps it.
  */
+function removeCallbackIngress(input: PendingSessionAdmissionReclaimInput, record: SessionContainerRecordV2): void {
+  try {
+    removeSessionMcpCallbackIngress({
+      io: input.io,
+      ...(input.dockerOptions === undefined ? {} : { dockerOptions: input.dockerOptions }),
+      projectId: input.expectedProject.projectId,
+      sessionId: record.sessionId,
+      sourceIp: record.sourceIp,
+    });
+  } catch (error) {
+    throw new ReclaimRefusal(
+      `session ${record.sessionId}: its MCP OAuth callback forwarder could not be proved removed`
+        + ` (${describeFailure(error)}); its record is kept so the session's address stays reserved; retry the command`,
+    );
+  }
+}
+
 function reclaimRecord(
   input: PendingSessionAdmissionReclaimInput,
   record: SessionContainerRecordV2,
@@ -447,6 +465,11 @@ function reclaimRecord(
     stampTerminal(input, record);
     input.lifecycleLock.assertHeld();
     removeSessionFile();
+    // No bound forwarder can exist without a container, but an unbound
+    // (pre-session-owned) callback forwarder may still route to this address;
+    // it is proved gone before the record releases the address.
+    input.lifecycleLock.assertHeld();
+    removeCallbackIngress(input, record);
     input.lifecycleLock.assertHeld();
     removeRecord();
     removeSessionHostStatus(input.stateDir, record.sessionId);

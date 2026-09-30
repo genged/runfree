@@ -360,6 +360,10 @@ function publishedAgents(fake: Fake): string[] {
   return eligibility.allowedSessionAgents.map((agent) => agent.selectedAgentImageId).sort();
 }
 
+const CALLBACK_FORWARDER_LISTING = `docker:ps -a --no-trunc --filter label=io.runfree.project-id=${SESSION_TEST_PROJECT.projectId} `
+  + "--filter label=io.runfree.container-role=ingress-forwarder "
+  + "--filter label=io.runfree.ingress-purpose=mcp-callback --format {{.ID}}";
+
 describe("reconcile before allocation", () => {
   beforeEach(() => {
     selectFileBackedControlPlane();
@@ -497,9 +501,7 @@ describe("reconcile before allocation", () => {
       `delete-session-file:${abandoned.sessionPrincipal}.json`,
       // The session's MCP OAuth callback route is proved absent before the
       // record releases its address (none exists here).
-      `docker:ps -a --no-trunc --filter label=io.runfree.project-id=${SESSION_TEST_PROJECT.projectId} `
-        + "--filter label=io.runfree.container-role=ingress-forwarder "
-        + "--filter label=io.runfree.ingress-purpose=mcp-callback --format {{.ID}}",
+      CALLBACK_FORWARDER_LISTING,
       `docker:network disconnect ${NETWORK.networkId} ${"a".repeat(64)}`,
       `docker:container stop --time 10 ${"a".repeat(64)}`,
       `docker:container rm --force ${"a".repeat(64)}`,
@@ -514,6 +516,8 @@ describe("reconcile before allocation", () => {
   test("tears down a dead owner's granted but not yet attached session the same way, file first", async () => {
     // A launcher killed during its entry-handoff wait leaves exactly this: the
     // session file written, the record still provisioning-running.
+    // Its callback forwarder, if eligible, was created before the grant, so
+    // the same route proof runs before its address is released.
     const abandoned = writeRecord({ liveness: "dead", host: 20, containerId: "a".repeat(64), state: "provisioning-running" });
     const fake = fakeDocker({ served: [servedFile(abandoned)] });
 
@@ -522,6 +526,7 @@ describe("reconcile before allocation", () => {
     expect(result.deadOwnersRevoked).toEqual([abandoned.sessionId]);
     expect(fake.effects()).toEqual([
       `delete-session-file:${abandoned.sessionPrincipal}.json`,
+      CALLBACK_FORWARDER_LISTING,
       `docker:network disconnect ${NETWORK.networkId} ${"a".repeat(64)}`,
       `docker:container stop --time 10 ${"a".repeat(64)}`,
       `docker:container rm --force ${"a".repeat(64)}`,
