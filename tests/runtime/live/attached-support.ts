@@ -31,7 +31,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { runfreeStateRoot } from "../../../packages/cli/src/paths.ts";
 import { listSessionContainerRecordsV2 } from "../../../packages/cli/src/runtime/session-containers.ts";
-import { SESSION_ENTRY_PATH } from "../../../packages/cli/src/runtime/session-launch.ts";
+import { parseSessionContainerTopHandoff } from "../../../packages/cli/src/runtime/session-container-docker.ts";
 import {
   sessionAdmissionFirewallSetReadCommand,
   servedSetReadCommand,
@@ -217,31 +217,31 @@ export async function startAttachedLaunch(
 export const AGENT_START_TIMEOUT_MS = 75_000;
 
 /**
- * Waits until the session entry has handed PID 1 to the agent.
+ * Waits until the session entry has handed off to the agent.
  *
- * `attached` is the host's record, and it can land before the entry's
- * readiness probe has seen the session active. Until the probe does, the entry
- * keeps polling and the agent has not started; a case that takes the proxy
- * away in that window leaves the entry polling a proxy that no longer serves
- * it, and after its activation bound it exits 111 — the session dies of the
- * case's own disruption, not of the product behaviour under test. A case
- * about *live* sessions therefore waits for the agent itself.
+ * Since the launch reports `attached` only after the handoff (the driver's
+ * `awaitHandoff`), an attached session has normally handed off already; this
+ * stays as the case's own check, and as the wait for a launch whose handoff
+ * report fell back at its ceiling.
  *
- * Read with `docker top` from the host, never by exec into the container: the
- * entry is gone from the process table exactly when it has exec'd the agent.
+ * Read with the product's own shape — `docker container top -o pid,ppid,args`,
+ * anchored on `State.Pid` and the container's own `Init` — from the host,
+ * never by exec into the container. Docker's init keeps the entry path in its
+ * own argv (`docker-init -- <entry> ...`) for the whole session, so a bare
+ * "no line names the entry" check would wait forever.
  */
 export async function awaitAgentStarted(containerId: string, label: string): Promise<void> {
   const deadline = Date.now() + AGENT_START_TIMEOUT_MS;
   for (;;) {
-    const top = docker(["top", containerId]);
-    if (top.status === 0) {
-      const processes = top.stdout.trim().split("\n").slice(1);
-      if (processes.length > 0 && !processes.some((line) => line.includes(SESSION_ENTRY_PATH))) return;
-    } else {
-      const state = docker(["inspect", "-f", "{{.State.Status}} exit={{.State.ExitCode}}", containerId]);
-      if (state.status === 0 && !state.stdout.startsWith("running")) {
-        throw new Error(`${label}: the session container stopped before its agent started (${state.stdout.trim()})`);
-      }
+    const state = docker(["inspect", "-f", "{{.State.Pid}} {{.HostConfig.Init}} {{.State.Status}} exit={{.State.ExitCode}}", containerId]);
+    const [pid, init, status] = state.stdout.trim().split(/\s+/u);
+    if (state.status === 0 && status !== "running") {
+      throw new Error(`${label}: the session container stopped before its agent started (${state.stdout.trim()})`);
+    }
+    const top = docker(["container", "top", containerId, "-o", "pid,ppid,args"]);
+    if (state.status === 0 && top.status === 0) {
+      const handoff = parseSessionContainerTopHandoff(top.stdout, { anchorPid: Number(pid), init: init === "true" });
+      if (handoff === "handed-off") return;
     }
     if (Date.now() >= deadline) {
       throw new Error(`${label}: the session entry never handed over to the agent: ${describeOutput(top.output)}`);
