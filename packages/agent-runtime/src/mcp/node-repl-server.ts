@@ -28,7 +28,8 @@ const JS_TOOL: Tool = {
     "Run JavaScript in a persistent Node.js kernel inside the Runfree agent container.",
     "State persists across calls: top-level declarations and globalThis properties stay defined until js_reset or a timeout.",
     "Return output with nodeRepl.write(value); console output and the value of the last expression are returned too.",
-    "A cell that uses top-level await runs as an async function body: keep state on globalThis and use return for a value.",
+    "A cell that uses top-level await runs as an async function body: its own declarations do not persist and its last expression is not returned, so keep state on globalThis and use return or nodeRepl.write for a value.",
+    "Redeclaring a top-level let, const, or class from an earlier call is a SyntaxError; assign to it or use var instead.",
     "nodeRepl.cwd is the session workspace and nodeRepl.tmpDir is a private scratch directory.",
     "The kernel runs as the agent user with the agent's files and network policy; host applications are not reachable.",
   ].join(" "),
@@ -167,14 +168,29 @@ export class NodeReplKernelHost {
       return Promise.resolve(textResult("js is busy: one call is running and one is waiting; retry later or call js_reset", true));
     }
     this.inFlight += 1;
+    let released = false;
+    const release = () => {
+      if (released) return;
+      released = true;
+      this.inFlight -= 1;
+    };
+    let started = false;
     const next = this.queue.then(() => {
+      started = true;
       if (signal?.aborted) return textResult("js call was cancelled before it started", true);
       return this.runNow(code, timeoutMs, signal);
     });
     this.queue = next.catch(() => undefined);
-    return next.finally(() => {
-      this.inFlight -= 1;
+    // A call cancelled while it waits frees its slot at once; it still reaches
+    // the queue head later and returns without running.
+    const cancelledWhileWaiting = new Promise<CallToolResult>((resolve) => {
+      signal?.addEventListener("abort", () => {
+        if (started) return;
+        release();
+        resolve(textResult("js call was cancelled before it started", true));
+      }, { once: true });
     });
+    return Promise.race([next, cancelledWhileWaiting]).finally(release);
   }
 
   /** Kills the kernel now, including a running cell, and discards its state. */
@@ -199,16 +215,20 @@ export class NodeReplKernelHost {
       // stdin is never the server's stdin, which carries MCP requests.
       stdio: ["ignore", "pipe", "pipe", "ipc"],
       serialization: "json",
-      // Own process group, so a reset or timeout also kills processes the
-      // cell started.
+      // Own process group, so a reset or timeout also kills the processes the
+      // cell started in that group (a cell that starts its own session or
+      // group with setsid or `detached` escapes it).
       detached: true,
     });
     this.child = child;
     // Output a cell's subprocesses write straight to the kernel's stdout or
     // stderr is attributed to the running cell; anything else is dropped.
-    const onRaw = (chunk: Buffer) => {
-      if (this.pending?.child === child) this.pending.output.append(chunk.toString("utf8"));
+    const onRaw = (chunk: string) => {
+      if (this.pending?.child === child) this.pending.output.append(chunk);
     };
+    // Decode as streams so a character split across chunks stays whole.
+    child.stdout?.setEncoding("utf8");
+    child.stderr?.setEncoding("utf8");
     child.stdout?.on("data", onRaw);
     child.stderr?.on("data", onRaw);
     child.on("message", (message: unknown) => {
@@ -234,6 +254,7 @@ export class NodeReplKernelHost {
       this.finish(pending, textResult(pending.output.text(), true));
     });
     child.on("error", (error) => {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
       const pending = this.pending;
       if (pending && pending.child === child) {
         this.child = undefined;

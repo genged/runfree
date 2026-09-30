@@ -12,8 +12,8 @@
     }
   ],
   "files": {
-    "runfree-mcp.mjs": "sha256:4d9318b4560ce44ba156e61f959382852b8fec66933ae22bc0eaa706d66ee371",
-    "node-repl-kernel.mjs": "sha256:19232b8e4ee29b98e255bc44291ee1b6f95ac20de6c289aa45e8f8a29ec055bf",
+    "runfree-mcp.mjs": "sha256:cab357893192f33ea18acb2c76b86f1b9f64ea2de719f8f480bcfd4f74f22e65",
+    "node-repl-kernel.mjs": "sha256:20c92d4d75d1e57a86a4a9b77f7258536472bd4161608ffee3d8f896bc14ba0d",
     "self-check.mjs": "sha256:580223ee517b7c303b2dadb8cafd0c785fa1a3a97cc3515fcac58244d6835925"
   },
   "packages": [
@@ -69,8 +69,8 @@
   "sources": {
     "capabilities.ts": "sha256:89394b36c98b9fe0ccd1c9f781d011ad291b9a5766642080bfc7d044c14527e9",
     "kernel-protocol.ts": "sha256:51dbbf266419597911d8698a130b292d3bdf9a0faa3534bbdaab5aee63dddd0a",
-    "node-repl-kernel.ts": "sha256:9bb90486b4d8d0ec91726881f7e1c789eaac9d50f1cc388166ca5b5e8545caed",
-    "node-repl-server.ts": "sha256:cbbca1b4c0dff1b461b8a272c9cb4beedf7eaecc69c7c20fed185f0528897150",
+    "node-repl-kernel.ts": "sha256:c6a4d0379a0e2cba154bba0f1f3900438e2c484738700101801cf0ba66ca5656",
+    "node-repl-server.ts": "sha256:55a6df4ef52827dbb8ade8ddba2a3a1966da45336c7361169f0b5c83a41b77c4",
     "runfree-mcp.ts": "sha256:ef90aa09b314cb2bf56f8b7e18f27bbb984a6bb2d43432a87093c5e1e3c4c49c",
     "self-check.ts": "sha256:4215b6a48b94ae7407ec28c1a5e19453f8feb93e03fa65952eb3eba7f5e05aed"
   }

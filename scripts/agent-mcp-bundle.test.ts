@@ -146,11 +146,20 @@ class McpClient {
   }
 
   request(method: string, params: Record<string, unknown>): Promise<Record<string, unknown>> {
+    return this.requestWithId(method, params).response;
+  }
+
+  requestWithId(method: string, params: Record<string, unknown>): { id: number; response: Promise<Record<string, unknown>> } {
     const id = this.nextId++;
-    return new Promise((resolve) => {
+    const response = new Promise<Record<string, unknown>>((resolve) => {
       this.waiting.set(id, resolve);
       this.child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`);
     });
+    return { id, response };
+  }
+
+  notify(method: string, params: Record<string, unknown>): void {
+    this.child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method, params })}\n`);
   }
 
   async initialize(): Promise<Record<string, unknown>> {
@@ -273,6 +282,33 @@ describe("shipped node-repl server", () => {
     expect(processAlive(pid)).toBe(true);
     const timedOut = await client.js("while (true) {}", { timeout_ms: 300 });
     expect(timedOut).toEqual({ content: [{ type: "text", text: NODE_REPL_MESSAGES.timeout }], isError: true });
+    expect(await waitUntil(() => !processAlive(pid))).toBe(true);
+    expect(text(await client.js("typeof kept"))).toBe("undefined");
+  }, 30_000);
+
+  test("a third concurrent call is refused as busy and js_reset preempts a running call", async () => {
+    const { client } = start();
+    await client.initialize();
+    await client.js("globalThis.kept = 1");
+    const running = client.js("while (true) {}", { timeout_ms: 20_000 });
+    const waiting = client.js("typeof kept");
+    const refused = await client.js("1");
+    expect(refused.isError).toBe(true);
+    expect(text(refused)).toContain("js is busy");
+    expect(text(await client.call("js_reset"))).toBe(NODE_REPL_MESSAGES.reset);
+    expect(await running).toEqual({ content: [{ type: "text", text: NODE_REPL_MESSAGES.reset }], isError: true });
+    // The waiting call runs in a fresh kernel, without the old state.
+    expect(text(await waiting)).toBe("undefined");
+  }, 30_000);
+
+  test("an MCP cancellation kills the running cell's kernel", async () => {
+    const { client } = start();
+    await client.initialize();
+    await client.js("globalThis.kept = 1");
+    const pid = Number(text(await client.js("globalThis.sleeper = require('node:child_process').spawn('sleep', ['300']); String(sleeper.pid)")));
+    const { id } = client.requestWithId("tools/call", { name: "js", arguments: { code: "while (true) {}", timeout_ms: 20_000 } });
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    client.notify("notifications/cancelled", { requestId: id, reason: "test" });
     expect(await waitUntil(() => !processAlive(pid))).toBe(true);
     expect(text(await client.js("typeof kept"))).toBe("undefined");
   }, 30_000);

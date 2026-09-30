@@ -1234,7 +1234,13 @@ env = { CODEX_HOME = "...", ... }              (host command, args, env, cwd dis
   the session working directory, with the agent's mounts and network policy.
   Limits: 256 KiB of code, 1 MiB of output per call, a 30 s default and 600 s
   maximum time limit. A timeout or `js_reset` kills the kernel's process
-  group and discards its state. Browser Use and Computer Use bootstraps that
+  group and discards its state (a process the cell moves to its own session
+  or group escapes that kill). The semantics are a compatible subset of Codex
+  Desktop's `node_repl`: a cell that uses top-level `await` runs as an async
+  function body, so its declarations do not persist and its last expression is
+  not returned (use `globalThis`, `return`, or `nodeRepl.write`); redeclaring a
+  top-level `let` or `const` from an earlier call is a `SyntaxError`; there is
+  no `js_add_node_module_dir`. Browser Use and Computer Use bootstraps that
   import host plugin scripts do not work, because those scripts are not in the
   container.
 - The server is built from `packages/agent-runtime/src/mcp/` with

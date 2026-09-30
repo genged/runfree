@@ -159,5 +159,29 @@ process.on("message", (message: unknown) => {
   queue = queue.then(() => runCell(message.id, message.code));
 });
 
-// The server going away ends the kernel.
-process.on("disconnect", () => process.exit(0));
+// Whether this process leads its own process group (the server spawns it
+// detached). Read from /proc so a kernel started some other way never signals
+// a group it does not own.
+function leadsOwnProcessGroup(): boolean {
+  try {
+    const stat = fs.readFileSync("/proc/self/stat", "utf8");
+    const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+    return Number(fields[2]) === process.pid;
+  } catch {
+    return false;
+  }
+}
+
+// The server going away ends the kernel, its scratch directory, and the
+// processes in its process group.
+process.on("disconnect", () => {
+  fs.rmSync(tmpDir, { recursive: true, force: true });
+  if (leadsOwnProcessGroup()) {
+    try {
+      process.kill(0, "SIGKILL");
+    } catch {
+      // Fall through to a plain exit.
+    }
+  }
+  process.exit(0);
+});

@@ -678,7 +678,7 @@ describe("admin MCP runtime preparation", () => {
     expect(explain.stdout).toContain("image check: not run against the selected agent image");
     expect(explain.stdout).toContain("not covered by proxy MCP operation policy or write approval");
     expect(explain.stdout).not.toContain("NODE_REPL_NODE_PATH");
-    expect(explain.stdout).not.toContain("/Applications/Codex.app/Contents/Resources/node\"");
+    expect(explain.stdout).not.toContain("Codex.app");
 
     // STDIO tool calls never pass the proxy, so MCP rules are refused before any write.
     const rules = await runAdmin(() => mcpRulesIntent({ agent: parseMcpAgent("codex"), server: "node_repl", source: parseMcpSource("user"), write: "allow" }));
