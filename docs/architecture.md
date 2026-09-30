@@ -426,11 +426,12 @@ directory, and the driver's ladder is:
    capability drops, mounts, `--restart no`, and a static address, then starts it
    attached — which is where Docker assigns the address and refuses a
    duplicate. A crash anywhere here leaves one inert record-and-container pair
-   the next reconcile reclaims exactly. The container's first process is the
-   base image's session entry
-   (`/usr/local/libexec/runfree/session-entry`), with the agent launch as its
-   argv; it polls the request proxy with the exact readiness request and does
-   not exec the agent until the proxy answers `200 active`.
+   the next reconcile reclaims exactly. The container runs under Docker's init
+   (`--init`, recorded in the session's template), and the init's child — the
+   container's first project-controlled process — is the base image's session
+   entry (`/usr/local/libexec/runfree/session-entry`), with the agent launch
+   as its argv; it polls the request proxy with the exact readiness request
+   and does not exec the agent until the proxy answers `200 active`.
 4. **Prove running** takes one post-start inspection, held byte-exact to the
    create plan — image, entrypoint and argv, user, capability drops,
    no-new-privileges, restart policy, every mount and its flags, environment,
@@ -438,14 +439,25 @@ directory, and the driver's ladder is:
    allocated address. It is the whole admission's only shape proof, and the
    session file's renewal anchor (process id, start time, network endpoint) is
    a projection of it.
-5. **Activate** writes the session file and advances the record to `attached`.
-   This is the first step that widens what the container may do; within one
-   consumer loop the firewall admits the address, the readiness probe gets
-   `200 active`, and the agent execs. A failure after the write deletes the
-   file again rather than leaving authority behind.
-6. **Await completion** releases the lifecycle lock and runs the heartbeat for
+5. **Activate** writes the session file. This is the first step that widens
+   what the container may do; within one consumer loop the firewall admits
+   the address, the readiness probe gets `200 active`, and the agent execs.
+   A failure after the write deletes the file again rather than leaving
+   authority behind.
+6. **Await handoff** keeps the lifecycle lock while it polls a daemon-side
+   `docker container top` (never an exec), anchored on the container's
+   `State.Pid`, until the entry has exec'd the agent. Only then is the record
+   advanced to `attached`, the status stamped, and the lock released, so no
+   proxy replacement can land between the grant and the exec and leave a
+   still-gated entry polling a proxy that no longer serves it. The wait also
+   ends when the foreground stream ends (the next step classifies that), when
+   the listing is unreadable, or at a fixed 10 s ceiling, well inside the
+   one-minute window other commands wait for the lock. The process table is
+   container-controlled, so it only decides when the launch reports; it
+   grants nothing.
+7. **Await completion** releases the lifecycle lock and runs the heartbeat for
    the life of the attached process.
-7. **Teardown** stamps the record terminal, deletes the file, disconnects,
+8. **Teardown** stamps the record terminal, deletes the file, disconnects,
    stops, removes the container, and only then removes the record.
 
 The project lifecycle lock covers steps 1–5 and teardown. It is released once
@@ -706,9 +718,10 @@ Keep the cadence at or below one third of the lease.
 
 #### Readiness Entry
 
-The container's first process is the base image's `session-entry`, and the
-agent launch is its argv. The entry sends one exact readiness request to the
-request proxy and execs the agent only on `200` with body `active`:
+The container's first project-controlled process (the child of Docker's init)
+is the base image's `session-entry`, and the agent launch is its argv. The
+entry sends one exact readiness request to the request proxy and execs the
+agent only on `200` with body `active`:
 
 ```text
 before the session file   firewall drops the connection   probe: connect failure
@@ -720,8 +733,11 @@ The readiness answer is local. It forwards nothing, resolves nothing, and
 grants nothing. The wait bound is `RUNFREE_SESSION_ENTRY_TIMEOUT_MS` (60 s),
 rendered by the host. An entry that gives up exits 111. The container stops,
 that code becomes the launch exit status, and normal teardown reclaims the
-file, container, and record. The entry is cooperation, not enforcement. A
-project image may replace it; it then loses only start ordering.
+file, container, and record. The launch reports the session `attached` only
+after the entry has exec'd the agent (see "Await handoff" above). The entry is
+cooperation, not enforcement. A project image may replace it; it then loses
+only start ordering, and a replacement that never execs delays its own
+`attached` report by the 10 s handoff ceiling.
 
 #### IP Reuse Fence
 

@@ -1,6 +1,7 @@
 #!/bin/sh
 #
-# Runfree session entry: the session container's first process.
+# Runfree session entry: the session container's first project-controlled
+# process (under Docker's init in a new session; PID 1 in an older one).
 #
 # Argv is the typed agent launch, `[agentPath, ...agentArgs]`. The entry polls
 # the request proxy with the exact admission readiness request (see
@@ -65,10 +66,16 @@ done
 entry_dir="$(CDPATH= cd -- "$(dirname -- "$entry_path")" && pwd)"
 probe="$entry_dir/session-ready-probe"
 
-# The entry is PID 1 until it execs the agent, so a stop signal must end it
-# promptly. Children run in the background and are awaited: a shell whose
-# `wait` is interruptible runs the trap at once, and one that is not (dash)
-# runs it as soon as the current child returns. Every child is bounded (the
+# A stop signal must end the entry promptly. In a session created since
+# 2026-09-30 the entry is the child of Docker's init (`docker-init`, PID 1),
+# which forwards SIGTERM/SIGINT to it; in an older session container (created
+# without `--init`) the entry itself is PID 1, where the kernel drops any
+# signal it has no handler for. The traps below cover both: without them a
+# PID 1 entry would ignore `docker stop` until the SIGKILL.
+#
+# Children run in the background and are awaited: a shell whose `wait` is
+# interruptible runs the trap at once, and one that is not (dash) runs it as
+# soon as the current child returns. Every child is bounded (the
 # probe by its own 2 s total timeout, the pause by its 250 ms sleep), so a stop
 # lands within one poll cycle either way. The handler ends the child first.
 child=""
@@ -111,4 +118,11 @@ while :; do
   run_interruptible sleep "$RUNFREE_SESSION_ENTRY_POLL_SLEEP"
 done
 
+# The handoff. The host keeps the launch's lifecycle lock, and reports the
+# session `attached`, until it observes (with a daemon-side `docker container
+# top`, never an exec) that no process runs this entry any more. So this exec
+# must stay the entry's last act once the probe has answered active: anything
+# the entry did in between would run while the session is already served but
+# not yet reported attached. Changing the poll above (its sleep, its probe)
+# only changes how soon this line is reached.
 exec "$@"

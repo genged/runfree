@@ -241,6 +241,26 @@ Details: [Write Approval Grants](architecture.md#write-approval-grants).
 3. Agent CLIs run with their own sandbox off (`--dangerously-skip-permissions`,
    `--dangerously-bypass-approvals-and-sandbox`). The container is the
    sandbox, so agent-side permission rules add nothing to it.
+4. **Docker's init is PID 1, not a boundary.** A session container is created
+   with `--init`, so PID 1 is Docker's `docker-init` (tini) and the session
+   entry, then the agent, is its child. The init forwards the stop signal, so
+   `docker stop` ends a live agent at once (exit 143) instead of waiting out
+   the stop timeout for a PID 1 that ignores SIGTERM. It runs as the same
+   uid 1000 with the same capabilities and `no-new-privileges`, so the agent
+   gains nothing by reaching it. Its bind mount is added by the daemon and is
+   outside the inspection proof; a project image can make PID 1 something
+   else, which costs only the fast stop. Project `TINI_*` variables
+   (`TINI_SUBREAPER`, `TINI_KILL_PROCESS_GROUP`, `TINI_VERBOSITY`) are honored:
+   none changes identity, capabilities, mounts, or network, and Docker's
+   SIGKILL after the stop timeout is the real stop bound. The engine must ship
+   Docker's init (`docker-init`); Docker Desktop, OrbStack, and Docker Engine
+   packages do. Without it, the container fails to start, the daemon's error
+   is shown, and nothing is left behind.
+   The init is recorded in each session's stored template: a session started
+   by an older release keeps its template, runs without the init, and is
+   proven that way (across proxy replacements too) until it ends.
+   Downgrading Runfree while sessions from a newer release are live is not
+   supported: run `runfree destroy --force` first.
 
 ### Host Files
 

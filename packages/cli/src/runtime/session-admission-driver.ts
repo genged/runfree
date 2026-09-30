@@ -655,7 +655,8 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
    *
    * The whole point of the confirmation: a `docker start
    * --attach` child can die on its own while the agent it was showing keeps
-   * running as PID 1 of a container this host can still inspect. So nothing is
+   * running (under Docker's init, or as PID 1 of a session created before the
+   * init wrapper) in a container this host can still inspect. So nothing is
    * concluded from the stream ending — one pinned inspection is spent, and only
    * what it proves decides. Never throws: a failed observation is a `wait`, the
    * same way the heartbeat treats one, because "this host could not look" is
