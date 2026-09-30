@@ -351,6 +351,14 @@ filter is repeatable; omit it to include both agents.
 
 Project `.mcp.json` and `.codex/config.toml` entries are imported only after approval. Static headers require a host-owned credential source.
 
+OAuth login works in any session. When an approved MCP server can use OAuth,
+each `runfree claude`, `codex`, `pi`, or `shell` session gets its own loopback
+callback port. In Claude, type `/mcp` and select the server; in Codex or a
+shell, run `codex mcp login <server>`. Then open the URL the client prints.
+Two sessions can log in at the same time. `runfree mcp auth` launches a session
+and prints these steps. A provider that accepts only one pre-registered
+callback port works only while its session holds the project's first port.
+
 ## Dependency Overlays
 
 ```bash
