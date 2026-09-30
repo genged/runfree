@@ -580,14 +580,18 @@ describe("proxy server session admission at the event-driven cadence", () => {
 
   test.each(ADMISSION_PATHS)("a lease that lapses with no file change is refused %s (I2)", async (_label, watchEnv) => {
     // Time passes and no file changes, so no event can ever report this: the
-    // backstop interval is the only path, with or without the watcher.
+    // backstop interval is the only path, with or without the watcher. The
+    // lease is written once the proxy is listening, so a slow start under load
+    // cannot consume it before the served state is observed; after that one
+    // write nothing changes on disk.
     const testState = state();
+    writeSessionFiles(testState, []);
+    const proxy = await startSessionProxy(testState, watchEnv);
     const inspectedAt = new Date();
     writeSessionFiles(testState, [sessionFile(KEY_A, {
       inspectedAt: inspectedAt.toISOString(),
       aliveUntil: new Date(inspectedAt.getTime() + 2_500).toISOString(),
     })]);
-    const proxy = await startSessionProxy(testState, watchEnv);
     await waitUntilServed(proxy.port);
     expectWatcherArmed(proxy, watchEnv);
     await waitUntilServed(proxy.port, false);
