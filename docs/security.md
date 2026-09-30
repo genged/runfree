@@ -229,6 +229,13 @@ Details: [Write Approval Grants](architecture.md#write-approval-grants).
    running in the agent from starting another binary or config.
 3. Static headers need a host-owned credential source.
 4. MCP tool calls follow the write-approval rules (`runfree mcp rules`).
+5. `runfree mcp enable` adds OAuth hosts only after one host-side review.
+   Discovery contacts a project-named host only after the user agrees, on a
+   terminal, and only public, checked addresses over a pinned HTTPS
+   connection. It adds a host only when valid metadata names a token endpoint
+   the proxy mediates for that server. The hosts live in host-owned state, not
+   in desired policy, and stop applying when the reviewed server config
+   changes. `runfree mcp revoke` removes exactly them.
 
 ### Agent Container
 
@@ -292,6 +299,8 @@ Accepted, known risks:
 | Native Claude, Codex, and Pi login state is readable by agent code | Agents need it to log in; it is per project |
 | Credentialless operational services (`agent-claude`, `agent-codex`) are open to any process in the agent | The user confirms them at launch; they carry no proxy credential |
 | Project image builds run before the sandbox exists | The build uses host Docker networking; review Dockerfiles and wide contexts (`runfree image approve-context`) |
+| `mcp enable` discovery tells the named host that you ran it (your IP and the time) | It asks first for project entries and sends no credentials; `--no-discover` makes no call |
+| An `--oauth-host` host is allowed like `host add`, and a request rule path prefix also admits sub-paths the proxy does not mediate (for example `/oauth/token/`) | The user named the host; discovered hosts get exact-endpoint rules, and token requests still follow write approval |
 | Audit mode allows non-listed hosts for a time window | It is explicit (`up --audit-network`) and never edits policy |
 | Audited WSS upgrades pass configured credential headers as-is | The WebSocket passthrough cannot rewrite upgrade headers; enforce mode is not affected |
 | Checkout binding cannot tell apart volumes mounted at the same path | It is a scope key, not an authority; see [Checkout Binding](architecture.md#checkout-binding) |

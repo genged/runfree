@@ -238,7 +238,7 @@ Useful options:
 | `--refresh-every 15m` | `credential set-source`, `credential add` | Re-resolve source on an interval. |
 | `--from-env`, `--from-1password`, `--from-source`, `--from-stdin` | credential source binding | Choose one credential source. |
 
-Credential commands never widen network policy. Use `service enable` or `mcp approve` when you want a reviewed composite workflow that manages hosts and credentials together.
+Credential commands never widen network policy. Use `service enable` or `mcp enable` when you want a reviewed composite workflow that manages hosts and credentials together.
 
 ## Services
 
@@ -337,12 +337,16 @@ runfree mcp configure --agent claude
 runfree mcp configure --agent claude --agent codex
 runfree mcp explain claude my-server
 runfree mcp explain claude my-server --source project --json
+runfree mcp enable claude my-server
+runfree mcp enable claude my-server --no-discover --oauth-host auth.example.com --no-login
+runfree mcp enable claude my-server --from-source op-token
 runfree mcp approve claude my-server --from-source op-token
 runfree mcp approve claude my-server --login
 runfree mcp auth claude my-server
 runfree mcp rules claude my-server
 runfree mcp rules claude my-server --tool create_issue --write ask
 runfree mcp revoke claude my-server
+runfree mcp revoke claude my-server --source user
 ```
 
 Agent IDs are `claude` (Claude Code) and `codex` (Codex CLI). MCP actions keep the
@@ -350,6 +354,57 @@ agent as the first positional argument. The optional `configure --agent <id>`
 filter is repeatable; omit it to include both agents.
 
 Project `.mcp.json` and `.codex/config.toml` entries are imported only after approval. Static headers require a host-owned credential source.
+
+### Enable an MCP server in one step
+
+`runfree mcp enable <agent> <server>` shows one review and asks once. The
+review lists every change:
+
+- the project approval (project entries);
+- the credential source (static-header entries; the same `--from-*` flags as
+  `mcp approve`);
+- the MCP endpoint host;
+- each OAuth host, with where it came from: `discovered` (and the metadata
+  that named it) or `--oauth-host`.
+
+After you accept, Runfree saves the changes, applies them to a running proxy,
+and then runs the OAuth login (`runfree mcp auth`) for OAuth servers. Pass
+`--no-login` to skip the login.
+
+To find the OAuth hosts, Runfree reads the server's OAuth metadata from this
+computer: RFC 9728 protected-resource metadata on the MCP endpoint host, then
+RFC 8414 authorization-server metadata or OpenID configuration from each
+authorization server it names. The requests are plain HTTPS GETs with no
+credentials, no cookies, no proxy, and no redirects. They go only to public
+addresses, with strict time and size limits. For a project entry, Runfree
+first asks before it contacts the host that the project file names.
+
+Discovery adds a host only when valid metadata names a token endpoint that the
+proxy mediates for this server. When nothing else allows it, a host found by
+discovery is limited to `/.well-known` and its exact OAuth endpoints (GET,
+HEAD, OPTIONS, and POST). The
+proxy mediates those endpoints, so the agent sees only `runfree_oauth_*`
+handles. The browser sign-in page opens on your computer and is never
+allowlisted. Token requests follow the project's write approval setting
+(default `ask`).
+
+| Option | Meaning |
+| --- | --- |
+| `--source user\|local\|project` | Choose the entry when more than one matches. User and local entries need no approval; `enable` records only their OAuth hosts. |
+| `--oauth-host <host>` | Also allow this exact host for the server (repeatable). It is allowed as given, like `runfree host add`. |
+| `--no-discover` | Make no network call. Use only `--oauth-host` hosts. |
+| `--no-login` | Do not run the OAuth login after enabling. |
+
+Discovery needs a terminal. Without one, `mcp enable` refuses before any DNS
+lookup unless you pass `--no-discover`; then the command line names every
+change and is itself the approval.
+
+OAuth hosts are not written to `.runfree/network-policy.json`. They are
+host-owned records bound to the reviewed server config: if a project entry
+changes, or a user entry is deleted, its hosts stop applying. `runfree mcp
+revoke <agent> <server>` removes exactly the hosts that `enable` added. A host
+that desired policy, a service, or another enabled MCP server also names stays
+allowed. `runfree mcp explain` lists the recorded hosts and endpoints.
 
 ## Dependency Overlays
 
