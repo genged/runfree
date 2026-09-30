@@ -27,6 +27,7 @@ export const CORE_LIVE_FILES = [
   "tests/runtime/live/allowlist-lifecycle.live.test.ts",
   "tests/runtime/live/live-policy-mutation.live.test.ts",
   "tests/runtime/live/managed-launch.live.test.ts",
+  "tests/runtime/live/mcp-enable.live.test.ts",
   "tests/runtime/live/session-admission-negative.live.test.ts",
   "tests/runtime/live/session-admission-drift.live.test.ts",
 ] as const;
