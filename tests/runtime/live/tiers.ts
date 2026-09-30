@@ -4,7 +4,8 @@
 // Core proves the trust boundary itself (docs/security.md "Core Rules"): the
 // network shape and capability floor, egress containment, request shape and
 // write approval, inert agent policy edits and live revocation, managed-launch
-// host-file safety, and exact per-session admission. Extended proves
+// host-file safety, exact per-session admission, and that the warm launch
+// path never skips what a changed runtime needs. Extended proves
 // availability, recovery, and optional features: crash recovery, rolling
 // upgrades and proxy replacement, renewal under load, the session-entry start
 // ordering, helper cleanup, and audit mode.
@@ -34,6 +35,7 @@ export const CORE_LIVE_FILES = [
 /** Files that hold cases of both tiers, split per case with `liveTierTest`. */
 export const MIXED_LIVE_FILES = [
   "tests/runtime/live/session-admission-attached.live.test.ts",
+  "tests/runtime/live/launch-latency.live.test.ts",
 ] as const;
 
 /**

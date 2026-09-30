@@ -11,6 +11,9 @@
 //   - `runfree up` always validates fully and rewrites the warm proof;
 //   - an in-place `docker restart` of the proxy is a warm-proof mismatch, and
 //     the launch still succeeds on the full path;
+//   - a firewall changed inside the running proxy (same container, same
+//     start time) is a warm-proof mismatch, and removing the change reclaims
+//     the warm path;
 //   - a normal numeric exit takes the short teardown (spec open decision 3:
 //     the exited container's inspection proves it stopped before removal),
 //     and the session container is gone afterwards.
@@ -39,6 +42,13 @@ import {
   MANAGED_HOLD_RELATIVE_PATH,
   provisionSandboxFixture,
 } from "./fixture.ts";
+import { liveTierSelected } from "./tiers.ts";
+
+// The fast paths are part of the trust boundary's proof (a warm launch must
+// never skip what a changed runtime needs), so those cases are core; the
+// latency gate is a measurement and is extended.
+const coreTest = liveTierSelected("core") ? test : test.skip;
+const extendedTest = liveTierSelected("extended") ? test : test.skip;
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
 const RUNFREE_BIN = path.join(REPO_ROOT, "bin", "runfree.js");
@@ -120,7 +130,7 @@ describe("launch latency: sub-second launch plan Phase B", () => {
     if (fixture) destroyLiveFixture(fixture, { keepHostState: process.env.TEST_RUNTIME_KEEP_PROJECT === "1" });
   }, PROVISION_TIMEOUT_MS);
 
-  test("a warm launch takes the warm proof, the held-lock handoff, and the short exit", () => {
+  coreTest("a warm launch takes the warm proof, the held-lock handoff, and the short exit", () => {
     const warm = launchClaude(fixture);
     const output = warm.output;
     expect(timing(output, "validation:warm-proof"), describeOutput(output)).toContain("match");
@@ -142,7 +152,7 @@ describe("launch latency: sub-second launch plan Phase B", () => {
     expect(sessionContainers(fixture)).toEqual([]);
   }, TEST_TIMEOUT_MS);
 
-  test("runfree up always validates fully, and the next launch is warm again", () => {
+  coreTest("runfree up always validates fully, and the next launch is warm again", () => {
     const up = runfreeTimed(fixture, ["up"]);
     expect(up.status, describeOutput(up.output)).toBe(0);
     expect(milliseconds(up.output, "validation:topology"), describeOutput(up.output)).toBeGreaterThan(0);
@@ -151,7 +161,7 @@ describe("launch latency: sub-second launch plan Phase B", () => {
     expect(timing(warm.output, "validation:warm-proof"), describeOutput(warm.output)).toContain("match");
   }, TEST_TIMEOUT_MS);
 
-  test("an in-place proxy restart is a warm-proof mismatch, and the launch validates fully", () => {
+  coreTest("an in-place proxy restart is a warm-proof mismatch, and the launch validates fully", () => {
     const project = composeProjectName(fixture);
     const proxyId = composeServiceContainerId(project, "proxy");
     dockerOrThrow("restart the proxy in place", ["restart", proxyId]);
@@ -164,7 +174,28 @@ describe("launch latency: sub-second launch plan Phase B", () => {
     expect(timing(warm.output, "validation:warm-proof"), describeOutput(warm.output)).toContain("match");
   }, TEST_TIMEOUT_MS);
 
-  test("latency gate: warm launches, measured in the CLI", () => {
+  coreTest("a firewall changed inside the running proxy is never a warm launch, and undoing it reclaims the warm path", () => {
+    const project = composeProjectName(fixture);
+    const proxyId = composeServiceContainerId(project, "proxy");
+    const nft = (verb: "add" | "delete") =>
+      ["exec", "--privileged", "--user", "0:0", proxyId, "nft", verb, "chain", "inet", "runfree_proxy", "runfree_warm_drift"];
+    // Same proxy container and start time: only the in-proxy ruleset moved.
+    dockerOrThrow("add a chain to the proxy's table", nft("add"));
+    try {
+      const drifted = runfreeTimed(fixture, ["claude"]);
+      const verdicts = timing(drifted.output, "validation:warm-proof");
+      expect(verdicts, describeOutput(drifted.output)).not.toContain("match");
+      expect(verdicts.some((verdict) => verdict.startsWith("mismatch:")), describeOutput(drifted.output)).toBe(true);
+    } finally {
+      dockerOrThrow("remove the added chain", nft("delete"));
+    }
+    // Reclaim: the next launch validates fully, and the one after is warm.
+    launchClaude(fixture);
+    const warm = launchClaude(fixture);
+    expect(timing(warm.output, "validation:warm-proof"), describeOutput(warm.output)).toContain("match");
+  }, TEST_TIMEOUT_MS);
+
+  extendedTest("latency gate: warm launches, measured in the CLI", () => {
     const runs = Number(process.env.LAUNCH_LATENCY_RUNS ?? "5");
     expect(Number.isSafeInteger(runs) && runs > 0).toBe(true);
     const samples: Array<Record<string, number | string | undefined>> = [];
