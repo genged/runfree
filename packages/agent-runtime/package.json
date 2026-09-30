@@ -2,5 +2,8 @@
   "name": "@runfree/agent-runtime",
   "version": "0.2.0",
   "private": true,
-  "type": "module"
+  "type": "module",
+  "devDependencies": {
+    "@modelcontextprotocol/sdk": "1.31.0"
+  }
 }

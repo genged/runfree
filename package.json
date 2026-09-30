@@ -24,6 +24,7 @@
     "generate:assets": "tsx scripts/generate-assets.ts",
     "update:runtime-inputs": "tsx scripts/update-runtime-input-lock.ts",
     "update:agent-tools": "tsx scripts/update-agent-tools.ts",
+    "bundle:agent-mcp": "tsx scripts/bundle-agent-mcp.ts",
     "build:bin": "pnpm build:runtime && pnpm run generate:assets && tsx scripts/build-bin.ts",
     "package:homebrew": "scripts/package-homebrew-artifacts.sh",
     "smoke:bin": "./dist/runfree help",
