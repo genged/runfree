@@ -676,7 +676,18 @@ describe("per-session admission survives a crash at every transition", () => {
   // finish the teardown on Docker's proof and start, with no `rebuild`.
   // -------------------------------------------------------------------------
 
-  async function assertInterruptedTeardownReclaimedByStart(options: Readonly<{ stopProxy: boolean }>): Promise<void> {
+  /**
+   * Leaves the residue a daemon death leaves: a launch parked at its refused
+   * session-file delete (stamp written, record kept), the session container
+   * killed, optionally the proxy killed, and the owner SIGKILLed.
+   */
+  async function leaveInterruptedTeardown(options: Readonly<{ stopProxy: boolean }>): Promise<Readonly<{
+    sessionId: string;
+    containerId: string;
+    proxyId: string;
+    stateDir: string;
+    identity: Readonly<{ projectId: string; composeProject: string }>;
+  }>> {
     const composeProject = composeProjectName(fixture);
     const projectId = composeProject.replace(/^runfree-/u, "");
     const stateDir = path.join(runfreeStateRoot(fixture.env), "projects", projectId);
@@ -687,15 +698,17 @@ describe("per-session admission survives a crash at every transition", () => {
     const point = "after-failed-file-delete" as const;
     const owner = startHeldLaunchOwner(fixture, ["--launch-hold-at", point, "--fail-session-file-delete"]);
     let killed = false;
-    let sessionId: string | undefined;
+    let sessionId = "";
+    let containerId = "";
     try {
       const attached = await owner.awaitReason("attached", HELD_LAUNCH_WAIT_TIMEOUT_MS);
       const [record] = attached.records;
       expect(record?.containerId, "the attached record names no container").toBeTruthy();
-      sessionId = record?.sessionId;
+      sessionId = String(record?.sessionId);
+      containerId = String(record?.containerId);
       // The agent ends, so the owner starts its teardown; the refused delete
       // parks it with the stamp written and the record kept.
-      docker(["kill", String(record?.containerId)]);
+      docker(["kill", containerId]);
       await owner.awaitReason(point, HELD_LAUNCH_WAIT_TIMEOUT_MS);
       expect(readSessionFileEvidence(proxyId).files.length, "the refused delete left no session file").toBe(1);
       // What the daemon's death does to this project: its containers stop.
@@ -708,14 +721,22 @@ describe("per-session admission survives a crash at every transition", () => {
     }
 
     // Vacuity guard: the pending record the start used to refuse is there.
-    const before = listSessionContainerRecordsV2(stateDir, identity);
-    expect(before.map((record) => record.sessionId), "the interrupted teardown left no record").toContain(sessionId);
+    expect(
+      listSessionContainerRecordsV2(stateDir, identity).map((record) => record.sessionId),
+      "the interrupted teardown left no record",
+    ).toContain(sessionId);
     if (options.stopProxy) {
       expect(
         docker(["container", "inspect", "--format", "{{.State.Running}}", proxyId]).stdout.trim(),
         "the proxy was meant to be stopped, as a daemon restart leaves it",
       ).toBe("false");
     }
+    return Object.freeze({ sessionId, containerId, proxyId, stateDir, identity });
+  }
+
+  async function assertInterruptedTeardownReclaimedByStart(options: Readonly<{ stopProxy: boolean }>): Promise<void> {
+    const { sessionId, stateDir, identity } = await leaveInterruptedTeardown(options);
+    const { composeProject, projectId } = identity;
 
     const started = fixture.runfree(["up"]);
     expect(started.status, `the start after an interrupted teardown failed: ${describeOutput(started.output, 4000)}`)
@@ -742,6 +763,23 @@ describe("per-session admission survives a crash at every transition", () => {
 
   test("a start with the proxy still running finishes an interrupted teardown through the ordinary delete", async () => {
     await assertInterruptedTeardownReclaimedByStart({ stopProxy: false });
+  }, TEST_TIMEOUT_MS);
+
+  // The negative: Docker proves the session container is running again, so
+  // the start must keep the record — the address reservation — and refuse
+  // with the reason, not reclaim. The harness reset between cases clears it.
+  test("a start refuses an interrupted teardown whose session container runs again, and keeps its record", async () => {
+    const { sessionId, containerId, stateDir, identity } = await leaveInterruptedTeardown({ stopProxy: false });
+    dockerOrThrow("restart the interrupted session container", ["start", containerId]);
+
+    const started = fixture.runfree(["up"]);
+    expect(started.status, `the start reclaimed a running session: ${describeOutput(started.output, 4000)}`).not.toBe(0);
+    expect(started.output).toContain(`session ${sessionId}`);
+    expect(started.output).toContain("is still running");
+    expect(
+      listSessionContainerRecordsV2(stateDir, identity).map((record) => record.sessionId),
+      "the start dropped the record of a session whose container runs",
+    ).toContain(sessionId);
   }, TEST_TIMEOUT_MS);
 
   test("the runtime still admits a session after every crash and recovery", () => {
