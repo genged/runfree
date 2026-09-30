@@ -61,7 +61,7 @@ function resolveMcpAuthEntry(input: McpAuthInput, context: RuntimeContext): McpI
     die(`multiple MCP entries match ${input.agent} ${input.server}; pass --source user, --source local, or --source project`);
   }
   const entry = matches[0];
-  if (entry.decision.status === "unsupported" || entry.decision.status === "conflict") {
+  if (entry.decision.status === "unsupported" || entry.decision.status === "skipped" || entry.decision.status === "conflict") {
     die(`cannot authenticate MCP server ${entry.agent} ${entry.name}: ${entry.decision.reason ?? entry.decision.status}`);
   }
   if (entry.source === "project" && entry.decision.status !== "approved") {

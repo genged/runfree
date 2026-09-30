@@ -356,13 +356,10 @@ filter is repeatable; omit it to include both agents.
 Project `.mcp.json` and `.codex/config.toml` entries are imported only after approval. Static headers require a host-owned credential source.
 
 Local STDIO servers run inside the agent container, never on the host. A
-command that is a host path is skipped with `local STDIO command is not a
-portable capability; install it in the agent image`. One exception is Codex
-Desktop's `node_repl`: Runfree replaces it with its own portable `node-repl`
-server in the agent image (`runfree mcp list` shows `stdio (node-repl)`), and
-`runfree mcp explain codex node_repl` prints what runs instead of the host
-command. Codex `computer-use` controls host desktop apps, so Runfree skips it.
-See [Portable compute MCP](architecture.md#portable-compute-mcp).
+command that is a host path is skipped with a warning. The Codex Desktop
+built-ins `node_repl` and `computer-use` are skipped silently: `runfree mcp
+list` shows them as `skipped`, and `--verbose` prints one line for each. See
+[Codex Desktop built-ins](architecture.md#codex-desktop-built-ins).
 
 OAuth login works in any session. When an approved MCP server can use OAuth,
 each `runfree claude`, `codex`, `pi`, or `shell` session gets its own loopback

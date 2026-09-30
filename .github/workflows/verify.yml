@@ -66,12 +66,6 @@ jobs:
       - name: Run static checks
         run: make test-static
 
-      # The portable MCP bundle is committed; rebuild it with the pinned Bun
-      # and byte-compare, so the shipped bytes are proved to come from the
-      # committed sources and lockfile.
-      - name: Verify portable MCP bundle is current
-        run: pnpm run bundle:agent-mcp -- --check
-
       - name: Run unit tests
         run: make test-unit
 

@@ -60,13 +60,6 @@ export const RUNTIME_ASSET_DESCRIPTORS: readonly RuntimeAssetDescriptor[] = [
   agentImage("agent/session-ready-probe.cjs"),
   agentImage("agent/agent-tools/package-lock.json"),
   agentImage("agent/agent-tools/package.json"),
-  // Portable MCP bundle: committed output of `pnpm run bundle:agent-mcp`,
-  // copied verbatim so the embedded manifest does not depend on a bundler.
-  agentImage("agent/mcp/manifest.json"),
-  agentImage("agent/mcp/node-repl-kernel.mjs"),
-  agentImage("agent/mcp/runfree-mcp.mjs"),
-  agentImage("agent/mcp/self-check.mjs"),
-  agentImage("agent/runfree-mcp.sh"),
   { path: "agent/compose.yaml", roles: ["compose-template"] as const },
   // Executed directly from host state, so it is the one asset that ships with
   // the execute bit. The agent image chmods its own copied scripts to 0755.

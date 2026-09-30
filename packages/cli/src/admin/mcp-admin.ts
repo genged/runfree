@@ -101,7 +101,7 @@ export function mcpListIntent(input: { json: boolean }): void {
       entry.source,
       entry.agent,
       entry.name,
-      entry.portable ? `${entry.transport} (${entry.portable.capability})` : entry.transport,
+      entry.transport,
       entry.auth,
       entry.decision.status,
       entry.mcpPolicy?.summary ?? "-",
@@ -190,8 +190,8 @@ function planProjectCredentialSource(
 }
 
 function assertApprovableProjectEntry(entry: McpInventoryEntry): void {
-  if (entry.decision.status === "unsupported") {
-    die(`cannot approve unsupported project MCP server: ${entry.decision.reason ?? "unsupported MCP configuration"}`);
+  if (entry.decision.status === "unsupported" || entry.decision.status === "skipped") {
+    die(`cannot approve ${entry.decision.status} project MCP server: ${entry.decision.reason ?? "unsupported MCP configuration"}`);
   }
   if (entry.decision.status === "conflict") {
     die(`cannot approve project MCP server ${entry.agent} ${entry.name}: ${entry.decision.reason ?? "conflict"}`);
@@ -305,7 +305,7 @@ export async function mcpEnableIntent(input: McpEnableInput, deps: McpEnableDeps
   const shownName = printable(serverName);
   // 1. Resolve and validate the entry. No network call happens before this.
   const entry = findMcpEntry(agent, serverName, input.source);
-  if (entry.decision.status === "unsupported" || entry.decision.status === "conflict") {
+  if (entry.decision.status === "unsupported" || entry.decision.status === "skipped" || entry.decision.status === "conflict") {
     die(`cannot enable MCP server ${agent} ${shownName}: ${printable(entry.decision.reason ?? entry.decision.status)}`);
   }
   const isProject = entry.source === "project";
@@ -510,15 +510,6 @@ export function mcpExplainIntent(input: McpExplainInput): void {
   if (entry.decision.reason) console.log(`reason: ${entry.decision.reason}`);
   console.log(`target: ${entry.target}`);
   if (entry.endpoint) console.log(`endpoint: ${entry.endpoint.host}${entry.endpoint.path}`);
-  if (entry.portable) {
-    // Shape and catalog facts only: nothing here ran the server in the selected
-    // agent image or in a live session.
-    console.log(`execution: portable container capability ${entry.portable.capability} (contract ${entry.portable.contractVersion})`);
-    console.log("source path: ignored; no host executable runs");
-    console.log(`bundle: runfree-mcp ${entry.portable.bundleVersion} from the Runfree base agent image`);
-    console.log("image check: not run against the selected agent image");
-    console.log("MCP tool calls: STDIO inside the agent container; not covered by proxy MCP operation policy or write approval");
-  }
   if (entry.mcpPolicy) {
     console.log(`server id: ${entry.mcpPolicy.operationServerId}`);
     console.log(`MCP tool default: ${entry.mcpPolicy.defaultToolWriteAction ?? "ask"}`);
@@ -555,7 +546,7 @@ export function mcpExplainIntent(input: McpExplainInput): void {
 
 export function mcpRulesIntent(input: McpRulesInput): void {
   const entry = findMcpEntry(input.agent, input.server, input.source);
-  if (entry.decision.status === "unsupported" || entry.decision.status === "conflict") {
+  if (entry.decision.status === "unsupported" || entry.decision.status === "skipped" || entry.decision.status === "conflict") {
     die(`cannot set MCP rules for ${entry.agent} ${entry.name}: ${entry.decision.reason ?? entry.decision.status}`);
   }
   if (entry.source === "project" && entry.decision.status !== "approved") {
@@ -675,7 +666,7 @@ export async function mcpConfigureIntent(input: McpConfigureInput): Promise<McpC
         { value: "keep", label: "Keep current approval state" },
         ...(entry.decision.status === "approved"
           ? [{ value: "revoke", label: "Revoke project approval" }]
-          : entry.decision.status === "unsupported" || entry.decision.status === "conflict"
+          : entry.decision.status === "unsupported" || entry.decision.status === "skipped" || entry.decision.status === "conflict"
             ? []
             : [{ value: "approve", label: "Approve project server" }]),
       ],

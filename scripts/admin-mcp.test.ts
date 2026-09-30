@@ -658,12 +658,11 @@ describe("admin MCP runtime preparation", () => {
     expect(result.stdout).toContain("repo.example.com");
   });
 
-  test("mcp list and explain show a portable node_repl without claiming an image or live check", async () => {
+  test("mcp list and explain show a Codex Desktop built-in as skipped, and no admin action accepts it", async () => {
     writeCodexNative([
       "[mcp_servers.node_repl]",
       'command = "/Applications/Codex.app/Contents/Resources/node_repl"',
       "args = []",
-      "startup_timeout_sec = 120",
       "",
       "[mcp_servers.node_repl.env]",
       'NODE_REPL_NODE_PATH = "/Applications/Codex.app/Contents/Resources/node"',
@@ -672,21 +671,17 @@ describe("admin MCP runtime preparation", () => {
 
     const list = await runAdmin(() => mcpListIntent({ json: false }));
     expect(list.status, list.stderr).toBe(0);
-    expect(list.stdout).toMatch(/node_repl\s+stdio \(node-repl\)\s+none\s+imported/);
+    expect(list.stdout).toMatch(/node_repl\s+stdio\s+unknown\s+skipped\s+-\s+excluded/);
+    expect(list.stderr).not.toContain("node_repl");
 
     const explain = await runAdmin(() => mcpExplainIntent({ agent: parseMcpAgent("codex"), server: "node_repl", source: parseMcpSource("user"), json: false }));
     expect(explain.status, explain.stderr).toBe(0);
-    expect(explain.stdout).toContain("execution: portable container capability node-repl (contract 1)");
-    expect(explain.stdout).toContain("source path: ignored; no host executable runs");
-    expect(explain.stdout).toContain("image check: not run against the selected agent image");
-    expect(explain.stdout).toContain("not covered by proxy MCP operation policy or write approval");
-    expect(explain.stdout).not.toContain("NODE_REPL_NODE_PATH");
-    expect(explain.stdout).not.toContain("Codex.app");
+    expect(explain.stdout).toContain("status: skipped");
+    expect(explain.stdout).toContain("reason: Codex Desktop built-in; not used in Runfree");
 
-    // STDIO tool calls never pass the proxy, so MCP rules are refused before any write.
     const rules = await runAdmin(() => mcpRulesIntent({ agent: parseMcpAgent("codex"), server: "node_repl", source: parseMcpSource("user"), write: "allow" }));
     expect(rules.status).toBe(1);
-    expect(rules.stderr).toContain("MCP rules apply only to HTTP MCP servers imported through the proxy");
+    expect(rules.stderr).toContain("cannot set MCP rules for codex node_repl: Codex Desktop built-in; not used in Runfree");
     expect(fs.existsSync(path.join(stateDir, "mcp-rules.json"))).toBe(false);
   });
 

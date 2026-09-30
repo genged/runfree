@@ -242,23 +242,17 @@ Details: [Write Approval Grants](architecture.md#write-approval-grants).
    STDIO MCP servers run inside the agent container; their calls do not pass
    the proxy, so `runfree mcp rules` refuses them.
 5. No imported MCP descriptor starts a host process. Local STDIO commands run
-   only in the agent container. A known portable descriptor (Codex Desktop
-   `node_repl`) is replaced by the fixed `runfree-mcp` command from the agent
-   image; its host command, args, env values, and working directory are
-   discarded and never enter the container or the approval digest. Codex
-   `computer-use` (host desktop control) is skipped. See
-   [Portable Compute MCP](architecture.md#portable-compute-mcp).
-6. A portable server has the agent's authority, no more: it runs as the agent
-   user with the agent's mounts, network policy, and placeholder-only
-   environment. It gets no proxy-managed credential.
-7. **Each session owns its OAuth callback path.** When an approved MCP server
+   only in the agent container; a host-path command is skipped. Codex Desktop
+   built-ins (`node_repl`, `computer-use`) are skipped and never enter the
+   generated agent config.
+6. **Each session owns its OAuth callback path.** When an approved MCP server
    can use OAuth, every session gets its own loopback port, forwarder, and
    in-session bridge before it starts. The forwarder is bound to that session
    and removed before the session's record releases its address, and before
    an orphan session container that no record claims is removed. The bridge
    accepts only its forwarder. The port is a routing value, not an
    authorization secret: the client keeps state, PKCE, and issuer checks.
-8. `runfree mcp enable` adds OAuth hosts only after one host-side review.
+7. `runfree mcp enable` adds OAuth hosts only after one host-side review.
    Discovery contacts a project-named host only after the user agrees, on a
    terminal, and only public, checked addresses over a pinned HTTPS
    connection. It adds a host only when valid metadata names a token endpoint

@@ -29,14 +29,9 @@ import type { ProjectInfo } from "../config.ts";
 import { readActiveEffectiveControl } from "../control/effective.ts";
 import { projectHash } from "../project-identity.ts";
 import { atomicReplaceFile, isPathInsideByRealpath, safeReadProjectFile } from "../safe-fs.ts";
-import { warn } from "../warnings.ts";
+import { runfreeLog, warn } from "../warnings.ts";
 import { updateCodexConfig } from "./codex-config.ts";
-import {
-  classifyPortableMcp,
-  PORTABLE_MESSAGES,
-  type PortableClassification,
-  portableCodexConfig,
-} from "./portable-mcp.ts";
+import { CODEX_DESKTOP_BUILTIN_REASON, isCodexDesktopBuiltIn } from "./mcp-desktop-builtins.ts";
 import {
   projectEnabledOAuthEndpoints,
   projectEnabledOAuthHosts,
@@ -84,21 +79,15 @@ type PreparedMcpServer = {
   };
   oauthPolicy?: McpOAuthServerPolicyJson;
   name: string;
-  portable?: McpPortableExecution;
   source: McpSourceScope;
   tokenBindings: HeaderTokenBinding[];
   transport: "http" | "stdio";
 };
 
-// A descriptor translated to a Runfree-owned container capability. The host
-// command, args, env values, and cwd were discarded.
-export type McpPortableExecution = {
-  bundleVersion: string;
-  capability: string;
-  contractVersion: number;
-};
-
-export type McpDecisionStatus = "approved" | "imported" | "unapproved" | "changed" | "unsupported" | "conflict";
+// `skipped`: a Codex Desktop built-in that Runfree deliberately ignores (see
+// mcp-desktop-builtins.ts). Like `unsupported`, it is never generated,
+// approved, enabled, or authenticated.
+export type McpDecisionStatus = "approved" | "imported" | "unapproved" | "changed" | "unsupported" | "skipped" | "conflict";
 
 export type McpInventoryEntry = {
   agent: McpAgent;
@@ -120,7 +109,6 @@ export type McpInventoryEntry = {
     tools: Record<string, McpToolOperationPolicyJson>;
   };
   name: string;
-  portable?: McpPortableExecution;
   source: McpSourceScope;
   sourcePath?: string;
   target: "excluded" | "generated";
@@ -853,7 +841,7 @@ function looksLikeHostPath(value: string, projectRoot: string): boolean {
 function assertContainerLocalStdio(server: NativeMcpServer, projectRoot: string): boolean {
   const command = typeof server.config.command === "string" ? server.config.command : "";
   if (command.trim() === "" || command.includes("/") || command.includes("\\") || path.isAbsolute(command)) {
-    warn(`mcp: skipped ${server.agent} server ${server.name} reason=${PORTABLE_MESSAGES.notPortable}`);
+    warn(`mcp: skipped ${server.agent} server ${server.name} reason=local stdio command must be installed in the container PATH`);
     return false;
   }
   const args = stringArray(server.config.args) ?? [];
@@ -908,48 +896,17 @@ function prepareStdioServer(server: NativeMcpServer, projectRoot: string, option
   };
 }
 
-function stdioPortableClassification(server: NativeMcpServer): PortableClassification {
-  return classifyPortableMcp({ agent: server.agent, name: server.name, config: server.config });
-}
-
-function preparePortableServer(
-  server: NativeMcpServer,
-  classification: Exclude<PortableClassification, { kind: "none" }>,
-  options: PrepareServerOptions,
-): PreparedMcpServer | undefined {
-  if (server.scope === "project" && !options.allowProject) return undefined;
-  if (classification.kind !== "portable") {
-    logMcp(options, { kind: "skipped", scope: server.scope, agent: server.agent, name: server.name, detail: `reason=${classification.reason}` });
-    return undefined;
-  }
-  const { capability } = classification;
-  logMcp(options, {
-    kind: "imported",
-    scope: server.scope,
-    agent: server.agent,
-    name: server.name,
-    detail: `transport=stdio portable=${capability.id}; host command ignored`,
-  });
-  return {
-    agent: server.agent,
-    auth: "none",
-    name: server.name,
-    portable: { bundleVersion: capability.bundleVersion, capability: capability.id, contractVersion: capability.contractVersion },
-    source: server.scope,
-    transport: "stdio",
-    tokenBindings: [],
-    codexConfig: portableCodexConfig(capability, classification.options),
-  };
+function isDesktopBuiltIn(server: NativeMcpServer): boolean {
+  return nativeTransport(server) === "stdio" && isCodexDesktopBuiltIn({ agent: server.agent, name: server.name, config: server.config });
 }
 
 function prepareServer(server: NativeMcpServer, projectRoot: string, options: PrepareServerOptions = {}): PreparedMcpServer | undefined {
   const transport = nativeTransport(server);
   if (transport === "http") return prepareHttpServer(server, options);
   if (transport === "stdio") {
-    // Portable classification runs before the generic STDIO rules, so a known
-    // host descriptor is never judged (or copied) by its host path.
-    const classification = stdioPortableClassification(server);
-    if (classification.kind !== "none") return preparePortableServer(server, classification, options);
+    // A Codex Desktop built-in is skipped before the generic STDIO rules, so
+    // it neither warns nor reaches the generated config.
+    if (isDesktopBuiltIn(server)) return undefined;
     return prepareStdioServer(server, projectRoot, options);
   }
   if (server.scope !== "project") logMcp(options, { kind: "skipped", scope: server.scope, agent: server.agent, name: server.name, detail: "reason=unsupported MCP transport" });
@@ -1125,10 +1082,6 @@ function mcpDescriptor(projectRoot: string, server: NativeMcpServer, prepared: P
     server: server.name,
     transport: prepared.transport,
     auth: prepared.auth,
-    // Binds the capability id and contract version, never the discarded host
-    // path. A contract change invalidates an existing project approval; a
-    // bundle patch that keeps the contract does not.
-    ...(prepared.portable ? { portable: { capability: prepared.portable.capability, contractVersion: prepared.portable.contractVersion } } : {}),
     ...(prepared.claudeConfig ? { claudeConfig: prepared.claudeConfig } : {}),
     ...(prepared.codexConfig ? { codexConfig: prepared.codexConfig } : {}),
     ...(prepared.oauthPolicy ? { oauthPolicy: prepared.oauthPolicy } : {}),
@@ -1183,7 +1136,7 @@ export function saveMcpApproval(projectRoot: string, filePath: string, entry: Mc
     schemaVersion: 1,
     server: entry.name,
     source: "project",
-    summary: `${entry.agent} ${entry.name} ${entry.transport}/${entry.auth}${entry.portable ? ` portable:${entry.portable.capability}@${entry.portable.contractVersion}` : ""}`,
+    summary: `${entry.agent} ${entry.name} ${entry.transport}/${entry.auth}`,
     transport: entry.transport,
   };
   approvals.approvals[approvalKey(entry.agent, entry.name, entry.descriptorDigest)] = record;
@@ -1216,6 +1169,7 @@ function mcpInventoryRecords(options: { approvalPath?: string; env: NodeJS.Proce
   const importedByName = new Map<string, McpSourceScope>();
   return discoverMcpServers(options.projectRoot, options.env).map((server): McpInventoryRecord => {
     const transport = nativeTransport(server) ?? "unknown";
+    const desktopBuiltIn = isDesktopBuiltIn(server);
     const prepared = prepareServer(server, options.projectRoot, { allowProject: true, log: false });
     const supported = prepared !== undefined;
     const digest = prepared ? descriptorDigest(options.projectRoot, server, prepared) : undefined;
@@ -1225,12 +1179,12 @@ function mcpInventoryRecords(options: { approvalPath?: string; env: NodeJS.Proce
     let status: McpDecisionStatus;
     let reason: string | undefined;
     let approval: McpApprovalRecord | undefined;
-    if (!supported) {
+    if (desktopBuiltIn) {
+      status = "skipped";
+      reason = CODEX_DESKTOP_BUILTIN_REASON;
+    } else if (!supported) {
       status = "unsupported";
-      const classification = transport === "stdio" ? stdioPortableClassification(server) : { kind: "none" as const };
-      reason = classification.kind === "changed" || classification.kind === "host-desktop"
-        ? classification.reason
-        : "unsupported MCP transport or unsafe MCP configuration";
+      reason = "unsupported MCP transport or unsafe MCP configuration";
     } else if (server.scope !== "project") {
       status = "imported";
       importedByName.set(nameKey, server.scope);
@@ -1282,12 +1236,11 @@ function mcpInventoryRecords(options: { approvalPath?: string; env: NodeJS.Proce
         }
         : {}),
       name: server.name,
-      ...(prepared?.portable ? { portable: prepared.portable } : {}),
       prepared,
       server,
       source: server.scope,
       ...(server.sourcePath ? { sourcePath: server.sourcePath } : {}),
-      target: server.scope === "project" && status !== "approved" ? "excluded" : "generated",
+      target: desktopBuiltIn || (server.scope === "project" && status !== "approved") ? "excluded" : "generated",
       ...(prepared && prepared.tokenBindings.length > 0 ? { tokenBindings: prepared.tokenBindings } : {}),
       transport,
     };
@@ -1766,6 +1719,7 @@ export function prepareMcpRuntime(options: McpPrepareOptions): McpPrepareResult 
   const callbackPort = options.callbackPort ?? mcpOAuthCallbackPort(options.projectRoot);
   const servers: PreparedMcpServer[] = [];
   const events: McpLogEvent[] = [];
+  const desktopBuiltIns: McpInventoryRecord[] = [];
   for (const entry of mcpInventoryRecords({
     approvalPath: options.approvalPath,
     env: options.env,
@@ -1773,12 +1727,9 @@ export function prepareMcpRuntime(options: McpPrepareOptions): McpPrepareResult 
     rulesPath: options.mcpRulesPath,
   })) {
     if (!entry.prepared) {
-      // Portable classification skips (changed descriptor, host desktop tool)
-      // are reported here; inventory preparation runs silently.
-      if (entry.transport === "stdio" && entry.decision.reason !== undefined
-        && (entry.decision.reason === PORTABLE_MESSAGES.changed || entry.decision.reason === PORTABLE_MESSAGES.hostDesktop)) {
-        events.push({ kind: "skipped", scope: entry.source, agent: entry.agent, name: entry.name, detail: `reason=${entry.decision.reason}` });
-      }
+      // A Codex Desktop built-in is not a problem to warn about: it gets one
+      // line under --verbose and nothing otherwise.
+      if (entry.decision.status === "skipped") desktopBuiltIns.push(entry);
       continue;
     }
     if (entry.source === "project" && entry.decision.status !== "approved") {
@@ -1845,6 +1796,12 @@ export function prepareMcpRuntime(options: McpPrepareOptions): McpPrepareResult 
     else grouped.set(key, { event, agents: [event.agent] });
   }
   for (const { event, agents } of grouped.values()) warn(renderMcpLogEvent(event, agents));
+  if (mcpLogContext.verbose) {
+    for (const entry of desktopBuiltIns) {
+      if (mcpLogContext.agent !== undefined && entry.agent !== mcpLogContext.agent) continue;
+      runfreeLog(`mcp: skipped Codex Desktop built-in ${entry.name}; not used in Runfree`);
+    }
+  }
 
   // The OAuth callback guidance is verbose-only: the host cannot see whether
   // the proxy already holds a live OAuth token for a server, and the agent
