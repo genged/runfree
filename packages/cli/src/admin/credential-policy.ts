@@ -67,6 +67,9 @@ import { TOKEN_SYNC_DEFERRED_STATUS } from "../runtime/constants.ts";
 // Per child process of the receipt-gated warm-launch sync, which can run while
 // the project lifecycle lock is held (sub-second launch plan Tasks 3 and 5).
 const WARM_SYNC_CALL_TIMEOUT_MS = 20_000;
+// And for the whole of it: past this the next call is not started and the
+// sync defers to the unlocked source-truth order.
+const WARM_SYNC_TOTAL_TIMEOUT_MS = 30_000;
 
 function assertKnownCredential(name: string): void {
   const policy = loadPolicy();
@@ -621,7 +624,7 @@ export async function credentialSyncIntent(input: CredentialSyncInput): Promise<
       // bounded, so a stuck Docker call cannot hold the project's lock.
       const result = withAdminCallTimeout(WARM_SYNC_CALL_TIMEOUT_MS, () => (
         syncTokens({ exitOnFailure: true, verbose: input.verbose, mode: "convergence", preparedOnly: true })
-      ));
+      ), WARM_SYNC_TOTAL_TIMEOUT_MS);
       currentAdminState().tokenResolutionReceipts = result.receipts;
     } catch (error) {
       if (!(error instanceof TokenSyncDeferredError)) throw error;

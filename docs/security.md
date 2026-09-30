@@ -166,8 +166,12 @@ agent sees: placeholder or runfree_oauth_* handle only
 4. A warm launch may reuse a proxy-held value without re-reading its source,
    only while a host receipt proves it current and its last read is under 15
    minutes old; the launch's watcher re-reads every source right after the
-   launch. A source revoked at its origin is therefore dropped seconds after a
-   warm launch, not before it. `runfree credential sync` always re-reads.
+   launch. A source revoked at its origin (a definitive read failure) is
+   therefore dropped seconds after a warm launch, not before it. A source that
+   cannot be read for a transient or unclassified reason (a locked vault, a
+   prompt the detached watcher cannot show) keeps the held value, bounded by
+   the keep-last-good age, until the next launch reads it interactively.
+   `runfree credential sync` always re-reads.
 5. The proxy CA private key is mounted only into the proxy.
 
 ### Sessions

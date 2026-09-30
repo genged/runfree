@@ -240,24 +240,28 @@ type TokenSyncOptions = TokenResolutionOptions & {
    * value (launch plan D4, reuse saved credentials on a warm launch). Anything
    * else — no prepared set, a due token the preparation skipped, a busy
    * control or token-store lock, a runtime that is not ready, unreadable
-   * source config — throws `TokenSyncDeferredError` before any proxy write or
-   * removal, so the caller can take the unlocked source-truth order instead.
+   * source config, an expired or rebound preparation — throws
+   * `TokenSyncDeferredError` before any proxy write or removal, so the caller
+   * can take the unlocked source-truth order instead. A proxy write that
+   * fails, and a spent total time budget, also defer: earlier writes of
+   * freshly re-read values may have landed, and nothing is removed.
    */
   preparedOnly?: boolean;
   /**
-   * Keep the last good proxy value on every source-resolution failure, not
-   * only a transient one (still bounded by the keep-last-good age). The
-   * watcher's first source-truth pass after a receipt-gated launch runs
-   * detached and non-interactive, so a source that needs a prompt must not
-   * delete a value the session is using. Config-level changes (source
-   * removed, fingerprint changed, token dropped from policy) still delete.
+   * Keep the last good proxy value on an unclassified source-resolution
+   * failure too, not only a transient one (still bounded by the keep-last-good
+   * age). The watcher's first source-truth pass after a receipt-gated launch
+   * runs detached and non-interactive, so a source that needs a prompt must
+   * not delete a value the session is using. A classified definitive failure
+   * (how a revocation at the source shows) still deletes, as do config-level
+   * changes (source removed, fingerprint changed, token dropped from policy).
    */
   keepLastGoodOnAnyResolutionFailure?: boolean;
 };
 
 /**
- * A prepared-only sync that could not proceed without resolving a source or
- * waiting on a lock. Thrown before any proxy write or removal.
+ * A prepared-only sync that could not proceed without resolving a source,
+ * waiting on a lock, or exceeding its time bounds. Never followed by a removal.
  */
 export class TokenSyncDeferredError extends Error {
   constructor(message: string) {
@@ -1136,11 +1140,19 @@ const adminLifecycleDeadline = new AsyncLocalStorage<number>();
 // A per-call bound for a sync that runs while the project lifecycle lock is
 // held (the receipt-gated warm-launch sync): each child process gets at most
 // this long, and a timed-out call is a failed observation, never a success.
-const adminCallTimeoutMs = new AsyncLocalStorage<number>();
+// With a total, the whole sync is bounded too: past it the next child process
+// is not started and the sync defers (`TokenSyncDeferredError`).
+const adminCallTimeoutMs = new AsyncLocalStorage<Readonly<{ callMs: number; deadline?: number }>>();
 
-/** Runs `action` with every admin child process bounded to `timeoutMs`. */
-export function withAdminCallTimeout<T>(timeoutMs: number, action: () => T): T {
-  return adminCallTimeoutMs.run(timeoutMs, action);
+/**
+ * Runs `action` with every admin child process bounded to `timeoutMs`, and,
+ * with `totalMs`, every child bounded by what is left of that total.
+ */
+export function withAdminCallTimeout<T>(timeoutMs: number, action: () => T, totalMs?: number): T {
+  return adminCallTimeoutMs.run(
+    { callMs: timeoutMs, ...(totalMs === undefined ? {} : { deadline: performance.now() + totalMs }) },
+    action,
+  );
 }
 
 function adminSpawnSync(
@@ -1152,10 +1164,16 @@ function adminSpawnSync(
   const remaining = deadline === undefined ? undefined : deadline - performance.now();
   if (remaining !== undefined && remaining <= 0) throw new Error("proxy reload lifecycle budget ended; sessions were preserved; retry runtime reload-policy --force");
   const deadlineBounded = remaining === undefined ? options : { ...options, timeout: Math.max(1, Math.floor(Math.min(options.timeout || remaining, remaining))) };
-  const callLimit = adminCallTimeoutMs.getStore();
+  const callBound = adminCallTimeoutMs.getStore();
+  let callLimit = callBound?.callMs;
+  if (callBound?.deadline !== undefined) {
+    const left = callBound.deadline - performance.now();
+    if (left <= 0) throw new TokenSyncDeferredError("the locked credential sync used its time budget");
+    callLimit = Math.min(callLimit as number, left);
+  }
   const bounded = callLimit === undefined
     ? deadlineBounded
-    : { ...deadlineBounded, timeout: Math.max(1, Math.min(deadlineBounded.timeout || callLimit, callLimit)) };
+    : { ...deadlineBounded, timeout: Math.max(1, Math.floor(Math.min(deadlineBounded.timeout || callLimit, callLimit))) };
   const result = currentAdminState().processRunner?.(command, args, bounded)
     ?? childProcess.spawnSync(command, args, bounded) as childProcess.SpawnSyncReturns<string>;
   if (deadline !== undefined && performance.now() >= deadline) throw new Error("proxy reload lifecycle budget ended; sessions were preserved; retry runtime reload-policy --force");
@@ -1902,7 +1920,10 @@ function keepLastGoodReceipt(input: {
   nowMs: number;
   anyFailure?: boolean;
 }): TokenResolutionReceipt | undefined {
-  if (!input.anyFailure && !isTransientTokenResolutionError(input.error)) return undefined;
+  // A classified definitive failure is how a revocation at the source shows,
+  // so it never keeps a value; `anyFailure` widens only to unclassified ones.
+  if (!isTransientTokenResolutionError(input.error)
+    && (!input.anyFailure || input.error instanceof TokenResolutionError)) return undefined;
   if (input.storeGeneration === undefined || input.sourceFingerprint === undefined) return undefined;
   const receipt = input.receipt;
   if (receipt === undefined) return undefined;
@@ -2769,8 +2790,17 @@ function syncTokensUnderLock(
     if (sourceRegistryError) throw new EffectiveControlSelectionChanged("prepared source registry changed; restore its metadata before retrying sync");
     const expectedNames = assertPreparedTokenSourceInputs(prepared, policy, config, sourceRegistry);
     // Binding and age are checked for every prepared entry, skipped ones too;
-    // only a due token ever reads a value (in the loop below).
-    for (const name of expectedNames) currentPreparedRuntimeTokenSource(name, config[name], { quiet: true, sourceRegistry: config[name].source === "named" ? sourceRegistry : undefined });
+    // only a due token ever reads a value (in the loop below). Under the held
+    // lock an expired or rebound preparation is a deferral: nothing was
+    // written yet, and the source-truth order prepares afresh.
+    try {
+      for (const name of expectedNames) currentPreparedRuntimeTokenSource(name, config[name], { quiet: true, sourceRegistry: config[name].source === "named" ? sourceRegistry : undefined });
+    } catch (error) {
+      if (options.preparedOnly && error instanceof EffectiveControlSelectionChanged) {
+        throw new TokenSyncDeferredError(`the prepared credential set no longer applies: ${error.message}`);
+      }
+      throw error;
+    }
   }
   const retryDelayMs = sourceRegistryError === undefined ? tokenRetryDelayMs(config, sourceRegistry) : 60_000;
   // Fences sit before each side-effect phase: the removal below, source
@@ -2849,7 +2879,17 @@ function syncTokensUnderLock(
       assertSelection();
       if (runtime.id) {
         adminVerbose(options, `${tokenName}: writing token value to proxy-only tmpfs`);
-        writeProxyRuntimeToken(runtime.id, tokenName, value);
+        try {
+          writeProxyRuntimeToken(runtime.id, tokenName, value);
+        } catch (error) {
+          // Under the held lock every call is time-bounded, and a killed
+          // client may still land its write: removing now could race it. The
+          // unlocked source-truth order retries instead.
+          if (options.preparedOnly) {
+            throw new TokenSyncDeferredError(`${tokenName}: proxy token write failed: ${error instanceof Error ? error.message : String(error)}`);
+          }
+          throw error;
+        }
         changed = true;
         heldTokens?.add(tokenName);
       } else {
@@ -2879,7 +2919,7 @@ function syncTokensUnderLock(
       };
       if (!options.quiet) console.log(`${tokenName}: ${runtimeStateMessage(runtime.state, runtime.validationMessage)} from ${describeSource(source)}`);
     } catch (error) {
-      if (error instanceof EffectiveControlSelectionChanged) throw error;
+      if (error instanceof EffectiveControlSelectionChanged || error instanceof TokenSyncDeferredError) throw error;
       clearCachedSourceSecret(source, options.sourceSecretCache);
       let failureFingerprint: string | undefined;
       try {

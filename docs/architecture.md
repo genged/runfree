@@ -1224,9 +1224,11 @@ between, or a lock is busy), it writes and removes nothing and the launch falls
 back to the full source-truth order. The launch's auto-refresh watcher then
 re-reads every source once, right away, so a value rotated at its source
 reaches the proxy seconds after the launch rather than before it. That pass
-runs detached: a source it cannot read keeps the held value (bounded by the
-keep-last-good age) until the next launch reads it interactively; an explicit
-`runfree credential sync` still deletes on a definitive failure.
+runs detached: a definitive failure (the item or variable is gone, access was
+denied) deletes the held value, as an explicit `runfree credential sync` does;
+a transient or unclassified failure (a locked vault, a source that needs a
+prompt) keeps it, bounded by the keep-last-good age, until the next launch
+reads it interactively.
 
 ## Services
 
