@@ -235,7 +235,44 @@ type TokenSyncOptions = TokenResolutionOptions & {
   exitOnFailure?: boolean;
   resolutionLedger?: TokenResolutionLedger;
   mode?: TokenSyncMode;
+  /**
+   * Resolve nothing: every due token must already have a resolved prepared
+   * value (launch plan D4, reuse saved credentials on a warm launch). Anything
+   * else — no prepared set, a due token the preparation skipped, a busy
+   * control or token-store lock, a runtime that is not ready, unreadable
+   * source config — throws `TokenSyncDeferredError` before any proxy write or
+   * removal, so the caller can take the unlocked source-truth order instead.
+   */
+  preparedOnly?: boolean;
+  /**
+   * Keep the last good proxy value on every source-resolution failure, not
+   * only a transient one (still bounded by the keep-last-good age). The
+   * watcher's first source-truth pass after a receipt-gated launch runs
+   * detached and non-interactive, so a source that needs a prompt must not
+   * delete a value the session is using. Config-level changes (source
+   * removed, fingerprint changed, token dropped from policy) still delete.
+   */
+  keepLastGoodOnAnyResolutionFailure?: boolean;
 };
+
+/**
+ * A prepared-only sync that could not proceed without resolving a source or
+ * waiting on a lock. Thrown before any proxy write or removal.
+ */
+export class TokenSyncDeferredError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "TokenSyncDeferredError";
+  }
+}
+
+/**
+ * How long a receipt-gated warm launch may keep a value it did not re-read
+ * from its source (sub-second launch plan Task 5, review H4). The watcher's
+ * first source-truth pass normally re-reads within seconds of the launch; this
+ * bound keeps a lost watcher from stretching that to the proxy's lifetime.
+ */
+export const WARM_TOKEN_SOURCE_READ_MAX_AGE_MS = 15 * 60 * 1000;
 export type EffectiveTokenRefresh =
   | { mode: "manual" }
   | { mode: "explicit"; seconds: number; sourceName?: string; ttlSeconds?: number }
@@ -1850,8 +1887,9 @@ function keepLastGoodReceipt(input: {
   storeGeneration: string | undefined;
   held: boolean;
   nowMs: number;
+  anyFailure?: boolean;
 }): TokenResolutionReceipt | undefined {
-  if (!isTransientTokenResolutionError(input.error)) return undefined;
+  if (!input.anyFailure && !isTransientTokenResolutionError(input.error)) return undefined;
   if (input.storeGeneration === undefined || input.sourceFingerprint === undefined) return undefined;
   const receipt = input.receipt;
   if (receipt === undefined) return undefined;
@@ -1988,7 +2026,7 @@ function removeStaleTokenStoreLock(lockPath: string): boolean {
   return true;
 }
 
-function acquireTokenStoreLock(lockPath: string, wait = true): void {
+function acquireTokenStoreLock(lockPath: string, wait = true, onBusy: "die" | "defer" = "die"): void {
   fs.mkdirSync(path.dirname(lockPath), { recursive: true, mode: 0o700 });
   // Resolved once, before any mkdir, and never inside the acquisition window.
   // On macOS this spawns `sysctl`; between our mkdir and the pid write that
@@ -2005,6 +2043,7 @@ function acquireTokenStoreLock(lockPath: string, wait = true): void {
       if (!(error instanceof Error) || !("code" in error) || error.code !== "EEXIST") throw error;
       if (removeStaleTokenStoreLock(lockPath)) continue;
       if (Date.now() >= deadline) {
+        if (onBusy === "defer") throw new TokenSyncDeferredError("another runfree command holds the token store lock");
         die(`timed out waiting for the token store lock; another runfree command is syncing tokens for this project (lock: ${lockPath})`);
       }
       sleepSyncMs(100);
@@ -2022,7 +2061,7 @@ function acquireTokenStoreLock(lockPath: string, wait = true): void {
   }
 }
 
-export function withTokenStoreLock<T>(action: () => T, options: { wait?: boolean } = {}): T {
+export function withTokenStoreLock<T>(action: () => T, options: { wait?: boolean; onBusy?: "die" | "defer" } = {}): T {
   const lockPath = tokenStoreLockPath();
   const depth = heldTokenStoreLockDepths.get(lockPath) ?? 0;
   if (depth > 0) {
@@ -2033,7 +2072,7 @@ export function withTokenStoreLock<T>(action: () => T, options: { wait?: boolean
       heldTokenStoreLockDepths.set(lockPath, depth);
     }
   }
-  acquireTokenStoreLock(lockPath, options.wait);
+  acquireTokenStoreLock(lockPath, options.wait, options.onBusy);
   heldTokenStoreLockDepths.set(lockPath, 1);
   try {
     return action();
@@ -2206,13 +2245,21 @@ type TokenSyncResult = {
 };
 
 export function syncTokens(options: TokenSyncOptions = {}): TokenSyncResult {
-  const effective = assertEffectiveControlConvergedBeforeCredentialResolution();
+  if (options.preparedOnly && options.mode !== "convergence") {
+    throw new Error("a prepared-only token sync is receipt-gated convergence");
+  }
+  const effective = assertEffectiveControlConvergedBeforeCredentialResolution({
+    onBusy: options.preparedOnly ? "defer" : "die",
+  });
   try {
     const policy = effective
       ? validateNetworkPolicy(effective.policy, effective.networkPolicyPath)
       : loadPolicy();
     ensureStateDirs();
-    return withTokenStoreLock(() => syncTokensUnderLock(options, policy, effective));
+    return withTokenStoreLock(
+      () => syncTokensUnderLock(options, policy, effective),
+      options.preparedOnly ? { wait: false, onBusy: "defer" } : {},
+    );
   } finally {
     effective?.lock.release();
   }
@@ -2228,17 +2275,74 @@ type EffectiveCredentialSnapshot = {
 
 class EffectiveControlSelectionChanged extends Error {}
 
+/**
+ * One prepared credential. `skipped` is a receipt-gated warm launch's decision
+ * not to re-read a source whose value the proxy provably holds (launch plan
+ * D4): it carries no value, so nothing can ever write one from it, and a sync
+ * that finds such a token due defers instead of resolving it.
+ */
+type PreparedTokenSourceEntry =
+  | Readonly<{ kind: "resolved"; fingerprint: string; value: string }>
+  | Readonly<{ kind: "skipped"; fingerprint: string }>;
+
 const preparedRuntimeTokenSources = new Map<string, {
   controlGeneration: string;
   preparedAt: number;
   admittedAt?: number;
   tokenConfigPath: string;
   sourceConfigPath: string;
-  values: Map<string, { fingerprint: string; value: string }>;
+  values: Map<string, PreparedTokenSourceEntry>;
 }>();
 
+export type RuntimeTokenSourcePreparationMode = "source-truth" | "convergence";
+
+/**
+ * The tokens a receipt-gated warm launch may skip re-reading: a current
+ * receipt (same source fingerprint, same live store generation), a value the
+ * proxy provably holds, a source read younger than the warm bound, and a
+ * refresh interval that is not due. Any observation failure skips nothing.
+ */
+function warmSkippableTokens(
+  policy: LoadedNetworkPolicy,
+  config: TokenSourceConfig,
+  registry: SourceRegistry | undefined,
+): ReadonlySet<string> {
+  const skippable = new Set<string>();
+  let runtime: ProxyRuntime;
+  try {
+    runtime = proxyRuntime();
+  } catch {
+    return skippable;
+  }
+  if (runtime.state !== "ready" || !runtime.id || !runtime.storeGeneration) return skippable;
+  const held = listProxyRuntimeTokens(runtime.id);
+  if (!held) return skippable;
+  const receipts = loadPersistedTokenReceipts();
+  const now = Date.now();
+  for (const name of Object.keys(policy.tokens)) {
+    const source = config[name];
+    const receipt = receipts.get(name);
+    if (!source || !receipt || !held.has(name)) continue;
+    const sourceRegistry = source.source === "named" ? registry : undefined;
+    let fingerprint: string;
+    let refresh: EffectiveTokenRefresh;
+    try {
+      fingerprint = tokenSourceFingerprint(source, sourceRegistry);
+      refresh = effectiveTokenRefresh(source, sourceRegistry);
+    } catch {
+      continue;
+    }
+    if (receipt.sourceFingerprint !== fingerprint || receipt.proxyStoreGeneration !== runtime.storeGeneration) continue;
+    const age = now - receipt.resolvedAt;
+    if (age < 0 || age >= WARM_TOKEN_SOURCE_READ_MAX_AGE_MS) continue;
+    if (refresh.mode !== "manual" && age >= refresh.seconds * 1000) continue;
+    skippable.add(name);
+  }
+  return skippable;
+}
+
 /** Host-only memory. Resolve prompts before proxy disruption; never stage token files. */
-export function prepareRuntimeTokenSources(): void {
+export function prepareRuntimeTokenSources(options: Readonly<{ mode?: RuntimeTokenSourcePreparationMode }> = {}): void {
   const project = currentAdminState().runtimeContext?.project ?? adminProjectInfo();
   preparedRuntimeTokenSources.delete(project.paths.stateDir);
   const active = readActiveEffectiveControl(project);
@@ -2246,7 +2350,8 @@ export function prepareRuntimeTokenSources(): void {
   const policy = validateNetworkPolicy(active.policy, active.networkPolicyPath);
   const config = loadTokenConfig();
   const registry = Object.values(config).some((source) => source.source === "named") ? loadSourceRegistry() : undefined;
-  const values = new Map<string, { fingerprint: string; value: string }>();
+  const skippable = options.mode === "convergence" ? warmSkippableTokens(policy, config, registry) : new Set<string>();
+  const values = new Map<string, PreparedTokenSourceEntry>();
   for (const [name, tokenPolicy] of Object.entries(policy.tokens)) {
     const source = config[name];
     if (!source) {
@@ -2254,8 +2359,10 @@ export function prepareRuntimeTokenSources(): void {
       throw new Error(missingRequiredTokenSourceMessage(name));
     }
     const sourceRegistry = source.source === "named" ? registry : undefined;
-    values.set(name, { fingerprint: tokenSourceFingerprint(source, sourceRegistry),
-      value: resolveTokenSource(name, source, { quiet: true, sourceRegistry }) });
+    const fingerprint = tokenSourceFingerprint(source, sourceRegistry);
+    values.set(name, skippable.has(name)
+      ? { kind: "skipped", fingerprint }
+      : { kind: "resolved", fingerprint, value: resolveTokenSource(name, source, { quiet: true, sourceRegistry }) });
   }
   if (readActiveControlSelection(project)?.controlGeneration !== active.controlGeneration) {
     throw new EffectiveControlSelectionChanged("effective policy changed during credential preparation; retry before proxy disruption");
@@ -2311,20 +2418,61 @@ export function clearPreparedRuntimeTokenSources(project: ProjectInfo): void {
   preparedRuntimeTokenSources.delete(project.paths.stateDir);
 }
 
-function resolvePreparedRuntimeTokenSource(name: string, source: TokenSource, options: TokenResolutionOptions): string {
+/** The current prepared entry for one token, checked for binding and age; undefined without a preparation. */
+function currentPreparedRuntimeTokenSource(
+  name: string,
+  source: TokenSource,
+  options: TokenResolutionOptions,
+): PreparedTokenSourceEntry | undefined {
   const project = currentAdminState().runtimeContext?.project ?? adminProjectInfo();
   const prepared = preparedRuntimeTokenSources.get(project.paths.stateDir);
-  if (!prepared) return resolveTokenSource(name, source, options);
+  if (!prepared) return undefined;
   const entry = prepared.values.get(name);
   if (!entry || entry.fingerprint !== tokenSourceFingerprint(source, options.sourceRegistry)
     || readActiveControlSelection(project as ProjectInfo)?.controlGeneration !== prepared.controlGeneration
     || Date.now() < (prepared.admittedAt ?? prepared.preparedAt) || Date.now() - (prepared.admittedAt ?? prepared.preparedAt) >= 120_000) {
     throw new EffectiveControlSelectionChanged("prepared credential inputs changed or expired; rerun runtime recovery to resolve them before disruption");
   }
+  return entry;
+}
+
+function resolvePreparedRuntimeTokenSource(name: string, source: TokenSource, options: TokenResolutionOptions): string {
+  const entry = currentPreparedRuntimeTokenSource(name, source, options);
+  if (!entry) return resolveTokenSource(name, source, options);
+  // A skipped entry holds no value by construction. A due token reaching here
+  // with one is a preparation that disagrees with the sync; refuse rather than
+  // resolve a source now.
+  if (entry.kind !== "resolved") {
+    throw new EffectiveControlSelectionChanged("a prepared credential was skipped but is due; resolve current sources and retry");
+  }
   return entry.value;
 }
 
-function assertEffectiveControlConvergedBeforeCredentialResolution(): EffectiveCredentialSnapshot | undefined {
+/** What the current preparation decided for one token, if there is one. */
+function preparedTokenEntryKind(name: string): PreparedTokenSourceEntry["kind"] | undefined {
+  const project = currentAdminState().runtimeContext?.project ?? adminProjectInfo();
+  return preparedRuntimeTokenSources.get(project.paths.stateDir)?.values.get(name)?.kind;
+}
+
+/**
+ * Throws the deferral before any effect when a prepared-only sync would have
+ * to resolve a source: no prepared set, or a due token whose preparation was
+ * skipped.
+ */
+function assertPreparedOnlyCovers(dueTokenNames: readonly string[]): void {
+  const project = currentAdminState().runtimeContext?.project ?? adminProjectInfo();
+  const prepared = preparedRuntimeTokenSources.get(project.paths.stateDir);
+  if (!prepared) throw new TokenSyncDeferredError("no prepared credential set for a prepared-only sync");
+  for (const name of dueTokenNames) {
+    if (prepared.values.get(name)?.kind !== "resolved") {
+      throw new TokenSyncDeferredError(`${name} is due and its source was not read before the lock`);
+    }
+  }
+}
+
+function assertEffectiveControlConvergedBeforeCredentialResolution(
+  options: Readonly<{ onBusy: "die" | "defer" }> = { onBusy: "die" },
+): EffectiveCredentialSnapshot | undefined {
   if (currentAdminState().policyAccess !== "effective-read-only") return undefined;
   const discovered = projectInfo(projectRoot(), childEnv());
   const project: ProjectInfo = {
@@ -2336,7 +2484,12 @@ function assertEffectiveControlConvergedBeforeCredentialResolution(): EffectiveC
     },
   };
   const lock = tryAcquireControlLock(project, childEnv());
-  if (!lock) die("credential resolution cannot start while another control operation is in progress");
+  if (!lock) {
+    if (options.onBusy === "defer") {
+      throw new TokenSyncDeferredError("another control operation holds the control lock");
+    }
+    die("credential resolution cannot start while another control operation is in progress");
+  }
   try {
     const active = readActiveControlSelection(project);
     const converged = readConvergedPolicyReceipt(project);
@@ -2462,6 +2615,13 @@ function syncTokensUnderLock(
     return result("proxy-unreachable");
   };
 
+  // A prepared-only sync never acts on a runtime it cannot write to exactly:
+  // anything but a ready proxy defers before any effect, including the
+  // validation-required wipe below.
+  if (options.preparedOnly && (runtime.state !== "ready" || !runtime.id || !runtime.storeGeneration)) {
+    throw new TokenSyncDeferredError(`proxy runtime is ${runtime.state}`);
+  }
+
   // A transient docker-exec failure (validation marker, StartedAt) means the
   // store generation cannot be determined for an unchanged container. Fail the
   // run: report, delete nothing, resolve nothing, write no receipts.
@@ -2478,6 +2638,7 @@ function syncTokensUnderLock(
   if (runtime.state === "ready" && runtime.id) {
     heldTokens = listProxyRuntimeTokens(runtime.id);
     if (heldTokens === undefined) {
+      if (options.preparedOnly) throw new TokenSyncDeferredError("the proxy's held-token listing is unavailable");
       return reportRunUnreachable();
     }
   }
@@ -2518,6 +2679,7 @@ function syncTokensUnderLock(
   try {
     config = loadTokenConfig();
   } catch (error) {
+    if (options.preparedOnly) throw new TokenSyncDeferredError("the credential source config is unreadable");
     // Project-reachable parse/validation failure: unconditional fail-closed
     // delete (never keep-last-good), and every removal retracts its receipt.
     options.sourceSecretCache?.jwtPrivateKeys.clear();
@@ -2566,11 +2728,36 @@ function syncTokensUnderLock(
       persistedReceipts: Array.from(persistedReceipts.values()),
     });
   }
+  if (options.preparedOnly) {
+    if (sourceRegistryError) throw new TokenSyncDeferredError("the source registry is unreadable");
+    // The whole due set is decided before the first effect, so a deferral can
+    // never land after a write or a removal this run already made.
+    const dueTokenNames: string[] = [];
+    for (const [tokenName] of Object.entries(policy.tokens)) {
+      const source = config[tokenName];
+      if (!source) continue;
+      const registryForSource = source.source === "named" ? sourceRegistry : undefined;
+      const due = tokenDueDecision({
+        heldTokens,
+        ledger,
+        nowMs: syncNowMs,
+        proxyStoreGeneration: runtime.storeGeneration,
+        refresh: effectiveTokenRefresh(source, registryForSource),
+        source,
+        sourceRegistry: registryForSource,
+        tokenName,
+      });
+      if (due.due && preparedTokenEntryKind(tokenName) !== "resolved") dueTokenNames.push(tokenName);
+    }
+    assertPreparedOnlyCovers(dueTokenNames);
+  }
   const prepared = preparedRuntimeTokenSources.get(stateDir());
   if (prepared) {
     if (sourceRegistryError) throw new EffectiveControlSelectionChanged("prepared source registry changed; restore its metadata before retrying sync");
     const expectedNames = assertPreparedTokenSourceInputs(prepared, policy, config, sourceRegistry);
-    for (const name of expectedNames) resolvePreparedRuntimeTokenSource(name, config[name], { quiet: true, sourceRegistry: config[name].source === "named" ? sourceRegistry : undefined });
+    // Binding and age are checked for every prepared entry, skipped ones too;
+    // only a due token ever reads a value (in the loop below).
+    for (const name of expectedNames) currentPreparedRuntimeTokenSource(name, config[name], { quiet: true, sourceRegistry: config[name].source === "named" ? sourceRegistry : undefined });
   }
   const retryDelayMs = sourceRegistryError === undefined ? tokenRetryDelayMs(config, sourceRegistry) : 60_000;
   // Fences sit before each side-effect phase: the removal below, source
@@ -2608,16 +2795,37 @@ function syncTokensUnderLock(
       const registryForSource = source.source === "named" ? sourceRegistry : undefined;
       const refresh = effectiveTokenRefresh(source, registryForSource);
       assertRefreshBeforeJwtExpiry(refresh);
-      const due = tokenDueDecision({
-        heldTokens,
-        ledger,
-        nowMs: syncNowMs,
-        proxyStoreGeneration: runtime.storeGeneration,
-        refresh,
-        source,
-        sourceRegistry: registryForSource,
-        tokenName,
-      });
+      // A value the preparation re-read from its source is always written: the
+      // warm bound (and a stale receipt) are why it was re-read at all.
+      const forced = (options.mode === "source-truth" && options.resolutionLedger !== undefined)
+        || (options.preparedOnly === true && preparedTokenEntryKind(tokenName) === "resolved");
+      const due: TokenDueDecision = forced
+        // An explicit source-truth pass with a long-lived ledger (the watcher's
+        // first pass after a receipt-gated launch): every token is due, and the
+        // ledger still records what was resolved for the passes after it.
+        ? {
+            due: true,
+            reason: options.preparedOnly ? "re-read before the lock" : "source-truth pass",
+            ...(runtime.storeGeneration
+              ? (() => {
+                  const sourceFingerprint = tokenSourceFingerprint(source, registryForSource);
+                  return {
+                    key: tokenResolutionLedgerKey(tokenName, sourceFingerprint, runtime.storeGeneration),
+                    sourceFingerprint,
+                  };
+                })()
+              : {}),
+          }
+        : tokenDueDecision({
+            heldTokens,
+            ledger,
+            nowMs: syncNowMs,
+            proxyStoreGeneration: runtime.storeGeneration,
+            refresh,
+            source,
+            sourceRegistry: registryForSource,
+            tokenName,
+          });
       if (!due.due) {
         adminVerbose(options, `${tokenName}: skipped (${due.reason})`);
         continue;
@@ -2681,7 +2889,17 @@ function syncTokensUnderLock(
         storeGeneration: runtime.storeGeneration,
         held: heldTokens?.has(tokenName) === true,
         nowMs: syncNowMs,
+        anyFailure: options.keepLastGoodOnAnyResolutionFailure === true,
       });
+      if (keptReceipt && options.keepLastGoodOnAnyResolutionFailure && ledger && runtime.storeGeneration && failureFingerprint) {
+        // A value kept because this detached pass could not read its source is
+        // not retried by the same detached watcher, whose retry would read it
+        // just as non-interactively and then delete it. It is read again at the
+        // next launch (interactive, before the lock) or when its own refresh
+        // interval falls due — the same exposure a held value had before the
+        // warm path existed.
+        ledger.retryAfterFailureAt.delete(tokenResolutionLedgerKey(tokenName, failureFingerprint, runtime.storeGeneration));
+      }
       if (keptReceipt) {
         const heldValueResolvedAt = new Date(keptReceipt.resolvedAt).toISOString();
         const staleMessage = `${message}; keeping last-good proxy value resolved at ${heldValueResolvedAt} (stale)`;
@@ -2770,7 +2988,17 @@ export type CredentialRemoveInput = { name: string; reloadProxy: boolean };
 export type CredentialSetSourceInput = { name: string; tokenSource: TokenSourceSelection; refreshEvery?: string; replaceSource: boolean; sync: boolean };
 export type CredentialClearSourceInput = { name: string };
 export type CredentialStatusInput = { name?: string };
-export type CredentialSyncInput = { verbose: boolean; watch: boolean; quiet: boolean; delayFirstSync: boolean; cacheSourceSecrets: boolean };
+export type CredentialSyncInput = {
+  verbose: boolean;
+  watch: boolean;
+  quiet: boolean;
+  delayFirstSync: boolean;
+  cacheSourceSecrets: boolean;
+  /** Watch only: re-read every source once before the first wait (launch plan D4). */
+  initialSourceTruth?: boolean;
+  /** One-shot only, in-process startup: the receipt-gated warm-launch sync. */
+  mode?: "startup-convergence";
+};
 
 // --- Source: typed intents + enforcement ------------------------------------
 

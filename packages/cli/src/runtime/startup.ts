@@ -155,6 +155,7 @@ import {
   type PreparedRuntime,
 } from "./prepared-runtime.ts";
 import { createRuntimeTimings, type RuntimeTimings } from "./timings.ts";
+import { TOKEN_SYNC_DEFERRED_STATUS } from "./constants.ts";
 import { imageCleanupStampMatches, writeImageCleanupStamp } from "./image-cleanup-stamp.ts";
 import { createOperationHistogram, withOperationHistogram } from "./operation-histogram.ts";
 import { remedy } from "../remedies.ts";
@@ -177,6 +178,13 @@ export type RuntimeStartResult =
   // tmpfs. Callers use this to skip a redundant policy reload.
       proxyRecreated?: boolean;
       tokenResolutionReceipts?: TokenResolutionReceipt[];
+      /**
+       * `receipt-gated`: this launch reused proxy-held credentials without
+       * re-reading their sources (launch plan D4); the auto-refresh watcher
+       * owes one immediate source-truth pass. `source-truth` (or absent):
+       * every source was read before the launch.
+       */
+      credentialFreshness?: "source-truth" | "receipt-gated";
     }
   | {
       kind: "failed";
@@ -222,9 +230,32 @@ function reportRuntimeVerbose(verbose: boolean | undefined, message: string): vo
 async function syncProxyManagedTokens(
   admin: (intent: RuntimeAdminIntent) => Promise<number>,
   verbose?: boolean,
+  mode?: "startup-convergence",
 ): Promise<number> {
   reportRuntimeProgress("syncing proxy-managed tokens", verbose);
-  return admin({ kind: "token-sync", verbose: Boolean(verbose) });
+  return admin({ kind: "token-sync", verbose: Boolean(verbose), ...(mode ? { mode } : {}) });
+}
+
+/**
+ * The warm-launch credential sync (launch plan D4, sub-second launch plan
+ * Task 5): receipt-gated, resolving no source. When it defers — a due token
+ * the preparation did not re-read, a busy control or token-store lock, a
+ * runtime that is not ready — nothing was written or removed, so the full
+ * source-truth order runs instead: every source is read again (prompts
+ * allowed), then synced.
+ */
+async function syncWarmLaunchTokens(input: Readonly<{
+  context: RuntimeContext;
+  io: RuntimeIO;
+  verbose?: boolean;
+  timings: RuntimeTimings;
+}>): Promise<Readonly<{ status: number; freshness: "source-truth" | "receipt-gated" }>> {
+  const admin = (intent: RuntimeAdminIntent) => input.io.admin(intent, input.context);
+  const gated = await syncProxyManagedTokens(admin, input.verbose, "startup-convergence");
+  if (gated !== TOKEN_SYNC_DEFERRED_STATUS) return { status: gated, freshness: "receipt-gated" };
+  input.timings.report("token-sync", "deferred source-truth");
+  await input.io.prepareTokenSources?.(input.context);
+  return { status: await syncProxyManagedTokens(admin, input.verbose), freshness: "source-truth" };
 }
 
 async function finalizeValidatedRuntime(
@@ -235,6 +266,7 @@ async function finalizeValidatedRuntime(
   proxyRecreated = false,
   lifecycleLock?: ProjectLifecycleLock,
   withCredentialResolution: (work: () => Promise<number>) => Promise<number> = (work) => work(),
+  credentialMode: "source-truth" | "receipt-gated" = "source-truth",
 ): Promise<RuntimeStartResult> {
   const context = runtimeContextFromActivePlan(plan);
   const activeContext = { ...context, validatedRuntime: proof };
@@ -298,9 +330,17 @@ async function finalizeValidatedRuntime(
     warn(error instanceof Error ? error.message : String(error));
     return { kind: "failed", fastPath: false, status: 1 };
   }
+  let credentialFreshness: "source-truth" | "receipt-gated" = "source-truth";
   const tokenSync = await timings.timeAsync(
     "token-sync",
-    () => withCredentialResolution(() => syncProxyManagedTokens((intent) => io.admin(intent, activeContext), verbose)),
+    () => withCredentialResolution(async () => {
+      if (credentialMode !== "receipt-gated") {
+        return await syncProxyManagedTokens((intent) => io.admin(intent, activeContext), verbose);
+      }
+      const warm = await syncWarmLaunchTokens({ context: activeContext, io, verbose, timings });
+      credentialFreshness = warm.freshness;
+      return warm.status;
+    }),
   );
   const tokenResolutionReceipts = tokenSync === 0 ? io.takeTokenResolutionReceipts?.() ?? [] : [];
   if (tokenSync === 0) reportRuntimeProgress("runtime startup complete", verbose);
@@ -311,6 +351,7 @@ async function finalizeValidatedRuntime(
     proxyRecreated,
     status: 0,
     tokenResolutionReceipts,
+    credentialFreshness,
   } : { kind: "failed", fastPath: false, status: tokenSync };
 }
 
@@ -1254,7 +1295,15 @@ export async function startRuntime(
     const pendingPreparedRebind = readControlPlaneRebindTransaction(preparedPlan.paths.stateDir,
       { projectId: preparedPlan.projectId, composeProject: preparedPlan.composeProjectName });
     if (pendingPreparedRebind) activePlan = materializeRetainedRebindRuntimePlan(activePlan, pendingPreparedRebind.candidateMaterialization, adapters.docker);
-    await io.prepareTokenSources?.(runtimeContextFromActivePlan(activePlan));
+    // Launch plan D4: a warm launch re-reads only the sources whose held value
+    // is not provably current (receipt, live store generation, held file,
+    // warm age bound); `up`, a cold start, and a proxy change read them all.
+    const receiptGatedCredentials = rebuildOptions.launch === true
+      && (upgradePlan.action === "token-sync" || upgradePlan.action === "component-select");
+    await io.prepareTokenSources?.(
+      runtimeContextFromActivePlan(activePlan),
+      receiptGatedCredentials ? { mode: "convergence" } : undefined,
+    );
     // Capture and compare under the lock. This pair detects a *change during
     // preparation*; it is not the mismatch gate. Once the reader returns a
     // value instead of throwing, a persistent mismatch compares equal to itself
@@ -1439,14 +1488,16 @@ export async function startRuntime(
       if (listSessionContainerRecordsV2(activePlan.paths.stateDir, { projectId: activePlan.projectId, composeProject: project }).length) {
         await restoreSameProxySessionAdmission({ plan: activePlan, io, lifecycleLock: heldLifecycleLock, proxyId: runtimeProof.proxyId, validation });
       }
+      const proxyRecreated = proxyRecreatedSinceStart(adapters.docker);
       return finalizeValidatedRuntime(
         selectedPlan,
         io,
         runtimeProof,
         verbose,
-        proxyRecreatedSinceStart(adapters.docker),
+        proxyRecreated,
         heldLifecycleLock,
         async (work) => { heldLifecycleLock.release(); return await work(); },
+        receiptGatedCredentials && !proxyRecreated ? "receipt-gated" : "source-truth",
       );
     };
     if (upgradePlan.action === "component-select" && runningWarmRuntime(activeContext, adapters.docker)) {

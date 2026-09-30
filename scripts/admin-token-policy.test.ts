@@ -46,6 +46,8 @@ import {
   credentialSyncIntent,
   credentialClearSourceIntent,
 } from "../packages/cli/src/admin/options.ts";
+import { prepareRuntimeTokenSources } from "../packages/cli/src/admin/admin-core.ts";
+import { TOKEN_SYNC_DEFERRED_STATUS } from "../packages/cli/src/runtime/constants.ts";
 import { flushWarnings } from "../packages/cli/src/warnings.ts";
 import { cliEntryArgv } from "../tests/support/prebuilt-entry.ts";
 
@@ -342,6 +344,27 @@ function ensureSelectedEffectiveControls(): void {
   } finally {
     if (original === undefined) fs.rmSync(policyPath, { force: true });
     else fs.writeFileSync(policyPath, original);
+  }
+}
+
+// Launch preparation reads the *selected effective* policy (never the project
+// file), so the D4 tests select one compiled from the test's own policy
+// fixture, which the admin sync then agrees with.
+function selectEffectiveControlsFromProjectPolicy(): void {
+  const project = adminProjectInfoForTokenSync();
+  const policyPath = project.paths.policyPath;
+  const original = fs.readFileSync(policyPath, "utf8");
+  // The admin fixtures predate desired-policy v2; the effective generation is
+  // compiled from the same hosts and tokens with the version stamp added.
+  fs.writeFileSync(policyPath, `${JSON.stringify({ version: 2, ...JSON.parse(original) }, null, 2)}\n`);
+  try {
+    const candidate = captureDesiredPolicyCandidate(tmp, project.paths.controlCandidatesDir);
+    approveNetworkCandidate(tmp, project, candidate, "network-project", "interactive");
+    approveNetworkCandidate(tmp, project, candidate, "network-local", "interactive");
+    approveRuntimeIsolationControl(tmp, project, "interactive");
+    publishEffectivePolicyGeneration(tmp, project);
+  } finally {
+    fs.writeFileSync(policyPath, original);
   }
 }
 
@@ -3217,6 +3240,223 @@ describe("convergent proxy token store", () => {
     expect(explicit.status).toBe(1);
     expect(readJsonLines(opLogPath)).toHaveLength(2);
     expect(tokenRemovalCount(fakeDocker.dockerLog)).toBe(1);
+  });
+
+  describe("receipt-gated warm launch (launch plan D4, sub-second launch plan Task 5)", () => {
+    const warmSync = { ...syncInput, mode: "startup-convergence" as const };
+
+    function tokenWrites(logPath: string): number {
+      return dockerExecCalls(logPath).filter((entry) => entry.stdin === "ghp_secret" || entry.stdin === "ghp_rotated").length;
+    }
+
+    async function populate(fakeDocker: { dockerLog: string; fakeBin: string }, hostOpBin: string): Promise<void> {
+      selectEffectiveControlsFromProjectPolicy();
+      const populated = await runAdmin(() => credentialSyncIntent(syncInput), opEnv(fakeDocker, hostOpBin));
+      expect(populated.status, populated.stderr).toBe(0);
+      expect(readReceiptsFile().map((receipt) => receipt.tokenName)).toEqual(["github"]);
+    }
+
+    test("a current receipt for a held value: no source read and no token write", async () => {
+      writeGithubOnePasswordFixture();
+      const fakeDocker = installTokenSyncDockerFake();
+      const hostOpBin = makeHostOpBin();
+      const opLogPath = path.join(tmpBase, `warm-op-${Math.random().toString(16).slice(2)}.jsonl`);
+      installFakeOp(hostOpBin, { logPath: opLogPath, output: "ghp_secret\n" });
+      await populate(fakeDocker, hostOpBin);
+      const writesBefore = tokenWrites(fakeDocker.dockerLog);
+
+      const warm = await runAdmin(async () => {
+        prepareRuntimeTokenSources({ mode: "convergence" });
+        await credentialSyncIntent(warmSync);
+      }, opEnv(fakeDocker, hostOpBin));
+
+      expect(warm.status, warm.stderr).toBe(0);
+      expect(readJsonLines(opLogPath)).toHaveLength(1);
+      expect(tokenWrites(fakeDocker.dockerLog)).toBe(writesBefore);
+      expect(tokenRemovalCount(fakeDocker.dockerLog)).toBe(0);
+    });
+
+    test("a source read older than the warm bound is re-read before the lock and written", async () => {
+      writeGithubOnePasswordFixture();
+      const fakeDocker = installTokenSyncDockerFake();
+      const hostOpBin = makeHostOpBin();
+      const opLogPath = path.join(tmpBase, `warm-old-op-${Math.random().toString(16).slice(2)}.jsonl`);
+      installFakeOp(hostOpBin, { logPath: opLogPath, output: "ghp_secret\n" });
+      await populate(fakeDocker, hostOpBin);
+      const [receipt] = readReceiptsFile();
+      fs.writeFileSync(receiptsFilePath(), `${JSON.stringify({
+        schemaVersion: 1,
+        receipts: [{ ...receipt, resolvedAt: Date.now() - 16 * 60 * 1000 }],
+      })}\n`);
+      installFakeOp(hostOpBin, { logPath: opLogPath, output: "ghp_rotated\n" });
+      const writesBefore = tokenWrites(fakeDocker.dockerLog);
+
+      const warm = await runAdmin(async () => {
+        prepareRuntimeTokenSources({ mode: "convergence" });
+        await credentialSyncIntent(warmSync);
+      }, opEnv(fakeDocker, hostOpBin));
+
+      expect(warm.status, warm.stderr).toBe(0);
+      expect(readJsonLines(opLogPath)).toHaveLength(2);
+      // The re-read value is written even though the ledger would call a
+      // manual token populated: the warm bound is why it was re-read.
+      expect(tokenWrites(fakeDocker.dockerLog)).toBe(writesBefore + 1);
+      expect(dockerExecCalls(fakeDocker.dockerLog).map((entry) => entry.stdin)).toContain("ghp_rotated");
+    });
+
+    test("a changed source fingerprint is re-read before the lock and written", async () => {
+      writeGithubOnePasswordFixture();
+      const fakeDocker = installTokenSyncDockerFake();
+      const hostOpBin = makeHostOpBin();
+      const opLogPath = path.join(tmpBase, `warm-fp-op-${Math.random().toString(16).slice(2)}.jsonl`);
+      installFakeOp(hostOpBin, { logPath: opLogPath, output: "ghp_secret\n" });
+      await populate(fakeDocker, hostOpBin);
+      writeTokenConfig({ github: { source: "1password", ref: "op://Private/GitHub/rotated" } });
+      const writesBefore = tokenWrites(fakeDocker.dockerLog);
+
+      const warm = await runAdmin(async () => {
+        prepareRuntimeTokenSources({ mode: "convergence" });
+        await credentialSyncIntent(warmSync);
+      }, opEnv(fakeDocker, hostOpBin));
+
+      expect(warm.status, warm.stderr).toBe(0);
+      expect(readJsonLines(opLogPath).at(-1)).toEqual({ args: ["read", "op://Private/GitHub/rotated"] });
+      expect(tokenWrites(fakeDocker.dockerLog)).toBe(writesBefore + 1);
+    });
+
+    test("a due token the preparation skipped defers before any source read, write, or removal", async () => {
+      writeGithubOnePasswordFixture();
+      const fakeDocker = installTokenSyncDockerFake();
+      const hostOpBin = makeHostOpBin();
+      const opLogPath = path.join(tmpBase, `warm-defer-op-${Math.random().toString(16).slice(2)}.jsonl`);
+      installFakeOp(hostOpBin, { logPath: opLogPath, output: "ghp_secret\n" });
+      await populate(fakeDocker, hostOpBin);
+      const execsBefore = dockerExecCalls(fakeDocker.dockerLog).length;
+
+      const deferred = await runAdmin(async () => {
+        prepareRuntimeTokenSources({ mode: "convergence" });
+        // Between preparation and the locked sync the receipt disappears, so
+        // the sync finds the token due with no value it may write.
+        fs.rmSync(receiptsFilePath());
+        await credentialSyncIntent(warmSync);
+      }, opEnv(fakeDocker, hostOpBin));
+
+      expect(deferred.status).toBe(TOKEN_SYNC_DEFERRED_STATUS);
+      expect(readJsonLines(opLogPath)).toHaveLength(1);
+      const execsAfter = dockerExecCalls(fakeDocker.dockerLog).slice(execsBefore);
+      expect(execsAfter.filter((entry) => entry.stdin !== "")).toEqual([]);
+      expect(tokenRemovalCount(fakeDocker.dockerLog)).toBe(0);
+    });
+
+    test("a prepared-only sync with no preparation defers instead of resolving", async () => {
+      writeGithubOnePasswordFixture();
+      const fakeDocker = installTokenSyncDockerFake();
+      const hostOpBin = makeHostOpBin();
+      const opLogPath = path.join(tmpBase, `warm-noprep-op-${Math.random().toString(16).slice(2)}.jsonl`);
+      installFakeOp(hostOpBin, { logPath: opLogPath, output: "ghp_secret\n" });
+      selectEffectiveControlsFromProjectPolicy();
+
+      const deferred = await runAdmin(() => credentialSyncIntent(warmSync), opEnv(fakeDocker, hostOpBin));
+
+      expect(deferred.status).toBe(TOKEN_SYNC_DEFERRED_STATUS);
+      expect(readJsonLines(opLogPath)).toHaveLength(0);
+      expect(tokenWrites(fakeDocker.dockerLog)).toBe(0);
+    });
+
+    test("a busy token-store lock defers at once instead of waiting under the lifecycle lock", async () => {
+      writeGithubOnePasswordFixture();
+      const fakeDocker = installTokenSyncDockerFake();
+      const hostOpBin = makeHostOpBin();
+      installFakeOp(hostOpBin, { output: "ghp_secret\n" });
+      await populate(fakeDocker, hostOpBin);
+      const lockPath = path.join(adminStateDir(), `token-store-sync-${projectHash(tmp)}.lock`);
+      const holder = childProcess.spawn(process.execPath, ["-e", "setTimeout(() => {}, 30000)"], { stdio: "ignore" });
+      try {
+        fs.mkdirSync(lockPath, { recursive: true });
+        fs.writeFileSync(path.join(lockPath, "pid"), `${holder.pid}\n`);
+        const startedAt = Date.now();
+        const deferred = await runAdmin(async () => {
+          prepareRuntimeTokenSources({ mode: "convergence" });
+          await credentialSyncIntent(warmSync);
+        }, { ...opEnv(fakeDocker, hostOpBin), RUNFREE_TEST_TOKEN_STORE_LOCK_WAIT_MS: "5000" });
+        expect(deferred.status).toBe(TOKEN_SYNC_DEFERRED_STATUS);
+        expect(Date.now() - startedAt).toBeLessThan(4_000);
+        expect(tokenRemovalCount(fakeDocker.dockerLog)).toBe(0);
+      } finally {
+        holder.kill("SIGKILL");
+        fs.rmSync(lockPath, { recursive: true, force: true });
+      }
+    });
+
+    test("the watcher's first pass after a receipt-gated launch re-reads every source, even with no refresh interval", async () => {
+      writeGithubOnePasswordFixture();
+      const fakeDocker = installTokenSyncDockerFake();
+      const hostOpBin = makeHostOpBin();
+      const opLogPath = path.join(tmpBase, `warm-watch-op-${Math.random().toString(16).slice(2)}.jsonl`);
+      installFakeOp(hostOpBin, { logPath: opLogPath, output: "ghp_secret\n" });
+      await populate(fakeDocker, hostOpBin);
+      installFakeOp(hostOpBin, { logPath: opLogPath, output: "ghp_rotated\n" });
+
+      const watch = await runAdmin(() => credentialSyncIntent({
+        verbose: false,
+        watch: true,
+        quiet: true,
+        delayFirstSync: false,
+        initialSourceTruth: true,
+        cacheSourceSecrets: true,
+      }), {
+        ...opEnv(fakeDocker, hostOpBin),
+        RUNFREE_TEST_TOKEN_SYNC_WATCH_ITERATIONS: "1",
+        RUNFREE_TEST_TOKEN_SYNC_WATCH_SLEEP_MS: "1",
+      });
+
+      expect(watch.status, watch.stderr).toBe(0);
+      // A manual source whose receipt is current is still re-read once, and
+      // the rotated value reaches the proxy.
+      expect(readJsonLines(opLogPath)).toHaveLength(2);
+      expect(dockerExecCalls(fakeDocker.dockerLog).map((entry) => entry.stdin)).toContain("ghp_rotated");
+    });
+
+    test("the watcher's first pass keeps the held value when a source cannot be read without a prompt", async () => {
+      writeGithubOnePasswordFixture();
+      const fakeDocker = installTokenSyncDockerFake();
+      const hostOpBin = makeHostOpBin();
+      installFakeOp(hostOpBin, { output: "ghp_secret\n" });
+      await populate(fakeDocker, hostOpBin);
+      // A definitive failure (the kind an explicit sync deletes on) from a
+      // detached, non-interactive read.
+      installFakeOp(hostOpBin, { exitCode: 1, stderr: 'could not read secret "op://Private/GitHub/token": item not found in vault\n' });
+
+      const watch = await runAdmin(() => credentialSyncIntent({
+        verbose: false,
+        watch: true,
+        quiet: true,
+        delayFirstSync: false,
+        initialSourceTruth: true,
+        cacheSourceSecrets: true,
+      }), {
+        ...opEnv(fakeDocker, hostOpBin),
+        RUNFREE_TEST_TOKEN_SYNC_WATCH_ITERATIONS: "1",
+        RUNFREE_TEST_TOKEN_SYNC_WATCH_SLEEP_MS: "1",
+      });
+
+      expect(watch.status, watch.stderr).toBe(0);
+      expect(tokenRemovalCount(fakeDocker.dockerLog)).toBe(0);
+      expect(readTokenStatus().github).toMatchObject({ ok: false, state: "stale" });
+      expect(readReceiptsFile()).toHaveLength(1);
+    });
+
+    test("an explicit source-truth credential sync still deletes on a definitive failure", async () => {
+      writeGithubOnePasswordFixture();
+      const fakeDocker = installTokenSyncDockerFake();
+      const hostOpBin = makeHostOpBin();
+      installFakeOp(hostOpBin, { output: "ghp_secret\n" });
+      await populate(fakeDocker, hostOpBin);
+      installFakeOp(hostOpBin, { exitCode: 1, stderr: 'could not read secret "op://Private/GitHub/token": item not found in vault\n' });
+      const explicit = await runAdmin(() => credentialSyncIntent(syncInput), opEnv(fakeDocker, hostOpBin));
+      expect(explicit.status).toBe(1);
+      expect(tokenRemovalCount(fakeDocker.dockerLog)).toBe(1);
+    });
   });
 
   test("a resurrected receipt for a value the proxy does not hold is ignored and re-resolved", async () => {

@@ -230,6 +230,12 @@ export function buildTokenAutoRefreshSpawnPlan(input: {
   parentPid: number;
   receipts?: TokenResolutionReceipt[];
   stderrFd?: number;
+  /**
+   * The launch reused saved credentials without re-reading their sources
+   * (launch plan D4): the watcher re-reads every source once, right away,
+   * instead of waiting for the first one to fall due.
+   */
+  initialSourceTruth?: boolean;
 }): TokenAutoRefreshSpawnPlan {
   const receipts = input.receipts ?? [];
   // Build the stdio array once and derive each channel's fd from its slot, so
@@ -259,7 +265,7 @@ export function buildTokenAutoRefreshSpawnPlan(input: {
       "sync",
       "--watch",
       "--quiet",
-      "--delay-first-sync",
+      input.initialSourceTruth ? "--initial-source-truth" : "--delay-first-sync",
     ],
     options: {
       detached: process.platform !== "win32",
@@ -317,7 +323,11 @@ function writeTokenResolutionReceipts(child: childProcess.ChildProcess, plan: To
   stream.end(plan.receiptPayload);
 }
 
-function startTokenAutoRefreshProcess(context: RuntimeContext, receipts: TokenResolutionReceipt[] = []): TokenAutoRefreshHandle {
+function startTokenAutoRefreshProcess(
+  context: RuntimeContext,
+  receipts: TokenResolutionReceipt[] = [],
+  options: Readonly<{ initialSourceTruth?: boolean }> = {},
+): TokenAutoRefreshHandle {
   const stderrFd = openTokenAutoRefreshLog(context);
   const plan = buildTokenAutoRefreshSpawnPlan({
     base: runfreeSelfInvocation(),
@@ -325,6 +335,7 @@ function startTokenAutoRefreshProcess(context: RuntimeContext, receipts: TokenRe
     parentPid: process.pid,
     receipts,
     stderrFd,
+    initialSourceTruth: options.initialSourceTruth === true,
   });
   let child: childProcess.ChildProcess;
   try {
@@ -357,10 +368,17 @@ function startTokenAutoRefreshProcess(context: RuntimeContext, receipts: TokenRe
 async function withTokenAutoRefresh(
   context: RuntimeContext,
   io: RuntimeIO,
-  receipts: TokenResolutionReceipt[] | undefined,
+  credentials: Readonly<{
+    tokenResolutionReceipts?: TokenResolutionReceipt[];
+    credentialFreshness?: "source-truth" | "receipt-gated";
+  }>,
   runSession: () => number | Promise<number>,
 ): Promise<number> {
-  const autoRefresh = io.startTokenAutoRefresh?.(context, receipts) ?? { stop: () => {} };
+  // A receipt-gated launch (launch plan D4) did not re-read its sources, so
+  // the watcher re-reads them once right away instead of waiting.
+  const autoRefresh = io.startTokenAutoRefresh?.(context, credentials.tokenResolutionReceipts, {
+    initialSourceTruth: credentials.credentialFreshness === "receipt-gated",
+  }) ?? { stop: () => {} };
   try {
     return await runSession();
   } finally {
@@ -621,11 +639,10 @@ async function runConfiguredAgent(
   if (runtime.kind === "failed") return runtime.status;
   const activeContext = preparedRuntimeContext(runtime.preparedRuntime);
   const proxyId = preparedRuntimeProxyId(runtime.preparedRuntime);
-  const tokenResolutionReceipts = runtime.tokenResolutionReceipts;
   flushWarnings();
   const sessionStartedAt = new Date().toISOString();
   const status = await withWriteApprovalSession(activeContext, () =>
-    withTokenAutoRefresh(activeContext, io, tokenResolutionReceipts, () => {
+    withTokenAutoRefresh(activeContext, io, runtime, () => {
       // Every foreground launch uses per-session admission. Custom-command
       // refusal and legacy-default normalization live in the session path.
       return launchConfiguredAgentThroughAdmission({
@@ -701,7 +718,7 @@ async function dispatchRuntimeAdmin(intent: RuntimeAdminIntent, context: Runtime
       return;
     }
     case "prepare-token-sources":
-      prepareRuntimeTokenSources();
+      prepareRuntimeTokenSources(intent.mode ? { mode: intent.mode } : {});
       return;
     case "token-sync":
       await credentialSyncIntent({
@@ -710,6 +727,7 @@ async function dispatchRuntimeAdmin(intent: RuntimeAdminIntent, context: Runtime
         quiet: false,
         delayFirstSync: false,
         cacheSourceSecrets: true,
+        ...(intent.mode ? { mode: intent.mode } : {}),
       });
       return;
     case "prepare": {
@@ -817,8 +835,11 @@ function createNodeRuntimeIO(): RuntimeIO {
 // The default host IO. Exported so the typed runtime command modules can invoke
 // the typed runtime cores with the real IO while tests inject their own.
 export const nodeRuntimeIO: RuntimeIO = createNodeRuntimeIO();
-nodeRuntimeIO.prepareTokenSources = async (context) => {
-  const status = await nodeRuntimeIO.admin({ kind: "prepare-token-sources" }, context);
+nodeRuntimeIO.prepareTokenSources = async (context, options = {}) => {
+  const status = await nodeRuntimeIO.admin({
+    kind: "prepare-token-sources",
+    ...(options.mode ? { mode: options.mode } : {}),
+  }, context);
   if (status !== 0) throw new Error("credential sources could not be prepared before proxy disruption; repair them and retry");
 };
 nodeRuntimeIO.admitPreparedTokenSources = (context) => admitPreparedRuntimeTokenSources(context.project);
@@ -1085,7 +1106,7 @@ export async function resumeRecoveryRuntime(
   flushWarnings();
   const sessionStartedAt = new Date().toISOString();
   const status = await withWriteApprovalSession(activeContext, () =>
-    withTokenAutoRefresh(activeContext, io, runtime.tokenResolutionReceipts, async () => {
+    withTokenAutoRefresh(activeContext, io, runtime, async () => {
       try {
         const result = await resumeInterruptedSessionThroughAdmission({
           preparedRuntime: runtime.preparedRuntime,
@@ -1181,7 +1202,7 @@ export async function shellRuntime(context: RuntimeContext, io: RuntimeIO, optio
   const activeContext = preparedRuntimeContext(runtime.preparedRuntime);
   flushWarnings();
   return await withWriteApprovalSession(activeContext, () =>
-    withTokenAutoRefresh(activeContext, io, runtime.tokenResolutionReceipts, () => {
+    withTokenAutoRefresh(activeContext, io, runtime, () => {
       return launchShellThroughAdmission({
         preparedRuntime: runtime.preparedRuntime,
         io,

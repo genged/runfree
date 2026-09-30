@@ -66,6 +66,7 @@ type SyncArgs = {
   watch?: boolean;
   quiet?: boolean;
   "delay-first-sync"?: boolean;
+  "initial-source-truth"?: boolean;
   "no-cache-source-secrets"?: boolean;
 };
 type SourceAddArgs = {
@@ -289,12 +290,18 @@ export const credentialCommand: CommandModule = {
               .option("watch", { type: "boolean", describe: "Keep running and re-sync as sources become due" })
               .option("quiet", { type: "boolean", describe: "Suppress non-error watch output" })
               .option("delay-first-sync", { type: "boolean", describe: "Wait until the first source is due" })
+              .option("initial-source-truth", {
+                type: "boolean",
+                hidden: true,
+                describe: "Re-read every source once before the first wait (internal: launch token auto-refresh)",
+              })
               .option("no-cache-source-secrets", { type: "boolean", describe: "Disable memory-only source-secret caching" }),
             handler((argv: ArgumentsCamelCase<SyncArgs>) => run(() => credentialSyncIntent({
               verbose: Boolean(argv.verbose),
               watch: Boolean(argv.watch),
               quiet: Boolean(argv.quiet),
               delayFirstSync: Boolean(argv["delay-first-sync"]),
+              initialSourceTruth: Boolean(argv["initial-source-truth"]),
               cacheSourceSecrets: !argv["no-cache-source-secrets"],
             }))),
           )

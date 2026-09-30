@@ -1174,6 +1174,21 @@ Supported source types include:
 
 The host CLI records the source and syncs resolved values into proxy-only token state. The proxy strips conflicting inbound credential headers and injects configured headers only for matching hosts and optional path prefixes. OAuth-backed services expose agent-visible handles, while token material remains mediated by the proxy.
 
+`runfree up`, a cold start, and a replaced proxy read every source before the
+lifecycle lock (source-truth). A warm session launch reuses what the proxy
+already holds: it skips re-reading a source only when a host receipt matches
+the source's fingerprint and the live token-store generation, the proxy holds
+the value, the last read is under 15 minutes old, and the source's refresh
+interval is not due. Every other source is read before the lock, as before.
+The locked sync then resolves nothing; if it would have to (a token fell due in
+between, or a lock is busy), it writes and removes nothing and the launch falls
+back to the full source-truth order. The launch's auto-refresh watcher then
+re-reads every source once, right away, so a value rotated at its source
+reaches the proxy seconds after the launch rather than before it. That pass
+runs detached: a source it cannot read keeps the held value (bounded by the
+keep-last-good age) until the next launch reads it interactively; an explicit
+`runfree credential sync` still deletes on a definitive failure.
+
 ## Services
 
 Services are named host bundles. Curated services live in `scripts/services.ts`; user-defined services use `user-*` ids and are stored under the Runfree XDG config root. Credentialless `agent-claude` and `agent-codex` services cover native subscription/login traffic and are distinct from the credential-bearing `anthropic` and `openai` API-key services.

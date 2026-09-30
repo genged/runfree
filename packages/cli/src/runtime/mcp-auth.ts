@@ -138,7 +138,9 @@ export async function mcpAuthRuntime(
   if (runtime.kind === "failed") return runtime.status;
   const activeContext = preparedRuntimeContext(runtime.preparedRuntime);
   flushWarnings();
-  const watcher = io.startTokenAutoRefresh?.(activeContext, runtime.tokenResolutionReceipts) ?? { stop: () => {} };
+  const watcher = io.startTokenAutoRefresh?.(activeContext, runtime.tokenResolutionReceipts, {
+    initialSourceTruth: runtime.credentialFreshness === "receipt-gated",
+  }) ?? { stop: () => {} };
   try {
     // Instruct the operator instead of auto-typing: feeding a reconnect line
     // into the agent's stdin needs a container-side fifo, which is shell syntax

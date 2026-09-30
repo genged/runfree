@@ -52,6 +52,7 @@ import {
   saveTokenStatus,
   seedTokenResolutionLedger,
   syncTokens,
+  TokenSyncDeferredError,
   tokenResolutionLedgerKey,
   type TokenSource,
   tokenSourceFingerprint,
@@ -60,6 +61,7 @@ import {
   tokenSyncWatchNowMs,
   withTokenStoreLock,
 } from "./admin-core.ts";
+import { TOKEN_SYNC_DEFERRED_STATUS } from "../runtime/constants.ts";
 
 function assertKnownCredential(name: string): void {
   const policy = loadPolicy();
@@ -325,7 +327,7 @@ async function sleepUntilNextTokenSync(options: { quiet?: boolean; resolutionLed
   return sleepTokenSyncWatch(delayMs, lifetime);
 }
 
-async function syncTokensWatch(options: { cacheSourceSecrets?: boolean; delayFirstSync?: boolean; quiet?: boolean; verbose?: boolean } = {}): Promise<void> {
+async function syncTokensWatch(options: { cacheSourceSecrets?: boolean; delayFirstSync?: boolean; initialSourceTruth?: boolean; quiet?: boolean; verbose?: boolean } = {}): Promise<void> {
   let iterations = 0;
   const maxIterations = tokenSyncWatchIterationsForTests();
   if (
@@ -341,7 +343,32 @@ async function syncTokensWatch(options: { cacheSourceSecrets?: boolean; delayFir
     : { jwtPrivateKeys: new Map<string, JwtPrivateKeyCacheEntry>() };
   const resolutionLedger = newTokenResolutionLedger(readStartupTokenResolutionReceipts());
   if (!options.quiet) console.log(`source secret cache: ${sourceSecretCache ? "memory-only" : "disabled"}`);
-  if (options.delayFirstSync && !(await sleepUntilNextTokenSync({ ...options, resolutionLedger }, lifetime))) return;
+  if (options.initialSourceTruth) {
+    // The launch reused saved credentials without re-reading their sources
+    // (launch plan D4), so the watcher owes one source-truth pass now — before
+    // the "no refresh intervals" exit below, which would otherwise skip it for
+    // manual sources forever. It runs detached and cannot prompt, so every
+    // resolution failure keeps the held value (bounded), and only config-level
+    // changes delete.
+    let firstPass: TokenSyncRuntimeSnapshot | undefined;
+    try {
+      const sync = syncTokens({
+        exitOnFailure: false,
+        quiet: options.quiet,
+        resolutionLedger,
+        sourceSecretCache,
+        verbose: options.verbose,
+        mode: "source-truth",
+        keepLastGoodOnAnyResolutionFailure: true,
+      });
+      firstPass = { runtimeState: sync.runtimeState, storeGeneration: sync.storeGeneration };
+      const problems = [...sync.failed, ...sync.stale];
+      if (options.quiet && problems.length > 0) console.error(`credential sync watch failed for: ${problems.join(", ")}`);
+    } catch (error) {
+      console.error(`credential sync watch first source-truth pass failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    if (!(await sleepUntilNextTokenSync({ ...options, resolutionLedger }, lifetime, firstPass))) return;
+  } else if (options.delayFirstSync && !(await sleepUntilNextTokenSync({ ...options, resolutionLedger }, lifetime))) return;
   while (true) {
     if (!tokenSyncWatchParentAlive(lifetime)) return;
     // The lock is acquired inside syncTokens per iteration, never for the
@@ -578,10 +605,27 @@ export async function credentialSyncIntent(input: CredentialSyncInput): Promise<
   if (!input.watch && input.quiet) die("--quiet only applies with --watch");
   if (!input.watch && !input.cacheSourceSecrets) die("--no-cache-source-secrets only applies with --watch");
   if (!input.watch && input.delayFirstSync) die("--delay-first-sync only applies with --watch");
+  if (!input.watch && input.initialSourceTruth) die("--initial-source-truth only applies with --watch");
+  if (input.watch && input.mode) die("a startup-convergence sync is one-shot");
+  if (input.mode === "startup-convergence") {
+    // Launch plan D4: receipt-gated, resolving nothing. A deferral is not a
+    // failure: it hands startup back the unlocked source-truth order, before
+    // this sync wrote or removed anything.
+    try {
+      const result = syncTokens({ exitOnFailure: true, verbose: input.verbose, mode: "convergence", preparedOnly: true });
+      currentAdminState().tokenResolutionReceipts = result.receipts;
+    } catch (error) {
+      if (!(error instanceof TokenSyncDeferredError)) throw error;
+      if (input.verbose) console.log(`credential sync deferred to a source-truth sync: ${error.message}`);
+      process.exitCode = TOKEN_SYNC_DEFERRED_STATUS;
+    }
+    return;
+  }
   if (input.watch) {
     await syncTokensWatch({
       cacheSourceSecrets: input.cacheSourceSecrets,
       delayFirstSync: input.delayFirstSync,
+      initialSourceTruth: input.initialSourceTruth === true,
       quiet: input.quiet,
       verbose: input.verbose,
     });

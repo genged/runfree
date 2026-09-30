@@ -161,8 +161,14 @@ agent sees: placeholder or runfree_oauth_* handle only
    header, and path. The source config that says where the value comes from
    is host-owned.
 3. Credential writes happen only after the runtime is validated and a
-   prepared runtime exists. Prepared values expire after 120 s.
-4. The proxy CA private key is mounted only into the proxy.
+   prepared runtime exists. Prepared values expire after 120 s. No source is
+   read while the lifecycle lock is held.
+4. A warm launch may reuse a proxy-held value without re-reading its source,
+   only while a host receipt proves it current and its last read is under 15
+   minutes old; the launch's watcher re-reads every source right after the
+   launch. A source revoked at its origin is therefore dropped seconds after a
+   warm launch, not before it. `runfree credential sync` always re-reads.
+5. The proxy CA private key is mounted only into the proxy.
 
 ### Sessions
 

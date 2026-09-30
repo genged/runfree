@@ -71,15 +71,20 @@ export type CaptureResult = {
 export type RuntimeAdminIntent =
   | { kind: "converge-proxy-policy" }
   | { kind: "ensure-agent-service"; id: string; quiet: boolean }
-  | { kind: "token-sync"; verbose: boolean }
-  | { kind: "prepare-token-sources" }
+  /**
+   * `startup-convergence` is the receipt-gated warm-launch sync (launch plan
+   * D4): it resolves no source and returns `TOKEN_SYNC_DEFERRED_STATUS` when
+   * it would have to. Absent means today's source-truth sync.
+   */
+  | { kind: "token-sync"; verbose: boolean; mode?: "startup-convergence" }
+  | { kind: "prepare-token-sources"; mode?: "source-truth" | "convergence" }
   | { kind: "prepare" };
 
 export type PiProviderChoice = "agent-codex" | "agent-claude" | "configure" | "custom";
 export type PiProviderOption = Readonly<{ label: string; value: PiProviderChoice }>;
 
 export type RuntimeIO = {
-  prepareTokenSources?(context: RuntimeContext): Promise<void>;
+  prepareTokenSources?(context: RuntimeContext, options?: Readonly<{ mode?: "source-truth" | "convergence" }>): Promise<void>;
   admitPreparedTokenSources?(context: RuntimeContext): void;
   clearPreparedTokenSources?(context: RuntimeContext): void;
   run(command: string, args: string[], options?: childProcess.SpawnSyncOptions): number;
@@ -89,7 +94,11 @@ export type RuntimeIO = {
   choosePiProvider?: (options: readonly PiProviderOption[]) => PiProviderChoice | undefined;
   isInteractive?: () => boolean;
   admin(intent: RuntimeAdminIntent, context: RuntimeContext): Promise<number>;
-  startTokenAutoRefresh?: (context: RuntimeContext, receipts?: TokenResolutionReceipt[]) => { stop: () => void };
+  startTokenAutoRefresh?: (
+    context: RuntimeContext,
+    receipts?: TokenResolutionReceipt[],
+    options?: Readonly<{ initialSourceTruth?: boolean }>,
+  ) => { stop: () => void };
   takeTokenResolutionReceipts?: () => TokenResolutionReceipt[];
 };
 

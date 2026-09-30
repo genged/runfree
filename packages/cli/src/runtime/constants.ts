@@ -15,6 +15,14 @@ export const RUNFREE_VERSION_LABEL = "io.runfree.version";
 export const AGENT_UID_GID = "1000:1000";
 export const ROOT_UID_GID = "0:0";
 export const PROXY_SERVER_UID_GID = `${PROXY_SERVER_UID}:${PROXY_SERVER_GID}`;
+/**
+ * The in-process token-sync status for a receipt-gated warm-launch sync that
+ * could not finish without resolving a source or waiting on a lock (launch
+ * plan D4). Not an exit status any command returns: startup reads it and
+ * takes the unlocked source-truth order instead.
+ */
+export const TOKEN_SYNC_DEFERRED_STATUS = 75;
+
 export const RUNTIME_VALIDATION_MARKER_PATH = "/run/runfree-runtime-validation.json";
 export const AGENT_BASE_IMAGE_ROLE = "agent-base";
 export const AGENT_RUNTIME_IMAGE_ROLE = "agent-runtime";

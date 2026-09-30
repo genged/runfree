@@ -104,6 +104,7 @@ import { runtimeDryRun } from "./runtime/front.ts";
 import { repairWorktreeLinks } from "./runtime/git-layout.ts";
 import { subprocessCategory } from "./runtime/operation-histogram.ts";
 import { COMPOSE_UP_FAILURE_REMEDY, restoreSameProxySessionAdmission, startRuntime, up } from "./runtime/startup.ts";
+import { TOKEN_SYNC_DEFERRED_STATUS } from "./runtime/constants.ts";
 import { flushWarnings, pendingWarningsForTest } from "./warnings.ts";
 import { projectLifecycleLockPath, tryAcquireProjectLifecycleLockWithRetry } from "./runtime/sessions.ts";
 
@@ -1287,9 +1288,14 @@ function runtimeIntentToArgs(intent: RuntimeAdminIntent): string[] {
     case "ensure-agent-service":
       return ["service", "ensure", intent.id, ...(intent.quiet ? ["--quiet"] : [])];
     case "token-sync":
-      return intent.verbose ? ["token", "sync", "--verbose"] : ["token", "sync"];
+      return [
+        "token",
+        "sync",
+        ...(intent.verbose ? ["--verbose"] : []),
+        ...(intent.mode ? [`--${intent.mode}`] : []),
+      ];
     case "prepare-token-sources":
-      return ["prepare-token-sources"];
+      return intent.mode ? ["prepare-token-sources", `--${intent.mode}`] : ["prepare-token-sources"];
     case "prepare":
       return ["prepare"];
   }
@@ -3574,6 +3580,82 @@ describe("runtime command flow", () => {
         "docker volume inspect": 1,
       }
     `);
+  });
+
+  describe("receipt-gated warm launch token sync (launch plan D4)", () => {
+    function launchContext(): RuntimeContext {
+      const projectRoot = path.join(tmp, "project");
+      const project = prepareProject(projectRoot);
+      return {
+        projectRoot,
+        project,
+        runtimeRoot: path.join(tmp, "runtime"),
+        env: { PATH: "/fake-bin" },
+        network: fixedNetwork,
+      };
+    }
+    const tokenSyncCalls = (calls: readonly RuntimeIoCall[]): string[][] => calls
+      .filter((call) => call.method === "admin" && call.args[0] === "token")
+      .map((call) => [...call.args]);
+
+    test("a warm launch syncs receipt-gated and tells the watcher to re-read sources", async () => {
+      const context = launchContext();
+      const io = createRuntimeIO();
+      expect((await startRuntime(context, io, false, { launch: true })).status).toBe(0);
+      const warmStart = io.calls.length;
+      const warm = await startRuntime(context, io, false, { launch: true });
+      expect(warm.status).toBe(0);
+      expect(tokenSyncCalls(io.calls.slice(warmStart))).toEqual([["token", "sync", "--startup-convergence"]]);
+      expect(warm.kind === "ready" && warm.credentialFreshness).toBe("receipt-gated");
+    });
+
+    test("a deferred receipt-gated sync re-reads every source and syncs source-truth instead", async () => {
+      const context = launchContext();
+      const prepares: Array<Readonly<{ mode?: string }> | undefined> = [];
+      const io = createRuntimeIO({
+        admin: async (args) => (args.includes("--startup-convergence") ? TOKEN_SYNC_DEFERRED_STATUS : 0),
+      });
+      io.prepareTokenSources = async (_context, options) => { prepares.push(options); };
+      expect((await startRuntime(context, io, false, { launch: true })).status).toBe(0);
+      const warmStart = io.calls.length;
+      prepares.length = 0;
+      const warm = await startRuntime(context, io, false, { launch: true });
+      expect(warm.status).toBe(0);
+      expect(tokenSyncCalls(io.calls.slice(warmStart))).toEqual([
+        ["token", "sync", "--startup-convergence"],
+        ["token", "sync"],
+      ]);
+      // First the warm preparation, then the full re-read after the deferral.
+      expect(prepares).toEqual([{ mode: "convergence" }, undefined]);
+      expect(warm.kind === "ready" && warm.credentialFreshness).toBe("source-truth");
+    });
+
+    test("runfree up and a cold launch keep the source-truth sync", async () => {
+      const context = launchContext();
+      const io = createRuntimeIO();
+      const coldStart = io.calls.length;
+      const cold = await startRuntime(context, io, false, { launch: true });
+      expect(cold.status).toBe(0);
+      expect(tokenSyncCalls(io.calls.slice(coldStart))).toEqual([["token", "sync"]]);
+      expect(cold.kind === "ready" && cold.credentialFreshness).toBe("source-truth");
+      const upStart = io.calls.length;
+      const warmUp = await startRuntime(context, io, false, {});
+      expect(warmUp.status).toBe(0);
+      expect(tokenSyncCalls(io.calls.slice(upStart))).toEqual([["token", "sync"]]);
+    });
+
+    test("the watcher spawned after a receipt-gated launch re-reads sources before its first wait", () => {
+      const projectRoot = path.join(tmp, "project");
+      const project = prepareProject(projectRoot);
+      const plan = buildTokenAutoRefreshSpawnPlan({
+        base: { command: "/usr/local/bin/runfree", args: [] },
+        context: { projectRoot, project, runtimeRoot: path.join(tmp, "runtime"), env: { PATH: "/fake-bin" } },
+        parentPid: 12345,
+        initialSourceTruth: true,
+      });
+      expect(plan.args).toContain("--initial-source-truth");
+      expect(plan.args).not.toContain("--delay-first-sync");
+    });
   });
 
   describe("image cleanup off the unchanged warm launch path", () => {
