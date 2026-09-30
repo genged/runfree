@@ -93,7 +93,7 @@ beforeAll(() => {
   volumeNames = dockerOrThrow("project volumes", ["volume", "ls", "--filter", `label=com.docker.compose.project=${project}`, "--format", "{{.Name}}"])
     .split("\n").filter(Boolean);
   versions = dockerOrThrow("docker versions", ["version", "--format", "client API {{.Client.APIVersion}}, server API {{.Server.APIVersion}}"]);
-  transport = createDockerApiCapture();
+  transport = createDockerApiCapture({ controlEnv: { ...process.env, RUNFREE_DOCKER_TRANSPORT: "api" } });
 }, PROVISION_TIMEOUT_MS);
 
 afterAll(() => {
@@ -144,7 +144,7 @@ describe("docker Engine API transport matches the Docker CLI on real Docker", ()
     }
   }, TEST_TIMEOUT_MS);
 
-  test("the product CLI routes calls through the transport on a warm up, and none with the kill switch", () => {
+  test("the product CLI routes calls only when opted in: api routes, unset and cli route none", () => {
     const warmUp = (extra: NodeJS.ProcessEnv) => childProcess.spawnSync(process.execPath, [...cliEntryArgv(), "--workspace", fixture.projectRoot, "up"], {
       cwd: REPO_ROOT,
       encoding: "utf8",
@@ -157,12 +157,22 @@ describe("docker Engine API transport matches the Docker CLI on real Docker", ()
       if (!match) throw new Error(`no docker-transport timing line: ${describeOutput(stderr)}`);
       return { routed: Number(match[1]), cli: Number(match[2]) };
     };
-    const on = warmUp({});
+    const on = warmUp({ RUNFREE_DOCKER_TRANSPORT: "api" });
     expect(on.status, describeOutput(`${on.stdout}${on.stderr}`)).toBe(0);
     expect(counts(on.stderr).routed).toBeGreaterThan(0);
     const off = warmUp({ RUNFREE_DOCKER_TRANSPORT: "cli" });
     expect(off.status, describeOutput(`${off.stdout}${off.stderr}`)).toBe(0);
     expect(counts(off.stderr).routed).toBe(0);
+    const { RUNFREE_DOCKER_TRANSPORT: _unset, ...defaultEnv } = fixture.env;
+    const unset = childProcess.spawnSync(process.execPath, [...cliEntryArgv(), "--workspace", fixture.projectRoot, "up"], {
+      cwd: REPO_ROOT,
+      encoding: "utf8",
+      env: { ...defaultEnv, RUNFREE_INVOCATION_CWD: REPO_ROOT, RUNFREE_PROJECT_ROOT: REPO_ROOT, RUNFREE_TIMINGS: "1" },
+      maxBuffer: MAX_BUFFER,
+      timeout: TEST_TIMEOUT_MS,
+    });
+    expect(unset.status, describeOutput(`${unset.stdout}${unset.stderr}`)).toBe(0);
+    expect(counts(unset.stderr).routed).toBe(0);
   }, TEST_TIMEOUT_MS);
 
   test("the kill switch keeps every call on the CLI", () => {

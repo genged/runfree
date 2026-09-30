@@ -8,7 +8,11 @@ import { demuxDockerStream, formatRawInspect, truncateId } from "./format.ts";
 import { type DockerApiRoute, matchDockerApiRoute } from "./routes.ts";
 import { type BridgeReply, type BridgeRequest, createSyncBridge, type SyncBridge } from "./sync-bridge.ts";
 
-/** `cli` forces every call onto the Docker CLI; unset or `api` allows the transport. */
+/**
+ * Opt-in until the live equivalence proof and Gate C pass on a Docker host:
+ * only `api` enables the transport; unset, empty, `cli`, or anything else
+ * keeps every call on the Docker CLI.
+ */
 export const DOCKER_TRANSPORT_ENV = "RUNFREE_DOCKER_TRANSPORT";
 
 // spawnSync's default maxBuffer.
@@ -304,7 +308,7 @@ export function createDockerApiCapture(deps: DockerApiCaptureDeps = {}): DockerA
   return (command, args, options = {}) => {
     if (command !== "docker") return { routed: false };
     const mode = controlEnv[DOCKER_TRANSPORT_ENV];
-    if (mode !== undefined && mode !== "" && mode !== "api") return { routed: false };
+    if (mode !== "api") return { routed: false };
     const envGiven = options.env !== undefined;
     const env = options.env ?? process.env;
     if (controlEnv.RUNFREE_TEST_FAKE_DOCKER === "1" || env.RUNFREE_TEST_FAKE_DOCKER === "1") return { routed: false };

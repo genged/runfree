@@ -268,7 +268,9 @@ Details: [Write Approval Grants](architecture.md#write-approval-grants).
    exec requests its routes build. No argv value, project file, or agent
    output selects the socket, the method, or the endpoint. An answer it
    cannot give exactly as the CLI would goes to the CLI, and a started exec
-   is never re-run. See [Docker Access](architecture.md#docker-access).
+   is never re-run. It is opt-in (`RUNFREE_DOCKER_TRANSPORT=api`) until its
+   live equivalence proof has passed. See
+   [Docker Access](architecture.md#docker-access).
 
 ## What Runfree Does Not Prove
 

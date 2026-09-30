@@ -33,7 +33,7 @@ async function start(replies: FakeEngineScript["replies"], execStarts?: FakeEngi
 
 function transportFor(fake: FakeEngine, deps: DockerApiCaptureDeps = {}) {
   return createDockerApiCapture({
-    controlEnv: {},
+    controlEnv: { RUNFREE_DOCKER_TRANSPORT: "api" },
     resolveEndpoint: () => ({ kind: "unix", socketPath: fake.socketPath, context: "default" }),
     dockerCliProbe: () => "docker-cli",
     runCli: () => ({ status: 0, stdout: `${cliVersionJson()}\n` }),
@@ -297,9 +297,11 @@ describe("docker API transport: bounded waits and failures", () => {
 
 describe("docker API transport: what stays on the CLI", () => {
   it.each([
+    ["the default (transport mode unset)", { controlEnv: {} }, {}],
+    ["an empty transport mode", { controlEnv: { RUNFREE_DOCKER_TRANSPORT: "" } }, {}],
     ["the kill switch", { controlEnv: { RUNFREE_DOCKER_TRANSPORT: "cli" } }, {}],
     ["an unknown transport mode", { controlEnv: { RUNFREE_DOCKER_TRANSPORT: "fast" } }, {}],
-    ["fake-docker test mode in the process env", { controlEnv: { RUNFREE_TEST_FAKE_DOCKER: "1" } }, {}],
+    ["fake-docker test mode in the process env", { controlEnv: { RUNFREE_DOCKER_TRANSPORT: "api", RUNFREE_TEST_FAKE_DOCKER: "1" } }, {}],
     ["fake-docker test mode in the call env", {}, { env: { RUNFREE_TEST_FAKE_DOCKER: "1" } }],
     ["a docker on PATH that is not a native binary", { dockerCliProbe: () => undefined }, {}],
     ["an endpoint that is not a socket", { socketIdentity: () => undefined }, {}],
@@ -312,7 +314,7 @@ describe("docker API transport: what stays on the CLI", () => {
     expect(await fake.requests()).toEqual([]);
   });
 
-  it("RUNFREE_DOCKER_TRANSPORT=api keeps the transport on", async () => {
+  it("RUNFREE_DOCKER_TRANSPORT=api turns the transport on", async () => {
     const fake = await start({ [`GET ${V}/containers/${ID}/json`]: json({ Id: ID }) });
     expect(transportFor(fake, { controlEnv: { RUNFREE_DOCKER_TRANSPORT: "api" } })("docker", ["container", "inspect", "--format", "{{.Id}}", ID]).routed).toBe(true);
   });
