@@ -34,6 +34,7 @@ import {
   createSessionAgentMaterializationManifestV2,
   publishControlPlaneMaterializationV2,
   publishSessionAgentMaterializationV2,
+  readControlPlaneMaterializationV2,
   selectDesiredSessionAgentV2,
   selectEffectiveControlPlaneV2,
   type ControlPlaneEffectiveSelectionV2,
@@ -52,15 +53,29 @@ import {
   assertSessionAdmissionDriverPreflight,
   createAllocatedSessionContainerRecordFromPreflight,
   createSessionAdmissionDriverPreflight,
+  createRetainedSessionRebindProofPlan,
   createSessionContainerCreatePlanFromPreflight,
   type SessionAdmissionDriverPreflight,
 } from "./session-admission-driver-preflight.ts";
+import { validateSessionContainerInspect } from "./session-container-proof.ts";
+import { sessionContainerTemplateInit } from "./session-container-template.ts";
+import { sessionContainerInspectJsonFixture } from "./session-container.test-harness.ts";
+import {
+  bindAllocatedSessionContainerIdV2,
+  createAllocatedSessionContainerRecordV2,
+} from "./session-containers.ts";
+import { createSessionLaunchTarget } from "./session-launch.ts";
+import {
+  runtimeTopologyProjectionArtifactDigestV2,
+  type RuntimeTopologyProjectionArtifactV2,
+} from "./topology-digest-v2.ts";
 import { createRuntimePlan, type ActiveRuntimePlan } from "./plan.ts";
 import { SESSION_ENTRY_PATH } from "./session-launch.ts";
 import {
   createSessionTemplateArtifactV1,
   serializeSessionTemplateArtifactV1,
   sessionTemplateArtifactSha256,
+  type SessionTemplateArtifactV1,
 } from "./session-template-artifact.ts";
 import type { ProjectLifecycleLock } from "./sessions.ts";
 import type { RuntimeContext } from "./types.ts";
@@ -592,5 +607,105 @@ describe("session admission driver preflight", () => {
     }));
     expect(() => createAllocatedSessionContainerRecordFromPreflight(preflight, recordInput()))
       .toThrow("changed after preflight");
+  });
+
+  /**
+   * A retained session's rebind proof reads the session's own stored template,
+   * so a session started before 2026-09-30 (version 1 template, container
+   * created without `--init`) keeps passing across a proxy replacement, and a
+   * session started after it must still run under the init wrapper.
+   */
+  describe("retained-session rebind proof across the init upgrade", () => {
+    function retainedPlan(value: ReturnType<typeof fixture>, legacy: boolean) {
+      let source = value.templateArtifactSource;
+      let materialization = value.desired;
+      if (legacy) {
+        const decoded = JSON.parse(source) as {
+          template: Record<string, unknown>;
+          topologyProjection: RuntimeTopologyProjectionArtifactV2 & {
+            structure: { createContract: Record<string, unknown> };
+          };
+        };
+        const { init: _init, ...template } = decoded.template;
+        decoded.template = { ...template, version: 1 };
+        decoded.topologyProjection.structure.createContract.init = false;
+        source = serializeSessionTemplateArtifactV1(decoded as unknown as SessionTemplateArtifactV1);
+        const inputs = createSessionAgentGenerationInputsV2({
+          selectedAgentImageInputDigest: value.desired.generation.selectedAgentImageInputDigest,
+          sessionTemplateDigest: runtimeTopologyProjectionArtifactDigestV2(decoded.topologyProjection),
+          admissionContractEpoch: value.desired.generation.admissionContractEpoch,
+        });
+        materialization = createSessionAgentMaterializationManifestV2({
+          projectId: value.desired.projectId,
+          composeProject: value.desired.composeProject,
+          generation: bindSessionAgentImageV2(inputs, value.desired.selectedAgentImageId),
+          selectedAgentImageRef: value.desired.selectedAgentImageRef,
+          selectedAgentImageId: value.desired.selectedAgentImageId,
+          selectedAgentImageKind: "embedded",
+          sessionTemplateArtifactSha256: sessionTemplateArtifactSha256(source),
+        });
+        publishSessionAgentMaterializationV2(value.project.paths.stateDir, materialization, source);
+      }
+      const record = bindAllocatedSessionContainerIdV2(createAllocatedSessionContainerRecordV2({
+        ...recordInput(),
+        launch: createSessionLaunchTarget({
+          path: SESSION_ENTRY_PATH,
+          args: ["/usr/local/bin/codex"],
+          interactive: true,
+          tty: true,
+        }),
+        materialization,
+        effectiveControlPlane: value.effective,
+      }), "c".repeat(64));
+      const candidateMaterialization = readControlPlaneMaterializationV2(
+        value.project.paths.stateDir,
+        value.effective.controlPlaneMaterializationDigest,
+      );
+      if (!candidateMaterialization) throw new Error("fixture control-plane materialization is missing");
+      return createRetainedSessionRebindProofPlan({
+        stateDir: value.project.paths.stateDir,
+        expectedProject: { projectId: value.plan.projectId, composeProject: value.plan.composeProjectName },
+        replacementRecord: record,
+        candidateControlPlane: value.effective,
+        candidateMaterialization,
+        docker: value.docker,
+        lifecycleLock: value.lock,
+        runfreeVersion: "0.3.0",
+      });
+    }
+
+    function inspectWithInit(plan: ReturnType<typeof retainedPlan>, init: boolean | null | undefined): string {
+      const evidence = JSON.parse(sessionContainerInspectJsonFixture(plan, { running: true })) as Array<{
+        HostConfig: Record<string, unknown>;
+      }>;
+      if (init === undefined) delete evidence[0].HostConfig.Init;
+      else evidence[0].HostConfig.Init = init;
+      return JSON.stringify(evidence);
+    }
+
+    test("a pre-upgrade session (version 1 template, no init) still proves", () => {
+      const value = fixture();
+      const plan = retainedPlan(value, true);
+      expect(plan.template.version).toBe(1);
+      expect(sessionContainerTemplateInit(plan.template)).toBe(false);
+      for (const init of [undefined, null, false] as const) {
+        expect(() => validateSessionContainerInspect(inspectWithInit(plan, init), plan, { kind: "active-running" }))
+          .not.toThrow();
+      }
+      expect(() => validateSessionContainerInspect(inspectWithInit(plan, true), plan, { kind: "active-running" }))
+        .toThrow("session container has an unexpected init wrapper");
+    });
+
+    test("a post-upgrade session (version 2 template) proves only under the init wrapper", () => {
+      const value = fixture();
+      const plan = retainedPlan(value, false);
+      expect(plan.template.version).toBe(2);
+      expect(() => validateSessionContainerInspect(inspectWithInit(plan, true), plan, { kind: "active-running" }))
+        .not.toThrow();
+      for (const init of [undefined, null, false] as const) {
+        expect(() => validateSessionContainerInspect(inspectWithInit(plan, init), plan, { kind: "active-running" }))
+          .toThrow("session container is missing its init wrapper");
+      }
+    });
   });
 });

@@ -31,6 +31,8 @@ import {
   composeManagedVolumeName,
   createSessionContainerCreatePlan,
   createSessionContainerTemplate,
+  createSessionContainerTemplateFromArtifact,
+  sessionContainerTemplateInit,
   sessionContainerTopologyProjectionV2,
   type SessionContainerCreatePlan,
   type SessionContainerCreatePlanInput,
@@ -292,7 +294,7 @@ describe("canonical session-container template", () => {
       schemaVersion: 2,
       createContract: {
         user: "1000:1000",
-        init: false,
+        init: true,
         stopSignal: "SIGTERM",
         createdStopped: true,
         networkAtCreate: true,
@@ -350,6 +352,51 @@ describe("canonical session-container template", () => {
       })]),
     });
     expect(JSON.stringify(projection)).not.toMatch(/idle-v1|session-supervisor|finaliz|docker-exec/u);
+  });
+
+  test("stores the init wrapper per template: version 2 runs under init, version 1 never did", () => {
+    const fresh = createSessionContainerTemplate(input());
+    expect(fresh.version).toBe(2);
+    expect(sessionContainerTemplateInit(fresh)).toBe(true);
+    const stored = JSON.parse(JSON.stringify(fresh)) as Record<string, unknown>;
+    expect(stored.init).toBe(true);
+
+    // A template persisted before 2026-09-30 has no `init` key and version 1.
+    const { init: _init, ...legacyShape } = stored;
+    const legacy = createSessionContainerTemplateFromArtifact(
+      { ...legacyShape, version: 1 },
+      { projectId: "0123456789ab", composeProject: COMPOSE_PROJECT },
+    );
+    expect(legacy.version).toBe(1);
+    expect(Object.keys(legacy)).not.toContain("init");
+    expect(sessionContainerTemplateInit(legacy)).toBe(false);
+    expect(sessionContainerTopologyProjectionV2(legacy)).toMatchObject({ createContract: { init: false } });
+    expect(sessionContainerTopologyProjectionV2(fresh)).toMatchObject({ createContract: { init: true } });
+
+    const restored = createSessionContainerTemplateFromArtifact(
+      stored,
+      { projectId: "0123456789ab", composeProject: COMPOSE_PROJECT },
+    );
+    expect(JSON.stringify(restored)).toBe(JSON.stringify(fresh));
+    expect(sessionContainerTemplateInit(restored)).toBe(true);
+  });
+
+  test.each([
+    ["a version 2 template with init false", (value: Record<string, unknown>) => ({ ...value, init: false })],
+    ["a version 2 template without init", (value: Record<string, unknown>) => {
+      const { init: _init, ...rest } = value;
+      return rest;
+    }],
+    ["a version 2 template with a non-boolean init", (value: Record<string, unknown>) => ({ ...value, init: "true" })],
+    ["a version 1 template that claims an init wrapper", (value: Record<string, unknown>) => ({ ...value, version: 1 })],
+    ["a version 1 template with init false spelled out", (value: Record<string, unknown>) => ({ ...value, version: 1, init: false })],
+    ["an unknown template version", (value: Record<string, unknown>) => ({ ...value, version: 3 })],
+  ])("refuses %s", (_label, mutate) => {
+    const stored = JSON.parse(JSON.stringify(createSessionContainerTemplate(input()))) as Record<string, unknown>;
+    expect(() => createSessionContainerTemplateFromArtifact(
+      mutate(stored),
+      { projectId: "0123456789ab", composeProject: COMPOSE_PROJECT },
+    )).toThrow("session-template artifact has an invalid contract");
   });
 
   test("fails closed for cross-project layouts and malformed volume identities", () => {

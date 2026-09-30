@@ -11,6 +11,7 @@ import {
 } from "./session-container-contract.ts";
 import {
   assertSessionContainerCreatePlan,
+  sessionContainerTemplateInit,
   type SessionContainerCreatePlan,
 } from "./session-container-template.ts";
 import {
@@ -208,6 +209,11 @@ export function sessionContainerCreateCommand(
       ...(plan.launch.tty ? ["--tty"] : []),
       ...SESSION_CONTAINER_SECURITY_OPTIONS.flatMap((option) => ["--security-opt", option]),
       ...SESSION_CONTAINER_CAPABILITY_DROPS.flatMap((capability) => ["--cap-drop", capability]),
+      // Docker's init as PID 1 forwards the stop signal to the entry and then
+      // the agent; a PID 1 agent without a SIGTERM handler drops it and waits
+      // out the stop timeout. Per template: a pre-init (version 1) template's
+      // container is created exactly as it was proven, without the wrapper.
+      ...(sessionContainerTemplateInit(plan.template) ? ["--init"] : []),
       "--stop-signal",
       SESSION_CONTAINER_STOP_SIGNAL,
       "--entrypoint",

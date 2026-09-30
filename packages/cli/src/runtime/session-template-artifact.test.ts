@@ -14,7 +14,13 @@ import {
   parseSessionTemplateArtifactV1,
   serializeSessionTemplateArtifactV1,
   sessionTemplateArtifactSha256,
+  type SessionTemplateArtifactV1,
 } from "./session-template-artifact.ts";
+import { sessionContainerTemplateInit } from "./session-container-template.ts";
+import {
+  runtimeTopologyProjectionArtifactDigestV2,
+  type RuntimeTopologyProjectionArtifactV2,
+} from "./topology-digest-v2.ts";
 import type { RuntimeContext } from "./types.ts";
 
 let temporaryRoot: string;
@@ -143,6 +149,80 @@ test("rejects template bytes that contradict their persisted topology projection
 
   expect(() => parseSessionTemplateArtifactV1(changed, {
     ...expected,
+    artifactSha256: sessionTemplateArtifactSha256(changed),
+  })).toThrow("topology does not describe its template");
+});
+
+/**
+ * The bytes a runfree release before 2026-09-30 persisted for the same plan:
+ * a version 1 template without an `init` key, and a stored projection whose
+ * create contract says `init: false`. Built from today's artifact so the
+ * rest of the contract stays exact; the digest is recomputed over the old
+ * projection, as the old release computed it.
+ */
+function legacyArtifact(source: string, projectionInit = false) {
+  const decoded = JSON.parse(source) as {
+    template: Record<string, unknown>;
+    topologyProjection: RuntimeTopologyProjectionArtifactV2 & {
+      structure: { createContract: Record<string, unknown> };
+    };
+  };
+  const { init: _init, ...template } = decoded.template;
+  decoded.template = { ...template, version: 1 };
+  decoded.topologyProjection.structure.createContract.init = projectionInit;
+  const legacySource = serializeSessionTemplateArtifactV1(decoded as unknown as SessionTemplateArtifactV1);
+  return {
+    source: legacySource,
+    sessionTemplateDigest: runtimeTopologyProjectionArtifactDigestV2(decoded.topologyProjection),
+  };
+}
+
+test("a fresh artifact stores a version 2 template that runs under init", () => {
+  const { artifact } = fixture();
+  expect(artifact.template.version).toBe(2);
+  expect(sessionContainerTemplateInit(artifact.template)).toBe(true);
+  expect(artifact.topologyProjection.structure).toMatchObject({ createContract: { init: true } });
+});
+
+test("a pre-upgrade artifact (version 1, init false) still parses, stays canonical, and keeps init false", () => {
+  const { expected, source } = fixture();
+  const legacy = legacyArtifact(source);
+
+  const parsed = parseSessionTemplateArtifactV1(legacy.source, {
+    ...expected,
+    sessionTemplateDigest: legacy.sessionTemplateDigest,
+    artifactSha256: sessionTemplateArtifactSha256(legacy.source),
+  });
+
+  expect(serializeSessionTemplateArtifactV1(parsed)).toBe(legacy.source);
+  expect(parsed.template.version).toBe(1);
+  expect(sessionContainerTemplateInit(parsed.template)).toBe(false);
+  // The two are different session templates, never one digest.
+  expect(legacy.sessionTemplateDigest).not.toBe(expected.sessionTemplateDigest);
+});
+
+test("refuses a version 1 artifact whose stored projection claims an init wrapper", () => {
+  const { expected, source } = fixture();
+  const forged = legacyArtifact(source, true);
+  expect(() => parseSessionTemplateArtifactV1(forged.source, {
+    ...expected,
+    sessionTemplateDigest: forged.sessionTemplateDigest,
+    artifactSha256: sessionTemplateArtifactSha256(forged.source),
+  })).toThrow("topology does not describe its template");
+});
+
+test("refuses a version 2 artifact whose stored projection denies its init wrapper", () => {
+  const { expected, source } = fixture();
+  const decoded = JSON.parse(source) as {
+    topologyProjection: RuntimeTopologyProjectionArtifactV2 & {
+      structure: { createContract: Record<string, unknown> };
+    };
+  };
+  decoded.topologyProjection.structure.createContract.init = false;
+  const changed = serializeSessionTemplateArtifactV1(decoded as unknown as SessionTemplateArtifactV1);
+  expect(() => parseSessionTemplateArtifactV1(changed, {
+    ...expected,
+    sessionTemplateDigest: runtimeTopologyProjectionArtifactDigestV2(decoded.topologyProjection),
     artifactSha256: sessionTemplateArtifactSha256(changed),
   })).toThrow("topology does not describe its template");
 });

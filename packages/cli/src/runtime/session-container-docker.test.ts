@@ -27,6 +27,7 @@ import {
   SESSION_TEST_PROJECT,
   sessionAgentMaterializationFixture,
   sessionContainerRecordFixture,
+  sessionContainerLegacyTemplateFixture,
   sessionContainerTemplateFixture,
   sessionGenerationFixture,
 } from "./session-container.test-harness.ts";
@@ -120,9 +121,12 @@ function attachIdentity(record: SessionContainerRecordV2): SessionContainerAttac
   };
 }
 
-function createPlan(record: SessionContainerRecordV2 = allocated()): SessionContainerCreatePlan {
+function createPlan(
+  record: SessionContainerRecordV2 = allocated(),
+  baseTemplate = sessionContainerTemplateFixture(),
+): SessionContainerCreatePlan {
   const { target, generation } = sessionGenerationFixture();
-  const template = bindSessionContainerTemplateGenerationV2(sessionContainerTemplateFixture(), target);
+  const template = bindSessionContainerTemplateGenerationV2(baseTemplate, target);
   const launch = createSessionLaunchTarget({
     path: record.launchPath,
     args: record.launchArgs,
@@ -180,6 +184,12 @@ function namedVolumeProof(plan: SessionContainerCreatePlan): SessionNamedVolumeP
 }
 
 describe("typed session-container Docker operations", () => {
+  test("creates a pre-upgrade (version 1) template's container without the init wrapper, as it was proven", () => {
+    const plan = createPlan(allocated(), sessionContainerLegacyTemplateFixture());
+    const command = sessionContainerCreateCommand(plan, namedVolumeProof(plan));
+    expect(command.args).not.toContain("--init");
+  });
+
   test("creates stopped from the selected image with exact network, launch, and confinement", () => {
     const plan = createPlan();
     const command = sessionContainerCreateCommand(plan, namedVolumeProof(plan));
@@ -199,7 +209,10 @@ describe("typed session-container Docker operations", () => {
     expect(command.args).toContain("--interactive");
     expect(command.args).toContain("--tty");
     expect(command.args).toContain(SESSION_CONTAINER_STOP_SIGNAL);
-    expect(command.args).not.toContain("--init");
+    // A version 2 template runs the agent under Docker's init, so a stop
+    // signal reaches it instead of being dropped for an unhandled PID 1.
+    expect(command.args.filter((argument) => argument === "--init")).toHaveLength(1);
+    expect(command.args.indexOf("--init")).toBeLessThan(command.args.indexOf("--entrypoint"));
     expect(command.args).not.toContain("--publish");
     expect(command.args).not.toContain("--add-host");
 

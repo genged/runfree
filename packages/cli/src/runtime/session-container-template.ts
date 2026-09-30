@@ -72,13 +72,35 @@ const MAX_TEMPLATE_TEXT_LENGTH = 16 * 1024;
 
 declare const sessionContainerTemplateBrand: unique symbol;
 
-export type SessionContainerTemplate = Readonly<{
+type SessionContainerTemplateBody = Readonly<{
   readonly [sessionContainerTemplateBrand]: true;
-  version: 1;
   environment: Readonly<Record<string, string>>;
   mounts: readonly SessionContainerMount[];
   workingDirectory: string;
 }>;
+
+/**
+ * The durable per-session create template.
+ *
+ * The version is also the init-wrapper contract, stored with each template
+ * rather than read from this code's constants, because a session keeps the
+ * template it was created from for its whole life:
+ *
+ *   version 1  no `init` key; the container runs without Docker's init, so the
+ *              agent (after the entry execs it) is PID 1. Every template a
+ *              release before 2026-09-30 persisted. Minted only by restoring
+ *              such an artifact.
+ *   version 2  `init: true`; the container is created with `--init`, so PID 1
+ *              is Docker's `docker-init` and a stop signal reaches the agent.
+ *
+ * `sessionContainerTemplateInit` is the only reader. The projection, the
+ * create argv, and the inspection proof all derive from it, so an old live
+ * session is proven against its own `Init: false` and a new one against
+ * `Init: true`, in both directions exactly.
+ */
+export type SessionContainerTemplate =
+  | (SessionContainerTemplateBody & Readonly<{ version: 1 }>)
+  | (SessionContainerTemplateBody & Readonly<{ version: 2; init: true }>);
 
 type SessionContainerTemplateIdentity = Readonly<SessionContainerProjectIdentity>;
 
@@ -279,7 +301,8 @@ export function createSessionContainerTemplate(
   const environment = Object.freeze(sessionEnvironment(input));
   const mounts = Object.freeze(sessionMounts(input).map((mount) => Object.freeze({ ...mount })));
   const template = Object.freeze({
-    version: 1,
+    version: 2,
+    init: true,
     environment,
     mounts,
     workingDirectory: input.gitLayout.containerProjectRoot,
@@ -297,6 +320,17 @@ export function assertSessionContainerTemplate(
   if (template === null || typeof template !== "object" || !validatedTemplates.has(template)) {
     throw new Error("session-container template was not minted by the canonical template builder");
   }
+}
+
+/**
+ * Whether this template's containers run under Docker's init wrapper.
+ *
+ * Read from the template itself — never from a constant of the running code —
+ * so a template persisted before the wrapper existed keeps meaning `false`.
+ */
+export function sessionContainerTemplateInit(template: SessionContainerTemplate): boolean {
+  assertSessionContainerTemplate(template);
+  return template.version === 2 && template.init === true;
 }
 
 
@@ -317,10 +351,19 @@ export function createSessionContainerTemplateFromArtifact(
   value: unknown,
   expectedProject: SessionContainerProjectIdentity,
 ): SessionContainerTemplate {
-  if (!isRecord(value) || !exactKeys(value, ["version", "environment", "mounts", "workingDirectory"])) {
+  // Exact in both directions: a version 1 template never carried an init key,
+  // and a version 2 template always carries exactly `init: true`.
+  const legacy = isRecord(value)
+    && value.version === 1
+    && exactKeys(value, ["version", "environment", "mounts", "workingDirectory"]);
+  const current = isRecord(value)
+    && value.version === 2
+    && value.init === true
+    && exactKeys(value, ["version", "init", "environment", "mounts", "workingDirectory"]);
+  if (!isRecord(value) || (!legacy && !current)) {
     throw new Error("session-template artifact has an invalid contract");
   }
-  if (value.version !== 1 || !isRecord(value.environment) || !Array.isArray(value.mounts)) {
+  if (!isRecord(value.environment) || !Array.isArray(value.mounts)) {
     throw new Error("session-template artifact has an invalid contract");
   }
   const environmentEntries = Object.entries(value.environment);
@@ -371,7 +414,7 @@ export function createSessionContainerTemplateFromArtifact(
     throw new Error("session-template artifact has an invalid working directory");
   }
   const template = Object.freeze({
-    version: 1,
+    ...(current ? { version: 2, init: true } : { version: 1 }),
     environment: Object.freeze(Object.fromEntries(
       Object.entries(environment).sort(([left], [right]) => left.localeCompare(right)),
     )),
@@ -638,7 +681,7 @@ export function sessionContainerTopologyProjectionV2(
     schemaVersion: 2,
     createContract: {
       user: SESSION_CONTAINER_USER,
-      init: false,
+      init: sessionContainerTemplateInit(template),
       stopSignal: SESSION_CONTAINER_STOP_SIGNAL,
       createdStopped: true,
       networkAtCreate: true,
