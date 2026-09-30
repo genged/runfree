@@ -222,7 +222,7 @@ export const mcpCommand: CommandModule = {
                 console.log(activationReportLine(activation));
                 if (!result.login) return 0;
                 if (argv["no-login"] || !interactive) {
-                  console.log(`log in with: runfree mcp auth ${result.login.agent} ${result.login.server} --source ${result.login.source}`);
+                  if (result.loginCommand) console.log(`log in with: ${result.loginCommand}`);
                   return 0;
                 }
                 return mcpAuthRuntime(result.login, context.runtimeContext(), nodeRuntimeIO);

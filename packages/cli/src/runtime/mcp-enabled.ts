@@ -13,10 +13,8 @@
 import fs from "node:fs";
 import path from "node:path";
 
-import { normalizePathPrefix } from "@runfree/runtime-contracts/network-policy";
-
 import { isMcpAgentId } from "../agents.ts";
-import { checkPolicyHostname } from "../admin/mcp-discovery.ts";
+import { checkPolicyHostname, isRecordableEndpoint } from "../admin/mcp-discovery.ts";
 import { projectHash } from "../project-identity.ts";
 import { atomicReplaceFile, isPathInsideByRealpath } from "../safe-fs.ts";
 import { isRecord } from "../strict-primitives.ts";
@@ -125,19 +123,15 @@ function validEndpoint(value: unknown): McpEnabledEndpoint | undefined {
   if (!isRecord(value) || !onlyKeys(value, ENDPOINT_KEYS)) return undefined;
   if (value.kind !== "metadata" && value.kind !== "token" && value.kind !== "registration") return undefined;
   if (typeof value.host !== "string" || typeof value.path !== "string") return undefined;
-  const checked = checkPolicyHostname(value.host);
-  if (!checked.ok || checked.host !== value.host) return undefined;
-  if (value.path.length > 1024 || !PRINTABLE_ASCII.test(value.path) || !value.path.startsWith("/")) return undefined;
-  try {
-    // The path must be exactly what a URL parser produces and a valid
-    // request-rule prefix, so the proxy's exact match and the rule agree.
-    if (new URL(`https://${value.host}${value.path}`).pathname !== value.path) return undefined;
-    if (normalizePathPrefix(value.path) !== value.path) return undefined;
-  } catch {
-    return undefined;
-  }
-  if (value.kind === "metadata" && !value.path.includes("/.well-known/")) return undefined;
+  // The same predicate discovery filters with, so every reviewed endpoint can
+  // be saved and nothing else can be read back.
+  if (!isRecordableEndpoint(value.kind, value.host, value.path)) return undefined;
   return { kind: value.kind, host: value.host, path: value.path };
+}
+
+/** Validate a record before it is shown for approval or saved. */
+export function validateMcpEnabledRecord(record: McpEnabledRecord): McpEnabledRecord | undefined {
+  return validRecord(record.identity, record);
 }
 
 function validRecord(key: string, value: unknown): McpEnabledRecord | undefined {
@@ -292,6 +286,79 @@ export function projectEnabledOAuthEndpoints(policy: EnabledOAuthPolicyTarget, r
       if (!hasEndpoint(policy.registrationEndpoints, endpoint.host, endpoint.path)) policy.registrationEndpoints.push({ host: endpoint.host, path: endpoint.path });
     }
   }
+}
+
+export type EnabledEndpointClaimant = {
+  // Unique per prepared server (agent, source, name).
+  serverKey: string;
+  // Shown in the warning.
+  label: string;
+  policy?: EnabledOAuthPolicyTarget;
+  record?: McpEnabledRecord;
+};
+
+function endpointKey(host: string, pathName: string): string {
+  return `${host}\0${pathName}`;
+}
+
+function staticEndpointKeys(policy: EnabledOAuthPolicyTarget | undefined): string[] {
+  const keys: string[] = [];
+  for (const endpoint of [...(policy?.tokenEndpoints ?? []), ...(policy?.registrationEndpoints ?? [])]) {
+    if (typeof endpoint === "string") {
+      try {
+        const url = new URL(endpoint);
+        keys.push(endpointKey(url.hostname.toLowerCase(), url.pathname || "/"));
+      } catch {
+        // The contract validator reports a malformed declared endpoint.
+      }
+    } else {
+      keys.push(endpointKey(endpoint.host, endpoint.path));
+    }
+  }
+  return keys;
+}
+
+/**
+ * Returns each claimant's record without the token and registration endpoints
+ * that another server also claims, statically or through its own record. The
+ * proxy mediates a token request for the first server whose endpoint list
+ * matches, so a shared endpoint projected statically could file one server's
+ * tokens under another server's handles. The dropped endpoints stay in the
+ * record's request rules (callers pass the unfiltered records there; the
+ * login still reaches them, as with `host add`); they are only not added to
+ * the mediation policy.
+ */
+export function withoutSharedEnabledEndpoints(claimants: readonly EnabledEndpointClaimant[]): {
+  records: Array<McpEnabledRecord | undefined>;
+  dropped: string[];
+} {
+  const claims = new Map<string, Set<string>>();
+  const claim = (key: string, serverKey: string): void => {
+    const set = claims.get(key) ?? new Set<string>();
+    set.add(serverKey);
+    claims.set(key, set);
+  };
+  for (const claimant of claimants) {
+    for (const key of staticEndpointKeys(claimant.policy)) claim(key, claimant.serverKey);
+    for (const endpoint of claimant.record?.oauthEndpoints ?? []) {
+      if (endpoint.kind !== "metadata") claim(endpointKey(endpoint.host, endpoint.path), claimant.serverKey);
+    }
+  }
+  const dropped: string[] = [];
+  const records = claimants.map((claimant) => {
+    const record = claimant.record;
+    if (!record?.oauthEndpoints) return record;
+    const kept = record.oauthEndpoints.filter((endpoint) => {
+      if (endpoint.kind === "metadata") return true;
+      const shared = (claims.get(endpointKey(endpoint.host, endpoint.path))?.size ?? 0) > 1;
+      if (shared) {
+        dropped.push(`mcp: ${claimant.label} ${endpoint.kind} endpoint https://${endpoint.host}${endpoint.path} is also used by another MCP server; the proxy does not mediate it statically for either`);
+      }
+      return !shared;
+    });
+    return { ...record, oauthEndpoints: kept };
+  });
+  return { records, dropped };
 }
 
 const OAUTH_HOST_METHODS = ["GET", "HEAD", "OPTIONS", "POST"] as const;

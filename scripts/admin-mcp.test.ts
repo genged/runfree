@@ -1160,7 +1160,11 @@ describe("runfree mcp enable", () => {
 
     const result = await runAdmin(async () => {
       const outcome = await mcpEnableIntent(enableInput(), { discovery: network.deps, confirm: prompts.confirm });
-      expect(outcome).toEqual({ applied: true, login: { agent: "claude", server: "repoOauth", source: "project" } });
+      expect(outcome).toEqual({
+        applied: true,
+        login: { agent: "claude", server: "repoOauth", source: "project" },
+        loginCommand: "runfree mcp auth claude repoOauth --source project",
+      });
     });
 
     expect(result.status, result.stderr).toBe(0);
@@ -1168,7 +1172,7 @@ describe("runfree mcp enable", () => {
     expect(prompts.asked).toEqual(["Contact repo-oauth.example.com to discover OAuth hosts?", "Enable this MCP server?"]);
     expect(result.stdout).toContain("allow host repo-oauth.example.com  [MCP endpoint]");
     expect(result.stdout).toContain("allow host auth.oauth-idp.example  [OAuth, discovered]");
-    expect(result.stdout).toContain("limited to GET/POST on /.well-known, /.well-known/oauth-authorization-server, /oauth/register, /oauth/token");
+    expect(result.stdout).toContain("limited to GET, HEAD, OPTIONS, and POST on paths starting with /.well-known, /.well-known/oauth-authorization-server, /oauth/register, /oauth/token");
     expect(result.stdout).toContain("browser sign-in at https://auth.oauth-idp.example (opened on this computer; not allowlisted)");
     expect(result.stdout).toContain("approved project MCP server: claude repoOauth");
 
@@ -1401,6 +1405,66 @@ describe("runfree mcp enable", () => {
     expect(explain.status, explain.stderr).toBe(0);
     expect(explain.stdout).toContain("OAuth host: auth.oauth-idp.example (discovered; added by mcp enable)");
     expect(explain.stdout).toContain("OAuth token endpoint: https://auth.oauth-idp.example/oauth/token");
+  });
+
+  test("an authorization server on the endpoint host adds no host but its endpoints are still mediated", async () => {
+    writeProjectOauthServer();
+    const network = fakeDiscovery({
+      "https://repo-oauth.example.com/.well-known/oauth-protected-resource/mcp": {
+        resource: "https://repo-oauth.example.com/mcp",
+        authorization_servers: ["https://repo-oauth.example.com"],
+      },
+      "https://repo-oauth.example.com/.well-known/oauth-authorization-server": {
+        issuer: "https://repo-oauth.example.com",
+        token_endpoint: "https://repo-oauth.example.com/token",
+      },
+    });
+    const result = await runAdmin(() => mcpEnableIntent(enableInput(), { discovery: network.deps, confirm: answers(true, true).confirm }).then(() => {}));
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout).toContain("proxy mediates token endpoint https://repo-oauth.example.com/token");
+    expect(result.stdout).toContain("OAuth hosts: none");
+
+    expect((await runAdmin(() => prepareRuntime())).status).toBe(0);
+    expect(readPolicy().hosts).toEqual(["repo-oauth.example.com"]);
+    expect(readPolicy().requests).toBeUndefined();
+    expect(readMcpOAuthPolicy()).toMatchObject({
+      providers: { "mcp:claude-repooauth": { tokenEndpoints: [{ host: "repo-oauth.example.com", path: "/token" }] } },
+    });
+  });
+
+  test("the review says when a discovered host is already allowed and keeps its rules", async () => {
+    writeFixtureRepo({ hosts: ["auth.oauth-idp.example"], tokens: {} });
+    writeProjectOauthServer();
+    const result = await runAdmin(() => mcpEnableIntent(enableInput(), { discovery: fakeDiscovery(oauthRoutes()).deps, confirm: answers(true, true).confirm }).then(() => {}));
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout).toContain("already allowed by the current policy; its existing rules stay");
+    expect(result.stdout).not.toContain("limited to GET");
+    expect((await runAdmin(() => prepareRuntime())).status).toBe(0);
+    expect(readPolicy().requests).toBeUndefined();
+  });
+
+  test("a token endpoint two enabled servers share is not mediated statically for either", async () => {
+    writeProjectOauthServer("serverA", "https://a.example.com/mcp");
+    writeProjectOauthServer("serverB", "https://b.example.com/mcp");
+    for (const [server, host] of [["serverA", "a.example.com"], ["serverB", "b.example.com"]] as const) {
+      const routes = {
+        [`https://${host}/.well-known/oauth-protected-resource/mcp`]: { resource: `https://${host}/mcp`, authorization_servers: ["https://shared-idp.example.com"] },
+        "https://shared-idp.example.com/.well-known/oauth-authorization-server": {
+          issuer: "https://shared-idp.example.com",
+          token_endpoint: "https://shared-idp.example.com/oauth/token",
+        },
+      };
+      const result = await runAdmin(() => mcpEnableIntent(enableInput({ server }), { discovery: fakeDiscovery(routes).deps, confirm: answers(true, true).confirm }).then(() => {}));
+      expect(result.status, result.stderr).toBe(0);
+    }
+    const prepare = await runAdmin(() => prepareRuntime());
+    expect(prepare.status, prepare.stderr).toBe(0);
+    expect(prepare.stderr).toContain("token endpoint https://shared-idp.example.com/oauth/token is also used by another MCP server");
+    const providers = (readMcpOAuthPolicy() as { providers: Record<string, { tokenEndpoints?: unknown[] }> }).providers;
+    expect(providers["mcp:claude-servera"]?.tokenEndpoints ?? []).toEqual([]);
+    expect(providers["mcp:claude-serverb"]?.tokenEndpoints ?? []).toEqual([]);
+    // The path stays reachable for the login, as with `host add`.
+    expect(readPolicy().requests?.["shared-idp.example.com"]?.pathPrefixes).toContain("/oauth/token");
   });
 
   test("printable escapes control, C1, and bidi characters from MCP config and metadata", () => {

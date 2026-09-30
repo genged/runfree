@@ -4,6 +4,7 @@ import https from "node:https";
 import type { AddressInfo } from "node:net";
 import os from "node:os";
 import path from "node:path";
+import tls from "node:tls";
 import { afterAll, beforeAll, describe, expect, test, vi } from "vitest";
 
 import {
@@ -14,6 +15,7 @@ import {
   type DiscoveryHttpResult,
   discoverMcpOAuthHosts,
   isPublicAddress,
+  isRecordableEndpoint,
   pinnedHttpsGet,
   protectedResourceMetadataUrls,
 } from "./mcp-discovery.ts";
@@ -299,6 +301,50 @@ describe("discoverMcpOAuthHosts", () => {
     expect(result.oauthDetected).toBe(true);
   });
 
+  test("a root-path or oversized endpoint is refused, so it can never open the whole host", async () => {
+    for (const [token, registration] of [
+      ["https://auth.example.com/", undefined],
+      [`https://auth.example.com/${"t".repeat(1100)}`, undefined],
+      ["https://auth.example.com/token", "https://auth.example.com/"],
+    ] as const) {
+      const net = fakeNetwork({
+        [PRM_PATH]: { resource: ENDPOINT, authorization_servers: ["https://auth.example.com"] },
+        [AS_META]: { issuer: "https://auth.example.com", token_endpoint: token, ...(registration ? { registration_endpoint: registration } : {}) },
+      });
+      const result = await discoverMcpOAuthHosts(input(), net.deps);
+      expect(result.endpoints.some((entry) => entry.path === "/" || entry.path.length > 1024), token).toBe(false);
+      if (registration) {
+        expect(result.endpoints.map((entry) => entry.kind)).toEqual(["metadata", "token"]);
+        expect(result.rejected.join("\n")).toContain("registration_endpoint is not an exact HTTPS URL");
+      } else {
+        expect(result.hosts).toEqual([]);
+      }
+    }
+  });
+
+  test("a declared metadata URL outside /.well-known is used but not recorded as a metadata endpoint", async () => {
+    const declared = "https://login.example.org/oauth/metadata";
+    const net = fakeNetwork({
+      [declared]: { issuer: "https://login.example.org", token_endpoint: "https://login.example.org/token" },
+    });
+    const result = await discoverMcpOAuthHosts(input({ declaredMetadataUrls: [declared] }), net.deps);
+    expect(result.endpoints).toEqual([{ kind: "token", host: "login.example.org", path: "/token" }]);
+  });
+
+  test("every endpoint discovery returns passes the record predicate", async () => {
+    const net = fakeNetwork(Object.fromEntries([
+      [PRM_PATH, { resource: ENDPOINT, authorization_servers: ["https://auth.example.com/tenant"] }],
+      ["https://auth.example.com/tenant/.well-known/openid-configuration", {
+        issuer: "https://auth.example.com/tenant",
+        token_endpoint: "https://auth.example.com/tenant/oauth2/v2.0/token",
+        registration_endpoint: "https://auth.example.com/tenant/register",
+      }],
+    ]));
+    const result = await discoverMcpOAuthHosts(input(), net.deps);
+    expect(result.endpoints.length).toBe(3);
+    for (const entry of result.endpoints) expect(isRecordableEndpoint(entry.kind, entry.host, entry.path), entry.path).toBe(true);
+  });
+
   test("a declared metadata URL with a port or query is not fetched", async () => {
     const net = fakeNetwork({});
     const result = await discoverMcpOAuthHosts(input({ declaredMetadataUrls: ["https://login.example.org:444/.well-known/x", "https://login.example.org/m?x=1"] }), net.deps);
@@ -469,5 +515,63 @@ describe("pinnedHttpsGet against a local TLS server", () => {
     } finally {
       vi.unstubAllEnvs();
     }
+  });
+});
+
+describe("pinnedHttpsGet parses HTTP/1.1 strictly", () => {
+  const HOST = "raw.discovery.invalid";
+  let dir: string;
+  let cert: string;
+  let server: tls.Server;
+  let port: number;
+  const RESPONSES: Record<string, string> = {
+    "/bad-chunk": "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ntransfer-encoding: chunked\r\n\r\n2\r\n{}XX0\r\n\r\n",
+    "/bad-header": "HTTP/1.1 200 OK\r\ncontent-type : application/json\r\ncontent-length: 2\r\n\r\n{}",
+    "/cl-and-te": "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 2\r\ntransfer-encoding: chunked\r\n\r\n2\r\n{}\r\n0\r\n\r\n",
+    "/two-lengths": "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 2\r\ncontent-length: 3\r\n\r\n{} ",
+    "/huge-head": `HTTP/1.1 200 OK\r\nx-pad: ${"a".repeat(DISCOVERY_LIMITS.maxHeaderBytes)}\r\n\r\n`,
+    "/http2": "HTTP/2 200\r\n\r\n",
+  };
+
+  beforeAll(async () => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), "runfree-mcp-discovery-raw-"));
+    childProcess.execFileSync("openssl", [
+      "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256", "-nodes",
+      "-keyout", path.join(dir, "k"), "-out", path.join(dir, "c"), "-subj", `/CN=${HOST}`, "-days", "1",
+      "-addext", `subjectAltName=DNS:${HOST}`,
+    ], { stdio: "ignore" });
+    cert = fs.readFileSync(path.join(dir, "c"), "utf8");
+    server = tls.createServer({ cert, key: fs.readFileSync(path.join(dir, "k"), "utf8") }, (socket) => {
+      socket.once("data", (data: Buffer) => {
+        const requestPath = /^GET (\S+) HTTP\/1\.1\r\n/.exec(data.toString("latin1"))?.[1] ?? "";
+        socket.end(RESPONSES[requestPath] ?? "HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\n\r\n");
+      });
+      socket.on("error", () => {});
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    port = (server.address() as AddressInfo).port;
+  });
+
+  afterAll(async () => {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  const get = (pathName: string) => pinnedHttpsGet(new URL(`https://${HOST}${pathName}`), [{ address: "127.0.0.1", family: 4 }], {
+    timeoutMs: 3_000,
+    maxBodyBytes: DISCOVERY_LIMITS.maxBodyBytes,
+    testCa: cert,
+    testPort: port,
+  });
+
+  test.each([
+    ["/bad-chunk", "malformed chunked body"],
+    ["/bad-header", "malformed HTTP header"],
+    ["/cl-and-te", "malformed content length"],
+    ["/two-lengths", "conflicting content-length headers"],
+    ["/huge-head", "response headers too large"],
+    ["/http2", "malformed HTTP status line"],
+  ])("%s is refused: %s", async (pathName, reason) => {
+    expect(await get(pathName)).toEqual({ kind: "error", reason });
   });
 });

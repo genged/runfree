@@ -31,7 +31,12 @@ import { projectHash } from "../project-identity.ts";
 import { atomicReplaceFile, isPathInsideByRealpath, safeReadProjectFile } from "../safe-fs.ts";
 import { warn } from "../warnings.ts";
 import { updateCodexConfig } from "./codex-config.ts";
-import { projectEnabledOAuthEndpoints, projectEnabledOAuthHosts, readMcpEnabled } from "./mcp-enabled.ts";
+import {
+  projectEnabledOAuthEndpoints,
+  projectEnabledOAuthHosts,
+  readMcpEnabled,
+  withoutSharedEnabledEndpoints,
+} from "./mcp-enabled.ts";
 import { RUNFREE_RUNTIME_TARGETS, workspaceMetadataTarget } from "./mount-target-policy.ts";
 import { sha256Hex, isRecord } from "../strict-primitives.ts";
 
@@ -1732,15 +1737,25 @@ export function prepareMcpRuntime(options: McpPrepareOptions): McpPrepareResult 
   // else allows get narrowed request rules; their endpoints then join the
   // OAuth mediation policy written below.
   const enabled = options.mcpEnabledPath ? readMcpEnabled(options.projectRoot, options.mcpEnabledPath).file : undefined;
-  const enabledRecords = enabled
-    ? servers.flatMap((server) => {
-      const identity = mcpRuleKey({ agent: server.agent, descriptorDigest: server.descriptorDigest, endpoint: server.endpoint, server: server.name, source: server.source });
-      const record = identity ? enabled.records[identity] : undefined;
-      if (record && server.oauthPolicy) projectEnabledOAuthEndpoints(server.oauthPolicy, record);
-      return record ? [record] : [];
-    })
-    : [];
-  projectEnabledOAuthHosts(options.policy, enabledRecords);
+  const claimants = servers.map((server) => {
+    const identity = enabled
+      ? mcpRuleKey({ agent: server.agent, descriptorDigest: server.descriptorDigest, endpoint: server.endpoint, server: server.name, source: server.source })
+      : undefined;
+    const record = identity ? enabled?.records[identity] : undefined;
+    return {
+      serverKey: `${server.agent}\0${server.source}\0${server.name}`,
+      label: `${server.agent} server ${server.name}`,
+      ...(server.oauthPolicy ? { policy: server.oauthPolicy } : {}),
+      ...(record ? { record } : {}),
+    };
+  });
+  const mediation = withoutSharedEnabledEndpoints(claimants);
+  for (const message of mediation.dropped) warn(message);
+  servers.forEach((server, index) => {
+    const record = mediation.records[index];
+    if (record && server.oauthPolicy) projectEnabledOAuthEndpoints(server.oauthPolicy, record);
+  });
+  projectEnabledOAuthHosts(options.policy, claimants.flatMap((claimant) => claimant.record ? [claimant.record] : []));
   writeMcpOAuthPolicy(options.mcpOAuthPolicyPath, servers, callbackPort);
   writeMcpOperationPolicy(
     options.mcpOperationPolicyPath ?? mcpOperationPolicyPath(path.dirname(options.mcpOAuthPolicyPath)),

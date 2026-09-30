@@ -28,6 +28,8 @@ import {
   boundedEvidence,
   MCP_ENABLED_LIMITS,
   type McpEnabledHost,
+  type McpEnabledRecord,
+  validateMcpEnabledRecord,
   mcpEnabledPath,
   readMcpEnabled,
   removeMcpEnabledRecords,
@@ -48,6 +50,7 @@ import {
   describeSource,
   die,
   ensureStateDirs,
+  loadPolicy,
   loadTokenConfig,
   type McpApproveInput,
   type McpConfigureInput,
@@ -212,7 +215,18 @@ export type McpEnableResult = {
   applied: boolean;
   // The OAuth login the command runs next (OAuth-capable servers only).
   login?: { agent: McpAgent; server: string; source: McpSourceScope };
+  // The same login as a printable, shell-quoted command.
+  loginCommand?: string;
 };
+
+// The hosts the current policy allows, when a policy can be read (display only).
+function currentPolicyHosts(): string[] {
+  try {
+    return loadPolicy().raw.hosts;
+  } catch {
+    return [];
+  }
+}
 
 export type McpEnableDeps = {
   discovery?: DiscoveryDeps;
@@ -292,7 +306,7 @@ export async function mcpEnableIntent(input: McpEnableInput, deps: McpEnableDeps
   // 1. Resolve and validate the entry. No network call happens before this.
   const entry = findMcpEntry(agent, serverName, input.source);
   if (entry.decision.status === "unsupported" || entry.decision.status === "conflict") {
-    die(`cannot enable MCP server ${agent} ${shownName}: ${entry.decision.reason ?? entry.decision.status}`);
+    die(`cannot enable MCP server ${agent} ${shownName}: ${printable(entry.decision.reason ?? entry.decision.status)}`);
   }
   const isProject = entry.source === "project";
   if (isProject) assertApprovableProjectEntry(entry);
@@ -370,9 +384,34 @@ export async function mcpEnableIntent(input: McpEnableInput, deps: McpEnableDeps
   }
   const endpoints = discovery?.endpoints ?? [];
 
+  // The record is built and validated before the review, so everything the
+  // review shows can be saved: a failure here writes nothing.
+  const record: McpEnabledRecord | undefined = oauthCapable && identity && (hosts.length > 0 || endpoints.length > 0)
+    ? {
+      schemaVersion: 1,
+      identity,
+      agent,
+      source: entry.source,
+      server: serverName,
+      enabledAt: new Date().toISOString(),
+      oauthHosts: hosts.map(({ alsoUser: _alsoUser, ...host }) => host),
+      ...(endpoints.length > 0 ? { oauthEndpoints: endpoints.map(({ kind, host, path: endpointPath }) => ({ kind, host, path: endpointPath })) } : {}),
+    }
+    : undefined;
+  if (record && !validateMcpEnabledRecord(record)) {
+    die(`cannot enable MCP server ${agent} ${shownName}: the planned OAuth host record is invalid; pass --no-discover with --oauth-host <host> instead`);
+  }
+
   // 4. The one review.
   const enabledFile = mcpEnabledPath(stateDir());
   const previous = readMcpEnabled(projectRoot(), enabledFile, { quiet: true }).file;
+  // Hosts the narrowing leaves broad: already allowed by the current policy,
+  // or named as `--oauth-host` by another server's record.
+  const broadHosts = new Set<string>([...currentPolicyHosts(), ...(endpointHost ? [endpointHost] : [])]);
+  for (const other of Object.values(previous.records)) {
+    if (other.agent === agent && other.server === serverName && other.source === entry.source) continue;
+    for (const host of other.oauthHosts) if (host.origin === "user") broadHosts.add(host.host);
+  }
   const previousHosts = Object.values(previous.records)
     .filter((record) => record.agent === agent && record.server === serverName && record.source === entry.source)
     .flatMap((record) => record.oauthHosts.map((host) => host.host));
@@ -395,8 +434,10 @@ export async function mcpEnableIntent(input: McpEnableInput, deps: McpEnableDeps
     console.log(`  allow host ${host.host}  [OAuth, ${hostOriginLabel(host)}]`);
     for (const evidence of host.evidence ?? []) console.log(`      ${evidence}`);
     const hostEndpoints = endpoints.filter((endpointEntry) => endpointEntry.host === host.host);
-    if (host.origin === "discovered") {
-      console.log(`      limited to GET/POST on /.well-known${hostEndpoints.map((endpointEntry) => `, ${endpointEntry.path}`).join("")}`);
+    if (host.origin === "discovered" && broadHosts.has(host.host)) {
+      console.log("      already allowed by the current policy; its existing rules stay");
+    } else if (host.origin === "discovered") {
+      console.log(`      limited to GET, HEAD, OPTIONS, and POST on paths starting with /.well-known${hostEndpoints.map((endpointEntry) => `, ${endpointEntry.path}`).join("")}`);
     }
   }
   for (const endpointEntry of endpoints) {
@@ -418,7 +459,7 @@ export async function mcpEnableIntent(input: McpEnableInput, deps: McpEnableDeps
     console.log("  --oauth-host hosts are allowed as given (like runfree host add); the proxy mediates tokens there only for endpoints the server's metadata names");
   }
   if (hosts.length > 0) console.log("  OAuth token requests follow this project's write approval setting (default: ask)");
-  if (login) console.log(`After saving: OAuth login with runfree mcp auth ${agent} ${shellWord(serverName)} --source ${entry.source}`);
+  if (login) console.log(`After saving: OAuth login with: runfree mcp auth ${agent} ${shellWord(serverName)} --source ${entry.source}`);
 
   // 5. The one approval. Without a terminal, the command line named every
   // change (`--no-discover`), so the command itself is the consent.
@@ -436,26 +477,20 @@ export async function mcpEnableIntent(input: McpEnableInput, deps: McpEnableDeps
     console.log(`approved project MCP server: ${agent} ${shownName}`);
     console.log(`digest: ${approval.digest}`);
   }
-  if (oauthCapable && identity && hosts.length > 0) {
-    const saved = saveMcpEnabledRecord(projectRoot(), enabledFile, {
-      schemaVersion: 1,
-      identity,
-      agent,
-      source: entry.source,
-      server: serverName,
-      enabledAt: new Date().toISOString(),
-      oauthHosts: hosts.map(({ alsoUser: _alsoUser, ...host }) => host),
-      ...(endpoints.length > 0 ? { oauthEndpoints: endpoints.map(({ kind, host, path: endpointPath }) => ({ kind, host, path: endpointPath })) } : {}),
-    });
+  if (record) {
+    const saved = saveMcpEnabledRecord(projectRoot(), enabledFile, record);
     if (saved.droppedInvalid > 0) console.log(`dropped ${saved.droppedInvalid} invalid MCP enable record(s) from ${enabledFile}`);
-    console.log(`OAuth hosts: ${hosts.map((host) => host.host).join(", ")}`);
+    console.log(`OAuth hosts: ${hosts.length > 0 ? hosts.map((host) => host.host).join(", ") : "none"}`);
   } else if (oauthCapable) {
     const removed = removeMcpEnabledRecords(projectRoot(), enabledFile, { agent, server: serverName, source: entry.source });
     if (removed.droppedInvalid > 0) console.log(`dropped ${removed.droppedInvalid} invalid MCP enable record(s) from ${enabledFile}`);
     console.log("OAuth hosts: none");
   }
   console.log(`enabled MCP server: ${agent} ${shownName}`);
-  return { applied: true, ...(login ? { login } : {}) };
+  return {
+    applied: true,
+    ...(login ? { login, loginCommand: `runfree mcp auth ${agent} ${shellWord(serverName)} --source ${entry.source}` } : {}),
+  };
 }
 
 export function mcpExplainIntent(input: McpExplainInput): void {

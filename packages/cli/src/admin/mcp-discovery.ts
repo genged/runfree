@@ -250,17 +250,36 @@ function issuerUrl(value: unknown): URL | undefined {
   return url;
 }
 
+export const MAX_ENDPOINT_PATH_CHARS = 1024;
+
+/**
+ * Whether an endpoint can be recorded by `runfree mcp enable`: the one
+ * predicate discovery filters with and the record reader validates with, so
+ * the review never shows an endpoint that cannot be saved. The path must be
+ * printable ASCII, equal its own URL-parsed form, be a valid request-rule
+ * prefix, and not be `/` (a `/` prefix would open the whole host). Metadata
+ * endpoints must be `/.well-known/` documents.
+ */
+export function isRecordableEndpoint(kind: OAuthEndpointKind, host: string, pathName: string): boolean {
+  const checked = checkPolicyHostname(host);
+  if (!checked.ok || checked.host !== host) return false;
+  if (pathName === "/" || !pathName.startsWith("/") || pathName.length > MAX_ENDPOINT_PATH_CHARS) return false;
+  if (!/^[\x21-\x7e]+$/.test(pathName)) return false;
+  try {
+    if (new URL(`https://${host}${pathName}`).pathname !== pathName) return false;
+    if (normalizePathPrefix(pathName) !== pathName) return false;
+  } catch {
+    return false;
+  }
+  return kind !== "metadata" || pathName.includes("/.well-known/");
+}
+
 // An endpoint the proxy can match exactly: HTTPS, no query/fragment, and a
-// path that is also a valid request-rule path prefix.
-function endpointUrl(value: unknown): URL | undefined {
+// recordable path.
+function endpointUrl(value: unknown, kind: OAuthEndpointKind): URL | undefined {
   const url = parseHttpsUrl(value);
   if (!url || url.search !== "" || url.hash !== "") return undefined;
-  try {
-    if (normalizePathPrefix(url.pathname) !== url.pathname) return undefined;
-  } catch {
-    return undefined;
-  }
-  return url;
+  return isRecordableEndpoint(kind, url.hostname, url.pathname) ? url : undefined;
 }
 
 function issuerPath(url: URL): string {
@@ -319,7 +338,10 @@ function parseHead(raw: Buffer): ParsedHead | "incomplete" | string {
   for (const line of lines.slice(1)) {
     const colon = line.indexOf(":");
     if (colon <= 0) return "malformed HTTP header";
-    const name = line.slice(0, colon).trim().toLowerCase();
+    const rawName = line.slice(0, colon);
+    // RFC 9110 token characters only; no whitespace before the colon.
+    if (!/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(rawName)) return "malformed HTTP header";
+    const name = rawName.toLowerCase();
     const value = line.slice(colon + 1).trim();
     const existing = headers.get(name);
     if (existing !== undefined && (name === "content-length" || name === "transfer-encoding" || name === "content-type")) {
@@ -346,6 +368,7 @@ function decodeChunked(raw: Buffer, maxBodyBytes: number): Buffer | "incomplete"
     total += size;
     if (total > maxBodyBytes) return `response larger than ${maxBodyBytes} bytes`;
     if (raw.length < offset + size + 2) return "incomplete";
+    if (raw[offset + size] !== 0x0d || raw[offset + size + 1] !== 0x0a) return "malformed chunked body";
     chunks.push(raw.subarray(offset, offset + size));
     offset += size + 2;
   }
@@ -354,7 +377,9 @@ function decodeChunked(raw: Buffer, maxBodyBytes: number): Buffer | "incomplete"
 function requestOnce(url: URL, target: ResolvedAddress, options: DiscoveryRequestOptions & { testCa?: string | Buffer; testPort?: number; deadline: number }): Promise<DiscoveryHttpResult & { connectFailed?: boolean }> {
   return new Promise((resolve) => {
     let settled = false;
-    let connected = false;
+    // Only a failure before the TCP connect lets the next checked address be
+    // tried; a TLS or HTTP failure after it is the answer for this request.
+    let tcpConnected = false;
     let raw = Buffer.alloc(0);
     let head: ParsedHead | undefined;
     // The socket goes to the checked IP; `servername` drives SNI and the
@@ -377,7 +402,7 @@ function requestOnce(url: URL, target: ResolvedAddress, options: DiscoveryReques
       resolve(result);
     };
     const timer = setTimeout(() => {
-      finish({ kind: "error", reason: `timed out after ${options.timeoutMs} ms`, ...(connected ? {} : { connectFailed: true }) });
+      finish({ kind: "error", reason: `timed out after ${options.timeoutMs} ms`, ...(tcpConnected ? {} : { connectFailed: true }) });
     }, Math.max(1, Math.min(options.timeoutMs, options.deadline - Date.now())));
     const complete = () => {
       if (!head) return;
@@ -397,8 +422,10 @@ function requestOnce(url: URL, target: ResolvedAddress, options: DiscoveryReques
         return finish({ kind: "response", status: head.status, contentType, body: bodyRaw.subarray(0, length) });
       }
     };
+    socket.once("connect", () => {
+      tcpConnected = true;
+    });
     socket.once("secureConnect", () => {
-      connected = true;
       if (socket.alpnProtocol && socket.alpnProtocol !== "http/1.1") {
         finish({ kind: "error", reason: "server did not accept HTTP/1.1" });
         return;
@@ -459,7 +486,7 @@ function requestOnce(url: URL, target: ResolvedAddress, options: DiscoveryReques
       finish({
         kind: "error",
         reason: error.code ? `request failed (${error.code})` : "request failed",
-        ...(connected ? {} : { connectFailed: true }),
+        ...(tcpConnected ? {} : { connectFailed: true }),
       });
     });
   });
@@ -615,12 +642,12 @@ function validateAuthServerMetadata(
     rejected.push(`${source}: issuer does not match ${expectedIssuer.href}`);
     return undefined;
   }
-  const tokenEndpoint = endpointUrl(value.token_endpoint);
+  const tokenEndpoint = endpointUrl(value.token_endpoint, "token");
   if (!tokenEndpoint) {
     rejected.push(`${source}: token_endpoint is missing or is not an exact HTTPS URL on a policy-valid hostname`);
     return undefined;
   }
-  const registrationEndpoint = endpointUrl(value.registration_endpoint);
+  const registrationEndpoint = endpointUrl(value.registration_endpoint, "registration");
   if (value.registration_endpoint !== undefined && !registrationEndpoint) {
     rejected.push(`${source}: registration_endpoint is not an exact HTTPS URL on a policy-valid hostname`);
   }
@@ -751,7 +778,9 @@ export async function discoverMcpOAuthHosts(
       continue;
     }
     addHost(metadata.metadataUrl.hostname, `${via}; metadata ${metadata.metadataUrl.href}`);
-    addEndpoint("metadata", metadata.metadataUrl);
+    if (isRecordableEndpoint("metadata", metadata.metadataUrl.hostname, metadata.metadataUrl.pathname)) {
+      addEndpoint("metadata", metadata.metadataUrl);
+    }
     addHost(token.hostname, `token_endpoint ${token.origin}${token.pathname}`);
     addEndpoint("token", token);
     const registration = metadata.registrationEndpoint;
