@@ -239,6 +239,7 @@ import { parseSessionFileV1, SESSION_ELIGIBILITY_PATH, SESSION_FILES_DIR } from 
 import { SESSION_ADMISSION_LEASE_MAX_DURATION_MS } from "@runfree/runtime-contracts/session-registry";
 
 import { createInternalSessionAdmissionDriver } from "./session-admission-driver.ts";
+import { SessionTeardownIncompleteError } from "./session-admission-probe.ts";
 import { flushWarnings, setOutputWriterForTest } from "../warnings.ts";
 import type { ActiveRuntimePlan } from "./plan.ts";
 import {
@@ -1156,6 +1157,15 @@ describe("internal session admission driver", () => {
       ? [value.message, ...value.errors.flatMap(messages)]
       : [String(value)]);
     expect(messages(failure).join("\n")).toContain("observation-unavailable during delete-session-file");
+    // The 2026-09-29 transcript: the teardown and its one retry fail
+    // identically when Docker is unreachable. That is one failure, reported
+    // once, as a teardown that did not complete — not as an admission probe
+    // failure paired with its own repeat.
+    expect(failure).toBeInstanceOf(SessionTeardownIncompleteError);
+    const aggregate = failure as SessionTeardownIncompleteError;
+    expect(aggregate.message).not.toContain("probe");
+    expect(aggregate.message).toContain("runfree up");
+    expect(aggregate.errors).toHaveLength(1);
 
     expect(mocks.removeSessionMetadata).toHaveBeenCalled();
     expect(mocks.markSessionInterrupted).not.toHaveBeenCalled();
@@ -1180,7 +1190,7 @@ describe("internal session admission driver", () => {
     });
 
     await expect(driver.launchBuiltin("codex")).rejects.toThrow(
-      "session admission probe failed and fail-closed cleanup also failed",
+      "session admission launch failed and fail-closed cleanup also failed",
     );
 
     expect(mocks.removeSessionMetadata).toHaveBeenCalledOnce();

@@ -1,3 +1,5 @@
+import { remedy } from "../remedies.ts";
+
 export const BUILTIN_SESSION_ADMISSION_PROBE_AGENTS = ["claude", "codex", "pi"] as const;
 
 export type SessionAdmissionProbeAgent = typeof BUILTIN_SESSION_ADMISSION_PROBE_AGENTS[number];
@@ -115,6 +117,7 @@ export async function runInternalSessionAdmissionLaunch(
 ): Promise<SessionAdmissionLaunchOutcome> {
   let cleanupUnadmitted = false;
   let provisioningMayBeSelected = (): boolean => false;
+  let outcome: SessionAdmissionLaunchOutcome;
 
   try {
     await steps.preflight();
@@ -128,17 +131,77 @@ export async function runInternalSessionAdmissionLaunch(
     provisioningMayBeSelected = steps.provisioningMayBeSelected ?? ((): boolean => true);
     await steps.proveRunning();
     await steps.activate();
-    const outcome = await steps.awaitCompletion();
-    await cleanupProvisioningSession(steps);
-    return outcome;
+    outcome = await steps.awaitCompletion();
   } catch (failure) {
     if (provisioningMayBeSelected()) {
-      return await throwWithCleanupFailure(failure, () => cleanupProvisioningSession(steps));
+      return await throwWithCleanupFailure(failure, () => cleanupProvisioningSession(steps), "launch");
     }
     if (cleanupUnadmitted) {
-      return await throwWithCleanupFailure(failure, () => steps.cleanupUnadmitted());
+      return await throwWithCleanupFailure(failure, () => steps.cleanupUnadmitted(), "launch");
     }
     throw failure;
+  }
+  // Outside the guard above on purpose. A teardown that fails here is not a
+  // launch failure to be answered with a second teardown and reported as a
+  // pair: it is the one failure, retried once, and reported once.
+  await tearDownAfterCompletion(steps);
+  return outcome;
+}
+
+/**
+ * The session ended but its ordered teardown did not complete.
+ *
+ * Whatever step stopped the teardown left the record in place, so the
+ * session's address stays reserved and the next start or launch finishes the
+ * job; this error says so rather than describing an admission that failed.
+ * Two identical failures — the ordinary shape when Docker is unreachable — are
+ * reported once.
+ */
+export class SessionTeardownIncompleteError extends AggregateError {
+  constructor(failures: readonly unknown[]) {
+    super(
+      distinctFailures(failures),
+      "the session ended but its teardown did not complete; any lifecycle record it left keeps the session's"
+        + ` address reserved, and the next \`${remedy.up()}\` or launch finishes the teardown once Docker is reachable`,
+    );
+    this.name = "SessionTeardownIncompleteError";
+  }
+}
+
+function failureIdentity(failure: unknown): string {
+  return failure instanceof Error ? `${failure.name}: ${failure.message}` : String(failure);
+}
+
+function distinctFailures(failures: readonly unknown[]): unknown[] {
+  const seen = new Set<string>();
+  return failures.filter((failure) => {
+    const identity = failureIdentity(failure);
+    if (seen.has(identity)) return false;
+    seen.add(identity);
+    return true;
+  });
+}
+
+/**
+ * The post-completion teardown, with the one retry the ladder has always
+ * given it.
+ *
+ * A retry that completes still reports the first failure — the first pass
+ * left something undone that this host saw fail — but a retry that also fails
+ * becomes one `SessionTeardownIncompleteError`, never a probe failure paired
+ * with its own repeat.
+ */
+async function tearDownAfterCompletion(steps: SessionAdmissionProbeSteps): Promise<void> {
+  try {
+    await cleanupProvisioningSession(steps);
+    return;
+  } catch (first) {
+    try {
+      await cleanupProvisioningSession(steps);
+    } catch (second) {
+      throw new SessionTeardownIncompleteError([first, second]);
+    }
+    throw first;
   }
 }
 
@@ -167,13 +230,17 @@ async function cleanupProvisioningSession(steps: SessionAdmissionProbeSteps): Pr
   await steps.tearDown();
 }
 
-async function throwWithCleanupFailure(failure: unknown, cleanup: () => Promise<void>): Promise<never> {
+async function throwWithCleanupFailure(
+  failure: unknown,
+  cleanup: () => Promise<void>,
+  sequence: "probe" | "launch" = "probe",
+): Promise<never> {
   try {
     await cleanup();
   } catch (cleanupFailure) {
     throw new AggregateError(
-      [failure, cleanupFailure],
-      "session admission probe failed and fail-closed cleanup also failed",
+      distinctFailures([failure, cleanupFailure]),
+      `session admission ${sequence} failed and fail-closed cleanup also failed`,
     );
   }
   throw failure;

@@ -16,6 +16,7 @@ import { describe, expect, test } from "vitest";
 import {
   runInternalSessionAdmissionLaunch,
   runInternalSessionAdmissionProbe,
+  SessionTeardownIncompleteError,
   type SessionAdmissionLaunchOutcome,
   type SessionAdmissionLaunchSteps,
 } from "./session-admission-probe.ts";
@@ -181,6 +182,86 @@ describe("internal session admission launch kernel", () => {
     const causes = flatten(failure).join("\n");
     expect(causes).toContain("activate failed");
     expect(causes).toContain("revocation failed");
+  });
+});
+
+describe("post-completion teardown failures", () => {
+  // The 2026-09-29 transcript: a daemon that died under a live session made
+  // the owner's teardown and its one retry fail with the same observation, and
+  // the launch reported them as `error[0]` and `error[1]` of an "admission
+  // probe failed" aggregate. It was one failure, seen twice.
+  test("an identical failure on the teardown and its retry is reported once, as an incomplete teardown", async () => {
+    const { calls, steps } = recorder();
+    const failing = {
+      ...steps,
+      tearDown: async () => {
+        calls.push("tearDown");
+        throw new Error("observation-unavailable during delete-session-file: Cannot connect to the Docker daemon");
+      },
+    } satisfies SessionAdmissionLaunchSteps;
+
+    const failure = await runInternalSessionAdmissionLaunch(failing).catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(SessionTeardownIncompleteError);
+    const aggregate = failure as SessionTeardownIncompleteError;
+    expect(aggregate.errors).toHaveLength(1);
+    expect(aggregate.message).not.toContain("probe");
+    expect(aggregate.message).toContain("runfree up");
+    // The retry the ladder has always given the teardown is kept, and there is
+    // no third pass.
+    expect(calls.filter((call) => call === "tearDown")).toHaveLength(2);
+  });
+
+  test("two different teardown failures are both kept", async () => {
+    const { steps } = recorder();
+    let attempt = 0;
+    const failing = {
+      ...steps,
+      tearDown: async () => {
+        attempt += 1;
+        throw new Error(`teardown attempt ${attempt} failed`);
+      },
+    } satisfies SessionAdmissionLaunchSteps;
+
+    const failure = await runInternalSessionAdmissionLaunch(failing).catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(SessionTeardownIncompleteError);
+    expect((failure as SessionTeardownIncompleteError).errors.map(String))
+      .toEqual(["Error: teardown attempt 1 failed", "Error: teardown attempt 2 failed"]);
+  });
+
+  test("a retry that completes still reports the first failure", async () => {
+    const { steps } = recorder();
+    let attempt = 0;
+    const flaky = {
+      ...steps,
+      tearDown: async () => {
+        attempt += 1;
+        if (attempt === 1) throw new Error("first teardown failed");
+      },
+    } satisfies SessionAdmissionLaunchSteps;
+
+    await expect(runInternalSessionAdmissionLaunch(flaky)).rejects.toThrow("first teardown failed");
+    expect(attempt).toBe(2);
+  });
+
+  test("a launch failure paired with an identical cleanup failure is reported once", async () => {
+    const { steps } = recorder();
+    const failing = {
+      ...steps,
+      awaitCompletion: async (): Promise<SessionAdmissionLaunchOutcome> => {
+        throw new Error("Cannot connect to the Docker daemon");
+      },
+      tearDown: async () => {
+        throw new Error("Cannot connect to the Docker daemon");
+      },
+    } satisfies SessionAdmissionLaunchSteps;
+
+    const failure = await runInternalSessionAdmissionLaunch(failing).catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(AggregateError);
+    expect((failure as AggregateError).message).toBe("session admission launch failed and fail-closed cleanup also failed");
+    expect((failure as AggregateError).errors).toHaveLength(1);
   });
 });
 
