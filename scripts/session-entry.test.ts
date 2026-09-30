@@ -51,7 +51,8 @@ type ProbeModule = Readonly<{
   EXIT_USAGE: number;
   PROXY_PORT: number;
   READINESS_REQUEST: string;
-  ATTEMPT_CONNECT_TIMEOUTS_MS: readonly number[];
+  ATTEMPT_CONNECT_TIMEOUT_MS: number;
+  RETRY_PAUSE_MS: number;
   TOTAL_TIMEOUT_MS: number;
   probeUntilActive: (options: Readonly<{
     host: string;
@@ -339,7 +340,9 @@ describe("session readiness probe against the real request proxy", () => {
 
     expect(code).toBe(probeModule.EXIT_ACTIVE);
     expect(calls).toBe(2);
-    expect(elapsed).toBeGreaterThanOrEqual(probeModule.ATTEMPT_CONNECT_TIMEOUTS_MS[0] - 5);
+    expect(elapsed).toBeGreaterThanOrEqual(probeModule.ATTEMPT_CONNECT_TIMEOUT_MS - 5);
+    // One short attempt, one pause, and the served answer: well under the old
+    // single attempt's 1 s connect timeout.
     expect(elapsed).toBeLessThan(900);
     expect(proxy.requests).toEqual([SESSION_ADMISSION_PROVISIONING_REQUEST]);
   });
@@ -363,8 +366,10 @@ describe("session readiness probe against the real request proxy", () => {
     expect(code).toBe(probeModule.EXIT_UNREACHABLE);
     expect(elapsed).toBeGreaterThanOrEqual(probeModule.TOTAL_TIMEOUT_MS - 25);
     expect(elapsed).toBeLessThan(probeModule.TOTAL_TIMEOUT_MS + 700);
-    // The escalating attempts were all made before the budget ran out.
-    expect(calls).toBeGreaterThan(probeModule.ATTEMPT_CONNECT_TIMEOUTS_MS.length);
+    // Short attempts, one after another, until the budget ran out.
+    expect(calls).toBeGreaterThanOrEqual(
+      Math.floor(probeModule.TOTAL_TIMEOUT_MS / (probeModule.ATTEMPT_CONNECT_TIMEOUT_MS + probeModule.RETRY_PAUSE_MS)),
+    );
   });
 
   test("an attempt cut short by the run's budget does not replace the last answer", async () => {
@@ -496,17 +501,20 @@ describe("session entry", () => {
   });
 
   test("starts the next probe run within a few tens of milliseconds of the last (launch plan Task 7)", async () => {
-    // A probe stand-in that fails at once, so the only thing between runs is
-    // the entry's own pause. The whole-second clock gives the loop one to two
-    // seconds; a 250 ms pause fits at most nine runs in that, a 20 ms one many.
+    // A probe stand-in that records when it ran and fails at once, so the only
+    // thing between two runs is the entry's own loop and pause. The median gap
+    // is well under the old 250 ms pause even on a loaded host.
     const runsPath = path.join(tmp, "probe-runs");
-    fs.writeFileSync(probePath, `#!/bin/sh\necho run >> "${runsPath}"\nexit 4\n`, { mode: 0o755 });
+    fs.writeFileSync(probePath, `#!/bin/sh\ndate +%s%N >> "${runsPath}"\nexit 4\n`, { mode: 0o755 });
     const proxy = await fakeProxy([ACTIVE_RESPONSE]);
-    const result = await runEntry([fakeAgentPath], entryEnv(proxy.port, { RUNFREE_SESSION_ENTRY_TIMEOUT_MS: "2000" }));
+    const result = await runEntry([fakeAgentPath], entryEnv(proxy.port, { RUNFREE_SESSION_ENTRY_TIMEOUT_MS: "3000" }));
 
     expect(result.status, result.stderr).toBe(111);
-    const runs = fs.readFileSync(runsPath, "utf8").split("\n").filter(Boolean).length;
-    expect(runs).toBeGreaterThan(15);
+    const stamps = fs.readFileSync(runsPath, "utf8").split("\n").filter(Boolean).map((line) => Number(BigInt(line) / 1_000_000n));
+    expect(stamps.length).toBeGreaterThan(5);
+    const gaps = stamps.slice(1).map((stamp, index) => stamp - stamps[index]).sort((left, right) => left - right);
+    const median = gaps[Math.floor(gaps.length / 2)];
+    expect(median).toBeLessThan(200);
   });
 
   test("prints the waiting notice once after two seconds and nothing on the fast path", async () => {

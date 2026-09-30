@@ -38,7 +38,9 @@ export type SessionAdmissionWatchTarget = Readonly<{
    * The host's atomic writes create a `.tmp` name first; that event would
    * only schedule a scan of the unchanged state, so it is ignored and the
    * rename's own event (which names the final `.json`) triggers the scan.
-   * A missing name is always relevant.
+   * An unnamed event is relevant. On Linux, events on the watched directory
+   * itself (replaced, deleted, re-moded) carry the directory's own name and
+   * are ignored here: the backstop tick sees them and re-arms.
    */
   relevant: (filename: string | null) => boolean;
 }>;

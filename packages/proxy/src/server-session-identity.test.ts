@@ -541,6 +541,16 @@ const ADMISSION_PATHS = [
   ["with the backstop interval alone", { RUNFREE_SESSION_ADMISSION_WATCH: "off" }],
 ] as const;
 
+/**
+ * The path under test is the one actually running: three armed directories
+ * with the watcher, none without. Without this, a watcher that never armed
+ * would pass the watcher cases on the backstop alone.
+ */
+function expectWatcherArmed(proxy: RunningProxy, watchEnv: Readonly<Record<string, string>>): void {
+  const armed = proxy.output().split("\n").filter((line) => line.startsWith("proxy: session admission watch: watching "));
+  expect(armed).toHaveLength(watchEnv.RUNFREE_SESSION_ADMISSION_WATCH === "off" ? 0 : 3);
+}
+
 describe("proxy server session admission at the event-driven cadence", () => {
   test.each(ADMISSION_PATHS)("removing the session file closes the open tunnel and refuses the next CONNECT %s (I1)", async (_label, watchEnv) => {
     const testState = state();
@@ -551,6 +561,7 @@ describe("proxy server session admission at the event-driven cadence", () => {
       policy: { hosts: ["127.0.0.1"], tokens: {}, writeApproval: "allow" },
     });
     await waitUntilServed(proxy.port);
+    expectWatcherArmed(proxy, watchEnv);
     const tunnel = await openConnectTunnel({ authority: "127.0.0.1:443", proxyPort: proxy.port });
     expect(tunnel.head.statusCode).toBe(200);
     const tlsSocket = await tlsHandshakeOverTunnel(tunnel.socket);
@@ -578,6 +589,7 @@ describe("proxy server session admission at the event-driven cadence", () => {
     })]);
     const proxy = await startSessionProxy(testState, watchEnv);
     await waitUntilServed(proxy.port);
+    expectWatcherArmed(proxy, watchEnv);
     await waitUntilServed(proxy.port, false);
     // Refused on the lease's own clock, well inside the served wait's bound.
     expect(Date.now() - inspectedAt.getTime()).toBeLessThan(8_000);
@@ -599,6 +611,7 @@ describe("proxy server session admission at the event-driven cadence", () => {
       policy: { hosts: ["127.0.0.1"], tokens: {}, writeApproval: "allow" },
     });
     await waitUntilServed(proxy.port);
+    expectWatcherArmed(proxy, {});
     const tunnel = await openConnectTunnel({ authority: "127.0.0.1:443", proxyPort: proxy.port });
     expect(tunnel.head.statusCode).toBe(200);
     const tlsSocket = await tlsHandshakeOverTunnel(tunnel.socket);

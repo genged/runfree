@@ -477,7 +477,7 @@ grants nothing. The 100 ms interval stays: it alone sees a lease run out
 (no file changes), and it covers a lost event or a watcher that failed or
 never armed, which it re-arms. A scan that lands inside the host's atomic
 replace (a changed inode or a link count other than 1 on the name) reads the
-file again, up to three times, instead of dropping it. Scheduling can still
+file again, three reads in all, instead of dropping it. Scheduling can still
 delay either process. Container creation waits for explicit retirement proof and
 does not assume a maximum consumer delay.
 
@@ -518,9 +518,9 @@ directory, and the driver's ladder is:
 5. **Activate** writes the session file. This is the first step that widens
    what the container may do; on the file's own event (or within one 100 ms
    loop) the firewall admits the address, the readiness probe gets `200
-   active`, and the agent execs. The probe retries with short connect
-   timeouts inside one 2 s run, because the firewall drops a
-   not-yet-admitted SYN without a reset and Linux resends it only after 1 s.
+   active`, and the agent execs. The probe retries 250 ms connect attempts
+   inside one 2 s run, because the firewall drops a not-yet-admitted SYN
+   without a reset and Linux resends it only after 1 s.
    A failure after the write deletes the file again rather than leaving
    authority behind.
 6. **Await handoff** keeps the lifecycle lock while it polls a daemon-side

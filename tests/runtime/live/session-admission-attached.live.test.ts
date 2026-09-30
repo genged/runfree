@@ -106,13 +106,17 @@ const extendedTest = liveTierSelected("extended") ? test : test.skip;
 /** How long the cadence case holds a launch before its file: past the old probe's 1 s connect timeout. */
 const ENTRY_MID_DROP_HOLD_MS = 3_000;
 /**
- * Release to the arriving agent's first forwarded request: the sealed file
- * write (one `docker exec`), the consumers' event-driven rescan, at most one
- * short probe attempt, the agent's start, one request through the proxy, and
- * the host seeing the recorded answer over the bind mount. A hypothesis until
- * the first Docker run records `live-timing: release-to-first-request`.
+ * From the host first reading the arriving session's file as served to its
+ * agent's first forwarded request being recorded: at most one 250 ms probe
+ * attempt and a 20 ms pause (plus a Node start if the file landed between two
+ * probe runs), the agent's start, one request through the proxy, and the
+ * host's 100 ms poll of the recorded answer over the bind mount. The old probe
+ * sat out the rest of a 1 s connect timeout plus a 250 ms pause here. A
+ * hypothesis until the first Docker run records `live-timing:
+ * served-to-first-request`; one sample cannot separate the two probes
+ * strictly, so the mechanism itself is proven by `scripts/session-entry.test.ts`.
  */
-const RELEASE_TO_FIRST_REQUEST_BOUND_MS = 1_500;
+const SERVED_TO_FIRST_REQUEST_BOUND_MS = 1_000;
 
 describe("attached per-session authority is exact and drift after the proof fails closed", () => {
   // Called for its validation, not its value, exactly as the sibling describes
@@ -830,8 +834,8 @@ describe("attached per-session authority is exact and drift after the proof fail
     // (1) Latency: the arriving launch is held before its session file for
     // longer than the old 1 s connect timeout, so its entry's probe is caught
     // mid dropped SYN when the file lands — the case the old probe spent its
-    // whole connect timeout on. From the release to the agent's first
-    // forwarded request is bounded by the file write, one probe attempt, the
+    // whole connect timeout on. From the file being served to the agent's
+    // first forwarded request is bounded by one short probe attempt, the
     // agent's start and one request, not by that timeout.
     //
     // (2) I8: every host publication (the arriving launch's IP fence, its
@@ -882,25 +886,32 @@ describe("attached per-session authority is exact and drift after the proof fail
         allowExistingSessions: true,
         extraEnv: FAST_HEARTBEAT_ENV,
       });
-      arrivingContainerId = arriving.held.records
-        .map((record) => record.containerId)
-        .find((containerId) => containerId && containerId !== servedRecord.containerId) ?? undefined;
+      const arrivingRecord = arriving.held.records
+        .find((record) => record.containerId && record.containerId !== servedRecord.containerId);
+      arrivingContainerId = arrivingRecord?.containerId ?? undefined;
       expect(arrivingContainerId, `the held launch names no container of its own: ${JSON.stringify(arriving.held)}`)
         .toBeTruthy();
+      const arrivingIp = String(arrivingRecord?.sourceIp);
       // Longer than the old probe's 1 s connect timeout, and past one of the
       // served session's 2 s heartbeats.
       await new Promise((resolve) => setTimeout(resolve, ENTRY_MID_DROP_HOLD_MS));
 
-      const releasedAt = performance.now();
       arriving.release();
       arrivingReleased = true;
+      await pollUntil(
+        () => servedSourceIps(proxyId).includes(arrivingIp),
+        CONSUMER_CONVERGENCE_TIMEOUT_MS,
+        "the arriving session's file to be served",
+        { label: "the arriving launch", completion: arriving.completion, output: arriving.output },
+      );
+      const servedAt = performance.now();
       const first = firstRequestAnswer(fixture, await firstRequestResult(fixture));
-      const releaseToFirstRequestMs = performance.now() - releasedAt;
-      console.log(`live-timing: release-to-first-request ms=${Math.round(releaseToFirstRequestMs)}`);
+      const servedToFirstRequestMs = performance.now() - servedAt;
+      console.log(`live-timing: served-to-first-request ms=${Math.round(servedToFirstRequestMs)}`);
       expect(admittedToUnresolvableHost(first), `the arriving agent's first request was not forwarded: ${first.detail}`)
         .toBe(true);
-      expect(releaseToFirstRequestMs, "the arriving entry waited out a connect timeout after its file landed")
-        .toBeLessThan(RELEASE_TO_FIRST_REQUEST_BOUND_MS);
+      expect(servedToFirstRequestMs, "the arriving entry waited out a connect timeout after its file was served")
+        .toBeLessThan(SERVED_TO_FIRST_REQUEST_BOUND_MS);
 
       // Several more heartbeats of both sessions, then the served session's
       // hold must still be the same open request.

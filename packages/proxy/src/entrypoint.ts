@@ -294,6 +294,8 @@ export function createSessionAdmissionScheduler(input: SessionAdmissionScheduler
     tick,
     start() {
       stopped = false;
+      watch?.close();
+      if (timer !== undefined) clearInterval(timer);
       // Watch, then list: the watcher is armed before the first reconcile, so
       // a write that lands between the two is seen by one or the other.
       watch = input.createWatch?.(() => {

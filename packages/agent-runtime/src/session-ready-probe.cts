@@ -28,11 +28,13 @@
 // One run retries (launch plan Task 7). A dropped SYN is only retransmitted
 // after Linux's 1 s initial RTO, so a single attempt started before the file
 // landed used to hold the entry for its whole 1 s connect timeout. A run now
-// makes attempts with short connect timeouts (`ATTEMPT_CONNECT_TIMEOUTS_MS`,
-// escalating so a loaded host still connects) and a `RETRY_PAUSE_MS` pause,
-// retrying every answer except `active`, until one `TOTAL_TIMEOUT_MS` budget
-// for the whole run is spent. A connected attempt may use the rest of that
-// budget for its answer.
+// makes attempts with a short connect timeout (`ATTEMPT_CONNECT_TIMEOUT_MS`;
+// the SYN-ACK on the session's own bridge is answered by the proxy's kernel,
+// so no healthy host needs more) and a `RETRY_PAUSE_MS` pause, retrying every
+// answer except `active`, until one `TOTAL_TIMEOUT_MS` budget for the whole
+// run is spent. A connected attempt may use the rest of that budget for its
+// answer. Once the file is served, the entry is released within one attempt
+// and one pause, plus one Node start when the file lands between two runs.
 //
 // Exit codes (for logs; the entry treats every non-zero code the same). A
 // run's code is its last attempt's, except that an attempt cut short by the
@@ -50,8 +52,8 @@
 import net from "node:net";
 
 export const PROXY_PORT = 8080;
-/** Per-attempt connect timeouts; attempts past the list use the remaining budget. */
-export const ATTEMPT_CONNECT_TIMEOUTS_MS: readonly number[] = Object.freeze([150, 150, 300, 300, 600]);
+/** Per-attempt connect timeout (capped by what is left of the run's budget). */
+export const ATTEMPT_CONNECT_TIMEOUT_MS = 250;
 export const RETRY_PAUSE_MS = 20;
 /** The whole run's budget, every attempt and pause included. */
 export const TOTAL_TIMEOUT_MS = 2_000;
@@ -157,7 +159,7 @@ export async function probeUntilActive(options: Readonly<{
       host: options.host,
       port: options.port,
       connect,
-      connectTimeoutMs: Math.min(ATTEMPT_CONNECT_TIMEOUTS_MS[index] ?? remaining, remaining),
+      connectTimeoutMs: Math.min(ATTEMPT_CONNECT_TIMEOUT_MS, remaining),
       totalTimeoutMs: remaining,
     });
     // An attempt the run's own budget cut short says nothing about the proxy,

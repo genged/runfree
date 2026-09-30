@@ -100,17 +100,16 @@ export function isSafeDirectory(directory: string, ownerUid: number): boolean {
 // caught too. Unlike that function, failures are returned as data (this
 // scanner never throws) so callers can report a per-file drop reason.
 //
-//
 // The host's own atomic replace (write a temp file, rename it over the name)
 // looks, from a concurrent reader, like two of those refusals: a different
 // file between the lstat and the open, and a link count that is not 1 while
 // the replaced inode is being unlinked (observed on tmpfs and overlayfs).
 // Since the consumers rescan on the rename's inotify events (launch plan Task
 // 7), a scan lands inside that window on every publication, where the 100 ms
-// loop rarely did. So those two outcomes alone re-read, a bounded number of
-// times, from a fresh lstat. Every accepted read still has a link count of 1
-// on both stats and its lstat and fstat agree; a file that stays hard-linked
-// or keeps changing under every re-read stays unsafe.
+// loop rarely did. So those two outcomes alone read again from a fresh lstat,
+// three reads in all. Every accepted read still has a link count of 1 on both
+// stats and its lstat and fstat agree; a file that stays hard-linked or keeps
+// changing under every read stays unsafe.
 const OWNED_FILE_UNSETTLED_READS = 3;
 
 type OwnedFileAttempt = OwnedFileRead | { kind: "unsettled"; reason: UnsafeReason };

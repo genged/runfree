@@ -357,12 +357,13 @@ describe("event-driven session admission scheduler", () => {
   };
 
   function schedulerWithFakeWatch(reconcileSessionAdmission: () => Promise<void>, log: (line: string) => void = () => {}) {
-    const fake: FakeWatch = { fire: () => {}, rearms: 0, closed: false };
+    const fake: FakeWatch & { created: number } = { fire: () => {}, rearms: 0, closed: false, created: 0 };
     const scheduler = createSessionAdmissionScheduler({
       controller: { reconcileSessionAdmission },
       intervalMs: 100,
       log,
       createWatch: (onChange) => {
+        fake.created += 1;
         fake.fire = onChange;
         return {
           rearm: () => {
@@ -440,8 +441,10 @@ describe("event-driven session admission scheduler", () => {
     vi.useFakeTimers();
     const reconcile = vi.fn(async () => {});
     const { scheduler, fake } = schedulerWithFakeWatch(reconcile);
-    fake.fire();
-    await vi.advanceTimersByTimeAsync(0);
+    // Nothing is watched until start, which main() calls only after the
+    // controller is initialized.
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(fake.created).toBe(0);
     expect(reconcile).not.toHaveBeenCalled();
 
     scheduler.start();
