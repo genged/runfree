@@ -191,6 +191,27 @@ export function parseDockerDaemonIdentity(stdout: string): DockerDaemonIdentity 
   return Object.freeze({ id, serverVersion, kernelVersion, liveRestoreEnabled: value.LiveRestoreEnabled });
 }
 
+/**
+ * Why a `docker info --format '{{json .}}'` that exited 0 still did not reach
+ * the daemon, or undefined when it did. Format mode prints what the client has
+ * and lists daemon failures in `ServerErrors` instead of failing the command,
+ * so the exit status alone does not prove a reachable daemon. Output that is
+ * not a JSON object reports no error here; it yields no daemon identity, which
+ * keeps every launch off the warm path.
+ */
+export function dockerInfoServerError(stdout: string): string | undefined {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(stdout);
+  } catch {
+    return undefined;
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
+  const errors = (parsed as Record<string, unknown>).ServerErrors;
+  if (errors === undefined || errors === null || (Array.isArray(errors) && errors.length === 0)) return undefined;
+  return Array.isArray(errors) ? errors.map(String).join("; ") : "docker info reported server errors";
+}
+
 /** The identity the most recent availability check in this process observed, if it parsed. */
 export function lastObservedDockerDaemonIdentity(): DockerDaemonIdentity | undefined {
   return lastDockerDaemonIdentity;
@@ -202,7 +223,7 @@ function dockerAvailable(context: RuntimeContext, io: RuntimeIO): boolean {
   }
   lastDockerDaemonIdentity = undefined;
   const info = io.capture("docker", ["info", "--format", "{{json .}}"], dockerClientEnvOptions(context));
-  if (info.status !== 0) {
+  if (info.status !== 0 || dockerInfoServerError(info.stdout) !== undefined) {
     die("docker daemon not running - start Docker / OrbStack first");
   }
   lastDockerDaemonIdentity = parseDockerDaemonIdentity(info.stdout);

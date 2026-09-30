@@ -51,6 +51,7 @@ import {
 } from "./component-state-v2.ts";
 import {
   effectiveControlPlaneMatchesLiveRuntimeValidationV2,
+  effectiveControlPlaneMatchesRuntimeValidationV2,
   proveCandidateControlPlaneV2,
   proveAndSelectEffectiveControlPlaneV2,
   reproveRecordedCandidateControlPlaneV2,
@@ -166,6 +167,7 @@ import {
   removeWarmProofRecord,
   tryWarmRuntimeValidation,
   type WarmProofInput,
+  type WarmProofVerdict,
   type WarmValidation,
 } from "./warm-proof.ts";
 import { TOKEN_SYNC_DEFERRED_STATUS } from "./constants.ts";
@@ -298,6 +300,8 @@ async function finalizeValidatedRuntime(
   withCredentialResolution: (work: () => Promise<number>) => Promise<number> = (work) => work(),
   credentialMode: "source-truth" | "receipt-gated" = "source-truth",
   launchHandoff?: LaunchHandoffRequest,
+  /** The preparation skipped held tokens (launch plan D4): a source-truth sync must re-read them first. */
+  preparedReceiptGated = false,
 ): Promise<RuntimeStartResult> {
   const context = runtimeContextFromActivePlan(plan);
   const activeContext = { ...context, validatedRuntime: proof };
@@ -374,6 +378,9 @@ async function finalizeValidatedRuntime(
     "token-sync",
     () => runCredentialSync(async () => {
       if (credentialMode !== "receipt-gated") {
+        // A proxy replaced after a receipt-gated preparation needs every
+        // source: re-read them, outside the lock, before the sync.
+        if (preparedReceiptGated) await io.prepareTokenSources?.(activeContext);
         return await syncProxyManagedTokens((intent) => io.admin(intent, activeContext), verbose);
       }
       const warm = await syncWarmLaunchTokens({
@@ -1486,7 +1493,12 @@ export async function startRuntime(
         timings.report("validation:warm-proof", "unavailable");
         return undefined;
       }
-      const verdict = timings.time("validation:warm-proof-check", () => tryWarmRuntimeValidation(input));
+      let verdict: WarmProofVerdict = timings.time("validation:warm-proof-check", () => tryWarmRuntimeValidation(input));
+      // The same no-Docker selection check the full path's reuse decision
+      // makes (image ref, rendered topology, generation, proxy id, contract).
+      if (verdict.kind === "match" && !effectiveControlPlaneMatchesRuntimeValidationV2(activePlan, verdict.validation.runtimeProof)) {
+        verdict = { kind: "mismatch", field: "effective-selection" };
+      }
       timings.report("validation:warm-proof", verdict.kind === "mismatch" ? `mismatch:${verdict.field}` : verdict.kind);
       if (verdict.kind !== "match") {
         if (verdict.kind === "unavailable") reportRuntimeVerbose(verbose, `warm-proof unavailable: ${verdict.reason}`);
@@ -1693,6 +1705,7 @@ export async function startRuntime(
         async (work) => { heldLifecycleLock.release(); return await work(); },
         credentialMode,
         launchHandoff,
+        receiptGatedCredentials,
       );
     };
     if (upgradePlan.action === "component-select" && runningWarmRuntime(activeContext, adapters.docker)) {

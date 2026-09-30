@@ -4028,6 +4028,32 @@ describe("runtime command flow", () => {
       expect(warm.kind === "ready" && warm.credentialFreshness).toBe("source-truth");
     });
 
+    test("a proxy replaced after a receipt-gated preparation re-reads every source before the source-truth sync", async () => {
+      const context = launchContext();
+      const prepares: Array<Readonly<{ mode?: string }> | undefined> = [];
+      let replaceFirstProxyObservation = false;
+      const io = createRuntimeIO({
+        // The proxy this launch observes first is not the one it syncs against.
+        capture: (command, args) => {
+          if (!replaceFirstProxyObservation || command !== "docker" || args[0] !== "ps" || args[1] !== "-q") return undefined;
+          if (!args.includes("label=com.docker.compose.service=proxy")) return undefined;
+          replaceFirstProxyObservation = false;
+          return captureResult(0, `${"9".repeat(64)}\n`);
+        },
+      });
+      io.prepareTokenSources = async (_context, options) => { prepares.push(options); };
+      expect((await startRuntime(context, io, false, { launch: true })).status).toBe(0);
+      const warmStart = io.calls.length;
+      prepares.length = 0;
+      replaceFirstProxyObservation = true;
+      const warm = await startRuntime(context, io, false, { launch: true });
+      expect(warm.status).toBe(0);
+      expect(tokenSyncCalls(io.calls.slice(warmStart))).toEqual([["token", "sync"]]);
+      // The warm preparation skipped held tokens; source-truth reads them all.
+      expect(prepares).toEqual([{ mode: "convergence" }, undefined]);
+      expect(warm.kind === "ready" && warm.credentialFreshness).toBe("source-truth");
+    });
+
     test("runfree up and a cold launch keep the source-truth sync", async () => {
       const context = launchContext();
       const io = createRuntimeIO();

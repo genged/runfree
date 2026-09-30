@@ -1,7 +1,7 @@
 import { expect, test } from "vitest";
 
 import { proxyNftablesTableJson } from "../proxy-nftables-proof.fixture.ts";
-import { parseDockerDaemonIdentity } from "./docker.ts";
+import { dockerInfoServerError, parseDockerDaemonIdentity } from "./docker.ts";
 import { assertWarmValidation, nftRulesetShapeSha256 } from "./warm-proof.ts";
 
 function withSessionMembers(raw: string, members: readonly string[]): string {
@@ -46,6 +46,19 @@ test("the daemon identity parses only a complete docker info JSON", () => {
   ]) {
     expect(parseDockerDaemonIdentity(broken)).toBeUndefined();
   }
+});
+
+test("a formatted docker info that exits 0 with server errors reports an unreachable daemon", () => {
+  const info = { ID: "abc", ServerVersion: "29.0.0", KernelVersion: "6.10.14-linuxkit", LiveRestoreEnabled: false };
+  expect(dockerInfoServerError(JSON.stringify(info))).toBeUndefined();
+  expect(dockerInfoServerError(JSON.stringify({ ...info, ServerErrors: [] }))).toBeUndefined();
+  // Format mode prints what it has and lists the daemon failure here.
+  expect(dockerInfoServerError(JSON.stringify({ ServerErrors: ["Cannot connect to the Docker daemon at unix:///var/run/docker.sock"] })))
+    .toContain("Cannot connect to the Docker daemon");
+  // Output that is not a JSON object is no daemon identity (no warm path),
+  // but not a reported daemon failure either.
+  expect(dockerInfoServerError("")).toBeUndefined();
+  expect(parseDockerDaemonIdentity("")).toBeUndefined();
 });
 
 test("a warm validation cannot be built by hand", () => {

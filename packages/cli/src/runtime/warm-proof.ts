@@ -335,8 +335,7 @@ function judgeWarmObservation(input: WarmProofInput, observation: WarmObservatio
   }
   if (proxy.Image !== effective.proxyImageId) return invalid("proxy-image");
   if (plan.generationV2.controlPlane.controlPlaneGenerationDigest !== effective.controlPlaneGenerationDigest
-    || (plan.activeRuntime.controlPlaneMaterializationDigest ?? effective.controlPlaneMaterializationDigest)
-      !== effective.controlPlaneMaterializationDigest) {
+    || plan.activeRuntime.controlPlaneMaterializationDigest !== effective.controlPlaneMaterializationDigest) {
     return invalid("control-plane-selection");
   }
 
