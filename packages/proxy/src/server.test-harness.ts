@@ -61,9 +61,6 @@ const HOST_PROXY_ENV_KEYS = [
   "no_proxy",
 ] as const;
 
-// Test-only self-signed pair for the local HTTPS upstream (127.0.0.1 and
-// *.test SANs). Not a secret: excluded from the proxy build and trusted by
-// nothing outside these tests. Allowlisted in .github/secret_scanning.yml.
 const TEST_UPSTREAM_CERT = `-----BEGIN CERTIFICATE-----
 MIIDsTCCApmgAwIBAgIUO+k0qSqcKuQLuiXidd08ZSoySYIwDQYJKoZIhvcNAQEL
 BQAwFDESMBAGA1UEAwwJMTI3LjAuMC4xMB4XDTI2MDYyMjA3MDIxM1oXDTM2MDYx
