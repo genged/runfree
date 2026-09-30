@@ -1360,26 +1360,22 @@ function replaceGeneratedCodexBlock(current: string, block: string): string {
   ].filter(Boolean).join("\n\n")}\n`;
 }
 
-function writeCodexRuntimeConfig(codexDir: string, servers: PreparedMcpServer[], callbackPort: number): void {
+function writeCodexRuntimeConfig(codexDir: string, servers: PreparedMcpServer[]): void {
   const codexServers = servers.filter((server) => server.agent === "codex" && server.codexConfig);
-  // The project's legacy callback port is only a fallback: the session's
-  // `codex` adapter overrides it with the session's own port
-  // (`-c mcp_oauth_callback_port=<port>`). No `mcp_oauth_callback_url`: the
-  // pinned Codex advertises that URL's port while it listens on the override,
-  // so a generated URL would send the browser to a port no forwarder serves.
-  // Codex may discover OAuth dynamically on a server that did not declare it,
-  // so any OAuth-capable HTTP server keeps the fallback.
+  // No callback settings (session MCP OAuth callback decisions, 2026-09-30).
+  // The session's `codex` adapter supplies the session's own port
+  // (`-c mcp_oauth_callback_port=<port>`). A shared fallback port here would
+  // send a login run outside the adapter to a port another session — or,
+  // with a colliding project hash, another project — owns; without one, such
+  // a login listens on an unforwarded ephemeral port and fails closed. No
+  // `mcp_oauth_callback_url` either: the pinned Codex advertises that URL's
+  // port while it listens on the override.
   const hasCodexCallback = codexServers.some(
     (server) => (server.auth === "oauth" || server.auth === "public") && typeof server.codexConfig?.url === "string",
   );
-  const globalLines = hasCodexCallback ? [`mcp_oauth_callback_port = ${callbackPort}`] : [];
-  const serverBlock = codexServers
+  const block = codexServers
     .map((server) => renderCodexServer(server.name, server.codexConfig as CodexGeneratedServer))
     .join("\n\n");
-  const block = [
-    globalLines.join("\n"),
-    serverBlock,
-  ].filter(Boolean).join("\n\n");
   updateCodexConfig(codexDir, (current) => {
     if (hasCodexCallback) warnOnOperatorCodexCallbackUrl(stripGeneratedCodexBlock(current ?? ""));
     return replaceGeneratedCodexBlock(current ?? "", block);
@@ -1722,7 +1718,7 @@ export function prepareMcpRuntime(options: McpPrepareOptions): McpPrepareResult 
   }
 
   writeClaudeRuntimeConfig(options.claudeConfigPath, options.claudeMcpConfigPath, servers);
-  writeCodexRuntimeConfig(options.codexDir, servers, callbackPort);
+  writeCodexRuntimeConfig(options.codexDir, servers);
   writeMcpOAuthPolicy(options.mcpOAuthPolicyPath, servers, callbackPort);
   writeMcpOperationPolicy(
     options.mcpOperationPolicyPath ?? mcpOperationPolicyPath(path.dirname(options.mcpOAuthPolicyPath)),

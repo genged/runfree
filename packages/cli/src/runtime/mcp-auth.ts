@@ -3,7 +3,6 @@ import { die } from "../errors.ts";
 import { flushWarnings } from "../warnings.ts";
 import { type RuntimeAdapters } from "./adapters.ts";
 import { launchConfiguredAgentThroughAdmission } from "./session-public-launch.ts";
-import { startSessionMcpCallback, stopSessionMcpCallback } from "./session-mcp-callback.ts";
 import {
   mcpApprovalPath,
   mcpInventory,
@@ -145,31 +144,22 @@ export async function mcpAuthRuntime(
     // the typed direct-launch path deliberately cannot represent. The session
     // launch is the ordinary agent argv plus exact instructions.
     for (const line of mcpAuthInstructionLines(entry.agent, entry.name)) console.log(line);
-    // The OAuth callback is a per-session two-hop path: as the session comes up,
-    // stand up the mcp-callback forwarder + in-session bridge against its
-    // now-known IP; tear the forwarder down once the foreground session ends
-    // (its bridge dies with the container).
-    try {
-      return await (deps.launch ?? launchConfiguredAgentThroughAdmission)({
-        preparedRuntime: runtime.preparedRuntime,
-        io,
-        agentName: entry.agent,
-        reprepare: async () => {
-          const refreshed = await start(context, io, false, { verbose: input.verbose });
-          if (refreshed.kind === "failed") {
-            throw new Error(`runtime re-preparation failed with status ${refreshed.status}`);
-          }
-          return refreshed.preparedRuntime;
-        },
-        onSessionRunning: async (session) => {
-          // The setup warns and reports on its own failures; a broken callback
-          // must not fail the launch, so its status is not propagated here.
-          await startSessionMcpCallback(activeContext, io, session);
-        },
-      });
-    } finally {
-      stopSessionMcpCallback(activeContext, io);
-    }
+    // The OAuth callback path is not owned here: every eligible session —
+    // this one included — gets its own loopback forwarder and bridge from the
+    // shared launch lifecycle, set up before the session starts and removed
+    // with it.
+    return await (deps.launch ?? launchConfiguredAgentThroughAdmission)({
+      preparedRuntime: runtime.preparedRuntime,
+      io,
+      agentName: entry.agent,
+      reprepare: async () => {
+        const refreshed = await start(context, io, false, { verbose: input.verbose });
+        if (refreshed.kind === "failed") {
+          throw new Error(`runtime re-preparation failed with status ${refreshed.status}`);
+        }
+        return refreshed.preparedRuntime;
+      },
+    });
   } finally {
     watcher.stop();
   }

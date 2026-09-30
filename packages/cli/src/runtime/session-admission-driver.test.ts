@@ -97,9 +97,17 @@ const mocks = vi.hoisted(() => ({
   createSessionId: vi.fn(),
   consumePreparedRuntime: vi.fn(),
   compileMaterializationEligibility: vi.fn(),
+  removeSessionIngress: vi.fn(),
+  reclaimStaleCallbacks: vi.fn(),
+  sessionMcpCallbackLifecycle: vi.fn(),
 }));
 
 vi.mock("../agents.ts", () => ({ builtinAgent: mocks.builtinAgent }));
+vi.mock("./session-callback-ingress.ts", () => ({
+  removeSessionMcpCallbackIngress: mocks.removeSessionIngress,
+  reclaimStaleSessionMcpCallbackForwarders: mocks.reclaimStaleCallbacks,
+}));
+vi.mock("./session-mcp-callback.ts", () => ({ sessionMcpCallbackLifecycle: mocks.sessionMcpCallbackLifecycle }));
 vi.mock("./host-identity.ts", () => ({
   hostBootId: mocks.hostBootId,
   hostProcessStart: mocks.hostProcessStart,
@@ -378,6 +386,15 @@ let effectiveControlPlane: {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  mocks.removeSessionIngress.mockImplementation(() => {
+    mocks.events.push("remove-session-ingress");
+    return 0;
+  });
+  mocks.reclaimStaleCallbacks.mockImplementation(() => {
+    mocks.events.push("reclaim-stale-callbacks");
+    return 0;
+  });
+  mocks.sessionMcpCallbackLifecycle.mockReturnValue(undefined);
   mocks.events.length = 0;
   mocks.dockerInputs.length = 0;
   mocks.failRunningProof = false;
@@ -1236,19 +1253,115 @@ describe("internal session admission driver", () => {
     expect(sessionLockManager.withLock).not.toHaveBeenCalled();
   });
 
-  test("launch fires onSessionRunning with the session identity, after the grant and before teardown", async () => {
-    const onSessionRunning = vi.fn(() => { mocks.events.push("session-running"); });
+  test("a participant refusal reclaims dead callback routes under the lock and proves once more", async () => {
+    mocks.createParticipantAuthority.mockImplementationOnce(() => {
+      mocks.events.push("participant-authority:refused");
+      throw new Error("refusing ingress participants: stale mcp-callback forwarder");
+    });
+    mocks.reclaimStaleCallbacks.mockImplementation(() => {
+      mocks.events.push("reclaim-stale-callbacks");
+      return 1;
+    });
     const driver = createInternalSessionAdmissionDriver({
       ...fixture(),
       nowEpochMs: () => Date.parse("2026-08-09T00:00:00.000Z"),
-      onSessionRunning,
     });
 
     await driver.launchBuiltin("codex");
 
-    expect(onSessionRunning).toHaveBeenCalledWith({ containerId: CONTAINER_ID, sourceIp: SOURCE_IP });
-    expect(mocks.events.indexOf("session-file:write")).toBeLessThan(mocks.events.indexOf("session-running"));
-    expect(mocks.events.indexOf("session-running")).toBeLessThan(mocks.events.indexOf("stamp-revoking"));
+    expect(mocks.events.indexOf("participant-authority:refused")).toBeLessThan(mocks.events.indexOf("reclaim-stale-callbacks"));
+    expect(mocks.events.indexOf("reclaim-stale-callbacks")).toBeLessThan(mocks.events.indexOf("participant-authority"));
+    expect(mocks.events.indexOf("participant-authority")).toBeLessThan(mocks.events.indexOf("allocate"));
+  });
+
+  test("a participant refusal with nothing to reclaim stands, before any allocation", async () => {
+    mocks.createParticipantAuthority.mockImplementationOnce(() => {
+      throw new Error("refusing ingress participants: unknown forwarder");
+    });
+    const driver = createInternalSessionAdmissionDriver({
+      ...fixture(),
+      nowEpochMs: () => Date.parse("2026-08-09T00:00:00.000Z"),
+    });
+
+    await expect(driver.launchBuiltin("codex")).rejects.toThrow("refusing ingress participants: unknown forwarder");
+    expect(mocks.reclaimStaleCallbacks).toHaveBeenCalledTimes(1);
+    expect(mocks.events).not.toContain("allocate");
+  });
+
+  test("a healthy launch spends nothing on callback reclaim", async () => {
+    const driver = createInternalSessionAdmissionDriver({
+      ...fixture(),
+      nowEpochMs: () => Date.parse("2026-08-09T00:00:00.000Z"),
+    });
+
+    await driver.launchBuiltin("codex");
+    expect(mocks.reclaimStaleCallbacks).not.toHaveBeenCalled();
+    expect(mocks.createParticipantAuthority).toHaveBeenCalledTimes(1);
+  });
+
+  test("a reconcile that ended a dead owner re-proves the participants before the baseline", async () => {
+    mocks.reconcileSessions.mockImplementation(async () => {
+      mocks.events.push("reconcile-sessions");
+      return {
+        orphanFilesDeleted: [],
+        deadOwnersRevoked: ["rf-20260809-dead01"],
+        orphanContainersRemoved: [],
+        unknownOwners: [],
+        reservedSourceIps: [],
+        orphanFiles: [],
+        recordsWithoutFiles: [],
+      };
+    });
+    const driver = createInternalSessionAdmissionDriver({
+      ...fixture(),
+      nowEpochMs: () => Date.parse("2026-08-09T00:00:00.000Z"),
+    });
+
+    await driver.launchBuiltin("codex");
+    expect(mocks.createParticipantAuthority).toHaveBeenCalledTimes(2);
+    expect(mocks.events.indexOf("reconcile-sessions")).toBeLessThan(mocks.events.lastIndexOf("participant-authority"));
+    expect(mocks.events.lastIndexOf("participant-authority")).toBeLessThan(mocks.events.indexOf("baseline"));
+  });
+
+  test("launch prepares the session ingress after the running proof and before the grant, then removes it first in teardown", async () => {
+    const prepare = vi.fn(async () => {
+      mocks.events.push("prepare-session-ingress");
+      return undefined;
+    });
+    const driver = createInternalSessionAdmissionDriver({
+      ...fixture(),
+      nowEpochMs: () => Date.parse("2026-08-09T00:00:00.000Z"),
+      sessionIngress: { prepare },
+    });
+
+    await driver.launchBuiltin("codex");
+
+    expect(prepare).toHaveBeenCalledWith({
+      sessionId: "rf-20260809-abcdef",
+      containerId: CONTAINER_ID,
+      sourceIp: SOURCE_IP,
+      internalNetwork: expect.any(String),
+    });
+    expect(mocks.events.indexOf("running-proof")).toBeLessThan(mocks.events.indexOf("prepare-session-ingress"));
+    expect(mocks.events.indexOf("prepare-session-ingress")).toBeLessThan(mocks.events.indexOf("session-file:write"));
+    // The shared teardown proves the route gone right after the file delete
+    // and before the record — the address reservation — is released.
+    expect(mocks.events.indexOf("session-file:delete")).toBeLessThan(mocks.events.indexOf("remove-session-ingress"));
+    expect(mocks.events.indexOf("remove-session-ingress"))
+      .toBeLessThan(mocks.events.indexOf("remove-exact-record:rf-20260809-abcdef"));
+  });
+
+  test("the project decides the session ingress when the caller passes none, and a probe never sets it up", async () => {
+    const prepare = vi.fn(async () => undefined);
+    mocks.sessionMcpCallbackLifecycle.mockReturnValue({ prepare });
+    const driver = createInternalSessionAdmissionDriver({
+      ...fixture(),
+      nowEpochMs: () => Date.parse("2026-08-09T00:00:00.000Z"),
+    });
+
+    await driver.launchBuiltin("codex");
+    expect(prepare).toHaveBeenCalledTimes(1);
+    expect(mocks.sessionMcpCallbackLifecycle).toHaveBeenCalledTimes(1);
   });
 
   test("launch preserves interrupted session evidence when the attached process does not exit 0", async () => {
@@ -1678,23 +1791,43 @@ describe("session admission under the per-session file source", () => {
     });
   });
 
-  test("fires onSessionRunning with the session identity once the file is written", async () => {
+  test("a failed session ingress fails the launch with no session file, removing the ingress before the record", async () => {
     const input = fixture();
     mocks.containerInspect = { status: 0, stdout: runningInspect(), stderr: "" };
-    const onSessionRunning = vi.fn(() => {
-      mocks.events.push("on-session-running");
+    const prepare = vi.fn(async () => {
+      mocks.events.push("prepare-session-ingress");
+      throw new Error("the MCP OAuth callback for this session could not be set up");
     });
     const driver = createInternalSessionAdmissionDriver({
       ...input,
-      onSessionRunning,
+      sessionIngress: { prepare },
       nowEpochMs: () => Date.parse("2026-08-09T00:10:00.000Z"),
     });
 
-    await driver.launchBuiltin("codex");
+    await expect(driver.launchBuiltin("codex")).rejects.toThrow("could not be set up");
 
-    expect(onSessionRunning).toHaveBeenCalledWith({ containerId: CONTAINER_ID, sourceIp: SOURCE_IP });
-    expect(mocks.events.indexOf("session-file:write"))
-      .toBeLessThan(mocks.events.indexOf("on-session-running"));
+    expect(mocks.events).not.toContain("session-file:write");
+    expect(mocks.events.indexOf("prepare-session-ingress")).toBeLessThan(mocks.events.indexOf("remove-session-ingress"));
+    expect(mocks.events.indexOf("remove-session-ingress")).toBeLessThan(mocks.events.lastIndexOf("remove-record"));
+  });
+
+  test("an ingress that cannot be proved removed keeps the unadmitted record for reconcile", async () => {
+    const input = fixture();
+    mocks.containerInspect = { status: 0, stdout: runningInspect(), stderr: "" };
+    mocks.removeSessionIngress.mockImplementation(() => {
+      mocks.events.push("remove-session-ingress");
+      throw new Error("Cannot connect to the Docker daemon");
+    });
+    const driver = createInternalSessionAdmissionDriver({
+      ...input,
+      sessionIngress: { prepare: async () => { throw new Error("probe failed"); } },
+      nowEpochMs: () => Date.parse("2026-08-09T00:10:00.000Z"),
+    });
+
+    await expect(driver.launchBuiltin("codex")).rejects.toBeDefined();
+
+    expect(mocks.events).toContain("remove-session-ingress");
+    expect(mocks.events.slice(mocks.events.indexOf("remove-session-ingress"))).not.toContain("remove-record");
   });
 
   test("an unavailable inspection at activation writes no session file and tears the session down", async () => {
@@ -2864,6 +2997,45 @@ describe("session admission under the per-session file source", () => {
     expect(mocks.allocateIp).toHaveBeenCalledWith(expect.objectContaining({
       reservedIps: expect.arrayContaining([SOURCE_IP]),
     }));
+    expect(mocks.createAllocated).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ sourceIp: "172.31.90.21" }),
+    );
+  });
+
+  test("never allocates an address an ingress forwarder still splices to", async () => {
+    const input = fixture();
+    mocks.containerInspect = { status: 0, stdout: runningInspect(), stderr: "" };
+    const withForwarder = {
+      ...(mocks.createParticipantAuthority() as Record<string, unknown>),
+      ingressParticipants: [
+        { containerId: "f".repeat(64), containerName: "runfree-ingress-port-x-3000", sourceIp: "172.31.90.5", imageId: "sha256:x", targetIp: "172.31.90.20" },
+        { containerId: "e".repeat(64), containerName: "runfree-ingress-vnc-x-5901", sourceIp: "172.31.90.6", imageId: "sha256:x", targetIp: "10.9.9.9" },
+      ],
+    };
+    mocks.events.length = 0;
+    mocks.createParticipantAuthority.mockImplementation(() => {
+      mocks.events.push("participant-authority");
+      return withForwarder;
+    });
+    mocks.allocateIp.mockImplementation((request: { reservedIps?: readonly string[] }) => {
+      const reserved = new Set(request.reservedIps ?? []);
+      for (let host = 20; host <= 30; host += 1) {
+        const candidate = `172.31.90.${host}`;
+        if (!reserved.has(candidate)) return candidate;
+      }
+      throw new Error("session-container source IP pool is exhausted");
+    });
+    const driver = createInternalSessionAdmissionDriver({
+      ...input,
+      nowEpochMs: () => Date.parse("2026-08-09T00:00:00.000Z"),
+    });
+
+    await driver.launchBuiltin("codex");
+
+    const request = mocks.allocateIp.mock.calls[0]?.[0] as { reservedIps?: readonly string[] };
+    expect(request.reservedIps).toContain("172.31.90.20");
+    expect(request.reservedIps).not.toContain("10.9.9.9");
     expect(mocks.createAllocated).toHaveBeenCalledWith(
       expect.anything(),
       expect.objectContaining({ sourceIp: "172.31.90.21" }),

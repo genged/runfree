@@ -44,6 +44,7 @@ import type {
   SessionContainerProjectIdentity,
   SessionContainerRecordV2,
 } from "./session-containers.ts";
+import { removeSessionMcpCallbackIngress } from "./session-callback-ingress.ts";
 import { provesContainerAbsent } from "./session-file-heartbeat.ts";
 import {
   executeSessionFileCommand,
@@ -155,6 +156,20 @@ export function teardownSessionRecord(input: SessionFileTeardownInput): SessionF
   } catch (error) {
     return Object.freeze({ completed: false, blockedAt: "delete-session-file" as const, error });
   }
+
+  // Step 1b. The session's host ingress. Its MCP OAuth callback forwarder
+  // routes host loopback to this record's address, so it must be proved gone
+  // before step 5 releases that address to a peer. A failure throws: the
+  // record stays, the address stays reserved, and the same call run again
+  // (this owner's second pass, or the next launch's reconcile) retries it.
+  input.lock();
+  removeSessionMcpCallbackIngress({
+    io: input.io,
+    ...(input.dockerOptions ? { dockerOptions: input.dockerOptions } : {}),
+    projectId: input.expectedProject.projectId,
+    sessionId: input.record.sessionId,
+    sourceIp: input.record.sourceIp,
+  });
 
   // Step 2. Defense in depth, and tolerant of its own failure: the session has
   // no authority left whatever the endpoint says, and the removal below takes

@@ -1,6 +1,5 @@
 import { LIFECYCLE_OPERATION_BUDGET_MS, withLifecycleOperationBudget } from "./lifecycle-operation-budget.ts";
 import { captureRebindTrustReceipt } from "./rebind-trust-receipt.ts";
-import net from "node:net";
 import { isDeepStrictEqual } from "node:util";
 import { readConfig } from "../config.ts";
 import { readControlApprovalSelection } from "../control/approvals.ts";
@@ -12,11 +11,6 @@ import { inspectRebindCreation, rebindParticipantIsAbsent } from "./control-plan
 import { projectHash } from "../project-identity.ts";
 import { runfreeLog, warn } from "../warnings.ts";
 import { waitForProxyFirewallReadiness } from "./proxy-firewall-readiness.ts";
-import { PROJECT_ID_LABEL } from "./constants.ts";
-import { CONTAINER_ROLE_LABEL, INGRESS_PURPOSE_LABEL } from "./container-inventory.ts";
-import {
-  ingressForwarderName,
-} from "./ingress-forwarder.ts";
 import { planValidatedIngressForwardersForRebuild } from "./ingress-forwarder-ownership.ts";
 import { prepareEffectiveControlsForStartup } from "../control/workflow.ts";
 import {
@@ -64,10 +58,6 @@ import {
   selectEffectiveRuntimePlan,
   selectPreparedSessionAgent,
 } from "./images.ts";
-import {
-  mcpOAuthCallbackPort,
-  runtimeMcpOAuthPolicyHasServers,
-} from "./mcp.ts";
 import {
   createRuntimePlan,
   runtimeContextFromActivePlan,
@@ -119,7 +109,6 @@ import { reclaimHelperResidue, type EphemeralHelperFence } from "./ephemeral-hel
 import type {
   ActiveAgentSession,
   DockerContainerInspect,
-  DockerPortBindings,
   RuntimeAdminIntent,
   RuntimeContext,
   RuntimeIO,
@@ -599,17 +588,6 @@ function runningWarmRuntime(context: RuntimeContext, docker: RuntimeDocker): boo
   return Boolean(docker.runningServiceContainerId(project, "proxy"));
 }
 
-function hasOnlyLoopbackPortBinding(bindings: DockerPortBindings | null | undefined, port: number): boolean {
-  const entries = Object.entries(bindings ?? {})
-    .filter(([, values]) => Array.isArray(values) && values.length > 0);
-  if (entries.length !== 1) return false;
-  const [[containerPort, values]] = entries;
-  return containerPort === `${port}/tcp`
-    && Array.isArray(values)
-    && values.length > 0
-    && values.every((binding) => binding?.HostIp === "127.0.0.1" && binding.HostPort === String(port));
-}
-
 function containValidationProxy(plan: ActiveRuntimePlan, io: RuntimeIO, proxyId: string, lifecycleLock?: ProjectLifecycleLock): void {
   if (!lifecycleLock) throw new Error("proxy boundary violation requires fenced containment; runtime safety is unconfirmed");
   containExactOwnedProxy({
@@ -770,77 +748,6 @@ type RuntimeTokenSyncPreparation = {
 
 export { planValidatedIngressForwardersForRebuild };
 
-
-/**
- * The OAuth callback port is held by the per-session mcp-callback ingress forwarder
- * (hop 1), a standalone hardened sidecar named
- * `runfree-ingress-mcp-callback-<projectId>-<port>` rather than a Compose
- * service. The only benign case is our own forwarder for this exact project,
- * still running and still publishing exactly 127.0.0.1:<port> on both the
- * requested publication and the live binding. Every unproven case — no
- * forwarder, a failed or malformed inspection, a stopped container, a wrong
- * project id, a wrong role or purpose label, a different published port, or any
- * non-loopback binding — returns false and the port stays denied.
- */
-export function mcpOAuthCallbackPortHeldByOwnIngressForwarder(
-  context: RuntimeContext,
-  io: RuntimeIO,
-  port: number,
-): boolean {
-  const projectId = projectHash(context.projectRoot);
-  const name = ingressForwarderName(projectId, "mcp-callback", String(port));
-  const inspect = parseDockerJson<DockerContainerInspect[]>(
-    io.capture("docker", ["inspect", name], dockerClientEnvOptions(context)),
-    "docker inspect MCP OAuth callback ingress forwarder port ownership",
-  );
-  const forwarder = inspect?.[0];
-  if (!forwarder || inspect.length !== 1) return false;
-  if (forwarder.State?.Running !== true) return false;
-  const forwarderLabels = forwarder.Config?.Labels ?? {};
-  if (forwarderLabels[PROJECT_ID_LABEL] !== projectId) return false;
-  if (forwarderLabels[CONTAINER_ROLE_LABEL] !== "ingress-forwarder") return false;
-  if (forwarderLabels[INGRESS_PURPOSE_LABEL] !== "mcp-callback") return false;
-  // Both views must agree: the requested publication and the live binding.
-  return hasOnlyLoopbackPortBinding(forwarder.HostConfig?.PortBindings, port)
-    && hasOnlyLoopbackPortBinding(forwarder.NetworkSettings?.Ports, port);
-}
-
-function checkMcpOAuthCallbackPortAvailable(
-  context: RuntimeContext,
-  io: RuntimeIO,
-): Promise<number> {
-  if (!runtimeMcpOAuthPolicyHasServers(context.project)) return Promise.resolve(0);
-  if (context.env?.RUNFREE_TEST_MCP_CALLBACK_PORT_AVAILABLE === "1") return Promise.resolve(0);
-  const port = mcpOAuthCallbackPort(context.projectRoot);
-  return new Promise((resolve) => {
-    const server = net.createServer();
-    const done = (status: number) => {
-      server.removeAllListeners();
-      resolve(status);
-    };
-    const denyUnlessOwnSidecar = () => {
-      if (mcpOAuthCallbackPortHeldByOwnIngressForwarder(context, io, port)) {
-        done(0);
-        return;
-      }
-      runfreeLog(`MCP OAuth callback port ${port} is already in use on 127.0.0.1`);
-      runfreeLog("stop the process using that port or remove stale Runfree runtime state");
-      done(1);
-    };
-    server.once("error", () => {
-      denyUnlessOwnSidecar();
-    });
-    server.listen({ host: "127.0.0.1", port, exclusive: true }, () => {
-      server.close((error) => {
-        if (error) {
-          denyUnlessOwnSidecar();
-          return;
-        }
-        done(0);
-      });
-    });
-  });
-}
 
 const SELECTED_IMAGE_ID_PATTERN = /^sha256:[a-f0-9]{64}$/u;
 
@@ -1652,8 +1559,6 @@ export async function startRuntime(
       if (downStatus !== 0) return result(downStatus, false, activeContext);
     }
     reportRuntimeProgress("starting Docker Compose runtime", verbose);
-    const callbackPortAvailable = await checkMcpOAuthCallbackPortAvailable(activeContext, io);
-    if (callbackPortAvailable !== 0) return result(callbackPortAvailable, false, activeContext);
     io.admitPreparedTokenSources?.(activeContext);
     const status = timings.time("compose-up", () => adapters.docker.composeUp(project, { forceRecreate: removeExisting }));
     if (status !== 0) {

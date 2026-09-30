@@ -2562,7 +2562,7 @@ describe("runtime recovery", () => {
     }
   });
 
-  test("MCP import writes Codex callback globals before existing TOML tables", () => {
+  test("MCP import writes no shared Codex callback settings and keeps existing TOML tables", () => {
     const projectRoot = path.join(tmp, "project");
     const project = prepareProject(projectRoot);
     const hostHome = path.join(tmp, "host-home");
@@ -2594,15 +2594,11 @@ describe("runtime recovery", () => {
     });
 
     const configToml = fs.readFileSync(path.join(project.paths.codexDir, "config.toml"), "utf8");
-    const callbackIndex = configToml.indexOf("mcp_oauth_callback_port");
-    const tuiTableIndex = configToml.indexOf("[tui]");
-    expect(callbackIndex).toBeGreaterThanOrEqual(0);
-    expect(tuiTableIndex).toBeGreaterThanOrEqual(0);
-    expect(callbackIndex).toBeLessThan(tuiTableIndex);
-    expect(configToml).toContain(`mcp_oauth_callback_port = ${callbackPort}`);
-    // The pinned Codex advertises a configured URL's port while listening on
-    // the session adapter's `-c mcp_oauth_callback_port` override, so a
-    // generated URL would send every login to a port no forwarder serves.
+    // Each session's `codex` adapter supplies its own port. A shared port here
+    // would route a login run outside the adapter to a port another session
+    // owns, and a URL would make the pinned Codex advertise a port it does not
+    // listen on.
+    expect(configToml).not.toContain("mcp_oauth_callback_port");
     expect(configToml).not.toContain("mcp_oauth_callback_url");
     expect(configToml).toContain([
       "[tui]",
@@ -2613,7 +2609,7 @@ describe("runtime recovery", () => {
       'url = "https://mcp.posthog.com/mcp"',
     ].join("\n"));
     const parsed = parseToml(configToml) as Record<string, unknown>;
-    expect(parsed.mcp_oauth_callback_port).toBe(callbackPort);
+    expect(parsed.mcp_oauth_callback_port).toBeUndefined();
     expect(parsed.mcp_oauth_callback_url).toBeUndefined();
     expect(parsed.tui).toEqual({ model_availability_nux: 1 });
   });

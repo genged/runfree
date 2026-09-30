@@ -994,7 +994,7 @@ describe("admin MCP runtime preparation", () => {
       },
     });
     const codex = readCodexGenerated();
-    expect(codex).toContain("mcp_oauth_callback_port = ");
+    expect(codex).not.toContain("mcp_oauth_callback_port");
     expect(codex).not.toContain("mcp_oauth_callback_url");
     expect(codex).toContain("[mcp_servers.sentry]");
     expect(codex).toContain("oauth = true");

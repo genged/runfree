@@ -168,6 +168,11 @@ import {
   type SessionLockManager,
 } from "./sessions.ts";
 import type { CaptureResult, RuntimeContext, RuntimeIO, SessionMetadata } from "./types.ts";
+import {
+  reclaimStaleSessionMcpCallbackForwarders,
+  removeSessionMcpCallbackIngress,
+} from "./session-callback-ingress.ts";
+import { sessionMcpCallbackLifecycle, type SessionIngressLifecycle } from "./session-mcp-callback.ts";
 import { remedy } from "../remedies.ts";
 
 const DEFAULT_INTERNAL_PROBE_LEASE_DURATION_MS = SESSION_ADMISSION_LEASE_MAX_DURATION_MS;
@@ -356,23 +361,19 @@ export type InternalSessionAdmissionDriver = Readonly<{
   recoverPending(agent: SessionAdmissionProbeAgent): Promise<void>;
 }>;
 
-/**
- * Fired once a launched session holds authority and is running, before the
- * attached process is awaited. Generic and additive: the driver knows nothing
- * of what a caller does with it. `runfree mcp auth` uses it to stand up the
- * per-session OAuth callback against the session's now-known IP; other launches
- * pass nothing. It must not throw — a caller's side effect failing may not cost
- * the session its authority — so a hook owns its own error handling.
- */
-export type SessionRunningHook = (session: Readonly<{ containerId: string; sourceIp: string }>) => Promise<void> | void;
-
 export type InternalSessionAdmissionDriverInput = Readonly<{
   preparedRuntime: PreparedRuntime;
   /** The only lifecycle-lock authority accepted by a session driver. */
   sessionLockManager: SessionLockManager;
   io: RuntimeIO;
   foregroundSpawner?: SessionContainerForegroundSpawner;
-  onSessionRunning?: SessionRunningHook;
+  /**
+   * The session-owned ingress a launch sets up before activation (today the
+   * MCP OAuth callback path). Omitted: derived from the project — present only
+   * when an OAuth-capable MCP server needs a callback. `null`: none. Probes
+   * never set any up.
+   */
+  sessionIngress?: SessionIngressLifecycle | null;
   nowEpochMs?: () => number;
   nowMonotonicMs?: () => number;
 }>;
@@ -475,6 +476,12 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
   #reservedSessionFileIps: readonly string[] = [];
   /** Present only in launch mode; probes must never leave user-facing session evidence. */
   #launch?: SessionAdmissionLaunchOptions;
+  /**
+   * Set before this launch starts creating its session-owned ingress, so
+   * unadmitted cleanup knows to prove that ingress absent before it releases
+   * the record — and with it the address the ingress targets.
+   */
+  #ingressMayExist = false;
   #displayIdentity?: Readonly<{ displayName: string; command: string; agentCommand: string }>;
   #sessionEvidence?: SessionMetadata;
 
@@ -1187,12 +1194,7 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
     // the state vanished under the held lifecycle lock.
     const effective = readEffectiveControlPlaneV2(this.#input.plan.paths.stateDir);
     if (!effective) throw new Error("session admission requires a durable effective control plane");
-    const authority = createControlPlaneInternalParticipantAuthority({
-      plan: this.#input.plan,
-      context: this.#input.context,
-      lifecycleLock: this.#input.lifecycleLock,
-      io: this.#gateway.io,
-    });
+    let authority = this.#participantAuthorityReclaimingStaleCallbacks();
     this.#ingressParticipants = authority.ingressParticipants;
     this.#participantNetwork = Object.freeze({
       networkId: authority.networkId,
@@ -1218,6 +1220,19 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
     this.#lock();
     this.#assertNoQuarantinedSessionRecords();
     this.#cleanPreexistingOrphans();
+    if (reconciled.deadOwnersRevoked.length > 0) {
+      // Ending a dead owner's session also removed its callback forwarder, so
+      // the participant proof taken before reconcile names an endpoint that is
+      // gone. Take it again, under the same held lock, before the baseline.
+      this.#lock();
+      authority = createControlPlaneInternalParticipantAuthority({
+        plan: this.#input.plan,
+        context: this.#input.context,
+        lifecycleLock: this.#input.lifecycleLock,
+        io: this.#gateway.io,
+      });
+      this.#ingressParticipants = authority.ingressParticipants;
+    }
     const records = listSessionContainerRecordsV2(
       this.#input.plan.paths.stateDir,
       this.#require(this.#preflight, "canonical preflight").expectedProject,
@@ -1266,6 +1281,43 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
   };
 
   /**
+   * The internal participant proof, after reclaiming dead callback routes.
+   *
+   * A callback forwarder whose session is gone (a killed launcher's leftover)
+   * makes the proof refuse. Only then — so the healthy path spends no Docker
+   * call on it — are forwarders that route to no running session removed under
+   * the held lock, and the proof is taken once more. With nothing to reclaim,
+   * the original refusal stands.
+   */
+  #participantAuthorityReclaimingStaleCallbacks(): ReturnType<typeof createControlPlaneInternalParticipantAuthority> {
+    const create = () => createControlPlaneInternalParticipantAuthority({
+      plan: this.#input.plan,
+      context: this.#input.context,
+      lifecycleLock: this.#input.lifecycleLock,
+      io: this.#gateway.io,
+    });
+    try {
+      return create();
+    } catch (refusal) {
+      let reclaimed = 0;
+      try {
+        this.#lock();
+        reclaimed = reclaimStaleSessionMcpCallbackForwarders({
+          io: this.#gateway.io,
+          dockerOptions: this.#dockerOptions(),
+          projectId: this.#input.plan.projectId,
+          internalNetwork: `${this.#input.plan.composeProjectName}_agent_internal`,
+        });
+      } catch (reclaimFailure) {
+        throw new AggregateError([refusal, reclaimFailure], refusal instanceof Error ? refusal.message : String(refusal));
+      }
+      if (reclaimed === 0) throw refusal;
+      this.#lock();
+      return create();
+    }
+  }
+
+  /**
    * The record's user-facing identity for this session kind.
    *
    * `command` is the short registry/display kind shared with proxy session
@@ -1294,10 +1346,17 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
    * into a permanent refusal instead of reserving anything.
    */
   #reservedSessionPoolAddresses(): readonly string[] {
-    if (this.#reservedSessionFileIps.length === 0) return [];
+    // Every address an ingress forwarder still splices to is reserved too, for
+    // any purpose and whatever its session's state: a forward or callback
+    // route that outlived its session must not reach the next session given
+    // that address.
+    const forwarderTargets = this.#ingressParticipants
+      .flatMap((participant) => participant.targetIp === undefined ? [] : [participant.targetIp]);
+    const candidates = [...new Set([...this.#reservedSessionFileIps, ...forwarderTargets])];
+    if (candidates.length === 0) return [];
     const prefix = this.#network().subnet.split("/")[0]?.split(".").slice(0, 3).join(".");
     if (prefix === undefined || prefix.length === 0) return [];
-    return this.#reservedSessionFileIps.filter((address) => address.startsWith(`${prefix}.`));
+    return candidates.filter((address) => address.startsWith(`${prefix}.`));
   }
 
   allocate = async (): Promise<void> => {
@@ -1609,12 +1668,6 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
       this.#fileWritten = outcome.file;
       this.#lock();
       this.#stampSessionHostStatus(outcome.file, "served");
-      // The hook fires at the one moment it means something: the session holds
-      // authority and is running with a known container id and source IP.
-      const containerId = attached.containerId;
-      if (containerId !== undefined && this.#input.onSessionRunning !== undefined) {
-        await this.#input.onSessionRunning({ containerId, sourceIp: attached.sourceIp });
-      }
     } catch (error) {
       this.#deleteSessionFileBestEffort(record);
       throw error;
@@ -1653,7 +1706,31 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
   activate = async (): Promise<void> => {
     this.#lock();
     const provisioning = this.#require(this.#provisioningAuthorization, "provisioning-running authority");
+    await this.#prepareSessionIngress(provisioning.record);
+    this.#lock();
     await this.#admitThroughSessionFile(provisioning.record);
+  };
+
+  /**
+   * Sets up the session-owned ingress (the MCP OAuth callback path) while the
+   * session entry still waits, so no client starts before its callback port
+   * exists. Launch mode only; a failure fails the launch and the unadmitted
+   * cleanup that follows proves the ingress gone before the record goes.
+   */
+  #prepareSessionIngress = async (record: SessionContainerRecordV2): Promise<void> => {
+    if (!this.#launch) return;
+    const lifecycle = this.#input.sessionIngress === undefined
+      ? sessionMcpCallbackLifecycle(this.#input.context, this.#gateway.io)
+      : this.#input.sessionIngress;
+    if (!lifecycle) return;
+    const containerId = this.#require(record.containerId, "session container id");
+    this.#ingressMayExist = true;
+    await lifecycle.prepare({
+      sessionId: record.sessionId,
+      containerId,
+      sourceIp: record.sourceIp,
+      internalNetwork: this.#network().networkName,
+    });
   };
 
   /**
@@ -2008,6 +2085,27 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
         this.#foreground = undefined;
       } catch (error) {
         failures.push(error);
+      }
+    }
+    if (this.#ingressMayExist) {
+      // A route to this session's address must be proved gone before the
+      // record that reserves the address is released. When it cannot be, the
+      // record stays: this owner exits, and the next launch's reconcile runs
+      // the shared teardown, which retries the same removal first.
+      try {
+        removeSessionMcpCallbackIngress({
+          io: this.#gateway.io,
+          dockerOptions: this.#dockerOptions(),
+          projectId: preflight.expectedProject.projectId,
+          sessionId: record.sessionId,
+          sourceIp: record.sourceIp,
+        });
+        this.#ingressMayExist = false;
+      } catch (error) {
+        throw new AggregateError(
+          [...failures, error],
+          "unadmitted session cleanup kept its record because its MCP OAuth callback forwarder could not be proved removed",
+        );
       }
     }
     if (record.containerId && this.#creationReceipt) {
