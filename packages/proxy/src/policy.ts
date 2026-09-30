@@ -81,6 +81,11 @@ export type PolicyOptions = {
   // Per-request body-aware GraphQL verdict (see classifyWrite); precomputed
   // by the async caller because this check is synchronous and body-free.
   graphqlBodyClass?: "read" | "write";
+  // Precomputed by the async server layer: this POST targets an exact,
+  // recorded, statically mediated OAuth token or registration endpoint and is
+  // protocol-shaped (OAuthMediator.protocolReadEndpoint plus
+  // protocolReadBodyAllowed). It makes the POST a read on an `ask` host only.
+  oauthProtocolRead?: boolean;
   mcpClassification?: McpClassification;
   approvedMcp?: McpDisplayFields;
 };
@@ -390,6 +395,9 @@ export function classifyWrite(input: {
   // POSTs to a declared graphql endpoint. "read" means the body was proven a
   // pure query document under the size cap; absent means unproven => write.
   graphqlBodyClass?: "read" | "write";
+  // See PolicyOptions.oauthProtocolRead; assertWriteAllowed passes it only
+  // for an `ask` host.
+  oauthProtocolRead?: boolean;
 }): WriteClassification {
   // A wss:// upgrade is an opaque live channel the proxy cannot inspect
   // frame-by-frame, so the whole connection classifies as a write (HIGH-2).
@@ -430,6 +438,10 @@ export function classifyWrite(input: {
   // Read exemptions for non-safe methods. Path confusion disqualifies a read
   // classification: the proxy and a decoding origin must not disagree.
   if (!hasPathConfusion(pathName)) {
+    // An exact, mediated OAuth protocol exchange (login, refresh, client
+    // registration). Runs after every write rule above, so an explicit write
+    // path, git push, override header, or GraphQL rule still wins.
+    if (input.oauthProtocolRead === true && input.method === "POST") return { write: false };
     if (rule?.readPathPrefixes !== undefined
       && rule.readPathPrefixes.some((prefix) => pathMatchesPrefix(pathName, prefix))) {
       return { write: false };
@@ -453,6 +465,7 @@ function assertWriteAllowed(input: {
   headers?: Record<string, string | string[] | undefined>;
   webSocket?: boolean;
   graphqlBodyClass?: "read" | "write";
+  oauthProtocolRead?: boolean;
   hasWriteGrant?: PolicyOptions["hasWriteGrant"];
   mcpClassification?: McpClassification;
   approvedMcp?: McpDisplayFields;
@@ -495,7 +508,11 @@ function assertWriteAllowed(input: {
     );
   }
   if (input.writeAction === "allow") return;
-  const classification = classifyWrite(input);
+  // An explicit `deny` stays a deny: the protocol read only spares `ask`.
+  const classification = classifyWrite({
+    ...input,
+    oauthProtocolRead: input.writeAction === "ask" && input.oauthProtocolRead === true && input.webSocket !== true,
+  });
   if (!classification.write) return;
 
   const pathName = requestPath(input.url);
@@ -749,6 +766,7 @@ export function beforeAllowedRequest(admission: AdmissionRecord, req: ProxyReque
     writeAction,
     headers: req.headers,
     graphqlBodyClass: options.graphqlBodyClass,
+    oauthProtocolRead: options.oauthProtocolRead,
     hasWriteGrant: options.hasWriteGrant,
     mcpClassification: options.mcpClassification,
     approvedMcp: options.approvedMcp,

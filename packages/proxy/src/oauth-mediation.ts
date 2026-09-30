@@ -11,6 +11,7 @@ import {
 } from "@runfree/runtime-contracts/oauth-mediation-policy";
 import { normalizeHostname, normalizePathPrefix, pathMatchesPrefix, readTokenFile } from "./policy.js";
 import { isRecord } from "@runfree/runtime-contracts/primitives";
+import { plainRequestPath, type ProtocolReadKind } from "./oauth-protocol-read.js";
 
 const ACCESS_HANDLE_PREFIX = "runfree_oauth_access_";
 const REFRESH_HANDLE_PREFIX = "runfree_oauth_refresh_";
@@ -112,6 +113,25 @@ type StoredDiscovery = Record<string, StoredDiscoveryEntry>;
 type StoredMcpOAuthState = {
   discovered?: StoredDiscovery;
   handles?: Record<string, StoredToken>;
+};
+
+// A POST the mediator may treat as an OAuth protocol read: its exact path is
+// one of this provider's recorded, statically mediated endpoints, and this
+// provider alone would mediate it.
+export type ProtocolReadMatch = {
+  kind: ProtocolReadKind;
+  provider: string;
+};
+
+export type OAuthBeforeRequestOptions = {
+  // Which proxy rule the request selected: true for the response-mediating
+  // rule. The rule is chosen before the request is handled, so a policy or
+  // discovery change in between can leave a now-mediated token request on the
+  // plain rule, whose response would reach the agent unmediated.
+  responseMediated?: boolean;
+  // The protocol-read match the write classification relied on; re-checked
+  // before any handle is swapped.
+  protocolRead?: ProtocolReadMatch;
 };
 
 export type OAuthIssuerDenialContext = {
@@ -819,7 +839,10 @@ export class OAuthMediator {
     }
   }
 
-  beforeRequest = async (req: OAuthProxyRequest): Promise<OAuthRequestResult | undefined> => {
+  beforeRequest = async (
+    req: OAuthProxyRequest,
+    options: OAuthBeforeRequestOptions = {},
+  ): Promise<OAuthRequestResult | undefined> => {
     const policyState = this.currentPolicyState();
     const url = parseUrl(req.url);
     if (!url || url.protocol !== "https:") return undefined;
@@ -828,6 +851,16 @@ export class OAuthMediator {
       return this.rejectRequestWhilePolicyUnavailable(req, policyState.policy, state, url);
     }
     const policy = policyState.policy;
+    if (options.responseMediated === false
+      && (matchingTokenServer(policy, state, url) !== undefined || matchingRegistrationServer(policy, state, url) !== undefined)) {
+      return forbidden("OAuth endpoint became mediated while this request was in flight; retry it");
+    }
+    if (options.protocolRead) {
+      const current = this.protocolReadMatch(req, policy, state);
+      if (current?.provider !== options.protocolRead.provider || current.kind !== options.protocolRead.kind) {
+        return forbidden("OAuth endpoint is no longer mediated for this server; retry it");
+      }
+    }
     const handle = bearerHandle(req.headers);
     if (handle) {
       return this.authorizeBearerHandleRequest(req, url, state, handle, policy);
@@ -952,6 +985,58 @@ export class OAuthMediator {
       };
     });
   };
+
+  /**
+   * The protocol-read match for a request, or undefined. Exact method (POST),
+   * exact raw path (no normalization, query, or encoding), an endpoint listed
+   * in exactly one provider's protocolReadEndpoints that is also one of its
+   * static token or registration endpoints, and no other provider (MCP or
+   * service, static or discovered at run time) that would mediate the URL.
+   */
+  protocolReadEndpoint = (req: { method?: string; url: string }): ProtocolReadMatch | undefined => {
+    const policyState = this.currentPolicyState();
+    if (!policyState.valid) return undefined;
+    let state: StoredMcpOAuthState;
+    try {
+      state = this.currentState();
+    } catch {
+      return undefined;
+    }
+    return this.protocolReadMatch(req, policyState.policy, state);
+  };
+
+  private protocolReadMatch(
+    req: { method?: string; url: string },
+    policy: LoadedMcpOAuthPolicy,
+    state: StoredMcpOAuthState,
+  ): ProtocolReadMatch | undefined {
+    if (req.method !== "POST") return undefined;
+    const pathName = plainRequestPath(req.url);
+    const url = parseUrl(req.url);
+    if (!pathName || !url || url.protocol !== "https:" || url.search !== "" || url.hash !== "" || url.pathname !== pathName) {
+      return undefined;
+    }
+    const host = url.hostname.toLowerCase();
+    const exact = (endpoint: TokenEndpoint) => endpoint.host === host && endpoint.path === pathName;
+    const listed = policy.servers.filter((server) => server.kind === "mcp" && server.protocolReadEndpoints.some(exact));
+    if (listed.length !== 1) return undefined;
+    const server = listed[0];
+    const isToken = server.tokenEndpoints.some(exact);
+    const isRegistration = server.registrationEndpoints.some(exact);
+    if (isToken === isRegistration) return undefined;
+    const claimants = policy.servers.filter((candidate) => {
+      return tokenEndpointList(candidate, state).some((endpoint) => tokenEndpointMatches(endpoint, url))
+        || registrationEndpointList(candidate, state).some((endpoint) => endpoint.host === host && pathMatchesPrefix(url.pathname, endpoint.path));
+    });
+    if (claimants.length !== 1 || claimants[0] !== server) return undefined;
+    // The mediator picks a token server before a registration server; the
+    // match must be the one it will actually use.
+    const tokenServer = matchingTokenServer(policy, state, url);
+    if (isToken ? tokenServer !== server : tokenServer !== undefined || matchingRegistrationServer(policy, state, url) !== server) {
+      return undefined;
+    }
+    return { kind: isToken ? "token" : "registration", provider: server.name };
+  }
 
   issuerDenialContext(rawHost: string): OAuthIssuerDenialContext | undefined {
     let host: string;

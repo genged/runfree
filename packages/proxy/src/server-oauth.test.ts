@@ -96,7 +96,9 @@ describe("proxy server entrypoint: OAuth mediation", () => {
 
     const stored = fs.readFileSync(path.join(mcpOAuthStateDir, "handles.json"), "utf8");
     expect(stored).toContain("real-access-token-1");
-    expect(stored).toContain("real-refresh-token-1");
+    // The refresh rotated, so the old refresh token's handle is retired.
+    expect(stored).not.toContain("real-refresh-token-1");
+    expect(stored).toContain("real-refresh-token-2");
     expect(stored).toContain("real-id-token-1");
     expect(stored).toContain("real-client-secret-1");
     expect(stored).toContain("real-registration-token-1");
@@ -200,7 +202,7 @@ describe("proxy server entrypoint: OAuth mediation", () => {
     expect(proxy.output()).not.toContain(tokenBody.access_token);
   }, 20_000);
 
-  test("mediates in-flight OAuth token responses after policy changes", async () => {
+  test("blocks an in-flight OAuth token response whose server the policy removed, storing nothing", async () => {
     const upstream = await startMcpOAuthUpstream({ tokenResponseDelayMs: 100 });
     const mcpOAuthPolicyPath = path.join(tmp, "oauth-mediation-policy.json");
     const mcpOAuthStateDir = path.join(tmp, "mcp-oauth-state");
@@ -236,13 +238,15 @@ describe("proxy server entrypoint: OAuth mediation", () => {
 
     const response = await tokenResponse;
 
-    expect(response.statusCode).toBe(200);
+    // The server was removed (as by `runfree mcp revoke`) while the exchange
+    // was in flight: its real tokens never reach the agent, and nothing is
+    // stored for a server the policy no longer names.
+    expect(response.body).toContain("blocked by OAuth proxy policy");
     expect(response.body).not.toContain("real-access-token-1");
     expect(response.body).not.toContain("real-refresh-token-1");
     expect(response.body).not.toContain("real-client-secret-1");
-    const body = JSON.parse(response.body) as { access_token: string; refresh_token: string };
-    expect(body.access_token).toMatch(/^runfree_oauth_access_/);
-    expect(body.refresh_token).toMatch(/^runfree_oauth_refresh_/);
+    const statePath = path.join(mcpOAuthStateDir, "handles.json");
+    expect(fs.existsSync(statePath) ? fs.readFileSync(statePath, "utf8") : "").not.toContain("real-access-token-1");
   }, 20_000);
 
   test("mediates OAuth token responses regardless of response content type", async () => {
@@ -958,4 +962,64 @@ describe("proxy server entrypoint: OAuth mediation", () => {
     expect(proxy.output()).not.toContain("runfree_oauth_access_unknown");
   }, 20_000);
 
+  test("a protocol-shaped POST to the exact recorded, mediated token endpoint is a read on an ask host; nothing else is", async () => {
+    const upstream = await startMcpOAuthUpstream();
+    const oauthPolicyPath = path.join(tmp, "oauth-mediation-policy.json");
+    writeJson(oauthPolicyPath, {
+      providers: {
+        "mcp:claude-linear": {
+          kind: "mcp",
+          resourceHost: "127.0.0.1",
+          resourcePathPrefix: "/mcp",
+          stateEpoch: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          tokenEndpoints: [{ host: "127.0.0.1", path: "/oauth/token" }],
+          protocolReadEndpoints: [{ host: "127.0.0.1", path: "/oauth/token" }],
+        },
+      },
+    });
+    const proxy = await startProxy({
+      extraEnv: {
+        NODE_EXTRA_CA_CERTS: path.join(tmp, "upstream.crt"),
+        RUNFREE_OAUTH_POLICY: oauthPolicyPath,
+        RUNFREE_OAUTH_STATE_DIR: path.join(tmp, "mcp-oauth-state"),
+      },
+      // The default write action is ask, and no approver is attached, so any
+      // request classified as a write is refused at once.
+      policy: { hosts: ["127.0.0.1"], tokens: {} },
+    });
+    const form = { "Content-Type": "application/x-www-form-urlencoded" };
+    const post = (requestPath: string, body: string, method = "POST", headers: Record<string, string> = form) => httpsViaProxy({
+      proxyPort: proxy.port,
+      targetPort: upstream.port,
+      method,
+      path: requestPath,
+      headers,
+      body,
+    });
+
+    const login = await post("/oauth/token", "grant_type=authorization_code&code=secret-authorization-code&redirect_uri=http%3A%2F%2Flocalhost%3A33418%2Fcallback");
+    expect(login.statusCode).toBe(200);
+    const tokens = JSON.parse(login.body) as { access_token: string };
+    expect(tokens.access_token).toMatch(/^runfree_oauth_access_/);
+    expect(login.body).not.toContain("real-access-token-1");
+    expect(proxy.output()).toContain("proxy: oauth protocol-read name=mcp:claude-linear kind=token");
+    expect(proxy.output()).not.toContain("secret-authorization-code");
+    const forwarded = upstream.requests.length;
+
+    for (const [label, response] of [
+      ["another grant", await post("/oauth/token", "grant_type=client_credentials&client_id=x")],
+      ["an extra field", await post("/oauth/token", "grant_type=authorization_code&code=c&data=exfil")],
+      ["a JSON body", await post("/oauth/token", JSON.stringify({ grant_type: "authorization_code", code: "c" }), "POST", { "Content-Type": "application/json" })],
+      ["a sub-path", await post("/oauth/token/", "grant_type=authorization_code&code=c")],
+      ["a dot-segment path", await post("/mcp/../oauth/token", "grant_type=authorization_code&code=c")],
+      ["a query", await post("/oauth/token?x=1", "grant_type=authorization_code&code=c")],
+      ["another path", await post("/other", "grant_type=authorization_code&code=c")],
+      ["another method", await post("/oauth/token", "grant_type=authorization_code&code=c", "PUT")],
+    ] as const) {
+      expect(response.statusCode, label).toBe(403);
+      expect(response.headers["x-runfree-blocked"], label).toMatch(/^write-approval/);
+    }
+    // Refused before any upstream connection.
+    expect(upstream.requests).toHaveLength(forwarded);
+  }, 30_000);
 });

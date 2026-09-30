@@ -32,7 +32,14 @@ import {
   setHeader,
   type OAuthProxyResponse,
   type OAuthRequestResult,
+  type ProtocolReadMatch,
 } from "./oauth-mediation.js";
+import {
+  PROTOCOL_READ_BODY_CAP_BYTES,
+  ProtocolReadRateLimiter,
+  protocolReadBodyAllowed,
+  protocolReadGrantType,
+} from "./oauth-protocol-read.js";
 import { validateMcpOperationPolicy, type LoadedMcpOperationPolicy } from "@runfree/runtime-contracts/mcp-operation-policy";
 import {
   effectiveProxyRootFromEnv,
@@ -1017,7 +1024,7 @@ function forceIdentityAcceptEncoding(
 // Audited request path inside mockttp: no denial, no token file reads, no
 // credential injection. HTTPS-only still holds, the host is re-validated, and
 // OAuth handle mediation runs unchanged.
-async function auditedRequestMutation(admission: AdmissionRecord, req: ProxyRequest): Promise<OAuthRequestResult> {
+async function auditedRequestMutation(admission: AdmissionRecord, req: ProxyRequest, responseMediated: boolean): Promise<OAuthRequestResult> {
   const { url, host } = assertRequestMatchesAdmission(
     admission,
     req,
@@ -1034,7 +1041,7 @@ async function auditedRequestMutation(admission: AdmissionRecord, req: ProxyRequ
     ...req,
     headers: headers ?? req.headers,
   };
-  const oauthMutation = await oauthMediator.beforeRequest(nextReq);
+  const oauthMutation = await oauthMediator.beforeRequest(nextReq, { responseMediated });
   return combineRequestMutations(headers ? { headers } : {}, oauthMutation);
 }
 
@@ -1448,6 +1455,48 @@ async function mcpClassificationForRequest(req: ProxyRequest): Promise<McpClassi
   });
 }
 
+const protocolReadLimiter = new ProtocolReadRateLimiter();
+
+// OAuth protocol read (login, refresh, client registration): consulted only
+// for a POST on an `ask` host that selected the response-mediating rule. The
+// mediator proves the exact endpoint is recorded and mediated for one server;
+// the body must be the protocol's own shape; a per-server budget bounds
+// unattended exchanges. Anything unproven stays a write.
+async function oauthProtocolReadForRequest(req: ProxyRequest, responseMediated: boolean): Promise<ProtocolReadMatch | undefined> {
+  if (!responseMediated || req.method !== "POST") return undefined;
+  let url: URL;
+  try {
+    url = new URL(req.url);
+  } catch {
+    return undefined;
+  }
+  const rule = currentPolicy.requests[url.hostname.toLowerCase()];
+  if ((rule?.writeAction ?? currentPolicy.writeApproval ?? DEFAULT_WRITE_ACTION) !== "ask") return undefined;
+  const match = oauthMediator.protocolReadEndpoint(req);
+  if (!match) return undefined;
+  const contentLengthRaw = firstHeader(req.headers, ["content-length"]);
+  if (contentLengthRaw === undefined || !/^\d{1,6}$/.test(contentLengthRaw) || Number(contentLengthRaw) > PROTOCOL_READ_BODY_CAP_BYTES) {
+    return undefined;
+  }
+  let bodyText: string | undefined;
+  try {
+    bodyText = await req.body?.getText();
+  } catch {
+    return undefined;
+  }
+  if (!protocolReadBodyAllowed({ bodyText, headers: req.headers, kind: match.kind })) return undefined;
+  // The body read awaited: a policy reload may have landed. Decide on the
+  // policy that is current now, synchronously with the classification.
+  const current = oauthMediator.protocolReadEndpoint(req);
+  if (current?.provider !== match.provider || current.kind !== match.kind) return undefined;
+  if (!protocolReadLimiter.take(match.provider)) {
+    console.log(`proxy: oauth protocol-read budget exhausted name=${match.provider}; the request follows write approval`);
+    return undefined;
+  }
+  console.log(`proxy: oauth protocol-read name=${match.provider} kind=${match.kind} host=${url.hostname.toLowerCase()} path=${url.pathname} grant_type=${protocolReadGrantType(match.kind, bodyText ?? "")}`);
+  return match;
+}
+
 // The policed request path: policy checks, write classification (with grant
 // consultation), credential injection, and OAuth mediation. Re-run in full
 // after an approved hold, so approval revalidates current policy by
@@ -1455,13 +1504,16 @@ async function mcpClassificationForRequest(req: ProxyRequest): Promise<McpClassi
 async function policedRequestMutation(
   admission: AdmissionRecord,
   req: ProxyRequest,
-  options: { approvedMcp?: McpDisplayFields } = {},
+  options: { approvedMcp?: McpDisplayFields; responseMediated: boolean },
 ): Promise<OAuthRequestResult> {
   let credential: CredentialMutationSummary | undefined;
   const principal = currentAdmissionPrincipal(admission);
   if (principal === undefined) return missingAdmissionResponse(req);
   const graphqlBodyClass = await graphqlBodyClassForRequest(req);
   const mcpClassification = await mcpClassificationForRequest(req);
+  // Last await before classification: from here to the mediator's own
+  // re-check nothing yields, so both see the same policy.
+  const protocolRead = await oauthProtocolReadForRequest(req, options.responseMediated);
   const mutation = beforeAllowedRequest(admission, req, {
     allowedHosts: currentPolicy.allowedHosts,
     credentials: currentPolicy.credentials,
@@ -1471,6 +1523,7 @@ async function policedRequestMutation(
     requests: currentPolicy.requests,
     writeApproval: currentPolicy.writeApproval,
     graphqlBodyClass,
+    oauthProtocolRead: protocolRead !== undefined,
     mcpClassification,
     approvedMcp: options.approvedMcp,
     hasWriteGrant: (details) => writeApprovals.hasGrant(details, principal, requestId(req)),
@@ -1490,7 +1543,10 @@ async function policedRequestMutation(
     ...req,
     headers: headers ?? req.headers,
   };
-  const oauthMutation = await oauthMediator.beforeRequest(nextReq);
+  const oauthMutation = await oauthMediator.beforeRequest(nextReq, {
+    responseMediated: options.responseMediated,
+    ...(protocolRead ? { protocolRead } : {}),
+  });
   logAllowedRequest(req, { credential });
   return combineRequestMutations(headers ? { headers } : mutation, oauthMutation);
 }
@@ -1539,7 +1595,7 @@ function writeApprovalDenial(req: ProxyRequest, shape: ShapeDenialDetails, reaso
 // until a decision, timeout, disconnect, or policy change resolves it. No
 // token is read and no upstream connection exists while held; an approved
 // hold re-runs the entire policed path with the grant recorded.
-async function holdWriteForApproval(admission: AdmissionRecord, req: ProxyRequest, shape: ShapeDenialDetails) {
+async function holdWriteForApproval(admission: AdmissionRecord, req: ProxyRequest, shape: ShapeDenialDetails, responseMediated: boolean) {
   const principal = currentAdmissionPrincipal(admission);
   if (principal === undefined) return missingAdmissionResponse(req);
   const heldMcpGeneration = shape.mcp ? currentMcpOperationPolicy?.generation : undefined;
@@ -1575,7 +1631,7 @@ async function holdWriteForApproval(admission: AdmissionRecord, req: ProxyReques
     try {
       const currentAdmission = server.revalidateAdmission(admission, req);
       if (!currentAdmission) return missingAdmissionResponse(req);
-      return await policedRequestMutation(currentAdmission, req, shape.mcp ? { approvedMcp: shape.mcp } : {});
+      return await policedRequestMutation(currentAdmission, req, { responseMediated, ...(shape.mcp ? { approvedMcp: shape.mcp } : {}) });
     } catch (error) {
       if (!isPolicyDenial(error)) throw error;
       // Includes a re-thrown ask (grant consumed by a racing request or a
@@ -1594,7 +1650,7 @@ async function holdWriteForApproval(admission: AdmissionRecord, req: ProxyReques
   return writeApprovalDenial(req, shape, "write-approval-required");
 }
 
-const handleBeforeRequest = async (admission: AdmissionRecord, req: ProxyRequest) => {
+const handleBeforeRequest = async (admission: AdmissionRecord, req: ProxyRequest, responseMediated: boolean) => {
   try {
     if (currentAdmissionPrincipal(admission) === undefined) {
       return missingAdmissionResponse(req);
@@ -1604,17 +1660,17 @@ const handleBeforeRequest = async (admission: AdmissionRecord, req: ProxyRequest
     // and forwarded instead of denied. Allowlisted hosts always take the
     // enforce path below, with credentials, in both modes.
     if (!currentPolicy.allowedHostSet.has(requestHost(req)) && auditMarkerState().active) {
-      const mutation = await auditedRequestMutation(admission, req);
+      const mutation = await auditedRequestMutation(admission, req, responseMediated);
       logAllowedRequest(req, { audit: true });
       return mutation;
     }
-    return await policedRequestMutation(admission, req);
+    return await policedRequestMutation(admission, req, { responseMediated });
   } catch (error) {
     if (!isPolicyDenial(error)) {
       throw error;
     }
     if (error instanceof ProxyPolicyDenialError && error.shape?.reason === "write-approval-required") {
-      return await holdWriteForApproval(admission, req, error.shape);
+      return await holdWriteForApproval(admission, req, error.shape, responseMediated);
     }
     return policyDenialResponse(req, error);
   }
@@ -1637,7 +1693,7 @@ await server.forAnyRequest()
   .matching((_admission: AdmissionRecord, req: ProxyRequest) => oauthMediator.requestNeedsResponseMediation(req))
   .always()
   .thenPassThrough({
-    beforeRequest: handleBeforeRequest,
+    beforeRequest: (admission: AdmissionRecord, req: ProxyRequest) => handleBeforeRequest(admission, req, true),
     beforeResponse: async (res, req) => {
       return await oauthMediator.beforeResponse(res as OAuthProxyResponse, req);
     },
@@ -1646,7 +1702,7 @@ await server.forAnyRequest()
 await server.forAnyRequest()
   .always()
   .thenPassThrough({
-    beforeRequest: handleBeforeRequest,
+    beforeRequest: (admission: AdmissionRecord, req: ProxyRequest) => handleBeforeRequest(admission, req, false),
   });
 
 // KNOWN LIMITATION (mockttp 4.4.2): the WebSocket passthrough step mirrors the

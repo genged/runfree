@@ -216,7 +216,7 @@ class JsonKeyScanner {
   }
 }
 
-function parseJsonStrict(raw: string): { value?: unknown; reason?: "duplicate-key" | "malformed-json" } {
+export function parseJsonStrict(raw: string): { value?: unknown; reason?: "duplicate-key" | "malformed-json" } {
   try {
     new JsonKeyScanner(raw).scan();
   } catch (error) {

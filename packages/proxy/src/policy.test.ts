@@ -1255,3 +1255,58 @@ describe("write classification (operation-aware read-only / approve-on-write)", 
     expect(mutation.headers?.["X-HTTP-Method"]).toBeUndefined();
   });
 });
+
+describe("OAuth protocol-read classification", () => {
+  const url = "https://auth.example.com/oauth/token";
+  const base: PolicyOptions = {
+    allowedHosts: ["auth.example.com"],
+    requests: { "auth.example.com": { methods: ["GET", "HEAD", "OPTIONS", "POST"], pathPrefixes: ["/.well-known", "/oauth/token"] } },
+  };
+
+  test("a POST the mediator proved protocol-shaped passes an ask host without a grant or a token read", () => {
+    const tokenReader = vi.fn(() => "never-read");
+    expect(() => testBeforeAllowedRequest({ method: "POST", url }, { ...base, oauthProtocolRead: true, tokenReader })).not.toThrow();
+    expect(tokenReader).not.toHaveBeenCalled();
+  });
+
+  test("without the proof the same POST is a write that needs approval", () => {
+    const denial = shapeDenial(() => testBeforeAllowedRequest({ method: "POST", url }, base));
+    expect(denial.shape?.reason).toBe("write-approval-required");
+  });
+
+  test("an explicit deny stays denied: the read class applies only to ask", () => {
+    const denial = shapeDenial(() => testBeforeAllowedRequest({ method: "POST", url }, { ...base, writeApproval: "deny", oauthProtocolRead: true }));
+    expect(denial.shape?.reason).toBe("write-denied");
+  });
+
+  test.each([
+    ["another method", { method: "PUT", url }, "method-not-allowed"],
+    ["a method-override header", { method: "POST", url, headers: { "x-http-method-override": "DELETE" } }, "write-approval-required"],
+  ] as const)("never makes %s a read", (_label, req, reason) => {
+    const denial = shapeDenial(() => testBeforeAllowedRequest(req, { ...base, oauthProtocolRead: true }));
+    expect(denial.shape?.reason).toBe(reason);
+  });
+
+  test("a PUT on a host without method rules stays a write even with the flag", () => {
+    const denial = shapeDenial(() => testBeforeAllowedRequest({ method: "PUT", url }, { allowedHosts: ["auth.example.com"], oauthProtocolRead: true }));
+    expect(denial.shape?.reason).toBe("write-approval-required");
+  });
+
+  test("an explicit write path rule wins over the protocol read", () => {
+    const denial = shapeDenial(() => testBeforeAllowedRequest({ method: "POST", url }, {
+      allowedHosts: ["auth.example.com"],
+      requests: { "auth.example.com": { writePathPrefixes: ["/oauth"] } },
+      oauthProtocolRead: true,
+    }));
+    expect(denial.shape?.writeCategory).toBe("write-path");
+  });
+
+  test("an MCP operation classification takes precedence over the protocol read", () => {
+    const denial = shapeDenial(() => testBeforeAllowedRequest({ method: "POST", url }, {
+      ...base,
+      oauthProtocolRead: true,
+      mcpClassification: { kind: "unclassifiable", category: "mcp-unknown", reason: "non-json", writeAction: "ask" },
+    }));
+    expect(denial.shape?.reason).toBe("write-approval-required");
+  });
+});
