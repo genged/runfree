@@ -56,6 +56,7 @@ import {
   readRetainedDesiredSessionAgentV2,
 } from "./component-state-v2.ts";
 import { RuntimeObservationError } from "./observation-failure.ts";
+import { removeOrphanSessionMcpCallbackIngress } from "./session-callback-ingress.ts";
 import {
   ensureSessionEligibilityPublished,
   observeProxyStartedAt,
@@ -333,6 +334,21 @@ function removeOrphanContainer(
   );
   const executor = (executable: "docker", args: readonly string[], options?: childProcess.SpawnSyncOptions) =>
     input.io.capture(executable, [...args], options ?? {});
+  // The orphan's MCP OAuth callback forwarder routes host loopback to the
+  // orphan's address, and removing the container releases that address to
+  // the next session. The route goes first, as it does in the ordered
+  // teardown; if it cannot be proved gone, the container stays, and with it
+  // the address, for the next reconcile to retry.
+  input.lifecycleLock.assertHeld();
+  removeOrphanSessionMcpCallbackIngress({
+    io: input.io,
+    ...(input.dockerOptions ? { dockerOptions: input.dockerOptions } : {}),
+    projectId: input.expectedProject.projectId,
+    containerId: authority.containerId,
+    sessionId: classification.identity.sessionId,
+    running: classification.container.running,
+    ...(classification.container.sourceIp ? { sourceIp: classification.container.sourceIp } : {}),
+  });
   if (classification.container.running) {
     input.lifecycleLock.assertHeld();
     const stopped = executeSessionContainerCleanupCommand(

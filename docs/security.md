@@ -254,7 +254,8 @@ Details: [Write Approval Grants](architecture.md#write-approval-grants).
 7. **Each session owns its OAuth callback path.** When an approved MCP server
    can use OAuth, every session gets its own loopback port, forwarder, and
    in-session bridge before it starts. The forwarder is bound to that session
-   and removed before the session's record releases its address. The bridge
+   and removed before the session's record releases its address, and before
+   an orphan session container that no record claims is removed. The bridge
    accepts only its forwarder. The port is a routing value, not an
    authorization secret: the client keeps state, PKCE, and issuer checks.
 8. `runfree mcp enable` adds OAuth hosts only after one host-side review.

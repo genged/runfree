@@ -58,8 +58,10 @@ import {
 } from "./session-containers.ts";
 import { readSessionHostStatus, writeSessionHostStatus } from "./session-host-status.ts";
 import { reconcileSessions } from "./session-reconcile.ts";
+import { boundCallbackForwarder } from "./session-callback-ingress.test-harness.ts";
+import { INGRESS_FORWARDER_TEST_IMAGE_ID } from "./ingress-forwarder.test-harness.ts";
 import type { ProjectLifecycleLock } from "./sessions.ts";
-import type { CaptureResult, RuntimeIO } from "./types.ts";
+import type { CaptureResult, DockerContainerInspect, RuntimeIO } from "./types.ts";
 
 const PROXY_ID = "7".repeat(64);
 const PROXY_STARTED_AT = "2026-09-07T12:00:05.123456789Z";
@@ -277,11 +279,32 @@ function fakeDocker(options: {
   proxyInspectFails?: boolean;
   /** Runs as each effect is answered, so a test can observe host state mid-pass. */
   observe?: (label: string) => void;
+  /** This project's MCP OAuth callback forwarders; removed ones drop out. */
+  forwarders?: DockerContainerInspect[];
+  /** Answers every forwarder removal with a daemon refusal. */
+  forwarderRemoveFails?: boolean;
 } = {}): Fake {
   const events: string[] = [];
   const inputs = new Map<string, string>();
   const containers = options.containers ?? [];
+  const forwarders = options.forwarders ?? [];
   const capture = vi.fn((_command: string, args: string[], captureOptions?: { input?: string }): CaptureResult => {
+    if (args[0] === "container" && args[1] === "inspect" && forwarders.some((forwarder) => forwarder.Id === args[2])) {
+      events.push(`forwarder-inspect:${args.slice(2).join(",")}`);
+      return success(JSON.stringify(args.slice(2).map((id) => forwarders.find((forwarder) => forwarder.Id === id))));
+    }
+    if (args[0] === "image" && args[1] === "inspect") return success(`${INGRESS_FORWARDER_TEST_IMAGE_ID}\n`);
+    if (args[0] === "rm" && args[1] === "-f") {
+      events.push(`docker:rm -f ${args[2]}`);
+      if (options.forwarderRemoveFails) return { status: 1, stdout: "", stderr: "Error response from daemon: removal in progress" };
+      const index = forwarders.findIndex((forwarder) => forwarder.Id === args[2]);
+      if (index >= 0) forwarders.splice(index, 1);
+      return success(args[2]);
+    }
+    if (args[0] === "ps" && args.includes("label=io.runfree.ingress-purpose=mcp-callback")) {
+      events.push(`docker:${args.join(" ")}`);
+      return success(forwarders.map((forwarder) => forwarder.Id).join("\n"));
+    }
     const label = ((): string => {
       if (args[0] === "exec" && args[6] === "-e") {
         if (args.length === 8) return "read-served-set";
@@ -335,7 +358,8 @@ function fakeDocker(options: {
     effects: () => events.filter((event) => event !== "read-served-set"
       && event !== "inspect-proxy"
       && event !== "inventory-list"
-      && !event.startsWith("inventory-inspect:")),
+      && !event.startsWith("inventory-inspect:")
+      && !event.startsWith("forwarder-inspect:")),
   });
 }
 
@@ -691,12 +715,114 @@ describe("reconcile before allocation", () => {
     expect(result.orphanContainersRemoved).toEqual(["b".repeat(64)]);
     expect(result.inventoryClean).toBe(false);
     expect(fake.effects()).toEqual([
+      CALLBACK_FORWARDER_LISTING,
       `docker:container stop --time 10 ${"b".repeat(64)}`,
       `docker:container rm ${"b".repeat(64)}`,
       `absence-list:${"b".repeat(64)}`,
       "network-inspect",
       "publish-eligibility",
     ]);
+  });
+
+  describe("an orphan session container with an MCP OAuth callback forwarder", () => {
+    const ORPHAN = "b".repeat(64);
+    const FORWARDER = "4".repeat(64);
+    const PEER_FORWARDER = "5".repeat(64);
+    function orphanRecord(): SessionContainerRecordV2 {
+      return sessionContainerRecordFixture({
+        containerId: ORPHAN,
+        overrides: {
+          sessionId: "rf-20260907-orphan1",
+          sessionIncarnation: "9".repeat(64),
+          sessionPrincipal: `9${"e".repeat(63)}`,
+          containerName: `runfree-${SESSION_TEST_PROJECT.projectId}-session-rf-20260907-orphan1`,
+          sourceIp: "172.31.90.25",
+        },
+      });
+    }
+    const forwarder = (id: string, sessionId: string, target: string) => boundCallbackForwarder({
+      composeProject: SESSION_TEST_PROJECT.composeProject,
+      projectId: SESSION_TEST_PROJECT.projectId,
+      hostPort: id === FORWARDER ? "47200" : "47201",
+      containerId: id,
+      sessionId,
+      sessionContainerId: id === FORWARDER ? ORPHAN : "6".repeat(64),
+      target,
+    });
+
+    test("has the forwarder removed before the container, and leaves a peer's route alone", async () => {
+      const forwarders = [
+        forwarder(FORWARDER, "rf-20260907-orphan1", "172.31.90.25"),
+        forwarder(PEER_FORWARDER, "rf-20260907-peer01", "172.31.90.26"),
+      ];
+      const fake = fakeDocker({ served: [], containers: [snapshotOf(orphanRecord())], forwarders });
+
+      const result = await repair(fake);
+
+      expect(result.orphanContainersRemoved).toEqual([ORPHAN]);
+      expect(fake.effects().slice(0, 4)).toEqual([
+        CALLBACK_FORWARDER_LISTING,
+        `docker:rm -f ${FORWARDER}`,
+        `docker:container stop --time 10 ${ORPHAN}`,
+        `docker:container rm ${ORPHAN}`,
+      ]);
+      expect(forwarders.map((one) => one.Id)).toEqual([PEER_FORWARDER]);
+    });
+
+    test("a stopped orphan's route is matched by its session binding only, never by an address a peer may hold", async () => {
+      // Docker releases a stopped container's address, so a live peer can hold
+      // it; the peer's forwarder must survive the orphan's removal.
+      const forwarders = [
+        forwarder(FORWARDER, "rf-20260907-orphan1", "172.31.90.25"),
+        forwarder(PEER_FORWARDER, "rf-20260907-peer01", "172.31.90.25"),
+      ];
+      const fake = fakeDocker({
+        served: [],
+        containers: [snapshotOf(orphanRecord(), { running: false })],
+        forwarders,
+      });
+
+      await repair(fake);
+
+      expect(forwarders.map((one) => one.Id)).toEqual([PEER_FORWARDER]);
+    });
+
+    test("keeps the container, and its address, when the forwarder cannot be proved removed", async () => {
+      const forwarders = [forwarder(FORWARDER, "rf-20260907-orphan1", "172.31.90.25")];
+      const fake = fakeDocker({
+        served: [],
+        containers: [snapshotOf(orphanRecord())],
+        forwarders,
+        forwarderRemoveFails: true,
+      });
+
+      const failure = await repair(fake).catch((error: unknown) => error);
+
+      expect(failure).toBeInstanceOf(Error);
+      expect((failure as Error).message).toContain(`callback route of orphan session container ${ORPHAN} could not be proved removed`);
+      expect((failure as Error).message).toContain("runfree destroy --force");
+      expect(fake.effects()).not.toContain(`docker:container stop --time 10 ${ORPHAN}`);
+      expect(fake.effects()).not.toContain(`docker:container rm ${ORPHAN}`);
+    });
+
+    test("a rerun once the daemon removes the forwarder reclaims both", async () => {
+      const forwarders = [forwarder(FORWARDER, "rf-20260907-orphan1", "172.31.90.25")];
+      const refused = fakeDocker({
+        served: [],
+        containers: [snapshotOf(orphanRecord())],
+        forwarders,
+        forwarderRemoveFails: true,
+      });
+      await expect(repair(refused)).rejects.toThrow("could not be proved removed");
+
+      const answering = fakeDocker({ served: [], containers: [snapshotOf(orphanRecord())], forwarders });
+      const result = await repair(answering);
+
+      expect(result.orphanContainersRemoved).toEqual([ORPHAN]);
+      expect(forwarders).toEqual([]);
+      expect(answering.effects().indexOf(`docker:rm -f ${FORWARDER}`))
+        .toBeLessThan(answering.effects().indexOf(`docker:container rm ${ORPHAN}`));
+    });
   });
 
   test("narrows eligibility once a retired materialization's last record is gone, and keeps a live one", async () => {

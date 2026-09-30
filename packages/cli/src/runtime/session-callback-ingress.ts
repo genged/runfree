@@ -156,14 +156,43 @@ function removeExactForwarders(input: CaptureInput, forwarders: readonly DockerC
 export function removeSessionMcpCallbackIngress(
   input: CaptureInput & Readonly<{ sessionId: string; sourceIp: string }>,
 ): number {
+  return removeRoutedForwarders(input, input.sessionId, input.sourceIp);
+}
+
+function removeRoutedForwarders(input: CaptureInput, sessionId: string, sourceIp: string | undefined): number {
   const { forwarders } = inspectCallbackForwarders(input);
   const routed = forwarders.filter((forwarder) => {
     const env = envMap(forwarder);
     const boundSession = env[SESSION_CALLBACK_SESSION_ID_ENV];
-    if (boundSession !== undefined) return boundSession === input.sessionId || env.INGRESS_TARGET === input.sourceIp;
-    return env.INGRESS_TARGET === input.sourceIp;
+    const targetsAddress = sourceIp !== undefined && env.INGRESS_TARGET === sourceIp;
+    if (boundSession !== undefined) return boundSession === sessionId || targetsAddress;
+    return targetsAddress;
   });
   return removeExactForwarders(input, routed);
+}
+
+/**
+ * Removes the callback route of a session container no record claims, before
+ * that container (and with it its address) is removed. Matched by the
+ * forwarder's session binding; by address as well only while the orphan is
+ * running, because only then is the address Docker reports exclusively its
+ * own — a stopped container's address may already belong to a live session.
+ * Throws, naming both reclaim paths, when absence cannot be proved: the
+ * caller keeps the container, and the next reconcile retries.
+ */
+export function removeOrphanSessionMcpCallbackIngress(
+  input: CaptureInput & Readonly<{ containerId: string; sessionId: string; running: boolean; sourceIp?: string }>,
+): number {
+  try {
+    return removeRoutedForwarders(input, input.sessionId, input.running ? input.sourceIp : undefined);
+  } catch (error) {
+    throw new Error(
+      `the MCP OAuth callback route of orphan session container ${input.containerId} could not be proved removed, `
+        + `so the container and its address were kept: ${error instanceof Error ? error.message : String(error)}; `
+        + `retry the command, or run \`${remedy.destroyForce()}\` to clear the project runtime and all its sessions`,
+      { cause: error },
+    );
+  }
 }
 
 /**
