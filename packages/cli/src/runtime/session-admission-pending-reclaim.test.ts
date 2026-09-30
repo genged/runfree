@@ -64,7 +64,9 @@ const OWNERS = {
 
 type OwnerShape = keyof typeof OWNERS;
 
-type ContainerAnswer = "absent" | "exited" | "running" | "unavailable" | "foreign";
+type ContainerAnswer =
+  | "absent" | "exited" | "running" | "paused" | "restarting" | "removing"
+  | "unavailable" | "foreign" | "malformed";
 type ProxyAnswer = "absent" | "exited" | "running" | "unavailable";
 
 const OK: CaptureResult = { status: 0, stdout: "", stderr: "" };
@@ -78,14 +80,20 @@ function noSuch(reference: string): CaptureResult {
   return { status: 1, stdout: "", stderr: `Error response from daemon: No such container: ${reference}` };
 }
 
-function containerInspect(id: string, status: "exited" | "running", labels: Record<string, string>): CaptureResult {
+function containerInspect(
+  id: string,
+  status: "exited" | "running" | "paused" | "restarting" | "removing",
+  labels: Record<string, string>,
+  name = "/runfree-session",
+): CaptureResult {
   return {
     status: 0,
     stdout: JSON.stringify([{
       Id: id,
-      Name: "/runfree-session",
+      Name: name,
       Config: { Labels: labels },
-      State: { Running: status === "running", Status: status },
+      // Docker reports a paused or restarting container as Running.
+      State: { Running: status === "running" || status === "paused" || status === "restarting", Status: status },
     }]),
     stderr: "",
   };
@@ -106,7 +114,10 @@ type Scenario = {
   owner: OwnerShape;
   /** What the session container inspect answers, in order; the last repeats. */
   container: ContainerAnswer[];
-  proxy: ProxyAnswer;
+  /** What the selected proxy observation answers, in order; the last repeats. */
+  proxy: ProxyAnswer | ProxyAnswer[];
+  /** Whether the proxy's session registry is a tmpfs (default true). */
+  proxyTmpfs?: boolean;
   otherRunningProxy?: boolean;
   deleteFails?: boolean;
   removeFails?: boolean;
@@ -155,15 +166,24 @@ function build(scenario: Scenario): Harness {
   }
 
   const events: string[] = [];
+  const proxyAnswers: ProxyAnswer[] = Array.isArray(scenario.proxy) ? [...scenario.proxy] : [scenario.proxy];
+  // One proxy observation is an inventory, an inspect, and a listing; the
+  // inventory call advances the sequence.
+  let proxy: ProxyAnswer = proxyAnswers[0] ?? "absent";
   const containerAnswers = [...scenario.container];
   const reference = record.containerId ?? record.containerName;
+  const sessionName = `/${record.containerName}`;
   const answerContainer = (): CaptureResult => {
     const answer = containerAnswers.length > 1 ? containerAnswers.shift() : containerAnswers[0];
     switch (answer) {
       case "absent": return noSuch(reference);
-      case "exited": return containerInspect(CONTAINER_ID, "exited", SESSION_LABELS);
-      case "running": return containerInspect(CONTAINER_ID, "running", SESSION_LABELS);
+      case "exited": return containerInspect(CONTAINER_ID, "exited", SESSION_LABELS, sessionName);
+      case "running": return containerInspect(CONTAINER_ID, "running", SESSION_LABELS, sessionName);
+      case "paused": return containerInspect(CONTAINER_ID, "paused", SESSION_LABELS, sessionName);
+      case "restarting": return containerInspect(CONTAINER_ID, "restarting", SESSION_LABELS, sessionName);
+      case "removing": return containerInspect(CONTAINER_ID, "removing", SESSION_LABELS, sessionName);
       case "foreign": return containerInspect(CONTAINER_ID, "exited", { "io.runfree.project-id": "ffffffffffff" });
+      case "malformed": return { status: 0, stdout: "not json", stderr: "" };
       default: return DAEMON_DOWN;
     }
   };
@@ -176,8 +196,9 @@ function build(scenario: Scenario): Harness {
       }
       if (args[0] === "ps" && args.includes(`id=${PROXY_ID}`)) {
         events.push("inventory-proxy");
-        if (scenario.proxy === "unavailable") return DAEMON_DOWN;
-        return { ...OK, stdout: scenario.proxy === "absent" ? "" : `${PROXY_ID}\n` };
+        proxy = (proxyAnswers.length > 1 ? proxyAnswers.shift() : proxyAnswers[0]) ?? "absent";
+        if (proxy === "unavailable") return DAEMON_DOWN;
+        return { ...OK, stdout: proxy === "absent" ? "" : `${PROXY_ID}\n` };
       }
       if (args[0] === "container" && args[1] === "inspect" && args[2] === PROXY_ID) {
         events.push("inspect-proxy");
@@ -186,7 +207,8 @@ function build(scenario: Scenario): Harness {
           stdout: JSON.stringify([{
             Id: PROXY_ID,
             Config: { Labels: PROXY_LABELS },
-            State: { Running: scenario.proxy === "running", Status: scenario.proxy === "running" ? "running" : "exited" },
+            State: { Running: proxy === "running", Status: proxy === "running" ? "running" : "exited" },
+            HostConfig: scenario.proxyTmpfs === false ? {} : { Tmpfs: { "/run/runfree-sessions": "mode=0755" } },
           }]),
           stderr: "",
         };
@@ -194,7 +216,7 @@ function build(scenario: Scenario): Harness {
       if (args[0] === "ps" && args.includes("label=com.docker.compose.service=proxy")) {
         events.push("list-running-proxies");
         const running = [
-          ...(scenario.proxy === "running" ? [PROXY_ID] : []),
+          ...(proxy === "running" ? [PROXY_ID] : []),
           ...(scenario.otherRunningProxy ? [OTHER_PROXY_ID] : []),
         ];
         return { ...OK, stdout: running.map((id) => `${id}\n`).join("") };
@@ -332,6 +354,13 @@ describe("no record is dropped before Docker proves it may be", () => {
     ["the running proxy refuses the file delete", { owner: "dead", container: ["exited"], proxy: "running", deleteFails: true }, "could not be removed from the proxy"],
     ["the container survives its removal", { owner: "dead", container: ["exited"], proxy: "exited" }, "still present after removal"],
     ["Docker goes away before absence is proved", { owner: "dead", container: ["exited", "unavailable"], proxy: "exited" }, "start Docker"],
+    ["the session container is paused", { owner: "dead", container: ["paused"], proxy: "exited" }, "is still paused"],
+    ["the session container is restarting", { owner: "dead", container: ["restarting"], proxy: "exited" }, "is still restarting"],
+    ["the session container is being removed", { owner: "dead", container: ["removing"], proxy: "exited" }, "is still removing"],
+    ["the session container inspection is malformed", { owner: "dead", container: ["malformed"], proxy: "exited" }, "the inspection is malformed"],
+    ["the proxy starts between the observation and the teardown", { owner: "dead", container: ["absent"], proxy: ["exited", "running"] }, "started during reclaim"],
+    ["the stopped proxy does not keep its session files on tmpfs", { owner: "dead", container: ["absent"], proxy: "exited", proxyTmpfs: false }, "does not keep its session files on tmpfs"],
+    ["a container holds the reserved name of a record that never bound one", { owner: "dead", container: ["exited"], proxy: "exited", bound: false, stamped: false }, "never bound it"],
   ])("refuses when %s", (_name, scenario, reason) => {
     const harness = build(scenario);
 
@@ -344,7 +373,10 @@ describe("no record is dropped before Docker proves it may be", () => {
     expect(result.reasons.join("\n")).toContain(harness.record.sessionId);
     // The record is the address reservation: it is exactly what it was.
     expect(harness.records()).toEqual([harness.record]);
-    expect(readSessionHostStatus(stateDir, harness.record.sessionId)?.terminal).toBe("revoking");
+    // Refused before the teardown began, an unstamped record stays unstamped;
+    // a stamped one stays pending either way.
+    expect(readSessionHostStatus(stateDir, harness.record.sessionId)?.terminal)
+      .toBe(scenario.stamped === false ? undefined : "revoking");
   });
 
   test("a refused owner is decided before any Docker call", () => {

@@ -417,12 +417,22 @@ export function planRuntimeUpgradeFromV2State(
     };
     const effectiveControlPlane = readEffectiveControlPlaneV2(desiredPlan.paths.stateDir);
     const retainedDesiredSessionAgent = readRetainedDesiredSessionAgentV2(desiredPlan.paths.stateDir);
-    const lifecycleRecords = listSessionContainerRecordsV2(desiredPlan.paths.stateDir, expectedProject);
-    const pendingAdmission = !options.deferPendingSessionAdmission && pendingSessionFileAdmissionRecords({
+    const registeredRecords = listSessionContainerRecordsV2(desiredPlan.paths.stateDir, expectedProject);
+    const pendingRecords = pendingSessionFileAdmissionRecords({
       stateDir: desiredPlan.paths.stateDir,
-      records: lifecycleRecords,
+      records: registeredRecords,
       nowEpochMs: Date.now(),
-    }).length > 0;
+    });
+    // Deferred, a pending record is the locked reclaim's to decide, so the
+    // pre-plan plans as if it were already gone: counted as a live record it
+    // would turn an incompatible upgrade into "wait for the sessions to
+    // drain", which a dead owner's record never does. If the reclaim refuses,
+    // the start stops there; if it succeeds, the strict plan sees exactly this
+    // registry.
+    const lifecycleRecords = options.deferPendingSessionAdmission
+      ? registeredRecords.filter((record) => !pendingRecords.includes(record))
+      : registeredRecords;
+    const pendingAdmission = !options.deferPendingSessionAdmission && pendingRecords.length > 0;
     const pendingRebind = readControlPlaneRebindTransaction(desiredPlan.paths.stateDir, expectedProject);
     const proxyContainerIds = docker.serviceContainerIds(
       desiredPlan.composeProjectName,

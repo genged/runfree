@@ -34,14 +34,18 @@
 //
 // Every observation this host could not make is a refusal, not an absence:
 // "Docker did not answer" is never "the container is gone". A refusal names
-// the session, the reason, and the remedy, and leaves every record exactly as
-// it was, so the same pass run again once Docker answers finishes the job.
+// the session, the reason, and the remedy, and leaves the record exactly as it
+// was (a refusal after the teardown has begun may have rewritten its terminal
+// stamp, which keeps it pending either way), so the same pass run again once
+// Docker answers finishes the job.
 //
 // A pending control-plane rebind is not touched here. The planner lets that
 // journal take precedence over a pending admission, and its own recovery
 // already classifies dead-owner participants, so this pass steps aside.
 
 import type * as childProcess from "node:child_process";
+
+import { PROXY_SESSION_REGISTRY_DIR } from "@runfree/runtime-contracts/session-registry";
 
 import { remedy } from "../remedies.ts";
 import { PROJECT_ID_LABEL } from "./constants.ts";
@@ -73,6 +77,8 @@ import type { ProjectLifecycleLock } from "./sessions.ts";
 import type { DockerContainerInspect } from "./types.ts";
 
 const DOCKER_OBJECT_ID_PATTERN = /^[a-f0-9]{64}$/;
+/** The proxy's session registry; the session files live in `sessions/` below it. */
+const SESSION_REGISTRY_PATH = PROXY_SESSION_REGISTRY_DIR;
 const SESSION_CONTAINER_ROLE = "session-agent";
 const SESSION_CONTAINER_OBSERVATION_TIMEOUT_MS = 5_000;
 const PROXY_INVENTORY_TIMEOUT_MS = 5_000;
@@ -266,6 +272,24 @@ function runningProjectProxyIds(input: PendingSessionAdmissionReclaimInput, sess
 type ProxyObservation = "running" | "not-serving";
 
 /**
+ * Whether this proxy's session registry is a tmpfs Docker discards on stop,
+ * with nothing persistent mounted inside it.
+ *
+ * The same two places the security contract reads a tmpfs from
+ * (`HostConfig.Tmpfs` for Compose's `tmpfs:`, or a `tmpfs` entry in `Mounts`).
+ */
+function sessionFilesOnTmpfs(proxy: DockerContainerInspect): boolean {
+  const tmpfs = proxy.HostConfig?.Tmpfs;
+  const mounts = proxy.Mounts ?? [];
+  const registryIsTmpfs = Boolean(tmpfs && Object.hasOwn(tmpfs, SESSION_REGISTRY_PATH))
+    || mounts.some((mount) => mount.Destination === SESSION_REGISTRY_PATH && mount.Type === "tmpfs");
+  const persistentInside = mounts.some((mount) => mount.Type !== "tmpfs"
+    && typeof mount.Destination === "string"
+    && (mount.Destination === SESSION_REGISTRY_PATH || mount.Destination.startsWith(`${SESSION_REGISTRY_PATH}/`)));
+  return registryIsTmpfs && !persistentInside;
+}
+
+/**
  * Whether the selected proxy could still hold this session's file.
  *
  * `not-serving` is a proof: the selected proxy is absent, or stopped, and no
@@ -303,7 +327,19 @@ function observeSelectedProxy(
         + ` (${others.map(shortId).join(", ")}); inspect the runtime, then recreate it with \`${remedy.rebuild()}\``,
     );
   }
-  if (!proxy || stoppedState(proxy.State)) return "not-serving";
+  if (!proxy) return "not-serving";
+  if (stoppedState(proxy.State)) {
+    // The claim that a stopped proxy holds no file rests on the session
+    // directory being tmpfs, so it is read off this exact container rather
+    // than assumed from the topology it was meant to have.
+    if (!sessionFilesOnTmpfs(proxy)) {
+      throw new ReclaimRefusal(
+        `session ${sessionId}: the stopped selected proxy does not keep its session files on tmpfs, so a stopped`
+          + ` proxy does not prove them gone; inspect the runtime, then recreate it with \`${remedy.rebuild()}\``,
+      );
+    }
+    return "not-serving";
+  }
   if (proxy.State?.Running === true) return "running";
   throw new ReclaimRefusal(
     `session ${sessionId}: the selected proxy is ${proxy.State?.Status ?? "in an unknown state"}, neither running`

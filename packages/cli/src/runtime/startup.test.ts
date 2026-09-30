@@ -17,6 +17,7 @@ import type { CaptureResult, DockerContainerInspect, RuntimeContext, RuntimeIO }
 import { sha256Digest } from "./component-state.ts";
 import {
   createControlPlaneGenerationV2,
+  createRuntimeTopologyGenerationV2,
   publishControlPlaneMaterializationV2,
   selectEffectiveControlPlaneV2,
 } from "./component-state-v2.ts";
@@ -454,6 +455,30 @@ test("the start pre-plan defers a terminal-stamped record to the locked reclaim;
     expect(planRuntimeUpgradeFromV2State(desiredPlan, context, docker)).toEqual(PENDING_ADMISSION_REFUSAL);
     expect(planRuntimeUpgradeFromV2State(desiredPlan, context, docker, { deferPendingSessionAdmission: true }))
       .toEqual({ action: "proxy-restart", services: ["proxy"] });
+
+    // An incompatible upgrade installed after the daemon died. Counted as a
+    // live record, the dead owner's record would ask the operator to wait for
+    // a session that can never drain; deferred, it is the reclaim's to decide.
+    const topology = createRuntimeTopologyGenerationV2({
+      controlPlaneTopologyDigest: sha256Digest("topology-after-daemon-death"),
+      sessionTemplateDigest: target.topology.sessionTemplateDigest,
+    });
+    const incompatiblePlan = {
+      ...desiredPlan,
+      generationV2: {
+        ...target,
+        topology,
+        controlPlane: createControlPlaneGenerationV2({
+          ...SESSION_TEST_PROJECT,
+          proxyImageInputDigest: target.controlPlane.proxyImageInputDigest,
+          controlPlaneTopologyDigest: topology.controlPlaneTopologyDigest,
+          admissionContractEpoch: target.controlPlane.admissionContractEpoch,
+        }),
+      },
+    } as RuntimePlan;
+    expect(planRuntimeUpgradeFromV2State(incompatiblePlan, context, docker, { deferPendingSessionAdmission: true }))
+      .toEqual({ action: "proxy-restart", services: ["proxy"] });
+    expect(planRuntimeUpgradeFromV2State(incompatiblePlan, context, docker)).toEqual(PENDING_ADMISSION_REFUSAL);
   } finally {
     fs.rmSync(stateDir, { recursive: true, force: true });
   }
