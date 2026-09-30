@@ -11,7 +11,7 @@ describe("matchDockerApiRoute", () => {
     [["container", "inspect", "runfree-x-proxy-1", ID], { kind: "inspect", object: "container", refs: ["runfree-x-proxy-1", ID], template: "raw" }],
     [["container", "inspect", "--format", "{{.Id}}", ID], { kind: "inspect", object: "container", refs: [ID], template: "id" }],
     [["container", "inspect", "--format", "{{.State.Running}}", ID], { kind: "inspect", object: "container", refs: [ID], template: "state-running" }],
-    [["inspect", ID, "proxy"], { kind: "inspect", object: "container", refs: [ID, "proxy"], template: "raw" }],
+    [["inspect", ID, "proxy"], { kind: "inspect", object: "container", refs: [ID, "proxy"], template: "raw", typeless: true }],
     [["image", "inspect", "runfree/agent:1.2", `sha256:${"b".repeat(64)}`], { kind: "inspect", object: "image", refs: ["runfree/agent:1.2", `sha256:${"b".repeat(64)}`], template: "raw" }],
     [["image", "inspect", "--format", "{{.Id}}", `ghcr.io/x/y@sha256:${"c".repeat(64)}`], { kind: "inspect", object: "image", refs: [`ghcr.io/x/y@sha256:${"c".repeat(64)}`], template: "id" }],
     [["network", "inspect", "runfree_x_internal"], { kind: "inspect", object: "network", refs: ["runfree_x_internal"], template: "raw" }],

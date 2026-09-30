@@ -192,8 +192,16 @@ caller -> budget wrapper -> histogram -> capture(argv)
   `DOCKER_CONTEXT`, `currentContext`, context metadata;
   `packages/cli/src/runtime/docker-endpoint.ts`). Only a local Unix socket
   is used; TCP, SSH, TLS, both overrides set, custom config headers, or an
-  unreadable config keep the call on the CLI. The daemon must answer
-  `/_ping` as Docker with API 1.41 or later.
+  unreadable config keep the call on the CLI.
+- **Binding.** Once per process for each Docker CLI binary, socket file,
+  and context, the transport runs `docker version` with the call's
+  environment and requires the CLI's context and its view of the server
+  (version, API range, commit, OS, architecture, kernel, build time) to
+  match what the socket's daemon reports, and the daemon to say Docker in
+  `/_ping`. It then speaks the API version the CLI negotiated, so the daemon
+  shapes every body as it would for the CLI. A mismatch keeps the process on
+  the CLI. A replaced `docker` binary or a re-created or re-pointed socket
+  binds again. Type-less `inspect` is answered only while swarm is inactive.
 - **Doubt stays on the CLI.** A `docker` on `PATH` that is not a native
   binary (a shim or a test fake), `RUNFREE_TEST_FAKE_DOCKER=1`, an
   unexpected spawn option, a refused connection, a missing object, or any
@@ -201,10 +209,13 @@ caller -> budget wrapper -> histogram -> capture(argv)
   budget. `RUNFREE_DOCKER_TRANSPORT=cli` forces every call onto the CLI.
 - **Failures.** A routed call ends at its budget with status 124
   (`timedOut`); there is no child process that could ignore SIGTERM. A call
-  with no budget ends at 120 s. A socket error after connecting, an output
-  over `maxBuffer`, or a lost worker thread is status 125 (the last also
-  sends the rest of the process to the CLI). Once an exec has started, no
-  failure hands it to the CLI, so a command never runs twice.
+  with no budget ends at 60 s; Ctrl-C during a stuck routed call waits for
+  that bound, because the waiting thread cannot run a signal handler. A
+  socket error after connecting, an output over `maxBuffer`, or a lost
+  worker thread is status 125 (the last also sends the rest of the process
+  to the CLI). Once an exec has started, no failure hands it to the CLI, so
+  a command never runs twice: a refused start is the CLI's status 1, and an
+  exec whose exit code the daemon never records is 124 at the budget.
 
 ### Agent Container
 

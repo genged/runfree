@@ -16,7 +16,8 @@ import path from "node:path";
  *
  * - `DOCKER_HOST` and `DOCKER_CONTEXT` both set: CLI versions disagree on
  *   which one wins.
- * - `DOCKER_TLS_VERIFY` / `DOCKER_CERT_PATH` / `DOCKER_API_VERSION` set, a
+ * - `DOCKER_TLS_VERIFY` / `DOCKER_CERT_PATH` / `DOCKER_API_VERSION` /
+ *   `DOCKER_CUSTOM_HEADERS` set, a
  *   non-`unix://` host (`tcp`, `ssh`, `fd`, `npipe`), a relative or
  *   non-canonical socket path.
  * - A config file or context record that is missing, unreadable, malformed,
@@ -125,7 +126,7 @@ function dockerContextTlsDir(configDir: string, contextName: string): string {
  * environment when the call passes none).
  */
 export function resolveDockerEndpoint(env: NodeJS.ProcessEnv, fsx: DockerEndpointFs = nodeDockerEndpointFs): DockerEndpoint {
-  for (const name of ["DOCKER_TLS_VERIFY", "DOCKER_CERT_PATH", "DOCKER_API_VERSION"] as const) {
+  for (const name of ["DOCKER_TLS_VERIFY", "DOCKER_CERT_PATH", "DOCKER_API_VERSION", "DOCKER_CUSTOM_HEADERS"] as const) {
     if (set(env[name])) return cli(`${name} is set`);
   }
   const host = env.DOCKER_HOST;

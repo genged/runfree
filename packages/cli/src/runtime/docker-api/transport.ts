@@ -1,7 +1,8 @@
-import type * as childProcess from "node:child_process";
+import * as childProcess from "node:child_process";
 
 import { type DockerEndpoint, type DockerEndpointFs, nodeDockerEndpointFs, resolveDockerEndpoint } from "../docker-endpoint.ts";
 import type { CaptureResult } from "../types.ts";
+import { bindDaemon, type BindingOutcome, type CliRunner, type DaemonBinding, socketIdentity } from "./binding.ts";
 import { createNativeDockerCliProbe, type DockerCliProbe } from "./cli-identity.ts";
 import { demuxDockerStream, formatRawInspect, truncateId } from "./format.ts";
 import { type DockerApiRoute, matchDockerApiRoute } from "./routes.ts";
@@ -14,14 +15,13 @@ export const DOCKER_TRANSPORT_ENV = "RUNFREE_DOCKER_TRANSPORT";
 const DEFAULT_MAX_BUFFER = 1024 * 1024;
 // A routed call the caller gave no timeout still ends here. The CLI path
 // would wait without limit; a bounded wait fails closed with 124 instead.
-// Longer than the 90 s lifecycle operation budget, so a budgeted caller
-// always hits its own budget first.
-export const UNBUDGETED_ROUTED_CALL_MS = 120_000;
-// The oldest Engine API whose exec hijack and inspect bodies the routes rely on
-// (Docker 20.10).
-const MIN_API_MINOR = 41;
-const EXEC_EXIT_POLLS = 20;
-const EXEC_EXIT_POLL_MS = 10;
+// It is also how long Ctrl-C can wait: the calling thread cannot run a
+// signal handler while it sleeps in Atomics.wait.
+export const UNBUDGETED_ROUTED_CALL_MS = 60_000;
+// Exec inspect polls after the stream ends, until the daemon records the exit
+// or the call's deadline passes.
+const EXEC_EXIT_FIRST_POLL_MS = 5;
+const EXEC_EXIT_MAX_POLL_MS = 100;
 const ALLOWED_OPTION_KEYS = new Set(["env", "timeout", "maxBuffer", "input", "encoding"]);
 
 export type DockerApiCaptureOutcome =
@@ -38,10 +38,19 @@ export type DockerApiCaptureDeps = {
   endpointFs?: DockerEndpointFs;
   resolveEndpoint?: (env: NodeJS.ProcessEnv) => DockerEndpoint;
   dockerCliProbe?: DockerCliProbe;
+  /** Runs the Docker CLI for the one-time daemon binding (`docker version`). */
+  runCli?: CliRunner;
+  /** The socket's identity (real path, device, inode); undefined when it is not a socket. */
+  socketIdentity?: (socketPath: string) => string | undefined;
   now?: () => number;
 };
 
-type Ping = { ok: true; apiVersion: string } | { ok: false };
+const spawnDockerCli: CliRunner = (args, env, timeoutMs) => {
+  const result = childProcess.spawnSync("docker", [...args], { encoding: "utf8", env, timeout: timeoutMs, maxBuffer: 1024 * 1024 });
+  const timedOut = (result.error as NodeJS.ErrnoException | undefined)?.code === "ETIMEDOUT";
+  const status = timedOut ? 124 : result.error || result.signal ? 125 : result.status ?? 125;
+  return { status, stdout: typeof result.stdout === "string" ? result.stdout : "" };
+};
 
 class StayOnCli {
   constructor(readonly reason: string) {}
@@ -119,8 +128,10 @@ export function createDockerApiCapture(deps: DockerApiCaptureDeps = {}): DockerA
   const endpointFs = deps.endpointFs ?? nodeDockerEndpointFs;
   const resolveEndpoint = deps.resolveEndpoint ?? ((env: NodeJS.ProcessEnv) => resolveDockerEndpoint(env, endpointFs));
   const dockerCliProbe = deps.dockerCliProbe ?? createNativeDockerCliProbe();
+  const runCli = deps.runCli ?? spawnDockerCli;
+  const identifySocket = deps.socketIdentity ?? socketIdentity;
   const now = deps.now ?? (() => performance.now());
-  const pings = new Map<string, Ping>();
+  const bindings = new Map<string, Extract<BindingOutcome, { kind: "bound" | "cli" }>>();
 
   const exchange = (req: Omit<BridgeRequest, "headers"> & { headers?: Record<string, string> }, deadline: number): BridgeReply => {
     const headers: Record<string, string> = { "User-Agent": "runfree-docker-transport", ...(req.headers ?? {}) };
@@ -129,24 +140,6 @@ export function createDockerApiCapture(deps: DockerApiCaptureDeps = {}): DockerA
       headers["Content-Length"] = String(req.body.byteLength);
     }
     return bridge.request({ ...req, headers }, deadline);
-  };
-
-  const ping = (socketPath: string, deadline: number): Ping | BridgeReply => {
-    const cached = pings.get(socketPath);
-    if (cached) return cached;
-    const reply = exchange({ socketPath, method: "GET", path: "/_ping", maxBytes: 4096 }, deadline);
-    if (reply.kind === "timeout" || reply.kind === "dead") return reply;
-    if (reply.kind === "error") return reply;
-    let result: Ping = { ok: false };
-    if (reply.kind === "response" && reply.status === 200) {
-      const version = reply.headers["api-version"] ?? "";
-      const server = reply.headers.server ?? "";
-      const match = /^1\.([0-9]{1,3})$/.exec(version);
-      const isDocker = server.startsWith("Docker/") && reply.headers["libpod-api-version"] === undefined;
-      if (match && Number(match[1]) >= MIN_API_MINOR && isDocker) result = { ok: true, apiVersion: version };
-    }
-    pings.set(socketPath, result);
-    return result;
   };
 
   const runInspect = (
@@ -263,15 +256,18 @@ export function createDockerApiCapture(deps: DockerApiCaptureDeps = {}): DockerA
     }, deadline);
     const startFailure = readFailure(started);
     if (startFailure) return startFailure;
+    // A refused start never ran the command (the daemon hijacks the
+    // connection before it starts the process); the CLI reports it as its
+    // generic daemon error with status 1.
     if (started.kind === "response") {
-      return statusOnly(125, `Error response from daemon: ${daemonMessage(started.body)}\n`);
+      return statusOnly(1, `Error response from daemon: ${daemonMessage(started.body)}\n`);
     }
     if (started.kind !== "upgraded" || started.status !== 101) return transportFailure("exec start was not upgraded");
     const streams = demuxDockerStream(started.body);
     if (!streams.ok) return transportFailure(streams.reason);
     if (streams.stdout.byteLength > maxBuffer || streams.stderr.byteLength > maxBuffer) return transportFailure("output exceeds maxBuffer");
 
-    for (let poll = 0; poll < EXEC_EXIT_POLLS; poll += 1) {
+    for (let pause = EXEC_EXIT_FIRST_POLL_MS; ; pause = Math.min(pause * 2, EXEC_EXIT_MAX_POLL_MS)) {
       const inspected = exchange({ socketPath, method: "GET", path: `/v${version}/exec/${execId}/json`, maxBytes: 256 * 1024 }, deadline);
       const inspectFailure = readFailure(inspected, true);
       if (inspectFailure) return inspectFailure;
@@ -282,12 +278,13 @@ export function createDockerApiCapture(deps: DockerApiCaptureDeps = {}): DockerA
       if (state.Running === false && typeof exitCode === "number" && Number.isInteger(exitCode) && exitCode >= 0 && exitCode <= 255) {
         return { status: exitCode, stdout: streams.stdout.toString("utf8"), stderr: streams.stderr.toString("utf8") };
       }
-      // The stream can end a moment before the daemon records the exit.
-      const pause = Math.min(EXEC_EXIT_POLL_MS, deadline - now());
-      if (pause <= 0) return TIMED_OUT;
-      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, pause);
+      if (state.Running === false) return transportFailure("exec exit code unavailable");
+      // The stream can end a moment before the daemon records the exit; keep
+      // asking until the call's own deadline, never past it.
+      const wait = Math.min(pause, deadline - now());
+      if (wait <= 0) return TIMED_OUT;
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, wait);
     }
-    return transportFailure("exec exit code unavailable");
   };
 
   return (command, args, options = {}) => {
@@ -302,9 +299,12 @@ export function createDockerApiCapture(deps: DockerApiCaptureDeps = {}): DockerA
     const route = matchDockerApiRoute(args, { hasInput: input !== undefined });
     if (!route) return { routed: false };
     if (bridge.isDead()) return { routed: false };
-    if (!dockerCliProbe(env, envGiven)) return { routed: false };
+    const cliIdentity = dockerCliProbe(env, envGiven);
+    if (cliIdentity === undefined) return { routed: false };
     const endpoint = resolveEndpoint(env);
     if (endpoint.kind !== "unix") return { routed: false };
+    const socket = identifySocket(endpoint.socketPath);
+    if (socket === undefined) return { routed: false };
 
     const started = now();
     const budget = options.timeout ?? UNBUDGETED_ROUTED_CALL_MS;
@@ -315,26 +315,45 @@ export function createDockerApiCapture(deps: DockerApiCaptureDeps = {}): DockerA
       return Math.max(1, Math.floor(deadline - now()));
     };
 
-    const pinged = ping(endpoint.socketPath, deadline);
-    if ("kind" in pinged) {
-      // A daemon that cannot be reached is the CLI's to report; a ping that
-      // failed after connecting is as unclear as any other socket error.
-      const failure = readFailure(pinged);
-      if (failure instanceof StayOnCli) return { routed: false, timeout: remaining() };
-      return { routed: true, result: failure ?? transportFailure("unexpected ping reply") };
+    const bindingKey = `${cliIdentity}\u0000${socket}\u0000${endpoint.context}`;
+    let bound = bindings.get(bindingKey);
+    if (!bound) {
+      const outcome = bindDaemon({
+        exchange: (req, until) => exchange({ ...req, socketPath: endpoint.socketPath }, until),
+        runCli,
+        env,
+        context: endpoint.context,
+        deadline,
+        now,
+      });
+      if (outcome.kind === "reply") {
+        // A binding step that timed out or lost its socket mid-request is as
+        // unclear as any other: 124 or 125, never a guess.
+        const failure = readFailure(outcome.reply);
+        if (failure instanceof StayOnCli || failure === undefined) return { routed: false, timeout: remaining() };
+        return { routed: true, result: failure };
+      }
+      if (outcome.kind === "cli" && !outcome.cache) return { routed: false, timeout: remaining() };
+      bound = outcome;
+      bindings.set(bindingKey, bound);
     }
-    if (!pinged.ok) return { routed: false, timeout: remaining() };
+    if (bound.kind !== "bound") {
+      if (options.timeout !== undefined && deadline - now() <= 0) return { routed: true, result: TIMED_OUT };
+      return { routed: false, timeout: remaining() };
+    }
+    const binding: DaemonBinding = bound.binding;
+    if (route.kind === "inspect" && route.typeless && !binding.swarmInactive) return { routed: false, timeout: remaining() };
 
     let run: RouteRun;
     switch (route.kind) {
       case "inspect":
-        run = runInspect(route, endpoint.socketPath, pinged.apiVersion, maxBuffer, deadline);
+        run = runInspect(route, endpoint.socketPath, binding.apiVersion, maxBuffer, deadline);
         break;
       case "ps":
-        run = runPs(route, endpoint.socketPath, pinged.apiVersion, maxBuffer, deadline);
+        run = runPs(route, endpoint.socketPath, binding.apiVersion, maxBuffer, deadline);
         break;
       case "exec":
-        run = runExec(route, endpoint.socketPath, pinged.apiVersion, maxBuffer, input, deadline);
+        run = runExec(route, endpoint.socketPath, binding.apiVersion, maxBuffer, input, deadline);
         break;
     }
     if (run instanceof StayOnCli) {

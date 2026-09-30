@@ -19,7 +19,8 @@ export type InspectObject = "container" | "image" | "network" | "volume";
 export type InspectTemplate = "raw" | "id" | "state-running";
 
 export type DockerApiRoute =
-  | { kind: "inspect"; object: InspectObject; refs: readonly string[]; template: InspectTemplate }
+  /** `typeless`: `docker inspect` without a type, answered only while swarm is inactive. */
+  | { kind: "inspect"; object: InspectObject; refs: readonly string[]; template: InspectTemplate; typeless?: true }
   | { kind: "ps"; all: boolean; noTrunc: boolean; filters: Readonly<Record<string, readonly string[]>> }
   | { kind: "exec"; user?: string; interactive: boolean; containerId: string; cmd: readonly string[] };
 
@@ -46,7 +47,7 @@ function refsValid(object: InspectObject, refs: readonly string[]): boolean {
   return refs.every((ref) => object === "image" ? validImageRef(ref) : NAME_PATTERN.test(ref));
 }
 
-function inspectRoute(object: InspectObject, rest: readonly string[], allowed: readonly InspectTemplate[]): DockerApiRoute | undefined {
+function inspectRoute(object: InspectObject, rest: readonly string[], allowed: readonly InspectTemplate[]): Extract<DockerApiRoute, { kind: "inspect" }> | undefined {
   let template: InspectTemplate = "raw";
   let refs = rest;
   if (rest[0] === "--format") {
@@ -142,9 +143,14 @@ export function matchDockerApiRoute(args: readonly string[], options: { hasInput
   const [first, second] = args;
   if (options.hasInput && first !== "exec") return undefined;
   if (first === "container" && second === "inspect") return inspectRoute("container", args.slice(2), ["raw", "id", "state-running"]);
-  // Type-less inspect tries containers first (cli/command/system inspect);
-  // any miss is answered by the CLI's full type search.
-  if (first === "inspect") return inspectRoute("container", args.slice(1), ["raw", "state-running"]);
+  // Type-less inspect tries containers first (cli/command/system inspect)
+  // unless the daemon is a swarm manager, when swarm objects can precede
+  // them; the transport answers it only while swarm is inactive. Any miss is
+  // answered by the CLI's full type search.
+  if (first === "inspect") {
+    const typeless = inspectRoute("container", args.slice(1), ["raw", "state-running"]);
+    return typeless ? { ...typeless, typeless: true } : undefined;
+  }
   if (first === "image" && second === "inspect") return inspectRoute("image", args.slice(2), ["raw", "id"]);
   if (first === "network" && second === "inspect") return inspectRoute("network", args.slice(2), ["raw"]);
   if (first === "volume" && second === "inspect") return inspectRoute("volume", args.slice(2), ["raw"]);

@@ -45,7 +45,7 @@ describe("resolveDockerEndpoint", () => {
     expect(resolveDockerEndpoint({ HOME, DOCKER_HOST: host }, fakeFs({})).kind).toBe("cli");
   });
 
-  it.each(["DOCKER_TLS_VERIFY", "DOCKER_CERT_PATH", "DOCKER_API_VERSION"])("falls back to the CLI when %s is set", (name) => {
+  it.each(["DOCKER_TLS_VERIFY", "DOCKER_CERT_PATH", "DOCKER_API_VERSION", "DOCKER_CUSTOM_HEADERS"])("falls back to the CLI when %s is set", (name) => {
     const fsx = fakeFs({}, ["/var/run/docker.sock"]);
     fsx.exists = () => true;
     expect(resolveDockerEndpoint({ HOME, DOCKER_HOST: "unix:///x.sock", [name]: "1" }, fsx).kind).toBe("cli");

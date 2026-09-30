@@ -1,6 +1,15 @@
 import { afterEach, describe, expect, it } from "vitest";
 
-import { DOCKER_PING, type FakeEngine, type FakeEngineScript, frame, startFakeEngine } from "./fake-engine.test-harness.ts";
+import {
+  cliVersionJson,
+  DAEMON_VERSION,
+  DOCKER_PING,
+  type FakeEngine,
+  type FakeEngineScript,
+  frame,
+  startFakeEngine,
+  versionReply,
+} from "./fake-engine.test-harness.ts";
 import { createSyncBridge } from "./sync-bridge.ts";
 import { type DockerApiCaptureDeps, createDockerApiCapture } from "./transport.ts";
 import { DOCKER_API_WORKER_SOURCE } from "./worker.ts";
@@ -18,7 +27,7 @@ afterEach(async () => {
 });
 
 async function start(replies: FakeEngineScript["replies"], execStarts?: FakeEngineScript["execStarts"]): Promise<FakeEngine> {
-  engine = await startFakeEngine({ replies: { "GET /_ping": DOCKER_PING, ...replies }, ...(execStarts ? { execStarts } : {}) });
+  engine = await startFakeEngine({ replies: { "GET /_ping": DOCKER_PING, ...versionReply(), ...replies }, ...(execStarts ? { execStarts } : {}) });
   return engine;
 }
 
@@ -26,7 +35,9 @@ function transportFor(fake: FakeEngine, deps: DockerApiCaptureDeps = {}) {
   return createDockerApiCapture({
     controlEnv: {},
     resolveEndpoint: () => ({ kind: "unix", socketPath: fake.socketPath, context: "default" }),
-    dockerCliProbe: () => true,
+    dockerCliProbe: () => "docker-cli",
+    runCli: () => ({ status: 0, stdout: `${cliVersionJson()}\n` }),
+    socketIdentity: () => "socket",
     ...deps,
   });
 }
@@ -34,7 +45,7 @@ function transportFor(fake: FakeEngine, deps: DockerApiCaptureDeps = {}) {
 const json = (value: unknown) => ({ status: 200, headers: { "Content-Type": "application/json" }, body: `${JSON.stringify(value)}\n` });
 
 async function apiRequests(fake: FakeEngine) {
-  return (await fake.requests()).filter((request) => request.url !== "/_ping");
+  return (await fake.requests()).filter((request) => request.url !== "/_ping" && !request.url.endsWith("/version"));
 }
 
 describe("docker API transport: inspect routes", () => {
@@ -192,13 +203,17 @@ describe("docker API transport: exec", () => {
     expect(requests[1].stdinBase64).toBe("");
   });
 
-  it("waits for the daemon to record the exit, then fails closed with 125 when it never does", async () => {
-    const fake = await start(execReplies([{ ...json({ Running: true, ExitCode: null }), times: 2 }, json({ Running: false, ExitCode: 0 })]), {
+  it("waits for the daemon to record the exit within the budget; a stopped exec without an exit code is 125, a never-stopping one 124", async () => {
+    const fake = await start(execReplies([{ ...json({ Running: true, ExitCode: null }), times: 30 }, json({ Running: false, ExitCode: 0 })]), {
       [EXEC_ID]: { chunks: [frame(1, "x").toString("base64")] },
     });
     expect(transportFor(fake)("docker", ["exec", ID, "true"])).toEqual({ routed: true, result: { status: 0, stdout: "x", stderr: "" } });
-    await fake.setScript({ replies: { "GET /_ping": DOCKER_PING, ...execReplies(json({ Running: false, ExitCode: null })) }, execStarts: { [EXEC_ID]: { chunks: [] } } });
+    await fake.setScript({ replies: { "GET /_ping": DOCKER_PING, ...versionReply(), ...execReplies(json({ Running: false, ExitCode: null })) }, execStarts: { [EXEC_ID]: { chunks: [] } } });
     expect(transportFor(fake)("docker", ["exec", ID, "true"])).toMatchObject({ routed: true, result: { status: 125, stdout: "" } });
+    await fake.setScript({ replies: { "GET /_ping": DOCKER_PING, ...versionReply(), ...execReplies(json({ Running: true, ExitCode: null })) }, execStarts: { [EXEC_ID]: { chunks: [] } } });
+    const started = performance.now();
+    expect(transportFor(fake)("docker", ["exec", ID, "true"], { timeout: 300 })).toMatchObject({ routed: true, result: { status: 124, timedOut: true } });
+    expect(performance.now() - started).toBeLessThan(1_500);
   });
 
   it("a stream cut short whose exec the daemon no longer knows is 125, never a clean exit", async () => {
@@ -212,16 +227,16 @@ describe("docker API transport: exec", () => {
     expect(transportFor(fake)("docker", ["exec", ID, "true"]).routed).toBe(false);
   });
 
-  it("never re-runs a started exec: a refused start, a reset stream, a system-error frame, or an overrun is 125", async () => {
-    const cases: Array<[FakeEngineScript["execStarts"], string]> = [
-      [{ [EXEC_ID]: { status: 500, body: '{"message":"boom"}' } }, "Error response from daemon: boom\n"],
-      [{ [EXEC_ID]: { chunks: [frame(1, "abcdef").subarray(0, 10).toString("base64")] } }, "runfree: Docker Engine API call failed: truncated exec stream frame\n"],
-      [{ [EXEC_ID]: { chunks: [frame(3, "oci failure").toString("base64")] } }, "runfree: Docker Engine API call failed: error from daemon in stream: oci failure\n"],
-      [{ [EXEC_ID]: { chunks: [frame(1, "y".repeat(2048)).toString("base64")] } }, "runfree: Docker Engine API call failed: output exceeds maxBuffer\n"],
+  it("never re-runs a started exec: a refused start is the CLI's status 1; a cut stream, a system-error frame, or an overrun is 125", async () => {
+    const cases: Array<[FakeEngineScript["execStarts"], string, number]> = [
+      [{ [EXEC_ID]: { status: 500, body: '{"message":"boom"}' } }, "Error response from daemon: boom\n", 1],
+      [{ [EXEC_ID]: { chunks: [frame(1, "abcdef").subarray(0, 10).toString("base64")] } }, "runfree: Docker Engine API call failed: truncated exec stream frame\n", 125],
+      [{ [EXEC_ID]: { chunks: [frame(3, "oci failure").toString("base64")] } }, "runfree: Docker Engine API call failed: error from daemon in stream: oci failure\n", 125],
+      [{ [EXEC_ID]: { chunks: [frame(1, "y".repeat(2048)).toString("base64")] } }, "runfree: Docker Engine API call failed: output exceeds maxBuffer\n", 125],
     ];
-    for (const [execStarts, stderr] of cases) {
+    for (const [execStarts, stderr, status] of cases) {
       const fake = await start(execReplies(json({ Running: false, ExitCode: 0 })), execStarts);
-      expect(transportFor(fake)("docker", ["exec", ID, "true"], { maxBuffer: 1024, timeout: 5_000 })).toEqual({ routed: true, result: { status: 125, stdout: "", stderr } });
+      expect(transportFor(fake)("docker", ["exec", ID, "true"], { maxBuffer: 1024, timeout: 5_000 })).toEqual({ routed: true, result: { status, stdout: "", stderr } });
       expect((await apiRequests(fake)).filter((request) => request.url.endsWith("/exec")).length).toBe(1);
       await fake.close();
       engine = undefined;
@@ -272,7 +287,7 @@ describe("docker API transport: bounded waits and failures", () => {
 
   it("a worker crash returns 125 and later calls fall back to the CLI for the rest of the process", async () => {
     const fake = await start({ [`GET ${V}/containers/${ID}/json`]: json({ Id: ID }) });
-    const crashing = DOCKER_API_WORKER_SOURCE.replace('if (message.type === "request") start(message);', 'if (message.type === "request") { if (message.req.path !== "/_ping") throw new Error("crash"); start(message); }');
+    const crashing = DOCKER_API_WORKER_SOURCE.replace('if (message.type === "request") start(message);', 'if (message.type === "request") { if (message.req.path !== "/_ping" && !message.req.path.endsWith("/version")) throw new Error("crash"); start(message); }');
     expect(crashing).not.toBe(DOCKER_API_WORKER_SOURCE);
     const capture = transportFor(fake, { bridge: createSyncBridge({ workerSource: crashing }) });
     expect(capture("docker", ["container", "inspect", ID], { timeout: 5_000 })).toMatchObject({ routed: true, result: { status: 125 } });
@@ -286,7 +301,8 @@ describe("docker API transport: what stays on the CLI", () => {
     ["an unknown transport mode", { controlEnv: { RUNFREE_DOCKER_TRANSPORT: "fast" } }, {}],
     ["fake-docker test mode in the process env", { controlEnv: { RUNFREE_TEST_FAKE_DOCKER: "1" } }, {}],
     ["fake-docker test mode in the call env", {}, { env: { RUNFREE_TEST_FAKE_DOCKER: "1" } }],
-    ["a docker on PATH that is not a native binary", { dockerCliProbe: () => false }, {}],
+    ["a docker on PATH that is not a native binary", { dockerCliProbe: () => undefined }, {}],
+    ["an endpoint that is not a socket", { socketIdentity: () => undefined }, {}],
     ["a non-unix endpoint", { resolveEndpoint: () => ({ kind: "cli" as const, reason: "tcp" }) }, {}],
     ["an unexpected spawn option", {}, { cwd: "/" }],
     ["a non-utf8 encoding", {}, { encoding: "buffer" as const }],
@@ -318,15 +334,97 @@ describe("docker API transport: what stays on the CLI", () => {
     ["a malformed API version", { ...DOCKER_PING, headers: { "Api-Version": "2", Server: "Docker/99 (linux)" } }],
     ["a failed ping", { status: 500, body: "" }],
   ])("%s stays on the CLI and is pinged only once per process", async (_label, pingReply) => {
-    engine = await startFakeEngine({ replies: { "GET /_ping": pingReply, [`GET ${V}/containers/${ID}/json`]: json({ Id: ID }) } });
-    const capture = transportFor(engine);
+    engine = await startFakeEngine({ replies: { "GET /_ping": pingReply, ...versionReply(), [`GET ${V}/containers/${ID}/json`]: json({ Id: ID }) } });
+    let cliRuns = 0;
+    const capture = transportFor(engine, { runCli: () => {
+      cliRuns += 1;
+      return { status: 0, stdout: cliVersionJson() };
+    } });
     expect(capture("docker", ["container", "inspect", ID]).routed).toBe(false);
     expect(capture("docker", ["container", "inspect", ID]).routed).toBe(false);
     expect((await engine.requests()).map((request) => request.url)).toEqual(["/_ping"]);
+    expect(cliRuns).toBe(0);
   });
 
-  it("uses the daemon's API version in every path", async () => {
-    engine = await startFakeEngine({ replies: { "GET /_ping": { ...DOCKER_PING, headers: { ...DOCKER_PING.headers, "Api-Version": "1.43" } }, "GET /v1.43/volumes/v1": json({ Name: "v1" }) } });
-    expect(transportFor(engine)("docker", ["volume", "inspect", "v1"]).routed).toBe(true);
+  it("speaks the API version the CLI negotiated, not the daemon's newest", async () => {
+    engine = await startFakeEngine({ replies: { "GET /_ping": DOCKER_PING, ...versionReply("1.43"), "GET /v1.43/volumes/v1": json({ Name: "v1" }) } });
+    const capture = transportFor(engine, { runCli: () => ({ status: 0, stdout: cliVersionJson({ clientApiVersion: "1.43" }) }) });
+    expect(capture("docker", ["volume", "inspect", "v1"]).routed).toBe(true);
+    expect((await engine.requests()).map((request) => request.url)).toEqual(["/_ping", "/v1.43/version", "/v1.43/volumes/v1"]);
+  });
+
+});
+
+describe("docker API transport: binding to the CLI's daemon", () => {
+  it.each([
+    ["the CLI resolved another context", cliVersionJson({ context: "orbstack" })],
+    ["the CLI's server has another kernel", cliVersionJson({ server: { ...DAEMON_VERSION, KernelVersion: "6.1.0" } })],
+    ["the CLI's server has another commit", cliVersionJson({ server: { ...DAEMON_VERSION, GitCommit: "abc1234" } })],
+    ["the CLI reports no server", JSON.stringify({ Client: { ApiVersion: "1.47", Context: "default" } })],
+    ["the CLI negotiated above the daemon", cliVersionJson({ clientApiVersion: "1.48" })],
+    ["the CLI negotiated below 1.41", cliVersionJson({ clientApiVersion: "1.40" })],
+    ["the CLI printed something else", "Client: Docker Engine\n"],
+  ])("%s: every call stays on the CLI and the binding runs once", async (_label, stdout) => {
+    const fake = await start({ [`GET ${V}/containers/${ID}/json`]: json({ Id: ID }) });
+    let cliRuns = 0;
+    const capture = transportFor(fake, { runCli: () => {
+      cliRuns += 1;
+      return { status: 0, stdout };
+    } });
+    expect(capture("docker", ["container", "inspect", ID]).routed).toBe(false);
+    expect(capture("docker", ["container", "inspect", ID]).routed).toBe(false);
+    expect(cliRuns).toBe(1);
+    expect(await apiRequests(fake)).toEqual([]);
+  });
+
+  it("a failed docker version keeps the process on the CLI", async () => {
+    const fake = await start({ [`GET ${V}/containers/${ID}/json`]: json({ Id: ID }) });
+    expect(transportFor(fake, { runCli: () => ({ status: 1, stdout: "" }) })("docker", ["container", "inspect", ID]).routed).toBe(false);
+  });
+
+  it("passes the call's environment to docker version", async () => {
+    const fake = await start({ [`GET ${V}/containers/${ID}/json`]: json({ Id: ID }) });
+    const seen: NodeJS.ProcessEnv[] = [];
+    const capture = transportFor(fake, { runCli: (_args, env) => {
+      seen.push(env);
+      return { status: 0, stdout: cliVersionJson() };
+    } });
+    capture("docker", ["container", "inspect", ID], { env: { PATH: "/x", DOCKER_CONTEXT: "desktop" } });
+    expect(seen).toEqual([{ PATH: "/x", DOCKER_CONTEXT: "desktop" }]);
+  });
+
+  it("binds again when the socket file or the CLI binary changes", async () => {
+    const fake = await start({ [`GET ${V}/containers/${ID}/json`]: json({ Id: ID }) });
+    let socket = "socket-1";
+    let cliBinary = "cli-1";
+    let cliRuns = 0;
+    const capture = transportFor(fake, {
+      socketIdentity: () => socket,
+      dockerCliProbe: () => cliBinary,
+      runCli: () => {
+        cliRuns += 1;
+        return { status: 0, stdout: cliVersionJson() };
+      },
+    });
+    const inspect = () => capture("docker", ["container", "inspect", "--format", "{{.Id}}", ID]).routed;
+    expect(inspect()).toBe(true);
+    expect(inspect()).toBe(true);
+    expect(cliRuns).toBe(1);
+    socket = "socket-2";
+    expect(inspect()).toBe(true);
+    cliBinary = "cli-2";
+    expect(inspect()).toBe(true);
+    expect(cliRuns).toBe(3);
+  });
+
+  it("answers type-less inspect only while swarm is inactive", async () => {
+    engine = await startFakeEngine({ replies: {
+      "GET /_ping": { ...DOCKER_PING, headers: { ...DOCKER_PING.headers, Swarm: "active/manager" } },
+      ...versionReply(),
+      [`GET ${V}/containers/${ID}/json`]: json({ Id: ID }),
+    } });
+    const capture = transportFor(engine);
+    expect(capture("docker", ["inspect", ID]).routed).toBe(false);
+    expect(capture("docker", ["container", "inspect", ID]).routed).toBe(true);
   });
 });

@@ -203,6 +203,33 @@ export const DOCKER_PING: FakeReply = {
   body: "OK",
 };
 
+/** The daemon's `/version` body, as the fake engine serves it. */
+export const DAEMON_VERSION = {
+  Platform: { Name: "Docker Engine - Community" },
+  Version: "27.3.1",
+  ApiVersion: "1.47",
+  MinAPIVersion: "1.24",
+  GitCommit: "41ca978",
+  GoVersion: "go1.22.7",
+  Os: "linux",
+  Arch: "arm64",
+  KernelVersion: "6.10.14-linuxkit",
+  BuildTime: "2024-09-20T11:41:19.000000000+00:00",
+};
+
+/** The fake engine's `/version` reply at an API version. */
+export function versionReply(apiVersion = "1.47"): Record<string, FakeReply> {
+  return { [`GET /v${apiVersion}/version`]: { status: 200, headers: { "Content-Type": "application/json" }, body: `${JSON.stringify(DAEMON_VERSION)}\n` } };
+}
+
+/** `docker version --format '{{json .}}'` as a CLI bound to the fake engine prints it. */
+export function cliVersionJson(options: { clientApiVersion?: string; context?: string; server?: Record<string, unknown> } = {}): string {
+  return JSON.stringify({
+    Client: { Version: "27.3.1", ApiVersion: options.clientApiVersion ?? "1.47", DefaultAPIVersion: "1.47", Os: "darwin", Arch: "arm64", Context: options.context ?? "default" },
+    Server: options.server ?? DAEMON_VERSION,
+  });
+}
+
 /** One multiplexed exec stream frame. */
 export function frame(type: number, payload: string | Buffer): Buffer {
   const bytes = typeof payload === "string" ? Buffer.from(payload) : payload;
