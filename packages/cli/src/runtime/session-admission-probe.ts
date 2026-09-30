@@ -162,14 +162,32 @@ export class SessionTeardownIncompleteError extends AggregateError {
     super(
       distinctFailures(failures),
       "the session ended but its teardown did not complete; any lifecycle record it left keeps the session's"
-        + ` address reserved, and the next \`${remedy.up()}\` or launch finishes the teardown once Docker is reachable`,
+        + ` address reserved; once Docker is reachable, the next \`${remedy.up()}\` or launch normally finishes the`
+        + " teardown, and otherwise names the remedy",
     );
     this.name = "SessionTeardownIncompleteError";
   }
 }
 
-function failureIdentity(failure: unknown): string {
-  return failure instanceof Error ? `${failure.name}: ${failure.message}` : String(failure);
+/**
+ * What makes two failures the same failure: name, message, typed observation
+ * evidence, and cause, recursively. Anything less would let a repeat hide a
+ * different cause behind the same sentence.
+ */
+function failureIdentity(failure: unknown, depth = 0): string {
+  if (!(failure instanceof Error)) return String(failure);
+  const evidence = (failure as { evidence?: unknown }).evidence;
+  let evidenceText = "";
+  try {
+    evidenceText = evidence === undefined ? "" : JSON.stringify(evidence);
+  } catch {
+    evidenceText = "<unserializable evidence>";
+  }
+  const cause = depth < 4 && failure.cause !== undefined ? failureIdentity(failure.cause, depth + 1) : "";
+  const nested = failure instanceof AggregateError && Array.isArray(failure.errors) && depth < 4
+    ? failure.errors.map((error: unknown) => failureIdentity(error, depth + 1)).join("|")
+    : "";
+  return JSON.stringify([failure.name, failure.message, evidenceText, cause, nested]);
 }
 
 function distinctFailures(failures: readonly unknown[]): unknown[] {

@@ -230,6 +230,22 @@ describe("post-completion teardown failures", () => {
       .toEqual(["Error: teardown attempt 1 failed", "Error: teardown attempt 2 failed"]);
   });
 
+  test("the same sentence over a different cause is not collapsed", async () => {
+    const { steps } = recorder();
+    let attempt = 0;
+    const failing = {
+      ...steps,
+      tearDown: async () => {
+        attempt += 1;
+        throw new Error("teardown failed", { cause: new Error(`cause ${attempt}`) });
+      },
+    } satisfies SessionAdmissionLaunchSteps;
+
+    const failure = await runInternalSessionAdmissionLaunch(failing).catch((error: unknown) => error);
+
+    expect((failure as SessionTeardownIncompleteError).errors).toHaveLength(2);
+  });
+
   test("a retry that completes still reports the first failure", async () => {
     const { steps } = recorder();
     let attempt = 0;
