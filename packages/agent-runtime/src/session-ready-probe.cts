@@ -35,7 +35,8 @@
 // budget for its answer.
 //
 // Exit codes (for logs; the entry treats every non-zero code the same). A
-// run's code is its last attempt's:
+// run's code is its last attempt's, except that an attempt cut short by the
+// run's budget keeps the previous attempt's code:
 //   0  active
 //   3  refused (403)
 //   4  connect failure or timeout
@@ -152,13 +153,16 @@ export async function probeUntilActive(options: Readonly<{
   for (let index = 0; ; index += 1) {
     const remaining = deadline - nowMs();
     if (remaining <= 0) return code;
-    code = await attempt({
+    const result = await attempt({
       host: options.host,
       port: options.port,
       connect,
       connectTimeoutMs: Math.min(ATTEMPT_CONNECT_TIMEOUTS_MS[index] ?? remaining, remaining),
       totalTimeoutMs: remaining,
     });
+    // An attempt the run's own budget cut short says nothing about the proxy,
+    // so it never replaces an earlier attempt's answer.
+    if (!(result === EXIT_UNREACHABLE && index > 0 && deadline - nowMs() <= 0)) code = result;
     if (code === EXIT_ACTIVE || deadline - nowMs() <= RETRY_PAUSE_MS) return code;
     await new Promise((resolve) => setTimeout(resolve, RETRY_PAUSE_MS));
   }

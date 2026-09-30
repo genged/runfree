@@ -367,6 +367,37 @@ describe("session readiness probe against the real request proxy", () => {
     expect(calls).toBeGreaterThan(probeModule.ATTEMPT_CONNECT_TIMEOUTS_MS.length);
   });
 
+  test("an attempt cut short by the run's budget does not replace the last answer", async () => {
+    // A loaded host can leave the run's final attempt waiting when the budget
+    // runs out; the run still reports what the proxy last said.
+    const answered = await fakeProxy(["HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"]);
+    const stalled = new Set<net.Socket>();
+    const stallServer = net.createServer((socket) => {
+      stalled.add(socket);
+      socket.on("data", () => {});
+      socket.on("error", () => {});
+    });
+    await new Promise<void>((resolve) => stallServer.listen(0, "127.0.0.1", resolve));
+    const stallAddress = stallServer.address();
+    if (stallAddress === null || typeof stallAddress === "string") throw new Error("stall server did not bind");
+    let calls = 0;
+    try {
+      const code = await probeModule.probeUntilActive({
+        host: "127.0.0.1",
+        port: answered.port,
+        connect: (options) => {
+          calls += 1;
+          return net.connect(calls === 1 ? options : { ...options, port: stallAddress.port });
+        },
+      });
+      expect(code).toBe(probeModule.EXIT_UNEXPECTED);
+      expect(calls).toBe(2);
+    } finally {
+      for (const socket of stalled) socket.destroy();
+      await new Promise<void>((resolve) => stallServer.close(() => resolve()));
+    }
+  });
+
   test("a refusal that never clears ends the run refused, every connection sending only the readiness bytes", async () => {
     const proxy = await fakeProxy([REFUSED_RESPONSE]);
     const result = await runProbe({ PROXY_IP: "127.0.0.1", RUNFREE_SESSION_READY_PROBE_PORT: String(proxy.port) });
