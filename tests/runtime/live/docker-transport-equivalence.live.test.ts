@@ -13,7 +13,9 @@
 //
 // The objects are the provisioned runtime's own: the proxy container, its
 // image, the project's networks and volumes, and exec into the proxy as
-// root with and without stdin.
+// root with and without stdin. One case runs the product CLI (the prebuilt
+// bundle the fixture uses) with RUNFREE_TIMINGS=1 and reads its
+// docker-transport count, so a silent fallback in the shipped path shows.
 
 import childProcess from "node:child_process";
 import path from "node:path";
@@ -23,6 +25,7 @@ import { afterAll, beforeAll, describe, expect, test } from "vitest";
 
 import { createDockerApiCapture, type DockerApiCapture } from "../../../packages/cli/src/runtime/docker-api/transport.ts";
 import { composeProjectName, composeServiceContainerId, dockerOrThrow } from "./docker.ts";
+import { cliEntryArgv } from "../../support/prebuilt-entry.ts";
 import { describeOutput, destroyLiveFixture, type LiveFixture, type LiveRuntimeBackend, provisionSandboxFixture } from "./fixture.ts";
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
@@ -139,6 +142,27 @@ describe("docker Engine API transport matches the Docker CLI on real Docker", ()
       const outcome = transport("docker", args, { env: process.env, timeout: CALL_TIMEOUT_MS });
       expect(outcome.routed, `docker ${args.join(" ")}`).toBe(false);
     }
+  }, TEST_TIMEOUT_MS);
+
+  test("the product CLI routes calls through the transport on a warm up, and none with the kill switch", () => {
+    const warmUp = (extra: NodeJS.ProcessEnv) => childProcess.spawnSync(process.execPath, [...cliEntryArgv(), "--workspace", fixture.projectRoot, "up"], {
+      cwd: REPO_ROOT,
+      encoding: "utf8",
+      env: { ...fixture.env, RUNFREE_INVOCATION_CWD: REPO_ROOT, RUNFREE_PROJECT_ROOT: REPO_ROOT, RUNFREE_TIMINGS: "1", ...extra },
+      maxBuffer: MAX_BUFFER,
+      timeout: TEST_TIMEOUT_MS,
+    });
+    const counts = (stderr: string) => {
+      const match = /timing: docker-transport routed=(\d+) cli=(\d+)/u.exec(stderr);
+      if (!match) throw new Error(`no docker-transport timing line: ${describeOutput(stderr)}`);
+      return { routed: Number(match[1]), cli: Number(match[2]) };
+    };
+    const on = warmUp({});
+    expect(on.status, describeOutput(`${on.stdout}${on.stderr}`)).toBe(0);
+    expect(counts(on.stderr).routed).toBeGreaterThan(0);
+    const off = warmUp({ RUNFREE_DOCKER_TRANSPORT: "cli" });
+    expect(off.status, describeOutput(`${off.stdout}${off.stderr}`)).toBe(0);
+    expect(counts(off.stderr).routed).toBe(0);
   }, TEST_TIMEOUT_MS);
 
   test("the kill switch keeps every call on the CLI", () => {

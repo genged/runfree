@@ -132,6 +132,9 @@ export function createDockerApiCapture(deps: DockerApiCaptureDeps = {}): DockerA
   const identifySocket = deps.socketIdentity ?? socketIdentity;
   const now = deps.now ?? (() => performance.now());
   const bindings = new Map<string, Extract<BindingOutcome, { kind: "bound" | "cli" }>>();
+  // The binding the current call runs under; calls are synchronous, so there
+  // is at most one.
+  let active: { key: string; binding: DaemonBinding } | undefined;
 
   const exchange = (req: Omit<BridgeRequest, "headers"> & { headers?: Record<string, string> }, deadline: number): BridgeReply => {
     const headers: Record<string, string> = { "User-Agent": "runfree-docker-transport", ...(req.headers ?? {}) };
@@ -139,7 +142,18 @@ export function createDockerApiCapture(deps: DockerApiCaptureDeps = {}): DockerA
       headers["Content-Type"] = "application/json";
       headers["Content-Length"] = String(req.body.byteLength);
     }
-    return bridge.request({ ...req, headers }, deadline);
+    const reply = bridge.request({ ...req, headers }, deadline);
+    // Every Docker reply names its engine (`Server`, `Api-Version`). A reply
+    // from another engine than the one bound — a backend restarted or swapped
+    // behind the same socket file — drops the binding and is treated like a
+    // refused connection: a read or an unstarted exec goes to the CLI, and a
+    // started exec fails closed.
+    if (active && reply.kind === "response" && !sameEngine(reply.headers, active.binding)) {
+      bindings.delete(active.key);
+      active = undefined;
+      return { kind: "error", code: "EDAEMONCHANGED", phase: "connect" };
+    }
+    return reply;
   };
 
   const runInspect = (
@@ -342,10 +356,12 @@ export function createDockerApiCapture(deps: DockerApiCaptureDeps = {}): DockerA
       return { routed: false, timeout: remaining() };
     }
     const binding: DaemonBinding = bound.binding;
+    active = { key: bindingKey, binding };
     if (route.kind === "inspect" && route.typeless && !binding.swarmInactive) return { routed: false, timeout: remaining() };
 
     let run: RouteRun;
-    switch (route.kind) {
+    try {
+      switch (route.kind) {
       case "inspect":
         run = runInspect(route, endpoint.socketPath, binding.apiVersion, maxBuffer, deadline);
         break;
@@ -355,6 +371,9 @@ export function createDockerApiCapture(deps: DockerApiCaptureDeps = {}): DockerA
       case "exec":
         run = runExec(route, endpoint.socketPath, binding.apiVersion, maxBuffer, input, deadline);
         break;
+      }
+    } finally {
+      active = undefined;
     }
     if (run instanceof StayOnCli) {
       if (options.timeout !== undefined && deadline - now() <= 0) return { routed: true, result: TIMED_OUT };
@@ -362,6 +381,12 @@ export function createDockerApiCapture(deps: DockerApiCaptureDeps = {}): DockerA
     }
     return { routed: true, result: run };
   };
+}
+
+function sameEngine(headers: Record<string, string>, binding: DaemonBinding): boolean {
+  const server = headers.server;
+  const apiVersion = headers["api-version"];
+  return (server === undefined || server === binding.server) && (apiVersion === undefined || apiVersion === binding.daemonApiVersion);
 }
 
 /**

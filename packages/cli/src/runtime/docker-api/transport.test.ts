@@ -361,6 +361,7 @@ describe("docker API transport: binding to the CLI's daemon", () => {
     ["the CLI's server has another kernel", cliVersionJson({ server: { ...DAEMON_VERSION, KernelVersion: "6.1.0" } })],
     ["the CLI's server has another commit", cliVersionJson({ server: { ...DAEMON_VERSION, GitCommit: "abc1234" } })],
     ["the CLI reports no server", JSON.stringify({ Client: { ApiVersion: "1.47", Context: "default" } })],
+    ["the CLI reports no context", JSON.stringify({ Client: { ApiVersion: "1.47" }, Server: DAEMON_VERSION })],
     ["the CLI negotiated above the daemon", cliVersionJson({ clientApiVersion: "1.48" })],
     ["the CLI negotiated below 1.41", cliVersionJson({ clientApiVersion: "1.40" })],
     ["the CLI printed something else", "Client: Docker Engine\n"],
@@ -415,6 +416,43 @@ describe("docker API transport: binding to the CLI's daemon", () => {
     cliBinary = "cli-2";
     expect(inspect()).toBe(true);
     expect(cliRuns).toBe(3);
+  });
+
+  it("a reply from another engine behind the same socket drops the binding: a read goes to the CLI, then binds again", async () => {
+    const swapped = { status: 200, headers: { "Content-Type": "application/json", Server: "Docker/28.0.0 (linux)", "Api-Version": "1.48" }, body: JSON.stringify({ Id: ID }) };
+    const fake = await start({ [`GET ${V}/containers/${ID}/json`]: [{ ...json({ Id: ID }), headers: { Server: DOCKER_PING.headers?.Server ?? "", "Api-Version": "1.47" }, times: 1 }, swapped] });
+    let cliRuns = 0;
+    const capture = transportFor(fake, { runCli: () => {
+      cliRuns += 1;
+      return { status: 0, stdout: cliVersionJson() };
+    } });
+    const inspect = () => capture("docker", ["container", "inspect", "--format", "{{.Id}}", ID], { timeout: 5_000 });
+    expect(inspect()).toMatchObject({ routed: true, result: { status: 0 } });
+    expect(inspect()).toMatchObject({ routed: false });
+    expect(cliRuns).toBe(1);
+    inspect();
+    expect(cliRuns).toBe(2);
+  });
+
+  it("an exec whose create reply names another engine goes to the CLI unstarted", async () => {
+    const fake = await start(
+      { [`POST ${V}/containers/${ID}/exec`]: { status: 201, headers: { Server: "Docker/28.0.0 (linux)" }, body: JSON.stringify({ Id: EXEC_ID }) } },
+      { [EXEC_ID]: { chunks: [] } },
+    );
+    expect(transportFor(fake)("docker", ["exec", ID, "true"]).routed).toBe(false);
+    expect((await apiRequests(fake)).map((request) => request.url)).toEqual([`${V}/containers/${ID}/exec`]);
+  });
+
+  it("an exec whose exit-code reply names another engine after it ran fails closed with 125", async () => {
+    const fake = await start(
+      {
+        [`POST ${V}/containers/${ID}/exec`]: { status: 201, body: JSON.stringify({ Id: EXEC_ID }) },
+        [`GET ${V}/exec/${EXEC_ID}/json`]: { status: 200, headers: { Server: "Docker/28.0.0 (linux)" }, body: JSON.stringify({ Running: false, ExitCode: 0 }) },
+      },
+      { [EXEC_ID]: { chunks: [frame(1, "ran").toString("base64")] } },
+    );
+    expect(transportFor(fake)("docker", ["exec", ID, "true"])).toMatchObject({ routed: true, result: { status: 125, stdout: "" } });
+    expect((await apiRequests(fake)).filter((request) => request.url.endsWith("/exec")).length).toBe(1);
   });
 
   it("answers type-less inspect only while swarm is inactive", async () => {

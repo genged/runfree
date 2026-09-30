@@ -13,7 +13,7 @@ import type { BridgeReply } from "./sync-bridge.ts";
  * binding asks the CLI itself — one `docker version --format '{{json .}}'`
  * with the call's environment — and requires:
  *
- * - the CLI's resolved context equals the endpoint's context;
+ * - the CLI reports its resolved context, and it equals the endpoint's;
  * - the daemon's `/_ping` says Docker (no libpod header) and its `/version`
  *   over the socket reports the same server version, API range, commit,
  *   OS/arch, kernel, and build time the CLI reported;
@@ -23,9 +23,17 @@ import type { BridgeReply } from "./sync-bridge.ts";
  *
  * Any mismatch or unreadable answer binds to `cli` for the rest of the
  * process. The key includes the socket's real path, device, and inode, so a
- * re-pointed or re-created socket is bound again.
+ * re-pointed or re-created socket is bound again, and the transport drops a
+ * binding as soon as a reply names another engine (`Server`, `Api-Version`).
  */
-export type DaemonBinding = { apiVersion: string; swarmInactive: boolean };
+export type DaemonBinding = {
+  /** The API version the CLI negotiated; every routed path uses it. */
+  apiVersion: string;
+  swarmInactive: boolean;
+  /** The bound engine's `Server` and `Api-Version` reply headers. */
+  server: string;
+  daemonApiVersion: string;
+};
 
 export type BindingOutcome =
   | { kind: "bound"; binding: DaemonBinding }
@@ -105,7 +113,7 @@ export function bindDaemon(input: {
   const client = reported && isRecord(reported.Client) ? reported.Client : undefined;
   const cliServer = reported && isRecord(reported.Server) ? reported.Server : undefined;
   if (!client || !cliServer) return cli("docker version did not report a client and a server");
-  if (client.Context !== undefined && client.Context !== input.context) return cli("the Docker CLI resolved another context");
+  if (typeof client.Context !== "string" || client.Context !== input.context) return cli("the Docker CLI resolved another context");
   const clientMinor = minor(client.ApiVersion);
   if (clientMinor === undefined || clientMinor < MIN_API_MINOR || clientMinor > daemonMinor) return cli("the Docker CLI API version is unsupported");
   const apiVersion = client.ApiVersion as string;
@@ -122,5 +130,8 @@ export function bindDaemon(input: {
     if (cliServer[field] !== daemon[field]) return cli(`the socket's daemon differs from the CLI's (${field})`);
   }
   if (daemon.ApiVersion !== ping.headers["api-version"]) return cli("the daemon API version changed during binding");
-  return { kind: "bound", binding: { apiVersion, swarmInactive: ping.headers.swarm === "inactive" } };
+  return {
+    kind: "bound",
+    binding: { apiVersion, swarmInactive: ping.headers.swarm === "inactive", server, daemonApiVersion: ping.headers["api-version"] as string },
+  };
 }
