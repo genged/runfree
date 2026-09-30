@@ -99,7 +99,35 @@ export function isSafeDirectory(directory: string, ownerUid: number): boolean {
 // pre-open lstat so a file swapped for a different one in that window is
 // caught too. Unlike that function, failures are returned as data (this
 // scanner never throws) so callers can report a per-file drop reason.
+//
+//
+// The host's own atomic replace (write a temp file, rename it over the name)
+// looks, from a concurrent reader, like two of those refusals: a different
+// file between the lstat and the open, and a link count that is not 1 while
+// the replaced inode is being unlinked (observed on tmpfs and overlayfs).
+// Since the consumers rescan on the rename's inotify events (launch plan Task
+// 7), a scan lands inside that window on every publication, where the 100 ms
+// loop rarely did. So those two outcomes alone re-read, a bounded number of
+// times, from a fresh lstat. Every accepted read still has a link count of 1
+// on both stats and its lstat and fstat agree; a file that stays hard-linked
+// or keeps changing under every re-read stays unsafe.
+const OWNED_FILE_UNSETTLED_READS = 3;
+
+type OwnedFileAttempt = OwnedFileRead | { kind: "unsettled"; reason: UnsafeReason };
+
 export function readOwnedRegularFile(filePath: string, ownerUid: number, maxBytes: number): OwnedFileRead {
+  for (let attempt = 1; ; attempt += 1) {
+    const read = readOwnedRegularFileOnce(filePath, ownerUid, maxBytes);
+    if (read.kind !== "unsettled") return read;
+    if (attempt >= OWNED_FILE_UNSETTLED_READS) return { kind: "unsafe", reason: read.reason };
+  }
+}
+
+function unsafeOrUnsettled(reason: UnsafeReason): OwnedFileAttempt {
+  return reason === "multi-link" ? { kind: "unsettled", reason } : { kind: "unsafe", reason };
+}
+
+function readOwnedRegularFileOnce(filePath: string, ownerUid: number, maxBytes: number): OwnedFileAttempt {
   let before: fs.Stats;
   try {
     before = fs.lstatSync(filePath);
@@ -108,7 +136,7 @@ export function readOwnedRegularFile(filePath: string, ownerUid: number, maxByte
     return { kind: "unsafe", reason: "not-regular" };
   }
   const beforeReason = classifyUnsafeStat(before, ownerUid, maxBytes);
-  if (beforeReason) return { kind: "unsafe", reason: beforeReason };
+  if (beforeReason) return unsafeOrUnsettled(beforeReason);
 
   let descriptor: number;
   try {
@@ -122,9 +150,9 @@ export function readOwnedRegularFile(filePath: string, ownerUid: number, maxByte
   try {
     const opened = fs.fstatSync(descriptor);
     const openedReason = classifyUnsafeStat(opened, ownerUid, maxBytes);
-    if (openedReason) return { kind: "unsafe", reason: openedReason };
+    if (openedReason) return unsafeOrUnsettled(openedReason);
     if (opened.dev !== before.dev || opened.ino !== before.ino || opened.size !== before.size) {
-      return { kind: "unsafe", reason: "not-regular" };
+      return { kind: "unsettled", reason: "not-regular" };
     }
     return { kind: "ok", content: fs.readFileSync(descriptor, "utf8") };
   } finally {
