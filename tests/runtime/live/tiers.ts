@@ -34,6 +34,7 @@ export const CORE_LIVE_FILES = [
 /** Files that hold cases of both tiers, split per case with `liveTierTest`. */
 export const MIXED_LIVE_FILES = [
   "tests/runtime/live/session-admission-attached.live.test.ts",
+  "tests/runtime/live/ingress-forwarder.live.test.ts",
 ] as const;
 
 /**
