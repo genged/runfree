@@ -39,3 +39,18 @@ test("a throwing call is still recorded and the error propagates", () => {
   expect(() => io.capture("docker", ["inspect", "x"])).toThrow("budget ended");
   expect(histogram.lines()[0]).toMatch(/^docker inspect count=1 /);
 });
+
+test("snapshot exposes per-category counts and totals without argv", () => {
+  const histogram = createOperationHistogram();
+  histogram.record("docker exec", 2.5);
+  histogram.record("docker exec", 1.5);
+  histogram.record("docker ps", 1);
+  const snapshot = histogram.snapshot();
+  expect(snapshot).toEqual({
+    "docker exec": { count: 2, totalMs: 4 },
+    "docker ps": { count: 1, totalMs: 1 },
+  });
+  // A snapshot is a copy: later records do not change it.
+  histogram.record("docker ps", 1);
+  expect(snapshot["docker ps"]).toEqual({ count: 1, totalMs: 1 });
+});

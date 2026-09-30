@@ -2538,6 +2538,44 @@ describe("session admission under the per-session file source", () => {
     }
   });
 
+  test("with timings on, reports admission-ops categories that sum to the docker operations before the agent", async () => {
+    const input = fixture();
+    (input.context.env as Record<string, string>).RUNFREE_TIMINGS = "1";
+    mocks.containerInspect = { status: 0, stdout: runningInspect(), stderr: "" };
+    const output = captureOutput();
+    const driver = createInternalSessionAdmissionDriver({
+      ...input,
+      nowEpochMs: () => Date.parse("2026-08-09T00:10:00.000Z"),
+    });
+
+    try {
+      await expect(driver.launchBuiltin("codex")).resolves.toEqual({ status: 0, signal: null });
+      // Rendered lines carry the severity prefix; the timing payload follows it.
+      const lines = output.drain().map((line) => line.slice(Math.max(0, line.indexOf("timing: "))));
+      const opsLines = lines.filter((line) => line.startsWith("timing: admission-ops "));
+      expect(opsLines.length).toBeGreaterThan(0);
+      const categorized = opsLines.reduce((sum, line) => {
+        const match = / count=(\d+) total=\d+\.\dms$/.exec(line);
+        expect(match).not.toBeNull();
+        return sum + Number(match?.[1]);
+      }, 0);
+      const before = lines.find((line) => line.startsWith("timing: session-admission docker-operations-before-agent="));
+      expect(before).toBeDefined();
+      expect(Number(/=(\d+)$/.exec(before ?? "")?.[1])).toBe(categorized);
+      // The ops summary is printed before the whole-launch total, and names
+      // verbs only: no container id, proxy id, or script text.
+      const total = lines.findIndex((line) => line.startsWith("timing: session-admission docker-operations="));
+      expect(total).toBeGreaterThan(lines.indexOf(before ?? ""));
+      for (const line of opsLines) {
+        expect(line).not.toContain(CONTAINER_ID);
+        expect(line).not.toContain("node");
+        expect(line).toMatch(/^timing: admission-ops docker [a-z -]+ count=/);
+      }
+    } finally {
+      output.restore();
+    }
+  });
+
   test("takes back a file it wrote but could not finish granting", async () => {
     const input = fixture();
     mocks.containerInspect = { status: 0, stdout: runningInspect(), stderr: "" };

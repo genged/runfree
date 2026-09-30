@@ -70,6 +70,7 @@ import {
   type SessionAdmissionSessionKind,
 } from "./session-admission-probe.ts";
 import { createRuntimeTimings, type RuntimeTimings } from "./timings.ts";
+import { createOperationHistogram, type OperationHistogram } from "./operation-histogram.ts";
 import {
   authorizeSessionContainerOrphanCleanup,
   authorizeUnboundCreatedSessionRecordRecovery,
@@ -2159,8 +2160,18 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
 function timedSessionAdmissionLaunchSteps(
   steps: SessionAdmissionLaunchSteps,
   timings: RuntimeTimings,
+  histogram: OperationHistogram,
 ): SessionAdmissionLaunchSteps {
   const timed = (phase: string, fn: () => Promise<void>) => (): Promise<void> => timings.timeAsync(phase, fn);
+  // Activation is the last step before the session entry execs the agent, so
+  // the histogram at that point is exactly the admission's Docker work before
+  // agent start (plan Phase 0). The categories are verbs only and always sum
+  // to the gateway count printed beside them.
+  const activate = async (): Promise<void> => {
+    await timings.timeAsync("admission:activate", steps.activate);
+    for (const line of histogram.lines()) timings.report("admission-ops", line);
+    timings.report("session-admission", `docker-operations-before-agent=${steps.dockerOperationCount()}`);
+  };
   return Object.freeze({
     agent: steps.agent,
     nowMs: steps.nowMs,
@@ -2169,7 +2180,7 @@ function timedSessionAdmissionLaunchSteps(
     allocate: timed("admission:allocate", steps.allocate),
     createStarted: timed("admission:create-started", steps.createStarted),
     proveRunning: timed("admission:prove-running", steps.proveRunning),
-    activate: timed("admission:activate", steps.activate),
+    activate,
     cleanupUnadmitted: timed("admission:cleanup-unadmitted", steps.cleanupUnadmitted),
     awaitCompletion: steps.awaitCompletion,
     tearDown: timed("teardown:session-file", steps.tearDown),
@@ -2216,11 +2227,13 @@ export function createInternalSessionAdmissionDriver(
   const stepsFor = (
     agent: SessionAdmissionSessionKind,
     launch?: SessionAdmissionLaunchOptions,
+    histogram?: OperationHistogram,
   ): InternalBuiltinAdmissionProbeSteps => {
     resolvedInput.lifecycleLock.assertHeld();
     const gateway = createSessionAdmissionDockerGateway({
       io: resolvedInput.io,
       ...(resolvedInput.foregroundSpawner ? { foregroundSpawner: resolvedInput.foregroundSpawner } : {}),
+      ...(histogram ? { histogram } : {}),
     });
     return new InternalBuiltinAdmissionProbeSteps(resolvedInput, gateway, agent, launch);
   };
@@ -2233,10 +2246,11 @@ export function createInternalSessionAdmissionDriver(
     // operation count, surfaced per launch. Measurement only — the facade
     // delegates every step to the same object and never reorders or retries.
     const timings = createRuntimeTimings(resolvedInput.context.env);
+    const histogram = timings.enabled ? createOperationHistogram() : undefined;
     let steps: InternalBuiltinAdmissionProbeSteps | undefined;
     try {
-      steps = stepsFor(kind, options);
-      const launchSteps = timings.enabled ? timedSessionAdmissionLaunchSteps(steps, timings) : steps;
+      steps = stepsFor(kind, options, histogram);
+      const launchSteps = histogram ? timedSessionAdmissionLaunchSteps(steps, timings, histogram) : steps;
       try {
         const outcome = await runInternalSessionAdmissionLaunch(launchSteps);
         steps.finalizeSessionEvidence(outcome);

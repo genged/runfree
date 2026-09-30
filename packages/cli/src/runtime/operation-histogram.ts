@@ -17,9 +17,13 @@ const OBJECT_COMMANDS = new Set(["container", "image", "network", "volume"]);
 // lowercase command name collapses to "?".
 const COMMAND_NAME = /^[a-z][a-z0-9._-]*$/;
 
+export type OperationHistogramBucket = Readonly<{ count: number; totalMs: number }>;
+
 export type OperationHistogram = Readonly<{
   record(category: string, durationMs: number): void;
   lines(): string[];
+  /** A copy of every category's count and total; keys are categories only. */
+  snapshot(): Readonly<Record<string, OperationHistogramBucket>>;
 }>;
 
 export function subprocessCategory(command: string, args: readonly string[]): string {
@@ -46,6 +50,11 @@ export function createOperationHistogram(): OperationHistogram {
       return [...buckets.entries()]
         .sort(([left], [right]) => left.localeCompare(right))
         .map(([category, bucket]) => `${category} count=${bucket.count} total=${bucket.totalMs.toFixed(1)}ms`);
+    },
+    snapshot(): Readonly<Record<string, OperationHistogramBucket>> {
+      return Object.freeze(Object.fromEntries([...buckets.entries()]
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([category, bucket]) => [category, Object.freeze({ count: bucket.count, totalMs: bucket.totalMs })])));
     },
   });
 }
