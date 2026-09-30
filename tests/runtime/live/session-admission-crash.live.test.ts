@@ -658,6 +658,92 @@ describe("per-session admission survives a crash at every transition", () => {
     }, TEST_TIMEOUT_MS);
   }
 
+  // -------------------------------------------------------------------------
+  // A Docker daemon that dies under a live session (todo 67, 2026-09-29).
+  //
+  // The owner stamps its record terminal, cannot delete the session file
+  // because the daemon is gone, keeps the record, and exits. When the daemon
+  // comes back, Docker has stopped both the session container and the proxy
+  // (neither has a restart policy). The next start used to refuse that
+  // pending record with `runfree rebuild` as the only remedy.
+  //
+  // The daemon itself is not restarted here: that cannot be done portably
+  // across Docker Desktop and OrbStack from a test. Its whole effect on this
+  // project is reproduced instead, from the same parts a real death leaves —
+  // a launch parked at its refused session-file delete (the stamp written, the
+  // record kept), the session container and the proxy killed the way a daemon
+  // stop kills them, and the owner SIGKILLed. A plain `runfree up` must then
+  // finish the teardown on Docker's proof and start, with no `rebuild`.
+  // -------------------------------------------------------------------------
+
+  async function assertInterruptedTeardownReclaimedByStart(options: Readonly<{ stopProxy: boolean }>): Promise<void> {
+    const composeProject = composeProjectName(fixture);
+    const projectId = composeProject.replace(/^runfree-/u, "");
+    const stateDir = path.join(runfreeStateRoot(fixture.env), "projects", projectId);
+    const identity = { projectId, composeProject };
+    const proxyId = composeServiceContainerId(composeProject, "proxy");
+    assertFilesPathExercised(fixture, proxyId, [], "before the interrupted teardown");
+
+    const point = "after-failed-file-delete" as const;
+    const owner = startHeldLaunchOwner(fixture, ["--launch-hold-at", point, "--fail-session-file-delete"]);
+    let killed = false;
+    let sessionId: string | undefined;
+    try {
+      const attached = await owner.awaitReason("attached", HELD_LAUNCH_WAIT_TIMEOUT_MS);
+      const [record] = attached.records;
+      expect(record?.containerId, "the attached record names no container").toBeTruthy();
+      sessionId = record?.sessionId;
+      // The agent ends, so the owner starts its teardown; the refused delete
+      // parks it with the stamp written and the record kept.
+      docker(["kill", String(record?.containerId)]);
+      await owner.awaitReason(point, HELD_LAUNCH_WAIT_TIMEOUT_MS);
+      expect(readSessionFileEvidence(proxyId).files.length, "the refused delete left no session file").toBe(1);
+      // What the daemon's death does to this project: its containers stop.
+      if (options.stopProxy) docker(["kill", proxyId]);
+      await owner.killOwner();
+      killed = true;
+    } finally {
+      if (!killed) await owner.killOwner();
+      owner.discard();
+    }
+
+    // Vacuity guard: the pending record the start used to refuse is there.
+    const before = listSessionContainerRecordsV2(stateDir, identity);
+    expect(before.map((record) => record.sessionId), "the interrupted teardown left no record").toContain(sessionId);
+    if (options.stopProxy) {
+      expect(
+        docker(["container", "inspect", "--format", "{{.State.Running}}", proxyId]).stdout.trim(),
+        "the proxy was meant to be stopped, as a daemon restart leaves it",
+      ).toBe("false");
+    }
+
+    const started = fixture.runfree(["up"]);
+    expect(started.status, `the start after an interrupted teardown failed: ${describeOutput(started.output, 4000)}`)
+      .toBe(0);
+    expect(started.output).not.toContain("requires recovery");
+    expect(started.output).toContain(`finished the interrupted teardown of session ${sessionId}`);
+
+    expect(listSessionContainerRecordsV2(stateDir, identity), "the start left the pending record behind").toEqual([]);
+    const sessionContainers = dockerOrThrow("post-start session containers", [
+      "ps", "-aq", "--no-trunc",
+      "--filter", `label=io.runfree.project-id=${projectId}`,
+      "--filter", "label=io.runfree.container-role=session-agent",
+    ]);
+    expect(sessionContainers, "the start left the interrupted session's container behind").toBe("");
+    expect(
+      readSessionFileEvidence(composeServiceContainerId(composeProject, "proxy")).files,
+      "the started proxy serves a session file for a session that no longer exists",
+    ).toEqual([]);
+  }
+
+  test("a start after the daemon stopped the proxy and session finishes the interrupted teardown without rebuild", async () => {
+    await assertInterruptedTeardownReclaimedByStart({ stopProxy: true });
+  }, TEST_TIMEOUT_MS);
+
+  test("a start with the proxy still running finishes an interrupted teardown through the ordinary delete", async () => {
+    await assertInterruptedTeardownReclaimedByStart({ stopProxy: false });
+  }, TEST_TIMEOUT_MS);
+
   test("the runtime still admits a session after every crash and recovery", () => {
     // The load-bearing close: six crashes and six recoveries must leave a
     // runtime that still works. A recovery that reconciled records while
