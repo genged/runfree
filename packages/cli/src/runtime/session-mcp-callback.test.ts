@@ -341,7 +341,9 @@ describe("in-session callback bridge", () => {
         let data = "";
         socket.once("connect", () => socket.write(payload));
         socket.on("data", (chunk) => { data += chunk.toString("utf8"); });
-        socket.once("error", () => resolve(undefined));
+        // Only a refused connect means the bridge is not listening yet. A reset
+        // after connecting is the bridge closing on us, which is an answer.
+        socket.once("error", (error: NodeJS.ErrnoException) => resolve(error.code === "ECONNREFUSED" ? undefined : data));
         socket.once("close", () => resolve(data));
         socket.setTimeout(2000, () => socket.destroy());
       });
