@@ -49,6 +49,7 @@ import {
   readDesiredSessionAgentV2,
   readEffectiveControlPlaneV2,
   selectEffectiveControlPlaneV2,
+  sessionAgentMaterializationsRootV2,
 } from "./runtime/component-state-v2.ts";
 import {
   createRuntimeComponentState,
@@ -3573,6 +3574,73 @@ describe("runtime command flow", () => {
         "docker volume inspect": 1,
       }
     `);
+  });
+
+  describe("image cleanup off the unchanged warm launch path", () => {
+    function launchContext(): RuntimeContext {
+      const projectRoot = path.join(tmp, "project");
+      const project = prepareProject(projectRoot);
+      return {
+        projectRoot,
+        project,
+        runtimeRoot: path.join(tmp, "runtime"),
+        env: { PATH: "/fake-bin" },
+        network: fixedNetwork,
+      };
+    }
+    // The cleanup pass is the only startup step that lists every container
+    // for the image accounting before validation; the reconcile after
+    // eligibility publication issues the other listing.
+    const containerListings = (calls: readonly RuntimeIoCall[]): number =>
+      dockerOperationProfile(calls)["docker container ls"] ?? 0;
+
+    test("unchanged inputs: a second warm launch runs no cleanup inventory", async () => {
+      const context = launchContext();
+      const io = createRuntimeIO();
+      expect((await startRuntime(context, io, false, { launch: true })).status).toBe(0);
+      const warmUpStart = io.calls.length;
+      expect((await startRuntime(context, io, false, { launch: true })).status).toBe(0);
+      const firstWarm = io.calls.slice(warmUpStart);
+      const secondWarmStart = io.calls.length;
+      expect((await startRuntime(context, io, false, { launch: true })).status).toBe(0);
+      const secondWarm = io.calls.slice(secondWarmStart);
+      expect(containerListings(secondWarm)).toBe(containerListings(firstWarm) - 1);
+      expect(fs.existsSync(path.join(context.project.paths.stateDir, "runtime", "v2", "launch", "image-cleanup-stamp.json"))).toBe(true);
+    });
+
+    test("runfree up always runs cleanup, even with a matching stamp", async () => {
+      const context = launchContext();
+      const io = createRuntimeIO();
+      expect((await startRuntime(context, io, false, { launch: true })).status).toBe(0);
+      expect((await startRuntime(context, io, false, { launch: true })).status).toBe(0);
+      const launchStart = io.calls.length;
+      expect((await startRuntime(context, io, false, { launch: true })).status).toBe(0);
+      const launchListings = containerListings(io.calls.slice(launchStart));
+      const upStart = io.calls.length;
+      expect((await startRuntime(context, io, false, {})).status).toBe(0);
+      expect(containerListings(io.calls.slice(upStart))).toBe(launchListings + 1);
+    });
+
+    test("a changed cleanup input runs cleanup again and the stamp follows the pass", async () => {
+      const context = launchContext();
+      const io = createRuntimeIO();
+      expect((await startRuntime(context, io, false, { launch: true })).status).toBe(0);
+      expect((await startRuntime(context, io, false, { launch: true })).status).toBe(0);
+      const stampPath = path.join(context.project.paths.stateDir, "runtime", "v2", "launch", "image-cleanup-stamp.json");
+      const stampBefore = fs.readFileSync(stampPath, "utf8");
+      // Crash residue: a materialization directory nothing references.
+      const stale = path.join(sessionAgentMaterializationsRootV2(context.project.paths.stateDir), `sha256-${"e".repeat(64)}`);
+      fs.mkdirSync(stale, { recursive: true });
+      const changedStart = io.calls.length;
+      expect((await startRuntime(context, io, false, { launch: true })).status).toBe(0);
+      const changed = io.calls.slice(changedStart);
+      const unchangedStart = io.calls.length;
+      expect((await startRuntime(context, io, false, { launch: true })).status).toBe(0);
+      expect(containerListings(changed)).toBe(containerListings(io.calls.slice(unchangedStart)) + 1);
+      expect(fs.existsSync(stale)).toBe(false);
+      expect(JSON.parse(fs.readFileSync(stampPath, "utf8")).inputsDigest)
+        .toBe(JSON.parse(stampBefore).inputsDigest);
+    });
   });
 
   describe("helper residue at startup", () => {

@@ -95,6 +95,14 @@ export type RebuildOptions = {
   assumeYes?: boolean;
   useApprovedPolicy?: boolean;
   verbose?: boolean;
+  /**
+   * The start is for a public session launch (`claude`/`codex`/`pi`, `shell`,
+   * `resume`, `mcp auth`). Only a launch may take the warm paths that skip
+   * repeated work (sub-second launch plan Phase B); `runfree up` never does,
+   * because it is the recovery command every refusal names and must re-prove
+   * from scratch.
+   */
+  launch?: boolean;
 };
 
 export type CreateSessionMetadataOptions = {

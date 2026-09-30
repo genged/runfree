@@ -58,6 +58,8 @@ import { prepareGitRepositoryLayoutResult, serializeGitLayoutPlan } from "./git-
 import {
   cleanupRunfreeImages,
   ensureRuntimeMaterialized,
+  imageCleanupInputsDigest,
+  type RuntimeCleanupCandidates,
   existingActiveRuntimePlan,
   materializeRetainedRebindRuntimePlan,
   RuntimeImageBuildStatus,
@@ -152,7 +154,8 @@ import {
   mintPreparedRuntime,
   type PreparedRuntime,
 } from "./prepared-runtime.ts";
-import { createRuntimeTimings } from "./timings.ts";
+import { createRuntimeTimings, type RuntimeTimings } from "./timings.ts";
+import { imageCleanupStampMatches, writeImageCleanupStamp } from "./image-cleanup-stamp.ts";
 import { createOperationHistogram, withOperationHistogram } from "./operation-histogram.ts";
 import { remedy } from "../remedies.ts";
 import { setMcpLogContext } from "./mcp.ts";
@@ -870,6 +873,52 @@ function ephemeralHelperFence(
   return { lifecycleLock: options.lifecycleLock, containmentIO: options.containmentIO, stateDir: plan.paths.stateDir };
 }
 
+/**
+ * Image cleanup, skipped on a launch whose cleanup inputs did not change since
+ * the last completed pass (sub-second launch plan Task 4).
+ *
+ * Cleanup only deletes, so skipping it can only retain garbage; it never
+ * changes what a session may do. `runfree up` and `rebuild` (not launches)
+ * always run it. The stamp is written only after a pass that reached its end,
+ * from the inputs as they are after that pass (the pass itself removes stale
+ * materializations), so the next launch compares against what it will see.
+ */
+function runImageCleanupUnlessUnchanged(input: Readonly<{
+  context: RuntimeContext;
+  docker: RuntimeDocker;
+  io: RuntimeIO;
+  launch: boolean;
+  timings: RuntimeTimings;
+  candidates: RuntimeCleanupCandidates;
+}>): void {
+  const stateDir = input.context.project.paths.stateDir;
+  const projectId = projectHash(input.context.projectRoot);
+  const inputsDigest = (): string | undefined => {
+    try {
+      return imageCleanupInputsDigest(input.context, input.candidates);
+    } catch {
+      return undefined;
+    }
+  };
+  if (input.launch) {
+    const current = inputsDigest();
+    if (current !== undefined && imageCleanupStampMatches(stateDir, projectId, current)) {
+      input.timings.report("image-cleanup", "skipped inputs-unchanged");
+      return;
+    }
+  }
+  const status = input.timings.time("image-cleanup", () => cleanupRunfreeImages(input.context, input.docker, input.io, input.candidates));
+  if (status !== "completed") return;
+  const after = inputsDigest();
+  if (after === undefined) return;
+  try {
+    writeImageCleanupStamp(stateDir, projectId, after);
+  } catch {
+    // Advisory: a stamp this host cannot write only means the next launch
+    // runs the pass again.
+  }
+}
+
 async function prepareRuntimeForTokenSyncOrRemoveInvalid(
   activePlan: ActiveRuntimePlan,
   context: RuntimeContext,
@@ -1278,12 +1327,19 @@ export async function startRuntime(
 
     const project = activePlan.composeProjectName;
     const validateSelectAndSync = async (): Promise<RuntimeStartResult> => {
-      timings.time("image-cleanup", () => cleanupRunfreeImages(activeContext, adapters.docker, io, {
-        controlPlaneMaterializationDigest: activePlan.activeRuntime.controlPlaneMaterializationDigest,
-        sessionAgentMaterializationDigest: readRetainedDesiredSessionAgentV2(
-          activePlan.paths.stateDir,
-        )?.selection.sessionAgentMaterializationDigest,
-      }));
+      runImageCleanupUnlessUnchanged({
+        context: activeContext,
+        docker: adapters.docker,
+        io,
+        launch: rebuildOptions.launch === true,
+        timings,
+        candidates: {
+          controlPlaneMaterializationDigest: activePlan.activeRuntime.controlPlaneMaterializationDigest,
+          sessionAgentMaterializationDigest: readRetainedDesiredSessionAgentV2(
+            activePlan.paths.stateDir,
+          )?.selection.sessionAgentMaterializationDigest,
+        },
+      });
       const validation = await timings.timeAsync(
         "runtime-validation",
         () => prepareRuntimeForTokenSyncOrRemoveInvalid(activePlan, activeContext, io, adapters.docker, { verbose, lifecycleLock: heldLifecycleLock, containmentIO }),

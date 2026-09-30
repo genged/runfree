@@ -134,7 +134,7 @@ export async function mcpAuthRuntime(
 ): Promise<number> {
   const entry = resolveMcpAuthEntry(input, context);
   const start = deps.start ?? startRuntime;
-  const runtime: RuntimeStartResult = await start(context, io, false, { verbose: input.verbose });
+  const runtime: RuntimeStartResult = await start(context, io, false, { verbose: input.verbose, launch: true });
   if (runtime.kind === "failed") return runtime.status;
   const activeContext = preparedRuntimeContext(runtime.preparedRuntime);
   flushWarnings();
@@ -155,7 +155,7 @@ export async function mcpAuthRuntime(
         io,
         agentName: entry.agent,
         reprepare: async () => {
-          const refreshed = await start(context, io, false, { verbose: input.verbose });
+          const refreshed = await start(context, io, false, { verbose: input.verbose, launch: true });
           if (refreshed.kind === "failed") {
             throw new Error(`runtime re-preparation failed with status ${refreshed.status}`);
           }

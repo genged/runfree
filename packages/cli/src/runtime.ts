@@ -616,6 +616,7 @@ async function runConfiguredAgent(
   const runtime = await startRuntime(context, io, false, {
     useApprovedPolicy: options.useApprovedPolicy,
     verbose: options.verbose,
+    launch: true,
   });
   if (runtime.kind === "failed") return runtime.status;
   const activeContext = preparedRuntimeContext(runtime.preparedRuntime);
@@ -1077,7 +1078,7 @@ export async function resumeRecoveryRuntime(
   // property.
   const serviceEnsure = await reviewAgentOperationalServices(context, io, classified.agent, Boolean(options.quiet));
   if (serviceEnsure.status !== 0) return serviceEnsure.status;
-  const runtime = await startRuntime(context, io, false, { verbose: options.verbose });
+  const runtime = await startRuntime(context, io, false, { verbose: options.verbose, launch: true });
   if (runtime.kind === "failed") return runtime.status;
   const activeContext = preparedRuntimeContext(runtime.preparedRuntime);
   const proxyId = preparedRuntimeProxyId(runtime.preparedRuntime);
@@ -1175,7 +1176,7 @@ export async function destroyRuntime(
 }
 
 export async function shellRuntime(context: RuntimeContext, io: RuntimeIO, options: { verbose: boolean }): Promise<number> {
-  const runtime = await startRuntime(context, io, false, { verbose: options.verbose });
+  const runtime = await startRuntime(context, io, false, { verbose: options.verbose, launch: true });
   if (runtime.kind === "failed") return runtime.status;
   const activeContext = preparedRuntimeContext(runtime.preparedRuntime);
   flushWarnings();
@@ -1193,7 +1194,7 @@ async function repreparePublicLaunchRuntime(
   io: RuntimeIO,
   verbose: boolean | undefined,
 ): Promise<PreparedRuntime> {
-  const result = await startRuntime(context, io, false, { verbose });
+  const result = await startRuntime(context, io, false, { verbose, launch: true });
   if (result.kind === "failed") {
     throw new Error(`runtime re-preparation failed with status ${result.status}`);
   }

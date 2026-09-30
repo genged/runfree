@@ -61,6 +61,7 @@ import type { DockerImageInspect } from "./docker.ts";
 import { composeProjectName, projectHash } from "./env.ts";
 import {
   cleanupRunfreeImages,
+  imageCleanupInputsDigest,
   ensureRuntimeMaterialized,
   selectPreparedSessionAgent,
   selectEffectiveRuntimePlan,
@@ -650,6 +651,67 @@ test("cleanup removes only exact zero-reference materialization paths and is ide
   expect(fs.existsSync(staleControlRoot), staleDigest).toBe(false);
   expect(fs.readdirSync(sessionAgentMaterializationsRootV2(plan.paths.stateDir))).toHaveLength(1);
   expect(fs.readdirSync(controlPlaneMaterializationsRootV2(plan.paths.stateDir))).toHaveLength(1);
+});
+
+test("cleanup reports completed only when the pass reached its end", () => {
+  const plan = defaultPlan();
+  const docker = new RuntimeImageDocker();
+  const active = ensureRuntimeMaterialized(plan, {
+    docker: docker as never,
+    io: { run: () => 0 } as never,
+    force: false,
+  });
+  const desired = readDesiredSessionAgentV2(plan.paths.stateDir);
+  if (!desired || !active.activeRuntime.controlPlaneMaterializationDigest) {
+    throw new Error("expected current v2 materializations");
+  }
+  const context = {
+    projectRoot: plan.projectRoot,
+    project: plan.project,
+    runtimeRoot: plan.baseRuntimeRoot,
+    env: {},
+  } satisfies RuntimeContext;
+  const candidates = {
+    controlPlaneMaterializationDigest: active.activeRuntime.controlPlaneMaterializationDigest,
+    sessionAgentMaterializationDigest: desired.selection.sessionAgentMaterializationDigest,
+  };
+  const inventory = (status: number) => ({
+    capture(command: string, args: string[]) {
+      if (command === "docker" && args.slice(0, 3).join(" ") === "container ls --all") {
+        return { status, stdout: "", stderr: status === 0 ? "" : "daemon unavailable" };
+      }
+      throw new Error(`unexpected cleanup command: ${command} ${args.join(" ")}`);
+    },
+  } as RuntimeIO);
+
+  expect(cleanupRunfreeImages(context, docker as never, inventory(0), candidates)).toBe("completed");
+  // An inventory the host could not read proves nothing: the pass is skipped,
+  // and the caller must not record it as done.
+  expect(cleanupRunfreeImages(context, docker as never, inventory(1), candidates)).toBe("skipped");
+});
+
+test("cleanup inputs digest is stable for unchanged inputs and moves with every deletion input", () => {
+  const plan = defaultPlan();
+  const docker = new RuntimeImageDocker();
+  const active = ensureRuntimeMaterialized(plan, {
+    docker: docker as never,
+    io: { run: () => 0 } as never,
+    force: false,
+  });
+  const context = {
+    projectRoot: plan.projectRoot,
+    project: plan.project,
+    runtimeRoot: plan.baseRuntimeRoot,
+    env: {},
+  } satisfies RuntimeContext;
+  const candidates = { controlPlaneMaterializationDigest: active.activeRuntime.controlPlaneMaterializationDigest };
+  const first = imageCleanupInputsDigest(context, candidates);
+  expect(first).toMatch(/^sha256:[a-f0-9]{64}$/);
+  expect(imageCleanupInputsDigest(context, candidates)).toBe(first);
+  expect(imageCleanupInputsDigest(context, {})).not.toBe(first);
+  // A new on-disk materialization (a build, or crash residue) is a new input.
+  fs.mkdirSync(path.join(sessionAgentMaterializationsRootV2(plan.paths.stateDir), `sha256-${"e".repeat(64)}`), { recursive: true });
+  expect(imageCleanupInputsDigest(context, candidates)).not.toBe(first);
 });
 
 test("cleanup refuses materialization deletion when an exact path contains a hard link", () => {

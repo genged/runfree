@@ -99,6 +99,7 @@ import {
 import { readProxySessionFiles } from "./session-reconcile.ts";
 import { readControlPlaneRebindTransaction } from "./control-plane-rebind.ts";
 import { remedy } from "../remedies.ts";
+import { stableJson } from "../strict-primitives.ts";
 
 export type RuntimeMaterialization = {
   activeRuntimeRoot: string;
@@ -473,12 +474,69 @@ export type RuntimeCleanupCandidates = Readonly<{
   sessionAgentMaterializationDigest?: string;
 }>;
 
+/**
+ * The digest of every host-side input a cleanup pass derives its deletion set
+ * from, read without Docker (sub-second launch plan Task 4).
+ *
+ * The lifecycle registry (every record, whole), the quarantine listing, the
+ * retained desired and effective selections, the rebind journal, the on-disk
+ * session and control-plane materialization inventories, the current
+ * candidates, whether a project image build is configured, and the CLI version
+ * (a new CLI may reference differently). Any change to
+ * one of them can create a new deletion candidate, so any change runs the pass.
+ * A new unreferenced image appears only through one of these (a build selects
+ * a new materialization; an ended session drops its record), which is why the
+ * Docker image listing is not an input. Throws on an unreadable input; the
+ * caller then runs the pass, whose own guards decide.
+ */
+export function imageCleanupInputsDigest(
+  context: RuntimeContext,
+  currentCandidates: RuntimeCleanupCandidates = {},
+): string {
+  const stateDir = context.project.paths.stateDir;
+  const expectedProject = { projectId: projectHash(context.projectRoot), composeProject: composeProjectName(context.projectRoot) };
+  const rebind = readControlPlaneRebindTransaction(stateDir, expectedProject);
+  return sha256Digest(stableJson({
+    version: 1,
+    cli: RUNFREE_VERSION,
+    projectId: expectedProject.projectId,
+    records: listSessionContainerRecordsV2(stateDir, expectedProject)
+      .map((record) => stableJson(record))
+      .sort(),
+    quarantined: [...listQuarantinedSessionContainerRecordNamesV2(stateDir)].sort(),
+    desired: stableJson((readRetainedDesiredSessionAgentV2(stateDir)?.selection ?? null)),
+    effective: stableJson((readEffectiveControlPlaneV2(stateDir)?.selection ?? null)),
+    rebind: rebind ? sha256Digest(stableJson(rebind)) : null,
+    sessionMaterializations: exactMaterializationDigests(
+      sessionAgentMaterializationsRootV2(stateDir),
+      new Set(["materialization.json", "session-template.json"]),
+    ).sort(),
+    controlMaterializations: exactMaterializationDigests(
+      controlPlaneMaterializationsRootV2(stateDir),
+      new Set(["materialization.json"]),
+    ).sort(),
+    candidates: {
+      controlPlane: currentCandidates.controlPlaneMaterializationDigest ?? null,
+      sessionAgent: currentCandidates.sessionAgentMaterializationDigest ?? null,
+    },
+    build: agentBuildConfig(context.project.config) !== undefined,
+  }));
+}
+
+export type RuntimeCleanupStatus = "completed" | "skipped";
+
+/**
+ * Removes zero-reference materializations and project images. Returns
+ * `completed` only when the pass reached its end; `skipped` means an exact
+ * reference could not be proved and nothing further was deleted (the reason
+ * was already warned).
+ */
 export function cleanupRunfreeImages(
   context: RuntimeContext,
   docker: RuntimeDocker,
   io: RuntimeIO,
   currentCandidates: RuntimeCleanupCandidates = {},
-): void {
+): RuntimeCleanupStatus {
   const projectId = projectHash(context.projectRoot);
   const build = agentBuildConfig(context.project.config);
   try {
@@ -592,9 +650,11 @@ export function cleanupRunfreeImages(
     if (staleImageIds.length > 0) {
       warnImageCleanupFailure("stale Runfree project image cleanup", docker.removeImages(staleImageIds));
     }
+    return "completed";
   } catch (error) {
     const detail = error instanceof Error ? `: ${error.message}` : "";
     warn(`stale Runfree runtime cleanup skipped because exact references could not be proved${detail}`);
+    return "skipped";
   }
 }
 
