@@ -360,6 +360,14 @@ server in the agent image (`runfree mcp list` shows `stdio (node-repl)`), and
 command. Codex `computer-use` controls host desktop apps, so Runfree skips it.
 See [Portable compute MCP](architecture.md#portable-compute-mcp).
 
+OAuth login works in any session. When an approved MCP server can use OAuth,
+each `runfree claude`, `codex`, `pi`, or `shell` session gets its own loopback
+callback port. In Claude, type `/mcp` and select the server; in Codex or a
+shell, run `codex mcp login <server>`. Then open the URL the client prints.
+Two sessions can log in at the same time. `runfree mcp auth` launches a session
+and prints these steps. A provider that accepts only one pre-registered
+callback port works only while its session holds the project's first port.
+
 ## Dependency Overlays
 
 ```bash

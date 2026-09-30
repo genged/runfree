@@ -241,6 +241,12 @@ Details: [Write Approval Grants](architecture.md#write-approval-grants).
 6. A portable server has the agent's authority, no more: it runs as the agent
    user with the agent's mounts, network policy, and placeholder-only
    environment. It gets no proxy-managed credential.
+7. **Each session owns its OAuth callback path.** When an approved MCP server
+   can use OAuth, every session gets its own loopback port, forwarder, and
+   in-session bridge before it starts. The forwarder is bound to that session
+   and removed before the session's record releases its address. The bridge
+   accepts only its forwarder. The port is a routing value, not an
+   authorization secret: the client keeps state, PKCE, and issuer checks.
 
 ### Agent Container
 
@@ -326,6 +332,21 @@ Details: [Write Approval Grants](architecture.md#write-approval-grants).
   acceptance record says so.
 
 ## Residual Risks
+
+- **The OAuth callback page reaches the host browser.** An eligible session
+  answers its own callback URL, and the operator's browser renders that answer
+  on `localhost`. A compromised session can use the page to send data out
+  through the browser, or to reach other localhost services with same-site
+  requests. This is the same channel `runfree forward` and `runfree vnc` open,
+  but it exists in every eligible session. Open callback URLs only for logins
+  you started.
+- **A callback forwarder that dies mid-session frees its address.** The
+  forwarder's `agent_internal` address is dynamic. If the forwarder exits while
+  its session runs, that address can go to a later session, which then passes
+  the bridge's peer check. It can only reach the first session's loopback
+  callback listener, which still checks OAuth state. The host port is also
+  freed and could be taken by another project; PKCE stops the code from being
+  redeemed there.
 
 Accepted, known risks:
 

@@ -35,11 +35,19 @@ export type ExactControlPlaneInternalParticipant = Readonly<{
   sourceIp: string;
 }>;
 
+const INGRESS_TARGET_IPV4_PATTERN = /^(?:\d{1,3}\.){3}\d{1,3}$/u;
+
 export type ExactIngressInternalParticipant = Readonly<{
   containerId: string;
   containerName: string;
   sourceIp: string;
   imageId: string;
+  /**
+   * The IPv4 address this forwarder splices to, when it targets one. The
+   * allocator reserves it: a forward whose session has ended must not become
+   * a route into whichever session is given that address next.
+   */
+  targetIp?: string;
 }>;
 
 declare const controlPlaneInternalParticipantAuthorityBrand: unique symbol;
@@ -289,7 +297,7 @@ function inspectIngressParticipants(
   selection: ControlPlaneEffectiveSelectionV2,
   internalNetwork: string,
 ): readonly ExactIngressInternalParticipant[] {
-  const { context, io, plan } = input;
+  const { context, io } = input;
   const names = listIngressForwarders(context, io, selection.projectId);
   if (names.length === 0) return Object.freeze([]);
   const hostNetwork = inspectIngressHostNetwork(context, io, selection.projectId);
@@ -319,7 +327,6 @@ function inspectIngressParticipants(
     proxy,
     projectId: selection.projectId,
     internalNetwork,
-    callbackRelay: { port: String(plan.mcpOAuth.callbackPort) },
   });
   const participants = inspected.slice(0, names.length).map((container, index) => {
     issues.push(...validateIngressForwarderTeardownCandidate({ container, expectedImageId: imageId, projectId: selection.projectId }));
@@ -333,7 +340,14 @@ function inspectIngressParticipants(
       || !endpoint.IPAddress) {
       throw new Error("ingress participant does not have its exact network identity");
     }
-    return Object.freeze({ containerId, containerName, sourceIp: endpoint.IPAddress, imageId });
+    const target = container.Config?.Env?.find((entry) => entry.startsWith("INGRESS_TARGET="))?.slice("INGRESS_TARGET=".length);
+    return Object.freeze({
+      containerId,
+      containerName,
+      sourceIp: endpoint.IPAddress,
+      imageId,
+      ...(target !== undefined && INGRESS_TARGET_IPV4_PATTERN.test(target) ? { targetIp: target } : {}),
+    });
   });
   if (issues.length > 0) {
     throw new Error(`refusing ingress participants: ${issues.map((issue) => issue.message).join("; ")}`);

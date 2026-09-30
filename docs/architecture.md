@@ -954,8 +954,49 @@ VNC, `runfree forward`). They are one-way host-to-agent transport sidecars on
 a loopback-only host bridge plus `agent_internal`. They are not credential or
 authorization boundaries. Runfree rejects unknown peers and checks each
 forwarder's command, networks, loopback publication, mounts, user,
-capabilities, and writable state. The MCP OAuth callback forwarder must target
-a live session address.
+capabilities, and writable state. The allocator never hands out an address an
+ingress forwarder still targets, whatever its purpose.
+
+#### Session MCP OAuth Callbacks
+
+When the selected OAuth policy names an MCP server, every launched session —
+agent, shell, resume, or `mcp auth` — gets its own callback path, set up after
+the running proof and before activation, so no client starts first
+([session-mcp-callback.ts](../packages/cli/src/runtime/session-mcp-callback.ts)):
+
+```text
+host 127.0.0.1:P -> forwarder (bound to session S) -> S's address:P
+                 -> in-session bridge (forwarder only) -> S's 127.0.0.1:P
+```
+
+- **Port.** The project's legacy callback port first, then up to 31
+  alternatives in the same block. A port another forwarder or host process
+  holds is skipped; Docker's loopback publication is the reservation.
+- **Binding.** The forwarder's `docker run` mints `RUNFREE_CALLBACK_SESSION_ID`
+  and `RUNFREE_CALLBACK_SESSION_CONTAINER`, so no forwarder exists without its
+  owner. Topology validation accepts it only when that container is a running
+  session carrying that session id at the forwarder's target address. An
+  unbound forwarder from before this design is refused.
+- **Clients.** The bridge writes the port to
+  `/tmp/runfree-mcp-oauth-callback-port`. The `claude` adapter exports
+  `MCP_OAUTH_CALLBACK_PORT`, and the `codex` adapter adds
+  `-c mcp_oauth_callback_port=<port>`, including for `codex mcp login` run from
+  a shell. Generated config carries no shared port or callback URL: Claude
+  prefers a configured `oauth.callbackPort` over the environment, and Codex
+  advertises a configured URL's port while listening on the override.
+- **Teardown.** The ordered session teardown removes the session's forwarder
+  after the session file and before the record, so the address is never
+  released while a route to it survives. A failure keeps the record for the
+  next reconcile. Unadmitted cleanup does the same.
+- **Reclaim.** When startup's topology validation or admission's participant
+  proof refuses, the refusing step removes callback forwarders that route to
+  no running owner (a killed launcher's leftover, a half-started forwarder, an
+  unbound one) under the lifecycle lock and proves once more. A forwarder whose
+  state cannot be read is never counted as dead. The healthy path spends no
+  Docker call on this.
+- **Failure.** A setup failure removes what it created and fails the launch
+  with a retry instruction. Sessions without an OAuth-capable server create
+  nothing.
 
 Before it admits a session beside a forwarder, the host rechecks that shape,
 the resolved immutable image ID, and the exact internal and host network IDs
@@ -1288,7 +1329,7 @@ Runfree imports supported Claude and Codex MCP entries into sanitized per-agent 
 - Host/user/local MCP entries can be inspected with `runfree mcp list` and `runfree mcp explain`.
 - Project `.mcp.json` and `.codex/config.toml` entries are imported only after `runfree mcp approve`.
 - Static headers require a host-owned credential source.
-- OAuth login runs through `runfree mcp auth` or `runfree mcp approve --login` inside a validated runtime.
+- OAuth login works from any session: every session with an OAuth-capable approved server gets its own loopback callback path ([Session MCP OAuth Callbacks](#session-mcp-oauth-callbacks)). `runfree mcp auth` and `runfree mcp approve --login` are shortcuts that launch a session and print the login steps.
 - Side-effecting MCP tool calls use the same write-approval posture as outbound writes and can be governed with `runfree mcp rules`. This covers HTTP MCP servers, whose calls pass the proxy. STDIO servers run inside the agent container and their calls do not pass the proxy.
 
 ### Portable Compute MCP

@@ -3,9 +3,8 @@ import net from "node:net";
 
 import { type RuntimeNetwork } from "../network.ts";
 import { validateProxyNftablesTableJson, type ProxyNftablesProofInput } from "../proxy-nftables-proof.ts";
-import { warn } from "../warnings.ts";
 import { PROXY_SERVER_UID } from "@runfree/proxy/firewall/nftables";
-import { runDockerExec, runDockerExecAgent, runDockerExecProxyServer, runDockerExecRoot } from "./attach.ts";
+import { runDockerExec, runDockerExecProxyServer, runDockerExecRoot } from "./attach.ts";
 import { AGENT_UID_GID } from "./constants.ts";
 import { dockerClientEnvOptions, } from "./docker.ts";
 import type { CaptureResult, DockerNetworkInspect, RuntimeContext, RuntimeIO } from "./types.ts";
@@ -25,29 +24,35 @@ function compactDiagnostic(value: string): string {
   return `${compact.slice(0, 497)}...`;
 }
 
-const MCP_CALLBACK_BRIDGE_STOP_SOURCE = [
-  "/* runfree_mcp_callback_bridge_stop */",
-  "const fs = require('node:fs');",
-  "const marker = 'runfree_mcp_callback_bridge';",
-  "for (const entry of fs.readdirSync('/proc')) {",
-  "  if (!/^\\d+$/.test(entry) || Number(entry) === process.pid) continue;",
-  "  let cmdline = '';",
-  "  try { cmdline = fs.readFileSync(`/proc/${entry}/cmdline`, 'utf8'); } catch { continue; }",
-  "  if (!cmdline.includes(marker)) continue;",
-  "  try { process.kill(Number(entry), 'SIGTERM'); } catch (error) {",
-  "    if (!error || error.code !== 'ESRCH') throw error;",
-  "  }",
-  "}",
-].join("\n");
-
-const MCP_CALLBACK_BRIDGE_SOURCE = [
+// Hop 2 of the per-session MCP OAuth callback, run as the agent user inside
+// the session container before the session is admitted. Argv: bind address,
+// port, probe challenge, the one peer address allowed to connect (the
+// callback forwarder's agent_internal address), and the session callback port
+// file. It records the port for the session's `claude`/`codex` adapters before
+// it listens — nothing else in the session runs before admission, so the file
+// exists before any client starts — then relays only the forwarder's
+// connections to the session's own loopback, answering the host probe's
+// challenge with an echo. A peer session connecting to this address is closed
+// without reaching the loopback callback listener.
+export const MCP_CALLBACK_BRIDGE_SOURCE = [
   "/* runfree_mcp_callback_bridge */",
+  "const fs = require('node:fs');",
   "const net = require('node:net');",
   "const host = process.argv[1];",
   "const port = Number(process.argv[2]);",
   "const probeToken = process.argv[3];",
-  "if (!probeToken) process.exit(1);",
+  "const allowedPeer = process.argv[4];",
+  "const portFile = process.argv[5];",
+  "if (!probeToken || !allowedPeer || !portFile || !Number.isInteger(port)) process.exit(1);",
+  "const temporary = `${portFile}.${process.pid}`;",
+  "fs.writeFileSync(temporary, `${port}\\n`, { flag: 'wx', mode: 0o644 });",
+  "fs.renameSync(temporary, portFile);",
+  "const peerAddress = (address) => typeof address === 'string' && address.startsWith('::ffff:') ? address.slice(7) : address;",
   "const server = net.createServer((client) => {",
+  "  if (peerAddress(client.remoteAddress) !== allowedPeer) {",
+  "    client.destroy();",
+  "    return;",
+  "  }",
   "  let decided = false;",
   "  const closeClient = () => client.destroy();",
   "  const forward = (firstChunk) => {",
@@ -77,6 +82,9 @@ const MCP_CALLBACK_BRIDGE_SOURCE = [
   "server.listen({ host, port, exclusive: true });",
   "setInterval(() => {}, 60_000);",
 ].join("\n");
+
+/** The session callback port file the bridge writes and the adapters read. */
+export const SESSION_MCP_CALLBACK_PORT_FILE = "/tmp/runfree-mcp-oauth-callback-port";
 
 function captureResult(status: number, stdout = "", stderr = ""): CaptureResult {
   return { status, stdout, stderr };
@@ -119,22 +127,17 @@ function probeMcpCallbackHostPath(port: number, challenge: string): Promise<Capt
 }
 
 /**
- * Starts the in-container callback bridge — a `docker exec -d` node process that
- * listens on `bindIp:port` and forwards to the container's own `127.0.0.1:port`,
- * intercepting the probe challenge with an echo. Shared by the legacy shared-agent
- * bridge (bound to the agent IP) and the per-session hop-2 bridge (bound to the
- * session IP). Stops any prior bridge first so a restart is clean.
+ * Starts hop 2 of the per-session callback — a `docker exec -d` node process,
+ * as the agent user, that records the session callback port and then relays
+ * `bindIp:port` to the session's own `127.0.0.1:port`, accepting only
+ * `allowedPeerIp` (the forwarder) and intercepting the probe challenge with an
+ * echo. The session container is new, so no earlier bridge can hold the port.
  */
 export function startMcpCallbackBridgeInContainer(
   context: RuntimeContext,
   io: RuntimeIO,
-  params: Readonly<{ containerId: string; bindIp: string; port: number; challenge: string }>,
+  params: Readonly<{ containerId: string; bindIp: string; port: number; challenge: string; allowedPeerIp: string }>,
 ): number {
-  const stop = runDockerExecAgent(context, io, params.containerId, ["node", "-e", MCP_CALLBACK_BRIDGE_STOP_SOURCE]);
-  if (stop.status !== 0) {
-    warn("MCP OAuth callback bridge failed to stop an existing bridge before validation");
-    return stop.status;
-  }
   return io.run("docker", [
     "exec",
     "-d",
@@ -147,21 +150,21 @@ export function startMcpCallbackBridgeInContainer(
     params.bindIp,
     String(params.port),
     params.challenge,
+    params.allowedPeerIp,
+    SESSION_MCP_CALLBACK_PORT_FILE,
   ], dockerClientEnvOptions(context));
 }
 
 /**
  * Probes the host callback path end to end (`127.0.0.1:port` → forwarder →
- * bridge echo), honoring the test override and retrying while the sidecars come
- * up. Used by the per-session callback setup.
+ * bridge echo), retrying while the sidecars come up. Used by the per-session
+ * callback setup. There is no environment override: a route this host did not
+ * prove never counts as set up.
  */
 export async function probeMcpCallbackPathWithRetries(
-  context: RuntimeContext,
   port: number,
   challenge: string,
 ): Promise<CaptureResult> {
-  if (context.env?.RUNFREE_TEST_MCP_CALLBACK_HOST_PROBE === "success") return captureResult(0);
-  if (context.env?.RUNFREE_TEST_MCP_CALLBACK_HOST_PROBE === "fail") return captureResult(1, "", "forced");
   let probe = await probeMcpCallbackHostPath(port, challenge);
   for (let attempt = 2; probe.status !== 0 && attempt <= MCP_CALLBACK_BRIDGE_PROBE_ATTEMPTS; attempt += 1) {
     sleepForMcpCallbackBridgeRetry();

@@ -495,6 +495,11 @@ describe("reconcile before allocation", () => {
     expect(result.deadOwnersRevoked).toEqual([abandoned.sessionId]);
     expect(fake.effects()).toEqual([
       `delete-session-file:${abandoned.sessionPrincipal}.json`,
+      // The session's MCP OAuth callback route is proved absent before the
+      // record releases its address (none exists here).
+      `docker:ps -a --no-trunc --filter label=io.runfree.project-id=${SESSION_TEST_PROJECT.projectId} `
+        + "--filter label=io.runfree.container-role=ingress-forwarder "
+        + "--filter label=io.runfree.ingress-purpose=mcp-callback --format {{.ID}}",
       `docker:network disconnect ${NETWORK.networkId} ${"a".repeat(64)}`,
       `docker:container stop --time 10 ${"a".repeat(64)}`,
       `docker:container rm --force ${"a".repeat(64)}`,

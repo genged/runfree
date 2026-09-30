@@ -1305,23 +1305,6 @@ function loadClaudeRuntimeConfig(filePath: string): Record<string, unknown> {
   }
 }
 
-function claudeConfigWithCallbackPort(
-  config: Record<string, unknown>,
-  auth: PreparedMcpServer["auth"],
-  callbackPort: number,
-): Record<string, unknown> {
-  // Only OAuth-capable servers need the loopback callback. Static-header servers
-  // already carry a proxy-injected credential and never run the OAuth flow.
-  // The port is always the Runfree-computed deterministic callback port, never a
-  // value copied from untrusted server config. Claude Code persists this as
-  // `oauth.callbackPort`; without it Claude picks a random loopback port that the
-  // host never publishes and the callback bridge cannot reach.
-  if (auth !== "public" && auth !== "oauth") return config;
-  const existing = config.oauth;
-  const oauth = isRecord(existing) ? { ...existing, callbackPort } : { callbackPort };
-  return { ...config, oauth };
-}
-
 function writeHostMountFile(filePath: string, contents: string): void {
   fs.mkdirSync(path.dirname(filePath), { recursive: true, mode: 0o700 });
   fs.writeFileSync(filePath, contents, { mode: 0o644 });
@@ -1337,13 +1320,19 @@ function writeClaudeRuntimeConfig(
   filePath: string,
   mcpConfigPath: string,
   servers: PreparedMcpServer[],
-  callbackPort: number,
 ): void {
   const current = loadClaudeRuntimeConfig(filePath);
   const mcpServers: Record<string, unknown> = {};
   for (const server of servers) {
     if (server.agent !== "claude" || !server.claudeConfig) continue;
-    mcpServers[server.name] = claudeConfigWithCallbackPort(server.claudeConfig, server.auth, callbackPort);
+    // No `oauth.callbackPort` (session MCP OAuth callback decisions,
+    // 2026-09-30): each eligible session owns its callback port, which the
+    // session's `claude` adapter exports as MCP_OAUTH_CALLBACK_PORT. The pinned
+    // Claude Code prefers a configured `oauth.callbackPort` over that variable,
+    // so one here would send every session's login to a single port only one
+    // session can own. Import already drops a source-configured callbackPort
+    // (it is not a safe OAuth key), so the prepared config carries none.
+    mcpServers[server.name] = server.claudeConfig;
   }
   writeHostMountFile(mcpConfigPath, `${JSON.stringify({ mcpServers }, null, 2)}\n`);
 
@@ -1435,28 +1424,39 @@ function replaceGeneratedCodexBlock(current: string, block: string): string {
   ].filter(Boolean).join("\n\n")}\n`;
 }
 
-function writeCodexRuntimeConfig(codexDir: string, servers: PreparedMcpServer[], callbackPort: number): void {
+function writeCodexRuntimeConfig(codexDir: string, servers: PreparedMcpServer[]): void {
   const codexServers = servers.filter((server) => server.agent === "codex" && server.codexConfig);
-  // Pin the deterministic callback port for any Codex HTTP server: like Claude,
-  // Codex may discover OAuth dynamically on a server that did not statically
-  // declare it, and an unpinned callback port would not match the bridge.
+  // No callback settings (session MCP OAuth callback decisions, 2026-09-30).
+  // The session's `codex` adapter supplies the session's own port
+  // (`-c mcp_oauth_callback_port=<port>`). A shared fallback port here would
+  // send a login run outside the adapter to a port another session — or,
+  // with a colliding project hash, another project — owns; without one, such
+  // a login listens on an unforwarded ephemeral port and fails closed. No
+  // `mcp_oauth_callback_url` either: the pinned Codex advertises that URL's
+  // port while it listens on the override.
   const hasCodexCallback = codexServers.some(
     (server) => (server.auth === "oauth" || server.auth === "public") && typeof server.codexConfig?.url === "string",
   );
-  const globalLines = hasCodexCallback
-    ? [
-      `mcp_oauth_callback_port = ${callbackPort}`,
-      `mcp_oauth_callback_url = ${tomlString(`http://localhost:${callbackPort}/callback`)}`,
-    ]
-    : [];
-  const serverBlock = codexServers
+  const block = codexServers
     .map((server) => renderCodexServer(server.name, server.codexConfig as CodexGeneratedServer))
     .join("\n\n");
-  const block = [
-    globalLines.join("\n"),
-    serverBlock,
-  ].filter(Boolean).join("\n\n");
-  updateCodexConfig(codexDir, (current) => replaceGeneratedCodexBlock(current ?? "", block));
+  updateCodexConfig(codexDir, (current) => {
+    if (hasCodexCallback) warnOnOperatorCodexCallbackUrl(stripGeneratedCodexBlock(current ?? ""));
+    return replaceGeneratedCodexBlock(current ?? "", block);
+  });
+}
+
+/**
+ * Names an operator-written top-level `mcp_oauth_callback_url`, which Runfree
+ * preserves but cannot serve: Codex would advertise that URL's port instead of
+ * the session's forwarded one, so the login could not return.
+ */
+function warnOnOperatorCodexCallbackUrl(operatorConfig: string): void {
+  const tableIndex = firstTomlTableIndex(operatorConfig);
+  const topLevel = tableIndex < 0 ? operatorConfig : operatorConfig.slice(0, tableIndex);
+  if (!/^[ \t]*mcp_oauth_callback_url[ \t]*=/m.test(topLevel)) return;
+  warn("mcp: the Codex config sets mcp_oauth_callback_url; Runfree forwards only the session's own callback port, "
+    + "so Codex MCP OAuth logins in this project cannot complete until that setting is removed");
 }
 
 function ensureDomain(policy: PolicyJson, host: string): void {
@@ -1789,8 +1789,8 @@ export function prepareMcpRuntime(options: McpPrepareOptions): McpPrepareResult 
     }
   }
 
-  writeClaudeRuntimeConfig(options.claudeConfigPath, options.claudeMcpConfigPath, servers, callbackPort);
-  writeCodexRuntimeConfig(options.codexDir, servers, callbackPort);
+  writeClaudeRuntimeConfig(options.claudeConfigPath, options.claudeMcpConfigPath, servers);
+  writeCodexRuntimeConfig(options.codexDir, servers);
   writeMcpOAuthPolicy(options.mcpOAuthPolicyPath, servers, callbackPort);
   writeMcpOperationPolicy(
     options.mcpOperationPolicyPath ?? mcpOperationPolicyPath(path.dirname(options.mcpOAuthPolicyPath)),
@@ -1815,7 +1815,7 @@ export function prepareMcpRuntime(options: McpPrepareOptions): McpPrepareResult 
   // prints the authorization URL itself when a login is actually needed.
   const oauthServers = servers.filter((server) => server.oauthPolicy && (mcpLogContext.agent === undefined || server.agent === mcpLogContext.agent));
   if (mcpLogContext.verbose && oauthServers.length > 0) {
-    warn(`mcp: OAuth login for ${[...new Set(oauthServers.map((server) => server.name))].sort().join(", ")} returns through http://localhost:${callbackPort}/callback; open the authorization URL the agent prints to complete it`);
+    warn(`mcp: OAuth login for ${[...new Set(oauthServers.map((server) => server.name))].sort().join(", ")} returns through the session's own loopback callback port; open the authorization URL the agent prints to complete it`);
   }
 
   return {

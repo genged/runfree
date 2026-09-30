@@ -18,10 +18,7 @@
 // bounded retry, and the outcome-to-exit-status mapping.
 
 import { CliError } from "../errors.ts";
-import {
-  createInternalSessionAdmissionDriver,
-  type SessionRunningHook,
-} from "./session-admission-driver.ts";
+import { createInternalSessionAdmissionDriver } from "./session-admission-driver.ts";
 import {
   preparedRuntimeContext,
   StalePreparedRuntimeError,
@@ -45,8 +42,6 @@ export type SessionPublicLaunchInput = Readonly<{
   /** The agent name the command line resolved; must be a built-in. */
   agentName: string;
   foregroundSpawner?: SessionContainerForegroundSpawner;
-  /** Fired once the session is running; `mcp auth` uses it for callback setup. */
-  onSessionRunning?: SessionRunningHook;
   /** Trusted startup finalizer retry used only for valid concurrent drift. */
   reprepare?: () => Promise<PreparedRuntime>;
 }>;
@@ -119,7 +114,6 @@ export type SessionPublicShellInput = Readonly<{
   preparedRuntime: PreparedRuntime;
   io: RuntimeIO;
   foregroundSpawner?: SessionContainerForegroundSpawner;
-  onSessionRunning?: SessionRunningHook;
   reprepare?: () => Promise<PreparedRuntime>;
 }>;
 
@@ -164,7 +158,6 @@ async function withSessionLaunchFrame(
         sessionLockManager,
         io: input.io,
         ...(input.foregroundSpawner ? { foregroundSpawner: input.foregroundSpawner } : {}),
-        ...(input.onSessionRunning ? { onSessionRunning: input.onSessionRunning } : {}),
       });
       const outcome = await launch(driver);
       return typeof outcome.status === "number" ? outcome.status : 1;

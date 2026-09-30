@@ -19,7 +19,6 @@ import {
   runAdminAction,
 } from "../packages/cli/src/admin/options.ts";
 import { projectHash } from "../packages/cli/src/project-identity.ts";
-import { mcpOAuthCallbackPort } from "../packages/cli/src/runtime/mcp.ts";
 import { flushWarnings } from "../packages/cli/src/warnings.ts";
 
 const repoRoot = path.resolve(new URL("..", import.meta.url).pathname);
@@ -738,7 +737,7 @@ describe("admin MCP runtime preparation", () => {
     expect(approve.stderr).toContain("conflicts with an imported user MCP server");
   });
 
-  test("prepare pins the deterministic callback port for OAuth-capable Claude servers and registers public servers as OAuth resources", async () => {
+  test("prepare leaves the callback port to the session for OAuth-capable Claude servers and registers public servers as OAuth resources", async () => {
     writeClaudeNative({
       mcpServers: {
         // Public remote HTTP server that advertises OAuth dynamically at runtime.
@@ -761,16 +760,17 @@ describe("admin MCP runtime preparation", () => {
     const result = await runAdmin(() => prepareRuntime());
     expect(result.status, result.stderr).toBe(0);
 
-    const port = mcpOAuthCallbackPort(projectRoot);
     const generated = readClaudeGenerated().mcpServers as Record<string, {
       oauth?: { callbackPort?: number; authServerMetadataUrl?: string };
     }>;
 
-    // Public + declared-OAuth servers pin the Runfree-computed callback port so
-    // Claude does not fall back to a random loopback port the bridge can't reach.
-    expect(generated.posthog.oauth?.callbackPort).toBe(port);
-    expect(generated.sentryClaude.oauth?.callbackPort).toBe(port);
-    // Declared OAuth metadata is preserved alongside the pinned port.
+    // No shared callback port: the pinned Claude prefers `oauth.callbackPort`
+    // over the session adapter's MCP_OAUTH_CALLBACK_PORT, and each session owns
+    // its own forwarded port, so a projected port would route every session's
+    // login to one port.
+    expect(generated.posthog.oauth?.callbackPort).toBeUndefined();
+    expect(generated.sentryClaude.oauth?.callbackPort).toBeUndefined();
+    // Declared OAuth metadata is preserved.
     expect(generated.sentryClaude.oauth?.authServerMetadataUrl).toBe("https://sentry.io/.well-known/oauth-authorization-server");
     // Static-header servers never run OAuth: no callback port, no leaked token.
     expect(generated.staticMcp.oauth).toBeUndefined();
@@ -1026,8 +1026,8 @@ describe("admin MCP runtime preparation", () => {
       },
     });
     const codex = readCodexGenerated();
-    expect(codex).toContain("mcp_oauth_callback_port = ");
-    expect(codex).toContain('mcp_oauth_callback_url = "http://localhost:');
+    expect(codex).not.toContain("mcp_oauth_callback_port");
+    expect(codex).not.toContain("mcp_oauth_callback_url");
     expect(codex).toContain("[mcp_servers.sentry]");
     expect(codex).toContain("oauth = true");
     expect(codex).toContain('oauth_resource = "https://mcp.sentry.dev/mcp"');

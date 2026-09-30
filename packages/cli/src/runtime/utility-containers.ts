@@ -30,12 +30,6 @@ export type InternalNetworkParticipantInput = {
   // participant. Session containers and ephemeral helpers join transiently and
   // are validated by admission / the helper contract, not here.
   attached: DockerContainerInspect[];
-  // The deterministic MCP OAuth callback port, so the per-session
-  // mcp-callback ingress forwarder can be held to publishing and forwarding
-  // exactly that port.
-  callbackRelay?: {
-    port: string;
-  };
   internalNetwork: string;
   projectId: string;
   proxy: DockerContainerInspect;
@@ -51,6 +45,23 @@ const INGRESS_TARGET_PATTERN = /^[A-Za-z0-9_.-]+$/;
 // never a container name, so a stale or hardwired target is rejected rather
 // than silently forwarded.
 const IPV4_PATTERN = /^(?:\d{1,3}\.){3}\d{1,3}$/;
+// Session-owned MCP OAuth callbacks (decisions 2026-09-30): each forwarder is
+// bound to exactly one session by these env entries, in the callback port
+// block Runfree allocates from.
+const CALLBACK_SESSION_ID_ENV = "RUNFREE_CALLBACK_SESSION_ID";
+const CALLBACK_SESSION_CONTAINER_ENV = "RUNFREE_CALLBACK_SESSION_CONTAINER";
+const SESSION_ID_LABEL = "io.runfree.session-id";
+const SESSION_ID_PATTERN = /^rf-[0-9]{8}-[a-z0-9]{6,32}$/;
+const FULL_CONTAINER_ID_PATTERN = /^[a-f0-9]{64}$/;
+const CALLBACK_PORT_MIN = 47100;
+const CALLBACK_PORT_MAX = 48099;
+const SINGLE_VALUED_CALLBACK_ENV = [
+  "INGRESS_HOST_PORT",
+  "INGRESS_TARGET",
+  "INGRESS_TARGET_PORT",
+  CALLBACK_SESSION_ID_ENV,
+  CALLBACK_SESSION_CONTAINER_ENV,
+] as const;
 
 function hasProjectRole(container: DockerContainerInspect, projectId: string, role: string): boolean {
   const labels = container.Config?.Labels ?? {};
@@ -197,11 +208,7 @@ function validateIngressForwarder(
   input: InternalNetworkParticipantInput,
   purpose: IngressPurpose,
   hostPort: string,
-  sessionAgentIps: readonly string[],
-  options: Readonly<{
-    requireLiveMcpTarget?: boolean;
-    requireRunning?: boolean;
-  }> = {},
+  sessionAgents: readonly DockerContainerInspect[],
 ): UtilityTopologyIssue[] {
   const issues: UtilityTopologyIssue[] = [];
   const name = containerName(container);
@@ -217,7 +224,7 @@ function validateIngressForwarder(
     issues.push(issue("utility-ingress-forwarder-shape", message, detail));
   };
 
-  if (options.requireRunning !== false && container.State?.Running !== true) {
+  if (container.State?.Running !== true) {
     invalid(`ingress forwarder ${name} must be running`);
   }
   if (container.Config?.Image !== INGRESS_FORWARDER_IMAGE) {
@@ -267,27 +274,44 @@ function validateIngressForwarder(
   if (!isPortNumber(env.INGRESS_TARGET_PORT)) invalid(`ingress forwarder ${name} must set a numeric INGRESS_TARGET_PORT`);
   if (!commandUsesKnownIngressSocatShape(container)) invalid(`ingress forwarder ${name} must run the known socat forwarder command`);
 
-  // Purpose-specific: the mcp-callback forwarder (hop 1 of the two-hop callback)
-  // publishes the deterministic callback port and targets the *live session's*
-  // internal IPv4 — never a hardwired or name-based target. vnc/port carry no
-  // extra shape here:
-  // their target correctness is owned by the creating command, and this
-  // validator cannot know a session's dynamic identity for those.
+  // Purpose-specific: the mcp-callback forwarder (hop 1 of a session's
+  // callback) must be bound to exactly one live session and route only to it:
+  // same port on both hops, inside the callback block, targeting the internal
+  // IPv4 of the running session container it names, whose session-id label
+  // matches its binding. An unbound forwarder (from before session-owned
+  // callbacks) is refused, never reinterpreted as ownership evidence; the
+  // admission preflight reclaims it. vnc/port carry no extra shape here: their
+  // target correctness is owned by the creating command.
   if (purpose === "mcp-callback") {
-    const callbackPort = input.callbackRelay?.port;
-    if (callbackPort !== undefined && hostPort !== callbackPort) {
-      invalid(`mcp-callback forwarder ${name} must publish the callback port ${callbackPort}`, `got ${hostPort}`);
+    for (const key of SINGLE_VALUED_CALLBACK_ENV) {
+      const count = stringList(container.Config?.Env).filter((entry) => entry.startsWith(`${key}=`)).length;
+      if (count > 1) invalid(`mcp-callback forwarder ${name} must set ${key} once`, `got ${count}`);
     }
-    if (callbackPort !== undefined && env.INGRESS_TARGET_PORT !== callbackPort) {
-      invalid(`mcp-callback forwarder ${name} must forward to the callback port ${callbackPort}`, `got ${env.INGRESS_TARGET_PORT || "<none>"}`);
+    if (env.INGRESS_TARGET_PORT !== hostPort) {
+      invalid(`mcp-callback forwarder ${name} must forward to the port it publishes`, `got ${env.INGRESS_TARGET_PORT || "<none>"} for ${hostPort}`);
+    }
+    const port = Number(hostPort);
+    if (!Number.isInteger(port) || port < CALLBACK_PORT_MIN || port > CALLBACK_PORT_MAX) {
+      invalid(`mcp-callback forwarder ${name} must publish a callback port in ${CALLBACK_PORT_MIN}-${CALLBACK_PORT_MAX}`, `got ${hostPort}`);
     }
     const target = env.INGRESS_TARGET ?? "";
+    const boundSession = env[CALLBACK_SESSION_ID_ENV];
+    const boundContainer = env[CALLBACK_SESSION_CONTAINER_ENV];
     if (!IPV4_PATTERN.test(target)) {
       invalid(`mcp-callback forwarder ${name} must target a session IPv4 address, not a name`, `got ${target || "<none>"}`);
-    } else if (options.requireLiveMcpTarget !== false && !sessionAgentIps.includes(target)) {
-      // A hardwired or stale target (a session that has since ended) points
-      // the callback at no live session.
-      invalid(`mcp-callback forwarder ${name} must target a live session's internal IP`, `got ${target}`);
+    } else if (boundSession === undefined || boundContainer === undefined) {
+      invalid(`mcp-callback forwarder ${name} must be bound to its owning session`, `got an unbound forwarder targeting ${target}`);
+    } else if (!SESSION_ID_PATTERN.test(boundSession) || !FULL_CONTAINER_ID_PATTERN.test(boundContainer)) {
+      invalid(`mcp-callback forwarder ${name} has a malformed session binding`);
+    } else {
+      const owner = sessionAgents.find((candidate) => candidate.Id === boundContainer);
+      if (!owner
+        || owner.Config?.Labels?.[SESSION_ID_LABEL] !== boundSession
+        || owner.NetworkSettings?.Networks?.[input.internalNetwork]?.IPAddress !== target) {
+        // A stale route (its session has ended) or one that names a container
+        // it does not reach points the callback at no live owner.
+        invalid(`mcp-callback forwarder ${name} must target its own live session's internal IP`, `got ${target} for session ${boundSession}`);
+      }
     }
   }
 
@@ -344,13 +368,14 @@ export function validateInternalNetworkParticipants(input: InternalNetworkPartic
   const issues: UtilityTopologyIssue[] = [];
   let sawProxy = false;
 
-  // The live sessions' internal IPs, so an mcp-callback forwarder can be
-  // checked to target one of them (never a hardwired or stale address). Read
-  // from the same inspected set, so no registry or Docker access is needed here.
-  const sessionAgentIps = input.attached
-    .filter((container) => hasProjectRole(container, input.projectId, "session-agent"))
-    .map((container) => container.NetworkSettings?.Networks?.[input.internalNetwork]?.IPAddress)
-    .filter((ip): ip is string => typeof ip === "string");
+  // The live session containers, so an mcp-callback forwarder can be checked
+  // to route to exactly its own session (never a hardwired or stale address).
+  // Read from the same inspected set, so no registry or Docker access is
+  // needed here.
+  const sessionAgents = input.attached
+    .filter((container) => hasProjectRole(container, input.projectId, "session-agent")
+      && container.State?.Running === true);
+  const callbackOwners = new Map<string, string>();
   for (const container of input.attached) {
     if (sameContainer(container, input.proxy)) {
       sawProxy = true;
@@ -359,7 +384,20 @@ export function validateInternalNetworkParticipants(input: InternalNetworkPartic
 
     const ingress = maybeIngressForwarder(container, input.projectId);
     if (ingress) {
-      issues.push(...validateIngressForwarder(container, input, ingress.purpose, ingress.hostPort, sessionAgentIps));
+      issues.push(...validateIngressForwarder(container, input, ingress.purpose, ingress.hostPort, sessionAgents));
+      if (ingress.purpose === "mcp-callback") {
+        const boundSession = envMap(container)[CALLBACK_SESSION_ID_ENV];
+        const earlier = boundSession === undefined ? undefined : callbackOwners.get(boundSession);
+        if (earlier !== undefined) {
+          issues.push(issue(
+            "utility-ingress-forwarder-shape",
+            `session ${boundSession} must own at most one mcp-callback forwarder`,
+            `got ${earlier} and ${containerName(container)}`,
+          ));
+        } else if (boundSession !== undefined) {
+          callbackOwners.set(boundSession, containerName(container));
+        }
+      }
       continue;
     }
     // Transient participants are legitimate but not validated here: a session

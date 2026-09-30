@@ -19,7 +19,6 @@ import {
   type DenyProbeSpec,
   failDenyProbeBatch,
 } from "./deny-probe-batch.ts";
-import { mcpOAuthCallbackPort } from "./mcp.ts";
 import { validateInternalNetworkParticipants } from "./utility-containers.ts";
 import type {
   DockerContainerInspect,
@@ -446,9 +445,6 @@ export function validateRuntimeTopologyWithProof(
     } else {
       const participantIssues = validateInternalNetworkParticipants({
         attached: attachedInspect,
-        callbackRelay: {
-          port: String(mcpOAuthCallbackPort(context.projectRoot)),
-        },
         internalNetwork,
         projectId,
         proxy,
