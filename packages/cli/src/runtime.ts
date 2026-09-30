@@ -72,6 +72,7 @@ import {
 } from "./runtime/ingress-forwarder-ownership.ts";
 import { createRuntimePlan } from "./runtime/plan.ts";
 import { failClosedSpawnStatus } from "./runtime/spawn-status.ts";
+import { createDockerApiCapture, type DockerApiCapture } from "./runtime/docker-api/transport.ts";
 import { planRuntimeUpgradeFromV2State, startRuntime } from "./runtime/startup.ts";
 import type {
   CaptureResult,
@@ -98,10 +99,22 @@ function run(command: string, args: string[], options: childProcess.SpawnSyncOpt
   return result.status ?? 1;
 }
 
+let dockerApiCapture: DockerApiCapture | undefined;
+
 function capture(command: string, args: string[], options: childProcess.SpawnSyncOptions = {}): CaptureResult {
+  // A fixed allowlist of hot `docker` argv shapes is answered over the Engine
+  // API socket with CLI-identical output; every other call, and every doubt,
+  // stays on the CLI below (see runtime/docker-api/transport.ts).
+  let spawnOptions = options;
+  if (command === "docker") {
+    dockerApiCapture ??= createDockerApiCapture();
+    const outcome = dockerApiCapture(command, args, options);
+    if (outcome.routed) return outcome.result;
+    if (outcome.timeout !== undefined) spawnOptions = { ...options, timeout: outcome.timeout };
+  }
   const result = childProcess.spawnSync(command, args, {
     encoding: "utf8",
-    ...options,
+    ...spawnOptions,
   });
   return {
     ...failClosedSpawnStatus(result),

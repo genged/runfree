@@ -1,6 +1,6 @@
 SHELL := /bin/bash
 
-.PHONY: help test test-all test-release test-static test-unit test-agent test-proxy test-security test-templates test-cli-e2e test-cli-e2e-live test-runtime test-runtime-core test-runtime-extended test-runtime-smoke test-runtime-live test-runtime-live-topology test-runtime-live-managed-launch test-runtime-live-egress test-runtime-live-connect-guard test-runtime-live-request-shape test-runtime-live-audit test-runtime-live-allowlist test-runtime-live-policy-mutation test-runtime-live-helper-reclaim test-live-session-admission-docker-desktop test-live-session-admission-orbstack test-live-session-admission-negative-docker-desktop test-live-session-admission-negative-orbstack test-live-session-admission-attached-docker-desktop test-live-session-admission-attached-orbstack test-live-session-renewal-docker-desktop test-live-session-renewal-orbstack test-live-session-independence-docker-desktop test-live-session-independence-orbstack test-live-session-admission-crash-docker-desktop test-live-session-admission-crash-orbstack test-live-session-admission-drift-docker-desktop test-live-session-admission-drift-orbstack reclaim-runtime-sandbox reclaim-runtime-sandbox-apply test-watch
+.PHONY: help test test-all test-release test-static test-unit test-agent test-proxy test-security test-templates test-cli-e2e test-cli-e2e-live test-runtime test-runtime-core test-runtime-extended test-runtime-smoke test-runtime-live test-runtime-live-topology test-runtime-live-managed-launch test-runtime-live-egress test-runtime-live-connect-guard test-runtime-live-request-shape test-runtime-live-audit test-runtime-live-allowlist test-runtime-live-policy-mutation test-runtime-live-helper-reclaim test-runtime-live-docker-transport test-live-session-admission-docker-desktop test-live-session-admission-orbstack test-live-session-admission-negative-docker-desktop test-live-session-admission-negative-orbstack test-live-session-admission-attached-docker-desktop test-live-session-admission-attached-orbstack test-live-session-renewal-docker-desktop test-live-session-renewal-orbstack test-live-session-independence-docker-desktop test-live-session-independence-orbstack test-live-session-admission-crash-docker-desktop test-live-session-admission-crash-orbstack test-live-session-admission-drift-docker-desktop test-live-session-admission-drift-orbstack reclaim-runtime-sandbox reclaim-runtime-sandbox-apply test-watch
 
 help:
 	@printf '%s\n' \
@@ -24,6 +24,7 @@ help:
 		'  make test-runtime-live    Run the migrated non-admission live tranches only (TEST_RUNTIME_BACKEND, default docker-desktop)' \
 		'  make test-runtime-live-<tranche>  One migrated tranche: topology|managed-launch|egress|connect-guard|request-shape|audit|allowlist|policy-mutation' \
 		'  make test-runtime-live-helper-reclaim  Ephemeral-helper tranche: bounded runs, exact-id reclaim, the pinned helper address' \
+		'  make test-runtime-live-docker-transport  Engine API transport: CLI-equal answers for every routed docker argv' \
 		'  make test-live-session-admission-docker-desktop  Run every standalone admission tranche on Docker Desktop' \
 		'  make test-live-session-admission-orbstack  Run every standalone admission tranche on OrbStack' \
 		'  make test-live-session-admission-negative-<backend>  Negative refusal tranche only' \
@@ -173,6 +174,11 @@ test-runtime-extended:
 # credential changes still need the full gate.
 test-runtime-smoke:
 	TEST_RUNTIME_BACKEND=$(TEST_RUNTIME_BACKEND) pnpm exec vitest run --project runtime-live runtime-topology
+
+# The Engine API transport's equivalence proof alone: every routed docker argv
+# answered by the transport and by the real Docker CLI, byte for byte.
+test-runtime-live-docker-transport:
+	TEST_RUNTIME_BACKEND=$(TEST_RUNTIME_BACKEND) pnpm exec vitest run --project runtime-live docker-transport-equivalence
 
 # Standalone live tranches, provisioning their own minimal fixture instead of
 # running behind the cumulative sandbox.

@@ -263,6 +263,12 @@ Details: [Write Approval Grants](architecture.md#write-approval-grants).
    nothing.
 4. `runfree stop` and `runtime reload-policy` need `--force` while live or
    unknown sessions, a pending rebind, or an interrupted teardown exist.
+5. The Docker Engine API transport contacts only the daemon the Docker CLI
+   would contact, over a local Unix socket, and only with the fixed read and
+   exec requests its routes build. No argv value, project file, or agent
+   output selects the socket, the method, or the endpoint. An answer it
+   cannot give exactly as the CLI would goes to the CLI, and a started exec
+   is never re-run. See [Docker Access](architecture.md#docker-access).
 
 ## What Runfree Does Not Prove
 
