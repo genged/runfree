@@ -259,6 +259,25 @@ Details: [Write Approval Grants](architecture.md#write-approval-grants).
    the proxy mediates for that server. The hosts live in host-owned state, not
    in desired policy, and stop applying when the reviewed server config
    changes. `runfree mcp revoke` removes exactly them.
+8. **Revoke clears the proxy's OAuth state for the server.** Revoke first
+   saves a new random state epoch for the server in host-owned state. Every
+   policy publishes an epoch for each MCP OAuth server. The proxy stamps
+   handles and discovered endpoints with it, deletes state from any other
+   epoch before it applies a policy, and refuses a stale handle at use. A
+   token response from an exchange that started before the revoke is
+   blocked, not stored. The clear works when no proxy runs (it happens at the
+   next start). Revoke says "cleared" only when the running proxy confirmed
+   the exact policy generation. A damaged or missing epoch record clears the
+   OAuth state of every MCP server.
+9. **Protocol reads are exact.** On an `ask` host, a POST is a read, with no
+   approval, only when its exact path (no normalization, query, or encoding)
+   is a token or registration endpoint that `mcp enable` recorded for one
+   server, the proxy mediates it for that server alone, and the body is a
+   plain login, refresh, or loopback-only client registration with no field
+   an issuer may fetch. Each server gets at most 30 a minute. Everything else
+   on the host stays a write. A request that selected the unmediated proxy
+   rule while its endpoint became mediated is refused, so a token never
+   reaches the agent unmediated.
 
 ### Agent Container
 
@@ -378,7 +397,8 @@ Accepted, known risks:
 | Credentialless operational services (`agent-claude`, `agent-codex`) are open to any process in the agent | The user confirms them at launch; they carry no proxy credential |
 | Project image builds run before the sandbox exists | The build uses host Docker networking; review Dockerfiles and wide contexts (`runfree image approve-context`) |
 | `mcp enable` discovery tells the named host that you ran it (your IP and the time) | It asks first for project entries and sends no credentials; `--no-discover` makes no call |
-| An `--oauth-host` host is allowed like `host add`, and a request rule path prefix also admits sub-paths the proxy does not mediate (for example `/oauth/token/`) | The user named the host; discovered hosts get exact-endpoint rules, and token requests still follow write approval |
+| An `--oauth-host` host is allowed like `host add`, and a request rule path prefix also admits sub-paths the proxy does not mediate (for example `/oauth/token/`) | The user named the host; discovered hosts get exact-endpoint rules, and a sub-path or an unrecorded endpoint still follows write approval |
+| Login, refresh, and client registration at a recorded, mediated endpoint run without approval | The issuer was reviewed at `mcp enable`; bodies are limited to the protocol's own fields and 16 KiB, responses become handles, and each server gets 30 a minute. The agent can still register a client with a loopback redirect or send its own authorization code |
 | Audit mode allows non-listed hosts for a time window | It is explicit (`up --audit-network`) and never edits policy |
 | Audited WSS upgrades pass configured credential headers as-is | The WebSocket passthrough cannot rewrite upgrade headers; enforce mode is not affected |
 | Checkout binding cannot tell apart volumes mounted at the same path | It is a scope key, not an authority; see [Checkout Binding](architecture.md#checkout-binding) |

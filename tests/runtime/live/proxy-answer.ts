@@ -35,6 +35,10 @@ export type ProbeAnswer = Readonly<{
 
 export type CurlProbeOptions = Readonly<{
   method?: string;
+  /** Request body, sent as-is (curl adds Content-Length). */
+  body?: string;
+  /** Extra request headers, as `Name: value`. */
+  headers?: readonly string[];
   maxTimeSeconds: number;
   /** Retries transient failures; an upstream's 408/429/5xx is retried too. */
   retries?: number;
@@ -53,7 +57,10 @@ export function curlProbeCommand(url: string, options: CurlProbeOptions): string
   if (options.retries !== undefined) flags.push("--retry", String(options.retries), "--retry-delay", "1", "--retry-all-errors");
   flags.push("--max-time", String(options.maxTimeSeconds));
   if (options.method !== undefined) flags.push("-X", options.method);
-  return `curl ${flags.join(" ")} -D - -o /dev/null -w '\\n${CODE_MARKER}%{http_code}\\n' '${url.replaceAll("'", "'\\''")}'`;
+  const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
+  for (const header of options.headers ?? []) flags.push("-H", quote(header));
+  if (options.body !== undefined) flags.push("--data-raw", quote(options.body));
+  return `curl ${flags.join(" ")} -D - -o /dev/null -w '\\n${CODE_MARKER}%{http_code}\\n' ${quote(url)}`;
 }
 
 /**

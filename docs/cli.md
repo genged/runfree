@@ -399,8 +399,18 @@ discovery is limited to GET, HEAD, OPTIONS, and POST on paths that start with
 `/.well-known` or one of its OAuth endpoint paths. The
 proxy mediates those endpoints, so the agent sees only `runfree_oauth_*`
 handles. The browser sign-in page opens on your computer and is never
-allowlisted. Token requests follow the project's write approval setting
-(default `ask`).
+allowlisted.
+
+Login and refresh do not wait for write approval. On an `ask` host, a POST to
+exactly one of the token or registration endpoints that discovery recorded for
+this server is an OAuth protocol read, but only while the proxy mediates that
+endpoint for this server alone. The body must be a plain login or refresh
+(`authorization_code` or `refresh_token` form grant), or a client registration
+whose redirect URIs are loopback `http` URLs only, with no other URL field. Any
+other method, path (sub-paths too), query, body, an endpoint that another
+server also uses, and an `--oauth-host` host with no recorded endpoint follow
+the project's write approval setting. A host set to `deny` stays denied. Each
+server gets at most 30 such reads a minute; after that, they need approval.
 
 | Option | Meaning |
 | --- | --- |
@@ -419,6 +429,24 @@ changes, or a user entry is deleted, its hosts stop applying. `runfree mcp
 revoke <agent> <server>` removes exactly the hosts that `enable` added. A host
 that desired policy, a service, or another enabled MCP server also names stays
 allowed. `runfree mcp explain` lists the recorded hosts and endpoints.
+
+`runfree mcp revoke` also clears the proxy's OAuth state for the server: its
+tokens, its `runfree_oauth_*` handles, and the issuers and endpoints the proxy
+found at run time. It does this for every source of that agent and server
+name, including user and local entries. A later `mcp enable` needs a new
+login. Revoke prints one of these lines:
+
+| Line | Meaning |
+| --- | --- |
+| `proxy OAuth state for <agent> <server>: cleared (...)` | The running proxy confirmed that it applied the policy that clears the state. |
+| `...: not cleared yet; the proxy clears it when it next starts ...` | No proxy runs now. The clear is saved and happens at the next start. |
+| `...: not proven cleared; ...` | A proxy runs, but it did not confirm the clear (for example, it is from an older Runfree version). It happens when the proxy next starts on this version. |
+
+If Runfree finds its record of cleared servers damaged or missing, it clears
+the OAuth state of every MCP server, and each server needs a new login. A
+damaged record also prints a warning. The first start after an upgrade to a
+version with this feature creates the record, so each MCP OAuth server needs
+one new login then.
 
 ## Dependency Overlays
 

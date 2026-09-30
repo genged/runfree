@@ -1195,8 +1195,9 @@ host allowlist -> request shape -> write class -> write action -> credential -> 
 
 A request that fails a step reads no token, does no OAuth mediation, and
 opens no upstream connection. One exception: for a non-read request to a
-declared GraphQL endpoint on an `ask`/`deny` host, and for MCP POST/DELETE,
-the proxy reads the request body locally before the shape check, because
+declared GraphQL endpoint on an `ask`/`deny` host, for MCP POST/DELETE, and
+for a POST to a recorded OAuth protocol-read endpoint on an `ask` host, the
+proxy reads the request body locally before the shape check, because
 classification needs it.
 
 **Request shape.**
@@ -1218,6 +1219,32 @@ WebSocket upgrades (under `ask`/`deny`), a method-override header, git push,
 other than GET/HEAD/OPTIONS. `readPathPrefixes` and the git upload-pack
 exemption make some POSTs reads; path confusion cancels those exemptions. MCP
 tool calls are classified by operation policy.
+
+**OAuth protocol reads.** On an `ask` host (never `deny`), a POST is a read
+when the OAuth mediator proves it is an exchange it mediates
+([oauth-protocol-read.ts](../packages/proxy/src/oauth-protocol-read.ts),
+`OAuthMediator.protocolReadEndpoint`):
+
+- the request selected the response-mediating proxy rule;
+- its raw path, compared byte for byte before any URL normalization, with no
+  query, percent-encoding, `;`, `//`, or dot segment, is in exactly one MCP
+  provider's `protocolReadEndpoints`. The host sets that list only from the
+  server's `mcp enable` record endpoints that became static token or
+  registration endpoints of that provider (not shared, on a bound host), and
+  the contract refuses any other entry;
+- no other provider, MCP or service, static or discovered at run time, would
+  mediate the URL, and the mediator's own selection is that provider;
+- the body is protocol-shaped: an identity-encoded body with a
+  `Content-Length` of at most 16 KiB; a form `authorization_code` or
+  `refresh_token` grant with only the standard fields and a loopback redirect;
+  or a JSON dynamic client registration with loopback `http` redirect URIs and
+  no URI field an issuer may fetch;
+- the provider's budget (30 a minute) is not spent.
+
+Every write rule above runs first. The mediator re-checks the match before it
+swaps any handle. A token or registration request that selected the plain
+rule but whose endpoint became mediated in the meantime is refused, so its
+response never reaches the agent unmediated.
 
 **Holds.** Under `ask` the proxy holds the request for
 `runtime.writeApprovalHoldSeconds` (default 120 s, range 5–300 s), with at
@@ -1450,7 +1477,8 @@ Runfree imports supported Claude and Codex MCP entries into sanitized per-agent 
 - Project `.mcp.json` and `.codex/config.toml` entries are imported only after `runfree mcp approve`.
 - Static headers require a host-owned credential source.
 - OAuth login works from any session: every session with an OAuth-capable approved server gets its own loopback callback path ([Session MCP OAuth Callbacks](#session-mcp-oauth-callbacks)). `runfree mcp auth` and `runfree mcp approve --login` are shortcuts that launch a session and print the login steps.
-- `runfree mcp enable` combines the approval, the credential source, and the server's OAuth hosts in one review. OAuth hosts come from host-side discovery ([mcp-discovery.ts](../packages/cli/src/admin/mcp-discovery.ts): HTTPS GET to public, checked addresses only, pinned connection, no redirects, credentials, or proxy) or from `--oauth-host`. They are stored in a host-owned record (`mcp-enabled.json` in project state, [mcp-enabled.ts](../packages/cli/src/runtime/mcp-enabled.ts)), keyed like MCP rules: the descriptor digest for project entries, the endpoint for user and local entries. The effective preparation projects each matching record beside the server's endpoint host, into the same host-only policy copy, never into desired policy. A host that only a discovered record allows gets request rules for `/.well-known` and the record's endpoint paths (prefix match), and those endpoints join the server's OAuth mediation policy as static token and registration endpoints, except an endpoint another server also claims: the proxy files tokens under the first matching server, so a shared endpoint is left to run-time mediation. An invalid record grants nothing; the next `enable` or `revoke` rewrites the file without it. `runfree mcp revoke` deletes the server's records, so the projection, a union over records, drops exactly its hosts.
+- `runfree mcp enable` combines the approval, the credential source, and the server's OAuth hosts in one review. OAuth hosts come from host-side discovery ([mcp-discovery.ts](../packages/cli/src/admin/mcp-discovery.ts): HTTPS GET to public, checked addresses only, pinned connection, no redirects, credentials, or proxy) or from `--oauth-host`. They are stored in a host-owned record (`mcp-enabled.json` in project state, [mcp-enabled.ts](../packages/cli/src/runtime/mcp-enabled.ts)), keyed like MCP rules: the descriptor digest for project entries, the endpoint for user and local entries. The effective preparation projects each matching record beside the server's endpoint host, into the same host-only policy copy, never into desired policy. A host that only a discovered record allows gets request rules for `/.well-known` and the record's endpoint paths (prefix match), and those endpoints join the server's OAuth mediation policy as static token and registration endpoints, except an endpoint another server also claims: the proxy files tokens under the first matching server, so a shared endpoint is left to run-time mediation. An invalid record grants nothing; the next `enable` or `revoke` rewrites the file without it. `runfree mcp revoke` deletes the server's records, so the projection, a union over records, drops exactly its hosts. The recorded endpoints that become static mediated endpoints are also published as the provider's `protocolReadEndpoints` (see OAuth protocol reads under [Proxy Enforcement Details](#proxy-enforcement-details)).
+- `runfree mcp revoke` clears the proxy's OAuth state for the server (handles, the tokens behind them, discovered issuers and endpoints, all in the `runfree-oauth-state` volume). Before it changes anything else, it writes a new random epoch for the provider id (`mcp:<agent>-<server>`) to a host-owned tombstone store, `mcp-oauth-epochs.json` in project state ([mcp-oauth-epochs.ts](../packages/cli/src/runtime/mcp-oauth-epochs.ts)). Every effective preparation publishes a `stateEpoch` for each MCP OAuth provider: its own after a revoke, else the store's `base`. The proxy stamps new handles and discovered entries with it; `activatePairedPolicy` deletes state from another epoch (and for providers the policy no longer names) before the policy applies, and a failed prune fails the reload. Use sites refuse state from another epoch, and a token response whose exchange began before an activation is checked against the policy current when the body arrives. A missing or invalid store gets a new `base`, which clears all MCP OAuth state once. The request-proxy status carries `oauthStateEpochs: 1`; revoke prints "cleared" only when the live status names the converged effective policy generation, carries that marker, and the generation publishes the new epoch or omits the provider ([mcp-oauth-clear.ts](../packages/cli/src/admin/mcp-oauth-clear.ts)). A rotated refresh token also retires the handle of the old one, and each provider keeps at most 256 handles.
 - Side-effecting MCP tool calls use the same write-approval posture as outbound writes and can be governed with `runfree mcp rules`. This covers HTTP MCP servers, whose calls pass the proxy. STDIO servers run inside the agent container and their calls do not pass the proxy.
 
 ### Codex Desktop Built-ins
