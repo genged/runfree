@@ -93,8 +93,12 @@ import {
   sessionContainerCreateCommand,
   sessionContainerInspectCommand,
   sessionContainerObservedExitStatus,
+  parseSessionContainerTopHandoff,
+  SESSION_CONTAINER_TOP_MAX_BYTES,
   sessionContainerStartAttachCommand,
+  sessionContainerTopCommand,
   sessionNetworkInspectCommand,
+  type SessionContainerTopHandoff,
   type SessionDockerCommand,
 } from "./session-container-docker.ts";
 import {
@@ -120,6 +124,7 @@ import {
 } from "./session-container-start.ts";
 import {
   bindSessionContainerCreatePlanRecord,
+  sessionContainerTemplateInit,
   type SessionContainerCreatePlan,
 } from "./session-container-template.ts";
 import {
@@ -291,6 +296,19 @@ const FOREGROUND_EXIT_BRIDGE_TIMEOUT_MS = 1_000;
 // nothing earlier: the proof still requires the same exact running assertion,
 // and no session is authorized before it returns.
 const RUNNING_PROOF_TIMEOUT_MS = 30_000;
+/**
+ * The longest a launch holds the project lifecycle lock after its grant while
+ * waiting for the session entry to hand off to the agent (`awaitHandoff`).
+ *
+ * Fixed, and far inside the window another command waits for the same lock
+ * (`PROJECT_LIFECYCLE_LOCK_RETRY_WINDOW_MS`, pinned by a unit test at no more
+ * than a third of it): an entry that never hands off — the project image may
+ * replace it — must never make a concurrent launch, `up`, or `destroy` in the
+ * same project give up. A healthy handoff takes well under a second.
+ */
+export const SESSION_HANDOFF_WAIT_CEILING_MS = 10_000;
+/** How often the handoff wait asks the daemon for the container's processes. */
+const SESSION_HANDOFF_POLL_MS = 100;
 
 class PostCompletionAdmissionRecoveryError extends Error {
   readonly outcome: SessionAdmissionLaunchOutcome;
@@ -427,6 +445,11 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
    * the `attached` record that admission produced.
    */
   #fileRecord?: SessionContainerRecordV2;
+  /**
+   * The provisioning-running record whose session file `activate` wrote, held
+   * until `awaitHandoff` reports it `attached`.
+   */
+  #admittedRecord?: SessionContainerRecordV2;
   /**
    * The last session file this host actually published.
    *
@@ -1561,7 +1584,8 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
    * leaves this session in the state its evidence supports:
    *
    *   written      authority granted; the durable record follows the file to
-   *                `attached` and the host stamps the lease it handed out;
+   *                `attached`, and the host stamps the lease it handed out,
+   *                once the entry has handed off (`awaitHandoff`);
    *   unavailable  the observation could not be made, so nothing was written
    *                and nothing is claimed — raised as the typed observation
    *                failure the launch ladder already fails closed on;
@@ -1591,10 +1615,25 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
         `session admission inspected a different container before granting authority: ${outcome.observation}`,
       );
     }
-    // The file now exists. Everything below it can still fail, and a failure
-    // that left the file behind would be a session the proxy serves under a
-    // record this launch is about to tear down — so the window is closed here
-    // rather than left to the caller's teardown to notice.
+    // The file now exists, and from here every failure takes it back through
+    // the ordered teardown (file first): `#fileMayExist` already routes the
+    // ladder there. The durable record stays provisioning-running until the
+    // entry has handed off (`awaitHandoff`).
+    this.#fileWritten = outcome.file;
+    this.#admittedRecord = record;
+  };
+
+  /**
+   * Reports the admitted session `attached`: the durable record, the plan
+   * bound to it, the host status stamp, and the session-running hook.
+   *
+   * Called once, by `awaitHandoff`, after the entry has handed off (or the
+   * wait has ended without that answer). A failure here would leave a file the
+   * proxy serves under a record this launch is about to tear down, so the
+   * window is closed here rather than left to the caller's teardown to notice.
+   */
+  #confirmAttached = async (record: SessionContainerRecordV2): Promise<void> => {
+    const file = this.#require(this.#fileWritten, "admitted session file");
     try {
       const attached = transitionProvisioningRunningSessionContainerToAttachedV2(record);
       replaceExactSessionContainerRecordV2(
@@ -1606,11 +1645,12 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
       this.#advanceDurableRecord(attached, "provisioning create plan");
       // From here every beat re-proves the record the session actually holds.
       this.#fileRecord = attached;
-      this.#fileWritten = outcome.file;
+      this.#admittedRecord = undefined;
       this.#lock();
-      this.#stampSessionHostStatus(outcome.file, "served");
+      this.#stampSessionHostStatus(file, "served");
       // The hook fires at the one moment it means something: the session holds
-      // authority and is running with a known container id and source IP.
+      // authority, its agent is running, and its container id and source IP
+      // are known.
       const containerId = attached.containerId;
       if (containerId !== undefined && this.#input.onSessionRunning !== undefined) {
         await this.#input.onSessionRunning({ containerId, sourceIp: attached.sourceIp });
@@ -1619,6 +1659,105 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
       this.#deleteSessionFileBestEffort(record);
       throw error;
     }
+  };
+
+  /**
+   * One daemon-side read of whether the entry has handed off. Never throws:
+   * a failed read, an unparseable answer, and a missing anchor are all
+   * `unreadable`, which ends the wait at once rather than holding the lock
+   * over an observation that will not improve.
+   */
+  #observeEntryHandoff(record: SessionContainerRecordV2): SessionContainerTopHandoff {
+    try {
+      const anchor = this.#require(this.#fileAnchor, "session-file anchor");
+      const plan = this.#require(this.#plan, "session-container create plan");
+      const result = executeSessionDockerCommand(
+        sessionContainerTopCommand(record, this.#projectIdentity()),
+        (executable, args) => this.#gateway.io.capture(
+          executable,
+          [...args],
+          this.#dockerOptions(SESSION_CONTAINER_TOP_MAX_BYTES),
+        ),
+      );
+      if (result.status !== 0) return "unreadable";
+      return parseSessionContainerTopHandoff(result.stdout, {
+        anchorPid: anchor.dockerPid,
+        init: sessionContainerTemplateInit(plan.template),
+      });
+    } catch {
+      return "unreadable";
+    }
+  }
+
+  /**
+   * Waits, still holding the lifecycle lock `activate` held, until the session
+   * entry has handed off to the agent, and only then reports `attached`.
+   *
+   * The gap this closes: the proxy serves the session from the moment its file
+   * is written, but the entry execs the agent only once its readiness probe
+   * has seen that. A proxy replacement landing in between — possible as soon
+   * as this launch released the lock — left the entry polling a proxy that no
+   * longer served it, and a recovery slower than the entry's own bound ended
+   * the session with exit 111 before the agent ever ran. Every lifecycle writer
+   * that could replace the proxy needs this lock, so holding it here moves the
+   * replacement after the handoff.
+   *
+   * The wait ends, and `attached` is reported, on the first of:
+   *
+   *   handed-off   the anchored process no longer runs the entry;
+   *   foreground   the foreground stream ended. Nothing is concluded here: the
+   *                attached wait's own lost-stream classification decides
+   *                whether the container exited or only the stream was lost,
+   *                exactly as it did before this step existed;
+   *   unreadable   the daemon's answer cannot say (reported once);
+   *   ceiling      `SESSION_HANDOFF_WAIT_CEILING_MS` (reported once) — the
+   *                project image may replace the entry with one that never
+   *                execs, and no launch may hold the project lock for long.
+   *
+   * The process table read is container-controlled data, so it only ever
+   * decides *when* this launch reports; it grants nothing, and its text is
+   * never echoed.
+   */
+  awaitHandoff = async (): Promise<void> => {
+    this.#lock();
+    // The foreground ended before the grant: there is nothing to attach, and
+    // the attached wait returns that outcome.
+    if (this.#preAttachCompletion) return;
+    const record = this.#require(this.#admittedRecord, "admitted provisioning-running record");
+    const foreground = this.#require(this.#foreground, "foreground attach handle");
+    const startedAt = this.#nowMonotonicMs();
+    let foregroundEnded = false;
+    void foreground.completion.then(() => { foregroundEnded = true; });
+    for (;;) {
+      this.#lock();
+      if (foregroundEnded || currentSessionContainerForegroundCompletion(foreground)) break;
+      const observed = this.#observeEntryHandoff(record);
+      this.#lock();
+      if (observed === "handed-off") break;
+      if (observed === "unreadable") {
+        warn("could not observe the session entry handing off to the agent; reporting the session attached now");
+        break;
+      }
+      const remaining = SESSION_HANDOFF_WAIT_CEILING_MS - (this.#nowMonotonicMs() - startedAt);
+      if (remaining <= 0) {
+        warn(`the session entry did not hand off to the agent within ${SESSION_HANDOFF_WAIT_CEILING_MS} ms; reporting the session attached now (the proxy has not served it yet, or the project image replaces the Runfree session entry)`);
+        break;
+      }
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([
+          foreground.completion,
+          new Promise<void>((resolve) => {
+            timer = setTimeout(resolve, Math.min(SESSION_HANDOFF_POLL_MS, remaining));
+            timer.unref?.();
+          }),
+        ]);
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+    }
+    this.#lock();
+    await this.#confirmAttached(record);
   };
 
   /**
@@ -2170,6 +2309,7 @@ function timedSessionAdmissionLaunchSteps(
     createStarted: timed("admission:create-started", steps.createStarted),
     proveRunning: timed("admission:prove-running", steps.proveRunning),
     activate: timed("admission:activate", steps.activate),
+    awaitHandoff: timed("admission:await-handoff", steps.awaitHandoff),
     cleanupUnadmitted: timed("admission:cleanup-unadmitted", steps.cleanupUnadmitted),
     awaitCompletion: steps.awaitCompletion,
     tearDown: timed("teardown:session-file", steps.tearDown),

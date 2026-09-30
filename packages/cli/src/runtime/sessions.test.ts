@@ -25,6 +25,7 @@ import {
   normalizeSessionName,
   parseActiveAgentSessionsForTest,
   printSessions,
+  PROJECT_LIFECYCLE_LOCK_RETRY_WINDOW_MS,
   projectLifecycleLockPath,
   warnDeferredRuntimeUpgrade,
   readSessionMetadata,
@@ -40,6 +41,7 @@ import {
   writeSessionMetadata,
 } from "./sessions.ts";
 import { flushWarnings } from "../warnings.ts";
+import { SESSION_HANDOFF_WAIT_CEILING_MS } from "./session-admission-driver.ts";
 import type { RuntimeContext, RuntimeIO } from "./types.ts";
 
 const BOOT_A = "linux:11111111-2222-3333-4444-555555555555";
@@ -1345,4 +1347,13 @@ test("a corrupt renewal queue refuses acquisition without wedging the manager, t
   await manager.withLock(work, new AbortController().signal);
   expect(work).toHaveBeenCalledOnce();
   manager.close();
+});
+
+test("a launch's entry-handoff wait holds the lifecycle lock for at most a third of another command's lock wait", () => {
+  // A project image may replace the session entry with one that never execs,
+  // so the handoff wait ends at its ceiling; a concurrent launch, `up`, or
+  // `destroy` in the same project must still get the lock long before it
+  // gives up waiting for it.
+  expect(PROJECT_LIFECYCLE_LOCK_RETRY_WINDOW_MS).toBe(60_000);
+  expect(SESSION_HANDOFF_WAIT_CEILING_MS * 3).toBeLessThanOrEqual(PROJECT_LIFECYCLE_LOCK_RETRY_WINDOW_MS);
 });

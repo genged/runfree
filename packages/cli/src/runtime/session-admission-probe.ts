@@ -78,6 +78,16 @@ export type SessionAdmissionLaunchSteps = SessionAdmissionProbeSteps & Readonly<
   /** Grants the session ordinary proxy authority. First point it has any. */
   activate(): Promise<void>;
   /**
+   * Reports the session `attached` once its entry has handed off to the agent.
+   *
+   * Runs under the same lifecycle lock as `activate`, so no proxy replacement
+   * or restore can land between the grant and the entry's exec — the window in
+   * which a still-gated entry could be left polling a proxy that no longer
+   * serves it. Bounded by a fixed ceiling well inside the lock acquisition
+   * window, and it grants nothing: authority was spent by `activate`.
+   */
+  awaitHandoff(): Promise<void>;
+  /**
    * Waits for the attached process to finish, beating its session file as it
    * runs.
    *
@@ -128,6 +138,7 @@ export async function runInternalSessionAdmissionLaunch(
     provisioningMayBeSelected = steps.provisioningMayBeSelected ?? ((): boolean => true);
     await steps.proveRunning();
     await steps.activate();
+    await steps.awaitHandoff();
     const outcome = await steps.awaitCompletion();
     await cleanupProvisioningSession(steps);
     return outcome;

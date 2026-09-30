@@ -62,6 +62,8 @@ const mocks = vi.hoisted(() => ({
   disconnectCommand: vi.fn(),
   attachCommand: vi.fn(),
   inspectCommand: vi.fn(),
+  topCommand: vi.fn(),
+  templateInit: vi.fn(),
   observedExited: vi.fn(),
   observedExitStatus: vi.fn(),
   removeCommand: vi.fn(),
@@ -140,7 +142,12 @@ vi.mock("./session-container-cleanup.ts", () => ({
   orphanSessionContainerStopCommand: mocks.orphanStop,
   orphanSessionContainerRemoveCommand: mocks.orphanRemove,
 }));
-vi.mock("./session-container-docker.ts", () => ({
+vi.mock("./session-container-docker.ts", async (importOriginal) => ({
+  // The handoff answer is parsed by the shipped parser; only Docker is faked.
+  parseSessionContainerTopHandoff:
+    (await importOriginal<typeof import("./session-container-docker.ts")>()).parseSessionContainerTopHandoff,
+  SESSION_CONTAINER_TOP_MAX_BYTES: 64 * 1024,
+  sessionContainerTopCommand: mocks.topCommand,
   executeSessionDockerCommand: mocks.executeDocker,
   sessionContainerAttachCommand: mocks.attachCommand,
   sessionContainerCreateCommand: mocks.createCommand,
@@ -187,6 +194,7 @@ vi.mock("./session-host-status.ts", () => ({
 }));
 vi.mock("./session-container-template.ts", () => ({
   bindSessionContainerCreatePlanRecord: mocks.bindPlan,
+  sessionContainerTemplateInit: mocks.templateInit,
 }));
 vi.mock("./session-containers.ts", () => ({
   bindAllocatedSessionContainerIdV2: mocks.bindAllocatedRecord,
@@ -238,7 +246,7 @@ vi.mock("./sessions.ts", () => ({
 import { parseSessionFileV1, SESSION_ELIGIBILITY_PATH, SESSION_FILES_DIR } from "@runfree/runtime-contracts/session-file";
 import { SESSION_ADMISSION_LEASE_MAX_DURATION_MS } from "@runfree/runtime-contracts/session-registry";
 
-import { createInternalSessionAdmissionDriver } from "./session-admission-driver.ts";
+import { createInternalSessionAdmissionDriver, SESSION_HANDOFF_WAIT_CEILING_MS } from "./session-admission-driver.ts";
 import { flushWarnings, setOutputWriterForTest } from "../warnings.ts";
 import type { ActiveRuntimePlan } from "./plan.ts";
 import {
@@ -370,6 +378,26 @@ function ordered(name: string) {
   };
 }
 
+/** The captured label of the handoff wait's daemon-side process listing. */
+const TOP_LABEL = `docker:container top ${CONTAINER_ID} -o pid,ppid,args`;
+
+/**
+ * One `docker container top -o pid,ppid,args` answer for this session: Docker's
+ * init as the anchor (`State.Pid`, `DOCKER_PID`) and, under it, the entry, the
+ * agent, or nothing yet.
+ */
+function topListing(child: "entry" | "agent" | "none"): string {
+  const rows = [
+    "PID     PPID    COMMAND",
+    `${DOCKER_PID}    4200    /sbin/docker-init -- /usr/local/libexec/runfree/session-entry /usr/local/bin/codex`,
+  ];
+  if (child === "entry") {
+    rows.push(`4300    ${DOCKER_PID}    /bin/sh /usr/local/libexec/runfree/session-entry /usr/local/bin/codex`);
+  }
+  if (child === "agent") rows.push(`4300    ${DOCKER_PID}    /usr/local/bin/codex`);
+  return `${rows.join("\n")}\n`;
+}
+
 /** The durable effective control plane this project's proxy was started from. */
 let effectiveControlPlane: {
   selection: Record<string, unknown>;
@@ -484,6 +512,11 @@ beforeEach(() => {
   mocks.classify.mockReturnValue([]);
   mocks.networkInspectCommand.mockReturnValue({ executable: "docker", args: ["network", "inspect", NETWORK_ID] });
   mocks.inspectCommand.mockReturnValue({ executable: "docker", args: ["container", "inspect", CONTAINER_ID] });
+  mocks.topCommand.mockReturnValue({ executable: "docker", args: ["container", "top", CONTAINER_ID, "-o", "pid,ppid,args"] });
+  mocks.templateInit.mockReturnValue(true);
+  // Default: the entry has already handed off by the first look, which is what
+  // a healthy launch sees; the handoff cases below script the other answers.
+  mocks.effectAnswers.set(TOP_LABEL, [{ status: 0, stdout: topListing("agent"), stderr: "" }]);
   // Default: the pre-stop inspection does NOT prove the container exited, so
   // every existing teardown expectation keeps the SIGTERM+grace stop path,
   // and no inspection carries a proved exit status.
@@ -1611,6 +1644,8 @@ describe("session admission under the per-session file source", () => {
       "docker:container create",
       `docker:container inspect ${CONTAINER_ID}`,
       "session-file:write",
+      // One daemon-side read of the process table: the entry has handed off.
+      TOP_LABEL,
     ]);
     expect(mocks.events.indexOf("start-foreground"))
       .toBeLessThan(mocks.events.indexOf(`docker:container inspect ${CONTAINER_ID}`));
@@ -3221,5 +3256,157 @@ describe("session admission under the per-session file source", () => {
       output.restore();
       vi.useRealTimers();
     }
+  });
+
+  describe("attached only after the entry hands off to the agent", () => {
+    const topAnswer = (child: "entry" | "agent" | "none") => ({ status: 0, stdout: topListing(child), stderr: "" });
+    const tops = (): number => mocks.events.filter((event) => event === TOP_LABEL).length;
+
+    beforeEach(() => {
+      mocks.transitionAttached.mockImplementation((value: FakeRecord) => {
+        mocks.events.push("transition-attached");
+        return { ...value, state: "attached" };
+      });
+    });
+
+    test("keeps the lock, the attached record, and the running hook until a poll sees the handoff", async () => {
+      const input = fixture();
+      mocks.effectAnswers.set(TOP_LABEL, [topAnswer("none"), topAnswer("entry"), topAnswer("entry"), topAnswer("agent")]);
+      const onSessionRunning = vi.fn(() => { mocks.events.push("session-running"); });
+      const foreground = attachableForeground();
+      const driver = createInternalSessionAdmissionDriver({
+        ...input,
+        sessionLockManager: orderedSessionLockManager(input.sessionLockManager),
+        nowEpochMs: () => Date.parse("2026-08-09T00:10:00.000Z"),
+        onSessionRunning,
+      });
+
+      const launch = driver.launchBuiltin("codex");
+      await vi.waitFor(() => expect(mocks.events).toContain("release-attached-lock"));
+      foreground.end({ kind: "exit", code: 0, signal: null });
+      await expect(launch).resolves.toEqual({ status: 0, signal: null });
+
+      const write = mocks.events.indexOf("session-file:write");
+      const attached = mocks.events.indexOf("transition-attached");
+      const handedOff = mocks.events.lastIndexOf(TOP_LABEL);
+      expect(tops()).toBe(4);
+      expect(write).toBeLessThan(mocks.events.indexOf(TOP_LABEL));
+      // Every poll ran under the grant's lock, and nothing was reported before
+      // the one that saw the agent.
+      expect(handedOff).toBeLessThan(attached);
+      expect(mocks.events.indexOf("write-host-status")).toBeGreaterThan(handedOff);
+      expect(mocks.events.indexOf("session-running")).toBeGreaterThan(attached);
+      expect(mocks.events.indexOf("release-attached-lock")).toBeGreaterThan(mocks.events.indexOf("session-running"));
+      expect(mocks.transitionAttached).toHaveBeenCalledTimes(1);
+    });
+
+    test("asserts the lifecycle lock on every poll and tears down, file first, when it is lost", async () => {
+      const input = fixture();
+      mocks.effectAnswers.set(TOP_LABEL, [topAnswer("entry")]);
+      let polls = 0;
+      mocks.topCommand.mockImplementation(() => {
+        polls += 1;
+        // The second poll finds the lock gone.
+        if (polls === 2) (input.sessionLockManager.lock.assertHeld as Mock).mockImplementation(() => {
+          throw new Error("test lifecycle lock is not held");
+        });
+        return { executable: "docker", args: ["container", "top", CONTAINER_ID, "-o", "pid,ppid,args"] };
+      });
+      const onSessionRunning = vi.fn();
+      attachableForeground();
+      const driver = createInternalSessionAdmissionDriver({ ...input, onSessionRunning });
+
+      await expect(driver.launchBuiltin("codex")).rejects.toThrow();
+
+      expect(polls).toBe(2);
+      expect(mocks.transitionAttached).not.toHaveBeenCalled();
+      expect(onSessionRunning).not.toHaveBeenCalled();
+      expect(input.sessionLockManager.releaseForWait).not.toHaveBeenCalled();
+    });
+
+    test("a foreground that ends during the wait is classified by the attached wait, never torn down there", async () => {
+      vi.useFakeTimers();
+      const output = captureOutput();
+      const input = fixture();
+      mocks.containerInspect = { status: 0, stdout: runningInspect(), stderr: "" };
+      mocks.effectAnswers.set(TOP_LABEL, [topAnswer("entry")]);
+      const foreground = attachableForeground();
+      const driver = createInternalSessionAdmissionDriver({
+        ...input,
+        nowEpochMs: () => Date.parse("2026-08-09T00:10:00.000Z"),
+        nowMonotonicMs: () => Date.now(),
+      });
+
+      try {
+        const launch = driver.launchBuiltin("codex");
+        await vi.advanceTimersByTimeAsync(0);
+        expect(tops()).toBe(1);
+        expect(mocks.transitionAttached).not.toHaveBeenCalled();
+
+        // Only the stream is lost; the container is still the proved one.
+        foreground.end({ kind: "exit", code: null, signal: "SIGHUP" });
+        await vi.advanceTimersByTimeAsync(0);
+
+        expect(mocks.transitionAttached).toHaveBeenCalledTimes(1);
+        expect(foreground.reattaches()).toBe(1);
+        expect(mocks.events).not.toContain("stamp-revoking");
+        expect(output.drain().join("\n")).not.toContain("hand off");
+
+        foreground.end({ kind: "exit", code: 0, signal: null });
+        await vi.advanceTimersByTimeAsync(0);
+        await expect(launch).resolves.toEqual({ status: 0, signal: null });
+      } finally {
+        output.restore();
+        vi.useRealTimers();
+      }
+    });
+
+    test("an unreadable listing reports attached at once, once, without echoing what the container wrote", async () => {
+      const output = captureOutput();
+      const input = fixture();
+      const hostile = "\u001b]0;pwned\u0007 PID PPID COMMAND";
+      mocks.effectAnswers.set(TOP_LABEL, [{ status: 1, stdout: hostile, stderr: hostile }]);
+      try {
+        const driver = createInternalSessionAdmissionDriver(input);
+        await expect(driver.launchBuiltin("codex")).resolves.toEqual({ status: 0, signal: null });
+        expect(tops()).toBe(1);
+        expect(mocks.transitionAttached).toHaveBeenCalledTimes(1);
+        const lines = output.drain();
+        expect(lines.filter((line) => line.includes("could not observe the session entry"))).toHaveLength(1);
+        expect(lines.join("\n")).not.toContain("pwned");
+      } finally {
+        output.restore();
+      }
+    });
+
+    test("an entry that never hands off holds the lock no longer than the ceiling", async () => {
+      const output = captureOutput();
+      const input = fixture();
+      mocks.effectAnswers.set(TOP_LABEL, [topAnswer("entry")]);
+      // A monotonic clock that advances 4 s per read, so the ceiling is reached
+      // in a few polls without waiting it out.
+      let clock = 0;
+      const foreground = attachableForeground();
+      const driver = createInternalSessionAdmissionDriver({
+        ...input,
+        sessionLockManager: orderedSessionLockManager(input.sessionLockManager),
+        nowMonotonicMs: () => (clock += 4_000),
+      });
+      try {
+        const launch = driver.launchBuiltin("codex");
+        await vi.waitFor(() => expect(mocks.events).toContain("release-attached-lock"));
+        foreground.end({ kind: "exit", code: 0, signal: null });
+        await expect(launch).resolves.toEqual({ status: 0, signal: null });
+        expect(tops()).toBeGreaterThan(0);
+        expect(tops()).toBeLessThanOrEqual(Math.ceil(SESSION_HANDOFF_WAIT_CEILING_MS / 4_000) + 1);
+        expect(mocks.events.indexOf("transition-attached")).toBeGreaterThan(mocks.events.lastIndexOf(TOP_LABEL));
+        expect(mocks.events.indexOf("release-attached-lock")).toBeGreaterThan(mocks.events.indexOf("transition-attached"));
+        const lines = output.drain();
+        expect(lines.filter((line) => line.includes(`did not hand off to the agent within ${SESSION_HANDOFF_WAIT_CEILING_MS} ms`)))
+          .toHaveLength(1);
+      } finally {
+        output.restore();
+      }
+    });
   });
 });

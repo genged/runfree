@@ -52,6 +52,7 @@ function recorder(failAt?: string, outcome: SessionAdmissionLaunchOutcome = OUTC
     createStarted: step("createStarted"),
     proveRunning: step("proveRunning"),
     activate: step("activate"),
+    awaitHandoff: step("awaitHandoff"),
     async awaitCompletion(): Promise<SessionAdmissionLaunchOutcome> {
       calls.push("awaitCompletion");
       if (failAt === "awaitCompletion") throw new Error("awaitCompletion failed");
@@ -74,6 +75,7 @@ describe("internal session admission launch kernel", () => {
       "createStarted",
       "proveRunning",
       "activate",
+      "awaitHandoff",
       "awaitCompletion",
       ...REVOCATION_SEQUENCE,
     ]);
@@ -81,6 +83,10 @@ describe("internal session admission launch kernel", () => {
     // has been started and proven, and the attached process only runs after.
     expect(calls.indexOf("activate")).toBeGreaterThan(calls.indexOf("proveRunning"));
     expect(calls.indexOf("awaitCompletion")).toBeGreaterThan(calls.indexOf("activate"));
+    // `attached` is reported only after the entry's handoff, still under the
+    // lock the grant took, and before the attached wait releases it.
+    expect(calls.indexOf("awaitHandoff")).toBe(calls.indexOf("activate") + 1);
+    expect(calls.indexOf("awaitCompletion")).toBe(calls.indexOf("awaitHandoff") + 1);
   });
 
   test("gives authority back when the attached process fails", async () => {
@@ -98,6 +104,16 @@ describe("internal session admission launch kernel", () => {
     const { calls, steps } = recorder("activate");
     await expect(runInternalSessionAdmissionLaunch(steps)).rejects.toThrow("activate failed");
     expect(calls.slice(calls.indexOf("activate") + 1)).toEqual(REVOCATION_SEQUENCE);
+    expect(calls).not.toContain("cleanupUnadmitted");
+  });
+
+  test("gives authority back when the handoff wait fails, and never waits for completion", async () => {
+    // The session file exists by then, so only the ordered teardown (file
+    // first) may answer, never the unadmitted cleanup.
+    const { calls, steps } = recorder("awaitHandoff");
+    await expect(runInternalSessionAdmissionLaunch(steps)).rejects.toThrow("awaitHandoff failed");
+    expect(calls.slice(calls.indexOf("awaitHandoff") + 1)).toEqual(REVOCATION_SEQUENCE);
+    expect(calls).not.toContain("awaitCompletion");
     expect(calls).not.toContain("cleanupUnadmitted");
   });
 
