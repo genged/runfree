@@ -104,6 +104,7 @@ export const RUNTIME_ASSET_DESCRIPTORS: readonly RuntimeAssetDescriptor[] = [
   proxyImage("proxy/policy.js"),
   proxyImage("proxy/resolved-hosts.js"),
   proxyImage("proxy/server.js"),
+  proxyImage("proxy/session-admission-watch.js"),
   proxyImage("proxy/session-file-registry.js"),
   proxyImage("proxy/session-identity-config.js"),
   proxyImage("proxy/session-file-validity.js"),

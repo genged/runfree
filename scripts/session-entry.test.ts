@@ -51,6 +51,14 @@ type ProbeModule = Readonly<{
   EXIT_USAGE: number;
   PROXY_PORT: number;
   READINESS_REQUEST: string;
+  ATTEMPT_CONNECT_TIMEOUT_MS: number;
+  RETRY_PAUSE_MS: number;
+  TOTAL_TIMEOUT_MS: number;
+  probeUntilActive: (options: Readonly<{
+    host: string;
+    port: number;
+    connect?: (options: Readonly<{ host: string; port: number; family: 4 }>) => net.Socket;
+  }>) => Promise<number>;
 }>;
 
 let probeModule: ProbeModule;
@@ -301,6 +309,110 @@ describe("session readiness probe against the real request proxy", () => {
     expect(result.status, result.stderr).toBe(probeModule.EXIT_UNEXPECTED);
   });
 
+  test("retries a refusal inside one run and exits active on the next connection", async () => {
+    // Between the firewall admitting the address and the request proxy
+    // serving the file the answer is a 403: the two consumers reconcile
+    // independently. One run must not end on it.
+    const proxy = await fakeProxy([REFUSED_RESPONSE, ACTIVE_RESPONSE]);
+    const result = await runProbe({ PROXY_IP: "127.0.0.1", RUNFREE_SESSION_READY_PROBE_PORT: String(proxy.port) });
+
+    expect(result.status, result.stderr).toBe(probeModule.EXIT_ACTIVE);
+    expect(proxy.requests).toEqual([SESSION_ADMISSION_PROVISIONING_REQUEST, SESSION_ADMISSION_PROVISIONING_REQUEST]);
+    expect(proxy.connections()).toBe(2);
+  });
+
+  test("a dropped SYN costs one short attempt, not a 1 s connect timeout (launch plan Task 7)", async () => {
+    // The firewall drops a not-yet-admitted session's SYN without an RST, and
+    // Linux retransmits it only after a 1 s RTO. A socket that never connects
+    // models that attempt; the next attempt reaches the served proxy.
+    const proxy = await fakeProxy([ACTIVE_RESPONSE]);
+    let calls = 0;
+    const startedAt = performance.now();
+    const code = await probeModule.probeUntilActive({
+      host: "127.0.0.1",
+      port: proxy.port,
+      connect: (options) => {
+        calls += 1;
+        return calls === 1 ? new net.Socket() : net.connect(options);
+      },
+    });
+    const elapsed = performance.now() - startedAt;
+
+    expect(code).toBe(probeModule.EXIT_ACTIVE);
+    expect(calls).toBe(2);
+    expect(elapsed).toBeGreaterThanOrEqual(probeModule.ATTEMPT_CONNECT_TIMEOUT_MS - 5);
+    // One short attempt, one pause, and the served answer: well under the old
+    // single attempt's 1 s connect timeout.
+    expect(elapsed).toBeLessThan(900);
+    expect(proxy.requests).toEqual([SESSION_ADMISSION_PROVISIONING_REQUEST]);
+  });
+
+  test("a run that is never answered spends exactly its one total budget", async () => {
+    // Every attempt dropped: the run ends on its whole-run budget, not per
+    // attempt, so the entry's stop and timeout arithmetic still sees a
+    // bounded child.
+    let calls = 0;
+    const startedAt = performance.now();
+    const code = await probeModule.probeUntilActive({
+      host: "127.0.0.1",
+      port: 9,
+      connect: () => {
+        calls += 1;
+        return new net.Socket();
+      },
+    });
+    const elapsed = performance.now() - startedAt;
+
+    expect(code).toBe(probeModule.EXIT_UNREACHABLE);
+    expect(elapsed).toBeGreaterThanOrEqual(probeModule.TOTAL_TIMEOUT_MS - 25);
+    expect(elapsed).toBeLessThan(probeModule.TOTAL_TIMEOUT_MS + 700);
+    // Short attempts, one after another, until the budget ran out.
+    expect(calls).toBeGreaterThanOrEqual(
+      Math.floor(probeModule.TOTAL_TIMEOUT_MS / (probeModule.ATTEMPT_CONNECT_TIMEOUT_MS + probeModule.RETRY_PAUSE_MS)),
+    );
+  });
+
+  test("a failed or cut-short attempt does not replace the proxy's last answer", async () => {
+    // A loaded host can time out an attempt, and the run's budget can cut the
+    // final one short; the run still reports what the proxy last said.
+    const answered = await fakeProxy(["HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"]);
+    const stalled = new Set<net.Socket>();
+    const stallServer = net.createServer((socket) => {
+      stalled.add(socket);
+      socket.on("data", () => {});
+      socket.on("error", () => {});
+    });
+    await new Promise<void>((resolve) => stallServer.listen(0, "127.0.0.1", resolve));
+    const stallAddress = stallServer.address();
+    if (stallAddress === null || typeof stallAddress === "string") throw new Error("stall server did not bind");
+    let calls = 0;
+    try {
+      const code = await probeModule.probeUntilActive({
+        host: "127.0.0.1",
+        port: answered.port,
+        connect: (options) => {
+          calls += 1;
+          return net.connect(calls === 1 ? options : { ...options, port: stallAddress.port });
+        },
+      });
+      expect(code).toBe(probeModule.EXIT_UNEXPECTED);
+      expect(calls).toBe(2);
+    } finally {
+      for (const socket of stalled) socket.destroy();
+      await new Promise<void>((resolve) => stallServer.close(() => resolve()));
+    }
+  });
+
+  test("a refusal that never clears ends the run refused, every connection sending only the readiness bytes", async () => {
+    const proxy = await fakeProxy([REFUSED_RESPONSE]);
+    const result = await runProbe({ PROXY_IP: "127.0.0.1", RUNFREE_SESSION_READY_PROBE_PORT: String(proxy.port) });
+
+    expect(result.status, result.stderr).toBe(probeModule.EXIT_REFUSED);
+    expect(proxy.requests.length).toBeGreaterThan(1);
+    expect(new Set(proxy.requests)).toEqual(new Set([SESSION_ADMISSION_PROVISIONING_REQUEST]));
+    expect(proxy.connections()).toBe(proxy.requests.length);
+  });
+
   test("exits unreachable when the proxy port is closed", async () => {
     const port = await unusedPort();
     const result = await runProbe({ PROXY_IP: "127.0.0.1", RUNFREE_SESSION_READY_PROBE_PORT: String(port) });
@@ -324,7 +436,8 @@ describe("session readiness probe against the real request proxy", () => {
       const startedAt = Date.now();
       const result = await runProbe({ PROXY_IP: "127.0.0.1", RUNFREE_SESSION_READY_PROBE_PORT: String(address.port) });
       expect(result.status, result.stderr).toBe(probeModule.EXIT_UNREACHABLE);
-      expect(Date.now() - startedAt).toBeLessThan(5_000);
+      // One run's budget, plus the Node start of the probe process.
+      expect(Date.now() - startedAt).toBeLessThan(probeModule.TOTAL_TIMEOUT_MS + 2_000);
     } finally {
       for (const socket of stalled) socket.destroy();
       await new Promise<void>((resolve) => server.close(() => resolve()));
@@ -385,6 +498,23 @@ describe("session entry", () => {
     expect(result.stderr).toContain("RUNFREE_SESSION_ENTRY_TIMEOUT_MS");
     expect(fs.existsSync(argvPath)).toBe(false);
     expect(proxy.requests.length).toBeGreaterThanOrEqual(2);
+  });
+
+  test("starts the next probe run within a few tens of milliseconds of the last (launch plan Task 7)", async () => {
+    // A probe stand-in that records when it ran and fails at once, so the only
+    // thing between two runs is the entry's own loop and pause. The median gap
+    // is well under the old 250 ms pause even on a loaded host.
+    const runsPath = path.join(tmp, "probe-runs");
+    fs.writeFileSync(probePath, `#!/bin/sh\ndate +%s%N >> "${runsPath}"\nexit 4\n`, { mode: 0o755 });
+    const proxy = await fakeProxy([ACTIVE_RESPONSE]);
+    const result = await runEntry([fakeAgentPath], entryEnv(proxy.port, { RUNFREE_SESSION_ENTRY_TIMEOUT_MS: "3000" }));
+
+    expect(result.status, result.stderr).toBe(111);
+    const stamps = fs.readFileSync(runsPath, "utf8").split("\n").filter(Boolean).map((line) => Number(BigInt(line) / 1_000_000n));
+    expect(stamps.length).toBeGreaterThan(5);
+    const gaps = stamps.slice(1).map((stamp, index) => stamp - stamps[index]).sort((left, right) => left - right);
+    const median = gaps[Math.floor(gaps.length / 2)];
+    expect(median).toBeLessThan(200);
   });
 
   test("prints the waiting notice once after two seconds and nothing on the fast path", async () => {

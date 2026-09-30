@@ -103,6 +103,21 @@ import { liveTierSelected } from "./tiers.ts";
 const coreTest = liveTierSelected("core") ? test : test.skip;
 const extendedTest = liveTierSelected("extended") ? test : test.skip;
 
+/** How long the cadence case holds a launch before its file: past the old probe's 1 s connect timeout. */
+const ENTRY_MID_DROP_HOLD_MS = 3_000;
+/**
+ * From the host first reading the arriving session's file as served to its
+ * agent's first forwarded request being recorded: at most one 250 ms probe
+ * attempt and a 20 ms pause (plus a Node start if the file landed between two
+ * probe runs), the agent's start, one request through the proxy, and the
+ * host's 100 ms poll of the recorded answer over the bind mount. The old probe
+ * sat out the rest of a 1 s connect timeout plus a 250 ms pause here. A
+ * hypothesis until the first Docker run records `live-timing:
+ * served-to-first-request`; one sample cannot separate the two probes
+ * strictly, so the mechanism itself is proven by `scripts/session-entry.test.ts`.
+ */
+const SERVED_TO_FIRST_REQUEST_BOUND_MS = 1_000;
+
 describe("attached per-session authority is exact and drift after the proof fails closed", () => {
   // Called for its validation, not its value, exactly as the sibling describes
   // below do: this tranche drives launches directly and no longer runs an
@@ -809,6 +824,116 @@ describe("attached per-session authority is exact and drift after the proof fail
         await first.completion.catch(() => undefined);
       }
     }
+  }, TEST_TIMEOUT_MS);
+
+  extendedTest("a launch beside a served session reaches its agent within one probe attempt of its file, and never disturbs the served session (launch plan Task 7)", async () => {
+    // The cadence change's live proof. Both proxy consumers now rescan on
+    // inotify events, and the readiness probe retries with short connect
+    // timeouts instead of one 1 s attempt.
+    //
+    // (1) Latency: the arriving launch is held before its session file for
+    // longer than the old 1 s connect timeout, so its entry's probe is caught
+    // mid dropped SYN when the file lands — the case the old probe spent its
+    // whole connect timeout on. From the file being served to the agent's
+    // first forwarded request is bounded by one short probe attempt, the
+    // agent's start and one request, not by that timeout.
+    //
+    // (2) I8: every host publication (the arriving launch's IP fence, its
+    // eligibility, its file, and the served session's own fast heartbeats)
+    // creates a temp file in a watched directory and renames it into place,
+    // so a rescan lands inside each write. The served session's request held
+    // open for approval across all of it must survive: a scan that read a
+    // mid-replace file as unsafe revoked the session and cancelled the hold.
+    assertSessionAuthorityExactly([], "before the cadence case");
+
+    const served = await startAttachedLaunch(fixture, { extraEnv: FAST_HEARTBEAT_ENV });
+    const [servedRecord] = served.attached.records;
+    expect(servedRecord?.containerId, "the served launch names no container").toBeTruthy();
+    await firstRequestResult(fixture);
+    clearFirstRequestResult(fixture);
+
+    const approvalContext = {
+      projectRoot: fixture.projectRoot,
+      project: projectInfo(fixture.projectRoot, fixture.env),
+      runtimeRoot: path.join(REPO_ROOT, "dist", "runtime"),
+      env: fixture.env,
+    };
+    const heartbeat = (): void => {
+      expect(
+        touchWatcherHeartbeat(approvalContext, nodeRuntimeIO, proxyId),
+        "could not register the current proxy approval epoch",
+      ).toBe(true);
+    };
+    const pendingWrites = (): readonly PendingApprovalRecord[] =>
+      readPendingApprovals(approvalContext, nodeRuntimeIO, proxyId)
+        .filter((record) => record.host === FIRST_REQUEST_HOST && record.method === "POST");
+
+    let arriving: HeldLaunch | undefined;
+    let arrivingContainerId: string | undefined;
+    let arrivingReleased = false;
+    try {
+      heartbeat();
+      startHeldWrite(String(servedRecord.containerId), "served");
+      let held: readonly PendingApprovalRecord[] = [];
+      await pollUntil(() => {
+        heartbeat();
+        held = pendingWrites();
+        return held.length === 1;
+      }, HELD_WRITE_TIMEOUT_MS, "the served session's write to be held for approval");
+      const servedHold = held[0];
+
+      arriving = await startHeldLaunch(fixture, "before-session-file-write", {
+        allowExistingSessions: true,
+        extraEnv: FAST_HEARTBEAT_ENV,
+      });
+      const arrivingRecord = arriving.held.records
+        .find((record) => record.containerId && record.containerId !== servedRecord.containerId);
+      arrivingContainerId = arrivingRecord?.containerId ?? undefined;
+      expect(arrivingContainerId, `the held launch names no container of its own: ${JSON.stringify(arriving.held)}`)
+        .toBeTruthy();
+      const arrivingIp = String(arrivingRecord?.sourceIp);
+      // Longer than the old probe's 1 s connect timeout, and past one of the
+      // served session's 2 s heartbeats.
+      await new Promise((resolve) => setTimeout(resolve, ENTRY_MID_DROP_HOLD_MS));
+
+      arriving.release();
+      arrivingReleased = true;
+      await pollUntil(
+        () => servedSourceIps(proxyId).includes(arrivingIp),
+        CONSUMER_CONVERGENCE_TIMEOUT_MS,
+        "the arriving session's file to be served",
+        { label: "the arriving launch", completion: arriving.completion, output: arriving.output },
+      );
+      const servedAt = performance.now();
+      const first = firstRequestAnswer(fixture, await firstRequestResult(fixture));
+      const servedToFirstRequestMs = performance.now() - servedAt;
+      console.log(`live-timing: served-to-first-request ms=${Math.round(servedToFirstRequestMs)}`);
+      expect(admittedToUnresolvableHost(first), `the arriving agent's first request was not forwarded: ${first.detail}`)
+        .toBe(true);
+      expect(servedToFirstRequestMs, "the arriving entry waited out a connect timeout after its file was served")
+        .toBeLessThan(SERVED_TO_FIRST_REQUEST_BOUND_MS);
+
+      // Several more heartbeats of both sessions, then the served session's
+      // hold must still be the same open request.
+      await new Promise((resolve) => setTimeout(resolve, 3 * Number(FAST_HEARTBEAT_ENV.RUNFREE_SESSION_HEARTBEAT_CADENCE_MS)));
+      heartbeat();
+      expect(
+        pendingWrites().map((record) => record.id),
+        "the served session's held request was cancelled while another launch was admitted",
+      ).toContain(servedHold.id);
+      expect(servedSourceIps(proxyId), "the served session lost its address while another launch was admitted")
+        .toContain(servedRecord.sourceIp);
+
+      const denied = fixture.runfree(["approve", servedHold.id, "--deny"]);
+      expect(denied.status, `approve --deny failed: ${describeOutput(denied.output, 4000)}`).toBe(0);
+    } finally {
+      if (arriving && !arrivingReleased) arriving.release();
+      if (arrivingContainerId) docker(["kill", arrivingContainerId]);
+      await arriving?.completion.catch(() => undefined);
+      docker(["kill", String(servedRecord.containerId)]);
+      await served.completion.catch(() => undefined);
+    }
+    assertSessionAuthorityExactly([], "after the cadence case");
   }, TEST_TIMEOUT_MS);
 
   // Recorded, not silently absent. A session file carries an absolute

@@ -452,7 +452,7 @@ executors. Retirement requires root firewall exclusion, kernel TCP drain, then f
 acknowledgements from both consumers. The root-owned assignment remains bound
 to the new session key. See [IP Reuse Fence](#ip-reuse-fence).
 
-The root proxy process runs two independent loops. A 100 ms, single-flight,
+The root proxy process runs two independent loops. A single-flight,
 level-triggered admission loop reads only the root-owned session files, the
 eligibility file, IP assignments, local time, and the `session_ipv4` set. It never loads
 policy, resolves DNS, handles audit state, or performs upstream I/O. The
@@ -461,13 +461,24 @@ allowed-host addresses, and maintains the allowed and audit sets. A blocked DNS
 lookup therefore cannot delay admission, expiry, or revocation, and concurrent
 ticks coalesce into one pass over the current directory contents.
 
-The uid-1001 request proxy runs the same rule on its own 100 ms loop over its
+The uid-1001 request proxy runs the same rule on its own loop over its
 own observation map, and serves each connection from the map that loop built
 rather than re-reading the directory per connection
 ([validity rule](../packages/proxy/src/session-file-validity.ts),
 [scanner](../packages/proxy/src/session-files.ts)). Neither consumer reads the
-other's decision. Their target cadence is 100 ms, but scheduling can delay
-either process. Container creation waits for explicit retirement proof and
+other's decision.
+
+Each consumer's loop runs when an admission input changes and every 100 ms
+([watch](../packages/proxy/src/session-admission-watch.ts)). An inotify event
+naming a `.json` file in the admission root, `sessions/`, or
+`ip-reuse/requests/` schedules one coalesced pass; neither consumer watches
+its own acknowledgement directory. The event only moves the pass earlier and
+grants nothing. The 100 ms interval stays: it alone sees a lease run out
+(no file changes), and it covers a lost event or a watcher that failed or
+never armed, which it re-arms. A scan that lands inside the host's atomic
+replace (a changed inode or a link count other than 1 on the name) reads the
+file again, three reads in all, instead of dropping it. Scheduling can still
+delay either process. Container creation waits for explicit retirement proof and
 does not assume a maximum consumer delay.
 
 Proxy startup clears the session and IP assignment directories and removes the eligibility file,
@@ -505,8 +516,11 @@ directory, and the driver's ladder is:
    session file's renewal anchor (process id, start time, network endpoint) is
    a projection of it.
 5. **Activate** writes the session file. This is the first step that widens
-   what the container may do; within one consumer loop the firewall admits
-   the address, the readiness probe gets `200 active`, and the agent execs.
+   what the container may do; on the file's own event (or within one 100 ms
+   loop) the firewall admits the address, the readiness probe gets `200
+   active`, and the agent execs. The probe retries 250 ms connect attempts
+   inside one 2 s run, because the firewall drops a not-yet-admitted SYN
+   without a reset and Linux resends it only after 1 s.
    A failure after the write deletes the file again rather than leaving
    authority behind.
 6. **Await handoff** keeps the lifecycle lock while it polls a daemon-side

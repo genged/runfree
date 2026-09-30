@@ -175,7 +175,7 @@ host: allocate IP -> fence IP -> create+start container -> inspect once
                                                               |
       <- heartbeat every 30 s: inspect, rewrite file  <- write session file
                                                               |
-proxy: firewall + request proxy read the file (100 ms loops) -> serve IP
+proxy: firewall + request proxy read the file (on change; 100 ms backstop) -> serve IP
 ```
 
 1. **No file, no traffic.** An IP is served only while a root-owned,
