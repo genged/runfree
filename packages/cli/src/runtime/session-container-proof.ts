@@ -23,6 +23,7 @@ import {
 } from "./session-container-contract.ts";
 import {
   assertSessionContainerCreatePlan,
+  sessionContainerTemplateInit,
   type SessionContainerCreatePlan,
 } from "./session-container-template.ts";
 import {
@@ -431,7 +432,14 @@ function assertHostContract(plan: SessionContainerCreatePlan, value: unknown): v
     throw new Error("session container network mode differs from the selected internal network");
   }
   if (absentAsFalse(value.Privileged) !== false) throw new Error("session container is privileged");
-  if (absentAsFalse(value.Init) !== false) throw new Error("session container has an unexpected init wrapper");
+  // Exact to the session's own template, in both directions: a version 2
+  // template requires Docker's init; a version 1 (pre-init) template requires
+  // its absence, so an old live session still proves across a rebind.
+  if (sessionContainerTemplateInit(plan.template)) {
+    if (value.Init !== true) throw new Error("session container is missing its init wrapper");
+  } else if (absentAsFalse(value.Init) !== false) {
+    throw new Error("session container has an unexpected init wrapper");
+  }
   if (absentAsFalse(value.AutoRemove) !== false) throw new Error("session container auto-remove contract differs");
   if (absentAsFalse(value.PublishAllPorts) !== false) {
     throw new Error("session container publishes all exposed ports");

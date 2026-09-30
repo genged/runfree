@@ -27,13 +27,17 @@ import {
 } from "./session-container-proof.ts";
 import {
   sessionContainerCreatePlanFixture,
+  sessionContainerLegacyTemplateFixture,
   sessionContainerRecordFixture,
 } from "./session-container.test-harness.ts";
 import {
   SESSION_TEST_DOCKER_STARTED_AT,
   SESSION_TEST_NETWORK_ENDPOINT_ID,
 } from "./session-container.test-harness.ts";
-import type { SessionContainerCreatePlan } from "./session-container-template.ts";
+import {
+  sessionContainerTemplateInit,
+  type SessionContainerCreatePlan,
+} from "./session-container-template.ts";
 import type { SessionContainerRecordV2 } from "./session-containers.ts";
 import { SESSION_ENTRY_PATH } from "./session-launch.ts";
 import {
@@ -55,6 +59,14 @@ function plan(overrides?: Partial<SessionContainerRecordV2>): SessionContainerCr
     ...(overrides
       ? { record: sessionContainerRecordFixture({ containerId: CONTAINER_ID, overrides }) }
       : {}),
+  });
+}
+
+/** A plan over the template a pre-2026-09-30 release stored (version 1, no init). */
+function legacyPlan(): SessionContainerCreatePlan {
+  return sessionContainerCreatePlanFixture({
+    containerId: CONTAINER_ID,
+    template: sessionContainerLegacyTemplateFixture(),
   });
 }
 
@@ -104,7 +116,7 @@ function inspect(value: SessionContainerCreatePlan, options: { running?: boolean
     HostConfig: {
       NetworkMode: value.effectiveControlPlane.networkIds.agentInternal,
       Privileged: false,
-      Init: false,
+      Init: sessionContainerTemplateInit(value.template) ? true : undefined,
       AutoRemove: false,
       PublishAllPorts: false,
       RestartPolicy: { Name: SESSION_CONTAINER_RESTART_POLICY, MaximumRetryCount: 0 },
@@ -272,11 +284,13 @@ describe("session container live inspection proof", () => {
   test("accepts the encodings a real daemon uses for the same contract", () => {
     const value = plan();
 
-    const withoutInit = inspect(value, { running: true });
+    // A pre-init (version 1) template's container: the daemon omits `Init`.
+    const legacy = legacyPlan();
+    const withoutInit = inspect(legacy, { running: true });
     delete withoutInit[0].HostConfig.Init;
     expect(() => validateSessionContainerInspect(
       JSON.stringify(withoutInit),
-      value,
+      legacy,
       { kind: "provisioning-running" },
     )).not.toThrow();
 
@@ -429,7 +443,7 @@ describe("session container live inspection proof", () => {
       evidence[0].Config.Labels["com.docker.compose.project"] = "forged";
     }],
     ["network mode", (evidence: MutableInspect) => { evidence[0].HostConfig.NetworkMode = "bridge"; }],
-    ["init wrapper", (evidence: MutableInspect) => { evidence[0].HostConfig.Init = true; }],
+    ["init wrapper", (evidence: MutableInspect) => { evidence[0].HostConfig.Init = false; }],
     ["auto-remove", (evidence: MutableInspect) => { evidence[0].HostConfig.AutoRemove = true; }],
     ["restart policy", (evidence: MutableInspect) => { evidence[0].HostConfig.RestartPolicy.Name = "always"; }],
     ["restart count", (evidence: MutableInspect) => { evidence[0].HostConfig.RestartPolicy.MaximumRetryCount = 1; }],
@@ -688,5 +702,61 @@ describe("session container live inspection proof", () => {
       value,
       { kind: "unexpected" } as never,
     )).toThrow("proof phase is invalid");
+  });
+});
+
+describe("session container init wrapper follows the session's own template", () => {
+  test("a version 2 template's container runs under Docker's init", () => {
+    const value = plan();
+    expect(sessionContainerTemplateInit(value.template)).toBe(true);
+    const evidence = inspect(value, { running: true });
+    expect(evidence[0].HostConfig.Init).toBe(true);
+    expect(() => validateSessionContainerInspect(
+      JSON.stringify(evidence),
+      value,
+      { kind: "provisioning-running" },
+    )).not.toThrow();
+  });
+
+  test.each([
+    ["false", false],
+    ["null", null],
+    ["absent", undefined],
+  ])("refuses a version 2 template's container whose Init is %s", (_label, init) => {
+    const value = plan();
+    const evidence = inspect(value, { running: true });
+    if (init === undefined) delete evidence[0].HostConfig.Init;
+    else evidence[0].HostConfig.Init = init;
+    for (const phase of [{ kind: "provisioning-running" }, { kind: "active-running" }] as const) {
+      expect(() => validateSessionContainerInspect(JSON.stringify(evidence), value, phase))
+        .toThrow("session container is missing its init wrapper");
+    }
+  });
+
+  test.each([
+    ["false", false],
+    ["null", null],
+    ["absent", undefined],
+  ])("accepts a pre-upgrade (version 1) template's container whose Init is %s", (_label, init) => {
+    const value = legacyPlan();
+    expect(sessionContainerTemplateInit(value.template)).toBe(false);
+    const evidence = inspect(value, { running: true });
+    if (init === undefined) delete evidence[0].HostConfig.Init;
+    else evidence[0].HostConfig.Init = init;
+    expect(() => validateSessionContainerInspect(
+      JSON.stringify(evidence),
+      value,
+      { kind: "active-running" },
+    )).not.toThrow();
+  });
+
+  test("refuses a pre-upgrade (version 1) template's container that runs under an init", () => {
+    const value = legacyPlan();
+    const evidence = inspect(value, { running: true });
+    evidence[0].HostConfig.Init = true;
+    for (const phase of [{ kind: "provisioning-running" }, { kind: "active-running" }] as const) {
+      expect(() => validateSessionContainerInspect(JSON.stringify(evidence), value, phase))
+        .toThrow("session container has an unexpected init wrapper");
+    }
   });
 });

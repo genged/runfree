@@ -158,7 +158,7 @@ function writeRecord(input: {
   host: number;
   containerId?: string;
   generation?: SessionAgentGenerationV2;
-  state?: "attached";
+  state?: "attached" | "provisioning-running";
 }): SessionContainerRecordV2 {
   sequence += 1;
   const index = sequence;
@@ -175,10 +175,10 @@ function writeRecord(input: {
       ...ownership(input.liveness),
     },
   });
-  const record = input.state === "attached"
+  const record = input.state !== undefined
     ? {
       ...base,
-      state: "attached" as const,
+      state: input.state,
       admittedAt: "2026-09-07T12:00:00.000Z",
       leaseGeneration: "8".repeat(32),
       leaseExpiresAt: "2026-09-07T12:05:00.000Z",
@@ -504,6 +504,25 @@ describe("reconcile before allocation", () => {
     // The terminal stamp is written before the file is touched and cleared
     // once the record is gone.
     expect(readSessionHostStatus(stateDir, abandoned.sessionId)).toBeUndefined();
+  });
+
+  test("tears down a dead owner's granted but not yet attached session the same way, file first", async () => {
+    // A launcher killed during its entry-handoff wait leaves exactly this: the
+    // session file written, the record still provisioning-running.
+    const abandoned = writeRecord({ liveness: "dead", host: 20, containerId: "a".repeat(64), state: "provisioning-running" });
+    const fake = fakeDocker({ served: [servedFile(abandoned)] });
+
+    const result = await repair(fake);
+
+    expect(result.deadOwnersRevoked).toEqual([abandoned.sessionId]);
+    expect(fake.effects()).toEqual([
+      `delete-session-file:${abandoned.sessionPrincipal}.json`,
+      `docker:network disconnect ${NETWORK.networkId} ${"a".repeat(64)}`,
+      `docker:container stop --time 10 ${"a".repeat(64)}`,
+      `docker:container rm --force ${"a".repeat(64)}`,
+      "publish-eligibility",
+    ]);
+    expect(listSessionContainerRecordsV2(stateDir, SESSION_TEST_PROJECT)).toEqual([]);
   });
 
   test("keeps a dead owner's record until its own file is proved gone", async () => {

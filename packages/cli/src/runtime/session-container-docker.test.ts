@@ -1,7 +1,7 @@
 import { describe, expect, test } from "vitest";
 
 import { createSessionImageDeclarationProof } from "./session-image-declarations.ts";
-import { createSessionLaunchTarget } from "./session-launch.ts";
+import { createSessionLaunchTarget, SESSION_ENTRY_PATH } from "./session-launch.ts";
 import {
   sessionNamedVolumeExpectations,
   validateSessionNamedVolumeInspect,
@@ -17,7 +17,9 @@ import {
   sessionContainerInspectCommand,
   sessionContainerObservedExited,
   sessionContainerObservedExitStatus,
+  parseSessionContainerTopHandoff,
   sessionContainerStartAttachCommand,
+  sessionContainerTopCommand,
   sessionNetworkInspectCommand,
   type SessionContainerAttachIdentity,
   type SessionDockerCommand,
@@ -27,6 +29,7 @@ import {
   SESSION_TEST_PROJECT,
   sessionAgentMaterializationFixture,
   sessionContainerRecordFixture,
+  sessionContainerLegacyTemplateFixture,
   sessionContainerTemplateFixture,
   sessionGenerationFixture,
 } from "./session-container.test-harness.ts";
@@ -120,9 +123,12 @@ function attachIdentity(record: SessionContainerRecordV2): SessionContainerAttac
   };
 }
 
-function createPlan(record: SessionContainerRecordV2 = allocated()): SessionContainerCreatePlan {
+function createPlan(
+  record: SessionContainerRecordV2 = allocated(),
+  baseTemplate = sessionContainerTemplateFixture(),
+): SessionContainerCreatePlan {
   const { target, generation } = sessionGenerationFixture();
-  const template = bindSessionContainerTemplateGenerationV2(sessionContainerTemplateFixture(), target);
+  const template = bindSessionContainerTemplateGenerationV2(baseTemplate, target);
   const launch = createSessionLaunchTarget({
     path: record.launchPath,
     args: record.launchArgs,
@@ -180,6 +186,12 @@ function namedVolumeProof(plan: SessionContainerCreatePlan): SessionNamedVolumeP
 }
 
 describe("typed session-container Docker operations", () => {
+  test("creates a pre-upgrade (version 1) template's container without the init wrapper, as it was proven", () => {
+    const plan = createPlan(allocated(), sessionContainerLegacyTemplateFixture());
+    const command = sessionContainerCreateCommand(plan, namedVolumeProof(plan));
+    expect(command.args).not.toContain("--init");
+  });
+
   test("creates stopped from the selected image with exact network, launch, and confinement", () => {
     const plan = createPlan();
     const command = sessionContainerCreateCommand(plan, namedVolumeProof(plan));
@@ -199,7 +211,10 @@ describe("typed session-container Docker operations", () => {
     expect(command.args).toContain("--interactive");
     expect(command.args).toContain("--tty");
     expect(command.args).toContain(SESSION_CONTAINER_STOP_SIGNAL);
-    expect(command.args).not.toContain("--init");
+    // A version 2 template runs the agent under Docker's init, so a stop
+    // signal reaches it instead of being dropped for an unhandled PID 1.
+    expect(command.args.filter((argument) => argument === "--init")).toHaveLength(1);
+    expect(command.args.indexOf("--init")).toBeLessThan(command.args.indexOf("--entrypoint"));
     expect(command.args).not.toContain("--publish");
     expect(command.args).not.toContain("--add-host");
 
@@ -428,5 +443,65 @@ describe("typed session-container Docker operations", () => {
     } as unknown as SessionDockerCommand;
     expect(() => executeSessionDockerCommand(forged, () => { dockerCalls += 1; })).toThrow("unvalidated");
     expect(dockerCalls).toBe(0);
+  });
+});
+
+describe("session entry handoff observation", () => {
+  // `docker container top <id> -o pid,ppid,args` as the daemon's procps prints
+  // it: host-namespace pids, the command last. The anchor is the container's
+  // `State.Pid` from the running proof — the init with a wrapper, the entry
+  // or agent without one.
+  const ANCHOR = 4242;
+  const HEADER = "PID                 PPID                COMMAND";
+  const row = (pid: number, ppid: number, command: string): string =>
+    `${pid}                ${ppid}                ${command}`;
+  const top = (...rows: string[]): string => `${[HEADER, ...rows].join("\n")}\n`;
+  const INIT = row(ANCHOR, 4200, `/sbin/docker-init -- ${SESSION_ENTRY_PATH} /usr/local/bin/claude --flag`);
+  const withInit = { anchorPid: ANCHOR, init: true } as const;
+  const withoutInit = { anchorPid: ANCHOR, init: false } as const;
+
+  test("reads a sealed, read-only daemon top of the exact container with explicit columns", () => {
+    const command = sessionContainerTopCommand(boundAllocated(), PROJECT);
+    expect(command.effect).toBe("top-session-container");
+    expect(command.args).toEqual(["container", "top", CONTAINER_ID, "-o", "pid,ppid,args"]);
+    expect(command.args).not.toContain("exec");
+    expect(() => sessionContainerTopCommand(allocated(), PROJECT)).toThrow("no exact container id");
+  });
+
+  test.each([
+    ["the init's child is the entry script", withInit, top(INIT, row(4300, ANCHOR, `/bin/sh ${SESSION_ENTRY_PATH} /usr/local/bin/claude --flag`), row(4301, 4300, "sleep 0.25")), "entry-running"],
+    ["the init's child is a replaced entry binary", withInit, top(INIT, row(4300, ANCHOR, `${SESSION_ENTRY_PATH} /usr/local/bin/claude`)), "entry-running"],
+    ["the init has not forked yet", withInit, top(INIT), "not-started"],
+    ["the init's child is the agent", withInit, top(INIT, row(4300, ANCHOR, "node /usr/local/libexec/runfree/claude-real --flag")), "handed-off"],
+    ["the agent's own argv names the entry as a later word", withInit, top(INIT, row(4300, ANCHOR, `node /agent.js ${SESSION_ENTRY_PATH}`)), "handed-off"],
+    ["a grandchild runs something that looks like the entry", withInit, top(INIT, row(4300, ANCHOR, "node /agent.js"), row(4301, 4300, `/bin/sh ${SESSION_ENTRY_PATH} x`)), "handed-off"],
+    ["a spoofed init line that is not the anchor", withInit, top(INIT, row(4300, ANCHOR, `/bin/sh ${SESSION_ENTRY_PATH} x`), row(4301, 4300, `/sbin/docker-init -- ${SESSION_ENTRY_PATH}`)), "entry-running"],
+    ["a pre-init PID 1 that is still the entry", withoutInit, top(row(ANCHOR, 4200, `/bin/sh ${SESSION_ENTRY_PATH} /usr/local/bin/claude`), row(4300, ANCHOR, "node /usr/local/libexec/runfree/session-ready-probe")), "entry-running"],
+    ["a pre-init PID 1 that is the agent", withoutInit, top(row(ANCHOR, 4200, "/bin/bash /usr/local/bin/claude --flag")), "handed-off"],
+    ["an anchor missing from the listing", withoutInit, top(row(1, 0, "/bin/bash /usr/local/bin/claude")), "unreadable"],
+    ["an anchor missing from the listing under init", withInit, top(row(1, 0, "/sbin/docker-init -- x")), "unreadable"],
+    ["control characters in a process title", withInit, top(INIT, row(4300, ANCHOR, "node \u001b[2J\u0007 /agent.js")), "handed-off"],
+  ])("classifies %s", (_label, anchor, stdout, expected) => {
+    expect(parseSessionContainerTopHandoff(stdout, anchor)).toBe(expected);
+  });
+
+  test.each([
+    ["empty output", ""],
+    ["the default ps -ef layout without PPID after PID", "UID PID C CMD\n1000 4242 0 x\n"],
+    ["a header without a command column", "PID PPID\n4242 1\n"],
+    ["a command column that is not last", "COMMAND PID PPID\nx 4242 1\n"],
+    ["a header only", `${HEADER}\n`],
+    ["a non-numeric pid", `${HEADER}\nabc 1 x\n`],
+    ["an answer over the size bound", top(INIT, row(4300, ANCHOR, "x".repeat(128 * 1024)))],
+    ["too many processes", top(INIT, ...Array.from({ length: 5000 }, (_, index) => row(5000 + index, ANCHOR, "sleep 1")))],
+  ])("reads %s as unreadable, never as a handoff", (_label, stdout) => {
+    expect(parseSessionContainerTopHandoff(stdout, withInit)).toBe("unreadable");
+  });
+
+  test("never throws, whatever the container put in its process table", () => {
+    for (const stdout of ["\u0000", "PID PPID COMMAND\n\n\n", "PID PPID COMMAND\n1e309 1 x\n", "PID PPID COMMAND\n-1 -1\n"]) {
+      expect(() => parseSessionContainerTopHandoff(stdout, withInit)).not.toThrow();
+      expect(parseSessionContainerTopHandoff(stdout, withInit)).not.toBe("handed-off");
+    }
   });
 });

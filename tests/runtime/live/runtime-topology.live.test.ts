@@ -49,6 +49,8 @@ import { afterAll, beforeAll, describe, expect, test } from "vitest";
 
 import { validateProxyNftablesTableJson } from "../../../packages/cli/src/proxy-nftables-proof.ts";
 import { NON_RESOLVING_CONNECT_PROBE_HOST } from "../../../packages/cli/src/runtime/probes.ts";
+import { parseSessionContainerTopHandoff } from "../../../packages/cli/src/runtime/session-container-docker.ts";
+import { SESSION_ENTRY_PATH } from "../../../packages/cli/src/runtime/session-launch.ts";
 import {
   firewallStatusPath,
   requestProxyStatusPath,
@@ -132,6 +134,24 @@ function capBitSet(hex: string, bit: bigint): boolean {
 }
 const CAP_NET_ADMIN = 12n;
 const CAP_NET_RAW = 13n;
+
+/**
+ * The in-container pid of the session's agent: the one child of PID 1 (Docker's
+ * init). A `docker exec` process has parent 0 in the container's namespace, so
+ * it is never counted.
+ */
+function sessionAgentPid(containerId: string): string {
+  const listed = containerExec(containerId, [
+    "sh",
+    "-c",
+    'for d in /proc/[0-9]*; do [ "$(awk \'/^PPid:/ { print $2 }\' "$d/status" 2>/dev/null)" = 1 ] && echo "${d#/proc/}"; done; true',
+  ], "1000:1000");
+  const pids = listed.stdout.split("\n").map((line) => line.trim()).filter(Boolean);
+  if (listed.status !== 0 || pids.length !== 1) {
+    throw new Error(`expected exactly one child of the session init: ${describeOutput(listed.output)}`);
+  }
+  return pids[0] as string;
+}
 
 function procStatusField(status: string, field: string): string {
   const line = status.split("\n").find((candidate) => candidate.startsWith(`${field}:`));
@@ -405,14 +425,20 @@ describe("runtime topology and capability floor on real Docker", () => {
     expect(capAdd, "session does not add NET_ADMIN").not.toContain("NET_ADMIN");
     expect(capAdd, "session does not add NET_RAW").not.toContain("NET_RAW");
 
-    const pid1 = containerExec(sessionId, ["awk", "/^(Uid|Gid|NoNewPrivs|CapBnd):/ { print }", "/proc/1/status"], "1000:1000");
-    expect(pid1.status, `could not read session PID 1 status: ${describeOutput(pid1.output)}`).toBe(0);
-    expect(procStatusField(pid1.stdout, "Uid").split(/\s+/)[0], "session PID 1 UID is fixed").toBe("1000");
-    expect(procStatusField(pid1.stdout, "Gid").split(/\s+/)[0], "session PID 1 GID is fixed").toBe("1000");
-    expect(procStatusField(pid1.stdout, "NoNewPrivs"), "session PID 1 no-new-privileges").toBe("1");
-    const capBnd = procStatusField(pid1.stdout, "CapBnd");
-    expect(capBitSet(capBnd, CAP_NET_ADMIN), "NET_ADMIN remains in session CapBnd").toBe(false);
-    expect(capBitSet(capBnd, CAP_NET_RAW), "NET_RAW remains in session CapBnd").toBe(false);
+    // PID 1 is Docker's init; the agent is its child. Both hold the floor: the
+    // init is the process a stop signal reaches first, the agent is the one
+    // that does the work.
+    const agentPid = sessionAgentPid(sessionId);
+    for (const [label, pid] of [["session PID 1 (init)", "1"], ["session agent (init's child)", agentPid]] as const) {
+      const status = containerExec(sessionId, ["awk", "/^(Uid|Gid|NoNewPrivs|CapBnd):/ { print }", `/proc/${pid}/status`], "1000:1000");
+      expect(status.status, `could not read ${label} status: ${describeOutput(status.output)}`).toBe(0);
+      expect(procStatusField(status.stdout, "Uid").split(/\s+/)[0], `${label} UID is fixed`).toBe("1000");
+      expect(procStatusField(status.stdout, "Gid").split(/\s+/)[0], `${label} GID is fixed`).toBe("1000");
+      expect(procStatusField(status.stdout, "NoNewPrivs"), `${label} no-new-privileges`).toBe("1");
+      const capBnd = procStatusField(status.stdout, "CapBnd");
+      expect(capBitSet(capBnd, CAP_NET_ADMIN), `NET_ADMIN remains in ${label} CapBnd`).toBe(false);
+      expect(capBitSet(capBnd, CAP_NET_RAW), `NET_RAW remains in ${label} CapBnd`).toBe(false);
+    }
 
     const idProbe = containerExec(sessionId, ["sh", "-lc", 'printf "uid=%s gid=%s\\n" "$(id -u)" "$(id -g)"'], "1000:1000");
     expect(idProbe.stdout.trim(), "session exec uid/gid fixed").toBe("uid=1000 gid=1000");
@@ -420,6 +446,25 @@ describe("runtime topology and capability floor on real Docker", () => {
     const setuid = containerExec(sessionId, ["/usr/local/bin/runfree-setuid-id", "-u"], "1000:1000");
     expect(setuid.status, `setuid probe failed: ${describeOutput(setuid.output)}`).toBe(0);
     expect(setuid.stdout.trim(), "a setuid helper still runs as uid 1000").toBe("1000");
+  }, TEST_TIMEOUT_MS);
+
+  test("the session runs under Docker's init: Init is true and PID 1 is the daemon's init, not the entry", () => {
+    expect(inspectField(sessionId, "{{json .HostConfig.Init}}"), "session HostConfig.Init").toBe("true");
+    const cmdline = containerExec(sessionId, ["cat", "/proc/1/cmdline"], "1000:1000");
+    expect(cmdline.status, `could not read session PID 1 cmdline: ${describeOutput(cmdline.output)}`).toBe(0);
+    const argv = cmdline.stdout.split("\0");
+    expect(argv[0], "session PID 1 is Docker's init").toBe("/sbin/docker-init");
+    expect(argv[1], "the init runs the session entry after its separator").toBe("--");
+    expect(argv[2], "the init's command is the session entry").toBe(SESSION_ENTRY_PATH);
+    // The host anchor agrees: the daemon's `State.Pid` is the init, and the
+    // entry has already handed off to the agent under it (the launch reports
+    // `attached` only after that).
+    const anchorPid = Number(inspectField(sessionId, "{{.State.Pid}}"));
+    const top = dockerOrThrow("list the session processes", ["container", "top", sessionId, "-o", "pid,ppid,args"]);
+    expect(parseSessionContainerTopHandoff(top, { anchorPid, init: true }), "the entry handed off under the init")
+      .toBe("handed-off");
+    const agentCmdline = containerExec(sessionId, ["cat", `/proc/${sessionAgentPid(sessionId)}/cmdline`], "1000:1000");
+    expect(agentCmdline.stdout.split("\0").slice(0, 2), "the init's child is no longer the entry").not.toContain(SESSION_ENTRY_PATH);
   }, TEST_TIMEOUT_MS);
 
   test("the proxy keeps NET_ADMIN without NET_RAW for the nftables backend", () => {

@@ -238,8 +238,9 @@ export async function startSessionContainerForeground(
  * ended without the container ending with it.
  *
  * A `docker start --attach` child can die on its own — a broken pipe, a killed
- * terminal, a signalled CLI — while the agent it was showing keeps running as
- * PID 1 of a container this host has just re-inspected and proved unchanged.
+ * terminal, a signalled CLI — while the agent it was showing keeps running
+ * (under Docker's init, or as PID 1 of a session created before the init
+ * wrapper) in a container this host has just re-inspected and proved unchanged.
  * Ending such a session would destroy a live process over a lost view of it, so
  * the driver re-attaches instead, and this is the only way to do it.
  *
