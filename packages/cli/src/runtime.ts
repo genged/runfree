@@ -48,6 +48,7 @@ import {
 import { prepareDependencyOverlayPlan } from "./runtime/dependency-overlays.ts";
 import { runFencedProjectDestroy } from "./runtime/destroy.ts";
 import { containerMissingNetwork, dockerClientEnvOptions } from "./runtime/docker.ts";
+import { clearStoppedControlPlaneSelection } from "./runtime/stopped-selection.ts";
 import {
   activeOrStartingAgentSessions,
   printSessions,
@@ -86,7 +87,7 @@ import type {
   RuntimeIO,
   TokenResolutionReceipt,
 } from "./runtime/types.ts";
-import { flushWarnings, runfreeLog } from "./warnings.ts";
+import { flushWarnings, runfreeLog, warn } from "./warnings.ts";
 import { remedy } from "./remedies.ts";
 import { setMcpLogContext } from "./runtime/mcp.ts";
 
@@ -1203,9 +1204,28 @@ export async function stopRuntime(context: RuntimeContext, io: RuntimeIO, option
   // A stopped runtime has no warm launch to serve; the next start re-proves.
   forgetWarmLaunchRecords(context);
   removeValidatedIngressForwarders(context, io, projectHash(context.projectRoot));
+  // Runs after a clean teardown, and also when nothing was left to stop, so a
+  // project an earlier stop left with a stale selection is reclaimed here.
+  const clearStaleSelection = (): void => {
+    const outcome = clearStoppedControlPlaneSelection(context.project.paths.stateDir, {
+      projectId: projectHash(context.projectRoot),
+      composeProject: composeProjectName(context.projectRoot),
+    }, {
+      docker: (args) => io.capture("docker", [...args], { ...dockerClientEnvOptions(context), timeout: 10_000, maxBuffer: 64 * 1024 }),
+      assertAuthority: () => lifecycleLock.assertHeld(),
+    });
+    if (outcome === "unverified") {
+      warn("could not prove the stopped runtime's proxy and networks are gone, so its control-plane selection was kept; if the next start refuses, run runfree destroy");
+    }
+  };
   const project = stopAdapters.docker.projectForWorkspace();
-  if (project) return stopAdapters.docker.composeDown(project);
+  if (project) {
+    const status = stopAdapters.docker.composeDown(project);
+    if (status === 0) clearStaleSelection();
+    return status;
+  }
   console.log("no container to stop");
+  clearStaleSelection();
   return 0;
   } finally {
     lifecycleLock.release();

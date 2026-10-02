@@ -3586,6 +3586,80 @@ describe("runtime command flow", () => {
     expect(sessionSetInspections).toHaveLength(2);
   });
 
+  describe("stop and the effective control-plane selection", () => {
+    // After `compose down` the selection still names the removed proxy and
+    // networks; left in place, the next start rebinds against networks that no
+    // longer exist and refuses on every start.
+    const absenceReads = (io: { calls: RuntimeIoCall[] }) => io.calls.filter((call) => call.method === "capture"
+      && call.command === "docker"
+      && ((call.args[0] === "ps" && call.args[1] === "--all" && call.args.some((arg) => arg.startsWith("id=")))
+        || (call.args[0] === "network" && call.args[1] === "ls")));
+    const goneAfterDown = (command: string, args: string[]): CaptureResult | undefined => {
+      if (command !== "docker") return undefined;
+      if (args[0] === "ps" && args[1] === "--all" && args.some((arg) => arg.startsWith("id="))) return captureResult(0);
+      if (args[0] === "network" && args[1] === "ls") return captureResult(0);
+      return undefined;
+    };
+    /** The workspace still has its Compose project, so stop takes compose down. */
+    const withComposeProject = (context: RuntimeContext) => (command: string, args: string[]): CaptureResult | undefined => {
+      if (command === "docker" && args[0] === "ps" && args[1] === "-aq") return captureResult(0, `${FAKE_PROXY_CONTAINER_ID}\n`);
+      if (command === "docker" && args[0] === "inspect" && args.some((arg) => arg.includes("com.docker.compose.project"))) {
+        return captureResult(0, `${composeProjectName(context.projectRoot)}\n`);
+      }
+      return goneAfterDown(command, args);
+    };
+    const composeDowns = (io: { calls: RuntimeIoCall[] }) => io.calls.filter((call) => call.method === "run"
+      && call.command === "docker" && call.args.includes("down"));
+
+    async function startedProject(): Promise<RuntimeContext> {
+      const projectRoot = path.join(tmp, "project");
+      const context: RuntimeContext = {
+        projectRoot,
+        project: prepareProject(projectRoot),
+        runtimeRoot: path.join(tmp, "runtime"),
+        env: { PATH: "/fake-bin" },
+        network: fixedNetwork,
+      };
+      expect((await startRuntime(context, createRuntimeIO(), false, {})).status).toBe(0);
+      expect(readEffectiveControlPlaneV2(context.project.paths.stateDir)).toBeDefined();
+      return context;
+    }
+
+    test("a clean compose down whose proxy and networks Docker proves gone clears the selection", async () => {
+      const context = await startedProject();
+      const io = createRuntimeIO({ capture: withComposeProject(context) });
+      expect(await stopRuntime(context, io)).toBe(0);
+      expect(composeDowns(io)).toHaveLength(1);
+      expect(absenceReads(io)).toHaveLength(3);
+      expect(readEffectiveControlPlaneV2(context.project.paths.stateDir)).toBeUndefined();
+    });
+
+    test("a failed compose down keeps the selection and reads nothing to prove absence", async () => {
+      const context = await startedProject();
+      const io = createRuntimeIO({
+        capture: withComposeProject(context),
+        run: (command, args) => (command === "docker" && args.includes("down") ? 1 : 0),
+      });
+      expect(await stopRuntime(context, io)).toBe(1);
+      expect(composeDowns(io)).toHaveLength(1);
+      expect(absenceReads(io)).toHaveLength(0);
+      expect(readEffectiveControlPlaneV2(context.project.paths.stateDir)).toBeDefined();
+    });
+
+    test("with nothing left to stop, a selection an earlier stop left behind is reclaimed", async () => {
+      const context = await startedProject();
+      const io = createRuntimeIO({
+        capture: (command, args) => (command === "docker" && args[0] === "ps" && args[1] === "-aq"
+          ? captureResult(0)
+          : goneAfterDown(command, args)),
+      });
+      expect(await stopRuntime(context, io)).toBe(0);
+      expect(composeDowns(io)).toHaveLength(0);
+      expect(absenceReads(io)).toHaveLength(3);
+      expect(readEffectiveControlPlaneV2(context.project.paths.stateDir)).toBeUndefined();
+    });
+  });
+
   // A runtime materialized before the session-file cutover has a manifest with
   // no `sessionAdmissionSource`. That manifest is not "not files", it is
   // unreadable — so the durable selection it backs is refused, and `up` must

@@ -403,7 +403,14 @@ step starts. A repeated rebuild can therefore resume after any final-state
 boundary.
 Unreadable or unclaimed evidence is refused with
 `runfree destroy --force` as the explicit remedy. `runfree stop` stops
-services. `runfree destroy` destroys the whole project runtime under the
+services. After a clean Compose teardown, or when nothing was left to stop,
+and when no lifecycle record or rebind journal remains and Docker proves the
+selected proxy and both selected networks are gone, stop also clears the stale
+live-container selection, so the next start takes the fresh path rather than a
+compatible rebind against networks that no longer exist
+([stopped-selection.ts](../packages/cli/src/runtime/stopped-selection.ts)).
+Anything short of that proof keeps the selection; when the state or Docker
+could not answer, stop warns and names `runfree destroy`. `runfree destroy` destroys the whole project runtime under the
 project lifecycle lock. Plain destroy proves ordinary utility ownership before
 the unclaimed-container refusal gate. After every refusal gate passes, it
 revokes recorded session authority file-first, stops the proxy, and removes
