@@ -1025,6 +1025,12 @@ function managedSessionHint(container: SessionContainerSnapshot, expected: Sessi
       SESSION_CONTAINER_LABELS.admissionContractEpoch,
     ].some((label) => Object.hasOwn(container.labels, label));
   if (projectScoped && sessionSpecificHint) return true;
+  // A runtime-owned ingress forwarder (per-session MCP callback, VNC, port
+  // forward) is managed and project-scoped but is never a session: it carries
+  // no session label, runs the ingress image rather than an agent image, and
+  // is proved by its own utility validation. Counted here, every live callback
+  // forwarder blocked session-agent image and materialization cleanup.
+  if (container.labels[SESSION_CONTAINER_LABELS.role] === "ingress-forwarder") return false;
   if (hasComposeOwnershipLabel(container.labels)) return false;
   return projectScoped && (container.managedInventoryHint === true
     || container.labels[SESSION_CONTAINER_LABELS.managed] === "true"

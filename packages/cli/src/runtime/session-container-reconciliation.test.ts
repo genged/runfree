@@ -699,6 +699,35 @@ describe("session-container reconciliation", () => {
     expect(unreferencedSessionAgentMaterializationDigests([digest("9")], accounting)).toEqual([]);
   });
 
+  test("a live ingress forwarder is not a session and does not block image cleanup", () => {
+    const record = bound();
+    const forwarderLabels = {
+      "io.runfree.managed": "true",
+      "io.runfree.container-role": "ingress-forwarder",
+      "io.runfree.ingress-purpose": "mcp-callback",
+      "io.runfree.label-schema": "1",
+      "io.runfree.lifecycle-owner": "utility",
+      "io.runfree.project-id": PROJECT.projectId,
+    };
+    const forwarder = snapshot(record, {
+      containerId: "e".repeat(64),
+      containerName: `runfree-ingress-mcp-callback-${PROJECT.projectId}-47301`,
+      labels: forwarderLabels,
+    });
+    const clean = accountSessionAgentImageReferences({ expectedProject: PROJECT, records: [], containers: [forwarder] });
+    expect(clean.uncertainContainerIds).toEqual([]);
+    expect(classifySessionContainerReconciliation({ expectedProject: PROJECT, records: [], containers: [forwarder] })).toEqual([]);
+
+    // The role exempts nothing that also claims a session.
+    const claiming = snapshot(record, {
+      containerId: "e".repeat(64),
+      containerName: `runfree-ingress-mcp-callback-${PROJECT.projectId}-47301`,
+      labels: { ...forwarderLabels, "io.runfree.session-id": record.sessionId },
+    });
+    const blocked = accountSessionAgentImageReferences({ expectedProject: PROJECT, records: [], containers: [claiming] });
+    expect(blocked.uncertainContainerIds).toEqual(["e".repeat(64)]);
+  });
+
   test("retains the exact selected identity from a verified live container without a lifecycle record", () => {
     const record = bound();
     const accounting = accountSessionAgentImageReferences({
