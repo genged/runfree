@@ -346,11 +346,20 @@ export type DestroyLiveFixtureOptions = Readonly<{
 
 export function destroyLiveFixture(fixture: LiveFixture, options: DestroyLiveFixtureOptions = {}): void {
   const report = options.report ?? ((message: string) => process.stderr.write(`${message}\n`));
+  const project = composeProjectName(fixture);
   const destroyed = fixture.runfree(["destroy"]);
   if (destroyed.status !== 0) {
     report(
       `runtime-live: destroy failed; reclaim with make reclaim-runtime-sandbox-apply: ${describeOutput(destroyed.output)}`,
     );
+  } else {
+    // A clean destroy owns the whole project, its volumes included: session
+    // volumes no Compose service uses once leaked about three per fixture.
+    const volumes = docker(["volume", "ls", "-q", "--filter", `label=com.docker.compose.project=${project}`]);
+    const left = volumes.stdout.split("\n").map((line) => line.trim()).filter(Boolean);
+    if (volumes.status !== 0 || left.length > 0) {
+      throw new Error(`runfree destroy left ${project} volumes behind: ${describeOutput(volumes.output || left.join(" "))}`);
+    }
   }
   if (options.keepHostState) {
     report(`runtime-live: keeping project at ${fixture.projectRoot}`);
@@ -415,7 +424,7 @@ import {
   HELD_STATE_FILE,
   type HeldSessionState,
 } from "../session-admission-crash.ts";
-import { docker } from "./docker.ts";
+import { composeProjectName, docker } from "./docker.ts";
 
 /** The one built-in the Phase-1 tranches launch; the sandbox's default was `pathProbe`. */
 export const SANDBOX_PROBE_AGENT = "claude" as const;

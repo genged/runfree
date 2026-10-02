@@ -417,7 +417,11 @@ revokes recorded session authority file-first, stops the proxy, and removes
 session containers by exact record-bound or validated-
 journal-bound ID (they are not Compose resources and Compose teardown cannot
 see them), runs the Compose
-teardown for services, volumes, local images, and orphans, and removes the
+teardown for services, volumes, local images, and orphans, then removes the
+project's session volumes Compose keeps because no service uses them
+(dependency caches, and the retired command-history volume older projects
+still have; matched by the exact project label and `<project>_` name, never
+forced), and removes the
 effective live-container selection, the rebind journal, and exact records in
 the same final order. It deletes this project's session files from the proxy
 before the records that reserve their addresses are touched. Live sessions and unclaimed containers carrying the

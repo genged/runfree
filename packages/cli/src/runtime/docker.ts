@@ -436,6 +436,36 @@ function composeTeardownEnv(composeFilePath: string, baseEnv: NodeJS.ProcessEnv 
   }
 }
 
+/**
+ * Removes the project's volumes that `compose down -v` leaves behind.
+ *
+ * Session containers mount the dependency-cache volumes, which startup creates
+ * with Compose labels (and older sessions also mounted the retired
+ * `runfree-commandhistory`). No Compose service uses them, and Compose 5.x
+ * `down -v` removes only volumes a service uses, so every destroy left them
+ * behind. A volume qualifies only when it carries this
+ * project's exact Compose label and the `<project>_` name startup gives it.
+ * Removal is never forced: Docker still refuses a volume in use.
+ */
+export function removeComposeProjectLeftoverVolumes(
+  io: Pick<RuntimeIO, "capture">,
+  project: string,
+  options: childProcess.SpawnSyncOptions,
+): number {
+  const listed = io.capture("docker", ["volume", "ls", "-q", ...composeProjectVolumeFilters(project)], options);
+  if (listed.status !== 0) {
+    warn(`destroy could not list ${project} volumes: ${listed.stderr.trim().slice(0, 512) || `exit ${listed.status}`}`);
+    return listed.status;
+  }
+  const names = listed.stdout.split("\n").map((line) => line.trim()).filter((name) => name.startsWith(`${project}_`));
+  if (names.length === 0) return 0;
+  const removed = io.capture("docker", ["volume", "rm", ...names], options);
+  if (removed.status !== 0) {
+    warn(`destroy could not remove ${project} volumes: ${removed.stderr.trim().slice(0, 512) || `exit ${removed.status}`}`);
+  }
+  return removed.status;
+}
+
 export function createRuntimeDocker(
   context: RuntimeContext,
   io: RuntimeIO,
@@ -468,6 +498,8 @@ export function createRuntimeDocker(
     serviceContainerIdCache.clear();
     imageInspectCache.clear();
   };
+  const removeProjectSessionVolumes = (project: string): number =>
+    removeComposeProjectLeftoverVolumes(io, project, dockerClientEnvOptions(context));
   const cachedComposeContainers = (project: string): ComposeContainer[] => {
     const cached = composeContainerCache.get(project);
     if (cached) return cached;
@@ -651,7 +683,8 @@ export function createRuntimeDocker(
         { ...options, env: composeTeardownEnv(composeFile(), options.env) },
       );
       clearRuntimeCaches();
-      return status;
+      if (status !== 0) return status;
+      return removeProjectSessionVolumes(project);
     },
     followLogs(project, service) {
       return io.run("docker", composeArgs(project, "logs", ["-f", service]), composeOptions());

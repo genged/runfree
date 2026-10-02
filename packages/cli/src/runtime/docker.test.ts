@@ -1,6 +1,13 @@
 import { expect, test } from "vitest";
 
-import { applyComposeTeardownDefaults, createRuntimeDocker, containerMissingNetwork, serviceContainerId } from "./docker.ts";
+import {
+  applyComposeTeardownDefaults,
+  createRuntimeDocker,
+  containerMissingNetwork,
+  lastObservedDockerDaemonIdentity,
+  removeComposeProjectLeftoverVolumes,
+  serviceContainerId,
+} from "./docker.ts";
 import { inspectReusableManagedImage } from "./image-identity.ts";
 import type { CaptureResult, RuntimeContext, RuntimeIO } from "./types.ts";
 
@@ -169,6 +176,53 @@ test("createComposeManagedVolume creates a local volume with the exact compose o
   ]);
   // The created volume is inspected and validated before any caller mounts it.
   expect(calls[1]?.args).toEqual(["volume", "inspect", "runfree-abc123def456_runfree-deps-abc123def456-pnpm-store"]);
+});
+
+function volumeIO(answers: { list?: CaptureResult; rm?: CaptureResult }) {
+  const calls: string[][] = [];
+  const io = {
+    capture(_command: string, args: string[]): CaptureResult {
+      calls.push(args);
+      if (args[0] === "volume" && args[1] === "ls") return answers.list ?? { status: 0, stdout: "", stderr: "" };
+      if (args[0] === "volume" && args[1] === "rm") return answers.rm ?? { status: 0, stdout: "", stderr: "" };
+      throw new Error(`unexpected docker ${args.join(" ")}`);
+    },
+  };
+  return { io, calls };
+}
+
+// Compose 5.x `down -v` keeps declared volumes no service uses, and session
+// volumes are used only by the session containers outside Compose.
+test("destroy removes the project's own volumes that compose down -v leaves, never forced", () => {
+  const { io, calls } = volumeIO({
+    list: {
+      status: 0,
+      stdout: "runfree-abc123def456_runfree-commandhistory\nrunfree-abc123def456_runfree-deps-abc123def456-pnpm-store\nforged-elsewhere\n",
+      stderr: "",
+    },
+  });
+  expect(removeComposeProjectLeftoverVolumes(io, "runfree-abc123def456", {})).toBe(0);
+  expect(calls).toEqual([
+    ["volume", "ls", "-q", "--filter", "label=com.docker.compose.project=runfree-abc123def456"],
+    ["volume", "rm", "runfree-abc123def456_runfree-commandhistory", "runfree-abc123def456_runfree-deps-abc123def456-pnpm-store"],
+  ]);
+});
+
+test("destroy removes nothing when the project has no leftover volume", () => {
+  const { io, calls } = volumeIO({ list: { status: 0, stdout: "someone-else_volume\n", stderr: "" } });
+  expect(removeComposeProjectLeftoverVolumes(io, "runfree-abc123def456", {})).toBe(0);
+  expect(calls).toHaveLength(1);
+});
+
+test.each([
+  ["the listing fails", { list: { status: 1, stdout: "", stderr: "daemon unavailable" } }],
+  ["Docker refuses a volume in use", {
+    list: { status: 0, stdout: "runfree-abc123def456_runfree-commandhistory\n", stderr: "" },
+    rm: { status: 1, stdout: "", stderr: "volume is in use" },
+  }],
+])("destroy reports, rather than hides, leftover volumes when %s", (_label, answers) => {
+  const { io } = volumeIO(answers);
+  expect(removeComposeProjectLeftoverVolumes(io, "runfree-abc123def456", {})).toBe(1);
 });
 
 test("createComposeManagedVolume fails closed when the daemon rejects the volume", () => {
