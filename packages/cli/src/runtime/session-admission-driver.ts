@@ -2002,7 +2002,9 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
         }
         break;
       }
-      const observed = this.#observeEntryHandoff(record, Math.max(remaining, SESSION_HANDOFF_MIN_READ_MS));
+      // spawnSync refuses a fractional timeout (the monotonic clock is), which
+      // would make every read unreadable and end the wait at once.
+      const observed = this.#observeEntryHandoff(record, Math.ceil(Math.max(remaining, SESSION_HANDOFF_MIN_READ_MS)));
       this.#lock();
       if (observed === "handed-off") break;
       if (observed === "unreadable") {

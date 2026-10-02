@@ -94,7 +94,19 @@ import { setMcpLogContext } from "./runtime/mcp.ts";
 export { containerMissingNetwork };
 export type { CaptureResult, RuntimeAdminIntent, RuntimeContext, RuntimeIO } from "./runtime/types.ts";
 
-function run(command: string, args: string[], options: childProcess.SpawnSyncOptions = {}): number {
+/**
+ * `spawnSync` throws on a fractional `timeout`, and deadline arithmetic on the
+ * monotonic clock produces one. Rounded up, so a bound is never shortened.
+ */
+export function integerSpawnTimeout<T extends { timeout?: number }>(options: T): T {
+  const { timeout } = options;
+  return typeof timeout === "number" && Number.isFinite(timeout) && !Number.isInteger(timeout)
+    ? { ...options, timeout: Math.ceil(timeout) }
+    : options;
+}
+
+function run(command: string, args: string[], rawOptions: childProcess.SpawnSyncOptions = {}): number {
+  const options = integerSpawnTimeout(rawOptions);
   const result = childProcess.spawnSync(command, args, {
     stdio: "inherit",
     ...options,
@@ -119,7 +131,8 @@ function dockerTransport(): DockerApiCapture {
   return dockerApiCapture;
 }
 
-function capture(command: string, args: string[], options: childProcess.SpawnSyncOptions = {}): CaptureResult {
+function capture(command: string, args: string[], rawOptions: childProcess.SpawnSyncOptions = {}): CaptureResult {
+  const options = integerSpawnTimeout(rawOptions);
   // A fixed allowlist of hot `docker` argv shapes is answered over the Engine
   // API socket with CLI-identical output; every other call, and every doubt,
   // stays on the CLI below (see runtime/docker-api/transport.ts).

@@ -83,6 +83,7 @@ import {
   sessionsRuntime,
   statusRuntime,
   stopRuntime,
+  integerSpawnTimeout,
   type CaptureResult,
   type RuntimeAdminIntent,
   type RuntimeContext,
@@ -3584,6 +3585,14 @@ describe("runtime command flow", () => {
     expect(exactNetworkInspections).toHaveLength(2);
     expect(baseStateInspections).toHaveLength(2);
     expect(sessionSetInspections).toHaveLength(2);
+  });
+
+  test("spawn timeouts from deadline arithmetic are rounded up to the integer spawnSync requires", () => {
+    expect(integerSpawnTimeout({ timeout: 9999.954208 })).toEqual({ timeout: 10_000 });
+    expect(integerSpawnTimeout({ timeout: 0.2, maxBuffer: 8 })).toEqual({ timeout: 1, maxBuffer: 8 });
+    const whole = { timeout: 1000 };
+    expect(integerSpawnTimeout(whole)).toBe(whole);
+    expect(integerSpawnTimeout({})).toEqual({});
   });
 
   describe("stop and the effective control-plane selection", () => {

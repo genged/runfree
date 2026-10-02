@@ -4073,6 +4073,9 @@ describe("session admission under the per-session file source", () => {
       expect(topCalls.length).toBeGreaterThan(0);
       for (const [, , options] of topCalls) {
         expect(options).toMatchObject({ killSignal: "SIGKILL", maxBuffer: 64 * 1024 });
+        // spawnSync throws on a fractional timeout, which made every real read
+        // unreadable and ended the handoff wait at once.
+        expect(Number.isInteger((options as { timeout: number }).timeout)).toBe(true);
         expect((options as { timeout: number }).timeout).toBeGreaterThan(0);
         expect((options as { timeout: number }).timeout).toBeLessThanOrEqual(SESSION_HANDOFF_WAIT_CEILING_MS);
       }
