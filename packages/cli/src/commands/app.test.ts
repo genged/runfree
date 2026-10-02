@@ -411,19 +411,37 @@ describe("runCommandApp parser", () => {
     expect(runDefault).not.toHaveBeenCalled();
   });
 
-  test("the typed default tolerates agent-specific flags (non-strict $0)", async () => {
+  test("the typed default rejects unknown flags and extra positionals before any runtime work", async () => {
     const runDefault = vi.fn(async () => 0);
 
-    // Built-in/configured agent names route through the non-strict `$0 [agent]`
-    // default, which tolerates trailing agent-specific flags (e.g.
-    // `claude --resume`) instead of rejecting them, and reaches the typed runtime
-    // core. The flags are not forwarded to the agent — the agent runs its fixed
-    // configured RUNFREE_AGENT_COMMAND, exactly as the legacy path did; this only
-    // asserts they are accepted, not rejected.
-    await expect(runCommandApp(strictContext(), ["claude", "--resume"], runDefault)).rejects.toThrow(
-      "runtimeContext() must not be called",
-    );
+    // The agent never receives trailing flags, so accepting one would silently
+    // drop it (`claude --resume` starting a fresh session, `--version` starting
+    // the runtime). strictContext throws if the runtime context is reached, so a
+    // CliError here proves the refusal came first.
+    const cases: Array<[string[], string, string | undefined]> = [
+      [["--version"], "Unknown argument: version", "use: runfree version"],
+      [["claude", "--resume"], "Unknown argument: resume", "use: runfree resume"],
+      [["claude", "--resume=abc"], "Unknown argument: resume", "use: runfree resume"],
+      [["codex", "--bogus"], "Unknown argument: bogus", undefined],
+      [["claude", "extra"], "Unknown argument: extra", undefined],
+    ];
+    for (const [args, reason, hint] of cases) {
+      const error = await runCommandApp(strictContext(), args, runDefault).then(
+        () => undefined,
+        (caught: unknown) => caught,
+      );
+      expect(error, args.join(" ")).toBeInstanceOf(CliError);
+      expect((error as CliError).message).toContain(reason);
+      if (hint) expect((error as CliError).message).toContain(hint);
+      else expect((error as CliError).message).not.toContain("use:");
+    }
     expect(runDefault).not.toHaveBeenCalled();
+  });
+
+  test("a migrated command's unknown flag gets no default-command hint", async () => {
+    await expect(runCommandApp(strictContext(), ["status", "--resume"], vi.fn(async () => 0))).rejects.toMatchObject({
+      message: expect.not.stringContaining("use: runfree resume"),
+    });
   });
 
   test("the typed default interprets --quiet and --verbose", async () => {

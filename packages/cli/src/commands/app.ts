@@ -134,12 +134,11 @@ async function groupHelpText(context: RunfreeCommandContext, name: string): Prom
 // The default `$0 [agent]` command handles bare `runfree`, built-in agents, and
 // project-configured agent names by resolving the optional `agent` positional
 // into a typed runtime intent (default agent | named agent | unknown command).
-// It is intentionally not strict about options so trailing agent-specific flags
-// (e.g. `claude --resume`) are tolerated rather than rejected — but, exactly as
-// the legacy path did, they are NOT forwarded: the agent runs its fixed
-// configured command (RUNFREE_AGENT_COMMAND). Only `--quiet`/`--verbose` are
-// interpreted by Runfree. Dry-run is honored keyed by the agent name (or
-// "default") before any resolution, matching the legacy path.
+// It is strict like every other command: the agent runs its fixed configured
+// command (RUNFREE_AGENT_COMMAND) and never receives trailing flags, so an
+// unknown flag (`claude --resume`, `--version`) is rejected before any project
+// or Docker work rather than silently dropped. Dry-run is honored keyed by the
+// agent name (or "default") before any resolution, matching the legacy path.
 export async function runAgentCommandWithControlPlaneRebindRefusal(
   context: Parameters<typeof runAgentCommand>[0],
   io: Parameters<typeof runAgentCommand>[1],
@@ -177,10 +176,7 @@ function registerDefaultCommand(
           coerce: normalizeSessionName,
         })
         .option("use-approved-policy", { type: "boolean" })
-        .option("verbose", { type: "boolean", alias: "v" })
-        // Opt out of global strict: trailing agent-specific flags/positionals
-        // (e.g. `claude --resume`) are tolerated here, not rejected.
-        .strict(false),
+        .option("verbose", { type: "boolean", alias: "v" }),
     handler((argv: ArgumentsCamelCase<{ agent?: string; quiet?: boolean; "session-name"?: string; "use-approved-policy"?: boolean; verbose?: boolean }>) => {
       const rc = runtimeContextWithSessionName(context.runtimeContext(), argv["session-name"]);
       const dry = runtimeDryRun(rc, nodeRuntimeIO, argv.agent ?? "default");
@@ -304,7 +300,18 @@ export async function runCommandApp(
     // CliError/AdminExit/handler errors and never reinterpret them as usage
     // errors. Only pre-handler parser/validation failures become usage errors.
     if (handlerStarted) throw error;
-    throw asUsageError(error);
+    throw withDefaultCommandHint(asUsageError(error), migrated ? [] : commandArgs);
   }
   return status;
+}
+
+// Flags users reach for on an agent launch that Runfree spells as commands.
+const DEFAULT_COMMAND_FLAG_HINTS: Readonly<Record<string, string>> = {
+  "--version": "runfree version",
+  "--resume": "runfree resume",
+};
+
+function withDefaultCommandHint(error: CliError, defaultArgs: readonly string[]): CliError {
+  const hint = defaultArgs.map((arg) => DEFAULT_COMMAND_FLAG_HINTS[arg.split("=", 1)[0] ?? ""]).find(Boolean);
+  return hint === undefined ? error : new CliError(`${error.message}\nuse: ${hint}`, error.status);
 }

@@ -5,10 +5,9 @@
 //
 // `.strict()` makes unknown commands, unknown options, AND extra positionals
 // fail consistently across every command (so e.g. `service disable <id> typo`
-// is rejected, not silently ignored). The single exception is the tolerant
-// `$0 [agent]` default, which opts back out with `.strict(false)` in its own
-// builder so trailing agent-specific flags/positionals (e.g. `claude --resume`)
-// are accepted rather than rejected.
+// is rejected, not silently ignored). That includes the `$0 [agent]` default:
+// the agent never receives trailing flags, so `claude --resume` is rejected
+// rather than silently dropped.
 
 import yargs from "yargs";
 import type { Argv } from "yargs";
