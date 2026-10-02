@@ -148,18 +148,24 @@ describe("OAuth mediation policy", () => {
     })).toThrow(message);
   });
 
-  test("refuses a state epoch or protocol-read endpoints on a service provider", () => {
+  // One field per case: with both on one provider, either refusal alone
+  // would satisfy the assertion.
+  test.each([
+    ["a state epoch", { stateEpoch: EPOCH }, /stateEpoch is only supported for mcp providers/],
+    ["protocol-read endpoints", {
+      protocolReadEndpoints: [{ host: "auth.example.com", path: "/token" }],
+    }, /protocolReadEndpoints are only supported for mcp providers/],
+  ])("refuses %s on a service provider", (_label, extra, message) => {
     expect(() => validateOAuthMediationPolicy({
       providers: {
         "service:x": {
           kind: "service",
           resourceHost: "api.example.com",
           tokenEndpoints: [{ host: "auth.example.com", path: "/token" }],
-          stateEpoch: EPOCH,
-          protocolReadEndpoints: [{ host: "auth.example.com", path: "/token" }],
+          ...extra,
         },
       },
-    })).toThrow(/only supported for mcp providers/);
+    })).toThrow(message);
   });
 });
 

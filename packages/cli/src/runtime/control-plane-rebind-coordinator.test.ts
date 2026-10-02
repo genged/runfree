@@ -92,6 +92,10 @@ beforeEach(() => {
   mocks.events.length = 0;
   mocks.invalidMaterializationSessionIds.clear();
   stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "runfree-rebind-coordinator-"));
+  // Journal and state publishes fsync every file and directory; against a
+  // temp dir that is pure disk latency. control-plane-rebind.test.ts and
+  // component-state-v2.test.ts prove the durability calls.
+  vi.spyOn(fs, "fsyncSync").mockImplementation(() => {});
   const desiredManifest = sessionAgentMaterializationFixture();
   mocks.desired = {
     selection: {
@@ -106,7 +110,10 @@ beforeEach(() => {
   };
 });
 
-afterEach(() => fs.rmSync(stateDir, { recursive: true, force: true }));
+afterEach(() => {
+  vi.restoreAllMocks();
+  fs.rmSync(stateDir, { recursive: true, force: true });
+});
 
 test("zero-session rebind publishes eligibility to the candidate and admits nothing", async () => {
   const oldTarget = sessionGenerationFixture().target;

@@ -14,6 +14,7 @@ import {
   readMcpEnabled,
   removeMcpEnabledRecords,
   saveMcpEnabledRecord,
+  withoutSharedEnabledEndpoints,
 } from "./mcp-enabled.ts";
 
 let tmp: string;
@@ -217,5 +218,41 @@ describe("projection", () => {
       { host: "mcp.example.com", path: "/oauth/token" },
     ]);
     expect(oauthPolicy.registrationEndpoints).toEqual([{ host: "auth.example.com", path: "/register" }]);
+  });
+
+  test("an endpoint another server declares statically is not mediated for the record; its own declaration is not a share", () => {
+    const own = record({
+      oauthEndpoints: [
+        { kind: "metadata", host: "auth.example.com", path: "/.well-known/oauth-authorization-server" },
+        { kind: "token", host: "auth.example.com", path: "/token" },
+        { kind: "registration", host: "auth.example.com", path: "/register" },
+        { kind: "token", host: "auth.example.com", path: "/own" },
+      ],
+    });
+    const result = withoutSharedEnabledEndpoints([
+      {
+        serverKey: "claude\0project\0srv",
+        label: "claude server srv",
+        policy: { resourceHost: "mcp.example.com", tokenEndpoints: [{ host: "auth.example.com", path: "/own" }] },
+        record: own,
+      },
+      // Another server's string-form static declaration of the same token URL.
+      {
+        serverKey: "codex\0user\0other",
+        label: "codex server other",
+        policy: { resourceHost: "other.example.com", tokenEndpoints: ["https://AUTH.example.com/token"] },
+      },
+    ]);
+    expect(result.records[0]?.oauthEndpoints).toEqual([
+      { kind: "metadata", host: "auth.example.com", path: "/.well-known/oauth-authorization-server" },
+      { kind: "registration", host: "auth.example.com", path: "/register" },
+      { kind: "token", host: "auth.example.com", path: "/own" },
+    ]);
+    expect(result.records[1]).toBeUndefined();
+    expect(result.dropped).toEqual([
+      "mcp: claude server srv token endpoint https://auth.example.com/token is also used by another MCP server; the proxy does not mediate it statically for either",
+    ]);
+    // The caller's record is not mutated: request rules still use every endpoint.
+    expect(own.oauthEndpoints).toHaveLength(4);
   });
 });

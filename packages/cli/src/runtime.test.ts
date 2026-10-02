@@ -125,7 +125,6 @@ const FAKE_AGENT_CONTAINER_ID = "1".repeat(64);
 const FAKE_PROXY_CONTAINER_ID = "2".repeat(64);
 const FAKE_AGENT_INTERNAL_NETWORK_ID = "3".repeat(64);
 const FAKE_PROXY_EGRESS_NETWORK_ID = "4".repeat(64);
-const FAKE_CALLBACK_HOST_NETWORK_ID = "5".repeat(64);
 const FAKE_PROXY_CA_PEM = "-----BEGIN CERTIFICATE-----\nfake-proxy-ca\n-----END CERTIFICATE-----\n";
 const FAKE_SYSTEM_ROOTS_PEM = "-----BEGIN CERTIFICATE-----\nfake-system-roots\n-----END CERTIFICATE-----\n";
 
@@ -292,13 +291,11 @@ function out(value) { if (value !== undefined) process.stdout.write(String(value
 function projectName() { return process.env.FAKE_COMPOSE_PROJECT || "fake-project"; }
 function agentIp() { return process.env.FAKE_AGENT_IP || "172.31.90.11"; }
 function proxyIp() { return process.env.FAKE_PROXY_IP || "172.31.90.10"; }
-function callbackIp() { return process.env.FAKE_CALLBACK_RELAY_IP || "172.31.90.12"; }
 function proxyEgressIp() { return process.env.FAKE_PROXY_EGRESS_IP || "172.31.91.10"; }
 const agentContainerId = ${JSON.stringify(FAKE_AGENT_CONTAINER_ID)};
 const proxyContainerId = ${JSON.stringify(FAKE_PROXY_CONTAINER_ID)};
 const agentInternalNetworkId = ${JSON.stringify(FAKE_AGENT_INTERNAL_NETWORK_ID)};
 const proxyEgressNetworkId = ${JSON.stringify(FAKE_PROXY_EGRESS_NETWORK_ID)};
-const callbackHostNetworkId = ${JSON.stringify(FAKE_CALLBACK_HOST_NETWORK_ID)};
 function imageId(reference) {
   return "sha256:" + crypto.createHash("sha256").update(reference).digest("hex");
 }
@@ -389,8 +386,7 @@ if (args[0] === "network" && args[1] === "inspect") {
       IPAM: { Config: [{ Subnet: process.env.FAKE_RUNTIME_SUBNET || "172.31.90.0/24" }] },
       Containers: {
         [proxyContainerId]: { Name: project + "-proxy-1" },
-        ...(process.env.FAKE_PREEXISTING_AGENT_ID ? { [agentContainerId]: { Name: project + "-agent-1" } } : {}),
-        ...(process.env.FAKE_MCP_CALLBACK_SIDECAR_ID ? { [process.env.FAKE_MCP_CALLBACK_SIDECAR_ID]: { Name: project + "-mcp_callback-1" } } : {})
+        ...(process.env.FAKE_PREEXISTING_AGENT_ID ? { [agentContainerId]: { Name: project + "-agent-1" } } : {})
       }
     });
   }
@@ -404,17 +400,6 @@ if (args[0] === "network" && args[1] === "inspect") {
       Containers: {
         [proxyContainerId]: { Name: project + "-proxy-1" }
       }
-    });
-  }
-  if (args.includes(project + "_callback_host")) {
-    networks.push({
-      Id: callbackHostNetworkId,
-      Name: project + "_callback_host",
-      Internal: true,
-      EnableIPv6: false,
-      Containers: process.env.FAKE_MCP_CALLBACK_SIDECAR_ID
-        ? { [process.env.FAKE_MCP_CALLBACK_SIDECAR_ID]: { Name: project + "-mcp_callback-1" } }
-        : {}
     });
   }
   if (networks.length === 0) {
@@ -447,18 +432,13 @@ if (args[0] === "ps") {
     if (process.env.FAKE_PREEXISTING_AGENT_ID) out(quiescedAgentId + "\\n");
   }
   else if (text.includes("com.docker.compose.service=proxy")) out(proxyContainerId + "\\n");
-  else if (text.includes("com.docker.compose.service=mcp_callback") && process.env.FAKE_MCP_CALLBACK_SIDECAR_ID) {
-    const dockerLog = process.env.FAKE_DOCKER_LOG;
-    const startedByCompose = dockerLog && fs.existsSync(dockerLog) && fs.readFileSync(dockerLog, "utf8").includes('"up"');
-    if (startedByCompose || process.env.FAKE_PREEXISTING_MCP_CALLBACK_ID) out(process.env.FAKE_MCP_CALLBACK_SIDECAR_ID + "\\n");
-  }
   else if (text.includes("com.docker.compose.service=agent")) {
     if (process.env.FAKE_PREEXISTING_AGENT_ID) out(agentContainerId + "\\n");
   }
   else if (text.includes("com.docker.compose.project=")) {
     const startedByCompose = logPath && fs.existsSync(logPath) && fs.readFileSync(logPath, "utf8").includes('"up"');
     const startedContainers = startedByCompose
-      ? [proxyContainerId, ...(process.env.FAKE_PREEXISTING_AGENT_ID ? [agentContainerId] : []), ...(process.env.FAKE_MCP_CALLBACK_SIDECAR_ID ? [process.env.FAKE_MCP_CALLBACK_SIDECAR_ID] : [])].join("\\n") + "\\n"
+      ? [proxyContainerId, ...(process.env.FAKE_PREEXISTING_AGENT_ID ? [agentContainerId] : [])].join("\\n") + "\\n"
       : "";
     out(process.env.FAKE_COMPOSE_CONTAINERS ?? startedContainers);
   }
@@ -488,17 +468,6 @@ if (args[0] === "container" && args[1] === "inspect") {
       NetworkSettings: { Networks: {
         [project + "_agent_internal"]: { NetworkID: agentInternalNetworkId },
         [project + "_proxy_egress"]: { NetworkID: proxyEgressNetworkId }
-      } }
-    });
-  }
-  if (process.env.FAKE_MCP_CALLBACK_SIDECAR_ID && requested.includes(process.env.FAKE_MCP_CALLBACK_SIDECAR_ID)) {
-    containers.push({
-      Id: process.env.FAKE_MCP_CALLBACK_SIDECAR_ID,
-      Image: proxyImage,
-      State: { Running: true, StartedAt: "2026-06-13T00:00:00.000Z" },
-      NetworkSettings: { Networks: {
-        [project + "_agent_internal"]: { NetworkID: agentInternalNetworkId },
-        [project + "_callback_host"]: { NetworkID: callbackHostNetworkId }
       } }
     });
   }
@@ -572,49 +541,6 @@ if (args[0] === "inspect") {
     out(JSON.stringify(securityEntries.filter((entry) => args.includes(entry.Id))));
     process.exit(0);
   }
-  if (process.env.FAKE_MCP_CALLBACK_SIDECAR_ID && args.includes(process.env.FAKE_MCP_CALLBACK_SIDECAR_ID) && !text.includes("--format")) {
-    const project = projectName();
-    const port = process.env.RUNFREE_MCP_OAUTH_CALLBACK_PORT || "47123";
-    out(JSON.stringify([{
-      Id: process.env.FAKE_MCP_CALLBACK_SIDECAR_ID,
-      Config: {
-        Cmd: ["node", "/app/proxy/mcp-callback-relay.js"],
-        Env: [
-          "RUNFREE_CALLBACK_LISTEN_HOST=0.0.0.0",
-          "RUNFREE_CALLBACK_LISTEN_PORT=" + port,
-          "RUNFREE_CALLBACK_TARGET_HOST=" + agentIp(),
-          "RUNFREE_CALLBACK_TARGET_PORT=" + port,
-          "RUNFREE_CALLBACK_RELAY_IP=" + callbackIp()
-        ],
-        Labels: {
-          "io.runfree.project-id": process.env.RUNFREE_PROJECT_ID,
-          "io.runfree.utility-role": "mcp-callback-relay",
-          "io.runfree.utility-version": "1"
-        },
-        User: "1001:1001"
-      },
-      HostConfig: {
-        CapAdd: [],
-        CapDrop: ["ALL"],
-        NetworkMode: project + "_callback_host",
-        PidsLimit: 64,
-        PortBindings: { [port + "/tcp"]: [{ HostIp: "127.0.0.1", HostPort: port }] },
-        Privileged: false,
-        ReadonlyRootfs: true,
-        SecurityOpt: ["no-new-privileges:true"]
-      },
-      Mounts: [],
-      NetworkSettings: {
-        Ports: { [port + "/tcp"]: [{ HostIp: "127.0.0.1", HostPort: port }] },
-        Networks: {
-          [project + "_callback_host"]: { IPAddress: "172.31.0.2" },
-          [project + "_agent_internal"]: { IPAddress: callbackIp() }
-        }
-      },
-      State: { Running: true, StartedAt: "2026-06-13T00:00:00.000Z" }
-    }]));
-    process.exit(0);
-  }
   if (args.includes(agentContainerId) && !text.includes("--format")) {
     out(JSON.stringify([{ Id: agentContainerId, Config: { Env: [] }, Mounts: [
       mount("/workspace", "rw"),
@@ -633,9 +559,7 @@ if (args[0] === "inspect") {
     }
     const ids = args.slice(3);
     for (const id of ids) {
-      const service = id === proxyContainerId
-        ? "proxy"
-        : id === process.env.FAKE_MCP_CALLBACK_SIDECAR_ID ? "mcp_callback" : "agent";
+      const service = id === proxyContainerId ? "proxy" : "agent";
       const agentDigest = service === "agent" ? (components.agentImageInputDigest || process.env.RUNFREE_AGENT_IMAGE_INPUT_DIGEST || "<no value>") : "<no value>";
       const proxyDigest = service === "proxy" ? (components.proxyImageInputDigest || process.env.RUNFREE_PROXY_IMAGE_INPUT_DIGEST || "<no value>") : "<no value>";
       out([
@@ -1042,6 +966,10 @@ beforeEach(() => {
   tmp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "runfree-runtime-tests-")));
   previousPath = process.env.PATH;
   writeRuntimeAssets(path.join(tmp, "runtime"));
+  // Durable state publishes fsync every file and directory; against a temp
+  // dir that is pure disk latency (~1 s per test). No test here asserts
+  // durability; component-state-v2.test.ts proves it.
+  vi.spyOn(fs, "fsyncSync").mockImplementation(() => {});
   vi.spyOn(console, "error").mockImplementation(() => {});
   vi.spyOn(console, "log").mockImplementation(() => {});
 });
@@ -1059,9 +987,6 @@ afterEach(() => {
   delete process.env.FAKE_DOCKER_LOG;
   delete process.env.FAKE_EXPECTED_NETWORK;
   delete process.env.FAKE_MARKER_LOG;
-  delete process.env.FAKE_MCP_CALLBACK_PORT;
-  delete process.env.FAKE_MCP_CALLBACK_SIDECAR_ID;
-  delete process.env.FAKE_PREEXISTING_MCP_CALLBACK_ID;
   delete process.env.FAKE_PREEXISTING_AGENT_ID;
   delete process.env.FAKE_RUNTIME_DIGEST;
   delete process.env.RUNFREE_TEST_SESSION_RANDOM;
@@ -1424,12 +1349,10 @@ function createRuntimeIO(overrides: {
       }), null, 2)}\n`);
     }
     const runningOnly = args.includes("-q") && !args.includes("-a") && !args.includes("-aq");
-    const callbackSidecarId = process.env.FAKE_MCP_CALLBACK_SIDECAR_ID;
     const projectId = observedProject.replace(/^runfree-/, "");
-    const derivedCallbackPort = /^[0-9a-f]{6}/.test(projectId)
+    const callbackPort = /^[0-9a-f]{6}/.test(projectId)
       ? String(47100 + (Number.parseInt(projectId.slice(0, 6), 16) % 1000))
       : "47123";
-    const callbackPort = process.env.FAKE_MCP_CALLBACK_PORT ?? derivedCallbackPort;
     const effectiveManifest = readEffectiveRuntimeGeneration(path.join(tmp, "state"));
     const desiredManifest = (() => {
       const root = path.join(tmp, "state", "runtime", "materializations");
@@ -1495,7 +1418,6 @@ function createRuntimeIO(overrides: {
       return captureResult(0, [
         ...(process.env.FAKE_PREEXISTING_AGENT_ID ? [FAKE_AGENT_CONTAINER_ID] : []),
         FAKE_PROXY_CONTAINER_ID,
-        ...(callbackSidecarId ? [callbackSidecarId] : []),
       ].join("\n"));
     }
     if (args[0] === "inspect" && args.includes("--format") && args.some((arg) => arg.includes("io.runfree.runtime-digest"))) {
@@ -1506,7 +1428,7 @@ function createRuntimeIO(overrides: {
           && componentEnv.RUNFREE_TOPOLOGY_DIGEST,
       );
       return captureResult(0, ids.map((id) => {
-        const service = id === FAKE_PROXY_CONTAINER_ID ? "proxy" : id === callbackSidecarId ? "mcp_callback" : "agent";
+        const service = id === FAKE_PROXY_CONTAINER_ID ? "proxy" : "agent";
         return [
           id,
           service,
@@ -1560,44 +1482,6 @@ function createRuntimeIO(overrides: {
       inspectedImagesById.set(inspectedImage.Id, inspectedImage);
       return captureResult(0, JSON.stringify([inspectedImage]));
     }
-    const callbackSidecarInspect = callbackSidecarId ? {
-      Id: callbackSidecarId,
-      Config: {
-        Cmd: ["node", "/app/proxy/mcp-callback-relay.js"],
-        Env: [
-          "RUNFREE_CALLBACK_LISTEN_HOST=0.0.0.0",
-          `RUNFREE_CALLBACK_LISTEN_PORT=${callbackPort}`,
-          `RUNFREE_CALLBACK_TARGET_HOST=${fixedNetwork.agentIp}`,
-          `RUNFREE_CALLBACK_TARGET_PORT=${callbackPort}`,
-          `RUNFREE_CALLBACK_RELAY_IP=${fixedNetwork.callbackSidecarIp}`,
-        ],
-        Labels: {
-          "io.runfree.project-id": projectId,
-          "io.runfree.utility-role": "mcp-callback-relay",
-          "io.runfree.utility-version": "1",
-        },
-        User: "1001:1001",
-      },
-      HostConfig: {
-        CapAdd: [],
-        CapDrop: ["ALL"],
-        NetworkMode: `${observedProject}_callback_host`,
-        PidsLimit: 64,
-        PortBindings: { [`${callbackPort}/tcp`]: [{ HostIp: "127.0.0.1", HostPort: callbackPort }] },
-        Privileged: false,
-        ReadonlyRootfs: true,
-        SecurityOpt: ["no-new-privileges:true"],
-      },
-      Mounts: [],
-      NetworkSettings: {
-        Ports: { [`${callbackPort}/tcp`]: [{ HostIp: "127.0.0.1", HostPort: callbackPort }] },
-        Networks: {
-          [`${observedProject}_callback_host`]: { IPAddress: "172.31.0.2" },
-          [`${observedProject}_agent_internal`]: { IPAddress: fixedNetwork.callbackSidecarIp },
-        },
-      },
-      State: { Running: true, StartedAt: "2026-06-13T00:00:00.000Z" },
-    } : undefined;
     if (args[0] === "container" && args[1] === "inspect") {
       const proxyImageRef = observedComposeEnv.RUNFREE_PROXY_IMAGE
         ?? selectedManifest?.images?.proxy
@@ -1612,15 +1496,6 @@ function createRuntimeIO(overrides: {
           NetworkSettings: { Networks: {
             [`${observedProject}_agent_internal`]: { NetworkID: FAKE_AGENT_INTERNAL_NETWORK_ID },
             [`${observedProject}_proxy_egress`]: { NetworkID: FAKE_PROXY_EGRESS_NETWORK_ID },
-          } },
-        }] : []),
-        ...(callbackSidecarInspect && requested.has(callbackSidecarInspect.Id) ? [{
-          Id: callbackSidecarInspect.Id,
-          Image: proxyImageId,
-          State: { Running: true, StartedAt: "2026-06-13T00:00:00.000Z" },
-          NetworkSettings: { Networks: {
-            [`${observedProject}_agent_internal`]: { NetworkID: FAKE_AGENT_INTERNAL_NETWORK_ID },
-            [`${observedProject}_callback_host`]: { NetworkID: FAKE_CALLBACK_HOST_NETWORK_ID },
           } },
         }] : []),
       ]));
@@ -1641,10 +1516,9 @@ function createRuntimeIO(overrides: {
       if (runningOnly && !process.env.FAKE_PREEXISTING_AGENT_ID && !composeStarted) return captureResult(0);
       return captureResult(0, fakeListedContainerIds(args, [FAKE_PROXY_CONTAINER_ID]));
     }
+    // The Compose `mcp_callback` relay is retired; it is never present.
     if (args[0] === "ps" && args.some((arg) => arg.includes("com.docker.compose.service=mcp_callback"))) {
-      if (!callbackSidecarId) return captureResult(0);
-      if (runningOnly && !composeStarted && !process.env.FAKE_PREEXISTING_MCP_CALLBACK_ID) return captureResult(0);
-      return captureResult(0, fakeListedContainerIds(args, [callbackSidecarId]));
+      return captureResult(0);
     }
     // The warm proof's one type-less inspect: proxy, both networks, the agent
     // image, and the session volumes, by id or exact name, in request order.
@@ -1734,19 +1608,8 @@ function createRuntimeIO(overrides: {
             },
           },
         },
-        ...(callbackSidecarInspect ? [callbackSidecarInspect] : []),
       ];
       return captureResult(0, JSON.stringify(entries.filter((entry) => args.includes(entry.Id))));
-    }
-    if (callbackSidecarInspect && args[0] === "inspect" && args.includes(FAKE_AGENT_CONTAINER_ID) && args.includes(callbackSidecarInspect.Id)) {
-      return captureResult(0, JSON.stringify([
-        {
-          Id: FAKE_AGENT_CONTAINER_ID,
-          HostConfig: { PortBindings: {} },
-          NetworkSettings: { Ports: {} },
-        },
-        callbackSidecarInspect,
-      ]));
     }
     if (args[0] === "inspect" && args.includes(FAKE_AGENT_CONTAINER_ID)) {
       return captureResult(0, JSON.stringify([{
@@ -1768,7 +1631,6 @@ function createRuntimeIO(overrides: {
         // agent_internal; session agents attach transiently at admission.
         Containers: {
           [FAKE_PROXY_CONTAINER_ID]: { Name: `${observedProject}-proxy-1` },
-          ...(callbackSidecarInspect ? { [callbackSidecarInspect.Id]: { Name: `${observedProject}-mcp_callback-1` } } : {}),
         },
       });
       if (args.includes(`${observedProject}_proxy_egress`)) networks.push({
@@ -1780,15 +1642,6 @@ function createRuntimeIO(overrides: {
         Containers: {
           [FAKE_PROXY_CONTAINER_ID]: { Name: `${observedProject}-proxy-1` },
         },
-      });
-      if (args.includes(`${observedProject}_callback_host`)) networks.push({
-        Id: FAKE_CALLBACK_HOST_NETWORK_ID,
-        Name: `${observedProject}_callback_host`,
-        Internal: true,
-        EnableIPv6: false,
-        Containers: callbackSidecarInspect ? {
-          [callbackSidecarInspect.Id]: { Name: `${observedProject}-mcp_callback-1` },
-        } : {},
       });
       return networks.length > 0
         ? captureResult(0, JSON.stringify(networks))
@@ -4421,8 +4274,13 @@ describe("runtime command flow", () => {
       const projectId = projectHash(context.projectRoot);
       leaveOldMarker(project.paths.stateDir);
       const stuck = residueDocker({ present: true, rmRemoves: false, projectId, lockPath });
+      // Skip the sweep's real-time absence poll: each clock read jumps past
+      // its deadline, so the first post-rm listing is the last.
+      let clock = performance.now();
+      const fastClock = vi.spyOn(performance, "now").mockImplementation(() => (clock += 60_000));
 
       expect((await startRuntime(context, stuck.io, false, {})).status).toBe(1);
+      fastClock.mockRestore();
       flushWarnings();
       const refusal = vi.mocked(console.error).mock.calls.flat().join("\n");
       expect(refusal).toContain("ephemeral helpers could not be confirmed removed");

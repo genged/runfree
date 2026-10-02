@@ -902,6 +902,11 @@ describe("IP assignment listing (sub-second launch plan Task 6)", () => {
     ["a symlinked assignment", (requests: string) => fs.symlinkSync("/etc/hostname", path.join(requests, "172.31.90.20.json"))],
     ["an oversize assignment", (requests: string) => fs.writeFileSync(path.join(requests, "172.31.90.20.json"), "x".repeat(513))],
     ["a group-writable directory", (requests: string) => fs.chmodSync(requests, 0o775)],
+    ["a hard-linked assignment", (requests: string) => {
+      fs.writeFileSync(path.join(requests, "172.31.90.20.json"), '{"v":1}\n');
+      fs.linkSync(path.join(requests, "172.31.90.20.json"), path.join(requests, "..", "elsewhere.json"));
+    }],
+    ["a name that is not an IPv4 address", (requests: string) => fs.writeFileSync(path.join(requests, "999.1.1.1.json"), '{"v":1}\n')],
   ])("refuses the whole listing on %s", (_label, damage) => {
     const sandbox = reuseSandbox();
     try {

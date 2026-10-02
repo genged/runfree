@@ -4,9 +4,11 @@ import path from "node:path";
 
 import { afterEach, describe, expect, test, vi } from "vitest";
 
+const { disposeLaunchHandoff } = vi.hoisted(() => ({ disposeLaunchHandoff: vi.fn() }));
+
 vi.mock("./prepared-runtime.ts", () => ({
   preparedRuntimeContext: (prepared: { context: unknown }) => prepared.context,
-  disposeLaunchHandoff: () => {},
+  disposeLaunchHandoff,
 }));
 
 import { projectInfo } from "../config.ts";
@@ -18,6 +20,7 @@ const tempDirs: string[] = [];
 
 afterEach(() => {
   vi.restoreAllMocks();
+  disposeLaunchHandoff.mockReset();
   for (const dir of tempDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
 });
 
@@ -182,6 +185,58 @@ describe("MCP auth runtime", () => {
       "project MCP server must be approved before auth: runfree mcp approve codex repo_tools",
     );
     expect(start).not.toHaveBeenCalled();
+  });
+
+  test("rejects a Codex Desktop built-in before runtime startup", async () => {
+    const context = tempContext([
+      "[mcp_servers.node_repl]",
+      'command = "/Applications/Codex.app/Contents/Resources/node_repl"',
+      "",
+    ].join("\n"));
+    const start = vi.fn();
+
+    await expect(mcpAuthRuntime({ agent: "codex", server: "node_repl" }, context, fakeIo(), { start })).rejects.toThrow(
+      "cannot authenticate MCP server codex node_repl: Codex Desktop built-in; not used in Runfree",
+    );
+    expect(start).not.toHaveBeenCalled();
+  });
+
+  test("asks for the launch handoff and releases it when the launch fails", async () => {
+    const context = tempContext([
+      "[mcp_servers.posthog]",
+      'url = "https://mcp.posthog.com/mcp"',
+      "",
+    ].join("\n"));
+    const preparedRuntime = Object.freeze({ version: 1, context }) as never;
+    const start = vi.fn(async () => ({
+      kind: "ready" as const,
+      preparedRuntime,
+      fastPath: true,
+      status: 0 as const,
+      tokenResolutionReceipts: [],
+      credentialFreshness: "receipt-gated" as const,
+    }));
+    const watcherStop = vi.fn();
+    const startTokenAutoRefresh = vi.fn(() => ({ stop: watcherStop }));
+    const launch = vi.fn(async () => {
+      expect(disposeLaunchHandoff).not.toHaveBeenCalled();
+      throw new Error("launch failed");
+    });
+    vi.spyOn(console, "log").mockImplementation(() => {});
+
+    await expect(mcpAuthRuntime({ agent: "codex", server: "posthog" }, context, { ...fakeIo(), startTokenAutoRefresh }, {
+      adaptersFor: () => ({ admin: vi.fn(async () => 0), docker: {} as never }),
+      launch,
+      start,
+    })).rejects.toThrow("launch failed");
+
+    expect(start).toHaveBeenCalledWith(context, expect.anything(), false, expect.objectContaining({ launch: true, launchHandoff: true }));
+    // A receipt-gated preparation skipped source reads, so the watcher's first
+    // pass must sync source truth.
+    expect(startTokenAutoRefresh).toHaveBeenCalledWith(context, [], { initialSourceTruth: true });
+    expect(watcherStop).toHaveBeenCalledTimes(1);
+    expect(disposeLaunchHandoff).toHaveBeenCalledTimes(1);
+    expect(disposeLaunchHandoff).toHaveBeenCalledWith(preparedRuntime);
   });
 
   test("starts validated runtime and launches the agent for public HTTP targets", async () => {

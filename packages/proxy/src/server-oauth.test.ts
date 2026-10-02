@@ -1021,5 +1021,18 @@ describe("proxy server entrypoint: OAuth mediation", () => {
     }
     // Refused before any upstream connection.
     expect(upstream.requests).toHaveLength(forwarded);
+
+    // The refusals above spent none of the per-server budget (30 a minute):
+    // 29 more logins pass as reads, then the next one falls back to write
+    // approval and is refused before it reaches the upstream.
+    for (let index = 1; index < 30; index += 1) {
+      const read = await post("/oauth/token", "grant_type=authorization_code&code=c");
+      expect(read.headers["x-runfree-blocked"], `read ${index}`).toBeUndefined();
+    }
+    const overBudget = await post("/oauth/token", "grant_type=authorization_code&code=c");
+    expect(overBudget.statusCode).toBe(403);
+    expect(overBudget.headers["x-runfree-blocked"]).toMatch(/^write-approval/);
+    expect(upstream.requests).toHaveLength(forwarded + 29);
+    expect(proxy.output()).toContain("proxy: oauth protocol-read budget exhausted name=mcp:claude-linear");
   }, 30_000);
 });

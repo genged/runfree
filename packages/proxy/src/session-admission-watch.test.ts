@@ -219,11 +219,14 @@ describe("session admission watch on a real directory", () => {
     fs.mkdirSync(path.join(root, "sessions"));
     fs.mkdirSync(path.join(root, "ip-reuse", "requests"), { recursive: true });
     let changes = 0;
-    const changed = new Promise<void>((resolve) => {
+    let attempts = 0;
+    let timer: NodeJS.Timeout | undefined;
+    const changed = new Promise<void>((resolve, reject) => {
       const watch = createSessionAdmissionWatch({
         targets: sessionAdmissionWatchTargets(root),
         onChange: () => {
           changes += 1;
+          clearInterval(timer);
           watch.close();
           resolve();
         },
@@ -231,9 +234,23 @@ describe("session admission watch on a real directory", () => {
       });
       watch.rearm();
       expect(watch.armedCount()).toBe(3);
-      const temporary = path.join(root, "sessions", ".runfree-1-0011223344556677.tmp");
-      fs.writeFileSync(temporary, "{}\n");
-      fs.renameSync(temporary, path.join(root, "sessions", `${"d".repeat(64)}.json`));
+      // On macOS, fs.watch rides FSEvents, whose stream can go live a moment
+      // after watch() returns; a rename in that window is never delivered. So
+      // the atomic rename repeats until the handler sees one, within a bound.
+      const renameOnce = (): void => {
+        attempts += 1;
+        if (attempts > 100) {
+          clearInterval(timer);
+          watch.close();
+          reject(new Error("no atomic rename reached the change handler within 10 s"));
+          return;
+        }
+        const temporary = path.join(root, "sessions", `.runfree-1-${String(attempts).padStart(16, "0")}.tmp`);
+        fs.writeFileSync(temporary, "{}\n");
+        fs.renameSync(temporary, path.join(root, "sessions", `${"d".repeat(64)}.json`));
+      };
+      renameOnce();
+      timer = setInterval(renameOnce, 100);
     });
     await changed;
     expect(changes).toBe(1);

@@ -1255,6 +1255,21 @@ describe("admin credential/host/mcp commands", () => {
     await expect(
       runCommandApp(strictContext(), ["mcp", "configure", "--agent", "bogusagent"], runDefault),
     ).rejects.toMatchObject({ message: expect.stringContaining("MCP agent must be claude or codex") });
+    await expect(
+      runCommandApp(strictContext(), ["mcp", "enable", "bogusagent", "srv"], runDefault),
+    ).rejects.toMatchObject({ message: expect.stringContaining("MCP agent must be claude or codex") });
+    await expect(
+      runCommandApp(strictContext(), ["mcp", "enable", "claude", "srv", "--source", "elsewhere"], runDefault),
+    ).rejects.toMatchObject({ message: expect.stringContaining("--source must be user, local, or project") });
+    await expect(
+      runCommandApp(strictContext(), ["mcp", "enable", "claude", "srv", "--from-env", "X", "--from-source", "Y"], runDefault),
+    ).rejects.toMatchObject({ message: expect.stringContaining("choose only one credential source") });
+    await expect(
+      runCommandApp(strictContext(), ["mcp", "enable", "claude", "srv", "--oauth-host"], runDefault),
+    ).rejects.toBeInstanceOf(CliError);
+    await expect(
+      runCommandApp(strictContext(), ["mcp", "revoke", "claude", "srv", "--source", "elsewhere"], runDefault),
+    ).rejects.toMatchObject({ message: expect.stringContaining("--source must be user, local, or project") });
 
     // Valid input parses and reaches enforcement (admin state), not runDefault.
     await expect(
@@ -1279,6 +1294,16 @@ describe("admin credential/host/mcp commands", () => {
     await expect(
       runCommandApp(strictContext(), ["mcp", "auth", "claude", "srv", "--source", "user"], runDefault),
     ).rejects.toThrow("runtimeContext() must not be called");
+    await expect(
+      runCommandApp(
+        strictContext(),
+        ["mcp", "enable", "claude", "srv", "--no-discover", "--oauth-host", "auth.example.com", "--oauth-host", "id.example.com"],
+        runDefault,
+      ),
+    ).rejects.toThrow("adminContext() must not be called");
+    await expect(
+      runCommandApp(strictContext(), ["mcp", "revoke", "claude", "srv", "--source", "project"], runDefault),
+    ).rejects.toThrow("adminContext() must not be called");
     expect(runDefault).not.toHaveBeenCalled();
   });
 

@@ -309,3 +309,93 @@ test("a peer that trickles bytes cannot hold a callback host probe past the setu
     await new Promise<void>((resolve) => server.close(() => resolve()));
   }
 });
+
+async function loopbackServer(onSocket: (socket: net.Socket) => void, port = 0) {
+  const sockets = new Set<net.Socket>();
+  const server = net.createServer((socket) => {
+    sockets.add(socket);
+    socket.on("error", () => {});
+    onSocket(socket);
+  });
+  await new Promise<void>((resolve) => server.listen(port, "127.0.0.1", resolve));
+  return {
+    port: (server.address() as net.AddressInfo).port,
+    close: async () => {
+      for (const socket of sockets) socket.destroy();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    },
+  };
+}
+
+const echoChunks = (socket: net.Socket) => socket.on("data", (chunk) => socket.write(chunk));
+
+test("the callback host probe counts only the echoed challenge", async () => {
+  const echo = await loopbackServer(echoChunks);
+  const wrong = await loopbackServer((socket) => socket.end("not-the-challenge\n"));
+  try {
+    expect(await probeMcpCallbackPathWithRetries(echo.port, "challenge-1", performance.now() + 2_000)).toEqual({ status: 0, stdout: "", stderr: "" });
+    // A peer that answers anything else is never the proved route.
+    const refused = await probeMcpCallbackPathWithRetries(wrong.port, "challenge-1", performance.now() + 250);
+    expect(refused.status).toBe(1);
+    expect(refused.stderr).toBe("callback host probe closed before echo");
+  } finally {
+    await echo.close();
+    await wrong.close();
+  }
+});
+
+test("the callback host probe retries a refused route until the forwarder answers", async () => {
+  const probe = await loopbackServer(() => {});
+  const port = probe.port;
+  await probe.close();
+  // The first try is refused at once; the retry sleep blocks the event loop,
+  // so the listener comes up between tries.
+  let late: Awaited<ReturnType<typeof loopbackServer>> | undefined;
+  setTimeout(() => {
+    void loopbackServer(echoChunks, port).then((server) => {
+      late = server;
+    });
+  }, 30);
+  try {
+    expect((await probeMcpCallbackPathWithRetries(port, "challenge-2", performance.now() + 2_000)).status).toBe(0);
+  } finally {
+    await late?.close();
+  }
+});
+
+function warmEvidence(overrides: Partial<{ routes: Array<{ exit: number; body: string }>; nftTable: { exit: number; body: string }; allowedSet: { exit: number; body: string } }> = {}) {
+  return {
+    routes: overrides.routes ?? [
+      { exit: 0, body: `${NETWORK.agentIp} dev eth0 src ${NETWORK.proxyIp} uid 1001` },
+      { exit: 0, body: `1.1.1.1 via ${NETWORK.proxyEgressGateway} dev eth1 src ${NETWORK.proxyEgressIp} uid 1001` },
+    ],
+    nftTable: overrides.nftTable ?? { exit: 0, body: proxyNftablesTableJson() },
+    allowedSet: overrides.allowedSet ?? { exit: 0, body: "table inet runfree_proxy {\n  set allowed_ipv4 { type ipv4_addr; }\n}" },
+  };
+}
+
+test("warm firewall evidence is judged with no Docker exec and mints the same nftables proof", () => {
+  const fixture = firewallFixture();
+  const proof = fixture.run({ expectedEgressSource: NETWORK.proxyEgressIp, warm: warmEvidence() });
+  expect(fixture.issues).toEqual([]);
+  expect(fixture.execs).toEqual([]);
+  expect(proof.nftablesProofInput?.rawJson).toBe(proxyNftablesTableJson());
+  expect(proof.nftablesProofInput?.internalIface).toBe("eth0");
+  expect(proof.nftablesProofInput?.egressIface).toBe("eth1");
+});
+
+test.each([
+  ["a missing route section", warmEvidence({ routes: [{ exit: 0, body: `${NETWORK.agentIp} dev eth0 src ${NETWORK.proxyIp}` }] }), "proxy internal route inspection failed"],
+  ["an egress route from another source", warmEvidence({ routes: [
+    { exit: 0, body: `${NETWORK.agentIp} dev eth0 src ${NETWORK.proxyIp} uid 1001` },
+    { exit: 0, body: `1.1.1.1 via ${NETWORK.proxyEgressGateway} dev eth1 src 172.30.1.99 uid 1001` },
+  ] }), "proxy default egress route must use proxy_egress address"],
+  ["a failed nftables table read", warmEvidence({ nftTable: { exit: 1, body: "" } }), "proxy nftables owned-table inspection"],
+  ["a failed allowlist set read", warmEvidence({ allowedSet: { exit: 1, body: "no such set" } }), "proxy nftables allowlist set inspection failed: no such set"],
+  ["an allowlist set without allowed_ipv4", warmEvidence({ allowedSet: { exit: 0, body: "table inet runfree_proxy {}" } }), "proxy firewall must expose the allowed_ipv4 nftables set"],
+])("warm firewall evidence with %s fails closed without falling back to Docker", (_label, warm, issue) => {
+  const fixture = firewallFixture();
+  fixture.run({ expectedEgressSource: NETWORK.proxyEgressIp, warm });
+  expect(fixture.issues.some((entry) => entry.includes(issue))).toBe(true);
+  expect(fixture.execs).toEqual([]);
+});

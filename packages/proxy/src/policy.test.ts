@@ -1263,10 +1263,10 @@ describe("OAuth protocol-read classification", () => {
     requests: { "auth.example.com": { methods: ["GET", "HEAD", "OPTIONS", "POST"], pathPrefixes: ["/.well-known", "/oauth/token"] } },
   };
 
-  test("a POST the mediator proved protocol-shaped passes an ask host without a grant or a token read", () => {
-    const tokenReader = vi.fn(() => "never-read");
-    expect(() => testBeforeAllowedRequest({ method: "POST", url }, { ...base, oauthProtocolRead: true, tokenReader })).not.toThrow();
-    expect(tokenReader).not.toHaveBeenCalled();
+  test("a POST the mediator proved protocol-shaped passes an ask host without a grant", () => {
+    const hasWriteGrant = vi.fn(() => false);
+    expect(() => testBeforeAllowedRequest({ method: "POST", url }, { ...base, oauthProtocolRead: true, hasWriteGrant })).not.toThrow();
+    expect(hasWriteGrant).not.toHaveBeenCalled();
   });
 
   test("without the proof the same POST is a write that needs approval", () => {

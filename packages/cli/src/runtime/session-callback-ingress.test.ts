@@ -4,6 +4,7 @@ import { projectHash } from "./env.ts";
 import {
   mcpCallbackForwarderRoutesToLiveOwner,
   reclaimStaleSessionMcpCallbackForwarders,
+  removeOrphanSessionMcpCallbackIngress,
   removeSessionMcpCallbackIngress,
 } from "./session-callback-ingress.ts";
 import {
@@ -82,6 +83,13 @@ describe("removeSessionMcpCallbackIngress", () => {
     expect(docker.removed()).toEqual(["3".repeat(64)]);
   });
 
+  test("also removes a forwarder bound to another session that routes to this session's address", () => {
+    // The address is about to be released; no route to it may survive.
+    const docker = fake([own(), peer({ containerId: "5".repeat(64), target: TEST_SESSION_IP })]);
+    expect(removeOwn(docker)).toBe(2);
+    expect(docker.removed().sort()).toEqual(["1".repeat(64), "5".repeat(64)]);
+  });
+
   test("is idempotent: nothing routed to the session means nothing removed", () => {
     const docker = fake([peer()]);
     expect(removeOwn(docker)).toBe(0);
@@ -103,6 +111,44 @@ describe("removeSessionMcpCallbackIngress", () => {
     const docker = fake([{ ...own(), Image: `sha256:${"0".repeat(64)}` }]);
     expect(() => removeOwn(docker)).toThrow("refusing to remove unverified MCP OAuth callback forwarder");
     expect(docker.removed()).toEqual([]);
+  });
+});
+
+describe("removeOrphanSessionMcpCallbackIngress", () => {
+  const ORPHAN_CONTAINER = "8".repeat(64);
+  function removeOrphan(docker: ReturnType<typeof fake>, running: boolean): number {
+    return removeOrphanSessionMcpCallbackIngress({
+      io: docker.io,
+      projectId: PROJECT_ID,
+      containerId: ORPHAN_CONTAINER,
+      sessionId: TEST_SESSION_ID,
+      running,
+      sourceIp: TEST_SESSION_IP,
+    });
+  }
+
+  test("a running orphan's route is matched by its binding and by the address it still holds", () => {
+    const legacy = own({ containerId: "3".repeat(64), hostPort: "47400", sessionId: null });
+    const docker = fake([own(), legacy, peer()]);
+    expect(removeOrphan(docker, true)).toBe(2);
+    expect(docker.removed().sort()).toEqual(["1".repeat(64), "3".repeat(64)]);
+  });
+
+  test("a stopped orphan's route is matched by its binding only: an address it no longer holds may be a peer's", () => {
+    const docker = fake([
+      own(),
+      own({ containerId: "3".repeat(64), hostPort: "47400", sessionId: null }),
+      peer({ containerId: "5".repeat(64), target: TEST_SESSION_IP }),
+    ]);
+    expect(removeOrphan(docker, false)).toBe(1);
+    expect(docker.removed()).toEqual(["1".repeat(64)]);
+  });
+
+  test("a route it cannot prove removed keeps the container, and names both reclaim paths", () => {
+    const docker = fake([own()], { removeFailure: true });
+    expect(() => removeOrphan(docker, true)).toThrow(
+      new RegExp(`callback route of orphan session container ${ORPHAN_CONTAINER} could not be proved removed.*retry the command, or run \`runfree destroy --force\``, "su"),
+    );
   });
 });
 

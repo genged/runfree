@@ -297,16 +297,23 @@ describe("session readiness probe against the real request proxy", () => {
     expect(proxy.connections()).toBe(1);
   });
 
-  test.each([
-    ["a 200 without the active body", ACTIVE_RESPONSE.replace("active", "actual")],
-    ["an unrelated status", "HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"],
-    ["a non-HTTP answer", "not http\r\n\r\n"],
-  ])("does not read %s as active", async (_label, response) => {
+  test("does not read a 200 without the active body, an unrelated status, or a non-HTTP answer as active", async () => {
     // Only the proxy's active answer may release the agent. Anything else
     // that is not one of the proxy's other answers is "not yet" as well.
-    const proxy = await fakeProxy([response]);
-    const result = await runProbe({ PROXY_IP: "127.0.0.1", RUNFREE_SESSION_READY_PROBE_PORT: String(proxy.port) });
-    expect(result.status, result.stderr).toBe(probeModule.EXIT_UNEXPECTED);
+    // Each run retries until its whole budget is spent, so the three run at
+    // once rather than one after another.
+    const cases = [
+      ["a 200 without the active body", ACTIVE_RESPONSE.replace("active", "actual")],
+      ["an unrelated status", "HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"],
+      ["a non-HTTP answer", "not http\r\n\r\n"],
+    ] as const;
+    const results = await Promise.all(cases.map(async ([label, response]) => {
+      const proxy = await fakeProxy([response]);
+      return { label, result: await runProbe({ PROXY_IP: "127.0.0.1", RUNFREE_SESSION_READY_PROBE_PORT: String(proxy.port) }) };
+    }));
+    for (const { label, result } of results) {
+      expect(result.status, `${label}: ${result.stderr}`).toBe(probeModule.EXIT_UNEXPECTED);
+    }
   });
 
   test("retries a refusal inside one run and exits active on the next connection", async () => {
@@ -487,19 +494,6 @@ describe("session entry", () => {
     expect(result.stderr).toBe("");
   });
 
-  test("exits 111 naming the bound when the session never becomes active", async () => {
-    const proxy = await fakeProxy([REFUSED_RESPONSE]);
-    const startedAt = Date.now();
-    const result = await runEntry([fakeAgentPath], entryEnv(proxy.port, { RUNFREE_SESSION_ENTRY_TIMEOUT_MS: "1500" }));
-
-    expect(result.status, result.stderr).toBe(111);
-    expect(Date.now() - startedAt).toBeLessThan(6_000);
-    expect(result.stderr).toContain("not activated within 1500 ms");
-    expect(result.stderr).toContain("RUNFREE_SESSION_ENTRY_TIMEOUT_MS");
-    expect(fs.existsSync(argvPath)).toBe(false);
-    expect(proxy.requests.length).toBeGreaterThanOrEqual(2);
-  });
-
   test("starts the next probe run within a few tens of milliseconds of the last (launch plan Task 7)", async () => {
     // A probe stand-in that records when it ran and fails at once, so the only
     // thing between two runs is the entry's own loop and pause. The median gap
@@ -507,7 +501,8 @@ describe("session entry", () => {
     const runsPath = path.join(tmp, "probe-runs");
     fs.writeFileSync(probePath, `#!/bin/sh\ndate +%s%N >> "${runsPath}"\nexit 4\n`, { mode: 0o755 });
     const proxy = await fakeProxy([ACTIVE_RESPONSE]);
-    const result = await runEntry([fakeAgentPath], entryEnv(proxy.port, { RUNFREE_SESSION_ENTRY_TIMEOUT_MS: "3000" }));
+    // Whole seconds in the entry: a 2 s bound runs it for 1-2 s, dozens of runs.
+    const result = await runEntry([fakeAgentPath], entryEnv(proxy.port, { RUNFREE_SESSION_ENTRY_TIMEOUT_MS: "2000" }));
 
     expect(result.status, result.stderr).toBe(111);
     const stamps = fs.readFileSync(runsPath, "utf8").split("\n").filter(Boolean).map((line) => Number(BigInt(line) / 1_000_000n));
@@ -517,12 +512,21 @@ describe("session entry", () => {
     expect(median).toBeLessThan(200);
   });
 
-  test("prints the waiting notice once after two seconds and nothing on the fast path", async () => {
+  test("prints the waiting notice once after two seconds, then exits 111 naming the bound", async () => {
+    // One run past the notice: each probe run against a refusal spends its
+    // 2 s budget, so the notice prints after the first run and the bound ends
+    // the second. The fast path's silence is proven above.
     const proxy = await fakeProxy([REFUSED_RESPONSE]);
+    const startedAt = Date.now();
     const result = await runEntry([fakeAgentPath], entryEnv(proxy.port, { RUNFREE_SESSION_ENTRY_TIMEOUT_MS: "3500" }));
 
     expect(result.status, result.stderr).toBe(111);
+    expect(Date.now() - startedAt).toBeLessThan(10_000);
     expect(result.stderr.split("\n").filter((line) => line === "runfree: waiting for session admission")).toHaveLength(1);
+    expect(result.stderr).toContain("not activated within 3500 ms");
+    expect(result.stderr).toContain("RUNFREE_SESSION_ENTRY_TIMEOUT_MS");
+    expect(fs.existsSync(argvPath)).toBe(false);
+    expect(proxy.requests.length).toBeGreaterThanOrEqual(2);
   });
 
   test("keeps polling across an unreachable proxy within the bound", async () => {

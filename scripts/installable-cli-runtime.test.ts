@@ -181,50 +181,69 @@ describe("installable runfree CLI: typescript runtime", () => {
     expect(init.status, init.stderr).toBe(0);
     selectCurrentDesiredControlsForTsCliProject();
 
+    // Recording `docker` and `git` ahead of the host's own on PATH: the
+    // harness's default fake docker only follows the host PATH, so without
+    // these a dry-run regression would reach the host's real Docker daemon and
+    // still exit 0.
+    const recordingBin = path.join(tmpBase, "dry-run-recording-bin");
+    const touchedLog = path.join(tmpBase, "dry-run-touched.log");
+    fs.mkdirSync(recordingBin, { recursive: true });
+    for (const tool of ["docker", "git"]) {
+      fs.writeFileSync(path.join(recordingBin, tool), `#!/bin/sh\nprintf '%s %s\\n' "${tool}" "$*" >> '${touchedLog}'\nexit 1\n`, { mode: 0o755 });
+    }
+    const dryRun = { RUNFREE_RUNTIME_DRY_RUN: "1", PATH: `${recordingBin}${path.delimiter}${process.env.PATH ?? ""}` };
+
     // `git` and `vnc` are typed runtime command modules (no runDefault
     // delegation). The shared dry-run front must short-circuit them the same way
     // it does the still-legacy `status` path: print the plan keyed by the
     // command name and exit 0 without running the host git capability probe or
     // any Docker call.
-    const git = runTsCli(["git", "repair-worktree-links"], { RUNFREE_RUNTIME_DRY_RUN: "1" });
+    const git = runTsCli(["git", "repair-worktree-links"], dryRun);
     expect(git.status, git.stderr).toBe(0);
     expect((JSON.parse(git.stdout) as { command: string }).command).toBe("git");
 
-    const vnc = runTsCli(["vnc", "start", "--no-password"], { RUNFREE_RUNTIME_DRY_RUN: "1" });
+    const vnc = runTsCli(["vnc", "start", "--no-password"], dryRun);
     expect(vnc.status, vnc.stderr).toBe(0);
     expect((JSON.parse(vnc.stdout) as { command: string }).command).toBe("vnc");
 
-    const up = runTsCli(["up", "--audit-network=2h"], { RUNFREE_RUNTIME_DRY_RUN: "1" });
+    const up = runTsCli(["up", "--audit-network=2h"], dryRun);
     expect(up.status, up.stderr).toBe(0);
     expect((JSON.parse(up.stdout) as { command: string }).command).toBe("up");
 
-    const audit = runTsCli(["audit", "status"], { RUNFREE_RUNTIME_DRY_RUN: "1" });
+    const audit = runTsCli(["audit", "status"], dryRun);
     expect(audit.status, audit.stderr).toBe(0);
     expect((JSON.parse(audit.stdout) as { command: string }).command).toBe("audit");
 
     // Bare `deps` defaults to plan; the dry-run front short-circuits it keyed
     // "deps" before any overlay/Docker work.
-    const deps = runTsCli(["deps"], { RUNFREE_RUNTIME_DRY_RUN: "1" });
+    const deps = runTsCli(["deps"], dryRun);
     expect(deps.status, deps.stderr).toBe(0);
     expect((JSON.parse(deps.stdout) as { command: string }).command).toBe("deps");
 
     // The simple read-only/teardown/session commands are typed modules too; each
     // honors the dry-run front before any Docker call.
     for (const name of ["resources", "sessions", "stop", "destroy", "shell"] as const) {
-      const r = runTsCli([name], { RUNFREE_RUNTIME_DRY_RUN: "1" });
+      const r = runTsCli([name], dryRun);
       expect(r.status, `${name}: ${r.stderr}`).toBe(0);
       expect((JSON.parse(r.stdout) as { command: string }).command).toBe(name);
     }
 
     // The typed `$0 [agent]` default honors dry-run keyed by the agent name, or
     // "default" for a bare invocation.
-    const bare = runTsCli([], { RUNFREE_RUNTIME_DRY_RUN: "1" });
+    const bare = runTsCli([], dryRun);
     expect(bare.status, bare.stderr).toBe(0);
     expect((JSON.parse(bare.stdout) as { command: string }).command).toBe("default");
 
-    const agent = runTsCli(["claude"], { RUNFREE_RUNTIME_DRY_RUN: "1" });
+    const agent = runTsCli(["claude"], dryRun);
     expect(agent.status, agent.stderr).toBe(0);
     expect((JSON.parse(agent.stdout) as { command: string }).command).toBe("claude");
+
+    // No Docker call at all. The only git a dry run runs is the dependency
+    // scan's read-only `ls-files` (fsmonitor disabled), never the host git
+    // capability probe.
+    const touched = (fs.existsSync(touchedLog) ? fs.readFileSync(touchedLog, "utf8") : "").split("\n").filter(Boolean);
+    expect(touched.filter((line) => line.startsWith("docker "))).toEqual([]);
+    expect(touched.filter((line) => !line.startsWith(`git -c core.fsmonitor= -C ${tmp} ls-files `))).toEqual([]);
   }, 60_000);
 
   test("dependency overlay scans do not run a repository fsmonitor hook", () => {

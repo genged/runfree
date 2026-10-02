@@ -73,147 +73,33 @@ test("formatTopologyIssues renders structured codes", () => {
   ])).toEqual(["[agent-container-exists] agent missing"]);
 });
 
-test("topology accepts a validated VNC utility on agent_internal", () => {
+// The shared Compose `agent` service is gone: the proxy is the only Compose
+// service the validator inspects, and every other agent_internal participant
+// goes through the participant validator. The proxy is stopped so validation
+// returns after the network checks, before any probe runs.
+function participantTopologyFixture(extraParticipants: Record<string, unknown>[]) {
   const projectRoot = "/workspace/project";
   const projectId = projectHash(projectRoot);
   const project = `runfree-${projectId}`;
   const internalNetwork = `${project}_agent_internal`;
   const egressNetwork = `${project}_proxy_egress`;
-  const agentName = `${project}-agent-1`;
   const proxyName = `${project}-proxy-1`;
-  const sidecarName = `runfree-vnc-forward-${projectId}-5901`;
+  const network = {
+    agentIp: "172.30.0.11",
+    callbackSidecarIp: "172.30.0.12",
+    proxyEgressGateway: "172.30.1.1",
+    proxyEgressIp: "172.30.1.10",
+    proxyEgressSubnet: "172.30.1.0/24",
+    proxyIp: "172.30.0.10",
+    subnet: "172.30.0.0/24",
+  };
   const context = {
     env: { RUNFREE_PROJECT_ID: projectId },
-    network: {
-      agentIp: "172.30.0.11",
-      callbackSidecarIp: "172.30.0.12",
-      proxyEgressGateway: "172.30.1.1",
-      proxyEgressIp: "172.30.1.10",
-      proxyEgressSubnet: "172.30.1.0/24",
-      proxyIp: "172.30.0.10",
-      subnet: "172.30.0.0/24",
-    },
-    project: {
-      config: {},
-      paths: { policyPath: "/tmp/policy.json" },
-    },
+    network,
+    project: { config: {}, paths: { policyPath: "/tmp/policy.json", stateDir: HELPER_STATE_DIR } },
     projectRoot,
     runtimeRoot: "/runtime",
   } as unknown as RuntimeContext;
-  const agent = {
-    Config: { User: "1000:1000" },
-    HostConfig: {
-      CapAdd: null,
-      CapDrop: ["NET_ADMIN", "NET_RAW"],
-      NetworkMode: internalNetwork,
-      PortBindings: {},
-      SecurityOpt: ["no-new-privileges:true"],
-    },
-    Id: "agent-id",
-    Name: `/${agentName}`,
-    NetworkSettings: { Ports: {}, Networks: { [internalNetwork]: { IPAddress: "172.30.0.11" } } },
-    State: { Running: true },
-  };
-  const proxy = {
-    HostConfig: { NetworkMode: internalNetwork, PortBindings: {} },
-    Id: "proxy-id",
-    Name: `/${proxyName}`,
-    NetworkSettings: {
-      Ports: {},
-      Networks: {
-        [internalNetwork]: { IPAddress: "172.30.0.10" },
-        [egressNetwork]: { IPAddress: "172.30.1.10" },
-      },
-    },
-    // Stop before expensive probe validation; this test targets network participants.
-    State: { ExitCode: 1, Running: false, Status: "exited" },
-  };
-  const vnc = {
-    Config: {
-      Cmd: ["-c", "exec socat \"TCP-LISTEN:${VNC_HOST_PORT},bind=$(hostname -i),fork,reuseaddr\" \"TCP:${VNC_TARGET}:${VNC_AGENT_PORT}\""],
-      Entrypoint: ["sh"],
-      Env: ["VNC_HOST_PORT=5901", `VNC_TARGET=${agentName}`, "VNC_AGENT_PORT=5901"],
-      Labels: {
-        [PROJECT_ID_LABEL]: projectId,
-        [UTILITY_ROLE_LABEL]: "vnc-forwarder",
-        [UTILITY_VERSION_LABEL]: "1",
-      },
-      User: "65534:65534",
-    },
-    HostConfig: {
-      CapAdd: [],
-      CapDrop: ["ALL"],
-      NetworkMode: `runfree-vnc-host-${projectId}`,
-      PidsLimit: 64,
-      PortBindings: { "5901/tcp": [{ HostIp: "127.0.0.1", HostPort: "5901" }] },
-      ReadonlyRootfs: true,
-      SecurityOpt: ["no-new-privileges:true"],
-    },
-    Id: "vnc-id",
-    Mounts: [],
-    Name: `/${sidecarName}`,
-    NetworkSettings: {
-      Networks: {
-        [internalNetwork]: { IPAddress: "172.30.0.30" },
-        [`runfree-vnc-host-${projectId}`]: { IPAddress: "172.31.0.2" },
-      },
-      Ports: { "5901/tcp": [{ HostIp: "127.0.0.1", HostPort: "5901" }] },
-    },
-    State: { Running: true },
-  };
-  const io: RuntimeIO = {
-    admin: () => Promise.resolve(0),
-    capture(command, args) {
-      if (command === "docker" && args[0] === "ps" && args.some((arg) => arg.includes("com.docker.compose.service=agent"))) {
-        return captureResult(0, "agent-id\n");
-      }
-      if (command === "docker" && args[0] === "ps" && args.some((arg) => arg.includes("com.docker.compose.service=proxy"))) {
-        return captureResult(0, "proxy-id\n");
-      }
-      if (command === "docker" && args[0] === "inspect" && args.includes("agent-id") && args.includes("proxy-id")) {
-        return captureResult(0, JSON.stringify([agent, proxy]));
-      }
-      if (command === "docker" && args[0] === "inspect" && args.includes("vnc-id")) {
-        return captureResult(0, JSON.stringify([vnc]));
-      }
-      if (command === "docker" && args[0] === "network" && args[1] === "inspect" && args.includes(internalNetwork)) {
-        return captureResult(0, JSON.stringify([{
-          Containers: {
-            "agent-id": { Name: agentName },
-            "proxy-id": { Name: proxyName },
-            "vnc-id": { Name: sidecarName },
-          },
-          EnableIPv6: false,
-          Internal: true,
-          Name: internalNetwork,
-          Options: { "com.docker.network.bridge.inhibit_ipv4": "true" },
-        }]));
-      }
-      if (command === "docker" && args[0] === "network" && args[1] === "inspect" && args.includes(egressNetwork)) {
-        return captureResult(0, JSON.stringify([{
-          EnableIPv6: false,
-          IPAM: { Config: [{ Gateway: "172.30.1.1", Subnet: "172.30.1.0/24" }] },
-          Name: egressNetwork,
-        }]));
-      }
-      return captureResult(0);
-    },
-    commandExists: () => true,
-    confirm: () => true,
-    run: () => 0,
-  };
-
-  expect(validateRuntimeTopology(context, io).map((issue) => issue.code)).not.toContain("agent-network-count");
-});
-
-test("topology validation accepts an ActiveRuntimePlan", () => {
-  const projectRoot = "/workspace/project";
-  const projectId = projectHash(projectRoot);
-  const project = `runfree-${projectId}`;
-  const internalNetwork = `${project}_agent_internal`;
-  const egressNetwork = `${project}_proxy_egress`;
-  const agentName = `${project}-agent-1`;
-  const proxyName = `${project}-proxy-1`;
   const plan = {
     activeRuntime: {
       activeRuntimeRoot: "/runtime-active",
@@ -224,50 +110,19 @@ test("topology validation accepts an ActiveRuntimePlan", () => {
       proxyImage: "runfree/proxy-runtime:test",
       runtimeDigest: "sha256:test",
     },
-    agentImage: undefined,
-    baseRuntimeRoot: "/runtime-base",
     composeProjectName: project,
-    dependencyOverlays: { mounts: [], namedVolumes: [] },
     execution: {
       adminEnvProvider: { dockerClient: {}, resolveChildEnv: () => ({}) },
       composeEnv: {},
       dockerClientEnv: {},
       runtimeInputBuildEnv: {},
     },
-    gitLayout: { kind: "direct", mounts: [] },
-    gitRepositoryShape: { kind: "plain" },
-    mcpOAuth: { callbackPort: 0, callbackUrl: "" },
-    network: {
-      agentIp: "172.30.0.11",
-      callbackSidecarIp: "172.30.0.12",
-      proxyEgressGateway: "172.30.1.1",
-      proxyEgressIp: "172.30.1.10",
-      proxyEgressSubnet: "172.30.1.0/24",
-      proxyIp: "172.30.0.10",
-      subnet: "172.30.0.0/24",
-    },
+    network,
     paths: { policyPath: "/tmp/policy.json" },
     project: { config: {}, paths: { policyPath: "/tmp/policy.json", stateDir: HELPER_STATE_DIR } },
     projectId,
     projectRoot,
-    projectRuntimeRoot: "/project-runtime",
-    runfreeVersion: "test",
-    runtimeDigest: "sha256:test",
   } as unknown as ActiveRuntimePlan;
-  const agent = {
-    Config: { User: "1000:1000" },
-    HostConfig: {
-      CapAdd: null,
-      CapDrop: ["NET_ADMIN", "NET_RAW"],
-      NetworkMode: internalNetwork,
-      PortBindings: {},
-      SecurityOpt: ["no-new-privileges:true"],
-    },
-    Id: "agent-id",
-    Name: `/${agentName}`,
-    NetworkSettings: { Ports: {}, Networks: { [internalNetwork]: { IPAddress: "172.30.0.11" } } },
-    State: { Running: true },
-  };
   const proxy = {
     HostConfig: { NetworkMode: internalNetwork, PortBindings: {} },
     Id: "proxy-id",
@@ -281,36 +136,40 @@ test("topology validation accepts an ActiveRuntimePlan", () => {
     },
     State: { ExitCode: 1, Running: false, Status: "exited" },
   };
+  const internalNetworkInspect = {
+    Containers: Object.fromEntries([proxy, ...extraParticipants].map((entry) => {
+      const { Id, Name } = entry as { Id: string; Name: string };
+      return [Id, { Name: Name.slice(1) }];
+    })),
+    EnableIPv6: false,
+    Internal: true,
+    Name: internalNetwork,
+    Options: { "com.docker.network.bridge.inhibit_ipv4": "true" },
+  };
+  const egressNetworkInspect = {
+    EnableIPv6: false,
+    IPAM: { Config: [{ Gateway: "172.30.1.1", Subnet: "172.30.1.0/24" }] },
+    Name: egressNetwork,
+  };
   const io: RuntimeIO = {
     admin: () => Promise.resolve(0),
     capture(command, args) {
-      if (command === "docker" && args[0] === "ps" && args.some((arg) => arg.includes("com.docker.compose.service=agent"))) {
-        return captureResult(0, "agent-id\n");
-      }
-      if (command === "docker" && args[0] === "ps" && args.some((arg) => arg.includes("com.docker.compose.service=proxy"))) {
+      if (command !== "docker") return captureResult(0);
+      if (args[0] === "ps" && args.some((arg) => arg.includes("com.docker.compose.service=proxy"))) {
         return captureResult(0, "proxy-id\n");
       }
-      if (command === "docker" && args[0] === "inspect") {
-        return captureResult(0, JSON.stringify([agent, proxy]));
+      if (args[0] === "inspect" && args.length === 2 && args[1] === "proxy-id") {
+        return captureResult(0, JSON.stringify([proxy]));
       }
-      if (command === "docker" && args[0] === "network" && args[1] === "inspect" && args.includes(internalNetwork)) {
-        return captureResult(0, JSON.stringify([{
-          Containers: {
-            "agent-id": { Name: agentName },
-            "proxy-id": { Name: proxyName },
-          },
-          EnableIPv6: false,
-          Internal: true,
-          Name: internalNetwork,
-          Options: { "com.docker.network.bridge.inhibit_ipv4": "true" },
-        }]));
+      if (args[0] === "inspect") {
+        const all = [proxy, ...extraParticipants] as Array<{ Id: string }>;
+        return captureResult(0, JSON.stringify(args.slice(1).map((id) => all.find((entry) => entry.Id === id))));
       }
-      if (command === "docker" && args[0] === "network" && args[1] === "inspect" && args.includes(egressNetwork)) {
-        return captureResult(0, JSON.stringify([{
-          EnableIPv6: false,
-          IPAM: { Config: [{ Gateway: "172.30.1.1", Subnet: "172.30.1.0/24" }] },
-          Name: egressNetwork,
-        }]));
+      if (args[0] === "network" && args[1] === "inspect" && args.includes(internalNetwork)) {
+        return captureResult(0, JSON.stringify([internalNetworkInspect]));
+      }
+      if (args[0] === "network" && args[1] === "inspect" && args.includes(egressNetwork)) {
+        return captureResult(0, JSON.stringify([egressNetworkInspect]));
       }
       return captureResult(0);
     },
@@ -318,8 +177,69 @@ test("topology validation accepts an ActiveRuntimePlan", () => {
     confirm: () => true,
     run: () => 0,
   };
+  return { context, plan, io, projectId, internalNetwork, proxy, internalNetworkInspect, egressNetworkInspect };
+}
 
-  expect(validateRuntimeTopology(plan, io).map((issue) => issue.code)).not.toContain("agent-ip-matches-plan");
+test("topology inspects the proxy and its networks for a context and an ActiveRuntimePlan alike", () => {
+  const { context, plan, io } = participantTopologyFixture([]);
+  // Only the stopped proxy: every inspection succeeded and nothing else failed.
+  const onlyStoppedProxy = [expect.stringMatching(/^proxy container .*exit=1/u)];
+  expect(validateRuntimeTopology(context, io).map((issue) => issue.message)).toEqual(onlyStoppedProxy);
+  expect(validateRuntimeTopology(plan, io).map((issue) => issue.message)).toEqual(onlyStoppedProxy);
+});
+
+test("topology refuses an unapproved agent_internal participant, such as the retired VNC sidecar", () => {
+  const { context, io, projectId, internalNetwork } = participantTopologyFixture([]);
+  const sidecarName = `runfree-vnc-forward-${projectId}-5901`;
+  const vnc = {
+    Config: {
+      Env: ["VNC_HOST_PORT=5901", "VNC_TARGET=agent", "VNC_AGENT_PORT=5901"],
+      Labels: { [PROJECT_ID_LABEL]: projectId, [UTILITY_ROLE_LABEL]: "vnc-forwarder", [UTILITY_VERSION_LABEL]: "1" },
+      User: "65534:65534",
+    },
+    HostConfig: { NetworkMode: `runfree-vnc-host-${projectId}`, PortBindings: {} },
+    Id: "vnc-id",
+    Name: `/${sidecarName}`,
+    NetworkSettings: { Networks: { [internalNetwork]: { IPAddress: "172.30.0.30" } }, Ports: {} },
+    State: { Running: true },
+  };
+  const withSidecar = participantTopologyFixture([vnc]);
+
+  expect(validateRuntimeTopology(context, io).map((issue) => issue.code)).not.toContain("agent-network-unapproved-container");
+  const issues = validateRuntimeTopology(withSidecar.context, withSidecar.io);
+  expect(issues.map((issue) => issue.code)).toContain("agent-network-unapproved-container");
+  expect(issues.some((issue) => issue.message.includes(sidecarName))).toBe(true);
+});
+
+// A warm launch hands the validator the objects its one batch fetched: the
+// validator then issues no Docker call and judges exactly those objects.
+test("warm evidence is judged without Docker, and a participant the batch did not inspect is refused", () => {
+  const participant = { Id: "stray-id", Name: "/stray", Config: { Labels: {} }, NetworkSettings: { Networks: {} }, State: { Running: true } };
+  const fixture = participantTopologyFixture([participant]);
+  const noDocker: RuntimeIO = {
+    ...fixture.io,
+    capture: (command, args) => { throw new Error(`warm validation ran ${command} ${args.join(" ")}`); },
+    run: () => { throw new Error("warm validation must not run a command"); },
+  };
+  const warmEvidence = (participants: readonly unknown[]) => ({
+    warmEvidence: {
+      proxyId: "proxy-id",
+      proxy: fixture.proxy,
+      internalNetwork: fixture.internalNetworkInspect,
+      participants,
+      egressNetwork: fixture.egressNetworkInspect,
+      capBnd: { exit: 0, body: "" },
+      firewall: {} as never,
+    } as never,
+  });
+
+  const missing = validateRuntimeTopology(fixture.plan, noDocker, warmEvidence([fixture.proxy]));
+  expect(missing.map((issue) => issue.message)).toContain("could not inspect agent_internal participants");
+
+  const complete = validateRuntimeTopology(fixture.plan, noDocker, warmEvidence([fixture.proxy, participant]));
+  expect(complete.map((issue) => issue.message)).not.toContain("could not inspect agent_internal participants");
+  // The same participant check the full path runs.
+  expect(complete.map((issue) => issue.code)).toContain("agent-network-unapproved-container");
 });
 
 // The non-443 CONNECT probe proves that the proxy rejects the port before DNS
@@ -362,20 +282,6 @@ test("the non-443 CONNECT probe targets a reserved non-resolving host, never a p
       projectRoot,
       runtimeRoot: "/runtime",
     } as unknown as RuntimeContext;
-    const agent = {
-      Config: { User: "1000:1000" },
-      HostConfig: {
-        CapAdd: null,
-        CapDrop: ["NET_ADMIN", "NET_RAW"],
-        NetworkMode: internalNetwork,
-        PortBindings: {},
-        SecurityOpt: ["no-new-privileges:true"],
-      },
-      Id: "agent-id",
-      Name: `/${project}-agent-1`,
-      NetworkSettings: { Ports: {}, Networks: { [internalNetwork]: { IPAddress: "172.30.0.11" } } },
-      State: { Running: true },
-    };
     const proxy = {
       HostConfig: { CapAdd: ["NET_ADMIN"], CapDrop: ["NET_RAW"], NetworkMode: internalNetwork, PortBindings: {} },
       Id: "proxy-id",
@@ -396,18 +302,15 @@ test("the non-443 CONNECT probe targets a reserved non-resolving host, never a p
       admin: () => Promise.resolve(0),
       capture(command, args) {
         if (command === "docker" && args[0] === "exec") execCommands.push(args.join(" "));
-        if (command === "docker" && args[0] === "ps" && args.some((arg) => arg.includes("com.docker.compose.service=agent"))) {
-          return captureResult(0, "agent-id\n");
-        }
         if (command === "docker" && args[0] === "ps" && args.some((arg) => arg.includes("com.docker.compose.service=proxy"))) {
           return captureResult(0, "proxy-id\n");
         }
-        if (command === "docker" && args[0] === "inspect" && args.includes("agent-id") && args.includes("proxy-id")) {
-          return captureResult(0, JSON.stringify([agent, proxy]));
+        if (command === "docker" && args[0] === "inspect" && args.length === 2 && args[1] === "proxy-id") {
+          return captureResult(0, JSON.stringify([proxy]));
         }
         if (command === "docker" && args[0] === "network" && args[1] === "inspect" && args.includes(internalNetwork)) {
           return captureResult(0, JSON.stringify([{
-            Containers: { "agent-id": { Name: `${project}-agent-1` }, "proxy-id": { Name: `${project}-proxy-1` } },
+            Containers: { "proxy-id": { Name: `${project}-proxy-1` } },
             EnableIPv6: false,
             Internal: true,
             Name: internalNetwork,
@@ -428,15 +331,15 @@ test("the non-443 CONNECT probe targets a reserved non-resolving host, never a p
       run: () => 0,
     };
 
-    validateRuntimeTopology(context, io);
+    const issues = validateRuntimeTopology(context, io);
 
-    // Post-cutover plain validation has no shared agent to run the agent-position
-    // CONNECT probe from; the non-443 denial is proven from an admitted session
-    // / ephemeral helper (the live admission tranches, and sandbox.sh against a
-    // real runtime). The unit-level guarantee preserved here is that no probe
-    // this path does emit borrows a policy host or a third-party service — a
-    // deny-all policy has no host to borrow, so the probe target must not vary
-    // with policy content. The reserved probe host is pinned above.
+    // Validation reached the proxy probes: every inspection succeeded.
+    expect(issues.map((issue) => issue.message).filter((message) => message.startsWith("could not inspect"))).toEqual([]);
+    expect(execCommands.length).toBeGreaterThan(0);
+    // Topology validation runs no raw CONNECT probe any more; the non-443
+    // denial is proven by the proxy tests and the live admission tranches.
+    // What this path must still never do is borrow a policy host or a
+    // third-party service for any probe it does run.
     const nonHttpsProbes = execCommands.filter((entry) => entry.includes("CONNECT") && entry.includes(":22"));
     expect(nonHttpsProbes).toHaveLength(0);
     expect(execCommands.some((entry) => entry.includes("policy-host.example"))).toBe(false);

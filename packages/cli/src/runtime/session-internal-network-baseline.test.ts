@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { describe, expect, test, vi } from "vitest";
+import { afterAll, afterEach, describe, expect, test, vi } from "vitest";
 
 import { createRuntimeComponentState, sha256Digest } from "./component-state.ts";
 import {
@@ -89,8 +89,28 @@ function lock(): ProjectLifecycleLock {
   };
 }
 
+const stateDirs: string[] = [];
+
+afterEach(() => {
+  for (const dir of stateDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
+});
+
+function tempStateDir(prefix: string): string {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  stateDirs.push(dir);
+  return dir;
+}
+
+// The published and selected control plane every fixture starts from. Durable
+// writes fsync, so it is built once and copied into each fixture's state.
+let selectedTemplate: string | undefined;
+
+afterAll(() => {
+  if (selectedTemplate) fs.rmSync(selectedTemplate, { recursive: true, force: true });
+});
+
 function authorityFixture() {
-  const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "runfree-participant-authority-"));
+  const stateDir = tempStateDir("runfree-participant-authority-");
   const target = sessionGenerationFixture().target;
   const materialization = controlPlaneMaterializationFixture({ target });
   const baseSelection = effectiveControlPlaneFixture({ target });
@@ -103,8 +123,12 @@ function authorityFixture() {
       proxyEgress: "9".repeat(64),
     },
   };
-  publishControlPlaneMaterializationV2(stateDir, materialization);
-  selectEffectiveControlPlaneV2(stateDir, selection);
+  if (!selectedTemplate) {
+    selectedTemplate = fs.mkdtempSync(path.join(os.tmpdir(), "runfree-participant-authority-template-"));
+    publishControlPlaneMaterializationV2(selectedTemplate, materialization);
+    selectEffectiveControlPlaneV2(selectedTemplate, selection);
+  }
+  fs.cpSync(selectedTemplate, stateDir, { recursive: true });
 
   const components = runtimeComponents(target);
   const composeProject = selection.composeProject;
@@ -351,7 +375,7 @@ describe("control-plane internal participant authority", () => {
       value.context.projectRoot = "/workspace/other";
     }],
     ["context state root", (value: ReturnType<typeof authorityFixture>) => {
-      value.context.project.paths.stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "runfree-other-state-"));
+      value.context.project.paths.stateDir = tempStateDir("runfree-other-state-");
     }],
     ["active runtime root", (value: ReturnType<typeof authorityFixture>) => {
       value.context.runtimeRoot = "/runtime/other";

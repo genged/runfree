@@ -308,6 +308,55 @@ test("docker adapter uses sanitized docker client environment", () => {
   expect(calls[0]?.env?.DOCKER_CLI_HINTS).toBe("false");
 });
 
+function dockerInfoIO(stdout: string, status = 0): RuntimeIO & { calls: string[][] } {
+  const calls: string[][] = [];
+  return {
+    calls,
+    run: () => { throw new Error("the availability check must not mutate Docker state"); },
+    capture(command, args) {
+      expect(command).toBe("docker");
+      calls.push(args);
+      return { status, stdout, stderr: "" };
+    },
+    commandExists: () => true,
+    confirm: () => true,
+    admin: async () => 0,
+  };
+}
+
+const DAEMON_INFO = { ID: "daemon-1", ServerVersion: "29.0.0", KernelVersion: "6.10.14-linuxkit", LiveRestoreEnabled: false };
+
+test("the availability check records the daemon identity from its one docker info", () => {
+  const io = dockerInfoIO(JSON.stringify(DAEMON_INFO));
+  createRuntimeDocker(context(), io).assertAvailable();
+  expect(io.calls).toEqual([["info", "--format", "{{json .}}"]]);
+  expect(lastObservedDockerDaemonIdentity()).toEqual({
+    id: "daemon-1",
+    serverVersion: "29.0.0",
+    kernelVersion: "6.10.14-linuxkit",
+    liveRestoreEnabled: false,
+  });
+});
+
+// Format mode exits 0 with the client half filled in when the daemon is
+// unreachable; only ServerErrors says so.
+test("the availability check refuses a docker info that exited 0 with server errors and forgets the earlier identity", () => {
+  createRuntimeDocker(context(), dockerInfoIO(JSON.stringify(DAEMON_INFO))).assertAvailable();
+  expect(lastObservedDockerDaemonIdentity()).toBeDefined();
+
+  const unreachable = dockerInfoIO(JSON.stringify({ ...DAEMON_INFO, ServerErrors: ["Cannot connect to the Docker daemon"] }));
+  expect(() => createRuntimeDocker(context(), unreachable).assertAvailable()).toThrow("docker daemon not running");
+  expect(lastObservedDockerDaemonIdentity()).toBeUndefined();
+
+  expect(() => createRuntimeDocker(context(), dockerInfoIO("", 1)).assertAvailable()).toThrow("docker daemon not running");
+});
+
+test("an unparseable docker info passes availability but yields no daemon identity", () => {
+  createRuntimeDocker(context(), dockerInfoIO(JSON.stringify(DAEMON_INFO))).assertAvailable();
+  createRuntimeDocker(context(), dockerInfoIO("not json")).assertAvailable();
+  expect(lastObservedDockerDaemonIdentity()).toBeUndefined();
+});
+
 // `docker ps -q` prints a 12-character prefix. Runtime validation markers, the
 // deny-by-default base observation, and effective control-plane selection all
 // compare exact 64-hex container identities, so this lookup must ask Docker for

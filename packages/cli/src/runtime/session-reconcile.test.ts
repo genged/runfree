@@ -12,7 +12,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test, vi } from "vitest";
 
 import { parseSessionAdmissionEligibility } from "@runfree/runtime-contracts/session-admission";
 import { SESSION_ELIGIBILITY_PATH, SESSION_FILES_DIR } from "@runfree/runtime-contracts/session-file";
@@ -388,11 +388,30 @@ const CALLBACK_FORWARDER_LISTING = `docker:ps -a --no-trunc --filter label=io.ru
   + "--filter label=io.runfree.container-role=ingress-forwarder "
   + "--filter label=io.runfree.ingress-purpose=mcp-callback --format {{.ID}}";
 
+/**
+ * The published control plane and desired agent every test starts from. The
+ * durable publication fsyncs each write, so it is built once and copied into
+ * each test's fresh state directory.
+ */
+let baseStateDir: string;
+
+beforeAll(() => {
+  const own = stateDir;
+  stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "runfree-session-reconcile-base-"));
+  baseStateDir = stateDir;
+  selectFileBackedControlPlane();
+  selectDesiredAgent();
+  stateDir = own;
+});
+
+afterAll(() => fs.rmSync(baseStateDir, { recursive: true, force: true }));
+
+function startFromPublishedState(): void {
+  fs.cpSync(baseStateDir, stateDir, { recursive: true });
+}
+
 describe("reconcile before allocation", () => {
-  beforeEach(() => {
-    selectFileBackedControlPlane();
-    selectDesiredAgent();
-  });
+  beforeEach(startFromPublishedState);
 
   test("deletes a session file no record claims, and reserves its address either way", async () => {
     const orphan = { ...servedFile(sessionContainerRecordFixture()), sessionKey: "c".repeat(64), sourceIp: "172.31.90.33" };
@@ -458,6 +477,8 @@ describe("reconcile before allocation", () => {
     expect(result.quarantinedFiles).toEqual(["c".repeat(64)]);
     expect(result.orphanFiles).toEqual(["c".repeat(64)]);
     expect(result.orphanFilesDeleted).toEqual([]);
+    // A partially legible registry is never settled state a launch may skip.
+    expect(result.inventoryClean).toBe(false);
     expect(fake.effects().some((event) => event.startsWith("delete-session-file:"))).toBe(false);
     // Kept, not lost: the address it named is still reserved, so no peer can
     // be allocated over a session the registry cannot currently account for.
@@ -524,6 +545,7 @@ describe("reconcile before allocation", () => {
     const result = await repair(fake);
 
     expect(result.deadOwnersRevoked).toEqual([abandoned.sessionId]);
+    expect(result.inventoryClean).toBe(false);
     expect(fake.effects()).toEqual([
       `delete-session-file:${abandoned.sessionPrincipal}.json`,
       // The session's MCP OAuth callback route is proved absent before the
@@ -889,10 +911,7 @@ describe("reconcile before allocation", () => {
 });
 
 describe("reconcile in report mode", () => {
-  beforeEach(() => {
-    selectFileBackedControlPlane();
-    selectDesiredAgent();
-  });
+  beforeEach(startFromPublishedState);
 
   test("issues no write, delete, or stop, and never takes the lock", async () => {
     const abandoned = writeRecord({ liveness: "dead", host: 20, containerId: "a".repeat(64), state: "attached" });

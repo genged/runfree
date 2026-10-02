@@ -44,13 +44,21 @@ describe("resolveAgentExecTarget", () => {
   });
 
   test("ignores leftover Compose-agent evidence and resolves only the lifecycle registry", () => {
+    // A leftover Compose agent is a different container from the session, so
+    // a fallback to it would be visible in the result.
+    const docker = fakeDocker({
+      runningServiceContainerId: vi.fn(() => OTHER_CONTAINER_ID),
+      serviceContainerId: vi.fn(() => OTHER_CONTAINER_ID),
+    });
     peekReturns([attachedRecord()]);
-    const docker = fakeDocker({ runningServiceContainerId: vi.fn(() => CONTAINER_ID) });
 
-    const target = resolveAgentExecTarget("runfree-p", docker, { sessionRegistry: REGISTRY });
+    expect(resolveAgentExecTarget("runfree-p", docker, { sessionRegistry: REGISTRY }))
+      .toMatchObject({ kind: "session", containerId: CONTAINER_ID });
 
-    expect(target).toMatchObject({ kind: "session", containerId: CONTAINER_ID });
-    expect(mocks.peek).toHaveBeenCalledOnce();
+    peekReturns([]);
+    expect(resolveAgentExecTarget("runfree-p", docker, { sessionRegistry: REGISTRY })).toBeUndefined();
+    expect(docker.runningServiceContainerId).not.toHaveBeenCalled();
+    expect(docker.serviceContainerId).not.toHaveBeenCalled();
   });
 
   test("resolves the one live attached session when no shared agent exists", () => {
@@ -102,9 +110,10 @@ describe("resolveAgentExecTarget", () => {
   });
 
   test("without the registry option, no singleton agent target exists", () => {
-    const docker = fakeDocker();
+    const docker = fakeDocker({ runningServiceContainerId: vi.fn(() => OTHER_CONTAINER_ID) });
 
     expect(resolveAgentExecTarget("runfree-p", docker)).toBeUndefined();
     expect(mocks.peek).not.toHaveBeenCalled();
+    expect(docker.runningServiceContainerId).not.toHaveBeenCalled();
   });
 });

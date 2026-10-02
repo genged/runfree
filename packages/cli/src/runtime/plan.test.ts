@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { beforeEach, expect, test } from "vitest";
+import { afterEach, beforeEach, expect, test, vi } from "vitest";
 
 import { defaultConfig, projectControlPaths, type ProjectInfo } from "../config.ts";
 import { approveNetworkCandidate, approveRuntimeIsolationControl } from "../control/approvals.ts";
@@ -29,6 +29,14 @@ let tmp: string;
 
 beforeEach(() => {
   tmp = fs.mkdtempSync(path.join(os.tmpdir(), "runfree-plan-"));
+  // Control publication fsyncs every state file; against a temp dir that is
+  // pure disk latency. Durability is proven in component-state-v2.test.ts.
+  vi.spyOn(fs, "fsyncSync").mockImplementation(() => {});
+});
+
+afterEach(() => {
+  vi.restoreAllMocks();
+  fs.rmSync(tmp, { recursive: true, force: true });
 });
 
 

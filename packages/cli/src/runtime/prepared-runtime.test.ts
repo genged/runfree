@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { afterEach, beforeEach, expect, test } from "vitest";
+import { afterAll, beforeAll, beforeEach, expect, test } from "vitest";
 
 import { defaultConfig, projectControlPaths, type ProjectInfo } from "../config.ts";
 import { approveNetworkCandidate, approveRuntimeIsolationControl } from "../control/approvals.ts";
@@ -45,13 +45,23 @@ import {
 import type { ProjectLifecycleLock } from "./sessions.ts";
 import type { RuntimeContext, RuntimeIO } from "./types.ts";
 
+// Every test works at the same path so the approved-controls state, built
+// once per file, can be copied in instead of re-approved (the slowest step).
+let base: string;
 let temporaryRoot: string;
+let controlsSnapshot: string | undefined;
 
-beforeEach(() => {
-  temporaryRoot = fs.mkdtempSync(path.join(os.tmpdir(), "runfree-prepared-runtime-"));
+beforeAll(() => {
+  base = fs.mkdtempSync(path.join(os.tmpdir(), "runfree-prepared-runtime-"));
+  temporaryRoot = path.join(base, "work");
 });
 
-afterEach(() => fs.rmSync(temporaryRoot, { recursive: true, force: true }));
+afterAll(() => fs.rmSync(base, { recursive: true, force: true }));
+
+beforeEach(() => {
+  fs.rmSync(temporaryRoot, { recursive: true, force: true });
+  fs.mkdirSync(temporaryRoot);
+});
 
 
 // Runtime environment generation requires a selected effective control
@@ -71,7 +81,13 @@ function ensureSelectedControls(projectRoot: string, project: ProjectInfo): void
 
 function projectInfo(projectRoot: string): ProjectInfo {
   const project = buildProjectInfo(projectRoot);
-  ensureSelectedControls(projectRoot, project);
+  if (controlsSnapshot) {
+    fs.cpSync(controlsSnapshot, temporaryRoot, { recursive: true });
+  } else {
+    ensureSelectedControls(projectRoot, project);
+    controlsSnapshot = path.join(base, "controls");
+    fs.cpSync(temporaryRoot, controlsSnapshot, { recursive: true });
+  }
   return project;
 }
 
@@ -335,6 +351,15 @@ test("rejects post-mint durable template corruption without consuming authority"
     lifecycleLock: prepared.lifecycleLock,
     io: prepared.io,
   })).toThrow("artifact hash does not match");
+
+  // The refusal consumed nothing: once the artifact is intact again, the same
+  // authority is still admissible.
+  fs.writeFileSync(artifactPath, prepared.templateArtifact);
+  expect(consumePreparedRuntime({
+    preparedRuntime: authority,
+    lifecycleLock: prepared.lifecycleLock,
+    io: prepared.io,
+  }).plan).toBe(prepared.activePlan);
 });
 
 function handoffFor(prepared: ReturnType<typeof fixture>, lock: ProjectLifecycleLock): LaunchHandoff {
@@ -434,5 +459,17 @@ test("consumption refuses a handoff under a different lock, and a durable select
     lifecycleLock: lock,
     io: prepared.io,
     handoff: handoffFor(prepared, lock),
+  })).toThrow(StalePreparedRuntimeError);
+});
+
+test("consumption under a handoff refuses one that proved another proxy than the durable selection", () => {
+  const prepared = fixture();
+  const authority = mintPreparedRuntime({ plan: prepared.activePlan, validationProof: prepared.proof });
+  const lock = countingLock();
+  expect(() => consumePreparedRuntime({
+    preparedRuntime: authority,
+    lifecycleLock: lock,
+    io: prepared.io,
+    handoff: { ...handoffFor(prepared, lock), proxy: { id: "9".repeat(64), startedAt: "2026-06-13T00:00:00.000Z" } },
   })).toThrow(StalePreparedRuntimeError);
 });

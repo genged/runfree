@@ -204,7 +204,7 @@ describe("docker API transport: exec", () => {
   });
 
   it("waits for the daemon to record the exit within the budget; a stopped exec without an exit code is 125, a never-stopping one 124", async () => {
-    const fake = await start(execReplies([{ ...json({ Running: true, ExitCode: null }), times: 30 }, json({ Running: false, ExitCode: 0 })]), {
+    const fake = await start(execReplies([{ ...json({ Running: true, ExitCode: null }), times: 4 }, json({ Running: false, ExitCode: 0 })]), {
       [EXEC_ID]: { chunks: [frame(1, "x").toString("base64")] },
     });
     expect(transportFor(fake)("docker", ["exec", ID, "true"])).toEqual({ routed: true, result: { status: 0, stdout: "x", stderr: "" } });
@@ -314,9 +314,16 @@ describe("docker API transport: what stays on the CLI", () => {
     expect(await fake.requests()).toEqual([]);
   });
 
-  it("RUNFREE_DOCKER_TRANSPORT=api turns the transport on", async () => {
+  it("asks the CLI probe about the PATH spawnSync would search: the call's env when given, else the process env", async () => {
     const fake = await start({ [`GET ${V}/containers/${ID}/json`]: json({ Id: ID }) });
-    expect(transportFor(fake, { controlEnv: { RUNFREE_DOCKER_TRANSPORT: "api" } })("docker", ["container", "inspect", "--format", "{{.Id}}", ID]).routed).toBe(true);
+    const seen: Array<[NodeJS.ProcessEnv, boolean]> = [];
+    const capture = transportFor(fake, { dockerCliProbe: (env, envGiven) => {
+      seen.push([env, envGiven]);
+      return undefined;
+    } });
+    capture("docker", ["container", "inspect", ID], { env: { PATH: "/x" } });
+    capture("docker", ["container", "inspect", ID]);
+    expect(seen).toEqual([[{ PATH: "/x" }, true], [process.env, false]]);
   });
 
   it("an unrouted argv or a non-docker command sends nothing to the socket", async () => {
@@ -378,6 +385,36 @@ describe("docker API transport: binding to the CLI's daemon", () => {
     expect(capture("docker", ["container", "inspect", ID]).routed).toBe(false);
     expect(cliRuns).toBe(1);
     expect(await apiRequests(fake)).toEqual([]);
+  });
+
+  it("a refused connection is not cached: the next call binds once the daemon listens", async () => {
+    const fake = await start({ [`GET ${V}/containers/${ID}/json`]: json({ Id: ID }) });
+    let socketPath = `${fake.dir}/absent.sock`;
+    const capture = transportFor(fake, { resolveEndpoint: () => ({ kind: "unix", socketPath, context: "default" }) });
+    const inspect = () => capture("docker", ["container", "inspect", "--format", "{{.Id}}", ID]);
+    expect(inspect().routed).toBe(false);
+    socketPath = fake.socketPath;
+    expect(inspect()).toEqual({ routed: true, result: { status: 0, stdout: `${ID}\n`, stderr: "" } });
+  });
+
+  it("a docker version that outlives the call's budget is 124, and the binding is tried again", async () => {
+    const fake = await start({ [`GET ${V}/containers/${ID}/json`]: json({ Id: ID }) });
+    // The bridge measures the deadline on performance.now(); skew only the transport's clock.
+    let skew = 0;
+    let cliRuns = 0;
+    const capture = transportFor(fake, {
+      now: () => performance.now() + skew,
+      runCli: () => {
+        cliRuns += 1;
+        if (cliRuns > 1) return { status: 0, stdout: cliVersionJson() };
+        skew += 10_000;
+        return { status: 124, stdout: "" };
+      },
+    });
+    expect(capture("docker", ["container", "inspect", ID], { timeout: 5_000 })).toEqual({ routed: true, result: { status: 124, stdout: "", stderr: "", timedOut: true } });
+    skew = 0;
+    expect(capture("docker", ["container", "inspect", "--format", "{{.Id}}", ID], { timeout: 5_000 }).routed).toBe(true);
+    expect(cliRuns).toBe(2);
   });
 
   it("a failed docker version keeps the process on the CLI", async () => {

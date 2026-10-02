@@ -484,7 +484,16 @@ describe("--clear-deny composed with --watch", () => {
     // The proxy never applies the clear: status keeps reporting the deny.
     const io = clearDenyIo([statusJson({ grants: [{ effect: "deny" as const, scope: "session" as const, subject: "session" as const, coverage: "host" as const, host: "*", session: GRANT_SESSION }] })], { trapWatch: true });
 
-    await expect(approvalsRuntime(watchInput, context, io)).resolves.toBe(1);
+    // The runtime entry uses the real confirm poll; fake its waits so the
+    // exhausted confirmation does not cost seconds.
+    vi.useFakeTimers({ toFake: ["setTimeout"] });
+    try {
+      const cleared = approvalsRuntime(watchInput, context, io);
+      await vi.runAllTimersAsync();
+      await expect(cleared).resolves.toBe(1);
+    } finally {
+      vi.useRealTimers();
+    }
     // No approver attached: watching here would show a healthy-looking prompt
     // loop for a runtime where every write is still denied.
     expect(io.heartbeats).toBe(0);

@@ -20,6 +20,7 @@ import {
   type FakeDockerOptions,
 } from "./session-callback-ingress.test-harness.ts";
 import {
+  hostLoopbackPortFree,
   prepareSessionMcpCallback,
   SESSION_CALLBACK_PORT_ATTEMPTS,
   sessionCallbackPortCandidates,
@@ -50,7 +51,7 @@ afterEach(() => {
 
 function contextWith(hasServers: boolean): RuntimeContext {
   const policyPath = path.join(tmp, "oauth-mediation-policy.json");
-  fs.writeFileSync(policyPath, JSON.stringify(hasServers ? { providers: { p: { kind: "mcp" } } } : { servers: [] }));
+  fs.writeFileSync(policyPath, JSON.stringify({ providers: hasServers ? { p: { kind: "mcp" } } : {} }));
   return {
     projectRoot: PROJECT_ROOT,
     project: { config: { version: 3 }, paths: { mcpOAuthPolicyPath: policyPath } },
@@ -81,6 +82,24 @@ describe("sessionCallbackPortCandidates", () => {
     expect(first).not.toContain(LEGACY_PORT);
     expect(first).toEqual(sessionCallbackPortCandidates(PROJECT_ROOT, TEST_SESSION_ID, held));
     expect(first).not.toEqual(second);
+  });
+});
+
+describe("hostLoopbackPortFree", () => {
+  test("is false while a host process listens on the IPv4 loopback port, and true once it closes", async () => {
+    const server = net.createServer();
+    const port = await new Promise<number>((resolve) => {
+      server.listen(0, "127.0.0.1", () => {
+        const address = server.address();
+        resolve(typeof address === "object" && address ? address.port : 0);
+      });
+    });
+    try {
+      expect(await hostLoopbackPortFree(port)).toBe(false);
+    } finally {
+      await new Promise((resolve) => server.close(resolve));
+    }
+    expect(await hostLoopbackPortFree(port)).toBe(true);
   });
 });
 

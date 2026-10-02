@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
 
 import { nodeRuntimeIO } from "../runtime.ts";
 import { withRebindBudgetIO } from "./control-plane-rebind-budget.ts";
@@ -186,6 +186,21 @@ function helperState() {
 }
 
 const HELPER_ID = "a".repeat(64);
+
+/**
+ * Runs `body` with every monotonic clock read jumping a minute, so a sweep
+ * whose `rm` left the helper listed gives up after one re-list instead of
+ * polling out its real 3 s deadline.
+ */
+function withSweepDeadlineElapsed<T>(body: () => T): T {
+  let clock = performance.now();
+  const spy = vi.spyOn(performance, "now").mockImplementation(() => (clock += 60_000));
+  try {
+    return body();
+  } finally {
+    spy.mockRestore();
+  }
+}
 
 /**
  * The budgeted IO runs only the helper; everything after it must go through
@@ -445,7 +460,7 @@ describe("runEphemeralHelper", () => {
     try {
       let caught: unknown;
       try {
-        runEphemeralHelper(harness.context, budgeted, DENY_PROBE_REQUEST, fence);
+        withSweepDeadlineElapsed(() => runEphemeralHelper(harness.context, budgeted, DENY_PROBE_REQUEST, fence));
       } catch (error) {
         caught = error;
       }
@@ -508,7 +523,7 @@ describe("runEphemeralHelper", () => {
     try {
       let caught: unknown;
       try {
-        runEphemeralHelper(harness.context, harness.io, DENY_PROBE_REQUEST, fence);
+        withSweepDeadlineElapsed(() => runEphemeralHelper(harness.context, harness.io, DENY_PROBE_REQUEST, fence));
       } catch (error) {
         caught = error;
       }
@@ -567,12 +582,12 @@ describe("the real-process bound", () => {
   });
 
   test("control: the default SIGTERM waits for a client that ignores it (why D-A needs SIGKILL)", () => {
-    const bin = fakeDockerBin("trap '' TERM; exec sleep 2");
+    const bin = fakeDockerBin("trap '' TERM; exec sleep 1");
     try {
       const startedAt = performance.now();
       const result = nodeRuntimeIO.capture("docker", ["run"], { env: { PATH: `${bin.dir}:/usr/bin:/bin` }, timeout: 300 });
       const elapsed = performance.now() - startedAt;
-      expect(elapsed).toBeGreaterThan(1_500);
+      expect(elapsed).toBeGreaterThan(700);
       expect(result).toMatchObject({ timedOut: true });
       expect(result.signal).toBeUndefined();
     } finally {

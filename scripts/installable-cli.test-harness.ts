@@ -36,9 +36,13 @@ export let tmpBase: string;
 export let hostHome: string;
 let defaultFakeBin: string;
 
+// The default fake `docker` goes ahead of the host PATH, so a test that names
+// no PATH of its own never reaches the host's real Docker daemon. A test that
+// does name one keeps its own tools first and gets the default only as a
+// fallback.
 function testPath(extraEnv: NodeJS.ProcessEnv = {}): string {
-  const requestedPath = extraEnv.PATH ?? process.env.PATH ?? "";
-  return `${requestedPath}${path.delimiter}${defaultFakeBin}`;
+  if (extraEnv.PATH !== undefined) return `${extraEnv.PATH}${path.delimiter}${defaultFakeBin}`;
+  return `${defaultFakeBin}${path.delimiter}${process.env.PATH ?? ""}`;
 }
 
 export function runCli(args: string[]): childProcess.SpawnSyncReturns<string> {

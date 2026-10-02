@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { beforeEach, describe, expect, test, vi, type Mock } from "vitest";
+import { afterAll, afterEach, beforeEach, describe, expect, test, vi, type Mock } from "vitest";
 
 import {
   createControlPlaneGenerationV2,
@@ -55,6 +55,10 @@ beforeEach(() => {
   stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "runfree-rebind-adoption-"));
 });
 
+afterEach(() => {
+  fs.rmSync(stateDir, { recursive: true, force: true });
+});
+
 function lifecycleLock(): ProjectLifecycleLock & { assertHeld: Mock<() => void> } {
   return { ownerToken: "test-owner", assertHeld: vi.fn<() => void>(), release: vi.fn<() => void>() };
 }
@@ -76,7 +80,24 @@ function candidateSelection(
   };
 }
 
-function fixture() {
+// Durable writes fsync, so the fixture state is built once and copied into
+// each test's state directory.
+let template: { dir: string; value: ReturnType<typeof buildFixture> } | undefined;
+
+afterAll(() => {
+  if (template) fs.rmSync(template.dir, { recursive: true, force: true });
+});
+
+function fixture(): ReturnType<typeof buildFixture> {
+  if (!template) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "runfree-rebind-adoption-template-"));
+    template = { dir, value: buildFixture(dir) };
+  }
+  fs.cpSync(template.dir, stateDir, { recursive: true });
+  return template.value;
+}
+
+function buildFixture(stateDir: string) {
   const { target } = sessionGenerationFixture();
   const oldSelection = effectiveControlPlaneFixture({ target });
   const oldManifest = controlPlaneMaterializationFixture({ target });

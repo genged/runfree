@@ -7,7 +7,7 @@ import { failClosedSpawnStatus } from "./spawn-status.ts";
 // Real child processes, not Docker: the fault is in how a spawnSync result is
 // mapped to a status, so a `node -e` child that behaves like a wedged Docker
 // client reproduces it exactly.
-const IGNORE_TERM_THEN_EXIT_ZERO = "process.on('SIGTERM', () => {}); setTimeout(() => process.exit(0), 1500);";
+const IGNORE_TERM_THEN_EXIT_ZERO = "process.on('SIGTERM', () => {}); setTimeout(() => process.exit(0), 800);";
 const FLOOD_IGNORING_TERM = "process.on('SIGTERM', () => {}); process.stdout.write('x'.repeat(65536)); setTimeout(() => process.exit(0), 300);";
 const FLOOD = "process.stdout.write('x'.repeat(65536));";
 
@@ -17,7 +17,7 @@ const captures = [
 ] as const;
 
 test.each(captures)("%s: a timed-out child that ignores SIGTERM and exits 0 is not success", (_name, capture) => {
-  const result = capture(IGNORE_TERM_THEN_EXIT_ZERO, { timeout: 500 });
+  const result = capture(IGNORE_TERM_THEN_EXIT_ZERO, { timeout: 400 });
   expect(result.stdout).toBe("");
   expect(result.status).not.toBe(0);
   expect(result).toMatchObject({ timedOut: true });
@@ -34,7 +34,7 @@ test.each(captures)("%s: an output flood past maxBuffer (ENOBUFS) is not success
 });
 
 test.each(captures)("%s: a timed-out child that later exits 1 is a timeout, not a definite no", (_name, capture) => {
-  const result = capture("process.on('SIGTERM', () => {}); setTimeout(() => process.exit(1), 1500);", { timeout: 500 });
+  const result = capture("process.on('SIGTERM', () => {}); setTimeout(() => process.exit(1), 800);", { timeout: 400 });
   expect(result).toMatchObject({ status: 124, timedOut: true });
 });
 

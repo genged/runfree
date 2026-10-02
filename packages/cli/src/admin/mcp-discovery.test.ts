@@ -493,8 +493,32 @@ describe("pinnedHttpsGet against a local TLS server", () => {
   });
 
   test("tries the next checked address only when the connect fails", async () => {
-    const result = await get("/json", { targets: [{ address: "127.0.0.2", family: 4 }, target] });
-    expect(result).toMatchObject({ kind: "response", status: 200 });
+    // The server listens on 127.0.0.1 only, so ::1 on the same port is
+    // refused at connect on every host. (127.0.0.2 is not portable: macOS
+    // does not answer it, so the connect hangs until the deadline.)
+    const refused = { address: "::1", family: 6 as const };
+    let accepted = 0;
+    const onConnection = () => {
+      accepted += 1;
+    };
+    server.on("connection", onConnection);
+    try {
+      expect(await get("/json", { targets: [refused, target] })).toMatchObject({ kind: "response", status: 200 });
+      expect(accepted).toBe(1);
+      // A TLS failure after the TCP connect is the answer: the second
+      // address is never tried.
+      accepted = 0;
+      const result = await pinnedHttpsGet(new URL("https://other.discovery.invalid/json"), [target, target], {
+        timeoutMs: 3_000,
+        maxBodyBytes: DISCOVERY_LIMITS.maxBodyBytes,
+        testPort: port,
+        testCa: cert,
+      });
+      expect(result).toEqual({ kind: "error", reason: "request failed (ERR_TLS_CERT_ALTNAME_INVALID)" });
+      expect(accepted).toBe(1);
+    } finally {
+      server.off("connection", onConnection);
+    }
   });
 
   test("verifies the certificate against the URL hostname, not the connected IP", async () => {

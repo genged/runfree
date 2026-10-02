@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { afterEach, describe, expect, test, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
 import { sessionFilePath } from "@runfree/runtime-contracts/session-file";
 
@@ -80,7 +80,15 @@ const DEAD_PID = 4_194_305;
 
 const roots: string[] = [];
 
+// Record and journal writes fsync every file and directory; against a temp
+// dir that is pure disk latency. The crash-after-removal case below layers
+// its own fsync fault over this stub.
+beforeEach(() => {
+  vi.spyOn(fs, "fsyncSync").mockImplementation(() => {});
+});
+
 afterEach(() => {
+  vi.restoreAllMocks();
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
 
@@ -646,10 +654,8 @@ describe("fenced project destroy", () => {
       originalRemove(candidate, options);
       if (candidate === rebindPath) rebindRemoved = true;
     }) as typeof fs.rmSync);
-    const originalFsync = fs.fsyncSync.bind(fs);
-    const fsyncSpy = vi.spyOn(fs, "fsyncSync").mockImplementation(((descriptor) => {
+    const fsyncSpy = vi.spyOn(fs, "fsyncSync").mockImplementation((() => {
       if (rebindRemoved) throw new Error("simulated crash after forced rebind-journal removal");
-      return originalFsync(descriptor);
     }) as typeof fs.fsyncSync);
     try {
       expect(() => runFencedProjectDestroy(forced.input)).toThrow("simulated crash");

@@ -524,6 +524,27 @@ describe("fast teardown after a proved exit (sub-second launch plan Task 8)", ()
     }
   });
 
+  test("a completion that throws reads as uncertain and keeps the full sequence", () => {
+    const fixture = harness();
+
+    expect(teardownSessionRecord(fixture.input({
+      completion: () => { throw new Error("inspection failed"); },
+    }))).toEqual({ completed: true });
+
+    expect(fixture.effects()).toEqual(["delete-session-file", "list-callback-ingress", "disconnect", "stop", "remove"]);
+  });
+
+  test("the completion is not asked before the session file is gone", () => {
+    const completion = vi.fn(() => exitedCompletion());
+    const fixture = harness({
+      answers: { "delete-session-file": { status: 1, stdout: "", stderr: "proxy exec failed" } },
+    });
+
+    expect(teardownSessionRecord(fixture.input({ completion }))).toMatchObject({ completed: false });
+
+    expect(completion).not.toHaveBeenCalled();
+  });
+
   test("a delete failure after a proved exit still stops everything before any container effect", () => {
     const fixture = harness({
       completion: exitedCompletion(),

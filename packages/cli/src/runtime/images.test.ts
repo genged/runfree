@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { beforeEach, expect, test } from "vitest";
+import { afterEach, beforeEach, expect, test, vi } from "vitest";
 
 import {
   agentRuntimeImageTag,
@@ -72,6 +72,7 @@ import {
   sessionContainerTemplateFixture,
 } from "./session-container.test-harness.ts";
 import { sessionContainerTopologyProjectionV2 } from "./session-container-template.ts";
+import { sessionContainerQuarantineRoot } from "./session-containers.ts";
 import { composeInterpolationVariables } from "./topology-digest.ts";
 import {
   createRuntimeTopologyProjectionArtifactV2,
@@ -83,6 +84,15 @@ let tmp: string;
 
 beforeEach(() => {
   tmp = fs.mkdtempSync(path.join(os.tmpdir(), "runfree-images-"));
+  // These tests prove which state is published and selected, not that it is
+  // durable; fsync was most of this file's wall time. The publish-path fsync
+  // contract is proved in component-state-v2.test.ts.
+  vi.spyOn(fs, "fsyncSync").mockImplementation(() => {});
+});
+
+afterEach(() => {
+  vi.restoreAllMocks();
+  fs.rmSync(tmp, { recursive: true, force: true });
 });
 
 function writeRuntimeAssets(runtimeRoot: string): void {
@@ -709,9 +719,22 @@ test("cleanup inputs digest is stable for unchanged inputs and moves with every 
   expect(first).toMatch(/^sha256:[a-f0-9]{64}$/);
   expect(imageCleanupInputsDigest(context, candidates)).toBe(first);
   expect(imageCleanupInputsDigest(context, {})).not.toBe(first);
+  const seen = new Set([first, imageCleanupInputsDigest(context, {})]);
+  const moved = (label: string): void => {
+    const next = imageCleanupInputsDigest(context, candidates);
+    expect(seen.has(next), label).toBe(false);
+    seen.add(next);
+  };
   // A new on-disk materialization (a build, or crash residue) is a new input.
   fs.mkdirSync(path.join(sessionAgentMaterializationsRootV2(plan.paths.stateDir), `sha256-${"e".repeat(64)}`), { recursive: true });
-  expect(imageCleanupInputsDigest(context, candidates)).not.toBe(first);
+  moved("session materialization");
+  fs.mkdirSync(path.join(controlPlaneMaterializationsRootV2(plan.paths.stateDir), `sha256-${"f".repeat(64)}`), { recursive: true });
+  moved("control-plane materialization");
+  fs.mkdirSync(sessionContainerQuarantineRoot(plan.paths.stateDir), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(sessionContainerQuarantineRoot(plan.paths.stateDir), "rf-20260930-abcdef.json"), "{}", { mode: 0o600 });
+  moved("quarantined record");
+  context.project = { ...context.project, config: { ...context.project.config, runtime: { ...context.project.config.runtime, agent: { build: { context: ".runfree/image", dockerfile: ".runfree/image/Dockerfile" } } } } };
+  moved("project image build configured");
 });
 
 test("cleanup refuses materialization deletion when an exact path contains a hard link", () => {

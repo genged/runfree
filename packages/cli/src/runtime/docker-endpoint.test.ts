@@ -89,16 +89,22 @@ describe("resolveDockerEndpoint", () => {
   });
 
   it.each([
-    ["missing", {}],
-    ["malformed", { [dockerContextMetaPath(CONFIG_DIR, "x1")]: "{nope" }],
-    ["not an object", { [dockerContextMetaPath(CONFIG_DIR, "x1")]: "[]" }],
-    ["naming another context", { [dockerContextMetaPath(CONFIG_DIR, "x1")]: JSON.stringify({ Name: "x2", Endpoints: { docker: { Host: "unix:///x.sock" } } }) }],
-    ["without a docker endpoint", { [dockerContextMetaPath(CONFIG_DIR, "x1")]: JSON.stringify({ Name: "x1", Endpoints: {} }) }],
-    ["with a tcp host", contextMeta("x1", "tcp://1.2.3.4:2376")],
-    ["with an ssh host", contextMeta("x1", "ssh://me@box")],
-    ["with SkipTLSVerify", contextMeta("x1", "unix:///x.sock", { SkipTLSVerify: true })],
-  ])("falls back to the CLI for context metadata %s", (_label, files) => {
-    expect(resolveDockerEndpoint({ HOME, DOCKER_CONTEXT: "x1" }, fakeFs(files)).kind).toBe("cli");
+    ["missing", {}, "Docker context x1 has no metadata"],
+    ["malformed", { [dockerContextMetaPath(CONFIG_DIR, "x1")]: "{nope" }, "is malformed"],
+    ["not an object", { [dockerContextMetaPath(CONFIG_DIR, "x1")]: "[]" }, "is not a JSON object"],
+    ["naming another context", { [dockerContextMetaPath(CONFIG_DIR, "x1")]: JSON.stringify({ Name: "x2", Endpoints: { docker: { Host: "unix:///x.sock" } } }) }, "metadata names another context"],
+    ["without a docker endpoint", { [dockerContextMetaPath(CONFIG_DIR, "x1")]: JSON.stringify({ Name: "x1", Endpoints: {} }) }, "Docker context has no docker endpoint"],
+    ["with a tcp host", contextMeta("x1", "tcp://1.2.3.4:2376"), "Docker context endpoint is not a unix socket"],
+    ["with an ssh host", contextMeta("x1", "ssh://me@box"), "Docker context endpoint is not a unix socket"],
+    ["with SkipTLSVerify", contextMeta("x1", "unix:///x.sock", { SkipTLSVerify: true }), "Docker context sets SkipTLSVerify"],
+  ])("falls back to the CLI for context metadata %s", (_label, files, reason) => {
+    const resolved = resolveDockerEndpoint({ HOME, DOCKER_CONTEXT: "x1" }, fakeFs(files));
+    expect(resolved).toEqual({ kind: "cli", reason: expect.stringContaining(reason) });
+  });
+
+  it("allows an empty HttpHeaders object in config.json", () => {
+    const fsx = fakeFs({ [path.join(CONFIG_DIR, "config.json")]: JSON.stringify({ HttpHeaders: {} }) }, ["/var/run/docker.sock"]);
+    expect(resolveDockerEndpoint({ HOME }, fsx)).toEqual({ kind: "unix", socketPath: "/var/run/docker.sock", context: "default" });
   });
 
   it("falls back to the CLI when the context has TLS material", () => {
@@ -142,19 +148,22 @@ describe("resolveDockerEndpoint", () => {
 
   it("reads nothing but the environment and the user's Docker config", () => {
     const read: string[] = [];
+    const files = contextMeta("x1", "unix:///x.sock");
     const fsx: DockerEndpointFs = {
       readFile: (filePath) => {
         read.push(filePath);
-        return undefined;
+        return files[filePath];
       },
       exists: (filePath) => {
         read.push(filePath);
-        return true;
+        return false;
       },
       passwdHome: () => undefined,
     };
-    resolveDockerEndpoint({ HOME, DOCKER_CONTEXT: "x1" }, fsx);
-    expect(read.every((filePath) => filePath.startsWith(CONFIG_DIR) || filePath === "/var/run/docker.sock")).toBe(true);
+    // Reaches the end of the context path: config, metadata, and TLS probe.
+    expect(resolveDockerEndpoint({ HOME, DOCKER_CONTEXT: "x1" }, fsx)).toMatchObject({ kind: "unix", socketPath: "/x.sock" });
+    expect(read).toHaveLength(3);
+    expect(read.every((filePath) => filePath.startsWith(`${CONFIG_DIR}/`))).toBe(true);
   });
 });
 

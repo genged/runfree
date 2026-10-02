@@ -165,4 +165,23 @@ describe("attached session wait", () => {
     preserved.settle({ kind: "exit", code: 0, signal: null });
     await expect(kept).resolves.toEqual({ status: 0, signal: null });
   });
+
+  test("a re-attach that cannot spawn waits on the beat, which answers with the container's proved exit", async () => {
+    const { handle, settle } = foregroundHandle();
+    const decisions: LostForegroundStreamDecision[] = [{ kind: "reattach" }, { kind: "exited", status: 7 }];
+    const wait = ports({
+      foreground: handle,
+      classifyLostStream: vi.fn((): LostForegroundStreamDecision => decisions.shift() ?? { kind: "wait", observation: "unreachable" }),
+      reattach: vi.fn(async () => { throw new Error("docker start --attach could not spawn"); }),
+    });
+    const outcome = waitForAttachedSessionCompletion(wait);
+    settle({ kind: "error", error: new Error("stream closed") });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(lines.some((line) => line.includes("session output stream lost: docker start --attach could not spawn"))).toBe(true);
+    await vi.advanceTimersByTimeAsync(1_000);
+    await expect(outcome).resolves.toEqual({ status: 7, signal: null });
+    expect(wait.reportInspectedExit).toHaveBeenCalledWith(7);
+    expect(wait.reportCompletion).not.toHaveBeenCalled();
+    expect(lines.some((line) => line.includes("session container exited with code 7"))).toBe(true);
+  });
 });

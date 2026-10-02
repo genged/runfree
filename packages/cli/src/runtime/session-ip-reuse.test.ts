@@ -25,7 +25,7 @@ function fixture() {
   return { root, directory, request };
 }
 
-async function fence(f: ReturnType<typeof fixture>, options: { respond?: boolean; kernelResidue?: boolean; expectedDigest?: string; umask?: number } = {}) {
+async function fence(f: ReturnType<typeof fixture>, options: { respond?: boolean; kernelResidue?: boolean; expectedDigest?: string; umask?: number; deadlineMs?: number } = {}) {
   const read = sessionIpAssignmentReadCommand("a".repeat(64), IP);
   const readScript = read.args[7].replaceAll(SESSION_IP_REUSE_DIR, f.directory).replace("const ownerUid = 0;", `const ownerUid = ${uid};`);
   const before = spawnSync(process.execPath, ["-e", readScript, f.directory, IP], { encoding: "utf8" });
@@ -35,11 +35,16 @@ async function fence(f: ReturnType<typeof fixture>, options: { respond?: boolean
   const kernelLog = path.join(f.root, "kernel-effects.jsonl");
   // Execute the exact sealed publisher. Substitute only container paths, UIDs,
   // the test timeout, and the kernel command boundary; consumers are real.
-  const sourceScript = command.args[command.args.indexOf("-e") + 1]
+  const sealed = command.args[command.args.indexOf("-e") + 1];
+  // Every substitution must land, or the test runs a different publisher.
+  for (const needle of ["const ownerUid = 0;", "const requestProxyUid = 1001;", "performance.now() + 20000", 'const { execFileSync } = require("node:child_process");']) {
+    expect(sealed).toContain(needle);
+  }
+  const sourceScript = sealed
     .replaceAll(SESSION_IP_REUSE_DIR, f.directory)
     .replace("const ownerUid = 0;", `const ownerUid = ${uid};`)
     .replace("const requestProxyUid = 1001;", `const requestProxyUid = ${uid};`)
-    .replace("performance.now() + 20000", "performance.now() + 2000")
+    .replace("performance.now() + 20000", `performance.now() + ${options.deadlineMs ?? 2000}`)
     .replace('const { execFileSync } = require("node:child_process");', `const execFileSync = (name, args) => {
       fs.appendFileSync(${JSON.stringify(kernelLog)}, JSON.stringify({ name, args }) + "\\n");
       return args.includes("-H") && ${options.kernelResidue === true} ? "ESTAB old connection" : "";
@@ -90,9 +95,10 @@ test("old acknowledgements cannot release a fence, and a retry reclaims it", asy
   for (const consumer of ["firewall", "request-proxy"]) {
     fs.writeFileSync(path.join(f.directory, consumer, `${IP}.json`), `${"f".repeat(32)}\n`);
   }
-  const refused = await fence(f, { respond: false });
+  // Refusals run to the fence deadline; a short one keeps the test fast.
+  const refused = await fence(f, { respond: false, deadlineMs: 300 });
   expect(refused.status).toBe(1);
-  expect(refused.stderr).toContain("retry the launch");
+  expect(refused.stderr).toContain("IP reuse fence timed out; retry the launch to reclaim it");
   expect(fs.existsSync(refused.kernelLog)).toBe(false);
   expect(JSON.parse(fs.readFileSync(f.request, "utf8")).state).toBe("draining");
   const retried = await fence(f);
@@ -102,7 +108,7 @@ test("old acknowledgements cannot release a fence, and a retry reclaims it", asy
 
 test("a successful ss kill with remaining kernel sockets refuses IP assignment", async () => {
   const f = fixture();
-  const result = await fence(f, { kernelResidue: true });
+  const result = await fence(f, { kernelResidue: true, deadlineMs: 300 });
   expect(result.status).toBe(1);
   expect(result.stderr).toContain("old TCP connections remain");
   expect(result.observedNonces.size).toBe(1);

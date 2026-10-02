@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { beforeEach, describe, expect, test, vi, type Mock } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, test, vi, type Mock } from "vitest";
 
 import { agentRuntimeImageTag } from "../agent-image.ts";
 import {
@@ -80,12 +80,25 @@ import {
 import type { ProjectLifecycleLock } from "./sessions.ts";
 import type { RuntimeContext } from "./types.ts";
 
+// Every test works at the same path so the approved-controls state, built
+// once per file, can be copied in instead of re-approved (the slowest step).
+let base: string;
 let tmp: string;
+let controlsSnapshot: string | undefined;
 
-beforeEach(() => {
-  tmp = fs.mkdtempSync(path.join(os.tmpdir(), "runfree-session-driver-preflight-"));
+beforeAll(() => {
+  base = fs.mkdtempSync(path.join(os.tmpdir(), "runfree-session-driver-preflight-"));
+  tmp = path.join(base, "work");
 });
 
+afterAll(() => {
+  fs.rmSync(base, { recursive: true, force: true });
+});
+
+beforeEach(() => {
+  fs.rmSync(tmp, { recursive: true, force: true });
+  fs.mkdirSync(tmp);
+});
 
 // Runtime environment generation requires a selected effective control
 // generation; publish a minimal one per fixture state dir (idempotent).
@@ -104,7 +117,13 @@ function ensureSelectedControls(projectRoot: string, project: ProjectInfo): void
 
 function projectInfo(projectRoot: string): ProjectInfo {
   const project = buildProjectInfo(projectRoot);
-  ensureSelectedControls(projectRoot, project);
+  if (controlsSnapshot) {
+    fs.cpSync(controlsSnapshot, tmp, { recursive: true });
+  } else {
+    ensureSelectedControls(projectRoot, project);
+    controlsSnapshot = path.join(base, "controls");
+    fs.cpSync(tmp, controlsSnapshot, { recursive: true });
+  }
   return project;
 }
 

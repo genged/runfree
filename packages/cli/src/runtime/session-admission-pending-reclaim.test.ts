@@ -10,7 +10,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { afterEach, beforeEach, describe, expect, test } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "vitest";
 
 import { SESSION_FILES_DIR } from "@runfree/runtime-contracts/session-file";
 
@@ -142,6 +142,19 @@ type Harness = {
 };
 
 let stateDir: string;
+// The published and selected control plane every scenario starts from. Durable
+// writes fsync, so it is built once and copied into each test's state.
+let controlPlaneTemplate: string;
+
+beforeAll(() => {
+  controlPlaneTemplate = fs.mkdtempSync(path.join(os.tmpdir(), "runfree-pending-reclaim-template-"));
+  publishControlPlaneMaterializationV2(controlPlaneTemplate, controlPlaneMaterializationFixture({ target: sessionGenerationFixture().target }));
+  selectEffectiveControlPlaneV2(controlPlaneTemplate, SELECTION);
+});
+
+afterAll(() => {
+  fs.rmSync(controlPlaneTemplate, { recursive: true, force: true });
+});
 
 beforeEach(() => {
   stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "runfree-pending-reclaim-"));
@@ -153,8 +166,7 @@ afterEach(() => {
 
 function build(scenario: Scenario): Harness {
   const target = sessionGenerationFixture().target;
-  publishControlPlaneMaterializationV2(stateDir, controlPlaneMaterializationFixture({ target }));
-  selectEffectiveControlPlaneV2(stateDir, SELECTION);
+  fs.cpSync(controlPlaneTemplate, stateDir, { recursive: true });
   const owner = OWNERS[scenario.owner];
   const record = sessionContainerRecordFixture({
     target,
@@ -475,6 +487,10 @@ describe("no record is dropped before Docker proves it may be", () => {
     expect(result.sessionIds).toEqual([harness.record.sessionId]);
     expect(result.reasons.join("\n")).toContain(reason);
     expect(result.reasons.join("\n")).toContain(harness.record.sessionId);
+    // Every remedy it prints is a real command.
+    for (const command of result.reasons.join("\n").match(/`runfree [^`]+`/gu) ?? []) {
+      expect(["`runfree up`", "`runfree rebuild`", "`runfree destroy --force`", "`runfree sessions`"]).toContain(command);
+    }
     // The record is the address reservation: it is exactly what it was.
     expect(harness.records()).toEqual([harness.record]);
     // Refused before the teardown began, an unstamped record stays unstamped;
@@ -497,16 +513,33 @@ describe("no record is dropped before Docker proves it may be", () => {
     expect(dockerEffects(harness.events)).toEqual(["inspect-session"]);
   });
 
-  test("every remedy it prints is a real command", () => {
-    const harness = build({ owner: "unknown", container: ["absent"], proxy: "exited" });
+  test("a pending record with no selected control plane is refused before any Docker call", () => {
+    const record = sessionContainerRecordFixture({
+      target: sessionGenerationFixture().target,
+      containerId: CONTAINER_ID,
+      overrides: { ...OWNERS.dead.overrides },
+    });
+    writeSessionContainerRecordV2(stateDir, SESSION_TEST_PROJECT, record);
+    writeSessionHostStatus(stateDir, {
+      v: 1,
+      sessionId: record.sessionId,
+      lastHeartbeatAt: "2026-09-29T20:00:00.000Z",
+      aliveUntil: "2026-09-29T20:00:00.000Z",
+      served: "unknown",
+      terminal: "revoking",
+    });
+    const result = reclaimPendingSessionAdmissions({
+      stateDir,
+      expectedProject: SESSION_TEST_PROJECT,
+      io: { capture: () => { throw new Error("no Docker call may run"); } },
+      lifecycleLock: { ownerToken: "test-owner", assertHeld: () => undefined, release: () => undefined },
+      env: { RUNFREE_TEST_FAKE_DOCKER: "1", ...OWNERS.dead.env },
+      nowEpochMs: Date.parse("2026-09-30T08:00:00.000Z"),
+    });
 
-    const result = reclaimPendingSessionAdmissions(harness.input);
-
-    expect(result.kind).toBe("refused");
-    if (result.kind !== "refused") return;
-    for (const command of result.reasons.join("\n").match(/`runfree [^`]+`/gu) ?? []) {
-      expect(["`runfree up`", "`runfree rebuild`", "`runfree destroy --force`", "`runfree sessions`"]).toContain(command);
-    }
+    expect(result).toMatchObject({ kind: "refused", sessionIds: [record.sessionId] });
+    expect(result.kind === "refused" && result.reasons.join("\n")).toContain("no selected control plane");
+    expect(listSessionContainerRecordsV2(stateDir, SESSION_TEST_PROJECT)).toEqual([record]);
   });
 
   test("no lock, no pass", () => {

@@ -43,6 +43,7 @@ describe("native Docker CLI probe", () => {
   it("refuses a relative or empty PATH entry reached before a docker, and an empty PATH", () => {
     expect(probe(`bin:${binDir({ bytes: ELF })}`)).toBeUndefined();
     expect(probe(`:${binDir({ bytes: ELF })}`)).toBeUndefined();
+    expect(probe(`.:${binDir({ bytes: ELF })}`)).toBeUndefined();
     expect(probe("")).toBeUndefined();
     expect(probe(binDir())).toBeUndefined();
   });
@@ -76,5 +77,8 @@ describe("spawnSearchPath", () => {
   it("follows spawnSync's lookup: the call env's PATH, /usr/bin:/bin for an env without PATH", () => {
     expect(spawnSearchPath({ PATH: "/a:/b" }, true)).toBe("/a:/b");
     expect(spawnSearchPath({}, true)).toBe("/usr/bin:/bin");
+    // No call env: process.env without PATH searches nothing.
+    expect(spawnSearchPath({}, false)).toBe("");
+    expect(spawnSearchPath({ PATH: "/a" }, false)).toBe("/a");
   });
 });

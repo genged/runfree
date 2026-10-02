@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test, vi } from "vitest";
 
 import {
   parseSessionAdmissionEligibility,
@@ -61,7 +61,7 @@ function recordingIo(status = 0): { io: RuntimeIO; calls: PublishedCall[] } {
 }
 
 /** Publishes the control-plane materialization and its effective selection. */
-function selectControlPlane(): ControlPlaneMaterializationManifestV2 {
+function selectControlPlane(stateDir: string): ControlPlaneMaterializationManifestV2 {
   const target = sessionGenerationFixture().target;
   const selection = effectiveControlPlaneFixture({ target });
   const manifest = createControlPlaneMaterializationManifestV2({
@@ -80,10 +80,26 @@ function selectControlPlane(): ControlPlaneMaterializationManifestV2 {
   return manifest;
 }
 
-function selectDesiredAgent(): void {
+function selectDesiredAgent(stateDir: string): void {
   const manifest = sessionAgentMaterializationFixture();
   publishSessionAgentMaterializationV2(stateDir, manifest, TEMPLATE_ARTIFACT);
   selectDesiredSessionAgentV2(stateDir, createSessionAgentDesiredSelectionV2(manifest));
+}
+
+// Durable writes fsync, so the selected control plane and desired agent every
+// test starts from are built once and copied into each test's state.
+let selectedTemplate: string;
+
+beforeAll(() => {
+  selectedTemplate = fs.mkdtempSync(path.join(os.tmpdir(), "runfree-admission-source-template-"));
+  selectControlPlane(selectedTemplate);
+  selectDesiredAgent(selectedTemplate);
+});
+
+afterAll(() => fs.rmSync(selectedTemplate, { recursive: true, force: true }));
+
+function selectControlPlaneAndDesiredAgent(): void {
+  fs.cpSync(selectedTemplate, stateDir, { recursive: true });
 }
 
 function olderAgentRecord(): SessionContainerRecordV2 {
@@ -142,8 +158,7 @@ function publication(input: {
 
 describe("session eligibility publication", () => {
   test("publishes one eligibility file carrying the desired and every live agent identity", () => {
-    selectControlPlane();
-    selectDesiredAgent();
+    selectControlPlaneAndDesiredAgent();
     const record = olderAgentRecord();
     const { io, calls } = recordingIo();
 
@@ -177,8 +192,7 @@ describe("session eligibility publication", () => {
   });
 
   test("republishes only when the eligibility bytes or the proxy incarnation change", () => {
-    selectControlPlane();
-    selectDesiredAgent();
+    selectControlPlaneAndDesiredAgent();
     const { io, calls } = recordingIo();
 
     expect(publication({ io }).published).toBe(true);
@@ -203,8 +217,7 @@ describe("session eligibility publication", () => {
   });
 
   test("publishes unconditionally when the caller knows the proxy file tree was recreated", () => {
-    selectControlPlane();
-    selectDesiredAgent();
+    selectControlPlaneAndDesiredAgent();
     const { io, calls } = recordingIo();
 
     expect(publication({ io }).published).toBe(true);
@@ -214,8 +227,7 @@ describe("session eligibility publication", () => {
   });
 
   test("refuses to publish into a proxy the selected control plane does not name", () => {
-    selectControlPlane();
-    selectDesiredAgent();
+    selectControlPlaneAndDesiredAgent();
     const { io, calls } = recordingIo();
 
     expect(() => publication({ io, proxyId: "b".repeat(64) }))
@@ -225,8 +237,7 @@ describe("session eligibility publication", () => {
   });
 
   test("leaves no publication record when the sealed write is refused", () => {
-    selectControlPlane();
-    selectDesiredAgent();
+    selectControlPlaneAndDesiredAgent();
     const { io, calls } = recordingIo(1);
 
     expect(() => publication({ io })).toThrow();

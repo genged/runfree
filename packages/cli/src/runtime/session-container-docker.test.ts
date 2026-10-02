@@ -15,10 +15,13 @@ import {
   sessionContainerAttachCommand,
   sessionContainerCreateCommand,
   sessionContainerInspectCommand,
+  sessionContainerNetworkDisconnectCommand,
   sessionContainerObservedExited,
   sessionContainerObservedExitStatus,
   parseSessionContainerTopHandoff,
+  sessionContainerRemoveCommand,
   sessionContainerStartAttachCommand,
+  sessionContainerStopCommand,
   sessionContainerTopCommand,
   sessionNetworkInspectCommand,
   type SessionContainerAttachIdentity,
@@ -504,5 +507,36 @@ describe("session entry handoff observation", () => {
       expect(() => parseSessionContainerTopHandoff(stdout, withInit)).not.toThrow();
       expect(parseSessionContainerTopHandoff(stdout, withInit)).not.toBe("handed-off");
     }
+  });
+});
+
+describe("ordered session teardown commands", () => {
+  const NETWORK_ID = "8".repeat(64);
+
+  test("seal exact disconnect, bounded stop, and forced remove argv for one exact container", () => {
+    const disconnect = sessionContainerNetworkDisconnectCommand(NETWORK_ID, CONTAINER_ID);
+    const stop = sessionContainerStopCommand(CONTAINER_ID, 10);
+    const remove = sessionContainerRemoveCommand(CONTAINER_ID);
+    expect(disconnect.args).toEqual(["network", "disconnect", NETWORK_ID, CONTAINER_ID]);
+    expect(stop.args).toEqual(["container", "stop", "--time", "10", CONTAINER_ID]);
+    expect(remove.args).toEqual(["container", "rm", "--force", CONTAINER_ID]);
+    const seen: string[][] = [];
+    for (const command of [disconnect, stop, remove]) {
+      executeSessionDockerCommand(command, (_executable, args) => seen.push([...args]));
+    }
+    expect(seen).toEqual([disconnect.args, stop.args, remove.args]);
+    // A copy is not the sealed command.
+    expect(() => executeSessionDockerCommand({ ...remove }, () => 0)).toThrow("refusing an unvalidated session Docker command");
+  });
+
+  test.each([
+    ["a short container id", () => sessionContainerRemoveCommand(CONTAINER_ID.slice(0, 12))],
+    ["a container name", () => sessionContainerStopCommand("runfree-session-x", 10)],
+    ["a network name", () => sessionContainerNetworkDisconnectCommand("runfree_agent_internal", CONTAINER_ID)],
+    ["a negative stop grace", () => sessionContainerStopCommand(CONTAINER_ID, -1)],
+    ["an unbounded stop grace", () => sessionContainerStopCommand(CONTAINER_ID, 301)],
+    ["a fractional stop grace", () => sessionContainerStopCommand(CONTAINER_ID, 1.5)],
+  ])("refuses %s before any command exists", (_label, build) => {
+    expect(build).toThrow();
   });
 });

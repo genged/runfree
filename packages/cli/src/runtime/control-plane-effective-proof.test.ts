@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { beforeEach, expect, test, vi } from "vitest";
+import { afterEach, beforeEach, expect, test, vi } from "vitest";
 
 import { sha256Digest, createRuntimeComponentState } from "./component-state.ts";
 import {
@@ -47,6 +47,14 @@ let stateDir: string;
 
 beforeEach(() => {
   stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "runfree-control-plane-proof-"));
+  // State publishes fsync every file and directory; against a temp dir that
+  // is pure disk latency. component-state-v2.test.ts proves the calls.
+  vi.spyOn(fs, "fsyncSync").mockImplementation(() => {});
+});
+
+afterEach(() => {
+  vi.restoreAllMocks();
+  fs.rmSync(stateDir, { recursive: true, force: true });
 });
 
 function fixture() {

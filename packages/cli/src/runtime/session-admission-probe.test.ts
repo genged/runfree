@@ -20,6 +20,7 @@ import {
   type SessionAdmissionLaunchOutcome,
   type SessionAdmissionLaunchSteps,
 } from "./session-admission-probe.ts";
+import { SessionFileTeardownBlockedError } from "./session-file-teardown.ts";
 
 const REVOCATION_SEQUENCE = ["tearDown"];
 
@@ -294,6 +295,44 @@ describe("post-completion teardown failures", () => {
     expect(failure).toBeInstanceOf(AggregateError);
     expect((failure as AggregateError).message).toBe("session admission launch failed and fail-closed cleanup also failed");
     expect((failure as AggregateError).errors).toHaveLength(1);
+  });
+});
+
+describe("blocked revocation during a failed launch", () => {
+  test("a launch failure and its cleanup both blocked on the session file report the one refusal, not an aggregate", async () => {
+    const { steps } = recorder();
+    const blocked = new SessionFileTeardownBlockedError(new Error("delete failed"));
+    const failing = {
+      ...steps,
+      awaitHandoff: async () => {
+        throw new SessionFileTeardownBlockedError(new Error("delete failed"));
+      },
+      tearDown: async () => {
+        throw blocked;
+      },
+    } satisfies SessionAdmissionLaunchSteps;
+
+    const failure = await runInternalSessionAdmissionLaunch(failing).catch((error: unknown) => error);
+
+    expect(failure).toBe(blocked);
+    expect((failure as Error).message).toContain("runfree up");
+  });
+
+  test("the same sentence over different observation evidence is not collapsed", async () => {
+    const { steps } = recorder();
+    let attempt = 0;
+    const failing = {
+      ...steps,
+      tearDown: async () => {
+        attempt += 1;
+        throw Object.assign(new Error("observation-unavailable"), { evidence: { attempt } });
+      },
+    } satisfies SessionAdmissionLaunchSteps;
+
+    const failure = await runInternalSessionAdmissionLaunch(failing).catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(SessionTeardownIncompleteError);
+    expect((failure as SessionTeardownIncompleteError).errors).toHaveLength(2);
   });
 });
 

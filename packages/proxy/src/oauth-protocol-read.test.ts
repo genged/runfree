@@ -264,8 +264,10 @@ describe("OAuthMediator.protocolReadEndpoint", () => {
   test("a protocol read whose endpoint stopped being mediated before forwarding is refused", async () => {
     const target = mediator();
     const match = target.protocolReadEndpoint({ method: "POST", url: TOKEN_URL });
+    expect(match).toBeDefined();
     target.activatePairedPolicy(validateOAuthMediationPolicy({ providers: { "mcp:claude-linear": linear({ protocolReadEndpoints: [] }) } }));
     const result = await target.beforeRequest({ method: "POST", url: TOKEN_URL }, { responseMediated: true, protocolRead: match });
     expect(result?.response?.statusCode).toBe(403);
+    expect(result?.response?.body).toContain("no longer mediated for this server");
   });
 });

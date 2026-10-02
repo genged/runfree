@@ -16,7 +16,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { beforeEach, expect, test, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, expect, test, vi } from "vitest";
 
 import { SESSION_ELIGIBILITY_PATH } from "@runfree/runtime-contracts/session-file";
 
@@ -79,6 +79,10 @@ let stateDir: string;
 
 beforeEach(() => {
   stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "runfree-startup-eligibility-"));
+});
+
+afterEach(() => {
+  fs.rmSync(stateDir, { recursive: true, force: true });
 });
 
 function lifecycleLock(): ProjectLifecycleLock {
@@ -184,9 +188,7 @@ type RestoreFixture = {
   securityProof: ReturnType<typeof validateRuntimeSecurityContractEvidence>;
 };
 
-/** Publishes and selects a control plane, a desired agent, and one live session. */
-function restoreFixture(): RestoreFixture {
-  const { target } = sessionGenerationFixture();
+function restorePlan(dir: string, target: ReturnType<typeof sessionGenerationFixture>["target"], controlPlaneMaterializationDigest: string): ActiveRuntimePlan {
   const components = createRuntimeComponentState({
     embeddedAgentImageInputDigest: sha256Digest("embedded-agent"),
     selectedAgentImageInputDigest: sha256Digest("selected-agent"),
@@ -195,28 +197,17 @@ function restoreFixture(): RestoreFixture {
     topologyDigest: sha256Digest("topology"),
     hostHelperDigest: sha256Digest("host-helper"),
   });
-  const proxyImageRef = "runfree/proxy-runtime:test";
-  const manifest = createControlPlaneMaterializationManifestV2({
-    ...SESSION_TEST_PROJECT,
-    generation: target.controlPlane,
-    proxyImageRef,
-    proxyImageId: PROXY_IMAGE_ID,
-    renderedControlPlaneSha256: target.controlPlane.controlPlaneTopologyDigest,
-    sessionAdmissionSource: "files",
-  });
-  publishControlPlaneMaterializationV2(stateDir, manifest);
-
-  const plan = {
+  return {
     projectId: SESSION_TEST_PROJECT.projectId,
     composeProjectName: SESSION_TEST_PROJECT.composeProject,
-    projectRoot: stateDir,
-    baseRuntimeRoot: path.join(stateDir, "runtime"),
+    projectRoot: dir,
+    baseRuntimeRoot: path.join(dir, "runtime"),
     generationV2: target,
     components,
-    paths: { stateDir },
+    paths: { stateDir: dir },
     activeRuntime: {
-      proxyImage: proxyImageRef,
-      controlPlaneMaterializationDigest: manifest.controlPlaneMaterializationDigest,
+      proxyImage: PROXY_IMAGE_REF,
+      controlPlaneMaterializationDigest,
     },
     execution: {
       dockerClientEnv: { DOCKER_HOST: "unix:///trusted-docker.sock" },
@@ -228,6 +219,33 @@ function restoreFixture(): RestoreFixture {
     mcpOAuth: {},
     runfreeVersion: "0.3.0-test",
   } as unknown as ActiveRuntimePlan;
+}
+
+const PROXY_IMAGE_REF = "runfree/proxy-runtime:test";
+
+type DurableRestoreState = {
+  dir: string;
+  controlPlaneMaterializationDigest: string;
+  runtimeProof: RuntimeValidationProof;
+  securityProof: ReturnType<typeof validateRuntimeSecurityContractEvidence>;
+};
+
+/**
+ * Publishes and selects a control plane, a desired agent, and one live session.
+ * Durable writes fsync, so this runs once per file and each test copies it.
+ */
+function buildDurableRestoreState(dir: string): DurableRestoreState {
+  const { target } = sessionGenerationFixture();
+  const manifest = createControlPlaneMaterializationManifestV2({
+    ...SESSION_TEST_PROJECT,
+    generation: target.controlPlane,
+    proxyImageRef: PROXY_IMAGE_REF,
+    proxyImageId: PROXY_IMAGE_ID,
+    renderedControlPlaneSha256: target.controlPlane.controlPlaneTopologyDigest,
+    sessionAdmissionSource: "files",
+  });
+  publishControlPlaneMaterializationV2(dir, manifest);
+  const plan = restorePlan(dir, target, manifest.controlPlaneMaterializationDigest);
 
   const runtimeProof: RuntimeValidationProof = {
     components: { ...target.controlPlane },
@@ -266,8 +284,8 @@ function restoreFixture(): RestoreFixture {
   });
 
   const agentManifest = sessionAgentMaterializationFixture();
-  publishSessionAgentMaterializationV2(stateDir, agentManifest, TEMPLATE_ARTIFACT);
-  selectDesiredSessionAgentV2(stateDir, createSessionAgentDesiredSelectionV2(agentManifest));
+  publishSessionAgentMaterializationV2(dir, agentManifest, TEMPLATE_ARTIFACT);
+  selectDesiredSessionAgentV2(dir, createSessionAgentDesiredSelectionV2(agentManifest));
 
   const attached = transitionProvisioningRunningSessionContainerToAttachedV2(
     transitionBoundAllocatedSessionContainerToProvisioningRunningV2(
@@ -275,10 +293,25 @@ function restoreFixture(): RestoreFixture {
       mintSessionContainerLeaseV2({ durationMs: 240_000 }),
     ),
   );
-  writeSessionContainerRecordV2(stateDir, SESSION_TEST_PROJECT, attached);
+  writeSessionContainerRecordV2(dir, SESSION_TEST_PROJECT, attached);
+  return { dir, controlPlaneMaterializationDigest: manifest.controlPlaneMaterializationDigest, runtimeProof, securityProof };
+}
 
+let durable: DurableRestoreState;
+
+beforeAll(() => {
+  durable = buildDurableRestoreState(fs.mkdtempSync(path.join(os.tmpdir(), "runfree-startup-eligibility-template-")));
+});
+
+afterAll(() => {
+  fs.rmSync(durable.dir, { recursive: true, force: true });
+});
+
+function restoreFixture(): RestoreFixture {
+  fs.cpSync(durable.dir, stateDir, { recursive: true });
+  const plan = restorePlan(stateDir, sessionGenerationFixture().target, durable.controlPlaneMaterializationDigest);
   const { io, effects, inputs } = restoreIo();
-  return { plan, io, effects, inputs, runtimeProof, securityProof };
+  return { plan, io, effects, inputs, runtimeProof: durable.runtimeProof, securityProof: durable.securityProof };
 }
 
 async function restore(fixture: RestoreFixture): Promise<void> {
@@ -396,7 +429,6 @@ test.each([
 ] as const)(
   "restore re-proves an unknown owner with %s",
   async (_name, live, expected) => {
-    stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "runfree-startup-eligibility-"));
     const fixture = restoreFixture();
     replaceRecordWithFrozenLease();
     stampSession(live ? {} : { aliveUntil: "2026-08-08T12:05:00.000Z" });

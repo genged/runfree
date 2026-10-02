@@ -3258,7 +3258,9 @@ describe("convergent proxy token store", () => {
   });
 
   describe("receipt-gated warm launch (launch plan D4, sub-second launch plan Task 5)", () => {
-    const warmSync = { ...syncInput, mode: "startup-convergence" as const };
+    // Verbose, so a deferral names its reason and each test can prove which
+    // step deferred.
+    const warmSync = { ...syncInput, verbose: true, mode: "startup-convergence" as const };
 
     function tokenWrites(logPath: string): number {
       return dockerExecCalls(logPath).filter((entry) => entry.stdin === "ghp_secret" || entry.stdin === "ghp_rotated").length;
@@ -3357,6 +3359,7 @@ describe("convergent proxy token store", () => {
       }, opEnv(fakeDocker, hostOpBin));
 
       expect(deferred.status).toBe(TOKEN_SYNC_DEFERRED_STATUS);
+      expect(deferred.stdout).toContain("credential sync deferred to a source-truth sync: github is due and its source was not read before the lock");
       expect(readJsonLines(opLogPath)).toHaveLength(1);
       const execsAfter = dockerExecCalls(fakeDocker.dockerLog).slice(execsBefore);
       expect(execsAfter.filter((entry) => entry.stdin !== "")).toEqual([]);
@@ -3374,12 +3377,15 @@ describe("convergent proxy token store", () => {
 
       const deferred = await runAdmin(async () => {
         prepareRuntimeTokenSources({ mode: "convergence" });
-        // The source config changes between preparation and the lock.
+        // The source config changes between preparation and the lock. The new
+        // fingerprint makes the token due, and the due check runs before the
+        // prepared-binding check, so the deferral names the unread source.
         writeTokenConfig({ github: { source: "1password", ref: "op://Private/GitHub/rotated" } });
         await credentialSyncIntent(warmSync);
       }, opEnv(fakeDocker, hostOpBin));
 
       expect(deferred.status).toBe(TOKEN_SYNC_DEFERRED_STATUS);
+      expect(deferred.stdout).toContain("credential sync deferred to a source-truth sync: github is due and its source was not read before the lock");
       expect(readJsonLines(opLogPath)).toHaveLength(1);
       const execsAfter = dockerExecCalls(fakeDocker.dockerLog).slice(execsBefore);
       expect(execsAfter.filter((entry) => entry.stdin !== "")).toEqual([]);
@@ -3407,6 +3413,7 @@ describe("convergent proxy token store", () => {
       }
 
       expect(deferred.status).toBe(TOKEN_SYNC_DEFERRED_STATUS);
+      expect(deferred.stdout).toContain("credential sync deferred to a source-truth sync: the prepared credential set no longer applies: prepared credential inputs changed or expired");
       expect(tokenRemovalCount(fakeDocker.dockerLog)).toBe(0);
     });
 
@@ -3432,6 +3439,7 @@ describe("convergent proxy token store", () => {
         schemaVersion: 1,
         receipts: [{ ...receipt, resolvedAt: Date.now() - 16 * 60 * 1000 }],
       })}\n`);
+      const writesBefore = tokenWrites(fakeDocker.dockerLog);
 
       const deferred = await runAdmin(async () => {
         prepareRuntimeTokenSources({ mode: "convergence" });
@@ -3441,6 +3449,9 @@ describe("convergent proxy token store", () => {
       // A killed client may still land its write; removing after it could
       // race the late write, so the source-truth order retries instead.
       expect(deferred.status).toBe(TOKEN_SYNC_DEFERRED_STATUS);
+      expect(deferred.stdout).toContain("credential sync deferred to a source-truth sync: github: proxy token write failed");
+      // The deferral came from the failed write, not from an earlier step.
+      expect(tokenWrites(fakeDocker.dockerLog)).toBe(writesBefore + 1);
       expect(tokenRemovalCount(fakeDocker.dockerLog)).toBe(0);
     });
 
@@ -3455,6 +3466,7 @@ describe("convergent proxy token store", () => {
       const deferred = await runAdmin(() => credentialSyncIntent(warmSync), opEnv(fakeDocker, hostOpBin));
 
       expect(deferred.status).toBe(TOKEN_SYNC_DEFERRED_STATUS);
+      expect(deferred.stdout).toContain("credential sync deferred to a source-truth sync: no prepared credential set for a prepared-only sync");
       expect(readJsonLines(opLogPath)).toHaveLength(0);
       expect(tokenWrites(fakeDocker.dockerLog)).toBe(0);
     });
@@ -3476,6 +3488,7 @@ describe("convergent proxy token store", () => {
           await credentialSyncIntent(warmSync);
         }, { ...opEnv(fakeDocker, hostOpBin), RUNFREE_TEST_TOKEN_STORE_LOCK_WAIT_MS: "5000" });
         expect(deferred.status).toBe(TOKEN_SYNC_DEFERRED_STATUS);
+        expect(deferred.stdout).toContain("credential sync deferred to a source-truth sync: another runfree command holds the token store lock");
         expect(Date.now() - startedAt).toBeLessThan(4_000);
         expect(tokenRemovalCount(fakeDocker.dockerLog)).toBe(0);
       } finally {
@@ -3498,6 +3511,7 @@ describe("convergent proxy token store", () => {
           await credentialSyncIntent(warmSync);
         }, opEnv(fakeDocker, hostOpBin), { policyAccess: "effective-read-only" });
         expect(deferred.status).toBe(TOKEN_SYNC_DEFERRED_STATUS);
+        expect(deferred.stdout).toContain("credential sync deferred to a source-truth sync: another control operation holds the control lock");
         expect(tokenRemovalCount(fakeDocker.dockerLog)).toBe(0);
       } finally {
         held?.release();
@@ -3927,6 +3941,10 @@ describe("convergent proxy token store", () => {
       // alone would keep the watcher running forever.
       RUNFREE_TOKEN_SYNC_WATCH_PARENT_PID: String(process.pid),
       RUNFREE_TOKEN_SYNC_LIFETIME_FD: "3",
+      // Short sleeps instead of the hourly refresh's 5 s ticks: the exit still
+      // depends only on the pipe, since nothing else ends this watch, and the
+      // test no longer waits out a whole tick.
+      RUNFREE_TEST_TOKEN_SYNC_WATCH_SLEEP_MS: "200",
     };
     const child = childProcess.spawn(
       process.execPath,
@@ -3954,8 +3972,8 @@ describe("convergent proxy token store", () => {
         }
       });
     });
-    // Close the parent's write end: the watcher must stop within one sleep
-    // tick even though the "parent" PID is still alive.
+    // Close the parent's write end: the watcher must stop at its next sleep
+    // check even though the "parent" PID is still alive.
     (child.stdio[3] as { destroy: () => void }).destroy();
     const timeout = new Promise<"timeout">((resolve) => setTimeout(() => resolve("timeout"), 20_000));
     const result = await Promise.race([exited, timeout]);
