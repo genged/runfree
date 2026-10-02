@@ -479,6 +479,67 @@ describe("container-only session orphan cleanup", () => {
     expect(inspected.slice(2).flat()).not.toContain(vanished);
   });
 
+  test("takes a churned chunk's survivors from Docker's partial output without re-inspecting them", () => {
+    // Docker exits non-zero when any member is gone but still prints the rest.
+    // Re-inspecting those survivors re-opened their window, so sustained churn
+    // (a teardown batch beside competing launches) lost a member every repair
+    // pass until the pass cap refused the launch.
+    const ids = inventoryIds(70);
+    const vanished = ids[3];
+    const survivors = ids.filter((id) => id !== vanished);
+    const inspected: string[][] = [];
+    let listCalls = 0;
+
+    const partialOutput = (_executable: "docker", args: readonly string[]): CaptureResult => {
+      if (args[1] === "ls") {
+        listCalls += 1;
+        return success(`${ids.join("\n")}\n`);
+      }
+      const requested = args.slice(2);
+      inspected.push([...requested]);
+      const found = requested.filter((id) => id !== vanished);
+      return {
+        status: found.length === requested.length ? 0 : 1,
+        stdout: inventoryInspectionMany(found.map(foreignSnapshotFor)),
+        stderr: found.length === requested.length ? "" : `Error response from daemon: No such container: ${vanished}`,
+      };
+    };
+
+    const inventory = inspectSessionContainerInventory(partialOutput, SESSION_TEST_PROJECT);
+
+    expect(inventory.map((container) => container.containerId).sort()).toEqual([...survivors].sort());
+    // Churn still forces one refreshed list, but nothing is inspected twice.
+    expect(listCalls).toBe(2);
+    expect(inspected).toEqual([ids.slice(0, 64), ids.slice(64)]);
+  });
+
+  test("repairs a churned chunk whose partial output does not account for every survivor", () => {
+    const ids = inventoryIds(3);
+    const vanished = ids[1];
+    const omitted = ids[2];
+    const inspected: string[][] = [];
+
+    const shortOutput = (_executable: "docker", args: readonly string[]): CaptureResult => {
+      if (args[1] === "ls") return success(`${ids.join("\n")}\n`);
+      const requested = args.slice(2);
+      inspected.push([...requested]);
+      if (!requested.includes(vanished)) return success(inventoryInspectionMany(requested.map(foreignSnapshotFor)));
+      // The refusal names one absent id but its output also drops a survivor,
+      // so it is not an exact account of the chunk.
+      return {
+        status: 1,
+        stdout: inventoryInspectionMany(requested.filter((id) => id !== vanished && id !== omitted).map(foreignSnapshotFor)),
+        stderr: `Error response from daemon: No such container: ${vanished}`,
+      };
+    };
+
+    const inventory = inspectSessionContainerInventory(shortOutput, SESSION_TEST_PROJECT);
+
+    expect(inventory.map((container) => container.containerId).sort())
+      .toEqual(ids.filter((id) => id !== vanished).sort());
+    expect(inspected).toEqual([[...ids], [ids[0], omitted]]);
+  });
+
   test("drops only ids a fresh list proves gone, and takes no more than two lists", () => {
     const ids = inventoryIds(3);
     const vanished = ids[1];

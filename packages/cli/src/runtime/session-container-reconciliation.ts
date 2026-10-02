@@ -509,16 +509,30 @@ function inspectSessionContainerInventoryIds(
     const chunk = ids.slice(offset, offset + MAX_SESSION_CONTAINER_INVENTORY_INSPECT_IDS);
     const inspectResult = executor("docker", ["container", "inspect", ...chunk], options);
     if (inspectResult.status !== 0) {
-      // Docker fails the whole chunk when any one member is gone and does not
-      // say which. Keep the chunk for repair and inspect the rest: abandoning
-      // the pass here only forces a re-inspection of chunks that already
-      // succeeded, which re-opens their window for nothing.
-      failedIds.push(...chunk);
       // The daemon names every id it could not find, one per line. That is the
       // only sound evidence that a container is gone: a fresh `container ls`
       // has been observed to still list an id that `container inspect` reports
       // as absent, so the list cannot settle existence.
-      for (const id of goneIdsFromFailure(inspectResult, chunk)) goneIds.add(id);
+      const chunkGoneIds = goneIdsFromFailure(inspectResult, chunk);
+      for (const id of chunkGoneIds) goneIds.add(id);
+      // Docker exits non-zero when any member is gone but still prints every
+      // member it found. When that output accounts for exactly the chunk minus
+      // the ids the daemon named absent, the survivors are proven by this same
+      // call. Re-inspecting them would re-open their window, and under
+      // sustained churn each repair pass then loses another member.
+      const survivors = partialChunkSnapshots(inspectResult, chunk, chunkGoneIds, expectedProject);
+      if (survivors) {
+        inspectedBytes += Buffer.byteLength(inspectResult.stdout);
+        if (inspectedBytes > MAX_SESSION_CONTAINER_INVENTORY_INSPECT_BYTES) {
+          throw new Error("Docker session-container inventory inspection exceeds the cumulative size limit");
+        }
+        snapshots.push(...survivors);
+        continue;
+      }
+      // Otherwise keep the chunk for repair and inspect the rest: abandoning
+      // the pass here only forces a re-inspection of chunks that already
+      // succeeded, which re-opens their window for nothing.
+      failedIds.push(...chunk);
       // Carry the reason: a vanished container, an unreachable daemon, and a
       // client-side buffer overrun all arrive here as a non-zero status, and a
       // refusal that cannot name which one is not diagnosable from a log.
@@ -565,6 +579,34 @@ function goneIdsFromFailure(result: CaptureResult, chunk: readonly string[]): re
   return chunk.filter((id) => named.has(id));
 }
 
+/**
+ * The survivors of a refused chunk, or undefined when the refusal's output
+ * does not account for every member.
+ *
+ * Accepted only when the daemon named at least one member absent and stdout is
+ * an exact inspection of every other member. Anything else — no named absence,
+ * malformed or truncated output, a missing or extra id — leaves the chunk to
+ * the repair path, which fails closed.
+ */
+function partialChunkSnapshots(
+  result: CaptureResult,
+  chunk: readonly string[],
+  goneIds: readonly string[],
+  expectedProject: SessionContainerProjectIdentity,
+): readonly SessionContainerSnapshot[] | undefined {
+  if (goneIds.length === 0) return undefined;
+  const gone = new Set(goneIds);
+  try {
+    return parseSessionContainerInventoryInspect(
+      `${result.stdout ?? ""}`,
+      chunk.filter((id) => !gone.has(id)),
+      expectedProject,
+    );
+  } catch {
+    return undefined;
+  }
+}
+
 const MAX_INVENTORY_FAILURE_REASON_CHARS = 300;
 
 /** Docker's own words for a refused chunk, bounded and single-line. */
@@ -579,8 +621,10 @@ function inspectFailureReason(result: CaptureResult): string {
 /**
  * Takes one bounded all-container ID snapshot, then inspects exactly that set.
  *
- * Docker refuses a whole `container inspect` chunk when any one member has
- * disappeared, so a failed chunk means either churn or a daemon failure. One
+ * Docker exits non-zero for a whole `container inspect` chunk when any one
+ * member has disappeared, so a failed chunk means either churn or a daemon
+ * failure. When the daemon names the absent members and stdout is an exact
+ * inspection of the rest, the survivors are taken from that same call. One
  * fresh all-container snapshot separates them and is the only authority for
  * "gone": an id that snapshot no longer reports does not exist, therefore holds
  * no address and belongs in no inventory. Every id it still reports must
@@ -613,10 +657,8 @@ export function inspectSessionContainerInventory(
   const ids = listSessionContainerInventoryIds(executor, captureOptions);
   if (ids.length === 0) return Object.freeze([]);
   const first = inspectSessionContainerInventoryIds(executor, ids, expectedProject, captureOptions);
-  if (first.failedIds.length === 0) {
-    return sealExactDockerInventory(first.snapshots, ids, expectedProject);
-  }
   if (first.goneIds.size === 0) {
+    if (first.failedIds.length === 0) return sealExactDockerInventory(first.snapshots, ids, expectedProject);
     throw new Error(
       `Docker could not inspect the exact session-container inventory: ${first.failureReason}`,
     );
@@ -652,8 +694,7 @@ export function inspectSessionContainerInventory(
       snapshots.push(snapshot);
       inspected.add(snapshot.containerId);
     }
-    if (pass.failedIds.length === 0) continue;
-    if (pass.goneIds.size === 0) {
+    if (pass.failedIds.length > 0 && pass.goneIds.size === 0) {
       throw new Error(
         `Docker could not inspect the exact session-container inventory: ${pass.failureReason}`,
       );
