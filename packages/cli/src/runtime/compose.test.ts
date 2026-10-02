@@ -54,7 +54,6 @@ describe("per-session compose shape", () => {
 
     expect(rendered).toContain([
       "volumes:",
-      "  runfree-commandhistory:",
       "  runfree-oauth-state:",
       "  runfree-node-modules:",
       "",
@@ -78,7 +77,10 @@ describe("per-session compose shape", () => {
   });
 
   test("fails closed when the top-level volumes block is missing", () => {
-    expect(() => renderRuntimeCompose(BASE_COMPOSE.replace("volumes:\n  runfree-commandhistory:\n  runfree-oauth-state:\n\n", ""), {
+    const withoutVolumes = BASE_COMPOSE.replace("volumes:\n  runfree-oauth-state:\n\n", "");
+    // The removal must actually happen, or this case proves nothing.
+    expect(withoutVolumes).not.toBe(BASE_COMPOSE);
+    expect(() => renderRuntimeCompose(withoutVolumes, {
       namedVolumes: ["deps"],
     })).toThrow("embedded runtime compose.yaml no longer has the expected top-level volumes block");
   });

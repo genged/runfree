@@ -1054,8 +1054,7 @@ async function prepareRuntimeForTokenSyncOrRemoveInvalid(
   // Create the Compose-managed session named volumes the removed `agent`
   // service used to make `compose up` create. Runs before the dependency-volume
   // ownership step so those volumes exist (labelled) before that step mounts and
-  // chowns them, and unconditionally so `runfree-commandhistory` exists even
-  // when dependency overlays are off.
+  // chowns them. With dependency overlays off there are none.
   const sessionVolumes = timings.time(
     "validation:session-volumes",
     () => ensureComposeManagedSessionVolumes(validationContext, docker),

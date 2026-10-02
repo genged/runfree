@@ -50,7 +50,6 @@ describe("session named-volume inspection proof", () => {
       executable: "docker",
       args: ["volume", "inspect", ...request.exactNames],
       exactNames: [
-        volume("runfree-commandhistory"),
         volume("runfree-deps-0123456789ab-node-modules"),
         volume("runfree-deps-0123456789ab-pnpm-store"),
       ],
@@ -60,10 +59,6 @@ describe("session named-volume inspection proof", () => {
     expect(proof.composeProject).toBe(PROJECT.composeProject);
     expect(proof.volumes.map((entry) => entry.name)).toEqual(request.exactNames);
     expect(proof.volumes).toEqual(expect.arrayContaining([
-      expect.objectContaining({
-        logicalName: "runfree-commandhistory",
-        targets: ["/commandhistory"],
-      }),
       expect.objectContaining({
         logicalName: "runfree-deps-0123456789ab-node-modules",
         targets: ["/runfree/git-layout/0123456789ab/worktrees/payments/node_modules"],
@@ -83,8 +78,8 @@ describe("session named-volume inspection proof", () => {
 
   test.each([
     ["anonymous volume", "4c0f88616f4b2e56797bdaf6989b1434"],
-    ["logical rather than physical name", "runfree-commandhistory"],
-    ["different Compose project", "runfree-fedcba987654_runfree-commandhistory"],
+    ["logical rather than physical name", "runfree-deps-0123456789ab-pnpm-store"],
+    ["different Compose project", "runfree-fedcba987654_runfree-deps-0123456789ab-pnpm-store"],
   ])("rejects a %s before constructing Docker argv", (_label, source) => {
     const value = plan();
     const forged = {

@@ -856,7 +856,7 @@ describe("dependency volume ownership without an agent container", () => {
 });
 
 describe("ensureComposeManagedSessionVolumes", () => {
-  test("creates the always-mounted command-history volume even with overlays off", () => {
+  test("creates no session volume with overlays off", () => {
     const created: Array<[string, string]> = [];
     const docker = {
       createComposeManagedVolume: (project: string, logical: string) => {
@@ -871,20 +871,20 @@ describe("ensureComposeManagedSessionVolumes", () => {
     } as unknown as import("./types.ts").RuntimeContext;
 
     expect(ensureComposeManagedSessionVolumes(context, docker)).toBe(0);
-    expect(created).toEqual([[composeProjectName(tmp), "runfree-commandhistory"]]);
+    expect(created).toEqual([]);
   });
 
-  test("also creates every dependency-overlay volume when overlays are active", () => {
+  test("creates only dependency volumes, every overlay's included, under this project, when overlays are active", () => {
     writeJson("package.json", { packageManager: "npm@10.0.0" });
     fs.writeFileSync(path.join(tmp, "package-lock.json"), "{}\n");
     fs.mkdirSync(path.join(tmp, "node_modules"), { recursive: true });
     const plan = createDependencyOverlayPlan(tmp, { mode: "auto" });
     expect(plan.overlays.length).toBeGreaterThan(0);
 
-    const created: string[] = [];
+    const created: Array<[string, string]> = [];
     const docker = {
-      createComposeManagedVolume: (_project: string, logical: string) => {
-        created.push(logical);
+      createComposeManagedVolume: (project: string, logical: string) => {
+        created.push([project, logical]);
         return 0;
       },
     } as unknown as import("./docker.ts").RuntimeDocker;
@@ -896,18 +896,24 @@ describe("ensureComposeManagedSessionVolumes", () => {
     } as unknown as import("./types.ts").RuntimeContext;
 
     expect(ensureComposeManagedSessionVolumes(context, docker)).toBe(0);
-    expect(created).toContain("runfree-commandhistory");
-    for (const overlay of plan.overlays) expect(created).toContain(overlay.volume);
+    const logical = created.map(([, name]) => name);
+    for (const overlay of plan.overlays) expect(logical).toContain(overlay.volume);
+    expect(logical.every((name) => name.startsWith("runfree-deps-")), logical.join(", ")).toBe(true);
+    expect(created.every(([project]) => project === composeProjectName(tmp))).toBe(true);
   });
 
   test("fails closed when a session volume cannot be created", () => {
+    writeJson("package.json", { packageManager: "npm@10.0.0" });
+    fs.writeFileSync(path.join(tmp, "package-lock.json"), "{}\n");
+    fs.mkdirSync(path.join(tmp, "node_modules"), { recursive: true });
     const docker = {
       createComposeManagedVolume: () => 1,
     } as unknown as import("./docker.ts").RuntimeDocker;
     const context = {
       projectRoot: tmp,
       env: {},
-      dependencyOverlayPlan: { mode: "off" },
+      dependencyOverlayPlan: createDependencyOverlayPlan(tmp, { mode: "auto" }),
+      gitLayoutPlan: { containerProjectRoot: "/workspaces/project" },
     } as unknown as import("./types.ts").RuntimeContext;
 
     expect(ensureComposeManagedSessionVolumes(context, docker)).toBe(1);

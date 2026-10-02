@@ -3826,8 +3826,6 @@ describe("runtime command flow", () => {
         "docker network inspect": 3,
         "docker ps": 12,
         "docker run": 1,
-        "docker volume create": 1,
-        "docker volume inspect": 1,
       }
     `);
   });
@@ -3999,8 +3997,14 @@ describe("runtime command flow", () => {
     afterEach(() => {
       for (const key of warmEnvKeys) delete process.env[key];
     });
-    function launchContext(): RuntimeContext {
+    /** `withSessionVolumes`: a pnpm project, so dependency overlays mount session named volumes. */
+    function launchContext(withSessionVolumes = false): RuntimeContext {
       const projectRoot = path.join(tmp, "project");
+      if (withSessionVolumes) {
+        fs.mkdirSync(projectRoot, { recursive: true });
+        fs.writeFileSync(path.join(projectRoot, "package.json"), JSON.stringify({ packageManager: "pnpm@10.28.0" }));
+        fs.writeFileSync(path.join(projectRoot, "pnpm-lock.yaml"), "lockfileVersion: '9.0'\n");
+      }
       const project = prepareProject(projectRoot);
       return {
         projectRoot,
@@ -4059,7 +4063,8 @@ describe("runtime command flow", () => {
       ["a rebooted Docker VM", { FAKE_WARM_BOOT_ID: "99999999-2222-3333-4444-555555555555" }],
       ["a volume replaced under its name", { FAKE_VOLUME_CREATED_AT: "2026-06-13T09:00:00Z" }],
     ])("a warm launch runs the full validation after %s", async (_label, env) => {
-      const context = launchContext();
+      // The volume case needs a session named volume for the proof to bind.
+      const context = launchContext("FAKE_VOLUME_CREATED_AT" in env);
       const io = createRuntimeIO();
       await warmedUp(context, io);
       Object.assign(process.env, env);
@@ -5801,6 +5806,10 @@ describe("runtime command flow", () => {
 
   test("up refuses a mislabelled session named volume before syncing proxy-managed tokens", async () => {
     const projectRoot = path.join(tmp, "project");
+    // A pnpm project, so dependency overlays mount session named volumes.
+    fs.mkdirSync(projectRoot, { recursive: true });
+    fs.writeFileSync(path.join(projectRoot, "package.json"), JSON.stringify({ packageManager: "pnpm@10.28.0" }));
+    fs.writeFileSync(path.join(projectRoot, "pnpm-lock.yaml"), "lockfileVersion: '9.0'\n");
     const project = prepareProject(projectRoot);
     const io = createRuntimeIO({
       admin: async (args) => args[0] === "token" ? 31 : 0,

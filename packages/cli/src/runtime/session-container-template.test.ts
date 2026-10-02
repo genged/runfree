@@ -192,7 +192,7 @@ function createPlanRuntimeInputs(input: {
       id: input.generation.selectedAgentImageId,
       labels: {},
       os: "linux",
-      volumes: ["/commandhistory"],
+      volumes: ["/home/agent/.local/share/pnpm/store"],
       environment: {
         IMAGE_DEFAULT: "preserved",
         HTTPS_PROXY: "http://image.invalid:8080",
@@ -227,11 +227,6 @@ describe("canonical session-container template", () => {
       ["/runfree/inbox", expect.objectContaining({ source: project().paths.inboxDir, readOnly: true })],
       ["/runfree/mcp/claude.json", expect.objectContaining({ readOnly: true })],
       ["/etc/proxy-ca", expect.objectContaining({ source: project().paths.proxyCaCertDir, readOnly: true })],
-      ["/commandhistory", expect.objectContaining({
-        source: `${COMPOSE_PROJECT}_runfree-commandhistory`,
-        type: "volume",
-        noCopy: true,
-      })],
       [`${gitLayout().containerProjectRoot}/node_modules`, expect.objectContaining({
         source: `${COMPOSE_PROJECT}_runfree-deps-0123456789ab-node-modules`,
         type: "volume",
@@ -243,6 +238,8 @@ describe("canonical session-container template", () => {
         noCopy: true,
       })],
     ]));
+    // The retired, never-used command-history volume is no longer mounted.
+    expect(byTarget.has("/commandhistory")).toBe(false);
     expect(template.mounts.map((mount) => mount.target)).toEqual(
       [...template.mounts].map((mount) => mount.target).sort(),
     );
@@ -454,7 +451,7 @@ describe("canonical session-container template", () => {
     });
     expect(plan.imageDeclarationProof).toMatchObject({
       selectedAgentImageId: record.selectedAgentImageId,
-      declaredVolumeTargets: ["/commandhistory"],
+      declaredVolumeTargets: ["/home/agent/.local/share/pnpm/store"],
       mergedEnvironment: expect.objectContaining({
         IMAGE_DEFAULT: "preserved",
         HTTPS_PROXY: template.environment.HTTPS_PROXY,

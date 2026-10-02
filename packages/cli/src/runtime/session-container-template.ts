@@ -245,11 +245,6 @@ function sessionMounts(input: SessionContainerTemplateInput): SessionContainerMo
       return bindMount(source, mount.target, mount.readOnly === true);
     }),
     bindMount(input.project.paths.gitConfigPath, "/home/agent/.gitconfig", true),
-    volumeMount(
-      composeManagedVolumeName(input.composeProjectName, "runfree-commandhistory"),
-      "/commandhistory",
-      { readOnly: false, noCopy: true },
-    ),
     bindMount(input.project.paths.proxyCaCertDir, "/etc/proxy-ca", true),
     ...[
       {

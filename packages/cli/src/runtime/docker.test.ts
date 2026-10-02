@@ -134,7 +134,7 @@ function composeVolumeInspect(
     Options: null,
     Labels: {
       "com.docker.compose.project": "runfree-abc123def456",
-      "com.docker.compose.volume": "runfree-commandhistory",
+      "com.docker.compose.volume": "runfree-deps-abc123def456-pnpm-store",
     },
     ...overrides,
   }]);
@@ -147,7 +147,7 @@ test("createComposeManagedVolume creates a local volume with the exact compose o
     capture(command, args) {
       calls.push({ command, args });
       if (args[0] === "volume" && args[1] === "inspect") {
-        return { status: 0, stdout: composeVolumeInspect("runfree-abc123def456_runfree-commandhistory"), stderr: "" };
+        return { status: 0, stdout: composeVolumeInspect("runfree-abc123def456_runfree-deps-abc123def456-pnpm-store"), stderr: "" };
       }
       return { status: 0, stdout: "", stderr: "" };
     },
@@ -156,7 +156,7 @@ test("createComposeManagedVolume creates a local volume with the exact compose o
     admin: () => Promise.resolve(0),
   };
 
-  const status = createRuntimeDocker(context(), io).createComposeManagedVolume("runfree-abc123def456", "runfree-commandhistory");
+  const status = createRuntimeDocker(context(), io).createComposeManagedVolume("runfree-abc123def456", "runfree-deps-abc123def456-pnpm-store");
 
   expect(status).toBe(0);
   // Exactly the two labels the session named-volume proof checks, on the
@@ -164,11 +164,11 @@ test("createComposeManagedVolume creates a local volume with the exact compose o
   expect(calls[0]?.args).toEqual([
     "volume", "create",
     "--label", "com.docker.compose.project=runfree-abc123def456",
-    "--label", "com.docker.compose.volume=runfree-commandhistory",
-    "runfree-abc123def456_runfree-commandhistory",
+    "--label", "com.docker.compose.volume=runfree-deps-abc123def456-pnpm-store",
+    "runfree-abc123def456_runfree-deps-abc123def456-pnpm-store",
   ]);
   // The created volume is inspected and validated before any caller mounts it.
-  expect(calls[1]?.args).toEqual(["volume", "inspect", "runfree-abc123def456_runfree-commandhistory"]);
+  expect(calls[1]?.args).toEqual(["volume", "inspect", "runfree-abc123def456_runfree-deps-abc123def456-pnpm-store"]);
 });
 
 test("createComposeManagedVolume fails closed when the daemon rejects the volume", () => {
@@ -179,7 +179,7 @@ test("createComposeManagedVolume fails closed when the daemon rejects the volume
     confirm: () => true,
     admin: () => Promise.resolve(0),
   };
-  expect(createRuntimeDocker(context(), io).createComposeManagedVolume("runfree-x", "runfree-commandhistory")).toBe(3);
+  expect(createRuntimeDocker(context(), io).createComposeManagedVolume("runfree-x", "runfree-deps-abc123def456-pnpm-store")).toBe(3);
 });
 
 test("createComposeManagedVolume fails closed when a reused volume is a bind mount", () => {
@@ -191,7 +191,7 @@ test("createComposeManagedVolume fails closed when a reused volume is a bind mou
       if (args[0] === "volume" && args[1] === "inspect") {
         return {
           status: 0,
-          stdout: composeVolumeInspect("runfree-abc123def456_runfree-commandhistory", {
+          stdout: composeVolumeInspect("runfree-abc123def456_runfree-deps-abc123def456-pnpm-store", {
             Mountpoint: "/etc",
             Options: { type: "none", o: "bind", device: "/etc" },
           }),
@@ -205,7 +205,7 @@ test("createComposeManagedVolume fails closed when a reused volume is a bind mou
     admin: () => Promise.resolve(0),
   };
   // Must refuse before the dependency-ownership chown can target the bind path.
-  expect(createRuntimeDocker(context(), io).createComposeManagedVolume("runfree-abc123def456", "runfree-commandhistory")).not.toBe(0);
+  expect(createRuntimeDocker(context(), io).createComposeManagedVolume("runfree-abc123def456", "runfree-deps-abc123def456-pnpm-store")).not.toBe(0);
 });
 
 test("applyComposeTeardownDefaults fills only the missing required compose vars", () => {

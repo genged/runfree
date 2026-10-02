@@ -231,8 +231,9 @@ describe("typed session-container Docker operations", () => {
     expect(command.args.some((argument) => argument.includes(plan.record.sessionPrincipal))).toBe(false);
     expect(command.args).toContain("type=bind,src=/host/runfree/state/payments/proxy-ca/public,dst=/etc/proxy-ca,readonly");
     expect(command.args).toContain(
-      "type=volume,src=runfree-0123456789ab_runfree-commandhistory,dst=/commandhistory,volume-nocopy",
+      "type=volume,src=runfree-0123456789ab_runfree-deps-0123456789ab-pnpm-store,dst=/home/agent/.local/share/pnpm/store,volume-nocopy",
     );
+    expect(command.args.some((argument) => argument.includes("dst=/commandhistory"))).toBe(false);
 
     const serialized = JSON.stringify(command.args);
     expect(serialized).not.toMatch(/docker exec|idle-v1|session-supervisor|finaliz/u);

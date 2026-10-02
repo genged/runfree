@@ -1103,8 +1103,8 @@ function dependencyVolumeValidationIssue(target: string, result: CaptureResult):
  * Ensures every Compose-managed named volume a session mounts exists with the
  * exact ownership labels the session named-volume proof requires.
  *
- * `runfree-commandhistory` is always mounted; dependency-overlay volumes are
- * mounted only when overlays are active. Before the per-session cutover the
+ * These are the dependency-overlay volumes, mounted only when overlays are
+ * active. Before the per-session cutover the
  * shared `agent` Compose service mounted all of these, so `compose up` created
  * them with the Compose ownership labels. That service is gone, and Compose does
  * not create a declared volume no started service mounts — so nothing creates
@@ -1114,7 +1114,7 @@ function dependencyVolumeValidationIssue(target: string, result: CaptureResult):
  */
 /** The logical names of every Compose-managed session volume this context's plan mounts. */
 export function composeManagedSessionVolumeLogicalNames(context: RuntimeContext): string[] {
-  const logicalNames = ["runfree-commandhistory"];
+  const logicalNames: string[] = [];
   const plan = context.dependencyOverlayPlan;
   if (plan && plan.mode !== "off") {
     for (const mount of dependencyOverlayMountsForRoot(plan, projectPhysicalRoot(context))) {

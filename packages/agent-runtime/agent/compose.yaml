@@ -114,7 +114,6 @@ services:
       CA_KEY: /ca/private/proxy-ca.key
 
 volumes:
-  runfree-commandhistory:
   runfree-oauth-state:
 
 networks:
