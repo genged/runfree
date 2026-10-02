@@ -36,9 +36,9 @@ import {
   startStandingSession,
   type StandingSessionHandle,
 } from "./fixture.ts";
+import { cliEntryArgv } from "../../support/prebuilt-entry.ts";
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
-const RUNFREE_BIN = path.join(REPO_ROOT, "bin", "runfree.js");
 const PROVISION_TIMEOUT_MS = 30 * 60_000;
 const TEST_TIMEOUT_MS = 10 * 60_000;
 const CAPTURE_MAX_BYTES = 8 * 1024 * 1024;
@@ -53,10 +53,10 @@ function requiredBackend(): LiveRuntimeBackend {
 
 /** Runs the source CLI with extra env (for probes that need test-only env vars). */
 function runfreeWithEnv(fixture: LiveFixture, args: readonly string[], extraEnv: NodeJS.ProcessEnv): CaptureResult {
-  const result = childProcess.spawnSync(process.execPath, [RUNFREE_BIN, "--workspace", fixture.projectRoot, ...args], {
+  const result = childProcess.spawnSync(process.execPath, [...cliEntryArgv(), "--workspace", fixture.projectRoot, ...args], {
     cwd: REPO_ROOT,
     encoding: "utf8",
-    env: { ...fixture.env, ...extraEnv },
+    env: { ...fixture.env, ...extraEnv, RUNFREE_INVOCATION_CWD: REPO_ROOT, RUNFREE_PROJECT_ROOT: REPO_ROOT },
     maxBuffer: CAPTURE_MAX_BYTES,
     stdio: ["ignore", "pipe", "pipe"],
   });

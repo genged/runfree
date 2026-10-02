@@ -45,10 +45,20 @@ function requiredBackend(): LiveRuntimeBackend {
 
 type Answer = { status: number; stdout: string; stderr: string };
 
+// `pnpm exec` prepends a relative `./node_modules/.bin` to PATH, and the
+// transport treats a relative PATH entry as doubt about which `docker` the CLI
+// path would run, so every call would stay on the CLI and fail the routed
+// assertion. The proof runs with PATH's absolute entries only.
+function absoluteSearchPath(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  return { ...env, PATH: (env.PATH ?? "").split(":").filter((dir) => path.isAbsolute(dir)).join(":") };
+}
+
+const SPAWN_ENV = absoluteSearchPath(process.env);
+
 function viaCli(args: readonly string[], input?: string): Answer {
   const result = childProcess.spawnSync("docker", [...args], {
     encoding: "utf8",
-    env: process.env,
+    env: SPAWN_ENV,
     maxBuffer: MAX_BUFFER,
     timeout: CALL_TIMEOUT_MS,
     ...(input !== undefined ? { input } : {}),
@@ -65,10 +75,21 @@ let networkNames: string[];
 let volumeNames: string[];
 let versions: string;
 
-function assertEquivalent(args: readonly string[], input?: string): Answer {
+// The daemon emits a container's `Mounts` in a different order on each
+// request, so two raw inspects through the CLI itself differ byte for byte.
+// Raw container inspects compare byte length (a reorder keeps it) and the
+// parsed objects with `Mounts` sorted; every other byte is still compared.
+function withSortedMounts(stdout: string): unknown {
+  const parsed = JSON.parse(stdout) as Array<Record<string, unknown>>;
+  return parsed.map((entry) => Array.isArray(entry.Mounts)
+    ? { ...entry, Mounts: [...entry.Mounts].sort((a, b) => String(a.Destination).localeCompare(String(b.Destination))) }
+    : entry);
+}
+
+function assertEquivalent(args: readonly string[], input?: string, options: { unorderedMounts?: boolean } = {}): Answer {
   const cli = viaCli(args, input);
   const outcome = transport("docker", args, {
-    env: process.env,
+    env: SPAWN_ENV,
     maxBuffer: MAX_BUFFER,
     timeout: CALL_TIMEOUT_MS,
     ...(input !== undefined ? { input } : {}),
@@ -77,7 +98,12 @@ function assertEquivalent(args: readonly string[], input?: string): Answer {
   expect(outcome.routed, `${label} was not answered by the transport`).toBe(true);
   if (!outcome.routed) return cli;
   expect(outcome.result.status, `${label}: CLI stderr ${describeOutput(cli.stderr)}`).toBe(cli.status);
-  expect(outcome.result.stdout, `${label} stdout`).toBe(cli.stdout);
+  if (options.unorderedMounts && cli.status === 0) {
+    expect(Buffer.byteLength(outcome.result.stdout), `${label} stdout length`).toBe(Buffer.byteLength(cli.stdout));
+    expect(withSortedMounts(outcome.result.stdout), `${label} stdout`).toEqual(withSortedMounts(cli.stdout));
+  } else {
+    expect(outcome.result.stdout, `${label} stdout`).toBe(cli.stdout);
+  }
   expect(outcome.result.stderr, `${label} stderr`).toBe(cli.stderr);
   return cli;
 }
@@ -93,7 +119,7 @@ beforeAll(() => {
   volumeNames = dockerOrThrow("project volumes", ["volume", "ls", "--filter", `label=com.docker.compose.project=${project}`, "--format", "{{.Name}}"])
     .split("\n").filter(Boolean);
   versions = dockerOrThrow("docker versions", ["version", "--format", "client API {{.Client.APIVersion}}, server API {{.Server.APIVersion}}"]);
-  transport = createDockerApiCapture({ controlEnv: { ...process.env, RUNFREE_DOCKER_TRANSPORT: "api" } });
+  transport = createDockerApiCapture({ controlEnv: { ...SPAWN_ENV, RUNFREE_DOCKER_TRANSPORT: "api" } });
 }, PROVISION_TIMEOUT_MS);
 
 afterAll(() => {
@@ -103,9 +129,9 @@ afterAll(() => {
 describe("docker Engine API transport matches the Docker CLI on real Docker", () => {
   test("container and type-less inspect, raw and templated", () => {
     expect(networkNames.length).toBeGreaterThan(0);
-    assertEquivalent(["container", "inspect", proxyId]);
-    assertEquivalent(["container", "inspect", proxyId, proxyId]);
-    assertEquivalent(["inspect", proxyId]);
+    assertEquivalent(["container", "inspect", proxyId], undefined, { unorderedMounts: true });
+    assertEquivalent(["container", "inspect", proxyId, proxyId], undefined, { unorderedMounts: true });
+    assertEquivalent(["inspect", proxyId], undefined, { unorderedMounts: true });
     assertEquivalent(["container", "inspect", "--format", "{{.Id}}", proxyId]);
     assertEquivalent(["container", "inspect", "--format", "{{.State.Running}}", proxyId]);
     assertEquivalent(["inspect", "--format", "{{.State.Running}}", proxyId]);
@@ -139,7 +165,7 @@ describe("docker Engine API transport matches the Docker CLI on real Docker", ()
 
   test("a missing object stays on the CLI, which prints its own not-found text", () => {
     for (const args of [["container", "inspect", MISSING_ID], ["inspect", MISSING_ID], ["exec", MISSING_ID, "true"]]) {
-      const outcome = transport("docker", args, { env: process.env, timeout: CALL_TIMEOUT_MS });
+      const outcome = transport("docker", args, { env: SPAWN_ENV, timeout: CALL_TIMEOUT_MS });
       expect(outcome.routed, `docker ${args.join(" ")}`).toBe(false);
     }
   }, TEST_TIMEOUT_MS);
@@ -148,7 +174,7 @@ describe("docker Engine API transport matches the Docker CLI on real Docker", ()
     const warmUp = (extra: NodeJS.ProcessEnv) => childProcess.spawnSync(process.execPath, [...cliEntryArgv(), "--workspace", fixture.projectRoot, "up"], {
       cwd: REPO_ROOT,
       encoding: "utf8",
-      env: { ...fixture.env, RUNFREE_INVOCATION_CWD: REPO_ROOT, RUNFREE_PROJECT_ROOT: REPO_ROOT, RUNFREE_TIMINGS: "1", ...extra },
+      env: { ...absoluteSearchPath(fixture.env), RUNFREE_INVOCATION_CWD: REPO_ROOT, RUNFREE_PROJECT_ROOT: REPO_ROOT, RUNFREE_TIMINGS: "1", ...extra },
       maxBuffer: MAX_BUFFER,
       timeout: TEST_TIMEOUT_MS,
     });
@@ -167,7 +193,7 @@ describe("docker Engine API transport matches the Docker CLI on real Docker", ()
     const unset = childProcess.spawnSync(process.execPath, [...cliEntryArgv(), "--workspace", fixture.projectRoot, "up"], {
       cwd: REPO_ROOT,
       encoding: "utf8",
-      env: { ...defaultEnv, RUNFREE_INVOCATION_CWD: REPO_ROOT, RUNFREE_PROJECT_ROOT: REPO_ROOT, RUNFREE_TIMINGS: "1" },
+      env: { ...absoluteSearchPath(defaultEnv), RUNFREE_INVOCATION_CWD: REPO_ROOT, RUNFREE_PROJECT_ROOT: REPO_ROOT, RUNFREE_TIMINGS: "1" },
       maxBuffer: MAX_BUFFER,
       timeout: TEST_TIMEOUT_MS,
     });
@@ -177,6 +203,6 @@ describe("docker Engine API transport matches the Docker CLI on real Docker", ()
 
   test("the kill switch keeps every call on the CLI", () => {
     const off = createDockerApiCapture({ controlEnv: { ...process.env, RUNFREE_DOCKER_TRANSPORT: "cli" } });
-    expect(off("docker", ["container", "inspect", proxyId], { env: process.env })).toEqual({ routed: false });
+    expect(off("docker", ["container", "inspect", proxyId], { env: SPAWN_ENV })).toEqual({ routed: false });
   }, TEST_TIMEOUT_MS);
 });

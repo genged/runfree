@@ -161,11 +161,16 @@ async function sendTerminalInterrupt(containerId: string): Promise<void> {
   const argv = process.platform === "darwin"
     ? ["-q", "/dev/null", "docker", "attach", containerId]
     : ["-q", "-f", "-c", `docker attach ${containerId}`, "/dev/null"];
-  const child = childProcess.spawn("script", argv, { stdio: ["pipe", "ignore", "ignore"] });
-  await new Promise((resolve) => setTimeout(resolve, 1_500));
-  child.stdin?.write("\u0003");
-  await new Promise((resolve) => setTimeout(resolve, 1_500));
-  child.kill("SIGKILL");
+  // A byte typed before `docker attach` has connected and put its terminal in
+  // raw mode is the attach client's own Ctrl-C and never reaches the session,
+  // so a slow daemon gets fresh attaches until the agent stops, within a bound.
+  for (let attempt = 1; attempt <= 4 && containerExitState(containerId).running; attempt += 1) {
+    const child = childProcess.spawn("script", argv, { stdio: ["pipe", "ignore", "ignore"] });
+    await new Promise((resolve) => setTimeout(resolve, 1_500 * attempt));
+    child.stdin?.write("\u0003");
+    await new Promise((resolve) => setTimeout(resolve, 1_500));
+    child.kill("SIGKILL");
+  }
 }
 
 describe("agent session containers run under Docker's init", () => {
@@ -194,7 +199,8 @@ describe("agent session containers run under Docker's init", () => {
     try {
       // With every probe delayed, a report taken at the grant would find the
       // entry still polling; the handoff-gated report finds the agent.
-      expect(handoffOf(containerId), "the entry had not handed off when the launch reported attached")
+      const warnings = run.output().split("\n").filter((line) => line.includes("warning")).join("\n");
+      expect(handoffOf(containerId), `the entry had not handed off when the launch reported attached; launch warnings: ${describeOutput(warnings, 3000)}`)
         .toBe("handed-off");
       // The same fact read independently of the product's parser: the init's
       // child is no longer the entry.
@@ -239,14 +245,20 @@ describe("agent session containers run under Docker's init", () => {
     await launchEnded(run);
   }, TEST_TIMEOUT_MS);
 
-  test("Ctrl-C typed at the session's terminal stops the agent", async () => {
+  // macOS's BSD `script` refuses a non-terminal stdin ("tcgetattr/ioctl:
+  // Operation not supported on socket"), and Node's pipes are sockets there, so
+  // no byte is ever typed. Typing one on macOS needs a pseudo-terminal
+  // dependency, which is still undecided; the daemon-delivered SIGINT case
+  // above proves the init's forwarding on every host.
+  test.skipIf(process.platform === "darwin")("Ctrl-C typed at the session's terminal stops the agent", async () => {
     const run = await startAttachedLaunch(fixture);
     const containerId = attachedContainerId(run);
     await awaitAgentStarted(containerId, "terminal Ctrl-C");
 
+    const tty = dockerOrThrow("inspect the session TTY", ["inspect", "-f", "{{.Config.Tty}} {{.Config.OpenStdin}}", containerId]).trim();
     await sendTerminalInterrupt(containerId);
 
-    await pollUntil(() => !containerExitState(containerId).running, 10_000, "the agent to stop on a typed Ctrl-C");
+    await pollUntil(() => !containerExitState(containerId).running, 10_000, `the agent to stop on a typed Ctrl-C (Tty OpenStdin: ${tty})`);
     expect(containerExitState(containerId).exitCode).toBe(SIGINT_EXIT);
     await launchEnded(run);
   }, TEST_TIMEOUT_MS);
@@ -267,8 +279,16 @@ describe("agent session containers run under Docker's init", () => {
     } finally {
       held.release();
     }
+    // The hold parks the host inside the running proof's own inspect, so the
+    // resumed launch finds that proof older than its bound and refuses it; it
+    // can never report the entry's exit as its outcome. What it must do is fail
+    // closed: never attached, and nothing left behind.
     const ended = await held.completion;
-    expect(parseLaunchReport(ended).outcome?.status ?? null, "the entry's exit is the launch outcome").toBe(ENTRY_TIMEOUT_EXIT);
+    const report = parseLaunchReport(ended);
+    expect(report.attached, `the never-served launch reported attached: ${describeOutput(ended.output, 3000)}`).toBeNull();
+    expect(report.failure, describeOutput(ended.output, 3000)).toBeDefined();
+    expect(report.after.records).toEqual([]);
+    expect(report.after.residualContainers).toBe(0);
   }, TEST_TIMEOUT_MS);
 
   test("a lifecycle command started inside the handoff window runs only after the handoff", async () => {
@@ -280,10 +300,13 @@ describe("agent session containers run under Docker's init", () => {
     const upStarted = Date.now();
     const up = startRunfree(fixture, ["up"]);
     // Sample the handoff from the test's side while `up` waits for the lock.
+    // Bounded: an entry that never hands off fails the assertion below rather
+    // than spinning until the test timeout.
     let handedOffAt: number | undefined;
     let containerId: string | undefined;
+    const samplerDeadline = upStarted + 120_000;
     const sampler = (async () => {
-      while (handedOffAt === undefined) {
+      while (handedOffAt === undefined && Date.now() < samplerDeadline) {
         const ids = dockerOrThrow("list session containers", [
           "ps", "-q", "--no-trunc", "--filter", "label=io.runfree.session-id",
           "--filter", `label=io.runfree.compose-project=${project}`,

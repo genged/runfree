@@ -63,19 +63,14 @@ function directSessionIds(projectId: string): readonly string[] {
 }
 
 // A container visible in `docker ps` is only the start of admission: the
-// launch still registers with the proxy (a durable admission transaction is
-// pending during that convergence), proves the running shape, and activates
-// the lifecycle record to `attached`. A concurrent runfree invocation that
-// reads component evidence during the transaction window refuses fail-closed,
+// launch still proves the running shape, publishes the session file, and
+// activates the lifecycle record to `attached`. A concurrent runfree
+// invocation during that window waits for or refuses on the lifecycle lock,
 // so "attached" here must mean the admitted record, not the running container.
 function sessionRecordAttached(fixture: LiveFixture, projectId: string, containerId: string): boolean {
   const stateDir = path.join(
     fixture.env.XDG_STATE_HOME as string, "runfree", "projects", projectId,
   );
-  const transactionPath = path.join(
-    stateDir, "runtime", "v2", "session-admission-transactions", `${projectId}.json`,
-  );
-  if (fs.existsSync(transactionPath)) return false;
   const registryDir = path.join(stateDir, "runtime", "v2", "session-containers");
   let entries: string[];
   try {
@@ -310,7 +305,10 @@ describe("per-session rolling runtime upgrades", () => {
     sessions.splice(sessions.indexOf(first), 1);
     const afterFirst = fixture.runfree(["up"]);
     expect(afterFirst.status, describeOutput(afterFirst.output, 4000)).toBe(0);
-    expect(fs.existsSync(materializationPath(stateDir, initialDesired.sessionAgentMaterializationDigest))).toBe(false);
+    expect(
+      fs.existsSync(materializationPath(stateDir, initialDesired.sessionAgentMaterializationDigest)),
+      `up kept the first session's materialization after it ended: ${describeOutput(afterFirst.output, 4000)}`,
+    ).toBe(false);
     expect(docker(["image", "inspect", templateDesired.selectedAgentImageId]).status).toBe(0);
 
     await endSession(second);

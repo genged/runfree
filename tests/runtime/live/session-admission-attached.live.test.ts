@@ -36,7 +36,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, test } from "vitest";
 import { projectInfo } from "../../../packages/cli/src/config.ts";
 import { nodeRuntimeIO } from "../../../packages/cli/src/runtime.ts";
 import { readPendingApprovals, touchWatcherHeartbeat } from "../../../packages/cli/src/runtime/approvals.ts";
-import { CONTAINER_ROLE_LABEL } from "../../../packages/cli/src/runtime/container-inventory.ts";
+import { CONTAINER_ROLE_LABEL, INGRESS_PURPOSE_LABEL } from "../../../packages/cli/src/runtime/container-inventory.ts";
 import { PROJECT_ID_LABEL } from "../../../packages/cli/src/runtime/constants.ts";
 import { tryAcquireProjectLifecycleLock } from "../../../packages/cli/src/runtime/sessions.ts";
 import type { PendingApprovalRecord } from "../../../packages/runtime-contracts/src/write-approvals.ts";
@@ -607,6 +607,9 @@ describe("attached per-session authority is exact and drift after the proof fail
         "ps", "--no-trunc",
         "--filter", `label=${PROJECT_ID_LABEL}=${project.replace(/^runfree-/u, "")}`,
         "--filter", `label=${CONTAINER_ROLE_LABEL}=ingress-forwarder`,
+        // `runfree forward`'s own purpose: an MCP-eligible project would also
+        // give each session its own `mcp-callback` forwarder on this network.
+        "--filter", `label=${INGRESS_PURPOSE_LABEL}=port`,
         "--format", "{{.ID}}",
       ]).split("\n").map((line) => line.trim()).filter(Boolean);
       expect(forwarderIds, "runfree forward opened no ingress forwarder container").toHaveLength(1);

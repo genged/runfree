@@ -100,10 +100,10 @@ export const HELD_WRITE_TIMEOUT_MS = 60_000;
  *
  * The generation path waits for both consumer acknowledgements before the host
  * call returns, so a completed teardown there has already converged. The file
- * source publishes no acknowledgement: the firewall's own 100 ms
- * level-triggered loop is what adds and drops addresses, so a read taken the
- * instant a sealed write or delete returned can legitimately be one loop
- * behind. The bound is the claim — convergence is prompt, not eventual — and it
+ * source publishes no acknowledgement: the firewall's own reconcile — run on
+ * the write's inotify event, with its 100 ms interval as the backstop — is
+ * what adds and drops addresses, so a read taken the instant a sealed write
+ * or delete returned can legitimately be one reconcile behind. The bound is the claim — convergence is prompt, not eventual — and it
  * is deliberately far below any lease, so a set that stayed wrong because a
  * heartbeat lapsed still fails.
  */

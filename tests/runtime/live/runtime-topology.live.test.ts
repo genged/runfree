@@ -392,15 +392,27 @@ describe("runtime topology and capability floor on real Docker", () => {
       "internal network inhibits the Docker bridge IPv4 gateway",
     ).toBe("true");
 
-    // Membership is a census of the daemon's own view: exactly the proxy and the
-    // one standing session, by container name.
+    // Membership is a census of the daemon's own view: exactly the proxy, the
+    // one standing session, and the session's own MCP OAuth callback forwarder
+    // (the fixture's policy names an MCP server), by container name. The
+    // forwarder counts only when its minted binding names this session.
+    const sessionLabel = inspectField(sessionId, '{{index .Config.Labels "io.runfree.session-id"}}');
+    const boundForwarders = dockerOrThrow("session callback forwarders", [
+      "ps", "-q", "--no-trunc",
+      "--filter", "label=io.runfree.container-role=ingress-forwarder",
+      "--filter", "label=io.runfree.ingress-purpose=mcp-callback",
+    ]).split("\n").filter(Boolean)
+      .filter((id) => inspectField(id, "{{range .Config.Env}}{{println .}}{{end}}").split("\n")
+        .includes(`RUNFREE_CALLBACK_SESSION_ID=${sessionLabel}`))
+      .map((id) => inspectField(id, "{{.Name}}").replace(/^\//u, ""));
     const members = Object.values(internal.Containers as Record<string, { Name: string }>)
       .map((entry) => entry.Name).sort();
     const expectedMembers = [
       inspectField(proxyId, "{{.Name}}").replace(/^\//u, ""),
       inspectField(sessionId, "{{.Name}}").replace(/^\//u, ""),
+      ...boundForwarders,
     ].sort();
-    expect(members, "internal network members are exactly the proxy and the session").toEqual(expectedMembers);
+    expect(members, "internal network members are exactly the proxy, the session, and its bound callback forwarder").toEqual(expectedMembers);
   }, TEST_TIMEOUT_MS);
 
   test("neither the proxy nor the session publishes a host port", () => {

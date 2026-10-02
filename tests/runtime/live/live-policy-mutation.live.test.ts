@@ -4,7 +4,7 @@
 // live-session refusal and rely on the capture → approved-base → atomic-write →
 // re-read → content-addressed-approve chain instead of pausing anything. This
 // tranche proves that against the real backend: `host add` with one live
-// session and `host remove` with three change effective authority — firewall
+// session and `host remove` with two change effective authority — firewall
 // and request proxy converge to a new effective generation and live egress
 // flips — with zero container restarts and no pause state ever set (exact
 // container ids, start times, and run state before and after).

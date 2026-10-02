@@ -1,6 +1,6 @@
 SHELL := /bin/bash
 
-.PHONY: help test test-all test-release test-static test-unit test-agent test-proxy test-security test-templates test-cli-e2e test-cli-e2e-live test-runtime test-runtime-core test-runtime-extended test-runtime-smoke test-runtime-live test-runtime-live-topology test-runtime-live-managed-launch test-runtime-live-egress test-runtime-live-connect-guard test-runtime-live-request-shape test-runtime-live-audit test-runtime-live-allowlist test-runtime-live-policy-mutation test-runtime-live-mcp-enable test-runtime-live-helper-reclaim test-runtime-live-docker-transport test-live-session-admission-docker-desktop test-live-session-admission-orbstack test-live-session-admission-negative-docker-desktop test-live-session-admission-negative-orbstack test-live-session-admission-attached-docker-desktop test-live-session-admission-attached-orbstack test-live-session-renewal-docker-desktop test-live-session-renewal-orbstack test-live-session-independence-docker-desktop test-live-session-independence-orbstack test-live-session-admission-crash-docker-desktop test-live-session-admission-crash-orbstack test-live-session-admission-drift-docker-desktop test-live-session-admission-drift-orbstack reclaim-runtime-sandbox reclaim-runtime-sandbox-apply test-watch
+.PHONY: help test test-all test-release test-static test-unit test-agent test-proxy test-security test-templates test-cli-e2e test-cli-e2e-live test-runtime test-runtime-core test-runtime-extended test-runtime-smoke test-runtime-live test-runtime-live-topology test-runtime-live-managed-launch test-runtime-live-egress test-runtime-live-connect-guard test-runtime-live-request-shape test-runtime-live-audit test-runtime-live-allowlist test-runtime-live-policy-mutation test-runtime-live-mcp-enable test-runtime-live-helper-reclaim test-runtime-live-docker-transport test-live-session-admission-docker-desktop test-live-session-admission-orbstack test-live-session-admission-negative-docker-desktop test-live-session-admission-negative-orbstack test-live-session-admission-attached-docker-desktop test-live-session-admission-attached-orbstack test-live-session-renewal-docker-desktop test-live-session-renewal-orbstack test-live-session-independence-docker-desktop test-live-session-independence-orbstack test-live-session-admission-crash-docker-desktop test-live-session-admission-crash-orbstack test-live-session-admission-drift-docker-desktop test-live-session-admission-drift-orbstack test-live-session-entry-gate-docker-desktop test-live-session-entry-gate-orbstack reclaim-runtime-sandbox reclaim-runtime-sandbox-apply test-watch
 
 help:
 	@printf '%s\n' \
@@ -183,10 +183,10 @@ test-runtime-live-docker-transport:
 # Standalone live tranches, provisioning their own minimal fixture instead of
 # running behind the cumulative sandbox.
 #
-# These two targets run every `*.live.test.ts` under tests/runtime: the negative
-# tranche, the crash tranche, and the drift tranche. Each describe block
-# provisions and destroys its own runtime, so this is several full builds. Use
-# the per-tranche targets below while iterating on one of them.
+# These two targets run every `*.live.test.ts` under tests/runtime, the same
+# files as `test-runtime`. Each describe block provisions and destroys its own
+# runtime, so this is several full builds. Use the per-tranche targets below
+# while iterating on one of them.
 test-live-session-admission-docker-desktop:
 	TEST_RUNTIME_BACKEND=docker-desktop pnpm exec vitest run --project runtime-live
 

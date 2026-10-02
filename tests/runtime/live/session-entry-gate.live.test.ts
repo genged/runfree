@@ -5,11 +5,11 @@
 // replace it. What a replaced entry loses is only that ordering, never
 // authority. This file proves the second half of that sentence against the
 // running proxy: a project image whose entry sends an ordinary CONNECT the
-// moment the container starts is answered exactly the guard's provisioning
-// refusal — a raw 403 naming the provisioning peer — while the session is
-// registered and proven but not yet active. Nothing else about admission
-// changes: the running proof still holds the replaced entry to the same
-// `Path`, and revocation still reclaims the session.
+// moment the container starts gets no answer at all while the session is
+// proven running but has no session file (its packets are dropped), and is
+// served once the file is written. Nothing else about admission changes: the
+// running proof still holds the replaced entry to the same `Path`, and the
+// launch still leaves no record or container behind.
 //
 // The lifecycle is parked between its running proof and activation with the
 // crash runner's `--hold-at`, which drives the internal probe and never
@@ -52,6 +52,7 @@ import {
   type LiveRuntimeBackend,
 } from "./fixture.ts";
 import { sessionAdmissionCrashEntryArgv } from "../../support/prebuilt-entry.ts";
+import { SESSION_CONTAINER_LABELS } from "../../../packages/cli/src/runtime/session-containers.ts";
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
 const PROVISION_TIMEOUT_MS = 30 * 60_000;
@@ -305,9 +306,9 @@ describe("a project image that replaces the session entry loses only the start o
       "--all",
       "--quiet",
       "--filter",
-      `label=com.docker.compose.project=${project}`,
+      `label=${SESSION_CONTAINER_LABELS.composeProject}=${project}`,
       "--filter",
-      "label=io.runfree.container-role=session-agent",
+      `label=${SESSION_CONTAINER_LABELS.role}=session-agent`,
     ]);
     expect(residual.stdout.trim(), "the served session left a session container").toBe("");
   }, TEST_TIMEOUT_MS);

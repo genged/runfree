@@ -12,8 +12,8 @@
 //   - an in-place `docker restart` of the proxy is a warm-proof mismatch, and
 //     the launch still succeeds on the full path;
 //   - a firewall changed inside the running proxy (same container, same
-//     start time) is a warm-proof mismatch, and removing the change reclaims
-//     the warm path;
+//     start time) is a warm-proof mismatch, full validation refuses it and
+//     contains the proxy, and the next launch reclaims the warm path;
 //   - a normal numeric exit takes the short teardown (spec open decision 3:
 //     the exited container's inspection proves it stopped before removal),
 //     and the session container is gone afterwards.
@@ -42,6 +42,7 @@ import {
   MANAGED_HOLD_RELATIVE_PATH,
   provisionSandboxFixture,
 } from "./fixture.ts";
+import { cliEntryArgv } from "../../support/prebuilt-entry.ts";
 import { liveTierSelected } from "./tiers.ts";
 
 // The fast paths are part of the trust boundary's proof (a warm launch must
@@ -51,10 +52,15 @@ const coreTest = liveTierSelected("core") ? test : test.skip;
 const extendedTest = liveTierSelected("extended") ? test : test.skip;
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
-const RUNFREE_BIN = path.join(REPO_ROOT, "bin", "runfree.js");
 const PROVISION_TIMEOUT_MS = 30 * 60_000;
 const TEST_TIMEOUT_MS = 15 * 60_000;
 const CAPTURE_MAX_BYTES = 8 * 1024 * 1024;
+/**
+ * One launch of the one-shot stand-in or one `up` on a provisioned runtime.
+ * `spawnSync` blocks the worker, so the case timeout cannot fire; a hung
+ * launch fails here with its partial output instead.
+ */
+const LAUNCH_TIMEOUT_MS = 5 * 60_000;
 
 function requiredBackend(): LiveRuntimeBackend {
   const backend = process.env.TEST_RUNTIME_BACKEND;
@@ -65,16 +71,19 @@ function requiredBackend(): LiveRuntimeBackend {
 }
 
 function runfreeTimed(fixture: LiveFixture, args: readonly string[]): CaptureResult {
-  const result = childProcess.spawnSync(process.execPath, [RUNFREE_BIN, "--workspace", fixture.projectRoot, ...args], {
+  const result = childProcess.spawnSync(process.execPath, [...cliEntryArgv(), "--workspace", fixture.projectRoot, ...args], {
     cwd: REPO_ROOT,
     encoding: "utf8",
-    env: { ...fixture.env, RUNFREE_TIMINGS: "1" },
+    env: { ...fixture.env, RUNFREE_TIMINGS: "1", RUNFREE_INVOCATION_CWD: REPO_ROOT, RUNFREE_PROJECT_ROOT: REPO_ROOT },
     maxBuffer: CAPTURE_MAX_BYTES,
     stdio: ["ignore", "pipe", "pipe"],
+    timeout: LAUNCH_TIMEOUT_MS,
   });
-  if (result.error) throw result.error;
   const stdout = typeof result.stdout === "string" ? result.stdout : "";
   const stderr = typeof result.stderr === "string" ? result.stderr : "";
+  if (result.error) {
+    throw new Error(`runfree ${args.join(" ")} did not finish: ${result.error.message}: ${describeOutput(`${stdout}${stderr}`)}`);
+  }
   return Object.freeze({ status: result.status ?? 1, stdout, stderr, output: `${stdout}${stderr}` });
 }
 
@@ -98,7 +107,9 @@ function milliseconds(output: string, phase: string): number | undefined {
 
 function launchClaude(fixture: LiveFixture): CaptureResult {
   const launched = runfreeTimed(fixture, ["claude"]);
-  expect(launched.status, describeOutput(launched.output)).toBe(0);
+  // Timing lines fill the tail describeOutput keeps; a failure needs the errors.
+  const withoutTimings = launched.output.split("\n").filter((line) => !line.includes(" timing: ")).join("\n");
+  expect(launched.status, describeOutput(withoutTimings, 4000)).toBe(0);
   return launched;
 }
 
@@ -174,23 +185,26 @@ describe("launch latency: sub-second launch plan Phase B", () => {
     expect(timing(warm.output, "validation:warm-proof"), describeOutput(warm.output)).toContain("match");
   }, TEST_TIMEOUT_MS);
 
-  coreTest("a firewall changed inside the running proxy is never a warm launch, and undoing it reclaims the warm path", () => {
+  coreTest("a firewall changed inside the running proxy is never a warm launch, and containment reclaims the warm path", () => {
     const project = composeProjectName(fixture);
     const proxyId = composeServiceContainerId(project, "proxy");
-    const nft = (verb: "add" | "delete") =>
-      ["exec", "--privileged", "--user", "0:0", proxyId, "nft", verb, "chain", "inet", "runfree_proxy", "runfree_warm_drift"];
     // Same proxy container and start time: only the in-proxy ruleset moved.
-    dockerOrThrow("add a chain to the proxy's table", nft("add"));
-    try {
-      const drifted = runfreeTimed(fixture, ["claude"]);
-      const verdicts = timing(drifted.output, "validation:warm-proof");
-      expect(verdicts, describeOutput(drifted.output)).not.toContain("match");
-      expect(verdicts.some((verdict) => verdict.startsWith("mismatch:")), describeOutput(drifted.output)).toBe(true);
-    } finally {
-      dockerOrThrow("remove the added chain", nft("delete"));
-    }
-    // Reclaim: the next launch validates fully, and the one after is warm.
+    dockerOrThrow("add a chain to the proxy's table",
+      ["exec", "--privileged", "--user", "0:0", proxyId, "nft", "add", "chain", "inet", "runfree_proxy", "runfree_warm_drift"]);
+    const drifted = runfreeTimed(fixture, ["claude"]);
+    const verdicts = timing(drifted.output, "validation:warm-proof");
+    expect(verdicts, describeOutput(drifted.output)).not.toContain("match");
+    expect(verdicts.some((verdict) => verdict.startsWith("mismatch:")), describeOutput(drifted.output)).toBe(true);
+    // Full validation refuses the drifted ruleset and contains the proxy; the
+    // drifted chain goes with the stopped proxy's network namespace.
+    expect(drifted.status, describeOutput(drifted.output)).not.toBe(0);
+    expect(dockerOrThrow("contained proxy state", ["inspect", "-f", "{{.State.Running}}", proxyId])).toBe("false");
+    // Reclaim: the next launch recovers the stopped proxy through the
+    // compatible rebind, which records no warm proof; the launch after it
+    // validates fully and records one; the one after that is warm.
     launchClaude(fixture);
+    const recorded = launchClaude(fixture);
+    expect(timing(recorded.output, "validation:warm-proof"), describeOutput(recorded.output)).toContain("recorded");
     const warm = launchClaude(fixture);
     expect(timing(warm.output, "validation:warm-proof"), describeOutput(warm.output)).toContain("match");
   }, TEST_TIMEOUT_MS);

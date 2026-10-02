@@ -29,6 +29,7 @@ import path from "node:path";
 import { pathToFileURL } from "node:url";
 
 import { createCommandContext } from "../../packages/cli/src/commands/context.ts";
+import { flushWarnings } from "../../packages/cli/src/warnings.ts";
 import { createRuntimeSecurityContract } from "../../packages/cli/src/runtime/security-contract.ts";
 import { readEffectiveControlPlaneV2 } from "../../packages/cli/src/runtime/component-state-v2.ts";
 import { removeSessionHostStatus } from "../../packages/cli/src/runtime/session-host-status.ts";
@@ -1189,6 +1190,9 @@ async function launchAndReport(options: CrashOptions): Promise<CrashLaunchReport
 
       fs.mkdirSync(directory, { recursive: true });
       observer = setInterval(() => {
+        // The product buffers warnings until its CLI flushes them at exit;
+        // this harness is the CLI here, so it flushes while the launch runs.
+        flushWarnings();
         if (attached) return;
         let records: HeldSessionState["records"];
         try {
@@ -1213,6 +1217,7 @@ async function launchAndReport(options: CrashOptions): Promise<CrashLaunchReport
       failure = renderFailure(error);
     } finally {
       if (observer) clearInterval(observer);
+      flushWarnings();
     }
     return Object.freeze({
       v: 1 as const,
@@ -1562,9 +1567,11 @@ function isMainModule(): boolean {
 if (isMainModule()) {
   main().then(
     (code) => {
+      flushWarnings();
       process.exitCode = code;
     },
     (error: unknown) => {
+      flushWarnings();
       process.stderr.write(`${renderFailure(error)}\n`);
       process.exitCode = 1;
     },

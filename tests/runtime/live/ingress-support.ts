@@ -21,7 +21,8 @@ import path from "node:path";
 
 import { CONTAINER_ROLE_LABEL, INGRESS_PURPOSE_LABEL } from "../../../packages/cli/src/runtime/container-inventory.ts";
 import { AGENT_UID_GID, PROJECT_ID_LABEL } from "../../../packages/cli/src/runtime/constants.ts";
-import { SESSION_CONTAINER_LABELS } from "../../../packages/cli/src/runtime/session-containers.ts";
+import { peekSessionContainerRecordsV2, SESSION_CONTAINER_LABELS } from "../../../packages/cli/src/runtime/session-containers.ts";
+import { runfreeStateRoot } from "../../../packages/cli/src/paths.ts";
 import { cliEntryArgv } from "../../support/prebuilt-entry.ts";
 import { stageLongLivedAgentBinary } from "./agent-stub.ts";
 import { ATTACHED_WAIT_TIMEOUT_MS, REPO_ROOT, SESSION_TEARDOWN_TIMEOUT_MS, awaitAgentStarted } from "./attached-support.ts";
@@ -291,7 +292,8 @@ export type CliLaunch = Readonly<{
 }>;
 
 /**
- * Starts a public CLI launch and waits for its session's agent to be running.
+ * Starts a public CLI launch and waits for its session's agent to be running
+ * and its lifecycle record to be attached.
  *
  * The new session is the one session-agent container that was not running
  * before the spawn, so launches must be started one at a time. Stdin is a
@@ -356,6 +358,25 @@ export async function startCliSession(
   const inspect = inspectContainer(containerId);
   const sessionId = inspect?.Config?.Labels?.[SESSION_CONTAINER_LABELS.sessionId];
   if (!sessionId) throw new Error(`${options.label}: the session container carries no session id label`);
+  // The agent runs before its record says so: the launch reports `attached`
+  // only once its own handoff poll sees the entry exec the agent. Consumers
+  // that resolve "the" session (`runfree forward`, `vnc`) accept only an
+  // attached record, so the launch is not usable until then.
+  const projectId = project.replace(/^runfree-/u, "");
+  const stateDir = path.join(runfreeStateRoot(fixture.env), "projects", projectId);
+  for (;;) {
+    const record = peekSessionContainerRecordsV2(stateDir, { projectId, composeProject: project }).records
+      .find((candidate) => candidate.sessionId === sessionId);
+    if (record?.state === "attached") break;
+    if (exited) {
+      throw new Error(`${options.label}: runfree ${args.join(" ")} exited before its session was attached: ${describeOutput(exited.output, 4000)}`);
+    }
+    if (Date.now() >= deadline) {
+      child.kill("SIGKILL");
+      throw new Error(`${options.label}: session ${sessionId} never reached attached (record state ${record?.state ?? "absent"}): ${describeOutput(output, 4000)}`);
+    }
+    await sleep(100);
+  }
   const ip = containerAddressOnNetwork(containerId, internalNetworkId(project));
   const session: LaunchedSession = Object.freeze({ containerId, sessionId, ip });
 

@@ -57,6 +57,14 @@ export type ProvisionLiveFixtureOptions = Readonly<{
   configure?: (fixture: LiveFixture) => void;
   /** Retains the host project and XDG roots when provisioning itself fails. */
   keepHostStateOnFailure?: boolean;
+  /**
+   * Runs the CLI with an empty HOME (and no CODEX_HOME), so the maintainer's
+   * user-scope MCP servers in `~/.claude.json` and `~/.codex/config.toml`
+   * never join the project's runtime MCP policy. Those need no project
+   * approval, so any HTTP one makes every session MCP OAuth eligible. Docker
+   * keeps the maintainer's client config through DOCKER_CONFIG.
+   */
+  isolateHostHome?: boolean;
 }>;
 
 function capture(command: string, args: readonly string[], options: childProcess.SpawnSyncOptions): CaptureResult {
@@ -137,7 +145,7 @@ function assertNoLeakedSandboxRuntimes(): void {
   }
   if (leaked.length > 0) {
     throw new Error(
-      `${leaked.length} container(s) from earlier live runs are still running; they hold Docker networks and the MCP callback port. Reclaim them with: make reclaim-runtime-sandbox-apply`,
+      `${leaked.length} container(s) from earlier live runs are still running; they and their ingress forwarders hold Docker networks and loopback callback ports. Reclaim them with: make reclaim-runtime-sandbox-apply`,
     );
   }
 }
@@ -259,8 +267,14 @@ export function provisionLiveFixture(options: ProvisionLiveFixtureOptions): Live
   const runToken = liveRunToken();
   const projectRoot = canonicalTempDir(`${SANDBOX_PROJECT_PREFIX}${runToken}.`);
   const ownerRoot = canonicalTempDir(`${SANDBOX_OWNER_PREFIX}${runToken}.`);
+  const hostHome = options.isolateHostHome ? path.join(ownerRoot, "home") : undefined;
+  if (hostHome) fs.mkdirSync(hostHome, { mode: 0o700 });
+  const { CODEX_HOME: _inheritedCodexHome, ...inherited } = process.env;
   const env = Object.freeze({
-    ...process.env,
+    ...(hostHome ? inherited : process.env),
+    ...(hostHome
+      ? { HOME: hostHome, DOCKER_CONFIG: process.env.DOCKER_CONFIG ?? path.join(os.homedir(), ".docker") }
+      : {}),
     // All three host roots the CLI derives from XDG. The config root holds the
     // host-owned credential source registry and per-project token configs;
     // without isolating it, a tranche's `credential source add` lands in the
@@ -781,7 +795,9 @@ export function sessionAgentContainerIds(
 ): readonly string[] {
   const result = run([
     "ps", "--no-trunc",
-    "--filter", `label=com.docker.compose.project=${project}`,
+    // Session agents are direct containers, not Compose services: they carry
+    // Runfree's own compose-project label, never Compose's.
+    "--filter", `label=${SESSION_CONTAINER_LABELS.composeProject}=${project}`,
     "--filter", `label=${SESSION_CONTAINER_LABELS.role}=session-agent`,
     "--format", "{{.ID}}",
   ]);

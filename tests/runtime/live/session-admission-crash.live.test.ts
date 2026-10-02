@@ -101,10 +101,12 @@ const AUTHORITY_BEARING_STATES = ["active", "attached"];
 /**
  * The longest authority a crashed-away session can still hold.
  *
- * Mirrors `INTERNAL_PROBE_LEASE_DURATION_MS` in `session-admission-driver.ts`,
- * which is not exported. Duplicated rather than relaxed on purpose: if that
- * lease grows, this assertion should fail and be considered again rather than
- * quietly permit a longer window of unsupervised authority.
+ * Mirrors `DEFAULT_INTERNAL_PROBE_LEASE_DURATION_MS` in
+ * `session-admission-driver.ts` (the shared contract's
+ * `SESSION_ADMISSION_LEASE_MAX_DURATION_MS`). Duplicated rather than imported
+ * on purpose: if that lease grows, this assertion should fail and be
+ * considered again rather than quietly permit a longer window of unsupervised
+ * authority.
  */
 const AUTHORITY_LEASE_MAX_MS = 5 * 60_000;
 
@@ -780,6 +782,13 @@ describe("per-session admission survives a crash at every transition", () => {
       listSessionContainerRecordsV2(stateDir, identity).map((record) => record.sessionId),
       "the start dropped the record of a session whose container runs",
     ).toContain(sessionId);
+    expect(started.output, "the refusal names its remedy").toContain("runfree rebuild");
+
+    // The named remedy reclaims it: the record and the container are gone.
+    const rebuilt = fixture.runfree(["rebuild"]);
+    expect(rebuilt.status, `the named remedy failed: ${describeOutput(rebuilt.output, 4000)}`).toBe(0);
+    expect(listSessionContainerRecordsV2(stateDir, identity).map((record) => record.sessionId)).not.toContain(sessionId);
+    expect(docker(["container", "inspect", containerId]).status, "rebuild left the session container").not.toBe(0);
   }, TEST_TIMEOUT_MS);
 
   test("the runtime still admits a session after every crash and recovery", () => {

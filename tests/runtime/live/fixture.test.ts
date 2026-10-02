@@ -18,6 +18,8 @@ import { parseSessionSample, SESSION_SAMPLE_SCRIPT, SessionObservation } from ".
 
 import type { CaptureResult } from "./fixture.ts";
 import { LIVE_RUN_ID_ENV, liveRunToken, newLiveRunToken } from "./run-token.ts";
+import { sessionContainerLabels } from "../../../packages/cli/src/runtime/session-containers.ts";
+import { sessionContainerRecordFixture } from "../../../packages/cli/src/runtime/session-container.test-harness.ts";
 import {
   describeOutput,
   assertCleanSessionReport,
@@ -51,6 +53,29 @@ describe("standing-session container resolver fails closed", () => {
 
   test("exactly one 64-hex id resolves", () => {
     expect(resolveStandingSessionContainer(PROJECT, stubRun(`${EXACT_ID}\n`))).toBe(EXACT_ID);
+  });
+
+  test("the label filters select the labels the product writes on a session container", () => {
+    // `docker ps --filter label=k=v` over containers labelled as the product
+    // labels them. Session agents are direct containers, so a filter on
+    // Compose's own project label would match none and every resolver caller
+    // would poll until its deadline.
+    const record = sessionContainerRecordFixture();
+    const containers = [
+      { id: EXACT_ID, labels: sessionContainerLabels(record, "0.2.0") as Record<string, string> },
+      { id: "b".repeat(64), labels: { "com.docker.compose.project": record.composeProject, "com.docker.compose.service": "proxy" } },
+    ];
+    const fakePs = (args: readonly string[]): CaptureResult => {
+      const filters = args.flatMap((arg, index) => args[index - 1] === "--filter" ? [arg.replace(/^label=/u, "")] : []);
+      const ids = containers.filter(({ labels }) => filters.every((filter) => {
+        const [key, value] = filter.split("=", 2) as [string, string | undefined];
+        return value === undefined ? key in labels : labels[key] === value;
+      })).map(({ id }) => id);
+      const stdout = ids.map((id) => `${id}\n`).join("");
+      return Object.freeze({ status: 0, stdout, stderr: "", output: stdout });
+    };
+    expect(sessionAgentContainerIds(record.composeProject, fakePs)).toEqual([EXACT_ID]);
+    expect(sessionAgentContainerIds("runfree-ffffffffffff", fakePs)).toEqual([]);
   });
 
   test("a non-zero docker exit is surfaced, not read as zero containers", () => {

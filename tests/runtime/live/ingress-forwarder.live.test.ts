@@ -19,11 +19,11 @@
 //         address refuses the forwarded port, while host→listener works.
 //   core  A project with no OAuth-capable MCP server gets no mcp-callback
 //         forwarder, no callback port file, and no bridge.
-//   core  Callback two-hop in an ordinary `runfree claude` session: exact
-//         forwarder name/env/publication, the in-session port file and bridge,
-//         a host GET reaching the session's loopback listener with path and
-//         query intact, and the forwarder gone when the session ends.
-//   core  Two concurrent sessions: two ports, two forwarders; a peer session
+//   core  Two concurrent `runfree claude` sessions, each with the whole
+//         callback two-hop (exact forwarder name/env/publication, the
+//         in-session port file and bridge, a host GET reaching the session's
+//         loopback listener with path and query intact, and the forwarder gone
+//         when the session ends): two ports, two forwarders; a peer session
 //         cannot reach the other's bridge or forwarder; ending one removes
 //         only its own forwarder.
 //   core  `runfree shell` and `runfree mcp auth` ride the same lifecycle.
@@ -70,6 +70,7 @@ import childProcess from "node:child_process";
 import { afterAll, afterEach, beforeAll, describe, expect, test } from "vitest";
 import { CONTAINER_ROLE_LABEL, INGRESS_PURPOSE_LABEL } from "../../../packages/cli/src/runtime/container-inventory.ts";
 import { PROJECT_ID_LABEL } from "../../../packages/cli/src/runtime/constants.ts";
+import { SESSION_CONTAINER_LABELS } from "../../../packages/cli/src/runtime/session-containers.ts";
 import {
   PROVISION_TIMEOUT_MS,
   REPO_ROOT,
@@ -135,8 +136,6 @@ import { cliEntryArgv } from "../../support/prebuilt-entry.ts";
 const coreTest = liveTierSelected("core") ? test : test.skip;
 const extendedTest = liveTierSelected("extended") ? test : test.skip;
 
-/** How long the negative case watches a launch for a callback forwarder that must never appear. */
-const NO_CALLBACK_SETTLE_MS = 10_000;
 /** Bound for a dead owner's forwarder to be reconciled away once a new launch runs. */
 const RECONCILE_TIMEOUT_MS = 90_000;
 /** Bound for a preserved session to be re-served after the compatible replacement. */
@@ -155,7 +154,10 @@ describe("ingress forwarders are loopback-only, one-way, per-session, and torn d
   const launches: CliLaunch[] = [];
 
   beforeAll(() => {
-    fixture = provisionLiveFixture({ repoRoot: REPO_ROOT, configure: configureIngressProject });
+    // An isolated HOME: a maintainer's user-scope HTTP MCP server needs no
+    // approval, so it would make every session here callback eligible and
+    // void the negative case's precondition.
+    fixture = provisionLiveFixture({ repoRoot: REPO_ROOT, configure: configureIngressProject, isolateHostHome: true });
     project = composeProjectName(fixture);
     projectId = project.replace(/^runfree-/u, "");
     internalNetworkName = `${project}_agent_internal`;
@@ -376,24 +378,18 @@ describe("ingress forwarders are loopback-only, one-way, per-session, and torn d
     // Ordering guard: this is the only case that needs the unapproved project.
     expect(mcpEligible, "the negative case ran after the project was made MCP OAuth eligible").toBe(false);
     const run = await launch(["claude"], "ineligible session");
-    const deadline = Date.now() + NO_CALLBACK_SETTLE_MS;
-    while (Date.now() < deadline) {
-      expect(projectIngressForwarders(projectId, "mcp-callback"), "an ineligible launch minted a callback forwarder").toEqual([]);
-      await new Promise((resolve) => setTimeout(resolve, 500));
-    }
+    // No settle window: an eligible launch sets its callback up before
+    // activation (`prepareSessionMcpCallback`), so by the time the agent runs
+    // any forwarder this launch would mint already exists.
+    expect(projectIngressForwarders(projectId, "mcp-callback"), "an ineligible launch minted a callback forwarder").toEqual([]);
     expect(sessionFile(run.session.containerId, CALLBACK_PORT_FILE), "an ineligible session has a callback port file").toBeUndefined();
     expect(sessionProcessArgv(run.session.containerId, CALLBACK_BRIDGE_MARKER), "an ineligible session runs a callback bridge").toEqual([]);
     await run.end();
     expect(projectIngressForwarders(projectId, "mcp-callback")).toEqual([]);
   }, TEST_TIMEOUT_MS);
 
-  coreTest("an ordinary runfree claude session gets its own two-hop callback, removed when the session ends", async () => {
-    ensureMcpOAuthEligible();
-    const run = await launch(["claude"], "claude session");
-    const { forwarder } = await assertCallbackTwoHop(run);
-    await endAndAssertCallbackGone(run, forwarder);
-  }, TEST_TIMEOUT_MS);
-
+  // The single-session two-hop is not a case of its own: each session below
+  // runs the whole `assertCallbackTwoHop` contract and `endAndAssertCallbackGone`.
   coreTest("concurrent sessions get distinct callback ports, cannot reach each other's callback, and end independently", async () => {
     ensureMcpOAuthEligible();
     const first = await launch(["claude"], "first session");
@@ -704,20 +700,25 @@ describe("ingress forwarders are loopback-only, one-way, per-session, and torn d
     // create` has returned, not once the container runs.
     const sessionContainers = (): string[] => dockerOrThrow("list session containers", [
       "ps", "-a", "--no-trunc",
-      "--filter", `label=com.docker.compose.project=${project}`,
-      "--filter", "label=io.runfree.container-role=session-agent",
+      // Session agents carry Runfree's compose-project label, never Compose's.
+      "--filter", `label=${SESSION_CONTAINER_LABELS.composeProject}=${project}`,
+      "--filter", `label=${SESSION_CONTAINER_LABELS.role}=session-agent`,
       "--format", "{{.ID}}",
     ]).split("\n").map((line) => line.trim()).filter(Boolean);
     const before = new Set(sessionContainers());
     const launched = spawnCli(["claude"], { RUNFREE_TIMINGS: "1" });
-    let sessionId: string | undefined;
+    let launchExited = false;
+    void launched.completion.then(() => { launchExited = true; }, () => { launchExited = true; });
+    let sessionContainerId: string | undefined;
     const deadline = Date.now() + 120_000;
-    while (!sessionId && Date.now() < deadline) {
-      sessionId = sessionContainers().find((id) => !before.has(id));
-      if (!sessionId) await new Promise((resolve) => setTimeout(resolve, 25));
+    // A launch that exits before creating its session fails here at once, not
+    // after the whole deadline.
+    while (!sessionContainerId && !launchExited && Date.now() < deadline) {
+      sessionContainerId = sessionContainers().find((id) => !before.has(id));
+      if (!sessionContainerId) await new Promise((resolve) => setTimeout(resolve, 25));
     }
-    expect(sessionId, `no session container appeared: ${describeOutput(launched.output(), 4000)}`).toBeDefined();
-    const throttled = docker(["update", "--cpus", "0.01", sessionId as string]);
+    expect(sessionContainerId, `no session container appeared: ${describeOutput(launched.output(), 4000)}`).toBeDefined();
+    const throttled = docker(["update", "--cpus", "0.01", sessionContainerId as string]);
     expect(throttled.status, `docker update --cpus failed: ${throttled.stderr}`).toBe(0);
 
     const destroyed = spawnCli(["destroy", "--force"]);
