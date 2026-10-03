@@ -51,7 +51,7 @@ describe("checkout-local Git exclusion", () => {
     expect(matches).toEqual([LOCAL_POLICY_EXCLUDE_PATTERN]);
   });
 
-  describe("a fatal Git shape", () => {
+  describe("host Git capability", () => {
     // Real Git for everything but the capability probe, whose help text decides
     // relative-link support; every capture is recorded, along with the env
     // each probe capture ran with (to prove env threading below).
@@ -113,6 +113,39 @@ describe("checkout-local Git exclusion", () => {
       fatalCheckout();
       const { io: newGit } = hostGitIO(true);
       expect(() => ensureCheckoutLocalPolicyExcluded(root, newGit)).toThrow(/Repair it on the host with:\n {2}git -C .* worktree repair --relative-paths/);
+    });
+
+    // A real relative-linked worktree: real Git creates it, so the supported
+    // case also runs the real `git ls-files` and exclude write.
+    function relativeLinkedWorktree(): string {
+      initGit();
+      const gitEnv = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" };
+      for (const args of [
+        ["-c", "user.name=Test", "-c", "user.email=test@example.test", "commit", "--allow-empty", "-qm", "initial"],
+        ["config", "--local", "worktree.useRelativePaths", "true"],
+        ["worktree", "add", "-qb", "feature", ".worktrees/feature"],
+      ]) expect(childProcess.spawnSync("git", ["-C", root, ...args], { env: gitEnv }).status).toBe(0);
+      return path.join(root, ".worktrees", "feature");
+    }
+
+    test("a relative-linked worktree on old host Git names the version requirement before running git ls-files", () => {
+      const worktree = relativeLinkedWorktree();
+      const excludePath = path.join(root, ".git", "info", "exclude");
+      const originalExclude = fs.readFileSync(excludePath, "utf8");
+      const { io: oldGit, captured } = hostGitIO(false);
+      expect(() => ensureCheckoutLocalPolicyExcluded(worktree, oldGit)).toThrow(
+        /^this Git worktree layout requires host Git >= 2\.48 \(found 2\.43\.0\); run runfree from the main checkout, or upgrade Git$/,
+      );
+      expect(captured.some((args) => args.includes("ls-files"))).toBe(false);
+      expect(fs.readFileSync(excludePath, "utf8")).toBe(originalExclude);
+    });
+
+    test("a relative-linked worktree on supported host Git writes the common exclude as before", () => {
+      const worktree = relativeLinkedWorktree();
+      const { io: newGit, captured } = hostGitIO(true);
+      expect(ensureCheckoutLocalPolicyExcluded(worktree, newGit)).toBe("written");
+      expect(captured.some((args) => args.includes("ls-files"))).toBe(true);
+      expect(fs.readFileSync(path.join(root, ".git", "info", "exclude"), "utf8").split(/\r?\n/)).toContain(LOCAL_POLICY_EXCLUDE_PATTERN);
     });
 
     test("a valid checkout never probes host Git", () => {

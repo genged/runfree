@@ -281,12 +281,47 @@ test("a launch-supplied capability result is used without probing again", () => 
     admin: async () => 0,
   } satisfies RuntimeIO;
   flushWarnings();
-  ensureSandboxGitConfig(context, io, { supported: false, version: "2.39.5" });
+  ensureSandboxGitConfig(context, io, { supported: false, version: "2.39.5", found: true });
   expect(captured.map((args) => args.slice(2, 4))).toEqual([["config", "--get"], ["config", "--get"]]);
   expect(pendingWarningsForTest().map((event) => event.message)).toEqual([
     expect.stringContaining("host Git 2.39.5 is older than 2.48"),
   ]);
   expect(fs.existsSync(context.project.paths.gitConfigPath)).toBe(true);
+});
+
+test.each([
+  {
+    kind: "missing host Git",
+    hostGit: { supported: false, version: "unknown", found: false },
+    relativeWorktrees: false,
+    expected: "host Git not found: Git worktrees created inside the sandbox will make this repository unreadable to host Git older than 2.48; install Git 2.48 or newer",
+  },
+  {
+    kind: "old host Git on a repository that already uses relative worktree links",
+    hostGit: { supported: false, version: "2.43.0", found: true },
+    relativeWorktrees: true,
+    expected: "host Git 2.43.0 is older than 2.48 and cannot read this repository, which uses relative worktree links; upgrade host Git (Ubuntu: sudo add-apt-repository ppa:git-core/ppa && sudo apt install git)",
+  },
+])("$kind gets exactly one launch warning naming its case", ({ hostGit, relativeWorktrees, expected }) => {
+  const projectRoot = path.join(tmp, "project");
+  fs.mkdirSync(projectRoot);
+  const gitEnv = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" };
+  expect(childProcess.spawnSync("git", ["init", "-q", projectRoot], { env: gitEnv }).status).toBe(0);
+  if (relativeWorktrees) {
+    expect(childProcess.spawnSync("git", ["-C", projectRoot, "config", "extensions.relativeWorktrees", "true"], { env: gitEnv }).status).toBe(0);
+  }
+  const context = { projectRoot, project: projectInfo(projectRoot), runtimeRoot: "/runtime" } as RuntimeContext;
+  const io = {
+    run: () => 0,
+    capture: () => ({ status: 1, stdout: "", stderr: "" }),
+    commandExists: () => true,
+    confirm: () => true,
+    admin: async () => 0,
+  } satisfies RuntimeIO;
+  flushWarnings();
+  ensureSandboxGitConfig(context, io, hostGit);
+  expect(pendingWarningsForTest().map((event) => event.message)).toEqual([expected]);
+  expect(fs.readFileSync(context.project.paths.gitConfigPath, "utf8")).toContain("useRelativePaths = true");
 });
 
 test.each(["include", "worktree", "conditional-include"])("sandbox Git keeps relative links despite a false %s override", (override) => {

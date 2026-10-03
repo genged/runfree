@@ -22,7 +22,7 @@ import { dockerClientEnvOptions, envOptions, serviceContainerId, shellSingleQuot
 import { composeProjectName, projectHash } from "./env.ts";
 import {
   type HostGitRelativeWorktreesCapability,
-  hostGitRelativeWorktreesDegradedWarning,
+  hostGitRelativeWorktreesLaunchWarning,
   probeHostGitRelativeWorktrees,
 } from "./git-layout.ts";
 import {
@@ -418,7 +418,8 @@ export function ensureSandboxGitConfig(
   // host Git cannot read. Degraded mode still writes the relative default:
   // `false` would let the agent record absolute container paths whose repair
   // needs the newer Git anyway. The warning names the outcome and the fix.
-  if (!hostGit.supported) warn(hostGitRelativeWorktreesDegradedWarning(hostGit.version));
+  const degraded = hostGitRelativeWorktreesLaunchWarning(context, hostGit);
+  if (degraded) warn(degraded);
   const gitConfigPath = context.env?.RUNFREE_GIT_CONFIG ?? context.project.paths.gitConfigPath;
   fs.mkdirSync(path.dirname(gitConfigPath), { recursive: true, mode: 0o700 });
   const source = sandboxGitConfigSource(

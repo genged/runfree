@@ -1,7 +1,12 @@
 import fs from "node:fs";
 import path from "node:path";
 
-import { classifyGitRepository, formatGitRepositoryShapeError, probeHostGitRelativeWorktrees } from "../runtime/git-layout.ts";
+import {
+  classifyGitRepository,
+  formatGitRepositoryShapeError,
+  hostGitRelativeWorktreesLaunchRefusal,
+  probeHostGitRelativeWorktrees,
+} from "../runtime/git-layout.ts";
 import type { RuntimeIO } from "../runtime/types.ts";
 
 export const LOCAL_POLICY_EXCLUDE_PATTERN = "/.runfree/network-policy.local.json";
@@ -114,6 +119,13 @@ export function ensureCheckoutLocalPolicyExcluded(
     // process env when no context is available on this path.
     const hostGit = probeHostGitRelativeWorktrees({ env: env ?? process.env }, io);
     throw new Error(formatGitRepositoryShapeError(shape, hostGit));
+  }
+  if (shape.kind === "relative-linked") {
+    // A relative-linked worktree carries extensions.relativeWorktrees, which
+    // old host Git cannot read, so `git ls-files` below would fail with an
+    // unexplained error. Name the version requirement before running it.
+    const hostGit = probeHostGitRelativeWorktrees({ env: env ?? process.env }, io);
+    if (!hostGit.supported) throw new Error(hostGitRelativeWorktreesLaunchRefusal(hostGit.version));
   }
 
   const tracked = gitCapture(projectRoot, io, ["ls-files", "--error-unmatch", "--", LOCAL_POLICY_REPOSITORY_PATH]);

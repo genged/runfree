@@ -526,13 +526,19 @@ export type PreparedGitRepositoryLayout = {
 // `hostGit` is the launch's single capability probe result. Callers that only
 // re-derive an already admitted layout omit it and keep the classification
 // as-is; a launch passes it so old host Git refuses the shapes it cannot use.
+// `lazyProbeIO`, when given without `hostGit`, probes host Git only once a
+// fatal shape is found, so the refusal never recommends repair commands old
+// host Git cannot run while a valid layout pays for no probe.
 export function prepareGitRepositoryLayoutResult(
   context: RuntimeContext,
   hostGit?: HostGitRelativeWorktreesCapability,
+  lazyProbeIO?: RuntimeIO,
 ): PreparedGitRepositoryLayout {
   const shape = classifyGitRepository(context.projectRoot);
   if (hostGit) refuseShapeUnusableByHostGit(shape, hostGit);
-  if (shape.kind === "fatal") die(formatGitRepositoryShapeError(shape));
+  if (shape.kind === "fatal") {
+    die(formatGitRepositoryShapeError(shape, hostGit ?? (lazyProbeIO ? probeHostGitRelativeWorktrees(context, lazyProbeIO) : undefined)));
+  }
   const plan = gitLayoutPlanForShape(context.projectRoot, shape);
   const serialized = serializeGitLayoutPlan(plan);
   const previous = readPersistedGitLayoutPlan(context);
@@ -578,7 +584,9 @@ function gitHelpSupportsRelativeWorktree(io: RuntimeIO, options: SpawnSyncOption
 // comparing this number, because distributions backport and rename freely.
 export const MIN_HOST_GIT_RELATIVE_WORKTREES_VERSION = "2.48";
 
-export type HostGitRelativeWorktreesCapability = { supported: boolean; version: string };
+// `found` is false when `git --version` itself failed (Git missing or
+// unrunnable); `version` is then "unknown" and `supported` is false.
+export type HostGitRelativeWorktreesCapability = { supported: boolean; version: string; found: boolean };
 
 export function hostGitRelativeWorktreesLaunchRefusal(version: string): string {
   return `this Git worktree layout requires host Git >= ${MIN_HOST_GIT_RELATIVE_WORKTREES_VERSION} (found ${version}); run runfree from the main checkout, or upgrade Git`;
@@ -597,8 +605,44 @@ export function hostGitRelativeWorktreesRepairRefusal(version: string): string {
   return `repairing worktree links requires host Git >= ${MIN_HOST_GIT_RELATIVE_WORKTREES_VERSION} (found ${version}); upgrade Git`;
 }
 
+const HOST_GIT_UBUNTU_UPGRADE = "sudo add-apt-repository ppa:git-core/ppa && sudo apt install git";
+
 export function hostGitRelativeWorktreesDegradedWarning(version: string): string {
-  return `host Git ${version} is older than ${MIN_HOST_GIT_RELATIVE_WORKTREES_VERSION}: Git worktrees created inside the sandbox will make this repository unreadable to host Git; upgrade host Git (Ubuntu: sudo add-apt-repository ppa:git-core/ppa && sudo apt install git)`;
+  return `host Git ${version} is older than ${MIN_HOST_GIT_RELATIVE_WORKTREES_VERSION}: Git worktrees created inside the sandbox will make this repository unreadable to host Git; upgrade host Git (Ubuntu: ${HOST_GIT_UBUNTU_UPGRADE})`;
+}
+
+export function hostGitRelativeWorktreesAlreadyUnreadableWarning(version: string): string {
+  return `host Git ${version} is older than ${MIN_HOST_GIT_RELATIVE_WORKTREES_VERSION} and cannot read this repository, which uses relative worktree links; upgrade host Git (Ubuntu: ${HOST_GIT_UBUNTU_UPGRADE})`;
+}
+
+export function hostGitNotFoundWarning(): string {
+  return `host Git not found: Git worktrees created inside the sandbox will make this repository unreadable to host Git older than ${MIN_HOST_GIT_RELATIVE_WORKTREES_VERSION}; install Git ${MIN_HOST_GIT_RELATIVE_WORKTREES_VERSION} or newer`;
+}
+
+// The one launch warning for a host Git without relative worktree links, or
+// undefined when host Git supports them. A main checkout whose common config
+// already enables extensions.relativeWorktrees is unreadable to this host Git
+// now, not only after a sandbox worktree is created. The config read is
+// best-effort: a read failure keeps the generic warning instead of aborting.
+// The launch passes its already classified shape; other callers fall back to
+// classifying here, only once the warning is known to be needed.
+export function hostGitRelativeWorktreesLaunchWarning(
+  context: Pick<RuntimeContext, "projectRoot" | "gitRepositoryShape">,
+  hostGit: HostGitRelativeWorktreesCapability,
+): string | undefined {
+  if (hostGit.supported) return undefined;
+  if (!hostGit.found) return hostGitNotFoundWarning();
+  const shape = context.gitRepositoryShape ?? classifyGitRepository(context.projectRoot);
+  if (shape.kind === "normal") {
+    let enabled: string | undefined;
+    try {
+      enabled = readGitConfigValue(path.join(shape.gitDir, "config"), "extensions.relativeWorktrees", true);
+    } catch {
+      enabled = undefined;
+    }
+    if (enabled === "true") return hostGitRelativeWorktreesAlreadyUnreadableWarning(hostGit.version);
+  }
+  return hostGitRelativeWorktreesDegradedWarning(hostGit.version);
 }
 
 function parseHostGitVersion(output: string): string {
@@ -617,12 +661,14 @@ export function probeHostGitRelativeWorktrees(context: Pick<RuntimeContext, "env
   };
   try {
     const versionResult = io.capture("git", ["--version"], options);
-    const version = versionResult.status === 0 ? parseHostGitVersion(versionResult.stdout) : "unknown";
+    const found = versionResult.status === 0;
+    if (!found) return { supported: false, version: "unknown", found };
+    const version = parseHostGitVersion(versionResult.stdout);
     const initialized = io.capture("git", ["init", "--bare", "--quiet", "--template=", probe], options);
     const supported = initialized.status === 0
       && gitHelpSupportsRelativeWorktree(io, options, "repair")
       && gitHelpSupportsRelativeWorktree(io, options, "add");
-    return { supported, version };
+    return { supported, version, found };
   } finally {
     fs.rmSync(probe, { recursive: true, force: true });
   }
@@ -636,8 +682,8 @@ export function formatHostGitStatusLine(hostGit: HostGitRelativeWorktreesCapabil
 // operator needs regardless of whether the runtime itself is running, so it
 // is probed and printed unconditionally. A probe failure must never change
 // the status command's exit code (probeHostGitRelativeWorktrees itself
-// already fails closed to `{ supported: false, version: "unknown" }`; the
-// try/catch only guards against the unexpected).
+// already fails closed to `supported: false`, with version "unknown" when
+// `git --version` fails; the try/catch only guards against the unexpected).
 export function printHostGitStatusLine(context: Pick<RuntimeContext, "env">, io: RuntimeIO): void {
   try {
     console.log(formatHostGitStatusLine(probeHostGitRelativeWorktrees(context, io)));

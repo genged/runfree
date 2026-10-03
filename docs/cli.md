@@ -549,6 +549,19 @@ the repository unreadable to host Git:
 
 `host Git <version> is older than 2.48: Git worktrees created inside the sandbox will make this repository unreadable to host Git; upgrade host Git (Ubuntu: sudo add-apt-repository ppa:git-core/ppa && sudo apt install git)`
 
+When the main checkout's Git config already sets
+`extensions.relativeWorktrees = true`, host Git older than 2.48 already
+cannot read the repository, so the warning says so instead:
+
+`host Git <version> is older than 2.48 and cannot read this repository, which uses relative worktree links; upgrade host Git (Ubuntu: sudo add-apt-repository ppa:git-core/ppa && sudo apt install git)`
+
+When `git --version` fails, for example because Git is not installed, launch
+continues with this warning instead:
+
+`host Git not found: Git worktrees created inside the sandbox will make this repository unreadable to host Git older than 2.48; install Git 2.48 or newer`
+
+Each launch prints at most one of these three warnings.
+
 When launched from the main checkout, Runfree also checks registered nested
 worktrees before starting the runtime. An unsupported layout — absolute
 links, including a stale `/workspace` link from a sandbox — stops startup. On
@@ -566,6 +579,17 @@ fix:
 `this Git worktree layout requires host Git >= 2.48 (found <version>); run runfree from the main checkout, or upgrade Git`
 
 Host-only worktrees outside the mounted project are outside this check.
+
+Commands that write checkout-local policy, such as `runfree init`, refuse
+with the same linked-worktree message on older host Git when run from a
+linked worktree. The refusal comes before Runfree asks Git whether that
+policy file is tracked, and before it writes the Git exclude file.
+
+Revalidating a running runtime (a launch that reuses it, or a proxy restart)
+and dependency overlay planning can find a Git layout that became unsupported
+after the runtime started. On host Git 2.48+ that refusal shows the repair
+commands, as above. On older host Git it shows the matching version
+requirement message above instead, because the repair needs 2.48+.
 
 `runfree git repair-worktree-links` itself refuses the same way on host Git
 older than 2.48:

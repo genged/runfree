@@ -54,6 +54,7 @@ import {
 } from "./control-plane-effective-proof.ts";
 import { composeProjectName } from "./env.ts";
 import {
+  type HostGitRelativeWorktreesCapability,
   prepareGitRepositoryLayoutResult,
   probeHostGitRelativeWorktrees,
   refuseGitLayoutUnusableByHostGit,
@@ -985,11 +986,20 @@ async function prepareRuntimeForTokenSyncOrRemoveInvalid(
   context: RuntimeContext,
   io: RuntimeIO,
   docker: RuntimeDocker,
-  options: { verbose?: boolean; lifecycleLock?: ProjectLifecycleLock; readOnly?: boolean; containmentIO?: RuntimeIO } = {},
+  options: {
+    verbose?: boolean;
+    lifecycleLock?: ProjectLifecycleLock;
+    readOnly?: boolean;
+    containmentIO?: RuntimeIO;
+    // The launch's host Git probe result, when this runs inside a launch.
+    hostGit?: HostGitRelativeWorktreesCapability;
+  } = {},
 ): Promise<RuntimeTokenSyncPreparation> {
   const timings = createRuntimeTimings(context.env);
   const project = composeProjectName(context.projectRoot);
-  const gitLayout = timings.time("validation:git-layout", () => prepareGitRepositoryLayoutResult(context));
+  // Without a launch probe result, host Git is probed only if the layout is
+  // fatal, so the refusal names the version requirement on old host Git.
+  const gitLayout = timings.time("validation:git-layout", () => prepareGitRepositoryLayoutResult(context, options.hostGit, io));
   if (serializeGitLayoutPlan(gitLayout.plan) !== serializeGitLayoutPlan(activePlan.gitLayout)) {
     warn("the Git worktree layout changed since the runtime was created; new authority was refused; repair the reported inputs and retry");
     return { status: 1 };
@@ -1535,7 +1545,7 @@ export async function startRuntime(
         }
         const full = await timings.timeAsync(
           "runtime-validation",
-          () => prepareRuntimeForTokenSyncOrRemoveInvalid(activePlan, activeContext, io, adapters.docker, { verbose, lifecycleLock: heldLifecycleLock, containmentIO }),
+          () => prepareRuntimeForTokenSyncOrRemoveInvalid(activePlan, activeContext, io, adapters.docker, { verbose, lifecycleLock: heldLifecycleLock, containmentIO, hostGit }),
         );
         if (full.status !== 0) return result(full.status, false, activeContext);
         validation = full;
@@ -1737,7 +1747,7 @@ export async function startRuntime(
             activeContext,
             rebindIO,
             rebindDocker,
-            { verbose, lifecycleLock: heldLifecycleLock, readOnly: true, containmentIO },
+            { verbose, lifecycleLock: heldLifecycleLock, readOnly: true, containmentIO, hostGit },
           );
           if (candidateValidation.status !== 0
             || !candidateValidation.proof
@@ -1763,7 +1773,7 @@ export async function startRuntime(
             activeContext,
             rebindIO,
             rebindDocker,
-            { verbose, lifecycleLock: heldLifecycleLock, readOnly: true, containmentIO },
+            { verbose, lifecycleLock: heldLifecycleLock, readOnly: true, containmentIO, hostGit },
           );
           if (candidateValidation.status !== 0
             || !candidateValidation.proof
