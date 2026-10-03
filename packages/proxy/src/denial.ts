@@ -136,6 +136,9 @@ export type ShapeDenialBodyDetails = {
   // `runfree host rules` (which replaces the whole rule) keeps every existing
   // restriction; without it the remedy names only the delta.
   rule?: RequestPolicyJson;
+  // The request was an OAuth token POST whose client_id is a client metadata
+  // URL Runfree does not recognize (fixed text; the value is never echoed).
+  oauthUnlistedClientIdUrl?: boolean;
 };
 
 // The exact widening command for a method denial. Repeating `runfree host rules`
@@ -205,6 +208,15 @@ function shapeDenialLines(host: string, reason: DenialReason, details: ShapeDeni
     `  reason: ${DENIAL_REASON_TEXT[reason]}${reasonSuffix}`,
     "",
   ];
+  if (details.oauthUnlistedClientIdUrl === true && reason.startsWith("write-approval")) {
+    lines.push(
+      "This OAuth token request names a client metadata URL as its client_id that",
+      "Runfree does not recognize. The authorization server fetches that URL, so",
+      "the request counts as a write. Runfree treats only the published Claude Code",
+      "and Codex client metadata URLs as OAuth protocol reads.",
+      "",
+    );
+  }
   if (host === UNPARSEABLE_HOST) {
     lines.push(
       "The person operating Runfree can inspect recent denials by running",

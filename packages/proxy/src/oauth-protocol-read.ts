@@ -41,6 +41,27 @@ const REGISTRATION_AUTH_METHODS = new Set(["none", "client_secret_basic", "clien
 const PRINTABLE_ASCII = /^[\x20-\x7e]*$/;
 
 /**
+ * The published client ID metadata document URLs of the agents Runfree pins.
+ * An authorization server that supports client ID metadata documents fetches a
+ * URL-valued client_id, so a URL is a protocol read only on exact string
+ * equality with one of these: a fixed, public vendor URL carries no bytes the
+ * agent chose. Any other URL (another path, a query, a case or encoding
+ * variant, an in-container override) stays a write. The live mcp-enable
+ * tranche proves each value is in the pinned agent binary.
+ */
+export const CLIENT_ID_METADATA_URLS: ReadonlySet<string> = new Set([
+  // Claude Code (MCP_OAUTH_CLIENT_METADATA_URL default)
+  "https://claude.ai/oauth/claude-code-client-metadata",
+  // Codex (rmcp CIMD client)
+  "https://chatgpt.com/oauth/codex/client.json",
+]);
+
+// A client_id an issuer may treat as a URL to fetch.
+function urlLikeClientId(clientId: string): boolean {
+  return /[:/]/.test(clientId);
+}
+
+/**
  * The request-target path exactly as the client sent it, before any URL
  * normalization (`new URL()` resolves dot segments, so `/a/../oauth/token`
  * would compare equal to `/oauth/token` while an origin may route it
@@ -92,8 +113,8 @@ function stringSubset(value: unknown, allowed: Set<string>): boolean {
 }
 
 // A `resource` (RFC 8707) must name this server's own resource host; a
-// `client_id` must not be a URL, because an authorization server that
-// supports client ID metadata documents fetches a URL-valued client_id.
+// URL-valued `client_id` must be a pinned agent metadata URL, because an
+// authorization server that supports client ID metadata documents fetches it.
 function resourceIndicatorAllowed(value: string, resourceHost: string): boolean {
   let url: URL;
   try {
@@ -114,7 +135,8 @@ function tokenBodyAllowed(bodyText: string, resourceHost: string): boolean {
   }
   if (!TOKEN_GRANTS.has(params.get("grant_type") ?? "")) return false;
   const clientId = params.get("client_id");
-  if (clientId !== null && (clientId.length > 256 || !PRINTABLE_ASCII.test(clientId) || /[:/]/.test(clientId))) return false;
+  if (clientId !== null && (clientId.length > 256 || !PRINTABLE_ASCII.test(clientId))) return false;
+  if (clientId !== null && urlLikeClientId(clientId) && !CLIENT_ID_METADATA_URLS.has(clientId)) return false;
   const resource = params.get("resource");
   if (resource !== null && !resourceIndicatorAllowed(resource, resourceHost)) return false;
   const redirect = params.get("redirect_uri");
@@ -153,8 +175,9 @@ function registrationBodyAllowed(bodyText: string): boolean {
  * loopback-only dynamic client registration for a registration endpoint. No
  * field an issuer may fetch (sector_identifier_uri, jwks_uri, logo_uri,
  * request_uris, software_statement, client assertions) is allowed, so the
- * issuer is never made to contact another host: a `client_id` may not be a
- * URL, and a `resource` must name the server's own resource host.
+ * issuer is never made to contact a host the agent chose: a URL `client_id`
+ * must be one of CLIENT_ID_METADATA_URLS, and a `resource` must name the
+ * server's own resource host.
  */
 export function protocolReadBodyAllowed(input: {
   bodyText: string | undefined;
@@ -176,6 +199,16 @@ export function protocolReadBodyAllowed(input: {
     return mediaType(contentType) === "application/x-www-form-urlencoded" && tokenBodyAllowed(bodyText, input.resourceHost);
   }
   return mediaType(contentType) === "application/json" && registrationBodyAllowed(bodyText);
+}
+
+/**
+ * True when a token body carries a single URL-valued client_id that is not a
+ * pinned agent metadata URL. Display only: it lets a write-approval denial say
+ * why the request was not a protocol read. The value itself is never echoed.
+ */
+export function unlistedClientIdMetadataUrl(bodyText: string): boolean {
+  const values = new URLSearchParams(bodyText).getAll("client_id");
+  return values.length === 1 && urlLikeClientId(values[0]) && !CLIENT_ID_METADATA_URLS.has(values[0]);
 }
 
 /** The grant type to log for a token request, never a secret. */

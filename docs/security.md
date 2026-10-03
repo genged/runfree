@@ -274,11 +274,17 @@ Details: [Write Approval Grants](architecture.md#write-approval-grants).
    is a token or registration endpoint that `mcp enable` recorded for one
    server, the proxy mediates it for that server alone, and the body is a
    plain login, refresh, or loopback-only client registration with no field
-   an issuer may fetch (no URL-valued `client_id`, no `resource` for another
-   host). Each server gets at most 30 a minute. Everything else
+   an issuer may fetch at a URL the agent chose: a URL-valued `client_id`
+   must equal, byte for byte, a pinned agent client metadata URL (Claude
+   Code's or Codex's published document), and no `resource` may name another
+   host. Each server gets at most 30 a minute. Everything else
    on the host stays a write. A request that selected the unmediated proxy
    rule while its endpoint became mediated is refused, so a token never
-   reaches the agent unmediated.
+   reaches the agent unmediated. This covers the token and registration
+   POSTs only: an authorization GET with a URL `client_id` to an issuer host
+   the project allows broadly (`--oauth-host`, desired policy, or the MCP
+   host itself) is an ordinary read, and an issuer that supports client ID
+   metadata documents may fetch that URL.
 
 ### Agent Container
 

@@ -86,6 +86,10 @@ export type PolicyOptions = {
   // protocol-shaped (OAuthMediator.protocolReadEndpoint plus
   // protocolReadBodyAllowed). It makes the POST a read on an `ask` host only.
   oauthProtocolRead?: boolean;
+  // Display only: the POST targeted a protocol-read endpoint but its client_id
+  // is a client metadata URL Runfree does not recognize. Carried into a write
+  // denial so it can say why the request was not a protocol read.
+  oauthUnlistedClientIdUrl?: boolean;
   mcpClassification?: McpClassification;
   approvedMcp?: McpDisplayFields;
 };
@@ -144,6 +148,7 @@ export type ShapeDenialDetails = {
   rule?: RequestPolicyJson;
   writeCategory?: WriteCategory;
   mcp?: McpDisplayFields;
+  oauthUnlistedClientIdUrl?: boolean;
 };
 
 export class ProxyPolicyDenialError extends Error {
@@ -466,6 +471,7 @@ function assertWriteAllowed(input: {
   webSocket?: boolean;
   graphqlBodyClass?: "read" | "write";
   oauthProtocolRead?: boolean;
+  oauthUnlistedClientIdUrl?: boolean;
   hasWriteGrant?: PolicyOptions["hasWriteGrant"];
   mcpClassification?: McpClassification;
   approvedMcp?: McpDisplayFields;
@@ -534,6 +540,7 @@ function assertWriteAllowed(input: {
       method: input.method,
       path: pathName,
       writeCategory: classification.category,
+      ...(input.oauthUnlistedClientIdUrl === true ? { oauthUnlistedClientIdUrl: true } : {}),
     },
   );
 }
@@ -767,6 +774,7 @@ export function beforeAllowedRequest(admission: AdmissionRecord, req: ProxyReque
     headers: req.headers,
     graphqlBodyClass: options.graphqlBodyClass,
     oauthProtocolRead: options.oauthProtocolRead,
+    oauthUnlistedClientIdUrl: options.oauthUnlistedClientIdUrl,
     hasWriteGrant: options.hasWriteGrant,
     mcpClassification: options.mcpClassification,
     approvedMcp: options.approvedMcp,

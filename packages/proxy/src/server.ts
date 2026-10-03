@@ -38,6 +38,7 @@ import {
   PROTOCOL_READ_BODY_CAP_BYTES,
   ProtocolReadRateLimiter,
   protocolReadBodyAllowed,
+  unlistedClientIdMetadataUrl,
   protocolReadGrantType,
 } from "./oauth-protocol-read.js";
 import { validateMcpOperationPolicy, type LoadedMcpOperationPolicy } from "@runfree/runtime-contracts/mcp-operation-policy";
@@ -1163,6 +1164,7 @@ function syntheticShapeDenialResponse(req: ProxyRequest, shape: ShapeDenialDetai
       allowedMethods: shape.allowedMethods,
       allowedPathPrefixes: shape.allowedPathPrefixes,
       rule: shape.rule,
+      ...(shape.oauthUnlistedClientIdUrl === true ? { oauthUnlistedClientIdUrl: true } : {}),
     }),
   };
 }
@@ -1465,7 +1467,7 @@ const protocolReadLimiter = new ProtocolReadRateLimiter();
 async function oauthProtocolReadForRequest(
   req: ProxyRequest,
   responseMediated: boolean,
-): Promise<{ grantType: string; match: ProtocolReadMatch } | undefined> {
+): Promise<{ grantType: string; match: ProtocolReadMatch } | { unlistedClientIdUrl: true } | undefined> {
   if (!responseMediated || req.method !== "POST") return undefined;
   let url: URL;
   try {
@@ -1487,7 +1489,12 @@ async function oauthProtocolReadForRequest(
   } catch {
     return undefined;
   }
-  if (!protocolReadBodyAllowed({ bodyText, headers: req.headers, kind: match.kind, resourceHost: match.resourceHost })) return undefined;
+  if (!protocolReadBodyAllowed({ bodyText, headers: req.headers, kind: match.kind, resourceHost: match.resourceHost })) {
+    // Display only: lets the write denial say why this was not a read.
+    return match.kind === "token" && bodyText !== undefined && unlistedClientIdMetadataUrl(bodyText)
+      ? { unlistedClientIdUrl: true }
+      : undefined;
+  }
   // The body read awaited: a policy reload may have landed. Decide on the
   // policy that is current now, synchronously with the classification.
   const current = oauthMediator.protocolReadEndpoint(req);
@@ -1517,7 +1524,8 @@ async function policedRequestMutation(
   const mcpClassification = await mcpClassificationForRequest(req);
   // Last await before classification: from here to the mediator's own
   // re-check nothing yields, so both see the same policy.
-  const protocolRead = await oauthProtocolReadForRequest(req, options.responseMediated);
+  const protocolReadResult = await oauthProtocolReadForRequest(req, options.responseMediated);
+  const protocolRead = protocolReadResult !== undefined && "match" in protocolReadResult ? protocolReadResult : undefined;
   const mutation = beforeAllowedRequest(admission, req, {
     allowedHosts: currentPolicy.allowedHosts,
     credentials: currentPolicy.credentials,
@@ -1528,6 +1536,7 @@ async function policedRequestMutation(
     writeApproval: currentPolicy.writeApproval,
     graphqlBodyClass,
     oauthProtocolRead: protocolRead !== undefined,
+    oauthUnlistedClientIdUrl: protocolReadResult !== undefined && "unlistedClientIdUrl" in protocolReadResult,
     mcpClassification,
     approvedMcp: options.approvedMcp,
     hasWriteGrant: (details) => writeApprovals.hasGrant(details, principal, requestId(req)),

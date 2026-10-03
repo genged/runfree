@@ -1246,12 +1246,21 @@ when the OAuth mediator proves it is an exchange it mediates
 - the body is protocol-shaped: an identity-encoded body with a
   `Content-Length` of at most 16 KiB; a form `authorization_code` or
   `refresh_token` grant with only the standard fields, a loopback redirect, a
-  `client_id` that is not a URL (an issuer that supports client ID metadata
-  documents fetches a URL-valued one), and a `resource` only on the server's
-  own resource host; or a JSON dynamic client registration with loopback
+  `client_id` that is not a URL or is byte for byte one of the pinned agent
+  client metadata URLs (`CLIENT_ID_METADATA_URLS`: the published Claude Code
+  and Codex documents; an issuer that supports client ID metadata documents
+  fetches a URL-valued `client_id`, so any other URL would let the agent pick
+  what the issuer fetches), and a `resource` only on the server's own
+  resource host; or a JSON dynamic client registration with loopback
   `http` redirect URIs and no URI field an issuer may fetch;
 - the provider's budget (30 a minute, checked here and spent only after the
   request passes every policy check) is not spent.
+
+A token POST refused only for an unpinned client metadata URL says so in its
+write-approval denial, in fixed text that never echoes the value. The live
+`mcp-enable` tranche proves each pinned URL is in the pinned agent binary, so
+a vendor URL change fails the gate instead of sending every login to
+approval.
 
 Every write rule above runs first. The mediator re-checks the match before it
 swaps any handle. A token or registration request that selected the plain

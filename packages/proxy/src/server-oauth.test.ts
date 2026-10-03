@@ -1004,10 +1004,27 @@ describe("proxy server entrypoint: OAuth mediation", () => {
     expect(login.body).not.toContain("real-access-token-1");
     expect(proxy.output()).toContain("proxy: oauth protocol-read name=mcp:claude-linear kind=token");
     expect(proxy.output()).not.toContain("secret-authorization-code");
+
+    // A pinned agent client metadata URL as the client_id is a read too.
+    const metadataLogin = await post("/oauth/token", `grant_type=authorization_code&code=c&client_id=${encodeURIComponent("https://claude.ai/oauth/claude-code-client-metadata")}`);
+    expect(metadataLogin.statusCode).toBe(200);
+    expect(metadataLogin.headers["x-runfree-blocked"]).toBeUndefined();
     const forwarded = upstream.requests.length;
+
+    // Any other URL client_id is a write, and the denial says why without
+    // echoing the value.
+    const attackerUrl = "https://evil.example/exfil-chunk";
+    const unlisted = await post("/oauth/token", `grant_type=authorization_code&code=c&client_id=${encodeURIComponent(attackerUrl)}`);
+    expect(unlisted.statusCode).toBe(403);
+    expect(unlisted.headers["x-runfree-blocked"]).toBe("write-approval-required");
+    expect(unlisted.body).toContain("client metadata URL as its client_id that\nRunfree does not recognize");
+    expect(unlisted.body).not.toContain("evil.example");
+    expect(proxy.output()).not.toContain("evil.example");
 
     for (const [label, response] of [
       ["another grant", await post("/oauth/token", "grant_type=client_credentials&client_id=x")],
+      ["a vendor-host path that is not pinned", await post("/oauth/token", `grant_type=authorization_code&code=c&client_id=${encodeURIComponent("https://claude.ai/share/x")}`)],
+      ["a pinned URL with a query", await post("/oauth/token", `grant_type=authorization_code&code=c&client_id=${encodeURIComponent("https://claude.ai/oauth/claude-code-client-metadata?d=x")}`)],
       ["an extra field", await post("/oauth/token", "grant_type=authorization_code&code=c&data=exfil")],
       ["a JSON body", await post("/oauth/token", JSON.stringify({ grant_type: "authorization_code", code: "c" }), "POST", { "Content-Type": "application/json" })],
       ["a sub-path", await post("/oauth/token/", "grant_type=authorization_code&code=c")],
@@ -1023,16 +1040,16 @@ describe("proxy server entrypoint: OAuth mediation", () => {
     expect(upstream.requests).toHaveLength(forwarded);
 
     // The refusals above spent none of the per-server budget (30 a minute):
-    // 29 more logins pass as reads, then the next one falls back to write
+    // 28 more logins pass as reads, then the next one falls back to write
     // approval and is refused before it reaches the upstream.
-    for (let index = 1; index < 30; index += 1) {
+    for (let index = 2; index < 30; index += 1) {
       const read = await post("/oauth/token", "grant_type=authorization_code&code=c");
       expect(read.headers["x-runfree-blocked"], `read ${index}`).toBeUndefined();
     }
     const overBudget = await post("/oauth/token", "grant_type=authorization_code&code=c");
     expect(overBudget.statusCode).toBe(403);
     expect(overBudget.headers["x-runfree-blocked"]).toMatch(/^write-approval/);
-    expect(upstream.requests).toHaveLength(forwarded + 29);
+    expect(upstream.requests).toHaveLength(forwarded + 28);
     expect(proxy.output()).toContain("proxy: oauth protocol-read budget exhausted name=mcp:claude-linear");
   }, 30_000);
 });

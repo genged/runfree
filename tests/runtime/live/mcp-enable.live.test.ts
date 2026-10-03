@@ -18,6 +18,10 @@
 // a revoke that leaves the server in the policy deletes it, and the revoke
 // says "cleared" only because the live proxy confirmed the generation.
 //
+// The client metadata proofs: a token POST whose client_id is a pinned agent
+// client metadata URL is a protocol read, any other URL client_id needs
+// approval, and the pinned agent binaries carry exactly the pinned URLs.
+//
 // Discovery itself cannot run here: by design it refuses non-public addresses,
 // and every probe host is an unresolvable `.invalid` name (the proxy decision is
 // the subject; an admitted request comes back as the proxy's upstream-failure
@@ -33,6 +37,7 @@ import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 
 import { projectHash } from "../../../packages/cli/src/project-identity.ts";
+import { CLIENT_ID_METADATA_URLS } from "../../../packages/proxy/src/oauth-protocol-read.ts";
 import { composeProjectName, composeServiceContainerId, docker, dockerOrThrow } from "./docker.ts";
 import {
   describeOutput,
@@ -232,13 +237,51 @@ describe("one-step MCP enable and exact revoke", () => {
       expect(logs).toContain(`proxy: oauth protocol-read name=${NARROW_PROVIDER} kind=token`);
       expect(logs).not.toContain("live-probe-code");
 
+      // A pinned agent client metadata URL as the client_id is still a read.
+      const metadataLogin = probe(sessionId, `https://${NARROW_IDP_HOST}/oauth/token`, "POST", {
+        headers: FORM,
+        body: `${LOGIN_BODY}&client_id=${encodeURIComponent("https://claude.ai/oauth/claude-code-client-metadata")}`,
+      });
+      expect(admittedToUnresolvableHost(metadataLogin), `the metadata-URL login was not admitted as a protocol read: ${metadataLogin.detail}`).toBe(true);
+
       for (const [label, url, body] of [
         ["another grant", `https://${NARROW_IDP_HOST}/oauth/token`, "grant_type=client_credentials&client_id=x"],
+        ["an unpinned client_id URL", `https://${NARROW_IDP_HOST}/oauth/token`, `${LOGIN_BODY}&client_id=${encodeURIComponent("https://runfree-attacker.invalid/chunk")}`],
         ["another path on the host", `https://${NARROW_IDP_HOST}/.well-known/oauth-authorization-server`, LOGIN_BODY],
         ["an --oauth-host host with no recorded endpoint", `https://${ENABLE_OAUTH_HOST}/oauth/token`, LOGIN_BODY],
       ] as const) {
         const answer = probe(sessionId, url, "POST", { headers: FORM, body });
         expect(answer.blocked, `${label} was not held for write approval: ${answer.detail}`).toMatch(/^write-approval/);
+      }
+    }, TEST_TIMEOUT_MS);
+  });
+
+  describe("the pinned agent binaries", () => {
+    let standing: StandingSessionHandle;
+    let sessionId: string;
+
+    beforeAll(async () => {
+      standing = await startStandingSession(fixture);
+      sessionId = standing.session.containerId;
+    }, PROVISION_TIMEOUT_MS);
+
+    afterAll(async () => {
+      if (standing) await standing.release();
+    }, PROVISION_TIMEOUT_MS);
+
+    // The proxy treats a URL client_id as a protocol read only on exact match
+    // with CLIENT_ID_METADATA_URLS. A vendor URL change in an agent-tools bump
+    // would silently send every login to write approval; this fails instead.
+    test("carry exactly the client metadata URLs the proxy accepts", () => {
+      const binaries: Record<string, string> = {
+        "https://claude.ai/oauth/claude-code-client-metadata": "/opt/runfree-agent-tools/node_modules/@anthropic-ai/claude-code-linux-*/claude",
+        "https://chatgpt.com/oauth/codex/client.json": "/opt/runfree-agent-tools/node_modules/@openai/codex-linux-*/vendor/*/bin/codex",
+      };
+      expect(Object.keys(binaries).sort()).toEqual([...CLIENT_ID_METADATA_URLS].sort());
+      for (const [url, pattern] of Object.entries(binaries)) {
+        // POSIX sh: an unmatched glob stays literal instead of aborting as in zsh.
+        const found = docker(["exec", sessionId, "sh", "-c", `for f in ${pattern}; do [ -f "$f" ] && grep -aFq '${url}' "$f" && exit 0; done; exit 1`]);
+        expect(found.status, `${url} not found in ${pattern}: ${describeOutput(found.output)}`).toBe(0);
       }
     }, TEST_TIMEOUT_MS);
   });

@@ -460,7 +460,10 @@ export async function mcpEnableIntent(input: McpEnableInput, deps: McpEnableDeps
   if (hosts.some((host) => host.origin === "user")) {
     console.log("  --oauth-host hosts are allowed as given (like runfree host add); the proxy mediates tokens there only for endpoints the server's metadata names");
   }
-  if (hosts.length > 0) console.log("  OAuth token requests follow this project's write approval setting (default: ask)");
+  if (hosts.length > 0) {
+    console.log("  OAuth login, refresh, and client registration at the mediated endpoints need no write approval;");
+    console.log("  other writes to these hosts follow this project's write approval setting (default: ask)");
+  }
   if (login) console.log(`After saving: OAuth login with: runfree mcp auth ${agent} ${shellWord(serverName)} --source ${entry.source}`);
 
   // 5. The one approval. Without a terminal, the command line named every

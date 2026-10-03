@@ -6,9 +6,11 @@ import { afterEach, beforeEach, describe, expect, test } from "vitest";
 import { validateOAuthMediationPolicy } from "@runfree/runtime-contracts/oauth-mediation-policy";
 import { OAuthMediator } from "./oauth-mediation.ts";
 import {
+  CLIENT_ID_METADATA_URLS,
   plainRequestPath,
   protocolReadBodyAllowed,
   ProtocolReadRateLimiter,
+  unlistedClientIdMetadataUrl,
 } from "./oauth-protocol-read.ts";
 
 const FORM = "application/x-www-form-urlencoded";
@@ -64,6 +66,69 @@ describe("protocolReadBodyAllowed", () => {
     ["a resource indicator for the server itself", `${code}&resource=https%3A%2F%2Fmcp.example.test%2Fmcp`],
   ])("allows %s", (_label, body) => {
     expect(protocolReadBodyAllowed({ resourceHost: "mcp.example.test", kind: "token", bodyText: body, headers: formHeaders(body) })).toBe(true);
+  });
+
+  test("pins exactly the Claude Code and Codex client metadata URLs", () => {
+    expect([...CLIENT_ID_METADATA_URLS].sort()).toEqual([
+      "https://chatgpt.com/oauth/codex/client.json",
+      "https://claude.ai/oauth/claude-code-client-metadata",
+    ]);
+  });
+
+  test.each([...CLIENT_ID_METADATA_URLS].flatMap((url) => [
+    [`an authorization-code grant with client_id ${url}`, code.replace("client_id=c", `client_id=${encodeURIComponent(url)}`)],
+    [`a refresh grant with client_id ${url}`, refresh.replace("client_id=c", `client_id=${encodeURIComponent(url)}`)],
+  ]))("allows %s", (_label, body) => {
+    expect(protocolReadBodyAllowed({ resourceHost: "mcp.example.test", kind: "token", bodyText: body, headers: formHeaders(body) })).toBe(true);
+  });
+
+  const claudeUrl = "https://claude.ai/oauth/claude-code-client-metadata";
+  const withClientId = (value: string) => code.replace("client_id=c", `client_id=${encodeURIComponent(value)}`);
+  test.each([
+    ["an attacker URL", "https://evil.example/x"],
+    ["another path on a vendor host", "https://claude.ai/share/attacker-chunk"],
+    ["the other vendor's host with this path", "https://chatgpt.com/oauth/claude-code-client-metadata"],
+    ["a query", `${claudeUrl}?d=exfil`],
+    ["an empty query", `${claudeUrl}?`],
+    ["a fragment", `${claudeUrl}#x`],
+    ["a trailing slash", `${claudeUrl}/`],
+    ["a path suffix", `${claudeUrl}/exfil`],
+    ["upper case", claudeUrl.toUpperCase()],
+    ["a mixed-case host", "https://Claude.ai/oauth/claude-code-client-metadata"],
+    ["an encoded slash", "https://claude.ai/oauth%2Fclaude-code-client-metadata"],
+    ["an explicit port", "https://claude.ai:443/oauth/claude-code-client-metadata"],
+    ["plain http", "http://claude.ai/oauth/claude-code-client-metadata"],
+    ["userinfo", "https://user@claude.ai/oauth/claude-code-client-metadata"],
+    ["a trailing-dot host", "https://claude.ai./oauth/claude-code-client-metadata"],
+    ["surrounding whitespace", ` ${claudeUrl}`],
+  ])("refuses a pinned metadata URL variant: %s", (_label, value) => {
+    const body = withClientId(value);
+    expect(protocolReadBodyAllowed({ resourceHost: "mcp.example.test", kind: "token", bodyText: body, headers: formHeaders(body) })).toBe(false);
+  });
+
+  test("refuses a pinned metadata URL repeated beside another client_id", () => {
+    for (const body of [
+      `${withClientId(claudeUrl)}&client_id=${encodeURIComponent("https://evil.example/x")}`,
+      `client_id=${encodeURIComponent("https://evil.example/x")}&${withClientId(claudeUrl)}`,
+    ]) {
+      expect(protocolReadBodyAllowed({ resourceHost: "mcp.example.test", kind: "token", bodyText: body, headers: formHeaders(body) })).toBe(false);
+    }
+  });
+
+  test.each([
+    ["a non-loopback redirect", withClientId(claudeUrl).replace("http%3A%2F%2Flocalhost%3A33418%2Fcallback", "https%3A%2F%2Fevil.example%2Fcb")],
+    ["a resource on another host", `${withClientId(claudeUrl)}&resource=https%3A%2F%2Fevil.example%2Fmcp`],
+    ["a client-credentials grant", withClientId(claudeUrl).replace("grant_type=authorization_code", "grant_type=client_credentials")],
+    ["an unknown field", `${withClientId(claudeUrl)}&data=exfil`],
+  ])("a pinned metadata URL does not relax the other checks: refuses %s", (_label, body) => {
+    expect(protocolReadBodyAllowed({ resourceHost: "mcp.example.test", kind: "token", bodyText: body, headers: formHeaders(body) })).toBe(false);
+  });
+
+  test("names an unlisted metadata URL for the denial, and nothing else", () => {
+    expect(unlistedClientIdMetadataUrl(withClientId("https://evil.example/x"))).toBe(true);
+    expect(unlistedClientIdMetadataUrl(withClientId(claudeUrl))).toBe(false);
+    expect(unlistedClientIdMetadataUrl(code)).toBe(false);
+    expect(unlistedClientIdMetadataUrl("grant_type=authorization_code&code=abc")).toBe(false);
   });
 
   test("allows a media-type parameter", () => {
