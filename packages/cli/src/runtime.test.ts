@@ -2187,6 +2187,55 @@ describe("runtime recovery", () => {
     return snapshot;
   }
 
+  // No host Git: `git --version` cannot spawn.
+  function missingHostGitCapture(command: string, args: string[]) {
+    if (command !== "git") return undefined;
+    return captureResult(127, "", "spawnSync git ENOENT");
+  }
+
+  test("up without host Git refuses a real Git repository before any state write", async () => {
+    const projectRoot = path.join(tmp, "project");
+    fs.mkdirSync(projectRoot);
+    const gitEnv = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" };
+    expect(childProcess.spawnSync("git", ["init", "-q", projectRoot], { env: gitEnv }).status).toBe(0);
+    const project = prepareProject(projectRoot);
+    const runtimeRoot = path.join(tmp, "runtime");
+    const watched = [project.paths.stateDir, project.paths.runfreeDir, runtimeRoot, path.join(projectRoot, ".git")];
+    const before = stateSnapshot(watched);
+    const io = createRuntimeIO({ capture: missingHostGitCapture });
+    // Git config reads in classification spawn git directly; make them fail too.
+    vi.stubEnv("PATH", "");
+    try {
+      await expect(up({
+        projectRoot, project, runtimeRoot, env: { PATH: "" }, network: fixedNetwork,
+      }, io, false, {})).rejects.toThrow("host Git not found: Runfree needs Git to check this repository's worktree layout; install Git 2.48 or newer");
+    } finally {
+      vi.unstubAllEnvs();
+    }
+    expect(stateSnapshot(watched)).toEqual(before);
+    expect(fs.existsSync(project.paths.gitConfigPath)).toBe(false);
+    expect(io.calls.filter((call) => call.command === "docker")).toEqual([]);
+    expect(io.calls.filter((call) => call.method === "admin")).toEqual([]);
+    flushWarnings();
+  });
+
+  test("up without host Git launches a non-Git project with exactly the not-found warning", async () => {
+    const projectRoot = path.join(tmp, "project");
+    fs.mkdirSync(projectRoot);
+    const project = prepareProject(projectRoot);
+    const io = createRuntimeIO({ capture: missingHostGitCapture });
+    flushWarnings();
+    const status = await up({
+      projectRoot, project, runtimeRoot: path.join(tmp, "runtime"), env: { PATH: "/fake-bin" }, network: fixedNetwork,
+    }, io, false, {});
+    expect(status).toBe(0);
+    const warned = pendingWarningsForTest().map((event) => event.message).filter((message) => message.includes("host Git"));
+    flushWarnings();
+    expect(warned).toEqual([
+      "host Git not found: Git worktrees created inside the sandbox will make this repository unreadable to host Git older than 2.48; install Git 2.48 or newer",
+    ]);
+  });
+
   test.each(["allocated", "fixed"])("up from a linked worktree on old host Git refuses before any state write (network %s)", async (networkMode) => {
     const projectRoot = path.join(tmp, "main", ".worktrees", "feature");
     prepareRelativeLinkedWorktree(projectRoot);

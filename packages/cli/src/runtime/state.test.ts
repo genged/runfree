@@ -289,27 +289,36 @@ test("a launch-supplied capability result is used without probing again", () => 
   expect(fs.existsSync(context.project.paths.gitConfigPath)).toBe(true);
 });
 
-test.each([
-  {
-    kind: "missing host Git",
-    hostGit: { supported: false, version: "unknown", found: false },
-    relativeWorktrees: false,
-    expected: "host Git not found: Git worktrees created inside the sandbox will make this repository unreadable to host Git older than 2.48; install Git 2.48 or newer",
-  },
-  {
-    kind: "old host Git on a repository that already uses relative worktree links",
-    hostGit: { supported: false, version: "2.43.0", found: true },
-    relativeWorktrees: true,
-    expected: "host Git 2.43.0 is older than 2.48 and cannot read this repository, which uses relative worktree links; upgrade host Git (Ubuntu: sudo add-apt-repository ppa:git-core/ppa && sudo apt install git)",
-  },
-])("$kind gets exactly one launch warning naming its case", ({ hostGit, relativeWorktrees, expected }) => {
+test("missing host Git on a non-Git project probes a genuinely failing git spawn and gets exactly the not-found warning", () => {
+  const projectRoot = path.join(tmp, "project");
+  fs.mkdirSync(projectRoot);
+  // A real spawn with an empty PATH: `git` cannot be found, as on a host
+  // without Git. No capability is supplied, so the real probe runs.
+  const context = { projectRoot, project: projectInfo(projectRoot), runtimeRoot: "/runtime", env: { PATH: "" } } as RuntimeContext;
+  const io = {
+    run: () => 0,
+    capture: (command, args, options) => {
+      const result = childProcess.spawnSync(command, args, { ...options, encoding: "utf8" });
+      return { status: result.error ? 127 : result.status ?? 1, stdout: result.stdout ?? "", stderr: result.stderr ?? "" };
+    },
+    commandExists: () => true,
+    confirm: () => true,
+    admin: async () => 0,
+  } satisfies RuntimeIO;
+  flushWarnings();
+  ensureSandboxGitConfig(context, io);
+  expect(pendingWarningsForTest().map((event) => event.message)).toEqual([
+    "host Git not found: Git worktrees created inside the sandbox will make this repository unreadable to host Git older than 2.48; install Git 2.48 or newer",
+  ]);
+  expect(fs.readFileSync(context.project.paths.gitConfigPath, "utf8")).toContain("useRelativePaths = true");
+});
+
+test("old host Git on a repository that already uses relative worktree links gets exactly the already-unreadable warning", () => {
   const projectRoot = path.join(tmp, "project");
   fs.mkdirSync(projectRoot);
   const gitEnv = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" };
   expect(childProcess.spawnSync("git", ["init", "-q", projectRoot], { env: gitEnv }).status).toBe(0);
-  if (relativeWorktrees) {
-    expect(childProcess.spawnSync("git", ["-C", projectRoot, "config", "extensions.relativeWorktrees", "true"], { env: gitEnv }).status).toBe(0);
-  }
+  expect(childProcess.spawnSync("git", ["-C", projectRoot, "config", "extensions.relativeWorktrees", "true"], { env: gitEnv }).status).toBe(0);
   const context = { projectRoot, project: projectInfo(projectRoot), runtimeRoot: "/runtime" } as RuntimeContext;
   const io = {
     run: () => 0,
@@ -319,8 +328,10 @@ test.each([
     admin: async () => 0,
   } satisfies RuntimeIO;
   flushWarnings();
-  ensureSandboxGitConfig(context, io, hostGit);
-  expect(pendingWarningsForTest().map((event) => event.message)).toEqual([expected]);
+  ensureSandboxGitConfig(context, io, { supported: false, version: "2.43.0", found: true });
+  expect(pendingWarningsForTest().map((event) => event.message)).toEqual([
+    "host Git 2.43.0 is older than 2.48 and cannot read this repository, which uses relative worktree links; upgrade host Git (Ubuntu: sudo add-apt-repository ppa:git-core/ppa && sudo apt install git)",
+  ]);
   expect(fs.readFileSync(context.project.paths.gitConfigPath, "utf8")).toContain("useRelativePaths = true");
 });
 

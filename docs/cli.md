@@ -555,12 +555,18 @@ cannot read the repository, so the warning says so instead:
 
 `host Git <version> is older than 2.48 and cannot read this repository, which uses relative worktree links; upgrade host Git (Ubuntu: sudo add-apt-repository ppa:git-core/ppa && sudo apt install git)`
 
-When `git --version` fails, for example because Git is not installed, launch
-continues with this warning instead:
+When `git --version` fails, for example because Git is not installed,
+launching a non-Git project continues with this warning instead:
 
 `host Git not found: Git worktrees created inside the sandbox will make this repository unreadable to host Git older than 2.48; install Git 2.48 or newer`
 
 Each launch prints at most one of these three warnings.
+
+Runfree reads a Git repository's config through Git to check its worktree
+layout. So when `git --version` fails and the project has a `.git` entry,
+launch refuses before writing any state:
+
+`host Git not found: Runfree needs Git to check this repository's worktree layout; install Git 2.48 or newer`
 
 When launched from the main checkout, Runfree also checks registered nested
 worktrees before starting the runtime. An unsupported layout — absolute
@@ -582,8 +588,10 @@ Host-only worktrees outside the mounted project are outside this check.
 
 Commands that write checkout-local policy, such as `runfree init`, refuse
 with the same linked-worktree message on older host Git when run from a
-linked worktree. The refusal comes before Runfree asks Git whether that
-policy file is tracked, and before it writes the Git exclude file.
+linked worktree. Without host Git, they refuse in any Git repository with
+the missing-Git message above. Both refusals come before Runfree asks Git
+whether that policy file is tracked, and before it writes the Git exclude
+file.
 
 Revalidating a running runtime (a launch that reuses it, or a proxy restart)
 and dependency overlay planning can find a Git layout that became unsupported

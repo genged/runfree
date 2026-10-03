@@ -3,7 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { afterEach, beforeEach, describe, expect, test } from "vitest";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
 import type { RuntimeIO } from "../runtime/types.ts";
 import { ensureCheckoutLocalPolicyExcluded, LOCAL_POLICY_EXCLUDE_PATTERN } from "./git-exclude.ts";
@@ -146,6 +146,34 @@ describe("checkout-local Git exclusion", () => {
       expect(ensureCheckoutLocalPolicyExcluded(worktree, newGit)).toBe("written");
       expect(captured.some((args) => args.includes("ls-files"))).toBe(true);
       expect(fs.readFileSync(path.join(root, ".git", "info", "exclude"), "utf8").split(/\r?\n/)).toContain(LOCAL_POLICY_EXCLUDE_PATTERN);
+    });
+
+    test("missing host Git in a real repository names the missing Git instead of the nested-worktree text, before git ls-files", () => {
+      const excludePath = initGit();
+      const originalExclude = fs.readFileSync(excludePath, "utf8");
+      const captured: string[][] = [];
+      // Every git spawn really fails: the probe's through the env passed in,
+      // classification's config read through the process env.
+      vi.stubEnv("PATH", "");
+      let message = "";
+      try {
+        const noGit: RuntimeIO = {
+          ...io,
+          capture: (commandName, args, options) => {
+            captured.push(args);
+            const result = childProcess.spawnSync(commandName, args, { ...options, encoding: "utf8" });
+            return { status: result.error ? 127 : result.status ?? 1, stdout: result.stdout ?? "", stderr: result.stderr ?? "" };
+          },
+        };
+        ensureCheckoutLocalPolicyExcluded(root, noGit, { PATH: "" });
+      } catch (error) {
+        message = error instanceof Error ? error.message : String(error);
+      } finally {
+        vi.unstubAllEnvs();
+      }
+      expect(message).toBe("host Git not found: Runfree needs Git to check this repository's worktree layout; install Git 2.48 or newer");
+      expect(captured.some((args) => args.includes("ls-files"))).toBe(false);
+      expect(fs.readFileSync(excludePath, "utf8")).toBe(originalExclude);
     });
 
     test("a valid checkout never probes host Git", () => {

@@ -479,6 +479,9 @@ export function formatGitRepositoryShapeError(
     `  ${shape.reason}`,
     "",
   ];
+  // Without host Git, classification itself could not run Git (the reason is
+  // a spawn failure), so the only accurate message is the missing Git.
+  if (hostGit && !hostGit.found) return hostGitNotFoundRefusal();
   // Every repair command needs `--relative-paths`, so on an older host Git the
   // only accurate next step is the version requirement itself. A shape found
   // from the main checkout (a nested worktree problem) cannot be fixed by
@@ -537,7 +540,16 @@ export function prepareGitRepositoryLayoutResult(
   const shape = classifyGitRepository(context.projectRoot);
   if (hostGit) refuseShapeUnusableByHostGit(shape, hostGit);
   if (shape.kind === "fatal") {
-    die(formatGitRepositoryShapeError(shape, hostGit ?? (lazyProbeIO ? probeHostGitRelativeWorktrees(context, lazyProbeIO) : undefined)));
+    let probed: HostGitRelativeWorktreesCapability | undefined;
+    if (!hostGit && lazyProbeIO) {
+      try {
+        probed = probeHostGitRelativeWorktrees(context, lazyProbeIO);
+      } catch {
+        // A failed probe must not hide the layout reason: keep the default text.
+        probed = undefined;
+      }
+    }
+    die(formatGitRepositoryShapeError(shape, hostGit ?? probed));
   }
   const plan = gitLayoutPlanForShape(context.projectRoot, shape);
   const serialized = serializeGitLayoutPlan(plan);
@@ -613,6 +625,14 @@ export function hostGitRelativeWorktreesDegradedWarning(version: string): string
 
 export function hostGitRelativeWorktreesAlreadyUnreadableWarning(version: string): string {
   return `host Git ${version} is older than ${MIN_HOST_GIT_RELATIVE_WORKTREES_VERSION} and cannot read this repository, which uses relative worktree links; upgrade host Git (Ubuntu: ${HOST_GIT_UBUNTU_UPGRADE})`;
+}
+
+// Classifying a Git repository's worktree layout reads its Git config through
+// Git, so a Git project cannot be checked, and must not be launched, without
+// host Git. A non-Git project needs no such check and launches with the warning
+// below.
+export function hostGitNotFoundRefusal(): string {
+  return `host Git not found: Runfree needs Git to check this repository's worktree layout; install Git ${MIN_HOST_GIT_RELATIVE_WORKTREES_VERSION} or newer`;
 }
 
 export function hostGitNotFoundWarning(): string {
@@ -694,6 +714,7 @@ export function printHostGitStatusLine(context: Pick<RuntimeContext, "env">, io:
 
 function refuseShapeUnusableByHostGit(shape: GitRepositoryShape, hostGit: HostGitRelativeWorktreesCapability): void {
   if (hostGit.supported) return;
+  if (!hostGit.found && shape.kind !== "none") die(hostGitNotFoundRefusal());
   if (shape.kind === "fatal") die(formatGitRepositoryShapeError(shape, hostGit));
   // A relative-linked worktree carries extensions.relativeWorktrees, which
   // host Git without relative-link support cannot read.
@@ -705,6 +726,9 @@ function refuseShapeUnusableByHostGit(shape: GitRepositoryShape, hostGit: HostGi
 // the capability is missing, so a supported host pays nothing extra.
 export function refuseGitLayoutUnusableByHostGit(projectRoot: string, hostGit: HostGitRelativeWorktreesCapability): void {
   if (hostGit.supported) return;
+  // Without host Git, classification cannot read Git config and would report
+  // a spawn failure as a broken layout; refuse on any `.git` entry first.
+  if (!hostGit.found && lstatExisting(path.join(projectRoot, ".git"))) die(hostGitNotFoundRefusal());
   refuseShapeUnusableByHostGit(classifyGitRepository(projectRoot), hostGit);
 }
 

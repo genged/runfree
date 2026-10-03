@@ -4,6 +4,7 @@ import path from "node:path";
 import {
   classifyGitRepository,
   formatGitRepositoryShapeError,
+  hostGitNotFoundRefusal,
   hostGitRelativeWorktreesLaunchRefusal,
   probeHostGitRelativeWorktrees,
 } from "../runtime/git-layout.ts";
@@ -123,8 +124,11 @@ export function ensureCheckoutLocalPolicyExcluded(
   if (shape.kind === "relative-linked") {
     // A relative-linked worktree carries extensions.relativeWorktrees, which
     // old host Git cannot read, so `git ls-files` below would fail with an
-    // unexplained error. Name the version requirement before running it.
+    // unexplained error. Only a probe can tell old from supported Git, so it
+    // runs here on every relative-linked worktree, supported Git included, to
+    // name the requirement before `git ls-files` runs.
     const hostGit = probeHostGitRelativeWorktrees({ env: env ?? process.env }, io);
+    if (!hostGit.found) throw new Error(hostGitNotFoundRefusal());
     if (!hostGit.supported) throw new Error(hostGitRelativeWorktreesLaunchRefusal(hostGit.version));
   }
 
