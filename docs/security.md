@@ -339,14 +339,6 @@ Details: [Write Approval Grants](architecture.md#write-approval-grants).
    serve the session file. The record goes only after Docker proves the
    container absent. Anything Docker cannot prove keeps the record and refuses
    with the reason and its remedy.
-6. The Docker Engine API transport contacts only the daemon the Docker CLI
-   would contact, over a local Unix socket, and only with the fixed read and
-   exec requests its routes build. No argv value, project file, or agent
-   output selects the socket, the method, or the endpoint. An answer it
-   cannot give exactly as the CLI would goes to the CLI, and a started exec
-   is never re-run. It is on by default; `RUNFREE_DOCKER_TRANSPORT=cli`
-   keeps every call on the Docker CLI. See
-   [Docker Access](architecture.md#docker-access).
 
 ## What Runfree Does Not Prove
 

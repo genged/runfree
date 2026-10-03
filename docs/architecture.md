@@ -159,66 +159,14 @@ Command modules under `packages/cli/src/commands/` build typed intents. Shared e
 
 #### Docker Access
 
-Runtime code issues Docker operations as `docker` argv through one
-`capture` function (`packages/cli/src/runtime.ts`). A fixed allowlist of hot
-argv shapes is answered over the Docker Engine API Unix socket instead of by
-spawning the Docker CLI (`packages/cli/src/runtime/docker-api/`). The answer
-has the same status, stdout, and stderr bytes the CLI would print, so every
-caller, budget wrapper, operation histogram, and test fake still sees the
-argv and reads the same output.
-
-```text
-caller -> budget wrapper -> histogram -> capture(argv)
-                                            |
-                        routed argv shape? --no--> spawnSync docker
-                                            | yes
-                calling thread waits (Atomics.wait, the call's budget)
-                                            |
-                   worker thread: one HTTP request on the Unix socket
-                                            |
-                 CLI-identical CaptureResult {status, stdout, stderr}
-```
-
-- **Routes.** Raw `container inspect` / `inspect` / `image inspect` /
-  `network inspect` / `volume inspect`, the `{{.Id}}` and
-  `{{.State.Running}}` inspect templates, quiet `ps` with `label`, `name`,
-  `id`, and `network` filters, and non-TTY `exec [--user uid:gid] [-i]
-  <64-hex id> cmd…`. Matching is exact per token; an object reference must
-  match a strict character set, so no argv value can add a path segment or a
-  query parameter. Everything else (`compose`, `run`, `create`, `start`,
-  `rm`, other flags or templates) stays on the CLI.
-- **Endpoint.** Resolved on every call from the call's environment and the
-  user's Docker config exactly as the CLI resolves it (`DOCKER_HOST`,
-  `DOCKER_CONTEXT`, `currentContext`, context metadata;
-  `packages/cli/src/runtime/docker-endpoint.ts`). Only a local Unix socket
-  is used; TCP, SSH, TLS, both overrides set, custom config headers, or an
-  unreadable config keep the call on the CLI.
-- **Binding.** Once per process for each Docker CLI binary, socket file,
-  and context, the transport runs `docker version` with the call's
-  environment and requires the CLI's context and its view of the server
-  (version, API range, commit, OS, architecture, kernel, build time) to
-  match what the socket's daemon reports, and the daemon to say Docker in
-  `/_ping`. It then speaks the API version the CLI negotiated, so the daemon
-  shapes every body as it would for the CLI. A mismatch keeps the process on
-  the CLI. A replaced `docker` binary or a re-created or re-pointed socket
-  binds again. Type-less `inspect` is answered only while swarm is inactive.
-- **On by default.** The transport runs when `RUNFREE_DOCKER_TRANSPORT` is
-  unset, empty, or `api`. `cli` is the kill switch, and any other value also
-  keeps every call on the Docker CLI.
-- **Doubt stays on the CLI.** A `docker` on `PATH` that is not a native
-  binary (a shim or a test fake), `RUNFREE_TEST_FAKE_DOCKER=1`, an
-  unexpected spawn option, a refused connection, a missing object, or any
-  daemon refusal before an exec starts: the CLI answers, with the remaining
-  budget.
-- **Failures.** A routed call ends at its budget with status 124
-  (`timedOut`); there is no child process that could ignore SIGTERM. A call
-  with no budget ends at 60 s; Ctrl-C during a stuck routed call waits for
-  that bound, because the waiting thread cannot run a signal handler. A
-  socket error after connecting, an output over `maxBuffer`, or a lost
-  worker thread is status 125 (the last also sends the rest of the process
-  to the CLI). Once an exec has started, no failure hands it to the CLI, so
-  a command never runs twice: a refused start is the CLI's status 1, and an
-  exec whose exit code the daemon never records is 124 at the budget.
+Runtime code issues every Docker operation by running the Docker CLI
+(`docker …`) through the runtime's `run` and `capture` functions
+(`packages/cli/src/runtime.ts`); interactive session starts and re-attaches
+spawn `docker container start --attach` and `docker container attach`
+directly. Runfree does not open the Docker socket itself, so the daemon it
+reaches is always the one the user's `docker` command reaches: the same
+`DOCKER_HOST`, Docker context, and credential helpers. Compose, BuildKit
+builds, and TTY attach come from the CLI unchanged.
 
 ### Agent Container
 
