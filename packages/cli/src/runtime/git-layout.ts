@@ -607,6 +607,24 @@ export function probeHostGitRelativeWorktrees(context: Pick<RuntimeContext, "env
   }
 }
 
+export function formatHostGitStatusLine(hostGit: HostGitRelativeWorktreesCapability): string {
+  return `host git: ${hostGit.version} (worktrees: ${hostGit.supported ? "enabled" : "disabled"})`;
+}
+
+// Best-effort `runfree status` line: host Git capability is a host fact the
+// operator needs regardless of whether the runtime itself is running, so it
+// is probed and printed unconditionally. A probe failure must never change
+// the status command's exit code (probeHostGitRelativeWorktrees itself
+// already fails closed to `{ supported: false, version: "unknown" }`; the
+// try/catch only guards against the unexpected).
+export function printHostGitStatusLine(context: Pick<RuntimeContext, "env">, io: RuntimeIO): void {
+  try {
+    console.log(formatHostGitStatusLine(probeHostGitRelativeWorktrees(context, io)));
+  } catch {
+    // Status stays useful even when Git cannot be probed.
+  }
+}
+
 function refuseShapeUnusableByHostGit(shape: GitRepositoryShape, hostGit: HostGitRelativeWorktreesCapability): void {
   if (hostGit.supported) return;
   if (shape.kind === "fatal") die(formatGitRepositoryShapeError(shape, hostGit));

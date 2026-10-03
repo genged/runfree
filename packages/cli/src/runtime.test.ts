@@ -5200,6 +5200,101 @@ describe("runtime command flow", () => {
     expect(verbose).toContain("session files: unavailable (proxy not running)");
   });
 
+  test("status reports host Git worktree support when host Git is new enough", () => {
+    const projectRoot = path.join(tmp, "project");
+    const project = prepareProject(projectRoot);
+    const context = {
+      projectRoot,
+      project,
+      runtimeRoot: path.join(tmp, "runtime"),
+      env: { PATH: "/fake-bin" },
+      network: fixedNetwork,
+    } satisfies RuntimeContext;
+    const io = createRuntimeIO({
+      capture: (command, args) => {
+        if (command === "docker" && args[0] === "info") return captureResult(0);
+        if (command === "git" && args[0] === "--version") return captureResult(0, "git version 2.49.0\n");
+        if (command === "git" && args[0] === "init") return captureResult(0);
+        if (command === "git" && args[0] === "worktree" && args.at(-1) === "-h") {
+          return captureResult(129, "    --[no-]relative-paths");
+        }
+        return captureResult(0);
+      },
+    });
+
+    expect(statusRuntime(context, io)).toBe(0);
+    const output = vi.mocked(console.log).mock.calls.map((call) => call.join(" ")).join("\n");
+    expect(output).toContain("host git: 2.49.0 (worktrees: enabled)");
+
+    vi.mocked(console.log).mockClear();
+    expect(statusRuntime(context, io, { verbose: true })).toBe(0);
+    const verbose = vi.mocked(console.log).mock.calls.map((call) => call.join(" ")).join("\n");
+    expect(verbose).toContain("host git: 2.49.0 (worktrees: enabled)");
+  });
+
+  test("status reports host Git worktree support as disabled on old host Git", () => {
+    const projectRoot = path.join(tmp, "project");
+    const project = prepareProject(projectRoot);
+    const context = {
+      projectRoot,
+      project,
+      runtimeRoot: path.join(tmp, "runtime"),
+      env: { PATH: "/fake-bin" },
+      network: fixedNetwork,
+    } satisfies RuntimeContext;
+    const io = createRuntimeIO({
+      capture: (command, args) => {
+        if (command === "docker" && args[0] === "info") return captureResult(0);
+        if (command === "git" && args[0] === "--version") return captureResult(0, "git version 2.43.0\n");
+        if (command === "git" && args[0] === "init") return captureResult(0);
+        if (command === "git" && args[0] === "worktree" && args.at(-1) === "-h") {
+          return captureResult(129, "usage: git worktree repair [<path>...]");
+        }
+        return captureResult(0);
+      },
+    });
+
+    expect(statusRuntime(context, io)).toBe(0);
+    const output = vi.mocked(console.log).mock.calls.map((call) => call.join(" ")).join("\n");
+    expect(output).toContain("host git: 2.43.0 (worktrees: disabled)");
+
+    vi.mocked(console.log).mockClear();
+    expect(statusRuntime(context, io, { verbose: true })).toBe(0);
+    const verbose = vi.mocked(console.log).mock.calls.map((call) => call.join(" ")).join("\n");
+    expect(verbose).toContain("host git: 2.43.0 (worktrees: disabled)");
+  });
+
+  test("a host Git probe failure drops the host git status line without changing the exit code or breaking other status lines", () => {
+    const projectRoot = path.join(tmp, "project");
+    const project = prepareProject(projectRoot);
+    const context = {
+      projectRoot,
+      project,
+      runtimeRoot: path.join(tmp, "runtime"),
+      env: { PATH: "/fake-bin" },
+      network: fixedNetwork,
+    } satisfies RuntimeContext;
+    publishMaterializedRuntimeGenerationV1(context, {});
+    const io = createRuntimeIO({
+      capture: (command, args) => {
+        if (command === "docker" && args[0] === "info") return captureResult(0);
+        // "git --version" is unique to the host Git capability probe; other
+        // Git calls (overlay discovery's `git ls-files`, etc.) must keep
+        // working so a probe failure proves isolated to its own status line.
+        if (command === "git" && args[0] === "--version") throw new Error("git probe exploded");
+        return captureResult(0);
+      },
+    });
+
+    expect(statusRuntime(context, io)).toBe(0);
+    const output = vi.mocked(console.log).mock.calls.map((call) => call.join(" ")).join("\n");
+    expect(output).not.toContain("host git:");
+    // The rest of status still reports: a probe failure is isolated to its
+    // own best-effort line.
+    expect(output).toContain("next safe action: start the v2 runtime");
+    expect(output).toContain("session files: unavailable (proxy not running)");
+  });
+
   test("status surfaces open ingress forwarders", () => {
     const projectRoot = path.join(tmp, "project");
     const project = prepareProject(projectRoot);
