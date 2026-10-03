@@ -53,7 +53,7 @@ import {
   reproveRecordedCandidateControlPlaneV2,
 } from "./control-plane-effective-proof.ts";
 import { composeProjectName } from "./env.ts";
-import { prepareGitRepositoryLayoutResult, serializeGitLayoutPlan } from "./git-layout.ts";
+import { prepareGitRepositoryLayoutResult, probeHostGitRelativeWorktrees, serializeGitLayoutPlan } from "./git-layout.ts";
 import {
   cleanupRunfreeImages,
   ensureRuntimeMaterialized,
@@ -1199,7 +1199,10 @@ export async function startRuntime(
     reportRuntimeVerbose(verbose,
       `using runtime network ${initialPlan.network.subnet}, proxy egress ${initialPlan.network.proxyEgressSubnet}`);
 
-    const gitLayout = prepareGitRepositoryLayoutResult(initialContext);
+    // Probe host Git once per launch: the layout refuses shapes old Git cannot
+    // use, and the sandbox Git config warns when it falls back to degraded mode.
+    const hostGit = probeHostGitRelativeWorktrees(initialContext, io);
+    const gitLayout = prepareGitRepositoryLayoutResult(initialContext, hostGit);
     const gitPreparedPlan: RuntimePlan = {
       ...initialPlan,
       gitLayout: gitLayout.plan,
@@ -1214,7 +1217,7 @@ export async function startRuntime(
     assertSafeRuntimePolicyPath(gitPreparedContext);
     ensureAgentState(gitPreparedContext);
     writeProjectRecoveryPointer(gitPreparedContext);
-    ensureSandboxGitConfig(gitPreparedContext, io);
+    ensureSandboxGitConfig(gitPreparedContext, io, hostGit);
     const dependencyPlan: PreparedDependencyOverlayPlan = prepareDependencyOverlayPlanResult(gitPreparedContext, io);
     // Supply the freshly discovered overlays before the plan is built, not
     // after. Compose output, the topology digest, the session container

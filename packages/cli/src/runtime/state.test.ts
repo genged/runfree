@@ -11,7 +11,7 @@ import { BASE_AGENT_ENVIRONMENT } from "./agent-env.ts";
 import { mcpOAuthCallbackPort } from "./mcp.ts";
 import { ensureSandboxGitConfig, ensureAgentState, runtimeValidationMarkerStatus } from "./state.ts";
 import type { RuntimeContext, RuntimeIO } from "./types.ts";
-import { flushWarnings } from "../warnings.ts";
+import { flushWarnings, pendingWarningsForTest } from "../warnings.ts";
 import { createRuntimeComponentState, sha256Digest } from "./component-state.ts";
 import {
   createControlPlaneGenerationV2,
@@ -228,21 +228,64 @@ test.each([true, false])("generated Git config creates portable worktrees, ident
   expect(worktrees.stdout).not.toContain("prunable");
 });
 
-test("unsupported host Git refuses the sandbox default before writing config, then recovers after an upgrade", () => {
+test.each(["normal repository", "non-Git project"])("old host Git writes the same sandbox config with one versioned warning for a %s, and drops it after an upgrade", (kind) => {
   const projectRoot = path.join(tmp, "project");
+  fs.mkdirSync(projectRoot);
+  if (kind === "normal repository") {
+    expect(childProcess.spawnSync("git", ["init", "-q", projectRoot], { env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" } }).status).toBe(0);
+  }
   const context = { projectRoot, project: projectInfo(projectRoot), runtimeRoot: "/runtime" } as RuntimeContext;
   let supportsRelativeLinks = false;
   const io = {
     run: () => 0,
-    capture: (_command, args) => args[0] === "init" ? ({ status: 0, stdout: "", stderr: "" }) : ({ status: 129, stdout: supportsRelativeLinks ? "--relative-paths" : "usage: git worktree", stderr: "" }),
+    capture: (_command, args) => args[0] === "--version"
+      ? ({ status: 0, stdout: "git version 2.43.0\n", stderr: "" })
+      : args[0] === "init"
+        ? ({ status: 0, stdout: "", stderr: "" })
+        : args[0] === "worktree"
+          ? ({ status: 129, stdout: supportsRelativeLinks ? "--relative-paths" : "usage: git worktree", stderr: "" })
+          : ({ status: 1, stdout: "", stderr: "" }),
     commandExists: () => true,
     confirm: () => true,
     admin: async () => 0,
   } satisfies RuntimeIO;
-  expect(() => ensureSandboxGitConfig(context, io)).toThrow("host Git does not support relative worktree links");
-  expect(fs.existsSync(context.project.paths.gitConfigPath)).toBe(false);
-  supportsRelativeLinks = true;
+  flushWarnings();
+
   ensureSandboxGitConfig(context, io);
+  const degraded = fs.readFileSync(context.project.paths.gitConfigPath, "utf8");
+  expect(degraded).toContain("useRelativePaths = true");
+  expect(pendingWarningsForTest().map((event) => event.message)).toEqual([
+    "host Git 2.43.0 is older than 2.48: Git worktrees created inside the sandbox will make this repository unreadable to host Git; upgrade host Git (Ubuntu: sudo add-apt-repository ppa:git-core/ppa && sudo apt install git)",
+  ]);
+  flushWarnings();
+
+  supportsRelativeLinks = true;
+  fs.rmSync(context.project.paths.gitConfigPath);
+  ensureSandboxGitConfig(context, io);
+  expect(pendingWarningsForTest()).toEqual([]);
+  expect(fs.readFileSync(context.project.paths.gitConfigPath, "utf8")).toBe(degraded);
+});
+
+test("a launch-supplied capability result is used without probing again", () => {
+  const projectRoot = path.join(tmp, "project");
+  const context = { projectRoot, project: projectInfo(projectRoot), runtimeRoot: "/runtime" } as RuntimeContext;
+  const captured: string[][] = [];
+  const io = {
+    run: () => 0,
+    capture: (_command, args) => {
+      captured.push(args);
+      return { status: 1, stdout: "", stderr: "" };
+    },
+    commandExists: () => true,
+    confirm: () => true,
+    admin: async () => 0,
+  } satisfies RuntimeIO;
+  flushWarnings();
+  ensureSandboxGitConfig(context, io, { supported: false, version: "2.39.5" });
+  expect(captured.map((args) => args.slice(2, 4))).toEqual([["config", "--get"], ["config", "--get"]]);
+  expect(pendingWarningsForTest().map((event) => event.message)).toEqual([
+    expect.stringContaining("host Git 2.39.5 is older than 2.48"),
+  ]);
   expect(fs.existsSync(context.project.paths.gitConfigPath)).toBe(true);
 });
 

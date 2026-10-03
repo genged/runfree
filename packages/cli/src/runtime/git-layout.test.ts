@@ -3,7 +3,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, test } from "vitest";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { projectInfo } from "../config.ts";
 
 import {
@@ -11,6 +11,7 @@ import {
   classifyGitRepository,
   gitLayoutPlanForShape,
   prepareGitRepositoryLayoutResult,
+  probeHostGitRelativeWorktrees,
   repairWorktreeLinks,
 } from "./git-layout.ts";
 import type { RuntimeContext, RuntimeIO } from "./types.ts";
@@ -82,6 +83,126 @@ test("host capability probing works outside a repository and cleans its disposab
   expect(fs.readdirSync(projectRoot)).toEqual([]);
   expect(probeDirs.size).toBe(1);
   for (const probe of probeDirs) expect(fs.existsSync(probe)).toBe(false);
+  // The real host Git reports a display version alongside the capability.
+  expect(probeHostGitRelativeWorktrees(context, io)).toEqual({ supported: true, version: expect.stringMatching(/^\d+\.\d+/) });
+});
+
+describe("host Git without relative worktree links", () => {
+  const OLD_REFUSAL = "requires host Git >= 2.48 (found 2.43.0); run runfree from the main checkout, or upgrade Git";
+
+  // Simulates host Git by its help text: the capability flips on the same
+  // signal the real probe reads, and every call is recorded.
+  function simulatedHostGit(state: { supported: boolean; version?: string }) {
+    const calls: string[][] = [];
+    const runs: string[][] = [];
+    const io = {
+      capture: (_command, args) => {
+        calls.push(args);
+        if (args[0] === "--version") return { status: 0, stdout: `git version ${state.version ?? "2.43.0"}\n`, stderr: "" };
+        if (args[0] === "init") return { status: 0, stdout: "", stderr: "" };
+        if (args[0] === "worktree") {
+          return { status: 129, stdout: state.supported ? "    --[no-]relative-paths" : "usage: git worktree repair [<path>...]", stderr: "" };
+        }
+        return { status: 1, stdout: "", stderr: "" };
+      },
+      run: (_command, args) => {
+        runs.push(args);
+        return 0;
+      },
+      commandExists: () => true,
+      confirm: () => true,
+      admin: async () => 0,
+    } satisfies RuntimeIO;
+    return { io, calls, runs };
+  }
+
+  function layoutContext(projectRoot: string): RuntimeContext {
+    return { projectRoot, project: { paths: { stateDir: path.join(tmp, "unpublished-state") } } } as RuntimeContext;
+  }
+
+  test("the probe reports unsupported with the parsed version and removes its disposable repository", () => {
+    const { io, calls } = simulatedHostGit({ supported: false });
+    const context = { projectRoot: tmp, env: { GIT_DIR: "/elsewhere" } } as unknown as RuntimeContext;
+    expect(probeHostGitRelativeWorktrees(context, io)).toEqual({ supported: false, version: "2.43.0" });
+    expect(calls.map((args) => args[0])).toEqual(["--version", "init", "worktree"]);
+    const probeDir = calls[1].at(-1) ?? "";
+    expect(probeDir).toContain("runfree-git-probe-");
+    expect(fs.existsSync(probeDir)).toBe(false);
+  });
+
+  test("an unreadable version reads as unknown and never decides the capability", () => {
+    const { io } = simulatedHostGit({ supported: true, version: "unparseable" });
+    expect(probeHostGitRelativeWorktrees({ projectRoot: tmp } as RuntimeContext, io)).toEqual({ supported: true, version: "unknown" });
+  });
+
+  test("a linked worktree launch refuses before the layout plan is published, then proceeds after an upgrade", () => {
+    const { projectRoot } = linkedWorktreeFixture();
+    const context = layoutContext(projectRoot);
+    const state = { supported: false };
+    const { io } = simulatedHostGit(state);
+
+    expect(() => prepareGitRepositoryLayoutResult(context, probeHostGitRelativeWorktrees(context, io))).toThrow(OLD_REFUSAL);
+    expect(fs.existsSync(context.project.paths.stateDir)).toBe(false);
+
+    state.supported = true;
+    expect(prepareGitRepositoryLayoutResult(context, probeHostGitRelativeWorktrees(context, io)).plan.kind).toBe("relative-linked");
+  });
+
+  test("a fatal shape names the version requirement instead of repair commands old Git cannot run", () => {
+    const { projectRoot, gitCommonDir } = linkedWorktreeFixture();
+    const main = path.dirname(gitCommonDir);
+    fs.writeFileSync(path.join(projectRoot, ".git"), `gitdir: ${path.join(gitCommonDir, "worktrees", "feature")}\n`);
+    const { io } = simulatedHostGit({ supported: false });
+    for (const root of [main, projectRoot]) {
+      const context = layoutContext(root);
+      let message = "";
+      try {
+        prepareGitRepositoryLayoutResult(context, probeHostGitRelativeWorktrees(context, io));
+      } catch (error) {
+        message = error instanceof Error ? error.message : String(error);
+      }
+      expect(message).toContain("must be relative");
+      expect(message).toContain(OLD_REFUSAL);
+      expect(message).not.toContain("--relative-paths");
+      expect(message).not.toContain("repair-worktree-links");
+      expect(fs.existsSync(context.project.paths.stateDir)).toBe(false);
+    }
+  });
+
+  test("a normal repository and a non-Git project keep their layout on old host Git", () => {
+    const normal = path.join(tmp, "normal");
+    fs.mkdirSync(path.join(normal, ".git"), { recursive: true });
+    const plain = path.join(tmp, "plain");
+    fs.mkdirSync(plain);
+    const { io } = simulatedHostGit({ supported: false });
+    for (const root of [normal, plain]) {
+      const context = layoutContext(root);
+      expect(prepareGitRepositoryLayoutResult(context, probeHostGitRelativeWorktrees(context, io)).plan.kind).toBe("workspace");
+    }
+  });
+
+  test("repair-worktree-links refuses before running git worktree repair or git config, then repairs after an upgrade", async () => {
+    const { projectRoot, gitCommonDir } = linkedWorktreeFixture();
+    const main = path.dirname(gitCommonDir);
+    const state = { supported: false };
+    const { io, runs } = simulatedHostGit(state);
+    const context = { projectRoot: main } as RuntimeContext;
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    try {
+      await expect(repairWorktreeLinks(context, io)).rejects.toThrow(
+        "repairing worktree links requires host Git >= 2.48 (found 2.43.0); upgrade Git",
+      );
+      expect(runs).toEqual([]);
+      expect(log).not.toHaveBeenCalled();
+
+      state.supported = true;
+      expect(await repairWorktreeLinks(context, io)).toBe(0);
+      expect(runs.map((args) => args.slice(2, 4))).toEqual([["worktree", "repair"], ["config", "--local"]]);
+      expect(runs[0]).toContain(projectRoot);
+    } finally {
+      log.mockRestore();
+    }
+  });
 });
 
 describe("git repository classifier", () => {

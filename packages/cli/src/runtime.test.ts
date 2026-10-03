@@ -2139,22 +2139,49 @@ describe("runtime recovery", () => {
     expect(fs.existsSync(path.join(project.paths.stateDir, "git-layout-plan.json"))).toBe(false);
   });
 
-  test("up refuses unsupported host Git before publishing sandbox config or starting Compose", async () => {
+  // Old host Git lacks `git worktree --relative-paths`; the probe reads that
+  // from the help text and the version only for display.
+  function oldHostGitCapture(command: string, args: string[]) {
+    if (command !== "git") return undefined;
+    if (args[0] === "--version") return captureResult(0, "git version 2.43.0\n");
+    if (args[0] === "worktree") return captureResult(129, "usage: git worktree (old Git)");
+    return undefined;
+  }
+
+  test.each(["plain project", "normal repository"])("up on old host Git launches a %s with one versioned warning and the same sandbox config", async (kind) => {
     const projectRoot = path.join(tmp, "project");
     fs.mkdirSync(projectRoot);
+    if (kind === "normal repository") fs.mkdirSync(path.join(projectRoot, ".git"));
     const project = prepareProject(projectRoot);
-    const io = createRuntimeIO({
-      capture: (command, args) => command === "git" && args[0] === "worktree"
-        ? captureResult(129, "usage: git worktree (old Git)")
-        : undefined,
-    });
-    await expect(up({
+    const io = createRuntimeIO({ capture: oldHostGitCapture });
+    flushWarnings();
+    const status = await up({
       projectRoot, project, runtimeRoot: path.join(tmp, "runtime"), env: { PATH: "/fake-bin" }, network: fixedNetwork,
-    }, io, false, {})).rejects.toThrow("host Git does not support relative worktree links");
-    expect(fs.existsSync(project.paths.gitConfigPath)).toBe(false);
-    expect(io.calls.find((call) => call.method === "run" && call.command === "docker" && call.args.includes("up"))).toBeUndefined();
+    }, io, false, {});
+    expect(status).toBe(0);
+    const warned = pendingWarningsForTest().map((event) => event.message).filter((message) => message.includes("host Git"));
+    flushWarnings();
+    expect(warned).toEqual([
+      "host Git 2.43.0 is older than 2.48: Git worktrees created inside the sandbox will make this repository unreadable to host Git; upgrade host Git (Ubuntu: sudo add-apt-repository ppa:git-core/ppa && sudo apt install git)",
+    ]);
+    expect(fs.readFileSync(project.paths.gitConfigPath, "utf8")).toContain("\tuseRelativePaths = true");
+    // One capability probe per launch.
+    expect(io.calls.filter((call) => call.method === "capture" && call.command === "git" && call.args[0] === "--version")).toHaveLength(1);
   });
 
+  test("up from a linked worktree on old host Git refuses before the layout plan, sandbox config, or Compose", async () => {
+    const projectRoot = path.join(tmp, "main", ".worktrees", "feature");
+    prepareRelativeLinkedWorktree(projectRoot);
+    const project = prepareProject(projectRoot);
+    const io = createRuntimeIO({ capture: oldHostGitCapture });
+    await expect(up({
+      projectRoot, project, runtimeRoot: path.join(tmp, "runtime"), env: { PATH: "/fake-bin" }, network: fixedNetwork,
+    }, io, false, {})).rejects.toThrow("requires host Git >= 2.48 (found 2.43.0); run runfree from the main checkout, or upgrade Git");
+    expect(fs.existsSync(project.paths.gitConfigPath)).toBe(false);
+    expect(fs.existsSync(path.join(project.paths.stateDir, "git-layout-plan.json"))).toBe(false);
+    expect(io.calls.find((call) => call.method === "run" && call.command === "docker" && call.args.includes("up"))).toBeUndefined();
+    flushWarnings();
+  });
 
   // Invariant 3 from the `up` end: every `up` reconciles the proxy's session
   // files, its own records, and its session containers before any launch can

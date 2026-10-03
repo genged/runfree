@@ -463,13 +463,22 @@ export function serializeGitLayoutPlan(plan: RuntimeGitLayoutPlan): string {
   return `${JSON.stringify(plan, null, 2)}\n`;
 }
 
-export function formatGitRepositoryShapeError(shape: Extract<GitRepositoryShape, { kind: "fatal" }>): string {
-  return [
+export function formatGitRepositoryShapeError(
+  shape: Extract<GitRepositoryShape, { kind: "fatal" }>,
+  hostGit?: HostGitRelativeWorktreesCapability,
+): string {
+  const header = [
     "Runfree only supports Git linked worktrees that use relative links.",
     "",
     "This worktree uses unsupported or unsafe Git metadata:",
     `  ${shape.reason}`,
     "",
+  ];
+  // Every repair command needs `--relative-paths`, so on an older host Git the
+  // only accurate next step is the version requirement itself.
+  if (hostGit && !hostGit.supported) return [...header, hostGitRelativeWorktreesLaunchRefusal(hostGit.version)].join("\n");
+  return [
+    ...header,
     "Repair it on the host with:",
     `  ${shape.remediation ?? ""}`,
     "",
@@ -502,9 +511,20 @@ export type PreparedGitRepositoryLayout = {
   shape: GitRepositoryShape;
 };
 
-export function prepareGitRepositoryLayoutResult(context: RuntimeContext): PreparedGitRepositoryLayout {
+// `hostGit` is the launch's single capability probe result. Callers that only
+// re-derive an already admitted layout omit it and keep the classification
+// as-is; a launch passes it so old host Git refuses the shapes it cannot use.
+export function prepareGitRepositoryLayoutResult(
+  context: RuntimeContext,
+  hostGit?: HostGitRelativeWorktreesCapability,
+): PreparedGitRepositoryLayout {
   const shape = classifyGitRepository(context.projectRoot);
-  if (shape.kind === "fatal") die(formatGitRepositoryShapeError(shape));
+  if (shape.kind === "fatal") die(formatGitRepositoryShapeError(shape, hostGit));
+  // A relative-linked worktree carries extensions.relativeWorktrees, which
+  // host Git without relative-link support cannot read.
+  if (shape.kind === "relative-linked" && hostGit && !hostGit.supported) {
+    die(hostGitRelativeWorktreesLaunchRefusal(hostGit.version));
+  }
   const plan = gitLayoutPlanForShape(context.projectRoot, shape);
   const serialized = serializeGitLayoutPlan(plan);
   const previous = readPersistedGitLayoutPlan(context);
@@ -546,7 +566,29 @@ function gitHelpSupportsRelativeWorktree(io: RuntimeIO, options: SpawnSyncOption
     || `${result.stdout}\n${result.stderr}`.includes("--relative-paths");
 }
 
-export function assertHostGitSupportsRelativeWorktrees(context: RuntimeContext, io: RuntimeIO): void {
+// Display-only: capability is decided by the help-text probe, never by
+// comparing this number, because distributions backport and rename freely.
+export const MIN_HOST_GIT_RELATIVE_WORKTREES_VERSION = "2.48";
+
+export type HostGitRelativeWorktreesCapability = { supported: boolean; version: string };
+
+export function hostGitRelativeWorktreesLaunchRefusal(version: string): string {
+  return `this Git worktree layout requires host Git >= ${MIN_HOST_GIT_RELATIVE_WORKTREES_VERSION} (found ${version}); run runfree from the main checkout, or upgrade Git`;
+}
+
+export function hostGitRelativeWorktreesRepairRefusal(version: string): string {
+  return `repairing worktree links requires host Git >= ${MIN_HOST_GIT_RELATIVE_WORKTREES_VERSION} (found ${version}); upgrade Git`;
+}
+
+export function hostGitRelativeWorktreesDegradedWarning(version: string): string {
+  return `host Git ${version} is older than ${MIN_HOST_GIT_RELATIVE_WORKTREES_VERSION}: Git worktrees created inside the sandbox will make this repository unreadable to host Git; upgrade host Git (Ubuntu: sudo add-apt-repository ppa:git-core/ppa && sudo apt install git)`;
+}
+
+function parseHostGitVersion(output: string): string {
+  return /\bgit version (\d+\.\d+(?:\.\d+)?)/.exec(output)?.[1] ?? "unknown";
+}
+
+export function probeHostGitRelativeWorktrees(context: RuntimeContext, io: RuntimeIO): HostGitRelativeWorktreesCapability {
   // Subcommand help requires a repository. Use a disposable one so the probe
   // also works outside Git projects and while repairing broken project links.
   const probe = fs.mkdtempSync(path.join(os.tmpdir(), "runfree-git-probe-"));
@@ -557,13 +599,21 @@ export function assertHostGitSupportsRelativeWorktrees(context: RuntimeContext, 
     timeout: 5_000,
   };
   try {
+    const versionResult = io.capture("git", ["--version"], options);
+    const version = versionResult.status === 0 ? parseHostGitVersion(versionResult.stdout) : "unknown";
     const initialized = io.capture("git", ["init", "--bare", "--quiet", "--template=", probe], options);
-    if (initialized.status !== 0 || !gitHelpSupportsRelativeWorktree(io, options, "repair") || !gitHelpSupportsRelativeWorktree(io, options, "add")) {
-      die("host Git does not support relative worktree links; install a Git version with git worktree --relative-paths support");
-    }
+    const supported = initialized.status === 0
+      && gitHelpSupportsRelativeWorktree(io, options, "repair")
+      && gitHelpSupportsRelativeWorktree(io, options, "add");
+    return { supported, version };
   } finally {
     fs.rmSync(probe, { recursive: true, force: true });
   }
+}
+
+export function assertHostGitSupportsRelativeWorktrees(context: RuntimeContext, io: RuntimeIO): void {
+  const hostGit = probeHostGitRelativeWorktrees(context, io);
+  if (!hostGit.supported) die(hostGitRelativeWorktreesRepairRefusal(hostGit.version));
 }
 
 export function worktreeRepairCandidateFiles(projectRoot: string): string[] {
