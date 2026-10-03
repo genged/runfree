@@ -3448,6 +3448,23 @@ describe("runtime command flow", () => {
     expect(integerSpawnTimeout({})).toEqual({});
   });
 
+  describe("docker calls run the Docker CLI", () => {
+    test("runs the docker binary on PATH even when RUNFREE_DOCKER_TRANSPORT=api", () => {
+      const bin = fs.mkdtempSync(path.join(os.tmpdir(), "runfree-docker-cli-"));
+      try {
+        const shim = path.join(bin, "docker");
+        fs.writeFileSync(shim, "#!/bin/sh\nprintf 'shim:%s\\n' \"$*\"\n", { mode: 0o755 });
+        const env = { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH ?? ""}`, RUNFREE_DOCKER_TRANSPORT: "api" };
+        const id = "a".repeat(64);
+        const result = nodeRuntimeIO.capture("docker", ["container", "inspect", id], { env, timeout: 5_000 });
+        expect(result.status).toBe(0);
+        expect(result.stdout).toBe(`shim:container inspect ${id}\n`);
+      } finally {
+        fs.rmSync(bin, { recursive: true, force: true });
+      }
+    });
+  });
+
   describe("stop and the effective control-plane selection", () => {
     // After `compose down` the selection still names the removed proxy and
     // networks; left in place, the next start rebinds against networks that no

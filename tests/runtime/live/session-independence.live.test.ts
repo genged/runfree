@@ -299,9 +299,7 @@ ${arming}exec ${quote(realDocker)} "$@"
     { mode: 0o755 },
   );
   return Object.freeze({
-    // The CLI transport is pinned: an Engine API transport routes hot execs
-    // past PATH, so the refused command would never reach the shim.
-    env: { PATH: `${bin}${path.delimiter}${fixture.env.PATH ?? ""}`, RUNFREE_DOCKER_TRANSPORT: "cli" },
+    env: { PATH: `${bin}${path.delimiter}${fixture.env.PATH ?? ""}` },
     refusedArgv: () => (fs.existsSync(refusedPath) ? fs.readFileSync(refusedPath, "utf8").trim() : undefined),
     dispose: () => fs.rmSync(bin, { recursive: true, force: true }),
   });
