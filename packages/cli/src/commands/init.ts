@@ -157,7 +157,7 @@ export async function ensureWizardApprovedBase(context: RuntimeContext, io: Runt
   }
 }
 
-function printInit(projectRoot: string, project: ProjectInfo): void {
+function printInit(projectRoot: string, project: ProjectInfo, wizardFollows: boolean): void {
   console.log(`project: ${projectRoot}`);
   console.log(`runfree config: ${project.paths.configPath}`);
   console.log(`network policy: ${project.paths.policyPath}`);
@@ -169,6 +169,9 @@ function printInit(projectRoot: string, project: ProjectInfo): void {
   );
   if (policy.hosts.length === 0 && Object.keys(policy.services ?? {}).length === 0) {
     console.log("outbound services: none (deny-all)");
+    // The setup wizard offers service enablement next; the manual hints
+    // below would contradict it.
+    if (wizardFollows) return;
     console.log("start Claude or Codex to review its required operational service");
     console.log("after the first start, enable services with: runfree service enable <id>");
     console.log("service ids are listed by: runfree service enable --help");
@@ -191,11 +194,12 @@ export const initCommand: CommandModule = {
       handler(async (argv: ArgumentsCamelCase<{ yes?: boolean }>) => {
         const { projectRoot, env } = context;
         const project = context.ensureProject();
-        printInit(projectRoot, project);
         // The wizard runs only on a TTY without --yes; every other invocation
-        // produces exactly the scaffold above. Declining everything in the wizard
+        // produces exactly the scaffold below. Declining everything in the wizard
         // leaves the same scaffold.
-        if (!argv.yes && process.stdin.isTTY && process.stdout.isTTY) {
+        const runWizard = !argv.yes && process.stdin.isTTY === true && process.stdout.isTTY === true;
+        printInit(projectRoot, project, runWizard);
+        if (runWizard) {
           const runtimeDir = context.assets().runtimeDir;
           const runtimeContext: RuntimeContext = { projectRoot, project, runtimeRoot: runtimeDir, env };
           // A drifted project policy has no approved base, and

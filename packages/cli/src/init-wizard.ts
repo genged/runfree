@@ -237,8 +237,8 @@ export function buildWizardPlan(
       kind: "service",
       label: `enable service ${providerService} (API key for the ${detection.agent} agent)`,
       notes: [
-        "off by default: browser login through Runfree-managed state needs no API key",
-        `configure the token source afterwards, for example: ${sourceHint}`,
+        "browser login through Runfree-managed state needs no API key",
+        `to use an API key, configure its token source afterwards, for example: ${sourceHint}`,
       ],
       intents: [{ kind: "service-enable", id: providerService }],
       enabled: false,
@@ -459,8 +459,10 @@ function createClackInitWizardUi(): InitWizardUi {
     },
     log: (message) => clackLog.info(message),
     choosePlan: async (items) => {
-      const noteLines = items.flatMap((item, index) => item.notes.map((line) => `${index + 1}. ${item.label}: ${line}`));
-      if (noteLines.length > 0) note(noteLines.join("\n"), "Review notes");
+      const noteBlocks = items
+        .filter((item) => item.notes.length > 0)
+        .map((item) => [item.label, ...item.notes.map((line) => `  - ${line}`)].join("\n"));
+      if (noteBlocks.length > 0) note(noteBlocks.join("\n\n"), "Review notes");
       const selected = await multiselect<number>({
         message: "Configure Runfree",
         options: items.map((item, index) => ({
