@@ -152,9 +152,8 @@ RUNFREE_TIMINGS=1 runfree up 2>&1 | grep 'timing:'
 The categories name the command and Docker subcommand only, never
 arguments, ids, or output, so the lines are safe to paste into an issue.
 
-The first start after an
-upgrade that changes the agent image inputs rebuilds the image and is expected
-to be slow.
+The first start after an upgrade that changes the agent image inputs
+rebuilds the image and is expected to be slow.
 
 ## A write is being held
 

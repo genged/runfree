@@ -159,14 +159,16 @@ Command modules under `packages/cli/src/commands/` build typed intents. Shared e
 
 #### Docker Access
 
-Runtime code issues every Docker operation by running the Docker CLI
-(`docker …`) through the runtime's `run` and `capture` functions
-(`packages/cli/src/runtime.ts`); interactive session starts and re-attaches
-spawn `docker container start --attach` and `docker container attach`
-directly. Runfree does not open the Docker socket itself, so the daemon it
-reaches is always the one the user's `docker` command reaches: the same
-`DOCKER_HOST`, Docker context, and credential helpers. Compose, BuildKit
-builds, and TTY attach come from the CLI unchanged.
+Runfree issues every Docker operation by running the Docker CLI
+(`docker …`). Runtime code goes through the runtime's `run` and `capture`
+functions (`packages/cli/src/runtime.ts`); admin enforcement uses its own
+runner (`runCapture` in `packages/cli/src/admin/admin-core.ts`); interactive
+session starts and re-attaches spawn `docker container start --attach` and
+`docker container attach` directly. Runfree does not open the Docker socket
+itself, so the daemon it reaches is always the one the user's `docker`
+command reaches: the same `DOCKER_HOST`, Docker context, and credential
+helpers. Compose, BuildKit builds, and TTY attach come from the CLI
+unchanged.
 
 ### Agent Container
 

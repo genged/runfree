@@ -4,7 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { parse as parseToml } from "smol-toml";
-import { afterEach, beforeEach, describe, expect, it, test, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
 import { SESSION_ELIGIBILITY_PATH } from "@runfree/runtime-contracts/session-file";
 
@@ -3449,7 +3449,7 @@ describe("runtime command flow", () => {
   });
 
   describe("docker calls run the Docker CLI", () => {
-    it("runs the docker binary on PATH even when RUNFREE_DOCKER_TRANSPORT=api", () => {
+    test("runs the docker binary on PATH even when RUNFREE_DOCKER_TRANSPORT=api", () => {
       const bin = fs.mkdtempSync(path.join(os.tmpdir(), "runfree-docker-cli-"));
       try {
         const shim = path.join(bin, "docker");
