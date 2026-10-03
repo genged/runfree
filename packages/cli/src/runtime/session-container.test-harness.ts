@@ -266,6 +266,7 @@ export function sessionTestDependencies(): DependencyOverlayPlan {
 
 export function sessionContainerTemplateFixture(input: {
   sessionLiveProbeRoot?: string;
+  dependencyOverlays?: DependencyOverlayPlan;
 } = {}): SessionContainerTemplate {
   const gitLayout = sessionTestGitLayout();
   return createSessionContainerTemplate({
@@ -273,7 +274,7 @@ export function sessionContainerTemplateFixture(input: {
     project: sessionTestProjectInfo(),
     composeProjectName: SESSION_TEST_PROJECT.composeProject,
     gitLayout,
-    dependencyOverlays: sessionTestDependencies(),
+    dependencyOverlays: input.dependencyOverlays ?? sessionTestDependencies(),
     runtimeEnvironment: {
       RUNFREE_PROJECT_NAME: "payments",
       RUNFREE_PROJECT_CONTAINER_ROOT: "/workspaces/payments",

@@ -830,6 +830,24 @@ describe("internal session admission driver", () => {
     expect(mocks.events).not.toContain("session-file:write");
   });
 
+  // A fresh project with no dependency overlays mounts no named volumes. Docker
+  // refuses `volume inspect` without a name, so the empty set is proven without
+  // asking Docker, and creation proceeds.
+  test("a plan with no named volumes proves the empty set without a Docker volume inspect", async () => {
+    mocks.namedVolumeRequest.mockReturnValue(undefined);
+    const input = fixture();
+    const driver = createInternalSessionAdmissionDriver({
+      ...input,
+      nowEpochMs: () => Date.parse("2026-08-09T00:00:00.000Z"),
+    });
+
+    await driver.probeBuiltin("codex");
+
+    expect(mocks.validateNamedVolumes).toHaveBeenCalledWith("[]", expect.anything());
+    expect((input.io.capture as Mock).mock.calls.some(([, args]) => args[0] === "volume")).toBe(false);
+    expect(mocks.events).toContain("create");
+  });
+
   // Regression from the first live run of the file source: with the pre-file
   // `register` gone, the running proof is the first observation taken after
   // `docker start --attach` is issued, so the window it waits is the whole

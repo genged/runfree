@@ -10,6 +10,8 @@ import {
 import {
   SESSION_TEST_PROJECT as PROJECT,
   sessionContainerCreatePlanFixture,
+  sessionContainerTemplateFixture,
+  sessionTestDependencies,
 } from "./session-container.test-harness.ts";
 import type { SessionContainerCreatePlan } from "./session-container-template.ts";
 
@@ -43,9 +45,27 @@ function inspect(value: SessionContainerCreatePlan): Record<string, unknown>[] {
 }
 
 describe("session named-volume inspection proof", () => {
+  test("a plan with no dependency overlays needs no Docker inspection and proves the empty set", () => {
+    const value = sessionContainerCreatePlanFixture({
+      template: sessionContainerTemplateFixture({
+        dependencyOverlays: { ...sessionTestDependencies(), overlays: [], storeVolumes: [] },
+      }),
+    });
+    expect(value.mounts.some((mount) => mount.type === "volume")).toBe(false);
+    expect(sessionNamedVolumeInspectRequest(value)).toBeUndefined();
+
+    const proof = validateSessionNamedVolumeInspect("[]", value);
+    expect(proof.volumes).toEqual([]);
+    expect(() => assertSessionNamedVolumeProof(value, proof)).not.toThrow();
+    expect(() => assertSessionNamedVolumeProof(plan(), proof)).toThrow("different session plan");
+    expect(() => validateSessionNamedVolumeInspect(JSON.stringify(inspect(plan())), value))
+      .toThrow("exact expected volume set");
+  });
+
   test("inspects only exact physical names and returns a canonical proof", () => {
     const value = plan();
     const request = sessionNamedVolumeInspectRequest(value);
+    if (!request) throw new Error("expected a named-volume inspection request");
     expect(request).toEqual({
       executable: "docker",
       args: ["volume", "inspect", ...request.exactNames],

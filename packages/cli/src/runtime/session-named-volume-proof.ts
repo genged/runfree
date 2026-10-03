@@ -106,9 +106,6 @@ export function sessionNamedVolumeExpectations(
     targets.push(mount.target);
     byName.set(mount.source, { logicalName, targets });
   }
-  if (byName.size === 0) {
-    throw new Error("session container plan has no named-volume mounts to prove");
-  }
   if (byName.size > SESSION_NAMED_VOLUME_MAX_COUNT) {
     throw new Error(`session container plan exceeds ${SESSION_NAMED_VOLUME_MAX_COUNT} named volumes`);
   }
@@ -121,10 +118,17 @@ export function sessionNamedVolumeExpectations(
     })));
 }
 
+/**
+ * The exact `docker volume inspect` for the plan's named volumes, or undefined
+ * when the plan mounts none — a project with no dependency overlays — because
+ * Docker refuses `volume inspect` without a name. Such a plan is proven by
+ * validating an empty inspection.
+ */
 export function sessionNamedVolumeInspectRequest(
   plan: SessionContainerCreatePlan,
-): SessionNamedVolumeInspectRequest {
+): SessionNamedVolumeInspectRequest | undefined {
   const exactNames = Object.freeze(sessionNamedVolumeExpectations(plan).map((volume) => volume.name));
+  if (exactNames.length === 0) return undefined;
   return Object.freeze({
     executable: "docker",
     args: Object.freeze(["volume", "inspect", ...exactNames]),

@@ -160,6 +160,7 @@ import {
   type ExactInternalNetworkParticipantBaseline,
 } from "./session-internal-network-baseline.ts";
 import {
+  type SessionNamedVolumeProof,
   sessionNamedVolumeInspectRequest,
   validateSessionNamedVolumeInspect,
 } from "./session-named-volume-proof.ts";
@@ -1584,23 +1585,9 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
     this.#plan = createSessionContainerCreatePlanFromPreflight(preflight, record);
   };
 
-  /**
-   * Creates the session container and spawns its foreground start, as one step.
-   *
-   * The durable record advances to provisioning-running — exact bound container
-   * id plus a freshly minted lease — before the spawn, so the record never
-   * claims less than the container might be: a crash at any point in this step
-   * leaves one inert, exactly reclaimable pair. The lease is minted here, before
-   * registration, because the request proxy refuses even a provisioning record
-   * without valid lease authority. Docker refuses a duplicate static address at
-   * start, and the single post-start inspection then holds the container to
-   * exactly one internal network at exactly the allocated address, which
-   * together replace the deleted pre-start network-target re-read.
-   */
-  createStarted = async (): Promise<void> => {
-    this.#lock();
-    const plan = this.#require(this.#plan, "allocated create plan");
+  #proveNamedVolumes(plan: SessionContainerCreatePlan): SessionNamedVolumeProof {
     const request = sessionNamedVolumeInspectRequest(plan);
+    if (!request) return validateSessionNamedVolumeInspect("[]", plan);
     const volumeInspect = this.#gateway.io.capture(request.executable, [...request.args], this.#dockerOptions());
     if (volumeInspect.status !== 0 && /no such volume/i.test(volumeInspect.stderr)) {
       // The named volumes come from the active generation's plan, and startup
@@ -1618,7 +1605,26 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
       "Docker failed to inspect exact session named volumes",
       volumeInspect,
     );
-    const namedVolumeProof = validateSessionNamedVolumeInspect(volumeResult.stdout, plan);
+    return validateSessionNamedVolumeInspect(volumeResult.stdout, plan);
+  }
+
+  /**
+   * Creates the session container and spawns its foreground start, as one step.
+   *
+   * The durable record advances to provisioning-running — exact bound container
+   * id plus a freshly minted lease — before the spawn, so the record never
+   * claims less than the container might be: a crash at any point in this step
+   * leaves one inert, exactly reclaimable pair. The lease is minted here, before
+   * registration, because the request proxy refuses even a provisioning record
+   * without valid lease authority. Docker refuses a duplicate static address at
+   * start, and the single post-start inspection then holds the container to
+   * exactly one internal network at exactly the allocated address, which
+   * together replace the deleted pre-start network-target re-read.
+   */
+  createStarted = async (): Promise<void> => {
+    this.#lock();
+    const plan = this.#require(this.#plan, "allocated create plan");
+    const namedVolumeProof = this.#proveNamedVolumes(plan);
     this.#lock();
     const assignment = this.#takeHandoffIpAssignment(plan.record.sourceIp)
       ?? executeSessionFileCommand(
