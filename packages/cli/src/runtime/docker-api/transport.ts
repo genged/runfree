@@ -9,9 +9,9 @@ import { type DockerApiRoute, matchDockerApiRoute } from "./routes.ts";
 import { type BridgeReply, type BridgeRequest, createSyncBridge, type SyncBridge } from "./sync-bridge.ts";
 
 /**
- * Opt-in until the live equivalence proof and Gate C pass on a Docker host:
- * only `api` enables the transport; unset, empty, `cli`, or anything else
- * keeps every call on the Docker CLI.
+ * On by default: unset, empty, or `api` enables the transport. `cli` is the
+ * kill switch, and any other value also keeps every call on the Docker CLI,
+ * so a mistyped switch falls back rather than routes.
  */
 export const DOCKER_TRANSPORT_ENV = "RUNFREE_DOCKER_TRANSPORT";
 
@@ -307,8 +307,8 @@ export function createDockerApiCapture(deps: DockerApiCaptureDeps = {}): DockerA
 
   return (command, args, options = {}) => {
     if (command !== "docker") return { routed: false };
-    const mode = controlEnv[DOCKER_TRANSPORT_ENV];
-    if (mode !== "api") return { routed: false };
+    const mode = controlEnv[DOCKER_TRANSPORT_ENV] ?? "";
+    if (mode !== "" && mode !== "api") return { routed: false };
     const envGiven = options.env !== undefined;
     const env = options.env ?? process.env;
     if (controlEnv.RUNFREE_TEST_FAKE_DOCKER === "1" || env.RUNFREE_TEST_FAKE_DOCKER === "1") return { routed: false };

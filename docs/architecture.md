@@ -202,11 +202,9 @@ caller -> budget wrapper -> histogram -> capture(argv)
   shapes every body as it would for the CLI. A mismatch keeps the process on
   the CLI. A replaced `docker` binary or a re-created or re-pointed socket
   binds again. Type-less `inspect` is answered only while swarm is inactive.
-- **Opt-in for now.** The transport runs only with
-  `RUNFREE_DOCKER_TRANSPORT=api`; unset, empty, or `cli` keeps every call on
-  the Docker CLI. The default flips to on once
-  `make test-runtime-live-docker-transport` and the full live gate pass with
-  the transport on and off on a Docker host.
+- **On by default.** The transport runs when `RUNFREE_DOCKER_TRANSPORT` is
+  unset, empty, or `api`. `cli` is the kill switch, and any other value also
+  keeps every call on the Docker CLI.
 - **Doubt stays on the CLI.** A `docker` on `PATH` that is not a native
   binary (a shim or a test fake), `RUNFREE_TEST_FAKE_DOCKER=1`, an
   unexpected spawn option, a refused connection, a missing object, or any

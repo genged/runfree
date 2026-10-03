@@ -152,13 +152,12 @@ RUNFREE_TIMINGS=1 runfree up 2>&1 | grep 'timing:'
 The categories name the command and Docker subcommand only, never
 arguments, ids, or output, so the lines are safe to paste into an issue.
 
-`RUNFREE_DOCKER_TRANSPORT=api` (opt-in, off by default) answers common
-Docker reads and proxy execs over the Docker socket instead of starting the
-Docker CLI each time; with `RUNFREE_TIMINGS=1` the
-`timing: docker-transport routed=N cli=M` line counts both paths. If a Docker
-call behaves differently from the same `docker` command in your shell, unset
-the variable (or set it to `cli`) and report the difference. The default
-becomes on once the transport's live proof has passed.
+By default, runfree answers common Docker reads and proxy execs over the
+Docker socket instead of starting the Docker CLI each time; with
+`RUNFREE_TIMINGS=1` the `timing: docker-transport routed=N cli=M` line counts
+both paths. If a Docker call behaves differently from the same `docker`
+command in your shell, set `RUNFREE_DOCKER_TRANSPORT=cli` to keep every call
+on the Docker CLI, and report the difference.
 
 The first start after an
 upgrade that changes the agent image inputs rebuilds the image and is expected

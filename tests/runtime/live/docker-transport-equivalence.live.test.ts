@@ -170,7 +170,7 @@ describe("docker Engine API transport matches the Docker CLI on real Docker", ()
     }
   }, TEST_TIMEOUT_MS);
 
-  test("the product CLI routes calls only when opted in: api routes, unset and cli route none", () => {
+  test("the product CLI routes calls by default: api and unset route, cli routes none", () => {
     const warmUp = (extra: NodeJS.ProcessEnv) => childProcess.spawnSync(process.execPath, [...cliEntryArgv(), "--workspace", fixture.projectRoot, "up"], {
       cwd: REPO_ROOT,
       encoding: "utf8",
@@ -198,7 +198,7 @@ describe("docker Engine API transport matches the Docker CLI on real Docker", ()
       timeout: TEST_TIMEOUT_MS,
     });
     expect(unset.status, describeOutput(`${unset.stdout}${unset.stderr}`)).toBe(0);
-    expect(counts(unset.stderr).routed).toBe(0);
+    expect(counts(unset.stderr).routed).toBeGreaterThan(0);
   }, TEST_TIMEOUT_MS);
 
   test("the kill switch keeps every call on the CLI", () => {

@@ -295,11 +295,21 @@ describe("docker API transport: bounded waits and failures", () => {
   });
 });
 
+describe("docker API transport: on by default", () => {
+  it.each([
+    ["the default (transport mode unset)", {}],
+    ["an empty transport mode", { RUNFREE_DOCKER_TRANSPORT: "" }],
+    ["an explicit api mode", { RUNFREE_DOCKER_TRANSPORT: "api" }],
+  ])("%s routes to the socket", async (_label, controlEnv) => {
+    const fake = await start({ [`GET ${V}/containers/${ID}/json`]: json({ Id: ID }) });
+    expect(transportFor(fake, { controlEnv })("docker", ["container", "inspect", ID], {})).toMatchObject({ routed: true, result: { status: 0 } });
+    expect((await apiRequests(fake)).map((request) => request.url)).toEqual([`${V}/containers/${ID}/json`]);
+  });
+});
+
 describe("docker API transport: what stays on the CLI", () => {
   it.each([
-    ["the default (transport mode unset)", { controlEnv: {} }, {}],
-    ["an empty transport mode", { controlEnv: { RUNFREE_DOCKER_TRANSPORT: "" } }, {}],
-    ["the kill switch", { controlEnv: { RUNFREE_DOCKER_TRANSPORT: "cli" } }, {}],
+    ["the kill switch",{ controlEnv: { RUNFREE_DOCKER_TRANSPORT: "cli" } }, {}],
     ["an unknown transport mode", { controlEnv: { RUNFREE_DOCKER_TRANSPORT: "fast" } }, {}],
     ["fake-docker test mode in the process env", { controlEnv: { RUNFREE_DOCKER_TRANSPORT: "api", RUNFREE_TEST_FAKE_DOCKER: "1" } }, {}],
     ["fake-docker test mode in the call env", {}, { env: { RUNFREE_TEST_FAKE_DOCKER: "1" } }],
