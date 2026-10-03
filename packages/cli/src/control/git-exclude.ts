@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 
-import { classifyGitRepository, formatGitRepositoryShapeError } from "../runtime/git-layout.ts";
+import { classifyGitRepository, formatGitRepositoryShapeError, probeHostGitRelativeWorktrees } from "../runtime/git-layout.ts";
 import type { RuntimeIO } from "../runtime/types.ts";
 
 export const LOCAL_POLICY_EXCLUDE_PATTERN = "/.runfree/network-policy.local.json";
@@ -102,7 +102,12 @@ function writeExclude(filePath: string, contents: string, expected: ExcludeFile)
 export function ensureCheckoutLocalPolicyExcluded(projectRoot: string, io: RuntimeIO): "absent-git" | "present" | "written" {
   const shape = classifyGitRepository(projectRoot);
   if (shape.kind === "none") return "absent-git";
-  if (shape.kind === "fatal") throw new Error(formatGitRepositoryShapeError(shape));
+  if (shape.kind === "fatal") {
+    // Probe only on the refusal path: old host Git cannot run the repair
+    // commands the default message recommends.
+    const hostGit = probeHostGitRelativeWorktrees({ env: process.env }, io);
+    throw new Error(formatGitRepositoryShapeError(shape, hostGit));
+  }
 
   const tracked = gitCapture(projectRoot, io, ["ls-files", "--error-unmatch", "--", LOCAL_POLICY_REPOSITORY_PATH]);
   if (tracked.status === 0) {

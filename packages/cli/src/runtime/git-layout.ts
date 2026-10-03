@@ -519,12 +519,8 @@ export function prepareGitRepositoryLayoutResult(
   hostGit?: HostGitRelativeWorktreesCapability,
 ): PreparedGitRepositoryLayout {
   const shape = classifyGitRepository(context.projectRoot);
-  if (shape.kind === "fatal") die(formatGitRepositoryShapeError(shape, hostGit));
-  // A relative-linked worktree carries extensions.relativeWorktrees, which
-  // host Git without relative-link support cannot read.
-  if (shape.kind === "relative-linked" && hostGit && !hostGit.supported) {
-    die(hostGitRelativeWorktreesLaunchRefusal(hostGit.version));
-  }
+  if (hostGit) refuseShapeUnusableByHostGit(shape, hostGit);
+  if (shape.kind === "fatal") die(formatGitRepositoryShapeError(shape));
   const plan = gitLayoutPlanForShape(context.projectRoot, shape);
   const serialized = serializeGitLayoutPlan(plan);
   const previous = readPersistedGitLayoutPlan(context);
@@ -588,7 +584,7 @@ function parseHostGitVersion(output: string): string {
   return /\bgit version (\d+\.\d+(?:\.\d+)?)/.exec(output)?.[1] ?? "unknown";
 }
 
-export function probeHostGitRelativeWorktrees(context: RuntimeContext, io: RuntimeIO): HostGitRelativeWorktreesCapability {
+export function probeHostGitRelativeWorktrees(context: Pick<RuntimeContext, "env">, io: RuntimeIO): HostGitRelativeWorktreesCapability {
   // Subcommand help requires a repository. Use a disposable one so the probe
   // also works outside Git projects and while repairing broken project links.
   const probe = fs.mkdtempSync(path.join(os.tmpdir(), "runfree-git-probe-"));
@@ -609,6 +605,22 @@ export function probeHostGitRelativeWorktrees(context: RuntimeContext, io: Runti
   } finally {
     fs.rmSync(probe, { recursive: true, force: true });
   }
+}
+
+function refuseShapeUnusableByHostGit(shape: GitRepositoryShape, hostGit: HostGitRelativeWorktreesCapability): void {
+  if (hostGit.supported) return;
+  if (shape.kind === "fatal") die(formatGitRepositoryShapeError(shape, hostGit));
+  // A relative-linked worktree carries extensions.relativeWorktrees, which
+  // host Git without relative-link support cannot read.
+  if (shape.kind === "relative-linked") die(hostGitRelativeWorktreesLaunchRefusal(hostGit.version));
+}
+
+// Launch preflight: refuse, before any project state is written, the Git
+// shapes that old host Git can neither use nor repair. Classifies only when
+// the capability is missing, so a supported host pays nothing extra.
+export function refuseGitLayoutUnusableByHostGit(projectRoot: string, hostGit: HostGitRelativeWorktreesCapability): void {
+  if (hostGit.supported) return;
+  refuseShapeUnusableByHostGit(classifyGitRepository(projectRoot), hostGit);
 }
 
 export function assertHostGitSupportsRelativeWorktrees(context: RuntimeContext, io: RuntimeIO): void {

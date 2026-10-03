@@ -53,7 +53,12 @@ import {
   reproveRecordedCandidateControlPlaneV2,
 } from "./control-plane-effective-proof.ts";
 import { composeProjectName } from "./env.ts";
-import { prepareGitRepositoryLayoutResult, probeHostGitRelativeWorktrees, serializeGitLayoutPlan } from "./git-layout.ts";
+import {
+  prepareGitRepositoryLayoutResult,
+  probeHostGitRelativeWorktrees,
+  refuseGitLayoutUnusableByHostGit,
+  serializeGitLayoutPlan,
+} from "./git-layout.ts";
 import {
   cleanupRunfreeImages,
   ensureRuntimeMaterialized,
@@ -1146,6 +1151,11 @@ export async function startRuntime(
   let lockHandedOff = false;
   let confirmedRebuildSessions: readonly ActiveAgentSession[] = [];
   try {
+    // Probe host Git once per launch, before any project state is written:
+    // shapes old host Git cannot use refuse here; the result also feeds the
+    // layout preparation and the sandbox Git config's degraded-mode warning.
+    const hostGit = probeHostGitRelativeWorktrees(context, io);
+    refuseGitLayoutUnusableByHostGit(context.projectRoot, hostGit);
     const capturedConfig = readConfig(context.projectRoot);
     if (removeExisting) {
       ensureDockerAvailable();
@@ -1199,9 +1209,6 @@ export async function startRuntime(
     reportRuntimeVerbose(verbose,
       `using runtime network ${initialPlan.network.subnet}, proxy egress ${initialPlan.network.proxyEgressSubnet}`);
 
-    // Probe host Git once per launch: the layout refuses shapes old Git cannot
-    // use, and the sandbox Git config warns when it falls back to degraded mode.
-    const hostGit = probeHostGitRelativeWorktrees(initialContext, io);
     const gitLayout = prepareGitRepositoryLayoutResult(initialContext, hostGit);
     const gitPreparedPlan: RuntimePlan = {
       ...initialPlan,

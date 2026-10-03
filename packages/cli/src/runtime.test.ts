@@ -2169,17 +2169,45 @@ describe("runtime recovery", () => {
     expect(io.calls.filter((call) => call.method === "capture" && call.command === "git" && call.args[0] === "--version")).toHaveLength(1);
   });
 
-  test("up from a linked worktree on old host Git refuses before the layout plan, sandbox config, or Compose", async () => {
+  // Every file and directory under a root, with file contents, so a refusal
+  // can prove it wrote no project, control, network, or runtime state at all.
+  function stateSnapshot(roots: string[]): Record<string, string> {
+    const snapshot: Record<string, string> = {};
+    const visit = (entry: string): void => {
+      const stat = fs.lstatSync(entry, { throwIfNoEntry: false });
+      if (!stat) return;
+      if (stat.isDirectory()) {
+        snapshot[entry] = "dir";
+        for (const child of fs.readdirSync(entry).sort()) visit(path.join(entry, child));
+        return;
+      }
+      snapshot[entry] = stat.isFile() ? fs.readFileSync(entry, "utf8") : `link:${fs.readlinkSync(entry)}`;
+    };
+    for (const root of roots) visit(root);
+    return snapshot;
+  }
+
+  test.each(["allocated", "fixed"])("up from a linked worktree on old host Git refuses before any state write (network %s)", async (networkMode) => {
     const projectRoot = path.join(tmp, "main", ".worktrees", "feature");
     prepareRelativeLinkedWorktree(projectRoot);
     const project = prepareProject(projectRoot);
+    const runtimeRoot = path.join(tmp, "runtime");
+    const watched = [project.paths.stateDir, project.paths.runfreeDir, runtimeRoot, path.join(tmp, "main", ".git")];
+    const before = stateSnapshot(watched);
     const io = createRuntimeIO({ capture: oldHostGitCapture });
     await expect(up({
-      projectRoot, project, runtimeRoot: path.join(tmp, "runtime"), env: { PATH: "/fake-bin" }, network: fixedNetwork,
+      projectRoot, project, runtimeRoot, env: { PATH: "/fake-bin" },
+      ...(networkMode === "fixed" ? { network: fixedNetwork } : {}),
     }, io, false, {})).rejects.toThrow("requires host Git >= 2.48 (found 2.43.0); run runfree from the main checkout, or upgrade Git");
+    // No sandbox Git config, Git layout plan, persisted network allocation,
+    // effective-control state, or Git metadata change: the state tree is untouched.
+    expect(stateSnapshot(watched)).toEqual(before);
     expect(fs.existsSync(project.paths.gitConfigPath)).toBe(false);
     expect(fs.existsSync(path.join(project.paths.stateDir, "git-layout-plan.json"))).toBe(false);
-    expect(io.calls.find((call) => call.method === "run" && call.command === "docker" && call.args.includes("up"))).toBeUndefined();
+    expect(fs.existsSync(path.join(project.paths.stateDir, "runtime-network.json"))).toBe(false);
+    // Nothing reached Docker: no subnet listing for an allocation, no Compose.
+    expect(io.calls.filter((call) => call.command === "docker")).toEqual([]);
+    expect(io.calls.filter((call) => call.method === "admin")).toEqual([]);
     flushWarnings();
   });
 
@@ -4736,7 +4764,9 @@ describe("runtime command flow", () => {
     const project = prepareProject(projectRoot);
     const io = createRuntimeIO({
       admin: async () => 42,
-      capture: () => {
+      // The host Git capability probe runs first; only Docker is off limits.
+      capture: (command) => {
+        if (command !== "docker") return undefined;
         throw new Error("Docker should not be touched after prepare fails");
       },
     });

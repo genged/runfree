@@ -51,6 +51,60 @@ describe("checkout-local Git exclusion", () => {
     expect(matches).toEqual([LOCAL_POLICY_EXCLUDE_PATTERN]);
   });
 
+  describe("a fatal Git shape", () => {
+    // Real Git for everything but the capability probe, whose help text decides
+    // relative-link support; every capture is recorded.
+    function hostGitIO(supported: boolean): { io: RuntimeIO; captured: string[][] } {
+      const captured: string[][] = [];
+      return {
+        captured,
+        io: {
+          ...io,
+          capture: (commandName, args, options) => {
+            captured.push(args);
+            if (args[0] === "--version") return { status: 0, stdout: "git version 2.43.0\n", stderr: "" };
+            if (args[0] === "worktree") {
+              return { status: 129, stdout: supported ? "    --[no-]relative-paths" : "usage: git worktree repair [<path>...]", stderr: "" };
+            }
+            return io.capture(commandName, args, options);
+          },
+        },
+      };
+    }
+
+    function fatalCheckout(): void {
+      fs.mkdirSync(path.join(root, "elsewhere-git"));
+      fs.symlinkSync(path.join(root, "elsewhere-git"), path.join(root, ".git"));
+    }
+
+    test("names the host Git version requirement on old host Git instead of repair commands it cannot run", () => {
+      fatalCheckout();
+      const { io: oldGit } = hostGitIO(false);
+      let message = "";
+      try {
+        ensureCheckoutLocalPolicyExcluded(root, oldGit);
+      } catch (error) {
+        message = error instanceof Error ? error.message : String(error);
+      }
+      expect(message).toContain(".git must not be a symlink");
+      expect(message).toContain("requires host Git >= 2.48 (found 2.43.0); run runfree from the main checkout, or upgrade Git");
+      expect(message).not.toContain("--relative-paths");
+    });
+
+    test("keeps the repair commands on supported host Git", () => {
+      fatalCheckout();
+      const { io: newGit } = hostGitIO(true);
+      expect(() => ensureCheckoutLocalPolicyExcluded(root, newGit)).toThrow(/Repair it on the host with:\n {2}git -C .* worktree repair --relative-paths/);
+    });
+
+    test("a valid checkout never probes host Git", () => {
+      initGit();
+      const { io: recorded, captured } = hostGitIO(false);
+      expect(ensureCheckoutLocalPolicyExcluded(root, recorded)).toBe("written");
+      expect(captured.filter((args) => args[0] === "--version" || args[0] === "worktree")).toEqual([]);
+    });
+  });
+
   test("does not require an exclude file outside a Git checkout", () => {
     expect(ensureCheckoutLocalPolicyExcluded(root, io)).toBe("absent-git");
     expect(fs.existsSync(path.join(root, ".git"))).toBe(false);
