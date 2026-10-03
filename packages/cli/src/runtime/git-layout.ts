@@ -33,7 +33,11 @@ export type GitRepositoryShape =
   | { kind: "none" }
   | { kind: "normal"; gitDir: string }
   | { kind: "relative-linked"; details: RelativeLinkedWorktree }
-  | { kind: "fatal"; reason: string; remediation?: string };
+  // `fromMainCheckout` marks a fatal shape found while classifying the main
+  // checkout itself (classifyMainRepository's `refuse()`, e.g. a nested
+  // worktree with absolute links): the caller is already in the main
+  // checkout, so "run runfree from the main checkout" is not a usable fix.
+  | { kind: "fatal"; reason: string; remediation?: string; fromMainCheckout?: true };
 
 export type RuntimeGitLayoutPlan =
   | {
@@ -310,6 +314,7 @@ function classifyMainRepository(projectRoot: string, gitDir: string): GitReposit
       `cd '${projectRoot.replaceAll("'", "'\\''")}'`,
       "runfree git repair-worktree-links",
     ].join("\n  "),
+    fromMainCheckout: true,
   });
   try {
     const relativeDefault = readGitConfigValue(path.join(gitDir, "config"), "worktree.useRelativePaths", true);
@@ -475,8 +480,15 @@ export function formatGitRepositoryShapeError(
     "",
   ];
   // Every repair command needs `--relative-paths`, so on an older host Git the
-  // only accurate next step is the version requirement itself.
-  if (hostGit && !hostGit.supported) return [...header, hostGitRelativeWorktreesLaunchRefusal(hostGit.version)].join("\n");
+  // only accurate next step is the version requirement itself. A shape found
+  // from the main checkout (a nested worktree problem) cannot be fixed by
+  // "run runfree from the main checkout" because that is where we already are.
+  if (hostGit && !hostGit.supported) {
+    const refusal = shape.fromMainCheckout
+      ? hostGitRelativeWorktreesMainCheckoutRefusal(hostGit.version)
+      : hostGitRelativeWorktreesLaunchRefusal(hostGit.version);
+    return [...header, refusal].join("\n");
+  }
   return [
     ...header,
     "Repair it on the host with:",
@@ -570,6 +582,15 @@ export type HostGitRelativeWorktreesCapability = { supported: boolean; version: 
 
 export function hostGitRelativeWorktreesLaunchRefusal(version: string): string {
   return `this Git worktree layout requires host Git >= ${MIN_HOST_GIT_RELATIVE_WORKTREES_VERSION} (found ${version}); run runfree from the main checkout, or upgrade Git`;
+}
+
+// Same version-requirement core as the launch refusal above, but for a fatal
+// shape found from the main checkout itself: the operator is already running
+// from the main checkout, so that advice is not an available fix. The real
+// fixes are to remove the nested worktree the old host Git cannot use, or to
+// upgrade Git.
+export function hostGitRelativeWorktreesMainCheckoutRefusal(version: string): string {
+  return `this Git worktree layout requires host Git >= ${MIN_HOST_GIT_RELATIVE_WORKTREES_VERSION} (found ${version}); remove or move the nested worktree (e.g. git worktree remove <path>), or upgrade Git`;
 }
 
 export function hostGitRelativeWorktreesRepairRefusal(version: string): string {

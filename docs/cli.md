@@ -554,19 +554,27 @@ worktrees before starting the runtime. An unsupported layout — absolute
 links, including a stale `/workspace` link from a sandbox — stops startup. On
 host Git 2.48+ it shows the repair command to run on the host from the main
 checkout, which also sets the repository's relative-path default. On older
-host Git, or when launching from a linked worktree, it refuses before writing
-any state instead, since the repair itself needs 2.48+:
+host Git, that check instead refuses before writing any state, since the
+repair itself needs 2.48+:
+
+`this Git worktree layout requires host Git >= 2.48 (found <version>); remove or move the nested worktree (e.g. git worktree remove <path>), or upgrade Git`
+
+Launching directly from a linked worktree on older host Git refuses the same
+way, naming the main checkout instead, since running from there is itself a
+fix:
 
 `this Git worktree layout requires host Git >= 2.48 (found <version>); run runfree from the main checkout, or upgrade Git`
 
 Host-only worktrees outside the mounted project are outside this check.
+
 `runfree git repair-worktree-links` itself refuses the same way on host Git
 older than 2.48:
 
 `repairing worktree links requires host Git >= 2.48 (found <version>); upgrade Git`
 
-Upgrading host Git is the only recovery from either refusal. `runfree status`
-always prints host Git's version and worktree capability:
+Upgrading host Git recovers from any of these refusals; removing or moving
+the nested worktree also recovers the main-checkout refusal above. `runfree
+status` always prints host Git's version and worktree capability:
 
 `host git: <version> (worktrees: enabled|disabled)`
 

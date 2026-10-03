@@ -53,17 +53,24 @@ describe("checkout-local Git exclusion", () => {
 
   describe("a fatal Git shape", () => {
     // Real Git for everything but the capability probe, whose help text decides
-    // relative-link support; every capture is recorded.
-    function hostGitIO(supported: boolean): { io: RuntimeIO; captured: string[][] } {
+    // relative-link support; every capture is recorded, along with the env
+    // each probe capture ran with (to prove env threading below).
+    function hostGitIO(supported: boolean): { io: RuntimeIO; captured: string[][]; probeEnvs: (NodeJS.ProcessEnv | undefined)[] } {
       const captured: string[][] = [];
+      const probeEnvs: (NodeJS.ProcessEnv | undefined)[] = [];
       return {
         captured,
+        probeEnvs,
         io: {
           ...io,
           capture: (commandName, args, options) => {
             captured.push(args);
-            if (args[0] === "--version") return { status: 0, stdout: "git version 2.43.0\n", stderr: "" };
+            if (args[0] === "--version") {
+              probeEnvs.push(options?.env);
+              return { status: 0, stdout: "git version 2.43.0\n", stderr: "" };
+            }
             if (args[0] === "worktree") {
+              probeEnvs.push(options?.env);
               return { status: 129, stdout: supported ? "    --[no-]relative-paths" : "usage: git worktree repair [<path>...]", stderr: "" };
             }
             return io.capture(commandName, args, options);
@@ -89,6 +96,17 @@ describe("checkout-local Git exclusion", () => {
       expect(message).toContain(".git must not be a symlink");
       expect(message).toContain("requires host Git >= 2.48 (found 2.43.0); run runfree from the main checkout, or upgrade Git");
       expect(message).not.toContain("--relative-paths");
+    });
+
+    test("probes with the caller's context env when one is given, instead of the bare process env", () => {
+      fatalCheckout();
+      const { io: oldGit, probeEnvs } = hostGitIO(false);
+      const callerEnv = { ...process.env, RUNFREE_TEST_GIT_EXCLUDE_ENV_MARKER: "from-caller-context" };
+      expect(() => ensureCheckoutLocalPolicyExcluded(root, oldGit, callerEnv)).toThrow();
+      expect(probeEnvs.length).toBeGreaterThan(0);
+      for (const probeEnv of probeEnvs) {
+        expect(probeEnv?.RUNFREE_TEST_GIT_EXCLUDE_ENV_MARKER).toBe("from-caller-context");
+      }
     });
 
     test("keeps the repair commands on supported host Git", () => {

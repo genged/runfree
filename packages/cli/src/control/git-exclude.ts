@@ -99,13 +99,20 @@ function writeExclude(filePath: string, contents: string, expected: ExcludeFile)
   }
 }
 
-export function ensureCheckoutLocalPolicyExcluded(projectRoot: string, io: RuntimeIO): "absent-git" | "present" | "written" {
+export function ensureCheckoutLocalPolicyExcluded(
+  projectRoot: string,
+  io: RuntimeIO,
+  env?: NodeJS.ProcessEnv,
+): "absent-git" | "present" | "written" {
   const shape = classifyGitRepository(projectRoot);
   if (shape.kind === "none") return "absent-git";
   if (shape.kind === "fatal") {
     // Probe only on the refusal path: old host Git cannot run the repair
-    // commands the default message recommends.
-    const hostGit = probeHostGitRelativeWorktrees({ env: process.env }, io);
+    // commands the default message recommends. Use the caller's context env
+    // when one is reachable, so the probe sees the same Git environment
+    // (e.g. GIT_* overrides) as the rest of that launch; fall back to the
+    // process env when no context is available on this path.
+    const hostGit = probeHostGitRelativeWorktrees({ env: env ?? process.env }, io);
     throw new Error(formatGitRepositoryShapeError(shape, hostGit));
   }
 

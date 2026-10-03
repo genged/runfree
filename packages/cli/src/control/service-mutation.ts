@@ -116,7 +116,7 @@ export async function mutateDesiredService(
       missingSelectionMessage: "desired service base approval disappeared during unchanged mutation",
     },
     prepare: () => {
-      if (layer === "local") ensureCheckoutLocalPolicyExcluded(context.projectRoot, io);
+      if (layer === "local") ensureCheckoutLocalPolicyExcluded(context.projectRoot, io, context.env);
     },
     plan: (before) => {
       const planned = reconcileDesiredService(desiredLayerPolicy(before, layer), mutation);

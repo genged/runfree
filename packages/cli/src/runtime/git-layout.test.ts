@@ -148,25 +148,50 @@ describe("host Git without relative worktree links", () => {
     expect(prepareGitRepositoryLayoutResult(context, probeHostGitRelativeWorktrees(context, io)).plan.kind).toBe("relative-linked");
   });
 
-  test("a fatal shape names the version requirement instead of repair commands old Git cannot run", () => {
+  // Both roots below classify a fatal shape over the same broken worktree
+  // (an absolute gitdir). Reached directly (from the worktree itself), the
+  // "run runfree from the main checkout" clause is a real fix. Reached from
+  // the main checkout (classifyMainRepository's refuse() path, e.g. a nested
+  // worktree with absolute links), it is not: the caller is already there.
+  function fatalNestedWorktreeFixture(): { main: string; projectRoot: string } {
     const { projectRoot, gitCommonDir } = linkedWorktreeFixture();
     const main = path.dirname(gitCommonDir);
     fs.writeFileSync(path.join(projectRoot, ".git"), `gitdir: ${path.join(gitCommonDir, "worktrees", "feature")}\n`);
-    const { io } = simulatedHostGit({ supported: false });
-    for (const root of [main, projectRoot]) {
-      const context = layoutContext(root);
-      let message = "";
-      try {
-        prepareGitRepositoryLayoutResult(context, probeHostGitRelativeWorktrees(context, io));
-      } catch (error) {
-        message = error instanceof Error ? error.message : String(error);
-      }
-      expect(message).toContain("must be relative");
-      expect(message).toContain(OLD_REFUSAL);
-      expect(message).not.toContain("--relative-paths");
-      expect(message).not.toContain("repair-worktree-links");
-      expect(fs.existsSync(context.project.paths.stateDir)).toBe(false);
+    return { main, projectRoot };
+  }
+
+  function fatalMessage(context: RuntimeContext, io: RuntimeIO): string {
+    try {
+      prepareGitRepositoryLayoutResult(context, probeHostGitRelativeWorktrees(context, io));
+    } catch (error) {
+      return error instanceof Error ? error.message : String(error);
     }
+    throw new Error("expected prepareGitRepositoryLayoutResult to throw");
+  }
+
+  test("a fatal shape reached from the linked worktree itself names the version requirement instead of repair commands old Git cannot run", () => {
+    const { projectRoot } = fatalNestedWorktreeFixture();
+    const { io } = simulatedHostGit({ supported: false });
+    const context = layoutContext(projectRoot);
+    const message = fatalMessage(context, io);
+    expect(message).toContain("must be relative");
+    expect(message).toContain(OLD_REFUSAL);
+    expect(message).not.toContain("--relative-paths");
+    expect(message).not.toContain("repair-worktree-links");
+    expect(fs.existsSync(context.project.paths.stateDir)).toBe(false);
+  });
+
+  test("a fatal shape reached from the main checkout names the nested-worktree fix instead of the self-referential main-checkout clause", () => {
+    const { main } = fatalNestedWorktreeFixture();
+    const { io } = simulatedHostGit({ supported: false });
+    const context = layoutContext(main);
+    const message = fatalMessage(context, io);
+    expect(message).toContain("must be relative");
+    expect(message).toContain("requires host Git >= 2.48 (found 2.43.0); remove or move the nested worktree (e.g. git worktree remove <path>), or upgrade Git");
+    expect(message).not.toContain("run runfree from the main checkout");
+    expect(message).not.toContain("--relative-paths");
+    expect(message).not.toContain("repair-worktree-links");
+    expect(fs.existsSync(context.project.paths.stateDir)).toBe(false);
   });
 
   test("a normal repository and a non-Git project keep their layout on old host Git", () => {
