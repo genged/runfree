@@ -4,7 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { parse as parseToml } from "smol-toml";
-import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, test, vi } from "vitest";
 
 import { SESSION_ELIGIBILITY_PATH } from "@runfree/runtime-contracts/session-file";
 
@@ -3446,6 +3446,23 @@ describe("runtime command flow", () => {
     const whole = { timeout: 1000 };
     expect(integerSpawnTimeout(whole)).toBe(whole);
     expect(integerSpawnTimeout({})).toEqual({});
+  });
+
+  describe("docker calls run the Docker CLI", () => {
+    it("runs the docker binary on PATH even when RUNFREE_DOCKER_TRANSPORT=api", () => {
+      const bin = fs.mkdtempSync(path.join(os.tmpdir(), "runfree-docker-cli-"));
+      try {
+        const shim = path.join(bin, "docker");
+        fs.writeFileSync(shim, "#!/bin/sh\nprintf 'shim:%s\\n' \"$*\"\n", { mode: 0o755 });
+        const env = { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH ?? ""}`, RUNFREE_DOCKER_TRANSPORT: "api" };
+        const id = "a".repeat(64);
+        const result = nodeRuntimeIO.capture("docker", ["container", "inspect", id], { env, timeout: 5_000 });
+        expect(result.status).toBe(0);
+        expect(result.stdout).toBe(`shim:container inspect ${id}\n`);
+      } finally {
+        fs.rmSync(bin, { recursive: true, force: true });
+      }
+    });
   });
 
   describe("stop and the effective control-plane selection", () => {
