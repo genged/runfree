@@ -53,7 +53,13 @@ import {
   reproveRecordedCandidateControlPlaneV2,
 } from "./control-plane-effective-proof.ts";
 import { composeProjectName } from "./env.ts";
-import { prepareGitRepositoryLayoutResult, serializeGitLayoutPlan } from "./git-layout.ts";
+import {
+  type HostGitRelativeWorktreesCapability,
+  prepareGitRepositoryLayoutResult,
+  probeHostGitRelativeWorktrees,
+  refuseGitLayoutUnusableByHostGit,
+  serializeGitLayoutPlan,
+} from "./git-layout.ts";
 import {
   cleanupRunfreeImages,
   ensureRuntimeMaterialized,
@@ -980,11 +986,20 @@ async function prepareRuntimeForTokenSyncOrRemoveInvalid(
   context: RuntimeContext,
   io: RuntimeIO,
   docker: RuntimeDocker,
-  options: { verbose?: boolean; lifecycleLock?: ProjectLifecycleLock; readOnly?: boolean; containmentIO?: RuntimeIO } = {},
+  options: {
+    verbose?: boolean;
+    lifecycleLock?: ProjectLifecycleLock;
+    readOnly?: boolean;
+    containmentIO?: RuntimeIO;
+    // The launch's host Git probe result, when this runs inside a launch.
+    hostGit?: HostGitRelativeWorktreesCapability;
+  } = {},
 ): Promise<RuntimeTokenSyncPreparation> {
   const timings = createRuntimeTimings(context.env);
   const project = composeProjectName(context.projectRoot);
-  const gitLayout = timings.time("validation:git-layout", () => prepareGitRepositoryLayoutResult(context));
+  // Without a launch probe result, host Git is probed only if the layout is
+  // fatal, so the refusal names the version requirement on old host Git.
+  const gitLayout = timings.time("validation:git-layout", () => prepareGitRepositoryLayoutResult(context, options.hostGit, io));
   if (serializeGitLayoutPlan(gitLayout.plan) !== serializeGitLayoutPlan(activePlan.gitLayout)) {
     warn("the Git worktree layout changed since the runtime was created; new authority was refused; repair the reported inputs and retry");
     return { status: 1 };
@@ -1146,6 +1161,11 @@ export async function startRuntime(
   let lockHandedOff = false;
   let confirmedRebuildSessions: readonly ActiveAgentSession[] = [];
   try {
+    // Probe host Git once per launch, before any project state is written:
+    // shapes old host Git cannot use refuse here; the result also feeds the
+    // layout preparation and the sandbox Git config's degraded-mode warning.
+    const hostGit = probeHostGitRelativeWorktrees(context, io);
+    refuseGitLayoutUnusableByHostGit(context.projectRoot, hostGit);
     const capturedConfig = readConfig(context.projectRoot);
     if (removeExisting) {
       ensureDockerAvailable();
@@ -1199,7 +1219,7 @@ export async function startRuntime(
     reportRuntimeVerbose(verbose,
       `using runtime network ${initialPlan.network.subnet}, proxy egress ${initialPlan.network.proxyEgressSubnet}`);
 
-    const gitLayout = prepareGitRepositoryLayoutResult(initialContext);
+    const gitLayout = prepareGitRepositoryLayoutResult(initialContext, hostGit);
     const gitPreparedPlan: RuntimePlan = {
       ...initialPlan,
       gitLayout: gitLayout.plan,
@@ -1214,7 +1234,7 @@ export async function startRuntime(
     assertSafeRuntimePolicyPath(gitPreparedContext);
     ensureAgentState(gitPreparedContext);
     writeProjectRecoveryPointer(gitPreparedContext);
-    ensureSandboxGitConfig(gitPreparedContext, io);
+    ensureSandboxGitConfig(gitPreparedContext, io, hostGit);
     const dependencyPlan: PreparedDependencyOverlayPlan = prepareDependencyOverlayPlanResult(gitPreparedContext, io);
     // Supply the freshly discovered overlays before the plan is built, not
     // after. Compose output, the topology digest, the session container
@@ -1525,7 +1545,7 @@ export async function startRuntime(
         }
         const full = await timings.timeAsync(
           "runtime-validation",
-          () => prepareRuntimeForTokenSyncOrRemoveInvalid(activePlan, activeContext, io, adapters.docker, { verbose, lifecycleLock: heldLifecycleLock, containmentIO }),
+          () => prepareRuntimeForTokenSyncOrRemoveInvalid(activePlan, activeContext, io, adapters.docker, { verbose, lifecycleLock: heldLifecycleLock, containmentIO, hostGit }),
         );
         if (full.status !== 0) return result(full.status, false, activeContext);
         validation = full;
@@ -1727,7 +1747,7 @@ export async function startRuntime(
             activeContext,
             rebindIO,
             rebindDocker,
-            { verbose, lifecycleLock: heldLifecycleLock, readOnly: true, containmentIO },
+            { verbose, lifecycleLock: heldLifecycleLock, readOnly: true, containmentIO, hostGit },
           );
           if (candidateValidation.status !== 0
             || !candidateValidation.proof
@@ -1753,7 +1773,7 @@ export async function startRuntime(
             activeContext,
             rebindIO,
             rebindDocker,
-            { verbose, lifecycleLock: heldLifecycleLock, readOnly: true, containmentIO },
+            { verbose, lifecycleLock: heldLifecycleLock, readOnly: true, containmentIO, hostGit },
           );
           if (candidateValidation.status !== 0
             || !candidateValidation.proof

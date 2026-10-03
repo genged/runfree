@@ -530,9 +530,10 @@ runfree git repair-worktree-links
 
 Repairs host Git metadata to use relative worktree links.
 
-Runfree requires host Git with `git worktree --relative-paths` support before
-starting a sandbox. This prevents the sandbox from creating repository
-metadata that the host Git cannot read.
+Runfree detects host Git's worktree capability by checking whether
+`git worktree add -h` and `git worktree repair -h` both advertise
+`--relative-paths` (Git 2.48+); the version named in messages below comes
+from `git --version`, or `unknown` when that fails.
 
 Sandbox Git defaults to relative worktree links, with an environment setting
 that takes precedence over repository includes and per-worktree config.
@@ -541,12 +542,73 @@ mounted project, for example `.worktrees/feature`, so both environments can
 reach them. On the host, use `git worktree add --relative-paths`, or set
 `git config --local worktree.useRelativePaths true` once for the repository.
 
-When launched from the main checkout, Runfree checks registered nested
-worktrees before starting the runtime. Absolute links, including stale
-`/workspace` links from a sandbox, stop startup and show the repair command.
-Run that command on the host from the main checkout; it also sets the
-repository's relative-path default. Host-only worktrees outside the mounted
-project are outside this startup check.
+On host Git older than 2.48, launching a normal repository or a non-Git
+project continues with a warning, because sandbox Git still defaults to
+relative links and a worktree created inside the sandbox would otherwise make
+the repository unreadable to host Git:
+
+`host Git <version> is older than 2.48: Git worktrees created inside the sandbox will make this repository unreadable to host Git; upgrade host Git (Ubuntu: sudo add-apt-repository ppa:git-core/ppa && sudo apt install git)`
+
+When the main checkout's Git config already sets
+`extensions.relativeWorktrees = true`, host Git older than 2.48 already
+cannot read the repository, so the warning says so instead:
+
+`host Git <version> is older than 2.48 and cannot read this repository, which uses relative worktree links; upgrade host Git (Ubuntu: sudo add-apt-repository ppa:git-core/ppa && sudo apt install git)`
+
+When `git --version` fails, for example because Git is not installed,
+launching a non-Git project continues with this warning instead:
+
+`host Git not found: Git worktrees created inside the sandbox will make this repository unreadable to host Git older than 2.48; install Git 2.48 or newer`
+
+Each launch prints at most one of these three warnings.
+
+Runfree reads a Git repository's config through Git to check its worktree
+layout. So when `git --version` fails and the project has a `.git` entry,
+launch refuses before writing any state:
+
+`host Git not found: Runfree needs Git to check this repository's worktree layout; install Git 2.48 or newer`
+
+When launched from the main checkout, Runfree also checks registered nested
+worktrees before starting the runtime. An unsupported layout — absolute
+links, including a stale `/workspace` link from a sandbox — stops startup. On
+host Git 2.48+ it shows the repair command to run on the host from the main
+checkout, which also sets the repository's relative-path default. On older
+host Git, that check instead refuses before writing any state, since the
+repair itself needs 2.48+:
+
+`this Git worktree layout requires host Git >= 2.48 (found <version>); remove or move the nested worktree (e.g. git worktree remove <path>), or upgrade Git`
+
+Launching directly from a linked worktree on older host Git refuses the same
+way, naming the main checkout instead, since running from there is itself a
+fix:
+
+`this Git worktree layout requires host Git >= 2.48 (found <version>); run runfree from the main checkout, or upgrade Git`
+
+Host-only worktrees outside the mounted project are outside this check.
+
+Commands that write checkout-local policy, such as `runfree init`, refuse
+with the same linked-worktree message on older host Git when run from a
+linked worktree. Without host Git, they refuse in any Git repository with
+the missing-Git message above. Both refusals come before Runfree asks Git
+whether that policy file is tracked, and before it writes the Git exclude
+file.
+
+Revalidating a running runtime (a launch that reuses it, or a proxy restart)
+and dependency overlay planning can find a Git layout that became unsupported
+after the runtime started. On host Git 2.48+ that refusal shows the repair
+commands, as above. On older host Git it shows the matching version
+requirement message above instead, because the repair needs 2.48+.
+
+`runfree git repair-worktree-links` itself refuses the same way on host Git
+older than 2.48:
+
+`repairing worktree links requires host Git >= 2.48 (found <version>); upgrade Git`
+
+Upgrading host Git recovers from any of these refusals; removing or moving
+the nested worktree also recovers the main-checkout refusal above. `runfree
+status` always prints host Git's version and worktree capability:
+
+`host git: <version> (worktrees: enabled|disabled)`
 
 ## Assets, Updates, And Version
 

@@ -1608,9 +1608,11 @@ function derivePreviousDependencyOverlayRuntimeSignature(
   return { error: "previous dependency overlay signature is missing and previous Git layout is unavailable" };
 }
 
-function currentDependencyOverlayContainerRoot(context: RuntimeContext): string {
+// The lazy probe IO only runs when the layout is fatal, so old host Git gets
+// the version requirement rather than repair commands it cannot run.
+function currentDependencyOverlayContainerRoot(context: RuntimeContext, io: RuntimeIO): string {
   return context.gitLayoutPlan?.containerProjectRoot
-    ?? prepareGitRepositoryLayoutResult(context).plan.containerProjectRoot;
+    ?? prepareGitRepositoryLayoutResult(context, undefined, io).plan.containerProjectRoot;
 }
 
 function readPreviousDependencyOverlayRuntimeSignature(
@@ -1726,7 +1728,7 @@ export function prepareDependencyOverlayPlanResult(context: RuntimeContext, io: 
     die(`dependency overlay plan failed: ${error instanceof Error ? error.message : String(error)}`);
   }
 
-  const runtimeSignature = dependencyOverlayRuntimeSignature(plan, currentDependencyOverlayContainerRoot(context));
+  const runtimeSignature = dependencyOverlayRuntimeSignature(plan, currentDependencyOverlayContainerRoot(context, io));
   const previous = readPreviousDependencyOverlayRuntimeSignature(context);
   const changed = previous.error !== undefined
     ? true

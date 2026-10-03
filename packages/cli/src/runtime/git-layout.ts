@@ -33,7 +33,11 @@ export type GitRepositoryShape =
   | { kind: "none" }
   | { kind: "normal"; gitDir: string }
   | { kind: "relative-linked"; details: RelativeLinkedWorktree }
-  | { kind: "fatal"; reason: string; remediation?: string };
+  // `fromMainCheckout` marks a fatal shape found while classifying the main
+  // checkout itself (classifyMainRepository's `refuse()`, e.g. a nested
+  // worktree with absolute links): the caller is already in the main
+  // checkout, so "run runfree from the main checkout" is not a usable fix.
+  | { kind: "fatal"; reason: string; remediation?: string; fromMainCheckout?: true };
 
 export type RuntimeGitLayoutPlan =
   | {
@@ -310,6 +314,7 @@ function classifyMainRepository(projectRoot: string, gitDir: string): GitReposit
       `cd '${projectRoot.replaceAll("'", "'\\''")}'`,
       "runfree git repair-worktree-links",
     ].join("\n  "),
+    fromMainCheckout: true,
   });
   try {
     const relativeDefault = readGitConfigValue(path.join(gitDir, "config"), "worktree.useRelativePaths", true);
@@ -463,13 +468,32 @@ export function serializeGitLayoutPlan(plan: RuntimeGitLayoutPlan): string {
   return `${JSON.stringify(plan, null, 2)}\n`;
 }
 
-export function formatGitRepositoryShapeError(shape: Extract<GitRepositoryShape, { kind: "fatal" }>): string {
-  return [
+export function formatGitRepositoryShapeError(
+  shape: Extract<GitRepositoryShape, { kind: "fatal" }>,
+  hostGit?: HostGitRelativeWorktreesCapability,
+): string {
+  const header = [
     "Runfree only supports Git linked worktrees that use relative links.",
     "",
     "This worktree uses unsupported or unsafe Git metadata:",
     `  ${shape.reason}`,
     "",
+  ];
+  // Without host Git, classification itself could not run Git (the reason is
+  // a spawn failure), so the only accurate message is the missing Git.
+  if (hostGit && !hostGit.found) return hostGitNotFoundRefusal();
+  // Every repair command needs `--relative-paths`, so on an older host Git the
+  // only accurate next step is the version requirement itself. A shape found
+  // from the main checkout (a nested worktree problem) cannot be fixed by
+  // "run runfree from the main checkout" because that is where we already are.
+  if (hostGit && !hostGit.supported) {
+    const refusal = shape.fromMainCheckout
+      ? hostGitRelativeWorktreesMainCheckoutRefusal(hostGit.version)
+      : hostGitRelativeWorktreesLaunchRefusal(hostGit.version);
+    return [...header, refusal].join("\n");
+  }
+  return [
+    ...header,
     "Repair it on the host with:",
     `  ${shape.remediation ?? ""}`,
     "",
@@ -502,9 +526,31 @@ export type PreparedGitRepositoryLayout = {
   shape: GitRepositoryShape;
 };
 
-export function prepareGitRepositoryLayoutResult(context: RuntimeContext): PreparedGitRepositoryLayout {
+// `hostGit` is the launch's single capability probe result. Callers that only
+// re-derive an already admitted layout omit it and keep the classification
+// as-is; a launch passes it so old host Git refuses the shapes it cannot use.
+// `lazyProbeIO`, when given without `hostGit`, probes host Git only once a
+// fatal shape is found, so the refusal never recommends repair commands old
+// host Git cannot run while a valid layout pays for no probe.
+export function prepareGitRepositoryLayoutResult(
+  context: RuntimeContext,
+  hostGit?: HostGitRelativeWorktreesCapability,
+  lazyProbeIO?: RuntimeIO,
+): PreparedGitRepositoryLayout {
   const shape = classifyGitRepository(context.projectRoot);
-  if (shape.kind === "fatal") die(formatGitRepositoryShapeError(shape));
+  if (hostGit) refuseShapeUnusableByHostGit(shape, hostGit);
+  if (shape.kind === "fatal") {
+    let probed: HostGitRelativeWorktreesCapability | undefined;
+    if (!hostGit && lazyProbeIO) {
+      try {
+        probed = probeHostGitRelativeWorktrees(context, lazyProbeIO);
+      } catch {
+        // A failed probe must not hide the layout reason: keep the default text.
+        probed = undefined;
+      }
+    }
+    die(formatGitRepositoryShapeError(shape, hostGit ?? probed));
+  }
   const plan = gitLayoutPlanForShape(context.projectRoot, shape);
   const serialized = serializeGitLayoutPlan(plan);
   const previous = readPersistedGitLayoutPlan(context);
@@ -546,7 +592,84 @@ function gitHelpSupportsRelativeWorktree(io: RuntimeIO, options: SpawnSyncOption
     || `${result.stdout}\n${result.stderr}`.includes("--relative-paths");
 }
 
-export function assertHostGitSupportsRelativeWorktrees(context: RuntimeContext, io: RuntimeIO): void {
+// Display-only: capability is decided by the help-text probe, never by
+// comparing this number, because distributions backport and rename freely.
+export const MIN_HOST_GIT_RELATIVE_WORKTREES_VERSION = "2.48";
+
+// `found` is false when `git --version` itself failed (Git missing or
+// unrunnable); `version` is then "unknown" and `supported` is false.
+export type HostGitRelativeWorktreesCapability = { supported: boolean; version: string; found: boolean };
+
+export function hostGitRelativeWorktreesLaunchRefusal(version: string): string {
+  return `this Git worktree layout requires host Git >= ${MIN_HOST_GIT_RELATIVE_WORKTREES_VERSION} (found ${version}); run runfree from the main checkout, or upgrade Git`;
+}
+
+// Same version-requirement core as the launch refusal above, but for a fatal
+// shape found from the main checkout itself: the operator is already running
+// from the main checkout, so that advice is not an available fix. The real
+// fixes are to remove the nested worktree the old host Git cannot use, or to
+// upgrade Git.
+export function hostGitRelativeWorktreesMainCheckoutRefusal(version: string): string {
+  return `this Git worktree layout requires host Git >= ${MIN_HOST_GIT_RELATIVE_WORKTREES_VERSION} (found ${version}); remove or move the nested worktree (e.g. git worktree remove <path>), or upgrade Git`;
+}
+
+export function hostGitRelativeWorktreesRepairRefusal(version: string): string {
+  return `repairing worktree links requires host Git >= ${MIN_HOST_GIT_RELATIVE_WORKTREES_VERSION} (found ${version}); upgrade Git`;
+}
+
+const HOST_GIT_UBUNTU_UPGRADE = "sudo add-apt-repository ppa:git-core/ppa && sudo apt install git";
+
+export function hostGitRelativeWorktreesDegradedWarning(version: string): string {
+  return `host Git ${version} is older than ${MIN_HOST_GIT_RELATIVE_WORKTREES_VERSION}: Git worktrees created inside the sandbox will make this repository unreadable to host Git; upgrade host Git (Ubuntu: ${HOST_GIT_UBUNTU_UPGRADE})`;
+}
+
+export function hostGitRelativeWorktreesAlreadyUnreadableWarning(version: string): string {
+  return `host Git ${version} is older than ${MIN_HOST_GIT_RELATIVE_WORKTREES_VERSION} and cannot read this repository, which uses relative worktree links; upgrade host Git (Ubuntu: ${HOST_GIT_UBUNTU_UPGRADE})`;
+}
+
+// Classifying a Git repository's worktree layout reads its Git config through
+// Git, so a Git project cannot be checked, and must not be launched, without
+// host Git. A non-Git project needs no such check and launches with the warning
+// below.
+export function hostGitNotFoundRefusal(): string {
+  return `host Git not found: Runfree needs Git to check this repository's worktree layout; install Git ${MIN_HOST_GIT_RELATIVE_WORKTREES_VERSION} or newer`;
+}
+
+export function hostGitNotFoundWarning(): string {
+  return `host Git not found: Git worktrees created inside the sandbox will make this repository unreadable to host Git older than ${MIN_HOST_GIT_RELATIVE_WORKTREES_VERSION}; install Git ${MIN_HOST_GIT_RELATIVE_WORKTREES_VERSION} or newer`;
+}
+
+// The one launch warning for a host Git without relative worktree links, or
+// undefined when host Git supports them. A main checkout whose common config
+// already enables extensions.relativeWorktrees is unreadable to this host Git
+// now, not only after a sandbox worktree is created. The config read is
+// best-effort: a read failure keeps the generic warning instead of aborting.
+// The launch passes its already classified shape; other callers fall back to
+// classifying here, only once the warning is known to be needed.
+export function hostGitRelativeWorktreesLaunchWarning(
+  context: Pick<RuntimeContext, "projectRoot" | "gitRepositoryShape">,
+  hostGit: HostGitRelativeWorktreesCapability,
+): string | undefined {
+  if (hostGit.supported) return undefined;
+  if (!hostGit.found) return hostGitNotFoundWarning();
+  const shape = context.gitRepositoryShape ?? classifyGitRepository(context.projectRoot);
+  if (shape.kind === "normal") {
+    let enabled: string | undefined;
+    try {
+      enabled = readGitConfigValue(path.join(shape.gitDir, "config"), "extensions.relativeWorktrees", true);
+    } catch {
+      enabled = undefined;
+    }
+    if (enabled === "true") return hostGitRelativeWorktreesAlreadyUnreadableWarning(hostGit.version);
+  }
+  return hostGitRelativeWorktreesDegradedWarning(hostGit.version);
+}
+
+function parseHostGitVersion(output: string): string {
+  return /\bgit version (\d+\.\d+(?:\.\d+)?)/.exec(output)?.[1] ?? "unknown";
+}
+
+export function probeHostGitRelativeWorktrees(context: Pick<RuntimeContext, "env">, io: RuntimeIO): HostGitRelativeWorktreesCapability {
   // Subcommand help requires a repository. Use a disposable one so the probe
   // also works outside Git projects and while repairing broken project links.
   const probe = fs.mkdtempSync(path.join(os.tmpdir(), "runfree-git-probe-"));
@@ -557,13 +680,61 @@ export function assertHostGitSupportsRelativeWorktrees(context: RuntimeContext, 
     timeout: 5_000,
   };
   try {
+    const versionResult = io.capture("git", ["--version"], options);
+    const found = versionResult.status === 0;
+    if (!found) return { supported: false, version: "unknown", found };
+    const version = parseHostGitVersion(versionResult.stdout);
     const initialized = io.capture("git", ["init", "--bare", "--quiet", "--template=", probe], options);
-    if (initialized.status !== 0 || !gitHelpSupportsRelativeWorktree(io, options, "repair") || !gitHelpSupportsRelativeWorktree(io, options, "add")) {
-      die("host Git does not support relative worktree links; install a Git version with git worktree --relative-paths support");
-    }
+    const supported = initialized.status === 0
+      && gitHelpSupportsRelativeWorktree(io, options, "repair")
+      && gitHelpSupportsRelativeWorktree(io, options, "add");
+    return { supported, version, found };
   } finally {
     fs.rmSync(probe, { recursive: true, force: true });
   }
+}
+
+export function formatHostGitStatusLine(hostGit: HostGitRelativeWorktreesCapability): string {
+  return `host git: ${hostGit.version} (worktrees: ${hostGit.supported ? "enabled" : "disabled"})`;
+}
+
+// Best-effort `runfree status` line: host Git capability is a host fact the
+// operator needs regardless of whether the runtime itself is running, so it
+// is probed and printed unconditionally. A probe failure must never change
+// the status command's exit code (probeHostGitRelativeWorktrees itself
+// already fails closed to `supported: false`, with version "unknown" when
+// `git --version` fails; the try/catch only guards against the unexpected).
+export function printHostGitStatusLine(context: Pick<RuntimeContext, "env">, io: RuntimeIO): void {
+  try {
+    console.log(formatHostGitStatusLine(probeHostGitRelativeWorktrees(context, io)));
+  } catch {
+    // Status stays useful even when Git cannot be probed.
+  }
+}
+
+function refuseShapeUnusableByHostGit(shape: GitRepositoryShape, hostGit: HostGitRelativeWorktreesCapability): void {
+  if (hostGit.supported) return;
+  if (!hostGit.found && shape.kind !== "none") die(hostGitNotFoundRefusal());
+  if (shape.kind === "fatal") die(formatGitRepositoryShapeError(shape, hostGit));
+  // A relative-linked worktree carries extensions.relativeWorktrees, which
+  // host Git without relative-link support cannot read.
+  if (shape.kind === "relative-linked") die(hostGitRelativeWorktreesLaunchRefusal(hostGit.version));
+}
+
+// Launch preflight: refuse, before any project state is written, the Git
+// shapes that old host Git can neither use nor repair. Classifies only when
+// the capability is missing, so a supported host pays nothing extra.
+export function refuseGitLayoutUnusableByHostGit(projectRoot: string, hostGit: HostGitRelativeWorktreesCapability): void {
+  if (hostGit.supported) return;
+  // Without host Git, classification cannot read Git config and would report
+  // a spawn failure as a broken layout; refuse on any `.git` entry first.
+  if (!hostGit.found && lstatExisting(path.join(projectRoot, ".git"))) die(hostGitNotFoundRefusal());
+  refuseShapeUnusableByHostGit(classifyGitRepository(projectRoot), hostGit);
+}
+
+export function assertHostGitSupportsRelativeWorktrees(context: RuntimeContext, io: RuntimeIO): void {
+  const hostGit = probeHostGitRelativeWorktrees(context, io);
+  if (!hostGit.supported) die(hostGitRelativeWorktreesRepairRefusal(hostGit.version));
 }
 
 export function worktreeRepairCandidateFiles(projectRoot: string): string[] {

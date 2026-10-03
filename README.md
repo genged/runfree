@@ -73,7 +73,9 @@ see [Limitations](#limitations).
 ### 1. Install
 
 Runfree publishes **Apple Silicon macOS** binaries and is supported with
-**Docker Desktop**. You also need `git`.
+**Docker Desktop**. You also need `git`: Git 2.48 or newer gives full
+worktree support. Older Git still works, with limits described in
+[Git worktrees](docs/cli.md#git-worktrees).
 
 ```bash
 brew install genged/tap/runfree

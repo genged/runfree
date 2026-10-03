@@ -48,6 +48,7 @@ import {
 import { prepareDependencyOverlayPlan } from "./runtime/dependency-overlays.ts";
 import { runFencedProjectDestroy } from "./runtime/destroy.ts";
 import { containerMissingNetwork, dockerClientEnvOptions } from "./runtime/docker.ts";
+import { printHostGitStatusLine } from "./runtime/git-layout.ts";
 import { clearStoppedControlPlaneSelection } from "./runtime/stopped-selection.ts";
 import {
   activeOrStartingAgentSessions,
@@ -936,6 +937,7 @@ export function statusRuntime(context: RuntimeContext, io: RuntimeIO, options: {
     // labeled; the dump is `runfree status --verbose`.
     for (const line of statusPostureLines(componentLines, lifecycleLines)) console.log(line);
   }
+  printHostGitStatusLine(context, io);
   printAuditStatusLine(context, io);
   printWriteApprovalStatusLine(context, io);
   printSessionFilesStatusLine(context, io, adapters);

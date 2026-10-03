@@ -19,9 +19,11 @@ import {
   ensureDependencyVolumeOwnership,
   parseDependencyPrepFixRecords,
   parseDependencyPrepProbeRecords,
+  prepareDependencyOverlayPlanResult,
 } from "./dependency-overlays.ts";
 import { composeProjectName } from "./env.ts";
 import type { EphemeralHelperFence } from "./ephemeral-helper.ts";
+import type { RuntimeContext, RuntimeIO } from "./types.ts";
 
 let tmp: string;
 
@@ -931,4 +933,49 @@ test("deps install is refused with a supported message in the per-session runtim
     { docker: {} as unknown as import("./docker.ts").RuntimeDocker },
     (async () => ({ status: 0 })) as never,
   )).rejects.toThrow("`runfree deps install` is not yet available in the per-session runtime");
+});
+
+describe("dependency overlay planning without a prepared Git layout", () => {
+  // Simulated host Git: `git --version` and worktree help decide capability;
+  // every other Git call (the ls-files discovery) fails, which the planner
+  // tolerates as "no Git facts".
+  function hostGitIO(supported: boolean): RuntimeIO {
+    return {
+      capture: (_command, args) => {
+        if (args[0] === "--version") return { status: 0, stdout: "git version 2.43.0\n", stderr: "" };
+        if (args[0] === "init") return { status: 0, stdout: "", stderr: "" };
+        if (args[0] === "worktree") return { status: 129, stdout: supported ? "--relative-paths" : "usage: git worktree", stderr: "" };
+        return { status: 1, stdout: "", stderr: "" };
+      },
+      run: () => 0,
+      commandExists: () => true,
+      confirm: () => true,
+      admin: async () => 0,
+    };
+  }
+
+  function fatalLayoutContext(): RuntimeContext {
+    fs.mkdirSync(path.join(tmp, "elsewhere-git"));
+    const projectRoot = path.join(tmp, "project");
+    fs.mkdirSync(projectRoot);
+    fs.symlinkSync(path.join(tmp, "elsewhere-git"), path.join(projectRoot, ".git"));
+    const stateRoot = path.join(tmp, "xdg");
+    return {
+      projectRoot,
+      project: { config: { runtime: {} }, paths: { stateDir: path.join(stateRoot, "state") } },
+      env: { XDG_CONFIG_HOME: stateRoot, XDG_DATA_HOME: stateRoot, XDG_STATE_HOME: stateRoot },
+    } as unknown as RuntimeContext;
+  }
+
+  test("a fatal Git layout on old host Git names the version requirement instead of repair commands", () => {
+    expect(() => prepareDependencyOverlayPlanResult(fatalLayoutContext(), hostGitIO(false))).toThrow(
+      /\.git must not be a symlink[\s\S]*requires host Git >= 2\.48 \(found 2\.43\.0\); run runfree from the main checkout, or upgrade Git$/,
+    );
+  });
+
+  test("a fatal Git layout on supported host Git keeps the repair commands", () => {
+    expect(() => prepareDependencyOverlayPlanResult(fatalLayoutContext(), hostGitIO(true))).toThrow(
+      /Repair it on the host with:\n {2}git -C .* worktree repair --relative-paths/,
+    );
+  });
 });

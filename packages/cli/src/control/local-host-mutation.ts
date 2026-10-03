@@ -250,7 +250,7 @@ export async function mutateDesiredHost(
     writeSubject: `${scope} policy write`,
     transactionNoun: "host",
     prepare: () => {
-      if (scope === "local") ensureCheckoutLocalPolicyExcluded(context.projectRoot, io);
+      if (scope === "local") ensureCheckoutLocalPolicyExcluded(context.projectRoot, io, context.env);
     },
     plan: (before) => {
       const planned = mutatePolicy(desiredLayerPolicy(before, scope), mutation, scope);

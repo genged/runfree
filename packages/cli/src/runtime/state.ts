@@ -20,7 +20,11 @@ import { ROOT_UID_GID, RUNTIME_VALIDATION_MARKER_PATH } from "./constants.ts";
 import { updateCodexConfig } from "./codex-config.ts";
 import { dockerClientEnvOptions, envOptions, serviceContainerId, shellSingleQuote } from "./docker.ts";
 import { composeProjectName, projectHash } from "./env.ts";
-import { assertHostGitSupportsRelativeWorktrees } from "./git-layout.ts";
+import {
+  type HostGitRelativeWorktreesCapability,
+  hostGitRelativeWorktreesLaunchWarning,
+  probeHostGitRelativeWorktrees,
+} from "./git-layout.ts";
 import {
   mcpOAuthCallbackPort,
   ensureClaudeMcpConfigFile,
@@ -405,10 +409,17 @@ function sandboxGitConfigSource(name: string | undefined, email: string | undefi
   ].join("\n");
 }
 
-export function ensureSandboxGitConfig(context: RuntimeContext, io: RuntimeIO): void {
-  // Relative-link creation upgrades shared Git metadata. Refuse before exposing
-  // that default when the host cannot read the resulting repository extension.
-  assertHostGitSupportsRelativeWorktrees(context, io);
+export function ensureSandboxGitConfig(
+  context: RuntimeContext,
+  io: RuntimeIO,
+  hostGit: HostGitRelativeWorktreesCapability = probeHostGitRelativeWorktrees(context, io),
+): void {
+  // Relative-link creation upgrades shared Git metadata to an extension older
+  // host Git cannot read. Degraded mode still writes the relative default:
+  // `false` would let the agent record absolute container paths whose repair
+  // needs the newer Git anyway. The warning names the outcome and the fix.
+  const degraded = hostGitRelativeWorktreesLaunchWarning(context, hostGit);
+  if (degraded) warn(degraded);
   const gitConfigPath = context.env?.RUNFREE_GIT_CONFIG ?? context.project.paths.gitConfigPath;
   fs.mkdirSync(path.dirname(gitConfigPath), { recursive: true, mode: 0o700 });
   const source = sandboxGitConfigSource(

@@ -3,7 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { afterEach, beforeEach, describe, expect, test } from "vitest";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
 import type { RuntimeIO } from "../runtime/types.ts";
 import { ensureCheckoutLocalPolicyExcluded, LOCAL_POLICY_EXCLUDE_PATTERN } from "./git-exclude.ts";
@@ -49,6 +49,139 @@ describe("checkout-local Git exclusion", () => {
       .split(/\r?\n/)
       .filter((line) => line === LOCAL_POLICY_EXCLUDE_PATTERN);
     expect(matches).toEqual([LOCAL_POLICY_EXCLUDE_PATTERN]);
+  });
+
+  describe("host Git capability", () => {
+    // Real Git for everything but the capability probe, whose help text decides
+    // relative-link support; every capture is recorded, along with the env
+    // each probe capture ran with (to prove env threading below).
+    function hostGitIO(supported: boolean): { io: RuntimeIO; captured: string[][]; probeEnvs: (NodeJS.ProcessEnv | undefined)[] } {
+      const captured: string[][] = [];
+      const probeEnvs: (NodeJS.ProcessEnv | undefined)[] = [];
+      return {
+        captured,
+        probeEnvs,
+        io: {
+          ...io,
+          capture: (commandName, args, options) => {
+            captured.push(args);
+            if (args[0] === "--version") {
+              probeEnvs.push(options?.env);
+              return { status: 0, stdout: "git version 2.43.0\n", stderr: "" };
+            }
+            if (args[0] === "worktree") {
+              probeEnvs.push(options?.env);
+              return { status: 129, stdout: supported ? "    --[no-]relative-paths" : "usage: git worktree repair [<path>...]", stderr: "" };
+            }
+            return io.capture(commandName, args, options);
+          },
+        },
+      };
+    }
+
+    function fatalCheckout(): void {
+      fs.mkdirSync(path.join(root, "elsewhere-git"));
+      fs.symlinkSync(path.join(root, "elsewhere-git"), path.join(root, ".git"));
+    }
+
+    test("names the host Git version requirement on old host Git instead of repair commands it cannot run", () => {
+      fatalCheckout();
+      const { io: oldGit } = hostGitIO(false);
+      let message = "";
+      try {
+        ensureCheckoutLocalPolicyExcluded(root, oldGit);
+      } catch (error) {
+        message = error instanceof Error ? error.message : String(error);
+      }
+      expect(message).toContain(".git must not be a symlink");
+      expect(message).toContain("requires host Git >= 2.48 (found 2.43.0); run runfree from the main checkout, or upgrade Git");
+      expect(message).not.toContain("--relative-paths");
+    });
+
+    test("probes with the caller's context env when one is given, instead of the bare process env", () => {
+      fatalCheckout();
+      const { io: oldGit, probeEnvs } = hostGitIO(false);
+      const callerEnv = { ...process.env, RUNFREE_TEST_GIT_EXCLUDE_ENV_MARKER: "from-caller-context" };
+      expect(() => ensureCheckoutLocalPolicyExcluded(root, oldGit, callerEnv)).toThrow();
+      expect(probeEnvs.length).toBeGreaterThan(0);
+      for (const probeEnv of probeEnvs) {
+        expect(probeEnv?.RUNFREE_TEST_GIT_EXCLUDE_ENV_MARKER).toBe("from-caller-context");
+      }
+    });
+
+    test("keeps the repair commands on supported host Git", () => {
+      fatalCheckout();
+      const { io: newGit } = hostGitIO(true);
+      expect(() => ensureCheckoutLocalPolicyExcluded(root, newGit)).toThrow(/Repair it on the host with:\n {2}git -C .* worktree repair --relative-paths/);
+    });
+
+    // A real relative-linked worktree: real Git creates it, so the supported
+    // case also runs the real `git ls-files` and exclude write.
+    function relativeLinkedWorktree(): string {
+      initGit();
+      const gitEnv = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" };
+      for (const args of [
+        ["-c", "user.name=Test", "-c", "user.email=test@example.test", "commit", "--allow-empty", "-qm", "initial"],
+        ["config", "--local", "worktree.useRelativePaths", "true"],
+        ["worktree", "add", "-qb", "feature", ".worktrees/feature"],
+      ]) expect(childProcess.spawnSync("git", ["-C", root, ...args], { env: gitEnv }).status).toBe(0);
+      return path.join(root, ".worktrees", "feature");
+    }
+
+    test("a relative-linked worktree on old host Git names the version requirement before running git ls-files", () => {
+      const worktree = relativeLinkedWorktree();
+      const excludePath = path.join(root, ".git", "info", "exclude");
+      const originalExclude = fs.readFileSync(excludePath, "utf8");
+      const { io: oldGit, captured } = hostGitIO(false);
+      expect(() => ensureCheckoutLocalPolicyExcluded(worktree, oldGit)).toThrow(
+        /^this Git worktree layout requires host Git >= 2\.48 \(found 2\.43\.0\); run runfree from the main checkout, or upgrade Git$/,
+      );
+      expect(captured.some((args) => args.includes("ls-files"))).toBe(false);
+      expect(fs.readFileSync(excludePath, "utf8")).toBe(originalExclude);
+    });
+
+    test("a relative-linked worktree on supported host Git writes the common exclude as before", () => {
+      const worktree = relativeLinkedWorktree();
+      const { io: newGit, captured } = hostGitIO(true);
+      expect(ensureCheckoutLocalPolicyExcluded(worktree, newGit)).toBe("written");
+      expect(captured.some((args) => args.includes("ls-files"))).toBe(true);
+      expect(fs.readFileSync(path.join(root, ".git", "info", "exclude"), "utf8").split(/\r?\n/)).toContain(LOCAL_POLICY_EXCLUDE_PATTERN);
+    });
+
+    test("missing host Git in a real repository names the missing Git instead of the nested-worktree text, before git ls-files", () => {
+      const excludePath = initGit();
+      const originalExclude = fs.readFileSync(excludePath, "utf8");
+      const captured: string[][] = [];
+      // Every git spawn really fails: the probe's through the env passed in,
+      // classification's config read through the process env.
+      vi.stubEnv("PATH", "");
+      let message = "";
+      try {
+        const noGit: RuntimeIO = {
+          ...io,
+          capture: (commandName, args, options) => {
+            captured.push(args);
+            const result = childProcess.spawnSync(commandName, args, { ...options, encoding: "utf8" });
+            return { status: result.error ? 127 : result.status ?? 1, stdout: result.stdout ?? "", stderr: result.stderr ?? "" };
+          },
+        };
+        ensureCheckoutLocalPolicyExcluded(root, noGit, { PATH: "" });
+      } catch (error) {
+        message = error instanceof Error ? error.message : String(error);
+      } finally {
+        vi.unstubAllEnvs();
+      }
+      expect(message).toBe("host Git not found: Runfree needs Git to check this repository's worktree layout; install Git 2.48 or newer");
+      expect(captured.some((args) => args.includes("ls-files"))).toBe(false);
+      expect(fs.readFileSync(excludePath, "utf8")).toBe(originalExclude);
+    });
+
+    test("a valid checkout never probes host Git", () => {
+      initGit();
+      const { io: recorded, captured } = hostGitIO(false);
+      expect(ensureCheckoutLocalPolicyExcluded(root, recorded)).toBe("written");
+      expect(captured.filter((args) => args[0] === "--version" || args[0] === "worktree")).toEqual([]);
+    });
   });
 
   test("does not require an exclude file outside a Git checkout", () => {

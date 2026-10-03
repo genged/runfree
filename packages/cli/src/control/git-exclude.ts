@@ -1,7 +1,13 @@
 import fs from "node:fs";
 import path from "node:path";
 
-import { classifyGitRepository, formatGitRepositoryShapeError } from "../runtime/git-layout.ts";
+import {
+  classifyGitRepository,
+  formatGitRepositoryShapeError,
+  hostGitNotFoundRefusal,
+  hostGitRelativeWorktreesLaunchRefusal,
+  probeHostGitRelativeWorktrees,
+} from "../runtime/git-layout.ts";
 import type { RuntimeIO } from "../runtime/types.ts";
 
 export const LOCAL_POLICY_EXCLUDE_PATTERN = "/.runfree/network-policy.local.json";
@@ -99,10 +105,32 @@ function writeExclude(filePath: string, contents: string, expected: ExcludeFile)
   }
 }
 
-export function ensureCheckoutLocalPolicyExcluded(projectRoot: string, io: RuntimeIO): "absent-git" | "present" | "written" {
+export function ensureCheckoutLocalPolicyExcluded(
+  projectRoot: string,
+  io: RuntimeIO,
+  env?: NodeJS.ProcessEnv,
+): "absent-git" | "present" | "written" {
   const shape = classifyGitRepository(projectRoot);
   if (shape.kind === "none") return "absent-git";
-  if (shape.kind === "fatal") throw new Error(formatGitRepositoryShapeError(shape));
+  if (shape.kind === "fatal") {
+    // Probe only on the refusal path: old host Git cannot run the repair
+    // commands the default message recommends. Use the caller's context env
+    // when one is reachable, so the probe sees the same Git environment
+    // (e.g. GIT_* overrides) as the rest of that launch; fall back to the
+    // process env when no context is available on this path.
+    const hostGit = probeHostGitRelativeWorktrees({ env: env ?? process.env }, io);
+    throw new Error(formatGitRepositoryShapeError(shape, hostGit));
+  }
+  if (shape.kind === "relative-linked") {
+    // A relative-linked worktree carries extensions.relativeWorktrees, which
+    // old host Git cannot read, so `git ls-files` below would fail with an
+    // unexplained error. Only a probe can tell old from supported Git, so it
+    // runs here on every relative-linked worktree, supported Git included, to
+    // name the requirement before `git ls-files` runs.
+    const hostGit = probeHostGitRelativeWorktrees({ env: env ?? process.env }, io);
+    if (!hostGit.found) throw new Error(hostGitNotFoundRefusal());
+    if (!hostGit.supported) throw new Error(hostGitRelativeWorktreesLaunchRefusal(hostGit.version));
+  }
 
   const tracked = gitCapture(projectRoot, io, ["ls-files", "--error-unmatch", "--", LOCAL_POLICY_REPOSITORY_PATH]);
   if (tracked.status === 0) {

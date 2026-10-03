@@ -2139,22 +2139,126 @@ describe("runtime recovery", () => {
     expect(fs.existsSync(path.join(project.paths.stateDir, "git-layout-plan.json"))).toBe(false);
   });
 
-  test("up refuses unsupported host Git before publishing sandbox config or starting Compose", async () => {
+  // Old host Git lacks `git worktree --relative-paths`; the probe reads that
+  // from the help text and the version only for display.
+  function oldHostGitCapture(command: string, args: string[]) {
+    if (command !== "git") return undefined;
+    if (args[0] === "--version") return captureResult(0, "git version 2.43.0\n");
+    if (args[0] === "worktree") return captureResult(129, "usage: git worktree (old Git)");
+    return undefined;
+  }
+
+  test.each(["plain project", "normal repository"])("up on old host Git launches a %s with one versioned warning and the same sandbox config", async (kind) => {
+    const projectRoot = path.join(tmp, "project");
+    fs.mkdirSync(projectRoot);
+    if (kind === "normal repository") fs.mkdirSync(path.join(projectRoot, ".git"));
+    const project = prepareProject(projectRoot);
+    const io = createRuntimeIO({ capture: oldHostGitCapture });
+    flushWarnings();
+    const status = await up({
+      projectRoot, project, runtimeRoot: path.join(tmp, "runtime"), env: { PATH: "/fake-bin" }, network: fixedNetwork,
+    }, io, false, {});
+    expect(status).toBe(0);
+    const warned = pendingWarningsForTest().map((event) => event.message).filter((message) => message.includes("host Git"));
+    flushWarnings();
+    expect(warned).toEqual([
+      "host Git 2.43.0 is older than 2.48: Git worktrees created inside the sandbox will make this repository unreadable to host Git; upgrade host Git (Ubuntu: sudo add-apt-repository ppa:git-core/ppa && sudo apt install git)",
+    ]);
+    expect(fs.readFileSync(project.paths.gitConfigPath, "utf8")).toContain("\tuseRelativePaths = true");
+    // One capability probe per launch.
+    expect(io.calls.filter((call) => call.method === "capture" && call.command === "git" && call.args[0] === "--version")).toHaveLength(1);
+  });
+
+  // Every file and directory under a root, with file contents, so a refusal
+  // can prove it wrote no project, control, network, or runtime state at all.
+  function stateSnapshot(roots: string[]): Record<string, string> {
+    const snapshot: Record<string, string> = {};
+    const visit = (entry: string): void => {
+      const stat = fs.lstatSync(entry, { throwIfNoEntry: false });
+      if (!stat) return;
+      if (stat.isDirectory()) {
+        snapshot[entry] = "dir";
+        for (const child of fs.readdirSync(entry).sort()) visit(path.join(entry, child));
+        return;
+      }
+      snapshot[entry] = stat.isFile() ? fs.readFileSync(entry, "utf8") : `link:${fs.readlinkSync(entry)}`;
+    };
+    for (const root of roots) visit(root);
+    return snapshot;
+  }
+
+  // No host Git: `git --version` cannot spawn.
+  function missingHostGitCapture(command: string, args: string[]) {
+    if (command !== "git") return undefined;
+    return captureResult(127, "", "spawnSync git ENOENT");
+  }
+
+  test("up without host Git refuses a real Git repository before any state write", async () => {
+    const projectRoot = path.join(tmp, "project");
+    fs.mkdirSync(projectRoot);
+    const gitEnv = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" };
+    expect(childProcess.spawnSync("git", ["init", "-q", projectRoot], { env: gitEnv }).status).toBe(0);
+    const project = prepareProject(projectRoot);
+    const runtimeRoot = path.join(tmp, "runtime");
+    const watched = [project.paths.stateDir, project.paths.runfreeDir, runtimeRoot, path.join(projectRoot, ".git")];
+    const before = stateSnapshot(watched);
+    const io = createRuntimeIO({ capture: missingHostGitCapture });
+    // Git config reads in classification spawn git directly; make them fail too.
+    vi.stubEnv("PATH", "");
+    try {
+      await expect(up({
+        projectRoot, project, runtimeRoot, env: { PATH: "" }, network: fixedNetwork,
+      }, io, false, {})).rejects.toThrow("host Git not found: Runfree needs Git to check this repository's worktree layout; install Git 2.48 or newer");
+    } finally {
+      vi.unstubAllEnvs();
+    }
+    expect(stateSnapshot(watched)).toEqual(before);
+    expect(fs.existsSync(project.paths.gitConfigPath)).toBe(false);
+    expect(io.calls.filter((call) => call.command === "docker")).toEqual([]);
+    expect(io.calls.filter((call) => call.method === "admin")).toEqual([]);
+    flushWarnings();
+  });
+
+  test("up without host Git launches a non-Git project with exactly the not-found warning", async () => {
     const projectRoot = path.join(tmp, "project");
     fs.mkdirSync(projectRoot);
     const project = prepareProject(projectRoot);
-    const io = createRuntimeIO({
-      capture: (command, args) => command === "git" && args[0] === "worktree"
-        ? captureResult(129, "usage: git worktree (old Git)")
-        : undefined,
-    });
-    await expect(up({
+    const io = createRuntimeIO({ capture: missingHostGitCapture });
+    flushWarnings();
+    const status = await up({
       projectRoot, project, runtimeRoot: path.join(tmp, "runtime"), env: { PATH: "/fake-bin" }, network: fixedNetwork,
-    }, io, false, {})).rejects.toThrow("host Git does not support relative worktree links");
-    expect(fs.existsSync(project.paths.gitConfigPath)).toBe(false);
-    expect(io.calls.find((call) => call.method === "run" && call.command === "docker" && call.args.includes("up"))).toBeUndefined();
+    }, io, false, {});
+    expect(status).toBe(0);
+    const warned = pendingWarningsForTest().map((event) => event.message).filter((message) => message.includes("host Git"));
+    flushWarnings();
+    expect(warned).toEqual([
+      "host Git not found: Git worktrees created inside the sandbox will make this repository unreadable to host Git older than 2.48; install Git 2.48 or newer",
+    ]);
   });
 
+  test.each(["allocated", "fixed"])("up from a linked worktree on old host Git refuses before any state write (network %s)", async (networkMode) => {
+    const projectRoot = path.join(tmp, "main", ".worktrees", "feature");
+    prepareRelativeLinkedWorktree(projectRoot);
+    const project = prepareProject(projectRoot);
+    const runtimeRoot = path.join(tmp, "runtime");
+    const watched = [project.paths.stateDir, project.paths.runfreeDir, runtimeRoot, path.join(tmp, "main", ".git")];
+    const before = stateSnapshot(watched);
+    const io = createRuntimeIO({ capture: oldHostGitCapture });
+    await expect(up({
+      projectRoot, project, runtimeRoot, env: { PATH: "/fake-bin" },
+      ...(networkMode === "fixed" ? { network: fixedNetwork } : {}),
+    }, io, false, {})).rejects.toThrow("requires host Git >= 2.48 (found 2.43.0); run runfree from the main checkout, or upgrade Git");
+    // No sandbox Git config, Git layout plan, persisted network allocation,
+    // effective-control state, or Git metadata change: the state tree is untouched.
+    expect(stateSnapshot(watched)).toEqual(before);
+    expect(fs.existsSync(project.paths.gitConfigPath)).toBe(false);
+    expect(fs.existsSync(path.join(project.paths.stateDir, "git-layout-plan.json"))).toBe(false);
+    expect(fs.existsSync(path.join(project.paths.stateDir, "runtime-network.json"))).toBe(false);
+    // Nothing reached Docker: no subnet listing for an allocation, no Compose.
+    expect(io.calls.filter((call) => call.command === "docker")).toEqual([]);
+    expect(io.calls.filter((call) => call.method === "admin")).toEqual([]);
+    flushWarnings();
+  });
 
   // Invariant 3 from the `up` end: every `up` reconciles the proxy's session
   // files, its own records, and its session containers before any launch can
@@ -4726,7 +4830,9 @@ describe("runtime command flow", () => {
     const project = prepareProject(projectRoot);
     const io = createRuntimeIO({
       admin: async () => 42,
-      capture: () => {
+      // The host Git capability probe runs first; only Docker is off limits.
+      capture: (command) => {
+        if (command !== "docker") return undefined;
         throw new Error("Docker should not be touched after prepare fails");
       },
     });
@@ -5158,6 +5264,101 @@ describe("runtime command flow", () => {
     expect(verbose).toContain("launch behavior: per-session schema v2");
     expect(verbose).toContain("next safe action: start the v2 runtime");
     expect(verbose).toContain("session files: unavailable (proxy not running)");
+  });
+
+  test("status reports host Git worktree support when host Git is new enough", () => {
+    const projectRoot = path.join(tmp, "project");
+    const project = prepareProject(projectRoot);
+    const context = {
+      projectRoot,
+      project,
+      runtimeRoot: path.join(tmp, "runtime"),
+      env: { PATH: "/fake-bin" },
+      network: fixedNetwork,
+    } satisfies RuntimeContext;
+    const io = createRuntimeIO({
+      capture: (command, args) => {
+        if (command === "docker" && args[0] === "info") return captureResult(0);
+        if (command === "git" && args[0] === "--version") return captureResult(0, "git version 2.49.0\n");
+        if (command === "git" && args[0] === "init") return captureResult(0);
+        if (command === "git" && args[0] === "worktree" && args.at(-1) === "-h") {
+          return captureResult(129, "    --[no-]relative-paths");
+        }
+        return captureResult(0);
+      },
+    });
+
+    expect(statusRuntime(context, io)).toBe(0);
+    const output = vi.mocked(console.log).mock.calls.map((call) => call.join(" ")).join("\n");
+    expect(output).toContain("host git: 2.49.0 (worktrees: enabled)");
+
+    vi.mocked(console.log).mockClear();
+    expect(statusRuntime(context, io, { verbose: true })).toBe(0);
+    const verbose = vi.mocked(console.log).mock.calls.map((call) => call.join(" ")).join("\n");
+    expect(verbose).toContain("host git: 2.49.0 (worktrees: enabled)");
+  });
+
+  test("status reports host Git worktree support as disabled on old host Git", () => {
+    const projectRoot = path.join(tmp, "project");
+    const project = prepareProject(projectRoot);
+    const context = {
+      projectRoot,
+      project,
+      runtimeRoot: path.join(tmp, "runtime"),
+      env: { PATH: "/fake-bin" },
+      network: fixedNetwork,
+    } satisfies RuntimeContext;
+    const io = createRuntimeIO({
+      capture: (command, args) => {
+        if (command === "docker" && args[0] === "info") return captureResult(0);
+        if (command === "git" && args[0] === "--version") return captureResult(0, "git version 2.43.0\n");
+        if (command === "git" && args[0] === "init") return captureResult(0);
+        if (command === "git" && args[0] === "worktree" && args.at(-1) === "-h") {
+          return captureResult(129, "usage: git worktree repair [<path>...]");
+        }
+        return captureResult(0);
+      },
+    });
+
+    expect(statusRuntime(context, io)).toBe(0);
+    const output = vi.mocked(console.log).mock.calls.map((call) => call.join(" ")).join("\n");
+    expect(output).toContain("host git: 2.43.0 (worktrees: disabled)");
+
+    vi.mocked(console.log).mockClear();
+    expect(statusRuntime(context, io, { verbose: true })).toBe(0);
+    const verbose = vi.mocked(console.log).mock.calls.map((call) => call.join(" ")).join("\n");
+    expect(verbose).toContain("host git: 2.43.0 (worktrees: disabled)");
+  });
+
+  test("a host Git probe failure drops the host git status line without changing the exit code or breaking other status lines", () => {
+    const projectRoot = path.join(tmp, "project");
+    const project = prepareProject(projectRoot);
+    const context = {
+      projectRoot,
+      project,
+      runtimeRoot: path.join(tmp, "runtime"),
+      env: { PATH: "/fake-bin" },
+      network: fixedNetwork,
+    } satisfies RuntimeContext;
+    publishMaterializedRuntimeGenerationV1(context, {});
+    const io = createRuntimeIO({
+      capture: (command, args) => {
+        if (command === "docker" && args[0] === "info") return captureResult(0);
+        // "git --version" is unique to the host Git capability probe; other
+        // Git calls (overlay discovery's `git ls-files`, etc.) must keep
+        // working so a probe failure proves isolated to its own status line.
+        if (command === "git" && args[0] === "--version") throw new Error("git probe exploded");
+        return captureResult(0);
+      },
+    });
+
+    expect(statusRuntime(context, io)).toBe(0);
+    const output = vi.mocked(console.log).mock.calls.map((call) => call.join(" ")).join("\n");
+    expect(output).not.toContain("host git:");
+    // The rest of status still reports: a probe failure is isolated to its
+    // own best-effort line.
+    expect(output).toContain("next safe action: start the v2 runtime");
+    expect(output).toContain("session files: unavailable (proxy not running)");
   });
 
   test("status surfaces open ingress forwarders", () => {
