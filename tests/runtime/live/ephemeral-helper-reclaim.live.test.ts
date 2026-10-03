@@ -121,8 +121,8 @@ type ProfileMode = "slow" | "hang";
 
 function requiredBackend(): LiveRuntimeBackend {
   const backend = process.env.TEST_RUNTIME_BACKEND;
-  if (backend !== "docker-desktop" && backend !== "orbstack") {
-    throw new Error("TEST_RUNTIME_BACKEND must be docker-desktop or orbstack for the ephemeral-helper reclaim tranche");
+  if (backend !== "docker-desktop") {
+    throw new Error("TEST_RUNTIME_BACKEND must be docker-desktop for the ephemeral-helper reclaim tranche");
   }
   return backend;
 }

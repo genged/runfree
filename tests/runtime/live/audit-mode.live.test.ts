@@ -44,8 +44,8 @@ const PRIVATE_AUDITED_HOST = "127.0.0.1.nip.io";
 
 function requiredBackend(): LiveRuntimeBackend {
   const backend = process.env.TEST_RUNTIME_BACKEND;
-  if (backend !== "docker-desktop" && backend !== "orbstack") {
-    throw new Error("TEST_RUNTIME_BACKEND must be docker-desktop or orbstack for the audit-mode tranche");
+  if (backend !== "docker-desktop") {
+    throw new Error("TEST_RUNTIME_BACKEND must be docker-desktop for the audit-mode tranche");
   }
   return backend;
 }

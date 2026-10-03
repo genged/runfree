@@ -232,9 +232,9 @@ static credentials, OAuth handle mediation, MCP import and approval, dependency
 overlays, approve-on-write, audit mode, interrupted-session recovery, and
 Homebrew packaging.
 
-Not in this release: Linux and Intel macOS binaries, OrbStack as a supported
-backend, prebuilt runtime images, npm distribution, and artifact provenance
-attestations.
+Not in this release: Linux and Intel macOS binaries, prebuilt runtime images,
+npm distribution, and artifact provenance attestations. OrbStack is not tested
+or supported.
 
 The published binary is ad-hoc signed, not notarized. Install with Homebrew or
 `scripts/install.sh` — both fetch over curl, which sets no quarantine

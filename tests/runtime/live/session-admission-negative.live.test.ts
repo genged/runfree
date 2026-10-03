@@ -72,8 +72,8 @@ const RESTART_PROBE_AGENT = "pi" as const;
 
 function requiredBackend(): LiveRuntimeBackend {
   const backend = process.env.TEST_RUNTIME_BACKEND;
-  if (backend !== "docker-desktop" && backend !== "orbstack") {
-    throw new Error("TEST_RUNTIME_BACKEND must be docker-desktop or orbstack for the negative admission tranche");
+  if (backend !== "docker-desktop") {
+    throw new Error("TEST_RUNTIME_BACKEND must be docker-desktop for the negative admission tranche");
   }
   return backend;
 }

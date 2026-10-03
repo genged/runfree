@@ -65,10 +65,10 @@ describe("resolveDockerEndpoint", () => {
 
   it("reads currentContext from config.json", () => {
     const fsx = fakeFs({
-      [path.join(CONFIG_DIR, "config.json")]: JSON.stringify({ currentContext: "orbstack" }),
-      ...contextMeta("orbstack", "unix:///home/u/.orbstack/run/docker.sock"),
+      [path.join(CONFIG_DIR, "config.json")]: JSON.stringify({ currentContext: "other-engine" }),
+      ...contextMeta("other-engine", "unix:///home/u/.other-engine/docker.sock"),
     });
-    expect(resolveDockerEndpoint({ HOME }, fsx)).toEqual({ kind: "unix", socketPath: "/home/u/.orbstack/run/docker.sock", context: "orbstack" });
+    expect(resolveDockerEndpoint({ HOME }, fsx)).toEqual({ kind: "unix", socketPath: "/home/u/.other-engine/docker.sock", context: "other-engine" });
   });
 
   it("uses the passwd home when HOME is unset, as the CLI does", () => {

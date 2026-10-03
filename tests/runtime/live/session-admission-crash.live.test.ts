@@ -119,8 +119,8 @@ const AUTHORITY_LEASE_MAX_MS = 5 * 60_000;
 
 function requiredBackend(): LiveRuntimeBackend {
   const backend = process.env.TEST_RUNTIME_BACKEND;
-  if (backend !== "docker-desktop" && backend !== "orbstack") {
-    throw new Error("TEST_RUNTIME_BACKEND must be docker-desktop or orbstack for the crash admission tranche");
+  if (backend !== "docker-desktop") {
+    throw new Error("TEST_RUNTIME_BACKEND must be docker-desktop for the crash admission tranche");
   }
   return backend;
 }
@@ -669,8 +669,8 @@ describe("per-session admission survives a crash at every transition", () => {
   // (neither has a restart policy). The next start used to refuse that
   // pending record with `runfree rebuild` as the only remedy.
   //
-  // The daemon itself is not restarted here: that cannot be done portably
-  // across Docker Desktop and OrbStack from a test. Its whole effect on this
+  // The daemon itself is not restarted here: Docker Desktop cannot be restarted
+  // reliably from a test. Its whole effect on this
   // project is reproduced instead, from the same parts a real death leaves —
   // a launch parked at its refused session-file delete (the stamp written, the
   // record kept), the session container and the proxy killed the way a daemon

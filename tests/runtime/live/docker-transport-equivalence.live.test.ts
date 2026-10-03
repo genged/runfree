@@ -37,8 +37,8 @@ const MISSING_ID = "f".repeat(64);
 
 function requiredBackend(): LiveRuntimeBackend {
   const backend = process.env.TEST_RUNTIME_BACKEND;
-  if (backend !== "docker-desktop" && backend !== "orbstack") {
-    throw new Error("TEST_RUNTIME_BACKEND must be docker-desktop or orbstack for the docker transport equivalence tranche");
+  if (backend !== "docker-desktop") {
+    throw new Error("TEST_RUNTIME_BACKEND must be docker-desktop for the docker transport equivalence tranche");
   }
   return backend;
 }

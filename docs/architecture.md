@@ -820,11 +820,11 @@ and the topology digest, forcing every project through re-approval and
 recreation for no gain. Any container occupying either address is an unknown
 participant and fails session allocation closed.
 
-`make test-live-session-admission-docker-desktop` and its OrbStack counterpart
-run the standalone admission tranches against a real daemon. Each built-in
-agent is admitted, proved and revoked by a successful admission slice
-somewhere in the negative tranche, which rotates the agent across the probes it
-already runs rather than repeating one built-in.
+`make test-live-session-admission-docker-desktop` runs the standalone
+admission tranches against a real daemon. Each built-in agent is admitted,
+proved and revoked by a successful admission slice somewhere in the negative
+tranche, which rotates the agent across the probes it already runs rather
+than repeating one built-in.
 
 Unexpected CLI failures render bounded nested `AggregateError.errors` and
 `Error.cause` name/message chains while retaining only the top-level stack.

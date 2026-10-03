@@ -219,12 +219,12 @@ export function lastObservedDockerDaemonIdentity(): DockerDaemonIdentity | undef
 
 function dockerAvailable(context: RuntimeContext, io: RuntimeIO): boolean {
   if (!io.commandExists("docker", dockerClientEnvOptions(context))) {
-    die("docker not found - install Docker Desktop or OrbStack first");
+    die("docker not found - install Docker Desktop first");
   }
   lastDockerDaemonIdentity = undefined;
   const info = io.capture("docker", ["info", "--format", "{{json .}}"], dockerClientEnvOptions(context));
   if (info.status !== 0 || dockerInfoServerError(info.stdout) !== undefined) {
-    die("docker daemon not running - start Docker / OrbStack first");
+    die("docker daemon not running - start Docker Desktop first");
   }
   lastDockerDaemonIdentity = parseDockerDaemonIdentity(info.stdout);
   return true;

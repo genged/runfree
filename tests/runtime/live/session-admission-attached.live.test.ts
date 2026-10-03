@@ -943,7 +943,7 @@ describe("attached per-session authority is exact and drift after the proof fail
   // `aliveUntil`, and the proxy compares it against the clock of the VM its
   // container runs in. A guest clock that lags the host's would therefore keep
   // serving a file the host considers expired, for as long as the lag. The
-  // fixture drives Docker Desktop and OrbStack through the ordinary client and
+  // fixture drives Docker Desktop through the ordinary client and
   // has no way to step the VM's clock (the daemon's own time is not a
   // per-container setting, and moving the host clock under a running run would
   // invalidate every other timing assertion in this file), so the case has no

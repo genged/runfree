@@ -72,7 +72,7 @@ function liveRuntimeWorkers(): number {
 }
 
 const liveRuntimeBackend = process.env.TEST_RUNTIME_BACKEND;
-const liveRuntimeEnabled = liveRuntimeBackend === "docker-desktop" || liveRuntimeBackend === "orbstack";
+const liveRuntimeEnabled = liveRuntimeBackend === "docker-desktop";
 const cliE2eEnabled = Boolean(process.env.RUNFREE_E2E_ARTIFACT);
 const cliE2eLiveEnabled = cliE2eEnabled && liveRuntimeEnabled && Boolean(process.env.RUNFREE_E2E_DOCKER_HOST);
 

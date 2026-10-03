@@ -55,7 +55,7 @@ const CAPTURE_MAX_BYTES = 32 * 1024 * 1024;
 const RECOVERY_RETRY_DELAY_MS = 1_000;
 const MAX_RECOVERY_ATTEMPTS = 3;
 
-export type SessionAdmissionMatrixBackend = "docker-desktop" | "orbstack";
+export type SessionAdmissionMatrixBackend = "docker-desktop";
 
 export type SessionAdmissionMatrixOptions = Readonly<{
   agents: readonly SessionAdmissionProbeAgent[];
@@ -200,8 +200,8 @@ export function parseSessionAdmissionMatrixArgs(
       if (selected.includes(agent)) throw new Error(`duplicate session admission agent: ${agent}`);
       selected.push(agent);
     } else if (option === "--backend") {
-      if (value !== "docker-desktop" && value !== "orbstack") {
-        throw new Error("--backend must be docker-desktop or orbstack");
+      if (value !== "docker-desktop") {
+        throw new Error("--backend must be docker-desktop");
       }
       backend = value;
     } else if (option === "--repeat") {
@@ -260,11 +260,7 @@ export function inspectSessionAdmissionMatrixBackend(
   const platformName = captureDockerValue(io, ["version", "--format", "{{.Server.Platform.Name}}"], "platform name");
   const operatingSystem = captureDockerValue(io, ["info", "--format", "{{.OperatingSystem}}"], "operating system");
   const normalized = `${platformName} ${operatingSystem}`.toLowerCase();
-  const detected = normalized.includes("orbstack")
-    ? "orbstack"
-    : normalized.includes("docker desktop")
-      ? "docker-desktop"
-      : undefined;
+  const detected = normalized.includes("docker desktop") ? "docker-desktop" : undefined;
   if (detected !== expected) {
     throw new Error(
       `expected ${expected}, detected ${detected ?? "unclassified"}: ${platformName} / ${operatingSystem}`,

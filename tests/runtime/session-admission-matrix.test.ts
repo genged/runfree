@@ -121,12 +121,12 @@ describe("internal session admission live matrix", () => {
     expect(() => parseSessionAdmissionMatrixArgs(["--workspace", "/tmp/sandbox"]))
       .toThrow("--backend is required");
     expect(() => parseSessionAdmissionMatrixArgs(["--workspace", "/tmp/sandbox", "--backend", "linux"]))
-      .toThrow("--backend must be docker-desktop or orbstack");
+      .toThrow("--backend must be docker-desktop");
     expect(() => parseSessionAdmissionMatrixArgs([
       "--workspace",
       "/tmp/sandbox",
       "--backend",
-      "orbstack",
+      "docker-desktop",
       "--repeat",
       "21",
     ])).toThrow("--repeat must be an integer from 1 through 20");
@@ -134,7 +134,7 @@ describe("internal session admission live matrix", () => {
       "--workspace",
       "/tmp/sandbox",
       "--backend",
-      "orbstack",
+      "docker-desktop",
       "--cleanup-request-after-seconds",
       "29",
     ])).toThrow("--cleanup-request-after-seconds must be an integer from 30 through 3600");
@@ -142,7 +142,7 @@ describe("internal session admission live matrix", () => {
       "--workspace",
       "/tmp/sandbox",
       "--backend",
-      "orbstack",
+      "docker-desktop",
       "--workspace",
       "/tmp/other",
     ])).toThrow("duplicate session admission matrix option: --workspace");
@@ -150,7 +150,7 @@ describe("internal session admission live matrix", () => {
       "--workspace",
       "/tmp/sandbox",
       "--backend",
-      "orbstack",
+      "docker-desktop",
       "--agents",
       "claude",
     ])).toThrow("unknown session admission matrix option: --agents");
@@ -163,7 +163,7 @@ describe("internal session admission live matrix", () => {
       "--workspace",
       "/tmp/sandbox",
       "--backend",
-      "orbstack",
+      "docker-desktop",
       "--agent",
       "pi",
       "--agent",
@@ -174,7 +174,7 @@ describe("internal session admission live matrix", () => {
       "--workspace",
       "/tmp/sandbox",
       "--backend",
-      "orbstack",
+      "docker-desktop",
       "--agent",
       "codex",
     ]).agents).toEqual(["codex"]);
@@ -183,7 +183,7 @@ describe("internal session admission live matrix", () => {
       "--workspace",
       "/tmp/sandbox",
       "--backend",
-      "orbstack",
+      "docker-desktop",
       "--agent",
       "gemini",
     ])).toThrow("--agent must be one of claude, codex, pi");
@@ -192,7 +192,7 @@ describe("internal session admission live matrix", () => {
       "--workspace",
       "/tmp/sandbox",
       "--backend",
-      "orbstack",
+      "docker-desktop",
       "--agent",
       "claude",
       "--agent",
@@ -216,8 +216,13 @@ describe("internal session admission live matrix", () => {
       platformName: "Docker Engine - Community",
       version: "29.0.0",
     });
-    expect(() => inspectSessionAdmissionMatrixBackend("orbstack", io))
-      .toThrow("expected orbstack, detected docker-desktop");
+
+    const engineIO = backendIO({
+      [["version", "--format", "{{.Server.Platform.Name}}"].join("\0")]: "Docker Engine - Community",
+      [["info", "--format", "{{.OperatingSystem}}"].join("\0")]: "Ubuntu 24.04 LTS",
+    });
+    expect(() => inspectSessionAdmissionMatrixBackend("docker-desktop", engineIO))
+      .toThrow("expected docker-desktop, detected unclassified: Docker Engine - Community / Ubuntu 24.04 LTS");
   });
 
   test("accepts only the exact non-degenerate worker bootstrap nonce", () => {

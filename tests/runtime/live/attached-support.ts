@@ -111,8 +111,8 @@ export const CONSUMER_CONVERGENCE_TIMEOUT_MS = 15_000;
 
 export function requiredBackend(): LiveRuntimeBackend {
   const backend = process.env.TEST_RUNTIME_BACKEND;
-  if (backend !== "docker-desktop" && backend !== "orbstack") {
-    throw new Error("TEST_RUNTIME_BACKEND must be docker-desktop or orbstack for the attached admission tranche");
+  if (backend !== "docker-desktop") {
+    throw new Error("TEST_RUNTIME_BACKEND must be docker-desktop for the attached admission tranche");
   }
   return backend;
 }

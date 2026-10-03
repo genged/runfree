@@ -376,7 +376,7 @@ describe("docker API transport: what stays on the CLI", () => {
 
 describe("docker API transport: binding to the CLI's daemon", () => {
   it.each([
-    ["the CLI resolved another context", cliVersionJson({ context: "orbstack" })],
+    ["the CLI resolved another context", cliVersionJson({ context: "other-engine" })],
     ["the CLI's server has another kernel", cliVersionJson({ server: { ...DAEMON_VERSION, KernelVersion: "6.1.0" } })],
     ["the CLI's server has another commit", cliVersionJson({ server: { ...DAEMON_VERSION, GitCommit: "abc1234" } })],
     ["the CLI reports no server", JSON.stringify({ Client: { ApiVersion: "1.47", Context: "default" } })],

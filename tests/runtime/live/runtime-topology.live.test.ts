@@ -81,8 +81,8 @@ const DENIED_PROBE_HOST = "denied.sandbox.invalid";
 
 function requiredBackend(): LiveRuntimeBackend {
   const backend = process.env.TEST_RUNTIME_BACKEND;
-  if (backend !== "docker-desktop" && backend !== "orbstack") {
-    throw new Error("TEST_RUNTIME_BACKEND must be docker-desktop or orbstack for the read-only runtime tranches");
+  if (backend !== "docker-desktop") {
+    throw new Error("TEST_RUNTIME_BACKEND must be docker-desktop for the read-only runtime tranches");
   }
   return backend;
 }

@@ -1,6 +1,6 @@
 SHELL := /bin/bash
 
-.PHONY: help test test-all test-release test-static test-unit test-agent test-proxy test-security test-templates test-cli-e2e test-cli-e2e-live test-runtime test-runtime-core test-runtime-extended test-runtime-smoke test-runtime-live test-runtime-live-topology test-runtime-live-managed-launch test-runtime-live-egress test-runtime-live-connect-guard test-runtime-live-request-shape test-runtime-live-audit test-runtime-live-allowlist test-runtime-live-policy-mutation test-runtime-live-mcp-enable test-runtime-live-helper-reclaim test-runtime-live-docker-transport test-live-session-admission-docker-desktop test-live-session-admission-orbstack test-live-session-admission-negative-docker-desktop test-live-session-admission-negative-orbstack test-live-session-admission-attached-docker-desktop test-live-session-admission-attached-orbstack test-live-session-renewal-docker-desktop test-live-session-renewal-orbstack test-live-session-independence-docker-desktop test-live-session-independence-orbstack test-live-session-admission-crash-docker-desktop test-live-session-admission-crash-orbstack test-live-session-admission-drift-docker-desktop test-live-session-admission-drift-orbstack test-live-session-entry-gate-docker-desktop test-live-session-entry-gate-orbstack reclaim-runtime-sandbox reclaim-runtime-sandbox-apply test-watch
+.PHONY: help test test-all test-release test-static test-unit test-agent test-proxy test-security test-templates test-cli-e2e test-cli-e2e-live test-runtime test-runtime-core test-runtime-extended test-runtime-smoke test-runtime-live test-runtime-live-topology test-runtime-live-managed-launch test-runtime-live-egress test-runtime-live-connect-guard test-runtime-live-request-shape test-runtime-live-audit test-runtime-live-allowlist test-runtime-live-policy-mutation test-runtime-live-mcp-enable test-runtime-live-helper-reclaim test-runtime-live-docker-transport test-live-session-admission-docker-desktop test-live-session-admission-negative-docker-desktop test-live-session-admission-attached-docker-desktop test-live-session-renewal-docker-desktop test-live-session-independence-docker-desktop test-live-session-admission-crash-docker-desktop test-live-session-admission-drift-docker-desktop test-live-session-entry-gate-docker-desktop reclaim-runtime-sandbox reclaim-runtime-sandbox-apply test-watch
 
 help:
 	@printf '%s\n' \
@@ -26,13 +26,12 @@ help:
 		'  make test-runtime-live-helper-reclaim  Ephemeral-helper tranche: bounded runs, exact-id reclaim, the pinned helper address' \
 		'  make test-runtime-live-docker-transport  Engine API transport: CLI-equal answers for every routed docker argv' \
 		'  make test-live-session-admission-docker-desktop  Run every standalone admission tranche on Docker Desktop' \
-		'  make test-live-session-admission-orbstack  Run every standalone admission tranche on OrbStack' \
-		'  make test-live-session-admission-negative-<backend>  Negative refusal tranche only' \
-		'  make test-live-session-admission-attached-<backend>  Attached authority/consumer tranche only' \
-		'  make test-live-session-renewal-<backend>  Renewal availability under sustained contention only' \
-		'  make test-live-session-independence-<backend>       Session-independence replacement cases only' \
-		'  make test-live-session-admission-crash-<backend>     Crash/recovery tranche only' \
-		'  make test-live-session-admission-drift-<backend>     Mid-lifecycle drift tranche only' \
+		'  make test-live-session-admission-negative-docker-desktop  Negative refusal tranche only' \
+		'  make test-live-session-admission-attached-docker-desktop  Attached authority/consumer tranche only' \
+		'  make test-live-session-renewal-docker-desktop  Renewal availability under sustained contention only' \
+		'  make test-live-session-independence-docker-desktop       Session-independence replacement cases only' \
+		'  make test-live-session-admission-crash-docker-desktop     Crash/recovery tranche only' \
+		'  make test-live-session-admission-drift-docker-desktop     Mid-lifecycle drift tranche only' \
 		'  make reclaim-runtime-sandbox  List Docker resources left by kept live runs' \
 		'  make reclaim-runtime-sandbox-apply  Remove what reclaim-runtime-sandbox lists' \
 		'  make test-watch           Vitest watch mode'
@@ -46,9 +45,7 @@ test: test-static test-unit
 test-release: test-static test-unit test-templates test-cli-e2e
 
 # The backend the live runtime suite runs on when folded into test-all.
-# Docker Desktop is the gating backend for Item 4 (maintainer decision,
-# 2026-08-14); OrbStack is deferred past the cutover and gates nothing, but
-# TEST_RUNTIME_BACKEND=orbstack still selects it here.
+# Docker Desktop is the only backend: OrbStack is not tested or supported.
 TEST_RUNTIME_BACKEND ?= docker-desktop
 
 # test-runtime runs the entire runtime-live project (every *.live.test.ts,
@@ -140,8 +137,7 @@ test-cli-e2e-live: test-cli-e2e-build
 # The live runtime security proof: the whole runtime-live project — every
 # *.live.test.ts, session-admission tranches included. Replaces the retired
 # tests/runtime/sandbox.sh (which was pre-flip: it exec'd into the removed shared
-# `agent` service). Each describe block provisions and destroys its own runtime;
-# override the backend with `make test-runtime TEST_RUNTIME_BACKEND=orbstack`.
+# `agent` service). Each describe block provisions and destroys its own runtime.
 # Use the narrower targets below to iterate on one tranche.
 #
 # Files run four at a time (`TEST_RUNTIME_WORKERS`, default 4 — see
@@ -183,31 +179,25 @@ test-runtime-live-docker-transport:
 # Standalone live tranches, provisioning their own minimal fixture instead of
 # running behind the cumulative sandbox.
 #
-# These two targets run every `*.live.test.ts` under tests/runtime, the same
+# This target runs every `*.live.test.ts` under tests/runtime, the same
 # files as `test-runtime`. Each describe block provisions and destroys its own
 # runtime, so this is several full builds. Use the per-tranche targets below
 # while iterating on one of them.
 test-live-session-admission-docker-desktop:
 	TEST_RUNTIME_BACKEND=docker-desktop pnpm exec vitest run --project runtime-live
 
-test-live-session-admission-orbstack:
-	TEST_RUNTIME_BACKEND=orbstack pnpm exec vitest run --project runtime-live
 
 # Negative only: unknown participant, capability drop and its mutation, address
 # conflict at start, and convergence after a proxy restart.
 test-live-session-admission-negative-docker-desktop:
 	TEST_RUNTIME_BACKEND=docker-desktop pnpm exec vitest run --project runtime-live session-admission-negative
 
-test-live-session-admission-negative-orbstack:
-	TEST_RUNTIME_BACKEND=orbstack pnpm exec vitest run --project runtime-live session-admission-negative
 
 # Drift only: the world changes under a paused lifecycle (address taken before
 # start, second network attached after start, address reuse identity).
 test-live-session-admission-drift-docker-desktop:
 	TEST_RUNTIME_BACKEND=docker-desktop pnpm exec vitest run --project runtime-live session-admission-drift
 
-test-live-session-admission-drift-orbstack:
-	TEST_RUNTIME_BACKEND=orbstack pnpm exec vitest run --project runtime-live session-admission-drift
 
 # Attached only: an activated session's authority is exactly its source IP in
 # both paired consumers, and drift after the running proof is refused by lease
@@ -216,16 +206,12 @@ test-live-session-admission-drift-orbstack:
 test-live-session-admission-attached-docker-desktop:
 	TEST_RUNTIME_BACKEND=docker-desktop pnpm exec vitest run --project runtime-live session-admission-attached
 
-test-live-session-admission-attached-orbstack:
-	TEST_RUNTIME_BACKEND=orbstack pnpm exec vitest run --project runtime-live session-admission-attached
 
 # Renewal availability only: every short-lease session renewing under sustained
 # competing launches.
 test-live-session-renewal-docker-desktop:
 	TEST_RUNTIME_BACKEND=docker-desktop pnpm exec vitest run --project runtime-live session-admission-renewal
 
-test-live-session-renewal-orbstack:
-	TEST_RUNTIME_BACKEND=orbstack pnpm exec vitest run --project runtime-live session-admission-renewal
 
 # The session-independence replacement cases only: sessions surviving a
 # compatible proxy replacement (L5), a candidate whose allowed destination IPs
@@ -237,8 +223,6 @@ test-live-session-renewal-orbstack:
 test-live-session-independence-docker-desktop:
 	TEST_RUNTIME_BACKEND=docker-desktop pnpm exec vitest run --project runtime-live session-independence
 
-test-live-session-independence-orbstack:
-	TEST_RUNTIME_BACKEND=orbstack pnpm exec vitest run --project runtime-live session-independence
 
 # Session entry gate negative only: a project image whose entry sends before
 # activation is refused as a provisioning peer, and the runtime still admits.
@@ -248,8 +232,6 @@ test-live-session-independence-orbstack:
 test-live-session-entry-gate-docker-desktop:
 	TEST_RUNTIME_BACKEND=docker-desktop pnpm exec vitest run --project runtime-live session-entry-gate
 
-test-live-session-entry-gate-orbstack:
-	TEST_RUNTIME_BACKEND=orbstack pnpm exec vitest run --project runtime-live session-entry-gate
 
 # Crash only: SIGKILL at each lifecycle transition, then recovery to empty.
 # No transition is skipped: preflight reclaims records whose owning host process
@@ -257,8 +239,6 @@ test-live-session-entry-gate-orbstack:
 test-live-session-admission-crash-docker-desktop:
 	TEST_RUNTIME_BACKEND=docker-desktop pnpm exec vitest run --project runtime-live session-admission-crash
 
-test-live-session-admission-crash-orbstack:
-	TEST_RUNTIME_BACKEND=orbstack pnpm exec vitest run --project runtime-live session-admission-crash
 
 # The migrated non-admission live runtime security tranches (topology, managed
 # launch, egress containment, CONNECT guard, request shape, audit mode,
@@ -270,7 +250,7 @@ test-live-session-admission-crash-orbstack:
 # tests/runtime/live/runtime-topology.live.test.ts; the per-tranche targets
 # below select their describe blocks with -t. Other tranches provision and
 # destroy their own runtime. Backend is $(TEST_RUNTIME_BACKEND) (default
-# docker-desktop); override with `make test-runtime-live TEST_RUNTIME_BACKEND=orbstack`.
+# docker-desktop, the only supported backend).
 test-runtime-live:
 	TEST_RUNTIME_BACKEND=$(TEST_RUNTIME_BACKEND) pnpm exec vitest run --project runtime-live \
 		runtime-topology managed-launch request-shape audit-mode allowlist-lifecycle live-policy-mutation mcp-enable

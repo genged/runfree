@@ -35,7 +35,7 @@ const CONTROL_CHARACTERS = /[\u0000-\u001f\u007f-\u009f]/gu;
 // runtime never carries it, so this can never count a maintainer's own work.
 const SANDBOX_MOUNT_SIGNATURE = SANDBOX_PROJECT_PREFIX;
 
-export type LiveRuntimeBackend = "docker-desktop" | "orbstack";
+export type LiveRuntimeBackend = "docker-desktop";
 
 export type CaptureResult = Readonly<{
   status: number;

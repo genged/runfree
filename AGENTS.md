@@ -118,6 +118,8 @@ project policy lives under `.runfree/`.
 - Host-side writes to project-controlled paths must reject symlinks, hard
   links, and special files. Use `safeReplaceProjectFile`,
   `ensureSafeProjectDir`, and related helpers.
+- OrbStack is never tested or supported. Docker Desktop is the only tested backend.
+  Do not add OrbStack targets, backend values, docs, or owed gates.
 - Do not mount host-wide secrets or home config into the agent. Per-project
   Claude/Codex state and generated Git identity are the intended exceptions.
 

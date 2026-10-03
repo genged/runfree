@@ -304,8 +304,8 @@ Details: [Write Approval Grants](architecture.md#write-approval-grants).
    (`TINI_SUBREAPER`, `TINI_KILL_PROCESS_GROUP`, `TINI_VERBOSITY`) are honored:
    none changes identity, capabilities, mounts, or network, and Docker's
    SIGKILL after the stop timeout is the real stop bound. The engine must ship
-   Docker's init (`docker-init`); Docker Desktop, OrbStack, and Docker Engine
-   packages do. Without it, the container fails to start, the daemon's error
+   Docker's init (`docker-init`); Docker Desktop and Docker Engine packages
+   do. Without it, the container fails to start, the daemon's error
    is shown, and nothing is left behind.
    The init is recorded in each session's stored template: a session started
    by an older release keeps its template, runs without the init, and is
@@ -416,8 +416,8 @@ agent real power upstream. Treat each one as a security decision.
 ## Platform Status
 
 The only supported host is Apple Silicon macOS with Docker Desktop. The only
-release artifact is `darwin-arm64`. Intel macOS, Linux, and OrbStack can work,
-but they are not supported.
+release artifact is `darwin-arm64`. Intel macOS and Linux can work, but they
+are not supported. OrbStack is not tested or supported.
 
 ## Verification
 
