@@ -49,6 +49,14 @@ const REMOVED_COMMAND_FRAGMENTS = new Set([
   "runfree paste-image",
 ]);
 
+// Commands the host-services feature emits before its CLI command lands: the
+// proxy's host-service remedy names `runfree host-service add`, which the
+// host-services plan adds in a later task. That task removes this entry, so
+// the remedy is then parsed like every other emitted command.
+const PENDING_COMMAND_PREFIXES: readonly string[] = [
+  "runfree host-service add ",
+];
+
 // English words that end a command fragment inside prose ("runfree update
 // does not ..."). None is a Runfree command word or flag.
 const PROSE_STOP_WORDS = new Set([
@@ -232,6 +240,7 @@ describe("emitted commands parse under the real command app", () => {
     const failures: string[] = [];
     for (const candidate of candidates) {
       if (REMOVED_COMMAND_FRAGMENTS.has(candidate.fragment)) continue;
+      if (PENDING_COMMAND_PREFIXES.some((prefix) => candidate.fragment.startsWith(prefix))) continue;
       const failure = await parseFailure(candidate.argv);
       if (!failure) continue;
       // A prose mention may name a command prefix; a presented next step may

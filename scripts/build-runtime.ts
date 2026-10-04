@@ -90,6 +90,7 @@ export const RUNTIME_ASSET_DESCRIPTORS: readonly RuntimeAssetDescriptor[] = [
   proxyImage("proxy/firewall/route.js"),
   proxyImage("proxy/firewall/supervisor.js"),
   proxyImage("proxy/graphql-classify.js"),
+  proxyImage("proxy/host-service-tunnel.js"),
   proxyImage("proxy/mcp-classify.js"),
   proxyImage("proxy/mockttp-adapter.js"),
   proxyImage("proxy/oauth-mediation.js"),
@@ -511,6 +512,7 @@ function copyTree(source: string, destination: string, options: {
 function rewriteRuntimeContractImports(filePath: string): void {
   const replacements = new Map([
     ["@runfree/runtime-contracts/effective-control", path.join(outputRoot, "proxy", "contracts", "effective-control.js")],
+    ["@runfree/runtime-contracts/host-services", path.join(outputRoot, "proxy", "contracts", "host-services.js")],
     ["@runfree/runtime-contracts/network-policy", path.join(outputRoot, "proxy", "contracts", "network-policy.js")],
     ["@runfree/runtime-contracts/mcp-operation-policy", path.join(outputRoot, "proxy", "contracts", "mcp-operation-policy.js")],
     ["@runfree/runtime-contracts/oauth-mediation-policy", path.join(outputRoot, "proxy", "contracts", "oauth-mediation-policy.js")],

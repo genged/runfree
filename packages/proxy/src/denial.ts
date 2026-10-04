@@ -40,6 +40,9 @@ export const DENIAL_REASONS = [
   "write-approval-timeout",
   "write-approval-capacity",
   "write-approval-session-denied",
+  "host-service-not-configured",
+  "host-service-unavailable",
+  "host-service-capacity",
   "policy-denied",
 ] as const;
 
@@ -90,10 +93,17 @@ const DENIAL_REASON_TEXT: Record<DenialReason, string> = {
   // A session-wide deny covers this session until the operator clears it;
   // the reason code stays stable as a wire identifier.
   "write-approval-session-denied": "the operator denied writes for this session until they clear the deny",
+  "host-service-not-configured": "this host service is not approved for the project",
+  "host-service-unavailable": "the host-service gateway or the host service is not available",
+  "host-service-capacity": "too many host-service connections are already open",
   // Defensive catch-all for a denial no earlier classification arm named. The
   // 403 body carries the precise message; this text serves doctor/summary.
   "policy-denied": "blocked by proxy policy",
 };
+
+export function denialReasonText(reason: DenialReason): string {
+  return DENIAL_REASON_TEXT[reason];
+}
 
 // Re-normalize before display. `requestHost()` output admits a broader
 // charset than `normalizeHostname` (underscores, trailing dots, raw IDN), so

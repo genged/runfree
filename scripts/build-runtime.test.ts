@@ -215,6 +215,12 @@ describe("runtime bundle build", () => {
     expect(server).not.toContain("@runfree/runtime-contracts");
     expect(server).not.toContain("/packages/");
     expect(server).not.toContain("/src/");
+    // Every shipped proxy module, not only the entrypoints: an unrewritten
+    // workspace specifier cannot resolve inside the proxy image.
+    const unrewritten = expectedRuntimeAssetPaths()
+      .filter((assetPath) => assetPath.startsWith("proxy/") && assetPath.endsWith(".js"))
+      .filter((assetPath) => /["']@runfree\/runtime-contracts/.test(read(assetPath)));
+    expect(unrewritten).toEqual([]);
     expect(fs.existsSync(path.join(runtimeRoot, "proxy", "stale-proxy.js"))).toBe(false);
     expect(fs.existsSync(path.join(runtimeRoot, "proxy", "contracts", "stale-contract.js"))).toBe(false);
     expect(fs.existsSync(staleProxyOutput)).toBe(false);
