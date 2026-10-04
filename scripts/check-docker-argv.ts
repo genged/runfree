@@ -26,6 +26,7 @@ export const DOCKER_LITERAL_ALLOWLIST: Readonly<Record<string, string>> = {
   "packages/cli/src/runtime/session-container-running-proof.ts": "sealed-session: SessionContainerRunningProofExecutor type signature only",
   "packages/cli/src/runtime/session-named-volume-proof.ts": "sealed-session: SessionNamedVolumeInspectRequest type signature and its matching Object.freeze({ executable: \"docker\", ... }) request builder only",
   "packages/cli/src/runtime/session-container-start.ts": "sealed-session: SessionContainerForegroundSpawner type signature and defaultSpawner's typed parameter only; spawn(executable, ...) uses the parameter, not the literal",
+  "packages/cli/src/runtime/session-file-publisher.ts": "sealed-session: sealed executor of SessionAdmissionDockerCommand args; refuses unsealed commands",
 
   // classifier: compares or types the command name; builds no argv.
   "packages/cli/src/runtime/operation-histogram.ts": "classifier: `command !== \"docker\"` routes histogram categorization; builds no argv",
@@ -79,14 +80,6 @@ export const DOCKER_LITERAL_ALLOWLIST: Readonly<Record<string, string>> = {
   "packages/cli/src/runtime/session-internal-network-baseline.ts": "pending: Task 7",
   "packages/cli/src/runtime/session-container-reconciliation.ts": "pending: Task 7",
   "packages/cli/src/runtime/session-reconcile.ts": "pending: Task 7",
-  // Unplanned (see task-2-report.md): this is the sealed session-file
-  // chokepoint, but captureSealed hardcodes the "docker" literal instead of
-  // reading it off the already-validated command, so it fails the
-  // sealed-session rule's "one raw capture(\"docker\", ...) call" exception.
-  // Only session-file-heartbeat.ts and session-file-teardown.ts call through
-  // it, and both are Task 7 files with no "docker" literal of their own, so
-  // this is grouped with Task 7 pending the controller's ruling.
-  "packages/cli/src/runtime/session-file-publisher.ts": "pending: Task 7 (unplanned; captureSealed's io.capture(\"docker\", ...) is a raw call on an otherwise sealed-session file)",
 
   // pending: Task 8
   "packages/cli/src/admin/admin-core.ts": "pending: Task 8",
