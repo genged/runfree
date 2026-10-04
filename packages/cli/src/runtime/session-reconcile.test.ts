@@ -294,12 +294,13 @@ function fakeDocker(options: {
       return success(JSON.stringify(args.slice(2).map((id) => forwarders.find((forwarder) => forwarder.Id === id))));
     }
     if (args[0] === "image" && args[1] === "inspect") return success(`${INGRESS_FORWARDER_TEST_IMAGE_ID}\n`);
-    if (args[0] === "rm" && args[1] === "-f") {
-      events.push(`docker:rm -f ${args[2]}`);
+    if (args[0] === "container" && args[1] === "rm" && args[2] === "--force") {
+      const id = args[3] as string;
+      events.push(`docker:container rm --force ${id}`);
       if (options.forwarderRemoveFails) return { status: 1, stdout: "", stderr: "Error response from daemon: removal in progress" };
-      const index = forwarders.findIndex((forwarder) => forwarder.Id === args[2]);
+      const index = forwarders.findIndex((forwarder) => forwarder.Id === id);
       if (index >= 0) forwarders.splice(index, 1);
-      return success(args[2]);
+      return success(id);
     }
     if (args[0] === "ps" && args.includes("label=io.runfree.ingress-purpose=mcp-callback")) {
       events.push(`docker:${args.join(" ")}`);
@@ -384,7 +385,7 @@ function publishedAgents(fake: Fake): string[] {
   return eligibility.allowedSessionAgents.map((agent) => agent.selectedAgentImageId).sort();
 }
 
-const CALLBACK_FORWARDER_LISTING = `docker:ps -a --no-trunc --filter label=io.runfree.project-id=${SESSION_TEST_PROJECT.projectId} `
+const CALLBACK_FORWARDER_LISTING = `docker:ps --all --no-trunc --filter label=io.runfree.project-id=${SESSION_TEST_PROJECT.projectId} `
   + "--filter label=io.runfree.container-role=ingress-forwarder "
   + "--filter label=io.runfree.ingress-purpose=mcp-callback --format {{.ID}}";
 
@@ -784,7 +785,7 @@ describe("reconcile before allocation", () => {
       expect(result.orphanContainersRemoved).toEqual([ORPHAN]);
       expect(fake.effects().slice(0, 4)).toEqual([
         CALLBACK_FORWARDER_LISTING,
-        `docker:rm -f ${FORWARDER}`,
+        `docker:container rm --force ${FORWARDER}`,
         `docker:container stop --time 10 ${ORPHAN}`,
         `docker:container rm ${ORPHAN}`,
       ]);
@@ -842,7 +843,7 @@ describe("reconcile before allocation", () => {
 
       expect(result.orphanContainersRemoved).toEqual([ORPHAN]);
       expect(forwarders).toEqual([]);
-      expect(answering.effects().indexOf(`docker:rm -f ${FORWARDER}`))
+      expect(answering.effects().indexOf(`docker:container rm --force ${FORWARDER}`))
         .toBeLessThan(answering.effects().indexOf(`docker:container rm ${ORPHAN}`));
     });
   });

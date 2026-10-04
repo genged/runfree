@@ -27,7 +27,7 @@ import {
   replaceValidatedIngressForwarder,
 } from "./ingress-forwarder-ownership.ts";
 import type { RuntimeAdapters } from "./adapters.ts";
-import type { CaptureResult, RuntimeContext, RuntimeIO } from "./types.ts";
+import type { RuntimeContext, RuntimeIO } from "./types.ts";
 
 const FORWARD_USAGE = "usage: runfree forward [<port>] [start|stop|status] "
   + "[--host-port PORT] [--agent-port PORT]";
@@ -101,12 +101,8 @@ export function forwardOptionsFromArgs(argv: ForwardArgs): ForwardOptions {
   };
 }
 
-function docker(context: RuntimeContext, io: RuntimeIO, args: string[]): CaptureResult {
-  return io.capture("docker", args, dockerClientEnvOptions(context));
-}
-
 function networkExists(context: RuntimeContext, io: RuntimeIO, name: string): boolean {
-  return docker(context, io, ["network", "inspect", name]).status === 0;
+  return createDockerClient(io, dockerClientEnvOptions(context)).inspect([name], { type: "network" }).status === 0;
 }
 
 /**

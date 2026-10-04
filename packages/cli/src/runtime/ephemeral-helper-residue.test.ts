@@ -73,8 +73,8 @@ function fakeDocker(initial: Container[] = []) {
       const matching = [...containers.values()].filter((entry) => filters.every(([key, value]) => entry.labels[key] === value));
       return { status: 0, stdout: matching.map((entry) => `${entry.id}\n`).join(""), stderr: "" };
     }
-    if (args[0] === "rm" && args[1] === "--force") {
-      const ids = args.slice(2);
+    if (args[0] === "container" && args[1] === "rm" && args[2] === "--force") {
+      const ids = args.slice(3);
       if (hooks.rm?.(ids) !== false) for (const id of ids) containers.delete(id);
       return { status: 0, stdout: "", stderr: "" };
     }
@@ -97,7 +97,7 @@ function fakeDocker(initial: Container[] = []) {
     hooks,
     fence,
     dockerCalls: () => calls.filter((call): call is Extract<Call, { kind: "docker" }> => call.kind === "docker"),
-    rmCalls: () => calls.filter((call) => call.kind === "docker" && call.args[0] === "rm"),
+    rmCalls: () => calls.filter((call) => call.kind === "docker" && call.args[0] === "container" && call.args[1] === "rm"),
     loseLockAt: (nth: number) => { lockThrowsAt = nth; },
   };
 }

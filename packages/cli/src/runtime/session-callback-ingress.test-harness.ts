@@ -121,7 +121,7 @@ export function createFakeDocker(input: Readonly<{
     if (args[0] === "ps") {
       if (options.listFailure) return { status: 1, stdout: "", stderr: "Cannot connect to the Docker daemon" };
       const filters = args.filter((_, index) => args[index - 1] === "--filter");
-      const running = !args.includes("-a");
+      const running = !args.includes("--all");
       const matches = containers.filter((container) => {
         if (running && container.State?.Running !== true) return false;
         return filters.every((filter) => {
@@ -175,7 +175,7 @@ export function createFakeDocker(input: Readonly<{
       return ok(`${created.Id}\n`);
     }
     if (args[0] === "exec") return ok();
-    if (args[0] === "rm") {
+    if (args[0] === "container" && args[1] === "rm") {
       if (options.removeFailure) return { status: 1, stdout: "", stderr: "Error response from daemon: removal in progress" };
       const ref = args[args.length - 1] as string;
       const index = containers.findIndex((container) => container.Id === ref || container.Name === `/${ref}`);
@@ -194,7 +194,7 @@ export function createFakeDocker(input: Readonly<{
     containers,
     captures,
     runs,
-    removed: () => captures.filter((args) => args[0] === "rm").map((args) => args[args.length - 1] as string),
+    removed: () => captures.filter((args) => args[0] === "container" && args[1] === "rm").map((args) => args[args.length - 1] as string),
     dockerRuns: () => captures.filter((args) => args[0] === "run"),
   };
 }

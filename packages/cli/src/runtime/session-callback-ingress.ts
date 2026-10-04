@@ -15,9 +15,10 @@ import {
   projectIngressForwarderFilters,
   wholeProjectContainerFilters,
 } from "./container-inventory.ts";
-import { parseDockerJson } from "./docker.ts";
+import { createDockerClient, type DockerClient } from "./docker-client.ts";
+import { filterValues, parseDockerJson } from "./docker.ts";
 import { INGRESS_FORWARDER_IMAGE, ingressHostNetworkName } from "./ingress-forwarder.ts";
-import type { CaptureResult, DockerContainerInspect, RuntimeIO } from "./types.ts";
+import type { DockerContainerInspect, RuntimeIO } from "./types.ts";
 import { validateIngressForwarderTeardownCandidate } from "./utility-containers.ts";
 
 export const MCP_CALLBACK_PURPOSE = "mcp-callback" as const;
@@ -38,8 +39,8 @@ export type CaptureInput = Readonly<{
   projectId: string;
 }>;
 
-function capture(input: CaptureInput, args: readonly string[]): CaptureResult {
-  return input.io.capture("docker", [...args], { ...(input.dockerOptions ?? {}), maxBuffer: 8 * 1024 * 1024 });
+function dockerClientFor(input: CaptureInput): DockerClient {
+  return createDockerClient(input.io, { ...(input.dockerOptions ?? {}), maxBuffer: 8 * 1024 * 1024 });
 }
 
 export function envMap(container: DockerContainerInspect): Record<string, string> {
@@ -62,21 +63,21 @@ type ForwarderInventory = Readonly<{
  * reuses a port on a guess.
  */
 export function inspectCallbackForwarders(input: CaptureInput): ForwarderInventory {
+  const client = dockerClientFor(input);
   // A forwarder can vanish between the listing and the inspection (another
   // exact removal, or `--rm` after its socat exited); one fresh listing
   // answers that race. A second failure is reported, never read as absence.
   let failure = "";
   for (let attempt = 0; attempt < 2; attempt += 1) {
-    const listed = capture(input, [
-      "ps",
-      "-a",
-      "--no-trunc",
-      ...projectIngressForwarderFilters(input.projectId),
-      "--filter",
-      `label=${INGRESS_PURPOSE_LABEL}=${MCP_CALLBACK_PURPOSE}`,
-      "--format",
-      "{{.ID}}",
-    ]);
+    const listed = client.listContainers({
+      all: true,
+      noTrunc: true,
+      filters: [
+        ...filterValues(projectIngressForwarderFilters(input.projectId)),
+        `label=${INGRESS_PURPOSE_LABEL}=${MCP_CALLBACK_PURPOSE}`,
+      ],
+      format: "{{.ID}}",
+    });
     if (listed.status !== 0) {
       throw new Error(`could not list MCP OAuth callback forwarders: ${listed.stderr.trim() || `exit ${listed.status}`}`);
     }
@@ -85,7 +86,7 @@ export function inspectCallbackForwarders(input: CaptureInput): ForwarderInvento
       throw new Error("MCP OAuth callback forwarder listing returned an inexact container id");
     }
     if (ids.length === 0) return Object.freeze({ forwarders: Object.freeze([]) });
-    const inspected = capture(input, ["container", "inspect", ...ids]);
+    const inspected = client.inspect(ids, { type: "container" });
     const parsed = inspected.status === 0
       ? parseDockerJson<DockerContainerInspect[]>(inspected, "docker inspect MCP OAuth callback forwarders")
       : undefined;
@@ -105,7 +106,7 @@ export function forwarderHostPort(forwarder: DockerContainerInspect): number | u
 }
 
 function resolvedIngressImageId(input: CaptureInput): string {
-  const image = capture(input, ["image", "inspect", "--format", "{{.Id}}", INGRESS_FORWARDER_IMAGE]);
+  const image = dockerClientFor(input).inspect([INGRESS_FORWARDER_IMAGE], { type: "image", format: "{{.Id}}" });
   const imageId = image.stdout.trim();
   if (image.status !== 0 || !DOCKER_IMAGE_ID_PATTERN.test(imageId)) {
     throw new Error(`could not resolve the immutable ingress forwarder image: ${image.stderr.trim() || "invalid Docker image id"}`);
@@ -128,6 +129,7 @@ function exactMissingContainer(stderr: string, target: string): boolean {
 function removeExactForwarders(input: CaptureInput, forwarders: readonly DockerContainerInspect[]): number {
   if (forwarders.length === 0) return 0;
   const imageId = resolvedIngressImageId(input);
+  const client = dockerClientFor(input);
   const failures: string[] = [];
   for (const forwarder of forwarders) {
     const id = forwarder.Id ?? "";
@@ -138,7 +140,7 @@ function removeExactForwarders(input: CaptureInput, forwarders: readonly DockerC
         + `inspect it, or run \`${remedy.destroyForce()}\` to clear the project runtime and all its sessions`);
       continue;
     }
-    const removed = capture(input, ["rm", "-f", id]);
+    const removed = client.removeContainers([id], { force: true });
     if (removed.status !== 0 && !exactMissingContainer(removed.stderr, id)) {
       failures.push(`Docker failed to remove MCP OAuth callback forwarder ${id}: ${removed.stderr.trim() || `exit ${removed.status}`}`);
     }
@@ -238,15 +240,15 @@ export function reclaimStaleSessionMcpCallbackForwarders(
 ): number {
   const { forwarders } = inspectCallbackForwarders(input);
   if (forwarders.length === 0) return 0;
-  const sessions = capture(input, [
-    "ps",
-    "--no-trunc",
-    ...wholeProjectContainerFilters(input.projectId),
-    "--filter",
-    `label=${CONTAINER_ROLE_LABEL}=session-agent`,
-    "--format",
-    "{{.ID}}",
-  ]);
+  const client = dockerClientFor(input);
+  const sessions = client.listContainers({
+    noTrunc: true,
+    filters: [
+      ...filterValues(wholeProjectContainerFilters(input.projectId)),
+      `label=${CONTAINER_ROLE_LABEL}=session-agent`,
+    ],
+    format: "{{.ID}}",
+  });
   if (sessions.status !== 0) {
     throw new Error(`could not list running sessions: ${sessions.stderr.trim() || `exit ${sessions.status}`}`);
   }
@@ -256,7 +258,7 @@ export function reclaimStaleSessionMcpCallbackForwarders(
   }
   let running: readonly DockerContainerInspect[] = [];
   if (sessionIds.length > 0) {
-    const inspected = capture(input, ["container", "inspect", ...sessionIds]);
+    const inspected = client.inspect(sessionIds, { type: "container" });
     const parsed = inspected.status === 0
       ? parseDockerJson<DockerContainerInspect[]>(inspected, "docker inspect running sessions")
       : undefined;

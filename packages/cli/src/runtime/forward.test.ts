@@ -91,8 +91,9 @@ function fakeIo(names: string[]) {
     if (args[0] === "image" && args[1] === "inspect") {
       return { status: 0, stdout: `${INGRESS_FORWARDER_TEST_IMAGE_ID}\n`, stderr: "" };
     }
-    if (args[0] === "rm") {
-      const removed = [...candidates.entries()].find(([, candidate]) => candidate.Id === args[2]);
+    if (args[0] === "container" && args[1] === "rm") {
+      const id = args.at(-1);
+      const removed = [...candidates.entries()].find(([, candidate]) => candidate.Id === id);
       if (removed) candidates.delete(removed[0]);
       return { status: 0, stdout: "", stderr: "" };
     }
@@ -151,7 +152,7 @@ describe("forwardRuntime", () => {
   test("stop without a port removes every port forward but leaves vnc alone", () => {
     const { io, capture, ids } = fakeIo([PORT_A, PORT_B, VNC]);
     expect(forwardRuntime({ action: "stop" }, context, io, adapters)).toBe(0);
-    const removed = captureArgs(capture).filter((args) => args[0] === "rm").flat();
+    const removed = captureArgs(capture).filter((args) => args[0] === "container" && args[1] === "rm").flat();
     expect(removed).toContain(ids.get(PORT_A));
     expect(removed).toContain(ids.get(PORT_B));
     expect(removed).not.toContain(ids.get(VNC));
@@ -160,7 +161,7 @@ describe("forwardRuntime", () => {
   test("stop with a port removes exactly that forwarder", () => {
     const { io, capture, ids } = fakeIo([PORT_A, PORT_B]);
     expect(forwardRuntime({ action: "stop", hostPort: "3000" }, context, io, adapters)).toBe(0);
-    const removed = captureArgs(capture).filter((args) => args[0] === "rm").flat();
+    const removed = captureArgs(capture).filter((args) => args[0] === "container" && args[1] === "rm").flat();
     expect(removed).toContain(ids.get(PORT_A));
     expect(removed).not.toContain(ids.get(PORT_B));
   });
@@ -185,14 +186,14 @@ describe("forwardRuntime", () => {
       if (args[0] === "network" && args[1] === "inspect") {
         return { status: 0, stdout: JSON.stringify([ingressHostNetworkInspectFixture(projectId)]), stderr: "" };
       }
-      if (args[0] === "rm") throw new Error("lookalike must not be removed");
+      if (args[0] === "container" && args[1] === "rm") throw new Error("lookalike must not be removed");
       return { status: 0, stdout: "", stderr: "" };
     });
     const io = { capture } as unknown as RuntimeIO;
 
     expect(() => forwardRuntime({ action: "stop", hostPort: "3000" }, context, io, adapters))
       .toThrow(/refusing to remove unverified ingress forwarder/u);
-    expect(capture.mock.calls.some((call) => (call[1] as string[])[0] === "rm")).toBe(false);
+    expect(capture.mock.calls.some((call) => (call[1] as string[])[0] === "container" && (call[1] as string[])[1] === "rm")).toBe(false);
   });
 
   test("start requires a port", () => {

@@ -43,9 +43,11 @@ import { CliError } from "../errors.ts";
 import { remedy } from "../remedies.ts";
 import { atomicReplaceFile } from "../safe-fs.ts";
 import { projectEphemeralHelperFilters } from "./container-inventory.ts";
+import { createDockerClient, type DockerClient } from "./docker-client.ts";
+import { filterValues } from "./docker.ts";
 import { RuntimeObservationError, type RuntimeFailureKind } from "./observation-failure.ts";
 import type { ProjectLifecycleLock } from "./sessions.ts";
-import type { CaptureResult, RuntimeIO } from "./types.ts";
+import type { RuntimeIO } from "./types.ts";
 
 export const HELPER_MARKER_FILE = "helpers-pending.json";
 /** Per-run records from earlier releases; removed on sight, never trusted. */
@@ -205,17 +207,14 @@ function settleHelperMarker(stateDir: string, options: HelperSweepOptions, leftB
   clearHelperMarker(stateDir);
 }
 
-type DockerStep = (args: string[], timeout: number) => CaptureResult;
+/** One fenced Docker client call: asserted held, run, asserted held again. */
+type FencedDockerCall = <T>(call: (client: DockerClient) => T) => T;
 
-function fencedDocker(fence: EphemeralHelperFence): DockerStep {
-  return (args, timeout) => {
+function fencedDockerCall(fence: EphemeralHelperFence): FencedDockerCall {
+  const client = createDockerClient(fence.containmentIO, { env: fence.dockerEnv, killSignal: "SIGKILL", maxBuffer: MAX_BUFFER });
+  return (call) => {
     fence.lifecycleLock.assertHeld();
-    const result = fence.containmentIO.capture("docker", args, {
-      env: fence.dockerEnv,
-      timeout,
-      killSignal: "SIGKILL",
-      maxBuffer: MAX_BUFFER,
-    });
+    const result = call(client);
     fence.lifecycleLock.assertHeld();
     return result;
   };
@@ -223,8 +222,13 @@ function fencedDocker(fence: EphemeralHelperFence): DockerStep {
 
 class ListingUnavailable extends Error {}
 
-function listProjectHelpers(docker: DockerStep, projectId: string, timeout = LIST_TIMEOUT_MS): string[] {
-  const listing = docker(["ps", "--all", "--quiet", "--no-trunc", ...projectEphemeralHelperFilters(projectId)], timeout);
+function listProjectHelpers(call: FencedDockerCall, projectId: string, timeout = LIST_TIMEOUT_MS): string[] {
+  const listing = call((client) => client.listContainers({
+    all: true,
+    quiet: true,
+    noTrunc: true,
+    filters: filterValues(projectEphemeralHelperFilters(projectId)),
+  }, { timeout }));
   // A failed, timed-out, or killed listing is not an answer: an empty stdout
   // from it never proves absence (the spawn maps each to a non-zero status).
   // Stderr alone does not refuse: a Docker CLI that always prints a warning
@@ -249,11 +253,11 @@ export function sweepProjectHelpers(
   projectId: string,
   options: HelperSweepOptions = {},
 ): number {
-  const docker = fencedDocker(fence);
+  const call = fencedDockerCall(fence);
   try {
-    const found = listProjectHelpers(docker, projectId);
+    const found = listProjectHelpers(call, projectId);
     if (found.length === 0) return 0;
-    docker(["rm", "--force", ...found], REMOVE_TIMEOUT_MS);
+    call((client) => client.removeContainers(found, { force: true }, { timeout: REMOVE_TIMEOUT_MS }));
     const now = options.now ?? (() => performance.now());
     const sleep = options.sleep ?? sleepSync;
     const deadline = now() + (options.pollDeadlineMs ?? DEFAULT_POLL_DEADLINE_MS);
@@ -261,7 +265,7 @@ export function sweepProjectHelpers(
       const remaining = deadline - now();
       let left: string[] | undefined;
       try {
-        left = listProjectHelpers(docker, projectId, Math.min(LIST_TIMEOUT_MS, Math.max(250, remaining)));
+        left = listProjectHelpers(call, projectId, Math.min(LIST_TIMEOUT_MS, Math.max(250, remaining)));
       } catch (error) {
         if (!(error instanceof ListingUnavailable)) throw error;
       }

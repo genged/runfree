@@ -4362,7 +4362,7 @@ describe("runtime command flow", () => {
             expect(args).toContain(`label=io.runfree.project-id=${options.projectId}`);
             return captureResult(0, present ? `${HELPER_ID}\n` : "");
           }
-          if (args[0] === "rm" && args[1] === "--force" && args.includes(HELPER_ID)) {
+          if (args[0] === "container" && args[1] === "rm" && args[2] === "--force" && args.includes(HELPER_ID)) {
             if (options.rmRemoves !== false) present = false;
             return options.rmRemoves === false ? captureResult(1, "", "daemon is busy") : captureResult(0, `${HELPER_ID}\n`);
           }
@@ -4385,7 +4385,7 @@ describe("runtime command flow", () => {
       expect((await startRuntime(context, io, false, {})).status).toBe(0);
 
       const calls = dockerArgs(io);
-      const removal = calls.findIndex((args) => args[0] === "rm" && args.includes(HELPER_ID));
+      const removal = calls.findIndex((args) => args[0] === "container" && args[1] === "rm" && args.includes(HELPER_ID));
       expect(removal).toBeGreaterThanOrEqual(0);
       expect(lockHeldAtSweep.length).toBeGreaterThan(0);
       expect(lockHeldAtSweep.every(Boolean)).toBe(true);
@@ -4420,7 +4420,7 @@ describe("runtime command flow", () => {
       const recovered = residueDocker({ present: false, projectId, lockPath });
       expect((await startRuntime(context, recovered.io, false, {})).status).toBe(0);
       expect(fs.existsSync(markerPath)).toBe(false);
-      expect(dockerArgs(recovered.io).some((args) => args[0] === "rm" && args.includes(HELPER_ID))).toBe(false);
+      expect(dockerArgs(recovered.io).some((args) => args[0] === "container" && args[1] === "rm" && args.includes(HELPER_ID))).toBe(false);
     });
 
     test("a legacy helper-runs directory is swept for and removed, whatever it holds", async () => {
@@ -4431,7 +4431,7 @@ describe("runtime command flow", () => {
       const { io } = residueDocker({ present: true, projectId: projectHash(context.projectRoot), lockPath });
 
       expect((await startRuntime(context, io, false, {})).status).toBe(0);
-      expect(dockerArgs(io).some((args) => args[0] === "rm" && args.includes(HELPER_ID))).toBe(true);
+      expect(dockerArgs(io).some((args) => args[0] === "container" && args[1] === "rm" && args.includes(HELPER_ID))).toBe(true);
       expect(fs.existsSync(legacyHelperRunsRoot(project.paths.stateDir))).toBe(false);
     });
 
@@ -4464,7 +4464,7 @@ describe("runtime command flow", () => {
         const start = io.calls.length;
         await restoreSameProxySessionAdmission({ plan, io, lifecycleLock: lock, proxyId, containmentIO: containment.io });
         // Residue first, through the containment IO.
-        expect(dockerArgs(containment.io).some((args) => args[0] === "rm" && args.includes(HELPER_ID))).toBe(true);
+        expect(dockerArgs(containment.io).some((args) => args[0] === "container" && args[1] === "rm" && args.includes(HELPER_ID))).toBe(true);
         expect(fs.existsSync(markerPath)).toBe(false);
         // Then the validation's helpers ran (the deny probe at least).
         const helperRuns = io.calls.slice(start).filter((call) => call.command === "docker" && call.args[0] === "run");

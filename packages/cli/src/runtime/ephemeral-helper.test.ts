@@ -221,8 +221,8 @@ function helperHarness(helper: (args: string[], options: Record<string, unknown>
   const containmentCapture: Capture = (_command, args) => {
     contained.push(args);
     if (args[0] === "ps") return { status: 0, stdout: [...containers].map((id) => `${id}\n`).join(""), stderr: "" };
-    if (args[0] === "rm") {
-      for (const id of args.slice(2)) containers.delete(id);
+    if (args[0] === "container" && args[1] === "rm") {
+      for (const id of args.slice(3)) containers.delete(id);
       return { status: 0, stdout: "", stderr: "" };
     }
     throw new Error(`unexpected containment call ${args.join(" ")}`);
@@ -310,8 +310,8 @@ describe("runEphemeralHelper", () => {
       markHelperRunPending(harness.stateDir, { wallClockMs: () => Date.parse("2026-01-01T00:00:00.000Z") });
       harness.containers.add(HELPER_ID);
       runEphemeralHelper(harness.context, harness.io, DENY_PROBE_REQUEST, harness.fence);
-      expect(harness.contained.map((args) => args[0])).toEqual(["ps", "rm", "ps"]);
-      expect(harness.contained[1]).toEqual(["rm", "--force", HELPER_ID]);
+      expect(harness.contained.map((args) => args[0])).toEqual(["ps", "container", "ps"]);
+      expect(harness.contained[1]).toEqual(["container", "rm", "--force", HELPER_ID]);
       expect(harness.containers.size).toBe(0);
       expect(harness.marker()).toBeUndefined();
     } finally {
@@ -385,8 +385,8 @@ describe("runEphemeralHelper", () => {
     try {
       expect(runEphemeralHelper(harness.context, harness.io, DENY_PROBE_REQUEST, harness.fence)).toEqual(outcome);
       expect(harness.budgeted).toHaveLength(1);
-      expect(harness.contained.map((args) => args[0])).toEqual(["ps", "rm", "ps"]);
-      expect(harness.contained[1]).toEqual(["rm", "--force", HELPER_ID]);
+      expect(harness.contained.map((args) => args[0])).toEqual(["ps", "container", "ps"]);
+      expect(harness.contained[1]).toEqual(["container", "rm", "--force", HELPER_ID]);
       expect(harness.containers.size).toBe(0);
       expect(harness.marker()).toBeUndefined();
     } finally {
@@ -405,7 +405,7 @@ describe("runEphemeralHelper", () => {
     });
     try {
       expect(runEphemeralHelper(harness.context, harness.io, DENY_PROBE_REQUEST, harness.fence)).toEqual(outcome);
-      expect(harness.contained).toContainEqual(["rm", "--force", HELPER_ID]);
+      expect(harness.contained).toContainEqual(["container", "rm", "--force", HELPER_ID]);
       expect(harness.containers.size).toBe(0);
       expect(harness.marker()?.lateCreateUntil).toBeDefined();
     } finally {
@@ -429,7 +429,7 @@ describe("runEphemeralHelper", () => {
     try {
       expect(() => runEphemeralHelper(harness.context, budgeted, DENY_PROBE_REQUEST, harness.fence))
         .toThrow(RuntimeObservationError);
-      expect(harness.contained).toContainEqual(["rm", "--force", HELPER_ID]);
+      expect(harness.contained).toContainEqual(["container", "rm", "--force", HELPER_ID]);
       expect(harness.containers.size).toBe(0);
     } finally {
       harness.cleanup();
@@ -452,7 +452,7 @@ describe("runEphemeralHelper", () => {
     const fence: EphemeralHelperFence = {
       ...harness.fence,
       containmentIO: {
-        capture: (command: string, args: string[], options?: Record<string, unknown>) => (args[0] === "rm"
+        capture: (command: string, args: string[], options?: Record<string, unknown>) => (args[0] === "container" && args[1] === "rm"
           ? { status: 124, stdout: "", stderr: "", timedOut: true }
           : harness.fence.containmentIO.capture(command, args, options)),
       } as unknown as RuntimeIO,
@@ -515,7 +515,7 @@ describe("runEphemeralHelper", () => {
     const fence: EphemeralHelperFence = {
       ...harness.fence,
       containmentIO: {
-        capture: (command: string, args: string[], options?: Record<string, unknown>) => (args[0] === "rm"
+        capture: (command: string, args: string[], options?: Record<string, unknown>) => (args[0] === "container" && args[1] === "rm"
           ? { status: 124, stdout: "", stderr: "", timedOut: true }
           : harness.fence.containmentIO.capture(command, args, options)),
       } as unknown as RuntimeIO,

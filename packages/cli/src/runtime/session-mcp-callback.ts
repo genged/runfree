@@ -28,6 +28,7 @@ import crypto from "node:crypto";
 import net from "node:net";
 
 import { CliError } from "../errors.ts";
+import { createDockerClient } from "./docker-client.ts";
 import { dockerClientEnvOptions, parseDockerJson } from "./docker.ts";
 import { projectHash } from "./env.ts";
 import { ingressForwarderName, startIngressForwarder } from "./ingress-forwarder.ts";
@@ -193,7 +194,7 @@ function forwarderInternalAddress(
   name: string,
   internalNetwork: string,
 ): string {
-  const inspected = io.capture("docker", ["container", "inspect", name], dockerClientEnvOptions(context));
+  const inspected = createDockerClient(io, dockerClientEnvOptions(context)).inspect([name], { type: "container" });
   const parsed = inspected.status === 0
     ? parseDockerJson<DockerContainerInspect[]>(inspected, "docker inspect MCP OAuth callback forwarder")
     : undefined;

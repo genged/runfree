@@ -242,7 +242,7 @@ function ingressFixture(value: ReturnType<typeof authorityFixture>) {
   } };
   vi.mocked(value.io.capture).mockImplementation((_command, args) => {
     let stdout: string;
-    if (args[0] === "ps") stdout = args.includes("-a") ? String(container.Name?.slice(1)) : "";
+    if (args[0] === "ps") stdout = args.includes("--all") ? String(container.Name?.slice(1)) : "";
     else if (args[0] === "network" && args[1] === "inspect") stdout = JSON.stringify([hostNetwork]);
     else if (args[0] === "image" && args[1] === "inspect") stdout = INGRESS_FORWARDER_TEST_IMAGE_ID;
     else if (args[0] === "container" && args[1] === "inspect") stdout = JSON.stringify([container]);

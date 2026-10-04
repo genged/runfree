@@ -463,7 +463,7 @@ test("reload-policy restore sweeps helper residue through the containment IO bef
   markHelperRunPending(stateDir, { wallClockMs: () => Date.parse("2026-01-01T00:00:00.000Z") });
   let present = true;
   const containment = vi.fn((_command: string, args: string[]) => {
-    if (args[0] === "rm") present = false;
+    if (args[0] === "container" && args[1] === "rm") present = false;
     return { status: 0, stdout: args[0] === "ps" && present ? `${HELPER_ID}\n` : "", stderr: "" };
   });
 
@@ -473,8 +473,8 @@ test("reload-policy restore sweeps helper residue through the containment IO bef
     plan: fixture.plan, io: fixture.io, lifecycleLock: lifecycleLock(), proxyId: PROXY_ID,
     containmentIO: { capture: containment } as unknown as RuntimeIO,
   }).catch(() => undefined);
-  expect(containment.mock.calls.map(([, args]) => args[0])).toEqual(["ps", "rm", "ps"]);
-  expect(containment.mock.calls[1][1]).toEqual(["rm", "--force", HELPER_ID]);
+  expect(containment.mock.calls.map(([, args]) => args[0])).toEqual(["ps", "container", "ps"]);
+  expect(containment.mock.calls[1][1]).toEqual(["container", "rm", "--force", HELPER_ID]);
   expect(fs.existsSync(helperMarkerPath(stateDir))).toBe(false);
 });
 
