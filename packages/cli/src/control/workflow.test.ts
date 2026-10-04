@@ -22,8 +22,12 @@ import {
   approveRuntimeIsolation,
   captureQuiescedDesiredPolicyCandidate,
   prepareEffectiveControlsForStartup,
+  useApprovedPolicyGeneration,
   usePreparedApprovedPolicyGeneration,
 } from "./workflow.ts";
+import { validateNetworkPolicy } from "@runfree/runtime-contracts/network-policy";
+import { compileDesiredPolicies } from "./compiler.ts";
+import { prepareMcpRuntime } from "../runtime/mcp.ts";
 import { readActiveControlSelection } from "./effective.ts";
 import type { HostServiceAdmit } from "./host-service-approval-admission.ts";
 import { desiredPolicyReviewLines } from "./review-render.ts";
@@ -326,6 +330,51 @@ describe("quiesced control workflow", () => {
     expect(approved.mechanism).toBe("interactive");
     expect(prompts.join("\n")).toContain("host service idb: 127.0.0.1:10882 (owner-10882, pid 4242)");
     expect(readApprovedNetworkPolicy(root, context.project, "network-project")?.hostServices?.idb?.port).toBe(10882);
+  });
+
+  test("the MCP projection keeps hostServices: prepareMcpRuntime and the prepared-policy read both carry it (SR8)", async () => {
+    fs.writeFileSync(path.join(root, ".runfree", "network-policy.json"), IDB_POLICY(10882));
+    await approveBothLayers();
+    const project = readApprovedNetworkPolicy(root, context.project, "network-project");
+    const local = readApprovedNetworkPolicy(root, context.project, "network-local");
+    if (!project || !local) throw new Error("both layers must be approved");
+    const compiled = compileDesiredPolicies({ project, local });
+    expect(compiled.policy.hostServices).toEqual({ idb: { target: "host-loopback", port: 10882 } });
+
+    // The prepare side (`prepareEffectiveRuntimeIntent` runs this on a clone
+    // of the approved compiled policy): host services survive the MCP merge.
+    const mcpState = fs.mkdtempSync(path.join(os.tmpdir(), "runfree-mcp-projection-"));
+    try {
+      const prepared = prepareMcpRuntime({
+        claudeConfigPath: path.join(mcpState, "claude.json"),
+        claudeMcpConfigPath: path.join(mcpState, "mounts", "claude-mcp.json"),
+        codexDir: path.join(mcpState, "codex"),
+        env: { HOME: mcpState, CODEX_HOME: path.join(mcpState, "host-codex") },
+        mcpOAuthPolicyPath: path.join(mcpState, "mcp-oauth-policy.json"),
+        mcpOperationPolicyPath: path.join(mcpState, "mcp-operation-policy.json"),
+        policy: structuredClone(validateNetworkPolicy(compiled.policy).raw),
+        projectRoot: root,
+        tokenConfig: {},
+      });
+      expect(prepared.policy.hostServices).toEqual({ idb: { target: "host-loopback", port: 10882 } });
+    } finally {
+      fs.rmSync(mcpState, { recursive: true, force: true });
+    }
+
+    // The read side: a prepared MCP network policy (here widened by an MCP
+    // host) replaces the compiled one, and its hostServices reach the
+    // published effective policy generation.
+    const base = validateNetworkPolicy(compiled.policy);
+    fs.mkdirSync(path.dirname(context.project.paths.controlMcpNetworkPolicyPath), { recursive: true });
+    fs.writeFileSync(context.project.paths.controlMcpNetworkPolicyPath, JSON.stringify({
+      schemaVersion: 1,
+      basePolicyGeneration: base.generation,
+      policy: { ...base.raw, hosts: [...base.raw.hosts, "mcp.example.com"] },
+    }));
+    await approveRuntimeIsolation(context, io(), { mechanism: "interactive" });
+    const generation = useApprovedPolicyGeneration(context);
+    expect(generation.policy.hosts).toContain("mcp.example.com");
+    expect(generation.policy.hostServices).toEqual({ idb: { target: "host-loopback", port: 10882 } });
   });
 
   test("refuses first startup non-interactively before selecting effective authority", async () => {

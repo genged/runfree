@@ -153,6 +153,16 @@ function readEtcHostsFile(): { text: string; stat: EtcHostsStat } {
   }
 }
 
+/** The supervisor's default gateway hand-off writer (root-owned, 0644, atomic). */
+export function publishHostServiceGatewayStatus(
+  status: HostServiceGatewayStatus,
+  filePath: string = hostServiceGatewayStatusPath(),
+): void {
+  writeGenerationStatusFile(filePath, status);
+}
+
+// Host-controlled (compose) like every proxy env var; only the test harness
+// sets it, so real runtimes keep the fixed root-owned status path.
 function hostServiceGatewayStatusPath(): string {
   return process.env.PROXY_HOST_SERVICE_GATEWAY_PATH
     ?? path.posix.join(DEFAULT_PROXY_STATUS_DIR, HOST_SERVICE_GATEWAY_STATUS_FILE);
@@ -223,7 +233,7 @@ export function createFirewallController(overrides: Partial<FirewallControllerDe
       }
     },
     readEtcHosts: () => readEtcHostsFile(),
-    publishHostServiceGateway: (status) => writeGenerationStatusFile(hostServiceGatewayStatusPath(), status),
+    publishHostServiceGateway: (status) => publishHostServiceGatewayStatus(status),
     replaceHostServiceSet: (entries, plan, gateways) => replaceHostServiceSet(entries, runner, plan, gateways),
     applyHostServiceTeardown: (draining, remaining, plan, gateways) =>
       applyHostServiceTeardown(draining, remaining, runner, plan, gateways),

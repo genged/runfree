@@ -5848,8 +5848,17 @@ describe("runtime command flow", () => {
       expect(out).toContain("host-service gateway: unavailable (gateway address changed from 192.168.65.254 to 192.168.65.2; run `runfree rebuild`)");
     });
 
+    test("status prints an unknown gateway without a warning when the proxy is not running", () => {
+      const { context, io, gatewayReads } = hostServiceStatusFixture(undefined);
+
+      expect(statusRuntime(context, io)).toBe(0);
+      const { out, err } = statusOutput();
+      expect(out).toContain("host-service gateway: unknown (proxy not running)");
+      expect(err).not.toContain("host-service gateway");
+      expect(gatewayReads).toHaveLength(0);
+    });
+
     test.each([
-      ["the proxy is not running", undefined],
       ["the read fails", () => captureResult(1, "", "cat: no such file")],
       ["the file is malformed", () => captureResult(0, gatewayStatusJson({ gatewayIp: "192.168.65.254", extra: true }))],
     ])("status prints an unknown gateway and a warning when %s, and still succeeds", (_label, gateway) => {

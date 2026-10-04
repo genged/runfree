@@ -40,7 +40,6 @@ export type HostServiceAdmitInput = {
 export type HostServiceTunnels = {
   admit(input: HostServiceAdmitInput): void;
   cutRemoved(next: Readonly<HostServicesJson>): number;
-  cutAll(): number;
   cutForGateway(gateway: HostServiceGatewayStatus | undefined): HostServiceGatewayCut;
   spliceCounts(): Record<string, number>;
 };
@@ -196,14 +195,6 @@ export function createHostServiceTunnels(options: HostServiceTunnelOptions): Hos
         cut(splice);
       }
       return count;
-    },
-    cutAll() {
-      const all = Array.from(splices);
-      for (const splice of all) {
-        untrack(splice);
-        cut(splice);
-      }
-      return all.length;
     },
     // The policyGeneration the status names is deliberately ignored here. The
     // supervisor republishes the file for every effective policy generation,

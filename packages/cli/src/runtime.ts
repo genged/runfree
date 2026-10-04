@@ -1017,6 +1017,7 @@ function printHostServiceStatusLine(context: RuntimeContext, io: RuntimeIO): voi
 type HostServiceGatewayState =
   | { kind: "available"; gatewayIp: string }
   | { kind: "unavailable"; reason: string }
+  | { kind: "not-running" }
   | { kind: "unknown"; detail: string };
 
 // The gateway the root firewall supervisor published (design "Approval and
@@ -1026,7 +1027,7 @@ type HostServiceGatewayState =
 // do. Observation only.
 function readHostServiceGatewayState(context: RuntimeContext, io: RuntimeIO): HostServiceGatewayState {
   const proxyId = serviceContainerId(composeProjectName(context.projectRoot), "proxy", context, io, { runningOnly: true });
-  if (!proxyId) return { kind: "unknown", detail: "the proxy is not running" };
+  if (!proxyId) return { kind: "not-running" };
   const read = io.capture(
     "docker",
     ["exec", "--user", ROOT_UID_GID, proxyId, "cat", PROXY_HOST_SERVICE_GATEWAY_STATUS_PATH],
@@ -1056,6 +1057,9 @@ function printHostServiceGatewayStatusLine(context: RuntimeContext, io: RuntimeI
     console.log(`host-service gateway: ${state.gatewayIp}`);
   } else if (state.kind === "unavailable") {
     console.log(`host-service gateway: unavailable (${printableStatusText(state.reason)})`);
+  } else if (state.kind === "not-running") {
+    // A stopped proxy is a normal state, not a fault: no warning.
+    console.log("host-service gateway: unknown (proxy not running)");
   } else {
     console.log("host-service gateway: unknown");
     warn(`host-service gateway state unknown: ${printableStatusText(state.detail)}`);

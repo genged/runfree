@@ -1,5 +1,13 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+
 import { describe, expect, test } from "vitest";
 
+import type { HostServiceGatewayStatus } from "@runfree/runtime-contracts/proxy-status";
+
+import { readHostServiceGatewayStatusFile } from "../status.ts";
+import { publishHostServiceGatewayStatus } from "./supervisor.ts";
 import {
   checkEtcHostsFile,
   parseHostServiceGatewayFromEtcHosts,
@@ -91,5 +99,56 @@ describe("host-service gateway from /etc/hosts", () => {
 
   test("a root-owned 0644 regular file is accepted", () => {
     expect(checkEtcHostsFile({ uid: 0, mode: 0o100644, isFile: true })).toBeUndefined();
+  });
+});
+
+describe("gateway hand-off round trip (supervisor writer -> request proxy reader)", () => {
+  const ownerUid = process.getuid?.() ?? 0;
+
+  test.each([
+    ["an available gateway", { gatewayIp: "192.168.65.254" }],
+    ["an unavailable gateway", { unavailableReason: "host-service gateway address changed from pinned 192.168.65.254; runfree rebuild" }],
+  ])("%s reads back exactly as written", (_label, fields) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "runfree-gateway-roundtrip-"));
+    try {
+      const filePath = path.join(dir, "host-service-gateway.json");
+      const status = {
+        schemaVersion: 1,
+        policyGeneration: `sha256:${"b".repeat(64)}`,
+        ...fields,
+        writtenAt: "2026-10-04T00:00:00.000Z",
+      } as HostServiceGatewayStatus;
+
+      publishHostServiceGatewayStatus(status, filePath);
+      expect(fs.statSync(filePath).mode & 0o777).toBe(0o644);
+      expect(readHostServiceGatewayStatusFile(filePath, ownerUid)).toEqual(status);
+
+      // Rewritten in place (atomic rename), the reader sees the new value.
+      const next = { ...status, policyGeneration: `sha256:${"c".repeat(64)}` };
+      publishHostServiceGatewayStatus(next, filePath);
+      expect(readHostServiceGatewayStatusFile(filePath, ownerUid)).toEqual(next);
+      expect(fs.readdirSync(dir)).toEqual(["host-service-gateway.json"]);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("the reader refuses a group-writable file, another owner, and a missing file", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "runfree-gateway-roundtrip-"));
+    try {
+      const filePath = path.join(dir, "host-service-gateway.json");
+      expect(readHostServiceGatewayStatusFile(filePath, ownerUid)).toBeUndefined();
+      publishHostServiceGatewayStatus({
+        schemaVersion: 1,
+        policyGeneration: `sha256:${"b".repeat(64)}`,
+        gatewayIp: "192.168.65.254",
+        writtenAt: "2026-10-04T00:00:00.000Z",
+      }, filePath);
+      expect(readHostServiceGatewayStatusFile(filePath, ownerUid + 1)).toBeUndefined();
+      fs.chmodSync(filePath, 0o664);
+      expect(readHostServiceGatewayStatusFile(filePath, ownerUid)).toBeUndefined();
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

@@ -413,7 +413,7 @@ export function hostGatewayTcpProbeCommand(gatewayIp: string, port: number): str
  * accept is uid 1001 only, so root to each approved port must be dropped. The
  * uid-1001 unapproved-port probe rides the server-UID denial batch instead.
  * Run once each, never retried: a success is an enforcement gap, and only a
- * timeout proves the drop (see `judgeDroppedGatewayProbe`).
+ * timeout proves the drop (see `judgeDroppedProbeExit`).
  */
 function runRootGatewayProbes(
   issues: string[],

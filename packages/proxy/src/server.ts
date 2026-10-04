@@ -50,7 +50,6 @@ import {
 } from "@runfree/runtime-contracts/effective-control";
 import {
   DEFAULT_PROXY_STATUS_DIR,
-  parseHostServiceGatewayStatus,
   requestProxyStatusPath,
   type HostServiceGatewayStatus,
   type RequestProxyGenerationStatus,
@@ -62,8 +61,7 @@ import {
   refusedHostServicePortReason,
 } from "@runfree/runtime-contracts/host-services";
 import { createHostServiceTunnels } from "./host-service-tunnel.js";
-import { readOwnedRegularFile } from "./session-files.js";
-import { writeGenerationStatusFile } from "./status.js";
+import { readHostServiceGatewayStatusFile, writeGenerationStatusFile } from "./status.js";
 import { installResolvedHostLookup, resolvedHostsPathFromEnv } from "./resolved-hosts.js";
 import { AdmissionRegistry, type AdmissionRecord } from "./admission.js";
 import {
@@ -156,9 +154,10 @@ const HOST_SERVICE_MAX_PER_SESSION = parseIntWithDefault(process.env.PROXY_HOST_
 const HOST_SERVICE_MAX_GLOBAL = parseIntWithDefault(process.env.PROXY_HOST_SERVICE_MAX_GLOBAL, 256);
 const HOST_SERVICE_MAX_PENDING = parseIntWithDefault(process.env.PROXY_HOST_SERVICE_MAX_PENDING, 64);
 const HOST_SERVICE_DIAL_TIMEOUT_MS = parseIntWithDefault(process.env.PROXY_HOST_SERVICE_DIAL_TIMEOUT_MS, 5_000);
+// Host-controlled (compose) like every proxy env var; only the test harness
+// sets it, so real runtimes keep the fixed root-owned status path.
 const HOST_SERVICE_GATEWAY_PATH = process.env.PROXY_HOST_SERVICE_GATEWAY_PATH
   ?? path.posix.join(DEFAULT_PROXY_STATUS_DIR, HOST_SERVICE_GATEWAY_STATUS_FILE);
-const HOST_SERVICE_GATEWAY_MAX_BYTES = 4096;
 const SESSION_ADMISSION_WATCH_MS = 100;
 // The exact readiness bytes from a served peer are answered locally with this,
 // so the session entry in the agent image can tell its session file has landed
@@ -271,15 +270,7 @@ const ipAssignments = new SessionIpAssignments(sessionIdentityConfig.registryRoo
 // refuse a group- or other-writable file. Any failure reads as unavailable.
 // The owner override is the same harness-only knob the session registry uses.
 function readHostServiceGateway(): HostServiceGatewayStatus | undefined {
-  try {
-    const stat = fs.lstatSync(HOST_SERVICE_GATEWAY_PATH);
-    if ((stat.mode & 0o022) !== 0) return undefined;
-    const read = readOwnedRegularFile(HOST_SERVICE_GATEWAY_PATH, testSessionOwnerUid ?? 0, HOST_SERVICE_GATEWAY_MAX_BYTES);
-    if (read.kind !== "ok") return undefined;
-    return parseHostServiceGatewayStatus(read.content);
-  } catch {
-    return undefined;
-  }
+  return readHostServiceGatewayStatusFile(HOST_SERVICE_GATEWAY_PATH, testSessionOwnerUid ?? 0);
 }
 
 const hostServiceTunnels = createHostServiceTunnels({

@@ -160,7 +160,7 @@ describe("host-service tunnels", () => {
     expect(connect.calls()).toBe(0);
   });
 
-  test("cutRemoved cuts removed names and changed ports, keeps unchanged pairs, and cutAll cuts the rest", async () => {
+  test("cutRemoved cuts removed names and changed ports, and keeps unchanged pairs", async () => {
     const tunnels = createHostServiceTunnels({
       readGateway: () => gateway,
       maxPerSession: 8,
@@ -185,10 +185,7 @@ describe("host-service tunnels", () => {
     expect(moved.server.destroyed).toBe(true);
     expect(kept.server.destroyed).toBe(false);
     expect(tunnels.spliceCounts()).toEqual({ kept: 1 });
-
-    expect(tunnels.cutAll()).toBe(1);
-    expect(kept.server.destroyed).toBe(true);
-    expect(tunnels.spliceCounts()).toEqual({});
+    kept.server.destroy();
   });
 
   // R16: the request proxy's own cut on a gateway withdrawal or address

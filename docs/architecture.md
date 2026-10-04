@@ -1432,7 +1432,11 @@ Root hands the pin to the request proxy in a root-owned `0644` file,
 The request proxy reads it on every admitted CONNECT, with the same owner,
 type, link-count, and size checks as session files, and dials only that IPv4
 literal when the file names its current network policy generation. The
-gateway is also withheld while a host-service set write is failing.
+gateway is also withheld while a host-service set write is failing. After any
+policy reload, even one that does not touch host services, new host-service
+CONNECTs refuse with `host-service-unavailable` for about 2 s, until the
+supervisor's next maintenance pass republishes the file for the new effective
+policy generation. Open splices are not affected.
 
 **Revocation.** Both consumers cut independently, on a removal and on a
 gateway change or withdrawal:

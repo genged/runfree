@@ -230,8 +230,9 @@ idb connect 127.0.0.1 10882
   `runfree status` repeats that check and warns when the listener is gone,
   changed, or owned by Docker Desktop. It also prints the gateway state:
   `host-service gateway: <ip>`, `host-service gateway: unavailable (<reason>)`,
-  or `host-service gateway: unknown` with a warning when the proxy's gateway
-  status cannot be read. These lines never change the exit code.
+  `host-service gateway: unknown (proxy not running)` with no warning when the
+  proxy is stopped, or `host-service gateway: unknown` with a warning when the
+  proxy's gateway status cannot be read or is malformed. These lines never change the exit code.
 - An approved port is recorded in a host-global registry. `runfree forward`
   and `runfree vnc` in any other project refuse it and name every owning
   project; several projects may approve the same port. If the registry is

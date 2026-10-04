@@ -39,12 +39,14 @@ type GenerationStatusIdentity = {
 export type FirewallGenerationStatus = GenerationStatusIdentity & {
   rulesetVerified: boolean;
   appliedAt: string;
-  // `hostServiceSetDigest` (below) over the root supervisor's applied record
-  // of `@host_service` and `host_service_draining`, updated only after an
-  // atomic `nft -f` batch succeeds; not a kernel read-back. The host proof
+  // Diagnostics only (R23): nothing reads these to decide convergence.
+  // `hostServiceSetDigest` (below) is over the root supervisor's applied
+  // record of `@host_service` and `host_service_draining`, updated only after
+  // an atomic `nft -f` batch succeeds; not a kernel read-back. The host proof
   // reads the kernel sets separately. `hostServiceDraining` is the number of
-  // pairs still draining; the host reads both to report a host-service
-  // removal converged on the firewall side.
+  // pairs still draining. A host-service removal converges by ordering
+  // instead: the supervisor cuts before it publishes a status naming the new
+  // effective policy generation, and activation waits for that status.
   hostServiceSetDigest?: string;
   hostServiceDraining?: number;
 };
@@ -56,9 +58,11 @@ export type RequestProxyGenerationStatus = GenerationStatusIdentity & {
   // a status naming a generation proves that generation's clears happened.
   // A proxy without the marker predates epochs and proves nothing.
   oauthStateEpochs?: 1;
-  // Live (and dialling) host-service splices per name. A name absent from the
-  // map has no splice; the request proxy cuts splices of a removed entry
-  // before it publishes the status naming the generation that removed it.
+  // Live (and dialling) host-service splices per name, for diagnostics only
+  // (R23). A name absent from the map has no splice. Convergence of a removal
+  // comes from ordering, not from this field: the request proxy cuts splices
+  // of a removed entry before it publishes the status naming the effective
+  // policy generation that removed it, and activation waits for that status.
   hostServiceSplices?: Record<string, number>;
 };
 
