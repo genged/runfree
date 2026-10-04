@@ -45,7 +45,7 @@ import {
   wholeProjectContainerFilters,
 } from "./container-inventory.ts";
 import { dockerClientEnvOptions, filterValues, type RuntimeDocker } from "./docker.ts";
-import { createDockerClient } from "./docker-client.ts";
+import { createDockerClient, type DockerClient } from "./docker-client.ts";
 import { removeHelperState } from "./ephemeral-helper-residue.ts";
 import {
   enumerateSessionContainerRecordsV2,
@@ -329,6 +329,79 @@ function stopProjectLabeledContainers(input: FencedProjectDestroyInput): void {
   }
 }
 
+// Keyed by `{{.Id}}` so a chunk's output lines can be matched back to their
+// ids without assuming Docker prints them in argv order.
+const RESIDUE_INSPECT_FORMAT = "{{.Id}}\t{{.Name}}\t{{.Config.Image}}\t{{.State.Status}}";
+
+// Bounds a single residue `docker container inspect` argv the same way the
+// stop fence above bounds its argv (`STOP_ID_CHUNK_SIZE`), and the same way
+// session-container-reconciliation.ts bounds `container inspect` chunks.
+const RESIDUE_INSPECT_CHUNK_SIZE = 64;
+
+/**
+ * Names of containers Docker's stderr reports gone, one capture per name.
+ * `container inspect` says "No such container"; the generic `inspect` says
+ * "No such object" — accept both, the same detection
+ * session-container-reconciliation.ts uses for a churned inventory chunk
+ * (`goneIdsFromFailure` there).
+ */
+const MISSING_CONTAINER_ID_PATTERN = /No such (?:container|object):\s*([0-9a-f]{6,64})/gi;
+
+/** Ids from this chunk that Docker's stderr explicitly reported absent. */
+function residueGoneIds(stderr: string, chunk: readonly string[]): readonly string[] {
+  const named = new Set<string>();
+  for (const match of stderr.matchAll(MISSING_CONTAINER_ID_PATTERN)) named.add(match[1].toLowerCase());
+  return chunk.filter((id) => named.has(id));
+}
+
+/** One container's `{{.Name}} {{.Config.Image}} {{.State.Status}}`, keyed by `{{.Id}}`. */
+function parseResidueDescriptions(stdout: string): Map<string, string> {
+  const descriptions = new Map<string, string>();
+  for (const line of stdout.trim().split(/\n+/).filter(Boolean)) {
+    const [id, ...fields] = line.split("\t");
+    if (id === undefined || id === "") continue;
+    descriptions.set(id, fields.filter(Boolean).join(" "));
+  }
+  return descriptions;
+}
+
+/**
+ * One chunk's id -> description map, tolerant of an id that vanished between
+ * `docker ps` and this inspect.
+ *
+ * Docker fails the whole chunk's `container inspect` when any one member is
+ * gone, but still prints every member it found and names each absent one in
+ * stderr. When stdout accounts for exactly the chunk minus the ids stderr
+ * names absent, the survivors are taken from that same call and the absent
+ * ids are reported as gone — the same reasoning
+ * session-container-reconciliation.ts (`partialChunkSnapshots`) uses for a
+ * churned inventory chunk. Anything else — no named absence, or output that
+ * does not account for every other member — is not proven churn, so this
+ * keeps the previous per-id fallback: every id in the chunk gets
+ * "inspection failed" rather than being dropped or aborting the scan.
+ */
+function residueChunkDescriptions(
+  client: DockerClient,
+  chunk: readonly string[],
+): Readonly<{ descriptions: ReadonlyMap<string, string>; goneIds: ReadonlySet<string> }> {
+  const inspected = client.inspect(chunk, { type: "container", format: RESIDUE_INSPECT_FORMAT });
+  if (inspected.status === 0) {
+    return Object.freeze({ descriptions: parseResidueDescriptions(inspected.stdout), goneIds: new Set<string>() });
+  }
+  const gone = residueGoneIds(inspected.stderr, chunk);
+  if (gone.length > 0) {
+    const survivors = parseResidueDescriptions(inspected.stdout);
+    const accountedForEveryOther = survivors.size === chunk.length - gone.length
+      && chunk.every((id) => gone.includes(id) || survivors.has(id));
+    if (accountedForEveryOther) {
+      return Object.freeze({ descriptions: survivors, goneIds: new Set(gone) });
+    }
+  }
+  const fallback = new Map<string, string>();
+  for (const id of chunk) fallback.set(id, "inspection failed");
+  return Object.freeze({ descriptions: fallback, goneIds: new Set<string>() });
+}
+
 function projectResidueCandidates(input: FencedProjectDestroyInput): ResidueCandidate[] {
   const projectId = projectHash(input.context.projectRoot);
   const client = createDockerClient(input.io, dockerClientEnvOptions(input.context));
@@ -338,13 +411,18 @@ function projectResidueCandidates(input: FencedProjectDestroyInput): ResidueCand
     throw new Error(`destroy could not scan for project residue: ${detail}`);
   }
   const ids = listed.stdout.trim().split(/\s+/).filter(Boolean);
-  return ids.map((id) => {
-    const inspected = client.inspect([id], { type: "container", format: "{{.Name}}\t{{.Config.Image}}\t{{.State.Status}}" });
-    const description = inspected.status === 0
-      ? inspected.stdout.trim().split("\t").filter(Boolean).join(" ")
-      : "inspection failed";
-    return Object.freeze({ id, description });
-  });
+  if (ids.length === 0) return [];
+  const descriptions = new Map<string, string>();
+  const goneIds = new Set<string>();
+  for (let offset = 0; offset < ids.length; offset += RESIDUE_INSPECT_CHUNK_SIZE) {
+    const chunk = ids.slice(offset, offset + RESIDUE_INSPECT_CHUNK_SIZE);
+    const result = residueChunkDescriptions(client, chunk);
+    for (const [id, description] of result.descriptions) descriptions.set(id, description);
+    for (const id of result.goneIds) goneIds.add(id);
+  }
+  return ids
+    .filter((id) => !goneIds.has(id))
+    .map((id) => Object.freeze({ id, description: descriptions.get(id) ?? "inspection failed" }));
 }
 
 function refuseLiveWork(

@@ -140,6 +140,14 @@ function harness(options: {
   inspectOperationalError?: boolean;
   composeDownFailsWhileResidueRemains?: boolean;
   composeDownFails?: boolean;
+  /**
+   * Ids `docker ps` still lists (via `residueIds`) but that `container
+   * inspect` reports gone, simulating a container that vanished between the
+   * listing and its inspection.
+   */
+  vanishedResidueIds?: string[];
+  /** Fails the batched residue inspect with an error that does not name a missing container. */
+  failResidueInspect?: boolean;
 } = {}): Harness {
   const stateDir = temporaryState();
   const projectInfo = sessionTestProjectInfo();
@@ -155,7 +163,7 @@ function harness(options: {
 
   const calls: string[][] = [];
   const composeDownCalls: string[] = [];
-  const removedContainers = new Set<string>();
+  const removedContainers = new Set<string>(options.vanishedResidueIds ?? []);
   let residueIds = [...(options.residueIds ?? [])];
 
   const capture = (command: string, args: string[]): CaptureResult => {
@@ -182,10 +190,25 @@ function harness(options: {
     }
     if (args[0] === "container" && args[1] === "inspect") {
       if (options.inspectOperationalError) return fail("Cannot connect to the Docker daemon");
-      const format = args[args.indexOf("--format") + 1] ?? "";
+      const formatIndex = args.indexOf("--format");
+      const format = args[formatIndex + 1] ?? "";
       if (format.includes("com.docker.compose.project")) {
-        const ids = args.slice(args.indexOf("--format") + 2);
+        const ids = args.slice(formatIndex + 2);
         return ok(`${ids.map((id) => `${id}\t`).join("\n")}\n`);
+      }
+      // The batched residue-description inspect (destroy.ts's
+      // RESIDUE_INSPECT_FORMAT): keyed by `{{.Id}}`, one or many refs.
+      if (format.startsWith("{{.Id}}\t")) {
+        if (options.failResidueInspect) return fail("Cannot connect to the Docker daemon");
+        const refs = args.slice(formatIndex + 2);
+        const present = refs.filter((id) => !removedContainers.has(id));
+        const missing = refs.filter((id) => removedContainers.has(id));
+        const lines = present.map((id) => `${id}\t/${id.slice(0, 12)}\timage:test\trunning`);
+        const stdout = lines.length > 0 ? `${lines.join("\n")}\n` : "";
+        if (missing.length > 0) {
+          return { status: 1, stdout, stderr: missing.map((id) => `Error: No such container: ${id}`).join("\n") };
+        }
+        return ok(stdout);
       }
       const id = args.at(-1) ?? "";
       if (removedContainers.has(id)) return fail(`Error: No such container: ${id}`);
@@ -712,6 +735,83 @@ describe("fenced project destroy", () => {
     const forced = harness({ residueIds: [RESIDUE_CONTAINER_ID], force: true });
     expect(runFencedProjectDestroy(forced.input)).toBe(0);
     expect(forced.calls.some((call) => call[1] === "container" && call[2] === "rm" && call.at(-1) === RESIDUE_CONTAINER_ID)).toBe(true);
+  });
+
+  // destroy.ts's RESIDUE_INSPECT_FORMAT, pinned here so these tests can
+  // identify the batched residue-description inspect among the other
+  // `container inspect` calls destroy issues (containerProvenAbsent's
+  // `{{.Id}}` probe, unclaimedProjectContainers' compose-label scan).
+  const RESIDUE_INSPECT_FORMAT = "{{.Id}}\t{{.Name}}\t{{.Config.Image}}\t{{.State.Status}}";
+  const residueInspectCalls = (calls: readonly string[][]): string[][] => (
+    calls.filter((call) => call[1] === "container" && call[2] === "inspect" && call[4] === RESIDUE_INSPECT_FORMAT)
+  );
+
+  test("inspects multiple residue candidates in one batched docker call instead of one per id", () => {
+    const ids = ["d".repeat(64), "e".repeat(64), "f".repeat(64)];
+    const forced = harness({ residueIds: ids, force: true });
+
+    expect(runFencedProjectDestroy(forced.input)).toBe(0);
+    const inspects = residueInspectCalls(forced.calls);
+    expect(inspects).toHaveLength(1);
+    expect(inspects[0]?.slice(5)).toEqual(ids);
+    // Every candidate the one batched call named is still removed, so the
+    // batched parse returns the same candidates the former per-id loop did.
+    for (const id of ids) {
+      expect(forced.calls.some((call) => call[1] === "container" && call[2] === "rm" && call.at(-1) === id)).toBe(true);
+    }
+  });
+
+  test("inspects residue candidates in id-bounded chunks", () => {
+    // Mirrors the stop fence's own 65-id chunk-boundary test above, for the
+    // same reason: no single docker argv may grow unbounded.
+    const ids = Array.from({ length: 65 }, (_, index) => index.toString(16).padStart(2, "0").repeat(32));
+    const { input, calls } = harness({ residueIds: ids, force: true });
+
+    expect(runFencedProjectDestroy(input)).toBe(0);
+    const inspectTargets = residueInspectCalls(calls).map((call) => call.slice(5));
+    expect(inspectTargets).toEqual([ids.slice(0, 64), ids.slice(64)]);
+  });
+
+  test("makes no residue inspect call when there are no residue candidates", () => {
+    const { input, calls } = harness();
+    expect(runFencedProjectDestroy(input)).toBe(0);
+    expect(residueInspectCalls(calls)).toEqual([]);
+  });
+
+  test("a residue id that vanishes between ps and inspect is dropped as absent; survivors are still reported", () => {
+    const ids = ["d".repeat(64), "e".repeat(64), "f".repeat(64)];
+    const vanished = ids[1] as string;
+    const forced = harness({ residueIds: ids, force: true, vanishedResidueIds: [vanished] });
+
+    expect(runFencedProjectDestroy(forced.input)).toBe(0);
+    // The one batched call still names every candidate; Docker's reply about
+    // the vanished id is what tells the parse to drop it.
+    const inspects = residueInspectCalls(forced.calls);
+    expect(inspects[0]?.slice(5)).toEqual(ids);
+    expect(forced.calls.some((call) => call[1] === "container" && call[2] === "rm" && call.at(-1) === ids[0])).toBe(true);
+    expect(forced.calls.some((call) => call[1] === "container" && call[2] === "rm" && call.at(-1) === ids[2])).toBe(true);
+    expect(forced.calls.some((call) => call[1] === "container" && call[2] === "rm" && call.at(-1) === vanished)).toBe(false);
+
+    // Without --force, the vanished id is reported as neither present nor
+    // blocking: only the survivors keep the destroy refused.
+    const plain = harness({ residueIds: ids, residueRunning: false, vanishedResidueIds: [vanished] });
+    expect(runFencedProjectDestroy(plain.input)).toBe(1);
+  });
+
+  test("a residue inspect failure that does not name a missing container keeps every candidate, exactly as the former per-id fallback", () => {
+    // Before batching, each id's own inspect call could fail for a reason
+    // other than the container being gone (a daemon hiccup, for instance);
+    // the per-id loop kept the id with a generic description rather than
+    // dropping it or aborting the scan. The batched call preserves that.
+    const ids = ["d".repeat(64), "e".repeat(64)];
+    const forced = harness({ residueIds: ids, force: true, failResidueInspect: true });
+    expect(runFencedProjectDestroy(forced.input)).toBe(0);
+    for (const id of ids) {
+      expect(forced.calls.some((call) => call[1] === "container" && call[2] === "rm" && call.at(-1) === id)).toBe(true);
+    }
+
+    const plain = harness({ residueIds: ids, residueRunning: false, failResidueInspect: true });
+    expect(runFencedProjectDestroy(plain.input)).toBe(1);
   });
 
   test("plain destroy refuses a quarantined unreadable record; --force proceeds and clears the evidence", () => {
