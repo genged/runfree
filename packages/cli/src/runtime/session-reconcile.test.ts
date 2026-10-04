@@ -313,8 +313,12 @@ function fakeDocker(options: {
         if (target === SESSION_ELIGIBILITY_PATH) return "publish-eligibility";
         return `delete-session-file:${target.slice(SESSION_FILES_DIR.length + 1)}`;
       }
+      // The inventory scan now builds its listing as `ps` (createDockerClient's
+      // listContainers); the sealed absence-list probe still builds
+      // `container ls --filter id=…` directly, unaffected by that migration.
+      if (args[0] === "ps") return "inventory-list";
       if (args[0] === "container" && args[1] === "ls") {
-        return args.includes("--filter") ? `absence-list:${args[5]?.slice(3)}` : "inventory-list";
+        return `absence-list:${args[5]?.slice(3)}`;
       }
       if (args[0] === "container" && args[1] === "inspect") {
         return args[2] === PROXY_ID ? "inspect-proxy" : `inventory-inspect:${args.slice(2).join(",")}`;

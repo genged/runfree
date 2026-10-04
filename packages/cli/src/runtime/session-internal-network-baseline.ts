@@ -9,7 +9,8 @@ import {
 } from "./component-state-v2.ts";
 import { controlPlaneTopologyProjectionV2 } from "./control-plane-topology-v2.ts";
 import type { ActiveRuntimePlan } from "./plan.ts";
-import { dockerClientEnvOptions, parseDockerJson } from "./docker.ts";
+import { createDockerClient } from "./docker-client.ts";
+import { dockerClientEnvOptions, filterValues, parseDockerJson } from "./docker.ts";
 import { INGRESS_FORWARDER_IMAGE, ingressHostNetworkName, inspectIngressHostNetwork, listIngressForwarders } from "./ingress-forwarder.ts";
 import { validateIngressForwarderTeardownCandidate, validateInternalNetworkParticipants } from "./utility-containers.ts";
 import {
@@ -303,19 +304,22 @@ function inspectIngressParticipants(
   const hostNetwork = inspectIngressHostNetwork(context, io, selection.projectId);
   if (!hostNetwork) throw new Error("ingress participants require a verified host network");
   const options = { ...dockerClientEnvOptions(context), maxBuffer: 8 * 1024 * 1024 };
-  const image = io.capture("docker", ["image", "inspect", "--format", "{{.Id}}", INGRESS_FORWARDER_IMAGE], options);
+  const docker = createDockerClient(io, options);
+  const image = docker.inspect([INGRESS_FORWARDER_IMAGE], { type: "image", format: "{{.Id}}" });
   const imageId = image.stdout.trim();
   if (image.status !== 0 || !/^sha256:[a-f0-9]{64}$/u.test(imageId)) {
     throw new Error("could not resolve the immutable ingress forwarder image");
   }
-  const sessions = io.capture("docker", ["ps", "--no-trunc",
-    ...wholeProjectContainerFilters(selection.projectId),
-    "--filter", "label=io.runfree.container-role=session-agent", "--format", "{{.ID}}"], options);
+  const sessions = docker.listContainers({
+    noTrunc: true,
+    filters: [...filterValues(wholeProjectContainerFilters(selection.projectId)), "label=io.runfree.container-role=session-agent"],
+    format: "{{.ID}}",
+  });
   const sessionIds = sessions.stdout.trim().split(/\s+/u).filter(Boolean);
   if (sessions.status !== 0 || sessionIds.some((id) => !DOCKER_OBJECT_ID_PATTERN.test(id))) {
     throw new Error("could not inventory live ingress session targets");
   }
-  const result = io.capture("docker", ["container", "inspect", ...names, ...sessionIds], options);
+  const result = docker.inspect([...names, ...sessionIds], { type: "container" });
   if (result.status !== 0) throw new Error("could not inspect ingress participants and their session targets");
   const inspected = parseDockerJson<DockerContainerInspect[]>(result, "ingress participant inspection");
   if (!Array.isArray(inspected) || inspected.length !== names.length + sessionIds.length) {

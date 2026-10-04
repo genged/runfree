@@ -109,7 +109,7 @@ function inventoryInspection(snapshots: readonly SessionContainerSnapshot[]): st
 
 function exactInventory(snapshots: readonly SessionContainerSnapshot[]): readonly SessionContainerSnapshot[] {
   return inspectSessionContainerInventory((_executable, args) => (
-    args[1] === "ls"
+    args[0] === "ps"
       ? success(`${snapshots.map((snapshot) => snapshot.containerId).join("\n")}\n`)
       : success(inventoryInspection(snapshots))
   ), SESSION_TEST_PROJECT);

@@ -17,6 +17,7 @@ import {
   type ControlPlaneMaterializationManifestV2,
 } from "./component-state-v2.ts";
 import { PROXY_CONTAINER_INSPECT_MAX_BYTES } from "./constants.ts";
+import { createDockerClient } from "./docker-client.ts";
 import { RuntimeObservationError } from "./observation-failure.ts";
 import { compileAllowedSessionAgentMaterializationsV2 } from "./session-materialization-eligibility.ts";
 import type { SessionContainerRecordV2 } from "./session-containers.ts";
@@ -37,10 +38,10 @@ export function observeProxyStartedAt(
   proxyId: string,
   dockerOptions: childProcess.SpawnSyncOptions = {},
 ): string {
-  const inspected = io.capture("docker", ["container", "inspect", proxyId], {
+  const inspected = createDockerClient(io, {
     ...dockerOptions,
     maxBuffer: PROXY_CONTAINER_INSPECT_MAX_BYTES,
-  });
+  }).inspect([proxyId], { type: "container" });
   let startedAt: unknown;
   try {
     const value: unknown = JSON.parse(inspected.stdout);

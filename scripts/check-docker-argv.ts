@@ -49,13 +49,28 @@ export const DOCKER_LITERAL_ALLOWLIST: Readonly<Record<string, string>> = {
   // `runContainer` like every other call in the task's seven files. None of
   // them carry a literal "docker" string any more, so none are listed here.
 
-  // pending: Task 7
-  "packages/cli/src/runtime/session-admission-driver.ts": "pending: Task 7",
-  "packages/cli/src/runtime/session-eligibility-publication.ts": "pending: Task 7",
-  "packages/cli/src/runtime/session-admission-pending-reclaim.ts": "pending: Task 7",
-  "packages/cli/src/runtime/session-internal-network-baseline.ts": "pending: Task 7",
-  "packages/cli/src/runtime/session-container-reconciliation.ts": "pending: Task 7",
-  "packages/cli/src/runtime/session-reconcile.ts": "pending: Task 7",
+  // Task 7 is complete: the raw session-path capture("docker", ...) and
+  // executor("docker", ...) sites in session-admission-driver.ts,
+  // session-eligibility-publication.ts, session-admission-pending-reclaim.ts,
+  // and session-internal-network-baseline.ts now build their argv through
+  // createDockerClient; none of them carry a literal "docker" string any
+  // more, so none are listed here. session-file-heartbeat.ts and
+  // session-file-teardown.ts never had a literal of their own.
+
+  // sealed-session: the only "docker" literal is `executable: "docker"` in
+  // `SessionContainerInventoryExecutor`'s function-type signature, the raw
+  // executor type `inspectSessionContainerInventory` takes. Both of its
+  // capture sites now build argv through
+  // `createDockerClient({ capture: executor }, options)`; no literal remains
+  // at either call.
+  "packages/cli/src/runtime/session-container-reconciliation.ts": "sealed-session: `executable: \"docker\"` appears only in the SessionContainerInventoryExecutor function-type signature; both inventory-scan capture sites build argv through createDockerClient({ capture: executor }, options)",
+
+  // sealed-session: the only "docker" literal types the local `executor`
+  // lambda's first parameter so it matches session-container-cleanup.ts's
+  // sealed SessionContainerCleanupExecutor; every call through it reaches
+  // executeSessionContainerCleanupCommand or proveSessionContainerOrphanAbsent
+  // (both sealed-session), never a raw capture("docker", ...) call.
+  "packages/cli/src/runtime/session-reconcile.ts": "sealed-session: `executable: \"docker\"` types the local executor passed only to executeSessionContainerCleanupCommand and proveSessionContainerOrphanAbsent (session-container-cleanup.ts, sealed-session); no raw capture(\"docker\", ...) call in this file",
 
   // pending: Task 8
   "packages/cli/src/admin/admin-core.ts": "pending: Task 8",

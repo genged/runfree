@@ -3796,13 +3796,12 @@ describe("runtime command flow", () => {
     expect(dockerOperationProfile(io.calls.slice(warmStart))).toMatchInlineSnapshot(`
       {
         "docker container inspect": 4,
-        "docker container ls": 2,
         "docker exec": 13,
         "docker image inspect": 9,
         "docker info": 1,
         "docker inspect": 6,
         "docker network inspect": 3,
-        "docker ps": 12,
+        "docker ps": 14,
         "docker run": 1,
       }
     `);
@@ -3831,12 +3830,11 @@ describe("runtime command flow", () => {
     expect(dockerOperationProfile(io.calls.slice(warmStart))).toMatchInlineSnapshot(`
       {
         "docker container inspect": 1,
-        "docker container ls": 1,
         "docker exec": 3,
         "docker image inspect": 9,
         "docker info": 1,
         "docker inspect": 2,
-        "docker ps": 7,
+        "docker ps": 8,
       }
     `);
   });
@@ -4278,9 +4276,18 @@ describe("runtime command flow", () => {
     }
     // The cleanup pass is the only startup step that lists every container
     // for the image accounting before validation; the reconcile after
-    // eligibility publication issues the other listing.
+    // eligibility publication issues the other listing. Both build their
+    // argv as `ps --all --no-trunc --format {{.ID}}` with no `--filter`
+    // (createDockerClient's listContainers); that unfiltered shape is unique
+    // to this inventory scan, so it still discriminates it from every other
+    // (always filtered) `docker ps` listing in the same window.
     const containerListings = (calls: readonly RuntimeIoCall[]): number =>
-      dockerOperationProfile(calls)["docker container ls"] ?? 0;
+      calls.filter((call) => call.method === "capture" && call.command === "docker"
+        && call.args[0] === "ps"
+        && call.args.includes("--all")
+        && call.args.includes("--no-trunc")
+        && call.args.includes("--format")
+        && !call.args.includes("--filter")).length;
 
     test("unchanged inputs: a second warm launch runs no cleanup inventory", async () => {
       const context = launchContext();

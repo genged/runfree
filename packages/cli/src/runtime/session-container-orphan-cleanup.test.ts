@@ -145,7 +145,7 @@ function orphanClassification(
   snapshot: SessionContainerSnapshot = orphanSnapshot(),
 ): Extract<SessionReconciliationClassification, { kind: "container-only" }> {
   const inventory = inspectSessionContainerInventory((_, args) => {
-    if (args[1] === "ls") return success(`${snapshot.containerId}\n`);
+    if (args[0] === "ps") return success(`${snapshot.containerId}\n`);
     return success(inventoryInspection(snapshot));
   }, SESSION_TEST_PROJECT);
   const [classification] = classifySessionContainerReconciliation({
@@ -202,7 +202,7 @@ describe("container-only session orphan cleanup", () => {
     const calls: Array<{ args: readonly string[]; options: unknown }> = [];
     const inventory = inspectSessionContainerInventory((_executable, args, options) => {
       calls.push({ args: [...args], options });
-      return args[1] === "ls"
+      return args[0] === "ps"
         ? success(`${CONTAINER_ID}\n`)
         : success(inventoryInspection(snapshot));
     }, SESSION_TEST_PROJECT, { cwd: "/trusted" });
@@ -215,7 +215,7 @@ describe("container-only session orphan cleanup", () => {
     });
     expect(calls).toEqual([
       {
-        args: ["container", "ls", "--all", "--no-trunc", "--format", "{{.ID}}"],
+        args: ["ps", "--all", "--no-trunc", "--format", "{{.ID}}"],
         options: { cwd: "/trusted", maxBuffer: 8 * 1024 * 1024 },
       },
       {
@@ -253,7 +253,7 @@ describe("container-only session orphan cleanup", () => {
     const calls: string[][] = [];
     const inventory = inspectSessionContainerInventory((_executable, args) => {
       calls.push([...args]);
-      if (args[1] === "ls") {
+      if (args[0] === "ps") {
         listCalls += 1;
         return success(listCalls === 1
           ? `${CONTAINER_ID}\n${OTHER_CONTAINER_ID}\n`
@@ -271,9 +271,9 @@ describe("container-only session orphan cleanup", () => {
     expect(inventory).toHaveLength(2);
     expect(inventory[0]?.containerId).toBe(CONTAINER_ID);
     expect(calls).toEqual([
-      ["container", "ls", "--all", "--no-trunc", "--format", "{{.ID}}"],
+      ["ps", "--all", "--no-trunc", "--format", "{{.ID}}"],
       ["container", "inspect", CONTAINER_ID, OTHER_CONTAINER_ID],
-      ["container", "ls", "--all", "--no-trunc", "--format", "{{.ID}}"],
+      ["ps", "--all", "--no-trunc", "--format", "{{.ID}}"],
       ["container", "inspect", CONTAINER_ID, squatterId],
     ]);
     const classifications = classifySessionContainerReconciliation({
@@ -304,7 +304,7 @@ describe("container-only session orphan cleanup", () => {
     let listCalls = 0;
     let inspectCalls = 0;
     const inventory = inspectSessionContainerInventory((_executable, args) => {
-      if (args[1] === "ls") {
+      if (args[0] === "ps") {
         listCalls += 1;
         return success(listCalls === 1
           ? `${CONTAINER_ID}\n${OTHER_CONTAINER_ID}\n`
@@ -358,7 +358,7 @@ describe("container-only session orphan cleanup", () => {
     let listCalls = 0;
     let inspectCalls = 0;
     const stableIdentityFailure = (_executable: "docker", args: readonly string[]): CaptureResult => {
-      if (args[1] === "ls") {
+      if (args[0] === "ps") {
         listCalls += 1;
         return success(`${CONTAINER_ID}\n`);
       }
@@ -374,7 +374,7 @@ describe("container-only session orphan cleanup", () => {
     listCalls = 0;
     inspectCalls = 0;
     const repeatedChurn = (_executable: "docker", args: readonly string[]): CaptureResult => {
-      if (args[1] === "ls") {
+      if (args[0] === "ps") {
         listCalls += 1;
         return success(listCalls === 1
           ? `${CONTAINER_ID}\n${OTHER_CONTAINER_ID}\n`
@@ -399,7 +399,7 @@ describe("container-only session orphan cleanup", () => {
     const departing = ids[1];
     let listCalls = 0;
     const listedButGone = (_executable: "docker", args: readonly string[]): CaptureResult => {
-      if (args[1] === "ls") {
+      if (args[0] === "ps") {
         listCalls += 1;
         // Both lists still report every id, including the departing one.
         return success(`${ids.join("\n")}\n`);
@@ -423,7 +423,7 @@ describe("container-only session orphan cleanup", () => {
     // Nothing is dropped and nothing is retried against the same ids.
     let inspectCalls = 0;
     const opaqueFailure = (_executable: "docker", args: readonly string[]): CaptureResult => {
-      if (args[1] === "ls") return success(`${inventoryIds(2).join("\n")}\n`);
+      if (args[0] === "ps") return success(`${inventoryIds(2).join("\n")}\n`);
       inspectCalls += 1;
       return { status: 1, stdout: "", stderr: "Cannot connect to the Docker daemon at unix:///var/run/docker.sock." };
     };
@@ -447,7 +447,7 @@ describe("container-only session orphan cleanup", () => {
     let listCalls = 0;
 
     const churnedFirstChunk = (_executable: "docker", args: readonly string[]): CaptureResult => {
-      if (args[1] === "ls") {
+      if (args[0] === "ps") {
         listCalls += 1;
         return success(`${(listCalls === 1 ? ids : survivors).join("\n")}\n`);
       }
@@ -491,7 +491,7 @@ describe("container-only session orphan cleanup", () => {
     let listCalls = 0;
 
     const partialOutput = (_executable: "docker", args: readonly string[]): CaptureResult => {
-      if (args[1] === "ls") {
+      if (args[0] === "ps") {
         listCalls += 1;
         return success(`${ids.join("\n")}\n`);
       }
@@ -520,7 +520,7 @@ describe("container-only session orphan cleanup", () => {
     const inspected: string[][] = [];
 
     const shortOutput = (_executable: "docker", args: readonly string[]): CaptureResult => {
-      if (args[1] === "ls") return success(`${ids.join("\n")}\n`);
+      if (args[0] === "ps") return success(`${ids.join("\n")}\n`);
       const requested = args.slice(2);
       inspected.push([...requested]);
       if (!requested.includes(vanished)) return success(inventoryInspectionMany(requested.map(foreignSnapshotFor)));
@@ -548,7 +548,7 @@ describe("container-only session orphan cleanup", () => {
     let inspectCalls = 0;
 
     const singleChurn = (_executable: "docker", args: readonly string[]): CaptureResult => {
-      if (args[1] === "ls") {
+      if (args[0] === "ps") {
         listCalls += 1;
         return success(`${(listCalls === 1 ? ids : survivors).join("\n")}\n`);
       }
@@ -578,7 +578,7 @@ describe("container-only session orphan cleanup", () => {
       NetworkSettings: "not-an-object",
     };
     const inventory = inspectSessionContainerInventory((_executable, args) => (
-      args[1] === "ls"
+      args[0] === "ps"
         ? success(`${CONTAINER_ID}\n${foreignId}\n`)
         : success(JSON.stringify([
             JSON.parse(inventoryInspection(exact))[0],
@@ -609,7 +609,7 @@ describe("container-only session orphan cleanup", () => {
       },
     ]) {
       const [container] = inspectSessionContainerInventory((_executable, args) => (
-        args[1] === "ls" ? success(`${foreignId}\n`) : success(JSON.stringify([raw]))
+        args[0] === "ps" ? success(`${foreignId}\n`) : success(JSON.stringify([raw]))
       ), SESSION_TEST_PROJECT);
       const [classification] = classifySessionContainerReconciliation({
         expectedProject: SESSION_TEST_PROJECT,
@@ -632,7 +632,7 @@ describe("container-only session orphan cleanup", () => {
       },
     };
     const [container] = inspectSessionContainerInventory((_executable, args) => (
-      args[1] === "ls" ? success(`${foreignId}\n`) : success(JSON.stringify([ipSquatter]))
+      args[0] === "ps" ? success(`${foreignId}\n`) : success(JSON.stringify([ipSquatter]))
     ), SESSION_TEST_PROJECT);
     const [classification] = classifySessionContainerReconciliation({
       expectedProject: SESSION_TEST_PROJECT,
@@ -702,7 +702,7 @@ describe("container-only session orphan cleanup", () => {
     };
     const inspection = [...composeParticipants, otherSession, currentSquatter, composeLabelSquatter];
     const inventory = inspectSessionContainerInventory((_executable, args) => (
-      args[1] === "ls"
+      args[0] === "ps"
         ? success(`${inspection.map(({ Id }) => Id).join("\n")}\n`)
         : success(JSON.stringify(inspection))
     ), SESSION_TEST_PROJECT);
@@ -743,7 +743,7 @@ describe("container-only session orphan cleanup", () => {
     const byId = new Map(snapshots.map((snapshot) => [snapshot.Id as string, snapshot]));
     const inspectCalls: string[][] = [];
     const inventory = inspectSessionContainerInventory((_executable, args) => {
-      if (args[1] === "ls") return success(`${snapshots.map(({ Id }) => Id).join("\n")}\n`);
+      if (args[0] === "ps") return success(`${snapshots.map(({ Id }) => Id).join("\n")}\n`);
       inspectCalls.push([...args]);
       return success(JSON.stringify(args.slice(2).map((id) => byId.get(id))));
     }, SESSION_TEST_PROJECT);
@@ -760,7 +760,7 @@ describe("container-only session orphan cleanup", () => {
 
     let inspectIndex = 0;
     const oversizedSecondChunk = (_executable: "docker", args: readonly string[]): CaptureResult => {
-      if (args[1] === "ls") return success(`${snapshots.map(({ Id }) => Id).join("\n")}\n`);
+      if (args[0] === "ps") return success(`${snapshots.map(({ Id }) => Id).join("\n")}\n`);
       inspectIndex += 1;
       return inspectIndex === 1
         ? success(JSON.stringify(args.slice(2).map((id) => byId.get(id))))
@@ -791,7 +791,7 @@ describe("container-only session orphan cleanup", () => {
     ]) {
       let inspectIndex = 0;
       const executor = (_executable: "docker", args: readonly string[]): CaptureResult => {
-        if (args[1] === "ls") return success(`${ids.join("\n")}\n`);
+        if (args[0] === "ps") return success(`${ids.join("\n")}\n`);
         inspectIndex += 1;
         return success(JSON.stringify(inspectIndex === 1
           ? args.slice(2).map((id) => byId.get(id))
@@ -814,7 +814,7 @@ describe("container-only session orphan cleanup", () => {
     const ids = inspections.map(({ Id }) => Id);
     let inspectIndex = 0;
     const executor = (_executable: "docker", args: readonly string[]): CaptureResult => {
-      if (args[1] === "ls") return success(`${ids.join("\n")}\n`);
+      if (args[0] === "ps") return success(`${ids.join("\n")}\n`);
       inspectIndex += 1;
       const chunk = args.slice(2).map((id) => inspections.find((item) => item.Id === id));
       const padding = "x".repeat(inspectIndex === 1 ? 5 * 1_024 * 1_024 : 4 * 1_024 * 1_024);
@@ -857,7 +857,7 @@ describe("container-only session orphan cleanup", () => {
       },
     ]) {
       const executor = vi.fn((_executable: "docker", args: readonly string[]) => (
-        args[1] === "ls" ? success(`${CONTAINER_ID}\n`) : inspectResult
+        args[0] === "ps" ? success(`${CONTAINER_ID}\n`) : inspectResult
       ));
       expect(() => inspectSessionContainerInventory(executor, SESSION_TEST_PROJECT)).toThrow();
       expect(executor).toHaveBeenCalledTimes(expectedCalls);

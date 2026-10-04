@@ -173,6 +173,7 @@ import {
 } from "./prepared-runtime.ts";
 import { sessionRegistryDigest } from "./launch-handoff.ts";
 import { createRuntimeDocker } from "./docker.ts";
+import { createDockerClient } from "./docker-client.ts";
 import {
   createSessionId,
   createSessionMetadata,
@@ -1300,7 +1301,7 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
     if (sessionRegistryDigest(this.#input.plan.paths.stateDir, this.#projectIdentity()) !== handoff.registryDigest) {
       return undefined;
     }
-    const inspected = this.#gateway.io.capture("docker", ["container", "inspect", proxyId], this.#dockerOptions());
+    const inspected = createDockerClient(this.#gateway.io, this.#dockerOptions()).inspect([proxyId], { type: "container" });
     let startedAt: unknown;
     let running: unknown;
     try {

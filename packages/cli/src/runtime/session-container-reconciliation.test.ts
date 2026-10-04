@@ -369,7 +369,7 @@ describe("session-container inventory inspection of real daemon output", () => {
   // container into malformed metadata.
   function inventory(inspectBody: readonly unknown[], ids: readonly string[] = [CONTAINER_ID]) {
     const executor = (_executable: string, args: readonly string[]) => {
-      if (args.includes("ls")) return { status: 0, stdout: `${ids.join("\n")}\n`, stderr: "" };
+      if (args[0] === "ps") return { status: 0, stdout: `${ids.join("\n")}\n`, stderr: "" };
       return { status: 0, stdout: JSON.stringify(inspectBody), stderr: "" };
     };
     return inspectSessionContainerInventory(executor, PROJECT);
