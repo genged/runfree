@@ -224,10 +224,10 @@ describe("forwardRuntime", () => {
     expect(() => forwardRuntime({ action: "start" }, context, io, adapters)).toThrow(/requires a port/u);
   });
 
-  test("start refuses a port another project registered as a host service, naming its root, before any removal", () => {
+  test("start refuses a port another project registered as a host service, naming its root, before any removal", async () => {
     const otherRoot = "/workspace/other-project";
     const otherProjectId = projectHash(otherRoot);
-    recordProjectHostServicePorts(context.env as NodeJS.ProcessEnv, { id: otherProjectId, root: otherRoot }, [10882]);
+    await recordProjectHostServicePorts(context.env as NodeJS.ProcessEnv, { id: otherProjectId, root: otherRoot }, [10882]);
     const { io } = fakeIo([PORT_A]);
 
     expect(() => forwardRuntime({ action: "start", hostPort: "10882", agentPort: "10882" }, context, io, adapters))

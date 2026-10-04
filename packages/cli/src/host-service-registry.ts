@@ -46,12 +46,17 @@ import {
   safeReplaceProjectFile,
 } from "./safe-fs.ts";
 import { isRecord, readBoundedRegularFile } from "./strict-primitives.ts";
+import { runfreeLog } from "./warnings.ts";
 
 const REGISTRY_FILE_NAME = "host-service-ports.json";
 const LOCK_DIR_NAME = "host-service-ports.lock";
 const PROJECT_ID_RE = /^[0-9a-f]{12}$/;
 const PORT_KEY_RE = /^[1-9][0-9]{0,4}$/;
 const MAX_REGISTRY_BYTES = 4 * 1024 * 1024;
+// `project.json` pointers are a root path plus a timestamp; generous but
+// still bounded, matching `launch-host-record.ts`'s precedent for small
+// host-state records.
+const PROJECT_POINTER_MAX_BYTES = 64 * 1024;
 
 // Matches `control/lock.ts`'s PIDLESS_GRACE_MS exactly: a lock directory with
 // no readable owner.json is reclaimed only once it has aged past this, so a
@@ -59,14 +64,19 @@ const MAX_REGISTRY_BYTES = 4 * 1024 * 1024;
 // never torn down from under it.
 const PIDLESS_GRACE_MS = 5_000;
 
-// A held, live lock blocks a writer only for this long in total before it
-// reports contention; this is a host-global file multiple concurrent
-// `runfree` invocations (different projects, different terminals) can
-// legitimately race to update, so a brief wait is cheap and avoids spurious
-// failures a fail-fast acquire (as in `control/lock.ts`, scoped to one
-// project and rarely contended) would not need.
-const LOCK_RETRY_ATTEMPTS = 50;
-const LOCK_RETRY_DELAY_MS = 100;
+// A held, live lock blocks a writer only this long in total before it reports
+// contention; this is a host-global file multiple concurrent `runfree`
+// invocations (different projects, different terminals) can legitimately
+// race to update, so a brief wait is cheap and avoids spurious failures a
+// fail-fast acquire (as in `control/lock.ts`, scoped to one project and
+// rarely contended) would not need. Pure attempt counting (no `Date.now()`)
+// so the wait is exact under fake timers in tests, matching the precedent in
+// `tryAcquireProjectLifecycleLockWithRetry` (`runtime/sessions.ts`).
+const LOCK_RETRY_DELAY_MS = 200;
+// (26 - 1) * 200ms = 5_000ms total.
+const LOCK_RETRY_ATTEMPTS = 26;
+// One progress line, once the wait passes this; never repeated.
+const LOCK_PROGRESS_AT_MS = 2_000;
 
 function isValidPort(value: unknown): value is number {
   return typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= 65535;
@@ -184,14 +194,27 @@ function tryAcquireRegistryLock(stateRoot: string, env: NodeJS.ProcessEnv): Regi
   return undefined;
 }
 
-function sleepSync(ms: number): void {
-  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function withRegistryLock<T>(stateRoot: string, env: NodeJS.ProcessEnv, action: () => T): T {
+/**
+ * Acquires the lock, retrying through the event loop (never blocking it) for
+ * one bounded total wait before giving up. A progress line is printed to
+ * stderr exactly once, the first time the wait passes `LOCK_PROGRESS_AT_MS`,
+ * so a caller held up by another `runfree` process sees why rather than a
+ * silent pause followed by a refusal.
+ */
+async function withRegistryLock<T>(stateRoot: string, env: NodeJS.ProcessEnv, action: () => T): Promise<T> {
   let lock = tryAcquireRegistryLock(stateRoot, env);
+  let printedProgress = false;
   for (let attempt = 1; !lock && attempt < LOCK_RETRY_ATTEMPTS; attempt += 1) {
-    sleepSync(LOCK_RETRY_DELAY_MS);
+    await delay(LOCK_RETRY_DELAY_MS);
+    const elapsedMs = attempt * LOCK_RETRY_DELAY_MS;
+    if (!printedProgress && elapsedMs >= LOCK_PROGRESS_AT_MS) {
+      runfreeLog(`waiting for the host-service port registry lock (${Math.round(elapsedMs / 1_000)}s; lock: ${lockDirPath(stateRoot)})`);
+      printedProgress = true;
+    }
     lock = tryAcquireRegistryLock(stateRoot, env);
   }
   if (!lock) {
@@ -323,11 +346,25 @@ function knownProjectPointers(stateRoot: string): Array<{ id: string; root: stri
       if (!entry) break;
       if (!entry.isDirectory() || !PROJECT_ID_RE.test(entry.name)) continue;
       const pointerPath = path.join(projectsRoot, entry.name, "project.json");
+      // Same open-by-fd, fstat-recheck, bounded-size, hard-link-rejecting
+      // helper the registry file itself reads with. A pointer that fails any
+      // of those checks (symlink, hard link, oversized, changed mid-read) is
+      // skipped — never aborts the repair for every other known project.
+      let read: ReturnType<typeof readBoundedRegularFile>;
+      try {
+        read = readBoundedRegularFile(pointerPath, {
+          maxBytes: PROJECT_POINTER_MAX_BYTES,
+          sizeRecheck: "exact",
+          notFileMessage: () => `project pointer is not a bounded regular single-link file: ${pointerPath}`,
+          changedMessage: () => `project pointer changed during read: ${pointerPath}`,
+        });
+      } catch {
+        continue;
+      }
+      if (!read) continue;
       let parsed: unknown;
       try {
-        const stat = fs.lstatSync(pointerPath);
-        if (!stat.isFile() || stat.isSymbolicLink()) continue;
-        parsed = parseStrictJson(fs.readFileSync(pointerPath, "utf8"));
+        parsed = parseStrictJson(read.source);
       } catch {
         continue;
       }
@@ -383,12 +420,12 @@ export function readHostServicePortRegistry(env: NodeJS.ProcessEnv): HostService
 }
 
 /** Runs under the lock. An empty `ports` list removes the project's row. */
-export function recordProjectHostServicePorts(
+export async function recordProjectHostServicePorts(
   env: NodeJS.ProcessEnv,
   project: { id: string; root: string },
   ports: readonly number[],
   owners?: Readonly<Record<number, string>>,
-): void {
+): Promise<void> {
   if (!PROJECT_ID_RE.test(project.id)) {
     throw new Error(`invalid project id for the host service port registry: ${project.id}`);
   }
@@ -396,7 +433,7 @@ export function recordProjectHostServicePorts(
     if (!isValidPort(port)) throw new Error(`invalid host service port: ${port}`);
   }
   const stateRoot = runfreeStateRoot(env);
-  withRegistryLock(stateRoot, env, () => {
+  await withRegistryLock(stateRoot, env, () => {
     const current = readRegistryFileForMutation(stateRoot);
     const projects: Record<string, RegistryProjectRow> = { ...current.projects };
     if (ports.length === 0) {
@@ -426,9 +463,9 @@ export function recordProjectHostServicePorts(
 }
 
 /** Runs under the lock. Idempotent: a project with no row is left alone. */
-export function removeProjectHostServicePorts(env: NodeJS.ProcessEnv, projectId: string): void {
+export async function removeProjectHostServicePorts(env: NodeJS.ProcessEnv, projectId: string): Promise<void> {
   const stateRoot = runfreeStateRoot(env);
-  withRegistryLock(stateRoot, env, () => {
+  await withRegistryLock(stateRoot, env, () => {
     const current = readRegistryFileForMutation(stateRoot);
     if (!(projectId in current.projects)) return;
     const projects: Record<string, RegistryProjectRow> = { ...current.projects };
@@ -444,12 +481,12 @@ export function removeProjectHostServicePorts(env: NodeJS.ProcessEnv, projectId:
  * reads. A project `readProjectPorts` reports no ports for is simply absent
  * from the rebuilt file.
  */
-export function repairHostServicePortRegistry(
+export async function repairHostServicePortRegistry(
   env: NodeJS.ProcessEnv,
   readProjectPorts: (projectRoot: string, projectId: string) => readonly number[] | undefined,
-): { projects: number; ports: number } {
+): Promise<{ projects: number; ports: number }> {
   const stateRoot = runfreeStateRoot(env);
-  return withRegistryLock(stateRoot, env, () => {
+  return await withRegistryLock(stateRoot, env, () => {
     const projects: Record<string, RegistryProjectRow> = {};
     let projectCount = 0;
     let portCount = 0;

@@ -3,7 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { afterEach, beforeEach, describe, expect, test } from "vitest";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
 import {
   readHostServicePortRegistry,
@@ -14,6 +14,7 @@ import {
 } from "./host-service-registry.ts";
 import { runfreeStateRoot } from "./paths.ts";
 import { projectHash } from "./project-identity.ts";
+import { setOutputWriterForTest } from "./warnings.ts";
 
 // A pid far past any plausible live process, so `processAlive` reads it as
 // dead on every platform without depending on what happens to be running.
@@ -44,15 +45,36 @@ function registryFile(): string {
   return path.join(stateRoot(), "host-service-ports.json");
 }
 
-function writeProjectPointer(id: string, root: string): void {
+function lockDir(): string {
+  return path.join(stateRoot(), "host-service-ports.lock");
+}
+
+function writeProjectPointer(id: string, root: string): string {
   const dir = path.join(stateRoot(), "projects", id);
   fs.mkdirSync(dir, { recursive: true });
-  fs.writeFileSync(path.join(dir, "project.json"), `${JSON.stringify({ projectRoot: root, updatedAt: new Date().toISOString() })}\n`);
+  const pointerPath = path.join(dir, "project.json");
+  fs.writeFileSync(pointerPath, `${JSON.stringify({ projectRoot: root, updatedAt: new Date().toISOString() })}\n`);
+  return pointerPath;
+}
+
+// A lock directory with a live (never dying, in this test) owner: our own
+// pid, which `processAlive` always reports as alive, and no boot/process-start
+// stamp, which `lockIsStale` reads as "unknown" rather than a provable
+// mismatch. The only way this lock goes away is something actually removing
+// the directory.
+function holdLockLive(nonce = "external-holder"): void {
+  fs.mkdirSync(lockDir(), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(lockDir(), "owner.json"), `${JSON.stringify({
+    schemaVersion: 1,
+    pid: process.pid,
+    nonce,
+    createdAt: new Date().toISOString(),
+  })}\n`);
 }
 
 describe("recordProjectHostServicePorts / readHostServicePortRegistry", () => {
-  test("round trips: record then read finds the exact owner", () => {
-    recordProjectHostServicePorts(env, { id: PROJECT_A_ID, root: PROJECT_A_ROOT }, [10882, 10883], { 10882: "idb_companion" });
+  test("round trips: record then read finds the exact owner", async () => {
+    await recordProjectHostServicePorts(env, { id: PROJECT_A_ID, root: PROJECT_A_ROOT }, [10882, 10883], { 10882: "idb_companion" });
 
     const read = readHostServicePortRegistry(env);
     expect(read.ok).toBe(true);
@@ -62,11 +84,11 @@ describe("recordProjectHostServicePorts / readHostServicePortRegistry", () => {
     expect(read.owners.get(10884)).toBeUndefined();
   });
 
-  test("an empty port list removes the project's row", () => {
-    recordProjectHostServicePorts(env, { id: PROJECT_A_ID, root: PROJECT_A_ROOT }, [10882]);
-    recordProjectHostServicePorts(env, { id: PROJECT_B_ID, root: PROJECT_B_ROOT }, [10883]);
+  test("an empty port list removes the project's row", async () => {
+    await recordProjectHostServicePorts(env, { id: PROJECT_A_ID, root: PROJECT_A_ROOT }, [10882]);
+    await recordProjectHostServicePorts(env, { id: PROJECT_B_ID, root: PROJECT_B_ROOT }, [10883]);
 
-    recordProjectHostServicePorts(env, { id: PROJECT_A_ID, root: PROJECT_A_ROOT }, []);
+    await recordProjectHostServicePorts(env, { id: PROJECT_A_ID, root: PROJECT_A_ROOT }, []);
 
     const read = readHostServicePortRegistry(env);
     expect(read.ok).toBe(true);
@@ -75,14 +97,14 @@ describe("recordProjectHostServicePorts / readHostServicePortRegistry", () => {
     expect(read.owners.get(10883)?.projectId).toBe(PROJECT_B_ID);
   });
 
-  test("a symlinked registry file is refused rather than followed for a write", () => {
+  test("a symlinked registry file is refused rather than followed for a write", async () => {
     fs.mkdirSync(stateRoot(), { recursive: true });
     const decoyTarget = path.join(stateRoot(), "decoy-target.json");
     fs.writeFileSync(decoyTarget, "{}\n");
     fs.symlinkSync(decoyTarget, registryFile());
 
-    expect(() => recordProjectHostServicePorts(env, { id: PROJECT_A_ID, root: PROJECT_A_ROOT }, [10882]))
-      .toThrow(/symlink/);
+    await expect(recordProjectHostServicePorts(env, { id: PROJECT_A_ID, root: PROJECT_A_ROOT }, [10882]))
+      .rejects.toThrow(/symlink/);
     expect(fs.readFileSync(decoyTarget, "utf8")).toBe("{}\n");
   });
 
@@ -100,13 +122,13 @@ describe("recordProjectHostServicePorts / readHostServicePortRegistry", () => {
 });
 
 describe("repairHostServicePortRegistry", () => {
-  test("rebuilds the registry from each known project's own answer, recovering from corruption", () => {
+  test("rebuilds the registry from each known project's own answer, recovering from corruption", async () => {
     writeProjectPointer(PROJECT_A_ID, PROJECT_A_ROOT);
     writeProjectPointer(PROJECT_B_ID, PROJECT_B_ROOT);
     fs.mkdirSync(stateRoot(), { recursive: true });
     fs.writeFileSync(registryFile(), "{ not json");
 
-    const result = repairHostServicePortRegistry(env, (_root, id) => (id === PROJECT_A_ID ? [10882] : undefined));
+    const result = await repairHostServicePortRegistry(env, (_root, id) => (id === PROJECT_A_ID ? [10882] : undefined));
     expect(result).toEqual({ projects: 1, ports: 1 });
 
     const read = readHostServicePortRegistry(env);
@@ -115,14 +137,54 @@ describe("repairHostServicePortRegistry", () => {
     expect(read.owners.get(10882)?.projectId).toBe(PROJECT_A_ID);
     expect(read.owners.size).toBe(1);
   });
+
+  test("skips a hard-linked project.json pointer without aborting repair for the other known project", async () => {
+    writeProjectPointer(PROJECT_A_ID, PROJECT_A_ROOT);
+    const pointerB = writeProjectPointer(PROJECT_B_ID, PROJECT_B_ROOT);
+    // A second directory entry for the same inode: the same hard-link shape
+    // `readBoundedRegularFile` refuses for the registry file itself.
+    fs.linkSync(pointerB, `${pointerB}.extra-link`);
+
+    const result = await repairHostServicePortRegistry(env, (_root, id) => {
+      if (id === PROJECT_A_ID) return [10882];
+      if (id === PROJECT_B_ID) return [10883];
+      return undefined;
+    });
+
+    expect(result).toEqual({ projects: 1, ports: 1 });
+    const read = readHostServicePortRegistry(env);
+    expect(read.ok).toBe(true);
+    if (!read.ok) throw new Error("unreachable");
+    expect(read.owners.get(10882)?.projectId).toBe(PROJECT_A_ID);
+    expect(read.owners.get(10883)).toBeUndefined();
+  });
+
+  test("skips an oversized project.json pointer without aborting repair for the other known project", async () => {
+    const pointerA = writeProjectPointer(PROJECT_A_ID, PROJECT_A_ROOT);
+    fs.writeFileSync(pointerA, `${JSON.stringify({ projectRoot: PROJECT_A_ROOT, updatedAt: new Date().toISOString(), pad: "x".repeat(128 * 1024) })}\n`);
+    writeProjectPointer(PROJECT_B_ID, PROJECT_B_ROOT);
+
+    const result = await repairHostServicePortRegistry(env, (_root, id) => {
+      if (id === PROJECT_A_ID) return [10882];
+      if (id === PROJECT_B_ID) return [10883];
+      return undefined;
+    });
+
+    expect(result).toEqual({ projects: 1, ports: 1 });
+    const read = readHostServicePortRegistry(env);
+    expect(read.ok).toBe(true);
+    if (!read.ok) throw new Error("unreachable");
+    expect(read.owners.get(10883)?.projectId).toBe(PROJECT_B_ID);
+    expect(read.owners.get(10882)).toBeUndefined();
+  });
 });
 
 describe("removeProjectHostServicePorts", () => {
-  test("removes one project's row and leaves another's intact", () => {
-    recordProjectHostServicePorts(env, { id: PROJECT_A_ID, root: PROJECT_A_ROOT }, [10882]);
-    recordProjectHostServicePorts(env, { id: PROJECT_B_ID, root: PROJECT_B_ROOT }, [10883]);
+  test("removes one project's row and leaves another's intact", async () => {
+    await recordProjectHostServicePorts(env, { id: PROJECT_A_ID, root: PROJECT_A_ROOT }, [10882]);
+    await recordProjectHostServicePorts(env, { id: PROJECT_B_ID, root: PROJECT_B_ROOT }, [10883]);
 
-    removeProjectHostServicePorts(env, PROJECT_A_ID);
+    await removeProjectHostServicePorts(env, PROJECT_A_ID);
 
     const read = readHostServicePortRegistry(env);
     expect(read.ok).toBe(true);
@@ -131,23 +193,23 @@ describe("removeProjectHostServicePorts", () => {
     expect(read.owners.get(10883)?.projectId).toBe(PROJECT_B_ID);
   });
 
-  test("is a no-op when the project has no row", () => {
-    recordProjectHostServicePorts(env, { id: PROJECT_B_ID, root: PROJECT_B_ROOT }, [10883]);
-    expect(() => removeProjectHostServicePorts(env, PROJECT_A_ID)).not.toThrow();
+  test("is a no-op when the project has no row", async () => {
+    await recordProjectHostServicePorts(env, { id: PROJECT_B_ID, root: PROJECT_B_ROOT }, [10883]);
+    await removeProjectHostServicePorts(env, PROJECT_A_ID);
     const read = readHostServicePortRegistry(env);
     expect(read.ok).toBe(true);
   });
 });
 
 describe("registeredHostServicePortRefusal", () => {
-  test("refuses a port registered by another project, naming its root", () => {
-    recordProjectHostServicePorts(env, { id: PROJECT_B_ID, root: PROJECT_B_ROOT }, [10882]);
+  test("refuses a port registered by another project, naming its root", async () => {
+    await recordProjectHostServicePorts(env, { id: PROJECT_B_ID, root: PROJECT_B_ROOT }, [10882]);
     const refusal = registeredHostServicePortRefusal(env, 10882, PROJECT_A_ID);
     expect(refusal).toContain(PROJECT_B_ROOT);
   });
 
-  test("admits the registering project's own port", () => {
-    recordProjectHostServicePorts(env, { id: PROJECT_A_ID, root: PROJECT_A_ROOT }, [10882]);
+  test("admits the registering project's own port", async () => {
+    await recordProjectHostServicePorts(env, { id: PROJECT_A_ID, root: PROJECT_A_ROOT }, [10882]);
     expect(registeredHostServicePortRefusal(env, 10882, PROJECT_A_ID)).toBeUndefined();
   });
 
@@ -156,21 +218,20 @@ describe("registeredHostServicePortRefusal", () => {
   });
 });
 
-describe("lock mechanics", () => {
-  test("a stale lock whose owner process no longer runs is reclaimed", () => {
-    const lockDir = path.join(stateRoot(), "host-service-ports.lock");
-    fs.mkdirSync(lockDir, { recursive: true, mode: 0o700 });
-    fs.writeFileSync(path.join(lockDir, "owner.json"), `${JSON.stringify({
+describe("lock mechanics: reclaim and contention", () => {
+  test("a stale lock whose owner process no longer runs is reclaimed", async () => {
+    fs.mkdirSync(lockDir(), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(path.join(lockDir(), "owner.json"), `${JSON.stringify({
       schemaVersion: 1,
       pid: DEAD_PID,
       nonce: "old-owner",
       createdAt: "2026-01-01T00:00:00.000Z",
     })}\n`);
 
-    expect(() => recordProjectHostServicePorts(env, { id: PROJECT_A_ID, root: PROJECT_A_ROOT }, [10882])).not.toThrow();
+    await recordProjectHostServicePorts(env, { id: PROJECT_A_ID, root: PROJECT_A_ROOT }, [10882]);
     // The reclaim replaced the stale holder and the write released cleanly;
     // nothing is left behind under the old owner's claim.
-    expect(fs.existsSync(lockDir)).toBe(false);
+    expect(fs.existsSync(lockDir())).toBe(false);
 
     const read = readHostServicePortRegistry(env);
     expect(read.ok).toBe(true);
@@ -178,31 +239,29 @@ describe("lock mechanics", () => {
     expect(read.owners.get(10882)?.projectId).toBe(PROJECT_A_ID);
   });
 
-  test("contention: a lock held by a live owner is retried until an outside release, and both projects' writes land", async () => {
-    const lockDir = path.join(stateRoot(), "host-service-ports.lock");
-    fs.mkdirSync(lockDir, { recursive: true, mode: 0o700 });
-    // Our own pid: always alive, and with no boot/process-start stamp the
-    // staleness check reads "unknown" rather than proving a mismatch, so this
-    // lock is live until something actually removes the directory.
-    fs.writeFileSync(path.join(lockDir, "owner.json"), `${JSON.stringify({
-      schemaVersion: 1,
-      pid: process.pid,
-      nonce: "external-holder",
-      createdAt: new Date().toISOString(),
-    })}\n`);
+  test("contention: a lock held by a live owner is retried through the event loop until an outside release, and both projects' writes land", async () => {
+    holdLockLive();
 
-    // A separate OS process releases the lock shortly after; the retrying
-    // acquire in this process is a synchronous busy-wait, so only another
-    // process's filesystem change can unblock it.
+    // A separate OS process releases the lock shortly after. The retrying
+    // acquire in this process now awaits a real `setTimeout` between
+    // attempts rather than blocking the event loop, so this process keeps
+    // running while it waits; only another process's filesystem change can
+    // unblock it (there is no injected release path).
     const releaseScript = "setTimeout(() => { try { require('fs').rmSync(process.argv[1], "
       + "{ recursive: true, force: true }); } catch (error) {} }, 150);";
-    const release = spawn(process.execPath, ["-e", releaseScript, lockDir], { stdio: "ignore" });
+    const release = spawn(process.execPath, ["-e", releaseScript, lockDir()], { stdio: "ignore" });
+    // Attached immediately, before anything is awaited: the release can
+    // complete (and "exit" can fire) while this process is inside its own
+    // retry `await`s, now that acquisition no longer blocks the event loop.
+    // A listener attached only in `finally`, after those awaits, could miss
+    // an "exit" that already fired and hang forever.
+    const released = new Promise<void>((resolve) => release.once("exit", () => resolve()));
 
     try {
-      recordProjectHostServicePorts(env, { id: PROJECT_A_ID, root: PROJECT_A_ROOT }, [10882]);
-      recordProjectHostServicePorts(env, { id: PROJECT_B_ID, root: PROJECT_B_ROOT }, [10883]);
+      await recordProjectHostServicePorts(env, { id: PROJECT_A_ID, root: PROJECT_A_ROOT }, [10882]);
+      await recordProjectHostServicePorts(env, { id: PROJECT_B_ID, root: PROJECT_B_ROOT }, [10883]);
     } finally {
-      await new Promise<void>((resolve) => release.once("exit", () => resolve()));
+      await released;
     }
 
     const read = readHostServicePortRegistry(env);
@@ -211,4 +270,44 @@ describe("lock mechanics", () => {
     expect(read.owners.get(10882)?.projectId).toBe(PROJECT_A_ID);
     expect(read.owners.get(10883)?.projectId).toBe(PROJECT_B_ID);
   }, 10_000);
+});
+
+describe("lock mechanics: progress line and exhaustion", () => {
+  let lines: string[];
+
+  beforeEach(() => {
+    lines = [];
+    setOutputWriterForTest((line) => lines.push(line));
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    setOutputWriterForTest(undefined);
+    vi.useRealTimers();
+  });
+
+  function progressLines(): string[] {
+    return lines.filter((line) => line.includes("waiting for the host-service port registry lock"));
+  }
+
+  test("prints one progress line once the wait passes 2s, never repeats it, and fails closed after 5s total", async () => {
+    holdLockLive();
+    const pending = recordProjectHostServicePorts(env, { id: PROJECT_A_ID, root: PROJECT_A_ROOT }, [10882]);
+    // Attach a listener for the eventual rejection now, so advancing fake
+    // timers to exhaustion later cannot surface it as unhandled.
+    const settled = expect(pending).rejects.toThrow(/another host-service port registry operation is in progress/);
+
+    await vi.advanceTimersByTimeAsync(1_800);
+    expect(progressLines()).toEqual([]);
+
+    await vi.advanceTimersByTimeAsync(400); // crosses the 2s mark (one retry lands at 2_000ms exactly)
+    expect(progressLines()).toHaveLength(1);
+
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(progressLines()).toHaveLength(1); // still just the one line
+
+    await vi.advanceTimersByTimeAsync(3_000); // exhausts the remaining budget (5s total)
+    await settled;
+    expect(fs.existsSync(lockDir())).toBe(true); // the external holder's lock is untouched
+  });
 });

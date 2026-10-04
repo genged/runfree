@@ -56,7 +56,11 @@ function contextWith(hasServers: boolean): RuntimeContext {
   return {
     projectRoot: PROJECT_ROOT,
     project: { config: { version: 3 }, paths: { mcpOAuthPolicyPath: policyPath } },
-    env: {},
+    // An isolated, empty XDG_STATE_HOME: the default `registeredHostPorts`
+    // reader (when a test doesn't inject one) calls `readHostServicePortRegistry`
+    // with this env, and it must never resolve to the real host's
+    // `~/.local/state/runfree`.
+    env: { XDG_STATE_HOME: path.join(tmp, "xdg-state") },
   } as unknown as RuntimeContext;
 }
 
@@ -190,7 +194,7 @@ describe("prepareSessionMcpCallback", () => {
     const registryHome = fs.mkdtempSync(path.join(os.tmpdir(), "runfree-session-callback-registry-"));
     try {
       const otherRoot = "/workspace/other-project";
-      recordProjectHostServicePorts({ XDG_STATE_HOME: registryHome }, { id: projectHash(otherRoot), root: otherRoot }, [LEGACY_PORT]);
+      await recordProjectHostServicePorts({ XDG_STATE_HOME: registryHome }, { id: projectHash(otherRoot), root: otherRoot }, [LEGACY_PORT]);
       const ctx = { ...contextWith(true), env: { XDG_STATE_HOME: registryHome } } as unknown as RuntimeContext;
       const docker = fake();
 

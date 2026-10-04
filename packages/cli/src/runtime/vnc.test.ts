@@ -313,7 +313,7 @@ describe("vnc start", () => {
   test("refuses a --host-port registered by another project before any docker call, so x11vnc is never started", async () => {
     const otherRoot = "/workspace/other-project";
     const otherProjectId = projectHash(otherRoot);
-    recordProjectHostServicePorts({ XDG_STATE_HOME: stateHome }, { id: otherProjectId, root: otherRoot }, [10882]);
+    await recordProjectHostServicePorts({ XDG_STATE_HOME: stateHome }, { id: otherProjectId, root: otherRoot }, [10882]);
     const { io, captures, runs } = fakeIo(() => undefined);
     const ctx = context();
 

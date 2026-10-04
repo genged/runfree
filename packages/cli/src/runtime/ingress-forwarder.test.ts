@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { describe, expect, test, vi } from "vitest";
+import { afterAll, beforeAll, describe, expect, test, vi } from "vitest";
 
 import { CliError } from "../errors.ts";
 import { recordProjectHostServicePorts } from "../host-service-registry.ts";
@@ -46,7 +46,20 @@ function input(overrides: Partial<IngressForwarderInput> = {}): IngressForwarder
   };
 }
 
+// An isolated XDG_STATE_HOME so `replaceValidatedIngressForwarder`'s
+// host-service port registry check (and the registry it consults) never
+// reads the real host's `~/.local/state/runfree`.
+let registryStateHome: string;
 const context = { env: {}, projectRoot: "/p" } as unknown as RuntimeContext;
+
+beforeAll(() => {
+  registryStateHome = fs.mkdtempSync(path.join(os.tmpdir(), "runfree-ingress-forwarder-test-"));
+  context.env = { XDG_STATE_HOME: registryStateHome };
+});
+
+afterAll(() => {
+  fs.rmSync(registryStateHome, { recursive: true, force: true });
+});
 
 describe("ingress forwarder run arguments", () => {
   test("mints the exact hardened, loopback-only argv with the generic socat shape", () => {
@@ -339,13 +352,13 @@ describe("startIngressForwarder", () => {
     expect(calls.some((args) => args[0] === "rm")).toBe(false);
   });
 
-  test("refuses a port another project registered as a host service, before any removal (defence in depth, A4)", () => {
+  test("refuses a port another project registered as a host service, before any removal (defence in depth, A4)", async () => {
     const stateHome = fs.mkdtempSync(path.join(os.tmpdir(), "runfree-ingress-ownership-registry-"));
     try {
       const env = { XDG_STATE_HOME: stateHome };
       const otherRoot = "/workspace/other-project";
       const otherProjectId = projectHash(otherRoot);
-      recordProjectHostServicePorts(env, { id: otherProjectId, root: otherRoot }, [10882]);
+      await recordProjectHostServicePorts(env, { id: otherProjectId, root: otherRoot }, [10882]);
       const capture = vi.fn((_cmd: string, _args: string[]) => {
         throw new Error("docker must not be called before the host-service port registry check");
       });
