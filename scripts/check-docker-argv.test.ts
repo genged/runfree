@@ -26,4 +26,8 @@ describe("docker argv gate", () => {
   test("every allowlist entry has a reason", () => {
     for (const reason of Object.values(DOCKER_LITERAL_ALLOWLIST)) expect(reason.length).toBeGreaterThan(0);
   });
+
+  test("no file is still pending migration", () => {
+    expect(Object.entries(DOCKER_LITERAL_ALLOWLIST).filter(([, reason]) => reason.startsWith("pending:"))).toEqual([]);
+  });
 });

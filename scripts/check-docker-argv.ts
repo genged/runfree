@@ -3,8 +3,10 @@
 // Docker argv ownership gate (todo 83 Phase 2). Non-session `docker` command
 // lines are built only in packages/cli/src/runtime/docker-client.ts; the
 // sealed session commands are the other owner. A `"docker"` string literal in
-// any other CLI source file means hand-written argv came back. Files still
-// being migrated carry a `pending:` reason; the list only shrinks.
+// any other CLI source file means hand-written argv came back. An allowlist
+// entry may carry a `pending:` reason while its file is mid-migration; this
+// file's own test asserts no `pending:` entry remains, so such an entry is
+// always temporary.
 
 import childProcess from "node:child_process";
 import fs from "node:fs";
@@ -43,19 +45,17 @@ export const DOCKER_LITERAL_ALLOWLIST: Readonly<Record<string, string>> = {
   // client runtime.ts builds via createDockerClient, not a hand-written call
   "packages/cli/src/runtime/stopped-selection.ts": "classifier: Pick<StoppedSelectionDeps, \"docker\" | ...> names the deps field by its own key, not argv; the docker dependency is the typed client runtime.ts builds via createDockerClient",
 
-  // Task 6 is complete: `DockerRunFlag` now admits `--label` (controller
-  // ruling, 2026-10-04), so ingress-forwarder.ts's and ephemeral-helper.ts's
-  // remaining `docker run` sites build through `createDockerClient`'s
-  // `runContainer` like every other call in the task's seven files. None of
-  // them carry a literal "docker" string any more, so none are listed here.
+  // ingress-forwarder.ts and ephemeral-helper.ts build their `docker run`
+  // calls through createDockerClient's runContainer, whose DockerRunFlag
+  // type admits `--label`; neither file carries a literal "docker" string,
+  // so neither is listed here.
 
-  // Task 7 is complete: the raw session-path capture("docker", ...) and
-  // executor("docker", ...) sites in session-admission-driver.ts,
-  // session-eligibility-publication.ts, session-admission-pending-reclaim.ts,
-  // and session-internal-network-baseline.ts now build their argv through
-  // createDockerClient; none of them carry a literal "docker" string any
-  // more, so none are listed here. session-file-heartbeat.ts and
-  // session-file-teardown.ts never had a literal of their own.
+  // session-admission-driver.ts, session-eligibility-publication.ts,
+  // session-admission-pending-reclaim.ts, and
+  // session-internal-network-baseline.ts build their argv through
+  // createDockerClient; none carries a literal "docker" string, so none is
+  // listed here. session-file-heartbeat.ts and session-file-teardown.ts
+  // never had a literal of their own.
 
   // sealed-session: the only "docker" literal is `executable: "docker"` in
   // `SessionContainerInventoryExecutor`'s function-type signature, the raw
@@ -72,7 +72,7 @@ export const DOCKER_LITERAL_ALLOWLIST: Readonly<Record<string, string>> = {
   // (both sealed-session), never a raw capture("docker", ...) call.
   "packages/cli/src/runtime/session-reconcile.ts": "sealed-session: `executable: \"docker\"` types the local executor passed only to executeSessionContainerCleanupCommand and proveSessionContainerOrphanAbsent (session-container-cleanup.ts, sealed-session); no raw capture(\"docker\", ...) call in this file",
 
-  // classifier: Task 8 moved every admin docker argv onto the typed client
+  // classifier: every admin docker argv builds through the typed client
   // (admin's own `adminDockerClient()`, built over `runCapture`). The two
   // remaining literals name the command for env/availability routing, not
   // argv: `childEnvForCommand`'s `command === "docker"` selects
