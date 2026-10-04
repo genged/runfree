@@ -72,9 +72,13 @@ export const DOCKER_LITERAL_ALLOWLIST: Readonly<Record<string, string>> = {
   // (both sealed-session), never a raw capture("docker", ...) call.
   "packages/cli/src/runtime/session-reconcile.ts": "sealed-session: `executable: \"docker\"` types the local executor passed only to executeSessionContainerCleanupCommand and proveSessionContainerOrphanAbsent (session-container-cleanup.ts, sealed-session); no raw capture(\"docker\", ...) call in this file",
 
-  // pending: Task 8
-  "packages/cli/src/admin/admin-core.ts": "pending: Task 8",
-  "packages/cli/src/admin/diagnostics.ts": "pending: Task 8",
+  // classifier: Task 8 moved every admin docker argv onto the typed client
+  // (admin's own `adminDockerClient()`, built over `runCapture`). The two
+  // remaining literals name the command for env/availability routing, not
+  // argv: `childEnvForCommand`'s `command === "docker"` selects
+  // `dockerChildEnv()` over the plain child env, and `dockerAvailable()`
+  // passes "docker" to `commandExists` as the probe target.
+  "packages/cli/src/admin/admin-core.ts": "classifier: `command === \"docker\"` in childEnvForCommand selects the Docker-specific child env; `commandExists(\"docker\")` in dockerAvailable names the availability-probe target; every docker argv in this file builds through adminDockerClient()/createDockerClient",
 };
 
 export function findDockerLiteralViolations(

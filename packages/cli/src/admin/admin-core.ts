@@ -96,9 +96,11 @@ import {
   corroboratedComposeProjectContainerFilters,
 } from "../runtime/container-inventory.ts";
 import {
+  filterValues,
   parseRuntimeContainerInspectRows,
   runtimeContainerInspectFormat,
 } from "../runtime/docker.ts";
+import { createDockerClient, type DockerClient } from "../runtime/docker-client.ts";
 import {
   LOCK_PIDLESS_GRACE_MS,
   lockAgeMs,
@@ -1202,6 +1204,33 @@ export function runCapture(command: string, args: string[], options: childProces
   };
 }
 
+// The Docker client admin enforcement builds every docker argv through. Its
+// IO is admin's own runner (`runCapture`), which keeps the lifecycle
+// deadline, the per-call time bounds, the `processRunner` test seam, and the
+// Docker-specific env `childEnvForCommand` selects — never runtime IO, never
+// a raw spawnSync.
+export function adminDockerClient(): DockerClient {
+  return createDockerClient({ capture: runCapture });
+}
+
+// Capture-shaped adapter over `adminSpawnSync`, built only for
+// `writeProxyRuntimeToken`'s client: identical status/stdout/stderr handling
+// to `runCapture` (same `failClosedSpawnStatus` treatment), but kept apart
+// from the general-purpose read capture so the one call that carries a real
+// service token on stdin stays self-contained for review.
+function proxyTokenWriteCapture(command: string, args: string[], options: childProcess.SpawnSyncOptions = {}): CaptureResult {
+  const result = adminSpawnSync(command, args, {
+    encoding: "utf8",
+    env: childEnvForCommand(command),
+    ...options,
+  });
+  return {
+    ...failClosedSpawnStatus(result),
+    stdout: typeof result.stdout === "string" ? result.stdout : "",
+    stderr: typeof result.stderr === "string" ? result.stderr : "",
+  };
+}
+
 export function describeSource(source: TokenSource | undefined): string {
   if (!source) return "unconfigured";
   if (source.source === "env") return `env ${source.env}`;
@@ -1462,17 +1491,17 @@ function assertTokenFilename(name: string): void {
 // runtime validation marker records; a `docker ps -q` short ID would fail the
 // marker's agent/proxy identity comparison in proxyRuntimeValidationIssue.
 function serviceContainerId(project: string, service: string, options: { runningOnly?: boolean } = {}): string | undefined {
-  const ps = runCapture("docker", [
-    "ps",
-    options.runningOnly ? "-q" : "-aq",
-    "--no-trunc",
-    ...composeServiceContainerFilters(project, service),
-  ]);
+  const ps = adminDockerClient().listContainers({
+    all: !options.runningOnly,
+    quiet: true,
+    noTrunc: true,
+    filters: filterValues(composeServiceContainerFilters(project, service)),
+  });
   return ps.stdout.trim().split(/\s+/).filter(Boolean)[0];
 }
 
 function dockerContainerStartedAt(containerId: string): string | undefined {
-  const result = runCapture("docker", ["inspect", "--format", "{{ .State.StartedAt }}", containerId]);
+  const result = adminDockerClient().inspect([containerId], { format: "{{.State.StartedAt}}" });
   const startedAt = result.stdout.trim();
   if (result.status !== 0 || startedAt === "" || startedAt === "<no value>") return undefined;
   return startedAt;
@@ -1484,7 +1513,7 @@ function dockerContainerStartedAt(containerId: string): string | undefined {
 type ProxyValidationMarker = { parsed?: unknown; fingerprint: string };
 
 function readProxyValidationMarker(proxyId: string): ProxyValidationMarker | undefined {
-  const result = runCapture("docker", ["exec", "--user", "0:0", proxyId, "cat", RUNTIME_VALIDATION_MARKER_PATH]);
+  const result = adminDockerClient().exec(proxyId, ["cat", RUNTIME_VALIDATION_MARKER_PATH], { user: "0:0" });
   if (result.status !== 0) return undefined;
   try {
     const parsed = JSON.parse(result.stdout) as unknown;
@@ -1527,7 +1556,7 @@ export function proxyRuntime(): ProxyRuntime {
   const agentId = undefined;
   const id = proxyContainerId(project);
   if (!id) return { state: "not-running" };
-  const running = runCapture("docker", ["inspect", "--format", "{{ .State.Running }}", id]);
+  const running = adminDockerClient().inspect([id], { format: "{{.State.Running}}" });
   if (running.status !== 0 || running.stdout.trim() !== "true") return { state: "not-running" };
   const marker = readProxyValidationMarker(id);
   const validation = proxyRuntimeValidationIssue(project, id, agentId, marker);
@@ -1640,7 +1669,7 @@ function liveRuntimeComponentValidationIssue(
   }
   if (!proxyId) return `runtime component container identity is malformed; run \`${remedy.up()}\``;
   const ids = [proxyId];
-  const inspect = runCapture("docker", ["inspect", "--format", runtimeContainerInspectFormat(), ...ids]);
+  const inspect = adminDockerClient().inspect(ids, { format: runtimeContainerInspectFormat() });
   if (inspect.status !== 0) return `runtime component labels cannot be inspected; run \`${remedy.up()}\``;
   const containers = parseRuntimeContainerInspectRows(inspect.stdout);
   const observedIds = new Set(containers.map((container) => container.id));
@@ -1689,7 +1718,7 @@ function runtimeSecurityContractContainerEvidence(
   contract: RuntimeContainerContract | undefined,
 ): NonNullable<RuntimeSecurityContractEvidence["agent"]> {
   if (!contract) return { inspect };
-  const probe = runCapture("docker", ["exec", containerId, "sh", "-c", runtimeSecurityContractProbeScript(contract)]);
+  const probe = adminDockerClient().exec(containerId, ["sh", "-c", runtimeSecurityContractProbeScript(contract)]);
   if (probe.status !== 0) return { inspect };
   return {
     inspect,
@@ -1698,9 +1727,10 @@ function runtimeSecurityContractContainerEvidence(
 }
 
 function runtimeSecurityContractEvidence(contract: RuntimeSecurityContract, agentId: string | undefined, proxyId: string): RuntimeSecurityContractEvidence {
+  const client = adminDockerClient();
   const evidence: RuntimeSecurityContractEvidence = {};
   const inspectIds = agentId !== undefined ? [agentId, proxyId] : [proxyId];
-  const inspectResult = runCapture("docker", ["inspect", ...inspectIds]);
+  const inspectResult = client.inspect(inspectIds);
   if (inspectResult.status !== 0) return evidence;
   let parsed: unknown;
   try {
@@ -1716,7 +1746,7 @@ function runtimeSecurityContractEvidence(contract: RuntimeSecurityContract, agen
     if (agentInspect) {
       evidence.agent = runtimeSecurityContractContainerEvidence(agentId, agentInspect, contractContainer(contract, "agent"));
       if (!evidence.agent.presentPaths) {
-        const privateCaProbe = runCapture("docker", ["exec", agentId, "sh", "-c", "test ! -e /ca/private/proxy-ca.key"]);
+        const privateCaProbe = client.exec(agentId, ["sh", "-c", "test ! -e /ca/private/proxy-ca.key"]);
         evidence.agent.presentPaths = privateCaProbe.status === 0 ? [] : ["/ca/private/proxy-ca.key"];
       }
     }
@@ -1834,14 +1864,14 @@ function writeProxyRuntimeToken(proxyId: string, name: string, value: string): v
     `chmod 600 ${shellSingleQuote(tmpFile)}`,
     `mv ${shellSingleQuote(tmpFile)} ${shellSingleQuote(tokenFile)}`,
   ].join("; ");
-  const result = adminSpawnSync("docker", ["exec", "--user", PROXY_RUNTIME_USER, "-i", proxyId, "sh", "-c", command], {
-    input: value,
-    encoding: "utf8",
-    env: dockerChildEnv(),
-  });
-  if (failClosedSpawnStatus(result).status !== 0) {
-    const stderr = typeof result.stderr === "string" ? result.stderr.trim() : "";
-    throw new Error(stderr || `failed to write ${name} token into proxy tmpfs`);
+  const result = createDockerClient({ capture: proxyTokenWriteCapture }).exec(
+    proxyId,
+    ["sh", "-c", command],
+    { interactive: true, user: PROXY_RUNTIME_USER },
+    { input: value },
+  );
+  if (result.status !== 0) {
+    throw new Error(result.stderr.trim() || `failed to write ${name} token into proxy tmpfs`);
   }
 }
 
@@ -1850,7 +1880,7 @@ export function removeProxyRuntimeToken(proxyId: string, name: string): void {
   const tokenFile = `${CONTAINER_SECRET_DIR}/${name}`;
   const tmpFile = `${tokenFile}.tmp`;
   const command = `rm -f ${shellSingleQuote(tokenFile)} ${shellSingleQuote(tmpFile)}`;
-  const result = runCapture("docker", ["exec", proxyId, "sh", "-c", command]);
+  const result = adminDockerClient().exec(proxyId, ["sh", "-c", command]);
   if (result.status !== 0) throw new Error(result.stderr.trim() || `failed to remove ${name} token from proxy tmpfs`);
 }
 
@@ -2121,7 +2151,7 @@ export function withTokenStoreLock<T>(action: () => T, options: { wait?: boolean
 // the token write path. Returns undefined when the listing itself fails — the
 // caller must then treat the proxy as unreachable rather than infer absence.
 function listProxyRuntimeTokens(proxyId: string): Set<string> | undefined {
-  const result = runCapture("docker", ["exec", proxyId, "sh", "-c", `ls -1 ${shellSingleQuote(CONTAINER_SECRET_DIR)}`]);
+  const result = adminDockerClient().exec(proxyId, ["sh", "-c", `ls -1 ${shellSingleQuote(CONTAINER_SECRET_DIR)}`]);
   if (result.status !== 0) return undefined;
   return new Set(result.stdout.split(/\r?\n/).map((line) => line.trim()).filter((name) => isTokenName(name)));
 }
@@ -3595,40 +3625,36 @@ export type ServiceDiffEntry = {
 
 export function dockerAvailable(): boolean {
   if (!commandExists("docker")) return false;
-  return runCapture("docker", ["info"]).status === 0;
+  return adminDockerClient().info().status === 0;
 }
 
 export function composeProject(): string | undefined {
-  const ps = runCapture("docker", [
-    "ps",
-    "-aq",
-    ...corroboratedComposeProjectContainerFilters(currentAdminState().projectId, composeProjectNameForAdmin()),
-  ]);
+  const client = adminDockerClient();
+  const ps = client.listContainers({
+    all: true,
+    quiet: true,
+    filters: filterValues(corroboratedComposeProjectContainerFilters(currentAdminState().projectId, composeProjectNameForAdmin())),
+  });
   const agentId = ps.stdout.trim().split(/\s+/).filter(Boolean)[0];
   if (!agentId) return undefined;
-  const inspect = runCapture("docker", [
-    "inspect",
-    "--format",
-    "{{ index .Config.Labels \"com.docker.compose.project\" }}",
-    agentId,
-  ]);
+  const inspect = client.inspect([agentId], { format: "{{ index .Config.Labels \"com.docker.compose.project\" }}" });
   const project = inspect.stdout.trim();
   if (inspect.status !== 0 || project === "" || project === "<no value>") return undefined;
   return project;
 }
 
 export function proxyContainerId(project: string): string | undefined {
-  const ps = runCapture("docker", [
-    "ps",
-    "-aq",
-    "--no-trunc",
-    ...composeServiceContainerFilters(project, "proxy"),
-  ]);
+  const ps = adminDockerClient().listContainers({
+    all: true,
+    quiet: true,
+    noTrunc: true,
+    filters: filterValues(composeServiceContainerFilters(project, "proxy")),
+  });
   return ps.stdout.trim().split(/\s+/).filter(Boolean)[0];
 }
 
 function containerRunning(id: string): boolean {
-  const running = runCapture("docker", ["inspect", "--format", "{{ .State.Running }}", id]);
+  const running = adminDockerClient().inspect([id], { format: "{{.State.Running}}" });
   return running.status === 0 && running.stdout.trim() === "true";
 }
 
@@ -3652,7 +3678,7 @@ function readProxyPolicyStatusFiles(proxyId: string): { firewall?: ParsedGenerat
   const script = [firewallStatusPath(), requestProxyStatusPath()]
     .map((file) => `if [ -f ${shellSingleQuote(file)} ]; then cat ${shellSingleQuote(file)}; else printf '{}'; fi; echo`)
     .join("; ");
-  const result = runCapture("docker", ["exec", proxyId, "sh", "-c", script]);
+  const result = adminDockerClient().exec(proxyId, ["sh", "-c", script]);
   if (result.status !== 0) return undefined;
   const lines = result.stdout.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
   if (lines.length !== 2) return undefined;
@@ -3781,8 +3807,8 @@ async function restartProxyAndSync(project: string, proxyId: string, policy: Loa
     lifecycleLock.assertHeld();
     admitPreparedRuntimeTokenSources(hostProject);
     const result = wasRunning
-      ? runCapture("docker", ["restart", proxyId])
-      : runCapture("docker", ["start", proxyId]);
+      ? adminDockerClient().restartContainer(proxyId)
+      : adminDockerClient().startContainer(proxyId);
     if (result.status !== 0) die(result.stderr.trim() || "docker failed while restarting proxy");
     waitForProxy(project);
     lifecycleLock.assertHeld();
