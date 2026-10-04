@@ -57,6 +57,8 @@ import {
 } from "@runfree/runtime-contracts/proxy-status";
 import {
   HOST_SERVICE_GATEWAY_STATUS_FILE,
+  HOST_SERVICE_RESERVED_SUFFIX,
+  isReservedRunfreeHostname,
   parseHostServiceAuthority,
 } from "@runfree/runtime-contracts/host-services";
 import { createHostServiceTunnels } from "./host-service-tunnel.js";
@@ -1899,7 +1901,6 @@ function hostServiceNotConfigured(host: string, remedy?: string): ConnectDecisio
 function classifyConnect(authority: string): ConnectDecision {
   const { host, port } = parseConnectAuthority(authority);
   const reserved = parseHostServiceAuthority(authority.trim());
-  if (reserved.kind === "malformed") return hostServiceNotConfigured(host);
   if (reserved.kind === "service") {
     if (currentPolicy.hostServices[reserved.name]?.port === reserved.port) {
       return { action: "host-service", name: reserved.name, port: reserved.port };
@@ -1910,6 +1911,17 @@ function classifyConnect(authority: string): ConnectDecision {
       host,
       `requested by the agent; to approve: runfree host-service add ${reserved.name} --port ${reserved.port}`,
     );
+  }
+  // Any other form that names the reserved suffix is refused with no remedy.
+  // `parseHostServiceAuthority` splits on the last colon while
+  // `parseConnectAuthority` strips brackets, so `[x.runfree.internal]:443` or
+  // `x.runfree.internal:443:` would otherwise read as not reserved and reach
+  // audit-pass, the denied tunnel, or mockttp. A bracketed form is never a
+  // valid service, even when the name and port match.
+  if (reserved.kind === "malformed"
+    || isReservedRunfreeHostname(host)
+    || authority.toLowerCase().includes(HOST_SERVICE_RESERVED_SUFFIX)) {
+    return hostServiceNotConfigured(host);
   }
   if (port !== 443) {
     return {

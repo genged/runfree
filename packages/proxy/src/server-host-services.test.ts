@@ -202,6 +202,9 @@ describe("proxy server: host-service CONNECT splice", () => {
     ["a trailing dot", (port: number) => `echo.runfree.internal.:${port}`],
     ["an upper-case name", (port: number) => `ECHO.runfree.internal:${port}`],
     ["no port", () => "echo.runfree.internal"],
+    ["a bracketed approved pair", (port: number) => `[echo.runfree.internal]:${port}`],
+    ["a trailing colon", () => "x.runfree.internal:443:"],
+    ["a reserved name inside another authority", () => "x.runfree.internal.example.com:443"],
   ])("a malformed reserved authority (%s) gets a raw 403 without a remedy and no dial", async (_label, authorityFor) => {
     const echo = await startEchoServer();
     const { proxy } = await startHostServiceProxy({ policy: hostServicePolicy({ echo: echo.port }) });
@@ -216,9 +219,11 @@ describe("proxy server: host-service CONNECT splice", () => {
   }, 20_000);
 
   test.each([
-    ["without", false],
-    ["with", true],
-  ])("x.runfree.internal:443 %s an active audit marker gets a raw 403, no spool write, and no audit pass", async (_label, auditActive) => {
+    ["x.runfree.internal:443", "without", false],
+    ["x.runfree.internal:443", "with", true],
+    ["[x.runfree.internal]:443", "without", false],
+    ["[x.runfree.internal]:443", "with", true],
+  ])("%s %s an active audit marker gets a raw 403, no spool write, and no audit pass", async (authority, _label, auditActive) => {
     const auditDir = fs.mkdtempSync(path.join(tmp, "audit-state-"));
     const markerPath = path.join(auditDir, "active.json");
     const spoolPath = path.join(auditDir, "spool.txt");
@@ -243,7 +248,7 @@ describe("proxy server: host-service CONNECT splice", () => {
     });
     if (auditActive) await proxy.waitForOutput("proxy-audit: network audit mode ACTIVE");
 
-    const response = await rawConnectViaProxy({ proxyPort: proxy.port, authority: "x.runfree.internal:443" });
+    const response = await rawConnectViaProxy({ proxyPort: proxy.port, authority });
     expect(response.statusCode).toBe(403);
     expect(response.raw).not.toContain("200 Connection Established");
     expect(response.body).toContain("host-service-not-configured");
