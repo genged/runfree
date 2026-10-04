@@ -23,7 +23,7 @@ import type { CaptureResult, RuntimeIO } from "./types.ts";
  *   logs --tail N ID / logs --since T ID      logs(ID, { tail: N }) / logs(ID, { since: T })
  *   exec [-i] [--user U|-u U] [-e E]… ID CMD… exec(ID, [CMD…], { interactive, user, env })
  *   exec -d … (via io.run)                    terminal.exec(ID, [CMD…], { detach: true, … })
- *   run FLAGS… IMAGE CMD…                     runContainer([[flag], [flag, value]…], IMAGE, [CMD…])
+ *   run FLAGS… IMAGE CMD… (incl. --label L…)  runContainer([[flag], [flag, value]…], IMAGE, [CMD…])
  *   rm [-f] ID… / container rm [--force] ID…  removeContainers([ID…], { force })
  *   rm -f ID… (via io.run)                    terminal.removeContainers([ID…], { force: true })
  *   stop|container stop --time N ID…          stopContainers([ID…], N)
@@ -70,7 +70,7 @@ export type DockerExecOptions = Readonly<{
 
 type DockerRunValueFlag =
   | "--name" | "--network" | "--ip" | "--user" | "--entrypoint" | "--pids-limit" | "--pull"
-  | "--cap-add" | "--cap-drop" | "--security-opt" | "-e" | "-p" | "-v";
+  | "--cap-add" | "--cap-drop" | "--security-opt" | "--label" | "-e" | "-p" | "-v";
 
 /** One `docker run` flag, in the caller's order. */
 export type DockerRunFlag =
@@ -79,6 +79,29 @@ export type DockerRunFlag =
   | readonly ["-i"]
   | readonly ["--read-only"]
   | readonly [DockerRunValueFlag, string];
+
+/**
+ * Turns a flat `--label`/value argv stream (as container-inventory.ts's
+ * label builders produce, and as `network create`/`volume create` splice
+ * directly) into `DockerRunFlag` tuples for `runContainer`, in the same
+ * order. Fails closed on a malformed stream rather than silently dropping
+ * or reordering a label.
+ */
+export function labelRunFlags(flagPairs: readonly string[]): readonly DockerRunFlag[] {
+  if (flagPairs.length % 2 !== 0) {
+    throw new Error(`malformed --label argv: expected [--label, value] pairs, got ${flagPairs.length} token(s): ${JSON.stringify(flagPairs)}`);
+  }
+  const flags: DockerRunFlag[] = [];
+  for (let index = 0; index < flagPairs.length; index += 2) {
+    const flag = flagPairs[index];
+    const value = flagPairs[index + 1];
+    if (flag !== "--label" || typeof value !== "string") {
+      throw new Error(`malformed --label argv at index ${index}: expected ["--label", value], got ${JSON.stringify(flagPairs.slice(index, index + 2))}`);
+    }
+    flags.push(["--label", value]);
+  }
+  return flags;
+}
 
 export type DockerClient = Readonly<{
   info(format?: string, options?: DockerCallOptions): CaptureResult;

@@ -293,6 +293,16 @@ describe("runEphemeralHelper", () => {
     }
   });
 
+  test("the migrated runContainer call produces the exact argv ephemeralHelperRunArguments builds", () => {
+    const harness = helperHarness(() => ({ status: 0, stdout: "", stderr: "" }));
+    try {
+      runEphemeralHelper(harness.context, harness.io, DENY_PROBE_REQUEST, harness.fence);
+      expect(harness.budgeted[0].args).toEqual(ephemeralHelperRunArguments(DENY_PROBE_REQUEST));
+    } finally {
+      harness.cleanup();
+    }
+  });
+
   test("the marker is on disk before the helper is spawned", () => {
     const harness = helperHarness(() => ({ status: 0, stdout: "", stderr: "" }));
     try {

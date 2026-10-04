@@ -136,6 +136,13 @@ describe("startIngressForwarder", () => {
     expect(readinessIdx).toBeLessThan(connectIdx);
   });
 
+  test("the migrated runContainer call produces the exact argv ingressForwarderRunArguments builds", () => {
+    const { io, calls } = fakeIo();
+    startIngressForwarder(context, io, input());
+    const runCall = calls.find((args) => args[0] === "run");
+    expect(runCall).toEqual(ingressForwarderRunArguments(input()));
+  });
+
   test.each<Record<string, string>>([
     {},
     { "com.docker.network.enable_ipv4": "true" },

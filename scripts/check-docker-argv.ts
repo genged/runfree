@@ -43,17 +43,11 @@ export const DOCKER_LITERAL_ALLOWLIST: Readonly<Record<string, string>> = {
   // client runtime.ts builds via createDockerClient, not a hand-written call
   "packages/cli/src/runtime/stopped-selection.ts": "classifier: Pick<StoppedSelectionDeps, \"docker\" | ...> names the deps field by its own key, not argv; the docker dependency is the typed client runtime.ts builds via createDockerClient",
 
-  // blocked: Task 6 — docker run mints `--label` pairs, which `DockerRunFlag`
-  // deliberately does not admit (the task brief: stop and report rather than
-  // widen the closed set). Every other call in the file builds through
-  // createDockerClient; only the one `docker run` site stays a direct
-  // io.capture("docker", ...) call pending a type decision on DockerRunFlag.
-  "packages/cli/src/runtime/ingress-forwarder.ts": "blocked: Task 6 — ingressForwarderRunArguments's docker run mints --label pairs (ingressForwarderLabelArguments), not representable in DockerRunFlag; every other call in this file builds through createDockerClient",
-  "packages/cli/src/runtime/ephemeral-helper.ts": "blocked: Task 6 — ephemeralHelperRunArguments's docker run mints --label pairs (ephemeralHelperLabelArguments), not representable in DockerRunFlag; this is the file's only Docker call site, so it stays unmigrated",
-
-  // session-callback-ingress.ts, session-mcp-callback.ts, forward.ts, vnc.ts,
-  // and ephemeral-helper-residue.ts (also Task 6) migrated cleanly and are no
-  // longer in this list.
+  // Task 6 is complete: `DockerRunFlag` now admits `--label` (controller
+  // ruling, 2026-10-04), so ingress-forwarder.ts's and ephemeral-helper.ts's
+  // remaining `docker run` sites build through `createDockerClient`'s
+  // `runContainer` like every other call in the task's seven files. None of
+  // them carry a literal "docker" string any more, so none are listed here.
 
   // pending: Task 7
   "packages/cli/src/runtime/session-admission-driver.ts": "pending: Task 7",

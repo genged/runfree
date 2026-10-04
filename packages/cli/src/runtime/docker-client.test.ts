@@ -45,6 +45,8 @@ describe("docker client argv", () => {
       ["exec", "--interactive", "--user", "0:0", "--env", "A=1", ID, "sh", "-c", "x"]],
     ["run keeps flag order", (c) => c.runContainer([["--rm"], ["-i"], ["--network", "n"], ["--cap-drop", "ALL"]], "img@sha256:1", ["true"]),
       ["run", "--rm", "-i", "--network", "n", "--cap-drop", "ALL", "img@sha256:1", "true"]],
+    ["run keeps label order", (c) => c.runContainer([["--rm"], ["--label", "a=b"], ["--network", "n"]], "img", ["true"]),
+      ["run", "--rm", "--label", "a=b", "--network", "n", "img", "true"]],
     ["rm", (c) => c.removeContainers([ID], { force: true }), ["container", "rm", "--force", ID]],
     ["stop", (c) => c.stopContainers([ID, "b"], 5), ["container", "stop", "--time", "5", ID, "b"]],
     ["start", (c) => c.startContainer(ID), ["container", "start", ID]],

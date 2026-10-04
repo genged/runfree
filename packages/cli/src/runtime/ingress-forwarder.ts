@@ -30,7 +30,7 @@ import {
   projectIngressForwarderFilters,
   type IngressPurpose,
 } from "./container-inventory.ts";
-import { createDockerClient } from "./docker-client.ts";
+import { createDockerClient, labelRunFlags, type DockerRunFlag } from "./docker-client.ts";
 import { dockerClientEnvOptions, filterValues, parseDockerJson } from "./docker.ts";
 import type {
   DockerContainerInspect,
@@ -364,48 +364,54 @@ function assertInput(input: IngressForwarderInput): void {
   }
 }
 
+/** The structured form of one forwarder's `docker run`: the single source of truth. */
+type IngressForwarderRunRequest = Readonly<{
+  flags: readonly DockerRunFlag[];
+  image: string;
+  command: readonly string[];
+}>;
+
 /**
- * The exact `docker run` argv for one forwarder, pure and testable.
- *
  * Every hardening flag is load-bearing: user 65534, cap-drop ALL, read-only,
  * no-new-privileges, bounded pids, no mounts, no Docker socket, `--rm`. The
  * publication is loopback-only (spec Non-goals: never `0.0.0.0`). The socat
  * command shape is fixed and the same for every purpose; only the target and
  * ports vary.
  */
+function ingressForwarderRunRequest(input: IngressForwarderInput): IngressForwarderRunRequest {
+  return {
+    flags: [
+      ["--rm"] as const,
+      ["-d"] as const,
+      ["--name", ingressForwarderName(input.projectId, input.purpose, input.hostPort)] as const,
+      ...labelRunFlags(ingressForwarderLabelArguments(input.projectId, input.purpose)),
+      ["--network", ingressHostNetworkName(input.projectId)] as const,
+      ["--cap-drop", "ALL"] as const,
+      ["--security-opt", "no-new-privileges:true"] as const,
+      ["--read-only"] as const,
+      ["--pids-limit", "64"] as const,
+      ["--user", "65534:65534"] as const,
+      ["-p", `127.0.0.1:${input.hostPort}:${input.hostPort}`] as const,
+      ["-e", `INGRESS_HOST_PORT=${input.hostPort}`] as const,
+      ["-e", `INGRESS_TARGET=${input.target}`] as const,
+      ["-e", `INGRESS_TARGET_PORT=${input.targetPort}`] as const,
+      ...Object.entries(input.extraEnv ?? {}).map(([name, value]) => ["-e", `${name}=${value}`] as const),
+      ["--entrypoint", INGRESS_FORWARDER_ENTRYPOINT] as const,
+    ],
+    image: INGRESS_FORWARDER_IMAGE,
+    command: INGRESS_FORWARDER_COMMAND,
+  };
+}
+
+/**
+ * The exact `docker run` argv for one forwarder, pure and testable. A thin
+ * flattening of `ingressForwarderRunRequest`'s structured flags — the same
+ * single source of truth `startIngressForwarder` hands to `runContainer` —
+ * so this and the real call can never drift apart.
+ */
 export function ingressForwarderRunArguments(input: IngressForwarderInput): string[] {
-  return [
-    "run",
-    "--rm",
-    "-d",
-    "--name",
-    ingressForwarderName(input.projectId, input.purpose, input.hostPort),
-    ...ingressForwarderLabelArguments(input.projectId, input.purpose),
-    "--network",
-    ingressHostNetworkName(input.projectId),
-    "--cap-drop",
-    "ALL",
-    "--security-opt",
-    "no-new-privileges:true",
-    "--read-only",
-    "--pids-limit",
-    "64",
-    "--user",
-    "65534:65534",
-    "-p",
-    `127.0.0.1:${input.hostPort}:${input.hostPort}`,
-    "-e",
-    `INGRESS_HOST_PORT=${input.hostPort}`,
-    "-e",
-    `INGRESS_TARGET=${input.target}`,
-    "-e",
-    `INGRESS_TARGET_PORT=${input.targetPort}`,
-    ...Object.entries(input.extraEnv ?? {}).flatMap(([name, value]) => ["-e", `${name}=${value}`]),
-    "--entrypoint",
-    INGRESS_FORWARDER_ENTRYPOINT,
-    INGRESS_FORWARDER_IMAGE,
-    ...INGRESS_FORWARDER_COMMAND,
-  ];
+  const { flags, image, command } = ingressForwarderRunRequest(input);
+  return ["run", ...flags.flatMap((flag) => [...flag]), image, ...command];
 }
 
 /**
@@ -426,15 +432,11 @@ export function startIngressForwarder(
 ): string {
   assertInput(input);
   const client = createDockerClient(io, dockerClientEnvOptions(context));
-  // Build the run argv up front: it mints the labels, which reject an invalid
-  // project id or purpose. Nothing mutates Docker until the whole input has
-  // been validated, so a rejected input never leaves a created network behind.
-  //
-  // This is the one Docker call `docker-client.ts`'s typed `runContainer`
-  // cannot build: the labels it mints are `--label` pairs, a flag
-  // `DockerRunFlag` deliberately does not admit (migration task 6). It stays a
-  // direct capture rather than widening that closed set.
-  const runArgs = ingressForwarderRunArguments(input);
+  // Build the run request up front: it mints the labels, which reject an
+  // invalid project id or purpose. Nothing mutates Docker until the whole
+  // input has been validated, so a rejected input never leaves a created
+  // network behind.
+  const runRequest = ingressForwarderRunRequest(input);
   const hostNetwork = ingressHostNetworkName(input.projectId);
   const name = ingressForwarderName(input.projectId, input.purpose, input.hostPort);
   const existing = client.inspect([name], { type: "container" });
@@ -484,7 +486,7 @@ export function startIngressForwarder(
       die(`${reason}; and cleanup failed, network ${createdId} may remain: ${cleanup.stderr.trim() || `exit ${cleanup.status}`}`);
     }
   }
-  const run = io.capture("docker", runArgs, dockerClientEnvOptions(context));
+  const run = client.runContainer(runRequest.flags, runRequest.image, runRequest.command);
   if (run.status !== 0) die(run.stderr.trim() || `failed to start ingress forwarder ${name}`);
   let containerId = run.stdout.trim();
   if (!FULL_DOCKER_CONTAINER_ID_PATTERN.test(containerId)) {
