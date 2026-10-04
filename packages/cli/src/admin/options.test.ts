@@ -921,7 +921,12 @@ exit 0
 
   expect(status).toBe(1);
   expect(errors.join("\n")).toContain("runtime validation marker is stale for runtime security contract");
-  expect(fs.readFileSync(dockerLogPath, "utf8")).not.toContain("--interactive --user 1001:1001 proxy-id");
+  // The token write exec's shape (flag order) is an implementation detail;
+  // what must never happen is the proxy-runtime-user exec reaching the
+  // token-write script (its command text names the secrets directory), in
+  // any flag order.
+  const dockerLogLines = fs.readFileSync(dockerLogPath, "utf8").split("\n");
+  expect(dockerLogLines.some((line) => line.includes("1001:1001") && line.includes("/run/runfree-proxy-secrets"))).toBe(false);
 });
 
 test("token sync watch quiet suppresses routine watch output", async () => {

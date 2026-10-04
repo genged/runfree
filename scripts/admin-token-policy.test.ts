@@ -2596,10 +2596,15 @@ exit 0
   });
 
   // Pins the token-write property independent of the exact argv shape above:
-  // the proxy-write Docker client (packages/cli/src/admin/admin-core.ts's
-  // `proxyTokenWriteCapture` adapter over `adminSpawnSync`) must deliver the
-  // secret only on the spawned call's stdin. A future argv change (quoting,
-  // flag order, a shell helper) must not let the value leak into argv.
+  // the proxy write (packages/cli/src/admin/admin-core.ts's
+  // `writeProxyRuntimeToken`, built through `adminDockerClient()`) must
+  // deliver the secret only on the spawned call's stdin, never in argv. A
+  // future argv change (quoting, flag order, a shell helper) must not let
+  // the value leak into argv. This does not check env: the fake docker log
+  // only ever records four fixed, unrelated keys
+  // (COMPOSE_PROJECT_NAME/DOCKER_CLI_HINTS/OP_SERVICE_ACCOUNT_TOKEN/
+  // RUNFREE_PROJECT_ROOT), so an env assertion against that log could never
+  // fail and would prove nothing.
   test("the proxy token write carries the secret only on stdin, never in argv", async () => {
     writeFixtureRepo({
       hosts: ["api.github.com"],
@@ -2628,7 +2633,6 @@ exit 0
     const writeCall = execCalls.find((entry) => String(entry.stdin) === secretValue);
     expect(writeCall, "no exec call carried the secret on stdin").toBeDefined();
     expect(JSON.stringify(writeCall?.args)).not.toContain(secretValue);
-    expect(JSON.stringify(writeCall?.env ?? {})).not.toContain(secretValue);
     // And nowhere else in the whole exchange with the proxy container.
     for (const entry of execCalls) {
       expect(JSON.stringify(entry.args)).not.toContain(secretValue);

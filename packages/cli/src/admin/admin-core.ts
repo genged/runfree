@@ -1213,24 +1213,6 @@ export function adminDockerClient(): DockerClient {
   return createDockerClient({ capture: runCapture });
 }
 
-// Capture-shaped adapter over `adminSpawnSync`, built only for
-// `writeProxyRuntimeToken`'s client: identical status/stdout/stderr handling
-// to `runCapture` (same `failClosedSpawnStatus` treatment), but kept apart
-// from the general-purpose read capture so the one call that carries a real
-// service token on stdin stays self-contained for review.
-function proxyTokenWriteCapture(command: string, args: string[], options: childProcess.SpawnSyncOptions = {}): CaptureResult {
-  const result = adminSpawnSync(command, args, {
-    encoding: "utf8",
-    env: childEnvForCommand(command),
-    ...options,
-  });
-  return {
-    ...failClosedSpawnStatus(result),
-    stdout: typeof result.stdout === "string" ? result.stdout : "",
-    stderr: typeof result.stderr === "string" ? result.stderr : "",
-  };
-}
-
 export function describeSource(source: TokenSource | undefined): string {
   if (!source) return "unconfigured";
   if (source.source === "env") return `env ${source.env}`;
@@ -1864,7 +1846,10 @@ function writeProxyRuntimeToken(proxyId: string, name: string, value: string): v
     `chmod 600 ${shellSingleQuote(tmpFile)}`,
     `mv ${shellSingleQuote(tmpFile)} ${shellSingleQuote(tokenFile)}`,
   ].join("; ");
-  const result = createDockerClient({ capture: proxyTokenWriteCapture }).exec(
+  // The token reaches the process only through `input` (stdin), never argv
+  // or env; `adminDockerClient()` is the same client every other admin
+  // docker call builds through.
+  const result = adminDockerClient().exec(
     proxyId,
     ["sh", "-c", command],
     { interactive: true, user: PROXY_RUNTIME_USER },
@@ -3806,9 +3791,10 @@ async function restartProxyAndSync(project: string, proxyId: string, policy: Loa
     const wasRunning = containerRunning(proxyId);
     lifecycleLock.assertHeld();
     admitPreparedRuntimeTokenSources(hostProject);
+    const dockerClient = adminDockerClient();
     const result = wasRunning
-      ? adminDockerClient().restartContainer(proxyId)
-      : adminDockerClient().startContainer(proxyId);
+      ? dockerClient.restartContainer(proxyId)
+      : dockerClient.startContainer(proxyId);
     if (result.status !== 0) die(result.stderr.trim() || "docker failed while restarting proxy");
     waitForProxy(project);
     lifecycleLock.assertHeld();
