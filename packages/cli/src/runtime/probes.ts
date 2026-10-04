@@ -17,7 +17,12 @@ import {
   type HostServiceSetEntry,
 } from "@runfree/runtime-contracts/proxy-status";
 import { runDockerExec, runDockerExecProxyServer, runDockerExecRoot } from "./attach.ts";
-import { applyDenyProbeBatchResult, denyProbeBatchScript, type DenyProbeSpec } from "./deny-probe-batch.ts";
+import {
+  applyDenyProbeBatchResult,
+  denyProbeBatchScript,
+  judgeDroppedProbeExit,
+  type DenyProbeSpec,
+} from "./deny-probe-batch.ts";
 import { AGENT_UID_GID } from "./constants.ts";
 import { dockerClientEnvOptions, } from "./docker.ts";
 import type { CaptureResult, DockerNetworkInspect, RuntimeContext, RuntimeIO } from "./types.ts";
@@ -404,12 +409,13 @@ export function hostGatewayTcpProbeCommand(gatewayIp: string, port: number): str
 }
 
 /**
- * Proxy-position gateway probes (design "Host-side proof"): the `@host_service`
- * accept is uid 1001 only and port-exact, so uid 1001 to an unapproved port
- * and root to each approved port must both fail. Run once each, never
- * retried: a success is an enforcement gap.
+ * Root-position gateway probes (design "Host-side proof"): the `@host_service`
+ * accept is uid 1001 only, so root to each approved port must be dropped. The
+ * uid-1001 unapproved-port probe rides the server-UID denial batch instead.
+ * Run once each, never retried: a success is an enforcement gap, and only a
+ * timeout proves the drop (see `judgeDroppedGatewayProbe`).
  */
-function runProxyPositionGatewayProbes(
+function runRootGatewayProbes(
   issues: string[],
   context: RuntimeContext,
   io: RuntimeIO,
@@ -418,18 +424,6 @@ function runProxyPositionGatewayProbes(
   ports: readonly number[],
   options: RuntimeProbeProgressOptions,
 ): void {
-  const unapproved = unapprovedHostServicePort(ports);
-  const serverSpecs: DenyProbeSpec[] = [{
-    label: `proxy-position server UID host gateway unapproved port ${unapproved}`,
-    command: hostGatewayTcpProbeCommand(gatewayIp, unapproved),
-  }];
-  options.onProbe?.("proxy-position server UID host gateway denial probe");
-  applyDenyProbeBatchResult(
-    issues,
-    serverSpecs,
-    runDockerExecProxyServer(context, io, proxyId, ["bash", "-c", denyProbeBatchScript(serverSpecs)]),
-    options.onBoundaryViolation,
-  );
   if (ports.length === 0) return;
   const rootSpecs: DenyProbeSpec[] = ports.map((port) => ({
     label: `proxy-position root host gateway port ${port}`,
@@ -441,6 +435,8 @@ function runProxyPositionGatewayProbes(
     rootSpecs,
     runDockerExecRoot(context, io, proxyId, ["bash", "-c", denyProbeBatchScript(rootSpecs)]),
     options.onBoundaryViolation,
+    undefined,
+    { requireTimeout: true },
   );
 }
 
@@ -523,42 +519,71 @@ export const SERVER_UID_DENIAL_PROBE_LABELS = [
   "proxy server UID route administration",
 ] as const;
 
-export const SERVER_UID_DENIAL_BATCH_SCRIPT = [
-  "set -u",
-  "for runfree_tool in dig ip nft timeout; do",
-  "  if ! command -v \"$runfree_tool\" >/dev/null 2>&1; then",
-  "    printf 'missing probe binary: %s\\n' \"$runfree_tool\" >&2",
-  "    exit 96",
-  "  fi",
-  "done",
-  "( timeout 3 dig +time=2 +tries=1 @1.1.1.1 example.com >/dev/null 2>&1 ) & runfree_pid_0=$!",
-  "( timeout 3 dig +time=2 +tries=1 @127.0.0.11 example.com >/dev/null 2>&1 ) & runfree_pid_1=$!",
-  "( nft list ruleset >/dev/null 2>&1 ) & runfree_pid_2=$!",
-  "( nft list set inet runfree_proxy allowed_ipv4 >/dev/null 2>&1 ) & runfree_pid_3=$!",
-  "( if ip route add blackhole 203.0.113.254/32 >/dev/null 2>&1; then ip route del blackhole 203.0.113.254/32 >/dev/null 2>&1 || true; exit 0; fi; exit 1 ) & runfree_pid_4=$!",
-  "wait \"$runfree_pid_0\"; runfree_status_0=$?",
-  "wait \"$runfree_pid_1\"; runfree_status_1=$?",
-  "wait \"$runfree_pid_2\"; runfree_status_2=$?",
-  "wait \"$runfree_pid_3\"; runfree_status_3=$?",
-  "wait \"$runfree_pid_4\"; runfree_status_4=$?",
-  `printf '${FIREWALL_PROBE_MARKER} 0 exit=%s\\n' "$runfree_status_0"`,
-  `printf '${FIREWALL_PROBE_MARKER} 1 exit=%s\\n' "$runfree_status_1"`,
-  `printf '${FIREWALL_PROBE_MARKER} 2 exit=%s\\n' "$runfree_status_2"`,
-  `printf '${FIREWALL_PROBE_MARKER} 3 exit=%s\\n' "$runfree_status_3"`,
-  `printf '${FIREWALL_PROBE_MARKER} 4 exit=%s\\n' "$runfree_status_4"`,
-  "exit 0",
-].join("\n");
+/**
+ * The uid-1001 host gateway probe that rides the server-UID denial batch as
+ * one more concurrent record: uid 1001 to a port the effective policy does
+ * not approve must be dropped, because the `@host_service` accept is
+ * port-exact. The host chooses the gateway (from the status file) and port.
+ */
+export type ServerUidGatewayProbe = Readonly<{ gatewayIp: string; port: number }>;
+
+export function serverUidGatewayProbeLabel(port: number): string {
+  return `proxy-position server UID host gateway unapproved port ${port}`;
+}
+
+const STRICT_IPV4_OCTET = "(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])";
+const STRICT_IPV4_LITERAL = new RegExp(`^${STRICT_IPV4_OCTET}(?:\\.${STRICT_IPV4_OCTET}){3}$`, "u");
+
+export function serverUidDenialBatchScript(gatewayProbe?: ServerUidGatewayProbe): string {
+  if (gatewayProbe && (!STRICT_IPV4_LITERAL.test(gatewayProbe.gatewayIp)
+    || !Number.isInteger(gatewayProbe.port) || gatewayProbe.port < 1 || gatewayProbe.port > 65535)) {
+    // Both values are interpolated into the shell: refuse anything else.
+    throw new Error("server UID gateway probe needs an IPv4 literal and a port from 1 to 65535");
+  }
+  const probes = [
+    "( timeout 3 dig +time=2 +tries=1 @1.1.1.1 example.com >/dev/null 2>&1 )",
+    "( timeout 3 dig +time=2 +tries=1 @127.0.0.11 example.com >/dev/null 2>&1 )",
+    "( nft list ruleset >/dev/null 2>&1 )",
+    "( nft list set inet runfree_proxy allowed_ipv4 >/dev/null 2>&1 )",
+    "( if ip route add blackhole 203.0.113.254/32 >/dev/null 2>&1; then ip route del blackhole 203.0.113.254/32 >/dev/null 2>&1 || true; exit 0; fi; exit 1 )",
+    ...(gatewayProbe ? [`( ${hostGatewayTcpProbeCommand(gatewayProbe.gatewayIp, gatewayProbe.port)} >/dev/null 2>&1 )`] : []),
+  ];
+  return [
+    "set -u",
+    `for runfree_tool in dig ip nft timeout${gatewayProbe ? " bash" : ""}; do`,
+    "  if ! command -v \"$runfree_tool\" >/dev/null 2>&1; then",
+    "    printf 'missing probe binary: %s\\n' \"$runfree_tool\" >&2",
+    "    exit 96",
+    "  fi",
+    "done",
+    ...probes.map((probe, index) => `${probe} & runfree_pid_${index}=$!`),
+    ...probes.map((_, index) => `wait "$runfree_pid_${index}"; runfree_status_${index}=$?`),
+    ...probes.map((_, index) => `printf '${FIREWALL_PROBE_MARKER} ${index} exit=%s\\n' "$runfree_status_${index}"`),
+    "exit 0",
+  ].join("\n");
+}
+
+export const SERVER_UID_DENIAL_BATCH_SCRIPT = serverUidDenialBatchScript();
 
 /**
  * Judges the batched server-UID denial records. No retry of failure-expected
  * probes; exit 0 is an enforcement gap, 126/127 is could-not-run (a validation
  * failure, not a denial — today's single-exec conflation, strengthened), and
  * any missing, duplicated, reordered, or extra record fails the validation.
+ * With `gatewayProbe`, the sixth record is the uid-1001 gateway probe, which
+ * only a timeout proves denied (`judgeDroppedProbeExit`).
  */
-export function applyServerUidDenialBatch(issues: string[], result: CaptureResult, onBoundaryViolation?: () => void): void {
+export function applyServerUidDenialBatch(
+  issues: string[],
+  result: CaptureResult,
+  onBoundaryViolation?: () => void,
+  gatewayProbe?: ServerUidGatewayProbe,
+): void {
   const batchFailure = (detail: string): void => {
     issues.push(`proxy server UID nftables and route denial batch could not run${detail ? `: ${detail}` : ""}`);
+    if (gatewayProbe) issues.push(`${serverUidGatewayProbeLabel(gatewayProbe.port)} denial probe did not run: the server UID batch failed`);
   };
+  const expectedRecords = SERVER_UID_DENIAL_PROBE_LABELS.length + (gatewayProbe ? 1 : 0);
   if (result.status !== 0) {
     batchFailure(compactDiagnostic(`${result.stderr}\n${result.stdout}`));
     return;
@@ -568,8 +593,8 @@ export function applyServerUidDenialBatch(issues: string[], result: CaptureResul
     return;
   }
   const records = result.stdout.split(/\r?\n/u).filter((line) => line.trim() !== "");
-  if (records.length !== SERVER_UID_DENIAL_PROBE_LABELS.length) {
-    batchFailure(`expected ${SERVER_UID_DENIAL_PROBE_LABELS.length} probe records, got ${records.length}`);
+  if (records.length !== expectedRecords) {
+    batchFailure(`expected ${expectedRecords} probe records, got ${records.length}`);
     return;
   }
   const outcomes: number[] = [];
@@ -582,6 +607,10 @@ export function applyServerUidDenialBatch(issues: string[], result: CaptureResul
     outcomes.push(Number(match[2]));
   }
   outcomes.forEach((exit, index) => {
+    if (gatewayProbe && index === SERVER_UID_DENIAL_PROBE_LABELS.length) {
+      judgeDroppedProbeExit(issues, serverUidGatewayProbeLabel(gatewayProbe.port), exit, onBoundaryViolation);
+      return;
+    }
     const label = SERVER_UID_DENIAL_PROBE_LABELS[index];
     if (exit === 0) {
       onBoundaryViolation?.();
@@ -771,9 +800,14 @@ export function validateProxyFirewall(
         hostServiceElements: undefined,
         expectedHostServiceElements: undefined,
       });
+      // A member at a different address than the status gateway is a re-pin
+      // or publish-order race: it refuses (a retry recovers) but proves no
+      // widening. Only a member at the status gateway on a port the
+      // effective policy does not approve is a violation.
       const expectedKeys = new Set(hostServices.expected?.map(hostServiceEntryKey) ?? []);
-      const unapprovedMember = hostServices.expected !== undefined
-        && (hostServices.elements ?? []).some((entry) => !expectedKeys.has(hostServiceEntryKey(entry)));
+      const unapprovedMember = hostServices.expected !== undefined && hostServices.gatewayIp !== undefined
+        && (hostServices.elements ?? []).some((entry) => entry.ip === hostServices.gatewayIp
+          && !expectedKeys.has(hostServiceEntryKey(entry)));
       try {
         const observed = JSON.parse(proxyTable.stdout) as { nftables?: unknown };
         if (Array.isArray(observed.nftables) && (shapeIssues.length > 0 || unapprovedMember)) options.onBoundaryViolation?.();
@@ -790,22 +824,27 @@ export function validateProxyFirewall(
   // the proxy-position gateway probes are not re-run.
   if (warm) return proof;
 
-  // Exec 4 (server UID batch): the five failure-expected denial probes.
+  // The proxy-position gateway probes need the pinned gateway; with none
+  // published (`unavailableReason`) there is no address to probe and
+  // `@host_service` was proved empty above instead.
+  const gatewayIp = options.effectiveHostServices ? hostServices.gatewayIp : undefined;
+  const approvedPorts = options.effectiveHostServices?.ports ?? [];
+  const gatewayProbe: ServerUidGatewayProbe | undefined = gatewayIp !== undefined
+    ? { gatewayIp, port: unapprovedHostServicePort(approvedPorts) }
+    : undefined;
+
+  // Exec 4 (server UID batch): the five failure-expected denial probes, plus
+  // the uid-1001 unapproved-port gateway probe as one more concurrent record.
   options.onProbe?.("proxy server UID denial probes");
   applyServerUidDenialBatch(
     issues,
-    runDockerExecProxyServer(context, io, proxyId, ["sh", "-lc", SERVER_UID_DENIAL_BATCH_SCRIPT]),
+    runDockerExecProxyServer(context, io, proxyId, ["sh", "-lc", serverUidDenialBatchScript(gatewayProbe)]),
     options.onBoundaryViolation,
+    gatewayProbe,
   );
 
-  // Exec 5 and 6: the proxy-position gateway probes. They need the pinned
-  // gateway; with none published (`unavailableReason`) there is no address
-  // to probe and `@host_service` was proved empty above instead.
-  if (hostServices.gatewayIp !== undefined && options.effectiveHostServices) {
-    runProxyPositionGatewayProbes(
-      issues, context, io, proxyId, hostServices.gatewayIp, options.effectiveHostServices.ports, options,
-    );
-  }
+  // Exec 5 (root): root to each approved gateway port.
+  if (gatewayIp !== undefined) runRootGatewayProbes(issues, context, io, proxyId, gatewayIp, approvedPorts, options);
   return proof;
 }
 

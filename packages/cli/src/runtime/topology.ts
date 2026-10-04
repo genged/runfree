@@ -406,13 +406,26 @@ export function validateRuntimeTopology(
   io: RuntimeIO,
   options: RuntimeTopologyOptions = {},
 ): RuntimeTopologyIssue[] {
-  return validateRuntimeTopologyWithProof(input, io, options).issues;
+  return validateTopology(input, io, options).issues;
 }
 
+/**
+ * The validation startup and the warm proof run. `effectiveHostServices` is
+ * required here so no caller can skip the host-service proof (SR10) by
+ * omitting it; only the issue-list `validateRuntimeTopology` leaves it out.
+ */
 export function validateRuntimeTopologyWithProof(
   input: RuntimeContext | ActiveRuntimePlan,
   io: RuntimeIO,
-  options: RuntimeTopologyOptions = {},
+  options: RuntimeTopologyOptions & { effectiveHostServices: EffectiveHostServices },
+): RuntimeTopologyValidationResult {
+  return validateTopology(input, io, options);
+}
+
+function validateTopology(
+  input: RuntimeContext | ActiveRuntimePlan,
+  io: RuntimeIO,
+  options: RuntimeTopologyOptions,
 ): RuntimeTopologyValidationResult {
   const context = topologyContext(input);
   const messages: string[] = [];

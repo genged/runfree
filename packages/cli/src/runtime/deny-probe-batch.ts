@@ -77,6 +77,32 @@ export function denyProbeBatchScript(specs: readonly DenyProbeSpec[]): string {
   return lines.join("\n");
 }
 
+/** `timeout` exits 124 when its command outlived the bound. */
+export const PROBE_TIMEOUT_EXIT = 124;
+
+/**
+ * Judges a proxy-position host gateway probe (`timeout 3 bash -c
+ * '</dev/tcp/<gateway>/<port>'`). An nftables output-chain drop leaves the SYN
+ * unanswered and the kernel retransmits it, so only a timeout (exit 124)
+ * proves the firewall dropped it. A refused or unreachable connect (exit 1)
+ * means the SYN left the proxy and the host answered: it would also read as
+ * "denied" when nothing listens on the port, so it is an unproven denial, a
+ * validation failure, though not an observed escape. Exit 0 is an escape.
+ * `make test-runtime-core` must confirm the dropped-SYN timeout on a live
+ * Docker Desktop host.
+ */
+export function judgeDroppedProbeExit(issues: string[], label: string, exit: number, onBoundaryViolation?: () => void): void {
+  if (exit === PROBE_TIMEOUT_EXIT) return;
+  if (exit === 0) {
+    onBoundaryViolation?.();
+    issues.push(`${label} unexpectedly succeeded`);
+  } else if (exit === 126 || exit === 127) {
+    issues.push(`${label} denial probe could not run (exit ${exit})`);
+  } else {
+    issues.push(`${label} was answered instead of dropped (exit ${exit}); only a timeout proves the firewall dropped it`);
+  }
+}
+
 function compactDiagnostic(value: string): string {
   const compact = value.replace(/\s+/g, " ").trim();
   if (compact.length <= 500) return compact;
@@ -121,6 +147,7 @@ export function applyDenyProbeBatchResult(
   result: CaptureResult,
   onBoundaryViolation?: () => void,
   helperAddress?: string,
+  judging: Readonly<{ requireTimeout?: boolean }> = {},
 ): void {
   const batchFailure = (detail: string): void => failDenyProbeBatch(issues, specs, detail);
   if (result.status !== 0 || result.timedOut === true || result.signal !== undefined) {
@@ -156,6 +183,10 @@ export function applyDenyProbeBatchResult(
   }
   outcomes.forEach((exit, index) => {
     const label = specs[index].label;
+    if (judging.requireTimeout === true) {
+      judgeDroppedProbeExit(issues, label, exit, onBoundaryViolation);
+      return;
+    }
     if (exit === 0) {
       onBoundaryViolation?.();
       issues.push(`${label} unexpectedly succeeded`);

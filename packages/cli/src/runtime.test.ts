@@ -8,6 +8,24 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
 import { SESSION_ELIGIBILITY_PATH } from "@runfree/runtime-contracts/session-file";
 
+// Lets a test make the next N reads of the effective host services fail, as
+// an unreadable effective policy generation would; every other call is real.
+const effectiveHostServicesFault = vi.hoisted(() => ({ failNext: 0, calls: 0 }));
+vi.mock("./control/effective.ts", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./control/effective.ts")>();
+  return {
+    ...actual,
+    readEffectiveHostServices: (...args: Parameters<typeof actual.readEffectiveHostServices>) => {
+      effectiveHostServicesFault.calls += 1;
+      if (effectiveHostServicesFault.failNext > 0) {
+        effectiveHostServicesFault.failNext -= 1;
+        throw new Error("effective host-service generation payload is corrupt (injected)");
+      }
+      return actual.readEffectiveHostServices(...args);
+    },
+  };
+});
+
 import { defaultConfig, projectControlPaths, type RunfreeConfig, type ProjectInfo } from "./config.ts";
 import { service, serviceHostNames } from "../../../scripts/services.ts";
 import { agentRuntimeImageTag, effectiveRuntimeDigest, proxyRuntimeImageTag } from "./agent-image.ts";
@@ -735,19 +753,21 @@ if (args[0] === "exec") {
     out(sections.join("\\n") + "\\n");
     process.exit(0);
   }
-  // The proxy-position host gateway probes: every probe is denied.
+  // The root host gateway probes: every SYN is dropped (timeout, exit 124).
   if (args[0] === "exec" && args.includes(proxyContainerId) && text.includes("RUNFREE_DENY_PROBE")) {
     const probes = (text.match(/runfree_pid_\\d+=\\$!/g) || []).length;
     const records = [];
-    for (let index = 0; index < probes; index += 1) records.push("RUNFREE_DENY_PROBE " + index + " exit=1");
+    for (let index = 0; index < probes; index += 1) records.push("RUNFREE_DENY_PROBE " + index + " exit=124");
     out(records.join("\\n") + "\\n");
     process.exit(0);
   }
   // L5b: the five server-UID denial probes arrive as one batch that exits 0
-  // with one denied (nonzero) record per probe.
+  // with one denied (nonzero) record per probe; a sixth record, the uid-1001
+  // host gateway probe, times out (dropped SYN, exit 124).
   if (args.includes("1001:1001") && text.includes("RUNFREE_FIREWALL_PROBE")) {
     const records = [];
-    for (let index = 0; index < 5; index += 1) records.push("RUNFREE_FIREWALL_PROBE " + index + " exit=1");
+    const probes = (text.match(/runfree_pid_\\d+=\\$!/g) || []).length;
+    for (let index = 0; index < probes; index += 1) records.push("RUNFREE_FIREWALL_PROBE " + index + " exit=" + (index === 5 ? 124 : 1));
     out(records.join("\\n") + "\\n");
     process.exit(0);
   }
@@ -1850,14 +1870,17 @@ function createRuntimeIO(overrides: {
     }
     // L5b: the five server-UID denial probes arrive as one batch under the
     // server identity; every probe is denied (nonzero record) and the batch
-    // itself exits 0.
+    // itself exits 0. A sixth record, the uid-1001 host gateway probe, times
+    // out: the firewall dropped its SYN (exit 124).
     if (args[0] === "exec" && args.includes(FAKE_PROXY_CONTAINER_ID) && args.includes("1001:1001") && text.includes("RUNFREE_FIREWALL_PROBE")) {
-      return captureResult(0, `${[0, 1, 2, 3, 4].map((index) => `RUNFREE_FIREWALL_PROBE ${index} exit=1`).join("\n")}\n`);
+      const probes = [...text.matchAll(/runfree_pid_(\d+)=\$!/g)].length;
+      return captureResult(0, `${Array.from({ length: probes }, (_, index) =>
+        `RUNFREE_FIREWALL_PROBE ${index} exit=${index === 5 ? 124 : 1}`).join("\n")}\n`);
     }
-    // The proxy-position host gateway probes: every probe is denied.
+    // The root host gateway probes: every SYN is dropped (exit 124).
     if (args[0] === "exec" && args.includes(FAKE_PROXY_CONTAINER_ID) && text.includes("RUNFREE_DENY_PROBE")) {
       const probes = [...text.matchAll(/runfree_pid_(\d+)=\$!/g)].length;
-      return captureResult(0, `${Array.from({ length: probes }, (_, index) => `RUNFREE_DENY_PROBE ${index} exit=1`).join("\n")}\n`);
+      return captureResult(0, `${Array.from({ length: probes }, (_, index) => `RUNFREE_DENY_PROBE ${index} exit=124`).join("\n")}\n`);
     }
     const routeTarget = /ip -o route get ([^\s]+)/.exec(text)?.[1];
     if (args[0] === "exec" && args.includes(FAKE_PROXY_CONTAINER_ID) && routeTarget && routeTarget !== "1.1.1.1") {
@@ -3852,14 +3875,13 @@ describe("runtime command flow", () => {
     // `runfree up` always validates fully, and then records the warm-proof
     // facts for the next launch: one type-less inspect and one root batch
     // (+1 `docker inspect`, +1 `docker exec`; sub-second launch plan Task 2).
-    // The full firewall proof also runs the proxy-position host gateway
-    // probe as uid 1001 (+1 `docker exec`; host services, design "Host-side
-    // proof"); this policy approves no host service, so no root probe runs.
+    // The uid-1001 host gateway probe rides the server-UID batch (no extra
+    // exec); this policy approves no host service, so no root probe runs.
     expect(dockerOperationProfile(io.calls.slice(warmStart))).toMatchInlineSnapshot(`
       {
         "docker container inspect": 4,
         "docker container ls": 2,
-        "docker exec": 14,
+        "docker exec": 13,
         "docker image inspect": 9,
         "docker info": 1,
         "docker inspect": 6,
@@ -4139,6 +4161,50 @@ describe("runtime command flow", () => {
       const start = io.calls.length;
       expect((await startRuntime(context, io, false, { launch: true })).status).toBe(0);
       expect(denyProbeRuns(io.calls.slice(start))).toBe(1);
+    });
+
+    test("unreadable effective host services refuse the start before topology, and a readable generation recovers", async () => {
+      const context = launchContext();
+      const io = createRuntimeIO();
+      effectiveHostServicesFault.failNext = Number.POSITIVE_INFINITY;
+      try {
+        const start = io.calls.length;
+        expect((await startRuntime(context, io, false, { launch: true })).status).toBe(1);
+        // Refused before the topology proof: no deny-probe helper ran and no
+        // warm record was written.
+        expect(denyProbeRuns(io.calls.slice(start))).toBe(0);
+        expect(fs.existsSync(recordPath(context))).toBe(false);
+        flushWarnings();
+        expect(vi.mocked(console.error).mock.calls.flat().join("\n"))
+          .toContain("effective host services could not be read: effective host-service generation payload is corrupt (injected); new authority was refused");
+      } finally {
+        effectiveHostServicesFault.failNext = 0;
+      }
+      // Reclaim: like any refused cold start, the proxy left without an
+      // effective control-plane selection is recreated by `runfree rebuild`;
+      // once the generation reads, that succeeds.
+      vi.mocked(console.error).mockClear();
+      const reclaimed = await startRuntime(context, io, true, {});
+      flushWarnings();
+      expect(reclaimed.status, vi.mocked(console.error).mock.calls.flat().join("\n")).toBe(0);
+    });
+
+    test("unreadable effective host services give no warm path; the launch validates fully", async () => {
+      const context = launchContext();
+      const io = createRuntimeIO();
+      await warmedUp(context, io);
+      // Only the warm-proof input's read fails; the full path reads normally.
+      effectiveHostServicesFault.failNext = 1;
+      const callsBefore = effectiveHostServicesFault.calls;
+      try {
+        const start = io.calls.length;
+        expect((await startRuntime(context, io, false, { launch: true })).status).toBe(0);
+        expect(effectiveHostServicesFault.failNext).toBe(0);
+        expect(effectiveHostServicesFault.calls - callsBefore).toBeGreaterThan(1);
+        expect(denyProbeRuns(io.calls.slice(start))).toBe(1);
+      } finally {
+        effectiveHostServicesFault.failNext = 0;
+      }
     });
 
     test("a batch that did not run as root takes the full path", async () => {

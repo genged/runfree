@@ -734,9 +734,13 @@ export function validateRuntimeTopologyOrRemoveInvalid(
     helperFence?: EphemeralHelperFence;
     helperImage?: string;
     readOnly?: boolean;
-    /** The host services of the effective policy generation the firewall readiness check waited for. */
-    effectiveHostServices?: EffectiveHostServices;
-  } = {},
+    /**
+     * The host services of the effective policy generation the firewall
+     * readiness check waited for. Required: the host-service proof (SR10)
+     * cannot be skipped by omitting it.
+     */
+    effectiveHostServices: EffectiveHostServices;
+  },
 ): { denyByDefaultObservation?: DenyByDefaultObservationV1; status: number; failureKind?: RuntimeFailureKind } {
   let boundaryViolated = false;
   const validate = () => validateRuntimeTopologyWithProof(plan, io, {
@@ -746,7 +750,7 @@ export function validateRuntimeTopologyOrRemoveInvalid(
     expectedProxyId: options.expectedProxyId,
     helperFence: options.helperFence,
     helperImage: options.helperImage,
-    ...(options.effectiveHostServices ? { effectiveHostServices: options.effectiveHostServices } : {}),
+    effectiveHostServices: options.effectiveHostServices,
   });
   let validation = validate();
   if (validation.issues.length > 0 && reclaimDeadCallbackRoutes(plan, context, io, options)) {

@@ -498,7 +498,14 @@ function denyProbeBatchPlanFixture(
         const script = args.at(-1) ?? "";
         const probes = [...script.matchAll(/runfree_pid_(\d+)=\$!/g)].length;
         return captureResult(0, `${Array.from({ length: probes }, (_, index) =>
-          `RUNFREE_DENY_PROBE ${index} exit=${fixtureOptions.proxyGatewayProbeExit ?? 1}`).join("\n")}\n`);
+          `RUNFREE_DENY_PROBE ${index} exit=${fixtureOptions.proxyGatewayProbeExit ?? 124}`).join("\n")}\n`);
+      }
+      // The server-UID batch: five denied records, then the uid-1001 gateway
+      // probe record when the batch carries one.
+      if (hostServices && args[0] === "exec" && text.includes("RUNFREE_FIREWALL_PROBE")) {
+        if (text.includes("/dev/tcp/")) proxyGatewayExecs.push([...args]);
+        const exits = [1, 1, 1, 1, 1, ...(text.includes("/dev/tcp/") ? [fixtureOptions.proxyGatewayProbeExit ?? 124] : [])];
+        return captureResult(0, `${exits.map((exit, index) => `RUNFREE_FIREWALL_PROBE ${index} exit=${exit}`).join("\n")}\n`);
       }
       return captureResult(0);
     },
@@ -802,4 +809,18 @@ test("with the gateway withheld no gateway port is probed from either position",
   expect(helperScript).not.toContain("/dev/tcp/192.168.65.254");
   expect(fixture.proxyGatewayExecs).toEqual([]);
   expect(codes).not.toContain("agent-host-gateway-port-denied");
+});
+
+test("a proxy-position gateway probe the host answered fails the gateway port code without containment", () => {
+  const fixture = denyProbeBatchPlanFixture(allDeniedBatch, {}, {
+    hostServices: { ports: [5432], gateway: HOST_GATEWAY },
+    proxyGatewayProbeExit: 1,
+  });
+  const messages = fixture.messages();
+  const codes = fixture.run();
+
+  expect(messages).toContain("proxy-position server UID host gateway unapproved port 9 was answered instead of dropped (exit 1); only a timeout proves the firewall dropped it");
+  expect(messages).toContain("proxy-position root host gateway port 5432 was answered instead of dropped (exit 1); only a timeout proves the firewall dropped it");
+  expect(codes).toContain("agent-host-gateway-port-denied");
+  expect(fixture.observed.boundaryViolated).toBe(false);
 });

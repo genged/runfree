@@ -1,6 +1,6 @@
 import net from "node:net";
 
-import { expect, test } from "vitest";
+import { describe, expect, test } from "vitest";
 
 import type { RuntimeNetwork } from "../network.ts";
 import { proxyHostServiceSetJson, proxyNftablesTableJson } from "../proxy-nftables-proof.fixture.ts";
@@ -11,6 +11,7 @@ import {
   firewallSectionBatchScript,
   parseFirewallSectionBatch,
   probeMcpCallbackPathWithRetries,
+  serverUidDenialBatchScript,
   validateProxyFirewall,
 } from "./probes.ts";
 import type { CaptureResult, RuntimeContext, RuntimeIO } from "./types.ts";
@@ -109,13 +110,18 @@ function firewallFixture(overrides: FirewallOverrides = {}) {
         return overrides.rootBatch ?? captureResult(0, sectionOutput(rootSections()));
       }
       if (text.includes("RUNFREE_FIREWALL_PROBE")) {
-        return overrides.serverBatch ?? captureResult(0, probeRecords([1, 1, 1, 1, 1]));
+        if (overrides.serverBatch) return overrides.serverBatch;
+        // Five denied server-UID records, plus the uid-1001 gateway probe
+        // record (dropped: a timeout) when the batch carries one.
+        const script = args.at(-1) ?? "";
+        const gateway = script.includes("/dev/tcp/");
+        return captureResult(0, probeRecords([1, 1, 1, 1, 1, ...(gateway ? [overrides.gatewayProbeExit?.("1001:1001", script) ?? 124] : [])]));
       }
       if (text.includes("RUNFREE_DENY_PROBE")) {
         const user = args[args.indexOf("--user") + 1] ?? "";
         const script = args.at(-1) ?? "";
         const probes = [...script.matchAll(/runfree_pid_(\d+)=\$!/g)].length;
-        const exit = overrides.gatewayProbeExit?.(user, script) ?? 1;
+        const exit = overrides.gatewayProbeExit?.(user, script) ?? 124;
         return captureResult(0, `${Array.from({ length: probes }, (_, index) => `RUNFREE_DENY_PROBE ${index} exit=${exit}`).join("\n")}\n`);
       }
       if (text.includes("@127.0.0.11 example.com")) {
@@ -275,27 +281,38 @@ function hostServiceFixture(
   return firewallFixture({ ...overrides, rootBatch: captureResult(0, sectionOutput(rootSections(sections))) });
 }
 
-test("matching host_service members pass and the proxy-position gateway probes run as uid 1001 and root", () => {
-  const fixture = hostServiceFixture({
-    hostServiceSet: { exit: 0, body: proxyHostServiceSetJson([{ ip: GATEWAY, port: 10882 }, { ip: GATEWAY, port: 5432 }]) },
-  });
+const MATCHING_SET = { exit: 0, body: proxyHostServiceSetJson([{ ip: GATEWAY, port: 10882 }, { ip: GATEWAY, port: 5432 }]) };
+
+test("matching host_service members pass; the uid 1001 gateway probe rides the server-UID batch and root probes run alone", () => {
+  const fixture = hostServiceFixture({ hostServiceSet: MATCHING_SET });
   const proof = fixture.run({ effectiveHostServices: HOST_SERVICES });
 
   expect(fixture.issues).toEqual([]);
   expect(proof.hostServiceGatewayIp).toBe(GATEWAY);
   expect(proof.nftablesProofInput?.expectedHostServiceElements).toEqual([{ ip: GATEWAY, port: 5432 }, { ip: GATEWAY, port: 10882 }]);
   expect(proof.nftablesProofInput?.hostServiceElements).toEqual([{ ip: GATEWAY, port: 10882 }, { ip: GATEWAY, port: 5432 }]);
-  // Route, table, root, server-UID denial, then the two gateway batches.
-  expect(fixture.execs).toHaveLength(6);
-  const [serverGateway, rootGateway] = fixture.execs.slice(4);
-  expect(serverGateway.slice(0, 3)).toEqual(["exec", "--user", "1001:1001"]);
-  // uid 1001 to a port the policy does not approve.
-  expect(serverGateway.join(" ")).toContain(`/dev/tcp/${GATEWAY}/9`);
-  expect(serverGateway.join(" ")).not.toContain(`/dev/tcp/${GATEWAY}/5432`);
+  // Route, table, root batch, server-UID batch (with the gateway record),
+  // then the root gateway batch: one exec more than without host services.
+  expect(fixture.execs).toHaveLength(5);
+  const [serverBatch, rootGateway] = fixture.execs.slice(3);
+  expect(serverBatch.slice(0, 3)).toEqual(["exec", "--user", "1001:1001"]);
+  expect(serverBatch.join(" ")).toContain("RUNFREE_FIREWALL_PROBE");
+  // uid 1001 to a port the policy does not approve, as the sixth record.
+  expect(serverBatch.join(" ")).toContain(`timeout 3 bash -c '</dev/tcp/${GATEWAY}/9'`);
+  expect(serverBatch.join(" ")).toContain("runfree_pid_5=$!");
+  expect(serverBatch.join(" ")).not.toContain(`/dev/tcp/${GATEWAY}/5432`);
   // Root to every approved port: the accept is uid 1001 only.
   expect(rootGateway.slice(0, 3)).toEqual(["exec", "--user", "0:0"]);
   expect(rootGateway.join(" ")).toContain(`/dev/tcp/${GATEWAY}/5432`);
   expect(rootGateway.join(" ")).toContain(`/dev/tcp/${GATEWAY}/10882`);
+});
+
+test("without host services the server-UID batch carries no gateway record", () => {
+  const fixture = firewallFixture();
+  fixture.run();
+  expect(fixture.execs).toHaveLength(4);
+  expect(fixture.execs[3].join(" ")).not.toContain("/dev/tcp/");
+  expect(fixture.execs[3].join(" ")).not.toContain("runfree_pid_5");
 });
 
 test("the uid 1001 probe picks a port the policy does not approve", () => {
@@ -305,29 +322,55 @@ test("the uid 1001 probe picks a port the policy does not approve", () => {
   fixture.run({ effectiveHostServices: { policyGeneration: POLICY_GENERATION, ports: [9, 10] } });
 
   expect(fixture.issues).toEqual([]);
-  expect(fixture.execs[4].join(" ")).toContain(`/dev/tcp/${GATEWAY}/11`);
+  expect(fixture.execs[3].join(" ")).toContain(`/dev/tcp/${GATEWAY}/11`);
 });
 
-test("a gateway port reached from the proxy position is a boundary violation", () => {
-  const serverReached = hostServiceFixture({
-    hostServiceSet: { exit: 0, body: proxyHostServiceSetJson([{ ip: GATEWAY, port: 5432 }, { ip: GATEWAY, port: 10882 }]) },
-  }, { gatewayProbeExit: (user) => (user === "1001:1001" ? 0 : 1) });
-  serverReached.run({ effectiveHostServices: HOST_SERVICES });
-  expect(serverReached.issues).toEqual(["proxy-position server UID host gateway unapproved port 9 unexpectedly succeeded"]);
-  expect(serverReached.observed.boundaryViolations).toBe(1);
+// Only a timeout (exit 124) proves an nftables output drop: the SYN goes
+// unanswered. A refused or unreachable connect (exit 1) means the host
+// answered, which also happens when nothing listens: an unproven denial,
+// not an escape. Exit 0 is an escape.
+describe.each([
+  ["uid 1001 to an unapproved port", "1001:1001", ["proxy-position server UID host gateway unapproved port 9"]],
+  ["root to each approved port", "0:0", ["proxy-position root host gateway port 5432", "proxy-position root host gateway port 10882"]],
+] as const)("the proxy-position gateway probe for %s", (_family, user, labels) => {
+  const run = (exit: number) => {
+    const fixture = hostServiceFixture({ hostServiceSet: MATCHING_SET }, {
+      gatewayProbeExit: (probeUser) => (probeUser === user ? exit : 124),
+    });
+    fixture.run({ effectiveHostServices: HOST_SERVICES });
+    return fixture;
+  };
 
-  const rootReached = hostServiceFixture({
-    hostServiceSet: { exit: 0, body: proxyHostServiceSetJson([{ ip: GATEWAY, port: 5432 }, { ip: GATEWAY, port: 10882 }]) },
-  }, { gatewayProbeExit: (user) => (user === "0:0" ? 0 : 1) });
-  rootReached.run({ effectiveHostServices: HOST_SERVICES });
-  expect(rootReached.issues).toEqual([
-    "proxy-position root host gateway port 5432 unexpectedly succeeded",
-    "proxy-position root host gateway port 10882 unexpectedly succeeded",
-  ]);
-  expect(rootReached.observed.boundaryViolations).toBe(2);
+  test("exit 124 (the SYN was dropped) proves the denial", () => {
+    const fixture = run(124);
+    expect(fixture.issues).toEqual([]);
+    expect(fixture.observed.boundaryViolations).toBe(0);
+  });
+
+  test("exit 1 (refused or unreachable) is an unproven denial, not a boundary violation", () => {
+    const fixture = run(1);
+    expect(fixture.issues).toEqual(labels.map((label) =>
+      `${label} was answered instead of dropped (exit 1); only a timeout proves the firewall dropped it`));
+    expect(fixture.observed.boundaryViolations).toBe(0);
+  });
+
+  test("exit 0 (connected) is a boundary violation", () => {
+    const fixture = run(0);
+    expect(fixture.issues).toEqual(labels.map((label) => `${label} unexpectedly succeeded`));
+    expect(fixture.observed.boundaryViolations).toBe(labels.length);
+  });
 });
 
-test("an extra host_service member is a refused widening; a missing one refuses without containment", () => {
+test("a failed server-UID batch leaves the uid 1001 gateway probe unproven too", () => {
+  const fixture = hostServiceFixture({ hostServiceSet: MATCHING_SET }, {
+    serverBatch: captureResult(0, probeRecords([1, 1, 1, 1, 1])),
+  });
+  fixture.run({ effectiveHostServices: HOST_SERVICES });
+  expect(fixture.issues.some((issue) => issue.includes("expected 6 probe records, got 5"))).toBe(true);
+  expect(fixture.issues).toContain("proxy-position server UID host gateway unapproved port 9 denial probe did not run: the server UID batch failed");
+});
+
+test("an extra host_service member at the status gateway is a refused widening; a missing one refuses without containment", () => {
   const extra = hostServiceFixture({
     hostServiceSet: { exit: 0, body: proxyHostServiceSetJson([{ ip: GATEWAY, port: 5432 }, { ip: GATEWAY, port: 10882 }, { ip: GATEWAY, port: 6379 }]) },
   });
@@ -343,6 +386,23 @@ test("an extra host_service member is a refused widening; a missing one refuses 
   expect(missing.observed.boundaryViolations).toBe(0);
 });
 
+test("host_service members at another address than the status gateway refuse without containment (a re-pin race)", () => {
+  const raced = hostServiceFixture({
+    hostServiceSet: { exit: 0, body: proxyHostServiceSetJson([{ ip: "192.168.65.253", port: 5432 }, { ip: "192.168.65.253", port: 10882 }]) },
+  });
+  raced.run({ effectiveHostServices: HOST_SERVICES });
+  expect(raced.issues.some((issue) => issue.startsWith("host_service members do not match the effective host services"))).toBe(true);
+  expect(raced.observed.boundaryViolations).toBe(0);
+
+  // The same race plus a pair at the status gateway on an unapproved port:
+  // that pair is still a widening.
+  const widened = hostServiceFixture({
+    hostServiceSet: { exit: 0, body: proxyHostServiceSetJson([{ ip: "192.168.65.253", port: 5432 }, { ip: GATEWAY, port: 6379 }]) },
+  });
+  widened.run({ effectiveHostServices: HOST_SERVICES });
+  expect(widened.observed.boundaryViolations).toBeGreaterThan(0);
+});
+
 test("a withheld gateway expects an empty host_service set and runs no gateway probe", () => {
   const unavailable = { exit: 0, body: gatewayStatus({ gatewayIp: undefined, unavailableReason: "host-service gateway not pinned" }) };
   const empty = hostServiceFixture({ gateway: unavailable });
@@ -350,27 +410,29 @@ test("a withheld gateway expects an empty host_service set and runs no gateway p
   expect(empty.issues).toEqual([]);
   expect(proof.hostServiceGatewayIp).toBeUndefined();
   expect(proof.nftablesProofInput?.expectedHostServiceElements).toEqual([]);
-  expect(empty.execs.some((args) => args.join(" ").includes("RUNFREE_DENY_PROBE"))).toBe(false);
+  expect(empty.execs.some((args) => args.join(" ").includes("/dev/tcp/"))).toBe(false);
 
   // Pairs left in the kernel while the gateway is withheld are reachable
-  // without a gateway the request proxy may use: refused.
+  // without a gateway the request proxy may use: refused, and with no status
+  // address to compare against they are not judged an escape.
   const leftover = hostServiceFixture({
     gateway: unavailable,
     hostServiceSet: { exit: 0, body: proxyHostServiceSetJson([{ ip: GATEWAY, port: 5432 }]) },
   });
   leftover.run({ effectiveHostServices: HOST_SERVICES });
   expect(leftover.issues.some((issue) => issue.startsWith("host_service members do not match the effective host services"))).toBe(true);
+  expect(leftover.observed.boundaryViolations).toBe(0);
 });
 
 test("a gateway status from another network policy generation refuses and runs no gateway probe", () => {
   const fixture = hostServiceFixture({
     gateway: { exit: 0, body: gatewayStatus({ policyGeneration: `sha256:${"b".repeat(64)}` }) },
-    hostServiceSet: { exit: 0, body: proxyHostServiceSetJson([{ ip: GATEWAY, port: 5432 }, { ip: GATEWAY, port: 10882 }]) },
+    hostServiceSet: MATCHING_SET,
   });
   const proof = fixture.run({ effectiveHostServices: HOST_SERVICES });
   expect(fixture.issues.some((issue) => issue.startsWith("proxy host-service gateway status names network policy generation sha256:bbbb"))).toBe(true);
   expect(proof.hostServiceGatewayIp).toBeUndefined();
-  expect(fixture.execs.some((args) => args.join(" ").includes("RUNFREE_DENY_PROBE"))).toBe(false);
+  expect(fixture.execs.some((args) => args.join(" ").includes("/dev/tcp/"))).toBe(false);
 });
 
 test.each([
@@ -617,4 +679,19 @@ test.each([
   fixture.run({ expectedEgressSource: NETWORK.proxyEgressIp, warm, effectiveHostServices: WARM_HOST_SERVICES });
   expect(fixture.issues.some((entry) => entry.includes(issue))).toBe(true);
   expect(fixture.execs).toEqual([]);
+});
+
+test("the server-UID batch refuses a gateway probe target that is not an IPv4 literal and a valid port", () => {
+  for (const probe of [
+    { gatewayIp: "192.168.65.254; reboot", port: 9 },
+    { gatewayIp: "192.168.65.999", port: 9 },
+    { gatewayIp: "192.168.65.254", port: 0 },
+    { gatewayIp: "192.168.65.254", port: 65536 },
+  ]) {
+    expect(() => serverUidDenialBatchScript(probe)).toThrow("server UID gateway probe needs an IPv4 literal");
+  }
+  const script = serverUidDenialBatchScript({ gatewayIp: "192.168.65.254", port: 9 });
+  expect(script).toContain("for runfree_tool in dig ip nft timeout bash; do");
+  expect(script).toContain("RUNFREE_FIREWALL_PROBE 5 exit=%s");
+  expect(SERVER_UID_DENIAL_BATCH_SCRIPT).not.toContain("runfree_pid_5");
 });
