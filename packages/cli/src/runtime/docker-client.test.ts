@@ -1,6 +1,6 @@
 import { describe, expect, test } from "vitest";
 
-import { createDockerClient, type DockerIo } from "./docker-client.ts";
+import { createDockerClient, labelRunFlags, type DockerIo } from "./docker-client.ts";
 import type { CaptureResult } from "./types.ts";
 
 type Call = { mode: "capture" | "run"; command: string; args: string[]; options: unknown };
@@ -103,5 +103,50 @@ describe("docker client options", () => {
     const { io, calls } = recordingIo(false);
     expect(() => createDockerClient(io).terminal.build(["."])).toThrow("this Docker client has no terminal runner");
     expect(calls).toEqual([]);
+  });
+});
+
+describe("labelRunFlags", () => {
+  test("turns a flat --label/value stream into run flags, in order", () => {
+    expect(labelRunFlags(["--label", "a=b", "--label", "c=d"])).toEqual([["--label", "a=b"], ["--label", "c=d"]]);
+  });
+
+  test("an empty stream yields no flags", () => {
+    expect(labelRunFlags([])).toEqual([]);
+  });
+
+  test("feeds straight into runContainer's label order", () => {
+    const { io, calls } = recordingIo();
+    createDockerClient(io).runContainer(
+      [["--rm"], ...labelRunFlags(["--label", "a=b", "--label", "c=d"]), ["--network", "n"]],
+      "img",
+      ["true"],
+    );
+    expect(calls).toEqual([{
+      mode: "capture",
+      command: "docker",
+      args: ["run", "--rm", "--label", "a=b", "--label", "c=d", "--network", "n", "img", "true"],
+      options: {},
+    }]);
+  });
+
+  test("rejects an odd-length stream: a trailing --label with no value", () => {
+    expect(() => labelRunFlags(["--label", "a=b", "--label"]))
+      .toThrow('malformed --label argv: expected [--label, value] pairs, got 3 token(s): ["--label","a=b","--label"]');
+  });
+
+  test("rejects an odd-length stream: a single bare token", () => {
+    expect(() => labelRunFlags(["--label"]))
+      .toThrow('malformed --label argv: expected [--label, value] pairs, got 1 token(s): ["--label"]');
+  });
+
+  test("rejects a wrong flag token at the start of a pair", () => {
+    expect(() => labelRunFlags(["--env", "a=b"]))
+      .toThrow('malformed --label argv at index 0: expected ["--label", value], got ["--env","a=b"]');
+  });
+
+  test("rejects a wrong flag token later in the stream, without dropping or reordering the valid pair before it", () => {
+    expect(() => labelRunFlags(["--label", "a=b", "--env", "c=d"]))
+      .toThrow('malformed --label argv at index 2: expected ["--label", value], got ["--env","c=d"]');
   });
 });
