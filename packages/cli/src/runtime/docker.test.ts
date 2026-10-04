@@ -48,7 +48,7 @@ function networkInventoryIO(responses: Array<{ args: string[]; result: CaptureRe
 
 test("network discovery discards partial inspection and includes newly discovered subnets after removal", () => {
   const responses = [
-    { args: ["network", "ls", "-q"], result: { status: 0, stdout: "1395a4232aaa\n36404f88457b\naaaaaaaaaaaa\n", stderr: "" } },
+    { args: ["network", "ls", "--quiet"], result: { status: 0, stdout: "1395a4232aaa\n36404f88457b\naaaaaaaaaaaa\n", stderr: "" } },
     {
       args: ["network", "inspect", "1395a4232aaa", "36404f88457b", "aaaaaaaaaaaa"],
       result: {
@@ -57,7 +57,7 @@ test("network discovery discards partial inspection and includes newly discovere
         stderr: "Error response from daemon: network 1395a4232aaa not found\nError response from daemon: network 36404f88457b not found\n",
       },
     },
-    { args: ["network", "ls", "-q"], result: { status: 0, stdout: "aaaaaaaaaaaa\nbbbbbbbbbbbb\n", stderr: "" } },
+    { args: ["network", "ls", "--quiet"], result: { status: 0, stdout: "aaaaaaaaaaaa\nbbbbbbbbbbbb\n", stderr: "" } },
     {
       args: ["network", "inspect", "aaaaaaaaaaaa", "bbbbbbbbbbbb"],
       result: {
@@ -77,9 +77,9 @@ test("network discovery discards partial inspection and includes newly discovere
 
 test.each(["1395a4232aaa", "xbtm0v4f1lfh"])("network discovery can recover to an empty fresh list after network %s disappears", (id) => {
   const responses = [
-    { args: ["network", "ls", "-q"], result: { status: 0, stdout: `${id}\n`, stderr: "" } },
+    { args: ["network", "ls", "--quiet"], result: { status: 0, stdout: `${id}\n`, stderr: "" } },
     { args: ["network", "inspect", id], result: { status: 1, stdout: "[]", stderr: `Error response from daemon: network ${id} not found` } },
-    { args: ["network", "ls", "-q"], result: { status: 0, stdout: "", stderr: "" } },
+    { args: ["network", "ls", "--quiet"], result: { status: 0, stdout: "", stderr: "" } },
   ];
   expect(createRuntimeDocker(context(), networkInventoryIO(responses)).networkSubnets()).toEqual([]);
   expect(responses).toHaveLength(0);
@@ -92,7 +92,7 @@ test.each([
   "",
 ])("network discovery refuses unrelated inspection failures without retry: %s", (stderr) => {
   const responses = [
-    { args: ["network", "ls", "-q"], result: { status: 0, stdout: "1395a4232aaa\n", stderr: "" } },
+    { args: ["network", "ls", "--quiet"], result: { status: 0, stdout: "1395a4232aaa\n", stderr: "" } },
     { args: ["network", "inspect", "1395a4232aaa"], result: { status: 1, stdout: "[]", stderr } },
   ];
   expect(() => createRuntimeDocker(context(), networkInventoryIO(responses)).networkSubnets())
@@ -102,7 +102,7 @@ test.each([
 
 test.each(["invalid JSON", "{}"])("network discovery refuses malformed successful inspection: %s", (stdout) => {
   const responses = [
-    { args: ["network", "ls", "-q"], result: { status: 0, stdout: "1395a4232aaa\n", stderr: "" } },
+    { args: ["network", "ls", "--quiet"], result: { status: 0, stdout: "1395a4232aaa\n", stderr: "" } },
     { args: ["network", "inspect", "1395a4232aaa"], result: { status: 0, stdout, stderr: "" } },
   ];
   expect(() => createRuntimeDocker(context(), networkInventoryIO(responses)).networkSubnets())
@@ -112,14 +112,14 @@ test.each(["invalid JSON", "{}"])("network discovery refuses malformed successfu
 
 test("network discovery bounds repeated removals and permits a later retry after churn settles", () => {
   const responses = Array.from({ length: 3 }, () => [
-    { args: ["network", "ls", "-q"], result: { status: 0, stdout: "1395a4232aaa\n", stderr: "" } },
+    { args: ["network", "ls", "--quiet"], result: { status: 0, stdout: "1395a4232aaa\n", stderr: "" } },
     { args: ["network", "inspect", "1395a4232aaa"], result: { status: 1, stdout: "[]", stderr: "Error response from daemon: network 1395a4232aaa not found" } },
   ]).flat();
   const docker = createRuntimeDocker(context(), networkInventoryIO(responses));
   expect(() => docker.networkSubnets()).toThrow("retry startup after Docker network changes settle");
   expect(responses).toHaveLength(0);
   responses.push(
-    { args: ["network", "ls", "-q"], result: { status: 0, stdout: "aaaaaaaaaaaa\n", stderr: "" } },
+    { args: ["network", "ls", "--quiet"], result: { status: 0, stdout: "aaaaaaaaaaaa\n", stderr: "" } },
     {
       args: ["network", "inspect", "aaaaaaaaaaaa"],
       result: { status: 0, stdout: JSON.stringify([{ Name: "stable", IPAM: { Config: [{ Subnet: "172.30.1.0/24" }] } }]), stderr: "" },
@@ -203,7 +203,7 @@ test("destroy removes the project's own volumes that compose down -v leaves, nev
   });
   expect(removeComposeProjectLeftoverVolumes(io, "runfree-abc123def456", {})).toBe(0);
   expect(calls).toEqual([
-    ["volume", "ls", "-q", "--filter", "label=com.docker.compose.project=runfree-abc123def456"],
+    ["volume", "ls", "--quiet", "--filter", "label=com.docker.compose.project=runfree-abc123def456"],
     ["volume", "rm", "runfree-abc123def456_runfree-commandhistory", "runfree-abc123def456_runfree-deps-abc123def456-pnpm-store"],
   ]);
 });
@@ -362,9 +362,9 @@ test("an unparseable docker info passes availability but yields no daemon identi
 // compare exact 64-hex container identities, so this lookup must ask Docker for
 // the untruncated ID.
 test.each([
-  [undefined, "-aq"],
-  [{ runningOnly: true }, "-q"],
-] as const)("service container lookup requests exact Docker container identity (%o)", (options, listFlag) => {
+  [undefined, ["--all", "--quiet"]],
+  [{ runningOnly: true }, ["--quiet"]],
+] as const)("service container lookup requests exact Docker container identity (%o)", (options, listFlags) => {
   const containerId = "1".repeat(64);
   const calls: string[][] = [];
   const io: RuntimeIO = {
@@ -381,7 +381,7 @@ test.each([
   expect(serviceContainerId("runfree-test", "agent", context(), io, options)).toBe(containerId);
   expect(calls).toEqual([[
     "ps",
-    listFlag,
+    ...listFlags,
     "--no-trunc",
     "--filter",
     "label=com.docker.compose.project=runfree-test",

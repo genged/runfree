@@ -120,7 +120,7 @@ describe("forwardRuntime", () => {
     try {
       expect(forwardRuntime({ action: "status" }, context, io, adapters)).toBe(0);
       const listArgs = captureArgs(capture).find((args) => args[0] === "ps" && args.includes("{{json .}}"));
-      expect(listArgs).toEqual(expect.arrayContaining(["-a", "--filter", `name=^/${PORT_A}$`]));
+      expect(listArgs).toEqual(expect.arrayContaining(["--all", "--filter", `name=^/${PORT_A}$`]));
       expect(listArgs?.join(" ")).not.toContain(VNC);
       expect(listArgs?.join(" ")).not.toContain(CALLBACK);
       // Rendered through the shared table, never Docker's own `table` format.

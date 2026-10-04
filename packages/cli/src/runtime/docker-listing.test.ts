@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, test } from "vitest";
 
 import { captureDockerListing, dockerListingLabel, renderDockerListing } from "./docker-listing.ts";
+import { createDockerClient } from "./docker-client.ts";
 import type { CaptureResult, RuntimeIO } from "./types.ts";
 import { flushWarnings, pendingWarningsForTest } from "../warnings.ts";
 
@@ -18,12 +19,16 @@ function io(result: CaptureResult, seen: string[][] = []): RuntimeIO {
   };
 }
 
+function client(result: CaptureResult, seen: string[][] = []) {
+  return createDockerClient(io(result, seen));
+}
+
 beforeEach(() => flushWarnings());
 
 describe("captureDockerListing", () => {
   test("appends the JSON format and parses one object per line", () => {
     const seen: string[][] = [];
-    const listing = captureDockerListing(io({
+    const listing = captureDockerListing(client({
       status: 0,
       stdout: [
         JSON.stringify({ Names: "a", Status: "Up 2 minutes", Ports: "127.0.0.1:3000->8080/tcp, [::1]:3000->8080/tcp" }),
@@ -31,8 +36,8 @@ describe("captureDockerListing", () => {
         "",
       ].join("\n"),
       stderr: "",
-    }, seen), ["ps", "-a", "--filter", "name=^/a$"], {}, "containers");
-    expect(seen).toEqual([["ps", "-a", "--filter", "name=^/a$", "--format", "{{json .}}"]]);
+    }, seen), { all: true, filters: ["name=^/a$"] }, "containers");
+    expect(seen).toEqual([["ps", "--all", "--filter", "name=^/a$", "--format", "{{json .}}"]]);
     expect(listing).toEqual({
       status: 0,
       rows: [
@@ -44,34 +49,34 @@ describe("captureDockerListing", () => {
   });
 
   test("an empty listing is zero rows, not an error", () => {
-    expect(captureDockerListing(io({ status: 0, stdout: "\n", stderr: "" }), ["network", "ls"], {}, "networks"))
+    expect(captureDockerListing(client({ status: 0, stdout: "\n", stderr: "" }), { type: "network" }, "networks"))
       .toEqual({ status: 0, rows: [] });
   });
 
   test("a failed docker command warns with its stderr and returns its status", () => {
-    const listing = captureDockerListing(io({ status: 1, stdout: "", stderr: "permission denied\n" }), ["ps"], {}, "containers");
+    const listing = captureDockerListing(client({ status: 1, stdout: "", stderr: "permission denied\n" }), {}, "containers");
     expect(listing).toEqual({ status: 1, rows: [] });
     expect(pendingWarningsForTest().map((event) => event.message)).toEqual(["could not list Docker containers: permission denied"]);
   });
 
   test("a line that is not a JSON object fails closed instead of rendering a partial table", () => {
-    const listing = captureDockerListing(io({
+    const listing = captureDockerListing(client({
       status: 0,
       stdout: `${JSON.stringify({ Names: "a" })}\nnot json\n`,
       stderr: "",
-    }), ["ps"], {}, "containers");
+    }), {}, "containers");
     expect(listing).toEqual({ status: 1, rows: [] });
     expect(pendingWarningsForTest().map((event) => event.message))
       .toEqual(["could not parse Docker containers listing: line 2 is not a JSON object"]);
   });
 
   test("a JSON array or scalar line is rejected the same way", () => {
-    expect(captureDockerListing(io({ status: 0, stdout: "[1]\n", stderr: "" }), ["ps"], {}, "containers").status).toBe(1);
-    expect(captureDockerListing(io({ status: 0, stdout: "null\n", stderr: "" }), ["ps"], {}, "containers").status).toBe(1);
+    expect(captureDockerListing(client({ status: 0, stdout: "[1]\n", stderr: "" }), {}, "containers").status).toBe(1);
+    expect(captureDockerListing(client({ status: 0, stdout: "null\n", stderr: "" }), {}, "containers").status).toBe(1);
   });
 
   test("non-string field values are stringified so every cell is text", () => {
-    const listing = captureDockerListing(io({ status: 0, stdout: '{"Names":"a","Size":12,"Labels":null}\n', stderr: "" }), ["ps"], {}, "containers");
+    const listing = captureDockerListing(client({ status: 0, stdout: '{"Names":"a","Size":12,"Labels":null}\n', stderr: "" }), {}, "containers");
     expect(listing.rows).toEqual([{ Names: "a", Size: "12", Labels: "" }]);
   });
 });

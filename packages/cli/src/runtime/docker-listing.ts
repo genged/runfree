@@ -1,8 +1,6 @@
-import type * as childProcess from "node:child_process";
-
 import { formatTerminalTable } from "../terminal-table.ts";
 import { warn } from "../warnings.ts";
-import type { RuntimeIO } from "./types.ts";
+import type { DockerClient, DockerListQuery, DockerObjectType } from "./docker-client.ts";
 
 // Docker `ls`-style listings (`ps`, `network ls`, `volume ls`, `image ls`) read
 // through `--format '{{json .}}'`: one self-describing JSON object per line,
@@ -27,13 +25,24 @@ export type DockerListingColumn = {
 
 export const DOCKER_JSON_FORMAT = "{{json .}}";
 
+/**
+ * What to list: containers when `type` is omitted or `"container"`, otherwise
+ * the named `image`/`network`/`volume` objects (optionally by exact
+ * `reference`). `format` is not accepted here — this always lists as JSON.
+ */
+export type DockerListingQuery = Readonly<
+  Omit<DockerListQuery, "format"> & Readonly<{ type?: DockerObjectType; reference?: string }>
+>;
+
 export function captureDockerListing(
-  io: RuntimeIO,
-  args: readonly string[],
-  options: childProcess.SpawnSyncOptions,
+  client: DockerClient,
+  query: DockerListingQuery,
   label: string,
 ): DockerListing {
-  const result = io.capture("docker", [...args, "--format", DOCKER_JSON_FORMAT], options);
+  const { type, reference, ...rest } = query;
+  const result = type === undefined || type === "container"
+    ? client.listContainers({ ...rest, format: DOCKER_JSON_FORMAT })
+    : client.listObjects(type, { ...rest, reference, format: DOCKER_JSON_FORMAT });
   if (result.status !== 0) {
     const detail = result.stderr.trim();
     warn(`could not list Docker ${label}${detail ? `: ${detail}` : ""}`);

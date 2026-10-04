@@ -1348,7 +1348,7 @@ function createRuntimeIO(overrides: {
         };
       }), null, 2)}\n`);
     }
-    const runningOnly = args.includes("-q") && !args.includes("-a") && !args.includes("-aq");
+    const runningOnly = args.includes("--quiet") && !args.includes("--all");
     const projectId = observedProject.replace(/^runfree-/, "");
     const callbackPort = /^[0-9a-f]{6}/.test(projectId)
       ? String(47100 + (Number.parseInt(projectId.slice(0, 6), 16) % 1000))
@@ -1407,7 +1407,7 @@ function createRuntimeIO(overrides: {
       return captureResult(0);
     }
     if (args[0] === "ps"
-      && args.includes("-aq")
+      && args.includes("--all") && args.includes("--quiet")
       && args.some((arg) => arg.startsWith("label=com.docker.compose.project="))
       && !args.some((arg) => arg.includes("com.docker.compose.service="))
       && (composeStarted || Boolean(process.env.FAKE_PREEXISTING_AGENT_ID))) {
@@ -1857,7 +1857,7 @@ function createRuntimeIO(overrides: {
     if (args[0] === "image" && args[1] === "inspect") return true;
     if (args[0] === "ps"
       && (composeStarted || Boolean(process.env.FAKE_PREEXISTING_AGENT_ID))
-      && args.includes("-aq")
+      && args.includes("--all") && args.includes("--quiet")
       && text.includes("com.docker.compose.project=")
       && !text.includes("com.docker.compose.service=")) return true;
     if (args[0] === "ps" && text.includes("com.docker.compose.service=")) return true;
@@ -1977,7 +1977,7 @@ function createRuntimeIO(overrides: {
       }
       if (composeStarted && isTopologyCapture(command, args)
         && ((args[0] === "ps"
-          && args.includes("-aq")
+          && args.includes("--all") && args.includes("--quiet")
           && args.some((arg) => arg.startsWith("label=com.docker.compose.project="))
           && !args.some((arg) => arg.includes("com.docker.compose.service=")))
           || (args[0] === "inspect"
@@ -3068,7 +3068,7 @@ describe("runtime recovery", () => {
         if (
           command === "docker"
           && args[0] === "ps"
-          && args[1] === "-aq"
+          && args[1] === "--all" && args[2] === "--quiet"
           && args.includes(`label=com.docker.compose.project=${projectName}`)
           && !args.some((arg) => arg.includes("com.docker.compose.service="))
         ) {
@@ -3082,7 +3082,7 @@ describe("runtime recovery", () => {
         return undefined;
       },
       run(command, args) {
-        if (command === "docker" && args[0] === "rm" && args.includes("stale-id")) staleRemoved = true;
+        if (command === "docker" && args[0] === "container" && args[1] === "rm" && args.includes("stale-id")) staleRemoved = true;
         return 0;
       },
     });
@@ -3099,12 +3099,12 @@ describe("runtime recovery", () => {
     expect(io.calls).toContainEqual(expect.objectContaining({
       method: "run",
       command: "docker",
-      args: ["rm", "-f", "stale-id"],
+      args: ["container", "rm", "--force", "stale-id"],
     }));
     expect(io.calls).not.toContainEqual(expect.objectContaining({
       method: "run",
       command: "docker",
-      args: ["rm", "-f", "fresh-id"],
+      args: ["container", "rm", "--force", "fresh-id"],
     }));
   });
 
@@ -3585,7 +3585,9 @@ describe("runtime command flow", () => {
     };
     /** The workspace still has its Compose project, so stop takes compose down. */
     const withComposeProject = (context: RuntimeContext) => (command: string, args: string[]): CaptureResult | undefined => {
-      if (command === "docker" && args[0] === "ps" && args[1] === "-aq") return captureResult(0, `${FAKE_PROXY_CONTAINER_ID}\n`);
+      if (command === "docker" && args[0] === "ps" && args[1] === "--all" && args.some((arg) => arg.startsWith("label="))) {
+        return captureResult(0, `${FAKE_PROXY_CONTAINER_ID}\n`);
+      }
       if (command === "docker" && args[0] === "inspect" && args.some((arg) => arg.includes("com.docker.compose.project"))) {
         return captureResult(0, `${composeProjectName(context.projectRoot)}\n`);
       }
@@ -3632,7 +3634,8 @@ describe("runtime command flow", () => {
     test("with nothing left to stop, a selection an earlier stop left behind is reclaimed", async () => {
       const context = await startedProject();
       const io = createRuntimeIO({
-        capture: (command, args) => (command === "docker" && args[0] === "ps" && args[1] === "-aq"
+        capture: (command, args) => (command === "docker" && args[0] === "ps" && args[1] === "--all"
+          && args.some((arg) => arg.startsWith("label="))
           ? captureResult(0)
           : goneAfterDown(command, args)),
       });
@@ -4213,7 +4216,7 @@ describe("runtime command flow", () => {
       const io = createRuntimeIO({
         // The proxy this launch observes first is not the one it syncs against.
         capture: (command, args) => {
-          if (!replaceFirstProxyObservation || command !== "docker" || args[0] !== "ps" || args[1] !== "-q") return undefined;
+          if (!replaceFirstProxyObservation || command !== "docker" || args[0] !== "ps" || args[1] !== "--quiet") return undefined;
           if (!args.includes("label=com.docker.compose.service=proxy")) return undefined;
           replaceFirstProxyObservation = false;
           return captureResult(0, `${"9".repeat(64)}\n`);
@@ -5173,7 +5176,7 @@ describe("runtime command flow", () => {
     expect(io.calls).toContainEqual(expect.objectContaining({
       method: "capture",
       command: "docker",
-      args: ["ps", "-aq", "--filter", `label=com.docker.compose.project=${projectName}`],
+      args: ["ps", "--all", "--quiet", "--filter", `label=com.docker.compose.project=${projectName}`],
     }));
     expect(io.calls).not.toContainEqual(expect.objectContaining({
       method: "capture",
@@ -5508,7 +5511,7 @@ describe("runtime command flow", () => {
     const io = createRuntimeIO({
       capture: (command, args) => {
         if (command === "docker" && args[0] === "info") return captureResult(0);
-        if (command === "docker" && args[0] === "ps" && args.includes("-q") && args.includes("--no-trunc")
+        if (command === "docker" && args[0] === "ps" && args.includes("--quiet") && args.includes("--no-trunc")
           && args.includes(`label=com.docker.compose.project=${projectName}`)
           && args.includes("label=com.docker.compose.service=proxy")) {
           return captureResult(0, `${proxyContainerId}\n`);
@@ -5547,7 +5550,7 @@ describe("runtime command flow", () => {
         if (command === "docker" && args[0] === "info") return captureResult(0);
         // No running proxy container for this project: status must report,
         // not throw or hang.
-        if (command === "docker" && args[0] === "ps" && args.includes("-q") && args.includes("--no-trunc")
+        if (command === "docker" && args[0] === "ps" && args.includes("--quiet") && args.includes("--no-trunc")
           && args.includes("label=com.docker.compose.service=proxy")) {
           return captureResult(0, "");
         }
@@ -5578,7 +5581,7 @@ describe("runtime command flow", () => {
     const io = createRuntimeIO({
       capture: (command, args) => {
         if (command === "docker" && args[0] === "info") return captureResult(0);
-        if (command === "docker" && args[0] === "ps" && args.includes("-q") && args.includes("--no-trunc")
+        if (command === "docker" && args[0] === "ps" && args.includes("--quiet") && args.includes("--no-trunc")
           && args.includes(`label=com.docker.compose.project=${projectName}`)
           && args.includes("label=com.docker.compose.service=proxy")) {
           return captureResult(0, `${proxyContainerId}\n`);
@@ -5722,7 +5725,7 @@ describe("runtime command flow", () => {
         return captureResult(0);
       },
       run: (command, args) => {
-        if (command === "docker" && args[0] === "rm") return 17;
+        if (command === "docker" && args[0] === "container" && args[1] === "rm") return 17;
         return 0;
       },
     });

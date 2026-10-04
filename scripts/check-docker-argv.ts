@@ -34,9 +34,10 @@ export const DOCKER_LITERAL_ALLOWLIST: Readonly<Record<string, string>> = {
   "packages/cli/src/runtime/session-admission-docker-gateway.ts": "classifier: types the gateway's accepted executable, compares `command !== \"docker\"` to pass through non-Docker calls, and labels histogram categories; builds no argv itself",
   "packages/cli/src/runtime.ts": "pending: Task 4",
 
-  // pending: Task 3
-  "packages/cli/src/runtime/docker.ts": "pending: Task 3",
-  "packages/cli/src/runtime/docker-listing.ts": "pending: Task 3",
+  // classifier: the one remaining literal names the probe target for
+  // io.commandExists, not argv; every docker argv in this file builds
+  // through createDockerClient (docker-client.ts)
+  "packages/cli/src/runtime/docker.ts": "classifier: io.commandExists(\"docker\", ...) names the availability-probe target, not argv; every docker argv in this file builds through createDockerClient",
 
   // pending: Task 4
   "packages/cli/src/runtime/startup.ts": "pending: Task 4",

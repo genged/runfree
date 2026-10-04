@@ -4,6 +4,7 @@ import { die } from "../errors.ts";
 import { resolveAgentExecTarget } from "./agent-exec-target.ts";
 import { AGENT_UID_GID } from "./constants.ts";
 import { createRuntimeDocker, dockerClientEnvOptions } from "./docker.ts";
+import { createDockerClient } from "./docker-client.ts";
 import { captureDockerListing, renderDockerListing } from "./docker-listing.ts";
 import { composeProjectName, projectHash } from "./env.ts";
 import {
@@ -305,8 +306,8 @@ export async function vncRuntime(
         console.log("no vnc forward sidecar found");
         return 0;
       }
-      const filters = forwarders.flatMap((name) => ["--filter", `name=^/${name}$`]);
-      const listing = captureDockerListing(io, ["ps", "-a", ...filters], dockerClientEnvOptions(context), "vnc forwards");
+      const filters = forwarders.map((name) => `name=^/${name}$`);
+      const listing = captureDockerListing(createDockerClient(io, dockerClientEnvOptions(context)), { all: true, filters }, "vnc forwards");
       if (listing.status !== 0) return listing.status;
       if (listing.rows.length === 0) {
         console.log("no vnc forward sidecar found");
