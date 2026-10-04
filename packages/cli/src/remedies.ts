@@ -49,6 +49,10 @@ export const remedy = {
   statusVerbose: (): string => "runfree status --verbose",
   help: (): string => "runfree help",
   init: (): string => "runfree init",
+  // The `host-service` command lands in a later task; until then this renders
+  // a command the real CLI does not parse yet (tracked as a temporary
+  // exception in `scripts/emitted-commands.test.ts`'s PENDING_COMMAND_PREFIXES).
+  hostServiceRepair: (): string => "runfree host-service list --repair",
 } as const;
 
 // One sample rendering per registry entry, for the parse gate.
@@ -89,5 +93,6 @@ export function sampleRemedyRenderings(): string[] {
     remedy.statusVerbose(),
     remedy.help(),
     remedy.init(),
+    remedy.hostServiceRepair(),
   ];
 }

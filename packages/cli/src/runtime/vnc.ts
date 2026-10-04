@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 
 import { die } from "../errors.ts";
+import { registeredHostServicePortRefusal } from "../host-service-registry.ts";
 import { resolveAgentExecTarget } from "./agent-exec-target.ts";
 import { AGENT_UID_GID } from "./constants.ts";
 import { createRuntimeDocker, dockerClientEnvOptions } from "./docker.ts";
@@ -333,6 +334,11 @@ export async function vncRuntime(
     }
     case "start":
     case "restart": {
+      // Checked before any forwarder removal or agent-side setup (A4): a port
+      // another project approved as a host service must never be shadowed by
+      // this project's own VNC publication.
+      const refusal = registeredHostServicePortRefusal(context.env ?? process.env, Number(options.hostPort), projectId);
+      if (refusal) die(refusal);
       const target = resolveVncTarget(project, projectId, context, io);
       const internalNetwork = `${project}_agent_internal`;
       if (!networkExists(context, io, internalNetwork)) {

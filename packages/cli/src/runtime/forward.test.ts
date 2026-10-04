@@ -1,5 +1,11 @@
-import { describe, expect, test, vi } from "vitest";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
+
+import { recordProjectHostServicePorts } from "../host-service-registry.ts";
+import { runfreeStateRoot } from "../paths.ts";
 import { projectHash } from "./env.ts";
 import { forwardOptionsFromArgs, forwardRuntime } from "./forward.ts";
 import {
@@ -8,8 +14,14 @@ import {
   ingressHostNetworkInspectFixture,
   missingContainerResult,
 } from "./ingress-forwarder.test-harness.ts";
+import { replaceValidatedIngressForwarder } from "./ingress-forwarder-ownership.ts";
 import type { RuntimeAdapters } from "./adapters.ts";
 import type { RuntimeContext, RuntimeIO } from "./types.ts";
+
+vi.mock("./ingress-forwarder-ownership.ts", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./ingress-forwarder-ownership.ts")>();
+  return { ...actual, replaceValidatedIngressForwarder: vi.fn(actual.replaceValidatedIngressForwarder) };
+});
 
 const projectRoot = "/workspace/project";
 const projectId = projectHash(projectRoot);
@@ -17,6 +29,18 @@ const composeProject = `runfree-${projectId}`;
 
 const context = { projectRoot, project: { paths: { stateDir: "/state" } } } as unknown as RuntimeContext;
 const adapters = { docker: { assertAvailable() {} } } as unknown as RuntimeAdapters;
+
+let stateHome: string;
+
+beforeEach(() => {
+  stateHome = fs.mkdtempSync(path.join(os.tmpdir(), "runfree-forward-registry-"));
+  context.env = { XDG_STATE_HOME: stateHome };
+  vi.mocked(replaceValidatedIngressForwarder).mockClear();
+});
+
+afterEach(() => {
+  fs.rmSync(stateHome, { recursive: true, force: true });
+});
 
 describe("forwardOptionsFromArgs", () => {
   test("a bare port defaults both sides and starts", () => {
@@ -198,5 +222,27 @@ describe("forwardRuntime", () => {
   test("start requires a port", () => {
     const { io } = fakeIo([]);
     expect(() => forwardRuntime({ action: "start" }, context, io, adapters)).toThrow(/requires a port/u);
+  });
+
+  test("start refuses a port another project registered as a host service, naming its root, before any removal", () => {
+    const otherRoot = "/workspace/other-project";
+    const otherProjectId = projectHash(otherRoot);
+    recordProjectHostServicePorts(context.env as NodeJS.ProcessEnv, { id: otherProjectId, root: otherRoot }, [10882]);
+    const { io } = fakeIo([PORT_A]);
+
+    expect(() => forwardRuntime({ action: "start", hostPort: "10882", agentPort: "10882" }, context, io, adapters))
+      .toThrow(new RegExp(otherRoot.replace(/\//g, "\\/")));
+    expect(replaceValidatedIngressForwarder).not.toHaveBeenCalled();
+  });
+
+  test("start refuses when the host-service port registry is corrupt, with the --repair remedy", () => {
+    const registryDir = runfreeStateRoot(context.env as NodeJS.ProcessEnv);
+    fs.mkdirSync(registryDir, { recursive: true });
+    fs.writeFileSync(path.join(registryDir, "host-service-ports.json"), "{ not json");
+    const { io } = fakeIo([]);
+
+    expect(() => forwardRuntime({ action: "start", hostPort: "10882", agentPort: "10882" }, context, io, adapters))
+      .toThrow(/runfree host-service list --repair/u);
+    expect(replaceValidatedIngressForwarder).not.toHaveBeenCalled();
   });
 });

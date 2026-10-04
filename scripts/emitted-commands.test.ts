@@ -50,11 +50,14 @@ const REMOVED_COMMAND_FRAGMENTS = new Set([
 ]);
 
 // Commands the host-services feature emits before its CLI command lands: the
-// proxy's host-service remedy names `runfree host-service add`, which the
-// host-services plan adds in a later task. That task removes this entry, so
-// the remedy is then parsed like every other emitted command.
+// proxy's host-service remedy names `runfree host-service add`, and the port
+// registry's repair remedy (`remedies.ts`) names `runfree host-service list
+// --repair`. Both name the `host-service` command the host-services plan adds
+// in a later task. That task removes this entry, so the remedy is then parsed
+// like every other emitted command.
 const PENDING_COMMAND_PREFIXES: readonly string[] = [
   "runfree host-service add ",
+  "runfree host-service list --repair",
 ];
 
 // English words that end a command fragment inside prose ("runfree update
@@ -216,6 +219,7 @@ describe("emitted commands parse under the real command app", () => {
     const failures: string[] = [];
     for (const rendering of sampleRemedyRenderings()) {
       expect(rendering.startsWith("runfree ")).toBe(true);
+      if (PENDING_COMMAND_PREFIXES.some((prefix) => rendering.startsWith(prefix))) continue;
       const failure = await parseFailure(rendering.slice("runfree ".length).split(" "));
       if (failure) failures.push(`${rendering}: ${failure}`);
     }

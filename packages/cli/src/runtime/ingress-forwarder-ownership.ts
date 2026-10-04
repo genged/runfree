@@ -1,4 +1,5 @@
 import { die } from "../errors.ts";
+import { registeredHostServicePortRefusal } from "../host-service-registry.ts";
 import {
   INGRESS_FORWARDER_IMAGE,
   type IngressForwarderInput,
@@ -189,6 +190,12 @@ export function replaceValidatedIngressForwarder(
   projectId: string,
   input: IngressForwarderInput,
 ): string {
+  // Defence in depth (A4): `forward` and `vnc` already check this before
+  // calling here, but this is the one place that ever removes an existing
+  // forwarder to make room for a new one, so it checks again right before
+  // that removal rather than trusting every future caller to have checked.
+  const refusal = registeredHostServicePortRefusal(context.env ?? process.env, Number(input.hostPort), projectId);
+  if (refusal) return die(refusal);
   const name = ingressForwarderName(projectId, input.purpose, input.hostPort);
   let plan: ValidatedIngressForwarderPlan;
   try {

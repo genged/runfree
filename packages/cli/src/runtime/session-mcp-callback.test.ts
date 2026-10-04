@@ -7,6 +7,7 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, test, vi, type Mock } from "vitest";
 
 import { CliError } from "../errors.ts";
+import { recordProjectHostServicePorts } from "../host-service-registry.ts";
 import { projectHash } from "./env.ts";
 import { mcpOAuthCallbackPort } from "./mcp.ts";
 import { MCP_CALLBACK_BRIDGE_SOURCE, SESSION_MCP_CALLBACK_PORT_FILE } from "./probes.ts";
@@ -167,6 +168,41 @@ describe("prepareSessionMcpCallback", () => {
 
     expect(endpoint.port).not.toBe(LEGACY_PORT);
     expect(docker.dockerRuns()).toHaveLength(1);
+  });
+
+  test("skips a port an injected host-service registry reader reports as registered (HS7)", async () => {
+    const docker = fake();
+    const endpoint = await prepareSessionMcpCallback(contextWith(true), docker.io, OWNER, {
+      hostPortFree: allFree,
+      probe: probeOk,
+      registeredHostPorts: () => new Set([LEGACY_PORT]),
+    });
+
+    expect(endpoint.port).not.toBe(LEGACY_PORT);
+    // The 32-attempt budget is unchanged: a registered port is simply one
+    // more exclusion, and one forwarder is still created for the chosen port.
+    expect(sessionCallbackPortCandidates(PROJECT_ROOT, OWNER.sessionId, new Set([LEGACY_PORT])))
+      .toHaveLength(SESSION_CALLBACK_PORT_ATTEMPTS);
+    expect(docker.dockerRuns()).toHaveLength(1);
+  });
+
+  test("excludes a port the host-global registry reports via the default reader, with no injection", async () => {
+    const registryHome = fs.mkdtempSync(path.join(os.tmpdir(), "runfree-session-callback-registry-"));
+    try {
+      const otherRoot = "/workspace/other-project";
+      recordProjectHostServicePorts({ XDG_STATE_HOME: registryHome }, { id: projectHash(otherRoot), root: otherRoot }, [LEGACY_PORT]);
+      const ctx = { ...contextWith(true), env: { XDG_STATE_HOME: registryHome } } as unknown as RuntimeContext;
+      const docker = fake();
+
+      const endpoint = await prepareSessionMcpCallback(ctx, docker.io, OWNER, {
+        hostPortFree: allFree,
+        probe: probeOk,
+      });
+
+      expect(endpoint.port).not.toBe(LEGACY_PORT);
+    } finally {
+      fs.rmSync(registryHome, { recursive: true, force: true });
+    }
   });
 
   test("moves on after a publication conflict and removes the created residue by exact identity", async () => {
