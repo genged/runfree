@@ -419,6 +419,45 @@ export function readHostServicePortRegistry(env: NodeJS.ProcessEnv): HostService
   }
 }
 
+/**
+ * The owner command the registry has on file for each of this project's
+ * registered ports, keyed by port (design "Policy shape", Re-check, SR13).
+ * Both `runfree status` and the launch-time re-check compare a port's live
+ * owner against this to detect drift. A port with no recorded command, an
+ * owner recorded for a different project, or an unreadable registry is
+ * simply absent -- never a reason to fail the status line or the launch.
+ */
+export function recordedHostServiceOwners(env: NodeJS.ProcessEnv, projectId: string): ReadonlyMap<number, string> {
+  const recorded = new Map<number, string>();
+  const registryRead = readHostServicePortRegistry(env);
+  if (!registryRead.ok) return recorded;
+  for (const [port, owner] of registryRead.owners) {
+    if (owner.projectId === projectId && owner.command !== undefined) recorded.set(port, owner.command);
+  }
+  return recorded;
+}
+
+/**
+ * Whether the registry currently assigns any port to `projectId`, regardless
+ * of whether a command is recorded for it. The launch-time re-check (R15)
+ * uses this to decide whether a project with no *effective* host services
+ * still needs the registry write that prunes a stale row -- left behind, for
+ * example, by removing `hostServices` outside `host-service remove` -- so a
+ * project that never used host services never takes the registry lock. An
+ * unreadable registry answers `false`: the write this gates is a no-op
+ * either way (an empty `ports` list removes the row), so there is nothing to
+ * lose by skipping it, and a project that does have ports to record still
+ * reaches its own write, which surfaces the same read failure.
+ */
+export function projectHasRegisteredHostServicePorts(env: NodeJS.ProcessEnv, projectId: string): boolean {
+  const registryRead = readHostServicePortRegistry(env);
+  if (!registryRead.ok) return false;
+  for (const owner of registryRead.owners.values()) {
+    if (owner.projectId === projectId) return true;
+  }
+  return false;
+}
+
 /** Runs under the lock. An empty `ports` list removes the project's row. */
 export async function recordProjectHostServicePorts(
   env: NodeJS.ProcessEnv,

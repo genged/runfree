@@ -25,7 +25,7 @@ import {
 } from "../control/effective.ts";
 import { validateNetworkPolicy } from "@runfree/runtime-contracts/network-policy";
 import { hostServiceOwnerWarnings } from "../host-service-port-owner.ts";
-import { readHostServicePortRegistry, recordProjectHostServicePorts } from "../host-service-registry.ts";
+import { projectHasRegisteredHostServicePorts, recordedHostServiceOwners, recordProjectHostServicePorts } from "../host-service-registry.ts";
 import type { EffectiveHostServices } from "./probes.ts";
 import {
   composeManagedSessionVolumeLogicalNames,
@@ -1160,25 +1160,25 @@ async function prepareRuntimeForTokenSyncOrRemoveInvalid(
  * project with the effective ports. Never throws and never changes the
  * launch's own result -- the proxy's own enforcement, not this probe,
  * protects the agent.
+ *
+ * R15: a project that never used host services must not take the
+ * host-global registry lock on every launch, so the write is skipped unless
+ * there is something to record or an existing row needs pruning.
  */
 async function refreshHostServicesAtLaunch(context: RuntimeContext, io: RuntimeIO): Promise<void> {
   try {
     const effectivePolicy = readActiveEffectiveControl(context.project)?.policy;
     const hostServices = effectivePolicy ? validateNetworkPolicy(effectivePolicy).hostServices : {};
     const env = context.env ?? process.env;
+    const projectId = projectHash(context.projectRoot);
     if (Object.keys(hostServices).length > 0) {
-      const projectId = projectHash(context.projectRoot);
-      const recorded = new Map<number, string>();
-      const registryRead = readHostServicePortRegistry(env);
-      if (registryRead.ok) {
-        for (const [port, owner] of registryRead.owners) {
-          if (owner.projectId === projectId && owner.command !== undefined) recorded.set(port, owner.command);
-        }
-      }
+      const recorded = recordedHostServiceOwners(env, projectId);
       for (const line of hostServiceOwnerWarnings(context, io, hostServices, recorded)) warn(line);
     }
     const ports = Array.from(new Set(Object.values(hostServices).map((entry) => entry.port))).sort((left, right) => left - right);
-    await recordProjectHostServicePorts(env, { id: projectHash(context.projectRoot), root: context.projectRoot }, ports);
+    if (ports.length > 0 || projectHasRegisteredHostServicePorts(env, projectId)) {
+      await recordProjectHostServicePorts(env, { id: projectId, root: context.projectRoot }, ports);
+    }
   } catch (error) {
     warn(`host-service re-check failed: ${error instanceof Error ? error.message : String(error)}`);
   }

@@ -4417,6 +4417,54 @@ describe("runtime command flow", () => {
       expect(hostServiceRecheckEvents.events.indexOf("probe"))
         .toBeLessThan(hostServiceRecheckEvents.events.lastIndexOf("lock"));
     });
+
+    // Controller ruling R15: a project that never used host services must
+    // not take the host-global registry lock on every launch. Proven
+    // behaviorally (not by spying on the write function): neither the
+    // registry file nor its lock directory may exist on disk afterward.
+    test("a project with no host services and no existing registry row makes no registry write and takes no lock", async () => {
+      const projectRoot = path.join(tmp, "project");
+      const project = prepareProject(projectRoot);
+      const context = {
+        projectRoot,
+        project,
+        runtimeRoot: path.join(tmp, "runtime"),
+        env: { PATH: "/fake-bin", XDG_STATE_HOME: path.join(tmp, "xdg-state") },
+        network: fixedNetwork,
+      } satisfies RuntimeContext;
+      const io = createRuntimeIO();
+
+      expect((await startRuntime(context, io, false, { launch: true })).status).toBe(0);
+
+      const registryStateRoot = path.join(context.env.XDG_STATE_HOME, "runfree");
+      expect(fs.existsSync(path.join(registryStateRoot, "host-service-ports.json"))).toBe(false);
+      expect(fs.existsSync(path.join(registryStateRoot, "host-service-ports.lock"))).toBe(false);
+    });
+
+    // The other half of R15's "or": a project with no *effective* host
+    // services but a stale registry row (left behind, for example, by
+    // removing `hostServices` outside `host-service remove`) must still get
+    // the write that prunes it.
+    test("a project with no host services but a stale registry row still gets pruned", async () => {
+      const projectRoot = path.join(tmp, "project");
+      const project = prepareProject(projectRoot);
+      const context = {
+        projectRoot,
+        project,
+        runtimeRoot: path.join(tmp, "runtime"),
+        env: { PATH: "/fake-bin", XDG_STATE_HOME: path.join(tmp, "xdg-state") },
+        network: fixedNetwork,
+      } satisfies RuntimeContext;
+      const projectId = projectHash(projectRoot);
+      await recordProjectHostServicePorts(context.env, { id: projectId, root: projectRoot }, [10882]);
+      const io = createRuntimeIO();
+
+      expect((await startRuntime(context, io, false, { launch: true })).status).toBe(0);
+
+      const registry = readHostServicePortRegistry(context.env);
+      if (!registry.ok) throw new Error(registry.reason);
+      expect(registry.owners.has(10882)).toBe(false);
+    });
   });
 
   describe("host-service port registry pruning at destroy (design \"Policy shape\", HS7)", () => {

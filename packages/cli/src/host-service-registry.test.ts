@@ -6,7 +6,9 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
 import {
+  projectHasRegisteredHostServicePorts,
   readHostServicePortRegistry,
+  recordedHostServiceOwners,
   recordProjectHostServicePorts,
   registeredHostServicePortRefusal,
   removeProjectHostServicePorts,
@@ -198,6 +200,48 @@ describe("removeProjectHostServicePorts", () => {
     await removeProjectHostServicePorts(env, PROJECT_A_ID);
     const read = readHostServicePortRegistry(env);
     expect(read.ok).toBe(true);
+  });
+});
+
+describe("recordedHostServiceOwners", () => {
+  test("collects only this project's ports that have a recorded command", async () => {
+    await recordProjectHostServicePorts(env, { id: PROJECT_A_ID, root: PROJECT_A_ROOT }, [10882, 10883], { 10882: "idb_companion" });
+    await recordProjectHostServicePorts(env, { id: PROJECT_B_ID, root: PROJECT_B_ROOT }, [10884], { 10884: "other_service" });
+
+    const recorded = recordedHostServiceOwners(env, PROJECT_A_ID);
+    expect(recorded).toEqual(new Map([[10882, "idb_companion"]]));
+  });
+
+  test("is empty for a project with no row", () => {
+    expect(recordedHostServiceOwners(env, PROJECT_A_ID)).toEqual(new Map());
+  });
+
+  test("is empty, never throws, when the registry is unreadable", () => {
+    fs.mkdirSync(stateRoot(), { recursive: true });
+    fs.writeFileSync(registryFile(), "not json");
+    expect(recordedHostServiceOwners(env, PROJECT_A_ID)).toEqual(new Map());
+  });
+});
+
+describe("projectHasRegisteredHostServicePorts", () => {
+  test("true for a project with a registered port, even with no recorded command", async () => {
+    await recordProjectHostServicePorts(env, { id: PROJECT_A_ID, root: PROJECT_A_ROOT }, [10882]);
+    expect(projectHasRegisteredHostServicePorts(env, PROJECT_A_ID)).toBe(true);
+  });
+
+  test("false for a project with no row", async () => {
+    await recordProjectHostServicePorts(env, { id: PROJECT_B_ID, root: PROJECT_B_ROOT }, [10883]);
+    expect(projectHasRegisteredHostServicePorts(env, PROJECT_A_ID)).toBe(false);
+  });
+
+  test("false for an empty registry", () => {
+    expect(projectHasRegisteredHostServicePorts(env, PROJECT_A_ID)).toBe(false);
+  });
+
+  test("false, never throws, when the registry is unreadable", () => {
+    fs.mkdirSync(stateRoot(), { recursive: true });
+    fs.writeFileSync(registryFile(), "not json");
+    expect(projectHasRegisteredHostServicePorts(env, PROJECT_A_ID)).toBe(false);
   });
 });
 

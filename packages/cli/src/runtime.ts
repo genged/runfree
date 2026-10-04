@@ -26,7 +26,7 @@ import {
 } from "./control/workflow.ts";
 import { die } from "./errors.ts";
 import { hostServiceOwnerWarnings, probeHostPortOwner } from "./host-service-port-owner.ts";
-import { readHostServicePortRegistry, removeProjectHostServicePorts } from "./host-service-registry.ts";
+import { recordedHostServiceOwners, removeProjectHostServicePorts } from "./host-service-registry.ts";
 import { composeProjectName, projectHash, runtimeEnvironment } from "./runtime/env.ts";
 import { resumeInterruptedSessionThroughAdmission } from "./runtime/session-admission-resume.ts";
 import { removeWarmProofRecord } from "./runtime/warm-proof.ts";
@@ -996,13 +996,7 @@ function printHostServiceStatusLine(context: RuntimeContext, io: RuntimeIO): voi
     if (names.length === 0) return;
     const env = context.env ?? process.env;
     const projectId = projectHash(context.projectRoot);
-    const recorded = new Map<number, string>();
-    const registryRead = readHostServicePortRegistry(env);
-    if (registryRead.ok) {
-      for (const [port, owner] of registryRead.owners) {
-        if (owner.projectId === projectId && owner.command !== undefined) recorded.set(port, owner.command);
-      }
-    }
+    const recorded = recordedHostServiceOwners(env, projectId);
     const summaries = [...names].sort().map((name) => {
       const entry = hostServices[name];
       const owner = probeHostPortOwner(context, io, entry.port);
