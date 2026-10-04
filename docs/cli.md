@@ -95,7 +95,7 @@ Created project files include:
 | `runfree resume --list` / `--json` | Inspect the current project's bounded recovery inventory offline without contacting Docker. |
 | `runfree resume --all` | Include interrupted work from every Runfree project; composes with `--list` or `--json`. |
 | `runfree resume --agent <agent>` | Include only one agent ID such as `claude` or `codex`; repeat the option to select a union. |
-| `runfree status` | List containers, desired/effective runtime component identities and upgrade action, audit state, and the proxy's session files with, for each, either `served until <aliveUntil>` or `on disk, not served (<reason>)`. |
+| `runfree status` | List containers, desired/effective runtime component identities and upgrade action, audit state, and the proxy's session files with, for each, either `served until <aliveUntil>` or `on disk, not served (<reason>)`. With approved [host services](#host-services), it also lists each one with its current listener and warns about drift. |
 | `runfree resources` | List Runfree Docker resources for this project. |
 | `runfree logs proxy` | Follow proxy logs. Use `--verbose` for sanitized allowed request metadata. |
 | `runfree runtime reload-policy [--force]` | Reload runtime policy and sync proxy-managed tokens. Refuses under the same conditions as `runfree stop` unless `--force` is given; a restarted proxy republishes session eligibility and the per-session heartbeats refill its session files. |
@@ -187,6 +187,58 @@ runfree doctor --post-failure
 ```
 
 `doctor` summarizes structured proxy denial events and suggests exact host add or rule-widening commands.
+
+## Host Services
+
+```bash
+runfree host-service add <name> --port <port>
+runfree host-service add <name> --port <port> --local
+runfree host-service remove <name>
+runfree host-service list
+runfree host-service list --repair
+```
+
+A host service lets the agent reach a TCP service on the host's loopback
+(`127.0.0.1:<port>`) through the proxy. For example, to let an unmodified
+`idb` client in the agent drive `idb_companion` on the Mac:
+
+```bash
+# on the host, with idb_companion listening on 127.0.0.1:10882
+runfree host-service add idb --port 10882
+```
+
+Then, in a new session:
+
+```bash
+idb connect 127.0.0.1 10882
+```
+
+- `add` writes a `hostServices` entry to the desired policy (`--local` for the
+  checkout-local layer) and approves it. The name matches
+  `[a-z][a-z0-9-]{0,62}`; the agent-facing name is
+  `<name>.runfree.internal`, which the agent never needs to use.
+- Before any policy write, `add` refuses these ports: 2375 and 2376 (Docker
+  Engine), 3128, 5901 (Runfree's VNC default), and 47100–48099 (Runfree's MCP
+  callback block). It then runs `lsof` and refuses a port with no visible
+  listener or with any listener owned by Docker Desktop (`com.docker.*`, a
+  published container port). The output names the process and pid you
+  approved.
+- Each new session starts a relay on `127.0.0.1:<port>` inside the session
+  for each approved service. A service added while a session runs appears in
+  the next session. `remove` cuts open connections at once in every session.
+- `list` prints the effective host services and who listens on each port now.
+  `runfree status` repeats that check and warns when the listener is gone,
+  changed, or owned by Docker Desktop.
+- An approved port is recorded in a host-global registry. `runfree forward`
+  and `runfree vnc` in any other project refuse it and name the owning
+  project. If the registry is corrupt, they refuse until
+  `runfree host-service list --repair` rebuilds it.
+- The tunnel is opaque: no request rules, write approval, or credential
+  injection apply, and the host service's own authentication is the only
+  check on what the agent does there. Access is per project. See
+  [Residual Risks](security.md#residual-risks).
+- If the proxy reports `gateway address changed`, host services stay refused
+  until `runfree rebuild`, which recreates the proxy and ends every session.
 
 ## Credentials
 

@@ -1,6 +1,6 @@
 SHELL := /bin/bash
 
-.PHONY: help test test-all test-release test-static test-unit test-agent test-proxy test-security test-templates test-cli-e2e test-cli-e2e-live test-runtime test-runtime-core test-runtime-extended test-runtime-smoke test-runtime-live test-runtime-live-topology test-runtime-live-managed-launch test-runtime-live-egress test-runtime-live-connect-guard test-runtime-live-request-shape test-runtime-live-audit test-runtime-live-allowlist test-runtime-live-policy-mutation test-runtime-live-mcp-enable test-runtime-live-helper-reclaim test-live-session-admission-docker-desktop test-live-session-admission-negative-docker-desktop test-live-session-admission-attached-docker-desktop test-live-session-renewal-docker-desktop test-live-session-independence-docker-desktop test-live-session-admission-crash-docker-desktop test-live-session-admission-drift-docker-desktop test-live-session-entry-gate-docker-desktop reclaim-runtime-sandbox reclaim-runtime-sandbox-apply test-watch
+.PHONY: help test test-all test-release test-static test-unit test-agent test-proxy test-security test-templates test-cli-e2e test-cli-e2e-live test-runtime test-runtime-core test-runtime-extended test-runtime-smoke test-runtime-live test-runtime-live-topology test-runtime-live-managed-launch test-runtime-live-egress test-runtime-live-connect-guard test-runtime-live-request-shape test-runtime-live-audit test-runtime-live-allowlist test-runtime-live-policy-mutation test-runtime-live-mcp-enable test-runtime-live-helper-reclaim test-runtime-live-host-service test-live-session-admission-docker-desktop test-live-session-admission-negative-docker-desktop test-live-session-admission-attached-docker-desktop test-live-session-renewal-docker-desktop test-live-session-independence-docker-desktop test-live-session-admission-crash-docker-desktop test-live-session-admission-drift-docker-desktop test-live-session-entry-gate-docker-desktop reclaim-runtime-sandbox reclaim-runtime-sandbox-apply test-watch
 
 help:
 	@printf '%s\n' \
@@ -24,6 +24,7 @@ help:
 		'  make test-runtime-live    Run the migrated non-admission live tranches only (TEST_RUNTIME_BACKEND, default docker-desktop)' \
 		'  make test-runtime-live-<tranche>  One migrated tranche: topology|managed-launch|egress|connect-guard|request-shape|audit|allowlist|policy-mutation|mcp-enable' \
 		'  make test-runtime-live-helper-reclaim  Ephemeral-helper tranche: bounded runs, exact-id reclaim, the pinned helper address' \
+		'  make test-runtime-live-host-service  Host-service tranche: relay reach, refusals, revocation cuts, gateway change and rebuild reclaim' \
 		'  make test-live-session-admission-docker-desktop  Run every standalone admission tranche on Docker Desktop' \
 		'  make test-live-session-admission-negative-docker-desktop  Negative refusal tranche only' \
 		'  make test-live-session-admission-attached-docker-desktop  Attached authority/consumer tranche only' \
@@ -286,6 +287,14 @@ test-runtime-live-mcp-enable:
 # path keeps the filter checked by scripts/check-test-inventory.ts.
 test-runtime-live-helper-reclaim:
 	TEST_RUNTIME_BACKEND=$(TEST_RUNTIME_BACKEND) pnpm exec vitest run --project runtime-live tests/runtime/live/ephemeral-helper-reclaim.live.test.ts
+
+# Approved host services only: the agent's loopback relay to a host echo
+# server, refused pairs and direct gateway paths, kernel set members,
+# cross-session reach, port admission and the host-global registry, revocation
+# with each cut proven where it can be staged, and the gateway-change refusal
+# reclaimed by rebuild. Its own fixture; core tier.
+test-runtime-live-host-service:
+	TEST_RUNTIME_BACKEND=$(TEST_RUNTIME_BACKEND) pnpm exec vitest run --project runtime-live tests/runtime/live/host-service.live.test.ts
 
 reclaim-runtime-sandbox:
 	tests/runtime/reclaim-sandbox-runtimes.sh
