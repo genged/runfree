@@ -18,16 +18,23 @@
 // fresh one after it succeeds. `runfree up` always takes the full path.
 //
 // What a match does not re-run (accepted, with its inputs bound): the
-// agent-position deny-probe helper, the proxy server-UID denial batch, and the
-// root Docker DNS liveness probe. Their results are functions of the network
-// and its participants, the proxy instance and image, the ruleset shape, the
+// agent-position deny-probe helper (with its host gateway port probes), the
+// proxy server-UID denial batch, the proxy-position host gateway probes, and
+// the root Docker DNS liveness probe. Their results are functions of the
+// network and its participants, the proxy instance and image, the ruleset
+// shape, the `@host_service` members (which carry the pinned gateway), the
 // agent image, and the daemon, all of which are in the fingerprint.
 
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 
-import { firewallStatusPath, parseGenerationStatusLine } from "@runfree/runtime-contracts/proxy-status";
+import {
+  firewallStatusPath,
+  hostServiceEntryKey,
+  parseGenerationStatusLine,
+  sortHostServiceEntries,
+} from "@runfree/runtime-contracts/proxy-status";
 
 import { stableJson } from "../strict-primitives.ts";
 import { exactKeySet, isRecord } from "../strict-primitives.ts";
@@ -39,7 +46,16 @@ import { dockerClientEnvOptions, type DockerDaemonIdentity } from "./docker.ts";
 import { composeProjectName } from "./env.ts";
 import { launchHostRecordPath, readLaunchHostRecord, removeLaunchHostRecord, writeLaunchHostRecord } from "./launch-host-record.ts";
 import type { ActiveRuntimePlan } from "./plan.ts";
-import { firewallSectionBatchScript, parseFirewallSectionBatch, type FirewallSectionResult } from "./probes.ts";
+import {
+  firewallSectionBatchScript,
+  parseFirewallSectionBatch,
+  PROXY_ETC_HOSTS_STAT_COMMAND,
+  PROXY_HOST_SERVICE_GATEWAY_COMMAND,
+  PROXY_HOST_SERVICE_SET_COMMAND,
+  type EffectiveHostServices,
+  type FirewallSectionResult,
+} from "./probes.ts";
+import { parseHostServiceSetMembers } from "../proxy-nftables-proof.ts";
 import {
   createRuntimeSecurityContract,
   parseRuntimeSecurityContractProbe,
@@ -98,6 +114,12 @@ export type WarmProofFacts = Readonly<{
   agentCaBundleSha256: string;
   markerSha256: string;
   nftShapeSha256: string;
+  /**
+   * The kernel `@host_service` members (`<ip> . <port>`, canonical order).
+   * The shape hash drops set members, so these are bound on their own: they
+   * carry the pinned gateway the skipped gateway port probes would target.
+   */
+  hostServiceMembers: readonly string[];
 }>;
 
 type WarmProofRecordV1 = Readonly<{ version: 1; facts: WarmProofFacts; writtenAt: string }>;
@@ -106,7 +128,7 @@ const FACT_KEYS = [
   "projectId", "composeProject", "daemon", "bootId", "proxy", "networks", "participants", "volumes",
   "agentImageId", "controlPlaneGenerationDigest", "controlPlaneMaterializationDigest", "securityContractHash",
   "effectivePolicyGeneration", "gitLayoutSha256", "proxyCaCertSha256", "agentCaBundleSha256", "markerSha256",
-  "nftShapeSha256",
+  "nftShapeSha256", "hostServiceMembers",
 ] as const satisfies readonly (keyof WarmProofFacts)[];
 
 export type WarmProofInput = Readonly<{
@@ -122,6 +144,8 @@ export type WarmProofInput = Readonly<{
   volumeLogicalNames: readonly string[];
   /** `serializeGitLayoutPlan` of the plan's layout. */
   gitLayout: string;
+  /** The effective policy's host services; the warm topology judges `@host_service` against them. */
+  effectiveHostServices: EffectiveHostServices;
 }>;
 
 export type WarmValidation = Readonly<{
@@ -204,6 +228,9 @@ function warmBatchCommands(plan: ActiveRuntimePlan, securityProbe: string): stri
     `sh -c ${quoted}`,
     "cat /proc/sys/kernel/random/boot_id",
     `node -e ${`'${listIpAssignmentsScript().replaceAll("'", "'\\''")}'`}`,
+    PROXY_HOST_SERVICE_SET_COMMAND,
+    PROXY_HOST_SERVICE_GATEWAY_COMMAND,
+    PROXY_ETC_HOSTS_STAT_COMMAND,
   ];
 }
 
@@ -316,8 +343,10 @@ type WarmJudgement =
 function judgeWarmObservation(input: WarmProofInput, observation: WarmObservation): WarmJudgement {
   const invalid = (field: string): WarmJudgement => Object.freeze({ kind: "invalid", field });
   const { plan, effective } = input;
-  const [uid, routeInternal, routeEgress, capBnd, nftTable, allowedSet, marker, firewallStatus, securityProbe, bootId, ipAssignments] =
-    observation.sections as FirewallSectionResult[];
+  const [
+    uid, routeInternal, routeEgress, capBnd, nftTable, allowedSet, marker, firewallStatus, securityProbe, bootId, ipAssignments,
+    hostServiceSet, hostServiceGateway, etcHostsStat,
+  ] = observation.sections as FirewallSectionResult[];
   if (uid.exit !== 0 || uid.body.trim() !== "0") return invalid("batch-identity");
   const daemon = input.daemon;
   if (!daemon) return invalid("daemon");
@@ -347,11 +376,19 @@ function judgeWarmObservation(input: WarmProofInput, observation: WarmObservatio
     participants: observation.participants,
     egressNetwork: observation.egressNetwork,
     capBnd,
-    firewall: Object.freeze({ routes: [routeInternal, routeEgress], nftTable, allowedSet }),
+    firewall: Object.freeze({
+      routes: [routeInternal, routeEgress],
+      nftTable,
+      allowedSet,
+      hostServiceSet,
+      hostServiceGateway,
+      etcHostsStat,
+    }),
   });
   const topology = validateRuntimeTopologyWithProof(plan, input.io, {
     warmEvidence,
     expectedProxyId: effective.proxyContainerId,
+    effectiveHostServices: input.effectiveHostServices,
   });
   for (const issue of topology.issues) topologyIssues.push(issue.message);
   const deny: DenyByDefaultObservationV1 | undefined = topology.denyByDefaultBaseObservation;
@@ -384,6 +421,10 @@ function judgeWarmObservation(input: WarmProofInput, observation: WarmObservatio
 
   const nftShape = nftRulesetShapeSha256(nftTable.body);
   if (!nftShape) return invalid("nft-shape");
+  // The warm topology above already required these members to equal the
+  // effective host services at the published gateway.
+  const hostServiceMembers = hostServiceSet.exit === 0 ? parseHostServiceSetMembers(hostServiceSet.body) : undefined;
+  if (!hostServiceMembers) return invalid("host-service-set");
 
   const project = composeProjectName(input.context.projectRoot);
   const volumes: WarmProofFacts["volumes"][number][] = [];
@@ -449,6 +490,7 @@ function judgeWarmObservation(input: WarmProofInput, observation: WarmObservatio
     agentCaBundleSha256,
     markerSha256: sha256(marker.body),
     nftShapeSha256: nftShape,
+    hostServiceMembers: Object.freeze(sortHostServiceEntries(hostServiceMembers).map(hostServiceEntryKey)),
   });
   const validation = Object.freeze({
     runtimeProof: markerProof.proof,

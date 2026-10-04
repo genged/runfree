@@ -20,7 +20,9 @@ import {
   effectiveControlSelectionForGeneration,
   readActiveControlSelection,
   readConvergedPolicyReceipt,
+  readEffectiveHostServices,
 } from "../control/effective.ts";
+import type { EffectiveHostServices } from "./probes.ts";
 import {
   composeManagedSessionVolumeLogicalNames,
   emptyDependencyOverlayPlan,
@@ -732,6 +734,8 @@ export function validateRuntimeTopologyOrRemoveInvalid(
     helperFence?: EphemeralHelperFence;
     helperImage?: string;
     readOnly?: boolean;
+    /** The host services of the effective policy generation the firewall readiness check waited for. */
+    effectiveHostServices?: EffectiveHostServices;
   } = {},
 ): { denyByDefaultObservation?: DenyByDefaultObservationV1; status: number; failureKind?: RuntimeFailureKind } {
   let boundaryViolated = false;
@@ -742,6 +746,7 @@ export function validateRuntimeTopologyOrRemoveInvalid(
     expectedProxyId: options.expectedProxyId,
     helperFence: options.helperFence,
     helperImage: options.helperImage,
+    ...(options.effectiveHostServices ? { effectiveHostServices: options.effectiveHostServices } : {}),
   });
   let validation = validate();
   if (validation.issues.length > 0 && reclaimDeadCallbackRoutes(plan, context, io, options)) {
@@ -1102,9 +1107,21 @@ async function prepareRuntimeForTokenSyncOrRemoveInvalid(
     warn(error instanceof Error ? error.message : String(error));
     return { status: 1, failureKind: error instanceof RuntimeObservationError ? error.evidence.kind : "unclassified" };
   }
+  // The host services the firewall proof judges `@host_service` against come
+  // from the same effective policy generation readiness waited for. An
+  // unreadable generation refuses: the proof never assumes "none".
+  let effectiveHostServices: EffectiveHostServices;
+  try {
+    effectiveHostServices = readEffectiveHostServices(context.project, readinessPolicy.controlGeneration);
+  } catch (error) {
+    warn(`effective host services could not be read: ${error instanceof Error ? error.message : String(error)}; new authority was refused`);
+    return { status: 1 };
+  }
   const validation = timings.time(
     "validation:topology",
-    () => validateRuntimeTopologyOrRemoveInvalid(activePlan, validationContext, io, docker, { ...options, expectedProxyId: readinessProxyId, helperFence, helperImage }),
+    () => validateRuntimeTopologyOrRemoveInvalid(activePlan, validationContext, io, docker, {
+      ...options, expectedProxyId: readinessProxyId, helperFence, helperImage, effectiveHostServices,
+    }),
   );
   if (validation.status !== 0) return validation;
   reportRuntimeProgress("validating runtime security contract", options.verbose);
@@ -1456,6 +1473,13 @@ export async function startRuntime(
       const effective = readEffectiveControlPlaneV2(activePlan.paths.stateDir);
       const policy = readActiveControlSelection(context.project);
       if (!effective || !policy) return undefined;
+      let effectiveHostServices: EffectiveHostServices;
+      try {
+        effectiveHostServices = readEffectiveHostServices(context.project, policy.controlGeneration);
+      } catch {
+        // Unreadable host services: no warm path; the full validation refuses.
+        return undefined;
+      }
       return {
         plan: activePlan,
         context: activeContext,
@@ -1466,6 +1490,7 @@ export async function startRuntime(
         agentImage: ephemeralHelperImage(activePlan),
         volumeLogicalNames: composeManagedSessionVolumeLogicalNames(activeContext),
         gitLayout: serializeGitLayoutPlan(activePlan.gitLayout),
+        effectiveHostServices,
       };
     };
     // Why this start may not even ask the warm proof, or undefined when it may.

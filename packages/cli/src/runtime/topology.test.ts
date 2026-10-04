@@ -10,6 +10,7 @@ import {
   validateRuntimeTopology,
 } from "./topology.ts";
 import { NON_RESOLVING_CONNECT_PROBE_HOST } from "./probes.ts";
+import { proxyHostServiceSetJson } from "../proxy-nftables-proof.fixture.ts";
 import { PROJECT_ID_LABEL } from "./constants.ts";
 import type { ActiveRuntimePlan } from "./plan.ts";
 import {
@@ -28,6 +29,11 @@ function captureResult(status: number, stdout = "", stderr = ""): CaptureResult 
   return { status, stdout, stderr };
 }
 
+// The proxy's one ExtraHosts entry, as compose.yaml writes it.
+const GATEWAY_ALIAS_EXTRA_HOST = "gateway.runfree.internal:host-gateway";
+const HOST_SERVICE_POLICY_GENERATION = `sha256:${"c".repeat(64)}`;
+const HOST_GATEWAY = "192.168.65.254";
+
 test("topology assertion inventory covers the current security checks", () => {
   expect(REQUIRED_TOPOLOGY_ASSERTIONS.map((entry) => entry.code).sort()).toEqual([
     "agent-container-exists",
@@ -36,6 +42,7 @@ test("topology assertion inventory covers the current security checks", () => {
     "agent-direct-tcp-denied",
     "agent-gateway-reachability-denied",
     "agent-host-gateway-denied",
+    "agent-host-gateway-port-denied",
     "agent-host-ports-denied",
     "agent-ip-matches-plan",
     "agent-net-admin-dropped",
@@ -54,6 +61,7 @@ test("topology assertion inventory covers the current security checks", () => {
     "proxy-egress-ip-matches-plan",
     "proxy-egress-network-subnet",
     "proxy-egress-route",
+    "proxy-extra-hosts-exact",
     "proxy-fixed-agent-ingress",
     "proxy-net-admin-shape",
     "proxy-net-raw-dropped",
@@ -124,7 +132,7 @@ function participantTopologyFixture(extraParticipants: Record<string, unknown>[]
     projectRoot,
   } as unknown as ActiveRuntimePlan;
   const proxy = {
-    HostConfig: { NetworkMode: internalNetwork, PortBindings: {} },
+    HostConfig: { ExtraHosts: [GATEWAY_ALIAS_EXTRA_HOST], NetworkMode: internalNetwork, PortBindings: {} },
     Id: "proxy-id",
     Name: `/${proxyName}`,
     NetworkSettings: {
@@ -283,7 +291,7 @@ test("the non-443 CONNECT probe targets a reserved non-resolving host, never a p
       runtimeRoot: "/runtime",
     } as unknown as RuntimeContext;
     const proxy = {
-      HostConfig: { CapAdd: ["NET_ADMIN"], CapDrop: ["NET_RAW"], NetworkMode: internalNetwork, PortBindings: {} },
+      HostConfig: { ExtraHosts: [GATEWAY_ALIAS_EXTRA_HOST], CapAdd: ["NET_ADMIN"], CapDrop: ["NET_RAW"], NetworkMode: internalNetwork, PortBindings: {} },
       Id: "proxy-id",
       Name: `/${project}-proxy-1`,
       NetworkSettings: {
@@ -356,7 +364,17 @@ function denyProbeBatchPlanFixture(
     containers?: Record<string, { Name?: string; IPv4Address?: string }>;
     ipam?: { Config: Array<{ Gateway?: string; Subnet?: string }> };
   } = {},
-  fixtureOptions: { fence?: boolean } = {},
+  fixtureOptions: {
+    fence?: boolean;
+    /**
+     * Effective host services handed to the validator. The proxy's root batch
+     * then publishes `gateway` (or withholds it when null) and a matching
+     * `@host_service`, and the proxy-position gateway probes all exit
+     * `proxyGatewayProbeExit` (default 1, denied).
+     */
+    hostServices?: { ports: number[]; gateway: string | null };
+    proxyGatewayProbeExit?: number;
+  } = {},
 ) {
   const projectRoot = "/workspace/project";
   const projectId = projectHash(projectRoot);
@@ -407,7 +425,7 @@ function denyProbeBatchPlanFixture(
     runtimeDigest: "sha256:test",
   } as unknown as ActiveRuntimePlan;
   const proxy = {
-    HostConfig: { CapAdd: ["NET_ADMIN"], CapDrop: ["NET_RAW"], NetworkMode: internalNetwork, PortBindings: {} },
+    HostConfig: { ExtraHosts: [GATEWAY_ALIAS_EXTRA_HOST], CapAdd: ["NET_ADMIN"], CapDrop: ["NET_RAW"], NetworkMode: internalNetwork, PortBindings: {} },
     Id: "proxy-id",
     Name: `/${proxyName}`,
     NetworkSettings: {
@@ -420,6 +438,7 @@ function denyProbeBatchPlanFixture(
     State: { Running: true },
   };
   const helperRuns: string[][] = [];
+  const proxyGatewayExecs: string[][] = [];
   const io: RuntimeIO = {
     admin: () => Promise.resolve(0),
     capture(command, args) {
@@ -454,12 +473,42 @@ function denyProbeBatchPlanFixture(
         }]));
       }
       if (text.includes("CapBnd")) return captureResult(0, "0000000000001000\n");
+      const hostServices = fixtureOptions.hostServices;
+      if (hostServices && args[0] === "exec" && text.includes("RUNFREE_FIREWALL_SECTION") && text.includes("allowed_ipv4")) {
+        const gateway = hostServices.gateway;
+        const members = gateway === null ? [] : hostServices.ports.map((port) => ({ ip: gateway, port }));
+        return captureResult(0, `${[
+          { exit: 0, body: "set allowed_ipv4" },
+          { exit: 0, body: "" },
+          { exit: 0, body: proxyHostServiceSetJson(members) },
+          {
+            exit: 0,
+            body: JSON.stringify({
+              schemaVersion: 1,
+              policyGeneration: HOST_SERVICE_POLICY_GENERATION,
+              ...(gateway === null ? { unavailableReason: "host-service gateway not pinned" } : { gatewayIp: gateway }),
+              writtenAt: "2026-10-04T00:00:00.000Z",
+            }),
+          },
+          { exit: 0, body: "0 81a4" },
+        ].map((section, index) => `RUNFREE_FIREWALL_SECTION ${index} exit=${section.exit}\n${section.body}\nRUNFREE_FIREWALL_SECTION_END ${index}`).join("\n")}\n`);
+      }
+      if (hostServices && args[0] === "exec" && text.includes("RUNFREE_DENY_PROBE")) {
+        proxyGatewayExecs.push([...args]);
+        const script = args.at(-1) ?? "";
+        const probes = [...script.matchAll(/runfree_pid_(\d+)=\$!/g)].length;
+        return captureResult(0, `${Array.from({ length: probes }, (_, index) =>
+          `RUNFREE_DENY_PROBE ${index} exit=${fixtureOptions.proxyGatewayProbeExit ?? 1}`).join("\n")}\n`);
+      }
       return captureResult(0);
     },
     commandExists: () => true,
     confirm: () => true,
     run: () => 0,
   };
+  const effectiveHostServices = fixtureOptions.hostServices
+    ? { effectiveHostServices: { policyGeneration: HOST_SERVICE_POLICY_GENERATION, ports: fixtureOptions.hostServices.ports } }
+    : {};
   // `boundaryViolated` is the escalation side channel `startup.ts` routes on: a
   // probe that observed a real confinement hole contains the validation proxy
   // and fails as `boundary-violation`, while a probe that could not run fails
@@ -476,12 +525,14 @@ function denyProbeBatchPlanFixture(
   };
   return {
     helperRuns,
+    proxyGatewayExecs,
     observed,
     run: () => validateRuntimeTopology(plan, io, {
       onBoundaryViolation: () => { observed.boundaryViolated = true; },
       helperFence,
+      ...effectiveHostServices,
     }).map((issue) => issue.code),
-    messages: () => validateRuntimeTopology(plan, io, { helperFence }).map((issue) => issue.message),
+    messages: () => validateRuntimeTopology(plan, io, { helperFence, ...effectiveHostServices }).map((issue) => issue.message),
   };
 }
 
@@ -658,4 +709,97 @@ test("an exhausted helper block refuses without docker run, and a freed address 
   const [helper] = freed.helperRuns;
   expect(helper[helper.indexOf("--ip") + 1]).toBe("172.30.0.16");
   for (const code of DENY_PROBE_CODES) expect(codes).not.toContain(code);
+});
+
+// SR17: the proxy's ExtraHosts is exactly the daemon-sourced gateway alias.
+test("a changed, extra, or missing proxy ExtraHosts entry refuses, and the template entry passes", () => {
+  const extraHostsCodes = (extraHosts: string[] | undefined) => {
+    const fixture = participantTopologyFixture([]);
+    (fixture.proxy.HostConfig as { ExtraHosts?: string[] }).ExtraHosts = extraHosts;
+    return validateRuntimeTopology(fixture.context, fixture.io).filter((issue) => issue.code === "proxy-extra-hosts-exact");
+  };
+
+  for (const refused of [
+    undefined,
+    [],
+    ["gateway.runfree.internal:192.168.65.254"],
+    ["gateway.runfree.internal:host-gateway", "host.docker.internal:host-gateway"],
+    ["other.runfree.internal:host-gateway"],
+  ]) {
+    const issues = extraHostsCodes(refused);
+    expect(issues).toHaveLength(1);
+    expect(issues[0]?.message).toContain("proxy ExtraHosts must be exactly gateway.runfree.internal:host-gateway");
+    expect(issues[0]?.message).toContain("runfree rebuild");
+  }
+  // Reclaim: a proxy recreated from the template carries exactly the entry.
+  expect(extraHostsCodes(["gateway.runfree.internal:host-gateway"])).toEqual([]);
+});
+
+function gatewayPortProbeIndex(script: string, port: number): number | undefined {
+  const line = script.split("\n").find((entry) => entry.includes(`/dev/tcp/${HOST_GATEWAY}/${port}`));
+  const match = line ? /runfree_pid_(\d+)=\$!/.exec(line) : null;
+  return match ? Number(match[1]) : undefined;
+}
+
+test("the agent-position helper probes every approved port at the published gateway", () => {
+  let helperScript = "";
+  const fixture = denyProbeBatchPlanFixture((script) => {
+    helperScript = script;
+    return allDeniedBatch(script);
+  }, {}, { hostServices: { ports: [5432, 10882], gateway: HOST_GATEWAY } });
+  const codes = fixture.run();
+
+  expect(fixture.helperRuns).toHaveLength(1);
+  expect(gatewayPortProbeIndex(helperScript, 5432)).toBeDefined();
+  expect(gatewayPortProbeIndex(helperScript, 10882)).toBeDefined();
+  expect(codes).not.toContain("agent-host-gateway-port-denied");
+  // The proxy-position probes ran too: uid 1001 and root, one exec each.
+  expect(fixture.proxyGatewayExecs.map((args) => args.slice(0, 3))).toEqual([
+    ["exec", "--user", "1001:1001"],
+    ["exec", "--user", "0:0"],
+  ]);
+});
+
+test("an approved gateway port reached from the agent position fails with its own code and contains the proxy", () => {
+  const fixture = denyProbeBatchPlanFixture((script) => {
+    const reached = gatewayPortProbeIndex(script, 5432);
+    const probes = [...script.matchAll(/runfree_pid_(\d+)=\$!/g)].length;
+    return captureResult(0, `${Array.from({ length: probes }, (_, index) =>
+      `RUNFREE_DENY_PROBE ${index} exit=${index === reached ? 0 : 1}`).join("\n")}\n`);
+  }, {}, { hostServices: { ports: [5432], gateway: HOST_GATEWAY } });
+  const messages = fixture.messages();
+  const codes = fixture.run();
+
+  expect(messages).toContain("agent-position host gateway port 5432 unexpectedly succeeded");
+  expect(codes).toContain("agent-host-gateway-port-denied");
+  expect(codes).not.toContain("agent-direct-tcp-denied");
+  expect(fixture.observed.boundaryViolated).toBe(true);
+});
+
+test("a gateway port reached from the proxy position maps to the gateway port code", () => {
+  const fixture = denyProbeBatchPlanFixture(allDeniedBatch, {}, {
+    hostServices: { ports: [5432], gateway: HOST_GATEWAY },
+    proxyGatewayProbeExit: 0,
+  });
+  const messages = fixture.messages();
+  const codes = fixture.run();
+
+  expect(messages).toContain("proxy-position server UID host gateway unapproved port 9 unexpectedly succeeded");
+  expect(messages).toContain("proxy-position root host gateway port 5432 unexpectedly succeeded");
+  expect(codes).toContain("agent-host-gateway-port-denied");
+  expect(fixture.observed.boundaryViolated).toBe(true);
+});
+
+test("with the gateway withheld no gateway port is probed from either position", () => {
+  let helperScript = "";
+  const fixture = denyProbeBatchPlanFixture((script) => {
+    helperScript = script;
+    return allDeniedBatch(script);
+  }, {}, { hostServices: { ports: [5432], gateway: null } });
+  const codes = fixture.run();
+
+  expect(fixture.helperRuns).toHaveLength(1);
+  expect(helperScript).not.toContain("/dev/tcp/192.168.65.254");
+  expect(fixture.proxyGatewayExecs).toEqual([]);
+  expect(codes).not.toContain("agent-host-gateway-port-denied");
 });

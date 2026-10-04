@@ -417,6 +417,23 @@ export function readActiveEffectiveControl(project: ProjectInfo): EffectivePolic
   };
 }
 
+/**
+ * The host services of one verified effective policy generation: its network
+ * policy generation and the approved ports, sorted. The host-side firewall
+ * proof pairs these ports with the gateway the proxy published.
+ */
+export function readEffectiveHostServices(
+  project: ProjectInfo,
+  controlGeneration: string,
+): { policyGeneration: string; ports: number[] } {
+  const verified = verifyEffectivePolicyGeneration(project, controlGeneration);
+  const policy = validateNetworkPolicy(parseStrictJson(regularContents(verified.proxyDirectory, "network-policy.json")));
+  return {
+    policyGeneration: verified.policyGeneration,
+    ports: Array.from(new Set(Object.values(policy.hostServices).map((entry) => entry.port))).sort((left, right) => left - right),
+  };
+}
+
 export function effectiveControlSelectionForGeneration(
   project: ProjectInfo,
   controlGeneration: string,
