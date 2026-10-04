@@ -84,7 +84,7 @@ import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import { runfreeStateRoot } from "../../../packages/cli/src/paths.ts";
 import { refusedHostServicePortReason } from "../../../packages/runtime-contracts/src/host-services.ts";
 import { cliEntryArgv } from "../../support/prebuilt-entry.ts";
-import { composeProjectName, composeServiceContainerId, docker, dockerOrThrow } from "./docker.ts";
+import { composeProjectName, composeServiceContainerId, docker, dockerOrThrow, waitUntil } from "./docker.ts";
 import {
   describeOutput,
   destroyLiveFixture,
@@ -308,11 +308,17 @@ function sessionRawConnect(sessionId: string, proxyIp: string, authority: string
   }
 }
 
-/** A long-lived relay client driven over stdin: one line out per line in. */
+/**
+ * A long-lived relay client driven over stdin: one line out per line in.
+ * argv[3] is a kill marker: never read, present only so this exact process
+ * can be found and killed by its argv (see \`killMarkedProcess\`) — a bare
+ * \`child.kill()\` on the host-side \`docker exec\` CLI leaves this process,
+ * and its open socket, running inside the container.
+ */
 const LONG_LIVED_CLIENT_PROGRAM = `
 const net = require("node:net");
 const port = Number(process.argv[1]);
-const socket = net.connect({ host: process.argv[2] || "127.0.0.1", port });
+const socket = net.connect({ host: process.argv[2], port });
 let incoming = "";
 let outgoing = "";
 socket.on("connect", () => console.log("connected"));
@@ -338,8 +344,16 @@ type LongLivedClient = Readonly<{
   stop(): void;
 }>;
 
+/** Every long-lived client this tranche has opened, for the afterAll sweep. */
+type MarkedClient = Readonly<{ containerId: string; marker: string; asRoot: boolean }>;
+const markedClients: MarkedClient[] = [];
+
 function openLongLivedClient(sessionId: string, port: number): LongLivedClient {
-  return spawnLongLivedClient(["exec", "-i", sessionId, "env", ...PROXY_ENV_UNSET, "node", "-e", LONG_LIVED_CLIENT_PROGRAM, String(port)]);
+  const marker = nonce("runfree-livetest-client");
+  return spawnLongLivedClient(
+    ["exec", "-i", sessionId, "env", ...PROXY_ENV_UNSET, "node", "-e", LONG_LIVED_CLIENT_PROGRAM, String(port), "127.0.0.1", marker],
+    { containerId: sessionId, marker, asRoot: false },
+  );
 }
 
 /**
@@ -348,13 +362,18 @@ function openLongLivedClient(sessionId: string, port: number): LongLivedClient {
  * can close it: only the firewall can stop its bytes.
  */
 function openRootProxyClient(proxyId: string, gateway: string, port: number): LongLivedClient {
-  return spawnLongLivedClient(["exec", "-i", "--user", "0:0", proxyId, "node", "-e", LONG_LIVED_CLIENT_PROGRAM, String(port), gateway]);
+  const marker = nonce("runfree-livetest-client");
+  return spawnLongLivedClient(
+    ["exec", "-i", "--user", "0:0", proxyId, "node", "-e", LONG_LIVED_CLIENT_PROGRAM, String(port), gateway, marker],
+    { containerId: proxyId, marker, asRoot: true },
+  );
 }
 
-function spawnLongLivedClient(dockerArgs: readonly string[]): LongLivedClient {
+function spawnLongLivedClient(dockerArgs: readonly string[], marked: MarkedClient): LongLivedClient {
   // Asynchronous on purpose: this client must stay open across the CLI and
   // Docker calls the case makes while it is connected.
   const child = childProcess.spawn("docker", [...dockerArgs], { stdio: ["pipe", "pipe", "pipe"] });
+  markedClients.push(marked);
   const received: string[] = [];
   let partial = "";
   let stderr = "";
@@ -366,6 +385,7 @@ function spawnLongLivedClient(dockerArgs: readonly string[]): LongLivedClient {
     }
   });
   child.stderr.on("data", (chunk) => { stderr = (stderr + String(chunk)).slice(-4096); });
+  let stopped = false;
   return Object.freeze({
     send: (text: string) => { child.stdin.write(`${text}\n`); },
     lines: () => [...received],
@@ -375,9 +395,65 @@ function spawnLongLivedClient(dockerArgs: readonly string[]): LongLivedClient {
           throw new Error(`${String(error)}; client output: ${describeOutput(received.join(" | "))}; stderr: ${describeOutput(stderr)}`);
         });
     },
-    stop: () => { child.kill("SIGKILL"); },
+    // Killing only the host-side `docker exec` CLI leaves the in-container
+    // process (and its open socket) running: that is the leak this closes.
+    // Idempotent, and never throws — a cleanup failure here must not replace
+    // a case's own assertion failure; the afterAll sweep is the backstop.
+    stop: () => {
+      if (stopped) return;
+      stopped = true;
+      try {
+        killMarkedProcess(marked.containerId, marked.marker, marked.asRoot);
+      } catch (error) {
+        console.warn(`could not confirm the marked client ${marked.marker} exited: ${String(error)}`);
+      }
+      child.kill("SIGKILL");
+    },
   });
 }
+
+/**
+ * Kills, inside its container, every process whose argv contains `marker` —
+ * read directly from `/proc/<pid>/cmdline`, since neither the proxy nor the
+ * agent image is guaranteed to carry procps (`pkill`/`pgrep`). A container or
+ * exec target that is already gone counts as "already killed": cleanup must
+ * never be what fails a run. Bounded: polls until no matching process remains.
+ */
+function killMarkedProcess(containerId: string, marker: string, asRoot: boolean): void {
+  const user = asRoot ? ["--user", "0:0"] : [];
+  const run = (program: string): CaptureResult => docker(["exec", ...user, containerId, "node", "-e", program, marker]);
+  const killed = run(KILL_MARKED_PROCESS_PROGRAM);
+  if (killed.status !== 0) return; // the container (or its exec target) is already gone.
+  waitUntil(() => {
+    const counted = run(COUNT_MARKED_PROCESS_PROGRAM);
+    return counted.status !== 0 || counted.stdout.trim() === "0";
+  }, { timeoutMs: 5_000, intervalMs: 100, label: `the marked client ${marker} in ${containerId.slice(0, 12)} to exit` });
+}
+
+const KILL_MARKED_PROCESS_PROGRAM = `
+const fs = require("node:fs");
+const marker = process.argv[1];
+for (const entry of fs.readdirSync("/proc")) {
+  if (!/^[0-9]+$/.test(entry) || Number(entry) === process.pid) continue;
+  let cmdline;
+  try { cmdline = fs.readFileSync("/proc/" + entry + "/cmdline", "utf8"); } catch { continue; }
+  if (!cmdline.includes(marker)) continue;
+  try { process.kill(Number(entry), "SIGKILL"); } catch {}
+}
+`;
+
+const COUNT_MARKED_PROCESS_PROGRAM = `
+const fs = require("node:fs");
+const marker = process.argv[1];
+let count = 0;
+for (const entry of fs.readdirSync("/proc")) {
+  if (!/^[0-9]+$/.test(entry)) continue;
+  let cmdline;
+  try { cmdline = fs.readFileSync("/proc/" + entry + "/cmdline", "utf8"); } catch { continue; }
+  if (cmdline.includes(marker)) count++;
+}
+process.stdout.write(String(count) + "\\n");
+`;
 
 // ---------------------------------------------------------------------------
 // Proxy-side reads. Each is a direct daemon or kernel read, not a product
@@ -477,23 +553,38 @@ function proxyLogsSince(proxyId: string, sinceIso: string): string {
 }
 
 /**
- * Counts the proxy's ESTABLISHED TCP sockets to exactly `ip:port`, read by
- * root from the proxy network namespace's `/proc/net/tcp` (state 01). A
- * direct kernel read: an open splice's upstream leg is one such socket.
+ * The proxy's ESTABLISHED TCP sockets to exactly `ip:port`, each identified
+ * by its own local port, read by root from the proxy network namespace's
+ * `/proc/net/tcp` (state 01). A direct kernel read: an open splice's upstream
+ * leg is one such socket, and its local port is what makes one flow (and its
+ * disappearance) distinguishable from any other that happens to share the
+ * remote pair.
  */
 const ESTABLISHED_FLOWS_PROGRAM = `
 const [ip, port] = process.argv.slice(1);
 const hex = (value, width) => value.toString(16).toUpperCase().padStart(width, "0");
 const remote = ip.split(".").reverse().map((octet) => hex(Number(octet), 2)).join("") + ":" + hex(Number(port), 4);
 const rows = require("node:fs").readFileSync("/proc/net/tcp", "utf8").split("\\n").slice(1).filter(Boolean);
-process.stdout.write(String(rows.map((row) => row.trim().split(/\\s+/)).filter((fields) => fields[2] === remote && fields[3] === "01").length) + "\\n");
+const localPorts = rows
+  .map((row) => row.trim().split(/\\s+/))
+  .filter((fields) => fields[2] === remote && fields[3] === "01")
+  .map((fields) => parseInt(fields[1].split(":")[1], 16));
+process.stdout.write(JSON.stringify(localPorts) + "\\n");
 `;
 
-function establishedProxyFlows(proxyId: string, ip: string, port: number): number {
+/** The local ports of the proxy's ESTABLISHED sockets to exactly `ip:port`. */
+function establishedProxyLocalPorts(proxyId: string, ip: string, port: number): readonly number[] {
   const text = dockerOrThrow("proxy established flows", ["exec", "--user", "0:0", proxyId, "node", "-e", ESTABLISHED_FLOWS_PROGRAM, ip, String(port)]);
-  const count = Number(text.trim());
-  if (!Number.isInteger(count)) throw new Error(`the established-flow probe printed ${describeOutput(text)}`);
-  return count;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text.trim());
+  } catch {
+    throw new Error(`the established-flow probe printed ${describeOutput(text)}`);
+  }
+  if (!Array.isArray(parsed) || !parsed.every((value) => Number.isInteger(value))) {
+    throw new Error(`the established-flow probe printed ${describeOutput(text)}`);
+  }
+  return parsed as number[];
 }
 
 function hostDataEvents(echo: EchoServer, id: number): number {
@@ -577,6 +668,18 @@ describe("approved host services", () => {
   }, PROVISION_TIMEOUT_MS);
 
   afterAll(async () => {
+    // Safety net: a case that forgot to stop a client, or whose own stop()
+    // only partly succeeded, must not leave an in-container process (and its
+    // open socket) running past this tranche. Each marker is killed
+    // best-effort, before tearing anything else down, while its container is
+    // still most likely to be alive.
+    for (const client of markedClients.splice(0)) {
+      try {
+        killMarkedProcess(client.containerId, client.marker, client.asRoot);
+      } catch (error) {
+        console.warn(`afterAll: could not confirm the marked client ${client.marker} exited: ${String(error)}`);
+      }
+    }
     try {
       if (fixture) {
         try {
@@ -869,8 +972,12 @@ describe("approved host services", () => {
       const hostId = hostConnectionCarrying(echo, opened);
       expect(hostId, "the host never saw the long-lived connection").toBeDefined();
       // Positive control for the flow probe below: the open splice's upstream
-      // leg is an established proxy socket to the pinned pair.
-      expect(establishedProxyFlows(proxyId, pinned, port), "the flow probe does not see the open splice").toBeGreaterThan(0);
+      // leg is exactly one established proxy socket to the pinned pair. (Not
+      // just "at least one": a prior case's leaked client would also show up
+      // here, making the later zero-count check pass without proving anything.)
+      const openPortsBeforeChange = establishedProxyLocalPorts(proxyId, pinned, port);
+      expect(openPortsBeforeChange.length, "the flow probe does not see exactly the open splice").toBe(1);
+      const splicePort = openPortsBeforeChange[0];
 
       const since = new Date().toISOString();
       // Rewrite only the IPv4 alias line, in place (a bind-mounted file cannot
@@ -923,7 +1030,9 @@ describe("approved host services", () => {
       if (windowLeft > 0) await sleep(windowLeft);
       await sleep(5_000);
       expect(hostServiceSetMembers(proxyId, "host_service"), "the sticky refusal re-admitted the old pair").toEqual([]);
-      expect(establishedProxyFlows(proxyId, pinned, port), "a cut splice's flow is still established after the drain window").toBe(0);
+      const openPortsAfterWindow = establishedProxyLocalPorts(proxyId, pinned, port);
+      expect(openPortsAfterWindow, "the cut splice's own flow is still established after the drain window").not.toContain(splicePort);
+      expect(openPortsAfterWindow.length, "a cut splice's flow is still established after the drain window").toBe(0);
       expect(hostDataEvents(echo, hostId as number), "bytes reached the host on the cut flow after the drain window").toBe(hostDataAtCut);
 
       // New connections refuse with the named cause.
