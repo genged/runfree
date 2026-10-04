@@ -25,6 +25,8 @@ import {
   requireUsableApprovalSelection,
 } from "./control/workflow.ts";
 import { die } from "./errors.ts";
+import { hostServiceOwnerWarnings, probeHostPortOwner } from "./host-service-port-owner.ts";
+import { readHostServicePortRegistry, removeProjectHostServicePorts } from "./host-service-registry.ts";
 import { composeProjectName, projectHash, runtimeEnvironment } from "./runtime/env.ts";
 import { resumeInterruptedSessionThroughAdmission } from "./runtime/session-admission-resume.ts";
 import { removeWarmProofRecord } from "./runtime/warm-proof.ts";
@@ -942,6 +944,7 @@ export function statusRuntime(context: RuntimeContext, io: RuntimeIO, options: {
   printWriteApprovalStatusLine(context, io);
   printSessionFilesStatusLine(context, io, adapters);
   printIngressForwarderStatusLine(context, io);
+  printHostServiceStatusLine(context, io);
   return status;
 }
 
@@ -976,6 +979,38 @@ function printIngressForwarderStatusLine(context: RuntimeContext, io: RuntimeIO)
     const open = listIngressForwarders(context, io, projectHash(context.projectRoot));
     if (open.length === 0) return;
     console.log(`ingress forwarders: ${open.length} open loopback host→agent port(s) (runfree forward status)`);
+  } catch {
+    // A status line must never be the reason status fails.
+  }
+}
+
+// Host-service re-check (design "Policy shape", Re-check, SR13): status
+// repeats the live owner check a launch does, so drift since the last launch
+// (a stopped listener, a different process, a port Docker Desktop now
+// publishes) is visible without a restart. Silent when there are no approved
+// host services; a probe failure is a warning, never a reason status fails.
+function printHostServiceStatusLine(context: RuntimeContext, io: RuntimeIO): void {
+  try {
+    const hostServices = validateNetworkPolicy(readActiveEffectiveControl(context.project)?.policy ?? { hosts: [] }).hostServices;
+    const names = Object.keys(hostServices);
+    if (names.length === 0) return;
+    const env = context.env ?? process.env;
+    const projectId = projectHash(context.projectRoot);
+    const recorded = new Map<number, string>();
+    const registryRead = readHostServicePortRegistry(env);
+    if (registryRead.ok) {
+      for (const [port, owner] of registryRead.owners) {
+        if (owner.projectId === projectId && owner.command !== undefined) recorded.set(port, owner.command);
+      }
+    }
+    const summaries = [...names].sort().map((name) => {
+      const entry = hostServices[name];
+      const owner = probeHostPortOwner(context, io, entry.port);
+      const label = owner.kind === "listener" ? ` (${owner.command})` : "";
+      return `${name} 127.0.0.1:${entry.port}${label}`;
+    });
+    console.log(`host services: ${summaries.join(", ")}`);
+    for (const line of hostServiceOwnerWarnings(context, io, hostServices, recorded)) warn(line);
   } catch {
     // A status line must never be the reason status fails.
   }
@@ -1234,7 +1269,7 @@ export async function destroyRuntime(
   }
   try {
     forgetWarmLaunchRecords(destroyContext);
-    return runFencedProjectDestroy({
+    const status = runFencedProjectDestroy({
       context: destroyContext,
       io,
       docker: destroyAdapters.docker,
@@ -1259,6 +1294,22 @@ export async function destroyRuntime(
         }
       },
     });
+    // Host-global port registry (design "Policy shape", HS7): only a
+    // *completed* destroy means the project can no longer be using its
+    // approved host services. A refusal (status !== 0) tears nothing down,
+    // so the registry row must stay -- pruning it early would let another
+    // project's `forward`/`vnc` or `host-service add` take a port a still-live
+    // session is using. Best-effort otherwise: a registry failure never
+    // changes destroy's own result; the reclaim path
+    // (`host-service list --repair`) covers it.
+    if (status === 0) {
+      try {
+        await removeProjectHostServicePorts(destroyContext.env ?? process.env, projectHash(destroyContext.projectRoot));
+      } catch (error) {
+        warn(`the host-service port registry was not updated after destroy: ${error instanceof Error ? error.message : String(error)}; run \`${remedy.hostServiceRepair()}\``);
+      }
+    }
+    return status;
   } finally {
     lifecycleLock.release();
   }

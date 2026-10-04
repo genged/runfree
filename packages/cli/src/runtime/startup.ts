@@ -19,9 +19,13 @@ import {
   convergeEffectivePolicyGeneration,
   effectiveControlSelectionForGeneration,
   readActiveControlSelection,
+  readActiveEffectiveControl,
   readConvergedPolicyReceipt,
   readEffectiveHostServices,
 } from "../control/effective.ts";
+import { validateNetworkPolicy } from "@runfree/runtime-contracts/network-policy";
+import { hostServiceOwnerWarnings } from "../host-service-port-owner.ts";
+import { readHostServicePortRegistry, recordProjectHostServicePorts } from "../host-service-registry.ts";
 import type { EffectiveHostServices } from "./probes.ts";
 import {
   composeManagedSessionVolumeLogicalNames,
@@ -1148,6 +1152,38 @@ async function prepareRuntimeForTokenSyncOrRemoveInvalid(
   };
 }
 
+/**
+ * The launch-time half of the host-service re-check (design "Policy shape",
+ * Re-check, SR13) and host-global port registry refresh (HS7): reads the
+ * active effective policy generation's approved host services, warns on
+ * every live-owner problem, and refreshes the registry's row for this
+ * project with the effective ports. Never throws and never changes the
+ * launch's own result -- the proxy's own enforcement, not this probe,
+ * protects the agent.
+ */
+async function refreshHostServicesAtLaunch(context: RuntimeContext, io: RuntimeIO): Promise<void> {
+  try {
+    const effectivePolicy = readActiveEffectiveControl(context.project)?.policy;
+    const hostServices = effectivePolicy ? validateNetworkPolicy(effectivePolicy).hostServices : {};
+    const env = context.env ?? process.env;
+    if (Object.keys(hostServices).length > 0) {
+      const projectId = projectHash(context.projectRoot);
+      const recorded = new Map<number, string>();
+      const registryRead = readHostServicePortRegistry(env);
+      if (registryRead.ok) {
+        for (const [port, owner] of registryRead.owners) {
+          if (owner.projectId === projectId && owner.command !== undefined) recorded.set(port, owner.command);
+        }
+      }
+      for (const line of hostServiceOwnerWarnings(context, io, hostServices, recorded)) warn(line);
+    }
+    const ports = Array.from(new Set(Object.values(hostServices).map((entry) => entry.port))).sort((left, right) => left - right);
+    await recordProjectHostServicePorts(env, { id: projectHash(context.projectRoot), root: context.projectRoot }, ports);
+  } catch (error) {
+    warn(`host-service re-check failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
 export async function startRuntime(
   context: RuntimeContext,
   io: RuntimeIO,
@@ -1255,6 +1291,14 @@ export async function startRuntime(
     assertSafeRuntimePolicyPath(gitPreparedContext);
     ensureAgentState(gitPreparedContext);
     writeProjectRecoveryPointer(gitPreparedContext);
+    // Host-service re-check and registry refresh (design "Policy shape",
+    // Re-check, SR13; registry, HS7). Runs here, after control preparation
+    // selected the effective policy generation, but before any lock is held
+    // (within the launch lock-hold budget) -- a probe failure only warns, it
+    // never refuses the launch. Refreshing the host-global registry here too
+    // keeps it current even when an activation came from `runfree up` rather
+    // than `host-service add/remove`.
+    await refreshHostServicesAtLaunch(gitPreparedContext, io);
     ensureSandboxGitConfig(gitPreparedContext, io, hostGit);
     const dependencyPlan: PreparedDependencyOverlayPlan = prepareDependencyOverlayPlanResult(gitPreparedContext, io);
     // Supply the freshly discovered overlays before the plan is built, not

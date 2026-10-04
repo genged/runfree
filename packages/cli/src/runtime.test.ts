@@ -26,6 +26,33 @@ vi.mock("./control/effective.ts", async (importOriginal) => {
   };
 });
 
+// Records "probe" when the host-service launch-time re-check runs and "lock"
+// when the project lifecycle lock is acquired, so a test can prove the probe
+// never runs under the lock (design "Policy shape", Re-check, SR13). Both
+// wrappers delegate to the real implementation, so every other test's
+// behavior is unaffected.
+const hostServiceRecheckEvents = vi.hoisted(() => ({ events: [] as string[] }));
+vi.mock("./host-service-port-owner.ts", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./host-service-port-owner.ts")>();
+  return {
+    ...actual,
+    hostServiceOwnerWarnings: (...args: Parameters<typeof actual.hostServiceOwnerWarnings>) => {
+      hostServiceRecheckEvents.events.push("probe");
+      return actual.hostServiceOwnerWarnings(...args);
+    },
+  };
+});
+vi.mock("./runtime/sessions.ts", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./runtime/sessions.ts")>();
+  return {
+    ...actual,
+    tryAcquireProjectLifecycleLockWithRetry: async (...args: Parameters<typeof actual.tryAcquireProjectLifecycleLockWithRetry>) => {
+      hostServiceRecheckEvents.events.push("lock");
+      return actual.tryAcquireProjectLifecycleLockWithRetry(...args);
+    },
+  };
+});
+
 import { defaultConfig, projectControlPaths, type RunfreeConfig, type ProjectInfo } from "./config.ts";
 import { service, serviceHostNames } from "../../../scripts/services.ts";
 import { agentRuntimeImageTag, effectiveRuntimeDigest, proxyRuntimeImageTag } from "./agent-image.ts";
@@ -92,6 +119,7 @@ import { hostBootId, hostProcessStart } from "./runtime/host-identity.ts";
 import { createSessionLaunchTarget } from "./runtime/session-launch.ts";
 import { buildTokenAutoRefreshSpawnPlan, containerMissingNetwork, resolveRunfreeSelfInvocation } from "./runtime.ts";
 import {
+  destroyRuntime,
   formatSessionFileStatusLine,
   logsRuntime,
   nodeRuntimeIO,
@@ -127,6 +155,7 @@ import { TOKEN_SYNC_DEFERRED_STATUS } from "./runtime/constants.ts";
 import { disposeLaunchHandoff, preparedRuntimeProxyId, takeLaunchHandoff, takeLaunchHandoffDeclined } from "./runtime/prepared-runtime.ts";
 import { LAUNCH_HANDOFF_STARTUP_SPAN_MAX_MS } from "./runtime/launch-lock-hold.ts";
 import { flushWarnings, pendingWarningsForTest } from "./warnings.ts";
+import { readHostServicePortRegistry, recordProjectHostServicePorts } from "./host-service-registry.ts";
 import { projectLifecycleLockPath, tryAcquireProjectLifecycleLock, tryAcquireProjectLifecycleLockWithRetry } from "./runtime/sessions.ts";
 
 // Real `docker ps -q`/`-aq` prints 12-character short IDs unless `--no-trunc`
@@ -885,6 +914,26 @@ function prepareProject(projectRoot: string, config: RunfreeConfig = defaultConf
   return project;
 }
 
+// Same as `prepareProject`, but the approved and published effective policy
+// generation also carries `hostServices` (design "Policy shape"), so
+// `readActiveEffectiveControl`/`readEffectiveHostServices` see them.
+function prepareProjectWithHostServices(
+  projectRoot: string,
+  hostServices: Record<string, { target: "host-loopback"; port: number }>,
+): ProjectInfo {
+  const project = projectInfo(projectRoot, defaultConfig());
+  fs.mkdirSync(path.dirname(project.paths.policyPath), { recursive: true });
+  fs.writeFileSync(project.paths.policyPath, `${JSON.stringify({
+    version: 2,
+    hosts: ["api.github.com"],
+    hostServices,
+  }, null, 2)}\n`);
+  fs.mkdirSync(project.paths.proxyCaCertDir, { recursive: true });
+  fs.writeFileSync(path.join(project.paths.proxyCaCertDir, "proxy-ca.crt"), FAKE_PROXY_CA_PEM);
+  approveAndPublishEffectiveControlsForTest(projectRoot, project);
+  return project;
+}
+
 function prepareRelativeLinkedWorktree(projectRoot: string): { gitCommonDir: string; gitDir: string } {
   const repoRoot = path.dirname(path.dirname(projectRoot));
   const gitCommonDir = path.join(repoRoot, ".git");
@@ -1293,6 +1342,8 @@ function createRuntimeIO(overrides: {
   choosePiProvider?: (options: readonly PiProviderOption[]) => PiProviderChoice | undefined;
   commandExists?: (command: string) => boolean;
   confirm?: (question: string) => boolean;
+  /** The firewall's live `host_service` kernel set, for a project whose effective policy approves host services. Empty by default. */
+  hostServiceSet?: ReadonlyArray<{ ip: string; port: number }>;
   isInteractive?: () => boolean;
   run?: (command: string, args: string[]) => number;
   startTokenAutoRefresh?: RuntimeIO["startTokenAutoRefresh"];
@@ -1716,7 +1767,7 @@ function createRuntimeIO(overrides: {
         writtenAt: "2026-06-14T00:00:00.000Z",
       });
     };
-    const hostServiceSetJson = proxyHostServiceSetJson([]);
+    const hostServiceSetJson = proxyHostServiceSetJson(overrides.hostServiceSet ?? []);
     // The warm proof's one root batch: fourteen framed sections, answered with
     // the same bytes the individual handlers give the full validation.
     if (args[0] === "exec" && args.includes(FAKE_PROXY_CONTAINER_ID) && args.includes("0:0")
@@ -4305,6 +4356,126 @@ describe("runtime command flow", () => {
     });
   });
 
+  describe("host-service re-check and registry refresh at launch (design \"Policy shape\", Re-check, SR13; HS7)", () => {
+    // The live firewall's kernel `host_service` set the full validation
+    // batch reports: it must match the effective policy's approved host
+    // services (gateway 192.168.65.254, the fixed fake gateway IP) or
+    // topology validation itself refuses the launch for an unrelated reason.
+    const idbHostServiceSet = [{ ip: "192.168.65.254", port: 10882 }];
+
+    function launchContext(): RuntimeContext {
+      const projectRoot = path.join(tmp, "project");
+      const project = prepareProjectWithHostServices(projectRoot, { idb: { target: "host-loopback", port: 10882 } });
+      return {
+        projectRoot,
+        project,
+        runtimeRoot: path.join(tmp, "runtime"),
+        env: { PATH: "/fake-bin", XDG_STATE_HOME: path.join(tmp, "xdg-state") },
+        network: fixedNetwork,
+      };
+    }
+
+    beforeEach(() => {
+      hostServiceRecheckEvents.events = [];
+    });
+
+    test("a launch emits the same live-owner warning status reports, and never fails because of it", async () => {
+      const context = launchContext();
+      const io = createRuntimeIO({ hostServiceSet: idbHostServiceSet });
+
+      // No darwin stub: the live-owner probe is unavailable on this
+      // platform, exactly like a status check would see.
+      expect((await startRuntime(context, io, false, { launch: true })).status).toBe(0);
+      flushWarnings();
+      const errOutput = vi.mocked(console.error).mock.calls.flat().join("\n");
+      expect(errOutput).toContain("runfree warning:");
+      expect(errOutput).toContain("host service idb (127.0.0.1:10882):");
+    });
+
+    test("a launch refreshes the host-global port registry with the effective ports", async () => {
+      const context = launchContext();
+      const io = createRuntimeIO({ hostServiceSet: idbHostServiceSet });
+
+      expect((await startRuntime(context, io, false, { launch: true })).status).toBe(0);
+      const registry = readHostServicePortRegistry(context.env ?? {});
+      if (!registry.ok) throw new Error(registry.reason);
+      expect(registry.owners.get(10882)?.projectId).toBe(projectHash(context.projectRoot));
+    });
+
+    test("the live-owner probe never runs under the project lifecycle lock", async () => {
+      const context = launchContext();
+      const io = createRuntimeIO({ hostServiceSet: idbHostServiceSet });
+
+      expect((await startRuntime(context, io, false, { launch: true })).status).toBe(0);
+      // Control preparation takes and releases the project lifecycle lock
+      // transiently for its own control-plane selection, before the probe
+      // runs; the launch's own long-held lock (guarding Docker/session
+      // admission) is always the *last* lock acquisition of a plain cold
+      // launch. The probe must complete before that one.
+      expect(hostServiceRecheckEvents.events).toContain("probe");
+      expect(hostServiceRecheckEvents.events).toContain("lock");
+      expect(hostServiceRecheckEvents.events.indexOf("probe"))
+        .toBeLessThan(hostServiceRecheckEvents.events.lastIndexOf("lock"));
+    });
+  });
+
+  describe("host-service port registry pruning at destroy (design \"Policy shape\", HS7)", () => {
+    test("destroy prunes the project's host-service port registry row", async () => {
+      const projectRoot = path.join(tmp, "project");
+      const project = prepareProjectWithHostServices(projectRoot, { idb: { target: "host-loopback", port: 10882 } });
+      const context = {
+        projectRoot,
+        project,
+        runtimeRoot: path.join(tmp, "runtime"),
+        env: { PATH: "/fake-bin", XDG_STATE_HOME: path.join(tmp, "xdg-state") },
+        network: fixedNetwork,
+      } satisfies RuntimeContext;
+      const projectId = projectHash(projectRoot);
+      await recordProjectHostServicePorts(context.env, { id: projectId, root: projectRoot }, [10882]);
+      const before = readHostServicePortRegistry(context.env);
+      if (!before.ok) throw new Error(before.reason);
+      expect(before.owners.get(10882)?.projectId).toBe(projectId);
+
+      const io = createRuntimeIO();
+      await destroyRuntime(context, io);
+
+      const after = readHostServicePortRegistry(context.env);
+      if (!after.ok) throw new Error(after.reason);
+      expect(after.owners.has(10882)).toBe(false);
+    });
+
+    test("a refused destroy never prunes the registry row: a still-live session must keep its port", async () => {
+      const projectRoot = path.join(tmp, "project");
+      const project = prepareProjectWithHostServices(projectRoot, { idb: { target: "host-loopback", port: 10882 } });
+      const context = {
+        projectRoot,
+        project,
+        runtimeRoot: path.join(tmp, "runtime"),
+        env: { PATH: "/fake-bin", XDG_STATE_HOME: path.join(tmp, "xdg-state") },
+        network: fixedNetwork,
+      } satisfies RuntimeContext;
+      const projectId = projectHash(projectRoot);
+      await recordProjectHostServicePorts(context.env, { id: projectId, root: projectRoot }, [10882]);
+
+      // Obstruct the session lifecycle registry so plain destroy refuses
+      // before any teardown effect (an unreadable registry may hide a live
+      // session, so destroy without --force fails closed on it).
+      const recordsRoot = path.join(project.paths.stateDir, "runtime", "v2", "session-containers");
+      fs.mkdirSync(path.dirname(recordsRoot), { recursive: true });
+      fs.writeFileSync(recordsRoot, "not a directory");
+
+      const io = createRuntimeIO();
+      const status = await destroyRuntime(context, io);
+      expect(status).not.toBe(0);
+
+      // Nothing was torn down: the registry row the project's approved host
+      // service still needs must survive the refused destroy untouched.
+      const after = readHostServicePortRegistry(context.env);
+      if (!after.ok) throw new Error(after.reason);
+      expect(after.owners.get(10882)?.projectId).toBe(projectId);
+    });
+  });
+
   describe("receipt-gated warm launch token sync (launch plan D4)", () => {
     function launchContext(): RuntimeContext {
       const projectRoot = path.join(tmp, "project");
@@ -5553,6 +5724,80 @@ describe("runtime command flow", () => {
     expect(output).toContain("NAME");
     expect(output).toMatch(new RegExp(`${projectName}-proxy-1\\s+Up 4 minutes\\s+${projectName}-proxy`));
     expect(output).not.toContain("\t");
+  });
+
+  describe("host-service status (design \"Policy shape\", Re-check, SR13)", () => {
+    const platformDescriptor = Object.getOwnPropertyDescriptor(process, "platform") as PropertyDescriptor;
+    afterEach(() => {
+      Object.defineProperty(process, "platform", platformDescriptor);
+    });
+
+    test("status reports a healthy host service and raises no warning", () => {
+      const projectRoot = path.join(tmp, "project");
+      const project = prepareProjectWithHostServices(projectRoot, { idb: { target: "host-loopback", port: 10882 } });
+      const context = {
+        projectRoot,
+        project,
+        runtimeRoot: path.join(tmp, "runtime"),
+        env: { PATH: "/fake-bin", XDG_STATE_HOME: path.join(tmp, "xdg-state") },
+        network: fixedNetwork,
+      } satisfies RuntimeContext;
+      Object.defineProperty(process, "platform", { value: "darwin" });
+      const io = createRuntimeIO({
+        capture: (command, args) => {
+          if (command === "docker" && args[0] === "info") return captureResult(0);
+          if (command === "/usr/sbin/lsof") return captureResult(0, "p4242\ncidb_companion\n");
+          return captureResult(0);
+        },
+      });
+
+      expect(statusRuntime(context, io)).toBe(0);
+      const output = vi.mocked(console.log).mock.calls.map((call) => call.join(" ")).join("\n");
+      expect(output).toContain("host services: idb 127.0.0.1:10882 (idb_companion)");
+      flushWarnings();
+      expect(vi.mocked(console.error).mock.calls.flat().join("\n")).not.toContain("runfree warning:");
+    });
+
+    test("an unavailable live-owner probe is a warning, never an error, and status still succeeds", () => {
+      const projectRoot = path.join(tmp, "project");
+      const project = prepareProjectWithHostServices(projectRoot, { idb: { target: "host-loopback", port: 10882 } });
+      const context = {
+        projectRoot,
+        project,
+        runtimeRoot: path.join(tmp, "runtime"),
+        env: { PATH: "/fake-bin", XDG_STATE_HOME: path.join(tmp, "xdg-state") },
+        network: fixedNetwork,
+      } satisfies RuntimeContext;
+      // No darwin stub: the live-owner probe is unavailable on this platform.
+      const io = createRuntimeIO({
+        capture: (command, args) => (command === "docker" && args[0] === "info" ? captureResult(0) : undefined),
+      });
+
+      expect(statusRuntime(context, io)).toBe(0);
+      flushWarnings();
+      const errOutput = vi.mocked(console.error).mock.calls.flat().join("\n");
+      expect(errOutput).toContain("runfree warning:");
+      expect(errOutput).toContain("host service idb (127.0.0.1:10882):");
+    });
+
+    test("status prints no host-services line when none are approved", () => {
+      const projectRoot = path.join(tmp, "project");
+      const project = prepareProject(projectRoot);
+      const context = {
+        projectRoot,
+        project,
+        runtimeRoot: path.join(tmp, "runtime"),
+        env: { PATH: "/fake-bin", XDG_STATE_HOME: path.join(tmp, "xdg-state") },
+        network: fixedNetwork,
+      } satisfies RuntimeContext;
+      const io = createRuntimeIO({
+        capture: (command, args) => (command === "docker" && args[0] === "info" ? captureResult(0) : undefined),
+      });
+
+      expect(statusRuntime(context, io)).toBe(0);
+      const output = vi.mocked(console.log).mock.calls.map((call) => call.join(" ")).join("\n");
+      expect(output).not.toContain("host services:");
+    });
   });
 
   /** Selects a `files`-backed effective control plane for `context`'s project. */

@@ -1,10 +1,11 @@
 import type childProcess from "node:child_process";
 import os from "node:os";
 
-import { describe, expect, test, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
-import { admitHostServicePort, probeHostPortOwner } from "./host-service-port-owner.ts";
+import { admitHostServicePort, hostServiceOwnerWarnings, probeHostPortOwner } from "./host-service-port-owner.ts";
 import type { CaptureResult, RuntimeIO } from "./runtime/types.ts";
+import type { HostServicesJson } from "@runfree/runtime-contracts/host-services";
 
 type CaptureCall = { command: string; args: string[]; options?: childProcess.SpawnSyncOptions };
 
@@ -21,6 +22,21 @@ function fakeIo(result: CaptureResult): { io: RuntimeIO; calls: CaptureCall[] } 
     admin: async () => 0,
   };
   return { io, calls };
+}
+
+/** Routes each lsof call to the result for the `-iTCP:<port>` it probed. */
+function fakeIoByPort(results: Readonly<Record<number, CaptureResult>>): RuntimeIO {
+  return {
+    capture: vi.fn((_command: string, args: string[]) => {
+      const portArg = args.find((arg) => arg.startsWith("-iTCP:"));
+      const port = Number(portArg?.slice("-iTCP:".length));
+      return results[port] ?? { status: 1, stdout: "", stderr: "" };
+    }),
+    run: () => 0,
+    commandExists: () => true,
+    confirm: () => false,
+    admin: async () => 0,
+  };
 }
 
 const context = {
@@ -174,5 +190,82 @@ describe("admitHostServicePort", () => {
       ok: true,
       owner: { command: "idb_companion", pid: 4242 },
     });
+  });
+});
+
+describe("hostServiceOwnerWarnings", () => {
+  const platformDescriptor = Object.getOwnPropertyDescriptor(process, "platform") as PropertyDescriptor;
+  beforeEach(() => {
+    Object.defineProperty(process, "platform", { value: "darwin" });
+  });
+  afterEach(() => {
+    Object.defineProperty(process, "platform", platformDescriptor);
+  });
+
+  const idb: HostServicesJson = { idb: { target: "host-loopback", port: 10882 } };
+
+  test("no listener is one warning line", () => {
+    const io = fakeIoByPort({ 10882: { status: 1, stdout: "", stderr: "" } });
+
+    expect(hostServiceOwnerWarnings(context, io, idb, new Map())).toEqual([
+      "host service idb (127.0.0.1:10882): no listener",
+    ]);
+  });
+
+  test("a Docker Desktop owner is one warning line", () => {
+    const io = fakeIoByPort({ 10882: { status: 0, stdout: "p77\nccom.docker.backend\n", stderr: "" } });
+
+    expect(hostServiceOwnerWarnings(context, io, idb, new Map())).toEqual([
+      "host service idb (127.0.0.1:10882): owned by Docker Desktop",
+    ]);
+  });
+
+  test("a listener that differs from the recorded owner is one warning line", () => {
+    const io = fakeIoByPort({ 10882: { status: 0, stdout: "p5151\ncother_process\n", stderr: "" } });
+
+    expect(hostServiceOwnerWarnings(context, io, idb, new Map([[10882, "idb_companion"]]))).toEqual([
+      "host service idb (127.0.0.1:10882): listener changed to other_process",
+    ]);
+  });
+
+  test("a listener that matches the recorded owner has no warning", () => {
+    const io = fakeIoByPort({ 10882: { status: 0, stdout: "p4242\ncidb_companion\n", stderr: "" } });
+
+    expect(hostServiceOwnerWarnings(context, io, idb, new Map([[10882, "idb_companion"]]))).toEqual([]);
+  });
+
+  test("a listener with nothing recorded has no warning", () => {
+    const io = fakeIoByPort({ 10882: { status: 0, stdout: "p4242\ncidb_companion\n", stderr: "" } });
+
+    expect(hostServiceOwnerWarnings(context, io, idb, new Map())).toEqual([]);
+  });
+
+  test("an unavailable probe reports its own reason, never throws", () => {
+    Object.defineProperty(process, "platform", { value: "linux" });
+    const io = fakeIoByPort({});
+
+    const lines = hostServiceOwnerWarnings(context, io, idb, new Map());
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toMatch(/^host service idb \(127\.0\.0\.1:10882\): .*macOS/);
+  });
+
+  test("no host services means no warnings and no probe", () => {
+    const io = fakeIoByPort({});
+
+    expect(hostServiceOwnerWarnings(context, io, {}, new Map())).toEqual([]);
+    expect(io.capture).not.toHaveBeenCalled();
+  });
+
+  test("names sort, so warnings come out in a stable order", () => {
+    const services: HostServicesJson = {
+      zed: { target: "host-loopback", port: 10883 },
+      alpha: { target: "host-loopback", port: 10882 },
+    };
+    const io = fakeIoByPort({ 10882: { status: 1, stdout: "", stderr: "" }, 10883: { status: 1, stdout: "", stderr: "" } });
+
+    expect(hostServiceOwnerWarnings(context, io, services, new Map())).toEqual([
+      "host service alpha (127.0.0.1:10882): no listener",
+      "host service zed (127.0.0.1:10883): no listener",
+    ]);
   });
 });

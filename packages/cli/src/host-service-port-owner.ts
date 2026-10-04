@@ -15,7 +15,7 @@
 // clean "no match" exit is `unavailable`, which admission refuses (fail
 // closed). The probe only reads: it never connects to the port.
 
-import { refusedHostServicePortReason } from "@runfree/runtime-contracts/host-services";
+import { refusedHostServicePortReason, type HostServicesJson } from "@runfree/runtime-contracts/host-services";
 
 import { sanitizedHostExecutionEnv } from "./host-path.ts";
 import type { RuntimeContext, RuntimeIO } from "./runtime/types.ts";
@@ -124,4 +124,39 @@ export function admitHostServicePort(
     return { ok: false, reason: `127.0.0.1:${port} is owned by Docker Desktop (a published container port)` };
   }
   return { ok: true, owner: { command: owner.command, pid: owner.pid } };
+}
+
+/**
+ * Live re-check (design "Policy shape", Re-check, SR13): every launch and
+ * `runfree status` repeat the owner check for each approved host service, so
+ * drift since `add` time (a stopped service, a different process, a port a
+ * container now publishes) is never silent. `recorded` is the owner command
+ * the port registry has on file for this port, if any; a warning fires only
+ * when there is a problem, never on a clean match, and the function never
+ * throws — an unavailable probe reports its own reason as the problem.
+ */
+export function hostServiceOwnerWarnings(
+  context: ProbeContext,
+  io: RuntimeIO,
+  services: HostServicesJson,
+  recorded: ReadonlyMap<number, string>,
+): string[] {
+  const lines: string[] = [];
+  for (const [name, entry] of Object.entries(services).sort(([left], [right]) => left.localeCompare(right))) {
+    const label = `host service ${name} (127.0.0.1:${entry.port})`;
+    const owner = probeHostPortOwner(context, io, entry.port);
+    if (owner.kind === "none") {
+      lines.push(`${label}: no listener`);
+    } else if (owner.kind === "unavailable") {
+      lines.push(`${label}: ${owner.reason}`);
+    } else if (owner.commands.some((command) => command.startsWith(DOCKER_DESKTOP_COMMAND_PREFIX))) {
+      lines.push(`${label}: owned by Docker Desktop`);
+    } else {
+      const previous = recorded.get(entry.port);
+      if (previous !== undefined && previous !== owner.command) {
+        lines.push(`${label}: listener changed to ${owner.command}`);
+      }
+    }
+  }
+  return lines;
 }
