@@ -524,8 +524,15 @@ export async function removeProjectHostServicePorts(env: NodeJS.ProcessEnv, proj
  * Reclaim: rebuilds the whole registry from each known project's own answer
  * (typically its selected effective generation's `hostServices`), discarding
  * whatever the file on disk said — including a corrupt file, which this never
- * reads. A project `readProjectPorts` reports no ports for is simply absent
- * from the rebuilt file.
+ * reads. A project `readProjectPorts` reports no ports for (`undefined` or an
+ * empty list) is simply absent from the rebuilt file.
+ *
+ * Fails closed: when `readProjectPorts` throws for any project, nothing is
+ * written and this throws, naming every such project and its state
+ * directory. Writing without that project's ports would let another
+ * project's `forward` or `vnc` take a port it may still use. The reclaim is
+ * to repair or destroy that project (or remove its state directory when its
+ * checkout is gone) and run the repair again.
  */
 export async function repairHostServicePortRegistry(
   env: NodeJS.ProcessEnv,
@@ -534,15 +541,32 @@ export async function repairHostServicePortRegistry(
   const stateRoot = runfreeStateRoot(env);
   return await withRegistryLock(stateRoot, env, () => {
     const projects: Record<string, RegistryProjectRow> = {};
+    const unreadable: string[] = [];
     let projectCount = 0;
     let portCount = 0;
     for (const { id, root } of knownProjectPointers(stateRoot)) {
-      const ports = readProjectPorts(root, id);
+      let ports: readonly number[] | undefined;
+      try {
+        ports = readProjectPorts(root, id);
+      } catch (error) {
+        unreadable.push(`${root} (state: ${path.join(stateRoot, "projects", id)}): ${error instanceof Error ? error.message : String(error)}`);
+        continue;
+      }
       if (!ports || ports.length === 0) continue;
       const sortedPorts = [...new Set(ports)].sort((left, right) => left - right);
       projects[id] = { projectRoot: root, ports: sortedPorts, updatedAt: new Date().toISOString() };
       projectCount += 1;
       portCount += sortedPorts.length;
+    }
+    if (unreadable.length > 0) {
+      throw new Error([
+        "the host-service port registry was not rebuilt: the selected effective policy generation of "
+          + `${unreadable.length === 1 ? "a known project" : "known projects"} could not be read`,
+        ...unreadable.map((entry) => `  ${entry}`),
+        `repair or destroy ${unreadable.length === 1 ? "that project" : "those projects"} `
+          + `(\`${remedy.destroy()}\` in its checkout, or remove its state directory if the checkout is gone), `
+          + `then run \`${remedy.hostServiceRepair()}\` again`,
+      ].join("\n"));
     }
     writeRegistryFile(stateRoot, { schemaVersion: 1, projects });
     return { projects: projectCount, ports: portCount };

@@ -1,6 +1,13 @@
+import {
+  HOST_SERVICE_NAME_RE,
+  HOST_SERVICE_RESERVED_SUFFIX,
+  refusedHostServicePortReason,
+} from "@runfree/runtime-contracts/host-services";
 import { hostRulesCommand, isHttpMethod, normalizeHostname, type PolicyJson } from "@runfree/runtime-contracts/network-policy";
 
-export type BlockedHostStatus = "missing" | "allowlisted" | "request-shape";
+import { remedy } from "../packages/cli/src/remedies.ts";
+
+export type BlockedHostStatus = "missing" | "allowlisted" | "request-shape" | "host-service";
 
 export type BlockedHostDiagnostic = {
   host: string;
@@ -9,12 +16,26 @@ export type BlockedHostDiagnostic = {
   reason?: string;
   method?: string;
   mcpOAuthIssuer?: McpOAuthIssuerDiagnostic;
-  command: string;
-  // "fix": pasting `command` widens policy; "inspect": it only shows the rule.
+  // Host-service denials only: the requested port, when the event carried a
+  // valid one.
+  port?: number;
+  // Absent only for a host-service denial with no remedy: a name outside the
+  // host-service pattern, a missing port, or a statically refused port.
+  command?: string;
+  // "fix": pasting `command` widens policy; "inspect": it only shows state.
   // Absent for allowlist/missing diagnoses, whose commands are always fixes.
   commandKind?: "fix" | "inspect";
   count: number;
 };
+
+// Host-service denials (`<name>.runfree.internal:<port>`) are not missing
+// hosts: `runfree host add` refuses the reserved suffix. They get their own
+// classification and remedies.
+const HOST_SERVICE_DENIAL_REASONS = new Set([
+  "host-service-not-configured",
+  "host-service-unavailable",
+  "host-service-capacity",
+]);
 
 export type McpOAuthIssuerDiagnostic = {
   serverName: string;
@@ -35,6 +56,7 @@ export type ProxyDenialEvent = {
   host?: string;
   method?: string;
   path?: string;
+  port?: unknown;
   mcpOAuthIssuer?: unknown;
   generation?: string;
   suppressed?: number;
@@ -156,6 +178,8 @@ type DenialOccurrence = {
   key: string;
   reason?: string;
   method?: string;
+  hostServiceReason?: string;
+  port?: number;
   mcpOAuthIssuer?: McpOAuthIssuerDiagnostic;
   count: number;
 };
@@ -201,6 +225,19 @@ function denialOccurrencesFromEvents(events: ProxyDenialEvent[]): DenialOccurren
       ? event.method.toUpperCase()
       : undefined;
     const mcpOAuthIssuer = mcpOAuthIssuerFromEvent(event.mcpOAuthIssuer);
+    if (typeof event.reason === "string" && HOST_SERVICE_DENIAL_REASONS.has(event.reason)) {
+      const port = typeof event.port === "number" && Number.isInteger(event.port) && event.port >= 1 && event.port <= 65535
+        ? event.port
+        : undefined;
+      occurrences.push({
+        host,
+        key: `${host}\0${event.reason}\0${port ?? ""}`,
+        hostServiceReason: event.reason,
+        ...(port !== undefined ? { port } : {}),
+        count: suppressed ?? 1,
+      });
+      continue;
+    }
     occurrences.push({
       host,
       key: reason !== undefined ? `${host}\0${reason}\0${method ?? ""}` : host,
@@ -233,6 +270,25 @@ export function countBlockedHostDiagnoses(logs: string): number {
   return new Set(denialOccurrencesFromEvents(extractDenialEvents(logs)).map((occurrence) => occurrence.key)).size;
 }
 
+/**
+ * A host-service denial's remedy. `host-service-not-configured` names the
+ * exact `add` only for a valid name and a port `add` would not statically
+ * refuse; anything else gets no remedy (the request was not a valid one).
+ * An unavailable gateway or a full splice cap points at `runfree status`.
+ */
+function hostServiceDiagnostic(host: string, reason: string, port: number | undefined, count: number): BlockedHostDiagnostic {
+  const base = { host, status: "host-service" as const, reason, ...(port !== undefined ? { port } : {}), count };
+  if (reason !== "host-service-not-configured") {
+    return { ...base, command: remedy.status(), commandKind: "inspect" };
+  }
+  const suffix = `.${HOST_SERVICE_RESERVED_SUFFIX}`;
+  const name = host.endsWith(suffix) ? host.slice(0, -suffix.length) : "";
+  if (!HOST_SERVICE_NAME_RE.test(name) || port === undefined || refusedHostServicePortReason(port) !== undefined) {
+    return base;
+  }
+  return { ...base, command: remedy.hostServiceAdd(name, port), commandKind: "fix" };
+}
+
 export function diagnoseBlockedHosts(logs: string, policy: PolicyJson, limit = 5): BlockedHostDiagnostic[] {
   // Structured `proxy-denial:` events are the single denial log format; the
   // emitter and this parser ship together, so there is no older-runtime
@@ -248,6 +304,9 @@ export function diagnoseBlockedHosts(logs: string, policy: PolicyJson, limit = 5
   return latestUniqueOccurrences(occurrences, limit).map((occurrence) => {
     const { host, reason, method, mcpOAuthIssuer } = occurrence;
     const count = counts.get(occurrence.key) ?? 1;
+    if (occurrence.hostServiceReason !== undefined) {
+      return hostServiceDiagnostic(host, occurrence.hostServiceReason, occurrence.port, count);
+    }
     if (reason !== undefined) {
       return {
         host,

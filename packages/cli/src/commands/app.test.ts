@@ -17,6 +17,7 @@ import { approveNetworkCandidate, approveRuntimeIsolationControl } from "../cont
 import { captureDesiredPolicyCandidate } from "../control/candidates.ts";
 import { publishEffectivePolicyGeneration } from "../control/effective.ts";
 import { mutateDesiredHostService } from "../control/host-service-mutation.ts";
+import { controlPlaneEffectiveSelectionPathV2 } from "../runtime/component-state-v2.ts";
 import { readHostServicePortRegistry } from "../host-service-registry.ts";
 import type { HostPortOwner, HostServicePortAdmission } from "../host-service-port-owner.ts";
 import type { ControlActivationResult } from "../control/activation.ts";
@@ -1243,6 +1244,61 @@ describe("admin host-service command", () => {
       expect(lines).toHaveLength(3);
     });
 
+    /** A live control-plane selection: what a running (not destroyed) project has. */
+    function markRuntimeLive(stateRoot: string): string {
+      const selection = controlPlaneEffectiveSelectionPathV2(path.join(stateRoot, "projects", projectHash(root)));
+      fs.mkdirSync(path.dirname(selection), { recursive: true });
+      fs.writeFileSync(selection, "{}\n");
+      return selection;
+    }
+
+    async function repairSetup(): Promise<string> {
+      await mutateDesiredHostService(projectContext().runtimeContext(), {} as never, "project", { kind: "add", name: "idb", port: 10882 }, {
+        admit: () => ({ ok: true, owner: { command: "idb_companion", pid: 4242 } }),
+      });
+      publish();
+      const stateRoot = path.join(stateHome, "runfree");
+      fs.writeFileSync(
+        path.join(stateRoot, "projects", projectHash(root), "project.json"),
+        `${JSON.stringify({ projectRoot: root, updatedAt: "2026-10-04T00:00:00.000Z" })}\n`,
+      );
+      fs.writeFileSync(path.join(stateRoot, "host-service-ports.json"), "{corrupt");
+      return stateRoot;
+    }
+
+    test("list --repair does not restore the row of a destroyed project (no control-plane selection)", async () => {
+      await repairSetup();
+      const out = captureStdout();
+
+      const status = await runCommandApp(strictContext({ env }), ["host-service", "list", "--repair"], vi.fn(async () => 0));
+
+      expect(status).toBe(0);
+      expect(out.text()).toContain("host-service port registry rebuilt: 0 port(s) from 0 project(s)");
+      const registry = readHostServicePortRegistry(env);
+      expect(registry.ok && registry.owners.has(10882)).toBe(false);
+    });
+
+    test("list --repair refuses to write and exits non-zero when a live project's ports cannot be read, then recovers", async () => {
+      const stateRoot = await repairSetup();
+      markRuntimeLive(stateRoot);
+      const project = projectInfo(root, env);
+      const activePath = path.join(project.paths.controlProxyDir, "active.json");
+      const activeBytes = fs.readFileSync(activePath, "utf8");
+      fs.chmodSync(activePath, 0o600);
+      fs.writeFileSync(activePath, "{not json");
+
+      await expect(runCommandApp(strictContext({ env }), ["host-service", "list", "--repair"], vi.fn(async () => 0)))
+        .rejects.toThrow(new RegExp(`host-service port registry was not rebuilt[\\s\\S]*${root.replace(/[/.]/g, "\\$&")}[\\s\\S]*runfree host-service list --repair`, "u"));
+      // Nothing written: the corrupt file is untouched and still refuses.
+      expect(fs.readFileSync(path.join(stateRoot, "host-service-ports.json"), "utf8")).toBe("{corrupt");
+
+      // Reclaim: the project's state is readable again.
+      fs.writeFileSync(activePath, activeBytes);
+      const out = captureStdout();
+      expect(await runCommandApp(strictContext({ env }), ["host-service", "list", "--repair"], vi.fn(async () => 0))).toBe(0);
+      expect(out.text()).toContain("host-service port registry rebuilt: 1 port(s) from 1 project(s)");
+    });
+
     test("list --repair rebuilds a corrupt registry from each project's selected effective policy generation", async () => {
       await mutateDesiredHostService(projectContext().runtimeContext(), {} as never, "project", { kind: "add", name: "idb", port: 10882 }, {
         admit: () => ({ ok: true, owner: { command: "idb_companion", pid: 4242 } }),
@@ -1253,6 +1309,7 @@ describe("admin host-service command", () => {
         path.join(stateRoot, "projects", projectHash(root), "project.json"),
         `${JSON.stringify({ projectRoot: root, updatedAt: "2026-10-04T00:00:00.000Z" })}\n`,
       );
+      markRuntimeLive(stateRoot);
       fs.writeFileSync(path.join(stateRoot, "host-service-ports.json"), "{corrupt");
       expect(readHostServicePortRegistry(env).ok).toBe(false);
       const out = captureStdout();

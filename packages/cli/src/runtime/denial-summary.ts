@@ -64,7 +64,9 @@ export function buildSessionDenialSummary(logs: string, policy: PolicyJson, limi
     // `runfree host add <host>`; the command is built from re-validated values.
     const remediation = diagnostic.status === "allowlisted"
       ? "now allowed; rerun the failed command"
-      : sanitizeForTerminal(diagnostic.command);
+      : diagnostic.command === undefined
+        ? "refused host service; no remedy"
+        : sanitizeForTerminal(diagnostic.command);
     lines.push(`  ${host.padEnd(hostWidth)}   ${requestCountLabel(diagnostic.count).padEnd(countWidth)}   ${remediation}`);
     // Secondary option only: the exact host above stays the primary
     // suggestion; the owning service is named but never auto-applied, with

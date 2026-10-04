@@ -1513,8 +1513,23 @@ skips it. Several projects may approve the same port (two projects sharing one
 is invalid. A corrupt or
 unreadable registry makes `forward` and `vnc` refuse; the callback block is
 never a host-service port, so it is unaffected. `runfree host-service list
---repair` rebuilds the registry from each known project's selected effective
-policy generation.
+--repair` rebuilds the registry from the selected effective policy generation
+of each known project that still has a runtime (a control-plane selection or a
+rebind recovery journal). A destroyed or never-launched project contributes no
+row; its next launch records one. If any such project's selection cannot be
+read, the repair writes nothing and exits non-zero, naming the project and its
+state directory: writing without its ports could free a port it still uses.
+The reclaim is to repair or destroy that project, or to remove its state
+directory when the checkout is gone, and run the repair again.
+
+`runfree doctor` and the session-end summary classify host-service denials on
+their own, never as missing hosts (`runfree host add` refuses the reserved
+suffix): a `host-service-not-configured` request with a valid name and a port
+`add` would not refuse suggests `runfree host-service add <name> --port
+<port>`, labelled as requested by the agent; any other such request gets no
+remedy; `host-service-unavailable` and `host-service-capacity` point to
+`runfree status`. The proxy's own refusal also omits the `add` remedy for a
+statically refused port.
 
 **Host-side proof.** Each launch's topology proof checks the proxy
 `ExtraHosts` and `/etc/hosts`, the three set types and their rules, and that

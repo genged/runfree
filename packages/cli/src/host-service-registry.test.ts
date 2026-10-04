@@ -203,6 +203,24 @@ describe("repairHostServicePortRegistry", () => {
     expect(read.owners.size).toBe(1);
   });
 
+  test("a project whose ports cannot be read fails the repair closed: nothing written, every such project named; a later readable pass reclaims", async () => {
+    writeProjectPointer(PROJECT_A_ID, PROJECT_A_ROOT);
+    writeProjectPointer(PROJECT_B_ID, PROJECT_B_ROOT);
+    fs.mkdirSync(stateRoot(), { recursive: true });
+    fs.writeFileSync(registryFile(), "{ not json");
+
+    await expect(repairHostServicePortRegistry(env, (_root, id) => {
+      if (id === PROJECT_B_ID) throw new Error("active control selection is malformed");
+      return [10882];
+    })).rejects.toThrow(new RegExp(`${PROJECT_B_ROOT.replace(/\//g, "\\/")}[^\n]*active control selection is malformed`, "u"));
+    expect(fs.readFileSync(registryFile(), "utf8")).toBe("{ not json");
+    expect(fs.existsSync(lockDir())).toBe(false);
+
+    const result = await repairHostServicePortRegistry(env, (_root, id) => (id === PROJECT_A_ID ? [10882] : undefined));
+    expect(result).toEqual({ projects: 1, ports: 1 });
+    expect(readHostServicePortRegistry(env).ok).toBe(true);
+  });
+
   test("skips a hard-linked project.json pointer without aborting repair for the other known project", async () => {
     writeProjectPointer(PROJECT_A_ID, PROJECT_A_ROOT);
     const pointerB = writeProjectPointer(PROJECT_B_ID, PROJECT_B_ROOT);

@@ -9,6 +9,7 @@
 //
 // `host` is the exact-host allowlist command; this is a separate root.
 
+import fs from "node:fs";
 import path from "node:path";
 
 import type { HostServicesJson } from "@runfree/runtime-contracts/host-services";
@@ -33,6 +34,8 @@ import { recordProjectHostServicePorts, repairHostServicePortRegistry } from "..
 import { runfreeStateRoot } from "../../paths.ts";
 import { projectHash } from "../../project-identity.ts";
 import { remedy } from "../../remedies.ts";
+import { controlPlaneEffectiveSelectionPathV2 } from "../../runtime/component-state-v2.ts";
+import { controlPlaneRebindTransactionPath } from "../../runtime/control-plane-rebind.ts";
 import { nodeRuntimeIO } from "../../runtime.ts";
 import type { RuntimeContext } from "../../runtime/types.ts";
 import { formatTerminalTable } from "../../terminal-table.ts";
@@ -93,15 +96,36 @@ function selectedEffectiveHostServicePorts(runtime: RuntimeContext, activation: 
 }
 
 /**
+ * Whether a project still has a runtime: a live control-plane selection, or
+ * the rebind recovery journal that stands in for one mid-rebuild. A completed
+ * destroy removes both (and prunes the registry row), while the effective
+ * policy generation selection survives it, so repair must not read that alone
+ * or it would restore a destroyed project's row. A project that was never
+ * launched has no row to protect; its next launch records it.
+ */
+function projectHasRuntimeSelection(stateDir: string): boolean {
+  for (const file of [controlPlaneEffectiveSelectionPathV2(stateDir), controlPlaneRebindTransactionPath(stateDir)]) {
+    try {
+      if (fs.lstatSync(file).isFile()) return true;
+    } catch (error) {
+      if (!(error && typeof error === "object" && "code" in error && error.code === "ENOENT")) throw error;
+    }
+  }
+  return false;
+}
+
+/**
  * The repair reader: one known project's selected effective policy generation,
  * read from host state only. The checkout is never read, so a project whose
  * config moved or broke still contributes the ports its runtime enforces.
+ * Throws when that state cannot be read; repair then refuses to write.
  */
 export function selectedEffectiveHostServicePortsFromState(
   env: NodeJS.ProcessEnv,
   projectId: string,
 ): readonly number[] | undefined {
   const stateDir = path.join(runfreeStateRoot(env), "projects", projectId);
+  if (!projectHasRuntimeSelection(stateDir)) return undefined;
   // The effective readers need only the state-derived control paths.
   const project = { paths: projectControlPaths(stateDir) } as unknown as ProjectInfo;
   const active = readActiveControlSelection(project);
@@ -182,19 +206,16 @@ function listEffective(context: RunfreeCommandContext): void {
 }
 
 async function repairRegistry(context: RunfreeCommandContext): Promise<void> {
-  const skipped: string[] = [];
-  const counts = await repairHostServicePortRegistry(context.env, (projectRoot, projectId) => {
-    try {
-      return selectedEffectiveHostServicePortsFromState(context.env, projectId);
-    } catch (error) {
-      skipped.push(`${projectRoot}: ${error instanceof Error ? error.message : String(error)}`);
-      return undefined;
-    }
-  });
-  console.log(`host-service port registry rebuilt: ${counts.ports} port(s) from ${counts.projects} project(s)`);
-  for (const entry of skipped) {
-    console.log(`warning: skipped a project whose selected effective policy generation could not be read: ${entry}`);
+  let counts: { projects: number; ports: number };
+  try {
+    counts = await repairHostServicePortRegistry(context.env, (_projectRoot, projectId) =>
+      selectedEffectiveHostServicePortsFromState(context.env, projectId));
+  } catch (error) {
+    // Fails closed (exit non-zero, nothing written) when any known project's
+    // ports cannot be read; the message names each one and the reclaim.
+    throw new CliError(error instanceof Error ? error.message : String(error));
   }
+  console.log(`host-service port registry rebuilt: ${counts.ports} port(s) from ${counts.projects} project(s)`);
 }
 
 export const hostServiceCommand: CommandModule = {

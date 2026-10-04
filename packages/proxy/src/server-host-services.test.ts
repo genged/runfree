@@ -197,6 +197,19 @@ describe("proxy server: host-service CONNECT splice", () => {
     await echo.stop();
   }, 20_000);
 
+  test("a not-configured request on a statically refused port gets no add remedy, and the denial carries the port", async () => {
+    const echo = await startEchoServer();
+    const { proxy } = await startHostServiceProxy({ policy: hostServicePolicy({ echo: echo.port }) });
+
+    const response = await rawConnectViaProxy({ proxyPort: proxy.port, authority: "docker.runfree.internal:2375" });
+    expect(response.statusCode).toBe(403);
+    expect(response.body).toContain("host-service-not-configured");
+    expect(response.body).not.toContain("runfree host-service add");
+    await proxy.waitForOutput(/proxy-denial: [^\n]*"reason":"host-service-not-configured","host":"docker\.runfree\.internal","port":2375/);
+    await expectNoDialFor(echo);
+    await echo.stop();
+  }, 20_000);
+
   test.each([
     ["the bare suffix", () => "runfree.internal:1"],
     ["a trailing dot", (port: number) => `echo.runfree.internal.:${port}`],

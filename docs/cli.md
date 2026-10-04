@@ -233,9 +233,11 @@ idb connect 127.0.0.1 10882
   or `host-service gateway: unknown` with a warning when the proxy's gateway
   status cannot be read. These lines never change the exit code.
 - An approved port is recorded in a host-global registry. `runfree forward`
-  and `runfree vnc` in any other project refuse it and name the owning
-  project. If the registry is corrupt, they refuse until
-  `runfree host-service list --repair` rebuilds it.
+  and `runfree vnc` in any other project refuse it and name every owning
+  project; several projects may approve the same port. If the registry is
+  corrupt, they refuse until `runfree host-service list --repair` rebuilds it.
+  The repair refuses, writes nothing, and exits non-zero when a known
+  project's state cannot be read; it names that project.
 - The tunnel is opaque: no request rules, write approval, or credential
   injection apply, and the host service's own authentication is the only
   check on what the agent does there. Access is per project. See

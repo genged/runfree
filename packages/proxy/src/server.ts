@@ -59,6 +59,7 @@ import {
   HOST_SERVICE_GATEWAY_STATUS_FILE,
   isReservedRunfreeHostname,
   parseHostServiceAuthority,
+  refusedHostServicePortReason,
 } from "@runfree/runtime-contracts/host-services";
 import { createHostServiceTunnels } from "./host-service-tunnel.js";
 import { readOwnedRegularFile } from "./session-files.js";
@@ -839,6 +840,7 @@ const denialEvents = createDenialEventEmitter();
 function emitDenial(input: {
   reason: DenialReason;
   host: string;
+  port?: number;
   method?: string;
   path?: string;
   mcp?: McpDisplayFields;
@@ -847,6 +849,7 @@ function emitDenial(input: {
   denialEvents.emit({
     reason: input.reason,
     host: input.host,
+    ...(input.port !== undefined ? { port: input.port } : {}),
     method: input.method,
     path: input.path,
     ...(input.mcp !== undefined ? { mcp: input.mcp } : {}),
@@ -1901,7 +1904,7 @@ type ConnectDecision =
   | { action: "audit-pass"; host: string }
   | { action: "denied-tunnel"; host: string }
   | { action: "host-service"; name: string; port: number }
-  | { action: "reject"; host: string; reason: string; denialReason: DenialReason; remedy?: string };
+  | { action: "reject"; host: string; reason: string; denialReason: DenialReason; remedy?: string; port?: number };
 
 // Every reading of a CONNECT authority's host that a later stage could act
 // on: the bracket-stripping parse, and the raw text before the last and the
@@ -1918,13 +1921,14 @@ function reservedConnectHostCandidates(authority: string, parsedHost: string): s
   ];
 }
 
-function hostServiceNotConfigured(host: string, remedy?: string): ConnectDecision {
+function hostServiceNotConfigured(host: string, remedy?: string, port?: number): ConnectDecision {
   return {
     action: "reject",
     host,
     reason: `host-service-not-configured: ${denialReasonText("host-service-not-configured")}`,
     denialReason: "host-service-not-configured",
     ...(remedy !== undefined ? { remedy } : {}),
+    ...(port !== undefined ? { port } : {}),
   };
 }
 
@@ -1949,9 +1953,14 @@ function classifyConnect(authority: string): ConnectDecision {
     }
     // The name already matched the host-service name pattern and the port is
     // a parsed integer, so this remedy echoes no free-form agent input (SR5).
+    // A statically refused port gets no remedy: `add` would refuse it.
+    if (refusedHostServicePortReason(reserved.port) !== undefined) {
+      return hostServiceNotConfigured(host, undefined, reserved.port);
+    }
     return hostServiceNotConfigured(
       host,
       `requested by the agent; to approve: runfree host-service add ${reserved.name} --port ${reserved.port}`,
+      reserved.port,
     );
   }
   // Any other authority whose host is reserved is refused with no remedy.
@@ -2396,10 +2405,10 @@ function handleGuardedConnection(clientSocket: net.Socket, mockttpPort: number):
     );
   };
 
-  const reject = (host: string, reason: string, denialReason: DenialReason, remedy?: string) => {
+  const reject = (host: string, reason: string, denialReason: DenialReason, remedy?: string, port?: number) => {
     if (decided) return;
     settle();
-    emitDenial({ reason: denialReason, host });
+    emitDenial({ reason: denialReason, host, ...(port !== undefined ? { port } : {}) });
     clientSocket.end(rawBlockedResponse(host, reason, remedy));
   };
 
@@ -2514,14 +2523,14 @@ function handleGuardedConnection(clientSocket: net.Socket, mockttpPort: number):
 
     const decision = classifyConnect(match[1]);
     if (decision.action === "reject") {
-      reject(decision.host, decision.reason, decision.denialReason, decision.remedy);
+      reject(decision.host, decision.reason, decision.denialReason, decision.remedy, decision.port);
       return;
     }
     if (decision.action === "host-service") {
       const sessionKey = guardIdentity.identity.sessionBinding?.sessionKey;
       const host = `${decision.name}.runfree.internal`;
       if (!sessionKey) {
-        reject(host, "host-service-unavailable: the connection has no session binding", "host-service-unavailable");
+        reject(host, "host-service-unavailable: the connection has no session binding", "host-service-unavailable", undefined, decision.port);
         return;
       }
       if (decided) return;
@@ -2535,7 +2544,7 @@ function handleGuardedConnection(clientSocket: net.Socket, mockttpPort: number):
         remainder: buffered.subarray(headEnd),
         // The guard has settled, so this refusal answers the client directly.
         reject: (reason, denialReason) => {
-          emitDenial({ reason: denialReason, host });
+          emitDenial({ reason: denialReason, host, port: decision.port });
           clientSocket.end(rawBlockedResponse(host, reason));
         },
       });

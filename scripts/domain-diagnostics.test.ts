@@ -25,6 +25,53 @@ function denialLine(fields: Record<string, unknown>): string {
   })}`;
 }
 
+describe("host-service denial diagnostics", () => {
+  test("a not-configured request with a valid name and port suggests the exact host-service add, never host add", () => {
+    const [diagnostic] = diagnoseBlockedHosts(
+      denialLine({ reason: "host-service-not-configured", host: "idb.runfree.internal", port: 10882 }),
+      policy,
+    );
+    expect(diagnostic).toMatchObject({
+      host: "idb.runfree.internal",
+      status: "host-service",
+      reason: "host-service-not-configured",
+      port: 10882,
+      command: "runfree host-service add idb --port 10882",
+      commandKind: "fix",
+    });
+  });
+
+  test.each([
+    ["a statically refused port", { host: "docker.runfree.internal", port: 2375 }],
+    ["the MCP callback block", { host: "cb.runfree.internal", port: 47100 }],
+    ["no port on the event", { host: "idb.runfree.internal" }],
+    ["a port outside 1-65535", { host: "idb.runfree.internal", port: 70000 }],
+    ["a name outside the host-service pattern", { host: "1idb.runfree.internal", port: 10882 }],
+    ["the bare suffix", { host: "runfree.internal", port: 10882 }],
+    ["a nested name", { host: "a.b.runfree.internal", port: 10882 }],
+  ])("a not-configured request with %s gets no remedy", (_label, fields) => {
+    const [diagnostic] = diagnoseBlockedHosts(denialLine({ reason: "host-service-not-configured", ...fields }), policy);
+    expect(diagnostic?.status).toBe("host-service");
+    expect(diagnostic?.command).toBeUndefined();
+  });
+
+  test.each(["host-service-unavailable", "host-service-capacity"])("%s points at runfree status", (reason) => {
+    const [diagnostic] = diagnoseBlockedHosts(denialLine({ reason, host: "idb.runfree.internal", port: 10882 }), policy);
+    expect(diagnostic).toMatchObject({ status: "host-service", command: "runfree status", commandKind: "inspect" });
+  });
+
+  test("different ports of one name are separate diagnoses", () => {
+    const diagnostics = diagnoseBlockedHosts([
+      denialLine({ reason: "host-service-not-configured", host: "idb.runfree.internal", port: 10882 }),
+      denialLine({ reason: "host-service-not-configured", host: "idb.runfree.internal", port: 10883 }),
+    ].join("\n"), policy);
+    expect(diagnostics.map((diagnostic) => diagnostic.command).sort()).toEqual([
+      "runfree host-service add idb --port 10882",
+      "runfree host-service add idb --port 10883",
+    ]);
+  });
+});
+
 describe("domain diagnostics", () => {
   test("builds host add commands for missing hosts", () => {
     expect(domainAddCommandForHost("platform.claude.com")).toBe(
