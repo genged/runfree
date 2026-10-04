@@ -148,6 +148,15 @@ function harness(options: {
   vanishedResidueIds?: string[];
   /** Fails the batched residue inspect with an error that does not name a missing container. */
   failResidueInspect?: boolean;
+  /**
+   * Full control over the batched residue-description inspect's reply, for
+   * adversarial stderr/stdout shapes the present/missing model below cannot
+   * express (an id outside the chunk, a short prefix, a non-container
+   * resource, or stdout that omits a survivor nobody named absent). Called
+   * with the chunk's refs; returning `undefined` falls back to the normal
+   * present/missing reply.
+   */
+  residueInspectResponse?: (refs: readonly string[]) => CaptureResult | undefined;
 } = {}): Harness {
   const stateDir = temporaryState();
   const projectInfo = sessionTestProjectInfo();
@@ -199,8 +208,12 @@ function harness(options: {
       // The batched residue-description inspect (destroy.ts's
       // RESIDUE_INSPECT_FORMAT): keyed by `{{.Id}}`, one or many refs.
       if (format.startsWith("{{.Id}}\t")) {
-        if (options.failResidueInspect) return fail("Cannot connect to the Docker daemon");
         const refs = args.slice(formatIndex + 2);
+        if (options.residueInspectResponse) {
+          const custom = options.residueInspectResponse(refs);
+          if (custom) return custom;
+        }
+        if (options.failResidueInspect) return fail("Cannot connect to the Docker daemon");
         const present = refs.filter((id) => !removedContainers.has(id));
         const missing = refs.filter((id) => removedContainers.has(id));
         const lines = present.map((id) => `${id}\t/${id.slice(0, 12)}\timage:test\trunning`);
@@ -812,6 +825,119 @@ describe("fenced project destroy", () => {
 
     const plain = harness({ residueIds: ids, residueRunning: false, failResidueInspect: true });
     expect(runFencedProjectDestroy(plain.input)).toBe(1);
+  });
+
+  // The anchoring that the churn-tolerant parse above depends on: a chunk's
+  // failed inspect must drop an id only when stderr names *that exact* id,
+  // *of this chunk*, and stdout proves every other member of the chunk, not
+  // on some looser signal. This path feeds `container rm --force`, so a false
+  // match here would mean destroy silently misses stale residue (AGENTS.md's
+  // negative-test rule for a sensitive side effect).
+
+  test("a residue inspect failure naming an id outside the chunk drops nothing", () => {
+    // Docker should never name an id this chunk's argv never mentioned, but
+    // defensively: an id named absent that was not actually one of our
+    // candidates must not be read as evidence about any of them.
+    const ids = ["d".repeat(64), "e".repeat(64), "f".repeat(64)];
+    const outsider = "9".repeat(64);
+    const forced = harness({
+      residueIds: ids,
+      force: true,
+      // The guard confines the adversarial reply to the one call that
+      // inspects every original candidate; any later pass (after a
+      // successful removal shrinks the candidate set) falls back to the
+      // harness's normal present/missing reply instead of replaying stale
+      // output for ids that are no longer being asked about.
+      residueInspectResponse: (refs) => (refs.length !== ids.length ? undefined : {
+        status: 1,
+        stdout: `${refs.map((id) => `${id}\t/${id.slice(0, 12)}\timage:test\trunning`).join("\n")}\n`,
+        stderr: `Error: No such container: ${outsider}`,
+      }),
+    });
+    expect(runFencedProjectDestroy(forced.input)).toBe(0);
+    for (const id of ids) {
+      expect(forced.calls.some((call) => call[1] === "container" && call[2] === "rm" && call.at(-1) === id)).toBe(true);
+    }
+  });
+
+  test("a residue inspect failure naming only a short prefix of a chunk id drops nothing", () => {
+    // Docker's own absence messages name the full id. A short prefix that
+    // happens to match the start of a real candidate must not be read as
+    // proof that candidate is gone: the anchoring is exact-string membership
+    // in the chunk, never a prefix or substring test.
+    const ids = ["d".repeat(64), "e".repeat(64), "f".repeat(64)];
+    const shortPrefix = (ids[0] as string).slice(0, 12);
+    const forced = harness({
+      residueIds: ids,
+      force: true,
+      residueInspectResponse: (refs) => (refs.length !== ids.length ? undefined : {
+        status: 1,
+        stdout: `${refs.map((id) => `${id}\t/${id.slice(0, 12)}\timage:test\trunning`).join("\n")}\n`,
+        stderr: `Error: No such container: ${shortPrefix}`,
+      }),
+    });
+    expect(runFencedProjectDestroy(forced.input)).toBe(0);
+    for (const id of ids) {
+      expect(forced.calls.some((call) => call[1] === "container" && call[2] === "rm" && call.at(-1) === id)).toBe(true);
+    }
+  });
+
+  test("a residue inspect failure naming a non-container resource drops nothing", () => {
+    // "No such object: foo" (not an id-shaped token at all) and "No such
+    // image: <id>" (a real id, but the wrong keyword and the wrong kind of
+    // resource) must both be ignored: this parse only trusts "No such
+    // container"/"No such object" naming a container id, never any "No
+    // such ...:" line.
+    const ids = ["d".repeat(64), "e".repeat(64), "f".repeat(64)];
+    const forced = harness({
+      residueIds: ids,
+      force: true,
+      residueInspectResponse: (refs) => (refs.length !== ids.length ? undefined : {
+        status: 1,
+        stdout: `${refs.map((id) => `${id}\t/${id.slice(0, 12)}\timage:test\trunning`).join("\n")}\n`,
+        stderr: `Error: No such object: foo\nError: No such image: ${ids[0]}`,
+      }),
+    });
+    expect(runFencedProjectDestroy(forced.input)).toBe(0);
+    for (const id of ids) {
+      expect(forced.calls.some((call) => call[1] === "container" && call[2] === "rm" && call.at(-1) === id)).toBe(true);
+    }
+  });
+
+  test("a chunk whose stdout omits an unnamed survivor falls back entirely, even for the id stderr did name", () => {
+    // Docker names one id (the first) absent for real, but stdout is missing
+    // a line for a third id nobody named absent. That gap means stdout is not
+    // a trustworthy full accounting of the chunk, so the survivor-count check
+    // must reject it — and the id stderr *did* genuinely name must still not
+    // be dropped: an unreadable batch falls back to the old per-id fallback
+    // for every id in it, not a partial trust of the part that looked clean.
+    const ids = ["d".repeat(64), "e".repeat(64), "f".repeat(64)];
+    const forced = harness({
+      residueIds: ids,
+      force: true,
+      residueInspectResponse: (refs) => (refs.length !== ids.length ? undefined : {
+        status: 1,
+        // Only the second id survives in stdout; the third is silently
+        // missing even though stderr never named it absent either.
+        stdout: `${refs[1]}\t/${(refs[1] as string).slice(0, 12)}\timage:test\trunning\n`,
+        stderr: `Error: No such container: ${refs[0]}`,
+      }),
+    });
+    expect(runFencedProjectDestroy(forced.input)).toBe(0);
+    for (const id of ids) {
+      expect(forced.calls.some((call) => call[1] === "container" && call[2] === "rm" && call.at(-1) === id)).toBe(true);
+    }
+  });
+
+  test("every residue candidate vanishing between ps and inspect leaves no residue at all", () => {
+    // The discriminating case for the vanished-id drop: when every listed
+    // candidate is proven gone (all named absent, stdout empty), the result
+    // must be empty residue — plain destroy succeeds on its own, with no
+    // --force needed — rather than an implementation that only drops ids when
+    // at least one survivor remains to anchor the arithmetic.
+    const ids = ["d".repeat(64), "e".repeat(64)];
+    const plain = harness({ residueIds: ids, residueRunning: false, vanishedResidueIds: ids });
+    expect(runFencedProjectDestroy(plain.input)).toBe(0);
   });
 
   test("plain destroy refuses a quarantined unreadable record; --force proceeds and clears the evidence", () => {
