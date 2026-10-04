@@ -1,9 +1,11 @@
 import { corroboratedComposeServiceContainerFilters, REBIND_ATTEMPT_LABEL, REBIND_TRANSACTION_LABEL } from "./container-inventory.ts";
 import type { ControlPlaneRebindTransaction } from "./control-plane-rebind.ts";
 import type { ActiveRuntimePlan } from "./plan.ts";
-import type { DockerNetworkInspect, RuntimeIO } from "./types.ts";
+import type { CaptureResult, DockerNetworkInspect, RuntimeIO } from "./types.ts";
 import { observeExactProxy } from "./proxy-containment.ts";
 import { RuntimeObservationError } from "./observation-failure.ts";
+import { createDockerClient } from "./docker-client.ts";
+import { filterValues } from "./docker.ts";
 
 /** Inspect creation crash windows before any force-recreate, using the journal's marker. */
 export function inspectRebindCreation(input: {
@@ -17,15 +19,17 @@ export function inspectRebindCreation(input: {
     throw new RuntimeObservationError({ kind, subject: "proxy", expectedIdentity: transaction.transactionId,
       phase: transaction.phase, observation });
   };
-  const capture = (args: string[]) => {
-    assertAuthority();
-    const result = io.capture("docker", args, { env: plan.execution.dockerClientEnv, timeout: 1000, maxBuffer: 1024 * 1024 });
+  const client = createDockerClient(io, { env: plan.execution.dockerClientEnv, timeout: 1000, maxBuffer: 1024 * 1024 });
+  const verify = (result: CaptureResult): string => {
     assertAuthority();
     if (result.status !== 0 || result.stderr.trim()) return fail("observation-unavailable", "proxy creation inventory is unavailable; no container was replaced");
     return result.stdout;
   };
-  const ids = capture(["ps", "--all", "--quiet", "--no-trunc", ...corroboratedComposeServiceContainerFilters(plan.projectId, plan.composeProjectName, "proxy")])
-    .trim().split(/\s+/u).filter(Boolean);
+  assertAuthority();
+  const ids = verify(client.listContainers({
+    all: true, quiet: true, noTrunc: true,
+    filters: filterValues(corroboratedComposeServiceContainerFilters(plan.projectId, plan.composeProjectName, "proxy")),
+  })).trim().split(/\s+/u).filter(Boolean);
   if (ids.length > 1 || ids.some((id) => !/^[a-f0-9]{64}$/u.test(id))) fail("identity-contradiction", "proxy creation inventory is ambiguous; inspect exact containers before repair");
   const proxy = ids[0] ? observeExactProxy({ proxyId: ids[0], projectId: plan.projectId, composeProject: plan.composeProjectName,
     io, env: plan.execution.dockerClientEnv, assertAuthority }) : undefined;
@@ -37,8 +41,9 @@ export function inspectRebindCreation(input: {
     fail("identity-contradiction", "unrecorded proxy has no exact creation marker or predecessor identity; automatic adoption and removal refused");
   }
   let networks: DockerNetworkInspect[];
-  try { networks = JSON.parse(capture(["network", "inspect", transaction.oldControlPlane.networkIds.agentInternal,
-    transaction.oldControlPlane.networkIds.proxyEgress])) as DockerNetworkInspect[]; }
+  assertAuthority();
+  try { networks = JSON.parse(verify(client.inspect([transaction.oldControlPlane.networkIds.agentInternal,
+    transaction.oldControlPlane.networkIds.proxyEgress], { type: "network" }))) as DockerNetworkInspect[]; }
   catch (error) { if (error instanceof RuntimeObservationError) throw error; return fail("observation-unavailable", "retained network inspection is malformed"); }
   if (!Array.isArray(networks) || networks.length !== 2) fail("observation-unavailable", "retained network inspection is incomplete");
   for (const [index, logical] of ["agent_internal", "proxy_egress"].entries()) {
@@ -77,8 +82,9 @@ export function rebindParticipantIsAbsent(input: {
 }): boolean {
   if (!input.containerId) return false;
   input.assertAuthority();
-  const found = input.io.capture("docker", ["ps", "--all", "--quiet", "--no-trunc", "--filter", `id=${input.containerId}`],
-    { env: input.env, timeout: 1000, maxBuffer: 8192 });
+  const found = createDockerClient(input.io, { env: input.env, timeout: 1000, maxBuffer: 8192 }).listContainers({
+    all: true, quiet: true, noTrunc: true, filters: [`id=${input.containerId}`],
+  });
   input.assertAuthority();
   if (found.status !== 0 || found.stderr.trim()) throw new RuntimeObservationError({ kind: "observation-unavailable", subject: "session",
     expectedIdentity: input.containerId, phase: "sessions-revalidated", observation: "session departure inventory is unavailable; preserve its participant receipt" });

@@ -221,7 +221,7 @@ describe("post-mutation control activation", () => {
           "com.docker.compose.project": composeProjectName(root), "com.docker.compose.service": "proxy",
         } } }]), stderr: "" };
       }
-      if (args[0] === "stop") { stops.push(args.at(-1) as string); running = false; return { status: 0, stdout: replacementId, stderr: "" }; }
+      if (args[0] === "container" && args[1] === "stop") { stops.push(args.at(-1) as string); running = false; return { status: 0, stdout: replacementId, stderr: "" }; }
       throw new Error(`unexpected Docker effect: ${args.join(" ")}`);
     } };
     await expect(activateApprovedControlsAfterMutation(context, io, { timeoutMs: 0 }))

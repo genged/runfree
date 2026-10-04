@@ -32,29 +32,16 @@ export const DOCKER_LITERAL_ALLOWLIST: Readonly<Record<string, string>> = {
   "packages/cli/src/runtime/operation-histogram.ts": "classifier: `command !== \"docker\"` routes histogram categorization; builds no argv",
   "packages/cli/src/runtime/control-plane-rebind-budget.ts": "classifier: `command === \"docker\"` gates budget accounting by command name; builds no argv",
   "packages/cli/src/runtime/session-admission-docker-gateway.ts": "classifier: types the gateway's accepted executable, compares `command !== \"docker\"` to pass through non-Docker calls, and labels histogram categories; builds no argv itself",
-  "packages/cli/src/runtime.ts": "pending: Task 4",
 
   // classifier: the one remaining literal names the probe target for
   // io.commandExists, not argv; every docker argv in this file builds
   // through createDockerClient (docker-client.ts)
   "packages/cli/src/runtime/docker.ts": "classifier: io.commandExists(\"docker\", ...) names the availability-probe target, not argv; every docker argv in this file builds through createDockerClient",
 
-  // pending: Task 4
-  "packages/cli/src/runtime/startup.ts": "pending: Task 4",
-  "packages/cli/src/runtime/topology.ts": "pending: Task 4",
-  "packages/cli/src/runtime/warm-proof.ts": "pending: Task 4",
-  "packages/cli/src/runtime/control-plane-effective-proof.ts": "pending: Task 4",
-  "packages/cli/src/runtime/control-plane-rebind-docker.ts": "pending: Task 4",
-  "packages/cli/src/runtime/proxy-containment.ts": "pending: Task 4",
-  "packages/cli/src/runtime/proxy-firewall-readiness.ts": "pending: Task 4",
-  "packages/cli/src/runtime/rebind-trust-receipt.ts": "pending: Task 4",
-  "packages/cli/src/runtime/state.ts": "pending: Task 4",
-  "packages/cli/src/runtime/probes.ts": "pending: Task 4",
-  "packages/cli/src/runtime/attach.ts": "pending: Task 4",
-  "packages/cli/src/runtime/images.ts": "pending: Task 4",
-  "packages/cli/src/runtime/dependency-overlays.ts": "pending: Task 4",
-  "packages/cli/src/control/activation.ts": "pending: Task 4",
-  "packages/cli/src/runtime/stopped-selection.ts": "pending: Task 4",
+  // classifier: Pick<StoppedSelectionDeps, "docker" | ...> names the deps
+  // field by its own key, not argv; the `docker` dependency is the typed
+  // client runtime.ts builds via createDockerClient, not a hand-written call
+  "packages/cli/src/runtime/stopped-selection.ts": "classifier: Pick<StoppedSelectionDeps, \"docker\" | ...> names the deps field by its own key, not argv; the docker dependency is the typed client runtime.ts builds via createDockerClient",
 
   // pending: Task 5
   "packages/cli/src/runtime/destroy.ts": "pending: Task 5",

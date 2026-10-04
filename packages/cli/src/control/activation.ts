@@ -1,6 +1,7 @@
 import { projectHash } from "../project-identity.ts";
 import { corroboratedComposeServiceContainerFilters } from "../runtime/container-inventory.ts";
-import { readProxyControlReceipts, dockerClientEnvOptions } from "../runtime/docker.ts";
+import { readProxyControlReceipts, dockerClientEnvOptions, filterValues } from "../runtime/docker.ts";
+import { createDockerClient } from "../runtime/docker-client.ts";
 import { composeProjectName } from "../runtime/env.ts";
 import { containExactOwnedProxy } from "../runtime/proxy-containment.ts";
 import { tryAcquireProjectLifecycleLockWithRetry } from "../runtime/sessions.ts";
@@ -35,16 +36,15 @@ type ActivationConsumer = {
  */
 export function discoverLiveProxyId(context: RuntimeContext, io: RuntimeIO): string | undefined {
   const composeProject = composeProjectName(context.projectRoot);
-  const discovery = io.capture("docker", [
-    "ps",
-    "-q",
-    "--no-trunc",
-    ...corroboratedComposeServiceContainerFilters(
+  const discovery = createDockerClient(io, dockerClientEnvOptions(context)).listContainers({
+    quiet: true,
+    noTrunc: true,
+    filters: filterValues(corroboratedComposeServiceContainerFilters(
       projectHash(context.projectRoot),
       composeProject,
       "proxy",
-    ),
-  ], { ...dockerClientEnvOptions(context), timeout: 1000, maxBuffer: 8192 });
+    )),
+  }, { timeout: 1000, maxBuffer: 8192 });
   if (discovery.status !== 0 || discovery.stderr.trim()) {
     const detail = discovery.stderr.replace(/\s+/g, " ").trim();
     throw new Error(`could not identify the live proxy consumer${detail ? `: ${detail}` : ""}`);

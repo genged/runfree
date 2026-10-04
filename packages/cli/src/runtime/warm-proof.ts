@@ -36,6 +36,7 @@ import { ROOT_UID_GID, RUNTIME_VALIDATION_MARKER_PATH } from "./constants.ts";
 import type { ControlPlaneEffectiveSelectionV2 } from "./component-state-v2.ts";
 import type { DenyByDefaultObservationV1 } from "./control-plane-deny-proof.ts";
 import { dockerClientEnvOptions, type DockerDaemonIdentity } from "./docker.ts";
+import { createDockerClient } from "./docker-client.ts";
 import { composeProjectName } from "./env.ts";
 import { launchHostRecordPath, readLaunchHostRecord, removeLaunchHostRecord, writeLaunchHostRecord } from "./launch-host-record.ts";
 import type { ActiveRuntimePlan } from "./plan.ts";
@@ -218,10 +219,11 @@ type WarmObservation = Readonly<{
 }>;
 
 function inspectObjects(input: WarmProofInput, targets: readonly string[]): unknown[] | string {
-  const result = input.io.capture("docker", ["inspect", ...targets], {
-    ...dockerClientEnvOptions(input.context),
-    maxBuffer: WARM_INSPECT_MAX_BYTES,
-  });
+  const result = createDockerClient(input.io, dockerClientEnvOptions(input.context)).inspect(
+    targets,
+    {},
+    { maxBuffer: WARM_INSPECT_MAX_BYTES },
+  );
   if (result.status !== 0) return `docker inspect exited ${result.status}`;
   let parsed: unknown;
   try {
@@ -291,10 +293,12 @@ function observeWarmRuntime(input: WarmProofInput): WarmObservation | string {
   } catch (error) {
     return error instanceof Error ? error.message : String(error);
   }
-  const batch = input.io.capture("docker", ["exec", "--user", ROOT_UID_GID, proxyId, "sh", "-c", firewallSectionBatchScript(commands)], {
-    ...dockerClientEnvOptions(input.context),
-    maxBuffer: WARM_BATCH_MAX_BYTES,
-  });
+  const batch = createDockerClient(input.io, dockerClientEnvOptions(input.context)).exec(
+    proxyId,
+    ["sh", "-c", firewallSectionBatchScript(commands)],
+    { user: ROOT_UID_GID },
+    { maxBuffer: WARM_BATCH_MAX_BYTES },
+  );
   const sections = parseFirewallSectionBatch(batch, commands.length);
   if (!sections) return "the proxy root batch was missing or garbled";
   return Object.freeze({

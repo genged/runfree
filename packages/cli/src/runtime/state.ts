@@ -19,6 +19,7 @@ import { warn } from "../warnings.ts";
 import { ROOT_UID_GID, RUNTIME_VALIDATION_MARKER_PATH } from "./constants.ts";
 import { updateCodexConfig } from "./codex-config.ts";
 import { dockerClientEnvOptions, envOptions, serviceContainerId, shellSingleQuote } from "./docker.ts";
+import { createDockerClient } from "./docker-client.ts";
 import { composeProjectName, projectHash } from "./env.ts";
 import {
   type HostGitRelativeWorktreesCapability,
@@ -129,10 +130,11 @@ export function writeRuntimeValidationMarkerResult(
     `chmod 600 ${shellSingleQuote(tmpPath)}`,
     `mv ${shellSingleQuote(tmpPath)} ${shellSingleQuote(RUNTIME_VALIDATION_MARKER_PATH)}`,
   ].join("; ");
-  const result = io.capture(
-    "docker",
-    ["exec", "--user", ROOT_UID_GID, "-i", proxyId, "sh", "-c", command],
-    { ...dockerClientEnvOptions(context), input: marker },
+  const result = createDockerClient(io, dockerClientEnvOptions(context)).exec(
+    proxyId,
+    ["sh", "-c", command],
+    { interactive: true, user: ROOT_UID_GID },
+    { input: marker },
   );
   if (result.status !== 0) {
     return { issue: `could not write runtime validation marker: ${compactDiagnostic(`${result.stderr}\n${result.stdout}`) || `exit ${result.status}`}` };
@@ -158,10 +160,10 @@ export function runtimeValidationMarkerStatus(
   if (agentId) {
     return { issue: "shared agent container is running but the per-session runtime forbids it" };
   }
-  const result = io.capture(
-    "docker",
-    ["exec", "--user", ROOT_UID_GID, proxyId, "cat", RUNTIME_VALIDATION_MARKER_PATH],
-    dockerClientEnvOptions(context),
+  const result = createDockerClient(io, dockerClientEnvOptions(context)).exec(
+    proxyId,
+    ["cat", RUNTIME_VALIDATION_MARKER_PATH],
+    { user: ROOT_UID_GID },
   );
   if (result.status !== 0) return { issue: "runtime validation marker is missing" };
   return runtimeValidationMarkerProof(context, result.stdout, proxyId, { ...options, components });
@@ -244,10 +246,10 @@ export function removeRuntimeValidationMarker(context: RuntimeContext, io: Runti
     "set -e",
     `rm -f ${shellSingleQuote(RUNTIME_VALIDATION_MARKER_PATH)} ${shellSingleQuote(tmpPath)}`,
   ].join("; ");
-  const result = io.capture(
-    "docker",
-    ["exec", "--user", ROOT_UID_GID, proxyId, "sh", "-c", command],
-    dockerClientEnvOptions(context),
+  const result = createDockerClient(io, dockerClientEnvOptions(context)).exec(
+    proxyId,
+    ["sh", "-c", command],
+    { user: ROOT_UID_GID },
   );
   if (result.status !== 0) {
     return `could not remove stale runtime validation marker: ${compactDiagnostic(`${result.stderr}\n${result.stdout}`) || `exit ${result.status}`}`;

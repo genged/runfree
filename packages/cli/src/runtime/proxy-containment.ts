@@ -1,6 +1,7 @@
 import { CONTAINER_ROLE_LABEL } from "./container-inventory.ts";
 import { PROJECT_ID_LABEL } from "./constants.ts";
 import { RuntimeObservationError } from "./observation-failure.ts";
+import { createDockerClient } from "./docker-client.ts";
 import type { DockerContainerInspect, RuntimeIO } from "./types.ts";
 
 export type ExactProxySubject = Readonly<{
@@ -20,16 +21,18 @@ export function observeExactProxy(input: ExactProxySubject & {
       phase: "proxy-inventory", observation });
   };
   if (!/^[a-f0-9]{64}$/u.test(input.proxyId)) fail("identity-contradiction", "exact proxy identity is required");
+  const client = createDockerClient(input.io, { env: input.env });
   input.assertAuthority();
-  const inventory = input.io.capture("docker", ["ps", "--all", "--quiet", "--no-trunc", "--filter", `id=${input.proxyId}`],
-    { env: input.env, timeout: 1000, maxBuffer: 8192 });
+  const inventory = client.listContainers(
+    { all: true, quiet: true, noTrunc: true, filters: [`id=${input.proxyId}`] },
+    { timeout: 1000, maxBuffer: 8192 },
+  );
   input.assertAuthority();
   if (inventory.status !== 0 || inventory.stderr.trim()) fail("observation-unavailable", "exact proxy inventory is unavailable");
   const ids = inventory.stdout.trim().split(/\s+/u).filter(Boolean);
   if (!ids.length) return undefined;
   if (ids.length !== 1 || ids[0] !== input.proxyId) fail("identity-contradiction", "exact proxy inventory returned another identity");
-  const result = input.io.capture("docker", ["container", "inspect", input.proxyId],
-    { env: input.env, timeout: 1000, maxBuffer: 1024 * 1024 });
+  const result = client.inspect([input.proxyId], { type: "container" }, { timeout: 1000, maxBuffer: 1024 * 1024 });
   input.assertAuthority();
   if (result.status !== 0 || result.stderr.trim()) fail("observation-unavailable", "exact proxy inspection is unavailable");
   let parsed: DockerContainerInspect[];
@@ -54,8 +57,7 @@ export function containExactOwnedProxy(input: Parameters<typeof observeExactProx
   const proxy = observeExactProxy(input);
   if (!proxy || proxy.State?.Running === false) return;
   input.assertAuthority();
-  const stopped = input.io.capture("docker", ["stop", "--time", "5", input.proxyId],
-    { env: input.env, timeout: 7000, maxBuffer: 8192 });
+  const stopped = createDockerClient(input.io, { env: input.env }).stopContainers([input.proxyId], 5, { timeout: 7000, maxBuffer: 8192 });
   input.assertAuthority();
   const observed = observeExactProxy(input);
   if (stopped.status !== 0 || observed?.State?.Running !== false && observed !== undefined) {

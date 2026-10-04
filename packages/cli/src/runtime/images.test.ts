@@ -1159,7 +1159,7 @@ test("cleanup removes exact zero-reference project image IDs; a v1 manifest refe
       if (command === "docker" && args.slice(0, 3).join(" ") === "container ls --all") {
         return { status: 0, stdout: "", stderr: "" };
       }
-      if (command === "docker" && args.slice(0, 3).join(" ") === "image ls --no-trunc") {
+      if (command === "docker" && args.slice(0, 3).join(" ") === "image ls --quiet") {
         return {
           status: 0,
           stdout: [effectiveId, staleId].filter((id) => !removedIds.has(id)).join("\n"),
@@ -1276,7 +1276,7 @@ test.each<[string, GcInspectAnswer]>([
       if (command === "docker" && args.slice(0, 3).join(" ") === "container ls --all") {
         return { status: 0, stdout: "", stderr: "" };
       }
-      if (command === "docker" && args.slice(0, 3).join(" ") === "image ls --no-trunc") {
+      if (command === "docker" && args.slice(0, 3).join(" ") === "image ls --quiet") {
         return { status: 0, stdout: staleIds.join("\n"), stderr: "" };
       }
       if (command === "docker" && args.slice(0, 2).join(" ") === "image inspect") {
@@ -1452,7 +1452,7 @@ test.each([
           stderr: "",
         };
       }
-      if (command === "docker" && args.slice(0, 3).join(" ") === "image ls --no-trunc") {
+      if (command === "docker" && args.slice(0, 3).join(" ") === "image ls --quiet") {
         return { status: 0, stdout: staleId, stderr: "" };
       }
       if (command === "docker" && args.slice(0, 2).join(" ") === "image inspect") {
@@ -1510,7 +1510,7 @@ test("cleanup without a durable effective control plane never reads the proxy's 
       if (command === "docker" && args.slice(0, 3).join(" ") === "container ls --all") {
         return { status: 0, stdout: "", stderr: "" };
       }
-      if (command === "docker" && args.slice(0, 3).join(" ") === "image ls --no-trunc") {
+      if (command === "docker" && args.slice(0, 3).join(" ") === "image ls --quiet") {
         return { status: 0, stdout: staleId, stderr: "" };
       }
       if (command === "docker" && args.slice(0, 2).join(" ") === "image inspect") {

@@ -1,6 +1,7 @@
 import { clearEffectiveControlPlaneV2, readEffectiveControlPlaneSelectionV2 } from "./component-state-v2.ts";
 import { readControlPlaneRebindTransaction } from "./control-plane-rebind.ts";
 import { peekSessionContainerRecordsV2, type SessionContainerProjectIdentity } from "./session-containers.ts";
+import type { DockerClient } from "./docker-client.ts";
 import type { CaptureResult } from "./types.ts";
 
 export type StoppedSelectionDeps = Readonly<{
@@ -8,8 +9,8 @@ export type StoppedSelectionDeps = Readonly<{
   peekRecords: typeof peekSessionContainerRecordsV2;
   readRebind: typeof readControlPlaneRebindTransaction;
   clearSelection: typeof clearEffectiveControlPlaneV2;
-  /** One bounded `docker` read; any failure or stderr is doubt. */
-  docker: (args: readonly string[]) => CaptureResult;
+  /** One bounded Docker client; any failure or stderr is doubt. */
+  docker: Pick<DockerClient, "listContainers" | "listObjects">;
   assertAuthority: () => void;
 }>;
 
@@ -66,17 +67,16 @@ export function clearStoppedControlPlaneSelection(
     return "unverified";
   }
   /** Empty answer: proved absent. Listed: retained. Anything else: no proof. */
-  const listing = (args: readonly string[]): "empty" | "listed" | "unverified" => {
-    const result = docker(args);
+  const listing = (result: CaptureResult): "empty" | "listed" | "unverified" => {
     if (result.status !== 0 || result.stderr.trim() !== "") return "unverified";
     return result.stdout.trim() === "" ? "empty" : "listed";
   };
-  for (const args of [
-    ["ps", "--all", "--quiet", "--no-trunc", "--filter", `id=${selection.proxyContainerId}`],
-    ["network", "ls", "--quiet", "--no-trunc", "--filter", `id=${selection.networkIds.agentInternal}`],
-    ["network", "ls", "--quiet", "--no-trunc", "--filter", `id=${selection.networkIds.proxyEgress}`],
+  for (const check of [
+    () => docker.listContainers({ all: true, quiet: true, noTrunc: true, filters: [`id=${selection.proxyContainerId}`] }),
+    () => docker.listObjects("network", { quiet: true, noTrunc: true, filters: [`id=${selection.networkIds.agentInternal}`] }),
+    () => docker.listObjects("network", { quiet: true, noTrunc: true, filters: [`id=${selection.networkIds.proxyEgress}`] }),
   ]) {
-    const answer = listing(args);
+    const answer = listing(check());
     if (answer !== "empty") return answer === "listed" ? "retained" : "unverified";
   }
   assertAuthority();

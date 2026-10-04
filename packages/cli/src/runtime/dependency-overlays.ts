@@ -22,6 +22,7 @@ import {
   type RuntimeToolStoreName,
 } from "./dependency-stores.ts";
 import { dockerClientEnvOptions, envOptions, parseDockerJson, shellSingleQuote, type RuntimeDocker } from "./docker.ts";
+import { createDockerClient } from "./docker-client.ts";
 import { composeProjectName } from "./env.ts";
 import { prepareGitRepositoryLayoutResult, readPersistedGitLayoutPlan } from "./git-layout.ts";
 import { EPHEMERAL_HELPER_FENCE_REQUIRED, runEphemeralHelper, type EphemeralHelperFence } from "./ephemeral-helper.ts";
@@ -1322,10 +1323,9 @@ function assertDependencyPrepVolumes(
   project: string,
   volumes: readonly DependencyPrepVolume[],
 ): string | undefined {
-  const inspected = io.capture(
-    "docker",
-    ["volume", "inspect", ...volumes.map((volume) => volume.name)],
-    dockerClientEnvOptions(context),
+  const inspected = createDockerClient(io, dockerClientEnvOptions(context)).inspect(
+    volumes.map((volume) => volume.name),
+    { type: "volume" },
   );
   if (inspected.status !== 0) {
     return `dependency volume inspection failed before preparation: ${compactDiagnostic(inspected.stderr) || `exit ${inspected.status}`}`;
@@ -1801,7 +1801,7 @@ function runningAgentDependencyOverlayState(
   if (!target) return "absent";
   const agentId = target.containerId;
   const inspected = parseDockerJson<DockerInspectContainer[]>(
-    io.capture("docker", ["inspect", agentId], dockerClientEnvOptions(context)),
+    createDockerClient(io, dockerClientEnvOptions(context)).inspect([agentId]),
     "dependency overlay runtime inspection",
   );
   const agent = inspected?.[0];
@@ -1974,7 +1974,7 @@ export async function depsRuntime(
         if (!io.confirm(`Remove ${volumes.length} Runfree dependency volume(s)? [y/N] `)) return 1;
       }
       adapters.docker.assertAvailable();
-      return io.run("docker", ["volume", "rm", ...volumes], dockerClientEnvOptions(context));
+      return createDockerClient(io, dockerClientEnvOptions(context)).terminal.removeVolumes(volumes);
     }
   }
 }
