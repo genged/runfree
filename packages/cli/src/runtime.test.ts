@@ -7068,7 +7068,8 @@ describe("runtime command flow", () => {
       command: "docker",
       args: [
         "ps",
-        "-aq",
+        "--all",
+        "--quiet",
         "--no-trunc",
         "--filter",
         `label=${PROJECT_ID_LABEL}=${projectHash(projectRoot)}`,
@@ -7395,7 +7396,7 @@ describe("runtime command flow", () => {
           && args.includes("label=com.docker.compose.service=agent")) {
           return captureResult(0, "agent-id\n");
         }
-        if (command === "docker" && args[0] === "exec" && args[1] === "-i" && args.includes("1000:1000") && args.includes(FAKE_AGENT_CONTAINER_ID)) {
+        if (command === "docker" && args[0] === "exec" && args[1] === "--interactive" && args.includes("1000:1000") && args.includes(FAKE_AGENT_CONTAINER_ID)) {
           return captureResult(0, [
             "101\t/dev/pts/0\tzsh",
             "122\t/dev/pts/0\tclaude --dangerously-skip-permissions",
@@ -7439,7 +7440,7 @@ describe("runtime command flow", () => {
       && call.args[0] === "exec"
       && call.args.includes(FAKE_AGENT_CONTAINER_ID));
     const probeScript = probeCall?.input;
-    expect(probeCall?.args).toEqual(["exec", "-i", "--user", "1000:1000", FAKE_AGENT_CONTAINER_ID, "sh", "-s"]);
+    expect(probeCall?.args).toEqual(["exec", "--interactive", "--user", "1000:1000", FAKE_AGENT_CONTAINER_ID, "sh", "-s"]);
     expect(probeScript).toContain("\n");
     const syntax = childProcess.spawnSync("sh", ["-n"], { encoding: "utf8", input: probeScript ?? "" });
     expect(syntax.status, syntax.stderr).toBe(0);
@@ -7507,7 +7508,7 @@ describe("runtime command flow", () => {
           && args.includes("label=com.docker.compose.service=agent")) {
           return captureResult(0, "agent-id\n");
         }
-        if (command === "docker" && args[0] === "exec" && args[1] === "-i"
+        if (command === "docker" && args[0] === "exec" && args[1] === "--interactive"
           && args.includes("1000:1000") && args.includes(FAKE_AGENT_CONTAINER_ID)) {
           return captureResult(0, confirmationFinished
             ? "201\t/dev/pts/1\tcodex --dangerously-bypass-approvals-and-sandbox\n"
@@ -7552,7 +7553,7 @@ describe("runtime command flow", () => {
           && args.includes("label=com.docker.compose.service=agent")) {
           return captureResult(0, "agent-id\n");
         }
-        if (command === "docker" && args[0] === "exec" && args[1] === "-i"
+        if (command === "docker" && args[0] === "exec" && args[1] === "--interactive"
           && args.includes("1000:1000") && args.includes(FAKE_AGENT_CONTAINER_ID)) {
           return captureResult(0, confirmationFinished
             ? "101\t/dev/pts/0\tclaude --dangerously-skip-permissions\n102\t/dev/pts/0\tbash tool.sh\n"
@@ -7595,7 +7596,7 @@ describe("runtime command flow", () => {
           && args.includes("label=com.docker.compose.service=agent")) {
           return captureResult(0, "agent-id\n");
         }
-        if (command === "docker" && args[0] === "exec" && args[1] === "-i"
+        if (command === "docker" && args[0] === "exec" && args[1] === "--interactive"
           && args.includes("1000:1000") && args.includes(FAKE_AGENT_CONTAINER_ID)) {
           activeProbeCount += 1;
           return captureResult(0, "101\t/dev/pts/0\tclaude --dangerously-skip-permissions\n");
@@ -7677,7 +7678,7 @@ describe("runtime command flow", () => {
           && args.includes("label=com.docker.compose.service=agent")) {
           return captureResult(0, "agent-id\n");
         }
-        if (command === "docker" && args[0] === "exec" && args[1] === "-i" && args.includes("1000:1000") && args.includes(FAKE_AGENT_CONTAINER_ID)) {
+        if (command === "docker" && args[0] === "exec" && args[1] === "--interactive" && args.includes("1000:1000") && args.includes(FAKE_AGENT_CONTAINER_ID)) {
           return captureResult(0, "201\t/dev/pts/1\trf-20260517-a1b2c3\t/usr/bin/codex --dangerously-bypass-approvals-and-sandbox\n");
         }
         return captureResult(0);
@@ -7774,7 +7775,7 @@ describe("runtime command flow", () => {
           && args.includes("label=com.docker.compose.service=agent")) {
           return captureResult(0, "agent-id\n");
         }
-        if (command === "docker" && args[0] === "exec" && args[1] === "-i" && args.includes("1000:1000") && args.includes(FAKE_AGENT_CONTAINER_ID)) {
+        if (command === "docker" && args[0] === "exec" && args[1] === "--interactive" && args.includes("1000:1000") && args.includes(FAKE_AGENT_CONTAINER_ID)) {
           return captureResult(0, "201\t/dev/pts/1\trf-20260618-stale1\t/usr/bin/claude --dangerously-skip-permissions\n");
         }
         return captureResult(0);
@@ -7843,7 +7844,7 @@ describe("runtime command flow", () => {
           && args.includes("label=com.docker.compose.service=agent")) {
           return captureResult(0, "agent-id\n");
         }
-        if (command === "docker" && args[0] === "exec" && args[1] === "-i" && args.includes("1000:1000") && args.includes(FAKE_AGENT_CONTAINER_ID)) {
+        if (command === "docker" && args[0] === "exec" && args[1] === "--interactive" && args.includes("1000:1000") && args.includes(FAKE_AGENT_CONTAINER_ID)) {
           return captureResult(0, "201\t/dev/pts/1\trf-20260517-a1b2c3\t/usr/bin/codex --dangerously-bypass-approvals-and-sandbox\n");
         }
         return captureResult(0);
@@ -7910,7 +7911,7 @@ describe("runtime command flow", () => {
         if (command === "docker" && args[0] === "inspect" && args.some((arg) => arg.includes("io.runfree.runtime-digest"))) {
           return captureResult(0, "agent-id\tagent\tsha256:old-runtime\nproxy-id\tproxy\tsha256:old-runtime\n");
         }
-        if (command === "docker" && args[0] === "exec" && args[1] === "-i" && args.includes("1000:1000") && args.includes(FAKE_AGENT_CONTAINER_ID)) {
+        if (command === "docker" && args[0] === "exec" && args[1] === "--interactive" && args.includes("1000:1000") && args.includes(FAKE_AGENT_CONTAINER_ID)) {
           return captureResult(0, "");
         }
         return captureResult(0);
@@ -7949,7 +7950,7 @@ describe("runtime command flow", () => {
           && args.includes("label=com.docker.compose.service=agent")) {
           return captureResult(0, "agent-id\n");
         }
-        if (command === "docker" && args[0] === "exec" && args[1] === "-i" && args.includes("1000:1000") && args.includes(FAKE_AGENT_CONTAINER_ID)) {
+        if (command === "docker" && args[0] === "exec" && args[1] === "--interactive" && args.includes("1000:1000") && args.includes(FAKE_AGENT_CONTAINER_ID)) {
           return captureResult(126, "", "container is paused\ntry again later\n");
         }
         return captureResult(0);
