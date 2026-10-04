@@ -70,6 +70,7 @@ export const RUNTIME_ASSET_DESCRIPTORS: readonly RuntimeAssetDescriptor[] = [
   proxyImage("proxy/audit.js"),
   proxyImage("proxy/contracts/desired-network-policy.js"),
   proxyImage("proxy/contracts/effective-control.js"),
+  proxyImage("proxy/contracts/host-services.js"),
   proxyImage("proxy/contracts/mcp-operation-policy.js"),
   proxyImage("proxy/contracts/network-policy.js"),
   proxyImage("proxy/contracts/oauth-mediation-policy.js"),

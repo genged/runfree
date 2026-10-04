@@ -392,3 +392,28 @@ describe("hostRulesCommand (rule-preserving remedies)", () => {
     );
   });
 });
+
+describe("hostServices", () => {
+  test("hostServices survive raw and change the generation only when present", () => {
+    const base = { hosts: ["api.example.com"], tokens: {} };
+    const without = validateNetworkPolicy(base);
+    const withEmpty = validateNetworkPolicy({ ...base, hostServices: {} });
+    const withIdb = validateNetworkPolicy({ ...base, hostServices: { idb: { target: "host-loopback", port: 10882 } } });
+    expect(withEmpty.generation).toBe(without.generation);
+    expect(withIdb.generation).not.toBe(without.generation);
+    expect(withIdb.raw.hostServices).toEqual({ idb: { target: "host-loopback", port: 10882 } });
+    expect(withIdb.hostServices).toEqual({ idb: { target: "host-loopback", port: 10882 } });
+    expect(without.hostServices).toEqual({});
+    expect(withEmpty.raw).not.toHaveProperty("hostServices");
+    expect(withIdb.allowedHosts).toEqual(without.allowedHosts);
+  });
+
+  test("the reserved suffix is refused in stored hosts, credential hosts and request keys", () => {
+    expect(validationIssues({ hosts: ["x.runfree.internal"], tokens: {} }).join("\n")).toContain("reserved");
+    expect(validationIssues({
+      hosts: ["api.example.com"],
+      tokens: { t: { description: "d", credentials: [{ host: "x.runfree.internal", header: "Authorization", scheme: "bearer" }] } },
+    }).join("\n")).toContain("reserved");
+    expect(validationIssues({ hosts: ["api.example.com"], tokens: {}, requests: { "x.runfree.internal": { methods: ["GET"] } } }).join("\n")).toContain("reserved");
+  });
+});

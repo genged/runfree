@@ -3,6 +3,7 @@ import { describe, expect, test } from "vitest";
 import {
   canonicalDesiredNetworkPolicy,
   desiredNetworkPolicyDigest,
+  desiredPolicyDirectProjection,
   validateDesiredNetworkPolicy,
 } from "./desired-network-policy.ts";
 
@@ -109,5 +110,17 @@ describe("desired network policy v2", () => {
     const ask = validateDesiredNetworkPolicy({ version: 2, hosts: [], writeApproval: "ask" });
     const deny = validateDesiredNetworkPolicy({ version: 2, hosts: [], writeApproval: "deny" });
     expect(desiredNetworkPolicyDigest(ask)).not.toBe(desiredNetworkPolicyDigest(deny));
+  });
+
+  test("hostServices is a known desired field and changes the digest", () => {
+    const a = validateDesiredNetworkPolicy({ version: 2, hosts: [] });
+    const b = validateDesiredNetworkPolicy({ version: 2, hosts: [], hostServices: { idb: { target: "host-loopback", port: 10882 } } });
+    expect(b.hostServices).toEqual({ idb: { target: "host-loopback", port: 10882 } });
+    expect(desiredNetworkPolicyDigest(a)).not.toBe(desiredNetworkPolicyDigest(b));
+    expect(desiredPolicyDirectProjection(b).hostServices).toEqual(b.hostServices);
+  });
+
+  test("desired hostServices refuse the address target", () => {
+    expect(() => validateDesiredNetworkPolicy({ version: 2, hosts: [], hostServices: { x: { target: "address", host: "h", port: 1 } } })).toThrow("not supported yet");
   });
 });

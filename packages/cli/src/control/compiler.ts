@@ -54,6 +54,10 @@ export function overlayDesiredPolicies(
     requests: { ...(project.requests ?? {}), ...(local.requests ?? {}) },
     tokens: { ...(project.tokens ?? {}), ...(local.tokens ?? {}) },
     writeApproval: local.writeApproval ?? project.writeApproval,
+    // Overlay by name, same as requests/tokens: local wins when both layers
+    // declare the same name. A port claimed by two different names (within a
+    // layer or across layers) is refused by validateHostServices below.
+    hostServices: { ...(project.hostServices ?? {}), ...(local.hostServices ?? {}) },
   });
 }
 
@@ -168,6 +172,7 @@ export function compileDesiredPolicies(input: {
     ...(Object.keys(requests).length > 0 ? { requests } : {}),
     ...(Object.keys(tokens).length > 0 ? { tokens } : {}),
     ...(merged.writeApproval ? { writeApproval: merged.writeApproval } : {}),
+    ...(merged.hostServices && Object.keys(merged.hostServices).length > 0 ? { hostServices: merged.hostServices } : {}),
   });
   return {
     policy: loaded.raw,
