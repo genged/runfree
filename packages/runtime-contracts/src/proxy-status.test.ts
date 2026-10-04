@@ -1,6 +1,12 @@
 import { describe, expect, test } from "vitest";
 
-import { parseGenerationStatusLine, parseHostServiceGatewayStatus, serializeGenerationStatus } from "./proxy-status.ts";
+import {
+  hostServiceSetDigest,
+  parseGenerationStatusLine,
+  parseHostServiceGatewayStatus,
+  serializeGenerationStatus,
+} from "./proxy-status.ts";
+import { sha256Digest } from "./primitives.ts";
 
 describe("request-proxy generation status", () => {
   test("carries the OAuth state epoch capability through the one-line framing", () => {
@@ -129,5 +135,24 @@ describe("host-service status fields", () => {
   ])("drops %s", (_label, field) => {
     const parsed = parseGenerationStatusLine(JSON.stringify({ generation: "g1", ...field }));
     expect(parsed).toEqual({ generation: "g1" });
+  });
+});
+
+describe("hostServiceSetDigest", () => {
+  const a = { ip: "192.168.65.254", port: 10882 };
+  const b = { ip: "192.168.65.254", port: 5432 };
+
+  test("pins the canonical form the host recomputes", () => {
+    expect(hostServiceSetDigest([a, b, a], [{ ip: "10.0.0.9", port: 1 }])).toBe(sha256Digest(JSON.stringify({
+      accept: ["192.168.65.254 . 5432", "192.168.65.254 . 10882"],
+      draining: ["10.0.0.9 . 1"],
+    })));
+  });
+
+  test("is order-independent and separates accepted from draining pairs", () => {
+    expect(hostServiceSetDigest([a, b], [])).toBe(hostServiceSetDigest([b, a], []));
+    expect(hostServiceSetDigest([a], [])).not.toBe(hostServiceSetDigest([a], [b]));
+    expect(hostServiceSetDigest([a], [b])).not.toBe(hostServiceSetDigest([a, b], []));
+    expect(hostServiceSetDigest([], [])).toMatch(/^sha256:[a-f0-9]{64}$/);
   });
 });

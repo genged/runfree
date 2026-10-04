@@ -1780,17 +1780,42 @@ describe("proxy firewall host-service gateway and set", () => {
   }
 
   function harness(initial: { etcHosts: EtcHosts | (() => EtcHosts); services: HostServicesJson }) {
-    const state = { etcHosts: initial.etcHosts, services: initial.services, now: START_MS };
+    const state = {
+      etcHosts: initial.etcHosts,
+      services: initial.services,
+      now: START_MS,
+      // Injected nft batch failures, consumed one per call.
+      failReplace: 0,
+      failTeardown: 0,
+    };
+    // Mirrors the renderer's refusal: a batch over the set size never reaches
+    // the kernel.
+    const capCheck = (entries: readonly Entry[]) => {
+      if (entries.length > plan.nftables.hostServiceMaxElements) {
+        throw new Error(`nftables host-service set update has ${entries.length} elements but max is 64`);
+      }
+    };
     const order: string[] = [];
     const kernel: { accept: Entry[]; draining: Entry[] } = { accept: [], draining: [] };
     const gateways: HostServiceGatewayStatus[] = [];
     const statuses: FirewallGenerationStatus[] = [];
     const replaceHostServiceSet = vi.fn(async (entries: readonly Entry[], _plan: FirewallPlan) => {
       order.push("replaceHostServiceSet");
+      capCheck(entries);
+      if (state.failReplace > 0) {
+        state.failReplace -= 1;
+        throw new Error("nft: injected replace failure");
+      }
       kernel.accept = [...entries];
     });
     const applyHostServiceTeardown = vi.fn(async (draining: readonly Entry[], remaining: readonly Entry[], _plan: FirewallPlan) => {
       order.push("applyHostServiceTeardown");
+      capCheck(draining);
+      capCheck(remaining);
+      if (state.failTeardown > 0) {
+        state.failTeardown -= 1;
+        throw new Error("nft: injected teardown failure");
+      }
       kernel.draining = [...draining];
       kernel.accept = [...remaining];
     });
@@ -2047,6 +2072,87 @@ describe("proxy firewall host-service gateway and set", () => {
       generation: started.policyGeneration,
       hostServiceSetDigest: hostServiceSetDigest([IDB_ENTRY], []),
     });
+  });
+
+  const PG: HostServicesJson = { pg: { target: "host-loopback", port: 5432 } };
+  const PG_ENTRY: Entry = { ip: GATEWAY, port: 5432 };
+
+  test("a failed set write fails closed with a named refusal, and the next tick restores the accept set", async () => {
+    const h = harness({ etcHosts: VALID, services: IDB });
+    await h.controller.initialize(h.startPlan());
+    expect(h.kernel.accept).toEqual([IDB_ENTRY]);
+
+    h.state.services = { ...IDB, ...PG };
+    h.state.failReplace = 1;
+    await h.controller.refreshPolicyAndIps({ refreshDns: false });
+    // Refusal: nothing stays accepted, and the pair that was accepted is cut.
+    expect(h.kernel).toEqual({ accept: [], draining: [IDB_ENTRY] });
+    const refused = h.gateways.at(-1);
+    expect(refused?.gatewayIp).toBeUndefined();
+    expect(refused?.unavailableReason).toContain("host-service firewall set update failed");
+    expect(refused?.unavailableReason).toContain("injected replace failure");
+    expect(h.statuses.at(-1)).toMatchObject({
+      hostServiceSetDigest: hostServiceSetDigest([], [IDB_ENTRY]),
+      hostServiceDraining: 1,
+    });
+
+    // Reclaim: the next tick writes the desired pairs and takes them out of
+    // draining in one batch, and the gateway is offered again.
+    await h.controller.refreshPolicyAndIps({ refreshDns: false });
+    expect(h.kernel).toEqual({ accept: [PG_ENTRY, IDB_ENTRY], draining: [] });
+    expect(h.gateways.at(-1)?.gatewayIp).toBe(GATEWAY);
+    expect(h.statuses.at(-1)).toMatchObject({
+      hostServiceSetDigest: hostServiceSetDigest([IDB_ENTRY, PG_ENTRY], []),
+      hostServiceDraining: 0,
+    });
+  });
+
+  test("a failed removal batch fails closed, and the next tick keeps only the removed pair draining", async () => {
+    const h = harness({ etcHosts: VALID, services: { ...IDB, ...PG } });
+    await h.controller.initialize(h.startPlan());
+    expect(h.kernel.accept).toEqual([PG_ENTRY, IDB_ENTRY]);
+
+    h.state.services = IDB;
+    h.state.failTeardown = 1;
+    await h.controller.refreshPolicyAndIps({ refreshDns: false });
+    expect(h.kernel).toEqual({ accept: [], draining: [PG_ENTRY, IDB_ENTRY] });
+    expect(h.gateways.at(-1)?.unavailableReason).toContain("injected teardown failure");
+
+    await h.controller.refreshPolicyAndIps({ refreshDns: false });
+    // pg was removed, so it legitimately stays draining for its window.
+    expect(h.kernel).toEqual({ accept: [IDB_ENTRY], draining: [PG_ENTRY] });
+    expect(h.gateways.at(-1)?.gatewayIp).toBe(GATEWAY);
+  });
+
+  test("more pairs than the set holds are refused before nftables on every tick, with a named cause, until the policy shrinks", async () => {
+    const many: HostServicesJson = Object.fromEntries(Array.from({ length: 65 }, (_, index) =>
+      [`svc${index}`, { target: "host-loopback" as const, port: 20000 + index }]));
+    const h = harness({ etcHosts: VALID, services: many });
+    // Policy validation refuses 65 entries, so the plan is fed directly; the
+    // reload keeps failing validation and preserves this plan.
+    await expect(h.controller.initialize({ ...plan, allowedHosts: [], hostServices: many, hostServiceDrainSeconds: 30 }))
+      .resolves.toBeUndefined();
+
+    for (let tick = 0; tick < 3; tick += 1) {
+      expect(h.kernel).toEqual({ accept: [], draining: [] });
+      const status = h.gateways.at(-1);
+      expect(status?.gatewayIp).toBeUndefined();
+      expect(status?.unavailableReason).toContain("host-service firewall set update failed");
+      expect(status?.unavailableReason).toContain("65");
+      await h.controller.refreshPolicyAndIps({ refreshDns: false });
+    }
+    // Refused before any batch: no nft call ever carried more than the cap.
+    for (const [entries] of h.replaceHostServiceSet.mock.calls) expect(entries.length).toBeLessThanOrEqual(64);
+    for (const [draining, remaining] of h.applyHostServiceTeardown.mock.calls) {
+      expect(draining.length + remaining.length).toBeLessThanOrEqual(64);
+    }
+    expect(h.gateways.every((status) => status.gatewayIp === undefined)).toBe(true);
+
+    // Reclaim: a policy within the cap is installed and offered.
+    h.state.services = IDB;
+    await h.controller.refreshPolicyAndIps({ refreshDns: false });
+    expect(h.kernel.accept).toEqual([IDB_ENTRY]);
+    expect(h.gateways.at(-1)?.gatewayIp).toBe(GATEWAY);
   });
 
   test("an unchanged tick republishes neither the gateway file nor the status", async () => {

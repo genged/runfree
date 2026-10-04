@@ -20,6 +20,10 @@ export type HostServiceJson = { target: HostServiceTarget; port: number };
 export type HostServicesJson = Record<string, HostServiceJson>;
 export const HOST_SERVICES_ENV = "RUNFREE_HOST_SERVICES";
 export const HOST_SERVICE_GATEWAY_STATUS_FILE = "host-service-gateway.json";
+// The firewall's `@host_service` set holds one `<gateway> . <port>` pair per
+// entry and is sized to this; policy validation refuses more entries so the
+// CLI refuses at write time instead of the firewall refusing at apply time.
+export const HOST_SERVICE_MAX_ENTRIES = 64;
 
 // Static port refusals (design "Policy shape", Port admission at add, SR5):
 // Docker Engine's own TCP ports, a precautionary proxy port, runfree's own
@@ -122,6 +126,10 @@ function validateHostServiceEntry(
 export function validateHostServices(raw: unknown, prefix: string, issues: string[]): HostServicesJson {
   if (!isRecord(raw)) {
     issues.push(`${prefix} must be an object`);
+    return {};
+  }
+  if (Object.keys(raw).length > HOST_SERVICE_MAX_ENTRIES) {
+    issues.push(`${prefix} has more than ${HOST_SERVICE_MAX_ENTRIES} entries`);
     return {};
   }
 

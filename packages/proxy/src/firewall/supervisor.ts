@@ -261,6 +261,11 @@ export function createFirewallController(overrides: Partial<FirewallControllerDe
   let pinnedGateway: string | undefined;
   let gatewayChangedReason: string | undefined;
   let gatewayUnavailableReason: string | undefined;
+  // Set while the last host-service set write failed (or was refused before
+  // nftables). The gateway is then not offered to the request proxy, so no
+  // splice is dialled toward a pair the firewall is dropping without a named
+  // refusal. Cleared by the next successful write.
+  let hostServiceWriteFailure: string | undefined;
   // What this supervisor last installed in @host_service and
   // @host_service_draining. The ruleset install creates both sets empty.
   let installedHostServices: HostServiceElement[] = [];
@@ -305,6 +310,7 @@ export function createFirewallController(overrides: Partial<FirewallControllerDe
     pinnedGateway = undefined;
     gatewayChangedReason = undefined;
     gatewayUnavailableReason = undefined;
+    hostServiceWriteFailure = undefined;
     installedHostServices = [];
     hostServiceDraining = undefined;
     lastPublishedGatewayKey = undefined;
@@ -358,12 +364,19 @@ export function createFirewallController(overrides: Partial<FirewallControllerDe
     deps.log(`proxy-firewall: ${gatewayChangedReason}`);
   }
 
-  function hostServiceGatewayAvailable(): string | undefined {
+  // The pinned gateway the firewall should program pairs for.
+  function pinnedUsableGateway(): string | undefined {
     return gatewayChangedReason === undefined ? pinnedGateway : undefined;
   }
 
+  // The gateway offered to the request proxy: additionally withheld while the
+  // set write is failing.
+  function offeredGateway(): string | undefined {
+    return hostServiceWriteFailure === undefined ? pinnedUsableGateway() : undefined;
+  }
+
   function desiredHostServiceEntries(plan: FirewallPlan): HostServiceElement[] {
-    const gateway = hostServiceGatewayAvailable();
+    const gateway = pinnedUsableGateway();
     if (gateway === undefined) return [];
     return sortHostServiceEntries(Object.values(plan.hostServices ?? {}).map(({ port }) => ({ ip: gateway, port })));
   }
@@ -375,6 +388,11 @@ export function createFirewallController(overrides: Partial<FirewallControllerDe
   // failed batch leaves the kernel, and this record of it, unchanged.
   async function applyHostServiceEntries(plan: FirewallPlan, force: boolean): Promise<void> {
     const desired = desiredHostServiceEntries(plan);
+    // Refused before any batch: the renderer would refuse it too, but naming
+    // the cause here keeps the refusal readable in the gateway file.
+    if (desired.length > plan.nftables.hostServiceMaxElements) {
+      throw new Error(`the policy approves ${desired.length} host-service pairs but the firewall set holds at most ${plan.nftables.hostServiceMaxElements}`);
+    }
     const desiredKeys = new Set(desired.map(hostServiceEntryKey));
     const currentDraining = hostServiceDraining?.entries ?? [];
     const removed = installedHostServices.filter((entry) => !desiredKeys.has(hostServiceEntryKey(entry)));
@@ -445,8 +463,11 @@ export function createFirewallController(overrides: Partial<FirewallControllerDe
   }
 
   function publishGateway(plan: FirewallPlan): void {
-    const gateway = hostServiceGatewayAvailable();
-    const reason = gatewayChangedReason ?? gatewayUnavailableReason ?? "host-service gateway not pinned";
+    const gateway = offeredGateway();
+    const reason = gatewayChangedReason
+      ?? hostServiceWriteFailure
+      ?? gatewayUnavailableReason
+      ?? "host-service gateway not pinned";
     const key = JSON.stringify([plan.policyGeneration, gateway ?? "", gateway === undefined ? reason : ""]);
     if (key === lastPublishedGatewayKey) return;
     deps.publishHostServiceGateway({
@@ -458,6 +479,35 @@ export function createFirewallController(overrides: Partial<FirewallControllerDe
     lastPublishedGatewayKey = key;
   }
 
+  // Write the desired pairs. On failure (an nft error, or a refusal before
+  // nftables) fail closed: record a named cause that withholds the gateway
+  // from the request proxy, and move every accepted pair into draining so
+  // nothing stays reachable. Each batch is atomic, so the record still matches
+  // the kernel, and the next pass retries from it (the reclaim).
+  async function convergeHostServiceSet(plan: FirewallPlan, force: boolean): Promise<void> {
+    try {
+      await applyHostServiceEntries(plan, force);
+      if (hostServiceWriteFailure !== undefined) deps.log("proxy-firewall: host-service set update recovered");
+      hostServiceWriteFailure = undefined;
+      return;
+    } catch (error) {
+      const reason = boundedReason(`host-service firewall set update failed: ${formatError(error)}`);
+      if (reason !== hostServiceWriteFailure) deps.log(`proxy-firewall: ${reason}`);
+      hostServiceWriteFailure = reason;
+    }
+    if (installedHostServices.length === 0) return;
+    try {
+      await installHostServiceTeardown(
+        plan,
+        boundedDraining(plan, installedHostServices, hostServiceDraining?.entries ?? []),
+        [],
+        true,
+      );
+    } catch (fallbackError) {
+      deps.log(`proxy-firewall: host-service fail-closed teardown failed: ${formatError(fallbackError)}`);
+    }
+  }
+
   // Maintenance-path host-service pass. Each step is independent and logged,
   // so a failure never wedges the refresh loop.
   async function refreshHostServices(plan: FirewallPlan): Promise<void> {
@@ -467,24 +517,7 @@ export function createFirewallController(overrides: Partial<FirewallControllerDe
     } catch (error) {
       deps.log(`proxy-firewall: host-service drain flush failed: ${formatError(error)}`);
     }
-    try {
-      await applyHostServiceEntries(plan, false);
-    } catch (error) {
-      deps.log(`proxy-firewall: host-service set update failed: ${formatError(error)}`);
-      // Fail closed: move every accepted pair into draining so nothing stays
-      // reachable while the desired state cannot be written. The next pass
-      // re-diffs from whatever the kernel now holds.
-      try {
-        await installHostServiceTeardown(
-          plan,
-          boundedDraining(plan, installedHostServices, hostServiceDraining?.entries ?? []),
-          [],
-          installedHostServices.length > 0,
-        );
-      } catch (fallbackError) {
-        deps.log(`proxy-firewall: host-service fail-closed teardown failed: ${formatError(fallbackError)}`);
-      }
-    }
+    await convergeHostServiceSet(plan, false);
     try {
       publishGateway(plan);
     } catch (error) {
@@ -1004,10 +1037,12 @@ export function createFirewallController(overrides: Partial<FirewallControllerDe
       // Host services: the ruleset above recreated both host-service sets
       // empty; pin the gateway, write the approved pairs explicitly, and hand
       // the gateway to the request proxy before readiness. A missing or
-      // invalid gateway entry is a named refusal, not a startup failure.
+      // invalid gateway entry, or a refused set write, is a named refusal,
+      // not a startup failure: the ruleset install above left both sets
+      // empty, so nothing is reachable while the refusal stands.
       resetHostServiceState();
       observeGateway(currentPlan);
-      await applyHostServiceEntries(currentPlan, true);
+      await convergeHostServiceSet(currentPlan, true);
       try {
         publishGateway(currentPlan);
       } catch (error) {

@@ -7,6 +7,7 @@
 // cannot silently diverge from the CLI parser.
 
 import { HOST_SERVICE_NAME_RE } from "./host-services.js";
+import { sha256Digest } from "./primitives.js";
 
 // Fixed by contract, like the .runfree/network-policy.json path: an env knob
 // honored by only one side of the host↔proxy ack protocol would silently
@@ -38,9 +39,12 @@ type GenerationStatusIdentity = {
 export type FirewallGenerationStatus = GenerationStatusIdentity & {
   rulesetVerified: boolean;
   appliedAt: string;
-  // Digest of the kernel `@host_service` members and the number of pairs
-  // still held in `host_service_draining`; the host reads both to report a
-  // host-service removal converged on the firewall side.
+  // `hostServiceSetDigest` (below) over the root supervisor's applied record
+  // of `@host_service` and `host_service_draining`, updated only after an
+  // atomic `nft -f` batch succeeds; not a kernel read-back. The host proof
+  // reads the kernel sets separately. `hostServiceDraining` is the number of
+  // pairs still draining; the host reads both to report a host-service
+  // removal converged on the firewall side.
   hostServiceSetDigest?: string;
   hostServiceDraining?: number;
 };
@@ -155,6 +159,41 @@ function parseHostServiceSplices(value: unknown): Record<string, number> | undef
     result[name] = count;
   }
   return result;
+}
+
+// One `<ipv4> . <port>` member of `@host_service` or `host_service_draining`.
+export type HostServiceSetEntry = { ip: string; port: number };
+
+export function hostServiceEntryKey(entry: HostServiceSetEntry): string {
+  return `${entry.ip} . ${entry.port}`;
+}
+
+function ipv4SortKey(ip: string): number {
+  return ip.split(".").reduce((value, octet) => ((value << 8) + Number(octet)) >>> 0, 0);
+}
+
+// De-duplicated, ordered by numeric address then port.
+export function sortHostServiceEntries(entries: readonly HostServiceSetEntry[]): HostServiceSetEntry[] {
+  const unique = new Map<string, HostServiceSetEntry>();
+  for (const entry of entries) unique.set(hostServiceEntryKey(entry), { ip: entry.ip, port: entry.port });
+  return Array.from(unique.values()).sort((left, right) =>
+    ipv4SortKey(left.ip) - ipv4SortKey(right.ip) || left.port - right.port);
+}
+
+// The firewall status `hostServiceSetDigest`. Canonical form:
+// `sha256:` + hex sha256 of
+// `JSON.stringify({ accept: [...keys], draining: [...keys] })`, where each
+// list is `sortHostServiceEntries(...)` mapped through `hostServiceEntryKey`
+// ("192.168.65.254 . 10882"). The proxy writer and the host reader both call
+// this function, so the two sides cannot drift.
+export function hostServiceSetDigest(
+  accept: readonly HostServiceSetEntry[],
+  draining: readonly HostServiceSetEntry[],
+): string {
+  return sha256Digest(JSON.stringify({
+    accept: sortHostServiceEntries(accept).map(hostServiceEntryKey),
+    draining: sortHostServiceEntries(draining).map(hostServiceEntryKey),
+  }));
 }
 
 // The CLI reads both files in one exec and splits on lines, so each status

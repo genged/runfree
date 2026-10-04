@@ -5,13 +5,18 @@
 // root firewall supervisor reads that one entry. These helpers are pure; the
 // supervisor owns the read, the pin, and the sticky refusal after the pin.
 
-import crypto from "node:crypto";
-
 import { HOST_SERVICE_GATEWAY_ALIAS } from "@runfree/runtime-contracts/host-services";
 
 import type { FirewallPlan } from "./nftables.js";
 
-export type HostServiceSetEntry = { ip: string; port: number };
+// The digest and its canonical form live in the shared status contract so the
+// host CLI recomputes it with the same code.
+export {
+  hostServiceEntryKey,
+  hostServiceSetDigest,
+  sortHostServiceEntries,
+  type HostServiceSetEntry,
+} from "@runfree/runtime-contracts/proxy-status";
 
 export type EtcHostsStat = { uid: number; mode: number; isFile: boolean };
 
@@ -85,31 +90,6 @@ export function validateHostServiceGateway(ip: string, plan: FirewallPlan): stri
     if (cidrContains(cidr, value)) return `host-service gateway ${ip} is inside the runtime subnet ${cidr}`;
   }
   return undefined;
-}
-
-export function sortHostServiceEntries(entries: readonly HostServiceSetEntry[]): HostServiceSetEntry[] {
-  const unique = new Map<string, HostServiceSetEntry>();
-  for (const entry of entries) unique.set(hostServiceEntryKey(entry), { ip: entry.ip, port: entry.port });
-  return Array.from(unique.values()).sort((left, right) =>
-    ipv4ToInt(left.ip) - ipv4ToInt(right.ip) || left.port - right.port);
-}
-
-export function hostServiceEntryKey(entry: HostServiceSetEntry): string {
-  return `${entry.ip} . ${entry.port}`;
-}
-
-// Firewall-side convergence fingerprint for the status file: the accept-set
-// members and the draining members, each sorted, so an equal kernel state
-// always yields an equal digest.
-export function hostServiceSetDigest(
-  entries: readonly HostServiceSetEntry[],
-  draining: readonly HostServiceSetEntry[],
-): string {
-  const canonical = JSON.stringify({
-    accept: sortHostServiceEntries(entries).map(hostServiceEntryKey),
-    draining: sortHostServiceEntries(draining).map(hostServiceEntryKey),
-  });
-  return `sha256:${crypto.createHash("sha256").update(canonical).digest("hex")}`;
 }
 
 function ipv4ToInt(ip: string): number {

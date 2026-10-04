@@ -2,7 +2,7 @@ import { describe, expect, test } from "vitest";
 
 import {
   formatHostServicesEnv, hostServiceAuthority, isReservedRunfreeHostname, parseHostServiceAuthority,
-  parseHostServicesEnv, refusedHostServicePortReason, validateHostServices,
+  HOST_SERVICE_MAX_ENTRIES, parseHostServicesEnv, refusedHostServicePortReason, validateHostServices,
 } from "./host-services.ts";
 
 describe("reserved suffix", () => {
@@ -59,6 +59,23 @@ describe("validateHostServices", () => {
     const issues: string[] = [];
     validateHostServices(raw, "hostServices", issues);
     expect(issues.join("\n")).toContain(needle);
+  });
+});
+
+describe("host-service entry cap", () => {
+  const services = (count: number) => Object.fromEntries(Array.from({ length: count }, (_, index) =>
+    [`svc${index}`, { target: "host-loopback", port: 20000 + index }]));
+
+  test("accepts exactly the firewall set size", () => {
+    const issues: string[] = [];
+    expect(Object.keys(validateHostServices(services(HOST_SERVICE_MAX_ENTRIES), "hostServices", issues))).toHaveLength(64);
+    expect(issues).toEqual([]);
+  });
+
+  test("refuses one entry more than the firewall set holds", () => {
+    const issues: string[] = [];
+    expect(validateHostServices(services(HOST_SERVICE_MAX_ENTRIES + 1), "hostServices", issues)).toEqual({});
+    expect(issues).toEqual(["hostServices has more than 64 entries"]);
   });
 });
 

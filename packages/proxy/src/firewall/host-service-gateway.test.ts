@@ -2,7 +2,6 @@ import { describe, expect, test } from "vitest";
 
 import {
   checkEtcHostsFile,
-  hostServiceSetDigest,
   parseHostServiceGatewayFromEtcHosts,
   validateHostServiceGateway,
 } from "./host-service-gateway.ts";
@@ -90,14 +89,5 @@ describe("host-service gateway from /etc/hosts", () => {
 
   test("a root-owned 0644 regular file is accepted", () => {
     expect(checkEtcHostsFile({ uid: 0, mode: 0o100644, isFile: true })).toBeUndefined();
-  });
-
-  test("the set digest is order-independent and covers the draining pairs", () => {
-    const a = { ip: "192.168.65.254", port: 10882 };
-    const b = { ip: "192.168.65.254", port: 5432 };
-    expect(hostServiceSetDigest([a, b], [])).toBe(hostServiceSetDigest([b, a], []));
-    expect(hostServiceSetDigest([a], [])).not.toBe(hostServiceSetDigest([a], [b]));
-    expect(hostServiceSetDigest([a], [b])).not.toBe(hostServiceSetDigest([a, b], []));
-    expect(hostServiceSetDigest([], [])).toMatch(/^sha256:[a-f0-9]{64}$/);
   });
 });

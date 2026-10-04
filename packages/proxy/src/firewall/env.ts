@@ -5,10 +5,7 @@ import {
 } from "../audit.js";
 import { isValidIpv4, type FirewallPlan } from "./nftables.js";
 import { assertSessionAdmissionSourceIsFiles } from "../session-identity-config.js";
-import type { HostServicesJson } from "@runfree/runtime-contracts/host-services";
-
-// Each element is `<pinned gateway> . <port>`, one per approved host service.
-const HOST_SERVICE_SET_MAX_ELEMENTS = 64;
+import { HOST_SERVICE_MAX_ENTRIES, type HostServicesJson } from "@runfree/runtime-contracts/host-services";
 
 type BuildFirewallPlanInput = {
   allowedHosts: readonly string[];
@@ -78,7 +75,9 @@ export function buildFirewallPlan(input: BuildFirewallPlanInput): FirewallPlan {
       ),
       hostServiceSetName: "host_service",
       hostServiceDrainingSetName: "host_service_draining",
-      hostServiceMaxElements: HOST_SERVICE_SET_MAX_ELEMENTS,
+      // Each element is `<pinned gateway> . <port>`, one per approved host
+      // service; policy validation caps the entries at the same number.
+      hostServiceMaxElements: HOST_SERVICE_MAX_ENTRIES,
     },
     hostServiceDrainSeconds: positiveInteger(
       env.PROXY_HOST_SERVICE_DRAIN_SECONDS ?? "30",
