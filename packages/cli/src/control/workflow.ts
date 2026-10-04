@@ -534,13 +534,18 @@ export async function requireUsableApprovalSelection(
   const candidate = await captureQuiescedDesiredPolicyCandidate(context, io);
   const runtimeSubject = runtimeIsolationControlSubject(context.project.config);
   // R21: the saved approvals carry no authority here, so every host service
-  // in either layer is admitted before the review (outside the lock).
-  const owners = admitCandidateHostServices(
-    context,
-    io,
-    { project: candidate.project, local: candidate.local },
-    deps.admitHostService,
-  );
+  // in either layer is admitted before the interactive review (outside the
+  // lock). A non-interactive run writes nothing and only prints the digest
+  // commands, whose `control approve` path runs its own admission.
+  const interactive = io.isInteractive?.() === true;
+  const owners = interactive
+    ? admitCandidateHostServices(
+      context,
+      io,
+      { project: candidate.project, local: candidate.local },
+      deps.admitHostService,
+    )
+    : undefined;
   for (const line of [
     "Runfree needs to review this checkout's saved approvals.",
     read.kind === "superseded" ? SUPERSEDED_HEADLINE : MISMATCH_HEADLINE[read.reason],
@@ -554,7 +559,7 @@ export async function requireUsableApprovalSelection(
 
   // `--yes` is not consent, and a non-TTY is not consent either: the exact
   // digest commands are the only non-interactive path in.
-  if (io.isInteractive?.() !== true) {
+  if (!interactive) {
     throw new CliError(`desired controls require exact approval before startup:\n${approvalCommands(candidate, runtimeSubject)}`);
   }
   if (!io.confirm("Use these settings for this checkout? [y/N] ")) {

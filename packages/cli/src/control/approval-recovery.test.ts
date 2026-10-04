@@ -334,3 +334,18 @@ test("a mismatch review admits every host service before the review and refuses 
   expect(read.kind).toBe("valid");
   expect(lines).toContain("  - host service idb: 127.0.0.1:10882 (idb_companion, pid 4242)");
 });
+
+test("a non-interactive mismatch review writes nothing and runs no admission; it prints the digest commands (R21)", async () => {
+  fs.writeFileSync(path.join(root, ".runfree", "network-policy.json"), JSON.stringify({
+    version: 2,
+    hosts: ["example.com"],
+    hostServices: { idb: { target: "host-loopback", port: 10882 } },
+  }));
+  const record = mismatched();
+  const admit = vi.fn(() => ({ ok: false as const, reason: "must not run" }));
+
+  await expect(requireUsableApprovalSelection(context, io({ isInteractive: () => false }), { admitHostService: admit }))
+    .rejects.toThrow("runfree control approve network-project --subject-digest sha256:");
+  expect(admit).not.toHaveBeenCalled();
+  expect(fs.readFileSync(context.project.paths.controlApprovalsPath, "utf8")).toBe(record);
+});
