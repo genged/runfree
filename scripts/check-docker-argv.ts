@@ -43,15 +43,6 @@ export const DOCKER_LITERAL_ALLOWLIST: Readonly<Record<string, string>> = {
   // client runtime.ts builds via createDockerClient, not a hand-written call
   "packages/cli/src/runtime/stopped-selection.ts": "classifier: Pick<StoppedSelectionDeps, \"docker\" | ...> names the deps field by its own key, not argv; the docker dependency is the typed client runtime.ts builds via createDockerClient",
 
-  // pending: Task 5
-  "packages/cli/src/runtime/destroy.ts": "pending: Task 5",
-  "packages/cli/src/runtime/recovery.ts": "pending: Task 5",
-  "packages/cli/src/runtime/sessions.ts": "pending: Task 5",
-  "packages/cli/src/runtime/approvals.ts": "pending: Task 5",
-  "packages/cli/src/runtime/audit.ts": "pending: Task 5",
-  "packages/cli/src/runtime/denial-summary.ts": "pending: Task 5",
-  "packages/cli/src/runtime/ingress-forwarder-ownership.ts": "pending: Task 5",
-
   // pending: Task 6
   "packages/cli/src/runtime/ingress-forwarder.ts": "pending: Task 6",
   "packages/cli/src/runtime/session-callback-ingress.ts": "pending: Task 6",

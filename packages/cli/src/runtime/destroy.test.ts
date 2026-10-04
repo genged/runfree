@@ -194,7 +194,7 @@ function harness(options: {
     if (args[0] === "ps") {
       const filter = args[args.indexOf("--filter") + 1] ?? "";
       if (!filter.startsWith("label=io.runfree.project-id=")) return ok("");
-      if (args.includes("-q") && options.residueRunning === false) return ok("");
+      if (args.includes("--quiet") && !args.includes("--all") && options.residueRunning === false) return ok("");
       return ok(`${residueIds.join("\n")}\n`);
     }
     if (args[0] === "network" && args[1] === "ls") {

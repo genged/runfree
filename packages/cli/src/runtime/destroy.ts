@@ -44,7 +44,8 @@ import {
   composeProjectContainerFilters,
   wholeProjectContainerFilters,
 } from "./container-inventory.ts";
-import { dockerClientEnvOptions, type RuntimeDocker } from "./docker.ts";
+import { dockerClientEnvOptions, filterValues, type RuntimeDocker } from "./docker.ts";
+import { createDockerClient } from "./docker-client.ts";
 import { removeHelperState } from "./ephemeral-helper-residue.ts";
 import {
   enumerateSessionContainerRecordsV2,
@@ -122,11 +123,8 @@ function operationName(input: FencedProjectDestroyInput): "destroy" | "rebuild" 
  * whose container still exists.
  */
 function containerProvenAbsent(input: FencedProjectDestroyInput, containerId: string): boolean {
-  const inspected = input.io.capture(
-    "docker",
-    ["container", "inspect", "--format", "{{.Id}}", containerId],
-    dockerClientEnvOptions(input.context),
-  );
+  const inspected = createDockerClient(input.io, dockerClientEnvOptions(input.context))
+    .inspect([containerId], { type: "container", format: "{{.Id}}" });
   if (inspected.status === 0) return false;
   if (CONTAINER_NOT_FOUND_PATTERN.test(inspected.stderr)) return true;
   const detail = inspected.stderr.trim().slice(0, 512) || `exit ${inspected.status}`;
@@ -139,11 +137,8 @@ function containerProvenAbsent(input: FencedProjectDestroyInput, containerId: st
  * while the container still exists.
  */
 function removeRecordBoundSessionContainer(input: FencedProjectDestroyInput, containerId: string): void {
-  const removed = input.io.capture(
-    "docker",
-    ["container", "rm", "--force", containerId],
-    dockerClientEnvOptions(input.context),
-  );
+  const removed = createDockerClient(input.io, dockerClientEnvOptions(input.context))
+    .removeContainers([containerId], { force: true });
   if (removed.status === 0) return;
   if (containerProvenAbsent(input, containerId)) return;
   const detail = removed.stderr.trim().slice(0, 512) || `exit ${removed.status}`;
@@ -191,12 +186,9 @@ function resolveProxyConsumerIds(
 }
 
 function stopProxyConsumers(input: FencedProjectDestroyInput, proxyConsumerIds: readonly string[]): void {
+  const client = createDockerClient(input.io, dockerClientEnvOptions(input.context));
   for (const proxyId of proxyConsumerIds) {
-    const stopped = input.io.capture(
-      "docker",
-      ["container", "stop", "--time", String(SESSION_CONTAINER_STOP_SECONDS), proxyId],
-      dockerClientEnvOptions(input.context),
-    );
+    const stopped = client.stopContainers([proxyId], SESSION_CONTAINER_STOP_SECONDS);
     if (stopped.status === 0) continue;
     if (containerProvenAbsent(input, proxyId)) continue;
     const detail = stopped.stderr.trim().slice(0, 512) || `exit ${stopped.status}`;
@@ -214,17 +206,18 @@ function stopProxyConsumers(input: FencedProjectDestroyInput, proxyConsumerIds: 
  * failure throws rather than reading as "nothing left".
  */
 function composeResourcesPresent(input: FencedProjectDestroyInput, composeProject: string): boolean {
-  const filters = composeProjectContainerFilters(composeProject);
-  const listings: ReadonlyArray<readonly string[]> = [
-    ["ps", "-aq", ...filters],
-    ["network", "ls", "-q", ...filters],
-    ["volume", "ls", "-q", ...filters],
+  const filters = filterValues(composeProjectContainerFilters(composeProject));
+  const client = createDockerClient(input.io, dockerClientEnvOptions(input.context));
+  const listings = [
+    () => client.listContainers({ all: true, quiet: true, filters }),
+    () => client.listObjects("network", { quiet: true, filters }),
+    () => client.listObjects("volume", { quiet: true, filters }),
     // Compose labels the images it builds; `down --rmi local` is the only
     // remover for those, so image-only residue still needs the teardown.
-    ["image", "ls", "-q", ...filters],
+    () => client.listObjects("image", { quiet: true, filters }),
   ];
-  for (const args of listings) {
-    const listed = input.io.capture("docker", [...args], dockerClientEnvOptions(input.context));
+  for (const listing of listings) {
+    const listed = listing();
     if (listed.status !== 0) {
       const detail = listed.stderr.trim().slice(0, 512) || `exit ${listed.status}`;
       throw new Error(`destroy could not determine whether Compose resources remain: ${detail}`);
@@ -251,13 +244,11 @@ function unclaimedProjectContainers(
   includeStopped: boolean,
 ): string[] {
   const projectId = projectHash(input.context.projectRoot);
+  const client = createDockerClient(input.io, dockerClientEnvOptions(input.context));
+  const filters = filterValues(wholeProjectContainerFilters(projectId));
   let lastDetail = "";
   for (let attempt = 0; attempt < 2; attempt += 1) {
-    const listed = input.io.capture(
-      "docker",
-      ["ps", includeStopped ? "-aq" : "-q", "--no-trunc", ...wholeProjectContainerFilters(projectId)],
-      dockerClientEnvOptions(input.context),
-    );
+    const listed = client.listContainers({ all: includeStopped, quiet: true, noTrunc: true, filters });
     if (listed.status !== 0) {
       const detail = listed.stderr.trim().slice(0, 512) || `exit ${listed.status}`;
       throw new Error(`${operationName(input)} could not list project containers: ${detail}`);
@@ -265,11 +256,10 @@ function unclaimedProjectContainers(
     const ids = listed.stdout.trim().split(/\s+/).filter(Boolean)
       .filter((id) => !recordContainerIds.has(id));
     if (ids.length === 0) return [];
-    const inspected = input.io.capture(
-      "docker",
-      ["container", "inspect", "--format", `{{.Id}}\t{{ index .Config.Labels "${COMPOSE_PROJECT_LABEL}" }}`, ...ids],
-      dockerClientEnvOptions(input.context),
-    );
+    const inspected = client.inspect(ids, {
+      type: "container",
+      format: `{{.Id}}\t{{ index .Config.Labels "${COMPOSE_PROJECT_LABEL}" }}`,
+    });
     if (inspected.status !== 0) {
       lastDetail = inspected.stderr.trim().slice(0, 512) || `exit ${inspected.status}`;
       if (CONTAINER_NOT_FOUND_PATTERN.test(inspected.stderr)) continue;
@@ -309,11 +299,8 @@ function runningUnclaimedProjectContainers(
  */
 function stopProjectLabeledContainers(input: FencedProjectDestroyInput): void {
   const projectId = projectHash(input.context.projectRoot);
-  const listed = input.io.capture(
-    "docker",
-    ["ps", "-q", "--no-trunc", ...wholeProjectContainerFilters(projectId)],
-    dockerClientEnvOptions(input.context),
-  );
+  const client = createDockerClient(input.io, dockerClientEnvOptions(input.context));
+  const listed = client.listContainers({ quiet: true, noTrunc: true, filters: filterValues(wholeProjectContainerFilters(projectId)) });
   if (listed.status !== 0) {
     const detail = listed.stderr.trim().slice(0, 512) || `exit ${listed.status}`;
     throw new Error(`${operationName(input)} could not list running project containers before session removal: ${detail}`);
@@ -328,18 +315,10 @@ function stopProjectLabeledContainers(input: FencedProjectDestroyInput): void {
   // attributed and proven exactly as before.
   for (let offset = 0; offset < running.length; offset += STOP_ID_CHUNK_SIZE) {
     const chunk = running.slice(offset, offset + STOP_ID_CHUNK_SIZE);
-    const batch = input.io.capture(
-      "docker",
-      ["container", "stop", "--time", String(SESSION_CONTAINER_STOP_SECONDS), ...chunk],
-      dockerClientEnvOptions(input.context),
-    );
+    const batch = client.stopContainers(chunk, SESSION_CONTAINER_STOP_SECONDS);
     if (batch.status === 0) continue;
     for (const containerId of chunk) {
-      const stopped = input.io.capture(
-        "docker",
-        ["container", "stop", "--time", String(SESSION_CONTAINER_STOP_SECONDS), containerId],
-        dockerClientEnvOptions(input.context),
-      );
+      const stopped = client.stopContainers([containerId], SESSION_CONTAINER_STOP_SECONDS);
       if (stopped.status === 0) continue;
       if (containerProvenAbsent(input, containerId)) continue;
       const detail = stopped.stderr.trim().slice(0, 512) || `exit ${stopped.status}`;
@@ -352,22 +331,15 @@ function stopProjectLabeledContainers(input: FencedProjectDestroyInput): void {
 
 function projectResidueCandidates(input: FencedProjectDestroyInput): ResidueCandidate[] {
   const projectId = projectHash(input.context.projectRoot);
-  const listed = input.io.capture(
-    "docker",
-    ["ps", "-aq", "--no-trunc", ...wholeProjectContainerFilters(projectId)],
-    dockerClientEnvOptions(input.context),
-  );
+  const client = createDockerClient(input.io, dockerClientEnvOptions(input.context));
+  const listed = client.listContainers({ all: true, quiet: true, noTrunc: true, filters: filterValues(wholeProjectContainerFilters(projectId)) });
   if (listed.status !== 0) {
     const detail = listed.stderr.trim().slice(0, 512) || `exit ${listed.status}`;
     throw new Error(`destroy could not scan for project residue: ${detail}`);
   }
   const ids = listed.stdout.trim().split(/\s+/).filter(Boolean);
   return ids.map((id) => {
-    const inspected = input.io.capture(
-      "docker",
-      ["container", "inspect", "--format", "{{.Name}}\t{{.Config.Image}}\t{{.State.Status}}", id],
-      dockerClientEnvOptions(input.context),
-    );
+    const inspected = client.inspect([id], { type: "container", format: "{{.Name}}\t{{.Config.Image}}\t{{.State.Status}}" });
     const description = inspected.status === 0
       ? inspected.stdout.trim().split("\t").filter(Boolean).join(" ")
       : "inspection failed";
@@ -993,13 +965,10 @@ export function runFencedProjectDestroy(input: FencedProjectDestroyInput): numbe
   // under --force, naming exactly what is removed.
   let residue = projectResidueCandidates(input);
   if (residue.length > 0 && input.force) {
+    const residueClient = createDockerClient(input.io, dockerClientEnvOptions(context));
     for (const candidate of residue) {
       console.log(`removing unverified project residue ${candidate.id.slice(0, 12)} (${candidate.description})`);
-      const removed = input.io.capture(
-        "docker",
-        ["container", "rm", "--force", candidate.id],
-        dockerClientEnvOptions(context),
-      );
+      const removed = residueClient.removeContainers([candidate.id], { force: true });
       if (removed.status !== 0) {
         let absent = false;
         try {
