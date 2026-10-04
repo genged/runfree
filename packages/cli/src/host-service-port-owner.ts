@@ -21,7 +21,10 @@ import { sanitizedHostExecutionEnv } from "./host-path.ts";
 import type { RuntimeContext, RuntimeIO } from "./runtime/types.ts";
 
 export type HostPortOwner =
-  | { kind: "listener"; command: string; pid: number; count: number }
+  // `command`/`pid` name the first listener (what the operator reviews);
+  // `commands` lists every listening process, so admission can refuse when
+  // any of them is Docker Desktop.
+  | { kind: "listener"; command: string; pid: number; count: number; commands: string[] }
   | { kind: "none" }
   | { kind: "unavailable"; reason: string };
 
@@ -66,7 +69,13 @@ function parseLsofFields(stdout: string): HostPortOwner {
   if (processes.some((entry) => entry.command === undefined)) {
     return { kind: "unavailable", reason: "lsof reported a listening process without its name" };
   }
-  return { kind: "listener", command: first.command as string, pid: first.pid, count: processes.length };
+  return {
+    kind: "listener",
+    command: first.command as string,
+    pid: first.pid,
+    count: processes.length,
+    commands: processes.map((entry) => entry.command as string),
+  };
 }
 
 /** Who listens on the host's TCP `port` (macOS only; read-only, bounded). */
@@ -79,12 +88,15 @@ export function probeHostPortOwner(
   if (platform !== "darwin") {
     return { kind: "unavailable", reason: "the host listener check needs macOS (Docker Desktop for Mac)" };
   }
-  const result = io.capture(LSOF_PATH, ["-nP", `-iTCP:${port}`, "-sTCP:LISTEN", "-Fpc"], {
+  // `+c 0`: the full process name, never lsof's default 9-character cut.
+  const result = io.capture(LSOF_PATH, ["-nP", "+c", "0", `-iTCP:${port}`, "-sTCP:LISTEN", "-Fpc"], {
     encoding: "utf8",
     timeout: LSOF_TIMEOUT_MS,
     env: { ...sanitizedHostExecutionEnv(context.projectRoot, context.env ?? process.env), LC_ALL: "C" },
   });
-  if (result.status === 1 && result.stdout.trim() === "") return { kind: "none" };
+  // lsof exits 1 both for "no match" and for errors; only a silent exit 1 is
+  // an answer. Anything on stderr makes the result unknown, never "none".
+  if (result.status === 1 && result.stdout.trim() === "" && result.stderr.trim() === "") return { kind: "none" };
   if (result.status !== 0) {
     const detail = result.timedOut ? "timed out" : `exited with status ${result.status}`;
     const stderr = printableCommand(result.stderr.trim());
@@ -105,7 +117,10 @@ export function admitHostServicePort(
   const owner = probeHostPortOwner(context, io, port, platform);
   if (owner.kind === "none") return { ok: false, reason: `no process listens on 127.0.0.1:${port}` };
   if (owner.kind === "unavailable") return { ok: false, reason: owner.reason };
-  if (owner.command.startsWith(DOCKER_DESKTOP_COMMAND_PREFIX)) {
+  // Every listener counts: two sockets can share a port on macOS (a user
+  // process on [::1] or *, Docker Desktop on 127.0.0.1, which the gateway
+  // reaches), so a non-Docker first listener proves nothing alone.
+  if (owner.commands.some((command) => command.startsWith(DOCKER_DESKTOP_COMMAND_PREFIX))) {
     return { ok: false, reason: `127.0.0.1:${port} is owned by Docker Desktop (a published container port)` };
   }
   return { ok: true, owner: { command: owner.command, pid: owner.pid } };

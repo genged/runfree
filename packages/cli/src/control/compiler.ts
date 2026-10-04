@@ -47,6 +47,14 @@ export function overlayDesiredPolicies(
 ): DesiredNetworkPolicyJson {
   const project = validateDesiredNetworkPolicy(projectInput);
   const local = validateDesiredNetworkPolicy(localInput);
+  // SR9: a host-service name is owned by exactly one layer. Unlike requests and
+  // tokens, local does not override project here, even with an identical entry:
+  // a name+port pairing must have one owner to approve, review, and remove.
+  for (const name of Object.keys(local.hostServices ?? {})) {
+    if (project.hostServices?.[name] !== undefined) {
+      throw new Error(`host service ${name} is defined in both the project and checkout-local desired policy; remove it from one layer`);
+    }
+  }
   return validateDesiredNetworkPolicy({
     version: 2,
     hosts: Array.from(new Set([...project.hosts, ...local.hosts])).sort(),
@@ -54,9 +62,9 @@ export function overlayDesiredPolicies(
     requests: { ...(project.requests ?? {}), ...(local.requests ?? {}) },
     tokens: { ...(project.tokens ?? {}), ...(local.tokens ?? {}) },
     writeApproval: local.writeApproval ?? project.writeApproval,
-    // Overlay by name, same as requests/tokens: local wins when both layers
-    // declare the same name. A port claimed by two different names (within a
-    // layer or across layers) is refused by validateHostServices below.
+    // Names are disjoint across layers (refused above), so this is a union. A
+    // port claimed by two different names (within a layer or across layers) is
+    // refused by validateHostServices below.
     hostServices: { ...(project.hostServices ?? {}), ...(local.hostServices ?? {}) },
   });
 }

@@ -29,6 +29,7 @@ const hostServiceSeams = vi.hoisted(() => ({
   probe: undefined as undefined | ((port: number) => HostPortOwner),
   activate: undefined as undefined | (() => Promise<ControlActivationResult>),
   recorded: [] as Array<{ ports: readonly number[]; owners?: Readonly<Record<number, string>> }>,
+  recordFails: false,
 }));
 
 vi.mock("../host-service-port-owner.ts", async (importOriginal) => {
@@ -57,6 +58,7 @@ vi.mock("../host-service-registry.ts", async (importOriginal) => {
     ...actual,
     recordProjectHostServicePorts: (...args: Parameters<typeof actual.recordProjectHostServicePorts>) => {
       hostServiceSeams.recorded.push({ ports: args[2], ...(args[3] ? { owners: args[3] } : {}) });
+      if (hostServiceSeams.recordFails) return Promise.reject(new Error("host-service port registry lock is held"));
       return actual.recordProjectHostServicePorts(...args);
     },
   };
@@ -1062,6 +1064,7 @@ describe("admin host-service command", () => {
     hostServiceSeams.probe = undefined;
     hostServiceSeams.activate = undefined;
     hostServiceSeams.recorded = [];
+    hostServiceSeams.recordFails = false;
   });
 
   test("bare host-service shows the group's own usage as a usage error", async () => {
@@ -1200,6 +1203,23 @@ describe("admin host-service command", () => {
       expect(pruned.ok && pruned.owners.has(10882)).toBe(false);
     });
 
+    test("a registry write failure after the policy applied exits non-zero with the repair remedy", async () => {
+      hostServiceSeams.activate = async () => ({ kind: "selected", controlGeneration: publish() });
+      hostServiceSeams.recordFails = true;
+      captureStdout();
+
+      const refusal = await cliRefusal(runCommandApp(projectContext(), ["host-service", "add", "idb", "--port", "10882"], vi.fn(async () => 0)));
+
+      expect(refusal.message).toContain("the policy change is saved, but the host-service port registry was not updated");
+      expect(refusal.message).toContain("host-service port registry lock is held");
+      expect(refusal.message).toContain("rebuild it with: runfree host-service list --repair");
+      // The policy change itself stays applied.
+      expect(JSON.parse(fs.readFileSync(path.join(root, ".runfree", "network-policy.json"), "utf8"))).toMatchObject({
+        hostServices: { idb: { target: "host-loopback", port: 10882 } },
+      });
+      expect(hostServiceSeams.recorded).toEqual([{ ports: [10882], owners: { 10882: "idb_companion" } }]);
+    });
+
     test("list prints one row per effective service with its current owner", async () => {
       const runtime = projectContext().runtimeContext();
       await mutateDesiredHostService(runtime, {} as never, "project", { kind: "add", name: "idb", port: 10882 }, {
@@ -1210,7 +1230,7 @@ describe("admin host-service command", () => {
       });
       publish();
       hostServiceSeams.probe = (port) => port === 10882
-        ? { kind: "listener", command: "idb_companion", pid: 4242, count: 1 }
+        ? { kind: "listener", command: "idb_companion", pid: 4242, count: 1, commands: ["idb_companion"] }
         : { kind: "none" };
       const out = captureStdout();
 

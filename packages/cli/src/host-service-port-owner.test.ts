@@ -37,10 +37,12 @@ describe("probeHostPortOwner", () => {
       command: "idb_companion",
       pid: 4242,
       count: 1,
+      commands: ["idb_companion"],
     });
     expect(calls).toHaveLength(1);
     expect(calls[0].command).toBe("/usr/sbin/lsof");
-    expect(calls[0].args).toEqual(["-nP", "-iTCP:10882", "-sTCP:LISTEN", "-Fpc"]);
+    // `+c 0`: never truncate the process name (the default width is 9).
+    expect(calls[0].args).toEqual(["-nP", "+c", "0", "-iTCP:10882", "-sTCP:LISTEN", "-Fpc"]);
     expect(calls[0].options?.timeout).toBe(5_000);
     // Sanitized host env plus a fixed locale: no inherited secrets or locale.
     expect(calls[0].options?.env).toMatchObject({ LC_ALL: "C", HOME: os.tmpdir() });
@@ -55,6 +57,7 @@ describe("probeHostPortOwner", () => {
       command: "idb_companion",
       pid: 4242,
       count: 2,
+      commands: ["idb_companion", "other"],
     });
   });
 
@@ -62,6 +65,14 @@ describe("probeHostPortOwner", () => {
     const { io } = fakeIo({ status: 1, stdout: "", stderr: "" });
 
     expect(probeHostPortOwner(context, io, 10882, "darwin")).toEqual({ kind: "none" });
+  });
+
+  test("lsof exit 1 with stderr is an error, not an empty answer", () => {
+    const { io } = fakeIo({ status: 1, stdout: "", stderr: "lsof: WARNING: can't stat() nfs file system" });
+
+    const owner = probeHostPortOwner(context, io, 10882, "darwin");
+    expect(owner.kind).toBe("unavailable");
+    expect(owner.kind === "unavailable" ? owner.reason : "").toContain("can't stat()");
   });
 
   test("a timeout is unavailable, never none", () => {
@@ -113,6 +124,23 @@ describe("admitHostServicePort", () => {
     });
   });
 
+  test("a truncated Docker Desktop owner name is still refused", () => {
+    const { io } = fakeIo({ status: 0, stdout: "p77\nccom.docker.backe\n", stderr: "" });
+
+    expect(admitHostServicePort(context, io, 10882, "darwin")).toMatchObject({ ok: false });
+  });
+
+  test("a Docker Desktop listener behind another listener on the same port is refused", () => {
+    // macOS lets two sockets share a port, e.g. a user process on [::1] or *
+    // and com.docker.backend on 127.0.0.1, which is what the gateway reaches.
+    const { io } = fakeIo({ status: 0, stdout: "p4242\ncidb_companion\nf7\np77\nccom.docker.backend\nf9\n", stderr: "" });
+
+    expect(admitHostServicePort(context, io, 10882, "darwin")).toEqual({
+      ok: false,
+      reason: "127.0.0.1:10882 is owned by Docker Desktop (a published container port)",
+    });
+  });
+
   test("no listener is refused", () => {
     const { io } = fakeIo({ status: 1, stdout: "", stderr: "" });
 
@@ -120,6 +148,15 @@ describe("admitHostServicePort", () => {
       ok: false,
       reason: "no process listens on 127.0.0.1:10882",
     });
+  });
+
+  test("an lsof error with exit 1 is refused as unavailable, never as no listener", () => {
+    const { io } = fakeIo({ status: 1, stdout: "", stderr: "lsof: status error" });
+
+    const admission = admitHostServicePort(context, io, 10882, "darwin");
+    expect(admission.ok).toBe(false);
+    expect(admission.ok ? "" : admission.reason).toContain("lsof");
+    expect(admission.ok ? "" : admission.reason).not.toContain("no process listens");
   });
 
   test("an unavailable probe is refused with its reason", () => {

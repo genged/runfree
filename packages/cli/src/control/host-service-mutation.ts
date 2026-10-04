@@ -4,9 +4,14 @@
 // (`withDesiredPolicyTransaction`): capture -> approved-base -> plan -> atomic
 // write -> re-read -> exact-match -> approve the in-memory candidate. The
 // family's difference lives in `plan`, which runs before the write, so every
-// refusal below — name, static port, duplicate port or name across layers,
-// compile, and the live port admission (SR5/SR13) — precedes the policy file
-// mutation and the approval.
+// policy refusal below — name, static port, duplicate port or name across
+// layers, compile — precedes the policy file mutation and the approval.
+//
+// The live port admission (SR5/SR13, an `lsof` spawn of up to 5 s) runs
+// BEFORE the transaction, outside the project lifecycle lock (ruling R14),
+// after the same policy checks against the approved layers. Inside the lock,
+// `plan` re-runs only the policy checks against the captured base and carries
+// the owner found earlier; a refused admission never takes the lock.
 
 import {
   canonicalDesiredNetworkPolicy,
@@ -19,7 +24,7 @@ import { CliError } from "../errors.ts";
 import { admitHostServicePort } from "../host-service-port-owner.ts";
 import { remedy } from "../remedies.ts";
 import type { RuntimeContext, RuntimeIO } from "../runtime/types.ts";
-import type { ControlApprovalSelection } from "./approvals.ts";
+import { type ControlApprovalSelection, readApprovedNetworkPolicy } from "./approvals.ts";
 import { compileDesiredPolicies } from "./compiler.ts";
 import {
   desiredLayerSubject,
@@ -141,6 +146,22 @@ function planPolicy(
   return { changed: canonicalDesiredNetworkPolicy(validated) !== before, policy: validated, warnings };
 }
 
+const EMPTY_LAYER: DesiredNetworkPolicyJson = { version: 2, hosts: [] };
+
+// The approved layers, for the unlocked pre-check only. A missing or
+// unreadable approval reads as empty: the in-lock plan and the approved-base
+// check are the authority, this only refuses early and gates the lsof spawn.
+function approvedLayersForPrecheck(context: RuntimeContext): { local: DesiredNetworkPolicyJson; project: DesiredNetworkPolicyJson } {
+  const read = (subjectType: "network-local" | "network-project"): DesiredNetworkPolicyJson => {
+    try {
+      return readApprovedNetworkPolicy(context.projectRoot, context.project, subjectType) ?? EMPTY_LAYER;
+    } catch {
+      return EMPTY_LAYER;
+    }
+  };
+  return { project: read("network-project"), local: read("network-local") };
+}
+
 export async function mutateDesiredHostService(
   context: RuntimeContext,
   io: RuntimeIO,
@@ -149,6 +170,19 @@ export async function mutateDesiredHostService(
   deps: HostServiceMutationDependencies = {},
 ): Promise<DesiredHostServiceMutationResult> {
   const admit = deps.admit ?? admitHostServicePort;
+  let owner: { command: string; pid: number } | undefined;
+  if (mutation.kind === "add") {
+    planPolicy(approvedLayersForPrecheck(context), scope, mutation);
+    const admission = admit(context, io, mutation.port);
+    if (!admission.ok) {
+      throw new CliError([
+        `cannot approve host service ${mutation.name} on port ${mutation.port}: ${admission.reason}`,
+        `start the service on the host's 127.0.0.1:${mutation.port} (not a Docker-published port), then run: `
+          + remedy.hostServiceAdd(mutation.name, mutation.port),
+      ].join("\n"));
+    }
+    owner = admission.owner;
+  }
   return withDesiredPolicyTransaction(context, io, {
     approvalSubject: hostServiceApprovalSubject(scope),
     writeSubject: `${scope} policy write`,
@@ -156,21 +190,10 @@ export async function mutateDesiredHostService(
     prepare: () => {
       if (scope === "local") ensureCheckoutLocalPolicyExcluded(context.projectRoot, io, context.env);
     },
-    plan: (before): PlannedHostService => {
-      const planned = planPolicy({ project: before.project, local: before.local }, scope, mutation);
-      if (mutation.kind !== "add") return planned;
-      // Port admission (SR5/SR13) last: every cheaper refusal above already
-      // ran, and this still precedes the write and the approval.
-      const admission = admit(context, io, mutation.port);
-      if (!admission.ok) {
-        throw new CliError([
-          `cannot approve host service ${mutation.name} on port ${mutation.port}: ${admission.reason}`,
-          `start the service on the host's 127.0.0.1:${mutation.port} (not a Docker-published port), then run: `
-            + remedy.hostServiceAdd(mutation.name, mutation.port),
-        ].join("\n"));
-      }
-      return { ...planned, owner: admission.owner };
-    },
+    plan: (before): PlannedHostService => ({
+      ...planPolicy({ project: before.project, local: before.local }, scope, mutation),
+      ...(owner ? { owner } : {}),
+    }),
     result: ({ candidate, plan, selection }) => ({
       changed: plan.changed,
       digest: desiredLayerSubject(candidate, scope).digest,

@@ -12,7 +12,20 @@ import { captureDesiredPolicyCandidate } from "./candidates.ts";
 import { LOCAL_POLICY_EXCLUDE_PATTERN } from "./git-exclude.ts";
 import { mutateDesiredHostService } from "./host-service-mutation.ts";
 
-const writes = vi.hoisted(() => ({ replaced: [] as string[] }));
+const writes = vi.hoisted(() => ({ replaced: [] as string[], events: [] as string[] }));
+
+// Records when the project lifecycle lock is taken, so a test can prove the
+// lsof admission runs before it (R14).
+vi.mock("./quiesce.ts", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./quiesce.ts")>();
+  return {
+    ...actual,
+    withQuiescedProject: (...args: Parameters<typeof actual.withQuiescedProject>) => {
+      writes.events.push("lock");
+      return actual.withQuiescedProject(...args);
+    },
+  };
+});
 
 vi.mock("../safe-fs.ts", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../safe-fs.ts")>();
@@ -41,6 +54,7 @@ describe("typed host-service mutations", () => {
 
   beforeEach(() => {
     writes.replaced = [];
+    writes.events = [];
     root = fs.mkdtempSync(path.join(os.tmpdir(), "runfree-host-service-"));
     stateHome = fs.mkdtempSync(path.join(os.tmpdir(), "runfree-host-service-state-"));
     fs.mkdirSync(path.join(root, ".runfree"));
@@ -131,7 +145,7 @@ describe("typed host-service mutations", () => {
 
     await expect(mutateDesiredHostService(context, io(), "project", { kind: "add", name: "other", port: 10882 }, { admit }))
       .rejects.toThrow("port 10882 is already used by host service idb");
-    // Across layers too: the compiler would refuse the pair, the mutation says so first.
+    // Across layers too, with the same refusal text.
     await expect(mutateDesiredHostService(context, io(), "local", { kind: "add", name: "other", port: 10882 }, { admit }))
       .rejects.toThrow("port 10882 is already used by host service idb");
 
@@ -147,6 +161,42 @@ describe("typed host-service mutations", () => {
 
     await expect(mutateDesiredHostService(context, io(), "local", { kind: "add", name: "idb", port: 10883 }, { admit: ADMIT_IDB }))
       .rejects.toThrow("host service idb is already approved in the project layer");
+    expect(writes.replaced).toEqual([]);
+  });
+
+  test("the lsof admission runs before the lifecycle lock; a refusal never takes it (R14)", async () => {
+    const admit = vi.fn(() => {
+      writes.events.push("admit");
+      return ADMIT_IDB();
+    });
+
+    await mutateDesiredHostService(context, io(), "local", { kind: "add", name: "idb", port: 10882 }, { admit });
+    expect(writes.events).toEqual(["admit", "lock"]);
+    expect(admit).toHaveBeenCalledOnce();
+
+    writes.events = [];
+    const refuse = vi.fn(() => {
+      writes.events.push("admit");
+      return { ok: false as const, reason: "no process listens on 127.0.0.1:10883" };
+    });
+    await expect(mutateDesiredHostService(context, io(), "project", { kind: "add", name: "sim", port: 10883 }, { admit: refuse }))
+      .rejects.toThrow("no process listens on 127.0.0.1:10883");
+    expect(writes.events).toEqual(["admit"]);
+  });
+
+  test("the in-lock plan re-runs the policy checks against the captured base", async () => {
+    // A concurrent trusted transaction claims the port between the unlocked
+    // pre-check and this transaction: the in-lock plan still refuses it.
+    const admit = vi.fn(() => {
+      fs.writeFileSync(localPolicyPath, '{"version":2,"hosts":[],"hostServices":{"sim":{"target":"host-loopback","port":10883}}}\n');
+      const candidate = captureDesiredPolicyCandidate(root, context.project.paths.controlCandidatesDir);
+      approveNetworkCandidate(root, context.project, candidate, "network-local", "interactive");
+      return ADMIT_IDB();
+    });
+
+    await expect(mutateDesiredHostService(context, io(), "project", { kind: "add", name: "other", port: 10883 }, { admit }))
+      .rejects.toThrow("port 10883 is already used by host service sim in the checkout-local layer");
+    expect(admit).toHaveBeenCalledOnce();
     expect(writes.replaced).toEqual([]);
   });
 
@@ -192,13 +242,15 @@ describe("typed host-service mutations", () => {
     });
   });
 
-  test("agent-authored drift is refused before admission runs", async () => {
-    fs.writeFileSync(projectPolicyPath, '{"version":2,"hosts":[],"hostServices":{"evil":{"target":"host-loopback","port":2222}}}\n');
+  test("agent-authored drift is refused before any write or approval; the pre-check never reads it", async () => {
+    fs.writeFileSync(projectPolicyPath, '{"version":2,"hosts":[],"hostServices":{"evil":{"target":"host-loopback","port":10882}}}\n');
     const admit = vi.fn(ADMIT_IDB);
 
     await expect(mutateDesiredHostService(context, io(), "project", { kind: "add", name: "idb", port: 10882 }, { admit }))
       .rejects.toThrow("project desired policy changed outside a trusted Runfree transaction");
-    expect(admit).not.toHaveBeenCalled();
+    // The unlocked pre-check reads only approved layers, so the drifted port
+    // never steers it; the read-only admission may run, the write never does.
+    expect(admit).toHaveBeenCalledWith(expect.anything(), expect.anything(), 10882);
     expect(writes.replaced).toEqual([]);
   });
 });
