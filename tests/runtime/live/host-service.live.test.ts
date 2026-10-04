@@ -4,7 +4,9 @@
 //
 // Setup: a TCP echo server on host 127.0.0.1 (an approved port P and an
 // unapproved port Q, both OS-chosen), the seeded sandbox project, `runfree
-// host-service add echo --port P` converged live, then a standing session.
+// host-service add echo --port P` converged live, `runfree up` to select the
+// session agent that renders it (the startup a production launch runs), then
+// a standing session.
 //
 // The echo server runs in a child process, not in this test process: every
 // Docker and CLI call here is `spawnSync`, which blocks this process's event
@@ -563,6 +565,14 @@ describe("approved host services", () => {
     expect(added.stdout, "add did not name the admitted listener").toMatch(
       new RegExp(`approved host service ${SERVICE_NAME}: 127\\.0\\.0\\.1:${port} \\([^,()]+, pid [1-9][0-9]*\\)`, "u"),
     );
+    // The activation selected a new effective policy generation only. The
+    // session template renders the approved host services, so the session
+    // agent that carries this service is selected by the next startup. A
+    // production `runfree claude` runs that startup itself; the standing
+    // session's crash-runner launch does not, so `up` stands in for it. Later
+    // remove/add cycles restore this same policy content and session agent.
+    const up = fixture.runfree(["up"]);
+    expect(up.status, `runfree up did not select the host-service session agent: ${describeOutput(up.output)}`).toBe(0);
     await startSession();
   }, PROVISION_TIMEOUT_MS);
 

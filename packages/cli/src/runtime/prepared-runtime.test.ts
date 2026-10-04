@@ -308,6 +308,23 @@ test("classifies a replaced live proxy as stale preparation", () => {
   })).toThrow(StalePreparedRuntimeError);
 });
 
+test("a plan that differs from a durable selection is refused naming that generation family", () => {
+  const prepared = fixture();
+  const { generationV2 } = prepared.activePlan;
+  const otherAgent = sha256Digest("other-session-agent-generation");
+  expect(() => mintPreparedRuntime({
+    plan: { ...prepared.activePlan, generationV2: { ...generationV2,
+      sessionAgent: { ...generationV2.sessionAgent, sessionAgentGenerationDigest: otherAgent } } },
+    validationProof: prepared.proof,
+  })).toThrow(`prepared runtime plan does not match its durable desired session-agent selection (selected session agent generation ${generationV2.sessionAgent.sessionAgentGenerationDigest}, planned ${otherAgent})`);
+  const otherControlPlane = sha256Digest("other-control-plane-generation");
+  expect(() => mintPreparedRuntime({
+    plan: { ...prepared.activePlan, generationV2: { ...generationV2,
+      controlPlane: { ...generationV2.controlPlane, controlPlaneGenerationDigest: otherControlPlane } } },
+    validationProof: prepared.proof,
+  })).toThrow(`prepared runtime plan does not match its durable effective control-plane selection (selected control plane generation ${generationV2.controlPlane.controlPlaneGenerationDigest}, planned ${otherControlPlane})`);
+});
+
 test("classifies a valid durable desired-selection change as stale preparation", () => {
   const prepared = fixture();
   const authority = mintPreparedRuntime({ plan: prepared.activePlan, validationProof: prepared.proof });

@@ -179,11 +179,20 @@ function readSnapshot(plan: ActiveRuntimePlan): PreparedRuntimeSnapshot {
       throw new Error("prepared runtime durable state belongs to a different project");
     }
   }
-  if (effective.manifest.generation.controlPlaneGenerationDigest
-      !== plan.generationV2.controlPlane.controlPlaneGenerationDigest
-    || desired.manifest.generation.sessionAgentGenerationDigest
-      !== plan.generationV2.sessionAgent.sessionAgentGenerationDigest) {
-    throw new Error("prepared runtime plan does not match its durable generation selections");
+  // Name the family that differs: an effective policy generation change can
+  // select a new session template (host services) without touching the
+  // control plane, and only a startup selects the matching session agent.
+  const selected = effective.manifest.generation.controlPlaneGenerationDigest;
+  const planned = plan.generationV2.controlPlane.controlPlaneGenerationDigest;
+  if (selected !== planned) {
+    throw new Error("prepared runtime plan does not match its durable effective control-plane selection"
+      + ` (selected control plane generation ${selected}, planned ${planned})`);
+  }
+  const desiredAgent = desired.manifest.generation.sessionAgentGenerationDigest;
+  const plannedAgent = plan.generationV2.sessionAgent.sessionAgentGenerationDigest;
+  if (desiredAgent !== plannedAgent) {
+    throw new Error("prepared runtime plan does not match its durable desired session-agent selection"
+      + ` (selected session agent generation ${desiredAgent}, planned ${plannedAgent})`);
   }
   return Object.freeze({ effective, desired });
 }

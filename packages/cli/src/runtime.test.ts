@@ -93,6 +93,7 @@ import {
   publishControlPlaneMaterializationV2,
   readDesiredSessionAgentV2,
   readEffectiveControlPlaneV2,
+  readSessionAgentTemplateArtifactV2,
   selectEffectiveControlPlaneV2,
   sessionAgentMaterializationsRootV2,
 } from "./runtime/component-state-v2.ts";
@@ -105,7 +106,7 @@ import {
   sha256Digest,
   type RuntimeComponentState,
 } from "./runtime/component-state.ts";
-import { activeRuntimePlanFromContext, createRuntimePlan } from "./runtime/plan.ts";
+import { activeRuntimePlanFromContext, createRuntimePlan, runtimeContextFromActivePlan } from "./runtime/plan.ts";
 import { NON_RESOLVING_CONNECT_PROBE_HOST } from "./runtime/probes.ts";
 import {
   bindAllocatedSessionContainerIdV2,
@@ -152,7 +153,10 @@ import { repairWorktreeLinks } from "./runtime/git-layout.ts";
 import { subprocessCategory } from "./runtime/operation-histogram.ts";
 import { COMPOSE_UP_FAILURE_REMEDY, restoreSameProxySessionAdmission, startRuntime, up } from "./runtime/startup.ts";
 import { TOKEN_SYNC_DEFERRED_STATUS } from "./runtime/constants.ts";
-import { disposeLaunchHandoff, preparedRuntimeProxyId, takeLaunchHandoff, takeLaunchHandoffDeclined } from "./runtime/prepared-runtime.ts";
+import { disposeLaunchHandoff, mintPreparedRuntime, preparedRuntimeProxyId, takeLaunchHandoff, takeLaunchHandoffDeclined } from "./runtime/prepared-runtime.ts";
+import { generatedRuntimeContextIfAvailable } from "./runtime/images.ts";
+import { createRuntimeSecurityContract } from "./runtime/security-contract.ts";
+import { runtimeValidationMarkerStatus } from "./runtime/state.ts";
 import { LAUNCH_HANDOFF_STARTUP_SPAN_MAX_MS } from "./runtime/launch-lock-hold.ts";
 import { flushWarnings, pendingWarningsForTest } from "./warnings.ts";
 import { readHostServicePortRegistry, recordProjectHostServicePorts } from "./host-service-registry.ts";
@@ -4416,6 +4420,75 @@ describe("runtime command flow", () => {
       expect(hostServiceRecheckEvents.events).toContain("lock");
       expect(hostServiceRecheckEvents.events.indexOf("probe"))
         .toBeLessThan(hostServiceRecheckEvents.events.lastIndexOf("lock"));
+    });
+
+    // A host-service activation (`host-service add`) selects a new effective
+    // policy generation only. The session template renders the approved host
+    // services, so the plan built from that generation carries a new session
+    // agent generation, which only a startup selects as the desired session
+    // agent. A production launch runs that startup, so the service appears in
+    // the next session while live sessions keep their materialization.
+    function hostServiceActivationContext(): RuntimeContext {
+      const projectRoot = path.join(tmp, "project");
+      return {
+        projectRoot,
+        project: prepareProject(projectRoot),
+        runtimeRoot: path.join(tmp, "runtime"),
+        env: { PATH: "/fake-bin", XDG_STATE_HOME: path.join(tmp, "xdg-state") },
+        network: fixedNetwork,
+      };
+    }
+    function activateHostService(context: RuntimeContext): void {
+      fs.writeFileSync(context.project.paths.policyPath, `${JSON.stringify({
+        version: 2, hosts: ["api.github.com"], hostServices: { idb: { target: "host-loopback", port: 10882 } },
+      }, null, 2)}\n`);
+      approveAndPublishEffectiveControlsForTest(context.projectRoot, context.project);
+    }
+
+    test("a launch after a host-service activation selects the session agent that renders the service", async () => {
+      const context = hostServiceActivationContext();
+      const overrides: { hostServiceSet: Array<{ ip: string; port: number }> } = { hostServiceSet: [] };
+      const io = createRuntimeIO(overrides);
+      expect((await startRuntime(context, io, false, {})).status).toBe(0);
+      const before = readDesiredSessionAgentV2(context.project.paths.stateDir);
+      activateHostService(context);
+      overrides.hostServiceSet = idbHostServiceSet;
+      const launched = await startRuntime(context, io, false, { launch: true, launchHandoff: true });
+      flushWarnings();
+      expect(launched.status, vi.mocked(console.error).mock.calls.flat().join("\n")).toBe(0);
+      if (launched.kind === "ready") disposeLaunchHandoff(launched.preparedRuntime);
+      const desired = readDesiredSessionAgentV2(context.project.paths.stateDir);
+      if (!before || !desired) throw new Error("no desired session agent was selected");
+      expect(desired.manifest.generation.sessionAgentGenerationDigest)
+        .not.toBe(before.manifest.generation.sessionAgentGenerationDigest);
+      expect(readSessionAgentTemplateArtifactV2(context.project.paths.stateDir, desired.manifest)).toContain("idb:10882");
+    });
+
+    // The live crash runner and admission matrix mint a prepared runtime from a
+    // plan rebuilt from current inputs, with no startup. After an activation
+    // that plan names an unselected session agent: the refusal names that
+    // family, and the startup a production launch runs (here `up`) clears it.
+    test("a plan rebuilt after a host-service activation is refused by family until a startup selects it", async () => {
+      const context = hostServiceActivationContext();
+      const overrides: { hostServiceSet: Array<{ ip: string; port: number }> } = { hostServiceSet: [] };
+      const io = createRuntimeIO(overrides);
+      const mintFromCurrentInputs = () => {
+        const activePlan = activeRuntimePlanFromContext(generatedRuntimeContextIfAvailable(context));
+        const contract = createRuntimeSecurityContract(activePlan);
+        const validation = runtimeValidationMarkerStatus(runtimeContextFromActivePlan(activePlan), io,
+          { contractHash: contract.contractHash });
+        if (!validation.proof || validation.issue) throw new Error(`no validation proof: ${validation.issue ?? "missing"}`);
+        return mintPreparedRuntime({ plan: activePlan, validationProof: validation.proof });
+      };
+      expect((await startRuntime(context, io, false, {})).status).toBe(0);
+      expect(preparedRuntimeProxyId(mintFromCurrentInputs())).toBe(FAKE_PROXY_CONTAINER_ID);
+      activateHostService(context);
+      overrides.hostServiceSet = idbHostServiceSet;
+      expect(mintFromCurrentInputs).toThrow(
+        "prepared runtime plan does not match its durable desired session-agent selection",
+      );
+      expect((await startRuntime(context, io, false, {})).status).toBe(0);
+      expect(preparedRuntimeProxyId(mintFromCurrentInputs())).toBe(FAKE_PROXY_CONTAINER_ID);
     });
 
     // Controller ruling R15: a project that never used host services must

@@ -1404,7 +1404,10 @@ relay binary, a crash, or a bind failure never changes the entry's exit code
 or delays its final `exec`. The relay binds first, so a later agent process
 that wants the same port gets `EADDRINUSE`. It binds loopback only, and each session has its own network
 namespace, so a peer session cannot reach it. A service added mid-session
-appears in the next session.
+appears in the next session: the live activation advances the effective
+policy generation only, and the next startup (which every launch runs)
+selects the desired session agent whose template renders the new list.
+Live sessions keep their materialization.
 
 **Gateway address.** The proxy service carries the literal Compose entry
 `extra_hosts: ["gateway.runfree.internal:host-gateway"]`, and the topology
