@@ -20,6 +20,7 @@ import {
   type SessionContainerRecordV2,
 } from "./session-containers.ts";
 import type { CaptureResult } from "./types.ts";
+import { createDockerClient } from "./docker-client.ts";
 import { remedy } from "../remedies.ts";
 import { isRecord } from "../strict-primitives.ts";
 
@@ -482,14 +483,11 @@ function listSessionContainerInventoryIds(
   executor: SessionContainerInventoryExecutor,
   options: childProcess.SpawnSyncOptions,
 ): readonly string[] {
-  const listResult = executor("docker", [
-    "container",
-    "ls",
-    "--all",
-    "--no-trunc",
-    "--format",
-    "{{.ID}}",
-  ], options);
+  const listResult = createDockerClient({ capture: executor }, options).listContainers({
+    all: true,
+    noTrunc: true,
+    format: "{{.ID}}",
+  });
   if (listResult.status !== 0) throw new Error("Docker could not list the exact session-container inventory");
   return parseSessionContainerInventoryIds(listResult.stdout);
 }
@@ -500,6 +498,7 @@ function inspectSessionContainerInventoryIds(
   expectedProject: SessionContainerProjectIdentity,
   options: childProcess.SpawnSyncOptions,
 ): SessionContainerInventoryInspection {
+  const docker = createDockerClient({ capture: executor }, options);
   const snapshots: SessionContainerSnapshot[] = [];
   const failedIds: string[] = [];
   const goneIds = new Set<string>();
@@ -507,12 +506,12 @@ function inspectSessionContainerInventoryIds(
   let inspectedBytes = 0;
   for (let offset = 0; offset < ids.length; offset += MAX_SESSION_CONTAINER_INVENTORY_INSPECT_IDS) {
     const chunk = ids.slice(offset, offset + MAX_SESSION_CONTAINER_INVENTORY_INSPECT_IDS);
-    const inspectResult = executor("docker", ["container", "inspect", ...chunk], options);
+    const inspectResult = docker.inspect(chunk, { type: "container" });
     if (inspectResult.status !== 0) {
       // The daemon names every id it could not find, one per line. That is the
-      // only sound evidence that a container is gone: a fresh `container ls`
-      // has been observed to still list an id that `container inspect` reports
-      // as absent, so the list cannot settle existence.
+      // only sound evidence that a container is gone: a fresh listing has been
+      // observed to still list an id that `container inspect` reports as
+      // absent, so the list cannot settle existence.
       const chunkGoneIds = goneIdsFromFailure(inspectResult, chunk);
       for (const id of chunkGoneIds) goneIds.add(id);
       // Docker exits non-zero when any member is gone but still prints every

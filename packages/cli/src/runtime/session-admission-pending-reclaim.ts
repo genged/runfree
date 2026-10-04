@@ -52,6 +52,8 @@ import { PROJECT_ID_LABEL } from "./constants.ts";
 import { readEffectiveControlPlaneV2 } from "./component-state-v2.ts";
 import { CONTAINER_ROLE_LABEL, composeServiceContainerFilters } from "./container-inventory.ts";
 import { readControlPlaneRebindTransaction } from "./control-plane-rebind.ts";
+import { createDockerClient } from "./docker-client.ts";
+import { filterValues } from "./docker.ts";
 import { RuntimeObservationError } from "./observation-failure.ts";
 import { observeExactProxy } from "./proxy-containment.ts";
 import {
@@ -196,8 +198,7 @@ function observeSessionContainer(
     );
   }
   input.lifecycleLock.assertHeld();
-  const inspected = input.io.capture("docker", ["container", "inspect", reference], {
-    ...(input.dockerOptions ?? {}),
+  const inspected = createDockerClient(input.io, input.dockerOptions ?? {}).inspect([reference], { type: "container" }, {
     timeout: SESSION_CONTAINER_OBSERVATION_TIMEOUT_MS,
     maxBuffer: OBSERVATION_MAX_BYTES,
   });
@@ -255,10 +256,11 @@ function runningProjectProxyIds(input: PendingSessionAdmissionReclaimInput, sess
   input.lifecycleLock.assertHeld();
   // Uncorroborated on purpose: any running container Compose would call this
   // project's proxy counts, which can only widen what refuses.
-  const listed = input.io.capture("docker", [
-    "ps", "--quiet", "--no-trunc",
-    ...composeServiceContainerFilters(input.expectedProject.composeProject, "proxy"),
-  ], { ...(input.dockerOptions ?? {}), timeout: PROXY_INVENTORY_TIMEOUT_MS, maxBuffer: OBSERVATION_MAX_BYTES });
+  const listed = createDockerClient(input.io, input.dockerOptions ?? {}).listContainers({
+    quiet: true,
+    noTrunc: true,
+    filters: filterValues(composeServiceContainerFilters(input.expectedProject.composeProject, "proxy")),
+  }, { timeout: PROXY_INVENTORY_TIMEOUT_MS, maxBuffer: OBSERVATION_MAX_BYTES });
   input.lifecycleLock.assertHeld();
   if (listed.status !== 0 || listed.stderr.trim()) {
     throw dockerUnavailable(

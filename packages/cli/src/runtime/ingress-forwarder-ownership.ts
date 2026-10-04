@@ -10,6 +10,7 @@ import {
   stopIngressForwarders,
 } from "./ingress-forwarder.ts";
 import { dockerClientEnvOptions, parseDockerJson } from "./docker.ts";
+import { createDockerClient } from "./docker-client.ts";
 import type { DockerContainerInspect, RuntimeContext, RuntimeIO } from "./types.ts";
 import { validateIngressForwarderTeardownCandidate } from "./utility-containers.ts";
 
@@ -46,14 +47,11 @@ export function planValidatedIngressForwarders(
     omitInvalid?: boolean;
   }> = {},
 ): ValidatedIngressForwarderPlan {
+  const client = createDockerClient(io, dockerClientEnvOptions(context));
   const names = [...new Set(options.names ?? listIngressForwarders(context, io, projectId))];
   const candidates: DockerContainerInspect[] = [];
   for (const name of names) {
-    const result = io.capture(
-      "docker",
-      ["container", "inspect", name],
-      dockerClientEnvOptions(context),
-    );
+    const result = client.inspect([name], { type: "container" });
     if (result.status !== 0) {
       if (exactMissingContainer(result.stderr, name)) continue;
       throw new Error(`could not inspect ingress forwarder ${name}: ${result.stderr.trim() || `exit ${result.status}`}`);
@@ -80,11 +78,7 @@ export function planValidatedIngressForwarders(
   const byId = new Map(validationCandidates.flatMap((candidate) => candidate.Id ? [[candidate.Id, candidate] as const] : []));
   for (const endpointId of hostNetwork?.containerIds ?? []) {
     if (byId.has(endpointId)) continue;
-    const result = io.capture(
-      "docker",
-      ["container", "inspect", endpointId],
-      dockerClientEnvOptions(context),
-    );
+    const result = client.inspect([endpointId], { type: "container" });
     if (result.status !== 0) {
       networkInvalidReason = `could not inspect ingress endpoint ${endpointId}: ${result.stderr.trim() || `exit ${result.status}`}`;
       break;
@@ -114,11 +108,7 @@ export function planValidatedIngressForwarders(
     });
   }
 
-  const imageResult = io.capture(
-    "docker",
-    ["image", "inspect", "--format", "{{.Id}}", INGRESS_FORWARDER_IMAGE],
-    dockerClientEnvOptions(context),
-  );
+  const imageResult = client.inspect([INGRESS_FORWARDER_IMAGE], { type: "image", format: "{{.Id}}" });
   const expectedImageId = imageResult.stdout.trim();
   if (imageResult.status !== 0 || !DOCKER_IMAGE_ID_PATTERN.test(expectedImageId)) {
     throw new Error(

@@ -1,6 +1,7 @@
 import { describe, expect, test, vi } from "vitest";
 
 import type { ControlPlaneEffectiveSelectionV2 } from "./component-state-v2.ts";
+import type { DockerListQuery, DockerObjectType } from "./docker-client.ts";
 import { clearStoppedControlPlaneSelection, type StoppedSelectionDeps } from "./stopped-selection.ts";
 import type { CaptureResult } from "./types.ts";
 
@@ -17,18 +18,28 @@ const SELECTION = {
 
 const clean: CaptureResult = { status: 0, stdout: "", stderr: "" };
 
+// Records each call as `["listContainers", query]` or `["listObjects", type,
+// query]`, in the same shape and order the old plain-argv recording used, so
+// the exact-sequence assertion below reads the same way.
 function harness(overrides: Partial<StoppedSelectionDeps> = {}) {
-  const calls: string[][] = [];
+  const calls: unknown[][] = [];
   const clearSelection = vi.fn();
+  const docker = {
+    listContainers: (query: DockerListQuery): CaptureResult => {
+      calls.push(["listContainers", query]);
+      return clean;
+    },
+    listObjects: (type: DockerObjectType, query: DockerListQuery): CaptureResult => {
+      calls.push(["listObjects", type, query]);
+      return clean;
+    },
+  };
   const deps = {
     readSelection: () => SELECTION,
     peekRecords: () => ({ records: [], unreadable: 0 }),
     readRebind: () => undefined,
     clearSelection,
-    docker: (args: readonly string[]) => {
-      calls.push([...args]);
-      return clean;
-    },
+    docker,
     assertAuthority: () => {},
     ...overrides,
   } as unknown as StoppedSelectionDeps;
@@ -41,9 +52,9 @@ describe("clearStoppedControlPlaneSelection", () => {
     expect(clearStoppedControlPlaneSelection("/state", PROJECT, deps)).toBe("cleared");
     expect(clearSelection).toHaveBeenCalledExactlyOnceWith("/state");
     expect(calls).toEqual([
-      ["ps", "--all", "--quiet", "--no-trunc", "--filter", `id=${PROXY_ID}`],
-      ["network", "ls", "--quiet", "--no-trunc", "--filter", `id=${INTERNAL_ID}`],
-      ["network", "ls", "--quiet", "--no-trunc", "--filter", `id=${EGRESS_ID}`],
+      ["listContainers", { all: true, quiet: true, noTrunc: true, filters: [`id=${PROXY_ID}`] }],
+      ["listObjects", "network", { quiet: true, noTrunc: true, filters: [`id=${INTERNAL_ID}`] }],
+      ["listObjects", "network", { quiet: true, noTrunc: true, filters: [`id=${EGRESS_ID}`] }],
     ]);
   });
 
@@ -77,8 +88,9 @@ describe("clearStoppedControlPlaneSelection", () => {
     ["a listing writes to stderr", "unverified", 2, { ...clean, stderr: "error during connect" }],
   ])("keeps the selection when %s", (_label, outcome, failingCall, answer) => {
     let call = 0;
+    const next = (): CaptureResult => (call++ === failingCall ? answer : clean);
     const { deps, clearSelection } = harness({
-      docker: () => (call++ === failingCall ? answer : clean),
+      docker: { listContainers: next, listObjects: next } as unknown as StoppedSelectionDeps["docker"],
     });
     expect(clearStoppedControlPlaneSelection("/state", PROJECT, deps)).toBe(outcome);
     expect(clearSelection).not.toHaveBeenCalled();

@@ -18,14 +18,13 @@
 // which is exactly what makes the deny proof honest — and the proxy rejects
 // its traffic like any unadmitted source.
 
-import type { SpawnSyncOptions } from "node:child_process";
-
 import { isExactSessionSourceIpv4 } from "@runfree/runtime-contracts/session-registry";
 
 import {
   ephemeralHelperLabelArguments,
   type EphemeralHelperPurpose,
 } from "./container-inventory.ts";
+import { createDockerClient, labelRunFlags, type DockerCallOptions, type DockerRunFlag } from "./docker-client.ts";
 import { dockerClientEnvOptions } from "./docker.ts";
 import {
   EphemeralHelperUnconfirmedError,
@@ -86,14 +85,19 @@ export type EphemeralHelperRequest = Readonly<{
   timeoutMs?: number;
 }>;
 
+/** The structured form of one helper's `docker run`: the single source of truth. */
+type EphemeralHelperRunRequest = Readonly<{
+  flags: readonly DockerRunFlag[];
+  image: string;
+  command: readonly string[];
+}>;
+
 /**
- * The exact `docker run` argv for one helper, pure and testable.
- *
  * Every hardening flag is load-bearing: the helper runs the project's selected
  * agent image, which is untrusted, so the run must grant nothing the session
  * create plan would not.
  */
-export function ephemeralHelperRunArguments(input: EphemeralHelperRequest): string[] {
+function ephemeralHelperRunRequest(input: EphemeralHelperRequest): EphemeralHelperRunRequest {
   if (!input.image || /\s/u.test(input.image)) {
     throw new Error(`ephemeral helper requires an exact image reference, not ${input.image || "<empty>"}`);
   }
@@ -125,33 +129,36 @@ export function ephemeralHelperRunArguments(input: EphemeralHelperRequest): stri
       throw new Error(`ephemeral helper capability is not in the closed set: ${String(capability)}`);
     }
   }
-  return [
-    "run",
-    "--rm",
+  const flags: DockerRunFlag[] = [
+    ["--rm"] as const,
     // A helper runs only an image that is already local: never a registry
     // fetch under the lifecycle lock, and never a different image by the
     // same reference.
-    "--pull",
-    "never",
-    ...(input.stdin !== undefined ? ["-i"] : []),
-    ...ephemeralHelperLabelArguments(input.projectId, input.purpose),
-    "--user",
-    input.user,
-    "--cap-drop",
-    "ALL",
-    ...(input.capabilities ?? []).flatMap((capability) => ["--cap-add", capability]),
-    "--security-opt",
-    "no-new-privileges:true",
-    "--read-only",
-    "--pids-limit",
-    "64",
-    "--network",
-    input.networkId ?? "none",
-    ...(input.ip !== undefined ? ["--ip", input.ip] : []),
-    ...(input.volumes ?? []).flatMap((volume) => ["-v", `${volume.name}:${volume.target}`]),
-    input.image,
-    ...input.command,
+    ["--pull", "never"] as const,
+    ...(input.stdin !== undefined ? [["-i"] as const] : []),
+    ...labelRunFlags(ephemeralHelperLabelArguments(input.projectId, input.purpose)),
+    ["--user", input.user] as const,
+    ["--cap-drop", "ALL"] as const,
+    ...(input.capabilities ?? []).map((capability) => ["--cap-add", capability] as const),
+    ["--security-opt", "no-new-privileges:true"] as const,
+    ["--read-only"] as const,
+    ["--pids-limit", "64"] as const,
+    ["--network", input.networkId ?? "none"] as const,
+    ...(input.ip !== undefined ? [["--ip", input.ip] as const] : []),
+    ...(input.volumes ?? []).map((volume) => ["-v", `${volume.name}:${volume.target}`] as const),
   ];
+  return { flags, image: input.image, command: input.command };
+}
+
+/**
+ * The exact `docker run` argv for one helper, pure and testable. A thin
+ * flattening of `ephemeralHelperRunRequest`'s structured flags — the same
+ * single source of truth `runEphemeralHelper` hands to `runContainer` — so
+ * this and the real call can never drift apart.
+ */
+export function ephemeralHelperRunArguments(input: EphemeralHelperRequest): string[] {
+  const { flags, image, command } = ephemeralHelperRunRequest(input);
+  return ["run", ...flags.flatMap((flag) => [...flag]), image, ...command];
 }
 
 /** Test-only shortening of every helper's wall-time bound (ruling D3). */
@@ -209,8 +216,9 @@ export function runEphemeralHelper(
   if (!fence) throw new Error(EPHEMERAL_HELPER_FENCE_REQUIRED);
   fence.lifecycleLock.assertHeld();
   // Argument validation refuses before the marker or the spawn.
-  const args = ephemeralHelperRunArguments(request);
+  const runRequest = ephemeralHelperRunRequest(request);
   const dockerOptions = dockerClientEnvOptions(context);
+  const client = createDockerClient(io, dockerOptions);
   // A marker here was left by another lock span (a crashed CLI, or one that
   // held the lock while this process released it). Sweep it first: this run's
   // clean exit would otherwise clear a marker whose helper was never swept.
@@ -221,15 +229,14 @@ export function runEphemeralHelper(
   let spawned = false;
   let outcome: { ok: true; result: CaptureResult } | { ok: false; error: unknown };
   try {
-    const options: SpawnSyncOptions = {
-      ...dockerOptions,
+    const options: DockerCallOptions = {
       timeout: ephemeralHelperTimeoutMs(request.purpose, context.env ?? {}, request.timeoutMs),
       killSignal: "SIGKILL",
       maxBuffer: DEFAULT_MAX_BUFFER,
       ...(request.stdin !== undefined ? { input: request.stdin } : {}),
     };
     spawned = true;
-    outcome = { ok: true, result: io.capture("docker", args, options) };
+    outcome = { ok: true, result: client.runContainer(runRequest.flags, runRequest.image, runRequest.command, options) };
   } catch (error) {
     if (wasRefusedBeforeSpawn(error)) spawned = false;
     outcome = { ok: false, error };

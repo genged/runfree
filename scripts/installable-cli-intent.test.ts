@@ -156,11 +156,11 @@ printf '%s|%s|%s|%s\\n' "$1" "$RUNFREE_CLAUDE_DIR" "$RUNFREE_CLAUDE_JSON" "$DOCK
 case "$1" in
   info) exit 0 ;;
   ps)
-    if [ "$2" = "-q" ]; then
+    if [ "$2" = "--quiet" ]; then
       case "$*" in
         *com.docker.compose.service=proxy*) ;;
       esac
-    elif [ "$2" = "-aq" ]; then
+    elif [ "$2" = "--all" ] && [ "$3" = "--quiet" ]; then
       case "$*" in
         *com.docker.compose.service=proxy*) echo proxy-id ;;
         *com.docker.compose.service=mcp_callback*) ;;
@@ -179,8 +179,12 @@ case "$1" in
     esac
     exit 0
     ;;
-  restart) exit 1 ;;
-  start) exit 1 ;;
+  container)
+    case "$2" in
+      restart|start) exit 1 ;;
+    esac
+    exit 0
+    ;;
   exec)
 ${dockerSecurityContractProbeShell()}
     case "$*" in
@@ -208,7 +212,7 @@ exit 0
     expect(result.stdout).toContain("effective policy: saved; applies when the runtime starts (effective policy generation sha256:");
     const log = fs.readFileSync(envLog, "utf8");
     expect(log).toContain("|false\n");
-    expect(log).not.toContain("restart|");
+    expect(log).not.toContain("container|");
     expect(log).not.toContain("/xdg-state/runfree/projects/");
     expect(log).not.toContain("compose|");
   });
@@ -226,7 +230,7 @@ printf '%s\\n' "$*" >> "${dockerLog}"
 case "$1" in
   info) exit 0 ;;
   ps)
-    if [ "$2" = "-aq" ]; then
+    if [ "$2 $3" = "--all --quiet" ]; then
       case "$*" in
         *io.runfree.project-id*) echo agent-id ;;
         *com.docker.compose.service=proxy*) echo proxy-id ;;

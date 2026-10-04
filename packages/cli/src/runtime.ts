@@ -48,6 +48,7 @@ import {
 import { prepareDependencyOverlayPlan } from "./runtime/dependency-overlays.ts";
 import { runFencedProjectDestroy } from "./runtime/destroy.ts";
 import { containerMissingNetwork, dockerClientEnvOptions } from "./runtime/docker.ts";
+import { createDockerClient } from "./runtime/docker-client.ts";
 import { printHostGitStatusLine } from "./runtime/git-layout.ts";
 import { clearStoppedControlPlaneSelection } from "./runtime/stopped-selection.ts";
 import {
@@ -1195,7 +1196,7 @@ export async function stopRuntime(context: RuntimeContext, io: RuntimeIO, option
       projectId: projectHash(context.projectRoot),
       composeProject: composeProjectName(context.projectRoot),
     }, {
-      docker: (args) => io.capture("docker", [...args], { ...dockerClientEnvOptions(context), timeout: 10_000, maxBuffer: 64 * 1024 }),
+      docker: createDockerClient(io, { ...dockerClientEnvOptions(context), timeout: 10_000, maxBuffer: 64 * 1024 }),
       assertAuthority: () => lifecycleLock.assertHeld(),
     });
     if (outcome === "unverified") {

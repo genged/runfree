@@ -7,6 +7,7 @@ import { PROXY_SERVER_UID } from "@runfree/proxy/firewall/nftables";
 import { runDockerExec, runDockerExecProxyServer, runDockerExecRoot } from "./attach.ts";
 import { AGENT_UID_GID } from "./constants.ts";
 import { dockerClientEnvOptions, } from "./docker.ts";
+import { createDockerClient } from "./docker-client.ts";
 import type { CaptureResult, DockerNetworkInspect, RuntimeContext, RuntimeIO } from "./types.ts";
 
 export type RuntimeProbeIssue = string;
@@ -146,21 +147,20 @@ export function startMcpCallbackBridgeInContainer(
   io: RuntimeIO,
   params: Readonly<{ containerId: string; bindIp: string; port: number; challenge: string; allowedPeerIp: string }>,
 ): number {
-  return io.run("docker", [
-    "exec",
-    "-d",
-    "--user",
-    AGENT_UID_GID,
+  return createDockerClient(io, dockerClientEnvOptions(context)).terminal.exec(
     params.containerId,
-    "node",
-    "-e",
-    MCP_CALLBACK_BRIDGE_SOURCE,
-    params.bindIp,
-    String(params.port),
-    params.challenge,
-    params.allowedPeerIp,
-    SESSION_MCP_CALLBACK_PORT_FILE,
-  ], dockerClientEnvOptions(context));
+    [
+      "node",
+      "-e",
+      MCP_CALLBACK_BRIDGE_SOURCE,
+      params.bindIp,
+      String(params.port),
+      params.challenge,
+      params.allowedPeerIp,
+      SESSION_MCP_CALLBACK_PORT_FILE,
+    ],
+    { detach: true, user: AGENT_UID_GID },
+  );
 }
 
 /**
@@ -590,6 +590,6 @@ export function validateProxyFirewall(
 }
 
 export function containerLogs(context: RuntimeContext, io: RuntimeIO, containerId: string): string {
-  const logs = io.capture("docker", ["logs", "--tail", "80", containerId], dockerClientEnvOptions(context));
+  const logs = createDockerClient(io, dockerClientEnvOptions(context)).logs(containerId, { tail: 80 });
   return logs.status === 0 ? compactDiagnostic(`${logs.stdout}\n${logs.stderr}`) : "";
 }

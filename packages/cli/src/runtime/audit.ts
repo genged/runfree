@@ -16,6 +16,7 @@ import { die } from "../errors.ts";
 import { runfreeLog } from "../warnings.ts";
 import { ROOT_UID_GID } from "./constants.ts";
 import { dockerClientEnvOptions, serviceContainerId, shellSingleQuote } from "./docker.ts";
+import { createDockerClient } from "./docker-client.ts";
 import { composeProjectName } from "./env.ts";
 import type { CaptureResult, RuntimeContext, RuntimeIO } from "./types.ts";
 
@@ -140,11 +141,8 @@ function runningProxyId(context: RuntimeContext, io: RuntimeIO): string | undefi
 }
 
 function execProxyRootNode(context: RuntimeContext, io: RuntimeIO, proxyId: string, script: string, args: string[]): CaptureResult {
-  return io.capture(
-    "docker",
-    ["exec", "--user", ROOT_UID_GID, proxyId, "node", "-e", script, ...args],
-    dockerClientEnvOptions(context),
-  );
+  return createDockerClient(io, dockerClientEnvOptions(context))
+    .exec(proxyId, ["node", "-e", script, ...args], { user: ROOT_UID_GID });
 }
 
 function formatDurationMinutes(ms: number): string {
@@ -246,11 +244,8 @@ function auditOffCommand(context: RuntimeContext, io: RuntimeIO): number {
     console.log("network audit: inactive (proxy not running)");
     return 0;
   }
-  const result = io.capture(
-    "docker",
-    ["exec", "--user", ROOT_UID_GID, proxyId, "sh", "-c", `rm -f ${shellSingleQuote(AUDIT_MARKER_PATH)}`],
-    dockerClientEnvOptions(context),
-  );
+  const result = createDockerClient(io, dockerClientEnvOptions(context))
+    .exec(proxyId, ["sh", "-c", `rm -f ${shellSingleQuote(AUDIT_MARKER_PATH)}`], { user: ROOT_UID_GID });
   if (result.status !== 0) {
     runfreeLog(`disabling audit mode failed: ${result.stderr.trim() || "docker exec failed"}`);
     return 1;
@@ -413,11 +408,8 @@ function auditReport(json: boolean, context: RuntimeContext, io: RuntimeIO): num
     console.log("no running proxy container; nothing to report");
     return 0;
   }
-  const logs = io.capture(
-    "docker",
-    ["logs", "--tail", String(AUDIT_REPORT_LOG_TAIL), proxyId],
-    { ...dockerClientEnvOptions(context), timeout: LOG_READ_TIMEOUT_MS },
-  );
+  const logs = createDockerClient(io, dockerClientEnvOptions(context))
+    .logs(proxyId, { tail: AUDIT_REPORT_LOG_TAIL }, { timeout: LOG_READ_TIMEOUT_MS });
   if (logs.status !== 0) {
     runfreeLog(`could not read proxy logs: ${logs.stderr.trim() || "docker logs failed"}`);
     return 1;

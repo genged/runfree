@@ -3,6 +3,7 @@ import { firewallStatusPath, parseGenerationStatusLine } from "@runfree/runtime-
 import type { RuntimeIO } from "./types.ts";
 import { RuntimeObservationError } from "./observation-failure.ts";
 import { PROXY_CONTAINER_INSPECT_MAX_BYTES } from "./constants.ts";
+import { createDockerClient } from "./docker-client.ts";
 
 const READY_TIMEOUT_MS = 10_000;
 const POLL_MS = 100;
@@ -23,11 +24,13 @@ export async function waitForProxyFirewallReadiness(input: {
   const now = input.nowMs ?? (() => performance.now());
   const delay = input.delay ?? ((ms) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
   const deadline = now() + READY_TIMEOUT_MS;
+  const client = createDockerClient(input.io, { env: input.dockerEnv, shell: false });
   let lastObservation = "no readable status";
   while (now() < deadline) {
     input.assertAuthority?.();
-    const options = { env: input.dockerEnv, shell: false as const, timeout: Math.max(1, Math.min(1000, deadline - now())), maxBuffer: PROXY_CONTAINER_INSPECT_MAX_BYTES };
-    const inspection = input.io.capture("docker", ["container", "inspect", input.proxyId], options);
+    const inspection = client.inspect([input.proxyId], { type: "container" }, {
+      timeout: Math.max(1, Math.min(1000, deadline - now())), maxBuffer: PROXY_CONTAINER_INSPECT_MAX_BYTES,
+    });
     input.assertAuthority?.();
     let startedAt: string | undefined;
     try {
@@ -39,8 +42,8 @@ export async function waitForProxyFirewallReadiness(input: {
     if (!startedAt || !Number.isFinite(Date.parse(startedAt))) {
       lastObservation = "exact running proxy start time is unavailable";
     } else if (now() < deadline) {
-      const status = input.io.capture("docker", ["exec", "--user", "0:0", input.proxyId, "cat", firewallStatusPath()], {
-        ...options, timeout: Math.max(1, Math.min(1000, deadline - now())),
+      const status = client.exec(input.proxyId, ["cat", firewallStatusPath()], { user: "0:0" }, {
+        timeout: Math.max(1, Math.min(1000, deadline - now())), maxBuffer: PROXY_CONTAINER_INSPECT_MAX_BYTES,
       });
       input.assertAuthority?.();
       let appliedAt: unknown;

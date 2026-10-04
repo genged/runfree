@@ -33,6 +33,7 @@ import { formatTerminalTable } from "../terminal-table.ts";
 import { runfreeLog } from "../warnings.ts";
 import { ROOT_UID_GID } from "./constants.ts";
 import { dockerClientEnvOptions, serviceContainerId } from "./docker.ts";
+import { createDockerClient } from "./docker-client.ts";
 import { composeProjectName } from "./env.ts";
 import {
   mcpApprovalPath,
@@ -215,11 +216,8 @@ function runningProxyId(context: RuntimeContext, io: RuntimeIO): string | undefi
 }
 
 function execProxyRootNode(context: RuntimeContext, io: RuntimeIO, proxyId: string, script: string, args: string[]): CaptureResult {
-  return io.capture(
-    "docker",
-    ["exec", "--user", ROOT_UID_GID, proxyId, "node", "-e", script, ...args],
-    dockerClientEnvOptions(context),
-  );
+  return createDockerClient(io, dockerClientEnvOptions(context))
+    .exec(proxyId, ["node", "-e", script, ...args], { user: ROOT_UID_GID });
 }
 
 function readPendingApprovalsSnapshot(context: RuntimeContext, io: RuntimeIO, proxyId: string): PendingApprovalRecord[] | undefined {
@@ -256,11 +254,8 @@ export function touchWatcherHeartbeat(context: RuntimeContext, io: RuntimeIO, pr
 export function readWriteApprovalsStatus(context: RuntimeContext, io: RuntimeIO): WriteApprovalsStatus | undefined {
   const proxyId = runningProxyId(context, io);
   if (!proxyId) return undefined;
-  const result = io.capture(
-    "docker",
-    ["exec", proxyId, "cat", writeApprovalsStatusPath()],
-    dockerClientEnvOptions(context),
-  );
+  const result = createDockerClient(io, dockerClientEnvOptions(context))
+    .exec(proxyId, ["cat", writeApprovalsStatusPath()]);
   if (result.status !== 0) return undefined;
   return parseWriteApprovalsStatus(result.stdout.trim());
 }

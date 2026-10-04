@@ -37,6 +37,7 @@ import {
 } from "./constants.ts";
 import { composeProjectName, composeRuntimeEnvironment, dockerClientEnvironment } from "./env.ts";
 import { assertComposeManagedLocalVolume } from "./session-named-volume-proof.ts";
+import { createDockerClient } from "./docker-client.ts";
 import {
   captureDockerListing,
   type DockerListingColumn,
@@ -222,7 +223,7 @@ function dockerAvailable(context: RuntimeContext, io: RuntimeIO): boolean {
     die("docker not found - install Docker Desktop first");
   }
   lastDockerDaemonIdentity = undefined;
-  const info = io.capture("docker", ["info", "--format", "{{json .}}"], dockerClientEnvOptions(context));
+  const info = createDockerClient(io, dockerClientEnvOptions(context)).info("{{json .}}");
   if (info.status !== 0 || dockerInfoServerError(info.stdout) !== undefined) {
     die("docker daemon not running - start Docker Desktop first");
   }
@@ -232,6 +233,28 @@ function dockerAvailable(context: RuntimeContext, io: RuntimeIO): boolean {
 
 function firstNonZero(...statuses: number[]): number {
   return statuses.find((status) => status !== 0) ?? 0;
+}
+
+// container-inventory.ts's filter builders return interleaved `--filter`/value
+// pairs for direct argv splicing; the Docker client's `filters` field wants
+// just the values, which it re-flags itself. Fails closed: a caller that feeds
+// this a malformed pair or a trailing `--filter` gets a thrown error rather
+// than a silently narrowed or widened listing (one caller feeds it into a
+// deletion, `removeComposeProjectLeftoverVolumes`).
+export function filterValues(flagPairs: readonly string[]): string[] {
+  if (flagPairs.length % 2 !== 0) {
+    throw new Error(`malformed --filter argv: expected [--filter, value] pairs, got ${flagPairs.length} token(s): ${JSON.stringify(flagPairs)}`);
+  }
+  const values: string[] = [];
+  for (let index = 0; index < flagPairs.length; index += 2) {
+    const flag = flagPairs[index];
+    const value = flagPairs[index + 1];
+    if (flag !== "--filter" || typeof value !== "string") {
+      throw new Error(`malformed --filter argv at index ${index}: expected ["--filter", value], got ${JSON.stringify(flagPairs.slice(index, index + 2))}`);
+    }
+    values.push(value);
+  }
+  return values;
 }
 
 function printResourceSection(title: string, columns: readonly DockerListingColumn[], rows: readonly DockerListingRow[]): void {
@@ -260,18 +283,18 @@ function imageRef(row: DockerListingRow): string {
 // `image ls` rows carry no labels, so the Runfree role and runtime digest come
 // from one `image inspect` over the listed refs, read as one JSON label object
 // per image and merged into the row as `RunfreeRole` / `RunfreeRuntimeDigest`.
-function imageRowsWithLabels(context: RuntimeContext, io: RuntimeIO, args: string[], label: string): { rows: DockerListingRow[]; status: number } {
-  const listing = captureDockerListing(io, args, dockerClientEnvOptions(context), label);
+function imageRowsWithLabels(
+  context: RuntimeContext,
+  io: RuntimeIO,
+  query: Readonly<{ filters?: string[]; reference?: string }>,
+  label: string,
+): { rows: DockerListingRow[]; status: number } {
+  const client = createDockerClient(io, dockerClientEnvOptions(context));
+  const listing = captureDockerListing(client, { type: "image", ...query }, label);
   const refs = listing.rows.map(imageRef).filter((ref) => ref !== ":" && ref !== "<none>:<none>");
   if (listing.status !== 0 || refs.length === 0) return listing;
 
-  const inspect = io.capture("docker", [
-    "image",
-    "inspect",
-    "--format",
-    "{{json .Config.Labels}}",
-    ...refs,
-  ], dockerClientEnvOptions(context));
+  const inspect = client.inspect(refs, { type: "image", format: "{{json .Config.Labels}}" });
   if (inspect.status !== 0) {
     const detail = inspect.stderr.trim();
     warn(`could not inspect Docker ${label} labels${detail ? `: ${detail}` : ""}`);
@@ -314,39 +337,29 @@ function projectResourceSummary(context: RuntimeContext, io: RuntimeIO, project:
   const projectId = projectHash(context.projectRoot);
   const dependencyVolumePrefix = `runfree-deps-${projectHash(fs.realpathSync(context.projectRoot))}-`;
   const options = dockerClientEnvOptions(context);
+  const client = createDockerClient(io, options);
 
-  const containers = captureDockerListing(io, [
-    "ps",
-    "-a",
-    ...corroboratedComposeProjectContainerFilters(projectId, project),
-  ], options, "containers");
-  const networks = captureDockerListing(io, [
-    "network",
-    "ls",
-    ...composeProjectNetworkFilters(project),
-  ], options, "networks");
-  const composeVolumes = captureDockerListing(io, [
-    "volume",
-    "ls",
-    ...composeProjectVolumeFilters(project),
-  ], options, "compose volumes");
-  const dependencyVolumes = captureDockerListing(io, [
-    "volume",
-    "ls",
-    "--filter",
-    `name=${dependencyVolumePrefix}`,
-  ], options, "dependency volumes");
-  const projectImages = imageRowsWithLabels(context, io, [
-    "image",
-    "ls",
-    ...projectImageFilters(projectId),
-  ], "images");
+  const containers = captureDockerListing(client, {
+    all: true,
+    filters: filterValues(corroboratedComposeProjectContainerFilters(projectId, project)),
+  }, "containers");
+  const networks = captureDockerListing(client, {
+    type: "network",
+    filters: filterValues(composeProjectNetworkFilters(project)),
+  }, "networks");
+  const composeVolumes = captureDockerListing(client, {
+    type: "volume",
+    filters: filterValues(composeProjectVolumeFilters(project)),
+  }, "compose volumes");
+  const dependencyVolumes = captureDockerListing(client, {
+    type: "volume",
+    filters: [`name=${dependencyVolumePrefix}`],
+  }, "dependency volumes");
+  const projectImages = imageRowsWithLabels(context, io, {
+    filters: filterValues(projectImageFilters(projectId)),
+  }, "images");
   const baseImages = agentBuildConfig(context.project.config)
-    ? imageRowsWithLabels(context, io, [
-      "image",
-      "ls",
-      agentBaseImageTag(),
-    ], "base images")
+    ? imageRowsWithLabels(context, io, { reference: agentBaseImageTag() }, "base images")
     : { rows: [], status: 0 };
   const dependencyVolumeRows = dependencyVolumes.rows
     .filter((row) => (row.Name ?? "").startsWith(dependencyVolumePrefix));
@@ -452,14 +465,15 @@ export function removeComposeProjectLeftoverVolumes(
   project: string,
   options: childProcess.SpawnSyncOptions,
 ): number {
-  const listed = io.capture("docker", ["volume", "ls", "-q", ...composeProjectVolumeFilters(project)], options);
+  const client = createDockerClient(io, options);
+  const listed = client.listObjects("volume", { quiet: true, filters: filterValues(composeProjectVolumeFilters(project)) });
   if (listed.status !== 0) {
     warn(`destroy could not list ${project} volumes: ${listed.stderr.trim().slice(0, 512) || `exit ${listed.status}`}`);
     return listed.status;
   }
   const names = listed.stdout.split("\n").map((line) => line.trim()).filter((name) => name.startsWith(`${project}_`));
   if (names.length === 0) return 0;
-  const removed = io.capture("docker", ["volume", "rm", ...names], options);
+  const removed = client.removeVolumes(names);
   if (removed.status !== 0) {
     warn(`destroy could not remove ${project} volumes: ${removed.stderr.trim().slice(0, 512) || `exit ${removed.status}`}`);
   }
@@ -475,10 +489,10 @@ export function createRuntimeDocker(
   const runtimeContainerCache = new Map<string, RuntimeContainer[]>();
   const serviceContainerIdCache = new Map<string, string | undefined>();
   const imageInspectCache = new Map<string, DockerImageInspect | undefined>();
+  const client = createDockerClient(io, dockerClientEnvOptions(context));
   const composeFile = (): string => path.join(context.runtimeRoot, "agent", "compose.yaml");
   const composeDir = (): string => path.dirname(composeFile());
   const composeArgs = (project: string, command: string, rest: string[] = []): string[] => [
-    "compose",
     "--project-directory",
     composeDir(),
     "-p",
@@ -522,7 +536,7 @@ export function createRuntimeDocker(
     return id;
   };
   const inspectImageUncached = (tag: string): DockerImageInspect | undefined => {
-    const result = io.capture("docker", ["image", "inspect", tag], dockerClientEnvOptions(context));
+    const result = client.inspect([tag], { type: "image" });
     if (result.status !== 0) return undefined;
     try {
       const parsed: unknown = JSON.parse(result.stdout);
@@ -600,7 +614,7 @@ export function createRuntimeDocker(
       dockerAvailable(context, io);
     },
     buildImage(args) {
-      const status = io.run("docker", ["build", ...args], dockerClientEnvOptions(context));
+      const status = client.terminal.build(args);
       imageInspectCache.clear();
       return status;
     },
@@ -609,8 +623,8 @@ export function createRuntimeDocker(
     },
     composeDown(project) {
       const options = composeOptions();
-      const status = io.run("docker", composeArgs(project, "down", ["--remove-orphans"]),
-        { ...options, env: composeTeardownEnv(composeFile(), options.env) });
+      const status = createDockerClient(io, { ...options, env: composeTeardownEnv(composeFile(), options.env) })
+        .terminal.compose(composeArgs(project, "down", ["--remove-orphans"]));
       clearRuntimeCaches();
       return status;
     },
@@ -633,7 +647,7 @@ export function createRuntimeDocker(
           fs.writeFileSync(override, `services:\n  proxy:\n    labels:\n      ${REBIND_TRANSACTION_LABEL}: '${transactionId}'\n      ${REBIND_ATTEMPT_LABEL}: '${attempt}'\n`, { mode: 0o600, flag: "wx" });
           args.splice(args.indexOf("up"), 0, "-f", override);
         }
-        const status = io.run("docker", args, composeOptions());
+        const status = createDockerClient(io, composeOptions()).terminal.compose(args);
         clearRuntimeCaches();
         return status;
       } finally {
@@ -645,12 +659,10 @@ export function createRuntimeDocker(
       // no-op that returns 0, so this is idempotent across reruns. It also
       // fails closed on a name that already exists under a non-local driver.
       const name = `${project}_${logicalName}`;
-      const created = io.capture("docker", [
-        "volume", "create",
-        "--label", `com.docker.compose.project=${project}`,
-        "--label", `com.docker.compose.volume=${logicalName}`,
-        name,
-      ], dockerClientEnvOptions(context));
+      const created = client.createVolume(name, [
+        `com.docker.compose.project=${project}`,
+        `com.docker.compose.volume=${logicalName}`,
+      ]);
       if (created.status !== 0) return created.status;
       // Create reuses a same-driver volume and does NOT apply the requested
       // labels, so a pre-placed local-driver bind mount (Options set) passes the
@@ -658,7 +670,7 @@ export function createRuntimeDocker(
       // before the per-session named-volume proof runs, so validate the exact
       // shape now and fail closed on anything that is not a plain, correctly
       // labelled, optionless local volume.
-      const inspected = io.capture("docker", ["volume", "inspect", name], dockerClientEnvOptions(context));
+      const inspected = client.inspect([name], { type: "volume" });
       if (inspected.status !== 0) {
         warn(`refusing session volume ${name}: inspection failed`);
         return inspected.status;
@@ -677,20 +689,17 @@ export function createRuntimeDocker(
       // in `destroy.ts` revokes and removes them by record-bound id around
       // this call, and it is the only production caller.
       const options = composeOptions();
-      const status = io.run(
-        "docker",
-        composeArgs(project, "down", ["-v", "--rmi", "local", "--remove-orphans"]),
-        { ...options, env: composeTeardownEnv(composeFile(), options.env) },
-      );
+      const status = createDockerClient(io, { ...options, env: composeTeardownEnv(composeFile(), options.env) })
+        .terminal.compose(composeArgs(project, "down", ["-v", "--rmi", "local", "--remove-orphans"]));
       clearRuntimeCaches();
       if (status !== 0) return status;
       return removeProjectSessionVolumes(project);
     },
     followLogs(project, service) {
-      return io.run("docker", composeArgs(project, "logs", ["-f", service]), composeOptions());
+      return createDockerClient(io, composeOptions()).terminal.compose(composeArgs(project, "logs", ["-f", service]));
     },
     imageExists(tag) {
-      return io.capture("docker", ["image", "inspect", tag], dockerClientEnvOptions(context)).status === 0;
+      return client.inspect([tag], { type: "image" }).status === 0;
     },
     inspectImage(tag, options = {}) {
       if (options.fresh === true) return inspectImageUncached(tag);
@@ -700,11 +709,7 @@ export function createRuntimeDocker(
       return image;
     },
     imageRefs(reference) {
-      const result = io.capture(
-        "docker",
-        ["image", "ls", "--format", "{{.Repository}}:{{.Tag}}", reference],
-        dockerClientEnvOptions(context),
-      );
+      const result = client.listObjects("image", { format: "{{.Repository}}:{{.Tag}}", reference });
       if (result.status !== 0) {
         const detail = result.stderr.trim();
         warn(`could not list Docker images for cleanup${detail ? `: ${detail}` : ""}`);
@@ -716,9 +721,7 @@ export function createRuntimeDocker(
       return dockerNetworkSubnets(context, io);
     },
     pruneImages(filters) {
-      const args = ["image", "prune", "-f"];
-      for (const filter of filters) args.push("--filter", filter);
-      const status = io.run("docker", args, dockerClientEnvOptions(context));
+      const status = client.terminal.pruneImages(filters);
       imageInspectCache.clear();
       return status;
     },
@@ -735,13 +738,13 @@ export function createRuntimeDocker(
     },
     removeContainers(ids) {
       if (ids.length === 0) return 0;
-      const status = io.run("docker", ["rm", "-f", ...ids], dockerClientEnvOptions(context));
+      const status = client.terminal.removeContainers(ids, { force: true });
       clearRuntimeCaches();
       return status;
     },
     removeImages(refs) {
       if (refs.length === 0) return 0;
-      const status = io.run("docker", ["image", "rm", ...refs], dockerClientEnvOptions(context));
+      const status = client.terminal.removeImages(refs);
       imageInspectCache.clear();
       return status;
     },
@@ -759,11 +762,7 @@ export function createRuntimeDocker(
     },
     containerRunning(containerId) {
       if (!/^[a-f0-9]{64}$/u.test(containerId)) return false;
-      const result = io.capture(
-        "docker",
-        ["container", "inspect", "--format", "{{.State.Running}}", containerId],
-        dockerClientEnvOptions(context),
-      );
+      const result = client.inspect([containerId], { type: "container", format: "{{.State.Running}}" });
       return result.status === 0 && result.stdout.trim() === "true";
     },
     setProxyVerboseMarker(proxyId, markerName) {
@@ -776,11 +775,10 @@ export function createRuntimeDocker(
       return projectResourceSummary(context, io, project);
     },
     status(project = composeProjectName(context.projectRoot)) {
-      const listing = captureDockerListing(io, [
-        "ps",
-        "-a",
-        ...corroboratedComposeProjectContainerFilters(projectHash(context.projectRoot), project),
-      ], dockerClientEnvOptions(context), "containers");
+      const listing = captureDockerListing(client, {
+        all: true,
+        filters: filterValues(corroboratedComposeProjectContainerFilters(projectHash(context.projectRoot), project)),
+      }, "containers");
       if (listing.status !== 0) return listing.status;
       if (listing.rows.length === 0) {
         console.log("no containers");
@@ -794,7 +792,7 @@ export function createRuntimeDocker(
       return 0;
     },
     tagImage(source, target) {
-      const status = io.run("docker", ["image", "tag", source, target], dockerClientEnvOptions(context));
+      const status = client.terminal.tagImage(source, target);
       imageInspectCache.clear();
       return status;
     },
@@ -873,35 +871,23 @@ export function parseRuntimeContainerInspectRows(output: string): RuntimeContain
 // appearing here would read as a duplicated participant. Whole-project
 // enumeration keys on `io.runfree.project-id` instead (see `destroy.ts`).
 function runtimeContainers(project: string, context: RuntimeContext, io: RuntimeIO): RuntimeContainer[] {
-  const ps = io.capture("docker", ["ps", "-aq", ...composeProjectContainerFilters(project)], dockerClientEnvOptions(context));
+  const client = createDockerClient(io, dockerClientEnvOptions(context));
+  const ps = client.listContainers({ all: true, quiet: true, filters: filterValues(composeProjectContainerFilters(project)) });
   if (ps.status !== 0) dockerInspectFailure("could not inspect Runfree runtime containers", ps);
   const ids = ps.stdout.trim().split(/\s+/).filter(Boolean);
   if (ids.length === 0) return [];
 
-  const inspect = io.capture("docker", [
-    "inspect",
-    "--format",
-    runtimeContainerInspectFormat(),
-    ...ids,
-  ], dockerClientEnvOptions(context));
+  const inspect = client.inspect(ids, { format: runtimeContainerInspectFormat() });
   if (inspect.status !== 0) dockerInspectFailure("could not inspect Runfree runtime container labels", inspect);
   return parseRuntimeContainerInspectRows(inspect.stdout);
 }
 
 function composeContainers(project: string, context: RuntimeContext, io: RuntimeIO): ComposeContainer[] {
-  const ps = io.capture(
-    "docker",
-    ["ps", "-aq", ...composeProjectContainerFilters(project)],
-    dockerClientEnvOptions(context),
-  );
+  const client = createDockerClient(io, dockerClientEnvOptions(context));
+  const ps = client.listContainers({ all: true, quiet: true, filters: filterValues(composeProjectContainerFilters(project)) });
   const ids = ps.stdout.trim().split(/\s+/).filter(Boolean);
   if (ps.status !== 0 || ids.length === 0) return [];
-  const inspect = io.capture("docker", [
-    "inspect",
-    "--format",
-    "{{.Id}}\t{{range $name, $_ := .NetworkSettings.Networks}}{{$name}} {{end}}",
-    ...ids,
-  ], dockerClientEnvOptions(context));
+  const inspect = client.inspect(ids, { format: "{{.Id}}\t{{range $name, $_ := .NetworkSettings.Networks}}{{$name}} {{end}}" });
   if (inspect.status !== 0) return ids.map((id) => ({ id, networks: [] }));
   return inspect.stdout.trim().split(/\n+/).filter(Boolean).map((line) => {
     const [id, networkList = ""] = line.split("\t");
@@ -935,19 +921,15 @@ export function parseDockerJson<T>(result: CaptureResult, label: string): T | un
 
 function composeProject(context: RuntimeContext, io: RuntimeIO): string | undefined {
   const project = composeProjectName(context.projectRoot);
-  const ps = io.capture("docker", [
-    "ps",
-    "-aq",
-    ...corroboratedComposeProjectContainerFilters(projectHash(context.projectRoot), project),
-  ], dockerClientEnvOptions(context));
+  const client = createDockerClient(io, dockerClientEnvOptions(context));
+  const ps = client.listContainers({
+    all: true,
+    quiet: true,
+    filters: filterValues(corroboratedComposeProjectContainerFilters(projectHash(context.projectRoot), project)),
+  });
   const agentId = ps.stdout.trim().split(/\s+/).filter(Boolean)[0];
   if (!agentId) return undefined;
-  const inspect = io.capture("docker", [
-    "inspect",
-    "--format",
-    "{{ index .Config.Labels \"com.docker.compose.project\" }}",
-    agentId,
-  ], dockerClientEnvOptions(context));
+  const inspect = client.inspect([agentId], { format: "{{ index .Config.Labels \"com.docker.compose.project\" }}" });
   const inspectedProject = inspect.stdout.trim();
   if (inspect.status !== 0 || inspectedProject === "" || inspectedProject === "<no value>") return undefined;
   return inspectedProject;
@@ -979,12 +961,12 @@ export function serviceContainerIds(
   io: RuntimeIO,
   options: { runningOnly?: boolean } = {},
 ): string[] {
-  const ps = io.capture("docker", [
-    "ps",
-    options.runningOnly ? "-q" : "-aq",
-    "--no-trunc",
-    ...composeServiceFilters(project, service),
-  ], dockerClientEnvOptions(context));
+  const ps = createDockerClient(io, dockerClientEnvOptions(context)).listContainers({
+    all: !options.runningOnly,
+    quiet: true,
+    noTrunc: true,
+    filters: filterValues(composeServiceFilters(project, service)),
+  });
   if (ps.status !== 0) return [];
   return ps.stdout.trim().split(/\s+/).filter(Boolean);
 }
@@ -996,13 +978,11 @@ export function serviceContainerName(
   io: RuntimeIO,
   options: { runningOnly?: boolean } = {},
 ): string | undefined {
-  const ps = io.capture("docker", [
-    "ps",
-    ...(options.runningOnly ? [] : ["-a"]),
-    ...composeServiceFilters(project, service),
-    "--format",
-    "{{.Names}}",
-  ], dockerClientEnvOptions(context));
+  const ps = createDockerClient(io, dockerClientEnvOptions(context)).listContainers({
+    all: !options.runningOnly,
+    filters: filterValues(composeServiceFilters(project, service)),
+    format: "{{.Names}}",
+  });
   if (ps.status !== 0) return undefined;
   return ps.stdout.trim().split(/\s+/).filter(Boolean)[0];
 }
@@ -1015,34 +995,29 @@ function setProxyVerboseMarker(proxyId: string, markerName: string, context: Run
   const markerDir = "/run/runfree-proxy-verbose";
   const markerPath = `${markerDir}/${markerName}`;
   const command = `mkdir -p ${shellSingleQuote(markerDir)} && : > ${shellSingleQuote(markerPath)}`;
-  const result = io.capture(
-    "docker",
-    ["exec", "--user", ROOT_UID_GID, proxyId, "sh", "-c", command],
-    dockerClientEnvOptions(context),
-  );
+  const result = createDockerClient(io, dockerClientEnvOptions(context))
+    .exec(proxyId, ["sh", "-c", command], { user: ROOT_UID_GID });
   if (result.status !== 0) die(result.stderr.trim() || "failed to enable proxy verbose logs");
 }
 
 function clearProxyVerboseMarker(proxyId: string, markerName: string, context: RuntimeContext, io: RuntimeIO): void {
   const markerPath = `/run/runfree-proxy-verbose/${markerName}`;
-  io.capture(
-    "docker",
-    ["exec", "--user", ROOT_UID_GID, proxyId, "sh", "-c", `rm -f ${shellSingleQuote(markerPath)}`],
-    dockerClientEnvOptions(context),
-  );
+  createDockerClient(io, dockerClientEnvOptions(context))
+    .exec(proxyId, ["sh", "-c", `rm -f ${shellSingleQuote(markerPath)}`], { user: ROOT_UID_GID });
 }
 
 function dockerNetworkInspection(context: RuntimeContext, io: RuntimeIO): string {
+  const client = createDockerClient(io, dockerClientEnvOptions(context));
   const maxAttempts = 3;
   for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
-    const list = io.capture("docker", ["network", "ls", "-q"], dockerClientEnvOptions(context));
+    const list = client.listObjects("network", { quiet: true });
     if (list.status !== 0) {
       const detail = list.stderr.trim();
       die(`could not inspect Docker networks${detail ? `: ${detail}` : ""}`);
     }
     const ids = list.stdout.trim().split(/\s+/).filter(Boolean);
     if (ids.length === 0) return "[]";
-    const inspect = io.capture("docker", ["network", "inspect", ...ids], dockerClientEnvOptions(context));
+    const inspect = client.inspect(ids, { type: "network" });
     if (inspect.status === 0) return inspect.stdout;
 
     const detail = inspect.stderr.trim();
@@ -1090,7 +1065,7 @@ export function readProxyControlReceipts(context: RuntimeContext, io: RuntimeIO,
   const script = [firewallStatusPath(), requestProxyStatusPath()]
     .map((file) => `if [ -f ${shellSingleQuote(file)} ]; then cat ${shellSingleQuote(file)}; else printf '{}'; fi; echo`)
     .join("; ");
-  const result = io.capture("docker", ["exec", proxyId, "sh", "-c", script], dockerClientEnvOptions(context));
+  const result = createDockerClient(io, dockerClientEnvOptions(context)).exec(proxyId, ["sh", "-c", script]);
   if (result.status !== 0) return undefined;
   const lines = result.stdout.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
   if (lines.length !== 2) return undefined;

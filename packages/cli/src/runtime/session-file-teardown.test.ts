@@ -154,7 +154,7 @@ describe("ordered session-file teardown", () => {
       "remove-record",
       "clear-stamp",
     ]);
-    expect(fixture.argv[1]?.slice(0, 2)).toEqual(["ps", "-a"]);
+    expect(fixture.argv[1]?.slice(0, 2)).toEqual(["ps", "--all"]);
     expect(fixture.argv[2]).toEqual(["network", "disconnect", NETWORK_ID, CONTAINER_ID]);
     expect(fixture.argv[3]).toEqual([
       "container",
@@ -400,7 +400,9 @@ describe("ordered session-file teardown", () => {
         if (args[0] === "ps") return { status: 0, stdout: `${forwarderId}\n`, stderr: "" };
         if (args[0] === "container" && args[1] === "inspect") return { status: 0, stdout: JSON.stringify([forwarder]), stderr: "" };
         if (args[0] === "image") return { status: 0, stdout: `sha256:${"a".repeat(64)}\n`, stderr: "" };
-        if (args[0] === "rm") events.push(`rm:${args[2]}`);
+        // The session container's own removal shares this exact shape
+        // (`container rm --force <id>`); only the forwarder's id is tracked here.
+        if (args[0] === "container" && args[1] === "rm" && args.includes(forwarderId)) events.push(`rm:${forwarderId}`);
         return { ...OK };
       }),
     };

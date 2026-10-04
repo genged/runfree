@@ -21,6 +21,7 @@ import {
   serviceContainerId,
   type RuntimeDocker,
 } from "./docker.ts";
+import { createDockerClient } from "./docker-client.ts";
 import { composeProjectName, projectHash } from "./env.ts";
 import {
   compareHostBootId,
@@ -1432,11 +1433,8 @@ export function activeAgentSessions(project: string, context: RuntimeContext, io
     }`);
     return [{ containerTty: "<unknown>", command: `agent container ${agentId}`, name: "unknown session", processCount: 1 }];
   }
-  const result = io.capture(
-    "docker",
-    ["exec", "-i", "--user", AGENT_UID_GID, agentId, "sh", "-s"],
-    { ...dockerClientEnvOptions(context), input: probe.source },
-  );
+  const result = createDockerClient(io, dockerClientEnvOptions(context))
+    .exec(agentId, ["sh", "-s"], { interactive: true, user: AGENT_UID_GID }, { input: probe.source });
   if (result.status !== 0) {
     const detail = compactDiagnostic(result.stderr);
     warn(`could not inspect active agent sessions; treating agent activity as live until inspection succeeds${

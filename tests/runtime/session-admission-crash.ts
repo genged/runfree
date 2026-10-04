@@ -319,7 +319,19 @@ export function sessionFileCommandEffect(argv: readonly string[]): "write" | "de
   return trailing.startsWith(sessionFilePrefix) ? "delete" : undefined;
 }
 
-export function matchesCrashPoint(argv: readonly string[], point: CrashPoint): boolean {
+/**
+ * Matches a Docker argv against a crash point's leading subcommand path (see
+ * the docblock above). `excludeContainerId`, checked only for
+ * `after-container-stop`, guards one specific collision: the sealed session
+ * stop (`session-container-cleanup.ts`) and the proxy stop
+ * (`docker-client.ts`'s `stopContainers`) both build `container stop --time N
+ * <id>`, so the bare subcommand prefix cannot tell them apart. Passing the
+ * known proxy container id excludes a proxy stop from ever satisfying this
+ * point, so a kill armed for the session's own teardown stop cannot
+ * misfire on the proxy's. Omit it (or pass the session's own id) to match
+ * exactly as before this exclusion existed.
+ */
+export function matchesCrashPoint(argv: readonly string[], point: CrashPoint, excludeContainerId?: string): boolean {
   const tokens = CRASH_POINTS[point];
   const words = argv.filter((argument) => !argument.startsWith("-"));
   const prefixMatches = tokens.every((token, offset) => words[offset] === token);
@@ -327,6 +339,9 @@ export function matchesCrashPoint(argv: readonly string[], point: CrashPoint): b
   if (point === "after-session-file-write") return sessionFileCommandEffect(argv) === "write";
   if (point === "after-file-deleted-before-stop" || point === "after-failed-file-delete") {
     return sessionFileCommandEffect(argv) === "delete";
+  }
+  if (point === "after-container-stop" && excludeContainerId !== undefined && words[words.length - 1] === excludeContainerId) {
+    return false;
   }
   return true;
 }
@@ -1389,6 +1404,12 @@ async function crash(options: CrashOptions): Promise<never> {
   }
 
   const { io, context, preparedRuntime } = resolveProject(options.workspace);
+  // The proxy is already running and validated before this driver ever issues
+  // a command, so its id is known up front: excluding it from
+  // `after-container-stop` means a kill armed for the session's own teardown
+  // stop can never fire on the proxy's `container stop` instead (both now
+  // build through the identical `container stop --time N <id>` subcommand).
+  const proxyId = context.validatedRuntime.proxyId;
   const observed: string[] = [];
   let matches = 0;
   let sessionStartObserved = false;
@@ -1408,7 +1429,7 @@ async function crash(options: CrashOptions): Promise<never> {
       if (observed.length !== options.killAfterCommand) return;
       reason = `command #${observed.length}`;
     } else {
-      if (!options.crashPoint || !armed || !matchesCrashPoint(args, options.crashPoint)) return;
+      if (!options.crashPoint || !armed || !matchesCrashPoint(args, options.crashPoint, proxyId)) return;
       matches += 1;
       if (matches < options.occurrence) return;
       reason = `${options.crashPoint} #${matches}`;

@@ -15,6 +15,7 @@
 import { die } from "../errors.ts";
 import { resolveAgentExecTarget } from "./agent-exec-target.ts";
 import { createRuntimeDocker, dockerClientEnvOptions } from "./docker.ts";
+import { createDockerClient } from "./docker-client.ts";
 import { captureDockerListing, renderDockerListing } from "./docker-listing.ts";
 import { composeProjectName, projectHash } from "./env.ts";
 import {
@@ -26,7 +27,7 @@ import {
   replaceValidatedIngressForwarder,
 } from "./ingress-forwarder-ownership.ts";
 import type { RuntimeAdapters } from "./adapters.ts";
-import type { CaptureResult, RuntimeContext, RuntimeIO } from "./types.ts";
+import type { RuntimeContext, RuntimeIO } from "./types.ts";
 
 const FORWARD_USAGE = "usage: runfree forward [<port>] [start|stop|status] "
   + "[--host-port PORT] [--agent-port PORT]";
@@ -100,12 +101,8 @@ export function forwardOptionsFromArgs(argv: ForwardArgs): ForwardOptions {
   };
 }
 
-function docker(context: RuntimeContext, io: RuntimeIO, args: string[]): CaptureResult {
-  return io.capture("docker", args, dockerClientEnvOptions(context));
-}
-
 function networkExists(context: RuntimeContext, io: RuntimeIO, name: string): boolean {
-  return docker(context, io, ["network", "inspect", name]).status === 0;
+  return createDockerClient(io, dockerClientEnvOptions(context)).inspect([name], { type: "network" }).status === 0;
 }
 
 /**
@@ -162,8 +159,8 @@ export function forwardRuntime(
         console.log("no port forwards open");
         return 0;
       }
-      const filters = forwarders.flatMap((name) => ["--filter", `name=^/${name}$`]);
-      const listing = captureDockerListing(io, ["ps", "-a", ...filters], dockerClientEnvOptions(context), "port forwards");
+      const filters = forwarders.map((name) => `name=^/${name}$`);
+      const listing = captureDockerListing(createDockerClient(io, dockerClientEnvOptions(context)), { all: true, filters }, "port forwards");
       if (listing.status !== 0) return listing.status;
       if (listing.rows.length === 0) {
         console.log("no port forwards open");

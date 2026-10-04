@@ -3,6 +3,7 @@
 import { SESSION_ELIGIBILITY_PATH } from "@runfree/runtime-contracts/session-file";
 
 import { ROOT_UID_GID } from "./constants.ts";
+import { createDockerClient } from "./docker-client.ts";
 import {
   CONTROL_PLANE_PROOF_SCHEMA_VERSION,
   readControlPlaneMaterializationV2,
@@ -150,8 +151,9 @@ function inspectLiveControlPlaneIdentity(input: {
   input.assertAuthority?.();
   const containerIds = [input.proxyContainerId];
   const dockerOptions = { env: { ...plan.execution.dockerClientEnv } };
+  const client = createDockerClient(io, dockerOptions);
   const containerValue = exactJson(
-    io.capture("docker", ["container", "inspect", ...containerIds], dockerOptions),
+    client.inspect(containerIds, { type: "container" }),
     "control-plane container inspection",
   );
   if (!Array.isArray(containerValue) || containerValue.length !== containerIds.length) {
@@ -177,7 +179,7 @@ function inspectLiveControlPlaneIdentity(input: {
   input.assertAuthority?.();
   const networkNames = [internalName, egressName];
   const networkValue = exactJson(
-    io.capture("docker", ["network", "inspect", ...networkNames], dockerOptions),
+    client.inspect(networkNames, { type: "network" }),
     "control-plane network inspection",
   );
   if (!Array.isArray(networkValue) || networkValue.length !== networkNames.length) {
@@ -228,18 +230,10 @@ function inspectLiveEvidence(input: {
     assertAuthority: () => lifecycleLock.assertHeld(),
   });
   const dockerOptions = { env: { ...plan.execution.dockerClientEnv } };
+  const client = createDockerClient(io, dockerOptions);
   lifecycleLock.assertHeld();
   const baseState = exactJson(
-    io.capture("docker", [
-      "exec",
-      "--user",
-      ROOT_UID_GID,
-      proof.proxyId,
-      "node",
-      "-e",
-      READ_BASE_STATE_SCRIPT,
-      ...BASE_STATE_PATHS,
-    ], dockerOptions),
+    client.exec(proof.proxyId, ["node", "-e", READ_BASE_STATE_SCRIPT, ...BASE_STATE_PATHS], { user: ROOT_UID_GID }),
     "session-admission base-state inspection",
   );
   if (!Array.isArray(baseState)
@@ -249,19 +243,7 @@ function inspectLiveEvidence(input: {
   }
   lifecycleLock.assertHeld();
   const sessionSet = exactJson(
-    io.capture("docker", [
-      "exec",
-      "--user",
-      ROOT_UID_GID,
-      proof.proxyId,
-      "nft",
-      "-j",
-      "list",
-      "set",
-      "inet",
-      "runfree_proxy",
-      "session_ipv4",
-    ], dockerOptions),
+    client.exec(proof.proxyId, ["nft", "-j", "list", "set", "inet", "runfree_proxy", "session_ipv4"], { user: ROOT_UID_GID }),
     "session-admission nftables base-set inspection",
   );
   if (!parseEmptySessionSet(sessionSet)) throw new Error("session-admission firewall base set is not empty");

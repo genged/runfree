@@ -1,6 +1,7 @@
 import { projectIdentity } from "../project-identity.ts";
 import { AGENT_UID_GID, PROXY_SERVER_UID_GID, ROOT_UID_GID } from "./constants.ts";
 import { dockerClientEnvOptions } from "./docker.ts";
+import { createDockerClient } from "./docker-client.ts";
 import type { CaptureResult, RuntimeContext, RuntimeIO } from "./types.ts";
 
 export const INTERACTIVE_TERMINAL_RESTORE_SEQUENCE = [
@@ -38,7 +39,7 @@ export function runDockerExec(
   containerId: string,
   args: string[],
 ): CaptureResult {
-  return io.capture("docker", ["exec", containerId, ...args], dockerClientEnvOptions(context));
+  return createDockerClient(io, dockerClientEnvOptions(context)).exec(containerId, args);
 }
 
 export function runDockerExecAgent(
@@ -47,7 +48,7 @@ export function runDockerExecAgent(
   containerId: string,
   args: string[],
 ): CaptureResult {
-  return io.capture("docker", ["exec", "--user", AGENT_UID_GID, containerId, ...args], dockerClientEnvOptions(context));
+  return createDockerClient(io, dockerClientEnvOptions(context)).exec(containerId, args, { user: AGENT_UID_GID });
 }
 
 export function runDockerExecRoot(
@@ -56,7 +57,7 @@ export function runDockerExecRoot(
   containerId: string,
   args: string[],
 ): CaptureResult {
-  return io.capture("docker", ["exec", "--user", ROOT_UID_GID, containerId, ...args], dockerClientEnvOptions(context));
+  return createDockerClient(io, dockerClientEnvOptions(context)).exec(containerId, args, { user: ROOT_UID_GID });
 }
 
 export function runDockerExecProxyServer(
@@ -65,7 +66,7 @@ export function runDockerExecProxyServer(
   containerId: string,
   args: string[],
 ): CaptureResult {
-  return io.capture("docker", ["exec", "--user", PROXY_SERVER_UID_GID, containerId, ...args], dockerClientEnvOptions(context));
+  return createDockerClient(io, dockerClientEnvOptions(context)).exec(containerId, args, { user: PROXY_SERVER_UID_GID });
 }
 
 export function projectPhysicalRoot(context: RuntimeContext): string {

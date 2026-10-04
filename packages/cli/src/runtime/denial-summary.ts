@@ -20,6 +20,7 @@ import { serviceSuggestionLines, type Service } from "../../../../scripts/servic
 import { combinedServiceRegistry } from "../user-services.ts";
 import { readActiveEffectiveControl } from "../control/effective.ts";
 import { dockerClientEnvOptions, serviceContainerId } from "./docker.ts";
+import { createDockerClient } from "./docker-client.ts";
 import { composeProjectName } from "./env.ts";
 import type { RuntimeContext, RuntimeIO } from "./types.ts";
 
@@ -104,11 +105,8 @@ export function printSessionDenialSummary(
   if (options.quiet) return;
   try {
     const project = composeProjectName(context.projectRoot);
-    const readLogs = (proxyId: string) => io.capture(
-      "docker",
-      ["logs", "--since", options.sinceIso, proxyId],
-      { ...dockerClientEnvOptions(context), timeout: LOG_READ_TIMEOUT_MS },
-    );
+    const client = createDockerClient(io, dockerClientEnvOptions(context));
+    const readLogs = (proxyId: string) => client.logs(proxyId, { since: options.sinceIso }, { timeout: LOG_READ_TIMEOUT_MS });
     let proxyId = options.proxyId ?? serviceContainerId(project, "proxy", context, io);
     if (!proxyId) return;
     let logs = readLogs(proxyId);

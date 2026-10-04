@@ -12,6 +12,7 @@ import { sanitizeForTerminal } from "../../../../scripts/domain-diagnostics.ts";
 import { formatTerminalTable } from "../terminal-table.ts";
 import { AGENT_UID_GID } from "./constants.ts";
 import { dockerClientEnvOptions } from "./docker.ts";
+import { createDockerClient, type DockerCallOptions } from "./docker-client.ts";
 import { composeProjectName } from "./env.ts";
 import { compareHostBootId, compareHostProcessStart, hostBootId, hostProcessStart } from "./host-identity.ts";
 import { peekSessionContainerRecordsV2, type SessionContainerRecordV2 } from "./session-containers.ts";
@@ -822,13 +823,10 @@ function countContainerProbe(state: ContainerProbePassState): void {
   state.captures += 1;
 }
 
-function containerProbeOptions(context: RuntimeContext) {
-  return {
-    ...dockerClientEnvOptions(context),
-    timeout: CONTAINER_PROBE_TIMEOUT_MS,
-    maxBuffer: CONTAINER_PROBE_MAX_BUFFER,
-  };
-}
+const CONTAINER_PROBE_CALL_OPTIONS: DockerCallOptions = {
+  timeout: CONTAINER_PROBE_TIMEOUT_MS,
+  maxBuffer: CONTAINER_PROBE_MAX_BUFFER,
+};
 
 // Docker's answer when the inspected object does not exist ("Error: No such
 // object" / "Error response from daemon: No such container"). Matched so a
@@ -847,16 +845,17 @@ function probeClaudeRegistryInContainer(
   containerId: string,
   pass: ContainerProbePassState,
 ): "active" | "gone" | "unverified" {
+  const client = createDockerClient(io, dockerClientEnvOptions(context));
   // The running/StartedAt inspection is item-independent, so one pass asks
   // Docker once per container however many items name it.
   let inspect = pass.inspects.get(containerId);
   if (!inspect) {
     if (!containerProbeAllowed(pass)) return "unverified";
     countContainerProbe(pass);
-    inspect = io.capture(
-      "docker",
-      ["inspect", "--format", "{{.State.Running}}\t{{.State.StartedAt}}", containerId],
-      containerProbeOptions(context),
+    inspect = client.inspect(
+      [containerId],
+      { format: "{{.State.Running}}\t{{.State.StartedAt}}" },
+      CONTAINER_PROBE_CALL_OPTIONS,
     );
     pass.inspects.set(containerId, inspect);
   }
@@ -870,14 +869,9 @@ function probeClaudeRegistryInContainer(
   if (containerStartedAt > registry.updatedAt) return "gone";
   if (!containerProbeAllowed(pass)) return "unverified";
   countContainerProbe(pass);
-  const probe = io.capture(
-    "docker",
+  const probe = client.exec(
+    containerId,
     [
-      "exec",
-      "-i",
-      "--user",
-      AGENT_UID_GID,
-      containerId,
       "node",
       "-e",
       [
@@ -894,7 +888,8 @@ function probeClaudeRegistryInContainer(
       ].join(""),
       String(registry.pid),
     ],
-    containerProbeOptions(context),
+    { interactive: true, user: AGENT_UID_GID },
+    CONTAINER_PROBE_CALL_OPTIONS,
   );
   if (probe.status === 2) return "gone";
   if (probe.status !== 0 || !/^[0-9]+$/.test(probe.stdout.trim())) return "unverified";
@@ -964,10 +959,11 @@ function probeHostContainerSession(
   }
   if (!containerProbeAllowed(pass)) return "unknown";
   countContainerProbe(pass);
-  const probe = io.capture(
-    "docker",
-    ["exec", "-i", "--user", AGENT_UID_GID, containerId, "sh", "-s"],
-    { ...containerProbeOptions(context), input: inspector },
+  const probe = createDockerClient(io, dockerClientEnvOptions(context)).exec(
+    containerId,
+    ["sh", "-s"],
+    { interactive: true, user: AGENT_UID_GID },
+    { ...CONTAINER_PROBE_CALL_OPTIONS, input: inspector },
   );
   if (probe.status !== 0) return "unknown";
   for (const line of probe.stdout.trim().split(/\n+/).filter(Boolean)) {

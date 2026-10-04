@@ -37,6 +37,7 @@ import {
   parseDockerJson,
   type RuntimeDocker,
 } from "./docker.ts";
+import { createDockerClient } from "./docker-client.ts";
 import { runFencedProjectRebuildTeardown } from "./destroy.ts";
 import { runtimeComponentDiagnosticLines } from "./component-diagnostics.ts";
 import {
@@ -811,10 +812,9 @@ function runtimeSecurityContractContainerEvidence(
   contract: RuntimeContainerContract | undefined,
 ): NonNullable<RuntimeSecurityContractEvidence["agent"]> {
   if (!contract) return { inspect };
-  const probe = io.capture(
-    "docker",
-    ["exec", containerId, "sh", "-c", runtimeSecurityContractProbeScript(contract)],
-    dockerClientEnvOptions(context),
+  const probe = createDockerClient(io, dockerClientEnvOptions(context)).exec(
+    containerId,
+    ["sh", "-c", runtimeSecurityContractProbeScript(contract)],
   );
   if (probe.status !== 0) {
     return { inspect };
@@ -838,8 +838,9 @@ function runtimeSecurityContractEvidence(
   const proxyId = docker.runningServiceContainerId(project, "proxy");
   const evidence: RuntimeSecurityContractEvidence = {};
   if (!proxyId) return evidence;
+  const client = createDockerClient(io, dockerClientEnvOptions(context));
   const inspects = parseDockerJson<DockerContainerInspect[]>(
-    io.capture("docker", ["inspect", ...(agentId ? [agentId] : []), proxyId], dockerClientEnvOptions(context)),
+    client.inspect([...(agentId ? [agentId] : []), proxyId]),
     "docker inspect runtime security contract",
   );
   const agentInspect = agentId ? inspectById(inspects, agentId) : undefined;
@@ -853,11 +854,7 @@ function runtimeSecurityContractEvidence(
       containerContract(contract, "agent"),
     );
     if (!evidence.agent.presentPaths) {
-      const privateCaProbe = io.capture(
-        "docker",
-        ["exec", agentId, "sh", "-c", "test ! -e /ca/private/proxy-ca.key"],
-        dockerClientEnvOptions(context),
-      );
+      const privateCaProbe = client.exec(agentId, ["sh", "-c", "test ! -e /ca/private/proxy-ca.key"]);
       evidence.agent.presentPaths = privateCaProbe.status === 0 ? [] : ["/ca/private/proxy-ca.key"];
     }
   }
@@ -1804,7 +1801,7 @@ export async function startRuntime(
           if (!proxy) return;
           if (proxy.State?.Running !== false) throw new Error("candidate retirement requires proof that the exact proxy is stopped");
           heldLifecycleLock.assertHeld();
-          const removed = rebindIO.capture("docker", ["rm", proxyId], { env: activePlan.execution.dockerClientEnv, timeout: 1000 });
+          const removed = createDockerClient(rebindIO, { env: activePlan.execution.dockerClientEnv, timeout: 1000 }).removeContainers([proxyId]);
           heldLifecycleLock.assertHeld();
           if (removed.status !== 0 || observeExactProxy(subject)) throw new Error("exact stopped candidate could not be retired; inspect it before recovery");
         };
@@ -1871,10 +1868,9 @@ export async function startRuntime(
                 lifecycleLock: heldLifecycleLock,
                 runfreeVersion: activePlan.runfreeVersion,
               });
-              const inspect = rebindIO.capture(
-                "docker",
-                ["container", "inspect", replacementRecord.containerId as string],
-                dockerClientEnvOptions(activeContext),
+              const inspect = createDockerClient(rebindIO, dockerClientEnvOptions(activeContext)).inspect(
+                [replacementRecord.containerId as string],
+                { type: "container" },
               );
               if (inspect.status !== 0) throw new RuntimeObservationError({ kind: "observation-unavailable", subject: "session",
                 expectedIdentity: replacementRecord.containerId as string, phase: "sessions-revalidated", observation: `session ${replacementRecord.sessionId} inspection failed` });
@@ -2148,7 +2144,7 @@ export async function restoreSameProxySessionAdmission(input: {
       candidateControlPlane: effective.selection, candidateMaterialization: effective.manifest,
       docker, lifecycleLock, runfreeVersion: plan.runfreeVersion,
     });
-    const inspected = io.capture("docker", ["container", "inspect", record.containerId as string], dockerClientEnvOptions(context));
+    const inspected = createDockerClient(io, dockerClientEnvOptions(context)).inspect([record.containerId as string], { type: "container" });
     if (inspected.status !== 0) throw new Error(`session ${record.sessionId} cannot be inspected; restart admission remains incomplete`);
     validateSessionContainerInspect(inspected.stdout, proofPlan, { kind: "active-running" });
   }

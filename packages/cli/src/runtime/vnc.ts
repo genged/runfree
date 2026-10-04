@@ -4,6 +4,7 @@ import { die } from "../errors.ts";
 import { resolveAgentExecTarget } from "./agent-exec-target.ts";
 import { AGENT_UID_GID } from "./constants.ts";
 import { createRuntimeDocker, dockerClientEnvOptions } from "./docker.ts";
+import { createDockerClient } from "./docker-client.ts";
 import { captureDockerListing, renderDockerListing } from "./docker-listing.ts";
 import { composeProjectName, projectHash } from "./env.ts";
 import {
@@ -15,7 +16,7 @@ import {
   replaceValidatedIngressForwarder,
 } from "./ingress-forwarder-ownership.ts";
 import type { RuntimeAdapters } from "./adapters.ts";
-import type { CaptureResult, RuntimeContext, RuntimeIO } from "./types.ts";
+import type { RuntimeContext, RuntimeIO } from "./types.ts";
 import { remedy } from "../remedies.ts";
 
 // VNC forwards are ingress forwarders carrying ingress-purpose=vnc, created
@@ -174,12 +175,8 @@ export function vncOptionsFromArgs(argv: VncArgs, env: NodeJS.ProcessEnv = {}): 
   };
 }
 
-function docker(context: RuntimeContext, io: RuntimeIO, args: string[]): CaptureResult {
-  return io.capture("docker", args, dockerClientEnvOptions(context));
-}
-
 function networkExists(context: RuntimeContext, io: RuntimeIO, name: string): boolean {
-  return docker(context, io, ["network", "inspect", name]).status === 0;
+  return createDockerClient(io, dockerClientEnvOptions(context)).inspect([name], { type: "network" }).status === 0;
 }
 
 type VncTarget = Readonly<{
@@ -221,15 +218,8 @@ function resolveVncTarget(
 }
 
 function agentPortListening(context: RuntimeContext, io: RuntimeIO, agent: string, agentPort: string): boolean {
-  return docker(context, io, [
-    "exec",
-    "-e",
-    `VNC_PORT=${agentPort}`,
-    agent,
-    "sh",
-    "-c",
-    LISTENING_SCRIPT,
-  ]).status === 0;
+  return createDockerClient(io, dockerClientEnvOptions(context))
+    .exec(agent, ["sh", "-c", LISTENING_SCRIPT], { env: [`VNC_PORT=${agentPort}`] }).status === 0;
 }
 
 async function ensureAgentVncServer(
@@ -244,31 +234,24 @@ async function ensureAgentVncServer(
     return;
   }
 
-  const probe = docker(context, io, ["exec", agent, "sh", "-c", "command -v x11vnc >/dev/null 2>&1"]);
+  const client = createDockerClient(io, dockerClientEnvOptions(context));
+  const probe = client.exec(agent, ["sh", "-c", "command -v x11vnc >/dev/null 2>&1"]);
   if (probe.status !== 0) {
     die("x11vnc not found in the agent image; add x11vnc and an X server (for example xvfb) "
       + `to .runfree/image/Dockerfile and run \`${remedy.rebuild()}\``);
   }
 
   console.log(`starting x11vnc in ${agent} on port ${options.agentPort}`);
-  const started = docker(context, io, [
-    "exec",
-    "-u",
-    AGENT_UID_GID,
-    "-e",
-    `VNC_PORT=${options.agentPort}`,
-    "-e",
-    `VNC_PASSWORD=${options.password}`,
-    "-e",
-    `VNC_DISPLAY=${options.display}`,
-    "-e",
-    `VNC_CLIPBOARD=${options.clipboard ? "1" : "0"}`,
-    "-d",
-    agent,
-    "sh",
-    "-c",
-    X11VNC_SCRIPT,
-  ]);
+  const started = client.exec(agent, ["sh", "-c", X11VNC_SCRIPT], {
+    detach: true,
+    user: AGENT_UID_GID,
+    env: [
+      `VNC_PORT=${options.agentPort}`,
+      `VNC_PASSWORD=${options.password}`,
+      `VNC_DISPLAY=${options.display}`,
+      `VNC_CLIPBOARD=${options.clipboard ? "1" : "0"}`,
+    ],
+  });
   if (started.status !== 0) die(started.stderr.trim() || "failed to start x11vnc in the agent container");
 
   for (let attempt = 0; attempt < 10; attempt += 1) {
@@ -305,8 +288,8 @@ export async function vncRuntime(
         console.log("no vnc forward sidecar found");
         return 0;
       }
-      const filters = forwarders.flatMap((name) => ["--filter", `name=^/${name}$`]);
-      const listing = captureDockerListing(io, ["ps", "-a", ...filters], dockerClientEnvOptions(context), "vnc forwards");
+      const filters = forwarders.map((name) => `name=^/${name}$`);
+      const listing = captureDockerListing(createDockerClient(io, dockerClientEnvOptions(context)), { all: true, filters }, "vnc forwards");
       if (listing.status !== 0) return listing.status;
       if (listing.rows.length === 0) {
         console.log("no vnc forward sidecar found");

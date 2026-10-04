@@ -961,7 +961,7 @@ printf '%s|%s|%s|%s\\n' "$1" "$RUNFREE_CLAUDE_DIR" "$RUNFREE_CLAUDE_JSON" "$DOCK
 case "$1" in
   info) exit 0 ;;
   ps)
-    if [ "$2" = "-aq" ]; then
+    if [ "$2" = "--all" ] && [ "$3" = "--quiet" ]; then
       case "$*" in
         *com.docker.compose.service=proxy*) echo proxy-id ;;
         *) echo agent-id ;;
@@ -976,8 +976,12 @@ case "$1" in
     esac
     exit 0
     ;;
-  restart) exit 1 ;;
-  start) exit 1 ;;
+  container)
+    case "$2" in
+      restart|start) exit 1 ;;
+    esac
+    exit 0
+    ;;
   exec)
     case "$*" in
       *request-proxy.json*)
@@ -1032,7 +1036,7 @@ exit 0
     expect(result.stderr).toContain("falling back to a proxy restart");
     expect(result.stderr).toContain("source prompts (e.g. 1Password) may reappear");
     expect(result.stdout).toContain("proxy reload: done");
-    expect(readJsonLines(fakeDocker.dockerLog).some((entry) => Array.isArray(entry.args) && entry.args[0] === "restart")).toBe(true);
+    expect(readJsonLines(fakeDocker.dockerLog).some((entry) => Array.isArray(entry.args) && entry.args[0] === "container" && entry.args[1] === "restart")).toBe(true);
   });
 
   test("policy mutation refuses the restart fallback when the runtime needs revalidation", async () => {
@@ -1058,7 +1062,7 @@ exit 0
     expect(result.stderr).toContain("did not acknowledge policy generation");
     expect(result.stderr).toContain("run `runfree up`");
     expect(result.stderr).toContain("a proxy restart cannot revalidate this runtime");
-    expect(readJsonLines(fakeDocker.dockerLog).some((entry) => Array.isArray(entry.args) && entry.args[0] === "restart")).toBe(false);
+    expect(readJsonLines(fakeDocker.dockerLog).some((entry) => Array.isArray(entry.args) && entry.args[0] === "container" && entry.args[1] === "restart")).toBe(false);
   });
 
   test("source add stores canonical command metadata outside the project without storing stdout", async () => {
@@ -2568,9 +2572,9 @@ exit 0
     expect(execCalls).toHaveLength(1);
     expect(execCalls[0].args).toEqual([
       "exec",
+      "--interactive",
       "--user",
       "1001:1001",
-      "-i",
       "proxy-id",
       "sh",
       "-c",
@@ -2589,6 +2593,50 @@ exit 0
       message: "synced to proxy tmpfs",
     });
     expect(JSON.stringify(status)).not.toContain("real-secret-value");
+  });
+
+  // Pins the token-write property independent of the exact argv shape above:
+  // the proxy write (packages/cli/src/admin/admin-core.ts's
+  // `writeProxyRuntimeToken`, built through `adminDockerClient()`) must
+  // deliver the secret only on the spawned call's stdin, never in argv. A
+  // future argv change (quoting, flag order, a shell helper) must not let
+  // the value leak into argv. This does not check env: the fake docker log
+  // only ever records four fixed, unrelated keys
+  // (COMPOSE_PROJECT_NAME/DOCKER_CLI_HINTS/OP_SERVICE_ACCOUNT_TOKEN/
+  // RUNFREE_PROJECT_ROOT), so an env assertion against that log could never
+  // fail and would prove nothing.
+  test("the proxy token write carries the secret only on stdin, never in argv", async () => {
+    writeFixtureRepo({
+      hosts: ["api.github.com"],
+      tokens: {
+        github: {
+          description: "GitHub token",
+          credentials: [
+            { host: "api.github.com", header: "Authorization", scheme: "bearer" },
+          ],
+        },
+      },
+    });
+    writeTokenConfig({ github: { source: "env", env: "GITHUB_TOKEN" } });
+    const fakeDocker = installTokenSyncDockerFake();
+    const secretValue = "pinned-secret-9f3a1c";
+
+    const result = await runAdmin(() => credentialSyncIntent({ verbose: false, watch: false, quiet: false, delayFirstSync: false, cacheSourceSecrets: true }), {
+      FAKE_DOCKER_LOG: fakeDocker.dockerLog,
+      GITHUB_TOKEN: secretValue,
+      PATH: `${fakeDocker.fakeBin}${path.delimiter}${process.env.PATH ?? ""}`,
+    });
+
+    expect(result.status, result.stderr).toBe(0);
+
+    const execCalls = dockerExecCalls(fakeDocker.dockerLog);
+    const writeCall = execCalls.find((entry) => String(entry.stdin) === secretValue);
+    expect(writeCall, "no exec call carried the secret on stdin").toBeDefined();
+    expect(JSON.stringify(writeCall?.args)).not.toContain(secretValue);
+    // And nowhere else in the whole exchange with the proxy container.
+    for (const entry of execCalls) {
+      expect(JSON.stringify(entry.args)).not.toContain(secretValue);
+    }
   });
 
   test("token sync accepts the startup-provided current validation proof without reading the marker", async () => {

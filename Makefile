@@ -76,6 +76,9 @@ test-static:
 	@# Generation-family terminology gate (output contract D8): user-visible
 	@# strings name the family, never a bare "generation".
 	pnpm exec tsx scripts/check-terminology.ts
+	@# Docker argv ownership gate (todo 83 Phase 2): docker command lines are
+	@# built only in runtime/docker-client.ts and the sealed session commands.
+	pnpm exec tsx scripts/check-docker-argv.ts
 	@# Public-documentation gate: every relative link and heading anchor must
 	@# resolve in a clone that has no local/ records.
 	pnpm exec tsx scripts/check-public-docs.ts

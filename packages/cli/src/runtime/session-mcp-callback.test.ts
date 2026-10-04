@@ -124,7 +124,7 @@ describe("prepareSessionMcpCallback", () => {
       `RUNFREE_CALLBACK_SESSION_ID=${TEST_SESSION_ID}`,
       `RUNFREE_CALLBACK_SESSION_CONTAINER=${TEST_SESSION_CONTAINER_ID}`,
     ]));
-    const bridge = docker.runs.find((args) => args[0] === "exec" && args.includes("-d"));
+    const bridge = docker.runs.find((args) => args[0] === "exec" && args.includes("--detach"));
     expect(bridge?.slice(-5)).toEqual([
       TEST_SESSION_IP,
       String(LEGACY_PORT),
@@ -279,7 +279,7 @@ describe("prepareSessionMcpCallback", () => {
     expect(docker.removed()).toHaveLength(1);
     expect(docker.containers.filter((container) => container.Config?.Labels?.["io.runfree.ingress-purpose"] === "mcp-callback")).toEqual([]);
     // The removal ran after the budget was spent, so it was not cut off.
-    const removal = (docker.io.capture as Mock).mock.calls.find(([, args]) => (args as string[])[0] === "rm");
+    const removal = (docker.io.capture as Mock).mock.calls.find(([, args]) => (args as string[])[0] === "container" && (args as string[])[1] === "rm");
     expect((removal?.[2] as { killSignal?: string } | undefined)?.killSignal).toBeUndefined();
   });
 

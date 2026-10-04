@@ -1348,7 +1348,7 @@ function createRuntimeIO(overrides: {
         };
       }), null, 2)}\n`);
     }
-    const runningOnly = args.includes("-q") && !args.includes("-a") && !args.includes("-aq");
+    const runningOnly = args.includes("--quiet") && !args.includes("--all");
     const projectId = observedProject.replace(/^runfree-/, "");
     const callbackPort = /^[0-9a-f]{6}/.test(projectId)
       ? String(47100 + (Number.parseInt(projectId.slice(0, 6), 16) % 1000))
@@ -1407,7 +1407,7 @@ function createRuntimeIO(overrides: {
       return captureResult(0);
     }
     if (args[0] === "ps"
-      && args.includes("-aq")
+      && args.includes("--all") && args.includes("--quiet")
       && args.some((arg) => arg.startsWith("label=com.docker.compose.project="))
       && !args.some((arg) => arg.includes("com.docker.compose.service="))
       && (composeStarted || Boolean(process.env.FAKE_PREEXISTING_AGENT_ID))) {
@@ -1857,7 +1857,7 @@ function createRuntimeIO(overrides: {
     if (args[0] === "image" && args[1] === "inspect") return true;
     if (args[0] === "ps"
       && (composeStarted || Boolean(process.env.FAKE_PREEXISTING_AGENT_ID))
-      && args.includes("-aq")
+      && args.includes("--all") && args.includes("--quiet")
       && text.includes("com.docker.compose.project=")
       && !text.includes("com.docker.compose.service=")) return true;
     if (args[0] === "ps" && text.includes("com.docker.compose.service=")) return true;
@@ -1977,7 +1977,7 @@ function createRuntimeIO(overrides: {
       }
       if (composeStarted && isTopologyCapture(command, args)
         && ((args[0] === "ps"
-          && args.includes("-aq")
+          && args.includes("--all") && args.includes("--quiet")
           && args.some((arg) => arg.startsWith("label=com.docker.compose.project="))
           && !args.some((arg) => arg.includes("com.docker.compose.service=")))
           || (args[0] === "inspect"
@@ -3068,7 +3068,7 @@ describe("runtime recovery", () => {
         if (
           command === "docker"
           && args[0] === "ps"
-          && args[1] === "-aq"
+          && args[1] === "--all" && args[2] === "--quiet"
           && args.includes(`label=com.docker.compose.project=${projectName}`)
           && !args.some((arg) => arg.includes("com.docker.compose.service="))
         ) {
@@ -3082,7 +3082,7 @@ describe("runtime recovery", () => {
         return undefined;
       },
       run(command, args) {
-        if (command === "docker" && args[0] === "rm" && args.includes("stale-id")) staleRemoved = true;
+        if (command === "docker" && args[0] === "container" && args[1] === "rm" && args.includes("stale-id")) staleRemoved = true;
         return 0;
       },
     });
@@ -3099,12 +3099,12 @@ describe("runtime recovery", () => {
     expect(io.calls).toContainEqual(expect.objectContaining({
       method: "run",
       command: "docker",
-      args: ["rm", "-f", "stale-id"],
+      args: ["container", "rm", "--force", "stale-id"],
     }));
     expect(io.calls).not.toContainEqual(expect.objectContaining({
       method: "run",
       command: "docker",
-      args: ["rm", "-f", "fresh-id"],
+      args: ["container", "rm", "--force", "fresh-id"],
     }));
   });
 
@@ -3585,7 +3585,10 @@ describe("runtime command flow", () => {
     };
     /** The workspace still has its Compose project, so stop takes compose down. */
     const withComposeProject = (context: RuntimeContext) => (command: string, args: string[]): CaptureResult | undefined => {
-      if (command === "docker" && args[0] === "ps" && args[1] === "-aq") return captureResult(0, `${FAKE_PROXY_CONTAINER_ID}\n`);
+      if (command === "docker" && args[0] === "ps" && args[1] === "--all" && args[2] === "--quiet"
+        && args.some((arg) => arg.startsWith("label="))) {
+        return captureResult(0, `${FAKE_PROXY_CONTAINER_ID}\n`);
+      }
       if (command === "docker" && args[0] === "inspect" && args.some((arg) => arg.includes("com.docker.compose.project"))) {
         return captureResult(0, `${composeProjectName(context.projectRoot)}\n`);
       }
@@ -3632,7 +3635,8 @@ describe("runtime command flow", () => {
     test("with nothing left to stop, a selection an earlier stop left behind is reclaimed", async () => {
       const context = await startedProject();
       const io = createRuntimeIO({
-        capture: (command, args) => (command === "docker" && args[0] === "ps" && args[1] === "-aq"
+        capture: (command, args) => (command === "docker" && args[0] === "ps" && args[1] === "--all" && args[2] === "--quiet"
+          && args.some((arg) => arg.startsWith("label="))
           ? captureResult(0)
           : goneAfterDown(command, args)),
       });
@@ -3792,13 +3796,12 @@ describe("runtime command flow", () => {
     expect(dockerOperationProfile(io.calls.slice(warmStart))).toMatchInlineSnapshot(`
       {
         "docker container inspect": 4,
-        "docker container ls": 2,
         "docker exec": 13,
         "docker image inspect": 9,
         "docker info": 1,
         "docker inspect": 6,
         "docker network inspect": 3,
-        "docker ps": 12,
+        "docker ps": 14,
         "docker run": 1,
       }
     `);
@@ -3827,12 +3830,11 @@ describe("runtime command flow", () => {
     expect(dockerOperationProfile(io.calls.slice(warmStart))).toMatchInlineSnapshot(`
       {
         "docker container inspect": 1,
-        "docker container ls": 1,
         "docker exec": 3,
         "docker image inspect": 9,
         "docker info": 1,
         "docker inspect": 2,
-        "docker ps": 7,
+        "docker ps": 8,
       }
     `);
   });
@@ -4213,7 +4215,7 @@ describe("runtime command flow", () => {
       const io = createRuntimeIO({
         // The proxy this launch observes first is not the one it syncs against.
         capture: (command, args) => {
-          if (!replaceFirstProxyObservation || command !== "docker" || args[0] !== "ps" || args[1] !== "-q") return undefined;
+          if (!replaceFirstProxyObservation || command !== "docker" || args[0] !== "ps" || args[1] !== "--quiet") return undefined;
           if (!args.includes("label=com.docker.compose.service=proxy")) return undefined;
           replaceFirstProxyObservation = false;
           return captureResult(0, `${"9".repeat(64)}\n`);
@@ -4274,9 +4276,18 @@ describe("runtime command flow", () => {
     }
     // The cleanup pass is the only startup step that lists every container
     // for the image accounting before validation; the reconcile after
-    // eligibility publication issues the other listing.
+    // eligibility publication issues the other listing. Both build their
+    // argv as `ps --all --no-trunc --format {{.ID}}` with no `--filter`
+    // (createDockerClient's listContainers); that unfiltered shape is unique
+    // to this inventory scan, so it still discriminates it from every other
+    // (always filtered) `docker ps` listing in the same window.
     const containerListings = (calls: readonly RuntimeIoCall[]): number =>
-      dockerOperationProfile(calls)["docker container ls"] ?? 0;
+      calls.filter((call) => call.method === "capture" && call.command === "docker"
+        && call.args[0] === "ps"
+        && call.args.includes("--all")
+        && call.args.includes("--no-trunc")
+        && call.args.includes("--format")
+        && !call.args.includes("--filter")).length;
 
     test("unchanged inputs: a second warm launch runs no cleanup inventory", async () => {
       const context = launchContext();
@@ -4358,7 +4369,7 @@ describe("runtime command flow", () => {
             expect(args).toContain(`label=io.runfree.project-id=${options.projectId}`);
             return captureResult(0, present ? `${HELPER_ID}\n` : "");
           }
-          if (args[0] === "rm" && args[1] === "--force" && args.includes(HELPER_ID)) {
+          if (args[0] === "container" && args[1] === "rm" && args[2] === "--force" && args.includes(HELPER_ID)) {
             if (options.rmRemoves !== false) present = false;
             return options.rmRemoves === false ? captureResult(1, "", "daemon is busy") : captureResult(0, `${HELPER_ID}\n`);
           }
@@ -4381,7 +4392,7 @@ describe("runtime command flow", () => {
       expect((await startRuntime(context, io, false, {})).status).toBe(0);
 
       const calls = dockerArgs(io);
-      const removal = calls.findIndex((args) => args[0] === "rm" && args.includes(HELPER_ID));
+      const removal = calls.findIndex((args) => args[0] === "container" && args[1] === "rm" && args.includes(HELPER_ID));
       expect(removal).toBeGreaterThanOrEqual(0);
       expect(lockHeldAtSweep.length).toBeGreaterThan(0);
       expect(lockHeldAtSweep.every(Boolean)).toBe(true);
@@ -4416,7 +4427,7 @@ describe("runtime command flow", () => {
       const recovered = residueDocker({ present: false, projectId, lockPath });
       expect((await startRuntime(context, recovered.io, false, {})).status).toBe(0);
       expect(fs.existsSync(markerPath)).toBe(false);
-      expect(dockerArgs(recovered.io).some((args) => args[0] === "rm" && args.includes(HELPER_ID))).toBe(false);
+      expect(dockerArgs(recovered.io).some((args) => args[0] === "container" && args[1] === "rm" && args.includes(HELPER_ID))).toBe(false);
     });
 
     test("a legacy helper-runs directory is swept for and removed, whatever it holds", async () => {
@@ -4427,7 +4438,7 @@ describe("runtime command flow", () => {
       const { io } = residueDocker({ present: true, projectId: projectHash(context.projectRoot), lockPath });
 
       expect((await startRuntime(context, io, false, {})).status).toBe(0);
-      expect(dockerArgs(io).some((args) => args[0] === "rm" && args.includes(HELPER_ID))).toBe(true);
+      expect(dockerArgs(io).some((args) => args[0] === "container" && args[1] === "rm" && args.includes(HELPER_ID))).toBe(true);
       expect(fs.existsSync(legacyHelperRunsRoot(project.paths.stateDir))).toBe(false);
     });
 
@@ -4460,7 +4471,7 @@ describe("runtime command flow", () => {
         const start = io.calls.length;
         await restoreSameProxySessionAdmission({ plan, io, lifecycleLock: lock, proxyId, containmentIO: containment.io });
         // Residue first, through the containment IO.
-        expect(dockerArgs(containment.io).some((args) => args[0] === "rm" && args.includes(HELPER_ID))).toBe(true);
+        expect(dockerArgs(containment.io).some((args) => args[0] === "container" && args[1] === "rm" && args.includes(HELPER_ID))).toBe(true);
         expect(fs.existsSync(markerPath)).toBe(false);
         // Then the validation's helpers ran (the deny probe at least).
         const helperRuns = io.calls.slice(start).filter((call) => call.command === "docker" && call.args[0] === "run");
@@ -5173,7 +5184,7 @@ describe("runtime command flow", () => {
     expect(io.calls).toContainEqual(expect.objectContaining({
       method: "capture",
       command: "docker",
-      args: ["ps", "-aq", "--filter", `label=com.docker.compose.project=${projectName}`],
+      args: ["ps", "--all", "--quiet", "--filter", `label=com.docker.compose.project=${projectName}`],
     }));
     expect(io.calls).not.toContainEqual(expect.objectContaining({
       method: "capture",
@@ -5508,7 +5519,7 @@ describe("runtime command flow", () => {
     const io = createRuntimeIO({
       capture: (command, args) => {
         if (command === "docker" && args[0] === "info") return captureResult(0);
-        if (command === "docker" && args[0] === "ps" && args.includes("-q") && args.includes("--no-trunc")
+        if (command === "docker" && args[0] === "ps" && args.includes("--quiet") && !args.includes("--all") && args.includes("--no-trunc")
           && args.includes(`label=com.docker.compose.project=${projectName}`)
           && args.includes("label=com.docker.compose.service=proxy")) {
           return captureResult(0, `${proxyContainerId}\n`);
@@ -5547,7 +5558,7 @@ describe("runtime command flow", () => {
         if (command === "docker" && args[0] === "info") return captureResult(0);
         // No running proxy container for this project: status must report,
         // not throw or hang.
-        if (command === "docker" && args[0] === "ps" && args.includes("-q") && args.includes("--no-trunc")
+        if (command === "docker" && args[0] === "ps" && args.includes("--quiet") && !args.includes("--all") && args.includes("--no-trunc")
           && args.includes("label=com.docker.compose.service=proxy")) {
           return captureResult(0, "");
         }
@@ -5578,7 +5589,7 @@ describe("runtime command flow", () => {
     const io = createRuntimeIO({
       capture: (command, args) => {
         if (command === "docker" && args[0] === "info") return captureResult(0);
-        if (command === "docker" && args[0] === "ps" && args.includes("-q") && args.includes("--no-trunc")
+        if (command === "docker" && args[0] === "ps" && args.includes("--quiet") && !args.includes("--all") && args.includes("--no-trunc")
           && args.includes(`label=com.docker.compose.project=${projectName}`)
           && args.includes("label=com.docker.compose.service=proxy")) {
           return captureResult(0, `${proxyContainerId}\n`);
@@ -5722,7 +5733,7 @@ describe("runtime command flow", () => {
         return captureResult(0);
       },
       run: (command, args) => {
-        if (command === "docker" && args[0] === "rm") return 17;
+        if (command === "docker" && args[0] === "container" && args[1] === "rm") return 17;
         return 0;
       },
     });
@@ -7064,7 +7075,8 @@ describe("runtime command flow", () => {
       command: "docker",
       args: [
         "ps",
-        "-aq",
+        "--all",
+        "--quiet",
         "--no-trunc",
         "--filter",
         `label=${PROJECT_ID_LABEL}=${projectHash(projectRoot)}`,
@@ -7391,7 +7403,7 @@ describe("runtime command flow", () => {
           && args.includes("label=com.docker.compose.service=agent")) {
           return captureResult(0, "agent-id\n");
         }
-        if (command === "docker" && args[0] === "exec" && args[1] === "-i" && args.includes("1000:1000") && args.includes(FAKE_AGENT_CONTAINER_ID)) {
+        if (command === "docker" && args[0] === "exec" && args[1] === "--interactive" && args.includes("1000:1000") && args.includes(FAKE_AGENT_CONTAINER_ID)) {
           return captureResult(0, [
             "101\t/dev/pts/0\tzsh",
             "122\t/dev/pts/0\tclaude --dangerously-skip-permissions",
@@ -7435,7 +7447,7 @@ describe("runtime command flow", () => {
       && call.args[0] === "exec"
       && call.args.includes(FAKE_AGENT_CONTAINER_ID));
     const probeScript = probeCall?.input;
-    expect(probeCall?.args).toEqual(["exec", "-i", "--user", "1000:1000", FAKE_AGENT_CONTAINER_ID, "sh", "-s"]);
+    expect(probeCall?.args).toEqual(["exec", "--interactive", "--user", "1000:1000", FAKE_AGENT_CONTAINER_ID, "sh", "-s"]);
     expect(probeScript).toContain("\n");
     const syntax = childProcess.spawnSync("sh", ["-n"], { encoding: "utf8", input: probeScript ?? "" });
     expect(syntax.status, syntax.stderr).toBe(0);
@@ -7503,7 +7515,7 @@ describe("runtime command flow", () => {
           && args.includes("label=com.docker.compose.service=agent")) {
           return captureResult(0, "agent-id\n");
         }
-        if (command === "docker" && args[0] === "exec" && args[1] === "-i"
+        if (command === "docker" && args[0] === "exec" && args[1] === "--interactive"
           && args.includes("1000:1000") && args.includes(FAKE_AGENT_CONTAINER_ID)) {
           return captureResult(0, confirmationFinished
             ? "201\t/dev/pts/1\tcodex --dangerously-bypass-approvals-and-sandbox\n"
@@ -7548,7 +7560,7 @@ describe("runtime command flow", () => {
           && args.includes("label=com.docker.compose.service=agent")) {
           return captureResult(0, "agent-id\n");
         }
-        if (command === "docker" && args[0] === "exec" && args[1] === "-i"
+        if (command === "docker" && args[0] === "exec" && args[1] === "--interactive"
           && args.includes("1000:1000") && args.includes(FAKE_AGENT_CONTAINER_ID)) {
           return captureResult(0, confirmationFinished
             ? "101\t/dev/pts/0\tclaude --dangerously-skip-permissions\n102\t/dev/pts/0\tbash tool.sh\n"
@@ -7591,7 +7603,7 @@ describe("runtime command flow", () => {
           && args.includes("label=com.docker.compose.service=agent")) {
           return captureResult(0, "agent-id\n");
         }
-        if (command === "docker" && args[0] === "exec" && args[1] === "-i"
+        if (command === "docker" && args[0] === "exec" && args[1] === "--interactive"
           && args.includes("1000:1000") && args.includes(FAKE_AGENT_CONTAINER_ID)) {
           activeProbeCount += 1;
           return captureResult(0, "101\t/dev/pts/0\tclaude --dangerously-skip-permissions\n");
@@ -7673,7 +7685,7 @@ describe("runtime command flow", () => {
           && args.includes("label=com.docker.compose.service=agent")) {
           return captureResult(0, "agent-id\n");
         }
-        if (command === "docker" && args[0] === "exec" && args[1] === "-i" && args.includes("1000:1000") && args.includes(FAKE_AGENT_CONTAINER_ID)) {
+        if (command === "docker" && args[0] === "exec" && args[1] === "--interactive" && args.includes("1000:1000") && args.includes(FAKE_AGENT_CONTAINER_ID)) {
           return captureResult(0, "201\t/dev/pts/1\trf-20260517-a1b2c3\t/usr/bin/codex --dangerously-bypass-approvals-and-sandbox\n");
         }
         return captureResult(0);
@@ -7770,7 +7782,7 @@ describe("runtime command flow", () => {
           && args.includes("label=com.docker.compose.service=agent")) {
           return captureResult(0, "agent-id\n");
         }
-        if (command === "docker" && args[0] === "exec" && args[1] === "-i" && args.includes("1000:1000") && args.includes(FAKE_AGENT_CONTAINER_ID)) {
+        if (command === "docker" && args[0] === "exec" && args[1] === "--interactive" && args.includes("1000:1000") && args.includes(FAKE_AGENT_CONTAINER_ID)) {
           return captureResult(0, "201\t/dev/pts/1\trf-20260618-stale1\t/usr/bin/claude --dangerously-skip-permissions\n");
         }
         return captureResult(0);
@@ -7839,7 +7851,7 @@ describe("runtime command flow", () => {
           && args.includes("label=com.docker.compose.service=agent")) {
           return captureResult(0, "agent-id\n");
         }
-        if (command === "docker" && args[0] === "exec" && args[1] === "-i" && args.includes("1000:1000") && args.includes(FAKE_AGENT_CONTAINER_ID)) {
+        if (command === "docker" && args[0] === "exec" && args[1] === "--interactive" && args.includes("1000:1000") && args.includes(FAKE_AGENT_CONTAINER_ID)) {
           return captureResult(0, "201\t/dev/pts/1\trf-20260517-a1b2c3\t/usr/bin/codex --dangerously-bypass-approvals-and-sandbox\n");
         }
         return captureResult(0);
@@ -7906,7 +7918,7 @@ describe("runtime command flow", () => {
         if (command === "docker" && args[0] === "inspect" && args.some((arg) => arg.includes("io.runfree.runtime-digest"))) {
           return captureResult(0, "agent-id\tagent\tsha256:old-runtime\nproxy-id\tproxy\tsha256:old-runtime\n");
         }
-        if (command === "docker" && args[0] === "exec" && args[1] === "-i" && args.includes("1000:1000") && args.includes(FAKE_AGENT_CONTAINER_ID)) {
+        if (command === "docker" && args[0] === "exec" && args[1] === "--interactive" && args.includes("1000:1000") && args.includes(FAKE_AGENT_CONTAINER_ID)) {
           return captureResult(0, "");
         }
         return captureResult(0);
@@ -7945,7 +7957,7 @@ describe("runtime command flow", () => {
           && args.includes("label=com.docker.compose.service=agent")) {
           return captureResult(0, "agent-id\n");
         }
-        if (command === "docker" && args[0] === "exec" && args[1] === "-i" && args.includes("1000:1000") && args.includes(FAKE_AGENT_CONTAINER_ID)) {
+        if (command === "docker" && args[0] === "exec" && args[1] === "--interactive" && args.includes("1000:1000") && args.includes(FAKE_AGENT_CONTAINER_ID)) {
           return captureResult(126, "", "container is paused\ntry again later\n");
         }
         return captureResult(0);

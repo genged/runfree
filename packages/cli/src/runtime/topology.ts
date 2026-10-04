@@ -4,6 +4,7 @@ import { resolveRuntimeNetwork } from "../network.ts";
 import { runfreeLog } from "../warnings.ts";
 import { runDockerExecRoot } from "./attach.ts";
 import { dockerClientEnvOptions, parseDockerJson, serviceContainerId } from "./docker.ts";
+import { createDockerClient } from "./docker-client.ts";
 import { composeProjectName, projectHash } from "./env.ts";
 import {
   LINUX_CAPABILITY_BITS,
@@ -380,6 +381,7 @@ export function validateRuntimeTopologyWithProof(
   options: RuntimeTopologyOptions = {},
 ): RuntimeTopologyValidationResult {
   const context = topologyContext(input);
+  const client = createDockerClient(io, dockerClientEnvOptions(context));
   const messages: string[] = [];
   let denyByDefaultBaseObservation: DenyByDefaultObservationV1 | undefined;
   const project = isActiveRuntimePlan(input) ? input.composeProjectName : composeProjectName(context.projectRoot);
@@ -410,7 +412,7 @@ export function validateRuntimeTopologyWithProof(
   const inspect = warm
     ? [warm.proxy]
     : parseDockerJson<DockerContainerInspect[]>(
-      io.capture("docker", ["inspect", proxyId], dockerClientEnvOptions(context)),
+      client.inspect([proxyId]),
       "docker inspect runtime containers",
     );
   if (!inspect || inspect.length !== 1) {
@@ -446,7 +448,7 @@ export function validateRuntimeTopologyWithProof(
   const networkInspect = warm
     ? [warm.internalNetwork]
     : parseDockerJson<DockerNetworkInspect[]>(
-      io.capture("docker", ["network", "inspect", internalNetwork], dockerClientEnvOptions(context)),
+      client.inspect([internalNetwork], { type: "network" }),
       "docker network inspect agent_internal",
     );
   const network = networkInspect?.[0];
@@ -470,7 +472,7 @@ export function validateRuntimeTopologyWithProof(
         // is a missing participant, which the length check below refuses.
         ? attachedIds.flatMap((id) => warm.participants.filter((participant) => participant.Id === id))
         : parseDockerJson<DockerContainerInspect[]>(
-          io.capture("docker", ["inspect", ...attachedIds], dockerClientEnvOptions(context)),
+          client.inspect(attachedIds),
           "docker inspect agent_internal participants",
         );
     if (!attachedInspect || attachedInspect.length !== attachedIds.length) {
@@ -493,7 +495,7 @@ export function validateRuntimeTopologyWithProof(
   const egressNetworkInspect = warm
     ? [warm.egressNetwork]
     : parseDockerJson<DockerNetworkInspect[]>(
-      io.capture("docker", ["network", "inspect", egressNetwork], dockerClientEnvOptions(context)),
+      client.inspect([egressNetwork], { type: "network" }),
       "docker network inspect proxy_egress",
     );
   const inspectedEgressNetwork = egressNetworkInspect?.[0];

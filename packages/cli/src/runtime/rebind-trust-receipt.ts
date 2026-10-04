@@ -5,6 +5,7 @@ import { readBoundedRegularFile } from "../strict-primitives.ts";
 import { stableJson, sha256Digest } from "../strict-primitives.ts";
 import type { ActiveRuntimePlan } from "./plan.ts";
 import type { RuntimeIO } from "./types.ts";
+import { createDockerClient } from "./docker-client.ts";
 
 /** No private bytes enter the journal. Missing retained trust refuses creation. */
 export function captureRebindTrustReceipt(plan: ActiveRuntimePlan, io: RuntimeIO, assertAuthority: () => void): string {
@@ -30,8 +31,8 @@ export function captureRebindTrustReceipt(plan: ActiveRuntimePlan, io: RuntimeIO
   const bundle = read(path.join(plan.paths.proxyCaCertDir, "ca-bundle.crt"));
   if (!bundle.includes(certificate.toString().trim())) throw new Error("retained agent trust bundle does not contain the proxy CA; restore original trust before recovery");
   const volumeName = `${plan.composeProjectName}_runfree-oauth-state`;
-  const inspected = io.capture("docker", ["volume", "inspect", volumeName],
-    { env: plan.execution.dockerClientEnv, timeout: 1000, maxBuffer: 64 * 1024 });
+  const inspected = createDockerClient(io, { env: plan.execution.dockerClientEnv, timeout: 1000, maxBuffer: 64 * 1024 })
+    .inspect([volumeName], { type: "volume" });
   assertAuthority();
   if (inspected.status !== 0 || inspected.stderr.trim()) throw new Error("retained OAuth volume inspection is unavailable; no proxy creation is authorized");
   const volumes = JSON.parse(inspected.stdout) as Array<Record<string, unknown>>;

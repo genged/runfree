@@ -233,7 +233,7 @@ function build(scenario: Scenario): Harness {
     capture(command: string, args: string[]): CaptureResult {
       expect(command).toBe("docker");
       if (args[0] === "ps" && args.includes("label=io.runfree.ingress-purpose=mcp-callback")) {
-        expect(args).toContain("-a");
+        expect(args).toContain("--all");
         events.push("list-callback-forwarders");
         if (callback === "list-fails") return DAEMON_DOWN;
         return { ...OK, stdout: forwarderPresent ? `${FORWARDER_ID}\n` : "" };
@@ -243,7 +243,7 @@ function build(scenario: Scenario): Harness {
         return forwarderPresent ? { ...OK, stdout: JSON.stringify([forwarder()]) } : noSuch(FORWARDER_ID);
       }
       if (args[0] === "image" && args[1] === "inspect") return { ...OK, stdout: `${INGRESS_IMAGE_ID}\n` };
-      if (args[0] === "rm" && args.at(-1) === FORWARDER_ID) {
+      if (args[0] === "container" && args[1] === "rm" && args.at(-1) === FORWARDER_ID) {
         events.push("remove-callback-forwarder");
         if (callback === "remove-fails") return DAEMON_DOWN;
         forwarderPresent = false;
@@ -404,7 +404,7 @@ describe("the daemon-death residue is reclaimed on Docker's proof", () => {
         ...harness.input,
         io: {
           capture(command, args, options) {
-            if (args[0] === "rm" && args.at(-1) === FORWARDER_ID) recordsWhenForwarderRemoved = harness.records().length;
+            if (args[0] === "container" && args[1] === "rm" && args.at(-1) === FORWARDER_ID) recordsWhenForwarderRemoved = harness.records().length;
             return capture(command, args, options);
           },
         },

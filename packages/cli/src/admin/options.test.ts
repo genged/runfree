@@ -579,7 +579,7 @@ ${dockerSecurityContractProbeShell()}
     /bin/cat ${JSON.stringify(markerPath)}
     exit 0
   fi
-  if [ "$2" = "--user" ] && [ "$3" = "1001:1001" ] && [ "$4" = "-i" ]; then
+  if [ "$2" = "--interactive" ] && [ "$3" = "--user" ] && [ "$4" = "1001:1001" ]; then
     /bin/cat >/dev/null
     : > ${JSON.stringify(path.join(secretsDir, "github"))}
     exit 0
@@ -740,7 +740,7 @@ if [ "$1" = "inspect" ] && [ "$2" = "--format" ]; then
       ;;
   esac
 fi
-if [ "$1" = "restart" ]; then
+if [ "$1" = "container" ] && [ "$2" = "restart" ]; then
   exit 0
 fi
 if [ "$1" = "exec" ]; then
@@ -791,7 +791,7 @@ exit 0
 
   if (drift) {
     await expect(runAdminAction(state, () => reloadProxy())).rejects.toThrow("before disruption");
-    expect(fs.readFileSync(dockerLogPath, "utf8").split("\n").some((line) => line.startsWith("restart ") || line.startsWith("start "))).toBe(false);
+    expect(fs.readFileSync(dockerLogPath, "utf8").split("\n").some((line) => line.startsWith("container restart ") || line.startsWith("container start "))).toBe(false);
     fs.unlinkSync(driftTrigger);
     fs.writeFileSync(tokenConfigPath, JSON.stringify({ github: { source: "env", env: "GITHUB_TOKEN" } }));
   }
@@ -921,7 +921,12 @@ exit 0
 
   expect(status).toBe(1);
   expect(errors.join("\n")).toContain("runtime validation marker is stale for runtime security contract");
-  expect(fs.readFileSync(dockerLogPath, "utf8")).not.toContain("--user 1001:1001 -i proxy-id");
+  // The token write exec's shape (flag order) is an implementation detail;
+  // what must never happen is the proxy-runtime-user exec reaching the
+  // token-write script (its command text names the secrets directory), in
+  // any flag order.
+  const dockerLogLines = fs.readFileSync(dockerLogPath, "utf8").split("\n");
+  expect(dockerLogLines.some((line) => line.includes("1001:1001") && line.includes("/run/runfree-proxy-secrets"))).toBe(false);
 });
 
 test("token sync watch quiet suppresses routine watch output", async () => {

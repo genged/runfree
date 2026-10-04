@@ -69,6 +69,27 @@ describe("crash point matching", () => {
     expect(matchesCrashPoint([], "after-create")).toBe(false);
   });
 
+  // The proxy stop (docker-client.ts's `stopContainers`) and the sealed
+  // session stop (session-container-cleanup.ts) both build the identical
+  // `container stop --time N <id>` subcommand, so the bare prefix cannot tell
+  // them apart. `excludeContainerId` is what lets a kill armed for the
+  // session's own teardown stop ignore a stop of the known proxy container.
+  test("excludes a container-stop whose id is the named excluded id", () => {
+    expect(matchesCrashPoint(["container", "stop", "--time", "5", "proxy-id"], "after-container-stop", "proxy-id")).toBe(false);
+  });
+
+  test("still matches a container-stop whose id is not the named excluded id", () => {
+    expect(matchesCrashPoint(["container", "stop", "--time", "5", "session-id"], "after-container-stop", "proxy-id")).toBe(true);
+  });
+
+  test("matches a container-stop exactly as before when no id is excluded", () => {
+    expect(matchesCrashPoint(["container", "stop", "--time", "5", "proxy-id"], "after-container-stop")).toBe(true);
+  });
+
+  test("the excluded-id check is scoped to after-container-stop; it does not suppress other points", () => {
+    expect(matchesCrashPoint(["container", "start", "--attach", "proxy-id"], "after-start", "proxy-id")).toBe(true);
+  });
+
   test("crash points are recognised by name and nothing else is", () => {
     for (const point of Object.keys(CRASH_POINTS)) expect(isCrashPoint(point)).toBe(true);
   });

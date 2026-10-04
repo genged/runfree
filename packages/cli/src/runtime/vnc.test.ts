@@ -113,7 +113,7 @@ function happyPathResponder(): { respond: (args: string[]) => CaptureResult | un
       // it is always listening in the happy path, independent of x11vnc.
       if (joined.includes("/proc/net/tcp")) return ok();
       if (joined.includes("command -v x11vnc")) return ok();
-      if (args.includes("-d")) {
+      if (args.includes("--detach")) {
         state.x11vncStarted = true;
         return ok();
       }
@@ -226,14 +226,14 @@ describe("vnc start", () => {
     await vncRuntime(parseVncArgs(["start", "--password", "secret"], ctx.env ?? {}), ctx, io, createRuntimeAdapters(ctx, io), noDelay);
 
     expect(state.x11vncStarted).toBe(true);
-    const started = captures.find((call) => call.args[0] === "exec" && call.args.includes("-d"));
+    const started = captures.find((call) => call.args[0] === "exec" && call.args.includes("--detach"));
     expect(started?.args).toContain("VNC_PASSWORD=secret");
     expect(started?.args).toContain("VNC_PORT=5901");
     expect(started?.args).toContain("VNC_CLIPBOARD=0");
-    expect(started?.args).toContain("-u");
+    expect(started?.args).toContain("--user");
     expect(started?.args).toContain("1000:1000");
     expect(started?.args[started.args.length - 1]).toContain("-nosel");
-    const startedIndex = captures.findIndex((call) => call.args[0] === "exec" && call.args.includes("-d"));
+    const startedIndex = captures.findIndex((call) => call.args[0] === "exec" && call.args.includes("--detach"));
     const runIndex = captures.findIndex((call) => call.args[0] === "run");
     expect(startedIndex).toBeGreaterThanOrEqual(0);
     expect(runIndex).toBeGreaterThan(startedIndex);
@@ -245,7 +245,7 @@ describe("vnc start", () => {
     const ctx = context();
     await vncRuntime(parseVncArgs(["start", "--clipboard"], ctx.env ?? {}), ctx, io, createRuntimeAdapters(ctx, io), noDelay);
 
-    const started = captures.find((call) => call.args[0] === "exec" && call.args.includes("-d"));
+    const started = captures.find((call) => call.args[0] === "exec" && call.args.includes("--detach"));
     expect(started?.args).toContain("VNC_CLIPBOARD=1");
   });
 
@@ -298,7 +298,7 @@ describe("vnc start", () => {
 
 // The facility's ingress-forwarder listing (by role label).
 function isIngressList(args: string[]): boolean {
-  return args[0] === "ps" && args.includes("-a") && args.includes(INGRESS_ROLE_FILTER);
+  return args[0] === "ps" && args.includes("--all") && args.includes(INGRESS_ROLE_FILTER);
 }
 
 function vncForwarderFixture(name: string) {
@@ -329,8 +329,9 @@ describe("vnc stop and status", () => {
           : missingContainerResult(args[2] as string);
       }
       if (args[0] === "image" && args[1] === "inspect") return ok(`${INGRESS_FORWARDER_TEST_IMAGE_ID}\n`);
-      if (args[0] === "rm") {
-        const removed = [...candidates].find(([, candidate]) => candidate.Id === args[2]);
+      if (args[0] === "container" && args[1] === "rm") {
+        const id = args.at(-1);
+        const removed = [...candidates].find(([, candidate]) => candidate.Id === id);
         if (removed) remaining.delete(removed[0]);
         return ok();
       }
@@ -347,7 +348,7 @@ describe("vnc stop and status", () => {
     const status = await vncRuntime(parseVncArgs(["stop"], ctx.env ?? {}), ctx, io, createRuntimeAdapters(ctx, io), noDelay);
     expect(status).toBe(0);
 
-    const removed = captures.filter((call) => call.args[0] === "rm").map((call) => call.args[2]);
+    const removed = captures.filter((call) => call.args[0] === "container" && call.args[1] === "rm").map((call) => call.args.at(-1));
     expect(removed).toEqual(expect.arrayContaining(
       forwarders.map((name) => candidates.get(name)?.Id),
     ));
@@ -369,8 +370,9 @@ describe("vnc stop and status", () => {
           : missingContainerResult(args[2] as string);
       }
       if (args[0] === "image" && args[1] === "inspect") return ok(`${INGRESS_FORWARDER_TEST_IMAGE_ID}\n`);
-      if (args[0] === "rm") {
-        const removed = [...candidates].find(([, candidate]) => candidate.Id === args[2]);
+      if (args[0] === "container" && args[1] === "rm") {
+        const id = args.at(-1);
+        const removed = [...candidates].find(([, candidate]) => candidate.Id === id);
         if (removed) remaining.delete(removed[0]);
         return ok();
       }
@@ -382,7 +384,7 @@ describe("vnc stop and status", () => {
     const ctx = context();
     await vncRuntime(parseVncArgs(["stop", "--host-port", "5902"], ctx.env ?? {}), ctx, io, createRuntimeAdapters(ctx, io), noDelay);
 
-    const removed = captures.filter((call) => call.args[0] === "rm").map((call) => call.args[2]);
+    const removed = captures.filter((call) => call.args[0] === "container" && call.args[1] === "rm").map((call) => call.args.at(-1));
     expect(removed).toEqual([candidates.get(target)?.Id]);
   });
 

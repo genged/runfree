@@ -84,6 +84,7 @@ import {
 } from "./session-template-artifact.ts";
 import type { RuntimeContext, RuntimeIO } from "./types.ts";
 import { dockerClientEnvOptions, type RuntimeDocker } from "./docker.ts";
+import { createDockerClient } from "./docker-client.ts";
 import { inspectReusableManagedImage, reusableManagedImage } from "./image-identity.ts";
 import {
   accountSessionAgentImageReferences,
@@ -293,12 +294,15 @@ function exactManagedProjectAgentImageIds(
   io: RuntimeIO,
   projectId: string,
 ): string[] {
-  const result = io.capture("docker", [
-    "image", "ls", "--no-trunc", "--quiet",
-    "--filter", `label=${RUNFREE_MANAGED_IMAGE_LABEL}=true`,
-    "--filter", `label=${PROJECT_ID_LABEL}=${projectId}`,
-    "--filter", `label=${RUNFREE_IMAGE_ROLE_LABEL}=${AGENT_PROJECT_IMAGE_ROLE}`,
-  ], dockerClientEnvOptions(context));
+  const client = createDockerClient(io, dockerClientEnvOptions(context));
+  const result = client.listObjects("image", {
+    quiet: true, noTrunc: true,
+    filters: [
+      `label=${RUNFREE_MANAGED_IMAGE_LABEL}=true`,
+      `label=${PROJECT_ID_LABEL}=${projectId}`,
+      `label=${RUNFREE_IMAGE_ROLE_LABEL}=${AGENT_PROJECT_IMAGE_ROLE}`,
+    ],
+  });
   if (result.status !== 0 || Buffer.byteLength(result.stdout) > 128 * 1024) {
     throw new Error("Docker could not list the bounded managed project-agent image set");
   }
@@ -308,10 +312,7 @@ function exactManagedProjectAgentImageIds(
     throw new Error("Docker returned an invalid managed project-agent image set");
   }
   if (ids.length === 0) return ids;
-  const inspect = io.capture("docker", ["image", "inspect", ...ids], {
-    ...dockerClientEnvOptions(context),
-    maxBuffer: GC_IMAGE_INSPECT_MAX_BYTES,
-  });
+  const inspect = client.inspect(ids, { type: "image" }, { maxBuffer: GC_IMAGE_INSPECT_MAX_BYTES });
   if (inspect.status !== 0 || Buffer.byteLength(inspect.stdout) > GC_IMAGE_INSPECT_MAX_BYTES) {
     throw new Error("managed project-agent images could not be re-inspected before cleanup");
   }

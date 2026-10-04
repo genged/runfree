@@ -30,9 +30,9 @@ import {
   projectIngressForwarderFilters,
   type IngressPurpose,
 } from "./container-inventory.ts";
-import { dockerClientEnvOptions, parseDockerJson } from "./docker.ts";
+import { createDockerClient, labelRunFlags, type DockerRunFlag } from "./docker-client.ts";
+import { dockerClientEnvOptions, filterValues, parseDockerJson } from "./docker.ts";
 import type {
-  CaptureResult,
   DockerContainerInspect,
   DockerNetworkInspect,
   RuntimeContext,
@@ -106,12 +106,8 @@ export type IngressForwarderInput = Readonly<{
   extraEnv?: Readonly<Record<string, string>>;
 }>;
 
-function docker(context: RuntimeContext, io: RuntimeIO, args: string[]): CaptureResult {
-  return io.capture("docker", args, dockerClientEnvOptions(context));
-}
-
 function containerExists(context: RuntimeContext, io: RuntimeIO, name: string): boolean {
-  return docker(context, io, ["container", "inspect", name]).status === 0;
+  return createDockerClient(io, dockerClientEnvOptions(context)).inspect([name], { type: "container" }).status === 0;
 }
 
 function exactMissingContainer(stderr: string, target: string): boolean {
@@ -132,7 +128,7 @@ function exactMissingContainer(stderr: string, target: string): boolean {
  * not proof the container is gone.)
  */
 function removeForwarder(context: RuntimeContext, io: RuntimeIO, name: string): { ok: boolean; detail?: string } {
-  const removed = docker(context, io, ["rm", "-f", name]);
+  const removed = createDockerClient(io, dockerClientEnvOptions(context)).removeContainers([name], { force: true });
   if (removed.status === 0) return { ok: true };
   const detail = removed.stderr.trim();
   // Only the canonical missing-target error for *this* container proves it is
@@ -240,7 +236,7 @@ export function inspectIngressHostNetwork(
   proof: "creation" | "teardown" = "creation",
 ): IngressHostNetworkProof | undefined {
   const name = ingressHostNetworkName(projectId);
-  const result = docker(context, io, ["network", "inspect", name]);
+  const result = createDockerClient(io, dockerClientEnvOptions(context)).inspect([name], { type: "network" });
   if (result.status !== 0) {
     if (exactMissingNetwork(result.stderr, name)) return undefined;
     die(`could not inspect ingress host network ${name}: ${result.stderr.trim() || `exit ${result.status}`}`);
@@ -334,7 +330,7 @@ export function removeValidatedEmptyManagedIngressHostNetworkAfterForcedSweep(
       kind: "retained",
     });
   }
-  const removed = docker(context, io, ["network", "rm", network.id]);
+  const removed = createDockerClient(io, dockerClientEnvOptions(context)).removeNetworks([network.id]);
   if (removed.status !== 0 && !exactMissingNetwork(removed.stderr, network.id)) {
     die(removed.stderr.trim() || `failed to remove Docker network ${network.name}`);
   }
@@ -368,48 +364,54 @@ function assertInput(input: IngressForwarderInput): void {
   }
 }
 
+/** The structured form of one forwarder's `docker run`: the single source of truth. */
+type IngressForwarderRunRequest = Readonly<{
+  flags: readonly DockerRunFlag[];
+  image: string;
+  command: readonly string[];
+}>;
+
 /**
- * The exact `docker run` argv for one forwarder, pure and testable.
- *
  * Every hardening flag is load-bearing: user 65534, cap-drop ALL, read-only,
  * no-new-privileges, bounded pids, no mounts, no Docker socket, `--rm`. The
  * publication is loopback-only (spec Non-goals: never `0.0.0.0`). The socat
  * command shape is fixed and the same for every purpose; only the target and
  * ports vary.
  */
+function ingressForwarderRunRequest(input: IngressForwarderInput): IngressForwarderRunRequest {
+  return {
+    flags: [
+      ["--rm"] as const,
+      ["-d"] as const,
+      ["--name", ingressForwarderName(input.projectId, input.purpose, input.hostPort)] as const,
+      ...labelRunFlags(ingressForwarderLabelArguments(input.projectId, input.purpose)),
+      ["--network", ingressHostNetworkName(input.projectId)] as const,
+      ["--cap-drop", "ALL"] as const,
+      ["--security-opt", "no-new-privileges:true"] as const,
+      ["--read-only"] as const,
+      ["--pids-limit", "64"] as const,
+      ["--user", "65534:65534"] as const,
+      ["-p", `127.0.0.1:${input.hostPort}:${input.hostPort}`] as const,
+      ["-e", `INGRESS_HOST_PORT=${input.hostPort}`] as const,
+      ["-e", `INGRESS_TARGET=${input.target}`] as const,
+      ["-e", `INGRESS_TARGET_PORT=${input.targetPort}`] as const,
+      ...Object.entries(input.extraEnv ?? {}).map(([name, value]) => ["-e", `${name}=${value}`] as const),
+      ["--entrypoint", INGRESS_FORWARDER_ENTRYPOINT] as const,
+    ],
+    image: INGRESS_FORWARDER_IMAGE,
+    command: INGRESS_FORWARDER_COMMAND,
+  };
+}
+
+/**
+ * The exact `docker run` argv for one forwarder, pure and testable. A thin
+ * flattening of `ingressForwarderRunRequest`'s structured flags — the same
+ * single source of truth `startIngressForwarder` hands to `runContainer` —
+ * so this and the real call can never drift apart.
+ */
 export function ingressForwarderRunArguments(input: IngressForwarderInput): string[] {
-  return [
-    "run",
-    "--rm",
-    "-d",
-    "--name",
-    ingressForwarderName(input.projectId, input.purpose, input.hostPort),
-    ...ingressForwarderLabelArguments(input.projectId, input.purpose),
-    "--network",
-    ingressHostNetworkName(input.projectId),
-    "--cap-drop",
-    "ALL",
-    "--security-opt",
-    "no-new-privileges:true",
-    "--read-only",
-    "--pids-limit",
-    "64",
-    "--user",
-    "65534:65534",
-    "-p",
-    `127.0.0.1:${input.hostPort}:${input.hostPort}`,
-    "-e",
-    `INGRESS_HOST_PORT=${input.hostPort}`,
-    "-e",
-    `INGRESS_TARGET=${input.target}`,
-    "-e",
-    `INGRESS_TARGET_PORT=${input.targetPort}`,
-    ...Object.entries(input.extraEnv ?? {}).flatMap(([name, value]) => ["-e", `${name}=${value}`]),
-    "--entrypoint",
-    INGRESS_FORWARDER_ENTRYPOINT,
-    INGRESS_FORWARDER_IMAGE,
-    ...INGRESS_FORWARDER_COMMAND,
-  ];
+  const { flags, image, command } = ingressForwarderRunRequest(input);
+  return ["run", ...flags.flatMap((flag) => [...flag]), image, ...command];
 }
 
 /**
@@ -429,13 +431,15 @@ export function startIngressForwarder(
   prevalidatedNetwork?: IngressHostNetworkProof,
 ): string {
   assertInput(input);
-  // Build the run argv up front: it mints the labels, which reject an invalid
-  // project id or purpose. Nothing mutates Docker until the whole input has
-  // been validated, so a rejected input never leaves a created network behind.
-  const runArgs = ingressForwarderRunArguments(input);
+  const client = createDockerClient(io, dockerClientEnvOptions(context));
+  // Build the run request up front: it mints the labels, which reject an
+  // invalid project id or purpose. Nothing mutates Docker until the whole
+  // input has been validated, so a rejected input never leaves a created
+  // network behind.
+  const runRequest = ingressForwarderRunRequest(input);
   const hostNetwork = ingressHostNetworkName(input.projectId);
   const name = ingressForwarderName(input.projectId, input.purpose, input.hostPort);
-  const existing = docker(context, io, ["container", "inspect", name]);
+  const existing = client.inspect([name], { type: "container" });
   if (existing.status === 0) {
     die(`ingress forwarder ${name} already exists; validate and stop it before replacement`);
   }
@@ -447,16 +451,10 @@ export function startIngressForwarder(
     die(`ingress host network ${hostNetwork} changed after ownership validation`);
   }
   if (!existingHostNetwork) {
-    const created = docker(context, io, [
-      "network",
-      "create",
-      "--label",
+    const created = client.createNetwork(hostNetwork, [
       `${MANAGED_LABEL}=true`,
-      "--label",
       `${PROJECT_ID_LABEL}=${input.projectId}`,
-      "--label",
       `${INGRESS_HOST_NETWORK_ROLE_LABEL}=${INGRESS_HOST_NETWORK_ROLE}`,
-      hostNetwork,
     ]);
     if (created.status !== 0) die(created.stderr.trim() || `failed to create Docker network ${hostNetwork}`);
     const createdId = created.stdout.trim();
@@ -468,13 +466,13 @@ export function startIngressForwarder(
       if (!FULL_DOCKER_NETWORK_ID_PATTERN.test(createdId)) {
         die(`${reason}; Docker returned no exact ID for the newly created network, so it may remain`);
       }
-      const cleanup = docker(context, io, ["network", "rm", createdId]);
+      const cleanup = client.removeNetworks([createdId]);
       if (cleanup.status === 0 || exactMissingNetwork(cleanup.stderr, createdId)) die(reason);
       die(`${reason}; and cleanup failed, network ${createdId} may remain: ${cleanup.stderr.trim() || `exit ${cleanup.status}`}`);
     }
     if (!inspectedCreated) {
       if (FULL_DOCKER_NETWORK_ID_PATTERN.test(createdId)) {
-        const cleanup = docker(context, io, ["network", "rm", createdId]);
+        const cleanup = client.removeNetworks([createdId]);
         if (cleanup.status !== 0 && !exactMissingNetwork(cleanup.stderr, createdId)) {
           die(`newly created ingress host network ${hostNetwork} disappeared before validation; cleanup failed: ${cleanup.stderr.trim() || `exit ${cleanup.status}`}`);
         }
@@ -482,17 +480,17 @@ export function startIngressForwarder(
       die(`newly created ingress host network ${hostNetwork} disappeared before validation`);
     }
     if (FULL_DOCKER_NETWORK_ID_PATTERN.test(createdId) && inspectedCreated.id !== createdId) {
-      const cleanup = docker(context, io, ["network", "rm", createdId]);
+      const cleanup = client.removeNetworks([createdId]);
       const reason = `ingress host network ${hostNetwork} changed after creation`;
       if (cleanup.status === 0 || exactMissingNetwork(cleanup.stderr, createdId)) die(reason);
       die(`${reason}; and cleanup failed, network ${createdId} may remain: ${cleanup.stderr.trim() || `exit ${cleanup.status}`}`);
     }
   }
-  const run = docker(context, io, runArgs);
+  const run = client.runContainer(runRequest.flags, runRequest.image, runRequest.command);
   if (run.status !== 0) die(run.stderr.trim() || `failed to start ingress forwarder ${name}`);
   let containerId = run.stdout.trim();
   if (!FULL_DOCKER_CONTAINER_ID_PATTERN.test(containerId)) {
-    const inspected = docker(context, io, ["container", "inspect", name]);
+    const inspected = client.inspect([name], { type: "container" });
     if (inspected.status !== 0) {
       if (exactMissingContainer(inspected.stderr, name)) {
         die(`Docker started ingress forwarder ${name} but returned no exact container ID; the container is already gone`);
@@ -534,7 +532,7 @@ export function startIngressForwarder(
   if (!waitForSocatBind(context, io, containerId, input.hostPort)) {
     dieAfterCleanup(context, io, containerId, name, `ingress forwarder ${name} did not begin listening on 127.0.0.1:${input.hostPort}`);
   }
-  const connected = docker(context, io, ["network", "connect", input.internalNetwork, containerId]);
+  const connected = client.connectNetwork(input.internalNetwork, containerId);
   if (connected.status !== 0) {
     dieAfterCleanup(
       context,
@@ -573,7 +571,7 @@ function dieAfterCleanup(
 function socatListening(context: RuntimeContext, io: RuntimeIO, name: string, hostPort: string): boolean {
   const portHex = Number(hostPort).toString(16).toUpperCase().padStart(4, "0");
   const script = `awk '$4=="0A" && $2 ~ /:${portHex}$/ {f=1} END{exit f?0:1}' /proc/net/tcp`;
-  return docker(context, io, ["exec", name, "sh", "-c", script]).status === 0;
+  return createDockerClient(io, dockerClientEnvOptions(context)).exec(name, ["sh", "-c", script]).status === 0;
 }
 
 /** Polls until socat binds, or fails closed if the container dies first. */
@@ -587,13 +585,11 @@ function waitForSocatBind(context: RuntimeContext, io: RuntimeIO, name: string, 
 
 /** This project's live ingress forwarder container names. */
 export function listIngressForwarders(context: RuntimeContext, io: RuntimeIO, projectId: string): string[] {
-  const result = docker(context, io, [
-    "ps",
-    "-a",
-    ...projectIngressForwarderFilters(projectId),
-    "--format",
-    "{{.Names}}",
-  ]);
+  const result = createDockerClient(io, dockerClientEnvOptions(context)).listContainers({
+    all: true,
+    filters: filterValues(projectIngressForwarderFilters(projectId)),
+    format: "{{.Names}}",
+  });
   if (result.status !== 0) die(result.stderr.trim() || "could not list ingress forwarders");
   return result.stdout.trim().split(/\s+/).filter(Boolean);
 }
@@ -609,7 +605,7 @@ function removeHostNetworkIfUnused(
   if (listIngressForwarders(context, io, projectId).length > 0) return;
   const network = inspectedNetwork ?? inspectIngressHostNetwork(context, io, projectId, "teardown");
   if (!network) return;
-  const removed = docker(context, io, ["network", "rm", network.id]);
+  const removed = createDockerClient(io, dockerClientEnvOptions(context)).removeNetworks([network.id]);
   if (removed.status !== 0 && !exactMissingNetwork(removed.stderr, network.id)) {
     die(removed.stderr.trim() || `failed to remove Docker network ${network.name}`);
   }

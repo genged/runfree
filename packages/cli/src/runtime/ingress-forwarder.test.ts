@@ -108,7 +108,7 @@ describe("startIngressForwarder", () => {
       // socat readiness probe: listening unless the test forces it to fail.
       if (args[0] === "exec") return { status: fail?.exec ? 1 : 0, stdout: "", stderr: "" };
       if (args[0] === "network" && args[1] === "connect") return { status: fail?.connect ? 1 : 0, stdout: "", stderr: "boom" };
-      if (args[0] === "rm") return { status: 0, stdout: "", stderr: "" };
+      if (args[0] === "container" && args[1] === "rm") return { status: 0, stdout: "", stderr: "" };
       return { status: 0, stdout: "", stderr: "" };
     });
     return { io: { capture } as unknown as RuntimeIO, calls };
@@ -134,6 +134,13 @@ describe("startIngressForwarder", () => {
     // merely likely.
     expect(runIdx).toBeLessThan(readinessIdx);
     expect(readinessIdx).toBeLessThan(connectIdx);
+  });
+
+  test("the migrated runContainer call produces the exact argv ingressForwarderRunArguments builds", () => {
+    const { io, calls } = fakeIo();
+    startIngressForwarder(context, io, input());
+    const runCall = calls.find((args) => args[0] === "run");
+    expect(runCall).toEqual(ingressForwarderRunArguments(input()));
   });
 
   test.each<Record<string, string>>([
@@ -258,7 +265,7 @@ describe("startIngressForwarder", () => {
         started = true;
         return { status: 0, stdout: "unexpected output\n", stderr: "" };
       }
-      if (args[0] === "rm") {
+      if (args[0] === "container" && args[1] === "rm") {
         started = false;
         return { status: 0, stdout: "", stderr: "" };
       }
@@ -267,7 +274,7 @@ describe("startIngressForwarder", () => {
     const io = { capture } as unknown as RuntimeIO;
 
     expect(() => startIngressForwarder(context, io, input())).toThrow(/returned no exact container ID/u);
-    expect(calls).toContainEqual(["rm", "-f", FORWARDER_ID]);
+    expect(calls).toContainEqual(["container", "rm", "--force", FORWARDER_ID]);
     expect(started).toBe(false);
   });
 
@@ -330,7 +337,7 @@ describe("startIngressForwarder", () => {
     expect(calls).toContainEqual(expect.arrayContaining(["network", "create", currentNetwork]));
     expect(calls.some((args) => args.includes(legacyNetwork))).toBe(false);
     expect(calls.some((args) => args[0] === "run")).toBe(true);
-    expect(calls.some((args) => args[0] === "rm")).toBe(false);
+    expect(calls.some((args) => args[0] === "container" && args[1] === "rm")).toBe(false);
   });
 
   test("refuses an unexpected current-network endpoint before removing the target", () => {
@@ -391,14 +398,14 @@ describe("startIngressForwarder", () => {
       input(),
     )).toThrow(/does not carry this project's exact ingress-forwarder labels/u);
 
-    expect(calls.some((args) => args[0] === "rm")).toBe(false);
+    expect(calls.some((args) => args[0] === "container" && args[1] === "rm")).toBe(false);
     expect(calls.some((args) => args[0] === "run")).toBe(false);
   });
 
   test("removes the sidecar when the agent_internal attach fails, leaving no half-homed forwarder", () => {
     const { io, calls } = fakeIo({ connect: true });
     expect(() => startIngressForwarder(context, io, input())).toThrow(CliError);
-    expect(calls.some((args) => args[0] === "rm" && args.includes("-f"))).toBe(true);
+    expect(calls.some((args) => args[0] === "container" && args[1] === "rm" && args.includes("--force"))).toBe(true);
   });
 
   test("does not attach agent_internal — and removes the sidecar — when socat never binds", () => {
@@ -406,7 +413,7 @@ describe("startIngressForwarder", () => {
     expect(() => startIngressForwarder(context, io, input())).toThrow(/did not begin listening/u);
     // The attach must never happen without a confirmed host-facing listener.
     expect(calls.some((args) => args[0] === "network" && args[1] === "connect")).toBe(false);
-    expect(calls.some((args) => args[0] === "rm" && args.includes("-f"))).toBe(true);
+    expect(calls.some((args) => args[0] === "container" && args[1] === "rm" && args.includes("--force"))).toBe(true);
   });
 
   test("surfaces a cleanup failure when the sidecar cannot be removed after a failed start", () => {
@@ -431,7 +438,7 @@ describe("startIngressForwarder", () => {
       }
       if (args[0] === "run") { started = true; return { status: 0, stdout: `${FORWARDER_ID}\n`, stderr: "" }; }
       if (args[0] === "exec") return { status: 1, stdout: "", stderr: "" };
-      if (args[0] === "rm") return { status: 1, stdout: "", stderr: "device busy" };
+      if (args[0] === "container" && args[1] === "rm") return { status: 1, stdout: "", stderr: "device busy" };
       return { status: 0, stdout: "", stderr: "" };
     });
     const io = { capture } as unknown as RuntimeIO;
@@ -462,7 +469,7 @@ describe("startIngressForwarder", () => {
       }
       if (args[0] === "run") { started = true; return { status: 0, stdout: `${FORWARDER_ID}\n`, stderr: "" }; }
       if (args[0] === "exec") return { status: 1, stdout: "", stderr: "" };
-      if (args[0] === "rm") return { status: 1, stdout: "", stderr: `Error: No such container: ${FORWARDER_ID}` };
+      if (args[0] === "container" && args[1] === "rm") return { status: 1, stdout: "", stderr: `Error: No such container: ${FORWARDER_ID}` };
       return { status: 0, stdout: "", stderr: "" };
     });
     const io = { capture } as unknown as RuntimeIO;
@@ -496,7 +503,7 @@ describe("startIngressForwarder", () => {
       }
       if (args[0] === "run") { started = true; return { status: 0, stdout: `${FORWARDER_ID}\n`, stderr: "" }; }
       if (args[0] === "exec") return { status: 1, stdout: "", stderr: "" };
-      if (args[0] === "rm") {
+      if (args[0] === "container" && args[1] === "rm") {
         return { status: 1, stdout: "", stderr: "cannot remove - Cannot kill container abc123: No such container: abc123def456" };
       }
       return { status: 0, stdout: "", stderr: "" };
@@ -525,7 +532,7 @@ describe("startIngressForwarder", () => {
       }
       if (args[0] === "run") { started = true; return { status: 0, stdout: `${FORWARDER_ID}\n`, stderr: "" }; }
       if (args[0] === "exec") return { status: 1, stdout: "", stderr: "" };
-      if (args[0] === "rm") {
+      if (args[0] === "container" && args[1] === "rm") {
         return { status: 1, stdout: "", stderr: `Error: No such container: ${FORWARDER_ID}-stale` };
       }
       return { status: 0, stdout: "", stderr: "" };
@@ -647,7 +654,7 @@ describe("teardown", () => {
       if (args[0] === "container" && args[1] === "inspect") {
         return { status: forwarders.includes(args[2]) ? 0 : 1, stdout: "", stderr: "" };
       }
-      if (args[0] === "rm") {
+      if (args[0] === "container" && args[1] === "rm") {
         forwarders = forwarders.filter((name) => !args.includes(name));
         return { status: 0, stdout: "", stderr: "" };
       }
@@ -662,7 +669,7 @@ describe("teardown", () => {
     removeAllIngressForwarders(context, io, PROJECT_ID);
 
     const calls = capture.mock.calls.map((c) => (c as unknown as [string, string[]])[1]);
-    expect(calls.some((args) => args[0] === "rm" && args.includes("runfree-ingress-port-0123456789ab-3000"))).toBe(true);
+    expect(calls.some((args) => args[0] === "container" && args[1] === "rm" && args.includes("runfree-ingress-port-0123456789ab-3000"))).toBe(true);
     expect(calls.some((args) => args[0] === "network" && args[1] === "rm" && args[2] === INGRESS_HOST_NETWORK_TEST_ID)).toBe(true);
   });
 
@@ -683,7 +690,7 @@ describe("teardown", () => {
   test("treats a validated --rm forwarder that disappears before removal as gone", () => {
     const id = "f".repeat(64);
     const capture = vi.fn((_cmd: string, args: string[]) => {
-      if (args[0] === "rm") {
+      if (args[0] === "container" && args[1] === "rm") {
         return { status: 1, stdout: "", stderr: `Error: No such container: ${id}` };
       }
       if (args[0] === "ps") return { status: 0, stdout: "", stderr: "" };

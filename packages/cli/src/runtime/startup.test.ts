@@ -117,11 +117,12 @@ function rebuildForwarderIo(
         const candidate = remaining.get(args[2]) ?? byId.get(args[2]);
         return candidate ? result(0, JSON.stringify([candidate])) : result(1, "", `No such container: ${args[2]}`);
       }
-      if (args[0] === "rm" && args[1] === "-f") {
-        const candidate = byId.get(args[2]);
-        if (!candidate) return result(1, "", `No such container: ${args[2]}`);
+      if (args[0] === "container" && args[1] === "rm" && args[2] === "--force") {
+        const id = args[3] as string;
+        const candidate = byId.get(id);
+        if (!candidate) return result(1, "", `No such container: ${id}`);
         remaining.delete(candidate.Name?.replace(/^\//, "") ?? "");
-        byId.delete(args[2]);
+        byId.delete(id);
         return result(0);
       }
       if (args[0] === "network" && args[1] === "inspect") {
@@ -165,8 +166,8 @@ test("rebuild removes only a shape-validated ingress forwarder by exact containe
   expect(plan.claimedContainerIds).toEqual([candidate.Id]);
   plan.remove();
 
-  expect(calls).toContainEqual(["rm", "-f", candidate.Id]);
-  expect(calls).not.toContainEqual(["rm", "-f", candidate.Name?.replace(/^\//, "")]);
+  expect(calls).toContainEqual(["container", "rm", "--force", candidate.Id]);
+  expect(calls).not.toContainEqual(["container", "rm", "--force", candidate.Name?.replace(/^\//, "")]);
 });
 
 test("rebuild refuses a label-spoofed ingress endpoint with different image bytes", () => {
@@ -187,7 +188,7 @@ test("rebuild refuses a label-spoofed ingress endpoint with different image byte
     SESSION_TEST_PROJECT.projectId,
   )).toThrow("does not use the resolved immutable ingress image");
   expect(calls.some((args) => args[0] === "image")).toBe(true);
-  expect(calls.some((args) => args[0] === "rm")).toBe(false);
+  expect(calls.some((args) => args[0] === "container" && args[1] === "rm")).toBe(false);
 });
 
 test("rebuild refuses a foreign endpoint visible only through the current managed network", () => {
@@ -214,7 +215,7 @@ test("rebuild refuses a foreign endpoint visible only through the current manage
     SESSION_TEST_PROJECT.projectId,
   )).toThrow(/does not carry this project's exact ingress-forwarder labels/u);
 
-  expect(calls.some((args) => args[0] === "rm")).toBe(false);
+  expect(calls.some((args) => args[0] === "container" && args[1] === "rm")).toBe(false);
   expect(calls.some((args) => args[0] === "network" && args[1] === "rm")).toBe(false);
 });
 
@@ -235,7 +236,7 @@ test("teardown refuses a labeled pinned-image candidate without one full contain
     io,
     SESSION_TEST_PROJECT.projectId,
   )).toThrow("must have one full Docker container ID");
-  expect(calls.some((args) => args[0] === "rm")).toBe(false);
+  expect(calls.some((args) => args[0] === "container" && args[1] === "rm")).toBe(false);
 });
 
 test("teardown removes a proven forwarder even when the managed bridge is gone", () => {
@@ -252,7 +253,7 @@ test("teardown removes a proven forwarder even when the managed bridge is gone",
   const plan = planValidatedIngressForwarders(context, io, SESSION_TEST_PROJECT.projectId);
   expect(plan.claimedContainerIds).toEqual([candidate.Id]);
   plan.remove();
-  expect(calls).toContainEqual(["rm", "-f", candidate.Id]);
+  expect(calls).toContainEqual(["container", "rm", "--force", candidate.Id]);
   expect(calls.some((args) => args[0] === "network" && args[1] === "rm")).toBe(false);
 });
 

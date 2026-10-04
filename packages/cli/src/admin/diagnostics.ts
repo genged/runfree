@@ -15,6 +15,7 @@ import { projectInfo, resolveAgentCommand } from "../config.ts";
 import { RUNFREE_RUNTIME_TARGETS } from "../runtime/mount-target-policy.ts";
 import { combinedServiceRegistry } from "../user-services.ts";
 import {
+  adminDockerClient,
   composeProject,
   currentAdminState,
   die,
@@ -22,7 +23,6 @@ import {
   type DoctorInput,
   loadPolicy,
   proxyContainerId,
-  runCapture,
 } from "./admin-core.ts";
 
 function parseTailOption(value: string | undefined): number {
@@ -38,7 +38,7 @@ function readRecentProxyLogs(tail: number): { ok: true; logs: string } | { ok: f
   const id = proxyContainerId(project);
   if (!id) return { ok: false, message: "no proxy container found; try 'runfree up' first" };
 
-  const logs = runCapture("docker", ["logs", "--tail", String(tail), id]);
+  const logs = adminDockerClient().logs(id, { tail });
   if (logs.status !== 0) {
     return { ok: false, message: logs.stderr.trim() || "failed to read proxy logs" };
   }
