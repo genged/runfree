@@ -39,17 +39,23 @@
 //      separate the proxy's revoke-driven socket cut from an ordinary client
 //      close; it proves only that no splice outlives its session.
 //   9. gateway change and reclaim (HS8): a rewritten `/etc/hosts` alias makes
-//      host services refuse with `gateway address changed`, and the firewall
-//      drain alone stops bytes on an already-open splice (a gateway change
-//      changes no policy, so the request proxy cuts nothing; the proxy log is
-//      checked for that). `runfree rebuild` re-pins and the echo works again.
+//      host services refuse with `gateway address changed`; the firewall
+//      drains the pinned pair, and the request proxy's gateway watch cuts the
+//      already-open splice (the client sees the close, the proxy logs
+//      `host-service splices cut` naming the withdrawn gateway). Past the
+//      drain window, when the established accept would pass the flow again,
+//      no established proxy socket to the old pair remains and the host saw
+//      no new bytes on it. `runfree rebuild` re-pins and the echo works again.
 //
 // Recorded proof gaps (not staged here, never faked):
 //
-//   - The firewall drain alone on `host-service remove`: the request proxy
-//     always cuts a removed pair's splices on reload and has no switch to
-//     disable that. Case 9 proves the same `@host_service_draining` drop alone,
-//     triggered by a gateway change instead of a removal.
+//   - The firewall drain alone, on `host-service remove` or on a gateway
+//     change: the request proxy cuts a removed pair's splices on reload and
+//     cuts every splice on a withdrawn or changed gateway, with no switch to
+//     disable either. No faithful stage exists in which only the
+//     `@host_service_draining` drop acts. Its rule order is covered by the
+//     ruleset proof and the supervisor unit tests, and case 7 proves the
+//     drop is armed (the pair enters the draining set).
 //   - A changed proxy `HostConfig.ExtraHosts` failing the topology proof with
 //     `proxy-extra-hosts-exact`: a running container's ExtraHosts cannot be
 //     changed without recreating it from a different Compose template. The
@@ -433,6 +439,30 @@ function proxyLogsSince(proxyId: string, sinceIso: string): string {
   return dockerOrThrow("proxy logs", ["logs", "--since", sinceIso, proxyId]);
 }
 
+/**
+ * Counts the proxy's ESTABLISHED TCP sockets to exactly `ip:port`, read by
+ * root from the proxy network namespace's `/proc/net/tcp` (state 01). A
+ * direct kernel read: an open splice's upstream leg is one such socket.
+ */
+const ESTABLISHED_FLOWS_PROGRAM = `
+const [ip, port] = process.argv.slice(1);
+const hex = (value, width) => value.toString(16).toUpperCase().padStart(width, "0");
+const remote = ip.split(".").reverse().map((octet) => hex(Number(octet), 2)).join("") + ":" + hex(Number(port), 4);
+const rows = require("node:fs").readFileSync("/proc/net/tcp", "utf8").split("\\n").slice(1).filter(Boolean);
+process.stdout.write(String(rows.map((row) => row.trim().split(/\\s+/)).filter((fields) => fields[2] === remote && fields[3] === "01").length) + "\\n");
+`;
+
+function establishedProxyFlows(proxyId: string, ip: string, port: number): number {
+  const text = dockerOrThrow("proxy established flows", ["exec", "--user", "0:0", proxyId, "node", "-e", ESTABLISHED_FLOWS_PROGRAM, ip, String(port)]);
+  const count = Number(text.trim());
+  if (!Number.isInteger(count)) throw new Error(`the established-flow probe printed ${describeOutput(text)}`);
+  return count;
+}
+
+function hostDataEvents(echo: EchoServer, id: number): number {
+  return echo.events().filter((event) => event.event === "data" && event.id === id).length;
+}
+
 // ---------------------------------------------------------------------------
 // The tranche.
 // ---------------------------------------------------------------------------
@@ -723,7 +753,7 @@ describe("approved host services", () => {
     });
   }, TEST_TIMEOUT_MS);
 
-  test("a changed gateway refuses with a named cause, the drain alone stops an open splice, and rebuild re-pins", async () => {
+  test("a changed gateway refuses with a named cause, the request proxy cuts an open splice, and rebuild re-pins", async () => {
     const before = await startSession();
     const client = openLongLivedClient(before.session.containerId, port);
     try {
@@ -731,6 +761,11 @@ describe("approved host services", () => {
       client.send(opened);
       await client.waitForLine(`echo ${opened}`, 20_000);
       const pinned = pinnedGateway(proxyId);
+      const hostId = hostConnectionCarrying(echo, opened);
+      expect(hostId, "the host never saw the long-lived connection").toBeDefined();
+      // Positive control for the flow probe below: the open splice's upstream
+      // leg is an established proxy socket to the pinned pair.
+      expect(establishedProxyFlows(proxyId, pinned, port), "the flow probe does not see the open splice").toBeGreaterThan(0);
 
       const since = new Date().toISOString();
       // Rewrite only the IPv4 alias line, in place (a bind-mounted file cannot
@@ -751,21 +786,40 @@ describe("approved host services", () => {
       }, { timeoutMs: MAINTENANCE_WAIT_MS, label: "the gateway status to report the changed address" });
       expect(status.gatewayIp, "a changed gateway is still offered to the request proxy").toBeUndefined();
       expect(status.unavailableReason, "the refusal does not name its reclaim").toContain("runfree rebuild");
-      await pollUntil(() => hostServiceSetMembers(proxyId, "host_service_draining").includes(`${pinned} . ${port}`), {
+      const drainingPair = `${pinned} . ${port}`;
+      await pollUntil(() => hostServiceSetMembers(proxyId, "host_service_draining").includes(drainingPair), {
         timeoutMs: MAINTENANCE_WAIT_MS,
         label: "the firewall to drain the pinned pair",
       });
+      const drainObservedAt = Date.now();
       expect(hostServiceSetMembers(proxyId, "host_service"), "the firewall still accepts the old pair").toEqual([]);
 
-      // The firewall drain alone: no policy changed, so the request proxy
-      // keeps the splice; bytes on it must still stop at the drop.
-      const stranded = nonce("after-change");
-      client.send(stranded);
-      await sleep(8_000);
-      expect(client.lines(), "bytes crossed a drained splice").not.toContain(`echo ${stranded}`);
-      expect(hostConnectionCarrying(echo, stranded), "the host received bytes on a drained splice").toBeUndefined();
-      expect(client.lines(), "the splice was closed, so the drop was not the only cut").not.toContain("closed");
-      expect(proxyLogsSince(proxyId, since), "the request proxy cut splices, so the drain was not alone").not.toContain("host-service splices cut");
+      // The request-proxy cut: a gateway change changes no policy, so this is
+      // the proxy's own gateway watch, not a reload's `cutRemoved`.
+      await client.waitForLine("closed", MAINTENANCE_WAIT_MS);
+      let logs = "";
+      await pollUntil(() => {
+        logs = proxyLogsSince(proxyId, since);
+        return logs.includes("host-service splices cut");
+      }, { timeoutMs: MAINTENANCE_WAIT_MS, label: "the request proxy to log the gateway cut" });
+      expect(logs, "the cut does not name the withdrawn gateway as its reason")
+        .toMatch(/proxy: host-service splices cut: [1-9][0-9]*; reason: the host-service gateway is unavailable: [^\n]*gateway address changed/u);
+      const hostDataAtCut = hostDataEvents(echo, hostId as number);
+
+      // Past the drain window the firewall flushes the draining set, and the
+      // established accept would pass a still-open flow again. The cut left
+      // none: no established proxy socket to the old pair, and no new bytes
+      // at the host on that connection.
+      await pollUntil(() => !hostServiceSetMembers(proxyId, "host_service_draining").includes(drainingPair), {
+        timeoutMs: DRAIN_WINDOW_MS + MAINTENANCE_WAIT_MS,
+        label: "the drain window to close",
+      });
+      const windowLeft = DRAIN_WINDOW_MS - (Date.now() - drainObservedAt);
+      if (windowLeft > 0) await sleep(windowLeft);
+      await sleep(5_000);
+      expect(hostServiceSetMembers(proxyId, "host_service"), "the sticky refusal re-admitted the old pair").toEqual([]);
+      expect(establishedProxyFlows(proxyId, pinned, port), "a cut splice's flow is still established after the drain window").toBe(0);
+      expect(hostDataEvents(echo, hostId as number), "bytes reached the host on the cut flow after the drain window").toBe(hostDataAtCut);
 
       // New connections refuse with the named cause.
       const response = sessionRawConnect(before.session.containerId, proxyIp, `${SERVICE_NAME}.runfree.internal:${port}`);

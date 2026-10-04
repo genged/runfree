@@ -18,7 +18,9 @@
 //   credential injection, and no payload inspection.
 // - Each splice is tied to its client socket, so session revoke and the
 //   IP-reuse fence (which destroy client sockets) cut it; `cutRemoved` cuts
-//   the splices of entries that left the effective policy.
+//   the splices of entries that left the effective policy, and
+//   `cutForGateway` cuts the splices whose pinned gateway was withdrawn or
+//   changed (Revocation, request-proxy consumer).
 
 import net from "node:net";
 import type { HostServicesJson } from "@runfree/runtime-contracts/host-services";
@@ -39,8 +41,12 @@ export type HostServiceTunnels = {
   admit(input: HostServiceAdmitInput): void;
   cutRemoved(next: Readonly<HostServicesJson>): number;
   cutAll(): number;
+  cutForGateway(gateway: HostServiceGatewayStatus | undefined): HostServiceGatewayCut;
   spliceCounts(): Record<string, number>;
 };
+
+// `reason` is present iff `count > 0`.
+export type HostServiceGatewayCut = { count: number; reason?: string };
 
 export type HostServiceTunnelOptions = {
   readGateway: () => HostServiceGatewayStatus | undefined;
@@ -57,6 +63,9 @@ type Splice = {
   name: string;
   port: number;
   sessionKey: string;
+  // The IP literal this splice was dialled to, from the gateway status that
+  // admitted it.
+  gatewayIp: string;
   client: net.Socket;
   upstream: net.Socket;
   pending: boolean;
@@ -114,6 +123,7 @@ export function createHostServiceTunnels(options: HostServiceTunnelOptions): Hos
       name: input.name,
       port: input.port,
       sessionKey: input.sessionKey,
+      gatewayIp: gateway.gatewayIp,
       client: clientSocket,
       upstream,
       pending: true,
@@ -194,6 +204,28 @@ export function createHostServiceTunnels(options: HostServiceTunnelOptions): Hos
         cut(splice);
       }
       return all.length;
+    },
+    // The policyGeneration the status names is deliberately ignored here. The
+    // supervisor republishes the file for every effective policy generation,
+    // so a short skew against the proxy's policy is normal; a reload's
+    // removals are cut by `cutRemoved`. Only a withdrawn gateway or a changed
+    // address cuts: either one means the dialled address is no longer the
+    // pinned, validated gateway.
+    cutForGateway(gateway) {
+      if (splices.size === 0) return { count: 0 };
+      const reason = gateway === undefined
+        ? "the host-service gateway status is missing or invalid"
+        : gateway.gatewayIp === undefined
+          ? `the host-service gateway is unavailable: ${gateway.unavailableReason ?? "unknown reason"}`
+          : "the pinned host-service gateway address changed";
+      let count = 0;
+      for (const splice of Array.from(splices)) {
+        if (gateway?.gatewayIp !== undefined && splice.gatewayIp === gateway.gatewayIp) continue;
+        count += 1;
+        untrack(splice);
+        cut(splice);
+      }
+      return count === 0 ? { count } : { count, reason };
     },
     spliceCounts() {
       const counts: Record<string, number> = {};

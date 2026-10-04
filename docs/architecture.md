@@ -1372,7 +1372,8 @@ firewall: uid 1001 to @host_service (<gateway> . <port>) on the egress interface
 Docker Desktop host gateway -> host 127.0.0.1:<port>
 ```
 
-- Every refusal happens before any dial, DNS lookup, or audit spool write.
+- Every policy refusal happens before any dial, DNS lookup, or audit spool
+  write. A failed or timed-out dial refuses before any 200.
   A reserved name on 443 or in audit mode never reaches the denied tunnel,
   audit, mockttp, or DNS. A refusal that names a valid service and port
   carries the remedy `runfree host-service add <name> --port <port>`, labelled
@@ -1395,8 +1396,8 @@ in the background before the readiness loop and never waits for it. It binds
 `RUNFREE_HOST_SERVICES`, a host-owned `name:port` list that the session
 template renders from the network policy of the same effective policy
 generation as the session's agent environment. The relay runs as the agent
-user with no added authority; a port it cannot bind (for example one below
-1024) is skipped with a warning. A missing relay binary, a crash, or a bind
+user with no added authority; a port it cannot bind (for example one another
+process in the session already holds) is skipped with a warning. A missing relay binary, a crash, or a bind
 failure never changes the entry's exit code or delays its final `exec`. The
 relay binds first, so a later agent process that wants the same port gets
 `EADDRINUSE`. It binds loopback only, and each session has its own network
@@ -1431,22 +1432,37 @@ type, link-count, and size checks as session files, and dials only that IPv4
 literal when the file names its current network policy generation. The
 gateway is also withheld while a host-service set write is failing.
 
-**Revocation.** Both consumers cut independently:
+**Revocation.** Both consumers cut independently, on a removal and on a
+gateway change or withdrawal:
 
-1. On a policy reload, the request proxy destroys every splice whose name and
-   port left the effective policy, before it publishes the status that names
-   the new effective policy generation.
-2. The firewall moves removed pairs from `@host_service` to
+1. The request proxy destroys both legs of a splice:
+   - on a policy reload, every splice whose name and port left the effective
+     policy, before it publishes the status that names the new effective
+     policy generation;
+   - on its policy watch tick (every second), when the gateway file changed
+     since its last read, every splice if the file is missing, invalid, or
+     carries `unavailableReason`, and every splice dialled to another address
+     than the file's `gatewayIp`. A file that names another effective policy
+     generation with the same address cuts nothing: the supervisor republishes
+     the file for every effective policy generation, so a short skew is
+     normal.
+
+   Each cut logs `proxy: host-service splices cut: <count>; reason: <reason>`
+   and republishes the request-proxy status.
+2. The firewall moves removed or re-addressed pairs from `@host_service` to
    `@host_service_draining` in one atomic batch. That set's drop rule sits
-   above the established-connection accept, so open flows stop at once. The
-   pairs leave the set after a 30 s drain window.
+   above the established-connection accept, so in-flight packets stop at
+   once. The pairs leave the set after a 30 s drain window; after that only
+   the request proxy's cut keeps an old flow from passing the established
+   accept again.
 
-Each consumer applies its cut before it publishes the status that names the
-new effective policy generation, so `runfree host-service remove` reports
-`live now` only after both have cut. The firewall status also carries a digest
-of both sets and the draining count; the request-proxy status records the open
-splices per service at each publish. A gateway change alters no policy, so
-only the firewall drain acts on splices that are already open; new CONNECTs
+On a removal, each consumer applies its cut before it publishes the status
+that names the new effective policy generation, so `runfree host-service
+remove` reports `live now` only after both have cut. The firewall status also
+carries a digest of both sets and the draining count; the request-proxy status
+records the open splices per service at each publish. On a gateway change or
+withdrawal, the request proxy cuts open splices within about a second, the
+firewall drain drops their in-flight packets for 30 s, and new CONNECTs
 refuse.
 
 **Port admission and the registry.** `runfree host-service add` checks the

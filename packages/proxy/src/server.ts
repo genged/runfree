@@ -733,7 +733,9 @@ function reloadPolicy(): void {
     // effective policy before the status names the new generation. New
     // CONNECTs already classify against `currentPolicy`.
     const cutSplices = hostServiceTunnels.cutRemoved(nextPolicy.hostServices);
-    if (cutSplices > 0) console.log(`proxy: host-service splices cut: ${cutSplices}`);
+    if (cutSplices > 0) {
+      console.log(`proxy: host-service splices cut: ${cutSplices}; reason: the approved name and port left the effective policy`);
+    }
     currentEffectiveControl = nextEffectiveControl;
     currentMcpOperationPolicy = nextMcpOperationPolicy;
     console.log(`proxy: policy reloaded, ${policySummary(currentPolicy)}, mcp_operation_generation=${currentMcpOperationPolicy?.generation ?? "unavailable"}`);
@@ -777,6 +779,30 @@ function sameWatchedFileRevision(left: WatchedFileRevision, right: WatchedFileRe
     && left.size === right.size;
 }
 
+// Revocation (SR3), request-proxy consumer, on a gateway change: the root
+// supervisor withdraws the gateway (sticky `unavailableReason`) when the
+// pinned address changes, turns invalid, or a set write fails, and its
+// firewall drain lasts only `hostServiceDrainSeconds`. After that the
+// established accept would pass an open splice's flow again, so this process
+// cuts on its own. On each watch tick it re-reads the gateway file with the
+// same defended reader `admit` uses, but only when the file's stat revision
+// changed: a splice admitted since the last read read the same file itself.
+// It cuts every splice when the file is missing, unreadable, invalid, or
+// carries `unavailableReason`, and every splice dialled to another address.
+// A `policyGeneration` that differs from this process's policy does not cut
+// (see `cutForGateway`).
+let hostServiceGatewayRevision: WatchedFileRevision | undefined;
+
+function reconcileHostServiceGateway(): void {
+  const revision = watchedFileRevision(HOST_SERVICE_GATEWAY_PATH);
+  if (hostServiceGatewayRevision !== undefined && sameWatchedFileRevision(revision, hostServiceGatewayRevision)) return;
+  hostServiceGatewayRevision = revision;
+  const cut = hostServiceTunnels.cutForGateway(readHostServiceGateway());
+  if (cut.count === 0) return;
+  console.log(`proxy: host-service splices cut: ${cut.count}; reason: ${cut.reason ?? "unknown"}`);
+  publishRequestProxyStatus();
+}
+
 const watchedPolicyPaths = [selectedPolicyPath, currentMcpPolicyPath].filter((value): value is string => value !== undefined);
 let watchedPolicyRevisions = watchedPolicyPaths.map(watchedFileRevision);
 let policyWatchNeedsInitialReconciliation = true;
@@ -791,6 +817,7 @@ const policyWatchTimer = setInterval(() => {
     policyWatchNeedsInitialReconciliation = false;
     reloadPolicy();
   }
+  reconcileHostServiceGateway();
 }, Number.isFinite(POLICY_WATCH_INTERVAL_MS) && POLICY_WATCH_INTERVAL_MS > 0 ? POLICY_WATCH_INTERVAL_MS : 1000);
 policyWatchTimer.unref();
 

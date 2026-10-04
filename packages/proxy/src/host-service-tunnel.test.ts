@@ -190,4 +190,66 @@ describe("host-service tunnels", () => {
     expect(kept.server.destroyed).toBe(true);
     expect(tunnels.spliceCounts()).toEqual({});
   });
+
+  // R16: the request proxy's own cut on a gateway withdrawal or address
+  // change. Each splice is judged against the address it was dialled to.
+  async function tunnelsDialledTo(addresses: string[]) {
+    let current: HostServiceGatewayStatus | undefined = gateway;
+    const tunnels = createHostServiceTunnels({
+      readGateway: () => current,
+      maxPerSession: 8,
+      maxGlobal: 8,
+      maxPendingDials: 8,
+      dialTimeoutMs: 60_000,
+      connect: neverConnecting(),
+    });
+    const pairs: Array<Awaited<ReturnType<typeof socketPair>>> = [];
+    for (const [index, address] of addresses.entries()) {
+      current = { ...gateway, gatewayIp: address };
+      const pair = await socketPair();
+      tunnels.admit(admitInput(pair.server, { name: `svc${index}`, port: 1000 + index }));
+      pairs.push(pair);
+    }
+    return { tunnels, pairs };
+  }
+
+  test.each([
+    ["a missing or invalid status", undefined, "missing or invalid"],
+    ["an unavailable status", {
+      schemaVersion: 1 as const,
+      policyGeneration: GENERATION,
+      unavailableReason: "gateway address changed",
+      writtenAt: gateway.writtenAt,
+    }, "unavailable: gateway address changed"],
+  ])("cutForGateway cuts every splice on %s", async (_label, status, reason) => {
+    const { tunnels, pairs } = await tunnelsDialledTo(["127.0.0.1", "127.0.0.2"]);
+    const result = tunnels.cutForGateway(status);
+    expect(result.count).toBe(2);
+    expect(result.reason).toContain(reason);
+    expect(pairs.every((pair) => pair.server.destroyed)).toBe(true);
+    expect(tunnels.spliceCounts()).toEqual({});
+  });
+
+  test("cutForGateway cuts only splices dialled to another address", async () => {
+    const { tunnels, pairs } = await tunnelsDialledTo(["127.0.0.1", "127.0.0.2"]);
+    const result = tunnels.cutForGateway({ ...gateway, gatewayIp: "127.0.0.2" });
+    expect(result.count).toBe(1);
+    expect(result.reason).toContain("address changed");
+    expect(pairs[0].server.destroyed).toBe(true);
+    expect(pairs[1].server.destroyed).toBe(false);
+    expect(tunnels.spliceCounts()).toEqual({ svc1: 1 });
+  });
+
+  test("cutForGateway keeps a splice on the same address under another policy generation", async () => {
+    const { tunnels, pairs } = await tunnelsDialledTo(["127.0.0.1"]);
+    const result = tunnels.cutForGateway({ ...gateway, policyGeneration: "sha256:next" });
+    expect(result).toEqual({ count: 0 });
+    expect(pairs[0].server.destroyed).toBe(false);
+    expect(tunnels.spliceCounts()).toEqual({ svc0: 1 });
+  });
+
+  test("cutForGateway with no splices cuts nothing", async () => {
+    const { tunnels } = await tunnelsDialledTo([]);
+    expect(tunnels.cutForGateway(undefined)).toEqual({ count: 0 });
+  });
 });

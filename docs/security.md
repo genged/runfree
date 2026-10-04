@@ -142,7 +142,10 @@ point to the mechanism.
    inside them. The firewall allows the pinned gateway and approved port
    pairs to the request proxy's uid 1001 only; root and the agent get no path
    to them. The gateway comes from the daemon's `extra_hosts` entry, never
-   from DNS, and never enters the DNS allow set.
+   from DNS, and never enters the DNS allow set. A removal, and a gateway
+   change or withdrawal, is cut by two independent consumers: the request
+   proxy destroys open splices immediately, and the firewall drain drops their
+   in-flight packets for 30 s.
 
 Order, hardening, and firewall rules:
 [Proxy Enforcement Details](architecture.md#proxy-enforcement-details).
@@ -433,7 +436,8 @@ Accepted, known risks:
 | An approved host service's own authentication and bugs are reachable from the agent | An approved `idb_companion` gives every session in the project full simulator control: install, launch, and file push and pull |
 | Host-service access is per project, not per session | Approval persists like an allowed host and applies to every session of the project |
 | Whatever holds an approved port on the host's loopback is reachable | If the approved service stops and another process takes the port, the agent reaches that process. The gateway reaches every host loopback listener, including root services, IDE servers, and other containers' published ports; the refused ports and the owner check at `add` cover only the known dangerous cases |
-| A publication that appears on an approved port mid-session is reachable until the next check | Another project's `forward` and `vnc` refuse registered ports, but a third-party publication on an approved port is only reported by the next launch or `runfree status` owner check |
+| A publication that appears on an approved port mid-session stays reachable; the next launch or `runfree status` only warns | Another project's `forward` and `vnc` refuse registered ports. A third-party publication on an approved port is reported by the next launch or `runfree status` owner check, which warns but neither refuses nor cuts |
+| A host gateway address change, or a withdrawn gateway, stops host services until `runfree rebuild` | Two independent cuts act at once: the request proxy destroys every open splice to the old or withdrawn address, and the firewall drain drops their in-flight packets for 30 s. New CONNECTs refuse with the named cause; `runfree rebuild` re-pins and drains every session |
 
 Approving a write, allowing a broad host, or adding a credential gives the
 agent real power upstream. Treat each one as a security decision.

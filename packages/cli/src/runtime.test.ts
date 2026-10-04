@@ -5780,7 +5780,11 @@ describe("runtime command flow", () => {
       Object.defineProperty(process, "platform", platformDescriptor);
     });
 
-    test("status reports a healthy host service and raises no warning", () => {
+    const PROXY_ID = "a".repeat(64);
+
+    // A darwin host with idb listening on 10882 and a running proxy whose
+    // gateway status read is answered by `gateway` (undefined: no proxy).
+    function hostServiceStatusFixture(gateway: (() => ReturnType<typeof captureResult>) | undefined) {
       const projectRoot = path.join(tmp, "project");
       const project = prepareProjectWithHostServices(projectRoot, { idb: { target: "host-loopback", port: 10882 } });
       const context = {
@@ -5791,19 +5795,71 @@ describe("runtime command flow", () => {
         network: fixedNetwork,
       } satisfies RuntimeContext;
       Object.defineProperty(process, "platform", { value: "darwin" });
+      const gatewayReads: string[][] = [];
       const io = createRuntimeIO({
         capture: (command, args) => {
           if (command === "docker" && args[0] === "info") return captureResult(0);
           if (command === "/usr/sbin/lsof") return captureResult(0, "p4242\ncidb_companion\n");
+          if (gateway && command === "docker" && args[0] === "ps" && args.includes("-q")
+            && args.includes("label=com.docker.compose.service=proxy")) {
+            return captureResult(0, `${PROXY_ID}\n`);
+          }
+          if (gateway && command === "docker" && args[0] === "exec" && args.includes(PROXY_ID)
+            && args.includes("/run/runfree-proxy-status/host-service-gateway.json")) {
+            gatewayReads.push(args);
+            return gateway();
+          }
           return captureResult(0);
         },
       });
+      return { context, io, gatewayReads };
+    }
+
+    function gatewayStatusJson(fields: Record<string, unknown>): string {
+      return `${JSON.stringify({ schemaVersion: 1, policyGeneration: `sha256:${"1".repeat(64)}`, writtenAt: "2026-10-04T00:00:00.000Z", ...fields })}\n`;
+    }
+
+    function statusOutput(): { out: string; err: string } {
+      flushWarnings();
+      return {
+        out: vi.mocked(console.log).mock.calls.map((call) => call.join(" ")).join("\n"),
+        err: vi.mocked(console.error).mock.calls.flat().join("\n"),
+      };
+    }
+
+    test("status reports a healthy host service and its pinned gateway, and raises no warning", () => {
+      const { context, io, gatewayReads } = hostServiceStatusFixture(() => captureResult(0, gatewayStatusJson({ gatewayIp: "192.168.65.254" })));
 
       expect(statusRuntime(context, io)).toBe(0);
-      const output = vi.mocked(console.log).mock.calls.map((call) => call.join(" ")).join("\n");
-      expect(output).toContain("host services: idb 127.0.0.1:10882 (idb_companion)");
-      flushWarnings();
-      expect(vi.mocked(console.error).mock.calls.flat().join("\n")).not.toContain("runfree warning:");
+      const { out, err } = statusOutput();
+      expect(out).toContain("host services: idb 127.0.0.1:10882 (idb_companion)");
+      expect(out).toContain("host-service gateway: 192.168.65.254");
+      expect(err).not.toContain("runfree warning:");
+      expect(gatewayReads).toHaveLength(1);
+    });
+
+    test("status shows an unavailable gateway with its reason and still succeeds", () => {
+      const { context, io } = hostServiceStatusFixture(() => captureResult(0, gatewayStatusJson({
+        unavailableReason: "gateway address changed from 192.168.65.254 to 192.168.65.2; run `runfree rebuild`",
+      })));
+
+      expect(statusRuntime(context, io)).toBe(0);
+      const { out } = statusOutput();
+      expect(out).toContain("host-service gateway: unavailable (gateway address changed from 192.168.65.254 to 192.168.65.2; run `runfree rebuild`)");
+    });
+
+    test.each([
+      ["the proxy is not running", undefined],
+      ["the read fails", () => captureResult(1, "", "cat: no such file")],
+      ["the file is malformed", () => captureResult(0, gatewayStatusJson({ gatewayIp: "192.168.65.254", extra: true }))],
+    ])("status prints an unknown gateway and a warning when %s, and still succeeds", (_label, gateway) => {
+      const { context, io } = hostServiceStatusFixture(gateway);
+
+      expect(statusRuntime(context, io)).toBe(0);
+      const { out, err } = statusOutput();
+      expect(out).toContain("host-service gateway: unknown");
+      expect(err).toContain("runfree warning:");
+      expect(err).toContain("host-service gateway");
     });
 
     test("an unavailable live-owner probe is a warning, never an error, and status still succeeds", () => {

@@ -426,6 +426,83 @@ describe("proxy server: host-service CONNECT splice", () => {
     await keep.stop();
   }, 20_000);
 
+  // R16: the request proxy cuts on its own when the pinned gateway is
+  // withdrawn or changes, with no policy reload. The harness watch tick is
+  // 50 ms; the waits allow a wide margin under load.
+  const GATEWAY_CUT_WAIT_MS = 5_000;
+
+  test.each([
+    ["the gateway turns unavailable", (generation: string) => ({
+      schemaVersion: 1,
+      policyGeneration: generation,
+      unavailableReason: "gateway address changed; run `runfree rebuild`",
+      writtenAt: new Date().toISOString(),
+    }), "the host-service gateway is unavailable: gateway address changed"],
+    ["the gateway address changes", (generation: string) => ({
+      ...availableGateway(generation),
+      gatewayIp: "127.0.0.2",
+    }), "the pinned host-service gateway address changed"],
+  ])("when %s an open splice is cut on both legs, then a valid file reclaims", async (_label, gatewayFor, reason) => {
+    const echo = await startEchoServer();
+    const policy = hostServicePolicy({ echo: echo.port });
+    const generation = policyGenerationOf(policy);
+    const { proxy, gateway } = await startHostServiceProxy({ policy });
+    const authority = `echo.runfree.internal:${echo.port}`;
+
+    const tunnel = await openConnectTunnel({ proxyPort: proxy.port, authority });
+    expect(tunnel.head.statusCode).toBe(200);
+    await waitUntil(() => echo.openSockets().length === 1, "splice dialled");
+    const upstreamLeg = echo.openSockets()[0];
+    let upstreamClosed = false;
+    upstreamLeg.once("close", () => {
+      upstreamClosed = true;
+    });
+
+    writeGateway(gateway, gatewayFor(generation));
+
+    await waitUntil(() => tunnel.socket.destroyed || tunnel.socket.readableEnded, "client leg closed", GATEWAY_CUT_WAIT_MS);
+    await waitUntil(() => upstreamClosed, "the echo server saw the close", GATEWAY_CUT_WAIT_MS);
+    await proxy.waitForOutput(`proxy: host-service splices cut: 1; reason: ${reason}`);
+    // The cut republishes the status; the splice is no longer counted.
+    const output = proxy.output();
+    const cutIndex = output.indexOf("proxy: host-service splices cut: 1");
+    await waitUntil(() => statusDebugLines(proxy.output()).some((line) => line.index > cutIndex), "status republished after the cut");
+    const after = statusDebugLines(proxy.output()).find((line) => line.index > cutIndex);
+    expect(after?.status.hostServiceSplices).toEqual({});
+
+    // Reclaim: the supervisor publishes a valid gateway again.
+    writeGateway(gateway, availableGateway(generation));
+    const recovered = await openConnectTunnel({ proxyPort: proxy.port, authority });
+    expect(recovered.head.statusCode).toBe(200);
+    recovered.socket.write("after-reclaim");
+    await readUntil(recovered.socket, "after-reclaim");
+    recovered.socket.destroy();
+    await echo.stop();
+  }, 20_000);
+
+  test("a gateway file for a new policy generation with the same address keeps an open splice", async () => {
+    const echo = await startEchoServer();
+    const policy = hostServicePolicy({ echo: echo.port });
+    const { proxy, gateway } = await startHostServiceProxy({ policy });
+
+    const tunnel = await openConnectTunnel({ proxyPort: proxy.port, authority: `echo.runfree.internal:${echo.port}` });
+    expect(tunnel.head.statusCode).toBe(200);
+    await waitUntil(() => echo.openSockets().length === 1, "splice dialled");
+
+    // The policy is unchanged; only the file's policyGeneration skews.
+    writeGateway(gateway, availableGateway(`sha256:${"8".repeat(64)}`));
+    // Many watch ticks.
+    await new Promise((resolve) => setTimeout(resolve, 750));
+
+    expect(tunnel.socket.destroyed).toBe(false);
+    tunnel.socket.write("still-open");
+    await readUntil(tunnel.socket, "still-open");
+    expect(echo.openSockets()).toHaveLength(1);
+    expect(proxy.output()).not.toContain("host-service splices cut");
+    tunnel.socket.destroy();
+    await echo.stop();
+  }, 20_000);
+
   test("revoking the session closes an open splice on both legs", async () => {
     const echo = await startEchoServer();
     const { proxy } = await startHostServiceProxy({ policy: hostServicePolicy({ echo: echo.port }) });

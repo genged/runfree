@@ -95,7 +95,7 @@ Created project files include:
 | `runfree resume --list` / `--json` | Inspect the current project's bounded recovery inventory offline without contacting Docker. |
 | `runfree resume --all` | Include interrupted work from every Runfree project; composes with `--list` or `--json`. |
 | `runfree resume --agent <agent>` | Include only one agent ID such as `claude` or `codex`; repeat the option to select a union. |
-| `runfree status` | List containers, desired/effective runtime component identities and upgrade action, audit state, and the proxy's session files with, for each, either `served until <aliveUntil>` or `on disk, not served (<reason>)`. With approved [host services](#host-services), it also lists each one with its current listener and warns about drift. |
+| `runfree status` | List containers, desired/effective runtime component identities and upgrade action, audit state, and the proxy's session files with, for each, either `served until <aliveUntil>` or `on disk, not served (<reason>)`. With approved [host services](#host-services), it also lists each one with its current listener and the host-service gateway state, and warns about drift. |
 | `runfree resources` | List Runfree Docker resources for this project. |
 | `runfree logs proxy` | Follow proxy logs. Use `--verbose` for sanitized allowed request metadata. |
 | `runfree runtime reload-policy [--force]` | Reload runtime policy and sync proxy-managed tokens. Refuses under the same conditions as `runfree stop` unless `--force` is given; a restarted proxy republishes session eligibility and the per-session heartbeats refill its session files. |
@@ -228,7 +228,10 @@ idb connect 127.0.0.1 10882
   the next session. `remove` cuts open connections at once in every session.
 - `list` prints the effective host services and who listens on each port now.
   `runfree status` repeats that check and warns when the listener is gone,
-  changed, or owned by Docker Desktop.
+  changed, or owned by Docker Desktop. It also prints the gateway state:
+  `host-service gateway: <ip>`, `host-service gateway: unavailable (<reason>)`,
+  or `host-service gateway: unknown` with a warning when the proxy's gateway
+  status cannot be read. These lines never change the exit code.
 - An approved port is recorded in a host-global registry. `runfree forward`
   and `runfree vnc` in any other project refuse it and name the owning
   project. If the registry is corrupt, they refuse until
@@ -237,8 +240,12 @@ idb connect 127.0.0.1 10882
   injection apply, and the host service's own authentication is the only
   check on what the agent does there. Access is per project. See
   [Residual Risks](security.md#residual-risks).
-- If the proxy reports `gateway address changed`, host services stay refused
-  until `runfree rebuild`, which recreates the proxy and ends every session.
+- If the host gateway address changes while the proxy runs, the proxy cuts
+  open host-service connections and new ones refuse. `runfree status` then
+  shows `host-service gateway: unavailable (... gateway address changed ...)`,
+  and `runfree logs proxy` shows the refusals and the cut. Host services stay
+  refused until `runfree rebuild`, which recreates the proxy and ends every
+  session.
 
 ## Credentials
 
