@@ -145,6 +145,15 @@ describe("compareCompiledAuthority", () => {
       .toBe(true);
     expect(compareCompiledAuthority(base, compiled({ hosts: ["git.example.com"] })).provenReduction).toBe(false);
   });
+
+  test("adding or re-porting a host service is widening; removing one is a reduction", () => {
+    const none = compiled({ hosts: [], tokens: {} });
+    const idb = compiled({ hosts: [], tokens: {}, hostServices: { idb: { target: "host-loopback", port: 10882 } } });
+    const moved = compiled({ hosts: [], tokens: {}, hostServices: { idb: { target: "host-loopback", port: 10883 } } });
+    expect(compareCompiledAuthority(none, idb)).toEqual({ provenReduction: false, reasons: ["idb: host service added"] });
+    expect(compareCompiledAuthority(idb, moved)).toEqual({ provenReduction: false, reasons: ["idb: host service changed"] });
+    expect(compareCompiledAuthority(idb, none).provenReduction).toBe(true);
+  });
 });
 
 describe("compareRuntimeIsolationAuthority", () => {

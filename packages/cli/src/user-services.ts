@@ -3,6 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+import { isReservedRunfreeHostname } from "@runfree/runtime-contracts/host-services";
 import {
   normalizeHostname,
   normalizePathPrefix,
@@ -145,6 +146,7 @@ function parseHost(value: unknown, owner: string): ServiceHost {
     throw new Error(`${owner}.host: ${error instanceof Error ? error.message : String(error)}`);
   }
   if (host !== value.host) throw new Error(`${owner}.host must be stored as exact normalized hostname ${host}`);
+  if (isReservedRunfreeHostname(host)) throw new Error(`${owner}.host ${host} uses the reserved runfree.internal suffix`);
   if (value.broad !== undefined && value.broad !== true) throw new Error(`${owner}.broad, when present, must be true`);
   const broad = value.broad === true;
   const explanation = value.explanation === undefined
@@ -176,6 +178,7 @@ function parseCredentialPolicy(value: unknown, owner: string): CredentialPolicyJ
     throw new Error(`${owner}.host: ${error instanceof Error ? error.message : String(error)}`);
   }
   if (host !== value.host) throw new Error(`${owner}.host must be stored as exact normalized hostname ${host}`);
+  if (isReservedRunfreeHostname(host)) throw new Error(`${owner}.host ${host} uses the reserved runfree.internal suffix`);
   const header = safeDisplayText(value.header, `${owner}.header`, 120);
   if (typeof value.scheme !== "string" || (value.scheme !== "bearer" && value.scheme !== "raw")) {
     throw new Error(`${owner}.scheme must be bearer or raw`);

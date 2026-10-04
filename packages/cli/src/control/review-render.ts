@@ -48,6 +48,7 @@ export function describeCompiledPolicyChanges(
   for (const host of before.policy.hosts.filter((host) => !afterHosts.has(host))) changes.push(`host ${host}: removed`);
   changes.push(...describeRecordChanges("request", before.policy.requests ?? {}, after.policy.requests ?? {}));
   changes.push(...describeRecordChanges("credential", before.policy.tokens ?? {}, after.policy.tokens ?? {}));
+  changes.push(...describeRecordChanges("host service", before.policy.hostServices ?? {}, after.policy.hostServices ?? {}));
   changes.push(...describeRecordChanges("OAuth", before.oauth, after.oauth));
   changes.push(...describeRecordChanges("service", before.selectedServices, after.selectedServices));
   changes.push(...describeRecordChanges(

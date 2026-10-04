@@ -15,7 +15,7 @@ import {
 } from "../runtime/session-container.test-harness.ts";
 import { writeSessionContainerRecordV2 } from "../runtime/session-containers.ts";
 import type { RuntimeContext, RuntimeIO } from "../runtime/types.ts";
-import { readControlApprovalSelection } from "./approvals.ts";
+import { readApprovedNetworkPolicy, readControlApprovalSelection } from "./approvals.ts";
 import {
   approveAutomaticNetworkReduction,
   approveNetworkControl,
@@ -162,6 +162,41 @@ describe("quiesced control workflow", () => {
     expect(readControlApprovalSelection(root, context.project)?.subjects["network-project"]?.digest).toBe(selectedBefore);
   });
 
+  test("an agent-added host service is widening, not an automatic reduction (SR1)", async () => {
+    const first = await captureQuiescedDesiredPolicyCandidate(context, io());
+    await approveNetworkControl(context, io(), "network-project", {
+      expectedDigest: first.projectSubject.digest,
+      mechanism: "interactive",
+    });
+    await approveNetworkControl(context, io(), "network-local", {
+      expectedDigest: first.localSubject.digest,
+      mechanism: "interactive",
+    });
+
+    // As the agent would: added to the project-tracked policy file.
+    fs.writeFileSync(path.join(root, ".runfree", "network-policy.json"), JSON.stringify({
+      version: 2,
+      hosts: ["example.com"],
+      hostServices: { idb: { target: "host-loopback", port: 10882 } },
+    }));
+    const selectedBefore = readControlApprovalSelection(root, context.project)?.subjects["network-project"]?.digest;
+    await expect(approveAutomaticNetworkReduction(context, io(), "network-project")).rejects.toThrow("not a proven authority reduction");
+    expect(readControlApprovalSelection(root, context.project)?.subjects["network-project"]?.digest).toBe(selectedBefore);
+    expect(readApprovedNetworkPolicy(root, context.project, "network-project")?.hostServices).toBeUndefined();
+
+    // Reset, then try the same widening through the checkout-local layer.
+    fs.writeFileSync(path.join(root, ".runfree", "network-policy.json"), `{"version":2,"hosts":["example.com"]}`);
+    fs.writeFileSync(path.join(root, ".runfree", "network-policy.local.json"), JSON.stringify({
+      version: 2,
+      hosts: [],
+      hostServices: { idb: { target: "host-loopback", port: 10882 } },
+    }));
+    const selectedLocalBefore = readControlApprovalSelection(root, context.project)?.subjects["network-local"]?.digest;
+    await expect(approveAutomaticNetworkReduction(context, io(), "network-local")).rejects.toThrow("not a proven authority reduction");
+    expect(readControlApprovalSelection(root, context.project)?.subjects["network-local"]?.digest).toBe(selectedLocalBefore);
+    expect(readApprovedNetworkPolicy(root, context.project, "network-local")?.hostServices).toBeUndefined();
+  });
+
   test("refuses first startup non-interactively before selecting effective authority", async () => {
     const nonInteractive = io();
     nonInteractive.isInteractive = () => false;
@@ -289,6 +324,25 @@ describe("quiesced control workflow", () => {
     expect(reduced.generation.controlGeneration).not.toBe(first.generation.controlGeneration);
     expect(readControlApprovalSelection(root, context.project)?.subjects["network-project"]?.mechanism)
       .toBe("automatic-reduction");
+  });
+
+  test("does not auto-approve an agent-added host service at startup (SR1)", async () => {
+    const interactive = io();
+    interactive.isInteractive = () => true;
+    interactive.confirm = () => true;
+    const first = await prepareEffectiveControlsForStartup(context, interactive);
+    fs.writeFileSync(path.join(root, ".runfree", "network-policy.json"), JSON.stringify({
+      version: 2,
+      hosts: ["example.com"],
+      hostServices: { idb: { target: "host-loopback", port: 10882 } },
+    }));
+
+    const nonInteractive = io();
+    nonInteractive.isInteractive = () => false;
+    await expect(prepareEffectiveControlsForStartup(context, nonInteractive)).rejects.toThrow(
+      "desired controls require exact approval before startup",
+    );
+    expect(readActiveControlSelection(context.project)?.controlGeneration).toBe(first.generation.controlGeneration);
   });
 
   test("recovers approved controls without reading invalid desired or corrupt active state", async () => {

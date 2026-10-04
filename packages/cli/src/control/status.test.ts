@@ -202,6 +202,25 @@ describe("control status", () => {
     expect(expansion.diffs[0].changes).toContain("host new.example.com: added");
   });
 
+  test("a pending added host service requires approval and renders in the review (SR1)", async () => {
+    const candidate = captureDesiredPolicyCandidate(root, context.project.paths.controlCandidatesDir);
+    approveNetworkCandidate(root, context.project, candidate, "network-project", "interactive");
+    approveNetworkCandidate(root, context.project, candidate, "network-local", "interactive");
+
+    fs.writeFileSync(path.join(root, ".runfree", "network-policy.json"), JSON.stringify({
+      version: 2,
+      hosts: ["example.com"],
+      hostServices: { idb: { target: "host-loopback", port: 10882 } },
+    }));
+    const pending = await inspectNetworkPolicyReview(context, io, "project");
+    expect(pending.diffs[0]).toMatchObject({
+      scope: "project",
+      classification: "approval-required",
+      reasons: ["idb: host service added"],
+    });
+    expect(pending.diffs[0].changes.some((change) => change.startsWith("host service idb: "))).toBe(true);
+  });
+
   function approveEverythingThenMismatch(): string {
     const candidate = captureDesiredPolicyCandidate(root, context.project.paths.controlCandidatesDir);
     approveNetworkCandidate(root, context.project, candidate, "network-project", "interactive");

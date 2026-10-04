@@ -119,6 +119,21 @@ function compareCredentialAuthority(previous: PolicyJson, next: PolicyJson, reas
   }
 }
 
+// SR1: an agent-added or re-pointed host service is widening. Only a removed
+// entry is a reduction; added entries and port/target changes are not
+// comparable because they grant a new (or different) host-loopback dial.
+function compareHostServiceAuthority(previous: PolicyJson, next: PolicyJson, reasons: string[]): void {
+  const previousServices = previous.hostServices ?? {};
+  for (const [name, service] of Object.entries(next.hostServices ?? {})) {
+    const previousService = previousServices[name];
+    if (previousService === undefined) {
+      reasons.push(`${name}: host service added`);
+    } else if (stableJson(previousService) !== stableJson(service)) {
+      reasons.push(`${name}: host service changed`);
+    }
+  }
+}
+
 function compareOAuthAndAgentEnvironment(
   previous: CompiledDesiredPolicy,
   next: CompiledDesiredPolicy,
@@ -151,6 +166,7 @@ export function compareCompiledAuthority(
     reasons.push("default write action weakened");
   }
   compareCredentialAuthority(previous, next, reasons);
+  compareHostServiceAuthority(previous, next, reasons);
   compareOAuthAndAgentEnvironment(previousInput, nextInput, reasons);
   return { provenReduction: reasons.length === 0, reasons: Array.from(new Set(reasons)).sort() };
 }

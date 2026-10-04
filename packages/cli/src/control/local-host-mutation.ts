@@ -3,6 +3,7 @@ import {
   validateDesiredNetworkPolicy,
   type DesiredNetworkPolicyJson,
 } from "@runfree/runtime-contracts/desired-network-policy";
+import { isReservedRunfreeHostname } from "@runfree/runtime-contracts/host-services";
 import {
   HTTP_METHODS,
   isHttpMethod,
@@ -90,11 +91,16 @@ function requestRule(input: RequestRuleInput, write?: WriteAction): RequestPolic
 }
 
 function normalizeMutationHost(host: string): string {
+  let normalized: string;
   try {
-    return normalizeHostname(host);
+    normalized = normalizeHostname(host);
   } catch (error) {
     throw new CliError(error instanceof Error ? error.message : String(error));
   }
+  if (isReservedRunfreeHostname(normalized)) {
+    throw new CliError(`${normalized} uses the reserved runfree.internal suffix`);
+  }
+  return normalized;
 }
 
 function pairFor(

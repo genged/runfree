@@ -3,6 +3,7 @@ import {
   validateDesiredNetworkPolicy,
   type DesiredNetworkPolicyJson,
 } from "@runfree/runtime-contracts/desired-network-policy";
+import { isReservedRunfreeHostname } from "@runfree/runtime-contracts/host-services";
 import {
   CREDENTIAL_SCHEMES,
   isTokenName,
@@ -37,6 +38,12 @@ function credentialIdentity(credential: CredentialPolicyJson): string {
   return `${credential.host}\0${credential.header.toLowerCase()}`;
 }
 
+function assertNotReservedHost(host: string): void {
+  if (isReservedRunfreeHostname(host)) {
+    throw new CliError(`${host} uses the reserved runfree.internal suffix`);
+  }
+}
+
 function normalizeName(name: string): string {
   if (!isTokenName(name)) throw new CliError(`invalid credential name: ${name}`);
   if (name.startsWith("user-")) {
@@ -48,6 +55,7 @@ function normalizeName(name: string): string {
 export function desiredCredentialFromFields(fields: CredentialFieldsInput): CredentialPolicyJson {
   if (!fields.host) throw new CliError("credential commands require --host <host>");
   const host = normalizeHostname(fields.host);
+  assertNotReservedHost(host);
   const header = fields.header ?? "Authorization";
   if (header.trim() === "") throw new CliError("--header must be non-empty");
   const scheme = fields.scheme ?? "bearer";
@@ -123,6 +131,7 @@ export function reconcileDesiredCredential(
       existing.credentials.push(mutation.credential);
     } else if (mutation.kind === "unlink") {
       const host = normalizeHostname(mutation.host);
+      assertNotReservedHost(host);
       const header = mutation.header ?? "Authorization";
       if (header.trim() === "") throw new CliError("--header must be non-empty");
       const index = existing.credentials.findIndex((entry) =>

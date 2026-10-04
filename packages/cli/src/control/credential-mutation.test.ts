@@ -127,4 +127,27 @@ describe("desired credential mutations", () => {
 
     expect(fs.readFileSync(context.project.paths.policyPath, "utf8")).toBe(before);
   });
+
+  test("refuses a credential destination using the reserved runfree.internal suffix (SR4/A1)", () => {
+    expect(() => desiredCredentialFromFields({ host: "x.runfree.internal" }))
+      .toThrow("reserved runfree.internal suffix");
+  });
+
+  test("refuses to unlink a reserved runfree.internal host before the project file changes (SR4/A1)", async () => {
+    await allow("api.example.com");
+    await mutateDesiredCredential(context, io, {
+      kind: "add",
+      name: "example",
+      credential: desiredCredentialFromFields({ host: "api.example.com" }),
+    });
+    const before = fs.readFileSync(context.project.paths.policyPath, "utf8");
+
+    await expect(mutateDesiredCredential(context, io, {
+      kind: "unlink",
+      name: "example",
+      host: "x.runfree.internal",
+    })).rejects.toThrow("reserved runfree.internal suffix");
+
+    expect(fs.readFileSync(context.project.paths.policyPath, "utf8")).toBe(before);
+  });
 });
