@@ -44,6 +44,13 @@ export type FirewallPlan = {
     hostServiceSetName: "host_service";
     hostServiceDrainingSetName: "host_service_draining";
     hostServiceMaxElements: number;
+    // Every gateway address the supervisor pinned during its lifetime (R19).
+    // A flow to one of these addresses on a pair not currently in
+    // @host_service is dropped above the established accept, with no time
+    // limit, so a removed or re-addressed pair stays cut even when the
+    // request proxy did not cut its splice.
+    hostServiceGatewaySetName: "host_service_gateways";
+    hostServiceGatewayMaxElements: number;
   };
   // Seconds a removed host-service pair stays in the drain-drop set.
   hostServiceDrainSeconds: number;
@@ -88,7 +95,8 @@ export function validateFirewallPlan(plan: FirewallPlan): void {
     throw new Error("invalid nftables audit set name");
   }
   if (!NFT_NAME_RE.test(plan.nftables.hostServiceSetName)
-    || !NFT_NAME_RE.test(plan.nftables.hostServiceDrainingSetName)) {
+    || !NFT_NAME_RE.test(plan.nftables.hostServiceDrainingSetName)
+    || !NFT_NAME_RE.test(plan.nftables.hostServiceGatewaySetName)) {
     throw new Error("invalid nftables host-service set name");
   }
   const setNames = new Set([
@@ -98,8 +106,9 @@ export function validateFirewallPlan(plan: FirewallPlan): void {
     plan.nftables.auditDrainingSetName,
     plan.nftables.hostServiceSetName,
     plan.nftables.hostServiceDrainingSetName,
+    plan.nftables.hostServiceGatewaySetName,
   ]);
-  if (setNames.size !== 6) {
+  if (setNames.size !== 7) {
     throw new Error("nftables set names must be distinct");
   }
   if (!/^sha256:[a-f0-9]{64}$/.test(plan.policyGeneration)) {
@@ -119,6 +128,9 @@ export function validateFirewallPlan(plan: FirewallPlan): void {
   }
   if (!Number.isInteger(plan.nftables.hostServiceMaxElements) || plan.nftables.hostServiceMaxElements < 1) {
     throw new Error(`invalid nftables host-service set max elements: ${plan.nftables.hostServiceMaxElements}`);
+  }
+  if (!Number.isInteger(plan.nftables.hostServiceGatewayMaxElements) || plan.nftables.hostServiceGatewayMaxElements < 1) {
+    throw new Error(`invalid nftables host-service gateway set max elements: ${plan.nftables.hostServiceGatewayMaxElements}`);
   }
   if (!Number.isInteger(plan.hostServiceDrainSeconds) || plan.hostServiceDrainSeconds < 1) {
     throw new Error(`invalid host-service drain seconds: ${plan.hostServiceDrainSeconds}`);
@@ -156,6 +168,11 @@ export function renderRuleset(plan: FirewallPlan): string {
   // host_service_draining drop sits above the established accept so a removed
   // or re-addressed pair is cut even mid-flow, and the host_service accept is
   // uid 1001 only on the egress interface, so root gets nothing from it.
+  // The host_service_gateways drop (R19) also sits above the established
+  // accept: any flow to a gateway the supervisor ever pinned, on a pair not
+  // currently in @host_service, is dropped for as long as the pair is not
+  // approved. The draining set stays as defence in depth with its bounded
+  // window; this rule is the permanent cut.
   return [
     `table inet ${nftables.tableName} {`,
     `  set ${nftables.setName} {`,
@@ -182,6 +199,10 @@ export function renderRuleset(plan: FirewallPlan): string {
     "    type ipv4_addr . inet_service",
     `    size ${nftables.hostServiceMaxElements}`,
     "  }",
+    `  set ${nftables.hostServiceGatewaySetName} {`,
+    "    type ipv4_addr",
+    `    size ${nftables.hostServiceGatewayMaxElements}`,
+    "  }",
     "  chain input {",
     "    type filter hook input priority filter; policy drop;",
     "    iifname \"lo\" accept",
@@ -200,6 +221,7 @@ export function renderRuleset(plan: FirewallPlan): string {
     `    oifname "${internal.iface}" ip daddr @${nftables.sessionSetName} ct state established,related accept`,
     `    oifname "${egress.iface}" ip daddr @${nftables.auditDrainingSetName} drop`,
     `    oifname "${egress.iface}" ip daddr . tcp dport @${nftables.hostServiceDrainingSetName} drop`,
+    `    oifname "${egress.iface}" ip daddr @${nftables.hostServiceGatewaySetName} ip daddr . tcp dport != @${nftables.hostServiceSetName} drop`,
     `    oifname "${egress.iface}" meta nfproto ipv4 ct state established,related accept`,
     `    oifname "${egress.iface}" ip daddr @${nftables.setName} tcp dport 443 accept`,
     `    oifname "${egress.iface}" ip daddr @${nftables.auditSetName} tcp dport 443 accept`,
@@ -328,10 +350,41 @@ function fillSetLines(tableName: string, setName: string, elements: readonly str
   ];
 }
 
-export function renderHostServiceSetUpdate(entries: readonly HostServiceElement[], plan: FirewallPlan): string {
+// The gateway set lines lead every host-service batch, and every accepted
+// pair's address must be one of those gateways, so no pair is ever accepted
+// in a batch that does not also install its permanent cut (R19).
+function gatewayElements(
+  gateways: readonly string[],
+  accepted: readonly HostServiceElement[],
+  plan: FirewallPlan,
+): string[] {
+  const unique = Array.from(new Set(gateways)).sort(compareIpv4);
+  for (const gateway of unique) assertIpv4(gateway, "host-service gateway IPv4");
+  if (unique.length > plan.nftables.hostServiceGatewayMaxElements) {
+    throw new Error(`nftables host-service gateway set update has ${unique.length} elements but max is ${plan.nftables.hostServiceGatewayMaxElements}`);
+  }
+  const known = new Set(unique);
+  for (const entry of accepted) {
+    if (!known.has(entry.ip)) {
+      throw new Error(`host-service pair ${entry.ip} . ${entry.port} is not at a recorded gateway; refusing to accept it without its permanent cut`);
+    }
+  }
+  return unique;
+}
+
+export function renderHostServiceSetUpdate(
+  entries: readonly HostServiceElement[],
+  plan: FirewallPlan,
+  gateways: readonly string[],
+): string {
   validateFirewallPlan(plan);
   const elements = hostServiceElements(entries, plan, "host-service");
-  return [...fillSetLines(plan.nftables.tableName, plan.nftables.hostServiceSetName, elements), ""].join("\n");
+  const gatewayList = gatewayElements(gateways, entries, plan);
+  return [
+    ...fillSetLines(plan.nftables.tableName, plan.nftables.hostServiceGatewaySetName, gatewayList),
+    ...fillSetLines(plan.nftables.tableName, plan.nftables.hostServiceSetName, elements),
+    "",
+  ].join("\n");
 }
 
 // One atomic `nft -f -` batch: fill the draining set first (its drop rule
@@ -341,12 +394,15 @@ export function renderHostServiceTeardown(
   draining: readonly HostServiceElement[],
   remaining: readonly HostServiceElement[],
   plan: FirewallPlan,
+  gateways: readonly string[],
 ): string {
   validateFirewallPlan(plan);
   const drainingElements = hostServiceElements(draining, plan, "host-service draining");
   const remainingElements = hostServiceElements(remaining, plan, "host-service");
-  const { tableName, hostServiceSetName, hostServiceDrainingSetName } = plan.nftables;
+  const gatewayList = gatewayElements(gateways, remaining, plan);
+  const { tableName, hostServiceSetName, hostServiceDrainingSetName, hostServiceGatewaySetName } = plan.nftables;
   return [
+    ...fillSetLines(tableName, hostServiceGatewaySetName, gatewayList),
     ...fillSetLines(tableName, hostServiceDrainingSetName, drainingElements),
     ...fillSetLines(tableName, hostServiceSetName, remainingElements),
     "",
@@ -448,8 +504,9 @@ export async function replaceHostServiceSet(
   entries: readonly HostServiceElement[],
   runner: CommandRunner,
   plan: FirewallPlan,
+  gateways: readonly string[],
 ): Promise<void> {
-  await runner.run("nft", ["-f", "-"], { input: renderHostServiceSetUpdate(entries, plan) });
+  await runner.run("nft", ["-f", "-"], { input: renderHostServiceSetUpdate(entries, plan, gateways) });
 }
 
 export async function applyHostServiceTeardown(
@@ -457,8 +514,9 @@ export async function applyHostServiceTeardown(
   remaining: readonly HostServiceElement[],
   runner: CommandRunner,
   plan: FirewallPlan,
+  gateways: readonly string[],
 ): Promise<void> {
-  await runner.run("nft", ["-f", "-"], { input: renderHostServiceTeardown(draining, remaining, plan) });
+  await runner.run("nft", ["-f", "-"], { input: renderHostServiceTeardown(draining, remaining, plan, gateways) });
 }
 
 export async function flushHostServiceDraining(runner: CommandRunner, plan: FirewallPlan): Promise<void> {

@@ -26,6 +26,8 @@ const PROJECT_A_ROOT = "/workspace/project-a";
 const PROJECT_B_ROOT = "/workspace/project-b";
 const PROJECT_A_ID = projectHash(PROJECT_A_ROOT);
 const PROJECT_B_ID = projectHash(PROJECT_B_ROOT);
+const PROJECT_C_ROOT = "/workspace/project-c";
+const PROJECT_C_ID = projectHash(PROJECT_C_ROOT);
 
 let stateHome: string;
 let env: NodeJS.ProcessEnv;
@@ -81,8 +83,8 @@ describe("recordProjectHostServicePorts / readHostServicePortRegistry", () => {
     const read = readHostServicePortRegistry(env);
     expect(read.ok).toBe(true);
     if (!read.ok) throw new Error("unreachable");
-    expect(read.owners.get(10882)).toEqual({ projectId: PROJECT_A_ID, projectRoot: PROJECT_A_ROOT, command: "idb_companion" });
-    expect(read.owners.get(10883)).toEqual({ projectId: PROJECT_A_ID, projectRoot: PROJECT_A_ROOT });
+    expect(read.owners.get(10882)).toEqual([{ projectId: PROJECT_A_ID, projectRoot: PROJECT_A_ROOT, command: "idb_companion" }]);
+    expect(read.owners.get(10883)).toEqual([{ projectId: PROJECT_A_ID, projectRoot: PROJECT_A_ROOT }]);
     expect(read.owners.get(10884)).toBeUndefined();
   });
 
@@ -96,7 +98,7 @@ describe("recordProjectHostServicePorts / readHostServicePortRegistry", () => {
     expect(read.ok).toBe(true);
     if (!read.ok) throw new Error("unreachable");
     expect(read.owners.get(10882)).toBeUndefined();
-    expect(read.owners.get(10883)?.projectId).toBe(PROJECT_B_ID);
+    expect(read.owners.get(10883)?.[0]?.projectId).toBe(PROJECT_B_ID);
   });
 
   test("a symlinked registry file is refused rather than followed for a write", async () => {
@@ -123,6 +125,67 @@ describe("recordProjectHostServicePorts / readHostServicePortRegistry", () => {
   });
 });
 
+describe("several projects owning one port (R18)", () => {
+  test("two projects record 10882 and every read stays ok, listing both owners", async () => {
+    await recordProjectHostServicePorts(env, { id: PROJECT_A_ID, root: PROJECT_A_ROOT }, [10882], { 10882: "idb_companion" });
+    await recordProjectHostServicePorts(env, { id: PROJECT_B_ID, root: PROJECT_B_ROOT }, [10882, 10883]);
+
+    const read = readHostServicePortRegistry(env);
+    expect(read.ok).toBe(true);
+    if (!read.ok) throw new Error("unreachable");
+    expect(read.owners.get(10882)?.map((owner) => owner.projectId).sort()).toEqual([PROJECT_A_ID, PROJECT_B_ID].sort());
+    expect(recordedHostServiceOwners(env, PROJECT_A_ID)).toEqual(new Map([[10882, "idb_companion"]]));
+    expect(recordedHostServiceOwners(env, PROJECT_B_ID)).toEqual(new Map());
+    expect(projectHasRegisteredHostServicePorts(env, PROJECT_B_ID)).toBe(true);
+    // A third write still reads and rewrites the shared state.
+    await recordProjectHostServicePorts(env, { id: PROJECT_A_ID, root: PROJECT_A_ROOT }, [10882, 10884]);
+    expect(readHostServicePortRegistry(env).ok).toBe(true);
+  });
+
+  test("a third project is refused on the shared port naming both owners, admitted on an unrelated port", async () => {
+    await recordProjectHostServicePorts(env, { id: PROJECT_A_ID, root: PROJECT_A_ROOT }, [10882]);
+    await recordProjectHostServicePorts(env, { id: PROJECT_B_ID, root: PROJECT_B_ROOT }, [10882]);
+
+    const refusal = registeredHostServicePortRefusal(env, 10882, PROJECT_C_ID);
+    expect(refusal).toContain(PROJECT_A_ROOT);
+    expect(refusal).toContain(PROJECT_B_ROOT);
+    expect(registeredHostServicePortRefusal(env, 19999, PROJECT_C_ID)).toBeUndefined();
+  });
+
+  test("an owner is still refused when another project also owns the port", async () => {
+    await recordProjectHostServicePorts(env, { id: PROJECT_A_ID, root: PROJECT_A_ROOT }, [10882]);
+    await recordProjectHostServicePorts(env, { id: PROJECT_B_ID, root: PROJECT_B_ROOT }, [10882]);
+
+    const refusal = registeredHostServicePortRefusal(env, 10882, PROJECT_A_ID);
+    expect(refusal).toContain(PROJECT_B_ROOT);
+    expect(refusal).not.toContain(PROJECT_A_ROOT);
+  });
+
+  test("a duplicate port inside one project's row is still refused on read", () => {
+    fs.mkdirSync(stateRoot(), { recursive: true });
+    fs.writeFileSync(registryFile(), `${JSON.stringify({
+      schemaVersion: 1,
+      projects: { [PROJECT_A_ID]: { projectRoot: PROJECT_A_ROOT, ports: [10882, 10882], updatedAt: new Date().toISOString() } },
+    })}\n`);
+    const read = readHostServicePortRegistry(env);
+    expect(read.ok).toBe(false);
+    if (read.ok) throw new Error("unreachable");
+    expect(read.reason).toMatch(/duplicate ports/);
+  });
+
+  test("repair over two projects approving the same port succeeds and reads back both", async () => {
+    writeProjectPointer(PROJECT_A_ID, PROJECT_A_ROOT);
+    writeProjectPointer(PROJECT_B_ID, PROJECT_B_ROOT);
+
+    const result = await repairHostServicePortRegistry(env, () => [10882]);
+    expect(result).toEqual({ projects: 2, ports: 2 });
+    const read = readHostServicePortRegistry(env);
+    expect(read.ok).toBe(true);
+    if (!read.ok) throw new Error("unreachable");
+    expect(read.owners.get(10882)).toHaveLength(2);
+  });
+});
+
 describe("repairHostServicePortRegistry", () => {
   test("rebuilds the registry from each known project's own answer, recovering from corruption", async () => {
     writeProjectPointer(PROJECT_A_ID, PROJECT_A_ROOT);
@@ -136,7 +199,7 @@ describe("repairHostServicePortRegistry", () => {
     const read = readHostServicePortRegistry(env);
     expect(read.ok).toBe(true);
     if (!read.ok) throw new Error("unreachable");
-    expect(read.owners.get(10882)?.projectId).toBe(PROJECT_A_ID);
+    expect(read.owners.get(10882)?.[0]?.projectId).toBe(PROJECT_A_ID);
     expect(read.owners.size).toBe(1);
   });
 
@@ -157,7 +220,7 @@ describe("repairHostServicePortRegistry", () => {
     const read = readHostServicePortRegistry(env);
     expect(read.ok).toBe(true);
     if (!read.ok) throw new Error("unreachable");
-    expect(read.owners.get(10882)?.projectId).toBe(PROJECT_A_ID);
+    expect(read.owners.get(10882)?.[0]?.projectId).toBe(PROJECT_A_ID);
     expect(read.owners.get(10883)).toBeUndefined();
   });
 
@@ -176,7 +239,7 @@ describe("repairHostServicePortRegistry", () => {
     const read = readHostServicePortRegistry(env);
     expect(read.ok).toBe(true);
     if (!read.ok) throw new Error("unreachable");
-    expect(read.owners.get(10883)?.projectId).toBe(PROJECT_B_ID);
+    expect(read.owners.get(10883)?.[0]?.projectId).toBe(PROJECT_B_ID);
     expect(read.owners.get(10882)).toBeUndefined();
   });
 });
@@ -192,7 +255,7 @@ describe("removeProjectHostServicePorts", () => {
     expect(read.ok).toBe(true);
     if (!read.ok) throw new Error("unreachable");
     expect(read.owners.get(10882)).toBeUndefined();
-    expect(read.owners.get(10883)?.projectId).toBe(PROJECT_B_ID);
+    expect(read.owners.get(10883)?.[0]?.projectId).toBe(PROJECT_B_ID);
   });
 
   test("is a no-op when the project has no row", async () => {
@@ -280,7 +343,7 @@ describe("lock mechanics: reclaim and contention", () => {
     const read = readHostServicePortRegistry(env);
     expect(read.ok).toBe(true);
     if (!read.ok) throw new Error("unreachable");
-    expect(read.owners.get(10882)?.projectId).toBe(PROJECT_A_ID);
+    expect(read.owners.get(10882)?.[0]?.projectId).toBe(PROJECT_A_ID);
   });
 
   test("contention: a lock held by a live owner is retried through the event loop until an outside release, and both projects' writes land", async () => {
@@ -311,8 +374,8 @@ describe("lock mechanics: reclaim and contention", () => {
     const read = readHostServicePortRegistry(env);
     expect(read.ok).toBe(true);
     if (!read.ok) throw new Error("unreachable");
-    expect(read.owners.get(10882)?.projectId).toBe(PROJECT_A_ID);
-    expect(read.owners.get(10883)?.projectId).toBe(PROJECT_B_ID);
+    expect(read.owners.get(10882)?.[0]?.projectId).toBe(PROJECT_A_ID);
+    expect(read.owners.get(10883)?.[0]?.projectId).toBe(PROJECT_B_ID);
   }, 10_000);
 });
 

@@ -274,6 +274,49 @@ describe("proxy server: host-service CONNECT splice", () => {
   }, 20_000);
 
   test.each([
+    ["192.168.65.254:443", "the gateway IPv4 literal"],
+    ["127.0.0.1:443", "a loopback IPv4 literal"],
+    ["[::1]:443", "a bracketed IPv6 literal"],
+    ["[fdc4:f303:9324::254]:443", "the gateway IPv6 literal"],
+  ])("%s (%s) under an active audit marker gets a raw 403 with no spool write, no audit pass, and no hand-off (R20)", async (authority) => {
+    const auditDir = fs.mkdtempSync(path.join(tmp, "audit-state-"));
+    const markerPath = path.join(auditDir, "active.json");
+    const spoolPath = path.join(auditDir, "spool.txt");
+    const now = new Date();
+    fs.writeFileSync(markerPath, `${JSON.stringify({
+      v: 1,
+      enabledAt: now.toISOString(),
+      expiresAt: new Date(now.getTime() + 600_000).toISOString(),
+      sessionHint: "server-test",
+    })}\n`);
+    const echo = await startEchoServer();
+    const { proxy } = await startHostServiceProxy({
+      policy: hostServicePolicy({ echo: echo.port }),
+      extraEnv: {
+        PROXY_AUDIT_MARKER_PATH: markerPath,
+        PROXY_AUDIT_SPOOL_PATH: spoolPath,
+        PROXY_AUDIT_RESOLVED_HOSTS_PATH: path.join(auditDir, "audit-resolved-hosts.json"),
+        PROXY_AUDIT_WATCH_MS: "100",
+      },
+    });
+    await proxy.waitForOutput("proxy-audit: network audit mode ACTIVE");
+
+    const response = await rawConnectViaProxy({ proxyPort: proxy.port, authority });
+    // A raw refusal: no 200, so neither the audit pass nor the denied tunnel
+    // (both answer 200 first) took the connection, and nothing was dialled.
+    expect(response.statusCode).toBe(403);
+    expect(response.raw).not.toContain("200 Connection Established");
+    await proxy.waitForOutput(/proxy-denial: [^\n]*"reason":"host-not-allowlisted"/);
+    expect(response.raw).toContain("blocked IP-literal CONNECT host in audit mode");
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    const spool = fs.existsSync(spoolPath) ? fs.readFileSync(spoolPath, "utf8") : "";
+    expect(spool).toBe("");
+    expect(proxy.output()).not.toMatch(/proxy-audit: \{/);
+    await expectNoDialFor(echo);
+    await echo.stop();
+  }, 20_000);
+
+  test.each([
     ["the gateway file is missing", (_generation: string) => "missing" as const],
     ["the gateway file names another policy generation", (_generation: string) => availableGateway(`sha256:${"9".repeat(64)}`)],
     ["the gateway file reports unavailable", (generation: string) => ({

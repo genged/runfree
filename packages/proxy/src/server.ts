@@ -83,6 +83,7 @@ import {
   evaluateRequestWriteAsk,
   hostFromUrl,
   loadProxyPolicy,
+  isIpLiteralHostname,
   normalizeHostname,
   type CredentialMutationSummary,
   type LoadedProxyPolicy,
@@ -1972,6 +1973,18 @@ function classifyConnect(authority: string): ConnectDecision {
   }
   if (!currentPolicy.allowedHostSet.has(host)) {
     if (auditMarkerState().active) {
+      // An IP literal is never audited (R20): mockttp would dial it without
+      // the resolver snapshot, and on 443 it could reach the pinned
+      // host-service gateway through the uid-1001 @host_service accept.
+      // Refused raw, before any spool write or hand-off.
+      if (isIpLiteralHostname(host)) {
+        return {
+          action: "reject",
+          host,
+          reason: `blocked IP-literal CONNECT host in audit mode: ${host}`,
+          denialReason: "host-not-allowlisted",
+        };
+      }
       try {
         return { action: "audit-pass", host: normalizeHostname(host) };
       } catch {

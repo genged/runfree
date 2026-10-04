@@ -4,6 +4,7 @@ import type { HostServicesJson } from "./host-services.js";
 import {
   normalizeHostname,
   normalizePathPrefix,
+  isIpLiteralHostname,
   validateNetworkPolicy,
   type PolicyJson,
   type RequestPolicyJson,
@@ -401,6 +402,12 @@ export function validateDesiredNetworkPolicy(raw: unknown): DesiredNetworkPolicy
         if (parsed) services[serviceId] = parsed;
       }
     }
+  }
+  // Policy hosts are exact names (R20): an IP literal would skip the
+  // resolver snapshot. Requests and credentials must name an allowlisted
+  // host, so refusing it here covers every stored host position.
+  for (const host of direct?.allowedHosts ?? []) {
+    if (isIpLiteralHostname(host)) issues.push(`${host} is an IP address; policy hosts must be hostnames`);
   }
   if (!direct || issues.length > 0) throw new DesiredNetworkPolicyValidationError(issues);
   return {

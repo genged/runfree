@@ -169,7 +169,7 @@ describe("proxy nftables session-only ruleset mutations", () => {
       rawJson: JSON.stringify(table),
     });
     expect(issues).toContain("proxy input chain must contain exactly 4 rules; got 2");
-    expect(issues).toContain("proxy output chain must contain exactly 8 rules; got 7");
+    expect(issues).toContain("proxy output chain must contain exactly 9 rules; got 8");
   });
 
   test("rejects a session ingress rule broadened beyond the admission set", () => {
@@ -299,6 +299,61 @@ describe("proxy nftables host-service sets and rules", () => {
       const issues = validateProxyNftablesTableJson({ ...proofInput, rawJson: JSON.stringify(table) });
       expect(issues.some((issue) => issue.includes(setName))).toBe(true);
     }
+  });
+
+  test("rejects host_service_gateways missing or typed as address . port (R19)", () => {
+    const missing = sessionOnlyTable();
+    missing.nftables = missing.nftables.filter((statement) => (statement.set as { name?: string } | undefined)?.name !== "host_service_gateways");
+    expect(validateProxyNftablesTableJson({ ...proofInput, rawJson: JSON.stringify(missing) }))
+      .toContain("proxy firewall must install the host_service_gateways IPv4 nftables set");
+
+    const concat = sessionOnlyTable();
+    const set = concat.nftables.find((statement) => (statement.set as { name?: string } | undefined)?.name === "host_service_gateways")
+      ?.set as { type?: unknown };
+    set.type = ["ipv4_addr", "inet_service"];
+    expect(validateProxyNftablesTableJson({ ...proofInput, rawJson: JSON.stringify(concat) }))
+      .toContain("proxy firewall must install the host_service_gateways IPv4 nftables set");
+  });
+
+  test("rejects the pinned-gateway cut with a non-negated lookup, without the gateway match, or below the established accept (R19)", () => {
+    const label = "egress-interface pinned-gateway cut of unapproved pairs above established accept" as const;
+    expect(validateProxyNftablesTableJson({ ...proofInput, rawJson: JSON.stringify(sessionOnlyTable()) })).toEqual([]);
+
+    // `==` would drop the approved pairs and let every unapproved one pass.
+    const positive = sessionOnlyTable();
+    for (const entry of (proxyOutputRule(positive, label).rule as FixtureRule).expr) {
+      if (entry.match && entry.match.right === "@host_service") (entry.match as { op?: string }).op = "==";
+    }
+    expect(validateProxyNftablesTableJson({ ...proofInput, rawJson: JSON.stringify(positive) }))
+      .toContain(proxyOutputRuleIssue(label));
+
+    // Without the gateway half the rule would also drop public HTTPS.
+    const noGateway = sessionOnlyTable();
+    const noGatewayRule = proxyOutputRule(noGateway, label).rule as FixtureRule;
+    noGatewayRule.expr = noGatewayRule.expr.filter((entry) => entry.match?.right !== "@host_service_gateways");
+    expect(validateProxyNftablesTableJson({ ...proofInput, rawJson: JSON.stringify(noGateway) }))
+      .toContain(proxyOutputRuleIssue(label));
+
+    // Negated against the draining set instead of the accept set.
+    const wrongSet = sessionOnlyTable();
+    for (const entry of (proxyOutputRule(wrongSet, label).rule as FixtureRule).expr) {
+      if (entry.match && entry.match.right === "@host_service") entry.match.right = "@host_service_draining";
+    }
+    expect(validateProxyNftablesTableJson({ ...proofInput, rawJson: JSON.stringify(wrongSet) }))
+      .toContain(proxyOutputRuleIssue(label));
+
+    // An accept verdict instead of drop.
+    const accepting = sessionOnlyTable();
+    const acceptingRule = proxyOutputRule(accepting, label).rule as FixtureRule;
+    acceptingRule.expr = acceptingRule.expr.map((entry) => (Object.hasOwn(entry, "drop") ? { accept: null } : entry));
+    expect(validateProxyNftablesTableJson({ ...proofInput, rawJson: JSON.stringify(accepting) }))
+      .toContain(proxyOutputRuleIssue(label));
+
+    const below = sessionOnlyTable();
+    swapProxyOutputRules(below, label, "egress-interface established output accept");
+    const issues = validateProxyNftablesTableJson({ ...proofInput, rawJson: JSON.stringify(below) });
+    expect(issues).toContain(proxyOutputRuleIssue(label));
+    expect(issues).toContain(proxyOutputRuleIssue("egress-interface established output accept"));
   });
 
   test("rejects a missing host-service set", () => {

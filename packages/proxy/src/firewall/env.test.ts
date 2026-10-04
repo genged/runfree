@@ -47,6 +47,8 @@ describe("proxy firewall environment parsing", () => {
       auditMaxElements: 256,
       hostServiceSetName: "host_service",
       hostServiceDrainingSetName: "host_service_draining",
+      hostServiceGatewaySetName: "host_service_gateways",
+      hostServiceGatewayMaxElements: 8,
       hostServiceMaxElements: 64,
     });
     expect(plan.hostServiceDrainSeconds).toBe(30);

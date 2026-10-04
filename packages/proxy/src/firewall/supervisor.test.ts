@@ -5,7 +5,7 @@ import path from "node:path";
 import { afterEach, describe, expect, test, vi } from "vitest";
 
 import { classifyResolvedIpv4, createFirewallController, type FirewallPlan } from "./supervisor.ts";
-import { renderAuditSetUpdate, renderAuditTeardown } from "./nftables.ts";
+import { renderAuditSetUpdate, renderAuditTeardown, renderHostServiceTeardown, renderRuleset } from "./nftables.ts";
 import { hostServiceSetDigest } from "./host-service-gateway.ts";
 import type { HostServiceGatewayStatus, FirewallGenerationStatus } from "@runfree/runtime-contracts/proxy-status";
 import type { HostServicesJson } from "@runfree/runtime-contracts/host-services";
@@ -93,6 +93,8 @@ const plan: FirewallPlan = {
     auditMaxElements: 256,
     hostServiceSetName: "host_service",
     hostServiceDrainingSetName: "host_service_draining",
+    hostServiceGatewaySetName: "host_service_gateways",
+    hostServiceGatewayMaxElements: 8,
     hostServiceMaxElements: 64,
   },
   hostServiceDrainSeconds: 30,
@@ -1796,19 +1798,25 @@ describe("proxy firewall host-service gateway and set", () => {
       }
     };
     const order: string[] = [];
-    const kernel: { accept: Entry[]; draining: Entry[] } = { accept: [], draining: [] };
+    const kernel: { accept: Entry[]; draining: Entry[]; gateways: string[] } = { accept: [], draining: [], gateways: [] };
     const gateways: HostServiceGatewayStatus[] = [];
     const statuses: FirewallGenerationStatus[] = [];
-    const replaceHostServiceSet = vi.fn(async (entries: readonly Entry[], _plan: FirewallPlan) => {
+    const replaceHostServiceSet = vi.fn(async (entries: readonly Entry[], _plan: FirewallPlan, gatewaySet: readonly string[]) => {
       order.push("replaceHostServiceSet");
       capCheck(entries);
       if (state.failReplace > 0) {
         state.failReplace -= 1;
         throw new Error("nft: injected replace failure");
       }
+      kernel.gateways = [...gatewaySet];
       kernel.accept = [...entries];
     });
-    const applyHostServiceTeardown = vi.fn(async (draining: readonly Entry[], remaining: readonly Entry[], _plan: FirewallPlan) => {
+    const applyHostServiceTeardown = vi.fn(async (
+      draining: readonly Entry[],
+      remaining: readonly Entry[],
+      _plan: FirewallPlan,
+      gatewaySet: readonly string[],
+    ) => {
       order.push("applyHostServiceTeardown");
       capCheck(draining);
       capCheck(remaining);
@@ -1816,6 +1824,7 @@ describe("proxy firewall host-service gateway and set", () => {
         state.failTeardown -= 1;
         throw new Error("nft: injected teardown failure");
       }
+      kernel.gateways = [...gatewaySet];
       kernel.draining = [...draining];
       kernel.accept = [...remaining];
     });
@@ -1885,7 +1894,7 @@ describe("proxy firewall host-service gateway and set", () => {
       gatewayIp: GATEWAY,
       writtenAt: new Date(START_MS).toISOString(),
     });
-    expect(h.replaceHostServiceSet).toHaveBeenCalledWith([IDB_ENTRY], expect.anything());
+    expect(h.replaceHostServiceSet).toHaveBeenCalledWith([IDB_ENTRY], expect.anything(), expect.anything());
     expect(h.kernel.accept).toEqual([IDB_ENTRY]);
     const ready = h.order.indexOf("publishFirewallStatus");
     expect(h.order.indexOf("publishHostServiceGateway")).toBeLessThan(ready);
@@ -1914,7 +1923,7 @@ describe("proxy firewall host-service gateway and set", () => {
     expect(h.gateways[0].gatewayIp).toBeUndefined();
     expect(h.gateways[0].policyGeneration).toBe(started.policyGeneration);
     expect(h.gateways[0].unavailableReason).toContain(needle);
-    expect(h.replaceHostServiceSet).toHaveBeenCalledWith([], expect.anything());
+    expect(h.replaceHostServiceSet).toHaveBeenCalledWith([], expect.anything(), expect.anything());
     expect(h.kernel.accept).toEqual([]);
     // The rest of the ruleset is unaffected: readiness still reports it.
     expect(h.statuses.at(-1)).toMatchObject({ rulesetVerified: true, hostServiceSetDigest: hostServiceSetDigest([], []) });
@@ -1979,11 +1988,11 @@ describe("proxy firewall host-service gateway and set", () => {
     const removedGeneration = servicePolicy({}).generation;
     h.order.length = 0;
     await h.controller.refreshPolicyAndIps({ refreshDns: false });
-    expect(h.applyHostServiceTeardown).toHaveBeenCalledWith([IDB_ENTRY], [], expect.anything());
+    expect(h.applyHostServiceTeardown).toHaveBeenCalledWith([IDB_ENTRY], [], expect.anything(), expect.anything());
     expect(h.order.indexOf("applyHostServiceTeardown")).toBeGreaterThanOrEqual(0);
     expect(h.order.indexOf("applyHostServiceTeardown")).toBeLessThan(h.order.indexOf("publishFirewallStatus"));
     expect(h.order.indexOf("publishHostServiceGateway")).toBeLessThan(h.order.indexOf("publishFirewallStatus"));
-    expect(h.kernel).toEqual({ accept: [], draining: [IDB_ENTRY] });
+    expect(h.kernel).toEqual({ accept: [], draining: [IDB_ENTRY], gateways: [GATEWAY] });
     expect(h.statuses.at(-1)).toMatchObject({
       generation: removedGeneration,
       hostServiceSetDigest: hostServiceSetDigest([], [IDB_ENTRY]),
@@ -1999,7 +2008,7 @@ describe("proxy firewall host-service gateway and set", () => {
     h.state.now += 1_000;
     await h.controller.refreshPolicyAndIps({ refreshDns: false });
     expect(h.flushHostServiceDraining).toHaveBeenCalledTimes(1);
-    expect(h.kernel).toEqual({ accept: [], draining: [] });
+    expect(h.kernel).toEqual({ accept: [], draining: [], gateways: [GATEWAY] });
     expect(h.statuses.at(-1)).toMatchObject({
       generation: removedGeneration,
       hostServiceSetDigest: hostServiceSetDigest([], []),
@@ -2016,7 +2025,7 @@ describe("proxy firewall host-service gateway and set", () => {
 
     h.state.services = IDB;
     await h.controller.refreshPolicyAndIps({ refreshDns: false });
-    expect(h.kernel).toEqual({ accept: [IDB_ENTRY], draining: [] });
+    expect(h.kernel).toEqual({ accept: [IDB_ENTRY], draining: [], gateways: [GATEWAY] });
     expect(h.statuses.at(-1)).toMatchObject({ hostServiceDraining: 0 });
   });
 
@@ -2030,7 +2039,69 @@ describe("proxy firewall host-service gateway and set", () => {
     h.state.services = { idb: { target: "host-loopback", port: 2375 } };
     h.state.now += 30_000;
     await h.controller.refreshPolicyAndIps({ refreshDns: false });
-    expect(h.kernel).toEqual({ accept: [], draining: [] });
+    expect(h.kernel).toEqual({ accept: [], draining: [], gateways: [GATEWAY] });
+  });
+
+  // The kernel verdict for an established flow on the egress interface, in
+  // the rendered rule order (above the established accept): the draining
+  // drop, then the permanent gateway cut (R19).
+  function establishedFlowDropped(
+    kernel: { accept: readonly Entry[]; draining: readonly Entry[]; gateways: readonly string[] },
+    entry: Entry,
+  ): boolean {
+    const same = (other: Entry) => other.ip === entry.ip && other.port === entry.port;
+    if (kernel.draining.some(same)) return true;
+    return kernel.gateways.includes(entry.ip) && !kernel.accept.some(same);
+  }
+
+  test("a stale request proxy: after the drain window the removed pair's established flow stays dropped (R19)", async () => {
+    const h = harness({ etcHosts: VALID, services: IDB });
+    const started = h.startPlan();
+    await h.controller.initialize(started);
+    expect(establishedFlowDropped(h.kernel, IDB_ENTRY)).toBe(false);
+
+    // The supervisor removes the pair. The request proxy is stale: nothing
+    // in this harness cuts its splice, so only the firewall acts.
+    h.state.services = {};
+    await h.controller.refreshPolicyAndIps({ refreshDns: false });
+    expect(establishedFlowDropped(h.kernel, IDB_ENTRY)).toBe(true);
+
+    h.state.now += 31_000;
+    await h.controller.refreshPolicyAndIps({ refreshDns: false });
+    expect(h.flushHostServiceDraining).toHaveBeenCalledTimes(1);
+    expect(h.kernel).toEqual({ accept: [], draining: [], gateways: [GATEWAY] });
+    expect(establishedFlowDropped(h.kernel, IDB_ENTRY)).toBe(true);
+    h.state.now += 3_600_000;
+    await h.controller.refreshPolicyAndIps({ refreshDns: false });
+    expect(establishedFlowDropped(h.kernel, IDB_ENTRY)).toBe(true);
+
+    // The rendered state: the batch kept the gateway with no accepted pair,
+    // and the ruleset's gateway cut sits above the established accept.
+    const [draining, remaining, , gateways] = h.applyHostServiceTeardown.mock.calls.at(-1) ?? [];
+    const batch = renderHostServiceTeardown(draining ?? [], remaining ?? [], started, gateways ?? []);
+    expect(batch).toContain(`add element inet runfree_proxy host_service_gateways { ${GATEWAY} }`);
+    expect(batch).not.toContain("add element inet runfree_proxy host_service {");
+    const rules = renderRuleset(started).split("\n");
+    const cut = rules.findIndex((line) => line.includes("ip daddr @host_service_gateways ip daddr . tcp dport != @host_service drop"));
+    const established = rules.findIndex((line) => line.includes("oifname \"eth1\" meta nfproto ipv4 ct state established,related accept"));
+    expect(cut).toBeGreaterThan(0);
+    expect(cut).toBeLessThan(established);
+
+    // Reclaim: re-approving the pair accepts it again.
+    h.state.services = IDB;
+    await h.controller.refreshPolicyAndIps({ refreshDns: false });
+    expect(establishedFlowDropped(h.kernel, IDB_ENTRY)).toBe(false);
+  });
+
+  test("a sticky gateway change keeps the old pair dropped after the drain window (R19)", async () => {
+    const h = harness({ etcHosts: VALID, services: IDB });
+    await h.controller.initialize(h.startPlan());
+    h.state.etcHosts = { text: hostsWith("192.168.65.200"), stat: ROOT_STAT };
+    await h.controller.refreshPolicyAndIps({ refreshDns: false });
+    h.state.now += 31_000;
+    await h.controller.refreshPolicyAndIps({ refreshDns: false });
+    expect(h.kernel).toEqual({ accept: [], draining: [], gateways: [GATEWAY] });
+    expect(establishedFlowDropped(h.kernel, IDB_ENTRY)).toBe(true);
   });
 
   test("only the maintenance path reads /etc/hosts; the session-admission loop never does", async () => {
@@ -2086,7 +2157,7 @@ describe("proxy firewall host-service gateway and set", () => {
     h.state.failReplace = 1;
     await h.controller.refreshPolicyAndIps({ refreshDns: false });
     // Refusal: nothing stays accepted, and the pair that was accepted is cut.
-    expect(h.kernel).toEqual({ accept: [], draining: [IDB_ENTRY] });
+    expect(h.kernel).toEqual({ accept: [], draining: [IDB_ENTRY], gateways: [GATEWAY] });
     const refused = h.gateways.at(-1);
     expect(refused?.gatewayIp).toBeUndefined();
     expect(refused?.unavailableReason).toContain("host-service firewall set update failed");
@@ -2099,7 +2170,7 @@ describe("proxy firewall host-service gateway and set", () => {
     // Reclaim: the next tick writes the desired pairs and takes them out of
     // draining in one batch, and the gateway is offered again.
     await h.controller.refreshPolicyAndIps({ refreshDns: false });
-    expect(h.kernel).toEqual({ accept: [PG_ENTRY, IDB_ENTRY], draining: [] });
+    expect(h.kernel).toEqual({ accept: [PG_ENTRY, IDB_ENTRY], draining: [], gateways: [GATEWAY] });
     expect(h.gateways.at(-1)?.gatewayIp).toBe(GATEWAY);
     expect(h.statuses.at(-1)).toMatchObject({
       hostServiceSetDigest: hostServiceSetDigest([IDB_ENTRY, PG_ENTRY], []),
@@ -2115,12 +2186,12 @@ describe("proxy firewall host-service gateway and set", () => {
     h.state.services = IDB;
     h.state.failTeardown = 1;
     await h.controller.refreshPolicyAndIps({ refreshDns: false });
-    expect(h.kernel).toEqual({ accept: [], draining: [PG_ENTRY, IDB_ENTRY] });
+    expect(h.kernel).toEqual({ accept: [], draining: [PG_ENTRY, IDB_ENTRY], gateways: [GATEWAY] });
     expect(h.gateways.at(-1)?.unavailableReason).toContain("injected teardown failure");
 
     await h.controller.refreshPolicyAndIps({ refreshDns: false });
     // pg was removed, so it legitimately stays draining for its window.
-    expect(h.kernel).toEqual({ accept: [IDB_ENTRY], draining: [PG_ENTRY] });
+    expect(h.kernel).toEqual({ accept: [IDB_ENTRY], draining: [PG_ENTRY], gateways: [GATEWAY] });
     expect(h.gateways.at(-1)?.gatewayIp).toBe(GATEWAY);
   });
 
@@ -2134,7 +2205,9 @@ describe("proxy firewall host-service gateway and set", () => {
       .resolves.toBeUndefined();
 
     for (let tick = 0; tick < 3; tick += 1) {
-      expect(h.kernel).toEqual({ accept: [], draining: [] });
+      // No batch ever ran, so nothing was accepted and the gateway set was
+      // never written either.
+      expect(h.kernel).toEqual({ accept: [], draining: [], gateways: [] });
       const status = h.gateways.at(-1);
       expect(status?.gatewayIp).toBeUndefined();
       expect(status?.unavailableReason).toContain("host-service firewall set update failed");

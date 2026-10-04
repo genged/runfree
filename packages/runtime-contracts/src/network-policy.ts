@@ -1,4 +1,6 @@
 
+import { isIP } from "node:net";
+
 import { isReservedRunfreeHostname, validateHostServices, type HostServicesJson } from "./host-services.js";
 import { isRecord, sha256Digest } from "./primitives.js";
 
@@ -224,6 +226,20 @@ export function pathMatchesPrefix(pathName: string, pathPrefix: string): boolean
   if (pathName === pathPrefix) return true;
   const childPrefix = pathPrefix.endsWith("/") ? pathPrefix : `${pathPrefix}/`;
   return pathName.startsWith(childPrefix);
+}
+
+/**
+ * True for an IP literal in any form a resolver or dialer accepts: dotted
+ * IPv4, IPv6 (brackets already stripped), or a name whose last label is a
+ * number (WHATWG "ends in a number": decimal or hex). Policy hosts are exact
+ * names, and an IP literal skips the resolver snapshot when dialled (R20).
+ * Desired-policy validation refuses IP-literal hosts with it; the effective
+ * policy loader does not, so a host-compiled effective policy is unchanged.
+ */
+export function isIpLiteralHostname(host: string): boolean {
+  if (isIP(host) !== 0) return true;
+  const last = host.split(".").at(-1) ?? "";
+  return /^[0-9]+$/.test(last) || /^0x[0-9a-f]*$/i.test(last);
 }
 
 function validateStoredHost(value: string, issues: string[]): string | undefined {

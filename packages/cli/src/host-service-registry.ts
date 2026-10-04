@@ -248,8 +248,11 @@ function parseRegistryFile(parsed: unknown): RegistryFile {
   if (parsed.schemaVersion !== 1) throw new Error("host service port registry has an unsupported schema version");
   if (!isRecord(parsed.projects)) throw new Error("host service port registry is missing a projects object");
 
+  // A port may be owned by several projects (R18): two projects sharing one
+  // host service on the same port is a valid setup, and the registry only
+  // keeps Runfree's own publications off approved ports. A duplicate port
+  // inside one project's row is still refused below.
   const projects: Record<string, RegistryProjectRow> = {};
-  const seenPorts = new Map<number, string>();
   for (const [projectId, rawRow] of Object.entries(parsed.projects)) {
     if (!PROJECT_ID_RE.test(projectId)) {
       throw new Error(`host service port registry has an invalid project id: ${projectId}`);
@@ -265,13 +268,6 @@ function parseRegistryFile(parsed: unknown): RegistryFile {
     const uniquePorts = new Set(ports);
     if (uniquePorts.size !== ports.length) {
       throw new Error(`host service port registry row for ${projectId} has duplicate ports`);
-    }
-    for (const port of ports) {
-      const existing = seenPorts.get(port);
-      if (existing !== undefined && existing !== projectId) {
-        throw new Error(`host service port registry has port ${port} registered by more than one project`);
-      }
-      seenPorts.set(port, projectId);
     }
     let owners: Record<string, string> | undefined;
     if (rawRow.owners !== undefined) {
@@ -383,8 +379,14 @@ function knownProjectPointers(stateRoot: string): Array<{ id: string; root: stri
 // Public API.
 // ---------------------------------------------------------------------------
 
+export type HostServicePortOwner = Readonly<{ projectId: string; projectRoot: string; command?: string }>;
+
+/**
+ * `owners` maps each registered port to every project that approved it,
+ * sorted by project id. The list is never empty.
+ */
 export type HostServicePortRegistryRead =
-  | { ok: true; owners: ReadonlyMap<number, { projectId: string; projectRoot: string; command?: string }> }
+  | { ok: true; owners: ReadonlyMap<number, readonly HostServicePortOwner[]> }
   | { ok: false; reason: string };
 
 /** Read-only: never takes the lock, and the only filesystem access is this one bounded read. */
@@ -402,15 +404,19 @@ export function readHostServicePortRegistry(env: NodeJS.ProcessEnv): HostService
     });
     if (!read) return { ok: true, owners: new Map() };
     const file = parseRegistryFile(parseStrictJson(read.source));
-    const owners = new Map<number, { projectId: string; projectRoot: string; command?: string }>();
-    for (const [projectId, row] of Object.entries(file.projects)) {
+    const owners = new Map<number, HostServicePortOwner[]>();
+    const projectIds = Object.keys(file.projects).sort();
+    for (const projectId of projectIds) {
+      const row = file.projects[projectId];
       for (const port of row.ports) {
         const command = row.owners?.[String(port)];
-        owners.set(port, {
+        const list = owners.get(port) ?? [];
+        list.push(Object.freeze({
           projectId,
           projectRoot: row.projectRoot,
           ...(command !== undefined ? { command } : {}),
-        });
+        }));
+        owners.set(port, list);
       }
     }
     return { ok: true, owners };
@@ -431,8 +437,9 @@ export function recordedHostServiceOwners(env: NodeJS.ProcessEnv, projectId: str
   const recorded = new Map<number, string>();
   const registryRead = readHostServicePortRegistry(env);
   if (!registryRead.ok) return recorded;
-  for (const [port, owner] of registryRead.owners) {
-    if (owner.projectId === projectId && owner.command !== undefined) recorded.set(port, owner.command);
+  for (const [port, owners] of registryRead.owners) {
+    const own = owners.find((owner) => owner.projectId === projectId);
+    if (own?.command !== undefined) recorded.set(port, own.command);
   }
   return recorded;
 }
@@ -452,8 +459,8 @@ export function recordedHostServiceOwners(env: NodeJS.ProcessEnv, projectId: str
 export function projectHasRegisteredHostServicePorts(env: NodeJS.ProcessEnv, projectId: string): boolean {
   const registryRead = readHostServicePortRegistry(env);
   if (!registryRead.ok) return false;
-  for (const owner of registryRead.owners.values()) {
-    if (owner.projectId === projectId) return true;
+  for (const owners of registryRead.owners.values()) {
+    if (owners.some((owner) => owner.projectId === projectId)) return true;
   }
   return false;
 }
@@ -558,8 +565,13 @@ export function registeredHostServicePortRefusal(
     return `the host-service port registry could not be read (${read.reason}); `
       + `refusing to risk a port another project approved as a host service - run \`${remedy.hostServiceRepair()}\``;
   }
-  const owner = read.owners.get(port);
-  if (!owner || owner.projectId === ownProjectId) return undefined;
-  return `port ${port} is already approved as a host service for the project at ${owner.projectRoot}; `
-    + "pick a different port, or remove that approval there before reusing it here";
+  const others = (read.owners.get(port) ?? []).filter((owner) => owner.projectId !== ownProjectId);
+  if (others.length === 0) return undefined;
+  const roots = others.map((owner) => owner.projectRoot);
+  if (roots.length === 1) {
+    return `port ${port} is already approved as a host service for the project at ${roots[0]}; `
+      + "pick a different port, or remove that approval there before reusing it here";
+  }
+  return `port ${port} is already approved as a host service for the projects at ${roots.join(", ")}; `
+    + "pick a different port, or remove those approvals there before reusing it here";
 }

@@ -17,6 +17,7 @@ import {
   isHttpMethod,
   isTokenName,
   shellQuoteToken,
+  isIpLiteralHostname,
   validateNetworkPolicy,
   type HttpMethod,
 } from "./network-policy.ts";
@@ -124,6 +125,14 @@ describe("request-shape policy validation", () => {
   test("rejects ambiguous hosts plus legacy domains input", () => {
     expect(validationIssues({ hosts: ["api.github.com"], domains: ["raw.githubusercontent.com"], tokens: {} }))
       .toContain("policy must not define both hosts and legacy domains");
+  });
+
+  test("the effective policy loader still accepts an IP-literal host; desired validation refuses it (R20)", () => {
+    expect(validationIssues({ hosts: ["127.0.0.1"], tokens: {} })).toEqual([]);
+    expect(isIpLiteralHostname("::1")).toBe(true);
+    expect(isIpLiteralHostname("192.168.65.254")).toBe(true);
+    expect(isIpLiteralHostname("1.2.3.0x7f")).toBe(true);
+    expect(isIpLiteralHostname("api.github.com")).toBe(false);
   });
 
   test("rejects rules for non-allowlisted or non-normalized hosts", () => {

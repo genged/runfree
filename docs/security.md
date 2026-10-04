@@ -144,8 +144,13 @@ point to the mechanism.
    to them. The gateway comes from the daemon's `extra_hosts` entry, never
    from DNS, and never enters the DNS allow set. A removal, and a gateway
    change or withdrawal, is cut by two independent consumers: the request
-   proxy destroys open splices immediately, and the firewall drain drops their
-   in-flight packets for 30 s.
+   proxy destroys open splices immediately, and the firewall drops every
+   packet, from any uid, to a gateway it pinned on a pair that is not
+   currently approved, above the established-connection accept and with no
+   time limit. A port is admitted (a visible listener on `127.0.0.1` or `*`,
+   not Docker Desktop) on every host approval path, not only at
+   `host-service add`. IP-literal CONNECT hosts are never audit-passed, and
+   policy hosts cannot be IP literals.
 
 Order, hardening, and firewall rules:
 [Proxy Enforcement Details](architecture.md#proxy-enforcement-details).
@@ -435,9 +440,11 @@ Accepted, known risks:
 | A host-service tunnel is opaque | No content audit, request rules, or write approval apply inside it; approve only services you would let the agent use freely |
 | An approved host service's own authentication and bugs are reachable from the agent | An approved `idb_companion` gives every session in the project full simulator control: install, launch, and file push and pull |
 | Host-service access is per project, not per session | Approval persists like an allowed host and applies to every session of the project |
-| Whatever holds an approved port on the host's loopback is reachable | If the approved service stops and another process takes the port, the agent reaches that process. The gateway reaches every host loopback listener, including root services, IDE servers, and other containers' published ports; the refused ports and the owner check at `add` cover only the known dangerous cases |
+| Whatever holds an approved port on the host's loopback is reachable | If the approved service stops and another process takes the port, the agent reaches that process. The gateway reaches every host loopback listener, including root services, IDE servers, and other containers' published ports; the refused ports and the owner check at approval cover only the known dangerous cases. A root-owned listener is invisible to the unprivileged `lsof`, so it is refused only as "no visible listener", never identified |
 | A publication that appears on an approved port mid-session stays reachable; the next launch or `runfree status` only warns | Another project's `forward` and `vnc` refuse registered ports. A third-party publication on an approved port is reported by the next launch or `runfree status` owner check, which warns but neither refuses nor cuts |
-| A host gateway address change, or a withdrawn gateway, stops host services until `runfree rebuild` | Two independent cuts act at once: the request proxy destroys every open splice to the old or withdrawn address, and the firewall drain drops their in-flight packets for 30 s. New CONNECTs refuse with the named cause; `runfree rebuild` re-pins and drains every session |
+| A host gateway address change, or a withdrawn gateway, stops host services until `runfree rebuild` | Two independent cuts act at once: the request proxy destroys every open splice to the old or withdrawn address, and the firewall drops every flow to a gateway it pinned whose pair is not currently approved, for as long as that holds. New CONNECTs refuse with the named cause; `runfree rebuild` re-pins and drains every session |
+| The permanent firewall cut covers only gateways pinned by the running supervisor | The pinned-gateway set is in memory and the ruleset install recreates it empty, so a proxy restart forgets earlier gateways. A restart also recreates the whole table, so no earlier flow is accepted by it; the cut matters only within one supervisor lifetime |
+| New host-service CONNECTs refuse for about 2 s after any policy reload | The request proxy dials only when the gateway file names its current effective policy generation; until the supervisor republishes the file on its next maintenance pass, a new CONNECT refuses with `host-service-unavailable`. Open splices are not affected |
 
 Approving a write, allowing a broad host, or adding a credential gives the
 agent real power upstream. Treat each one as a security decision.

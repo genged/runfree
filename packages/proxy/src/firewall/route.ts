@@ -78,7 +78,11 @@ export async function verifyFirewallState(plan: FirewallPlan, runner: CommandRun
   await runner.run("nft", ["list", "set", "inet", plan.nftables.tableName, plan.nftables.sessionSetName]);
   // The host-service sets must exist; their members legitimately change at
   // runtime, so only existence is checked here (the host proof checks members).
-  for (const hostServiceSet of [plan.nftables.hostServiceSetName, plan.nftables.hostServiceDrainingSetName]) {
+  for (const hostServiceSet of [
+    plan.nftables.hostServiceSetName,
+    plan.nftables.hostServiceDrainingSetName,
+    plan.nftables.hostServiceGatewaySetName,
+  ]) {
     await runner.run("nft", ["list", "set", "inet", plan.nftables.tableName, hostServiceSet]);
   }
   for (const auditSet of [plan.nftables.auditSetName, plan.nftables.auditDrainingSetName]) {

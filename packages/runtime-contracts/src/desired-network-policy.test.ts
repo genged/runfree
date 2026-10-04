@@ -10,6 +10,14 @@ import {
 const digest = `sha256:${"a".repeat(64)}`;
 
 describe("desired network policy v2", () => {
+  test("refuses IP-literal hosts, which would skip the resolver snapshot (R20)", () => {
+    for (const host of ["192.168.65.254", "127.0.0.1", "1.2.3.0x7f", "foo.123"]) {
+      expect(() => validateDesiredNetworkPolicy({ version: 2, hosts: [host] }), host)
+        .toThrow(`${host} is an IP address; policy hosts must be hostnames`);
+    }
+    expect(validateDesiredNetworkPolicy({ version: 2, hosts: ["x1.example.com"] }).hosts).toEqual(["x1.example.com"]);
+  });
+
   test("canonicalizes direct policy and self-contained service semantics", () => {
     const first = validateDesiredNetworkPolicy({
       version: 2,

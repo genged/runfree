@@ -25,6 +25,8 @@ const plan: FirewallPlan = {
     auditMaxElements: 256,
     hostServiceSetName: "host_service",
     hostServiceDrainingSetName: "host_service_draining",
+    hostServiceGatewaySetName: "host_service_gateways",
+    hostServiceGatewayMaxElements: 8,
     hostServiceMaxElements: 64,
   },
   hostServiceDrainSeconds: 30,

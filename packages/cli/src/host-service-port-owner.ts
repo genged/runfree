@@ -4,8 +4,12 @@
 //   1. the static refusals shared with policy validation (Docker Engine TCP,
 //      runfree's own VNC default and MCP callback block);
 //   2. the live owner: `lsof` must show a visible process listening on the
-//      host's TCP port. No listener refuses (Docker Desktop answers some ports
-//      from its VM, root-owned services are invisible); a `com.docker.*` owner
+//      host's TCP port at 127.0.0.1:<port> or *:<port>, the addresses the
+//      Docker Desktop gateway reaches (R22). No visible listener refuses:
+//      Docker Desktop answers some ports from its VM, and a root-owned
+//      listener is invisible to an unprivileged lsof, so it refuses as "no
+//      visible listener" too. A listener only on [::1] or a LAN address is
+//      refused with its address. A `com.docker.*` listener on any address
 //      refuses (another container's published port, or Docker Engine TCP).
 // The admitted owner (command and pid) is what the operator reviews and what
 // the port registry records.
@@ -20,11 +24,13 @@ import { refusedHostServicePortReason, type HostServicesJson } from "@runfree/ru
 import { sanitizedHostExecutionEnv } from "./host-path.ts";
 import type { RuntimeContext, RuntimeIO } from "./runtime/types.ts";
 
+export type HostPortListener = { command: string; pid: number; addresses: string[] };
+
 export type HostPortOwner =
-  // `command`/`pid` name the first listener (what the operator reviews);
-  // `commands` lists every listening process, so admission can refuse when
-  // any of them is Docker Desktop.
-  | { kind: "listener"; command: string; pid: number; count: number; commands: string[] }
+  // `command`/`pid` name the first listener; `commands` lists every listening
+  // process, so admission can refuse when any of them is Docker Desktop;
+  // `listeners` carries each process's listen addresses (`-Fn`, R22).
+  | { kind: "listener"; command: string; pid: number; count: number; commands: string[]; listeners: HostPortListener[] }
   | { kind: "none" }
   | { kind: "unavailable"; reason: string };
 
@@ -47,20 +53,24 @@ function printableCommand(raw: string): string {
 }
 
 function parseLsofFields(stdout: string): HostPortOwner {
-  const processes: Array<{ pid: number; command?: string }> = [];
+  const processes: Array<{ pid: number; command?: string; addresses: string[] }> = [];
   for (const line of stdout.split("\n")) {
     if (line === "") continue;
     const field = line[0];
     const value = line.slice(1);
     if (field === "p") {
       if (!PID_RE.test(value)) return { kind: "unavailable", reason: `lsof reported a malformed pid: ${printableCommand(value)}` };
-      processes.push({ pid: Number(value) });
+      processes.push({ pid: Number(value), addresses: [] });
     } else if (field === "c") {
       const current = processes.at(-1);
       if (!current || current.command !== undefined || value === "") {
         return { kind: "unavailable", reason: "lsof reported a process name outside a process record" };
       }
       current.command = printableCommand(value);
+    } else if (field === "n") {
+      const current = processes.at(-1);
+      if (!current || value === "") return { kind: "unavailable", reason: "lsof reported a listen address outside a process record" };
+      current.addresses.push(printableCommand(value));
     }
     // Other fields (lsof always adds `f` file descriptor records) are ignored.
   }
@@ -75,7 +85,26 @@ function parseLsofFields(stdout: string): HostPortOwner {
     pid: first.pid,
     count: processes.length,
     commands: processes.map((entry) => entry.command as string),
+    listeners: processes.map((entry) => ({ command: entry.command as string, pid: entry.pid, addresses: entry.addresses })),
   };
+}
+
+/**
+ * The first listener bound where the Docker Desktop gateway reaches it:
+ * `127.0.0.1:<port>` or the wildcard `*:<port>` (R22). `[::1]` and LAN
+ * addresses alone do not count.
+ */
+export function gatewayReachableListener(
+  owner: Extract<HostPortOwner, { kind: "listener" }>,
+  port: number,
+): HostPortListener | undefined {
+  const reachable = new Set([`127.0.0.1:${port}`, `*:${port}`]);
+  return owner.listeners.find((listener) => listener.addresses.some((address) => reachable.has(address)));
+}
+
+function listenAddressSummary(owner: Extract<HostPortOwner, { kind: "listener" }>): string {
+  const addresses = [...new Set(owner.listeners.flatMap((listener) => listener.addresses))];
+  return addresses.length > 0 ? addresses.join(", ") : "no address reported";
 }
 
 /** Who listens on the host's TCP `port` (macOS only; read-only, bounded). */
@@ -89,7 +118,8 @@ export function probeHostPortOwner(
     return { kind: "unavailable", reason: "the host listener check needs macOS (Docker Desktop for Mac)" };
   }
   // `+c 0`: the full process name, never lsof's default 9-character cut.
-  const result = io.capture(LSOF_PATH, ["-nP", "+c", "0", `-iTCP:${port}`, "-sTCP:LISTEN", "-Fpc"], {
+  // `-Fpcn`: pid, command, and each listen address (R22).
+  const result = io.capture(LSOF_PATH, ["-nP", "+c", "0", `-iTCP:${port}`, "-sTCP:LISTEN", "-Fpcn"], {
     encoding: "utf8",
     timeout: LSOF_TIMEOUT_MS,
     env: { ...sanitizedHostExecutionEnv(context.projectRoot, context.env ?? process.env), LC_ALL: "C" },
@@ -123,7 +153,15 @@ export function admitHostServicePort(
   if (owner.commands.some((command) => command.startsWith(DOCKER_DESKTOP_COMMAND_PREFIX))) {
     return { ok: false, reason: `127.0.0.1:${port} is owned by Docker Desktop (a published container port)` };
   }
-  return { ok: true, owner: { command: owner.command, pid: owner.pid } };
+  const reachable = gatewayReachableListener(owner, port);
+  if (!reachable) {
+    return {
+      ok: false,
+      reason: `no visible listener on 127.0.0.1:${port} or *:${port} (found: ${listenAddressSummary(owner)}); `
+        + "the Docker Desktop gateway reaches only IPv4 loopback, so bind the service to 127.0.0.1",
+    };
+  }
+  return { ok: true, owner: { command: reachable.command, pid: reachable.pid } };
 }
 
 /**
@@ -152,9 +190,14 @@ export function hostServiceOwnerWarnings(
     } else if (owner.commands.some((command) => command.startsWith(DOCKER_DESKTOP_COMMAND_PREFIX))) {
       lines.push(`${label}: owned by Docker Desktop`);
     } else {
+      const reachable = gatewayReachableListener(owner, entry.port);
+      if (!reachable) {
+        lines.push(`${label}: no visible listener on 127.0.0.1 or * (found: ${listenAddressSummary(owner)})`);
+        continue;
+      }
       const previous = recorded.get(entry.port);
-      if (previous !== undefined && previous !== owner.command) {
-        lines.push(`${label}: listener changed to ${owner.command}`);
+      if (previous !== undefined && previous !== reachable.command) {
+        lines.push(`${label}: listener changed to ${reachable.command}`);
       }
     }
   }

@@ -117,11 +117,18 @@ type FirewallControllerDependencies = {
   readEtcHosts: () => { text: string; stat: EtcHostsStat };
   // Root-written hand-off of the pinned gateway to the uid-1001 request proxy.
   publishHostServiceGateway: (status: HostServiceGatewayStatus) => void;
-  replaceHostServiceSet: (entries: readonly HostServiceElement[], plan: FirewallPlan) => Promise<void>;
+  // `gateways` is every gateway pinned in this supervisor's lifetime; each
+  // batch refills @host_service_gateways with it (R19).
+  replaceHostServiceSet: (
+    entries: readonly HostServiceElement[],
+    plan: FirewallPlan,
+    gateways: readonly string[],
+  ) => Promise<void>;
   applyHostServiceTeardown: (
     draining: readonly HostServiceElement[],
     remaining: readonly HostServiceElement[],
     plan: FirewallPlan,
+    gateways: readonly string[],
   ) => Promise<void>;
   flushHostServiceDraining: (plan: FirewallPlan) => Promise<void>;
 };
@@ -217,8 +224,9 @@ export function createFirewallController(overrides: Partial<FirewallControllerDe
     },
     readEtcHosts: () => readEtcHostsFile(),
     publishHostServiceGateway: (status) => writeGenerationStatusFile(hostServiceGatewayStatusPath(), status),
-    replaceHostServiceSet: (entries, plan) => replaceHostServiceSet(entries, runner, plan),
-    applyHostServiceTeardown: (draining, remaining, plan) => applyHostServiceTeardown(draining, remaining, runner, plan),
+    replaceHostServiceSet: (entries, plan, gateways) => replaceHostServiceSet(entries, runner, plan, gateways),
+    applyHostServiceTeardown: (draining, remaining, plan, gateways) =>
+      applyHostServiceTeardown(draining, remaining, runner, plan, gateways),
     flushHostServiceDraining: (plan) => flushHostServiceDraining(runner, plan),
     ...overrides,
   };
@@ -269,6 +277,13 @@ export function createFirewallController(overrides: Partial<FirewallControllerDe
   // What this supervisor last installed in @host_service and
   // @host_service_draining. The ruleset install creates both sets empty.
   let installedHostServices: HostServiceElement[] = [];
+  // Every gateway this supervisor pinned during its lifetime (R19). Never
+  // cleared, not even by a re-initialize: the permanent cut must keep
+  // covering an address that ever carried an accepted pair.
+  const lifetimeGateways = new Set<string>();
+  // What the kernel's @host_service_gateways holds (the ruleset install
+  // creates it empty).
+  let installedGateways: string[] = [];
   let hostServiceDraining: { entries: HostServiceElement[]; untilMs: number } | undefined;
   let lastPublishedGatewayKey: string | undefined;
   let lastPublishedStatusKey: string | undefined;
@@ -312,6 +327,7 @@ export function createFirewallController(overrides: Partial<FirewallControllerDe
     gatewayUnavailableReason = undefined;
     hostServiceWriteFailure = undefined;
     installedHostServices = [];
+    installedGateways = [];
     hostServiceDraining = undefined;
     lastPublishedGatewayKey = undefined;
     lastPublishedStatusKey = undefined;
@@ -339,6 +355,7 @@ export function createFirewallController(overrides: Partial<FirewallControllerDe
     if (pinnedGateway === undefined) {
       if ("ip" in observed) {
         pinnedGateway = observed.ip;
+        lifetimeGateways.add(observed.ip);
         if (gatewayUnavailableReason !== undefined) {
           deps.log(`proxy-firewall: host-service gateway pinned ip=${observed.ip} after earlier refusal`);
         } else {
@@ -375,6 +392,10 @@ export function createFirewallController(overrides: Partial<FirewallControllerDe
     return hostServiceWriteFailure === undefined ? pinnedUsableGateway() : undefined;
   }
 
+  function gatewayList(): string[] {
+    return [...lifetimeGateways].sort();
+  }
+
   function desiredHostServiceEntries(plan: FirewallPlan): HostServiceElement[] {
     const gateway = pinnedUsableGateway();
     if (gateway === undefined) return [];
@@ -409,14 +430,17 @@ export function createFirewallController(overrides: Partial<FirewallControllerDe
       installedHostServices.map(hostServiceEntryKey),
       desired.map(hostServiceEntryKey),
     );
+    const gatewaysChanged = !sameStringArray(installedGateways, gatewayList());
 
     if (removed.length > 0 || drainingChanged) {
       await installHostServiceTeardown(plan, nextDraining, desired, removed.length > 0);
       return;
     }
-    if (acceptChanged || force) {
-      await deps.replaceHostServiceSet(desired, plan);
+    if (acceptChanged || gatewaysChanged || force) {
+      const gateways = gatewayList();
+      await deps.replaceHostServiceSet(desired, plan, gateways);
       installedHostServices = desired;
+      installedGateways = gateways;
       deps.log(`proxy-firewall: host-service set updated pairs=${desired.length}`);
     }
   }
@@ -427,8 +451,10 @@ export function createFirewallController(overrides: Partial<FirewallControllerDe
     remaining: HostServiceElement[],
     restartWindow: boolean,
   ): Promise<void> {
-    await deps.applyHostServiceTeardown(draining, remaining, plan);
+    const gateways = gatewayList();
+    await deps.applyHostServiceTeardown(draining, remaining, plan, gateways);
     installedHostServices = remaining;
+    installedGateways = gateways;
     hostServiceDraining = draining.length === 0 ? undefined : {
       entries: draining,
       untilMs: restartWindow || hostServiceDraining === undefined

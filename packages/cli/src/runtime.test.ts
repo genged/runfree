@@ -4399,7 +4399,7 @@ describe("runtime command flow", () => {
       expect((await startRuntime(context, io, false, { launch: true })).status).toBe(0);
       const registry = readHostServicePortRegistry(context.env ?? {});
       if (!registry.ok) throw new Error(registry.reason);
-      expect(registry.owners.get(10882)?.projectId).toBe(projectHash(context.projectRoot));
+      expect(registry.owners.get(10882)?.[0]?.projectId).toBe(projectHash(context.projectRoot));
     });
 
     test("the live-owner probe never runs under the project lifecycle lock", async () => {
@@ -4482,7 +4482,7 @@ describe("runtime command flow", () => {
       await recordProjectHostServicePorts(context.env, { id: projectId, root: projectRoot }, [10882]);
       const before = readHostServicePortRegistry(context.env);
       if (!before.ok) throw new Error(before.reason);
-      expect(before.owners.get(10882)?.projectId).toBe(projectId);
+      expect(before.owners.get(10882)?.[0]?.projectId).toBe(projectId);
 
       const io = createRuntimeIO();
       await destroyRuntime(context, io);
@@ -4520,7 +4520,7 @@ describe("runtime command flow", () => {
       // service still needs must survive the refused destroy untouched.
       const after = readHostServicePortRegistry(context.env);
       if (!after.ok) throw new Error(after.reason);
-      expect(after.owners.get(10882)?.projectId).toBe(projectId);
+      expect(after.owners.get(10882)?.[0]?.projectId).toBe(projectId);
     });
   });
 
@@ -5799,7 +5799,7 @@ describe("runtime command flow", () => {
       const io = createRuntimeIO({
         capture: (command, args) => {
           if (command === "docker" && args[0] === "info") return captureResult(0);
-          if (command === "/usr/sbin/lsof") return captureResult(0, "p4242\ncidb_companion\n");
+          if (command === "/usr/sbin/lsof") return captureResult(0, "p4242\ncidb_companion\nf7\nn127.0.0.1:10882\n");
           if (gateway && command === "docker" && args[0] === "ps" && args.includes("-q")
             && args.includes("label=com.docker.compose.service=proxy")) {
             return captureResult(0, `${PROXY_ID}\n`);

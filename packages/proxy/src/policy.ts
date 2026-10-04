@@ -24,6 +24,7 @@ export {
   DEFAULT_WRITE_ACTION,
   effectiveWriteAction,
   hostFromUrl,
+  isIpLiteralHostname,
   normalizeHostname,
   normalizePathPrefix,
   pathMatchesPrefix,

@@ -10,6 +10,11 @@
 import type { DesiredNetworkPolicyJson } from "@runfree/runtime-contracts/desired-network-policy";
 import type { RuntimeContext } from "../runtime/types.ts";
 import { readApprovedNetworkPolicy } from "./approvals.ts";
+import {
+  admittedOwnerReviewLines,
+  admittedOwnerText,
+  type AdmittedHostServiceOwners,
+} from "./host-service-approval-admission.ts";
 import type { DesiredPolicyCandidate } from "./candidates.ts";
 import { compileDesiredPolicies, type CompiledDesiredPolicy } from "./compiler.ts";
 import { isControlApprovalUnusableError } from "./refusals.ts";
@@ -37,9 +42,30 @@ function describeRecordChanges(
   return changes;
 }
 
+/**
+ * Host-service changes. An added or changed entry whose port admission ran
+ * (R21) names the admitted listener instead of the raw JSON, so the operator
+ * approves `idb_companion (pid 4242) on 10882`, not a bare number.
+ */
+function describeHostServiceChanges(
+  before: Record<string, unknown>,
+  after: Record<string, unknown>,
+  owners: AdmittedHostServiceOwners | undefined,
+): string[] {
+  const changes: string[] = [];
+  for (const key of Array.from(new Set([...Object.keys(before), ...Object.keys(after)])).sort()) {
+    if (stable(before[key]) === stable(after[key])) continue;
+    const owner = after[key] !== undefined ? owners?.get(key) : undefined;
+    const next = owner ? admittedOwnerText(owner) : JSON.stringify(after[key] ?? null);
+    changes.push(`host service ${key}: ${JSON.stringify(before[key] ?? null)} -> ${next}`);
+  }
+  return changes;
+}
+
 export function describeCompiledPolicyChanges(
   before: CompiledDesiredPolicy,
   after: CompiledDesiredPolicy,
+  owners?: AdmittedHostServiceOwners,
 ): string[] {
   const changes: string[] = [];
   const beforeHosts = new Set(before.policy.hosts);
@@ -48,7 +74,7 @@ export function describeCompiledPolicyChanges(
   for (const host of before.policy.hosts.filter((host) => !afterHosts.has(host))) changes.push(`host ${host}: removed`);
   changes.push(...describeRecordChanges("request", before.policy.requests ?? {}, after.policy.requests ?? {}));
   changes.push(...describeRecordChanges("credential", before.policy.tokens ?? {}, after.policy.tokens ?? {}));
-  changes.push(...describeRecordChanges("host service", before.policy.hostServices ?? {}, after.policy.hostServices ?? {}));
+  changes.push(...describeHostServiceChanges(before.policy.hostServices ?? {}, after.policy.hostServices ?? {}, owners));
   changes.push(...describeRecordChanges("OAuth", before.oauth, after.oauth));
   changes.push(...describeRecordChanges("service", before.selectedServices, after.selectedServices));
   changes.push(...describeRecordChanges(
@@ -92,6 +118,7 @@ export function desiredPolicyReviewLines(
   candidate: DesiredPolicyCandidate,
   subject: ControlSubject,
   scope: "local" | "project",
+  owners?: AdmittedHostServiceOwners,
 ): string[] {
   const policy = scope === "project" ? candidate.project : candidate.local;
   const lines = [
@@ -110,9 +137,13 @@ export function desiredPolicyReviewLines(
       local: scope === "local" ? candidate.local : previousLocal,
     });
     lines.push("effective semantic changes:");
-    const changes = describeCompiledPolicyChanges(before, after);
+    const changes = describeCompiledPolicyChanges(before, after, owners);
     if (changes.length === 0) lines.push("  none (provenance-only or canonical no-op)");
     else for (const change of changes) lines.push(`  - ${change}`);
+  } else if (owners) {
+    // No change list to annotate (no usable approved base): name every
+    // admitted listener on its own.
+    lines.push(...admittedOwnerReviewLines(owners));
   }
   lines.push("This approval applies only to this exact canonical policy input.");
   return lines;

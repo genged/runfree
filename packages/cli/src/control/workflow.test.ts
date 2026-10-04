@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { afterEach, beforeEach, describe, expect, test } from "vitest";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
 import { projectInfo } from "../config.ts";
 import { desiredServiceEntry } from "../admin/service-policy.ts";
@@ -25,6 +25,8 @@ import {
   usePreparedApprovedPolicyGeneration,
 } from "./workflow.ts";
 import { readActiveControlSelection } from "./effective.ts";
+import type { HostServiceAdmit } from "./host-service-approval-admission.ts";
+import { desiredPolicyReviewLines } from "./review-render.ts";
 
 describe("quiesced control workflow", () => {
   let root: string;
@@ -195,6 +197,135 @@ describe("quiesced control workflow", () => {
     await expect(approveAutomaticNetworkReduction(context, io(), "network-local")).rejects.toThrow("not a proven authority reduction");
     expect(readControlApprovalSelection(root, context.project)?.subjects["network-local"]?.digest).toBe(selectedLocalBefore);
     expect(readApprovedNetworkPolicy(root, context.project, "network-local")?.hostServices).toBeUndefined();
+  });
+
+  const IDB_POLICY = (port: number) => JSON.stringify({
+    version: 2,
+    hosts: ["example.com"],
+    hostServices: { idb: { target: "host-loopback", port } },
+  });
+  const admitted: HostServiceAdmit = (_runtime, _io, port) => ({ ok: true, owner: { command: `owner-${port}`, pid: 4242 } });
+  const refused: HostServiceAdmit = (_runtime, _io, port) => ({ ok: false, reason: `no process listens on 127.0.0.1:${port}` });
+
+  /** Both network layers approved as they stand now (host services admitted by a stub). */
+  async function approveBothLayers(): Promise<void> {
+    const candidate = await captureQuiescedDesiredPolicyCandidate(context, io());
+    for (const subjectType of ["network-project", "network-local"] as const) {
+      await approveNetworkControl(context, io(), subjectType, {
+        expectedDigest: subjectType === "network-project" ? candidate.projectSubject.digest : candidate.localSubject.digest,
+        mechanism: "digest-command",
+        admitHostService: admitted,
+      });
+    }
+  }
+
+  test("an agent re-pointing an approved host service to another port is refused by automatic reduction and startup, in both layers (SR1)", async () => {
+    const localPath = path.join(root, ".runfree", "network-policy.local.json");
+    for (const layer of ["project", "local"] as const) {
+      const layerPath = layer === "project" ? path.join(root, ".runfree", "network-policy.json") : localPath;
+      const subjectType = layer === "project" ? "network-project" : "network-local";
+      // Approved: idb on 10882 in this layer only.
+      fs.writeFileSync(path.join(root, ".runfree", "network-policy.json"), layer === "project" ? IDB_POLICY(10882) : `{"version":2,"hosts":["example.com"]}`);
+      fs.writeFileSync(localPath, layer === "local"
+        ? JSON.stringify({ version: 2, hosts: [], hostServices: { idb: { target: "host-loopback", port: 10882 } } })
+        : `{"version":2,"hosts":[]}`);
+      await approveBothLayers();
+      const interactive = io();
+      interactive.isInteractive = () => true;
+      interactive.confirm = () => true;
+      const started = await prepareEffectiveControlsForStartup(context, interactive, { admitHostService: admitted });
+      const selectedBefore = readControlApprovalSelection(root, context.project)?.subjects[subjectType]?.digest;
+
+      // As the agent would: the same name, another port.
+      const repointed = JSON.parse(fs.readFileSync(layerPath, "utf8")) as { hostServices: Record<string, { port: number }> };
+      repointed.hostServices.idb.port = 10883;
+      fs.writeFileSync(layerPath, JSON.stringify(repointed));
+
+      await expect(approveAutomaticNetworkReduction(context, io(), subjectType)).rejects.toThrow("not a proven authority reduction");
+      const nonInteractive = io();
+      nonInteractive.isInteractive = () => false;
+      await expect(prepareEffectiveControlsForStartup(context, nonInteractive)).rejects.toThrow(
+        "desired controls require exact approval before startup",
+      );
+      expect(readControlApprovalSelection(root, context.project)?.subjects[subjectType]?.digest, layer).toBe(selectedBefore);
+      expect(readApprovedNetworkPolicy(root, context.project, subjectType)?.hostServices?.idb?.port, layer).toBe(10882);
+      expect(readActiveControlSelection(context.project)?.controlGeneration, layer).toBe(started.generation.controlGeneration);
+    }
+  });
+
+  test("policy approval of an agent-added host service runs the port admission and refuses before writing (R21)", async () => {
+    await approveBothLayers();
+    fs.writeFileSync(path.join(root, ".runfree", "network-policy.json"), IDB_POLICY(10882));
+    const before = fs.readFileSync(context.project.paths.controlApprovalsPath, "utf8");
+    const admit = vi.fn(refused);
+    const confirm = vi.fn(() => true);
+
+    for (const mechanism of ["digest-command", "interactive"] as const) {
+      const candidate = await captureQuiescedDesiredPolicyCandidate(context, io());
+      await expect(approveNetworkControl(context, io(), "network-project", {
+        ...(mechanism === "digest-command" ? { expectedDigest: candidate.projectSubject.digest } : { confirm }),
+        mechanism,
+        admitHostService: admit,
+      })).rejects.toThrow(/failed the port admission[\s\S]*host service idb \(127\.0\.0\.1:10882, project layer\): no process listens[\s\S]*runfree policy review --project/u);
+    }
+    expect(admit).toHaveBeenCalledTimes(2);
+    expect(confirm).not.toHaveBeenCalled();
+    expect(fs.readFileSync(context.project.paths.controlApprovalsPath, "utf8")).toBe(before);
+    expect(readApprovedNetworkPolicy(root, context.project, "network-project")?.hostServices).toBeUndefined();
+
+    // An unchanged host service is not re-admitted; only additions and re-ports are.
+    const unrelated = vi.fn(admitted);
+    fs.writeFileSync(path.join(root, ".runfree", "network-policy.json"), `{"version":2,"hosts":["example.com","other.example.com"]}`);
+    await approveNetworkControl(context, io(), "network-project", { mechanism: "interactive", confirm: () => true, admitHostService: unrelated });
+    expect(unrelated).not.toHaveBeenCalled();
+  });
+
+  test("an admitted host service is approved, and the review names the admitted listener (R21)", async () => {
+    await approveBothLayers();
+    fs.writeFileSync(path.join(root, ".runfree", "network-policy.json"), IDB_POLICY(10882));
+    let reviewed: string[] = [];
+    const selection = await approveNetworkControl(context, io(), "network-project", {
+      mechanism: "interactive",
+      admitHostService: admitted,
+      confirm: (candidate, subject, owners) => {
+        reviewed = desiredPolicyReviewLines(context, candidate, subject, "project", owners);
+        return true;
+      },
+    });
+    expect(reviewed).toContain("  - host service idb: null -> 127.0.0.1:10882 (owner-10882, pid 4242)");
+    expect(selection.subjects["network-project"]?.mechanism).toBe("interactive");
+    expect(readApprovedNetworkPolicy(root, context.project, "network-project")?.hostServices?.idb?.port).toBe(10882);
+  });
+
+  test("the interactive startup approval runs the port admission before consent (R21)", async () => {
+    const interactive = io();
+    interactive.isInteractive = () => true;
+    interactive.confirm = () => true;
+    const started = await prepareEffectiveControlsForStartup(context, interactive);
+    fs.writeFileSync(path.join(root, ".runfree", "network-policy.json"), IDB_POLICY(10882));
+    const before = fs.readFileSync(context.project.paths.controlApprovalsPath, "utf8");
+
+    const refusing = io();
+    refusing.isInteractive = () => true;
+    const confirm = vi.fn(() => true);
+    refusing.confirm = confirm;
+    await expect(prepareEffectiveControlsForStartup(context, refusing, { admitHostService: refused }))
+      .rejects.toThrow("failed the port admission");
+    expect(confirm).not.toHaveBeenCalled();
+    expect(fs.readFileSync(context.project.paths.controlApprovalsPath, "utf8")).toBe(before);
+    expect(readActiveControlSelection(context.project)?.controlGeneration).toBe(started.generation.controlGeneration);
+
+    const accepting = io();
+    accepting.isInteractive = () => true;
+    const prompts: string[] = [];
+    accepting.confirm = (message: string) => {
+      prompts.push(message);
+      return true;
+    };
+    const approved = await prepareEffectiveControlsForStartup(context, accepting, { admitHostService: admitted });
+    expect(approved.mechanism).toBe("interactive");
+    expect(prompts.join("\n")).toContain("host service idb: 127.0.0.1:10882 (owner-10882, pid 4242)");
+    expect(readApprovedNetworkPolicy(root, context.project, "network-project")?.hostServices?.idb?.port).toBe(10882);
   });
 
   test("refuses first startup non-interactively before selecting effective authority", async () => {

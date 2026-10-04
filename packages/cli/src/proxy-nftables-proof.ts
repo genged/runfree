@@ -71,6 +71,7 @@ const DEFAULT_AUDIT_SET_NAME = "audit_ipv4";
 const DEFAULT_AUDIT_DRAINING_SET_NAME = "audit_draining_ipv4";
 const HOST_SERVICE_SET_NAME = "host_service";
 const HOST_SERVICE_DRAINING_SET_NAME = "host_service_draining";
+const HOST_SERVICE_GATEWAY_SET_NAME = "host_service_gateways";
 // `ipv4_addr . inet_service`, as nft JSON writes a concatenated set type.
 const HOST_SERVICE_SET_TYPE = ["ipv4_addr", "inet_service"] as const;
 const IPV4_OCTET = "(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])";
@@ -337,7 +338,7 @@ export function validateProxyNftablesTableJson(input: ProxyNftablesProofInput): 
 
   const sets = statements.map((statement) => statement.set).filter((set): set is NftSet => set !== undefined);
   const expectedSets: ReadonlyArray<{ name: string; concat: boolean }> = [
-    ...[setName, DEFAULT_SESSION_SET_NAME, DEFAULT_AUDIT_SET_NAME, DEFAULT_AUDIT_DRAINING_SET_NAME]
+    ...[setName, DEFAULT_SESSION_SET_NAME, DEFAULT_AUDIT_SET_NAME, DEFAULT_AUDIT_DRAINING_SET_NAME, HOST_SERVICE_GATEWAY_SET_NAME]
       .map((name) => ({ name, concat: false })),
     // Exactly these two sets are `ipv4_addr . inet_service`.
     { name: HOST_SERVICE_SET_NAME, concat: true },
@@ -470,6 +471,18 @@ export function validateProxyNftablesTableJson(input: ProxyNftablesProofInput): 
       exprCount: 3,
       matches: (expr) => nftExprHasMatch(expr, { kind: "meta", key: "oifname" }, input.egressIface)
         && nftExprHasMatch(expr, { kind: "concat-daddr-dport" }, `@${HOST_SERVICE_DRAINING_SET_NAME}`)
+        && nftExprHasVerdict(expr, "drop"),
+    },
+    {
+      // The permanent cut (R19): any flow, from any uid, to a gateway pinned
+      // this supervisor lifetime on a pair NOT in @host_service is dropped
+      // above the established accept. The negated lookup is the load-bearing
+      // half: an `==` here would drop the approved pairs instead.
+      label: "egress-interface pinned-gateway cut of unapproved pairs above established accept",
+      exprCount: 4,
+      matches: (expr) => nftExprHasMatch(expr, { kind: "meta", key: "oifname" }, input.egressIface)
+        && nftExprHasMatch(expr, { kind: "payload", protocol: "ip", field: "daddr" }, `@${HOST_SERVICE_GATEWAY_SET_NAME}`)
+        && nftExprHasMatch(expr, { kind: "concat-daddr-dport" }, `@${HOST_SERVICE_SET_NAME}`, "!=")
         && nftExprHasVerdict(expr, "drop"),
     },
     {

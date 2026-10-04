@@ -78,6 +78,10 @@ export function buildFirewallPlan(input: BuildFirewallPlanInput): FirewallPlan {
       // Each element is `<pinned gateway> . <port>`, one per approved host
       // service; policy validation caps the entries at the same number.
       hostServiceMaxElements: HOST_SERVICE_MAX_ENTRIES,
+      hostServiceGatewaySetName: "host_service_gateways",
+      // The supervisor pins one gateway per lifetime (a later different read
+      // is sticky, HS8); the headroom covers re-initialization in one process.
+      hostServiceGatewayMaxElements: 8,
     },
     hostServiceDrainSeconds: positiveInteger(
       env.PROXY_HOST_SERVICE_DRAIN_SECONDS ?? "30",

@@ -1274,6 +1274,8 @@ output  default drop; allow loopback, established, TCP 443 to @allowed_ipv4
         (and @audit_ipv4 in audit mode) on the egress interface
         drop TCP to @host_service_draining (<gateway> . <port>) on the egress
         interface, above the established accept
+        drop TCP to @host_service_gateways whose <gateway> . <port> is not in
+        @host_service, on the egress interface, above the established accept
         allow TCP to @host_service (<gateway> . <port>) on the egress
         interface for uid 1001 only
 dns     uid 1001 port 53 rejected before Docker DNS rewrite
@@ -1397,10 +1399,10 @@ in the background before the readiness loop and never waits for it. It binds
 template renders from the network policy of the same effective policy
 generation as the session's agent environment. The relay runs as the agent
 user with no added authority; a port it cannot bind (for example one another
-process in the session already holds) is skipped with a warning. A missing relay binary, a crash, or a bind
-failure never changes the entry's exit code or delays its final `exec`. The
-relay binds first, so a later agent process that wants the same port gets
-`EADDRINUSE`. It binds loopback only, and each session has its own network
+process in the session already holds) is skipped with a warning. A missing
+relay binary, a crash, or a bind failure never changes the entry's exit code
+or delays its final `exec`. The relay binds first, so a later agent process
+that wants the same port gets `EADDRINUSE`. It binds loopback only, and each session has its own network
 namespace, so a peer session cannot reach it. A service added mid-session
 appears in the next session.
 
@@ -1452,28 +1454,49 @@ gateway change or withdrawal:
 2. The firewall moves removed or re-addressed pairs from `@host_service` to
    `@host_service_draining` in one atomic batch. That set's drop rule sits
    above the established-connection accept, so in-flight packets stop at
-   once. The pairs leave the set after a 30 s drain window; after that only
-   the request proxy's cut keeps an old flow from passing the established
-   accept again.
+   once. The pairs leave the draining set after a 30 s drain window. The
+   permanent cut is a second drop rule above the established accept:
+   `ip daddr @host_service_gateways ip daddr . tcp dport != @host_service
+   drop`. `@host_service_gateways` holds every gateway the supervisor pinned
+   in its lifetime, and every host-service batch refills it before the accept
+   set, so a pair is never accepted without its cut. A flow to a pinned
+   gateway on a pair that is not currently approved is dropped for as long
+   as that holds, for every uid, even when the request proxy did not cut it
+   (a stale request proxy, or a flow it never tracked). The draining set
+   stays as defence in depth with the same effect inside its window.
 
 On a removal, each consumer applies its cut before it publishes the status
-that names the new effective policy generation, so `runfree host-service
-remove` reports `live now` only after both have cut. The firewall status also
-carries a digest of both sets and the draining count; the request-proxy status
-records the open splices per service at each publish. On a gateway change or
-withdrawal, the request proxy cuts open splices within about a second, the
-firewall drain drops their in-flight packets for 30 s, and new CONNECTs
-refuse.
+that names the new effective policy generation, and activation waits for both
+statuses, so `runfree host-service remove` reports `live now` only after both
+have cut. Convergence comes from that ordering alone. The firewall status also
+carries a digest of both sets and the draining count, and the request-proxy
+status records the open splices per service at each publish; these fields are
+diagnostics, and nothing reads them to decide convergence. On a gateway change
+or withdrawal, the request proxy cuts open splices within about a second, the
+firewall drops their packets from then on, and new CONNECTs refuse.
 
 **Port admission and the registry.** `runfree host-service add` checks the
 port before the policy transaction, outside the project lifecycle lock:
 
 1. the static refusals above;
-2. `lsof -nP +c 0 -iTCP:<port> -sTCP:LISTEN` on the host must show a visible
-   listener (no listener refuses; this also catches ports Docker Desktop
-   answers from its VM and root-owned services), and no listener may be a
-   `com.docker.*` process (a published container port);
+2. `lsof -nP +c 0 -iTCP:<port> -sTCP:LISTEN -Fpcn` on the host must show a
+   visible listener bound to `127.0.0.1:<port>` or `*:<port>`, the addresses
+   the gateway reaches. No visible listener refuses; this also catches ports
+   Docker Desktop answers from its VM. A root-owned listener is invisible to
+   the unprivileged `lsof`, so it refuses as "no visible listener" too. A
+   listener only on `[::1]` or a LAN address refuses with its address. No
+   listener on any address may be a `com.docker.*` process (a published
+   container port);
 3. the review line names the admitted process and pid.
+
+The same admission runs on every other host approval path that approves a
+host service added or re-ported relative to the approved layer: the startup
+review, `runfree policy approve`, `runfree control approve`, the
+checkout-binding review, and the setup wizard's base review. It runs after the
+candidate capture releases the lifecycle lock and before any approval write.
+A refusal names each entry, its reason, and the review command; the review
+line reads, for example, `host service idb: null -> 127.0.0.1:10882
+(idb_companion, pid 4242)`.
 
 Every launch and `runfree status` repeat the owner check for each effective
 entry and warn, without blocking, when there is no listener, Docker Desktop
@@ -1484,17 +1507,21 @@ every project's effective host-service ports. `host-service add` and `remove`
 refresh it after activation, each launch refreshes it for a project that has
 host services or a registry row, and a completed `runfree destroy` prunes it.
 In every other project, `runfree forward` and `runfree vnc` refuse a
-registered port and name the owning project, and MCP callback port selection
-skips it. A corrupt or
+registered port and name every owning project, and MCP callback port selection
+skips it. Several projects may approve the same port (two projects sharing one
+`idb_companion`, for example); only a duplicate port inside one project's row
+is invalid. A corrupt or
 unreadable registry makes `forward` and `vnc` refuse; the callback block is
 never a host-service port, so it is unaffected. `runfree host-service list
 --repair` rebuilds the registry from each known project's selected effective
 policy generation.
 
 **Host-side proof.** Each launch's topology proof checks the proxy
-`ExtraHosts` and `/etc/hosts`, the two set types and rules, and that the
-kernel members of `@host_service` equal the effective ports paired with the
-published gateway. On the full path (not a matching warm launch),
+`ExtraHosts` and `/etc/hosts`, the three set types and their rules, and that
+the kernel members of `@host_service` equal the effective ports paired with
+the published gateway. The members of `@host_service_gateways` are not read
+back by the host; the renderer refuses any batch whose accepted pairs are not
+at a gateway in that set. On the full path (not a matching warm launch),
 agent-position probes to `<gateway>:<port>` must fail, and proxy-position
 probes must time out (a dropped SYN): root to each approved port, and uid 1001
 to an unapproved port.

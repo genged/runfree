@@ -34,6 +34,11 @@
 //      accepts exactly this pair above the `@host_service_draining` drop for
 //      the whole removal, so the firewall cut cannot act, and the host still
 //      sees the connection close (the proxy's own FIN).
+//   7b. firewall-only cut (R19): a root flow in the proxy, opened through a
+//      one-shot root rule, is one the request proxy does not track. After
+//      `host-service remove` and past the drain window, new bytes on it never
+//      reach the host: the pinned-gateway drop above the established accept
+//      holds the cut with no time limit.
 //   8. session stop: the host sees the splice close when its session ends.
 //      The session's processes die with the container, so this does not
 //      separate the proxy's revoke-driven socket cut from an ordinary client
@@ -49,13 +54,13 @@
 //
 // Recorded proof gaps (not staged here, never faked):
 //
-//   - The firewall drain alone, on `host-service remove` or on a gateway
-//     change: the request proxy cuts a removed pair's splices on reload and
-//     cuts every splice on a withdrawn or changed gateway, with no switch to
-//     disable either. No faithful stage exists in which only the
-//     `@host_service_draining` drop acts. Its rule order is covered by the
-//     ruleset proof and the supervisor unit tests, and case 7 proves the
-//     drop is armed (the pair enters the draining set).
+//   - The firewall cut of a request-proxy splice, on `host-service remove`
+//     or on a gateway change: the request proxy cuts a removed pair's
+//     splices on reload and cuts every splice on a withdrawn or changed
+//     gateway, with no switch to disable either. Case 7b stages the firewall
+//     cut alone on a root flow the request proxy does not track, which is
+//     the same kernel path (the drops are not uid-scoped); the rule order is
+//     covered by the ruleset proof and the supervisor unit tests.
 //   - A changed proxy `HostConfig.ExtraHosts` failing the topology proof with
 //     `proxy-extra-hosts-exact`: a running container's ExtraHosts cannot be
 //     changed without recreating it from a different Compose template. The
@@ -104,6 +109,7 @@ const DRAIN_WINDOW_MS = 30_000;
 /** Firewall maintenance runs every 2 s; this allows several ticks. */
 const MAINTENANCE_WAIT_MS = 30_000;
 const BYPASS_COMMENT = "runfree-livetest-drain-bypass";
+const ROOT_OPENER_COMMENT = "runfree-livetest-root-opener";
 /** A public address: the gateway validator requires RFC 1918. */
 const TAMPERED_GATEWAY = "1.1.1.1";
 
@@ -304,7 +310,7 @@ function sessionRawConnect(sessionId: string, proxyIp: string, authority: string
 const LONG_LIVED_CLIENT_PROGRAM = `
 const net = require("node:net");
 const port = Number(process.argv[1]);
-const socket = net.connect({ host: "127.0.0.1", port });
+const socket = net.connect({ host: process.argv[2] || "127.0.0.1", port });
 let incoming = "";
 let outgoing = "";
 socket.on("connect", () => console.log("connected"));
@@ -331,13 +337,22 @@ type LongLivedClient = Readonly<{
 }>;
 
 function openLongLivedClient(sessionId: string, port: number): LongLivedClient {
+  return spawnLongLivedClient(["exec", "-i", sessionId, "env", ...PROXY_ENV_UNSET, "node", "-e", LONG_LIVED_CLIENT_PROGRAM, String(port)]);
+}
+
+/**
+ * A root-owned client inside the proxy container, connected straight to
+ * `gateway:port`. The request proxy never sees it, so no request-proxy cut
+ * can close it: only the firewall can stop its bytes.
+ */
+function openRootProxyClient(proxyId: string, gateway: string, port: number): LongLivedClient {
+  return spawnLongLivedClient(["exec", "-i", "--user", "0:0", proxyId, "node", "-e", LONG_LIVED_CLIENT_PROGRAM, String(port), gateway]);
+}
+
+function spawnLongLivedClient(dockerArgs: readonly string[]): LongLivedClient {
   // Asynchronous on purpose: this client must stay open across the CLI and
   // Docker calls the case makes while it is connected.
-  const child = childProcess.spawn(
-    "docker",
-    ["exec", "-i", sessionId, "env", ...PROXY_ENV_UNSET, "node", "-e", LONG_LIVED_CLIENT_PROGRAM, String(port)],
-    { stdio: ["pipe", "pipe", "pipe"] },
-  );
+  const child = childProcess.spawn("docker", [...dockerArgs], { stdio: ["pipe", "pipe", "pipe"] });
   const received: string[] = [];
   let partial = "";
   let stderr = "";
@@ -428,11 +443,31 @@ function drainBypassPresent(proxyId: string): boolean {
 }
 
 function removeDrainBypass(proxyId: string): void {
+  removeCommentedRules(proxyId, BYPASS_COMMENT);
+}
+
+function removeCommentedRules(proxyId: string, comment: string): void {
   for (const line of outputChainWithHandles(proxyId).split("\n")) {
-    const match = line.includes(BYPASS_COMMENT) ? /# handle (\d+)/u.exec(line) : null;
-    if (match) dockerOrThrow("remove drain bypass", ["exec", "--user", "0:0", proxyId, "nft", "delete", "rule", "inet", NFT_TABLE, "output", "handle", match[1]]);
+    const match = line.includes(comment) ? /# handle (\d+)/u.exec(line) : null;
+    if (match) dockerOrThrow(`remove ${comment}`, ["exec", "--user", "0:0", proxyId, "nft", "delete", "rule", "inet", NFT_TABLE, "output", "handle", match[1]]);
   }
-  if (drainBypassPresent(proxyId)) throw new Error("the drain bypass rule is still in the output chain");
+  if (outputChainWithHandles(proxyId).includes(comment)) throw new Error(`the ${comment} rule is still in the output chain`);
+}
+
+/**
+ * Lets root open one NEW flow to exactly `gateway:port`: a rule at the top
+ * of the output chain. Root has no host-service accept of its own (uid 1001
+ * only), so this is the only way to stage a flow the request proxy does not
+ * track. Removed by `removeCommentedRules` right after the connect; a
+ * leftover rule fails the next launch's ruleset proof.
+ */
+function installRootOpener(proxyId: string, gateway: string, port: number): void {
+  dockerOrThrow("install root opener", [
+    "exec", "--user", "0:0", proxyId, "nft", "insert", "rule", "inet", NFT_TABLE, "output",
+    "meta", "skuid", "0", "ip", "daddr", gateway, "tcp", "dport", String(port), "ct", "state", "new",
+    "accept", "comment", `"${ROOT_OPENER_COMMENT}"`,
+  ]);
+  if (!outputChainWithHandles(proxyId).includes(ROOT_OPENER_COMMENT)) throw new Error("the root opener rule did not land in the output chain");
 }
 
 function proxyLogsSince(proxyId: string, sinceIso: string): string {
@@ -535,7 +570,10 @@ describe("approved host services", () => {
     try {
       if (fixture) {
         try {
-          if (proxyId && docker(["container", "inspect", proxyId]).status === 0 && drainBypassPresent(proxyId)) removeDrainBypass(proxyId);
+          if (proxyId && docker(["container", "inspect", proxyId]).status === 0) {
+            if (drainBypassPresent(proxyId)) removeDrainBypass(proxyId);
+            if (outputChainWithHandles(proxyId).includes(ROOT_OPENER_COMMENT)) removeCommentedRules(proxyId, ROOT_OPENER_COMMENT);
+          }
         } finally {
           try {
             await releaseStandingSessions(sessions.splice(0), () => forceCleanSessions(fixture));
@@ -731,6 +769,63 @@ describe("approved host services", () => {
     // Restore the approval for the remaining cases.
     runConverged(["host-service", "add", SERVICE_NAME, "--port", String(port)]);
     await assertEchoThroughRelay(sessionId, "re-added");
+  }, TEST_TIMEOUT_MS);
+
+  test("the firewall alone keeps a removed pair cut past the drain window (R19)", async () => {
+    // A flow the request proxy does not track: root in the proxy, opened
+    // through a one-shot root rule while the pair is approved. No request-
+    // proxy cut can close it, so only the firewall stops its bytes.
+    const gateway = pinnedGateway(proxyId);
+    const pair = `${gateway} . ${port}`;
+    installRootOpener(proxyId, gateway, port);
+    let client: LongLivedClient | undefined;
+    try {
+      client = openRootProxyClient(proxyId, gateway, port);
+      const opened = nonce("untracked");
+      client.send(opened);
+      await client.waitForLine(`echo ${opened}`, 20_000);
+    } finally {
+      removeCommentedRules(proxyId, ROOT_OPENER_COMMENT);
+    }
+    try {
+      // Positive control: with the opener gone, the established flow still
+      // carries bytes while the pair is approved.
+      const control = nonce("untracked-control");
+      client.send(control);
+      await client.waitForLine(`echo ${control}`, 20_000);
+      const hostId = hostConnectionCarrying(echo, control);
+      expect(hostId, "the host never saw the root flow").toBeDefined();
+
+      runConverged(["host-service", "remove", SERVICE_NAME]);
+      await pollUntil(() => hostServiceSetMembers(proxyId, "host_service_draining").includes(pair), {
+        timeoutMs: MAINTENANCE_WAIT_MS,
+        label: "the firewall to drain the removed pair",
+      });
+      const drainObservedAt = Date.now();
+      await pollUntil(() => !hostServiceSetMembers(proxyId, "host_service_draining").includes(pair), {
+        timeoutMs: DRAIN_WINDOW_MS + MAINTENANCE_WAIT_MS,
+        label: "the drain window to close",
+      });
+      const windowLeft = DRAIN_WINDOW_MS - (Date.now() - drainObservedAt);
+      if (windowLeft > 0) await sleep(windowLeft);
+      expect(hostServiceSetMembers(proxyId, "host_service"), "the removed pair is still accepted").toEqual([]);
+
+      // Past the drain window the established accept would pass this flow
+      // again; the pinned-gateway cut must still drop it.
+      const hostDataBefore = hostDataEvents(echo, hostId as number);
+      const late = nonce("untracked-late");
+      client.send(late);
+      await sleep(5_000);
+      expect(hostConnectionCarrying(echo, late), "bytes reached the host on a removed pair after the drain window").toBeUndefined();
+      expect(hostDataEvents(echo, hostId as number), "the host saw new data on the removed pair").toBe(hostDataBefore);
+      expect(client.lines(), "the root client got an echo after the drain window").not.toContain(`echo ${late}`);
+    } finally {
+      client.stop();
+    }
+
+    // Restore the approval for the remaining cases.
+    runConverged(["host-service", "add", SERVICE_NAME, "--port", String(port)]);
+    await assertEchoThroughRelay(sessions[0].session.containerId, "re-added after the firewall-only cut");
   }, TEST_TIMEOUT_MS);
 
   test("no splice outlives its session", async () => {

@@ -1190,7 +1190,7 @@ describe("admin host-service command", () => {
 
       expect(hostServiceSeams.recorded).toEqual([{ ports: [10882], owners: { 10882: "idb_companion" } }]);
       const registry = readHostServicePortRegistry(env);
-      expect(registry.ok && registry.owners.get(10882)).toMatchObject({
+      expect(registry.ok && registry.owners.get(10882)?.[0]).toMatchObject({
         projectId: projectHash(root),
         projectRoot: root,
         command: "idb_companion",
@@ -1230,7 +1230,7 @@ describe("admin host-service command", () => {
       });
       publish();
       hostServiceSeams.probe = (port) => port === 10882
-        ? { kind: "listener", command: "idb_companion", pid: 4242, count: 1, commands: ["idb_companion"] }
+        ? { kind: "listener", command: "idb_companion", pid: 4242, count: 1, commands: ["idb_companion"], listeners: [{ command: "idb_companion", pid: 4242, addresses: ["127.0.0.1:10882"] }] }
         : { kind: "none" };
       const out = captureStdout();
 
@@ -1263,7 +1263,7 @@ describe("admin host-service command", () => {
       expect(status).toBe(0);
       expect(out.text()).toContain("host-service port registry rebuilt: 1 port(s) from 1 project(s)");
       const registry = readHostServicePortRegistry(env);
-      expect(registry.ok && registry.owners.get(10882)).toMatchObject({ projectId: projectHash(root), projectRoot: root });
+      expect(registry.ok && registry.owners.get(10882)?.[0]).toMatchObject({ projectId: projectHash(root), projectRoot: root });
     });
   });
 });

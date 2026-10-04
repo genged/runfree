@@ -18,6 +18,7 @@ import { desiredPolicyReviewLines } from "../control/review-render.ts";
 import { activateApprovedControlsAfterMutation } from "../control/activation.ts";
 import { CliError } from "../errors.ts";
 import { formatTerminalTable } from "../terminal-table.ts";
+import type { AdmittedHostServiceOwners } from "../control/host-service-approval-admission.ts";
 import type { DesiredPolicyCandidate } from "../control/candidates.ts";
 import type { ControlSubject } from "../control/subjects.ts";
 import type { CommandModule } from "./types.ts";
@@ -74,8 +75,9 @@ export function printApprovalReview(
   subject: ControlSubject,
   scope: "local" | "project",
   io: RuntimeIO = nodeRuntimeIO,
+  owners?: AdmittedHostServiceOwners,
 ): boolean {
-  for (const line of desiredPolicyReviewLines(runtime, candidate, subject, scope)) console.log(line);
+  for (const line of desiredPolicyReviewLines(runtime, candidate, subject, scope, owners)) console.log(line);
   return io.confirm("Approve exact policy? [y/N] ");
 }
 
@@ -260,7 +262,7 @@ export const policyCommand: CommandModule = {
                 expectedDigest: intent.expectedDigest,
                 mechanism: intent.mechanism,
                 ...(intent.mechanism === "interactive"
-                  ? { confirm: (candidate, subject) => printApprovalReview(runtime, candidate, subject, intent.scope) }
+                  ? { confirm: (candidate, subject, owners) => printApprovalReview(runtime, candidate, subject, intent.scope, nodeRuntimeIO, owners) }
                   : {}),
               },
             );

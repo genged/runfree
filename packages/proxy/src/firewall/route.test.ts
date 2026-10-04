@@ -29,6 +29,8 @@ const plan: FirewallPlan = {
     auditMaxElements: 256,
     hostServiceSetName: "host_service",
     hostServiceDrainingSetName: "host_service_draining",
+    hostServiceGatewaySetName: "host_service_gateways",
+    hostServiceGatewayMaxElements: 8,
     hostServiceMaxElements: 64,
   },
   hostServiceDrainSeconds: 30,
@@ -149,13 +151,14 @@ describe("proxy firewall route verification", () => {
       { command: "nft", args: ["list", "set", "inet", "runfree_proxy", "session_ipv4"], input: undefined },
       { command: "nft", args: ["list", "set", "inet", "runfree_proxy", "host_service"], input: undefined },
       { command: "nft", args: ["list", "set", "inet", "runfree_proxy", "host_service_draining"], input: undefined },
+      { command: "nft", args: ["list", "set", "inet", "runfree_proxy", "host_service_gateways"], input: undefined },
       { command: "nft", args: ["list", "set", "inet", "runfree_proxy", "audit_ipv4"], input: undefined },
       { command: "nft", args: ["list", "set", "inet", "runfree_proxy", "audit_draining_ipv4"], input: undefined },
     ]);
   });
 
-  test("fails verification when either host-service set is missing, and passes once it exists", async () => {
-    for (const hostServiceSet of ["host_service", "host_service_draining"] as const) {
+  test("fails verification when any host-service set is missing, and passes once it exists", async () => {
+    for (const hostServiceSet of ["host_service", "host_service_draining", "host_service_gateways"] as const) {
       const missing = createRunner({ routes: [routeJson("eth1", "172.30.1.10")], nftMissingSets: [hostServiceSet] });
       await expect(verifyFirewallState(plan, missing.runner)).rejects.toThrow(`set ${hostServiceSet}`);
     }

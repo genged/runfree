@@ -143,7 +143,7 @@ export async function ensureWizardApprovedBase(context: RuntimeContext, io: Runt
   try {
     await approveNetworkControl(context, io, "network-project", {
       mechanism: "interactive",
-      confirm: (candidate, subject) => printApprovalReview(context, candidate, subject, "project", io),
+      confirm: (candidate, subject, owners) => printApprovalReview(context, candidate, subject, "project", io, owners),
     });
     return true;
   } catch (error) {

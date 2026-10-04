@@ -45,8 +45,8 @@ const context = {
 };
 
 describe("probeHostPortOwner", () => {
-  test("parses the first listener's pid and command from lsof field output", () => {
-    const { io, calls } = fakeIo({ status: 0, stdout: "p4242\ncidb_companion\n", stderr: "" });
+  test("parses the first listener's pid, command, and listen addresses from lsof field output", () => {
+    const { io, calls } = fakeIo({ status: 0, stdout: "p4242\ncidb_companion\nf7\nn127.0.0.1:10882\n", stderr: "" });
 
     expect(probeHostPortOwner(context, io, 10882, "darwin")).toEqual({
       kind: "listener",
@@ -54,11 +54,12 @@ describe("probeHostPortOwner", () => {
       pid: 4242,
       count: 1,
       commands: ["idb_companion"],
+      listeners: [{ command: "idb_companion", pid: 4242, addresses: ["127.0.0.1:10882"] }],
     });
     expect(calls).toHaveLength(1);
     expect(calls[0].command).toBe("/usr/sbin/lsof");
     // `+c 0`: never truncate the process name (the default width is 9).
-    expect(calls[0].args).toEqual(["-nP", "+c", "0", "-iTCP:10882", "-sTCP:LISTEN", "-Fpc"]);
+    expect(calls[0].args).toEqual(["-nP", "+c", "0", "-iTCP:10882", "-sTCP:LISTEN", "-Fpcn"]);
     expect(calls[0].options?.timeout).toBe(5_000);
     // Sanitized host env plus a fixed locale: no inherited secrets or locale.
     expect(calls[0].options?.env).toMatchObject({ LC_ALL: "C", HOME: os.tmpdir() });
@@ -66,7 +67,7 @@ describe("probeHostPortOwner", () => {
   });
 
   test("takes the first of several listeners and records the count", () => {
-    const { io } = fakeIo({ status: 0, stdout: "p4242\ncidb_companion\nf7\np5151\ncother\nf9\n", stderr: "" });
+    const { io } = fakeIo({ status: 0, stdout: "p4242\ncidb_companion\nf7\nn[::1]:10882\nf8\nn127.0.0.1:10882\np5151\ncother\nf9\nn*:10882\n", stderr: "" });
 
     expect(probeHostPortOwner(context, io, 10882, "darwin")).toEqual({
       kind: "listener",
@@ -74,6 +75,10 @@ describe("probeHostPortOwner", () => {
       pid: 4242,
       count: 2,
       commands: ["idb_companion", "other"],
+      listeners: [
+        { command: "idb_companion", pid: 4242, addresses: ["[::1]:10882", "127.0.0.1:10882"] },
+        { command: "other", pid: 5151, addresses: ["*:10882"] },
+      ],
     });
   });
 
@@ -99,7 +104,7 @@ describe("probeHostPortOwner", () => {
   });
 
   test("malformed field output is unavailable, never a listener", () => {
-    for (const stdout of ["cidb_companion\n", "pnot-a-pid\ncx\n", "p4242\n", "p0\ncx\n"]) {
+    for (const stdout of ["cidb_companion\n", "pnot-a-pid\ncx\n", "p4242\n", "p0\ncx\n", "n127.0.0.1:10882\np1\ncx\n", "p1\ncx\nn\n"]) {
       const { io } = fakeIo({ status: 0, stdout, stderr: "" });
       expect(probeHostPortOwner(context, io, 10882, "darwin").kind, stdout).toBe("unavailable");
     }
@@ -183,12 +188,56 @@ describe("admitHostServicePort", () => {
     expect(admission.ok ? "" : admission.reason).toMatch(/lsof/u);
   });
 
-  test("a visible listener is admitted and its owner returned", () => {
-    const { io } = fakeIo({ status: 0, stdout: "p4242\ncidb_companion\n", stderr: "" });
+  test("a visible listener on 127.0.0.1 is admitted and its owner returned", () => {
+    const { io } = fakeIo({ status: 0, stdout: "p4242\ncidb_companion\nf7\nn127.0.0.1:10882\n", stderr: "" });
 
     expect(admitHostServicePort(context, io, 10882, "darwin")).toEqual({
       ok: true,
       owner: { command: "idb_companion", pid: 4242 },
+    });
+  });
+
+  test("a wildcard listener (*:P) is admitted (R22)", () => {
+    const { io } = fakeIo({ status: 0, stdout: "p4242\ncidb_companion\nf7\nn*:10882\n", stderr: "" });
+
+    expect(admitHostServicePort(context, io, 10882, "darwin")).toEqual({
+      ok: true,
+      owner: { command: "idb_companion", pid: 4242 },
+    });
+  });
+
+  test("a listener only on [::1] is refused with its address (R22)", () => {
+    const { io } = fakeIo({ status: 0, stdout: "p4242\ncidb_companion\nf7\nn[::1]:10882\n", stderr: "" });
+
+    const admission = admitHostServicePort(context, io, 10882, "darwin");
+    expect(admission.ok).toBe(false);
+    expect(admission.ok ? "" : admission.reason).toContain("no visible listener on 127.0.0.1:10882 or *:10882");
+    expect(admission.ok ? "" : admission.reason).toContain("[::1]:10882");
+    expect(admission.ok ? "" : admission.reason).toContain("bind the service to 127.0.0.1");
+  });
+
+  test("a listener only on a LAN address is refused (R22)", () => {
+    const { io } = fakeIo({ status: 0, stdout: "p4242\ncidb_companion\nf7\nn192.168.1.20:10882\n", stderr: "" });
+
+    const admission = admitHostServicePort(context, io, 10882, "darwin");
+    expect(admission.ok ? "" : admission.reason).toContain("192.168.1.20:10882");
+  });
+
+  test("the admitted owner is the reachable listener, not the first one", () => {
+    const { io } = fakeIo({ status: 0, stdout: "p5151\ncv6_only\nf7\nn[::1]:10882\np4242\ncidb_companion\nf8\nn127.0.0.1:10882\n", stderr: "" });
+
+    expect(admitHostServicePort(context, io, 10882, "darwin")).toEqual({
+      ok: true,
+      owner: { command: "idb_companion", pid: 4242 },
+    });
+  });
+
+  test("a reachable listener mixed with a Docker Desktop listener is refused (R22)", () => {
+    const { io } = fakeIo({ status: 0, stdout: "p4242\ncidb_companion\nf7\nn*:10882\np77\nccom.docker.backend\nf9\nn[::1]:10882\n", stderr: "" });
+
+    expect(admitHostServicePort(context, io, 10882, "darwin")).toEqual({
+      ok: false,
+      reason: "127.0.0.1:10882 is owned by Docker Desktop (a published container port)",
     });
   });
 });
@@ -221,7 +270,7 @@ describe("hostServiceOwnerWarnings", () => {
   });
 
   test("a listener that differs from the recorded owner is one warning line", () => {
-    const io = fakeIoByPort({ 10882: { status: 0, stdout: "p5151\ncother_process\n", stderr: "" } });
+    const io = fakeIoByPort({ 10882: { status: 0, stdout: "p5151\ncother_process\nf7\nn127.0.0.1:10882\n", stderr: "" } });
 
     expect(hostServiceOwnerWarnings(context, io, idb, new Map([[10882, "idb_companion"]]))).toEqual([
       "host service idb (127.0.0.1:10882): listener changed to other_process",
@@ -229,13 +278,21 @@ describe("hostServiceOwnerWarnings", () => {
   });
 
   test("a listener that matches the recorded owner has no warning", () => {
-    const io = fakeIoByPort({ 10882: { status: 0, stdout: "p4242\ncidb_companion\n", stderr: "" } });
+    const io = fakeIoByPort({ 10882: { status: 0, stdout: "p4242\ncidb_companion\nf7\nn127.0.0.1:10882\n", stderr: "" } });
 
     expect(hostServiceOwnerWarnings(context, io, idb, new Map([[10882, "idb_companion"]]))).toEqual([]);
   });
 
+  test("a listener only on [::1] is one warning line (R22)", () => {
+    const io = fakeIoByPort({ 10882: { status: 0, stdout: "p4242\ncidb_companion\nf7\nn[::1]:10882\n", stderr: "" } });
+
+    expect(hostServiceOwnerWarnings(context, io, idb, new Map([[10882, "idb_companion"]]))).toEqual([
+      "host service idb (127.0.0.1:10882): no visible listener on 127.0.0.1 or * (found: [::1]:10882)",
+    ]);
+  });
+
   test("a listener with nothing recorded has no warning", () => {
-    const io = fakeIoByPort({ 10882: { status: 0, stdout: "p4242\ncidb_companion\n", stderr: "" } });
+    const io = fakeIoByPort({ 10882: { status: 0, stdout: "p4242\ncidb_companion\nf7\nn127.0.0.1:10882\n", stderr: "" } });
 
     expect(hostServiceOwnerWarnings(context, io, idb, new Map())).toEqual([]);
   });

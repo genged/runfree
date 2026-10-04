@@ -235,6 +235,31 @@ describe("forwardRuntime", () => {
     expect(replaceValidatedIngressForwarder).not.toHaveBeenCalled();
   });
 
+  test("two other projects sharing one host-service port: start on that port is refused naming both, start on an unrelated port is not (R18)", async () => {
+    const firstRoot = "/workspace/first-project";
+    const secondRoot = "/workspace/second-project";
+    const env = context.env as NodeJS.ProcessEnv;
+    await recordProjectHostServicePorts(env, { id: projectHash(firstRoot), root: firstRoot }, [10882]);
+    await recordProjectHostServicePorts(env, { id: projectHash(secondRoot), root: secondRoot }, [10882]);
+
+    const refused = fakeIo([]);
+    let message = "";
+    try {
+      forwardRuntime({ action: "start", hostPort: "10882", agentPort: "10882" }, context, refused.io, adapters);
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error);
+    }
+    expect(message).toContain(firstRoot);
+    expect(message).toContain(secondRoot);
+    expect(replaceValidatedIngressForwarder).not.toHaveBeenCalled();
+
+    // An unrelated port passes the registry check and reaches the next step
+    // (target resolution, which has no live session in this fixture).
+    const admitted = fakeIo([]);
+    expect(() => forwardRuntime({ action: "start", hostPort: "3000", agentPort: "3000" }, context, admitted.io, adapters))
+      .toThrow(/no running agent container or live session/u);
+  });
+
   test("start refuses when the host-service port registry is corrupt, with the --repair remedy", () => {
     const registryDir = runfreeStateRoot(context.env as NodeJS.ProcessEnv);
     fs.mkdirSync(registryDir, { recursive: true });
