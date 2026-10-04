@@ -4,6 +4,7 @@ import {
   applyComposeTeardownDefaults,
   createRuntimeDocker,
   containerMissingNetwork,
+  filterValues,
   lastObservedDockerDaemonIdentity,
   removeComposeProjectLeftoverVolumes,
   serviceContainerId,
@@ -28,6 +29,24 @@ function context(): RuntimeContext {
 test("containerMissingNetwork reports absent compose network", () => {
   expect(containerMissingNetwork({ id: "abc", networks: ["other"] }, "agent_internal")).toBe(true);
   expect(containerMissingNetwork({ id: "abc", networks: ["agent_internal", "proxy_egress"] }, "agent_internal")).toBe(false);
+});
+
+test("filterValues extracts the values out of well-formed --filter pairs", () => {
+  expect(filterValues(["--filter", "label=a=1", "--filter", "label=b=2"])).toEqual(["label=a=1", "label=b=2"]);
+  expect(filterValues([])).toEqual([]);
+});
+
+// Fails closed: one caller feeds this straight into a deletion
+// (removeComposeProjectLeftoverVolumes), so a malformed input must throw
+// rather than silently narrow or widen the listing it gates.
+test("filterValues throws on a trailing --filter with no value", () => {
+  expect(() => filterValues(["--filter", "label=a=1", "--filter"]))
+    .toThrow("malformed --filter argv: expected [--filter, value] pairs, got 3 token(s)");
+});
+
+test("filterValues throws on a malformed pair whose flag is not --filter", () => {
+  expect(() => filterValues(["--filter", "label=a=1", "--other", "label=b=2"]))
+    .toThrow('malformed --filter argv at index 2: expected ["--filter", value], got ["--other","label=b=2"]');
 });
 
 function networkInventoryIO(responses: Array<{ args: string[]; result: CaptureResult }>): RuntimeIO {

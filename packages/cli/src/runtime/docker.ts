@@ -237,11 +237,22 @@ function firstNonZero(...statuses: number[]): number {
 
 // container-inventory.ts's filter builders return interleaved `--filter`/value
 // pairs for direct argv splicing; the Docker client's `filters` field wants
-// just the values, which it re-flags itself.
-function filterValues(flagPairs: readonly string[]): string[] {
+// just the values, which it re-flags itself. Fails closed: a caller that feeds
+// this a malformed pair or a trailing `--filter` gets a thrown error rather
+// than a silently narrowed or widened listing (one caller feeds it into a
+// deletion, `removeComposeProjectLeftoverVolumes`).
+export function filterValues(flagPairs: readonly string[]): string[] {
+  if (flagPairs.length % 2 !== 0) {
+    throw new Error(`malformed --filter argv: expected [--filter, value] pairs, got ${flagPairs.length} token(s): ${JSON.stringify(flagPairs)}`);
+  }
   const values: string[] = [];
-  for (let index = 0; index < flagPairs.length; index += 1) {
-    if (flagPairs[index] === "--filter") values.push(flagPairs[index + 1]);
+  for (let index = 0; index < flagPairs.length; index += 2) {
+    const flag = flagPairs[index];
+    const value = flagPairs[index + 1];
+    if (flag !== "--filter" || typeof value !== "string") {
+      throw new Error(`malformed --filter argv at index ${index}: expected ["--filter", value], got ${JSON.stringify(flagPairs.slice(index, index + 2))}`);
+    }
+    values.push(value);
   }
   return values;
 }

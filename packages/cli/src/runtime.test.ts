@@ -3585,7 +3585,8 @@ describe("runtime command flow", () => {
     };
     /** The workspace still has its Compose project, so stop takes compose down. */
     const withComposeProject = (context: RuntimeContext) => (command: string, args: string[]): CaptureResult | undefined => {
-      if (command === "docker" && args[0] === "ps" && args[1] === "--all" && args.some((arg) => arg.startsWith("label="))) {
+      if (command === "docker" && args[0] === "ps" && args[1] === "--all" && args[2] === "--quiet"
+        && args.some((arg) => arg.startsWith("label="))) {
         return captureResult(0, `${FAKE_PROXY_CONTAINER_ID}\n`);
       }
       if (command === "docker" && args[0] === "inspect" && args.some((arg) => arg.includes("com.docker.compose.project"))) {
@@ -3634,7 +3635,7 @@ describe("runtime command flow", () => {
     test("with nothing left to stop, a selection an earlier stop left behind is reclaimed", async () => {
       const context = await startedProject();
       const io = createRuntimeIO({
-        capture: (command, args) => (command === "docker" && args[0] === "ps" && args[1] === "--all"
+        capture: (command, args) => (command === "docker" && args[0] === "ps" && args[1] === "--all" && args[2] === "--quiet"
           && args.some((arg) => arg.startsWith("label="))
           ? captureResult(0)
           : goneAfterDown(command, args)),
@@ -5511,7 +5512,7 @@ describe("runtime command flow", () => {
     const io = createRuntimeIO({
       capture: (command, args) => {
         if (command === "docker" && args[0] === "info") return captureResult(0);
-        if (command === "docker" && args[0] === "ps" && args.includes("--quiet") && args.includes("--no-trunc")
+        if (command === "docker" && args[0] === "ps" && args.includes("--quiet") && !args.includes("--all") && args.includes("--no-trunc")
           && args.includes(`label=com.docker.compose.project=${projectName}`)
           && args.includes("label=com.docker.compose.service=proxy")) {
           return captureResult(0, `${proxyContainerId}\n`);
@@ -5550,7 +5551,7 @@ describe("runtime command flow", () => {
         if (command === "docker" && args[0] === "info") return captureResult(0);
         // No running proxy container for this project: status must report,
         // not throw or hang.
-        if (command === "docker" && args[0] === "ps" && args.includes("--quiet") && args.includes("--no-trunc")
+        if (command === "docker" && args[0] === "ps" && args.includes("--quiet") && !args.includes("--all") && args.includes("--no-trunc")
           && args.includes("label=com.docker.compose.service=proxy")) {
           return captureResult(0, "");
         }
@@ -5581,7 +5582,7 @@ describe("runtime command flow", () => {
     const io = createRuntimeIO({
       capture: (command, args) => {
         if (command === "docker" && args[0] === "info") return captureResult(0);
-        if (command === "docker" && args[0] === "ps" && args.includes("--quiet") && args.includes("--no-trunc")
+        if (command === "docker" && args[0] === "ps" && args.includes("--quiet") && !args.includes("--all") && args.includes("--no-trunc")
           && args.includes(`label=com.docker.compose.project=${projectName}`)
           && args.includes("label=com.docker.compose.service=proxy")) {
           return captureResult(0, `${proxyContainerId}\n`);

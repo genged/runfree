@@ -226,7 +226,7 @@ printf '%s\\n' "$*" >> "${dockerLog}"
 case "$1" in
   info) exit 0 ;;
   ps)
-    if [ "$2" = "--all" ]; then
+    if [ "$2 $3" = "--all --quiet" ]; then
       case "$*" in
         *io.runfree.project-id*) echo agent-id ;;
         *com.docker.compose.service=proxy*) echo proxy-id ;;
