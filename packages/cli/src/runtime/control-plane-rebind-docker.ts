@@ -41,9 +41,11 @@ export function inspectRebindCreation(input: {
     fail("identity-contradiction", "unrecorded proxy has no exact creation marker or predecessor identity; automatic adoption and removal refused");
   }
   let networks: DockerNetworkInspect[];
-  assertAuthority();
-  try { networks = JSON.parse(verify(client.inspect([transaction.oldControlPlane.networkIds.agentInternal,
-    transaction.oldControlPlane.networkIds.proxyEgress], { type: "network" }))) as DockerNetworkInspect[]; }
+  try {
+    assertAuthority();
+    networks = JSON.parse(verify(client.inspect([transaction.oldControlPlane.networkIds.agentInternal,
+      transaction.oldControlPlane.networkIds.proxyEgress], { type: "network" }))) as DockerNetworkInspect[];
+  }
   catch (error) { if (error instanceof RuntimeObservationError) throw error; return fail("observation-unavailable", "retained network inspection is malformed"); }
   if (!Array.isArray(networks) || networks.length !== 2) fail("observation-unavailable", "retained network inspection is incomplete");
   for (const [index, logical] of ["agent_internal", "proxy_egress"].entries()) {

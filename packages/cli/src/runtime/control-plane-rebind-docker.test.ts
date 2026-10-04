@@ -64,6 +64,24 @@ test.each(["image", "network", "marker", "endpoint", "unavailable", "fence"] as 
   },
 );
 
+test("a lost fence right before the retained network inspect is read as malformed inspection, not a raw propagation", () => {
+  const state = fixture();
+  // The 6th assertAuthority() call is the one `inspectRebindCreation` makes
+  // right before its retained-network `client.inspect(...)` call, once the
+  // creation-inventory ps and the nested `observeExactProxy` (its own ps,
+  // then its container inspect) have all already answered cleanly. That
+  // assertion sits inside the same `try` as the network inspect itself, so a
+  // plain Error there must be caught and reported as a malformed inspection —
+  // exactly like a malformed JSON body would be — never propagated raw.
+  let calls = 0;
+  state.input.assertAuthority.mockImplementation(() => {
+    calls += 1;
+    if (calls === 6) throw new Error("fence lost");
+  });
+  expect(() => inspectRebindCreation(state.input)).toThrow("retained network inspection is malformed");
+  expect(state.capture.mock.calls.some(([, args]) => args[0] === "network")).toBe(false);
+});
+
 // What capture returns for a Docker call that timed out (or was killed) even
 // when the client itself exited 0: a non-zero status with empty output.
 const timedOut = { status: 124, stdout: "", stderr: "", timedOut: true };

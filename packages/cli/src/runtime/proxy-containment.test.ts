@@ -26,7 +26,7 @@ test("failed inventory grants neither absence nor containment authority; fresh r
   containExactOwnedProxy(input);
   expect(running).toBe(false);
   expect(capture.mock.calls.filter(([, args]) => args[0] === "container" && args[1] === "stop")).toEqual([["docker", ["container", "stop", "--time", "5", proxyId], expect.anything()]]);
-  expect(capture.mock.calls.some(([, args]) => args.includes("down") || args[0] === "rm" || args[0] === "volume")).toBe(false);
+  expect(capture.mock.calls.some(([, args]) => args.includes("down") || (args[0] === "container" && args[1] === "rm") || args[0] === "volume")).toBe(false);
 });
 
 test("successful empty inventory proves absence; fence loss never runs compensation", () => {
