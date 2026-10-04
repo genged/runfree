@@ -16,8 +16,10 @@
 # never waits on it: a missing relay binary, a crash, or a bind failure never
 # changes this entry's exit code and never delays the final `exec` below. The
 # relay stays this entry's direct (non-detached) child, so the handoff's
-# process shape is unchanged, and it is killed alongside the probe on a stop
-# signal. See local/specs/2026-10-03-host-services-design.md, "The
+# process shape is unchanged. It is killed alongside the probe on a stop
+# signal and on the entry's own activation-timeout exit (111); only the
+# final `exec` below leaves it running, deliberately, for the rest of the
+# session. See local/specs/2026-10-03-host-services-design.md, "The
 # agent-side relay".
 #
 # This is cooperation, not enforcement. A project image may replace it; a
@@ -78,10 +80,12 @@ entry_dir="$(CDPATH= cd -- "$(dirname -- "$entry_path")" && pwd)"
 probe="$entry_dir/session-ready-probe"
 
 # Started before the readiness loop and never awaited (see header comment).
+# The relay never writes stdout; discarding it here is belt-and-suspenders
+# alongside the relay's own post-bind rule against writing to the TUI.
 relay="$entry_dir/host-service-relay"
 relay_pid=""
 if [ -n "${RUNFREE_HOST_SERVICES:-}" ] && [ -x "$relay" ]; then
-  "$relay" </dev/null &
+  "$relay" </dev/null >/dev/null &
   relay_pid=$!
 fi
 
@@ -131,6 +135,7 @@ while :; do
   elapsed=$(( now - started_at ))
   if [ "$elapsed" -ge "$timeout_s" ]; then
     echo "runfree: session was not activated within ${timeout_ms} ms (RUNFREE_SESSION_ENTRY_TIMEOUT_MS); giving up" >&2
+    [ -n "$relay_pid" ] && kill "$relay_pid" 2>/dev/null
     exit "$RUNFREE_SESSION_ENTRY_TIMEOUT_EXIT"
   fi
   if [ "$notified" -eq 0 ] && [ "$elapsed" -ge "$RUNFREE_SESSION_ENTRY_NOTICE_AFTER_S" ]; then

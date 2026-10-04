@@ -836,10 +836,21 @@ describe("session entry: host-service relay (T6)", () => {
     // that; the exact entry path is the precise, correct check.)
     expect(relayLine).not.toContain(entryPath);
 
-    // The entry's own timeout exit (111) does not kill the relay (only
-    // `on_term`/`on_int` do, per `session-entry.sh`), so nothing else would
-    // ever let the spawned process's `close` event fire.
-    killRelayProcess();
+    // The entry's own activation-timeout exit (111) now kills the relay too
+    // (fix round 1, item 6), so `runPromise`'s `close`-based resolution no
+    // longer needs a manual `killRelayProcess()` push here; the next test
+    // proves that cleanup directly.
     await runPromise;
+  }, 10_000);
+
+  test("the relay is gone after the entry's own activation-timeout exit (111)", async () => {
+    const relayPort = await unusedPort();
+    const proxy = await fakeProxy([REFUSED_RESPONSE]);
+    const result = await runEntry([fakeAgentPath], entryEnv(proxy.port, {
+      RUNFREE_HOST_SERVICES: `svc:${relayPort}`,
+      RUNFREE_SESSION_ENTRY_TIMEOUT_MS: "1200",
+    }));
+    expect(result.status, result.stderr).toBe(111);
+    expect(await waitForRefusal(relayPort, 1_500)).toBe(true);
   }, 10_000);
 });

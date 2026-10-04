@@ -58,6 +58,22 @@ export const PROXY_PORT = 8080;
 export const RELAY_LOG_PATH = "/tmp/runfree-host-service-relay.log";
 const RESERVED_SUFFIX = "runfree.internal";
 const PROXY_HEAD_LIMIT_BYTES = 8_192;
+// Covers both the upstream dial and the wait for the proxy's CONNECT
+// response head. Set somewhat above the proxy's own host-service dial
+// timeout (5000 ms default, `PROXY_HOST_SERVICE_DIAL_TIMEOUT_MS` in
+// `packages/proxy/src/server.ts`), so a dial the proxy itself is still
+// waiting on is never torn down first here.
+export const DEFAULT_HANDSHAKE_TIMEOUT_MS = 10_000;
+// Signals a terminal in cooked mode can deliver to this process's whole
+// foreground process group (Ctrl-C, Ctrl-\, Ctrl-Z) and the controlling
+// terminal going away. Node resets the SIG_IGN disposition `sh` sets on a
+// backgrounded `&` job for SIGINT/SIGQUIT before running this script, so
+// without these no-op handlers one of those keystrokes in the agent's own
+// TTY would kill or stop the relay for the rest of the session. SIGTERM is
+// deliberately left at its default disposition (process termination): the
+// entry's `on_term`/`on_int` traps `kill` this process on a stop signal, and
+// that must still work.
+const TERMINAL_SIGNALS_TO_IGNORE = ["SIGINT", "SIGQUIT", "SIGTSTP", "SIGHUP"] as const;
 
 const IPV4_OCTET = "(?:25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])";
 const IPV4_LITERAL = new RegExp(`^${IPV4_OCTET}(?:\\.${IPV4_OCTET}){3}$`);
@@ -97,7 +113,7 @@ const STATUS_LINE_RE = /^HTTP\/1\.[01] (\d{3})(?: |$)/;
 /**
  * One accepted client: opens its own `CONNECT` to the proxy, forwards the
  * client's bytes only after the proxy answers `200`, and tears both sockets
- * down together on any refusal, error, or close.
+ * down together on any refusal, error, close, or handshake deadline.
  */
 function relayConnection(
   clientSocket: net.Socket,
@@ -106,6 +122,7 @@ function relayConnection(
   proxyPort: number,
   connect: RelayConnect,
   log: (line: string) => void,
+  handshakeTimeoutMs: number,
 ): void {
   const authority = `${service.name}.${RESERVED_SUFFIX}:${service.port}`;
   const head = [`CONNECT ${authority} HTTP/1.1`, `Host: ${authority}`, "", ""].join("\r\n");
@@ -118,10 +135,17 @@ function relayConnection(
   const teardown = (reason?: string): void => {
     if (torn) return;
     torn = true;
+    clearTimeout(handshakeTimer);
     if (reason !== undefined) log(`${service.name}: ${reason}`);
     clientSocket.destroy();
     upstream.destroy();
   };
+
+  // Covers the dial and the wait for the response head together; cleared
+  // only once the proxy answers 200 (`established`).
+  const handshakeTimer = setTimeout(() => {
+    teardown("the proxy did not complete the CONNECT handshake within the deadline");
+  }, handshakeTimeoutMs);
 
   // Held until the proxy answers 200: nothing the client sends before then is
   // lost, only delayed (mirrors `host-service-tunnel.ts`'s own `admit()`).
@@ -149,6 +173,7 @@ function relayConnection(
       return;
     }
     established = true;
+    clearTimeout(handshakeTimer);
     upstream.removeAllListeners("data");
     if (remainder.length > 0) clientSocket.write(remainder);
     clientSocket.pipe(upstream);
@@ -166,6 +191,8 @@ export type StartRelayOptions = Readonly<{
   proxyPort: number;
   log?: (line: string) => void;
   connect?: RelayConnect;
+  /** Test seam; defaults to `DEFAULT_HANDSHAKE_TIMEOUT_MS`. */
+  handshakeTimeoutMs?: number;
 }>;
 
 export type StartRelayResult = Readonly<{
@@ -183,6 +210,7 @@ export type StartRelayResult = Readonly<{
 export async function startRelay(options: StartRelayOptions): Promise<StartRelayResult> {
   const connect = options.connect ?? ((connectOptions) => net.connect(connectOptions));
   const log = options.log ?? (() => {});
+  const handshakeTimeoutMs = options.handshakeTimeoutMs ?? DEFAULT_HANDSHAKE_TIMEOUT_MS;
   const bound: Array<{ name: string; port: number }> = [];
   const skipped: Array<{ name: string; port: number; reason: string }> = [];
   const servers: net.Server[] = [];
@@ -193,7 +221,7 @@ export async function startRelay(options: StartRelayOptions): Promise<StartRelay
     const server = net.createServer((clientSocket) => {
       activeSockets.add(clientSocket);
       clientSocket.once("close", () => activeSockets.delete(clientSocket));
-      relayConnection(clientSocket, service, options.proxyHost, options.proxyPort, connect, log);
+      relayConnection(clientSocket, service, options.proxyHost, options.proxyPort, connect, log, handshakeTimeoutMs);
     });
     server.once("error", (error: NodeJS.ErrnoException) => {
       if (settled) return;
@@ -230,6 +258,13 @@ function appendLogLine(line: string): void {
   }
 }
 
+/** See `TERMINAL_SIGNALS_TO_IGNORE`. */
+function installTerminalSignalGuards(): void {
+  for (const signal of TERMINAL_SIGNALS_TO_IGNORE) {
+    process.on(signal, () => {});
+  }
+}
+
 /**
  * Never exits on the success path: once a service is bound, its `net.Server`
  * is an active handle that must keep the process alive indefinitely (that is
@@ -239,6 +274,8 @@ function appendLogLine(line: string): void {
  * ends, so a successful bind is never torn down by this function returning.
  */
 async function main(): Promise<void> {
+  installTerminalSignalGuards();
+
   const proxyHost = process.env.PROXY_IP;
   if (typeof proxyHost !== "string" || !IPV4_LITERAL.test(proxyHost)) {
     process.stderr.write(`host-service-relay: PROXY_IP must be an IPv4 literal, got: ${proxyHost === undefined ? "<unset>" : proxyHost}\n`);
@@ -271,6 +308,15 @@ async function main(): Promise<void> {
   for (const skip of result.skipped) {
     process.stderr.write(`host-service-relay: ${skip.name}:${skip.port} not bound: ${skip.reason}\n`);
   }
+
+  // All binds have settled: from here on, nothing may write to the agent's
+  // TUI. An exception thrown inside a socket event callback (not a rejected
+  // promise, so `main().catch()` below cannot see it) would otherwise crash
+  // the process with a stack trace on stderr and a non-zero exit code.
+  process.on("uncaughtException", (error: unknown) => {
+    appendLogLine(`uncaughtException: ${error instanceof Error ? error.message : String(error)}`);
+    process.exit(0);
+  });
   // No explicit exit here, win or lose: zero bound services means nothing is
   // pending and the process ends on its own; one or more means the bound
   // servers must keep it running.
