@@ -162,7 +162,7 @@ function parseHostServiceSplices(value: unknown): Record<string, number> | undef
 // sanctioned writer framing; JSON.stringify never emits raw newlines, so the
 // invariant holds by construction.
 export function serializeGenerationStatus(
-  status: FirewallGenerationStatus | RequestProxyGenerationStatus,
+  status: FirewallGenerationStatus | RequestProxyGenerationStatus | HostServiceGatewayStatus,
 ): string {
   return `${JSON.stringify(status)}\n`;
 }

@@ -5,12 +5,17 @@ import {
 } from "../audit.js";
 import { isValidIpv4, type FirewallPlan } from "./nftables.js";
 import { assertSessionAdmissionSourceIsFiles } from "../session-identity-config.js";
+import type { HostServicesJson } from "@runfree/runtime-contracts/host-services";
+
+// Each element is `<pinned gateway> . <port>`, one per approved host service.
+const HOST_SERVICE_SET_MAX_ELEMENTS = 64;
 
 type BuildFirewallPlanInput = {
   allowedHosts: readonly string[];
   controlGeneration?: string;
   effectiveProxyRoot?: string;
   env?: NodeJS.ProcessEnv;
+  hostServices?: Readonly<HostServicesJson>;
   policyPath?: string;
   policyGeneration: string;
 };
@@ -49,6 +54,7 @@ export function buildFirewallPlan(input: BuildFirewallPlanInput): FirewallPlan {
       gatewayIp,
     },
     allowedHosts: [...input.allowedHosts],
+    hostServices: { ...(input.hostServices ?? {}) },
     runtimeSubnets,
     nftables: {
       tableName: "runfree_proxy",
@@ -70,7 +76,14 @@ export function buildFirewallPlan(input: BuildFirewallPlanInput): FirewallPlan {
         env.PROXY_FIREWALL_AUDIT_SET_MAX_ELEMENTS ?? "256",
         "PROXY_FIREWALL_AUDIT_SET_MAX_ELEMENTS",
       ),
+      hostServiceSetName: "host_service",
+      hostServiceDrainingSetName: "host_service_draining",
+      hostServiceMaxElements: HOST_SERVICE_SET_MAX_ELEMENTS,
     },
+    hostServiceDrainSeconds: positiveInteger(
+      env.PROXY_HOST_SERVICE_DRAIN_SECONDS ?? "30",
+      "PROXY_HOST_SERVICE_DRAIN_SECONDS",
+    ),
     refresh: {
       policyCheckIntervalSeconds: positiveInteger(env.PROXY_FIREWALL_POLICY_SECONDS ?? "2", "PROXY_FIREWALL_POLICY_SECONDS"),
       dnsRefreshIntervalSeconds: positiveInteger(env.PROXY_FIREWALL_DNS_SECONDS ?? env.PROXY_FIREWALL_REFRESH_SECONDS ?? "300", "PROXY_FIREWALL_DNS_SECONDS"),

@@ -12,6 +12,7 @@ import fs from "node:fs";
 import {
   serializeGenerationStatus,
   type FirewallGenerationStatus,
+  type HostServiceGatewayStatus,
   type RequestProxyGenerationStatus,
 } from "@runfree/runtime-contracts/proxy-status";
 
@@ -20,10 +21,11 @@ export type { FirewallGenerationStatus, RequestProxyGenerationStatus };
 // Atomic replace within the same tmpfs directory so a poll never observes a
 // torn write; the shared serializer guarantees the one-JSON-line framing the
 // CLI's exec-split reader depends on. Unique tmp name plus failure cleanup,
-// matching writeResolvedHostsFile.
+// matching writeResolvedHostsFile. The root supervisor also writes the
+// host-service gateway hand-off through here (root-owned, 0644, atomic).
 export function writeGenerationStatusFile(
   filePath: string,
-  status: FirewallGenerationStatus | RequestProxyGenerationStatus,
+  status: FirewallGenerationStatus | RequestProxyGenerationStatus | HostServiceGatewayStatus,
 ): void {
   const tmpPath = `${filePath}.${process.pid}.${Date.now().toString(36)}.tmp`;
   try {

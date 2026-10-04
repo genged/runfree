@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import path from "node:path";
 import { type SessionIpAssignment } from "@runfree/runtime-contracts/session-file";
 import { SessionIpAssignments } from "../session-ip-reuse.js";
 import { performance } from "node:perf_hooks";
@@ -9,8 +10,11 @@ import { createCommandRunner, type CommandRunner } from "./command.js";
 import { resolveIpv4 } from "./dns.js";
 import {
   applyAuditTeardown,
+  applyHostServiceTeardown,
   applyRuleset,
+  flushHostServiceDraining,
   isValidIpv4,
+  replaceHostServiceSet,
   replaceAllowedSet,
   replaceAuditDrainingSet,
   replaceAuditSet,
@@ -18,7 +22,17 @@ import {
   validateFirewallPlan,
   verifySessionAdmissionSet,
   type FirewallPlan,
+  type HostServiceElement,
 } from "./nftables.js";
+import {
+  checkEtcHostsFile,
+  hostServiceEntryKey,
+  hostServiceSetDigest,
+  parseHostServiceGatewayFromEtcHosts,
+  sortHostServiceEntries,
+  validateHostServiceGateway,
+  type EtcHostsStat,
+} from "./host-service-gateway.js";
 import {
   discoverInterfaces,
   ensureDefaultRoute,
@@ -35,7 +49,12 @@ import {
   type LoadedEffectiveProxyControl,
 } from "@runfree/runtime-contracts/effective-control";
 import { resolvedHostsPathFromEnv, writeResolvedHostsFile, type ResolvedHostsSnapshot } from "../resolved-hosts.js";
-import { firewallStatusPath } from "@runfree/runtime-contracts/proxy-status";
+import {
+  DEFAULT_PROXY_STATUS_DIR,
+  firewallStatusPath,
+  type HostServiceGatewayStatus,
+} from "@runfree/runtime-contracts/proxy-status";
+import { HOST_SERVICE_GATEWAY_STATUS_FILE } from "@runfree/runtime-contracts/host-services";
 import { scanSessionFiles, type SessionFileScan } from "../session-files.js";
 import { servedSessionFiles, type SessionFileObservation } from "../session-file-validity.js";
 import {
@@ -92,7 +111,45 @@ type FirewallControllerDependencies = {
   publishAuditResolvedHosts: (path: string, snapshot: ResolvedHostsSnapshot) => void;
   clearAuditResolvedHosts: (path: string) => void;
   clearAuditSpool: (path: string) => void;
+  // Host services (design "Gateway address", "Firewall", "Revocation"). The
+  // /etc/hosts read runs only on the maintenance path and in initialize,
+  // never in the 100 ms session-admission loop.
+  readEtcHosts: () => { text: string; stat: EtcHostsStat };
+  // Root-written hand-off of the pinned gateway to the uid-1001 request proxy.
+  publishHostServiceGateway: (status: HostServiceGatewayStatus) => void;
+  replaceHostServiceSet: (entries: readonly HostServiceElement[], plan: FirewallPlan) => Promise<void>;
+  applyHostServiceTeardown: (
+    draining: readonly HostServiceElement[],
+    remaining: readonly HostServiceElement[],
+    plan: FirewallPlan,
+  ) => Promise<void>;
+  flushHostServiceDraining: (plan: FirewallPlan) => Promise<void>;
 };
+
+const ETC_HOSTS_PATH = "/etc/hosts";
+const ETC_HOSTS_MAX_BYTES = 64 * 1024;
+const HOST_SERVICE_REASON_LIMIT = 512;
+
+// One descriptor for the stat and the read, opened without following a
+// symlink, so the checked file is the file whose bytes are parsed.
+function readEtcHostsFile(): { text: string; stat: EtcHostsStat } {
+  const fd = fs.openSync(ETC_HOSTS_PATH, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+  try {
+    const stat = fs.fstatSync(fd);
+    if (stat.isFile() && stat.size > ETC_HOSTS_MAX_BYTES) {
+      throw new Error(`${ETC_HOSTS_PATH} is larger than ${ETC_HOSTS_MAX_BYTES} bytes`);
+    }
+    const text = stat.isFile() ? fs.readFileSync(fd, "utf8") : "";
+    return { text, stat: { uid: stat.uid, mode: stat.mode, isFile: stat.isFile() } };
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+function hostServiceGatewayStatusPath(): string {
+  return process.env.PROXY_HOST_SERVICE_GATEWAY_PATH
+    ?? path.posix.join(DEFAULT_PROXY_STATUS_DIR, HOST_SERVICE_GATEWAY_STATUS_FILE);
+}
 
 type ResolvedHost = {
   host: string;
@@ -158,6 +215,11 @@ export function createFirewallController(overrides: Partial<FirewallControllerDe
         // Missing spool means nothing to clear.
       }
     },
+    readEtcHosts: () => readEtcHostsFile(),
+    publishHostServiceGateway: (status) => writeGenerationStatusFile(hostServiceGatewayStatusPath(), status),
+    replaceHostServiceSet: (entries, plan) => replaceHostServiceSet(entries, runner, plan),
+    applyHostServiceTeardown: (draining, remaining, plan) => applyHostServiceTeardown(draining, remaining, runner, plan),
+    flushHostServiceDraining: (plan) => flushHostServiceDraining(runner, plan),
     ...overrides,
   };
 
@@ -193,7 +255,24 @@ export function createFirewallController(overrides: Partial<FirewallControllerDe
   let auditIpCapLogged = false;
   let auditDraining: { ips: Set<string>; untilMs: number } | undefined;
 
+  // --- Host-service state (in-memory; a new supervisor instance re-pins) ----
+  // The gateway is pinned for this supervisor's lifetime. After the pin, a
+  // different or invalid read is sticky (HS8): only a new instance re-pins.
+  let pinnedGateway: string | undefined;
+  let gatewayChangedReason: string | undefined;
+  let gatewayUnavailableReason: string | undefined;
+  // What this supervisor last installed in @host_service and
+  // @host_service_draining. The ruleset install creates both sets empty.
+  let installedHostServices: HostServiceElement[] = [];
+  let hostServiceDraining: { entries: HostServiceElement[]; untilMs: number } | undefined;
+  let lastPublishedGatewayKey: string | undefined;
+  let lastPublishedStatusKey: string | undefined;
+  let lastRulesetVerified = true;
+
   function publishStatus(plan: FirewallPlan, rulesetVerified: boolean): void {
+    lastRulesetVerified = rulesetVerified;
+    const digest = currentHostServiceDigest();
+    const draining = hostServiceDraining?.entries.length ?? 0;
     deps.publishFirewallStatus({
       generation: plan.policyGeneration,
       ...(plan.controlGeneration ? {
@@ -202,7 +281,215 @@ export function createFirewallController(overrides: Partial<FirewallControllerDe
       } : {}),
       rulesetVerified,
       appliedAt: new Date(deps.nowMs()).toISOString(),
+      hostServiceSetDigest: digest,
+      hostServiceDraining: draining,
     });
+    lastPublishedStatusKey = statusKey(plan, rulesetVerified);
+  }
+
+  function currentHostServiceDigest(): string {
+    return hostServiceSetDigest(installedHostServices, hostServiceDraining?.entries ?? []);
+  }
+
+  function statusKey(plan: FirewallPlan, rulesetVerified: boolean): string {
+    return JSON.stringify([
+      plan.policyGeneration,
+      plan.controlGeneration ?? "",
+      rulesetVerified,
+      currentHostServiceDigest(),
+      hostServiceDraining?.entries.length ?? 0,
+    ]);
+  }
+
+  function resetHostServiceState(): void {
+    pinnedGateway = undefined;
+    gatewayChangedReason = undefined;
+    gatewayUnavailableReason = undefined;
+    installedHostServices = [];
+    hostServiceDraining = undefined;
+    lastPublishedGatewayKey = undefined;
+    lastPublishedStatusKey = undefined;
+  }
+
+  // Read, check, and (before the first pin) pin the gateway. Runs only from
+  // initialize and the maintenance path.
+  function observeGateway(plan: FirewallPlan): void {
+    if (gatewayChangedReason !== undefined) return;
+    let observed: { ip: string } | { error: string };
+    try {
+      const read = deps.readEtcHosts();
+      const statError = checkEtcHostsFile(read.stat);
+      if (statError !== undefined) {
+        observed = { error: statError };
+      } else {
+        const parsed = parseHostServiceGatewayFromEtcHosts(read.text);
+        const invalid = "ip" in parsed ? validateHostServiceGateway(parsed.ip, plan) : parsed.error;
+        observed = invalid === undefined && "ip" in parsed ? parsed : { error: invalid ?? "invalid gateway entry" };
+      }
+    } catch (error) {
+      observed = { error: `cannot read /etc/hosts: ${formatError(error)}` };
+    }
+
+    if (pinnedGateway === undefined) {
+      if ("ip" in observed) {
+        pinnedGateway = observed.ip;
+        if (gatewayUnavailableReason !== undefined) {
+          deps.log(`proxy-firewall: host-service gateway pinned ip=${observed.ip} after earlier refusal`);
+        } else {
+          deps.log(`proxy-firewall: host-service gateway pinned ip=${observed.ip}`);
+        }
+        gatewayUnavailableReason = undefined;
+      } else {
+        const reason = boundedReason(`host-service gateway unavailable: ${observed.error}`);
+        if (reason !== gatewayUnavailableReason) deps.log(`proxy-firewall: ${reason}`);
+        gatewayUnavailableReason = reason;
+      }
+      return;
+    }
+    if ("ip" in observed && observed.ip === pinnedGateway) return;
+    const detail = "ip" in observed ? `now ${observed.ip}` : observed.error;
+    // The remedy goes before the variable detail so the length bound can
+    // never cut it off.
+    gatewayChangedReason = boundedReason(
+      `host-service gateway address changed from pinned ${pinnedGateway}; `
+      + "host services stay refused until runfree rebuild recreates the proxy, which drains every session"
+      + ` (${detail})`,
+    );
+    deps.log(`proxy-firewall: ${gatewayChangedReason}`);
+  }
+
+  function hostServiceGatewayAvailable(): string | undefined {
+    return gatewayChangedReason === undefined ? pinnedGateway : undefined;
+  }
+
+  function desiredHostServiceEntries(plan: FirewallPlan): HostServiceElement[] {
+    const gateway = hostServiceGatewayAvailable();
+    if (gateway === undefined) return [];
+    return sortHostServiceEntries(Object.values(plan.hostServices ?? {}).map(({ port }) => ({ ip: gateway, port })));
+  }
+
+  // Converge @host_service on the desired pairs. A pair that leaves the set
+  // moves into @host_service_draining in the same batch, so its established
+  // flows are cut, not merely no longer accepted. A pair that comes back is
+  // taken out of draining at once. Each `nft -f -` batch is atomic, so a
+  // failed batch leaves the kernel, and this record of it, unchanged.
+  async function applyHostServiceEntries(plan: FirewallPlan, force: boolean): Promise<void> {
+    const desired = desiredHostServiceEntries(plan);
+    const desiredKeys = new Set(desired.map(hostServiceEntryKey));
+    const currentDraining = hostServiceDraining?.entries ?? [];
+    const removed = installedHostServices.filter((entry) => !desiredKeys.has(hostServiceEntryKey(entry)));
+    const nextDraining = boundedDraining(
+      plan,
+      removed,
+      currentDraining.filter((entry) => !desiredKeys.has(hostServiceEntryKey(entry))),
+    );
+    const drainingChanged = !sameStringArray(
+      currentDraining.map(hostServiceEntryKey),
+      nextDraining.map(hostServiceEntryKey),
+    );
+    const acceptChanged = !sameStringArray(
+      installedHostServices.map(hostServiceEntryKey),
+      desired.map(hostServiceEntryKey),
+    );
+
+    if (removed.length > 0 || drainingChanged) {
+      await installHostServiceTeardown(plan, nextDraining, desired, removed.length > 0);
+      return;
+    }
+    if (acceptChanged || force) {
+      await deps.replaceHostServiceSet(desired, plan);
+      installedHostServices = desired;
+      deps.log(`proxy-firewall: host-service set updated pairs=${desired.length}`);
+    }
+  }
+
+  async function installHostServiceTeardown(
+    plan: FirewallPlan,
+    draining: HostServiceElement[],
+    remaining: HostServiceElement[],
+    restartWindow: boolean,
+  ): Promise<void> {
+    await deps.applyHostServiceTeardown(draining, remaining, plan);
+    installedHostServices = remaining;
+    hostServiceDraining = draining.length === 0 ? undefined : {
+      entries: draining,
+      untilMs: restartWindow || hostServiceDraining === undefined
+        ? deps.nowMs() + plan.hostServiceDrainSeconds * 1000
+        : hostServiceDraining.untilMs,
+    };
+    deps.log(`proxy-firewall: host-service set updated pairs=${remaining.length} draining=${draining.length}`);
+  }
+
+  // Newly removed pairs first: an older draining pair's window is already
+  // running, so it is the one dropped when the set is full (logged).
+  function boundedDraining(
+    plan: FirewallPlan,
+    removed: readonly HostServiceElement[],
+    previous: readonly HostServiceElement[],
+  ): HostServiceElement[] {
+    const all = sortHostServiceEntries([...removed, ...previous]);
+    if (all.length <= plan.nftables.hostServiceMaxElements) return all;
+    const removedKeys = new Set(removed.map(hostServiceEntryKey));
+    deps.log(`proxy-firewall: host-service draining set full; keeping ${plan.nftables.hostServiceMaxElements} of ${all.length} pairs`);
+    return sortHostServiceEntries([
+      ...all.filter((entry) => removedKeys.has(hostServiceEntryKey(entry))),
+      ...all.filter((entry) => !removedKeys.has(hostServiceEntryKey(entry))),
+    ].slice(0, plan.nftables.hostServiceMaxElements));
+  }
+
+  async function maintainHostServiceDrain(plan: FirewallPlan): Promise<void> {
+    if (!hostServiceDraining || deps.nowMs() < hostServiceDraining.untilMs) return;
+    await deps.flushHostServiceDraining(plan);
+    hostServiceDraining = undefined;
+    deps.log("proxy-firewall: host-service drain window complete");
+  }
+
+  function publishGateway(plan: FirewallPlan): void {
+    const gateway = hostServiceGatewayAvailable();
+    const reason = gatewayChangedReason ?? gatewayUnavailableReason ?? "host-service gateway not pinned";
+    const key = JSON.stringify([plan.policyGeneration, gateway ?? "", gateway === undefined ? reason : ""]);
+    if (key === lastPublishedGatewayKey) return;
+    deps.publishHostServiceGateway({
+      schemaVersion: 1,
+      policyGeneration: plan.policyGeneration,
+      ...(gateway !== undefined ? { gatewayIp: gateway } : { unavailableReason: reason }),
+      writtenAt: new Date(deps.nowMs()).toISOString(),
+    });
+    lastPublishedGatewayKey = key;
+  }
+
+  // Maintenance-path host-service pass. Each step is independent and logged,
+  // so a failure never wedges the refresh loop.
+  async function refreshHostServices(plan: FirewallPlan): Promise<void> {
+    observeGateway(plan);
+    try {
+      await maintainHostServiceDrain(plan);
+    } catch (error) {
+      deps.log(`proxy-firewall: host-service drain flush failed: ${formatError(error)}`);
+    }
+    try {
+      await applyHostServiceEntries(plan, false);
+    } catch (error) {
+      deps.log(`proxy-firewall: host-service set update failed: ${formatError(error)}`);
+      // Fail closed: move every accepted pair into draining so nothing stays
+      // reachable while the desired state cannot be written. The next pass
+      // re-diffs from whatever the kernel now holds.
+      try {
+        await installHostServiceTeardown(
+          plan,
+          boundedDraining(plan, installedHostServices, hostServiceDraining?.entries ?? []),
+          [],
+          installedHostServices.length > 0,
+        );
+      } catch (fallbackError) {
+        deps.log(`proxy-firewall: host-service fail-closed teardown failed: ${formatError(fallbackError)}`);
+      }
+    }
+    try {
+      publishGateway(plan);
+    } catch (error) {
+      deps.log(`proxy-firewall: failed to publish host-service gateway: ${formatError(error)}`);
+    }
   }
 
   function allowedIpsFromCache(): Set<string> {
@@ -670,6 +957,19 @@ export function createFirewallController(overrides: Partial<FirewallControllerDe
     ].join(" "));
   }
 
+  // The status is level-triggered: a host-service change within one
+  // generation (drain window closing, a late pin, a sticky gateway refusal)
+  // republishes it so the host's convergence read sees the kernel state.
+  function republishStatusIfHostServicesChanged(plan: FirewallPlan): void {
+    if (!initialized || lastPublishedStatusKey === undefined) return;
+    if (statusKey(plan, lastRulesetVerified) === lastPublishedStatusKey) return;
+    try {
+      publishStatus(plan, lastRulesetVerified);
+    } catch (error) {
+      deps.log(`proxy-firewall: failed to publish generation status: ${formatError(error)}`);
+    }
+  }
+
   return {
     async initialize(plan) {
       stopped = false;
@@ -701,6 +1001,18 @@ export function createFirewallController(overrides: Partial<FirewallControllerDe
       // generation, the live ruleset/route/audit-set state verified, and only
       // then readiness. Deny-all is proven, not merely unconfigured.
       await refreshResolvedIps("require-any-configured-host");
+      // Host services: the ruleset above recreated both host-service sets
+      // empty; pin the gateway, write the approved pairs explicitly, and hand
+      // the gateway to the request proxy before readiness. A missing or
+      // invalid gateway entry is a named refusal, not a startup failure.
+      resetHostServiceState();
+      observeGateway(currentPlan);
+      await applyHostServiceEntries(currentPlan, true);
+      try {
+        publishGateway(currentPlan);
+      } catch (error) {
+        deps.log(`proxy-firewall: failed to publish host-service gateway: ${formatError(error)}`);
+      }
       await deps.verify(currentPlan);
       publishStatus(currentPlan, true);
       initialized = true;
@@ -724,7 +1036,10 @@ export function createFirewallController(overrides: Partial<FirewallControllerDe
         deps.log(`proxy-firewall: invalid policy reload preserved previous valid policy previous_generation=${activePlan.policyGeneration}: ${formatError(error)}`);
         // Marker expiry must still tear audit state down while an invalid
         // policy edit is preserved-as-previous, so the audit tick runs even
-        // on this early-return path.
+        // on this early-return path. The host-service drain window and the
+        // gateway check run here for the same reason.
+        await refreshHostServices(activePlan);
+        republishStatusIfHostServicesChanged(activePlan);
         await refreshAuditTick(activePlan);
         return;
       }
@@ -734,9 +1049,10 @@ export function createFirewallController(overrides: Partial<FirewallControllerDe
       const generationChanged = activePlan.policyGeneration !== nextPolicy.generation
         || activePlan.controlGeneration !== nextControlGeneration;
       const policyChanged = !sameStringArray(allowedHosts, nextAllowedHosts);
-      const nextPlan = {
+      const nextPlan: FirewallPlan = {
         ...activePlan,
         allowedHosts: nextAllowedHosts,
+        hostServices: nextPolicy.hostServices,
         ...(nextControl ? { policyPath: nextControl.networkPolicyPath } : {}),
         ...(nextControlGeneration ? { controlGeneration: nextControlGeneration } : {}),
         policyGeneration: nextPolicy.generation,
@@ -747,6 +1063,9 @@ export function createFirewallController(overrides: Partial<FirewallControllerDe
 
       allowedHosts = nextAllowedHosts;
       currentPlan = nextPlan;
+      // Every host-service change (pairs, draining, gateway hand-off) lands
+      // before the status naming this generation is published.
+      await refreshHostServices(currentPlan);
       if (generationChanged) {
         deps.log(`proxy-firewall: policy reloaded path=${currentPlan.policyPath} hosts=${allowedHosts.length} generation=${currentPlan.policyGeneration}`);
         // Re-verify the installed ruleset for the new generation (the
@@ -768,6 +1087,8 @@ export function createFirewallController(overrides: Partial<FirewallControllerDe
         } catch (error) {
           deps.log(`proxy-firewall: failed to publish generation status: ${formatError(error)}`);
         }
+      } else {
+        republishStatusIfHostServicesChanged(currentPlan);
       }
       await refreshAuditTick(currentPlan);
     },
@@ -808,6 +1129,10 @@ export function classifyResolvedIpv4(ip: string, plan: FirewallPlan): { allowed:
   }
 
   return { allowed: true };
+}
+
+function boundedReason(reason: string): string {
+  return reason.length <= HOST_SERVICE_REASON_LIMIT ? reason : `${reason.slice(0, HOST_SERVICE_REASON_LIMIT - 1)}…`;
 }
 
 function failNoPlan(): never {

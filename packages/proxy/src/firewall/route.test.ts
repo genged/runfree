@@ -27,7 +27,11 @@ const plan: FirewallPlan = {
     auditSetName: "audit_ipv4",
     auditDrainingSetName: "audit_draining_ipv4",
     auditMaxElements: 256,
+    hostServiceSetName: "host_service",
+    hostServiceDrainingSetName: "host_service_draining",
+    hostServiceMaxElements: 64,
   },
+  hostServiceDrainSeconds: 30,
   refresh: {
     policyCheckIntervalSeconds: 1,
     dnsRefreshIntervalSeconds: 300,

@@ -1,5 +1,6 @@
 import type { CommandRunner } from "./command.js";
 import { isRecord } from "@runfree/runtime-contracts/primitives";
+import type { HostServicesJson } from "@runfree/runtime-contracts/host-services";
 
 const IFACE_RE = /^[A-Za-z0-9_.:-]{1,64}$/;
 const NFT_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]{0,63}$/;
@@ -22,6 +23,9 @@ export type FirewallPlan = {
     gatewayIp: string;
   };
   allowedHosts: readonly string[];
+  // The effective policy's approved host services. Members of @host_service
+  // are exactly `<pinned gateway> . <port>` for each entry.
+  hostServices?: Readonly<HostServicesJson>;
   runtimeSubnets?: readonly string[];
   nftables: {
     tableName: "runfree_proxy";
@@ -35,7 +39,14 @@ export type FirewallPlan = {
     auditSetName: "audit_ipv4";
     auditDrainingSetName: "audit_draining_ipv4";
     auditMaxElements: number;
+    // Host services (design "Firewall"): the uid-1001 accept set and the
+    // drain-drop set that severs established flows of removed pairs.
+    hostServiceSetName: "host_service";
+    hostServiceDrainingSetName: "host_service_draining";
+    hostServiceMaxElements: number;
   };
+  // Seconds a removed host-service pair stays in the drain-drop set.
+  hostServiceDrainSeconds: number;
   refresh: {
     policyCheckIntervalSeconds: number;
     dnsRefreshIntervalSeconds: number;
@@ -76,13 +87,19 @@ export function validateFirewallPlan(plan: FirewallPlan): void {
     || !NFT_NAME_RE.test(plan.nftables.auditDrainingSetName)) {
     throw new Error("invalid nftables audit set name");
   }
+  if (!NFT_NAME_RE.test(plan.nftables.hostServiceSetName)
+    || !NFT_NAME_RE.test(plan.nftables.hostServiceDrainingSetName)) {
+    throw new Error("invalid nftables host-service set name");
+  }
   const setNames = new Set([
     plan.nftables.setName,
     plan.nftables.sessionSetName,
     plan.nftables.auditSetName,
     plan.nftables.auditDrainingSetName,
+    plan.nftables.hostServiceSetName,
+    plan.nftables.hostServiceDrainingSetName,
   ]);
-  if (setNames.size !== 4) {
+  if (setNames.size !== 6) {
     throw new Error("nftables set names must be distinct");
   }
   if (!/^sha256:[a-f0-9]{64}$/.test(plan.policyGeneration)) {
@@ -99,6 +116,12 @@ export function validateFirewallPlan(plan: FirewallPlan): void {
   }
   if (!Number.isInteger(plan.nftables.auditMaxElements) || plan.nftables.auditMaxElements < 1) {
     throw new Error(`invalid nftables audit set max elements: ${plan.nftables.auditMaxElements}`);
+  }
+  if (!Number.isInteger(plan.nftables.hostServiceMaxElements) || plan.nftables.hostServiceMaxElements < 1) {
+    throw new Error(`invalid nftables host-service set max elements: ${plan.nftables.hostServiceMaxElements}`);
+  }
+  if (!Number.isInteger(plan.hostServiceDrainSeconds) || plan.hostServiceDrainSeconds < 1) {
+    throw new Error(`invalid host-service drain seconds: ${plan.hostServiceDrainSeconds}`);
   }
   for (const [label, value] of [
     ["audit marker path", plan.audit.markerPath],
@@ -129,6 +152,10 @@ export function renderRuleset(plan: FirewallPlan): string {
   // are severed even when conntrack already marks them established. This is
   // the sole severance mechanism for in-flight audited flows at teardown
   // (nft + NET_ADMIN only; no conntrack-tools, no NET_RAW).
+  // Host services follow the same pattern: the always-present
+  // host_service_draining drop sits above the established accept so a removed
+  // or re-addressed pair is cut even mid-flow, and the host_service accept is
+  // uid 1001 only on the egress interface, so root gets nothing from it.
   return [
     `table inet ${nftables.tableName} {`,
     `  set ${nftables.setName} {`,
@@ -147,6 +174,14 @@ export function renderRuleset(plan: FirewallPlan): string {
     "    type ipv4_addr",
     `    size ${nftables.auditMaxElements}`,
     "  }",
+    `  set ${nftables.hostServiceSetName} {`,
+    "    type ipv4_addr . inet_service",
+    `    size ${nftables.hostServiceMaxElements}`,
+    "  }",
+    `  set ${nftables.hostServiceDrainingSetName} {`,
+    "    type ipv4_addr . inet_service",
+    `    size ${nftables.hostServiceMaxElements}`,
+    "  }",
     "  chain input {",
     "    type filter hook input priority filter; policy drop;",
     "    iifname \"lo\" accept",
@@ -164,9 +199,11 @@ export function renderRuleset(plan: FirewallPlan): string {
     "    oifname \"lo\" accept",
     `    oifname "${internal.iface}" ip daddr @${nftables.sessionSetName} ct state established,related accept`,
     `    oifname "${egress.iface}" ip daddr @${nftables.auditDrainingSetName} drop`,
+    `    oifname "${egress.iface}" ip daddr . tcp dport @${nftables.hostServiceDrainingSetName} drop`,
     `    oifname "${egress.iface}" meta nfproto ipv4 ct state established,related accept`,
     `    oifname "${egress.iface}" ip daddr @${nftables.setName} tcp dport 443 accept`,
     `    oifname "${egress.iface}" ip daddr @${nftables.auditSetName} tcp dport 443 accept`,
+    `    oifname "${egress.iface}" meta skuid ${PROXY_SERVER_UID} ip daddr . tcp dport @${nftables.hostServiceSetName} accept`,
     "  }",
     "  chain forward {",
     "    type filter hook forward priority filter; policy drop;",
@@ -265,6 +302,57 @@ export function renderAuditTeardown(drainingIps: readonly string[], plan: Firewa
   ].filter((line): line is string => line !== undefined).join("\n");
 }
 
+export type HostServiceElement = { ip: string; port: number };
+
+function hostServiceElements(entries: readonly HostServiceElement[], plan: FirewallPlan, label: string): string[] {
+  const unique = new Map<string, HostServiceElement>();
+  for (const entry of entries) {
+    assertIpv4(entry.ip, `${label} IPv4`);
+    if (!Number.isInteger(entry.port) || entry.port < 1 || entry.port > 65535) {
+      throw new Error(`invalid ${label} port: ${entry.port}`);
+    }
+    unique.set(`${entry.ip} . ${entry.port}`, entry);
+  }
+  if (unique.size > plan.nftables.hostServiceMaxElements) {
+    throw new Error(`nftables host-service set update has ${unique.size} elements but max is ${plan.nftables.hostServiceMaxElements}`);
+  }
+  return Array.from(unique.values())
+    .sort((left, right) => compareIpv4(left.ip, right.ip) || left.port - right.port)
+    .map((entry) => `${entry.ip} . ${entry.port}`);
+}
+
+function fillSetLines(tableName: string, setName: string, elements: readonly string[]): string[] {
+  return [
+    `flush set inet ${tableName} ${setName}`,
+    ...(elements.length > 0 ? [`add element inet ${tableName} ${setName} { ${elements.join(", ")} }`] : []),
+  ];
+}
+
+export function renderHostServiceSetUpdate(entries: readonly HostServiceElement[], plan: FirewallPlan): string {
+  validateFirewallPlan(plan);
+  const elements = hostServiceElements(entries, plan, "host-service");
+  return [...fillSetLines(plan.nftables.tableName, plan.nftables.hostServiceSetName, elements), ""].join("\n");
+}
+
+// One atomic `nft -f -` batch: fill the draining set first (its drop rule
+// severs established flows to its members), then refill the accept set with
+// the pairs that stay, so no removed pair is ever accepted and not draining.
+export function renderHostServiceTeardown(
+  draining: readonly HostServiceElement[],
+  remaining: readonly HostServiceElement[],
+  plan: FirewallPlan,
+): string {
+  validateFirewallPlan(plan);
+  const drainingElements = hostServiceElements(draining, plan, "host-service draining");
+  const remainingElements = hostServiceElements(remaining, plan, "host-service");
+  const { tableName, hostServiceSetName, hostServiceDrainingSetName } = plan.nftables;
+  return [
+    ...fillSetLines(tableName, hostServiceDrainingSetName, drainingElements),
+    ...fillSetLines(tableName, hostServiceSetName, remainingElements),
+    "",
+  ].join("\n");
+}
+
 export async function applyRuleset(plan: FirewallPlan, runner: CommandRunner): Promise<void> {
   validateFirewallPlan(plan);
   const { tableName } = plan.nftables;
@@ -354,6 +442,75 @@ export async function replaceAuditDrainingSet(ips: readonly string[], plan: Fire
 
 export async function applyAuditTeardown(drainingIps: readonly string[], plan: FirewallPlan, runner: CommandRunner): Promise<void> {
   await runner.run("nft", ["-f", "-"], { input: renderAuditTeardown(drainingIps, plan) });
+}
+
+export async function replaceHostServiceSet(
+  entries: readonly HostServiceElement[],
+  runner: CommandRunner,
+  plan: FirewallPlan,
+): Promise<void> {
+  await runner.run("nft", ["-f", "-"], { input: renderHostServiceSetUpdate(entries, plan) });
+}
+
+export async function applyHostServiceTeardown(
+  draining: readonly HostServiceElement[],
+  remaining: readonly HostServiceElement[],
+  runner: CommandRunner,
+  plan: FirewallPlan,
+): Promise<void> {
+  await runner.run("nft", ["-f", "-"], { input: renderHostServiceTeardown(draining, remaining, plan) });
+}
+
+export async function flushHostServiceDraining(runner: CommandRunner, plan: FirewallPlan): Promise<void> {
+  validateFirewallPlan(plan);
+  await runner.run("nft", ["-f", "-"], {
+    input: `flush set inet ${plan.nftables.tableName} ${plan.nftables.hostServiceDrainingSetName}\n`,
+  });
+}
+
+// Kernel readback of @host_service from `nft -j list set`. Concat elements
+// arrive as `{"concat":["1.2.3.4",5432]}`, or wrapped as
+// `{"elem":{"val":{"concat":[...]}}}` when the set carries element options.
+export async function readHostServiceSetElements(runner: CommandRunner, plan: FirewallPlan): Promise<HostServiceElement[]> {
+  validateFirewallPlan(plan);
+  const { tableName, hostServiceSetName } = plan.nftables;
+  const result = await runner.run("nft", ["-j", "list", "set", "inet", tableName, hostServiceSetName]);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(result.stdout) as unknown;
+  } catch {
+    throw new Error("nftables host-service set readback returned malformed JSON");
+  }
+  const elements = nftSetConcatElements(parsed, tableName, hostServiceSetName);
+  if (!elements) throw new Error("nftables host-service set readback is missing or malformed");
+  return elements.sort((left, right) => compareIpv4(left.ip, right.ip) || left.port - right.port);
+}
+
+function nftSetConcatElements(value: unknown, tableName: string, setName: string): HostServiceElement[] | undefined {
+  if (!isRecord(value) || !Array.isArray(value.nftables)) return undefined;
+  for (const item of value.nftables) {
+    if (!isRecord(item) || !isRecord(item.set)) continue;
+    const set = item.set;
+    if (set.family !== "inet" || set.table !== tableName || set.name !== setName) continue;
+    const raw = set.elem === undefined ? [] : set.elem;
+    if (!Array.isArray(raw)) return undefined;
+    const elements: HostServiceElement[] = [];
+    for (const element of raw) {
+      const unwrapped = isRecord(element) && isRecord(element.elem) ? element.elem.val : element;
+      if (!isRecord(unwrapped) || !Array.isArray(unwrapped.concat) || unwrapped.concat.length !== 2) return undefined;
+      const [ip, port] = unwrapped.concat as unknown[];
+      if (typeof ip !== "string" || !isValidIpv4(ip)) return undefined;
+      if (typeof port !== "number" || !Number.isInteger(port) || port < 1 || port > 65535) return undefined;
+      elements.push({ ip, port });
+    }
+    return elements;
+  }
+  return undefined;
+}
+
+function compareIpv4(left: string, right: string): number {
+  const toInt = (ip: string) => ip.split(".").reduce((value, octet) => ((value << 8) + Number(octet)) >>> 0, 0);
+  return toInt(left) - toInt(right);
 }
 
 export function isValidIpv4(value: string): boolean {

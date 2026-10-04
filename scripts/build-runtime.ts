@@ -85,6 +85,7 @@ export const RUNTIME_ASSET_DESCRIPTORS: readonly RuntimeAssetDescriptor[] = [
   proxyImage("proxy/firewall/command.js"),
   proxyImage("proxy/firewall/dns.js"),
   proxyImage("proxy/firewall/env.js"),
+  proxyImage("proxy/firewall/host-service-gateway.js"),
   proxyImage("proxy/firewall/index.js"),
   proxyImage("proxy/firewall/nftables.js"),
   proxyImage("proxy/firewall/route.js"),

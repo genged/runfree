@@ -6,6 +6,9 @@ import { afterEach, describe, expect, test, vi } from "vitest";
 
 import { classifyResolvedIpv4, createFirewallController, type FirewallPlan } from "./supervisor.ts";
 import { renderAuditSetUpdate, renderAuditTeardown } from "./nftables.ts";
+import { hostServiceSetDigest } from "./host-service-gateway.ts";
+import type { HostServiceGatewayStatus, FirewallGenerationStatus } from "@runfree/runtime-contracts/proxy-status";
+import type { HostServicesJson } from "@runfree/runtime-contracts/host-services";
 import type { AuditMarkerState } from "../audit.ts";
 import { validateProxyPolicy } from "../policy.ts";
 import type { LoadedEffectiveProxyControl } from "@runfree/runtime-contracts/effective-control";
@@ -32,6 +35,13 @@ function createTestFirewallController(overrides: Parameters<typeof createFirewal
     acknowledgeIpAssignment: () => {},
     replaceSessionAdmissionSet: async () => {},
     verifySessionAdmissionSet: async () => {},
+    // Host services default to "no gateway entry" and no-op nftables so unit
+    // tests never read the real /etc/hosts or touch the kernel.
+    readEtcHosts: () => ({ text: "", stat: { uid: 0, mode: 0o100644, isFile: true } }),
+    publishHostServiceGateway: () => {},
+    replaceHostServiceSet: async () => {},
+    applyHostServiceTeardown: async () => {},
+    flushHostServiceDraining: async () => {},
     ...overrides,
   });
 }
@@ -81,7 +91,11 @@ const plan: FirewallPlan = {
     auditSetName: "audit_ipv4",
     auditDrainingSetName: "audit_draining_ipv4",
     auditMaxElements: 256,
+    hostServiceSetName: "host_service",
+    hostServiceDrainingSetName: "host_service_draining",
+    hostServiceMaxElements: 64,
   },
+  hostServiceDrainSeconds: 30,
   refresh: {
     policyCheckIntervalSeconds: 2,
     dnsRefreshIntervalSeconds: 300,
@@ -330,6 +344,8 @@ describe("proxy firewall DNS supervisor", () => {
       generation: initialGeneration,
       rulesetVerified: true,
       appliedAt: new Date(1_750_000_000_000).toISOString(),
+      hostServiceSetDigest: hostServiceSetDigest([], []),
+      hostServiceDraining: 0,
     });
     const verifiesAfterInit = verify.mock.calls.length;
 
@@ -591,6 +607,8 @@ describe("proxy firewall empty allowlist state", () => {
       generation: EMPTY_GENERATION,
       rulesetVerified: true,
       appliedAt: new Date(NOW_MS).toISOString(),
+      hostServiceSetDigest: hostServiceSetDigest([], []),
+      hostServiceDraining: 0,
     }]);
   });
 
@@ -1742,5 +1760,302 @@ describe("proxy firewall session file admission", () => {
 
     expect(harness.replacements).toEqual([]);
     expect(harness.verified).toEqual([]);
+  });
+});
+
+describe("proxy firewall host-service gateway and set", () => {
+  type Entry = { ip: string; port: number };
+  type EtcHosts = { text: string; stat: { uid: number; mode: number; isFile: boolean } };
+  const GATEWAY = "192.168.65.254";
+  const ROOT_STAT = { uid: 0, mode: 0o100644, isFile: true };
+  const hostsWith = (ip: string): string =>
+    `127.0.0.1 localhost\n${ip}\tgateway.runfree.internal\nfdc4:f303:9324::254 gateway.runfree.internal\n`;
+  const VALID: EtcHosts = { text: hostsWith(GATEWAY), stat: ROOT_STAT };
+  const IDB: HostServicesJson = { idb: { target: "host-loopback", port: 10882 } };
+  const IDB_ENTRY: Entry = { ip: GATEWAY, port: 10882 };
+  const START_MS = 1_750_000_000_000;
+
+  function servicePolicy(services: HostServicesJson) {
+    return validateProxyPolicy({ hosts: [], tokens: {}, hostServices: services }, plan.policyPath);
+  }
+
+  function harness(initial: { etcHosts: EtcHosts | (() => EtcHosts); services: HostServicesJson }) {
+    const state = { etcHosts: initial.etcHosts, services: initial.services, now: START_MS };
+    const order: string[] = [];
+    const kernel: { accept: Entry[]; draining: Entry[] } = { accept: [], draining: [] };
+    const gateways: HostServiceGatewayStatus[] = [];
+    const statuses: FirewallGenerationStatus[] = [];
+    const replaceHostServiceSet = vi.fn(async (entries: readonly Entry[], _plan: FirewallPlan) => {
+      order.push("replaceHostServiceSet");
+      kernel.accept = [...entries];
+    });
+    const applyHostServiceTeardown = vi.fn(async (draining: readonly Entry[], remaining: readonly Entry[], _plan: FirewallPlan) => {
+      order.push("applyHostServiceTeardown");
+      kernel.draining = [...draining];
+      kernel.accept = [...remaining];
+    });
+    const flushHostServiceDraining = vi.fn(async (_plan: FirewallPlan) => {
+      order.push("flushHostServiceDraining");
+      kernel.draining = [];
+    });
+    const readEtcHosts = vi.fn((): EtcHosts => {
+      order.push("readEtcHosts");
+      return typeof state.etcHosts === "function" ? state.etcHosts() : state.etcHosts;
+    });
+    const makeController = () => createTestFirewallController({
+      nowMs: () => state.now,
+      log: () => {},
+      resolve4: async () => [],
+      loadPolicy: () => servicePolicy(state.services),
+      ensureDefaultRoute: async () => {},
+      applyRuleset: async () => {},
+      replaceAllowedSet: async () => {},
+      publishResolvedHosts,
+      verify: async () => {},
+      readEtcHosts,
+      publishHostServiceGateway: (status) => {
+        order.push("publishHostServiceGateway");
+        gateways.push(status);
+      },
+      replaceHostServiceSet,
+      applyHostServiceTeardown,
+      flushHostServiceDraining,
+      publishFirewallStatus: (status) => {
+        order.push("publishFirewallStatus");
+        statuses.push(status);
+      },
+    });
+    const startPlan = (): FirewallPlan => ({
+      ...plan,
+      allowedHosts: [],
+      policyGeneration: servicePolicy(state.services).generation,
+      hostServices: state.services,
+      hostServiceDrainSeconds: 30,
+    });
+    return {
+      controller: makeController(),
+      makeController,
+      state,
+      order,
+      kernel,
+      gateways,
+      statuses,
+      readEtcHosts,
+      replaceHostServiceSet,
+      applyHostServiceTeardown,
+      flushHostServiceDraining,
+      startPlan,
+    };
+  }
+
+  test("initialize pins the gateway and installs only the approved pairs before readiness", async () => {
+    const h = harness({ etcHosts: VALID, services: IDB });
+    const started = h.startPlan();
+    await h.controller.initialize(started);
+
+    expect(h.gateways).toHaveLength(1);
+    expect(h.gateways[0]).toEqual({
+      schemaVersion: 1,
+      policyGeneration: started.policyGeneration,
+      gatewayIp: GATEWAY,
+      writtenAt: new Date(START_MS).toISOString(),
+    });
+    expect(h.replaceHostServiceSet).toHaveBeenCalledWith([IDB_ENTRY], expect.anything());
+    expect(h.kernel.accept).toEqual([IDB_ENTRY]);
+    const ready = h.order.indexOf("publishFirewallStatus");
+    expect(h.order.indexOf("publishHostServiceGateway")).toBeLessThan(ready);
+    expect(h.order.indexOf("replaceHostServiceSet")).toBeLessThan(ready);
+    expect(h.statuses[0]).toMatchObject({
+      rulesetVerified: true,
+      hostServiceSetDigest: hostServiceSetDigest([IDB_ENTRY], []),
+      hostServiceDraining: 0,
+    });
+  });
+
+  test.each([
+    ["a non-root /etc/hosts", { text: hostsWith(GATEWAY), stat: { uid: 1001, mode: 0o100644, isFile: true } }, "uid 0"],
+    ["a group-writable /etc/hosts", { text: hostsWith(GATEWAY), stat: { uid: 0, mode: 0o100664, isFile: true } }, "writable"],
+    ["a missing alias", { text: "127.0.0.1 localhost\n", stat: ROOT_STAT }, "missing"],
+    ["a public gateway address", { text: hostsWith("8.8.8.8"), stat: ROOT_STAT }, "RFC 1918"],
+    ["an unreadable /etc/hosts", () => {
+      throw new Error("EACCES");
+    }, "EACCES"],
+  ])("%s publishes a named refusal and leaves the set empty", async (_label, etcHosts, needle) => {
+    const h = harness({ etcHosts: etcHosts as EtcHosts | (() => EtcHosts), services: IDB });
+    const started = h.startPlan();
+    await h.controller.initialize(started);
+
+    expect(h.gateways).toHaveLength(1);
+    expect(h.gateways[0].gatewayIp).toBeUndefined();
+    expect(h.gateways[0].policyGeneration).toBe(started.policyGeneration);
+    expect(h.gateways[0].unavailableReason).toContain(needle);
+    expect(h.replaceHostServiceSet).toHaveBeenCalledWith([], expect.anything());
+    expect(h.kernel.accept).toEqual([]);
+    // The rest of the ruleset is unaffected: readiness still reports it.
+    expect(h.statuses.at(-1)).toMatchObject({ rulesetVerified: true, hostServiceSetDigest: hostServiceSetDigest([], []) });
+  });
+
+  test("a changed gateway address after the pin is sticky until a new supervisor re-pins (HS8)", async () => {
+    const h = harness({ etcHosts: VALID, services: IDB });
+    await h.controller.initialize(h.startPlan());
+    expect(h.kernel.accept).toEqual([IDB_ENTRY]);
+
+    h.state.etcHosts = { text: hostsWith("192.168.65.200"), stat: ROOT_STAT };
+    await h.controller.refreshPolicyAndIps({ refreshDns: false });
+    expect(h.kernel.accept).toEqual([]);
+    // The old pair is severed, not just no longer accepted.
+    expect(h.kernel.draining).toEqual([IDB_ENTRY]);
+    const refusal = h.gateways.at(-1);
+    expect(refusal?.gatewayIp).toBeUndefined();
+    expect(refusal?.unavailableReason).toContain("gateway address changed");
+    expect(refusal?.unavailableReason).toContain("runfree rebuild");
+    expect(h.statuses.at(-1)).toMatchObject({
+      hostServiceSetDigest: hostServiceSetDigest([], [IDB_ENTRY]),
+      hostServiceDraining: 1,
+    });
+
+    // Reading the original address again does not re-enable anything.
+    h.state.etcHosts = VALID;
+    await h.controller.refreshPolicyAndIps({ refreshDns: false });
+    h.state.now += 60_000;
+    await h.controller.refreshPolicyAndIps({ refreshDns: false });
+    expect(h.kernel.accept).toEqual([]);
+    expect(h.gateways.at(-1)?.unavailableReason).toContain("gateway address changed");
+    expect(h.gateways.every((status, index) => index === 0 || status.gatewayIp === undefined)).toBe(true);
+
+    // Reclaim: a new supervisor instance (a proxy restart after `runfree
+    // rebuild`) re-runs the checks and re-pins.
+    const restarted = h.makeController();
+    await restarted.initialize(h.startPlan());
+    expect(h.kernel.accept).toEqual([IDB_ENTRY]);
+    expect(h.gateways.at(-1)?.gatewayIp).toBe(GATEWAY);
+  });
+
+  test("an invalid read after the pin is sticky in the same way", async () => {
+    const h = harness({ etcHosts: VALID, services: IDB });
+    await h.controller.initialize(h.startPlan());
+
+    h.state.etcHosts = { text: hostsWith(GATEWAY), stat: { uid: 0, mode: 0o100666, isFile: true } };
+    await h.controller.refreshPolicyAndIps({ refreshDns: false });
+    expect(h.kernel.accept).toEqual([]);
+    expect(h.gateways.at(-1)?.unavailableReason).toContain("gateway address changed");
+
+    h.state.etcHosts = VALID;
+    await h.controller.refreshPolicyAndIps({ refreshDns: false });
+    expect(h.kernel.accept).toEqual([]);
+    expect(h.gateways.at(-1)?.gatewayIp).toBeUndefined();
+  });
+
+  test("removing a service drains its pair before the status names the generation, then flushes after the drain window", async () => {
+    const h = harness({ etcHosts: VALID, services: IDB });
+    await h.controller.initialize(h.startPlan());
+
+    h.state.services = {};
+    const removedGeneration = servicePolicy({}).generation;
+    h.order.length = 0;
+    await h.controller.refreshPolicyAndIps({ refreshDns: false });
+    expect(h.applyHostServiceTeardown).toHaveBeenCalledWith([IDB_ENTRY], [], expect.anything());
+    expect(h.order.indexOf("applyHostServiceTeardown")).toBeGreaterThanOrEqual(0);
+    expect(h.order.indexOf("applyHostServiceTeardown")).toBeLessThan(h.order.indexOf("publishFirewallStatus"));
+    expect(h.order.indexOf("publishHostServiceGateway")).toBeLessThan(h.order.indexOf("publishFirewallStatus"));
+    expect(h.kernel).toEqual({ accept: [], draining: [IDB_ENTRY] });
+    expect(h.statuses.at(-1)).toMatchObject({
+      generation: removedGeneration,
+      hostServiceSetDigest: hostServiceSetDigest([], [IDB_ENTRY]),
+      hostServiceDraining: 1,
+    });
+    // The gateway file follows the policy generation the request proxy uses.
+    expect(h.gateways.at(-1)).toMatchObject({ policyGeneration: removedGeneration, gatewayIp: GATEWAY });
+
+    h.state.now += 29_000;
+    await h.controller.refreshPolicyAndIps({ refreshDns: false });
+    expect(h.flushHostServiceDraining).not.toHaveBeenCalled();
+
+    h.state.now += 1_000;
+    await h.controller.refreshPolicyAndIps({ refreshDns: false });
+    expect(h.flushHostServiceDraining).toHaveBeenCalledTimes(1);
+    expect(h.kernel).toEqual({ accept: [], draining: [] });
+    expect(h.statuses.at(-1)).toMatchObject({
+      generation: removedGeneration,
+      hostServiceSetDigest: hostServiceSetDigest([], []),
+      hostServiceDraining: 0,
+    });
+  });
+
+  test("re-adding a draining pair takes it out of the draining set at once", async () => {
+    const h = harness({ etcHosts: VALID, services: IDB });
+    await h.controller.initialize(h.startPlan());
+    h.state.services = {};
+    await h.controller.refreshPolicyAndIps({ refreshDns: false });
+    expect(h.kernel.draining).toEqual([IDB_ENTRY]);
+
+    h.state.services = IDB;
+    await h.controller.refreshPolicyAndIps({ refreshDns: false });
+    expect(h.kernel).toEqual({ accept: [IDB_ENTRY], draining: [] });
+    expect(h.statuses.at(-1)).toMatchObject({ hostServiceDraining: 0 });
+  });
+
+  test("the drain window still closes while an invalid policy reload is preserved", async () => {
+    const h = harness({ etcHosts: VALID, services: IDB });
+    await h.controller.initialize(h.startPlan());
+    h.state.services = {};
+    await h.controller.refreshPolicyAndIps({ refreshDns: false });
+    expect(h.kernel.draining).toEqual([IDB_ENTRY]);
+
+    h.state.services = { idb: { target: "host-loopback", port: 2375 } };
+    h.state.now += 30_000;
+    await h.controller.refreshPolicyAndIps({ refreshDns: false });
+    expect(h.kernel).toEqual({ accept: [], draining: [] });
+  });
+
+  test("only the maintenance path reads /etc/hosts; the session-admission loop never does", async () => {
+    const h = harness({ etcHosts: VALID, services: IDB });
+    await h.controller.initialize(h.startPlan());
+    h.readEtcHosts.mockClear();
+
+    for (let index = 0; index < 5; index += 1) await h.controller.reconcileSessionAdmission();
+    expect(h.readEtcHosts).not.toHaveBeenCalled();
+
+    await h.controller.refreshPolicyAndIps({ refreshDns: false });
+    expect(h.readEtcHosts).toHaveBeenCalledTimes(1);
+  });
+
+  test("a missing entry before the first pin refuses, and a later valid maintenance read pins and enables", async () => {
+    const missing: EtcHosts = { text: "127.0.0.1 localhost\n", stat: ROOT_STAT };
+    const h = harness({ etcHosts: missing, services: IDB });
+    const started = h.startPlan();
+    await h.controller.initialize(started);
+    expect(h.kernel.accept).toEqual([]);
+    expect(h.gateways.at(-1)?.unavailableReason).toContain("missing");
+
+    // Still missing: still refused, nothing installed.
+    await h.controller.refreshPolicyAndIps({ refreshDns: false });
+    expect(h.kernel.accept).toEqual([]);
+    expect(h.gateways.at(-1)?.gatewayIp).toBeUndefined();
+
+    h.state.etcHosts = VALID;
+    await h.controller.refreshPolicyAndIps({ refreshDns: false });
+    expect(h.kernel.accept).toEqual([IDB_ENTRY]);
+    expect(h.gateways.at(-1)).toEqual({
+      schemaVersion: 1,
+      policyGeneration: started.policyGeneration,
+      gatewayIp: GATEWAY,
+      writtenAt: new Date(START_MS).toISOString(),
+    });
+    // The level-triggered status is republished for the same generation.
+    expect(h.statuses.at(-1)).toMatchObject({
+      generation: started.policyGeneration,
+      hostServiceSetDigest: hostServiceSetDigest([IDB_ENTRY], []),
+    });
+  });
+
+  test("an unchanged tick republishes neither the gateway file nor the status", async () => {
+    const h = harness({ etcHosts: VALID, services: IDB });
+    await h.controller.initialize(h.startPlan());
+    await h.controller.refreshPolicyAndIps({ refreshDns: false });
+    await h.controller.refreshPolicyAndIps({ refreshDns: false });
+    expect(h.gateways).toHaveLength(1);
+    expect(h.statuses).toHaveLength(1);
+    expect(h.replaceHostServiceSet).toHaveBeenCalledTimes(1);
   });
 });
