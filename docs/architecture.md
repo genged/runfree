@@ -171,7 +171,10 @@ Every `docker` command line outside the sealed session commands is built by
 one module, `packages/cli/src/runtime/docker-client.ts`; the sealed session
 commands (`packages/cli/src/runtime/session-container-docker.ts` and the
 other session builders) build theirs with a named effect each.
-`make test-static` fails if `docker` argv is written anywhere else.
+`make test-static` runs a gate (`scripts/check-docker-argv.ts`) that fails if a
+`"docker"` string literal appears in a CLI source file outside a reviewed
+allowlist; it cannot see argv built from a typed executor parameter, nor new
+argv hand-written inside an already-allowlisted file.
 
 Runfree does not open the Docker socket itself, so the daemon it reaches is
 always the one the user's `docker` command reaches: the same `DOCKER_HOST`,
