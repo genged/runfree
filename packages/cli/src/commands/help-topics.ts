@@ -92,6 +92,11 @@ Allow exact hosts:
   runfree host rules <host> [--read-only] [--method <M>]... [--request-path-prefix /path/] [--local]
   runfree host rules <host> [--clear] [--local]
 
+Approve a service on the host's loopback (agent reaches 127.0.0.1:<port>):
+  runfree host-service add <name> --port <port> [--local] [--no-reload]
+  runfree host-service remove <name> [--local] [--no-reload]
+  runfree host-service list [--repair]
+
 Discover needed hosts without editing policy:
   runfree up --audit-network[=<duration>]
   runfree audit status
@@ -404,6 +409,15 @@ Network policy:
       Show a host's allowlist status, credentials, and request rules
   runfree host rules <host> [--write allow|ask|deny] [--read-only | --method <M>]... [--request-path-prefix /path/]... [--deny-git-push] [--clear] [--local] [--no-reload]
       Show/change effective request rules; --write sets write handling, rule flags replace request-shape rules, and --clear removes rules
+  runfree host-service add <name> --port <port> [--local] [--no-reload]
+      Approve agent access to 127.0.0.1:<port> on the host. Refuses Docker Engine, runfree's own ports,
+      a port with no visible listener, and a Docker Desktop-owned port; review names the listening process.
+      New sessions reach it on the agent's 127.0.0.1:<port> through a relay and the proxy.
+  runfree host-service remove <name> [--local] [--no-reload]
+      Remove an approved host service; the proxy cuts its open connections once the change applies
+  runfree host-service list [--repair]
+      Print effective host services and each port's current listener; --repair rebuilds the
+      host-global host-service port registry from every known project
 
 Credentials:
   runfree credential source add <name> -- <command> [args...]

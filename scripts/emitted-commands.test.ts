@@ -49,17 +49,6 @@ const REMOVED_COMMAND_FRAGMENTS = new Set([
   "runfree paste-image",
 ]);
 
-// Commands the host-services feature emits before its CLI command lands: the
-// proxy's host-service remedy names `runfree host-service add`, and the port
-// registry's repair remedy (`remedies.ts`) names `runfree host-service list
-// --repair`. Both name the `host-service` command the host-services plan adds
-// in a later task. That task removes this entry, so the remedy is then parsed
-// like every other emitted command.
-const PENDING_COMMAND_PREFIXES: readonly string[] = [
-  "runfree host-service add ",
-  "runfree host-service list --repair",
-];
-
 // English words that end a command fragment inside prose ("runfree update
 // does not ..."). None is a Runfree command word or flag.
 const PROSE_STOP_WORDS = new Set([
@@ -92,6 +81,7 @@ const FLAG_VALUE_FOR_TEMPLATE: Record<string, string> = {
   "--from-source": "src",
   "--from-1password": "op://vault/item/field",
   "--host": "api.example.com",
+  "--port": "8080",
   "--subject-digest": `sha256:${"a".repeat(64)}`,
 };
 
@@ -219,7 +209,6 @@ describe("emitted commands parse under the real command app", () => {
     const failures: string[] = [];
     for (const rendering of sampleRemedyRenderings()) {
       expect(rendering.startsWith("runfree ")).toBe(true);
-      if (PENDING_COMMAND_PREFIXES.some((prefix) => rendering.startsWith(prefix))) continue;
       const failure = await parseFailure(rendering.slice("runfree ".length).split(" "));
       if (failure) failures.push(`${rendering}: ${failure}`);
     }
@@ -241,10 +230,13 @@ describe("emitted commands parse under the real command app", () => {
     // The lint must actually see the emitting modules; an empty scan would
     // pass vacuously.
     expect(candidates.length).toBeGreaterThan(40);
+    // The proxy's hand-written host-service remedy (it cannot import
+    // remedies.ts) is one of the parsed fragments, not skipped.
+    expect(candidates.some((candidate) =>
+      candidate.file === "packages/proxy/src/server.ts" && candidate.fragment.startsWith("runfree host-service add "))).toBe(true);
     const failures: string[] = [];
     for (const candidate of candidates) {
       if (REMOVED_COMMAND_FRAGMENTS.has(candidate.fragment)) continue;
-      if (PENDING_COMMAND_PREFIXES.some((prefix) => candidate.fragment.startsWith(prefix))) continue;
       const failure = await parseFailure(candidate.argv);
       if (!failure) continue;
       // A prose mention may name a command prefix; a presented next step may
@@ -262,5 +254,7 @@ describe("emitted commands parse under the real command app", () => {
     expect(await parseFailure(["host", "add", "api.example.com", "--bogus"])).toContain("Unknown argument: bogus");
     expect(await parseFailure(["host", "add", "api.example.com", "--no-reload"])).toBeUndefined();
     expect(await parseFailure(["credential", "source", "add", "gh", "--", "gh", "auth", "token"])).toBeUndefined();
+    expect(await parseFailure(["host-service", "add", "idb", "--port", "10882"])).toBeUndefined();
+    expect(await parseFailure(["host-service", "add", "idb", "--port", "010"])).toContain("--port must be a decimal port");
   });
 });

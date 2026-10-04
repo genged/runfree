@@ -49,9 +49,9 @@ export const remedy = {
   statusVerbose: (): string => "runfree status --verbose",
   help: (): string => "runfree help",
   init: (): string => "runfree init",
-  // The `host-service` command lands in a later task; until then this renders
-  // a command the real CLI does not parse yet (tracked as a temporary
-  // exception in `scripts/emitted-commands.test.ts`'s PENDING_COMMAND_PREFIXES).
+  hostServiceAdd: (name: string, port: number | string): string => `runfree host-service add ${name} --port ${port}`,
+  hostServiceRemove: (name: string): string => `runfree host-service remove ${name}`,
+  hostServiceList: (): string => "runfree host-service list",
   hostServiceRepair: (): string => "runfree host-service list --repair",
 } as const;
 
@@ -93,6 +93,9 @@ export function sampleRemedyRenderings(): string[] {
     remedy.statusVerbose(),
     remedy.help(),
     remedy.init(),
+    remedy.hostServiceAdd("idb", 10882),
+    remedy.hostServiceRemove("idb"),
+    remedy.hostServiceList(),
     remedy.hostServiceRepair(),
   ];
 }
