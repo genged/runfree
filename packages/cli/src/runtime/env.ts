@@ -35,10 +35,16 @@ function mcpOperationPolicyPath(project: ProjectInfo): string {
   return project.paths.mcpOperationPolicyPath ?? path.join(project.paths.stateDir, "mcp-operation-policy.json");
 }
 
-function selectedAgentEnvironmentPath(project: ProjectInfo): string {
+// Both paths come from the same verifyEffectivePolicyGeneration result, so
+// RUNFREE_AGENT_ENV_FILE and RUNFREE_NETWORK_POLICY_FILE always name the same
+// effective policy generation (A5). The session template reads this path
+// instead of re-resolving the active selection, so a later selection change
+// cannot desync the network policy it renders from the agent env it reads.
+function selectedEffectivePolicyPaths(project: ProjectInfo): { agentEnvPath: string; networkPolicyPath: string } {
   const active = readActiveControlSelection(project);
   if (!active) throw new Error("selected effective controls are required before runtime environment generation");
-  return verifyEffectivePolicyGeneration(project, active.controlGeneration).agentEnvPath;
+  const generation = verifyEffectivePolicyGeneration(project, active.controlGeneration);
+  return { agentEnvPath: generation.agentEnvPath, networkPolicyPath: generation.networkPolicyPath };
 }
 
 export function dockerClientEnvironment(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
@@ -80,6 +86,7 @@ function generatedRunfreeEnvironment(
     runtimeOverrides.RUNFREE_PROXY_EGRESS_IP = runtimeNetwork.proxyEgressIp;
   }
 
+  const effectivePolicyPaths = selectedEffectivePolicyPaths(project);
   const runtimeDigest = options.runtimeDigest ?? effectiveRuntimeDigest(projectRoot, project.config);
   const identity = projectIdentity(projectRoot, project.config);
   const gitLayout = options.gitLayout;
@@ -103,7 +110,8 @@ function generatedRunfreeEnvironment(
     RUNFREE_PROJECT_PHYSICAL_ROOT: physicalRoot,
     RUNFREE_INBOX_DIR: project.paths.inboxDir,
     RUNFREE_INBOX_CONTAINER_DIR: inboxContainerDir(),
-    RUNFREE_AGENT_ENV_FILE: selectedAgentEnvironmentPath(project),
+    RUNFREE_AGENT_ENV_FILE: effectivePolicyPaths.agentEnvPath,
+    RUNFREE_NETWORK_POLICY_FILE: effectivePolicyPaths.networkPolicyPath,
     RUNFREE_EFFECTIVE_PROXY_DIR: project.paths.controlProxyDir,
     RUNFREE_MCP_OAUTH_CALLBACK_PORT: String(mcpOAuthCallbackPort(projectRoot)),
     RUNFREE_MCP_OAUTH_CALLBACK_URL: mcpOAuthCallbackUrl(projectRoot),

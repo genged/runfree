@@ -1,8 +1,13 @@
+import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 
-import { describe, expect, test } from "vitest";
+import { afterEach, beforeEach, describe, expect, test } from "vitest";
 
-import type { ProjectInfo } from "../config.ts";
+import { projectInfo as realProjectInfo, type ProjectInfo } from "../config.ts";
+import { approveNetworkCandidate, approveRuntimeIsolationControl } from "../control/approvals.ts";
+import { captureDesiredPolicyCandidate } from "../control/candidates.ts";
+import { publishEffectivePolicyGeneration } from "../control/effective.ts";
 import { RUNFREE_PLACEHOLDER_VALUE } from "../../../../scripts/services.ts";
 import {
   bindSessionAgentImageV2,
@@ -14,6 +19,7 @@ import {
 } from "./component-state-v2.ts";
 import { sha256Digest } from "./component-state.ts";
 import type { DependencyOverlayPlan } from "./dependency-overlays.ts";
+import { composeProjectName, composeRuntimeEnvironment } from "./env.ts";
 import type { RuntimeGitLayoutPlan } from "./git-layout.ts";
 import {
   SESSION_TEST_PROJECT,
@@ -32,12 +38,14 @@ import {
   createSessionContainerCreatePlan,
   createSessionContainerTemplate,
   createSessionContainerTemplateFromArtifact,
+  sessionContainerTemplateForRuntimePlan,
   sessionContainerTemplateInit,
   sessionContainerTopologyProjectionV2,
   type SessionContainerCreatePlan,
   type SessionContainerCreatePlanInput,
   type SessionContainerTemplate,
   type SessionContainerTemplateInput,
+  type SessionContainerTemplateRuntimePlan,
 } from "./session-container-template.ts";
 import { createSessionImageDeclarationProof } from "./session-image-declarations.ts";
 import { createSessionLaunchTarget } from "./session-launch.ts";
@@ -153,6 +161,7 @@ function input(overrides: Partial<SessionContainerTemplateInput> = {}): SessionC
       RUNFREE_EFFECTIVE_PROXY_DIR: "/must/not/appear/proxy-controls",
       DOCKER_CONFIG: "/must/not/appear/docker-config",
     },
+    hostServices: {},
     selectedAgentEnvironment: {
       displayPath: "/host/effective/agent.env",
       source: [
@@ -283,6 +292,21 @@ describe("canonical session-container template", () => {
     expect(reordered).toEqual(baseline);
     expect(sessionContainerTopologyProjectionV2(reordered))
       .toEqual(sessionContainerTopologyProjectionV2(baseline));
+  });
+
+  test("renders approved host services as sorted name:port pairs (SR14)", () => {
+    const template = createSessionContainerTemplate(input({
+      hostServices: {
+        idb: { target: "host-loopback", port: 10882 },
+        echo: { target: "host-loopback", port: 18080 },
+      },
+    }));
+    expect(template.environment.RUNFREE_HOST_SERVICES).toBe("echo:18080,idb:10882");
+  });
+
+  test("omits RUNFREE_HOST_SERVICES entirely (not an empty value) when no host services are approved", () => {
+    const template = createSessionContainerTemplate(input());
+    expect(Object.hasOwn(template.environment, "RUNFREE_HOST_SERVICES")).toBe(false);
   });
 
   test("projects the fixed stopped-create and admitted-network contracts", () => {
@@ -707,5 +731,87 @@ describe("canonical session-container template", () => {
     for (const [label, candidate] of mutations) {
       expect(() => createSessionContainerCreatePlan(candidate), label).toThrow();
     }
+  });
+});
+
+describe("effective policy generation binding (A5)", () => {
+  let root: string;
+  let stateHome: string;
+
+  beforeEach(() => {
+    root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "runfree-session-template-a5-")));
+    stateHome = fs.mkdtempSync(path.join(os.tmpdir(), "runfree-session-template-a5-state-"));
+    fs.mkdirSync(path.join(root, ".runfree"), { recursive: true });
+  });
+
+  afterEach(() => {
+    fs.rmSync(root, { recursive: true, force: true });
+    fs.rmSync(stateHome, { recursive: true, force: true });
+  });
+
+  // Captures, approves, and publishes policyJson as a brand-new effective
+  // policy generation, and leaves it as the active selection (as a real
+  // `runfree` approval flow would). Returns the project used plus the
+  // published generation, so a caller can compare a generation captured
+  // before this call against whatever is active after it.
+  function publishGeneration(policyJson: string): {
+    project: ProjectInfo;
+    env: NodeJS.ProcessEnv;
+    networkPolicyPath: string;
+    agentEnvPath: string;
+  } {
+    const env = { XDG_STATE_HOME: stateHome, XDG_CONFIG_HOME: path.join(stateHome, "config") };
+    const project = realProjectInfo(root, env);
+    fs.writeFileSync(project.paths.policyPath, policyJson);
+    const candidate = captureDesiredPolicyCandidate(root, project.paths.controlCandidatesDir);
+    approveNetworkCandidate(root, project, candidate, "network-project", "interactive");
+    approveNetworkCandidate(root, project, candidate, "network-local", "interactive");
+    approveRuntimeIsolationControl(root, project, "interactive");
+    const generation = publishEffectivePolicyGeneration(root, project);
+    return {
+      project,
+      env,
+      networkPolicyPath: generation.networkPolicyPath,
+      agentEnvPath: generation.agentEnvPath,
+    };
+  }
+
+  test("renders the host services of the generation named by composeEnv, never whatever is selected when the template is built", () => {
+    const g1 = publishGeneration('{"version":2,"hosts":[]}\n');
+    const composeEnv = Object.fromEntries(
+      Object.entries(composeRuntimeEnvironment(root, g1.project, path.join(root, "runtime"), g1.env))
+        .filter((entry): entry is [string, string] => typeof entry[1] === "string"),
+    );
+    // Sanity: the composeEnv just built really does name G1 (no host services).
+    expect(composeEnv.RUNFREE_NETWORK_POLICY_FILE).toBe(g1.networkPolicyPath);
+    expect(composeEnv.RUNFREE_AGENT_ENV_FILE).toBe(g1.agentEnvPath);
+
+    // Select G2 before the template is built: a different effective policy
+    // generation, with an approved host service G1 never had.
+    const g2 = publishGeneration(JSON.stringify({
+      version: 2,
+      hosts: [],
+      hostServices: { idb: { target: "host-loopback", port: 10882 } },
+    }));
+    expect(g2.networkPolicyPath).not.toBe(g1.networkPolicyPath);
+
+    const plan: SessionContainerTemplateRuntimePlan = {
+      projectRoot: root,
+      project: g1.project,
+      composeProjectName: composeProjectName(root),
+      dependencyOverlays: dependencies(),
+      gitLayout: {
+        version: 1,
+        kind: "workspace",
+        hostProjectRoot: root,
+        containerProjectRoot: "/workspaces/project",
+        containerCompatRoot: "/workspace",
+      },
+      projectRuntimeRoot: path.join(root, "runtime"),
+      execution: { composeEnv },
+    };
+
+    const template = sessionContainerTemplateForRuntimePlan(plan);
+    expect(Object.hasOwn(template.environment, "RUNFREE_HOST_SERVICES")).toBe(false);
   });
 });

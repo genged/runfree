@@ -75,6 +75,7 @@ describe("runtime environment", () => {
       RUNFREE_PROJECT_COMPAT_ROOT: "/workspace",
       RUNFREE_PROJECT_PHYSICAL_ROOT: "/workspace",
       RUNFREE_AGENT_ENV_FILE: effective.agentEnvPath,
+      RUNFREE_NETWORK_POLICY_FILE: effective.networkPolicyPath,
       RUNFREE_EFFECTIVE_PROXY_DIR: path.join(tmp, "state", "control", "effective", "proxy"),
       RUNFREE_GIT_LAYOUT_KIND: "workspace",
       RUNFREE_INBOX_DIR: path.join(tmp, "state", "inbox"),

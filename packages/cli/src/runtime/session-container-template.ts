@@ -1,6 +1,9 @@
 import fs from "node:fs";
 import path from "node:path";
 
+import { formatHostServicesEnv, HOST_SERVICES_ENV, type HostServicesJson } from "@runfree/runtime-contracts/host-services";
+import { validateNetworkPolicy } from "@runfree/runtime-contracts/network-policy";
+
 import {
   agentStateEnvironment,
   composeAgentEnvironment,
@@ -152,6 +155,10 @@ export type SessionContainerTemplateInput = {
   gitLayout: RuntimeGitLayoutPlan;
   dependencyOverlays: DependencyOverlayPlan;
   runtimeEnvironment: Readonly<Record<string, string | undefined>>;
+  // Approved host services (SR14) of the same effective policy generation as
+  // selectedAgentEnvironment, rendered into RUNFREE_HOST_SERVICES. Routing
+  // data only: see sessionEnvironment.
+  hostServices: HostServicesJson;
   selectedAgentEnvironment: {
     source: string;
     displayPath: string;
@@ -200,6 +207,9 @@ function sessionEnvironment(input: SessionContainerTemplateInput): Record<string
     name,
     resolveComposeEnvironmentValue(value, input.runtimeEnvironment),
   ]));
+  // Absent (not empty) with no host services, so the agent image's session
+  // entry starts the relay only when there is something for it to route to.
+  const hostServicesEnv = formatHostServicesEnv(input.hostServices);
   return sortedEnvironment({
     ...projectAgentEnvironmentOverrides(
       input.selectedAgentEnvironment.source,
@@ -207,6 +217,7 @@ function sessionEnvironment(input: SessionContainerTemplateInput): Record<string
       { declaredParameterEnvNames: input.selectedAgentEnvironment.declaredParameterEnvNames ?? [] },
     ),
     ...resolvedRuntimeOwned,
+    ...(hostServicesEnv === "" ? {} : { [HOST_SERVICES_ENV]: hostServicesEnv }),
   });
 }
 
@@ -732,6 +743,15 @@ function selectedAgentEnvironmentSource(selectedPath: string): string {
   return fs.readFileSync(selectedPath, "utf8");
 }
 
+// Reads the exact network policy named by RUNFREE_NETWORK_POLICY_FILE, the
+// same effective policy generation as RUNFREE_AGENT_ENV_FILE (A5). Never
+// re-resolves the active selection: a later selection change must not desync
+// the host services a session template renders from the agent env it reads.
+function selectedNetworkPolicyHostServices(selectedPath: string): HostServicesJson {
+  const raw: unknown = JSON.parse(fs.readFileSync(selectedPath, "utf8"));
+  return validateNetworkPolicy(raw, selectedPath).hostServices;
+}
+
 // The selected generation's approved services declare which agent env names
 // are parameters (values pass through) rather than credentials (placeholders).
 // Recomputed from the verified approved subjects, like the provenance snapshot.
@@ -750,6 +770,8 @@ export function sessionContainerTemplateForRuntimePlan(
 ): SessionContainerTemplate {
   const selectedAgentEnvironmentPath = plan.execution.composeEnv.RUNFREE_AGENT_ENV_FILE;
   if (!selectedAgentEnvironmentPath) throw new Error("selected session-container agent environment is missing");
+  const selectedNetworkPolicyPath = plan.execution.composeEnv.RUNFREE_NETWORK_POLICY_FILE;
+  if (!selectedNetworkPolicyPath) throw new Error("selected session-container network policy is missing");
   return createSessionContainerTemplate({
     projectRoot: plan.projectRoot,
     project: plan.project,
@@ -757,6 +779,7 @@ export function sessionContainerTemplateForRuntimePlan(
     gitLayout: plan.gitLayout,
     dependencyOverlays: plan.dependencyOverlays,
     runtimeEnvironment: plan.execution.composeEnv,
+    hostServices: selectedNetworkPolicyHostServices(selectedNetworkPolicyPath),
     selectedAgentEnvironment: {
       source: selectedAgentEnvironmentSource(selectedAgentEnvironmentPath),
       displayPath: selectedAgentEnvironmentPath,

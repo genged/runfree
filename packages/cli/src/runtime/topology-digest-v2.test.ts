@@ -6,6 +6,8 @@ import { describe, expect, test } from "vitest";
 import { composeAgentStateMounts } from "../agents.ts";
 import { inboxMount } from "../inbox.ts";
 import { renderRuntimeCompose } from "./compose.ts";
+import { sessionContainerTemplateFixture } from "./session-container.test-harness.ts";
+import { sessionContainerTopologyProjectionV2 } from "./session-container-template.ts";
 import { composeInterpolationVariables } from "./topology-digest.ts";
 import {
   RUNTIME_COMPOSE_INTERPOLATION_PROJECTIONS_V2,
@@ -184,6 +186,23 @@ describe("runtime topology generation v2", () => {
     }));
     expect(session.controlPlaneTopologyDigest).toBe(baseline.controlPlaneTopologyDigest);
     expect(session.sessionTemplateDigest).not.toBe(baseline.sessionTemplateDigest);
+  });
+
+  test("changes sessionTemplateDigest when approved host services change (SR14 digest effect)", () => {
+    const withoutHostServices = sessionContainerTopologyProjectionV2(sessionContainerTemplateFixture());
+    const withHostServices = sessionContainerTopologyProjectionV2(sessionContainerTemplateFixture({
+      hostServices: { idb: { target: "host-loopback", port: 10882 } },
+    }));
+
+    const baseline = runtimeTopologyGenerationV2(input({
+      sessionTemplate: { structure: withoutHostServices, runtimeSignatures: {} },
+    }));
+    const changed = runtimeTopologyGenerationV2(input({
+      sessionTemplate: { structure: withHostServices, runtimeSignatures: {} },
+    }));
+
+    expect(changed.controlPlaneTopologyDigest).toBe(baseline.controlPlaneTopologyDigest);
+    expect(changed.sessionTemplateDigest).not.toBe(baseline.sessionTemplateDigest);
   });
 
   test("fails closed for unclassified, valueless, and non-JSON projection inputs", () => {
