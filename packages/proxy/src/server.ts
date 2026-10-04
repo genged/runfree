@@ -57,7 +57,6 @@ import {
 } from "@runfree/runtime-contracts/proxy-status";
 import {
   HOST_SERVICE_GATEWAY_STATUS_FILE,
-  HOST_SERVICE_RESERVED_SUFFIX,
   isReservedRunfreeHostname,
   parseHostServiceAuthority,
 } from "@runfree/runtime-contracts/host-services";
@@ -1876,6 +1875,21 @@ type ConnectDecision =
   | { action: "host-service"; name: string; port: number }
   | { action: "reject"; host: string; reason: string; denialReason: DenialReason; remedy?: string };
 
+// Every reading of a CONNECT authority's host that a later stage could act
+// on: the bracket-stripping parse, and the raw text before the last and the
+// first colon, each with surrounding brackets removed.
+function reservedConnectHostCandidates(authority: string, parsedHost: string): string[] {
+  const trimmed = authority.trim();
+  const stripBrackets = (value: string) => value.replace(/^\[/, "").replace(/\]$/, "");
+  const lastColon = trimmed.lastIndexOf(":");
+  const firstColon = trimmed.indexOf(":");
+  return [
+    parsedHost,
+    stripBrackets(lastColon === -1 ? trimmed : trimmed.slice(0, lastColon)),
+    stripBrackets(firstColon === -1 ? trimmed : trimmed.slice(0, firstColon)),
+  ];
+}
+
 function hostServiceNotConfigured(host: string, remedy?: string): ConnectDecision {
   return {
     action: "reject",
@@ -1912,15 +1926,13 @@ function classifyConnect(authority: string): ConnectDecision {
       `requested by the agent; to approve: runfree host-service add ${reserved.name} --port ${reserved.port}`,
     );
   }
-  // Any other form that names the reserved suffix is refused with no remedy.
+  // Any other authority whose host is reserved is refused with no remedy.
   // `parseHostServiceAuthority` splits on the last colon while
   // `parseConnectAuthority` strips brackets, so `[x.runfree.internal]:443` or
   // `x.runfree.internal:443:` would otherwise read as not reserved and reach
   // audit-pass, the denied tunnel, or mockttp. A bracketed form is never a
   // valid service, even when the name and port match.
-  if (reserved.kind === "malformed"
-    || isReservedRunfreeHostname(host)
-    || authority.toLowerCase().includes(HOST_SERVICE_RESERVED_SUFFIX)) {
+  if (reserved.kind === "malformed" || reservedConnectHostCandidates(authority, host).some(isReservedRunfreeHostname)) {
     return hostServiceNotConfigured(host);
   }
   if (port !== 443) {

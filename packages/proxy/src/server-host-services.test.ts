@@ -204,7 +204,6 @@ describe("proxy server: host-service CONNECT splice", () => {
     ["no port", () => "echo.runfree.internal"],
     ["a bracketed approved pair", (port: number) => `[echo.runfree.internal]:${port}`],
     ["a trailing colon", () => "x.runfree.internal:443:"],
-    ["a reserved name inside another authority", () => "x.runfree.internal.example.com:443"],
   ])("a malformed reserved authority (%s) gets a raw 403 without a remedy and no dial", async (_label, authorityFor) => {
     const echo = await startEchoServer();
     const { proxy } = await startHostServiceProxy({ policy: hostServicePolicy({ echo: echo.port }) });
@@ -214,6 +213,20 @@ describe("proxy server: host-service CONNECT splice", () => {
     expect(response.body).toContain("host-service-not-configured");
     expect(response.body).not.toContain("runfree host-service add");
     expect(response.body).not.toContain("requested by the agent");
+    await expectNoDialFor(echo);
+    await echo.stop();
+  }, 20_000);
+
+  test("an ordinary host that only contains the reserved suffix keeps the normal path", async () => {
+    const echo = await startEchoServer();
+    const { proxy } = await startHostServiceProxy({ policy: hostServicePolicy({ echo: echo.port }) });
+
+    // Not allowlisted, so the normal path adopts it into a denied tunnel.
+    const tunnel = await openConnectTunnel({ proxyPort: proxy.port, authority: "x.runfree.internal.example.com:443" });
+    expect(tunnel.head.statusCode).toBe(200);
+    tunnel.socket.destroy();
+    await proxy.waitForOutput(/proxy-denial: [^\n]*"reason":"host-not-allowlisted","host":"x\.runfree\.internal\.example\.com"/);
+    expect(proxy.output()).not.toContain("host-service-not-configured");
     await expectNoDialFor(echo);
     await echo.stop();
   }, 20_000);
