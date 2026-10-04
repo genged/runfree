@@ -75,6 +75,7 @@ describe("runtime bundle build", () => {
     expect(paths).toContain("agent/codex-runfree.sh");
     expect(paths).toContain("agent/session-entry.sh");
     expect(paths).toContain("agent/session-ready-probe.cjs");
+    expect(paths).toContain("agent/host-service-relay.cjs");
     expect(paths).not.toContain("agent/session-finalizer.Dockerfile");
     expect(paths).not.toContain("agent/session-supervisor.c");
     expect(paths).toContain("proxy/Dockerfile");
@@ -196,12 +197,14 @@ describe("runtime bundle build", () => {
     expect(agentDockerfile).toContain("COPY codex-runfree.sh /usr/local/libexec/runfree/codex");
     expect(agentDockerfile).toContain("ln -s /usr/local/libexec/runfree/codex /usr/local/bin/codex");
     // The image must install the entry at the path every typed launch target
-    // names as the container's `Path`, and the probe beside it where the entry
-    // resolves it.
+    // names as the container's `Path`, and the probe and the host-service
+    // relay beside it where the entry resolves them.
     expect(agentDockerfile).toContain(`COPY session-entry.sh ${SESSION_ENTRY_PATH}`);
     expect(agentDockerfile).toContain(`COPY session-ready-probe.cjs ${path.posix.dirname(SESSION_ENTRY_PATH)}/session-ready-probe`);
+    expect(agentDockerfile).toContain(`COPY host-service-relay.cjs ${path.posix.dirname(SESSION_ENTRY_PATH)}/host-service-relay`);
     expect(fs.existsSync(path.join(runtimeRoot, "agent", "session-entry.sh"))).toBe(true);
     expect(fs.existsSync(path.join(runtimeRoot, "agent", "session-ready-probe.cjs"))).toBe(true);
+    expect(fs.existsSync(path.join(runtimeRoot, "agent", "host-service-relay.cjs"))).toBe(true);
     expect(agentDockerfile).toContain("/usr/local/libexec/runfree/claude-real");
     expect(agentDockerfile).not.toContain("musl-gcc");
     expect(agentDockerfile).not.toContain("/usr/local/libexec/runfree/session-supervisor");

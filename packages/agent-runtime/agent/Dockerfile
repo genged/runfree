@@ -139,13 +139,19 @@ COPY claude-runfree.sh /usr/local/libexec/runfree/claude
 COPY codex-runfree.sh /usr/local/libexec/runfree/codex
 # The session container's first process: waits for the proxy to report the
 # session active, then execs the typed agent argv. Cooperation, not
-# enforcement; see docs/architecture.md "Readiness Entry".
+# enforcement; see docs/architecture.md "Readiness Entry". When
+# `RUNFREE_HOST_SERVICES` is set, the entry also starts host-service-relay in
+# the background before the readiness loop; it survives the exec above to
+# relay approved host services for the whole session (local/specs/
+# 2026-10-03-host-services-design.md, "The agent-side relay").
 COPY session-entry.sh /usr/local/libexec/runfree/session-entry
 COPY session-ready-probe.cjs /usr/local/libexec/runfree/session-ready-probe
+COPY host-service-relay.cjs /usr/local/libexec/runfree/host-service-relay
 RUN chmod 0755 /usr/local/libexec/runfree/claude \
       /usr/local/libexec/runfree/codex \
       /usr/local/libexec/runfree/session-entry \
       /usr/local/libexec/runfree/session-ready-probe \
+      /usr/local/libexec/runfree/host-service-relay \
  && ln -s /opt/runfree-agent-tools/node_modules/.bin/claude /usr/local/libexec/runfree/claude-real \
  && ln -s /usr/local/libexec/runfree/claude /usr/local/bin/claude \
  && ln -s /opt/runfree-agent-tools/node_modules/.bin/codex /usr/local/libexec/runfree/codex-real \

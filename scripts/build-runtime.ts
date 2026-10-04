@@ -23,6 +23,10 @@ const buildOutputs = [
 // compiled by the same `tsc -b` step as the proxy and shipped as CommonJS next
 // to the shell entry it serves. The Dockerfile installs it extensionless.
 const AGENT_PROBE_OUTPUT = path.join(repoRoot, "packages", "agent-runtime", "dist", "session-ready-probe.cjs");
+// The agent-side host-service relay (host services plan Task 6): same
+// package, same `tsc -b` step, shipped as CommonJS next to the probe and the
+// shell entry that starts it. The Dockerfile installs it extensionless too.
+const AGENT_RELAY_OUTPUT = path.join(repoRoot, "packages", "agent-runtime", "dist", "host-service-relay.cjs");
 
 export const RUNTIME_ASSET_ROLES = [
   "agent-image",
@@ -56,6 +60,7 @@ export const RUNTIME_ASSET_DESCRIPTORS: readonly RuntimeAssetDescriptor[] = [
   agentImage("agent/Dockerfile"),
   agentImage("agent/claude-runfree.sh"),
   agentImage("agent/codex-runfree.sh"),
+  agentImage("agent/host-service-relay.cjs"),
   agentImage("agent/session-entry.sh"),
   agentImage("agent/session-ready-probe.cjs"),
   agentImage("agent/agent-tools/package-lock.json"),
@@ -563,6 +568,7 @@ export function buildRuntime(): void {
 
   copyTree(path.join(repoRoot, "packages", "agent-runtime", "agent"), path.join(outputRoot, "agent"));
   copyFile(AGENT_PROBE_OUTPUT, path.join(outputRoot, "agent", "session-ready-probe.cjs"));
+  copyFile(AGENT_RELAY_OUTPUT, path.join(outputRoot, "agent", "host-service-relay.cjs"));
   copyFile(
     path.join(repoRoot, "packages", "agent-runtime", "runtime-inputs.lock.json"),
     path.join(outputRoot, "runtime-inputs.lock.json"),
