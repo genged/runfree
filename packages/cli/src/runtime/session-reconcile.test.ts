@@ -316,7 +316,11 @@ function fakeDocker(options: {
       // The inventory scan now builds its listing as `ps` (createDockerClient's
       // listContainers); the sealed absence-list probe still builds
       // `container ls --filter id=…` directly, unaffected by that migration.
-      if (args[0] === "ps") return "inventory-list";
+      // The inventory scan's `ps` is always unfiltered (todo 39 scope); a
+      // filtered `ps` is some other call (the mcp-callback forwarder listing
+      // above already intercepts its own filtered `ps` first, but a future
+      // filtered `ps` in this path must not be misread as the inventory scan).
+      if (args[0] === "ps" && !args.includes("--filter")) return "inventory-list";
       if (args[0] === "container" && args[1] === "ls") {
         return `absence-list:${args[5]?.slice(3)}`;
       }

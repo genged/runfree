@@ -80,6 +80,18 @@ import {
 } from "./topology-digest-v2.ts";
 import type { RuntimeContext, RuntimeIO } from "./types.ts";
 
+/**
+ * The cleanup pass's session-container inventory scan: `createDockerClient`'s
+ * `listContainers` built as unfiltered `ps --all --no-trunc --format
+ * {{.ID}}` (via `inspectSessionContainerInventory`). That exact, unfiltered
+ * shape is unique to this scan — a filtered `ps --all --no-trunc --filter …`
+ * is some other call and must not be mistaken for it.
+ */
+function isInventoryListCall(args: readonly string[]): boolean {
+  return args[0] === "ps" && args.includes("--all") && args.includes("--no-trunc")
+    && args.includes("--format") && !args.includes("--filter");
+}
+
 let tmp: string;
 
 beforeEach(() => {
@@ -637,7 +649,7 @@ test("cleanup removes only exact zero-reference materialization paths and is ide
   fs.writeFileSync(path.join(staleControlRoot, "materialization.json"), "incomplete crash residue\n");
   const io = {
     capture(command: string, args: string[]) {
-      if (command === "docker" && args.slice(0, 3).join(" ") === "ps --all --no-trunc") {
+      if (command === "docker" && isInventoryListCall(args)) {
         return { status: 0, stdout: "", stderr: "" };
       }
       throw new Error(`unexpected cleanup command: ${command} ${args.join(" ")}`);
@@ -687,7 +699,7 @@ test("cleanup reports completed only when the pass reached its end", () => {
   };
   const inventory = (status: number) => ({
     capture(command: string, args: string[]) {
-      if (command === "docker" && args.slice(0, 3).join(" ") === "ps --all --no-trunc") {
+      if (command === "docker" && isInventoryListCall(args)) {
         return { status, stdout: "", stderr: status === 0 ? "" : "daemon unavailable" };
       }
       throw new Error(`unexpected cleanup command: ${command} ${args.join(" ")}`);
@@ -759,7 +771,7 @@ test("cleanup refuses materialization deletion when an exact path contains a har
   fs.linkSync(outside, path.join(staleRoot, "materialization.json"));
   const io = {
     capture(command: string, args: string[]) {
-      if (command === "docker" && args.slice(0, 3).join(" ") === "ps --all --no-trunc") {
+      if (command === "docker" && isInventoryListCall(args)) {
         return { status: 0, stdout: "", stderr: "" };
       }
       throw new Error(`unexpected cleanup command: ${command} ${args.join(" ")}`);
@@ -1156,7 +1168,7 @@ test("cleanup removes exact zero-reference project image IDs; a v1 manifest refe
   };
   const io = {
     capture(command: string, args: string[]) {
-      if (command === "docker" && args.slice(0, 3).join(" ") === "ps --all --no-trunc") {
+      if (command === "docker" && isInventoryListCall(args)) {
         return { status: 0, stdout: "", stderr: "" };
       }
       if (command === "docker" && args.slice(0, 3).join(" ") === "image ls --quiet") {
@@ -1273,7 +1285,7 @@ test.each<[string, GcInspectAnswer]>([
   const removed: string[][] = [];
   const io = {
     capture(command: string, args: string[]) {
-      if (command === "docker" && args.slice(0, 3).join(" ") === "ps --all --no-trunc") {
+      if (command === "docker" && isInventoryListCall(args)) {
         return { status: 0, stdout: "", stderr: "" };
       }
       if (command === "docker" && args.slice(0, 3).join(" ") === "image ls --quiet") {
@@ -1316,7 +1328,7 @@ test("cleanup skips tagged deletion when live image references cannot be inspect
   let removed = false;
   const io = {
     capture(command: string, args: string[]) {
-      if (command === "docker" && args[0] === "ps") {
+      if (command === "docker" && isInventoryListCall(args)) {
         return { status: 1, stdout: "", stderr: "inspect failed" };
       }
       if (command === "docker" && args[0] === "image") listed = true;
@@ -1439,7 +1451,7 @@ test.each([
   const servedSetReads: string[][] = [];
   const io = {
     capture(command: string, args: string[]) {
-      if (command === "docker" && args.slice(0, 3).join(" ") === "ps --all --no-trunc") {
+      if (command === "docker" && isInventoryListCall(args)) {
         return { status: 0, stdout: "", stderr: "" };
       }
       if (command === "docker" && args[0] === "exec") {
@@ -1507,7 +1519,7 @@ test("cleanup without a durable effective control plane never reads the proxy's 
   const removed: string[][] = [];
   const io = {
     capture(command: string, args: string[]) {
-      if (command === "docker" && args.slice(0, 3).join(" ") === "ps --all --no-trunc") {
+      if (command === "docker" && isInventoryListCall(args)) {
         return { status: 0, stdout: "", stderr: "" };
       }
       if (command === "docker" && args.slice(0, 3).join(" ") === "image ls --quiet") {
