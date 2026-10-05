@@ -83,6 +83,8 @@ const commonExclude = [
   // Maintainer-only and gitignored; it has its own local/scripts/vitest.config.ts.
   "local/**",
   ".worktrees/**",
+  // Claude Code agent worktrees: full checkouts of other branches.
+  ".claude/worktrees/**",
   ".pnpm-store/**",
   "proxy/node_modules/**",
   "packages/**/node_modules/**",
@@ -223,6 +225,7 @@ export default defineConfig({
         "packages/cli/src/embedded-assets.generated.ts",
         "projects/**",
         ".worktrees/**",
+        ".claude/worktrees/**",
         ".pnpm-store/**",
         "proxy/node_modules/**",
         "packages/**/node_modules/**",
