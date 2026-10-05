@@ -105,4 +105,24 @@ describe("desired policy compiler", () => {
       local: { version: 2, hosts: [] },
     })).toThrow("conflicts with first.api.example.com.Authorization");
   });
+
+  test("a host-service name defined in both layers is an ownership conflict (SR9), even when identical", () => {
+    const project: DesiredNetworkPolicyJson = { version: 2, hosts: [], hostServices: { idb: { target: "host-loopback", port: 10882 } } };
+    const differentPort: DesiredNetworkPolicyJson = { version: 2, hosts: [], hostServices: { idb: { target: "host-loopback", port: 10883 } } };
+    expect(() => compileDesiredPolicies({ project, local: differentPort }))
+      .toThrow("host service idb is defined in both the project and checkout-local desired policy");
+    expect(() => compileDesiredPolicies({ project, local: structuredClone(project) }))
+      .toThrow("host service idb is defined in both the project and checkout-local desired policy");
+  });
+
+  test("host services from both layers merge, and a port claimed by two names is refused", () => {
+    const project: DesiredNetworkPolicyJson = { version: 2, hosts: [], hostServices: { idb: { target: "host-loopback", port: 10882 } } };
+    const local: DesiredNetworkPolicyJson = { version: 2, hosts: [], hostServices: { sim: { target: "host-loopback", port: 10883 } } };
+    expect(compileDesiredPolicies({ project, local }).policy.hostServices).toEqual({
+      idb: { target: "host-loopback", port: 10882 },
+      sim: { target: "host-loopback", port: 10883 },
+    });
+    const clash: DesiredNetworkPolicyJson = { version: 2, hosts: [], hostServices: { other: { target: "host-loopback", port: 10882 } } };
+    expect(() => compileDesiredPolicies({ project, local: clash })).toThrow("duplicate port");
+  });
 });

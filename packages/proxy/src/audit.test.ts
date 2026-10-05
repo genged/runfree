@@ -120,6 +120,18 @@ describe("audit spool writer", () => {
     writer.record("api.example.com");
     expect(appended).toEqual(["api.example.com\n", "second.example\n", "api.example.com\n"]);
   });
+
+  test("drops reserved runfree.internal hostnames without writing anything (SR4/A1)", () => {
+    const appended: string[] = [];
+    const writer = createAuditSpoolWriter({
+      path: "/spool",
+      appendFile: (_path, data) => appended.push(data),
+    });
+
+    writer.record("x.runfree.internal");
+    writer.record("RUNFREE.internal");
+    expect(appended).toEqual([]);
+  });
 });
 
 describe("audit spool validation", () => {

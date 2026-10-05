@@ -95,7 +95,15 @@ export function doctorIntent(input: DoctorInput): void {
   for (const diagnostic of diagnostics) {
     const host = sanitizeForTerminal(diagnostic.host);
     const requests = diagnostic.count === 1 ? "1 request" : `${diagnostic.count} requests`;
-    if (diagnostic.status === "request-shape") {
+    if (diagnostic.status === "host-service") {
+      const authority = diagnostic.port !== undefined ? `${host}:${diagnostic.port}` : host;
+      console.log(`${authority} refused as a host service (${sanitizeForTerminal(diagnostic.reason ?? "host-service")}, ${requests})`);
+      if (diagnostic.command === undefined) {
+        console.log("no remedy: not a host service runfree can approve");
+      } else {
+        console.log(`${diagnostic.commandKind === "inspect" ? "inspect" : "suggested fix (requested by the agent)"}: ${diagnostic.command}`);
+      }
+    } else if (diagnostic.status === "request-shape") {
       const method = diagnostic.method ? ` method ${sanitizeForTerminal(diagnostic.method)}` : "";
       console.log(`${host} blocked by request rules (${sanitizeForTerminal(diagnostic.reason ?? "request-shape")}${method}, ${requests})`);
       // The bare `host rules <host>` form only shows the rule; labeling it a

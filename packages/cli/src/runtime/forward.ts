@@ -13,6 +13,7 @@
 // (that hardening is why `runfree vnc`'s `--host-network` has no analogue here).
 
 import { die } from "../errors.ts";
+import { registeredHostServicePortRefusal } from "../host-service-registry.ts";
 import { resolveAgentExecTarget } from "./agent-exec-target.ts";
 import { createRuntimeDocker, dockerClientEnvOptions } from "./docker.ts";
 import { createDockerClient } from "./docker-client.ts";
@@ -193,6 +194,11 @@ export function forwardRuntime(
       if (options.hostPort === undefined || options.agentPort === undefined) {
         die(`forward start requires a port\n${FORWARD_USAGE}`);
       }
+      // Checked before any forwarder removal (A4): a port another project
+      // approved as a host service must never be shadowed by this project's
+      // own publication, even transiently while replacing an existing one.
+      const refusal = registeredHostServicePortRefusal(context.env ?? process.env, Number(options.hostPort), projectId);
+      if (refusal) die(refusal);
       const internalNetwork = `${project}_agent_internal`;
       if (!networkExists(context, io, internalNetwork)) {
         die(`agent network not found: ${internalNetwork} - try 'runfree up' first`);

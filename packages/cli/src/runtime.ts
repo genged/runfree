@@ -4,6 +4,7 @@ import path from "node:path";
 import { assertSessionDisruptionAuthorized } from "./runtime/session-disruption.ts";
 
 import { DEFAULT_WRITE_ACTION, effectiveWriteAction, validateNetworkPolicy } from "@runfree/runtime-contracts/network-policy";
+import { parseHostServiceGatewayStatus } from "@runfree/runtime-contracts/proxy-status";
 import { service, serviceHostNames } from "../../../scripts/services.ts";
 import {
   resolveAgentCommand,
@@ -25,6 +26,8 @@ import {
   requireUsableApprovalSelection,
 } from "./control/workflow.ts";
 import { die } from "./errors.ts";
+import { hostServiceOwnerWarnings, probeHostPortOwner } from "./host-service-port-owner.ts";
+import { recordedHostServiceOwners, removeProjectHostServicePorts } from "./host-service-registry.ts";
 import { composeProjectName, projectHash, runtimeEnvironment } from "./runtime/env.ts";
 import { resumeInterruptedSessionThroughAdmission } from "./runtime/session-admission-resume.ts";
 import { removeWarmProofRecord } from "./runtime/warm-proof.ts";
@@ -47,8 +50,10 @@ import {
 } from "./runtime/component-diagnostics.ts";
 import { prepareDependencyOverlayPlan } from "./runtime/dependency-overlays.ts";
 import { runFencedProjectDestroy } from "./runtime/destroy.ts";
-import { containerMissingNetwork, dockerClientEnvOptions } from "./runtime/docker.ts";
+import { containerMissingNetwork, dockerClientEnvOptions, serviceContainerId } from "./runtime/docker.ts";
 import { createDockerClient } from "./runtime/docker-client.ts";
+import { ROOT_UID_GID } from "./runtime/constants.ts";
+import { PROXY_HOST_SERVICE_GATEWAY_STATUS_PATH } from "./runtime/probes.ts";
 import { printHostGitStatusLine } from "./runtime/git-layout.ts";
 import { clearStoppedControlPlaneSelection } from "./runtime/stopped-selection.ts";
 import {
@@ -943,6 +948,7 @@ export function statusRuntime(context: RuntimeContext, io: RuntimeIO, options: {
   printWriteApprovalStatusLine(context, io);
   printSessionFilesStatusLine(context, io, adapters);
   printIngressForwarderStatusLine(context, io);
+  printHostServiceStatusLine(context, io);
   return status;
 }
 
@@ -979,6 +985,82 @@ function printIngressForwarderStatusLine(context: RuntimeContext, io: RuntimeIO)
     console.log(`ingress forwarders: ${open.length} open loopback host→agent port(s) (runfree forward status)`);
   } catch {
     // A status line must never be the reason status fails.
+  }
+}
+
+// Host-service re-check (design "Policy shape", Re-check, SR13): status
+// repeats the live owner check a launch does, so drift since the last launch
+// (a stopped listener, a different process, a port Docker Desktop now
+// publishes) is visible without a restart. Silent when there are no approved
+// host services; a probe failure is a warning, never a reason status fails.
+function printHostServiceStatusLine(context: RuntimeContext, io: RuntimeIO): void {
+  try {
+    const hostServices = validateNetworkPolicy(readActiveEffectiveControl(context.project)?.policy ?? { hosts: [] }).hostServices;
+    const names = Object.keys(hostServices);
+    if (names.length === 0) return;
+    const env = context.env ?? process.env;
+    const projectId = projectHash(context.projectRoot);
+    const recorded = recordedHostServiceOwners(env, projectId);
+    const summaries = [...names].sort().map((name) => {
+      const entry = hostServices[name];
+      const owner = probeHostPortOwner(context, io, entry.port);
+      const label = owner.kind === "listener" ? ` (${owner.command})` : "";
+      return `${name} 127.0.0.1:${entry.port}${label}`;
+    });
+    console.log(`host services: ${summaries.join(", ")}`);
+    printHostServiceGatewayStatusLine(context, io);
+    for (const line of hostServiceOwnerWarnings(context, io, hostServices, recorded)) warn(line);
+  } catch {
+    // A status line must never be the reason status fails.
+  }
+}
+
+type HostServiceGatewayState =
+  | { kind: "available"; gatewayIp: string }
+  | { kind: "unavailable"; reason: string }
+  | { kind: "not-running" }
+  | { kind: "unknown"; detail: string };
+
+// The gateway the root firewall supervisor published (design "Approval and
+// CLI", HS8): the pinned address, or the sticky reason it withholds one (for
+// example `gateway address changed`, reclaimed by `runfree rebuild`). Read
+// through a root exec of the running proxy, as the other proxy status reads
+// do. Observation only.
+function readHostServiceGatewayState(context: RuntimeContext, io: RuntimeIO): HostServiceGatewayState {
+  const proxyId = serviceContainerId(composeProjectName(context.projectRoot), "proxy", context, io, { runningOnly: true });
+  if (!proxyId) return { kind: "not-running" };
+  const read = createDockerClient(io, dockerClientEnvOptions(context))
+    .exec(proxyId, ["cat", PROXY_HOST_SERVICE_GATEWAY_STATUS_PATH], { user: ROOT_UID_GID });
+  if (read.status !== 0) {
+    return { kind: "unknown", detail: `reading the proxy's gateway status failed (exit ${read.status})` };
+  }
+  try {
+    const status = parseHostServiceGatewayStatus(read.stdout);
+    if (status.gatewayIp !== undefined) return { kind: "available", gatewayIp: status.gatewayIp };
+    return { kind: "unavailable", reason: status.unavailableReason ?? "unknown reason" };
+  } catch (error) {
+    return { kind: "unknown", detail: `the proxy's gateway status is malformed: ${error instanceof Error ? error.message : String(error)}` };
+  }
+}
+
+// Root writes the reason, but keep terminal control bytes out of status.
+function printableStatusText(text: string): string {
+  return text.replace(/[\u0000-\u001f\u007f-\u009f]/gu, "?");
+}
+
+// Warn-only: never changes the status exit code.
+function printHostServiceGatewayStatusLine(context: RuntimeContext, io: RuntimeIO): void {
+  const state = readHostServiceGatewayState(context, io);
+  if (state.kind === "available") {
+    console.log(`host-service gateway: ${state.gatewayIp}`);
+  } else if (state.kind === "unavailable") {
+    console.log(`host-service gateway: unavailable (${printableStatusText(state.reason)})`);
+  } else if (state.kind === "not-running") {
+    // A stopped proxy is a normal state, not a fault: no warning.
+    console.log("host-service gateway: unknown (proxy not running)");
+  } else {
+    console.log("host-service gateway: unknown");
+    warn(`host-service gateway state unknown: ${printableStatusText(state.detail)}`);
   }
 }
 
@@ -1235,7 +1317,7 @@ export async function destroyRuntime(
   }
   try {
     forgetWarmLaunchRecords(destroyContext);
-    return runFencedProjectDestroy({
+    const status = runFencedProjectDestroy({
       context: destroyContext,
       io,
       docker: destroyAdapters.docker,
@@ -1260,6 +1342,22 @@ export async function destroyRuntime(
         }
       },
     });
+    // Host-global port registry (design "Policy shape", HS7): only a
+    // *completed* destroy means the project can no longer be using its
+    // approved host services. A refusal (status !== 0) tears nothing down,
+    // so the registry row must stay -- pruning it early would let another
+    // project's `forward`/`vnc` or `host-service add` take a port a still-live
+    // session is using. Best-effort otherwise: a registry failure never
+    // changes destroy's own result; the reclaim path
+    // (`host-service list --repair`) covers it.
+    if (status === 0) {
+      try {
+        await removeProjectHostServicePorts(destroyContext.env ?? process.env, projectHash(destroyContext.projectRoot));
+      } catch (error) {
+        warn(`the host-service port registry was not updated after destroy: ${error instanceof Error ? error.message : String(error)}; run \`${remedy.hostServiceRepair()}\``);
+      }
+    }
+    return status;
   } finally {
     lifecycleLock.release();
   }

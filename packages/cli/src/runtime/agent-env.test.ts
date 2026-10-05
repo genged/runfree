@@ -60,6 +60,7 @@ describe("agent environment ownership", () => {
       "RUNFREE_AGENT_COMMAND",
       "RUNFREE_RESUME_COMMAND",
       "RUNFREE_RESUME_SESSION",
+      "RUNFREE_HOST_SERVICES",
       "RUNFREE_INBOX_CONTAINER_DIR",
       "RUNFREE_INBOX_DIR",
       "RUNFREE_TERMINAL_TITLE",
@@ -131,6 +132,14 @@ describe("agent environment ownership", () => {
     )).toEqual({ ACME_REGION: "eu-1", ACME_TOKEN: RUNFREE_PLACEHOLDER_VALUE });
     expect(projectAgentEnvironmentOverrides("ACME_REGION=eu-1\n", "effective/agent.env"))
       .toEqual({ ACME_REGION: RUNFREE_PLACEHOLDER_VALUE });
+  });
+
+  test("drops a project agent.env line setting the runtime-owned host-services variable (SR14)", () => {
+    expect(projectAgentEnvironmentOverrides(
+      ["RUNFREE_HOST_SERVICES=evil:22", "ACME_REGION=eu-1", ""].join("\n"),
+      "effective/agent.env",
+      { declaredParameterEnvNames: ["ACME_REGION", "RUNFREE_HOST_SERVICES"] },
+    )).toEqual({ ACME_REGION: "eu-1" });
   });
 
   test("rejects malformed, duplicate, and control-bearing agent env input", () => {

@@ -138,6 +138,7 @@ export type DockerContainerInspect = {
     Binds?: string[] | null;
     CapAdd?: string[] | null;
     CapDrop?: string[] | null;
+    ExtraHosts?: string[] | null;
     NetworkMode?: string;
     PidsLimit?: number;
     PortBindings?: DockerPortBindings | null;

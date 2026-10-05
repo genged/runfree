@@ -335,6 +335,7 @@ export async function main(): Promise<number> {
   const policy = effectiveControl?.networkPolicy ?? loadProxyPolicy();
   const plan = buildFirewallPlan({
     allowedHosts: policy.allowedHosts,
+    hostServices: policy.hostServices,
     ...(effectiveControl ? {
       controlGeneration: effectiveControl.active.controlGeneration,
       effectiveProxyRoot,

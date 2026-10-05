@@ -46,9 +46,14 @@ export const remedy = {
   runtimeReloadPolicy: (): string => "runfree runtime reload-policy",
   forwardStatus: (): string => "runfree forward status",
   forwardStop: (): string => "runfree forward stop",
+  status: (): string => "runfree status",
   statusVerbose: (): string => "runfree status --verbose",
   help: (): string => "runfree help",
   init: (): string => "runfree init",
+  hostServiceAdd: (name: string, port: number | string): string => `runfree host-service add ${name} --port ${port}`,
+  hostServiceRemove: (name: string): string => `runfree host-service remove ${name}`,
+  hostServiceList: (): string => "runfree host-service list",
+  hostServiceRepair: (): string => "runfree host-service list --repair",
 } as const;
 
 // One sample rendering per registry entry, for the parse gate.
@@ -86,8 +91,13 @@ export function sampleRemedyRenderings(): string[] {
     remedy.runtimeReloadPolicy(),
     remedy.forwardStatus(),
     remedy.forwardStop(),
+    remedy.status(),
     remedy.statusVerbose(),
     remedy.help(),
     remedy.init(),
+    remedy.hostServiceAdd("idb", 10882),
+    remedy.hostServiceRemove("idb"),
+    remedy.hostServiceList(),
+    remedy.hostServiceRepair(),
   ];
 }

@@ -40,6 +40,9 @@ export const DENIAL_REASONS = [
   "write-approval-timeout",
   "write-approval-capacity",
   "write-approval-session-denied",
+  "host-service-not-configured",
+  "host-service-unavailable",
+  "host-service-capacity",
   "policy-denied",
 ] as const;
 
@@ -90,10 +93,17 @@ const DENIAL_REASON_TEXT: Record<DenialReason, string> = {
   // A session-wide deny covers this session until the operator clears it;
   // the reason code stays stable as a wire identifier.
   "write-approval-session-denied": "the operator denied writes for this session until they clear the deny",
+  "host-service-not-configured": "this host service is not approved for the project",
+  "host-service-unavailable": "the host-service gateway or the host service is not available",
+  "host-service-capacity": "too many host-service connections are already open",
   // Defensive catch-all for a denial no earlier classification arm named. The
   // 403 body carries the precise message; this text serves doctor/summary.
   "policy-denied": "blocked by proxy policy",
 };
+
+export function denialReasonText(reason: DenialReason): string {
+  return DENIAL_REASON_TEXT[reason];
+}
 
 // Re-normalize before display. `requestHost()` output admits a broader
 // charset than `normalizeHostname` (underscores, trailing dots, raw IDN), so
@@ -335,6 +345,9 @@ export function syntheticDenialBody(rawHost: string, reason: DenialReason, detai
 export type DenialEventInput = {
   reason: DenialReason;
   host: string;
+  // The requested port of a host-service denial, so `runfree doctor` can
+  // name the exact `host-service add` remedy. Dropped unless an integer port.
+  port?: number;
   method?: string;
   // Raw request URL or path; reduced to a bounded pathname before emission.
   path?: string;
@@ -364,6 +377,7 @@ export type DenialEventEmitterOptions = {
 type DenialBucket = {
   host: string;
   reason: DenialReason;
+  port?: number;
   method?: string;
   mcpOAuthIssuer?: McpOAuthIssuerDenialContext;
   windowStartMs: number;
@@ -405,6 +419,7 @@ export function createDenialEventEmitter(options: DenialEventEmitterOptions = {}
       ts: timestamp.toISOString(),
       reason: bucket.reason,
       host: bucket.host,
+      ...(bucket.port !== undefined ? { port: bucket.port } : {}),
       ...(bucket.method !== undefined ? { method: bucket.method } : {}),
       ...(bucket.mcpOAuthIssuer !== undefined ? { mcpOAuthIssuer: bucket.mcpOAuthIssuer } : {}),
       suppressed: bucket.suppressed,
@@ -430,9 +445,13 @@ export function createDenialEventEmitter(options: DenialEventEmitterOptions = {}
       const coalescedMethod = SHAPE_DENIAL_REASONS.has(input.reason)
         ? (input.method ?? "").slice(0, DENIAL_METHOD_LIMIT)
         : undefined;
-      const key = coalescedMethod !== undefined
+      const port = input.port !== undefined && Number.isInteger(input.port) && input.port >= 1 && input.port <= 65535
+        ? input.port
+        : undefined;
+      const baseKey = coalescedMethod !== undefined
         ? `${host}\0${input.reason}\0${coalescedMethod}`
         : `${host}\0${input.reason}`;
+      const key = port !== undefined ? `${baseKey}\0${port}` : baseKey;
       let bucket = buckets.get(key);
       if (!bucket) {
         if (buckets.size >= maxTrackedKeys) {
@@ -448,6 +467,7 @@ export function createDenialEventEmitter(options: DenialEventEmitterOptions = {}
         bucket = {
           host,
           reason: input.reason,
+          ...(port !== undefined ? { port } : {}),
           ...(coalescedMethod !== undefined ? { method: coalescedMethod } : {}),
           ...(mcpOAuthIssuer !== undefined ? { mcpOAuthIssuer } : {}),
           windowStartMs: nowMs,
@@ -475,6 +495,7 @@ export function createDenialEventEmitter(options: DenialEventEmitterOptions = {}
         ts: timestamp.toISOString(),
         reason: input.reason,
         host,
+        ...(port !== undefined ? { port } : {}),
         ...(input.method !== undefined ? { method: input.method.slice(0, DENIAL_METHOD_LIMIT) } : {}),
         ...(path !== undefined ? { path } : {}),
         ...(input.mcp !== undefined ? { mcp: input.mcp } : {}),

@@ -67,9 +67,15 @@ function input(overrides: Partial<Parameters<typeof discoverMcpOAuthHosts>[0]> =
 describe("hostname and address rules", () => {
   test("accepts exact hostnames and refuses IPs, wildcards, URLs, ports, and localhost", () => {
     expect(checkPolicyHostname("Auth.Example.com")).toEqual({ ok: true, host: "auth.example.com" });
-    for (const bad of ["10.0.0.1", "1.2.3.4", "1.2.3.0x4", "a.0x7f", "::1", "[::1]", "*.example.com", "https://a.example.com", "a.example.com:8443", "localhost", "x.localhost", "example", "a.b.c.123", ""]) {
+    for (const bad of ["10.0.0.1", "1.2.3.4", "1.2.3.0x4", "a.0x7f", "::1", "[::1]", "*.example.com", "https://a.example.com", "a.example.com:8443", "localhost", "x.localhost", "example", "a.b.c.123", "", "gateway.runfree.internal", "runfree.internal"]) {
       expect(checkPolicyHostname(bad).ok, bad).toBe(false);
     }
+  });
+
+  test("refuses the reserved runfree.internal suffix with a named reason (SR4/A1)", () => {
+    const checked = checkPolicyHostname("gateway.runfree.internal");
+    expect(checked.ok).toBe(false);
+    expect(checked.ok === false && checked.reason).toMatch(/reserved runfree\.internal suffix/);
   });
 
   test("only plainly public unicast addresses are eligible", () => {

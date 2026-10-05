@@ -42,6 +42,7 @@ import { SESSION_ADMISSION_PROVISIONING_REQUEST } from "../packages/runtime-cont
 const AGENT_PACKAGE = path.resolve("packages/agent-runtime");
 const ENTRY_SOURCE = path.join(AGENT_PACKAGE, "agent", "session-entry.sh");
 const PROBE_SOURCE = path.join(AGENT_PACKAGE, "dist", "session-ready-probe.cjs");
+const RELAY_SOURCE = path.join(AGENT_PACKAGE, "dist", "host-service-relay.cjs");
 
 type ProbeModule = Readonly<{
   EXIT_ACTIVE: number;
@@ -172,6 +173,7 @@ let tmp: string;
 let libexecDir: string;
 let entryPath: string;
 let probePath: string;
+let relayPath: string;
 let fakeAgentPath: string;
 let argvPath: string;
 let proxies: FakeProxy[];
@@ -182,10 +184,13 @@ beforeEach(() => {
   fs.mkdirSync(libexecDir, { recursive: true });
   entryPath = path.join(libexecDir, "session-entry");
   probePath = path.join(libexecDir, "session-ready-probe");
+  relayPath = path.join(libexecDir, "host-service-relay");
   fs.copyFileSync(ENTRY_SOURCE, entryPath);
   fs.copyFileSync(PROBE_SOURCE, probePath);
+  fs.copyFileSync(RELAY_SOURCE, relayPath);
   fs.chmodSync(entryPath, 0o755);
   fs.chmodSync(probePath, 0o755);
+  fs.chmodSync(relayPath, 0o755);
   argvPath = path.join(tmp, "argv.json");
   fakeAgentPath = path.join(tmp, "fake-agent");
   fs.writeFileSync(fakeAgentPath, [
@@ -195,7 +200,11 @@ beforeEach(() => {
     "  argv: process.argv.slice(2),",
     "  pid: process.pid,",
     "}));",
-    "process.exit(Number(process.env.RUNFREE_TEST_EXIT_STATUS || 0));",
+    // A test proving the relay survives past the exec needs a window where
+    // the exec'd process is still alive but has already recorded its argv;
+    // zero (the default) exits as fast as before.
+    "const holdMs = Number(process.env.RUNFREE_TEST_HOLD_MS || 0);",
+    "setTimeout(() => process.exit(Number(process.env.RUNFREE_TEST_EXIT_STATUS || 0)), holdMs);",
     "",
   ].join("\n"), { mode: 0o755 });
   proxies = [];
@@ -203,6 +212,28 @@ beforeEach(() => {
 
 afterEach(async () => {
   for (const proxy of proxies) await proxy.close();
+  // A host-service relay started by the entry outlives a normal exec (that is
+  // the point of it), so a test that starts one leaves it running as an
+  // orphan once the fake agent exits. Every process this test spawned ran
+  // under this test's own tmp dir (the entry, probe, and relay binaries are
+  // all copied there), so sweeping `/proc` for that path is scoped to this
+  // test alone and safe to run unconditionally.
+  try {
+    const ps = childProcess.spawnSync("ps", ["-eo", "pid,args"], { encoding: "utf8" });
+    for (const line of ps.stdout.split("\n")) {
+      if (!line.includes(tmp)) continue;
+      const pid = Number(line.trim().split(/\s+/)[0]);
+      if (Number.isInteger(pid)) {
+        try {
+          process.kill(pid, "SIGKILL");
+        } catch {
+          // Already gone.
+        }
+      }
+    }
+  } catch {
+    // `ps` unavailable: nothing more we can do here.
+  }
   fs.rmSync(tmp, { recursive: true, force: true });
 });
 
@@ -246,6 +277,75 @@ async function probeUntil(port: number, expected: number, attempts = 40): Promis
 
 function recordedAgentRun(): { argv: string[]; pid: number } {
   return JSON.parse(fs.readFileSync(argvPath, "utf8")) as { argv: string[]; pid: number };
+}
+
+/** One attempt: whether a loopback TCP connection to `port` succeeds right now. */
+async function isListening(port: number): Promise<boolean> {
+  return new Promise<boolean>((resolve) => {
+    const socket = net.connect({ host: "127.0.0.1", port });
+    socket.once("connect", () => {
+      socket.destroy();
+      resolve(true);
+    });
+    socket.once("error", () => resolve(false));
+  });
+}
+
+/** Polls `127.0.0.1:port` until a connection succeeds or the bound elapses. */
+async function waitForConnect(port: number, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    if (await isListening(port)) return true;
+    if (Date.now() >= deadline) return false;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+}
+
+/** Polls `127.0.0.1:port` until every connection is refused or the bound elapses. */
+async function waitForRefusal(port: number, timeoutMs: number): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    if (!(await isListening(port))) return true;
+    if (Date.now() >= deadline) return false;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+}
+
+/**
+ * The one `ps` line for a process whose argv names this test's own copy of
+ * the relay binary (`relayPath`, inside this test's own tmp dir), if any is
+ * running. Matching on that exact absolute path, rather than the bare
+ * `host-service-relay` substring, keeps this from also matching unrelated
+ * processes whose command line happens to mention this test file's own name
+ * (`scripts/host-service-relay.test.ts`, e.g. the test runner's own argv).
+ */
+function relayProcessLine(): string | undefined {
+  const ps = childProcess.spawnSync("ps", ["-eo", "pid,ppid,args"], { encoding: "utf8" });
+  return ps.stdout.split("\n").find((line) => line.includes(relayPath));
+}
+
+/**
+ * The relay is designed to survive the entry's own exec (that is the point
+ * of it), and it inherits the entry's stdout/stderr pipes (nothing redirects
+ * them in `session-entry.sh`, only the relay's stdin). A background child
+ * that still holds those pipes open keeps a spawned `ChildProcess`'s `close`
+ * event from ever firing, even once the tracked process itself has long
+ * since exited — proven against a minimal repro before relying on it here.
+ * A test that has already observed what it needs from a still-running relay
+ * must kill it before awaiting a `run()`-based promise, or that promise
+ * would hang until the relay exits on its own, which (by design) it never
+ * does.
+ */
+function killRelayProcess(): void {
+  const relayLine = relayProcessLine();
+  if (relayLine === undefined) return;
+  const pid = Number(relayLine.trim().split(/\s+/)[0]);
+  if (!Number.isInteger(pid)) return;
+  try {
+    process.kill(pid, "SIGKILL");
+  } catch {
+    // Already gone.
+  }
 }
 
 describe("session readiness probe against the real request proxy", () => {
@@ -596,4 +696,161 @@ describe("session entry", () => {
     expect(result.status, result.stderr).toBe(0);
     expect(recordedAgentRun().argv).toEqual([]);
   });
+});
+
+describe("session entry: host-service relay (T6)", () => {
+  test("the relay listens before the probe reports active", async () => {
+    const relayPort = await unusedPort();
+    let releaseActive: (() => void) | undefined;
+    const activeGate = new Promise<void>((resolve) => {
+      releaseActive = resolve;
+    });
+    // A proxy that only answers the readiness request once released, so the
+    // probe stays in its "not yet" loop for as long as the test needs.
+    const server = net.createServer((socket) => {
+      let buffered = Buffer.alloc(0);
+      socket.on("data", (chunk: Buffer) => {
+        buffered = Buffer.concat([buffered, chunk]);
+        if (!buffered.includes("\r\n\r\n")) return;
+        void activeGate.then(() => socket.end(ACTIVE_RESPONSE, "latin1"));
+      });
+      socket.on("error", () => {});
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address() as net.AddressInfo;
+
+    const resultPromise = runEntry([fakeAgentPath], entryEnv(address.port, { RUNFREE_HOST_SERVICES: `svc:${relayPort}` }));
+    try {
+      expect(await waitForConnect(relayPort, 2_000)).toBe(true);
+      // The entry is still waiting: the proxy has not been allowed to answer
+      // active yet, so the agent has not been exec'd.
+      expect(fs.existsSync(argvPath)).toBe(false);
+    } finally {
+      releaseActive?.();
+    }
+    // The relay survives the exec by design (that is the point of it), and
+    // it inherits the entry's stdout/stderr pipes, so the spawned process's
+    // `close` event (what `runEntry` awaits) would otherwise never fire.
+    // Everything this test needs was already observed above.
+    killRelayProcess();
+    const result = await resultPromise;
+    expect(result.status, result.stderr).toBe(0);
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  });
+
+  test("after exec: the agent PID is unchanged, the relay is still listening, and the relay's parent is the agent PID", async () => {
+    const relayPort = await unusedPort();
+    const proxy = await fakeProxy([ACTIVE_RESPONSE]);
+    const runPromise = runEntry([fakeAgentPath], entryEnv(proxy.port, {
+      RUNFREE_HOST_SERVICES: `svc:${relayPort}`,
+      // A window after exec, while the agent (same PID as the entry) is still
+      // alive, to sample process state before it exits.
+      RUNFREE_TEST_HOLD_MS: "600",
+    }));
+
+    const deadline = Date.now() + 5_000;
+    while (!fs.existsSync(argvPath) && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    expect(fs.existsSync(argvPath)).toBe(true);
+    const agentPid = recordedAgentRun().pid;
+
+    expect(await isListening(relayPort)).toBe(true);
+
+    const relayLine = relayProcessLine();
+    expect(relayLine, "no host-service-relay process found").toBeDefined();
+    const match = /^\s*(\d+)\s+(\d+)/.exec(relayLine ?? "");
+    expect(match).not.toBeNull();
+    expect(Number(match?.[2])).toBe(agentPid);
+
+    // Everything this test needs was already observed above; see the comment
+    // on `killRelayProcess`.
+    killRelayProcess();
+    const result = await runPromise;
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.pid).toBe(agentPid);
+  });
+
+  test("execs the agent normally, with unchanged exit status and timing, when the relay binary is missing", async () => {
+    fs.rmSync(relayPath, { force: true });
+    const relayPort = await unusedPort();
+    const proxy = await fakeProxy([ACTIVE_RESPONSE]);
+    const startedAt = Date.now();
+    const result = await runEntry([fakeAgentPath], entryEnv(proxy.port, { RUNFREE_HOST_SERVICES: `svc:${relayPort}` }));
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stderr).toBe("");
+    expect(Date.now() - startedAt).toBeLessThan(2_000);
+    expect(recordedAgentRun().pid).toBe(result.pid);
+  });
+
+  test.each([
+    ["TERM", "SIGTERM", 143],
+    ["INT", "SIGINT", 130],
+  ] as const)("the relay is gone within 1.5s when %s arrives while waiting", async (_label, signal, code) => {
+    const relayPort = await unusedPort();
+    const proxy = await fakeProxy([REFUSED_RESPONSE]);
+    let signalledAt = 0;
+    const result = await runEntry([fakeAgentPath], entryEnv(proxy.port, { RUNFREE_HOST_SERVICES: `svc:${relayPort}` }), {
+      onSpawn: (child) => {
+        const started = Date.now();
+        const tick = async (): Promise<void> => {
+          const relayUp = await isListening(relayPort);
+          if ((proxy.requests.length === 0 || !relayUp) && Date.now() - started < 5_000) {
+            setTimeout(tick, 25);
+            return;
+          }
+          signalledAt = Date.now();
+          child.kill(signal);
+        };
+        void tick();
+      },
+    });
+
+    expect({ status: result.status, signal: result.signal }).toEqual({ status: code, signal: null });
+    expect(signalledAt).toBeGreaterThan(0);
+    const goneWithinBound = await waitForRefusal(relayPort, Math.max(0, signalledAt + 1_500 - Date.now()));
+    expect(goneWithinBound, "the relay was still listening 1.5s after the signal").toBe(true);
+  });
+
+  test("starts no relay process when RUNFREE_HOST_SERVICES is unset", async () => {
+    const proxy = await fakeProxy([ACTIVE_RESPONSE]);
+    const result = await runEntry([fakeAgentPath], entryEnv(proxy.port));
+    expect(result.status, result.stderr).toBe(0);
+    expect(relayProcessLine()).toBeUndefined();
+  });
+
+  test("the relay's argv never names the session-entry path", async () => {
+    const relayPort = await unusedPort();
+    const proxy = await fakeProxy([REFUSED_RESPONSE]);
+    const runPromise = runEntry([fakeAgentPath], entryEnv(proxy.port, {
+      RUNFREE_HOST_SERVICES: `svc:${relayPort}`,
+      RUNFREE_SESSION_ENTRY_TIMEOUT_MS: "1500",
+    }));
+
+    expect(await waitForConnect(relayPort, 1_000)).toBe(true);
+    const relayLine = relayProcessLine();
+    expect(relayLine, "no host-service-relay process found").toBeDefined();
+    // The brief's own check: the relay's argv never names the session-entry
+    // path. (This test's tmp dir is itself named `runfree-session-entry-*`,
+    // so a bare `"session-entry"` substring check would false-positive on
+    // that; the exact entry path is the precise, correct check.)
+    expect(relayLine).not.toContain(entryPath);
+
+    // The entry's own activation-timeout exit (111) now kills the relay too
+    // (fix round 1, item 6), so `runPromise`'s `close`-based resolution no
+    // longer needs a manual `killRelayProcess()` push here; the next test
+    // proves that cleanup directly.
+    await runPromise;
+  }, 10_000);
+
+  test("the relay is gone after the entry's own activation-timeout exit (111)", async () => {
+    const relayPort = await unusedPort();
+    const proxy = await fakeProxy([REFUSED_RESPONSE]);
+    const result = await runEntry([fakeAgentPath], entryEnv(proxy.port, {
+      RUNFREE_HOST_SERVICES: `svc:${relayPort}`,
+      RUNFREE_SESSION_ENTRY_TIMEOUT_MS: "1200",
+    }));
+    expect(result.status, result.stderr).toBe(111);
+    expect(await waitForRefusal(relayPort, 1_500)).toBe(true);
+  }, 10_000);
 });

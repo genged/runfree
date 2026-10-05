@@ -23,6 +23,10 @@ const buildOutputs = [
 // compiled by the same `tsc -b` step as the proxy and shipped as CommonJS next
 // to the shell entry it serves. The Dockerfile installs it extensionless.
 const AGENT_PROBE_OUTPUT = path.join(repoRoot, "packages", "agent-runtime", "dist", "session-ready-probe.cjs");
+// The agent-side host-service relay (host services plan Task 6): same
+// package, same `tsc -b` step, shipped as CommonJS next to the probe and the
+// shell entry that starts it. The Dockerfile installs it extensionless too.
+const AGENT_RELAY_OUTPUT = path.join(repoRoot, "packages", "agent-runtime", "dist", "host-service-relay.cjs");
 
 export const RUNTIME_ASSET_ROLES = [
   "agent-image",
@@ -56,6 +60,7 @@ export const RUNTIME_ASSET_DESCRIPTORS: readonly RuntimeAssetDescriptor[] = [
   agentImage("agent/Dockerfile"),
   agentImage("agent/claude-runfree.sh"),
   agentImage("agent/codex-runfree.sh"),
+  agentImage("agent/host-service-relay.cjs"),
   agentImage("agent/session-entry.sh"),
   agentImage("agent/session-ready-probe.cjs"),
   agentImage("agent/agent-tools/package-lock.json"),
@@ -70,6 +75,7 @@ export const RUNTIME_ASSET_DESCRIPTORS: readonly RuntimeAssetDescriptor[] = [
   proxyImage("proxy/audit.js"),
   proxyImage("proxy/contracts/desired-network-policy.js"),
   proxyImage("proxy/contracts/effective-control.js"),
+  proxyImage("proxy/contracts/host-services.js"),
   proxyImage("proxy/contracts/mcp-operation-policy.js"),
   proxyImage("proxy/contracts/network-policy.js"),
   proxyImage("proxy/contracts/oauth-mediation-policy.js"),
@@ -84,11 +90,13 @@ export const RUNTIME_ASSET_DESCRIPTORS: readonly RuntimeAssetDescriptor[] = [
   proxyImage("proxy/firewall/command.js"),
   proxyImage("proxy/firewall/dns.js"),
   proxyImage("proxy/firewall/env.js"),
+  proxyImage("proxy/firewall/host-service-gateway.js"),
   proxyImage("proxy/firewall/index.js"),
   proxyImage("proxy/firewall/nftables.js"),
   proxyImage("proxy/firewall/route.js"),
   proxyImage("proxy/firewall/supervisor.js"),
   proxyImage("proxy/graphql-classify.js"),
+  proxyImage("proxy/host-service-tunnel.js"),
   proxyImage("proxy/mcp-classify.js"),
   proxyImage("proxy/mockttp-adapter.js"),
   proxyImage("proxy/oauth-mediation.js"),
@@ -510,6 +518,7 @@ function copyTree(source: string, destination: string, options: {
 function rewriteRuntimeContractImports(filePath: string): void {
   const replacements = new Map([
     ["@runfree/runtime-contracts/effective-control", path.join(outputRoot, "proxy", "contracts", "effective-control.js")],
+    ["@runfree/runtime-contracts/host-services", path.join(outputRoot, "proxy", "contracts", "host-services.js")],
     ["@runfree/runtime-contracts/network-policy", path.join(outputRoot, "proxy", "contracts", "network-policy.js")],
     ["@runfree/runtime-contracts/mcp-operation-policy", path.join(outputRoot, "proxy", "contracts", "mcp-operation-policy.js")],
     ["@runfree/runtime-contracts/oauth-mediation-policy", path.join(outputRoot, "proxy", "contracts", "oauth-mediation-policy.js")],
@@ -559,6 +568,7 @@ export function buildRuntime(): void {
 
   copyTree(path.join(repoRoot, "packages", "agent-runtime", "agent"), path.join(outputRoot, "agent"));
   copyFile(AGENT_PROBE_OUTPUT, path.join(outputRoot, "agent", "session-ready-probe.cjs"));
+  copyFile(AGENT_RELAY_OUTPUT, path.join(outputRoot, "agent", "host-service-relay.cjs"));
   copyFile(
     path.join(repoRoot, "packages", "agent-runtime", "runtime-inputs.lock.json"),
     path.join(outputRoot, "runtime-inputs.lock.json"),

@@ -28,6 +28,7 @@ import crypto from "node:crypto";
 import net from "node:net";
 
 import { CliError } from "../errors.ts";
+import { readHostServicePortRegistry } from "../host-service-registry.ts";
 import { createDockerClient } from "./docker-client.ts";
 import { dockerClientEnvOptions, parseDockerJson } from "./docker.ts";
 import { projectHash } from "./env.ts";
@@ -160,6 +161,15 @@ type PrepareDependencies = Readonly<{
   nowMs?: () => number;
   /** The whole setup's budget; defaults to `SESSION_CALLBACK_SETUP_BUDGET_MS`. */
   budgetMs?: number;
+  /**
+   * Ports any project has approved as a host service (HS7): never a callback
+   * candidate, in any project. Defaults to one bounded read of the host-global
+   * registry — never lsof, never the registry's own write lock — and reads
+   * as empty rather than throwing, since the callback's own fixed port block
+   * (47100-48099) is a host-service port no project can ever register, so an
+   * unreadable registry does not weaken it.
+   */
+  registeredHostPorts?: () => ReadonlySet<number>;
 }>;
 
 /**
@@ -234,6 +244,11 @@ export async function prepareSessionMcpCallback(
   const held = new Set(inspectCallbackForwarders({ ...dockerInput, io: setupIo }).forwarders
     .map(forwarderHostPort)
     .filter((port): port is number => port !== undefined));
+  const registeredHostPorts = deps.registeredHostPorts ?? (() => {
+    const read = readHostServicePortRegistry(context.env ?? process.env);
+    return read.ok ? new Set(read.owners.keys()) : new Set<number>();
+  });
+  for (const port of registeredHostPorts()) held.add(port);
   const candidates = sessionCallbackPortCandidates(context.projectRoot, owner.sessionId, held);
 
   let endpoint: SessionCallbackEndpoint | undefined;

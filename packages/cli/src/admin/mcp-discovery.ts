@@ -24,6 +24,7 @@ import dns from "node:dns";
 import net from "node:net";
 import tls from "node:tls";
 
+import { isReservedRunfreeHostname } from "@runfree/runtime-contracts/host-services";
 import { normalizeHostname, normalizePathPrefix } from "@runfree/runtime-contracts/network-policy";
 
 export const DISCOVERY_LIMITS = Object.freeze({
@@ -108,6 +109,9 @@ export function checkPolicyHostname(input: string): { ok: true; host: string } |
     host = normalizeHostname(input);
   } catch (error) {
     return { ok: false, reason: error instanceof Error ? (error.message.split("\n")[0] ?? error.message) : String(error) };
+  }
+  if (isReservedRunfreeHostname(host)) {
+    return { ok: false, reason: `${host} uses the reserved runfree.internal suffix` };
   }
   const labels = host.split(".");
   const last = labels[labels.length - 1] ?? "";

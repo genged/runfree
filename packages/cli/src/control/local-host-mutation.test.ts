@@ -169,6 +169,17 @@ describe("checkout-local host mutations", () => {
     expect(readControlApprovalSelection(root, context.project)?.subjects["network-project"]?.digest).toBe(approvedBefore);
   });
 
+  test("refuses to add a host using the reserved runfree.internal suffix before any file write (SR4/A1)", async () => {
+    const beforeProject = fs.readFileSync(projectPolicyPath, "utf8");
+    expect(fs.existsSync(localPolicyPath)).toBe(false);
+
+    await expect(mutateDesiredHost(context, io(), "project", { kind: "add", host: "x.runfree.internal" }))
+      .rejects.toThrow("reserved runfree.internal suffix");
+
+    expect(fs.readFileSync(projectPolicyPath, "utf8")).toBe(beforeProject);
+    expect(fs.existsSync(localPolicyPath)).toBe(false);
+  });
+
   test("does not remove or change a host supplied only by the project layer", async () => {
     const approvedBefore = readControlApprovalSelection(root, context.project)?.subjects["network-local"]?.digest;
 

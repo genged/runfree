@@ -19,8 +19,14 @@ import {
   convergeEffectivePolicyGeneration,
   effectiveControlSelectionForGeneration,
   readActiveControlSelection,
+  readActiveEffectiveControl,
   readConvergedPolicyReceipt,
+  readEffectiveHostServices,
 } from "../control/effective.ts";
+import { validateNetworkPolicy } from "@runfree/runtime-contracts/network-policy";
+import { hostServiceOwnerWarnings } from "../host-service-port-owner.ts";
+import { projectHasRegisteredHostServicePorts, recordedHostServiceOwners, recordProjectHostServicePorts } from "../host-service-registry.ts";
+import type { EffectiveHostServices } from "./probes.ts";
 import {
   composeManagedSessionVolumeLogicalNames,
   emptyDependencyOverlayPlan,
@@ -733,7 +739,13 @@ export function validateRuntimeTopologyOrRemoveInvalid(
     helperFence?: EphemeralHelperFence;
     helperImage?: string;
     readOnly?: boolean;
-  } = {},
+    /**
+     * The host services of the effective policy generation the firewall
+     * readiness check waited for. Required: the host-service proof (SR10)
+     * cannot be skipped by omitting it.
+     */
+    effectiveHostServices: EffectiveHostServices;
+  },
 ): { denyByDefaultObservation?: DenyByDefaultObservationV1; status: number; failureKind?: RuntimeFailureKind } {
   let boundaryViolated = false;
   const validate = () => validateRuntimeTopologyWithProof(plan, io, {
@@ -743,6 +755,7 @@ export function validateRuntimeTopologyOrRemoveInvalid(
     expectedProxyId: options.expectedProxyId,
     helperFence: options.helperFence,
     helperImage: options.helperImage,
+    effectiveHostServices: options.effectiveHostServices,
   });
   let validation = validate();
   if (validation.issues.length > 0 && reclaimDeadCallbackRoutes(plan, context, io, options)) {
@@ -1099,9 +1112,21 @@ async function prepareRuntimeForTokenSyncOrRemoveInvalid(
     warn(error instanceof Error ? error.message : String(error));
     return { status: 1, failureKind: error instanceof RuntimeObservationError ? error.evidence.kind : "unclassified" };
   }
+  // The host services the firewall proof judges `@host_service` against come
+  // from the same effective policy generation readiness waited for. An
+  // unreadable generation refuses: the proof never assumes "none".
+  let effectiveHostServices: EffectiveHostServices;
+  try {
+    effectiveHostServices = readEffectiveHostServices(context.project, readinessPolicy.controlGeneration);
+  } catch (error) {
+    warn(`effective host services could not be read: ${error instanceof Error ? error.message : String(error)}; new authority was refused`);
+    return { status: 1 };
+  }
   const validation = timings.time(
     "validation:topology",
-    () => validateRuntimeTopologyOrRemoveInvalid(activePlan, validationContext, io, docker, { ...options, expectedProxyId: readinessProxyId, helperFence, helperImage }),
+    () => validateRuntimeTopologyOrRemoveInvalid(activePlan, validationContext, io, docker, {
+      ...options, expectedProxyId: readinessProxyId, helperFence, helperImage, effectiveHostServices,
+    }),
   );
   if (validation.status !== 0) return validation;
   reportRuntimeProgress("validating runtime security contract", options.verbose);
@@ -1122,6 +1147,38 @@ async function prepareRuntimeForTokenSyncOrRemoveInvalid(
     denyByDefaultObservation: validation.denyByDefaultObservation,
     status: 0,
   };
+}
+
+/**
+ * The launch-time half of the host-service re-check (design "Policy shape",
+ * Re-check, SR13) and host-global port registry refresh (HS7): reads the
+ * active effective policy generation's approved host services, warns on
+ * every live-owner problem, and refreshes the registry's row for this
+ * project with the effective ports. Never throws and never changes the
+ * launch's own result -- the proxy's own enforcement, not this probe,
+ * protects the agent.
+ *
+ * R15: a project that never used host services must not take the
+ * host-global registry lock on every launch, so the write is skipped unless
+ * there is something to record or an existing row needs pruning.
+ */
+async function refreshHostServicesAtLaunch(context: RuntimeContext, io: RuntimeIO): Promise<void> {
+  try {
+    const effectivePolicy = readActiveEffectiveControl(context.project)?.policy;
+    const hostServices = effectivePolicy ? validateNetworkPolicy(effectivePolicy).hostServices : {};
+    const env = context.env ?? process.env;
+    const projectId = projectHash(context.projectRoot);
+    if (Object.keys(hostServices).length > 0) {
+      const recorded = recordedHostServiceOwners(env, projectId);
+      for (const line of hostServiceOwnerWarnings(context, io, hostServices, recorded)) warn(line);
+    }
+    const ports = Array.from(new Set(Object.values(hostServices).map((entry) => entry.port))).sort((left, right) => left - right);
+    if (ports.length > 0 || projectHasRegisteredHostServicePorts(env, projectId)) {
+      await recordProjectHostServicePorts(env, { id: projectId, root: context.projectRoot }, ports);
+    }
+  } catch (error) {
+    warn(`host-service re-check failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
 }
 
 export async function startRuntime(
@@ -1231,6 +1288,14 @@ export async function startRuntime(
     assertSafeRuntimePolicyPath(gitPreparedContext);
     ensureAgentState(gitPreparedContext);
     writeProjectRecoveryPointer(gitPreparedContext);
+    // Host-service re-check and registry refresh (design "Policy shape",
+    // Re-check, SR13; registry, HS7). Runs here, after control preparation
+    // selected the effective policy generation, but before any lock is held
+    // (within the launch lock-hold budget) -- a probe failure only warns, it
+    // never refuses the launch. Refreshing the host-global registry here too
+    // keeps it current even when an activation came from `runfree up` rather
+    // than `host-service add/remove`.
+    await refreshHostServicesAtLaunch(gitPreparedContext, io);
     ensureSandboxGitConfig(gitPreparedContext, io, hostGit);
     const dependencyPlan: PreparedDependencyOverlayPlan = prepareDependencyOverlayPlanResult(gitPreparedContext, io);
     // Supply the freshly discovered overlays before the plan is built, not
@@ -1453,6 +1518,13 @@ export async function startRuntime(
       const effective = readEffectiveControlPlaneV2(activePlan.paths.stateDir);
       const policy = readActiveControlSelection(context.project);
       if (!effective || !policy) return undefined;
+      let effectiveHostServices: EffectiveHostServices;
+      try {
+        effectiveHostServices = readEffectiveHostServices(context.project, policy.controlGeneration);
+      } catch {
+        // Unreadable host services: no warm path; the full validation refuses.
+        return undefined;
+      }
       return {
         plan: activePlan,
         context: activeContext,
@@ -1463,6 +1535,7 @@ export async function startRuntime(
         agentImage: ephemeralHelperImage(activePlan),
         volumeLogicalNames: composeManagedSessionVolumeLogicalNames(activeContext),
         gitLayout: serializeGitLayoutPlan(activePlan.gitLayout),
+        effectiveHostServices,
       };
     };
     // Why this start may not even ask the warm proof, or undefined when it may.

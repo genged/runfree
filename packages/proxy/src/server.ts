@@ -21,6 +21,7 @@ import {
 } from "./audit.js";
 import {
   createDenialEventEmitter,
+  denialReasonText,
   safePathname,
   syntheticDenialBody,
   type DenialReason,
@@ -47,8 +48,20 @@ import {
   loadEffectiveProxyControl,
   type LoadedEffectiveProxyControl,
 } from "@runfree/runtime-contracts/effective-control";
-import { requestProxyStatusPath } from "@runfree/runtime-contracts/proxy-status";
-import { writeGenerationStatusFile } from "./status.js";
+import {
+  DEFAULT_PROXY_STATUS_DIR,
+  requestProxyStatusPath,
+  type HostServiceGatewayStatus,
+  type RequestProxyGenerationStatus,
+} from "@runfree/runtime-contracts/proxy-status";
+import {
+  HOST_SERVICE_GATEWAY_STATUS_FILE,
+  isReservedRunfreeHostname,
+  parseHostServiceAuthority,
+  refusedHostServicePortReason,
+} from "@runfree/runtime-contracts/host-services";
+import { createHostServiceTunnels } from "./host-service-tunnel.js";
+import { readHostServiceGatewayStatusFile, writeGenerationStatusFile } from "./status.js";
 import { installResolvedHostLookup, resolvedHostsPathFromEnv } from "./resolved-hosts.js";
 import { AdmissionRegistry, type AdmissionRecord } from "./admission.js";
 import {
@@ -69,6 +82,7 @@ import {
   evaluateRequestWriteAsk,
   hostFromUrl,
   loadProxyPolicy,
+  isIpLiteralHostname,
   normalizeHostname,
   type CredentialMutationSummary,
   type LoadedProxyPolicy,
@@ -129,6 +143,21 @@ const DENIED_TUNNEL_IDLE_MS = parseIntWithDefault(process.env.PROXY_DENIED_TUNNE
 // leak regression). It is never enabled in production and never affects
 // denial behavior.
 const DENIED_TUNNEL_DEBUG = process.env.PROXY_DENIED_TUNNEL_DEBUG === "1";
+// Deliberately retained test-only observability, like DENIED_TUNNEL_DEBUG:
+// the status file lives at a fixed path the test harness cannot write, so
+// server-host-services.test.ts reads each published request-proxy status from
+// this log line instead. Never enabled in production; never affects behavior.
+const STATUS_DEBUG = process.env.PROXY_STATUS_DEBUG === "1";
+// Host-service splice bounds (design "Limits", SR11). Each cap refusal is a
+// raw pre-200 reject; capacity frees as splices close.
+const HOST_SERVICE_MAX_PER_SESSION = parseIntWithDefault(process.env.PROXY_HOST_SERVICE_MAX_PER_SESSION, 32);
+const HOST_SERVICE_MAX_GLOBAL = parseIntWithDefault(process.env.PROXY_HOST_SERVICE_MAX_GLOBAL, 256);
+const HOST_SERVICE_MAX_PENDING = parseIntWithDefault(process.env.PROXY_HOST_SERVICE_MAX_PENDING, 64);
+const HOST_SERVICE_DIAL_TIMEOUT_MS = parseIntWithDefault(process.env.PROXY_HOST_SERVICE_DIAL_TIMEOUT_MS, 5_000);
+// Host-controlled (compose) like every proxy env var; only the test harness
+// sets it, so real runtimes keep the fixed root-owned status path.
+const HOST_SERVICE_GATEWAY_PATH = process.env.PROXY_HOST_SERVICE_GATEWAY_PATH
+  ?? path.posix.join(DEFAULT_PROXY_STATUS_DIR, HOST_SERVICE_GATEWAY_STATUS_FILE);
 const SESSION_ADMISSION_WATCH_MS = 100;
 // The exact readiness bytes from a served peer are answered locally with this,
 // so the session entry in the agent image can tell its session file has landed
@@ -234,6 +263,23 @@ const sessionRegistry = new SessionFileRegistry({
   onSessionInvalidated: revokeSessionContexts,
 });
 const ipAssignments = new SessionIpAssignments(sessionIdentityConfig.registryRoot, testSessionOwnerUid);
+
+// The root firewall supervisor is the only writer of the gateway status file,
+// in the root-owned status root. Read it the same defended way as the session
+// files (owner, regular file, no symlink, single link, bounded size) and also
+// refuse a group- or other-writable file. Any failure reads as unavailable.
+// The owner override is the same harness-only knob the session registry uses.
+function readHostServiceGateway(): HostServiceGatewayStatus | undefined {
+  return readHostServiceGatewayStatusFile(HOST_SERVICE_GATEWAY_PATH, testSessionOwnerUid ?? 0);
+}
+
+const hostServiceTunnels = createHostServiceTunnels({
+  readGateway: readHostServiceGateway,
+  maxPerSession: HOST_SERVICE_MAX_PER_SESSION,
+  maxGlobal: HOST_SERVICE_MAX_GLOBAL,
+  maxPendingDials: HOST_SERVICE_MAX_PENDING,
+  dialTimeoutMs: HOST_SERVICE_DIAL_TIMEOUT_MS,
+});
 const acceptedSocketsByIp = new Map<string, Set<net.Socket>>();
 let sessionAdmissionWatchTimer: NodeJS.Timeout | undefined;
 let sessionAdmissionWatch: SessionAdmissionWatch | undefined;
@@ -614,18 +660,23 @@ function loadMcpOperationPolicy(): LoadedMcpOperationPolicy | undefined {
 // load-bearing for whether policy applies. The `proxy: policy reloaded` /
 // `proxy: listening on` log lines are human diagnostics only.
 function publishRequestProxyStatus(): void {
+  const status: RequestProxyGenerationStatus = {
+    generation: currentPolicy.generation,
+    ...(currentEffectiveControl ? {
+      controlGeneration: currentEffectiveControl.active.controlGeneration,
+      policyGeneration: currentPolicy.generation,
+    } : { generation: currentPolicy.generation }),
+    appliedAt: new Date().toISOString(),
+    // activatePairedPolicy prunes OAuth state from other state epochs and
+    // throws (failing the reload before this publish) if it cannot.
+    oauthStateEpochs: 1,
+    // reloadPolicy cuts the splices of removed entries before this publish,
+    // so a status naming a generation never counts a splice it removed.
+    hostServiceSplices: hostServiceTunnels.spliceCounts(),
+  };
+  if (STATUS_DEBUG) console.log(`proxy-debug: request-proxy status ${JSON.stringify(status)}`);
   try {
-    writeGenerationStatusFile(requestProxyStatusPath(), {
-      generation: currentPolicy.generation,
-      ...(currentEffectiveControl ? {
-        controlGeneration: currentEffectiveControl.active.controlGeneration,
-        policyGeneration: currentPolicy.generation,
-      } : { generation: currentPolicy.generation }),
-      appliedAt: new Date().toISOString(),
-      // activatePairedPolicy prunes OAuth state from other state epochs and
-      // throws (failing the reload before this publish) if it cannot.
-      oauthStateEpochs: 1,
-    });
+    writeGenerationStatusFile(requestProxyStatusPath(), status);
   } catch (error) {
     console.error(`proxy: failed to publish generation status: ${error instanceof Error ? error.message : String(error)}`);
   }
@@ -671,6 +722,13 @@ function reloadPolicy(): void {
     }
     if (nextEffectiveControl) oauthMediator.activatePairedPolicy(nextEffectiveControl.oauthPolicy);
     currentPolicy = nextPolicy;
+    // Revocation (SR3): cut open splices whose (name, port) left the
+    // effective policy before the status names the new generation. New
+    // CONNECTs already classify against `currentPolicy`.
+    const cutSplices = hostServiceTunnels.cutRemoved(nextPolicy.hostServices);
+    if (cutSplices > 0) {
+      console.log(`proxy: host-service splices cut: ${cutSplices}; reason: the approved name and port left the effective policy`);
+    }
     currentEffectiveControl = nextEffectiveControl;
     currentMcpOperationPolicy = nextMcpOperationPolicy;
     console.log(`proxy: policy reloaded, ${policySummary(currentPolicy)}, mcp_operation_generation=${currentMcpOperationPolicy?.generation ?? "unavailable"}`);
@@ -714,6 +772,30 @@ function sameWatchedFileRevision(left: WatchedFileRevision, right: WatchedFileRe
     && left.size === right.size;
 }
 
+// Revocation (SR3), request-proxy consumer, on a gateway change: the root
+// supervisor withdraws the gateway (sticky `unavailableReason`) when the
+// pinned address changes, turns invalid, or a set write fails, and its
+// firewall drain lasts only `hostServiceDrainSeconds`. After that the
+// established accept would pass an open splice's flow again, so this process
+// cuts on its own. On each watch tick it re-reads the gateway file with the
+// same defended reader `admit` uses, but only when the file's stat revision
+// changed: a splice admitted since the last read read the same file itself.
+// It cuts every splice when the file is missing, unreadable, invalid, or
+// carries `unavailableReason`, and every splice dialled to another address.
+// A `policyGeneration` that differs from this process's policy does not cut
+// (see `cutForGateway`).
+let hostServiceGatewayRevision: WatchedFileRevision | undefined;
+
+function reconcileHostServiceGateway(): void {
+  const revision = watchedFileRevision(HOST_SERVICE_GATEWAY_PATH);
+  if (hostServiceGatewayRevision !== undefined && sameWatchedFileRevision(revision, hostServiceGatewayRevision)) return;
+  hostServiceGatewayRevision = revision;
+  const cut = hostServiceTunnels.cutForGateway(readHostServiceGateway());
+  if (cut.count === 0) return;
+  console.log(`proxy: host-service splices cut: ${cut.count}; reason: ${cut.reason ?? "unknown"}`);
+  publishRequestProxyStatus();
+}
+
 const watchedPolicyPaths = [selectedPolicyPath, currentMcpPolicyPath].filter((value): value is string => value !== undefined);
 let watchedPolicyRevisions = watchedPolicyPaths.map(watchedFileRevision);
 let policyWatchNeedsInitialReconciliation = true;
@@ -728,6 +810,7 @@ const policyWatchTimer = setInterval(() => {
     policyWatchNeedsInitialReconciliation = false;
     reloadPolicy();
   }
+  reconcileHostServiceGateway();
 }, Number.isFinite(POLICY_WATCH_INTERVAL_MS) && POLICY_WATCH_INTERVAL_MS > 0 ? POLICY_WATCH_INTERVAL_MS : 1000);
 policyWatchTimer.unref();
 
@@ -748,6 +831,7 @@ const denialEvents = createDenialEventEmitter();
 function emitDenial(input: {
   reason: DenialReason;
   host: string;
+  port?: number;
   method?: string;
   path?: string;
   mcp?: McpDisplayFields;
@@ -756,6 +840,7 @@ function emitDenial(input: {
   denialEvents.emit({
     reason: input.reason,
     host: input.host,
+    ...(input.port !== undefined ? { port: input.port } : {}),
     method: input.method,
     path: input.path,
     ...(input.mcp !== undefined ? { mcp: input.mcp } : {}),
@@ -1064,8 +1149,9 @@ function auditedWebSocketHost(req: ProxyRequest): string | undefined {
   }
 }
 
-function blockedBody(host: string, reason: string): string {
-  return `blocked by agent proxy policy\nreason: ${reason}\nhost: ${host}\n`;
+function blockedBody(host: string, reason: string, remedy?: string): string {
+  const remedyLine = remedy !== undefined ? `${remedy}\n` : "";
+  return `blocked by agent proxy policy\nreason: ${reason}\nhost: ${host}\n${remedyLine}`;
 }
 
 // Defensive catch-all for a policy denial no earlier arm classified. The
@@ -1203,8 +1289,8 @@ function isPolicyDenial(error: unknown): error is Error {
     || (error instanceof Error && error.message.startsWith("blocked "));
 }
 
-function rawBlockedResponse(host: string, reason: string): string {
-  const body = blockedBody(host, reason);
+function rawBlockedResponse(host: string, reason: string, remedy?: string): string {
+  const body = blockedBody(host, reason, remedy);
   return [
     "HTTP/1.1 403 Forbidden",
     "content-type: text/plain",
@@ -1808,7 +1894,34 @@ type ConnectDecision =
   | { action: "pass"; host: string }
   | { action: "audit-pass"; host: string }
   | { action: "denied-tunnel"; host: string }
-  | { action: "reject"; host: string; reason: string; denialReason: DenialReason };
+  | { action: "host-service"; name: string; port: number }
+  | { action: "reject"; host: string; reason: string; denialReason: DenialReason; remedy?: string; port?: number };
+
+// Every reading of a CONNECT authority's host that a later stage could act
+// on: the bracket-stripping parse, and the raw text before the last and the
+// first colon, each with surrounding brackets removed.
+function reservedConnectHostCandidates(authority: string, parsedHost: string): string[] {
+  const trimmed = authority.trim();
+  const stripBrackets = (value: string) => value.replace(/^\[/, "").replace(/\]$/, "");
+  const lastColon = trimmed.lastIndexOf(":");
+  const firstColon = trimmed.indexOf(":");
+  return [
+    parsedHost,
+    stripBrackets(lastColon === -1 ? trimmed : trimmed.slice(0, lastColon)),
+    stripBrackets(firstColon === -1 ? trimmed : trimmed.slice(0, firstColon)),
+  ];
+}
+
+function hostServiceNotConfigured(host: string, remedy?: string, port?: number): ConnectDecision {
+  return {
+    action: "reject",
+    host,
+    reason: `host-service-not-configured: ${denialReasonText("host-service-not-configured")}`,
+    denialReason: "host-service-not-configured",
+    ...(remedy !== undefined ? { remedy } : {}),
+    ...(port !== undefined ? { port } : {}),
+  };
+}
 
 // CONNECT matrix: allowed host on 443 passes through to mockttp; a denied
 // host on 443 is adopted into the local denied-tunnel TLS endpoint so the
@@ -1817,8 +1930,39 @@ type ConnectDecision =
 // allowlisted host (registered + observed). Any non-443 port and malformed
 // CONNECT requests keep the raw pre-TLS rejection in every mode because no
 // readable in-tunnel response is possible there.
+//
+// The reserved `runfree.internal` suffix is classified first, on every port
+// and in every mode (SR4): such an authority never reaches the port check,
+// the denied-tunnel path, audit, the spool, or DNS. Only an exact approved
+// `<name>.runfree.internal:<port>` pair becomes a host-service splice.
 function classifyConnect(authority: string): ConnectDecision {
   const { host, port } = parseConnectAuthority(authority);
+  const reserved = parseHostServiceAuthority(authority.trim());
+  if (reserved.kind === "service") {
+    if (currentPolicy.hostServices[reserved.name]?.port === reserved.port) {
+      return { action: "host-service", name: reserved.name, port: reserved.port };
+    }
+    // The name already matched the host-service name pattern and the port is
+    // a parsed integer, so this remedy echoes no free-form agent input (SR5).
+    // A statically refused port gets no remedy: `add` would refuse it.
+    if (refusedHostServicePortReason(reserved.port) !== undefined) {
+      return hostServiceNotConfigured(host, undefined, reserved.port);
+    }
+    return hostServiceNotConfigured(
+      host,
+      `requested by the agent; to approve: runfree host-service add ${reserved.name} --port ${reserved.port}`,
+      reserved.port,
+    );
+  }
+  // Any other authority whose host is reserved is refused with no remedy.
+  // `parseHostServiceAuthority` splits on the last colon while
+  // `parseConnectAuthority` strips brackets, so `[x.runfree.internal]:443` or
+  // `x.runfree.internal:443:` would otherwise read as not reserved and reach
+  // audit-pass, the denied tunnel, or mockttp. A bracketed form is never a
+  // valid service, even when the name and port match.
+  if (reserved.kind === "malformed" || reservedConnectHostCandidates(authority, host).some(isReservedRunfreeHostname)) {
+    return hostServiceNotConfigured(host);
+  }
   if (port !== 443) {
     return {
       action: "reject",
@@ -1829,6 +1973,18 @@ function classifyConnect(authority: string): ConnectDecision {
   }
   if (!currentPolicy.allowedHostSet.has(host)) {
     if (auditMarkerState().active) {
+      // An IP literal is never audited (R20): mockttp would dial it without
+      // the resolver snapshot, and on 443 it could reach the pinned
+      // host-service gateway through the uid-1001 @host_service accept.
+      // Refused raw, before any spool write or hand-off.
+      if (isIpLiteralHostname(host)) {
+        return {
+          action: "reject",
+          host,
+          reason: `blocked IP-literal CONNECT host in audit mode: ${host}`,
+          denialReason: "host-not-allowlisted",
+        };
+      }
       try {
         return { action: "audit-pass", host: normalizeHostname(host) };
       } catch {
@@ -2240,11 +2396,11 @@ function handleGuardedConnection(clientSocket: net.Socket, mockttpPort: number):
     );
   };
 
-  const reject = (host: string, reason: string, denialReason: DenialReason) => {
+  const reject = (host: string, reason: string, denialReason: DenialReason, remedy?: string, port?: number) => {
     if (decided) return;
     settle();
-    emitDenial({ reason: denialReason, host });
-    clientSocket.end(rawBlockedResponse(host, reason));
+    emitDenial({ reason: denialReason, host, ...(port !== undefined ? { port } : {}) });
+    clientSocket.end(rawBlockedResponse(host, reason, remedy));
   };
 
   const onData = (chunk: Buffer) => {
@@ -2358,7 +2514,31 @@ function handleGuardedConnection(clientSocket: net.Socket, mockttpPort: number):
 
     const decision = classifyConnect(match[1]);
     if (decision.action === "reject") {
-      reject(decision.host, decision.reason, decision.denialReason);
+      reject(decision.host, decision.reason, decision.denialReason, decision.remedy, decision.port);
+      return;
+    }
+    if (decision.action === "host-service") {
+      const sessionKey = guardIdentity.identity.sessionBinding?.sessionKey;
+      const host = `${decision.name}.runfree.internal`;
+      if (!sessionKey) {
+        reject(host, "host-service-unavailable: the connection has no session binding", "host-service-unavailable", undefined, decision.port);
+        return;
+      }
+      if (decided) return;
+      settle();
+      hostServiceTunnels.admit({
+        clientSocket,
+        sessionKey,
+        name: decision.name,
+        port: decision.port,
+        policyGeneration: currentPolicy.generation,
+        remainder: buffered.subarray(headEnd),
+        // The guard has settled, so this refusal answers the client directly.
+        reject: (reason, denialReason) => {
+          emitDenial({ reason: denialReason, host, port: decision.port });
+          clientSocket.end(rawBlockedResponse(host, reason));
+        },
+      });
       return;
     }
     if (decision.action === "audit-pass") {

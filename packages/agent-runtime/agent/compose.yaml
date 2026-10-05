@@ -41,6 +41,13 @@ services:
       io.runfree.topology-digest: ${RUNFREE_TOPOLOGY_DIGEST:?RUNFREE_TOPOLOGY_DIGEST is required}
       io.runfree.version: ${RUNFREE_VERSION:?RUNFREE_VERSION is required}
     init: true
+    # Host-service gateway alias (design "Gateway address"): a literal with no
+    # interpolation. Root in the proxy reads it from /etc/hosts and pins it;
+    # the name sits under the reserved runfree.internal suffix, so no proxy
+    # path resolves it for an agent-chosen name. Topology requires ExtraHosts
+    # to be exactly this entry. The agent keeps no ExtraHosts.
+    extra_hosts:
+      - "gateway.runfree.internal:host-gateway"
     volumes:
       - type: bind
         source: ${RUNFREE_PROXY_CA_KEY_DIR:?RUNFREE_PROXY_CA_KEY_DIR is required}

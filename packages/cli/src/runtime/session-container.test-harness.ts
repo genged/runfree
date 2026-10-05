@@ -1,5 +1,7 @@
 import path from "node:path";
 
+import type { HostServicesJson } from "@runfree/runtime-contracts/host-services";
+
 import type { ProjectInfo } from "../config.ts";
 import {
   bindSessionAgentImageV2,
@@ -267,6 +269,7 @@ export function sessionTestDependencies(): DependencyOverlayPlan {
 export function sessionContainerTemplateFixture(input: {
   sessionLiveProbeRoot?: string;
   dependencyOverlays?: DependencyOverlayPlan;
+  hostServices?: HostServicesJson;
 } = {}): SessionContainerTemplate {
   const gitLayout = sessionTestGitLayout();
   return createSessionContainerTemplate({
@@ -282,6 +285,7 @@ export function sessionContainerTemplateFixture(input: {
       RUNFREE_PROJECT_PHYSICAL_ROOT: gitLayout.containerProjectRoot,
       RUNFREE_PROXY_IP: "172.31.90.10",
     },
+    hostServices: input.hostServices ?? {},
     selectedAgentEnvironment: {
       displayPath: "/host/effective/agent.env",
       source: "GH_TOKEN=raw-secret\nTERM=xterm-256color\n",

@@ -20,6 +20,7 @@ import {
   readControlApprovalSelection,
 } from "./approvals.ts";
 import { captureDesiredPolicyCandidate } from "./candidates.ts";
+import { mutateDesiredHostService } from "./host-service-mutation.ts";
 import { mutateDesiredHost, readDesiredHostRules } from "./local-host-mutation.ts";
 
 // The transaction body is synchronous, so the agent-write injections need
@@ -231,5 +232,89 @@ describe("desired-mutation agent-drift window guard", () => {
     });
     await expect(mutateDesiredHost(context, io(), "project", { kind: "add", host: "other.example.com" }))
       .rejects.toThrow("project desired policy changed outside a trusted Runfree transaction");
+  });
+
+  // The same five windows for the host-service family: its plan also runs a
+  // live port admission, which must not open a window the host family lacks.
+  describe("host-service mutation", () => {
+    const IDB_SERVICE = { idb: { target: "host-loopback", port: 10882 } };
+    const addIdb = () => mutateDesiredHostService(context, io(), "project", { kind: "add", name: "idb", port: 10882 }, {
+      admit: () => ({ ok: true, owner: { command: "x", pid: 1 } }),
+    });
+    const addOther = () => mutateDesiredHostService(context, io(), "project", { kind: "add", name: "other", port: 10883 }, {
+      admit: () => ({ ok: true, owner: { command: "x", pid: 1 } }),
+    });
+
+    test("window 1 - an edit before capture is refused against the approved base", async () => {
+      const approvedBefore = approvedProjectDigest();
+      writeAgentDrift();
+
+      await expect(addIdb()).rejects.toThrow("project desired policy changed outside a trusted Runfree transaction");
+
+      expect(approvedProjectDigest()).toBe(approvedBefore);
+      expect(readApprovedNetworkPolicy(root, context.project, "network-project")).toEqual({
+        version: 2,
+        hosts: ["project.example.com"],
+      });
+      expect(fs.readFileSync(projectPolicyPath, "utf8")).toBe(AGENT_DRIFT);
+    });
+
+    test("window 2 - an edit between capture and the atomic write is destroyed by the rename", async () => {
+      seams.beforeReplace = writeAgentDrift;
+
+      const result = await addIdb();
+
+      expect(result.changed).toBe(true);
+      const onDisk = JSON.parse(fs.readFileSync(projectPolicyPath, "utf8")) as Record<string, unknown>;
+      expect(onDisk).toEqual({ version: 2, hosts: ["project.example.com"], hostServices: IDB_SERVICE });
+      expect(readApprovedNetworkPolicy(root, context.project, "network-project")).toEqual({
+        version: 2,
+        hosts: ["project.example.com"],
+        hostServices: IDB_SERVICE,
+      });
+    });
+
+    test("window 3 - an edit between the write and the re-read fails the exact-match check unapproved", async () => {
+      const approvedBefore = approvedProjectDigest();
+      seams.beforeCapture = [undefined, writeAgentDrift];
+
+      await expect(addIdb()).rejects.toThrow("project policy write did not produce the exact planned candidate");
+
+      expect(approvedProjectDigest()).toBe(approvedBefore);
+      expect(readApprovedNetworkPolicy(root, context.project, "network-project")).toEqual({
+        version: 2,
+        hosts: ["project.example.com"],
+      });
+      await expect(addOther()).rejects.toThrow("project desired policy changed outside a trusted Runfree transaction");
+    });
+
+    test("window 4 - an edit after the re-read cannot reach the approval, which uses the in-memory candidate", async () => {
+      seams.beforeApprove = writeAgentDrift;
+
+      const result = await addIdb();
+
+      expect(result.changed).toBe(true);
+      expect(readApprovedNetworkPolicy(root, context.project, "network-project")).toEqual({
+        version: 2,
+        hosts: ["project.example.com"],
+        hostServices: IDB_SERVICE,
+      });
+      expect(fs.readFileSync(projectPolicyPath, "utf8")).toBe(AGENT_DRIFT);
+      await expect(addOther()).rejects.toThrow("project desired policy changed outside a trusted Runfree transaction");
+    });
+
+    test("window 5 - an edit after approval cannot reach the content-addressed snapshot", async () => {
+      const result = await addIdb();
+      expect(result.changed).toBe(true);
+
+      writeAgentDrift();
+
+      expect(readApprovedNetworkPolicy(root, context.project, "network-project")).toEqual({
+        version: 2,
+        hosts: ["project.example.com"],
+        hostServices: IDB_SERVICE,
+      });
+      await expect(addOther()).rejects.toThrow("project desired policy changed outside a trusted Runfree transaction");
+    });
   });
 });

@@ -37,6 +37,12 @@ import { approvalReadRefusal } from "./approval-read.ts";
 import { migrateControlApprovalRecord } from "./approval-migration.ts";
 import { desiredPolicyReviewLines } from "./review-render.ts";
 import {
+  admitCandidateHostServices,
+  admittedOwnerReviewLines,
+  type AdmittedHostServiceOwners,
+  type HostServiceAdmit,
+} from "./host-service-approval-admission.ts";
+import {
   captureDesiredPolicyCandidate,
   verifyDesiredPolicyCandidate,
   type DesiredPolicyCandidate,
@@ -179,7 +185,9 @@ export async function approveNetworkControl(
   io: RuntimeIO,
   subjectType: "network-local" | "network-project",
   input: {
-    confirm?: (candidate: DesiredPolicyCandidate, subject: ControlSubject) => boolean;
+    /** Port admission seam (R21); defaults to the live `lsof` check. */
+    admitHostService?: HostServiceAdmit;
+    confirm?: (candidate: DesiredPolicyCandidate, subject: ControlSubject, owners: AdmittedHostServiceOwners) => boolean;
     expectedDigest?: string;
     mechanism: ControlApprovalMechanism;
     now?: Date;
@@ -188,7 +196,16 @@ export async function approveNetworkControl(
   const candidate = await captureQuiescedDesiredPolicyCandidate(context, io);
   const subject = subjectType === "network-project" ? candidate.projectSubject : candidate.localSubject;
   exactDigest(input.expectedDigest, subject);
-  if (input.confirm && !input.confirm(candidate, subject)) throw new CliError("control approval declined");
+  // R21: an added or re-ported host service is admitted before the review and
+  // before any approval write, outside the lifecycle lock (the capture above
+  // released it).
+  const owners = admitCandidateHostServices(
+    context,
+    io,
+    subjectType === "network-project" ? { project: candidate.project } : { local: candidate.local },
+    input.admitHostService,
+  );
+  if (input.confirm && !input.confirm(candidate, subject, owners)) throw new CliError("control approval declined");
   return approveNetworkCandidate(
     context.projectRoot,
     context.project,
@@ -481,6 +498,7 @@ const SUPERSEDED_HEADLINE = "These saved approvals predate this version of runfr
 export async function requireUsableApprovalSelection(
   context: RuntimeContext,
   io: RuntimeIO,
+  deps: { admitHostService?: HostServiceAdmit } = {},
 ): Promise<ControlApprovalRead> {
   let read = readControlApprovalRecord(context.projectRoot, context.project);
   if (read.kind === "valid" || read.kind === "missing") return read;
@@ -515,20 +533,33 @@ export async function requireUsableApprovalSelection(
 
   const candidate = await captureQuiescedDesiredPolicyCandidate(context, io);
   const runtimeSubject = runtimeIsolationControlSubject(context.project.config);
+  // R21: the saved approvals carry no authority here, so every host service
+  // in either layer is admitted before the interactive review (outside the
+  // lock). A non-interactive run writes nothing and only prints the digest
+  // commands, whose `control approve` path runs its own admission.
+  const interactive = io.isInteractive?.() === true;
+  const owners = interactive
+    ? admitCandidateHostServices(
+      context,
+      io,
+      { project: candidate.project, local: candidate.local },
+      deps.admitHostService,
+    )
+    : undefined;
   for (const line of [
     "Runfree needs to review this checkout's saved approvals.",
     read.kind === "superseded" ? SUPERSEDED_HEADLINE : MISMATCH_HEADLINE[read.reason],
     "",
-    ...desiredPolicyReviewLines(context, candidate, candidate.projectSubject, "project"),
+    ...desiredPolicyReviewLines(context, candidate, candidate.projectSubject, "project", owners),
     "",
-    ...desiredPolicyReviewLines(context, candidate, candidate.localSubject, "local"),
+    ...desiredPolicyReviewLines(context, candidate, candidate.localSubject, "local", owners),
     "",
     `runtime-isolation subject digest: ${runtimeSubject.digest}`,
   ]) console.log(line);
 
   // `--yes` is not consent, and a non-TTY is not consent either: the exact
   // digest commands are the only non-interactive path in.
-  if (io.isInteractive?.() !== true) {
+  if (!interactive) {
     throw new CliError(`desired controls require exact approval before startup:\n${approvalCommands(candidate, runtimeSubject)}`);
   }
   if (!io.confirm("Use these settings for this checkout? [y/N] ")) {
@@ -563,7 +594,7 @@ export async function requireUsableApprovalSelection(
 export async function prepareEffectiveControlsForStartup(
   context: RuntimeContext,
   io: RuntimeIO,
-  options: { useApprovedPolicy?: boolean } = {},
+  options: { admitHostService?: HostServiceAdmit; useApprovedPolicy?: boolean } = {},
 ): Promise<StartupControlPreparation> {
   // Before the active-session short-circuit on purpose. That path returns the
   // published generation without ever reading the selection, and
@@ -571,7 +602,7 @@ export async function prepareEffectiveControlsForStartup(
   // prepared on every launch rather than only on a build, a cached custom image
   // on an active-session entry would otherwise be the first thing to meet a
   // non-valid selection.
-  await requireUsableApprovalSelection(context, io);
+  await requireUsableApprovalSelection(context, io, { admitHostService: options.admitHostService });
 
   if (options.useApprovedPolicy) {
     return { generation: await usePreparedApprovedPolicyGeneration(context, io), mechanism: "use-approved" };
@@ -633,11 +664,24 @@ export async function prepareEffectiveControlsForStartup(
   if (!interactive) {
     throw new CliError(`desired controls require exact approval before startup:\n${approvalCommands(candidate, runtimeSubject)}`);
   }
+  // R21: the interactive approval below writes every changed network layer,
+  // so each host service it adds or re-ports is admitted first (outside the
+  // lock; the capture above released it). A refusal throws before consent.
+  const owners = admitCandidateHostServices(
+    context,
+    io,
+    {
+      ...(networkProjectChanged ? { project: candidate.project } : {}),
+      ...(networkLocalChanged ? { local: candidate.local } : {}),
+    },
+    options.admitHostService,
+  );
   const summary = [
     "Desired controls require approval:",
     `  network-project ${candidate.projectSubject.digest}`,
     `  network-local ${candidate.localSubject.digest}`,
     `  runtime-isolation ${runtimeSubject.digest}`,
+    ...admittedOwnerReviewLines(owners),
   ].join("\n");
   if (!io.confirm(`${summary}\nApprove these exact controls? [y/N] `)) {
     throw new CliError("control approval declined; runtime was not started");

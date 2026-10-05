@@ -3,12 +3,21 @@ import { describe, expect, test } from "vitest";
 import {
   canonicalDesiredNetworkPolicy,
   desiredNetworkPolicyDigest,
+  desiredPolicyDirectProjection,
   validateDesiredNetworkPolicy,
 } from "./desired-network-policy.ts";
 
 const digest = `sha256:${"a".repeat(64)}`;
 
 describe("desired network policy v2", () => {
+  test("refuses IP-literal hosts, which would skip the resolver snapshot (R20)", () => {
+    for (const host of ["192.168.65.254", "127.0.0.1", "1.2.3.0x7f", "foo.123"]) {
+      expect(() => validateDesiredNetworkPolicy({ version: 2, hosts: [host] }), host)
+        .toThrow(`${host} is an IP address; policy hosts must be hostnames`);
+    }
+    expect(validateDesiredNetworkPolicy({ version: 2, hosts: ["x1.example.com"] }).hosts).toEqual(["x1.example.com"]);
+  });
+
   test("canonicalizes direct policy and self-contained service semantics", () => {
     const first = validateDesiredNetworkPolicy({
       version: 2,
@@ -109,5 +118,17 @@ describe("desired network policy v2", () => {
     const ask = validateDesiredNetworkPolicy({ version: 2, hosts: [], writeApproval: "ask" });
     const deny = validateDesiredNetworkPolicy({ version: 2, hosts: [], writeApproval: "deny" });
     expect(desiredNetworkPolicyDigest(ask)).not.toBe(desiredNetworkPolicyDigest(deny));
+  });
+
+  test("hostServices is a known desired field and changes the digest", () => {
+    const a = validateDesiredNetworkPolicy({ version: 2, hosts: [] });
+    const b = validateDesiredNetworkPolicy({ version: 2, hosts: [], hostServices: { idb: { target: "host-loopback", port: 10882 } } });
+    expect(b.hostServices).toEqual({ idb: { target: "host-loopback", port: 10882 } });
+    expect(desiredNetworkPolicyDigest(a)).not.toBe(desiredNetworkPolicyDigest(b));
+    expect(desiredPolicyDirectProjection(b).hostServices).toEqual(b.hostServices);
+  });
+
+  test("desired hostServices refuse the address target", () => {
+    expect(() => validateDesiredNetworkPolicy({ version: 2, hosts: [], hostServices: { x: { target: "address", host: "h", port: 1 } } })).toThrow("not supported yet");
   });
 });

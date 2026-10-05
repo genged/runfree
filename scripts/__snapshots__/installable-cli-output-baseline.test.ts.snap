@@ -242,6 +242,33 @@ on the host machine:
 
 Policy reloads automatically; rerun the failed command afterwards.
 ",
+  "host-service-capacity": "Runfree blocked this request.
+
+  host:   api.example.com
+  reason: too many host-service connections are already open
+
+This block is enforced by the Runfree proxy outside the agent container.
+The person operating Runfree can inspect recent denials by running
+\`runfree doctor\` on the host machine.
+",
+  "host-service-not-configured": "Runfree blocked this request.
+
+  host:   api.example.com
+  reason: this host service is not approved for the project
+
+This block is enforced by the Runfree proxy outside the agent container.
+The person operating Runfree can inspect recent denials by running
+\`runfree doctor\` on the host machine.
+",
+  "host-service-unavailable": "Runfree blocked this request.
+
+  host:   api.example.com
+  reason: the host-service gateway or the host service is not available
+
+This block is enforced by the Runfree proxy outside the agent container.
+The person operating Runfree can inspect recent denials by running
+\`runfree doctor\` on the host machine.
+",
   "malformed-connect": "Runfree blocked this request.
 
   host:   api.example.com

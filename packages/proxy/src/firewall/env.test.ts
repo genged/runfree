@@ -45,7 +45,14 @@ describe("proxy firewall environment parsing", () => {
       auditSetName: "audit_ipv4",
       auditDrainingSetName: "audit_draining_ipv4",
       auditMaxElements: 256,
+      hostServiceSetName: "host_service",
+      hostServiceDrainingSetName: "host_service_draining",
+      hostServiceGatewaySetName: "host_service_gateways",
+      hostServiceGatewayMaxElements: 8,
+      hostServiceMaxElements: 64,
     });
+    expect(plan.hostServiceDrainSeconds).toBe(30);
+    expect(plan.hostServices).toEqual({});
     expect(plan.audit).toEqual({
       markerPath: "/run/runfree-proxy-audit/active.json",
       spoolPath: "/run/runfree-proxy-audit-spool/spool.txt",
@@ -105,6 +112,26 @@ describe("proxy firewall environment parsing", () => {
       resolveBudgetPerTick: 2,
       drainSeconds: 5,
     });
+  });
+
+  test("carries the policy host services and a tunable host-service drain window", () => {
+    const plan = buildFirewallPlan({
+      env: {
+        RUNFREE_SESSION_ADMISSION_SOURCE: "files",
+        PROXY_POLICY_PATH: "/policy.json",
+        PROXY_HOST_SERVICE_DRAIN_SECONDS: "7",
+      },
+      allowedHosts: [],
+      hostServices: { idb: { target: "host-loopback", port: 10882 } },
+      policyGeneration: POLICY_GENERATION,
+    });
+    expect(plan.hostServiceDrainSeconds).toBe(7);
+    expect(plan.hostServices).toEqual({ idb: { target: "host-loopback", port: 10882 } });
+    expect(() => buildFirewallPlan({
+      env: { RUNFREE_SESSION_ADMISSION_SOURCE: "files", PROXY_POLICY_PATH: "/policy.json", PROXY_HOST_SERVICE_DRAIN_SECONDS: "0" },
+      allowedHosts: [],
+      policyGeneration: POLICY_GENERATION,
+    })).toThrow(/PROXY_HOST_SERVICE_DRAIN_SECONDS must be a positive integer/);
   });
 
   test("rejects invalid addresses and ports", () => {

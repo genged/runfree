@@ -21,6 +21,7 @@
 //   used for the exfiltration-surface warning;
 // - a credential's `credentials[]` hosts must be a subset of the service hosts.
 
+import { isReservedRunfreeHostname } from "@runfree/runtime-contracts/host-services";
 import {
   normalizeHostname,
   normalizePathPrefix,
@@ -1126,6 +1127,7 @@ export function validateServiceDefinition(svc: Service, options: ServiceDefiniti
       issues.push(`${svc.id}: host ${host}: ${error instanceof Error ? error.message : String(error)}`);
     }
     if (host.includes("*")) issues.push(`${svc.id}: host ${host} must not be a wildcard`);
+    if (isReservedRunfreeHostname(host)) issues.push(`${svc.id}: host ${host} uses the reserved runfree.internal suffix`);
   }
   for (const host of serviceBroadHosts(svc)) {
     if (!host.explanation || host.explanation.trim().length < 20) {
@@ -1332,6 +1334,9 @@ export function validateServiceDefinition(svc: Service, options: ServiceDefiniti
           }
         } catch (error) {
           issues.push(`${svc.id}: ${replacementLabel}.host: ${error instanceof Error ? error.message : String(error)}`);
+        }
+        if (isReservedRunfreeHostname(replacement.host)) {
+          issues.push(`${svc.id}: ${replacementLabel}.host ${replacement.host} uses the reserved runfree.internal suffix`);
         }
         if (!hostSet.has(replacement.host)) {
           issues.push(`${svc.id}: ${replacementLabel}.host must be a current service host`);

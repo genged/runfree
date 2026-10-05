@@ -15,6 +15,7 @@ import { normalizeSessionName } from "../runtime/sessions.ts";
 import { credentialCommand } from "./admin/credential.ts";
 import { doctorCommand, runtimeAdminCommand } from "./admin/diagnostics.ts";
 import { hostCommand } from "./admin/host.ts";
+import { hostServiceCommand } from "./admin/host-service.ts";
 import { mcpCommand } from "./admin/mcp.ts";
 import { serviceCommand } from "./admin/service.ts";
 import { assetsCommand } from "./assets.ts";
@@ -82,6 +83,7 @@ const COMMAND_MODULES: readonly CommandModule[] = [
   forwardCommand,
   gitCommand,
   hostCommand,
+  hostServiceCommand,
   doctorCommand,
   runtimeAdminCommand,
   credentialCommand,

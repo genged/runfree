@@ -17,6 +17,7 @@ import {
   isHttpMethod,
   isTokenName,
   shellQuoteToken,
+  isIpLiteralHostname,
   validateNetworkPolicy,
   type HttpMethod,
 } from "./network-policy.ts";
@@ -124,6 +125,14 @@ describe("request-shape policy validation", () => {
   test("rejects ambiguous hosts plus legacy domains input", () => {
     expect(validationIssues({ hosts: ["api.github.com"], domains: ["raw.githubusercontent.com"], tokens: {} }))
       .toContain("policy must not define both hosts and legacy domains");
+  });
+
+  test("the effective policy loader still accepts an IP-literal host; desired validation refuses it (R20)", () => {
+    expect(validationIssues({ hosts: ["127.0.0.1"], tokens: {} })).toEqual([]);
+    expect(isIpLiteralHostname("::1")).toBe(true);
+    expect(isIpLiteralHostname("192.168.65.254")).toBe(true);
+    expect(isIpLiteralHostname("1.2.3.0x7f")).toBe(true);
+    expect(isIpLiteralHostname("api.github.com")).toBe(false);
   });
 
   test("rejects rules for non-allowlisted or non-normalized hosts", () => {
@@ -390,5 +399,30 @@ describe("hostRulesCommand (rule-preserving remedies)", () => {
     expect(describeRequestRule({ methods: ["GET"], gitPush: "deny", writeAction: "ask" })).toBe(
       "methods=GET pathPrefixes=all gitPush=deny writeAction=ask",
     );
+  });
+});
+
+describe("hostServices", () => {
+  test("hostServices survive raw and change the generation only when present", () => {
+    const base = { hosts: ["api.example.com"], tokens: {} };
+    const without = validateNetworkPolicy(base);
+    const withEmpty = validateNetworkPolicy({ ...base, hostServices: {} });
+    const withIdb = validateNetworkPolicy({ ...base, hostServices: { idb: { target: "host-loopback", port: 10882 } } });
+    expect(withEmpty.generation).toBe(without.generation);
+    expect(withIdb.generation).not.toBe(without.generation);
+    expect(withIdb.raw.hostServices).toEqual({ idb: { target: "host-loopback", port: 10882 } });
+    expect(withIdb.hostServices).toEqual({ idb: { target: "host-loopback", port: 10882 } });
+    expect(without.hostServices).toEqual({});
+    expect(withEmpty.raw).not.toHaveProperty("hostServices");
+    expect(withIdb.allowedHosts).toEqual(without.allowedHosts);
+  });
+
+  test("the reserved suffix is refused in stored hosts, credential hosts and request keys", () => {
+    expect(validationIssues({ hosts: ["x.runfree.internal"], tokens: {} }).join("\n")).toContain("reserved");
+    expect(validationIssues({
+      hosts: ["api.example.com"],
+      tokens: { t: { description: "d", credentials: [{ host: "x.runfree.internal", header: "Authorization", scheme: "bearer" }] } },
+    }).join("\n")).toContain("reserved");
+    expect(validationIssues({ hosts: ["api.example.com"], tokens: {}, requests: { "x.runfree.internal": { methods: ["GET"] } } }).join("\n")).toContain("reserved");
   });
 });

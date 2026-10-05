@@ -194,6 +194,15 @@ describe("denial event emitter", () => {
     });
   }
 
+  test("a host-service denial carries its port; an invalid port is dropped; ports coalesce separately", () => {
+    const { emitter, lines } = emitterWithClock();
+    emitter.emit({ reason: "host-service-not-configured", host: "idb.runfree.internal", port: 10882, generation: GENERATION_A });
+    emitter.emit({ reason: "host-service-not-configured", host: "idb.runfree.internal", port: 70000, generation: GENERATION_A });
+    const events = lines.map((line) => JSON.parse(line.slice("proxy-denial: ".length)) as Record<string, unknown>);
+    expect(events[0]).toMatchObject({ reason: "host-service-not-configured", host: "idb.runfree.internal", port: 10882 });
+    expect(events[1]).not.toHaveProperty("port");
+  });
+
   test("emits exactly one schema-versioned structured event per denial", () => {
     const { emitter, lines } = emitterWithClock();
     emitter.emit({

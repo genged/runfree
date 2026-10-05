@@ -7,6 +7,7 @@
     "./effective-control": "./src/effective-control.ts",
     "./desired-network-policy": "./src/desired-network-policy.ts",
     "./network-policy": "./src/network-policy.ts",
+    "./host-services": "./src/host-services.ts",
     "./mcp-operation-policy": "./src/mcp-operation-policy.ts",
     "./oauth-mediation-policy": "./src/oauth-mediation-policy.ts",
     "./proxy-status": "./src/proxy-status.ts",

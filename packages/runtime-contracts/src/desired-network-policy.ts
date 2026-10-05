@@ -1,8 +1,10 @@
 
 
+import type { HostServicesJson } from "./host-services.js";
 import {
   normalizeHostname,
   normalizePathPrefix,
+  isIpLiteralHostname,
   validateNetworkPolicy,
   type PolicyJson,
   type RequestPolicyJson,
@@ -65,6 +67,7 @@ export type DesiredServiceEntry = {
 
 export type DesiredNetworkPolicyJson = {
   hosts: string[];
+  hostServices?: HostServicesJson;
   requests?: Record<string, RequestPolicyJson>;
   services?: Record<string, DesiredServiceEntry>;
   tokens?: Record<string, TokenPolicyJson>;
@@ -371,7 +374,7 @@ function validateServiceEntry(value: unknown, serviceId: string, issues: string[
 export function validateDesiredNetworkPolicy(raw: unknown): DesiredNetworkPolicyJson {
   const issues: string[] = [];
   if (!isRecord(raw)) throw new DesiredNetworkPolicyValidationError(["policy must be a JSON object"]);
-  exactKeys(raw, ["hosts", "requests", "services", "tokens", "version", "writeApproval"], "", issues);
+  exactKeys(raw, ["hosts", "hostServices", "requests", "services", "tokens", "version", "writeApproval"], "", issues);
   if (raw.version !== DESIRED_NETWORK_POLICY_VERSION) issues.push(`version must be ${DESIRED_NETWORK_POLICY_VERSION}`);
   let direct: ReturnType<typeof validateNetworkPolicy> | undefined;
   try {
@@ -380,6 +383,7 @@ export function validateDesiredNetworkPolicy(raw: unknown): DesiredNetworkPolicy
       ...(raw.requests === undefined ? {} : { requests: raw.requests }),
       ...(raw.tokens === undefined ? {} : { tokens: raw.tokens }),
       ...(raw.writeApproval === undefined ? {} : { writeApproval: raw.writeApproval }),
+      ...(raw.hostServices === undefined ? {} : { hostServices: raw.hostServices }),
     });
   } catch (error) {
     if (error && typeof error === "object" && "issues" in error && Array.isArray(error.issues)) {
@@ -399,6 +403,12 @@ export function validateDesiredNetworkPolicy(raw: unknown): DesiredNetworkPolicy
       }
     }
   }
+  // Policy hosts are exact names (R20): an IP literal would skip the
+  // resolver snapshot. Requests and credentials must name an allowlisted
+  // host, so refusing it here covers every stored host position.
+  for (const host of direct?.allowedHosts ?? []) {
+    if (isIpLiteralHostname(host)) issues.push(`${host} is an IP address; policy hosts must be hostnames`);
+  }
   if (!direct || issues.length > 0) throw new DesiredNetworkPolicyValidationError(issues);
   return {
     version: DESIRED_NETWORK_POLICY_VERSION,
@@ -407,6 +417,7 @@ export function validateDesiredNetworkPolicy(raw: unknown): DesiredNetworkPolicy
     ...(Object.keys(direct.requests).length > 0 ? { requests: direct.requests } : {}),
     ...(Object.keys(direct.tokens).length > 0 ? { tokens: direct.tokens } : {}),
     ...(direct.writeApproval ? { writeApproval: direct.writeApproval } : {}),
+    ...(Object.keys(direct.hostServices).length > 0 ? { hostServices: direct.hostServices } : {}),
   };
 }
 
@@ -425,5 +436,6 @@ export function desiredPolicyDirectProjection(policy: DesiredNetworkPolicyJson):
     ...(validated.requests ? { requests: validated.requests } : {}),
     ...(validated.tokens ? { tokens: validated.tokens } : {}),
     ...(validated.writeApproval ? { writeApproval: validated.writeApproval } : {}),
+    ...(validated.hostServices ? { hostServices: validated.hostServices } : {}),
   };
 }

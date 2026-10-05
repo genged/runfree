@@ -12,9 +12,13 @@ import {
   containerLogs,
   dockerNetworkGateways,
   dockerOptionIsTrue,
+  hostGatewayTcpProbeCommand,
   validateProxyFirewall,
+  type EffectiveHostServices,
   type WarmFirewallEvidence,
 } from "./probes.ts";
+import { HOST_SERVICE_GATEWAY_ALIAS } from "@runfree/runtime-contracts/host-services";
+import { remedy } from "../remedies.ts";
 import {
   applyDenyProbeBatchResult,
   denyProbeBatchScript,
@@ -62,11 +66,21 @@ export type RuntimeTopologyOptions = {
    * Evidence a warm launch already fetched (sub-second launch plan Task 2):
    * with it the validator issues no Docker call and judges exactly these
    * objects and outputs with the same checks as the full path. The deny-probe
-   * helper, the server-UID denial batch, and the root DNS liveness probe do
-   * not run on this path.
+   * helper, the server-UID denial batch, the root DNS liveness probe, and the
+   * proxy-position host gateway probes do not run on this path.
    */
   warmEvidence?: WarmTopologyEvidence;
+  /**
+   * The effective policy's host services, read on the host. With them the
+   * firewall proof requires `@host_service` to hold exactly these ports at
+   * the published gateway, and the gateway port probes run. Startup always
+   * passes them.
+   */
+  effectiveHostServices?: EffectiveHostServices;
 };
+
+/** The one `ExtraHosts` entry the proxy service carries (compose.yaml, literal). */
+export const PROXY_EXTRA_HOSTS = [`${HOST_SERVICE_GATEWAY_ALIAS}:host-gateway`] as const;
 
 export type WarmTopologyEvidence = Readonly<{
   proxyId: string;
@@ -101,6 +115,7 @@ export const REQUIRED_TOPOLOGY_ASSERTIONS: readonly TopologyAssertionInventoryEn
   { code: "agent-net-raw-dropped", source: "docker-inspect" },
   { code: "proxy-net-admin-shape", source: "docker-inspect" },
   { code: "proxy-net-raw-dropped", source: "docker-inspect" },
+  { code: "proxy-extra-hosts-exact", source: "docker-inspect" },
   { code: "agent-pid1-identity", source: "exec-probe" },
   { code: "agent-no-new-privileges", source: "exec-probe" },
   { code: "git-layout-container-proof", source: "git-proof" },
@@ -110,6 +125,7 @@ export const REQUIRED_TOPOLOGY_ASSERTIONS: readonly TopologyAssertionInventoryEn
   { code: "agent-default-route-denied", source: "exec-probe" },
   { code: "agent-host-gateway-denied", source: "exec-probe" },
   { code: "agent-gateway-reachability-denied", source: "exec-probe" },
+  { code: "agent-host-gateway-port-denied", source: "exec-probe" },
   { code: "raw-connect-disallowed-host-denied", source: "proxy-probe" },
   { code: "raw-connect-non-443-denied", source: "proxy-probe" },
   { code: "proxy-egress-route", source: "exec-probe" },
@@ -127,6 +143,12 @@ export function formatTopologyIssues(issues: readonly RuntimeTopologyIssue[]): s
 }
 
 function codeForTopologyMessage(message: string): string {
+  // Host-service gateway checks first: their labels share prefixes with the
+  // older proxy and agent-position families below.
+  if (message.startsWith("proxy ExtraHosts") || message.startsWith("proxy /etc/hosts")) return "proxy-extra-hosts-exact";
+  if (message.startsWith("agent-position host gateway port")
+    || message.startsWith("proxy-position server UID host gateway")
+    || message.startsWith("proxy-position root host gateway")) return "agent-host-gateway-port-denied";
   if (message.startsWith("agent container")) return "agent-container-exists";
   if (message.startsWith("proxy container")) return "proxy-container-exists";
   if (message.startsWith("agent networks") || message.includes("agent_internal must contain agent") || message.includes("agent_internal must contain proxy")) return "agent-network-count";
@@ -279,6 +301,19 @@ function validateContainerShape(
   }
 }
 
+/**
+ * The proxy's `ExtraHosts` is the daemon-sourced gateway alias and nothing
+ * else (design "Gateway address", SR17). It comes from the host-owned Compose
+ * template, so a difference is drift, not an agent action: it refuses, and
+ * recreating the proxy from the template (`runfree rebuild`) reclaims it.
+ */
+function validateProxyExtraHosts(issues: string[], proxy: DockerContainerInspect): void {
+  const actual = proxy.HostConfig?.ExtraHosts;
+  const list = Array.isArray(actual) ? actual : [];
+  if (list.length === PROXY_EXTRA_HOSTS.length && list.every((entry, index) => entry === PROXY_EXTRA_HOSTS[index])) return;
+  issues.push(`proxy ExtraHosts must be exactly ${PROXY_EXTRA_HOSTS.join(", ")}; got ${list.length > 0 ? list.join(", ") : "<none>"}; run \`${remedy.rebuild()}\` to recreate the proxy`);
+}
+
 function validateProxyCapabilities(
   issues: string[],
   context: RuntimeContext,
@@ -372,13 +407,26 @@ export function validateRuntimeTopology(
   io: RuntimeIO,
   options: RuntimeTopologyOptions = {},
 ): RuntimeTopologyIssue[] {
-  return validateRuntimeTopologyWithProof(input, io, options).issues;
+  return validateTopology(input, io, options).issues;
 }
 
+/**
+ * The validation startup and the warm proof run. `effectiveHostServices` is
+ * required here so no caller can skip the host-service proof (SR10) by
+ * omitting it; only the issue-list `validateRuntimeTopology` leaves it out.
+ */
 export function validateRuntimeTopologyWithProof(
   input: RuntimeContext | ActiveRuntimePlan,
   io: RuntimeIO,
-  options: RuntimeTopologyOptions = {},
+  options: RuntimeTopologyOptions & { effectiveHostServices: EffectiveHostServices },
+): RuntimeTopologyValidationResult {
+  return validateTopology(input, io, options);
+}
+
+function validateTopology(
+  input: RuntimeContext | ActiveRuntimePlan,
+  io: RuntimeIO,
+  options: RuntimeTopologyOptions,
 ): RuntimeTopologyValidationResult {
   const context = topologyContext(input);
   const client = createDockerClient(io, dockerClientEnvOptions(context));
@@ -424,6 +472,7 @@ export function validateRuntimeTopologyWithProof(
   const beforeShape = messages.length;
   validateContainerShape(messages, "proxy", proxy, [internalNetwork, egressNetwork]);
   if (messages.length > beforeShape) options.onBoundaryViolation?.();
+  validateProxyExtraHosts(messages, proxy);
 
   const proxyStateIssue = containerStateIssue("proxy", proxy);
   if (proxyStateIssue) {
@@ -525,6 +574,20 @@ export function validateRuntimeTopologyWithProof(
     messages.push(`proxy egress IP must be ${runtimeNetwork.proxyEgressIp}; got ${proxyEgress?.IPAddress || "<none>"}`);
   }
 
+  // The firewall proof fetches and validates the live kernel nft table. It runs
+  // before the deny-by-default minting on purpose: the post-cutover observation
+  // is minted from that SAME validated fetch (no second `nft list`), so the
+  // ruleset must be captured and proven first. It also runs before the
+  // agent-position probes, which need the host-service gateway it reads.
+  topologyProgress(options, "checking proxy firewall");
+  const firewallProof = validateProxyFirewall(messages, context, io, proxyId, runtimeNetwork, {
+    onProbe: (label) => topologyVerbose(options, label),
+    onBoundaryViolation: options.onBoundaryViolation,
+    expectedEgressSource: proxyEgress?.IPAddress,
+    ...(warm ? { warm: warm.firewall } : {}),
+    ...(options.effectiveHostServices ? { effectiveHostServices: options.effectiveHostServices } : {}),
+  });
+
   if (isActiveRuntimePlan(input) && network?.Id !== undefined && !warm) {
     // Per-session confinement of the agent *position*: the same direct-egress
     // denial probes, run in ONE ephemeral helper on agent_internal rather than
@@ -555,6 +618,24 @@ export function validateRuntimeTopologyWithProof(
         label: `agent-position Docker bridge gateway ${gateway} TCP reachability`,
         command: `timeout 3 bash -c '</dev/tcp/${gateway}/80'`,
       });
+    }
+    // Each approved host-service port at the pinned gateway must stay
+    // unreachable from the agent position: only the proxy's uid 1001 may
+    // dial it. With no published gateway there is no address to probe.
+    const hostGateway = firewallProof.hostServiceGatewayIp;
+    if (hostGateway !== undefined) {
+      for (const port of options.effectiveHostServices?.ports ?? []) {
+        // Same guard as the bridge gateways: the address is interpolated into
+        // a shell probe, so only a bare IPv4 literal reaches bash.
+        if (!/^\d{1,3}(\.\d{1,3}){3}$/u.test(hostGateway) || !Number.isInteger(port) || port < 1 || port > 65535) {
+          messages.push(`agent-position host gateway port ${port} denial probe did not run: the gateway is not IPv4 or the port is invalid`);
+          continue;
+        }
+        probeSpecs.push({
+          label: `agent-position host gateway port ${port}`,
+          command: hostGatewayTcpProbeCommand(hostGateway, port),
+        });
+      }
     }
     for (const spec of probeSpecs) topologyVerbose(options, `${spec.label} denial probe (batched)`);
     // The helper runs the untrusted agent image on agent_internal, so it is
@@ -593,18 +674,6 @@ export function validateRuntimeTopologyWithProof(
       applyDenyProbeBatchResult(messages, probeSpecs, batch, options.onBoundaryViolation, helperIp);
     }
   }
-
-  // The firewall proof fetches and validates the live kernel nft table. It runs
-  // before the deny-by-default minting on purpose: the post-cutover observation
-  // is minted from that SAME validated fetch (no second `nft list`), so the
-  // ruleset must be captured and proven first.
-  topologyProgress(options, "checking proxy firewall");
-  const firewallProof = validateProxyFirewall(messages, context, io, proxyId, runtimeNetwork, {
-    onProbe: (label) => topologyVerbose(options, label),
-    onBoundaryViolation: options.onBoundaryViolation,
-    expectedEgressSource: proxyEgress?.IPAddress,
-    ...(warm ? { warm: warm.firewall } : {}),
-  });
 
   // A denied port-443 host is no longer rejected at the raw CONNECT guard: the
   // proxy accepts the tunnel and serves a synthetic in-tunnel 403 (see the

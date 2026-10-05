@@ -10,20 +10,27 @@
 
 import fs from "node:fs";
 import {
+  parseHostServiceGatewayStatus,
   serializeGenerationStatus,
   type FirewallGenerationStatus,
+  type HostServiceGatewayStatus,
   type RequestProxyGenerationStatus,
 } from "@runfree/runtime-contracts/proxy-status";
 
+import { readOwnedRegularFile } from "./session-files.js";
+
 export type { FirewallGenerationStatus, RequestProxyGenerationStatus };
+
+export const HOST_SERVICE_GATEWAY_MAX_BYTES = 4096;
 
 // Atomic replace within the same tmpfs directory so a poll never observes a
 // torn write; the shared serializer guarantees the one-JSON-line framing the
 // CLI's exec-split reader depends on. Unique tmp name plus failure cleanup,
-// matching writeResolvedHostsFile.
+// matching writeResolvedHostsFile. The root supervisor also writes the
+// host-service gateway hand-off through here (root-owned, 0644, atomic).
 export function writeGenerationStatusFile(
   filePath: string,
-  status: FirewallGenerationStatus | RequestProxyGenerationStatus,
+  status: FirewallGenerationStatus | RequestProxyGenerationStatus | HostServiceGatewayStatus,
 ): void {
   const tmpPath = `${filePath}.${process.pid}.${Date.now().toString(36)}.tmp`;
   try {
@@ -32,5 +39,22 @@ export function writeGenerationStatusFile(
   } catch (error) {
     fs.rmSync(tmpPath, { force: true });
     throw error;
+  }
+}
+
+// The uid-1001 request proxy's reader of the gateway hand-off. The root
+// firewall supervisor is its only writer, in the root-owned status root. Read
+// it the same defended way as the session files (owner, regular file, no
+// symlink, single link, bounded size) and also refuse a group- or
+// other-writable file. Any failure reads as unavailable (`undefined`).
+export function readHostServiceGatewayStatusFile(filePath: string, ownerUid: number): HostServiceGatewayStatus | undefined {
+  try {
+    const stat = fs.lstatSync(filePath);
+    if ((stat.mode & 0o022) !== 0) return undefined;
+    const read = readOwnedRegularFile(filePath, ownerUid, HOST_SERVICE_GATEWAY_MAX_BYTES);
+    if (read.kind !== "ok") return undefined;
+    return parseHostServiceGatewayStatus(read.content);
+  } catch {
+    return undefined;
   }
 }

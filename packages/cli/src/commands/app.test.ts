@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -12,6 +12,58 @@ import type { RuntimeContext } from "../runtime/types.ts";
 import { runAgentCommandWithControlPlaneRebindRefusal, runCommandApp } from "./app.ts";
 import { approvalsInputFromArgs, runUp, runtimeContextWithSessionName } from "./runtime.ts";
 import type { RunfreeCommandContext } from "./context.ts";
+import { projectInfo } from "../config.ts";
+import { approveNetworkCandidate, approveRuntimeIsolationControl } from "../control/approvals.ts";
+import { captureDesiredPolicyCandidate } from "../control/candidates.ts";
+import { publishEffectivePolicyGeneration } from "../control/effective.ts";
+import { mutateDesiredHostService } from "../control/host-service-mutation.ts";
+import { controlPlaneEffectiveSelectionPathV2 } from "../runtime/component-state-v2.ts";
+import { readHostServicePortRegistry } from "../host-service-registry.ts";
+import type { HostPortOwner, HostServicePortAdmission } from "../host-service-port-owner.ts";
+import type { ControlActivationResult } from "../control/activation.ts";
+
+// Seams for the host-service command tests: the lsof probe and the activation
+// are host/Docker facing, the registry write is spied. Each passes through to
+// the real module unless a test arms it.
+const hostServiceSeams = vi.hoisted(() => ({
+  admit: undefined as undefined | ((port: number) => HostServicePortAdmission),
+  probe: undefined as undefined | ((port: number) => HostPortOwner),
+  activate: undefined as undefined | (() => Promise<ControlActivationResult>),
+  recorded: [] as Array<{ ports: readonly number[]; owners?: Readonly<Record<number, string>> }>,
+  recordFails: false,
+}));
+
+vi.mock("../host-service-port-owner.ts", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../host-service-port-owner.ts")>();
+  return {
+    ...actual,
+    admitHostServicePort: (...args: Parameters<typeof actual.admitHostServicePort>) =>
+      hostServiceSeams.admit ? hostServiceSeams.admit(args[2]) : actual.admitHostServicePort(...args),
+    probeHostPortOwner: (...args: Parameters<typeof actual.probeHostPortOwner>) =>
+      hostServiceSeams.probe ? hostServiceSeams.probe(args[2]) : actual.probeHostPortOwner(...args),
+  };
+});
+
+vi.mock("../control/activation.ts", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../control/activation.ts")>();
+  return {
+    ...actual,
+    activateApprovedControlsAfterMutation: (...args: Parameters<typeof actual.activateApprovedControlsAfterMutation>) =>
+      hostServiceSeams.activate ? hostServiceSeams.activate() : actual.activateApprovedControlsAfterMutation(...args),
+  };
+});
+
+vi.mock("../host-service-registry.ts", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../host-service-registry.ts")>();
+  return {
+    ...actual,
+    recordProjectHostServicePorts: (...args: Parameters<typeof actual.recordProjectHostServicePorts>) => {
+      hostServiceSeams.recorded.push({ ports: args[2], ...(args[3] ? { owners: args[3] } : {}) });
+      if (hostServiceSeams.recordFails) return Promise.reject(new Error("host-service port registry lock is held"));
+      return actual.recordProjectHostServicePorts(...args);
+    },
+  };
+});
 
 const PROJECT_ROOT = "/tmp/runfree-app-test-project";
 const tempDirs: string[] = [];
@@ -1004,6 +1056,272 @@ describe("admin host command (Phase 4)", () => {
     expect(refusal.message).toContain("`runfree domain` has been removed");
     expect(refusal.message).toContain("runfree host add");
     expect(runDefault).not.toHaveBeenCalled();
+  });
+});
+
+describe("admin host-service command", () => {
+  afterEach(() => {
+    hostServiceSeams.admit = undefined;
+    hostServiceSeams.probe = undefined;
+    hostServiceSeams.activate = undefined;
+    hostServiceSeams.recorded = [];
+    hostServiceSeams.recordFails = false;
+  });
+
+  test("bare host-service shows the group's own usage as a usage error", async () => {
+    const runDefault = vi.fn(async () => 0);
+
+    const usage = await cliRefusal(runCommandApp(strictContext(), ["host-service"], runDefault));
+    expect(usage.message).toBe("runfree host-service needs a subcommand");
+    expect(usage.detail).toContain("runfree host-service add");
+    expect(usage.detail).not.toContain("runfree host add");
+    expect(usage.detail).not.toContain("runfree credential add");
+    expect(runDefault).not.toHaveBeenCalled();
+  });
+
+  test("host-service --help prints usage without touching project state", async () => {
+    const out = captureStdout();
+
+    const status = await runCommandApp(strictContext(), ["host-service", "--help"], vi.fn(async () => 0));
+
+    expect(status).toBe(0);
+    expect(out.text()).toContain("Commands:");
+    expect(out.text()).toContain("runfree host-service add");
+  });
+
+  test("rejects unknown subcommands and flags before enforcement", async () => {
+    for (const args of [
+      ["host-service", "bogus"],
+      ["host-service", "add"],
+      ["host-service", "add", "idb"],
+      ["host-service", "add", "idb", "--port"],
+      ["host-service", "add", "idb", "--port", "10882", "--bogus"],
+      ["host-service", "remove"],
+      ["host-service", "remove", "idb", "--port", "10882"],
+      ["host-service", "list", "--bad"],
+    ]) {
+      await expect(runCommandApp(strictContext(), args, vi.fn(async () => 0)), args.join(" ")).rejects.toBeInstanceOf(CliError);
+    }
+  });
+
+  test("--port must be canonical decimal from 1 to 65535, refused at parse", async () => {
+    for (const port of ["010", "70000", "0", "-1", "1e3", "0x2a", "10882.0", "65536", " 10882", "abc"]) {
+      await expect(
+        runCommandApp(strictContext(), ["host-service", "add", "idb", "--port", port], vi.fn(async () => 0)),
+        port,
+      ).rejects.toBeInstanceOf(CliError);
+    }
+    await expect(
+      runCommandApp(strictContext(), ["host-service", "add", "idb", "--port", "10882", "--port", "10883"], vi.fn(async () => 0)),
+    ).rejects.toBeInstanceOf(CliError);
+    for (const port of ["1", "10882", "65535"]) {
+      await expect(
+        runCommandApp(strictContext(), ["host-service", "add", "idb", "--port", port, "--no-reload"], vi.fn(async () => 0)),
+      ).rejects.toThrow("runtimeContext() must not be called");
+    }
+  });
+
+  describe("against a project", () => {
+    let root: string;
+    let stateHome: string;
+    let env: NodeJS.ProcessEnv;
+
+    function projectContext(): RunfreeCommandContext {
+      return strictContext({
+        env,
+        projectRoot: root,
+        runtimeContext: () => ({ projectRoot: root, project: projectInfo(root, env), runtimeRoot: path.join(root, "runtime"), env }),
+      });
+    }
+
+    function publish(): string {
+      const project = projectInfo(root, env);
+      approveRuntimeIsolationControl(root, project, "interactive");
+      return publishEffectivePolicyGeneration(root, project, { runtimeNetwork: { subnet: "172.30.1.0/24" } }).controlGeneration;
+    }
+
+    beforeEach(() => {
+      root = fs.mkdtempSync(path.join(os.tmpdir(), "runfree-app-host-service-"));
+      stateHome = fs.mkdtempSync(path.join(os.tmpdir(), "runfree-app-host-service-state-"));
+      tempDirs.push(root, stateHome);
+      fs.mkdirSync(path.join(root, ".runfree"));
+      fs.writeFileSync(path.join(root, ".runfree", "network-policy.json"), '{"version":2,"hosts":["example.com"]}\n');
+      env = {
+        XDG_STATE_HOME: stateHome,
+        XDG_CONFIG_HOME: path.join(stateHome, "config"),
+        RUNFREE_TEST_HOST_BOOT_ID: "linux:11111111-2222-3333-4444-555555555555",
+        RUNFREE_TEST_HOST_PROCESS_START: "linux:12345",
+      };
+      const project = projectInfo(root, env);
+      const candidate = captureDesiredPolicyCandidate(root, project.paths.controlCandidatesDir);
+      approveNetworkCandidate(root, project, candidate, "network-project", "interactive");
+      approveNetworkCandidate(root, project, candidate, "network-local", "interactive");
+      hostServiceSeams.admit = () => ({ ok: true, owner: { command: "idb_companion", pid: 4242 } });
+    });
+
+    test("add prints the reviewed owner and the agent address", async () => {
+      const out = captureStdout();
+
+      const status = await runCommandApp(projectContext(), ["host-service", "add", "idb", "--port", "10882", "--no-reload"], vi.fn(async () => 0));
+
+      expect(status).toBe(0);
+      expect(out.text()).toContain("approved host service idb: 127.0.0.1:10882 (idb_companion, pid 4242)");
+      expect(out.text()).toContain("agent address: 127.0.0.1:10882 (relay in new sessions)");
+      expect(out.text()).toContain("effective policy: unchanged (--no-reload)");
+      // --no-reload selects nothing, so nothing new is effective to record.
+      expect(hostServiceSeams.recorded).toEqual([]);
+    });
+
+    test("an admission refusal exits non-zero before the policy write", async () => {
+      hostServiceSeams.admit = (port) => ({ ok: false, reason: `no process listens on 127.0.0.1:${port}` });
+      const before = fs.readFileSync(path.join(root, ".runfree", "network-policy.json"), "utf8");
+
+      const refusal = await cliRefusal(runCommandApp(projectContext(), ["host-service", "add", "idb", "--port", "10882"], vi.fn(async () => 0)));
+
+      expect(refusal.message).toContain("no process listens on 127.0.0.1:10882");
+      expect(fs.readFileSync(path.join(root, ".runfree", "network-policy.json"), "utf8")).toBe(before);
+      expect(hostServiceSeams.recorded).toEqual([]);
+    });
+
+    test("add with reload records the new effective ports and the owner in the registry", async () => {
+      hostServiceSeams.activate = async () => ({ kind: "selected", controlGeneration: publish() });
+      captureStdout();
+
+      await runCommandApp(projectContext(), ["host-service", "add", "idb", "--port", "10882"], vi.fn(async () => 0));
+
+      expect(hostServiceSeams.recorded).toEqual([{ ports: [10882], owners: { 10882: "idb_companion" } }]);
+      const registry = readHostServicePortRegistry(env);
+      expect(registry.ok && registry.owners.get(10882)?.[0]).toMatchObject({
+        projectId: projectHash(root),
+        projectRoot: root,
+        command: "idb_companion",
+      });
+
+      // remove with reload prunes the port from the registry.
+      await runCommandApp(projectContext(), ["host-service", "remove", "idb"], vi.fn(async () => 0));
+      expect(hostServiceSeams.recorded.at(-1)).toEqual({ ports: [] });
+      const pruned = readHostServicePortRegistry(env);
+      expect(pruned.ok && pruned.owners.has(10882)).toBe(false);
+    });
+
+    test("a registry write failure after the policy applied exits non-zero with the repair remedy", async () => {
+      hostServiceSeams.activate = async () => ({ kind: "selected", controlGeneration: publish() });
+      hostServiceSeams.recordFails = true;
+      captureStdout();
+
+      const refusal = await cliRefusal(runCommandApp(projectContext(), ["host-service", "add", "idb", "--port", "10882"], vi.fn(async () => 0)));
+
+      expect(refusal.message).toContain("the policy change is saved, but the host-service port registry was not updated");
+      expect(refusal.message).toContain("host-service port registry lock is held");
+      expect(refusal.message).toContain("rebuild it with: runfree host-service list --repair");
+      // The policy change itself stays applied.
+      expect(JSON.parse(fs.readFileSync(path.join(root, ".runfree", "network-policy.json"), "utf8"))).toMatchObject({
+        hostServices: { idb: { target: "host-loopback", port: 10882 } },
+      });
+      expect(hostServiceSeams.recorded).toEqual([{ ports: [10882], owners: { 10882: "idb_companion" } }]);
+    });
+
+    test("list prints one row per effective service with its current owner", async () => {
+      const runtime = projectContext().runtimeContext();
+      await mutateDesiredHostService(runtime, {} as never, "project", { kind: "add", name: "idb", port: 10882 }, {
+        admit: () => ({ ok: true, owner: { command: "idb_companion", pid: 4242 } }),
+      });
+      await mutateDesiredHostService(runtime, {} as never, "project", { kind: "add", name: "sim", port: 10883 }, {
+        admit: () => ({ ok: true, owner: { command: "sim", pid: 1 } }),
+      });
+      publish();
+      hostServiceSeams.probe = (port) => port === 10882
+        ? { kind: "listener", command: "idb_companion", pid: 4242, count: 1, commands: ["idb_companion"], listeners: [{ command: "idb_companion", pid: 4242, addresses: ["127.0.0.1:10882"] }] }
+        : { kind: "none" };
+      const out = captureStdout();
+
+      expect(await runCommandApp(projectContext(), ["host-service", "list"], vi.fn(async () => 0))).toBe(0);
+
+      const lines = out.text().split("\n");
+      expect(lines[0]).toMatch(/^NAME\s+PORT\s+OWNER$/u);
+      expect(lines[1]).toMatch(/^idb\s+10882\s+idb_companion \(pid 4242\)$/u);
+      expect(lines[2]).toMatch(/^sim\s+10883\s+no listener$/u);
+      expect(lines).toHaveLength(3);
+    });
+
+    /** A live control-plane selection: what a running (not destroyed) project has. */
+    function markRuntimeLive(stateRoot: string): string {
+      const selection = controlPlaneEffectiveSelectionPathV2(path.join(stateRoot, "projects", projectHash(root)));
+      fs.mkdirSync(path.dirname(selection), { recursive: true });
+      fs.writeFileSync(selection, "{}\n");
+      return selection;
+    }
+
+    async function repairSetup(): Promise<string> {
+      await mutateDesiredHostService(projectContext().runtimeContext(), {} as never, "project", { kind: "add", name: "idb", port: 10882 }, {
+        admit: () => ({ ok: true, owner: { command: "idb_companion", pid: 4242 } }),
+      });
+      publish();
+      const stateRoot = path.join(stateHome, "runfree");
+      fs.writeFileSync(
+        path.join(stateRoot, "projects", projectHash(root), "project.json"),
+        `${JSON.stringify({ projectRoot: root, updatedAt: "2026-10-04T00:00:00.000Z" })}\n`,
+      );
+      fs.writeFileSync(path.join(stateRoot, "host-service-ports.json"), "{corrupt");
+      return stateRoot;
+    }
+
+    test("list --repair does not restore the row of a destroyed project (no control-plane selection)", async () => {
+      await repairSetup();
+      const out = captureStdout();
+
+      const status = await runCommandApp(strictContext({ env }), ["host-service", "list", "--repair"], vi.fn(async () => 0));
+
+      expect(status).toBe(0);
+      expect(out.text()).toContain("host-service port registry rebuilt: 0 port(s) from 0 project(s)");
+      const registry = readHostServicePortRegistry(env);
+      expect(registry.ok && registry.owners.has(10882)).toBe(false);
+    });
+
+    test("list --repair refuses to write and exits non-zero when a live project's ports cannot be read, then recovers", async () => {
+      const stateRoot = await repairSetup();
+      markRuntimeLive(stateRoot);
+      const project = projectInfo(root, env);
+      const activePath = path.join(project.paths.controlProxyDir, "active.json");
+      const activeBytes = fs.readFileSync(activePath, "utf8");
+      fs.chmodSync(activePath, 0o600);
+      fs.writeFileSync(activePath, "{not json");
+
+      await expect(runCommandApp(strictContext({ env }), ["host-service", "list", "--repair"], vi.fn(async () => 0)))
+        .rejects.toThrow(new RegExp(`host-service port registry was not rebuilt[\\s\\S]*${root.replace(/[/.]/g, "\\$&")}[\\s\\S]*runfree host-service list --repair`, "u"));
+      // Nothing written: the corrupt file is untouched and still refuses.
+      expect(fs.readFileSync(path.join(stateRoot, "host-service-ports.json"), "utf8")).toBe("{corrupt");
+
+      // Reclaim: the project's state is readable again.
+      fs.writeFileSync(activePath, activeBytes);
+      const out = captureStdout();
+      expect(await runCommandApp(strictContext({ env }), ["host-service", "list", "--repair"], vi.fn(async () => 0))).toBe(0);
+      expect(out.text()).toContain("host-service port registry rebuilt: 1 port(s) from 1 project(s)");
+    });
+
+    test("list --repair rebuilds a corrupt registry from each project's selected effective policy generation", async () => {
+      await mutateDesiredHostService(projectContext().runtimeContext(), {} as never, "project", { kind: "add", name: "idb", port: 10882 }, {
+        admit: () => ({ ok: true, owner: { command: "idb_companion", pid: 4242 } }),
+      });
+      publish();
+      const stateRoot = path.join(stateHome, "runfree");
+      fs.writeFileSync(
+        path.join(stateRoot, "projects", projectHash(root), "project.json"),
+        `${JSON.stringify({ projectRoot: root, updatedAt: "2026-10-04T00:00:00.000Z" })}\n`,
+      );
+      markRuntimeLive(stateRoot);
+      fs.writeFileSync(path.join(stateRoot, "host-service-ports.json"), "{corrupt");
+      expect(readHostServicePortRegistry(env).ok).toBe(false);
+      const out = captureStdout();
+
+      // The reclaim is host-global: it never needs this checkout's project context.
+      const status = await runCommandApp(strictContext({ env }), ["host-service", "list", "--repair"], vi.fn(async () => 0));
+
+      expect(status).toBe(0);
+      expect(out.text()).toContain("host-service port registry rebuilt: 1 port(s) from 1 project(s)");
+      const registry = readHostServicePortRegistry(env);
+      expect(registry.ok && registry.owners.get(10882)?.[0]).toMatchObject({ projectId: projectHash(root), projectRoot: root });
+    });
   });
 });
 

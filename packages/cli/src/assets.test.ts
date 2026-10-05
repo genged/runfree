@@ -55,6 +55,7 @@ describe("runtime asset materialization", () => {
     expect(containerPaths).toContain("runtime/agent/codex-runfree.sh");
     expect(containerPaths).toContain("runtime/agent/session-entry.sh");
     expect(containerPaths).toContain("runtime/agent/session-ready-probe.cjs");
+    expect(containerPaths).toContain("runtime/agent/host-service-relay.cjs");
     expect(containerPaths).toContain("runtime/proxy/package-lock.json");
     expect(containerPaths).toContain("runtime/proxy/server.js");
     expect(containerPaths).toContain("runtime/proxy/contracts/network-policy.js");

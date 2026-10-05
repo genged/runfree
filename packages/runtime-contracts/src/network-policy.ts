@@ -1,4 +1,7 @@
 
+import { isIP } from "node:net";
+
+import { isReservedRunfreeHostname, validateHostServices, type HostServicesJson } from "./host-services.js";
 import { isRecord, sha256Digest } from "./primitives.js";
 
 const INLINE_POLICY_LABEL = "<inline policy>";
@@ -42,6 +45,11 @@ export type PolicyJson = {
   // desired-policy default, then materializes it here so the proxy reads one
   // generation-hashed policy and never reads project config or desired input.
   writeApproval?: WriteAction;
+  // Approved agent access to a service on the Docker Desktop host's loopback
+  // (local/specs/2026-10-03-host-services-design.md). Present only when
+  // non-empty, so a policy with no host services keeps its pre-feature raw
+  // shape and generation.
+  hostServices?: HostServicesJson;
 };
 
 // Per-host request-shape rules. Absent fields mean "unrestricted"; the whole
@@ -104,6 +112,7 @@ export type LoadedNetworkPolicy = {
   credentialMappings: CredentialMapping[];
   requests: Record<string, RequestPolicyJson>;
   writeApproval?: WriteAction;
+  hostServices: Readonly<HostServicesJson>;
 };
 
 export class PolicyValidationError extends Error {
@@ -219,6 +228,20 @@ export function pathMatchesPrefix(pathName: string, pathPrefix: string): boolean
   return pathName.startsWith(childPrefix);
 }
 
+/**
+ * True for an IP literal in any form a resolver or dialer accepts: dotted
+ * IPv4, IPv6 (brackets already stripped), or a name whose last label is a
+ * number (WHATWG "ends in a number": decimal or hex). Policy hosts are exact
+ * names, and an IP literal skips the resolver snapshot when dialled (R20).
+ * Desired-policy validation refuses IP-literal hosts with it; the effective
+ * policy loader does not, so a host-compiled effective policy is unchanged.
+ */
+export function isIpLiteralHostname(host: string): boolean {
+  if (isIP(host) !== 0) return true;
+  const last = host.split(".").at(-1) ?? "";
+  return /^[0-9]+$/.test(last) || /^0x[0-9a-f]*$/i.test(last);
+}
+
 function validateStoredHost(value: string, issues: string[]): string | undefined {
   if (value !== value.toLowerCase()) {
     issues.push(`${value} must be stored lowercase`);
@@ -234,6 +257,9 @@ function validateStoredHost(value: string, issues: string[]): string | undefined
 
   if (host !== value) {
     issues.push(`${value} must be stored as exact normalized hostname ${host}`);
+  }
+  if (isReservedRunfreeHostname(host)) {
+    issues.push(`${host} uses the reserved runfree.internal suffix`);
   }
   return host;
 }
@@ -270,6 +296,7 @@ function policyGeneration(
   tokens: Record<string, TokenPolicyJson>,
   requests: Record<string, RequestPolicyJson>,
   writeApproval: WriteAction | undefined,
+  hostServices: HostServicesJson,
 ): string {
   const normalizedTokens = Object.fromEntries(Object.entries(tokens)
     .sort(([left], [right]) => compareStableText(left, right))
@@ -304,14 +331,18 @@ function policyGeneration(
           : {}),
       },
     ]));
+  const normalizedHostServices = Object.fromEntries(Object.entries(hostServices)
+    .sort(([left], [right]) => compareStableText(left, right)));
   const payload = {
     allowedHosts: [...allowedHosts].sort(compareStableText),
     tokens: normalizedTokens,
     // Only present when rules exist so request-less policies keep the exact
     // pre-request-shape generation for unchanged inputs. The same holds for
-    // writeApproval: absent means the pre-tri-state generation is preserved.
+    // writeApproval and hostServices: absent means the pre-feature generation
+    // is preserved for unchanged inputs.
     ...(Object.keys(normalizedRequests).length > 0 ? { requests: normalizedRequests } : {}),
     ...(writeApproval !== undefined ? { writeApproval } : {}),
+    ...(Object.keys(normalizedHostServices).length > 0 ? { hostServices: normalizedHostServices } : {}),
   };
   return sha256Digest(JSON.stringify(payload));
 }
@@ -540,6 +571,9 @@ export function validateNetworkPolicy(raw: unknown, policyPath = INLINE_POLICY_L
           issues.push(`${prefix}.host ${host}: ${error instanceof Error ? error.message : String(error)}`);
           continue;
         }
+        if (isReservedRunfreeHostname(host)) {
+          issues.push(`${prefix}.host ${host} uses the reserved runfree.internal suffix`);
+        }
         if (!allowedHostSet.has(host)) {
           issues.push(`${prefix}.host ${host} is credentialed but not allowlisted`);
         }
@@ -640,6 +674,9 @@ export function validateNetworkPolicy(raw: unknown, policyPath = INLINE_POLICY_L
         issues.push(`${prefix} must be stored as exact normalized hostname ${normalizedHost}`);
         continue;
       }
+      if (isReservedRunfreeHostname(host)) {
+        issues.push(`${prefix} uses the reserved runfree.internal suffix`);
+      }
       if (!allowedHostSet.has(host)) {
         issues.push(`${prefix} has request rules but is not allowlisted`);
       }
@@ -737,20 +774,27 @@ export function validateNetworkPolicy(raw: unknown, policyPath = INLINE_POLICY_L
     }
   }
 
+  const rawHostServices = raw.hostServices;
+  const hostServices: HostServicesJson = rawHostServices !== undefined
+    ? validateHostServices(rawHostServices, "hostServices", issues)
+    : {};
+
   if (issues.length > 0) throw new PolicyValidationError(issues);
 
   return {
     policyPath,
-    generation: policyGeneration(allowedHosts, tokens, requests, writeApproval),
+    generation: policyGeneration(allowedHosts, tokens, requests, writeApproval, hostServices),
     raw: {
       hosts,
       tokens,
       ...(Object.keys(requests).length > 0 ? { requests } : {}),
       ...(writeApproval !== undefined ? { writeApproval } : {}),
+      ...(Object.keys(hostServices).length > 0 ? { hostServices } : {}),
     },
     allowedHosts,
     allowedHostSet,
     credentials,
+    hostServices,
     tokens,
     credentialMappings,
     requests,

@@ -73,13 +73,15 @@ effective policy, the proxy CA private key, and host files outside the project.
  |  agent state read-write         |   |  request proxy (uid 1001)    |
  |  /runfree/inbox read-only       |   |  tokens on proxy-only tmpfs  |
  |  CA cert only (no key)          |   |  session files (root-owned)  |
- |  placeholders, no real tokens   |   |                              |
+ |  placeholders, no real tokens   |   |  pinned host-service gateway |
+ |  host-service relay (loopback)  |   |                              |
  +---------------|-----------------+   +------|---------------|-------+
                  |   agent_internal            |               |
                  +---- (internal: true) -------+          proxy_egress
                      no route to internet                      |
                                                                v
-                                                  allowed HTTPS/WSS hosts
+                                   allowed HTTPS/WSS hosts; approved ports
+                                   on the host's loopback (uid 1001 only)
 ```
 
 - Each agent process runs in its own session container on `agent_internal`.
@@ -88,6 +90,11 @@ effective policy, the proxy CA private key, and host files outside the project.
 - Ingress forwarders (VNC, `runfree forward`, MCP OAuth callback) connect the
   host loopback to a session. They are one-way transport, not an authority
   boundary. See [Utility Participants](architecture.md#utility-participants).
+- Host services carry the agent to an approved port on the host's loopback.
+  The session relay holds no authority: the proxy admits only an exact
+  approved `<name>.runfree.internal:<port>` pair and splices it to the pinned
+  Docker Desktop gateway, and the firewall lets only the request proxy's
+  uid 1001 reach that pair. See [Host Services](architecture.md#host-services).
 - Proxy environment variables only route cooperative clients. They are not
   enforcement.
 
@@ -102,6 +109,10 @@ effective policy, the proxy CA private key, and host files outside the project.
 | `cat ~/.ssh/id_rsa`, `~/.aws/credentials` | file not found | not mounted |
 | `cat /etc/proxy-ca/*.key` | file not found | key mounted only in proxy |
 | Edits `.runfree/network-policy.json` | no effect | host approval of exact bytes |
+| Adds or re-ports a `hostServices` entry | no effect; never auto-approved | host review of every widening |
+| Connects to an approved host service at `127.0.0.1:<port>` | **allowed**, opaque bytes to the host port | `runfree host-service add` approval only |
+| CONNECTs to an unapproved `<name>.runfree.internal:<port>` | raw 403, no dial | proxy name and port pair check |
+| Dials the host gateway IP directly | no route | `agent_internal` has no egress; uid 1001-only firewall rule |
 | POSTs to an allowed host under `ask` | held for a host decision | write approval |
 | Uses an allowed token for a wrong purpose | **allowed** | token scope and request rules only |
 | Runs arbitrary code in the project | **allowed** | bounded by mounts and proxy |
@@ -115,12 +126,31 @@ point to the mechanism.
 
 1. The proxy checks policy **before** DNS lookup, credential read, OAuth
    mediation, and upstream connect. Plain HTTP, hosts not on the list, raw
-   tunnels, method or path violations, and unapproved writes stop there.
+   tunnels other than an approved host service, method or path violations,
+   and unapproved writes stop there.
 2. Hosts are exact names. No wildcards.
 3. The root firewall allows traffic to a destination only if it is in the DNS
-   allow set built from the same policy generation as the request proxy.
+   allow set built from the same policy generation as the request proxy, or
+   is an approved host-service pair (rule 6).
 4. Denied CONNECT requests get feedback in the tunnel. Denials go to
    `runfree doctor`.
+5. `runfree.internal` and every name under it are reserved. Every hostname
+   validator refuses them, and the proxy classifies them first, on every
+   port and in every mode, before any DNS lookup, audit spool write, or dial.
+6. Host services are opaque TCP tunnels, approved per exact name and port by
+   the host. No request rules, write approval, or credential injection apply
+   inside them. The firewall allows the pinned gateway and approved port
+   pairs to the request proxy's uid 1001 only; root and the agent get no path
+   to them. The gateway comes from the daemon's `extra_hosts` entry, never
+   from DNS, and never enters the DNS allow set. A removal, and a gateway
+   change or withdrawal, is cut by two independent consumers: the request
+   proxy destroys open splices immediately, and the firewall drops every
+   packet, from any uid, to a gateway it pinned on a pair that is not
+   currently approved, above the established-connection accept and with no
+   time limit. A port is admitted (a visible listener on `127.0.0.1` or `*`,
+   not Docker Desktop) on every host approval path, not only at
+   `host-service add`. IP-literal CONNECT hosts are never audit-passed, and
+   policy hosts cannot be IP literals.
 
 Order, hardening, and firewall rules:
 [Proxy Enforcement Details](architecture.md#proxy-enforcement-details).
@@ -407,6 +437,14 @@ Accepted, known risks:
 | VNC viewers parse display data from the agent | Use a maintained viewer and the default random password |
 | Transitive apt packages in runtime images can drift | The lock pins direct packages, but the apt sources are live archives |
 | Homebrew installs trust the tap formula and release assets | Use fully qualified installs; check checksums for script installs |
+| A host-service tunnel is opaque | No content audit, request rules, or write approval apply inside it; approve only services you would let the agent use freely |
+| An approved host service's own authentication and bugs are reachable from the agent | An approved `idb_companion` gives every session in the project full simulator control: install, launch, and file push and pull |
+| Host-service access is per project, not per session | Approval persists like an allowed host and applies to every session of the project |
+| Whatever holds an approved port on the host's loopback is reachable | If the approved service stops and another process takes the port, the agent reaches that process. The gateway reaches every host loopback listener, including root services, IDE servers, and other containers' published ports; the refused ports and the owner check at approval cover only the known dangerous cases. A root-owned listener is invisible to the unprivileged `lsof`, so it is refused only as "no visible listener", never identified |
+| A publication that appears on an approved port mid-session stays reachable; the next launch or `runfree status` only warns | Another project's `forward` and `vnc` refuse registered ports. A third-party publication on an approved port is reported by the next launch or `runfree status` owner check, which warns but neither refuses nor cuts |
+| A host gateway address change, or a withdrawn gateway, stops host services until `runfree rebuild` | Two independent cuts act at once: the request proxy destroys every open splice to the old or withdrawn address, and the firewall drops every flow to a gateway it pinned whose pair is not currently approved, for as long as that holds. New CONNECTs refuse with the named cause; `runfree rebuild` re-pins and drains every session |
+| The permanent firewall cut covers only gateways pinned by the running supervisor | The pinned-gateway set is in memory and the ruleset install recreates it empty, so a proxy restart forgets earlier gateways. A restart also recreates the whole table, so no earlier flow is accepted by it; the cut matters only within one supervisor lifetime |
+| New host-service CONNECTs refuse for about 2 s after any policy reload | The request proxy dials only when the gateway file names its current effective policy generation; until the supervisor republishes the file on its next maintenance pass, a new CONNECT refuses with `host-service-unavailable`. Open splices are not affected |
 
 Approving a write, allowing a broad host, or adding a credential gives the
 agent real power upstream. Treat each one as a security decision.

@@ -2,9 +2,27 @@
 import net from "node:net";
 
 import { type RuntimeNetwork } from "../network.ts";
-import { validateProxyNftablesTableJson, type ProxyNftablesProofInput } from "../proxy-nftables-proof.ts";
+import {
+  parseHostServiceSetMembers,
+  validateProxyNftablesTableJson,
+  type ProxyNftablesProofInput,
+} from "../proxy-nftables-proof.ts";
+import { remedy } from "../remedies.ts";
 import { PROXY_SERVER_UID } from "@runfree/proxy/firewall/nftables";
+import { HOST_SERVICE_GATEWAY_STATUS_FILE } from "@runfree/runtime-contracts/host-services";
+import {
+  DEFAULT_PROXY_STATUS_DIR,
+  hostServiceEntryKey,
+  parseHostServiceGatewayStatus,
+  type HostServiceSetEntry,
+} from "@runfree/runtime-contracts/proxy-status";
 import { runDockerExec, runDockerExecProxyServer, runDockerExecRoot } from "./attach.ts";
+import {
+  applyDenyProbeBatchResult,
+  denyProbeBatchScript,
+  judgeDroppedProbeExit,
+  type DenyProbeSpec,
+} from "./deny-probe-batch.ts";
 import { AGENT_UID_GID } from "./constants.ts";
 import { dockerClientEnvOptions, } from "./docker.ts";
 import { createDockerClient } from "./docker-client.ts";
@@ -280,7 +298,147 @@ function routeInterface(stdout: string): string | undefined {
  */
 export type ProxyFirewallProof = {
   nftablesProofInput?: ProxyNftablesProofInput;
+  /**
+   * The pinned host-service gateway the proxy published, when the gateway
+   * status file was valid, named the effective network policy generation,
+   * and carried an address. Absent otherwise; the gateway port probes then
+   * do not run (there is no address to probe).
+   */
+  hostServiceGatewayIp?: string;
 };
+
+/**
+ * The effective policy's host services, read on the host: the network policy
+ * generation they belong to and their ports. Startup reads them from the same
+ * active effective policy generation the firewall readiness check waited for.
+ */
+export type EffectiveHostServices = Readonly<{
+  policyGeneration: string;
+  ports: readonly number[];
+}>;
+
+export const PROXY_HOST_SERVICE_GATEWAY_STATUS_PATH = `${DEFAULT_PROXY_STATUS_DIR}/${HOST_SERVICE_GATEWAY_STATUS_FILE}`;
+export const PROXY_HOST_SERVICE_SET_COMMAND = "nft -j list set inet runfree_proxy host_service";
+// `%u %f`: owner uid and the raw mode in hex (file type bits included), so a
+// symlink or a non-regular file can never read as a regular one.
+export const PROXY_ETC_HOSTS_STAT_COMMAND = "stat -c '%u %f' /etc/hosts";
+export const PROXY_HOST_SERVICE_GATEWAY_COMMAND = `cat ${PROXY_HOST_SERVICE_GATEWAY_STATUS_PATH}`;
+
+const S_IFMT = 0o170000;
+const S_IFREG = 0o100000;
+const GROUP_OR_OTHER_WRITE = 0o022;
+
+/**
+ * Root's stat of the proxy's `/etc/hosts`, which carries the daemon-written
+ * gateway alias: uid 0, a regular file, and no group or other write bit.
+ */
+export function judgeProxyEtcHostsStat(issues: string[], section: FirewallSectionResult): void {
+  if (section.exit !== 0) {
+    issues.push(`proxy /etc/hosts inspection failed: ${compactDiagnostic(section.body) || `exit ${section.exit}`}`);
+    return;
+  }
+  const match = /^(\d+) ([0-9a-f]{1,8})$/u.exec(section.body.trim());
+  const uid = match ? Number(match[1]) : undefined;
+  const mode = match ? Number.parseInt(match[2], 16) : undefined;
+  if (uid !== 0 || mode === undefined || (mode & S_IFMT) !== S_IFREG || (mode & GROUP_OR_OTHER_WRITE) !== 0) {
+    issues.push(`proxy /etc/hosts must be a root-owned regular file that is not group- or other-writable; got ${compactDiagnostic(section.body) || "<empty>"}; run \`${remedy.rebuild()}\` to recreate the proxy`);
+  }
+}
+
+type HostServiceFirewallObservation = {
+  elements?: HostServiceSetEntry[];
+  expected?: HostServiceSetEntry[];
+  gatewayIp?: string;
+};
+
+/**
+ * Judges the `@host_service` member listing and the gateway status file
+ * against the effective host services. Expected members are the effective
+ * ports paired with the published gateway. When the status file carries
+ * `unavailableReason` there is no gateway: the supervisor withholds it only
+ * while `@host_service` is empty (never pinned, a suspect address, or a
+ * failed write it tore down), so the expected members are none.
+ */
+function observeHostServiceFirewall(
+  issues: string[],
+  setSection: FirewallSectionResult,
+  gatewaySection: FirewallSectionResult,
+  effective: EffectiveHostServices | undefined,
+): HostServiceFirewallObservation {
+  const observation: HostServiceFirewallObservation = {};
+  if (setSection.exit !== 0) {
+    issues.push(`proxy nftables host_service set inspection failed: ${compactDiagnostic(setSection.body) || `exit ${setSection.exit}`}`);
+  } else {
+    observation.elements = parseHostServiceSetMembers(setSection.body);
+    if (!observation.elements) issues.push("proxy nftables host_service set inspection did not return the owned host_service set as nft JSON");
+  }
+  if (gatewaySection.exit !== 0) {
+    issues.push(`proxy host-service gateway status inspection failed: ${compactDiagnostic(gatewaySection.body) || `exit ${gatewaySection.exit}`}`);
+    return observation;
+  }
+  let status: ReturnType<typeof parseHostServiceGatewayStatus>;
+  try {
+    status = parseHostServiceGatewayStatus(gatewaySection.body);
+  } catch (error) {
+    issues.push(`proxy host-service gateway status is malformed: ${error instanceof Error ? error.message : String(error)}`);
+    return observation;
+  }
+  if (!effective) return observation;
+  if (status.policyGeneration !== effective.policyGeneration) {
+    issues.push(`proxy host-service gateway status names network policy generation ${status.policyGeneration}, not the effective network policy generation ${effective.policyGeneration}`);
+    return observation;
+  }
+  const gatewayIp = status.gatewayIp;
+  observation.gatewayIp = gatewayIp;
+  observation.expected = gatewayIp === undefined ? [] : effective.ports.map((port) => ({ ip: gatewayIp, port }));
+  return observation;
+}
+
+// The lowest port from 9 up that the effective policy does not approve: the
+// uid-1001 probe target that must stay unreachable.
+function unapprovedHostServicePort(approved: readonly number[]): number {
+  const taken = new Set(approved);
+  let port = 9;
+  while (taken.has(port)) port += 1;
+  return port;
+}
+
+/** The gateway TCP probe body; the address is a strict IPv4 literal. */
+export function hostGatewayTcpProbeCommand(gatewayIp: string, port: number): string {
+  return `timeout 3 bash -c '</dev/tcp/${gatewayIp}/${port}'`;
+}
+
+/**
+ * Root-position gateway probes (design "Host-side proof"): the `@host_service`
+ * accept is uid 1001 only, so root to each approved port must be dropped. The
+ * uid-1001 unapproved-port probe rides the server-UID denial batch instead.
+ * Run once each, never retried: a success is an enforcement gap, and only a
+ * timeout proves the drop (see `judgeDroppedProbeExit`).
+ */
+function runRootGatewayProbes(
+  issues: string[],
+  context: RuntimeContext,
+  io: RuntimeIO,
+  proxyId: string,
+  gatewayIp: string,
+  ports: readonly number[],
+  options: RuntimeProbeProgressOptions,
+): void {
+  if (ports.length === 0) return;
+  const rootSpecs: DenyProbeSpec[] = ports.map((port) => ({
+    label: `proxy-position root host gateway port ${port}`,
+    command: hostGatewayTcpProbeCommand(gatewayIp, port),
+  }));
+  options.onProbe?.("proxy-position root host gateway denial probes");
+  applyDenyProbeBatchResult(
+    issues,
+    rootSpecs,
+    runDockerExecRoot(context, io, proxyId, ["bash", "-c", denyProbeBatchScript(rootSpecs)]),
+    options.onBoundaryViolation,
+    undefined,
+    { requireTimeout: true },
+  );
+}
 
 // L5b framing: firewall probes merge only within one exec identity group, and
 // every merged exec frames its per-probe results with these host-declared,
@@ -361,42 +519,71 @@ export const SERVER_UID_DENIAL_PROBE_LABELS = [
   "proxy server UID route administration",
 ] as const;
 
-export const SERVER_UID_DENIAL_BATCH_SCRIPT = [
-  "set -u",
-  "for runfree_tool in dig ip nft timeout; do",
-  "  if ! command -v \"$runfree_tool\" >/dev/null 2>&1; then",
-  "    printf 'missing probe binary: %s\\n' \"$runfree_tool\" >&2",
-  "    exit 96",
-  "  fi",
-  "done",
-  "( timeout 3 dig +time=2 +tries=1 @1.1.1.1 example.com >/dev/null 2>&1 ) & runfree_pid_0=$!",
-  "( timeout 3 dig +time=2 +tries=1 @127.0.0.11 example.com >/dev/null 2>&1 ) & runfree_pid_1=$!",
-  "( nft list ruleset >/dev/null 2>&1 ) & runfree_pid_2=$!",
-  "( nft list set inet runfree_proxy allowed_ipv4 >/dev/null 2>&1 ) & runfree_pid_3=$!",
-  "( if ip route add blackhole 203.0.113.254/32 >/dev/null 2>&1; then ip route del blackhole 203.0.113.254/32 >/dev/null 2>&1 || true; exit 0; fi; exit 1 ) & runfree_pid_4=$!",
-  "wait \"$runfree_pid_0\"; runfree_status_0=$?",
-  "wait \"$runfree_pid_1\"; runfree_status_1=$?",
-  "wait \"$runfree_pid_2\"; runfree_status_2=$?",
-  "wait \"$runfree_pid_3\"; runfree_status_3=$?",
-  "wait \"$runfree_pid_4\"; runfree_status_4=$?",
-  `printf '${FIREWALL_PROBE_MARKER} 0 exit=%s\\n' "$runfree_status_0"`,
-  `printf '${FIREWALL_PROBE_MARKER} 1 exit=%s\\n' "$runfree_status_1"`,
-  `printf '${FIREWALL_PROBE_MARKER} 2 exit=%s\\n' "$runfree_status_2"`,
-  `printf '${FIREWALL_PROBE_MARKER} 3 exit=%s\\n' "$runfree_status_3"`,
-  `printf '${FIREWALL_PROBE_MARKER} 4 exit=%s\\n' "$runfree_status_4"`,
-  "exit 0",
-].join("\n");
+/**
+ * The uid-1001 host gateway probe that rides the server-UID denial batch as
+ * one more concurrent record: uid 1001 to a port the effective policy does
+ * not approve must be dropped, because the `@host_service` accept is
+ * port-exact. The host chooses the gateway (from the status file) and port.
+ */
+export type ServerUidGatewayProbe = Readonly<{ gatewayIp: string; port: number }>;
+
+export function serverUidGatewayProbeLabel(port: number): string {
+  return `proxy-position server UID host gateway unapproved port ${port}`;
+}
+
+const STRICT_IPV4_OCTET = "(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])";
+const STRICT_IPV4_LITERAL = new RegExp(`^${STRICT_IPV4_OCTET}(?:\\.${STRICT_IPV4_OCTET}){3}$`, "u");
+
+export function serverUidDenialBatchScript(gatewayProbe?: ServerUidGatewayProbe): string {
+  if (gatewayProbe && (!STRICT_IPV4_LITERAL.test(gatewayProbe.gatewayIp)
+    || !Number.isInteger(gatewayProbe.port) || gatewayProbe.port < 1 || gatewayProbe.port > 65535)) {
+    // Both values are interpolated into the shell: refuse anything else.
+    throw new Error("server UID gateway probe needs an IPv4 literal and a port from 1 to 65535");
+  }
+  const probes = [
+    "( timeout 3 dig +time=2 +tries=1 @1.1.1.1 example.com >/dev/null 2>&1 )",
+    "( timeout 3 dig +time=2 +tries=1 @127.0.0.11 example.com >/dev/null 2>&1 )",
+    "( nft list ruleset >/dev/null 2>&1 )",
+    "( nft list set inet runfree_proxy allowed_ipv4 >/dev/null 2>&1 )",
+    "( if ip route add blackhole 203.0.113.254/32 >/dev/null 2>&1; then ip route del blackhole 203.0.113.254/32 >/dev/null 2>&1 || true; exit 0; fi; exit 1 )",
+    ...(gatewayProbe ? [`( ${hostGatewayTcpProbeCommand(gatewayProbe.gatewayIp, gatewayProbe.port)} >/dev/null 2>&1 )`] : []),
+  ];
+  return [
+    "set -u",
+    `for runfree_tool in dig ip nft timeout${gatewayProbe ? " bash" : ""}; do`,
+    "  if ! command -v \"$runfree_tool\" >/dev/null 2>&1; then",
+    "    printf 'missing probe binary: %s\\n' \"$runfree_tool\" >&2",
+    "    exit 96",
+    "  fi",
+    "done",
+    ...probes.map((probe, index) => `${probe} & runfree_pid_${index}=$!`),
+    ...probes.map((_, index) => `wait "$runfree_pid_${index}"; runfree_status_${index}=$?`),
+    ...probes.map((_, index) => `printf '${FIREWALL_PROBE_MARKER} ${index} exit=%s\\n' "$runfree_status_${index}"`),
+    "exit 0",
+  ].join("\n");
+}
+
+export const SERVER_UID_DENIAL_BATCH_SCRIPT = serverUidDenialBatchScript();
 
 /**
  * Judges the batched server-UID denial records. No retry of failure-expected
  * probes; exit 0 is an enforcement gap, 126/127 is could-not-run (a validation
  * failure, not a denial — today's single-exec conflation, strengthened), and
  * any missing, duplicated, reordered, or extra record fails the validation.
+ * With `gatewayProbe`, the sixth record is the uid-1001 gateway probe, which
+ * only a timeout proves denied (`judgeDroppedProbeExit`).
  */
-export function applyServerUidDenialBatch(issues: string[], result: CaptureResult, onBoundaryViolation?: () => void): void {
+export function applyServerUidDenialBatch(
+  issues: string[],
+  result: CaptureResult,
+  onBoundaryViolation?: () => void,
+  gatewayProbe?: ServerUidGatewayProbe,
+): void {
   const batchFailure = (detail: string): void => {
     issues.push(`proxy server UID nftables and route denial batch could not run${detail ? `: ${detail}` : ""}`);
+    if (gatewayProbe) issues.push(`${serverUidGatewayProbeLabel(gatewayProbe.port)} denial probe did not run: the server UID batch failed`);
   };
+  const expectedRecords = SERVER_UID_DENIAL_PROBE_LABELS.length + (gatewayProbe ? 1 : 0);
   if (result.status !== 0) {
     batchFailure(compactDiagnostic(`${result.stderr}\n${result.stdout}`));
     return;
@@ -406,8 +593,8 @@ export function applyServerUidDenialBatch(issues: string[], result: CaptureResul
     return;
   }
   const records = result.stdout.split(/\r?\n/u).filter((line) => line.trim() !== "");
-  if (records.length !== SERVER_UID_DENIAL_PROBE_LABELS.length) {
-    batchFailure(`expected ${SERVER_UID_DENIAL_PROBE_LABELS.length} probe records, got ${records.length}`);
+  if (records.length !== expectedRecords) {
+    batchFailure(`expected ${expectedRecords} probe records, got ${records.length}`);
     return;
   }
   const outcomes: number[] = [];
@@ -420,6 +607,10 @@ export function applyServerUidDenialBatch(issues: string[], result: CaptureResul
     outcomes.push(Number(match[2]));
   }
   outcomes.forEach((exit, index) => {
+    if (gatewayProbe && index === SERVER_UID_DENIAL_PROBE_LABELS.length) {
+      judgeDroppedProbeExit(issues, serverUidGatewayProbeLabel(gatewayProbe.port), exit, onBoundaryViolation);
+      return;
+    }
     const label = SERVER_UID_DENIAL_PROBE_LABELS[index];
     if (exit === 0) {
       onBoundaryViolation?.();
@@ -445,6 +636,12 @@ export type WarmFirewallEvidence = Readonly<{
   nftTable: FirewallSectionResult;
   /** `nft list set inet runfree_proxy allowed_ipv4`. */
   allowedSet: FirewallSectionResult;
+  /** `PROXY_HOST_SERVICE_SET_COMMAND`. */
+  hostServiceSet: FirewallSectionResult;
+  /** `PROXY_HOST_SERVICE_GATEWAY_COMMAND`. */
+  hostServiceGateway: FirewallSectionResult;
+  /** `PROXY_ETC_HOSTS_STAT_COMMAND`. */
+  etcHostsStat: FirewallSectionResult;
 }>;
 
 export function validateProxyFirewall(
@@ -453,7 +650,15 @@ export function validateProxyFirewall(
   io: RuntimeIO,
   proxyId: string,
   runtimeNetwork: RuntimeNetwork,
-  options: RuntimeProbeProgressOptions & { warm?: WarmFirewallEvidence } = {},
+  options: RuntimeProbeProgressOptions & {
+    warm?: WarmFirewallEvidence;
+    /**
+     * When given, `@host_service` must hold exactly these ports at the
+     * published gateway, and the gateway port probes run. Startup always
+     * passes it.
+     */
+    effectiveHostServices?: EffectiveHostServices;
+  } = {},
 ): ProxyFirewallProof {
   const warm = options.warm;
   // Exec 1 (default daemon user): both route inspections, one framed batch.
@@ -508,6 +713,74 @@ export function validateProxyFirewall(
     : runDockerExecRoot(context, io, proxyId, ["nft", "-j", "list", "table", "inet", "runfree_proxy"]);
   expectProbeSuccess(issues, "proxy nftables owned-table inspection", proxyTable);
   if (proxyTable.status !== 0) return {};
+
+  // Exec 3 (root batch, full path): allowlist-set inspection, root Docker DNS,
+  // the `@host_service` members, the host-service gateway status, and the
+  // `/etc/hosts` stat. A warm launch already fetched the same outputs (all
+  // but root DNS) in its one root batch.
+  const rootDnsCommand = "timeout 3 dig +time=2 +tries=1 @127.0.0.11 example.com";
+  let allowedSet: FirewallSectionResult | undefined;
+  let rootDns: FirewallSectionResult | undefined;
+  let hostServiceSet: FirewallSectionResult | undefined;
+  let hostServiceGateway: FirewallSectionResult | undefined;
+  let etcHostsStat: FirewallSectionResult | undefined;
+  if (warm) {
+    ({ allowedSet, hostServiceSet, hostServiceGateway, etcHostsStat } = warm);
+  } else {
+    options.onProbe?.("proxy nftables allowlist set, root Docker DNS, and host-service gateway inspection");
+    const rootBatch = runDockerExecRoot(context, io, proxyId, ["sh", "-lc", firewallSectionBatchScript([
+      "nft list set inet runfree_proxy allowed_ipv4",
+      rootDnsCommand,
+      PROXY_HOST_SERVICE_SET_COMMAND,
+      PROXY_HOST_SERVICE_GATEWAY_COMMAND,
+      PROXY_ETC_HOSTS_STAT_COMMAND,
+    ])]);
+    const rootSections = parseFirewallSectionBatch(rootBatch, 5);
+    if (!rootSections) {
+      const detail = compactDiagnostic(`${rootBatch.stderr}\n${rootBatch.stdout}`);
+      const garbled = `root batch was missing or garbled${detail ? `: ${detail}` : ""}`;
+      issues.push(`proxy nftables allowlist set inspection failed: ${garbled}`);
+      issues.push(`proxy root Docker DNS failed: ${garbled}`);
+      issues.push(`proxy nftables host_service set inspection failed: ${garbled}`);
+      issues.push(`proxy /etc/hosts inspection failed: ${garbled}`);
+    } else {
+      [allowedSet, rootDns, hostServiceSet, hostServiceGateway, etcHostsStat] = rootSections;
+    }
+  }
+
+  if (allowedSet) {
+    if (allowedSet.exit !== 0) {
+      issues.push(`proxy nftables allowlist set inspection failed: ${compactDiagnostic(allowedSet.body) || `exit ${allowedSet.exit}`}`);
+    } else if (!allowedSet.body.includes("set allowed_ipv4")) {
+      issues.push("proxy firewall must expose the allowed_ipv4 nftables set for live inspection");
+    }
+  }
+  if (rootDns && rootDns.exit !== 0) {
+    // Only the root Docker DNS probe retries, and it retries SOLO (L5b): it
+    // traverses a real network path where one lost packet would fail a valid
+    // runtime closed, and re-running any other probe alongside it — above
+    // all a failure-expected one — could only mask an enforcement gap. Two
+    // solo attempts on top of the batch attempt keep today's three total.
+    options.onProbe?.("proxy root Docker DNS retry");
+    const attempts = [`attempt 1 exit=${rootDns.exit}: ${compactDiagnostic(rootDns.body) || "no output"}`];
+    let succeeded = false;
+    for (let attempt = 2; attempt <= 3; attempt += 1) {
+      const result = runDockerExecRoot(context, io, proxyId, ["sh", "-lc", rootDnsCommand]);
+      if (result.status === 0) {
+        succeeded = true;
+        break;
+      }
+      attempts.push(`attempt ${attempt} exit=${result.status}: ${compactDiagnostic(`${result.stdout}\n${result.stderr}`) || "no output"}`);
+    }
+    if (!succeeded) {
+      issues.push(`proxy root Docker DNS failed: resolver=127.0.0.11 query=example.com; ${attempts.join("; ")}`);
+    }
+  }
+  if (etcHostsStat) judgeProxyEtcHostsStat(issues, etcHostsStat);
+  const hostServices: HostServiceFirewallObservation = hostServiceSet && hostServiceGateway
+    ? observeHostServiceFirewall(issues, hostServiceSet, hostServiceGateway, options.effectiveHostServices)
+    : {};
+
   let nftablesProofInput: ProxyNftablesProofInput | undefined;
   if (internalIface && egressIface) {
     nftablesProofInput = {
@@ -515,78 +788,64 @@ export function validateProxyFirewall(
       internalIface,
       egressIface,
       serverUid: PROXY_SERVER_UID,
+      ...(hostServices.elements ? { hostServiceElements: hostServices.elements } : {}),
+      ...(hostServices.expected ? { expectedHostServiceElements: hostServices.expected } : {}),
     };
-    const shapeIssues = validateProxyNftablesTableJson(nftablesProofInput);
-    if (shapeIssues.length) {
+    const proofIssues = validateProxyNftablesTableJson(nftablesProofInput);
+    if (proofIssues.length) {
+      // A kernel member the effective policy does not approve is a widening;
+      // a missing one only refuses (the supervisor may be mid-write).
+      const shapeIssues = validateProxyNftablesTableJson({
+        ...nftablesProofInput,
+        hostServiceElements: undefined,
+        expectedHostServiceElements: undefined,
+      });
+      // A member at a different address than the status gateway is a re-pin
+      // or publish-order race: it refuses (a retry recovers) but proves no
+      // widening. Only a member at the status gateway on a port the
+      // effective policy does not approve is a violation.
+      const expectedKeys = new Set(hostServices.expected?.map(hostServiceEntryKey) ?? []);
+      const unapprovedMember = hostServices.expected !== undefined && hostServices.gatewayIp !== undefined
+        && (hostServices.elements ?? []).some((entry) => entry.ip === hostServices.gatewayIp
+          && !expectedKeys.has(hostServiceEntryKey(entry)));
       try {
         const observed = JSON.parse(proxyTable.stdout) as { nftables?: unknown };
-        if (Array.isArray(observed.nftables)) options.onBoundaryViolation?.();
+        if (Array.isArray(observed.nftables) && (shapeIssues.length > 0 || unapprovedMember)) options.onBoundaryViolation?.();
       } catch { /* Malformed evidence is not a proved violation. */ }
     }
-    issues.push(...shapeIssues);
+    issues.push(...proofIssues);
   }
+  const proof: ProxyFirewallProof = {
+    nftablesProofInput,
+    ...(hostServices.gatewayIp !== undefined ? { hostServiceGatewayIp: hostServices.gatewayIp } : {}),
+  };
 
-  if (warm) {
-    // Warm match: the allowlist set is judged from the batch; the root DNS
-    // liveness probe and the server-UID denial batch are not re-run.
-    if (warm.allowedSet.exit !== 0) {
-      issues.push(`proxy nftables allowlist set inspection failed: ${compactDiagnostic(warm.allowedSet.body) || `exit ${warm.allowedSet.exit}`}`);
-    } else if (!warm.allowedSet.body.includes("set allowed_ipv4")) {
-      issues.push("proxy firewall must expose the allowed_ipv4 nftables set for live inspection");
-    }
-    return { nftablesProofInput };
-  }
+  // Warm match: the root DNS liveness probe, the server-UID denial batch and
+  // the proxy-position gateway probes are not re-run.
+  if (warm) return proof;
 
-  // Exec 3 (root batch): allowlist-set inspection plus root Docker DNS.
-  options.onProbe?.("proxy nftables allowlist set inspection and root Docker DNS");
-  const rootDnsCommand = "timeout 3 dig +time=2 +tries=1 @127.0.0.11 example.com";
-  const rootBatch = runDockerExecRoot(context, io, proxyId, ["sh", "-lc", firewallSectionBatchScript([
-    "nft list set inet runfree_proxy allowed_ipv4",
-    rootDnsCommand,
-  ])]);
-  const rootSections = parseFirewallSectionBatch(rootBatch, 2);
-  if (!rootSections) {
-    const detail = compactDiagnostic(`${rootBatch.stderr}\n${rootBatch.stdout}`);
-    issues.push(`proxy nftables allowlist set inspection failed: root batch was missing or garbled${detail ? `: ${detail}` : ""}`);
-    issues.push(`proxy root Docker DNS failed: root batch was missing or garbled${detail ? `: ${detail}` : ""}`);
-  } else {
-    const [allowedSet, rootDns] = rootSections;
-    if (allowedSet.exit !== 0) {
-      issues.push(`proxy nftables allowlist set inspection failed: ${compactDiagnostic(allowedSet.body) || `exit ${allowedSet.exit}`}`);
-    } else if (!allowedSet.body.includes("set allowed_ipv4")) {
-      issues.push("proxy firewall must expose the allowed_ipv4 nftables set for live inspection");
-    }
-    if (rootDns.exit !== 0) {
-      // Only the root Docker DNS probe retries, and it retries SOLO (L5b): it
-      // traverses a real network path where one lost packet would fail a valid
-      // runtime closed, and re-running any other probe alongside it — above
-      // all a failure-expected one — could only mask an enforcement gap. Two
-      // solo attempts on top of the batch attempt keep today's three total.
-      options.onProbe?.("proxy root Docker DNS retry");
-      const attempts = [`attempt 1 exit=${rootDns.exit}: ${compactDiagnostic(rootDns.body) || "no output"}`];
-      let succeeded = false;
-      for (let attempt = 2; attempt <= 3; attempt += 1) {
-        const result = runDockerExecRoot(context, io, proxyId, ["sh", "-lc", rootDnsCommand]);
-        if (result.status === 0) {
-          succeeded = true;
-          break;
-        }
-        attempts.push(`attempt ${attempt} exit=${result.status}: ${compactDiagnostic(`${result.stdout}\n${result.stderr}`) || "no output"}`);
-      }
-      if (!succeeded) {
-        issues.push(`proxy root Docker DNS failed: resolver=127.0.0.11 query=example.com; ${attempts.join("; ")}`);
-      }
-    }
-  }
+  // The proxy-position gateway probes need the pinned gateway; with none
+  // published (`unavailableReason`) there is no address to probe and
+  // `@host_service` was proved empty above instead.
+  const gatewayIp = options.effectiveHostServices ? hostServices.gatewayIp : undefined;
+  const approvedPorts = options.effectiveHostServices?.ports ?? [];
+  const gatewayProbe: ServerUidGatewayProbe | undefined = gatewayIp !== undefined
+    ? { gatewayIp, port: unapprovedHostServicePort(approvedPorts) }
+    : undefined;
 
-  // Exec 4 (server UID batch): the five failure-expected denial probes.
+  // Exec 4 (server UID batch): the five failure-expected denial probes, plus
+  // the uid-1001 unapproved-port gateway probe as one more concurrent record.
   options.onProbe?.("proxy server UID denial probes");
   applyServerUidDenialBatch(
     issues,
-    runDockerExecProxyServer(context, io, proxyId, ["sh", "-lc", SERVER_UID_DENIAL_BATCH_SCRIPT]),
+    runDockerExecProxyServer(context, io, proxyId, ["sh", "-lc", serverUidDenialBatchScript(gatewayProbe)]),
     options.onBoundaryViolation,
+    gatewayProbe,
   );
-  return { nftablesProofInput };
+
+  // Exec 5 (root): root to each approved gateway port.
+  if (gatewayIp !== undefined) runRootGatewayProbes(issues, context, io, proxyId, gatewayIp, approvedPorts, options);
+  return proof;
 }
 
 export function containerLogs(context: RuntimeContext, io: RuntimeIO, containerId: string): string {

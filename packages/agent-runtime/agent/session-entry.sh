@@ -11,6 +11,17 @@
 # persist state on that answer; the entry moves the agent's first request past
 # activation for every client.
 #
+# When `RUNFREE_HOST_SERVICES` is set, the entry also starts
+# `host-service-relay` in the background, before the readiness loop, and
+# never waits on it: a missing relay binary, a crash, or a bind failure never
+# changes this entry's exit code and never delays the final `exec` below. The
+# relay stays this entry's direct (non-detached) child, so the handoff's
+# process shape is unchanged. It is killed alongside the probe on a stop
+# signal and on the entry's own activation-timeout exit (111); only the
+# final `exec` below leaves it running, deliberately, for the rest of the
+# session. See local/specs/2026-10-03-host-services-design.md, "The
+# agent-side relay".
+#
 # This is cooperation, not enforcement. A project image may replace it; a
 # replaced entry that sends early receives the same 403s the proxy answers
 # today. Nothing in the trust boundary depends on this file.
@@ -68,6 +79,16 @@ done
 entry_dir="$(CDPATH= cd -- "$(dirname -- "$entry_path")" && pwd)"
 probe="$entry_dir/session-ready-probe"
 
+# Started before the readiness loop and never awaited (see header comment).
+# The relay never writes stdout; discarding it here is belt-and-suspenders
+# alongside the relay's own post-bind rule against writing to the TUI.
+relay="$entry_dir/host-service-relay"
+relay_pid=""
+if [ -n "${RUNFREE_HOST_SERVICES:-}" ] && [ -x "$relay" ]; then
+  "$relay" </dev/null >/dev/null &
+  relay_pid=$!
+fi
+
 # A stop signal must end the entry promptly. In a session created since
 # 2026-09-30 the entry is the child of Docker's init (`docker-init`, PID 1),
 # which forwards SIGTERM/SIGINT to it; in an older session container (created
@@ -84,10 +105,12 @@ probe="$entry_dir/session-ready-probe"
 child=""
 on_term() {
   [ -n "$child" ] && kill "$child" 2>/dev/null
+  [ -n "$relay_pid" ] && kill "$relay_pid" 2>/dev/null
   exit 143
 }
 on_int() {
   [ -n "$child" ] && kill "$child" 2>/dev/null
+  [ -n "$relay_pid" ] && kill "$relay_pid" 2>/dev/null
   exit 130
 }
 trap on_term TERM
@@ -112,6 +135,7 @@ while :; do
   elapsed=$(( now - started_at ))
   if [ "$elapsed" -ge "$timeout_s" ]; then
     echo "runfree: session was not activated within ${timeout_ms} ms (RUNFREE_SESSION_ENTRY_TIMEOUT_MS); giving up" >&2
+    [ -n "$relay_pid" ] && kill "$relay_pid" 2>/dev/null
     exit "$RUNFREE_SESSION_ENTRY_TIMEOUT_EXIT"
   fi
   if [ "$notified" -eq 0 ] && [ "$elapsed" -ge "$RUNFREE_SESSION_ENTRY_NOTICE_AFTER_S" ]; then

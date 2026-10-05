@@ -10,6 +10,7 @@
 
 import fs from "node:fs";
 
+import { isReservedRunfreeHostname } from "@runfree/runtime-contracts/host-services";
 import { normalizeHostname } from "@runfree/runtime-contracts/network-policy";
 
 import {
@@ -126,6 +127,8 @@ export function createAuditSpoolWriter(options: {
       } catch {
         return;
       }
+      // SR4/A1: the reserved runfree.internal suffix never reaches the spool.
+      if (isReservedRunfreeHostname(host)) return;
       if (written.has(host)) return;
       const line = `${host}\n`;
       if (bytesWritten + line.length > maxBytes) {

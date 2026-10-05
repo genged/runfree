@@ -8,6 +8,51 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
 import { SESSION_ELIGIBILITY_PATH } from "@runfree/runtime-contracts/session-file";
 
+// Lets a test make the next N reads of the effective host services fail, as
+// an unreadable effective policy generation would; every other call is real.
+const effectiveHostServicesFault = vi.hoisted(() => ({ failNext: 0, calls: 0 }));
+vi.mock("./control/effective.ts", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./control/effective.ts")>();
+  return {
+    ...actual,
+    readEffectiveHostServices: (...args: Parameters<typeof actual.readEffectiveHostServices>) => {
+      effectiveHostServicesFault.calls += 1;
+      if (effectiveHostServicesFault.failNext > 0) {
+        effectiveHostServicesFault.failNext -= 1;
+        throw new Error("effective host-service generation payload is corrupt (injected)");
+      }
+      return actual.readEffectiveHostServices(...args);
+    },
+  };
+});
+
+// Records "probe" when the host-service launch-time re-check runs and "lock"
+// when the project lifecycle lock is acquired, so a test can prove the probe
+// never runs under the lock (design "Policy shape", Re-check, SR13). Both
+// wrappers delegate to the real implementation, so every other test's
+// behavior is unaffected.
+const hostServiceRecheckEvents = vi.hoisted(() => ({ events: [] as string[] }));
+vi.mock("./host-service-port-owner.ts", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./host-service-port-owner.ts")>();
+  return {
+    ...actual,
+    hostServiceOwnerWarnings: (...args: Parameters<typeof actual.hostServiceOwnerWarnings>) => {
+      hostServiceRecheckEvents.events.push("probe");
+      return actual.hostServiceOwnerWarnings(...args);
+    },
+  };
+});
+vi.mock("./runtime/sessions.ts", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./runtime/sessions.ts")>();
+  return {
+    ...actual,
+    tryAcquireProjectLifecycleLockWithRetry: async (...args: Parameters<typeof actual.tryAcquireProjectLifecycleLockWithRetry>) => {
+      hostServiceRecheckEvents.events.push("lock");
+      return actual.tryAcquireProjectLifecycleLockWithRetry(...args);
+    },
+  };
+});
+
 import { defaultConfig, projectControlPaths, type RunfreeConfig, type ProjectInfo } from "./config.ts";
 import { service, serviceHostNames } from "../../../scripts/services.ts";
 import { agentRuntimeImageTag, effectiveRuntimeDigest, proxyRuntimeImageTag } from "./agent-image.ts";
@@ -30,7 +75,7 @@ import type { RuntimeNetwork } from "./network.ts";
 import type { PiProviderChoice, PiProviderOption } from "./runtime/types.ts";
 import { composeProjectName, projectHash } from "./project-identity.ts";
 import { helperMarkerPath, legacyHelperRunsRoot, markHelperRunPending, readHelperMarker } from "./runtime/ephemeral-helper-residue.ts";
-import { proxyNftablesTableFixture, proxyNftablesTableJson } from "./proxy-nftables-proof.fixture.ts";
+import { proxyHostServiceSetJson, proxyNftablesTableFixture, proxyNftablesTableJson } from "./proxy-nftables-proof.fixture.ts";
 import {
   createDependencyOverlayPlan,
   dependencyOverlayRuntimeSignature,
@@ -48,6 +93,7 @@ import {
   publishControlPlaneMaterializationV2,
   readDesiredSessionAgentV2,
   readEffectiveControlPlaneV2,
+  readSessionAgentTemplateArtifactV2,
   selectEffectiveControlPlaneV2,
   sessionAgentMaterializationsRootV2,
 } from "./runtime/component-state-v2.ts";
@@ -60,7 +106,7 @@ import {
   sha256Digest,
   type RuntimeComponentState,
 } from "./runtime/component-state.ts";
-import { activeRuntimePlanFromContext, createRuntimePlan } from "./runtime/plan.ts";
+import { activeRuntimePlanFromContext, createRuntimePlan, runtimeContextFromActivePlan } from "./runtime/plan.ts";
 import { NON_RESOLVING_CONNECT_PROBE_HOST } from "./runtime/probes.ts";
 import {
   bindAllocatedSessionContainerIdV2,
@@ -74,6 +120,7 @@ import { hostBootId, hostProcessStart } from "./runtime/host-identity.ts";
 import { createSessionLaunchTarget } from "./runtime/session-launch.ts";
 import { buildTokenAutoRefreshSpawnPlan, containerMissingNetwork, resolveRunfreeSelfInvocation } from "./runtime.ts";
 import {
+  destroyRuntime,
   formatSessionFileStatusLine,
   logsRuntime,
   nodeRuntimeIO,
@@ -106,9 +153,13 @@ import { repairWorktreeLinks } from "./runtime/git-layout.ts";
 import { subprocessCategory } from "./runtime/operation-histogram.ts";
 import { COMPOSE_UP_FAILURE_REMEDY, restoreSameProxySessionAdmission, startRuntime, up } from "./runtime/startup.ts";
 import { TOKEN_SYNC_DEFERRED_STATUS } from "./runtime/constants.ts";
-import { disposeLaunchHandoff, preparedRuntimeProxyId, takeLaunchHandoff, takeLaunchHandoffDeclined } from "./runtime/prepared-runtime.ts";
+import { disposeLaunchHandoff, mintPreparedRuntime, preparedRuntimeProxyId, takeLaunchHandoff, takeLaunchHandoffDeclined } from "./runtime/prepared-runtime.ts";
+import { generatedRuntimeContextIfAvailable } from "./runtime/images.ts";
+import { createRuntimeSecurityContract } from "./runtime/security-contract.ts";
+import { runtimeValidationMarkerStatus } from "./runtime/state.ts";
 import { LAUNCH_HANDOFF_STARTUP_SPAN_MAX_MS } from "./runtime/launch-lock-hold.ts";
 import { flushWarnings, pendingWarningsForTest } from "./warnings.ts";
+import { readHostServicePortRegistry, recordProjectHostServicePorts } from "./host-service-registry.ts";
 import { projectLifecycleLockPath, tryAcquireProjectLifecycleLock, tryAcquireProjectLifecycleLockWithRetry } from "./runtime/sessions.ts";
 
 // Real `docker ps -q`/`-aq` prints 12-character short IDs unless `--no-trunc`
@@ -516,6 +567,7 @@ if (args[0] === "inspect") {
         HostConfig: {
           CapAdd: ["NET_ADMIN"],
           CapDrop: ["NET_RAW"],
+          ExtraHosts: ["gateway.runfree.internal:host-gateway"],
           NetworkMode: project + "_agent_internal",
           PortBindings: {},
           SecurityOpt: ["no-new-privileges:true"],
@@ -711,17 +763,44 @@ if (args[0] === "exec") {
       } else if (embedded.includes("@127.0.0.11 example.com")) {
         exitCode = 0;
         body = "";
+      } else if (embedded.includes("nft -j list set inet runfree_proxy host_service")) {
+        exitCode = 0;
+        body = JSON.stringify({ nftables: [{ set: { family: "inet", name: "host_service", table: "runfree_proxy", type: ["ipv4_addr", "inet_service"] } }] });
+      } else if (embedded.includes("/run/runfree-proxy-status/host-service-gateway.json")) {
+        // The pinned gateway for the effective network policy generation;
+        // the effective policy approves no host services, so the set is empty.
+        const effectiveRoot = process.env.RUNFREE_EFFECTIVE_PROXY_DIR
+          || (logPath ? require("node:path").join(require("node:path").dirname(logPath), "state", "control", "effective", "proxy") : undefined);
+        if (effectiveRoot) {
+          const active = JSON.parse(fs.readFileSync(effectiveRoot + "/active.json", "utf8"));
+          const manifest = JSON.parse(fs.readFileSync(effectiveRoot + "/generations/" + active.controlGeneration.slice("sha256:".length) + "/manifest.json", "utf8"));
+          exitCode = 0;
+          body = JSON.stringify({ schemaVersion: 1, policyGeneration: manifest.policyGeneration, gatewayIp: "192.168.65.254", writtenAt: "2026-06-14T00:00:00.000Z" });
+        }
+      } else if (embedded.includes("/etc/hosts")) {
+        exitCode = 0;
+        body = "0 81a4";
       }
       sections.push("RUNFREE_FIREWALL_SECTION " + index + " exit=" + exitCode + "\\n" + body + "\\nRUNFREE_FIREWALL_SECTION_END " + index);
     }
     out(sections.join("\\n") + "\\n");
     process.exit(0);
   }
+  // The root host gateway probes: every SYN is dropped (timeout, exit 124).
+  if (args[0] === "exec" && args.includes(proxyContainerId) && text.includes("RUNFREE_DENY_PROBE")) {
+    const probes = (text.match(/runfree_pid_\\d+=\\$!/g) || []).length;
+    const records = [];
+    for (let index = 0; index < probes; index += 1) records.push("RUNFREE_DENY_PROBE " + index + " exit=124");
+    out(records.join("\\n") + "\\n");
+    process.exit(0);
+  }
   // L5b: the five server-UID denial probes arrive as one batch that exits 0
-  // with one denied (nonzero) record per probe.
+  // with one denied (nonzero) record per probe; a sixth record, the uid-1001
+  // host gateway probe, times out (dropped SYN, exit 124).
   if (args.includes("1001:1001") && text.includes("RUNFREE_FIREWALL_PROBE")) {
     const records = [];
-    for (let index = 0; index < 5; index += 1) records.push("RUNFREE_FIREWALL_PROBE " + index + " exit=1");
+    const probes = (text.match(/runfree_pid_\\d+=\\$!/g) || []).length;
+    for (let index = 0; index < probes; index += 1) records.push("RUNFREE_FIREWALL_PROBE " + index + " exit=" + (index === 5 ? 124 : 1));
     out(records.join("\\n") + "\\n");
     process.exit(0);
   }
@@ -833,6 +912,26 @@ function prepareProject(projectRoot: string, config: RunfreeConfig = defaultConf
   // The proxy publishes its CA into this host directory at first boot; the
   // fixture seeds it so the host-side CA bundle render has its input, the
   // same way the fake trust-setup exec already stood in for the wait.
+  fs.mkdirSync(project.paths.proxyCaCertDir, { recursive: true });
+  fs.writeFileSync(path.join(project.paths.proxyCaCertDir, "proxy-ca.crt"), FAKE_PROXY_CA_PEM);
+  approveAndPublishEffectiveControlsForTest(projectRoot, project);
+  return project;
+}
+
+// Same as `prepareProject`, but the approved and published effective policy
+// generation also carries `hostServices` (design "Policy shape"), so
+// `readActiveEffectiveControl`/`readEffectiveHostServices` see them.
+function prepareProjectWithHostServices(
+  projectRoot: string,
+  hostServices: Record<string, { target: "host-loopback"; port: number }>,
+): ProjectInfo {
+  const project = projectInfo(projectRoot, defaultConfig());
+  fs.mkdirSync(path.dirname(project.paths.policyPath), { recursive: true });
+  fs.writeFileSync(project.paths.policyPath, `${JSON.stringify({
+    version: 2,
+    hosts: ["api.github.com"],
+    hostServices,
+  }, null, 2)}\n`);
   fs.mkdirSync(project.paths.proxyCaCertDir, { recursive: true });
   fs.writeFileSync(path.join(project.paths.proxyCaCertDir, "proxy-ca.crt"), FAKE_PROXY_CA_PEM);
   approveAndPublishEffectiveControlsForTest(projectRoot, project);
@@ -1082,6 +1181,7 @@ function securityContractInspectPair(options: {
     HostConfig: {
       CapAdd: ["NET_ADMIN"],
       CapDrop: ["NET_RAW"],
+      ExtraHosts: ["gateway.runfree.internal:host-gateway"],
       NetworkMode: "agent_internal",
       PortBindings: {},
       SecurityOpt: ["no-new-privileges:true"],
@@ -1241,10 +1341,13 @@ function dockerOperationProfile(calls: readonly RuntimeIoCall[]): Record<string,
 
 function createRuntimeIO(overrides: {
   admin?: (args: string[], context: RuntimeContext) => Promise<number>;
-  capture?: (command: string, args: string[]) => CaptureResult | undefined;
+  /** `fallback` answers the call as the default fake would. */
+  capture?: (command: string, args: string[], fallback: () => CaptureResult) => CaptureResult | undefined;
   choosePiProvider?: (options: readonly PiProviderOption[]) => PiProviderChoice | undefined;
   commandExists?: (command: string) => boolean;
   confirm?: (question: string) => boolean;
+  /** The firewall's live `host_service` kernel set, for a project whose effective policy approves host services. Empty by default. */
+  hostServiceSet?: ReadonlyArray<{ ip: string; port: number }>;
   isInteractive?: () => boolean;
   run?: (command: string, args: string[]) => number;
   startTokenAutoRefresh?: RuntimeIO["startTokenAutoRefresh"];
@@ -1596,6 +1699,7 @@ function createRuntimeIO(overrides: {
             ...(proxyInspect.HostConfig as Record<string, unknown>),
             CapAdd: ["NET_ADMIN"],
             CapDrop: ["NET_RAW"],
+            ExtraHosts: ["gateway.runfree.internal:host-gateway"],
             NetworkMode: `${observedProject}_agent_internal`,
             PortBindings: {},
             SecurityOpt: ["no-new-privileges:true"],
@@ -1648,8 +1752,28 @@ function createRuntimeIO(overrides: {
         : captureResult(1, "", `Error response from daemon: network ${args.at(-1)} not found`);
     }
     const text = args.join(" ");
-    // The warm proof's one root batch: ten framed sections, answered with the
-    // same bytes the individual handlers give the full validation.
+    // The proxy's host-service gateway status: pinned, for the effective
+    // network policy generation. The effective policy approves no host
+    // services, so `@host_service` is empty.
+    const hostServiceGatewayStatus = (): string | undefined => {
+      const effectiveRoot = observedComposeEnv.RUNFREE_EFFECTIVE_PROXY_DIR
+        ?? path.join(tmp, "state", "control", "effective", "proxy");
+      const activePath = path.join(effectiveRoot, "active.json");
+      if (!fs.existsSync(activePath)) return undefined;
+      const active = JSON.parse(fs.readFileSync(activePath, "utf8")) as { controlGeneration: string };
+      const manifest = JSON.parse(fs.readFileSync(path.join(
+        effectiveRoot, "generations", active.controlGeneration.slice("sha256:".length), "manifest.json",
+      ), "utf8")) as { policyGeneration: string };
+      return JSON.stringify({
+        schemaVersion: 1,
+        policyGeneration: manifest.policyGeneration,
+        gatewayIp: "192.168.65.254",
+        writtenAt: "2026-06-14T00:00:00.000Z",
+      });
+    };
+    const hostServiceSetJson = proxyHostServiceSetJson(overrides.hostServiceSet ?? []);
+    // The warm proof's one root batch: fourteen framed sections, answered with
+    // the same bytes the individual handlers give the full validation.
     if (args[0] === "exec" && args.includes(FAKE_PROXY_CONTAINER_ID) && args.includes("0:0")
       && text.includes("RUNFREE_FIREWALL_SECTION") && text.includes("/proc/sys/kernel/random/boot_id")) {
       const body = (request: string[]): string => defaultCapture("docker", request, env).stdout.replace(/\n$/, "");
@@ -1673,6 +1797,9 @@ function createRuntimeIO(overrides: {
         { exit: 0, body: securityContractProbeOutput("proxy").replace(/\n$/, "") },
         { exit: 0, body: process.env.FAKE_WARM_BOOT_ID ?? "11111111-2222-3333-4444-555555555555" },
         { exit: 0, body: process.env.FAKE_WARM_IP_ASSIGNMENTS ?? "{}" },
+        { exit: 0, body: process.env.FAKE_WARM_HOST_SERVICE_SET ?? hostServiceSetJson },
+        { exit: 0, body: hostServiceGatewayStatus() ?? "" },
+        { exit: 0, body: "0 81a4" },
       ];
       return captureResult(0, `${sections.map((section, index) => [
         `RUNFREE_FIREWALL_SECTION ${index} exit=${section.exit}`,
@@ -1782,6 +1909,12 @@ function createRuntimeIO(overrides: {
           };
         }
         if (embedded.includes("@127.0.0.11 example.com")) return { exit: 0, body: "" };
+        if (embedded.includes("nft -j list set inet runfree_proxy host_service")) return { exit: 0, body: hostServiceSetJson };
+        if (embedded.includes("/run/runfree-proxy-status/host-service-gateway.json")) {
+          const status = hostServiceGatewayStatus();
+          return status ? { exit: 0, body: status } : { exit: 1, body: "cat: no such file" };
+        }
+        if (embedded.includes("/etc/hosts")) return { exit: 0, body: "0 81a4" };
         return { exit: 1, body: "unexpected batched firewall command" };
       });
       return captureResult(0, `${sections.map((section, index) => [
@@ -1792,9 +1925,17 @@ function createRuntimeIO(overrides: {
     }
     // L5b: the five server-UID denial probes arrive as one batch under the
     // server identity; every probe is denied (nonzero record) and the batch
-    // itself exits 0.
+    // itself exits 0. A sixth record, the uid-1001 host gateway probe, times
+    // out: the firewall dropped its SYN (exit 124).
     if (args[0] === "exec" && args.includes(FAKE_PROXY_CONTAINER_ID) && args.includes("1001:1001") && text.includes("RUNFREE_FIREWALL_PROBE")) {
-      return captureResult(0, `${[0, 1, 2, 3, 4].map((index) => `RUNFREE_FIREWALL_PROBE ${index} exit=1`).join("\n")}\n`);
+      const probes = [...text.matchAll(/runfree_pid_(\d+)=\$!/g)].length;
+      return captureResult(0, `${Array.from({ length: probes }, (_, index) =>
+        `RUNFREE_FIREWALL_PROBE ${index} exit=${index === 5 ? 124 : 1}`).join("\n")}\n`);
+    }
+    // The root host gateway probes: every SYN is dropped (exit 124).
+    if (args[0] === "exec" && args.includes(FAKE_PROXY_CONTAINER_ID) && text.includes("RUNFREE_DENY_PROBE")) {
+      const probes = [...text.matchAll(/runfree_pid_(\d+)=\$!/g)].length;
+      return captureResult(0, `${Array.from({ length: probes }, (_, index) => `RUNFREE_DENY_PROBE ${index} exit=124`).join("\n")}\n`);
     }
     const routeTarget = /ip -o route get ([^\s]+)/.exec(text)?.[1];
     if (args[0] === "exec" && args.includes(FAKE_PROXY_CONTAINER_ID) && routeTarget && routeTarget !== "1.1.1.1") {
@@ -1970,7 +2111,7 @@ function createRuntimeIO(overrides: {
         && (builtImageReferences.has(args[2]) || inspectedImagesById.has(args[2]))) {
         return defaultCapture(command, args, options?.env);
       }
-      const overridden = overrides.capture?.(command, args);
+      const overridden = overrides.capture?.(command, args, () => defaultCapture(command, args, options?.env));
       if (command === "git" && args[0] === "worktree" && args.at(-1) === "-h"
         && overridden?.status === 0 && !overridden.stdout && !overridden.stderr) {
         return defaultCapture(command, args, options?.env);
@@ -3793,6 +3934,8 @@ describe("runtime command flow", () => {
     // `runfree up` always validates fully, and then records the warm-proof
     // facts for the next launch: one type-less inspect and one root batch
     // (+1 `docker inspect`, +1 `docker exec`; sub-second launch plan Task 2).
+    // The uid-1001 host gateway probe rides the server-UID batch (no extra
+    // exec); this policy approves no host service, so no root probe runs.
     expect(dockerOperationProfile(io.calls.slice(warmStart))).toMatchInlineSnapshot(`
       {
         "docker container inspect": 4,
@@ -3969,6 +4112,7 @@ describe("runtime command flow", () => {
     const warmEnvKeys = [
       "FAKE_PROXY_STARTED_AT", "FAKE_PROXY_PID", "FAKE_DOCKER_DAEMON_ID", "FAKE_DOCKER_LIVE_RESTORE",
       "FAKE_WARM_NFT_TABLE", "FAKE_WARM_CAPBND", "FAKE_WARM_BATCH_UID", "FAKE_WARM_BOOT_ID", "FAKE_VOLUME_CREATED_AT",
+      "FAKE_WARM_HOST_SERVICE_SET",
     ] as const;
     afterEach(() => {
       for (const key of warmEnvKeys) delete process.env[key];
@@ -4060,6 +4204,64 @@ describe("runtime command flow", () => {
       const start = io.calls.length;
       await startRuntime(context, io, false, { launch: true });
       expect(denyProbeRuns(io.calls.slice(start))).toBe(1);
+    });
+
+    test("the record binds the host_service members, and a member the effective policy lacks takes the full path", async () => {
+      const context = launchContext();
+      const io = createRuntimeIO();
+      await warmedUp(context, io);
+      const record = JSON.parse(fs.readFileSync(recordPath(context), "utf8")) as { facts: { hostServiceMembers?: unknown } };
+      expect(record.facts.hostServiceMembers).toEqual([]);
+      // A kernel pair the effective policy does not approve: the re-run warm
+      // topology refuses it, so the launch validates fully.
+      process.env.FAKE_WARM_HOST_SERVICE_SET = proxyHostServiceSetJson([{ ip: "192.168.65.254", port: 5432 }]);
+      const start = io.calls.length;
+      expect((await startRuntime(context, io, false, { launch: true })).status).toBe(0);
+      expect(denyProbeRuns(io.calls.slice(start))).toBe(1);
+    });
+
+    test("unreadable effective host services refuse the start before topology, and a readable generation recovers", async () => {
+      const context = launchContext();
+      const io = createRuntimeIO();
+      effectiveHostServicesFault.failNext = Number.POSITIVE_INFINITY;
+      try {
+        const start = io.calls.length;
+        expect((await startRuntime(context, io, false, { launch: true })).status).toBe(1);
+        // Refused before the topology proof: no deny-probe helper ran and no
+        // warm record was written.
+        expect(denyProbeRuns(io.calls.slice(start))).toBe(0);
+        expect(fs.existsSync(recordPath(context))).toBe(false);
+        flushWarnings();
+        expect(vi.mocked(console.error).mock.calls.flat().join("\n"))
+          .toContain("effective host services could not be read: effective host-service generation payload is corrupt (injected); new authority was refused");
+      } finally {
+        effectiveHostServicesFault.failNext = 0;
+      }
+      // Reclaim: like any refused cold start, the proxy left without an
+      // effective control-plane selection is recreated by `runfree rebuild`;
+      // once the generation reads, that succeeds.
+      vi.mocked(console.error).mockClear();
+      const reclaimed = await startRuntime(context, io, true, {});
+      flushWarnings();
+      expect(reclaimed.status, vi.mocked(console.error).mock.calls.flat().join("\n")).toBe(0);
+    });
+
+    test("unreadable effective host services give no warm path; the launch validates fully", async () => {
+      const context = launchContext();
+      const io = createRuntimeIO();
+      await warmedUp(context, io);
+      // Only the warm-proof input's read fails; the full path reads normally.
+      effectiveHostServicesFault.failNext = 1;
+      const callsBefore = effectiveHostServicesFault.calls;
+      try {
+        const start = io.calls.length;
+        expect((await startRuntime(context, io, false, { launch: true })).status).toBe(0);
+        expect(effectiveHostServicesFault.failNext).toBe(0);
+        expect(effectiveHostServicesFault.calls - callsBefore).toBeGreaterThan(1);
+        expect(denyProbeRuns(io.calls.slice(start))).toBe(1);
+      } finally {
+        effectiveHostServicesFault.failNext = 0;
+      }
     });
 
     test("a batch that did not run as root takes the full path", async () => {
@@ -4157,6 +4359,243 @@ describe("runtime command flow", () => {
       // The record matched, but a registry with a session in it never takes
       // the warm path: its restore re-proof must run.
       expect(denyProbeRuns(io.calls.slice(start))).toBe(1);
+    });
+  });
+
+  describe("host-service re-check and registry refresh at launch (design \"Policy shape\", Re-check, SR13; HS7)", () => {
+    // The live firewall's kernel `host_service` set the full validation
+    // batch reports: it must match the effective policy's approved host
+    // services (gateway 192.168.65.254, the fixed fake gateway IP) or
+    // topology validation itself refuses the launch for an unrelated reason.
+    const idbHostServiceSet = [{ ip: "192.168.65.254", port: 10882 }];
+
+    function launchContext(): RuntimeContext {
+      const projectRoot = path.join(tmp, "project");
+      const project = prepareProjectWithHostServices(projectRoot, { idb: { target: "host-loopback", port: 10882 } });
+      return {
+        projectRoot,
+        project,
+        runtimeRoot: path.join(tmp, "runtime"),
+        env: { PATH: "/fake-bin", XDG_STATE_HOME: path.join(tmp, "xdg-state") },
+        network: fixedNetwork,
+      };
+    }
+
+    beforeEach(() => {
+      hostServiceRecheckEvents.events = [];
+    });
+
+    test("a launch emits the same live-owner warning status reports, and never fails because of it", async () => {
+      const context = launchContext();
+      const io = createRuntimeIO({ hostServiceSet: idbHostServiceSet });
+
+      // No darwin stub: the live-owner probe is unavailable on this
+      // platform, exactly like a status check would see.
+      expect((await startRuntime(context, io, false, { launch: true })).status).toBe(0);
+      flushWarnings();
+      const errOutput = vi.mocked(console.error).mock.calls.flat().join("\n");
+      expect(errOutput).toContain("runfree warning:");
+      expect(errOutput).toContain("host service idb (127.0.0.1:10882):");
+    });
+
+    test("a launch refreshes the host-global port registry with the effective ports", async () => {
+      const context = launchContext();
+      const io = createRuntimeIO({ hostServiceSet: idbHostServiceSet });
+
+      expect((await startRuntime(context, io, false, { launch: true })).status).toBe(0);
+      const registry = readHostServicePortRegistry(context.env ?? {});
+      if (!registry.ok) throw new Error(registry.reason);
+      expect(registry.owners.get(10882)?.[0]?.projectId).toBe(projectHash(context.projectRoot));
+    });
+
+    test("the live-owner probe never runs under the project lifecycle lock", async () => {
+      const context = launchContext();
+      const io = createRuntimeIO({ hostServiceSet: idbHostServiceSet });
+
+      expect((await startRuntime(context, io, false, { launch: true })).status).toBe(0);
+      // Control preparation takes and releases the project lifecycle lock
+      // transiently for its own control-plane selection, before the probe
+      // runs; the launch's own long-held lock (guarding Docker/session
+      // admission) is always the *last* lock acquisition of a plain cold
+      // launch. The probe must complete before that one.
+      expect(hostServiceRecheckEvents.events).toContain("probe");
+      expect(hostServiceRecheckEvents.events).toContain("lock");
+      expect(hostServiceRecheckEvents.events.indexOf("probe"))
+        .toBeLessThan(hostServiceRecheckEvents.events.lastIndexOf("lock"));
+    });
+
+    // A host-service activation (`host-service add`) selects a new effective
+    // policy generation only. The session template renders the approved host
+    // services, so the plan built from that generation carries a new session
+    // agent generation, which only a startup selects as the desired session
+    // agent. A production launch runs that startup, so the service appears in
+    // the next session while live sessions keep their materialization.
+    function hostServiceActivationContext(): RuntimeContext {
+      const projectRoot = path.join(tmp, "project");
+      return {
+        projectRoot,
+        project: prepareProject(projectRoot),
+        runtimeRoot: path.join(tmp, "runtime"),
+        env: { PATH: "/fake-bin", XDG_STATE_HOME: path.join(tmp, "xdg-state") },
+        network: fixedNetwork,
+      };
+    }
+    function activateHostService(context: RuntimeContext): void {
+      fs.writeFileSync(context.project.paths.policyPath, `${JSON.stringify({
+        version: 2, hosts: ["api.github.com"], hostServices: { idb: { target: "host-loopback", port: 10882 } },
+      }, null, 2)}\n`);
+      approveAndPublishEffectiveControlsForTest(context.projectRoot, context.project);
+    }
+
+    test("a launch after a host-service activation selects the session agent that renders the service", async () => {
+      const context = hostServiceActivationContext();
+      const overrides: { hostServiceSet: Array<{ ip: string; port: number }> } = { hostServiceSet: [] };
+      const io = createRuntimeIO(overrides);
+      expect((await startRuntime(context, io, false, {})).status).toBe(0);
+      const before = readDesiredSessionAgentV2(context.project.paths.stateDir);
+      activateHostService(context);
+      overrides.hostServiceSet = idbHostServiceSet;
+      const launched = await startRuntime(context, io, false, { launch: true, launchHandoff: true });
+      flushWarnings();
+      expect(launched.status, vi.mocked(console.error).mock.calls.flat().join("\n")).toBe(0);
+      if (launched.kind === "ready") disposeLaunchHandoff(launched.preparedRuntime);
+      const desired = readDesiredSessionAgentV2(context.project.paths.stateDir);
+      if (!before || !desired) throw new Error("no desired session agent was selected");
+      expect(desired.manifest.generation.sessionAgentGenerationDigest)
+        .not.toBe(before.manifest.generation.sessionAgentGenerationDigest);
+      expect(readSessionAgentTemplateArtifactV2(context.project.paths.stateDir, desired.manifest)).toContain("idb:10882");
+    });
+
+    // The live crash runner and admission matrix mint a prepared runtime from a
+    // plan rebuilt from current inputs, with no startup. After an activation
+    // that plan names an unselected session agent: the refusal names that
+    // family, and the startup a production launch runs (here `up`) clears it.
+    test("a plan rebuilt after a host-service activation is refused by family until a startup selects it", async () => {
+      const context = hostServiceActivationContext();
+      const overrides: { hostServiceSet: Array<{ ip: string; port: number }> } = { hostServiceSet: [] };
+      const io = createRuntimeIO(overrides);
+      const mintFromCurrentInputs = () => {
+        const activePlan = activeRuntimePlanFromContext(generatedRuntimeContextIfAvailable(context));
+        const contract = createRuntimeSecurityContract(activePlan);
+        const validation = runtimeValidationMarkerStatus(runtimeContextFromActivePlan(activePlan), io,
+          { contractHash: contract.contractHash });
+        if (!validation.proof || validation.issue) throw new Error(`no validation proof: ${validation.issue ?? "missing"}`);
+        return mintPreparedRuntime({ plan: activePlan, validationProof: validation.proof });
+      };
+      expect((await startRuntime(context, io, false, {})).status).toBe(0);
+      expect(preparedRuntimeProxyId(mintFromCurrentInputs())).toBe(FAKE_PROXY_CONTAINER_ID);
+      activateHostService(context);
+      overrides.hostServiceSet = idbHostServiceSet;
+      expect(mintFromCurrentInputs).toThrow(
+        "prepared runtime plan does not match its durable desired session-agent selection",
+      );
+      expect((await startRuntime(context, io, false, {})).status).toBe(0);
+      expect(preparedRuntimeProxyId(mintFromCurrentInputs())).toBe(FAKE_PROXY_CONTAINER_ID);
+    });
+
+    // Controller ruling R15: a project that never used host services must
+    // not take the host-global registry lock on every launch. Proven
+    // behaviorally (not by spying on the write function): neither the
+    // registry file nor its lock directory may exist on disk afterward.
+    test("a project with no host services and no existing registry row makes no registry write and takes no lock", async () => {
+      const projectRoot = path.join(tmp, "project");
+      const project = prepareProject(projectRoot);
+      const context = {
+        projectRoot,
+        project,
+        runtimeRoot: path.join(tmp, "runtime"),
+        env: { PATH: "/fake-bin", XDG_STATE_HOME: path.join(tmp, "xdg-state") },
+        network: fixedNetwork,
+      } satisfies RuntimeContext;
+      const io = createRuntimeIO();
+
+      expect((await startRuntime(context, io, false, { launch: true })).status).toBe(0);
+
+      const registryStateRoot = path.join(context.env.XDG_STATE_HOME, "runfree");
+      expect(fs.existsSync(path.join(registryStateRoot, "host-service-ports.json"))).toBe(false);
+      expect(fs.existsSync(path.join(registryStateRoot, "host-service-ports.lock"))).toBe(false);
+    });
+
+    // The other half of R15's "or": a project with no *effective* host
+    // services but a stale registry row (left behind, for example, by
+    // removing `hostServices` outside `host-service remove`) must still get
+    // the write that prunes it.
+    test("a project with no host services but a stale registry row still gets pruned", async () => {
+      const projectRoot = path.join(tmp, "project");
+      const project = prepareProject(projectRoot);
+      const context = {
+        projectRoot,
+        project,
+        runtimeRoot: path.join(tmp, "runtime"),
+        env: { PATH: "/fake-bin", XDG_STATE_HOME: path.join(tmp, "xdg-state") },
+        network: fixedNetwork,
+      } satisfies RuntimeContext;
+      const projectId = projectHash(projectRoot);
+      await recordProjectHostServicePorts(context.env, { id: projectId, root: projectRoot }, [10882]);
+      const io = createRuntimeIO();
+
+      expect((await startRuntime(context, io, false, { launch: true })).status).toBe(0);
+
+      const registry = readHostServicePortRegistry(context.env);
+      if (!registry.ok) throw new Error(registry.reason);
+      expect(registry.owners.has(10882)).toBe(false);
+    });
+  });
+
+  describe("host-service port registry pruning at destroy (design \"Policy shape\", HS7)", () => {
+    test("destroy prunes the project's host-service port registry row", async () => {
+      const projectRoot = path.join(tmp, "project");
+      const project = prepareProjectWithHostServices(projectRoot, { idb: { target: "host-loopback", port: 10882 } });
+      const context = {
+        projectRoot,
+        project,
+        runtimeRoot: path.join(tmp, "runtime"),
+        env: { PATH: "/fake-bin", XDG_STATE_HOME: path.join(tmp, "xdg-state") },
+        network: fixedNetwork,
+      } satisfies RuntimeContext;
+      const projectId = projectHash(projectRoot);
+      await recordProjectHostServicePorts(context.env, { id: projectId, root: projectRoot }, [10882]);
+      const before = readHostServicePortRegistry(context.env);
+      if (!before.ok) throw new Error(before.reason);
+      expect(before.owners.get(10882)?.[0]?.projectId).toBe(projectId);
+
+      const io = createRuntimeIO();
+      await destroyRuntime(context, io);
+
+      const after = readHostServicePortRegistry(context.env);
+      if (!after.ok) throw new Error(after.reason);
+      expect(after.owners.has(10882)).toBe(false);
+    });
+
+    test("a refused destroy never prunes the registry row: a still-live session must keep its port", async () => {
+      const projectRoot = path.join(tmp, "project");
+      const project = prepareProjectWithHostServices(projectRoot, { idb: { target: "host-loopback", port: 10882 } });
+      const context = {
+        projectRoot,
+        project,
+        runtimeRoot: path.join(tmp, "runtime"),
+        env: { PATH: "/fake-bin", XDG_STATE_HOME: path.join(tmp, "xdg-state") },
+        network: fixedNetwork,
+      } satisfies RuntimeContext;
+      const projectId = projectHash(projectRoot);
+      await recordProjectHostServicePorts(context.env, { id: projectId, root: projectRoot }, [10882]);
+
+      // Obstruct the session lifecycle registry so plain destroy refuses
+      // before any teardown effect (an unreadable registry may hide a live
+      // session, so destroy without --force fails closed on it).
+      const recordsRoot = path.join(project.paths.stateDir, "runtime", "v2", "session-containers");
+      fs.mkdirSync(path.dirname(recordsRoot), { recursive: true });
+      fs.writeFileSync(recordsRoot, "not a directory");
+
+      const io = createRuntimeIO();
+      const status = await destroyRuntime(context, io);
+      expect(status).not.toBe(0);
+
+      // Nothing was torn down: the registry row the project's approved host
+      // service still needs must survive the refused destroy untouched.
+      const after = readHostServicePortRegistry(context.env);
+      if (!after.ok) throw new Error(after.reason);
+      expect(after.owners.get(10882)?.[0]?.projectId).toBe(projectId);
     });
   });
 
@@ -5419,6 +5858,145 @@ describe("runtime command flow", () => {
     expect(output).not.toContain("\t");
   });
 
+  describe("host-service status (design \"Policy shape\", Re-check, SR13)", () => {
+    const platformDescriptor = Object.getOwnPropertyDescriptor(process, "platform") as PropertyDescriptor;
+    afterEach(() => {
+      Object.defineProperty(process, "platform", platformDescriptor);
+    });
+
+    const PROXY_ID = "a".repeat(64);
+
+    // A darwin host with idb listening on 10882 and a running proxy whose
+    // gateway status read is answered by `gateway` (undefined: no proxy).
+    function hostServiceStatusFixture(gateway: (() => ReturnType<typeof captureResult>) | undefined) {
+      const projectRoot = path.join(tmp, "project");
+      const project = prepareProjectWithHostServices(projectRoot, { idb: { target: "host-loopback", port: 10882 } });
+      const context = {
+        projectRoot,
+        project,
+        runtimeRoot: path.join(tmp, "runtime"),
+        env: { PATH: "/fake-bin", XDG_STATE_HOME: path.join(tmp, "xdg-state") },
+        network: fixedNetwork,
+      } satisfies RuntimeContext;
+      Object.defineProperty(process, "platform", { value: "darwin" });
+      const gatewayReads: string[][] = [];
+      const io = createRuntimeIO({
+        capture: (command, args) => {
+          if (command === "docker" && args[0] === "info") return captureResult(0);
+          if (command === "/usr/sbin/lsof") return captureResult(0, "p4242\ncidb_companion\nf7\nn127.0.0.1:10882\n");
+          if (gateway && command === "docker" && args[0] === "ps" && args.includes("--quiet")
+            && args.includes("label=com.docker.compose.service=proxy")) {
+            return captureResult(0, `${PROXY_ID}\n`);
+          }
+          if (gateway && command === "docker" && args[0] === "exec" && args.includes(PROXY_ID)
+            && args.includes("/run/runfree-proxy-status/host-service-gateway.json")) {
+            gatewayReads.push(args);
+            return gateway();
+          }
+          return captureResult(0);
+        },
+      });
+      return { context, io, gatewayReads };
+    }
+
+    function gatewayStatusJson(fields: Record<string, unknown>): string {
+      return `${JSON.stringify({ schemaVersion: 1, policyGeneration: `sha256:${"1".repeat(64)}`, writtenAt: "2026-10-04T00:00:00.000Z", ...fields })}\n`;
+    }
+
+    function statusOutput(): { out: string; err: string } {
+      flushWarnings();
+      return {
+        out: vi.mocked(console.log).mock.calls.map((call) => call.join(" ")).join("\n"),
+        err: vi.mocked(console.error).mock.calls.flat().join("\n"),
+      };
+    }
+
+    test("status reports a healthy host service and its pinned gateway, and raises no warning", () => {
+      const { context, io, gatewayReads } = hostServiceStatusFixture(() => captureResult(0, gatewayStatusJson({ gatewayIp: "192.168.65.254" })));
+
+      expect(statusRuntime(context, io)).toBe(0);
+      const { out, err } = statusOutput();
+      expect(out).toContain("host services: idb 127.0.0.1:10882 (idb_companion)");
+      expect(out).toContain("host-service gateway: 192.168.65.254");
+      expect(err).not.toContain("runfree warning:");
+      expect(gatewayReads).toHaveLength(1);
+    });
+
+    test("status shows an unavailable gateway with its reason and still succeeds", () => {
+      const { context, io } = hostServiceStatusFixture(() => captureResult(0, gatewayStatusJson({
+        unavailableReason: "gateway address changed from 192.168.65.254 to 192.168.65.2; run `runfree rebuild`",
+      })));
+
+      expect(statusRuntime(context, io)).toBe(0);
+      const { out } = statusOutput();
+      expect(out).toContain("host-service gateway: unavailable (gateway address changed from 192.168.65.254 to 192.168.65.2; run `runfree rebuild`)");
+    });
+
+    test("status prints an unknown gateway without a warning when the proxy is not running", () => {
+      const { context, io, gatewayReads } = hostServiceStatusFixture(undefined);
+
+      expect(statusRuntime(context, io)).toBe(0);
+      const { out, err } = statusOutput();
+      expect(out).toContain("host-service gateway: unknown (proxy not running)");
+      expect(err).not.toContain("host-service gateway");
+      expect(gatewayReads).toHaveLength(0);
+    });
+
+    test.each([
+      ["the read fails", () => captureResult(1, "", "cat: no such file")],
+      ["the file is malformed", () => captureResult(0, gatewayStatusJson({ gatewayIp: "192.168.65.254", extra: true }))],
+    ])("status prints an unknown gateway and a warning when %s, and still succeeds", (_label, gateway) => {
+      const { context, io } = hostServiceStatusFixture(gateway);
+
+      expect(statusRuntime(context, io)).toBe(0);
+      const { out, err } = statusOutput();
+      expect(out).toContain("host-service gateway: unknown");
+      expect(err).toContain("runfree warning:");
+      expect(err).toContain("host-service gateway");
+    });
+
+    test("an unavailable live-owner probe is a warning, never an error, and status still succeeds", () => {
+      const projectRoot = path.join(tmp, "project");
+      const project = prepareProjectWithHostServices(projectRoot, { idb: { target: "host-loopback", port: 10882 } });
+      const context = {
+        projectRoot,
+        project,
+        runtimeRoot: path.join(tmp, "runtime"),
+        env: { PATH: "/fake-bin", XDG_STATE_HOME: path.join(tmp, "xdg-state") },
+        network: fixedNetwork,
+      } satisfies RuntimeContext;
+      // No darwin stub: the live-owner probe is unavailable on this platform.
+      const io = createRuntimeIO({
+        capture: (command, args) => (command === "docker" && args[0] === "info" ? captureResult(0) : undefined),
+      });
+
+      expect(statusRuntime(context, io)).toBe(0);
+      flushWarnings();
+      const errOutput = vi.mocked(console.error).mock.calls.flat().join("\n");
+      expect(errOutput).toContain("runfree warning:");
+      expect(errOutput).toContain("host service idb (127.0.0.1:10882):");
+    });
+
+    test("status prints no host-services line when none are approved", () => {
+      const projectRoot = path.join(tmp, "project");
+      const project = prepareProject(projectRoot);
+      const context = {
+        projectRoot,
+        project,
+        runtimeRoot: path.join(tmp, "runtime"),
+        env: { PATH: "/fake-bin", XDG_STATE_HOME: path.join(tmp, "xdg-state") },
+        network: fixedNetwork,
+      } satisfies RuntimeContext;
+      const io = createRuntimeIO({
+        capture: (command, args) => (command === "docker" && args[0] === "info" ? captureResult(0) : undefined),
+      });
+
+      expect(statusRuntime(context, io)).toBe(0);
+      const output = vi.mocked(console.log).mock.calls.map((call) => call.join(" ")).join("\n");
+      expect(output).not.toContain("host services:");
+    });
+  });
+
   /** Selects a `files`-backed effective control plane for `context`'s project. */
   function selectFileBackedControlPlaneForStatus(context: RuntimeContext, proxyContainerId: string): void {
     const stateDir = context.project.paths.stateDir;
@@ -5796,6 +6374,7 @@ describe("runtime command flow", () => {
               HostConfig: {
                 CapAdd: ["NET_ADMIN"],
                 CapDrop: ["NET_RAW"],
+                ExtraHosts: ["gateway.runfree.internal:host-gateway"],
                 NetworkMode: `${projectName}_agent_internal`,
                 PortBindings: {},
                 SecurityOpt: ["no-new-privileges:true"],
@@ -6268,7 +6847,7 @@ describe("runtime command flow", () => {
     const project = prepareProject(projectRoot);
     let dnsAttempts = 0;
     const io = createRuntimeIO({
-      capture: (command, args) => {
+      capture: (command, args, fallback) => {
         const text = args.join(" ");
         if (
           command === "docker"
@@ -6277,24 +6856,15 @@ describe("runtime command flow", () => {
           && text.includes("@127.0.0.11 example.com")
         ) {
           dnsAttempts += 1;
-          // First attempt rides the root batch (L5b): the allowlist section
+          // First attempt rides the root batch (L5b): every other section
           // passes while the DNS section loses one UDP query. Only the DNS
           // probe retries, solo — the second attempt is a bare exec.
           if (text.includes("RUNFREE_FIREWALL_SECTION")) {
-            return captureResult(0, [
-              "RUNFREE_FIREWALL_SECTION 0 exit=0",
-              "table inet runfree_proxy {",
-              "  set allowed_ipv4 {",
-              "    type ipv4_addr",
-              "    elements = { 140.82.112.5 }",
-              "  }",
-              "}",
-              "RUNFREE_FIREWALL_SECTION_END 0",
-              "RUNFREE_FIREWALL_SECTION 1 exit=1",
-              "one lost UDP query",
-              "RUNFREE_FIREWALL_SECTION_END 1",
-              "",
-            ].join("\n"));
+            const batch = fallback();
+            return captureResult(0, batch.stdout.replace(
+              /RUNFREE_FIREWALL_SECTION 1 exit=0\n[^\n]*\nRUNFREE_FIREWALL_SECTION_END 1/u,
+              "RUNFREE_FIREWALL_SECTION 1 exit=1\none lost UDP query\nRUNFREE_FIREWALL_SECTION_END 1",
+            ));
           }
           return captureResult(0);
         }

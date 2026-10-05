@@ -1,3 +1,9 @@
+import {
+  hostServiceEntryKey,
+  sortHostServiceEntries,
+  type HostServiceSetEntry,
+} from "@runfree/runtime-contracts/proxy-status";
+
 import { isRecord } from "./strict-primitives.ts";
 export type ProxyNftablesProofInput = {
   rawJson: string;
@@ -7,6 +13,10 @@ export type ProxyNftablesProofInput = {
   serverUid?: string;
   tableName?: string;
   setName?: string;
+  /** Kernel members of `@host_service` (`nft -j list set ... host_service`). */
+  hostServiceElements?: HostServiceSetEntry[];
+  /** The effective policy's host-service ports paired with the published gateway. */
+  expectedHostServiceElements?: HostServiceSetEntry[];
 };
 
 type NftJsonStatement = {
@@ -59,6 +69,13 @@ const DEFAULT_SET_NAME = "allowed_ipv4";
 const DEFAULT_SESSION_SET_NAME = "session_ipv4";
 const DEFAULT_AUDIT_SET_NAME = "audit_ipv4";
 const DEFAULT_AUDIT_DRAINING_SET_NAME = "audit_draining_ipv4";
+const HOST_SERVICE_SET_NAME = "host_service";
+const HOST_SERVICE_DRAINING_SET_NAME = "host_service_draining";
+const HOST_SERVICE_GATEWAY_SET_NAME = "host_service_gateways";
+// `ipv4_addr . inet_service`, as nft JSON writes a concatenated set type.
+const HOST_SERVICE_SET_TYPE = ["ipv4_addr", "inet_service"] as const;
+const IPV4_OCTET = "(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])";
+const STRICT_IPV4_RE = new RegExp(`^${IPV4_OCTET}(?:\\.${IPV4_OCTET}){3}$`);
 const DEFAULT_PROXY_PORT = 8080;
 const DEFAULT_SERVER_UID = "1001";
 const EXPECTED_CHAINS = ["input", "output_dns_guard", "output", "forward"] as const;
@@ -110,9 +127,21 @@ function nftLeftMatches(left: unknown, kind: "meta" | "ct" | "payload", expected
   return Object.entries(expected).every(([key, expectedValue]) => value[key] === expectedValue);
 }
 
+// `ip daddr . tcp dport`: exactly the two payload halves, in that order.
+function nftLeftIsDaddrDportConcat(left: unknown): boolean {
+  if (!isRecord(left) || !Array.isArray(left.concat) || left.concat.length !== 2) return false;
+  const [address, port] = left.concat as unknown[];
+  return isRecord(address) && Object.keys(address).length === 1 && nftLeftMatches(address, "payload", { protocol: "ip", field: "daddr" })
+    && isRecord(port) && Object.keys(port).length === 1 && nftLeftMatches(port, "payload", { protocol: "tcp", field: "dport" });
+}
+
 function nftExprHasMatch(
   expr: readonly unknown[],
-  left: { kind: "meta"; key: string } | { kind: "ct"; key: string } | { kind: "payload"; protocol: string; field: string },
+  left:
+    | { kind: "meta"; key: string }
+    | { kind: "ct"; key: string }
+    | { kind: "payload"; protocol: string; field: string }
+    | { kind: "concat-daddr-dport" },
   right: string | number | readonly string[],
   op = "==",
 ): boolean {
@@ -123,6 +152,7 @@ function nftExprHasMatch(
     const actualLeft = match.left;
     const actualRight = match.right;
     if (!nftRightEquals(actualRight, right)) return false;
+    if (left.kind === "concat-daddr-dport") return nftLeftIsDaddrDportConcat(actualLeft);
     if (left.kind === "meta") return nftLeftMatches(actualLeft, "meta", { key: left.key });
     if (left.kind === "ct") return nftLeftMatches(actualLeft, "ct", { key: left.key });
     return nftLeftMatches(actualLeft, "payload", { protocol: left.protocol, field: left.field });
@@ -174,6 +204,58 @@ function nftExpressionIsExact(expr: readonly unknown[], count: number): boolean 
     if (!isRecord(entry)) return false;
     return Object.hasOwn(entry, "match") || Object.hasOwn(entry, "accept") || Object.hasOwn(entry, "reject") || Object.hasOwn(entry, "drop");
   });
+}
+
+function nftSetTypeIsHostService(type: unknown): boolean {
+  return Array.isArray(type)
+    && type.length === HOST_SERVICE_SET_TYPE.length
+    && HOST_SERVICE_SET_TYPE.every((part, index) => type[index] === part);
+}
+
+function strictHostServiceEntry(value: unknown): HostServiceSetEntry | undefined {
+  if (!isRecord(value) || !Array.isArray(value.concat) || value.concat.length !== 2) return undefined;
+  const [ip, port] = value.concat as unknown[];
+  if (typeof ip !== "string" || !STRICT_IPV4_RE.test(ip)) return undefined;
+  if (typeof port !== "number" || !Number.isInteger(port) || port < 1 || port > 65535) return undefined;
+  return { ip, port };
+}
+
+/**
+ * Members of `@host_service` from `nft -j list set inet runfree_proxy
+ * host_service`. Each element is `{"concat":[ip, port]}`, or that value
+ * wrapped as `{"elem":{"val":...}}` when nft prints element options. Anything
+ * else, including a second set statement or a malformed element, returns
+ * undefined: unreadable kernel state is never read as "no members".
+ */
+export function parseHostServiceSetMembers(rawJson: string, tableName = DEFAULT_TABLE_NAME): HostServiceSetEntry[] | undefined {
+  const statements = parseNftJsonTable(rawJson);
+  if (!statements) return undefined;
+  const sets = statements.map((statement) => statement.set).filter((set): set is NftSet & { elem?: unknown } => set !== undefined);
+  if (sets.length !== 1) return undefined;
+  const [set] = sets;
+  if (!nftStatementOwned(set, tableName) || set.name !== HOST_SERVICE_SET_NAME || !nftSetTypeIsHostService(set.type)) return undefined;
+  if (set.elem === undefined) return [];
+  if (!Array.isArray(set.elem)) return undefined;
+  const members: HostServiceSetEntry[] = [];
+  for (const element of set.elem) {
+    const value = isRecord(element) && isRecord(element.elem) ? element.elem.val : element;
+    const entry = strictHostServiceEntry(value);
+    if (!entry) return undefined;
+    members.push(entry);
+  }
+  return members;
+}
+
+function sameHostServiceMembers(left: readonly HostServiceSetEntry[], right: readonly HostServiceSetEntry[]): boolean {
+  const leftKeys = sortHostServiceEntries(left).map(hostServiceEntryKey);
+  const rightKeys = sortHostServiceEntries(right).map(hostServiceEntryKey);
+  // Compared as sets: a kernel set holds each pair once.
+  return leftKeys.length === rightKeys.length && leftKeys.every((key, index) => key === rightKeys[index]);
+}
+
+function formatHostServiceMembers(entries: readonly HostServiceSetEntry[]): string {
+  const keys = sortHostServiceEntries(entries).map(hostServiceEntryKey);
+  return keys.length > 0 ? keys.join(", ") : "<none>";
 }
 
 function nftPriorityEquals(actual: unknown, expected: "filter" | "raw"): boolean {
@@ -255,10 +337,20 @@ export function validateProxyNftablesTableJson(input: ProxyNftablesProofInput): 
   }
 
   const sets = statements.map((statement) => statement.set).filter((set): set is NftSet => set !== undefined);
-  for (const expectedSet of [setName, DEFAULT_SESSION_SET_NAME, DEFAULT_AUDIT_SET_NAME, DEFAULT_AUDIT_DRAINING_SET_NAME]) {
+  const expectedSets: ReadonlyArray<{ name: string; concat: boolean }> = [
+    ...[setName, DEFAULT_SESSION_SET_NAME, DEFAULT_AUDIT_SET_NAME, DEFAULT_AUDIT_DRAINING_SET_NAME, HOST_SERVICE_GATEWAY_SET_NAME]
+      .map((name) => ({ name, concat: false })),
+    // Exactly these two sets are `ipv4_addr . inet_service`.
+    { name: HOST_SERVICE_SET_NAME, concat: true },
+    { name: HOST_SERVICE_DRAINING_SET_NAME, concat: true },
+  ];
+  for (const { name: expectedSet, concat } of expectedSets) {
     const found = sets.filter((set) => nftStatementOwned(set, tableName) && set.name === expectedSet);
-    if (found.length !== 1 || found[0]?.type !== "ipv4_addr") {
-      issues.push(`proxy firewall must install the ${expectedSet} IPv4 nftables set`);
+    const typeMatches = concat ? nftSetTypeIsHostService(found[0]?.type) : found[0]?.type === "ipv4_addr";
+    if (found.length !== 1 || !typeMatches) {
+      issues.push(concat
+        ? `proxy firewall must install the ${expectedSet} IPv4 address . port nftables set`
+        : `proxy firewall must install the ${expectedSet} IPv4 nftables set`);
     }
     const flags = found[0]?.flags;
     if (flags !== undefined && (!Array.isArray(flags) || flags.length !== 0)) {
@@ -373,6 +465,27 @@ export function validateProxyNftablesTableJson(input: ProxyNftablesProofInput): 
         && nftExprHasVerdict(expr, "drop"),
     },
     {
+      // Above the established accept for the same reason: a removed or
+      // re-addressed host-service pair is cut even mid-flow.
+      label: "egress-interface host-service drain-drop above established accept",
+      exprCount: 3,
+      matches: (expr) => nftExprHasMatch(expr, { kind: "meta", key: "oifname" }, input.egressIface)
+        && nftExprHasMatch(expr, { kind: "concat-daddr-dport" }, `@${HOST_SERVICE_DRAINING_SET_NAME}`)
+        && nftExprHasVerdict(expr, "drop"),
+    },
+    {
+      // The permanent cut (R19): any flow, from any uid, to a gateway pinned
+      // this supervisor lifetime on a pair NOT in @host_service is dropped
+      // above the established accept. The negated lookup is the load-bearing
+      // half: an `==` here would drop the approved pairs instead.
+      label: "egress-interface pinned-gateway cut of unapproved pairs above established accept",
+      exprCount: 4,
+      matches: (expr) => nftExprHasMatch(expr, { kind: "meta", key: "oifname" }, input.egressIface)
+        && nftExprHasMatch(expr, { kind: "payload", protocol: "ip", field: "daddr" }, `@${HOST_SERVICE_GATEWAY_SET_NAME}`)
+        && nftExprHasMatch(expr, { kind: "concat-daddr-dport" }, `@${HOST_SERVICE_SET_NAME}`, "!=")
+        && nftExprHasVerdict(expr, "drop"),
+    },
+    {
       label: "egress-interface established output accept",
       exprCount: 4,
       matches: (expr) => nftExprHasMatch(expr, { kind: "meta", key: "oifname" }, input.egressIface)
@@ -396,8 +509,22 @@ export function validateProxyNftablesTableJson(input: ProxyNftablesProofInput): 
         && nftExprHasMatch(expr, { kind: "payload", protocol: "tcp", field: "dport" }, 443)
         && nftExprHasVerdict(expr, "accept"),
     },
+    {
+      // uid 1001 only: root gets nothing from the host-service set.
+      label: "egress-interface proxy server UID host-service accept",
+      exprCount: 4,
+      matches: (expr) => nftExprHasMatch(expr, { kind: "meta", key: "oifname" }, input.egressIface)
+        && nftExprHasMatch(expr, { kind: "meta", key: "skuid" }, Number(serverUid))
+        && nftExprHasMatch(expr, { kind: "concat-daddr-dport" }, `@${HOST_SERVICE_SET_NAME}`)
+        && nftExprHasVerdict(expr, "accept"),
+    },
   ]);
 
   validateNftRules(issues, tableName, "forward", rulesByChain.get("forward") ?? [], []);
+
+  if (input.hostServiceElements !== undefined && input.expectedHostServiceElements !== undefined
+    && !sameHostServiceMembers(input.hostServiceElements, input.expectedHostServiceElements)) {
+    issues.push(`host_service members do not match the effective host services: kernel ${formatHostServiceMembers(input.hostServiceElements)}; expected ${formatHostServiceMembers(input.expectedHostServiceElements)}`);
+  }
   return issues;
 }

@@ -549,6 +549,30 @@ describe("service registry invariants", () => {
     expect(issues).toContain("node: migrations[0].requestRuleReplacements[0].to must equal the current service profile");
   });
 
+  test("validateServiceDefinition refuses a reserved runfree.internal host, including a credential-less service's own hosts (SR4/A1)", () => {
+    const invalidHost = { ...SERVICES.python, hosts: [{ host: "x.runfree.internal" }] } as Service;
+    const issues = validateServiceDefinition(invalidHost, { origin: "registry" });
+    expect(issues.some((issue) => issue.includes("reserved runfree.internal suffix"))).toBe(true);
+  });
+
+  test("validateServiceDefinition refuses a reserved runfree.internal host in migration requestRuleReplacements, even with an unsanctioned field that skips the from/to check (SR4/A1)", () => {
+    const invalidMigration = {
+      ...SERVICES.node,
+      migrations: [{
+        fromRevision: 1,
+        toRevision: 2,
+        requestRuleReplacements: [{
+          host: "x.runfree.internal",
+          field: "methods",
+          from: ["/a"],
+          to: ["/b"],
+        }],
+      }],
+    } as unknown as Service;
+    const issues = validateServiceDefinition(invalidMigration, { origin: "registry" });
+    expect(issues.some((issue) => issue.includes("reserved runfree.internal suffix"))).toBe(true);
+  });
+
   test("service lookups are case-insensitive and unknown ids return undefined", () => {
     expect(service("NODE")?.id).toBe("node");
     expect(service("nope")).toBeUndefined();

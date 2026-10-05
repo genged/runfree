@@ -121,6 +121,12 @@ export const COMMAND_EXAMPLES = {
     { cmd: "runfree host rules api.github.com", blurb: "Show the host's request rules (--clear removes them)" },
     { cmd: "runfree host rules api.github.com --write ask", blurb: "Hold writes to this host for approval" },
   ],
+  "host-service": [
+    { cmd: "runfree host-service add idb --port 10882", blurb: "Approve the host's 127.0.0.1:10882 for the agent after checking its listener" },
+    { cmd: "runfree host-service list", blurb: "List effective host services and who listens on each port" },
+    { cmd: "runfree host-service remove idb", blurb: "Remove an approved host service" },
+    { cmd: "runfree host-service list --repair", blurb: "Rebuild the host-global host-service port registry" },
+  ],
   credential: [
     { cmd: "runfree credential source add github-cli -- gh auth token", blurb: "Add a reusable host-owned command source" },
     { cmd: "runfree host add api.github.com", blurb: "Allow a custom credential destination first" },
@@ -199,6 +205,7 @@ const HELP_ALL_ORDER: readonly CommandExampleKey[] = [
   "deps",
   "git",
   "host",
+  "host-service",
   "credential",
   "service",
   "mcp",

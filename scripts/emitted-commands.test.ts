@@ -81,6 +81,7 @@ const FLAG_VALUE_FOR_TEMPLATE: Record<string, string> = {
   "--from-source": "src",
   "--from-1password": "op://vault/item/field",
   "--host": "api.example.com",
+  "--port": "8080",
   "--subject-digest": `sha256:${"a".repeat(64)}`,
 };
 
@@ -229,6 +230,10 @@ describe("emitted commands parse under the real command app", () => {
     // The lint must actually see the emitting modules; an empty scan would
     // pass vacuously.
     expect(candidates.length).toBeGreaterThan(40);
+    // The proxy's hand-written host-service remedy (it cannot import
+    // remedies.ts) is one of the parsed fragments, not skipped.
+    expect(candidates.some((candidate) =>
+      candidate.file === "packages/proxy/src/server.ts" && candidate.fragment.startsWith("runfree host-service add "))).toBe(true);
     const failures: string[] = [];
     for (const candidate of candidates) {
       if (REMOVED_COMMAND_FRAGMENTS.has(candidate.fragment)) continue;
@@ -249,5 +254,7 @@ describe("emitted commands parse under the real command app", () => {
     expect(await parseFailure(["host", "add", "api.example.com", "--bogus"])).toContain("Unknown argument: bogus");
     expect(await parseFailure(["host", "add", "api.example.com", "--no-reload"])).toBeUndefined();
     expect(await parseFailure(["credential", "source", "add", "gh", "--", "gh", "auth", "token"])).toBeUndefined();
+    expect(await parseFailure(["host-service", "add", "idb", "--port", "10882"])).toBeUndefined();
+    expect(await parseFailure(["host-service", "add", "idb", "--port", "010"])).toContain("--port must be a decimal port");
   });
 });

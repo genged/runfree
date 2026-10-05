@@ -1,4 +1,8 @@
-import { beforeEach, describe, expect, test, vi } from "vitest";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
 const SESSION_CONTAINER = "a".repeat(64);
 const SESSION_IP = "172.31.90.20";
@@ -15,6 +19,7 @@ vi.mock("./agent-exec-target.ts", () => ({
 }));
 
 import { createRuntimeAdapters } from "./adapters.ts";
+import { recordProjectHostServicePorts } from "../host-service-registry.ts";
 import {
   INGRESS_FORWARDER_IMAGE,
   ingressForwarderName,
@@ -43,6 +48,16 @@ const INGRESS_ROLE_FILTER = "label=io.runfree.container-role=ingress-forwarder";
 
 type Call = { command: string; args: string[] };
 
+let stateHome: string;
+
+beforeEach(() => {
+  stateHome = fs.mkdtempSync(path.join(os.tmpdir(), "runfree-vnc-registry-"));
+});
+
+afterEach(() => {
+  fs.rmSync(stateHome, { recursive: true, force: true });
+});
+
 function context(): RuntimeContext {
   return {
     projectRoot: PROJECT_ROOT,
@@ -53,7 +68,7 @@ function context(): RuntimeContext {
       },
     },
     runtimeRoot: "/runtime",
-    env: { PATH: "/bin" },
+    env: { PATH: "/bin", XDG_STATE_HOME: stateHome },
   } as unknown as RuntimeContext;
 }
 
@@ -293,6 +308,27 @@ describe("vnc start", () => {
     expect(captures.some((call) => call.args[0] === "exec" && call.args.join(" ").includes("x11vnc"))).toBe(false);
     expect(captures.every((call) => call.args[0] !== "exec" || call.args.join(" ").includes("/proc/net/tcp"))).toBe(true);
     expect(captures.some((call) => call.args[0] === "run")).toBe(true);
+  });
+
+  test("refuses a --host-port registered by another project before any docker call, so x11vnc is never started", async () => {
+    const otherRoot = "/workspace/other-project";
+    const otherProjectId = projectHash(otherRoot);
+    await recordProjectHostServicePorts({ XDG_STATE_HOME: stateHome }, { id: otherProjectId, root: otherRoot }, [10882]);
+    const { io, captures, runs } = fakeIo(() => undefined);
+    const ctx = context();
+
+    await expect(vncRuntime(
+      parseVncArgs(["start", "--host-port", "10882"], ctx.env ?? {}),
+      ctx,
+      io,
+      createRuntimeAdapters(ctx, io),
+      noDelay,
+    )).rejects.toThrow(new RegExp(otherRoot.replace(/\//g, "\\/")));
+
+    // Only the adapter's own docker-availability probe ran; nothing else did
+    // — not the agent target lookup, not x11vnc, not the forward.
+    expect(captures.every((call) => call.args[0] === "info")).toBe(true);
+    expect(runs).toEqual([]);
   });
 });
 

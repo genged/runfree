@@ -27,7 +27,13 @@ const plan: FirewallPlan = {
     auditSetName: "audit_ipv4",
     auditDrainingSetName: "audit_draining_ipv4",
     auditMaxElements: 256,
+    hostServiceSetName: "host_service",
+    hostServiceDrainingSetName: "host_service_draining",
+    hostServiceGatewaySetName: "host_service_gateways",
+    hostServiceGatewayMaxElements: 8,
+    hostServiceMaxElements: 64,
   },
+  hostServiceDrainSeconds: 30,
   refresh: {
     policyCheckIntervalSeconds: 1,
     dnsRefreshIntervalSeconds: 300,
@@ -56,6 +62,7 @@ function createRunner(options: {
   routes: string[];
   nftFails?: boolean;
   nftSetOutputs?: Record<string, string>;
+  nftMissingSets?: readonly string[];
 }): { calls: RecordedCall[]; runner: CommandRunner } {
   const calls: RecordedCall[] = [];
   const routes = [...options.routes];
@@ -73,6 +80,9 @@ function createRunner(options: {
         if (command === "nft") {
           if (options.nftFails) throw new Error("nft unavailable");
           const setName = args[0] === "list" && args[1] === "set" ? args[4] : undefined;
+          if (setName && options.nftMissingSets?.includes(setName)) {
+            throw new Error(`Error: No such file or directory; set ${setName}`);
+          }
           return { stdout: (setName && options.nftSetOutputs?.[setName]) ?? "", stderr: "" };
         }
         throw new Error(`unexpected command: ${command} ${args.join(" ")}`);
@@ -139,9 +149,25 @@ describe("proxy firewall route verification", () => {
       { command: "nft", args: ["list", "ruleset"], input: undefined },
       { command: "nft", args: ["list", "set", "inet", "runfree_proxy", "allowed_ipv4"], input: undefined },
       { command: "nft", args: ["list", "set", "inet", "runfree_proxy", "session_ipv4"], input: undefined },
+      { command: "nft", args: ["list", "set", "inet", "runfree_proxy", "host_service"], input: undefined },
+      { command: "nft", args: ["list", "set", "inet", "runfree_proxy", "host_service_draining"], input: undefined },
+      { command: "nft", args: ["list", "set", "inet", "runfree_proxy", "host_service_gateways"], input: undefined },
       { command: "nft", args: ["list", "set", "inet", "runfree_proxy", "audit_ipv4"], input: undefined },
       { command: "nft", args: ["list", "set", "inet", "runfree_proxy", "audit_draining_ipv4"], input: undefined },
     ]);
+  });
+
+  test("fails verification when any host-service set is missing, and passes once it exists", async () => {
+    for (const hostServiceSet of ["host_service", "host_service_draining", "host_service_gateways"] as const) {
+      const missing = createRunner({ routes: [routeJson("eth1", "172.30.1.10")], nftMissingSets: [hostServiceSet] });
+      await expect(verifyFirewallState(plan, missing.runner)).rejects.toThrow(`set ${hostServiceSet}`);
+    }
+    // Members legitimately change at runtime: a populated accept set verifies.
+    const populated = createRunner({
+      routes: [routeJson("eth1", "172.30.1.10")],
+      nftSetOutputs: { host_service: "set host_service {\n  elements = { 192.168.65.254 . 10882 }\n}" },
+    });
+    await expect(verifyFirewallState(plan, populated.runner)).resolves.toBeUndefined();
   });
 
   test("fails when nftables state cannot be inspected", async () => {

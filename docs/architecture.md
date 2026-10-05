@@ -215,6 +215,8 @@ The `proxy` service is the trusted network boundary. It enforces:
 - write actions: `allow`, `ask`, or `deny`;
 - credential header stripping and proxy-managed credential injection;
 - OAuth handle mediation;
+- opaque TCP splices to approved [host services](#host-services), and nothing
+  else under the reserved `runfree.internal` suffix;
 - structured denial logs for `runfree doctor`.
 
 The proxy reads a stable read-only XDG effective-control parent. Its strict
@@ -238,7 +240,9 @@ Canonical runtime source lives in:
 - `packages/agent-runtime/agent/` for agent-side runtime files, including the
   session entry (`session-entry.sh`) that gates the agent's start on
   activation, and `packages/agent-runtime/src/` for the TypeScript readiness
-  probe it runs, compiled by `tsc` into `agent/session-ready-probe.cjs`;
+  probe it runs, compiled by `tsc` into `agent/session-ready-probe.cjs`, and
+  the host-service relay the entry starts, compiled into
+  `agent/host-service-relay.cjs`;
 - `packages/proxy/src/` and `packages/proxy/Dockerfile` for the proxy;
 - `packages/cli/templates/` for initial project templates.
 
@@ -261,6 +265,7 @@ Do not edit generated runtime assets by hand.
 | XDG config root | host | host-owned sources and user-defined service definitions |
 | XDG data root | host | materialized runtime assets |
 | XDG state root | host | approvals, immutable effective controls, runtime generations, sessions, agent state, token sync state, proxy CA material |
+| `<XDG state>/runfree/host-service-ports.json` | host | host-global registry of every project's approved host-service ports; see [Host Services](#host-services) |
 | Docker volumes | Docker | dependency overlays, runtime volumes |
 | Docker Compose project | Docker | fixed `proxy`, networks, and named volumes; session agents are direct containers |
 
@@ -1023,6 +1028,11 @@ forwarder's command, networks, loopback publication, mounts, user,
 capabilities, and writable state. The allocator never hands out an address an
 ingress forwarder still targets, whatever its purpose.
 
+The [host-service relay](#host-services) is not a participant. It is a
+process inside the session container, bound to that session's loopback, with
+no address, network, or authority of its own. Its traffic reaches the proxy
+from the session's own source IP and is admitted as that session.
+
 #### Session MCP OAuth Callbacks
 
 When the selected OAuth policy names an MCP server, every launched session —
@@ -1244,7 +1254,8 @@ by a request-scoped grant.
 `blocked.invalid` certificate and answered with a synthetic 403 that names the
 host and the `runfree host add` (or `host rules`, `approvals --watch`)
 remedy. At most 32 denied tunnels run at once; past that, and for non-443
-CONNECT, the answer is a raw pre-TLS 403. Idle denied tunnels close after 5 s.
+CONNECT, the answer is a raw pre-TLS 403. The one non-443 CONNECT that can
+pass is an exact approved [host service](#host-services) pair. Idle denied tunnels close after 5 s.
 A certificate-validating client sees a TLS error, not the body, but the proxy
 still records a `proxy-denial:` event for `runfree doctor` and the session-end
 summary ([denial.ts](../packages/proxy/src/denial.ts)). Events are coalesced
@@ -1272,6 +1283,12 @@ accept, so in-flight audited uploads are cut.
 input   :8080 accepted only from @session_ipv4
 output  default drop; allow loopback, established, TCP 443 to @allowed_ipv4
         (and @audit_ipv4 in audit mode) on the egress interface
+        drop TCP to @host_service_draining (<gateway> . <port>) on the egress
+        interface, above the established accept
+        drop TCP to @host_service_gateways whose <gateway> . <port> is not in
+        @host_service, on the egress interface, above the established accept
+        allow TCP to @host_service (<gateway> . <port>) on the egress
+        interface for uid 1001 only
 dns     uid 1001 port 53 rejected before Docker DNS rewrite
 ipv6    loopback only
 ```
@@ -1280,7 +1297,9 @@ The supervisor resolves allowed hosts and rejects loopback, private,
 link-local, CGNAT, documentation, benchmark, multicast, reserved, broadcast,
 and runtime-subnet answers before they reach `allowed_ipv4` or the resolver
 snapshot. The request proxy answers `dns.lookup` only from that snapshot and
-does no DNS of its own.
+does no DNS of its own. The host-service gateway never enters `allowed_ipv4`
+or the snapshot; an allowlisted host that resolves to it is still rejected as
+a private answer.
 
 **Process hardening.** The proxy container adds `NET_ADMIN` and drops
 `NET_RAW`. The root entrypoint starts the server through `setpriv` as uid/gid
@@ -1303,6 +1322,242 @@ pins base images by digest, exact apt package versions, and release artifact
 checksums. A missing or malformed lock fails before any build. The apt sources
 are the live Ubuntu archives, not snapshots, so transitive apt dependencies
 can still drift without a lock change.
+
+### Host Services
+
+A host service is a TCP service on the Docker Desktop host's loopback that the
+agent may reach, such as `idb_companion` on `127.0.0.1:10882`. It is approved
+per project in desired policy and persists like an allowed host:
+
+```json
+{
+  "version": 2,
+  "hosts": [],
+  "hostServices": {
+    "idb": { "target": "host-loopback", "port": 10882 }
+  }
+}
+```
+
+- **Shape.** The name matches `[a-z][a-z0-9-]{0,62}` and is the label in
+  `<name>.runfree.internal`. `target` is a fixed keyword, never a hostname:
+  `host-loopback` is the only supported value, and the reserved `address`
+  target is refused as not supported yet. `port` is an integer from 1 to
+  65535. Unknown keys are refused, and a policy holds at most 64 entries.
+- **Layers.** A port appears once across the project and checkout-local
+  layers, and a name is approved in one layer only; the compiler refuses
+  either conflict.
+- **Refused ports.** 2375 and 2376 (Docker Engine), 3128, 5901 (Runfree's VNC
+  default), and 47100–48099 (Runfree's MCP callback block) are refused by
+  every validator.
+- **Approval.** An added entry, a changed port, or a changed target is a
+  widening, so it always needs host review; only a removal is an automatic
+  reduction. Review output lists host-service changes.
+- **Reserved suffix.** `runfree.internal` and every name under it are refused
+  by every hostname validator (hosts, request rules, credential hosts, service
+  definitions, `--oauth-host`, discovered MCP hosts) and dropped from the
+  audit spool.
+
+Data path:
+
+```text
+agent client: idb connect 127.0.0.1 10882           (client unchanged)
+   v
+session relay on 127.0.0.1:10882 (routing only, no authority)
+   | CONNECT idb.runfree.internal:10882 to the proxy
+   v
+proxy (admitted session source IP only)
+   classifyConnect, first check, every port, every mode:
+     host under runfree.internal?
+       not exactly <name>.runfree.internal:<port> -> raw 403
+       name not in the effective policy           -> raw 403
+       effective[name].port != port               -> raw 403
+     else:
+       gateway file missing, invalid, or names
+         another effective policy generation      -> raw 403
+       session, global, or pending-dial cap hit   -> raw 403
+       dial <pinned gateway IPv4 literal>:<port> (5 s timeout)
+         failed or timed out                      -> raw 403
+         connected -> 200, then opaque splice
+   v
+firewall: uid 1001 to @host_service (<gateway> . <port>) on the egress interface
+   v
+Docker Desktop host gateway -> host 127.0.0.1:<port>
+```
+
+- Every policy refusal happens before any dial, DNS lookup, or audit spool
+  write. A failed or timed-out dial refuses before any 200.
+  A reserved name on 443 or in audit mode never reaches the denied tunnel,
+  audit, mockttp, or DNS. A refusal that names a valid service and port
+  carries the remedy `runfree host-service add <name> --port <port>`, labelled
+  as requested by the agent.
+- The splice is opaque: no TLS interception, no request rules, no header
+  stripping, no credential injection, and no write approval. Bytes the client
+  sent after the CONNECT head are forwarded once the dial succeeds. Both legs
+  use TCP keepalive; there is no idle timeout.
+- Limits ([server.ts](../packages/proxy/src/server.ts)): 32 splices per
+  session, 256 in all, and 64 dials pending. A cap refusal frees as splices
+  close.
+- Each splice is tied to its client socket, so session revoke and the
+  [IP reuse fence](#ip-reuse-fence) cut it with the session's sockets.
+
+**Session relay.** Clients such as `fb-idb` ignore proxy variables, so the
+session entry starts one relay process
+([host-service-relay.cts](../packages/agent-runtime/src/host-service-relay.cts))
+in the background before the readiness loop and never waits for it. It binds
+`127.0.0.1:<port>` only, on the same port number as the host, for each entry of
+`RUNFREE_HOST_SERVICES`, a host-owned `name:port` list that the session
+template renders from the network policy of the same effective policy
+generation as the session's agent environment. The relay runs as the agent
+user with no added authority; a port it cannot bind (for example one another
+process in the session already holds) is skipped with a warning. A missing
+relay binary, a crash, or a bind failure never changes the entry's exit code
+or delays its final `exec`. The relay binds first, so a later agent process
+that wants the same port gets `EADDRINUSE`. It binds loopback only, and each session has its own network
+namespace, so a peer session cannot reach it. A service added mid-session
+appears in the next session: the live activation advances the effective
+policy generation only, and the next startup (which every launch runs)
+selects the desired session agent whose template renders the new list.
+Live sessions keep their materialization.
+
+**Gateway address.** The proxy service carries the literal Compose entry
+`extra_hosts: ["gateway.runfree.internal:host-gateway"]`, and the topology
+proof requires `HostConfig.ExtraHosts` to be exactly that entry. The root
+firewall supervisor reads the alias from `/etc/hosts` in its maintenance pass
+(every 2 s, never in the admission loop):
+
+- `/etc/hosts` must be a root-owned regular file with no group or other write
+  bit;
+- the alias token must map to exactly one IPv4 address; IPv6 lines are
+  ignored;
+- the address must be RFC 1918 and not loopback, link-local, a runtime subnet,
+  the egress gateway, or a proxy address.
+
+The first valid read pins the address for the supervisor's lifetime. Before
+the pin, an invalid read refuses host services with a named cause, and the
+next valid read recovers. After the pin, a different or invalid read is
+sticky: `@host_service` is emptied, its pairs move to draining, and host
+services refuse with `gateway address changed`. The reclaim is `runfree
+rebuild`, which recreates the proxy and drains every session.
+
+Root hands the pin to the request proxy in a root-owned `0644` file,
+`/run/runfree-proxy-status/host-service-gateway.json`
+(`{schemaVersion, policyGeneration, gatewayIp | unavailableReason, writtenAt}`).
+The request proxy reads it on every admitted CONNECT, with the same owner,
+type, link-count, and size checks as session files, and dials only that IPv4
+literal when the file names its current network policy generation. The
+gateway is also withheld while a host-service set write is failing. After any
+policy reload, even one that does not touch host services, new host-service
+CONNECTs refuse with `host-service-unavailable` for about 2 s, until the
+supervisor's next maintenance pass republishes the file for the new effective
+policy generation. Open splices are not affected.
+
+**Revocation.** Both consumers cut independently, on a removal and on a
+gateway change or withdrawal:
+
+1. The request proxy destroys both legs of a splice:
+   - on a policy reload, every splice whose name and port left the effective
+     policy, before it publishes the status that names the new effective
+     policy generation;
+   - on its policy watch tick (every second), when the gateway file changed
+     since its last read, every splice if the file is missing, invalid, or
+     carries `unavailableReason`, and every splice dialled to another address
+     than the file's `gatewayIp`. A file that names another effective policy
+     generation with the same address cuts nothing: the supervisor republishes
+     the file for every effective policy generation, so a short skew is
+     normal.
+
+   Each cut logs `proxy: host-service splices cut: <count>; reason: <reason>`
+   and republishes the request-proxy status.
+2. The firewall moves removed or re-addressed pairs from `@host_service` to
+   `@host_service_draining` in one atomic batch. That set's drop rule sits
+   above the established-connection accept, so in-flight packets stop at
+   once. The pairs leave the draining set after a 30 s drain window. The
+   permanent cut is a second drop rule above the established accept:
+   `ip daddr @host_service_gateways ip daddr . tcp dport != @host_service
+   drop`. `@host_service_gateways` holds every gateway the supervisor pinned
+   in its lifetime, and every host-service batch refills it before the accept
+   set, so a pair is never accepted without its cut. A flow to a pinned
+   gateway on a pair that is not currently approved is dropped for as long
+   as that holds, for every uid, even when the request proxy did not cut it
+   (a stale request proxy, or a flow it never tracked). The draining set
+   stays as defence in depth with the same effect inside its window.
+
+On a removal, each consumer applies its cut before it publishes the status
+that names the new effective policy generation, and activation waits for both
+statuses, so `runfree host-service remove` reports `live now` only after both
+have cut. Convergence comes from that ordering alone. The firewall status also
+carries a digest of both sets and the draining count, and the request-proxy
+status records the open splices per service at each publish; these fields are
+diagnostics, and nothing reads them to decide convergence. On a gateway change
+or withdrawal, the request proxy cuts open splices within about a second, the
+firewall drops their packets from then on, and new CONNECTs refuse.
+
+**Port admission and the registry.** `runfree host-service add` checks the
+port before the policy transaction, outside the project lifecycle lock:
+
+1. the static refusals above;
+2. `lsof -nP +c 0 -iTCP:<port> -sTCP:LISTEN -Fpcn` on the host must show a
+   visible listener bound to `127.0.0.1:<port>` or `*:<port>`, the addresses
+   the gateway reaches. No visible listener refuses; this also catches ports
+   Docker Desktop answers from its VM. A root-owned listener is invisible to
+   the unprivileged `lsof`, so it refuses as "no visible listener" too. A
+   listener only on `[::1]` or a LAN address refuses with its address. No
+   listener on any address may be a `com.docker.*` process (a published
+   container port);
+3. the review line names the admitted process and pid.
+
+The same admission runs on every other host approval path that approves a
+host service added or re-ported relative to the approved layer: the startup
+review, `runfree policy approve`, `runfree control approve`, the
+checkout-binding review, and the setup wizard's base review. It runs after the
+candidate capture releases the lifecycle lock and before any approval write.
+A refusal names each entry, its reason, and the review command; the review
+line reads, for example, `host service idb: null -> 127.0.0.1:10882
+(idb_companion, pid 4242)`.
+
+Every launch and `runfree status` repeat the owner check for each effective
+entry and warn, without blocking, when there is no listener, Docker Desktop
+owns the port, or the process differs from the one recorded.
+
+The host-global registry `<XDG state>/runfree/host-service-ports.json` records
+every project's effective host-service ports. `host-service add` and `remove`
+refresh it after activation, each launch refreshes it for a project that has
+host services or a registry row, and a completed `runfree destroy` prunes it.
+In every other project, `runfree forward` and `runfree vnc` refuse a
+registered port and name every owning project, and MCP callback port selection
+skips it. Several projects may approve the same port (two projects sharing one
+`idb_companion`, for example); only a duplicate port inside one project's row
+is invalid. A corrupt or
+unreadable registry makes `forward` and `vnc` refuse; the callback block is
+never a host-service port, so it is unaffected. `runfree host-service list
+--repair` rebuilds the registry from the selected effective policy generation
+of each known project that still has a runtime (a control-plane selection or a
+rebind recovery journal). A destroyed or never-launched project contributes no
+row; its next launch records one. If any such project's selection cannot be
+read, the repair writes nothing and exits non-zero, naming the project and its
+state directory: writing without its ports could free a port it still uses.
+The reclaim is to repair or destroy that project, or to remove its state
+directory when the checkout is gone, and run the repair again.
+
+`runfree doctor` and the session-end summary classify host-service denials on
+their own, never as missing hosts (`runfree host add` refuses the reserved
+suffix): a `host-service-not-configured` request with a valid name and a port
+`add` would not refuse suggests `runfree host-service add <name> --port
+<port>`, labelled as requested by the agent; any other such request gets no
+remedy; `host-service-unavailable` and `host-service-capacity` point to
+`runfree status`. The proxy's own refusal also omits the `add` remedy for a
+statically refused port.
+
+**Host-side proof.** Each launch's topology proof checks the proxy
+`ExtraHosts` and `/etc/hosts`, the three set types and their rules, and that
+the kernel members of `@host_service` equal the effective ports paired with
+the published gateway. The members of `@host_service_gateways` are not read
+back by the host; the renderer refuses any batch whose accepted pairs are not
+at a gateway in that set. On the full path (not a matching warm launch),
+agent-position probes to `<gateway>:<port>` must fail, and proxy-position
+probes must time out (a dropped SYN): root to each approved port, and uid 1001
+to an unapproved port.
 
 ### Checkout Binding
 
@@ -1522,6 +1777,7 @@ A project image may replace the base image's session entry (`/usr/local/libexec/
 - `runfree resume` inventories and resumes interrupted Claude or Codex sessions; Pi evidence is listed but Pi has no resume command.
 - `runfree vnc` starts an x11vnc session in the agent and forwards it through a loopback-only sidecar for headed UI workflows.
 - `runfree forward` opens a loopback-only host port forward into the agent through a labeled, pinned-image ingress forwarder; `runfree forward status` lists open forwards.
+- `runfree host-service add|remove|list` approves agent access to a TCP service on the host's loopback, carried by the session relay and an opaque proxy splice; see [Host Services](#host-services).
 - `runfree git repair-worktree-links` repairs host Git worktree metadata to use relative links.
 
 ## Development And Verification

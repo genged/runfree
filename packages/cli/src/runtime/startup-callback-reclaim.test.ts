@@ -30,6 +30,7 @@ const context = { projectRoot: "/workspace/project", env: {} } as unknown as Run
 const io = {} as RuntimeIO;
 const docker = {} as never;
 const lifecycleLock = { assertHeld: mocks.assertHeld } as unknown as ProjectLifecycleLock;
+const effectiveHostServices = { policyGeneration: `sha256:${"a".repeat(64)}`, ports: [5432] };
 const staleIssue = {
   code: "utility-ingress-forwarder-shape",
   message: "mcp-callback forwarder x must target its own live session's internal IP",
@@ -46,7 +47,7 @@ describe("startup topology validation and dead callback routes", () => {
       .mockReturnValueOnce({ issues: [] });
     mocks.reclaim.mockReturnValue(1);
 
-    const result = validateRuntimeTopologyOrRemoveInvalid(plan, context, io, docker, { lifecycleLock });
+    const result = validateRuntimeTopologyOrRemoveInvalid(plan, context, io, docker, { lifecycleLock, effectiveHostServices });
 
     expect(result.status).toBe(0);
     expect(mocks.assertHeld).toHaveBeenCalled();
@@ -55,13 +56,17 @@ describe("startup topology validation and dead callback routes", () => {
       internalNetwork: "runfree-0123456789ab_agent_internal",
     }));
     expect(mocks.validate).toHaveBeenCalledTimes(2);
+    // Both proofs judge @host_service against the same effective host services.
+    for (const call of mocks.validate.mock.calls) {
+      expect(call[2]).toEqual(expect.objectContaining({ effectiveHostServices }));
+    }
   });
 
   test("keeps the refusal when nothing was reclaimable", () => {
     mocks.validate.mockReturnValue({ issues: [staleIssue] });
     mocks.reclaim.mockReturnValue(0);
 
-    expect(validateRuntimeTopologyOrRemoveInvalid(plan, context, io, docker, { lifecycleLock }).status).toBe(1);
+    expect(validateRuntimeTopologyOrRemoveInvalid(plan, context, io, docker, { lifecycleLock, effectiveHostServices }).status).toBe(1);
     expect(mocks.validate).toHaveBeenCalledTimes(1);
   });
 
@@ -69,22 +74,22 @@ describe("startup topology validation and dead callback routes", () => {
     mocks.validate.mockReturnValue({ issues: [staleIssue] });
     mocks.reclaim.mockImplementation(() => { throw new Error("Cannot connect to the Docker daemon"); });
 
-    expect(validateRuntimeTopologyOrRemoveInvalid(plan, context, io, docker, { lifecycleLock }).status).toBe(1);
+    expect(validateRuntimeTopologyOrRemoveInvalid(plan, context, io, docker, { lifecycleLock, effectiveHostServices }).status).toBe(1);
     expect(mocks.validate).toHaveBeenCalledTimes(1);
   });
 
   test("never mutates without the lifecycle lock or in a read-only validation", () => {
     mocks.validate.mockReturnValue({ issues: [staleIssue] });
 
-    expect(validateRuntimeTopologyOrRemoveInvalid(plan, context, io, docker).status).toBe(1);
-    expect(validateRuntimeTopologyOrRemoveInvalid(plan, context, io, docker, { lifecycleLock, readOnly: true }).status).toBe(1);
+    expect(validateRuntimeTopologyOrRemoveInvalid(plan, context, io, docker, { effectiveHostServices }).status).toBe(1);
+    expect(validateRuntimeTopologyOrRemoveInvalid(plan, context, io, docker, { lifecycleLock, readOnly: true, effectiveHostServices }).status).toBe(1);
     expect(mocks.reclaim).not.toHaveBeenCalled();
   });
 
   test("a healthy topology spends nothing on reclaim", () => {
     mocks.validate.mockReturnValue({ issues: [] });
 
-    expect(validateRuntimeTopologyOrRemoveInvalid(plan, context, io, docker, { lifecycleLock }).status).toBe(0);
+    expect(validateRuntimeTopologyOrRemoveInvalid(plan, context, io, docker, { lifecycleLock, effectiveHostServices }).status).toBe(0);
     expect(mocks.reclaim).not.toHaveBeenCalled();
   });
 });
