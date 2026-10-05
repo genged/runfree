@@ -138,7 +138,9 @@ function citedRepoPaths(markdown: string, topLevel: ReadonlySet<string>): string
  */
 function linkedRelativePaths(markdown: string): string[] {
   const linked = new Set<string>();
-  for (const link of markdown.matchAll(/\]\(([^()\s]+)\)/gu)) {
+  // Code is not a link: a regex like `[a](?:b)` in a code span is not one.
+  const prose = markdown.replace(/^```[^\n]*\n[\s\S]*?^```/gmu, "").replace(/`[^`\n]+`/gu, "");
+  for (const link of prose.matchAll(/\]\(([^()\s]+)\)/gu)) {
     const target = (link[1] as string).split("#")[0] as string;
     if (target === "" || /^[a-z][a-z0-9+.-]*:/iu.test(target) || target.startsWith("/")) continue;
     linked.add(target);

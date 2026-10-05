@@ -188,6 +188,18 @@ describe("spec-citation static gate", () => {
     expect(result.stderr).toContain("cited path no longer resolves: packages/gone.ts");
   });
 
+  test("ignores link-shaped text inside code spans and fenced blocks", () => {
+    writeSpec(
+      "2026-09-01-code-design.md",
+      `${CURRENCY}Pattern \`[a-z](?:[a-z._-]*[a-z])?\`.\n\n\`\`\`\n[x](./fenced-missing.md)\n\`\`\`\n\nSee [the other spec](./missing-design.md).\n`,
+    );
+    const result = runGate(["--repo-root", fixtureRoot]);
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("linked file does not resolve: ./missing-design.md");
+    expect(result.stderr).not.toContain("?:");
+    expect(result.stderr).not.toContain("fenced-missing");
+  });
+
   test("rejects a link that escapes the repository instead of counting it as evidence", () => {
     writeSpec(
       "2026-09-01-escape-design.md",
