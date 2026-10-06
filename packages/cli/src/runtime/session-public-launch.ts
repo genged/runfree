@@ -17,6 +17,9 @@
 // public-facing frame: builtin-name validation, the lifecycle lock with a
 // bounded retry, and the outcome-to-exit-status mapping.
 
+import crypto from "node:crypto";
+
+import { builtinAgent } from "../agents.ts";
 import { CliError } from "../errors.ts";
 import { warn } from "../warnings.ts";
 import { LIFECYCLE_LOCK_WAITER_YIELD_MS, launchHandoffSpanFits } from "./launch-lock-hold.ts";
@@ -95,9 +98,19 @@ export async function launchConfiguredAgentThroughAdmission(
   input: SessionPublicLaunchInput,
 ): Promise<number> {
   const agent = assertBuiltinLaunchAgent(input.agentName);
+  // Minted once per public launch, outside `withSessionLaunchFrame`'s retry
+  // loop, so an admission retry with a re-prepared runtime keeps the same
+  // conversation instead of starting a second one (spec §2, plan decision
+  // P1). Only an agent that declares the flag gets one; Codex has none.
+  const launchConversationId = builtinAgent(agent)?.launchConversationIdFlag
+    ? crypto.randomUUID()
+    : undefined;
   return await withOutcomeLine(
     `${input.agentName} did not start`,
-    () => withSessionLaunchFrame(input, (driver) => driver.launchBuiltin(agent)),
+    () => withSessionLaunchFrame(
+      input,
+      (driver) => driver.launchBuiltin(agent, launchConversationId ? { launchConversationId } : {}),
+    ),
   );
 }
 

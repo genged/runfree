@@ -1211,6 +1211,96 @@ describe("internal session admission driver", () => {
     );
   });
 
+  test("a fresh claude launch threads its host-chosen conversation id into preflight and host evidence", async () => {
+    const ID = "0f8b1a2c-3d4e-4f5a-8b6c-7d8e9f0a1b2c";
+    mocks.builtinAgent.mockReturnValue({
+      id: "claude",
+      label: "Claude",
+      defaultCommand: "claude",
+      launchConversationIdFlag: "--session-id",
+    });
+    const driver = createInternalSessionAdmissionDriver({
+      ...fixture(),
+      nowEpochMs: () => Date.parse("2026-08-09T00:00:00.000Z"),
+    });
+
+    const outcome = await driver.launchBuiltin("claude", { launchConversationId: ID });
+
+    expect(outcome).toEqual({ status: 0, signal: null });
+    // This is the one host-controlled boundary the host-chosen id crosses on
+    // its way to container argv: the typed preflight launch input. The exact
+    // `--session-id <ID>` argv itself is the builder's own contract (proved by
+    // `session-builtin-launch.test.ts`).
+    expect(mocks.createPreflight).toHaveBeenCalledWith(
+      expect.objectContaining({
+        launch: expect.objectContaining({ kind: "builtin", agentId: "claude", launchConversationId: ID }),
+      }),
+    );
+    expect(mocks.createSessionMetadata).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.anything(),
+      "claude",
+      "claude",
+      expect.objectContaining({ launchConversationId: ID }),
+    );
+  });
+
+  test("a fresh claude launch with no host-chosen id is refused before any Docker call", async () => {
+    mocks.builtinAgent.mockReturnValue({
+      id: "claude",
+      label: "Claude",
+      defaultCommand: "claude",
+      launchConversationIdFlag: "--session-id",
+    });
+    const driver = createInternalSessionAdmissionDriver({
+      ...fixture(),
+      nowEpochMs: () => Date.parse("2026-08-09T00:00:00.000Z"),
+    });
+
+    await expect(driver.launchBuiltin("claude")).rejects.toThrow(
+      "a fresh claude launch requires a host-chosen conversation id",
+    );
+
+    expect(mocks.createPreflight).not.toHaveBeenCalled();
+    expect(mocks.createContainer).not.toHaveBeenCalled();
+  });
+
+  test("a resume launch carrying a host-chosen conversation id is refused before any Docker call", async () => {
+    const ID = "0f8b1a2c-3d4e-4f5a-8b6c-7d8e9f0a1b2c";
+    mocks.builtinAgent.mockReturnValue({
+      id: "claude",
+      label: "Claude",
+      defaultCommand: "claude",
+      launchConversationIdFlag: "--session-id",
+    });
+    const driver = createInternalSessionAdmissionDriver({
+      ...fixture(),
+      nowEpochMs: () => Date.parse("2026-08-09T00:00:00.000Z"),
+    });
+
+    await expect(driver.launchBuiltin("claude", { launchConversationId: ID, resume: { conversationId: ID } }))
+      .rejects.toThrow("a resume launch cannot carry a host-chosen conversation id");
+
+    expect(mocks.createPreflight).not.toHaveBeenCalled();
+    expect(mocks.createContainer).not.toHaveBeenCalled();
+  });
+
+  test("a fresh codex launch needs no host-chosen conversation id: codex has no launch-id flag", async () => {
+    const driver = createInternalSessionAdmissionDriver({
+      ...fixture(),
+      nowEpochMs: () => Date.parse("2026-08-09T00:00:00.000Z"),
+    });
+
+    const outcome = await driver.launchBuiltin("codex");
+
+    expect(outcome).toEqual({ status: 0, signal: null });
+    expect(mocks.createPreflight).toHaveBeenCalledWith(
+      expect.objectContaining({
+        launch: expect.not.objectContaining({ launchConversationId: expect.anything() }),
+      }),
+    );
+  });
+
   // A teardown the proxy blocks is the owner's failure to report, and it must
   // not be confused with the agent's own exit: the process ended cleanly, so
   // its session evidence is consumed rather than preserved as interrupted.

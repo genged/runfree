@@ -24,10 +24,12 @@
 // read as a pass.
 
 import * as childProcess from "node:child_process";
+import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 
+import { builtinAgent } from "../../packages/cli/src/agents.ts";
 import { createCommandContext } from "../../packages/cli/src/commands/context.ts";
 import { flushWarnings } from "../../packages/cli/src/warnings.ts";
 import { createRuntimeSecurityContract } from "../../packages/cli/src/runtime/security-contract.ts";
@@ -38,7 +40,10 @@ import {
   sessionAdmissionFirewallSetReadCommand,
   sessionFileDeleteCommand,
 } from "../../packages/cli/src/runtime/session-file-publisher.ts";
-import { createInternalSessionAdmissionDriver } from "../../packages/cli/src/runtime/session-admission-driver.ts";
+import {
+  createInternalSessionAdmissionDriver,
+  type SessionAdmissionLaunchOptions,
+} from "../../packages/cli/src/runtime/session-admission-driver.ts";
 import {
   classifySessionContainerReconciliation,
   inspectSessionContainerInventory,
@@ -90,6 +95,19 @@ export const CRASH_REPORT_PREFIX = '{"v":1,"kind":"runfree-session-admission-cra
  * line and no completion is proof the crash happened where it says.
  */
 export const CRASH_INJECTION_MARKER = "crash-injection: killing after";
+
+/**
+ * A fresh launch's options for the production launch path below: a
+ * host-chosen conversation id, minted the same way the public launch frame
+ * mints one (spec §2), for an agent descriptor that declares the flag; none
+ * for Codex, which has no flag and would be refused if given one.
+ */
+function freshLaunchOptions(agent: SessionAdmissionProbeAgent): SessionAdmissionLaunchOptions {
+  const launchConversationId = builtinAgent(agent)?.launchConversationIdFlag
+    ? crypto.randomUUID()
+    : undefined;
+  return launchConversationId ? { launchConversationId } : {};
+}
 
 /**
  * Prefix for one observed Docker command in `--list-commands` output.
@@ -1227,7 +1245,7 @@ async function launchAndReport(options: CrashOptions): Promise<CrashLaunchReport
       }, LAUNCH_OBSERVER_POLL_INTERVAL_MS);
       observer.unref?.();
 
-      outcome = await driver.launchBuiltin(options.agent);
+      outcome = await driver.launchBuiltin(options.agent, freshLaunchOptions(options.agent));
     } catch (error) {
       failure = renderFailure(error);
     } finally {
@@ -1514,7 +1532,7 @@ async function crash(options: CrashOptions): Promise<never> {
       watchForAttachedSession();
       // The only caller of the production launch path anywhere in the repo.
       // Everything else drives `probeBuiltin`, which never activates.
-      await driver.launchBuiltin(options.agent);
+      await driver.launchBuiltin(options.agent, freshLaunchOptions(options.agent));
     } else {
       await driver.probeBuiltin(options.agent);
     }

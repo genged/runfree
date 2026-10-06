@@ -331,6 +331,16 @@ export type SessionAdmissionLaunchOptions = Readonly<{
    * retryable representation of the interrupted conversation.
    */
   resume?: SessionAdmissionResumeRequest;
+  /**
+   * Host-chosen conversation id for a fresh launch only (spec `local/specs/
+   * 2026-10-04-same-terminal-session-resume-design.md` section 2). The public
+   * launch frame mints this once with `crypto.randomUUID()`, outside its own
+   * retry loop, so an admission retry after a re-prepared runtime still
+   * resumes the same conversation. Never present together with `resume`: the
+   * preflight builder refuses both the resume-plus-id combination and a fresh
+   * launch of an agent that accepts the flag but was given no id.
+   */
+  launchConversationId?: string;
 }>;
 
 export type InternalSessionAdmissionDriver = Readonly<{
@@ -1337,6 +1347,19 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
       if (!descriptor || descriptor.id !== this.agent) {
         throw new Error(`unknown built-in admission probe agent: ${this.agent}`);
       }
+      // Host-chosen conversation id shape, refused here — before allocation,
+      // container creation, or any other Docker effect (spec §2). Resume argv
+      // is descriptor-owned recovery authority and must never carry a fresh
+      // launch's id; a descriptor that accepts one must always get one for a
+      // fresh launch, or a killed client's crash evidence could not be matched
+      // back to the same-terminal conversation that started it.
+      if (this.#launch?.resume && this.#launch.launchConversationId !== undefined) {
+        throw new Error("a resume launch cannot carry a host-chosen conversation id");
+      }
+      if (this.#launch && !this.#launch.resume && descriptor.launchConversationIdFlag
+        && this.#launch.launchConversationId === undefined) {
+        throw new Error(`a fresh ${descriptor.id} launch requires a host-chosen conversation id`);
+      }
       // Launch mode threads the project's real configured command, so a
       // customized command is refused here — before allocation, container
       // creation, or any other Docker effect — instead of being silently
@@ -1353,6 +1376,9 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
         agentId: descriptor.id,
         configuredCommand,
         ...(this.#launch?.resume ? { resume: this.#launch.resume } : {}),
+        ...(this.#launch?.launchConversationId !== undefined
+          ? { launchConversationId: this.#launch.launchConversationId }
+          : {}),
       };
     }
     this.#preflight = createSessionAdmissionDriverPreflight({
@@ -1693,6 +1719,7 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
     // keeps the survivor exact rather than a picker item.
     if (this.#launch) {
       const resumeConversationId = this.#launch.resume?.conversationId;
+      const launchConversationId = this.#launch.launchConversationId;
       const metadata = createSessionMetadata(
         this.#input.context,
         this.#gateway.io,
@@ -1702,6 +1729,7 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
           id: provisioningPlan.record.sessionId,
           sessionContainerName: provisioningPlan.record.containerName,
           ...(resumeConversationId !== undefined ? { resumeConversationId } : {}),
+          ...(launchConversationId !== undefined ? { launchConversationId } : {}),
         },
       );
       writeSessionMetadata(this.#input.context, metadata);

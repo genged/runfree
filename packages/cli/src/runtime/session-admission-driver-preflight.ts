@@ -239,7 +239,19 @@ export type SessionAdmissionResumeRequest = Readonly<{
  * points at, so project config must not be able to affect it.
  */
 export type SessionAdmissionPreflightLaunch =
-  | Readonly<{ kind: "builtin"; agentId: string; configuredCommand: string; resume?: SessionAdmissionResumeRequest }>
+  | Readonly<{
+      kind: "builtin";
+      agentId: string;
+      configuredCommand: string;
+      resume?: SessionAdmissionResumeRequest;
+      /**
+       * Host-chosen conversation id for a fresh launch only (spec §2); never
+       * present together with `resume`. The driver mints and refuses this
+       * before preflight runs, so by the time it is threaded into
+       * `createBuiltinSessionLaunchTarget` below it is already validated shape.
+       */
+      launchConversationId?: string;
+    }>
   | Readonly<{ kind: "shell" }>;
 
 export function createSessionAdmissionDriverPreflight(input: Readonly<{
@@ -314,6 +326,9 @@ export function createSessionAdmissionDriverPreflight(input: Readonly<{
       : createBuiltinSessionLaunchTarget({
           agentId: input.launch.agentId,
           configuredCommand: input.launch.configuredCommand,
+          ...(input.launch.launchConversationId !== undefined
+            ? { launchConversationId: input.launch.launchConversationId }
+            : {}),
         });
   const imageExpectation = expectedManagedImage(snapshot.desired.manifest);
 

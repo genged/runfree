@@ -44,6 +44,9 @@ import { tryAcquireProjectLifecycleLock, tryAcquireProjectLifecycleLockWithRetry
 import { LAUNCH_HANDOFF_STARTUP_SPAN_MAX_MS } from "./launch-lock-hold.ts";
 import type { RuntimeContext, RuntimeIO } from "./types.ts";
 
+// Host-chosen ids are minted by `crypto.randomUUID()`, always lowercase.
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+
 let tmp: string;
 let projectRoot: string;
 let stateDir: string;
@@ -103,7 +106,12 @@ describe("public launch through session admission", () => {
     });
 
     expect(status).toBe(0);
-    expect(mocks.launchBuiltin).toHaveBeenCalledWith("claude");
+    // Claude declares the host-chosen conversation id flag, so a fresh public
+    // launch mints one (spec §2).
+    expect(mocks.launchBuiltin).toHaveBeenCalledWith(
+      "claude",
+      { launchConversationId: expect.stringMatching(UUID_PATTERN) },
+    );
     const driverInput = mocks.createDriver.mock.calls[0]?.[0] as {
       sessionLockManager?: { lock: unknown };
       lifecycleLock?: unknown;
@@ -366,6 +374,41 @@ describe("public launch through session admission", () => {
     expect(reprepare).toHaveBeenCalledTimes(1);
     expect(mocks.createDriver).toHaveBeenCalledTimes(2);
     expect(mocks.createDriver.mock.calls[1]?.[0]).toEqual(expect.objectContaining({ preparedRuntime: second }));
+  });
+
+  test("mints one host-chosen conversation id per public launch and reuses it across an admission retry", async () => {
+    // Spec §2 / plan decision P1: the id is minted once, outside the frame's
+    // retry loop, so a re-prepared runtime admission retry still resumes the
+    // same conversation rather than two different ones.
+    const first = preparedRuntime();
+    const second = preparedRuntime();
+    mocks.launchBuiltin.mockImplementationOnce(() => {
+      throw new StalePreparedRuntimeError("the proxy restarted after startup prepared this launch");
+    });
+
+    const status = await launchConfiguredAgentThroughAdmission({
+      preparedRuntime: first,
+      io,
+      agentName: "claude",
+      reprepare: async () => second,
+    });
+
+    expect(status).toBe(0);
+    expect(mocks.launchBuiltin).toHaveBeenCalledTimes(2);
+    const firstOptions = mocks.launchBuiltin.mock.calls[0]?.[1] as { launchConversationId?: string };
+    const secondOptions = mocks.launchBuiltin.mock.calls[1]?.[1] as { launchConversationId?: string };
+    expect(firstOptions.launchConversationId).toMatch(UUID_PATTERN);
+    expect(secondOptions.launchConversationId).toBe(firstOptions.launchConversationId);
+  });
+
+  test("codex has no host-chosen conversation id flag, so the public launch mints none", async () => {
+    await launchConfiguredAgentThroughAdmission({
+      preparedRuntime: preparedRuntime(),
+      io,
+      agentName: "codex",
+    });
+
+    expect(mocks.launchBuiltin).toHaveBeenCalledWith("codex", {});
   });
 
   test("refuses repeated preparation drift at the retry bound", async () => {

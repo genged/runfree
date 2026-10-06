@@ -127,6 +127,13 @@ export type CreateSessionMetadataOptions = {
   sessionContainerName?: string;
   /** Exact conversation a resume launch targets; lineage for re-crash evidence. */
   resumeConversationId?: string;
+  /**
+   * Host-chosen conversation id minted for a fresh launch (spec `local/specs/
+   * 2026-10-04-same-terminal-session-resume-design.md` section 2). Written so
+   * a host crash during this session's first process still leaves evidence
+   * keyed to the exact conversation this terminal started.
+   */
+  launchConversationId?: string;
 };
 
 const CONTROL_CHARACTERS = /[\u0000-\u001f\u007f-\u009f]/u;
@@ -307,6 +314,7 @@ export function createSessionMetadata(
     ...(processStart ? { hostProcessStart: processStart } : {}),
     ...(options.sessionContainerName !== undefined ? { sessionContainerName: options.sessionContainerName } : {}),
     ...(options.resumeConversationId !== undefined ? { resumeConversationId: options.resumeConversationId } : {}),
+    ...(options.launchConversationId !== undefined ? { launchConversationId: options.launchConversationId } : {}),
     recordVersion: SESSION_RECORD_VERSION,
     ...(Object.keys(terminalIds).length > 0 ? { terminalIds } : {}),
     hostInbox: context.project.paths.inboxDir,
