@@ -1,5 +1,6 @@
 import { describe, expect, test } from "vitest";
 
+import { builtinAgent } from "../agents.ts";
 import { assertSessionLaunchTarget, SESSION_ENTRY_PATH } from "./session-launch.ts";
 import {
   createBuiltinSessionLaunchTarget,
@@ -157,25 +158,81 @@ describe("built-in session resume launch", () => {
     });
   });
 
-  test("refuses before minting: bad UUID, no resume capability, custom command, exact-resume gap", () => {
+  // Claude, Codex, and Pi all define `resume` (Codex and Pi gained exact
+  // resume in the same-terminal-resume design), so no built-in agent can
+  // demonstrate a missing resume capability any more; that refusal path
+  // remains in `createBuiltinSessionResumeLaunchTarget` for any future
+  // descriptor that omits `resume`, but only the two agent-independent
+  // refusals below still have a built-in agent to exercise them.
+  test("refuses before minting: bad UUID and custom command", () => {
     expect(() => createBuiltinSessionResumeLaunchTarget({
       agentId: "claude",
       configuredCommand: "claude --dangerously-skip-permissions --add-dir /runfree/inbox",
       conversationId: "not-a-uuid; rm -rf /",
     })).toThrow("not a valid conversation UUID");
     expect(() => createBuiltinSessionResumeLaunchTarget({
-      agentId: "pi",
-      configuredCommand: "pi",
-    })).toThrow("resume is not supported");
-    expect(() => createBuiltinSessionResumeLaunchTarget({
       agentId: "claude",
       configuredCommand: "claude --dangerously-skip-permissions",
       conversationId: CONVERSATION_ID,
     })).toThrow("exact claude built-in command");
-    expect(() => createBuiltinSessionResumeLaunchTarget({
+  });
+});
+
+// Host-chosen conversation id (spec `2026-10-04-same-terminal-session-resume-design.md`
+// section 2): the host mints the id once per public launch and appends it to
+// a fresh launch's argv only. Claude and Pi accept it; Codex does not. The
+// flag must never reach resume or picker argv (asserted above and in
+// `agents.test.ts`).
+function requireDefaultCommand(agentId: string): string {
+  const descriptor = builtinAgent(agentId);
+  if (!descriptor) throw new Error(`missing built-in agent: ${agentId}`);
+  return descriptor.defaultCommand;
+}
+
+describe("host-chosen conversation id", () => {
+  const ID = "3f1c2b9e-8a4d-4c1e-9f2a-0b6d7e8f9a10";
+
+  test.each([
+    [
+      "claude",
+      "claude --dangerously-skip-permissions --add-dir /runfree/inbox",
+      "/usr/local/bin/claude",
+      ["--dangerously-skip-permissions", "--add-dir", "/runfree/inbox"],
+    ],
+    ["pi", "pi", "/usr/local/bin/pi", []],
+  ])("a fresh %s launch carries --session-id and the id as two separate elements", (agentId, configuredCommand, innerPath, innerArgs) => {
+    const target = createBuiltinSessionLaunchTarget({ agentId, configuredCommand, launchConversationId: ID });
+    expect(target.args).toEqual([innerPath, ...innerArgs, "--session-id", ID]);
+  });
+
+  test("refuses an id for an agent without the flag, and a malformed id, before minting", () => {
+    expect(() => createBuiltinSessionLaunchTarget({
       agentId: "codex",
       configuredCommand: "codex -c check_for_update_on_startup=false --dangerously-bypass-approvals-and-sandbox",
-      conversationId: CONVERSATION_ID,
-    })).toThrow("does not support exact conversation resume");
+      launchConversationId: ID,
+    })).toThrow("does not accept a host-chosen conversation id");
+    expect(() => createBuiltinSessionLaunchTarget({ agentId: "pi", configuredCommand: "pi", launchConversationId: "x; rm -rf /" }))
+      .toThrow("not a valid conversation UUID");
+    expect(() => createBuiltinSessionLaunchTarget({ agentId: "pi", configuredCommand: "pi", launchConversationId: ID.toUpperCase() }))
+      .toThrow("not a valid conversation UUID");
+  });
+
+  test.each(["claude", "pi", "codex"])("resume and picker argv for %s never carry --session-id", (agentId) => {
+    const configuredCommand = requireDefaultCommand(agentId);
+    const exact = createBuiltinSessionResumeLaunchTarget({ agentId, configuredCommand, conversationId: ID });
+    const picker = createBuiltinSessionResumeLaunchTarget({ agentId, configuredCommand });
+    expect(exact.args).not.toContain("--session-id");
+    expect(picker.args).not.toContain("--session-id");
+    expect(exact.args.at(-1)).toBe(ID);
+  });
+
+  test("pi and codex exact resume use the descriptor argv", () => {
+    expect(createBuiltinSessionResumeLaunchTarget({ agentId: "pi", configuredCommand: "pi", conversationId: ID }).args)
+      .toEqual(["/usr/local/bin/pi", "--session", ID]);
+    expect(createBuiltinSessionResumeLaunchTarget({
+      agentId: "codex",
+      configuredCommand: requireDefaultCommand("codex"),
+      conversationId: ID,
+    }).args).toEqual(["/usr/local/bin/codex", "-c", "check_for_update_on_startup=false", "resume", "--dangerously-bypass-approvals-and-sandbox", ID]);
   });
 });

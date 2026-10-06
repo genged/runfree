@@ -128,5 +128,17 @@ describe("built-in agent descriptors", () => {
         ],
       }),
     ])).toThrow("duplicate agent state env");
+    // Host-chosen conversation id (spec `2026-10-04-same-terminal-session-
+    // resume-design.md` section 2): the flag that carries it into a fresh
+    // launch is fixed at "--session-id", and it must never appear in resume
+    // or picker argv.
+    expect(() => validateBuiltinAgentDescriptors([
+      cloneDescriptor({
+        launchConversationIdFlag: "--session" as unknown as BuiltinAgentDescriptor["launchConversationIdFlag"],
+      }),
+    ])).toThrow("launch conversation id flag must be --session-id");
+    expect(() => validateBuiltinAgentDescriptors([
+      cloneDescriptor({ resume: { pickerArgv: ["claude", "--session-id", "x"] } }),
+    ])).toThrow("resume argv must not carry --session-id");
   });
 });

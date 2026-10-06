@@ -3,7 +3,12 @@ import path from "node:path";
 import { builtinAgent, type BuiltinAgentDescriptor } from "../agents.ts";
 import { createSessionLaunchTarget, SESSION_ENTRY_PATH, type SessionLaunchTarget } from "./session-launch.ts";
 
-const RESUME_CONVERSATION_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const CONVERSATION_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+// Host-chosen ids are minted by the host itself (`crypto.randomUUID()`),
+// which is always lowercase, so this pattern accepts only that one spelling
+// rather than normalizing a case variant the host never produced.
+const HOST_CHOSEN_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
 /**
  * Wraps a validated inner launch in the image's session entry.
@@ -63,13 +68,31 @@ export function createBuiltinSessionShellLaunchTarget(): SessionLaunchTarget {
  * Converts only an unchanged Runfree built-in command to typed direct-launch
  * authority. Arbitrary project commands remain shell syntax and must not be
  * split or interpreted for the per-session path.
+ *
+ * `launchConversationId`, when given, is a host-chosen conversation id for a
+ * fresh launch only (spec `local/specs/2026-10-04-same-terminal-session-
+ * resume-design.md` section 2): the host mints it once per public launch and
+ * it must never reach resume or picker argv. Only a descriptor that declares
+ * `launchConversationIdFlag` accepts one.
  */
 export function createBuiltinSessionLaunchTarget(input: Readonly<{
   agentId: string;
   configuredCommand: string;
+  launchConversationId?: string;
 }>): SessionLaunchTarget {
   const descriptor = requireExactBuiltin(input);
-  return sessionEntryLaunchTarget(descriptor.directLaunch);
+  if (input.launchConversationId === undefined) return sessionEntryLaunchTarget(descriptor.directLaunch);
+  if (!descriptor.launchConversationIdFlag) {
+    throw new Error(`built-in session agent ${descriptor.id} does not accept a host-chosen conversation id`);
+  }
+  // Last host-owned step before the value becomes container argv (spec §2).
+  if (!HOST_CHOSEN_ID_PATTERN.test(input.launchConversationId)) {
+    throw new Error("host-chosen conversation id is not a valid conversation UUID");
+  }
+  return sessionEntryLaunchTarget({
+    path: descriptor.directLaunch.path,
+    args: [...descriptor.directLaunch.args, descriptor.launchConversationIdFlag, input.launchConversationId],
+  });
 }
 
 /**
@@ -93,7 +116,7 @@ export function createBuiltinSessionResumeLaunchTarget(input: Readonly<{
   if (!resume) throw new Error(`resume is not supported for built-in session agent ${descriptor.id}`);
   let argv: readonly string[];
   if (input.conversationId !== undefined) {
-    if (!RESUME_CONVERSATION_ID_PATTERN.test(input.conversationId)) {
+    if (!CONVERSATION_ID_PATTERN.test(input.conversationId)) {
       throw new Error(`resume conversation id is not a valid conversation UUID`);
     }
     if (!resume.exactArgvPrefix) {

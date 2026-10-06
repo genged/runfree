@@ -436,13 +436,12 @@ describe("session admission driver preflight", () => {
     expect(record.launchArgs).toEqual(["/usr/bin/zsh", "-il"]);
   });
 
-  test("rejects a resume request before any container authority when the agent lacks the capability", () => {
+  // Every built-in agent now defines `resume` (Pi and Codex gained exact
+  // resume in the same-terminal-resume design), so no built-in agent id is
+  // left to demonstrate a missing resume capability through this fixture;
+  // the malformed-id refusal below is agent-independent and still applies.
+  test("rejects a resume request before any container authority when the conversation id is malformed", () => {
     const value = fixture();
-    expect(() => value.build({
-      agentId: "pi",
-      configuredCommand: builtinAgent("pi")?.defaultCommand ?? "",
-      resume: {},
-    })).toThrow("resume is not supported");
     expect(() => value.build({
       resume: { conversationId: "not-a-uuid" },
     })).toThrow("not a valid conversation UUID");

@@ -26,6 +26,14 @@ export type BuiltinAgentDescriptor = {
   env: Record<string, string>;
   id: string;
   label: string;
+  /**
+   * The flag that carries a host-chosen conversation id into a fresh launch
+   * (spec `local/specs/2026-10-04-same-terminal-session-resume-design.md`
+   * section 2): the host mints the id once per public launch and this flag
+   * carries it as its own argv element. Fresh launch only; never in resume
+   * or picker argv.
+   */
+  launchConversationIdFlag?: "--session-id";
   processNames: string[];
   resume?: {
     exactArgvPrefix?: string[];
@@ -76,6 +84,7 @@ const DESCRIPTORS: BuiltinAgentDescriptor[] = [
       },
     ],
     requiredServices: ["agent-claude"],
+    launchConversationIdFlag: "--session-id",
     processNames: ["claude"],
     resume: {
       exactArgvPrefix: [
@@ -120,6 +129,16 @@ const DESCRIPTORS: BuiltinAgentDescriptor[] = [
     requiredServices: ["agent-codex"],
     processNames: ["codex"],
     resume: {
+      // Codex has no launch-time id option, so exact resume reuses the
+      // picker argv with the conversation id appended (spec section 2,
+      // maintainer decision 8, 2026-10-06): `codex ... resume <uuid>`.
+      exactArgvPrefix: [
+        "codex",
+        "-c",
+        "check_for_update_on_startup=false",
+        "resume",
+        "--dangerously-bypass-approvals-and-sandbox",
+      ],
       pickerArgv: [
         "codex",
         "-c",
@@ -153,7 +172,12 @@ const DESCRIPTORS: BuiltinAgentDescriptor[] = [
       },
     ],
     requiredServices: [],
+    launchConversationIdFlag: "--session-id",
     processNames: ["pi"],
+    resume: {
+      exactArgvPrefix: ["pi", "--session"],
+      pickerArgv: ["pi", "--resume"],
+    },
   },
 ];
 
@@ -222,6 +246,9 @@ export function validateBuiltinAgentDescriptors(descriptors: readonly BuiltinAge
     if (directLaunchCommand !== descriptor.defaultCommand) {
       throw new Error(`built-in agent ${descriptor.id} direct launch must match its default command`);
     }
+    if (descriptor.launchConversationIdFlag !== undefined && descriptor.launchConversationIdFlag !== "--session-id") {
+      throw new Error(`built-in agent ${descriptor.id} launch conversation id flag must be --session-id`);
+    }
     for (const command of descriptor.legacyDefaultCommands ?? []) {
       if (command.trim() === "" || command === descriptor.defaultCommand) {
         throw new Error(`built-in agent ${descriptor.id} legacy command must be non-empty and distinct`);
@@ -242,6 +269,9 @@ export function validateBuiltinAgentDescriptors(descriptors: readonly BuiltinAge
       if (argv === undefined) continue;
       if (argv.length === 0 || argv.some((entry) => entry.trim() === "" || /[\r\n\0]/.test(entry))) {
         throw new Error(`built-in agent ${descriptor.id} resume argv must contain safe non-empty elements`);
+      }
+      if (argv.includes("--session-id")) {
+        throw new Error(`built-in agent ${descriptor.id} resume argv must not carry --session-id`);
       }
     }
     for (const mount of descriptor.stateMounts) {
@@ -320,6 +350,7 @@ export function agentDescriptorRuntimeInputs(): object[] {
     env: sortedRecord(descriptor.env),
     id: descriptor.id,
     label: descriptor.label,
+    ...(descriptor.launchConversationIdFlag ? { launchConversationIdFlag: descriptor.launchConversationIdFlag } : {}),
     processNames: [...descriptor.processNames].sort(),
     ...(descriptor.resume ? { resume: descriptor.resume } : {}),
     requiredServices: [...descriptor.requiredServices].sort(),
