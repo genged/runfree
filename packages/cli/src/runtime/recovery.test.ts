@@ -218,6 +218,142 @@ describe("bounded offline recovery inventory", () => {
       Object.assign(RECOVERY_LIMITS, { maxFilesPerKindPerProject: originalLimit });
     }
   });
+
+  test("keeps the newest files when the per-kind cap truncates a project", () => {
+    // Sort-before-cap: a truncation must keep the most recently active
+    // evidence, never whichever files the filesystem happens to enumerate
+    // first.
+    const originalLimit = RECOVERY_LIMITS.maxFilesPerKindPerProject;
+    const cap = 5;
+    Object.assign(RECOVERY_LIMITS, { maxFilesPerKindPerProject: cap });
+    try {
+      const ids = Array.from({ length: cap + 5 }, (_, index) => `rf-20260731-sess${String(index).padStart(2, "0")}`);
+      const files = ids.map((id) => hostEvidence(id, { outcome: "interrupted", endedAt: "2026-07-31T00:02:00.000Z" }));
+      // Explicit mtimes, newest last, regardless of write order: the last 5
+      // ids are the 5 newest files.
+      files.forEach((filePath, index) => {
+        const stamp = new Date((1_700_000_000 + index) * 1000);
+        fs.utimesSync(filePath, stamp, stamp);
+      });
+      const newestIds = ids.slice(-cap);
+
+      const inventory = scanRecoveryInventory({ env });
+
+      expect(inventory.truncated).toBe(true);
+      expect(inventory.items.map((item) => item.sourceId).sort()).toEqual([...newestIds].sort());
+    } finally {
+      Object.assign(RECOVERY_LIMITS, { maxFilesPerKindPerProject: originalLimit });
+    }
+  });
+
+  test("bounds a directory flooded with non-matching junk entries", () => {
+    // Review F4: every directory entry counts against the name budget,
+    // matching or not, so a flood of junk names must not make the scan
+    // iterate (or stat) all of them.
+    const dir = path.join(stateDir, "claude", "sessions");
+    fs.mkdirSync(dir, { recursive: true });
+    for (let index = 0; index < 100_000; index += 1) {
+      fs.writeFileSync(path.join(dir, `junk-${index}.txt`), "x");
+    }
+
+    const startedAtMs = Date.now();
+    const inventory = scanRecoveryInventory({ env });
+    const elapsedMs = Date.now() - startedAtMs;
+
+    expect(elapsedMs).toBeLessThan(3_000);
+    expect(inventory.truncated).toBe(true);
+    expect(inventory.items).toEqual([]);
+  }, 30_000);
+
+  test("mints a host-chosen exact id from a fresh launch's own host record", () => {
+    hostEvidence(undefined, { recordVersion: 2, launchConversationId: CLAUDE_SESSION, outcome: "interrupted" });
+
+    expect(firstItem()).toMatchObject({
+      recordVersion: 2,
+      conversationId: CLAUDE_SESSION,
+      conversationSource: "host-chosen",
+    });
+  });
+
+  test("carries resume lineage from a resumed launch's own host record", () => {
+    hostEvidence(undefined, { recordVersion: 2, resumeConversationId: CLAUDE_SESSION, outcome: "interrupted" });
+
+    expect(firstItem()).toMatchObject({
+      conversationId: CLAUDE_SESSION,
+      conversationSource: "resume-lineage",
+    });
+  });
+
+  test("resume lineage wins over a host-chosen id when a record somehow carries both", () => {
+    const OTHER_SESSION = "22222222-3333-4333-8444-555555555555";
+    hostEvidence(undefined, {
+      recordVersion: 2,
+      launchConversationId: OTHER_SESSION,
+      resumeConversationId: CLAUDE_SESSION,
+      outcome: "interrupted",
+    });
+
+    expect(firstItem()).toMatchObject({
+      conversationId: CLAUDE_SESSION,
+      conversationSource: "resume-lineage",
+    });
+  });
+
+  test("joins a host item to its own reported Claude registry evidence into exactly one item", () => {
+    claudeEvidence({ sessionId: CLAUDE_SESSION });
+    const standaloneClaudeItem = firstItem();
+
+    hostEvidence(undefined, { recordVersion: 2, launchConversationId: CLAUDE_SESSION, outcome: "interrupted" });
+
+    const inventory = scanRecoveryInventory({ env });
+
+    expect(inventory.items).toHaveLength(1);
+    const [item] = inventory.items;
+    expect(item).toMatchObject({ evidenceKind: "host", conversationName: "fix recovery" });
+    expect(item?.linkedClaude).toEqual({
+      id: standaloneClaudeItem.id,
+      evidencePath: standaloneClaudeItem.evidencePath,
+      fingerprint: standaloneClaudeItem.fingerprint,
+    });
+  });
+
+  test("the exact-recovery epoch does not block a host Claude record that names its own conversation", () => {
+    // H2: the epoch only protects imprecise host-only evidence; a host record
+    // with an exact id (host-chosen or resume lineage) can never be shadowed
+    // by a different exact Claude recovery completing.
+    fs.mkdirSync(path.join(stateDir, "sessions", "recovery-consumed"), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(
+      path.join(stateDir, "sessions", "recovery-consumed", "agent-claude.json"),
+      `${JSON.stringify({ v: 1, agent: "claude", consumedAt: "2026-07-31T00:03:00.000Z" })}\n`,
+      { mode: 0o600 },
+    );
+    hostEvidence("rf-20260731-withid", {
+      recordVersion: 2,
+      launchConversationId: CLAUDE_SESSION,
+      outcome: "interrupted",
+      endedAt: "2026-07-31T00:02:00.000Z",
+    });
+    hostEvidence("rf-20260731-noidrec", { outcome: "interrupted", endedAt: "2026-07-31T00:02:00.000Z" });
+
+    const inventory = scanRecoveryInventory({ env });
+    const withId = inventory.items.find((item) => item.sourceId === "rf-20260731-withid");
+    const noId = inventory.items.find((item) => item.sourceId === "rf-20260731-noidrec");
+
+    expect(withId).toBeDefined();
+    expect(noId).toBeDefined();
+    expect(withId?.resumeBlockedReason).toBeUndefined();
+    expect(noId?.resumeBlockedReason).toContain("exact Claude recovery");
+  });
+
+  test("carries terminal ids, boot id, and a dead owner state for interrupted host evidence", () => {
+    hostEvidence(undefined, { outcome: "interrupted", terminalIds: { iterm: "w0t0p0" } });
+
+    const item = firstItem();
+
+    expect(item.ownerState).toBe("dead");
+    expect(item.terminal?.ids).toEqual({ iterm: "w0t0p0" });
+    expect(item.terminal?.bootId).toBe(BOOT);
+  });
 });
 
 describe("live classification and launch plans", () => {

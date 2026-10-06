@@ -18,7 +18,7 @@ import { compareHostBootId, compareHostProcessStart, hostBootId, hostProcessStar
 import { peekSessionContainerRecordsV2, type SessionContainerRecordV2 } from "./session-containers.ts";
 import { readSessionHostStatus } from "./session-host-status.ts";
 import { classifySessionRecordLiveness } from "./session-record-liveness.ts";
-import { parseTerminalIdentity } from "./terminal-identity.ts";
+import { parseTerminalIdentity, type TerminalIdentity } from "./terminal-identity.ts";
 import {
   processAlive,
   projectLifecycleLockPath,
@@ -38,9 +38,19 @@ const HOST_SESSION_FILE_RE = /^rf-[0-9]{8}-[a-z0-9]{6,32}\.json$/;
 export const RECOVERY_LIMITS = {
   maxProjects: 1_024,
   maxFilesPerKindPerProject: 2_048,
+  // Pass-1 name budget (review F4): every directory entry counts against this,
+  // matching or not, so a directory an attacker fills with junk names cannot
+  // make the scan expensive by volume alone. Deliberately larger than
+  // `maxFilesPerKindPerProject`, which bounds the much costlier pass-2 work
+  // (open, read, parse) that only matching names reach.
+  maxNamesPerKindPerProject: 16_384,
   maxFilesGlobal: 10_000,
   maxBytesPerKindPerProject: 16 * 1024 * 1024,
   maxFileBytes: 64 * 1024,
+  // Wall-clock backstop for one directory scan, independent of the name and
+  // file budgets above: a slow filesystem (or a budget set too high) must
+  // still bound the time a listing command spends on one project.
+  scanDeadlineMs: 2_000,
 } as const;
 
 export type RecoveryState = "active" | "interrupted" | "unverified" | "claimed" | "unrecoverable";
@@ -78,6 +88,24 @@ export type RecoveryItem = {
   resumeBlockedReason?: string;
   hostMetadata?: SessionMetadata;
   claudeRegistry?: ClaudeRegistryEvidence;
+  // 2 for host evidence written by the same-terminal resume release; absent
+  // for everything else (older Runfree, and all Claude-registry evidence).
+  recordVersion?: number;
+  // Where `conversationId` came from. "host-chosen"/"resume-lineage" are
+  // host-side lineage on host evidence; "claude-reported" is the Claude
+  // registry naming its own conversation; "codex-match" is reserved for a
+  // later task.
+  conversationSource?: "host-chosen" | "resume-lineage" | "claude-reported" | "codex-match";
+  // Host-side process/boot identity verdict for host evidence only (from
+  // `hostOwnerState`). Absent on Claude-registry items, which have no host
+  // owner of their own to check.
+  ownerState?: "active" | "dead" | "unknown";
+  // The Claude-registry item this host item's own reported conversation
+  // joined into it (see `joinHostAndClaudeItems`). Once linked, that Claude
+  // item no longer appears as a separate inventory entry.
+  linkedClaude?: Readonly<{ id: string; evidencePath: string; fingerprint: EvidenceFingerprint }>;
+  // Host-only terminal identity for host evidence (terminal-identity.ts).
+  terminal?: Readonly<{ ids: TerminalIdentity; tty?: string; termProgram?: string; bootId?: string }>;
 };
 
 export type RecoveryInventory = {
@@ -360,6 +388,8 @@ function entryResolvesInsideDirectory(
   }
 }
 
+type DirectoryCandidate = { name: string; mtimeMs: number };
+
 function scanFixedDirectory<T>(input: {
   anchor: string;
   dir: string;
@@ -369,59 +399,97 @@ function scanFixedDirectory<T>(input: {
   parse(filePath: string, name: string, read: SecureRead): T | undefined;
 }): T[] {
   const results: T[] = [];
-  let directory: fs.Dir | undefined;
   const directoryIdentity = verifiedDirectoryIdentity(input.anchor, input.dir);
   if (!directoryIdentity) return results;
+
+  // Pass 1: a cheap, non-authoritative enumeration. It reads only entry names
+  // and, for a matching name, one `lstat` for `mtimeMs`; every entry — match
+  // or not — counts against `maxNamesPerKindPerProject`, so a directory an
+  // attacker fills with junk names cannot make this pass expensive by volume
+  // alone (review F4). A wall-clock deadline bounds it independently, in case
+  // the name budget is ever raised past what the deadline allows. Nothing
+  // decided here is trusted: pass 2 below repeats every existing identity and
+  // content check against the real filesystem state before any file opens.
+  const deadlineAt = Date.now() + RECOVERY_LIMITS.scanDeadlineMs;
+  const candidates: DirectoryCandidate[] = [];
+  let names = 0;
+  let directory: fs.Dir | undefined;
   try {
     directory = fs.opendirSync(input.dir);
     if (!directoryIdentityMatches(input.dir, directoryIdentity)) return results;
     while (true) {
+      if (Date.now() >= deadlineAt) {
+        input.global.truncated = true;
+        break;
+      }
       const entry = directory.readSync();
       if (!entry) break;
+      names += 1;
+      if (names > RECOVERY_LIMITS.maxNamesPerKindPerProject) {
+        input.global.truncated = true;
+        break;
+      }
       if (!input.fileName.test(entry.name)) continue;
-      if (
-        input.budget.files >= RECOVERY_LIMITS.maxFilesPerKindPerProject
-        || input.global.files >= RECOVERY_LIMITS.maxFilesGlobal
-      ) {
-        input.global.truncated = true;
-        break;
-      }
-      input.budget.files += 1;
-      input.global.files += 1;
-      if (!directoryIdentityMatches(input.dir, directoryIdentity)) {
-        input.global.invalidFiles += 1;
-        break;
-      }
-      const filePath = path.join(input.dir, entry.name);
-      let stat: fs.Stats;
       try {
-        stat = fs.lstatSync(filePath);
+        candidates.push({ name: entry.name, mtimeMs: fs.lstatSync(path.join(input.dir, entry.name)).mtimeMs });
       } catch {
-        input.global.invalidFiles += 1;
-        continue;
+        // Gone already, or otherwise unreadable: sorts as oldest, and pass 2
+        // below will hit the same failure again and count it as invalid.
+        candidates.push({ name: entry.name, mtimeMs: 0 });
       }
-      if (input.budget.bytes + stat.size > RECOVERY_LIMITS.maxBytesPerKindPerProject) {
-        input.global.truncated = true;
-        break;
-      }
-      input.budget.bytes += Math.max(0, stat.size);
-      if (!entryResolvesInsideDirectory(input.dir, filePath, directoryIdentity, stat)) {
-        input.global.invalidFiles += 1;
-        continue;
-      }
-      const read = safeReadJson(filePath, stat);
-      if (!read || !entryResolvesInsideDirectory(input.dir, filePath, directoryIdentity, read.stat)) {
-        input.global.invalidFiles += 1;
-        continue;
-      }
-      const parsed = input.parse(filePath, entry.name, read);
-      if (parsed === undefined) input.global.invalidFiles += 1;
-      else results.push(parsed);
     }
   } catch {
     return results;
   } finally {
     directory?.closeSync();
+  }
+
+  // Newest first, then by name, so a per-kind cap in pass 2 always keeps the
+  // most recently active evidence rather than whatever order the filesystem
+  // happened to return it in.
+  candidates.sort((left, right) => right.mtimeMs - left.mtimeMs || left.name.localeCompare(right.name));
+
+  // Pass 2: the existing per-file loop, unchanged, now walking the sorted
+  // candidate list instead of raw readdir order.
+  for (const candidate of candidates) {
+    if (
+      input.budget.files >= RECOVERY_LIMITS.maxFilesPerKindPerProject
+      || input.global.files >= RECOVERY_LIMITS.maxFilesGlobal
+    ) {
+      input.global.truncated = true;
+      break;
+    }
+    input.budget.files += 1;
+    input.global.files += 1;
+    if (!directoryIdentityMatches(input.dir, directoryIdentity)) {
+      input.global.invalidFiles += 1;
+      break;
+    }
+    const filePath = path.join(input.dir, candidate.name);
+    let stat: fs.Stats;
+    try {
+      stat = fs.lstatSync(filePath);
+    } catch {
+      input.global.invalidFiles += 1;
+      continue;
+    }
+    if (input.budget.bytes + stat.size > RECOVERY_LIMITS.maxBytesPerKindPerProject) {
+      input.global.truncated = true;
+      break;
+    }
+    input.budget.bytes += Math.max(0, stat.size);
+    if (!entryResolvesInsideDirectory(input.dir, filePath, directoryIdentity, stat)) {
+      input.global.invalidFiles += 1;
+      continue;
+    }
+    const read = safeReadJson(filePath, stat);
+    if (!read || !entryResolvesInsideDirectory(input.dir, filePath, directoryIdentity, read.stat)) {
+      input.global.invalidFiles += 1;
+      continue;
+    }
+    const parsed = input.parse(filePath, candidate.name, read);
+    if (parsed === undefined) input.global.invalidFiles += 1;
+    else results.push(parsed);
   }
   return results;
 }
@@ -535,6 +603,10 @@ function itemClaimed(item: RecoveryItem, env: NodeJS.ProcessEnv): boolean {
   return read ? parsedClaimIsLive(read.value, env) : false;
 }
 
+function validConversationId(value: string | undefined): string | undefined {
+  return value !== undefined && UUID_RE.test(value) ? value.toLowerCase() : undefined;
+}
+
 function itemFromHost(
   projectId: string,
   stateDir: string,
@@ -543,26 +615,43 @@ function itemFromHost(
   env: NodeJS.ProcessEnv,
 ): RecoveryItem {
   const metadata = evidence.metadata;
+  // Strict-format validated here and again at argv composition, so a
+  // corrupted value degrades to picker precision rather than being trusted.
+  // `resumeConversationId` (lineage from an admission-path resume launch)
+  // wins over `launchConversationId` (the id a fresh launch minted for
+  // itself) when a record somehow carries both, since it names the
+  // conversation this launch actually resumed.
+  const resumeId = validConversationId(metadata.resumeConversationId);
+  const launchId = validConversationId(metadata.launchConversationId);
+  const exactId = resumeId ?? launchId;
+  const conversationSource: RecoveryItem["conversationSource"] = resumeId !== undefined
+    ? "resume-lineage"
+    : launchId !== undefined
+      ? "host-chosen"
+      : undefined;
+  const ownerState = hostOwnerState(metadata, env);
   const item: RecoveryItem = {
     id: recoveryId(projectId, "host", metadata.id),
     projectId,
     ...(mapping.projectRoot ? { projectRoot: mapping.projectRoot } : {}),
     projectName: mapping.projectName,
     stateDir,
-    state: mapping.valid && hostOwnerState(metadata, env) === "active" ? "active" : "unverified",
+    state: mapping.valid && ownerState === "active" ? "active" : "unverified",
     evidenceKind: "host",
     evidencePath: evidence.path,
     fingerprint: fingerprint(evidence.stat, metadata.id, evidence.sha256),
     sourceId: metadata.id,
     agent: metadata.command,
     command: metadata.agentCommand,
-    // Lineage from an admission-path resume launch: the exact conversation the
-    // crashed session was resuming. Strict-format validated here and again at
-    // argv composition, so a corrupted value degrades to picker precision
-    // rather than being trusted.
-    ...(metadata.resumeConversationId !== undefined && UUID_RE.test(metadata.resumeConversationId)
-      ? { conversationId: metadata.resumeConversationId.toLowerCase() }
-      : {}),
+    ...(exactId !== undefined ? { conversationId: exactId, conversationSource } : {}),
+    recordVersion: metadata.recordVersion,
+    ownerState,
+    terminal: {
+      ids: metadata.terminalIds ?? {},
+      tty: metadata.hostTty,
+      termProgram: metadata.termProgram,
+      bootId: metadata.hostBootId,
+    },
     startedAt: metadata.startedAt,
     updatedAt: metadata.endedAt ?? metadata.lastSeenAt,
     terminalHint: metadata.hostTty ?? metadata.termProgram,
@@ -570,10 +659,15 @@ function itemFromHost(
     ...(!mapping.valid ? { state: "unrecoverable", reason: mapping.reason } : {}),
   };
   if (mapping.valid && itemClaimed(item, env)) item.state = "claimed";
-  const consumedAt = metadata.command.toLowerCase() === "claude" ? claudeRecoveryEpoch(stateDir) : undefined;
-  const evidenceActivity = metadata.endedAt ?? metadata.lastSeenAt;
-  if (consumedAt && Date.parse(evidenceActivity) <= Date.parse(consumedAt)) {
-    item.resumeBlockedReason = "an exact Claude recovery completed after this host-only evidence was created";
+  // The Claude-wide exact-recovery epoch (H2) only protects *imprecise*
+  // host-only evidence: an item that already names its own conversation
+  // cannot be shadowed by a different exact Claude recovery completing.
+  if (exactId === undefined) {
+    const consumedAt = metadata.command.toLowerCase() === "claude" ? claudeRecoveryEpoch(stateDir) : undefined;
+    const evidenceActivity = metadata.endedAt ?? metadata.lastSeenAt;
+    if (consumedAt && Date.parse(evidenceActivity) <= Date.parse(consumedAt)) {
+      item.resumeBlockedReason = "an exact Claude recovery completed after this host-only evidence was created";
+    }
   }
   return item;
 }
@@ -599,6 +693,7 @@ function itemFromClaude(
     sourceId: registry.sessionId,
     agent: "claude",
     conversationId: registry.sessionId,
+    conversationSource: "claude-reported",
     conversationName: registry.name,
     conversationStatus: registry.status,
     startedAt: new Date(registry.startedAt).toISOString(),
@@ -608,6 +703,50 @@ function itemFromClaude(
   };
   if (mapping.valid && itemClaimed(item, env)) item.state = "claimed";
   return item;
+}
+
+/**
+ * Folds a host item's own reported Claude registry evidence into it, so a
+ * crashed session that left both an exact host record and a live Claude
+ * registry entry for the same conversation appears once, not twice. Joining
+ * is keyed by `(projectId, conversationId)` on a host item whose `agent` is
+ * Claude — the only `agent` the scanned Claude evidence can ever report —
+ * and only against Claude evidence nothing has consumed yet: a host item
+ * whose matching Claude evidence was already consumed keeps no link, rather
+ * than pointing at evidence that no longer names a live conversation. The
+ * joined Claude item is removed from the flat list so it never appears as a
+ * separate entry.
+ */
+function joinHostAndClaudeItems(items: readonly RecoveryItem[]): RecoveryItem[] {
+  const claudeIndexByKey = new Map<string, number>();
+  items.forEach((item, index) => {
+    if (item.evidenceKind === "claude" && item.conversationId !== undefined) {
+      claudeIndexByKey.set(`${item.projectId}\0${item.conversationId}`, index);
+    }
+  });
+  const joinedClaudeIndexes = new Set<number>();
+  const joined = items.map((item) => {
+    if (item.evidenceKind !== "host" || item.conversationId === undefined || item.agent.toLowerCase() !== "claude") {
+      return item;
+    }
+    const claudeIndex = claudeIndexByKey.get(`${item.projectId}\0${item.conversationId}`);
+    const claudeItem = claudeIndex !== undefined ? items[claudeIndex] : undefined;
+    if (claudeIndex === undefined || !claudeItem || joinedClaudeIndexes.has(claudeIndex) || itemWasConsumed(claudeItem)) {
+      return item;
+    }
+    joinedClaudeIndexes.add(claudeIndex);
+    return {
+      ...item,
+      linkedClaude: { id: claudeItem.id, evidencePath: claudeItem.evidencePath, fingerprint: claudeItem.fingerprint },
+      ...(item.conversationName === undefined && claudeItem.conversationName !== undefined
+        ? { conversationName: claudeItem.conversationName }
+        : {}),
+      ...(item.conversationStatus === undefined && claudeItem.conversationStatus !== undefined
+        ? { conversationStatus: claudeItem.conversationStatus }
+        : {}),
+    };
+  });
+  return joined.filter((_item, index) => !joinedClaudeIndexes.has(index));
 }
 
 export function scanRecoveryInventory(input: {
@@ -652,7 +791,7 @@ export function scanRecoveryInventory(input: {
     projects?.closeSync();
   }
   const deduped = Array.from(new Map(
-    items
+    joinHostAndClaudeItems(items)
       .filter((item) => !itemWasConsumed(item))
       .sort((left, right) => Date.parse(right.updatedAt ?? right.startedAt ?? "") - Date.parse(left.updatedAt ?? left.startedAt ?? ""))
       .map((item) => [item.id, item]),
