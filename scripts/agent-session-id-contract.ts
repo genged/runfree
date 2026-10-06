@@ -149,7 +149,14 @@ export function imageContractRunner(image: string): ContractRunner {
   return (script, uuid) => spawnDocker([...CONTAINER_FLAGS, image, "-c", script, "sh", uuid]);
 }
 
-/** Update gate: rebuild (runs install scripts) and probe inside a throwaway container. */
+/**
+ * Update gate: rebuild (runs install scripts) and probe inside a throwaway
+ * container. Review finding 2: the rebuild's own output goes to stderr
+ * (`1>&2`), not `/dev/null` — a rebuild failure (`exit 3`) is reported by
+ * `assertAgentSessionIdContract` from the combined stdout+stderr of the
+ * overall `docker run`, so sending it to `/dev/null` left that error with no
+ * cause at all.
+ */
 export function lockedToolsContractRunner(toolsDir: string): ContractRunner {
   return (script, uuid) => spawnDocker([
     ...CONTAINER_FLAGS,
@@ -157,8 +164,44 @@ export function lockedToolsContractRunner(toolsDir: string): ContractRunner {
     "-v", `${toolsDir}:/opt/t`,
     CONTRACT_NODE_IMAGE,
     "-c",
-    `npm rebuild --prefix /opt/t --omit=dev >/dev/null 2>&1 || exit 3; PATH=/opt/t/node_modules/.bin:$PATH; ${script}`,
+    `npm rebuild --prefix /opt/t --omit=dev 1>&2 || exit 3; PATH=/opt/t/node_modules/.bin:$PATH; ${script}`,
     "sh",
     uuid,
   ]);
+}
+
+export type DockerCpuArch = "x64" | "arm64";
+
+/**
+ * Maps Docker's own `{{.Server.Arch}}` naming to npm's `--cpu` values.
+ * Refuses anything else rather than silently guessing: review finding 1 is
+ * exactly about a platform mismatch going unnoticed, so an architecture this
+ * module does not recognize must fail loudly before the host `npm ci` step
+ * that uses this value ever runs.
+ */
+export function mapDockerServerArchToNpmCpu(serverArch: string): DockerCpuArch {
+  if (serverArch === "x86_64" || serverArch === "amd64") return "x64";
+  if (serverArch === "aarch64" || serverArch === "arm64") return "arm64";
+  throw new Error(
+    `unsupported Docker server architecture ${JSON.stringify(serverArch)}; expected x86_64/amd64 or aarch64/arm64`,
+  );
+}
+
+/**
+ * `docker version --format '{{.Server.Arch}}'`, through the same restricted
+ * spawn every other Docker call in this module uses (`spawnDocker`): no host
+ * credential, proxy, or token env reaches the `docker` CLI invocation, and a
+ * missing Docker CLI throws the same "needs Docker" message every other call
+ * here throws. A `docker version` that runs but fails (daemon unreachable,
+ * context broken, ...) is treated the same way — review finding 1 requires
+ * this to fail before the host ever downloads anything.
+ */
+export function dockerServerCpuArch(): DockerCpuArch {
+  const result = spawnDocker(["version", "--format", "{{.Server.Arch}}"]);
+  if (result.status !== 0) {
+    throw new Error(
+      `could not determine the Docker server architecture: ${`${result.stdout}${result.stderr}`.trim()}`,
+    );
+  }
+  return mapDockerServerArchToNpmCpu(result.stdout.trim());
 }

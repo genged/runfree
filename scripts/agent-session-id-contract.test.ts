@@ -6,8 +6,10 @@ import {
   AGENT_SESSION_ID_CONTRACT_SCRIPT,
   CONTRACT_NODE_IMAGE,
   assertAgentSessionIdContract,
+  dockerServerCpuArch,
   imageContractRunner,
   lockedToolsContractRunner,
+  mapDockerServerArchToNpmCpu,
   type ContractRunner,
 } from "./agent-session-id-contract.ts";
 
@@ -81,6 +83,84 @@ describe("assertAgentSessionIdContract", () => {
       expect(error).toBeInstanceOf(Error);
       expect((error as Error).message.length).toBeLessThanOrEqual(4000 + 200);
     }
+  });
+
+  // Review finding 2: lockedToolsContractRunner's `npm rebuild` now sends its
+  // own output to stderr (`1>&2`) instead of `/dev/null`, specifically so a
+  // rebuild failure (`exit 3`) is not a cause-less error. This proves the
+  // consumer side of that fix: stderr text reaches the thrown error.
+  test("a rebuild failure (exit 3) with its output on stderr carries that output in the thrown error", () => {
+    const run: ContractRunner = () => ({
+      status: 3,
+      stdout: "",
+      stderr: "npm error could not determine executable to run for claude-code-linux-arm64\n",
+    });
+    expect(() => assertAgentSessionIdContract(run)).toThrow(
+      /npm error could not determine executable to run for claude-code-linux-arm64/,
+    );
+  });
+});
+
+describe("mapDockerServerArchToNpmCpu", () => {
+  test.each([
+    ["x86_64", "x64"],
+    ["amd64", "x64"],
+    ["aarch64", "arm64"],
+    ["arm64", "arm64"],
+  ] as const)("maps docker's %s to npm's --cpu=%s", (serverArch, npmCpu) => {
+    expect(mapDockerServerArchToNpmCpu(serverArch)).toBe(npmCpu);
+  });
+
+  test("refuses an architecture it does not recognize", () => {
+    expect(() => mapDockerServerArchToNpmCpu("riscv64")).toThrow(/unsupported Docker server architecture/);
+  });
+});
+
+describe("dockerServerCpuArch", () => {
+  test("resolves the mapped --cpu value from `docker version`", () => {
+    const spy = vi.spyOn(childProcess, "spawnSync").mockReturnValue({
+      status: 0,
+      stdout: "aarch64\n",
+      stderr: "",
+      pid: 1,
+      output: [],
+      signal: null,
+    });
+
+    expect(dockerServerCpuArch()).toBe("arm64");
+    const [command, args] = spy.mock.calls[0] as [string, string[]];
+    expect(command).toBe("docker");
+    expect(args).toEqual(["version", "--format", "{{.Server.Arch}}"]);
+  });
+
+  test("a failing `docker version` (daemon unreachable, etc.) is treated like no usable Docker", () => {
+    vi.spyOn(childProcess, "spawnSync").mockReturnValue({
+      status: 1,
+      stdout: "",
+      stderr: "error during connect: ...\n",
+      pid: 1,
+      output: [],
+      signal: null,
+    });
+
+    expect(() => dockerServerCpuArch()).toThrow(/could not determine the Docker server architecture/);
+  });
+
+  test("a missing Docker CLI throws the same no-Docker message every other call here throws", () => {
+    const enoent = Object.assign(new Error("spawn docker ENOENT"), { code: "ENOENT" });
+    vi.spyOn(childProcess, "spawnSync").mockReturnValue({
+      status: null,
+      stdout: "",
+      stderr: "",
+      pid: 0,
+      output: [],
+      signal: null,
+      error: enoent,
+    });
+
+    expect(() => dockerServerCpuArch()).toThrow(
+      /the --session-id contract needs Docker; run make test-runtime-core on a Docker host, or pass --no-contract/,
+    );
   });
 });
 
@@ -172,6 +252,25 @@ describe("lockedToolsContractRunner", () => {
     expect(combined).toContain("npm rebuild --prefix /opt/t --omit=dev");
     expect(combined).toContain("script-body");
     expect(combined.indexOf("npm rebuild")).toBeLessThan(combined.indexOf("script-body"));
+  });
+
+  // Review finding 2: a rebuild failure must not be silently discarded.
+  test("a rebuild failure's output goes to stderr, not /dev/null", () => {
+    const spy = vi.spyOn(childProcess, "spawnSync").mockReturnValue({
+      status: 0,
+      stdout: "ok",
+      stderr: "",
+      pid: 1,
+      output: [],
+      signal: null,
+    });
+
+    lockedToolsContractRunner("/tmp/agent-tools-xyz")("script-body", "uuid-2");
+
+    const args = spy.mock.calls[0]?.[1] as string[];
+    const combined = args[args.indexOf("-c") + 1] ?? "";
+    expect(combined).toContain("npm rebuild --prefix /opt/t --omit=dev 1>&2 || exit 3");
+    expect(combined).not.toContain("/dev/null");
   });
 });
 

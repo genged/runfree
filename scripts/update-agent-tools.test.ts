@@ -1,3 +1,4 @@
+import childProcess from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -7,11 +8,20 @@ import { afterEach, describe, expect, test, vi } from "vitest";
 import {
   agentToolPackageSpecs,
   assertAgentToolsPackageLockConsistency,
+  defaultSessionIdContractGate,
   main,
   parseAgentToolUpdateArgs,
   usage,
   type AgentToolUpdateDeps,
 } from "./update-agent-tools.ts";
+
+const OK_CONTRACT_STDOUT =
+  "claude-transcript=ok\nclaude-resume-refused=ok\npi-session-id=ok\npi-resume-refused=ok\n";
+
+/** A minimal spawnSync stand-in: fixed return shape, overridable per test. */
+function spawnSyncResult(overrides: Partial<childProcess.SpawnSyncReturns<string>>): childProcess.SpawnSyncReturns<string> {
+  return { status: 0, stdout: "", stderr: "", pid: 1, output: [], signal: null, ...overrides };
+}
 
 describe("agent tools updater", () => {
   test("defaults to updating all bundled agent tools and rebuilding assets", () => {
@@ -107,6 +117,107 @@ describe("agent tools updater", () => {
 });
 
 // ---------------------------------------------------------------------------
+// defaultSessionIdContractGate: review finding 1. The host `npm ci` step
+// must target the probe container's platform (Linux, Docker's own server
+// arch), not the host's — resolved by spying on `childProcess.spawnSync`
+// directly, since `spawnDocker` and `run()` both call it under the hood and
+// this is the only seam that reaches every step (docker version, npm ci, and
+// the final `docker run` probe) without adding a second injectable `deps`
+// layer just for this one function.
+// ---------------------------------------------------------------------------
+
+describe("defaultSessionIdContractGate: host npm targets the container platform", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  test("the host npm ci argv carries --os/--cpu/--libc with the Docker server's mapped arch", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "runfree-contract-gate-test-"));
+    const packageJsonPath = path.join(dir, "package.json");
+    const packageLockPath = path.join(dir, "package-lock.json");
+    fs.writeFileSync(packageJsonPath, "{}");
+    fs.writeFileSync(packageLockPath, "{}");
+
+    const spy = vi.spyOn(childProcess, "spawnSync").mockImplementation((command, args) => {
+      const argv = (args ?? []) as string[];
+      if (command === "docker" && argv[0] === "version") {
+        return spawnSyncResult({ stdout: "x86_64\n" });
+      }
+      if (command === "npm" && argv[0] === "ci") {
+        return spawnSyncResult({});
+      }
+      if (command === "docker" && argv[0] === "run") {
+        return spawnSyncResult({ stdout: OK_CONTRACT_STDOUT });
+      }
+      throw new Error(`unexpected spawnSync(${command}, ${JSON.stringify(argv)})`);
+    });
+
+    expect(() => defaultSessionIdContractGate({ packageJsonPath, packageLockPath })).not.toThrow();
+
+    const npmCall = spy.mock.calls.find(([command]) => command === "npm");
+    expect(npmCall).toBeDefined();
+    const npmArgs = npmCall?.[1] as string[];
+    expect(npmArgs).toEqual(expect.arrayContaining(["--os=linux", "--cpu=x64", "--libc=glibc"]));
+
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("an architecture Docker reports that npm's --cpu does not recognize is refused before any npm call", () => {
+    const spy = vi.spyOn(childProcess, "spawnSync").mockReturnValue(spawnSyncResult({ stdout: "riscv64\n" }));
+
+    expect(() =>
+      defaultSessionIdContractGate({
+        packageJsonPath: "/nonexistent/package.json",
+        packageLockPath: "/nonexistent/package-lock.json",
+      }),
+    ).toThrow(/unsupported Docker server architecture/);
+
+    // Resolved before the temp dir exists, so neither file was even read —
+    // and only the one `docker version` call happened, never `npm`.
+    expect(spy).toHaveBeenCalledTimes(1);
+    expect(spy.mock.calls.every(([command]) => command === "docker")).toBe(true);
+  });
+
+  test("a failing `docker version` (daemon unreachable) fails before any npm download, and main() restores the snapshot", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "runfree-contract-gate-restore-test-"));
+    const packageJsonPath = path.join(dir, "package.json");
+    const packageLockPath = path.join(dir, "package-lock.json");
+    fs.writeFileSync(packageJsonPath, JSON.stringify(fixturePackageJson(BEFORE_VERSIONS)));
+    fs.writeFileSync(packageLockPath, JSON.stringify(fixturePackageLock(BEFORE_VERSIONS)));
+    const originalJson = fs.readFileSync(packageJsonPath);
+    const originalLock = fs.readFileSync(packageLockPath);
+
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const spawnSpy = vi
+      .spyOn(childProcess, "spawnSync")
+      .mockReturnValue(spawnSyncResult({ status: 1, stderr: "Cannot connect to the Docker daemon\n" }));
+
+    const deps: AgentToolUpdateDeps = {
+      packageJsonPath,
+      packageLockPath,
+      runNpmUpdate: () => {
+        fs.writeFileSync(packageJsonPath, JSON.stringify(fixturePackageJson(AFTER_VERSIONS)));
+        fs.writeFileSync(packageLockPath, JSON.stringify(fixturePackageLock(AFTER_VERSIONS)));
+      },
+      runSessionIdContractGate: () => defaultSessionIdContractGate({ packageJsonPath, packageLockPath }),
+      rebuildRuntimeAssets: vi.fn(),
+    };
+
+    await expect(main(["claude@2.1.171", "--no-assets"], deps)).rejects.toThrow(
+      "agent tools left unchanged: --session-id contract failed",
+    );
+
+    // Exactly the "docker version" probe ran — no npm ci, no docker run.
+    expect(spawnSpy.mock.calls.every(([command]) => command === "docker")).toBe(true);
+    expect(fs.readFileSync(packageJsonPath)).toEqual(originalJson);
+    expect(fs.readFileSync(packageLockPath)).toEqual(originalLock);
+
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+});
+
+// ---------------------------------------------------------------------------
 // main(): the npm step and the --session-id contract gate are injected as
 // fakes (review F7's seam), so these never run real npm or Docker and never
 // touch the real packages/agent-runtime/agent/agent-tools files — only a temp
@@ -177,6 +288,59 @@ describe("main(): --session-id contract gate wiring", () => {
   afterEach(() => {
     vi.restoreAllMocks();
     if (fixture) fs.rmSync(fixture.dir, { recursive: true, force: true });
+  });
+
+  // Cheap minor fix: the restore now covers the npm step and the lockfile
+  // check too, not only the contract gate — a throw from either also
+  // restores the snapshot, named by the phase that actually failed.
+
+  test("a failing npm step restores both agent-tools files exactly", async () => {
+    fixture = createMainFixture();
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const gate = vi.fn();
+    const deps: AgentToolUpdateDeps = {
+      packageJsonPath: fixture.packageJsonPath,
+      packageLockPath: fixture.packageLockPath,
+      runNpmUpdate: () => {
+        throw new Error("npm install failed: network error");
+      },
+      runSessionIdContractGate: gate,
+      rebuildRuntimeAssets: vi.fn(),
+    };
+
+    await expect(main(["claude@2.1.171", "--no-assets"], deps)).rejects.toThrow(
+      "agent tools left unchanged: npm update failed",
+    );
+
+    expect(fs.readFileSync(fixture.packageJsonPath)).toEqual(fixture.originalJson);
+    expect(fs.readFileSync(fixture.packageLockPath)).toEqual(fixture.originalLock);
+    expect(gate).not.toHaveBeenCalled();
+  });
+
+  test("an inconsistent lockfile left by the npm step restores both agent-tools files exactly", async () => {
+    fixture = createMainFixture();
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const gate = vi.fn();
+    const deps: AgentToolUpdateDeps = {
+      packageJsonPath: fixture.packageJsonPath,
+      packageLockPath: fixture.packageLockPath,
+      runNpmUpdate: () => {
+        // package.json claims a new pin; package-lock.json was left stale —
+        // the real assertAgentToolsPackageLockConsistency must catch this.
+        fs.writeFileSync(fixture.packageJsonPath, JSON.stringify(fixturePackageJson(AFTER_VERSIONS)));
+        fs.writeFileSync(fixture.packageLockPath, JSON.stringify(fixturePackageLock(BEFORE_VERSIONS)));
+      },
+      runSessionIdContractGate: gate,
+      rebuildRuntimeAssets: vi.fn(),
+    };
+
+    await expect(main(["claude@2.1.171", "--no-assets"], deps)).rejects.toThrow(
+      "agent tools left unchanged: lockfile verification failed",
+    );
+
+    expect(fs.readFileSync(fixture.packageJsonPath)).toEqual(fixture.originalJson);
+    expect(fs.readFileSync(fixture.packageLockPath)).toEqual(fixture.originalLock);
+    expect(gate).not.toHaveBeenCalled();
   });
 
   test("a failing contract gate restores both agent-tools files exactly", async () => {

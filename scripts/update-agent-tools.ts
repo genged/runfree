@@ -4,7 +4,11 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-import { assertAgentSessionIdContract, lockedToolsContractRunner } from "./agent-session-id-contract.ts";
+import {
+  assertAgentSessionIdContract,
+  dockerServerCpuArch,
+  lockedToolsContractRunner,
+} from "./agent-session-id-contract.ts";
 
 export type AgentToolId = "claude" | "codex" | "pi";
 
@@ -265,13 +269,30 @@ function rebuildRuntimeAssets(): void {
  * (`lockedToolsContractRunner`), never on the host. The temp copy keeps this
  * gate from depending on (or mutating) whatever `npm install` left in the
  * real agent-tools directory.
+ *
+ * Fix-round review finding 1: the host `npm ci` must target the probe
+ * container's platform, not the host's. npm skips `optionalDependencies`
+ * whose `os`/`cpu` do not match the install target, and `@anthropic-ai/
+ * claude-code` ships its native binary only through per-platform optional
+ * packages (see `packages/agent-runtime/agent/agent-tools/package-lock.json`,
+ * e.g. `claude-code-linux-arm64`). On a non-Linux or differently-arched host,
+ * an `npm ci` with no platform override would fetch none of those, leaving
+ * only the JS stub for `npm rebuild` to find inside the Linux probe
+ * container — so the architecture is resolved from the Docker server itself
+ * (`dockerServerCpuArch`, through the same restricted spawn every Docker
+ * call here uses) before the temp dir is even created, so a missing or
+ * unreachable Docker fails before any download.
  */
-function defaultSessionIdContractGate(paths: { packageJsonPath: string; packageLockPath: string }): void {
+export function defaultSessionIdContractGate(paths: { packageJsonPath: string; packageLockPath: string }): void {
+  const cpu = dockerServerCpuArch();
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "runfree-agent-tools-contract-"));
   try {
     fs.copyFileSync(paths.packageJsonPath, path.join(tmp, "package.json"));
     fs.copyFileSync(paths.packageLockPath, path.join(tmp, "package-lock.json"));
-    run("npm", ["ci", "--ignore-scripts", "--omit=dev", "--fund=false", "--audit=false"], { cwd: tmp });
+    run("npm", [
+      "ci", "--ignore-scripts", "--omit=dev", "--fund=false", "--audit=false",
+      "--os=linux", `--cpu=${cpu}`, "--libc=glibc",
+    ], { cwd: tmp });
     assertAgentSessionIdContract(lockedToolsContractRunner(tmp));
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true });
@@ -323,25 +344,32 @@ export async function main(argv = process.argv.slice(2), deps: AgentToolUpdateDe
 
   if (options.dryRun) return;
 
-  // Review F7: snapshotted before anything mutates them, so a gate failure
-  // below can restore these exact bytes rather than leaving a half-applied
-  // update in place.
+  // Review F7: snapshotted before anything mutates them, so a failure below
+  // — in the npm step itself, in the lockfile consistency check, or in the
+  // contract gate — can restore these exact bytes rather than leaving a
+  // half-applied update in place.
   const packageJsonSnapshot = fs.readFileSync(deps.packageJsonPath);
   const packageLockSnapshot = fs.readFileSync(deps.packageLockPath);
 
   const before = readAgentToolVersions(deps.packageJsonPath);
-  deps.runNpmUpdate(specs);
-  verifyAgentToolsLockfiles({ packageJsonPath: deps.packageJsonPath, packageLockPath: deps.packageLockPath });
 
-  if (!options.skipContract) {
-    try {
+  // Named per phase so a restore names what actually failed, rather than
+  // always blaming the contract gate for an npm or lockfile failure that
+  // happened before the gate ever ran.
+  let phase = "npm update";
+  try {
+    deps.runNpmUpdate(specs);
+    phase = "lockfile verification";
+    verifyAgentToolsLockfiles({ packageJsonPath: deps.packageJsonPath, packageLockPath: deps.packageLockPath });
+    if (!options.skipContract) {
+      phase = "--session-id contract";
       deps.runSessionIdContractGate();
-    } catch (error) {
-      fs.writeFileSync(deps.packageJsonPath, packageJsonSnapshot);
-      fs.writeFileSync(deps.packageLockPath, packageLockSnapshot);
-      console.error(error instanceof Error ? error.message : String(error));
-      throw new Error("agent tools left unchanged: --session-id contract failed");
     }
+  } catch (error) {
+    fs.writeFileSync(deps.packageJsonPath, packageJsonSnapshot);
+    fs.writeFileSync(deps.packageLockPath, packageLockSnapshot);
+    console.error(error instanceof Error ? error.message : String(error));
+    throw new Error(`agent tools left unchanged: ${phase} failed`);
   }
 
   const after = readAgentToolVersions(deps.packageJsonPath);
