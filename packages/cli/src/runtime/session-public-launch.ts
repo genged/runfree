@@ -109,7 +109,7 @@ export async function launchConfiguredAgentThroughAdmission(
     `${input.agentName} did not start`,
     () => withSessionLaunchFrame(
       input,
-      (driver) => driver.launchBuiltin(agent, launchConversationId ? { launchConversationId } : {}),
+      (driver) => driver.launchBuiltin(agent, launchConversationId !== undefined ? { launchConversationId } : {}),
     ),
   );
 }

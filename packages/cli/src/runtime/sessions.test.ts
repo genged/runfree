@@ -1169,6 +1169,17 @@ test("stamps new session metadata with the current boot", () => {
   expect(metadata.name).toMatch(/^claude /);
 });
 
+test("writes a fresh launch's host-chosen conversation id and the current record version", () => {
+  const runtimeContext = hostContext(harnessEnv(BOOT_B, PROCESS_B));
+  const io = { capture: () => ({ status: 1, stdout: "", stderr: "" }) } as unknown as RuntimeIO;
+  const ID = "0f8b1a2c-3d4e-4f5a-8b6c-7d8e9f0a1b2c";
+
+  const metadata = createSessionMetadata(runtimeContext, io, "claude", undefined, { launchConversationId: ID });
+
+  expect(metadata.launchConversationId).toBe(ID);
+  expect(metadata.recordVersion).toBe(2);
+});
+
 test("normalizes bounded session names by Unicode characters", () => {
   expect(normalizeSessionName("  payments refactor  ")).toBe("payments refactor");
   expect(normalizeSessionName("😀".repeat(80))).toBe("😀".repeat(80));

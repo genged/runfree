@@ -337,8 +337,9 @@ export type SessionAdmissionLaunchOptions = Readonly<{
    * launch frame mints this once with `crypto.randomUUID()`, outside its own
    * retry loop, so an admission retry after a re-prepared runtime still
    * resumes the same conversation. Never present together with `resume`: the
-   * preflight builder refuses both the resume-plus-id combination and a fresh
-   * launch of an agent that accepts the flag but was given no id.
+   * driver's preflight step (below) refuses both the resume-plus-id
+   * combination and a fresh launch of an agent that accepts the flag but was
+   * given no id.
    */
   launchConversationId?: string;
 }>;

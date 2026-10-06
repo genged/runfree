@@ -106,7 +106,7 @@ function freshLaunchOptions(agent: SessionAdmissionProbeAgent): SessionAdmission
   const launchConversationId = builtinAgent(agent)?.launchConversationIdFlag
     ? crypto.randomUUID()
     : undefined;
-  return launchConversationId ? { launchConversationId } : {};
+  return launchConversationId !== undefined ? { launchConversationId } : {};
 }
 
 /**

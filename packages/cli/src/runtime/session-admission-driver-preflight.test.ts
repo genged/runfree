@@ -320,7 +320,12 @@ function fixture() {
   };
   const build = (
     launchOverrides:
-      | Partial<{ agentId: string; configuredCommand: string; resume: { conversationId?: string } }>
+      | Partial<{
+          agentId: string;
+          configuredCommand: string;
+          resume: { conversationId?: string };
+          launchConversationId: string;
+        }>
       | Readonly<{ kind: "shell" }> = {},
   ) =>
     createSessionAdmissionDriverPreflight({
@@ -336,6 +341,9 @@ function fixture() {
               ?? builtinAgent(launchOverrides.agentId ?? "codex")?.defaultCommand
               ?? "",
             ...(launchOverrides.resume ? { resume: launchOverrides.resume } : {}),
+            ...(launchOverrides.launchConversationId !== undefined
+              ? { launchConversationId: launchOverrides.launchConversationId }
+              : {}),
           },
     });
   return {
@@ -414,6 +422,52 @@ describe("session admission driver preflight", () => {
     expect(record.launchPath).toBe(SESSION_ENTRY_PATH);
     expect(record.launchArgs[0]).toBe("/usr/local/bin/claude");
     expect(record.launchArgs.at(-1)).toBe(conversationId);
+    // A resume launch's argv is the recovery spec's resume authority; it must
+    // never also carry the fresh-launch id flag (spec §2).
+    expect(record.launchArgs).not.toContain("--session-id");
+  });
+
+  test("binds a fresh claude launch's host-chosen conversation id into the record argv", () => {
+    const value = fixture();
+    const ID = "0f8b1a2c-3d4e-4f5a-8b6c-7d8e9f0a1b2c";
+    const preflight = value.build({
+      agentId: "claude",
+      configuredCommand: builtinAgent("claude")?.defaultCommand ?? "",
+      launchConversationId: ID,
+    });
+
+    expect(preflight.launch.path).toBe(SESSION_ENTRY_PATH);
+    expect(preflight.launch.args).toEqual([
+      "/usr/local/bin/claude",
+      "--dangerously-skip-permissions",
+      "--add-dir",
+      "/runfree/inbox",
+      "--session-id",
+      ID,
+    ]);
+    const record = createAllocatedSessionContainerRecordFromPreflight(preflight, {
+      ...recordInput(),
+      command: "claude",
+    });
+    expect(record.launchArgs.slice(-2)).toEqual(["--session-id", ID]);
+  });
+
+  test("binds a fresh pi launch's host-chosen conversation id into the record argv", () => {
+    const value = fixture();
+    const ID = "0f8b1a2c-3d4e-4f5a-8b6c-7d8e9f0a1b2c";
+    const preflight = value.build({
+      agentId: "pi",
+      configuredCommand: builtinAgent("pi")?.defaultCommand ?? "",
+      launchConversationId: ID,
+    });
+
+    expect(preflight.launch.path).toBe(SESSION_ENTRY_PATH);
+    expect(preflight.launch.args).toEqual(["/usr/local/bin/pi", "--session-id", ID]);
+    const record = createAllocatedSessionContainerRecordFromPreflight(preflight, {
+      ...recordInput(),
+      command: "pi",
+    });
+    expect(record.launchArgs.slice(-2)).toEqual(["--session-id", ID]);
   });
 
   test("mints the login-shell target for a shell session and binds it into the record", () => {
