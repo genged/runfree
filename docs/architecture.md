@@ -1326,15 +1326,15 @@ can still drift without a lock change.
 ### Host Services
 
 A host service is a TCP service on the Docker Desktop host's loopback that the
-agent may reach, such as `idb_companion` on `127.0.0.1:10882`. It is approved
-per project in desired policy and persists like an allowed host:
+agent may reach, such as a dev server, a database, or a device bridge on
+`127.0.0.1:<port>`. It is approved per project in desired policy and persists like an allowed host:
 
 ```json
 {
   "version": 2,
   "hosts": [],
   "hostServices": {
-    "idb": { "target": "host-loopback", "port": 10882 }
+    "devserver": { "target": "host-loopback", "port": 3000 }
   }
 }
 ```
@@ -1361,10 +1361,10 @@ per project in desired policy and persists like an allowed host:
 Data path:
 
 ```text
-agent client: idb connect 127.0.0.1 10882           (client unchanged)
+agent client: connects to 127.0.0.1:3000             (client unchanged)
    v
-session relay on 127.0.0.1:10882 (routing only, no authority)
-   | CONNECT idb.runfree.internal:10882 to the proxy
+session relay on 127.0.0.1:3000 (routing only, no authority)
+   | CONNECT devserver.runfree.internal:3000 to the proxy
    v
 proxy (admitted session source IP only)
    classifyConnect, first check, every port, every mode:
@@ -1401,7 +1401,8 @@ Docker Desktop host gateway -> host 127.0.0.1:<port>
 - Each splice is tied to its client socket, so session revoke and the
   [IP reuse fence](#ip-reuse-fence) cut it with the session's sockets.
 
-**Session relay.** Clients such as `fb-idb` ignore proxy variables, so the
+**Session relay.** Many clients (database drivers, gRPC libraries, custom
+tools) ignore proxy variables, so the
 session entry starts one relay process
 ([host-service-relay.cts](../packages/agent-runtime/src/host-service-relay.cts))
 in the background before the readiness loop and never waits for it. It binds
@@ -1513,8 +1514,8 @@ review, `runfree policy approve`, `runfree control approve`, the
 checkout-binding review, and the setup wizard's base review. It runs after the
 candidate capture releases the lifecycle lock and before any approval write.
 A refusal names each entry, its reason, and the review command; the review
-line reads, for example, `host service idb: null -> 127.0.0.1:10882
-(idb_companion, pid 4242)`.
+line reads, for example, `host service devserver: null -> 127.0.0.1:3000
+(node, pid 4242)`.
 
 Every launch and `runfree status` repeat the owner check for each effective
 entry and warn, without blocking, when there is no listener, Docker Desktop
@@ -1526,8 +1527,8 @@ refresh it after activation, each launch refreshes it for a project that has
 host services or a registry row, and a completed `runfree destroy` prunes it.
 In every other project, `runfree forward` and `runfree vnc` refuse a
 registered port and name every owning project, and MCP callback port selection
-skips it. Several projects may approve the same port (two projects sharing one
-`idb_companion`, for example); only a duplicate port inside one project's row
+skips it. Several projects may approve the same port (two projects sharing one host
+service, for example); only a duplicate port inside one project's row
 is invalid. A corrupt or
 unreadable registry makes `forward` and `vnc` refuse; the callback block is
 never a host-service port, so it is unaffected. `runfree host-service list

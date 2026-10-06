@@ -198,19 +198,65 @@ runfree host-service list
 runfree host-service list --repair
 ```
 
-A host service lets the agent reach a TCP service on the host's loopback
-(`127.0.0.1:<port>`) through the proxy. For example, to let an unmodified
-`idb` client in the agent drive `idb_companion` on the Mac:
+A host service lets the agent reach a TCP service that runs on the host's
+loopback (`127.0.0.1:<port>`): a local dev server, a database, a model server,
+a device or simulator bridge, or any other service you run on the host. Clients
+in the agent use it unmodified at `127.0.0.1:<port>`, even when they ignore
+proxy settings.
+
+1. Start the service on the host. It must listen on `127.0.0.1:<port>` or
+   `*:<port>`.
+2. Approve it for the project:
+
+   ```bash
+   runfree host-service add <name> --port <port>
+   ```
+
+3. Start a new session. Inside it, point the client at `127.0.0.1:<port>`.
+
+For example, with a dev server on the host at `127.0.0.1:3000`:
 
 ```bash
-# on the host, with idb_companion listening on 127.0.0.1:10882
+runfree host-service add devserver --port 3000
+runfree claude
+# inside the session
+curl http://127.0.0.1:3000/
+```
+
+Install the client tool in the agent the usual way: allow its package hosts
+with `runfree host add`, or build it into the project image
+(`.runfree/image/Dockerfile`).
+
+### Host service examples
+
+**iOS Simulator with `idb`.** Run `idb_companion` on the Mac and drive it
+from the unmodified `idb` client in the agent:
+
+```bash
+# on the host
+xcrun simctl list devices booted                 # find the simulator UDID
+idb_companion --udid <UDID> --grpc-port 10882
 runfree host-service add idb --port 10882
 ```
 
-Then, in a new session:
+```bash
+# inside a new session (the agent needs the fb-idb client installed)
+idb connect 127.0.0.1 10882
+idb list-targets
+idb screenshot screen.png
+```
+
+`idb_companion` gives full simulator control: install, launch, UI actions,
+and file push and pull. Approving it gives every session in the project that
+control.
+
+**A database on the host.** A database installed natively on the host (not in
+a Docker container, whose published port `add` refuses) works the same way:
 
 ```bash
-idb connect 127.0.0.1 10882
+runfree host-service add postgres --port 5432
+# inside a new session
+psql -h 127.0.0.1 -p 5432 -U <user> <database>
 ```
 
 - `add` writes a `hostServices` entry to the desired policy (`--local` for the

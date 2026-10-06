@@ -95,8 +95,8 @@ export function sampleRemedyRenderings(): string[] {
     remedy.statusVerbose(),
     remedy.help(),
     remedy.init(),
-    remedy.hostServiceAdd("idb", 10882),
-    remedy.hostServiceRemove("idb"),
+    remedy.hostServiceAdd("devserver", 3000),
+    remedy.hostServiceRemove("devserver"),
     remedy.hostServiceList(),
     remedy.hostServiceRepair(),
   ];

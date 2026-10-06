@@ -122,9 +122,10 @@ export const COMMAND_EXAMPLES = {
     { cmd: "runfree host rules api.github.com --write ask", blurb: "Hold writes to this host for approval" },
   ],
   "host-service": [
-    { cmd: "runfree host-service add idb --port 10882", blurb: "Approve the host's 127.0.0.1:10882 for the agent after checking its listener" },
+    { cmd: "runfree host-service add devserver --port 3000", blurb: "Approve the host's 127.0.0.1:3000 for the agent after checking its listener" },
+    { cmd: "runfree host-service add idb --port 10882", blurb: "Let the agent's idb client drive idb_companion (iOS Simulator) on the host" },
     { cmd: "runfree host-service list", blurb: "List effective host services and who listens on each port" },
-    { cmd: "runfree host-service remove idb", blurb: "Remove an approved host service" },
+    { cmd: "runfree host-service remove devserver", blurb: "Remove an approved host service" },
     { cmd: "runfree host-service list --repair", blurb: "Rebuild the host-global host-service port registry" },
   ],
   credential: [

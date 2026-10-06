@@ -162,6 +162,17 @@ runfree host add api.example.com --read-only
 runfree host explain api.example.com
 ```
 
+To let the agent use a service that runs on your machine's loopback (a dev
+server, a database, a model server, a device bridge), approve its port. New
+sessions reach it at `127.0.0.1:<port>`, with the client unchanged:
+
+```bash
+runfree host-service add <name> --port <port>
+runfree host-service list
+```
+
+See [Host Services](docs/cli.md#host-services) for the checks and limits.
+
 To discover what a project actually needs, during a trusted onboarding task:
 
 ```bash

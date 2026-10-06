@@ -8,6 +8,7 @@ page is the map.
 | Document | When you need it |
 | --- | --- |
 | [Command reference](cli.md) | Every command, flag, and workflow |
+| [Host services](cli.md#host-services) | Letting the agent use a service that runs on your machine's loopback |
 | [Team workflow](team-workflow.md) | Sharing policy across a team without sharing credentials |
 | [Troubleshooting](troubleshooting.md) | A refusal you do not understand, or a runtime that will not start |
 | [What's new in 0.5.2](whats-new-0.5.2.md) | Release gate runs the full verification, `make test-release` |
