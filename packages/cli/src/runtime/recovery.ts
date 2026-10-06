@@ -670,36 +670,98 @@ function parsedClaimLivenessFromRecord(value: unknown, env: NodeJS.ProcessEnv): 
 }
 
 function unprovableClaimAgeMs(createdAt: unknown, fallbackMtimeMs: number, now: Date): number {
+  const nowMs = now.getTime();
   const createdAtMs = isoString(createdAt) ? Date.parse(createdAt) : undefined;
-  return now.getTime() - (createdAtMs ?? fallbackMtimeMs);
+  // A `createdAt` (or, failing that, an mtime) in the future is not a
+  // trustworthy age: fall back from one to the other, and if even the
+  // fallback is in the future, report an age of 0 rather than a negative
+  // number that would read as younger than fresh.
+  const effectiveMs = createdAtMs !== undefined && createdAtMs <= nowMs ? createdAtMs : fallbackMtimeMs;
+  return Math.max(0, nowMs - effectiveMs);
 }
 
-type ClaimFileLiveness = { liveness: ClaimLiveness; bytes?: SecureBytes };
+type MalformedClaimStat = Readonly<{ dev: number; ino: number; size: number; mtimeMs: number }>;
+type ClaimFileLiveness = { liveness: ClaimLiveness; bytes?: SecureBytes; malformedStat?: MalformedClaimStat };
+
+/**
+ * `lstat` alone, for a claim file `safeReadBytes` refused to read (size 0 —
+ * what a crash leaves between the claim's direct `wx` open and its write —
+ * over the byte cap, or an unstable TOCTOU read). Only a plain regular,
+ * non-hardlinked file counts: anything else (a directory, a symlink, a
+ * hardlinked file) is left alone entirely, exactly as a file `lstat` cannot
+ * even see is left alone — there is nothing here this function may trust
+ * enough to age or reclaim.
+ */
+function malformedClaimStat(filePath: string): fs.Stats | undefined {
+  try {
+    const stat = fs.lstatSync(filePath);
+    return stat.isFile() && stat.nlink === 1 ? stat : undefined;
+  } catch {
+    return undefined;
+  }
+}
 
 /**
  * The full liveness of one claim file: absent is "dead" (nothing to block
  * on), a record that can be parsed is judged on identity, and content that
- * cannot be parsed (the claim write is a direct, non-atomic `wx`, so a crash
- * mid-write can leave this) is "unprovable" from its mtime alone. Either way,
- * an "unprovable" verdict past `UNPROVABLE_CLAIM_MAX_AGE_MS` is promoted to
- * "dead" (decision 9). The returned `bytes`, when present, is exactly what
- * `unlinkIfFingerprintMatches` needs to reclaim the file under the lock.
+ * cannot be parsed or read at all — unreadable JSON, or a file
+ * `safeReadBytes` refuses outright (size 0, over the cap, an unstable
+ * read) — is "unprovable" from its `lstat` mtime alone, since the claim
+ * write is a direct, non-atomic `wx` that a crash mid-write can leave in
+ * either state. Either way, an "unprovable" verdict past
+ * `UNPROVABLE_CLAIM_MAX_AGE_MS` is promoted to "dead" (decision 9). The
+ * returned `bytes` or `malformedStat`, when present, is exactly what the
+ * caller needs to reclaim the file under the lock — by content fingerprint
+ * when there is content to hash, otherwise by a plain stat match.
  */
 function claimFileLiveness(filePath: string, env: NodeJS.ProcessEnv, now: Date): ClaimFileLiveness {
   const bytes = safeReadBytes(filePath);
-  if (!bytes) return { liveness: "dead" };
-  let value: unknown;
-  try {
-    value = JSON.parse(bytes.buffer.toString("utf8"));
-  } catch {
-    const age = unprovableClaimAgeMs(undefined, bytes.stat.mtimeMs, now);
+  if (bytes) {
+    let value: unknown;
+    try {
+      value = JSON.parse(bytes.buffer.toString("utf8"));
+    } catch {
+      const age = unprovableClaimAgeMs(undefined, bytes.stat.mtimeMs, now);
+      return { liveness: age > UNPROVABLE_CLAIM_MAX_AGE_MS ? "dead" : "unprovable", bytes };
+    }
+    const base = parsedClaimLivenessFromRecord(value, env);
+    if (base !== "unprovable") return { liveness: base, bytes };
+    const createdAt = isRecord(value) ? value.createdAt : undefined;
+    const age = unprovableClaimAgeMs(createdAt, bytes.stat.mtimeMs, now);
     return { liveness: age > UNPROVABLE_CLAIM_MAX_AGE_MS ? "dead" : "unprovable", bytes };
   }
-  const base = parsedClaimLivenessFromRecord(value, env);
-  if (base !== "unprovable") return { liveness: base, bytes };
-  const createdAt = isRecord(value) ? value.createdAt : undefined;
-  const age = unprovableClaimAgeMs(createdAt, bytes.stat.mtimeMs, now);
-  return { liveness: age > UNPROVABLE_CLAIM_MAX_AGE_MS ? "dead" : "unprovable", bytes };
+  const stat = malformedClaimStat(filePath);
+  if (!stat) return { liveness: "dead" };
+  const age = unprovableClaimAgeMs(undefined, stat.mtimeMs, now);
+  return {
+    liveness: age > UNPROVABLE_CLAIM_MAX_AGE_MS ? "dead" : "unprovable",
+    malformedStat: { dev: stat.dev, ino: stat.ino, size: stat.size, mtimeMs: stat.mtimeMs },
+  };
+}
+
+/**
+ * Reclaims a claim file this function could not read as content (size 0, or
+ * over the byte cap) but could `lstat`: an unlink bound to an immediately
+ * re-checked dev/ino/size/mtime match, the same TOCTOU discipline as
+ * `unlinkIfFingerprintMatches`, just without a content hash to check against.
+ */
+function unlinkIfStatMatches(filePath: string, expected: MalformedClaimStat): boolean {
+  let actual: fs.Stats;
+  try {
+    actual = fs.lstatSync(filePath);
+  } catch {
+    return false;
+  }
+  if (
+    !actual.isFile()
+    || actual.nlink !== 1
+    || actual.dev !== expected.dev
+    || actual.ino !== expected.ino
+    || actual.size !== expected.size
+    || actual.mtimeMs !== expected.mtimeMs
+  ) return false;
+  fs.unlinkSync(filePath);
+  return true;
 }
 
 /**
@@ -722,6 +784,23 @@ function crossScopeClaimIsLive(
     const read = safeReadJson(pickerPath);
     return read !== undefined && parsedClaimLivenessFromRecord(read.value, env) === "live";
   }
+  // Picker scope: every exact claim of this agent must be seen, or a live
+  // one the listing missed would let this claim through. A claims directory
+  // that plainly does not exist yet is safe — it is the only place either
+  // kind of claim file can ever live, and both are only ever created under
+  // this same per-project lifecycle lock, so its absence proves no claim of
+  // either scope exists. Anything else that keeps the listing from being
+  // authoritative — a verification failure (wrong type, a symlink swapped
+  // in, a broken parent) or a truncated scan — fails closed instead of
+  // reading a partial or unreadable view as "no live claims" (review F2).
+  let exists = true;
+  try {
+    fs.lstatSync(claimsDir);
+  } catch {
+    exists = false;
+  }
+  if (!exists) return false;
+  if (!verifiedDirectoryIdentity(item.stateDir, claimsDir)) return true;
   const global: GlobalScanBudget = { files: 0, truncated: false, invalidFiles: 0 };
   const liveExactClaims = scanFixedDirectory<true>({
     anchor: item.stateDir,
@@ -731,7 +810,7 @@ function crossScopeClaimIsLive(
     global,
     parse: (_filePath, _name, read) => (parsedClaimLivenessFromRecord(read.value, env) === "live" ? true : undefined),
   });
-  return liveExactClaims.length > 0;
+  return global.truncated || liveExactClaims.length > 0;
 }
 
 /**
@@ -1512,6 +1591,22 @@ export class RecoveryClaimLifecycleLockTimeoutError extends Error {
   }
 }
 
+/**
+ * A claim without a provable boot id and process start can never be told
+ * apart later from an unrelated process that happens to reuse its pid after
+ * a reboot (`host-identity.ts`), so it could neither exclude a cross-scope
+ * claim nor ever be proved dead for reclaim — it would sit there "live"
+ * forever. Fail closed at write time instead (controller ruling): refuse to
+ * create the claim at all. `dismissRecoveryItem` never hits this, because it
+ * writes no claim.
+ */
+export class RecoveryClaimOwnerIdentityError extends Error {
+  constructor() {
+    super("cannot claim the recovery item: this process's boot id or start time could not be read; retry");
+    this.name = "RecoveryClaimOwnerIdentityError";
+  }
+}
+
 type RecoveryClaimOwnerIdentity = Readonly<{
   bootId?: string;
   processStart?: string;
@@ -1605,6 +1700,7 @@ export async function acquireRecoveryClaim(
   // of milliseconds — wide enough to consume much of a concurrent selector's
   // bounded lock-acquisition window.
   const owner = recoveryClaimOwnerIdentity(context);
+  if (!owner.bootId || !owner.processStart) throw new RecoveryClaimOwnerIdentityError();
   const lifecycle = await tryAcquireProjectLifecycleLockWithRetry(context);
   if (!lifecycle) {
     // A changed or consumed item remains the ordinary undefined result. If the
@@ -1651,13 +1747,19 @@ function createRecoveryClaimUnderLifecycle(
   const existing = claimFileLiveness(filePath, env, now);
   if (existing.liveness === "live" || existing.liveness === "unprovable") return undefined;
   // "dead": reclaim it under this same lock, the only place a claim is ever
-  // unlinked. `bytes` is absent only when the path is simply free (no file)
-  // or fails the bounded safety checks on an existing, unaccountable file —
-  // either way there is nothing this function may unlink; a lingering,
-  // unaccountable file is left for the `wx` write below to refuse against.
+  // unlinked — by content fingerprint when there was content to hash,
+  // otherwise (a 0-byte or over-cap file `safeReadBytes` refused to read) by
+  // a plain stat match. Neither `bytes` nor `malformedStat` is present only
+  // when the path is simply free (no file), or fails even the loosest
+  // `lstat`-only check on an existing, unaccountable file (not a regular,
+  // single-link file) — either way there is nothing this function may
+  // unlink; a lingering, unaccountable file is left for the `wx` write below
+  // to refuse against.
   if (existing.bytes) {
     const existingFingerprint = fingerprint(existing.bytes.stat, item.id, existing.bytes.sha256);
     if (!unlinkIfFingerprintMatches(filePath, existingFingerprint)) return undefined;
+  } else if (existing.malformedStat) {
+    if (!unlinkIfStatMatches(filePath, existing.malformedStat)) return undefined;
   }
   const record: RecoveryClaimRecord = {
     v: 1,
@@ -1691,9 +1793,12 @@ function createRecoveryClaimUnderLifecycle(
 
 /**
  * Marks one linked Claude registry item consumed, keyed by its own id and
- * the fingerprint it had at join time. A write failure, or a fingerprint a
- * later re-scan no longer accepts (the registry file changed since joining),
- * must not fail the primary (host) consumption this always follows — this
+ * the fingerprint it had at join time — but only once that fingerprint is
+ * re-verified against the registry file *now*: a fingerprint a later re-scan
+ * would no longer accept (the file changed since joining) means this entry
+ * must be left alone, not marked consumed under a snapshot it no longer
+ * matches. A write failure, same as a non-matching fingerprint, must not
+ * fail the primary (host) consumption this is always called around — this
  * is best-effort per entry, so one bad entry cannot wedge the rest.
  */
 function writeLinkedClaudeConsumedRecord(
@@ -1702,6 +1807,10 @@ function writeLinkedClaudeConsumedRecord(
 ): void {
   if (!RECOVERY_ID_RE.test(linked.id)) return;
   try {
+    const read = safeReadJson(linked.evidencePath);
+    if (!read) return;
+    const current = fingerprint(read.stat, linked.fingerprint.schemaId, read.sha256);
+    if (!sameFingerprint(current, linked.fingerprint)) return;
     const record: RecoveryConsumedRecord = {
       v: 1,
       recoveryId: linked.id,
@@ -1718,16 +1827,17 @@ export function consumeRecoveryEvidence(item: RecoveryItem): boolean {
   const current = rereadEvidence(item);
   if (!current || !sameFingerprint(current.fingerprint, item.fingerprint)) return false;
   if (item.evidenceKind === "host") {
-    const unlinked = unlinkIfFingerprintMatches(item.evidencePath, item.fingerprint);
-    // A joined item's own linked Claude ids are consumed too (section 4: one
-    // conversation, one item — consuming either consumes both). This never
-    // touches the Claude-wide epoch: that epoch only protects *imprecise*
-    // host-only evidence (H2), and a host item that reached here already
-    // named its own exact conversation.
-    if (unlinked) {
-      for (const linked of item.linkedClaude ?? []) writeLinkedClaudeConsumedRecord(item.stateDir, linked);
-    }
-    return unlinked;
+    // A joined item's own linked Claude ids are marked consumed *before* the
+    // host record is unlinked (section 4: one conversation, one item —
+    // consuming either consumes both). The reverse order would leave a
+    // window, once the host record is gone, where those linked registry
+    // files scan as fresh, unclaimed standalone items — inviting a second
+    // resume of the conversation this one just finished. This never touches
+    // the Claude-wide epoch: that epoch only protects *imprecise* host-only
+    // evidence (H2), and a host item that reached here already named its
+    // own exact conversation.
+    for (const linked of item.linkedClaude ?? []) writeLinkedClaudeConsumedRecord(item.stateDir, linked);
+    return unlinkIfFingerprintMatches(item.evidencePath, item.fingerprint);
   }
   const record: RecoveryConsumedRecord = {
     v: 1,

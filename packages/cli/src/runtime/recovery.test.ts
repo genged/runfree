@@ -1378,6 +1378,47 @@ describe("stuck-claim reclaim (section 4, review F2, decision 9)", () => {
     expect(scanned?.claimUnprovable).toBe("a recovery claim's owner could not be proved alive or dead");
     expect(scanned?.state).not.toBe("claimed");
   });
+
+  test("a 0-byte claim file (interrupted mid-write) is unprovable and hides only that row", () => {
+    // `safeReadBytes` refuses an empty file outright — exactly what a crash
+    // between the claim's direct `wx` open and its write leaves — so this
+    // exercises the `malformedStat` branch of `claimFileLiveness`, not the
+    // content-fingerprint one. Real (fresh) mtime: the scan has no injected
+    // clock, so age boundary cases are covered separately below through
+    // `acquireRecoveryClaim`'s injected `now`.
+    hostEvidence(undefined, { outcome: "interrupted" });
+    const item = firstItem();
+    const scope = recoveryClaimScope(item);
+    fs.mkdirSync(path.dirname(scope.path), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(scope.path, "", { mode: 0o600 });
+
+    const scanned = scanRecoveryInventory({ env }).items.find((candidate) => candidate.id === item.id);
+
+    expect(scanned?.claimUnprovable).toBe("a recovery claim's owner could not be proved alive or dead");
+    expect(scanned?.state).not.toBe("claimed");
+  });
+
+  test("a 0-byte claim file uses its mtime for the 24h age boundary, then is reclaimed by stat match", async () => {
+    hostEvidence(undefined, { outcome: "interrupted" });
+    const item = firstItem();
+    const context = runtimeContext();
+    const scope = recoveryClaimScope(item);
+    fs.mkdirSync(path.dirname(scope.path), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(scope.path, "", { mode: 0o600 });
+    const mtime = new Date("2026-08-01T00:00:00.000Z");
+    fs.utimesSync(scope.path, mtime, mtime);
+
+    const almostExpired = new Date(mtime.getTime() + UNPROVABLE_CLAIM_MAX_AGE_MS - 60_000);
+    expect(await acquireRecoveryClaim(context, item, almostExpired)).toBeUndefined();
+
+    const expired = new Date(mtime.getTime() + UNPROVABLE_CLAIM_MAX_AGE_MS + 60_000);
+    const claim = await acquireRecoveryClaim(context, item, expired);
+    expect(claim).toBeDefined();
+    const written = JSON.parse(fs.readFileSync(scope.path, "utf8"));
+    expect(written.ownerPid).toBe(process.pid);
+    expect(written.createdAt).toBe(expired.toISOString());
+    claim?.release();
+  });
 });
 
 describe("unprovable claims block only their own scope (review F2)", () => {
@@ -1495,5 +1536,167 @@ describe("linked consumption and dismiss (section 5)", () => {
     } finally {
       held?.release();
     }
+  });
+
+  test("dismiss returns 'claimed' and deletes nothing when its own-scope claim is unprovable", async () => {
+    hostEvidence(undefined, { outcome: "interrupted" });
+    const item = firstItem();
+    writeClaimFile(item, { ownerPid: process.pid, hostBootId: undefined, hostProcessStart: undefined });
+
+    const result = await dismissRecoveryItem(runtimeContext(), item);
+
+    expect(result).toBe("claimed");
+    expect(fs.existsSync(item.evidencePath)).toBe(true);
+  });
+
+  test("dismiss returns 'claimed' and deletes nothing when a live cross-scope (exact) claim exists", async () => {
+    claudeEvidence(); // exact scope: agent claude, conversationId CLAUDE_SESSION
+    hostEvidence(undefined, { outcome: "interrupted" }); // picker scope, same agent
+    const items = scanRecoveryInventory({ env }).items;
+    const exact = items.find((candidate) => candidate.evidenceKind === "claude");
+    const picker = items.find((candidate) => candidate.evidenceKind === "host");
+    if (!exact || !picker) throw new Error("missing fixtures");
+    const context = runtimeContext();
+    const exactClaim = await acquireRecoveryClaim(context, exact);
+    expect(exactClaim).toBeDefined();
+
+    const result = await dismissRecoveryItem(context, picker);
+
+    expect(result).toBe("claimed");
+    expect(fs.existsSync(picker.evidencePath)).toBe(true);
+    exactClaim?.release();
+  });
+
+  test("linked consumption with one entry whose fingerprint no longer matches consumes the primary and the matching entry, leaving the other alone", async () => {
+    const MATCHING_SESSION = CLAUDE_SESSION;
+    const STALE_SESSION = "55555555-6666-4333-8444-555555555555";
+    claudeEvidence({ sessionId: MATCHING_SESSION }, 4242);
+    const staleEvidencePath = claudeEvidence({ sessionId: STALE_SESSION }, 4343);
+    hostEvidence(undefined, { recordVersion: 2, launchConversationId: "66666666-7777-4333-8444-555555555555", outcome: "interrupted" });
+    const items = scanRecoveryInventory({ env }).items;
+    const host = items.find((candidate) => candidate.evidenceKind === "host");
+    const matchingClaude = items.find((candidate) => candidate.conversationId === MATCHING_SESSION);
+    const staleClaude = items.find((candidate) => candidate.conversationId === STALE_SESSION);
+    if (!host || !matchingClaude || !staleClaude) throw new Error("missing fixtures");
+    expect(matchingClaude.id).not.toBe(staleClaude.id);
+
+    // Hand-built link list: two distinct linked ids, one of which (`stale`)
+    // will no longer match its on-disk fingerprint by the time consumption
+    // runs.
+    const joinedItem: RecoveryItem = {
+      ...host,
+      linkedClaude: [
+        { id: matchingClaude.id, evidencePath: matchingClaude.evidencePath, fingerprint: matchingClaude.fingerprint },
+        { id: staleClaude.id, evidencePath: staleClaude.evidencePath, fingerprint: staleClaude.fingerprint },
+      ],
+    };
+    const staleContent = JSON.parse(fs.readFileSync(staleEvidencePath, "utf8"));
+    staleContent.name = "changed after join";
+    fs.writeFileSync(staleEvidencePath, `${JSON.stringify(staleContent)}\n`);
+
+    await expect(runWithRecoveryClaim(runtimeContext(), joinedItem, () => 0)).resolves.toEqual({ status: 0, consumed: true });
+
+    expect(fs.existsSync(host.evidencePath)).toBe(false);
+    expect(fs.existsSync(path.join(stateDir, "sessions", "recovery-consumed", `${matchingClaude.id}.json`))).toBe(true);
+    expect(fs.existsSync(path.join(stateDir, "sessions", "recovery-consumed", `${staleClaude.id}.json`))).toBe(false);
+  });
+});
+
+describe("claim writer identity (controller ruling, fix round 1)", () => {
+  test("refuses to write a claim when its own boot id or process start cannot be read", async () => {
+    hostEvidence(undefined, { outcome: "interrupted" });
+    const item = firstItem();
+    // Non-empty but invalid overrides return `undefined` directly from
+    // `hostBootId`/`hostProcessStart` (host-identity.ts) without falling
+    // through to a real platform probe, so this is deterministic regardless
+    // of what boot id or process start this host actually has.
+    env.RUNFREE_TEST_HOST_BOOT_ID = "not-a-boot-id";
+    env.RUNFREE_TEST_HOST_PROCESS_START = "not-a-start-time";
+    const context = runtimeContext();
+
+    await expect(acquireRecoveryClaim(context, item)).rejects.toThrow(/boot id or start time/);
+    expect(fs.existsSync(path.join(stateDir, "sessions", "recovery-claims"))).toBe(false);
+  });
+
+  test("runWithRecoveryClaim's action is never called when the writer's identity cannot be read", async () => {
+    hostEvidence(undefined, { outcome: "interrupted" });
+    const item = firstItem();
+    env.RUNFREE_TEST_HOST_BOOT_ID = "not-a-boot-id";
+    env.RUNFREE_TEST_HOST_PROCESS_START = "not-a-start-time";
+    const context = runtimeContext();
+    const action = vi.fn().mockResolvedValue(0);
+
+    await expect(runWithRecoveryClaim(context, item, action)).rejects.toThrow(/boot id or start time/);
+    expect(action).not.toHaveBeenCalled();
+    expect(fs.existsSync(item.evidencePath)).toBe(true);
+  });
+});
+
+describe("cross-scope listing fails closed (review F2, availability)", () => {
+  test("a truncated exact-claim listing refuses a picker claim and reports it claimed, not free", async () => {
+    hostEvidence(undefined, { outcome: "interrupted" }); // picker item, agent claude
+    const item = firstItem();
+    const context = runtimeContext();
+    const pickerScope = recoveryClaimScope(item);
+    const agentScopeMatch = /agent-([0-9a-f]{24})\.json$/.exec(pickerScope.path);
+    if (!agentScopeMatch?.[1]) throw new Error("unexpected picker scope path");
+    const agentScope = agentScopeMatch[1];
+    const claimsDir = path.dirname(pickerScope.path);
+    fs.mkdirSync(claimsDir, { recursive: true, mode: 0o700 });
+
+    // A live exact claim, deliberately the *older* of two candidates so a
+    // files-per-kind cap of 1 scans the other one first and truncates this
+    // one away — proving the listing itself, not just its presence, is what
+    // must fail closed.
+    const liveConvPath = path.join(claimsDir, `conv-${agentScope}-${"a".repeat(24)}.json`);
+    fs.writeFileSync(liveConvPath, `${JSON.stringify({
+      v: 1,
+      recoveryId: `rfr-${"a".repeat(24)}`,
+      action: "resume",
+      ownerPid: process.pid,
+      hostBootId: BOOT,
+      hostProcessStart: PROCESS_START,
+      createdAt: new Date().toISOString(),
+      evidence: item.fingerprint,
+    })}\n`, { mode: 0o600 });
+    const olderStamp = new Date("2026-01-01T00:00:00.000Z");
+    fs.utimesSync(liveConvPath, olderStamp, olderStamp);
+
+    const deadConvPath = path.join(claimsDir, `conv-${agentScope}-${"b".repeat(24)}.json`);
+    fs.writeFileSync(deadConvPath, `${JSON.stringify({
+      v: 1,
+      recoveryId: `rfr-${"b".repeat(24)}`,
+      action: "resume",
+      ownerPid: DEAD_PID,
+      hostBootId: BOOT,
+      hostProcessStart: PROCESS_START,
+      createdAt: new Date().toISOString(),
+      evidence: item.fingerprint,
+    })}\n`, { mode: 0o600 });
+
+    const originalLimit = RECOVERY_LIMITS.maxFilesPerKindPerProject;
+    Object.assign(RECOVERY_LIMITS, { maxFilesPerKindPerProject: 1 });
+    try {
+      const claim = await acquireRecoveryClaim(context, item);
+      expect(claim).toBeUndefined();
+
+      const scanned = scanRecoveryInventory({ env }).items.find((candidate) => candidate.id === item.id);
+      expect(scanned?.state).toBe("claimed");
+    } finally {
+      Object.assign(RECOVERY_LIMITS, { maxFilesPerKindPerProject: originalLimit });
+    }
+  });
+
+  test("a claims directory replaced by a symlink is unverifiable and refuses a picker claim", async () => {
+    hostEvidence(undefined, { outcome: "interrupted" });
+    const item = firstItem();
+    const context = runtimeContext();
+    const claimsDir = path.dirname(recoveryClaimScope(item).path);
+    const outside = path.join(tmp, "outside-claims");
+    fs.mkdirSync(outside, { recursive: true });
+    fs.mkdirSync(path.dirname(claimsDir), { recursive: true });
+    fs.symlinkSync(outside, claimsDir, "dir");
+
+    expect(await acquireRecoveryClaim(context, item)).toBeUndefined();
   });
 });
