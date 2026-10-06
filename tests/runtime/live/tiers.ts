@@ -5,8 +5,10 @@
 // network shape and capability floor, egress containment, request shape and
 // write approval, inert agent policy edits and live revocation, managed-launch
 // host-file safety, exact per-session admission, the approved host-service
-// path and its refusals, and that the warm launch path never skips what a
-// changed runtime needs. Extended proves
+// path and its refusals, that the warm launch path never skips what a
+// changed runtime needs, and that the pinned claude/pi binaries still accept
+// and refuse `--session-id` the way the launch and resume paths assume.
+// Extended proves
 // availability, recovery, and optional features: crash recovery, rolling
 // upgrades and proxy replacement, renewal under load, the session-entry start
 // ordering, helper cleanup, and audit mode.
@@ -24,6 +26,7 @@ export const LIVE_TIER_ENV = "TEST_RUNTIME_TIER";
 
 /** Files whose every case is core. */
 export const CORE_LIVE_FILES = [
+  "tests/runtime/live/agent-session-id-contract.live.test.ts",
   "tests/runtime/live/runtime-topology.live.test.ts",
   "tests/runtime/live/request-shape.live.test.ts",
   "tests/runtime/live/allowlist-lifecycle.live.test.ts",

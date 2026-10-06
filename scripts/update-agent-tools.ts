@@ -1,7 +1,10 @@
 import childProcess from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+
+import { assertAgentSessionIdContract, lockedToolsContractRunner } from "./agent-session-id-contract.ts";
 
 export type AgentToolId = "claude" | "codex" | "pi";
 
@@ -28,6 +31,7 @@ export type AgentToolUpdateOptions = {
   rebuildAssets: boolean;
   requests: string[];
   showHelp: boolean;
+  skipContract: boolean;
 };
 
 export type AgentToolPackageSpec = {
@@ -48,7 +52,7 @@ type PackageLock = {
   packages?: Record<string, { dependencies?: Record<string, string>; version?: string }>;
 };
 
-function usage(): string {
+export function usage(): string {
   return `Usage: pnpm run update:agent-tools -- [options] [all|claude|codex|pi|<tool>@<version> ...]
 
 Updates the embedded Runfree agent CLI package pins in:
@@ -59,6 +63,7 @@ With no package arguments, updates all bundled coding agents to npm latest.
 
 Options:
   --no-assets     Only update package.json/package-lock.json; skip runtime asset rebuild
+  --no-contract   Skip the pinned --session-id contract gate (needs Docker)
   --dry-run       Print the npm specs and follow-up steps without mutating files
   -h, --help      Show this help
 
@@ -75,6 +80,7 @@ export function parseAgentToolUpdateArgs(argv: string[]): AgentToolUpdateOptions
     rebuildAssets: true,
     requests: [],
     showHelp: false,
+    skipContract: false,
   };
 
   for (const arg of argv) {
@@ -87,6 +93,10 @@ export function parseAgentToolUpdateArgs(argv: string[]): AgentToolUpdateOptions
     }
     if (arg === "--no-assets") {
       options.rebuildAssets = false;
+      continue;
+    }
+    if (arg === "--no-contract") {
+      options.skipContract = true;
       continue;
     }
     if (arg === "--assets") {
@@ -213,9 +223,9 @@ export function assertAgentToolsPackageLockConsistency(
   }
 }
 
-function verifyAgentToolsLockfiles(): void {
-  const packageJson = readJson<PackageJson>(agentToolsPackageJsonPath);
-  const packageLock = readJson<PackageLock>(agentToolsPackageLockPath);
+function verifyAgentToolsLockfiles(paths: { packageJsonPath: string; packageLockPath: string }): void {
+  const packageJson = readJson<PackageJson>(paths.packageJsonPath);
+  const packageLock = readJson<PackageLock>(paths.packageLockPath);
   assertAgentToolsPackageLockConsistency(packageJson, packageLock);
 }
 
@@ -248,13 +258,59 @@ function rebuildRuntimeAssets(): void {
   run("pnpm", ["run", "generate:assets"], { cwd: repoRoot });
 }
 
+/**
+ * Security review F1: the only npm step that runs on the host is `npm ci
+ * --ignore-scripts` (download, no package code executes); the pinned probe
+ * itself runs inside a throwaway `--network none` container
+ * (`lockedToolsContractRunner`), never on the host. The temp copy keeps this
+ * gate from depending on (or mutating) whatever `npm install` left in the
+ * real agent-tools directory.
+ */
+function defaultSessionIdContractGate(paths: { packageJsonPath: string; packageLockPath: string }): void {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "runfree-agent-tools-contract-"));
+  try {
+    fs.copyFileSync(paths.packageJsonPath, path.join(tmp, "package.json"));
+    fs.copyFileSync(paths.packageLockPath, path.join(tmp, "package-lock.json"));
+    run("npm", ["ci", "--ignore-scripts", "--omit=dev", "--fund=false", "--audit=false"], { cwd: tmp });
+    assertAgentSessionIdContract(lockedToolsContractRunner(tmp));
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+}
+
 function printPlan(specs: AgentToolPackageSpec[], options: AgentToolUpdateOptions): void {
   console.log(`agent tools: ${path.relative(repoRoot, agentToolsDir)}`);
   console.log(`npm specs: ${specs.map((spec) => spec.npmSpec).join(" ")}`);
   console.log(`runtime assets: ${options.rebuildAssets ? "rebuild and regenerate" : "skipped (--no-assets)"}`);
+  if (options.skipContract) console.log("session-id contract: skipped (--no-contract)");
 }
 
-export async function main(argv = process.argv.slice(2)): Promise<void> {
+/**
+ * The side-effecting steps `main` drives, injectable so a test can fake the
+ * npm step and the contract gate without running real npm or Docker, and
+ * without pointing either at the real agent-tools files. The restore-on-
+ * failure test (review F7) needs exactly this seam: it hands `main` its own
+ * temp `packageJsonPath`/`packageLockPath` and fakes that mutate and then
+ * fail, and asserts the real defaults are never touched.
+ */
+export type AgentToolUpdateDeps = {
+  packageJsonPath: string;
+  packageLockPath: string;
+  runNpmUpdate: (specs: AgentToolPackageSpec[]) => void;
+  runSessionIdContractGate: () => void;
+  rebuildRuntimeAssets: () => void;
+};
+
+const defaultDeps: AgentToolUpdateDeps = {
+  packageJsonPath: agentToolsPackageJsonPath,
+  packageLockPath: agentToolsPackageLockPath,
+  runNpmUpdate,
+  runSessionIdContractGate: () =>
+    defaultSessionIdContractGate({ packageJsonPath: agentToolsPackageJsonPath, packageLockPath: agentToolsPackageLockPath }),
+  rebuildRuntimeAssets,
+};
+
+export async function main(argv = process.argv.slice(2), deps: AgentToolUpdateDeps = defaultDeps): Promise<void> {
   const options = parseAgentToolUpdateArgs(argv);
   if (options.showHelp) {
     process.stdout.write(usage());
@@ -267,10 +323,28 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
 
   if (options.dryRun) return;
 
-  const before = readAgentToolVersions();
-  runNpmUpdate(specs);
-  verifyAgentToolsLockfiles();
-  const after = readAgentToolVersions();
+  // Review F7: snapshotted before anything mutates them, so a gate failure
+  // below can restore these exact bytes rather than leaving a half-applied
+  // update in place.
+  const packageJsonSnapshot = fs.readFileSync(deps.packageJsonPath);
+  const packageLockSnapshot = fs.readFileSync(deps.packageLockPath);
+
+  const before = readAgentToolVersions(deps.packageJsonPath);
+  deps.runNpmUpdate(specs);
+  verifyAgentToolsLockfiles({ packageJsonPath: deps.packageJsonPath, packageLockPath: deps.packageLockPath });
+
+  if (!options.skipContract) {
+    try {
+      deps.runSessionIdContractGate();
+    } catch (error) {
+      fs.writeFileSync(deps.packageJsonPath, packageJsonSnapshot);
+      fs.writeFileSync(deps.packageLockPath, packageLockSnapshot);
+      console.error(error instanceof Error ? error.message : String(error));
+      throw new Error("agent tools left unchanged: --session-id contract failed");
+    }
+  }
+
+  const after = readAgentToolVersions(deps.packageJsonPath);
 
   console.log("agent tool versions:");
   for (const tool of AGENT_TOOL_PACKAGES) {
@@ -278,7 +352,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     console.log(`  ${tool.id}: ${before[tool.id]} ${marker} ${after[tool.id]}`);
   }
 
-  if (options.rebuildAssets) rebuildRuntimeAssets();
+  if (options.rebuildAssets) deps.rebuildRuntimeAssets();
   console.log("done");
   if (!options.rebuildAssets) {
     console.log("next: pnpm run build:runtime && pnpm run generate:assets");
