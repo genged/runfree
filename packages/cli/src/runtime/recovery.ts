@@ -56,6 +56,16 @@ export const RECOVERY_LIMITS = {
 export type RecoveryState = "active" | "interrupted" | "unverified" | "claimed" | "unrecoverable";
 export type RecoveryEvidenceKind = "host" | "claude";
 
+// Whether a claim's recorded owner can be shown alive ("live"), shown gone
+// ("dead" — a different boot, or the same boot with a dead pid or a mismatched
+// process start), or neither ("unprovable" — no record, no usable `ownerPid`,
+// or a live pid with no boot/start identity to check it against). An
+// "unprovable" claim older than `UNPROVABLE_CLAIM_MAX_AGE_MS` counts as "dead"
+// (decision 9, review F2): the risk accepted is that a resumed session
+// running longer than that with an unknown owner identity can lose its claim.
+export type ClaimLiveness = "live" | "dead" | "unprovable";
+export const UNPROVABLE_CLAIM_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+
 export type EvidenceFingerprint = {
   dev: number;
   ino: number;
@@ -114,6 +124,11 @@ export type RecoveryItem = {
   linkedClaude?: readonly Readonly<{ id: string; evidencePath: string; fingerprint: EvidenceFingerprint }>[];
   // Host-only terminal identity for host evidence (terminal-identity.ts).
   terminal?: Readonly<{ ids: TerminalIdentity; tty?: string; termProgram?: string; bootId?: string }>;
+  // Set only when this item's own claim scope holds an unprovable claim (its
+  // owner could not be shown alive or dead) — the reason; the row is hidden
+  // from the prompt and the picker. Never set from a *cross-scope* unprovable
+  // claim, which must not block or annotate another record (review F2).
+  claimUnprovable?: string;
 };
 
 export type RecoveryInventory = {
@@ -143,6 +158,18 @@ type ClaudeRegistryEvidence = {
 
 type SecureRead = {
   value: unknown;
+  stat: fs.Stats;
+  sha256: string;
+};
+
+// The bounded, TOCTOU-safe read without the JSON parse: `safeReadJson` is
+// this plus `JSON.parse`. Kept separate so a claim file that fails to parse
+// (the direct, non-atomic `wx` write in `createRecoveryClaimUnderLifecycle`
+// can be interrupted mid-write by a crash) still yields a trustworthy stat
+// and content hash — enough to age it and to reclaim it with
+// `unlinkIfFingerprintMatches` — without ever reading an unbounded file.
+type SecureBytes = {
+  buffer: Buffer;
   stat: fs.Stats;
   sha256: string;
 };
@@ -228,7 +255,7 @@ function boundedString(value: unknown, max = 4_096): value is string {
   return typeof value === "string" && value.length > 0 && value.length <= max;
 }
 
-function safeReadJson(filePath: string, knownStat?: fs.Stats): SecureRead | undefined {
+function safeReadBytes(filePath: string, knownStat?: fs.Stats): SecureBytes | undefined {
   let before: fs.Stats;
   try {
     before = knownStat ?? fs.lstatSync(filePath);
@@ -266,7 +293,7 @@ function safeReadJson(filePath: string, knownStat?: fs.Stats): SecureRead | unde
       || after.mtimeMs !== opened.mtimeMs
     ) return undefined;
     return {
-      value: JSON.parse(buffer.toString("utf8")),
+      buffer,
       stat: after,
       sha256: crypto.createHash("sha256").update(buffer).digest("hex"),
     };
@@ -274,6 +301,16 @@ function safeReadJson(filePath: string, knownStat?: fs.Stats): SecureRead | unde
     return undefined;
   } finally {
     if (fd !== undefined) fs.closeSync(fd);
+  }
+}
+
+function safeReadJson(filePath: string, knownStat?: fs.Stats): SecureRead | undefined {
+  const bytes = safeReadBytes(filePath, knownStat);
+  if (!bytes) return undefined;
+  try {
+    return { value: JSON.parse(bytes.buffer.toString("utf8")), stat: bytes.stat, sha256: bytes.sha256 };
+  } catch {
+    return undefined;
   }
 }
 
@@ -586,29 +623,139 @@ function hostOwnerState(metadata: SessionMetadata, env: NodeJS.ProcessEnv): "act
   return "unknown";
 }
 
-function claimPath(item: RecoveryItem): string {
+function agentScopeHash(agent: string): string {
+  return crypto.createHash("sha256").update(agent.toLowerCase()).digest("hex").slice(0, 24);
+}
+
+function recoveryClaimsDir(item: RecoveryItem): string {
+  return path.join(item.stateDir, "sessions", "recovery-claims");
+}
+
+/**
+ * The claim key for one recovery item (section 4, decision 9): exact resume
+ * (a conversation id the agent's descriptor can resume exactly) claims its
+ * own conversation; everything else claims the whole agent, the picker
+ * scope. Two exact claims of different conversations stay concurrent (H1); a
+ * picker claim excludes every exact claim of that agent, and vice versa.
+ */
+export function recoveryClaimScope(item: RecoveryItem): Readonly<{ kind: "conversation" | "agent"; path: string }> {
   if (!RECOVERY_ID_RE.test(item.id)) throw new Error(`invalid recovery id: ${item.id}`);
-  const agentScope = crypto.createHash("sha256").update(item.agent.toLowerCase()).digest("hex").slice(0, 24);
-  return path.join(item.stateDir, "sessions", "recovery-claims", `agent-${agentScope}.json`);
+  const agentScope = agentScopeHash(item.agent);
+  const exact = item.conversationId !== undefined && builtinAgent(item.agent)?.resume?.exactArgvPrefix !== undefined;
+  if (exact) {
+    const conversationScope = crypto.createHash("sha256").update(item.conversationId as string).digest("hex").slice(0, 24);
+    return Object.freeze({
+      kind: "conversation" as const,
+      path: path.join(recoveryClaimsDir(item), `conv-${agentScope}-${conversationScope}.json`),
+    });
+  }
+  return Object.freeze({ kind: "agent" as const, path: path.join(recoveryClaimsDir(item), `agent-${agentScope}.json`) });
 }
 
-function parsedClaimIsLive(value: unknown, env: NodeJS.ProcessEnv): boolean {
-  if (!isRecord(value) || !Number.isInteger(value.ownerPid) || (value.ownerPid as number) <= 0) return true;
+// Identity-only liveness, with no notion of age: "unprovable" covers both no
+// record at all and a live pid the record cannot otherwise verify. Age is
+// folded in by `claimFileLiveness`, the only caller, once it has a trustworthy
+// timestamp to measure against.
+function parsedClaimLivenessFromRecord(value: unknown, env: NodeJS.ProcessEnv): ClaimLiveness {
+  if (!isRecord(value) || !Number.isInteger(value.ownerPid) || (value.ownerPid as number) <= 0) return "unprovable";
   const pid = value.ownerPid as number;
-  if (compareHostBootId(value.hostBootId, env) === "mismatch") return false;
-  if (!processAlive(pid)) return false;
-  if (
-    compareHostBootId(value.hostBootId, env) === "match"
-    && compareHostProcessStart(value.hostProcessStart, pid, env) === "mismatch"
-  ) return false;
-  // Unknown identity with a live PID fails closed as a live claim. It may need
-  // manual cleanup, but it can never admit two resume executions.
-  return true;
+  const boot = compareHostBootId(value.hostBootId, env);
+  if (boot === "mismatch" || !processAlive(pid)) return "dead";
+  const processStart = compareHostProcessStart(value.hostProcessStart, pid, env);
+  if (boot === "match" && processStart === "mismatch") return "dead";
+  if (boot === "match" && processStart === "match") return "live";
+  // Boot unknown, or boot known but start unknown, with a live pid: cannot be
+  // shown either way (review F2 — this used to fail closed as "live").
+  return "unprovable";
 }
 
-function itemClaimed(item: RecoveryItem, env: NodeJS.ProcessEnv): boolean {
-  const read = safeReadJson(claimPath(item));
-  return read ? parsedClaimIsLive(read.value, env) : false;
+function unprovableClaimAgeMs(createdAt: unknown, fallbackMtimeMs: number, now: Date): number {
+  const createdAtMs = isoString(createdAt) ? Date.parse(createdAt) : undefined;
+  return now.getTime() - (createdAtMs ?? fallbackMtimeMs);
+}
+
+type ClaimFileLiveness = { liveness: ClaimLiveness; bytes?: SecureBytes };
+
+/**
+ * The full liveness of one claim file: absent is "dead" (nothing to block
+ * on), a record that can be parsed is judged on identity, and content that
+ * cannot be parsed (the claim write is a direct, non-atomic `wx`, so a crash
+ * mid-write can leave this) is "unprovable" from its mtime alone. Either way,
+ * an "unprovable" verdict past `UNPROVABLE_CLAIM_MAX_AGE_MS` is promoted to
+ * "dead" (decision 9). The returned `bytes`, when present, is exactly what
+ * `unlinkIfFingerprintMatches` needs to reclaim the file under the lock.
+ */
+function claimFileLiveness(filePath: string, env: NodeJS.ProcessEnv, now: Date): ClaimFileLiveness {
+  const bytes = safeReadBytes(filePath);
+  if (!bytes) return { liveness: "dead" };
+  let value: unknown;
+  try {
+    value = JSON.parse(bytes.buffer.toString("utf8"));
+  } catch {
+    const age = unprovableClaimAgeMs(undefined, bytes.stat.mtimeMs, now);
+    return { liveness: age > UNPROVABLE_CLAIM_MAX_AGE_MS ? "dead" : "unprovable", bytes };
+  }
+  const base = parsedClaimLivenessFromRecord(value, env);
+  if (base !== "unprovable") return { liveness: base, bytes };
+  const createdAt = isRecord(value) ? value.createdAt : undefined;
+  const age = unprovableClaimAgeMs(createdAt, bytes.stat.mtimeMs, now);
+  return { liveness: age > UNPROVABLE_CLAIM_MAX_AGE_MS ? "dead" : "unprovable", bytes };
+}
+
+/**
+ * Whether the claim on the *other* scope for this item's agent is live. An
+ * exact (conversation) item's cross scope is the single agent-wide picker
+ * claim; a picker (agent) item's cross scope is every exact claim of that
+ * agent, bounded-listed. Age never matters here: only "live" blocks, and an
+ * unprovable or dead claim can never read as live (review F2 — a cross-scope
+ * claim that cannot be proved live must never block another record).
+ */
+function crossScopeClaimIsLive(
+  item: RecoveryItem,
+  scope: Readonly<{ kind: "conversation" | "agent"; path: string }>,
+  env: NodeJS.ProcessEnv,
+): boolean {
+  const agentScope = agentScopeHash(item.agent);
+  const claimsDir = recoveryClaimsDir(item);
+  if (scope.kind === "conversation") {
+    const pickerPath = path.join(claimsDir, `agent-${agentScope}.json`);
+    const read = safeReadJson(pickerPath);
+    return read !== undefined && parsedClaimLivenessFromRecord(read.value, env) === "live";
+  }
+  const global: GlobalScanBudget = { files: 0, truncated: false, invalidFiles: 0 };
+  const liveExactClaims = scanFixedDirectory<true>({
+    anchor: item.stateDir,
+    dir: claimsDir,
+    fileName: new RegExp(`^conv-${agentScope}-[0-9a-f]{24}\\.json$`),
+    budget: { files: 0, bytes: 0 },
+    global,
+    parse: (_filePath, _name, read) => (parsedClaimLivenessFromRecord(read.value, env) === "live" ? true : undefined),
+  });
+  return liveExactClaims.length > 0;
+}
+
+/**
+ * The claim state visible to the scan and to classification: "claimed" when
+ * this item's own scope is live, or the cross scope is live; "unprovable"
+ * when only this item's own scope cannot be shown alive or dead (and the
+ * cross scope is not live); "free" otherwise. An own-scope claim past the
+ * unprovable age limit reads as "free" here too — the next actual claim
+ * attempt reclaims it, so display should not keep hiding it as unprovable.
+ */
+function itemClaimState(item: RecoveryItem, env: NodeJS.ProcessEnv): "free" | "claimed" | "unprovable" {
+  const scope = recoveryClaimScope(item);
+  const own = claimFileLiveness(scope.path, env, new Date()).liveness;
+  if (own === "live" || crossScopeClaimIsLive(item, scope, env)) return "claimed";
+  return own === "unprovable" ? "unprovable" : "free";
+}
+
+const CLAIM_UNPROVABLE_REASON = "a recovery claim's owner could not be proved alive or dead";
+
+/** Applies the scan-time claim verdict to a freshly built item, in place. */
+function applyClaimState(item: RecoveryItem, env: NodeJS.ProcessEnv): void {
+  const state = itemClaimState(item, env);
+  if (state === "claimed") item.state = "claimed";
+  else if (state === "unprovable") item.claimUnprovable = CLAIM_UNPROVABLE_REASON;
 }
 
 function validConversationId(value: string | undefined): string | undefined {
@@ -666,7 +813,7 @@ function itemFromHost(
     hostMetadata: metadata,
     ...(!mapping.valid ? { state: "unrecoverable", reason: mapping.reason } : {}),
   };
-  if (mapping.valid && itemClaimed(item, env)) item.state = "claimed";
+  if (mapping.valid) applyClaimState(item, env);
   // The Claude-wide exact-recovery epoch (H2) only protects *imprecise*
   // host-only evidence: an item that already names its own conversation
   // cannot be shadowed by a different exact Claude recovery completing.
@@ -709,7 +856,7 @@ function itemFromClaude(
     claudeRegistry: registry,
     ...(!mapping.valid ? { reason: mapping.reason } : {}),
   };
-  if (mapping.valid && itemClaimed(item, env)) item.state = "claimed";
+  if (mapping.valid) applyClaimState(item, env);
   return item;
 }
 
@@ -1157,10 +1304,14 @@ export function classifyRecoveryItemLive(
   live: RecoveryLiveInputs,
   options: { ignoreClaim?: boolean } = {},
 ): RecoveryItem {
-  const current = rereadEvidence(item);
+  let current = rereadEvidence(item);
   if (!current) return { ...item, state: "unverified", reason: "recovery evidence changed or became unreadable" };
   if (item.state === "unrecoverable" || !item.projectRoot) return current;
-  if (!options.ignoreClaim && itemClaimed(current, context.env ?? process.env)) return { ...current, state: "claimed" };
+  if (!options.ignoreClaim) {
+    const claimState = itemClaimState(current, context.env ?? process.env);
+    if (claimState === "claimed") return { ...current, state: "claimed" };
+    if (claimState === "unprovable") current = { ...current, claimUnprovable: CLAIM_UNPROVABLE_REASON };
+  }
   if (current.evidenceKind === "host") {
     const owner = current.hostMetadata
       ? hostOwnerState(current.hostMetadata, context.env ?? process.env)
@@ -1430,9 +1581,13 @@ function itemWasConsumed(item: RecoveryItem): boolean {
 }
 
 function unlinkIfFingerprintMatches(filePath: string, expected: EvidenceFingerprint): boolean {
-  const read = safeReadJson(filePath);
-  if (!read) return false;
-  const actual = fingerprint(read.stat, expected.schemaId, read.sha256);
+  // `safeReadBytes`, not `safeReadJson`: the fingerprint is over the raw bytes
+  // (stat plus content hash), so this reclaims a malformed claim file — one a
+  // crash left mid-write through the claim's direct, non-atomic `wx` — the
+  // same way it reclaims any other evidence.
+  const bytes = safeReadBytes(filePath);
+  if (!bytes) return false;
+  const actual = fingerprint(bytes.stat, expected.schemaId, bytes.sha256);
   if (!sameFingerprint(actual, expected)) return false;
   fs.unlinkSync(filePath);
   return true;
@@ -1485,19 +1640,24 @@ function createRecoveryClaimUnderLifecycle(
   // Recheck after acquisition because a bounded retry can wait while the
   // agent-owned evidence changes or disappears.
   if (!RECOVERY_ID_RE.test(item.id) || !evidenceMatches(item) || itemWasConsumed(item)) return undefined;
-  const filePath = claimPath(item);
+  const env = context.env ?? process.env;
+  const scope = recoveryClaimScope(item);
+  // A live cross-scope claim excludes this one outright (section 4): an
+  // unprovable cross-scope claim never blocks (review F2), so it is not
+  // checked again here.
+  if (crossScopeClaimIsLive(item, scope, env)) return undefined;
+  const filePath = scope.path;
   fs.mkdirSync(path.dirname(filePath), { recursive: true, mode: 0o700 });
-  const existing = safeReadJson(filePath);
-  if (existing) {
-    if (parsedClaimIsLive(existing.value, context.env ?? process.env)) return undefined;
-    const existingFingerprint = fingerprint(existing.stat, item.id, existing.sha256);
+  const existing = claimFileLiveness(filePath, env, now);
+  if (existing.liveness === "live" || existing.liveness === "unprovable") return undefined;
+  // "dead": reclaim it under this same lock, the only place a claim is ever
+  // unlinked. `bytes` is absent only when the path is simply free (no file)
+  // or fails the bounded safety checks on an existing, unaccountable file —
+  // either way there is nothing this function may unlink; a lingering,
+  // unaccountable file is left for the `wx` write below to refuse against.
+  if (existing.bytes) {
+    const existingFingerprint = fingerprint(existing.bytes.stat, item.id, existing.bytes.sha256);
     if (!unlinkIfFingerprintMatches(filePath, existingFingerprint)) return undefined;
-  } else {
-    try {
-      if (fs.lstatSync(filePath)) return undefined;
-    } catch {
-      // Absent is the expected path.
-    }
   }
   const record: RecoveryClaimRecord = {
     v: 1,
@@ -1529,11 +1689,45 @@ function createRecoveryClaimUnderLifecycle(
   };
 }
 
+/**
+ * Marks one linked Claude registry item consumed, keyed by its own id and
+ * the fingerprint it had at join time. A write failure, or a fingerprint a
+ * later re-scan no longer accepts (the registry file changed since joining),
+ * must not fail the primary (host) consumption this always follows — this
+ * is best-effort per entry, so one bad entry cannot wedge the rest.
+ */
+function writeLinkedClaudeConsumedRecord(
+  stateDir: string,
+  linked: Readonly<{ id: string; evidencePath: string; fingerprint: EvidenceFingerprint }>,
+): void {
+  if (!RECOVERY_ID_RE.test(linked.id)) return;
+  try {
+    const record: RecoveryConsumedRecord = {
+      v: 1,
+      recoveryId: linked.id,
+      evidence: linked.fingerprint,
+      consumedAt: new Date().toISOString(),
+    };
+    atomicWriteJson(path.join(stateDir, "sessions", "recovery-consumed", `${linked.id}.json`), record);
+  } catch {
+    // Best-effort: see the doc comment above.
+  }
+}
+
 export function consumeRecoveryEvidence(item: RecoveryItem): boolean {
   const current = rereadEvidence(item);
   if (!current || !sameFingerprint(current.fingerprint, item.fingerprint)) return false;
   if (item.evidenceKind === "host") {
-    return unlinkIfFingerprintMatches(item.evidencePath, item.fingerprint);
+    const unlinked = unlinkIfFingerprintMatches(item.evidencePath, item.fingerprint);
+    // A joined item's own linked Claude ids are consumed too (section 4: one
+    // conversation, one item — consuming either consumes both). This never
+    // touches the Claude-wide epoch: that epoch only protects *imprecise*
+    // host-only evidence (H2), and a host item that reached here already
+    // named its own exact conversation.
+    if (unlinked) {
+      for (const linked of item.linkedClaude ?? []) writeLinkedClaudeConsumedRecord(item.stateDir, linked);
+    }
+    return unlinked;
   }
   const record: RecoveryConsumedRecord = {
     v: 1,
@@ -1565,6 +1759,34 @@ export async function runWithRecoveryClaim(
     };
   } finally {
     claim.release();
+  }
+}
+
+/**
+ * "Forget it" (section 5): dismisses one recovery item without resuming it.
+ * Reuses the same fingerprint-checked consumption as a successful resume,
+ * under the same lifecycle lock, so a dismiss races a concurrent claim the
+ * same way a resume does and never deletes evidence a live claim still
+ * owns. Writes only under `<stateDir>/sessions/` and deletes nothing when it
+ * returns anything other than "dismissed" (review F9: a lock timeout is
+ * reported as "deferred", never "claimed").
+ */
+export async function dismissRecoveryItem(
+  context: RuntimeContext,
+  item: RecoveryItem,
+  options: { lifecycleLockRetry?: { attempts?: number; delayMs?: number } } = {},
+): Promise<"dismissed" | "changed" | "claimed" | "deferred"> {
+  if (!evidenceMatches(item)) return "changed";
+  const lifecycle = await tryAcquireProjectLifecycleLockWithRetry(context, options.lifecycleLockRetry);
+  if (!lifecycle) return "deferred";
+  try {
+    const env = context.env ?? process.env;
+    // An unprovable own-scope claim blocks a dismiss exactly like a live one:
+    // either could still be a live resume in progress.
+    if (itemClaimState(item, env) !== "free") return "claimed";
+    return consumeRecoveryEvidence(item) ? "dismissed" : "changed";
+  } finally {
+    lifecycle.release();
   }
 }
 

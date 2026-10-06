@@ -163,6 +163,27 @@ describe("resume through session admission", () => {
     expect(fs.existsSync(path.join(stateDir, "claude", "sessions", "4242.json"))).toBe(true);
   });
 
+  test("resuming a host record joined to its own Claude registry entry consumes the linked id, never the epoch", async () => {
+    const claudePath = claudeEvidence();
+    hostEvidence(undefined, { recordVersion: 2, launchConversationId: CLAUDE_SESSION });
+    const context = runtimeContext();
+    const item = firstItem();
+    const linkedId = item.linkedClaude?.[0]?.id;
+    if (!linkedId) throw new Error("missing linked claude fixture");
+
+    const result = await resumeInterruptedSessionThroughAdmission({ preparedRuntime: preparedRuntime(context), io, item });
+
+    expect(result).toEqual({ status: 0, consumed: true });
+    expect(mocks.launchBuiltin).toHaveBeenCalledWith("claude", {
+      resume: { conversationId: CLAUDE_SESSION },
+    });
+    expect(fs.existsSync(path.join(stateDir, "sessions", "rf-20260731-abcdef.json"))).toBe(false);
+    expect(fs.existsSync(path.join(stateDir, "sessions", "recovery-consumed", `${linkedId}.json`))).toBe(true);
+    expect(fs.existsSync(path.join(stateDir, "sessions", "recovery-consumed", "agent-claude.json"))).toBe(false);
+    // The agent-writable registry entry itself is never unlinked.
+    expect(fs.existsSync(claudePath)).toBe(true);
+  });
+
   test("retries a transient lifecycle-lock collision before launching the resume", async () => {
     claudeEvidence();
     const context = runtimeContext();
