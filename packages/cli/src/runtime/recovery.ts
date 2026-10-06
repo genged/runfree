@@ -81,6 +81,11 @@ export type RecoveryItem = {
   conversationId?: string;
   conversationName?: string;
   conversationStatus?: string;
+  // Where a *copied* `conversationName` came from — set only when a host
+  // item's name was copied from somewhere else (see `joinHostAndClaudeItems`
+  // for "claude-reported"; a later task sets "codex-index"). Absent when the
+  // item's own evidence names its own conversation.
+  conversationNameSource?: "claude-reported" | "codex-index";
   startedAt?: string;
   updatedAt?: string;
   terminalHint?: string;
@@ -100,10 +105,13 @@ export type RecoveryItem = {
   // `hostOwnerState`). Absent on Claude-registry items, which have no host
   // owner of their own to check.
   ownerState?: "active" | "dead" | "unknown";
-  // The Claude-registry item this host item's own reported conversation
-  // joined into it (see `joinHostAndClaudeItems`). Once linked, that Claude
-  // item no longer appears as a separate inventory entry.
-  linkedClaude?: Readonly<{ id: string; evidencePath: string; fingerprint: EvidenceFingerprint }>;
+  // Every Claude-registry item for this host item's own reported
+  // conversation (see `joinHostAndClaudeItems`), newest first. A crashed
+  // original process and a crashed resumed process can each leave their own
+  // registry file for the same conversation — normally, and also by a
+  // forged duplicate — so this is a list, not a single value. Once linked,
+  // none of these Claude items appear as a separate inventory entry.
+  linkedClaude?: readonly Readonly<{ id: string; evidencePath: string; fingerprint: EvidenceFingerprint }>[];
   // Host-only terminal identity for host evidence (terminal-identity.ts).
   terminal?: Readonly<{ ids: TerminalIdentity; tty?: string; termProgram?: string; bootId?: string }>;
 };
@@ -706,22 +714,36 @@ function itemFromClaude(
 }
 
 /**
- * Folds a host item's own reported Claude registry evidence into it, so a
- * crashed session that left both an exact host record and a live Claude
- * registry entry for the same conversation appears once, not twice. Joining
- * is keyed by `(projectId, conversationId)` on a host item whose `agent` is
- * Claude — the only `agent` the scanned Claude evidence can ever report —
- * and only against Claude evidence nothing has consumed yet: a host item
- * whose matching Claude evidence was already consumed keeps no link, rather
- * than pointing at evidence that no longer names a live conversation. The
- * joined Claude item is removed from the flat list so it never appears as a
+ * Folds every one of a host item's own reported Claude registry items into
+ * it, so a crashed session that left both an exact host record and one or
+ * more live Claude registry entries for the same conversation appears once,
+ * not once-per-registry-file. A crashed original process and a crashed
+ * resumed process can each leave their own `claude/sessions/<pid>.json` file
+ * naming the same conversation — ordinary duplicate residue, and also
+ * forgeable by an agent — and `recoveryId` hashes only `(projectId, kind,
+ * sourceId)`, so two such files collide on the same recovery id. Joining
+ * must therefore gather *every* match for the key, not just one, or a
+ * duplicate survives as a standalone row whose id equals the linked id.
+ *
+ * Joining is keyed by `(projectId, conversationId)` on a host item whose
+ * `agent` is Claude — the only `agent` the scanned Claude evidence can ever
+ * report — and only against Claude evidence nothing has consumed yet: a
+ * consumed duplicate is neither linked nor shown (it is dropped by the
+ * caller's `itemWasConsumed` filter same as always). The surviving matches
+ * are sorted newest first (by the Claude item's own `updatedAt`, then
+ * evidence `mtimeMs`); `conversationName`/`conversationStatus` are copied
+ * from the newest, onto a host item that has none of its own. Every joined
+ * Claude item is removed from the flat list so none of them appear as a
  * separate entry.
  */
 function joinHostAndClaudeItems(items: readonly RecoveryItem[]): RecoveryItem[] {
-  const claudeIndexByKey = new Map<string, number>();
+  const claudeIndexesByKey = new Map<string, number[]>();
   items.forEach((item, index) => {
     if (item.evidenceKind === "claude" && item.conversationId !== undefined) {
-      claudeIndexByKey.set(`${item.projectId}\0${item.conversationId}`, index);
+      const key = `${item.projectId}\0${item.conversationId}`;
+      const existing = claudeIndexesByKey.get(key);
+      if (existing) existing.push(index);
+      else claudeIndexesByKey.set(key, [index]);
     }
   });
   const joinedClaudeIndexes = new Set<number>();
@@ -729,20 +751,31 @@ function joinHostAndClaudeItems(items: readonly RecoveryItem[]): RecoveryItem[] 
     if (item.evidenceKind !== "host" || item.conversationId === undefined || item.agent.toLowerCase() !== "claude") {
       return item;
     }
-    const claudeIndex = claudeIndexByKey.get(`${item.projectId}\0${item.conversationId}`);
-    const claudeItem = claudeIndex !== undefined ? items[claudeIndex] : undefined;
-    if (claudeIndex === undefined || !claudeItem || joinedClaudeIndexes.has(claudeIndex) || itemWasConsumed(claudeItem)) {
-      return item;
-    }
-    joinedClaudeIndexes.add(claudeIndex);
+    const key = `${item.projectId}\0${item.conversationId}`;
+    const matches = (claudeIndexesByKey.get(key) ?? [])
+      .filter((index) => !joinedClaudeIndexes.has(index))
+      .map((index) => ({ index, claudeItem: items[index] }))
+      .filter((entry): entry is { index: number; claudeItem: RecoveryItem } =>
+        entry.claudeItem !== undefined && !itemWasConsumed(entry.claudeItem));
+    if (matches.length === 0) return item;
+    matches.sort((left, right) => {
+      const byUpdatedAt = Date.parse(right.claudeItem.updatedAt ?? "") - Date.parse(left.claudeItem.updatedAt ?? "");
+      return byUpdatedAt !== 0 ? byUpdatedAt : right.claudeItem.fingerprint.mtimeMs - left.claudeItem.fingerprint.mtimeMs;
+    });
+    for (const match of matches) joinedClaudeIndexes.add(match.index);
+    const newest = matches[0]?.claudeItem;
     return {
       ...item,
-      linkedClaude: { id: claudeItem.id, evidencePath: claudeItem.evidencePath, fingerprint: claudeItem.fingerprint },
-      ...(item.conversationName === undefined && claudeItem.conversationName !== undefined
-        ? { conversationName: claudeItem.conversationName }
+      linkedClaude: matches.map(({ claudeItem }) => ({
+        id: claudeItem.id,
+        evidencePath: claudeItem.evidencePath,
+        fingerprint: claudeItem.fingerprint,
+      })),
+      ...(item.conversationName === undefined && newest?.conversationName !== undefined
+        ? { conversationName: newest.conversationName, conversationNameSource: "claude-reported" as const }
         : {}),
-      ...(item.conversationStatus === undefined && claudeItem.conversationStatus !== undefined
-        ? { conversationStatus: claudeItem.conversationStatus }
+      ...(item.conversationStatus === undefined && newest?.conversationStatus !== undefined
+        ? { conversationStatus: newest.conversationStatus }
         : {}),
     };
   });

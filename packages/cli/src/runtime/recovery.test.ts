@@ -14,6 +14,7 @@ import {
   formatRecoveryInventory,
   liveClaudeSessionBlocksPicker,
   RECOVERY_LIMITS,
+  recoveryIdIsValid,
   recoveryInventoryJson,
   runWithRecoveryClaim,
   scanRecoveryInventory,
@@ -74,12 +75,17 @@ function hostEvidence(id = "rf-20260731-abcdef", overrides: Record<string, unkno
   return filePath;
 }
 
-function claudeEvidence(overrides: Record<string, unknown> = {}): string {
+// `pid` controls the registry filename (`claude/sessions/<pid>.json`) as well
+// as the default `pid` field, so a caller can write a *second*, distinct
+// registry file for the same (or a different) conversation — e.g. a crashed
+// original process and a crashed resumed process each leaving their own
+// file for one conversation.
+function claudeEvidence(overrides: Record<string, unknown> = {}, pid = 4242): string {
   const dir = path.join(stateDir, "claude", "sessions");
   fs.mkdirSync(dir, { recursive: true });
-  const filePath = path.join(dir, "4242.json");
+  const filePath = path.join(dir, `${pid}.json`);
   fs.writeFileSync(filePath, `${JSON.stringify({
-    pid: 4242,
+    pid,
     sessionId: CLAUDE_SESSION,
     cwd: "/workspace",
     startedAt: Date.parse("2026-07-31T00:00:00.000Z"),
@@ -265,6 +271,36 @@ describe("bounded offline recovery inventory", () => {
     expect(inventory.items).toEqual([]);
   }, 30_000);
 
+  test("bounds a directory scan by wall-clock deadline, independent of the name budget", () => {
+    // Tells the two F4 budgets apart: this flood is far too small to ever hit
+    // `maxNamesPerKindPerProject` (16_384) on its own, so only the deadline
+    // can explain a truncation here.
+    const dir = path.join(stateDir, "claude", "sessions");
+    fs.mkdirSync(dir, { recursive: true });
+    for (let index = 0; index < 10; index += 1) {
+      fs.writeFileSync(path.join(dir, `junk-${index}.txt`), "x");
+    }
+    const realNow = Date.now.bind(Date);
+    let calls = 0;
+    const nowSpy = vi.spyOn(Date, "now").mockImplementation(() => {
+      calls += 1;
+      // Let the first few deadline checks through at the real time (enough
+      // to start reading real entries), then jump straight past the
+      // deadline so the scan truncates after only a handful of entries.
+      return calls <= 5 ? realNow() : realNow() + RECOVERY_LIMITS.scanDeadlineMs + 1;
+    });
+    try {
+      const inventory = scanRecoveryInventory({ env });
+
+      expect(inventory.truncated).toBe(true);
+      // Far fewer directory reads than the name budget: the deadline, not
+      // the name count, is what stopped this scan.
+      expect(calls).toBeLessThan(RECOVERY_LIMITS.maxNamesPerKindPerProject);
+    } finally {
+      nowSpy.mockRestore();
+    }
+  });
+
   test("mints a host-chosen exact id from a fresh launch's own host record", () => {
     hostEvidence(undefined, { recordVersion: 2, launchConversationId: CLAUDE_SESSION, outcome: "interrupted" });
 
@@ -309,12 +345,106 @@ describe("bounded offline recovery inventory", () => {
 
     expect(inventory.items).toHaveLength(1);
     const [item] = inventory.items;
-    expect(item).toMatchObject({ evidenceKind: "host", conversationName: "fix recovery" });
-    expect(item?.linkedClaude).toEqual({
+    expect(item).toMatchObject({
+      evidenceKind: "host",
+      conversationName: "fix recovery",
+      conversationNameSource: "claude-reported",
+    });
+    expect(item?.linkedClaude).toEqual([{
       id: standaloneClaudeItem.id,
       evidencePath: standaloneClaudeItem.evidencePath,
       fingerprint: standaloneClaudeItem.fingerprint,
+    }]);
+  });
+
+  test("joins every unconsumed duplicate Claude registry file for one conversation, newest first", () => {
+    // Two registry files can legitimately name the same conversation (a
+    // crashed original process plus a crashed resumed process), and an agent
+    // can also forge a duplicate. `recoveryId` hashes only the conversation,
+    // so both get the same recovery id; joining must gather both or one
+    // survives as a standalone row with an id equal to the linked id.
+    // Deliberately not read standalone before the host item exists: both
+    // files share one recovery id (see above), so the pre-existing id-keyed
+    // dedup in `scanRecoveryInventory` would already collapse them to one
+    // entry with nothing yet to join against, which would prove nothing
+    // about the join itself.
+    const older = claudeEvidence({
+      sessionId: CLAUDE_SESSION,
+      name: "older generation",
+      updatedAt: Date.parse("2026-07-31T00:01:00.000Z"),
+    }, 4242);
+    const newer = claudeEvidence({
+      sessionId: CLAUDE_SESSION,
+      name: "newer generation",
+      updatedAt: Date.parse("2026-07-31T00:05:00.000Z"),
+    }, 4343);
+
+    hostEvidence(undefined, { recordVersion: 2, launchConversationId: CLAUDE_SESSION, outcome: "interrupted" });
+
+    const inventory = scanRecoveryInventory({ env });
+
+    expect(inventory.items).toHaveLength(1);
+    const [item] = inventory.items;
+    expect(item?.evidenceKind).toBe("host");
+    expect(item?.conversationName).toBe("newer generation");
+    expect(item?.conversationNameSource).toBe("claude-reported");
+    // Newest first, by evidencePath (both links share one `id`, which is the
+    // accepted consequence of the shared-conversation hash above).
+    expect(item?.linkedClaude).toHaveLength(2);
+    expect(item?.linkedClaude?.map((link) => link.evidencePath)).toEqual([newer, older]);
+    const [newestLink, olderLink] = item?.linkedClaude ?? [];
+    expect(recoveryIdIsValid(newestLink?.id ?? "")).toBe(true);
+    expect(newestLink?.id).toBe(olderLink?.id);
+    // No standalone Claude row leaked out at all, so none can carry an id
+    // equal to a linked id.
+    expect(inventory.items.some((candidate) => candidate.evidenceKind === "claude")).toBe(false);
+  });
+
+  test("a host item whose only linked Claude evidence was consumed keeps no link", async () => {
+    claudeEvidence({ sessionId: CLAUDE_SESSION });
+    const claudeItem = firstItem();
+    await expect(runWithRecoveryClaim(runtimeContext(), claudeItem, () => 0)).resolves.toEqual({
+      status: 0,
+      consumed: true,
     });
+
+    hostEvidence(undefined, { recordVersion: 2, launchConversationId: CLAUDE_SESSION, outcome: "interrupted" });
+
+    const inventory = scanRecoveryInventory({ env });
+
+    expect(inventory.items).toHaveLength(1);
+    const [item] = inventory.items;
+    expect(item?.evidenceKind).toBe("host");
+    expect(item?.linkedClaude).toBeUndefined();
+    expect(inventory.items.some((candidate) => candidate.evidenceKind === "claude")).toBe(false);
+  });
+
+  test("consuming one of two duplicate Claude registry files leaves only the unconsumed one linked", async () => {
+    // Consume the first duplicate while it is still the *only* claude item,
+    // so its own scan is never subject to the id-collision dedup above; only
+    // then does the second (unconsumed) duplicate for the same conversation
+    // appear.
+    claudeEvidence({ sessionId: CLAUDE_SESSION, name: "older generation" }, 4242);
+    const olderItem = firstItem();
+    await expect(runWithRecoveryClaim(runtimeContext(), olderItem, () => 0)).resolves.toEqual({
+      status: 0,
+      consumed: true,
+    });
+
+    const newer = claudeEvidence({
+      sessionId: CLAUDE_SESSION,
+      name: "newer generation",
+      updatedAt: Date.parse("2026-07-31T00:05:00.000Z"),
+    }, 4343);
+    hostEvidence(undefined, { recordVersion: 2, launchConversationId: CLAUDE_SESSION, outcome: "interrupted" });
+
+    const inventory = scanRecoveryInventory({ env });
+
+    expect(inventory.items).toHaveLength(1);
+    const [item] = inventory.items;
+    expect(item?.linkedClaude).toHaveLength(1);
+    expect(item?.linkedClaude?.[0]?.evidencePath).toBe(newer);
+    expect(inventory.items.some((candidate) => candidate.evidenceKind === "claude")).toBe(false);
   });
 
   test("the exact-recovery epoch does not block a host Claude record that names its own conversation", () => {
@@ -345,14 +475,21 @@ describe("bounded offline recovery inventory", () => {
     expect(noId?.resumeBlockedReason).toContain("exact Claude recovery");
   });
 
-  test("carries terminal ids, boot id, and a dead owner state for interrupted host evidence", () => {
-    hostEvidence(undefined, { outcome: "interrupted", terminalIds: { iterm: "w0t0p0" } });
+  test("carries terminal ids, tty, term program, boot id, and a dead owner state for interrupted host evidence", () => {
+    hostEvidence(undefined, {
+      outcome: "interrupted",
+      terminalIds: { iterm: "w0t0p0" },
+      hostTty: "/dev/ttys003",
+      termProgram: "iTerm.app",
+    });
 
     const item = firstItem();
 
     expect(item.ownerState).toBe("dead");
     expect(item.terminal?.ids).toEqual({ iterm: "w0t0p0" });
     expect(item.terminal?.bootId).toBe(BOOT);
+    expect(item.terminal?.tty).toBe("/dev/ttys003");
+    expect(item.terminal?.termProgram).toBe("iTerm.app");
   });
 });
 
