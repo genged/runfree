@@ -122,6 +122,13 @@ export type RecoveryItem = {
   // forged duplicate — so this is a list, not a single value. Once linked,
   // none of these Claude items appear as a separate inventory entry.
   linkedClaude?: readonly Readonly<{ id: string; evidencePath: string; fingerprint: EvidenceFingerprint }>[];
+  // Every other host item that names this item's own exact conversation (see
+  // `joinHostItemsBySameConversation`) — what a killed host client leaves:
+  // the original launch's record, plus a later resume's record for the same
+  // conversation. This item is the newest by `startedAt`; consuming or
+  // dismissing it also removes every file named here (security review F3,
+  // decision 10).
+  linkedHost?: readonly Readonly<{ evidencePath: string; fingerprint: EvidenceFingerprint; sourceId: string }>[];
   // Host-only terminal identity for host evidence (terminal-identity.ts).
   terminal?: Readonly<{ ids: TerminalIdentity; tty?: string; termProgram?: string; bootId?: string }>;
   // Set only when this item's own claim scope holds an unprovable claim (its
@@ -1008,6 +1015,86 @@ function joinHostAndClaudeItems(items: readonly RecoveryItem[]): RecoveryItem[] 
   return joined.filter((_item, index) => !joinedClaudeIndexes.has(index));
 }
 
+/**
+ * Deduplicates `linkedClaude` entries by `evidencePath` (the greater
+ * `mtimeMs` wins a collision), newest first by `mtimeMs` — the only ordering
+ * information a linked entry itself carries. Used when merging the
+ * `linkedClaude` lists of several host items into the one each is folded
+ * into (`joinHostItemsBySameConversation`).
+ */
+function dedupeLinkedClaudeNewestFirst(
+  entries: readonly Readonly<{ id: string; evidencePath: string; fingerprint: EvidenceFingerprint }>[],
+): Readonly<{ id: string; evidencePath: string; fingerprint: EvidenceFingerprint }>[] {
+  const byPath = new Map<string, Readonly<{ id: string; evidencePath: string; fingerprint: EvidenceFingerprint }>>();
+  for (const entry of entries) {
+    const existing = byPath.get(entry.evidencePath);
+    if (!existing || entry.fingerprint.mtimeMs > existing.fingerprint.mtimeMs) byPath.set(entry.evidencePath, entry);
+  }
+  return Array.from(byPath.values()).sort((left, right) => right.fingerprint.mtimeMs - left.fingerprint.mtimeMs);
+}
+
+/**
+ * Joins every host item that names the same exact conversation as another
+ * host item — what a killed host client leaves behind: the original
+ * launch's own record, plus a later resume's record for the same
+ * conversation (a resume's transient evidence is removed on a clean exit,
+ * but kept, as its own interrupted record, when the resumed session reached
+ * `attached` and then ended non-zero — `finalizeSessionEvidence`, security
+ * review F3, decision 10). Grouped by `(projectId, agent, conversationId)`
+ * so only an exact id joins, never a picker item.
+ *
+ * Keeps the item with the newest `startedAt` (ties broken by evidence
+ * `mtimeMs`) — its terminal ids are what the next `runfree resume` in that
+ * terminal should match — and names every other member `linkedHost`, so
+ * consuming or dismissing the kept item also removes them
+ * (`consumeRecoveryEvidence`). `linkedClaude` entries already attached to
+ * any grouped member (`joinHostAndClaudeItems`, run first) are merged onto
+ * the kept item.
+ */
+function joinHostItemsBySameConversation(items: readonly RecoveryItem[]): RecoveryItem[] {
+  const indexesByKey = new Map<string, number[]>();
+  items.forEach((item, index) => {
+    if (item.evidenceKind === "host" && item.conversationId !== undefined) {
+      const key = `${item.projectId}\0${item.agent.toLowerCase()}\0${item.conversationId}`;
+      const existing = indexesByKey.get(key);
+      if (existing) existing.push(index);
+      else indexesByKey.set(key, [index]);
+    }
+  });
+  const dropped = new Set<number>();
+  const mergedByPrimaryIndex = new Map<number, RecoveryItem>();
+  for (const group of indexesByKey.values()) {
+    if (group.length <= 1) continue;
+    const members = group
+      .map((index) => ({ index, member: items[index] }))
+      .filter((entry): entry is { index: number; member: RecoveryItem } => entry.member !== undefined);
+    members.sort((left, right) => {
+      const byStartedAt = Date.parse(right.member.startedAt ?? "") - Date.parse(left.member.startedAt ?? "");
+      return byStartedAt !== 0 ? byStartedAt : right.member.fingerprint.mtimeMs - left.member.fingerprint.mtimeMs;
+    });
+    const primary = members[0];
+    if (!primary) continue;
+    const others = members.slice(1);
+    for (const other of others) dropped.add(other.index);
+    const mergedLinkedClaude = dedupeLinkedClaudeNewestFirst([
+      ...(primary.member.linkedClaude ?? []),
+      ...others.flatMap(({ member }) => member.linkedClaude ?? []),
+    ]);
+    mergedByPrimaryIndex.set(primary.index, {
+      ...primary.member,
+      ...(mergedLinkedClaude.length > 0 ? { linkedClaude: mergedLinkedClaude } : {}),
+      linkedHost: others.map(({ member }) => ({
+        evidencePath: member.evidencePath,
+        fingerprint: member.fingerprint,
+        sourceId: member.sourceId,
+      })),
+    });
+  }
+  return items
+    .map((item, index) => mergedByPrimaryIndex.get(index) ?? item)
+    .filter((_item, index) => !dropped.has(index));
+}
+
 export function scanRecoveryInventory(input: {
   env?: NodeJS.ProcessEnv;
   projectRoot?: string;
@@ -1049,12 +1136,24 @@ export function scanRecoveryInventory(input: {
   } finally {
     projects?.closeSync();
   }
-  const deduped = Array.from(new Map(
-    joinHostAndClaudeItems(items)
-      .filter((item) => !itemWasConsumed(item))
-      .sort((left, right) => Date.parse(right.updatedAt ?? right.startedAt ?? "") - Date.parse(left.updatedAt ?? left.startedAt ?? ""))
-      .map((item) => [item.id, item]),
-  ).values());
+  // Newest first, then kept-first-wins on a duplicate id (an orphan Claude
+  // item without a host record to join can share its recovery id with
+  // another registry file naming the same conversation — `recoveryId` hashes
+  // only the conversation). A `Map` built from `[id, item]` pairs keeps the
+  // *last* `set` for a repeated key, which is the oldest once the array is
+  // sorted newest-first — the opposite of what the picker and the one
+  // question must see — so this dedups by hand instead, skipping every id
+  // already seen, which keeps the first (newest) occurrence.
+  const sorted = joinHostItemsBySameConversation(joinHostAndClaudeItems(items))
+    .filter((item) => !itemWasConsumed(item))
+    .sort((left, right) => Date.parse(right.updatedAt ?? right.startedAt ?? "") - Date.parse(left.updatedAt ?? left.startedAt ?? ""));
+  const seenIds = new Set<string>();
+  const deduped: RecoveryItem[] = [];
+  for (const item of sorted) {
+    if (seenIds.has(item.id)) continue;
+    seenIds.add(item.id);
+    deduped.push(item);
+  }
   return { items: deduped, truncated: global.truncated, invalidFiles: global.invalidFiles };
 }
 
@@ -1725,6 +1824,48 @@ function recoveryClaimOwnerIdentity(context: RuntimeContext): RecoveryClaimOwner
   });
 }
 
+/**
+ * Sweeps every dead claim file of `item`'s own agent scope — every
+ * `conv-<agentScope>-*.json` and the `agent-<agentScope>.json` picker claim
+ * — before the cross-scope check below ever reads the same directory.
+ * Without this, a dead `conv-*` claim is reclaimed only when its own
+ * conversation is claimed again (the single-scope reclaim further down this
+ * function), so a resume that never retries that exact conversation left its
+ * dead claim behind for good (AGENTS.md: every fail-closed refusal ships its
+ * reclaim path). Each dead file is unlinked by the same fingerprint- or
+ * stat-bound check the single-scope reclaim uses below — never a blind
+ * unlink — and the directory walk shares `scanFixedDirectory`'s own scan
+ * budget, the same one every other recovery directory read uses, so an
+ * attacker-filled claims directory cannot make this unbounded. A live or
+ * unprovable claim — of this scope or another agent's scope entirely — is
+ * left exactly alone.
+ */
+function sweepDeadClaimsForAgentScope(item: RecoveryItem, env: NodeJS.ProcessEnv, now: Date): void {
+  const agentScope = agentScopeHash(item.agent);
+  const claimsDir = recoveryClaimsDir(item);
+  const global: GlobalScanBudget = { files: 0, truncated: false, invalidFiles: 0 };
+  const candidatePaths = [
+    path.join(claimsDir, `agent-${agentScope}.json`),
+    ...scanFixedDirectory<string>({
+      anchor: item.stateDir,
+      dir: claimsDir,
+      fileName: new RegExp(`^conv-${agentScope}-[0-9a-f]{24}\\.json$`),
+      budget: { files: 0, bytes: 0 },
+      global,
+      parse: (filePath) => filePath,
+    }),
+  ];
+  for (const filePath of candidatePaths) {
+    const liveness = claimFileLiveness(filePath, env, now);
+    if (liveness.liveness !== "dead") continue;
+    if (liveness.bytes) {
+      unlinkIfFingerprintMatches(filePath, fingerprint(liveness.bytes.stat, "recovery-claim", liveness.bytes.sha256));
+    } else if (liveness.malformedStat) {
+      unlinkIfStatMatches(filePath, liveness.malformedStat);
+    }
+  }
+}
+
 function createRecoveryClaimUnderLifecycle(
   context: RuntimeContext,
   item: RecoveryItem,
@@ -1738,6 +1879,9 @@ function createRecoveryClaimUnderLifecycle(
   if (!RECOVERY_ID_RE.test(item.id) || !evidenceMatches(item) || itemWasConsumed(item)) return undefined;
   const env = context.env ?? process.env;
   const scope = recoveryClaimScope(item);
+  // Reclaim this agent's own dead claim residue before the cross-scope check
+  // below reads the same directory (see `sweepDeadClaimsForAgentScope`).
+  sweepDeadClaimsForAgentScope(item, env, now);
   // A live cross-scope claim excludes this one outright (section 4): an
   // unprovable cross-scope claim never blocks (review F2), so it is not
   // checked again here.
@@ -1837,7 +1981,14 @@ export function consumeRecoveryEvidence(item: RecoveryItem): boolean {
     // evidence (H2), and a host item that reached here already named its
     // own exact conversation.
     for (const linked of item.linkedClaude ?? []) writeLinkedClaudeConsumedRecord(item.stateDir, linked);
-    return unlinkIfFingerprintMatches(item.evidencePath, item.fingerprint);
+    const consumed = unlinkIfFingerprintMatches(item.evidencePath, item.fingerprint);
+    // Every other host item this one was joined with (`linkedHost`,
+    // decision 10) is unlinked after the primary, by the same
+    // fingerprint-bound check: a mismatch — the file changed since the scan
+    // — just leaves that one file alone, and never fails the primary's own
+    // consumption above.
+    for (const linked of item.linkedHost ?? []) unlinkIfFingerprintMatches(linked.evidencePath, linked.fingerprint);
+    return consumed;
   }
   const record: RecoveryConsumedRecord = {
     v: 1,
@@ -1851,10 +2002,20 @@ export function consumeRecoveryEvidence(item: RecoveryItem): boolean {
   return itemWasConsumed(item);
 }
 
+/**
+ * An action's result when a non-zero status must still consume the claimed
+ * evidence: a resume whose own session reached `attached` and then ended
+ * non-zero (a second Docker stop) keeps its own record instead of the
+ * claimed original's, so that new record supersedes it (security review F3,
+ * decision 10) — the original must be consumed even though `status` here is
+ * non-zero.
+ */
+export type RecoveryActionResult = Readonly<{ status: number; supersededByNewRecord: boolean }>;
+
 export async function runWithRecoveryClaim(
   context: RuntimeContext,
   item: RecoveryItem,
-  action: () => number | Promise<number>,
+  action: () => (number | RecoveryActionResult) | Promise<number | RecoveryActionResult>,
 ): Promise<{ status: number; consumed: boolean } | undefined> {
   // An attached session can briefly own the lifecycle lock for renewal. A
   // selector must ride out that transient hold before it decides that the
@@ -1862,10 +2023,12 @@ export async function runWithRecoveryClaim(
   const claim = await acquireRecoveryClaim(context, item);
   if (!claim) return undefined;
   try {
-    const status = await action();
+    const result = await action();
+    const status = typeof result === "number" ? result : result.status;
+    const supersededByNewRecord = typeof result === "number" ? false : result.supersededByNewRecord;
     return {
       status,
-      consumed: status === 0 ? consumeRecoveryEvidence(item) : false,
+      consumed: status === 0 || supersededByNewRecord ? consumeRecoveryEvidence(item) : false,
     };
   } finally {
     claim.release();

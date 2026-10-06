@@ -220,6 +220,25 @@ describe("resume through session admission", () => {
     expect(mocks.launchBuiltin).toHaveBeenCalledTimes(2);
   });
 
+  test("a resume whose own record superseded the original consumes the claimed evidence despite a non-zero status (security review F3)", async () => {
+    // A second Docker stop while this resume was attached: the driver keeps
+    // its own evidence (`resumeRecordKept`) instead of the claimed original,
+    // so that new record supersedes the original — which must still be
+    // consumed, unlike an ordinary failed resume above.
+    claudeEvidence();
+    const context = runtimeContext();
+    const item = firstItem();
+    mocks.launchBuiltin.mockResolvedValueOnce({ status: 137, signal: null, resumeRecordKept: true });
+
+    const result = await resumeInterruptedSessionThroughAdmission({ preparedRuntime: preparedRuntime(context), io, item });
+
+    expect(result).toEqual({ status: 137, consumed: true });
+    expect(fs.readdirSync(path.join(stateDir, "sessions", "recovery-consumed")).sort()).toEqual([
+      "agent-claude.json",
+      `${item.id}.json`,
+    ]);
+  });
+
   test("a signal death maps to a nonzero status and does not consume evidence", async () => {
     claudeEvidence();
     mocks.launchBuiltin.mockResolvedValueOnce({ status: null, signal: "SIGKILL" });

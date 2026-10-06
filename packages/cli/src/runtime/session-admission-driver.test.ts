@@ -1693,6 +1693,46 @@ describe("internal session admission driver", () => {
     );
     // A failed resume must not mint a second, less precise recovery item: the
     // claimed original evidence stays the only retryable representation.
+    // This failure never reaches `attached` (the running proof fails
+    // closed first), so `resumeRecordKept` is never set on anything — there
+    // is no outcome object here at all to carry it.
+    expect(mocks.removeSessionMetadata).toHaveBeenCalled();
+    expect(mocks.markSessionInterrupted).not.toHaveBeenCalled();
+  });
+
+  test("a resume launch that reaches attached and then ends non-zero keeps its own record (security review F3)", async () => {
+    // A second Docker stop while tab 2 is resuming tab 1's interrupted
+    // session: this launch's own evidence must survive as interrupted,
+    // carrying this terminal's ids and the resumed conversation, rather
+    // than being removed as an ordinary failed-resume attempt.
+    mocks.foregroundCompletion = { kind: "exit", code: 137, signal: null };
+    const driver = createInternalSessionAdmissionDriver({
+      ...fixture(),
+      nowEpochMs: () => Date.parse("2026-08-09T00:00:00.000Z"),
+    });
+    const conversationId = "0f8b1a2c-3d4e-4f5a-8b6c-7d8e9f0a1b2c";
+
+    const outcome = await driver.launchBuiltin("codex", { resume: { conversationId } });
+
+    expect(outcome).toEqual({ status: 137, signal: null, resumeRecordKept: true });
+    expect(mocks.markSessionInterrupted).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ id: "rf-20260809-abcdef", resumeConversationId: conversationId }),
+      137,
+    );
+    expect(mocks.removeSessionMetadata).not.toHaveBeenCalled();
+  });
+
+  test("a resume launch that reaches attached and exits 0 still removes its own record", async () => {
+    const driver = createInternalSessionAdmissionDriver({
+      ...fixture(),
+      nowEpochMs: () => Date.parse("2026-08-09T00:00:00.000Z"),
+    });
+    const conversationId = "0f8b1a2c-3d4e-4f5a-8b6c-7d8e9f0a1b2c";
+
+    const outcome = await driver.launchBuiltin("codex", { resume: { conversationId } });
+
+    expect(outcome).toEqual({ status: 0, signal: null });
     expect(mocks.removeSessionMetadata).toHaveBeenCalled();
     expect(mocks.markSessionInterrupted).not.toHaveBeenCalled();
   });

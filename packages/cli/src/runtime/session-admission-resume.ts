@@ -96,7 +96,14 @@ export async function resumeInterruptedSessionThroughAdmission(
             ...(input.foregroundSpawner ? { foregroundSpawner: input.foregroundSpawner } : {}),
           });
           const outcome = await driver.launchBuiltin(agent, current.resume);
-          return typeof outcome.status === "number" ? outcome.status : 1;
+          return {
+            status: typeof outcome.status === "number" ? outcome.status : 1,
+            // A second Docker stop while this resume was attached keeps the
+            // resuming tab's own evidence (security review F3, decision 10):
+            // the claimed original must still be consumed, even though the
+            // exit status here is non-zero.
+            supersededByNewRecord: outcome.resumeRecordKept === true,
+          };
         } finally {
           sessionLockManager.close();
         }

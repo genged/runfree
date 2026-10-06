@@ -106,6 +106,15 @@ export type SessionAdmissionLaunchOutcome = Readonly<{
   /** Exit status of the attached process, or null when it died by signal. */
   status: number | null;
   signal: NodeJS.Signals | null;
+  /**
+   * Set only for a resume launch that reached `attached` and then ended
+   * non-zero: its own transient session evidence is kept as interrupted
+   * instead of being removed, so the resuming terminal's own ids survive a
+   * second Docker stop (security review F3, decision 10). The claim layer
+   * reads this to consume the claimed original evidence even though the
+   * exit status itself is non-zero.
+   */
+  resumeRecordKept?: boolean;
 }>;
 
 /**

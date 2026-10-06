@@ -497,6 +497,15 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
   #preAttachCompletion?: SessionAdmissionLaunchOutcome;
   #foregroundOutcome?: SessionAdmissionLaunchOutcome;
   /**
+   * Set once `#confirmAttached` has durably transitioned the record to
+   * `attached`. `finalizeSessionEvidence` reads this to tell a resume that
+   * never reached attachment (its evidence is disposable, same as any other
+   * pre-attach failure) from a resume that did and then ended non-zero (its
+   * evidence is this terminal's only record of the conversation and must be
+   * kept — security review F3, decision 10).
+   */
+  #attached = false;
+  /**
    * Set only by control-plane rebind adoption. The launch-time preflight
    * selection stays immutable; when a compatible proxy rebind replaces the
    * control plane under this live session, the driver adopts the durable
@@ -1919,6 +1928,10 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
       // From here every beat re-proves the record the session actually holds.
       this.#fileRecord = attached;
       this.#admittedRecord = undefined;
+      // Durable, not best-effort: the record above is already written as
+      // `attached`, so from here a resume's own evidence is this terminal's
+      // only record of the conversation (security review F3, decision 10).
+      this.#attached = true;
       this.#lock();
       this.#stampSessionHostStatus(file, "served");
     } catch (error) {
@@ -2364,21 +2377,29 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
    * Applies the outcome-aware session evidence rule after a launch: status 0
    * consumes the evidence; any other outcome (nonzero, signal, or a thrown
    * failure passed as `undefined`) preserves it as interrupted host evidence.
-   * A resume launch always removes its transient evidence instead, so one
-   * failed attempt cannot mint a second, less precise recovery item beside the
-   * claimed original.
+   * A resume launch that never reached `attached` always removes its
+   * transient evidence instead, so one failed attempt cannot mint a second,
+   * less precise recovery item beside the claimed original. A resume launch
+   * that *did* reach `attached` and then ended non-zero — a second Docker
+   * stop while tab 2 is resuming tab 1's interrupted session — keeps its own
+   * evidence as interrupted instead: it carries this terminal's own ids, so
+   * tab 2 is the one `runfree resume` asks next (security review F3,
+   * decision 10). The returned outcome carries `resumeRecordKept: true` in
+   * that case, so the claim layer can consume the original it claimed even
+   * though the exit status itself is non-zero.
    */
-  finalizeSessionEvidence(outcome: SessionAdmissionLaunchOutcome | undefined): void {
+  finalizeSessionEvidence(outcome: SessionAdmissionLaunchOutcome | undefined): SessionAdmissionLaunchOutcome | undefined {
     outcome ??= this.#foregroundOutcome ?? this.#preAttachCompletion;
     this.#foregroundOutcome = undefined;
     this.#preAttachCompletion = undefined;
     const metadata = this.#sessionEvidence;
-    if (!metadata) return;
+    if (!metadata) return outcome;
+    const resumeRecordKept = this.#launch?.resume !== undefined && this.#attached && outcome?.status !== 0;
     // Each evidence file has one exact session id and is not part of the
     // whole-registry admission generation. Finalize it even if bounded teardown
     // reacquisition failed; otherwise one lock timeout leaves both registry
     // residue and misleading open host evidence.
-    if (outcome?.status === 0 || this.#launch?.resume !== undefined) {
+    if (outcome?.status === 0 || (this.#launch?.resume !== undefined && !this.#attached)) {
       removeSessionMetadata(this.#input.context, metadata.id);
     } else {
       markSessionInterrupted(this.#input.context, metadata, outcome?.status ?? undefined);
@@ -2388,6 +2409,7 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
     // failure-path finalize can still preserve the evidence as interrupted
     // instead of silently orphaning an open metadata file.
     this.#sessionEvidence = undefined;
+    return resumeRecordKept && outcome ? { ...outcome, resumeRecordKept: true } : outcome;
   }
 }
 
@@ -2508,9 +2530,9 @@ export function createInternalSessionAdmissionDriver(
       const launchSteps = histogram ? timedSessionAdmissionLaunchSteps(steps, timings, histogram, steps.lockHoldMs) : steps;
       try {
         const outcome = await runInternalSessionAdmissionLaunch(launchSteps);
-        steps.finalizeSessionEvidence(outcome);
+        const finalized = steps.finalizeSessionEvidence(outcome);
         resolvedInput.lifecycleLock.assertHeld();
-        return outcome;
+        return finalized ?? outcome;
       } catch (failure) {
         try {
           steps.finalizeSessionEvidence(

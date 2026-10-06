@@ -27,6 +27,7 @@ import {
 } from "./recovery.ts";
 import type { SessionContainerRecordV2 } from "./session-containers.ts";
 import { tryAcquireProjectLifecycleLock } from "./sessions.ts";
+import { matchTerminal, type TerminalSide } from "./terminal-identity.ts";
 import type { RuntimeContext, RuntimeIO } from "./types.ts";
 
 const BOOT = "linux:11111111-2222-3333-4444-555555555555";
@@ -516,6 +517,214 @@ describe("bounded offline recovery inventory", () => {
     expect(item.terminal?.bootId).toBe(BOOT);
     expect(item.terminal?.tty).toBe("/dev/ttys003");
     expect(item.terminal?.termProgram).toBe("iTerm.app");
+  });
+
+  test("the final id-keyed dedup keeps the newest of two orphan Claude files sharing a sessionId (ruling A)", () => {
+    // No host record exists, so these two duplicate registry files for one
+    // conversation have nothing to join against (`joinHostAndClaudeItems`
+    // only folds Claude items into a *host* item): the id-keyed dedup at the
+    // end of `scanRecoveryInventory` is what collapses the two into one row,
+    // and it must keep the newer file — a `Map` built from `[id, item]`
+    // pairs over a newest-first array keeps the *last* `set`, which is the
+    // oldest, the opposite of what the prompt and picker must show.
+    const older = claudeEvidence({
+      sessionId: CLAUDE_SESSION,
+      name: "older generation",
+      updatedAt: Date.parse("2026-07-31T00:01:00.000Z"),
+    }, 4242);
+    const newer = claudeEvidence({
+      sessionId: CLAUDE_SESSION,
+      name: "newer generation",
+      updatedAt: Date.parse("2026-07-31T00:05:00.000Z"),
+    }, 4343);
+
+    const inventory = scanRecoveryInventory({ env });
+
+    expect(inventory.items).toHaveLength(1);
+    expect(inventory.items[0]?.evidencePath).toBe(newer);
+    expect(inventory.items[0]?.evidencePath).not.toBe(older);
+    expect(inventory.items[0]?.conversationName).toBe("newer generation");
+  });
+});
+
+describe("host-host join for one conversation (decision 10, security review F3)", () => {
+  test("two host records naming the same exact conversation join into one item, built from the newer, naming the older linkedHost", () => {
+    const olderPath = hostEvidence("rf-20260731-original", {
+      recordVersion: 2,
+      launchConversationId: CLAUDE_SESSION,
+      outcome: "interrupted",
+      startedAt: "2026-07-31T00:00:00.000Z",
+      terminalIds: { appleTerminal: "tab-1" },
+      hostTty: "/dev/ttys001",
+      termProgram: "Apple_Terminal",
+    });
+    // What a killed host client leaves: the original launch's own record,
+    // plus a later resume's record for the same conversation, carrying
+    // tab 2's own terminal ids.
+    const newerPath = hostEvidence("rf-20260731-resumed", {
+      recordVersion: 2,
+      resumeConversationId: CLAUDE_SESSION,
+      outcome: "interrupted",
+      startedAt: "2026-07-31T00:10:00.000Z",
+      terminalIds: { appleTerminal: "tab-2" },
+      hostTty: "/dev/ttys002",
+      termProgram: "Apple_Terminal",
+    });
+
+    const inventory = scanRecoveryInventory({ env });
+
+    expect(inventory.items).toHaveLength(1);
+    const [item] = inventory.items;
+    expect(item?.evidencePath).toBe(newerPath);
+    expect(item?.terminal?.ids).toEqual({ appleTerminal: "tab-2" });
+    expect(item?.linkedHost).toHaveLength(1);
+    expect(item?.linkedHost?.[0]?.evidencePath).toBe(olderPath);
+    expect(item?.linkedHost?.[0]?.sourceId).toBe("rf-20260731-original");
+  });
+
+  test("the merged primary inherits a linkedClaude list the *other* grouped host item was the one joined to", () => {
+    // `joinHostAndClaudeItems` (Task 5) attaches every match for a key to
+    // whichever host item it meets first by scan order (file mtime), not by
+    // `startedAt` content — so the member holding the Claude link and the
+    // member kept as the primary (newest `startedAt`) can be two different
+    // items. `joinHostItemsBySameConversation` must still carry the link
+    // forward onto the kept primary rather than losing it.
+    const claudePath = claudeEvidence({ sessionId: CLAUDE_SESSION });
+    const olderPath = hostEvidence("rf-20260731-original", {
+      recordVersion: 2,
+      launchConversationId: CLAUDE_SESSION,
+      outcome: "interrupted",
+      startedAt: "2026-07-31T00:00:00.000Z",
+    });
+    const newerPath = hostEvidence("rf-20260731-resumed", {
+      recordVersion: 2,
+      resumeConversationId: CLAUDE_SESSION,
+      outcome: "interrupted",
+      startedAt: "2026-07-31T00:10:00.000Z",
+    });
+    // Force the scan to see the *older* (by `startedAt`) host record first,
+    // so the Claude join above lands on it instead of on the kept primary.
+    const olderFileMtime = new Date("2026-07-31T00:20:00.000Z");
+    const newerFileMtime = new Date("2026-07-31T00:15:00.000Z");
+    fs.utimesSync(olderPath, olderFileMtime, olderFileMtime);
+    fs.utimesSync(newerPath, newerFileMtime, newerFileMtime);
+
+    const inventory = scanRecoveryInventory({ env });
+
+    expect(inventory.items).toHaveLength(1);
+    const [item] = inventory.items;
+    expect(item?.evidencePath).toBe(newerPath);
+    expect(item?.linkedHost).toHaveLength(1);
+    expect(item?.linkedHost?.[0]?.evidencePath).toBe(olderPath);
+    expect(item?.linkedClaude).toHaveLength(1);
+    expect(item?.linkedClaude?.[0]?.evidencePath).toBe(claudePath);
+  });
+
+  test("consuming the joined item deletes both host records", async () => {
+    const olderPath = hostEvidence("rf-20260731-original", {
+      recordVersion: 2,
+      launchConversationId: CLAUDE_SESSION,
+      outcome: "interrupted",
+      startedAt: "2026-07-31T00:00:00.000Z",
+    });
+    const newerPath = hostEvidence("rf-20260731-resumed", {
+      recordVersion: 2,
+      resumeConversationId: CLAUDE_SESSION,
+      outcome: "interrupted",
+      startedAt: "2026-07-31T00:10:00.000Z",
+    });
+    const item = firstItem();
+
+    await expect(runWithRecoveryClaim(runtimeContext(), item, () => 0)).resolves.toEqual({ status: 0, consumed: true });
+
+    expect(fs.existsSync(newerPath)).toBe(false);
+    expect(fs.existsSync(olderPath)).toBe(false);
+  });
+
+  test("dismissing the joined item deletes both host records", async () => {
+    const olderPath = hostEvidence("rf-20260731-original", {
+      recordVersion: 2,
+      launchConversationId: CLAUDE_SESSION,
+      outcome: "interrupted",
+      startedAt: "2026-07-31T00:00:00.000Z",
+    });
+    const newerPath = hostEvidence("rf-20260731-resumed", {
+      recordVersion: 2,
+      resumeConversationId: CLAUDE_SESSION,
+      outcome: "interrupted",
+      startedAt: "2026-07-31T00:10:00.000Z",
+    });
+    const item = firstItem();
+
+    const result = await dismissRecoveryItem(runtimeContext(), item);
+
+    expect(result).toBe("dismissed");
+    expect(fs.existsSync(newerPath)).toBe(false);
+    expect(fs.existsSync(olderPath)).toBe(false);
+  });
+
+  test("a stale linkedHost entry is left alone and does not fail consumption of the primary", async () => {
+    const olderPath = hostEvidence("rf-20260731-original", {
+      recordVersion: 2,
+      launchConversationId: CLAUDE_SESSION,
+      outcome: "interrupted",
+      startedAt: "2026-07-31T00:00:00.000Z",
+    });
+    hostEvidence("rf-20260731-resumed", {
+      recordVersion: 2,
+      resumeConversationId: CLAUDE_SESSION,
+      outcome: "interrupted",
+      startedAt: "2026-07-31T00:10:00.000Z",
+    });
+    const item = firstItem();
+    // Changed after the scan built `linkedHost`, before consumption runs.
+    const replacement = JSON.parse(fs.readFileSync(olderPath, "utf8"));
+    replacement.lastSeenAt = "2026-07-31T00:09:00.000Z";
+    fs.writeFileSync(olderPath, `${JSON.stringify(replacement)}\n`);
+
+    await expect(runWithRecoveryClaim(runtimeContext(), item, () => 0)).resolves.toEqual({ status: 0, consumed: true });
+
+    expect(fs.existsSync(olderPath)).toBe(true);
+  });
+
+  test("a terminal match against the newer record's ids is strong, and against the older record's ids is not", () => {
+    // After test 5's join, the second crash prompts in tab 2: the kept
+    // item's own `terminal` field is the newer (resuming) record's.
+    hostEvidence("rf-20260731-original", {
+      recordVersion: 2,
+      launchConversationId: CLAUDE_SESSION,
+      outcome: "interrupted",
+      startedAt: "2026-07-31T00:00:00.000Z",
+      terminalIds: { appleTerminal: "tab-1" },
+      hostTty: "/dev/ttys001",
+      termProgram: "Apple_Terminal",
+    });
+    hostEvidence("rf-20260731-resumed", {
+      recordVersion: 2,
+      resumeConversationId: CLAUDE_SESSION,
+      outcome: "interrupted",
+      startedAt: "2026-07-31T00:10:00.000Z",
+      terminalIds: { appleTerminal: "tab-2" },
+      hostTty: "/dev/ttys002",
+      termProgram: "Apple_Terminal",
+    });
+    const item = firstItem();
+    if (!item.terminal) throw new Error("missing terminal fixture");
+    const tab2: TerminalSide = {
+      ids: { appleTerminal: "tab-2" },
+      tty: "/dev/ttys002",
+      termProgram: "Apple_Terminal",
+      bootId: BOOT,
+    };
+    const tab1: TerminalSide = {
+      ids: { appleTerminal: "tab-1" },
+      tty: "/dev/ttys001",
+      termProgram: "Apple_Terminal",
+      bootId: BOOT,
+    };
+
+    expect(matchTerminal(tab2, item.terminal)).toBe("strong");
+    expect(matchTerminal(tab1, item.terminal)).not.toBe("strong");
   });
 });
 
@@ -1698,5 +1907,79 @@ describe("cross-scope listing fails closed (review F2, availability)", () => {
     fs.symlinkSync(outside, claimsDir, "dir");
 
     expect(await acquireRecoveryClaim(context, item)).toBeUndefined();
+  });
+});
+
+describe("dead-claim sweep (AGENTS.md: every fail-closed refusal ships its reclaim path)", () => {
+  test("3 dead conv claims of the agent are removed by the next picker claim, which then succeeds", async () => {
+    const CONVERSATION_A = CLAUDE_SESSION;
+    const CONVERSATION_B = "22222222-3333-4333-8444-555555555555";
+    const CONVERSATION_C = "33333333-4444-4333-8444-555555555555";
+    hostEvidence("rf-20260731-aaaaaa", { recordVersion: 2, launchConversationId: CONVERSATION_A, outcome: "interrupted" });
+    hostEvidence("rf-20260731-bbbbbb", { recordVersion: 2, launchConversationId: CONVERSATION_B, outcome: "interrupted" });
+    hostEvidence("rf-20260731-cccccc", { recordVersion: 2, launchConversationId: CONVERSATION_C, outcome: "interrupted" });
+    hostEvidence("rf-20260731-picker", { outcome: "interrupted" });
+    const items = scanRecoveryInventory({ env }).items;
+    const itemA = items.find((item) => item.conversationId === CONVERSATION_A);
+    const itemB = items.find((item) => item.conversationId === CONVERSATION_B);
+    const itemC = items.find((item) => item.conversationId === CONVERSATION_C);
+    const picker = items.find((item) => item.sourceId === "rf-20260731-picker");
+    if (!itemA || !itemB || !itemC || !picker) throw new Error("missing fixtures");
+    // Dead: a pid above any real pid_max, written directly at each exact
+    // scope's own claim path, bypassing `acquireRecoveryClaim`.
+    const pathA = writeClaimFile(itemA, { ownerPid: DEAD_PID });
+    const pathB = writeClaimFile(itemB, { ownerPid: DEAD_PID });
+    const pathC = writeClaimFile(itemC, { ownerPid: DEAD_PID });
+    const context = runtimeContext();
+
+    const claim = await acquireRecoveryClaim(context, picker);
+
+    expect(claim).toBeDefined();
+    expect(fs.existsSync(pathA)).toBe(false);
+    expect(fs.existsSync(pathB)).toBe(false);
+    expect(fs.existsSync(pathC)).toBe(false);
+    claim?.release();
+  });
+
+  test("a live conv claim is not removed by the sweep and still blocks the picker", async () => {
+    hostEvidence("rf-20260731-exactxx", { recordVersion: 2, launchConversationId: CLAUDE_SESSION, outcome: "interrupted" });
+    hostEvidence("rf-20260731-picker", { outcome: "interrupted" });
+    const items = scanRecoveryInventory({ env }).items;
+    const exact = items.find((item) => item.conversationId === CLAUDE_SESSION);
+    const picker = items.find((item) => item.sourceId === "rf-20260731-picker");
+    if (!exact || !picker) throw new Error("missing fixtures");
+    const context = runtimeContext();
+    const exactClaim = await acquireRecoveryClaim(context, exact);
+    expect(exactClaim).toBeDefined();
+    const exactClaimPath = recoveryClaimScope(exact).path;
+
+    const pickerClaim = await acquireRecoveryClaim(context, picker);
+
+    expect(pickerClaim).toBeUndefined();
+    expect(fs.existsSync(exactClaimPath)).toBe(true);
+    exactClaim?.release();
+  });
+
+  test("a dead claim of another agent is untouched by this agent's sweep", async () => {
+    const OTHER_SESSION = "44444444-5555-4333-8444-555555555555";
+    hostEvidence("rf-20260731-piexactxx", {
+      command: "pi",
+      recordVersion: 2,
+      launchConversationId: OTHER_SESSION,
+      outcome: "interrupted",
+    });
+    hostEvidence("rf-20260731-picker", { outcome: "interrupted" }); // agent claude
+    const items = scanRecoveryInventory({ env }).items;
+    const piItem = items.find((item) => item.agent === "pi");
+    const picker = items.find((item) => item.sourceId === "rf-20260731-picker");
+    if (!piItem || !picker) throw new Error("missing fixtures");
+    const piClaimPath = writeClaimFile(piItem, { ownerPid: DEAD_PID });
+    const context = runtimeContext();
+
+    const claim = await acquireRecoveryClaim(context, picker);
+
+    expect(claim).toBeDefined();
+    expect(fs.existsSync(piClaimPath)).toBe(true);
+    claim?.release();
   });
 });
