@@ -18,6 +18,7 @@ import { compareHostBootId, compareHostProcessStart, hostBootId, hostProcessStar
 import { peekSessionContainerRecordsV2, type SessionContainerRecordV2 } from "./session-containers.ts";
 import { readSessionHostStatus } from "./session-host-status.ts";
 import { classifySessionRecordLiveness } from "./session-record-liveness.ts";
+import { parseTerminalIdentity } from "./terminal-identity.ts";
 import {
   processAlive,
   projectLifecycleLockPath,
@@ -268,6 +269,10 @@ function parseHostEvidence(value: unknown, fileSessionId: string): SessionMetada
   for (const key of optionalStrings) {
     if (value[key] !== undefined && typeof value[key] !== "string") return undefined;
   }
+  if (value.recordVersion !== undefined && value.recordVersion !== 2) return undefined;
+  if (value.terminalIds !== undefined && parseTerminalIdentity(value.terminalIds) === undefined) return undefined;
+  if (value.launchConversationId !== undefined
+    && (typeof value.launchConversationId !== "string" || !UUID_RE.test(value.launchConversationId))) return undefined;
   return value as unknown as SessionMetadata;
 }
 

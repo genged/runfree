@@ -276,6 +276,32 @@ describe("canonical session-container template", () => {
     expect(template.mounts.some((mount) => mount.source.includes("docker"))).toBe(false);
   });
 
+  test("never leaks host terminal identity into the session-container environment", () => {
+    const sentinels = {
+      TERM_SESSION_ID: "leak-term-session-id",
+      ITERM_SESSION_ID: "leak-iterm-session-id",
+      WT_SESSION: "leak-wt-session",
+      TMUX: "leak-tmux-socket,4242,0",
+      TMUX_PANE: "leak-tmux-pane",
+      KITTY_WINDOW_ID: "leak-kitty-window",
+      KITTY_PID: "leak-kitty-pid",
+      KITTY_LISTEN_ON: "leak-kitty-listen",
+      WEZTERM_PANE: "leak-wezterm-pane",
+      WEZTERM_UNIX_SOCKET: "leak-wezterm-socket",
+      TERM_PROGRAM: "leak-term-program",
+    };
+    const template = createSessionContainerTemplate(input({
+      runtimeEnvironment: { ...input().runtimeEnvironment, ...sentinels },
+    }));
+
+    const leakKeyPattern = /^(RUNFREE_HOST_(TTY|TERM)|TERM_SESSION_ID|ITERM_SESSION_ID|WT_SESSION|TMUX|KITTY_|WEZTERM_)/;
+    expect(Object.keys(template.environment).some((key) => leakKeyPattern.test(key))).toBe(false);
+    const serialized = JSON.stringify(template);
+    for (const sentinel of Object.values(sentinels)) {
+      expect(serialized).not.toContain(sentinel);
+    }
+  });
+
   test("is canonical across selected-env and dependency input ordering", () => {
     const baseline = createSessionContainerTemplate(input());
     const reorderedDependencies = dependencies();

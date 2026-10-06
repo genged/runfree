@@ -7,6 +7,7 @@ import type { DependencyOverlayPlan } from "./dependency-overlays.ts";
 import type { RuntimeComponentState } from "./component-state.ts";
 import type { ControlPlaneGenerationV2, RuntimeGenerationTargetV2 } from "./component-state-v2.ts";
 import type { GitRepositoryShape, RuntimeGitLayoutPlan } from "./git-layout.ts";
+import type { TerminalIdentity } from "./terminal-identity.ts";
 
 export type { TokenResolutionReceipt } from "../token-resolution.ts";
 
@@ -274,6 +275,13 @@ export type SessionMetadata = {
   // session, this lineage makes the surviving evidence an exact-resume item
   // for the same conversation rather than a less precise picker item.
   resumeConversationId?: string;
+  // 2 for records written by the same-terminal resume release. Records without
+  // it come from an older Runfree; the prompt and picker hide them.
+  recordVersion?: number;
+  // Host-only terminal ids (terminal-identity.ts). Never sent to a container.
+  terminalIds?: TerminalIdentity;
+  // The host-chosen conversation id a fresh Claude or Pi launch started with.
+  launchConversationId?: string;
   hostInbox: string;
   containerInbox: string;
   hostParentPid?: number;

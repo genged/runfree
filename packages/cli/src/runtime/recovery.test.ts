@@ -148,6 +148,17 @@ describe("bounded offline recovery inventory", () => {
     expect(inventory.invalidFiles).toBeGreaterThanOrEqual(4);
   });
 
+  test("rejects invalid same-terminal resume fields on host evidence", () => {
+    hostEvidence("rf-20260731-badterm", { terminalIds: { iterm: 5 } });
+    hostEvidence("rf-20260731-badver", { recordVersion: 3 });
+    hostEvidence("rf-20260731-baduuid", { launchConversationId: "not-a-uuid" });
+
+    const inventory = scanRecoveryInventory({ env });
+
+    expect(inventory.items).toEqual([]);
+    expect(inventory.invalidFiles).toBe(3);
+  });
+
   test("rejects a symlinked agent-writable registry directory ancestor", () => {
     claudeEvidence();
     const claudeDir = path.join(stateDir, "claude");

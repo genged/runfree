@@ -34,7 +34,6 @@ import {
   SessionLockAcquisitionAbortedError,
   SessionLockAcquisitionTimeoutError,
   sessionCommandLabelForTest,
-  sessionEnvOptions,
   stampLockOwner,
   synthesizeSessionName,
   tryAcquireProjectLifecycleLock,
@@ -1252,7 +1251,6 @@ test("renames exactly one current session metadata record as display-only state"
   expect(readSessionMetadata(runtimeContext, metadata.id)).toEqual(renamed);
   expect(fs.statSync(path.join(runtimeContext.project.paths.sessionsDir, `${metadata.id}.json`)).mode & 0o777)
     .toBe(0o600);
-  expect(sessionEnvOptions(renamed).join("\n")).not.toContain("RUNFREE_SESSION_NAME");
 });
 
 test("rename rejects invalid input and linked records before any outside mutation", () => {

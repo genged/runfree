@@ -32,6 +32,7 @@ import {
   recordedOnPreviousBoot,
 } from "./host-identity.ts";
 export { processAlive } from "./host-identity.ts";
+import { captureTerminalIdentity } from "./terminal-identity.ts";
 import { readEffectiveControlPlaneV2 } from "./component-state-v2.ts";
 import {
   peekSessionContainerRecordsV2,
@@ -132,6 +133,12 @@ const CONTROL_CHARACTERS = /[\u0000-\u001f\u007f-\u009f]/u;
 const SAFE_SESSION_RECORD_ID = /^rf-[a-z0-9][a-z0-9-]{0,79}$/;
 const CURRENT_SESSION_ID = /^rf-[0-9]{8}-[a-z0-9]{6,32}$/;
 const MAX_SESSION_METADATA_BYTES = 64 * 1024;
+
+// Bumped for the same-terminal resume release: host records now carry
+// terminalIds (terminal-identity.ts). A record written before this version
+// cannot answer a same-terminal match, so readers must treat it as it did
+// before this field existed rather than as a false negative.
+export const SESSION_RECORD_VERSION = 2;
 
 function compactCommand(command: string): string {
   const compact = command.replace(/\s+/g, " ").trim();
@@ -282,6 +289,7 @@ export function createSessionMetadata(
   const termSessionId = optionalEnv(context.env, "TERM_SESSION_ID");
   const itermSessionId = optionalEnv(context.env, "ITERM_SESSION_ID");
   const wtSession = optionalEnv(context.env, "WT_SESSION");
+  const terminalIds = captureTerminalIdentity(context.env);
   const requestedName = options.name ?? optionalEnv(context.env, "RUNFREE_SESSION_NAME");
   const name = requestedName === undefined
     ? synthesizeSessionName({ command, hostTty, termProgram, startedAt: now })
@@ -299,6 +307,8 @@ export function createSessionMetadata(
     ...(processStart ? { hostProcessStart: processStart } : {}),
     ...(options.sessionContainerName !== undefined ? { sessionContainerName: options.sessionContainerName } : {}),
     ...(options.resumeConversationId !== undefined ? { resumeConversationId: options.resumeConversationId } : {}),
+    recordVersion: SESSION_RECORD_VERSION,
+    ...(Object.keys(terminalIds).length > 0 ? { terminalIds } : {}),
     hostInbox: context.project.paths.inboxDir,
     containerInbox: inboxContainerDir(),
     ...(process.ppid ? { hostParentPid: process.ppid } : {}),
@@ -1338,23 +1348,6 @@ export function activeOrStartingAgentSessions(
       || !active.some((item) => item.sessionId === session.sessionId)),
     ...starting,
   ];
-}
-
-export function sessionEnvOptions(metadata: SessionMetadata): string[] {
-  // The display name remains in host/proxy state. It is not an agent-supplied
-  // identity claim and is intentionally absent from the container environment.
-  const entries: Array<[string, string | undefined]> = [
-    ["RUNFREE_SESSION_ID", metadata.id],
-    ["RUNFREE_SESSION_COMMAND", metadata.command],
-    ["RUNFREE_HOST_TTY", metadata.hostTty],
-    ["RUNFREE_HOST_TERM_PROGRAM", metadata.termProgram],
-    ["RUNFREE_HOST_TERM_SESSION_ID", metadata.termSessionId],
-    ["RUNFREE_HOST_ITERM_SESSION_ID", metadata.itermSessionId],
-    ["RUNFREE_HOST_WT_SESSION", metadata.wtSession],
-  ];
-  return entries
-    .filter((entry): entry is [string, string] => entry[1] !== undefined && entry[1] !== "")
-    .flatMap(([name, value]) => ["--env", `${name}=${value}`]);
 }
 
 function baseRuntimeRoot(context: RuntimeContext): string {
