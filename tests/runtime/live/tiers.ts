@@ -15,7 +15,8 @@
 //
 // A file is core by listing it here; every other live file is extended, so a
 // new live file can never drop out of both tiers. A mixed file splits its
-// cases with `liveTierTest` and appears in `MIXED_LIVE_FILES`.
+// cases with `liveTierSelected` (as `coreTest`/`extendedTest` — see
+// `session-admission-attached.live.test.ts`) and appears in `MIXED_LIVE_FILES`.
 //
 // Data only: `vitest.config.ts` imports this, so it must not import vitest.
 
@@ -38,7 +39,7 @@ export const CORE_LIVE_FILES = [
   "tests/runtime/live/host-service.live.test.ts",
 ] as const;
 
-/** Files that hold cases of both tiers, split per case with `liveTierTest`. */
+/** Files that hold cases of both tiers, split per case with `liveTierSelected`. */
 export const MIXED_LIVE_FILES = [
   "tests/runtime/live/session-admission-attached.live.test.ts",
   "tests/runtime/live/session-admission-crash.live.test.ts",
