@@ -49,7 +49,7 @@ add`, `runfree credential add`, and `runfree mcp approve`.
 - **Dependency overlays** so common dependency directories and caches live in Runfree-owned Docker volumes instead of polluting the host checkout.
 - **Project image customization** through a Dockerfile that extends the Runfree base image.
 - **Diagnostics** for blocked proxy requests, desired/effective runtime component state, upgrade actions, resources, logs, assets, and token sync status.
-- **Interrupted-session recovery** with bounded offline current-project inventory, explicit cross-project and agent filtering, and retry-safe Claude/Codex resume claims.
+- **Interrupted-session recovery** with bounded offline current-project inventory, explicit cross-project and agent filtering, and same-terminal resume for Claude, Codex, and Pi with per-conversation claims.
 
 ## What Runfree Does Not Promise
 
@@ -82,6 +82,7 @@ Runtime/security changes should be validated with `make test-runtime-core` on a 
 | CLI entrypoint and command app | `packages/cli/src/cli.ts`, `packages/cli/src/commands/` |
 | Project config and init wizard | `packages/cli/src/config.ts`, `packages/cli/src/init-wizard.ts`, `packages/cli/templates/` |
 | Runtime lifecycle and Docker Compose orchestration | `packages/cli/src/runtime.ts`, `packages/cli/src/runtime/env.ts`, `packages/cli/src/network.ts` |
+| Interrupted session recovery and `runfree resume` | `packages/cli/src/runtime/recovery.ts`, `packages/cli/src/runtime/resume-selection.ts`, `packages/cli/src/runtime/terminal-identity.ts`, `packages/cli/src/runtime/codex-rollouts.ts`, `packages/cli/src/commands/resume.ts` |
 | Desired/effective network contracts | `packages/runtime-contracts/src/desired-network-policy.ts`, `packages/runtime-contracts/src/network-policy.ts` |
 | OAuth mediation contracts | `packages/runtime-contracts/src/oauth-mediation-policy.ts` |
 | Proxy enforcement | `packages/proxy/src/` |

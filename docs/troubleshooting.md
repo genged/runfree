@@ -172,6 +172,23 @@ If you told Runfree to stop asking and want the prompts back:
 runfree approvals --clear-deny
 ```
 
+## An interrupted session will not resume
+
+`runfree resume` refuses before it starts anything, so a refusal never leaves
+a half-started session.
+
+| Message | Cause | Remedy |
+| --- | --- | --- |
+| `another terminal is resuming this session` | Another terminal holds the claim on this conversation. | Use that terminal. If its process is gone, the claim clears on a later `runfree resume`. |
+| `the session record changed; run runfree resume again` | The record changed after the list was read. | Run `runfree resume` again. |
+| `a runtime lifecycle change is in progress; run runfree resume again` | Another Runfree command is starting, stopping, or repairing the runtime. | Wait for it, then run `runfree resume` again. |
+| `runfree resume cannot claim this session: the host boot id or this process's start time could not be read ...` | Runfree could not identify its own process, so it cannot keep two terminals from resuming the same conversation. | Run it again. If it repeats, check that `ps` works in this shell. |
+| `... is no longer valid: the Codex conversation match changed` | The Codex history changed after the picker was built. | Run `runfree resume` again and choose from the new list. |
+
+If a resume fails after you chose to resume it, the same question appears the
+next time. Choose "Forget it" to stop being asked about that session; it
+starts nothing and only marks the record done.
+
 ## Credentials are not reaching the proxy
 
 ```bash

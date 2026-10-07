@@ -1089,70 +1089,49 @@ repairing or stopping the forwarder, or by `runfree destroy --force`.
 
 ### Interrupted Session Recovery
 
-Interactive attaches write host-owned session evidence under the per-project
-XDG state directory. A clean exit consumes that evidence; a nonzero exit,
-Docker disconnect, host kill, or reboot preserves it. Records carry boot and
-process-start identity so a reused PID cannot make abandoned work look active.
+When a session ends badly (Docker stops, the host client is killed, or the
+machine restarts), the host keeps a record of it in the project's own state
+directory. A clean exit removes the record. Each record says which process
+and which boot started the session, so a reused process ID cannot make
+abandoned work look active. For Claude and Pi, the host also chooses the
+conversation id before the agent starts and passes it to the agent, so the
+record names the exact conversation without trusting anything the agent
+writes. The record also notes which terminal started the session; that
+information stays on the host and never reaches the session container.
 
-`runfree resume --list` and `--json` scan bounded fixed state directories for
-the current project without contacting Docker or mutating state. `--all`
-explicitly expands the scan across projects; repeatable `--agent <agent>`
-filters the resulting inventory by exact agent ID. Selecting a recovery item
-revalidates its project mapping and exact live container session, acquires a
-host-owned claim, starts the normal validated runtime, and launches a
-descriptor-owned Claude, Codex, or Pi resume argv. A record naming its own
-exact conversation id — a host-chosen id minted once per launch and carried
-into Claude or Pi as `--session-id`, a resumed session's own lineage, a
-Claude-registry report, or a Codex time match (below) — claims only that
-conversation, so two different conversations of the same agent can resume at
-once; a record with no exact id claims the whole agent instead, and the two
-claim kinds exclude each other within one agent. A claim records its owner's
-boot id and process start: one whose owner is proved dead, or whose boot id no
-longer matches, is reclaimed under the lifecycle lock; one that can be proved
-neither alive nor dead blocks only its own claim scope and ages into "dead"
-after 24 hours. Failure releases only the claim. A successful exit
-fingerprint-checks and consumes the selected evidence and every Claude
-registry record and host record linked to the same conversation: host
-records are deleted, and each Claude registry file is marked consumed by its
-own per-file record (the agent-writable file itself is never deleted). A
-resume that attached and then ended non-zero also consumes the original
-record, because the resume's own interrupted record replaces it; a resume
-that fails before attach leaves the original record for the next
-`runfree resume`.
+`runfree resume` reads these records without contacting Docker. In a terminal,
+it compares the current terminal with each record. When exactly one Claude or
+Pi record clearly belongs to this terminal, it asks one question: resume,
+not now, or forget it. Otherwise it shows a picker, with this terminal's
+sessions first. Codex cannot take a conversation id from the host, so a Codex
+session is matched to its conversation by time instead; those matches only
+add labelled rows to the picker and are never offered as the one question.
+Starting an agent never asks about interrupted sessions.
 
-Claude registry files are untrusted agent state. Recovery reads only bounded,
-regular, single-link files from fixed directories, with a no-follow,
-non-blocking open (so a FIFO swapped in cannot stall the scan) and inode
-checks, validates conversation ids before building argv, and sanitizes
-display strings. It never touches conversation transcripts. `--agent` filters
-only; it grants no resume authority. A completed resume of a Claude-registry
-row closes a recovery epoch for the agent, but the epoch blocks only
-*older* host records with no exact conversation id of their own; a host
-record that already names its own exact conversation is never shadowed by
-another conversation's epoch.
+Choosing a session takes a host-owned claim on that conversation, checks the
+session again, and starts it as a new, normally admitted session; the old
+container is never reused. Claims are per conversation, so several terminals
+can resume different conversations at the same time, while two terminals can
+never resume the same one. A claim whose owner is gone is cleared, and one
+whose owner cannot be identified stops blocking after a while. When the
+resumed session ends cleanly, the old record and everything linked to the
+same conversation is marked done. If Docker stops again during the resumed
+session, the new record (from the terminal that resumed it) replaces the old
+one. If the resume fails before the session starts, the record stays and the
+next `runfree resume` asks again. "Forget it" marks the record done without
+starting anything, and refuses while another terminal holds a claim on it.
 
-Codex has no launch-time conversation id. A Codex row in the resume picker
-instead comes from a bounded reader that matches a host record's own time
-window against Codex's own rollout files under `sessions/<year>/<month>/<day>/`
-and `session_index.jsonl`. Which day directories it opens is computed only
-from the host record's own window timestamps; it never discovers a directory
-by listing `sessions/` or any year or month directory. Inside each day
-directory it does open, every entry, whether or not its name matches, counts
-against an entry budget and a time limit; entries that match are opened
-without following links or blocking, and count against file and byte
-budgets. A thread inside exactly one record's window becomes a "Codex match"
-row; one inside more than one record's window becomes a row in each, marked
-"matches N tabs". These rows exist only in the interactive resume picker,
-never in `--list`, `--json`, or `--all`, and are capped per record and in
-total. A Codex match is never the one question and never the picker's
-default row, and its presence is re-checked against the live rollout files
-immediately before the claim.
+Files the agent writes, such as Claude's session list and Codex's history,
+are untrusted. Recovery reads them only from fixed places, with size, count,
+and time limits, never follows links, and cannot be stalled by a special
+file. Names taken from them are cleaned before they reach the terminal, are
+labelled as agent-reported, and are never the default choice. The limits are
+listed in [security.md](security.md).
 
-Host updates to the writable Codex state use a fixed-file operation at the
-mount root. It rejects symlinks, hard links, special files, oversized files,
-and concurrent changes, creates the new file with no-follow and exclusive-open
-flags, and replaces `config.toml` by rename. An unsafe entry is left in place
-for manual recovery.
+Host updates to the writable Codex state go through one guarded file
+operation that refuses links, special files, oversized files, and concurrent
+changes, and replaces the configuration file in one step. An unsafe entry is
+left in place for manual recovery.
 
 ## Network Policy Model
 

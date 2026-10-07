@@ -42,6 +42,7 @@ project policy lives under `.runfree/`.
 | Project config and init | `packages/cli/src/config.ts`, `packages/cli/src/init-wizard.ts`, `packages/cli/templates/` | Current config version is 4; older versions and legacy keys are refused, not migrated. The init wizard runs only on a TTY without `--yes`. |
 | Runtime lifecycle | `packages/cli/src/runtime.ts`, `packages/cli/src/runtime/env.ts`, `packages/cli/src/network.ts` | Docker Compose orchestration, project state, network selection, stale runtime checks. |
 | Per-session admission | `packages/cli/src/runtime/session-admission-{probe,driver}.ts`, `session-file-{publisher,heartbeat,teardown}.ts`, `session-container-{proof,template}.ts`, `session-containers.ts`, `session-internal-network-baseline.ts` | Source-IP session identity, lifecycle records, and Docker-inspection proofs. Reached by every public launch (`claude`/`codex`/`pi`, `shell`, `resume`, `mcp auth`) through `session-public-launch.ts`. See `docs/security.md`. |
+| Interrupted session recovery | `packages/cli/src/runtime/recovery.ts`, `runtime/resume-selection.ts`, `runtime/terminal-identity.ts`, `runtime/codex-rollouts.ts`, `runtime/session-admission-resume.ts`, `packages/cli/src/commands/resume.ts`, `commands/resume-prompt.ts` | Host records, offline inventory, terminal matching, per-conversation claims and consumption, the bounded Codex time match, and the `runfree resume` prompt. Agent-written registry and rollout files are hostile input. See `docs/architecture.md` and `docs/security.md`. |
 | Project custom agent images | `packages/cli/src/agent-image.ts`, `.runfree/image/Dockerfile` | Project Dockerfiles extend `RUNFREE_BASE_IMAGE`; full image overrides are not supported. |
 | Embedded runtime assets | `packages/agent-runtime/agent/`, `packages/proxy/src/`, `dist/runtime/` | `pnpm build:runtime` creates `dist/runtime`, then assets are materialized into XDG data state by `packages/cli/src/assets.ts`. The agent image's session entry is `packages/agent-runtime/agent/session-entry.sh`; its readiness probe is TypeScript at `packages/agent-runtime/src/session-ready-probe.cts`, compiled by the same `tsc -b` step as the proxy into `dist/runtime/agent/session-ready-probe.cjs`. The probe embeds the readiness request bytes, pinned to the contract by `scripts/session-entry.test.ts`. |
 | Proxy policy and credential injection | `packages/runtime-contracts/src/network-policy.ts`, `packages/runtime-contracts/src/oauth-mediation-policy.ts`, `packages/proxy/src/policy.ts`, `packages/proxy/src/oauth-mediation.ts`, `packages/proxy/src/server.ts` | HTTPS/WSS allowlisting, request-shape rules, header stripping, proxy-only token reads, and OAuth handle mediation. Denial feedback lives in `packages/proxy/src/denial.ts`; audit mode in `packages/proxy/src/audit.ts`. |
@@ -73,7 +74,14 @@ project policy lives under `.runfree/`.
 - `pnpm run generate:assets` regenerates
   `packages/cli/src/embedded-assets.generated.ts` from `dist/runtime/**`.
 - `pnpm run update:agent-tools -- [all|claude|codex|pi@<version>]` updates the
-  embedded Claude/Codex/Pi CLI pins and regenerates runtime assets.
+  embedded Claude/Codex/Pi CLI pins and regenerates runtime assets. It first
+  checks that the new Claude and Pi accept `--session-id` the way launch and
+  resume assume (`scripts/agent-session-id-contract.ts`): the host only
+  downloads the locked tools with `--ignore-scripts`, and the rebuild and
+  probes run in a pinned `node:22` container with no network. This needs a
+  reachable Docker daemon; a failed check restores the previous lockfile.
+  `--no-contract` skips the check, and `make test-runtime-core` runs the same
+  check on the built agent image.
 - `pnpm run build:bin` compiles `dist/runfree`; release archives use
   `scripts/package-homebrew-artifacts.sh`.
 - `scripts/dev-runfree.sh [--state-root DIR] <runfree args>` runs this

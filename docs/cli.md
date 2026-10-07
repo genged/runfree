@@ -94,7 +94,7 @@ Created project files include:
 | `runfree resume` | Pick and resume interrupted Claude, Codex, or Pi work for the current project. |
 | `runfree resume --list` / `--json` | Inspect the current project's bounded recovery inventory offline without contacting Docker. |
 | `runfree resume --all` | Include interrupted work from every Runfree project; composes with `--list` or `--json`. |
-| `runfree resume --agent <agent>` | Include only one agent ID such as `claude` or `codex`; repeat the option to select a union. |
+| `runfree resume --agent <agent>` | Include only one agent ID such as `claude`, `codex`, or `pi`; repeat the option to select a union. |
 | `runfree status` | List containers, desired/effective runtime component identities and upgrade action, audit state, and the proxy's session files with, for each, either `served until <aliveUntil>` or `on disk, not served (<reason>)`. With approved [host services](#host-services), it also lists each one with its current listener and the host-service gateway state, and warns about drift. |
 | `runfree resources` | List Runfree Docker resources for this project. |
 | `runfree logs proxy` | Follow proxy logs. Use `--verbose` for sanitized allowed request metadata. |
