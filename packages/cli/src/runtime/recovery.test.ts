@@ -1,3 +1,4 @@
+import { spawn, spawnSync } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
@@ -2620,5 +2621,43 @@ describe("codex-match rows carry their own conversation's claim state", () => {
     expect(after.find((item) => item.id === host.id)?.claimUnprovable).toBeDefined();
     expect(codexRow(after, THREAD_X).claimUnprovable).toBeUndefined();
     expect(codexRow(after, THREAD_Y).claimUnprovable).toBeUndefined();
+  });
+});
+
+describe("agent-writable evidence swapped for a FIFO", () => {
+  test.skipIf(process.platform === "win32")("a FIFO that passes the lstat check is refused without blocking the scan", (ctx) => {
+    const dir = path.join(stateDir, "claude", "sessions");
+    fs.mkdirSync(dir, { recursive: true });
+    const fifoPath = path.join(dir, "4242.json");
+    const made = spawnSync("mkfifo", [fifoPath]);
+    if (made.error || made.status !== 0) ctx.skip();
+    // The race being modelled: the agent swaps the file for a FIFO between
+    // the scan's `lstat` and its `open`. Stubbing `lstat` to report a regular
+    // file puts the FIFO right at the `open`.
+    const realLstat = fs.lstatSync;
+    const lstatSpy = vi.spyOn(fs, "lstatSync").mockImplementation(((target: fs.PathLike, options?: fs.StatSyncOptions) => {
+      const real = realLstat(target, options as fs.StatSyncOptions) as fs.Stats;
+      if (target !== fifoPath) return real;
+      return Object.assign(Object.create(Object.getPrototypeOf(real)), real, {
+        mode: (real.mode & ~fs.constants.S_IFMT) | fs.constants.S_IFREG,
+        size: 100,
+      });
+    }) as typeof fs.lstatSync);
+    // Backstop so a regression fails this test instead of hanging the worker:
+    // a writer opening the FIFO after 3 s releases a blocked reader.
+    const unblocker = spawn("sh", ["-c", 'sleep 3; exec 3>"$1"', "sh", fifoPath], { stdio: "ignore" });
+
+    try {
+      const startedAt = Date.now();
+      const inventory = scanRecoveryInventory({ env });
+      const elapsedMs = Date.now() - startedAt;
+
+      expect(elapsedMs).toBeLessThan(1_000);
+      expect(inventory.items).toEqual([]);
+      expect(inventory.invalidFiles).toBe(1);
+    } finally {
+      lstatSpy.mockRestore();
+      unblocker.kill("SIGKILL");
+    }
   });
 });

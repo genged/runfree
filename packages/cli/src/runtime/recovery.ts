@@ -299,7 +299,12 @@ function safeReadBytes(filePath: string, knownStat?: fs.Stats): SecureBytes | un
   }
   let fd: number | undefined;
   try {
-    fd = fs.openSync(filePath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+    // O_NONBLOCK: every caller reads agent-writable or project-state files,
+    // and an agent can swap one for a FIFO between the `lstat` above and this
+    // open. A blocking open would then stall `runfree resume` and
+    // `runfree sessions` until a writer appeared; non-blocking, it returns at
+    // once and the `isFile` check below refuses the FIFO.
+    fd = fs.openSync(filePath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
     const opened = fs.fstatSync(fd);
     if (
       !opened.isFile()
