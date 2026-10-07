@@ -363,12 +363,13 @@ Details: [Write Approval Grants](architecture.md#write-approval-grants).
    directory it opens is fixed (the Claude registry) or computed only from
    the host's own session timestamps (a Codex day directory); it never
    discovers a directory by listing `sessions/` or any year or month
-   directory. Inside every directory it does open, each entry counts against
-   an entry, file, byte, and time budget, whether or not its name matches,
-   and every file is opened without following links and without blocking.
-   Rows built from it (a Claude-registry name, a Codex time-matched thread)
-   are sanitized, labeled ("Claude reported", "Codex match"), and never the
-   resume prompt's default row or its one-question path.
+   directory. Inside every directory it does open, every entry, whether or
+   not its name matches, counts against an entry budget and a time limit;
+   entries that match are opened without following links or blocking, and
+   count against file and byte budgets. Rows built from it (a
+   Claude-registry name, a Codex time-matched thread) are sanitized, labeled
+   ("Claude reported", "Codex match"), and never the resume prompt's default
+   row or its one-question path.
 4. Terminal identifiers used to match a resumable session to the terminal
    that started it (`TERM_SESSION_ID`, `ITERM_SESSION_ID`, `TMUX_PANE`, and
    similar) are captured only from the host launcher's own environment. They

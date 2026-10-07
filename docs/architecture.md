@@ -1129,15 +1129,16 @@ window against Codex's own rollout files under `sessions/<year>/<month>/<day>/`
 and `session_index.jsonl`. Which day directories it opens is computed only
 from the host record's own window timestamps; it never discovers a directory
 by listing `sessions/` or any year or month directory. Inside each day
-directory it does open, every entry counts against an entry, file, byte, and
-time budget, whether or not its name matches, and every file is opened
-without following links and without blocking. A thread inside exactly one
-record's window becomes a "Codex match" row; one inside more than one
-record's window becomes a row in each, marked "matches N tabs". These rows
-exist only in the interactive resume picker, never in `--list`, `--json`, or
-`--all`, and are capped per record and in total. A Codex match is never the
-one question and never the picker's default row, and its presence is
-re-checked against the live rollout files immediately before the claim.
+directory it does open, every entry, whether or not its name matches, counts
+against an entry budget and a time limit; entries that match are opened
+without following links or blocking, and count against file and byte
+budgets. A thread inside exactly one record's window becomes a "Codex match"
+row; one inside more than one record's window becomes a row in each, marked
+"matches N tabs". These rows exist only in the interactive resume picker,
+never in `--list`, `--json`, or `--all`, and are capped per record and in
+total. A Codex match is never the one question and never the picker's
+default row, and its presence is re-checked against the live rollout files
+immediately before the claim.
 
 Host updates to the writable Codex state use a fixed-file operation at the
 mount root. It rejects symlinks, hard links, special files, oversized files,
