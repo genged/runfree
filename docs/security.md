@@ -359,13 +359,16 @@ Details: [Write Approval Grants](architecture.md#write-approval-grants).
    Intended exceptions: per-project agent state, sanitized per-agent config,
    generated Git identity, dependency volumes, and the read-only inbox.
 3. Host code treats agent-writable state (Codex config, Claude session
-   registry, Codex rollout and session-index files) as hostile input:
-   bounded, no-follow, single-link reads from a fixed, computed walk — never
-   a directory listing an attacker could seed — with per-directory,
-   per-tree, and byte budgets plus a wall-clock deadline. Rows built from it
-   (a Claude-registry name, a Codex time-matched thread) are sanitized,
-   labeled ("Claude reported", "Codex match"), and never the resume prompt's
-   default row or its one-question path.
+   registry, Codex rollout and session-index files) as hostile input. Which
+   directory it opens is fixed (the Claude registry) or computed only from
+   the host's own session timestamps (a Codex day directory); it never
+   discovers a directory by listing `sessions/` or any year or month
+   directory. Inside every directory it does open, each entry counts against
+   an entry, file, byte, and time budget, whether or not its name matches,
+   and every file is opened without following links and without blocking.
+   Rows built from it (a Claude-registry name, a Codex time-matched thread)
+   are sanitized, labeled ("Claude reported", "Codex match"), and never the
+   resume prompt's default row or its one-question path.
 4. Terminal identifiers used to match a resumable session to the terminal
    that started it (`TERM_SESSION_ID`, `ITERM_SESSION_ID`, `TMUX_PANE`, and
    similar) are captured only from the host launcher's own environment. They

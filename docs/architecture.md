@@ -1117,8 +1117,8 @@ Claude registry files are untrusted agent state. Recovery reads only bounded,
 regular, single-link files from fixed directories, with no-follow open and
 inode checks, validates conversation ids before building argv, and sanitizes
 display strings. It never touches conversation transcripts. `--agent` filters
-only; it grants no resume authority. A completed exact Claude-conversation
-resume closes a recovery epoch for the agent, but the epoch blocks only
+only; it grants no resume authority. A completed resume of a Claude-registry
+row closes a recovery epoch for the agent, but the epoch blocks only
 *older* host records with no exact conversation id of their own; a host
 record that already names its own exact conversation is never shadowed by
 another conversation's epoch.
@@ -1126,15 +1126,18 @@ another conversation's epoch.
 Codex has no launch-time conversation id. A Codex row in the resume picker
 instead comes from a bounded reader that matches a host record's own time
 window against Codex's own rollout files under `sessions/<year>/<month>/<day>/`
-and `session_index.jsonl` — fixed-depth, no-follow, single-link opens with a
-byte budget and a wall-clock deadline, never a directory listing an attacker
-could seed. A thread inside exactly one record's window becomes a "Codex
-match" row; one inside more than one record's window becomes a row in each,
-marked "matches N tabs". These rows exist only in the interactive resume
-picker, never in `--list`, `--json`, or `--all`, and are capped per record and
-in total. A Codex match is never the one question and never the picker's
-default row, and its presence is re-checked against the live rollout files
-immediately before the claim.
+and `session_index.jsonl`. Which day directories it opens is computed only
+from the host record's own window timestamps; it never discovers a directory
+by listing `sessions/` or any year or month directory. Inside each day
+directory it does open, every entry counts against an entry, file, byte, and
+time budget, whether or not its name matches, and every file is opened
+without following links and without blocking. A thread inside exactly one
+record's window becomes a "Codex match" row; one inside more than one
+record's window becomes a row in each, marked "matches N tabs". These rows
+exist only in the interactive resume picker, never in `--list`, `--json`, or
+`--all`, and are capped per record and in total. A Codex match is never the
+one question and never the picker's default row, and its presence is
+re-checked against the live rollout files immediately before the claim.
 
 Host updates to the writable Codex state use a fixed-file operation at the
 mount root. It rejects symlinks, hard links, special files, oversized files,

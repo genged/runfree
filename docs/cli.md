@@ -119,7 +119,8 @@ runfree rebuild --yes
 
 Bare `runfree resume`, on a terminal (stdin and stdout both TTYs), scans only
 the current project. One strong terminal match to a Claude or Pi record
-carrying a host-chosen session id asks one question, default "Resume it":
+carrying an exact conversation id the host recorded when it started or
+resumed that session asks one question, default "Resume it":
 
 ```text
 ◆ Interrupted in this terminal (14:02, 6 min ago):
