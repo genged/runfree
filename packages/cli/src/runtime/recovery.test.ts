@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -153,6 +154,12 @@ function runtimeContext(): RuntimeContext {
     runtimeRoot: path.join(tmp, "runtime"),
     env,
   } as unknown as RuntimeContext;
+}
+
+// The per-evidence-file consumed record name (`consumedPath` in recovery.ts):
+// one record per Claude registry file, not per recovery id.
+function consumedRecordName(id: string, evidencePath: string): string {
+  return `${id}-${crypto.createHash("sha256").update(evidencePath).digest("hex").slice(0, 16)}.json`;
 }
 
 function firstItem(): RecoveryItem {
@@ -1723,12 +1730,13 @@ describe("linked consumption and dismiss (section 5)", () => {
     const hostPath = hostEvidence(undefined, { recordVersion: 2, launchConversationId: CLAUDE_SESSION, outcome: "interrupted" });
     const item = firstItem();
     const linkedId = item.linkedClaude?.[0]?.id;
-    if (!linkedId) throw new Error("missing linked claude fixture");
+    const linkedPath = item.linkedClaude?.[0]?.evidencePath;
+    if (!linkedId || !linkedPath) throw new Error("missing linked claude fixture");
 
     await expect(runWithRecoveryClaim(runtimeContext(), item, () => 0)).resolves.toEqual({ status: 0, consumed: true });
 
     expect(fs.existsSync(hostPath)).toBe(false);
-    expect(fs.existsSync(path.join(stateDir, "sessions", "recovery-consumed", `${linkedId}.json`))).toBe(true);
+    expect(fs.existsSync(path.join(stateDir, "sessions", "recovery-consumed", consumedRecordName(linkedId, linkedPath)))).toBe(true);
     expect(fs.existsSync(path.join(stateDir, "sessions", "recovery-consumed", "agent-claude.json"))).toBe(false);
   });
 
@@ -1737,7 +1745,8 @@ describe("linked consumption and dismiss (section 5)", () => {
     const hostPath = hostEvidence(undefined, { recordVersion: 2, launchConversationId: CLAUDE_SESSION, outcome: "interrupted" });
     const item = firstItem();
     const linkedId = item.linkedClaude?.[0]?.id;
-    if (!linkedId) throw new Error("missing linked claude fixture");
+    const linkedPath = item.linkedClaude?.[0]?.evidencePath;
+    if (!linkedId || !linkedPath) throw new Error("missing linked claude fixture");
 
     const result = await dismissRecoveryItem(runtimeContext(), item);
 
@@ -1746,7 +1755,7 @@ describe("linked consumption and dismiss (section 5)", () => {
     // The agent-writable registry file itself is never unlinked, only marked
     // consumed by fingerprint.
     expect(fs.existsSync(claudePath)).toBe(true);
-    expect(fs.existsSync(path.join(stateDir, "sessions", "recovery-consumed", `${linkedId}.json`))).toBe(true);
+    expect(fs.existsSync(path.join(stateDir, "sessions", "recovery-consumed", consumedRecordName(linkedId, linkedPath)))).toBe(true);
     expect(fs.existsSync(path.join(stateDir, "sessions", "recovery-consumed", "agent-claude.json"))).toBe(false);
   });
 
@@ -1853,8 +1862,8 @@ describe("linked consumption and dismiss (section 5)", () => {
     await expect(runWithRecoveryClaim(runtimeContext(), joinedItem, () => 0)).resolves.toEqual({ status: 0, consumed: true });
 
     expect(fs.existsSync(host.evidencePath)).toBe(false);
-    expect(fs.existsSync(path.join(stateDir, "sessions", "recovery-consumed", `${matchingClaude.id}.json`))).toBe(true);
-    expect(fs.existsSync(path.join(stateDir, "sessions", "recovery-consumed", `${staleClaude.id}.json`))).toBe(false);
+    expect(fs.existsSync(path.join(stateDir, "sessions", "recovery-consumed", consumedRecordName(matchingClaude.id, matchingClaude.evidencePath)))).toBe(true);
+    expect(fs.existsSync(path.join(stateDir, "sessions", "recovery-consumed", consumedRecordName(staleClaude.id, staleClaude.evidencePath)))).toBe(false);
   });
 });
 
@@ -2424,5 +2433,122 @@ describe("Codex C1 time-match rows (scanRecoveryInventory)", () => {
     expect(
       inventory.items.some((item) => item.sourceId === "rf-20260731-cdx003" && item.conversationSource !== "codex-match"),
     ).toBe(true);
+  });
+});
+
+describe("per-evidence-file consumed records (duplicate Claude registry files)", () => {
+  test("scan, consume, rescan with two duplicate Claude files for one conversation gives no row", async () => {
+    claudeEvidence({ sessionId: CLAUDE_SESSION, updatedAt: Date.parse("2026-07-31T00:01:00.000Z") }, 4242);
+    claudeEvidence({ sessionId: CLAUDE_SESSION, updatedAt: Date.parse("2026-07-31T00:05:00.000Z") }, 4343);
+    hostEvidence(undefined, { recordVersion: 2, launchConversationId: CLAUDE_SESSION, outcome: "interrupted" });
+    const item = firstItem();
+    expect(item.linkedClaude).toHaveLength(2);
+
+    await expect(runWithRecoveryClaim(runtimeContext(), item, () => 0)).resolves.toEqual({ status: 0, consumed: true });
+
+    expect(scanRecoveryInventory({ env }).items).toEqual([]);
+  });
+
+  test("consuming one duplicate standalone Claude row leaves the other visible, and consuming that one too leaves neither", async () => {
+    const older = claudeEvidence({ sessionId: CLAUDE_SESSION, updatedAt: Date.parse("2026-07-31T00:01:00.000Z") }, 4242);
+    const newer = claudeEvidence({ sessionId: CLAUDE_SESSION, updatedAt: Date.parse("2026-07-31T00:05:00.000Z") }, 4343);
+    const first = firstItem();
+    expect(first.evidencePath).toBe(newer);
+
+    await expect(runWithRecoveryClaim(runtimeContext(), first, () => 0)).resolves.toEqual({ status: 0, consumed: true });
+
+    const remaining = scanRecoveryInventory({ env }).items;
+    expect(remaining.map((candidate) => candidate.evidencePath)).toEqual([older]);
+    const second = remaining[0];
+    if (!second) throw new Error("missing remaining duplicate");
+
+    await expect(runWithRecoveryClaim(runtimeContext(), second, () => 0)).resolves.toEqual({ status: 0, consumed: true });
+
+    expect(scanRecoveryInventory({ env }).items).toEqual([]);
+  });
+
+  test("decision 10: consume R1, later consume R2 for the same conversation, and neither Claude file comes back", async () => {
+    // R1: the original launch and its Claude registry file.
+    hostEvidence("rf-20260731-original", {
+      recordVersion: 2,
+      launchConversationId: CLAUDE_SESSION,
+      outcome: "interrupted",
+      startedAt: "2026-07-31T00:00:00.000Z",
+    });
+    claudeEvidence({ sessionId: CLAUDE_SESSION, updatedAt: Date.parse("2026-07-31T00:01:00.000Z") }, 4242);
+    const r1 = firstItem();
+    await expect(runWithRecoveryClaim(runtimeContext(), r1, () => 0)).resolves.toEqual({ status: 0, consumed: true });
+    expect(scanRecoveryInventory({ env }).items).toEqual([]);
+
+    // R2: a later resume of the same conversation crashed too, leaving its
+    // own host record and a second registry file (a new Claude pid).
+    hostEvidence("rf-20260731-resumed", {
+      recordVersion: 2,
+      resumeConversationId: CLAUDE_SESSION,
+      outcome: "interrupted",
+      startedAt: "2026-07-31T00:10:00.000Z",
+    });
+    claudeEvidence({ sessionId: CLAUDE_SESSION, updatedAt: Date.parse("2026-07-31T00:11:00.000Z") }, 4343);
+    const r2 = firstItem();
+    expect(r2.sourceId).toBe("rf-20260731-resumed");
+    await expect(runWithRecoveryClaim(runtimeContext(), r2, () => 0)).resolves.toEqual({ status: 0, consumed: true });
+
+    expect(scanRecoveryInventory({ env }).items).toEqual([]);
+  });
+
+  test("a consumed record an older Runfree wrote under the per-id key still hides exactly its own file", () => {
+    // The legacy-consumed file is the newer one, so a missed legacy read would
+    // let the final id dedup show it instead of the older, unconsumed file.
+    claudeEvidence({ sessionId: CLAUDE_SESSION, updatedAt: Date.parse("2026-07-31T00:05:00.000Z") }, 4242);
+    const item = firstItem();
+    const consumedDir = path.join(stateDir, "sessions", "recovery-consumed");
+    fs.mkdirSync(consumedDir, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(path.join(consumedDir, `${item.id}.json`), `${JSON.stringify({
+      v: 1,
+      recoveryId: item.id,
+      evidence: item.fingerprint,
+      consumedAt: "2026-07-31T00:03:00.000Z",
+    })}\n`, { mode: 0o600 });
+    const other = claudeEvidence({ sessionId: CLAUDE_SESSION, updatedAt: Date.parse("2026-07-31T00:01:00.000Z") }, 4343);
+
+    expect(scanRecoveryInventory({ env }).items.map((candidate) => candidate.evidencePath)).toEqual([other]);
+  });
+
+  test("linkedHost records are not unlinked when the primary consumption fails", async () => {
+    const olderPath = hostEvidence("rf-20260731-original", {
+      recordVersion: 2,
+      launchConversationId: CLAUDE_SESSION,
+      outcome: "interrupted",
+      startedAt: "2026-07-31T00:00:00.000Z",
+    });
+    const newerPath = hostEvidence("rf-20260731-resumed", {
+      recordVersion: 2,
+      resumeConversationId: CLAUDE_SESSION,
+      outcome: "interrupted",
+      startedAt: "2026-07-31T00:10:00.000Z",
+    });
+    const item = firstItem();
+    expect(item.evidencePath).toBe(newerPath);
+    // The first open (the reread in `consumeRecoveryEvidence`) succeeds; the
+    // second (the fingerprint-bound unlink's own read) fails, so the primary
+    // is not consumed.
+    const realOpen = fs.openSync;
+    let primaryOpens = 0;
+    const openSpy = vi.spyOn(fs, "openSync").mockImplementation(((target: fs.PathLike, ...rest: unknown[]) => {
+      if (target === newerPath) {
+        primaryOpens += 1;
+        if (primaryOpens > 1) throw Object.assign(new Error("EIO"), { code: "EIO" });
+      }
+      return (realOpen as (...args: unknown[]) => number)(target, ...rest);
+    }) as typeof fs.openSync);
+
+    try {
+      expect(consumeRecoveryEvidence(item)).toBe(false);
+    } finally {
+      openSpy.mockRestore();
+    }
+
+    expect(fs.existsSync(newerPath)).toBe(true);
+    expect(fs.existsSync(olderPath)).toBe(true);
   });
 });

@@ -1908,9 +1908,26 @@ type AgentRecoveryEpoch = {
   consumedAt: string;
 };
 
-function consumedPath(item: RecoveryItem): string {
-  if (!RECOVERY_ID_RE.test(item.id)) throw new Error(`invalid recovery id: ${item.id}`);
-  return path.join(item.stateDir, "sessions", "recovery-consumed", `${item.id}.json`);
+/**
+ * The consumed record for one Claude evidence *file*, not one recovery id:
+ * `recoveryId` hashes only the conversation, so two registry files for one
+ * conversation (a crashed original and a crashed resumed process, or a forged
+ * duplicate) share an id. One record per id let the second write overwrite
+ * the first, and the first file came back as an orphan row. Every reader and
+ * writer goes through this one key.
+ */
+function consumedPath(stateDir: string, id: string, evidencePath: string): string {
+  if (!RECOVERY_ID_RE.test(id)) throw new Error(`invalid recovery id: ${id}`);
+  const fileKey = crypto.createHash("sha256").update(evidencePath).digest("hex").slice(0, 16);
+  return path.join(stateDir, "sessions", "recovery-consumed", `${id}-${fileKey}.json`);
+}
+
+// The pre-release per-id key (`<id>.json`). Read only, never written, so a
+// Claude item consumed by an older Runfree stays consumed after an upgrade;
+// the fingerprint check below still binds it to exactly one file.
+function legacyConsumedPath(stateDir: string, id: string): string {
+  if (!RECOVERY_ID_RE.test(id)) throw new Error(`invalid recovery id: ${id}`);
+  return path.join(stateDir, "sessions", "recovery-consumed", `${id}.json`);
 }
 
 function claudeRecoveryEpochPath(stateDir: string): string {
@@ -1944,9 +1961,8 @@ function parseFingerprint(value: unknown): EvidenceFingerprint | undefined {
   return value as EvidenceFingerprint;
 }
 
-function itemWasConsumed(item: RecoveryItem): boolean {
-  if (item.evidenceKind !== "claude") return false;
-  const read = safeReadJson(consumedPath(item));
+function consumedRecordMatches(filePath: string, item: RecoveryItem): boolean {
+  const read = safeReadJson(filePath);
   if (
     !read
     || !isRecord(read.value)
@@ -1956,6 +1972,12 @@ function itemWasConsumed(item: RecoveryItem): boolean {
   ) return false;
   const recorded = parseFingerprint(read.value.evidence);
   return recorded !== undefined && sameFingerprint(recorded, item.fingerprint);
+}
+
+function itemWasConsumed(item: RecoveryItem): boolean {
+  if (item.evidenceKind !== "claude") return false;
+  return consumedRecordMatches(consumedPath(item.stateDir, item.id, item.evidencePath), item)
+    || consumedRecordMatches(legacyConsumedPath(item.stateDir, item.id), item);
 }
 
 function unlinkIfFingerprintMatches(filePath: string, expected: EvidenceFingerprint): boolean {
@@ -2163,7 +2185,7 @@ function writeLinkedClaudeConsumedRecord(
       evidence: linked.fingerprint,
       consumedAt: new Date().toISOString(),
     };
-    atomicWriteJson(path.join(stateDir, "sessions", "recovery-consumed", `${linked.id}.json`), record);
+    atomicWriteJson(consumedPath(stateDir, linked.id, linked.evidencePath), record);
   } catch {
     // Best-effort: see the doc comment above.
   }
@@ -2185,12 +2207,14 @@ export function consumeRecoveryEvidence(item: RecoveryItem): boolean {
     for (const linked of item.linkedClaude ?? []) writeLinkedClaudeConsumedRecord(item.stateDir, linked);
     const consumed = unlinkIfFingerprintMatches(item.evidencePath, item.fingerprint);
     // Every other host item this one was joined with (`linkedHost`,
-    // decision 10) is unlinked after the primary, by the same
-    // fingerprint-bound check: a mismatch — the file changed since the scan
-    // — just leaves that one file alone, and never fails the primary's own
-    // consumption above.
+    // decision 10) is unlinked only once the primary itself was consumed,
+    // by the same fingerprint-bound check: a mismatch — the file changed
+    // since the scan — just leaves that one file alone, and never fails the
+    // primary's own consumption above. A primary that was not consumed
+    // keeps every linked record too, so the item stays whole for a retry.
+    if (!consumed) return false;
     for (const linked of item.linkedHost ?? []) unlinkIfFingerprintMatches(linked.evidencePath, linked.fingerprint);
-    return consumed;
+    return true;
   }
   const record: RecoveryConsumedRecord = {
     v: 1,
@@ -2200,7 +2224,7 @@ export function consumeRecoveryEvidence(item: RecoveryItem): boolean {
   };
   const epoch: AgentRecoveryEpoch = { v: 1, agent: "claude", consumedAt: record.consumedAt };
   atomicWriteJson(claudeRecoveryEpochPath(item.stateDir), epoch);
-  atomicWriteJson(consumedPath(item), record);
+  atomicWriteJson(consumedPath(item.stateDir, item.id, item.evidencePath), record);
   return itemWasConsumed(item);
 }
 

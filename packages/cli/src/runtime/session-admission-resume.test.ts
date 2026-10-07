@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -148,6 +149,12 @@ function preparedRuntime(context = runtimeContext()) {
   return Object.freeze({ version: 1, context }) as never;
 }
 
+// The per-evidence-file consumed record name (`consumedPath` in recovery.ts):
+// one record per Claude registry file, not per recovery id.
+function consumedRecordName(id: string, evidencePath: string): string {
+  return `${id}-${crypto.createHash("sha256").update(evidencePath).digest("hex").slice(0, 16)}.json`;
+}
+
 describe("resume through session admission", () => {
   test("launches the exact conversation as a new lifecycle session and consumes the claimed evidence", async () => {
     claudeEvidence();
@@ -168,7 +175,7 @@ describe("resume through session admission", () => {
     // epoch; the agent-writable registry entry itself is never unlinked.
     expect(fs.readdirSync(path.join(stateDir, "sessions", "recovery-consumed")).sort()).toEqual([
       "agent-claude.json",
-      `${item.id}.json`,
+      consumedRecordName(item.id, item.evidencePath),
     ]);
     expect(fs.existsSync(path.join(stateDir, "claude", "sessions", "4242.json"))).toBe(true);
   });
@@ -179,7 +186,8 @@ describe("resume through session admission", () => {
     const context = runtimeContext();
     const item = firstItem();
     const linkedId = item.linkedClaude?.[0]?.id;
-    if (!linkedId) throw new Error("missing linked claude fixture");
+    const linkedPath = item.linkedClaude?.[0]?.evidencePath;
+    if (!linkedId || !linkedPath) throw new Error("missing linked claude fixture");
 
     const result = await resumeInterruptedSessionThroughAdmission({ preparedRuntime: preparedRuntime(context), io, item });
 
@@ -188,7 +196,7 @@ describe("resume through session admission", () => {
       resume: { conversationId: CLAUDE_SESSION },
     });
     expect(fs.existsSync(path.join(stateDir, "sessions", "rf-20260731-abcdef.json"))).toBe(false);
-    expect(fs.existsSync(path.join(stateDir, "sessions", "recovery-consumed", `${linkedId}.json`))).toBe(true);
+    expect(fs.existsSync(path.join(stateDir, "sessions", "recovery-consumed", consumedRecordName(linkedId, linkedPath)))).toBe(true);
     expect(fs.existsSync(path.join(stateDir, "sessions", "recovery-consumed", "agent-claude.json"))).toBe(false);
     // The agent-writable registry entry itself is never unlinked.
     expect(fs.existsSync(claudePath)).toBe(true);
@@ -245,7 +253,7 @@ describe("resume through session admission", () => {
     expect(result).toEqual({ status: 137, consumed: true });
     expect(fs.readdirSync(path.join(stateDir, "sessions", "recovery-consumed")).sort()).toEqual([
       "agent-claude.json",
-      `${item.id}.json`,
+      consumedRecordName(item.id, item.evidencePath),
     ]);
   });
 
