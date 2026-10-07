@@ -25,6 +25,10 @@ import { dockerClientEnvOptions } from "./docker.ts";
 import { createDockerClient, type DockerCallOptions } from "./docker-client.ts";
 import { composeProjectName } from "./env.ts";
 import { compareHostBootId, compareHostProcessStart, hostBootId, hostProcessStart } from "./host-identity.ts";
+// Value import on purpose (not `import type`): `resume-selection.ts` only
+// ever imports `RecoveryItem` from here as a type, so this direction carries
+// no runtime cycle (see that module's own header comment).
+import { sanitizeAgentText } from "./resume-selection.ts";
 import { peekSessionContainerRecordsV2, type SessionContainerRecordV2 } from "./session-containers.ts";
 import { readSessionHostStatus } from "./session-host-status.ts";
 import { classifySessionRecordLiveness } from "./session-record-liveness.ts";
@@ -1341,10 +1345,10 @@ function publicRecoveryItem(item: RecoveryItem): object {
     conversationId: item.conversationId,
     conversationName: item.conversationName === undefined
       ? undefined
-      : sanitizeForTerminal(item.conversationName).slice(0, 160),
+      : sanitizeAgentText(item.conversationName, 160),
     status: item.conversationStatus === undefined
       ? undefined
-      : sanitizeForTerminal(item.conversationStatus).slice(0, 40),
+      : sanitizeAgentText(item.conversationStatus, 40),
     updatedAt: item.updatedAt,
     terminal: item.terminalHint === undefined
       ? undefined
@@ -1383,7 +1387,7 @@ export function formatRecoveryInventory(inventory: RecoveryInventory): string {
       sanitizeForTerminal(item.projectName).slice(0, 40),
       sanitizeForTerminal(item.agent).slice(0, 24),
       item.state,
-      sanitizeForTerminal(item.conversationName ?? item.conversationId ?? "-").slice(0, 60),
+      sanitizeAgentText(item.conversationName ?? item.conversationId ?? "-", 60),
       displayTime(item.updatedAt ?? item.startedAt),
       sanitizeForTerminal(item.terminalHint ?? "-").slice(0, 40),
     ]),

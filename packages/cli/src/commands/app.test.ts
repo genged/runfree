@@ -8,9 +8,11 @@ import { RUNFREE_VERSION } from "../embedded-assets.generated.ts";
 import { CliError } from "../errors.ts";
 import { composeProjectName, projectHash } from "../project-identity.ts";
 import { ControlPlaneRebindCandidateMismatchError } from "../runtime/control-plane-rebind-coordinator.ts";
-import type { RuntimeContext } from "../runtime/types.ts";
+import type { RuntimeContext, RuntimeIO } from "../runtime/types.ts";
+import { runAgentCommand } from "../runtime.ts";
 import { runAgentCommandWithControlPlaneRebindRefusal, runCommandApp } from "./app.ts";
 import { approvalsInputFromArgs, runUp, runtimeContextWithSessionName } from "./runtime.ts";
+import type { PromptApi } from "./resume-prompt.ts";
 import type { RunfreeCommandContext } from "./context.ts";
 import { projectInfo } from "../config.ts";
 import { approveNetworkCandidate, approveRuntimeIsolationControl } from "../control/approvals.ts";
@@ -62,6 +64,29 @@ vi.mock("../host-service-registry.ts", async (importOriginal) => {
       if (hostServiceSeams.recordFails) return Promise.reject(new Error("host-service port registry lock is held"));
       return actual.recordProjectHostServicePorts(...args);
     },
+  };
+});
+
+// Seams for the same-terminal resume tests: `scanCalls` counts every call
+// (decision 5 guard — a launch must make none), and `dismissResult`, when
+// set, short-circuits `dismissRecoveryItem` to prove `resume.ts`'s own
+// message mapping for each of its four results without needing a real claim,
+// a real lifecycle-lock contender, or a mid-flight evidence change.
+const recoverySeams = vi.hoisted(() => ({
+  dismissResult: undefined as undefined | "dismissed" | "claimed" | "changed" | "deferred",
+  scanCalls: 0,
+}));
+
+vi.mock("../runtime/recovery.ts", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../runtime/recovery.ts")>();
+  return {
+    ...actual,
+    scanRecoveryInventory: (...args: Parameters<typeof actual.scanRecoveryInventory>) => {
+      recoverySeams.scanCalls += 1;
+      return actual.scanRecoveryInventory(...args);
+    },
+    dismissRecoveryItem: async (...args: Parameters<typeof actual.dismissRecoveryItem>) =>
+      recoverySeams.dismissResult ?? actual.dismissRecoveryItem(...args),
   };
 });
 
@@ -170,8 +195,90 @@ function writeHostRecoveryFixture(stateRoot: string, projectRoot: string, agent:
   );
 }
 
+// A record-version-2 host fixture whose owner is provably dead (`outcome:
+// "interrupted"`), so it is eligible for the same-terminal prompt and picker
+// (`eligible`, resume-selection.ts) — unlike `writeHostRecoveryFixture`
+// above, which deliberately omits `recordVersion` for the pre-this-release
+// fixtures.
+function writeHostRecoveryFixtureV2(stateRoot: string, projectRoot: string, overrides: Record<string, unknown> = {}): string {
+  fs.mkdirSync(projectRoot, { recursive: true });
+  const stateDir = path.join(stateRoot, "runfree", "projects", projectHash(projectRoot));
+  const sessionsDir = path.join(stateDir, "sessions");
+  fs.mkdirSync(sessionsDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(stateDir, "project.json"),
+    `${JSON.stringify({ projectRoot, updatedAt: "2026-08-01T00:00:00.000Z" })}\n`,
+  );
+  const id = "rf-20260801-strong01";
+  const filePath = path.join(sessionsDir, `${id}.json`);
+  fs.writeFileSync(
+    filePath,
+    `${JSON.stringify({
+      id,
+      projectRoot,
+      composeProject: composeProjectName(projectRoot),
+      command: "claude",
+      hostPid: 999_999,
+      recordVersion: 2,
+      startedAt: "2026-08-01T00:00:00.000Z",
+      lastSeenAt: "2026-08-01T00:01:00.000Z",
+      outcome: "interrupted",
+      launchConversationId: "11111111-2222-4333-8444-555555555555",
+      ...overrides,
+    })}\n`,
+  );
+  return filePath;
+}
+
+// Forces `process.stdin`/`process.stdout`'s `isTTY` for the duration of
+// `run`, restoring whatever this test runner actually had — the same
+// save/restore shape `runtime/approvals-lifecycle.test.ts` uses.
+async function withTty<T>(stdinTty: boolean, stdoutTty: boolean, run: () => Promise<T>): Promise<T> {
+  const entries: ReadonlyArray<[NodeJS.ReadStream | NodeJS.WriteStream, boolean]> = [
+    [process.stdin, stdinTty],
+    [process.stdout, stdoutTty],
+  ];
+  const descriptors = entries.map(([stream]) => Object.getOwnPropertyDescriptor(stream, "isTTY"));
+  for (const [stream, value] of entries) Object.defineProperty(stream, "isTTY", { configurable: true, value });
+  try {
+    return await run();
+  } finally {
+    entries.forEach(([stream], index) => {
+      const descriptor = descriptors[index];
+      if (descriptor) Object.defineProperty(stream, "isTTY", descriptor);
+      else Reflect.deleteProperty(stream, "isTTY");
+    });
+  }
+}
+
+const PROMPT_CANCEL = Symbol("prompt-cancel");
+
+type RecordedSelectCall = Readonly<{
+  message: string;
+  options: ReadonlyArray<{ value: unknown; label: string }>;
+  initialValue: unknown;
+}>;
+
+// A `PromptApi` test double: every `select` call is recorded, then answered
+// by `respond` (its own call and a 0-based call index), so a test can drive a
+// multi-step prompt (list, then a sub-menu) without touching a terminal.
+function fakePromptApi(respond: (call: RecordedSelectCall, index: number) => unknown): PromptApi & { calls: RecordedSelectCall[] } {
+  const calls: RecordedSelectCall[] = [];
+  return {
+    calls,
+    select: (async (opts: { message: string; options: ReadonlyArray<{ value: unknown; label: string }>; initialValue?: unknown }) => {
+      const call: RecordedSelectCall = { message: opts.message, options: opts.options, initialValue: opts.initialValue };
+      calls.push(call);
+      return respond(call, calls.length - 1);
+    }) as unknown as PromptApi["select"],
+    isCancel: ((value: unknown) => value === PROMPT_CANCEL) as unknown as PromptApi["isCancel"],
+  };
+}
+
 afterEach(() => {
   vi.restoreAllMocks();
+  recoverySeams.dismissResult = undefined;
+  recoverySeams.scanCalls = 0;
   for (const dir of tempDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
 });
 
@@ -447,6 +554,234 @@ describe("runCommandApp parser", () => {
     expect(out.text()).toContain("Claude recovery");
     expect(out.text()).toContain("codex");
     expect(runDefault).not.toHaveBeenCalled();
+  });
+
+  test("resume --list strips a bidi override and a zero-width space from an agent-supplied name (review F5)", async () => {
+    const stateRoot = fs.mkdtempSync(path.join(os.tmpdir(), "runfree-resume-sanitize-"));
+    tempDirs.push(stateRoot);
+    const projectRoot = path.join(stateRoot, "current-project");
+    writeClaudeRecoveryFixture(stateRoot, projectRoot, "safe‮name​here");
+    const out = captureStdout();
+    const runDefault = vi.fn(async () => 0);
+
+    const status = await runCommandApp(
+      strictContext({ env: { XDG_STATE_HOME: stateRoot }, projectRoot }),
+      ["resume", "--list"],
+      runDefault,
+    );
+
+    expect(status).toBe(0);
+    expect(out.text()).toContain("safenamehere");
+    expect(out.text()).not.toContain("‮");
+    expect(out.text()).not.toContain("​");
+  });
+
+  test("resume with no id and no TTY prints the list, same as --list", async () => {
+    const stateRoot = fs.mkdtempSync(path.join(os.tmpdir(), "runfree-resume-notty-"));
+    tempDirs.push(stateRoot);
+    const projectRoot = path.join(stateRoot, "current-project");
+    writeClaudeRecoveryFixture(stateRoot, projectRoot, "current conversation");
+    const out = captureStdout();
+    const runDefault = vi.fn(async () => 0);
+
+    const status = await withTty(false, false, () =>
+      runCommandApp(strictContext({ env: { XDG_STATE_HOME: stateRoot }, projectRoot }), ["resume"], runDefault));
+
+    expect(status).toBe(0);
+    expect(out.text()).toContain("current conversation");
+    expect(runDefault).not.toHaveBeenCalled();
+  });
+
+  test("resume --all on a TTY never shows the same-terminal one question", async () => {
+    const stateRoot = fs.mkdtempSync(path.join(os.tmpdir(), "runfree-resume-all-tty-"));
+    tempDirs.push(stateRoot);
+    const projectRoot = path.join(stateRoot, "current-project");
+    // Eligible (recordVersion 2, provably dead owner) so the picker actually
+    // offers it; `--all` must still never ask the one question over it.
+    writeHostRecoveryFixtureV2(stateRoot, projectRoot);
+    const runDefault = vi.fn(async () => 0);
+    const promptApi = fakePromptApi(() => PROMPT_CANCEL);
+    const context = strictContext({ env: { XDG_STATE_HOME: stateRoot }, projectRoot, promptApi });
+
+    const status = await withTty(true, true, () => runCommandApp(context, ["resume", "--all"], runDefault));
+
+    expect(status).toBe(0);
+    expect(promptApi.calls.length).toBeGreaterThan(0);
+    for (const call of promptApi.calls) expect(call.message).not.toContain("Interrupted in this terminal");
+    expect(runDefault).not.toHaveBeenCalled();
+  });
+
+  test("a host record without a record version is listed but hidden from the picker (decision 3)", async () => {
+    const stateRoot = fs.mkdtempSync(path.join(os.tmpdir(), "runfree-resume-recordver-"));
+    tempDirs.push(stateRoot);
+    const projectRoot = path.join(stateRoot, "current-project");
+    writeHostRecoveryFixture(stateRoot, projectRoot, "codex"); // no recordVersion: pre-this-release
+    writeClaudeRecoveryFixture(stateRoot, projectRoot, "eligible conversation"); // always eligible
+    const out = captureStdout();
+    const runDefault = vi.fn(async () => 0);
+
+    const listStatus = await runCommandApp(
+      strictContext({ env: { XDG_STATE_HOME: stateRoot }, projectRoot }),
+      ["resume", "--list"],
+      runDefault,
+    );
+    expect(listStatus).toBe(0);
+    expect(out.text()).toContain("codex");
+    expect(out.text()).toContain("eligible conversation");
+
+    const promptApi = fakePromptApi(() => PROMPT_CANCEL);
+    const context = strictContext({ env: { XDG_STATE_HOME: stateRoot }, projectRoot, promptApi });
+
+    const status = await withTty(true, true, () => runCommandApp(context, ["resume"], runDefault));
+
+    expect(status).toBe(0);
+    expect(promptApi.calls).toHaveLength(1);
+    expect(promptApi.calls[0]?.options).toHaveLength(1);
+    expect(promptApi.calls[0]?.options[0]?.label).toContain("eligible conversation");
+    expect(runDefault).not.toHaveBeenCalled();
+  });
+
+  describe("choice: dismiss (\"Forget it\")", () => {
+    afterEach(() => {
+      recoverySeams.dismissResult = undefined;
+    });
+
+    function setupDismissProject(prefix: string): { stateRoot: string; projectRoot: string } {
+      const stateRoot = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+      tempDirs.push(stateRoot);
+      const projectRoot = path.join(stateRoot, "current-project");
+      writeClaudeRecoveryFixture(stateRoot, projectRoot, "forgettable conversation");
+      fs.mkdirSync(path.join(projectRoot, ".runfree"), { recursive: true });
+      fs.writeFileSync(path.join(projectRoot, ".runfree", "network-policy.json"), '{"version":2,"hosts":["example.com"]}\n');
+      return { stateRoot, projectRoot };
+    }
+
+    // The only eligible row is picked, then "forget" at the sub-menu —
+    // `contextForRecoveryItem` still reaches `assets()` to build the
+    // `RuntimeContext` dismiss needs, so it is stubbed here, not left
+    // throwing like `strictContext`'s default.
+    function dismissContext(stateRoot: string, projectRoot: string): RunfreeCommandContext {
+      let step = 0;
+      const promptApi = fakePromptApi((call) => {
+        step += 1;
+        return step === 1 ? call.options[0]?.value : "forget";
+      });
+      return strictContext({
+        env: { XDG_STATE_HOME: stateRoot },
+        projectRoot,
+        promptApi,
+        assets: () => ({ runtimeDir: "/fake/runtime" }) as unknown as ReturnType<RunfreeCommandContext["assets"]>,
+      });
+    }
+
+    test("'dismissed' prints the forgotten-session confirmation and exits 0 without starting a runtime", async () => {
+      const { stateRoot, projectRoot } = setupDismissProject("runfree-resume-dismiss-ok-");
+      recoverySeams.dismissResult = "dismissed";
+      const out = captureStdout();
+      const runDefault = vi.fn(async () => 0);
+
+      const status = await withTty(true, true, () =>
+        runCommandApp(dismissContext(stateRoot, projectRoot), ["resume"], runDefault));
+
+      expect(status).toBe(0);
+      expect(out.text()).toContain("forgot the interrupted session from");
+      expect(runDefault).not.toHaveBeenCalled();
+    });
+
+    test("'claimed' refuses: another terminal is resuming this session", async () => {
+      const { stateRoot, projectRoot } = setupDismissProject("runfree-resume-dismiss-claimed-");
+      recoverySeams.dismissResult = "claimed";
+
+      const refusal = await cliRefusal(withTty(true, true, () =>
+        runCommandApp(dismissContext(stateRoot, projectRoot), ["resume"], vi.fn(async () => 0))));
+
+      expect(refusal.status).toBe(1);
+      expect(refusal.message).toBe("another terminal is resuming this session");
+    });
+
+    test("'changed' refuses: the session record changed; run runfree resume again", async () => {
+      const { stateRoot, projectRoot } = setupDismissProject("runfree-resume-dismiss-changed-");
+      recoverySeams.dismissResult = "changed";
+
+      const refusal = await cliRefusal(withTty(true, true, () =>
+        runCommandApp(dismissContext(stateRoot, projectRoot), ["resume"], vi.fn(async () => 0))));
+
+      expect(refusal.status).toBe(1);
+      expect(refusal.message).toBe("the session record changed; run runfree resume again");
+    });
+
+    test("'deferred' refuses: a runtime lifecycle change is in progress; run runfree resume again", async () => {
+      const { stateRoot, projectRoot } = setupDismissProject("runfree-resume-dismiss-deferred-");
+      recoverySeams.dismissResult = "deferred";
+
+      const refusal = await cliRefusal(withTty(true, true, () =>
+        runCommandApp(dismissContext(stateRoot, projectRoot), ["resume"], vi.fn(async () => 0))));
+
+      expect(refusal.status).toBe(1);
+      expect(refusal.message).toBe("a runtime lifecycle change is in progress; run runfree resume again");
+    });
+  });
+
+  test("runfree claude on a TTY with a strong-match record calls no scan and no prompt (decision 5)", async () => {
+    const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), "runfree-claude-decision5-"));
+    tempDirs.push(projectRoot);
+    const stateRoot = fs.mkdtempSync(path.join(os.tmpdir(), "runfree-claude-decision5-state-"));
+    tempDirs.push(stateRoot);
+    fs.mkdirSync(path.join(projectRoot, ".runfree"));
+    fs.writeFileSync(path.join(projectRoot, ".runfree", "network-policy.json"), '{"version":2,"hosts":["example.com"]}');
+    const env = {
+      XDG_STATE_HOME: stateRoot,
+      XDG_CONFIG_HOME: path.join(stateRoot, "config"),
+      RUNFREE_TEST_FAKE_DOCKER: "1",
+      RUNFREE_TEST_HOST_BOOT_ID: "linux:11111111-2222-3333-4444-555555555555",
+      RUNFREE_TEST_HOST_PROCESS_START: "linux:12345",
+    };
+    const context = {
+      projectRoot,
+      project: projectInfo(projectRoot, env),
+      runtimeRoot: path.join(projectRoot, "runtime"),
+      env,
+    } as RuntimeContext;
+    // A record that, if the launch ever scanned for it, would be a strong
+    // match and a one-question candidate — proving the launch path never
+    // reaches it, not merely that no such record happened to exist.
+    writeHostRecoveryFixtureV2(stateRoot, projectRoot, {
+      terminalIds: { iterm: "same-terminal" },
+      termProgram: "iTerm.app",
+      hostTty: "/dev/ttys004",
+    });
+
+    // Approve, then corrupt the checkout binding: `requireUsableApprovalSelection`
+    // refuses before Docker, before any claim, and — per decision 5 — before
+    // any recovery scan. Same reachability proof `launch-approval-gate.test.ts`
+    // uses for the start funnel and for `runfree resume`.
+    const candidate = captureDesiredPolicyCandidate(projectRoot, context.project.paths.controlCandidatesDir);
+    approveNetworkCandidate(projectRoot, context.project, candidate, "network-project", "interactive");
+    approveNetworkCandidate(projectRoot, context.project, candidate, "network-local", "interactive");
+    approveRuntimeIsolationControl(projectRoot, context.project, "interactive");
+    const approvalsPath = context.project.paths.controlApprovalsPath;
+    const stored = JSON.parse(fs.readFileSync(approvalsPath, "utf8")) as { checkoutBinding: { rootInode: string } };
+    stored.checkoutBinding.rootInode = "999999999";
+    fs.writeFileSync(approvalsPath, `${JSON.stringify(stored, null, 2)}\n`);
+
+    const io = {
+      capture: () => ({ status: 1, stdout: "", stderr: "" }),
+      run: () => 0,
+      commandExists: () => true,
+      confirm: () => { throw new Error("a non-interactive refusal must not confirm"); },
+      isInteractive: () => false,
+      admin: async () => 0,
+    } as unknown as RuntimeIO;
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.spyOn(console, "error").mockImplementation(() => {});
+
+    await withTty(true, true, async () => {
+      await expect(runAgentCommand(context, io, "claude", { quiet: false, verbose: false })).rejects.toThrow(
+        "require exact approval before startup",
+      );
+    });
+
+    expect(recoverySeams.scanCalls).toBe(0);
   });
 
   test("init ensures the project (reaches the typed handler); unknown flags reject first", async () => {

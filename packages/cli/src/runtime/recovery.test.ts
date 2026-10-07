@@ -241,6 +241,24 @@ describe("bounded offline recovery inventory", () => {
     expect(output).not.toContain("\nFAKE PROMPT");
   });
 
+  // Review F5: `formatRecoveryInventory` and `recoveryInventoryJson` sanitize
+  // agent-supplied names with `sanitizeAgentText` (resume-selection.ts), not
+  // the plainer `sanitizeForTerminal` — so a bidi override and a zero-width
+  // space (neither of which is a C0/C1 control or an ANSI sequence) are
+  // stripped too, in both the table Runfree prints and the JSON it emits.
+  test("strips a bidi override and a zero-width space from an agent-supplied conversation name", () => {
+    claudeEvidence({ name: "safe‮name​here" });
+
+    const inventory = scanRecoveryInventory({ env });
+    const textOutput = formatRecoveryInventory(inventory);
+    const jsonOutput = JSON.parse(recoveryInventoryJson(inventory)) as { items: Array<{ conversationName?: string }> };
+
+    expect(textOutput).toContain("safenamehere");
+    expect(textOutput).not.toContain("‮");
+    expect(textOutput).not.toContain("​");
+    expect(jsonOutput.items[0]?.conversationName).toBe("safenamehere");
+  });
+
   test("invalid project mappings are listable but never actionable", () => {
     hostEvidence();
     fs.writeFileSync(

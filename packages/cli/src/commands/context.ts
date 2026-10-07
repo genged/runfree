@@ -19,6 +19,7 @@ import {
 import { readActiveEffectiveControl } from "../control/effective.ts";
 import { runtimeEnvironment } from "../runtime/env.ts";
 import type { RuntimeContext } from "../runtime/types.ts";
+import type { PromptApi } from "./resume-prompt.ts";
 
 export type RunfreeCommandContext = {
   env: NodeJS.ProcessEnv;
@@ -34,6 +35,10 @@ export type RunfreeCommandContext = {
   adminContext(): AdminContext;
   sourceAdminContext(): AdminContext;
   runtimeContext(): RuntimeContext;
+  // Test seam only: `createCommandContext` never sets this, so production
+  // always falls through to the real `@clack/prompts` API. Lets a test spy on
+  // `runfree resume`'s prompts without mocking the `@clack/prompts` module.
+  promptApi?: PromptApi;
 };
 
 export function createCommandContext(input: {
