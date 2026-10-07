@@ -448,6 +448,40 @@ describe("resume through session admission", () => {
     expect(fs.existsSync(path.join(stateDir, "sessions", "recovery-claims"))).toBe(false);
   });
 
+  test("refuses a Codex C1 match whose thread moved outside the window but stays in an adjacent visited day directory (F2: presence re-check must filter by window, not id alone)", async () => {
+    const codexUuid = "01a0692c-7f74-7750-ad42-fb36200a005e";
+    hostEvidence("rf-20260731-cdxwindow", {
+      command: "codex",
+      recordVersion: 2,
+      outcome: "interrupted",
+      startedAt: "2026-07-31T00:00:00.000Z",
+      endedAt: "2026-07-31T00:10:00.000Z",
+    });
+    // Re-stamped: the file still carries the matched uuid, but its
+    // `session_meta.timestamp` is now the day *before* the window, and it is
+    // physically filed under that day's own directory. `scanCodexThreads`
+    // still visits that day (its coverage widens forward past the window's
+    // own day), so a check that matches by id alone would wrongly call this
+    // "still present"; the window boundary itself must reject it.
+    codexRollout("2026/07/30", codexUuid, "2026-07-30T23:50:00.000Z");
+    const hostItem = firstItem();
+    const matchItem: RecoveryItem = {
+      ...hostItem,
+      id: `rfr-${"c".repeat(24)}`,
+      conversationId: codexUuid,
+      conversationSource: "codex-match",
+      codexMatchOf: hostItem.id,
+      codexMatchTabs: 1,
+    };
+    const context = runtimeContext();
+
+    await expect(resumeInterruptedSessionThroughAdmission({ preparedRuntime: preparedRuntime(context), io, item: matchItem }))
+      .rejects.toThrow("the Codex conversation match changed");
+    expect(mocks.createDriver).not.toHaveBeenCalled();
+    expect(mocks.launchBuiltin).not.toHaveBeenCalled();
+    expect(fs.existsSync(path.join(stateDir, "sessions", "recovery-claims"))).toBe(false);
+  });
+
   test("resumes a Codex C1 match whose thread is still present (sanity: the presence re-check only refuses a changed match)", async () => {
     const codexUuid = "01a0692c-7f74-7750-ad42-fb36200a005e";
     hostEvidence("rf-20260731-cdxmatch2", {

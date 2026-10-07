@@ -121,6 +121,18 @@ function fakeUuid(n: number): string {
   return `00000000-0000-7000-8000-${n.toString(16).padStart(12, "0")}`;
 }
 
+/** The `n`th UTC calendar day after 2026-01-01, as both a `codexRollout` path and an ISO-timestamp builder for a given `HH:MM`, so a test can build many non-overlapping single-day windows without hand-computing month/day rollovers. */
+function dayAt(n: number): { path: string; iso: (hm: string) => string } {
+  const d = new Date(Date.UTC(2026, 0, 1) + n * 24 * 60 * 60 * 1000);
+  const year = String(d.getUTCFullYear());
+  const month = String(d.getUTCMonth() + 1).padStart(2, "0");
+  const day = String(d.getUTCDate()).padStart(2, "0");
+  return {
+    path: `${year}/${month}/${day}`,
+    iso: (hm: string) => `${year}-${month}-${day}T${hm}:00.000Z`,
+  };
+}
+
 function runtimeContext(): RuntimeContext {
   const policyPath = path.join(projectRoot, ".runfree", "network-policy.json");
   fs.mkdirSync(path.dirname(policyPath), { recursive: true });
@@ -2084,6 +2096,118 @@ describe("Codex C1 time-match rows (scanRecoveryInventory)", () => {
     expect(new Set(matches.map((item) => item.codexMatchOf)).size).toBe(2);
   });
 
+  test("a thread also inside a *second* record's window still counts toward tabs even when that second record's own scan is incomplete (round-1 finding 1a)", () => {
+    // A: a narrow window; its own scan completes normally and gets a row.
+    hostEvidence("rf-20260731-cdxaaa", {
+      command: "codex",
+      recordVersion: 2,
+      outcome: "interrupted",
+      startedAt: "2026-07-31T00:00:00.000Z",
+      endedAt: "2026-07-31T00:10:00.000Z",
+    });
+    // B: the same thread's timestamp also falls inside B's own window, but
+    // B's window is deliberately so wide (70+ days) that `candidateDayStarts`
+    // hits its own `maxDateDirs` cap and reports `complete: false` for B's
+    // call — cheaply, with no filesystem cost, purely from the day-count
+    // arithmetic. B must still count toward the shared thread's tab total
+    // even though B itself never gets a row.
+    hostEvidence("rf-20260731-cdxbbb", {
+      command: "codex",
+      recordVersion: 2,
+      outcome: "interrupted",
+      startedAt: "2026-05-22T00:00:00.000Z",
+      endedAt: "2026-07-31T00:10:00.000Z",
+    });
+    codexRollout("2026/07/31", CODEX_UUID, "2026-07-31T00:05:00.000Z");
+
+    const inventory = scanRecoveryInventory({ env, projectRoot, includeCodexMatches: true });
+    const matches = inventory.items.filter((item) => item.conversationSource === "codex-match");
+    const hostA = inventory.items.find((item) => item.sourceId === "rf-20260731-cdxaaa" && item.conversationSource !== "codex-match");
+    const hostB = inventory.items.find((item) => item.sourceId === "rf-20260731-cdxbbb" && item.conversationSource !== "codex-match");
+
+    // Only A gets a row (B's own scan never completed), but it is correctly
+    // marked ambiguous: the same thread also sits inside B's window.
+    expect(matches).toHaveLength(1);
+    expect(matches[0]?.codexMatchOf).toBe(hostA?.id);
+    expect(matches[0]?.codexMatchTabs).toBe(2);
+    expect(matches.some((item) => item.codexMatchOf === hostB?.id)).toBe(false);
+  });
+
+  test("an active record's window overlapping a guessed thread marks it ambiguous even though the active record never gets a row (round-1 finding 1b)", () => {
+    // D: dead, narrow window; gets the row.
+    hostEvidence("rf-20260731-cdxddd", {
+      command: "codex",
+      recordVersion: 2,
+      outcome: "interrupted",
+      startedAt: "2026-07-31T00:00:00.000Z",
+      endedAt: "2026-07-31T00:10:00.000Z",
+    });
+    // L: a live (active) Codex record whose own lease window also covers
+    // the same thread's timestamp. No `endedAt` yet (still running), so its
+    // window end comes from the lifecycle record's `leaseExpiresAt`.
+    hostEvidence("rf-20260731-cdxlll", {
+      command: "codex",
+      recordVersion: 2,
+      startedAt: "2026-07-31T00:00:00.000Z",
+    });
+    const recordsRoot = path.join(stateDir, "runtime", "v2", "session-containers");
+    fs.mkdirSync(recordsRoot, { recursive: true });
+    const liveRecord = sessionRecord({
+      sessionId: "rf-20260731-cdxlll",
+      command: "codex",
+      launchPath: "/usr/local/bin/codex",
+      leaseExpiresAt: "2026-07-31T00:20:00.000Z",
+    });
+    fs.writeFileSync(path.join(recordsRoot, `${liveRecord.sessionId}.json`), `${JSON.stringify(liveRecord)}\n`);
+    codexRollout("2026/07/31", CODEX_UUID, "2026-07-31T00:05:00.000Z");
+
+    const inventory = scanRecoveryInventory({ env, projectRoot, includeCodexMatches: true });
+    const matches = inventory.items.filter((item) => item.conversationSource === "codex-match");
+    const hostD = inventory.items.find((item) => item.sourceId === "rf-20260731-cdxddd" && item.conversationSource !== "codex-match");
+    const hostL = inventory.items.find((item) => item.sourceId === "rf-20260731-cdxlll" && item.conversationSource !== "codex-match");
+    expect(hostL?.ownerState).toBe("active");
+
+    expect(matches).toHaveLength(1);
+    expect(matches[0]?.codexMatchOf).toBe(hostD?.id);
+    expect(matches[0]?.codexMatchTabs).toBe(2);
+  });
+
+  test("a host item that already has an exact conversationId (e.g. resume-lineage) never gets a guessed row, but still counts toward another row's tabs (minor: skip exact-id items)", () => {
+    // E: dead, narrow window, no exact id of its own; gets the guessed row.
+    hostEvidence("rf-20260731-cdxeee", {
+      command: "codex",
+      recordVersion: 2,
+      outcome: "interrupted",
+      startedAt: "2026-07-31T00:00:00.000Z",
+      endedAt: "2026-07-31T00:10:00.000Z",
+    });
+    // X: already names its own exact conversation (resume-lineage) and also
+    // overlaps the same thread's timestamp. It must never get a *second*,
+    // guessed row for a thread it did not itself claim.
+    const exactConversationId = "99999999-8888-4333-8444-555555555555";
+    hostEvidence("rf-20260731-cdxxxx", {
+      command: "codex",
+      recordVersion: 2,
+      outcome: "interrupted",
+      startedAt: "2026-07-31T00:00:00.000Z",
+      endedAt: "2026-07-31T00:30:00.000Z",
+      resumeConversationId: exactConversationId,
+    });
+    codexRollout("2026/07/31", CODEX_UUID, "2026-07-31T00:05:00.000Z");
+
+    const inventory = scanRecoveryInventory({ env, projectRoot, includeCodexMatches: true });
+    const matches = inventory.items.filter((item) => item.conversationSource === "codex-match");
+    const hostE = inventory.items.find((item) => item.sourceId === "rf-20260731-cdxeee" && item.conversationSource !== "codex-match");
+    const hostX = inventory.items.find((item) => item.sourceId === "rf-20260731-cdxxxx");
+    expect(hostX?.conversationId).toBe(exactConversationId);
+
+    expect(matches).toHaveLength(1);
+    expect(matches[0]?.codexMatchOf).toBe(hostE?.id);
+    // X's own overlapping window still makes E's row ambiguous.
+    expect(matches[0]?.codexMatchTabs).toBe(2);
+    expect(matches.some((item) => item.codexMatchOf === hostX?.id)).toBe(false);
+  });
+
   test("the default (includeCodexMatches omitted) and --all (no projectRoot) add no Codex rows and never open codex/", () => {
     hostEvidence("rf-20260731-cdx001", {
       command: "codex",
@@ -2150,6 +2274,115 @@ describe("Codex C1 time-match rows (scanRecoveryInventory)", () => {
 
     expect(matches).toHaveLength(CODEX_MATCH_LIMITS.maxRowsTotal);
     expect(matches.some((item) => item.codexMatchOf === oldestHostRow?.id)).toBe(false);
+  });
+
+  test("the cross-scan thread merge keeps the newest startedAtMs, not the first one seen (minor: threadsById collision policy)", () => {
+    const sharedUuid = "01a0692c-7f74-7750-ad42-fb36200a005e";
+    // Processed first (newest own `startedAt`): its window physically
+    // reaches a file carrying the shared uuid, but one stamped with an
+    // *old* `session_meta.timestamp` that belongs inside neither item's own
+    // window — on its own it would never produce a row.
+    hostEvidence("rf-20260731-cdxfirst", {
+      command: "codex",
+      recordVersion: 2,
+      outcome: "interrupted",
+      startedAt: "2026-08-15T00:00:00.000Z",
+      endedAt: "2026-08-15T00:10:00.000Z",
+    });
+    codexRollout("2026/08/14", sharedUuid, "2026-01-01T00:00:00.000Z");
+    // Processed second (older own `startedAt`): its own window reaches the
+    // *same* uuid's genuinely current file, stamped inside its own window.
+    hostEvidence("rf-20260731-cdxsecond", {
+      command: "codex",
+      recordVersion: 2,
+      outcome: "interrupted",
+      startedAt: "2026-01-05T00:00:00.000Z",
+      endedAt: "2026-01-05T00:10:00.000Z",
+    });
+    codexRollout("2026/01/05", sharedUuid, "2026-01-05T00:05:00.000Z");
+
+    const inventory = scanRecoveryInventory({ env, projectRoot, includeCodexMatches: true });
+    const matches = inventory.items.filter((item) => item.conversationSource === "codex-match");
+    const hostSecond = inventory.items.find(
+      (item) => item.sourceId === "rf-20260731-cdxsecond" && item.conversationSource !== "codex-match",
+    );
+
+    // Keeping the first-seen (older, out-of-window) value would leave this
+    // thread matching no window at all, so the row would be missing.
+    expect(matches).toHaveLength(1);
+    expect(matches[0]?.conversationId).toBe(sharedUuid);
+    expect(matches[0]?.codexMatchOf).toBe(hostSecond?.id);
+  });
+
+  test("ten stale records whose windows all reach the same day share one pass: that day directory is opened only once (round-1 finding 4)", () => {
+    for (let i = 0; i < 10; i += 1) {
+      hostEvidence(`rf-20260731-cdxp${String(i).padStart(2, "0")}`, {
+        command: "codex",
+        recordVersion: 2,
+        outcome: "interrupted",
+        startedAt: "2026-07-31T00:00:00.000Z",
+        endedAt: "2026-07-31T00:10:00.000Z",
+      });
+    }
+    codexRollout("2026/07/31", CODEX_UUID, "2026-07-31T00:05:00.000Z");
+    const opendirSpy = vi.spyOn(fs, "opendirSync");
+
+    const inventory = scanRecoveryInventory({ env, projectRoot, includeCodexMatches: true });
+
+    const dayDir = path.join(stateDir, "codex", "sessions", "2026", "07", "31");
+    expect(opendirSpy.mock.calls.filter((call) => call[0] === dayDir)).toHaveLength(1);
+    const matches = inventory.items.filter((item) => item.conversationSource === "codex-match");
+    expect(matches).toHaveLength(10);
+    expect(matches.every((item) => item.codexMatchTabs === 10)).toBe(true);
+    opendirSpy.mockRestore();
+  });
+
+  test("a pass whose deadline is exceeded partway through still returns promptly, giving no rows to the records not yet reached (round-1 finding 4)", () => {
+    const TOTAL = 20;
+    for (let i = 0; i < TOTAL; i += 1) {
+      const day = dayAt(i);
+      hostEvidence(`rf-20260731-cdxq${String(i).padStart(2, "0")}`, {
+        command: "codex",
+        recordVersion: 2,
+        outcome: "interrupted",
+        startedAt: day.iso("00:00"),
+        endedAt: day.iso("00:10"),
+      });
+      codexRollout(day.path, fakeUuid(i), day.iso("00:05"));
+    }
+
+    // A deterministic virtual clock that advances a fixed, small amount on
+    // *every* `Date.now()` read anywhere in the scan (never frozen, never
+    // jumped). This is the discriminating shape: a deadline recomputed
+    // fresh per record (today's un-shared behavior) always gets a full,
+    // renewed budget relative to wherever the clock currently is, so it
+    // would never trip no matter how many records came before it — only a
+    // *single* deadline fixed once, at the start of the whole pass, is
+    // eventually overtaken by a clock that keeps advancing underneath it.
+    let calls = 0;
+    const base = Date.now();
+    const dateNowSpy = vi.spyOn(Date, "now").mockImplementation(() => {
+      calls += 1;
+      return base + calls * 50;
+    });
+
+    try {
+      const inventory = scanRecoveryInventory({ env, projectRoot, includeCodexMatches: true });
+      const matches = inventory.items.filter((item) => item.conversationSource === "codex-match");
+
+      // Some records were read before the shared deadline hit...
+      expect(matches.length).toBeGreaterThan(0);
+      // ...but not every one of them — the whole point of a *shared*
+      // deadline is that it is not re-armed per record.
+      expect(matches.length).toBeLessThan(TOTAL);
+      // Every host row is present regardless of whether it got a guess.
+      for (let i = 0; i < TOTAL; i += 1) {
+        const id = `rf-20260731-cdxq${String(i).padStart(2, "0")}`;
+        expect(inventory.items.some((item) => item.sourceId === id && item.conversationSource !== "codex-match")).toBe(true);
+      }
+    } finally {
+      dateNowSpy.mockRestore();
+    }
   });
 
   test("a Codex scan error leaves no Codex rows but keeps the host row", () => {

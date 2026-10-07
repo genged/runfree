@@ -1,4 +1,4 @@
-import { codexWindowForItem, scanCodexThreads } from "./codex-rollouts.ts";
+import { codexWindowForItem, matchCodexThreads, scanCodexThreads } from "./codex-rollouts.ts";
 import { composeProjectName } from "./env.ts";
 import { createRuntimeDocker } from "./docker.ts";
 import {
@@ -155,10 +155,20 @@ function validateResumeTarget(
   // that the thread is still present in the window — it is not, and cannot
   // be, proof that no other container is concurrently writing to it
   // (security review F8).
+  //
+  // `scan.threads` alone is not enough: `scanCodexThreads` returns every
+  // valid thread in the *day directories* that overlap the window (widened
+  // for time-zone skew), not only threads whose own timestamp falls inside
+  // it — a thread re-stamped to an adjacent day can still carry the matched
+  // id while actually sitting outside the window. `matchCodexThreads` is the
+  // one place that applies the actual window-boundary predicate, so it is
+  // reused here rather than a second, possibly diverging id-only check
+  // (review F2).
   if (item.conversationSource === "codex-match") {
     const window = codexWindowForItem(item, live.sessionContainers?.records ?? []);
     const scan = window ? scanCodexThreads({ stateDir: item.stateDir, windows: [window] }) : undefined;
-    const stillPresent = scan?.threads.some((thread) => thread.id === item.conversationId) ?? false;
+    const matches = scan && window ? matchCodexThreads([{ itemId: item.id, window }], scan.threads) : [];
+    const stillPresent = matches.some((match) => match.thread.id === item.conversationId);
     if (!stillPresent) {
       throw new Error(`recovery item ${item.id} is no longer valid: the Codex conversation match changed`);
     }

@@ -13,6 +13,7 @@ import { formatTerminalTable } from "../terminal-table.ts";
 import {
   CODEX_MATCH_LIMITS,
   codexWindowForItem,
+  createCodexScanPass,
   matchCodexThreads,
   scanCodexThreads,
   type CodexMatch,
@@ -149,9 +150,10 @@ export type RecoveryItem = {
   // picker only", decision 4). `codexMatchOf` names the host item this row
   // was derived from (same evidence path and fingerprint — resuming it
   // consumes the host record, never a Codex file of its own); `codexMatchTabs`
-  // is how many *other* eligible host records' windows the same thread also
-  // fell into ("matches N tabs" when > 1 — an ambiguous match, never guessed
-  // down to one owner). Never set on anything but a `conversationSource:
+  // is the *total* number of eligible Codex records — including this row's
+  // own `codexMatchOf` record — whose window the same thread falls into
+  // ("matches N tabs" when > 1 — an ambiguous match, never guessed down to
+  // one owner). Never set on anything but a `conversationSource:
   // "codex-match"` row.
   codexMatchOf?: string;
   codexMatchTabs?: number;
@@ -1124,21 +1126,38 @@ function joinHostItemsBySameConversation(items: readonly RecoveryItem[]): Recove
 
 /**
  * Codex C1 time-match rows for one project (spec section 2, "Codex: time
- * match (C1), picker only"; decision 4; controller ruling on the task 8
- * review). Only ever called for the one `projectRoot`-scoped project with
- * `includeCodexMatches: true` — `runfree sessions`, `--list`, `--json`, and
- * `--all` never reach this and never open `codex/` (review F5).
+ * match (C1), picker only"; decision 4; controller rulings on the task 8 and
+ * task 9 round-1 reviews). Only ever called for the one `projectRoot`-scoped
+ * project with `includeCodexMatches: true` — `runfree sessions`, `--list`,
+ * `--json`, and `--all` never reach this and never open `codex/` (review
+ * F5).
  *
- * `scanCodexThreads` is called once per *eligible* host item's own window,
- * newest `startedAt` first, never once over every window: the shared
- * `maxDateDirs` cap on one call would otherwise starve every later record's
- * rows. An incomplete scan (budget or deadline exhausted) gives *that
- * record* no rows — its `CodexMatchInput` is dropped — but the threads an
- * earlier, complete scan already found remain eligible for every other
- * item's window (the failure is scoped to the one record, not global).
- * `matchCodexThreads` then compares the union of every thread found against
- * every eligible item's own window, so "matches N tabs" is correct even
- * though each scan only opened one item's window at a time.
+ * Every Codex v2 host record's window counts toward ambiguity
+ * ("`codexMatchTabs`", the total number of eligible records — including
+ * this one — whose window the thread falls into), whether or not that
+ * record itself gets a row: an `ownerState: "active"` record is still
+ * running and so never gets a *guessed* row of its own, and a record that
+ * already names its own exact `conversationId` (round-1 finding 1, minor)
+ * needs no guess either — but a thread that also falls inside either kind
+ * of record's window is still a real ambiguity the picker must show, not
+ * something a guessed row may silently ignore.
+ *
+ * `scanCodexThreads` is called once per *row-eligible* record's own window
+ * (active and already-exact records are never scanned — their window alone
+ * is enough), newest `startedAt` first, sharing one `CodexScanPass` across
+ * every call in this pass (round-1 finding 4): one deadline and one pair of
+ * byte/file budgets for the whole project, not one each per record, and
+ * every day directory is read at most once no matter how many records'
+ * windows reach it. An incomplete scan (that record's own share of the pass
+ * ran out of budget or the shared deadline) gives *that record* no row —
+ * it is dropped from the row-eligible set — but the threads it or an
+ * earlier record's scan already found remain eligible for every other
+ * record's window (the failure is scoped to the one record's row, not
+ * global, and not to the ambiguity count: its `CodexMatchInput` is still
+ * pushed). `matchCodexThreads` then compares the union of every thread
+ * found against every record's own window — eligible or not, complete or
+ * not — so "matches N tabs" is correct even though each scan only opened
+ * one record's window at a time.
  *
  * Any failure anywhere in this — a thrown error, a missing or unreadable
  * lifecycle registry, anything — gives no Codex rows at all and never
@@ -1152,30 +1171,47 @@ function codexMatchItemsForProject(
   hostItems: readonly RecoveryItem[],
 ): RecoveryItem[] {
   try {
-    const eligible = hostItems
-      .filter((item) => item.agent === "codex" && item.recordVersion === 2 && item.ownerState !== "active")
+    // Every Codex v2 host record, newest `startedAt` first: active and
+    // already-exact records are kept here so their windows still count
+    // toward ambiguity, even though neither is ever scanned or rowed below.
+    const codexItems = hostItems
+      .filter((item) => item.agent === "codex" && item.recordVersion === 2)
       .sort((left, right) => Date.parse(right.startedAt ?? "") - Date.parse(left.startedAt ?? ""));
-    if (eligible.length === 0 || !mapping.projectRoot) return [];
+    if (codexItems.length === 0 || !mapping.projectRoot) return [];
 
     const lifecycleRecords = peekSessionContainerRecordsV2(stateDir, {
       projectId,
       composeProject: composeProjectName(mapping.projectRoot),
     }).records;
 
+    const pass = createCodexScanPass();
     const matchInputs: CodexMatchInput[] = [];
+    const rowEligibleIds = new Set<string>();
     const threadsById = new Map<string, CodexThread>();
-    for (const item of eligible) {
+    for (const item of codexItems) {
       const window = codexWindowForItem(item, lifecycleRecords);
       if (!window) continue;
-      const scan = scanCodexThreads({ stateDir, windows: [window] });
-      if (!scan.complete) continue; // this record only (see doc comment above)
+      // Counts toward ambiguity regardless of row-eligibility (round-1
+      // finding 1): pushed unconditionally once a window exists.
       matchInputs.push({ itemId: item.id, window });
+      // Still running, or already naming its own exact conversation: never
+      // a *guessed* row, and never worth a scan of its own either — any
+      // thread in its window is discovered by some other record's scan
+      // when one reaches the same day.
+      if (item.ownerState === "active" || item.conversationId !== undefined) continue;
+      const scan = scanCodexThreads({ stateDir, windows: [window], pass });
+      if (scan.complete) rowEligibleIds.add(item.id);
       for (const thread of scan.threads) {
-        if (!threadsById.has(thread.id)) threadsById.set(thread.id, thread);
+        const existing = threadsById.get(thread.id);
+        // Newest `startedAtMs` wins on a cross-scan collision (minor), the
+        // same policy the in-scan dedupe already uses.
+        if (!existing || thread.startedAtMs > existing.startedAtMs) threadsById.set(thread.id, thread);
       }
     }
 
-    const matches = matchCodexThreads(matchInputs, Array.from(threadsById.values()));
+    const matches = matchCodexThreads(matchInputs, Array.from(threadsById.values()))
+      .filter((match) => rowEligibleIds.has(match.itemId));
+    const eligible = codexItems.filter((item) => rowEligibleIds.has(item.id));
     return codexMatchRows(projectId, eligible, matches);
   } catch {
     return [];

@@ -8,6 +8,7 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import {
   CODEX_ROLLOUT_LIMITS,
   codexWindowForItem,
+  createCodexScanPass,
   matchCodexThreads,
   scanCodexThreads,
   setCodexRolloutAfterOpenHookForTest,
@@ -322,25 +323,32 @@ describe("scanCodexThreads", () => {
   // captured before opening" — without ever reaching the realpath or
   // dev/ino comparisons. These two swap only the already-opened *file*, so
   // the day directory itself still passes that first check and the swap is
-  // caught only by the deeper checks: a symlink into another directory is
-  // caught by the realpath comparison, and an in-place replacement is caught
-  // by the dev/ino comparison (review F8; both verified by hand, temporarily
-  // deleting the `entryResolvesInsideDirectory` call from `scanDayDirectory`
-  // and confirming each case then returns the decoy's/original's thread
-  // instead of `[]`, before restoring it).
-  test("a rollout file swapped for a symlink into a decoy directory after open is rejected by the realpath check (F8)", () => {
+  // caught only by the deeper checks: the first moves the *original* file
+  // (same inode) into a decoy directory and symlinks the original path back
+  // to it, so dev/ino matches and only the realpath comparison catches the
+  // wrong directory; the second keeps the original path and directory but
+  // replaces the file's content, so realpath matches and only the dev/ino
+  // comparison catches the wrong inode. Verified by hand (review F8,
+  // round 2): temporarily short-circuiting *only* the realpath comparison
+  // inside `entryResolvesInsideDirectory` turned exactly the first test red
+  // (the second stayed green); restoring that and short-circuiting *only*
+  // the dev/ino comparison turned exactly the second test red (the first
+  // stayed green); then both were restored. See the task report for the RED
+  // output of each run.
+  test("a rollout file moved into a decoy directory and symlinked back is rejected by the realpath check even though dev/ino still matches (F8)", () => {
     const filePath = rollout("2026/10/04", VALID_UUID_1, { id: VALID_UUID_1, timestamp: "2026-10-04T12:00:00.000Z" });
     const decoyDir = path.join(stateDir, "decoy");
     fs.mkdirSync(decoyDir, { recursive: true });
     const decoyPath = path.join(decoyDir, path.basename(filePath));
-    const decoyLine = JSON.stringify({
-      type: "session_meta",
-      payload: { id: VALID_UUID_1, timestamp: "2026-10-04T12:00:00.000Z" },
-    });
-    fs.writeFileSync(decoyPath, `${decoyLine}\n`);
 
     setCodexRolloutAfterOpenHookForTest(() => {
-      fs.unlinkSync(filePath);
+      // Move the *original* opened file (same inode, same already-pinned fd)
+      // into the decoy directory, then symlink the original path back to it.
+      // `fs.statSync` on the resolved target therefore reports the exact
+      // dev/ino `openRegular` captured — a dev/ino-only check would wrongly
+      // accept this. Only the realpath comparison (resolved file's directory
+      // no longer equals the day directory) can catch it.
+      fs.renameSync(filePath, decoyPath);
       fs.symlinkSync(decoyPath, filePath);
     });
 
@@ -492,5 +500,96 @@ describe("codexWindowForItem", () => {
     const records = [minimalSessionContainerRecord({ sessionId: "a different session" })];
 
     expect(codexWindowForItem(item, records)).toBeUndefined();
+  });
+});
+
+describe("CodexScanPass (shared across calls, round-1 finding 4)", () => {
+  test("two calls that need the same day, sharing one pass, open that day's directory only once", () => {
+    const startedAt = "2026-10-04T12:00:00.000Z";
+    rollout("2026/10/04", VALID_UUID_1, { id: VALID_UUID_1, timestamp: startedAt });
+    const pass = createCodexScanPass();
+    const opendirSpy = vi.spyOn(fs, "opendirSync");
+
+    const first = scanCodexThreads({ stateDir, windows: windowAround(startedAt), pass });
+    const second = scanCodexThreads({ stateDir, windows: windowAround(startedAt), pass });
+
+    expect(first.threads.map((thread) => thread.id)).toEqual([VALID_UUID_1]);
+    // The second call's thread comes from the pass's day cache, not a
+    // second directory read.
+    expect(second.threads.map((thread) => thread.id)).toEqual([VALID_UUID_1]);
+    const dayDir = path.join(stateDir, "codex", "sessions", "2026", "10", "04");
+    const dayOpens = opendirSpy.mock.calls.filter((call) => call[0] === dayDir);
+    expect(dayOpens).toHaveLength(1);
+    opendirSpy.mockRestore();
+  });
+
+  test("ten calls over ten different (but neighbor-overlapping) days, sharing one pass, open each physical day directory only once", () => {
+    for (let i = 0; i < 10; i += 1) {
+      rollout(`2026/10/${String(4 + i).padStart(2, "0")}`, fakeUuid(i), { id: fakeUuid(i), timestamp: `2026-10-${String(4 + i).padStart(2, "0")}T12:00:00.000Z` });
+    }
+    const pass = createCodexScanPass();
+    const opendirSpy = vi.spyOn(fs, "opendirSync");
+
+    const foundIds = new Set<string>();
+    for (let i = 0; i < 10; i += 1) {
+      const startedAt = `2026-10-${String(4 + i).padStart(2, "0")}T12:00:00.000Z`;
+      // Two calls per record (as `codexMatchItemsForProject` would make for
+      // ten overlapping-window records) to prove repeats are free, not just
+      // one each. Consecutive records' widened day coverage overlaps (the
+      // point of this test), so a single call's own result can legitimately
+      // include a neighbor's thread too — only the aggregate ("every thread
+      // was found at least once" and "every day opened at most once") is
+      // asserted, not each call's exact content.
+      scanCodexThreads({ stateDir, windows: windowAround(startedAt), pass });
+      const scan = scanCodexThreads({ stateDir, windows: windowAround(startedAt), pass });
+      for (const thread of scan.threads) foundIds.add(thread.id);
+    }
+
+    for (let i = 0; i < 10; i += 1) expect(foundIds.has(fakeUuid(i))).toBe(true);
+    const opensByDay = new Map<string, number>();
+    for (const call of opendirSpy.mock.calls) {
+      const key = String(call[0]);
+      opensByDay.set(key, (opensByDay.get(key) ?? 0) + 1);
+    }
+    for (const [day, count] of opensByDay) expect(count, `opendirSync count for ${day}`).toBe(1);
+    opendirSpy.mockRestore();
+  });
+
+  test("a pass whose deadline has already passed returns complete: false immediately and opens nothing", () => {
+    rollout("2026/10/04", VALID_UUID_1, { id: VALID_UUID_1, timestamp: "2026-10-04T12:00:00.000Z" });
+    const pass = createCodexScanPass();
+    // Simulate the deadline already having elapsed by the time this call's
+    // turn in the pass comes up (an earlier record's scan used up the
+    // pass's whole budget).
+    (pass as { deadlineAt: number }).deadlineAt = Date.now() - 1;
+    const opendirSpy = vi.spyOn(fs, "opendirSync");
+
+    const scan = scanCodexThreads({ stateDir, windows: windowAround("2026-10-04T12:00:00.000Z"), pass });
+
+    expect(scan).toEqual({ threads: [], complete: false });
+    expect(opendirSpy).not.toHaveBeenCalled();
+    opendirSpy.mockRestore();
+  });
+
+  test("a pass whose file budget is already exhausted truncates the next call immediately, without reading its file", () => {
+    rollout("2026/10/04", VALID_UUID_1, { id: VALID_UUID_1, timestamp: "2026-10-04T12:00:00.000Z" });
+    const pass = createCodexScanPass();
+    pass.fileBudget.attempted = CODEX_ROLLOUT_LIMITS.maxFilesTotal;
+    const openSpy = vi.spyOn(fs, "openSync");
+
+    const scan = scanCodexThreads({ stateDir, windows: windowAround("2026-10-04T12:00:00.000Z"), pass });
+
+    expect(scan).toEqual({ threads: [], complete: false });
+    expect(openSpy).not.toHaveBeenCalled();
+    openSpy.mockRestore();
+  });
+
+  test("without a pass, a call still gets its own fresh deadline and budgets (today's single-call behavior)", () => {
+    const startedAt = "2026-10-04T12:00:00.000Z";
+    rollout("2026/10/04", VALID_UUID_1, { id: VALID_UUID_1, timestamp: startedAt });
+
+    const scan = scanCodexThreads({ stateDir, windows: windowAround(startedAt) });
+
+    expect(scan).toEqual({ threads: [{ id: VALID_UUID_1, startedAtMs: Date.parse(startedAt) }], complete: true });
   });
 });

@@ -50,6 +50,36 @@ export const CODEX_MATCH_LIMITS = {
   maxRowsTotal: 50,
 } as const;
 
+/**
+ * Shared state across every `scanCodexThreads` call that makes up one
+ * Codex-match pass over several host records (`codexMatchItemsForProject`,
+ * `recovery.ts`): one deadline and one pair of byte/file budgets for the
+ * *whole* pass, not one each per call, so N stale records cannot stall a
+ * resume for about N × `deadlineMs` (security review, task 9 round-1 finding
+ * 4). `days` caches each UTC day-start already read during this pass —
+ * `readonly CodexThread[]` for a day that was read to completion (possibly
+ * empty), or `"incomplete"` for one a budget or the deadline cut off midway
+ * — so two records whose windows overlap the same day never pay to open it
+ * twice. Construct with `createCodexScanPass`; a caller that does not pass
+ * one gets today's single-call behavior (its own fresh deadline and
+ * budgets, scoped to that one call).
+ */
+export type CodexScanPass = {
+  readonly deadlineAt: number;
+  readonly byteBudget: { bytes: number };
+  readonly fileBudget: { attempted: number };
+  readonly days: Map<string, readonly CodexThread[] | "incomplete">;
+};
+
+export function createCodexScanPass(): CodexScanPass {
+  return {
+    deadlineAt: Date.now() + CODEX_ROLLOUT_LIMITS.deadlineMs,
+    byteBudget: { bytes: 0 },
+    fileBudget: { attempted: 0 },
+    days: new Map(),
+  };
+}
+
 const DATE_PART = { year: /^\d{4}$/, month: /^\d{2}$/, day: /^\d{2}$/ };
 const ROLLOUT_RE =
   /^rollout-[0-9T:-]+-([0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.jsonl$/;
@@ -297,13 +327,16 @@ function scanDayDirectory(
   return "ok";
 }
 
-function scanCodexThreadsUnsafe(input: Readonly<{ stateDir: string; windows: readonly CodexWindow[] }>): CodexScan {
+function scanCodexThreadsUnsafe(
+  input: Readonly<{ stateDir: string; windows: readonly CodexWindow[]; pass?: CodexScanPass }>,
+): CodexScan {
   if (input.windows.length === 0) return { threads: [], complete: true };
 
-  const deadlineAt = Date.now() + CODEX_ROLLOUT_LIMITS.deadlineMs;
+  const pass = input.pass ?? createCodexScanPass();
+  const deadlineAt = pass.deadlineAt;
   const codexRoot = path.join(input.stateDir, "codex");
-  const byteBudget = { bytes: 0 };
-  const fileBudget = { attempted: 0 };
+  const byteBudget = pass.byteBudget;
+  const fileBudget = pass.fileBudget;
   const candidates: RolloutCandidate[] = [];
   let complete = true;
 
@@ -315,17 +348,42 @@ function scanCodexThreadsUnsafe(input: Readonly<{ stateDir: string; windows: rea
       complete = false;
       break;
     }
+
+    // Shared across every call in one pass: a day already read (by this
+    // call's own earlier window, or by an earlier record's call) is never
+    // opened a second time (security review, task 9 round-1 finding 4).
+    const dayKey = String(dayStartUtc);
+    const cached = pass.days.get(dayKey);
+    if (cached === "incomplete") {
+      complete = false;
+      continue; // known-bad from an earlier call; cheap to keep checking other days
+    }
+    if (cached !== undefined) {
+      for (const thread of cached) candidates.push({ id: thread.id, startedAtMs: thread.startedAtMs, fileName: "" });
+      continue;
+    }
+
     const segments = dayDirSegments(dayStartUtc);
-    if (!segments) continue;
+    if (!segments) {
+      pass.days.set(dayKey, []);
+      continue;
+    }
     const dayDir = path.join(codexRoot, "sessions", segments.year, segments.month, segments.day);
     const dayIdentity = verifiedDirectoryIdentity(codexRoot, dayDir);
-    if (!dayIdentity) continue; // no such day, or a symlink somewhere in the chain
+    if (!dayIdentity) {
+      pass.days.set(dayKey, []); // no such day, or a symlink somewhere in the chain
+      continue;
+    }
 
-    const result = scanDayDirectory(dayDir, dayIdentity, deadlineAt, byteBudget, fileBudget, candidates);
+    const dayCandidates: RolloutCandidate[] = [];
+    const result = scanDayDirectory(dayDir, dayIdentity, deadlineAt, byteBudget, fileBudget, dayCandidates);
     if (result === "truncated") {
       complete = false;
+      pass.days.set(dayKey, "incomplete");
       break;
     }
+    pass.days.set(dayKey, dayCandidates.map((candidate) => ({ id: candidate.id, startedAtMs: candidate.startedAtMs })));
+    candidates.push(...dayCandidates);
   }
 
   if (candidates.length === 0) return { threads: [], complete };
@@ -357,8 +415,14 @@ function scanCodexThreadsUnsafe(input: Readonly<{ stateDir: string; windows: rea
  * `{ threads: [], complete: false }`, same as an exhausted budget or the
  * wall-clock deadline. An empty `windows` list does no filesystem I/O at
  * all.
+ *
+ * `pass` (optional) shares one deadline, one pair of byte/file budgets, and
+ * one per-day cache across several calls — see `CodexScanPass`. Without it,
+ * this call gets its own fresh deadline and budgets, exactly as before.
  */
-export function scanCodexThreads(input: Readonly<{ stateDir: string; windows: readonly CodexWindow[] }>): CodexScan {
+export function scanCodexThreads(
+  input: Readonly<{ stateDir: string; windows: readonly CodexWindow[]; pass?: CodexScanPass }>,
+): CodexScan {
   try {
     return scanCodexThreadsUnsafe(input);
   } catch {
