@@ -21,6 +21,7 @@ import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { projectInfo } from "../config.ts";
 import { approveNetworkCandidate, approveRuntimeIsolationControl } from "../control/approvals.ts";
 import { captureDesiredPolicyCandidate } from "../control/candidates.ts";
+import { CliError } from "../errors.ts";
 import { resumeRecoveryRuntime, shellRuntime } from "../runtime.ts";
 import { mcpAuthRuntime } from "./mcp-auth.ts";
 import { startRuntime, up } from "./startup.ts";
@@ -171,6 +172,39 @@ test("resume crosses the gate before its operational-service review", async () =
   }), item)).rejects.toThrow("require exact approval before startup");
 
   expect(printed.join("\n")).toContain("Runfree needs to review this checkout's saved approvals.");
+});
+
+// Controller ruling (fix round 1): checked before the approval gate, before
+// any runtime or Docker work — not only inside `acquireRecoveryClaim`, deep
+// in admission, after `startRuntime` had already brought Docker up. An
+// override env makes `hostBootId`/`hostProcessStart` (host-identity.ts)
+// deterministically unreadable; approvals are never set up (`mismatched()`
+// is not called), so a refusal here cannot be the approval gate's.
+test("resume refuses before the approval gate, before any Docker call, when this process's claim identity cannot be read", async () => {
+  const identityContext: RuntimeContext = {
+    ...context,
+    env: { ...context.env, RUNFREE_TEST_HOST_BOOT_ID: "not-a-boot-id", RUNFREE_TEST_HOST_PROCESS_START: "not-a-start-time" },
+  };
+  const item = { id: "rf-20260916-resume02", agent: "claude" } as unknown as RecoveryItem;
+  const refusalIo = io({
+    capture: () => { throw new Error("must not probe Docker before the identity check"); },
+    confirm: () => { throw new Error("must not confirm before the identity check"); },
+  });
+
+  let caught: unknown;
+  try {
+    await resumeRecoveryRuntime(identityContext, refusalIo, item);
+  } catch (error) {
+    caught = error;
+  }
+
+  expect(caught).toBeInstanceOf(CliError);
+  expect((caught as CliError).status).toBe(1);
+  expect((caught as CliError).message).toBe(
+    "runfree resume cannot claim this session: the host boot id or this process's start time could not be read, "
+    + "so another terminal's claim could not be excluded. No session was started.",
+  );
+  expect(printed.join("\n")).not.toContain("Runfree needs to review this checkout's saved approvals.");
 });
 
 // MCP auth resolves which server to authenticate and then hands off to the same

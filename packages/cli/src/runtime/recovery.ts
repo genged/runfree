@@ -1875,6 +1875,13 @@ export class RecoveryClaimLifecycleLockTimeoutError extends Error {
  * forever. Fail closed at write time instead (controller ruling): refuse to
  * create the claim at all. `dismissRecoveryItem` never hits this, because it
  * writes no claim.
+ *
+ * The primary gate is `assertRecoveryClaimOwnerIdentity`, called by
+ * `resumeRecoveryRuntime` (runtime.ts) before any runtime or Docker work
+ * (controller ruling, fix round 1), so this is caught with a clear,
+ * command-naming message before `startRuntime` ever runs. The throw inside
+ * `acquireRecoveryClaim` below stays as defence in depth for any other
+ * caller.
  */
 export class RecoveryClaimOwnerIdentityError extends Error {
   constructor() {
@@ -1975,8 +1982,13 @@ export async function acquireRecoveryClaim(
   // inside the hold stretched a milliseconds-scale critical section into tens
   // of milliseconds — wide enough to consume much of a concurrent selector's
   // bounded lock-acquisition window.
+  //
+  // `resumeRecoveryRuntime` (runtime.ts) already calls
+  // `assertRecoveryClaimOwnerIdentity` before any runtime/Docker work
+  // (controller ruling, fix round 1); the check below is defence in depth
+  // for every other caller of this function, not the primary gate.
+  assertRecoveryClaimOwnerIdentity(context);
   const owner = recoveryClaimOwnerIdentity(context);
-  if (!owner.bootId || !owner.processStart) throw new RecoveryClaimOwnerIdentityError();
   const lifecycle = await tryAcquireProjectLifecycleLockWithRetry(context);
   if (!lifecycle) {
     // A changed or consumed item remains the ordinary undefined result. If the
@@ -1999,6 +2011,19 @@ function recoveryClaimOwnerIdentity(context: RuntimeContext): RecoveryClaimOwner
     ...(bootId ? { bootId } : {}),
     ...(processStart ? { processStart } : {}),
   });
+}
+
+/**
+ * Throws `RecoveryClaimOwnerIdentityError` when this process's boot id or
+ * start time cannot be read, so a caller can refuse *before* any runtime or
+ * Docker work (controller ruling, fix round 1) instead of only inside
+ * `acquireRecoveryClaim`, deep in admission, after `startRuntime` already
+ * brought Docker up. Reuses `recoveryClaimOwnerIdentity` rather than
+ * duplicating its probe.
+ */
+export function assertRecoveryClaimOwnerIdentity(context: RuntimeContext): void {
+  const owner = recoveryClaimOwnerIdentity(context);
+  if (!owner.bootId || !owner.processStart) throw new RecoveryClaimOwnerIdentityError();
 }
 
 /**

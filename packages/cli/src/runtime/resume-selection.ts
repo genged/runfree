@@ -135,7 +135,12 @@ function nameOf(item: RecoveryItem): string | undefined {
   return sanitized.length > 0 ? sanitized : undefined;
 }
 
-function buildRow(item: RecoveryItem, current: CurrentTerminal, now: Date): ResumeRow {
+// Exported so `resume.ts` can build labelled rows for the `--all`/`--project`
+// picker, which uses its own, looser eligibility (controller ruling, fix
+// round 1) instead of this module's `eligible`/`selectResumeCandidates`.
+// Passing a `current` that cannot match anything (`{ids: {}}`) still keeps
+// every row's `match` "none", so the one question stays unreachable there.
+export function buildResumeRow(item: RecoveryItem, current: CurrentTerminal, now: Date): ResumeRow {
   const source = sourceOf(item);
   const match = matchOf(item, source, current);
   const ms = timestampOf(item);
@@ -186,7 +191,7 @@ export function selectResumeCandidates(input: Readonly<{
   current: CurrentTerminal;
   now: Date;
 }>): ResumeSelection {
-  const rows = input.items.filter(eligible).map((item) => buildRow(item, input.current, input.now)).sort(compareRows);
+  const rows = input.items.filter(eligible).map((item) => buildResumeRow(item, input.current, input.now)).sort(compareRows);
   if (rows.length === 0) return { kind: "none" };
 
   const strongRows = rows.filter((row) => row.match === "strong");

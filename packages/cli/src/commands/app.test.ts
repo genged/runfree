@@ -90,6 +90,39 @@ vi.mock("../runtime/recovery.ts", async (importOriginal) => {
   };
 });
 
+// `resumeRecoveryRuntime` is the only thing that starts a runtime/Docker for
+// `runfree resume`; counting real calls to it (always passed through) lets a
+// dismiss/refusal test prove no runtime ever started, not merely that the
+// test's own assertions happened to pass.
+const runtimeSeams = vi.hoisted(() => ({ resumeRecoveryRuntimeCalls: 0 }));
+
+vi.mock("../runtime.ts", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../runtime.ts")>();
+  return {
+    ...actual,
+    resumeRecoveryRuntime: (...args: Parameters<typeof actual.resumeRecoveryRuntime>) => {
+      runtimeSeams.resumeRecoveryRuntimeCalls += 1;
+      return actual.resumeRecoveryRuntime(...args);
+    },
+  };
+});
+
+// `startRuntime` is the Docker boundary inside `runConfiguredAgent`; stubbing
+// it (only where a test arms it) lets the decision-5 guard run a real launch
+// all the way to a clean, known completion without a Docker daemon.
+const startupSeams = vi.hoisted(() => ({
+  startRuntime: undefined as undefined | ((...args: unknown[]) => unknown),
+}));
+
+vi.mock("../runtime/startup.ts", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../runtime/startup.ts")>();
+  return {
+    ...actual,
+    startRuntime: (...args: Parameters<typeof actual.startRuntime>) =>
+      startupSeams.startRuntime ? startupSeams.startRuntime(...args) : actual.startRuntime(...args),
+  };
+});
+
 const PROJECT_ROOT = "/tmp/runfree-app-test-project";
 const tempDirs: string[] = [];
 
@@ -168,7 +201,12 @@ function writeClaudeRecoveryFixture(stateRoot: string, projectRoot: string, name
   );
 }
 
-function writeHostRecoveryFixture(stateRoot: string, projectRoot: string, agent: string): void {
+function writeHostRecoveryFixture(
+  stateRoot: string,
+  projectRoot: string,
+  agent: string,
+  overrides: { id?: string; recordVersion?: number } = {},
+): void {
   fs.mkdirSync(projectRoot, { recursive: true });
   const stateDir = path.join(stateRoot, "runfree", "projects", projectHash(projectRoot));
   const sessionsDir = path.join(stateDir, "sessions");
@@ -177,7 +215,7 @@ function writeHostRecoveryFixture(stateRoot: string, projectRoot: string, agent:
     path.join(stateDir, "project.json"),
     `${JSON.stringify({ projectRoot, updatedAt: "2026-08-01T00:00:00.000Z" })}\n`,
   );
-  const id = "rf-20260801-c0de01";
+  const id = overrides.id ?? "rf-20260801-c0de01";
   fs.writeFileSync(
     path.join(sessionsDir, `${id}.json`),
     `${JSON.stringify({
@@ -191,6 +229,7 @@ function writeHostRecoveryFixture(stateRoot: string, projectRoot: string, agent:
       endedAt: "2026-08-01T00:02:00.000Z",
       exitStatus: 137,
       outcome: "interrupted",
+      ...(overrides.recordVersion !== undefined ? { recordVersion: overrides.recordVersion } : {}),
     })}\n`,
   );
 }
@@ -279,6 +318,8 @@ afterEach(() => {
   vi.restoreAllMocks();
   recoverySeams.dismissResult = undefined;
   recoverySeams.scanCalls = 0;
+  runtimeSeams.resumeRecoveryRuntimeCalls = 0;
+  startupSeams.startRuntime = undefined;
   for (const dir of tempDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
 });
 
@@ -608,6 +649,33 @@ describe("runCommandApp parser", () => {
     expect(status).toBe(0);
     expect(promptApi.calls.length).toBeGreaterThan(0);
     for (const call of promptApi.calls) expect(call.message).not.toContain("Interrupted in this terminal");
+    // Spanning more than one project, each row is prefixed with its own
+    // project name.
+    expect(promptApi.calls[0]?.options[0]?.label.startsWith("current-project")).toBe(true);
+    expect(runDefault).not.toHaveBeenCalled();
+  });
+
+  test("resume --all shows an unverified, unknown-owner, version-2 row (controller ruling, fix round 1)", async () => {
+    const stateRoot = fs.mkdtempSync(path.join(os.tmpdir(), "runfree-resume-all-unverified-"));
+    tempDirs.push(stateRoot);
+    const projectRoot = path.join(stateRoot, "current-project");
+    // `hostPid: process.pid` (this very test process: genuinely alive) with
+    // no outcome and no recorded boot id/process start makes `hostOwnerState`
+    // come out "unknown", never "dead" or "active" — `selectResumeCandidates`
+    // (the current-project picker, unchanged) would hide this row entirely,
+    // but `--all`/`--project` must still offer it; the live classification in
+    // `resumeRecoveryRuntime` decides for real, under the lock.
+    writeHostRecoveryFixtureV2(stateRoot, projectRoot, { outcome: undefined, hostPid: process.pid });
+    const runDefault = vi.fn(async () => 0);
+    const promptApi = fakePromptApi(() => PROMPT_CANCEL);
+    const context = strictContext({ env: { XDG_STATE_HOME: stateRoot }, projectRoot, promptApi });
+
+    const status = await withTty(true, true, () => runCommandApp(context, ["resume", "--all"], runDefault));
+
+    expect(status).toBe(0);
+    expect(promptApi.calls).toHaveLength(1);
+    expect(promptApi.calls[0]?.options).toHaveLength(1);
+    expect(promptApi.calls[0]?.options[0]?.label.startsWith("current-project")).toBe(true);
     expect(runDefault).not.toHaveBeenCalled();
   });
 
@@ -615,7 +683,12 @@ describe("runCommandApp parser", () => {
     const stateRoot = fs.mkdtempSync(path.join(os.tmpdir(), "runfree-resume-recordver-"));
     tempDirs.push(stateRoot);
     const projectRoot = path.join(stateRoot, "current-project");
-    writeHostRecoveryFixture(stateRoot, projectRoot, "codex"); // no recordVersion: pre-this-release
+    writeHostRecoveryFixture(stateRoot, projectRoot, "codex"); // no recordVersion: pre-this-release, hidden
+    // A control differing from the hidden row above *only* in recordVersion —
+    // same agent, same times, same owner-dead outcome — isolates recordVersion
+    // as the one thing that flips visibility, rather than relying only on the
+    // Claude row below (which differs in evidenceKind, fields, and source).
+    writeHostRecoveryFixture(stateRoot, projectRoot, "codex", { id: "rf-20260801-control1", recordVersion: 2 });
     writeClaudeRecoveryFixture(stateRoot, projectRoot, "eligible conversation"); // always eligible
     const out = captureStdout();
     const runDefault = vi.fn(async () => 0);
@@ -636,8 +709,12 @@ describe("runCommandApp parser", () => {
 
     expect(status).toBe(0);
     expect(promptApi.calls).toHaveLength(1);
-    expect(promptApi.calls[0]?.options).toHaveLength(1);
-    expect(promptApi.calls[0]?.options[0]?.label).toContain("eligible conversation");
+    // Exactly two: the Claude row and the recordVersion-2 control. The
+    // version-less row never reaches the options at all.
+    const labels = (promptApi.calls[0]?.options ?? []).map((option) => option.label);
+    expect(labels).toHaveLength(2);
+    expect(labels.some((label) => label.includes("eligible conversation"))).toBe(true);
+    expect(labels.some((label) => label.includes("codex"))).toBe(true);
     expect(runDefault).not.toHaveBeenCalled();
   });
 
@@ -686,6 +763,9 @@ describe("runCommandApp parser", () => {
       expect(status).toBe(0);
       expect(out.text()).toContain("forgot the interrupted session from");
       expect(runDefault).not.toHaveBeenCalled();
+      // The dismiss branch never starts a runtime: the only function that
+      // could is `resumeRecoveryRuntime`, and it was never called.
+      expect(runtimeSeams.resumeRecoveryRuntimeCalls).toBe(0);
     });
 
     test("'claimed' refuses: another terminal is resuming this session", async () => {
@@ -697,6 +777,7 @@ describe("runCommandApp parser", () => {
 
       expect(refusal.status).toBe(1);
       expect(refusal.message).toBe("another terminal is resuming this session");
+      expect(runtimeSeams.resumeRecoveryRuntimeCalls).toBe(0);
     });
 
     test("'changed' refuses: the session record changed; run runfree resume again", async () => {
@@ -708,6 +789,7 @@ describe("runCommandApp parser", () => {
 
       expect(refusal.status).toBe(1);
       expect(refusal.message).toBe("the session record changed; run runfree resume again");
+      expect(runtimeSeams.resumeRecoveryRuntimeCalls).toBe(0);
     });
 
     test("'deferred' refuses: a runtime lifecycle change is in progress; run runfree resume again", async () => {
@@ -719,10 +801,11 @@ describe("runCommandApp parser", () => {
 
       expect(refusal.status).toBe(1);
       expect(refusal.message).toBe("a runtime lifecycle change is in progress; run runfree resume again");
+      expect(runtimeSeams.resumeRecoveryRuntimeCalls).toBe(0);
     });
   });
 
-  test("runfree claude on a TTY with a strong-match record calls no scan and no prompt (decision 5)", async () => {
+  test("runfree claude refuses before the approval gate, scanning nothing, when the checkout binding is corrupted (decision 5)", async () => {
     const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), "runfree-claude-decision5-"));
     tempDirs.push(projectRoot);
     const stateRoot = fs.mkdtempSync(path.join(os.tmpdir(), "runfree-claude-decision5-state-"));
@@ -781,6 +864,78 @@ describe("runCommandApp parser", () => {
       );
     });
 
+    expect(recoverySeams.scanCalls).toBe(0);
+  });
+
+  // Controller ruling (fix round 1): a refusal that stops the launch early
+  // proves nothing by itself — stopping early is exactly when a scan is also
+  // structurally unreachable. This test instead lets the whole launch run to
+  // a clean, known completion (approvals genuinely approved, the
+  // operational-service review genuinely allowed to enable `agent-claude`,
+  // only `startRuntime` — the Docker boundary — stubbed) and still asserts
+  // zero `scanRecoveryInventory` calls.
+  test("runfree claude never scans across a full, successful launch, with only startRuntime stubbed (decision 5)", async () => {
+    const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), "runfree-claude-decision5-full-"));
+    tempDirs.push(projectRoot);
+    const stateRoot = fs.mkdtempSync(path.join(os.tmpdir(), "runfree-claude-decision5-full-state-"));
+    tempDirs.push(stateRoot);
+    fs.mkdirSync(path.join(projectRoot, ".runfree"));
+    fs.writeFileSync(path.join(projectRoot, ".runfree", "network-policy.json"), '{"version":2,"hosts":["example.com"]}');
+    const env = {
+      XDG_STATE_HOME: stateRoot,
+      XDG_CONFIG_HOME: path.join(stateRoot, "config"),
+      RUNFREE_TEST_FAKE_DOCKER: "1",
+      RUNFREE_TEST_HOST_BOOT_ID: "linux:11111111-2222-3333-4444-555555555555",
+      RUNFREE_TEST_HOST_PROCESS_START: "linux:12345",
+    };
+    const context = {
+      projectRoot,
+      project: projectInfo(projectRoot, env),
+      runtimeRoot: path.join(projectRoot, "runtime"),
+      env,
+    } as RuntimeContext;
+    // Bait, as above: a record that would be a strong, one-question
+    // candidate if the launch ever scanned for it.
+    writeHostRecoveryFixtureV2(stateRoot, projectRoot, {
+      terminalIds: { iterm: "same-terminal" },
+      termProgram: "iTerm.app",
+      hostTty: "/dev/ttys004",
+    });
+
+    // Genuinely approved, matching this checkout (no corruption this time):
+    // the approval gate passes, so the launch continues past it.
+    const candidate = captureDesiredPolicyCandidate(projectRoot, context.project.paths.controlCandidatesDir);
+    approveNetworkCandidate(projectRoot, context.project, candidate, "network-project", "interactive");
+    approveNetworkCandidate(projectRoot, context.project, candidate, "network-local", "interactive");
+    approveRuntimeIsolationControl(projectRoot, context.project, "interactive");
+
+    // `startRuntime` is the Docker boundary; stub it to a known, clean
+    // "failed" result so `runConfiguredAgent` returns normally right after
+    // it, instead of needing a real Docker daemon.
+    startupSeams.startRuntime = vi.fn(async () => ({ kind: "failed", fastPath: false, status: 7 }));
+
+    const io = {
+      capture: () => ({ status: 1, stdout: "", stderr: "" }),
+      run: () => 0,
+      commandExists: () => true,
+      // The operational-service review finds `agent-claude` unselected by
+      // this minimal policy and asks to enable it; answering yes and
+      // stubbing the admin call lets that review complete without touching
+      // Docker or the project's real policy file.
+      confirm: () => true,
+      isInteractive: () => true,
+      admin: async () => 0,
+    } as unknown as RuntimeIO;
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.spyOn(console, "error").mockImplementation(() => {});
+
+    const status = await withTty(true, true, () =>
+      runAgentCommand(context, io, "claude", { quiet: false, verbose: false }));
+
+    // `startRuntime`'s own stubbed status, proving the real launch logic ran
+    // all the way to it rather than failing earlier for an unrelated reason.
+    expect(status).toBe(7);
+    expect(startupSeams.startRuntime).toHaveBeenCalled();
     expect(recoverySeams.scanCalls).toBe(0);
   });
 

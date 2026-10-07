@@ -14,7 +14,13 @@ import {
   type RecoveryInventory,
   type RecoveryItem,
 } from "../runtime/recovery.ts";
-import { formatResumeRow, selectResumeCandidates, type ResumeSelection } from "../runtime/resume-selection.ts";
+import {
+  buildResumeRow,
+  formatResumeRow,
+  sanitizeAgentText,
+  selectResumeCandidates,
+  type ResumeSelection,
+} from "../runtime/resume-selection.ts";
 import type { RuntimeContext } from "../runtime/types.ts";
 import { nodeRuntimeIO, resumeRecoveryRuntime } from "../runtime.ts";
 import { currentTerminal, promptResumeSelection, type PromptApi } from "./resume-prompt.ts";
@@ -98,25 +104,42 @@ function filterByAgents(inventory: RecoveryInventory, selectedAgents: Set<string
   return { ...inventory, items: inventory.items.filter((item) => selectedAgents.has(item.agent)) };
 }
 
+// Looser than `selectResumeCandidates`'s `eligible` (controller ruling, fix
+// round 1): an unverified row stays offered even when its owner is unknown
+// (not provably dead) — the live classification in `resumeRecoveryRuntime`
+// still decides for real, under the lock, before anything is consumed. Only
+// hides what the brief actually asks to hide: a pre-this-release record
+// (decision 3, no `recordVersion`), a row already claimed/unrecoverable/
+// active, or one whose own claim could not be proved either way.
+function eligibleForAllProjectsPicker(item: RecoveryItem): boolean {
+  if (item.state === "claimed" || item.state === "unrecoverable" || item.state === "active") return false;
+  if (item.claimUnprovable) return false;
+  if (item.evidenceKind === "claude") return true; // never carries recordVersion; not a decision-3 record
+  return item.recordVersion === 2;
+}
+
 // `--all`/`--project` keep the plain, single-step picker Runfree had before
 // same-terminal resume (spec section 3, "Scope": only bare `runfree resume`
 // ever asks the one question or shows the labelled two-step picker). Rows
-// are still built, filtered, and ordered by `selectResumeCandidates`, with a
-// terminal identity that cannot match anything, so a row's `match` is always
-// "none" — never "strong" — and the one question can never trigger here.
+// are built with a terminal identity that cannot match anything, so a row's
+// `match` is always "none" — never "strong" — and the one question can never
+// trigger here. Spanning more than one project, each label is prefixed with
+// its own project name.
 async function selectFromLabelledPicker(
   items: readonly RecoveryItem[],
   api: PromptApi,
 ): Promise<RecoveryItem | undefined> {
-  const selection = selectResumeCandidates({ items, current: { ids: {} }, now: new Date() });
-  if (selection.kind !== "picker") return undefined;
+  const rows = items.filter(eligibleForAllProjectsPicker).map((item) => buildResumeRow(item, { ids: {} }, new Date()));
+  if (rows.length === 0) return undefined;
   const choice = await api.select({
     message: "Resume which interrupted session?",
-    options: selection.rows.map((row) => ({ value: row.item.id, label: formatResumeRow(row) })),
-    initialValue: selection.defaultItemId,
+    options: rows.map((row) => ({
+      value: row.item.id,
+      label: `${sanitizeAgentText(row.item.projectName, 40)}  ${formatResumeRow(row)}`,
+    })),
   });
   if (api.isCancel(choice)) return undefined;
-  return selection.rows.find((row) => row.item.id === choice)?.item;
+  return rows.find((row) => row.item.id === choice)?.item;
 }
 
 export const resumeCommand: CommandModule = {

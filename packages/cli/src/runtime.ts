@@ -64,8 +64,10 @@ import {
 } from "./runtime/sessions.ts";
 import { readProxySessionFiles, type ProxySessionFile } from "./runtime/session-reconcile.ts";
 import {
+  assertRecoveryClaimOwnerIdentity,
   classifyRecoveryItemLive,
   formatRecoveryInventory,
+  RecoveryClaimOwnerIdentityError,
   scanRecoveryInventory,
   sessionContainerRecoveryLiveInputs,
   type RecoveryItem,
@@ -1185,6 +1187,22 @@ export async function resumeRecoveryRuntime(
   item: RecoveryItem,
   options: { quiet?: boolean; verbose?: boolean } = {},
 ): Promise<number> {
+  // Checked first, before the approval gate and before any runtime or Docker
+  // work (controller ruling, fix round 1): this process's claim identity
+  // depends on nothing Docker produces, so a boot id or process start that
+  // cannot be read must refuse here, with a clear, command-naming message,
+  // rather than surfacing deep inside admission after `startRuntime` already
+  // brought Docker up. `acquireRecoveryClaim` keeps the same check as
+  // defence in depth.
+  try {
+    assertRecoveryClaimOwnerIdentity(context);
+  } catch (error) {
+    if (!(error instanceof RecoveryClaimOwnerIdentityError)) throw error;
+    return die(
+      "runfree resume cannot claim this session: the host boot id or this process's start time could not be read, "
+      + "so another terminal's claim could not be excluded. No session was started.",
+    );
+  }
   // Resume is a public launch entry, so it meets the recovery gate like every
   // other one. `reviewAgentOperationalServices` below reads approved authority
   // before `startRuntime` runs — without the gate here, a record that carries
