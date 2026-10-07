@@ -7,6 +7,8 @@
 // The lint catches hand-written strings that bypass the registry — the class
 // of defect where the init wizard printed `runfree allow ...` (never a
 // command) and `runfree source add` (a removed shim), and nothing could tell.
+// The same parse runs over the `runfree ...` examples in the public
+// documentation, so a renamed command or flag cannot leave a stale example.
 import childProcess from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
@@ -190,6 +192,93 @@ function extractCandidates(): Candidate[] {
   return candidates;
 }
 
+// Public documentation: every `runfree ...` line in a fenced block and every
+// inline `runfree ...` code span. Release notes and the per-release
+// "what's new" pages describe the command surface of their own release and
+// are reviewed when that release is cut, so they are not held to today's.
+function listPublicDocs(): string[] {
+  const output = childProcess.spawnSync("git", ["ls-files", "-z", "--", "README.md", "CONTRIBUTING.md", "SECURITY.md", "docs"], {
+    cwd: repoRoot,
+    encoding: "utf8",
+  });
+  expect(output.status, output.stderr).toBe(0);
+  return output.stdout
+    .split("\0")
+    .filter((entry) => entry.endsWith(".md") && !entry.startsWith("docs/release-notes/") && !entry.startsWith("docs/whats-new-"))
+    .sort();
+}
+
+// Options accepted before the command word (docs/cli.md "Global Options"),
+// with the number of values each takes.
+const GLOBAL_OPTIONS = new Map([["--workspace", 1], ["--quiet", 0], ["--verbose", 0], ["-v", 0]]);
+
+// Tokenize one documented command line the way a shell would split it.
+// Returns undefined for syntax documentation (brackets, alternation,
+// ellipsis), shell composition, a templated command word, or a line that
+// launches the default agent with global options only.
+function documentedArgv(text: string): string[] | undefined {
+  const words: string[] = [];
+  for (const match of text.matchAll(/"((?:[^"\\]|\\.)*)"|'([^']*)'|(\S+)/g)) {
+    const bare = match[3];
+    if (bare?.startsWith("#")) break;
+    // Quoted words are literal arguments; only bare words carry syntax.
+    if (bare !== undefined && /[[\]|]|\.\.\.|…|^\$\(|^&&$|^>>?$|^<$/.test(bare)) return undefined;
+    words.push(match[1] ?? match[2] ?? bare);
+  }
+  let index = 0;
+  while (index < words.length && GLOBAL_OPTIONS.has(words[index])) index += 1 + (GLOBAL_OPTIONS.get(words[index]) ?? 0);
+  // Output samples ("runfree error: ...") and diagram labels ("runfree CLI")
+  // are not commands.
+  if (index < words.length && !WORD.test(words[index]) && !PLACEHOLDER.test(words[index])) return undefined;
+  const argv: string[] = [];
+  let previousFlag: string | undefined;
+  for (const word of words.slice(index)) {
+    const placeholder = PLACEHOLDER.exec(word);
+    if (placeholder && argv.length === 0) return undefined;
+    const token = placeholder
+      ? ((previousFlag && FLAG_VALUE_FOR_TEMPLATE[previousFlag]) ?? PLACEHOLDER_VALUES[placeholder[1].toLowerCase()] ?? placeholder[1].toLowerCase())
+      : word;
+    argv.push(token);
+    previousFlag = token.startsWith("--") && !token.includes("=") ? token : undefined;
+  }
+  return argv.length === 0 ? undefined : argv;
+}
+
+function extractDocCandidates(file: string, markdown: string): Candidate[] {
+  const candidates: Candidate[] = [];
+  const lines = markdown.split("\n");
+  let fence: string | undefined;
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
+    const lineNumber = index + 1;
+    const marker = /^\s*(`{3,}|~{3,})/.exec(line)?.[1];
+    if (marker !== undefined) {
+      if (fence === undefined) fence = marker;
+      else if (marker[0] === fence[0] && marker.length >= fence.length) fence = undefined;
+      continue;
+    }
+    if (fence !== undefined) {
+      let text = line.trim().replace(/^\$\s+/, "").replace(/^(?:[A-Z_][A-Z0-9_]*=\S*\s+)+/, "");
+      while (text.endsWith("\\") && index + 1 < lines.length) {
+        index += 1;
+        text = `${text.slice(0, -1)} ${lines[index].trim()}`;
+      }
+      if (!text.startsWith("runfree ")) continue;
+      const argv = documentedArgv(text.slice("runfree ".length));
+      // A fenced line is a command to run, never a mention.
+      if (argv) candidates.push({ file, line: lineNumber, fragment: `runfree ${argv.join(" ")}`, argv, mention: false });
+      continue;
+    }
+    for (const span of line.matchAll(/`(runfree [^`]+)`/g)) {
+      const argv = documentedArgv(span[1].slice("runfree ".length));
+      // Prose names command groups (`runfree host add` adds a host), so a
+      // span may stop before the positionals.
+      if (argv) candidates.push({ file, line: lineNumber, fragment: `runfree ${argv.join(" ")}`, argv, mention: true });
+    }
+  }
+  return candidates;
+}
+
 function parseContext() {
   const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), "runfree-emitted-commands-"));
   return createCommandContext({ projectRoot, invocationCwd: projectRoot, commandName: "", env: { ...process.env } });
@@ -245,6 +334,55 @@ describe("emitted commands parse under the real command app", () => {
       failures.push(`${candidate.file}:${candidate.line}: ${candidate.fragment} — ${failure}`);
     }
     expect(failures).toEqual([]);
+  });
+
+  test("every `runfree ...` example in the public documentation parses", async () => {
+    const candidates = listPublicDocs().flatMap((file) =>
+      extractDocCandidates(file, fs.readFileSync(path.join(repoRoot, file), "utf8")));
+    // An empty scan would pass vacuously; the docs hold hundreds of examples.
+    expect(candidates.length).toBeGreaterThan(200);
+    expect(candidates.some((candidate) => candidate.file === "docs/cli.md" && !candidate.mention)).toBe(true);
+    const failures: string[] = [];
+    for (const candidate of candidates) {
+      const failure = await parseFailure(candidate.argv);
+      if (!failure) continue;
+      if (candidate.mention && /^Not enough non-option arguments/.test(failure)) continue;
+      failures.push(`${candidate.file}:${candidate.line}: ${candidate.fragment} — ${failure}`);
+    }
+    expect(failures).toEqual([]);
+  });
+
+  test("the documentation extractor finds stale commands and skips syntax", async () => {
+    const markdown = [
+      "Run `runfree allow api.example.com` first.",
+      "```bash",
+      "$ runfree host add api.example.com --bogus",
+      "RUNFREE_DEBUG=1 runfree --workspace ../app host rules \\",
+      "  api.example.com --write <mode>",
+      "runfree service configure",
+      "runfree host add <host> [--local]",
+      "runfree status | head",
+      "runfree <command> --help",
+      "runfree --verbose",
+      "runfree error: .runfree/runfree.json is refused",
+      "```",
+      "`runfree host add` adds one host.",
+    ].join("\n");
+    const candidates = extractDocCandidates("fixture.md", markdown);
+    expect(candidates.map((candidate) => [candidate.line, candidate.fragment, candidate.mention])).toEqual([
+      [1, "runfree allow api.example.com", true],
+      [3, "runfree host add api.example.com --bogus", false],
+      [4, "runfree host rules api.example.com --write ask", false],
+      [6, "runfree service configure", false],
+      [13, "runfree host add", true],
+    ]);
+    const failures = await Promise.all(candidates.map((candidate) => parseFailure(candidate.argv)));
+    expect(failures[0]).toContain("unknown command: allow");
+    expect(failures[1]).toContain("Unknown argument: bogus");
+    expect(failures[2]).toBeUndefined();
+    // A fenced command may not stop before its positionals; a prose span may.
+    expect(failures[3]).toMatch(/Not enough non-option arguments/);
+    expect(failures[4]).toMatch(/Not enough non-option arguments/);
   });
 
   test("the lint catches the defect classes it exists for", async () => {
