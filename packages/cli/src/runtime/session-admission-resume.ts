@@ -1,3 +1,4 @@
+import { codexWindowForItem, scanCodexThreads } from "./codex-rollouts.ts";
 import { composeProjectName } from "./env.ts";
 import { createRuntimeDocker } from "./docker.ts";
 import {
@@ -145,6 +146,23 @@ function validateResumeTarget(
     agentContainerId: docker.runningServiceContainerId(project, "agent"),
     sessionContainers: sessionContainerRecoveryLiveInputs(context),
   };
+  // A Codex C1 row is only a time match (spec section 2; decision 4), never
+  // a host-chosen id: the thread it named can be gone by the time the user
+  // actually resumes it (a crash, `/compact`, concurrent cleanup). Re-derive
+  // the host record's own window and re-scan for that exact thread id before
+  // any claim or live classification, so a stale match is refused before a
+  // side effect rather than classified or claimed first. This proves only
+  // that the thread is still present in the window — it is not, and cannot
+  // be, proof that no other container is concurrently writing to it
+  // (security review F8).
+  if (item.conversationSource === "codex-match") {
+    const window = codexWindowForItem(item, live.sessionContainers?.records ?? []);
+    const scan = window ? scanCodexThreads({ stateDir: item.stateDir, windows: [window] }) : undefined;
+    const stillPresent = scan?.threads.some((thread) => thread.id === item.conversationId) ?? false;
+    if (!stillPresent) {
+      throw new Error(`recovery item ${item.id} is no longer valid: the Codex conversation match changed`);
+    }
+  }
   const classified = classifyRecoveryItemLive(item, context, io, live, { ignoreClaim: options.ignoreClaim });
   if (classified.state !== "interrupted") {
     throw new Error(options.ignoreClaim

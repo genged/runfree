@@ -20,7 +20,8 @@
 import fs from "node:fs";
 import path from "node:path";
 
-import { entryResolvesInsideDirectory, verifiedDirectoryIdentity, type DirectoryIdentity } from "./recovery.ts";
+import { entryResolvesInsideDirectory, verifiedDirectoryIdentity, type DirectoryIdentity, type RecoveryItem } from "./recovery.ts";
+import type { SessionContainerRecordV2 } from "./session-containers.ts";
 import { isRecord } from "../strict-primitives.ts";
 
 export const CODEX_ROLLOUT_LIMITS = {
@@ -36,6 +37,18 @@ export const CODEX_ROLLOUT_LIMITS = {
 export type CodexWindow = Readonly<{ startMs: number; endMs: number }>;
 export type CodexThread = Readonly<{ id: string; startedAtMs: number; name?: string }>;
 export type CodexScan = Readonly<{ threads: readonly CodexThread[]; complete: boolean }>;
+
+// Spec section 2, "Codex: time match (C1), picker only", and decision 4: a
+// time match only adds picker rows, never the one question, so the picker
+// can show more than one candidate row per record ("matches N tabs") without
+// ever being asked to resolve the ambiguity itself.
+export type CodexMatchInput = Readonly<{ itemId: string; window?: CodexWindow }>;
+export type CodexMatch = Readonly<{ itemId: string; thread: CodexThread; tabs: number }>;
+
+export const CODEX_MATCH_LIMITS = {
+  maxRowsPerHostItem: 5,
+  maxRowsTotal: 50,
+} as const;
 
 const DATE_PART = { year: /^\d{4}$/, month: /^\d{2}$/, day: /^\d{2}$/ };
 const ROLLOUT_RE =
@@ -202,7 +215,31 @@ function readThreadNames(
   }
 }
 
-type RolloutCandidate = { id: string; startedAtMs: number };
+// `fileName` is carried only for `dedupeCandidatesById`'s tie-break; it never
+// reaches `CodexThread`.
+type RolloutCandidate = { id: string; startedAtMs: number; fileName: string };
+
+/**
+ * Collapses `candidates` so each session id appears at most once: a thread
+ * id can legitimately come from more than one rollout file (for example, a
+ * continued session, or two files an attacker crafted to collide on
+ * `payload.id`), and the picker must show one row for it, not one per file.
+ * The newest `startedAtMs` wins; a tie breaks on the lexically greatest
+ * filename, so the result is deterministic rather than depending on
+ * directory enumeration order.
+ */
+function dedupeCandidatesById(candidates: readonly RolloutCandidate[]): RolloutCandidate[] {
+  const byId = new Map<string, RolloutCandidate>();
+  for (const candidate of candidates) {
+    const existing = byId.get(candidate.id);
+    if (!existing
+      || candidate.startedAtMs > existing.startedAtMs
+      || (candidate.startedAtMs === existing.startedAtMs && candidate.fileName > existing.fileName)) {
+      byId.set(candidate.id, candidate);
+    }
+  }
+  return Array.from(byId.values());
+}
 
 function scanDayDirectory(
   dayDir: string,
@@ -252,7 +289,7 @@ function scanDayDirectory(
       if (byteBudget.bytes > CODEX_ROLLOUT_LIMITS.maxTotalBytes) return "truncated";
       if (!firstLine) continue;
       const parsed = parseSessionMetaLine(firstLine, fileUuid);
-      if (parsed) out.push(parsed);
+      if (parsed) out.push({ ...parsed, fileName: name });
     } finally {
       fs.closeSync(opened.fd);
     }
@@ -293,10 +330,11 @@ function scanCodexThreadsUnsafe(input: Readonly<{ stateDir: string; windows: rea
 
   if (candidates.length === 0) return { threads: [], complete };
 
+  const deduped = dedupeCandidatesById(candidates);
   const names = Date.now() < deadlineAt ? readThreadNames(codexRoot, byteBudget) : undefined;
   if (names === undefined) complete = false;
 
-  const threads: CodexThread[] = candidates.map((candidate) => {
+  const threads: CodexThread[] = deduped.map((candidate) => {
     const name = names?.get(candidate.id);
     return name !== undefined
       ? { id: candidate.id, startedAtMs: candidate.startedAtMs, name }
@@ -307,9 +345,15 @@ function scanCodexThreadsUnsafe(input: Readonly<{ stateDir: string; windows: rea
 }
 
 /**
- * Scans `<stateDir>/codex` for rollout threads whose `session_meta` start
- * time falls in one of `windows` (widened by one day for time-zone skew —
- * see `dayOverlapsWindow`). Never throws: any unexpected failure gives
+ * Scans `<stateDir>/codex` for every valid rollout thread in the day
+ * directories that overlap one of `windows` (each day's coverage widened by
+ * one day for time-zone skew — see `dayOverlapsWindow`). The windows choose
+ * *which day directories get opened*; they do not filter individual
+ * threads — a thread whose own `startedAtMs` falls outside every window can
+ * still come back if its file lives in a visited day (the widened coverage
+ * means a visited day can reach past a window's nominal edge). Matching a
+ * thread to the window(s) it actually belongs to is the caller's job
+ * (`matchCodexThreads`). Never throws: any unexpected failure gives
  * `{ threads: [], complete: false }`, same as an exhausted budget or the
  * wall-clock deadline. An empty `windows` list does no filesystem I/O at
  * all.
@@ -320,4 +364,67 @@ export function scanCodexThreads(input: Readonly<{ stateDir: string; windows: re
   } catch {
     return { threads: [], complete: false };
   }
+}
+
+/**
+ * The time window a host Codex record's own evidence bounds a thread search
+ * to (spec section 2, "Window end"). `item`'s own `hostMetadata.endedAt`
+ * wins; else the per-session lifecycle record matching `item.sourceId`
+ * gives `leaseExpiresAt`, an upper bound on the last lease renewal (decision
+ * 4: it can only widen the window, so it can only add "matches N tabs"
+ * marks, never remove a real match); else `undefined` — no window, so
+ * `matchCodexThreads` never matches this item to anything. `lastSeenAt` is
+ * deliberately never read here: it is written only at session creation
+ * (`sessions.ts`), so by itself it carries no information about when the
+ * session actually ended.
+ */
+export function codexWindowForItem(
+  item: RecoveryItem,
+  records: readonly SessionContainerRecordV2[],
+): CodexWindow | undefined {
+  const startMs = Date.parse(item.startedAt ?? "");
+  if (!Number.isFinite(startMs)) return undefined;
+
+  const endedAt = item.hostMetadata?.endedAt;
+  if (endedAt !== undefined) {
+    const endMs = Date.parse(endedAt);
+    if (Number.isFinite(endMs)) return { startMs, endMs };
+  }
+
+  const leaseExpiresAt = records.find((record) => record.sessionId === item.sourceId)?.leaseExpiresAt;
+  if (leaseExpiresAt !== undefined) {
+    const endMs = Date.parse(leaseExpiresAt);
+    if (Number.isFinite(endMs)) return { startMs, endMs };
+  }
+
+  return undefined;
+}
+
+/**
+ * Matches scanned Codex threads to picker rows (spec section 2, "Codex:
+ * time match (C1), picker only"). A thread whose `startedAtMs` falls inside
+ * one item's window gives that item a match; a thread inside more than one
+ * item's window gives every one of those items a match, each stamped with
+ * the total count — the ambiguity itself is useful picker information
+ * ("matches N tabs"), never a reason to guess a single owner (decision 4,
+ * security review M2). An item with no window (`window` absent, meaning
+ * `codexWindowForItem` returned `undefined` for it) never matches anything.
+ * The caller decides row ordering and the `CODEX_MATCH_LIMITS` caps; this
+ * function only answers "which item(s) does each thread belong to".
+ */
+export function matchCodexThreads(
+  records: readonly CodexMatchInput[],
+  threads: readonly CodexThread[],
+): CodexMatch[] {
+  const matches: CodexMatch[] = [];
+  for (const thread of threads) {
+    const inWindow = records.filter((record) =>
+      record.window !== undefined
+      && thread.startedAtMs >= record.window.startMs
+      && thread.startedAtMs <= record.window.endMs);
+    for (const record of inWindow) {
+      matches.push({ itemId: record.itemId, thread, tabs: inWindow.length });
+    }
+  }
+  return matches;
 }

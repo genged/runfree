@@ -109,6 +109,16 @@ function hostEvidence(id = "rf-20260731-abcdef", overrides: Record<string, unkno
   return filePath;
 }
 
+/** Writes `<stateDir>/codex/sessions/<date>/rollout-...-<uuid>.jsonl` with a minimal `session_meta` first line, matching the fixture builders in `codex-rollouts.test.ts` and `recovery.test.ts`. */
+function codexRollout(date: string, uuid: string, timestamp: string): string {
+  const [year, month, day] = date.split("/");
+  const dir = path.join(stateDir, "codex", "sessions", year as string, month as string, day as string);
+  fs.mkdirSync(dir, { recursive: true });
+  const filePath = path.join(dir, `rollout-${date.replace(/\//g, "-")}T00-00-00-${uuid}.jsonl`);
+  fs.writeFileSync(filePath, `${JSON.stringify({ type: "session_meta", payload: { id: uuid, timestamp } })}\n`);
+  return filePath;
+}
+
 function runtimeContext(): RuntimeContext {
   const policyPath = path.join(projectRoot, ".runfree", "network-policy.json");
   fs.mkdirSync(path.dirname(policyPath), { recursive: true });
@@ -404,5 +414,64 @@ describe("resume through session admission", () => {
     await expect(resumeInterruptedSessionThroughAdmission({ preparedRuntime: preparedRuntime(), io, item: firstItem() }))
       .rejects.toThrow("only built-in agents");
     expect(mocks.createDriver).not.toHaveBeenCalled();
+  });
+
+  test("refuses a Codex C1 match whose thread is no longer present, before any claim or launch (F8 presence re-check)", async () => {
+    const codexUuid = "01a0692c-7f74-7750-ad42-fb36200a005e";
+    hostEvidence("rf-20260731-cdxmatch", {
+      command: "codex",
+      recordVersion: 2,
+      outcome: "interrupted",
+      startedAt: "2026-07-31T00:00:00.000Z",
+      endedAt: "2026-07-31T00:10:00.000Z",
+    });
+    const rolloutPath = codexRollout("2026/07/31", codexUuid, "2026-07-31T00:05:00.000Z");
+    const hostItem = firstItem();
+    const matchItem: RecoveryItem = {
+      ...hostItem,
+      id: `rfr-${"b".repeat(24)}`,
+      conversationId: codexUuid,
+      conversationSource: "codex-match",
+      codexMatchOf: hostItem.id,
+      codexMatchTabs: 1,
+    };
+    const context = runtimeContext();
+    // The rollout the picker matched is gone by resume time (a crash,
+    // `/compact`, or concurrent cleanup) — the thread the row named is no
+    // longer provably present in the host record's window.
+    fs.rmSync(rolloutPath);
+
+    await expect(resumeInterruptedSessionThroughAdmission({ preparedRuntime: preparedRuntime(context), io, item: matchItem }))
+      .rejects.toThrow("the Codex conversation match changed");
+    expect(mocks.createDriver).not.toHaveBeenCalled();
+    expect(mocks.launchBuiltin).not.toHaveBeenCalled();
+    expect(fs.existsSync(path.join(stateDir, "sessions", "recovery-claims"))).toBe(false);
+  });
+
+  test("resumes a Codex C1 match whose thread is still present (sanity: the presence re-check only refuses a changed match)", async () => {
+    const codexUuid = "01a0692c-7f74-7750-ad42-fb36200a005e";
+    hostEvidence("rf-20260731-cdxmatch2", {
+      command: "codex",
+      recordVersion: 2,
+      outcome: "interrupted",
+      startedAt: "2026-07-31T00:00:00.000Z",
+      endedAt: "2026-07-31T00:10:00.000Z",
+    });
+    codexRollout("2026/07/31", codexUuid, "2026-07-31T00:05:00.000Z");
+    const hostItem = firstItem();
+    const matchItem: RecoveryItem = {
+      ...hostItem,
+      id: `rfr-${"a".repeat(24)}`,
+      conversationId: codexUuid,
+      conversationSource: "codex-match",
+      codexMatchOf: hostItem.id,
+      codexMatchTabs: 1,
+    };
+    const context = runtimeContext();
+
+    const result = await resumeInterruptedSessionThroughAdmission({ preparedRuntime: preparedRuntime(context), io, item: matchItem });
+
+    expect(result).toEqual({ status: 0, consumed: true });
+    expect(mocks.launchBuiltin).toHaveBeenCalledWith("codex", { resume: { conversationId: codexUuid } });
   });
 });

@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
 import { defaultConfig } from "../config.ts";
 import { composeProjectName, projectHash } from "../project-identity.ts";
+import { CODEX_MATCH_LIMITS } from "./codex-rollouts.ts";
 import {
   acquireRecoveryClaim,
   buildResumeLaunchPlan,
@@ -102,6 +103,22 @@ function claudeEvidence(overrides: Record<string, unknown> = {}, pid = 4242): st
     ...overrides,
   })}\n`, { mode: 0o600 });
   return filePath;
+}
+
+/** Writes `<stateDir>/codex/sessions/<date>/rollout-...-<uuid>.jsonl` with a minimal `session_meta` first line, matching the fixture builder in `codex-rollouts.test.ts`. */
+function codexRollout(date: string, uuid: string, timestamp: string): void {
+  const [year, month, day] = date.split("/");
+  const dir = path.join(stateDir, "codex", "sessions", year as string, month as string, day as string);
+  fs.mkdirSync(dir, { recursive: true });
+  const filePath = path.join(dir, `rollout-${date.replace(/\//g, "-")}T00-00-00-${uuid}.jsonl`);
+  fs.writeFileSync(filePath, `${JSON.stringify({ type: "session_meta", payload: { id: uuid, timestamp } })}\n`);
+}
+
+function fakeUuid(n: number): string {
+  // Only the last, unconstrained 12-hex group varies; version/variant
+  // nibbles stay fixed so every generated id still matches the rollout
+  // reader's filename pattern.
+  return `00000000-0000-7000-8000-${n.toString(16).padStart(12, "0")}`;
 }
 
 function runtimeContext(): RuntimeContext {
@@ -1981,5 +1998,180 @@ describe("dead-claim sweep (AGENTS.md: every fail-closed refusal ships its recla
     expect(claim).toBeDefined();
     expect(fs.existsSync(piClaimPath)).toBe(true);
     claim?.release();
+  });
+});
+
+function writeCodexIndex(rows: readonly Readonly<{ id: string; thread_name: string }>[]): void {
+  const dir = path.join(stateDir, "codex");
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, "session_index.jsonl"), `${rows.map((row) => JSON.stringify(row)).join("\n")}\n`);
+}
+
+describe("Codex C1 time-match rows (scanRecoveryInventory)", () => {
+  const CODEX_UUID = "01a0692c-7f74-7750-ad42-fb36200a005e";
+
+  test("includeCodexMatches adds a codex-match row for a thread inside the host record's window, named from the Codex index", () => {
+    hostEvidence("rf-20260731-cdx001", {
+      command: "codex",
+      recordVersion: 2,
+      outcome: "interrupted",
+      startedAt: "2026-07-31T00:00:00.000Z",
+      endedAt: "2026-07-31T00:10:00.000Z",
+    });
+    codexRollout("2026/07/31", CODEX_UUID, "2026-07-31T00:05:00.000Z");
+    writeCodexIndex([{ id: CODEX_UUID, thread_name: "fix the picker" }]);
+
+    const inventory = scanRecoveryInventory({ env, projectRoot, includeCodexMatches: true });
+    const hostRow = inventory.items.find(
+      (item) => item.sourceId === "rf-20260731-cdx001" && item.conversationSource !== "codex-match",
+    );
+    const matchRow = inventory.items.find((item) => item.conversationSource === "codex-match");
+    if (!hostRow || !matchRow) throw new Error("missing fixtures");
+
+    expect(matchRow.conversationId).toBe(CODEX_UUID);
+    expect(matchRow.conversationName).toBe("fix the picker");
+    expect(matchRow.conversationNameSource).toBe("codex-index");
+    expect(matchRow.codexMatchTabs).toBe(1);
+    expect(matchRow.codexMatchOf).toBe(hostRow.id);
+    expect(matchRow.id).not.toBe(hostRow.id);
+    // Resuming the match row consumes the *same* host evidence — same
+    // evidence path and fingerprint — never a Codex file of its own.
+    expect(matchRow.evidencePath).toBe(hostRow.evidencePath);
+    expect(matchRow.fingerprint).toEqual(hostRow.fingerprint);
+    // A time match is never the one question's default (decision 4).
+    expect(matchRow.conversationSource).not.toBe("host-chosen");
+  });
+
+  test("a thread with no name in the Codex index gets a codex-match row with no conversationName", () => {
+    hostEvidence("rf-20260731-cdx000", {
+      command: "codex",
+      recordVersion: 2,
+      outcome: "interrupted",
+      startedAt: "2026-07-31T00:00:00.000Z",
+      endedAt: "2026-07-31T00:10:00.000Z",
+    });
+    codexRollout("2026/07/31", CODEX_UUID, "2026-07-31T00:05:00.000Z");
+
+    const inventory = scanRecoveryInventory({ env, projectRoot, includeCodexMatches: true });
+    const matchRow = inventory.items.find((item) => item.conversationSource === "codex-match");
+
+    expect(matchRow?.conversationName).toBeUndefined();
+    expect(matchRow?.conversationNameSource).toBeUndefined();
+  });
+
+  test("a thread inside two host records' windows gives both a match row, each stamped matches 2 tabs", () => {
+    hostEvidence("rf-20260731-cdx010", {
+      command: "codex",
+      recordVersion: 2,
+      outcome: "interrupted",
+      startedAt: "2026-07-31T00:00:00.000Z",
+      endedAt: "2026-07-31T00:30:00.000Z",
+    });
+    hostEvidence("rf-20260731-cdx011", {
+      command: "codex",
+      recordVersion: 2,
+      outcome: "interrupted",
+      startedAt: "2026-07-31T00:05:00.000Z",
+      endedAt: "2026-07-31T00:40:00.000Z",
+    });
+    codexRollout("2026/07/31", CODEX_UUID, "2026-07-31T00:10:00.000Z");
+
+    const inventory = scanRecoveryInventory({ env, projectRoot, includeCodexMatches: true });
+    const matches = inventory.items.filter((item) => item.conversationSource === "codex-match");
+
+    expect(matches).toHaveLength(2);
+    expect(matches.every((item) => item.codexMatchTabs === 2)).toBe(true);
+    expect(new Set(matches.map((item) => item.codexMatchOf)).size).toBe(2);
+  });
+
+  test("the default (includeCodexMatches omitted) and --all (no projectRoot) add no Codex rows and never open codex/", () => {
+    hostEvidence("rf-20260731-cdx001", {
+      command: "codex",
+      recordVersion: 2,
+      outcome: "interrupted",
+      startedAt: "2026-07-31T00:00:00.000Z",
+      endedAt: "2026-07-31T00:10:00.000Z",
+    });
+    codexRollout("2026/07/31", CODEX_UUID, "2026-07-31T00:05:00.000Z");
+    const codexSegment = `${path.sep}codex${path.sep}`;
+    const opendirSpy = vi.spyOn(fs, "opendirSync");
+
+    const scoped = scanRecoveryInventory({ env, projectRoot });
+    expect(scoped.items.some((item) => item.conversationSource === "codex-match")).toBe(false);
+
+    const all = scanRecoveryInventory({ env, includeCodexMatches: true });
+    expect(all.items.some((item) => item.conversationSource === "codex-match")).toBe(false);
+
+    for (const call of opendirSpy.mock.calls) expect(String(call[0])).not.toContain(codexSegment);
+    opendirSpy.mockRestore();
+  });
+
+  test("caps Codex rows at 5 per host item (F5)", () => {
+    hostEvidence("rf-20260731-cdx002", {
+      command: "codex",
+      recordVersion: 2,
+      outcome: "interrupted",
+      startedAt: "2026-07-31T00:00:00.000Z",
+      endedAt: "2026-07-31T01:00:00.000Z",
+    });
+    for (let i = 0; i < 8; i += 1) {
+      codexRollout("2026/07/31", fakeUuid(i), `2026-07-31T00:${String(10 + i).padStart(2, "0")}:00.000Z`);
+    }
+
+    const inventory = scanRecoveryInventory({ env, projectRoot, includeCodexMatches: true });
+    const matches = inventory.items.filter((item) => item.conversationSource === "codex-match");
+
+    expect(matches).toHaveLength(CODEX_MATCH_LIMITS.maxRowsPerHostItem);
+  });
+
+  test("caps Codex rows at 50 in total across many host items, dropping the oldest item's rows first (F5)", () => {
+    const ids: string[] = [];
+    for (let i = 0; i < 12; i += 1) {
+      const hour = i * 2;
+      const id = `rf-20260731-cdx1${String(i).padStart(2, "0")}`;
+      ids.push(id);
+      hostEvidence(id, {
+        command: "codex",
+        recordVersion: 2,
+        outcome: "interrupted",
+        startedAt: `2026-07-31T${String(hour).padStart(2, "0")}:00:00.000Z`,
+        endedAt: `2026-07-31T${String(hour).padStart(2, "0")}:50:00.000Z`,
+      });
+      for (let j = 0; j < 5; j += 1) {
+        codexRollout("2026/07/31", fakeUuid(i * 10 + j), `2026-07-31T${String(hour).padStart(2, "0")}:1${j}:00.000Z`);
+      }
+    }
+
+    const inventory = scanRecoveryInventory({ env, projectRoot, includeCodexMatches: true });
+    const matches = inventory.items.filter((item) => item.conversationSource === "codex-match");
+    const oldestHostRow = inventory.items.find(
+      (item) => item.sourceId === ids[0] && item.conversationSource !== "codex-match",
+    );
+
+    expect(matches).toHaveLength(CODEX_MATCH_LIMITS.maxRowsTotal);
+    expect(matches.some((item) => item.codexMatchOf === oldestHostRow?.id)).toBe(false);
+  });
+
+  test("a Codex scan error leaves no Codex rows but keeps the host row", () => {
+    hostEvidence("rf-20260731-cdx003", {
+      command: "codex",
+      recordVersion: 2,
+      outcome: "interrupted",
+      startedAt: "2026-07-31T00:00:00.000Z",
+      endedAt: "2026-07-31T00:10:00.000Z",
+    });
+    const codexDir = path.join(stateDir, "codex");
+    fs.mkdirSync(codexDir, { recursive: true });
+    // `sessions` must be a directory; replacing it with a file makes every
+    // day-directory lookup fail, the same shape of failure a real scan error
+    // (or an exhausted budget) produces.
+    fs.writeFileSync(path.join(codexDir, "sessions"), "");
+
+    const inventory = scanRecoveryInventory({ env, projectRoot, includeCodexMatches: true });
+
+    expect(inventory.items.some((item) => item.conversationSource === "codex-match")).toBe(false);
+    expect(
+      inventory.items.some((item) => item.sourceId === "rf-20260731-cdx003" && item.conversationSource !== "codex-match"),
+    ).toBe(true);
   });
 });

@@ -7,10 +7,20 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
 import {
   CODEX_ROLLOUT_LIMITS,
+  codexWindowForItem,
+  matchCodexThreads,
   scanCodexThreads,
   setCodexRolloutAfterOpenHookForTest,
+  type CodexMatchInput,
+  type CodexThread,
   type CodexWindow,
 } from "./codex-rollouts.ts";
+import {
+  SESSION_CONTAINER_RECORD_SCHEMA_VERSION,
+  type SessionContainerRecordV2,
+} from "./session-containers.ts";
+import type { RecoveryItem } from "./recovery.ts";
+import type { SessionMetadata } from "./types.ts";
 
 // Real uuids captured from a local Codex home (session_meta.payload.id /
 // rollout filename), shaped exactly like Codex's own (uuid v7-ish: version
@@ -80,6 +90,72 @@ function fakeUuid(n: number): string {
   return `00000000-0000-7000-8000-${n.toString(16).padStart(12, "0")}`;
 }
 
+function minimalSessionMetadata(overrides: Partial<SessionMetadata> = {}): SessionMetadata {
+  return {
+    id: "rf-20260731-abcdef",
+    projectRoot: "/tmp/project",
+    composeProject: "runfree-000000000000",
+    command: "codex",
+    name: "codex",
+    hostPid: 1,
+    hostInbox: "/tmp/inbox",
+    containerInbox: "/container/inbox",
+    startedAt: "2026-10-04T10:00:00.000Z",
+    lastSeenAt: "2026-10-04T10:01:00.000Z",
+    ...overrides,
+  };
+}
+
+function minimalRecoveryItem(overrides: Partial<RecoveryItem> = {}): RecoveryItem {
+  const sourceId = (overrides.sourceId as string | undefined) ?? "rf-20260731-abcdef";
+  return {
+    id: "rfr-000000000000000000000000",
+    projectId: "000000000000",
+    projectName: "test",
+    stateDir,
+    state: "unverified",
+    evidenceKind: "host",
+    evidencePath: path.join(stateDir, "sessions", `${sourceId}.json`),
+    fingerprint: { dev: 0, ino: 0, size: 0, mtimeMs: 0, schemaId: sourceId, sha256: "x" },
+    sourceId,
+    agent: "codex",
+    startedAt: "2026-10-04T10:00:00.000Z",
+    ...overrides,
+  };
+}
+
+function minimalSessionContainerRecord(overrides: Partial<SessionContainerRecordV2> = {}): SessionContainerRecordV2 {
+  const sessionId = (overrides.sessionId as string | undefined) ?? "rf-20260731-abcdef";
+  return {
+    schemaVersion: SESSION_CONTAINER_RECORD_SCHEMA_VERSION,
+    projectId: "000000000000",
+    composeProject: "runfree-000000000000",
+    sessionId,
+    sessionIncarnation: "1".repeat(64),
+    sessionPrincipal: "2".repeat(64),
+    displayName: "Codex session",
+    command: "codex",
+    launchPath: "/usr/local/bin/codex",
+    launchArgs: [],
+    interactive: true,
+    tty: true,
+    state: "attached",
+    containerName: `runfree-000000000000-session-${sessionId}`,
+    sourceIp: "172.31.90.20",
+    selectedAgentImageRef: "runfree/agent-project:test",
+    selectedAgentImageId: `sha256:${"a".repeat(64)}`,
+    sessionAgentMaterializationDigest: `sha256:${"b".repeat(64)}`,
+    selectedAgentImageInputDigest: `sha256:${"c".repeat(64)}`,
+    sessionTemplateDigest: `sha256:${"d".repeat(64)}`,
+    sessionAgentGenerationDigest: `sha256:${"e".repeat(64)}`,
+    controlPlaneGenerationDigest: `sha256:${"f".repeat(64)}`,
+    admissionContractEpoch: 1,
+    hostPid: 1,
+    createdAt: "2026-10-04T10:00:00.000Z",
+    ...overrides,
+  };
+}
+
 describe("scanCodexThreads", () => {
   test("a valid rollout inside a window gives one thread with id, startedAtMs, and name", () => {
     const startedAt = "2026-10-04T12:00:00.000Z";
@@ -108,6 +184,19 @@ describe("scanCodexThreads", () => {
     const outsideDay = path.join("2026", "01", "01");
     for (const call of openSpy.mock.calls) expect(String(call[0])).not.toContain(outsideDay);
     openSpy.mockRestore();
+  });
+
+  test("two rollout files that share a session id collapse to one thread, keeping the newest startedAtMs (dedupe)", () => {
+    const dir = path.join(stateDir, "codex", "sessions", "2026", "10", "04");
+    fs.mkdirSync(dir, { recursive: true });
+    const olderLine = JSON.stringify({ type: "session_meta", payload: { id: VALID_UUID_1, timestamp: "2026-10-04T10:00:00.000Z" } });
+    const newerLine = JSON.stringify({ type: "session_meta", payload: { id: VALID_UUID_1, timestamp: "2026-10-04T11:00:00.000Z" } });
+    fs.writeFileSync(path.join(dir, `rollout-2026-10-04T10-00-00-${VALID_UUID_1}.jsonl`), `${olderLine}\n`);
+    fs.writeFileSync(path.join(dir, `rollout-2026-10-04T11-00-00-${VALID_UUID_1}.jsonl`), `${newerLine}\n`);
+
+    const scan = scanCodexThreads({ stateDir, windows: windowAround("2026-10-04T12:00:00.000Z") });
+
+    expect(scan.threads).toEqual([{ id: VALID_UUID_1, startedAtMs: Date.parse("2026-10-04T11:00:00.000Z") }]);
   });
 
   test("a filename uuid that does not match payload.id gives no thread", () => {
@@ -227,18 +316,49 @@ describe("scanCodexThreads", () => {
     },
   );
 
-  test("a directory swapped for a symlink between open and the containment check gives no thread (F8)", () => {
-    const dir = path.join(stateDir, "codex", "sessions", "2026", "10", "04");
+  // The naive version of this pair (symlinking the whole day *directory*
+  // back to itself) is caught by `entryResolvesInsideDirectory`'s first,
+  // cheapest check — "is this still a real directory with the identity we
+  // captured before opening" — without ever reaching the realpath or
+  // dev/ino comparisons. These two swap only the already-opened *file*, so
+  // the day directory itself still passes that first check and the swap is
+  // caught only by the deeper checks: a symlink into another directory is
+  // caught by the realpath comparison, and an in-place replacement is caught
+  // by the dev/ino comparison (review F8; both verified by hand, temporarily
+  // deleting the `entryResolvesInsideDirectory` call from `scanDayDirectory`
+  // and confirming each case then returns the decoy's/original's thread
+  // instead of `[]`, before restoring it).
+  test("a rollout file swapped for a symlink into a decoy directory after open is rejected by the realpath check (F8)", () => {
     const filePath = rollout("2026/10/04", VALID_UUID_1, { id: VALID_UUID_1, timestamp: "2026-10-04T12:00:00.000Z" });
     const decoyDir = path.join(stateDir, "decoy");
     fs.mkdirSync(decoyDir, { recursive: true });
+    const decoyPath = path.join(decoyDir, path.basename(filePath));
     const decoyLine = JSON.stringify({
       type: "session_meta",
       payload: { id: VALID_UUID_1, timestamp: "2026-10-04T12:00:00.000Z" },
     });
-    fs.writeFileSync(path.join(decoyDir, path.basename(filePath)), `${decoyLine}\n`);
+    fs.writeFileSync(decoyPath, `${decoyLine}\n`);
 
-    setCodexRolloutAfterOpenHookForTest(() => swapForSymlink(dir));
+    setCodexRolloutAfterOpenHookForTest(() => {
+      fs.unlinkSync(filePath);
+      fs.symlinkSync(decoyPath, filePath);
+    });
+
+    const scan = scanCodexThreads({ stateDir, windows: windowAround("2026-10-04T12:00:00.000Z") });
+
+    expect(scan).toEqual({ threads: [], complete: true });
+  });
+
+  test("a rollout file replaced by a different file at the same path after open is rejected by the dev/ino check (F8)", () => {
+    const filePath = rollout("2026/10/04", VALID_UUID_1, { id: VALID_UUID_1, timestamp: "2026-10-04T12:00:00.000Z" });
+    const decoyPath = `${filePath}.decoy`;
+    const decoyLine = JSON.stringify({
+      type: "session_meta",
+      payload: { id: VALID_UUID_1, timestamp: "2026-10-04T12:00:00.000Z" },
+    });
+    fs.writeFileSync(decoyPath, `${decoyLine}\n`);
+
+    setCodexRolloutAfterOpenHookForTest(() => fs.renameSync(decoyPath, filePath));
 
     const scan = scanCodexThreads({ stateDir, windows: windowAround("2026-10-04T12:00:00.000Z") });
 
@@ -289,5 +409,88 @@ describe("scanCodexThreads", () => {
     } finally {
       dateNowSpy.mockRestore();
     }
+  });
+});
+
+describe("matchCodexThreads", () => {
+  const thread: CodexThread = { id: VALID_UUID_1, startedAtMs: Date.parse("2026-10-04T12:00:00.000Z") };
+  const window: CodexWindow = {
+    startMs: Date.parse("2026-10-04T11:00:00.000Z"),
+    endMs: Date.parse("2026-10-04T13:00:00.000Z"),
+  };
+
+  test("a thread inside one item's window gives one match with tabs: 1", () => {
+    const records: CodexMatchInput[] = [{ itemId: "item-a", window }];
+
+    expect(matchCodexThreads(records, [thread])).toEqual([{ itemId: "item-a", thread, tabs: 1 }]);
+  });
+
+  test("a thread inside two items' windows gives a match for each item, both stamped tabs: 2", () => {
+    const records: CodexMatchInput[] = [{ itemId: "item-a", window }, { itemId: "item-b", window }];
+
+    expect(matchCodexThreads(records, [thread])).toEqual([
+      { itemId: "item-a", thread, tabs: 2 },
+      { itemId: "item-b", thread, tabs: 2 },
+    ]);
+  });
+
+  test("an item with window: undefined never matches", () => {
+    const records: CodexMatchInput[] = [{ itemId: "item-a" }];
+
+    expect(matchCodexThreads(records, [thread])).toEqual([]);
+  });
+
+  test("a thread outside every window matches nothing", () => {
+    const records: CodexMatchInput[] = [{ itemId: "item-a", window }];
+    const farThread: CodexThread = { id: VALID_UUID_2, startedAtMs: Date.parse("2026-10-01T00:00:00.000Z") };
+
+    expect(matchCodexThreads(records, [farThread])).toEqual([]);
+  });
+});
+
+describe("codexWindowForItem", () => {
+  test("endedAt wins over the lifecycle record's leaseExpiresAt", () => {
+    const item = minimalRecoveryItem({
+      startedAt: "2026-10-04T10:00:00.000Z",
+      hostMetadata: minimalSessionMetadata({ endedAt: "2026-10-04T10:10:00.000Z", lastSeenAt: "2026-10-04T10:05:00.000Z" }),
+    });
+    const records = [minimalSessionContainerRecord({ sessionId: item.sourceId, leaseExpiresAt: "2026-10-04T10:30:00.000Z" })];
+
+    expect(codexWindowForItem(item, records)).toEqual({
+      startMs: Date.parse("2026-10-04T10:00:00.000Z"),
+      endMs: Date.parse("2026-10-04T10:10:00.000Z"),
+    });
+  });
+
+  test("falls back to the lifecycle record's leaseExpiresAt when endedAt is absent", () => {
+    const item = minimalRecoveryItem({
+      startedAt: "2026-10-04T10:00:00.000Z",
+      hostMetadata: minimalSessionMetadata({ lastSeenAt: "2026-10-04T10:05:00.000Z" }),
+    });
+    const records = [minimalSessionContainerRecord({ sessionId: item.sourceId, leaseExpiresAt: "2026-10-04T10:30:00.000Z" })];
+
+    expect(codexWindowForItem(item, records)).toEqual({
+      startMs: Date.parse("2026-10-04T10:00:00.000Z"),
+      endMs: Date.parse("2026-10-04T10:30:00.000Z"),
+    });
+  });
+
+  test("lastSeenAt is never used: with only lastSeenAt set and no lifecycle record, the window is undefined", () => {
+    const item = minimalRecoveryItem({
+      startedAt: "2026-10-04T10:00:00.000Z",
+      hostMetadata: minimalSessionMetadata({ lastSeenAt: "2026-10-04T10:05:00.000Z" }),
+    });
+
+    expect(codexWindowForItem(item, [])).toBeUndefined();
+  });
+
+  test("no endedAt, no matching lifecycle record: the window is undefined", () => {
+    const item = minimalRecoveryItem({
+      startedAt: "2026-10-04T10:00:00.000Z",
+      hostMetadata: minimalSessionMetadata(),
+    });
+    const records = [minimalSessionContainerRecord({ sessionId: "a different session" })];
+
+    expect(codexWindowForItem(item, records)).toBeUndefined();
   });
 });

@@ -10,6 +10,15 @@ import { projectHash } from "../project-identity.ts";
 import { runfreeStateRoot } from "../paths.ts";
 import { sanitizeForTerminal } from "../../../../scripts/domain-diagnostics.ts";
 import { formatTerminalTable } from "../terminal-table.ts";
+import {
+  CODEX_MATCH_LIMITS,
+  codexWindowForItem,
+  matchCodexThreads,
+  scanCodexThreads,
+  type CodexMatch,
+  type CodexMatchInput,
+  type CodexThread,
+} from "./codex-rollouts.ts";
 import { AGENT_UID_GID } from "./constants.ts";
 import { dockerClientEnvOptions } from "./docker.ts";
 import { createDockerClient, type DockerCallOptions } from "./docker-client.ts";
@@ -136,6 +145,16 @@ export type RecoveryItem = {
   // from the prompt and the picker. Never set from a *cross-scope* unprovable
   // claim, which must not block or annotate another record (review F2).
   claimUnprovable?: string;
+  // Codex C1 time-match rows only (spec section 2, "Codex: time match (C1),
+  // picker only", decision 4). `codexMatchOf` names the host item this row
+  // was derived from (same evidence path and fingerprint — resuming it
+  // consumes the host record, never a Codex file of its own); `codexMatchTabs`
+  // is how many *other* eligible host records' windows the same thread also
+  // fell into ("matches N tabs" when > 1 — an ambiguous match, never guessed
+  // down to one owner). Never set on anything but a `conversationSource:
+  // "codex-match"` row.
+  codexMatchOf?: string;
+  codexMatchTabs?: number;
 };
 
 export type RecoveryInventory = {
@@ -1057,7 +1076,12 @@ function dedupeLinkedClaudeNewestFirst(
 function joinHostItemsBySameConversation(items: readonly RecoveryItem[]): RecoveryItem[] {
   const indexesByKey = new Map<string, number[]>();
   items.forEach((item, index) => {
-    if (item.evidenceKind === "host" && item.conversationId !== undefined) {
+    // A Codex C1 match is excluded here: its `conversationId` is only a
+    // time-match *guess*, so two different host records guessed into the
+    // same thread are still two different tabs — showing "matches N tabs"
+    // as separate rows (decision 4, review M2), never merged into one the
+    // way genuine duplicate evidence of one exact conversation is below.
+    if (item.evidenceKind === "host" && item.conversationId !== undefined && item.conversationSource !== "codex-match") {
       const key = `${item.projectId}\0${item.agent.toLowerCase()}\0${item.conversationId}`;
       const existing = indexesByKey.get(key);
       if (existing) existing.push(index);
@@ -1098,9 +1122,115 @@ function joinHostItemsBySameConversation(items: readonly RecoveryItem[]): Recove
     .filter((_item, index) => !dropped.has(index));
 }
 
+/**
+ * Codex C1 time-match rows for one project (spec section 2, "Codex: time
+ * match (C1), picker only"; decision 4; controller ruling on the task 8
+ * review). Only ever called for the one `projectRoot`-scoped project with
+ * `includeCodexMatches: true` — `runfree sessions`, `--list`, `--json`, and
+ * `--all` never reach this and never open `codex/` (review F5).
+ *
+ * `scanCodexThreads` is called once per *eligible* host item's own window,
+ * newest `startedAt` first, never once over every window: the shared
+ * `maxDateDirs` cap on one call would otherwise starve every later record's
+ * rows. An incomplete scan (budget or deadline exhausted) gives *that
+ * record* no rows — its `CodexMatchInput` is dropped — but the threads an
+ * earlier, complete scan already found remain eligible for every other
+ * item's window (the failure is scoped to the one record, not global).
+ * `matchCodexThreads` then compares the union of every thread found against
+ * every eligible item's own window, so "matches N tabs" is correct even
+ * though each scan only opened one item's window at a time.
+ *
+ * Any failure anywhere in this — a thrown error, a missing or unreadable
+ * lifecycle registry, anything — gives no Codex rows at all and never
+ * removes the host row: a fresh launch always remains available (spec
+ * section 2, "Any scan error or exhausted budget gives no Codex row").
+ */
+function codexMatchItemsForProject(
+  projectId: string,
+  stateDir: string,
+  mapping: ProjectMapping,
+  hostItems: readonly RecoveryItem[],
+): RecoveryItem[] {
+  try {
+    const eligible = hostItems
+      .filter((item) => item.agent === "codex" && item.recordVersion === 2 && item.ownerState !== "active")
+      .sort((left, right) => Date.parse(right.startedAt ?? "") - Date.parse(left.startedAt ?? ""));
+    if (eligible.length === 0 || !mapping.projectRoot) return [];
+
+    const lifecycleRecords = peekSessionContainerRecordsV2(stateDir, {
+      projectId,
+      composeProject: composeProjectName(mapping.projectRoot),
+    }).records;
+
+    const matchInputs: CodexMatchInput[] = [];
+    const threadsById = new Map<string, CodexThread>();
+    for (const item of eligible) {
+      const window = codexWindowForItem(item, lifecycleRecords);
+      if (!window) continue;
+      const scan = scanCodexThreads({ stateDir, windows: [window] });
+      if (!scan.complete) continue; // this record only (see doc comment above)
+      matchInputs.push({ itemId: item.id, window });
+      for (const thread of scan.threads) {
+        if (!threadsById.has(thread.id)) threadsById.set(thread.id, thread);
+      }
+    }
+
+    const matches = matchCodexThreads(matchInputs, Array.from(threadsById.values()));
+    return codexMatchRows(projectId, eligible, matches);
+  } catch {
+    return [];
+  }
+}
+
+/** Groups `matches` by host item, newest thread first, within `CODEX_MATCH_LIMITS` (5 rows per host item, 50 in total — security review F5). Host items are already newest-`startedAt`-first, so the running total cap drops the oldest items' rows first. */
+function codexMatchRows(
+  projectId: string,
+  eligible: readonly RecoveryItem[],
+  matches: readonly CodexMatch[],
+): RecoveryItem[] {
+  const matchesByItemId = new Map<string, CodexMatch[]>();
+  for (const match of matches) {
+    const list = matchesByItemId.get(match.itemId);
+    if (list) list.push(match);
+    else matchesByItemId.set(match.itemId, [match]);
+  }
+  const rows: RecoveryItem[] = [];
+  for (const item of eligible) {
+    const itemMatches = (matchesByItemId.get(item.id) ?? [])
+      .slice()
+      .sort((left, right) => right.thread.startedAtMs - left.thread.startedAtMs)
+      .slice(0, CODEX_MATCH_LIMITS.maxRowsPerHostItem);
+    for (const match of itemMatches) {
+      if (rows.length >= CODEX_MATCH_LIMITS.maxRowsTotal) return rows;
+      rows.push(codexMatchItem(projectId, item, match));
+    }
+  }
+  return rows;
+}
+
+/** A Codex-match row is a copy of its host item with the conversation fields replaced: same evidence path and fingerprint, so resuming it consumes the host record, never a Codex file of its own. */
+function codexMatchItem(projectId: string, hostItem: RecoveryItem, match: CodexMatch): RecoveryItem {
+  return {
+    ...hostItem,
+    id: recoveryId(projectId, "host", `${hostItem.sourceId}:${match.thread.id}`),
+    conversationId: match.thread.id,
+    conversationSource: "codex-match",
+    conversationName: match.thread.name,
+    conversationNameSource: match.thread.name !== undefined ? "codex-index" : undefined,
+    codexMatchOf: hostItem.id,
+    codexMatchTabs: match.tabs,
+  };
+}
+
 export function scanRecoveryInventory(input: {
   env?: NodeJS.ProcessEnv;
   projectRoot?: string;
+  // Opt-in only (default `false`): adds Codex C1 time-match rows for the one
+  // named project (`projectRoot` must also be set). `runfree sessions`,
+  // `--list`, `--json`, and `--all` (no `projectRoot`) never set this, so
+  // they never open `codex/` at all (security review F5). Only the
+  // interactive `runfree resume` path sets it.
+  includeCodexMatches?: boolean;
 } = {}): RecoveryInventory {
   const env = input.env ?? process.env;
   const projectsRoot = path.join(runfreeStateRoot(env), "projects");
@@ -1127,8 +1257,12 @@ export function scanRecoveryInventory(input: {
       const claudeEvidence = scanClaudeEvidence(stateDir, global);
       const mapping = projectMapping(stateDir, entry.name, hostEvidence);
       if (requestedRoot && mapping.projectRoot !== requestedRoot) continue;
-      items.push(...hostEvidence.map((evidence) => itemFromHost(entry.name, stateDir, mapping, evidence, env)));
+      const hostItems = hostEvidence.map((evidence) => itemFromHost(entry.name, stateDir, mapping, evidence, env));
+      items.push(...hostItems);
       items.push(...claudeEvidence.map((evidence) => itemFromClaude(entry.name, stateDir, mapping, evidence, env)));
+      if (requestedRoot && input.includeCodexMatches === true) {
+        items.push(...codexMatchItemsForProject(entry.name, stateDir, mapping, hostItems));
+      }
       if (global.files >= RECOVERY_LIMITS.maxFilesGlobal) {
         global.truncated = true;
         break;
