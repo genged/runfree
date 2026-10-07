@@ -648,7 +648,7 @@ describe("per-session admission survives a crash at every transition", () => {
     // Step 1: two crashed fresh launches, one after the other, each carrying
     // its own host-chosen conversation id.
     //
-    // `forceCleanSessions` runs between them, harness-only: the *second*
+    // The product's recovery (`--recover`) runs between them: the *second*
     // crash's own precondition refuses a dirty project (any surviving
     // lifecycle record or container), and the first crash's attached session
     // is exactly that — its owning host client is dead, but its session
@@ -659,8 +659,7 @@ describe("per-session admission survives a crash at every transition", () => {
     // lifecycle record (`runtime/v2/session-containers/<id>.json`) the clean
     // removes — so neither conversation's recoverability is lost.
     // Session ids the two crashes leave, so the "attached" waits below can
-    // exclude them explicitly rather than trust that `forceCleanSessions`
-    // (harness cleanup, not part of what this case proves) always finishes
+    // exclude them explicitly rather than trust that recovery always finishes
     // before either wait starts polling.
     const crashedSessionIds = new Set<string>();
     for (const conversationId of [conversationA, conversationB]) {
@@ -670,7 +669,22 @@ describe("per-session admission survives a crash at every transition", () => {
         `no attached crash landed for conversation ${conversationId}: ${describeOutput(crashed.output, 4000)}`,
       ).toContain(CRASH_INJECTION_MARKER);
       for (const record of listSessionContainerRecordsV2(stateDir, identity)) crashedSessionIds.add(record.sessionId);
-      await forceCleanSessions(fixture);
+      // The product's own reconciliation clears the crash residue, as every
+      // other crash case here does. `forceCleanSessions` is the harness's
+      // last-resort repair and reports any repair as a failure, so using it
+      // for expected residue failed this case live (2026-10-07).
+      const recovery = parseCrashRecovery(
+        await runCrashScript(fixture, ["--recover"]),
+        `recovery after the crash of conversation ${conversationId}`,
+      );
+      expect(
+        recovery.recovered,
+        `recovery after the crash of conversation ${conversationId} failed: ${describeOutput(recovery.failure ?? "<no failure reported>", 2000)}`,
+      ).toBe(true);
+      expect(
+        recovery.after.lifecycleRegistryEmpty && recovery.after.residualContainers === 0,
+        `recovery after the crash of conversation ${conversationId} left session residue: ${JSON.stringify(recovery.after)}`,
+      ).toBe(true);
     }
 
     // Step 2: the host-side inventory names both conversations exactly, each
