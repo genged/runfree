@@ -42,8 +42,20 @@ const TERMINAL_PART_MAX = 40;
 // characters or break a terminal line.
 const FORMAT_OR_SEPARATOR = /[\p{Cf}\p{Zl}\p{Zp}]/gu;
 
+// A `"` would let an agent-supplied name close `formatResumeRow`'s quoting
+// early; a run of plain spaces/tabs would let it fake the two-space column
+// gaps the host fields are joined with. Both are neutralized here, after
+// the existing strips and before the length cut, so the quoted name can
+// never be mistaken for (or bleed into) the host fields that follow it.
+const DOUBLE_QUOTE = /"/g;
+const WHITESPACE_RUN = /[ \t]+/g;
+
 export function sanitizeAgentText(value: string, max: number): string {
-  return sanitizeForTerminal(value).replace(FORMAT_OR_SEPARATOR, "").slice(0, max);
+  return sanitizeForTerminal(value)
+    .replace(FORMAT_OR_SEPARATOR, "")
+    .replace(DOUBLE_QUOTE, "'")
+    .replace(WHITESPACE_RUN, " ")
+    .slice(0, max);
 }
 
 // Whether a record is a candidate at all, independent of ranking (spec
@@ -159,6 +171,9 @@ function oneQuestionAllowed(row: ResumeRow, rows: readonly ResumeRow[]): boolean
   if (!ONE_QUESTION_AGENTS.has(item.agent)) return false;
   if (item.conversationSource !== "host-chosen" && item.conversationSource !== "resume-lineage") return false;
   const started = Date.parse(item.startedAt ?? "");
+  // Fail closed: an unparsable startedAt can't be compared against another
+  // row's, so show the picker instead of guessing it's the newest.
+  if (Number.isNaN(started)) return false;
   // Decision 1: a newer Claude-reported conversation means /clear or /resume
   // may have moved this tab to another conversation.
   return !rows.some((other) => other.source === "claude-reported"

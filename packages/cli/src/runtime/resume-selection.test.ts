@@ -181,6 +181,22 @@ describe("selectResumeCandidates", () => {
     expect(result.row.ago).toBe("6 min ago"); // NOW is 14:08Z, updatedAt is 14:02Z
   });
 
+  test("a resume-lineage host row with a strong match also asks the one question", () => {
+    const item = hostItem({ conversationSource: "resume-lineage" });
+    const result = selectResumeCandidates({ items: [item], current: CURRENT, now: NOW });
+    expect(result.kind).toBe("one-question");
+    if (result.kind !== "one-question") throw new Error("unreachable");
+    expect(result.row.item.id).toBe(item.id);
+  });
+
+  test("fails closed to the picker when startedAt cannot be parsed", () => {
+    const item = hostItem({ startedAt: undefined });
+    const result = selectResumeCandidates({ items: [item], current: CURRENT, now: NOW });
+    expect(result.kind).toBe("picker");
+    if (result.kind !== "picker") throw new Error("unreachable");
+    expect(result.defaultItemId).toBe(item.id);
+  });
+
   test("a codex-match note says 'Codex match' for one tab and 'matches N tabs' for several", () => {
     const base = hostItem({ agent: "codex" });
     const single = hostItem({ agent: "codex", conversationSource: "codex-match", codexMatchOf: base.id, codexMatchTabs: 1 });
@@ -202,6 +218,28 @@ describe("sanitizeAgentText", () => {
 
   test("cuts the result to max", () => {
     expect(sanitizeAgentText("x".repeat(100), 10)).toBe("x".repeat(10));
+  });
+
+  test("replaces embedded double quotes so a name cannot forge a closing quote and the host fields after it", () => {
+    const spoof = 'x"  claude  14:02  ttys004 · this terminal  "y';
+    const sanitized = sanitizeAgentText(spoof, 200);
+    expect(sanitized.includes('"')).toBe(false);
+    const row: ResumeRow = {
+      item: hostItem(),
+      match: "strong",
+      source: "host",
+      time: "09:15",
+      ago: "1 min ago",
+      agent: "claude",
+      terminal: "ttys007 (Terminal)",
+      name: sanitized,
+    };
+    const formatted = formatResumeRow(row);
+    expect(formatted.split('"')).toHaveLength(3); // exactly two '"' characters, both the real wrapper
+  });
+
+  test("collapses whitespace runs so a name cannot fake the two-space column gaps", () => {
+    expect(sanitizeAgentText("a   b    c", 80)).toBe("a b c");
   });
 });
 
