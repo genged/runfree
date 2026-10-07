@@ -116,6 +116,8 @@ effective policy, the proxy CA private key, and host files outside the project.
 | POSTs to an allowed host under `ask` | held for a host decision | write approval |
 | Uses an allowed token for a wrong purpose | **allowed** | token scope and request rules only |
 | Runs arbitrary code in the project | **allowed** | bounded by mounts and proxy |
+| Writes a fake Claude registry entry or Codex rollout file | labeled, non-default row in its own project's resume picker | sanitized display; never the default cursor or the one question; a resume still goes through normal admission |
+| Sets terminal-multiplexer env vars hoping to match a host session | no effect | terminal ids are read only from the host launcher's own environment, never read from or forwarded into the container |
 
 ## Core Rules
 
@@ -357,7 +359,17 @@ Details: [Write Approval Grants](architecture.md#write-approval-grants).
    Intended exceptions: per-project agent state, sanitized per-agent config,
    generated Git identity, dependency volumes, and the read-only inbox.
 3. Host code treats agent-writable state (Codex config, Claude session
-   registry) as hostile input: bounded, no-follow, single-link reads.
+   registry, Codex rollout and session-index files) as hostile input:
+   bounded, no-follow, single-link reads from a fixed, computed walk — never
+   a directory listing an attacker could seed — with per-directory,
+   per-tree, and byte budgets plus a wall-clock deadline. Rows built from it
+   (a Claude-registry name, a Codex time-matched thread) are sanitized,
+   labeled ("Claude reported", "Codex match"), and never the resume prompt's
+   default row or its one-question path.
+4. Terminal identifiers used to match a resumable session to the terminal
+   that started it (`TERM_SESSION_ID`, `ITERM_SESSION_ID`, `TMUX_PANE`, and
+   similar) are captured only from the host launcher's own environment. They
+   are never forwarded into a session container's environment.
 
 ### Lifecycle
 

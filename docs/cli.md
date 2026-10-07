@@ -91,7 +91,7 @@ Created project files include:
 | `runfree stop [--force]` | Stop this project's services. Requires `--force` while live or unprovable session owners remain, while a control-plane rebind is pending, or while any session is mid-teardown. |
 | `runfree destroy [--force]` | Destroy the whole project runtime: delete this project's session files from the proxy, remove session containers by their lifecycle records, run the Compose teardown (volumes, local images, orphans), then clear the lifecycle records. Without `--force` it refuses whenever ending work or losing state is possible: live sessions, running project containers no record or Compose claims, quarantined unreadable lifecycle records, an unreadable control-plane rebind journal, or a registry that cannot be enumerated. |
 | `runfree sessions` | List active sessions plus interrupted or unverified recovery evidence for this project. The CONTAINER TTY column reports each session's heartbeat: `attached, served until <aliveUntil>`, or `attached, NOT served since <lastHeartbeatAt> (heartbeat retrying)`. It also compares the proxy's session files with this project's records, without changing either: a session whose owning host process can be proved neither alive nor dead is named, with `runfree destroy --force` as the remedy, and session files no record claims are named with `runfree up` as the remedy. |
-| `runfree resume` | Pick and resume interrupted Claude or Codex work for the current project. |
+| `runfree resume` | Pick and resume interrupted Claude, Codex, or Pi work for the current project. |
 | `runfree resume --list` / `--json` | Inspect the current project's bounded recovery inventory offline without contacting Docker. |
 | `runfree resume --all` | Include interrupted work from every Runfree project; composes with `--list` or `--json`. |
 | `runfree resume --agent <agent>` | Include only one agent ID such as `claude` or `codex`; repeat the option to select a union. |
@@ -114,6 +114,40 @@ runfree logs proxy --verbose
 runfree runtime reload-policy
 runfree rebuild --yes
 ```
+
+### Resume
+
+Bare `runfree resume`, on a terminal (stdin and stdout both TTYs), scans only
+the current project. One strong terminal match to a Claude or Pi record
+carrying a host-chosen session id asks one question, default "Resume it":
+
+```text
+◆ Interrupted in this terminal (14:02, 6 min ago):
+│  "refactor proxy denial messages" — claude
+│  ● Resume it
+│  ○ Not now
+│  ○ Forget it (don't ask again)
+```
+
+"Not now" leaves the record for the next `runfree resume`; "Forget it"
+discards it immediately.
+
+Any other case shows a picker instead — strong terminal matches first, then
+weak matches, then the rest, newest first. Choosing a row asks "Resume it" /
+"Forget it" / "Back", so any row can be forgotten, not only a strong match.
+`--all` and `--project` show their own labelled picker, each row prefixed
+with its project name; it only resumes a row or returns to the list, and
+never asks the one question.
+
+Without a TTY, or with `--list`, `runfree resume` only prints the inventory
+table; `--json` is unchanged. Records from before this feature, with no
+record version, are hidden from the one question and the picker, but still
+listed by `--list`.
+
+`runfree claude`, `runfree codex`, and `runfree pi` never scan for
+interrupted work and never ask: they always start a fresh session. Resuming
+only ever happens through `runfree resume`. See [Interrupted Session
+Recovery](architecture.md#interrupted-session-recovery).
 
 ## Network Policy
 

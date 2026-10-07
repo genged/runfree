@@ -1098,16 +1098,43 @@ process-start identity so a reused PID cannot make abandoned work look active.
 the current project without contacting Docker or mutating state. `--all`
 explicitly expands the scan across projects; repeatable `--agent <agent>`
 filters the resulting inventory by exact agent ID. Selecting a recovery item
-revalidates its project mapping and exact live container session, acquires an
-exclusive host-owned claim, starts the normal validated runtime, and launches a
-descriptor-owned Claude or Codex resume argv. Failure releases only the claim;
-successful exit fingerprint-checks and consumes only the selected evidence.
+revalidates its project mapping and exact live container session, acquires a
+host-owned claim, starts the normal validated runtime, and launches a
+descriptor-owned Claude, Codex, or Pi resume argv. A record naming its own
+exact conversation id — a host-chosen id minted once per launch and carried
+into Claude or Pi as `--session-id`, a resumed session's own lineage, a
+Claude-registry report, or a Codex time match (below) — claims only that
+conversation, so two different conversations of the same agent can resume at
+once; a record with no exact id claims the whole agent instead, and the two
+claim kinds exclude each other within one agent. A claim records its owner's
+boot id and process start: one whose owner is proved dead, or whose boot id no
+longer matches, is reclaimed under the lifecycle lock; one that can be proved
+neither alive nor dead blocks only its own claim scope and ages into "dead"
+after 24 hours. Failure releases only the claim; successful exit
+fingerprint-checks and consumes only the selected evidence.
 
 Claude registry files are untrusted agent state. Recovery reads only bounded,
 regular, single-link files from fixed directories, with no-follow open and
 inode checks, validates conversation ids before building argv, and sanitizes
 display strings. It never touches conversation transcripts. `--agent` filters
-only; it grants no resume authority.
+only; it grants no resume authority. A completed exact Claude-conversation
+resume closes a recovery epoch for the agent, but the epoch blocks only
+*older* host records with no exact conversation id of their own; a host
+record that already names its own exact conversation is never shadowed by
+another conversation's epoch.
+
+Codex has no launch-time conversation id. A Codex row in the resume picker
+instead comes from a bounded reader that matches a host record's own time
+window against Codex's own rollout files under `sessions/<year>/<month>/<day>/`
+and `session_index.jsonl` — fixed-depth, no-follow, single-link opens with a
+byte budget and a wall-clock deadline, never a directory listing an attacker
+could seed. A thread inside exactly one record's window becomes a "Codex
+match" row; one inside more than one record's window becomes a row in each,
+marked "matches N tabs". These rows exist only in the interactive resume
+picker, never in `--list`, `--json`, or `--all`, and are capped per record and
+in total. A Codex match is never the one question and never the picker's
+default row, and its presence is re-checked against the live rollout files
+immediately before the claim.
 
 Host updates to the writable Codex state use a fixed-file operation at the
 mount root. It rejects symlinks, hard links, special files, oversized files,
@@ -1775,7 +1802,7 @@ A project image may replace the base image's session entry (`/usr/local/libexec/
 ## Optional Side Features
 
 - `runfree inbox paste` imports a macOS clipboard image into the read-only `/runfree/inbox` mount and prints its container path. The legacy `runfree paste-image` alias remains available with a deprecation warning.
-- `runfree resume` inventories and resumes interrupted Claude or Codex sessions; Pi evidence is listed but Pi has no resume command.
+- `runfree resume` inventories and resumes interrupted Claude, Codex, or Pi sessions.
 - `runfree vnc` starts an x11vnc session in the agent and forwards it through a loopback-only sidecar for headed UI workflows.
 - `runfree forward` opens a loopback-only host port forward into the agent through a labeled, pinned-image ingress forwarder; `runfree forward status` lists open forwards.
 - `runfree host-service add|remove|list` approves agent access to a TCP service on the host's loopback, carried by the session relay and an opaque proxy splice; see [Host Services](#host-services).
