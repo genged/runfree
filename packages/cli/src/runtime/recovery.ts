@@ -876,6 +876,14 @@ function validConversationId(value: string | undefined): string | undefined {
   return value !== undefined && UUID_RE.test(value) ? value.toLowerCase() : undefined;
 }
 
+// A host item's state before any claim verdict is applied: shared by the
+// host item itself and by every Codex C1 row derived from it, so a row never
+// inherits the host's own (agent-wide, picker) claim verdict.
+function hostItemPreClaimState(mapping: ProjectMapping, ownerState: RecoveryItem["ownerState"]): RecoveryState {
+  if (!mapping.valid) return "unrecoverable";
+  return ownerState === "active" ? "active" : "unverified";
+}
+
 function itemFromHost(
   projectId: string,
   stateDir: string,
@@ -905,7 +913,7 @@ function itemFromHost(
     ...(mapping.projectRoot ? { projectRoot: mapping.projectRoot } : {}),
     projectName: mapping.projectName,
     stateDir,
-    state: mapping.valid && ownerState === "active" ? "active" : "unverified",
+    state: hostItemPreClaimState(mapping, ownerState),
     evidenceKind: "host",
     evidencePath: evidence.path,
     fingerprint: fingerprint(evidence.stat, metadata.id, evidence.sha256),
@@ -925,7 +933,7 @@ function itemFromHost(
     updatedAt: metadata.endedAt ?? metadata.lastSeenAt,
     terminalHint: metadata.hostTty ?? metadata.termProgram,
     hostMetadata: metadata,
-    ...(!mapping.valid ? { state: "unrecoverable", reason: mapping.reason } : {}),
+    ...(!mapping.valid ? { reason: mapping.reason } : {}),
   };
   if (mapping.valid) applyClaimState(item, env);
   // The Claude-wide exact-recovery epoch (H2) only protects *imprecise*
@@ -1173,6 +1181,7 @@ function codexMatchItemsForProject(
   stateDir: string,
   mapping: ProjectMapping,
   hostItems: readonly RecoveryItem[],
+  env: NodeJS.ProcessEnv,
 ): RecoveryItem[] {
   try {
     // Every Codex v2 host record, newest `startedAt` first: active and
@@ -1216,7 +1225,7 @@ function codexMatchItemsForProject(
     const matches = matchCodexThreads(matchInputs, Array.from(threadsById.values()))
       .filter((match) => rowEligibleIds.has(match.itemId));
     const eligible = codexItems.filter((item) => rowEligibleIds.has(item.id));
-    return codexMatchRows(projectId, eligible, matches);
+    return codexMatchRows(projectId, mapping, eligible, matches, env);
   } catch {
     return [];
   }
@@ -1225,8 +1234,10 @@ function codexMatchItemsForProject(
 /** Groups `matches` by host item, newest thread first, within `CODEX_MATCH_LIMITS` (5 rows per host item, 50 in total — security review F5). Host items are already newest-`startedAt`-first, so the running total cap drops the oldest items' rows first. */
 function codexMatchRows(
   projectId: string,
+  mapping: ProjectMapping,
   eligible: readonly RecoveryItem[],
   matches: readonly CodexMatch[],
+  env: NodeJS.ProcessEnv,
 ): RecoveryItem[] {
   const matchesByItemId = new Map<string, CodexMatch[]>();
   for (const match of matches) {
@@ -1242,16 +1253,33 @@ function codexMatchRows(
       .slice(0, CODEX_MATCH_LIMITS.maxRowsPerHostItem);
     for (const match of itemMatches) {
       if (rows.length >= CODEX_MATCH_LIMITS.maxRowsTotal) return rows;
-      rows.push(codexMatchItem(projectId, item, match));
+      rows.push(codexMatchItem(projectId, mapping, item, match, env));
     }
   }
   return rows;
 }
 
-/** A Codex-match row is a copy of its host item with the conversation fields replaced: same evidence path and fingerprint, so resuming it consumes the host record, never a Codex file of its own. */
-function codexMatchItem(projectId: string, hostItem: RecoveryItem, match: CodexMatch): RecoveryItem {
-  return {
-    ...hostItem,
+/**
+ * A Codex-match row is a copy of its host item with the conversation fields
+ * replaced: same evidence path and fingerprint, so resuming it consumes the
+ * host record, never a Codex file of its own. Its claim state is its own:
+ * the host item's `state` and `claimUnprovable` came from the host's
+ * agent-wide (picker) scope, so the row starts from the host's pre-claim
+ * state and gets the verdict of its own per-conversation scope
+ * (`recoveryClaimScope`) — one live exact claim on thread X must not hide the
+ * row for thread Y.
+ */
+function codexMatchItem(
+  projectId: string,
+  mapping: ProjectMapping,
+  hostItem: RecoveryItem,
+  match: CodexMatch,
+  env: NodeJS.ProcessEnv,
+): RecoveryItem {
+  const { claimUnprovable: _hostClaimUnprovable, ...host } = hostItem;
+  const row: RecoveryItem = {
+    ...host,
+    state: hostItemPreClaimState(mapping, hostItem.ownerState),
     id: recoveryId(projectId, "host", `${hostItem.sourceId}:${match.thread.id}`),
     conversationId: match.thread.id,
     conversationSource: "codex-match",
@@ -1260,6 +1288,8 @@ function codexMatchItem(projectId: string, hostItem: RecoveryItem, match: CodexM
     codexMatchOf: hostItem.id,
     codexMatchTabs: match.tabs,
   };
+  if (mapping.valid) applyClaimState(row, env);
+  return row;
 }
 
 export function scanRecoveryInventory(input: {
@@ -1301,7 +1331,7 @@ export function scanRecoveryInventory(input: {
       items.push(...hostItems);
       items.push(...claudeEvidence.map((evidence) => itemFromClaude(entry.name, stateDir, mapping, evidence, env)));
       if (requestedRoot && input.includeCodexMatches === true) {
-        items.push(...codexMatchItemsForProject(entry.name, stateDir, mapping, hostItems));
+        items.push(...codexMatchItemsForProject(entry.name, stateDir, mapping, hostItems, env));
       }
       if (global.files >= RECOVERY_LIMITS.maxFilesGlobal) {
         global.truncated = true;

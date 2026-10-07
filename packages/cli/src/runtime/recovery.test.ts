@@ -2552,3 +2552,73 @@ describe("per-evidence-file consumed records (duplicate Claude registry files)",
     expect(fs.existsSync(olderPath)).toBe(true);
   });
 });
+
+describe("codex-match rows carry their own conversation's claim state", () => {
+  const THREAD_X = "01a0692c-7f74-7750-ad42-fb36200a0001";
+  const THREAD_Y = "01a0692c-7f74-7750-ad42-fb36200a0002";
+
+  function codexHostWithTwoThreads(): void {
+    hostEvidence("rf-20260731-cdxclm", {
+      command: "codex",
+      recordVersion: 2,
+      outcome: "interrupted",
+      startedAt: "2026-07-31T00:00:00.000Z",
+      endedAt: "2026-07-31T00:30:00.000Z",
+    });
+    codexRollout("2026/07/31", THREAD_X, "2026-07-31T00:05:00.000Z");
+    codexRollout("2026/07/31", THREAD_Y, "2026-07-31T00:10:00.000Z");
+  }
+
+  function codexRow(items: readonly RecoveryItem[], thread: string): RecoveryItem {
+    const row = items.find((item) => item.conversationSource === "codex-match" && item.conversationId === thread);
+    if (!row) throw new Error(`missing codex-match row for ${thread}`);
+    return row;
+  }
+
+  test("a live exact claim on thread X marks only the X row claimed; the Y row stays offered", async () => {
+    codexHostWithTwoThreads();
+    const before = scanRecoveryInventory({ env, projectRoot, includeCodexMatches: true }).items;
+    const claim = await acquireRecoveryClaim(runtimeContext(), codexRow(before, THREAD_X));
+    expect(claim).toBeDefined();
+
+    try {
+      const after = scanRecoveryInventory({ env, projectRoot, includeCodexMatches: true }).items;
+      const host = after.find((item) => item.sourceId === "rf-20260731-cdxclm" && item.conversationSource !== "codex-match");
+
+      // The host row is the agent-wide picker scope, which a live exact
+      // claim of the same agent excludes.
+      expect(host?.state).toBe("claimed");
+      expect(codexRow(after, THREAD_X).state).toBe("claimed");
+      expect(codexRow(after, THREAD_Y).state).not.toBe("claimed");
+      expect(codexRow(after, THREAD_Y).claimUnprovable).toBeUndefined();
+    } finally {
+      claim?.release();
+    }
+  });
+
+  test("an unprovable claim on the row's own thread sets claimUnprovable on that row only", () => {
+    codexHostWithTwoThreads();
+    const before = scanRecoveryInventory({ env, projectRoot, includeCodexMatches: true }).items;
+    writeClaimFile(codexRow(before, THREAD_X), { hostBootId: undefined, hostProcessStart: undefined });
+
+    const after = scanRecoveryInventory({ env, projectRoot, includeCodexMatches: true }).items;
+
+    expect(codexRow(after, THREAD_X).claimUnprovable).toBeDefined();
+    expect(codexRow(after, THREAD_Y).claimUnprovable).toBeUndefined();
+    expect(codexRow(after, THREAD_Y).state).not.toBe("claimed");
+  });
+
+  test("an unprovable picker claim on the host record does not mark its codex-match rows unprovable", () => {
+    codexHostWithTwoThreads();
+    const before = scanRecoveryInventory({ env, projectRoot, includeCodexMatches: true }).items;
+    const host = before.find((item) => item.sourceId === "rf-20260731-cdxclm" && item.conversationSource !== "codex-match");
+    if (!host) throw new Error("missing host row");
+    writeClaimFile(host, { hostBootId: undefined, hostProcessStart: undefined });
+
+    const after = scanRecoveryInventory({ env, projectRoot, includeCodexMatches: true }).items;
+
+    expect(after.find((item) => item.id === host.id)?.claimUnprovable).toBeDefined();
+    expect(codexRow(after, THREAD_X).claimUnprovable).toBeUndefined();
+    expect(codexRow(after, THREAD_Y).claimUnprovable).toBeUndefined();
+  });
+});
