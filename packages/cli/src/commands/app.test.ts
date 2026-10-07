@@ -8,6 +8,7 @@ import { RUNFREE_VERSION } from "../embedded-assets.generated.ts";
 import { CliError } from "../errors.ts";
 import { composeProjectName, projectHash } from "../project-identity.ts";
 import { ControlPlaneRebindCandidateMismatchError } from "../runtime/control-plane-rebind-coordinator.ts";
+import { runWithRecoveryClaim, scanRecoveryInventory, type RecoveryItem } from "../runtime/recovery.ts";
 import type { RuntimeContext, RuntimeIO } from "../runtime/types.ts";
 import { runAgentCommand } from "../runtime.ts";
 import { runAgentCommandWithControlPlaneRebindRefusal, runCommandApp } from "./app.ts";
@@ -91,10 +92,14 @@ vi.mock("../runtime/recovery.ts", async (importOriginal) => {
 });
 
 // `resumeRecoveryRuntime` is the only thing that starts a runtime/Docker for
-// `runfree resume`; counting real calls to it (always passed through) lets a
-// dismiss/refusal test prove no runtime ever started, not merely that the
-// test's own assertions happened to pass.
-const runtimeSeams = vi.hoisted(() => ({ resumeRecoveryRuntimeCalls: 0 }));
+// `runfree resume`; counting real calls to it lets a dismiss/refusal test
+// prove no runtime ever started, not merely that the test's own assertions
+// happened to pass. Passed through unless a test arms `resumeRecoveryRuntime`
+// to stand in for the Docker-facing resume.
+const runtimeSeams = vi.hoisted(() => ({
+  resumeRecoveryRuntimeCalls: 0,
+  resumeRecoveryRuntime: undefined as undefined | ((...args: never[]) => Promise<number>),
+}));
 
 vi.mock("../runtime.ts", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../runtime.ts")>();
@@ -102,7 +107,8 @@ vi.mock("../runtime.ts", async (importOriginal) => {
     ...actual,
     resumeRecoveryRuntime: (...args: Parameters<typeof actual.resumeRecoveryRuntime>) => {
       runtimeSeams.resumeRecoveryRuntimeCalls += 1;
-      return actual.resumeRecoveryRuntime(...args);
+      const stub = runtimeSeams.resumeRecoveryRuntime as undefined | typeof actual.resumeRecoveryRuntime;
+      return stub ? stub(...args) : actual.resumeRecoveryRuntime(...args);
     },
   };
 });
@@ -319,6 +325,7 @@ afterEach(() => {
   recoverySeams.dismissResult = undefined;
   recoverySeams.scanCalls = 0;
   runtimeSeams.resumeRecoveryRuntimeCalls = 0;
+  runtimeSeams.resumeRecoveryRuntime = undefined;
   startupSeams.startRuntime = undefined;
   for (const dir of tempDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
 });
@@ -805,6 +812,109 @@ describe("runCommandApp parser", () => {
     });
   });
 
+  describe("bare runfree resume: the one question (resume.ts)", () => {
+    const ITERM_ID = "w0t0p0:same-terminal";
+
+    // A strong-match v2 Claude host record: its terminal ids equal the ids
+    // `currentTerminal` reads from this test env, so bare `runfree resume`
+    // asks the one question about it.
+    function setupStrongMatchProject(prefix: string): { stateRoot: string; projectRoot: string; env: NodeJS.ProcessEnv; recordPath: string } {
+      const stateRoot = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+      tempDirs.push(stateRoot);
+      const projectRoot = path.join(stateRoot, "current-project");
+      const recordPath = writeHostRecoveryFixtureV2(stateRoot, projectRoot, {
+        terminalIds: { iterm: ITERM_ID },
+        termProgram: "iTerm.app",
+      });
+      fs.mkdirSync(path.join(projectRoot, ".runfree"), { recursive: true });
+      fs.writeFileSync(path.join(projectRoot, ".runfree", "network-policy.json"), '{"version":2,"hosts":["example.com"]}\n');
+      const env = {
+        XDG_STATE_HOME: stateRoot,
+        TERM_PROGRAM: "iTerm.app",
+        ITERM_SESSION_ID: ITERM_ID,
+        RUNFREE_TEST_HOST_BOOT_ID: "linux:11111111-2222-3333-4444-555555555555",
+        RUNFREE_TEST_HOST_PROCESS_START: "linux:12345",
+      };
+      return { stateRoot, projectRoot, env, recordPath };
+    }
+
+    function resumeContext(projectRoot: string, env: NodeJS.ProcessEnv, promptApi: PromptApi): RunfreeCommandContext {
+      return strictContext({
+        env,
+        projectRoot,
+        promptApi,
+        assets: () => ({ runtimeDir: "/fake/runtime" }) as unknown as ReturnType<RunfreeCommandContext["assets"]>,
+      });
+    }
+
+    test("on a TTY, a strong match asks the one question, and \"Resume it\" reaches resumeRecoveryRuntime with that item", async () => {
+      const { projectRoot, env, recordPath } = setupStrongMatchProject("runfree-resume-one-question-");
+      const expected = scanRecoveryInventory({ env, projectRoot }).items[0];
+      if (!expected) throw new Error("missing recovery fixture");
+      runtimeSeams.resumeRecoveryRuntime = vi.fn(async () => 0);
+      const promptApi = fakePromptApi(() => "resume");
+      const runDefault = vi.fn(async () => 0);
+
+      const status = await withTty(true, true, () =>
+        runCommandApp(resumeContext(projectRoot, env, promptApi), ["resume"], runDefault));
+
+      expect(status).toBe(0);
+      expect(promptApi.calls).toHaveLength(1);
+      expect(promptApi.calls[0]?.message).toContain("Interrupted in this terminal");
+      expect(runtimeSeams.resumeRecoveryRuntime).toHaveBeenCalledTimes(1);
+      const passed = vi.mocked(runtimeSeams.resumeRecoveryRuntime).mock.calls[0]?.[2] as RecoveryItem | undefined;
+      expect(passed?.id).toBe(expected.id);
+      expect(passed?.evidencePath).toBe(recordPath);
+      expect(passed?.fingerprint).toEqual(expected.fingerprint);
+      expect(runDefault).not.toHaveBeenCalled();
+    });
+
+    test("stdin a TTY but stdout not: prints the list and asks nothing", async () => {
+      const { projectRoot, env } = setupStrongMatchProject("runfree-resume-stdout-notty-");
+      runtimeSeams.resumeRecoveryRuntime = vi.fn(async () => 0);
+      const promptApi = fakePromptApi(() => "resume");
+      const out = captureStdout();
+
+      const status = await withTty(true, false, () =>
+        runCommandApp(resumeContext(projectRoot, env, promptApi), ["resume"], vi.fn(async () => 0)));
+
+      expect(status).toBe(0);
+      expect(promptApi.calls).toHaveLength(0);
+      expect(out.text()).toContain("claude");
+      expect(out.text()).toContain("11111111-2222-4333-8444-555555555555");
+      expect(runtimeSeams.resumeRecoveryRuntime).not.toHaveBeenCalled();
+    });
+
+    test("decision 6: a resume that ends non-zero keeps the record, and the next runfree resume asks the same one question", async () => {
+      const { projectRoot, env, recordPath } = setupStrongMatchProject("runfree-resume-nonzero-");
+      // The real claim and consumption path around a resumed session that
+      // ended non-zero (no `supersededByNewRecord`): only the Docker-facing
+      // session itself is replaced.
+      runtimeSeams.resumeRecoveryRuntime = vi.fn(async (context: RuntimeContext, _io: RuntimeIO, item: RecoveryItem) => {
+        const result = await runWithRecoveryClaim(context, item, () => 137);
+        return result?.status ?? 1;
+      });
+      const firstPrompt = fakePromptApi(() => "resume");
+
+      const status = await withTty(true, true, () =>
+        runCommandApp(resumeContext(projectRoot, env, firstPrompt), ["resume"], vi.fn(async () => 0)));
+
+      expect(status).toBe(137);
+      expect(fs.existsSync(recordPath)).toBe(true);
+      const secondPrompt = fakePromptApi(() => PROMPT_CANCEL);
+      vi.spyOn(console, "log").mockImplementation(() => {});
+
+      const second = await withTty(true, true, () =>
+        runCommandApp(resumeContext(projectRoot, env, secondPrompt), ["resume"], vi.fn(async () => 0)));
+
+      expect(second).toBe(0);
+      expect(secondPrompt.calls).toHaveLength(1);
+      expect(secondPrompt.calls[0]?.message).toContain("Interrupted in this terminal");
+      expect(secondPrompt.calls[0]?.message).toBe(firstPrompt.calls[0]?.message);
+      expect(secondPrompt.calls[0]?.options.map((option) => option.value)).toEqual(["resume", "not-now", "forget"]);
+    });
+  });
+
   test("runfree claude refuses before the approval gate, scanning nothing, when the checkout binding is corrupted (decision 5)", async () => {
     const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), "runfree-claude-decision5-"));
     tempDirs.push(projectRoot);
@@ -869,12 +979,13 @@ describe("runCommandApp parser", () => {
 
   // Controller ruling (fix round 1): a refusal that stops the launch early
   // proves nothing by itself — stopping early is exactly when a scan is also
-  // structurally unreachable. This test instead lets the whole launch run to
-  // a clean, known completion (approvals genuinely approved, the
-  // operational-service review genuinely allowed to enable `agent-claude`,
-  // only `startRuntime` — the Docker boundary — stubbed) and still asserts
-  // zero `scanRecoveryInventory` calls.
-  test("runfree claude never scans across a full, successful launch, with only startRuntime stubbed (decision 5)", async () => {
+  // structurally unreachable. This test instead lets the launch run past the
+  // approval gate and the operational-service review (approvals genuinely
+  // approved, the review genuinely allowed to enable `agent-claude`) into
+  // `startRuntime` — the Docker boundary, stubbed to a known failed status —
+  // and still asserts zero `scanRecoveryInventory` calls. It does not reach
+  // the session itself: everything after `startRuntime` is out of scope.
+  test("runfree claude never scans on the launch path through the approval gate and service review into startRuntime (decision 5)", async () => {
     const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), "runfree-claude-decision5-full-"));
     tempDirs.push(projectRoot);
     const stateRoot = fs.mkdtempSync(path.join(os.tmpdir(), "runfree-claude-decision5-full-state-"));
