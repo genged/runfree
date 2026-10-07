@@ -171,7 +171,7 @@ Order, hardening, and firewall rules:
    See [Desired-Policy Mutation](architecture.md#desired-policy-mutation-beside-live-sessions).
 5. Invalid or incomplete generations keep the previous effective policy.
 6. The project `.runfree/config/agent.env` is ignored. The agent environment
-   comes from the selected effective generation.
+   comes from the selected effective policy generation.
 
 ### Credentials
 

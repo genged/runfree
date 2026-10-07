@@ -30,7 +30,7 @@ request is the boundary working.
 ## Policy edits had no effect
 
 Editing `.runfree/network-policy.json` changes *desired* policy. Nothing changes
-at runtime until a host-owned approval selects a compiled effective generation.
+at runtime until a host-owned approval selects a compiled effective policy generation.
 
 ```bash
 runfree policy status     # desired, approved, and selected identities

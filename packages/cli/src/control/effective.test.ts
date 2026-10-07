@@ -306,7 +306,7 @@ describe("effective control generations", () => {
     }
 
     fs.writeFileSync(path.join(project.paths.controlEffectiveDir, "generations", "unexpected"), "unsafe");
-    expect(() => cleanupEffectivePolicyGenerations(project, { retainUnprotected: 0 })).toThrow("unexpected effective generation entry");
+    expect(() => cleanupEffectivePolicyGenerations(project, { retainUnprotected: 0 })).toThrow("unexpected effective policy generation entry");
   });
 
   test("a changed checkout observation does not change the effective policy generation", () => {

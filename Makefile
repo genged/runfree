@@ -75,7 +75,7 @@ test-static:
 	@# checkouts without local/specs; never passes vacuously when specs exist.
 	pnpm exec tsx scripts/check-spec-citations.ts
 	@# Generation-family terminology gate (output contract D8): user-visible
-	@# strings name the family, never a bare "generation".
+	@# strings and public docs name the family, never a bare "generation".
 	pnpm exec tsx scripts/check-terminology.ts
 	@# Docker argv ownership gate (todo 83 Phase 2): docker command lines are
 	@# built only in runtime/docker-client.ts and the sealed session commands.

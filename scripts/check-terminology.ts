@@ -3,13 +3,14 @@
 // Generation-family terminology gate (output contract D8; AGENTS.md
 // "Generation Families").
 //
-// User-visible strings must name the generation family — effective policy
-// generation, control plane generation, session agent generation, runtime
-// generation, ... — never the bare phrase "control generation" or an
-// unqualified "a/the/selected/new generation" or a bare `generation:` label,
-// because two near-homograph families exist and the bare word reads as the
-// wrong one. The check runs over string literals in the emitting modules (the
-// same set the remedy parse gate scans) and is part of `make test-static`.
+// User-visible strings and the public documentation must name the generation
+// family — effective policy generation, control plane generation, session
+// agent generation, runtime generation, ... — never the bare phrase "control
+// generation" or an unqualified "a/the/selected/new generation" or a bare
+// `generation:` label, because two near-homograph families exist and the bare
+// word reads as the wrong one. The check runs over string literals in the
+// emitting modules (the same set the remedy parse gate scans) and over the
+// public documentation, and is part of `make test-static`.
 
 import childProcess from "node:child_process";
 import fs from "node:fs";
@@ -56,6 +57,7 @@ const FAMILY_QUALIFIERS = [
 
 const BARE_PHRASES: Array<{ pattern: RegExp; reason: string }> = [
   { pattern: /\bcontrol generation\b/i, reason: "bare \"control generation\"; name the family (effective policy generation vs control plane generation)" },
+  { pattern: /\beffective generation\b/i, reason: "bare \"effective generation\"; the family is \"effective policy generation\"" },
   { pattern: /\b(?:a|the|new|selected|active|current|desired|this|that|no|its|each|every|one|another|latest|previous|same|different)\s+generation\b/i, reason: "unqualified generation; add the family qualifier" },
   { pattern: /(?:^|[\s(])generation:/i, reason: "bare `generation:` label; qualify the family inline" },
 ];
@@ -106,8 +108,42 @@ function listEmittingFiles(): string[] {
     .sort();
 }
 
+// Public documentation names the same families. Release notes and the
+// per-release "what's new" pages are fixed records of their release.
+function listPublicDocs(): string[] {
+  const output = childProcess.spawnSync("git", ["ls-files", "-z", "--", "README.md", "CONTRIBUTING.md", "SECURITY.md", "docs"], {
+    cwd: repoRoot,
+    encoding: "utf8",
+  });
+  if (output.status !== 0) {
+    console.error(`check-terminology: git ls-files failed: ${output.stderr}`);
+    process.exit(1);
+  }
+  return output.stdout
+    .split("\0")
+    .filter((entry) => entry.endsWith(".md") && !entry.startsWith("docs/release-notes/") && !entry.startsWith("docs/whats-new-"))
+    .sort();
+}
+
+// A double-quoted phrase is a mention of the term ("control generation" is
+// retired), not a use of it.
+export function findDocumentationViolations(line: string): TerminologyViolation[] {
+  return findTerminologyViolations(line.replace(/"[^"]*"/g, (quoted) => " ".repeat(quoted.length)));
+}
+
 export function scanRepository(): string[] {
   const problems: string[] = [];
+  const docs = listPublicDocs();
+  if (docs.length === 0) problems.push("check-terminology: found no public documentation; the gate would pass vacuously");
+  for (const file of docs) {
+    const lines = fs.readFileSync(path.join(repoRoot, file), "utf8").split("\n");
+    lines.forEach((line, index) => {
+      if (!/generation/i.test(line)) return;
+      for (const violation of findDocumentationViolations(line)) {
+        problems.push(`${file}:${index + 1}: "${violation.text}" — ${violation.reason}`);
+      }
+    });
+  }
   const files = listEmittingFiles();
   if (files.length === 0) {
     problems.push("check-terminology: found no emitting modules; the gate would pass vacuously");
@@ -131,7 +167,7 @@ const entryPath = process.argv[1] ? path.resolve(process.argv[1]) : "";
 if (entryPath === fileURLToPath(import.meta.url)) {
   const problems = scanRepository();
   if (problems.length > 0) {
-    console.error("check-terminology: user-visible strings must name the generation family:");
+    console.error("check-terminology: user-visible strings and public docs must name the generation family:");
     for (const problem of problems) console.error(`  ${problem}`);
     process.exit(1);
   }

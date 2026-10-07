@@ -370,7 +370,7 @@ export function readEffectiveControlProvenance(
   const generation = verifyEffectivePolicyGeneration(project, controlGeneration);
   const projectDigest = generation.hostManifest.selectedSubjects["network-project"];
   const localDigest = generation.hostManifest.selectedSubjects["network-local"];
-  if (!projectDigest || !localDigest) throw new Error("effective generation has no selected network subjects");
+  if (!projectDigest || !localDigest) throw new Error("effective policy generation has no selected network subjects");
   const compiled = compileDesiredPolicies({
     project: verifyNetworkSnapshot(project, "network-project", projectDigest),
     local: verifyNetworkSnapshot(project, "network-local", localDigest),
@@ -712,15 +712,15 @@ export function cleanupEffectivePolicyGenerations(
   });
   for (const names of namesByRoot) {
     for (const name of names) {
-      if (!/^[a-f0-9]{64}$/.test(name)) throw new Error(`unexpected effective generation entry: ${name}`);
+      if (!/^[a-f0-9]{64}$/.test(name)) throw new Error(`unexpected effective policy generation entry: ${name}`);
     }
   }
   const allNames = new Set(namesByRoot.flat());
   for (const name of allNames) {
-    if (!namesByRoot.every((names) => names.includes(name))) throw new Error(`unpaired effective generation entry: ${name}`);
+    if (!namesByRoot.every((names) => names.includes(name))) throw new Error(`unpaired effective policy generation entry: ${name}`);
     for (const root of roots) {
       const stat = fs.lstatSync(path.join(root, name));
-      if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error(`unsafe effective generation entry: ${name}`);
+      if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error(`unsafe effective policy generation entry: ${name}`);
     }
   }
   const protectedDigests = new Set<string>([

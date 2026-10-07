@@ -157,7 +157,7 @@ Runfree policy is exact-host based. There are no wildcard hosts.
 `.runfree/network-policy.json` is writable desired policy v2. Editing it does
 not change a running proxy or authorize the next start. Runfree captures it
 while project agents are quiesced, compares it with host-owned approvals, and
-compiles an immutable effective generation only after exact approval.
+compiles an immutable effective policy generation only after exact approval.
 
 ### Review and activate desired policy
 
