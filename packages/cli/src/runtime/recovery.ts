@@ -388,9 +388,12 @@ function recoveryId(projectId: string, kind: RecoveryEvidenceKind, sourceId: str
   return `rfr-${digest.slice(0, 24)}`;
 }
 
-type DirectoryIdentity = { dev: number; ino: number };
+// Exported so the bounded Codex rollout reader (`codex-rollouts.ts`) can
+// reuse the exact same anchored-walk and post-open containment checks
+// instead of a second, divergent copy (security review F8).
+export type DirectoryIdentity = { dev: number; ino: number };
 
-function verifiedDirectoryIdentity(anchor: string, directoryPath: string): DirectoryIdentity | undefined {
+export function verifiedDirectoryIdentity(anchor: string, directoryPath: string): DirectoryIdentity | undefined {
   const root = path.resolve(anchor);
   const target = path.resolve(directoryPath);
   const relative = path.relative(root, target);
@@ -421,7 +424,7 @@ function directoryIdentityMatches(directoryPath: string, expected: DirectoryIden
   }
 }
 
-function entryResolvesInsideDirectory(
+export function entryResolvesInsideDirectory(
   directoryPath: string,
   filePath: string,
   expectedDirectory: DirectoryIdentity,
