@@ -39,9 +39,13 @@ U="$1"
 T="$(mktemp -d)"
 trap 'rm -rf "$T"' EXIT
 mkdir -p "$T/home" "$T/work" "$T/pi"
+# The image's claude is the Runfree launcher, which always passes
+# --mcp-config, defaulting to /runfree/mcp/claude.json. Only a session mounts
+# that file, so a bare image run needs its own (empty) one.
+printf '{"mcpServers":{}}\\n' > "$T/mcp.json"
 cd "$T/work" || exit 2
 run() {
-  env -i "PATH=$PATH" "HOME=$T/home" "CLAUDE_CONFIG_DIR=$T/home/.claude" \\
+  env -i "PATH=$PATH" "HOME=$T/home" "CLAUDE_CONFIG_DIR=$T/home/.claude" "RUNFREE_CLAUDE_MCP_CONFIG=$T/mcp.json" \\
     ANTHROPIC_API_KEY=placeholder ANTHROPIC_BASE_URL=http://127.0.0.1:9 DISABLE_AUTOUPDATER=1 \\
     "PI_CODING_AGENT_DIR=$T/pi" PI_SKIP_VERSION_CHECK=1 PI_TELEMETRY=0 "$@"
 }

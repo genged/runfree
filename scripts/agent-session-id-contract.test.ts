@@ -1,4 +1,7 @@
 import childProcess from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 
 import { afterEach, describe, expect, test, vi } from "vitest";
 
@@ -36,6 +39,43 @@ describe("AGENT_SESSION_ID_CONTRACT_SCRIPT", () => {
     // quoted prefix every claude/pi invocation shares.
     expect(AGENT_SESSION_ID_CONTRACT_SCRIPT.match(/env -i/g)).toHaveLength(1);
   });
+
+  test("gives the image's claude launcher an MCP config it creates itself", () => {
+    // The image's `claude` is the Runfree launcher, which always passes
+    // `--mcp-config "${RUNFREE_CLAUDE_MCP_CONFIG:-/runfree/mcp/claude.json}"`.
+    // A bare `docker run` of the image has no /runfree mount, so real claude
+    // exited "MCP config file not found" before writing the transcript
+    // (live failure, 2026-10-07). These stubs keep that one behavior.
+    const binDir = fs.mkdtempSync(path.join(os.tmpdir(), "runfree-contract-bin-"));
+    try {
+      fs.writeFileSync(path.join(binDir, "claude"), [
+        "#!/bin/sh",
+        // The default stands in for /runfree/mcp/claude.json, which a bare
+        // image lacks; this sandbox may itself be a session that has it.
+        'config="${RUNFREE_CLAUDE_MCP_CONFIG:-/nonexistent/runfree/mcp/claude.json}"',
+        '[ -f "$config" ] || { echo "MCP config file not found: $config" >&2; exit 1; }',
+        'for a in "$@"; do [ "$a" = "--resume" ] && { echo "--session-id can only be used with --continue or --resume" >&2; exit 1; }; done',
+        'id=""; prev=""; for a in "$@"; do [ "$prev" = "--session-id" ] && id="$a"; prev="$a"; done',
+        'mkdir -p "$CLAUDE_CONFIG_DIR/projects/work" && : > "$CLAUDE_CONFIG_DIR/projects/work/$id.jsonl"',
+        "sleep 30",
+      ].join("\n"), { mode: 0o755 });
+      fs.writeFileSync(path.join(binDir, "pi"), [
+        "#!/bin/sh",
+        'for a in "$@"; do [ "$a" = "--resume" ] && { echo "--session-id cannot be combined with --resume" >&2; exit 1; }; done',
+        'id=""; prev=""; for a in "$@"; do [ "$prev" = "--session-id" ] && id="$a"; prev="$a"; done',
+        'echo "Warning: No project session found with id \'$id\'; creating a new session with that id." >&2',
+        "exit 1",
+      ].join("\n"), { mode: 0o755 });
+      const result = childProcess.spawnSync(
+        "sh",
+        ["-c", AGENT_SESSION_ID_CONTRACT_SCRIPT, "sh", "11111111-2222-4333-8444-555555555555"],
+        { encoding: "utf8", env: { PATH: `${binDir}:${process.env.PATH ?? ""}` }, timeout: 30_000 },
+      );
+      expect(result.stdout, result.stderr).toBe(OK_RESULT.stdout);
+    } finally {
+      fs.rmSync(binDir, { recursive: true, force: true });
+    }
+  }, 40_000);
 });
 
 describe("CONTRACT_NODE_IMAGE", () => {
