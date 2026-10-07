@@ -2609,6 +2609,27 @@ describe("codex-match rows carry their own conversation's claim state", () => {
     expect(codexRow(after, THREAD_Y).state).not.toBe("claimed");
   });
 
+  test("dismissing the Y row is refused while a live claim on sibling thread X would consume the same host record", async () => {
+    codexHostWithTwoThreads();
+    const before = scanRecoveryInventory({ env, projectRoot, includeCodexMatches: true }).items;
+    const rowX = codexRow(before, THREAD_X);
+    const rowY = codexRow(before, THREAD_Y);
+    const context = runtimeContext();
+    const claim = await acquireRecoveryClaim(context, rowX);
+    expect(claim).toBeDefined();
+
+    try {
+      await expect(dismissRecoveryItem(context, rowY)).resolves.toBe("claimed");
+      expect(fs.existsSync(rowY.evidencePath)).toBe(true);
+    } finally {
+      claim?.release();
+    }
+
+    // With the sibling's claim released, the same dismiss goes through.
+    await expect(dismissRecoveryItem(context, rowY)).resolves.toBe("dismissed");
+    expect(fs.existsSync(rowY.evidencePath)).toBe(false);
+  });
+
   test("an unprovable picker claim on the host record does not mark its codex-match rows unprovable", () => {
     codexHostWithTwoThreads();
     const before = scanRecoveryInventory({ env, projectRoot, includeCodexMatches: true }).items;

@@ -2297,6 +2297,43 @@ export async function runWithRecoveryClaim(
 }
 
 /**
+ * Whether any held claim of this item's agent — live, or unprovable and not
+ * yet past `UNPROVABLE_CLAIM_MAX_AGE_MS` — names this item's own evidence
+ * fingerprint: a claim whose consumption would remove the same evidence
+ * file this dismiss is about to remove. Its own scope is not enough for a
+ * Codex C1 row: every row derived from one host record shares that record's
+ * evidence (`codexMatchItem`), so a resume of thread X holds only X's scope
+ * yet consumes the record a dismiss of thread Y would delete. A claims
+ * directory that cannot be verified, or a truncated listing, fails closed.
+ * A claim file whose content cannot be parsed names no evidence and is left
+ * to its own scope (review F2: it must not block another record).
+ */
+function claimOnSameEvidenceHeld(item: RecoveryItem, env: NodeJS.ProcessEnv, now: Date): boolean {
+  const agentScope = agentScopeHash(item.agent);
+  const claimsDir = recoveryClaimsDir(item);
+  try {
+    fs.lstatSync(claimsDir);
+  } catch {
+    return false;
+  }
+  if (!verifiedDirectoryIdentity(item.stateDir, claimsDir)) return true;
+  const global: GlobalScanBudget = { files: 0, truncated: false, invalidFiles: 0 };
+  const held = scanFixedDirectory<true>({
+    anchor: item.stateDir,
+    dir: claimsDir,
+    fileName: new RegExp(`^(agent-${agentScope}|conv-${agentScope}-[0-9a-f]{24})\\.json$`),
+    budget: { files: 0, bytes: 0 },
+    global,
+    parse: (filePath, _name, read) => {
+      const recorded = isRecord(read.value) ? parseFingerprint(read.value.evidence) : undefined;
+      if (!recorded || !sameFingerprint(recorded, item.fingerprint)) return undefined;
+      return claimFileLiveness(filePath, env, now).liveness === "dead" ? undefined : true;
+    },
+  });
+  return global.truncated || held.length > 0;
+}
+
+/**
  * "Forget it" (section 5): dismisses one recovery item without resuming it.
  * Reuses the same fingerprint-checked consumption as a successful resume,
  * under the same lifecycle lock, so a dismiss races a concurrent claim the
@@ -2316,8 +2353,9 @@ export async function dismissRecoveryItem(
   try {
     const env = context.env ?? process.env;
     // An unprovable own-scope claim blocks a dismiss exactly like a live one:
-    // either could still be a live resume in progress.
-    if (itemClaimState(item, env) !== "free") return "claimed";
+    // either could still be a live resume in progress. So does any held claim
+    // of another scope that would consume this same evidence file.
+    if (itemClaimState(item, env) !== "free" || claimOnSameEvidenceHeld(item, env, new Date())) return "claimed";
     return consumeRecoveryEvidence(item) ? "dismissed" : "changed";
   } finally {
     lifecycle.release();
