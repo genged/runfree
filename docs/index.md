@@ -32,6 +32,7 @@ summarizes them, the shorter page is the summary and they are the contract.
 | --- | --- |
 | [Contributing](../CONTRIBUTING.md) | Setup, tests, review expectations, PR scope |
 | [Testing](testing.md) | Test layers, what each proves, and proof limits |
+| [Writing documentation](writing-docs.md) | Which page owns which topic, and the checks the docs must pass |
 | [Security policy](../SECURITY.md) | How to report a vulnerability |
 
 ## Release notes

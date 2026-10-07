@@ -136,6 +136,12 @@ Public documentation must work in a clone that has nothing else:
 `make test-static` fails on a relative link or heading anchor that would not
 resolve there.
 
+[`docs/writing-docs.md`](docs/writing-docs.md) says which page owns which
+topic and how to write for it. A user-visible change updates its owning page in
+the same pull request, or the pull request says why nothing needs to change.
+`make test` also fails when a documented `runfree ...` example no longer parses
+or a page uses a bare generation phrase.
+
 ## Reporting bugs
 
 GitHub Issues, with the bug or feature template. Include the Runfree version,

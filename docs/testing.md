@@ -104,11 +104,17 @@ and `make test-static`:
   every hand-written `runfree <command>` string literal in the emitting
   modules — under the real command parser. A remedy that names a command,
   subcommand, or flag that does not exist fails the suite. Emit next-step
-  commands through the registry rather than as string literals.
+  commands through the registry rather than as string literals. The same
+  parse runs over every `runfree ...` example in the public docs, fenced or
+  inline, except release notes and "what's new" pages.
 - `scripts/check-terminology.ts` rejects the bare word "generation" in
-  user-visible strings: name the family (effective policy generation, control
-  plane generation, session agent generation, runtime generation, ...) as
-  `docs/architecture.md` "Generation Families" requires.
+  user-visible strings and in the public docs: name the family (effective
+  policy generation, control plane generation, session agent generation,
+  runtime generation, ...) as `docs/architecture.md` "Generation Families"
+  requires.
+
+[Writing documentation](writing-docs.md) lists every check the public docs
+must pass.
 
 When writing a failure message, make the last line state what did not happen
 in the user's nouns, reserve "deferred" for work that is actually queued, and
