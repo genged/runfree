@@ -34,6 +34,7 @@
 // late-lifecycle coverage while remaining self-identifying.
 
 import childProcess from "node:child_process";
+import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -43,6 +44,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, test } from "vitest";
 
 import { startLivePhase } from "./timing.ts";
 import { runfreeStateRoot } from "../../../packages/cli/src/paths.ts";
+import { scanRecoveryInventory } from "../../../packages/cli/src/runtime/recovery.ts";
 import {
   listQuarantinedSessionContainerRecordNamesV2,
   listSessionContainerRecordsV2,
@@ -65,16 +67,27 @@ import {
   CRASH_INJECTION_MARKER,
   CRASH_PRECONDITION_EXIT,
   CRASH_RECOVERY_PREFIX,
+  CRASH_REPORT_PREFIX,
   CRASH_RESUME_PREFIX,
   HELD_STATE_FILE,
   launchCrashPoints,
   probeCrashPoints,
   type CrashPoint,
   type CrashRecoveryReport,
+  type CrashReport,
   type CrashResumeReport,
   type HeldSessionState,
 } from "../session-admission-crash.ts";
 import { sessionAdmissionCrashEntryArgv } from "../../support/prebuilt-entry.ts";
+import { liveTierSelected } from "./tiers.ts";
+
+// This file holds cases of both live tiers (see `tiers.ts`): per-conversation
+// concurrent resume is the trust-boundary property (exact ids keep two
+// resumes from colliding) and is core; the single-crash-point sweep and
+// recovery-lifecycle cases below it are availability/recovery proofs and stay
+// extended.
+const coreTest = liveTierSelected("core") ? test : test.skip;
+const extendedTest = liveTierSelected("extended") ? test : test.skip;
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
 const CAPTURE_MAX_BYTES = 8 * 1024 * 1024;
@@ -140,14 +153,23 @@ type CrashRun = Readonly<{ status: number | null; signal: NodeJS.Signals | null;
  *
  * Sequencing is unchanged — callers await each run in order — but the event
  * loop stays free between reads, so the worker keeps answering.
+ *
+ * `options.env`, when given, replaces `fixture.env` for this one invocation —
+ * the second-Docker-stop case (review F3, Task 7) needs a terminal identity
+ * (`TERM_PROGRAM`/`ITERM_SESSION_ID`) in the runner's own environment so the
+ * host evidence it writes for the resumed session names a terminal.
  */
-async function runCrashScript(fixture: LiveFixture, args: readonly string[]): Promise<CrashRun> {
+async function runCrashScript(
+  fixture: LiveFixture,
+  args: readonly string[],
+  options: Readonly<{ env?: NodeJS.ProcessEnv }> = {},
+): Promise<CrashRun> {
   return await new Promise<CrashRun>((resolve, reject) => {
     const child = childProcess.spawn(
       process.execPath,
       [...sessionAdmissionCrashEntryArgv(), "--workspace", fixture.projectRoot, "--agent", PROBE_AGENT, ...args],
       // Its own process group, so the orphans below can be reaped as a unit.
-      { cwd: REPO_ROOT, detached: true, env: fixture.env, stdio: ["ignore", "pipe", "pipe"] },
+      { cwd: REPO_ROOT, detached: true, env: options.env ?? fixture.env, stdio: ["ignore", "pipe", "pipe"] },
     );
     let output = "";
     let truncated = false;
@@ -303,6 +325,14 @@ function parseCrashResume(run: CrashRun, label: string): CrashResumeReport {
     throw new Error(`${label} emitted no labelled resume report: ${describeOutput(run.output, 4000)}`);
   }
   return JSON.parse(line) as CrashResumeReport;
+}
+
+function parseCrashReport(run: CrashRun, label: string): CrashReport {
+  const line = run.output.split("\n").find((candidate) => candidate.startsWith(CRASH_REPORT_PREFIX));
+  if (!line) {
+    throw new Error(`${label} emitted no labelled report: ${describeOutput(run.output, 4000)}`);
+  }
+  return JSON.parse(line) as CrashReport;
 }
 
 describe("per-session admission survives a crash at every transition", () => {
@@ -466,7 +496,7 @@ describe("per-session admission survives a crash at every transition", () => {
   // it never writes a session file, and asking for a file transition would fail
   // as "never occurred" rather than prove anything.
   for (const point of probeCrashPoints()) {
-    test(`a crash ${point} leaves no authority and recovers to empty`, async () => {
+    extendedTest(`a crash ${point} leaves no authority and recovers to empty`, async () => {
       await assertCrashLeavesNoAuthorityAndRecovers(["--kill-at", point], point);
     }, TEST_TIMEOUT_MS);
   }
@@ -491,7 +521,7 @@ describe("per-session admission survives a crash at every transition", () => {
   // *new* validated lifecycle session created through the admission path. The
   // crashed container is residue to reclaim, never a resume target, and the
   // typed resume argv must be what actually launches in the new container.
-  test("a crashed attached session resumes into a new lifecycle session, never the old container", async () => {
+  extendedTest("a crashed attached session resumes into a new lifecycle session, never the old container", async () => {
     const crashed = await runCrashScript(fixture, ["--kill-when-attached"]);
     expect(
       crashed.output,
@@ -561,6 +591,182 @@ describe("per-session admission survives a crash at every transition", () => {
     // residue was reclaimed on the way in: nothing survives on either side.
     expect(resume.after.lifecycleRegistryEmpty, "resume left lifecycle records behind").toBe(true);
     expect(resume.after.residualContainers, "resume left session containers behind").toBe(0);
+  }, TEST_TIMEOUT_MS);
+
+  // Task 12 (same-terminal resume plan): two tabs resume at the same time.
+  //
+  // Per-conversation claims (Task 6) are the property under test: a claim
+  // scopes to one conversation, so two interrupted conversations in the same
+  // project can resume concurrently rather than queueing behind one
+  // whole-agent claim. `--resume-id` (this task) is what lets a caller name
+  // one exact conversation to resume instead of accepting whichever host
+  // evidence happens to be newest — without it, two concurrent crashes could
+  // never be told apart by anything this runner exposes.
+  coreTest("two interrupted Claude sessions resume at the same time, each with its own exact id", async () => {
+    const composeProject = composeProjectName(fixture);
+    const projectId = composeProject.replace(/^runfree-/u, "");
+    const stateDir = path.join(runfreeStateRoot(fixture.env), "projects", projectId);
+    const identity = { projectId, composeProject };
+    const claimsDir = path.join(stateDir, "sessions", "recovery-claims");
+    const stubDir = path.join(fixture.projectRoot, RESUME_STUB_DIRECTORY);
+    const claimFiles = (): string[] => (fs.existsSync(claimsDir) ? fs.readdirSync(claimsDir) : []);
+
+    const conversationA = crypto.randomUUID();
+    const conversationB = crypto.randomUUID();
+
+    // Step 1: two crashed fresh launches, one after the other, each carrying
+    // its own host-chosen conversation id.
+    //
+    // `forceCleanSessions` runs between them, harness-only: the *second*
+    // crash's own precondition refuses a dirty project (any surviving
+    // lifecycle record or container), and the first crash's attached session
+    // is exactly that — its owning host client is dead, but its session
+    // container keeps running, matching a record, until something reclaims
+    // it. That reclaim never touches the first crash's host evidence crash
+    // manifest, which lives under a completely separate tree
+    // (`sessions/<id>.json`, read by `scanRecoveryInventory`) from the
+    // lifecycle record (`runtime/v2/session-containers/<id>.json`) the clean
+    // removes — so neither conversation's recoverability is lost.
+    for (const conversationId of [conversationA, conversationB]) {
+      const crashed = await runCrashScript(fixture, ["--kill-when-attached", "--launch-conversation-id", conversationId]);
+      expect(
+        crashed.output,
+        `no attached crash landed for conversation ${conversationId}: ${describeOutput(crashed.output, 4000)}`,
+      ).toContain(CRASH_INJECTION_MARKER);
+      await forceCleanSessions(fixture);
+    }
+
+    // Step 2: the host-side inventory names both conversations exactly, each
+    // its own host-chosen item.
+    const crashedItems = scanRecoveryInventory({ projectRoot: fixture.projectRoot, env: fixture.env }).items;
+    const itemA = crashedItems.find((candidate) => candidate.conversationId === conversationA);
+    const itemB = crashedItems.find((candidate) => candidate.conversationId === conversationB);
+    expect(itemA, `no recovery item names conversation A: ${JSON.stringify(crashedItems.map((item) => item.id))}`).toBeDefined();
+    expect(itemB, `no recovery item names conversation B: ${JSON.stringify(crashedItems.map((item) => item.id))}`).toBeDefined();
+    expect(itemA?.conversationSource, "conversation A was not host-chosen").toBe("host-chosen");
+    expect(itemB?.conversationSource, "conversation B was not host-chosen").toBe("host-chosen");
+    expect(itemA?.id, "the two crashed conversations share one recovery id").not.toBe(itemB?.id);
+
+    // Vacuity guard: no per-conversation claim exists before either resume
+    // starts, so the count asserted below while both are attached is this
+    // case's own claims and not residue from an earlier one.
+    expect(claimFiles(), "a per-conversation claim exists before either resume started").toEqual([]);
+
+    // Step 3: both resumes run concurrently, each naming its own exact item.
+    fs.rmSync(stubDir, { recursive: true, force: true });
+    let completedA = false;
+    let completedB = false;
+    const resumedA = runCrashScript(fixture, ["--resume", "--resume-id", String(itemA?.id)])
+      .then((result) => { completedA = true; return result; });
+    const resumedB = runCrashScript(fixture, ["--resume", "--resume-id", String(itemB?.id)])
+      .then((result) => { completedB = true; return result; });
+    const finishConcurrent = startLivePhase("crash: two conversations resumed concurrently");
+    try {
+      const deadline = Date.now() + HELD_LAUNCH_WAIT_TIMEOUT_MS;
+      for (;;) {
+        const attached = listSessionContainerRecordsV2(stateDir, identity).filter((record) => record.state === "attached");
+        const readyA = fs.existsSync(path.join(stubDir, `ready-${conversationA}`));
+        const readyB = fs.existsSync(path.join(stubDir, `ready-${conversationB}`));
+        if (attached.length === 2 && readyA && readyB) break;
+        if (completedA || completedB) {
+          throw new Error(`a resume ended before both reached attached (A completed=${completedA}, B completed=${completedB})`);
+        }
+        if (Date.now() > deadline) throw new Error("both resumed agents never reached their ready/attached handshake");
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+
+      // Vacuity guard (step 3.5): exactly two per-conversation claims exist
+      // while both resumes are attached — the proof that per-conversation
+      // claims, not one shared whole-agent claim, are what let both run.
+      expect(
+        claimFiles().filter((name) => /^conv-[0-9a-f]{24}-[0-9a-f]{24}\.json$/u.test(name)),
+        "the claim directory does not hold exactly two per-conversation claims while both resumes are attached",
+      ).toHaveLength(2);
+    } finally {
+      fs.mkdirSync(stubDir, { recursive: true });
+      fs.writeFileSync(path.join(stubDir, `release-${conversationA}`), "");
+      fs.writeFileSync(path.join(stubDir, `release-${conversationB}`), "");
+      await Promise.allSettled([resumedA, resumedB]);
+      finishConcurrent();
+    }
+
+    // Step 4: both resumes completed through admission with their own exact
+    // id, never the other's and never a fresh-launch flag.
+    const resultA = parseCrashResume(await resumedA, "resume A");
+    const resultB = parseCrashResume(await resumedB, "resume B");
+    for (const [label, result, conversationId] of [
+      ["A", resultA, conversationA],
+      ["B", resultB, conversationB],
+    ] as const) {
+      expect(result.failure, `resume ${label} failed: ${describeOutput(result.failure ?? "", 4000)}`).toBeUndefined();
+      expect(result.outcome, `resume ${label} reported no outcome`).toEqual({ status: 0, consumed: true });
+      const createCommand = result.observedCommands.find((command) => command.startsWith("container create"));
+      expect(createCommand, `no session container create was observed during resume ${label}`).toBeDefined();
+      expect(createCommand).toContain(`--resume ${conversationId}`);
+      expect(createCommand, `resume ${label} carried a fresh-launch flag instead of resuming`).not.toContain("--session-id");
+    }
+
+    const after = parseCrashReport(await runCrashScript(fixture, ["--report"]), "report after both concurrent resumes");
+    expect(after.lifecycleRegistryEmpty, "the concurrent resumes left a lifecycle record").toBe(true);
+    expect(after.residualContainers, "the concurrent resumes left a session container").toBe(0);
+
+    // Step 6 (review F3, Task 7): a second Docker stop. Crash A once more,
+    // resume it with an iTerm terminal identity in the runner's own
+    // environment, and end the resumed session's container directly — not
+    // through the stub's ready/release handshake — while it is attached. A
+    // resumed session that reaches attached and then ends non-zero keeps its
+    // own record rather than the claimed original's, so the inventory holds
+    // exactly one item afterwards: the resumed session's own, naming the
+    // terminal it was resumed in.
+    const crashedAgain = await runCrashScript(fixture, ["--kill-when-attached", "--launch-conversation-id", conversationA]);
+    expect(
+      crashedAgain.output,
+      `no attached crash landed for the second-stop case: ${describeOutput(crashedAgain.output, 4000)}`,
+    ).toContain(CRASH_INJECTION_MARKER);
+
+    const itemAAgain = scanRecoveryInventory({ projectRoot: fixture.projectRoot, env: fixture.env }).items
+      .find((candidate) => candidate.conversationId === conversationA);
+    expect(itemAAgain, "no recovery item names conversation A after the second crash").toBeDefined();
+
+    fs.rmSync(stubDir, { recursive: true, force: true });
+    const iTermEnv: NodeJS.ProcessEnv = { ...fixture.env, TERM_PROGRAM: "iTerm.app", ITERM_SESSION_ID: "tab2" };
+    let secondResumeCompleted = false;
+    const secondResume = runCrashScript(fixture, ["--resume", "--resume-id", String(itemAAgain?.id)], { env: iTermEnv })
+      .then((result) => { secondResumeCompleted = true; return result; });
+    let secondContainerId: string | undefined;
+    try {
+      const deadline = Date.now() + HELD_LAUNCH_WAIT_TIMEOUT_MS;
+      for (;;) {
+        const attached = listSessionContainerRecordsV2(stateDir, identity).find((record) => record.state === "attached");
+        if (attached?.containerId && fs.existsSync(path.join(stubDir, `ready-${conversationA}`))) {
+          secondContainerId = attached.containerId;
+          break;
+        }
+        if (secondResumeCompleted) throw new Error(`the second-stop resume ended before reaching attached: ${(await secondResume).output}`);
+        if (Date.now() > deadline) throw new Error("the second-stop resume never reached its ready/attached handshake");
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+    } finally {
+      if (secondContainerId) docker(["kill", secondContainerId]);
+    }
+    const secondResult = parseCrashResume(await secondResume, "resume with a second Docker stop");
+    expect(secondResult.failure, `the second-stop resume failed: ${describeOutput(secondResult.failure ?? "", 4000)}`).toBeUndefined();
+    expect(secondResult.outcome, "the second-stop resume reported no outcome").toBeDefined();
+    expect(secondResult.outcome?.status, "ending the container read as a clean resume exit").not.toBe(0);
+    expect(secondResult.outcome?.consumed, "the second-stop resume did not consume the claimed original").toBe(true);
+
+    const finalItems = scanRecoveryInventory({ projectRoot: fixture.projectRoot, env: fixture.env }).items;
+    const matchingA = finalItems.filter((candidate) => candidate.conversationId === conversationA);
+    expect(
+      matchingA,
+      `expected exactly one recovery item for conversation A after the second stop: ${JSON.stringify(finalItems.map((item) => item.id))}`,
+    ).toHaveLength(1);
+    expect(matchingA[0]?.terminal?.ids).toEqual({ iterm: "tab2" });
+
+    // Harness cleanup: the kept record's own host evidence does not live
+    // under the lifecycle-record tree `afterEach`'s `forceCleanSessions`
+    // sweeps, so it would otherwise leak into a later case in this file.
+    if (matchingA[0]) fs.rmSync(matchingA[0].evidencePath, { force: true });
   }, TEST_TIMEOUT_MS);
 
   // -------------------------------------------------------------------------
@@ -648,7 +854,7 @@ describe("per-session admission survives a crash at every transition", () => {
   }
 
   for (const point of launchCrashPoints()) {
-    test(`a crash ${point} leaves no served session and recovers to empty`, async () => {
+    extendedTest(`a crash ${point} leaves no served session and recovers to empty`, async () => {
       await assertHeldOwnerCrashRecovers(point, {
         // Only the admission point happens on the way in; the other two are
         // teardown steps, which need the agent to have ended.
@@ -759,18 +965,18 @@ describe("per-session admission survives a crash at every transition", () => {
     ).toEqual([]);
   }
 
-  test("a start after the daemon stopped the proxy and session finishes the interrupted teardown without rebuild", async () => {
+  extendedTest("a start after the daemon stopped the proxy and session finishes the interrupted teardown without rebuild", async () => {
     await assertInterruptedTeardownReclaimedByStart({ stopProxy: true });
   }, TEST_TIMEOUT_MS);
 
-  test("a start with the proxy still running finishes an interrupted teardown through the ordinary delete", async () => {
+  extendedTest("a start with the proxy still running finishes an interrupted teardown through the ordinary delete", async () => {
     await assertInterruptedTeardownReclaimedByStart({ stopProxy: false });
   }, TEST_TIMEOUT_MS);
 
   // The negative: Docker proves the session container is running again, so
   // the start must keep the record — the address reservation — and refuse
   // with the reason, not reclaim. The harness reset between cases clears it.
-  test("a start refuses an interrupted teardown whose session container runs again, and keeps its record", async () => {
+  extendedTest("a start refuses an interrupted teardown whose session container runs again, and keeps its record", async () => {
     const { sessionId, containerId, stateDir, identity } = await leaveInterruptedTeardown({ stopProxy: false });
     dockerOrThrow("restart the interrupted session container", ["start", containerId]);
 
@@ -791,7 +997,7 @@ describe("per-session admission survives a crash at every transition", () => {
     expect(docker(["container", "inspect", containerId]).status, "rebuild left the session container").not.toBe(0);
   }, TEST_TIMEOUT_MS);
 
-  test("the runtime still admits a session after every crash and recovery", () => {
+  extendedTest("the runtime still admits a session after every crash and recovery", () => {
     // The load-bearing close: six crashes and six recoveries must leave a
     // runtime that still works. A recovery that reconciled records while
     // quietly breaking admission would pass every assertion above.
@@ -803,7 +1009,7 @@ describe("per-session admission survives a crash at every transition", () => {
   // Compose resources, so the old one-Compose-call destroy left them running
   // and their records behind. Everything is read back from the daemon and the
   // state directory, never from destroy's own output.
-  test("one plain destroy clears an attached-crash residue: no session container, no Compose container, empty registry", async () => {
+  extendedTest("one plain destroy clears an attached-crash residue: no session container, no Compose container, empty registry", async () => {
     const crashed = await runCrashScript(fixture, ["--kill-when-attached"]);
     expect(
       crashed.output,

@@ -58,7 +58,7 @@ import {
   type SessionAdmissionLaunchOutcome,
   type SessionAdmissionProbeAgent,
 } from "../../packages/cli/src/runtime/session-admission-probe.ts";
-import { scanRecoveryInventory } from "../../packages/cli/src/runtime/recovery.ts";
+import { recoveryIdIsValid, scanRecoveryInventory } from "../../packages/cli/src/runtime/recovery.ts";
 import { resumeInterruptedSessionThroughAdmission } from "../../packages/cli/src/runtime/session-admission-resume.ts";
 import { generatedRuntimeContextIfAvailable } from "../../packages/cli/src/runtime/images.ts";
 import { mintPreparedRuntime } from "../../packages/cli/src/runtime/prepared-runtime.ts";
@@ -97,16 +97,31 @@ export const CRASH_REPORT_PREFIX = '{"v":1,"kind":"runfree-session-admission-cra
 export const CRASH_INJECTION_MARKER = "crash-injection: killing after";
 
 /**
+ * Mirrors the host-chosen id shape `session-builtin-launch.ts` requires
+ * (`HOST_CHOSEN_ID_PATTERN`): lowercase only, since a host-chosen id is
+ * always minted by `crypto.randomUUID()`, which never produces anything
+ * else. Validated here too so `--launch-conversation-id` fails clearly at
+ * parse time rather than deep inside the driver.
+ */
+const LAUNCH_CONVERSATION_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+
+/**
  * A fresh launch's options for the production launch path below: a
  * host-chosen conversation id, minted the same way the public launch frame
  * mints one (spec §2), for an agent descriptor that declares the flag; none
  * for Codex, which has no flag and would be refused if given one.
+ *
+ * `--launch-conversation-id` lets a caller choose the id in advance (two
+ * concurrent crash launches need to know each other's id before either one
+ * completes, to resume each by its own exact id afterwards); without it, one
+ * is minted at random exactly as a fresh public launch mints its own.
  */
-function freshLaunchOptions(agent: SessionAdmissionProbeAgent): SessionAdmissionLaunchOptions {
-  const launchConversationId = builtinAgent(agent)?.launchConversationIdFlag
-    ? crypto.randomUUID()
-    : undefined;
-  return launchConversationId !== undefined ? { launchConversationId } : {};
+function freshLaunchOptions(
+  agent: SessionAdmissionProbeAgent,
+  launchConversationId?: string,
+): SessionAdmissionLaunchOptions {
+  if (builtinAgent(agent)?.launchConversationIdFlag === undefined) return {};
+  return { launchConversationId: launchConversationId ?? crypto.randomUUID() };
 }
 
 /**
@@ -425,6 +440,21 @@ type CrashOptions = Readonly<{
    * and the case silently kills somewhere else while still passing.
    */
   killWhenAttached?: boolean;
+  /**
+   * Launch-harness only (`--kill-when-attached` or `--launch`): the exact
+   * host-chosen conversation id a fresh launch carries, instead of one minted
+   * at random. Lets a caller know the id before the launch completes, which
+   * two concurrent crash launches both need in order to resume each other's
+   * conversation by its own exact id afterwards.
+   */
+  launchConversationId?: string;
+  /**
+   * `--resume` only: resumes exactly this recovery item instead of the
+   * newest host evidence for `--agent`. Required when more than one
+   * interrupted conversation for the same agent may be outstanding — the
+   * newest-first default cannot tell two concurrent conversations apart.
+   */
+  resumeId?: string;
   /** Which matching command to kill after; 1 is the first. */
   occurrence: number;
 }>;
@@ -433,10 +463,11 @@ function usage(message: string): never {
   process.stderr.write(`${message}\n`);
   process.stderr.write(
     "usage: session-admission-crash.ts --workspace <dir> --agent <claude|codex|pi>"
-      + " (--kill-at <point> [--occurrence <n>] | --kill-after-command <n> | --kill-when-attached"
+      + " (--kill-at <point> [--occurrence <n>] | --kill-after-command <n>"
+      + " | --kill-when-attached [--launch-conversation-id <uuid>]"
       + " | --launch --hold-dir <dir> [--allow-existing-sessions]"
-      + " [--fail-session-file-delete] [--launch-hold-at <point>]"
-      + " | --report | --recover | --resume | --list-commands | --force-clean)\n",
+      + " [--fail-session-file-delete] [--launch-hold-at <point>] [--launch-conversation-id <uuid>]"
+      + " | --report | --recover | --resume [--resume-id <rfr-id>] | --list-commands | --force-clean)\n",
   );
   process.stderr.write(`kill points: ${Object.keys(CRASH_POINTS).join(", ")}\n`);
   // Named apart because `--kill-at` drives the internal probe, which never
@@ -448,7 +479,9 @@ function usage(message: string): never {
   process.exit(2);
 }
 
-function parseArguments(argv: readonly string[]): CrashOptions {
+// Exported for unit coverage of argument parsing (`--launch-conversation-id`,
+// `--resume-id`, and their pairing rules) without a live Docker cycle.
+export function parseArguments(argv: readonly string[]): CrashOptions {
   let workspace: string | undefined;
   let agent: SessionAdmissionProbeAgent | undefined;
   let mode: CrashOptions["mode"] | undefined;
@@ -459,6 +492,8 @@ function parseArguments(argv: readonly string[]): CrashOptions {
   let allowExistingSessions = false;
   let failSessionFileDelete = false;
   let launchHoldPoint: LaunchHoldPoint | undefined;
+  let launchConversationId: string | undefined;
+  let resumeId: string | undefined;
   let occurrence = 1;
 
   for (let index = 0; index < argv.length; index += 1) {
@@ -525,6 +560,11 @@ function parseArguments(argv: readonly string[]): CrashOptions {
       case "--fail-session-file-delete":
         failSessionFileDelete = true;
         break;
+      case "--launch-conversation-id":
+        if (!value || !LAUNCH_CONVERSATION_ID_RE.test(value)) usage("--launch-conversation-id must be a lowercase conversation UUID");
+        launchConversationId = value;
+        index += 1;
+        break;
       case "--report":
         mode = "report";
         break;
@@ -533,6 +573,11 @@ function parseArguments(argv: readonly string[]): CrashOptions {
         break;
       case "--resume":
         mode = "resume";
+        break;
+      case "--resume-id":
+        if (!value || !recoveryIdIsValid(value)) usage("--resume-id must be a valid recovery id (rfr-<24 hex>)");
+        resumeId = value;
+        index += 1;
         break;
       case "--force-clean":
         mode = "force-clean";
@@ -586,6 +631,17 @@ function parseArguments(argv: readonly string[]): CrashOptions {
   if (failSessionFileDelete !== (launchHoldPoint === "after-failed-file-delete")) {
     usage("--fail-session-file-delete and --launch-hold-at after-failed-file-delete must be passed together");
   }
+  // Only the two launch-harness selectors that actually mint a fresh
+  // conversation id (`freshLaunchOptions`) accept an explicit one; every
+  // other mode would silently ignore it.
+  if (launchConversationId !== undefined && mode !== "launch" && !killWhenAttached) {
+    usage("--launch-conversation-id requires --launch or --kill-when-attached");
+  }
+  // Paired with `--resume`, not a mode of its own: unlike `--kill-at` and its
+  // `--occurrence`, nothing else sets `mode = "resume"` for it to attach to.
+  if (resumeId !== undefined && mode !== "resume") {
+    usage("--resume-id requires --resume");
+  }
   return Object.freeze({
     workspace,
     agent,
@@ -598,6 +654,8 @@ function parseArguments(argv: readonly string[]): CrashOptions {
     ...(allowExistingSessions ? { allowExistingSessions } : {}),
     ...(failSessionFileDelete ? { failSessionFileDelete } : {}),
     ...(launchHoldPoint ? { launchHoldPoint } : {}),
+    ...(launchConversationId !== undefined ? { launchConversationId } : {}),
+    ...(resumeId !== undefined ? { resumeId } : {}),
   });
 }
 
@@ -1033,7 +1091,11 @@ function forceClean(workspace: string): CrashReport {
  * needs the observed state on both sides either way, and that state is the
  * evidence for the finding.
  */
-async function resumeCrashed(workspace: string, agent: SessionAdmissionProbeAgent): Promise<CrashResumeReport> {
+async function resumeCrashed(
+  workspace: string,
+  agent: SessionAdmissionProbeAgent,
+  resumeId?: string,
+): Promise<CrashResumeReport> {
   const before = report(workspace);
   const observed: string[] = [];
   let itemSummary: CrashResumeReport["item"];
@@ -1059,10 +1121,20 @@ async function resumeCrashed(workspace: string, agent: SessionAdmissionProbeAgen
       return childProcess.spawn(executable, [...args], spawnOptions) as ReturnType<SessionContainerForegroundSpawner>;
     };
     const inventory = scanRecoveryInventory({ env: context.env ?? process.env, projectRoot: context.projectRoot });
-    const item = inventory.items
-      .filter((candidate) => candidate.agent === agent && candidate.evidenceKind === "host")
-      .sort((left, right) => (right.startedAt ?? "").localeCompare(left.startedAt ?? ""))[0];
-    if (!item) throw new Error(`no host recovery evidence exists for ${agent}`);
+    // `--resume-id` selects exactly that item, for when more than one
+    // interrupted conversation may be outstanding at once; without it, the
+    // newest-first default is the only selector available and cannot tell
+    // two concurrent conversations apart.
+    const item = resumeId !== undefined
+      ? inventory.items.find((candidate) => candidate.id === resumeId)
+      : inventory.items
+          .filter((candidate) => candidate.agent === agent && candidate.evidenceKind === "host")
+          .sort((left, right) => (right.startedAt ?? "").localeCompare(left.startedAt ?? ""))[0];
+    if (!item) {
+      throw new Error(resumeId !== undefined
+        ? `no recovery item ${resumeId} exists`
+        : `no host recovery evidence exists for ${agent}`);
+    }
     itemSummary = Object.freeze({
       id: item.id,
       sessionId: item.sourceId,
@@ -1245,7 +1317,7 @@ async function launchAndReport(options: CrashOptions): Promise<CrashLaunchReport
       }, LAUNCH_OBSERVER_POLL_INTERVAL_MS);
       observer.unref?.();
 
-      outcome = await driver.launchBuiltin(options.agent, freshLaunchOptions(options.agent));
+      outcome = await driver.launchBuiltin(options.agent, freshLaunchOptions(options.agent, options.launchConversationId));
     } catch (error) {
       failure = renderFailure(error);
     } finally {
@@ -1532,7 +1604,7 @@ async function crash(options: CrashOptions): Promise<never> {
       watchForAttachedSession();
       // The only caller of the production launch path anywhere in the repo.
       // Everything else drives `probeBuiltin`, which never activates.
-      await driver.launchBuiltin(options.agent, freshLaunchOptions(options.agent));
+      await driver.launchBuiltin(options.agent, freshLaunchOptions(options.agent, options.launchConversationId));
     } else {
       await driver.probeBuiltin(options.agent);
     }
@@ -1580,7 +1652,7 @@ async function main(): Promise<number> {
     return 0;
   }
   if (options.mode === "resume") {
-    process.stdout.write(`${JSON.stringify(await resumeCrashed(options.workspace, options.agent))}\n`);
+    process.stdout.write(`${JSON.stringify(await resumeCrashed(options.workspace, options.agent, options.resumeId))}\n`);
     return 0;
   }
   if (options.mode === "launch") {

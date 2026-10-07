@@ -5,7 +5,7 @@
 // 3, printing the observed stream), but a live cycle costs a full rebuild, so
 // the matching rule is proven here where it costs nothing.
 
-import { describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 
 import { createSessionAdmissionEligibility } from "@runfree/runtime-contracts/session-admission";
 import {
@@ -26,6 +26,7 @@ import {
   isLaunchHoldPoint,
   launchCrashPoints,
   matchesCrashPoint,
+  parseArguments,
   probeCrashPoints,
   sessionFileCommandEffect,
 } from "./session-admission-crash.ts";
@@ -219,5 +220,81 @@ describe("per-session file crash points", () => {
       "after-file-deleted-before-stop",
       "after-failed-file-delete",
     ]);
+  });
+});
+
+describe("--resume-id and --launch-conversation-id parsing", () => {
+  const BASE = ["--workspace", "/tmp/project", "--agent", "claude"];
+  const VALID_LAUNCH_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  const VALID_RESUME_ID = `rfr-${"a".repeat(24)}`;
+
+  // `usage()` exits the process; mocked here so an invalid-argument case
+  // observes the exit rather than tearing down the whole test worker.
+  // `process.stderr.write` is mocked too so the expected failures do not
+  // spam the test run's own output.
+  function expectUsageExit(argv: readonly string[]): void {
+    const exitSpy = vi.spyOn(process, "exit").mockImplementation(((code?: number) => {
+      throw new Error(`usage-exit:${code}`);
+    }) as typeof process.exit);
+    const stderrSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+    try {
+      expect(() => parseArguments(argv)).toThrow("usage-exit:2");
+    } finally {
+      exitSpy.mockRestore();
+      stderrSpy.mockRestore();
+    }
+  }
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  test("--launch-conversation-id threads through to options when paired with --kill-when-attached", () => {
+    const options = parseArguments([...BASE, "--kill-when-attached", "--launch-conversation-id", VALID_LAUNCH_ID]);
+    expect(options.mode).toBe("crash");
+    expect(options.killWhenAttached).toBe(true);
+    expect(options.launchConversationId).toBe(VALID_LAUNCH_ID);
+  });
+
+  test("--launch-conversation-id threads through to options when paired with --launch", () => {
+    const options = parseArguments([...BASE, "--launch", "--hold-dir", "/tmp/held", "--launch-conversation-id", VALID_LAUNCH_ID]);
+    expect(options.mode).toBe("launch");
+    expect(options.launchConversationId).toBe(VALID_LAUNCH_ID);
+  });
+
+  test("--kill-when-attached without --launch-conversation-id leaves it unset, so a random id is still minted", () => {
+    const options = parseArguments([...BASE, "--kill-when-attached"]);
+    expect(options.launchConversationId).toBeUndefined();
+  });
+
+  test("rejects a malformed --launch-conversation-id", () => {
+    expectUsageExit([...BASE, "--kill-when-attached", "--launch-conversation-id", "not-a-uuid"]);
+  });
+
+  test("rejects an uppercase --launch-conversation-id (host-chosen ids are always lowercase)", () => {
+    expectUsageExit([...BASE, "--kill-when-attached", "--launch-conversation-id", VALID_LAUNCH_ID.toUpperCase()]);
+  });
+
+  test("rejects --launch-conversation-id without --launch or --kill-when-attached", () => {
+    expectUsageExit([...BASE, "--kill-at", "after-create", "--launch-conversation-id", VALID_LAUNCH_ID]);
+  });
+
+  test("--resume-id threads through to options when paired with --resume", () => {
+    const options = parseArguments([...BASE, "--resume", "--resume-id", VALID_RESUME_ID]);
+    expect(options.mode).toBe("resume");
+    expect(options.resumeId).toBe(VALID_RESUME_ID);
+  });
+
+  test("--resume without --resume-id leaves it unset, so the runner falls back to the newest item", () => {
+    const options = parseArguments([...BASE, "--resume"]);
+    expect(options.resumeId).toBeUndefined();
+  });
+
+  test("rejects a malformed --resume-id", () => {
+    expectUsageExit([...BASE, "--resume", "--resume-id", "not-a-recovery-id"]);
+  });
+
+  test("rejects --resume-id without --resume", () => {
+    expectUsageExit([...BASE, "--recover", "--resume-id", VALID_RESUME_ID]);
   });
 });

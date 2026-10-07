@@ -37,24 +37,37 @@ import type { LiveFixture } from "./fixture.ts";
  * agent to stay up long enough to act against. The stub branches on the typed
  * resume argv the driver launches it with, which also makes the branch itself
  * proof that the resume argv reached the container.
+ *
+ * The argument immediately after `--resume` is the exact conversation id the
+ * driver is resuming (`resume.exactArgvPrefix` plus that id), so the stub
+ * records it in the ready/release file names too: `ready-$id`/`release-$id`
+ * beside the bare `ready`/`release`. Two concurrently resumed sessions in the
+ * same project share this one bind-mounted stub directory, and only the
+ * id-qualified names tell a caller which of them has reached its own
+ * handshake and which has been told to proceed — the bare names alone could
+ * not prove that per-conversation concurrency rather than one process
+ * answering for both. The bare names stay so the single-conversation resume
+ * case keeps working unchanged.
  */
 export const RESUME_STUB_DIRECTORY = ".runfree-resume-stub";
 
 export function resumeStub(directory = `/workspace/${RESUME_STUB_DIRECTORY}`): string {
   const quoted = `'${directory.replaceAll("'", "'\\''")}'`;
-  return `for a in "$@"; do
-  if [ "$a" = "--resume" ]; then
+  return `prev=""
+for a in "$@"; do
+  if [ "$prev" = "--resume" ]; then
     dir=${quoted}
     mkdir -p "$dir"
-    : > "$dir/ready"
+    : > "$dir/ready"; : > "$dir/ready-$a"
     i=0
-    while [ ! -f "$dir/release" ]; do
+    while [ ! -f "$dir/release" ] && [ ! -f "$dir/release-$a" ]; do
       i=$((i + 1))
       if [ "$i" -gt 1800 ]; then echo 'resume stub was not released' >&2; exit 124; fi
       sleep 0.1
     done
     exit 0
   fi
+  prev="$a"
 done`;
 }
 
