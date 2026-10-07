@@ -1110,12 +1110,20 @@ claim kinds exclude each other within one agent. A claim records its owner's
 boot id and process start: one whose owner is proved dead, or whose boot id no
 longer matches, is reclaimed under the lifecycle lock; one that can be proved
 neither alive nor dead blocks only its own claim scope and ages into "dead"
-after 24 hours. Failure releases only the claim; successful exit
-fingerprint-checks and consumes only the selected evidence.
+after 24 hours. Failure releases only the claim. A successful exit
+fingerprint-checks and consumes the selected evidence and every Claude
+registry record and host record linked to the same conversation: host
+records are deleted, and each Claude registry file is marked consumed by its
+own per-file record (the agent-writable file itself is never deleted). A
+resume that attached and then ended non-zero also consumes the original
+record, because the resume's own interrupted record replaces it; a resume
+that fails before attach leaves the original record for the next
+`runfree resume`.
 
 Claude registry files are untrusted agent state. Recovery reads only bounded,
-regular, single-link files from fixed directories, with no-follow open and
-inode checks, validates conversation ids before building argv, and sanitizes
+regular, single-link files from fixed directories, with a no-follow,
+non-blocking open (so a FIFO swapped in cannot stall the scan) and inode
+checks, validates conversation ids before building argv, and sanitizes
 display strings. It never touches conversation transcripts. `--agent` filters
 only; it grants no resume authority. A completed resume of a Claude-registry
 row closes a recovery epoch for the agent, but the epoch blocks only
