@@ -2424,6 +2424,27 @@ export function prepareRuntimeTokenSources(options: Readonly<{ mode?: RuntimeTok
   preparedRuntimeTokenSources.set(project.paths.stateDir, { controlGeneration: active.controlGeneration, preparedAt: Date.now(), tokenConfigPath: tokenConfigPath(), sourceConfigPath: sourceConfigPath(), values });
 }
 
+/**
+ * Whether a receipt-gated warm sync has nothing it could write, delete, or
+ * prune: the effective policy names no token, the host token config holds no
+ * entry (so no dropped-token cleanup is owed), and no persisted receipt waits
+ * to be pruned. Any unreadable input answers false, so the full sync runs and
+ * reports it.
+ */
+export function warmConvergenceSyncIsEmpty(): boolean {
+  try {
+    const project = currentAdminState().runtimeContext?.project ?? adminProjectInfo();
+    const active = readActiveEffectiveControl(project);
+    if (!active) return false;
+    const policy = validateNetworkPolicy(active.policy, active.networkPolicyPath);
+    if (Object.keys(policy.tokens).length > 0) return false;
+    if (Object.keys(loadTokenConfig()).length > 0) return false;
+    return loadPersistedTokenReceipts().size === 0;
+  } catch {
+    return false;
+  }
+}
+
 function assertPreparedTokenSourceInputs(
   prepared: NonNullable<ReturnType<typeof preparedRuntimeTokenSources.get>>,
   policy: LoadedNetworkPolicy,

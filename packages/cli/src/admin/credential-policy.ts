@@ -60,6 +60,7 @@ import {
   tokenSourceFromSelection,
   type TokenSourceSelection,
   tokenSyncWatchNowMs,
+  warmConvergenceSyncIsEmpty,
   withTokenStoreLock,
 } from "./admin-core.ts";
 import {
@@ -613,6 +614,11 @@ export async function credentialSyncIntent(input: CredentialSyncInput): Promise<
   if (!input.watch && input.initialSourceTruth) die("--initial-source-truth only applies with --watch");
   if (input.watch && input.mode) die("a startup-convergence sync is one-shot");
   if (input.mode === "startup-convergence") {
+    // Nothing to write, delete, or prune: the sync would only observe the proxy.
+    if (warmConvergenceSyncIsEmpty()) {
+      currentAdminState().tokenResolutionReceipts = [];
+      return;
+    }
     // Launch plan D4: receipt-gated, resolving nothing. A deferral is not a
     // failure: it hands startup back the unlocked source-truth order, before
     // this sync wrote or removed anything.

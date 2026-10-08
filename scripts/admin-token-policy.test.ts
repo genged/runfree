@@ -3144,6 +3144,77 @@ exit 0
     });
     expect(JSON.stringify(readTokenStatus())).not.toContain("unused-secret");
   });
+
+  // Perf plan Task 1: a receipt-gated warm-launch sync with nothing it could
+  // write, delete, or prune returns before any Docker call.
+  test("a startup-convergence sync with no tokens, no token config, and no receipts asks Docker nothing", async () => {
+    writeFixtureRepo({ hosts: [], tokens: {} });
+    writeTokenConfig({});
+    const fakeDocker = installTokenSyncDockerFake();
+    const result = await runAdmin(() => credentialSyncIntent({
+      verbose: false, watch: false, quiet: false, delayFirstSync: false, cacheSourceSecrets: true, mode: "startup-convergence",
+    }), {
+      FAKE_DOCKER_LOG: fakeDocker.dockerLog,
+      PATH: `${fakeDocker.fakeBin}${path.delimiter}${process.env.PATH ?? ""}`,
+    });
+    expect(result.status, result.stderr).toBe(0);
+    expect(fs.existsSync(fakeDocker.dockerLog) ? readJsonLines(fakeDocker.dockerLog) : []).toEqual([]);
+  });
+
+  test("a startup-convergence sync still runs when the host token config holds an entry the policy dropped", async () => {
+    writeFixtureRepo({ hosts: [], tokens: {} });
+    writeTokenConfig({ dropped: { source: "env", env: "DROPPED_TOKEN" } });
+    const fakeDocker = installTokenSyncDockerFake();
+    await runAdmin(() => credentialSyncIntent({
+      verbose: false, watch: false, quiet: false, delayFirstSync: false, cacheSourceSecrets: true, mode: "startup-convergence",
+    }), {
+      FAKE_DOCKER_LOG: fakeDocker.dockerLog,
+      PATH: `${fakeDocker.fakeBin}${path.delimiter}${process.env.PATH ?? ""}`,
+    });
+    // The dropped-token cleanup must still get its chance: the sync observed the proxy.
+    expect(readJsonLines(fakeDocker.dockerLog).length).toBeGreaterThan(0);
+  });
+
+  test("a startup-convergence sync still runs when a persisted receipt awaits pruning", async () => {
+    // Arrange a persisted receipt the way an earlier successful sync leaves
+    // one: run a source-truth sync with a real token so it resolves and
+    // writes a receipt, then drop the token from both the policy and the
+    // token config, so only the receipt remains as evidence of something a
+    // sync could still prune.
+    writeFixtureRepo(exampleTokenPolicy(["alpha"]));
+    writeTokenConfig({ alpha: { source: "env", env: "ALPHA_TOKEN" } });
+    const fakeDocker = installTokenSyncDockerFake();
+
+    const populated = await runAdmin(() => credentialSyncIntent({
+      verbose: false, watch: false, quiet: false, delayFirstSync: false, cacheSourceSecrets: true,
+    }), {
+      ALPHA_TOKEN: "alpha_secret",
+      FAKE_DOCKER_LOG: fakeDocker.dockerLog,
+      PATH: `${fakeDocker.fakeBin}${path.delimiter}${process.env.PATH ?? ""}`,
+    });
+    expect(populated.status, populated.stderr).toBe(0);
+    expect(fs.existsSync(tokenReceiptsFilePath())).toBe(true);
+    const receiptsBefore = JSON.parse(fs.readFileSync(tokenReceiptsFilePath(), "utf8")) as { receipts: Array<{ tokenName: string }> };
+    expect(receiptsBefore.receipts.map((receipt) => receipt.tokenName)).toEqual(["alpha"]);
+
+    // Drop the token everywhere but the receipt file. (Not writeFixtureRepo:
+    // it unconditionally symlinks node_modules into the project and would
+    // fail with EEXIST on this second call.)
+    fs.writeFileSync(path.join(tmp, ".runfree/network-policy.json"), `${JSON.stringify({ hosts: [], tokens: {} }, null, 2)}\n`);
+    writeTokenConfig({});
+    const linesBeforeWarmSync = readJsonLines(fakeDocker.dockerLog).length;
+
+    await runAdmin(() => credentialSyncIntent({
+      verbose: false, watch: false, quiet: false, delayFirstSync: false, cacheSourceSecrets: true, mode: "startup-convergence",
+    }), {
+      FAKE_DOCKER_LOG: fakeDocker.dockerLog,
+      PATH: `${fakeDocker.fakeBin}${path.delimiter}${process.env.PATH ?? ""}`,
+    });
+
+    // The receipt alone must be enough to force the sync to run and observe
+    // the proxy: new Docker log entries past the populate run.
+    expect(readJsonLines(fakeDocker.dockerLog).slice(linesBeforeWarmSync)).not.toEqual([]);
+  });
 });
 
 describe("convergent proxy token store", () => {
