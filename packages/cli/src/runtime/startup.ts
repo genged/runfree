@@ -1218,7 +1218,7 @@ export async function startRuntime(
     // Probe host Git once per launch, before any project state is written:
     // shapes old host Git cannot use refuse here; the result also feeds the
     // layout preparation and the sandbox Git config's degraded-mode warning.
-    const hostGit = probeHostGitRelativeWorktrees(context, io);
+    const hostGit = timings.time("startup:host-git-probe", () => probeHostGitRelativeWorktrees(context, io));
     refuseGitLayoutUnusableByHostGit(context.projectRoot, hostGit);
     const capturedConfig = readConfig(context.projectRoot);
     if (removeExisting) {
@@ -1257,8 +1257,8 @@ export async function startRuntime(
     const dockerSubnets = context.network
       ? []
       : (() => {
-        ensureDockerAvailable();
-        return initialAdapters.docker.networkSubnets();
+        timings.time("startup:docker-available", ensureDockerAvailable);
+        return timings.time("startup:network-subnets", () => initialAdapters.docker.networkSubnets());
       })();
     // Plan the bootstrap without overlay discovery: the Git facts it needs are
     // not available yet, and preparedPlan below replaces every overlay-derived
@@ -1273,7 +1273,7 @@ export async function startRuntime(
     reportRuntimeVerbose(verbose,
       `using runtime network ${initialPlan.network.subnet}, proxy egress ${initialPlan.network.proxyEgressSubnet}`);
 
-    const gitLayout = prepareGitRepositoryLayoutResult(initialContext, hostGit);
+    const gitLayout = timings.time("startup:git-layout", () => prepareGitRepositoryLayoutResult(initialContext, hostGit));
     const gitPreparedPlan: RuntimePlan = {
       ...initialPlan,
       gitLayout: gitLayout.plan,
@@ -1286,8 +1286,10 @@ export async function startRuntime(
 
     reportRuntimeProgress("preparing project runtime state", verbose);
     assertSafeRuntimePolicyPath(gitPreparedContext);
-    ensureAgentState(gitPreparedContext);
-    writeProjectRecoveryPointer(gitPreparedContext);
+    timings.time("startup:agent-state", () => {
+      ensureAgentState(gitPreparedContext);
+      writeProjectRecoveryPointer(gitPreparedContext);
+    });
     // Host-service re-check and registry refresh (design "Policy shape",
     // Re-check, SR13; registry, HS7). Runs here, after control preparation
     // selected the effective policy generation, but before any lock is held
@@ -1295,9 +1297,9 @@ export async function startRuntime(
     // never refuses the launch. Refreshing the host-global registry here too
     // keeps it current even when an activation came from `runfree up` rather
     // than `host-service add/remove`.
-    await refreshHostServicesAtLaunch(gitPreparedContext, io);
-    ensureSandboxGitConfig(gitPreparedContext, io, hostGit);
-    const dependencyPlan: PreparedDependencyOverlayPlan = prepareDependencyOverlayPlanResult(gitPreparedContext, io);
+    await timings.timeAsync("startup:host-services-refresh", () => refreshHostServicesAtLaunch(gitPreparedContext, io));
+    timings.time("startup:sandbox-git-config", () => ensureSandboxGitConfig(gitPreparedContext, io, hostGit));
+    const dependencyPlan: PreparedDependencyOverlayPlan = timings.time("startup:dependency-overlay-plan", () => prepareDependencyOverlayPlanResult(gitPreparedContext, io));
     // Supply the freshly discovered overlays before the plan is built, not
     // after. Compose output, the topology digest, the session container
     // template, and the generation target are all derived from the plan's
@@ -1325,26 +1327,26 @@ export async function startRuntime(
     });
     adapters = createRuntimeAdapters(existingContext, io);
 
-    ensureDockerAvailable();
+    timings.time("startup:docker-available", ensureDockerAvailable);
     const startupDaemonIdentity = lastObservedDockerDaemonIdentity();
     // Capture the proxy container id before any lifecycle change. The proxy
     // loads the on-disk policy at boot, so a changed id afterwards means it
     // already reflects the merged policy and a follow-up policy reload is moot.
-    const proxyContainerIdBefore = adapters.docker.runningServiceContainerId(
+    const proxyContainerIdBefore = timings.time("startup:proxy-id-before", () => adapters.docker.runningServiceContainerId(
       existingActivePlan.composeProjectName,
       "proxy",
-    );
+    ));
     const proxyRecreatedSinceStart = (docker: RuntimeDocker): boolean =>
       docker.runningServiceContainerId(existingActivePlan.composeProjectName, "proxy")
         !== proxyContainerIdBefore;
     let upgradePlan: RuntimeUpgradePlan = { action: "none", services: [] };
     if (!removeExisting) {
-      await awaitLiveSessionAdmissionQuiescence(preparedPlan.paths.stateDir, {
+      await timings.timeAsync("startup:admission-quiescence", () => awaitLiveSessionAdmissionQuiescence(preparedPlan.paths.stateDir, {
         projectId: preparedPlan.projectId,
         composeProject: preparedPlan.composeProjectName,
-      });
-      upgradePlan = planRuntimeUpgradeFromV2State(preparedPlan, existingContext, adapters.docker,
-        { deferPendingSessionAdmission: true });
+      }));
+      upgradePlan = timings.time("startup:upgrade-plan", () => planRuntimeUpgradeFromV2State(preparedPlan, existingContext, adapters.docker,
+        { deferPendingSessionAdmission: true }));
       reportRuntimeVerbose(verbose, `runtime upgrade plan is ${upgradePlan.action}`);
       if (verbose) {
         for (const line of runtimeComponentDiagnosticLines({
@@ -1353,7 +1355,7 @@ export async function startRuntime(
           stateDir: preparedPlan.paths.stateDir,
         })) reportRuntimeVerbose(true, line);
       }
-      const upgradeStatus = applyRuntimeUpgradePlan(existingContext, adapters.docker, upgradePlan);
+      const upgradeStatus = timings.time("startup:upgrade-apply", () => applyRuntimeUpgradePlan(existingContext, adapters.docker, upgradePlan));
       if (upgradeStatus !== 0) return result(upgradeStatus, false, existingContext);
       // Diagnostic only: the marker status picks between two verbose lines and
       // validation replaces the marker right after, so a quiet start skips the
@@ -1369,7 +1371,7 @@ export async function startRuntime(
         }
       }
       {
-        const repair = await repairStaleComposeNetworkState(existingContext, adapters.docker);
+        const repair = await timings.timeAsync("startup:network-repair", () => repairStaleComposeNetworkState(existingContext, adapters.docker));
         if (repair !== 0) return result(repair, false, existingContext);
       }
 
@@ -1402,16 +1404,16 @@ export async function startRuntime(
     // warm age bound); `up`, a cold start, and a proxy change read them all.
     const receiptGatedCredentials = rebuildOptions.launch === true
       && (upgradePlan.action === "token-sync" || upgradePlan.action === "component-select");
-    await io.prepareTokenSources?.(
+    await timings.timeAsync("startup:prepare-token-sources", async () => io.prepareTokenSources?.(
       runtimeContextFromActivePlan(activePlan),
       receiptGatedCredentials ? { mode: "convergence" } : undefined,
-    );
+    ));
     // Capture and compare under the lock. This pair detects a *change during
     // preparation*; it is not the mismatch gate. Once the reader returns a
     // value instead of throwing, a persistent mismatch compares equal to itself
     // and passes the comparison below — the recovery gate ran long before here.
     const preparedApproval = readControlApprovalSelection(context.projectRoot, context.project);
-    lifecycleLock ??= await tryAcquireProjectLifecycleLockWithRetry(preparedContext);
+    lifecycleLock ??= await timings.timeAsync("startup:lock-acquire", () => tryAcquireProjectLifecycleLockWithRetry(preparedContext));
     acquiredLifecycleLock = lifecycleLock;
     // Where a handed-off lock's one continuous hold starts (launch-lock-hold.ts).
     const lockAcquiredAtMonotonicMs = performance.now();
@@ -1452,8 +1454,8 @@ export async function startRuntime(
     }
     heldLifecycleLock.assertHeld();
     const currentConfig = readConfig(context.projectRoot);
-    const currentPlan = createRuntimePlan(preparedContext,
-      { dockerSubnets: [], persistNetwork: false });
+    const currentPlan = timings.time("startup:recheck-plan", () => createRuntimePlan(preparedContext,
+      { dockerSubnets: [], persistNetwork: false }));
     if (!isDeepStrictEqual(currentConfig, capturedConfig)
       || !isDeepStrictEqual(currentPlan.generationV2, preparedPlan.generationV2)
       || !isDeepStrictEqual(readControlApprovalSelection(context.projectRoot, context.project), preparedApproval)
@@ -1473,7 +1475,7 @@ export async function startRuntime(
       // the start refuses with the reason and the remedy for that record.
       let reclaim: ReturnType<typeof reclaimPendingSessionAdmissions>;
       try {
-        reclaim = reclaimPendingSessionAdmissions({
+        reclaim = timings.time("startup:reclaim-pending-admissions", () => reclaimPendingSessionAdmissions({
           stateDir: preparedPlan.paths.stateDir,
           expectedProject: { projectId: preparedPlan.projectId, composeProject: preparedPlan.composeProjectName },
           io,
@@ -1481,7 +1483,7 @@ export async function startRuntime(
           env: preparedContext.env,
           dockerOptions: dockerClientEnvOptions(preparedContext),
           nowEpochMs: Date.now(),
-        });
+        }));
       } catch (error) {
         // A lost lock is not a refusal to report; it ends the start.
         heldLifecycleLock.assertHeld();
@@ -1501,10 +1503,10 @@ export async function startRuntime(
       }
     }
     io.admitPreparedTokenSources?.(runtimeContextFromActivePlan(activePlan));
-    selectPreparedSessionAgent(activePlan, adapters.docker);
+    timings.time("startup:select-session-agent", () => selectPreparedSessionAgent(activePlan, adapters.docker));
     if (!removeExisting) {
-      upgradePlan = planRuntimeUpgradeFromV2State(preparedPlan, existingContext, adapters.docker);
-      const status = applyRuntimeUpgradePlan(existingContext, adapters.docker, upgradePlan);
+      upgradePlan = timings.time("startup:upgrade-plan-locked", () => planRuntimeUpgradeFromV2State(preparedPlan, existingContext, adapters.docker));
+      const status = timings.time("startup:upgrade-apply-locked", () => applyRuntimeUpgradePlan(existingContext, adapters.docker, upgradePlan));
       if (status !== 0) return result(status, false, existingContext);
     }
     const activeContext = runtimeContextFromActivePlan(activePlan, {
@@ -1682,17 +1684,18 @@ export async function startRuntime(
         if (!effective || !desired) {
           throw new Error("session eligibility requires the selected control plane and the retained current agent template");
         }
-        proxyStartedAt = warm?.proxyStartedAt ?? observeProxyStartedAt(io, runtimeProof.proxyId, dockerClientEnvOptions(activeContext));
-        ensureSessionEligibilityPublished({
+        const observedProxyStartedAt = warm?.proxyStartedAt ?? observeProxyStartedAt(io, runtimeProof.proxyId, dockerClientEnvOptions(activeContext));
+        proxyStartedAt = observedProxyStartedAt;
+        timings.time("startup:eligibility-publish", () => ensureSessionEligibilityPublished({
           io,
           proxyId: runtimeProof.proxyId,
-          proxyStartedAt,
+          proxyStartedAt: observedProxyStartedAt,
           stateDir: activePlan.paths.stateDir,
           effective,
           desired,
           records: listSessionContainerRecordsV2(activePlan.paths.stateDir, { projectId: activePlan.projectId, composeProject: project }),
           dockerOptions: dockerClientEnvOptions(activeContext),
-        });
+        }));
         heldLifecycleLock.assertHeld();
         // Invariant 3, from the other end: `up` is the point a project comes
         // back after a crash, so the same reconcile every launch runs is run
@@ -1701,7 +1704,7 @@ export async function startRuntime(
         // held and before any session can be admitted. It follows the
         // publication above, which widened the admitted set; step 5 of the
         // reconcile narrows it again once the residue is gone.
-        reconciled = await reconcileSessions({
+        reconciled = await timings.timeAsync("startup:reconcile-sessions", () => reconcileSessions({
           stateDir: activePlan.paths.stateDir,
           expectedProject: { projectId: activePlan.projectId, composeProject: project },
           io,
@@ -1715,7 +1718,7 @@ export async function startRuntime(
           lifecycleLock: heldLifecycleLock,
           mode: "repair",
           dockerOptions: dockerClientEnvOptions(activeContext),
-        });
+        }));
         heldLifecycleLock.assertHeld();
       } catch (error) {
         warn(error instanceof Error ? error.message : String(error));
