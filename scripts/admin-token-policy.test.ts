@@ -11,7 +11,11 @@ import { validateNetworkPolicy, type PolicyJson } from "@runfree/runtime-contrac
 import { defaultConfig, projectControlPaths, type ProjectInfo } from "../packages/cli/src/config.ts";
 import { approveNetworkCandidate, approveRuntimeIsolationControl } from "../packages/cli/src/control/approvals.ts";
 import { captureDesiredPolicyCandidate } from "../packages/cli/src/control/candidates.ts";
-import { publishEffectivePolicyGeneration } from "../packages/cli/src/control/effective.ts";
+import {
+  convergeEffectivePolicyGeneration,
+  publishEffectivePolicyGeneration,
+  readActiveEffectiveControl,
+} from "../packages/cli/src/control/effective.ts";
 import { RUNFREE_RUNTIME_DIGEST } from "../packages/cli/src/embedded-assets.generated.ts";
 import { projectHash } from "../packages/cli/src/project-identity.ts";
 import { sha256Digest } from "../packages/cli/src/runtime/component-state.ts";
@@ -161,7 +165,7 @@ function writeFixtureRepo(policy: unknown): void {
 async function runAdmin(
   action: () => void | Promise<void>,
   extraEnv: NodeJS.ProcessEnv = {},
-  stateOverrides: Readonly<{ policyAccess?: "effective-read-only" }> = {},
+  stateOverrides: Readonly<{ policyAccess?: "effective-read-only"; validatedRuntime?: ReturnType<typeof tokenSyncValidatedRuntime> }> = {},
 ): Promise<AdminRunResult> {
   fs.mkdirSync(home, { recursive: true });
   const env = {
@@ -402,6 +406,19 @@ function expectedTokenSyncComponents() {
   return expectedTokenSyncContract().components;
 }
 
+// The startup-provided validation proof a warm launch hands the admin state.
+function tokenSyncValidatedRuntime(proxyId = "proxy-id") {
+  return {
+    components: expectedTokenSyncComponents(),
+    contractHash: expectedTokenSyncContractHash(),
+    mcpOAuthCallbackPort: mcpOAuthCallbackPort(tmp),
+    mcpOAuthCallbackTopologyVersion: 2 as const,
+    projectId: projectHash(tmp),
+    proofVersion: 4 as const,
+    proxyId,
+  };
+}
+
 function expectedTokenSyncComponentRows(ids: readonly string[], proxyId = "proxy-id"): string {
   const plan = expectedTokenSyncActivePlan();
   return `${ids.map((id) => {
@@ -572,6 +589,10 @@ function installTokenSyncDockerFake(options: { composeProject?: string; onMarker
         if (env.FAKE_DOCKER_STARTED_AT_STATUS) {
           return spawnResult({ status: Number(env.FAKE_DOCKER_STARTED_AT_STATUS), stderr: "transient inspect failure\n" });
         }
+        // A proxy restart that lands after an armed held-token listing.
+        if (env.FAKE_DOCKER_RESTART_ON_LISTING_ARM && fs.existsSync(`${env.FAKE_DOCKER_RESTART_ON_LISTING_ARM}.restarted`)) {
+          return spawnResult({ stdout: "2026-06-18T00:00:01.000000000Z\n" });
+        }
         return spawnResult({ stdout: "2026-06-18T00:00:00.000000000Z\n" });
       }
       if (text.includes("com.docker.compose.project")) return spawnResult({ stdout: `${composeProjectLabel}\n` });
@@ -582,13 +603,21 @@ function installTokenSyncDockerFake(options: { composeProject?: string; onMarker
       if (env.FAKE_DOCKER_SECRET_LIST_STATUS) {
         return spawnResult({ status: Number(env.FAKE_DOCKER_SECRET_LIST_STATUS), stderr: "transient exec failure\n" });
       }
+      if (env.FAKE_DOCKER_RESTART_ON_LISTING_ARM && fs.existsSync(env.FAKE_DOCKER_RESTART_ON_LISTING_ARM)) {
+        fs.writeFileSync(`${env.FAKE_DOCKER_RESTART_ON_LISTING_ARM}.restarted`, "");
+      }
       const held = Array.from(fakeProxySecretStore).sort();
       return spawnResult({ stdout: held.length > 0 ? `${held.join("\n")}\n` : "" });
     }
     if (text.includes("request-proxy.json")) {
       const generation = env.FAKE_PROXY_STATUS_GENERATION ?? "";
       if (!generation) return spawnResult({ stdout: "{}\n{}\n" });
-      return spawnResult({ stdout: `${JSON.stringify({ generation, rulesetVerified: true, appliedAt: "2026-06-18T00:00:00.000Z" })}\n${JSON.stringify({ generation, appliedAt: "2026-06-18T00:00:00.000Z" })}\n` });
+      // Effective-control acknowledgement: both consumers name the selected
+      // effective policy generation as well as the network policy generation.
+      const control = env.FAKE_PROXY_STATUS_CONTROL_GENERATION
+        ? { controlGeneration: env.FAKE_PROXY_STATUS_CONTROL_GENERATION, policyGeneration: generation }
+        : {};
+      return spawnResult({ stdout: `${JSON.stringify({ generation, ...control, rulesetVerified: true, appliedAt: "2026-06-18T00:00:00.000Z" })}\n${JSON.stringify({ generation, ...control, appliedAt: "2026-06-18T00:00:00.000Z" })}\n` });
     }
     {
       const writeMatch = /mv '\/run\/runfree-proxy-secrets\/[^']*' '\/run\/runfree-proxy-secrets\/([^']+)'/.exec(text);
@@ -3640,6 +3669,83 @@ describe("convergent proxy token store", () => {
       const free = tryAcquireControlLock(adminProjectInfoForTokenSync());
       expect(free).toBeDefined();
       free?.release();
+    });
+
+    // Record the selected effective policy generation as converged, the state
+    // a warm launch reaches before its credential sync, and return the fake
+    // proxy env that acknowledges that generation from both consumers.
+    async function convergeSelectedGeneration(): Promise<NodeJS.ProcessEnv> {
+      const project = adminProjectInfoForTokenSync();
+      const active = readActiveEffectiveControl(project);
+      if (!active) throw new Error("test setup: no selected effective policy generation");
+      const ids = { controlGeneration: active.controlGeneration, policyGeneration: active.policyGeneration };
+      await convergeEffectivePolicyGeneration(project, {
+        probe: async () => ({
+          firewall: { generation: ids.policyGeneration, ...ids, rulesetVerified: true },
+          requestProxy: { generation: ids.policyGeneration, ...ids },
+        }),
+        stopRuntime: async () => {},
+      });
+      return { FAKE_PROXY_STATUS_CONTROL_GENERATION: ids.controlGeneration, FAKE_PROXY_STATUS_GENERATION: ids.policyGeneration };
+    }
+
+    test("a warm sync with nothing to write observes the proxy once more for the write fence and never lists compose containers", async () => {
+      writeGithubOnePasswordFixture();
+      const fakeDocker = installTokenSyncDockerFake();
+      const hostOpBin = makeHostOpBin();
+      installFakeOp(hostOpBin, { output: "ghp_secret\n" });
+      await populate(fakeDocker, hostOpBin);
+      const ackEnv = await convergeSelectedGeneration();
+      const writesBefore = tokenWrites(fakeDocker.dockerLog);
+      // Count only the sync: preparation's own observation happens before the
+      // control lock and is not part of this sync's proof.
+      let logBefore = 0;
+
+      const warm = await runAdmin(async () => {
+        prepareRuntimeTokenSources({ mode: "convergence" });
+        logBefore = readJsonLines(fakeDocker.dockerLog).length;
+        await credentialSyncIntent(warmSync);
+      }, { ...opEnv(fakeDocker, hostOpBin), ...ackEnv }, { policyAccess: "effective-read-only", validatedRuntime: tokenSyncValidatedRuntime() });
+
+      expect(warm.status, warm.stderr).toBe(0);
+      expect(tokenWrites(fakeDocker.dockerLog)).toBe(writesBefore);
+      const log = readJsonLines(fakeDocker.dockerLog).slice(logBefore).filter((entry) => Array.isArray(entry.args));
+      const joined = log.map((entry) => (entry.args as string[]).join(" "));
+      const markerReads = joined.filter((args) => args.startsWith("exec") && args.includes("cat /run/runfree-runtime-validation.json")).length;
+      const startedAtReads = joined.filter((args) => args.includes("{{.State.StartedAt}}")).length;
+      const composeLookups = joined.filter((args) => args.startsWith("ps") || args.startsWith("container ls")).length;
+      expect({ markerReads, startedAtReads, composeLookups }).toEqual({ markerReads: 2, startedAtReads: 2, composeLookups: 0 });
+    });
+
+    test("a warm sync refuses the token write when the proxy restarts after the precheck observed it", async () => {
+      writeGithubOnePasswordFixture();
+      const fakeDocker = installTokenSyncDockerFake();
+      const hostOpBin = makeHostOpBin();
+      installFakeOp(hostOpBin, { output: "ghp_secret\n" });
+      // No populate: with no receipt the token is due, so the sync reaches a write.
+      selectEffectiveControlsFromProjectPolicy();
+      const ackEnv = await convergeSelectedGeneration();
+      const restartArm = path.join(tmpBase, `warm-restart-${Math.random().toString(16).slice(2)}.arm`);
+
+      const result = await runAdmin(async () => {
+        prepareRuntimeTokenSources({ mode: "convergence" });
+        // Arm after preparation, so the restart lands after the sync's own
+        // held-token listing, which runs after the precheck observed the proxy.
+        fs.writeFileSync(restartArm, "");
+        await credentialSyncIntent(warmSync);
+      }, {
+        ...opEnv(fakeDocker, hostOpBin),
+        ...ackEnv,
+        FAKE_DOCKER_RESTART_ON_LISTING_ARM: restartArm,
+      }, { policyAccess: "effective-read-only", validatedRuntime: tokenSyncValidatedRuntime() });
+
+      // The restart happened: the held-token listing ran under the precheck's
+      // observation, and the write fence then saw a new store generation.
+      expect(fs.existsSync(`${restartArm}.restarted`)).toBe(true);
+      expect(result.status).not.toBe(0);
+      expect(`${result.stdout}${result.stderr}`).toContain("exact proxy or token store changed during credential resolution");
+      expect(tokenWrites(fakeDocker.dockerLog)).toBe(0);
+      expect(readReceiptsFile()).toHaveLength(0);
     });
 
     test("the watcher's first pass after a receipt-gated launch re-reads every source, even with no refresh interval", async () => {

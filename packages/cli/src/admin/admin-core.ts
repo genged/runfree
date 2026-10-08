@@ -2320,6 +2320,7 @@ type EffectiveCredentialSnapshot = {
   policy: PolicyJson;
   project: ProjectInfo;
   lock: ControlLock;
+  runtime: ProxyRuntime;
 };
 
 class EffectiveControlSelectionChanged extends Error {}
@@ -2594,6 +2595,7 @@ function assertEffectiveControlConvergedBeforeCredentialResolution(
       policy: effective.policy,
       project,
       lock,
+      runtime,
     };
   } catch (error) {
     lock.release();
@@ -2607,7 +2609,8 @@ function syncTokensUnderLock(
   effective?: EffectiveCredentialSnapshot,
 ): TokenSyncResult {
   let exactRuntime: ProxyRuntime | undefined;
-  const rebindProject = { projectId: projectId(), composeProject: composeProject() ?? `runfree-${projectId()}` };
+  // The journal's identity is always the derived name (its parser refuses any other), so no Docker lookup is needed.
+  const rebindProject = { projectId: projectId(), composeProject: `runfree-${projectId()}` };
   const rebindAtStart = readControlPlaneRebindTransaction(stateDir(), rebindProject);
   const rebindReceipt = rebindAtStart ? serializeControlPlaneRebindTransaction(rebindAtStart) : undefined;
   const assertSelection = (): void => {
@@ -2632,7 +2635,9 @@ function syncTokensUnderLock(
   };
   assertSelection();
   const status = loadTokenStatus();
-  const runtime = proxyRuntime();
+  // The precheck observed this exact proxy moments ago under the control lock;
+  // the store-generation re-check in assertSelection() still guards every write.
+  const runtime = effective?.runtime ?? proxyRuntime();
   exactRuntime = runtime;
   adminVerbose(options, `proxy runtime state is ${runtime.state}`);
 
