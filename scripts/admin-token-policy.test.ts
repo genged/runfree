@@ -589,8 +589,10 @@ function installTokenSyncDockerFake(options: { composeProject?: string; onMarker
         if (env.FAKE_DOCKER_STARTED_AT_STATUS) {
           return spawnResult({ status: Number(env.FAKE_DOCKER_STARTED_AT_STATUS), stderr: "transient inspect failure\n" });
         }
-        // A proxy restart that lands after an armed held-token listing.
-        if (env.FAKE_DOCKER_RESTART_ON_LISTING_ARM && fs.existsSync(`${env.FAKE_DOCKER_RESTART_ON_LISTING_ARM}.restarted`)) {
+        // A proxy restart that lands after an armed held-token listing, or
+        // after an armed precheck status-file read.
+        if ((env.FAKE_DOCKER_RESTART_ON_LISTING_ARM && fs.existsSync(`${env.FAKE_DOCKER_RESTART_ON_LISTING_ARM}.restarted`))
+          || (env.FAKE_DOCKER_RESTART_ON_STATUS_ARM && fs.existsSync(`${env.FAKE_DOCKER_RESTART_ON_STATUS_ARM}.restarted`))) {
           return spawnResult({ stdout: "2026-06-18T00:00:01.000000000Z\n" });
         }
         return spawnResult({ stdout: "2026-06-18T00:00:00.000000000Z\n" });
@@ -610,6 +612,11 @@ function installTokenSyncDockerFake(options: { composeProject?: string; onMarker
       return spawnResult({ stdout: held.length > 0 ? `${held.join("\n")}\n` : "" });
     }
     if (text.includes("request-proxy.json")) {
+      // A proxy restart that lands after the precheck's policy-acknowledgement
+      // status-file read, before the sync's own held-token listing runs.
+      if (env.FAKE_DOCKER_RESTART_ON_STATUS_ARM && fs.existsSync(env.FAKE_DOCKER_RESTART_ON_STATUS_ARM)) {
+        fs.writeFileSync(`${env.FAKE_DOCKER_RESTART_ON_STATUS_ARM}.restarted`, "");
+      }
       const generation = env.FAKE_PROXY_STATUS_GENERATION ?? "";
       if (!generation) return spawnResult({ stdout: "{}\n{}\n" });
       // Effective-control acknowledgement: both consumers name the selected
@@ -3174,7 +3181,7 @@ exit 0
     expect(JSON.stringify(readTokenStatus())).not.toContain("unused-secret");
   });
 
-  // Perf plan Task 1: a receipt-gated warm-launch sync with nothing it could
+  // A receipt-gated warm-launch sync with nothing it could
   // write, delete, or prune returns before any Docker call.
   test("a startup-convergence sync with no tokens, no token config, and no receipts asks Docker nothing", async () => {
     writeFixtureRepo({ hosts: [], tokens: {} });
@@ -3746,6 +3753,52 @@ describe("convergent proxy token store", () => {
       expect(`${result.stdout}${result.stderr}`).toContain("exact proxy or token store changed during credential resolution");
       expect(tokenWrites(fakeDocker.dockerLog)).toBe(0);
       expect(readReceiptsFile()).toHaveLength(0);
+    });
+
+    test("a warm sync refuses the token write when the proxy restarts during the precheck's own status read, and a retry then succeeds", async () => {
+      writeGithubOnePasswordFixture();
+      const fakeDocker = installTokenSyncDockerFake();
+      const hostOpBin = makeHostOpBin();
+      installFakeOp(hostOpBin, { output: "ghp_secret\n" });
+      // No populate: with no receipt the token is due, so the sync reaches a write.
+      selectEffectiveControlsFromProjectPolicy();
+      const ackEnv = await convergeSelectedGeneration();
+      const restartArm = path.join(tmpBase, `warm-restart-status-${Math.random().toString(16).slice(2)}.arm`);
+
+      const refused = await runAdmin(async () => {
+        prepareRuntimeTokenSources({ mode: "convergence" });
+        // Arm after preparation, so the restart lands on the precheck's own
+        // policy-acknowledgement status read -- before the sync's own
+        // held-token listing runs, let alone any write.
+        fs.writeFileSync(restartArm, "");
+        await credentialSyncIntent(warmSync);
+      }, {
+        ...opEnv(fakeDocker, hostOpBin),
+        ...ackEnv,
+        FAKE_DOCKER_RESTART_ON_STATUS_ARM: restartArm,
+      }, { policyAccess: "effective-read-only", validatedRuntime: tokenSyncValidatedRuntime() });
+
+      // The restart happened during the precheck itself, before the sync's
+      // own work started; the later write fence still catches it.
+      expect(fs.existsSync(`${restartArm}.restarted`)).toBe(true);
+      expect(refused.status).not.toBe(0);
+      expect(`${refused.stdout}${refused.stderr}`).toContain("exact proxy or token store changed during credential resolution");
+      expect(tokenWrites(fakeDocker.dockerLog)).toBe(0);
+      expect(dockerExecCalls(fakeDocker.dockerLog).some((entry) => String((entry.args as string[]).at(-1)).includes("mv '/run/runfree-proxy-secrets/"))).toBe(false);
+      expect(readReceiptsFile()).toHaveLength(0);
+
+      // Reclaim: a retry that observes no restart succeeds and writes once.
+      const retried = await runAdmin(async () => {
+        prepareRuntimeTokenSources({ mode: "convergence" });
+        await credentialSyncIntent(warmSync);
+      }, {
+        ...opEnv(fakeDocker, hostOpBin),
+        ...ackEnv,
+      }, { policyAccess: "effective-read-only", validatedRuntime: tokenSyncValidatedRuntime() });
+
+      expect(retried.status, retried.stderr).toBe(0);
+      expect(tokenWrites(fakeDocker.dockerLog)).toBe(1);
+      expect(readReceiptsFile().map((receipt) => receipt.tokenName)).toEqual(["github"]);
     });
 
     test("the watcher's first pass after a receipt-gated launch re-reads every source, even with no refresh interval", async () => {

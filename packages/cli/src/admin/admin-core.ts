@@ -2635,8 +2635,9 @@ function syncTokensUnderLock(
   };
   assertSelection();
   const status = loadTokenStatus();
-  // The precheck observed this exact proxy moments ago under the control lock;
-  // the store-generation re-check in assertSelection() still guards every write.
+  // `runtime` is the precheck's observation, reused rather than re-observed. If the
+  // proxy restarted since — including while waiting for the token-store lock above —
+  // assertSelection()'s store-generation fence refuses every write, and a retry observes the new proxy.
   const runtime = effective?.runtime ?? proxyRuntime();
   exactRuntime = runtime;
   adminVerbose(options, `proxy runtime state is ${runtime.state}`);

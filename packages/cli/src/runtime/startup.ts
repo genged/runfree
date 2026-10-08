@@ -1327,7 +1327,7 @@ export async function startRuntime(
     });
     adapters = createRuntimeAdapters(existingContext, io);
 
-    timings.time("startup:docker-available", ensureDockerAvailable);
+    timings.time("startup:docker-available-prepared", ensureDockerAvailable);
     const startupDaemonIdentity = lastObservedDockerDaemonIdentity();
     // Capture the proxy container id before any lifecycle change. The proxy
     // loads the on-disk policy at boot, so a changed id afterwards means it
