@@ -1102,6 +1102,28 @@ test("prepared credentials refuse stale admission, then bind one fresh operation
   } finally { clock.mockRestore(); clearPreparedRuntimeTokenSources(project); fs.rmSync(root, { recursive: true, force: true }); }
 });
 
+test("a warm convergence preparation with no credential to read asks Docker nothing", async () => {
+  const { prepareRuntimeTokenSources, clearPreparedRuntimeTokenSources } = await import("./admin-core.ts");
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "runfree-prepared-no-tokens-"));
+  const projectRoot = path.join(root, "project");
+  const policyPath = path.join(projectRoot, ".runfree/network-policy.json");
+  const stateDir = path.join(root, "state");
+  const tokenConfigPath = path.join(root, "tokens.json");
+  fs.mkdirSync(path.dirname(policyPath), { recursive: true });
+  fs.writeFileSync(policyPath, JSON.stringify({ hosts: [], tokens: {} }));
+  fs.writeFileSync(tokenConfigPath, "{}");
+  const project = adminTestProjectInfo({ projectRoot, policyPath, stateDir, tokenConfigPath });
+  prepareSelectedAdminControls(projectRoot, project, policyPath);
+  const processes = vi.fn(() => ({ status: 1, stdout: "", stderr: "", pid: 1, signal: null, output: [] }));
+  const state = createAdminState({ projectRoot, policyPath, stateDir, tokenConfigPath,
+    env: { HOME: root, PATH: process.env.PATH }, processRunner: processes,
+    runtimeContext: { projectRoot, project, runtimeRoot: "/runtime" } });
+  try {
+    expect(await runAdminAction(state, () => prepareRuntimeTokenSources({ mode: "convergence" }))).toBe(0);
+    expect(processes).not.toHaveBeenCalled();
+  } finally { clearPreparedRuntimeTokenSources(project); fs.rmSync(root, { recursive: true, force: true }); }
+});
+
 test.each(["binding", "required-removal", "optional-addition", "named-change", "named-removal", "named-malformed", "malformed"] as const)(
   "prepared credential admission refuses %s before disruption and accepts restored metadata without another source read", async (change) => {
     const { prepareRuntimeTokenSources, admitPreparedRuntimeTokenSources, clearPreparedRuntimeTokenSources } = await import("./admin-core.ts");

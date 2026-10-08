@@ -2399,7 +2399,12 @@ export function prepareRuntimeTokenSources(options: Readonly<{ mode?: RuntimeTok
   const policy = validateNetworkPolicy(active.policy, active.networkPolicyPath);
   const config = loadTokenConfig();
   const registry = Object.values(config).some((source) => source.source === "named") ? loadSourceRegistry() : undefined;
-  const skippable = options.mode === "convergence" ? warmSkippableTokens(policy, config, registry) : new Set<string>();
+  // The skip set only ever spares a read, so with no configured source to read
+  // there is nothing to spare and no reason to ask the proxy.
+  const readsSources = Object.keys(policy.tokens).some((name) => config[name] !== undefined);
+  const skippable = options.mode === "convergence" && readsSources
+    ? warmSkippableTokens(policy, config, registry)
+    : new Set<string>();
   const values = new Map<string, PreparedTokenSourceEntry>();
   for (const [name, tokenPolicy] of Object.entries(policy.tokens)) {
     const source = config[name];
