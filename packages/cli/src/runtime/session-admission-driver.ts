@@ -192,7 +192,13 @@ import {
   removeOrphanSessionMcpCallbackIngress,
   removeSessionMcpCallbackIngress,
 } from "./session-callback-ingress.ts";
-import { sessionMcpCallbackLifecycle, type SessionIngressLifecycle } from "./session-mcp-callback.ts";
+import {
+  type SessionCallbackOwner,
+  type SessionCallbackReservation,
+  sessionMcpCallbackLifecycle,
+  type SessionIngressLifecycle,
+} from "./session-mcp-callback.ts";
+import { createTaskScope, type ScopedTask } from "./task-scope.ts";
 import { launchLockHoldDeadline, RUNNING_PROOF_TIMEOUT_MS } from "./launch-lock-hold.ts";
 import { remedy } from "../remedies.ts";
 
@@ -532,6 +538,18 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
    * the record — and with it the address the ingress targets.
    */
   #ingressMayExist = false;
+  /**
+   * Every branch this launch runs beside its foreground steps. Cleanup,
+   * teardown, and the launch's return each settle it first, under the
+   * lifecycle lock, so no Docker call outlives the lock or races a cleanup.
+   */
+  readonly #tasks = createTaskScope({ assertHeld: () => this.#lock() });
+  /** The session ingress whose reservation is running beside the session container's start. */
+  #ingress?: Readonly<{
+    lifecycle: SessionIngressLifecycle;
+    owner: SessionCallbackOwner;
+    reservation: ScopedTask<SessionCallbackReservation>;
+  }>;
   #displayIdentity?: Readonly<{ displayName: string; command: string; agentCommand: string }>;
   #sessionEvidence?: SessionMetadata;
 
@@ -1732,6 +1750,11 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
     this.#record = provisioning;
     this.#persistedRecord = provisioning;
     this.#plan = provisioningPlan;
+    // The durable record now names the exact container, so the reservation can
+    // bind its forwarder to it. It runs beside the evidence write, the
+    // foreground start, and the running proof, and finishes before them: it
+    // starts first and its budget is no longer than the proof's.
+    this.#startSessionIngressReservation(provisioning);
     const command = sessionContainerStartAttachCommand(provisioningPlan.record, provisioningPlan.expectedProject);
     // Host session evidence is written before the foreground spawn, matching
     // the legacy attach path: a host client killed while the start is in
@@ -2119,32 +2142,60 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
   activate = async (): Promise<void> => {
     this.#lock();
     const provisioning = this.#require(this.#provisioningAuthorization, "provisioning-running authority");
-    await this.#prepareSessionIngress(provisioning.record);
+    await this.#completeSessionIngress();
     this.#lock();
     await this.#admitThroughSessionFile(provisioning.record);
   };
 
   /**
-   * Sets up the session-owned ingress (the MCP OAuth callback path) while the
-   * session entry still waits, so no client starts before its callback port
-   * exists. Launch mode only; a failure fails the launch and the unadmitted
-   * cleanup that follows proves the ingress gone before the record goes.
+   * Starts reserving the session-owned ingress (the MCP OAuth callback port)
+   * beside the session container's start. Launch mode only. Ingress intent is
+   * recorded before the reservation's first effect, so every failure path
+   * proves the ingress gone before the record — and with it the address the
+   * ingress targets — is released.
    */
-  #prepareSessionIngress = async (record: SessionContainerRecordV2): Promise<void> => {
+  #startSessionIngressReservation(record: SessionContainerRecordV2): void {
     if (!this.#launch) return;
     const lifecycle = this.#input.sessionIngress === undefined
       ? sessionMcpCallbackLifecycle(this.#input.context, this.#gateway.io)
       : this.#input.sessionIngress;
     if (!lifecycle) return;
-    const containerId = this.#require(record.containerId, "session container id");
-    this.#ingressMayExist = true;
-    await lifecycle.prepare({
+    const owner: SessionCallbackOwner = Object.freeze({
       sessionId: record.sessionId,
-      containerId,
+      containerId: this.#require(record.containerId, "session container id"),
       sourceIp: record.sourceIp,
       internalNetwork: this.#network().networkName,
     });
+    this.#lock();
+    this.#ingressMayExist = true;
+    this.#ingress = Object.freeze({
+      lifecycle,
+      owner,
+      reservation: this.#tasks.start("session-ingress-reserve", () => lifecycle.reserve(owner)),
+    });
+  }
+
+  /**
+   * Completes the reserved ingress after the running proof and before the
+   * session file: attaches it, starts the in-session bridge (which announces
+   * the port), and proves the path, while the session entry still waits, so
+   * no client starts before its callback port exists. A failure of either
+   * phase fails the launch, and the unadmitted cleanup that follows proves
+   * the ingress gone before the record goes.
+   */
+  #completeSessionIngress = async (): Promise<void> => {
+    const ingress = this.#ingress;
+    if (!ingress) return;
+    const reserved = await ingress.reservation.result();
+    this.#lock();
+    await ingress.lifecycle.complete(ingress.owner, reserved);
   };
+
+  /** Waits for every branch started beside the foreground steps, then asserts the lock. */
+  settleTasks = (): Promise<void> => this.#tasks.settleAll();
+
+  /** How many branches started beside the foreground steps are still in flight. */
+  pendingTasks = (): number => this.#tasks.pending();
 
   /**
    * Holds the session for the life of the attached process, beating its file.
@@ -2250,6 +2301,9 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
 
   cleanupUnadmitted = async (): Promise<void> => {
     this.#lock();
+    // A reservation still in flight may yet create a forwarder; nothing is
+    // removed until it has settled.
+    await this.#tasks.settleAll();
     const preflight = this.#require(this.#preflight, "canonical preflight");
     const record = this.#record;
     if (!record) return;
@@ -2389,6 +2443,7 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
 
   tearDown = async (): Promise<void> => {
     this.#lock();
+    await this.#tasks.settleAll();
     await this.#tearDownSessionFileSession();
   };
 
@@ -2579,11 +2634,19 @@ export function createInternalSessionAdmissionDriver(
         throw failure;
       }
     } finally {
-      if (timings.enabled && steps) {
-        timings.report("session-admission", `docker-operations=${steps.dockerOperationCount()}`);
-        timings.report("teardown-path", steps.teardownPath());
+      // Every cleanup path settles the launch's branches first; this is the
+      // backstop, so nothing started under the lock outlives the launch that
+      // holds it. Only a branch still in flight is waited on, so a launch that
+      // already lost the lock reports its own failure, not a second one.
+      try {
+        if (steps && steps.pendingTasks() > 0) await steps.settleTasks();
+      } finally {
+        if (timings.enabled && steps) {
+          timings.report("session-admission", `docker-operations=${steps.dockerOperationCount()}`);
+          timings.report("teardown-path", steps.teardownPath());
+        }
+        inFlight = false;
       }
-      inFlight = false;
     }
   };
   return Object.freeze({

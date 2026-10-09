@@ -32,15 +32,19 @@ import { readHostServicePortRegistry } from "../host-service-registry.ts";
 import { createDockerClient } from "./docker-client.ts";
 import { dockerClientEnvOptions, parseDockerJson } from "./docker.ts";
 import { projectHash } from "./env.ts";
-import { ingressForwarderName, startIngressForwarder } from "./ingress-forwarder.ts";
-import { SESSION_CALLBACK_SETUP_BUDGET_MS } from "./launch-lock-hold.ts";
+import { connectIngressForwarderAsync, ingressForwarderName, startIngressForwarderAsync } from "./ingress-forwarder.ts";
+import {
+  SESSION_CALLBACK_COMPLETE_BUDGET_MS,
+  SESSION_CALLBACK_RESERVE_BUDGET_MS,
+  SESSION_CALLBACK_SETUP_BUDGET_MS,
+} from "./launch-lock-hold.ts";
 import { removeValidatedIngressForwarders } from "./ingress-forwarder-ownership.ts";
 import { mcpOAuthCallbackPort, runtimeMcpOAuthPolicyHasServers } from "./mcp.ts";
 import { probeMcpCallbackPathWithRetries, startMcpCallbackBridgeInContainer } from "./probes.ts";
 import type { CaptureResult, DockerContainerInspect, RuntimeContext, RuntimeIO } from "./types.ts";
 import {
   forwarderHostPort,
-  inspectCallbackForwarders,
+  inspectCallbackForwardersAsync,
   MCP_CALLBACK_PURPOSE,
   removeSessionMcpCallbackIngress,
   SESSION_CALLBACK_CONTAINER_ENV,
@@ -77,9 +81,28 @@ export type SessionCallbackEndpoint = Readonly<{
   forwarderName: string;
 }>;
 
-/** What the admission driver needs: set up before activation. Teardown is shared. */
+/** A published, LISTENing forwarder bound to its session, not yet attached to `agent_internal`. */
+export type SessionCallbackReservation = Readonly<{
+  port: number;
+  forwarderName: string;
+  /** The forwarder's exact 64-hex container id. */
+  forwarderId: string;
+}>;
+
+/**
+ * What the admission driver needs, in two phases. Teardown is shared.
+ *
+ * `reserve` may overlap the session container's start and running proof: it
+ * touches only the forwarder and the host-facing network. `complete` runs
+ * after the running proof and before the session file is written: attaching
+ * `agent_internal` (a dynamic address) waits until the session's static
+ * address is bound, and the bridge announces the port before any client runs.
+ */
 export type SessionIngressLifecycle = Readonly<{
-  prepare(owner: SessionCallbackOwner): Promise<SessionCallbackEndpoint | undefined>;
+  /** Steps 1-5: list forwarders, host port check, name check, host network, `docker run -p` (the reservation), readiness. */
+  reserve(owner: SessionCallbackOwner): Promise<SessionCallbackReservation>;
+  /** Step 6 onward: connect agent_internal, internal address, bridge (port file), probe. Removes the ingress on failure. */
+  complete(owner: SessionCallbackOwner, reservation: SessionCallbackReservation): Promise<SessionCallbackEndpoint>;
 }>;
 
 function assertOwner(owner: SessionCallbackOwner): void {
@@ -159,8 +182,15 @@ type PrepareDependencies = Readonly<{
   probe?: (port: number, challenge: string, deadlineMs: number, nowMs: () => number) => Promise<CaptureResult>;
   /** Monotonic clock for the setup budget; defaults to `performance.now`. */
   nowMs?: () => number;
-  /** The whole setup's budget; defaults to `SESSION_CALLBACK_SETUP_BUDGET_MS`. */
+  /**
+   * The phase's budget. Defaults: `SESSION_CALLBACK_RESERVE_BUDGET_MS` for a
+   * reserve, `SESSION_CALLBACK_COMPLETE_BUDGET_MS` for a complete, and
+   * `SESSION_CALLBACK_SETUP_BUDGET_MS` for the whole of a prepare, whose two
+   * phases share one deadline.
+   */
   budgetMs?: number;
+  /** The ordered port candidates, given the excluded ports; defaults to `sessionCallbackPortCandidates`. */
+  candidates?: (excluded: ReadonlySet<number>) => readonly number[];
   /**
    * Ports any project has approved as a host service (HS7): never a callback
    * candidate, in any project. Defaults to one bounded read of the host-global
@@ -220,33 +250,67 @@ function forwarderInternalAddress(
   return address;
 }
 
+type PhaseDeadline = Readonly<{ deadlineMs: number; budgetMs: number }>;
+
+function phaseDeadline(deps: PrepareDependencies, defaultBudgetMs: number): PhaseDeadline {
+  const budgetMs = deps.budgetMs ?? defaultBudgetMs;
+  return Object.freeze({ deadlineMs: (deps.nowMs ?? (() => performance.now()))() + budgetMs, budgetMs });
+}
+
+function failureMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
 /**
- * Sets up this session's callback: reserves a port by creating its bound
- * forwarder, starts the in-session bridge, and proves the host path. Runs
- * before activation, while the session's entry is still waiting. Any failure
- * removes what this call created and throws, failing the launch.
+ * Removes every forwarder routed to this session, on the caller's io (never
+ * cut off by a spent budget), then throws the retry error for `message`.
  */
-export async function prepareSessionMcpCallback(
+function failAfterRemovingSessionIngress(
   context: RuntimeContext,
   io: RuntimeIO,
   owner: SessionCallbackOwner,
-  deps: PrepareDependencies = {},
-): Promise<SessionCallbackEndpoint> {
+  message: string,
+): never {
+  try {
+    removeSessionMcpCallbackIngress({
+      io,
+      dockerOptions: dockerClientEnvOptions(context),
+      projectId: projectHash(context.projectRoot),
+      sessionId: owner.sessionId,
+      sourceIp: owner.sourceIp,
+    });
+  } catch (cleanup) {
+    throw sessionCallbackRetry(`${message}; and cleanup failed: ${failureMessage(cleanup)}`);
+  }
+  throw sessionCallbackRetry(message);
+}
+
+async function reserveWithin(
+  context: RuntimeContext,
+  io: RuntimeIO,
+  owner: SessionCallbackOwner,
+  deps: PrepareDependencies,
+  phase: PhaseDeadline,
+): Promise<SessionCallbackReservation> {
   assertOwner(owner);
   const projectId = projectHash(context.projectRoot);
   const { internalNetwork } = owner;
-  // Cleanup (removing what this call created) uses the caller's io; every
-  // setup step uses the deadline-bound one.
-  const dockerInput = { io, dockerOptions: dockerClientEnvOptions(context), projectId } as const;
   const hostPortFree = deps.hostPortFree ?? hostLoopbackPortFree;
   const nowMs = deps.nowMs ?? (() => performance.now());
-  const budgetMs = deps.budgetMs ?? SESSION_CALLBACK_SETUP_BUDGET_MS;
-  const deadlineMs = nowMs() + budgetMs;
+  const { deadlineMs, budgetMs } = phase;
+  // Every reservation step runs on the asynchronous client, so it can overlap
+  // the session container's start, and each is cut off at the time left.
+  // Cleanup (removing what this call created) uses the caller's io.
   const setupIo = withSetupDeadline(io, () => deadlineMs - nowMs(), budgetMs);
 
   // Ports this project's forwarders already publish are never candidates;
-  // Docker's publication conflict covers every other process on the host.
-  const held = new Set(inspectCallbackForwarders({ ...dockerInput, io: setupIo }).forwarders
+  // Docker's publication conflict covers every other process on the host,
+  // including another project's concurrent reservation.
+  const held = new Set((await inspectCallbackForwardersAsync({
+    io: setupIo,
+    dockerOptions: dockerClientEnvOptions(context),
+    projectId,
+  })).forwarders
     .map(forwarderHostPort)
     .filter((port): port is number => port !== undefined));
   const registeredHostPorts = deps.registeredHostPorts ?? (() => {
@@ -254,9 +318,9 @@ export async function prepareSessionMcpCallback(
     return read.ok ? new Set(read.owners.keys()) : new Set<number>();
   });
   for (const port of registeredHostPorts()) held.add(port);
-  const candidates = sessionCallbackPortCandidates(context.projectRoot, owner.sessionId, held);
+  const candidates = (deps.candidates ?? ((excluded) => sessionCallbackPortCandidates(context.projectRoot, owner.sessionId, excluded)))(held)
+    .filter((port) => !held.has(port));
 
-  let endpoint: SessionCallbackEndpoint | undefined;
   let lastConflict = "";
   for (const port of candidates) {
     if (nowMs() >= deadlineMs) {
@@ -265,7 +329,7 @@ export async function prepareSessionMcpCallback(
     if (!(await hostPortFree(port))) continue;
     const name = ingressForwarderName(projectId, MCP_CALLBACK_PURPOSE, String(port));
     try {
-      startIngressForwarder(context, setupIo, {
+      const started = await startIngressForwarderAsync(context, setupIo, {
         purpose: MCP_CALLBACK_PURPOSE,
         projectId,
         hostPort: String(port),
@@ -277,64 +341,127 @@ export async function prepareSessionMcpCallback(
           [SESSION_CALLBACK_CONTAINER_ENV]: owner.containerId,
         },
       });
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      if (!PUBLICATION_CONFLICT_PATTERN.test(message)) {
-        try {
-          removeSessionMcpCallbackIngress({ ...dockerInput, sessionId: owner.sessionId, sourceIp: owner.sourceIp });
-        } catch (cleanup) {
-          throw sessionCallbackRetry(`${message}; and cleanup failed: ${cleanup instanceof Error ? cleanup.message : String(cleanup)}`);
-        }
-        throw sessionCallbackRetry(message);
+      if (started.name !== name || !FULL_DOCKER_ID_PATTERN.test(started.containerId)) {
+        throw new Error(`MCP OAuth callback forwarder ${started.name} started without its exact identity`);
       }
+      return Object.freeze({ port, forwarderName: name, forwarderId: started.containerId });
+    } catch (error) {
+      const message = failureMessage(error);
+      if (!PUBLICATION_CONFLICT_PATTERN.test(message)) failAfterRemovingSessionIngress(context, io, owner, message);
       lastConflict = message;
       try {
         removeCreatedResidue(context, io, projectId, name);
       } catch (cleanup) {
-        throw sessionCallbackRetry(`${message}; and cleanup failed: ${cleanup instanceof Error ? cleanup.message : String(cleanup)}`);
+        throw sessionCallbackRetry(`${message}; and cleanup failed: ${failureMessage(cleanup)}`);
       }
-      continue;
     }
-    endpoint = Object.freeze({ port, forwarderName: name });
-    break;
   }
-  if (!endpoint) {
-    throw sessionCallbackRetry(
-      `no free loopback port among ${candidates.length} candidates${lastConflict ? ` (last conflict: ${lastConflict})` : ""}`,
-    );
-  }
+  throw sessionCallbackRetry(
+    `no free loopback port among ${candidates.length} candidates${lastConflict ? ` (last conflict: ${lastConflict})` : ""}`,
+  );
+}
 
+async function completeWithin(
+  context: RuntimeContext,
+  io: RuntimeIO,
+  owner: SessionCallbackOwner,
+  reservation: SessionCallbackReservation,
+  deps: PrepareDependencies,
+  phase: PhaseDeadline,
+): Promise<SessionCallbackEndpoint> {
+  assertOwner(owner);
+  const nowMs = deps.nowMs ?? (() => performance.now());
+  const { deadlineMs, budgetMs } = phase;
+  const setupIo = withSetupDeadline(io, () => deadlineMs - nowMs(), budgetMs);
   try {
-    const allowedPeerIp = forwarderInternalAddress(context, setupIo, endpoint.forwarderName, internalNetwork);
+    const projectId = projectHash(context.projectRoot);
+    if (!Number.isInteger(reservation.port)
+      || reservation.forwarderName !== ingressForwarderName(projectId, MCP_CALLBACK_PURPOSE, String(reservation.port))
+      || !FULL_DOCKER_ID_PATTERN.test(reservation.forwarderId)) {
+      throw new Error("the callback reservation is not this project's forwarder for its port");
+    }
+    // Attached only now: the forwarder's `agent_internal` address is dynamic,
+    // and the session's static address is bound only once it has started.
+    await connectIngressForwarderAsync(
+      context,
+      setupIo,
+      { name: reservation.forwarderName, containerId: reservation.forwarderId },
+      owner.internalNetwork,
+    );
+    const allowedPeerIp = forwarderInternalAddress(context, setupIo, reservation.forwarderName, owner.internalNetwork);
     const challenge = crypto.randomBytes(24).toString("base64url");
     const bridge = startMcpCallbackBridgeInContainer(context, setupIo, {
       containerId: owner.containerId,
       bindIp: owner.sourceIp,
-      port: endpoint.port,
+      port: reservation.port,
       challenge,
       allowedPeerIp,
     });
     if (bridge !== 0) throw new Error(`the in-session callback bridge did not start (exit ${bridge})`);
-    const probe = await (deps.probe ?? probeMcpCallbackPathWithRetries)(endpoint.port, challenge, deadlineMs, nowMs);
+    const probe = await (deps.probe ?? probeMcpCallbackPathWithRetries)(reservation.port, challenge, deadlineMs, nowMs);
     if (probe.status !== 0) {
-      throw new Error(`http://127.0.0.1:${endpoint.port} did not reach the session (${probe.stderr || "no echo"})`);
+      throw new Error(`http://127.0.0.1:${reservation.port} did not reach the session (${probe.stderr || "no echo"})`);
     }
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    try {
-      removeSessionMcpCallbackIngress({ ...dockerInput, sessionId: owner.sessionId, sourceIp: owner.sourceIp });
-    } catch (cleanup) {
-      throw sessionCallbackRetry(`${message}; and cleanup failed: ${cleanup instanceof Error ? cleanup.message : String(cleanup)}`);
-    }
-    throw sessionCallbackRetry(message);
+    failAfterRemovingSessionIngress(context, io, owner, failureMessage(error));
   }
-  return endpoint;
+  return Object.freeze({ port: reservation.port, forwarderName: reservation.forwarderName });
+}
+
+/**
+ * Reserves this session's callback port: creates its bound forwarder on the
+ * host-facing network and waits until it LISTENs there. Every Docker call is
+ * asynchronous, so a launch runs this beside the session container's start.
+ * The forwarder is not attached to `agent_internal`. Any failure removes what
+ * this call created and throws, failing the launch.
+ */
+export async function reserveSessionMcpCallback(
+  context: RuntimeContext,
+  io: RuntimeIO,
+  owner: SessionCallbackOwner,
+  deps: PrepareDependencies = {},
+): Promise<SessionCallbackReservation> {
+  return reserveWithin(context, io, owner, deps, phaseDeadline(deps, SESSION_CALLBACK_RESERVE_BUDGET_MS));
+}
+
+/**
+ * Completes a reserved callback after the session's running proof: attaches
+ * the forwarder to `agent_internal`, starts the peer-only bridge (which writes
+ * the port file), and proves the host path. Runs before activation, while the
+ * session's entry is still waiting. Any failure removes every forwarder routed
+ * to this session and throws, failing the launch.
+ */
+export async function completeSessionMcpCallback(
+  context: RuntimeContext,
+  io: RuntimeIO,
+  owner: SessionCallbackOwner,
+  reservation: SessionCallbackReservation,
+  deps: PrepareDependencies = {},
+): Promise<SessionCallbackEndpoint> {
+  return completeWithin(context, io, owner, reservation, deps, phaseDeadline(deps, SESSION_CALLBACK_COMPLETE_BUDGET_MS));
+}
+
+/**
+ * Sets up this session's callback in one call: reserve, then complete, under
+ * one deadline for the whole setup. For a caller with nothing to overlap.
+ */
+export async function prepareSessionMcpCallback(
+  context: RuntimeContext,
+  io: RuntimeIO,
+  owner: SessionCallbackOwner,
+  deps: PrepareDependencies = {},
+): Promise<SessionCallbackEndpoint> {
+  const phase = phaseDeadline(deps, SESSION_CALLBACK_SETUP_BUDGET_MS);
+  const reservation = await reserveWithin(context, io, owner, deps, phase);
+  return completeWithin(context, io, owner, reservation, deps, phase);
 }
 
 /** The lifecycle the admission driver runs for an eligible launch; undefined when none is needed. */
 export function sessionMcpCallbackLifecycle(context: RuntimeContext, io: RuntimeIO): SessionIngressLifecycle | undefined {
   if (!sessionMcpCallbackRequired(context)) return undefined;
   return Object.freeze({
-    prepare: (owner: SessionCallbackOwner) => prepareSessionMcpCallback(context, io, owner),
+    reserve: (owner: SessionCallbackOwner) => reserveSessionMcpCallback(context, io, owner),
+    complete: (owner: SessionCallbackOwner, reservation: SessionCallbackReservation) =>
+      completeSessionMcpCallback(context, io, owner, reservation),
   });
 }

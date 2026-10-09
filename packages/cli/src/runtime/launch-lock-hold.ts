@@ -48,11 +48,14 @@ export const LAUNCH_HANDOFF_STARTUP_SPAN_MAX_MS =
 
 /**
  * The overlapped MCP callback setup's own two budgets: the part that may run
- * concurrently with the running proof (the forwarder port search and the
- * in-session bridge), and the part that runs after the running proof has
- * returned (the host path probe). Keeping both at the whole setup budget
- * bounds each phase independently without assuming how much of the setup the
- * reserve phase actually used while it overlapped the proof.
+ * concurrently with the session container's start and running proof (the
+ * forwarder port search, its `docker run -p`, and its readiness), and the
+ * part that runs after the running proof has returned (the `agent_internal`
+ * attach, the in-session bridge, and the host path probe). Keeping both at
+ * the whole setup budget bounds each phase independently without assuming
+ * how much of the setup the reserve phase actually used while it overlapped
+ * the proof. The reserve starts before the proof does and its budget is no
+ * longer than the proof's, so it ends before the proof's deadline.
  */
 export const SESSION_CALLBACK_RESERVE_BUDGET_MS = SESSION_CALLBACK_SETUP_BUDGET_MS;
 export const SESSION_CALLBACK_COMPLETE_BUDGET_MS = SESSION_CALLBACK_SETUP_BUDGET_MS;

@@ -20,9 +20,12 @@ import {
   TEST_SESSION_IP,
   type FakeDockerOptions,
 } from "./session-callback-ingress.test-harness.ts";
+import { SESSION_CALLBACK_COMPLETE_BUDGET_MS, SESSION_CALLBACK_RESERVE_BUDGET_MS } from "./launch-lock-hold.ts";
 import {
+  completeSessionMcpCallback,
   hostLoopbackPortFree,
   prepareSessionMcpCallback,
+  reserveSessionMcpCallback,
   SESSION_CALLBACK_PORT_ATTEMPTS,
   sessionCallbackPortCandidates,
   sessionMcpCallbackLifecycle,
@@ -281,6 +284,7 @@ describe("prepareSessionMcpCallback", () => {
 
     const calls = [
       ...(docker.io.capture as Mock).mock.calls,
+      ...(docker.io.captureAsync as unknown as Mock).mock.calls,
       ...(docker.io.run as Mock).mock.calls,
     ] as Array<[string, string[], { timeout?: number; killSignal?: string }]>;
     const setupCalls = calls.filter(([, args]) => args[0] !== "rm");
@@ -298,7 +302,7 @@ describe("prepareSessionMcpCallback", () => {
     const docker = fake();
     let clock = 0;
     const base = (docker.io.capture as Mock).getMockImplementation() as (command: string, args: string[]) => unknown;
-    (docker.io.capture as Mock).mockImplementation((command: string, args: string[], options: { timeout?: number }) => {
+    (docker.io.captureAsync as unknown as Mock).mockImplementation(async (command: string, args: string[], options: { timeout?: number }) => {
       if (args[0] !== "run") return base(command, args);
       // The daemon creates the forwarder, but the CLI is killed at the
       // deadline before it reports the container id.
@@ -358,6 +362,178 @@ describe("prepareSessionMcpCallback", () => {
   });
 });
 
+describe("reserveSessionMcpCallback and completeSessionMcpCallback", () => {
+  const isForwarder = (container: DockerContainerInspect) =>
+    container.Config?.Labels?.["io.runfree.ingress-purpose"] === "mcp-callback";
+  const indexOf = (sequence: string[][], match: (args: string[]) => boolean) => sequence.findIndex(match);
+  const isRun = (args: string[]) => args[0] === "run";
+  const isConnect = (args: string[]) => args[0] === "network" && args[1] === "connect";
+  const isBridge = (args: string[]) => args[0] === "exec" && args.includes("--detach");
+
+  test("reserve publishes the port and does not attach agent_internal; complete attaches, starts the bridge, and probes", async () => {
+    const docker = fake();
+    const probe = vi.fn(probeOk);
+    const reservation = await reserveSessionMcpCallback(contextWith(true), docker.io, OWNER, { hostPortFree: allFree, probe });
+
+    expect(reservation.port).toBe(LEGACY_PORT);
+    expect(reservation.forwarderName).toBe(`runfree-ingress-mcp-callback-${PROJECT_ID}-${LEGACY_PORT}`);
+    expect(reservation.forwarderId).toMatch(/^[a-f0-9]{64}$/u);
+    expect(indexOf(docker.sequence, isRun)).toBeGreaterThanOrEqual(0);
+    expect(indexOf(docker.sequence, isConnect)).toBe(-1);
+    expect(indexOf(docker.sequence, isBridge)).toBe(-1);
+    expect(probe).not.toHaveBeenCalled();
+
+    const endpoint = await completeSessionMcpCallback(contextWith(true), docker.io, OWNER, reservation, { hostPortFree: allFree, probe });
+
+    expect(endpoint).toEqual({ port: LEGACY_PORT, forwarderName: reservation.forwarderName });
+    const run = indexOf(docker.sequence, isRun);
+    const connect = indexOf(docker.sequence, isConnect);
+    const bridge = indexOf(docker.sequence, isBridge);
+    expect(run).toBeLessThan(connect);
+    expect(connect).toBeLessThan(bridge);
+    expect(docker.sequence[connect]).toEqual(expect.arrayContaining([INTERNAL_NETWORK, reservation.forwarderId]));
+    expect(probe).toHaveBeenCalledOnce();
+    expect(docker.removed()).toEqual([]);
+  });
+
+  test("reserve uses only async Docker calls", async () => {
+    const docker = fake();
+    (docker.io.capture as Mock).mockImplementation(() => {
+      throw new Error("a synchronous Docker call ran during the reservation");
+    });
+    const reservation = await reserveSessionMcpCallback(contextWith(true), docker.io, OWNER, { hostPortFree: allFree, probe: probeOk });
+
+    expect(reservation.port).toBe(LEGACY_PORT);
+    expect((docker.io.captureAsync as unknown as Mock).mock.calls.map(([, args]) => (args as string[])[0]))
+      .toEqual(expect.arrayContaining(["ps", "run", "exec"]));
+  });
+
+  test("two concurrent reservations never share a port", async () => {
+    // Two projects (the lifecycle lock serializes one project's admissions)
+    // racing for the same first candidate on one host's loopback.
+    const otherRoot = "/workspace/other-project";
+    const otherId = projectHash(otherRoot);
+    const published = new Set<number>();
+    const first = fake([], { publishedPorts: published, conflictLeavesResidue: true, asyncYield: true });
+    const second = createFakeDocker({
+      projectId: otherId,
+      composeProject: `runfree-${otherId}`,
+      options: { publishedPorts: published, conflictLeavesResidue: true, asyncYield: true },
+    });
+    const shared = [47_500, 47_501, 47_502];
+    const otherOwner = {
+      ...OWNER,
+      sessionId: "rf-20260930-zzzzzz",
+      containerId: "d".repeat(64),
+      internalNetwork: `runfree-${otherId}_agent_internal`,
+    };
+    const otherContext = { ...contextWith(true), projectRoot: otherRoot } as RuntimeContext;
+
+    const [a, b] = await Promise.all([
+      reserveSessionMcpCallback(contextWith(true), first.io, OWNER, { hostPortFree: allFree, candidates: () => shared }),
+      reserveSessionMcpCallback(otherContext, second.io, otherOwner, { hostPortFree: allFree, candidates: () => shared }),
+    ]);
+
+    expect(a.port).not.toBe(b.port);
+    expect(new Set([a.port, b.port])).toEqual(new Set([47_500, 47_501]));
+    expect([...published].sort()).toEqual([47_500, 47_501]);
+    // The loser's conflicting `docker run` residue was removed by exact identity.
+    const loser = a.port === 47_500 ? second : first;
+    expect(loser.dockerRuns()).toHaveLength(2);
+    expect(loser.removed()).toHaveLength(1);
+    expect(loser.containers.filter((container) => container.State?.Running !== true)).toEqual([]);
+  });
+
+  test("complete removes the reserved forwarder when the connect fails", async () => {
+    const docker = fake([], { connectFailure: "Error response from daemon: network not found" });
+    const reservation = await reserveSessionMcpCallback(contextWith(true), docker.io, OWNER, { hostPortFree: allFree });
+    const failure = await completeSessionMcpCallback(contextWith(true), docker.io, OWNER, reservation, { probe: probeOk })
+      .catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(CliError);
+    expect((failure as Error).message).toContain("network not found");
+    expect((failure as Error).message).toContain("retry the command");
+    expect(docker.containers.filter(isForwarder)).toEqual([]);
+    expect(indexOf(docker.sequence, isBridge)).toBe(-1);
+  });
+
+  test("complete removes the reserved forwarder when the bridge does not start", async () => {
+    const docker = fake([], { bridgeStatus: 1 });
+    const reservation = await reserveSessionMcpCallback(contextWith(true), docker.io, OWNER, { hostPortFree: allFree });
+    await expect(completeSessionMcpCallback(contextWith(true), docker.io, OWNER, reservation, { probe: probeOk }))
+      .rejects.toThrow("the in-session callback bridge did not start");
+    expect(docker.removed()).toEqual([reservation.forwarderId]);
+    expect(docker.containers.filter(isForwarder)).toEqual([]);
+  });
+
+  test("complete refuses a reservation that is not this project's forwarder for its port, and removes the session's route", async () => {
+    const docker = fake();
+    const reservation = await reserveSessionMcpCallback(contextWith(true), docker.io, OWNER, { hostPortFree: allFree });
+    await expect(completeSessionMcpCallback(contextWith(true), docker.io, OWNER, { ...reservation, port: reservation.port + 1 }, {
+      probe: probeOk,
+    })).rejects.toThrow("retry the command");
+    expect(indexOf(docker.sequence, isConnect)).toBe(-1);
+    expect(docker.containers.filter(isForwarder)).toEqual([]);
+  });
+
+  test("each phase is cut at its own budget", async () => {
+    const docker = fake();
+    let clock = 1_000;
+    const nowMs = () => (clock += 10);
+    const reservation = await reserveSessionMcpCallback(contextWith(true), docker.io, OWNER, {
+      hostPortFree: allFree,
+      budgetMs: 4_000,
+      nowMs,
+    });
+    const reserveCalls = [...(docker.io.captureAsync as unknown as Mock).mock.calls] as Array<[string, string[], { timeout?: number; killSignal?: string }]>;
+    expect(reserveCalls.length).toBeGreaterThan(0);
+    for (const [, , options] of reserveCalls) {
+      expect(options.killSignal).toBe("SIGKILL");
+      expect(options.timeout).toBeGreaterThan(0);
+      expect(options.timeout).toBeLessThanOrEqual(4_000);
+    }
+
+    clock = 50_000;
+    const probe = vi.fn(probeOk);
+    await completeSessionMcpCallback(contextWith(true), docker.io, OWNER, reservation, { probe, budgetMs: 3_000, nowMs });
+    // The complete phase's deadline is fixed when it starts, from its own budget.
+    expect(probe).toHaveBeenCalledWith(reservation.port, expect.any(String), 50_010 + 3_000, expect.any(Function));
+    const completeCalls = (docker.io.captureAsync as unknown as Mock).mock.calls.slice(reserveCalls.length) as typeof reserveCalls;
+    expect(completeCalls.map(([, args]) => args[0])).toContain("network");
+    for (const [, , options] of completeCalls) {
+      expect(options.killSignal).toBe("SIGKILL");
+      expect(options.timeout).toBeLessThanOrEqual(3_000);
+    }
+  });
+
+  test("the phases default to their own budgets", async () => {
+    const docker = fake();
+    const probe = vi.fn(probeOk);
+    const nowMs = () => 7_000;
+    const reservation = await reserveSessionMcpCallback(contextWith(true), docker.io, OWNER, { hostPortFree: allFree, nowMs });
+    const reserveCalls = (docker.io.captureAsync as unknown as Mock).mock.calls as Array<[string, string[], { timeout?: number }]>;
+    expect(reserveCalls.every(([, , options]) => options.timeout === SESSION_CALLBACK_RESERVE_BUDGET_MS)).toBe(true);
+    await completeSessionMcpCallback(contextWith(true), docker.io, OWNER, reservation, { probe, nowMs });
+    expect(probe).toHaveBeenCalledWith(reservation.port, expect.any(String), 7_000 + SESSION_CALLBACK_COMPLETE_BUDGET_MS, expect.any(Function));
+  });
+
+  test("a spent reserve budget ends the port search before a forwarder is created", async () => {
+    const docker = fake();
+    let clock = 0;
+    const failure = await reserveSessionMcpCallback(contextWith(true), docker.io, OWNER, {
+      hostPortFree: async () => {
+        clock += 5_000;
+        return false;
+      },
+      budgetMs: 12_000,
+      nowMs: () => clock,
+    }).catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(CliError);
+    expect((failure as Error).message).toContain("used its whole 12000 ms budget before a port was reserved");
+    expect(docker.dockerRuns()).toEqual([]);
+  });
+});
+
 describe("sessionMcpCallbackLifecycle", () => {
   test("a current-config project without a selected effective generation refuses rather than guessing", () => {
     const context = {
@@ -370,7 +546,9 @@ describe("sessionMcpCallbackLifecycle", () => {
 
   test("is absent when no OAuth-capable MCP server needs a callback", () => {
     expect(sessionMcpCallbackLifecycle(contextWith(false), fake().io)).toBeUndefined();
-    expect(sessionMcpCallbackLifecycle(contextWith(true), fake().io)).toBeDefined();
+    const lifecycle = sessionMcpCallbackLifecycle(contextWith(true), fake().io);
+    expect(typeof lifecycle?.reserve).toBe("function");
+    expect(typeof lifecycle?.complete).toBe("function");
   });
 });
 

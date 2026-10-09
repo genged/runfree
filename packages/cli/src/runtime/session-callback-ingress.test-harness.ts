@@ -27,8 +27,19 @@ export type FakeDockerOptions = {
   /** A `docker run` failure that is not a publication conflict. */
   runFailure?: string;
   listFailure?: boolean;
+  /** A `docker network connect` failure. */
+  connectFailure?: string;
   removeFailure?: boolean;
   bridgeStatus?: number;
+  /**
+   * Host loopback publications shared across fakes (one per project), the
+   * way Docker's port bindings are host-global: a `docker run -p` for a port
+   * already in the set conflicts, a successful run adds its port, and
+   * removing that forwarder frees it.
+   */
+  publishedPorts?: Set<number>;
+  /** Yield to the event loop before each async capture answers, so concurrent callers interleave. */
+  asyncYield?: boolean;
 };
 
 let nextId = 0;
@@ -106,6 +117,8 @@ export function createFakeDocker(input: Readonly<{
   const containers: DockerContainerInspect[] = [...(input.containers ?? [])];
   const captures: string[][] = [];
   const runs: string[][] = [];
+  /** Every Docker argv in call order, captured or run, sync or async. */
+  const sequence: string[][] = [];
   let hostNetwork = false;
   const byRef = (ref: string) => containers.find((container) => container.Id === ref || container.Name === `/${ref}`);
   const envValue = (args: string[], key: string) => {
@@ -115,9 +128,10 @@ export function createFakeDocker(input: Readonly<{
     return undefined;
   };
 
-  const capture = vi.fn((_command: string, rawArgs: readonly string[], _options?: unknown): CaptureResult => {
+  const answer = (_command: string, rawArgs: readonly string[], _options?: unknown): CaptureResult => {
     const args = [...rawArgs];
     captures.push(args);
+    sequence.push(args);
     if (args[0] === "ps") {
       if (options.listFailure) return { status: 1, stdout: "", stderr: "Cannot connect to the Docker daemon" };
       const filters = args.filter((_, index) => args[index - 1] === "--filter");
@@ -150,7 +164,9 @@ export function createFakeDocker(input: Readonly<{
       hostNetwork = true;
       return ok(INGRESS_HOST_NETWORK_TEST_ID);
     }
-    if (args[0] === "network" && args[1] === "connect") return ok();
+    if (args[0] === "network" && args[1] === "connect") {
+      return options.connectFailure ? { status: 1, stdout: "", stderr: options.connectFailure } : ok();
+    }
     if (args[0] === "run") {
       const hostPort = envValue(args, "INGRESS_HOST_PORT") as string;
       if (options.runFailure) return { status: 125, stdout: "", stderr: options.runFailure };
@@ -163,7 +179,7 @@ export function createFakeDocker(input: Readonly<{
         sessionContainerId: envValue(args, "RUNFREE_CALLBACK_SESSION_CONTAINER") ?? "",
         target: envValue(args, "INGRESS_TARGET") ?? "",
       });
-      if (options.conflictingPorts?.has(Number(hostPort))) {
+      if (options.conflictingPorts?.has(Number(hostPort)) || options.publishedPorts?.has(Number(hostPort))) {
         if (options.conflictLeavesResidue) containers.push({ ...created, State: { Running: false } });
         return {
           status: 125,
@@ -172,6 +188,7 @@ export function createFakeDocker(input: Readonly<{
         };
       }
       containers.push(created);
+      options.publishedPorts?.add(Number(hostPort));
       return ok(`${created.Id}\n`);
     }
     if (args[0] === "exec") return ok();
@@ -180,20 +197,33 @@ export function createFakeDocker(input: Readonly<{
       const ref = args[args.length - 1] as string;
       const index = containers.findIndex((container) => container.Id === ref || container.Name === `/${ref}`);
       if (index < 0) return missingContainerResult(ref);
-      containers.splice(index, 1);
+      const [gone] = containers.splice(index, 1);
+      if (gone?.State?.Running === true) {
+        const port = gone.Config?.Env?.find((entry) => entry.startsWith("INGRESS_HOST_PORT="))?.slice("INGRESS_HOST_PORT=".length);
+        if (port !== undefined) options.publishedPorts?.delete(Number(port));
+      }
       return ok(ref);
     }
     return ok();
+  };
+  const capture = vi.fn(answer);
+  // A separate mock, so a test can tell (and fail) the synchronous path apart
+  // from the overlapped one.
+  const captureAsync = vi.fn(async (command: string, args: readonly string[], callOptions?: unknown): Promise<CaptureResult> => {
+    if (options.asyncYield) await new Promise((resolve) => setImmediate(resolve));
+    return answer(command, args, callOptions);
   });
   const run = vi.fn((_command: string, rawArgs: readonly string[]) => {
     runs.push([...rawArgs]);
+    sequence.push([...rawArgs]);
     return options.bridgeStatus ?? 0;
   });
   return {
-    io: { capture, run, captureAsync: async (c: string, a: string[], o?: unknown) => capture(c, a, o) } as unknown as RuntimeIO,
+    io: { capture, run, captureAsync } as unknown as RuntimeIO,
     containers,
     captures,
     runs,
+    sequence,
     removed: () => captures.filter((args) => args[0] === "container" && args[1] === "rm").map((args) => args[args.length - 1] as string),
     dockerRuns: () => captures.filter((args) => args[0] === "run"),
   };

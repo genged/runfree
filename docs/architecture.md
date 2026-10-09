@@ -1037,8 +1037,8 @@ from the session's own source IP and is admitted as that session.
 #### Session MCP OAuth Callbacks
 
 When the selected OAuth policy names an MCP server, every launched session —
-agent, shell, resume, or `mcp auth` — gets its own callback path, set up after
-the running proof and before activation, so no client starts first
+agent, shell, resume, or `mcp auth` — gets its own callback path, ready
+before activation, so no client starts first
 ([session-mcp-callback.ts](../packages/cli/src/runtime/session-mcp-callback.ts)):
 
 ```text
@@ -1049,6 +1049,16 @@ host 127.0.0.1:P -> forwarder (bound to session S) -> S's address:P
 - **Port.** The project's legacy callback port first, then up to 31
   alternatives in the same block. A port another forwarder or host process
   holds is skipped; Docker's loopback publication is the reservation.
+- **Two phases.** The reservation (the forwarder's `docker run -p` and its
+  readiness, on the host-facing network only) starts once the provisioning
+  record names the exact session container, and runs beside the container's
+  start and running proof. Its budget is no longer than the proof's, so it
+  never lengthens the launch's lock hold. The rest runs after the running
+  proof and before the session file: attaching the forwarder to
+  `agent_internal` (its address there is dynamic, and the session's static
+  address is bound only at start), the bridge, and the host path probe. A
+  failure in either phase, or in the container's own start, waits for the
+  other branch to settle under the lifecycle lock before any cleanup runs.
 - **Binding.** The forwarder's `docker run` mints `RUNFREE_CALLBACK_SESSION_ID`
   and `RUNFREE_CALLBACK_SESSION_CONTAINER`, so no forwarder exists without its
   owner. Topology validation accepts it only when that container is a running

@@ -379,7 +379,7 @@ describe("ingress forwarders are loopback-only, one-way, per-session, and torn d
     expect(mcpEligible, "the negative case ran after the project was made MCP OAuth eligible").toBe(false);
     const run = await launch(["claude"], "ineligible session");
     // No settle window: an eligible launch sets its callback up before
-    // activation (`prepareSessionMcpCallback`), so by the time the agent runs
+    // activation (`reserveSessionMcpCallback`, then `completeSessionMcpCallback`), so by the time the agent runs
     // any forwarder this launch would mint already exists.
     expect(projectIngressForwarders(projectId, "mcp-callback"), "an ineligible launch minted a callback forwarder").toEqual([]);
     expect(sessionFile(run.session.containerId, CALLBACK_PORT_FILE), "an ineligible session has a callback port file").toBeUndefined();
