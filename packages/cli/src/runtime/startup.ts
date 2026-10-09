@@ -1601,14 +1601,22 @@ export async function startRuntime(
       // never asked to prove or select from warm evidence.
       heldLifecycleLock.assertHeld();
       const warm = warmValidationForLaunch();
+      const dropWarmRecord = (why: string): void => {
+        try {
+          removeWarmProofRecord(activePlan.paths.stateDir);
+        } catch (error) {
+          warn(`the warm-proof record could not be removed after ${why}: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      };
       let validation: RuntimeTokenSyncPreparation | undefined;
       let runtimeProof: RuntimeValidationProof | undefined;
       if (warm) {
         assertWarmValidation(warm);
         runtimeProof = warm.runtimeProof;
       } else {
-        // The record goes before the full path runs, so a validation that
-        // fails anywhere below leaves no record a later launch could match.
+        // The record goes before the full path runs and is written again only
+        // after the session reconcile below, so a validation that fails
+        // anywhere below leaves no record a later launch could match.
         try {
           removeWarmProofRecord(activePlan.paths.stateDir);
         } catch (error) {
@@ -1660,15 +1668,6 @@ export async function startRuntime(
       } catch (error) {
         warn(error instanceof Error ? error.message : String(error));
         return result(1, false, activeContext);
-      }
-      // A full validation just proved the runtime and the selection matches
-      // it: record the warm-proof facts for the next launch (runfree up and
-      // launches alike; never a rebuild). Best effort.
-      if (!warm && !removeExisting) {
-        const input = warmProofInput();
-        const recorded = input ? recordWarmRuntimeProof(input) : "the warm-proof inputs are unavailable";
-        timings.report("validation:warm-proof", recorded === "written" ? "recorded" : "not-recorded");
-        if (recorded !== "written") reportRuntimeVerbose(verbose, `warm-proof record not written: ${recorded}`);
       }
       let proxyStartedAt: string | undefined;
       let reconciled: SessionReconcileResult | undefined;
@@ -1722,7 +1721,22 @@ export async function startRuntime(
         heldLifecycleLock.assertHeld();
       } catch (error) {
         warn(error instanceof Error ? error.message : String(error));
+        dropWarmRecord("a session reconcile that did not complete");
         return result(1, false, activeContext);
+      }
+      // The record is written only after a reconcile that found nothing to
+      // repair: a record taken earlier could bind a participant the reconcile
+      // was about to remove, and a later launch would match it while that
+      // container still runs. A full validation just proved the runtime and
+      // the selection matches it, so record the warm-proof facts for the next
+      // launch (runfree up and launches alike; never a rebuild). Best effort.
+      if (reconciled && !reconciled.inventoryClean) {
+        dropWarmRecord("a session reconcile that repaired residue");
+      } else if (!warm && !removeExisting && reconciled?.inventoryClean) {
+        const input = warmProofInput();
+        const recorded = input ? recordWarmRuntimeProof(input) : "the warm-proof inputs are unavailable";
+        timings.report("validation:warm-proof", recorded === "written" ? "recorded" : "not-recorded");
+        if (recorded !== "written") reportRuntimeVerbose(verbose, `warm-proof record not written: ${recorded}`);
       }
       // A warm proxy that kept its container id can still have restarted in
       // place, taking its session-file directory and eligibility with it. The

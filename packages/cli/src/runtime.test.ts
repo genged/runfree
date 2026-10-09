@@ -1133,6 +1133,12 @@ function captureResult(status: number, stdout = "", stderr = ""): CaptureResult 
   return { status, stdout, stderr };
 }
 
+/** The proxy's served-set read: its session-file listing, not the firewall's section read. */
+const servedSetRead = (args: readonly string[]): boolean => args[0] === "exec"
+  && args.includes(FAKE_PROXY_CONTAINER_ID)
+  && args.join(" ").includes("fs.readdirSync(sessionsDir)")
+  && !args.join(" ").includes("RUNFREE_FIREWALL_SECTION");
+
 function inspectMount(destination: string, mode: "ro" | "rw" | "tmpfs" = "rw"): {
   Destination: string;
   Mode?: string;
@@ -4173,6 +4179,78 @@ describe("runtime command flow", () => {
       expect(denyProbeRuns(io.calls.slice(start))).toBe(1);
       const after = JSON.parse(fs.readFileSync(recordPath(context), "utf8")) as { writtenAt: string };
       expect(Date.parse(after.writtenAt)).toBeGreaterThanOrEqual(Date.parse(before.writtenAt));
+    });
+
+    test("a startup whose session reconcile fails writes no warm-proof record, and the next launch reclaims", async () => {
+      const context = launchContext();
+      let failListing = false;
+      const io = createRuntimeIO({
+        capture: (_command, args) => (failListing && servedSetRead(args) ? captureResult(1, "", "proxy gone") : undefined),
+      });
+      await warmedUp(context, io);
+      // Full path: a new proxy pid is a warm mismatch; image cleanup inputs are unchanged.
+      process.env.FAKE_PROXY_PID = "5151";
+      failListing = true;
+      expect((await startRuntime(context, io, false, { launch: true })).status).toBe(1);
+      expect(pendingWarningsForTest().map((event) => event.message).join("\n")).toContain("could not report its session files");
+      expect(fs.existsSync(recordPath(context))).toBe(false);
+      // Reclamation: the proxy answers again; the full path records, the next launch is warm.
+      failListing = false;
+      const start = io.calls.length;
+      expect((await startRuntime(context, io, false, { launch: true })).status).toBe(0);
+      expect(denyProbeRuns(io.calls.slice(start))).toBe(1);
+      expect(fs.existsSync(recordPath(context))).toBe(true);
+      const warmStart = io.calls.length;
+      expect((await startRuntime(context, io, false, { launch: true })).status).toBe(0);
+      expect(denyProbeRuns(io.calls.slice(warmStart))).toBe(0);
+    });
+
+    test("a warm launch whose reconcile fails removes the warm-proof record, and the next launch reclaims", async () => {
+      const context = launchContext();
+      let failListing = false;
+      const io = createRuntimeIO({
+        capture: (_command, args) => (failListing && servedSetRead(args) ? captureResult(1, "", "proxy gone") : undefined),
+      });
+      await warmedUp(context, io);
+      // Warm match: the failing launch skips the full validation.
+      failListing = true;
+      const failStart = io.calls.length;
+      expect((await startRuntime(context, io, false, { launch: true })).status).toBe(1);
+      expect(denyProbeRuns(io.calls.slice(failStart))).toBe(0);
+      expect(pendingWarningsForTest().map((event) => event.message).join("\n")).toContain("could not report its session files");
+      expect(fs.existsSync(recordPath(context))).toBe(false);
+      // Reclamation: the proxy answers again; the full path records, the next launch is warm.
+      failListing = false;
+      const start = io.calls.length;
+      expect((await startRuntime(context, io, false, { launch: true })).status).toBe(0);
+      expect(denyProbeRuns(io.calls.slice(start))).toBe(1);
+      expect(fs.existsSync(recordPath(context))).toBe(true);
+      const warmStart = io.calls.length;
+      expect((await startRuntime(context, io, false, { launch: true })).status).toBe(0);
+      expect(denyProbeRuns(io.calls.slice(warmStart))).toBe(0);
+    });
+
+    test("a reconcile that repaired residue leaves no warm-proof record", async () => {
+      const context = launchContext();
+      let orphanListings = 0;
+      const io = createRuntimeIO({
+        capture: (_command, args) => {
+          if (orphanListings === 0 || !servedSetRead(args)) return undefined;
+          orphanListings -= 1;
+          return captureResult(0, JSON.stringify([{ sessionKey: "b".repeat(64), name: `${"b".repeat(64)}.json`, malformed: true }]));
+        },
+      });
+      await warmedUp(context, io);
+      // An orphan session file the reconcile removes (a failed delete only warns).
+      orphanListings = 1;
+      expect((await startRuntime(context, io, false, { launch: true })).status).toBe(0);
+      expect(orphanListings).toBe(0);
+      expect(fs.existsSync(recordPath(context))).toBe(false);
+      // The next launch takes the full path and records again.
+      const start = io.calls.length;
+      expect((await startRuntime(context, io, false, { launch: true })).status).toBe(0);
+      expect(denyProbeRuns(io.calls.slice(start))).toBe(1);
+      expect(fs.existsSync(recordPath(context))).toBe(true);
     });
 
     test.each([
