@@ -1305,28 +1305,30 @@ describe("a crashed session with no record falls back from the warm-empty skip",
     expect(containerAbsent(orphanId), `orphan container ${orphanId} survived the launch's reconcile`).toBe(true);
   }, TEST_TIMEOUT_MS);
 
-  // Named without "running": the orphan runs the one-shot recorder stand-in
-  // (needed so the *next* launch below can complete rather than hang on a
-  // long-lived agent), which records its argv and exits right after
-  // `after-start`, so by the time this case inspects anything the container
-  // may already be stopped rather than running. What distinguishes this case
-  // from the one above is not the orphan's run state; it is that the
-  // reconcile it depends on is made to fail first.
-  coreTest("an orphan whose reconcile failed is reclaimed by the next launch", async () => {
-    // Item 3 just repaired residue (removed its own orphan), and startup.ts
-    // drops the warm-proof record whenever a reconcile had to repair
-    // anything (`dropWarmRecord("a session reconcile that repaired
-    // residue")`) — so entering this case there is already no warm-proof
-    // record on disk. Crashing straight away would make every assertion
-    // below pass even with the reconcile-catch's own drop reverted, because
-    // the record would already be absent before the broken launch ever ran.
-    // One clean launch here re-establishes a genuine record first.
+  // The warm path's reconcile catch: a warm launch whose reconcile fails
+  // drops the warm-proof record, and the next launch recovers on the full
+  // path. The reconcile only runs on a warm launch when the warm-empty check
+  // is blocked, and a warm match needs no lifecycle record, no quarantined
+  // record, and no session participant on agent_internal. A container
+  // created but never started is the one piece of residue that satisfies
+  // both: it is not a network participant, so the warm proof still matches,
+  // and the host-wide container listing still sees it, so warm-empty reports
+  // `session-containers-present` and the reconcile runs. A started orphan
+  // cannot serve here: as a participant it makes the warm proof mismatch
+  // (`mismatch:participants`) and the launch takes the full path, which never
+  // reaches this catch. With no residue at all, warm-empty is `empty` and the
+  // reconcile, and so the injected read failure, is skipped.
+  coreTest("a warm launch whose reconcile fails drops the warm-proof record, and the next launch recovers", async () => {
+    // The case above reclaimed its orphan, and a reconcile that repaired
+    // residue drops the warm-proof record, so there is no record on entry.
+    // Without one, every assertion below would pass even with the catch's
+    // own drop reverted. One clean launch re-establishes a genuine record.
     const warmProofPath = warmProofRecordPath(stateDir);
     const clean = launchClaudeTimed(fixture);
     expect(timing(clean.output, "validation:warm-proof"), describeOutput(clean.output)).toContain("recorded");
     expect(fs.existsSync(warmProofPath), "the clean launch did not record a warm proof").toBe(true);
 
-    const orphanId = await crashAndOrphanTheRecord("after-start");
+    const orphanId = await crashAndOrphanTheRecord("after-create");
     expect(fs.existsSync(warmProofPath), "the crash alone removed the warm-proof record").toBe(true);
 
     // Fail only the reconcile's read of the proxy's session files. The
@@ -1352,6 +1354,8 @@ describe("a crashed session with no record falls back from the warm-empty skip",
       // before reconcile even ran and this case would prove nothing about
       // the catch.
       expect(timing(broken.output, "validation:warm-proof"), describeOutput(broken.output)).toContain("match");
+      expect(timing(broken.output, "startup:warm-empty"), describeOutput(broken.output))
+        .toContain("blocked:session-containers-present");
       // Image cleanup runs before the reconcile and reads the same session
       // files when its inputs changed; its failure is only a warning carrying
       // its own prefix. A line without that prefix is the reconcile's.
@@ -1372,6 +1376,12 @@ describe("a crashed session with no record falls back from the warm-empty skip",
     expect(sessionContainers(fixture)).toEqual([]);
     expect(listSessionContainerRecordsV2(stateDir, expectedProject)).toEqual([]);
     expect(containerAbsent(orphanId), `orphan container ${orphanId} survived recovery`).toBe(true);
+    // The recovery ran the full path, and its reconcile repaired residue (the
+    // orphan), so it records no warm proof. The next clean launch does.
+    expect(fs.existsSync(warmProofPath), "a reconcile that repaired residue recorded a warm proof").toBe(false);
+    const rerecorded = runfreeTimed(fixture, ["claude"]);
+    expect(rerecorded.status, describeOutput(rerecorded.output, 4000)).toBe(0);
+    expect(timing(rerecorded.output, "validation:warm-proof"), describeOutput(rerecorded.output)).toContain("recorded");
 
     const warm = runfreeTimed(fixture, ["claude"]);
     expect(warm.status, describeOutput(warm.output, 4000)).toBe(0);
