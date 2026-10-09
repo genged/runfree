@@ -95,6 +95,22 @@ describe("MCP protocol classifier", () => {
     expect(classify({ path: "/mcp/%2e%2e/other", body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize" }) })).toBeUndefined();
   });
 
+  // Known defect (todo 102, property P3.5): a key that
+  // differs from `method`, `params`, `name`, or `id` only in case rides along on
+  // a read, and a case-insensitive upstream decoder (Go `encoding/json`) may
+  // act on it. Turn these into plain tests when the classifier refuses them.
+  test.fails("known defect: a METHOD key beside a read method still classifies read", () => {
+    expect(classify({
+      body: "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"METHOD\":\"tools/call\",\"params\":{\"name\":\"deleteFeatureFlag\"}}",
+    })?.kind).not.toBe("read");
+  });
+
+  test.fails("known defect: a case-variant params name on a response still classifies read", () => {
+    expect(classify({
+      body: "{\"jsonrpc\":\"2.0\",\"id\":\"\",\"result\":[],\"params\":{\"namE\":\"tools/call\"}}",
+    })?.kind).not.toBe("read");
+  });
+
   // A batch is one HTTP request, so one classification must stand for every
   // message in it: no element may lend the batch a weaker action or a display
   // that a grant for a different element would match.
