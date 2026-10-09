@@ -32,6 +32,29 @@ vi.mock("./control/effective.ts", async (importOriginal) => {
 // wrappers delegate to the real implementation, so every other test's
 // behavior is unaffected.
 const hostServiceRecheckEvents = vi.hoisted(() => ({ events: [] as string[] }));
+// Lets a launch test report another live session in the project, and records
+// (or fails) the post-mutation activation a launch-time service enable needs
+// beside it. Both default to the real behavior.
+const liveSessionSeam = vi.hoisted(() => ({
+  active: undefined as undefined | Array<{ command: string; containerTty: string; name: string; processCount: number }>,
+}));
+const activationSeam = vi.hoisted(() => ({
+  calls: 0,
+  fail: undefined as undefined | Error,
+  enabled: false,
+}));
+vi.mock("./control/activation.ts", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./control/activation.ts")>();
+  return {
+    ...actual,
+    activateApprovedControlsAfterMutation: async (...args: Parameters<typeof actual.activateApprovedControlsAfterMutation>) => {
+      if (!activationSeam.enabled) return actual.activateApprovedControlsAfterMutation(...args);
+      activationSeam.calls += 1;
+      if (activationSeam.fail) throw activationSeam.fail;
+      return { kind: "converged" as const, controlGeneration: "sha256:seam" };
+    },
+  };
+});
 vi.mock("./host-service-port-owner.ts", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./host-service-port-owner.ts")>();
   return {
@@ -50,6 +73,8 @@ vi.mock("./runtime/sessions.ts", async (importOriginal) => {
       hostServiceRecheckEvents.events.push("lock");
       return actual.tryAcquireProjectLifecycleLockWithRetry(...args);
     },
+    activeLifecycleSessions: (...args: Parameters<typeof actual.activeLifecycleSessions>) =>
+      liveSessionSeam.active ?? actual.activeLifecycleSessions(...args),
   };
 });
 
@@ -1076,6 +1101,10 @@ beforeEach(() => {
 afterEach(() => {
   flushWarnings();
   vi.restoreAllMocks();
+  liveSessionSeam.active = undefined;
+  activationSeam.calls = 0;
+  activationSeam.fail = undefined;
+  activationSeam.enabled = false;
   if (previousPath === undefined) {
     delete process.env.PATH;
   } else {
@@ -8615,6 +8644,87 @@ describe("runtime command flow", () => {
     expect(io.calls.some((call) => call.method === "admin")).toBe(false);
     expect(composeUpCall(io)).toBeUndefined();
     expect(configuredAgentExecCall(io)).toBeUndefined();
+  });
+
+  // Startup reuses the selected effective policy generation while another
+  // session in the project is live, so a service enabled at the launch prompt
+  // must be activated by the prompt itself or the shared proxy keeps denying
+  // its hosts for this session.
+  test("a launch-time service enable beside a live session activates the approved policy before startup", async () => {
+    const projectRoot = path.join(tmp, "project");
+    const project = prepareProject(projectRoot);
+    const io = createRuntimeIO();
+    liveSessionSeam.active = [{ command: "claude", containerTty: "/dev/pts/0", name: "rf-live", processCount: 1 }];
+    activationSeam.enabled = true;
+    let ensuredBeforeActivation = false;
+    const admin = io.admin;
+    io.admin = async (intent, context) => {
+      const status = await admin(intent, context);
+      if (intent.kind === "ensure-agent-service" && activationSeam.calls === 0) ensuredBeforeActivation = true;
+      return status;
+    };
+
+    // Only the steps before startup matter here; the harness cannot admit
+    // the session itself.
+    await runAgentCommand({
+      projectRoot,
+      project,
+      runtimeRoot: path.join(tmp, "runtime"),
+      env: { PATH: "/fake-bin" },
+      network: fixedNetwork,
+    }, io, "codex", { quiet: false, verbose: false }).catch(() => 1);
+
+    expect(ensuredBeforeActivation).toBe(true);
+    expect(activationSeam.calls).toBe(1);
+    expect(vi.mocked(console.log).mock.calls.flat().join("\n"))
+      .toContain("effective policy: live now (effective policy generation sha256:seam)");
+  });
+
+  test("a failed activation beside a live session stops the launch before the runtime starts", async () => {
+    const projectRoot = path.join(tmp, "project");
+    const project = prepareProject(projectRoot);
+    const io = createRuntimeIO();
+    liveSessionSeam.active = [{ command: "claude", containerTty: "/dev/pts/0", name: "rf-live", processCount: 1 }];
+    activationSeam.enabled = true;
+    activationSeam.fail = new Error("could not identify the live proxy consumer");
+
+    const status = await runAgentCommand({
+      projectRoot,
+      project,
+      runtimeRoot: path.join(tmp, "runtime"),
+      env: { PATH: "/fake-bin" },
+      network: fixedNetwork,
+    }, io, "codex", { quiet: false, verbose: false });
+
+    expect(status).toBe(1);
+    const errors = vi.mocked(console.error).mock.calls.flat().join("\n");
+    expect(errors).toContain("could not identify the live proxy consumer");
+    expect(errors).toContain("runfree runtime reload-policy");
+    // The approved enable stays saved; reclaiming it is the reload above.
+    expect(JSON.parse(fs.readFileSync(project.paths.policyPath, "utf8")).services).toHaveProperty("agent-codex");
+    expect(composeUpCall(io)).toBeUndefined();
+    expect(configuredAgentExecCall(io)).toBeUndefined();
+  });
+
+  test("a launch-time service enable with no other live session leaves activation to startup", async () => {
+    const projectRoot = path.join(tmp, "project");
+    const project = prepareProject(projectRoot);
+    const io = createRuntimeIO();
+    liveSessionSeam.active = [];
+    activationSeam.enabled = true;
+
+    // Only the steps before startup matter here; the harness cannot admit
+    // the session itself.
+    await runAgentCommand({
+      projectRoot,
+      project,
+      runtimeRoot: path.join(tmp, "runtime"),
+      env: { PATH: "/fake-bin" },
+      network: fixedNetwork,
+    }, io, "codex", { quiet: false, verbose: false }).catch(() => 1);
+
+    expect(io.calls.some((call) => call.method === "admin" && call.args.join(" ") === "service ensure agent-codex")).toBe(true);
+    expect(activationSeam.calls).toBe(0);
   });
 
 

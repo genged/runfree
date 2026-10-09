@@ -16,6 +16,8 @@ import { createAdminState } from "./admin/context.ts";
 import { prepareRuntimeTokenSources, clearPreparedRuntimeTokenSources, admitPreparedRuntimeTokenSources } from "./admin/admin-core.ts";
 import { convergeProxyPolicy, credentialSyncIntent, prepareEffectiveRuntimeIntent, runAdminAction } from "./admin/options.ts";
 import { planDesiredServiceEnable } from "./admin/service-policy.ts";
+import { activateApprovedControlsAfterMutation } from "./control/activation.ts";
+import { activationReportLine } from "./control/activation-report.ts";
 import { compileDesiredPolicies } from "./control/compiler.ts";
 import { readActiveEffectiveControl } from "./control/effective.ts";
 import { ControlsNotApprovedError } from "./control/refusals.ts";
@@ -57,6 +59,7 @@ import { PROXY_HOST_SERVICE_GATEWAY_STATUS_PATH } from "./runtime/probes.ts";
 import { printHostGitStatusLine } from "./runtime/git-layout.ts";
 import { clearStoppedControlPlaneSelection } from "./runtime/stopped-selection.ts";
 import {
+  activeLifecycleSessions,
   activeOrStartingAgentSessions,
   printSessions,
   projectLifecycleLockPath,
@@ -499,6 +502,25 @@ async function operationalServiceIds(context: RuntimeContext, io: RuntimeIO): Pr
   }).selectedServices));
 }
 
+// Make a service enabled at the launch prompt live in the shared proxy when
+// another session in this project is live. Startup reuses the selected
+// effective policy generation in that case (prepareEffectiveControlsForStartup),
+// so without this the new session runs on a policy that still denies the hosts
+// just approved. With no live session, startup prepares the approved policy
+// itself. The enable is already saved and approved; a failed activation stops
+// the launch and names the command that applies it.
+async function activateLaunchServiceBesideLiveSessions(context: RuntimeContext, io: RuntimeIO): Promise<number> {
+  if (activeLifecycleSessions(context).length === 0) return 0;
+  try {
+    console.log(activationReportLine(await activateApprovedControlsAfterMutation(context, io)));
+    return 0;
+  } catch (error) {
+    console.error(`could not apply the enabled service beside the live session: ${error instanceof Error ? error.message : String(error)}`);
+    console.error(`the change is saved; apply it with: ${remedy.runtimeReloadPolicy()}`);
+    return 1;
+  }
+}
+
 function printAgentServiceReview(agentLabel: string, id: string): void {
   const svc = service(id);
   if (!svc) die(`built-in agent ${agentLabel} requires unknown service ${id}`);
@@ -591,6 +613,8 @@ async function reviewPiProvider(
   }
   const status = await io.admin({ kind: "ensure-agent-service", id: choice, quiet }, context);
   if (status !== 0) return { changed: false, status };
+  const activation = await activateLaunchServiceBesideLiveSessions(context, io);
+  if (activation !== 0) return { changed: true, status: activation };
   console.log("Pi login state remains Pi-owned; use /login inside Pi.");
   return { changed: true, status: 0 };
 }
@@ -626,6 +650,8 @@ async function reviewAgentOperationalServices(
     const status = await io.admin({ kind: "ensure-agent-service", id, quiet }, context);
     if (status !== 0) return { changed: false, status };
   }
+  const activation = await activateLaunchServiceBesideLiveSessions(context, io);
+  if (activation !== 0) return { changed: true, status: activation };
   return { changed: true, status: 0 };
 }
 
