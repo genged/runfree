@@ -565,18 +565,19 @@ the attached wait ([driver](../packages/cli/src/runtime/session-admission-driver
 
 A warm `claude`, `codex`, `pi`, `shell`, or `mcp auth` launch does not release
 the lock between startup and admission. When its credential sync needed no
-source read, startup hands the exact held lock to the launch, in process memory
-and at most once, with what it proved under it: the proxy id and `StartedAt`,
-the registry digest, and how the project's sessions were settled. That is
-either the startup reconcile's result (whether it saw only settled state, and
-the addresses the proxy's session files reserved) or a warm-empty state, below.
-Admission then skips repeating the reconcile and the orphan sweep only if that
-reconcile was settled or the warm-empty state is consumed, the registry on
-disk is unchanged, and one inspection shows the same proxy incarnation (a
-restarted proxy refuses as stale and the launch re-prepares once). It still checks quarantine and unreclaimed records, reads a
-fresh network baseline, fences the address, and holds the started container to
-the one post-start inspection. Every launch caller releases a handoff nobody
-took; a crashed process leaves an ordinary stale lock. `runfree up` and
+source read, startup hands the exact held lock to the launch, in process
+memory and at most once, with what it proved under it: the proxy id and
+`StartedAt`, the registry digest, and how the project's sessions were settled.
+That is either the startup reconcile's result (whether it saw only settled
+state, and the addresses the proxy's session files reserved) or a warm-empty
+state, below. Admission then skips repeating the reconcile and the orphan
+sweep only if that reconcile was settled or the warm-empty state is consumed,
+the registry on disk is unchanged, and one inspection shows the same proxy
+incarnation (a restarted proxy refuses as stale and the launch re-prepares
+once). It still checks quarantine and unreclaimed records, reads a fresh
+network baseline, fences the address, and holds the started container to the
+one post-start inspection. Every launch caller releases a handoff nobody took;
+a crashed process leaves an ordinary stale lock. `runfree up` and
 `runfree resume` never hand off (the recovery claim takes the lifecycle lock
 itself).
 
@@ -599,23 +600,25 @@ its full preflight, reconcile included. Any failed or unreadable check
 reconciles as before, and so do `runfree up`, `runfree rebuild`,
 `runfree resume`, and every launch that did not ask for a handoff.
 
-One launch's continuous hold of the lock — from startup's acquisition when
-the lock is handed off, otherwise from admission's own — is planned against a
-50 s budget, so another command's one-minute wait for the lock outlasts it
-([launch-lock-hold](../packages/cli/src/runtime/launch-lock-hold.ts)).
-Startup hands the lock off only if it has held it for at most 8 s, and the
-launch frame checks that again when it takes the handoff; past it, the lock is
+One launch's continuous hold of the lock — from startup's acquisition when the
+lock is handed off, otherwise from admission's own — is planned against a 50 s
+budget, so another command's one-minute wait for the lock outlasts it
+([launch-lock-hold](../packages/cli/src/runtime/launch-lock-hold.ts)). Startup
+hands the lock off only if it has held it for at most 8 s, and the launch
+frame checks that again when it takes the handoff; past it, the lock is
 released and admission takes its own, running the full preflight. Admission's
 bounded steps fill the rest: the running proof (30 s), the MCP OAuth callback
 setup, and the handoff wait. The callback reservation runs beside the running
-proof, with a shorter budget, so it is planned to end inside it; the rest of the callback setup runs after the proof
-within 12 s. Every Docker call in either part is cut off at the time left, and
-the host probe stops at the deadline. The handoff wait ends by the budget's
-deadline. The 10 s between the budget and the minute is the
-allowance for the short daemon round-trips between those steps, which carry
-no timeout of their own. A unit test pins that arithmetic. A launch that
-releases a lock startup held too long waits about half a second before taking
-its own, so a command already waiting gets the lock first.
+proof, with a budget 18 s shorter, so it is planned to end inside the proof;
+its cut-off is a timer, so it can overrun that budget by at most one blocking
+synchronous call. The rest of the callback setup runs after the proof within
+12 s. Every Docker call in either part is cut off at the time left, and the
+host probe stops at the deadline. The handoff wait ends by the budget's
+deadline. The 10 s between the budget and the minute is the allowance for the
+short daemon round-trips between those steps, which carry no timeout of their
+own. A unit test pins that arithmetic. A launch that releases a lock startup
+held too long waits about half a second before taking its own, so a command
+already waiting gets the lock first.
 
 The budget covers the steps that are slow in ordinary use. It does not bound
 their fault cases, which can still stretch one hold past the minute: the IP
@@ -1088,13 +1091,15 @@ host 127.0.0.1:P -> forwarder (bound to session S) -> S's address:P
 - **Two phases.** The reservation (the forwarder's `docker run -p` and its
   readiness, on the host-facing network only) starts once the provisioning
   record names the exact session container, and runs beside the container's
-  start and running proof. Its budget is no longer than the proof's, so it
-  never lengthens the launch's lock hold. The rest runs after the running
-  proof and before the session file: attaching the forwarder to
-  `agent_internal` (its address there is dynamic, and the session's static
-  address is bound only at start), the bridge, and the host path probe. A
-  failure in either phase, or in the container's own start, waits for the
-  other branch to settle under the lifecycle lock before any cleanup runs.
+  start and running proof. Its budget is 18 s shorter than the proof's, so it
+  is planned to end inside the proof and so inside the launch's lock hold; its
+  cut-off is a timer, so it can overrun that budget by at most one blocking
+  synchronous call. The rest runs after the running proof and before the
+  session file: attaching the forwarder to `agent_internal` (its address there
+  is dynamic, and the session's static address is bound only at start), the
+  bridge, and the host path probe. A failure in either phase, or in the
+  container's own start, waits for the other branch to settle under the
+  lifecycle lock before any cleanup runs.
 - **Binding.** The forwarder's `docker run` mints `RUNFREE_CALLBACK_SESSION_ID`
   and `RUNFREE_CALLBACK_SESSION_CONTAINER`, so no forwarder exists without its
   owner. Topology validation accepts it only when that container is a running
