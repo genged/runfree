@@ -89,6 +89,16 @@ host-resolved sources and proxy-only memory.
 `safeReplaceProjectFile`, `ensureSafeProjectDir`, and the rest of
 `packages/cli/src/safe-fs.ts` reject symlinks, hard links, and special files.
 
+**Property tests are replayed, not retried.** Files named
+`<module>.property.test.ts` use `fast-check` with a random seed on every run
+(`tests/support/property.ts`). A failure prints the seed and shrink path; replay
+it with
+`RUNFREE_PROP_SEED=<seed> RUNFREE_PROP_PATH=<path> pnpm exec vitest run <file> -t "<property name>"`.
+Decide whether the failure is a product bug, a wrong property, or an
+infrastructure fault before you rerun anything. Keep the shrunk counterexample
+as a plain example test in the module's ordinary test file, so it still runs if
+the generator changes. `RUNFREE_PROP_RUNS` raises the run count for a soak run.
+
 **Prefer runtime inspection over declarative config in tests.** For
 capabilities, routes, mounts, and firewall state, ask the running system. A
 Compose file that says the right thing is not proof that the container has it.
