@@ -859,6 +859,53 @@ describe("proxy policy", () => {
     expect(request("GET", "/owner/repo.git/info/refs?service=git-upload-pack")).toEqual({});
   });
 
+  // Under `writeApproval: allow` the git-push rule is the only check a push
+  // meets, so it must match every spelling a routing origin may reduce to the
+  // push RPC: by its last path segment, not by a raw suffix.
+  test("gitPush deny matches the push RPC by its last path segment under an allow posture", () => {
+    const options = {
+      allowedHosts: ["github.com"],
+      credentials: {},
+      writeApproval: "allow" as const,
+      requests: { "github.com": { gitPush: "deny" as const } },
+    };
+    const request = (method: string, path: string) => testBeforeAllowedRequest({
+      url: `https://github.com${path}`,
+      method,
+      headers: {},
+    }, options);
+
+    for (const path of [
+      "/owner/repo.git/git-receive-pack/",
+      "/owner/repo.git/git-receive-pack;x",
+      "/owner/repo.git/git-receive-pack%00",
+      "/owner/repo.git/git-receive-pack%00.txt",
+      "/owner/repo.git/git-receive-pack.",
+      "/owner/repo.git/git-receive-pack%2f",
+      "/owner/repo.git/git-receive-pack%5c",
+      "/owner/repo.git/git-receive-pack%20",
+      // Six encoding levels: past the decode bound, so it fails closed.
+      "/owner/repo.git/git-receive-pac%2525252525256b",
+    ]) {
+      expect(shapeDenial(() => request("POST", path)).shape?.reason, path).toBe("git-push-denied");
+    }
+    for (const path of [
+      "/owner/repo.git/info/refs/?service=git-receive-pack",
+      "/owner/repo.git/info/refs;x?service=git-receive-pack",
+      "/owner/repo.git/info/refs?service=git-upload-pack&service=git-receive-pack",
+      "/owner/repo.git/info/refs?service=GIT-RECEIVE-PACK",
+      "/owner/repo.git/info/refs?service=git-receive-pac%256b",
+    ]) {
+      expect(shapeDenial(() => request("GET", path)).shape?.reason, path).toBe("git-push-denied");
+    }
+
+    // Look-alike names and the fetch RPC stay allowed.
+    expect(request("POST", "/owner/repo.git/git-upload-pack")).toEqual({});
+    expect(request("POST", "/owner/repo.git/git-receive-pack-other")).toEqual({});
+    expect(request("GET", "/owner/repo/blob/main/git-receive-pack.txt")).toEqual({});
+    expect(request("GET", "/owner/repo.git/info/refs?service=git-upload-pack")).toEqual({});
+  });
+
   test("WebSocket upgrades evaluate as GET against method and path rules", () => {
     expect(() => testAssertAllowedWebSocketRequest({
       url: "wss://api.example.com/socket",

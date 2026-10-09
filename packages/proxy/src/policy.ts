@@ -326,30 +326,58 @@ function hasPathConfusion(pathName: string): boolean {
   return false;
 }
 
-// The git-push decision is the only check that runs on a `{gitPush:"deny"}`-only
-// host, so it must be self-contained against path confusion: a percent-encoded
-// or matrix-parameter segment that a decoding origin (git-http-backend, GitHub)
-// routes to `git-receive-pack` must be denied here even though
-// `url.pathname.endsWith("/git-receive-pack")` is false on the raw form.
-function isGitPushPath(url: URL, pathName: string): boolean {
-  let canonicalPath: string;
-  try {
-    canonicalPath = decodeToFixedPoint(pathName);
-  } catch {
-    // Malformed encoding on a push-denied host fails closed: treat it as a push.
-    return true;
-  }
-  for (const candidate of [pathName, canonicalPath]) {
-    if (candidate.toLowerCase().endsWith("/git-receive-pack")) return true;
-  }
-  // Capability-probe form: GET .../info/refs?service=git-receive-pack. The
-  // service value rides the query, which `URL` already percent-decodes, but
-  // decode the canonical pathname so `/info/ref%73` is matched too.
-  const service = url.searchParams.get("service");
-  if (service === "git-receive-pack") {
-    for (const candidate of [pathName, canonicalPath]) {
-      if (candidate.toLowerCase().endsWith("/info/refs")) return true;
+// Decodes `%xx` to a fixed point like decodeToFixedPoint, but reports a
+// string that is still changing at the iteration bound (or malformed) as
+// undefined, so a caller that must match a name can fail closed instead of
+// comparing a half-decoded form.
+function decodeToConvergence(value: string): string | undefined {
+  let current = value;
+  for (let iteration = 0; iteration <= MAX_PATH_DECODE_ITERATIONS; iteration += 1) {
+    let next: string;
+    try {
+      next = decodeURIComponent(current);
+    } catch {
+      return undefined;
     }
+    if (next === current) return next;
+    current = next;
+  }
+  return undefined;
+}
+
+// The name a routing origin may reduce a path's last segment to: decoded to a
+// fixed point, cut at a NUL, split on `/` and `\`, each segment stripped of
+// `;params` and trailing dots or whitespace, empty segments dropped, and
+// lowercased. Undefined when decoding does not converge.
+function canonicalPathSegments(pathName: string): string[] | undefined {
+  const decoded = decodeToConvergence(pathName);
+  if (decoded === undefined) return undefined;
+  const nul = decoded.indexOf("\0");
+  return (nul === -1 ? decoded : decoded.slice(0, nul))
+    .split(/[\\/]/u)
+    .map((segment) => segment.split(";", 1)[0].replace(/[.\s]+$/u, "").toLowerCase())
+    .filter((segment) => segment !== "");
+}
+
+// The git-push decision is the only check that runs on a `{gitPush:"deny"}`-only
+// host, and under `writeApproval: allow` the only check a push meets, so it must
+// be self-contained against path confusion: any spelling a decoding or
+// normalizing origin (git-http-backend, GitHub) may route to `git-receive-pack`
+// is a push. It matches the canonical last segment, not a raw suffix, so a
+// trailing `/`, `;param`, `.`, NUL, or encoded separator cannot hide it.
+function isGitPushPath(url: URL, pathName: string): boolean {
+  const segments = canonicalPathSegments(pathName);
+  // Malformed or non-converging encoding on a push-denied host fails closed.
+  if (segments === undefined) return true;
+  const last = segments.at(-1);
+  if (last === "git-receive-pack") return true;
+  // Capability-probe form: GET .../info/refs?service=git-receive-pack. Every
+  // `service` value counts, since an origin may read the last one.
+  if (last === "refs" && segments.at(-2) === "info") {
+    return url.searchParams.getAll("service").some((service) => {
+      const decoded = decodeToConvergence(service);
+      return decoded === undefined || decoded.toLowerCase() === "git-receive-pack";
+    });
   }
   return false;
 }
