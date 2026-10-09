@@ -204,10 +204,23 @@ function prefixedPath(prefix: string, tail: string): string {
   return `${prefix}${prefix.endsWith("/") ? "" : "/"}${tail}`;
 }
 
-// What the proxy judges and forwards: the WHATWG-parsed pathname, which has
-// already resolved literal and `%2e` dot segments and turned `\` into `/`.
+// What the proxy judges: the WHATWG-parsed pathname, which has already
+// resolved literal and `%2e` dot segments and turned `\` into `/`.
 function parsedPathname(pathAndQuery: string): string {
   return new URL(`https://${HOST}${pathAndQuery}`).pathname;
+}
+
+// What the upstream receives: the raw request target, with only `\` turned
+// into `/`. Dot segments, `//`, `;params`, and every percent-encoding are
+// forwarded as sent (observed through the real proxy, 2026-10-09).
+function forwardedPathname(pathAndQuery: string): string {
+  return pathAndQuery.split(/[?#]/u, 1)[0].replaceAll("\\", "/");
+}
+
+// Both readings of the path: the oracle judges what the proxy saw and what
+// the origin will decode.
+function judgedPathnames(pathAndQuery: string): string[] {
+  return [parsedPathname(pathAndQuery), forwardedPathname(pathAndQuery)];
 }
 
 function pathPrefixOptions(prefix: string): PolicyOptions {
@@ -292,7 +305,7 @@ describe("proxy policy path confusion properties", () => {
         (prefix, pieces, method, pipeline) => {
           const pathAndQuery = prefixedPath(prefix, renderPieces(pieces));
           fc.pre(httpsDecision(pathAndQuery, method, pathPrefixOptions(prefix)) === "allow");
-          for (const reduction of reductions(parsedPathname(pathAndQuery), pipeline)) {
+          for (const reduction of judgedPathnames(pathAndQuery).flatMap((path) => reductions(path, pipeline))) {
             expect(withinPrefix(reduction.path, prefix), `${reduction.pipeline} routes ${pathAndQuery} to ${JSON.stringify(reduction.path)}`).toBe(true);
           }
         },
@@ -310,7 +323,7 @@ describe("proxy policy path confusion properties", () => {
         fc.pre(httpsDecision(pathAndQuery, request.method, GIT_PUSH_OPTIONS) === "allow");
         const url = new URL(`https://${HOST}${pathAndQuery}`);
         const pushService = url.searchParams.getAll("service").some(isReceivePackService);
-        for (const reduction of reductions(url.pathname, request.pipeline)) {
+        for (const reduction of judgedPathnames(pathAndQuery).flatMap((path) => reductions(path, request.pipeline))) {
           const routed = reduction.path.toLowerCase();
           const where = `${reduction.pipeline} routes ${pathAndQuery} to ${JSON.stringify(reduction.path)}`;
           expect(routed.endsWith("/git-receive-pack"), where).toBe(false);

@@ -931,6 +931,12 @@ describe("proxy policy", () => {
     test.fails("P1.1 counterexample: an encoded dot past the decode bound escapes the prefix", () => {
       expect(shapeDenial(() => request("/api/v2/.%2525252525252e")).shape?.reason).toBe("path-not-allowed");
     });
+    // The proxy judges the parsed path, where `..` removes `..;x` and leaves
+    // `/api/v2/`; the raw target is forwarded unchanged, and an origin that
+    // strips `;params` first (Tomcat order) resolves `/api/v2/../..` to `/`.
+    test.fails("P1.1 counterexample: a `..;x` segment removed by the parser escapes the prefix upstream", () => {
+      expect(shapeDenial(() => request("/api/v2/..;x/..")).shape?.reason).toBe("path-not-allowed");
+    });
     // `%2f` is denied, but `%252f` is not: only the raw and fully decoded
     // forms are checked, never the intermediate ones.
     test.fails("P1.3 counterexample: a doubly encoded slash is admitted while a singly encoded one is denied", () => {
