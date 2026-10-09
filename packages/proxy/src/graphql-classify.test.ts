@@ -115,3 +115,20 @@ describe("GraphQL request body classification (MED-5 guardrails)", () => {
     expect(classifyJson(jsonBody("query { a }"), { bodyText: undefined })).toBe("write");
   });
 });
+
+// Known defects found by graphql-classify.property.test.ts. Each pins today's
+// wrong answer with test.fails; when the defect is fixed, drop `.fails`.
+describe("GraphQL classifier known defects", () => {
+  // graphql-js parses `query, mutation`: `\"""` is an escape inside a block
+  // string, but the stripper ends the string there, and the trailing `"""` in
+  // the comment re-balances it, hiding the mutation.
+  test.fails('known defect todo 107: a \\""" escape in a block string hides a later mutation', () => {
+    expect(classifyGraphqlDocument('{ a(x: """\\""" """) } mutation { m } # """')).toBe("write");
+  });
+
+  // JSON.parse keeps the last duplicate key; an upstream that keeps the first
+  // runs the mutation.
+  test.fails("known defect todo 108: a duplicate query key classifies write", () => {
+    expect(classifyJson('{"query":"mutation { deleteRepo(id: 1) { id } }","query":"{ a }"}')).toBe("write");
+  });
+});
