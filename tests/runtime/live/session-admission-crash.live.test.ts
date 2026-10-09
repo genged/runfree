@@ -42,14 +42,19 @@ import { fileURLToPath } from "node:url";
 
 import { afterAll, afterEach, beforeAll, describe, expect, test } from "vitest";
 
+import { SESSION_FILES_DIR } from "@runfree/runtime-contracts/session-file";
+
 import { startLivePhase } from "./timing.ts";
 import { runfreeStateRoot } from "../../../packages/cli/src/paths.ts";
 import { scanRecoveryInventory } from "../../../packages/cli/src/runtime/recovery.ts";
 import {
   listQuarantinedSessionContainerRecordNamesV2,
   listSessionContainerRecordsV2,
+  sessionContainerRecordPath,
   sessionContainerRecordsRoot,
+  type SessionContainerProjectIdentity,
 } from "../../../packages/cli/src/runtime/session-containers.ts";
+import { warmProofRecordPath } from "../../../packages/cli/src/runtime/warm-proof.ts";
 import { RESUME_STUB_DIRECTORY, stageLongLivedAgentBinary } from "./agent-stub.ts";
 import { composeProjectName, composeServiceContainerId, docker, dockerOrThrow } from "./docker.ts";
 import {
@@ -57,8 +62,11 @@ import {
   forceCleanSessions,
   describeOutput,
   destroyLiveFixture,
+  MANAGED_HOLD_RELATIVE_PATH,
   provisionLiveFixture,
+  provisionSandboxFixture,
   readSessionFileEvidence,
+  type CaptureResult,
   type LiveFixture,
   type LiveRuntimeBackend,
 } from "./fixture.ts";
@@ -78,7 +86,7 @@ import {
   type CrashResumeReport,
   type HeldSessionState,
 } from "../session-admission-crash.ts";
-import { sessionAdmissionCrashEntryArgv } from "../../support/prebuilt-entry.ts";
+import { cliEntryArgv, sessionAdmissionCrashEntryArgv } from "../../support/prebuilt-entry.ts";
 import { liveTierSelected } from "./tiers.ts";
 
 // This file holds cases of both live tiers (see `tiers.ts`): per-conversation
@@ -136,6 +144,50 @@ function requiredBackend(): LiveRuntimeBackend {
     throw new Error("TEST_RUNTIME_BACKEND must be docker-desktop for the crash admission tranche");
   }
   return backend;
+}
+
+/** Every `timing: <phase> <detail>` line, as [phase, detail] pairs. */
+function timingLines(output: string): Array<readonly [string, string]> {
+  return output.split("\n").flatMap((line) => {
+    const match = /timing: (\S+) (.*)$/.exec(line.trimEnd());
+    return match ? [[match[1] as string, match[2] as string] as const] : [];
+  });
+}
+
+function timing(output: string, phase: string): string[] {
+  return timingLines(output).filter(([name]) => name === phase).map(([, detail]) => detail);
+}
+
+/** A real launch with `RUNFREE_TIMINGS=1`, so its stdout/stderr carries the startup phase lines. */
+function runfreeTimed(target: LiveFixture, args: readonly string[]): CaptureResult {
+  const result = childProcess.spawnSync(process.execPath, [...cliEntryArgv(), "--workspace", target.projectRoot, ...args], {
+    cwd: REPO_ROOT,
+    encoding: "utf8",
+    env: { ...target.env, RUNFREE_TIMINGS: "1", RUNFREE_INVOCATION_CWD: REPO_ROOT, RUNFREE_PROJECT_ROOT: REPO_ROOT },
+    maxBuffer: CAPTURE_MAX_BYTES,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  const stdout = typeof result.stdout === "string" ? result.stdout : "";
+  const stderr = typeof result.stderr === "string" ? result.stderr : "";
+  if (result.error) {
+    throw new Error(`runfree ${args.join(" ")} did not finish: ${result.error.message}: ${describeOutput(`${stdout}${stderr}`)}`);
+  }
+  return Object.freeze({ status: result.status ?? 1, stdout, stderr, output: `${stdout}${stderr}` });
+}
+
+/** A launch that is expected to admit and tear down cleanly; fails loudly otherwise. */
+function launchClaudeTimed(target: LiveFixture): CaptureResult {
+  const launched = runfreeTimed(target, ["claude"]);
+  const withoutTimings = launched.output.split("\n").filter((line) => !line.includes(" timing: ")).join("\n");
+  expect(launched.status, describeOutput(withoutTimings, 4000)).toBe(0);
+  return launched;
+}
+
+/** This project's session containers, from the daemon rather than the registry. */
+function sessionContainers(target: LiveFixture): string[] {
+  const project = composeProjectName(target);
+  const listed = docker(["ps", "-aq", "--no-trunc", "--filter", `name=^runfree-${project.replace(/^runfree-/, "")}-session-`]);
+  return listed.stdout.split("\n").map((line) => line.trim()).filter(Boolean);
 }
 
 type CrashRun = Readonly<{ status: number | null; signal: NodeJS.Signals | null; output: string }>;
@@ -1159,5 +1211,110 @@ describe("per-session admission survives a crash at every transition", () => {
     ).toBe(false);
     expect(listQuarantinedSessionContainerRecordNamesV2(stateDir)).toEqual([]);
     runtimeDestroyed = true;
+  }, TEST_TIMEOUT_MS);
+});
+
+// The two cases below need a session the crash runner's probe drive creates
+// for real (it calls the production admission driver directly, so the
+// container it leaves behind is a real Docker object) but then prove the
+// fallback through a genuine `runfree claude` launch, which — unlike the
+// probe drive — must actually run `startup.ts` end to end and complete. That
+// needs the recorder/one-shot project image `launch-latency.live.test.ts`
+// stages, not the long-lived one the crash sweep above depends on for its own
+// different reason (holding a session open to crash it mid-attach), so this
+// gets its own fixture rather than sharing the one above.
+describe("a crashed session with no record falls back from the warm-empty skip", () => {
+  let fixture: LiveFixture;
+  let proxyId: string;
+  let stateDir: string;
+  let expectedProject: SessionContainerProjectIdentity;
+
+  beforeAll(() => {
+    requiredBackend();
+    fixture = provisionSandboxFixture(REPO_ROOT);
+    fs.rmSync(path.join(fixture.projectRoot, MANAGED_HOLD_RELATIVE_PATH), { force: true });
+    // Two launches: the first may still build or select, the second leaves a
+    // clean warm proof behind.
+    launchClaudeTimed(fixture);
+    launchClaudeTimed(fixture);
+    const project = composeProjectName(fixture);
+    proxyId = composeServiceContainerId(project, "proxy");
+    const projectId = dockerOrThrow("project-id label", [
+      "inspect", "--format", '{{ index .Config.Labels "io.runfree.project-id" }}', proxyId,
+    ]).trim();
+    stateDir = path.join(runfreeStateRoot(fixture.env), "projects", projectId);
+    expectedProject = Object.freeze({ projectId, composeProject: project });
+  }, PROVISION_TIMEOUT_MS);
+
+  afterAll(() => {
+    if (fixture) destroyLiveFixture(fixture, { keepHostState: process.env.TEST_RUNTIME_KEEP_PROJECT === "1" });
+  }, PROVISION_TIMEOUT_MS);
+
+  /** Crashes at `point`, then strips the lifecycle record the crash left, leaving a bare orphan container. */
+  async function crashAndOrphanTheRecord(point: CrashPoint): Promise<void> {
+    const crashed = await runCrashScript(fixture, ["--kill-at", point]);
+    expect(
+      crashed.output,
+      `no crash landed at ${point}, so there is no orphan to test: ${describeOutput(crashed.output, 4000)}`,
+    ).toContain(CRASH_INJECTION_MARKER);
+    expect(crashed.status, `the crashed lifecycle process at ${point} exited cleanly`).not.toBe(0);
+
+    const records = listSessionContainerRecordsV2(stateDir, expectedProject);
+    expect(
+      records.length,
+      `the crash at ${point} left no lifecycle record, so the kill did not land inside allocation: ${describeOutput(crashed.output, 4000)}`,
+    ).toBeGreaterThan(0);
+    for (const record of records) fs.rmSync(sessionContainerRecordPath(stateDir, record.sessionId), { force: true });
+    expect(listSessionContainerRecordsV2(stateDir, expectedProject)).toEqual([]);
+  }
+
+  coreTest("a stopped orphan with no record is removed by the next warm launch's reconcile", async () => {
+    // A container crashed right after `create` was never started, so it is
+    // invisible to the internal network's participant listing; the only
+    // evidence that can still see it is the host-wide container listing
+    // `SESSION_CONTAINER_ABSENCE_FORMAT` drives, which this exercises against
+    // a real daemon.
+    await crashAndOrphanTheRecord("after-create");
+
+    const launched = runfreeTimed(fixture, ["claude"]);
+    expect(launched.status, describeOutput(launched.output, 4000)).toBe(0);
+    expect(timing(launched.output, "startup:warm-empty"), describeOutput(launched.output))
+      .toContain("blocked:session-containers-present");
+    expect(sessionContainers(fixture)).toEqual([]);
+  }, TEST_TIMEOUT_MS);
+
+  coreTest("a running orphan whose reconcile failed is reclaimed by the next launch", async () => {
+    await crashAndOrphanTheRecord("after-start");
+
+    // Breaking the session-files directory's permissions makes the proxy's
+    // own listing script refuse it, so the reconcile this launch falls back
+    // to cannot run either. The failure must be loud rather than silently
+    // falling back to the warm-empty skip it cannot prove: the warm-proof
+    // record goes with it, so nothing later can mistake this project for one
+    // that converged.
+    dockerOrThrow("break the session-files directory", [
+      "exec", "--user", "0:0", proxyId, "chmod", "0777", SESSION_FILES_DIR,
+    ]);
+    const warmProofPath = warmProofRecordPath(stateDir);
+    try {
+      const broken = runfreeTimed(fixture, ["claude"]);
+      expect(broken.status, describeOutput(broken.output, 4000)).not.toBe(0);
+      expect(broken.output, describeOutput(broken.output, 4000)).toContain("could not report its session files");
+      expect(fs.existsSync(warmProofPath), "a failed reconcile left the warm-proof record behind").toBe(false);
+    } finally {
+      dockerOrThrow("restore the session-files directory", [
+        "exec", "--user", "0:0", proxyId, "chmod", "0755", SESSION_FILES_DIR,
+      ]);
+    }
+
+    const recovered = runfreeTimed(fixture, ["claude"]);
+    expect(recovered.status, describeOutput(recovered.output, 4000)).toBe(0);
+    expect(sessionContainers(fixture)).toEqual([]);
+    expect(listSessionContainerRecordsV2(stateDir, expectedProject)).toEqual([]);
+
+    const warm = runfreeTimed(fixture, ["claude"]);
+    expect(warm.status, describeOutput(warm.output, 4000)).toBe(0);
+    expect(timing(warm.output, "validation:warm-proof"), describeOutput(warm.output)).toContain("match");
+    expect(timing(warm.output, "startup:warm-empty"), describeOutput(warm.output)).toContain("empty");
   }, TEST_TIMEOUT_MS);
 });

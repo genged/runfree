@@ -22,17 +22,24 @@
 // drift tranches through the production admission launch. Session grant
 // separation is proven by the attached tranche.
 
+import crypto from "node:crypto";
+import fs from "node:fs";
 import path from "node:path";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { sessionIpAssignmentReadCommand, sessionIpReuseFenceCommand } from "../../../packages/cli/src/runtime/session-file-publisher.ts";
 import { fileURLToPath } from "node:url";
 
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 
+import { SESSION_FILES_DIR } from "@runfree/runtime-contracts/session-file";
+
 import {
   destroyLiveFixture,
   describeOutput,
+  MANAGED_HOLD_RELATIVE_PATH,
   provisionLiveFixture,
+  provisionSandboxFixture,
+  type CaptureResult,
   type LiveFixture,
   type LiveRuntimeBackend,
 } from "./fixture.ts";
@@ -50,11 +57,13 @@ import {
   waitUntil,
 } from "./docker.ts";
 import { runNominalAdmissionSlice } from "./session-admission-slice.ts";
+import { cliEntryArgv } from "../../support/prebuilt-entry.ts";
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
 const PROVISION_TIMEOUT_MS = 30 * 60_000;
 const TEST_TIMEOUT_MS = 15 * 60_000;
 const PROXY_READY_TIMEOUT_MS = 120_000;
+const CAPTURE_MAX_BYTES = 8 * 1024 * 1024;
 
 // One agent is enough for every refusal here: the refusals are properties of
 // admission, not of which built-in launches, so running all three would triple
@@ -76,6 +85,42 @@ function requiredBackend(): LiveRuntimeBackend {
     throw new Error("TEST_RUNTIME_BACKEND must be docker-desktop for the negative admission tranche");
   }
   return backend;
+}
+
+/** Every `timing: <phase> <detail>` line, as [phase, detail] pairs. */
+function timingLines(output: string): Array<readonly [string, string]> {
+  return output.split("\n").flatMap((line) => {
+    const match = /timing: (\S+) (.*)$/.exec(line.trimEnd());
+    return match ? [[match[1] as string, match[2] as string] as const] : [];
+  });
+}
+
+function timing(output: string, phase: string): string[] {
+  return timingLines(output).filter(([name]) => name === phase).map(([, detail]) => detail);
+}
+
+/** A real launch with `RUNFREE_TIMINGS=1`, so its stdout/stderr carries the startup phase lines. */
+function runfreeTimed(target: LiveFixture, args: readonly string[]): CaptureResult {
+  const result = spawnSync(process.execPath, [...cliEntryArgv(), "--workspace", target.projectRoot, ...args], {
+    cwd: REPO_ROOT,
+    encoding: "utf8",
+    env: { ...target.env, RUNFREE_TIMINGS: "1", RUNFREE_INVOCATION_CWD: REPO_ROOT, RUNFREE_PROJECT_ROOT: REPO_ROOT },
+    maxBuffer: CAPTURE_MAX_BYTES,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  const stdout = typeof result.stdout === "string" ? result.stdout : "";
+  const stderr = typeof result.stderr === "string" ? result.stderr : "";
+  if (result.error) {
+    throw new Error(`runfree ${args.join(" ")} did not finish: ${result.error.message}: ${describeOutput(`${stdout}${stderr}`)}`);
+  }
+  return Object.freeze({ status: result.status ?? 1, stdout, stderr, output: `${stdout}${stderr}` });
+}
+
+function launchClaudeTimed(target: LiveFixture): CaptureResult {
+  const launched = runfreeTimed(target, ["claude"]);
+  const withoutTimings = launched.output.split("\n").filter((line) => !line.includes(" timing: ")).join("\n");
+  expect(launched.status, describeOutput(withoutTimings, 4000)).toBe(0);
+  return launched;
 }
 
 describe("per-session admission refuses and its controls are load-bearing", () => {
@@ -349,5 +394,63 @@ describe("per-session admission refuses and its controls are load-bearing", () =
     // authority, or one that came back unable to converge at all, fails here.
     // Runs as `pi` so the third built-in is admitted, proved and revoked too.
     runNominalAdmissionSlice({ fixture, backend, agent: RESTART_PROBE_AGENT, expect: "success" });
+  }, TEST_TIMEOUT_MS);
+});
+
+// The case below needs a real `runfree claude` launch rather than the
+// internal admission probe the rest of this file uses: the warm-empty skip
+// and its fallback live in `startup.ts`, which the probe's minimal
+// preparer never runs, so only a genuine launch can show the exact
+// `startup:warm-empty` verdict and the reconcile it falls back to. It gets
+// its own fixture with the recorder/one-shot project image (as
+// `launch-latency.live.test.ts` uses) rather than the shared refusal
+// fixture above, whose project image is never actually run end to end.
+describe("the warm-empty skip falls back to the full reconcile on a real orphan file", () => {
+  let fixture: LiveFixture;
+  let proxyId: string;
+
+  beforeAll(() => {
+    requiredBackend();
+    fixture = provisionSandboxFixture(REPO_ROOT);
+    fs.rmSync(path.join(fixture.projectRoot, MANAGED_HOLD_RELATIVE_PATH), { force: true });
+    // Two launches: the first may still build or select, the second leaves a
+    // clean warm proof behind so the probe launch below takes the warm path.
+    launchClaudeTimed(fixture);
+    launchClaudeTimed(fixture);
+    const project = composeProjectName(fixture);
+    proxyId = composeServiceContainerId(project, "proxy");
+  }, PROVISION_TIMEOUT_MS);
+
+  afterAll(() => {
+    if (fixture) destroyLiveFixture(fixture, { keepHostState: process.env.TEST_RUNTIME_KEEP_PROJECT === "1" });
+  }, PROVISION_TIMEOUT_MS);
+
+  test("an orphan session file is deleted before allocation", () => {
+    const sessionKey = crypto.randomBytes(32).toString("hex");
+    const plantedPath = `${SESSION_FILES_DIR}/${sessionKey}.json`;
+    dockerOrThrow("plant an orphan session file", [
+      "exec", "--user", "0:0", proxyId, "sh", "-c",
+      `umask 022; printf '{}' > ${plantedPath}`,
+    ]);
+    try {
+      const launched = runfreeTimed(fixture, ["claude"]);
+      expect(launched.status, describeOutput(launched.output, 4000)).toBe(0);
+      expect(timing(launched.output, "startup:warm-empty"), describeOutput(launched.output))
+        .toContain("blocked:session-files-present");
+      // The reconcile that removed the file ran before this launch's session
+      // was allocated, never after — a reconcile that only happened to finish
+      // first would not prove the ordering this fallback depends on.
+      const reconcileIndex = launched.output.indexOf("timing: startup:reconcile-sessions ");
+      const allocateIndex = launched.output.indexOf("timing: admission:allocate");
+      expect(reconcileIndex, describeOutput(launched.output)).toBeGreaterThanOrEqual(0);
+      expect(allocateIndex, describeOutput(launched.output)).toBeGreaterThan(reconcileIndex);
+      const stillPresent = docker(["exec", "--user", "0:0", proxyId, "test", "-e", plantedPath]);
+      expect(
+        stillPresent.status,
+        `the orphan session file ${plantedPath} survived the launch's reconcile`,
+      ).not.toBe(0);
+    } finally {
+      docker(["exec", "--user", "0:0", proxyId, "rm", "-f", plantedPath]);
+    }
   }, TEST_TIMEOUT_MS);
 });

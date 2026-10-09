@@ -163,6 +163,17 @@ describe("launch latency: sub-second launch plan Phase B", () => {
     expect(sessionContainers(fixture)).toEqual([]);
   }, TEST_TIMEOUT_MS);
 
+  coreTest("a warm launch with no session state skips the startup reconcile", () => {
+    // The previous case already left the project with no session file, no
+    // lifecycle record and no session container, so this launch's own
+    // evidence proves the empty state the skip depends on.
+    const warm = launchClaude(fixture);
+    const output = warm.output;
+    expect(timing(output, "startup:warm-empty"), describeOutput(output)).toContain("empty");
+    expect(timing(output, "startup:reconcile-sessions"), describeOutput(output)).toContain("skipped warm-empty");
+    expect(timing(output, "launch-handoff"), describeOutput(output)).toContain("minted");
+  }, TEST_TIMEOUT_MS);
+
   coreTest("runfree up always validates fully, and the next launch is warm again", () => {
     const up = runfreeTimed(fixture, ["up"]);
     expect(up.status, describeOutput(up.output)).toBe(0);
