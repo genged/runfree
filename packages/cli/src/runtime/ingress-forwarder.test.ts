@@ -16,6 +16,7 @@ import {
   missingNetworkResult,
 } from "./ingress-forwarder.test-harness.ts";
 import {
+  connectIngressForwarderAsync,
   INGRESS_FORWARDER_IMAGE,
   ingressForwarderName,
   ingressForwarderRunArguments,
@@ -25,6 +26,7 @@ import {
   removeAllIngressForwarders,
   removeValidatedEmptyManagedIngressHostNetworkAfterForcedSweep,
   startIngressForwarder,
+  startIngressForwarderAsync,
   stopIngressForwarders,
   type IngressForwarderInput,
 } from "./ingress-forwarder.ts";
@@ -746,5 +748,145 @@ describe("teardown", () => {
     const io = { capture } as unknown as RuntimeIO;
 
     expect(() => stopIngressForwarders(context, io, PROJECT_ID, [id])).not.toThrow();
+  });
+});
+
+describe("ingress forwarder step drivers", () => {
+  type Scenario =
+    | "success"
+    | "name collision"
+    | "created host network"
+    | "run without exact id"
+    | "never listens"
+    | "connect failure"
+    | "post-create inspect throws";
+
+  // One fresh stateful fake Docker per run, so the sync and async runs see the
+  // same daemon from the same starting state.
+  function scenarioIo(scenario: Scenario): { io: RuntimeIO; calls: string[][] } {
+    const name = ingressForwarderName(PROJECT_ID, "port", "3000");
+    const calls: string[][] = [];
+    let networkExists = scenario === "success" || scenario === "never listens" || scenario === "connect failure";
+    let started = false;
+    const capture = (_cmd: string, args: string[]) => {
+      calls.push(args);
+      if (args[0] === "container" && args[1] === "inspect") {
+        if (scenario === "name collision") return { status: 0, stdout: "[]", stderr: "" };
+        if (!started) return missingContainerResult(args[2] as string);
+        if (scenario === "run without exact id") {
+          return {
+            status: 0,
+            stdout: JSON.stringify([{
+              Config: {
+                Image: INGRESS_FORWARDER_IMAGE,
+                Labels: {
+                  "io.runfree.container-role": "ingress-forwarder",
+                  "io.runfree.ingress-purpose": "port",
+                  "io.runfree.project-id": PROJECT_ID,
+                },
+              },
+              Id: FORWARDER_ID,
+              Name: `/${name}`,
+            }]),
+            stderr: "",
+          };
+        }
+        return { status: 0, stdout: "[]", stderr: "" };
+      }
+      if (args[0] === "network" && args[1] === "inspect") {
+        if (scenario === "post-create inspect throws" && networkExists) throw new Error("inspect transport failed");
+        return networkExists
+          ? { status: 0, stdout: JSON.stringify([ingressHostNetworkInspectFixture(PROJECT_ID)]), stderr: "" }
+          : missingNetworkResult(args[2] as string);
+      }
+      if (args[0] === "network" && args[1] === "create") {
+        networkExists = true;
+        return { status: 0, stdout: INGRESS_HOST_NETWORK_TEST_ID, stderr: "" };
+      }
+      if (args[0] === "network" && args[1] === "rm") {
+        networkExists = false;
+        return { status: 0, stdout: "", stderr: "" };
+      }
+      if (args[0] === "run") {
+        started = true;
+        return { status: 0, stdout: scenario === "run without exact id" ? "unexpected output\n" : `${FORWARDER_ID}\n`, stderr: "" };
+      }
+      if (args[0] === "exec") return { status: scenario === "never listens" ? 1 : 0, stdout: "", stderr: "" };
+      if (args[0] === "network" && args[1] === "connect") {
+        return scenario === "connect failure"
+          ? { status: 1, stdout: "", stderr: "connect refused" }
+          : { status: 0, stdout: "", stderr: "" };
+      }
+      if (args[0] === "container" && args[1] === "rm") {
+        started = false;
+        return { status: 0, stdout: "", stderr: "" };
+      }
+      throw new Error(`unexpected Docker arguments: ${args.join(" ")}`);
+    };
+    const captureAsync = async (cmd: string, args: string[]) => capture(cmd, args);
+    return { io: { capture, captureAsync } as unknown as RuntimeIO, calls };
+  }
+
+  function outcome(error: unknown): string {
+    if (error === undefined) return "ok";
+    return `${(error as Error).constructor.name}: ${(error as Error).message}`;
+  }
+
+  test.each<Scenario>([
+    "success",
+    "name collision",
+    "created host network",
+    "run without exact id",
+    "never listens",
+    "connect failure",
+    "post-create inspect throws",
+  ])("the synchronous and asynchronous drivers issue the same Docker requests: %s", async (scenario) => {
+    const sync = scenarioIo(scenario);
+    let syncError: unknown;
+    try {
+      startIngressForwarder(context, sync.io, input());
+    } catch (error) {
+      syncError = error;
+    }
+
+    const overlapped = scenarioIo(scenario);
+    let asyncError: unknown;
+    try {
+      const started = await startIngressForwarderAsync(context, overlapped.io, input());
+      expect(started).toEqual({ name: ingressForwarderName(PROJECT_ID, "port", "3000"), containerId: FORWARDER_ID });
+      await connectIngressForwarderAsync(context, overlapped.io, started, input().internalNetwork);
+    } catch (error) {
+      asyncError = error;
+    }
+
+    expect(overlapped.calls).toEqual(sync.calls);
+    expect(outcome(asyncError)).toBe(outcome(syncError));
+    if (scenario === "success" || scenario === "created host network") expect(syncError).toBeUndefined();
+    else expect(syncError).toBeInstanceOf(scenario === "post-create inspect throws" ? Error : CliError);
+  });
+
+  test("a Docker call that throws after the host network was created still removes that network", () => {
+    const { io, calls } = scenarioIo("post-create inspect throws");
+    expect(() => startIngressForwarder(context, io, input())).toThrow("inspect transport failed");
+    expect(calls).toContainEqual(["network", "rm", INGRESS_HOST_NETWORK_TEST_ID]);
+    expect(calls.some((args) => args[0] === "run")).toBe(false);
+  });
+
+  test.each([
+    ["bad name", /internal network is invalid: bad name/u],
+    [ingressHostNetworkName(PROJECT_ID), /must not be the host-facing network/u],
+  ])("a connect onto a refused network %s removes the started sidecar instead of attaching it", async (network, message) => {
+    const { io, calls } = scenarioIo("success");
+    const started = await startIngressForwarderAsync(context, io, input());
+    await expect(connectIngressForwarderAsync(context, io, started, network)).rejects.toThrow(message);
+    expect(calls.some((args) => args[0] === "network" && args[1] === "connect")).toBe(false);
+    expect(calls.at(-1)).toEqual(["container", "rm", "--force", FORWARDER_ID]);
+  });
+
+  test("the asynchronous driver refuses an IO that cannot run Docker calls concurrently, before any Docker call", async () => {
+    const capture = vi.fn();
+    await expect(startIngressForwarderAsync(context, { capture } as unknown as RuntimeIO, input()))
+      .rejects.toThrow("this IO cannot run Docker calls concurrently");
+    expect(capture).not.toHaveBeenCalled();
   });
 });
