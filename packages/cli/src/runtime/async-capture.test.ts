@@ -1,8 +1,12 @@
 import childProcess from "node:child_process";
+import fs from "node:fs";
 import os from "node:os";
+import path from "node:path";
 import { performance } from "node:perf_hooks";
 
-import { describe, expect, test } from "vitest";
+import { afterEach, beforeEach, describe, expect, test } from "vitest";
+
+import { nodeRuntimeIO } from "../runtime.ts";
 
 import { captureAsync } from "./async-capture.ts";
 import { failClosedSpawnStatus } from "./spawn-status.ts";
@@ -106,10 +110,58 @@ describe("captureAsync", () => {
   });
 
   test("two calls run concurrently", async () => {
-    const sleep = ["-e", "setTimeout(() => {}, 300)"];
+    const sleep = ["-e", "setTimeout(() => {}, 1_000)"];
     const startedAt = performance.now();
     const results = await Promise.all([captureAsync(node, sleep), captureAsync(node, sleep)]);
     expect(results.map((result) => result.status)).toEqual([0, 0]);
-    expect(performance.now() - startedAt).toBeLessThan(550);
+    expect(performance.now() - startedAt).toBeLessThan(1_800);
+  });
+
+  test("large input to a child that exits without reading stdin still resolves", async () => {
+    const result = await captureAsync(node, ["-e", "process.exit(0)"], { input: "x".repeat(8 * 1024 * 1024), timeout: 10_000 });
+    expect(result.status).toBe(0);
+  });
+
+  test("a timeout past the timer's 32-bit range is honored, not fired at once", async () => {
+    const result = await captureAsync(node, ["-e", "setTimeout(() => {}, 200)"], { timeout: 2 ** 31 });
+    expect(result).toMatchObject({ status: 0 });
+    expect(result.timedOut).toBeUndefined();
+  });
+});
+
+describe("captureAsync refuses invalid options before spawning", () => {
+  let directory: string;
+  beforeEach(() => { directory = fs.mkdtempSync(path.join(os.tmpdir(), "runfree-async-capture-")); });
+  afterEach(() => { fs.rmSync(directory, { recursive: true, force: true }); });
+
+  const markerScript = (marker: string) => ["-e", `require("fs").writeFileSync(${JSON.stringify(marker)}, "spawned")`];
+  const invalid: Array<[string, childProcess.SpawnSyncOptions]> = [
+    ["NaN timeout", { timeout: Number.NaN }],
+    ["Infinity timeout", { timeout: Number.POSITIVE_INFINITY }],
+    ["negative timeout", { timeout: -1 }],
+    ["negative fractional timeout", { timeout: -0.5 }],
+    ["NaN maxBuffer", { maxBuffer: Number.NaN }],
+    ["negative maxBuffer", { maxBuffer: -1 }],
+    ["unknown kill signal", { killSignal: "SIGBOGUS" as NodeJS.Signals }],
+  ];
+  for (const [name, options] of invalid) {
+    test(`${name} is status 125 and no child runs`, async () => {
+      const marker = path.join(directory, "marker");
+      const result = await captureAsync(node, markerScript(marker), options);
+      expect(result).toMatchObject({ status: 125, stdout: "", stderr: "" });
+      // Give a wrongly spawned child time to write its marker.
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      expect(fs.existsSync(marker)).toBe(false);
+    });
+  }
+
+  test("each timeout the sync capture refuses, the async capture refuses; each it runs, it runs the same", async () => {
+    for (const timeout of [Number.NaN, Number.POSITIVE_INFINITY, -1, 0, undefined, 1.5, 100]) {
+      const options = timeout === undefined ? {} : { timeout };
+      let sync: { status: number } | "refused";
+      try { sync = nodeRuntimeIO.capture(node, ["-e", "0"], options); } catch { sync = "refused"; }
+      const result = await captureAsync(node, ["-e", "0"], options);
+      expect([timeout, result.status]).toEqual([timeout, sync === "refused" ? 125 : sync.status]);
+    }
   });
 });

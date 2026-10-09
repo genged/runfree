@@ -84,7 +84,7 @@ import {
   removeValidatedIngressForwarders,
 } from "./runtime/ingress-forwarder-ownership.ts";
 import { createRuntimePlan } from "./runtime/plan.ts";
-import { failClosedSpawnStatus } from "./runtime/spawn-status.ts";
+import { failClosedSpawnStatus, integerSpawnTimeout } from "./runtime/spawn-status.ts";
 import { planRuntimeUpgradeFromV2State, startRuntime } from "./runtime/startup.ts";
 import type {
   CaptureResult,
@@ -102,16 +102,7 @@ import { setMcpLogContext } from "./runtime/mcp.ts";
 export { containerMissingNetwork };
 export type { CaptureResult, RuntimeAdminIntent, RuntimeContext, RuntimeIO } from "./runtime/types.ts";
 
-/**
- * `spawnSync` throws on a fractional `timeout`, and deadline arithmetic on the
- * monotonic clock produces one. Rounded up, so a bound is never shortened.
- */
-export function integerSpawnTimeout<T extends { timeout?: number }>(options: T): T {
-  const { timeout } = options;
-  return typeof timeout === "number" && Number.isFinite(timeout) && !Number.isInteger(timeout)
-    ? { ...options, timeout: Math.ceil(timeout) }
-    : options;
-}
+export { integerSpawnTimeout };
 
 function run(command: string, args: string[], rawOptions: childProcess.SpawnSyncOptions = {}): number {
   const options = integerSpawnTimeout(rawOptions);

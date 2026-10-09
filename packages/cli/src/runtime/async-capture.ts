@@ -1,20 +1,13 @@
 import * as childProcess from "node:child_process";
 
-import { failClosedSpawnStatus } from "./spawn-status.ts";
+import { failClosedSpawnStatus, integerSpawnTimeout, spawnOptionsRefusal } from "./spawn-status.ts";
 import type { CaptureResult } from "./types.ts";
 
 // spawnSync's default per-stream output bound.
 const DEFAULT_MAX_BUFFER = 1024 * 1024;
 
-/**
- * `spawnSync`'s timeout must be an integer, and deadline arithmetic produces
- * fractions; rounded up, as the sync capture does, so a bound is never
- * shortened.
- */
-function integerTimeout(timeout: number | undefined): number | undefined {
-  if (typeof timeout !== "number" || !Number.isFinite(timeout) || timeout <= 0) return undefined;
-  return Math.ceil(timeout);
-}
+// setTimeout's largest delay; a longer one would fire at once.
+const MAX_TIMER_MS = 2 ** 31 - 1;
 
 /**
  * The asynchronous twin of the host `capture`: the same result for the same
@@ -26,7 +19,9 @@ function integerTimeout(timeout: number | undefined): number | undefined {
  * - Output past `maxBuffer` on either stream (default 1 MiB) ends the child
  *   with `killSignal`, as spawnSync's ENOBUFS does: status 128 + that signal
  *   when the kill ended the child, else 125. Never the child's own status.
- * - A child that cannot be spawned reports status 125.
+ * - A child that cannot be spawned reports status 125, and so do options
+ *   `spawnSync` would refuse (`spawnOptionsRefusal`): no child is spawned,
+ *   so an invalid `timeout` is never read as no timeout.
  * - `input` is written to stdin, which is then closed.
  *
  * The status comes from `failClosedSpawnStatus`, the sync capture's mapping.
@@ -37,7 +32,9 @@ export function captureAsync(
   args: readonly string[],
   options: childProcess.SpawnSyncOptions = {},
 ): Promise<CaptureResult> {
-  const { input, maxBuffer, timeout, killSignal, encoding: _encoding, stdio: _stdio, ...spawnOptions } = options;
+  const refusal = spawnOptionsRefusal(options);
+  if (refusal) return Promise.resolve({ ...failClosedSpawnStatus({ status: null, signal: null, error: refusal }), stdout: "", stderr: "" });
+  const { input, maxBuffer, timeout, killSignal, encoding: _encoding, stdio: _stdio, ...spawnOptions } = integerSpawnTimeout(options);
   const bound = typeof maxBuffer === "number" && !Number.isNaN(maxBuffer) ? maxBuffer : DEFAULT_MAX_BUFFER;
   const signal = killSignal ?? "SIGTERM";
   return new Promise<CaptureResult>((resolve) => {
@@ -98,8 +95,12 @@ export function captureAsync(
     });
     child.on("close", (status, exitSignal) => finish(status, exitSignal));
 
-    const limit = integerTimeout(timeout);
-    if (limit !== undefined) timer = setTimeout(() => fail("ETIMEDOUT"), limit);
+    // Zero or absent is no timeout, as for spawnSync. A delay past the timer's
+    // range is re-armed in steps rather than firing at once.
+    const arm = (left: number): void => {
+      timer = setTimeout(() => (left > MAX_TIMER_MS ? arm(left - MAX_TIMER_MS) : fail("ETIMEDOUT")), Math.min(left, MAX_TIMER_MS));
+    };
+    if (typeof timeout === "number" && timeout > 0) arm(timeout);
 
     // A child that exits without reading stdin closes the pipe under us.
     child.stdin?.on("error", () => {});
