@@ -661,6 +661,40 @@ describe("ingress forwarders are loopback-only, one-way, per-session, and torn d
       && attributes[SESSION_CONTAINER_LABELS.role] === "session-agent";
   }
 
+  function escapeRegExp(text: string): string {
+    return text.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+  }
+
+  /**
+   * The callback refusal carrying only an inner detail a removed forwarder
+   * yields at `point` (`session-mcp-callback.ts`, `ingress-forwarder.ts`).
+   *
+   * Forwarder start: readiness sees the container gone (`did not begin
+   * listening`); or readiness won and the agent_internal connect meets the
+   * removal (`No such container`, or Docker's `is marked for removal` while
+   * the forced removal is in flight); or the connect won too and the address
+   * read finds no forwarder (`has no exact … address`).
+   *
+   * agent_internal connect: the connect has returned, so the address read
+   * finds no forwarder; or the read won and the host probe through the
+   * removed forwarder fails (`did not reach the session`). The bridge start
+   * is not forwarder-dependent, so its failure is not accepted.
+   */
+  function removalCausedFailure(point: "forwarder start" | "agent_internal connect", forwarderName: string): RegExp {
+    expect(forwarderName, "the removed forwarder's start event carried no name").toMatch(new RegExp(`^runfree-ingress-mcp-callback-${escapeRegExp(projectId)}-\\d+$`, "u"));
+    const name = escapeRegExp(forwarderName);
+    const noAddress = `MCP OAuth callback forwarder ${name} has no exact \\S+ address`;
+    const details = point === "forwarder start"
+      ? [
+        `ingress forwarder ${name} did not begin listening on 127\\.0\\.0\\.1:\\d+`,
+        "(?:Error response from daemon: )?No such container",
+        "(?:Error response from daemon: )?[Cc]ontainer \\S+ is marked for removal",
+        noAddress,
+      ]
+      : [noAddress, "http://127\\.0\\.0\\.1:\\d+ did not reach the session"];
+    return new RegExp(`the MCP OAuth callback for this session could not be set up: (?:${details.join("|")})`, "u");
+  }
+
   /** No callback forwarder, session container, or lifecycle record: the state a residue claim is measured from. */
   function assertNoSessionResidue(label: string): void {
     expect(projectIngressForwarders(projectId, "mcp-callback"), `${label}: callback forwarders`).toEqual([]);
@@ -686,13 +720,14 @@ describe("ingress forwarders are loopback-only, one-way, per-session, and torn d
       // launch, so only this launch could have left it.
       assertNoSessionResidue(`${label}, before the launch`);
 
-      const forwarders = new Set<string>();
+      /** Forwarder id to its container name, from the start events. */
+      const forwarders = new Map<string, string>();
       const sessionContainers = new Set<string>();
       let throttled: Readonly<{ id: string; status: number; output: string }> | undefined;
-      let removed: Readonly<{ id: string; status: number; output: string }> | undefined;
+      let removed: Readonly<{ id: string; name: string; status: number; output: string }> | undefined;
       const remove = (id: string): void => {
         const result = docker(["rm", "-f", id]);
-        removed = Object.freeze({ id, status: result.status, output: result.output });
+        removed = Object.freeze({ id, name: forwarders.get(id) ?? "", status: result.status, output: result.output });
       };
       const watcher = watchDockerEvents(daemonNow(), CALLBACK_SETUP_EVENT_FILTERS, (event) => {
         const id = event.Actor?.ID ?? "";
@@ -710,7 +745,7 @@ describe("ingress forwarders are loopback-only, one-way, per-session, and torn d
           }
         }
         if (isCallbackForwarderEvent(event) && event.Action === "start") {
-          forwarders.add(id);
+          forwarders.set(id, eventAttributes(event).name ?? "");
           if (point === "forwarder start" && !removed) remove(id);
           return;
         }
@@ -735,7 +770,15 @@ describe("ingress forwarders are loopback-only, one-way, per-session, and torn d
       const killed = removed as NonNullable<typeof removed>;
       expect(killed.status, `${label}: docker rm -f ${killed.id} failed: ${describeOutput(killed.output)}`).toBe(0);
       expect(failed.status, `${label}: the launch succeeded without its forwarder: ${describeOutput(failed.output, 4000)}`).not.toBe(0);
-      expect(failed.output, `${label}: the launch failed for another reason`).toContain("the MCP OAuth callback for this session could not be set up");
+      // The callback refusal wraps every setup failure alike, a spent budget
+      // included, so the inner detail is what attributes this one to the
+      // removal. Each point accepts only the details a removed forwarder can
+      // produce there, and none that a spent budget produces.
+      expect(failed.output, `${label}: the callback setup ran out of budget instead`).not.toMatch(/used its whole|budget ended/u);
+      expect(
+        removalCausedFailure(point, killed.name).test(failed.output),
+        `${label}: the launch did not fail on the removed forwarder: ${describeOutput(failed.output, 4000)}`,
+      ).toBe(true);
       // The launch reached its session container, so "no session container
       // remains" is a claim about one that existed.
       expect(sessionContainers.size, `${label}: the launch never created a session container`).toBeGreaterThan(0);
