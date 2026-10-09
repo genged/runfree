@@ -47,8 +47,12 @@
 //         agent_internal connect), from a `docker events` watcher, fails the
 //         launch with the callback refusal and leaves no forwarder, session
 //         container, or registry record; the next launch gets a two-hop path.
-//   ext   A launcher SIGKILLed at its forwarder's start leaves that forwarder
-//         behind; the next launch succeeds and reclaims it.
+//         At the connect point the session is mildly CPU-throttled from its
+//         create, so the removal lands before the bridge and probe; a launch
+//         that attaches anyway fails the case at once.
+//   ext   A launcher SIGKILLed at its forwarder's start leaves that forwarder,
+//         its session container, and its lifecycle record behind; the next
+//         launch succeeds and all three are reclaimed.
 //   ext   Recovery (b): a compatible proxy replacement leaves a live callback
 //         forwarder and a port forward in place, loopback-only and reaching.
 //   core  `runfree stop` and `runfree destroy` each remove a port forward
@@ -76,9 +80,6 @@
 //   - A browser: the host GET is the browser's redirect request.
 //   - VNC on the stock base image, which ships no x11vnc (the case reports
 //     that as a skip, not a pass).
-
-import fs from "node:fs";
-import path from "node:path";
 
 import { afterAll, afterEach, beforeAll, describe, expect, test } from "vitest";
 import { CONTAINER_ROLE_LABEL, INGRESS_PURPOSE_LABEL } from "../../../packages/cli/src/runtime/container-inventory.ts";
@@ -108,7 +109,6 @@ import {
   type LiveFixture,
 } from "./fixture.ts";
 import {
-  CALLBACK_AT_START_DIRNAME,
   CALLBACK_BRIDGE_MARKER,
   CALLBACK_FORWARDER_TIMEOUT_MS,
   CALLBACK_PORT_FILE,
@@ -116,6 +116,7 @@ import {
   MCP_FIXTURE_SERVER,
   allCallbackForwarders,
   allSessionContainers,
+  awaitExitUnlessAttached,
   awaitHostReach,
   awaitStartObservation,
   callbackForwardersForSession,
@@ -135,6 +136,7 @@ import {
   sessionFile,
   sessionListenerOwner,
   sessionProcessArgv,
+  peekSessionRegistryRecords,
   sessionRegistryRecords,
   sessionTcpProbe,
   spawnCli,
@@ -158,6 +160,12 @@ import { LAUNCH_LOCK_HOLD_BUDGET_MS } from "../../../packages/cli/src/runtime/la
 const coreTest = liveTierSelected("core") ? test : test.skip;
 const extendedTest = liveTierSelected("extended") ? test : test.skip;
 
+/**
+ * The session's CPU share at the agent_internal-connect kill point: slow
+ * enough that the bridge start outlasts a `docker rm -f`, far above the
+ * lock-hold case's 0.01 so the bridge is not starved into its own timeout.
+ */
+const CONNECT_POINT_SESSION_CPUS = 0.1;
 /** Bound for a dead owner's forwarder to be reconciled away once a new launch runs. */
 const RECONCILE_TIMEOUT_MS = 90_000;
 /** Bound for a preserved session to be re-served after the compatible replacement. */
@@ -453,9 +461,8 @@ describe("ingress forwarders are loopback-only, one-way, per-session, and torn d
 
   coreTest("the port file and the forwarder exist before the agent's first instruction", async () => {
     ensureMcpOAuthEligible();
-    // Precondition: no record an earlier case's session left can stand in
-    // for this launch's.
-    fs.rmSync(path.join(fixture.projectRoot, CALLBACK_AT_START_DIRNAME), { recursive: true, force: true });
+    // The record is container-local, so no earlier session's record can
+    // stand in for this launch's: the container is new.
     const run = await launch(["claude"], "first-instruction session");
     const session = inspectOrThrow(run.session.containerId, run.label);
     // Read once, at attach, never polled: a forwarder that only appeared later
@@ -667,6 +674,12 @@ describe("ingress forwarders are loopback-only, one-way, per-session, and torn d
     // Reservation: the forwarder's `docker run -p` has just started it.
     // Completion: it has just joined agent_internal; the bridge and the host
     // probe have not run yet.
+    //
+    // The second iteration's empty-residue precondition directly follows the
+    // first's `end()`. That holds without polling: the owner's teardown
+    // (`teardownSessionRecord`, run inline by the admission driver before the
+    // CLI returns) removes the session container and then the lifecycle
+    // record, and a blocked step leaves the residue a failure should report.
     for (const point of ["forwarder start", "agent_internal connect"] as const) {
       const label = `forwarder removed at its ${point}`;
       // Precondition: everything asserted absent below is absent before the
@@ -675,6 +688,7 @@ describe("ingress forwarders are loopback-only, one-way, per-session, and torn d
 
       const forwarders = new Set<string>();
       const sessionContainers = new Set<string>();
+      let throttled: Readonly<{ id: string; status: number; output: string }> | undefined;
       let removed: Readonly<{ id: string; status: number; output: string }> | undefined;
       const remove = (id: string): void => {
         const result = docker(["rm", "-f", id]);
@@ -682,7 +696,19 @@ describe("ingress forwarders are loopback-only, one-way, per-session, and torn d
       };
       const watcher = watchDockerEvents(daemonNow(), CALLBACK_SETUP_EVENT_FILTERS, (event) => {
         const id = event.Actor?.ID ?? "";
-        if (isSessionAgentEvent(event)) sessionContainers.add(id);
+        if (isSessionAgentEvent(event)) {
+          sessionContainers.add(id);
+          // After connect the launch still has to start the in-session bridge
+          // and probe through it before it can attach. A mild throttle on the
+          // session, applied at create (as the lock-hold case does), makes
+          // the bridge's `node` start take far longer than the `docker rm -f`
+          // below, so the removal reliably lands first. Mild, so the
+          // removal, not the bridge's own budget, is what fails the launch.
+          if (point === "agent_internal connect" && event.Action === "create" && !throttled) {
+            const result = docker(["update", "--cpus", String(CONNECT_POINT_SESSION_CPUS), id]);
+            throttled = Object.freeze({ id, status: result.status, output: result.output });
+          }
+        }
         if (isCallbackForwarderEvent(event) && event.Action === "start") {
           forwarders.add(id);
           if (point === "forwarder start" && !removed) remove(id);
@@ -695,12 +721,16 @@ describe("ingress forwarders are loopback-only, one-way, per-session, and torn d
       });
       let failed: Awaited<SpawnedCli["completion"]>;
       try {
-        failed = await spawnCli(fixture, ["claude"]).completion;
+        failed = await awaitExitUnlessAttached(fixture, project, spawnCli(fixture, ["claude"]), label);
       } finally {
         await watcher.stop();
       }
 
       expect(watcher.handlerError(), `${label}: the event watcher failed`).toBeUndefined();
+      if (point === "agent_internal connect") {
+        expect(throttled, `${label}: the session container was never throttled`).toBeDefined();
+        expect(throttled?.status, `${label}: docker update --cpus failed: ${describeOutput(throttled?.output ?? "")}`).toBe(0);
+      }
       expect(removed, `${label}: the kill point never came: ${describeOutput(failed.output, 4000)}`).toBeDefined();
       const killed = removed as NonNullable<typeof removed>;
       expect(killed.status, `${label}: docker rm -f ${killed.id} failed: ${describeOutput(killed.output)}`).toBe(0);
@@ -723,9 +753,12 @@ describe("ingress forwarders are loopback-only, one-way, per-session, and torn d
     ensureMcpOAuthEligible();
     assertNoSessionResidue("before the launch");
     let deadForwarderId: string | undefined;
+    const deadSessionContainers = new Set<string>();
     const dead = spawnCli(fixture, ["claude"]);
     try {
       const watcher = watchDockerEvents(daemonNow(), CALLBACK_SETUP_EVENT_FILTERS, (event) => {
+        // Created before the reservation starts, so seen before the kill.
+        if (isSessionAgentEvent(event) && event.Action === "create") deadSessionContainers.add(event.Actor?.ID ?? "");
         if (deadForwarderId || !isCallbackForwarderEvent(event) || event.Action !== "start") return;
         deadForwarderId = event.Actor?.ID ?? "";
         // At once, from the handler: the launch must die mid-setup.
@@ -748,6 +781,10 @@ describe("ingress forwarders are loopback-only, one-way, per-session, and torn d
       // Precondition: the residue exists, so its removal below is the next
       // launch's reclamation, not the dead launch's own cleanup.
       expect(inspectContainer(residue), "the killed launcher's forwarder was already gone").toBeDefined();
+      expect(deadSessionContainers.size, "the killed launcher never created its session container").toBe(1);
+      const deadRecords = (): readonly string[] => peekSessionRegistryRecords(fixture, project)
+        .filter((record) => record.hostPid === dead.pid).map((record) => record.sessionId);
+      expect(deadRecords(), "the killed launcher left no lifecycle record").toHaveLength(1);
 
       // The dead launch's session container may still be starting, so the
       // next session is found by its own lifecycle record.
@@ -758,6 +795,14 @@ describe("ingress forwarders are loopback-only, one-way, per-session, and torn d
         () => inspectContainer(residue) === undefined,
         RECONCILE_TIMEOUT_MS,
         "the killed launcher's callback forwarder to be reclaimed",
+        { label: next.label, completion: next.completion, output: next.output },
+      );
+      // The rest of the dead launch's residue goes the same way: its session
+      // container and its lifecycle record.
+      await pollUntil(
+        () => [...deadSessionContainers].every((id) => inspectContainer(id) === undefined) && deadRecords().length === 0,
+        RECONCILE_TIMEOUT_MS,
+        "the killed launcher's session container and lifecycle record to be reclaimed",
         { label: next.label, completion: next.completion, output: next.output },
       );
       expect(allCallbackForwarders(projectId).map((candidate) => candidate.id), "a stale callback forwarder remains")

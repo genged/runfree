@@ -58,9 +58,14 @@ export const CALLBACK_REQUEST_PATH = "/callback/abc?code=synthetic&state=x";
  * Where the agent stub records what it saw at its first instruction: the
  * callback port file's contents, or `absent`. One file per session, named by
  * `RUNFREE_SESSION_ID` or else the container's hostname.
+ *
+ * Container-local on purpose, never the `/workspace` bind mount: on Docker
+ * Desktop a bind-mounted file's mtime comes from the host's clock, while
+ * `State.StartedAt` comes from the VM's. A file in the container's own
+ * filesystem is stamped by the same VM kernel that stamps the daemon's times,
+ * and a fresh session container cannot hold an earlier session's record.
  */
-export const CALLBACK_AT_START_DIRNAME = ".runfree-callback-at-start";
-export const CALLBACK_AT_START_CONTAINER_DIR = `/workspace/${CALLBACK_AT_START_DIRNAME}`;
+export const CALLBACK_AT_START_CONTAINER_DIR = "/tmp/runfree-callback-at-start";
 
 /** Bound for a launch's callback forwarder to appear once its agent is up. */
 export const CALLBACK_FORWARDER_TIMEOUT_MS = 60_000;
@@ -717,6 +722,9 @@ export function spawnCli(fixture: LiveFixture, args: readonly string[], extraEnv
     try { process.kill(-pid, "SIGKILL"); } catch { /* the group is already gone */ }
   };
   const backstop = setTimeout(killGroup, LAUNCH_TIMEOUT_MS);
+  // Never what keeps the worker alive: an exited CLI clears it, and a worker
+  // shutting down with the CLI still running is cleaned up by afterEach.
+  backstop.unref();
   const completion = new Promise<Readonly<{ status: number | null; output: string; elapsedMs: number }>>((resolve, reject) => {
     child.once("error", reject);
     child.once("close", (status) => resolve(Object.freeze({ status, output, elapsedMs: Date.now() - startedAt })));
@@ -848,6 +856,49 @@ export function sessionRegistryRecords(fixture: LiveFixture, project: string): r
   return listSessionContainerRecordsV2(stateDir, { projectId, composeProject: project });
 }
 
+/**
+ * The registry, tolerantly: a record mid-replacement is skipped rather than
+ * thrown on. For sampling while a launch runs; residue claims use the strict
+ * `sessionRegistryRecords`.
+ */
+export function peekSessionRegistryRecords(fixture: LiveFixture, project: string): readonly SessionContainerRecordV2[] {
+  const projectId = project.replace(/^runfree-/u, "");
+  const stateDir = path.join(runfreeStateRoot(fixture.env), "projects", projectId);
+  return peekSessionContainerRecordsV2(stateDir, { projectId, composeProject: project }).records;
+}
+
+/**
+ * Waits for a launch that must fail, and fails fast if it attaches instead.
+ *
+ * A launch that unexpectedly attaches would otherwise hold its session until
+ * the spawn backstop, minutes later. Its lifecycle record names the spawn's
+ * pid as `hostPid` and reaches `attached` at the handoff, so the first sample
+ * that sees it kills the launch's process group and throws at once.
+ */
+export async function awaitExitUnlessAttached(
+  fixture: LiveFixture,
+  project: string,
+  run: SpawnedCli,
+  label: string,
+): Promise<Readonly<{ status: number | null; output: string; elapsedMs: number }>> {
+  let settled: Readonly<{ status: number | null; output: string; elapsedMs: number }> | undefined;
+  let spawnError: unknown;
+  let rejected = false;
+  void run.completion.then((result) => { settled = result; }, (error: unknown) => { spawnError = error; rejected = true; });
+  for (;;) {
+    if (settled) return settled;
+    if (rejected) throw spawnError;
+    const attached = peekSessionRegistryRecords(fixture, project)
+      .find((record) => record.hostPid === run.pid && record.state === "attached");
+    if (attached) {
+      run.killGroup();
+      await run.completion.catch(() => undefined);
+      throw new Error(`${label}: the launch attached session ${attached.sessionId} instead of failing: ${describeOutput(run.output(), 4000)}`);
+    }
+    await sleep(250);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // What the agent saw at its first instruction
 // ---------------------------------------------------------------------------
@@ -856,9 +907,11 @@ export type StartObservation = Readonly<{ content: string; mtimeNs: bigint }>;
 
 /**
  * The stub's at-start record for one session: what it saw, and the record's
- * mtime in nanoseconds on the daemon's clock (read inside the session, where
- * the daemon and the file share a kernel). Undefined when the stub left no
- * record under either name it may use.
+ * mtime in nanoseconds. The record lives in the container's own filesystem
+ * and its mtime is read inside the container, so both come from the VM
+ * kernel's clock — the clock the daemon stamps `State.StartedAt` with on
+ * Docker Desktop. Undefined when the stub left no record under either name it
+ * may use.
  */
 export function startObservation(session: ContainerInspect): StartObservation | undefined {
   const sessionId = session.Config?.Labels?.[SESSION_CONTAINER_LABELS.sessionId];

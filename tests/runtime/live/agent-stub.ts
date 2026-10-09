@@ -74,7 +74,8 @@ done`;
 /**
  * The agent's first instructions when it must record what it found at start:
  * whether `portFile` exists, and if so its contents, written to
- * `<directory>/<RUNFREE_SESSION_ID or $HOSTNAME>` (`absent` when it does not).
+ * `<directory>/<RUNFREE_SESSION_ID, else $HOSTNAME, else unknown>` (`absent`
+ * when it does not).
  *
  * The observation is the very first thing the stub does, before it creates
  * the directory or writes anything, so the record says what the agent's first
@@ -86,7 +87,7 @@ export function startObservationStub(directory: string, portFile: string): strin
   const quotedPortFile = `'${portFile.replaceAll("'", "'\\''")}'`;
   return `if [ -f ${quotedPortFile} ]; then observed_at_start="$(cat ${quotedPortFile})"; else observed_at_start=absent; fi
 observation_dir=${quotedDirectory}
-observation_name="\${RUNFREE_SESSION_ID:-$HOSTNAME}"
+observation_name="\${RUNFREE_SESSION_ID:-\${HOSTNAME:-unknown}}"
 mkdir -p "$observation_dir"
 printf '%s\\n' "$observed_at_start" > "$observation_dir/$observation_name.tmp"
 mv -f "$observation_dir/$observation_name.tmp" "$observation_dir/$observation_name"`;
