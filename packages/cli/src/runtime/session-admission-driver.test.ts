@@ -1834,6 +1834,8 @@ describe("internal session admission driver", () => {
     expect(failure).toBeInstanceOf(AggregateError);
     expect((failure as Error).message).toContain("in-flight branches settled after the lifecycle lock was lost");
     const [launchFailure, settleFailure] = (failure as AggregateError).errors;
+    // The launch's own typed failure stays reachable as the aggregate's cause.
+    expect((failure as AggregateError).cause).toBe(launchFailure);
     expect(String((launchFailure as Error).message) + JSON.stringify((launchFailure as AggregateError).errors?.map(String)))
       .toContain("running proof failed closed");
     expect((settleFailure as Error).message).toContain("test lifecycle lock is not held");
@@ -1844,11 +1846,23 @@ describe("internal session admission driver", () => {
 
   test("a launch that succeeded reports a final settle that finds the lock lost", async () => {
     const input = fixture();
+    const assertHeld = input.sessionLockManager.lock.assertHeld as Mock<() => void>;
+    const heldCheck = assertHeld.getMockImplementation() as () => void;
+    const launchChecked = deferred();
+    let launchFinalCheckPassed = false;
     mocks.removeSessionMetadata.mockImplementationOnce(() => {
       mocks.events.push("remove-session-evidence");
+      // The success path's evidence removal is followed directly by the
+      // launch's own final lock check; the lock is released only after that
+      // check passed, so only the final settle can find it lost.
+      assertHeld.mockImplementationOnce(() => {
+        heldCheck();
+        launchFinalCheckPassed = true;
+        launchChecked.release();
+      });
       // A branch still in flight after teardown, which loses the lock as it settles.
       mocks.taskScopes.at(-1)?.start("late-branch", async () => {
-        await new Promise((resolve) => setTimeout(resolve, 10));
+        await launchChecked.promise;
         input.sessionLockManager.lock.release();
         mocks.events.push("late-branch:settled");
       });
@@ -1859,7 +1873,10 @@ describe("internal session admission driver", () => {
       sessionIngress: recordingIngress(),
     });
 
-    await expect(driver.launchBuiltin("codex")).rejects.toThrow("test lifecycle lock is not held");
+    const failure = await driver.launchBuiltin("codex").catch((error: unknown) => error);
+    expect(launchFinalCheckPassed).toBe(true);
+    expect(failure).not.toBeInstanceOf(AggregateError);
+    expect((failure as Error).message).toBe("test lifecycle lock is not held");
     expect(mocks.events).toContain("late-branch:settled");
     expect(mocks.taskScopes.every((scope) => scope.pending() === 0)).toBe(true);
   });

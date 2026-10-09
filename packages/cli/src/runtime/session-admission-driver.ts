@@ -2574,9 +2574,13 @@ export function createInternalSessionAdmissionDriver(
     preparedRuntime: input.preparedRuntime,
     lifecycleLock,
     io: input.io,
-    // Only a handoff that may settle admission (`#settledByHandoff`) skips
-    // the marker re-read; any other runs the full preflight, so it re-reads
-    // the marker too.
+    // A handoff that may settle admission skips the marker re-read. The skip
+    // relies on lifecycle-lock continuity, which `consumePreparedRuntime`
+    // checks: this lock's owner token must be the handoff's, so no other
+    // holder can have changed the runtime since startup proved it. A
+    // warm-empty handoff that passes this peek but is refused when
+    // `#settledByHandoff` consumes it runs the full preflight without the
+    // re-read, on the same continuity.
     ...(handoffMaySettle(input.handoff) ? { handoff: input.handoff } : {}),
   });
   const resolvedInput = Object.freeze({
@@ -2663,9 +2667,12 @@ export function createInternalSessionAdmissionDriver(
     inFlight = false;
     if (!result.ok) {
       if (settleFailure) {
+        // The launch's failure leads and is also the cause, so a caller that
+        // inspects the cause still finds its typed error.
         throw new AggregateError(
           [result.failure, settleFailure.error],
           "session launch failed and its in-flight branches settled after the lifecycle lock was lost",
+          { cause: result.failure },
         );
       }
       throw result.failure;

@@ -4402,6 +4402,38 @@ describe("runtime command flow", () => {
       expect(fs.existsSync(recordPath(context))).toBe(true);
     });
 
+    test("a full-path launch whose reconcile repaired residue writes no warm-proof record", async () => {
+      const context = launchContext();
+      let orphanListings = 0;
+      let recordDuringReconcile: boolean | undefined;
+      const io = createRuntimeIO({
+        capture: (_command, args) => {
+          if (orphanListings === 0 || !servedSetRead(args)) return undefined;
+          orphanListings -= 1;
+          recordDuringReconcile = fs.existsSync(recordPath(context));
+          return captureResult(0, JSON.stringify([{ sessionKey: "c".repeat(64), name: `${"c".repeat(64)}.json`, malformed: true }]));
+        },
+      });
+      await warmedUp(context, io);
+      // Full path: a new proxy pid is a warm mismatch. The full validation
+      // passes, and then the reconcile finds an orphan session file and removes
+      // it. A record written before the reconcile would survive a crash
+      // during the repair, so none may exist while the reconcile runs.
+      process.env.FAKE_PROXY_PID = "5151";
+      orphanListings = 1;
+      const repairStart = io.calls.length;
+      expect((await startRuntime(context, io, false, { launch: true })).status).toBe(0);
+      expect(denyProbeRuns(io.calls.slice(repairStart))).toBe(1);
+      expect(orphanListings).toBe(0);
+      expect(recordDuringReconcile).toBe(false);
+      expect(fs.existsSync(recordPath(context))).toBe(false);
+      // The next launch takes the full path again and records.
+      const start = io.calls.length;
+      expect((await startRuntime(context, io, false, { launch: true })).status).toBe(0);
+      expect(denyProbeRuns(io.calls.slice(start))).toBe(1);
+      expect(fs.existsSync(recordPath(context))).toBe(true);
+    });
+
     test.each([
       ["a restarted proxy (new StartedAt)", { FAKE_PROXY_STARTED_AT: "2026-06-13T06:00:00.000Z" }],
       ["a new proxy process id", { FAKE_PROXY_PID: "5151" }],
