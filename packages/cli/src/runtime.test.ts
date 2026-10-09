@@ -183,6 +183,7 @@ import { generatedRuntimeContextIfAvailable } from "./runtime/images.ts";
 import { createRuntimeSecurityContract } from "./runtime/security-contract.ts";
 import { runtimeValidationMarkerStatus } from "./runtime/state.ts";
 import { LAUNCH_HANDOFF_STARTUP_SPAN_MAX_MS } from "./runtime/launch-lock-hold.ts";
+import { SESSION_CONTAINER_ABSENCE_FORMAT } from "./runtime/session-container-reconciliation.ts";
 import { flushWarnings, pendingWarningsForTest } from "./warnings.ts";
 import { readHostServicePortRegistry, recordProjectHostServicePorts } from "./host-service-registry.ts";
 import { projectLifecycleLockPath, tryAcquireProjectLifecycleLock, tryAcquireProjectLifecycleLockWithRetry } from "./runtime/sessions.ts";
@@ -1162,6 +1163,56 @@ function captureResult(status: number, stdout = "", stderr = ""): CaptureResult 
   return { status, stdout, stderr };
 }
 
+/** The proxy's served-set read: its session-file listing, not the firewall's section read. */
+const servedSetRead = (args: readonly string[]): boolean => args[0] === "exec"
+  && args.includes(FAKE_PROXY_CONTAINER_ID)
+  && args.join(" ").includes("fs.readdirSync(sessionsDir)")
+  && !args.join(" ").includes("RUNFREE_FIREWALL_SECTION");
+
+/** The host-wide session-container absence listing a warm handoff launch takes. */
+const absenceListing = (args: readonly string[]): boolean => args[0] === "ps"
+  && args.includes(SESSION_CONTAINER_ABSENCE_FORMAT);
+
+/** The warm proof's one root batch inside the proxy. */
+const warmProofBatch = (args: readonly string[]): boolean => args[0] === "exec"
+  && args.join(" ").includes("RUNFREE_FIREWALL_SECTION") && args.join(" ").includes("/proc/sys/kernel/random/boot_id");
+
+/**
+ * The Docker calls after a launch's warm-proof batch. Image cleanup, which
+ * runs before it, reads the same session-file listing and container inventory
+ * as the session reconcile, which runs after it.
+ */
+function dockerCallsAfterWarmProof(calls: readonly RuntimeIoCall[]): RuntimeIoCall[] {
+  const docker = calls.filter((call) => call.command === "docker");
+  const batch = docker.findIndex((call) => warmProofBatch(call.args));
+  if (batch < 0) throw new Error("the launch took no warm proof");
+  return docker.slice(batch + 1);
+}
+
+/** The reconcile's orphan inventory: every container id, running or not. */
+const orphanInventoryListing = (args: readonly string[]): boolean => args[0] === "ps"
+  && (args.includes("--all") || args.includes("-a"))
+  && args.includes("{{.ID}}");
+
+/**
+ * A container on the internal network beside the proxy, present while
+ * `FAKE_INTERNAL_PARTICIPANT_ROLE` names its `io.runfree.container-role`.
+ * Topology tolerates a project's session agents and ephemeral helpers there.
+ */
+const FAKE_EXTRA_PARTICIPANT_ID = "5".repeat(64);
+function fakeExtraParticipant(composeProject: string): Record<string, unknown> | undefined {
+  const role = process.env.FAKE_INTERNAL_PARTICIPANT_ROLE;
+  if (!role) return undefined;
+  return {
+    Id: FAKE_EXTRA_PARTICIPANT_ID,
+    Name: `/${composeProject}-participant`,
+    State: { Status: "running", Running: true },
+    Config: { Labels: { "io.runfree.project-id": composeProject.slice("runfree-".length), "io.runfree.container-role": role } },
+    HostConfig: {},
+    NetworkSettings: { Networks: { [`${composeProject}_agent_internal`]: { NetworkID: FAKE_AGENT_INTERNAL_NETWORK_ID } } },
+  };
+}
+
 function inspectMount(destination: string, mode: "ro" | "rw" | "tmpfs" = "rw"): {
   Destination: string;
   Mode?: string;
@@ -1742,7 +1793,13 @@ function createRuntimeIO(overrides: {
           },
         },
       ];
-      return captureResult(0, JSON.stringify(entries.filter((entry) => args.includes(entry.Id))));
+      const extra = fakeExtraParticipant(observedProject);
+      return captureResult(0, JSON.stringify([...entries, ...(extra ? [extra] : [])]
+        .filter((entry) => args.includes(entry.Id as string))));
+    }
+    // The warm proof inspects the internal network's other participants alone.
+    if (args[0] === "inspect" && args.includes(FAKE_EXTRA_PARTICIPANT_ID) && fakeExtraParticipant(observedProject)) {
+      return captureResult(0, JSON.stringify([fakeExtraParticipant(observedProject)]));
     }
     if (args[0] === "inspect" && args.includes(FAKE_AGENT_CONTAINER_ID)) {
       return captureResult(0, JSON.stringify([{
@@ -1764,6 +1821,9 @@ function createRuntimeIO(overrides: {
         // agent_internal; session agents attach transiently at admission.
         Containers: {
           [FAKE_PROXY_CONTAINER_ID]: { Name: `${observedProject}-proxy-1` },
+          ...(fakeExtraParticipant(observedProject)
+            ? { [FAKE_EXTRA_PARTICIPANT_ID]: { Name: `${observedProject}-participant` } }
+            : {}),
         },
       });
       if (args.includes(`${observedProject}_proxy_egress`)) networks.push({
@@ -1829,6 +1889,7 @@ function createRuntimeIO(overrides: {
         { exit: 0, body: process.env.FAKE_WARM_HOST_SERVICE_SET ?? hostServiceSetJson },
         { exit: 0, body: hostServiceGatewayStatus() ?? "" },
         { exit: 0, body: "0 81a4" },
+        { exit: Number(process.env.FAKE_WARM_SESSION_FILES_EXIT ?? "0"), body: process.env.FAKE_WARM_SESSION_FILES ?? "[]" },
       ];
       return captureResult(0, `${sections.map((section, index) => [
         `RUNFREE_FIREWALL_SECTION ${index} exit=${section.exit}`,
@@ -4012,6 +4073,11 @@ describe("runtime command flow", () => {
   });
 
   describe("held-lock launch handoff minting (sub-second launch plan Task 3)", () => {
+    afterEach(() => {
+      for (const key of ["FAKE_WARM_SESSION_FILES", "FAKE_WARM_SESSION_FILES_EXIT", "FAKE_INTERNAL_PARTICIPANT_ROLE"]) {
+        delete process.env[key];
+      }
+    });
     function launchContext(): RuntimeContext {
       const projectRoot = path.join(tmp, "project");
       const project = prepareProject(projectRoot);
@@ -4023,6 +4089,11 @@ describe("runtime command flow", () => {
         network: fixedNetwork,
       };
     }
+    /** The same context with `RUNFREE_TIMINGS=1`, so startup reports its timing details. */
+    const timed = (context: RuntimeContext): RuntimeContext => ({ ...context, env: { ...context.env, RUNFREE_TIMINGS: "1" } });
+    const timingDetails = (): string[] => vi.mocked(console.error).mock.calls.flat().map(String)
+      .filter((line) => line.includes("timing: startup:warm-empty") || line.includes("timing: startup:reconcile-sessions"))
+      .map((line) => line.slice(line.indexOf("timing: ")));
     const lockIsFree = (context: RuntimeContext): boolean => {
       const lock = tryAcquireProjectLifecycleLock(context);
       lock?.release();
@@ -4039,7 +4110,8 @@ describe("runtime command flow", () => {
       expect(lockIsFree(context)).toBe(false);
       const handoff = takeLaunchHandoff(warm.preparedRuntime);
       expect(handoff?.proxy.id).toBe(FAKE_PROXY_CONTAINER_ID);
-      expect(handoff?.inventoryClean).toBe(true);
+      // A warm proof matched and its evidence showed no session state.
+      expect(handoff?.sessionState.kind).toBe("warm-empty");
       // A warm proof matched, so the handoff carries the batch's IP listing
       // and the observed incarnation.
       expect(handoff?.ipAssignmentDigests).toEqual({});
@@ -4047,6 +4119,89 @@ describe("runtime command flow", () => {
       expect(takeLaunchHandoff(warm.preparedRuntime)).toBeUndefined();
       handoff?.lifecycleLock.release();
       expect(lockIsFree(context)).toBe(true);
+    });
+
+    test("a warm handoff launch with no session state skips the startup reconcile", async () => {
+      const context = launchContext();
+      const io = createRuntimeIO();
+      // Two launches: the second is warm and stamps the image-cleanup inputs,
+      // so the launch under test runs no image-cleanup pass, which reads the
+      // same session-file listing and container inventory the reconcile does.
+      expect((await startRuntime(context, io, false, { launch: true })).status).toBe(0);
+      expect((await startRuntime(context, io, false, { launch: true })).status).toBe(0);
+      const start = io.calls.length;
+      const warm = await startRuntime(timed(context), io, false, { launch: true, launchHandoff: true });
+      if (warm.kind !== "ready") throw new Error("warm launch failed");
+      const handoff = takeLaunchHandoff(warm.preparedRuntime);
+      try {
+        expect(handoff?.sessionState.kind).toBe("warm-empty");
+        expect(timingDetails()).toEqual(expect.arrayContaining([
+          "timing: startup:warm-empty empty",
+          "timing: startup:reconcile-sessions skipped warm-empty",
+        ]));
+        const calls = io.calls.slice(start).filter((call) => call.command === "docker");
+        expect(calls.filter((call) => warmProofBatch(call.args))).toHaveLength(1);
+        expect(calls.filter((call) => servedSetRead(call.args))).toHaveLength(0);
+        expect(calls.filter((call) => orphanInventoryListing(call.args))).toHaveLength(0);
+        expect(calls.filter((call) => absenceListing(call.args))).toHaveLength(1);
+      } finally {
+        handoff?.lifecycleLock.release();
+      }
+    });
+
+    test.each([
+      ["a session file the proxy holds", { FAKE_WARM_SESSION_FILES: JSON.stringify([{ sessionKey: "b".repeat(64), name: `${"b".repeat(64)}.json`, malformed: true }]) }, undefined, "session-files-present"],
+      ["an unreadable session-file listing", { FAKE_WARM_SESSION_FILES_EXIT: "1" }, undefined, "session-files-unreadable"],
+      ["an unparseable session-file listing", { FAKE_WARM_SESSION_FILES: "not json" }, undefined, "session-files-unreadable"],
+      ["a session agent on the internal network", { FAKE_INTERNAL_PARTICIPANT_ROLE: "session-agent" }, undefined, "session-participant"],
+      ["an ephemeral helper on the internal network", { FAKE_INTERNAL_PARTICIPANT_ROLE: "ephemeral-helper" }, undefined, "non-ingress-participant"],
+      ["a container that may be a session", {}, "present", "session-containers-present"],
+      ["an absence listing that timed out", {}, "timeout", "session-containers-unreadable"],
+    ] as const)("a warm handoff launch with %s reconciles as before", async (_label, env, absence, reason) => {
+      const context = launchContext();
+      const io = createRuntimeIO({
+        capture: (_command, args) => {
+          if (absence === undefined || !absenceListing(args)) return undefined;
+          if (absence === "timeout") return captureResult(124, "", "timed out");
+          return captureResult(0, `${JSON.stringify([
+            "6".repeat(64),
+            `runfree-${projectHash(context.projectRoot)}-session-x`,
+            "",
+            ...Array.from({ length: 13 }, () => ""),
+          ])}\n`);
+        },
+      });
+      // Present from the cold launch on, so the warm proof still matches.
+      Object.assign(process.env, env);
+      expect((await startRuntime(context, io, false, { launch: true })).status).toBe(0);
+      const start = io.calls.length;
+      const warm = await startRuntime(timed(context), io, false, { launch: true, launchHandoff: true });
+      if (warm.kind !== "ready") throw new Error("warm launch failed");
+      const handoff = takeLaunchHandoff(warm.preparedRuntime);
+      try {
+        // The warm proof matched; only the session-state evidence blocked.
+        expect(handoff?.proxy.pid).toBe(4242);
+        expect(timingDetails()).toContain(`timing: startup:warm-empty blocked:${reason}`);
+        expect(handoff?.sessionState.kind).toBe("reconciled");
+        // The reclamation: the startup reconcile ran after the warm proof.
+        const afterProof = dockerCallsAfterWarmProof(io.calls.slice(start));
+        expect(afterProof.filter((call) => servedSetRead(call.args)).length).toBeGreaterThan(0);
+        expect(afterProof.filter((call) => orphanInventoryListing(call.args)).length).toBeGreaterThan(0);
+      } finally {
+        handoff?.lifecycleLock.release();
+      }
+    });
+
+    test("a launch that does not ask for a handoff still reconciles", async () => {
+      const context = launchContext();
+      const io = createRuntimeIO();
+      expect((await startRuntime(context, io, false, { launch: true })).status).toBe(0);
+      const start = io.calls.length;
+      const warm = await startRuntime(context, io, false, { launch: true });
+      if (warm.kind !== "ready") throw new Error("warm launch failed");
+      const afterProof = dockerCallsAfterWarmProof(io.calls.slice(start));
+      expect(afterProof.filter((call) => servedSetRead(call.args)).length).toBeGreaterThan(0);
+      expect(afterProof.filter((call) => absenceListing(call.args))).toHaveLength(0);
     });
 
     test("a start that held the lock longer than a handoff may carry releases it and hands nothing off", async () => {
@@ -4141,7 +4296,7 @@ describe("runtime command flow", () => {
     const warmEnvKeys = [
       "FAKE_PROXY_STARTED_AT", "FAKE_PROXY_PID", "FAKE_DOCKER_DAEMON_ID", "FAKE_DOCKER_LIVE_RESTORE",
       "FAKE_WARM_NFT_TABLE", "FAKE_WARM_CAPBND", "FAKE_WARM_BATCH_UID", "FAKE_WARM_BOOT_ID", "FAKE_VOLUME_CREATED_AT",
-      "FAKE_WARM_HOST_SERVICE_SET",
+      "FAKE_WARM_HOST_SERVICE_SET", "FAKE_WARM_SESSION_FILES", "FAKE_WARM_SESSION_FILES_EXIT",
     ] as const;
     afterEach(() => {
       for (const key of warmEnvKeys) delete process.env[key];
@@ -4202,6 +4357,110 @@ describe("runtime command flow", () => {
       expect(denyProbeRuns(io.calls.slice(start))).toBe(1);
       const after = JSON.parse(fs.readFileSync(recordPath(context), "utf8")) as { writtenAt: string };
       expect(Date.parse(after.writtenAt)).toBeGreaterThanOrEqual(Date.parse(before.writtenAt));
+    });
+
+    test("a startup whose session reconcile fails writes no warm-proof record, and the next launch reclaims", async () => {
+      const context = launchContext();
+      let failListing = false;
+      const io = createRuntimeIO({
+        capture: (_command, args) => (failListing && servedSetRead(args) ? captureResult(1, "", "proxy gone") : undefined),
+      });
+      await warmedUp(context, io);
+      // Full path: a new proxy pid is a warm mismatch; image cleanup inputs are unchanged.
+      process.env.FAKE_PROXY_PID = "5151";
+      failListing = true;
+      expect((await startRuntime(context, io, false, { launch: true })).status).toBe(1);
+      expect(pendingWarningsForTest().map((event) => event.message).join("\n")).toContain("could not report its session files");
+      expect(fs.existsSync(recordPath(context))).toBe(false);
+      // Reclamation: the proxy answers again; the full path records, the next launch is warm.
+      failListing = false;
+      const start = io.calls.length;
+      expect((await startRuntime(context, io, false, { launch: true })).status).toBe(0);
+      expect(denyProbeRuns(io.calls.slice(start))).toBe(1);
+      expect(fs.existsSync(recordPath(context))).toBe(true);
+      const warmStart = io.calls.length;
+      expect((await startRuntime(context, io, false, { launch: true })).status).toBe(0);
+      expect(denyProbeRuns(io.calls.slice(warmStart))).toBe(0);
+    });
+
+    test("a warm launch whose reconcile fails removes the warm-proof record, and the next launch reclaims", async () => {
+      const context = launchContext();
+      let failListing = false;
+      const io = createRuntimeIO({
+        capture: (_command, args) => (failListing && servedSetRead(args) ? captureResult(1, "", "proxy gone") : undefined),
+      });
+      await warmedUp(context, io);
+      // Warm match: the failing launch skips the full validation.
+      failListing = true;
+      const failStart = io.calls.length;
+      expect((await startRuntime(context, io, false, { launch: true })).status).toBe(1);
+      expect(denyProbeRuns(io.calls.slice(failStart))).toBe(0);
+      expect(pendingWarningsForTest().map((event) => event.message).join("\n")).toContain("could not report its session files");
+      expect(fs.existsSync(recordPath(context))).toBe(false);
+      // Reclamation: the proxy answers again; the full path records, the next launch is warm.
+      failListing = false;
+      const start = io.calls.length;
+      expect((await startRuntime(context, io, false, { launch: true })).status).toBe(0);
+      expect(denyProbeRuns(io.calls.slice(start))).toBe(1);
+      expect(fs.existsSync(recordPath(context))).toBe(true);
+      const warmStart = io.calls.length;
+      expect((await startRuntime(context, io, false, { launch: true })).status).toBe(0);
+      expect(denyProbeRuns(io.calls.slice(warmStart))).toBe(0);
+    });
+
+    test("a reconcile that repaired residue leaves no warm-proof record", async () => {
+      const context = launchContext();
+      let orphanListings = 0;
+      const io = createRuntimeIO({
+        capture: (_command, args) => {
+          if (orphanListings === 0 || !servedSetRead(args)) return undefined;
+          orphanListings -= 1;
+          return captureResult(0, JSON.stringify([{ sessionKey: "b".repeat(64), name: `${"b".repeat(64)}.json`, malformed: true }]));
+        },
+      });
+      await warmedUp(context, io);
+      // An orphan session file the reconcile removes (a failed delete only warns).
+      orphanListings = 1;
+      expect((await startRuntime(context, io, false, { launch: true })).status).toBe(0);
+      expect(orphanListings).toBe(0);
+      expect(fs.existsSync(recordPath(context))).toBe(false);
+      // The next launch takes the full path and records again.
+      const start = io.calls.length;
+      expect((await startRuntime(context, io, false, { launch: true })).status).toBe(0);
+      expect(denyProbeRuns(io.calls.slice(start))).toBe(1);
+      expect(fs.existsSync(recordPath(context))).toBe(true);
+    });
+
+    test("a full-path launch whose reconcile repaired residue writes no warm-proof record", async () => {
+      const context = launchContext();
+      let orphanListings = 0;
+      let recordDuringReconcile: boolean | undefined;
+      const io = createRuntimeIO({
+        capture: (_command, args) => {
+          if (orphanListings === 0 || !servedSetRead(args)) return undefined;
+          orphanListings -= 1;
+          recordDuringReconcile = fs.existsSync(recordPath(context));
+          return captureResult(0, JSON.stringify([{ sessionKey: "c".repeat(64), name: `${"c".repeat(64)}.json`, malformed: true }]));
+        },
+      });
+      await warmedUp(context, io);
+      // Full path: a new proxy pid is a warm mismatch. The full validation
+      // passes, and then the reconcile finds an orphan session file and removes
+      // it. A record written before the reconcile would survive a crash
+      // during the repair, so none may exist while the reconcile runs.
+      process.env.FAKE_PROXY_PID = "5151";
+      orphanListings = 1;
+      const repairStart = io.calls.length;
+      expect((await startRuntime(context, io, false, { launch: true })).status).toBe(0);
+      expect(denyProbeRuns(io.calls.slice(repairStart))).toBe(1);
+      expect(orphanListings).toBe(0);
+      expect(recordDuringReconcile).toBe(false);
+      expect(fs.existsSync(recordPath(context))).toBe(false);
+      // The next launch takes the full path again and records.
+      const start = io.calls.length;
+      expect((await startRuntime(context, io, false, { launch: true })).status).toBe(0);
+      expect(denyProbeRuns(io.calls.slice(start))).toBe(1);
+      expect(fs.existsSync(recordPath(context))).toBe(true);
     });
 
     test.each([

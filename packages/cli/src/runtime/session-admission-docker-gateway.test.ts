@@ -147,4 +147,52 @@ describe("session admission Docker gateway", () => {
       expect(serialized).not.toContain(forbidden);
     }
   });
+  test("counts and records a Docker captureAsync call once, over its whole run", async () => {
+    const io = runtimeIo();
+    const captureAsync = vi.fn(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      return { status: 0, stdout: "x", stderr: "" };
+    });
+    io.captureAsync = captureAsync;
+    const histogram = createOperationHistogram();
+    const gateway = createSessionAdmissionDockerGateway({
+      io,
+      histogram,
+      foregroundSpawner: vi.fn(() => ({} as SessionContainerForegroundChild)),
+    });
+
+    const pending = gateway.io.captureAsync?.("docker", ["container", "inspect", "x"], { timeout: 5 });
+    // Counted when the call starts, not when it settles.
+    expect(gateway.dockerOperationCount()).toBe(1);
+    await expect(pending).resolves.toEqual({ status: 0, stdout: "x", stderr: "" });
+    await gateway.io.captureAsync?.("git", ["status"]);
+    expect(captureAsync).toHaveBeenCalledWith("docker", ["container", "inspect", "x"], { timeout: 5 });
+    expect(captureAsync).toHaveBeenCalledWith("git", ["status"], undefined);
+    expect(gateway.dockerOperationCount()).toBe(1);
+    const bucket = histogram.snapshot()["docker container inspect"];
+    expect(bucket?.count).toBe(1);
+    expect(bucket?.totalMs).toBeGreaterThanOrEqual(15);
+  });
+
+  test("a rejected Docker captureAsync call is counted and recorded once", async () => {
+    const io = runtimeIo();
+    io.captureAsync = vi.fn(async () => { throw new Error("budget ended"); });
+    const histogram = createOperationHistogram();
+    const gateway = createSessionAdmissionDockerGateway({
+      io,
+      histogram,
+      foregroundSpawner: vi.fn(() => ({} as SessionContainerForegroundChild)),
+    });
+    await expect(gateway.io.captureAsync?.("docker", ["ps"])).rejects.toThrow("budget ended");
+    expect(gateway.dockerOperationCount()).toBe(1);
+    expect(histogram.snapshot()["docker ps"]?.count).toBe(1);
+  });
+
+  test("exposes no captureAsync when the inner IO has none", () => {
+    const gateway = createSessionAdmissionDockerGateway({
+      io: runtimeIo(),
+      foregroundSpawner: vi.fn(() => ({} as SessionContainerForegroundChild)),
+    });
+    expect("captureAsync" in gateway.io).toBe(false);
+  });
 });

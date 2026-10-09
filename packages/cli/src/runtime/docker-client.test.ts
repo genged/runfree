@@ -1,6 +1,6 @@
 import { describe, expect, test } from "vitest";
 
-import { createDockerClient, labelRunFlags, type DockerIo } from "./docker-client.ts";
+import { createAsyncDockerClient, createDockerClient, labelRunFlags, type DockerCaptureMethods, type DockerIo } from "./docker-client.ts";
 import type { CaptureResult } from "./types.ts";
 
 type Call = { mode: "capture" | "run"; command: string; args: string[]; options: unknown };
@@ -83,6 +83,63 @@ describe("docker client argv", () => {
       expect(calls).toEqual([{ mode: "run", command: "docker", args: argv, options: {} }]);
     });
   }
+});
+
+describe("async docker client", () => {
+  type Recorded = { command: string; args: string[]; options: unknown };
+  const methodCases: Array<[string, <R>(c: DockerCaptureMethods<R>) => R]> = [
+    ["info", (c) => c.info("{{json .}}", { timeout: 9 })],
+    ["inspect", (c) => c.inspect([ID, "b"], { type: "container", format: "{{.Id}}" }, { maxBuffer: 4 })],
+    ["listContainers", (c) => c.listContainers({ all: true, quiet: true, noTrunc: true, filters: ["label=a"], format: "{{.ID}}" })],
+    ["listObjects", (c) => c.listObjects("volume", { quiet: true, filters: ["label=v"], reference: "r" })],
+    ["logs", (c) => c.logs(ID, { tail: 3, since: "s" })],
+    ["exec", (c) => c.exec(ID, ["cat", "/x"], { interactive: true, user: "0:0", env: ["A=1"] }, { input: "in", killSignal: "SIGKILL" })],
+    ["runContainer", (c) => c.runContainer([["--rm"], ["-p", "127.0.0.1:1:2"], ["--label", "a=b"]], "img", ["true"])],
+    ["removeContainers", (c) => c.removeContainers([ID], { force: true })],
+    ["stopContainers", (c) => c.stopContainers([ID], 2)],
+    ["startContainer", (c) => c.startContainer(ID)],
+    ["restartContainer", (c) => c.restartContainer(ID)],
+    ["createNetwork", (c) => c.createNetwork("n", ["a=b"])],
+    ["connectNetwork", (c) => c.connectNetwork("n", ID)],
+    ["removeNetworks", (c) => c.removeNetworks(["n", "m"])],
+    ["createVolume", (c) => c.createVolume("v", ["a=b"])],
+    ["removeVolumes", (c) => c.removeVolumes(["v"])],
+  ];
+
+  test("covers every capture method of the sync client", () => {
+    const { io } = recordingIo();
+    const { terminal: _terminal, ...methods } = createDockerClient(io);
+    expect(methodCases.map(([name]) => name).sort()).toEqual(Object.keys(methods).sort());
+  });
+
+  for (const [name, call] of methodCases) {
+    test(`${name} produces the same argv and merged options as the sync client`, async () => {
+      const base = { env: { PATH: "/bin" }, timeout: 1000 };
+      const syncCalls: Recorded[] = [];
+      const asyncCalls: Recorded[] = [];
+      const result: CaptureResult = { status: 0, stdout: "out", stderr: "" };
+      const syncClient = createDockerClient({ capture: (command, args, options) => {
+        syncCalls.push({ command, args: [...args], options });
+        return result;
+      } }, base);
+      const asyncClient = createAsyncDockerClient({ captureAsync: async (command, args, options) => {
+        asyncCalls.push({ command, args: [...args], options });
+        return result;
+      } }, base);
+      call(syncClient);
+      await expect(call(asyncClient)).resolves.toBe(result);
+      expect(asyncCalls).toEqual(syncCalls);
+      expect(asyncCalls).toHaveLength(1);
+    });
+  }
+
+  test("an IO without captureAsync refuses on first call, with no sync fallback", () => {
+    const { io, calls } = recordingIo();
+    const client = createAsyncDockerClient(io as Readonly<{ captureAsync?: never }>);
+    expect(() => client.info()).toThrow("this IO cannot run Docker calls concurrently");
+    expect(() => createAsyncDockerClient({}).listContainers({ quiet: true })).toThrow("this IO cannot run Docker calls concurrently");
+    expect(calls).toEqual([]);
+  });
 });
 
 describe("docker client options", () => {

@@ -172,6 +172,7 @@ import {
   type PreparedRuntime,
 } from "./prepared-runtime.ts";
 import { sessionRegistryDigest } from "./launch-handoff.ts";
+import { consumeWarmEmptySessionState, isWarmEmptySessionState } from "./warm-empty-session-state.ts";
 import { createRuntimeDocker } from "./docker.ts";
 import { createDockerClient } from "./docker-client.ts";
 import {
@@ -191,7 +192,13 @@ import {
   removeOrphanSessionMcpCallbackIngress,
   removeSessionMcpCallbackIngress,
 } from "./session-callback-ingress.ts";
-import { sessionMcpCallbackLifecycle, type SessionIngressLifecycle } from "./session-mcp-callback.ts";
+import {
+  type SessionCallbackOwner,
+  type SessionCallbackReservation,
+  sessionMcpCallbackLifecycle,
+  type SessionIngressLifecycle,
+} from "./session-mcp-callback.ts";
+import { createTaskScope, type ScopedTask } from "./task-scope.ts";
 import { launchLockHoldDeadline, RUNNING_PROOF_TIMEOUT_MS } from "./launch-lock-hold.ts";
 import { remedy } from "../remedies.ts";
 
@@ -531,6 +538,18 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
    * the record — and with it the address the ingress targets.
    */
   #ingressMayExist = false;
+  /**
+   * Every branch this launch runs beside its foreground steps. Cleanup,
+   * teardown, and the launch's return each settle it first, under the
+   * lifecycle lock, so no Docker call outlives the lock or races a cleanup.
+   */
+  readonly #tasks = createTaskScope({ assertHeld: () => this.#lock() });
+  /** The session ingress whose reservation is running beside the session container's start. */
+  #ingress?: Readonly<{
+    lifecycle: SessionIngressLifecycle;
+    owner: SessionCallbackOwner;
+    reservation: ScopedTask<SessionCallbackReservation>;
+  }>;
   #displayIdentity?: Readonly<{ displayName: string; command: string; agentCommand: string }>;
   #sessionEvidence?: SessionMetadata;
 
@@ -1314,7 +1333,7 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
 
   #settledByHandoff(): LaunchHandoff | undefined {
     const handoff = this.#input.handoff;
-    if (!handoff || !handoff.inventoryClean) return undefined;
+    if (!handoff || !handoffMaySettle(handoff)) return undefined;
     this.#lock();
     const proxyId = this.#controlPlane().proxyContainerId;
     if (handoff.proxy.id !== proxyId) return undefined;
@@ -1336,6 +1355,18 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
     if (inspected.status !== 0 || typeof startedAt !== "string") return undefined;
     if (running !== true || startedAt !== handoff.proxy.startedAt) {
       throw new StalePreparedRuntimeError("the proxy restarted after startup prepared this launch");
+    }
+    // A warm-empty state settles admission once, and only bound to exactly
+    // what was just re-proved: the registry, the proxy incarnation, and this
+    // held lock. One that does not consume runs the full preflight.
+    const state = handoff.sessionState;
+    if (state.kind === "warm-empty" && !consumeWarmEmptySessionState(state, {
+      registryDigest: handoff.registryDigest,
+      proxyId,
+      proxyStartedAt: handoff.proxy.startedAt,
+      lockOwnerToken: this.#input.lifecycleLock.ownerToken,
+    })) {
+      return undefined;
     }
     return handoff;
   }
@@ -1421,15 +1452,21 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
       networkName: authority.networkName,
       subnet: authority.subnet,
     });
-    // Sub-second launch plan Task 3: startup ran this same reconcile under the
-    // lock this launch still holds. When nothing it saw needed repair and the
-    // registry and proxy incarnation are still exactly what it left, repeating
-    // it (and the orphan sweep) would observe the same state again. A settled
-    // reconcile revoked no dead owner and removed no orphan container, so no
-    // callback forwarder went away since the participant proof above was taken.
+    // Startup settled the project's sessions under the lock this launch still
+    // holds, in one of two ways. Either its reconcile saw nothing that needed
+    // repair, or its warm evidence proved there were no session files, no
+    // session participants, no records, and no session containers, so it had
+    // nothing to reconcile. Either way, while the registry and proxy
+    // incarnation are still exactly what it left, repeating the reconcile (and
+    // the orphan sweep) would observe the same state again. Neither path
+    // revoked a dead owner or removed an orphan container, so no callback
+    // forwarder went away since the participant proof above was taken.
     const settledByHandoff = this.#settledByHandoff();
     if (settledByHandoff) {
-      this.#reservedSessionFileIps = settledByHandoff.reservedSourceIps;
+      // A warm-empty state saw no session file, so no address is reserved.
+      this.#reservedSessionFileIps = settledByHandoff.sessionState.kind === "reconciled"
+        ? settledByHandoff.sessionState.reservedSourceIps
+        : [];
       this.#handoffIpAssignments = settledByHandoff.ipAssignmentDigests;
       this.#lock();
       this.#assertNoQuarantinedSessionRecords();
@@ -1713,6 +1750,11 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
     this.#record = provisioning;
     this.#persistedRecord = provisioning;
     this.#plan = provisioningPlan;
+    // The durable record now names the exact container, so the reservation can
+    // bind its forwarder to it. It runs beside the evidence write, the
+    // foreground start, and the running proof, and finishes before them: it
+    // starts first and its budget is no longer than the proof's.
+    this.#startSessionIngressReservation(provisioning);
     const command = sessionContainerStartAttachCommand(provisioningPlan.record, provisioningPlan.expectedProject);
     // Host session evidence is written before the foreground spawn, matching
     // the legacy attach path: a host client killed while the start is in
@@ -2100,32 +2142,60 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
   activate = async (): Promise<void> => {
     this.#lock();
     const provisioning = this.#require(this.#provisioningAuthorization, "provisioning-running authority");
-    await this.#prepareSessionIngress(provisioning.record);
+    await this.#completeSessionIngress();
     this.#lock();
     await this.#admitThroughSessionFile(provisioning.record);
   };
 
   /**
-   * Sets up the session-owned ingress (the MCP OAuth callback path) while the
-   * session entry still waits, so no client starts before its callback port
-   * exists. Launch mode only; a failure fails the launch and the unadmitted
-   * cleanup that follows proves the ingress gone before the record goes.
+   * Starts reserving the session-owned ingress (the MCP OAuth callback port)
+   * beside the session container's start. Launch mode only. Ingress intent is
+   * recorded before the reservation's first effect, so every failure path
+   * proves the ingress gone before the record — and with it the address the
+   * ingress targets — is released.
    */
-  #prepareSessionIngress = async (record: SessionContainerRecordV2): Promise<void> => {
+  #startSessionIngressReservation(record: SessionContainerRecordV2): void {
     if (!this.#launch) return;
     const lifecycle = this.#input.sessionIngress === undefined
       ? sessionMcpCallbackLifecycle(this.#input.context, this.#gateway.io)
       : this.#input.sessionIngress;
     if (!lifecycle) return;
-    const containerId = this.#require(record.containerId, "session container id");
-    this.#ingressMayExist = true;
-    await lifecycle.prepare({
+    const owner: SessionCallbackOwner = Object.freeze({
       sessionId: record.sessionId,
-      containerId,
+      containerId: this.#require(record.containerId, "session container id"),
       sourceIp: record.sourceIp,
       internalNetwork: this.#network().networkName,
     });
+    this.#lock();
+    this.#ingressMayExist = true;
+    this.#ingress = Object.freeze({
+      lifecycle,
+      owner,
+      reservation: this.#tasks.start("session-ingress-reserve", () => lifecycle.reserve(owner)),
+    });
+  }
+
+  /**
+   * Completes the reserved ingress after the running proof and before the
+   * session file: attaches it, starts the in-session bridge (which announces
+   * the port), and proves the path, while the session entry still waits, so
+   * no client starts before its callback port exists. A failure of either
+   * phase fails the launch, and the unadmitted cleanup that follows proves
+   * the ingress gone before the record goes.
+   */
+  #completeSessionIngress = async (): Promise<void> => {
+    const ingress = this.#ingress;
+    if (!ingress) return;
+    const reserved = await ingress.reservation.result();
+    this.#lock();
+    await ingress.lifecycle.complete(ingress.owner, reserved);
   };
+
+  /** Waits for every branch started beside the foreground steps, then asserts the lock. */
+  settleTasks = (): Promise<void> => this.#tasks.settleAll();
+
+  /** How many branches started beside the foreground steps are still in flight. */
+  pendingTasks = (): number => this.#tasks.pending();
 
   /**
    * Holds the session for the life of the attached process, beating its file.
@@ -2229,8 +2299,14 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
    */
   provisioningMayBeSelected = (): boolean => this.#fileMayExist;
 
+  /** Whether unadmitted cleanup will prove this session's ingress gone before its record. */
+  ingressMayExist = (): boolean => this.#ingressMayExist;
+
   cleanupUnadmitted = async (): Promise<void> => {
     this.#lock();
+    // A reservation still in flight may yet create a forwarder; nothing is
+    // removed until it has settled.
+    await this.#tasks.settleAll();
     const preflight = this.#require(this.#preflight, "canonical preflight");
     const record = this.#record;
     if (!record) return;
@@ -2370,6 +2446,7 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
 
   tearDown = async (): Promise<void> => {
     this.#lock();
+    await this.#tasks.settleAll();
     await this.#tearDownSessionFileSession();
   };
 
@@ -2463,6 +2540,18 @@ function timedSessionAdmissionLaunchSteps(
 }
 
 /**
+ * Whether a handoff may settle admission without its full preflight: a
+ * reconcile that saw only settled state, or a warm-empty state this process
+ * minted and nobody has consumed. A peek only; `#settledByHandoff` consumes.
+ */
+function handoffMaySettle(handoff: LaunchHandoff | undefined): boolean {
+  if (!handoff) return false;
+  return handoff.sessionState.kind === "reconciled"
+    ? handoff.sessionState.inventoryClean
+    : isWarmEmptySessionState(handoff.sessionState);
+}
+
+/**
  * Creates the production adapter for the internal admission proof gate.
  *
  * Its only public operation is a built-in probe. All Docker targets, lifecycle
@@ -2485,9 +2574,14 @@ export function createInternalSessionAdmissionDriver(
     preparedRuntime: input.preparedRuntime,
     lifecycleLock,
     io: input.io,
-    // Only a clean handoff settles admission (`#settledByHandoff`); an
-    // unclean one runs the full preflight, so it re-reads the marker too.
-    ...(input.handoff?.inventoryClean ? { handoff: input.handoff } : {}),
+    // A handoff that may settle admission skips the marker re-read. The skip
+    // relies on lifecycle-lock continuity, which `consumePreparedRuntime`
+    // checks: this lock's owner token must be the handoff's, so no other
+    // holder can have changed the runtime since startup proved it. A
+    // warm-empty handoff that passes this peek but is refused when
+    // `#settledByHandoff` consumes it runs the full preflight without the
+    // re-read, on the same continuity.
+    ...(handoffMaySettle(input.handoff) ? { handoff: input.handoff } : {}),
   });
   const resolvedInput = Object.freeze({
     ...input,
@@ -2525,7 +2619,7 @@ export function createInternalSessionAdmissionDriver(
     const timings = createRuntimeTimings(resolvedInput.context.env);
     const histogram = timings.enabled ? createOperationHistogram() : undefined;
     let steps: InternalBuiltinAdmissionProbeSteps | undefined;
-    try {
+    const attempt = async (): Promise<SessionAdmissionLaunchOutcome> => {
       steps = stepsFor(kind, options, histogram);
       const launchSteps = histogram ? timedSessionAdmissionLaunchSteps(steps, timings, histogram, steps.lockHoldMs) : steps;
       try {
@@ -2546,13 +2640,45 @@ export function createInternalSessionAdmissionDriver(
         }
         throw failure;
       }
-    } finally {
-      if (timings.enabled && steps) {
-        timings.report("session-admission", `docker-operations=${steps.dockerOperationCount()}`);
-        timings.report("teardown-path", steps.teardownPath());
-      }
-      inFlight = false;
+    };
+    let result: Readonly<{ ok: true; outcome: SessionAdmissionLaunchOutcome }> | Readonly<{ ok: false; failure: unknown }>;
+    try {
+      result = { ok: true, outcome: await attempt() };
+    } catch (failure) {
+      result = { ok: false, failure };
     }
+    // Every cleanup path settles the launch's branches first; this is the
+    // backstop, so nothing started under the lock outlives the launch that
+    // holds it. It always waits for every branch still in flight. A settle
+    // that then finds the lock lost never hides the launch's own failure: it
+    // is reported beside it, and alone only when nothing else failed.
+    let settleFailure: Readonly<{ error: unknown }> | undefined;
+    try {
+      const settling = steps as InternalBuiltinAdmissionProbeSteps | undefined;
+      if (settling && settling.pendingTasks() > 0) await settling.settleTasks();
+    } catch (error) {
+      settleFailure = { error };
+    }
+    const finished = steps as InternalBuiltinAdmissionProbeSteps | undefined;
+    if (timings.enabled && finished) {
+      timings.report("session-admission", `docker-operations=${finished.dockerOperationCount()}`);
+      timings.report("teardown-path", finished.teardownPath());
+    }
+    inFlight = false;
+    if (!result.ok) {
+      if (settleFailure) {
+        // The launch's failure leads and is also the cause, so a caller that
+        // inspects the cause still finds its typed error.
+        throw new AggregateError(
+          [result.failure, settleFailure.error],
+          "session launch failed and its in-flight branches settled after the lifecycle lock was lost",
+          { cause: result.failure },
+        );
+      }
+      throw result.failure;
+    }
+    if (settleFailure) throw settleFailure.error;
+    return result.outcome;
   };
   return Object.freeze({
     async probeBuiltin(agent: SessionAdmissionProbeAgent) {

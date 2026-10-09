@@ -14,7 +14,7 @@ import { runfreeLog, warn } from "../warnings.ts";
 import { waitForProxyFirewallReadiness } from "./proxy-firewall-readiness.ts";
 import { planValidatedIngressForwardersForRebuild } from "./ingress-forwarder-ownership.ts";
 import { reclaimStaleSessionMcpCallbackForwarders } from "./session-callback-ingress.ts";
-import { prepareEffectiveControlsForStartup } from "../control/workflow.ts";
+import { prepareEffectiveControlsForLaunch } from "../control/workflow.ts";
 import {
   convergeEffectivePolicyGeneration,
   effectiveControlSelectionForGeneration,
@@ -184,6 +184,7 @@ import { imageCleanupStampMatches, writeImageCleanupStamp } from "./image-cleanu
 import { createOperationHistogram, withOperationHistogram } from "./operation-histogram.ts";
 import { remedy } from "../remedies.ts";
 import { sessionRegistryDigest } from "./launch-handoff.ts";
+import { proveWarmEmptySessionState, type WarmEmptySessionState } from "./warm-empty-session-state.ts";
 import { setMcpLogContext } from "./mcp.ts";
 
 const RETAINED_AGENT_TEMPLATE_REMEDY =
@@ -1240,7 +1241,7 @@ export async function startRuntime(
     }
     reportRuntimeProgress("preparing approved effective controls", verbose);
     try {
-      const preparedControls = await timings.timeAsync("control-preparation", () => prepareEffectiveControlsForStartup(context, io, {
+      const preparedControls = await timings.timeAsync("control-preparation", () => prepareEffectiveControlsForLaunch(context, io, {
         useApprovedPolicy: rebuildOptions.useApprovedPolicy,
       }));
       reportRuntimeVerbose(
@@ -1601,14 +1602,22 @@ export async function startRuntime(
       // never asked to prove or select from warm evidence.
       heldLifecycleLock.assertHeld();
       const warm = warmValidationForLaunch();
+      const dropWarmRecord = (why: string): void => {
+        try {
+          removeWarmProofRecord(activePlan.paths.stateDir);
+        } catch (error) {
+          warn(`the warm-proof record could not be removed after ${why}: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      };
       let validation: RuntimeTokenSyncPreparation | undefined;
       let runtimeProof: RuntimeValidationProof | undefined;
       if (warm) {
         assertWarmValidation(warm);
         runtimeProof = warm.runtimeProof;
       } else {
-        // The record goes before the full path runs, so a validation that
-        // fails anywhere below leaves no record a later launch could match.
+        // The record goes before the full path runs and is written again only
+        // after the session reconcile below, so a validation that fails
+        // anywhere below leaves no record a later launch could match.
         try {
           removeWarmProofRecord(activePlan.paths.stateDir);
         } catch (error) {
@@ -1661,17 +1670,9 @@ export async function startRuntime(
         warn(error instanceof Error ? error.message : String(error));
         return result(1, false, activeContext);
       }
-      // A full validation just proved the runtime and the selection matches
-      // it: record the warm-proof facts for the next launch (runfree up and
-      // launches alike; never a rebuild). Best effort.
-      if (!warm && !removeExisting) {
-        const input = warmProofInput();
-        const recorded = input ? recordWarmRuntimeProof(input) : "the warm-proof inputs are unavailable";
-        timings.report("validation:warm-proof", recorded === "written" ? "recorded" : "not-recorded");
-        if (recorded !== "written") reportRuntimeVerbose(verbose, `warm-proof record not written: ${recorded}`);
-      }
       let proxyStartedAt: string | undefined;
       let reconciled: SessionReconcileResult | undefined;
+      let warmEmpty: WarmEmptySessionState | undefined;
       // Invariant 9, widen-before-new-files: the proxy is proven ready and the
       // control plane is selected, so publish the project's session eligibility
       // before anything waits on session admission. A proxy holding no
@@ -1704,25 +1705,66 @@ export async function startRuntime(
         // held and before any session can be admitted. It follows the
         // publication above, which widened the admitted set; step 5 of the
         // reconcile narrows it again once the residue is gone.
-        reconciled = await timings.timeAsync("startup:reconcile-sessions", () => reconcileSessions({
-          stateDir: activePlan.paths.stateDir,
-          expectedProject: { projectId: activePlan.projectId, composeProject: project },
-          io,
-          proxyId: runtimeProof.proxyId,
-          network: {
-            networkId: effective.selection.networkIds.agentInternal,
-            networkName: `${project}_agent_internal`,
-            subnet: activePlan.network.subnet,
-          },
-          env: activeContext.env,
-          lifecycleLock: heldLifecycleLock,
-          mode: "repair",
-          dockerOptions: dockerClientEnvOptions(activeContext),
-        }));
+        //
+        // A warm launch that will hand this lock to its admission skips the
+        // reconcile only when its own evidence proves there is nothing to
+        // reconcile: no proxy session file, no session participant, no
+        // lifecycle or quarantined record, and no container that may be a
+        // session. The publication above already used that empty registry,
+        // so nothing is left to narrow. Anything short of that reconciles.
+        if (warm && rebuildOptions.launchHandoff === true && rebuildOptions.launch === true && !removeExisting
+          && acquiredLifecycleLock !== undefined) {
+          const verdict = timings.time("startup:warm-empty-check", () => proveWarmEmptySessionState({
+            warm,
+            io,
+            stateDir: activePlan.paths.stateDir,
+            expectedProject: { projectId: activePlan.projectId, composeProject: project },
+            proxyId: runtimeProof.proxyId,
+            proxyStartedAt: observedProxyStartedAt,
+            lifecycleLock: heldLifecycleLock,
+            dockerOptions: dockerClientEnvOptions(activeContext),
+          }));
+          timings.report("startup:warm-empty", verdict.kind === "empty" ? "empty" : `blocked:${verdict.reason}`);
+          if (verdict.kind === "empty") warmEmpty = verdict.state;
+        }
+        if (warmEmpty) {
+          timings.report("startup:reconcile-sessions", "skipped warm-empty");
+        } else {
+          reconciled = await timings.timeAsync("startup:reconcile-sessions", () => reconcileSessions({
+            stateDir: activePlan.paths.stateDir,
+            expectedProject: { projectId: activePlan.projectId, composeProject: project },
+            io,
+            proxyId: runtimeProof.proxyId,
+            network: {
+              networkId: effective.selection.networkIds.agentInternal,
+              networkName: `${project}_agent_internal`,
+              subnet: activePlan.network.subnet,
+            },
+            env: activeContext.env,
+            lifecycleLock: heldLifecycleLock,
+            mode: "repair",
+            dockerOptions: dockerClientEnvOptions(activeContext),
+          }));
+        }
         heldLifecycleLock.assertHeld();
       } catch (error) {
         warn(error instanceof Error ? error.message : String(error));
+        dropWarmRecord("a session reconcile that did not complete");
         return result(1, false, activeContext);
+      }
+      // The record is written only after a reconcile that found nothing to
+      // repair: a record taken earlier could bind a participant the reconcile
+      // was about to remove, and a later launch would match it while that
+      // container still runs. A full validation just proved the runtime and
+      // the selection matches it, so record the warm-proof facts for the next
+      // launch (runfree up and launches alike; never a rebuild). Best effort.
+      if (reconciled && !reconciled.inventoryClean) {
+        dropWarmRecord("a session reconcile that repaired residue");
+      } else if (!warm && !removeExisting && reconciled?.inventoryClean) {
+        const input = warmProofInput();
+        const recorded = input ? recordWarmRuntimeProof(input) : "the warm-proof inputs are unavailable";
+        timings.report("validation:warm-proof", recorded === "written" ? "recorded" : "not-recorded");
+        if (recorded !== "written") reportRuntimeVerbose(verbose, `warm-proof record not written: ${recorded}`);
       }
       // A warm proxy that kept its container id can still have restarted in
       // place, taking its session-file directory and eligibility with it. The
@@ -1748,7 +1790,7 @@ export async function startRuntime(
       const handoffLock = acquiredLifecycleLock;
       const launchHandoff: LaunchHandoffRequest | undefined = rebuildOptions.launchHandoff === true
         && rebuildOptions.launch === true && !removeExisting && handoffLock !== undefined
-        && proxyStartedAt !== undefined && reconciled !== undefined
+        && proxyStartedAt !== undefined && (reconciled !== undefined || warmEmpty !== undefined)
         ? {
             build: () => {
               heldLifecycleLock.assertHeld();
@@ -1770,8 +1812,11 @@ export async function startRuntime(
                 },
                 ...(warm?.ipAssignmentDigests ? { ipAssignmentDigests: warm.ipAssignmentDigests } : {}),
                 registryDigest: sessionRegistryDigest(activePlan.paths.stateDir, { projectId: activePlan.projectId, composeProject: project }),
-                inventoryClean: (reconciled as SessionReconcileResult).inventoryClean,
-                reservedSourceIps: [...(reconciled as SessionReconcileResult).reservedSourceIps],
+                sessionState: warmEmpty ?? Object.freeze({
+                  kind: "reconciled" as const,
+                  inventoryClean: (reconciled as SessionReconcileResult).inventoryClean,
+                  reservedSourceIps: [...(reconciled as SessionReconcileResult).reservedSourceIps],
+                }),
               };
             },
             releaseLock: () => heldLifecycleLock.release(),

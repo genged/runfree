@@ -46,6 +46,9 @@ export function createSessionAdmissionDockerGateway(input: Readonly<{
     operations += 1;
   };
   const histogram = input.histogram;
+  const record = (args: readonly string[], startedAt: number): void => {
+    histogram?.record(subprocessCategory("docker", args), performance.now() - startedAt);
+  };
   const counted = <T>(args: readonly string[], call: () => T): T => {
     count();
     if (!histogram) return call();
@@ -53,9 +56,21 @@ export function createSessionAdmissionDockerGateway(input: Readonly<{
     try {
       return call();
     } finally {
-      histogram.record(subprocessCategory("docker", args), performance.now() - startedAt);
+      record(args, startedAt);
     }
   };
+  // The async twin: counted when it starts, recorded when it settles.
+  const countedAsync = async <T>(args: readonly string[], call: () => Promise<T>): Promise<T> => {
+    count();
+    if (!histogram) return call();
+    const startedAt = performance.now();
+    try {
+      return await call();
+    } finally {
+      record(args, startedAt);
+    }
+  };
+  const innerCaptureAsync = input.io.captureAsync;
   const io: RuntimeIO = {
     ...input.io,
     run(command, args, options) {
@@ -66,6 +81,12 @@ export function createSessionAdmissionDockerGateway(input: Readonly<{
       if (command !== "docker") return input.io.capture(command, args, options);
       return counted(args, () => input.io.capture(command, args, options));
     },
+    ...(innerCaptureAsync ? {
+      captureAsync(command: string, args: string[], options?: childProcess.SpawnSyncOptions) {
+        if (command !== "docker") return innerCaptureAsync.call(input.io, command, args, options);
+        return countedAsync(args, () => innerCaptureAsync.call(input.io, command, args, options));
+      },
+    } : {}),
   };
   const spawn = input.foregroundSpawner ?? defaultForegroundSpawner;
   const foregroundSpawner: SessionContainerForegroundSpawner = (executable, args, options) => (

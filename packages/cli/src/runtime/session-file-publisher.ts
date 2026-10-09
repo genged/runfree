@@ -431,6 +431,15 @@ for (const entry of fs.readdirSync(path.join(root, "requests")).sort()) {
 process.stdout.write(JSON.stringify(digests));
 `;
 
+/**
+ * The served-set read script, for a root batch that already runs as
+ * `--user 0:0` in the exact proxy. Its stdout parses with
+ * `parseProxySessionFileListing`.
+ */
+export function servedSetReadScript(): string {
+  return READ_SERVED_SET_SCRIPT;
+}
+
 /** The listing script, for a root batch that already runs as `--user 0:0` in the exact proxy. */
 export function listIpAssignmentsScript(): string {
   return LIST_IP_ASSIGNMENTS_SCRIPT;

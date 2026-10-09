@@ -99,6 +99,12 @@ const mocks = vi.hoisted(() => ({
   removeOrphanIngress: vi.fn(),
   reclaimStaleCallbacks: vi.fn(),
   sessionMcpCallbackLifecycle: vi.fn(),
+  /** Every task scope the driver created, so a test can read what is still in flight. */
+  taskScopes: [] as Array<{ pending(): number; start<T>(label: string, run: () => Promise<T>): unknown }>,
+  /** The raw steps object of the launch in progress (timings are off in these tests). */
+  launchSteps: undefined as undefined | { ingressMayExist?: () => boolean },
+  consumeWarmEmpty: vi.fn(),
+  isWarmEmpty: vi.fn(),
 }));
 
 vi.mock("../agents.ts", () => ({ builtinAgent: mocks.builtinAgent }));
@@ -108,6 +114,29 @@ vi.mock("./session-callback-ingress.ts", () => ({
   reclaimStaleSessionMcpCallbackForwarders: mocks.reclaimStaleCallbacks,
 }));
 vi.mock("./session-mcp-callback.ts", () => ({ sessionMcpCallbackLifecycle: mocks.sessionMcpCallbackLifecycle }));
+// The ladder stays real; the steps it runs are only recorded.
+vi.mock("./session-admission-probe.ts", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./session-admission-probe.ts")>();
+  return {
+    ...actual,
+    runInternalSessionAdmissionLaunch: (steps: Parameters<typeof actual.runInternalSessionAdmissionLaunch>[0]) => {
+      mocks.launchSteps = steps as unknown as { ingressMayExist?: () => boolean };
+      return actual.runInternalSessionAdmissionLaunch(steps);
+    },
+  };
+});
+// The scope stays real; it is only recorded.
+vi.mock("./task-scope.ts", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./task-scope.ts")>();
+  return {
+    ...actual,
+    createTaskScope: (input: Parameters<typeof actual.createTaskScope>[0]) => {
+      const scope = actual.createTaskScope(input);
+      mocks.taskScopes.push(scope);
+      return scope;
+    },
+  };
+});
 vi.mock("./host-identity.ts", () => ({
   hostBootId: mocks.hostBootId,
   hostProcessStart: mocks.hostProcessStart,
@@ -205,7 +234,10 @@ vi.mock("./session-container-template.ts", () => ({
   bindSessionContainerCreatePlanRecord: mocks.bindPlan,
   sessionContainerTemplateInit: mocks.templateInit,
 }));
-vi.mock("./session-containers.ts", () => ({
+vi.mock("./session-containers.ts", async (importOriginal) => ({
+  // A constant, not behavior: modules that build Docker label filters from it
+  // read it at load time.
+  SESSION_CONTAINER_LABELS: (await importOriginal<typeof import("./session-containers.ts")>()).SESSION_CONTAINER_LABELS,
   bindAllocatedSessionContainerIdV2: mocks.bindAllocatedRecord,
   bindExactAllocatedSessionContainerRecordIdV2: mocks.bindExactAllocatedRecord,
   listQuarantinedSessionContainerRecordNamesV2: mocks.listQuarantinedNames,
@@ -237,6 +269,10 @@ vi.mock("./session-materialization-eligibility.ts", () => ({
   classifySessionAgentMaterializationEligibilityV2: mocks.compileMaterializationEligibility,
 }));
 vi.mock("./docker.ts", () => ({ createRuntimeDocker: mocks.createRuntimeDocker }));
+vi.mock("./warm-empty-session-state.ts", () => ({
+  consumeWarmEmptySessionState: mocks.consumeWarmEmpty,
+  isWarmEmptySessionState: mocks.isWarmEmpty,
+}));
 vi.mock("./sessions.ts", () => ({
   SessionLockAcquisitionAbortedError: class SessionLockAcquisitionAbortedError extends Error {},
   // The one message-bearing lock error a test asserts on; the real class
@@ -395,6 +431,40 @@ function ordered(name: string) {
   };
 }
 
+const RESERVATION = Object.freeze({
+  port: 47_123,
+  forwarderName: "runfree-ingress-mcp-callback-0123456789ab-47123",
+  forwarderId: "e".repeat(64),
+});
+
+/** A session ingress lifecycle that records its phases in the event stream. */
+function recordingIngress(overrides: Partial<{
+  reserve: () => Promise<typeof RESERVATION>;
+  complete: () => Promise<{ port: number; forwarderName: string }>;
+}> = {}) {
+  const reserve = vi.fn(async (..._args: unknown[]) => {
+    mocks.events.push("ingress:reserve-start");
+    const reservation = overrides.reserve ? await overrides.reserve() : RESERVATION;
+    mocks.events.push("ingress:reserved");
+    return reservation;
+  });
+  const complete = vi.fn(async (..._args: unknown[]) => {
+    mocks.events.push("ingress:complete-start");
+    const endpoint = overrides.complete
+      ? await overrides.complete()
+      : { port: RESERVATION.port, forwarderName: RESERVATION.forwarderName };
+    mocks.events.push("ingress:completed");
+    return endpoint;
+  });
+  return { reserve, complete };
+}
+
+function deferred(): { promise: Promise<void>; release: () => void } {
+  let release = (): void => {};
+  const promise = new Promise<void>((resolve) => { release = resolve; });
+  return { promise, release };
+}
+
 /** The captured label of the handoff wait's daemon-side process listing. */
 const TOP_LABEL = `docker:container top ${CONTAINER_ID} -o pid,ppid,args`;
 
@@ -436,6 +506,12 @@ beforeEach(() => {
     return 0;
   });
   mocks.sessionMcpCallbackLifecycle.mockReturnValue(undefined);
+  mocks.taskScopes.length = 0;
+  mocks.launchSteps = undefined;
+  // The seal itself is proved in its own module: here a warm-empty state is
+  // recognized by kind, and admission can consume it only when a test says so.
+  mocks.isWarmEmpty.mockImplementation((value: unknown) => (value as { kind?: unknown } | undefined)?.kind === "warm-empty");
+  mocks.consumeWarmEmpty.mockReturnValue(false);
   mocks.events.length = 0;
   mocks.dockerInputs.length = 0;
   mocks.failRunningProof = false;
@@ -1583,51 +1659,247 @@ describe("internal session admission driver", () => {
     });
   });
 
-  test("launch prepares the session ingress after the running proof and before the grant, then removes it first in teardown", async () => {
-    const prepare = vi.fn(async () => {
-      mocks.events.push("prepare-session-ingress");
-      return undefined;
-    });
+  test("the reservation starts after the bound provisioning record and before the foreground start, and completes after the running proof and before the session-file write", async () => {
+    const ingress = recordingIngress();
     const driver = createInternalSessionAdmissionDriver({
       ...fixture(),
       nowEpochMs: () => Date.parse("2026-08-09T00:00:00.000Z"),
-      sessionIngress: { prepare },
+      sessionIngress: ingress,
     });
 
     await driver.launchBuiltin("codex");
 
-    expect(prepare).toHaveBeenCalledWith({
+    const owner = {
       sessionId: "rf-20260809-abcdef",
       containerId: CONTAINER_ID,
       sourceIp: SOURCE_IP,
       internalNetwork: expect.any(String),
-    });
-    expect(mocks.events.indexOf("running-proof")).toBeLessThan(mocks.events.indexOf("prepare-session-ingress"));
-    expect(mocks.events.indexOf("prepare-session-ingress")).toBeLessThan(mocks.events.indexOf("session-file:write"));
+    };
+    expect(ingress.reserve).toHaveBeenCalledWith(owner);
+    expect(ingress.complete).toHaveBeenCalledWith(owner, RESERVATION);
+    const at = (event: string) => mocks.events.indexOf(event);
+    expect(at("replace-record")).toBeGreaterThanOrEqual(0);
+    expect(at("replace-record")).toBeLessThan(at("ingress:reserve-start"));
+    expect(at("ingress:reserve-start")).toBeLessThan(at("start-foreground"));
+    expect(at("running-proof")).toBeLessThan(at("ingress:complete-start"));
+    expect(at("ingress:reserved")).toBeLessThan(at("ingress:complete-start"));
+    expect(at("ingress:completed")).toBeLessThan(at("session-file:write"));
     // The shared teardown proves the route gone right after the file delete
     // and before the record — the address reservation — is released.
-    expect(mocks.events.indexOf("session-file:delete")).toBeLessThan(mocks.events.indexOf("remove-session-ingress"));
-    expect(mocks.events.indexOf("remove-session-ingress"))
-      .toBeLessThan(mocks.events.indexOf("remove-exact-record:rf-20260809-abcdef"));
+    expect(at("session-file:delete")).toBeLessThan(at("remove-session-ingress"));
+    expect(at("remove-session-ingress")).toBeLessThan(at("remove-exact-record:rf-20260809-abcdef"));
   });
 
-  test("the project decides the session ingress when the caller passes none, and a probe never sets it up", async () => {
-    const prepare = vi.fn(async () => undefined);
-    mocks.sessionMcpCallbackLifecycle.mockReturnValue({ prepare });
+  test("ingress intent is recorded before the reservation's first effect", async () => {
+    let intentAtReserve: boolean | undefined;
+    const reserve = vi.fn((): Promise<typeof RESERVATION> => {
+      // Read before the reservation's first effect: cleanup must already know
+      // to prove the ingress gone.
+      intentAtReserve = mocks.launchSteps?.ingressMayExist?.();
+      mocks.events.push("ingress:reserve-start");
+      throw new Error("the reservation threw before it returned");
+    });
+    const complete = vi.fn();
+    mocks.waitRunning.mockImplementationOnce(async () => {
+      mocks.events.push("running-proof");
+      throw new Error("running proof failed closed");
+    });
+    const driver = createInternalSessionAdmissionDriver({
+      ...fixture(),
+      nowEpochMs: () => Date.parse("2026-08-09T00:00:00.000Z"),
+      sessionIngress: { reserve, complete },
+    });
+
+    await expect(driver.launchBuiltin("codex")).rejects.toThrow("running proof failed closed");
+
+    expect(reserve).toHaveBeenCalledOnce();
+    expect(intentAtReserve).toBe(true);
+    expect(complete).not.toHaveBeenCalled();
+    expect(mocks.events.indexOf("ingress:reserve-start")).toBeLessThan(mocks.events.indexOf("remove-session-ingress"));
+    expect(mocks.events.indexOf("remove-session-ingress")).toBeLessThan(mocks.events.lastIndexOf("remove-record"));
+  });
+
+  test("a running-proof failure waits for an in-flight reservation, then removes the forwarder before the record", async () => {
+    const gate = deferred();
+    const ingress = recordingIngress({
+      reserve: async () => {
+        await gate.promise;
+        return RESERVATION;
+      },
+    });
+    mocks.waitRunning.mockImplementationOnce(async () => {
+      mocks.events.push("running-proof");
+      // The reservation is released only after the proof has thrown, and on a
+      // later turn: cleanup must wait for it rather than run beside it.
+      setTimeout(gate.release, 25);
+      throw new Error("running proof failed closed");
+    });
+    const input = fixture();
+    const driver = createInternalSessionAdmissionDriver({
+      ...input,
+      nowEpochMs: () => Date.parse("2026-08-09T00:00:00.000Z"),
+      sessionIngress: ingress,
+    });
+
+    await expect(driver.launchBuiltin("codex")).rejects.toThrow("running proof failed closed");
+
+    const at = (event: string) => mocks.events.indexOf(event);
+    expect(at("running-proof")).toBeLessThan(at("ingress:reserved"));
+    expect(at("ingress:reserved")).toBeLessThan(at("remove-session-ingress"));
+    expect(at("remove-session-ingress")).toBeLessThan(mocks.events.lastIndexOf("remove-record"));
+    expect(mocks.events).not.toContain("session-file:write");
+    expect(ingress.complete).not.toHaveBeenCalled();
+    expect(mocks.taskScopes.every((scope) => scope.pending() === 0)).toBe(true);
+    expect(() => input.sessionLockManager.lock.assertHeld()).not.toThrow();
+  });
+
+  test("a reservation failure fails the launch after the running proof and cleans up both branches", async () => {
+    const ingress = recordingIngress({
+      reserve: async () => {
+        await Promise.resolve();
+        throw new Error("the MCP OAuth callback for this session could not be set up: no free loopback port");
+      },
+    });
+    const driver = createInternalSessionAdmissionDriver({
+      ...fixture(),
+      nowEpochMs: () => Date.parse("2026-08-09T00:00:00.000Z"),
+      sessionIngress: ingress,
+    });
+
+    await expect(driver.launchBuiltin("codex")).rejects.toThrow("no free loopback port");
+
+    const at = (event: string) => mocks.events.indexOf(event);
+    const stop = mocks.events.findIndex((event) => event.startsWith("docker:container stop"));
+    const remove = mocks.events.findIndex((event) => event.startsWith(`docker:container rm ${CONTAINER_ID}`));
+    expect(at("running-proof")).toBeGreaterThanOrEqual(0);
+    expect(ingress.complete).not.toHaveBeenCalled();
+    expect(mocks.events).not.toContain("session-file:write");
+    expect(at("remove-session-ingress")).toBeGreaterThan(at("running-proof"));
+    expect(stop).toBeGreaterThan(at("running-proof"));
+    expect(remove).toBeGreaterThan(stop);
+    const lastRecord = mocks.events.lastIndexOf("remove-record");
+    expect(lastRecord).toBeGreaterThan(at("remove-session-ingress"));
+    expect(lastRecord).toBeGreaterThan(remove);
+  });
+
+  test("the lock is still held and no task is pending when the launch returns", async () => {
+    const input = fixture();
+    const ingress = recordingIngress({
+      reserve: async () => {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        return RESERVATION;
+      },
+    });
+    const driver = createInternalSessionAdmissionDriver({
+      ...input,
+      nowEpochMs: () => Date.parse("2026-08-09T00:00:00.000Z"),
+      sessionIngress: ingress,
+    });
+
+    await expect(driver.launchBuiltin("codex")).resolves.toEqual({ status: 0, signal: null });
+
+    expect(mocks.taskScopes.length).toBeGreaterThan(0);
+    expect(mocks.taskScopes.every((scope) => scope.pending() === 0)).toBe(true);
+    const assertHeld = input.sessionLockManager.lock.assertHeld as Mock;
+    expect(assertHeld).toHaveBeenCalled();
+    expect(assertHeld.mock.results.at(-1)?.type).toBe("return");
+    expect(() => input.sessionLockManager.lock.assertHeld()).not.toThrow();
+  });
+
+  test("a launch failure that lost the lock keeps its own failure beside the final settle's", async () => {
+    const input = fixture();
+    const gate = deferred();
+    const ingress = recordingIngress({
+      reserve: async () => {
+        await gate.promise;
+        return RESERVATION;
+      },
+    });
+    mocks.waitRunning.mockImplementationOnce(async () => {
+      mocks.events.push("running-proof");
+      // The lock is lost and the proof fails while the reservation is still in
+      // flight: cleanup cannot settle it, so only the final settle waits.
+      input.sessionLockManager.lock.release();
+      setTimeout(gate.release, 25);
+      throw new Error("running proof failed closed");
+    });
+    const driver = createInternalSessionAdmissionDriver({
+      ...input,
+      nowEpochMs: () => Date.parse("2026-08-09T00:00:00.000Z"),
+      sessionIngress: ingress,
+    });
+
+    const failure = await driver.launchBuiltin("codex").catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(AggregateError);
+    expect((failure as Error).message).toContain("in-flight branches settled after the lifecycle lock was lost");
+    const [launchFailure, settleFailure] = (failure as AggregateError).errors;
+    // The launch's own typed failure stays reachable as the aggregate's cause.
+    expect((failure as AggregateError).cause).toBe(launchFailure);
+    expect(String((launchFailure as Error).message) + JSON.stringify((launchFailure as AggregateError).errors?.map(String)))
+      .toContain("running proof failed closed");
+    expect((settleFailure as Error).message).toContain("test lifecycle lock is not held");
+    // The branch was waited for, never abandoned.
+    expect(mocks.events).toContain("ingress:reserved");
+    expect(mocks.taskScopes.every((scope) => scope.pending() === 0)).toBe(true);
+  });
+
+  test("a launch that succeeded reports a final settle that finds the lock lost", async () => {
+    const input = fixture();
+    const assertHeld = input.sessionLockManager.lock.assertHeld as Mock<() => void>;
+    const heldCheck = assertHeld.getMockImplementation() as () => void;
+    const launchChecked = deferred();
+    let launchFinalCheckPassed = false;
+    mocks.removeSessionMetadata.mockImplementationOnce(() => {
+      mocks.events.push("remove-session-evidence");
+      // The success path's evidence removal is followed directly by the
+      // launch's own final lock check; the lock is released only after that
+      // check passed, so only the final settle can find it lost.
+      assertHeld.mockImplementationOnce(() => {
+        heldCheck();
+        launchFinalCheckPassed = true;
+        launchChecked.release();
+      });
+      // A branch still in flight after teardown, which loses the lock as it settles.
+      mocks.taskScopes.at(-1)?.start("late-branch", async () => {
+        await launchChecked.promise;
+        input.sessionLockManager.lock.release();
+        mocks.events.push("late-branch:settled");
+      });
+    });
+    const driver = createInternalSessionAdmissionDriver({
+      ...input,
+      nowEpochMs: () => Date.parse("2026-08-09T00:00:00.000Z"),
+      sessionIngress: recordingIngress(),
+    });
+
+    const failure = await driver.launchBuiltin("codex").catch((error: unknown) => error);
+    expect(launchFinalCheckPassed).toBe(true);
+    expect(failure).not.toBeInstanceOf(AggregateError);
+    expect((failure as Error).message).toBe("test lifecycle lock is not held");
+    expect(mocks.events).toContain("late-branch:settled");
+    expect(mocks.taskScopes.every((scope) => scope.pending() === 0)).toBe(true);
+  });
+
+  test("the project decides the session ingress when the caller passes none, and a probe never reserves", async () => {
+    const ingress = recordingIngress();
+    mocks.sessionMcpCallbackLifecycle.mockReturnValue(ingress);
     const driver = createInternalSessionAdmissionDriver({
       ...fixture(),
       nowEpochMs: () => Date.parse("2026-08-09T00:00:00.000Z"),
     });
 
     await driver.launchBuiltin("codex");
-    expect(prepare).toHaveBeenCalledTimes(1);
+    expect(ingress.reserve).toHaveBeenCalledTimes(1);
+    expect(ingress.complete).toHaveBeenCalledTimes(1);
     expect(mocks.sessionMcpCallbackLifecycle).toHaveBeenCalledTimes(1);
 
     await createInternalSessionAdmissionDriver({
       ...fixture(),
       nowEpochMs: () => Date.parse("2026-08-09T00:00:00.000Z"),
     }).probeBuiltin("codex");
-    expect(prepare).toHaveBeenCalledTimes(1);
+    expect(ingress.reserve).toHaveBeenCalledTimes(1);
+    expect(ingress.complete).toHaveBeenCalledTimes(1);
     expect(mocks.sessionMcpCallbackLifecycle).toHaveBeenCalledTimes(1);
   });
 
@@ -2105,20 +2377,21 @@ describe("session admission under the per-session file source", () => {
   test("a failed session ingress fails the launch with no session file, removing the ingress before the record", async () => {
     const input = fixture();
     mocks.containerInspect = { status: 0, stdout: runningInspect(), stderr: "" };
-    const prepare = vi.fn(async () => {
-      mocks.events.push("prepare-session-ingress");
-      throw new Error("the MCP OAuth callback for this session could not be set up");
+    const ingress = recordingIngress({
+      complete: async () => {
+        throw new Error("the MCP OAuth callback for this session could not be set up");
+      },
     });
     const driver = createInternalSessionAdmissionDriver({
       ...input,
-      sessionIngress: { prepare },
+      sessionIngress: ingress,
       nowEpochMs: () => Date.parse("2026-08-09T00:10:00.000Z"),
     });
 
     await expect(driver.launchBuiltin("codex")).rejects.toThrow("could not be set up");
 
     expect(mocks.events).not.toContain("session-file:write");
-    expect(mocks.events.indexOf("prepare-session-ingress")).toBeLessThan(mocks.events.indexOf("remove-session-ingress"));
+    expect(mocks.events.indexOf("ingress:complete-start")).toBeLessThan(mocks.events.indexOf("remove-session-ingress"));
     expect(mocks.events.indexOf("remove-session-ingress")).toBeLessThan(mocks.events.lastIndexOf("remove-record"));
   });
 
@@ -2131,7 +2404,7 @@ describe("session admission under the per-session file source", () => {
     });
     const driver = createInternalSessionAdmissionDriver({
       ...input,
-      sessionIngress: { prepare: async () => { throw new Error("probe failed"); } },
+      sessionIngress: recordingIngress({ complete: async () => { throw new Error("probe failed"); } }),
       nowEpochMs: () => Date.parse("2026-08-09T00:10:00.000Z"),
     });
 
@@ -3100,8 +3373,7 @@ describe("session admission under the per-session file source", () => {
         lockAcquiredAtMonotonicMs: performance.now(),
         proxy: { id: PROXY_ID, startedAt: PROXY_STARTED_AT },
         registryDigest: sessionRegistryDigest("/state", EXPECTED_PROJECT),
-        inventoryClean: true,
-        reservedSourceIps: ["172.31.90.33"],
+        sessionState: { kind: "reconciled", inventoryClean: true, reservedSourceIps: ["172.31.90.33"] },
         ...overrides,
       };
     }
@@ -3137,7 +3409,7 @@ describe("session admission under the per-session file source", () => {
 
     test.each([
       ["no handoff", undefined],
-      ["an unsettled startup reconcile", { inventoryClean: false }],
+      ["an unsettled startup reconcile", { sessionState: { kind: "reconciled", inventoryClean: false, reservedSourceIps: [] } }],
       ["a registry changed since startup", { registryDigest: `sha256:${"1".repeat(64)}` }],
       ["another proxy", { proxy: { id: "9".repeat(64), startedAt: PROXY_STARTED_AT } }],
     ] as const)("admission with %s runs the current preflight", async (_label, overrides) => {
@@ -3178,7 +3450,7 @@ describe("session admission under the per-session file source", () => {
       for (const inventoryClean of [true, false]) {
         mocks.consumePreparedRuntime.mockClear();
         const input = fixture();
-        const handoff = handoffFor(input, { inventoryClean });
+        const handoff = handoffFor(input, { sessionState: { kind: "reconciled", inventoryClean, reservedSourceIps: [] } });
         createInternalSessionAdmissionDriver({ ...input, handoff });
         const consumed = mocks.consumePreparedRuntime.mock.calls[0]?.[0] as { handoff?: LaunchHandoff };
         // An unclean handoff runs the full preflight, and with it the full
@@ -3244,6 +3516,94 @@ describe("session admission under the per-session file source", () => {
 
       expect(mocks.events).not.toContain("allocate");
       expect(mocks.createContainer).not.toHaveBeenCalled();
+      expect(mocks.reconcileSessions).not.toHaveBeenCalled();
+    });
+
+    function warmEmptyHandoff(input: ReturnType<typeof fixture>): LaunchHandoff {
+      return handoffFor(input, {
+        sessionState: {
+          kind: "warm-empty",
+          registryDigest: sessionRegistryDigest("/state", EXPECTED_PROJECT),
+          proxyId: PROXY_ID,
+          proxyStartedAt: PROXY_STARTED_AT,
+          lockOwnerToken: input.sessionLockManager.lock.ownerToken,
+        } as LaunchHandoff["sessionState"],
+      });
+    }
+
+    test("admission accepts a warm-empty state it can consume, without reconcile or orphan inventory", async () => {
+      const input = fixture();
+      mocks.containerInspect = { status: 0, stdout: runningInspect(), stderr: "" };
+      proxyInspectAnswer(PROXY_STARTED_AT);
+      mocks.consumeWarmEmpty.mockReturnValue(true);
+      const handoff = warmEmptyHandoff(input);
+      const driver = createInternalSessionAdmissionDriver({
+        ...input,
+        handoff,
+        nowEpochMs: () => Date.parse("2026-08-09T00:10:00.000Z"),
+      });
+
+      await expect(driver.launchBuiltin("codex")).resolves.toEqual({ status: 0, signal: null });
+
+      expect(mocks.consumeWarmEmpty).toHaveBeenCalledTimes(1);
+      expect(mocks.consumeWarmEmpty).toHaveBeenCalledWith(handoff.sessionState, {
+        registryDigest: handoff.registryDigest,
+        proxyId: PROXY_ID,
+        proxyStartedAt: PROXY_STARTED_AT,
+        lockOwnerToken: input.sessionLockManager.lock.ownerToken,
+      });
+      expect(mocks.reconcileSessions).not.toHaveBeenCalled();
+      expect(mocks.inventory).not.toHaveBeenCalled();
+      // No session files existed, so nothing is reserved; the fresh baseline,
+      // the fence, and the post-start proof still run.
+      expect(mocks.allocateIp).toHaveBeenCalledWith(expect.objectContaining({ reservedIps: [] }));
+      expect(mocks.events).toContain(`docker:network inspect ${NETWORK_ID}`);
+      expect(mocks.events).toContain("session-file:ip-reuse-fence");
+      // A consumable warm-empty state also skips the marker re-read.
+      const consumed = mocks.consumePreparedRuntime.mock.calls[0]?.[0] as { handoff?: LaunchHandoff };
+      expect(consumed.handoff).toBe(handoff);
+    });
+
+    test("admission refuses a warm-empty state it did not mint and runs the full preflight", async () => {
+      const input = fixture();
+      mocks.containerInspect = { status: 0, stdout: runningInspect(), stderr: "" };
+      proxyInspectAnswer(PROXY_STARTED_AT);
+      mocks.consumeWarmEmpty.mockReturnValue(false);
+      const driver = createInternalSessionAdmissionDriver({
+        ...input,
+        handoff: warmEmptyHandoff(input),
+        nowEpochMs: () => Date.parse("2026-08-09T00:10:00.000Z"),
+      });
+
+      await expect(driver.launchBuiltin("codex")).resolves.toEqual({ status: 0, signal: null });
+
+      expect(mocks.consumeWarmEmpty).toHaveBeenCalledTimes(1);
+      expect(mocks.reconcileSessions).toHaveBeenCalledTimes(1);
+      expect(mocks.inventory).toHaveBeenCalled();
+    });
+
+    test("a warm-empty state admission cannot recognize does not skip the marker re-read", () => {
+      const input = fixture();
+      mocks.isWarmEmpty.mockReturnValue(false);
+      createInternalSessionAdmissionDriver({ ...input, handoff: warmEmptyHandoff(input) });
+      const consumed = mocks.consumePreparedRuntime.mock.calls[0]?.[0] as { handoff?: LaunchHandoff };
+      expect(consumed.handoff).toBeUndefined();
+    });
+
+    test("a proxy restarted since startup refuses as stale before the warm-empty state is consumed", async () => {
+      const input = fixture();
+      proxyInspectAnswer("2026-08-09T00:05:00.000Z");
+      mocks.consumeWarmEmpty.mockReturnValue(true);
+      const driver = createInternalSessionAdmissionDriver({
+        ...input,
+        handoff: warmEmptyHandoff(input),
+        nowEpochMs: () => Date.parse("2026-08-09T00:10:00.000Z"),
+      });
+
+      await expect(driver.launchBuiltin("codex")).rejects.toBeInstanceOf(StalePreparedRuntimeError);
+
+      expect(mocks.consumeWarmEmpty).not.toHaveBeenCalled();
+      expect(mocks.events).not.toContain("allocate");
       expect(mocks.reconcileSessions).not.toHaveBeenCalled();
     });
 
@@ -4346,8 +4706,7 @@ describe("session admission under the per-session file source", () => {
                 lockAcquiredAtMonotonicMs: heldSince,
                 proxy: { id: PROXY_ID, startedAt: "2026-08-09T00:00:00.000Z" },
                 registryDigest: sessionRegistryDigest("/state", EXPECTED_PROJECT),
-                inventoryClean: true,
-                reservedSourceIps: [],
+                sessionState: { kind: "reconciled", inventoryClean: true, reservedSourceIps: [] },
               },
             }
           : { lockHeldSinceMonotonicMs: heldSince }),

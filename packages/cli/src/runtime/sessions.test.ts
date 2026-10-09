@@ -48,6 +48,8 @@ import {
   launchHandoffSpanFits,
   LIFECYCLE_LOCK_WAITER_YIELD_MS,
   launchLockHoldDeadline,
+  SESSION_CALLBACK_COMPLETE_BUDGET_MS,
+  SESSION_CALLBACK_RESERVE_BUDGET_MS,
   SESSION_CALLBACK_SETUP_BUDGET_MS,
 } from "./launch-lock-hold.ts";
 import { WARM_TOKEN_SYNC_CALL_TIMEOUT_MS, WARM_TOKEN_SYNC_TOTAL_TIMEOUT_MS } from "./constants.ts";
@@ -1388,6 +1390,12 @@ test("one launch's whole continuous lifecycle-lock hold fits inside another comm
   expect(LAUNCH_HANDOFF_STARTUP_SPAN_MAX_MS).toBe(8_000);
   expect(LAUNCH_HANDOFF_STARTUP_SPAN_MAX_MS + RUNNING_PROOF_TIMEOUT_MS + SESSION_CALLBACK_SETUP_BUDGET_MS)
     .toBeLessThanOrEqual(LAUNCH_LOCK_HOLD_BUDGET_MS);
+  // The callback setup may overlap the running proof: its reserve phase runs
+  // concurrently, bounded by the proof's own window, then its complete phase
+  // runs after. The overlapped chain must still fit the same hold budget.
+  expect(SESSION_CALLBACK_RESERVE_BUDGET_MS).toBeLessThanOrEqual(RUNNING_PROOF_TIMEOUT_MS);
+  expect(LAUNCH_HANDOFF_STARTUP_SPAN_MAX_MS + Math.max(RUNNING_PROOF_TIMEOUT_MS, SESSION_CALLBACK_RESERVE_BUDGET_MS)
+    + SESSION_CALLBACK_COMPLETE_BUDGET_MS).toBeLessThanOrEqual(LAUNCH_LOCK_HOLD_BUDGET_MS);
   // What is left of the 60 s window is the allowance for the short daemon
   // round-trips between those steps, which carry no timeout of their own.
   expect(PROJECT_LIFECYCLE_LOCK_RETRY_WINDOW_MS - LAUNCH_LOCK_HOLD_BUDGET_MS).toBeGreaterThanOrEqual(10_000);

@@ -4,6 +4,24 @@ import path from "node:path";
 
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
+// Lets a case hide live sessions from exactly one `activeLifecycleSessions`
+// call, standing in for a peer launch that admits its session just after this
+// launch's unlocked active-session check. Every other call is the real one.
+const sessionVisibility = vi.hoisted(() => ({ hideNextActiveCheck: false }));
+vi.mock("../runtime/sessions.ts", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../runtime/sessions.ts")>();
+  return {
+    ...actual,
+    activeLifecycleSessions: (...args: Parameters<typeof actual.activeLifecycleSessions>) => {
+      if (sessionVisibility.hideNextActiveCheck) {
+        sessionVisibility.hideNextActiveCheck = false;
+        return [];
+      }
+      return actual.activeLifecycleSessions(...args);
+    },
+  };
+});
+
 import { projectInfo } from "../config.ts";
 import { desiredServiceEntry } from "../admin/service-policy.ts";
 import { service } from "../../../../scripts/services.ts";
@@ -13,7 +31,7 @@ import {
   sessionContainerRecordFixture,
   writeLiveAttachedSessionContainerRecordFixture,
 } from "../runtime/session-container.test-harness.ts";
-import { writeSessionContainerRecordV2 } from "../runtime/session-containers.ts";
+import { sessionContainerRecordsRoot, writeSessionContainerRecordV2 } from "../runtime/session-containers.ts";
 import type { RuntimeContext, RuntimeIO } from "../runtime/types.ts";
 import { readApprovedNetworkPolicy, readControlApprovalSelection } from "./approvals.ts";
 import {
@@ -21,6 +39,7 @@ import {
   approveNetworkControl,
   approveRuntimeIsolation,
   captureQuiescedDesiredPolicyCandidate,
+  prepareEffectiveControlsForLaunch,
   prepareEffectiveControlsForStartup,
   useApprovedPolicyGeneration,
   usePreparedApprovedPolicyGeneration,
@@ -29,6 +48,7 @@ import { validateNetworkPolicy } from "@runfree/runtime-contracts/network-policy
 import { compileDesiredPolicies } from "./compiler.ts";
 import { prepareMcpRuntime } from "../runtime/mcp.ts";
 import { readActiveControlSelection } from "./effective.ts";
+import { ControlLockBusyError, controlLockPath, tryAcquireControlLock } from "./lock.ts";
 import type { HostServiceAdmit } from "./host-service-approval-admission.ts";
 import { desiredPolicyReviewLines } from "./review-render.ts";
 
@@ -299,6 +319,145 @@ describe("quiesced control workflow", () => {
     expect(reviewed).toContain("  - host service idb: null -> 127.0.0.1:10882 (owner-10882, pid 4242)");
     expect(selection.subjects["network-project"]?.mechanism).toBe("interactive");
     expect(readApprovedNetworkPolicy(root, context.project, "network-project")?.hostServices?.idb?.port).toBe(10882);
+  });
+
+  describe("a peer launch's session going live during control preparation", () => {
+    afterEach(() => {
+      sessionVisibility.hideNextActiveCheck = false;
+    });
+
+    test("joins the selected generation when the capture is refused only for a live agent", async () => {
+      const interactive = io();
+      interactive.isInteractive = () => true;
+      interactive.confirm = () => true;
+      const first = await prepareEffectiveControlsForStartup(context, interactive);
+      writeLiveAttachedSessionContainerRecordFixture({
+        stateDir: context.project.paths.stateDir,
+        projectRoot: root,
+        env: context.env,
+      });
+      // Desired input that must stay unread: the join reads no desired state.
+      fs.writeFileSync(context.project.paths.policyPath, "invalid desired policy that must remain unread\n");
+      const approvalsBefore = fs.readFileSync(context.project.paths.controlApprovalsPath, "utf8");
+      const candidatesBefore = fs.readdirSync(context.project.paths.controlCandidatesDir).sort();
+
+      const joining = io();
+      joining.isInteractive = () => false;
+      joining.admin = async () => {
+        throw new Error("a launch joining a live session must not prepare or publish controls");
+      };
+      sessionVisibility.hideNextActiveCheck = true;
+      const joined = await prepareEffectiveControlsForStartup(context, joining);
+
+      expect(sessionVisibility.hideNextActiveCheck).toBe(false);
+      expect(joined.mechanism).toBe("active-session");
+      expect(joined.generation.controlGeneration).toBe(first.generation.controlGeneration);
+      expect(readActiveControlSelection(context.project)?.controlGeneration).toBe(first.generation.controlGeneration);
+      expect(fs.readFileSync(context.project.paths.controlApprovalsPath, "utf8")).toBe(approvalsBefore);
+      expect(fs.readdirSync(context.project.paths.controlCandidatesDir).sort()).toEqual(candidatesBefore);
+    });
+
+    test("still fails on a quiesce refusal that is not about a live agent", async () => {
+      const interactive = io();
+      interactive.isInteractive = () => true;
+      interactive.confirm = () => true;
+      await prepareEffectiveControlsForStartup(context, interactive);
+      const recordsRoot = sessionContainerRecordsRoot(context.project.paths.stateDir);
+      fs.mkdirSync(recordsRoot, { recursive: true });
+      fs.writeFileSync(path.join(recordsRoot, "corrupt.json"), "{not json");
+
+      sessionVisibility.hideNextActiveCheck = true;
+      await expect(prepareEffectiveControlsForStartup(context, io()))
+        .rejects.toThrow("control change deferred because session-container lifecycle state is unreadable");
+    });
+  });
+
+  describe("a launch's control preparation while the control lock is busy", () => {
+    function approvingIO(): RuntimeIO {
+      const approving = io();
+      approving.isInteractive = () => true;
+      approving.confirm = () => true;
+      return approving;
+    }
+
+    test("waits for a holder that releases mid-wait, then prepares", async () => {
+      const held = tryAcquireControlLock(context.project);
+      expect(held).toBeDefined();
+      const logs: string[] = [];
+      const release = setTimeout(() => held?.release(), 40);
+      try {
+        const prepared = await prepareEffectiveControlsForLaunch(context, approvingIO(), {
+          controlLockWait: { attempts: 200, delayMs: 5, diagnosticIntervalMs: 1, log: (line) => logs.push(line) },
+        });
+        expect(prepared.mechanism).toBe("interactive");
+        expect(readActiveControlSelection(context.project)?.controlGeneration).toBe(prepared.generation.controlGeneration);
+        expect(logs[0]).toContain(`lock: ${controlLockPath(context.project)}`);
+      } finally {
+        clearTimeout(release);
+        held?.release();
+      }
+    });
+
+    test("fails with the original message when the holder never releases", async () => {
+      const held = tryAcquireControlLock(context.project);
+      expect(held).toBeDefined();
+      try {
+        await expect(prepareEffectiveControlsForLaunch(context, approvingIO(), {
+          controlLockWait: { attempts: 3, delayMs: 1, log: () => {} },
+        })).rejects.toThrow(`another control operation is in progress (${controlLockPath(context.project)})`);
+        expect(readControlApprovalSelection(root, context.project)).toBeUndefined();
+        expect(readActiveControlSelection(context.project)).toBeUndefined();
+      } finally {
+        held?.release();
+      }
+    });
+
+    test("does not retry a failure that is not lock contention", async () => {
+      const failing = approvingIO();
+      const admin = vi.fn(async () => 7);
+      failing.admin = admin;
+      await expect(prepareEffectiveControlsForLaunch(context, failing, {
+        controlLockWait: { attempts: 5, delayMs: 1, log: () => {} },
+      })).rejects.toThrow("host-owned effective control preparation failed with status 7");
+      expect(admin).toHaveBeenCalledTimes(1);
+    });
+
+    test("does not carry consent across a retry", async () => {
+      const prompts: string[] = [];
+      let held: ReturnType<typeof tryAcquireControlLock>;
+      const declining = approvingIO();
+      declining.confirm = (message: string) => {
+        prompts.push(message);
+        if (prompts.length > 1) return false;
+        // Contention lands between consent and the approval write.
+        held = tryAcquireControlLock(context.project);
+        expect(held).toBeDefined();
+        setTimeout(() => held?.release(), 30);
+        return true;
+      };
+      try {
+        await expect(prepareEffectiveControlsForLaunch(context, declining, {
+          controlLockWait: { attempts: 200, delayMs: 5, log: () => {} },
+        })).rejects.toThrow("control approval declined; runtime was not started");
+        expect(prompts).toHaveLength(2);
+        expect(readControlApprovalSelection(root, context.project)).toBeUndefined();
+        expect(readActiveControlSelection(context.project)).toBeUndefined();
+      } finally {
+        held?.release();
+      }
+    });
+
+    test("an admin approval still fails fast on the same busy lock", async () => {
+      const held = tryAcquireControlLock(context.project);
+      expect(held).toBeDefined();
+      try {
+        await expect(approveNetworkControl(context, io(), "network-project", { mechanism: "digest-command" }))
+          .rejects.toBeInstanceOf(ControlLockBusyError);
+        expect(readControlApprovalSelection(root, context.project)).toBeUndefined();
+      } finally {
+        held?.release();
+      }
+    });
   });
 
   test("the interactive startup approval runs the port admission before consent (R21)", async () => {

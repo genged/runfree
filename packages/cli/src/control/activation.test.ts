@@ -2,13 +2,13 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { afterEach, beforeEach, describe, expect, test } from "vitest";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
 import { projectInfo } from "../config.ts";
 import { composeProjectName } from "../runtime/env.ts";
 import { projectHash } from "../project-identity.ts";
 import type { RuntimeContext, RuntimeIO } from "../runtime/types.ts";
-import { activateApprovedControlsAfterMutation } from "./activation.ts";
+import { activateApprovedControlsAfterMutation, withFencedReceiptRead } from "./activation.ts";
 import {
   approveNetworkCandidate,
   approveRuntimeIsolationControl,
@@ -233,4 +233,34 @@ describe("post-mutation control activation", () => {
     if (converged) await expect(activateApprovedControlsAfterMutation(context, io, { timeoutMs: 0 })).resolves.toMatchObject({ kind: "converged" });
   });
 
+});
+
+describe("fenced receipt read IO", () => {
+  const ok = { status: 0, stdout: "{}", stderr: "" };
+  const fenced = (held: () => boolean, inner: Partial<RuntimeIO>) => withFencedReceiptRead(inner as RuntimeIO, () => {
+    if (!held()) throw new Error("lifecycle lock lost");
+  });
+
+  test("an async read is bounded and needs the lock before it starts and after it settles, as a sync read does", async () => {
+    let held = true;
+    const captureAsync = vi.fn(async (_command: string, _args: string[], _options?: unknown) => ok);
+    const capture = vi.fn((_command: string, _args: string[], _options?: unknown) => ok);
+    const io = fenced(() => held, { capture, captureAsync });
+    expect(io.capture("docker", ["exec", "p"], { timeout: 60_000 })).toBe(ok);
+    await expect(io.captureAsync?.("docker", ["exec", "p"], { timeout: 60_000 })).resolves.toBe(ok);
+    expect(captureAsync.mock.calls[0]).toEqual(["docker", ["exec", "p"], { timeout: 1000, maxBuffer: 1024 * 1024 }]);
+    expect(captureAsync.mock.calls[0]?.[2]).toEqual(capture.mock.calls[0]?.[2]);
+
+    held = false;
+    await expect(io.captureAsync?.("docker", ["exec", "p"])).rejects.toThrow("lifecycle lock lost");
+    expect(captureAsync).toHaveBeenCalledOnce();
+
+    held = true;
+    captureAsync.mockImplementationOnce(async () => { held = false; return ok; });
+    await expect(io.captureAsync?.("docker", ["exec", "p"])).rejects.toThrow("lifecycle lock lost");
+  });
+
+  test("exposes no captureAsync when the inner IO has none", () => {
+    expect("captureAsync" in fenced(() => true, { capture: vi.fn(() => ok) })).toBe(false);
+  });
 });

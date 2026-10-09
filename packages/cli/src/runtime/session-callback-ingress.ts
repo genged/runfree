@@ -15,9 +15,15 @@ import {
   projectIngressForwarderFilters,
   wholeProjectContainerFilters,
 } from "./container-inventory.ts";
-import { createDockerClient, type DockerClient } from "./docker-client.ts";
+import { createAsyncDockerClient, createDockerClient, type DockerClient } from "./docker-client.ts";
 import { filterValues, parseDockerJson } from "./docker.ts";
-import { INGRESS_FORWARDER_IMAGE, ingressHostNetworkName } from "./ingress-forwarder.ts";
+import {
+  type DockerSteps,
+  INGRESS_FORWARDER_IMAGE,
+  ingressHostNetworkName,
+  runDockerSteps,
+  runDockerStepsAsync,
+} from "./ingress-forwarder.ts";
 import type { DockerContainerInspect, RuntimeIO } from "./types.ts";
 import { validateIngressForwarderTeardownCandidate } from "./utility-containers.ts";
 
@@ -39,8 +45,16 @@ export type CaptureInput = Readonly<{
   projectId: string;
 }>;
 
+export type AsyncCaptureInput = Readonly<{
+  io: Pick<RuntimeIO, "captureAsync">;
+  dockerOptions?: childProcess.SpawnSyncOptions;
+  projectId: string;
+}>;
+
+const INVENTORY_MAX_BUFFER = 8 * 1024 * 1024;
+
 function dockerClientFor(input: CaptureInput): DockerClient {
-  return createDockerClient(input.io, { ...(input.dockerOptions ?? {}), maxBuffer: 8 * 1024 * 1024 });
+  return createDockerClient(input.io, { ...(input.dockerOptions ?? {}), maxBuffer: INVENTORY_MAX_BUFFER });
 }
 
 export function envMap(container: DockerContainerInspect): Record<string, string> {
@@ -63,17 +77,28 @@ type ForwarderInventory = Readonly<{
  * reuses a port on a guess.
  */
 export function inspectCallbackForwarders(input: CaptureInput): ForwarderInventory {
-  const client = dockerClientFor(input);
+  return runDockerSteps(inspectCallbackForwardersSteps(input.projectId), dockerClientFor(input));
+}
+
+/** `inspectCallbackForwarders` on the asynchronous client, for a caller that overlaps other Docker work. */
+export async function inspectCallbackForwardersAsync(input: AsyncCaptureInput): Promise<ForwarderInventory> {
+  return runDockerStepsAsync(
+    inspectCallbackForwardersSteps(input.projectId),
+    createAsyncDockerClient(input.io, { ...(input.dockerOptions ?? {}), maxBuffer: INVENTORY_MAX_BUFFER }),
+  );
+}
+
+function* inspectCallbackForwardersSteps(projectId: string): DockerSteps<ForwarderInventory> {
   // A forwarder can vanish between the listing and the inspection (another
   // exact removal, or `--rm` after its socat exited); one fresh listing
   // answers that race. A second failure is reported, never read as absence.
   let failure = "";
   for (let attempt = 0; attempt < 2; attempt += 1) {
-    const listed = client.listContainers({
+    const listed = yield (client) => client.listContainers({
       all: true,
       noTrunc: true,
       filters: [
-        ...filterValues(projectIngressForwarderFilters(input.projectId)),
+        ...filterValues(projectIngressForwarderFilters(projectId)),
         `label=${INGRESS_PURPOSE_LABEL}=${MCP_CALLBACK_PURPOSE}`,
       ],
       format: "{{.ID}}",
@@ -86,7 +111,7 @@ export function inspectCallbackForwarders(input: CaptureInput): ForwarderInvento
       throw new Error("MCP OAuth callback forwarder listing returned an inexact container id");
     }
     if (ids.length === 0) return Object.freeze({ forwarders: Object.freeze([]) });
-    const inspected = client.inspect(ids, { type: "container" });
+    const inspected = yield (client) => client.inspect(ids, { type: "container" });
     const parsed = inspected.status === 0
       ? parseDockerJson<DockerContainerInspect[]>(inspected, "docker inspect MCP OAuth callback forwarders")
       : undefined;

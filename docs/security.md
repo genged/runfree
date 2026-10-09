@@ -240,6 +240,11 @@ proxy: firewall + request proxy read the file (on change; 100 ms backstop) -> se
 8. **Revoke file first, record last.** The record reserves the IP, so it goes
    last. A failed file delete stops teardown.
 9. **Heartbeats never kill the agent.** They control only the session file.
+10. **A skipped reconcile needs absolute evidence.** A warm launch skips the
+    startup reconcile only when an empty session-file listing, the internal
+    network's participants, an empty lifecycle registry, and one host-wide
+    container listing all show no session state. Unreadable is never empty:
+    a listing that fails, times out, or has a malformed row reconciles.
 
 Mechanics: [Session Admission](architecture.md#session-admission).
 
@@ -391,6 +396,10 @@ Details: [Write Approval Grants](architecture.md#write-approval-grants).
    serve the session file. The record goes only after Docker proves the
    container absent. Anything Docker cannot prove keeps the record and refuses
    with the reason and its remedy.
+6. Every Docker call a launch started settles before cleanup or lock release.
+   When one step fails while another, such as the callback reservation, is
+   still running, the launch waits for it under the lifecycle lock before it
+   removes anything or releases the lock.
 
 ## What Runfree Does Not Prove
 
@@ -429,6 +438,14 @@ Details: [Write Approval Grants](architecture.md#write-approval-grants).
   callback listener, which still checks OAuth state. The host port is also
   freed and could be taken by another project; PKCE stops the code from being
   redeemed there.
+- **Two state roots on one project path share one runtime.** The project id
+  and the Compose project come from the project path, so two state roots for
+  one path (for example `scripts/dev-runfree.sh` without a scratch
+  `--workspace`) share one proxy, one network, and one project id, but each
+  has its own lifecycle registry and lock. Either root's reconcile can remove
+  the other's session files and containers. A warm-empty skip refuses while
+  the other root has a session file in the proxy, a session container, or a
+  session on `agent_internal`; it cannot see the other root's records.
 
 Accepted, known risks:
 

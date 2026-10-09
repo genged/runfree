@@ -22,6 +22,19 @@ export class ProjectQuiesceError extends CliError {
   }
 }
 
+/**
+ * The one quiesce refusal that names live per-session agents and nothing
+ * else. A launch's control preparation tells it apart from every other
+ * refusal: a peer launch's session that went live while this launch waited
+ * means this launch joins the running generation instead of capturing.
+ */
+export class LivePerSessionAgentsError extends ProjectQuiesceError {
+  constructor(message: string) {
+    super(message);
+    this.name = "LivePerSessionAgentsError";
+  }
+}
+
 function refuseLivePerSessionAgents(context: RuntimeContext, allowLiveSessions: boolean): void {
   const projectId = projectHash(context.projectRoot);
   const peek = peekSessionContainerRecordsV2(context.project.paths.stateDir, {
@@ -49,7 +62,7 @@ function refuseLivePerSessionAgents(context: RuntimeContext, allowLiveSessions: 
       processCount: 1,
       sessionId: record.sessionId,
     })}, host pid ${record.hostPid}`);
-    throw new ProjectQuiesceError(
+    throw new LivePerSessionAgentsError(
       `control change deferred because ${live.length} active per-session agent${live.length === 1 ? " is" : "s are"} running:\n${
         details.map((detail) => `  ${detail}`).join("\n")
       }\nstop the named session${live.length === 1 ? "" : "s"}, then retry the control change`,

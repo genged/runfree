@@ -68,3 +68,32 @@ test("a rebind refusal before delegating is marked as never spawned; one after t
   expect(wasRefusedBeforeSpawn(refusal(() => io.capture("docker", ["run", "image"])))).toBe(false);
   expect(capture).toHaveBeenCalledOnce();
 });
+
+test("a captureAsync call is clamped, mutation-gated, and re-checked after it settles, as capture is", async () => {
+  const allowance = { number: 0, exhausted: false, deadlineAt: new Date(Date.now() + 5_000).toISOString(), lastObservedAt: new Date().toISOString() };
+  state.transaction = { transactionId: "d".repeat(64), phase: "prepared", recovery: { allowance } };
+  let authorized = true;
+  const observed: Array<number | undefined> = [];
+  const captureAsync = vi.fn(async (_c: string, _a: string[], options: { timeout?: number } = {}) => {
+    observed.push(options.timeout);
+    return { status: 0, stdout: "", stderr: "" };
+  });
+  const io = withRebindBudgetIO({ capture: vi.fn(), run: vi.fn(), captureAsync } as unknown as RuntimeIO, "/state",
+    { projectId: "0123456789ab", composeProject: "runfree-0123456789ab" }, () => { if (!authorized) throw new Error("lock lost"); });
+  await expect(io.captureAsync?.("docker", ["container", "inspect", "exact"], { timeout: 600_000 })).resolves.toMatchObject({ status: 0 });
+  expect(observed[0]).toBeLessThanOrEqual(5_000);
+  authorized = false;
+  const refusal = await io.captureAsync?.("docker", ["run", "image"]).then(() => undefined, (error: unknown) => error);
+  expect(wasRefusedBeforeSpawn(refusal)).toBe(true);
+  expect(captureAsync).toHaveBeenCalledOnce();
+  authorized = true;
+  captureAsync.mockImplementationOnce(async () => { allowance.deadlineAt = new Date(Date.now() - 1).toISOString(); return { status: 0, stdout: "", stderr: "" }; });
+  await expect(io.captureAsync?.("docker", ["container", "inspect", "exact"])).rejects.toThrow(/allowance ended/);
+});
+
+test("the rebind budget exposes no captureAsync when the inner IO has none", () => {
+  state.transaction = undefined;
+  const io = withRebindBudgetIO({ capture: vi.fn(), run: vi.fn() } as unknown as RuntimeIO, "/state",
+    { projectId: "0123456789ab", composeProject: "runfree-0123456789ab" }, () => {});
+  expect("captureAsync" in io).toBe(false);
+});

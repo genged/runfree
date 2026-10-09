@@ -53,7 +53,8 @@ import {
   type ReductionComparison,
 } from "./comparator.ts";
 import { compileDesiredPolicies } from "./compiler.ts";
-import { withQuiescedProject } from "./quiesce.ts";
+import { type ControlLockWaitOptions, waitWhileControlLockBusy } from "./lock.ts";
+import { LivePerSessionAgentsError, withQuiescedProject } from "./quiesce.ts";
 import { parseStrictJson } from "./strict-json.ts";
 import {
   approveNarrowImageBuildCandidate,
@@ -585,6 +586,18 @@ export async function requireUsableApprovalSelection(
 }
 
 /**
+ * The launch beside a running session: the exact selected host-owned
+ * generation, with no desired-input read, preparation, or publication.
+ */
+function joinActiveSessionGeneration(context: RuntimeContext): StartupControlPreparation {
+  const active = readActiveEffectiveControl(context.project);
+  if (!active) {
+    throw new Error("active sessions require an existing verified effective control selection");
+  }
+  return { generation: active, mechanism: "active-session" };
+}
+
+/**
  * Resolve startup authority before Docker planning, image work, credential
  * resolution, or attach. A concurrent launch reuses the verified active
  * generation without reading desired project input or publishing authority.
@@ -613,15 +626,24 @@ export async function prepareEffectiveControlsForStartup(
   // Reuse the exact selected host-owned generation instead. This path performs
   // no preparation or publication, so starting another session cannot activate
   // desired drift or a different approved snapshot.
-  if (activeLifecycleSessions(context).length > 0) {
-    const active = readActiveEffectiveControl(context.project);
-    if (!active) {
-      throw new Error("active sessions require an existing verified effective control selection");
-    }
-    return { generation: active, mechanism: "active-session" };
-  }
+  if (activeLifecycleSessions(context).length > 0) return joinActiveSessionGeneration(context);
 
-  const candidate = await captureQuiescedDesiredPolicyCandidate(context, io);
+  let candidate: DesiredPolicyCandidate;
+  try {
+    candidate = await captureQuiescedDesiredPolicyCandidate(context, io);
+  } catch (error) {
+    // The check above runs without the lifecycle lock, so a peer launch can
+    // admit its session between that check and this capture: the capture's
+    // own live-agent refusal is then about a session this launch would have
+    // joined had it looked a moment later. The refusal is raised before the
+    // capture reads or writes anything, so joining here is the same decision
+    // as the check above. Every other refusal still fails, and the re-check
+    // must still see a live session.
+    if (error instanceof LivePerSessionAgentsError && activeLifecycleSessions(context).length > 0) {
+      return joinActiveSessionGeneration(context);
+    }
+    throw error;
+  }
   const runtimeSubject = runtimeIsolationControlSubject(context.project.config);
   let selection = readControlApprovalSelection(context.projectRoot, context.project);
   const networkProjectChanged = selectedDigest(selection, "network-project") !== candidate.projectSubject.digest;
@@ -692,4 +714,30 @@ export async function prepareEffectiveControlsForStartup(
     runtimeIsolation: true,
   });
   return { generation: await usePreparedApprovedPolicyGeneration(context, io), mechanism: "interactive" };
+}
+
+/**
+ * A launch's control preparation: `prepareEffectiveControlsForStartup`, run
+ * again while another operation holds the project control lock. Two launches
+ * started together in one project both publish the selected generation under
+ * that lock, so the second would otherwise fail on plain contention.
+ *
+ * Only a launch waits. Admin and policy commands keep failing fast on a busy
+ * lock. Every attempt takes and releases its own locks, so nothing is held
+ * while this waits, and an attempt that a busy lock stopped part-way has
+ * either persisted a step (the next attempt finds it already done) or written
+ * nothing. An interactive review that the busy lock interrupted after consent
+ * asks again: consent is never carried across attempts.
+ */
+export async function prepareEffectiveControlsForLaunch(
+  context: RuntimeContext,
+  io: RuntimeIO,
+  options: Parameters<typeof prepareEffectiveControlsForStartup>[2] & { controlLockWait?: ControlLockWaitOptions } = {},
+): Promise<StartupControlPreparation> {
+  const { controlLockWait, ...prepareOptions } = options;
+  return waitWhileControlLockBusy(
+    context.project,
+    () => prepareEffectiveControlsForStartup(context, io, prepareOptions),
+    controlLockWait,
+  );
 }

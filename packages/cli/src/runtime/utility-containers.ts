@@ -422,3 +422,26 @@ export function validateInternalNetworkParticipants(input: InternalNetworkPartic
   }
   return issues;
 }
+
+/**
+ * Why the internal network's participants could still hold session state, or
+ * undefined when every participant other than the proxy is a runtime-owned
+ * ingress forwarder. Call it only on participants the topology validation
+ * already accepted: it judges what each one is, not whether it is well formed.
+ *
+ * A session container is session state. Anything else that is not an ingress
+ * forwarder — an ephemeral helper, or a container the validation tolerated for
+ * any other reason — is not proved stateless, so it blocks too.
+ */
+export function internalNetworkSessionStateBlocker(
+  participants: readonly DockerContainerInspect[],
+  proxyId: string,
+  projectId: string,
+): "session-participant" | "non-ingress-participant" | undefined {
+  for (const participant of participants) {
+    if (participant.Id === proxyId) continue;
+    if (hasProjectRole(participant, projectId, "session-agent")) return "session-participant";
+    if (maybeIngressForwarder(participant, projectId) === undefined) return "non-ingress-participant";
+  }
+  return undefined;
+}

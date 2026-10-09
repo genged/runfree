@@ -48,8 +48,13 @@ import { scanRecoveryInventory } from "../../../packages/cli/src/runtime/recover
 import {
   listQuarantinedSessionContainerRecordNamesV2,
   listSessionContainerRecordsV2,
+  sessionContainerName,
+  sessionContainerRecordPath,
   sessionContainerRecordsRoot,
+  type SessionContainerProjectIdentity,
 } from "../../../packages/cli/src/runtime/session-containers.ts";
+import { listIpAssignmentsScript, servedSetReadScript } from "../../../packages/cli/src/runtime/session-file-publisher.ts";
+import { warmProofRecordPath } from "../../../packages/cli/src/runtime/warm-proof.ts";
 import { RESUME_STUB_DIRECTORY, stageLongLivedAgentBinary } from "./agent-stub.ts";
 import { composeProjectName, composeServiceContainerId, docker, dockerOrThrow } from "./docker.ts";
 import {
@@ -57,11 +62,14 @@ import {
   forceCleanSessions,
   describeOutput,
   destroyLiveFixture,
+  MANAGED_HOLD_RELATIVE_PATH,
   provisionLiveFixture,
+  provisionSandboxFixture,
   readSessionFileEvidence,
   type LiveFixture,
   type LiveRuntimeBackend,
 } from "./fixture.ts";
+import { launchClaudeTimed, runfreeTimed, sessionContainers, timing } from "./launch-timing-support.ts";
 import { runNominalAdmissionSlice } from "./session-admission-slice.ts";
 import {
   CRASH_INJECTION_MARKER,
@@ -364,6 +372,51 @@ function iTermOnlyEnv(base: NodeJS.ProcessEnv, itermSessionId: string): NodeJS.P
   const scrubbed = { ...base };
   for (const key of TERMINAL_IDENTITY_ENV_KEYS) delete scrubbed[key];
   return { ...scrubbed, TERM_PROGRAM: "iTerm.app", ITERM_SESSION_ID: itermSessionId };
+}
+
+/** What the served-set read failure shim prints, so a case can tell its fault from any other. */
+const SERVED_SET_READ_FAILURE = "live test: injected served-set read failure";
+
+/** Text that appears in the served-set read script and in no other script the proxy runs as `node -e`. */
+const SERVED_SET_READ_MARKER = "const noncePattern = ";
+
+/**
+ * Writes a `docker` shim that exits non-zero for a standalone
+ * `docker exec … node -e <served-set read script>` and execs the real client
+ * for every other call, and returns `base` with the shim first on PATH.
+ *
+ * The real client's path is baked into the shim: the CLI hands Docker an
+ * allowlisted environment (PATH and the Docker client variables), so nothing
+ * else set here would reach it.
+ */
+function installServedSetReadFailureShim(base: NodeJS.ProcessEnv): { directory: string; env: NodeJS.ProcessEnv } {
+  const servedSetRead = servedSetReadScript();
+  if (!servedSetRead.includes(SERVED_SET_READ_MARKER) || listIpAssignmentsScript().includes(SERVED_SET_READ_MARKER)) {
+    throw new Error("the served-set read marker no longer identifies only the served-set read script");
+  }
+  const located = childProcess.spawnSync("sh", ["-c", "command -v docker"], { encoding: "utf8", env: base });
+  const realDocker = located.status === 0 ? located.stdout.trim() : "";
+  if (!path.isAbsolute(realDocker)) throw new Error(`could not locate the real docker client: ${located.stderr}`);
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "runfree-docker-shim-"));
+  const quote = (value: string): string => `'${value.replaceAll("'", "'\\''")}'`;
+  fs.writeFileSync(path.join(directory, "docker"), [
+    "#!/bin/sh",
+    "before=''",
+    "previous=''",
+    'for arg in "$@"; do',
+    '  if [ "$before" = node ] && [ "$previous" = -e ]; then',
+    '    case "$arg" in',
+    `      *${quote(SERVED_SET_READ_MARKER)}*) echo ${quote(SERVED_SET_READ_FAILURE)} >&2; exit 97 ;;`,
+    "    esac",
+    "  fi",
+    '  before="$previous"',
+    '  previous="$arg"',
+    "done",
+    `exec ${quote(realDocker)} "$@"`,
+    "",
+  ].join("\n"), { mode: 0o755 });
+  const searchPath = base.PATH ?? process.env.PATH ?? "";
+  return { directory, env: { ...base, PATH: searchPath ? `${directory}${path.delimiter}${searchPath}` : directory } };
 }
 
 describe("per-session admission survives a crash at every transition", () => {
@@ -1159,5 +1212,180 @@ describe("per-session admission survives a crash at every transition", () => {
     ).toBe(false);
     expect(listQuarantinedSessionContainerRecordNamesV2(stateDir)).toEqual([]);
     runtimeDestroyed = true;
+  }, TEST_TIMEOUT_MS);
+});
+
+// The two cases below need a session the crash runner's probe drive creates
+// for real (it calls the production admission driver directly, so the
+// container it leaves behind is a real Docker object) but then prove the
+// fallback through a genuine `runfree claude` launch, which — unlike the
+// probe drive — must actually run `startup.ts` end to end and complete. That
+// needs the recorder/one-shot project image `launch-latency.live.test.ts`
+// stages, not the long-lived one the crash sweep above depends on for its own
+// different reason (holding a session open to crash it mid-attach), so this
+// gets its own fixture rather than sharing the one above.
+describe("a crashed session with no record falls back from the warm-empty skip", () => {
+  let fixture: LiveFixture;
+  let proxyId: string;
+  let stateDir: string;
+  let expectedProject: SessionContainerProjectIdentity;
+
+  beforeAll(() => {
+    requiredBackend();
+    fixture = provisionSandboxFixture(REPO_ROOT);
+    fs.rmSync(path.join(fixture.projectRoot, MANAGED_HOLD_RELATIVE_PATH), { force: true });
+    // Two launches: the first may still build or select, the second leaves a
+    // clean warm proof behind.
+    launchClaudeTimed(fixture);
+    launchClaudeTimed(fixture);
+    const project = composeProjectName(fixture);
+    proxyId = composeServiceContainerId(project, "proxy");
+    const projectId = dockerOrThrow("project-id label", [
+      "inspect", "--format", '{{ index .Config.Labels "io.runfree.project-id" }}', proxyId,
+    ]).trim();
+    stateDir = path.join(runfreeStateRoot(fixture.env), "projects", projectId);
+    expectedProject = Object.freeze({ projectId, composeProject: project });
+  }, PROVISION_TIMEOUT_MS);
+
+  afterAll(() => {
+    if (fixture) destroyLiveFixture(fixture, { keepHostState: process.env.TEST_RUNTIME_KEEP_PROJECT === "1" });
+  }, PROVISION_TIMEOUT_MS);
+
+  /**
+   * Crashes at `point`, strips the lifecycle record the crash left (so the
+   * surviving container is a bare orphan no record claims), and returns that
+   * exact container id so the caller can prove it specifically is gone later
+   * — not just that no session container happens to remain.
+   */
+  async function crashAndOrphanTheRecord(point: CrashPoint): Promise<string> {
+    const crashed = await runCrashScript(fixture, ["--kill-at", point]);
+    expect(
+      crashed.output,
+      `no crash landed at ${point}, so there is no orphan to test: ${describeOutput(crashed.output, 4000)}`,
+    ).toContain(CRASH_INJECTION_MARKER);
+    expect(crashed.status, `the crashed lifecycle process at ${point} exited cleanly`).not.toBe(0);
+
+    const records = listSessionContainerRecordsV2(stateDir, expectedProject);
+    expect(
+      records.length,
+      `the crash at ${point} left ${records.length} lifecycle record(s), expected exactly 1: ${describeOutput(crashed.output, 4000)}`,
+    ).toBe(1);
+    const sessionId = (records[0] as (typeof records)[number]).sessionId;
+    const orphanId = dockerOrThrow(`orphan container id for session ${sessionId}`, [
+      "ps", "-aq", "--no-trunc", "--filter", `name=^${sessionContainerName(expectedProject.projectId, sessionId)}$`,
+    ]);
+    expect(
+      orphanId,
+      `no container is named for session ${sessionId}, so the kill at ${point} left nothing to test: ${describeOutput(crashed.output, 4000)}`,
+    ).not.toBe("");
+
+    fs.rmSync(sessionContainerRecordPath(stateDir, sessionId), { force: true });
+    expect(listSessionContainerRecordsV2(stateDir, expectedProject)).toEqual([]);
+    return orphanId;
+  }
+
+  /** Whether `containerId` is absent from the daemon's full inventory, running or not. */
+  function containerAbsent(containerId: string): boolean {
+    return dockerOrThrow("post-recovery container scan", ["ps", "-aq", "--no-trunc", "--filter", `id=${containerId}`]) === "";
+  }
+
+  coreTest("a stopped orphan with no record is removed by the next warm launch's reconcile", async () => {
+    // A container crashed right after `create` was never started, so it is
+    // invisible to the internal network's participant listing; the only
+    // evidence that can still see it is the host-wide container listing
+    // `SESSION_CONTAINER_ABSENCE_FORMAT` drives, which this exercises against
+    // a real daemon.
+    const orphanId = await crashAndOrphanTheRecord("after-create");
+
+    const launched = runfreeTimed(fixture, ["claude"]);
+    expect(launched.status, describeOutput(launched.output, 4000)).toBe(0);
+    expect(timing(launched.output, "startup:warm-empty"), describeOutput(launched.output))
+      .toContain("blocked:session-containers-present");
+    expect(sessionContainers(fixture)).toEqual([]);
+    expect(containerAbsent(orphanId), `orphan container ${orphanId} survived the launch's reconcile`).toBe(true);
+  }, TEST_TIMEOUT_MS);
+
+  // The warm path's reconcile catch: a warm launch whose reconcile fails
+  // drops the warm-proof record, and the next launch recovers on the full
+  // path. The reconcile only runs on a warm launch when the warm-empty check
+  // is blocked, and a warm match needs no lifecycle record, no quarantined
+  // record, and no session participant on agent_internal. A container
+  // created but never started is the one piece of residue that satisfies
+  // both: it is not a network participant, so the warm proof still matches,
+  // and the host-wide container listing still sees it, so warm-empty reports
+  // `session-containers-present` and the reconcile runs. A started orphan
+  // cannot serve here: as a participant it makes the warm proof mismatch
+  // (`mismatch:participants`) and the launch takes the full path, which never
+  // reaches this catch. With no residue at all, warm-empty is `empty` and the
+  // reconcile, and so the injected read failure, is skipped.
+  coreTest("a warm launch whose reconcile fails drops the warm-proof record, and the next launch recovers", async () => {
+    // The case above reclaimed its orphan, and a reconcile that repaired
+    // residue drops the warm-proof record, so there is no record on entry.
+    // Without one, every assertion below would pass even with the catch's
+    // own drop reverted. One clean launch re-establishes a genuine record.
+    const warmProofPath = warmProofRecordPath(stateDir);
+    const clean = launchClaudeTimed(fixture);
+    expect(timing(clean.output, "validation:warm-proof"), describeOutput(clean.output)).toContain("recorded");
+    expect(fs.existsSync(warmProofPath), "the clean launch did not record a warm proof").toBe(true);
+
+    const orphanId = await crashAndOrphanTheRecord("after-create");
+    expect(fs.existsSync(warmProofPath), "the crash alone removed the warm-proof record").toBe(true);
+
+    // Fail only the reconcile's read of the proxy's session files. The
+    // proxy's own state stays intact: a chmod of the session-files directory
+    // breaks the security contract's `proxy-session-files-dir` check, so the
+    // warm proof reports a mismatch and the launch takes the full validation
+    // path, which contains (stops) the proxy instead of reaching reconcile.
+    // A `docker` shim first on PATH for this one launch fails exactly the
+    // standalone `docker exec … node -e <served-set read>` that
+    // `readProxySessionFiles` runs, and execs the real client for everything
+    // else. The warm batch runs the same script, but inside one `sh -c`
+    // argument, so the shim never matches it: the warm proof still matches,
+    // the warm-empty check is blocked by the orphan container, and the full
+    // reconcile's read is the one that fails — the step whose throw startup
+    // turns into "could not report its session files" and the dropped record.
+    const shim = installServedSetReadFailureShim(fixture.env);
+    try {
+      const broken = runfreeTimed({ ...fixture, env: shim.env }, ["claude"]);
+      expect(broken.status, describeOutput(broken.output, 4000)).not.toBe(0);
+      // Proves the failure happened on the warm path — the record the clean
+      // launch above wrote still matched — rather than on some incidental
+      // cold path, where the record would have been dropped unconditionally
+      // before reconcile even ran and this case would prove nothing about
+      // the catch.
+      expect(timing(broken.output, "validation:warm-proof"), describeOutput(broken.output)).toContain("match");
+      expect(timing(broken.output, "startup:warm-empty"), describeOutput(broken.output))
+        .toContain("blocked:session-containers-present");
+      // Image cleanup runs before the reconcile and reads the same session
+      // files when its inputs changed; its failure is only a warning carrying
+      // its own prefix. A line without that prefix is the reconcile's.
+      const reconcileFailures = broken.output.split("\n").filter((line) => line.includes("could not report its session files")
+        && !line.includes("stale Runfree runtime cleanup skipped"));
+      expect(reconcileFailures, describeOutput(broken.output, 4000)).not.toEqual([]);
+      expect(reconcileFailures.join("\n"), describeOutput(broken.output, 4000)).toContain(SERVED_SET_READ_FAILURE);
+      expect(fs.existsSync(warmProofPath), "a failed reconcile left the warm-proof record behind").toBe(false);
+    } finally {
+      // Removing the shim directory is the only restore: nothing in the
+      // proxy or the daemon was changed, so cleanup cannot fail in a way
+      // that replaces the assertion failure above.
+      fs.rmSync(shim.directory, { recursive: true, force: true });
+    }
+
+    const recovered = runfreeTimed(fixture, ["claude"]);
+    expect(recovered.status, describeOutput(recovered.output, 4000)).toBe(0);
+    expect(sessionContainers(fixture)).toEqual([]);
+    expect(listSessionContainerRecordsV2(stateDir, expectedProject)).toEqual([]);
+    expect(containerAbsent(orphanId), `orphan container ${orphanId} survived recovery`).toBe(true);
+    // The recovery ran the full path, and its reconcile repaired residue (the
+    // orphan), so it records no warm proof. The next clean launch does.
+    expect(fs.existsSync(warmProofPath), "a reconcile that repaired residue recorded a warm proof").toBe(false);
+    const rerecorded = runfreeTimed(fixture, ["claude"]);
+    expect(rerecorded.status, describeOutput(rerecorded.output, 4000)).toBe(0);
+    expect(timing(rerecorded.output, "validation:warm-proof"), describeOutput(rerecorded.output)).toContain("recorded");
+
+    const warm = runfreeTimed(fixture, ["claude"]);
+    expect(warm.status, describeOutput(warm.output, 4000)).toBe(0);
+    expect(timing(warm.output, "validation:warm-proof"), describeOutput(warm.output)).toContain("match");
+    expect(timing(warm.output, "startup:warm-empty"), describeOutput(warm.output)).toContain("empty");
   }, TEST_TIMEOUT_MS);
 });

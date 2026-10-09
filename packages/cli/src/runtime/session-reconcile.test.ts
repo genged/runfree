@@ -57,7 +57,7 @@ import {
   type SessionContainerRecordV2,
 } from "./session-containers.ts";
 import { readSessionHostStatus, writeSessionHostStatus } from "./session-host-status.ts";
-import { reconcileSessions } from "./session-reconcile.ts";
+import { parseProxySessionFileListing, readProxySessionFiles, reconcileSessions } from "./session-reconcile.ts";
 import { boundCallbackForwarder } from "./session-callback-ingress.test-harness.ts";
 import { INGRESS_FORWARDER_TEST_IMAGE_ID } from "./ingress-forwarder.test-harness.ts";
 import type { ProjectLifecycleLock } from "./sessions.ts";
@@ -418,6 +418,33 @@ afterAll(() => fs.rmSync(baseStateDir, { recursive: true, force: true }));
 function startFromPublishedState(): void {
   fs.cpSync(baseStateDir, stateDir, { recursive: true });
 }
+
+describe("the session-file listing parser", () => {
+  test("an empty array is no files", () => {
+    expect(parseProxySessionFileListing("[]")).toEqual([]);
+  });
+
+  test("anything that is not an array of parseable entries is no answer, never no files", () => {
+    expect(parseProxySessionFileListing("not json")).toBeUndefined();
+    expect(parseProxySessionFileListing("{}")).toBeUndefined();
+    expect(parseProxySessionFileListing("[{}]")).toBeUndefined();
+  });
+
+  test("a malformed keyed entry parses as malformed", () => {
+    const key = "c".repeat(64);
+    expect(parseProxySessionFileListing(JSON.stringify([{ sessionKey: key, name: `${key}.json`, malformed: true }])))
+      .toEqual([{ sessionKey: key, name: `${key}.json`, malformed: true }]);
+  });
+
+  test("readProxySessionFiles still refuses an unparseable listing", () => {
+    const fake = fakeDocker({ servedRaw: "[{}]\n" });
+
+    expect(() => readProxySessionFiles({ io: fake.io, proxyId: PROXY_ID })).toThrow(RuntimeObservationError);
+    expect(() => readProxySessionFiles({ io: fakeDocker({ servedRaw: "not json\n" }).io, proxyId: PROXY_ID }))
+      .toThrow(/session file listing is unreadable/);
+    expect(fake.events).toEqual(["read-served-set"]);
+  });
+});
 
 describe("reconcile before allocation", () => {
   beforeEach(startFromPublishedState);

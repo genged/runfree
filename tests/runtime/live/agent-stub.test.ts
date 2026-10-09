@@ -16,7 +16,7 @@ import path from "node:path";
 
 import { describe, expect, test } from "vitest";
 
-import { resumeStub } from "./agent-stub.ts";
+import { resumeStub, startObservationStub } from "./agent-stub.ts";
 
 // A sentinel tail distinct from the real `exec sleep 3600` the long-lived
 // agent image appends: an unexercised stub falls through to this exit code,
@@ -118,6 +118,47 @@ describe("resume stub", () => {
 
       fs.writeFileSync(path.join(dir, `release-${idB}`), "");
       expect(await exitB).toBe(0);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("start observation stub", () => {
+  function observe(dir: string, portFile: string, env: NodeJS.ProcessEnv): childProcess.SpawnSyncReturns<string> {
+    return childProcess.spawnSync("sh", ["-c", startObservationStub(dir, portFile)], { encoding: "utf8", env, timeout: 10_000 });
+  }
+
+  test("is syntactically valid sh", () => {
+    const syntax = childProcess.spawnSync("sh", ["-n"], { encoding: "utf8", input: startObservationStub("/workspace/x", "/tmp/p") });
+    expect(syntax.status, syntax.stderr).toBe(0);
+  });
+
+  test("records the port file's contents under the hostname when no session id is set", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "start-observation-"));
+    try {
+      const portFile = path.join(dir, "port");
+      fs.writeFileSync(portFile, "41234");
+      const result = observe(path.join(dir, "records"), portFile, { PATH: process.env.PATH, HOSTNAME: "abc123" });
+      expect(result.status, result.stderr).toBe(0);
+      expect(fs.readFileSync(path.join(dir, "records", "abc123"), "utf8")).toBe("41234\n");
+      expect(fs.existsSync(path.join(dir, "records", "abc123.tmp"))).toBe(false);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("records absent under the session id when the port file does not exist", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "start-observation-"));
+    try {
+      const result = observe(path.join(dir, "records"), path.join(dir, "missing"), {
+        PATH: process.env.PATH,
+        HOSTNAME: "abc123",
+        RUNFREE_SESSION_ID: "session-1",
+      });
+      expect(result.status, result.stderr).toBe(0);
+      expect(fs.readFileSync(path.join(dir, "records", "session-1"), "utf8")).toBe("absent\n");
+      expect(fs.existsSync(path.join(dir, "records", "abc123"))).toBe(false);
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }

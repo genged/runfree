@@ -30,9 +30,18 @@ import {
   projectIngressForwarderFilters,
   type IngressPurpose,
 } from "./container-inventory.ts";
-import { createDockerClient, labelRunFlags, type DockerRunFlag } from "./docker-client.ts";
+import {
+  createAsyncDockerClient,
+  createDockerClient,
+  labelRunFlags,
+  type AsyncDockerClient,
+  type DockerCaptureMethods,
+  type DockerClient,
+  type DockerRunFlag,
+} from "./docker-client.ts";
 import { dockerClientEnvOptions, filterValues, parseDockerJson } from "./docker.ts";
 import type {
+  CaptureResult,
   DockerContainerInspect,
   DockerNetworkInspect,
   RuntimeContext,
@@ -106,8 +115,62 @@ export type IngressForwarderInput = Readonly<{
   extraEnv?: Readonly<Record<string, string>>;
 }>;
 
-function containerExists(context: RuntimeContext, io: RuntimeIO, name: string): boolean {
-  return createDockerClient(io, dockerClientEnvOptions(context)).inspect([name], { type: "container" }).status === 0;
+/**
+ * One captured Docker call, written once for either client: the synchronous
+ * client returns its `CaptureResult`, the asynchronous one a promise of it.
+ */
+export type DockerRequest = <R>(client: DockerCaptureMethods<R>) => R;
+
+/**
+ * A Docker program written as a generator: it yields each call in order and
+ * receives its result. The order of calls, every check between them, and every
+ * refusal live in the program, so a synchronous caller and an overlapped
+ * caller cannot drift apart. The program does no non-Docker waiting: the
+ * readiness poll is paced by its own `docker exec` round-trips, not a sleep.
+ */
+export type DockerSteps<T> = Generator<DockerRequest, T, CaptureResult>;
+
+/**
+ * Runs a Docker program on the synchronous client. A call that throws is
+ * thrown back into the program at the point it was yielded, exactly as the
+ * call would have thrown inline, so the program's own cleanup still runs.
+ */
+export function runDockerSteps<T>(steps: DockerSteps<T>, client: DockerClient): T {
+  let next = steps.next();
+  while (!next.done) {
+    let result: CaptureResult;
+    try {
+      result = next.value(client);
+    } catch (error) {
+      next = steps.throw(error);
+      continue;
+    }
+    next = steps.next(result);
+  }
+  return next.value;
+}
+
+/**
+ * Runs a Docker program on the asynchronous client, one call at a time and in
+ * the same order as `runDockerSteps`. Each call settles before the next starts.
+ */
+export async function runDockerStepsAsync<T>(steps: DockerSteps<T>, client: AsyncDockerClient): Promise<T> {
+  let next = steps.next();
+  while (!next.done) {
+    let result: CaptureResult;
+    try {
+      result = await next.value(client);
+    } catch (error) {
+      next = steps.throw(error);
+      continue;
+    }
+    next = steps.next(result);
+  }
+  return next.value;
+}
+
+function* containerExistsSteps(name: string): DockerSteps<boolean> {
+  return (yield (client) => client.inspect([name], { type: "container" })).status === 0;
 }
 
 function exactMissingContainer(stderr: string, target: string): boolean {
@@ -127,8 +190,8 @@ function exactMissingContainer(stderr: string, target: string): boolean {
  * outage that failed the removal fails the inspect, and "inspect errored" is
  * not proof the container is gone.)
  */
-function removeForwarder(context: RuntimeContext, io: RuntimeIO, name: string): { ok: boolean; detail?: string } {
-  const removed = createDockerClient(io, dockerClientEnvOptions(context)).removeContainers([name], { force: true });
+function* removeForwarderSteps(name: string): DockerSteps<{ ok: boolean; detail?: string }> {
+  const removed = yield (client) => client.removeContainers([name], { force: true });
   if (removed.status === 0) return { ok: true };
   const detail = removed.stderr.trim();
   // Only the canonical missing-target error for *this* container proves it is
@@ -142,6 +205,10 @@ function removeForwarder(context: RuntimeContext, io: RuntimeIO, name: string): 
   // otherwise match. The `m` flag lets `$` close the canonical diagnostic line.
   if (exactMissingContainer(detail, name)) return { ok: true };
   return { ok: false, detail: detail || name };
+}
+
+function removeForwarder(context: RuntimeContext, io: RuntimeIO, name: string): { ok: boolean; detail?: string } {
+  return runDockerSteps(removeForwarderSteps(name), createDockerClient(io, dockerClientEnvOptions(context)));
 }
 
 function exactMissingNetwork(stderr: string, target: string): boolean {
@@ -235,8 +302,15 @@ export function inspectIngressHostNetwork(
   projectId: string,
   proof: "creation" | "teardown" = "creation",
 ): IngressHostNetworkProof | undefined {
+  return runDockerSteps(inspectIngressHostNetworkSteps(projectId, proof), createDockerClient(io, dockerClientEnvOptions(context)));
+}
+
+function* inspectIngressHostNetworkSteps(
+  projectId: string,
+  proof: "creation" | "teardown",
+): DockerSteps<IngressHostNetworkProof | undefined> {
   const name = ingressHostNetworkName(projectId);
-  const result = createDockerClient(io, dockerClientEnvOptions(context)).inspect([name], { type: "network" });
+  const result = yield (client) => client.inspect([name], { type: "network" });
   if (result.status !== 0) {
     if (exactMissingNetwork(result.stderr, name)) return undefined;
     die(`could not inspect ingress host network ${name}: ${result.stderr.trim() || `exit ${result.status}`}`);
@@ -414,6 +488,8 @@ export function ingressForwarderRunArguments(input: IngressForwarderInput): stri
   return ["run", ...flags.flatMap((flag) => [...flag]), image, ...command];
 }
 
+export type IngressForwarderStarted = Readonly<{ name: string; containerId: string }>;
+
 /**
  * Starts one ingress forwarder, dual-homing it after the host-facing bind so
  * the one-way invariant holds by construction (spec I2).
@@ -423,6 +499,10 @@ export function ingressForwarderRunArguments(input: IngressForwarderInput): stri
  * (so its listener binds that interface), then connect it to `agent_internal`.
  * A failed connect removes the sidecar rather than leaving a half-homed
  * forwarder that publishes a port it cannot serve.
+ *
+ * The two halves are separate programs (`startIngressForwarderSteps`, then
+ * `connectIngressForwarderSteps`) so an overlapped caller can run them on the
+ * asynchronous client; this synchronous entry runs both back to back.
  */
 export function startIngressForwarder(
   context: RuntimeContext,
@@ -430,8 +510,47 @@ export function startIngressForwarder(
   input: IngressForwarderInput,
   prevalidatedNetwork?: IngressHostNetworkProof,
 ): string {
-  assertInput(input);
   const client = createDockerClient(io, dockerClientEnvOptions(context));
+  const started = runDockerSteps(startIngressForwarderSteps(input, prevalidatedNetwork), client);
+  runDockerSteps(connectIngressForwarderSteps(started, input.internalNetwork), client);
+  return started.name;
+}
+
+/** `startIngressForwarder`'s first half on the asynchronous client: the sidecar is up and LISTENing, not yet attached. */
+export async function startIngressForwarderAsync(
+  context: RuntimeContext,
+  io: RuntimeIO,
+  input: IngressForwarderInput,
+): Promise<IngressForwarderStarted> {
+  return runDockerStepsAsync(
+    startIngressForwarderSteps(input),
+    createAsyncDockerClient(io, dockerClientEnvOptions(context)),
+  );
+}
+
+/** `startIngressForwarder`'s second half on the asynchronous client: attach `agent_internal`, or remove the sidecar. */
+export async function connectIngressForwarderAsync(
+  context: RuntimeContext,
+  io: RuntimeIO,
+  started: IngressForwarderStarted,
+  internalNetwork: string,
+): Promise<void> {
+  return runDockerStepsAsync(
+    connectIngressForwarderSteps(started, internalNetwork),
+    createAsyncDockerClient(io, dockerClientEnvOptions(context)),
+  );
+}
+
+/**
+ * Validates the input, proves the name unused, creates or validates the
+ * host-facing network, runs the sidecar on it alone, and waits until socat is
+ * LISTENing there. The sidecar is not yet on `agent_internal`.
+ */
+export function* startIngressForwarderSteps(
+  input: IngressForwarderInput,
+  prevalidatedNetwork?: IngressHostNetworkProof,
+): DockerSteps<IngressForwarderStarted> {
+  assertInput(input);
   // Build the run request up front: it mints the labels, which reject an
   // invalid project id or purpose. Nothing mutates Docker until the whole
   // input has been validated, so a rejected input never leaves a created
@@ -439,19 +558,19 @@ export function startIngressForwarder(
   const runRequest = ingressForwarderRunRequest(input);
   const hostNetwork = ingressHostNetworkName(input.projectId);
   const name = ingressForwarderName(input.projectId, input.purpose, input.hostPort);
-  const existing = client.inspect([name], { type: "container" });
+  const existing = yield (client) => client.inspect([name], { type: "container" });
   if (existing.status === 0) {
     die(`ingress forwarder ${name} already exists; validate and stop it before replacement`);
   }
   if (!exactMissingContainer(existing.stderr, name)) {
     die(`could not prove ingress forwarder name ${name} is unused: ${existing.stderr.trim() || `exit ${existing.status}`}`);
   }
-  const existingHostNetwork = inspectIngressHostNetwork(context, io, input.projectId);
+  const existingHostNetwork = yield* inspectIngressHostNetworkSteps(input.projectId, "creation");
   if (existingHostNetwork && prevalidatedNetwork && existingHostNetwork.id !== prevalidatedNetwork.id) {
     die(`ingress host network ${hostNetwork} changed after ownership validation`);
   }
   if (!existingHostNetwork) {
-    const created = client.createNetwork(hostNetwork, [
+    const created = yield (client) => client.createNetwork(hostNetwork, [
       `${MANAGED_LABEL}=true`,
       `${PROJECT_ID_LABEL}=${input.projectId}`,
       `${INGRESS_HOST_NETWORK_ROLE_LABEL}=${INGRESS_HOST_NETWORK_ROLE}`,
@@ -460,19 +579,19 @@ export function startIngressForwarder(
     const createdId = created.stdout.trim();
     let inspectedCreated: IngressHostNetworkProof | undefined;
     try {
-      inspectedCreated = inspectIngressHostNetwork(context, io, input.projectId);
+      inspectedCreated = yield* inspectIngressHostNetworkSteps(input.projectId, "creation");
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error);
       if (!FULL_DOCKER_NETWORK_ID_PATTERN.test(createdId)) {
         die(`${reason}; Docker returned no exact ID for the newly created network, so it may remain`);
       }
-      const cleanup = client.removeNetworks([createdId]);
+      const cleanup = yield (client) => client.removeNetworks([createdId]);
       if (cleanup.status === 0 || exactMissingNetwork(cleanup.stderr, createdId)) die(reason);
       die(`${reason}; and cleanup failed, network ${createdId} may remain: ${cleanup.stderr.trim() || `exit ${cleanup.status}`}`);
     }
     if (!inspectedCreated) {
       if (FULL_DOCKER_NETWORK_ID_PATTERN.test(createdId)) {
-        const cleanup = client.removeNetworks([createdId]);
+        const cleanup = yield (client) => client.removeNetworks([createdId]);
         if (cleanup.status !== 0 && !exactMissingNetwork(cleanup.stderr, createdId)) {
           die(`newly created ingress host network ${hostNetwork} disappeared before validation; cleanup failed: ${cleanup.stderr.trim() || `exit ${cleanup.status}`}`);
         }
@@ -480,17 +599,17 @@ export function startIngressForwarder(
       die(`newly created ingress host network ${hostNetwork} disappeared before validation`);
     }
     if (FULL_DOCKER_NETWORK_ID_PATTERN.test(createdId) && inspectedCreated.id !== createdId) {
-      const cleanup = client.removeNetworks([createdId]);
+      const cleanup = yield (client) => client.removeNetworks([createdId]);
       const reason = `ingress host network ${hostNetwork} changed after creation`;
       if (cleanup.status === 0 || exactMissingNetwork(cleanup.stderr, createdId)) die(reason);
       die(`${reason}; and cleanup failed, network ${createdId} may remain: ${cleanup.stderr.trim() || `exit ${cleanup.status}`}`);
     }
   }
-  const run = client.runContainer(runRequest.flags, runRequest.image, runRequest.command);
+  const run = yield (client) => client.runContainer(runRequest.flags, runRequest.image, runRequest.command);
   if (run.status !== 0) die(run.stderr.trim() || `failed to start ingress forwarder ${name}`);
   let containerId = run.stdout.trim();
   if (!FULL_DOCKER_CONTAINER_ID_PATTERN.test(containerId)) {
-    const inspected = client.inspect([name], { type: "container" });
+    const inspected = yield (client) => client.inspect([name], { type: "container" });
     if (inspected.status !== 0) {
       if (exactMissingContainer(inspected.stderr, name)) {
         die(`Docker started ingress forwarder ${name} but returned no exact container ID; the container is already gone`);
@@ -518,9 +637,7 @@ export function startIngressForwarder(
       die(`Docker started ingress forwarder ${name} but returned no exact container ID; its identity is unverified and it may still be running`);
     }
     containerId = recoveredId;
-    dieAfterCleanup(
-      context,
-      io,
+    yield* dieAfterCleanupSteps(
       containerId,
       name,
       `Docker started ingress forwarder ${name} but returned no exact container ID`,
@@ -529,20 +646,43 @@ export function startIngressForwarder(
   // Attach agent_internal only once socat is LISTENing on the host-facing
   // interface. Until then `hostname -i` has not been evaluated, and a premature
   // attach would let it observe two interfaces — dissolving the one-way bind.
-  if (!waitForSocatBind(context, io, containerId, input.hostPort)) {
-    dieAfterCleanup(context, io, containerId, name, `ingress forwarder ${name} did not begin listening on 127.0.0.1:${input.hostPort}`);
+  if (!(yield* waitForSocatBindSteps(containerId, input.hostPort))) {
+    yield* dieAfterCleanupSteps(containerId, name, `ingress forwarder ${name} did not begin listening on 127.0.0.1:${input.hostPort}`);
   }
-  const connected = client.connectNetwork(input.internalNetwork, containerId);
-  if (connected.status !== 0) {
-    dieAfterCleanup(
-      context,
-      io,
+  return Object.freeze({ name, containerId });
+}
+
+/**
+ * Attaches a started, LISTENing forwarder to `agent_internal`. A failed attach
+ * removes the sidecar rather than leaving a half-homed forwarder that
+ * publishes a port it cannot serve.
+ */
+export function* connectIngressForwarderSteps(
+  started: IngressForwarderStarted,
+  internalNetwork: string,
+): DockerSteps<void> {
+  const { name, containerId } = started;
+  // `startIngressForwarderSteps` validated its input's network; a caller that
+  // passes a different one here is held to the same shape, and the sidecar it
+  // started is removed rather than left published and half-homed.
+  if (!NETWORK_NAME_PATTERN.test(internalNetwork)) {
+    yield* dieAfterCleanupSteps(containerId, name, `ingress forwarder internal network is invalid: ${internalNetwork}`);
+  }
+  if (internalNetwork.startsWith(`${HOST_NETWORK_PREFIX}-`)) {
+    yield* dieAfterCleanupSteps(
       containerId,
       name,
-      connected.stderr.trim() || `failed to attach ${name} to ${input.internalNetwork}`,
+      `ingress forwarder internal network must not be the host-facing network: ${internalNetwork}`,
     );
   }
-  return name;
+  const connected = yield (client) => client.connectNetwork(internalNetwork, containerId);
+  if (connected.status !== 0) {
+    yield* dieAfterCleanupSteps(
+      containerId,
+      name,
+      connected.stderr.trim() || `failed to attach ${name} to ${internalNetwork}`,
+    );
+  }
 }
 
 /**
@@ -551,14 +691,8 @@ export function startIngressForwarder(
  * sidecar that outlives its failed startup is a live loopback path, not a
  * no-op. Never returns.
  */
-function dieAfterCleanup(
-  context: RuntimeContext,
-  io: RuntimeIO,
-  containerId: string,
-  name: string,
-  reason: string,
-): never {
-  const cleanup = removeForwarder(context, io, containerId);
+function* dieAfterCleanupSteps(containerId: string, name: string, reason: string): DockerSteps<never> {
+  const cleanup = yield* removeForwarderSteps(containerId);
   die(cleanup.ok ? reason : `${reason}; and cleanup failed, ${name} is still running: ${cleanup.detail}`);
 }
 
@@ -568,17 +702,21 @@ function dieAfterCleanup(
  * state; `0A` is LISTEN) rather than depending on `ss`/`netstat` being present
  * in the image.
  */
-function socatListening(context: RuntimeContext, io: RuntimeIO, name: string, hostPort: string): boolean {
+function* socatListeningSteps(name: string, hostPort: string): DockerSteps<boolean> {
   const portHex = Number(hostPort).toString(16).toUpperCase().padStart(4, "0");
   const script = `awk '$4=="0A" && $2 ~ /:${portHex}$/ {f=1} END{exit f?0:1}' /proc/net/tcp`;
-  return createDockerClient(io, dockerClientEnvOptions(context)).exec(name, ["sh", "-c", script]).status === 0;
+  return (yield (client) => client.exec(name, ["sh", "-c", script])).status === 0;
 }
 
-/** Polls until socat binds, or fails closed if the container dies first. */
-function waitForSocatBind(context: RuntimeContext, io: RuntimeIO, name: string, hostPort: string): boolean {
+/**
+ * Polls until socat binds, or fails closed if the container dies first. The
+ * poll has no sleep: each attempt is paced by its own `docker exec` and
+ * `docker inspect` round-trips, so neither driver blocks between attempts.
+ */
+function* waitForSocatBindSteps(name: string, hostPort: string): DockerSteps<boolean> {
   for (let attempt = 0; attempt < READINESS_ATTEMPTS; attempt += 1) {
-    if (socatListening(context, io, name, hostPort)) return true;
-    if (!containerExists(context, io, name)) return false;
+    if (yield* socatListeningSteps(name, hostPort)) return true;
+    if (!(yield* containerExistsSteps(name))) return false;
   }
   return false;
 }

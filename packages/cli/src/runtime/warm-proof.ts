@@ -64,9 +64,11 @@ import {
   validateRuntimeSecurityContractEvidence,
 } from "./security-contract.ts";
 import { assertComposeManagedLocalVolume } from "./session-named-volume-proof.ts";
-import { listIpAssignmentsScript, parseIpAssignmentListing } from "./session-file-publisher.ts";
+import { listIpAssignmentsScript, parseIpAssignmentListing, servedSetReadScript } from "./session-file-publisher.ts";
+import { parseProxySessionFileListing } from "./session-reconcile.ts";
 import { runtimeValidationMarkerProof, type RuntimeValidationProof } from "./state.ts";
 import { validateRuntimeTopologyWithProof, type WarmTopologyEvidence } from "./topology.ts";
+import { internalNetworkSessionStateBlocker } from "./utility-containers.ts";
 import type { DockerContainerInspect, DockerNetworkInspect, RuntimeContext, RuntimeIO } from "./types.ts";
 
 export const WARM_PROOF_RECORD_NAME = "runtime-warm-proof.json";
@@ -158,6 +160,12 @@ export type WarmValidation = Readonly<{
   bootId: string;
   /** `ip -> sha256 hex` of every IP assignment file the batch read; absent means none. */
   ipAssignmentDigests?: Readonly<Record<string, string>>;
+  /**
+   * Whether this launch's evidence proves the proxy holds no session file and
+   * no session container sits on the internal network. Evidence only, never a
+   * compared fact: anything short of a clean listing is `blocked`.
+   */
+  sessionState: Readonly<{ kind: "empty" }> | Readonly<{ kind: "blocked"; reason: string }>;
 }>;
 
 /**
@@ -232,6 +240,7 @@ function warmBatchCommands(plan: ActiveRuntimePlan, securityProbe: string): stri
     PROXY_HOST_SERVICE_SET_COMMAND,
     PROXY_HOST_SERVICE_GATEWAY_COMMAND,
     PROXY_ETC_HOSTS_STAT_COMMAND,
+    `node -e ${`'${servedSetReadScript().replaceAll("'", "'\\''")}'`}`,
   ];
 }
 
@@ -349,7 +358,7 @@ function judgeWarmObservation(input: WarmProofInput, observation: WarmObservatio
   const { plan, effective } = input;
   const [
     uid, routeInternal, routeEgress, capBnd, nftTable, allowedSet, marker, firewallStatus, securityProbe, bootId, ipAssignments,
-    hostServiceSet, hostServiceGateway, etcHostsStat,
+    hostServiceSet, hostServiceGateway, etcHostsStat, sessionFiles,
   ] = observation.sections as FirewallSectionResult[];
   if (uid.exit !== 0 || uid.body.trim() !== "0") return invalid("batch-identity");
   const daemon = input.daemon;
@@ -397,6 +406,22 @@ function judgeWarmObservation(input: WarmProofInput, observation: WarmObservatio
   for (const issue of topology.issues) topologyIssues.push(issue.message);
   const deny: DenyByDefaultObservationV1 | undefined = topology.denyByDefaultBaseObservation;
   if (topologyIssues.length > 0 || !deny) return invalid("topology");
+
+  // Session-state evidence, judged only over participants the topology above
+  // accepted. Unreadable is never empty.
+  const listedSessionFiles = sessionFiles?.exit === 0 ? parseProxySessionFileListing(sessionFiles.body) : undefined;
+  const participantBlocker = internalNetworkSessionStateBlocker(
+    observation.participants,
+    effective.proxyContainerId,
+    plan.projectId,
+  );
+  const sessionState: WarmValidation["sessionState"] = listedSessionFiles === undefined
+    ? { kind: "blocked", reason: "session-files-unreadable" }
+    : listedSessionFiles.length > 0
+      ? { kind: "blocked", reason: "session-files-present" }
+      : participantBlocker
+        ? { kind: "blocked", reason: participantBlocker }
+        : { kind: "empty" };
 
   const contract = createRuntimeSecurityContract(plan);
   if (securityProbe.exit !== 0) return invalid("security-contract");
@@ -507,6 +532,7 @@ function judgeWarmObservation(input: WarmProofInput, observation: WarmObservatio
     ...(ipAssignments?.exit === 0 && parseIpAssignmentListing(ipAssignments.body)
       ? { ipAssignmentDigests: parseIpAssignmentListing(ipAssignments.body) }
       : {}),
+    sessionState: Object.freeze(sessionState),
   });
   sealedValidations.add(validation);
   return Object.freeze({ kind: "valid", facts, validation });

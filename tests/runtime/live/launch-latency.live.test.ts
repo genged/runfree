@@ -25,24 +25,28 @@
 // p50 about 1.8–2.0 s through the dev wrapper; Gate E/F: p95 <= 1.0 s) are
 // recorded by the benchmark script, not hard-coded here.
 
-import childProcess from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 
-import { composeProjectName, composeServiceContainerId, docker, dockerOrThrow } from "./docker.ts";
+import { composeProjectName, composeServiceContainerId, dockerOrThrow } from "./docker.ts";
 import {
   describeOutput,
   destroyLiveFixture,
-  type CaptureResult,
   type LiveFixture,
   type LiveRuntimeBackend,
   MANAGED_HOLD_RELATIVE_PATH,
   provisionSandboxFixture,
 } from "./fixture.ts";
-import { cliEntryArgv } from "../../support/prebuilt-entry.ts";
+import {
+  launchClaudeTimed,
+  milliseconds,
+  runfreeTimed,
+  sessionContainers,
+  timing,
+} from "./launch-timing-support.ts";
 import { liveTierSelected } from "./tiers.ts";
 
 // The fast paths are part of the trust boundary's proof (a warm launch must
@@ -54,13 +58,6 @@ const extendedTest = liveTierSelected("extended") ? test : test.skip;
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
 const PROVISION_TIMEOUT_MS = 30 * 60_000;
 const TEST_TIMEOUT_MS = 15 * 60_000;
-const CAPTURE_MAX_BYTES = 8 * 1024 * 1024;
-/**
- * One launch of the one-shot stand-in or one `up` on a provisioned runtime.
- * `spawnSync` blocks the worker, so the case timeout cannot fire; a hung
- * launch fails here with its partial output instead.
- */
-const LAUNCH_TIMEOUT_MS = 5 * 60_000;
 
 function requiredBackend(): LiveRuntimeBackend {
   const backend = process.env.TEST_RUNTIME_BACKEND;
@@ -68,55 +65,6 @@ function requiredBackend(): LiveRuntimeBackend {
     throw new Error("TEST_RUNTIME_BACKEND must be docker-desktop for the launch latency tranche");
   }
   return backend;
-}
-
-function runfreeTimed(fixture: LiveFixture, args: readonly string[]): CaptureResult {
-  const result = childProcess.spawnSync(process.execPath, [...cliEntryArgv(), "--workspace", fixture.projectRoot, ...args], {
-    cwd: REPO_ROOT,
-    encoding: "utf8",
-    env: { ...fixture.env, RUNFREE_TIMINGS: "1", RUNFREE_INVOCATION_CWD: REPO_ROOT, RUNFREE_PROJECT_ROOT: REPO_ROOT },
-    maxBuffer: CAPTURE_MAX_BYTES,
-    stdio: ["ignore", "pipe", "pipe"],
-    timeout: LAUNCH_TIMEOUT_MS,
-  });
-  const stdout = typeof result.stdout === "string" ? result.stdout : "";
-  const stderr = typeof result.stderr === "string" ? result.stderr : "";
-  if (result.error) {
-    throw new Error(`runfree ${args.join(" ")} did not finish: ${result.error.message}: ${describeOutput(`${stdout}${stderr}`)}`);
-  }
-  return Object.freeze({ status: result.status ?? 1, stdout, stderr, output: `${stdout}${stderr}` });
-}
-
-/** Every `timing: <phase> <detail>` line, as [phase, detail] pairs. */
-function timingLines(output: string): Array<readonly [string, string]> {
-  return output.split("\n").flatMap((line) => {
-    const match = /timing: (\S+) (.*)$/.exec(line.trimEnd());
-    return match ? [[match[1] as string, match[2] as string] as const] : [];
-  });
-}
-
-function timing(output: string, phase: string): string[] {
-  return timingLines(output).filter(([name]) => name === phase).map(([, detail]) => detail);
-}
-
-function milliseconds(output: string, phase: string): number | undefined {
-  const detail = timing(output, phase).at(-1);
-  const match = detail ? /^([\d.]+)ms$/.exec(detail) : undefined;
-  return match ? Number(match[1]) : undefined;
-}
-
-function launchClaude(fixture: LiveFixture): CaptureResult {
-  const launched = runfreeTimed(fixture, ["claude"]);
-  // Timing lines fill the tail describeOutput keeps; a failure needs the errors.
-  const withoutTimings = launched.output.split("\n").filter((line) => !line.includes(" timing: ")).join("\n");
-  expect(launched.status, describeOutput(withoutTimings, 4000)).toBe(0);
-  return launched;
-}
-
-function sessionContainers(fixture: LiveFixture): string[] {
-  const project = composeProjectName(fixture);
-  const listed = docker(["ps", "-aq", "--no-trunc", "--filter", `name=^runfree-${project.replace(/^runfree-/, "")}-session-`]);
-  return listed.stdout.split("\n").map((line) => line.trim()).filter(Boolean);
 }
 
 function nearestRankP95(values: readonly number[]): number {
@@ -133,8 +81,8 @@ describe("launch latency: sub-second launch plan Phase B", () => {
     fs.rmSync(path.join(fixture.projectRoot, MANAGED_HOLD_RELATIVE_PATH), { force: true });
     // Two launches: the first may still build or select, the second leaves a
     // full validation's warm proof and a completed cleanup stamp behind.
-    launchClaude(fixture);
-    launchClaude(fixture);
+    launchClaudeTimed(fixture);
+    launchClaudeTimed(fixture);
   }, PROVISION_TIMEOUT_MS);
 
   afterAll(() => {
@@ -142,7 +90,7 @@ describe("launch latency: sub-second launch plan Phase B", () => {
   }, PROVISION_TIMEOUT_MS);
 
   coreTest("a warm launch takes the warm proof, the held-lock handoff, and the short exit", () => {
-    const warm = launchClaude(fixture);
+    const warm = launchClaudeTimed(fixture);
     const output = warm.output;
     expect(timing(output, "validation:warm-proof"), describeOutput(output)).toContain("match");
     // The full validation's phases did not run.
@@ -163,12 +111,23 @@ describe("launch latency: sub-second launch plan Phase B", () => {
     expect(sessionContainers(fixture)).toEqual([]);
   }, TEST_TIMEOUT_MS);
 
+  coreTest("a warm launch with no session state skips the startup reconcile", () => {
+    // The previous case already left the project with no session file, no
+    // lifecycle record and no session container, so this launch's own
+    // evidence proves the empty state the skip depends on.
+    const warm = launchClaudeTimed(fixture);
+    const output = warm.output;
+    expect(timing(output, "startup:warm-empty"), describeOutput(output)).toContain("empty");
+    expect(timing(output, "startup:reconcile-sessions"), describeOutput(output)).toContain("skipped warm-empty");
+    expect(timing(output, "launch-handoff"), describeOutput(output)).toContain("minted");
+  }, TEST_TIMEOUT_MS);
+
   coreTest("runfree up always validates fully, and the next launch is warm again", () => {
     const up = runfreeTimed(fixture, ["up"]);
     expect(up.status, describeOutput(up.output)).toBe(0);
     expect(milliseconds(up.output, "validation:topology"), describeOutput(up.output)).toBeGreaterThan(0);
     expect(timing(up.output, "validation:warm-proof")).toContain("recorded");
-    const warm = launchClaude(fixture);
+    const warm = launchClaudeTimed(fixture);
     expect(timing(warm.output, "validation:warm-proof"), describeOutput(warm.output)).toContain("match");
   }, TEST_TIMEOUT_MS);
 
@@ -176,12 +135,12 @@ describe("launch latency: sub-second launch plan Phase B", () => {
     const project = composeProjectName(fixture);
     const proxyId = composeServiceContainerId(project, "proxy");
     dockerOrThrow("restart the proxy in place", ["restart", proxyId]);
-    const restarted = launchClaude(fixture);
+    const restarted = launchClaudeTimed(fixture);
     const verdicts = timing(restarted.output, "validation:warm-proof");
     expect(verdicts.some((verdict) => verdict.startsWith("mismatch:")), describeOutput(restarted.output)).toBe(true);
     expect(milliseconds(restarted.output, "validation:topology")).toBeGreaterThan(0);
     // And the one after it is warm on the new incarnation.
-    const warm = launchClaude(fixture);
+    const warm = launchClaudeTimed(fixture);
     expect(timing(warm.output, "validation:warm-proof"), describeOutput(warm.output)).toContain("match");
   }, TEST_TIMEOUT_MS);
 
@@ -202,10 +161,10 @@ describe("launch latency: sub-second launch plan Phase B", () => {
     // Reclaim: the next launch recovers the stopped proxy through the
     // compatible rebind, which records no warm proof; the launch after it
     // validates fully and records one; the one after that is warm.
-    launchClaude(fixture);
-    const recorded = launchClaude(fixture);
+    launchClaudeTimed(fixture);
+    const recorded = launchClaudeTimed(fixture);
     expect(timing(recorded.output, "validation:warm-proof"), describeOutput(recorded.output)).toContain("recorded");
-    const warm = launchClaude(fixture);
+    const warm = launchClaudeTimed(fixture);
     expect(timing(warm.output, "validation:warm-proof"), describeOutput(warm.output)).toContain("match");
   }, TEST_TIMEOUT_MS);
 
@@ -215,7 +174,7 @@ describe("launch latency: sub-second launch plan Phase B", () => {
     const samples: Array<Record<string, number | string | undefined>> = [];
     for (let index = 0; index < runs; index += 1) {
       const startedAt = performance.now();
-      const launched = launchClaude(fixture);
+      const launched = launchClaudeTimed(fixture);
       const wallMs = performance.now() - startedAt;
       const admission = ["admission:preflight", "admission:allocate", "admission:create-started", "admission:prove-running", "admission:activate", "admission:await-handoff"]
         .reduce((sum, phase) => sum + (milliseconds(launched.output, phase) ?? 0), 0);

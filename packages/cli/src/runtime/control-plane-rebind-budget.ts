@@ -1,3 +1,5 @@
+import type { SpawnSyncOptions } from "node:child_process";
+
 import { checkBeforeSpawn } from "./io-refusal.ts";
 import type { RuntimeIO } from "./types.ts";
 import { readControlPlaneRebindTransaction } from "./control-plane-rebind.ts";
@@ -32,19 +34,30 @@ export function withRebindBudgetIO(io: RuntimeIO, stateDir: string, project: Ses
     }
     return Math.floor(milliseconds);
   };
+  // Captured mutators spend the same durable allowance as run(). Exact
+  // defensive stop remains available for proved containment after expiry.
+  const admitCapture = (command: string, args: string[], options: SpawnSyncOptions): SpawnSyncOptions => {
+    if (command === "docker" && (["create", "run", "start", "restart", "rm", "cp", "compose"].includes(args[0])
+      || args[0] === "container" && ["create", "start", "restart", "rm"].includes(args[1])
+      || ["network", "volume"].includes(args[0]) && ["create", "connect", "disconnect", "rm"].includes(args[1]))) checkBeforeSpawn(assertMutationAllowance);
+    const budget = checkBeforeSpawn(remaining);
+    return { ...options, timeout: Math.min(options.timeout ?? budget, budget) };
+  };
+  const { captureAsync } = io;
   return {
     ...io,
     capture(command, args, options = {}) {
-      // Captured mutators spend the same durable allowance as run(). Exact
-      // defensive stop remains available for proved containment after expiry.
-      if (command === "docker" && (["create", "run", "start", "restart", "rm", "cp", "compose"].includes(args[0])
-        || args[0] === "container" && ["create", "start", "restart", "rm"].includes(args[1])
-        || ["network", "volume"].includes(args[0]) && ["create", "connect", "disconnect", "rm"].includes(args[1]))) checkBeforeSpawn(assertMutationAllowance);
-      const budget = checkBeforeSpawn(remaining);
-      const result = io.capture(command, args, { ...options, timeout: Math.min(options.timeout ?? budget, budget) });
+      const result = io.capture(command, args, admitCapture(command, args, options));
       remaining();
       return result;
     },
+    ...(captureAsync ? {
+      async captureAsync(command: string, args: string[], options: SpawnSyncOptions = {}) {
+        const result = await captureAsync.call(io, command, args, admitCapture(command, args, options));
+        remaining();
+        return result;
+      },
+    } : {}),
     run(command, args, options = {}) {
       checkBeforeSpawn(assertMutationAllowance);
       const budget = checkBeforeSpawn(remaining);

@@ -326,8 +326,12 @@ The compatible active-session restart path is enabled: a compatible proxy replac
 
 A surviving session's launch process rebinds its own held authority after that transaction completes. Before each heartbeat it compares its held proxy container ID and control plane generation digest with the durable selection, and on a change it adopts exactly one completed compatible rebind of its own session — the durable candidate selection plus its registry record advanced only by the rebind writer's fields — and then beats and revokes against the new proxy. Any other divergence between held and durable authority refuses before any durable write, and the next launch reclaims the residue.
 
-A warm session launch can skip the full runtime validation. Every full
-validation ends by recording a warm-proof fingerprint in host state: the proxy
+A warm session launch can skip the full runtime validation. A full validation
+records a warm-proof fingerprint in host state only after the startup session
+reconcile that follows it found nothing to repair; a reconcile that fails or
+repairs residue removes the record instead, so a later launch cannot match a
+fingerprint that names a participant the reconcile was about to remove. The
+fingerprint holds the proxy
 container id, `StartedAt`, PID, image, and network endpoints; both networks
 and their participants; the session volumes; the agent image; both generation
 families; the security contract hash; the Git layout; the proxy CA and agent
@@ -504,6 +508,16 @@ directory, and the driver's ladder is:
    entry (`/usr/local/libexec/runfree/session-entry`), with the agent launch
    as its argv; it polls the request proxy with the exact readiness request
    and does not exec the agent until the proxy answers `200 active`.
+   When the session needs an MCP OAuth callback, its forwarder is reserved
+   (the forwarder's `docker run -p` and its readiness) beside the start and
+   the running proof below, once the durable record names the exact
+   container. Attaching the forwarder to `agent_internal`, the in-session
+   bridge, and the host path probe follow the running proof and come before
+   the session file is written. The attach waits for the proof because the
+   forwarder's address on `agent_internal` is dynamic, and the session's
+   static address is bound only when the container starts; attaching earlier
+   could let the forwarder take it. See
+   [Session MCP OAuth Callbacks](#session-mcp-oauth-callbacks).
 4. **Prove running** takes one post-start inspection, held byte-exact to the
    create plan — image, entrypoint and argv, user, capability drops,
    no-new-privileges, restart policy, every mount and its flags, environment,
@@ -551,35 +565,60 @@ the attached wait ([driver](../packages/cli/src/runtime/session-admission-driver
 
 A warm `claude`, `codex`, `pi`, `shell`, or `mcp auth` launch does not release
 the lock between startup and admission. When its credential sync needed no
-source read, startup hands the exact held lock to the launch, in process memory
-and at most once, with what it proved under it: the proxy id and `StartedAt`,
-the registry digest after its reconcile, whether that reconcile saw only
-settled state, and the addresses the proxy's session files reserved. Admission
-then skips repeating the reconcile and the orphan sweep only if that reconcile
-was settled, the registry on disk is unchanged, and one inspection shows the
-same proxy incarnation (a restarted proxy refuses as stale and the launch
-re-prepares once). It still checks quarantine and unreclaimed records, reads a
-fresh network baseline, fences the address, and holds the started container to
-the one post-start inspection. Every launch caller releases a handoff nobody
-took; a crashed process leaves an ordinary stale lock. `runfree up` and
+source read, startup hands the exact held lock to the launch, in process
+memory and at most once, with what it proved under it: the proxy id and
+`StartedAt`, the registry digest, and how the project's sessions were settled.
+That is either the startup reconcile's result (whether it saw only settled
+state, and the addresses the proxy's session files reserved) or a warm-empty
+state, below. Admission then skips repeating the reconcile and the orphan
+sweep only if that reconcile was settled or the warm-empty state is consumed,
+the registry on disk is unchanged, and one inspection shows the same proxy
+incarnation (a restarted proxy refuses as stale and the launch re-prepares
+once). It still checks quarantine and unreclaimed records, reads a fresh
+network baseline, fences the address, and holds the started container to the
+one post-start inspection. Every launch caller releases a handoff nobody took;
+a crashed process leaves an ordinary stale lock. `runfree up` and
 `runfree resume` never hand off (the recovery claim takes the lifecycle lock
 itself).
 
-One launch's continuous hold of the lock — from startup's acquisition when
-the lock is handed off, otherwise from admission's own — is planned against a
-50 s budget, so another command's one-minute wait for the lock outlasts it
-([launch-lock-hold](../packages/cli/src/runtime/launch-lock-hold.ts)).
-Startup hands the lock off only if it has held it for at most 8 s, and the
-launch frame checks that again when it takes the handoff; past it, the lock is
+A warm launch that asked for a handoff can skip the startup reconcile itself
+when its own evidence, all taken under the held lock, shows the project holds
+no session state: the warm proof's root batch read a session-file listing
+that parsed and was empty, and `agent_internal` held no session container and
+no participant beside the proxy except ingress forwarders; the lifecycle
+registry, re-read, holds no record and no quarantined record; and one
+`docker ps --all` listing over every container on the host shows nothing the
+reconciler would treat as one of this project's sessions. That listing judges
+each container with the same session-hint rule the reconciler uses, reading
+both the joined label view and each label it needs by exact key; a row whose
+two views disagree, a malformed row, or a failed listing counts as
+unreadable. Startup then hands admission a sealed, one-shot `warm-empty`
+state bound to the empty registry digest, the proxy id and `StartedAt`, and
+the lock owner. Admission accepts only a state it can consume against what it
+has just re-proved; a copy, a second use, or any mismatch sends it through
+its full preflight, reconcile included. Any failed or unreadable check
+reconciles as before, and so do `runfree up`, `runfree rebuild`,
+`runfree resume`, and every launch that did not ask for a handoff.
+
+One launch's continuous hold of the lock — from startup's acquisition when the
+lock is handed off, otherwise from admission's own — is planned against a 50 s
+budget, so another command's one-minute wait for the lock outlasts it
+([launch-lock-hold](../packages/cli/src/runtime/launch-lock-hold.ts)). Startup
+hands the lock off only if it has held it for at most 8 s, and the launch
+frame checks that again when it takes the handoff; past it, the lock is
 released and admission takes its own, running the full preflight. Admission's
 bounded steps fill the rest: the running proof (30 s), the MCP OAuth callback
-setup (12 s in total, every Docker call in it cut off at the time left and
-the host probe stopped at the deadline), and the handoff wait, which ends by
-the budget's deadline. The 10 s between the budget and the minute is the
-allowance for the short daemon round-trips between those steps, which carry
-no timeout of their own. A unit test pins that arithmetic. A launch that
-releases a lock startup held too long waits about half a second before taking
-its own, so a command already waiting gets the lock first.
+setup, and the handoff wait. The callback reservation runs beside the running
+proof, with a budget 18 s shorter, so it is planned to end inside the proof;
+its cut-off is a timer, so it can overrun that budget by at most one blocking
+synchronous call. The rest of the callback setup runs after the proof within
+12 s. Every Docker call in either part is cut off at the time left, and the
+host probe stops at the deadline. The handoff wait ends by the budget's
+deadline. The 10 s between the budget and the minute is the allowance for the
+short daemon round-trips between those steps, which carry no timeout of their
+own. A unit test pins that arithmetic. A launch that releases a lock startup
+held too long waits about half a second before taking its own, so a command
+already waiting gets the lock first.
 
 The budget covers the steps that are slow in ordinary use. It does not bound
 their fault cases, which can still stretch one hold past the minute: the IP
@@ -649,7 +688,7 @@ Any other answer, and every reconcile, keeps the full sequence. The next contain
 fence verifies old kernel sockets and consumer authority are gone. Teardown
 latency is not a security guard.
 
-**Reconcile** runs at every launch preflight (or, for a held-lock handoff, in the startup that handed the lock over) and at `runfree up`, under the
+**Reconcile** runs at every launch preflight (or, for a held-lock handoff, in the startup that handed the lock over, unless that startup proved the warm-empty state above) and at `runfree up`, under the
 same held lock as the allocation that follows
 ([reconcile](../packages/cli/src/runtime/session-reconcile.ts)): delete proxy
 files no lifecycle record claims, tear down records whose owner is provably
@@ -1037,8 +1076,8 @@ from the session's own source IP and is admitted as that session.
 #### Session MCP OAuth Callbacks
 
 When the selected OAuth policy names an MCP server, every launched session —
-agent, shell, resume, or `mcp auth` — gets its own callback path, set up after
-the running proof and before activation, so no client starts first
+agent, shell, resume, or `mcp auth` — gets its own callback path, ready
+before activation, so no client starts first
 ([session-mcp-callback.ts](../packages/cli/src/runtime/session-mcp-callback.ts)):
 
 ```text
@@ -1049,6 +1088,18 @@ host 127.0.0.1:P -> forwarder (bound to session S) -> S's address:P
 - **Port.** The project's legacy callback port first, then up to 31
   alternatives in the same block. A port another forwarder or host process
   holds is skipped; Docker's loopback publication is the reservation.
+- **Two phases.** The reservation (the forwarder's `docker run -p` and its
+  readiness, on the host-facing network only) starts once the provisioning
+  record names the exact session container, and runs beside the container's
+  start and running proof. Its budget is 18 s shorter than the proof's, so it
+  is planned to end inside the proof and so inside the launch's lock hold; its
+  cut-off is a timer, so it can overrun that budget by at most one blocking
+  synchronous call. The rest runs after the running proof and before the
+  session file: attaching the forwarder to `agent_internal` (its address there
+  is dynamic, and the session's static address is bound only at start), the
+  bridge, and the host path probe. A failure in either phase, or in the
+  container's own start, waits for the other branch to settle under the
+  lifecycle lock before any cleanup runs.
 - **Binding.** The forwarder's `docker run` mints `RUNFREE_CALLBACK_SESSION_ID`
   and `RUNFREE_CALLBACK_SESSION_CONTAINER`, so no forwarder exists without its
   owner. Topology validation accepts it only when that container is a running

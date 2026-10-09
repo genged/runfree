@@ -278,27 +278,33 @@ export function readProxySessionFiles(
       error,
     );
   }
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(result.stdout);
-  } catch {
-    parsed = undefined;
-  }
-  if (!Array.isArray(parsed)) {
+  const files = parseProxySessionFileListing(result.stdout);
+  if (files === undefined) {
     throw observationUnavailable(
       input.proxyId,
       `the proxy's session file listing is unreadable; run \`${remedy.up()}\` and retry`,
     );
   }
+  return files;
+}
+
+/**
+ * The served-set script's stdout as session files, or undefined when it is not
+ * a JSON array of entries that each parse. Undefined is "no answer", never "no
+ * files": every caller must treat it as an unavailable observation.
+ */
+export function parseProxySessionFileListing(stdout: string): readonly ProxySessionFile[] | undefined {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(stdout);
+  } catch {
+    return undefined;
+  }
+  if (!Array.isArray(parsed)) return undefined;
   const files: ProxySessionFile[] = [];
   for (const entry of parsed) {
     const file = parseProxySessionFile(entry);
-    if (!file) {
-      throw observationUnavailable(
-        input.proxyId,
-        `the proxy's session file listing is unreadable; run \`${remedy.up()}\` and retry`,
-      );
-    }
+    if (!file) return undefined;
     files.push(file);
   }
   return Object.freeze(files);

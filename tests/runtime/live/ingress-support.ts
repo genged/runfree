@@ -21,13 +21,19 @@ import path from "node:path";
 
 import { CONTAINER_ROLE_LABEL, INGRESS_PURPOSE_LABEL } from "../../../packages/cli/src/runtime/container-inventory.ts";
 import { AGENT_UID_GID, PROJECT_ID_LABEL } from "../../../packages/cli/src/runtime/constants.ts";
-import { peekSessionContainerRecordsV2, SESSION_CONTAINER_LABELS } from "../../../packages/cli/src/runtime/session-containers.ts";
+import {
+  listSessionContainerRecordsV2,
+  peekSessionContainerRecordsV2,
+  SESSION_CONTAINER_LABELS,
+  type SessionContainerRecordV2,
+} from "../../../packages/cli/src/runtime/session-containers.ts";
 import { runfreeStateRoot } from "../../../packages/cli/src/paths.ts";
 import { cliEntryArgv } from "../../support/prebuilt-entry.ts";
-import { stageLongLivedAgentBinary } from "./agent-stub.ts";
+import { stageLongLivedAgentBinary, startObservationStub } from "./agent-stub.ts";
 import { ATTACHED_WAIT_TIMEOUT_MS, REPO_ROOT, SESSION_TEARDOWN_TIMEOUT_MS, awaitAgentStarted } from "./attached-support.ts";
 import { containerAddressOnNetwork, docker, dockerOrThrow, internalNetworkId } from "./docker.ts";
 import { describeOutput, sessionAgentContainerIds, type LiveFixture } from "./fixture.ts";
+import { LAUNCH_TIMEOUT_MS } from "./launch-timing-support.ts";
 
 const CAPTURE_MAX_BYTES = 8 * 1024 * 1024;
 
@@ -47,6 +53,19 @@ export const CALLBACK_PORT_FILE = "/tmp/runfree-mcp-oauth-callback-port";
 export const CALLBACK_BRIDGE_MARKER = "runfree_mcp_callback_bridge";
 /** The OAuth-shaped path the host-side "browser" requests; echoed back byte for byte. */
 export const CALLBACK_REQUEST_PATH = "/callback/abc?code=synthetic&state=x";
+
+/**
+ * Where the agent stub records what it saw at its first instruction: the
+ * callback port file's contents, or `absent`. One file per session, named by
+ * `RUNFREE_SESSION_ID` or else the container's hostname.
+ *
+ * Container-local on purpose, never the `/workspace` bind mount: on Docker
+ * Desktop a bind-mounted file's mtime comes from the host's clock, while
+ * `State.StartedAt` comes from the VM's. A file in the container's own
+ * filesystem is stamped by the same VM kernel that stamps the daemon's times,
+ * and a fresh session container cannot hold an earlier session's record.
+ */
+export const CALLBACK_AT_START_CONTAINER_DIR = "/tmp/runfree-callback-at-start";
 
 /** Bound for a launch's callback forwarder to appear once its agent is up. */
 export const CALLBACK_FORWARDER_TIMEOUT_MS = 60_000;
@@ -83,7 +102,9 @@ function git(projectRoot: string, args: readonly string[]): void {
  * `ensureMcpOAuthEligible` makes it eligible the way a user would.
  */
 export function configureIngressProject(fixture: LiveFixture): void {
-  stageLongLivedAgentBinary(fixture);
+  // Only this tranche records the callback port file at the agent's first
+  // instruction; every other tranche stages the plain long-lived stub.
+  stageLongLivedAgentBinary(fixture, { firstInstructions: startObservationStub(CALLBACK_AT_START_CONTAINER_DIR, CALLBACK_PORT_FILE) });
   runOrThrow(fixture, ["service", "enable", "agent-claude", "--no-reload"]);
   fs.writeFileSync(path.join(fixture.projectRoot, ".mcp.json"), MCP_FIXTURE_JSON);
   git(fixture.projectRoot, ["add", ".mcp.json"]);
@@ -140,8 +161,13 @@ export type ContainerInspect = Readonly<{
   Id: string;
   Name?: string;
   Image?: string;
-  State?: Readonly<{ Running?: boolean; Status?: string }>;
-  Config?: Readonly<{ User?: string; Env?: readonly string[] | null; Labels?: Readonly<Record<string, string>> | null }>;
+  State?: Readonly<{ Running?: boolean; Status?: string; StartedAt?: string }>;
+  Config?: Readonly<{
+    Hostname?: string;
+    User?: string;
+    Env?: readonly string[] | null;
+    Labels?: Readonly<Record<string, string>> | null;
+  }>;
   HostConfig?: Readonly<{
     AutoRemove?: boolean;
     Binds?: readonly string[] | null;
@@ -296,16 +322,22 @@ export type CliLaunch = Readonly<{
  * and its lifecycle record to be attached.
  *
  * The new session is the one session-agent container that was not running
- * before the spawn, so launches must be started one at a time. Stdin is a
- * pipe held open for the whole launch: a login shell attached to a closed
- * stdin exits at once, and the agent stub ignores it.
+ * before the spawn, so launches must be started one at a time — unless
+ * `byOwnerPid` is set. Then the session is the new container whose lifecycle
+ * record names this spawn's pid as its host process (the CLI runs in the
+ * spawned process itself, so `hostPid` is that pid), which tells apart
+ * launches started at the same moment. Stdin is a pipe held open for the
+ * whole launch: a login shell attached to a closed stdin exits at once, and
+ * the agent stub ignores it.
  */
 export async function startCliSession(
   fixture: LiveFixture,
   project: string,
   args: readonly string[],
-  options: Readonly<{ label: string; extraEnv?: NodeJS.ProcessEnv }>,
+  options: Readonly<{ label: string; extraEnv?: NodeJS.ProcessEnv; byOwnerPid?: boolean }>,
 ): Promise<CliLaunch> {
+  const projectId = project.replace(/^runfree-/u, "");
+  const stateDir = path.join(runfreeStateRoot(fixture.env), "projects", projectId);
   const before = new Set(sessionAgentContainerIds(project));
   const child = childProcess.spawn(
     process.execPath,
@@ -332,10 +364,21 @@ export async function startCliSession(
     });
   });
 
+  /** New session containers, narrowed to this spawn's own when launches overlap. */
+  const freshContainers = (): string[] => {
+    const fresh = sessionAgentContainerIds(project).filter((id) => !before.has(id));
+    if (!options.byOwnerPid || fresh.length === 0) return fresh;
+    const records = peekSessionContainerRecordsV2(stateDir, { projectId, composeProject: project }).records;
+    return fresh.filter((id) => {
+      const sessionId = inspectContainer(id)?.Config?.Labels?.[SESSION_CONTAINER_LABELS.sessionId];
+      return records.some((record) => record.sessionId === sessionId && record.hostPid === child.pid);
+    });
+  };
+
   let containerId: string | undefined;
   const deadline = Date.now() + ATTACHED_WAIT_TIMEOUT_MS;
   while (!containerId) {
-    const fresh = sessionAgentContainerIds(project).filter((id) => !before.has(id));
+    const fresh = freshContainers();
     if (fresh.length > 1) {
       child.kill("SIGKILL");
       throw new Error(`${options.label}: ${fresh.length} new session containers appeared for one launch`);
@@ -362,8 +405,6 @@ export async function startCliSession(
   // only once its own handoff poll sees the entry exec the agent. Consumers
   // that resolve "the" session (`runfree forward`, `vnc`) accept only an
   // attached record, so the launch is not usable until then.
-  const projectId = project.replace(/^runfree-/u, "");
-  const stateDir = path.join(runfreeStateRoot(fixture.env), "projects", projectId);
   for (;;) {
     const record = peekSessionContainerRecordsV2(stateDir, { projectId, composeProject: project }).records
       .find((candidate) => candidate.sessionId === sessionId);
@@ -626,4 +667,290 @@ export function hostTcpBanner(port: string, bytes: number, timeoutMs = 5000): Pr
     socket.on("error", reject);
     socket.on("close", () => reject(new Error(`connection closed before a ${bytes}-byte banner (got ${JSON.stringify(data)})`)));
   });
+}
+
+// ---------------------------------------------------------------------------
+// Launches that are expected to fail or to be killed
+// ---------------------------------------------------------------------------
+
+export type SpawnedCli = Readonly<{
+  child: childProcess.ChildProcess;
+  pid: number;
+  /** Settles when the CLI's pipes close, or when the hang backstop kills its group. */
+  completion: Promise<Readonly<{ status: number | null; output: string; elapsedMs: number }>>;
+  output: () => string;
+  /** SIGKILLs the CLI process only; the Docker children it spawned survive, as after a closed terminal. */
+  killOwner: () => Promise<void>;
+  /** SIGKILLs the CLI's whole process group. Cleanup only. */
+  killGroup: () => void;
+}>;
+
+/**
+ * One CLI invocation as a child process, so a test can overlap it with other
+ * work, act on Docker events while it runs, or kill it.
+ *
+ * Detached into its own process group so cleanup can reach every Docker child
+ * the CLI left behind. The group is killed at `LAUNCH_TIMEOUT_MS` whatever
+ * the CLI is doing, so awaiting `completion` is always bounded.
+ */
+export function spawnCli(fixture: LiveFixture, args: readonly string[], extraEnv: NodeJS.ProcessEnv = {}): SpawnedCli {
+  const startedAt = Date.now();
+  const child = childProcess.spawn(
+    process.execPath,
+    [...cliEntryArgv(), "--workspace", fixture.projectRoot, ...args],
+    {
+      cwd: REPO_ROOT,
+      detached: true,
+      env: { ...fixture.env, RUNFREE_INVOCATION_CWD: REPO_ROOT, RUNFREE_PROJECT_ROOT: REPO_ROOT, ...extraEnv },
+      stdio: ["pipe", "pipe", "pipe"],
+    },
+  );
+  if (child.pid === undefined) throw new Error(`runfree ${args.join(" ")} did not spawn`);
+  const pid = child.pid;
+  let output = "";
+  const collect = (chunk: Buffer | string): void => {
+    output = (output + String(chunk)).slice(-CAPTURE_MAX_BYTES);
+  };
+  child.stdout?.on("data", collect);
+  child.stderr?.on("data", collect);
+  child.stdin?.on("error", () => undefined);
+  const exited = new Promise<void>((resolve) => {
+    if (child.exitCode !== null || child.signalCode !== null) resolve();
+    else child.once("exit", () => resolve());
+  });
+  const killGroup = (): void => {
+    try { process.kill(-pid, "SIGKILL"); } catch { /* the group is already gone */ }
+  };
+  const backstop = setTimeout(killGroup, LAUNCH_TIMEOUT_MS);
+  // Never what keeps the worker alive: an exited CLI clears it, and a worker
+  // shutting down with the CLI still running is cleaned up by afterEach.
+  backstop.unref();
+  const completion = new Promise<Readonly<{ status: number | null; output: string; elapsedMs: number }>>((resolve, reject) => {
+    child.once("error", reject);
+    child.once("close", (status) => resolve(Object.freeze({ status, output, elapsedMs: Date.now() - startedAt })));
+  });
+  void completion.then(() => clearTimeout(backstop), () => clearTimeout(backstop));
+  const killOwner = async (): Promise<void> => {
+    child.kill("SIGKILL");
+    await exited;
+    // The surviving Docker children inherited these pipes; release this end
+    // so `close` does not wait on the very processes the kill leaves running.
+    child.stdin?.destroy();
+    child.stdout?.destroy();
+    child.stderr?.destroy();
+  };
+  return Object.freeze({ child, pid, completion, output: () => output, killOwner, killGroup });
+}
+
+// ---------------------------------------------------------------------------
+// Docker events
+// ---------------------------------------------------------------------------
+
+export type DockerEvent = Readonly<{
+  Type?: string;
+  Action?: string;
+  Actor?: Readonly<{ ID?: string; Attributes?: Readonly<Record<string, string>> }>;
+}>;
+
+export type DockerEventWatcher = Readonly<{
+  /** Ends the `docker events` process and waits for it to exit. Idempotent. */
+  stop: () => Promise<void>;
+  /** The first exception a handler threw, rendered; undefined when none did. */
+  handlerError: () => string | undefined;
+}>;
+
+const EVENT_WATCHER_STOP_TIMEOUT_MS = 5_000;
+
+/** The daemon's own clock, so `--since` is measured on the clock that stamps events. */
+export function daemonNow(): string {
+  const now = JSON.parse(dockerOrThrow("daemon clock", ["info", "--format", "{{json .SystemTime}}"])) as unknown;
+  if (typeof now !== "string" || now === "") throw new Error(`docker info reported no SystemTime: ${String(now)}`);
+  return now;
+}
+
+/**
+ * Streams `docker events` as parsed JSON to `onEvent`, from `since` (a daemon
+ * timestamp taken before the action under test starts).
+ *
+ * `--since` replays everything after that instant, so an event that fires
+ * before the subscription is fully established is still delivered: the
+ * watcher never has to win a race with the launch it watches. Handlers run
+ * synchronously in arrival order. The caller must `stop()` the watcher in a
+ * `finally`.
+ */
+export function watchDockerEvents(
+  since: string,
+  filters: readonly string[],
+  onEvent: (event: DockerEvent) => void,
+): DockerEventWatcher {
+  const child = childProcess.spawn(
+    "docker",
+    ["events", "--since", since, "--format", "{{json .}}", ...filters.flatMap((filter) => ["--filter", filter])],
+    { stdio: ["ignore", "pipe", "pipe"] },
+  );
+  let buffered = "";
+  let handlerError: string | undefined;
+  let stderr = "";
+  child.stderr?.on("data", (chunk) => { stderr = (stderr + String(chunk)).slice(-8192); });
+  child.stdout?.on("data", (chunk) => {
+    buffered += String(chunk);
+    let newline = buffered.indexOf("\n");
+    while (newline >= 0) {
+      const line = buffered.slice(0, newline).trim();
+      buffered = buffered.slice(newline + 1);
+      newline = buffered.indexOf("\n");
+      if (!line) continue;
+      try {
+        onEvent(JSON.parse(line) as DockerEvent);
+      } catch (error) {
+        handlerError ??= error instanceof Error ? error.message : String(error);
+      }
+    }
+  });
+  const closed = new Promise<void>((resolve) => {
+    if (child.exitCode !== null || child.signalCode !== null) resolve();
+    else child.once("close", () => resolve());
+  });
+  // A watcher that dies on its own (a bad filter, a lost daemon) must fail the
+  // case rather than look like a launch that emitted no events.
+  let stopping = false;
+  void closed.then(() => {
+    if (!stopping) handlerError ??= `docker events exited early: ${describeOutput(stderr)}`;
+  });
+  const stop = async (): Promise<void> => {
+    stopping = true;
+    if (child.exitCode === null && child.signalCode === null) child.kill("SIGTERM");
+    let timer: NodeJS.Timeout | undefined;
+    const escalated = new Promise<void>((resolve) => {
+      timer = setTimeout(() => {
+        child.kill("SIGKILL");
+        resolve();
+      }, EVENT_WATCHER_STOP_TIMEOUT_MS);
+    });
+    await Promise.race([closed, escalated]);
+    clearTimeout(timer);
+    await closed;
+  };
+  return Object.freeze({ stop, handlerError: () => handlerError });
+}
+
+// ---------------------------------------------------------------------------
+// Session residue readback
+// ---------------------------------------------------------------------------
+
+/** Every session-agent container of the project, created, running, or exited. */
+export function allSessionContainers(project: string): readonly string[] {
+  return dockerOrThrow("list session containers", [
+    "ps", "-a", "--no-trunc",
+    // Session agents carry Runfree's compose-project label, never Compose's.
+    "--filter", `label=${SESSION_CONTAINER_LABELS.composeProject}=${project}`,
+    "--filter", `label=${SESSION_CONTAINER_LABELS.role}=session-agent`,
+    "--format", "{{.ID}}",
+  ]).split("\n").map((line) => line.trim()).filter(Boolean);
+}
+
+/** The project's lifecycle registry, strictly: a quarantined or unreadable record throws. */
+export function sessionRegistryRecords(fixture: LiveFixture, project: string): readonly SessionContainerRecordV2[] {
+  const projectId = project.replace(/^runfree-/u, "");
+  const stateDir = path.join(runfreeStateRoot(fixture.env), "projects", projectId);
+  return listSessionContainerRecordsV2(stateDir, { projectId, composeProject: project });
+}
+
+/**
+ * The registry, tolerantly: a record mid-replacement is skipped rather than
+ * thrown on. For sampling while a launch runs; residue claims use the strict
+ * `sessionRegistryRecords`.
+ */
+export function peekSessionRegistryRecords(fixture: LiveFixture, project: string): readonly SessionContainerRecordV2[] {
+  const projectId = project.replace(/^runfree-/u, "");
+  const stateDir = path.join(runfreeStateRoot(fixture.env), "projects", projectId);
+  return peekSessionContainerRecordsV2(stateDir, { projectId, composeProject: project }).records;
+}
+
+/**
+ * Waits for a launch that must fail, and fails fast if it attaches instead.
+ *
+ * A launch that unexpectedly attaches would otherwise hold its session until
+ * the spawn backstop, minutes later. Its lifecycle record names the spawn's
+ * pid as `hostPid` and reaches `attached` at the handoff, so the first sample
+ * that sees it kills the launch's process group and throws at once.
+ */
+export async function awaitExitUnlessAttached(
+  fixture: LiveFixture,
+  project: string,
+  run: SpawnedCli,
+  label: string,
+): Promise<Readonly<{ status: number | null; output: string; elapsedMs: number }>> {
+  let settled: Readonly<{ status: number | null; output: string; elapsedMs: number }> | undefined;
+  let spawnError: unknown;
+  let rejected = false;
+  void run.completion.then((result) => { settled = result; }, (error: unknown) => { spawnError = error; rejected = true; });
+  for (;;) {
+    if (settled) return settled;
+    if (rejected) throw spawnError;
+    const attached = peekSessionRegistryRecords(fixture, project)
+      .find((record) => record.hostPid === run.pid && record.state === "attached");
+    if (attached) {
+      run.killGroup();
+      await run.completion.catch(() => undefined);
+      throw new Error(`${label}: the launch attached session ${attached.sessionId} instead of failing: ${describeOutput(run.output(), 4000)}`);
+    }
+    await sleep(250);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// What the agent saw at its first instruction
+// ---------------------------------------------------------------------------
+
+export type StartObservation = Readonly<{ content: string; mtimeNs: bigint }>;
+
+/**
+ * The stub's at-start record for one session: what it saw, and the record's
+ * mtime in nanoseconds. The record lives in the container's own filesystem
+ * and its mtime is read inside the container, so both come from the VM
+ * kernel's clock — the clock the daemon stamps `State.StartedAt` with on
+ * Docker Desktop. Undefined when the stub left no record under either name it
+ * may use.
+ */
+export function startObservation(session: ContainerInspect): StartObservation | undefined {
+  const sessionId = session.Config?.Labels?.[SESSION_CONTAINER_LABELS.sessionId];
+  const names = [sessionId, session.Config?.Hostname].filter((name): name is string => Boolean(name));
+  for (const name of names) {
+    const file = `${CALLBACK_AT_START_CONTAINER_DIR}/${name}`;
+    const content = sessionFile(session.Id, file);
+    if (content === undefined) continue;
+    const mtime = dockerOrThrow("start observation mtime", ["exec", "--user", AGENT_UID_GID, session.Id, "date", "-r", file, "+%s%N"]);
+    if (!/^\d+$/u.test(mtime)) throw new Error(`could not read the mtime of ${file}: ${mtime}`);
+    return Object.freeze({ content: content.trim(), mtimeNs: BigInt(mtime) });
+  }
+  return undefined;
+}
+
+/** A Docker RFC 3339 timestamp (`State.StartedAt`) as nanoseconds since the epoch, at full precision. */
+export function dockerTimestampNs(timestamp: string): bigint {
+  const match = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d{1,9}))?(Z|[+-]\d{2}:\d{2})$/u.exec(timestamp);
+  if (!match) throw new Error(`not a Docker timestamp: ${JSON.stringify(timestamp)}`);
+  // Whole seconds only: the fraction is added back at nanosecond precision.
+  const wholeSecondsMs = Date.parse(`${match[1]}${match[3]}`);
+  if (!Number.isFinite(wholeSecondsMs) || timestamp.startsWith("0001-")) throw new Error(`not a set Docker timestamp: ${timestamp}`);
+  return BigInt(wholeSecondsMs) * 1_000_000n + BigInt((match[2] ?? "").padEnd(9, "0"));
+}
+
+/** Bound for the agent stub's at-start record to land once its session has handed off. */
+const START_OBSERVATION_TIMEOUT_MS = 20_000;
+
+/**
+ * Waits for the at-start record. The handoff the launch waits for is the
+ * entry exec'ing the agent; the stub writes its record a moment later, so its
+ * arrival is waited for. What it says is the claim, not when it lands.
+ */
+export async function awaitStartObservation(session: ContainerInspect, label: string): Promise<StartObservation> {
+  const deadline = Date.now() + START_OBSERVATION_TIMEOUT_MS;
+  for (;;) {
+    const observed = startObservation(session);
+    if (observed) return observed;
+    if (Date.now() >= deadline) throw new Error(`${label}: the agent stub left no record under ${CALLBACK_AT_START_CONTAINER_DIR}`);
+    await sleep(250);
+  }
 }

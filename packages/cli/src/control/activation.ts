@@ -1,3 +1,5 @@
+import type { SpawnSyncOptions } from "node:child_process";
+
 import { projectHash } from "../project-identity.ts";
 import { corroboratedComposeServiceContainerFilters } from "../runtime/container-inventory.ts";
 import { readProxyControlReceipts, dockerClientEnvOptions, filterValues } from "../runtime/docker.ts";
@@ -56,6 +58,33 @@ export function discoverLiveProxyId(context: RuntimeContext, io: RuntimeIO): str
   return ids[0];
 }
 
+/**
+ * The IO for a receipt read under the lifecycle lock: each capture, sync or
+ * async, is short and bounded, and needs the lock both before it starts and
+ * after it settles.
+ */
+export function withFencedReceiptRead(io: RuntimeIO, assertHeld: () => void): RuntimeIO {
+  const fresh = (options: SpawnSyncOptions | undefined): SpawnSyncOptions => ({ ...options, timeout: 1000, maxBuffer: 1024 * 1024 });
+  const { captureAsync } = io;
+  return {
+    ...io,
+    capture(command, args, options) {
+      assertHeld();
+      const result = io.capture(command, args, fresh(options));
+      assertHeld();
+      return result;
+    },
+    ...(captureAsync ? {
+      async captureAsync(command: string, args: string[], options?: SpawnSyncOptions) {
+        assertHeld();
+        const result = await captureAsync.call(io, command, args, fresh(options));
+        assertHeld();
+        return result;
+      },
+    } : {}),
+  };
+}
+
 function discoverConsumer(context: RuntimeContext, io: RuntimeIO): ActivationConsumer {
   const composeProject = composeProjectName(context.projectRoot);
   const proxyId = discoverLiveProxyId(context, io);
@@ -73,12 +102,7 @@ function discoverConsumer(context: RuntimeContext, io: RuntimeIO): ActivationCon
         if (!currentProxyId) return;
         // A replacement or delayed convergence can finish while containment
         // waits for the lock. Bind the fresh receipt read to this exact ID.
-        const freshIo: RuntimeIO = { ...io, capture(command, args, options) {
-          lock.assertHeld();
-          const result = io.capture(command, args, { ...options, timeout: 1000, maxBuffer: 1024 * 1024 });
-          lock.assertHeld();
-          return result;
-        } };
+        const freshIo = withFencedReceiptRead(io, () => lock.assertHeld());
         const receipts = readProxyControlReceipts(context, freshIo, currentProxyId);
         let selected: ReturnType<typeof readActiveEffectiveControl>;
         try { selected = readActiveEffectiveControl(context.project); }

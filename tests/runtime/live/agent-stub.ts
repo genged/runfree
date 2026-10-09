@@ -71,9 +71,40 @@ for a in "$@"; do
 done`;
 }
 
-export function stageLongLivedAgentBinary(fixture: LiveFixture): void {
+/**
+ * The agent's first instructions when it must record what it found at start:
+ * whether `portFile` exists, and if so its contents, written to
+ * `<directory>/<RUNFREE_SESSION_ID, else $HOSTNAME, else unknown>` (`absent`
+ * when it does not).
+ *
+ * The observation is the very first thing the stub does, before it creates
+ * the directory or writes anything, so the record says what the agent's first
+ * instruction saw. The record is renamed into place, so its mtime is the
+ * moment it was complete and a reader never sees a partial one.
+ */
+export function startObservationStub(directory: string, portFile: string): string {
+  const quotedDirectory = `'${directory.replaceAll("'", "'\\''")}'`;
+  const quotedPortFile = `'${portFile.replaceAll("'", "'\\''")}'`;
+  return `if [ -f ${quotedPortFile} ]; then observed_at_start="$(cat ${quotedPortFile})"; else observed_at_start=absent; fi
+observation_dir=${quotedDirectory}
+observation_name="\${RUNFREE_SESSION_ID:-\${HOSTNAME:-unknown}}"
+mkdir -p "$observation_dir"
+printf '%s\\n' "$observed_at_start" > "$observation_dir/$observation_name.tmp"
+mv -f "$observation_dir/$observation_name.tmp" "$observation_dir/$observation_name"`;
+}
+
+export type LongLivedAgentOptions = Readonly<{
+  /**
+   * Shell run as the agent's first instructions, before the resume handshake.
+   * Opt-in: the default stub is byte-for-byte what every other tranche stages.
+   */
+  firstInstructions?: string;
+}>;
+
+export function stageLongLivedAgentBinary(fixture: LiveFixture, options: LongLivedAgentOptions = {}): void {
   const imageDir = path.join(fixture.projectRoot, ".runfree", "image");
-  fs.writeFileSync(path.join(imageDir, "long-lived-claude.sh"), `#!/bin/sh\n${resumeStub()}\nexec sleep 3600\n`, { mode: 0o755 });
+  const preamble = options.firstInstructions === undefined ? "" : `${options.firstInstructions}\n`;
+  fs.writeFileSync(path.join(imageDir, "long-lived-claude.sh"), `#!/bin/sh\n${preamble}${resumeStub()}\nexec sleep 3600\n`, { mode: 0o755 });
   fs.appendFileSync(path.join(imageDir, "Dockerfile"), [
     "", "USER root", "COPY long-lived-claude.sh /usr/local/bin/claude",
     "RUN chmod 0755 /usr/local/bin/claude", "USER agent", "",
