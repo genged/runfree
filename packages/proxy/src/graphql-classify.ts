@@ -23,32 +23,46 @@ export type GraphqlRequestBodyInput = {
   capBytes?: number;
 };
 
+function isGraphqlLineTerminator(char: string | undefined): boolean {
+  return char === "\n" || char === "\r";
+}
+
 // Strips string literals (block and regular, with escapes) and #-comments so
 // keyword scanning cannot be confused by "mutation" appearing inside a string
-// argument. Throws nothing; malformed input just yields whatever remains.
-export function stripGraphqlStringsAndComments(document: string): string {
+// argument. Throws nothing. Returns undefined for a string the GraphQL lexer
+// rejects (unterminated, or a regular string crossing a line terminator):
+// stripping it would hide the rest of the document, which a lenient server
+// might still run.
+//
+// A comment ends at any GraphQL line terminator (`\n`, `\r`, `\r\n`), not only
+// `\n`: `{ a } # c\rmutation { x }` is a query and a mutation.
+export function stripGraphqlStringsAndComments(document: string): string | undefined {
   let output = "";
   let index = 0;
   while (index < document.length) {
     const char = document[index];
     if (document.startsWith('"""', index)) {
       const end = document.indexOf('"""', index + 3);
-      if (end === -1) return output;
+      if (end === -1) return undefined;
       index = end + 3;
       continue;
     }
     if (char === '"') {
       index += 1;
-      while (index < document.length && document[index] !== '"') {
-        index += document[index] === "\\" ? 2 : 1;
+      while (document[index] !== '"') {
+        if (index >= document.length || isGraphqlLineTerminator(document[index])) return undefined;
+        if (document[index] === "\\") {
+          if (index + 1 >= document.length || isGraphqlLineTerminator(document[index + 1])) return undefined;
+          index += 2;
+          continue;
+        }
+        index += 1;
       }
       index += 1;
       continue;
     }
     if (char === "#") {
-      const end = document.indexOf("\n", index);
-      if (end === -1) return output;
-      index = end;
+      while (index < document.length && !isGraphqlLineTerminator(document[index])) index += 1;
       continue;
     }
     output += char;
@@ -65,7 +79,7 @@ export function stripGraphqlStringsAndComments(document: string): string {
 // even in a shape the scanner does not fully understand — classifies write.
 export function classifyGraphqlDocument(document: string): GraphqlBodyClass {
   const stripped = stripGraphqlStringsAndComments(document);
-  if (stripped.trim() === "") return "write";
+  if (stripped === undefined || stripped.trim() === "") return "write";
   if (/(^|[^A-Za-z0-9_])(mutation|subscription)([^A-Za-z0-9_]|$)/.test(stripped)) return "write";
   return "read";
 }

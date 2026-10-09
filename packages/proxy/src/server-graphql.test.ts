@@ -120,6 +120,11 @@ describe("proxy server GraphQL endpoint classification", () => {
         body: JSON.stringify({ query: "mutation { createIssue { id } }" }),
       },
       {
+        // A bare `\r` ends a GraphQL comment, so the mutation after it is real.
+        label: "mutation after a CR-terminated comment",
+        body: JSON.stringify({ query: "{ a } # c\rmutation { deleteRepo(id: 1) { id } }" }),
+      },
+      {
         label: "batch",
         body: JSON.stringify([{ query: "query { a }" }]),
       },

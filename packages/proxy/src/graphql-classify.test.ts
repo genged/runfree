@@ -53,6 +53,28 @@ describe("GraphQL document classification (conservative, fail-closed)", () => {
     expect(classifyGraphqlDocument("")).toBe("write");
     expect(classifyGraphqlDocument('"unterminated string')).toBe("write");
   });
+
+  // GraphQL ends a line, and so a comment, at `\n`, `\r`, or `\r\n`. A
+  // stripper that waits for `\n` swallows the operation after a bare `\r`,
+  // which graphql-js parses as `query, mutation`.
+  test("a comment ends at every GraphQL line terminator, so a mutation after it stays visible", () => {
+    expect(classifyGraphqlDocument("{ a } # c\rmutation { x }")).toBe("write");
+    expect(classifyGraphqlDocument("{ a } # c\r\nmutation { x }")).toBe("write");
+    expect(classifyGraphqlDocument("{ a } # c\nmutation { x }")).toBe("write");
+    expect(classifyJson(jsonBody("{ a } # c\rmutation { deleteRepo(id: 1) { id } }"))).toBe("write");
+    expect(classifyGraphqlDocument("# note\rquery { viewer { id } }")).toBe("read");
+  });
+
+  // Each of these is a GraphQL syntax error ("Unterminated string" in
+  // graphql-js), so the scanner cannot prove what a lenient server would run.
+  test("a string the GraphQL lexer rejects classifies write instead of hiding the rest", () => {
+    expect(classifyGraphqlDocument('{ a } "unterminated mutation { x }')).toBe("write");
+    expect(classifyGraphqlDocument('{ a(x: "foo\nmutation { y }") }')).toBe("write");
+    expect(classifyGraphqlDocument('{ a(x: "foo\rmutation { y }") }')).toBe("write");
+    expect(classifyGraphqlDocument('{ a(x: "foo\\\nmutation { y }") }')).toBe("write");
+    expect(classifyGraphqlDocument('{ a(x: """abc) } mutation { x }')).toBe("write");
+    expect(classifyGraphqlDocument('{ a(x: "escaped \\" quote") }')).toBe("read");
+  });
 });
 
 describe("GraphQL request body classification (MED-5 guardrails)", () => {
