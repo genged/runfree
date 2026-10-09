@@ -4,6 +4,7 @@ import {
   applyHostServiceTeardown,
   applyRuleset,
   flushHostServiceDraining,
+  isValidIpv4,
   readHostServiceSetElements,
   renderHostServiceSetUpdate,
   renderHostServiceTeardown,
@@ -497,5 +498,19 @@ describe("proxy firewall nftables renderer", () => {
       ...basePlan,
       nftables: { ...basePlan.nftables, tableName: "bad-name" },
     } as unknown as FirewallPlan)).toThrow(/invalid nftables table name/);
+  });
+
+  // Known defects pinned from nftables.property.test.ts. Each `test.fails`
+  // starts failing when its defect is fixed; then make it a plain test.
+  test.fails("known defect (todo 103): rejects an IPv4 octet with a leading zero", () => {
+    // P5.3 counterexample. nft may read 010 as octal, naming a different address.
+    expect(isValidIpv4("00.0.0.0")).toBe(false);
+    expect(isValidIpv4("010.0.0.1")).toBe(false);
+  });
+
+  test.fails("known defect (todo 104): rejects a set size that renders in exponent form", () => {
+    // P5.1 counterexample: the ruleset rendered `size 1e+21`.
+    expect(() => renderRuleset({ ...basePlan, nftables: { ...basePlan.nftables, maxElements: 1e21 } }))
+      .toThrow(/invalid nftables set max elements/);
   });
 });
