@@ -1103,6 +1103,7 @@ async function resumeCrashed(
   let failure: string | undefined;
   try {
     const { io, context, preparedRuntime } = resolveProject(workspace);
+    const resumeAsync = io.captureAsync;
     const watchingIo = Object.freeze({
       ...io,
       run(command: string, args: string[], runOptions?: Parameters<typeof io.run>[2]) {
@@ -1115,6 +1116,13 @@ async function resumeCrashed(
         observed.push(args.join(" "));
         return result;
       },
+      ...(resumeAsync ? {
+        async captureAsync(command: string, args: string[], captureOptions?: Parameters<typeof io.capture>[2]) {
+          const result = await resumeAsync.call(io, command, args, captureOptions);
+          observed.push(args.join(" "));
+          return result;
+        },
+      } : {}),
     });
     const foregroundSpawner: SessionContainerForegroundSpawner = (executable, args, spawnOptions) => {
       observed.push(args.join(" "));
@@ -1215,6 +1223,7 @@ async function launchAndReport(options: CrashOptions): Promise<CrashLaunchReport
     let observer: NodeJS.Timeout | undefined;
     try {
       const { io, preparedRuntime } = resolveProject(options.workspace);
+      const innerAsync = io.captureAsync;
       // `--fail-session-file-delete`: the sealed delete is refused exactly the
       // way the real command refuses, and never reaches Docker, so the file it
       // would have removed is genuinely still published when the ordered teardown
@@ -1232,6 +1241,18 @@ async function launchAndReport(options: CrashOptions): Promise<CrashLaunchReport
               }
               return io.capture(command, args, captureOptions);
             },
+            ...(innerAsync ? {
+              async captureAsync(
+                command: string,
+                args: string[],
+                captureOptions?: Parameters<typeof io.capture>[2],
+              ): Promise<ReturnType<typeof io.capture>> {
+                if (command === "docker" && sessionFileCommandEffect(args) === "delete") {
+                  return { status: 1, stdout: "", stderr: "injected session-file delete failure" };
+                }
+                return innerAsync.call(io, command, args, captureOptions);
+              },
+            } : {}),
           })
         : io;
       // `--launch-hold-at`: the same command-stream seam the crash and hold
@@ -1266,6 +1287,7 @@ async function launchAndReport(options: CrashOptions): Promise<CrashLaunchReport
         held = true;
         holdAtTransition(options, `${point} #1`, options.workspace);
       };
+      const heldAsync = injectedIo.captureAsync;
       const heldIo = options.launchHoldPoint === undefined
         ? injectedIo
         : Object.freeze({
@@ -1280,6 +1302,13 @@ async function launchAndReport(options: CrashOptions): Promise<CrashLaunchReport
               watchForHold(args, result.stdout);
               return result;
             },
+            ...(heldAsync ? {
+              async captureAsync(command: string, args: string[], captureOptions?: Parameters<typeof io.capture>[2]) {
+                const result = await heldAsync.call(injectedIo, command, args, captureOptions);
+                watchForHold(args, result.stdout);
+                return result;
+              },
+            } : {}),
           });
       const foregroundSpawner: SessionContainerForegroundSpawner = (executable, args, spawnOptions) => {
         const child = childProcess.spawn(executable, [...args], spawnOptions) as ReturnType<SessionContainerForegroundSpawner>;
@@ -1536,6 +1565,7 @@ async function crash(options: CrashOptions): Promise<never> {
     process.kill(process.pid, "SIGKILL");
   };
 
+  const watchedAsync = io.captureAsync;
   const watchingIo = Object.freeze({
     ...io,
     run(command: string, args: string[], runOptions?: Parameters<typeof io.run>[2]) {
@@ -1548,6 +1578,15 @@ async function crash(options: CrashOptions): Promise<never> {
       watch(args);
       return result;
     },
+    // Async calls are observed as they settle, like sync ones, so kill points
+    // and `--list-commands` see the whole Docker command stream.
+    ...(watchedAsync ? {
+      async captureAsync(command: string, args: string[], captureOptions?: Parameters<typeof io.capture>[2]) {
+        const result = await watchedAsync.call(io, command, args, captureOptions);
+        watch(args);
+        return result;
+      },
+    } : {}),
   });
 
   // The foreground launch does NOT pass through `RuntimeIO`. The gateway spawns

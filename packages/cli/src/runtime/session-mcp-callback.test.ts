@@ -26,8 +26,9 @@ import {
   SESSION_CALLBACK_PORT_ATTEMPTS,
   sessionCallbackPortCandidates,
   sessionMcpCallbackLifecycle,
+  withSetupDeadline,
 } from "./session-mcp-callback.ts";
-import type { DockerContainerInspect, RuntimeContext } from "./types.ts";
+import type { DockerContainerInspect, RuntimeContext, RuntimeIO } from "./types.ts";
 
 const PROJECT_ROOT = "/workspace/project";
 const PROJECT_ID = projectHash(PROJECT_ROOT);
@@ -449,5 +450,23 @@ describe("in-session callback bridge", () => {
     } finally {
       bridge.kill();
     }
+  });
+});
+
+describe("setup deadline IO", () => {
+  test("a captureAsync call is cut off with SIGKILL at what is left of the setup budget", async () => {
+    let left = 700.6;
+    const captureAsync = vi.fn(async () => ({ status: 0, stdout: "", stderr: "" }));
+    const io = withSetupDeadline({ capture: vi.fn(), run: vi.fn(), captureAsync } as unknown as RuntimeIO, () => left, 12_000);
+    await io.captureAsync?.("docker", ["container", "inspect", "x"], { timeout: 60_000, maxBuffer: 8 });
+    expect(captureAsync).toHaveBeenCalledWith("docker", ["container", "inspect", "x"], { timeout: 700, maxBuffer: 8, killSignal: "SIGKILL" });
+    left = 0;
+    await expect(io.captureAsync?.("docker", ["ps"])).rejects.toThrow("used its whole 12000 ms budget");
+    expect(captureAsync).toHaveBeenCalledOnce();
+  });
+
+  test("exposes no captureAsync when the inner IO has none", () => {
+    const io = withSetupDeadline({ capture: vi.fn(), run: vi.fn() } as unknown as RuntimeIO, () => 1_000, 12_000);
+    expect("captureAsync" in io).toBe(false);
   });
 });

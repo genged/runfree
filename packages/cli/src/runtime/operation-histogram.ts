@@ -5,6 +5,7 @@
 // subcommand verbs, never arguments, ids, paths, or output, so a timing line
 // cannot leak a secret.
 
+import type { SpawnSyncOptions } from "node:child_process";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
 import type { RuntimeIO } from "./types.ts";
@@ -68,9 +69,22 @@ export function withOperationHistogram(io: RuntimeIO, histogram: OperationHistog
       histogram.record(subprocessCategory(command, args), performance.now() - startedAt);
     }
   };
+  const timedAsync = async <T>(command: string, args: string[], call: () => Promise<T>): Promise<T> => {
+    const startedAt = performance.now();
+    try {
+      return await call();
+    } finally {
+      histogram.record(subprocessCategory(command, args), performance.now() - startedAt);
+    }
+  };
+  const { captureAsync } = io;
   return {
     ...io,
     capture: (command, args, options) => timed(command, args, () => io.capture(command, args, options)),
     run: (command, args, options) => timed(command, args, () => io.run(command, args, options)),
+    ...(captureAsync ? {
+      captureAsync: (command: string, args: string[], options?: SpawnSyncOptions) =>
+        timedAsync(command, args, () => captureAsync.call(io, command, args, options)),
+    } : {}),
   };
 }

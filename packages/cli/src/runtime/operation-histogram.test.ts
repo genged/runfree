@@ -54,3 +54,35 @@ test("snapshot exposes per-category counts and totals without argv", () => {
   histogram.record("docker ps", 1);
   expect(snapshot["docker ps"]).toEqual({ count: 1, totalMs: 1 });
 });
+
+test("the wrapper times a captureAsync call over its whole run", async () => {
+  const histogram = createOperationHistogram();
+  const inner = {
+    capture: (): CaptureResult => ({ status: 0, stdout: "", stderr: "" }),
+    captureAsync: async (): Promise<CaptureResult> => {
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      return { status: 3, stdout: "out", stderr: "" };
+    },
+    run: () => 0,
+  } as unknown as RuntimeIO;
+  const io = withOperationHistogram(inner, histogram);
+  await expect(io.captureAsync?.("docker", ["container", "inspect", "x"])).resolves.toEqual({ status: 3, stdout: "out", stderr: "" });
+  const bucket = histogram.snapshot()["docker container inspect"];
+  expect(bucket?.count).toBe(1);
+  expect(bucket?.totalMs).toBeGreaterThanOrEqual(25);
+});
+
+test("a rejected captureAsync call is still recorded and the rejection propagates", async () => {
+  const histogram = createOperationHistogram();
+  const io = withOperationHistogram({
+    captureAsync: async () => { throw new Error("budget ended"); },
+  } as unknown as RuntimeIO, histogram);
+  await expect(io.captureAsync?.("docker", ["ps"])).rejects.toThrow("budget ended");
+  expect(histogram.lines()[0]).toMatch(/^docker ps count=1 /);
+});
+
+test("the wrapper exposes no captureAsync when the inner IO has none", () => {
+  const io = withOperationHistogram({ capture: () => ({ status: 0, stdout: "", stderr: "" }), run: () => 0 } as unknown as RuntimeIO, createOperationHistogram());
+  expect(io.captureAsync).toBeUndefined();
+  expect("captureAsync" in io).toBe(false);
+});

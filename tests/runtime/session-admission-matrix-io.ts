@@ -11,6 +11,7 @@
 
 import childProcess from "node:child_process";
 
+import { captureAsync } from "../../packages/cli/src/runtime/async-capture.ts";
 import type { RuntimeIO } from "../../packages/cli/src/runtime/types.ts";
 
 const CAPTURE_MAX_BYTES = 32 * 1024 * 1024;
@@ -34,6 +35,12 @@ export function createMatrixRuntimeIO(): RuntimeIO {
         stdout: typeof result.stdout === "string" ? result.stdout : "",
         stderr: typeof result.stderr === "string" ? result.stderr : "",
       };
+    },
+    // The production async capture, so a runner that overlaps Docker calls
+    // runs the real thing. Its failures are fail-closed statuses (124/125/
+    // 128+signal) rather than the throw `capture` above uses.
+    captureAsync(command, args, options = {}) {
+      return captureAsync(command, args, { maxBuffer: CAPTURE_MAX_BYTES, ...options });
     },
     commandExists(command, options = {}) {
       return childProcess.spawnSync("command", ["-v", command], {

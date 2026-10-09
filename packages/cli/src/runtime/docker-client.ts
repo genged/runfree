@@ -37,6 +37,7 @@ import type { CaptureResult, RuntimeIO } from "./types.ts";
  *   compose ARGS… (via io.run)                terminal.compose([ARGS…])
  *   image prune -f --filter X… (via io.run)   terminal.pruneImages([X…])
  *   image rm R… / image tag S T (via io.run)  terminal.removeImages([R…]) / terminal.tagImage(S, T)
+ *   any captured call above, overlapped       createAsyncDockerClient(io).<same method>(…) (io.captureAsync)
  *
  * `{{ .State.Running }}` is written `{{.State.Running}}`; Docker prints the
  * same output for both.
@@ -103,23 +104,29 @@ export function labelRunFlags(flagPairs: readonly string[]): readonly DockerRunF
   return flags;
 }
 
-export type DockerClient = Readonly<{
-  info(format?: string, options?: DockerCallOptions): CaptureResult;
-  inspect(refs: readonly string[], query?: Readonly<{ type?: DockerObjectType; format?: string }>, options?: DockerCallOptions): CaptureResult;
-  listContainers(query: DockerListQuery, options?: DockerCallOptions): CaptureResult;
-  listObjects(type: Exclude<DockerObjectType, "container">, query: DockerListQuery & Readonly<{ reference?: string }>, options?: DockerCallOptions): CaptureResult;
-  logs(containerId: string, query: Readonly<{ tail?: number; since?: string }>, options?: DockerCallOptions): CaptureResult;
-  exec(containerId: string, command: readonly string[], exec?: DockerExecOptions, options?: DockerCallOptions): CaptureResult;
-  runContainer(flags: readonly DockerRunFlag[], image: string, command?: readonly string[], options?: DockerCallOptions): CaptureResult;
-  removeContainers(ids: readonly string[], query?: Readonly<{ force?: boolean }>, options?: DockerCallOptions): CaptureResult;
-  stopContainers(ids: readonly string[], timeSeconds: number, options?: DockerCallOptions): CaptureResult;
-  startContainer(id: string, options?: DockerCallOptions): CaptureResult;
-  restartContainer(id: string, options?: DockerCallOptions): CaptureResult;
-  createNetwork(name: string, labels: readonly string[], options?: DockerCallOptions): CaptureResult;
-  connectNetwork(network: string, containerId: string, options?: DockerCallOptions): CaptureResult;
-  removeNetworks(ids: readonly string[], options?: DockerCallOptions): CaptureResult;
-  createVolume(name: string, labels: readonly string[], options?: DockerCallOptions): CaptureResult;
-  removeVolumes(names: readonly string[], options?: DockerCallOptions): CaptureResult;
+/** The captured Docker calls, each returning `R`: a `CaptureResult`, or a promise of one. */
+export type DockerCaptureMethods<R> = Readonly<{
+  info(format?: string, options?: DockerCallOptions): R;
+  inspect(refs: readonly string[], query?: Readonly<{ type?: DockerObjectType; format?: string }>, options?: DockerCallOptions): R;
+  listContainers(query: DockerListQuery, options?: DockerCallOptions): R;
+  listObjects(type: Exclude<DockerObjectType, "container">, query: DockerListQuery & Readonly<{ reference?: string }>, options?: DockerCallOptions): R;
+  logs(containerId: string, query: Readonly<{ tail?: number; since?: string }>, options?: DockerCallOptions): R;
+  exec(containerId: string, command: readonly string[], exec?: DockerExecOptions, options?: DockerCallOptions): R;
+  runContainer(flags: readonly DockerRunFlag[], image: string, command?: readonly string[], options?: DockerCallOptions): R;
+  removeContainers(ids: readonly string[], query?: Readonly<{ force?: boolean }>, options?: DockerCallOptions): R;
+  stopContainers(ids: readonly string[], timeSeconds: number, options?: DockerCallOptions): R;
+  startContainer(id: string, options?: DockerCallOptions): R;
+  restartContainer(id: string, options?: DockerCallOptions): R;
+  createNetwork(name: string, labels: readonly string[], options?: DockerCallOptions): R;
+  connectNetwork(network: string, containerId: string, options?: DockerCallOptions): R;
+  removeNetworks(ids: readonly string[], options?: DockerCallOptions): R;
+  createVolume(name: string, labels: readonly string[], options?: DockerCallOptions): R;
+  removeVolumes(names: readonly string[], options?: DockerCallOptions): R;
+}>;
+
+export type AsyncDockerClient = DockerCaptureMethods<Promise<CaptureResult>>;
+
+export type DockerClient = DockerCaptureMethods<CaptureResult> & Readonly<{
   /** Operations whose output goes to the user's terminal; each returns the exit status. */
   terminal: Readonly<{
     build(args: readonly string[], options?: DockerCallOptions): number;
@@ -160,12 +167,7 @@ function execArgs(containerId: string, command: readonly string[], exec: DockerE
 
 const removeArgs = (ids: readonly string[], force?: boolean): string[] => ["container", "rm", ...(force ? ["--force"] : []), ...ids];
 
-export function createDockerClient(io: DockerIo, base: childProcess.SpawnSyncOptions = {}): DockerClient {
-  const capture = (args: string[], options: DockerCallOptions = {}): CaptureResult => io.capture("docker", args, { ...base, ...options });
-  const run = (args: string[], options: DockerCallOptions = {}): number => {
-    if (!io.run) throw new Error("this Docker client has no terminal runner");
-    return io.run("docker", args, { ...base, ...options });
-  };
+function captureMethods<R>(capture: (args: string[], options?: DockerCallOptions) => R): DockerCaptureMethods<R> {
   return Object.freeze({
     info: (format, options) => capture(["info", ...(format !== undefined ? ["--format", format] : [])], options),
     inspect: (refs, query = {}, options) => capture([
@@ -192,6 +194,17 @@ export function createDockerClient(io: DockerIo, base: childProcess.SpawnSyncOpt
     removeNetworks: (ids, options) => capture(["network", "rm", ...ids], options),
     createVolume: (name, labels, options) => capture(["volume", "create", ...labelArgs(labels), name], options),
     removeVolumes: (names, options) => capture(["volume", "rm", ...names], options),
+  });
+}
+
+export function createDockerClient(io: DockerIo, base: childProcess.SpawnSyncOptions = {}): DockerClient {
+  const capture = (args: string[], options: DockerCallOptions = {}): CaptureResult => io.capture("docker", args, { ...base, ...options });
+  const run = (args: string[], options: DockerCallOptions = {}): number => {
+    if (!io.run) throw new Error("this Docker client has no terminal runner");
+    return io.run("docker", args, { ...base, ...options });
+  };
+  return Object.freeze({
+    ...captureMethods(capture),
     terminal: Object.freeze({
       build: (args: readonly string[], options?: DockerCallOptions) => run(["build", ...args], options),
       compose: (args: readonly string[], options?: DockerCallOptions) => run(["compose", ...args], options),
@@ -203,4 +216,21 @@ export function createDockerClient(io: DockerIo, base: childProcess.SpawnSyncOpt
       removeVolumes: (names: readonly string[], options?: DockerCallOptions) => run(["volume", "rm", ...names], options),
     }),
   });
+}
+
+/**
+ * The same captured calls, returning promises, so independent Docker calls can
+ * overlap. Runs only on an IO with `captureAsync`; on any other IO the first
+ * call throws rather than falling back to a blocking call, so a caller that
+ * relies on overlap cannot silently lose it.
+ */
+export function createAsyncDockerClient(
+  io: Readonly<{ captureAsync?: RuntimeIO["captureAsync"] }>,
+  base: childProcess.SpawnSyncOptions = {},
+): AsyncDockerClient {
+  const capture = (args: string[], options: DockerCallOptions = {}): Promise<CaptureResult> => {
+    if (!io.captureAsync) throw new Error("this IO cannot run Docker calls concurrently");
+    return io.captureAsync("docker", args, { ...base, ...options });
+  };
+  return captureMethods(capture);
 }

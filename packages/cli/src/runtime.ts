@@ -2,6 +2,7 @@ import childProcess from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { assertSessionDisruptionAuthorized } from "./runtime/session-disruption.ts";
+import { captureAsync } from "./runtime/async-capture.ts";
 
 import { DEFAULT_WRITE_ACTION, effectiveWriteAction, validateNetworkPolicy } from "@runfree/runtime-contracts/network-policy";
 import { parseHostServiceGatewayStatus } from "@runfree/runtime-contracts/proxy-status";
@@ -834,6 +835,7 @@ function createNodeRuntimeIO(): RuntimeIO {
   return {
     run,
     capture,
+    captureAsync,
     commandExists,
     confirm,
     choosePiProvider,

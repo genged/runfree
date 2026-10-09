@@ -90,6 +90,14 @@ export type RuntimeIO = {
   clearPreparedTokenSources?(context: RuntimeContext): void;
   run(command: string, args: string[], options?: childProcess.SpawnSyncOptions): number;
   capture(command: string, args: string[], options?: childProcess.SpawnSyncOptions): CaptureResult;
+  /**
+   * `capture` without blocking, so independent calls can overlap; the same
+   * result for the same call. Optional: an IO without it cannot overlap calls.
+   * Every IO wrapper that transforms `capture` must transform this the same
+   * way, and define it only when its inner IO has one, so an async call can
+   * never bypass a budget, deadline, or count.
+   */
+  captureAsync?(command: string, args: string[], options?: childProcess.SpawnSyncOptions): Promise<CaptureResult>;
   commandExists(command: string, options?: childProcess.SpawnSyncOptions): boolean;
   confirm(question: string): boolean;
   choosePiProvider?: (options: readonly PiProviderOption[]) => PiProviderChoice | undefined;

@@ -1,3 +1,5 @@
+import type { SpawnSyncOptions } from "node:child_process";
+
 import { projectHash } from "../project-identity.ts";
 import { corroboratedComposeServiceContainerFilters } from "../runtime/container-inventory.ts";
 import { readProxyControlReceipts, dockerClientEnvOptions, filterValues } from "../runtime/docker.ts";
@@ -73,12 +75,19 @@ function discoverConsumer(context: RuntimeContext, io: RuntimeIO): ActivationCon
         if (!currentProxyId) return;
         // A replacement or delayed convergence can finish while containment
         // waits for the lock. Bind the fresh receipt read to this exact ID.
+        const fresh = (options: SpawnSyncOptions | undefined): SpawnSyncOptions => ({ ...options, timeout: 1000, maxBuffer: 1024 * 1024 });
+        const { captureAsync } = io;
         const freshIo: RuntimeIO = { ...io, capture(command, args, options) {
           lock.assertHeld();
-          const result = io.capture(command, args, { ...options, timeout: 1000, maxBuffer: 1024 * 1024 });
+          const result = io.capture(command, args, fresh(options));
           lock.assertHeld();
           return result;
-        } };
+        }, ...(captureAsync ? { async captureAsync(command: string, args: string[], options?: SpawnSyncOptions) {
+          lock.assertHeld();
+          const result = await captureAsync.call(io, command, args, fresh(options));
+          lock.assertHeld();
+          return result;
+        } } : {}) };
         const receipts = readProxyControlReceipts(context, freshIo, currentProxyId);
         let selected: ReturnType<typeof readActiveEffectiveControl>;
         try { selected = readActiveEffectiveControl(context.project); }

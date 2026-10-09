@@ -179,16 +179,21 @@ type PrepareDependencies = Readonly<{
  * steps use it: removing what the setup created runs on the caller's io, so a
  * spent budget never leaves a forwarder behind for want of time to remove it.
  */
-function withSetupDeadline(io: RuntimeIO, remainingMs: () => number, budgetMs: number): RuntimeIO {
+export function withSetupDeadline(io: RuntimeIO, remainingMs: () => number, budgetMs: number): RuntimeIO {
   const bounded = (options: childProcess.SpawnSyncOptions | undefined): childProcess.SpawnSyncOptions => {
     const left = Math.floor(remainingMs());
     if (left <= 0) throw new Error(`the callback setup used its whole ${budgetMs} ms budget`);
     return { ...(options ?? {}), timeout: Math.min(options?.timeout ?? left, left), killSignal: "SIGKILL" };
   };
+  const { captureAsync } = io;
   return {
     ...io,
     capture: (command, args, options) => io.capture(command, args, bounded(options)),
     run: (command, args, options) => io.run(command, args, bounded(options)),
+    ...(captureAsync ? {
+      captureAsync: async (command: string, args: string[], options?: childProcess.SpawnSyncOptions) =>
+        captureAsync.call(io, command, args, bounded(options)),
+    } : {}),
   };
 }
 

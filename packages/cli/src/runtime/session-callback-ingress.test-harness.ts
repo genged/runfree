@@ -115,7 +115,7 @@ export function createFakeDocker(input: Readonly<{
     return undefined;
   };
 
-  const capture = vi.fn((_command: string, rawArgs: readonly string[]): CaptureResult => {
+  const capture = vi.fn((_command: string, rawArgs: readonly string[], _options?: unknown): CaptureResult => {
     const args = [...rawArgs];
     captures.push(args);
     if (args[0] === "ps") {
@@ -190,7 +190,7 @@ export function createFakeDocker(input: Readonly<{
     return options.bridgeStatus ?? 0;
   });
   return {
-    io: { capture, run } as unknown as RuntimeIO,
+    io: { capture, run, captureAsync: async (c: string, a: string[], o?: unknown) => capture(c, a, o) } as unknown as RuntimeIO,
     containers,
     captures,
     runs,

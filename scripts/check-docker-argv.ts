@@ -30,8 +30,8 @@ export type DockerLiteralAllowlistEntry = Readonly<{
 
 export const DOCKER_LITERAL_ALLOWLIST: Readonly<Record<string, DockerLiteralAllowlistEntry>> = {
   "packages/cli/src/runtime/docker-client.ts": {
-    reason: "owner: builds every non-session docker argv",
-    count: 3,
+    reason: "owner: builds every non-session docker argv, sync and async",
+    count: 4,
   },
 
   // sealed-session: every "docker" literal is either the SessionDockerCommand
@@ -72,8 +72,8 @@ export const DOCKER_LITERAL_ALLOWLIST: Readonly<Record<string, DockerLiteralAllo
     count: 1,
   },
   "packages/cli/src/runtime/session-admission-docker-gateway.ts": {
-    reason: "classifier: types the gateway's accepted executable, compares `command !== \"docker\"` to pass through non-Docker calls, and labels histogram categories; builds no argv itself",
-    count: 4,
+    reason: "classifier: types the gateway's accepted executable, compares `command !== \"docker\"` to pass through non-Docker calls (sync and async), and labels histogram categories; builds no argv itself",
+    count: 5,
   },
 
   // classifier: the one remaining literal names the probe target for

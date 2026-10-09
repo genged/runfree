@@ -1,3 +1,5 @@
+import type { SpawnSyncOptions } from "node:child_process";
+
 import { checkBeforeSpawn } from "./io-refusal.ts";
 import { RuntimeObservationError } from "./observation-failure.ts";
 import type { RuntimeIO } from "./types.ts";
@@ -13,12 +15,22 @@ export function withLifecycleOperationBudget(io: RuntimeIO, remainingMs: () => n
       observation: "lifecycle operation budget ended; session processes were preserved; retry with fresh runtime evidence" });
     return value === undefined ? undefined : Math.max(1, Math.floor(value));
   };
+  const bounded = (options: SpawnSyncOptions, budget: number | undefined): SpawnSyncOptions => (
+    budget === undefined ? options : { ...options, timeout: Math.min(options.timeout ?? budget, budget) });
+  const { captureAsync } = io;
   return { ...io,
     capture(command, args, options = {}) {
       const budget = checkBeforeSpawn(remaining);
-      const result = io.capture(command, args, budget === undefined ? options : { ...options, timeout: Math.min(options.timeout ?? budget, budget) });
+      const result = io.capture(command, args, bounded(options, budget));
       remaining(); return result;
     },
+    ...(captureAsync ? {
+      async captureAsync(command: string, args: string[], options: SpawnSyncOptions = {}) {
+        const budget = checkBeforeSpawn(remaining);
+        const result = await captureAsync.call(io, command, args, bounded(options, budget));
+        remaining(); return result;
+      },
+    } : {}),
     run(command, args, options = {}) {
       const budget = checkBeforeSpawn(remaining);
       const result = io.run(command, args, budget === undefined ? options : { ...options, timeout: Math.min(options.timeout ?? budget, budget) });
