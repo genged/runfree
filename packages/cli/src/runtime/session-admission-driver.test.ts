@@ -100,7 +100,9 @@ const mocks = vi.hoisted(() => ({
   reclaimStaleCallbacks: vi.fn(),
   sessionMcpCallbackLifecycle: vi.fn(),
   /** Every task scope the driver created, so a test can read what is still in flight. */
-  taskScopes: [] as Array<{ pending(): number }>,
+  taskScopes: [] as Array<{ pending(): number; start<T>(label: string, run: () => Promise<T>): unknown }>,
+  /** The raw steps object of the launch in progress (timings are off in these tests). */
+  launchSteps: undefined as undefined | { ingressMayExist?: () => boolean },
   consumeWarmEmpty: vi.fn(),
   isWarmEmpty: vi.fn(),
 }));
@@ -112,6 +114,17 @@ vi.mock("./session-callback-ingress.ts", () => ({
   reclaimStaleSessionMcpCallbackForwarders: mocks.reclaimStaleCallbacks,
 }));
 vi.mock("./session-mcp-callback.ts", () => ({ sessionMcpCallbackLifecycle: mocks.sessionMcpCallbackLifecycle }));
+// The ladder stays real; the steps it runs are only recorded.
+vi.mock("./session-admission-probe.ts", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./session-admission-probe.ts")>();
+  return {
+    ...actual,
+    runInternalSessionAdmissionLaunch: (steps: Parameters<typeof actual.runInternalSessionAdmissionLaunch>[0]) => {
+      mocks.launchSteps = steps as unknown as { ingressMayExist?: () => boolean };
+      return actual.runInternalSessionAdmissionLaunch(steps);
+    },
+  };
+});
 // The scope stays real; it is only recorded.
 vi.mock("./task-scope.ts", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./task-scope.ts")>();
@@ -494,6 +507,7 @@ beforeEach(() => {
   });
   mocks.sessionMcpCallbackLifecycle.mockReturnValue(undefined);
   mocks.taskScopes.length = 0;
+  mocks.launchSteps = undefined;
   // The seal itself is proved in its own module: here a warm-empty state is
   // recognized by kind, and admission can consume it only when a test says so.
   mocks.isWarmEmpty.mockImplementation((value: unknown) => (value as { kind?: unknown } | undefined)?.kind === "warm-empty");
@@ -1677,7 +1691,11 @@ describe("internal session admission driver", () => {
   });
 
   test("ingress intent is recorded before the reservation's first effect", async () => {
+    let intentAtReserve: boolean | undefined;
     const reserve = vi.fn((): Promise<typeof RESERVATION> => {
+      // Read before the reservation's first effect: cleanup must already know
+      // to prove the ingress gone.
+      intentAtReserve = mocks.launchSteps?.ingressMayExist?.();
       mocks.events.push("ingress:reserve-start");
       throw new Error("the reservation threw before it returned");
     });
@@ -1695,6 +1713,7 @@ describe("internal session admission driver", () => {
     await expect(driver.launchBuiltin("codex")).rejects.toThrow("running proof failed closed");
 
     expect(reserve).toHaveBeenCalledOnce();
+    expect(intentAtReserve).toBe(true);
     expect(complete).not.toHaveBeenCalled();
     expect(mocks.events.indexOf("ingress:reserve-start")).toBeLessThan(mocks.events.indexOf("remove-session-ingress"));
     expect(mocks.events.indexOf("remove-session-ingress")).toBeLessThan(mocks.events.lastIndexOf("remove-record"));
@@ -1785,6 +1804,64 @@ describe("internal session admission driver", () => {
     expect(assertHeld).toHaveBeenCalled();
     expect(assertHeld.mock.results.at(-1)?.type).toBe("return");
     expect(() => input.sessionLockManager.lock.assertHeld()).not.toThrow();
+  });
+
+  test("a launch failure that lost the lock keeps its own failure beside the final settle's", async () => {
+    const input = fixture();
+    const gate = deferred();
+    const ingress = recordingIngress({
+      reserve: async () => {
+        await gate.promise;
+        return RESERVATION;
+      },
+    });
+    mocks.waitRunning.mockImplementationOnce(async () => {
+      mocks.events.push("running-proof");
+      // The lock is lost and the proof fails while the reservation is still in
+      // flight: cleanup cannot settle it, so only the final settle waits.
+      input.sessionLockManager.lock.release();
+      setTimeout(gate.release, 25);
+      throw new Error("running proof failed closed");
+    });
+    const driver = createInternalSessionAdmissionDriver({
+      ...input,
+      nowEpochMs: () => Date.parse("2026-08-09T00:00:00.000Z"),
+      sessionIngress: ingress,
+    });
+
+    const failure = await driver.launchBuiltin("codex").catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(AggregateError);
+    expect((failure as Error).message).toContain("in-flight branches settled after the lifecycle lock was lost");
+    const [launchFailure, settleFailure] = (failure as AggregateError).errors;
+    expect(String((launchFailure as Error).message) + JSON.stringify((launchFailure as AggregateError).errors?.map(String)))
+      .toContain("running proof failed closed");
+    expect((settleFailure as Error).message).toContain("test lifecycle lock is not held");
+    // The branch was waited for, never abandoned.
+    expect(mocks.events).toContain("ingress:reserved");
+    expect(mocks.taskScopes.every((scope) => scope.pending() === 0)).toBe(true);
+  });
+
+  test("a launch that succeeded reports a final settle that finds the lock lost", async () => {
+    const input = fixture();
+    mocks.removeSessionMetadata.mockImplementationOnce(() => {
+      mocks.events.push("remove-session-evidence");
+      // A branch still in flight after teardown, which loses the lock as it settles.
+      mocks.taskScopes.at(-1)?.start("late-branch", async () => {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        input.sessionLockManager.lock.release();
+        mocks.events.push("late-branch:settled");
+      });
+    });
+    const driver = createInternalSessionAdmissionDriver({
+      ...input,
+      nowEpochMs: () => Date.parse("2026-08-09T00:00:00.000Z"),
+      sessionIngress: recordingIngress(),
+    });
+
+    await expect(driver.launchBuiltin("codex")).rejects.toThrow("test lifecycle lock is not held");
+    expect(mocks.events).toContain("late-branch:settled");
+    expect(mocks.taskScopes.every((scope) => scope.pending() === 0)).toBe(true);
   });
 
   test("the project decides the session ingress when the caller passes none, and a probe never reserves", async () => {

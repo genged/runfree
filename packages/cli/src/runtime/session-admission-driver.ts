@@ -2299,6 +2299,9 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
    */
   provisioningMayBeSelected = (): boolean => this.#fileMayExist;
 
+  /** Whether unadmitted cleanup will prove this session's ingress gone before its record. */
+  ingressMayExist = (): boolean => this.#ingressMayExist;
+
   cleanupUnadmitted = async (): Promise<void> => {
     this.#lock();
     // A reservation still in flight may yet create a forwarder; nothing is
@@ -2612,7 +2615,7 @@ export function createInternalSessionAdmissionDriver(
     const timings = createRuntimeTimings(resolvedInput.context.env);
     const histogram = timings.enabled ? createOperationHistogram() : undefined;
     let steps: InternalBuiltinAdmissionProbeSteps | undefined;
-    try {
+    const attempt = async (): Promise<SessionAdmissionLaunchOutcome> => {
       steps = stepsFor(kind, options, histogram);
       const launchSteps = histogram ? timedSessionAdmissionLaunchSteps(steps, timings, histogram, steps.lockHoldMs) : steps;
       try {
@@ -2633,21 +2636,42 @@ export function createInternalSessionAdmissionDriver(
         }
         throw failure;
       }
-    } finally {
-      // Every cleanup path settles the launch's branches first; this is the
-      // backstop, so nothing started under the lock outlives the launch that
-      // holds it. Only a branch still in flight is waited on, so a launch that
-      // already lost the lock reports its own failure, not a second one.
-      try {
-        if (steps && steps.pendingTasks() > 0) await steps.settleTasks();
-      } finally {
-        if (timings.enabled && steps) {
-          timings.report("session-admission", `docker-operations=${steps.dockerOperationCount()}`);
-          timings.report("teardown-path", steps.teardownPath());
-        }
-        inFlight = false;
-      }
+    };
+    let result: Readonly<{ ok: true; outcome: SessionAdmissionLaunchOutcome }> | Readonly<{ ok: false; failure: unknown }>;
+    try {
+      result = { ok: true, outcome: await attempt() };
+    } catch (failure) {
+      result = { ok: false, failure };
     }
+    // Every cleanup path settles the launch's branches first; this is the
+    // backstop, so nothing started under the lock outlives the launch that
+    // holds it. It always waits for every branch still in flight. A settle
+    // that then finds the lock lost never hides the launch's own failure: it
+    // is reported beside it, and alone only when nothing else failed.
+    let settleFailure: Readonly<{ error: unknown }> | undefined;
+    try {
+      const settling = steps as InternalBuiltinAdmissionProbeSteps | undefined;
+      if (settling && settling.pendingTasks() > 0) await settling.settleTasks();
+    } catch (error) {
+      settleFailure = { error };
+    }
+    const finished = steps as InternalBuiltinAdmissionProbeSteps | undefined;
+    if (timings.enabled && finished) {
+      timings.report("session-admission", `docker-operations=${finished.dockerOperationCount()}`);
+      timings.report("teardown-path", finished.teardownPath());
+    }
+    inFlight = false;
+    if (!result.ok) {
+      if (settleFailure) {
+        throw new AggregateError(
+          [result.failure, settleFailure.error],
+          "session launch failed and its in-flight branches settled after the lifecycle lock was lost",
+        );
+      }
+      throw result.failure;
+    }
+    if (settleFailure) throw settleFailure.error;
+    return result.outcome;
   };
   return Object.freeze({
     async probeBuiltin(agent: SessionAdmissionProbeAgent) {

@@ -54,8 +54,12 @@ export const LAUNCH_HANDOFF_STARTUP_SPAN_MAX_MS =
  * attach, the in-session bridge, and the host path probe). Keeping both at
  * the whole setup budget bounds each phase independently without assuming
  * how much of the setup the reserve phase actually used while it overlapped
- * the proof. The reserve starts before the proof does and its budget is no
- * longer than the proof's, so it ends before the proof's deadline.
+ * the proof. The reserve starts before the proof does and its budget is 18 s
+ * shorter than the proof's, and every Docker call in it is cut off at the
+ * time left. The cut is a timer, so the reserve can overrun its budget by at
+ * most one blocking synchronous call on the event loop (a failure cleanup, or
+ * a step of the main flow) before it settles; the 18 s slack is what keeps
+ * it inside the proof's deadline in practice.
  */
 export const SESSION_CALLBACK_RESERVE_BUDGET_MS = SESSION_CALLBACK_SETUP_BUDGET_MS;
 export const SESSION_CALLBACK_COMPLETE_BUDGET_MS = SESSION_CALLBACK_SETUP_BUDGET_MS;
