@@ -1,6 +1,7 @@
-import { expect, test } from "vitest";
+import { describe, expect, test } from "vitest";
 
 import {
+  internalNetworkSessionStateBlocker,
   UTILITY_ROLE_LABEL,
   UTILITY_VERSION_LABEL,
   validateIngressForwarderTeardownCandidate,
@@ -586,4 +587,47 @@ test("per-session shape still requires the proxy participant", () => {
     roleContainer("session-agent", "session-1"),
   ]);
   expect(issues.map((issue) => issue.code)).toContain("agent-network-count");
+});
+
+describe("the session-state blocker", () => {
+  const proxy = container(proxyName, [internalNetwork, `${project}_proxy_egress`]);
+  const proxyId = proxy.Id as string;
+
+  function labelled(name: string, labels: Record<string, string>): DockerContainerInspect {
+    const base = container(name, [internalNetwork]);
+    return { ...base, Config: { ...base.Config, Labels: labels } };
+  }
+
+  test("a proxy alone holds no session state", () => {
+    expect(internalNetworkSessionStateBlocker([proxy], proxyId, projectId)).toBeUndefined();
+  });
+
+  test("a valid ingress forwarder holds no session state", () => {
+    expect(internalNetworkSessionStateBlocker([proxy, ingressForwarder("vnc", "5901")], proxyId, projectId))
+      .toBeUndefined();
+  });
+
+  test("this project's session container is a session participant", () => {
+    const session = labelled(`${project}-session-rf-20260101-abcdef`, {
+      [PROJECT_ID_LABEL]: projectId,
+      [CONTAINER_ROLE_LABEL]: "session-agent",
+    });
+    expect(internalNetworkSessionStateBlocker([proxy, session], proxyId, projectId)).toBe("session-participant");
+  });
+
+  test("an ephemeral helper is not proved stateless", () => {
+    const helper = labelled(`${project}-helper`, {
+      [PROJECT_ID_LABEL]: projectId,
+      [CONTAINER_ROLE_LABEL]: "ephemeral-helper",
+    });
+    expect(internalNetworkSessionStateBlocker([proxy, helper], proxyId, projectId)).toBe("non-ingress-participant");
+  });
+
+  test("another project's session container is not this project's ingress forwarder", () => {
+    const foreign = labelled("runfree-ffffffffffff-session-rf-20260101-abcdef", {
+      [PROJECT_ID_LABEL]: "ffffffffffff",
+      [CONTAINER_ROLE_LABEL]: "session-agent",
+    });
+    expect(internalNetworkSessionStateBlocker([proxy, foreign], proxyId, projectId)).toBe("non-ingress-participant");
+  });
 });

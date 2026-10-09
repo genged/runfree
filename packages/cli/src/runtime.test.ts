@@ -1806,6 +1806,7 @@ function createRuntimeIO(overrides: {
         { exit: 0, body: process.env.FAKE_WARM_HOST_SERVICE_SET ?? hostServiceSetJson },
         { exit: 0, body: hostServiceGatewayStatus() ?? "" },
         { exit: 0, body: "0 81a4" },
+        { exit: Number(process.env.FAKE_WARM_SESSION_FILES_EXIT ?? "0"), body: process.env.FAKE_WARM_SESSION_FILES ?? "[]" },
       ];
       return captureResult(0, `${sections.map((section, index) => [
         `RUNFREE_FIREWALL_SECTION ${index} exit=${section.exit}`,
@@ -4118,7 +4119,7 @@ describe("runtime command flow", () => {
     const warmEnvKeys = [
       "FAKE_PROXY_STARTED_AT", "FAKE_PROXY_PID", "FAKE_DOCKER_DAEMON_ID", "FAKE_DOCKER_LIVE_RESTORE",
       "FAKE_WARM_NFT_TABLE", "FAKE_WARM_CAPBND", "FAKE_WARM_BATCH_UID", "FAKE_WARM_BOOT_ID", "FAKE_VOLUME_CREATED_AT",
-      "FAKE_WARM_HOST_SERVICE_SET",
+      "FAKE_WARM_HOST_SERVICE_SET", "FAKE_WARM_SESSION_FILES", "FAKE_WARM_SESSION_FILES_EXIT",
     ] as const;
     afterEach(() => {
       for (const key of warmEnvKeys) delete process.env[key];

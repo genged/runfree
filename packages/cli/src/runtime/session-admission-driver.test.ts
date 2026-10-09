@@ -205,7 +205,10 @@ vi.mock("./session-container-template.ts", () => ({
   bindSessionContainerCreatePlanRecord: mocks.bindPlan,
   sessionContainerTemplateInit: mocks.templateInit,
 }));
-vi.mock("./session-containers.ts", () => ({
+vi.mock("./session-containers.ts", async (importOriginal) => ({
+  // A constant, not behavior: modules that build Docker label filters from it
+  // read it at load time.
+  SESSION_CONTAINER_LABELS: (await importOriginal<typeof import("./session-containers.ts")>()).SESSION_CONTAINER_LABELS,
   bindAllocatedSessionContainerIdV2: mocks.bindAllocatedRecord,
   bindExactAllocatedSessionContainerRecordIdV2: mocks.bindExactAllocatedRecord,
   listQuarantinedSessionContainerRecordNamesV2: mocks.listQuarantinedNames,

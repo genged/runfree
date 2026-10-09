@@ -492,6 +492,97 @@ function listSessionContainerInventoryIds(
   return parseSessionContainerInventoryIds(listResult.stdout);
 }
 
+/** Proven absence of this project's session containers; only `observeSessionContainersAbsent` mints one. */
+export type SessionContainersAbsent = Readonly<{ kind: "absent" }>;
+
+export type SessionContainersObservation =
+  | SessionContainersAbsent
+  | Readonly<{ kind: "present"; reason: string }>
+  | Readonly<{ kind: "unreadable"; reason: string }>;
+
+export const SESSION_CONTAINER_ABSENCE_TIMEOUT_MS = 5_000;
+
+/**
+ * One JSON array per container: id, names, then the project-id, compose
+ * project, role, and session-id labels. Each field is JSON-encoded on its own,
+ * so no label value can be mistaken for a delimiter.
+ */
+export const SESSION_CONTAINER_ABSENCE_FORMAT = `[{{json .ID}},{{json .Names}},{{json (.Label "${SESSION_CONTAINER_LABELS.projectId}")}},{{json (.Label "${SESSION_CONTAINER_LABELS.composeProject}")}},{{json (.Label "${SESSION_CONTAINER_LABELS.role}")}},{{json (.Label "${SESSION_CONTAINER_LABELS.sessionId}")}}]`;
+
+const sealedSessionContainerAbsences = new WeakSet<object>();
+
+export function assertSessionContainersAbsent(value: unknown): asserts value is SessionContainersAbsent {
+  if (!value || typeof value !== "object" || !sealedSessionContainerAbsences.has(value)) {
+    throw new Error("session-container absence was not minted by the absence listing");
+  }
+}
+
+function parseSessionContainerAbsenceRow(line: string): readonly string[] | undefined {
+  let parsed: unknown;
+  try {
+    parsed = parseStrictJson(line);
+  } catch {
+    return undefined;
+  }
+  if (!Array.isArray(parsed) || parsed.length !== 6 || !parsed.every((field) => typeof field === "string")) {
+    return undefined;
+  }
+  return parsed as string[];
+}
+
+/**
+ * Whether Docker holds any container, running or stopped, that could be one of
+ * this project's sessions, from one host-wide listing.
+ *
+ * A row counts when its name is this project's session name, or when it is
+ * scoped to this project (by project-id or compose-project label) and carries
+ * the session-agent role or a session id. This is `managedSessionHint` without
+ * its ingress-forwarder exclusion: a forwarder carries neither signal, so it
+ * never counts here. A non-zero exit, a thrown call, or any row that does not
+ * parse is unreadable, never absent.
+ */
+export function observeSessionContainersAbsent(
+  executor: SessionContainerInventoryExecutor,
+  expectedProject: SessionContainerProjectIdentity,
+  options: childProcess.SpawnSyncOptions = {},
+): SessionContainersObservation {
+  const unreadable = (reason: string): SessionContainersObservation => Object.freeze({ kind: "unreadable", reason });
+  try {
+    assertExactSessionProjectIdentity(expectedProject);
+  } catch {
+    return unreadable("session-container project identity is invalid");
+  }
+  let result: CaptureResult;
+  try {
+    result = createDockerClient({ capture: executor }, options).listContainers(
+      { all: true, noTrunc: true, format: SESSION_CONTAINER_ABSENCE_FORMAT },
+      { timeout: SESSION_CONTAINER_ABSENCE_TIMEOUT_MS },
+    );
+  } catch (error) {
+    return unreadable(`Docker could not list containers (${error instanceof Error ? error.message : String(error)})`);
+  }
+  if (result.status !== 0) return unreadable(`Docker could not list containers (exit ${String(result.status)})`);
+  const lines = result.stdout.split("\n");
+  if (lines.at(-1) === "") lines.pop();
+  const namePrefix = `runfree-${expectedProject.projectId}-session-`;
+  let present: string | undefined;
+  for (const line of lines) {
+    const row = parseSessionContainerAbsenceRow(line);
+    if (!row) return unreadable("Docker's container listing has a malformed row");
+    const [id, names, projectId, composeProject, role, sessionId] = row as [string, string, string, string, string, string];
+    if (!DOCKER_OBJECT_ID_PATTERN.test(id)) return unreadable("Docker's container listing has a non-exact container id");
+    if (present !== undefined) continue;
+    const projectScoped = projectId === expectedProject.projectId || composeProject === expectedProject.composeProject;
+    if (names.startsWith(namePrefix) || (projectScoped && (role === "session-agent" || sessionId !== ""))) {
+      present = `container ${id} may be one of this project's sessions`;
+    }
+  }
+  if (present !== undefined) return Object.freeze({ kind: "present", reason: present });
+  const absent: SessionContainersAbsent = Object.freeze({ kind: "absent" });
+  sealedSessionContainerAbsences.add(absent);
+  return absent;
+}
+
 function inspectSessionContainerInventoryIds(
   executor: SessionContainerInventoryExecutor,
   ids: readonly string[],

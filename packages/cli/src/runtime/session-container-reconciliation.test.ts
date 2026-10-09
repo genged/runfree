@@ -1,4 +1,4 @@
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
 
 import {
   AGENT_PROJECT_IMAGE_ROLE,
@@ -19,6 +19,11 @@ import {
 } from "./session-containers.ts";
 import {
   accountSessionAgentImageReferences,
+  assertSessionContainersAbsent,
+  observeSessionContainersAbsent,
+  SESSION_CONTAINER_ABSENCE_FORMAT,
+  SESSION_CONTAINER_ABSENCE_TIMEOUT_MS,
+  type SessionContainerInventoryExecutor,
   allocateSessionSourceIp,
   classifySessionContainerReconciliation,
   EPHEMERAL_HELPER_HOSTS,
@@ -736,5 +741,93 @@ describe("session-container reconciliation", () => {
       containers: [snapshot(record)],
     });
     expect(accounting.images.map(({ imageId }) => imageId)).toEqual([record.selectedAgentImageId]);
+  });
+});
+
+describe("the session-container absence listing", () => {
+  type Row = { id?: string; names?: string; projectId?: string; composeProject?: string; role?: string; sessionId?: string };
+
+  function row(input: Row = {}): string {
+    return JSON.stringify([
+      input.id ?? "4".repeat(64),
+      input.names ?? "some-unrelated-container",
+      input.projectId ?? "",
+      input.composeProject ?? "",
+      input.role ?? "",
+      input.sessionId ?? "",
+    ]);
+  }
+
+  function listing(stdout: string, status = 0) {
+    const executor = vi.fn<SessionContainerInventoryExecutor>(() => ({ status, stdout, stderr: "" }));
+    return { executor, observation: observeSessionContainersAbsent(executor, PROJECT) };
+  }
+
+  test("lists every container once, by the exact argv, under its own timeout", () => {
+    const { executor } = listing("");
+
+    expect(SESSION_CONTAINER_ABSENCE_TIMEOUT_MS).toBe(5_000);
+    expect(executor).toHaveBeenCalledTimes(1);
+    expect(executor.mock.calls[0]?.[0]).toBe("docker");
+    expect(executor.mock.calls[0]?.[1]).toEqual(["ps", "--all", "--no-trunc", "--format", SESSION_CONTAINER_ABSENCE_FORMAT]);
+    expect(executor.mock.calls[0]?.[2]).toMatchObject({ timeout: 5000 });
+  });
+
+  test("an empty listing is a sealed absence, and only a minted one is accepted", () => {
+    const { observation } = listing("");
+
+    expect(observation).toEqual({ kind: "absent" });
+    expect(() => assertSessionContainersAbsent(observation)).not.toThrow();
+    expect(() => assertSessionContainersAbsent({ kind: "absent" })).toThrow(/not minted/);
+  });
+
+  test.each<[string, Row]>([
+    ["this project's session name", { names: `runfree-${PROJECT.projectId}-session-rf-20260805-abcdef` }],
+    ["this project's id label with the session-agent role", { projectId: PROJECT.projectId, role: "session-agent" }],
+    ["this compose project's label with a session id", { composeProject: PROJECT.composeProject, sessionId: "rf-20260805-abcdef" }],
+  ])("%s is present", (_label, input) => {
+    const { observation } = listing(`${row()}\n${row({ id: "5".repeat(64), ...input })}\n`);
+
+    expect(observation.kind).toBe("present");
+    expect(() => assertSessionContainersAbsent(observation)).toThrow();
+  });
+
+  test.each<[string, Row]>([
+    ["another project's session", {
+      names: "runfree-ffffffffffff-session-rf-20260805-abcdef",
+      projectId: "ffffffffffff",
+      composeProject: "runfree-ffffffffffff",
+      role: "session-agent",
+      sessionId: "rf-20260805-abcdef",
+    }],
+    ["this project's ingress forwarder", {
+      names: `runfree-ingress-vnc-${PROJECT.projectId}-5901`,
+      projectId: PROJECT.projectId,
+      role: "ingress-forwarder",
+    }],
+  ])("%s is absent", (_label, input) => {
+    expect(listing(`${row(input)}\n`).observation.kind).toBe("absent");
+  });
+
+  test.each<[string, string, number]>([
+    ["a timed-out listing", "", 124],
+    ["a row that is not a six-string array", `${JSON.stringify(["4".repeat(64), "name", "", "", ""])}\n`, 0],
+    ["a row whose fields are not all strings", `${JSON.stringify(["4".repeat(64), "name", "", "", "", 1])}\n`, 0],
+    ["a row that is not JSON", "4444\tname\n", 0],
+    ["a row whose id is not exact", `${row({ id: "4".repeat(12) })}\n`, 0],
+    ["a malformed row after a present one", `${row({ names: `runfree-${PROJECT.projectId}-session-x` })}\nnot json\n`, 0],
+  ])("%s is unreadable, never absent", (_label, stdout, status) => {
+    const { observation } = listing(stdout, status);
+
+    expect(observation.kind).toBe("unreadable");
+    expect(() => assertSessionContainersAbsent(observation)).toThrow();
+  });
+
+  test("a throwing executor is unreadable", () => {
+    const executor = vi.fn<SessionContainerInventoryExecutor>(() => {
+      throw new Error("spawn failed");
+    });
+
+    expect(observeSessionContainersAbsent(executor, PROJECT).kind).toBe("unreadable");
   });
 });
