@@ -12,6 +12,7 @@ import {
 import {
   PROJECT_LIFECYCLE_LOCK_RETRY_ATTEMPTS,
   PROJECT_LIFECYCLE_LOCK_RETRY_DELAY_MS,
+  PROJECT_LIFECYCLE_LOCK_RETRY_WINDOW_MS,
   processAlive,
 } from "../runtime/sessions.ts";
 import { runfreeLog } from "../warnings.ts";
@@ -157,13 +158,19 @@ export type ControlLockWaitOptions = {
   delayMs?: number;
   diagnosticIntervalMs?: number;
   log?: (message: string) => void;
+  now?: () => number;
+  windowMs?: number;
 };
 
 /**
- * Runs `attempt` again while it fails with `ControlLockBusyError`, for the
- * same bounded window another command waits for the project lifecycle lock.
+ * Runs `attempt` again while it fails with `ControlLockBusyError`. Retrying
+ * stops at whichever comes first: `windowMs` of wall-clock time since the
+ * first busy failure (by default the window another command waits for the
+ * project lifecycle lock), or `attempts` tries. The clock matters because
+ * one attempt can itself take long (it may wait for the lifecycle lock or for
+ * an interactive answer), so a count of tries alone does not bound the wait.
  * Any other error propagates at once, and the last busy error propagates
- * unchanged when the window is spent.
+ * unchanged when the bound is reached.
  *
  * The caller must hold no lock across the wait: each attempt has to take and
  * release its own locks, so a busy error leaves nothing held while this sleeps.
@@ -177,28 +184,39 @@ export async function waitWhileControlLockBusy<T>(
 ): Promise<T> {
   const attempts = options.attempts ?? PROJECT_LIFECYCLE_LOCK_RETRY_ATTEMPTS;
   const delayMs = options.delayMs ?? PROJECT_LIFECYCLE_LOCK_RETRY_DELAY_MS;
+  const windowMs = options.windowMs ?? PROJECT_LIFECYCLE_LOCK_RETRY_WINDOW_MS;
   const diagnosticIntervalMs = options.diagnosticIntervalMs ?? 5_000;
   const log = options.log ?? runfreeLog;
+  const now = options.now ?? Date.now;
   if (!Number.isSafeInteger(attempts) || attempts < 1) {
     throw new Error("control lock wait attempts must be a positive integer");
   }
   if (!Number.isSafeInteger(delayMs) || delayMs < 1) {
     throw new Error("control lock wait delay must be a positive integer");
   }
-  const startedAt = Date.now();
-  let nextDiagnosticAt = startedAt + diagnosticIntervalMs;
+  if (!Number.isSafeInteger(windowMs) || windowMs < 0) {
+    throw new Error("control lock wait window must be a non-negative integer");
+  }
+  let firstBusyAt: number | undefined;
+  let nextDiagnosticAt = 0;
   for (let tried = 1; ; tried += 1) {
     try {
       return await attempt();
     } catch (error) {
-      if (!(error instanceof ControlLockBusyError) || tried >= attempts) throw error;
+      if (!(error instanceof ControlLockBusyError)) throw error;
+      const busyAt = now();
+      if (firstBusyAt === undefined) {
+        firstBusyAt = busyAt;
+        nextDiagnosticAt = busyAt + diagnosticIntervalMs;
+      }
+      if (tried >= attempts || busyAt - firstBusyAt >= windowMs) throw error;
     }
     await new Promise((resolve) => setTimeout(resolve, delayMs));
-    const now = Date.now();
-    if (now >= nextDiagnosticAt) {
-      const elapsedSeconds = Math.max(1, Math.round((now - startedAt) / 1_000));
+    const waitedAt = now();
+    if (waitedAt >= nextDiagnosticAt) {
+      const elapsedSeconds = Math.max(1, Math.round((waitedAt - firstBusyAt) / 1_000));
       log(`waiting for the project control lock (${elapsedSeconds}s; lock: ${controlLockPath(project)})`);
-      nextDiagnosticAt = now + diagnosticIntervalMs;
+      nextDiagnosticAt = waitedAt + diagnosticIntervalMs;
     }
   }
 }

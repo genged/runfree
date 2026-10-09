@@ -54,7 +54,7 @@ import {
 } from "./comparator.ts";
 import { compileDesiredPolicies } from "./compiler.ts";
 import { type ControlLockWaitOptions, waitWhileControlLockBusy } from "./lock.ts";
-import { withQuiescedProject } from "./quiesce.ts";
+import { LivePerSessionAgentsError, withQuiescedProject } from "./quiesce.ts";
 import { parseStrictJson } from "./strict-json.ts";
 import {
   approveNarrowImageBuildCandidate,
@@ -586,6 +586,18 @@ export async function requireUsableApprovalSelection(
 }
 
 /**
+ * The launch beside a running session: the exact selected host-owned
+ * generation, with no desired-input read, preparation, or publication.
+ */
+function joinActiveSessionGeneration(context: RuntimeContext): StartupControlPreparation {
+  const active = readActiveEffectiveControl(context.project);
+  if (!active) {
+    throw new Error("active sessions require an existing verified effective control selection");
+  }
+  return { generation: active, mechanism: "active-session" };
+}
+
+/**
  * Resolve startup authority before Docker planning, image work, credential
  * resolution, or attach. A concurrent launch reuses the verified active
  * generation without reading desired project input or publishing authority.
@@ -614,15 +626,24 @@ export async function prepareEffectiveControlsForStartup(
   // Reuse the exact selected host-owned generation instead. This path performs
   // no preparation or publication, so starting another session cannot activate
   // desired drift or a different approved snapshot.
-  if (activeLifecycleSessions(context).length > 0) {
-    const active = readActiveEffectiveControl(context.project);
-    if (!active) {
-      throw new Error("active sessions require an existing verified effective control selection");
-    }
-    return { generation: active, mechanism: "active-session" };
-  }
+  if (activeLifecycleSessions(context).length > 0) return joinActiveSessionGeneration(context);
 
-  const candidate = await captureQuiescedDesiredPolicyCandidate(context, io);
+  let candidate: DesiredPolicyCandidate;
+  try {
+    candidate = await captureQuiescedDesiredPolicyCandidate(context, io);
+  } catch (error) {
+    // The check above runs without the lifecycle lock, so a peer launch can
+    // admit its session between that check and this capture: the capture's
+    // own live-agent refusal is then about a session this launch would have
+    // joined had it looked a moment later. The refusal is raised before the
+    // capture reads or writes anything, so joining here is the same decision
+    // as the check above. Every other refusal still fails, and the re-check
+    // must still see a live session.
+    if (error instanceof LivePerSessionAgentsError && activeLifecycleSessions(context).length > 0) {
+      return joinActiveSessionGeneration(context);
+    }
+    throw error;
+  }
   const runtimeSubject = runtimeIsolationControlSubject(context.project.config);
   let selection = readControlApprovalSelection(context.projectRoot, context.project);
   const networkProjectChanged = selectedDigest(selection, "network-project") !== candidate.projectSubject.digest;

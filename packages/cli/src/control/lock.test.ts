@@ -144,6 +144,27 @@ describe("shared control lock", () => {
       held?.release();
     });
 
+    test("stops retrying once the wall-clock window since the first busy failure is spent", async () => {
+      const held = tryAcquireControlLock(project);
+      expect(held).toBeDefined();
+      let clock = 0;
+      // Each attempt stands in for a slow one (a lifecycle-lock wait, say).
+      const attempt = vi.fn(() => {
+        clock += 30_000;
+        return withControlLock(project, () => "never");
+      });
+
+      await expect(waitWhileControlLockBusy(project, attempt, {
+        attempts: 1_000,
+        delayMs: 1,
+        log: () => {},
+        now: () => clock,
+        windowMs: 60_000,
+      })).rejects.toBeInstanceOf(ControlLockBusyError);
+      expect(attempt).toHaveBeenCalledTimes(3);
+      held?.release();
+    });
+
     test("does not retry an error that is not lock contention", async () => {
       const failure = new Error("control publication failed");
       const attempt = vi.fn(() => {
