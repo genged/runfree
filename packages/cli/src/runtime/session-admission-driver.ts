@@ -172,6 +172,7 @@ import {
   type PreparedRuntime,
 } from "./prepared-runtime.ts";
 import { sessionRegistryDigest } from "./launch-handoff.ts";
+import { consumeWarmEmptySessionState, isWarmEmptySessionState } from "./warm-empty-session-state.ts";
 import { createRuntimeDocker } from "./docker.ts";
 import { createDockerClient } from "./docker-client.ts";
 import {
@@ -1314,7 +1315,7 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
 
   #settledByHandoff(): LaunchHandoff | undefined {
     const handoff = this.#input.handoff;
-    if (!handoff || !handoff.inventoryClean) return undefined;
+    if (!handoff || !handoffMaySettle(handoff)) return undefined;
     this.#lock();
     const proxyId = this.#controlPlane().proxyContainerId;
     if (handoff.proxy.id !== proxyId) return undefined;
@@ -1336,6 +1337,18 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
     if (inspected.status !== 0 || typeof startedAt !== "string") return undefined;
     if (running !== true || startedAt !== handoff.proxy.startedAt) {
       throw new StalePreparedRuntimeError("the proxy restarted after startup prepared this launch");
+    }
+    // A warm-empty state settles admission once, and only bound to exactly
+    // what was just re-proved: the registry, the proxy incarnation, and this
+    // held lock. One that does not consume runs the full preflight.
+    const state = handoff.sessionState;
+    if (state.kind === "warm-empty" && !consumeWarmEmptySessionState(state, {
+      registryDigest: handoff.registryDigest,
+      proxyId,
+      proxyStartedAt: handoff.proxy.startedAt,
+      lockOwnerToken: this.#input.lifecycleLock.ownerToken,
+    })) {
+      return undefined;
     }
     return handoff;
   }
@@ -1421,15 +1434,21 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
       networkName: authority.networkName,
       subnet: authority.subnet,
     });
-    // Sub-second launch plan Task 3: startup ran this same reconcile under the
-    // lock this launch still holds. When nothing it saw needed repair and the
-    // registry and proxy incarnation are still exactly what it left, repeating
-    // it (and the orphan sweep) would observe the same state again. A settled
-    // reconcile revoked no dead owner and removed no orphan container, so no
-    // callback forwarder went away since the participant proof above was taken.
+    // Startup settled the project's sessions under the lock this launch still
+    // holds, in one of two ways. Either its reconcile saw nothing that needed
+    // repair, or its warm evidence proved there were no session files, no
+    // session participants, no records, and no session containers, so it had
+    // nothing to reconcile. Either way, while the registry and proxy
+    // incarnation are still exactly what it left, repeating the reconcile (and
+    // the orphan sweep) would observe the same state again. Neither path
+    // revoked a dead owner or removed an orphan container, so no callback
+    // forwarder went away since the participant proof above was taken.
     const settledByHandoff = this.#settledByHandoff();
     if (settledByHandoff) {
-      this.#reservedSessionFileIps = settledByHandoff.reservedSourceIps;
+      // A warm-empty state saw no session file, so no address is reserved.
+      this.#reservedSessionFileIps = settledByHandoff.sessionState.kind === "reconciled"
+        ? settledByHandoff.sessionState.reservedSourceIps
+        : [];
       this.#handoffIpAssignments = settledByHandoff.ipAssignmentDigests;
       this.#lock();
       this.#assertNoQuarantinedSessionRecords();
@@ -2463,6 +2482,18 @@ function timedSessionAdmissionLaunchSteps(
 }
 
 /**
+ * Whether a handoff may settle admission without its full preflight: a
+ * reconcile that saw only settled state, or a warm-empty state this process
+ * minted and nobody has consumed. A peek only; `#settledByHandoff` consumes.
+ */
+function handoffMaySettle(handoff: LaunchHandoff | undefined): boolean {
+  if (!handoff) return false;
+  return handoff.sessionState.kind === "reconciled"
+    ? handoff.sessionState.inventoryClean
+    : isWarmEmptySessionState(handoff.sessionState);
+}
+
+/**
  * Creates the production adapter for the internal admission proof gate.
  *
  * Its only public operation is a built-in probe. All Docker targets, lifecycle
@@ -2485,9 +2516,10 @@ export function createInternalSessionAdmissionDriver(
     preparedRuntime: input.preparedRuntime,
     lifecycleLock,
     io: input.io,
-    // Only a clean handoff settles admission (`#settledByHandoff`); an
-    // unclean one runs the full preflight, so it re-reads the marker too.
-    ...(input.handoff?.inventoryClean ? { handoff: input.handoff } : {}),
+    // Only a handoff that may settle admission (`#settledByHandoff`) skips
+    // the marker re-read; any other runs the full preflight, so it re-reads
+    // the marker too.
+    ...(handoffMaySettle(input.handoff) ? { handoff: input.handoff } : {}),
   });
   const resolvedInput = Object.freeze({
     ...input,

@@ -18,6 +18,7 @@ import type { SessionContainerTemplate } from "./session-container-template.ts";
 import { runtimeValidationMarkerStatus, type RuntimeValidationProof } from "./state.ts";
 import type { ProjectLifecycleLock } from "./sessions.ts";
 import type { RuntimeContext, RuntimeIO } from "./types.ts";
+import type { WarmEmptySessionState } from "./warm-empty-session-state.ts";
 import { stableJson } from "../strict-primitives.ts";
 import { warn } from "../warnings.ts";
 
@@ -52,6 +53,15 @@ type PreparedRuntimeBinding = Readonly<{
 }>;
 
 export type ConsumedPreparedRuntime = PreparedRuntimeBinding;
+
+/** What startup's session reconcile under the handed-off lock saw. */
+export type ReconciledSessionState = Readonly<{
+  kind: "reconciled";
+  /** That reconcile saw only settled state. */
+  inventoryClean: boolean;
+  /** Every address a proxy session file named in that reconcile. */
+  reservedSourceIps: readonly string[];
+}>;
 
 /**
  * The project lifecycle lock a launch's startup still holds, handed to that
@@ -89,10 +99,13 @@ export type LaunchHandoff = Readonly<{
   proxy: Readonly<{ id: string; startedAt: string; pid?: number; bootId?: string }>;
   /** sha256 of the lifecycle registry as startup left it. */
   registryDigest: string;
-  /** Startup's reconcile under this lock saw only settled state. */
-  inventoryClean: boolean;
-  /** Every address a proxy session file named in that reconcile. */
-  reservedSourceIps: readonly string[];
+  /**
+   * The project's session state under this lock: what startup's reconcile
+   * saw, or a sealed one-shot proof that a warm launch's evidence found no
+   * session state, in which case startup did not reconcile. Kept by reference
+   * through attach, so the seal survives (`warm-empty-session-state.ts`).
+   */
+  sessionState: ReconciledSessionState | WarmEmptySessionState;
   /**
    * Every IP assignment file's digest, read inside the proxy under this same
    * held lock and proxy incarnation (sub-second launch plan Task 6). The IP

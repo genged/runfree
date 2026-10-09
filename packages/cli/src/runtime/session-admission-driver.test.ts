@@ -99,6 +99,8 @@ const mocks = vi.hoisted(() => ({
   removeOrphanIngress: vi.fn(),
   reclaimStaleCallbacks: vi.fn(),
   sessionMcpCallbackLifecycle: vi.fn(),
+  consumeWarmEmpty: vi.fn(),
+  isWarmEmpty: vi.fn(),
 }));
 
 vi.mock("../agents.ts", () => ({ builtinAgent: mocks.builtinAgent }));
@@ -240,6 +242,10 @@ vi.mock("./session-materialization-eligibility.ts", () => ({
   classifySessionAgentMaterializationEligibilityV2: mocks.compileMaterializationEligibility,
 }));
 vi.mock("./docker.ts", () => ({ createRuntimeDocker: mocks.createRuntimeDocker }));
+vi.mock("./warm-empty-session-state.ts", () => ({
+  consumeWarmEmptySessionState: mocks.consumeWarmEmpty,
+  isWarmEmptySessionState: mocks.isWarmEmpty,
+}));
 vi.mock("./sessions.ts", () => ({
   SessionLockAcquisitionAbortedError: class SessionLockAcquisitionAbortedError extends Error {},
   // The one message-bearing lock error a test asserts on; the real class
@@ -439,6 +445,10 @@ beforeEach(() => {
     return 0;
   });
   mocks.sessionMcpCallbackLifecycle.mockReturnValue(undefined);
+  // The seal itself is proved in its own module: here a warm-empty state is
+  // recognized by kind, and admission can consume it only when a test says so.
+  mocks.isWarmEmpty.mockImplementation((value: unknown) => (value as { kind?: unknown } | undefined)?.kind === "warm-empty");
+  mocks.consumeWarmEmpty.mockReturnValue(false);
   mocks.events.length = 0;
   mocks.dockerInputs.length = 0;
   mocks.failRunningProof = false;
@@ -3103,8 +3113,7 @@ describe("session admission under the per-session file source", () => {
         lockAcquiredAtMonotonicMs: performance.now(),
         proxy: { id: PROXY_ID, startedAt: PROXY_STARTED_AT },
         registryDigest: sessionRegistryDigest("/state", EXPECTED_PROJECT),
-        inventoryClean: true,
-        reservedSourceIps: ["172.31.90.33"],
+        sessionState: { kind: "reconciled", inventoryClean: true, reservedSourceIps: ["172.31.90.33"] },
         ...overrides,
       };
     }
@@ -3140,7 +3149,7 @@ describe("session admission under the per-session file source", () => {
 
     test.each([
       ["no handoff", undefined],
-      ["an unsettled startup reconcile", { inventoryClean: false }],
+      ["an unsettled startup reconcile", { sessionState: { kind: "reconciled", inventoryClean: false, reservedSourceIps: [] } }],
       ["a registry changed since startup", { registryDigest: `sha256:${"1".repeat(64)}` }],
       ["another proxy", { proxy: { id: "9".repeat(64), startedAt: PROXY_STARTED_AT } }],
     ] as const)("admission with %s runs the current preflight", async (_label, overrides) => {
@@ -3181,7 +3190,7 @@ describe("session admission under the per-session file source", () => {
       for (const inventoryClean of [true, false]) {
         mocks.consumePreparedRuntime.mockClear();
         const input = fixture();
-        const handoff = handoffFor(input, { inventoryClean });
+        const handoff = handoffFor(input, { sessionState: { kind: "reconciled", inventoryClean, reservedSourceIps: [] } });
         createInternalSessionAdmissionDriver({ ...input, handoff });
         const consumed = mocks.consumePreparedRuntime.mock.calls[0]?.[0] as { handoff?: LaunchHandoff };
         // An unclean handoff runs the full preflight, and with it the full
@@ -3247,6 +3256,94 @@ describe("session admission under the per-session file source", () => {
 
       expect(mocks.events).not.toContain("allocate");
       expect(mocks.createContainer).not.toHaveBeenCalled();
+      expect(mocks.reconcileSessions).not.toHaveBeenCalled();
+    });
+
+    function warmEmptyHandoff(input: ReturnType<typeof fixture>): LaunchHandoff {
+      return handoffFor(input, {
+        sessionState: {
+          kind: "warm-empty",
+          registryDigest: sessionRegistryDigest("/state", EXPECTED_PROJECT),
+          proxyId: PROXY_ID,
+          proxyStartedAt: PROXY_STARTED_AT,
+          lockOwnerToken: input.sessionLockManager.lock.ownerToken,
+        } as LaunchHandoff["sessionState"],
+      });
+    }
+
+    test("admission accepts a warm-empty state it can consume, without reconcile or orphan inventory", async () => {
+      const input = fixture();
+      mocks.containerInspect = { status: 0, stdout: runningInspect(), stderr: "" };
+      proxyInspectAnswer(PROXY_STARTED_AT);
+      mocks.consumeWarmEmpty.mockReturnValue(true);
+      const handoff = warmEmptyHandoff(input);
+      const driver = createInternalSessionAdmissionDriver({
+        ...input,
+        handoff,
+        nowEpochMs: () => Date.parse("2026-08-09T00:10:00.000Z"),
+      });
+
+      await expect(driver.launchBuiltin("codex")).resolves.toEqual({ status: 0, signal: null });
+
+      expect(mocks.consumeWarmEmpty).toHaveBeenCalledTimes(1);
+      expect(mocks.consumeWarmEmpty).toHaveBeenCalledWith(handoff.sessionState, {
+        registryDigest: handoff.registryDigest,
+        proxyId: PROXY_ID,
+        proxyStartedAt: PROXY_STARTED_AT,
+        lockOwnerToken: input.sessionLockManager.lock.ownerToken,
+      });
+      expect(mocks.reconcileSessions).not.toHaveBeenCalled();
+      expect(mocks.inventory).not.toHaveBeenCalled();
+      // No session files existed, so nothing is reserved; the fresh baseline,
+      // the fence, and the post-start proof still run.
+      expect(mocks.allocateIp).toHaveBeenCalledWith(expect.objectContaining({ reservedIps: [] }));
+      expect(mocks.events).toContain(`docker:network inspect ${NETWORK_ID}`);
+      expect(mocks.events).toContain("session-file:ip-reuse-fence");
+      // A consumable warm-empty state also skips the marker re-read.
+      const consumed = mocks.consumePreparedRuntime.mock.calls[0]?.[0] as { handoff?: LaunchHandoff };
+      expect(consumed.handoff).toBe(handoff);
+    });
+
+    test("admission refuses a warm-empty state it did not mint and runs the full preflight", async () => {
+      const input = fixture();
+      mocks.containerInspect = { status: 0, stdout: runningInspect(), stderr: "" };
+      proxyInspectAnswer(PROXY_STARTED_AT);
+      mocks.consumeWarmEmpty.mockReturnValue(false);
+      const driver = createInternalSessionAdmissionDriver({
+        ...input,
+        handoff: warmEmptyHandoff(input),
+        nowEpochMs: () => Date.parse("2026-08-09T00:10:00.000Z"),
+      });
+
+      await expect(driver.launchBuiltin("codex")).resolves.toEqual({ status: 0, signal: null });
+
+      expect(mocks.consumeWarmEmpty).toHaveBeenCalledTimes(1);
+      expect(mocks.reconcileSessions).toHaveBeenCalledTimes(1);
+      expect(mocks.inventory).toHaveBeenCalled();
+    });
+
+    test("a warm-empty state admission cannot recognize does not skip the marker re-read", () => {
+      const input = fixture();
+      mocks.isWarmEmpty.mockReturnValue(false);
+      createInternalSessionAdmissionDriver({ ...input, handoff: warmEmptyHandoff(input) });
+      const consumed = mocks.consumePreparedRuntime.mock.calls[0]?.[0] as { handoff?: LaunchHandoff };
+      expect(consumed.handoff).toBeUndefined();
+    });
+
+    test("a proxy restarted since startup refuses as stale before the warm-empty state is consumed", async () => {
+      const input = fixture();
+      proxyInspectAnswer("2026-08-09T00:05:00.000Z");
+      mocks.consumeWarmEmpty.mockReturnValue(true);
+      const driver = createInternalSessionAdmissionDriver({
+        ...input,
+        handoff: warmEmptyHandoff(input),
+        nowEpochMs: () => Date.parse("2026-08-09T00:10:00.000Z"),
+      });
+
+      await expect(driver.launchBuiltin("codex")).rejects.toBeInstanceOf(StalePreparedRuntimeError);
+
+      expect(mocks.consumeWarmEmpty).not.toHaveBeenCalled();
+      expect(mocks.events).not.toContain("allocate");
       expect(mocks.reconcileSessions).not.toHaveBeenCalled();
     });
 
@@ -4349,8 +4446,7 @@ describe("session admission under the per-session file source", () => {
                 lockAcquiredAtMonotonicMs: heldSince,
                 proxy: { id: PROXY_ID, startedAt: "2026-08-09T00:00:00.000Z" },
                 registryDigest: sessionRegistryDigest("/state", EXPECTED_PROJECT),
-                inventoryClean: true,
-                reservedSourceIps: [],
+                sessionState: { kind: "reconciled", inventoryClean: true, reservedSourceIps: [] },
               },
             }
           : { lockHeldSinceMonotonicMs: heldSince }),

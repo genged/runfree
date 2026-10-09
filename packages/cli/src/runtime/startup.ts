@@ -184,6 +184,7 @@ import { imageCleanupStampMatches, writeImageCleanupStamp } from "./image-cleanu
 import { createOperationHistogram, withOperationHistogram } from "./operation-histogram.ts";
 import { remedy } from "../remedies.ts";
 import { sessionRegistryDigest } from "./launch-handoff.ts";
+import { proveWarmEmptySessionState, type WarmEmptySessionState } from "./warm-empty-session-state.ts";
 import { setMcpLogContext } from "./mcp.ts";
 
 const RETAINED_AGENT_TEMPLATE_REMEDY =
@@ -1671,6 +1672,7 @@ export async function startRuntime(
       }
       let proxyStartedAt: string | undefined;
       let reconciled: SessionReconcileResult | undefined;
+      let warmEmpty: WarmEmptySessionState | undefined;
       // Invariant 9, widen-before-new-files: the proxy is proven ready and the
       // control plane is selected, so publish the project's session eligibility
       // before anything waits on session admission. A proxy holding no
@@ -1703,21 +1705,47 @@ export async function startRuntime(
         // held and before any session can be admitted. It follows the
         // publication above, which widened the admitted set; step 5 of the
         // reconcile narrows it again once the residue is gone.
-        reconciled = await timings.timeAsync("startup:reconcile-sessions", () => reconcileSessions({
-          stateDir: activePlan.paths.stateDir,
-          expectedProject: { projectId: activePlan.projectId, composeProject: project },
-          io,
-          proxyId: runtimeProof.proxyId,
-          network: {
-            networkId: effective.selection.networkIds.agentInternal,
-            networkName: `${project}_agent_internal`,
-            subnet: activePlan.network.subnet,
-          },
-          env: activeContext.env,
-          lifecycleLock: heldLifecycleLock,
-          mode: "repair",
-          dockerOptions: dockerClientEnvOptions(activeContext),
-        }));
+        //
+        // A warm launch that will hand this lock to its admission skips the
+        // reconcile only when its own evidence proves there is nothing to
+        // reconcile: no proxy session file, no session participant, no
+        // lifecycle or quarantined record, and no container that may be a
+        // session. The publication above already used that empty registry,
+        // so nothing is left to narrow. Anything short of that reconciles.
+        if (warm && rebuildOptions.launchHandoff === true && rebuildOptions.launch === true && !removeExisting
+          && acquiredLifecycleLock !== undefined) {
+          const verdict = timings.time("startup:warm-empty-check", () => proveWarmEmptySessionState({
+            warm,
+            io,
+            stateDir: activePlan.paths.stateDir,
+            expectedProject: { projectId: activePlan.projectId, composeProject: project },
+            proxyId: runtimeProof.proxyId,
+            proxyStartedAt: observedProxyStartedAt,
+            lifecycleLock: heldLifecycleLock,
+            dockerOptions: dockerClientEnvOptions(activeContext),
+          }));
+          timings.report("startup:warm-empty", verdict.kind === "empty" ? "empty" : `blocked:${verdict.reason}`);
+          if (verdict.kind === "empty") warmEmpty = verdict.state;
+        }
+        if (warmEmpty) {
+          timings.report("startup:reconcile-sessions", "skipped warm-empty");
+        } else {
+          reconciled = await timings.timeAsync("startup:reconcile-sessions", () => reconcileSessions({
+            stateDir: activePlan.paths.stateDir,
+            expectedProject: { projectId: activePlan.projectId, composeProject: project },
+            io,
+            proxyId: runtimeProof.proxyId,
+            network: {
+              networkId: effective.selection.networkIds.agentInternal,
+              networkName: `${project}_agent_internal`,
+              subnet: activePlan.network.subnet,
+            },
+            env: activeContext.env,
+            lifecycleLock: heldLifecycleLock,
+            mode: "repair",
+            dockerOptions: dockerClientEnvOptions(activeContext),
+          }));
+        }
         heldLifecycleLock.assertHeld();
       } catch (error) {
         warn(error instanceof Error ? error.message : String(error));
@@ -1762,7 +1790,7 @@ export async function startRuntime(
       const handoffLock = acquiredLifecycleLock;
       const launchHandoff: LaunchHandoffRequest | undefined = rebuildOptions.launchHandoff === true
         && rebuildOptions.launch === true && !removeExisting && handoffLock !== undefined
-        && proxyStartedAt !== undefined && reconciled !== undefined
+        && proxyStartedAt !== undefined && (reconciled !== undefined || warmEmpty !== undefined)
         ? {
             build: () => {
               heldLifecycleLock.assertHeld();
@@ -1784,8 +1812,11 @@ export async function startRuntime(
                 },
                 ...(warm?.ipAssignmentDigests ? { ipAssignmentDigests: warm.ipAssignmentDigests } : {}),
                 registryDigest: sessionRegistryDigest(activePlan.paths.stateDir, { projectId: activePlan.projectId, composeProject: project }),
-                inventoryClean: (reconciled as SessionReconcileResult).inventoryClean,
-                reservedSourceIps: [...(reconciled as SessionReconcileResult).reservedSourceIps],
+                sessionState: warmEmpty ?? Object.freeze({
+                  kind: "reconciled" as const,
+                  inventoryClean: (reconciled as SessionReconcileResult).inventoryClean,
+                  reservedSourceIps: [...(reconciled as SessionReconcileResult).reservedSourceIps],
+                }),
               };
             },
             releaseLock: () => heldLifecycleLock.release(),

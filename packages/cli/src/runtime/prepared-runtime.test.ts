@@ -386,8 +386,7 @@ function handoffFor(prepared: ReturnType<typeof fixture>, lock: ProjectLifecycle
     lockAcquiredAtMonotonicMs: performance.now(),
     proxy: { id: prepared.proof.proxyId, startedAt: "2026-06-13T00:00:00.000Z" },
     registryDigest: `sha256:${"0".repeat(64)}`,
-    inventoryClean: true,
-    reservedSourceIps: [],
+    sessionState: { kind: "reconciled", inventoryClean: true, reservedSourceIps: [] },
   };
 }
 
@@ -421,6 +420,16 @@ test("a launch handoff is taken exactly once and a disposed untaken handoff rele
   disposeLaunchHandoff(untaken);
   expect(other.releases).toBe(1);
   expect(takeLaunchHandoff(untaken)).toBeUndefined();
+});
+
+test("a handoff's session state survives attach by reference", () => {
+  // Attach copies the handoff, so a seal on the session state lives on the
+  // nested object, which must reach the taker as the very same object.
+  const prepared = fixture();
+  const runtime = mintPreparedRuntime({ plan: prepared.activePlan, validationProof: prepared.proof });
+  const handoff = handoffFor(prepared, countingLock());
+  attachLaunchHandoff(runtime, handoff);
+  expect(takeLaunchHandoff(runtime)?.sessionState).toBe(handoff.sessionState);
 });
 
 test("disposing a handoff whose release fails does not throw over the caller's own error", () => {
