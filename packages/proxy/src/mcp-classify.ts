@@ -348,20 +348,33 @@ function classifyMessage(
   };
 }
 
-function maxSeverity(
-  left: McpClassification | undefined,
-  right: McpClassification,
+// A JSON-RPC batch is one HTTP request, so one classification must stand for
+// every message in it. Reads add nothing. A single non-read message keeps its
+// own classification. Two or more non-read messages that include a write
+// become one `<batch>` write carrying the most restrictive action of every
+// element (an unclassifiable element contributes the global action): no
+// element may lend the batch a weaker action than another element needs, and
+// no grant for one tool may match a display that stands for several.
+function classifyBatch(
+  classifications: readonly McpClassification[],
+  server: LoadedMcpOperationServer,
+  globalWriteAction: WriteAction,
 ): McpClassification {
-  if (!left) return right;
-  if (left.kind === "unclassifiable" || right.kind === "unclassifiable") {
-    return left.kind === "unclassifiable" ? left : right;
-  }
-  if (left.kind === "write" && right.kind === "write") {
-    return mcpMostRestrictiveWriteAction([left.writeAction, right.writeAction]) === left.writeAction ? left : right;
-  }
-  if (left.kind === "write") return left;
-  if (right.kind === "write") return right;
-  return left;
+  const nonRead = classifications.filter((entry) => entry.kind !== "read");
+  if (nonRead.length === 0) return classifications[0];
+  if (nonRead.length === 1) return nonRead[0];
+  const writes = nonRead.filter((entry) => entry.kind === "write");
+  if (writes.length === 0) return nonRead[0];
+  const writeAction = mcpMostRestrictiveWriteAction(
+    nonRead.map((entry) => (entry.kind === "write" ? entry.writeAction : globalWriteAction)),
+  );
+  return {
+    kind: "write",
+    category: "mcp-unknown",
+    writeAction,
+    operation: operationFor(server, "<batch>"),
+    display: displayFor(server, "<batch>"),
+  };
 }
 
 export function classifyMcpRequestBody(input: {
@@ -415,9 +428,9 @@ export function classifyMcpRequestBody(input: {
   if (messages.length === 0) {
     return { kind: "unclassifiable", category: "mcp-unknown", reason: "unsupported-envelope", writeAction: globalWriteAction, display: displayFor(server, "<unknown>") };
   }
-  let result: McpClassification | undefined;
-  for (const message of messages) {
-    result = maxSeverity(result, classifyMessage(message, servers, globalWriteAction));
-  }
-  return result;
+  return classifyBatch(
+    messages.map((message) => classifyMessage(message, servers, globalWriteAction)),
+    server,
+    globalWriteAction,
+  );
 }

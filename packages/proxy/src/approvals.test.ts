@@ -357,6 +357,16 @@ describe("write approval manager", () => {
       category: "mcp-unknown",
       mcp: { agent: "codex", serverId: "codex:user:posthog", server: "posthog", method: "resources/subscribe" },
     }, SESSION_A)).toBe(false);
+    // A batch of several writes is classified as one `<batch>` operation; a
+    // tools grant must not admit it, since the batch can carry other methods.
+    expect(approvals.hasGrant({
+      host: "mcp.posthog.com",
+      method: "POST",
+      path: "/mcp",
+      writeAction: "ask",
+      category: "mcp-unknown",
+      mcp: { agent: "codex", serverId: "codex:user:posthog", server: "posthog", method: "<batch>" },
+    }, SESSION_A)).toBe(false);
     expect(approvals.hasGrant(detailsFor({ host: "mcp.posthog.com", method: "POST", path: "/mcp" }), SESSION_A)).toBe(false);
   });
 

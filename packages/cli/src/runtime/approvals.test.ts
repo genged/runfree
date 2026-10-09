@@ -17,6 +17,7 @@ import {
   grantCoverageLabel,
   decisionSummary,
   detailLines,
+  mcpMethodGrantable,
   pendingTableLines,
   saveMcpRuleForApproval,
   standingAuthorityLines,
@@ -668,5 +669,14 @@ describe("standing authority rendering", () => {
       "allow grant: all writes to api.github.com (5m left, session payments)",
     ]);
     expect(standingAuthorityLines(status, Date.parse("2026-07-27T00:20:00.000Z"))).toEqual([]);
+  });
+});
+
+describe("mcpMethodGrantable", () => {
+  test("offers session scope for a real MCP method but not for tool calls or proxy placeholders", () => {
+    expect(mcpMethodGrantable("resources/subscribe")).toBe(true);
+    expect(mcpMethodGrantable("tools/call")).toBe(false);
+    expect(mcpMethodGrantable("<unknown>")).toBe(false);
+    expect(mcpMethodGrantable("<batch>")).toBe(false);
   });
 });

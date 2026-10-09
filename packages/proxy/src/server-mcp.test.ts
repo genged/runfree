@@ -58,6 +58,7 @@ function mcpOperationPolicyPath(): string {
         defaultToolWriteAction: "ask",
         tools: {
           query: { writeAction: "allow" },
+          dropTable: { writeAction: "deny" },
         },
       },
     ],
@@ -65,7 +66,7 @@ function mcpOperationPolicyPath(): string {
   return filePath;
 }
 
-function mcpPolicy() {
+function mcpPolicy(hostWriteAction: "allow" | "ask" = "ask") {
   return {
     hosts: ["127.0.0.1"],
     tokens: {
@@ -77,12 +78,12 @@ function mcpPolicy() {
       },
     },
     requests: {
-      "127.0.0.1": { writeAction: "ask" },
+      "127.0.0.1": { writeAction: hostWriteAction },
     },
   };
 }
 
-async function startMcpProxy(dirs?: ApprovalDirs) {
+async function startMcpProxy(dirs?: ApprovalDirs, hostWriteAction: "allow" | "ask" = "ask") {
   const upstream = await startHttpsUpstream();
   const proxy = await startProxy({
     extraEnv: {
@@ -97,7 +98,7 @@ async function startMcpProxy(dirs?: ApprovalDirs) {
         }
         : {}),
     },
-    policy: mcpPolicy(),
+    policy: mcpPolicy(hostWriteAction),
     secretFiles: { example: "real-proxy-token\n" },
   });
   if (dirs && fs.existsSync(path.join(dirs.decisionsDir, APPROVALS_WATCHER_HEARTBEAT_FILE))) attachWatcher(dirs);
@@ -132,6 +133,27 @@ describe("proxy server MCP operation policy", () => {
     expect(upstream.requests).toHaveLength(1);
     expect(upstream.requests[0].headers.authorization).toBe("Bearer real-proxy-token");
   }, 20_000);
+
+  // One malformed batch element must not swap a denied tool's deny for the
+  // host's allow: the whole batch is one request and is denied before upstream.
+  test("a batch carrying a denied tool call is denied under an allow host, whatever else it carries", async () => {
+    const { proxy, upstream } = await startMcpProxy(undefined, "allow");
+    const deniedCall = { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "dropTable", arguments: {} } };
+    for (const body of [[deniedCall, 5], [5, deniedCall], [deniedCall, { jsonrpc: "2.0", id: 2, method: "tools/call", params: { name: "query" } }]]) {
+      const response = await httpsViaProxy({
+        proxyPort: proxy.port,
+        targetPort: upstream.port,
+        method: "POST",
+        path: "/mcp",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      expect(response.statusCode, JSON.stringify(body)).toBe(403);
+      expect(response.raw).toContain("x-runfree-blocked: write-denied");
+      expect(response.raw).not.toContain("real-proxy-token");
+    }
+    expect(upstream.requests).toHaveLength(0);
+  }, 30_000);
 
   test("write-like MCP tool calls hold with MCP identity and do not reach upstream before approval", async () => {
     const dirs = approvalDirs();

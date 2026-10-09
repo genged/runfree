@@ -26,6 +26,7 @@ function classify(input: {
   body?: string;
   contentEncoding?: string;
   contentType?: string;
+  globalWriteAction?: "allow" | "ask" | "deny";
   method?: string;
   path?: string;
 }) {
@@ -35,7 +36,7 @@ function classify(input: {
     contentEncoding: input.contentEncoding,
     contentLength: Buffer.byteLength(body),
     contentType: input.contentType ?? "application/json",
-    globalWriteAction: "ask",
+    globalWriteAction: input.globalWriteAction ?? "ask",
     method: input.method ?? "POST",
     policy,
     url: new URL(`https://mcp.posthog.com${input.path ?? "/mcp"}`),
@@ -92,5 +93,65 @@ describe("MCP protocol classifier", () => {
       reason: "non-json",
     });
     expect(classify({ path: "/mcp/%2e%2e/other", body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize" }) })).toBeUndefined();
+  });
+
+  // A batch is one HTTP request, so one classification must stand for every
+  // message in it: no element may lend the batch a weaker action or a display
+  // that a grant for a different element would match.
+  describe("JSON-RPC batches", () => {
+    const call = (id: number, name: string) => ({ jsonrpc: "2.0", id, method: "tools/call", params: { name } });
+    const read = (id: number) => ({ jsonrpc: "2.0", id, method: "tools/list" });
+
+    test("a malformed element never erases a denied tool's deny", () => {
+      expect(classify({ globalWriteAction: "allow", body: JSON.stringify([call(1, "deleteFeatureFlag"), 5]) })).toMatchObject({
+        kind: "write",
+        writeAction: "deny",
+      });
+      expect(classify({ globalWriteAction: "allow", body: JSON.stringify([5, call(1, "deleteFeatureFlag")]) })).toMatchObject({
+        kind: "write",
+        writeAction: "deny",
+      });
+    });
+
+    test("a malformed element beside an allowed tool takes the global action, not allow", () => {
+      expect(classify({ globalWriteAction: "ask", body: JSON.stringify([call(1, "query"), { jsonrpc: "2.0", id: 2 }]) })).toMatchObject({
+        kind: "write",
+        writeAction: "ask",
+      });
+    });
+
+    test("two or more writes classify as one batch write with the strictest action and no single tool", () => {
+      const twoAsks = classify({ body: JSON.stringify([call(1, "createFeatureFlag"), call(2, "updateFeatureFlag")]) });
+      expect(twoAsks).toMatchObject({
+        kind: "write",
+        category: "mcp-unknown",
+        writeAction: "ask",
+        operation: { rpcMethod: "<batch>" },
+        display: { method: "<batch>" },
+      });
+      expect(twoAsks?.kind === "write" && twoAsks.display.tool).toBeUndefined();
+      expect(classify({ body: JSON.stringify([call(1, "query"), call(2, "deleteFeatureFlag")]) })).toMatchObject({
+        kind: "write",
+        writeAction: "deny",
+      });
+      expect(classify({ body: JSON.stringify([call(1, "query"), call(2, "query")]) })).toMatchObject({
+        kind: "write",
+        writeAction: "allow",
+      });
+    });
+
+    test("reads beside one write leave that write's classification unchanged", () => {
+      expect(classify({ body: JSON.stringify([read(1), call(2, "deleteFeatureFlag"), read(3)]) })).toMatchObject({
+        kind: "write",
+        category: "mcp-tool",
+        writeAction: "deny",
+        display: { method: "tools/call", tool: "deleteFeatureFlag" },
+      });
+      expect(classify({ body: JSON.stringify([read(1), read(2)]) })).toMatchObject({ kind: "read" });
+      expect(classify({ body: JSON.stringify([read(1), 5]) })).toMatchObject({
+        kind: "unclassifiable",
+        reason: "unsupported-envelope",
+      });
+    });
   });
 });

@@ -357,6 +357,15 @@ export function pendingTableLines(records: PendingApprovalRecord[], nowMs = Date
   return table.split("\n");
 }
 
+// Whether a held MCP method may be granted or denied for the rest of a session.
+// `tools/call` is scoped by tool instead. The proxy's placeholders stand for
+// no single operation: `<unknown>` for an unclassifiable body and `<batch>` for
+// several writes in one request, so a session grant would admit anything
+// later classified the same way.
+export function mcpMethodGrantable(method: string): boolean {
+  return method !== "tools/call" && method !== "<unknown>" && method !== "<batch>";
+}
+
 export function detailLines(record: PendingApprovalRecord, nowMs = Date.now()): string[] {
   if (record.mcp) {
     const server = mcpServerLabel(record);
@@ -589,7 +598,7 @@ async function pickDecision(record: PendingApprovalRecord, signal: AbortSignal):
   if (record.mcp) {
     const server = mcpServerLabel(record);
     const hasTool = record.mcp.method === "tools/call" && record.mcp.tool;
-    const stableMethod = record.mcp.method !== "<unknown>" && !hasTool && record.mcp.method !== "tools/call";
+    const stableMethod = !hasTool && mcpMethodGrantable(record.mcp.method);
     const mcpChoice = await select({
       signal,
       message: `${shortId(record.id)} — ${actionPhrase(record)}`,
