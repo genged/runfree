@@ -117,4 +117,75 @@ describe("task scope", () => {
     await scope.settleAll();
     expect(scope.pending()).toBe(0);
   });
+
+  test("two concurrent settleAll calls both stay pending until a slow branch resolves", async () => {
+    const scope = createTaskScope({ assertHeld: () => {} });
+    const slow = deferred<void>();
+    scope.start("slow", () => slow.promise);
+
+    const first = scope.settleAll();
+    const second = scope.settleAll();
+
+    const raced = await Promise.race([
+      Promise.all([first, second]).then(() => "settled" as const),
+      tick(20),
+    ]);
+    expect(raced).toBe("tick");
+
+    slow.resolve();
+    await Promise.all([first, second]);
+  });
+
+  test("pending() during an active settleAll is > 0", async () => {
+    const scope = createTaskScope({ assertHeld: () => {} });
+    const slow = deferred<void>();
+    scope.start("slow", () => slow.promise);
+
+    const settling = scope.settleAll();
+    expect(scope.pending()).toBeGreaterThan(0);
+
+    slow.resolve();
+    await settling;
+    expect(scope.pending()).toBe(0);
+  });
+
+  test("start succeeds after a clean settle, and is awaited by the next settleAll", async () => {
+    const scope = createTaskScope({ assertHeld: () => {} });
+    await scope.settleAll();
+
+    const later = deferred<void>();
+    let ranLater = false;
+    scope.start("later", async () => {
+      await later.promise;
+      ranLater = true;
+    });
+
+    const settling = scope.settleAll();
+    const raced = await Promise.race([settling.then(() => "settled" as const), tick(20)]);
+    expect(raced).toBe("tick");
+
+    later.resolve();
+    await settling;
+    expect(ranLater).toBe(true);
+  });
+
+  test("a slow task's continuation starts another task during settlement, and settleAll waits for it", async () => {
+    const scope = createTaskScope({ assertHeld: () => {} });
+    const slow = deferred<void>();
+    let nestedRan = false;
+
+    scope.start("outer", async () => {
+      await slow.promise;
+      scope.start("nested", async () => {
+        nestedRan = true;
+      });
+    });
+
+    const settling = scope.settleAll();
+    slow.resolve();
+    await settling;
+
+    expect(nestedRan).toBe(true);
+    expect(scope.pending()).toBe(0);
+  });
 });

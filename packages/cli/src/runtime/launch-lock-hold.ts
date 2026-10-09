@@ -16,7 +16,8 @@
 //
 // The remaining 10 s of the 60 s window is the allowance for the short daemon
 // round-trips between those steps (inspect, create, start, the session-file
-// write), which carry no timeout of their own. The whole-chain arithmetic is
+// write, and the settle and cleanup of a failed branch), which carry no
+// timeout of their own. The whole-chain arithmetic is
 // pinned by a unit test in `sessions.test.ts`. This module imports nothing, so
 // startup, the launch frame, the driver, and the callback setup can all read it.
 
