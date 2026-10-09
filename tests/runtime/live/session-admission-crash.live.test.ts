@@ -42,8 +42,6 @@ import { fileURLToPath } from "node:url";
 
 import { afterAll, afterEach, beforeAll, describe, expect, test } from "vitest";
 
-import { SESSION_FILES_DIR } from "@runfree/runtime-contracts/session-file";
-
 import { startLivePhase } from "./timing.ts";
 import { runfreeStateRoot } from "../../../packages/cli/src/paths.ts";
 import { scanRecoveryInventory } from "../../../packages/cli/src/runtime/recovery.ts";
@@ -55,6 +53,7 @@ import {
   sessionContainerRecordsRoot,
   type SessionContainerProjectIdentity,
 } from "../../../packages/cli/src/runtime/session-containers.ts";
+import { listIpAssignmentsScript, servedSetReadScript } from "../../../packages/cli/src/runtime/session-file-publisher.ts";
 import { warmProofRecordPath } from "../../../packages/cli/src/runtime/warm-proof.ts";
 import { RESUME_STUB_DIRECTORY, stageLongLivedAgentBinary } from "./agent-stub.ts";
 import { composeProjectName, composeServiceContainerId, docker, dockerOrThrow } from "./docker.ts";
@@ -373,6 +372,51 @@ function iTermOnlyEnv(base: NodeJS.ProcessEnv, itermSessionId: string): NodeJS.P
   const scrubbed = { ...base };
   for (const key of TERMINAL_IDENTITY_ENV_KEYS) delete scrubbed[key];
   return { ...scrubbed, TERM_PROGRAM: "iTerm.app", ITERM_SESSION_ID: itermSessionId };
+}
+
+/** What the served-set read failure shim prints, so a case can tell its fault from any other. */
+const SERVED_SET_READ_FAILURE = "live test: injected served-set read failure";
+
+/** Text that appears in the served-set read script and in no other script the proxy runs as `node -e`. */
+const SERVED_SET_READ_MARKER = "const noncePattern = ";
+
+/**
+ * Writes a `docker` shim that exits non-zero for a standalone
+ * `docker exec … node -e <served-set read script>` and execs the real client
+ * for every other call, and returns `base` with the shim first on PATH.
+ *
+ * The real client's path is baked into the shim: the CLI hands Docker an
+ * allowlisted environment (PATH and the Docker client variables), so nothing
+ * else set here would reach it.
+ */
+function installServedSetReadFailureShim(base: NodeJS.ProcessEnv): { directory: string; env: NodeJS.ProcessEnv } {
+  const servedSetRead = servedSetReadScript();
+  if (!servedSetRead.includes(SERVED_SET_READ_MARKER) || listIpAssignmentsScript().includes(SERVED_SET_READ_MARKER)) {
+    throw new Error("the served-set read marker no longer identifies only the served-set read script");
+  }
+  const located = childProcess.spawnSync("sh", ["-c", "command -v docker"], { encoding: "utf8", env: base });
+  const realDocker = located.status === 0 ? located.stdout.trim() : "";
+  if (!path.isAbsolute(realDocker)) throw new Error(`could not locate the real docker client: ${located.stderr}`);
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "runfree-docker-shim-"));
+  const quote = (value: string): string => `'${value.replaceAll("'", "'\\''")}'`;
+  fs.writeFileSync(path.join(directory, "docker"), [
+    "#!/bin/sh",
+    "before=''",
+    "previous=''",
+    'for arg in "$@"; do',
+    '  if [ "$before" = node ] && [ "$previous" = -e ]; then',
+    '    case "$arg" in',
+    `      *${quote(SERVED_SET_READ_MARKER)}*) echo ${quote(SERVED_SET_READ_FAILURE)} >&2; exit 97 ;;`,
+    "    esac",
+    "  fi",
+    '  before="$previous"',
+    '  previous="$arg"',
+    "done",
+    `exec ${quote(realDocker)} "$@"`,
+    "",
+  ].join("\n"), { mode: 0o755 });
+  const searchPath = base.PATH ?? process.env.PATH ?? "";
+  return { directory, env: { ...base, PATH: searchPath ? `${directory}${path.delimiter}${searchPath}` : directory } };
 }
 
 describe("per-session admission survives a crash at every transition", () => {
@@ -1285,27 +1329,22 @@ describe("a crashed session with no record falls back from the warm-empty skip",
     const orphanId = await crashAndOrphanTheRecord("after-start");
     expect(fs.existsSync(warmProofPath), "the crash alone removed the warm-proof record").toBe(true);
 
-    // Breaking the session-files directory's permissions makes the proxy's
-    // own listing script refuse it (`assertSafeDir`'s `(mode & 0o022) !== 0`
-    // check in session-file-publisher.ts). Read against the warm-proof
-    // comparison in warm-proof.ts: that same script is also one section of
-    // the warm batch, but a failed section there only sets `sessionState` to
-    // `blocked("session-files-unreadable")` — it is read and judged entirely
-    // apart from the topology/security/firewall checks that decide
-    // match-vs-invalid, so it does not turn this launch into a cold one. The
-    // match still holds, the warm-empty check is blocked on that same
-    // reason without even reaching the container listing, and it is the
-    // *separate* read inside the full `reconcileSessions` fallback — a second,
-    // independent `docker exec` of the identical script — whose throw
-    // startup.ts's catch turns into "could not report its session files" and
-    // the dropped record. So this one injection reaches the reconcile step,
-    // not an earlier one, and proves the catch path rather than the
-    // unconditional cold-path removal.
-    dockerOrThrow("break the session-files directory", [
-      "exec", "--user", "0:0", proxyId, "chmod", "0777", SESSION_FILES_DIR,
-    ]);
+    // Fail only the reconcile's read of the proxy's session files. The
+    // proxy's own state stays intact: a chmod of the session-files directory
+    // breaks the security contract's `proxy-session-files-dir` check, so the
+    // warm proof reports a mismatch and the launch takes the full validation
+    // path, which contains (stops) the proxy instead of reaching reconcile.
+    // A `docker` shim first on PATH for this one launch fails exactly the
+    // standalone `docker exec … node -e <served-set read>` that
+    // `readProxySessionFiles` runs, and execs the real client for everything
+    // else. The warm batch runs the same script, but inside one `sh -c`
+    // argument, so the shim never matches it: the warm proof still matches,
+    // the warm-empty check is blocked by the orphan container, and the full
+    // reconcile's read is the one that fails — the step whose throw startup
+    // turns into "could not report its session files" and the dropped record.
+    const shim = installServedSetReadFailureShim(fixture.env);
     try {
-      const broken = runfreeTimed(fixture, ["claude"]);
+      const broken = runfreeTimed({ ...fixture, env: shim.env }, ["claude"]);
       expect(broken.status, describeOutput(broken.output, 4000)).not.toBe(0);
       // Proves the failure happened on the warm path — the record the clean
       // launch above wrote still matched — rather than on some incidental
@@ -1314,11 +1353,13 @@ describe("a crashed session with no record falls back from the warm-empty skip",
       // the catch.
       expect(timing(broken.output, "validation:warm-proof"), describeOutput(broken.output)).toContain("match");
       expect(broken.output, describeOutput(broken.output, 4000)).toContain("could not report its session files");
+      expect(broken.output, describeOutput(broken.output, 4000)).toContain(SERVED_SET_READ_FAILURE);
       expect(fs.existsSync(warmProofPath), "a failed reconcile left the warm-proof record behind").toBe(false);
     } finally {
-      dockerOrThrow("restore the session-files directory", [
-        "exec", "--user", "0:0", proxyId, "chmod", "0755", SESSION_FILES_DIR,
-      ]);
+      // Removing the shim directory is the only restore: nothing in the
+      // proxy or the daemon was changed, so cleanup cannot fail in a way
+      // that replaces the assertion failure above.
+      fs.rmSync(shim.directory, { recursive: true, force: true });
     }
 
     const recovered = runfreeTimed(fixture, ["claude"]);
