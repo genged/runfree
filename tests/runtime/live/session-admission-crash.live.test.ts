@@ -1352,8 +1352,13 @@ describe("a crashed session with no record falls back from the warm-empty skip",
       // before reconcile even ran and this case would prove nothing about
       // the catch.
       expect(timing(broken.output, "validation:warm-proof"), describeOutput(broken.output)).toContain("match");
-      expect(broken.output, describeOutput(broken.output, 4000)).toContain("could not report its session files");
-      expect(broken.output, describeOutput(broken.output, 4000)).toContain(SERVED_SET_READ_FAILURE);
+      // Image cleanup runs before the reconcile and reads the same session
+      // files when its inputs changed; its failure is only a warning carrying
+      // its own prefix. A line without that prefix is the reconcile's.
+      const reconcileFailures = broken.output.split("\n").filter((line) => line.includes("could not report its session files")
+        && !line.includes("stale Runfree runtime cleanup skipped"));
+      expect(reconcileFailures, describeOutput(broken.output, 4000)).not.toEqual([]);
+      expect(reconcileFailures.join("\n"), describeOutput(broken.output, 4000)).toContain(SERVED_SET_READ_FAILURE);
       expect(fs.existsSync(warmProofPath), "a failed reconcile left the warm-proof record behind").toBe(false);
     } finally {
       // Removing the shim directory is the only restore: nothing in the
