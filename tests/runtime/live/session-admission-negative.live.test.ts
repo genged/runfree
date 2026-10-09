@@ -25,7 +25,7 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { spawn, spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import { sessionIpAssignmentReadCommand, sessionIpReuseFenceCommand } from "../../../packages/cli/src/runtime/session-file-publisher.ts";
 import { fileURLToPath } from "node:url";
 
@@ -39,7 +39,6 @@ import {
   MANAGED_HOLD_RELATIVE_PATH,
   provisionLiveFixture,
   provisionSandboxFixture,
-  type CaptureResult,
   type LiveFixture,
   type LiveRuntimeBackend,
 } from "./fixture.ts";
@@ -56,14 +55,13 @@ import {
   startLiveTestContainer,
   waitUntil,
 } from "./docker.ts";
+import { launchClaudeTimed, runfreeTimed, timing } from "./launch-timing-support.ts";
 import { runNominalAdmissionSlice } from "./session-admission-slice.ts";
-import { cliEntryArgv } from "../../support/prebuilt-entry.ts";
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
 const PROVISION_TIMEOUT_MS = 30 * 60_000;
 const TEST_TIMEOUT_MS = 15 * 60_000;
 const PROXY_READY_TIMEOUT_MS = 120_000;
-const CAPTURE_MAX_BYTES = 8 * 1024 * 1024;
 
 // One agent is enough for every refusal here: the refusals are properties of
 // admission, not of which built-in launches, so running all three would triple
@@ -85,42 +83,6 @@ function requiredBackend(): LiveRuntimeBackend {
     throw new Error("TEST_RUNTIME_BACKEND must be docker-desktop for the negative admission tranche");
   }
   return backend;
-}
-
-/** Every `timing: <phase> <detail>` line, as [phase, detail] pairs. */
-function timingLines(output: string): Array<readonly [string, string]> {
-  return output.split("\n").flatMap((line) => {
-    const match = /timing: (\S+) (.*)$/.exec(line.trimEnd());
-    return match ? [[match[1] as string, match[2] as string] as const] : [];
-  });
-}
-
-function timing(output: string, phase: string): string[] {
-  return timingLines(output).filter(([name]) => name === phase).map(([, detail]) => detail);
-}
-
-/** A real launch with `RUNFREE_TIMINGS=1`, so its stdout/stderr carries the startup phase lines. */
-function runfreeTimed(target: LiveFixture, args: readonly string[]): CaptureResult {
-  const result = spawnSync(process.execPath, [...cliEntryArgv(), "--workspace", target.projectRoot, ...args], {
-    cwd: REPO_ROOT,
-    encoding: "utf8",
-    env: { ...target.env, RUNFREE_TIMINGS: "1", RUNFREE_INVOCATION_CWD: REPO_ROOT, RUNFREE_PROJECT_ROOT: REPO_ROOT },
-    maxBuffer: CAPTURE_MAX_BYTES,
-    stdio: ["ignore", "pipe", "pipe"],
-  });
-  const stdout = typeof result.stdout === "string" ? result.stdout : "";
-  const stderr = typeof result.stderr === "string" ? result.stderr : "";
-  if (result.error) {
-    throw new Error(`runfree ${args.join(" ")} did not finish: ${result.error.message}: ${describeOutput(`${stdout}${stderr}`)}`);
-  }
-  return Object.freeze({ status: result.status ?? 1, stdout, stderr, output: `${stdout}${stderr}` });
-}
-
-function launchClaudeTimed(target: LiveFixture): CaptureResult {
-  const launched = runfreeTimed(target, ["claude"]);
-  const withoutTimings = launched.output.split("\n").filter((line) => !line.includes(" timing: ")).join("\n");
-  expect(launched.status, describeOutput(withoutTimings, 4000)).toBe(0);
-  return launched;
 }
 
 describe("per-session admission refuses and its controls are load-bearing", () => {
