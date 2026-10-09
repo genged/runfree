@@ -906,6 +906,67 @@ describe("proxy policy", () => {
     expect(request("GET", "/owner/repo.git/info/refs?service=git-upload-pack")).toEqual({});
   });
 
+  // Known defects found by policy.property.test.ts (P1.1, P1.3), todo 100.
+  // Each pins a path the guard admits today; flip to a plain `test` when the
+  // guard denies it.
+  describe("known defect: path-confusion guard gaps", () => {
+    const options = {
+      allowedHosts: ["api.example.com"],
+      credentials: {},
+      writeApproval: "allow" as const,
+      requests: { "api.example.com": { pathPrefixes: ["/api/v2/"] } },
+    };
+    const request = (path: string) => testBeforeAllowedRequest({
+      url: `https://api.example.com${path}`,
+      method: "GET",
+      headers: {},
+    }, options);
+
+    // A NUL-truncating origin reaches `/api/v2/..`, which resolves to `/api`.
+    test.fails("P1.1 counterexample: `..%00` escapes the prefix", () => {
+      expect(shapeDenial(() => request("/api/v2/..%00")).shape?.reason).toBe("path-not-allowed");
+    });
+    // `%2e` under seven encoding levels: past the 5-level decode bound, so
+    // the guard never sees it, but a decode-to-fixed-point origin reaches `..`.
+    test.fails("P1.1 counterexample: an encoded dot past the decode bound escapes the prefix", () => {
+      expect(shapeDenial(() => request("/api/v2/.%2525252525252e")).shape?.reason).toBe("path-not-allowed");
+    });
+    // `%2f` is denied, but `%252f` is not: only the raw and fully decoded
+    // forms are checked, never the intermediate ones.
+    test.fails("P1.3 counterexample: a doubly encoded slash is admitted while a singly encoded one is denied", () => {
+      expect(shapeDenial(() => request("/api/v2/a%2fb")).shape?.reason).toBe("path-not-allowed");
+      expect(shapeDenial(() => request("/api/v2/a%252fb")).shape?.reason).toBe("path-not-allowed");
+    });
+  });
+
+  // Known defects found by policy.property.test.ts (P1.2), todo 101. The push
+  // check canonicalizes in one decoder order; an origin with a different order
+  // reaches the push RPC.
+  describe("known defect: git-push decoder order", () => {
+    const options = {
+      allowedHosts: ["github.com"],
+      credentials: {},
+      writeApproval: "allow" as const,
+      requests: { "github.com": { gitPush: "deny" as const } },
+    };
+    const push = (path: string) => testBeforeAllowedRequest({
+      url: `https://github.com${path}`,
+      method: "POST",
+      headers: {},
+    }, options);
+
+    // The proxy cuts at the NUL and sees `repo.git`; an origin that decodes
+    // without truncating routes `.../\0/git-receive-pack`.
+    test.fails("P1.2 counterexample: a NUL segment before the push RPC hides it", () => {
+      expect(shapeDenial(() => push("/owner/repo.git/%00/git-receive-pack")).shape?.reason).toBe("git-push-denied");
+    });
+    // The proxy decodes first and sees last segment `a`; an origin that strips
+    // `;params` before decoding (Tomcat order) routes `git-receive-pack`.
+    test.fails("P1.2 counterexample: a param holding an encoded slash hides the push RPC", () => {
+      expect(shapeDenial(() => push("/owner/repo.git/git-receive-pack;x%2Fa")).shape?.reason).toBe("git-push-denied");
+    });
+  });
+
   test("WebSocket upgrades evaluate as GET against method and path rules", () => {
     expect(() => testAssertAllowedWebSocketRequest({
       url: "wss://api.example.com/socket",
