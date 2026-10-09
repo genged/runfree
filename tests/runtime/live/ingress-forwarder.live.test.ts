@@ -26,6 +26,12 @@
 //         when the session ends): two ports, two forwarders; a peer session
 //         cannot reach the other's bridge or forwarder; ending one removes
 //         only its own forwarder.
+//   core  The callback is set up before the agent runs: the agent stub's very
+//         first instruction already sees the port file naming this session's
+//         forwarder port, and that forwarder started no later than the stub's
+//         record of it.
+//   core  Two launches started at the same moment get distinct callback ports
+//         and each a working two-hop path.
 //   core  `runfree shell` and `runfree mcp auth` ride the same lifecycle.
 //   ext   `runfree vnc` end to end: server bootstrap (RFB banner through the
 //         forward), loopback publication, ingress labels, clipboard off by
@@ -37,6 +43,12 @@
 //   ext   Recovery (a'): the dead owner's session container has also
 //         stopped, so warm-launch topology validation meets the dead route
 //         first; startup reclaims it and the next launch succeeds.
+//   ext   A forwarder removed at each callback setup step (its start; its
+//         agent_internal connect), from a `docker events` watcher, fails the
+//         launch with the callback refusal and leaves no forwarder, session
+//         container, or registry record; the next launch gets a two-hop path.
+//   ext   A launcher SIGKILLed at its forwarder's start leaves that forwarder
+//         behind; the next launch succeeds and reclaims it.
 //   ext   Recovery (b): a compatible proxy replacement leaves a live callback
 //         forwarder and a port forward in place, loopback-only and reaching.
 //   core  `runfree stop` and `runfree destroy` each remove a port forward
@@ -65,7 +77,8 @@
 //   - VNC on the stock base image, which ships no x11vnc (the case reports
 //     that as a skip, not a pass).
 
-import childProcess from "node:child_process";
+import fs from "node:fs";
+import path from "node:path";
 
 import { afterAll, afterEach, beforeAll, describe, expect, test } from "vitest";
 import { CONTAINER_ROLE_LABEL, INGRESS_PURPOSE_LABEL } from "../../../packages/cli/src/runtime/container-inventory.ts";
@@ -95,16 +108,21 @@ import {
   type LiveFixture,
 } from "./fixture.ts";
 import {
+  CALLBACK_AT_START_DIRNAME,
   CALLBACK_BRIDGE_MARKER,
   CALLBACK_FORWARDER_TIMEOUT_MS,
   CALLBACK_PORT_FILE,
   CALLBACK_REQUEST_PATH,
   MCP_FIXTURE_SERVER,
   allCallbackForwarders,
+  allSessionContainers,
   awaitHostReach,
+  awaitStartObservation,
   callbackForwardersForSession,
   configureIngressProject,
   containerEnv,
+  daemonNow,
+  dockerTimestampNs,
   forceRemoveProjectForwarders,
   freeLoopbackPort,
   hostTcpBanner,
@@ -117,18 +135,22 @@ import {
   sessionFile,
   sessionListenerOwner,
   sessionProcessArgv,
+  sessionRegistryRecords,
   sessionTcpProbe,
+  spawnCli,
   startCliSession,
   startSessionListener,
   upWithExactApprovals,
+  watchDockerEvents,
   type CallbackForwarder,
   type CliLaunch,
   type ContainerInspect,
+  type DockerEvent,
   type SessionListener,
+  type SpawnedCli,
 } from "./ingress-support.ts";
 import { liveTierSelected } from "./tiers.ts";
 import { LAUNCH_LOCK_HOLD_BUDGET_MS } from "../../../packages/cli/src/runtime/launch-lock-hold.ts";
-import { cliEntryArgv } from "../../support/prebuilt-entry.ts";
 
 // Mixed file (see `tiers.ts`): loopback publication, the one-way refusal, the
 // callback two-hop and peer refusal, and teardown are trust-boundary proofs;
@@ -180,8 +202,13 @@ describe("ingress forwarders are loopback-only, one-way, per-session, and torn d
     forceRemoveProjectForwarders(projectId);
   }, PROVISION_TIMEOUT_MS);
 
-  async function launch(args: readonly string[], label: string, extraEnv?: NodeJS.ProcessEnv): Promise<CliLaunch> {
-    const started = await startCliSession(fixture, project, args, { label, extraEnv });
+  async function launch(
+    args: readonly string[],
+    label: string,
+    extraEnv?: NodeJS.ProcessEnv,
+    options: Readonly<{ byOwnerPid?: boolean }> = {},
+  ): Promise<CliLaunch> {
+    const started = await startCliSession(fixture, project, args, { label, extraEnv, byOwnerPid: options.byOwnerPid });
     launches.push(started);
     return started;
   }
@@ -378,9 +405,13 @@ describe("ingress forwarders are loopback-only, one-way, per-session, and torn d
     // Ordering guard: this is the only case that needs the unapproved project.
     expect(mcpEligible, "the negative case ran after the project was made MCP OAuth eligible").toBe(false);
     const run = await launch(["claude"], "ineligible session");
-    // No settle window: an eligible launch sets its callback up before
-    // activation (`reserveSessionMcpCallback`, then `completeSessionMcpCallback`), so by the time the agent runs
-    // any forwarder this launch would mint already exists.
+    // No settle window is needed below: an eligible launch's forwarder exists
+    // before its agent's first instruction ("the port file and the forwarder
+    // exist before the agent's first instruction" proves it), so an attached
+    // ineligible session has already passed the point where one would exist.
+    // What the agent itself saw at start agrees.
+    const observed = await awaitStartObservation(inspectOrThrow(run.session.containerId, run.label), run.label);
+    expect(observed.content, "an ineligible session's agent saw a callback port file at start").toBe("absent");
     expect(projectIngressForwarders(projectId, "mcp-callback"), "an ineligible launch minted a callback forwarder").toEqual([]);
     expect(sessionFile(run.session.containerId, CALLBACK_PORT_FILE), "an ineligible session has a callback port file").toBeUndefined();
     expect(sessionProcessArgv(run.session.containerId, CALLBACK_BRIDGE_MARKER), "an ineligible session runs a callback bridge").toEqual([]);
@@ -418,6 +449,59 @@ describe("ingress forwarders are loopback-only, one-way, per-session, and torn d
     await awaitHostReach(a.forwarder.port, "/callback/after-peer-ended", a.listener, "A after B ended");
 
     await endAndAssertCallbackGone(first, a.forwarder);
+  }, TEST_TIMEOUT_MS);
+
+  coreTest("the port file and the forwarder exist before the agent's first instruction", async () => {
+    ensureMcpOAuthEligible();
+    // Precondition: no record an earlier case's session left can stand in
+    // for this launch's.
+    fs.rmSync(path.join(fixture.projectRoot, CALLBACK_AT_START_DIRNAME), { recursive: true, force: true });
+    const run = await launch(["claude"], "first-instruction session");
+    const session = inspectOrThrow(run.session.containerId, run.label);
+    // Read once, at attach, never polled: a forwarder that only appeared later
+    // would be a setup that finished after the handoff.
+    const forwarders = callbackForwardersForSession(projectId, run.session.sessionId);
+    expect(forwarders, `${run.label}: callback forwarders naming the session at attach`).toHaveLength(1);
+    const [forwarder] = forwarders;
+
+    const observed = await awaitStartObservation(session, run.label);
+    expect(observed.content, `${run.label}: what the agent's first instruction found at ${CALLBACK_PORT_FILE}`).toBe(forwarder.port);
+    const startedAt = inspectOrThrow(forwarder.id, run.label).State?.StartedAt ?? "";
+    expect(
+      dockerTimestampNs(startedAt) <= observed.mtimeNs,
+      `${run.label}: the forwarder started at ${startedAt}, after the agent's record (mtime ${observed.mtimeNs} ns)`,
+    ).toBe(true);
+
+    // The same forwarder carries the whole two-hop path, and leaves with the session.
+    const hop = await assertCallbackTwoHop(run);
+    expect(hop.forwarder.id, `${run.label}: the two-hop forwarder is not the one present at attach`).toBe(forwarder.id);
+    await endAndAssertCallbackGone(run, hop.forwarder);
+  }, TEST_TIMEOUT_MS);
+
+  coreTest("two launches started at the same moment get distinct callback ports", async () => {
+    ensureMcpOAuthEligible();
+    // Precondition: neither launch can find a port already taken by residue.
+    expect(projectIngressForwarders(projectId, "mcp-callback"), "a callback forwarder exists before the launches").toEqual([]);
+    // Both spawned in the same tick, neither awaited before the other starts.
+    // Each finds its own session by its lifecycle record's host pid.
+    const settled = await Promise.allSettled([
+      launch(["claude"], "simultaneous launch A", undefined, { byOwnerPid: true }),
+      launch(["claude"], "simultaneous launch B", undefined, { byOwnerPid: true }),
+    ]);
+    const rejected = settled.find((result): result is PromiseRejectedResult => result.status === "rejected");
+    if (rejected) throw rejected.reason;
+    const [first, second] = settled.map((result) => (result as PromiseFulfilledResult<CliLaunch>).value);
+    expect(second.session.containerId, "both launches resolved to one session").not.toBe(first.session.containerId);
+
+    const a = await assertCallbackTwoHop(first);
+    const b = await assertCallbackTwoHop(second);
+    expect(b.forwarder.port, "two simultaneous launches share one callback port").not.toBe(a.forwarder.port);
+    expect(b.forwarder.id).not.toBe(a.forwarder.id);
+    expect(allCallbackForwarders(projectId).map((forwarder) => forwarder.id).sort(), "callback forwarders beyond the two launches'")
+      .toEqual([a.forwarder.id, b.forwarder.id].sort());
+
+    await endAndAssertCallbackGone(first, a.forwarder);
+    await endAndAssertCallbackGone(second, b.forwarder);
   }, TEST_TIMEOUT_MS);
 
   coreTest("runfree shell gets its own two-hop callback with the same lifecycle", async () => {
@@ -541,6 +625,151 @@ describe("ingress forwarders are loopback-only, one-way, per-session, and torn d
     await endAndAssertCallbackGone(next, forwarder);
   }, TEST_TIMEOUT_MS);
 
+  /**
+   * The events every callback-setup kill point is chosen from: container
+   * create and start, and network connect. Docker ANDs different filter keys,
+   * so a label filter would drop every network event; the project and role
+   * are matched on the event's own attributes instead.
+   */
+  const CALLBACK_SETUP_EVENT_FILTERS = ["type=container", "type=network", "event=create", "event=start", "event=connect"] as const;
+
+  function eventAttributes(event: DockerEvent): Readonly<Record<string, string>> {
+    return event.Actor?.Attributes ?? {};
+  }
+
+  /** A container event for this project's mcp-callback forwarder (container events carry the labels). */
+  function isCallbackForwarderEvent(event: DockerEvent): boolean {
+    const attributes = eventAttributes(event);
+    return event.Type === "container"
+      && attributes[PROJECT_ID_LABEL] === projectId
+      && attributes[CONTAINER_ROLE_LABEL] === "ingress-forwarder"
+      && attributes[INGRESS_PURPOSE_LABEL] === "mcp-callback";
+  }
+
+  /** A container event for one of this project's session agents. */
+  function isSessionAgentEvent(event: DockerEvent): boolean {
+    const attributes = eventAttributes(event);
+    return event.Type === "container"
+      && attributes[SESSION_CONTAINER_LABELS.composeProject] === project
+      && attributes[SESSION_CONTAINER_LABELS.role] === "session-agent";
+  }
+
+  /** No callback forwarder, session container, or lifecycle record: the state a residue claim is measured from. */
+  function assertNoSessionResidue(label: string): void {
+    expect(projectIngressForwarders(projectId, "mcp-callback"), `${label}: callback forwarders`).toEqual([]);
+    expect(allSessionContainers(project), `${label}: session containers`).toEqual([]);
+    expect(sessionRegistryRecords(fixture, project), `${label}: lifecycle registry`).toEqual([]);
+  }
+
+  extendedTest("a forwarder killed at each setup step fails the launch with no residue, and the next launch reclaims", async () => {
+    ensureMcpOAuthEligible();
+    const internalId = internalNetworkId(project);
+    // Reservation: the forwarder's `docker run -p` has just started it.
+    // Completion: it has just joined agent_internal; the bridge and the host
+    // probe have not run yet.
+    for (const point of ["forwarder start", "agent_internal connect"] as const) {
+      const label = `forwarder removed at its ${point}`;
+      // Precondition: everything asserted absent below is absent before the
+      // launch, so only this launch could have left it.
+      assertNoSessionResidue(`${label}, before the launch`);
+
+      const forwarders = new Set<string>();
+      const sessionContainers = new Set<string>();
+      let removed: Readonly<{ id: string; status: number; output: string }> | undefined;
+      const remove = (id: string): void => {
+        const result = docker(["rm", "-f", id]);
+        removed = Object.freeze({ id, status: result.status, output: result.output });
+      };
+      const watcher = watchDockerEvents(daemonNow(), CALLBACK_SETUP_EVENT_FILTERS, (event) => {
+        const id = event.Actor?.ID ?? "";
+        if (isSessionAgentEvent(event)) sessionContainers.add(id);
+        if (isCallbackForwarderEvent(event) && event.Action === "start") {
+          forwarders.add(id);
+          if (point === "forwarder start" && !removed) remove(id);
+          return;
+        }
+        const connected = eventAttributes(event).container ?? "";
+        if (event.Type === "network" && event.Action === "connect" && id === internalId && forwarders.has(connected)) {
+          if (point === "agent_internal connect" && !removed) remove(connected);
+        }
+      });
+      let failed: Awaited<SpawnedCli["completion"]>;
+      try {
+        failed = await spawnCli(fixture, ["claude"]).completion;
+      } finally {
+        await watcher.stop();
+      }
+
+      expect(watcher.handlerError(), `${label}: the event watcher failed`).toBeUndefined();
+      expect(removed, `${label}: the kill point never came: ${describeOutput(failed.output, 4000)}`).toBeDefined();
+      const killed = removed as NonNullable<typeof removed>;
+      expect(killed.status, `${label}: docker rm -f ${killed.id} failed: ${describeOutput(killed.output)}`).toBe(0);
+      expect(failed.status, `${label}: the launch succeeded without its forwarder: ${describeOutput(failed.output, 4000)}`).not.toBe(0);
+      expect(failed.output, `${label}: the launch failed for another reason`).toContain("the MCP OAuth callback for this session could not be set up");
+      // The launch reached its session container, so "no session container
+      // remains" is a claim about one that existed.
+      expect(sessionContainers.size, `${label}: the launch never created a session container`).toBeGreaterThan(0);
+      for (const id of sessionContainers) assertGone(id, `${label}: the failed launch's session container`);
+      assertNoSessionResidue(`${label}, after the failed launch`);
+
+      const next = await launch(["claude"], `launch after a ${label}`);
+      const { forwarder } = await assertCallbackTwoHop(next);
+      expect(forwarder.id, `${label}: the removed forwarder came back`).not.toBe(killed.id);
+      await endAndAssertCallbackGone(next, forwarder);
+    }
+  }, TEST_TIMEOUT_MS);
+
+  extendedTest("a launcher killed during callback setup leaves residue the next launch reclaims", async () => {
+    ensureMcpOAuthEligible();
+    assertNoSessionResidue("before the launch");
+    let deadForwarderId: string | undefined;
+    const dead = spawnCli(fixture, ["claude"]);
+    try {
+      const watcher = watchDockerEvents(daemonNow(), CALLBACK_SETUP_EVENT_FILTERS, (event) => {
+        if (deadForwarderId || !isCallbackForwarderEvent(event) || event.Action !== "start") return;
+        deadForwarderId = event.Actor?.ID ?? "";
+        // At once, from the handler: the launch must die mid-setup.
+        dead.child.kill("SIGKILL");
+      });
+      try {
+        await pollUntil(
+          () => deadForwarderId !== undefined,
+          CALLBACK_FORWARDER_TIMEOUT_MS,
+          "the launch's callback forwarder to start",
+          { label: "killed launcher", completion: dead.completion, output: dead.output },
+        );
+      } finally {
+        await watcher.stop();
+      }
+      expect(watcher.handlerError(), "the event watcher failed").toBeUndefined();
+      await dead.killOwner();
+      const residue = deadForwarderId as string;
+      expect(residue, "the forwarder start event carried no container id").toMatch(/^[a-f0-9]{64}$/u);
+      // Precondition: the residue exists, so its removal below is the next
+      // launch's reclamation, not the dead launch's own cleanup.
+      expect(inspectContainer(residue), "the killed launcher's forwarder was already gone").toBeDefined();
+
+      // The dead launch's session container may still be starting, so the
+      // next session is found by its own lifecycle record.
+      const next = await launch(["claude"], "launch after a killed launcher", undefined, { byOwnerPid: true });
+      const { forwarder } = await assertCallbackTwoHop(next);
+      expect(forwarder.id, "the next launch adopted the dead launcher's forwarder").not.toBe(residue);
+      await pollUntil(
+        () => inspectContainer(residue) === undefined,
+        RECONCILE_TIMEOUT_MS,
+        "the killed launcher's callback forwarder to be reclaimed",
+        { label: next.label, completion: next.completion, output: next.output },
+      );
+      expect(allCallbackForwarders(projectId).map((candidate) => candidate.id), "a stale callback forwarder remains")
+        .toEqual([forwarder.id]);
+      await endAndAssertCallbackGone(next, forwarder);
+    } finally {
+      // Cleanup only: the Docker children the kill left behind.
+      dead.killGroup();
+      await dead.completion.catch(() => undefined);
+    }
+  }, TEST_TIMEOUT_MS);
+
   extendedTest("a compatible proxy replacement keeps the callback forwarder and a port forward in place and reaching", async () => {
     ensureMcpOAuthEligible();
     const run = await launch(["claude"], "rebind session", REBIND_SESSION_ENV);
@@ -653,32 +882,6 @@ describe("ingress forwarders are loopback-only, one-way, per-session, and torn d
     throw new Error("runfree up after destroy did not converge in three rounds");
   }
 
-  /** One CLI invocation as a child process, so two can overlap. */
-  function spawnCli(args: readonly string[], extraEnv: NodeJS.ProcessEnv = {}) {
-    const startedAt = Date.now();
-    const child = childProcess.spawn(
-      process.execPath,
-      [...cliEntryArgv(), "--workspace", fixture.projectRoot, ...args],
-      {
-        cwd: REPO_ROOT,
-        env: { ...fixture.env, RUNFREE_INVOCATION_CWD: REPO_ROOT, RUNFREE_PROJECT_ROOT: REPO_ROOT, ...extraEnv },
-        stdio: ["pipe", "pipe", "pipe"],
-      },
-    );
-    let output = "";
-    const collect = (chunk: Buffer | string): void => {
-      output += String(chunk);
-    };
-    child.stdout?.on("data", collect);
-    child.stderr?.on("data", collect);
-    child.stdin?.on("error", () => undefined);
-    const completion = new Promise<Readonly<{ status: number | null; output: string; elapsedMs: number }>>((resolve, reject) => {
-      child.once("error", reject);
-      child.once("close", (status) => resolve({ status, output, elapsedMs: Date.now() - startedAt }));
-    });
-    return { child, completion, output: () => output };
-  }
-
   extendedTest("a handed-off launch with a slow callback bridge never makes a concurrent destroy give up on the lifecycle lock", async () => {
     // Todo: launch-lock-hold budget (cross-lane review finding 1). A warm launch
     // hands startup's lifecycle lock to admission, which then sets up the
@@ -698,15 +901,9 @@ describe("ingress forwarders are loopback-only, one-way, per-session, and torn d
     // Every session-agent container, created or running: the throttle must
     // land before the callback setup, so it is applied as soon as `docker
     // create` has returned, not once the container runs.
-    const sessionContainers = (): string[] => dockerOrThrow("list session containers", [
-      "ps", "-a", "--no-trunc",
-      // Session agents carry Runfree's compose-project label, never Compose's.
-      "--filter", `label=${SESSION_CONTAINER_LABELS.composeProject}=${project}`,
-      "--filter", `label=${SESSION_CONTAINER_LABELS.role}=session-agent`,
-      "--format", "{{.ID}}",
-    ]).split("\n").map((line) => line.trim()).filter(Boolean);
+    const sessionContainers = (): readonly string[] => allSessionContainers(project);
     const before = new Set(sessionContainers());
-    const launched = spawnCli(["claude"], { RUNFREE_TIMINGS: "1" });
+    const launched = spawnCli(fixture, ["claude"], { RUNFREE_TIMINGS: "1" });
     let launchExited = false;
     void launched.completion.then(() => { launchExited = true; }, () => { launchExited = true; });
     let sessionContainerId: string | undefined;
@@ -721,7 +918,7 @@ describe("ingress forwarders are loopback-only, one-way, per-session, and torn d
     const throttled = docker(["update", "--cpus", "0.01", sessionContainerId as string]);
     expect(throttled.status, `docker update --cpus failed: ${throttled.stderr}`).toBe(0);
 
-    const destroyed = spawnCli(["destroy", "--force"]);
+    const destroyed = spawnCli(fixture, ["destroy", "--force"]);
     runtimeDestroyed = true;
     const destroy = await destroyed.completion;
     const launchResult = await Promise.race([
