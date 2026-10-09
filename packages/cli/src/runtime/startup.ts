@@ -14,7 +14,7 @@ import { runfreeLog, warn } from "../warnings.ts";
 import { waitForProxyFirewallReadiness } from "./proxy-firewall-readiness.ts";
 import { planValidatedIngressForwardersForRebuild } from "./ingress-forwarder-ownership.ts";
 import { reclaimStaleSessionMcpCallbackForwarders } from "./session-callback-ingress.ts";
-import { prepareEffectiveControlsForStartup } from "../control/workflow.ts";
+import { prepareEffectiveControlsForLaunch } from "../control/workflow.ts";
 import {
   convergeEffectivePolicyGeneration,
   effectiveControlSelectionForGeneration,
@@ -1241,7 +1241,7 @@ export async function startRuntime(
     }
     reportRuntimeProgress("preparing approved effective controls", verbose);
     try {
-      const preparedControls = await timings.timeAsync("control-preparation", () => prepareEffectiveControlsForStartup(context, io, {
+      const preparedControls = await timings.timeAsync("control-preparation", () => prepareEffectiveControlsForLaunch(context, io, {
         useApprovedPolicy: rebuildOptions.useApprovedPolicy,
       }));
       reportRuntimeVerbose(

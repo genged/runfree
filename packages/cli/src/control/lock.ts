@@ -9,7 +9,12 @@ import {
   hostBootId,
   hostProcessStart,
 } from "../runtime/host-identity.ts";
-import { processAlive } from "../runtime/sessions.ts";
+import {
+  PROJECT_LIFECYCLE_LOCK_RETRY_ATTEMPTS,
+  PROJECT_LIFECYCLE_LOCK_RETRY_DELAY_MS,
+  processAlive,
+} from "../runtime/sessions.ts";
+import { runfreeLog } from "../warnings.ts";
 
 const PIDLESS_GRACE_MS = 5_000;
 
@@ -118,16 +123,82 @@ export function tryAcquireControlLock(
   return undefined;
 }
 
+/**
+ * The control lock is held by another live operation. Distinct from every
+ * other failure so that a caller that may wait (a launch's control
+ * preparation) can tell contention from a real error.
+ */
+export class ControlLockBusyError extends Error {
+  readonly lockPath: string;
+
+  constructor(lockPath: string) {
+    super(`another control operation is in progress (${lockPath})`);
+    this.name = "ControlLockBusyError";
+    this.lockPath = lockPath;
+  }
+}
+
 export function withControlLock<T>(
   project: ProjectInfo,
   action: () => T,
   env: NodeJS.ProcessEnv = process.env,
 ): T {
   const lock = tryAcquireControlLock(project, env);
-  if (!lock) throw new Error(`another control operation is in progress (${controlLockPath(project)})`);
+  if (!lock) throw new ControlLockBusyError(controlLockPath(project));
   try {
     return action();
   } finally {
     lock.release();
+  }
+}
+
+export type ControlLockWaitOptions = {
+  attempts?: number;
+  delayMs?: number;
+  diagnosticIntervalMs?: number;
+  log?: (message: string) => void;
+};
+
+/**
+ * Runs `attempt` again while it fails with `ControlLockBusyError`, for the
+ * same bounded window another command waits for the project lifecycle lock.
+ * Any other error propagates at once, and the last busy error propagates
+ * unchanged when the window is spent.
+ *
+ * The caller must hold no lock across the wait: each attempt has to take and
+ * release its own locks, so a busy error leaves nothing held while this sleeps.
+ * A lock left by a dead or earlier-boot owner is not contention:
+ * `tryAcquireControlLock` reclaims it on the next try.
+ */
+export async function waitWhileControlLockBusy<T>(
+  project: ProjectInfo,
+  attempt: () => T | Promise<T>,
+  options: ControlLockWaitOptions = {},
+): Promise<T> {
+  const attempts = options.attempts ?? PROJECT_LIFECYCLE_LOCK_RETRY_ATTEMPTS;
+  const delayMs = options.delayMs ?? PROJECT_LIFECYCLE_LOCK_RETRY_DELAY_MS;
+  const diagnosticIntervalMs = options.diagnosticIntervalMs ?? 5_000;
+  const log = options.log ?? runfreeLog;
+  if (!Number.isSafeInteger(attempts) || attempts < 1) {
+    throw new Error("control lock wait attempts must be a positive integer");
+  }
+  if (!Number.isSafeInteger(delayMs) || delayMs < 1) {
+    throw new Error("control lock wait delay must be a positive integer");
+  }
+  const startedAt = Date.now();
+  let nextDiagnosticAt = startedAt + diagnosticIntervalMs;
+  for (let tried = 1; ; tried += 1) {
+    try {
+      return await attempt();
+    } catch (error) {
+      if (!(error instanceof ControlLockBusyError) || tried >= attempts) throw error;
+    }
+    await new Promise((resolve) => setTimeout(resolve, delayMs));
+    const now = Date.now();
+    if (now >= nextDiagnosticAt) {
+      const elapsedSeconds = Math.max(1, Math.round((now - startedAt) / 1_000));
+      log(`waiting for the project control lock (${elapsedSeconds}s; lock: ${controlLockPath(project)})`);
+      nextDiagnosticAt = now + diagnosticIntervalMs;
+    }
   }
 }

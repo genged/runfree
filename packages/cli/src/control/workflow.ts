@@ -53,6 +53,7 @@ import {
   type ReductionComparison,
 } from "./comparator.ts";
 import { compileDesiredPolicies } from "./compiler.ts";
+import { type ControlLockWaitOptions, waitWhileControlLockBusy } from "./lock.ts";
 import { withQuiescedProject } from "./quiesce.ts";
 import { parseStrictJson } from "./strict-json.ts";
 import {
@@ -692,4 +693,30 @@ export async function prepareEffectiveControlsForStartup(
     runtimeIsolation: true,
   });
   return { generation: await usePreparedApprovedPolicyGeneration(context, io), mechanism: "interactive" };
+}
+
+/**
+ * A launch's control preparation: `prepareEffectiveControlsForStartup`, run
+ * again while another operation holds the project control lock. Two launches
+ * started together in one project both publish the selected generation under
+ * that lock, so the second would otherwise fail on plain contention.
+ *
+ * Only a launch waits. Admin and policy commands keep failing fast on a busy
+ * lock. Every attempt takes and releases its own locks, so nothing is held
+ * while this waits, and an attempt that a busy lock stopped part-way has
+ * either persisted a step (the next attempt finds it already done) or written
+ * nothing. An interactive review that the busy lock interrupted after consent
+ * asks again: consent is never carried across attempts.
+ */
+export async function prepareEffectiveControlsForLaunch(
+  context: RuntimeContext,
+  io: RuntimeIO,
+  options: Parameters<typeof prepareEffectiveControlsForStartup>[2] & { controlLockWait?: ControlLockWaitOptions } = {},
+): Promise<StartupControlPreparation> {
+  const { controlLockWait, ...prepareOptions } = options;
+  return waitWhileControlLockBusy(
+    context.project,
+    () => prepareEffectiveControlsForStartup(context, io, prepareOptions),
+    controlLockWait,
+  );
 }

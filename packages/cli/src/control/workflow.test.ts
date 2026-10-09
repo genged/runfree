@@ -21,6 +21,7 @@ import {
   approveNetworkControl,
   approveRuntimeIsolation,
   captureQuiescedDesiredPolicyCandidate,
+  prepareEffectiveControlsForLaunch,
   prepareEffectiveControlsForStartup,
   useApprovedPolicyGeneration,
   usePreparedApprovedPolicyGeneration,
@@ -29,6 +30,7 @@ import { validateNetworkPolicy } from "@runfree/runtime-contracts/network-policy
 import { compileDesiredPolicies } from "./compiler.ts";
 import { prepareMcpRuntime } from "../runtime/mcp.ts";
 import { readActiveControlSelection } from "./effective.ts";
+import { ControlLockBusyError, controlLockPath, tryAcquireControlLock } from "./lock.ts";
 import type { HostServiceAdmit } from "./host-service-approval-admission.ts";
 import { desiredPolicyReviewLines } from "./review-render.ts";
 
@@ -299,6 +301,69 @@ describe("quiesced control workflow", () => {
     expect(reviewed).toContain("  - host service idb: null -> 127.0.0.1:10882 (owner-10882, pid 4242)");
     expect(selection.subjects["network-project"]?.mechanism).toBe("interactive");
     expect(readApprovedNetworkPolicy(root, context.project, "network-project")?.hostServices?.idb?.port).toBe(10882);
+  });
+
+  describe("a launch's control preparation while the control lock is busy", () => {
+    function approvingIO(): RuntimeIO {
+      const approving = io();
+      approving.isInteractive = () => true;
+      approving.confirm = () => true;
+      return approving;
+    }
+
+    test("waits for a holder that releases mid-wait, then prepares", async () => {
+      const held = tryAcquireControlLock(context.project);
+      expect(held).toBeDefined();
+      const logs: string[] = [];
+      const release = setTimeout(() => held?.release(), 40);
+      try {
+        const prepared = await prepareEffectiveControlsForLaunch(context, approvingIO(), {
+          controlLockWait: { attempts: 200, delayMs: 5, diagnosticIntervalMs: 1, log: (line) => logs.push(line) },
+        });
+        expect(prepared.mechanism).toBe("interactive");
+        expect(readActiveControlSelection(context.project)?.controlGeneration).toBe(prepared.generation.controlGeneration);
+        expect(logs[0]).toContain(`lock: ${controlLockPath(context.project)}`);
+      } finally {
+        clearTimeout(release);
+        held?.release();
+      }
+    });
+
+    test("fails with the original message when the holder never releases", async () => {
+      const held = tryAcquireControlLock(context.project);
+      expect(held).toBeDefined();
+      try {
+        await expect(prepareEffectiveControlsForLaunch(context, approvingIO(), {
+          controlLockWait: { attempts: 3, delayMs: 1, log: () => {} },
+        })).rejects.toThrow(`another control operation is in progress (${controlLockPath(context.project)})`);
+        expect(readControlApprovalSelection(root, context.project)).toBeUndefined();
+        expect(readActiveControlSelection(context.project)).toBeUndefined();
+      } finally {
+        held?.release();
+      }
+    });
+
+    test("does not retry a failure that is not lock contention", async () => {
+      const failing = approvingIO();
+      const admin = vi.fn(async () => 7);
+      failing.admin = admin;
+      await expect(prepareEffectiveControlsForLaunch(context, failing, {
+        controlLockWait: { attempts: 5, delayMs: 1, log: () => {} },
+      })).rejects.toThrow("host-owned effective control preparation failed with status 7");
+      expect(admin).toHaveBeenCalledTimes(1);
+    });
+
+    test("an admin approval still fails fast on the same busy lock", async () => {
+      const held = tryAcquireControlLock(context.project);
+      expect(held).toBeDefined();
+      try {
+        await expect(approveNetworkControl(context, io(), "network-project", { mechanism: "digest-command" }))
+          .rejects.toBeInstanceOf(ControlLockBusyError);
+        expect(readControlApprovalSelection(root, context.project)).toBeUndefined();
+      } finally {
+        held?.release();
+      }
+    });
   });
 
   test("the interactive startup approval runs the port admission before consent (R21)", async () => {
