@@ -745,17 +745,24 @@ describe("session-container reconciliation", () => {
 });
 
 describe("the session-container absence listing", () => {
-  type Row = { id?: string; names?: string; projectId?: string; composeProject?: string; role?: string; sessionId?: string };
+  /** The keys the format reads with `.Label`, in row order, taken from the format itself. */
+  const exactKeys = [...SESSION_CONTAINER_ABSENCE_FORMAT.matchAll(/\.Label "([^"]+)"/g)].map((match) => match[1] as string);
+  const L = {
+    projectId: "io.runfree.project-id",
+    composeProject: "io.runfree.compose-project",
+    role: "io.runfree.container-role",
+    managed: "io.runfree.managed",
+    sessionId: "io.runfree.session-id",
+  } as const;
 
+  type Row = { id?: string; names?: string; labels?: Record<string, string>; joined?: string; exact?: Record<string, string> };
+
+  /** One row as Docker prints it: `.Labels` is the comma-joined view, `.Label "k"` is "" when missing. */
   function row(input: Row = {}): string {
-    return JSON.stringify([
-      input.id ?? "4".repeat(64),
-      input.names ?? "some-unrelated-container",
-      input.projectId ?? "",
-      input.composeProject ?? "",
-      input.role ?? "",
-      input.sessionId ?? "",
-    ]);
+    const labels = input.labels ?? {};
+    const joined = input.joined ?? Object.entries(labels).map(([key, value]) => `${key}=${value}`).join(",");
+    const exact = exactKeys.map((key) => input.exact?.[key] ?? labels[key] ?? "");
+    return JSON.stringify([input.id ?? "4".repeat(64), input.names ?? "some-unrelated-container", joined, ...exact]);
   }
 
   function listing(stdout: string, status = 0) {
@@ -763,10 +770,13 @@ describe("the session-container absence listing", () => {
     return { executor, observation: observeSessionContainersAbsent(executor, PROJECT) };
   }
 
+  const unrelated = row({ labels: { "org.opencontainers.image.authors": "a, b", "com.docker.compose.config-hash": "x" } });
+
   test("lists every container once, by the exact argv, under its own timeout", () => {
     const { executor } = listing("");
 
     expect(SESSION_CONTAINER_ABSENCE_TIMEOUT_MS).toBe(5_000);
+    expect(exactKeys).toEqual(expect.arrayContaining([...Object.values(L), "com.docker.compose.project"]));
     expect(executor).toHaveBeenCalledTimes(1);
     expect(executor.mock.calls[0]?.[0]).toBe("docker");
     expect(executor.mock.calls[0]?.[1]).toEqual(["ps", "--all", "--no-trunc", "--format", SESSION_CONTAINER_ABSENCE_FORMAT]);
@@ -781,29 +791,63 @@ describe("the session-container absence listing", () => {
     expect(() => assertSessionContainersAbsent({ kind: "absent" })).toThrow(/not minted/);
   });
 
+  const scoped = { [L.projectId]: PROJECT.projectId };
   test.each<[string, Row]>([
     ["this project's session name", { names: `runfree-${PROJECT.projectId}-session-rf-20260805-abcdef` }],
-    ["this project's id label with the session-agent role", { projectId: PROJECT.projectId, role: "session-agent" }],
-    ["this compose project's label with a session id", { composeProject: PROJECT.composeProject, sessionId: "rf-20260805-abcdef" }],
+    ["this project's session name as a second name", { names: `other,runfree-${PROJECT.projectId}-session-rf-20260805-abcdef` }],
+    ["this project's id label with the session-agent role", { labels: { ...scoped, [L.role]: "session-agent" } }],
+    ["this compose project's label with the session-agent role", { labels: { [L.composeProject]: PROJECT.composeProject, [L.role]: "session-agent" } }],
+    ["this compose project's label with a session id", { labels: { [L.composeProject]: PROJECT.composeProject, [L.sessionId]: "rf-20260805-abcdef" } }],
+    ["a project-scoped ephemeral helper", { labels: { ...scoped, [L.role]: "ephemeral-helper" } }],
+    ["a project-scoped container marked managed, with no role", { labels: { ...scoped, [L.managed]: "true" } }],
+    ["a project-scoped container with any other runfree label", { labels: { ...scoped, "io.runfree.future-label": "1" } }],
+    ["a present but empty session-id label", { labels: { ...scoped, [L.sessionId]: "" } }],
+    ["an older, partially labelled session container", {
+      labels: { ...scoped, [L.composeProject]: PROJECT.composeProject, "io.runfree.session-incarnation": "1".repeat(64) },
+    }],
+    ["a Compose token forged inside another label's value", {
+      labels: { ...scoped, [L.role]: "ephemeral-helper", "org.example.note": "x,com.docker.compose.project=foo" },
+    }],
   ])("%s is present", (_label, input) => {
-    const { observation } = listing(`${row()}\n${row({ id: "5".repeat(64), ...input })}\n`);
+    const { observation } = listing(`${unrelated}\n${row({ id: "5".repeat(64), ...input })}\n`);
 
     expect(observation.kind).toBe("present");
     expect(() => assertSessionContainersAbsent(observation)).toThrow();
   });
 
+  test.each([
+    "io.runfree.session-incarnation",
+    "io.runfree.selected-agent-image-input-digest",
+    "io.runfree.selected-agent-image-id",
+    "io.runfree.session-agent-materialization-digest",
+    "io.runfree.session-agent-generation-digest",
+    "io.runfree.session-template-digest",
+    "io.runfree.admission-contract-epoch",
+  ])("a project-scoped container with only %s is present, even when Compose owns it", (label) => {
+    const labels = { ...scoped, [label]: "1", "com.docker.compose.project": PROJECT.composeProject };
+    expect(listing(`${row({ labels })}\n`).observation.kind).toBe("present");
+  });
+
   test.each<[string, Row]>([
     ["another project's session", {
       names: "runfree-ffffffffffff-session-rf-20260805-abcdef",
-      projectId: "ffffffffffff",
-      composeProject: "runfree-ffffffffffff",
-      role: "session-agent",
-      sessionId: "rf-20260805-abcdef",
+      labels: {
+        [L.projectId]: "ffffffffffff",
+        [L.composeProject]: "runfree-ffffffffffff",
+        [L.role]: "session-agent",
+        [L.sessionId]: "rf-20260805-abcdef",
+      },
     }],
     ["this project's ingress forwarder", {
       names: `runfree-ingress-vnc-${PROJECT.projectId}-5901`,
-      projectId: PROJECT.projectId,
-      role: "ingress-forwarder",
+      labels: { ...scoped, [L.role]: "ingress-forwarder", [L.managed]: "true" },
+    }],
+    ["this project's Compose-owned proxy", {
+      names: `${PROJECT.composeProject}-proxy-1`,
+      labels: { ...scoped, [L.role]: "proxy", [L.managed]: "true", "com.docker.compose.project": PROJECT.composeProject },
+    }],
+    ["an unrelated container whose label values hold commas", {
+      labels: { "com.docker.compose.project.config_files": "a.yml,b.yml", "org.example": "x,y=z" },
     }],
   ])("%s is absent", (_label, input) => {
     expect(listing(`${row(input)}\n`).observation.kind).toBe("absent");
@@ -811,11 +855,12 @@ describe("the session-container absence listing", () => {
 
   test.each<[string, string, number]>([
     ["a timed-out listing", "", 124],
-    ["a row that is not a six-string array", `${JSON.stringify(["4".repeat(64), "name", "", "", ""])}\n`, 0],
-    ["a row whose fields are not all strings", `${JSON.stringify(["4".repeat(64), "name", "", "", "", 1])}\n`, 0],
+    ["a row with too few fields", `${JSON.stringify(["4".repeat(64), "name", ""])}\n`, 0],
+    ["a row whose fields are not all strings", `${JSON.stringify(["4".repeat(64), "name", "", ...exactKeys.map(() => 1)])}\n`, 0],
     ["a row that is not JSON", "4444\tname\n", 0],
     ["a row whose id is not exact", `${row({ id: "4".repeat(12) })}\n`, 0],
     ["a malformed row after a present one", `${row({ names: `runfree-${PROJECT.projectId}-session-x` })}\nnot json\n`, 0],
+    ["a label value that the joined view does not carry", `${row({ joined: "", exact: { [L.role]: "ingress-forwarder" } })}\n`, 0],
   ])("%s is unreadable, never absent", (_label, stdout, status) => {
     const { observation } = listing(stdout, status);
 

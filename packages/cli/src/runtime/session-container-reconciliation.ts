@@ -502,12 +502,81 @@ export type SessionContainersObservation =
 
 export const SESSION_CONTAINER_ABSENCE_TIMEOUT_MS = 5_000;
 
+/** The labels whose mere presence, on a project-scoped container, marks it as a session. */
+const SESSION_SPECIFIC_LABELS = [
+  SESSION_CONTAINER_LABELS.sessionId,
+  SESSION_CONTAINER_LABELS.sessionIncarnation,
+  SESSION_CONTAINER_LABELS.selectedAgentImageInputDigest,
+  SESSION_CONTAINER_LABELS.selectedAgentImageId,
+  SESSION_CONTAINER_LABELS.sessionAgentMaterializationDigest,
+  SESSION_CONTAINER_LABELS.sessionAgentGenerationDigest,
+  SESSION_CONTAINER_LABELS.sessionTemplateDigest,
+  SESSION_CONTAINER_LABELS.admissionContractEpoch,
+] as const;
+
+const COMPOSE_LABEL_PREFIX = "com.docker.compose.";
+const COMPOSE_PROJECT_LABEL = "com.docker.compose.project";
+
 /**
- * One JSON array per container: id, names, then the project-id, compose
- * project, role, and session-id labels. Each field is JSON-encoded on its own,
- * so no label value can be mistaken for a delimiter.
+ * The one session-hint predicate: whether container metadata could belong to
+ * one of this project's sessions. The reconciler's `managedSessionHint` and the
+ * absence listing both decide through it, so "absent" can never mean less than
+ * "the reconciler would see no session hint".
+ *
+ * `labels` is the label map (presence matters: an empty value still counts),
+ * and `managedHint` is whether any `io.runfree.*` label exists, well formed or
+ * not.
  */
-export const SESSION_CONTAINER_ABSENCE_FORMAT = `[{{json .ID}},{{json .Names}},{{json (.Label "${SESSION_CONTAINER_LABELS.projectId}")}},{{json (.Label "${SESSION_CONTAINER_LABELS.composeProject}")}},{{json (.Label "${SESSION_CONTAINER_LABELS.role}")}},{{json (.Label "${SESSION_CONTAINER_LABELS.sessionId}")}}]`;
+function sessionHintFromMetadata(
+  input: Readonly<{ names: readonly string[]; labels: Readonly<Record<string, string>>; managedHint: boolean }>,
+  expected: SessionContainerProjectIdentity,
+): boolean {
+  const namePrefix = `runfree-${expected.projectId}-session-`;
+  if (input.names.some((name) => name.startsWith(namePrefix))) return true;
+  const { labels } = input;
+  const projectScoped = labels[SESSION_CONTAINER_LABELS.projectId] === expected.projectId
+    || labels[SESSION_CONTAINER_LABELS.composeProject] === expected.composeProject;
+  const sessionSpecificHint = labels[SESSION_CONTAINER_LABELS.role] === "session-agent"
+    || SESSION_SPECIFIC_LABELS.some((label) => Object.hasOwn(labels, label));
+  if (projectScoped && sessionSpecificHint) return true;
+  // A runtime-owned ingress forwarder (per-session MCP callback, VNC, port
+  // forward) is managed and project-scoped but is never a session: it carries
+  // no session label, runs the ingress image rather than an agent image, and
+  // is proved by its own utility validation. Counted here, every live callback
+  // forwarder blocked session-agent image and materialization cleanup.
+  if (labels[SESSION_CONTAINER_LABELS.role] === "ingress-forwarder") return false;
+  if (hasComposeOwnershipLabel(labels)) return false;
+  return projectScoped && (input.managedHint
+    || labels[SESSION_CONTAINER_LABELS.managed] === "true"
+    || labels[SESSION_CONTAINER_LABELS.role] === "session-agent");
+}
+
+/** Every label the session-hint predicate reads by exact key, listed by value. */
+const ABSENCE_EXACT_LABELS = [
+  SESSION_CONTAINER_LABELS.projectId,
+  SESSION_CONTAINER_LABELS.composeProject,
+  SESSION_CONTAINER_LABELS.role,
+  SESSION_CONTAINER_LABELS.managed,
+  ...SESSION_SPECIFIC_LABELS,
+  COMPOSE_PROJECT_LABEL,
+] as const;
+
+/**
+ * One JSON array per container: id, names, Docker's comma-joined `key=value`
+ * label view, then the exact value of every label in `ABSENCE_EXACT_LABELS`.
+ *
+ * `docker ps` offers no map form of the labels. Its `.Labels` view cannot tell
+ * a comma inside a value from a separator, and `.Label "k"` cannot tell a
+ * missing label from an empty one. Together they settle every question the
+ * session-hint predicate asks, each resolved so that doubt can only add a hint
+ * (see `absenceListingMetadata`). Every field is JSON-encoded on its own, so
+ * no value can be mistaken for a delimiter between fields.
+ */
+export const SESSION_CONTAINER_ABSENCE_FORMAT = `[{{json .ID}},{{json .Names}},{{json .Labels}},${
+  ABSENCE_EXACT_LABELS.map((label) => `{{json (.Label "${label}")}}`).join(",")
+}]`;
+
+const ABSENCE_ROW_FIELDS = 3 + ABSENCE_EXACT_LABELS.length;
 
 const sealedSessionContainerAbsences = new WeakSet<object>();
 
@@ -524,22 +593,61 @@ function parseSessionContainerAbsenceRow(line: string): readonly string[] | unde
   } catch {
     return undefined;
   }
-  if (!Array.isArray(parsed) || parsed.length !== 6 || !parsed.every((field) => typeof field === "string")) {
+  if (!Array.isArray(parsed) || parsed.length !== ABSENCE_ROW_FIELDS
+    || !parsed.every((field) => typeof field === "string")) {
     return undefined;
   }
   return parsed as string[];
 }
 
 /**
- * Whether Docker holds any container, running or stopped, that could be one of
- * this project's sessions, from one host-wide listing.
+ * The predicate's input from one listing row, or undefined when the row
+ * contradicts itself.
  *
- * A row counts when its name is this project's session name, or when it is
- * scoped to this project (by project-id or compose-project label) and carries
- * the session-agent role or a session id. This is `managedSessionHint` without
- * its ingress-forwarder exclusion: a forwarder carries neither signal, so it
- * never counts here. A non-zero exit, a thrown call, or any row that does not
- * parse is unreadable, never absent.
+ * A real label `k=v` always yields a `.Labels` token that starts `k=`, and a
+ * real empty label yields the exact token `k=`. A token can also be forged by
+ * a value that contains a comma, so a token alone only ever adds a hint:
+ * - a session-specific label is present when its value is non-empty, or when
+ *   the exact `k=` token appears (a forged one can only add a hint);
+ * - `managedHint` is any token starting `io.runfree.` (likewise);
+ * - Compose ownership, which removes a hint, is believed only from a
+ *   non-empty, well-formed `.Label "com.docker.compose.project"`, which no
+ *   token can forge. Any other Compose token is ignored, which can only add a
+ *   hint.
+ * Exact values (project, role, managed) come from `.Label` alone. A non-empty
+ * `.Label` with no matching token is a contradiction: unreadable.
+ */
+function absenceListingMetadata(
+  row: readonly string[],
+): Readonly<{ names: readonly string[]; labels: Record<string, string>; managedHint: boolean }> | undefined {
+  const [, names, joinedLabels, ...exactValues] = row as [string, string, string, ...string[]];
+  const tokens = joinedLabels === "" ? [] : joinedLabels.split(",");
+  const labels: Record<string, string> = {};
+  for (const [index, label] of ABSENCE_EXACT_LABELS.entries()) {
+    const value = exactValues[index] as string;
+    if (value !== "") {
+      if (!tokens.some((token) => token.startsWith(`${label}=`))) return undefined;
+      if (label === COMPOSE_PROJECT_LABEL && !wellFormedDockerLabel(label, value)) continue;
+      labels[label] = value;
+    } else if (label !== COMPOSE_PROJECT_LABEL && tokens.includes(`${label}=`)) {
+      labels[label] = "";
+    }
+  }
+  return Object.freeze({
+    names: Object.freeze(names === "" ? [] : names.split(",")),
+    labels,
+    managedHint: tokens.some((token) => token.startsWith(RUNFREE_LABEL_NAMESPACE)),
+  });
+}
+
+/**
+ * Whether Docker holds any container, running or stopped, that the reconciler
+ * would treat as one of this project's sessions, from one host-wide listing.
+ *
+ * Each row goes through the reconciler's own session-hint predicate, with any
+ * doubt in the listing resolved toward a hint, so `absent` implies the
+ * reconciler would see none. A non-zero exit, a thrown call, a row that does
+ * not parse, or a row that contradicts itself is unreadable, never absent.
  */
 export function observeSessionContainersAbsent(
   executor: SessionContainerInventoryExecutor,
@@ -564,16 +672,15 @@ export function observeSessionContainersAbsent(
   if (result.status !== 0) return unreadable(`Docker could not list containers (exit ${String(result.status)})`);
   const lines = result.stdout.split("\n");
   if (lines.at(-1) === "") lines.pop();
-  const namePrefix = `runfree-${expectedProject.projectId}-session-`;
   let present: string | undefined;
   for (const line of lines) {
     const row = parseSessionContainerAbsenceRow(line);
     if (!row) return unreadable("Docker's container listing has a malformed row");
-    const [id, names, projectId, composeProject, role, sessionId] = row as [string, string, string, string, string, string];
+    const id = row[0] as string;
     if (!DOCKER_OBJECT_ID_PATTERN.test(id)) return unreadable("Docker's container listing has a non-exact container id");
-    if (present !== undefined) continue;
-    const projectScoped = projectId === expectedProject.projectId || composeProject === expectedProject.composeProject;
-    if (names.startsWith(namePrefix) || (projectScoped && (role === "session-agent" || sessionId !== ""))) {
+    const metadata = absenceListingMetadata(row);
+    if (!metadata) return unreadable(`Docker's labels for container ${id} contradict each other`);
+    if (present === undefined && sessionHintFromMetadata(metadata, expectedProject)) {
       present = `container ${id} may be one of this project's sessions`;
     }
   }
@@ -1009,7 +1116,7 @@ function boundedLabel(value: string | undefined, maximum: number): value is stri
 }
 
 function hasComposeOwnershipLabel(labels: Record<string, string>): boolean {
-  return Object.keys(labels).some((name) => name.startsWith("com.docker.compose."));
+  return Object.keys(labels).some((name) => name.startsWith(COMPOSE_LABEL_PREFIX));
 }
 
 function hasUnknownRunfreeLabel(labels: Record<string, string>): boolean {
@@ -1139,33 +1246,11 @@ function unboundAllocatedRecordMatchesCreatedContainer(
 }
 
 function managedSessionHint(container: SessionContainerSnapshot, expected: SessionContainerProjectIdentity): boolean {
-  if (container.sessionInventoryHint === true
-    || container.containerName.startsWith(`runfree-${expected.projectId}-session-`)
-  ) return true;
-  const projectScoped = container.labels[SESSION_CONTAINER_LABELS.projectId] === expected.projectId
-    || container.labels[SESSION_CONTAINER_LABELS.composeProject] === expected.composeProject;
-  const sessionSpecificHint = container.labels[SESSION_CONTAINER_LABELS.role] === "session-agent"
-    || [
-      SESSION_CONTAINER_LABELS.sessionId,
-      SESSION_CONTAINER_LABELS.sessionIncarnation,
-      SESSION_CONTAINER_LABELS.selectedAgentImageInputDigest,
-      SESSION_CONTAINER_LABELS.selectedAgentImageId,
-      SESSION_CONTAINER_LABELS.sessionAgentMaterializationDigest,
-      SESSION_CONTAINER_LABELS.sessionAgentGenerationDigest,
-      SESSION_CONTAINER_LABELS.sessionTemplateDigest,
-      SESSION_CONTAINER_LABELS.admissionContractEpoch,
-    ].some((label) => Object.hasOwn(container.labels, label));
-  if (projectScoped && sessionSpecificHint) return true;
-  // A runtime-owned ingress forwarder (per-session MCP callback, VNC, port
-  // forward) is managed and project-scoped but is never a session: it carries
-  // no session label, runs the ingress image rather than an agent image, and
-  // is proved by its own utility validation. Counted here, every live callback
-  // forwarder blocked session-agent image and materialization cleanup.
-  if (container.labels[SESSION_CONTAINER_LABELS.role] === "ingress-forwarder") return false;
-  if (hasComposeOwnershipLabel(container.labels)) return false;
-  return projectScoped && (container.managedInventoryHint === true
-    || container.labels[SESSION_CONTAINER_LABELS.managed] === "true"
-    || container.labels[SESSION_CONTAINER_LABELS.role] === "session-agent");
+  return container.sessionInventoryHint === true || sessionHintFromMetadata({
+    names: [container.containerName],
+    labels: container.labels,
+    managedHint: container.managedInventoryHint === true,
+  }, expected);
 }
 
 function sealContainerOnlyClassification(
