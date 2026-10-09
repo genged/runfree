@@ -97,7 +97,8 @@ it with
 Decide whether the failure is a product bug, a wrong property, or an
 infrastructure fault before you rerun anything. Keep the shrunk counterexample
 as a plain example test in the module's ordinary test file, so it still runs if
-the generator changes. `RUNFREE_PROP_RUNS` raises the run count for a soak run.
+the generator changes. `make test-property-soak` runs the agent-input
+properties at 100,000 cases each; `RUNFREE_PROP_RUNS` sets the count for any run.
 
 **Prefer runtime inspection over declarative config in tests.** For
 capabilities, routes, mounts, and firewall state, ask the running system. A
