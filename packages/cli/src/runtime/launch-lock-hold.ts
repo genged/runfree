@@ -10,6 +10,8 @@
 //   startup span (handoff only)  <= LAUNCH_HANDOFF_STARTUP_SPAN_MAX_MS
 //   running proof                <= RUNNING_PROOF_TIMEOUT_MS
 //   callback setup               <= SESSION_CALLBACK_SETUP_BUDGET_MS
+//     callback reserve           <= SESSION_CALLBACK_RESERVE_BUDGET_MS (<= 12 s, overlaps the running proof)
+//     callback complete          <= SESSION_CALLBACK_COMPLETE_BUDGET_MS (<= 12 s, after the running proof)
 //   entry-handoff wait           ends at the hold deadline at the latest
 //
 // The remaining 10 s of the 60 s window is the allowance for the short daemon
@@ -42,6 +44,17 @@ export const SESSION_CALLBACK_SETUP_BUDGET_MS = 12_000;
  */
 export const LAUNCH_HANDOFF_STARTUP_SPAN_MAX_MS =
   LAUNCH_LOCK_HOLD_BUDGET_MS - RUNNING_PROOF_TIMEOUT_MS - SESSION_CALLBACK_SETUP_BUDGET_MS;
+
+/**
+ * The overlapped MCP callback setup's own two budgets: the part that may run
+ * concurrently with the running proof (the forwarder port search and the
+ * in-session bridge), and the part that runs after the running proof has
+ * returned (the host path probe). Keeping both at the whole setup budget
+ * bounds each phase independently without assuming how much of the setup the
+ * reserve phase actually used while it overlapped the proof.
+ */
+export const SESSION_CALLBACK_RESERVE_BUDGET_MS = SESSION_CALLBACK_SETUP_BUDGET_MS;
+export const SESSION_CALLBACK_COMPLETE_BUDGET_MS = SESSION_CALLBACK_SETUP_BUDGET_MS;
 
 /**
  * How long a launch that has just released a long-held lock waits before it
