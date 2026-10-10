@@ -496,6 +496,14 @@ filter is repeatable; omit it to include both agents.
 
 Project `.mcp.json` and `.codex/config.toml` entries are imported only after approval. Static headers require a host-owned credential source.
 
+A server name must be one that the agent's own `mcp add` accepts: letters,
+numbers, `-`, and `_` for Claude, plus `:`, `@`, `/`, and `.` for Codex. It
+must be at most 128 characters and must not be `__proto__`. `runfree mcp list`
+shows a server with any other name as `unsupported`, and the server is skipped
+with a warning. Names that differ only by case, or that map to the same
+Runfree ID, are skipped together. If one of them is a user or local server,
+that server stays and only the project entries are skipped (`conflict`).
+
 Local STDIO servers run inside the agent container, never on the host. A
 command that is a host path is skipped with a warning. The Codex Desktop
 built-ins `node_repl` and `computer-use` are skipped silently: `runfree mcp

@@ -13,7 +13,7 @@ help:
 		'  make test-agent           Runfree bootstrap Vitest suite' \
 		'  make test-proxy           Proxy Vitest suite' \
 		'  make test-security        Security-sensitive Vitest suites' \
-		'  make test-property-soak   Path, GraphQL, and MCP property tests at 100000 cases each (by hand; up to ~15 min)' \
+		'  make test-property-soak   Path, GraphQL, MCP, and .mcp.json property tests at 100000 cases each (by hand; up to ~15 min)' \
 		'  make test-templates       Docker Compose template validation' \
 		'  make test-cli-e2e         Build dist/runfree and run packaged CLI scenarios' \
 		'  make test-cli-e2e-live    Build dist/runfree and run its real-Docker lifecycle scenario' \
@@ -122,7 +122,7 @@ test-proxy:
 # failure (a broken property still fails at its first counterexample).
 RUNFREE_PROP_SOAK_RUNS ?= 100000
 test-property-soak:
-	RUNFREE_PROP_RUNS=$${RUNFREE_PROP_RUNS:-$(RUNFREE_PROP_SOAK_RUNS)} pnpm exec vitest run --testTimeout=1800000 packages/proxy/src/policy.property.test.ts packages/proxy/src/graphql-classify.property.test.ts packages/proxy/src/mcp-classify.property.test.ts
+	RUNFREE_PROP_RUNS=$${RUNFREE_PROP_RUNS:-$(RUNFREE_PROP_SOAK_RUNS)} pnpm exec vitest run --testTimeout=1800000 packages/proxy/src/policy.property.test.ts packages/proxy/src/graphql-classify.property.test.ts packages/proxy/src/mcp-classify.property.test.ts packages/cli/src/runtime/mcp-project-config.property.test.ts
 
 # A filter matching no file is not an error to Vitest: the run reports green over
 # whatever else matched, so scripts/check-test-inventory.ts asserts every path

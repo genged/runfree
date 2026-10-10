@@ -321,7 +321,7 @@ function safeReadHostText(filePath: string, projectRoot: string, label: string):
     return fs.readFileSync(resolved, "utf8");
   } catch (error) {
     if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") return undefined;
-    warn(`mcp: skipped ${label} config ${resolved}: ${error instanceof Error ? error.message : String(error)}`);
+    warn(`mcp: skipped ${label} config ${resolved}: ${printable(error instanceof Error ? error.message : String(error))}`);
     return undefined;
   }
 }
@@ -333,16 +333,43 @@ function readJsonConfig(filePath: string, projectRoot: string, label: string): R
     const parsed = JSON.parse(source) as unknown;
     if (isRecord(parsed)) return parsed;
   } catch (error) {
-    warn(`mcp: skipped ${label} config ${filePath}: ${error instanceof Error ? error.message : String(error)}`);
+    warn(`mcp: skipped ${label} config ${filePath}: ${printable(error instanceof Error ? error.message : String(error))}`);
     return undefined;
   }
   warn(`mcp: skipped ${label} config ${filePath}: expected JSON object`);
   return undefined;
 }
 
+// Render text that came from MCP config or remote metadata: escape anything
+// that is not printable ASCII (control, C1, bidi, and other formatting
+// characters), so it cannot move the cursor or reorder the review.
+export function printable(value: string): string {
+  return value.replace(/[^\x20-\x7e]/g, (char) => `\\u{${(char.codePointAt(0) ?? 0).toString(16)}}`);
+}
+
+// Server names each agent's own `mcp add` accepts (Claude Code: letters,
+// digits, `-`, `_`; codex-cli 0.156.1 also `:`, `@`, `/`, `.`), with a length
+// cap of Runfree's own. A name outside them is skipped, never generated.
+const MCP_SERVER_NAME_MAX_LENGTH = 128;
+const MCP_SERVER_NAME_RULES: Record<McpAgent, { pattern: RegExp; characters: string }> = {
+  claude: { pattern: /^[A-Za-z0-9_-]+$/, characters: "letters, numbers, '-', '_'" },
+  codex: { pattern: /^[A-Za-z0-9_\-:@/.]+$/, characters: "letters, numbers, '-', '_', ':', '@', '/', '.'" },
+};
+
+export function mcpServerNameRefusal(agent: McpAgent, name: string): string | undefined {
+  if (name === "__proto__") return "server name __proto__ is reserved";
+  if (name.length === 0 || name.length > MCP_SERVER_NAME_MAX_LENGTH) {
+    return `server name must be 1-${MCP_SERVER_NAME_MAX_LENGTH} characters`;
+  }
+  const rule = MCP_SERVER_NAME_RULES[agent];
+  return rule.pattern.test(name) ? undefined : `server name must use only ${rule.characters}`;
+}
+
+// Null-prototype so a server named `__proto__` is kept as an entry (and then
+// refused by name) instead of replacing the prototype.
 function mcpServersFromRecord(value: unknown): Record<string, Record<string, unknown>> {
-  if (!isRecord(value)) return {};
-  const servers: Record<string, Record<string, unknown>> = {};
+  const servers: Record<string, Record<string, unknown>> = Object.create(null);
+  if (!isRecord(value)) return servers;
   for (const [name, server] of Object.entries(value)) {
     if (!isRecord(server)) continue;
     servers[name] = server;
@@ -383,7 +410,7 @@ function collectClaudeServers(projectRoot: string, env: NodeJS.ProcessEnv): Nati
   try {
     projectSource = safeReadProjectFile(projectRoot, projectMcpPath);
   } catch (error) {
-    warn(`mcp: skipped project claude config .mcp.json: ${error instanceof Error ? error.message : String(error)}`);
+    warn(`mcp: skipped project claude config .mcp.json: ${printable(error instanceof Error ? error.message : String(error))}`);
   }
   if (projectSource !== undefined) {
     if (projectSource.trim() === "") return servers;
@@ -393,7 +420,7 @@ function collectClaudeServers(projectRoot: string, env: NodeJS.ProcessEnv): Nati
         servers.push({ agent: "claude", scope: "project", name, config, sourcePath: projectMcpPath });
       }
     } catch (error) {
-      warn(`mcp: skipped project claude config .mcp.json: ${error instanceof Error ? error.message : String(error)}`);
+      warn(`mcp: skipped project claude config .mcp.json: ${printable(error instanceof Error ? error.message : String(error))}`);
     }
   }
 
@@ -415,12 +442,12 @@ function unsupportedCodexTomlValuePath(value: unknown, path: string): string | u
 }
 
 function parseCodexToml(source: string): Record<string, Record<string, unknown>> {
-  const servers: Record<string, Record<string, unknown>> = {};
+  const servers: Record<string, Record<string, unknown>> = Object.create(null);
   let parsed: Record<string, unknown>;
   try {
     parsed = parseToml(source, { maxDepth: 32 });
   } catch (error) {
-    warn(`mcp: skipped codex config reason=invalid TOML: ${error instanceof Error ? error.message : String(error)}`);
+    warn(`mcp: skipped codex config reason=invalid TOML: ${printable(error instanceof Error ? error.message : String(error))}`);
     return servers;
   }
   if (!isPlainRecord(parsed.mcp_servers)) return servers;
@@ -432,7 +459,7 @@ function parseCodexToml(source: string): Record<string, Record<string, unknown>>
       if (unsupportedPath) break;
     }
     if (unsupportedPath) {
-      warn(`mcp: skipped codex server ${name} reason=unsupported TOML value for ${unsupportedPath}`);
+      warn(`mcp: skipped codex server ${printable(name)} reason=unsupported TOML value for ${printable(unsupportedPath)}`);
       continue;
     }
     servers[name] = config;
@@ -455,7 +482,7 @@ function collectCodexServers(projectRoot: string, env: NodeJS.ProcessEnv): Nativ
   try {
     projectSource = safeReadProjectFile(projectRoot, projectCodexPath);
   } catch (error) {
-    warn(`mcp: skipped project codex config .codex/config.toml: ${error instanceof Error ? error.message : String(error)}`);
+    warn(`mcp: skipped project codex config .codex/config.toml: ${printable(error instanceof Error ? error.message : String(error))}`);
   }
   if (projectSource !== undefined) {
     for (const [name, config] of Object.entries(parseCodexToml(projectSource))) {
@@ -479,18 +506,18 @@ function normalizeMcpUrl(url: string, server: NativeMcpServer): { host: string; 
   try {
     parsed = new URL(url);
   } catch {
-    warn(`mcp: skipped ${server.agent} server ${server.name} reason=invalid URL`);
+    warn(`mcp: skipped ${server.agent} server ${printable(server.name)} reason=invalid URL`);
     return undefined;
   }
   if (parsed.protocol !== "https:") {
-    warn(`mcp: skipped ${server.agent} server ${server.name} reason=remote HTTP MCP must use https`);
+    warn(`mcp: skipped ${server.agent} server ${printable(server.name)} reason=remote HTTP MCP must use https`);
     return undefined;
   }
   let host: string;
   try {
     host = normalizeHostname(parsed.hostname);
   } catch (error) {
-    warn(`mcp: skipped ${server.agent} server ${server.name} reason=${error instanceof Error ? error.message : String(error)}`);
+    warn(`mcp: skipped ${server.agent} server ${printable(server.name)} reason=${printable(error instanceof Error ? error.message : String(error))}`);
     return undefined;
   }
   return {
@@ -850,19 +877,19 @@ function looksLikeHostPath(value: string, projectRoot: string): boolean {
 function assertContainerLocalStdio(server: NativeMcpServer, projectRoot: string): boolean {
   const command = typeof server.config.command === "string" ? server.config.command : "";
   if (command.trim() === "" || command.includes("/") || command.includes("\\") || path.isAbsolute(command)) {
-    warn(`mcp: skipped ${server.agent} server ${server.name} reason=local stdio command must be installed in the container PATH`);
+    warn(`mcp: skipped ${server.agent} server ${printable(server.name)} reason=local stdio command must be installed in the container PATH`);
     return false;
   }
   const args = stringArray(server.config.args) ?? [];
   for (const arg of args) {
     if (looksLikeHostPath(arg, projectRoot)) {
-      warn(`mcp: skipped ${server.agent} server ${server.name} reason=local stdio args contain a host path`);
+      warn(`mcp: skipped ${server.agent} server ${printable(server.name)} reason=local stdio args contain a host path`);
       return false;
     }
   }
   const cwd = typeof server.config.cwd === "string" ? server.config.cwd : undefined;
   if (cwd && looksLikeHostPath(cwd, projectRoot)) {
-    warn(`mcp: skipped ${server.agent} server ${server.name} reason=local stdio cwd is a host path`);
+    warn(`mcp: skipped ${server.agent} server ${printable(server.name)} reason=local stdio cwd is a host path`);
     return false;
   }
   return true;
@@ -875,7 +902,7 @@ function prepareStdioServer(server: NativeMcpServer, projectRoot: string, option
   const args = stringArray(server.config.args);
   const env = stringRecord(server.config.env);
   if (env && Object.keys(env).length > 0) {
-    warn(`mcp: skipped ${server.agent} server ${server.name} reason=local stdio env would expose host config values to the agent`);
+    warn(`mcp: skipped ${server.agent} server ${printable(server.name)} reason=local stdio env would expose host config values to the agent`);
     return undefined;
   }
   const cwd = typeof server.config.cwd === "string" ? server.config.cwd : undefined;
@@ -970,7 +997,7 @@ export function readMcpApprovals(projectRoot: string, filePath?: string): McpApp
     parsed = JSON.parse(fs.readFileSync(filePath, "utf8")) as unknown;
   } catch (error) {
     if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") return empty;
-    warn(`mcp: ignored malformed approval file ${filePath}: ${error instanceof Error ? error.message : String(error)}`);
+    warn(`mcp: ignored malformed approval file ${filePath}: ${printable(error instanceof Error ? error.message : String(error))}`);
     return empty;
   }
   if (!isRecord(parsed) || parsed.schemaVersion !== 1 || parsed.projectHash !== projectHash(projectRoot) || !isRecord(parsed.approvals)) {
@@ -1040,7 +1067,7 @@ export function readMcpRules(projectRoot: string, filePath?: string): McpRulesFi
     parsed = JSON.parse(fs.readFileSync(filePath, "utf8")) as unknown;
   } catch (error) {
     if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") return empty;
-    warn(`mcp: ignored malformed rules file ${filePath}: ${error instanceof Error ? error.message : String(error)}`);
+    warn(`mcp: ignored malformed rules file ${filePath}: ${printable(error instanceof Error ? error.message : String(error))}`);
     return empty;
   }
   if (!isRecord(parsed) || parsed.schemaVersion !== 1 || parsed.projectHash !== projectHash(projectRoot) || !isRecord(parsed.rules)) {
@@ -1172,12 +1199,74 @@ function mcpPolicySummary(rule: McpRuleRecord | undefined): string {
   return tools > 0 ? `tools=${defaultAction} (${tools} overrides)` : `tools=${defaultAction}`;
 }
 
+type McpNameRefusal = { status: "unsupported" | "conflict"; reason: string };
+
+// Name checks, run before anything derives an ID or a key from a name. Two
+// different names that map to one OAuth provider ID or one MCP operation
+// server ID would make the generated policy invalid, so every entry of such a
+// group is skipped. When user or local servers hold one name of the group,
+// they keep it and the colliding project entries are the ones skipped, as for
+// an exact-name conflict: project config cannot take a configured server away.
+function mcpNameRefusals(servers: NativeMcpServer[]): Map<NativeMcpServer, McpNameRefusal> {
+  const refusals = new Map<NativeMcpServer, McpNameRefusal>();
+  const groups = new Map<string, NativeMcpServer[]>();
+  for (const server of servers) {
+    const reason = mcpServerNameRefusal(server.agent, server.name);
+    if (reason) {
+      refusals.set(server, { status: "unsupported", reason });
+      continue;
+    }
+    if (isDesktopBuiltIn(server)) continue;
+    const ids = [
+      `oauth\0${mcpOAuthProviderId(server.agent, server.name)}`,
+      `operation\0${mcpOperationServerId({ agent: server.agent, name: server.name, source: server.scope })}`,
+    ];
+    for (const id of ids) groups.set(id, [...(groups.get(id) ?? []), server]);
+  }
+  for (const group of groups.values()) {
+    const names = new Set(group.map((server) => server.name));
+    if (names.size < 2) continue;
+    const importedNames = new Set(group.filter((server) => server.scope !== "project").map((server) => server.name));
+    for (const server of group) {
+      if (refusals.has(server)) continue;
+      const others = [...names].filter((name) => name !== server.name).map(printable).join(", ");
+      if (importedNames.size === 1) {
+        // The imported name stays; an exact-name project entry is a conflict later.
+        if (importedNames.has(server.name)) continue;
+        refusals.set(server, { status: "conflict", reason: `server name collides with imported MCP server ${others}` });
+      } else {
+        refusals.set(server, { status: "unsupported", reason: `server name collides with MCP server ${others}` });
+      }
+    }
+  }
+  for (const [server, refusal] of refusals) {
+    warn(`mcp: skipped ${server.agent} server ${printable(server.name)} reason=${refusal.reason}`);
+  }
+  return refusals;
+}
+
 function mcpInventoryRecords(options: { approvalPath?: string; env: NodeJS.ProcessEnv; projectRoot: string; rulesPath?: string }): McpInventoryRecord[] {
   const approvals = readMcpApprovals(options.projectRoot, options.approvalPath);
   const rules = readMcpRules(options.projectRoot, options.rulesPath);
   const importedByName = new Map<string, McpSourceScope>();
-  return discoverMcpServers(options.projectRoot, options.env).map((server): McpInventoryRecord => {
+  const servers = discoverMcpServers(options.projectRoot, options.env);
+  const refusals = mcpNameRefusals(servers);
+  return servers.map((server): McpInventoryRecord => {
     const transport = nativeTransport(server) ?? "unknown";
+    const refusal = refusals.get(server);
+    if (refusal) {
+      return {
+        agent: server.agent,
+        auth: "unknown",
+        decision: refusal,
+        name: server.name,
+        server,
+        source: server.scope,
+        ...(server.sourcePath ? { sourcePath: server.sourcePath } : {}),
+        target: "excluded",
+        transport,
+      };
+    }
     const desktopBuiltIn = isDesktopBuiltIn(server);
     const prepared = prepareServer(server, options.projectRoot, { allowProject: true, log: false });
     const supported = prepared !== undefined;
@@ -1549,7 +1638,7 @@ function writeMcpOAuthPolicy(filePath: string, servers: PreparedMcpServer[], cal
   writeOAuthMediationPolicy(filePath, mcpOAuthPolicyJson(servers, callbackPort));
 }
 
-function mcpOperationServerId(server: PreparedMcpServer): string {
+function mcpOperationServerId(server: Pick<PreparedMcpServer, "agent" | "name" | "source">): string {
   const slug = server.name.toLowerCase().replace(/[^a-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "");
   const safeName = slug === "" ? sha256Hex(server.name).slice(0, 12) : slug.slice(0, 96);
   return `${server.agent}:${server.source}:${safeName}`;

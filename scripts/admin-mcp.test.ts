@@ -1320,6 +1320,27 @@ describe("runfree mcp enable", () => {
     expect(fs.existsSync(enabledFilePath())).toBe(false);
   });
 
+  test("a refused or colliding server name is refused by enable before any write or lookup", async () => {
+    fs.writeFileSync(path.join(projectRoot, ".mcp.json"), JSON.stringify({
+      mcpServers: {
+        "with.dot": { type: "http", url: "https://dot.example.com/mcp" },
+        Foo: { type: "http", url: "https://foo.example.com/mcp" },
+        foo: { type: "http", url: "https://foo2.example.com/mcp" },
+      },
+    }));
+    const cases: Array<[string, string]> = [
+      ["with.dot", "server name must use only letters, numbers, '-', '_'"],
+      ["Foo", "server name collides with MCP server foo"],
+    ];
+    for (const [server, reason] of cases) {
+      const enable = await runAdmin(() => mcpEnableIntent(enableInput({ server }), { discovery: NO_NETWORK }).then(() => {}));
+      expect(enable.status, server).not.toBe(0);
+      expect(enable.stderr).toContain(`cannot enable MCP server claude ${server}: ${reason}`);
+    }
+    expect(fs.existsSync(approvalFilePath())).toBe(false);
+    expect(fs.existsSync(enabledFilePath())).toBe(false);
+  });
+
   test("declining to contact the endpoint makes no lookup and writes nothing", async () => {
     writeProjectOauthServer();
     const prompts = answers(false);

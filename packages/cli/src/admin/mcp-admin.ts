@@ -21,6 +21,7 @@ import {
   readMcpRules,
   type McpSourceScope,
   prepareMcpRuntime,
+  printable,
   revokeMcpApproval,
   saveMcpApproval,
   writeMcpRules,
@@ -241,12 +242,7 @@ export type McpEnableDeps = {
 
 type PlannedOAuthHost = McpEnabledHost & { alsoUser?: boolean };
 
-// Render text that came from MCP config or remote metadata: escape anything
-// that is not printable ASCII (control, C1, bidi, and other formatting
-// characters), so it cannot move the cursor or reorder the review.
-export function printable(value: string): string {
-  return value.replace(/[^\x20-\x7e]/g, (char) => `\\u{${(char.codePointAt(0) ?? 0).toString(16)}}`);
-}
+export { printable };
 
 // Quote one shell word for a printed command; plain words stay bare.
 function shellWord(value: string): string {
