@@ -167,7 +167,7 @@ function candidateArgv(rest: string): { argv: string[]; mention: boolean } | und
   // have their own rendering test).
   if (argv[0].includes("placeholder")) return undefined;
   // Prose follows, or the quoted fragment ends a sentence ("... after
-  // 'runfree mcp approve'."): a mention, not a presented next step.
+  // 'runfree mcp enable'."): a mention, not a presented next step.
   const mention = words.slice(consumed).some((word) => word !== "" && !word.startsWith("#"))
     || /[`'"][.,;]$/.test(words[consumed - 1] ?? "");
   return { argv, mention };

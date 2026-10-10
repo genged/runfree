@@ -37,6 +37,9 @@ export const remedy = {
   serviceEnableFromItem: (id: string): string => `runfree service enable ${id} --from-1password-item op://<vault>/<item>`,
   serviceEnableHelp: (): string => "runfree service enable --help",
   serviceExplain: (id: string): string => `runfree service explain ${id}`,
+  // `--source project` keeps the command exact when a user or local entry
+  // shares the server name.
+  mcpEnableProject: (agent: string, server: string): string => `runfree mcp enable ${agent} ${server} --source project`,
   credentialAdd: (name: string, host: string, source: string): string =>
     `runfree credential add ${name} --host ${host} --from-source ${source}`,
   credentialUnlink: (name: string, host: string): string => `runfree credential unlink ${name} --host ${host}`,
@@ -83,6 +86,7 @@ export function sampleRemedyRenderings(): string[] {
     remedy.serviceEnableFromItem("apple-ads"),
     remedy.serviceEnableHelp(),
     remedy.serviceExplain("github"),
+    remedy.mcpEnableProject("claude", "srv"),
     remedy.credentialAdd("github", "api.github.com", "github-cli"),
     remedy.credentialUnlink("github", "api.github.com"),
     remedy.imageApproveContext(),

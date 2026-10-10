@@ -41,6 +41,7 @@ import {
 import { mcpOAuthStateEpoch, updateMcpOAuthEpochs } from "./mcp-oauth-epochs.ts";
 import { RUNFREE_RUNTIME_TARGETS, workspaceMetadataTarget } from "./mount-target-policy.ts";
 import { sha256Hex, isRecord } from "../strict-primitives.ts";
+import { remedy } from "../remedies.ts";
 
 type TokenSource =
   | { source: "env"; env: string }
@@ -1743,7 +1744,7 @@ export function prepareMcpRuntime(options: McpPrepareOptions): McpPrepareResult 
     if (entry.source === "project" && entry.decision.status !== "approved") {
       const reason = entry.decision.reason ?? "project MCP requires approval";
       const suffix = entry.decision.status === "unapproved"
-        ? `; run runfree mcp approve ${entry.agent} ${entry.name}`
+        ? `; run ${remedy.mcpEnableProject(entry.agent, entry.name)}`
         : "";
       events.push({ kind: "skipped", scope: "project", agent: entry.agent, name: entry.name, detail: `reason=${reason}${suffix}` });
       continue;

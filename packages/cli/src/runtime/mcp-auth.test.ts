@@ -138,7 +138,7 @@ describe("MCP auth runtime", () => {
     const start = vi.fn();
 
     await expect(mcpAuthRuntime({ agent: "codex", server: "repo_tools", source: "project" }, context, fakeIo(), { start })).rejects.toThrow(
-      "project MCP server must be approved before auth: runfree mcp approve codex repo_tools",
+      "project MCP server must be approved before auth: runfree mcp enable codex repo_tools --source project",
     );
     expect(start).not.toHaveBeenCalled();
   });
@@ -182,7 +182,7 @@ describe("MCP auth runtime", () => {
     const start = vi.fn();
 
     await expect(mcpAuthRuntime({ agent: "codex", server: "repo_tools", source: "project" }, context, fakeIo(), { start })).rejects.toThrow(
-      "project MCP server must be approved before auth: runfree mcp approve codex repo_tools",
+      "project MCP server must be approved before auth: runfree mcp enable codex repo_tools --source project",
     );
     expect(start).not.toHaveBeenCalled();
   });

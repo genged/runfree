@@ -98,11 +98,11 @@ explicit approval on each machine:
 ```bash
 runfree mcp list
 runfree mcp explain claude my-server
-runfree mcp approve claude my-server --from-source op-token
+runfree mcp enable claude my-server --from-source op-token
 ```
 
 The same rule applies: committing an MCP entry proposes it. Static headers need
-a host-owned credential source, so approving still does not put a real token in
+a host-owned credential source, so enabling still does not put a real token in
 the repository or in the container.
 
 ## What not to do

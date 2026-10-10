@@ -270,7 +270,7 @@ Details: [Write Approval Grants](architecture.md#write-approval-grants).
 ### MCP
 
 1. Project entries from `.mcp.json` and `.codex/config.toml` load only after
-   `runfree mcp approve`.
+   `runfree mcp enable`.
 2. Claude gets a read-only approved config with strict MCP mode. This stops
    passive project descriptors at startup. It does not stop code already
    running in the agent from starting another binary or config.

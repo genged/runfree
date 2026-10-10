@@ -2143,25 +2143,18 @@ describe("admin credential/host/mcp commands", () => {
     const usage = await cliRefusal(runCommandApp(strictContext(), ["mcp"], runDefault));
     expect(usage.message).toBe("runfree mcp needs a subcommand");
     expect(usage.detail).toContain("runfree mcp list");
-    expect(usage.detail).toContain("runfree mcp approve");
+    expect(usage.detail).toContain("runfree mcp enable");
+    expect(usage.detail).not.toContain("runfree mcp approve");
     // A bare group prints only its own usage, never another group's or the full admin reference.
     expect(usage.detail).not.toContain("runfree credential source add");
     expect(usage.detail).not.toContain("runfree credential add");
     expect(usage.detail).not.toContain("runfree service enable");
-    await expect(runCommandApp(strictContext(), ["mcp", "approve", "claude"], runDefault)).rejects.toBeInstanceOf(
+    await expect(runCommandApp(strictContext(), ["mcp", "enable", "claude"], runDefault)).rejects.toBeInstanceOf(
       CliError,
     );
     await expect(
       runCommandApp(strictContext(), ["mcp", "revoke", "claude", "srv", "--bogus"], runDefault),
     ).rejects.toBeInstanceOf(CliError);
-    // Invalid agent is re-validated in the command module before enforcement.
-    await expect(
-      runCommandApp(strictContext(), ["mcp", "approve", "bogusagent", "srv"], runDefault),
-    ).rejects.toMatchObject({ message: expect.stringContaining("MCP agent must be claude or codex") });
-    // Conflicting credential sources are caught building the typed selection.
-    await expect(
-      runCommandApp(strictContext(), ["mcp", "approve", "claude", "srv", "--from-env", "X", "--from-source", "Y"], runDefault),
-    ).rejects.toMatchObject({ message: expect.stringContaining("choose only one credential source") });
     await expect(
       runCommandApp(strictContext(), ["mcp", "rules", "claude", "srv", "--write", "maybe"], runDefault),
     ).rejects.toBeInstanceOf(CliError);
@@ -2174,12 +2167,14 @@ describe("admin credential/host/mcp commands", () => {
     await expect(
       runCommandApp(strictContext(), ["mcp", "configure", "--agent", "bogusagent"], runDefault),
     ).rejects.toMatchObject({ message: expect.stringContaining("MCP agent must be claude or codex") });
+    // Invalid agent is re-validated in the command module before enforcement.
     await expect(
       runCommandApp(strictContext(), ["mcp", "enable", "bogusagent", "srv"], runDefault),
     ).rejects.toMatchObject({ message: expect.stringContaining("MCP agent must be claude or codex") });
     await expect(
       runCommandApp(strictContext(), ["mcp", "enable", "claude", "srv", "--source", "elsewhere"], runDefault),
     ).rejects.toMatchObject({ message: expect.stringContaining("--source must be user, local, or project") });
+    // Conflicting credential sources are caught building the typed selection.
     await expect(
       runCommandApp(strictContext(), ["mcp", "enable", "claude", "srv", "--from-env", "X", "--from-source", "Y"], runDefault),
     ).rejects.toMatchObject({ message: expect.stringContaining("choose only one credential source") });
@@ -2202,10 +2197,7 @@ describe("admin credential/host/mcp commands", () => {
       ),
     ).rejects.toThrow("adminContext() must not be called");
     await expect(
-      runCommandApp(strictContext(), ["mcp", "approve", "claude", "srv", "--from-env", "X"], runDefault),
-    ).rejects.toThrow("adminContext() must not be called");
-    await expect(
-      runCommandApp(strictContext(), ["mcp", "approve", "claude", "srv", "--login"], runDefault),
+      runCommandApp(strictContext(), ["mcp", "enable", "claude", "srv", "--source", "project", "--from-env", "X"], runDefault),
     ).rejects.toThrow("adminContext() must not be called");
     await expect(
       runCommandApp(strictContext(), ["mcp", "rules", "claude", "srv", "--source", "user", "--tool", "query", "--write", "allow"], runDefault),
@@ -2226,7 +2218,18 @@ describe("admin credential/host/mcp commands", () => {
     expect(runDefault).not.toHaveBeenCalled();
   });
 
-  test("mcp approve --login hands off to runtime auth only after approval succeeds", async () => {
+  // `runfree mcp approve` was removed outright; `mcp enable` replaces it. No
+  // alias may parse, with or without arguments.
+  test("mcp approve is an unknown command", async () => {
+    const runDefault = vi.fn(async () => 0);
+    for (const argv of [["mcp", "approve"], ["mcp", "approve", "claude", "srv"], ["mcp", "approve", "claude", "srv", "--from-env", "X"]]) {
+      const refusal = await cliRefusal(runCommandApp(strictContext(), argv, runDefault));
+      expect(refusal.message).toMatch(/^Unknown arguments?: (?:.*, )?approve(?:,|$)/);
+    }
+    expect(runDefault).not.toHaveBeenCalled();
+  });
+
+  test("mcp enable reaches runtime activation only after the approval is saved", async () => {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "runfree-mcp-login-command-"));
     tempDirs.push(tmp);
     const projectRoot = path.join(tmp, "project");
@@ -2274,8 +2277,10 @@ describe("admin credential/host/mcp commands", () => {
     });
 
     await expect(
-      runCommandApp(context, ["mcp", "approve", "codex", "repo_tools", "--login"], runDefault),
+      runCommandApp(context, ["mcp", "enable", "codex", "repo_tools", "--source", "project", "--no-discover"], runDefault),
     ).rejects.toThrow("runtimeContext() called after approval");
+    const approvals = JSON.parse(fs.readFileSync(path.join(stateDir, "approved-mcp.json"), "utf8")) as unknown;
+    expect(JSON.stringify(approvals)).toContain("repo_tools");
     expect(runDefault).not.toHaveBeenCalled();
   });
 });

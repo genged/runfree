@@ -14,6 +14,7 @@ import {
 import { startRuntime, type RuntimeStartResult } from "./startup.ts";
 import { disposeLaunchHandoff, preparedRuntimeContext } from "./prepared-runtime.ts";
 import type { RuntimeContext, RuntimeIO } from "./types.ts";
+import { remedy } from "../remedies.ts";
 
 export type McpAuthInput = {
   agent: McpAgent;
@@ -65,7 +66,7 @@ function resolveMcpAuthEntry(input: McpAuthInput, context: RuntimeContext): McpI
     die(`cannot authenticate MCP server ${entry.agent} ${entry.name}: ${entry.decision.reason ?? entry.decision.status}`);
   }
   if (entry.source === "project" && entry.decision.status !== "approved") {
-    die(`project MCP server must be approved before auth: runfree mcp approve ${entry.agent} ${entry.name}`);
+    die(`project MCP server must be approved before auth: ${remedy.mcpEnableProject(entry.agent, entry.name)}`);
   }
   if (entry.transport === "stdio") {
     die(`no OAuth login is available for stdio MCP server ${entry.agent} ${entry.name}`);

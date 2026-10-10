@@ -223,12 +223,14 @@ describe("ingress forwarders are loopback-only, one-way, per-session, and torn d
 
   /**
    * Makes the project's runtime MCP OAuth policy carry a server, the way a
-   * user does: approve the project's public HTTP MCP server, then start.
+   * user does: enable the project's public HTTP MCP server, then start.
+   * Without a terminal, enable needs --no-discover; it saves the approval and
+   * selects the approved controls before the runtime starts.
    */
   function ensureMcpOAuthEligible(): void {
     if (mcpEligible) return;
-    const approved = fixture.runfree(["mcp", "approve", "claude", MCP_FIXTURE_SERVER]);
-    expect(approved.status, `mcp approve failed: ${describeOutput(approved.output, 4000)}`).toBe(0);
+    const approved = fixture.runfree(["mcp", "enable", "claude", MCP_FIXTURE_SERVER, "--source", "project", "--no-discover", "--no-login"]);
+    expect(approved.status, `mcp enable failed: ${describeOutput(approved.output, 4000)}`).toBe(0);
     upWithExactApprovals(fixture);
     mcpEligible = true;
   }

@@ -34,7 +34,7 @@ and Runfree has published an immutable effective policy generation. Starting
 built-in Claude or Codex first offers its credentialless native operational
 service without overwriting stricter user write rules. Other policy changes are
 explicit host-side commands such as `runfree service enable`, `runfree host
-add`, `runfree credential add`, and `runfree mcp approve`.
+add`, `runfree credential add`, and `runfree mcp enable`.
 
 ## What Runfree Provides
 

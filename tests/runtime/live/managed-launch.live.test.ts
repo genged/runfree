@@ -249,8 +249,10 @@ describe("managed built-in launch", () => {
 
   describe("one-shot launches (no standing session)", () => {
     test("mcp auth uses the same managed Claude adapter and strict MCP argv", () => {
-      const approved = fixture.runfree(["mcp", "approve", "claude", "hostSentinel"]);
-      expect(approved.status, `mcp approve failed: ${describeOutput(approved.output)}`).toBe(0);
+      // Without a terminal, an OAuth-capable HTTP server is enabled with
+      // --no-discover: no network call, no login prompt.
+      const approved = fixture.runfree(["mcp", "enable", "claude", "hostSentinel", "--source", "project", "--no-discover", "--no-login"]);
+      expect(approved.status, `mcp enable failed: ${describeOutput(approved.output)}`).toBe(0);
       // Truncate first so the recorded line is unambiguously this launch's.
       fs.writeFileSync(path.join(fixture.projectRoot, MANAGED_CLAUDE_ARGV_RELATIVE_PATH), "");
       // The real Claude has no credentials and exits non-zero; the launch's exit

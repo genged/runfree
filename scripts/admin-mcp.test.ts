@@ -10,7 +10,6 @@ import type { McpEnableInput } from "../packages/cli/src/admin/admin-core.ts";
 import { printable } from "../packages/cli/src/admin/mcp-admin.ts";
 import type { DiscoveryDeps } from "../packages/cli/src/admin/mcp-discovery.ts";
 import {
-  mcpApproveIntent,
   mcpConfigureIntent,
   mcpEnableIntent,
   mcpExplainIntent,
@@ -342,14 +341,14 @@ describe("admin MCP runtime preparation", () => {
     ].join("\n"));
   });
 
-  test("mcp approve stores project approval outside the project and prepare imports approved public HTTP MCP", async () => {
+  test("mcp enable stores project approval outside the project and prepare imports approved public HTTP MCP", async () => {
     fs.writeFileSync(path.join(projectRoot, ".mcp.json"), JSON.stringify({
       mcpServers: {
         repoTools: { type: "http", url: "https://repo.example.com/mcp" },
       },
     }));
 
-    const approve = await runAdmin(() => mcpApproveIntent({ agent: parseMcpAgent("claude"), server: "repoTools", tokenSource: { kind: "none" }, replaceSource: false }));
+    const approve = await runAdmin(() => enableProjectNoTty("repoTools"));
     expect(approve.status, approve.stderr).toBe(0);
     expect(approve.stdout).toContain("approved project MCP server: claude repoTools");
     expect(fs.existsSync(path.join(projectRoot, ".runfree/approved-mcp.json"))).toBe(false);
@@ -402,7 +401,7 @@ describe("admin MCP runtime preparation", () => {
     });
 
     expect(result.status).toBe(1);
-    expect(result.stderr).toContain("runfree mcp configure requires a TTY; use runfree mcp list/approve/rules for scripts");
+    expect(result.stderr).toContain("runfree mcp configure requires a TTY; for scripts use mcp list, mcp enable, and mcp rules");
     expect(fs.readFileSync(path.join(projectRoot, ".runfree/network-policy.json"), "utf8")).toBe(before);
   });
 
@@ -465,7 +464,7 @@ describe("admin MCP runtime preparation", () => {
         repoTools: { type: "http", url: "https://repo.example.com/mcp" },
       },
     }));
-    expect((await runAdmin(() => mcpApproveIntent({ agent: parseMcpAgent("claude"), server: "repoTools", tokenSource: { kind: "none" }, replaceSource: false }))).status).toBe(0);
+    expect((await runAdmin(() => enableProjectNoTty("repoTools"))).status).toBe(0);
     fs.writeFileSync(path.join(projectRoot, ".mcp.json"), JSON.stringify({
       mcpServers: {
         repoTools: { type: "http", url: "https://changed.example.com/mcp" },
@@ -485,7 +484,7 @@ describe("admin MCP runtime preparation", () => {
         repoTools: { type: "http", url: "https://repo.example.com/mcp" },
       },
     }));
-    expect((await runAdmin(() => mcpApproveIntent({ agent: parseMcpAgent("claude"), server: "repoTools", tokenSource: { kind: "none" }, replaceSource: false }))).status).toBe(0);
+    expect((await runAdmin(() => enableProjectNoTty("repoTools"))).status).toBe(0);
     const projectStateDir = path.join(projectRoot, ".runfree");
     fs.mkdirSync(projectStateDir, { recursive: true });
     fs.copyFileSync(path.join(stateDir, "approved-mcp.json"), path.join(projectStateDir, "approved-mcp.json"));
@@ -511,10 +510,14 @@ describe("admin MCP runtime preparation", () => {
       },
     }));
 
-    const result = await runAdmin(() => mcpApproveIntent({ agent: parseMcpAgent("claude"), server: "repoTools", tokenSource: { kind: "none" }, replaceSource: false }));
+    const result = await runAdmin(() => enableProjectNoTty("repoTools"));
 
     expect(result.status).toBe(1);
     expect(result.stderr).toContain("static project MCP credentials require --from-env, --from-1password, or --from-source");
+    // Refused before any write: no approval and no credential source.
+    expect(fs.existsSync(path.join(stateDir, "approved-mcp.json"))).toBe(false);
+    const tokensFile = path.join(home, ".config/runfree/projects", projectHash(projectRoot), "tokens.json");
+    expect(fs.existsSync(tokensFile) ? readTokenConfig() : {}).toEqual({});
   });
 
   test("project static-header MCP approval binds credential source and prepare omits header from generated config", async () => {
@@ -528,7 +531,7 @@ describe("admin MCP runtime preparation", () => {
       },
     }));
 
-    const approve = await runAdmin(() => mcpApproveIntent({ agent: parseMcpAgent("claude"), server: "repoTools", tokenSource: { kind: "env", env: "REPO_MCP_TOKEN" }, replaceSource: false }), {
+    const approve = await runAdmin(() => enableProjectNoTty("repoTools", { kind: "env", env: "REPO_MCP_TOKEN" }), {
       REPO_MCP_TOKEN: "host-secret",
     });
     expect(approve.status, approve.stderr).toBe(0);
@@ -556,7 +559,7 @@ describe("admin MCP runtime preparation", () => {
       },
     }));
 
-    const approve = await runAdmin(() => mcpApproveIntent({ agent: parseMcpAgent("claude"), server: "repoTools", tokenSource: { kind: "env", env: "REPO_MCP_TOKEN" }, replaceSource: false }), {
+    const approve = await runAdmin(() => enableProjectNoTty("repoTools", { kind: "env", env: "REPO_MCP_TOKEN" }), {
       REPO_MCP_TOKEN: "host-secret",
     });
     expect(approve.status, approve.stderr).toBe(0);
@@ -582,7 +585,7 @@ describe("admin MCP runtime preparation", () => {
       },
     }));
 
-    const approve = await runAdmin(() => mcpApproveIntent({ agent: parseMcpAgent("claude"), server: "repoOauth", tokenSource: { kind: "none" }, replaceSource: false }));
+    const approve = await runAdmin(() => enableProjectNoTty("repoOauth"));
     expect(approve.status, approve.stderr).toBe(0);
     const prepare = await runAdmin(() => prepareRuntime());
 
@@ -613,7 +616,7 @@ describe("admin MCP runtime preparation", () => {
       },
     }));
 
-    const approve = await runAdmin(() => mcpApproveIntent({ agent: parseMcpAgent("claude"), server: "repoTools", tokenSource: { kind: "none" }, replaceSource: false }));
+    const approve = await runAdmin(() => enableProjectNoTty("repoTools"));
     expect(approve.status, approve.stderr).toBe(0);
     const prepare = await runAdmin(() => prepareRuntime());
 
@@ -635,10 +638,11 @@ describe("admin MCP runtime preparation", () => {
       },
     }));
 
-    const result = await runAdmin(() => mcpApproveIntent({ agent: parseMcpAgent("claude"), server: "repoTools", tokenSource: { kind: "env", env: "REPO_MCP_TOKEN" }, replaceSource: false }));
+    const result = await runAdmin(() => enableProjectNoTty("repoTools", { kind: "env", env: "REPO_MCP_TOKEN" }));
 
     expect(result.status).toBe(1);
     expect(result.stderr).toContain("--from-* is only valid for static-header project MCP servers");
+    expect(fs.existsSync(path.join(stateDir, "approved-mcp.json"))).toBe(false);
   });
 
   test("mcp explain shows project approval decision and descriptor digest", async () => {
@@ -654,7 +658,7 @@ describe("admin MCP runtime preparation", () => {
     expect(result.stdout).toContain("source: project");
     expect(result.stdout).toContain("status: unapproved");
     expect(result.stdout).toContain("digest:");
-    expect(result.stdout).toContain("approve: runfree mcp approve claude repoTools");
+    expect(result.stdout).toContain("enable: runfree mcp enable claude repoTools --source project");
     expect(result.stdout).toContain("repo.example.com");
   });
 
@@ -691,7 +695,7 @@ describe("admin MCP runtime preparation", () => {
         repoTools: { type: "http", url: "https://repo.example.com/mcp" },
       },
     }));
-    expect((await runAdmin(() => mcpApproveIntent({ agent: parseMcpAgent("claude"), server: "repoTools", tokenSource: { kind: "none" }, replaceSource: false }))).status).toBe(0);
+    expect((await runAdmin(() => enableProjectNoTty("repoTools"))).status).toBe(0);
     const revoke = await runAdmin(() => { mcpRevokeIntent({ agent: parseMcpAgent("claude"), server: "repoTools" }); });
     expect(revoke.status, revoke.stderr).toBe(0);
     expect(revoke.stdout).toContain("revoked project MCP server: claude repoTools");
@@ -709,7 +713,7 @@ describe("admin MCP runtime preparation", () => {
         repoTools: { type: "http", url: "https://repo.example.com/mcp" },
       },
     }));
-    expect((await runAdmin(() => mcpApproveIntent({ agent: parseMcpAgent("claude"), server: "repoTools", tokenSource: { kind: "none" }, replaceSource: false }))).status).toBe(0);
+    expect((await runAdmin(() => enableProjectNoTty("repoTools"))).status).toBe(0);
     fs.rmSync(mcpPath);
 
     const revoke = await runAdmin(() => { mcpRevokeIntent({ agent: parseMcpAgent("claude"), server: "repoTools" }); });
@@ -730,10 +734,11 @@ describe("admin MCP runtime preparation", () => {
       },
     }));
 
-    const approve = await runAdmin(() => mcpApproveIntent({ agent: parseMcpAgent("claude"), server: "repoTools", tokenSource: { kind: "none" }, replaceSource: false }));
+    const approve = await runAdmin(() => enableProjectNoTty("repoTools"));
 
     expect(approve.status).toBe(1);
     expect(approve.stderr).toContain("conflicts with an imported user MCP server");
+    expect(fs.existsSync(path.join(stateDir, "approved-mcp.json"))).toBe(false);
   });
 
   test("prepare leaves the callback port to the session for OAuth-capable Claude servers and registers public servers as OAuth resources", async () => {
@@ -1156,6 +1161,22 @@ function enableInput(overrides: Partial<McpEnableInput> = {}): McpEnableInput {
     interactive: true,
     ...overrides,
   };
+}
+
+// `runfree mcp enable <agent> <server> --source project --no-discover` without a
+// terminal: the command line names every change, so it applies without a
+// prompt and makes no network call.
+async function enableProjectNoTty(server: string, tokenSource: McpEnableInput["tokenSource"] = { kind: "none" }): Promise<void> {
+  await mcpEnableIntent({
+    agent: parseMcpAgent("claude"),
+    server,
+    source: "project",
+    tokenSource,
+    replaceSource: false,
+    oauthHosts: [],
+    discover: false,
+    interactive: false,
+  });
 }
 
 function answers(...values: boolean[]): { confirm: (message: string) => Promise<boolean>; asked: string[] } {

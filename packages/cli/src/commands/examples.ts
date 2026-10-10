@@ -157,7 +157,7 @@ export const COMMAND_EXAMPLES = {
     { cmd: "runfree mcp explain claude my-server", blurb: "Show the normalized descriptor and import decision" },
     { cmd: "runfree mcp enable claude my-server", blurb: "Approve a server, its OAuth hosts, and its login in one review" },
     { cmd: "runfree mcp enable claude my-server --no-discover --oauth-host auth.example.com", blurb: "Name the OAuth hosts yourself; no network call" },
-    { cmd: "runfree mcp approve claude my-server --from-source op-token", blurb: "Approve a project-local server" },
+    { cmd: "runfree mcp enable claude my-server --source project --from-source op-token", blurb: "Enable a static-header project server with a saved credential source" },
     { cmd: "runfree mcp auth claude my-server", blurb: "Run MCP OAuth login inside the validated runtime" },
     { cmd: "runfree mcp rules claude my-server --tool create_issue --write ask", blurb: "Hold one side-effecting tool for approval" },
     { cmd: "runfree mcp revoke claude my-server", blurb: "Remove the approval and the OAuth hosts mcp enable added" },

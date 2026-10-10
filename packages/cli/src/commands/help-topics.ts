@@ -167,14 +167,13 @@ Runfree import and project approval:
   runfree mcp list [--json]
   runfree mcp configure [--agent <agent>]... [--server <name>]
   runfree mcp explain <agent> <server> [--source user|local|project]
-  runfree mcp enable <agent> <server> [--source user|local|project] [--oauth-host <host>]... [--no-discover] [--no-login] [--from-env ENV | --from-1password op://... | --from-source <name>]
-  runfree mcp approve <agent> <server> [--from-env ENV | --from-1password op://... | --from-source <name>] [--login]
+  runfree mcp enable <agent> <server> [--source user|local|project] [--oauth-host <host>]... [--no-discover] [--no-login] [--from-env ENV | --from-1password op://... | --from-source <name> | --from-stdin] [--replace-source]
   runfree mcp auth <agent> <server> [--source user|local|project]
   runfree mcp rules <agent> <server> [--tool <tool>] [--write allow|ask|deny]
   runfree mcp revoke <agent> <server> [--source user|local|project]
 
 Project .mcp.json and .codex/config.toml entries are imported only after
-project-local approval. Agent IDs are claude (Claude Code) and codex (Codex CLI).
+project-local approval with mcp enable. Agent IDs are claude (Claude Code) and codex (Codex CLI).
 Static headers require a host-owned credential source. mcp enable shows one
 review for the approval, the server's OAuth hosts, and the credential source;
 mcp revoke removes exactly the OAuth hosts that mcp enable added.`;
@@ -476,10 +475,9 @@ MCP servers:
                                   Configure MCP imports and tool-call rules interactively
   runfree mcp explain <agent> <server> [--source user|local|project] [--json]
                                   Show the normalized descriptor and import/approval decision
-  runfree mcp enable <agent> <server> [--source user|local|project] [--oauth-host <host>]... [--no-discover] [--no-login] [--from-env ENV | --from-1password op://... | --from-source <name>] [--replace-source]
-                                  Enable a server in one review: approval, OAuth hosts (discovered or named), credential source, then login
-  runfree mcp approve <agent> <server> [--from-env ENV | --from-1password op://... | --from-source <name> | --from-stdin] [--replace-source] [--login]
-                                  Approve a project-local MCP server; static headers require a host-owned credential source
+  runfree mcp enable <agent> <server> [--source user|local|project] [--oauth-host <host>]... [--no-discover] [--no-login] [--from-env ENV | --from-1password op://... | --from-source <name> | --from-stdin] [--replace-source]
+                                  Enable a server in one review: approval, OAuth hosts (discovered or named), credential source, then login;
+                                  static headers on a project server require a host-owned credential source
   runfree mcp auth <agent> <server> [--source user|local|project]
                                   Run agent-native MCP OAuth login inside the validated runtime
   runfree mcp rules <agent> <server> [--source user|local|project] [--tool <tool>] [--write allow|ask|deny]
@@ -488,7 +486,7 @@ MCP servers:
                                   Remove project-local MCP approval and the OAuth hosts mcp enable added, without editing project files
       Runfree imports supported host MCP entries when the sandbox starts and writes sanitized per-agent config.
       Agent IDs are claude (Claude Code) and codex (Codex CLI); configure --agent is repeatable.
-      Project .mcp.json and .codex/config.toml entries are imported only after runfree mcp approve.
+      Project .mcp.json and .codex/config.toml entries are imported only after runfree mcp enable.
 
 Proxy and diagnostics:
   runfree runtime reload-policy [--force]  Reload runtime policy and sync credentials; a proxy restart refuses live sessions unless --force

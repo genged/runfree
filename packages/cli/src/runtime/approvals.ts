@@ -45,6 +45,7 @@ import {
   type McpInventoryEntry,
 } from "./mcp.ts";
 import type { CaptureResult, RuntimeContext, RuntimeIO } from "./types.ts";
+import { remedy } from "../remedies.ts";
 
 const WATCH_POLL_MS = 1_000;
 const WATCH_HEARTBEAT_MS = 10_000;
@@ -506,7 +507,7 @@ function mcpRuleEntryForApproval(record: PendingApprovalRecord, context: Runtime
   }
   const entry = matches[0];
   if (entry.source === "project" && entry.decision.status !== "approved") {
-    die(`cannot save MCP rules for unapproved project MCP server: runfree mcp approve ${entry.agent} ${entry.name}`);
+    die(`cannot save MCP rules for unapproved project MCP server: ${remedy.mcpEnableProject(entry.agent, entry.name)}`);
   }
   if (!entry.endpoint || !entry.mcpPolicy) {
     die("saved MCP rules apply only to HTTP MCP servers imported through the proxy");

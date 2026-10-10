@@ -125,10 +125,10 @@ function runOk(fixture: LiveFixture, args: readonly string[]): CaptureResult {
   return result;
 }
 
-/** The project state dir, read from the approval path `mcp approve` prints. */
-function stateDirFrom(approveOutput: string): string {
-  const line = approveOutput.split("\n").find((candidate) => candidate.startsWith("approval: "));
-  if (!line) throw new Error(`mcp approve printed no approval path: ${describeOutput(approveOutput)}`);
+/** The project state dir, read from the approval path `mcp enable` prints. */
+function stateDirFrom(enableOutput: string): string {
+  const line = enableOutput.split("\n").find((candidate) => candidate.startsWith("approval: "));
+  if (!line) throw new Error(`mcp enable printed no approval path: ${describeOutput(enableOutput)}`);
   return path.dirname(line.slice("approval: ".length).trim());
 }
 
@@ -165,9 +165,10 @@ describe("one-step MCP enable and exact revoke", () => {
     let enableOutput: string;
 
     beforeAll(async () => {
-      // The second server: approved, with a record in the shape a reviewed
-      // discovery writes (discovered origin, exact endpoints).
-      const approved = runOk(fixture, ["mcp", "approve", "claude", NARROW_SERVER]);
+      // The second server: approved (enable with no OAuth hosts writes no
+      // record), then given a record in the shape a reviewed discovery writes
+      // (discovered origin, exact endpoints).
+      const approved = runOk(fixture, ["mcp", "enable", "claude", NARROW_SERVER, "--source", "project", "--no-discover", "--no-login"]);
       stateDir = stateDirFrom(approved.stdout);
       const identity = `project:claude:${NARROW_SERVER}:${descriptorDigest(fixture, NARROW_SERVER)}`;
       const enabledPath = path.join(stateDir, "mcp-enabled.json");

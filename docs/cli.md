@@ -483,8 +483,6 @@ runfree mcp explain claude my-server --source project --json
 runfree mcp enable claude my-server
 runfree mcp enable claude my-server --no-discover --oauth-host auth.example.com --no-login
 runfree mcp enable claude my-server --from-source op-token
-runfree mcp approve claude my-server --from-source op-token
-runfree mcp approve claude my-server --login
 runfree mcp auth claude my-server
 runfree mcp rules claude my-server
 runfree mcp rules claude my-server --tool create_issue --write ask
@@ -518,8 +516,8 @@ callback port works only while its session holds the project's first port.
 review lists every change:
 
 - the project approval (project entries);
-- the credential source (static-header entries; the same `--from-*` flags as
-  `mcp approve`);
+- the credential source (static-header entries; `--from-env`,
+  `--from-1password`, `--from-source`, or `--from-stdin`);
 - the MCP endpoint host;
 - each OAuth host, with where it came from: `discovered` (and the metadata
   that named it) or `--oauth-host`.
@@ -562,6 +560,8 @@ server gets at most 30 such reads a minute; after that, they need approval.
 | `--oauth-host <host>` | Also allow this exact host for the server (repeatable). It is allowed as given, like `runfree host add`. |
 | `--no-discover` | Make no network call. Use only `--oauth-host` hosts. |
 | `--no-login` | Do not run the OAuth login after enabling. |
+| `--from-env`, `--from-1password`, `--from-source`, `--from-stdin` | Bind a project entry's static header to a host-owned credential source. Choose one. |
+| `--replace-source` | Replace an existing credential source for this server. |
 
 Discovery needs a terminal. Without one, `mcp enable` refuses before any DNS
 lookup unless you pass `--no-discover`; then the command line names every

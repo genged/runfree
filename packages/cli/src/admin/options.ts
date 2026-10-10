@@ -14,7 +14,6 @@ export {
   type DomainExplainInput,
   type DomainRemoveInput,
   type DomainRulesInput,
-  type McpApproveInput,
   type McpConfigureInput,
   type McpEnableInput,
   type McpExplainInput,
@@ -75,7 +74,6 @@ export {
   serviceUndefineIntent,
 } from "./service-policy.ts";
 export {
-  mcpApproveIntent,
   mcpConfigureIntent,
   type McpEnableDeps,
   mcpEnableIntent,

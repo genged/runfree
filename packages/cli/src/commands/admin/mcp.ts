@@ -1,5 +1,5 @@
-// `runfree mcp <list|explain|approve|enable|revoke>` — Runfree import and project-local
-// approval of MCP servers.
+// `runfree mcp <list|configure|explain|enable|auth|rules|revoke>` — Runfree
+// import, project-local approval, and enabling of MCP servers.
 //
 // Typed end-to-end: the yargs module converts argv into a typed intent and calls
 // the shared MCP enforcement (which re-validates credential sources, descriptor
@@ -12,12 +12,10 @@ import { createAdminState } from "../../admin/context.ts";
 import { activateApprovedControlsAfterMutation } from "../../control/activation.ts";
 import { activationReportLine } from "../../control/activation-report.ts";
 import {
-  type McpApproveInput,
   type McpConfigureInput,
   type McpEnableInput,
   type McpEnableResult,
   type McpRulesInput,
-  mcpApproveIntent,
   mcpConfigureIntent,
   mcpEnableIntent,
   mcpExplainIntent,
@@ -56,21 +54,13 @@ type EnableArgs = AgentServerArgs & {
   "from-stdin"?: boolean;
   "replace-source"?: boolean;
 };
-type ApproveArgs = AgentServerArgs & {
-  "from-env"?: string;
-  "from-1password"?: string;
-  "from-source"?: string;
-  "from-stdin"?: boolean;
-  login?: boolean;
-  "replace-source"?: boolean;
-};
 
 const agentServerPositionals = (cmd: Argv): Argv =>
   cmd
     .positional("agent", { type: "string", demandOption: true, describe: `Agent ID that owns the server (${MCP_AGENT_IDS.join(" or ")})` })
     .positional("server", { type: "string", demandOption: true, describe: "MCP server name" });
 
-function approveTokenSource(argv: ArgumentsCamelCase<ApproveArgs | EnableArgs>): McpApproveInput["tokenSource"] {
+function credentialSourceArgs(argv: ArgumentsCamelCase<EnableArgs>): McpEnableInput["tokenSource"] {
   return credentialSourceSelectionFromArgs({
     env: argv["from-env"],
     onePassword: argv["from-1password"],
@@ -87,7 +77,7 @@ export const mcpCommand: CommandModule = {
       runAdminAction(createAdminState(context.adminContext()), action);
     return parser.command(
       "mcp",
-      "Import and approve MCP servers",
+      "Import and enable MCP servers",
       (mcp) => {
         // Each handler builds the typed intent FIRST (so a parse/validation
         // failure fails before any admin-state setup or project init), then
@@ -115,7 +105,7 @@ export const mcpCommand: CommandModule = {
                   describe: `Include only this agent ID (repeatable; ${MCP_AGENT_IDS.join(" or ")})`,
                 })
                 .option("server", { type: "string", requiresArg: true, describe: "Limit to one MCP server name" })
-                .epilogue("Non-interactive scripts should use runfree mcp list/approve/rules/auth directly."),
+                .epilogue("Non-interactive scripts should use mcp list, mcp enable, mcp rules, and mcp auth directly."),
             handler((argv: ArgumentsCamelCase<ConfigureArgs>) => {
               const intent: McpConfigureInput = {
                 agents: argv.agent?.map((agent) => parseMcpAgent(agent)),
@@ -149,36 +139,6 @@ export const mcpCommand: CommandModule = {
             }),
           )
           .command(
-            "approve <agent> <server>",
-            "Approve a project-local MCP server and optionally bind a credential",
-            (cmd) =>
-              agentServerPositionals(cmd)
-                .option("from-env", { type: "string", requiresArg: true, group: TOKEN_SOURCE_GROUP, describe: "Read the token from this host env var" })
-                .option("from-1password", { type: "string", requiresArg: true, group: TOKEN_SOURCE_GROUP, describe: "Read the token from a 1Password secret ref (op://...)" })
-                .option("from-source", { type: "string", requiresArg: true, group: TOKEN_SOURCE_GROUP, describe: "Bind a previously-saved host-owned source" })
-                .option("from-stdin", { type: "boolean", group: TOKEN_SOURCE_GROUP, describe: "Read the token from stdin" })
-                .option("login", { type: "boolean", describe: "After approval, start the validated runtime and run MCP OAuth login for this server" })
-                .option("replace-source", { type: "boolean", describe: "Overwrite an existing credential source for this server" })
-                .epilogue("Static headers require a host-owned credential source; the real token never enters the agent."),
-            handler((argv: ArgumentsCamelCase<ApproveArgs>) => {
-              const intent: McpApproveInput = {
-                agent: parseMcpAgent(argv.agent),
-                server: argv.server,
-                tokenSource: approveTokenSource(argv),
-                replaceSource: Boolean(argv["replace-source"]),
-              };
-              return (async () => {
-                const status = await run(() => mcpApproveIntent(intent));
-                if (status !== 0 || !argv.login) return status;
-                return mcpAuthRuntime({
-                  agent: intent.agent,
-                  server: intent.server,
-                  source: "project",
-                }, context.runtimeContext(), nodeRuntimeIO);
-              })();
-            }),
-          )
-          .command(
             "enable <agent> <server>",
             "Enable an MCP server in one review: approval, OAuth hosts, and credential source",
             (cmd) =>
@@ -208,7 +168,7 @@ export const mcpCommand: CommandModule = {
                 agent: parseMcpAgent(argv.agent),
                 server: argv.server,
                 source: parseMcpSource(argv.source),
-                tokenSource: approveTokenSource(argv),
+                tokenSource: credentialSourceArgs(argv),
                 replaceSource: Boolean(argv["replace-source"]),
                 oauthHosts: argv["oauth-host"] ?? [],
                 discover: !argv["no-discover"],
@@ -299,7 +259,7 @@ export const mcpCommand: CommandModule = {
             }),
           );
         return withExamples(built, "mcp")
-          .epilogue("Project .mcp.json / .codex/config.toml entries are imported only after 'runfree mcp approve'.")
+          .epilogue("Project .mcp.json / .codex/config.toml entries are imported only after 'runfree mcp enable'.")
           .demandCommand(1);
       },
       () => {},

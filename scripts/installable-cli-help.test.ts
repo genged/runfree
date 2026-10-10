@@ -117,7 +117,7 @@ describe("installable runfree CLI: help and usage", () => {
       "codex mcp",
       "runfree mcp list [--json]",
       "runfree mcp explain <agent> <server>",
-      "runfree mcp approve <agent> <server>",
+      "runfree mcp enable <agent> <server>",
       "runfree mcp revoke <agent> <server>",
       "Runfree imports supported host MCP entries when the sandbox starts",
       "runfree runtime reload-policy",
@@ -203,9 +203,9 @@ describe("installable runfree CLI: help and usage", () => {
     // The value of native per-command help is that every option is documented
     // under its group with a description. Guard the flagship credential command
     // so a dropped describe/group regresses loudly (it otherwise passes silently).
-    const help = runCliInProject(["mcp", "approve", "--help"]);
+    const help = runCliInProject(["mcp", "enable", "--help"]);
     expect(help.status, help.stderr).toBe(0);
-    expect(help.stdout).toContain("runfree mcp approve <agent> <server>");
+    expect(help.stdout).toContain("runfree mcp enable <agent> <server>");
     expect(help.stdout).toContain("Credential source (choose at most one):");
     expect(help.stdout).toContain("--from-env");
     expect(help.stdout).toContain("Read the token from this host env var");

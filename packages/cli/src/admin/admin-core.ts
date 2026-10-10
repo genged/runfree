@@ -3389,7 +3389,6 @@ export type ServiceConfigureInput = { id: string; reloadProxy: boolean };
 // --- MCP: typed intents + enforcement ----------------------------------------
 
 export type McpExplainInput = { agent: McpAgent; server: string; source?: McpSourceScope; json: boolean };
-export type McpApproveInput = { agent: McpAgent; server: string; tokenSource: TokenSourceSelection; replaceSource: boolean };
 export type McpConfigureInput = { agents?: McpAgent[]; server?: string };
 export type McpRevokeInput = { agent: McpAgent; server: string; source?: McpSourceScope };
 export type McpEnableInput = {

@@ -64,7 +64,7 @@ const helpInvocations: readonly (readonly string[])[] = [
     "credential sync", "credential source add", "credential source list", "credential source show",
     "credential source remove", "service list", "service enable", "service disable",
     "service explain", "service configure", "service diff", "service custom add",
-    "service custom remove", "mcp list", "mcp configure", "mcp explain", "mcp approve", "mcp enable",
+    "service custom remove", "mcp list", "mcp configure", "mcp explain", "mcp enable",
     "mcp auth", "mcp rules", "mcp revoke",
   ].map((command) => [...command.split(" "), "--help"]),
 ];

@@ -38,6 +38,7 @@ import {
 } from "../runtime/mcp-enabled.ts";
 import { mcpOAuthEpochsPath, mcpOAuthStateEpoch, updateMcpOAuthEpochs } from "../runtime/mcp-oauth-epochs.ts";
 import { atomicReplaceFile } from "../safe-fs.ts";
+import { remedy } from "../remedies.ts";
 import {
   checkPolicyHostname,
   type DiscoveryDeps,
@@ -54,7 +55,6 @@ import {
   ensureStateDirs,
   loadPolicy,
   loadTokenConfig,
-  type McpApproveInput,
   type McpConfigureInput,
   type McpEnableInput,
   type McpExplainInput,
@@ -67,6 +67,7 @@ import {
   saveTokenSource,
   stateDir,
   tokenSourceFromSelection,
+  type TokenSourceSelection,
 } from "./admin-core.ts";
 
 export type McpConfigureResult = {
@@ -155,7 +156,7 @@ type StaticCredentialPlan = {
 // refusal happens here; `apply` only writes.
 function planProjectCredentialSource(
   entry: McpInventoryEntry,
-  input: Pick<McpApproveInput, "tokenSource" | "replaceSource">,
+  input: Pick<McpEnableInput, "tokenSource" | "replaceSource">,
 ): StaticCredentialPlan {
   const hasSource = input.tokenSource.kind !== "none";
   if (entry.auth !== "static") {
@@ -200,15 +201,17 @@ function assertApprovableProjectEntry(entry: McpInventoryEntry): void {
   }
 }
 
-export function mcpApproveIntent(input: McpApproveInput): void {
-  const { agent, server: serverName } = input;
+// The "Approve project server" choice of `runfree mcp configure`: approve one
+// project entry and bind its credential source. It writes no OAuth host
+// record, so an earlier `mcp enable` record stays as it was.
+function approveProjectMcpServer(agent: McpAgent, serverName: string, tokenSource: TokenSourceSelection): void {
   const approvalFile = mcpApprovalPath(stateDir());
   const entry = findMcpEntry(agent, serverName, "project");
   assertApprovableProjectEntry(entry);
-  planProjectCredentialSource(entry, input).apply();
+  planProjectCredentialSource(entry, { tokenSource, replaceSource: false }).apply();
 
   const approval = saveMcpApproval(projectRoot(), approvalFile, entry);
-  console.log(`approved project MCP server: ${agent} ${serverName}`);
+  console.log(`approved project MCP server: ${agent} ${printable(serverName)}`);
   console.log(`approval: ${approvalFile}`);
   console.log(`digest: ${approval.digest}`);
 }
@@ -310,8 +313,9 @@ export async function mcpEnableIntent(input: McpEnableInput, deps: McpEnableDeps
   if (entry.decision.status === "unsupported" || entry.decision.status === "skipped" || entry.decision.status === "conflict") {
     die(`cannot enable MCP server ${agent} ${shownName}: ${printable(entry.decision.reason ?? entry.decision.status)}`);
   }
+  // The check above refuses every status assertApprovableProjectEntry does,
+  // with the enable wording.
   const isProject = entry.source === "project";
-  if (isProject) assertApprovableProjectEntry(entry);
   if (!isProject && input.tokenSource.kind !== "none") {
     die(`--from-* applies to project MCP servers; bind a ${entry.source} server's credential with: runfree credential set-source <name> --from-env <env>`);
   }
@@ -480,6 +484,7 @@ export async function mcpEnableIntent(input: McpEnableInput, deps: McpEnableDeps
     const approvalFile = mcpApprovalPath(stateDir());
     const approval = saveMcpApproval(projectRoot(), approvalFile, entry);
     console.log(`approved project MCP server: ${agent} ${shownName}`);
+    console.log(`approval: ${approvalFile}`);
     console.log(`digest: ${approval.digest}`);
   }
   if (record) {
@@ -542,7 +547,7 @@ export function mcpExplainIntent(input: McpExplainInput): void {
   }
   if (entry.source === "project" && (entry.decision.status === "unapproved" || entry.decision.status === "changed")) {
     const staticHint = entry.auth === "static" ? " --from-env <ENV>" : "";
-    console.log(`approve: runfree mcp approve ${entry.agent} ${entry.name}${staticHint}`);
+    console.log(`enable: ${remedy.mcpEnableProject(entry.agent, entry.name)}${staticHint}`);
   }
   if (entry.source === "project" && entry.decision.status === "approved") {
     console.log(`revoke: runfree mcp revoke ${entry.agent} ${entry.name}`);
@@ -555,7 +560,7 @@ export function mcpRulesIntent(input: McpRulesInput): void {
     die(`cannot set MCP rules for ${entry.agent} ${entry.name}: ${entry.decision.reason ?? entry.decision.status}`);
   }
   if (entry.source === "project" && entry.decision.status !== "approved") {
-    die(`cannot set MCP rules for unapproved project MCP server: runfree mcp approve ${entry.agent} ${entry.name}`);
+    die(`cannot set MCP rules for unapproved project MCP server: ${remedy.mcpEnableProject(entry.agent, entry.name)}`);
   }
   if (!entry.endpoint || !entry.mcpPolicy) {
     die("MCP rules apply only to HTTP MCP servers imported through the proxy");
@@ -598,7 +603,7 @@ export function mcpRulesIntent(input: McpRulesInput): void {
   }
 }
 
-async function promptTokenSourceForStatic(entry: McpInventoryEntry): Promise<McpApproveInput["tokenSource"] | undefined> {
+async function promptTokenSourceForStatic(entry: McpInventoryEntry): Promise<TokenSourceSelection | undefined> {
   const choice = await select({
     message: `Credential source for ${agentChoiceLabel(entry.agent)} / ${entry.name}`,
     options: [
@@ -629,7 +634,7 @@ type ConfigureChange = {
 
 export async function mcpConfigureIntent(input: McpConfigureInput): Promise<McpConfigureResult> {
   if (!interactiveTty()) {
-    die("runfree mcp configure requires a TTY; use runfree mcp list/approve/rules for scripts");
+    die("runfree mcp configure requires a TTY; for scripts use mcp list, mcp enable, and mcp rules");
   }
   const inventory = mcpInventory({
     projectRoot: projectRoot(),
@@ -682,7 +687,7 @@ export async function mcpConfigureIntent(input: McpConfigureInput): Promise<McpC
       if (!tokenSource) return {};
       changes.push({
         label: `approve project ${entry.agent}/${entry.name}`,
-        apply: () => mcpApproveIntent({ agent: entry.agent, server: entry.name, tokenSource, replaceSource: false }),
+        apply: () => approveProjectMcpServer(entry.agent, entry.name, tokenSource),
       });
     } else if (approvalChoice === "revoke") {
       selectedEntryWillRemain = false;
