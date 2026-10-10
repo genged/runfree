@@ -53,7 +53,10 @@ describe("benchmark-startup harness", () => {
       observed: false,
       reason: "process did not reach it (failure)",
     });
-    expect(failedBeforeHandoff.normalExitMs).toEqual({ observed: false, reason: "nonzero exit code 7" });
+    // normalExitMs's absent reason reuses the outcome's own reason -- the
+    // same event explains both, so there is no second, separately-worded
+    // placeholder to drift out of sync with it.
+    expect(failedBeforeHandoff.normalExitMs).toEqual({ observed: false, reason: "exit code 7: boom" });
     expect(reached.wallToHandoffMs.observed).toBe(true);
 
     const summary = summarizeStartupSamples([reached, failedBeforeHandoff]);
@@ -126,6 +129,62 @@ describe("benchmark-startup harness", () => {
     expect(handoffMs).toBeGreaterThanOrEqual(150);
     expect(handoffMs).not.toBe(sample.phaseDurationsMs["startup-total"]);
   }, 15_000);
+
+  test("parses the real output formatter's prefixed, timestamped lines", async () => {
+    // Every real `timing:` line is actually emitted through the project's
+    // one output formatter (packages/cli/src/runtime/timings.ts calling
+    // packages/cli/src/warnings.ts's runfreeLog/emit), which prepends a
+    // "runfree:" severity prefix and, on this piped (non-TTY) child, an ISO
+    // timestamp -- never a bare "timing: ..." line. This drives that real
+    // code (imported by file URL, not re-typed here) so a regression in the
+    // harness's parser/handoff-pattern anchoring is caught against the
+    // actual format it must match, not a synthetic stand-in for it.
+    const timingsUrl = new URL("../packages/cli/src/runtime/timings.ts", import.meta.url).href;
+    const script = [
+      `import { createRuntimeTimings } from ${JSON.stringify(timingsUrl)};`,
+      'const timings = createRuntimeTimings({ RUNFREE_TIMINGS: "1" });',
+      'timings.time("token-sync", () => {});',
+      'timings.report("launch-handoff", "minted");',
+    ].join("\n");
+
+    const sample = await observeStartupRun({
+      command: process.execPath,
+      args: ["--import", "tsx", "--input-type=module", "-e", script],
+      scenarioId: "test-scenario",
+      tree: "test-tree",
+      runId: `run-${nextRunId++}`,
+      timeoutMs: 20_000,
+    });
+
+    expect(sample.outcome).toEqual({ kind: "success" });
+    expect(sample.wallToHandoffMs.observed).toBe(true);
+    expect(typeof sample.phaseDurationsMs["token-sync"]).toBe("number");
+    expect(sample.phaseDurationsMs["token-sync"]).toBeGreaterThanOrEqual(0);
+  }, 25_000);
+
+  test("redacts a secret that straddles the diagnostic tail boundary", async () => {
+    // The harness keeps only the last 2000 characters of captured output
+    // for a failure's short diagnostic `reason`. Build a single `op://`
+    // reference long enough that this boundary falls well past its 5-char
+    // "op://" prefix, with every slash-separated segment short enough
+    // (under 32 characters) that the generic opaque-token fallback pattern
+    // cannot catch a surviving fragment on its own -- only redacting the
+    // whole captured output before any slicing can catch this. (If the
+    // order ever regresses to slice-then-redact, the raw, unprefixed
+    // fragment would leak into `reason` untouched.)
+    const segments = Array.from({ length: 400 }, (_, index) => `segment${index}`);
+    const secret = `op://${segments.join("/")}`;
+    expect(secret.length).toBeGreaterThan(2010);
+    expect(segments.every((segment) => segment.length < 32)).toBe(true);
+
+    const script = `process.stderr.write(${JSON.stringify(`starting up\n${secret}`)}); process.exitCode = 9;`;
+    const sample = await runFakeChild(script);
+
+    expect(sample.outcome.kind).toBe("failure");
+    const reason = sample.outcome.kind === "failure" ? sample.outcome.reason : "";
+    expect(reason).toContain("op://[redacted]");
+    expect(reason).not.toMatch(/segment\d+/);
+  });
 
   test("redacts provider identifiers and values", async () => {
     expect(redactSecrets("token=abc123 plain text")).toContain("token=[redacted]");

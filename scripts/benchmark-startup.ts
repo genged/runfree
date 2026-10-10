@@ -126,8 +126,7 @@ function milestoneAbsent(reason: string): StartupMilestone {
 export type StartupOutcome =
   | { readonly kind: "success" }
   | { readonly kind: "failure"; readonly reason: string }
-  | { readonly kind: "timeout"; readonly reason: string }
-  | { readonly kind: "cancelled"; readonly reason: string };
+  | { readonly kind: "timeout"; readonly reason: string };
 
 /**
  * One observed run. `phaseDurationsMs` and `operationCounts` come from the
@@ -160,8 +159,14 @@ export interface StartupSample {
 /**
  * Parses the project's existing `timing: <phase> <detail>` convention
  * (`tests/runtime/live/launch-timing-support.ts`, `local/scripts/launch-timing-bench.sh`).
- * A plain `<number>ms` detail is a phase duration; the last line for a given
- * phase name wins (matches the live harness's `milliseconds()` helper), so a
+ * Deliberately **unanchored** (no `^`), matching `launch-timing-support.ts:31`:
+ * every real `timing:` line is actually emitted through the project's one
+ * output formatter (`packages/cli/src/warnings.ts` `emit`/`renderOutputEvent`),
+ * which prepends a `"runfree:"` severity prefix and, on a non-TTY stream
+ * (true for a piped child, which is how this harness always observes one),
+ * an ISO timestamp — so a line never starts with a bare `timing:`. A plain
+ * `<number>ms` detail is a phase duration; the last line for a given phase
+ * name wins (matches the live harness's `milliseconds()` helper), so a
  * phase is never summed against itself. A `<category> count=<n>` detail
  * (the `*-ops` lines) adds into a per phase+category operation count; counts
  * from different phases are kept under different keys and are never added
@@ -175,7 +180,7 @@ export function parseTimingLines(
   const operationCounts: Record<string, number> = {};
   for (const rawLine of text.split("\n")) {
     const line = rawLine.replace(/\r$/, "").trimEnd();
-    const match = /^timing: (\S+) (.*)$/.exec(line);
+    const match = /timing: (\S+) (.*)$/.exec(line);
     if (!match) continue;
     const phase = match[1] as string;
     const detail = match[2] as string;
@@ -208,7 +213,7 @@ export interface StartupRunSpec {
   readonly tree: string;
   readonly runId: string;
   readonly environment?: Readonly<Record<string, string | number | boolean>>;
-  /** Matched against each line of combined stdout/stderr as it arrives. Default matches this project's `timing: launch-handoff minted` line. */
+  /** Matched against each line of combined stdout/stderr as it arrives. Default matches this project's `timing: launch-handoff minted` line, unanchored (see `parseTimingLines`): the real line always carries the output formatter's `"runfree:"` prefix and usually a timestamp before it. */
   readonly handoffPattern?: RegExp;
   /** Agent first-response marker. Kept separate from readiness: set only by a line this agent itself produced, never inferred from exit code. Omit when the scenario has no agent step. */
   readonly usefulAgentPattern?: RegExp;
@@ -217,7 +222,7 @@ export interface StartupRunSpec {
   readonly timeoutMs?: number;
 }
 
-const DEFAULT_HANDOFF_PATTERN = /^timing: launch-handoff minted$/;
+const DEFAULT_HANDOFF_PATTERN = /timing: launch-handoff minted$/;
 const DEFAULT_TIMEOUT_MS = 5 * 60_000;
 const DIAGNOSTIC_TAIL_CHARS = 2000;
 
@@ -226,30 +231,26 @@ function redactOutcome(outcome: StartupOutcome): StartupOutcome {
   return { kind: outcome.kind, reason: redactSecrets(outcome.reason) };
 }
 
-function outcomeAndNormalExit(
+/**
+ * `redactedTail` must already be redacted (the caller redacts the whole
+ * captured output first, then slices the tail from that — never the other
+ * way around, or a secret whose recognizable prefix falls just before the
+ * slice boundary could survive in the kept fragment).
+ */
+function classifyOutcome(
   input: { timedOut: boolean; timeoutMs: number; signal: NodeJS.Signals | null; code: number | null; redactedTail: string },
-): { outcome: StartupOutcome; normalExitMs: StartupMilestone } {
+): StartupOutcome {
   const { timedOut, timeoutMs, signal, code, redactedTail } = input;
-  if (timedOut) {
-    return {
-      outcome: { kind: "timeout", reason: `killed after ${timeoutMs}ms without exiting` },
-      normalExitMs: milestoneAbsent("timed out"),
-    };
-  }
-  if (signal !== null) {
-    return {
-      outcome: { kind: "failure", reason: `terminated by signal ${signal}` },
-      normalExitMs: milestoneAbsent(`terminated by signal ${signal}`),
-    };
-  }
-  if (code === 0) {
-    return { outcome: { kind: "success" }, normalExitMs: milestoneAbsent("set by caller after measuring exit") };
-  }
+  if (timedOut) return { kind: "timeout", reason: `killed after ${timeoutMs}ms without exiting` };
+  if (signal !== null) return { kind: "failure", reason: `terminated by signal ${signal}` };
+  if (code === 0) return { kind: "success" };
   const tail = lastNonEmptyLine(redactedTail);
-  return {
-    outcome: { kind: "failure", reason: `exit code ${code}${tail ? `: ${tail}` : ""}` },
-    normalExitMs: milestoneAbsent(`nonzero exit code ${code}`),
-  };
+  return { kind: "failure", reason: `exit code ${code}${tail ? `: ${tail}` : ""}` };
+}
+
+/** The outcome already explains why a run did or didn't exit normally, so a non-success `normalExitMs` reuses its `reason` rather than keeping a second, separately-worded explanation of the same event. */
+function normalExitFor(outcome: StartupOutcome, elapsedMs: number): StartupMilestone {
+  return outcome.kind === "success" ? milestoneObserved(elapsedMs) : milestoneAbsent(outcome.reason);
 }
 
 /**
@@ -308,8 +309,11 @@ export function observeStartupRun(spec: StartupRunSpec): Promise<StartupSample> 
       resolve(result);
     };
 
-    const buildSample = (outcome: StartupOutcome, normalExitMs: StartupMilestone, elapsedMs: number): StartupSample => {
-      const redactedOutput = redactSecrets(combinedOutput);
+    // Takes the already-redacted full output (never the other order: see
+    // `classifyOutcome`'s note) so every derived field — parsed phases and
+    // the outcome's own `reason` — is built from text a secret cannot
+    // survive in, regardless of where in the output it appeared.
+    const buildSample = (outcome: StartupOutcome, elapsedMs: number, redactedOutput: string): StartupSample => {
       const { phaseDurationsMs, operationCounts } = parseTimingLines(redactedOutput);
       const unreachedReason = `process did not reach it (${outcome.kind})`;
       return {
@@ -324,7 +328,7 @@ export function observeStartupRun(spec: StartupRunSpec): Promise<StartupSample> 
         ...(spec.firstMcpSuccessPattern !== undefined
           ? { wallToFirstMcpSuccessMs: mcpSuccessMs ?? milestoneAbsent(unreachedReason) }
           : {}),
-        normalExitMs: outcome.kind === "success" ? milestoneObserved(elapsedMs) : normalExitMs,
+        normalExitMs: normalExitFor(outcome, elapsedMs),
         outcome: redactOutcome(outcome),
         operationCounts: Object.freeze(operationCounts),
         environment: Object.freeze(redactEnvironment(spec.environment ?? {})),
@@ -333,14 +337,19 @@ export function observeStartupRun(spec: StartupRunSpec): Promise<StartupSample> 
 
     child.on("close", (code, signal) => {
       const elapsedMs = performance.now() - startedAt;
-      const redactedTail = redactSecrets(combinedOutput.slice(-DIAGNOSTIC_TAIL_CHARS));
-      const { outcome, normalExitMs } = outcomeAndNormalExit({ timedOut, timeoutMs, signal, code, redactedTail });
-      settle(buildSample(outcome, normalExitMs, elapsedMs));
+      // Redact the whole capture first, then slice the tail from the
+      // redacted text — slicing the raw text first could cut a secret's
+      // recognizable prefix (`Bearer `, `op://`, `token=`) off, leaving an
+      // unprefixed fragment past every named redaction pattern.
+      const redactedOutput = redactSecrets(combinedOutput);
+      const redactedTail = redactedOutput.slice(-DIAGNOSTIC_TAIL_CHARS);
+      const outcome = classifyOutcome({ timedOut, timeoutMs, signal, code, redactedTail });
+      settle(buildSample(outcome, elapsedMs, redactedOutput));
     });
 
     child.on("error", (error) => {
       const outcome: StartupOutcome = { kind: "failure", reason: `spawn error: ${error.message}` };
-      settle(buildSample(outcome, milestoneAbsent("process failed to start"), performance.now() - startedAt));
+      settle(buildSample(outcome, performance.now() - startedAt, redactSecrets(combinedOutput)));
     });
   });
 }
