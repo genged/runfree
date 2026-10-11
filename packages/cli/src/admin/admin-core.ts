@@ -144,6 +144,20 @@ import {
   settleHostSignals,
 } from "./credential-cancellation.ts";
 import { type CredentialReadInput, type CredentialReadResult, readCredentialSource } from "./credential-source-reader.ts";
+import {
+  type CredentialObservation,
+  type ProxyValidationMarker,
+  type CredentialObservationPhase,
+  type CredentialObservationResult,
+  type ProxyObservationPaths,
+  type ProxyObservationSection,
+  STARTED_AT_INSPECT_FIELD,
+  lockedHeldTokenNames,
+  observeCredentialRuntime,
+  inspectOutputRows,
+  readProxyObservationSections,
+  splitTrailingStartedAt,
+} from "./credential-observation.ts";
 import { stableJsonDroppingUndefined as stableJson, sha256Hex, isRecord } from "../strict-primitives.ts";
 import { remedy } from "../remedies.ts";
 
@@ -208,6 +222,8 @@ export type ProxyRuntimeState = "ready" | "not-running" | "docker-unavailable" |
 export type ProxyRuntime = {
   id?: string;
   storeGeneration?: string;
+  /** The incarnation the store generation binds; a later observation must see the same one. */
+  startedAt?: string;
   state: ProxyRuntimeState;
   validationMessage?: string;
 };
@@ -1822,82 +1838,114 @@ function serviceContainerId(project: string, service: string, options: { running
   return ps.stdout.trim().split(/\s+/).filter(Boolean)[0];
 }
 
-function dockerContainerStartedAt(containerId: string): string | undefined {
-  const result = adminDockerClient().inspect([containerId], { format: "{{.State.StartedAt}}" });
-  const startedAt = result.stdout.trim();
-  if (result.status !== 0 || startedAt === "" || startedAt === "<no value>") return undefined;
-  return startedAt;
+function proxyObservationPaths(): ProxyObservationPaths {
+  return {
+    validationMarker: RUNTIME_VALIDATION_MARKER_PATH,
+    firewallStatus: firewallStatusPath(),
+    requestProxyStatus: requestProxyStatusPath(),
+    secretDir: CONTAINER_SECRET_DIR,
+  };
 }
 
-// One docker exec yields both consumers of the validation marker: the parsed
-// record for validation and its fingerprint for the store generation, so a
-// proxyRuntime() pass never reads the marker twice.
-type ProxyValidationMarker = { parsed?: unknown; fingerprint: string };
+/** A proxy runtime state and, when it is ready, the observation that proved it. */
+type ProxyRuntimeObservation = Readonly<{ runtime: ProxyRuntime; observation?: CredentialObservation }>;
 
-function readProxyValidationMarker(proxyId: string): ProxyValidationMarker | undefined {
-  const result = adminDockerClient().exec(proxyId, ["cat", RUNTIME_VALIDATION_MARKER_PATH], { user: "0:0" });
-  if (result.status !== 0) return undefined;
-  try {
-    const parsed = JSON.parse(result.stdout) as unknown;
-    return { parsed, fingerprint: sha256Json(parsed) };
-  } catch {
-    return { fingerprint: sha256Json({ raw: result.stdout }) };
+// The store generation must be deterministic for an unchanged container: a
+// transient docker-exec failure reading the validation marker (or a failed
+// StartedAt inspect, or a restart inside the observation) must fail the sync
+// run without fabricating a different generation — a fabricated generation
+// would spuriously invalidate receipts and flip a keep-last-good decision into
+// a delete. "proxy-unreachable" makes syncTokens report and change nothing.
+function proxyRuntimeFromObservation(result: CredentialObservationResult, proxyId: string): ProxyRuntimeObservation {
+  if (result.kind === "refused") return { runtime: { state: "validation-required", id: proxyId, validationMessage: result.message } };
+  if (result.kind !== "observed" || result.observation.storeGeneration === undefined) {
+    return { runtime: { state: "proxy-unreachable", id: proxyId } };
   }
+  const { observation } = result;
+  return {
+    runtime: { state: "ready", id: proxyId, storeGeneration: observation.storeGeneration, startedAt: observation.startedAt },
+    observation,
+  };
 }
 
-function proxyValidationMarkerFingerprint(proxyId: string): string | undefined {
-  return readProxyValidationMarker(proxyId)?.fingerprint;
-}
-
-function proxyTokenStoreGeneration(proxyId: string, validationIdentity: unknown): string | undefined {
-  const startedAt = dockerContainerStartedAt(proxyId);
-  if (!startedAt) return undefined;
-  return sha256Json({
+/**
+ * Observes the project's proxy for a credential operation of one phase: its
+ * validation, its incarnation, and, in the same root exec as the validation
+ * marker, any further proxy file the caller needs (consumer
+ * acknowledgements, held token names).
+ */
+function observeProxyRuntime(
+  phase: CredentialObservationPhase,
+  extraSections: readonly ProxyObservationSection[] = [],
+): ProxyRuntimeObservation {
+  const sections: ProxyObservationSection[] = ["validation-marker", ...extraSections];
+  const observe = (proxyId: string, before: string, after?: Parameters<typeof observeCredentialRuntime>[0]["after"]) => proxyRuntimeFromObservation(observeCredentialRuntime({
+    phase,
     proxyId,
-    startedAt,
-    validationIdentity,
-  });
-}
-
-export function proxyRuntime(): ProxyRuntime {
+    sections,
+    paths: proxyObservationPaths(),
+    docker: adminDockerClient(),
+    isTokenName,
+    before,
+    ...(after ? { after } : {}),
+  }), proxyId);
   const prevalidatedRuntime = validatedRuntime();
   if (prevalidatedRuntime
     && prevalidatedRuntime.projectId === projectId()
     && validatedRuntimeCallbackProofMatches(prevalidatedRuntime)) {
     const validation = validatedRuntimeSecurityContractIssue(prevalidatedRuntime);
-    if (validation) {
-      return { state: "validation-required", id: prevalidatedRuntime.proxyId, validationMessage: validation };
+    if ("issue" in validation) {
+      return { runtime: { state: "validation-required", id: prevalidatedRuntime.proxyId, validationMessage: validation.issue } };
     }
-    return readyProxyRuntime(prevalidatedRuntime.proxyId);
+    // The component inspect that proved the container also read its
+    // incarnation: the batch below must see the same one after it.
+    if (!validation.startedAt) return { runtime: { state: "proxy-unreachable", id: prevalidatedRuntime.proxyId } };
+    return observe(prevalidatedRuntime.proxyId, validation.startedAt);
   }
-  if (!dockerAvailable()) return { state: "docker-unavailable" };
+  if (!dockerAvailable()) return { runtime: { state: "docker-unavailable" } };
   const project = composeProject();
-  if (!project) return { state: "not-running" };
+  if (!project) return { runtime: { state: "not-running" } };
   // The per-session runtime has no shared agent service; token sync validates
   // the proxy control plane, and each session is validated by admission.
   const agentId = undefined;
   const id = proxyContainerId(project);
-  if (!id) return { state: "not-running" };
-  const running = adminDockerClient().inspect([id], { format: "{{.State.Running}}" });
-  if (running.status !== 0 || running.stdout.trim() !== "true") return { state: "not-running" };
-  const marker = readProxyValidationMarker(id);
-  const validation = proxyRuntimeValidationIssue(project, id, agentId, marker);
-  if (validation) return { state: "validation-required", id, validationMessage: validation };
-  return readyProxyRuntime(id, marker?.fingerprint);
+  if (!id) return { runtime: { state: "not-running" } };
+  const running = adminDockerClient().inspect([id], { format: `{{.State.Running}}\t${STARTED_AT_INSPECT_FIELD}` });
+  const runningRows = running.status === 0 ? inspectOutputRows(running.stdout) : [];
+  const runningRow = runningRows.length === 1 ? splitTrailingStartedAt(runningRows[0], 1) : undefined;
+  if (runningRow?.head !== "true") return { runtime: { state: "not-running" } };
+  if (!runningRow.startedAt) return { runtime: { state: "proxy-unreachable", id } };
+  // Validation runs on the batch's marker; its own component inspect is the
+  // incarnation reading after the batch.
+  return observe(id, runningRow.startedAt, (observed) => {
+    const validation = proxyRuntimeValidationIssue(project, id, agentId, observed.validationMarker);
+    if ("issue" in validation) return { kind: "refused", message: validation.issue };
+    return validation.startedAt
+      ? { kind: "started", startedAt: validation.startedAt }
+      : { kind: "unavailable", reason: "proxy StartedAt could not be inspected" };
+  });
 }
 
-// The store generation must be deterministic for an unchanged container: a
-// transient docker-exec failure reading the validation marker (or a failed
-// StartedAt inspect) must fail the sync run without fabricating a different
-// generation — a fabricated generation would spuriously invalidate receipts
-// and flip a keep-last-good decision into a delete. "proxy-unreachable" makes
-// syncTokens report and change nothing.
-function readyProxyRuntime(proxyId: string, knownValidationIdentity?: string): ProxyRuntime {
-  const validationIdentity = knownValidationIdentity ?? proxyValidationMarkerFingerprint(proxyId);
-  if (validationIdentity === undefined) return { state: "proxy-unreachable", id: proxyId };
-  const storeGeneration = proxyTokenStoreGeneration(proxyId, validationIdentity);
-  if (storeGeneration === undefined) return { state: "proxy-unreachable", id: proxyId };
-  return { state: "ready", id: proxyId, storeGeneration };
+export function proxyRuntime(): ProxyRuntime {
+  return observeProxyRuntime("preparation").runtime;
+}
+
+/**
+ * Re-observes the exact proxy a locked sync is acting on. The baseline's
+ * incarnation is the reading before the batch, so a restart since the
+ * baseline was proved cannot pass.
+ */
+function observeExactProxyRuntime(baseline: ProxyRuntime): ProxyRuntime {
+  if (!baseline.id || !baseline.startedAt) return { state: "proxy-unreachable", ...(baseline.id ? { id: baseline.id } : {}) };
+  return proxyRuntimeFromObservation(observeCredentialRuntime({
+    phase: "locked-sync",
+    proxyId: baseline.id,
+    sections: ["validation-marker"],
+    paths: proxyObservationPaths(),
+    docker: adminDockerClient(),
+    isTokenName,
+    before: baseline.startedAt,
+  }), baseline.id).runtime;
 }
 
 function runtimeStateMessage(state: ProxyRuntimeState, validationMessage?: string): string {
@@ -1978,28 +2026,36 @@ function currentRuntimeSecurityContract(): RuntimeSecurityContract | undefined {
   return currentRuntimeValidationTarget()?.contract;
 }
 
+/** A refusal, or the proved components' incarnation (undefined when Docker did not report it). */
+type RuntimeValidationOutcome = Readonly<{ issue: string }> | Readonly<{ startedAt?: string }>;
+
+const RUNTIME_CONTAINER_INSPECT_FIELDS = 11;
+
 function liveRuntimeComponentValidationIssue(
   proof: Record<string, unknown>,
   target: NonNullable<ReturnType<typeof currentRuntimeValidationTarget>>,
-): string | undefined {
+): RuntimeValidationOutcome {
   const agentId = typeof proof.agentId === "string" ? proof.agentId : undefined;
   const proxyId = typeof proof.proxyId === "string" ? proof.proxyId : undefined;
   // Shape-exact: the per-session proof binds no shared agent or retired relay
   // sidecar. A proof carrying either is stale, not merely malformed.
   if (agentId !== undefined || proof.mcpOAuthCallbackSidecarId !== undefined) {
-    return `runtime component identity is stale for the per-session runtime shape; run \`${remedy.up()}\``;
+    return { issue: `runtime component identity is stale for the per-session runtime shape; run \`${remedy.up()}\`` };
   }
-  if (!proxyId) return `runtime component container identity is malformed; run \`${remedy.up()}\``;
+  if (!proxyId) return { issue: `runtime component container identity is malformed; run \`${remedy.up()}\`` };
   const ids = [proxyId];
-  const inspect = adminDockerClient().inspect(ids, { format: runtimeContainerInspectFormat() });
-  if (inspect.status !== 0) return `runtime component labels cannot be inspected; run \`${remedy.up()}\``;
-  const containers = parseRuntimeContainerInspectRows(inspect.stdout);
+  // The incarnation is grouped into the component inspect: the credential
+  // observation needs it, and this call already names the exact container.
+  const inspect = adminDockerClient().inspect(ids, { format: `${runtimeContainerInspectFormat()}\t${STARTED_AT_INSPECT_FIELD}` });
+  if (inspect.status !== 0) return { issue: `runtime component labels cannot be inspected; run \`${remedy.up()}\`` };
+  const rows = inspectOutputRows(inspect.stdout).map((line) => splitTrailingStartedAt(line, RUNTIME_CONTAINER_INSPECT_FIELDS));
+  const containers = parseRuntimeContainerInspectRows(rows.map((row) => row?.head ?? "").join("\n"));
   const observedIds = new Set(containers.map((container) => container.id));
-  if (containers.length !== ids.length || ids.some((id) => !observedIds.has(id))) {
-    return `runtime component container identities changed; run \`${remedy.up()}\``;
+  if (rows.some((row) => row === undefined) || containers.length !== ids.length || ids.some((id) => !observedIds.has(id))) {
+    return { issue: `runtime component container identities changed; run \`${remedy.up()}\`` };
   }
   if (containers.some((container) => container.running !== true)) {
-    return `runtime component container is not running; run \`${remedy.up()}\``;
+    return { issue: `runtime component container is not running; run \`${remedy.up()}\`` };
   }
   const identity = {
     composeProject: target.plan.composeProjectName,
@@ -2018,12 +2074,12 @@ function liveRuntimeComponentValidationIssue(
         agent: target.plan.activeRuntime.agentImage,
         proxy: target.plan.activeRuntime.proxyImage,
       }, identity);
-  if (!issue) return undefined;
+  if (!issue) return { startedAt: rows[0]?.startedAt };
   // `runfree up` repairs a missing container by recreating the composition, but
   // it refuses duplicated or contradictory evidence by design, so pointing
   // those at `up` would name a command that fails the same way every time.
   const remedyLine = issue.kind === "missing" ? `run \`${remedy.up()}\`` : `run \`${remedy.rebuild()}\``;
-  return `${issue.message}; ${remedyLine}`;
+  return { issue: `${issue.message}; ${remedyLine}` };
 }
 
 function inspectById(inspects: DockerContainerInspect[] | undefined, id: string): DockerContainerInspect | undefined {
@@ -2106,17 +2162,17 @@ function runtimeSecurityContractValidationIssue(
   return `runtime security contract validation failed (${issue.container}: ${issue.code}: ${issue.detail}); run \`runfree up\``;
 }
 
-function validatedRuntimeSecurityContractIssue(proof: NonNullable<AdminState["validatedRuntime"]>): string | undefined {
+function validatedRuntimeSecurityContractIssue(proof: NonNullable<AdminState["validatedRuntime"]>): RuntimeValidationOutcome {
   if (proof.proofVersion !== 4 || typeof proof.contractHash !== "string" || proof.contractHash === "") {
-    return `runtime security contract cannot be checked; run \`${remedy.up()}\``;
+    return { issue: `runtime security contract cannot be checked; run \`${remedy.up()}\`` };
   }
   const target = currentRuntimeValidationTarget();
-  if (!target?.contract.contractHash) return `runtime security contract cannot be checked; run \`${remedy.up()}\``;
+  if (!target?.contract.contractHash) return { issue: `runtime security contract cannot be checked; run \`${remedy.up()}\`` };
   if (runtimeValidationComponentsIssue(proof.components, target.contract.components)) {
-    return `runtime validation marker is stale for runtime components; run \`${remedy.up()}\``;
+    return { issue: `runtime validation marker is stale for runtime components; run \`${remedy.up()}\`` };
   }
   if (proof.contractHash !== target.contract.contractHash) {
-    return `runtime validation marker is stale for runtime security contract; run \`${remedy.up()}\``;
+    return { issue: `runtime validation marker is stale for runtime security contract; run \`${remedy.up()}\`` };
   }
   return liveRuntimeComponentValidationIssue(proof, target);
 }
@@ -2132,29 +2188,29 @@ function runtimeValidationComponentsIssue(
   return undefined;
 }
 
-function proxyRuntimeValidationIssue(project: string, proxyId: string, agentId: string | undefined, marker: ProxyValidationMarker | undefined): string | undefined {
-  if (!marker) return `runtime validation required before proxy token sync; run \`${remedy.up()}\``;
+function proxyRuntimeValidationIssue(project: string, proxyId: string, agentId: string | undefined, marker: ProxyValidationMarker | undefined): RuntimeValidationOutcome {
+  if (!marker) return { issue: `runtime validation required before proxy token sync; run \`${remedy.up()}\`` };
   const parsed = marker.parsed;
-  if (parsed === undefined) return `runtime validation marker is malformed; run \`${remedy.up()}\``;
-  if (!isRecord(parsed)) return `runtime validation marker is malformed; run \`${remedy.up()}\``;
-  if (parsed.proofVersion !== 4) return `runtime validation marker has stale proof version; run \`${remedy.up()}\``;
-  if (parsed.projectId !== projectId()) return `runtime validation marker belongs to another project; run \`${remedy.up()}\``;
+  if (parsed === undefined) return { issue: `runtime validation marker is malformed; run \`${remedy.up()}\`` };
+  if (!isRecord(parsed)) return { issue: `runtime validation marker is malformed; run \`${remedy.up()}\`` };
+  if (parsed.proofVersion !== 4) return { issue: `runtime validation marker has stale proof version; run \`${remedy.up()}\`` };
+  if (parsed.projectId !== projectId()) return { issue: `runtime validation marker belongs to another project; run \`${remedy.up()}\`` };
   // Shape-exact: the per-session marker names no agent, so one carrying an
   // agent id was written for a different runtime shape than the one running.
   if (parsed.agentId !== undefined) {
-    return `runtime validation marker is stale for the per-session runtime shape; run \`${remedy.up()}\``;
+    return { issue: `runtime validation marker is stale for the per-session runtime shape; run \`${remedy.up()}\`` };
   }
   if (typeof parsed.proxyId !== "string" || parsed.proxyId === "") {
-    return `runtime validation marker is malformed; run \`${remedy.up()}\``;
+    return { issue: `runtime validation marker is malformed; run \`${remedy.up()}\`` };
   }
   if (parsed.proxyId !== proxyId) {
-    return `runtime validation marker belongs to another proxy container; run \`${remedy.up()}\``;
+    return { issue: `runtime validation marker belongs to another proxy container; run \`${remedy.up()}\`` };
   }
   if (parsed.mcpOAuthCallbackTopologyVersion !== 2) {
-    return `runtime validation marker is stale for MCP OAuth callback topology; run \`${remedy.up()}\``;
+    return { issue: `runtime validation marker is stale for MCP OAuth callback topology; run \`${remedy.up()}\`` };
   }
   if (parsed.mcpOAuthCallbackPort !== mcpOAuthCallbackPort(projectRoot())) {
-    return `runtime validation marker is stale for MCP OAuth callback port; run \`${remedy.up()}\``;
+    return { issue: `runtime validation marker is stale for MCP OAuth callback port; run \`${remedy.up()}\`` };
   }
   // A marker or live Compose service from the retired relay generation was
   // minted by an older binary; refuse it so the runtime revalidates.
@@ -2165,12 +2221,12 @@ function proxyRuntimeValidationIssue(project: string, proxyId: string, agentId: 
     || parsed.mcpOAuthCallbackSidecarIp !== undefined
     || parsed.mcpOAuthCallbackSidecarService !== undefined
   ) {
-    return `runtime validation marker is stale for MCP OAuth callback sidecar; run \`${remedy.up()}\``;
+    return { issue: `runtime validation marker is stale for MCP OAuth callback sidecar; run \`${remedy.up()}\`` };
   }
   const securityContractValidation = runtimeSecurityContractValidationIssue(parsed, agentId, proxyId);
-  if (securityContractValidation) return securityContractValidation;
+  if (securityContractValidation) return { issue: securityContractValidation };
   const target = currentRuntimeValidationTarget();
-  if (!target) return `runtime security contract cannot be checked; run \`${remedy.up()}\``;
+  if (!target) return { issue: `runtime security contract cannot be checked; run \`${remedy.up()}\`` };
   return liveRuntimeComponentValidationIssue(parsed, target);
 }
 
@@ -2515,12 +2571,23 @@ export function withTokenStoreLock<T>(action: () => T, options: { wait?: boolean
 
 // Possession check: one batched listing of the proxy secret directory per sync
 // run (never one exec per token), over the same trusted host→proxy channel as
-// the token write path. Returns undefined when the listing itself fails — the
-// caller must then treat the proxy as unreachable rather than infer absence.
-function listProxyRuntimeTokens(proxyId: string): Set<string> | undefined {
-  const result = adminDockerClient().exec(proxyId, ["sh", "-c", `ls -1 ${shellSingleQuote(CONTAINER_SECRET_DIR)}`]);
-  if (result.status !== 0) return undefined;
-  return new Set(result.stdout.split(/\r?\n/).map((line) => line.trim()).filter((name) => isTokenName(name)));
+// the token write path. Names only, never a value. Returns undefined when the
+// listing itself fails — the caller must then treat the proxy as unreachable
+// rather than infer absence.
+//
+// Read under the token-store lock, after the baseline observation and before
+// the fence that precedes every effect and every persistence: those two
+// incarnation readings bracket it.
+function listProxyRuntimeTokensUnderLock(proxyId: string): Set<string> | undefined {
+  const read = readProxyObservationSections({
+    proxyId,
+    sections: ["held-token-names"],
+    paths: proxyObservationPaths(),
+    docker: adminDockerClient(),
+    isTokenName,
+  });
+  if (!read.ok || !read.sections.heldTokenNames) return undefined;
+  return new Set(read.sections.heldTokenNames);
 }
 
 export function importStartupTokenResolutionReceipts(input: {
@@ -2683,6 +2750,7 @@ export function syncTokens(options: TokenSyncOptions = {}): TokenSyncResult {
   }
   const effective = assertEffectiveControlConvergedBeforeCredentialResolution({
     onBusy: options.preparedOnly ? "defer" : "die",
+    phase: "locked-sync",
   });
   try {
     const policy = effective
@@ -2836,7 +2904,7 @@ export function planWatchCredentialReads(input: Readonly<{
   if (reads.length > 0 && currentAdminState().policyAccess === "effective-read-only") {
     // The same precheck the locked pass repeats: no source is read for a
     // selection the proxy has not converged on.
-    const effective = assertEffectiveControlConvergedBeforeCredentialResolution();
+    const effective = assertEffectiveControlConvergedBeforeCredentialResolution({ onBusy: "die", phase: "preparation" });
     effective?.lock.release();
     observedRuntime ??= effective?.runtime;
   }
@@ -2914,14 +2982,18 @@ function warmSkippableTokens(
   registry: SourceRegistry | undefined,
 ): ReadonlySet<string> {
   const skippable = new Set<string>();
-  let runtime: ProxyRuntime;
+  let observed: ProxyRuntimeObservation;
   try {
-    runtime = proxyRuntime();
+    // Held names come from the same root exec as the validation marker, bound
+    // to one incarnation. Preparation evidence: it may spare a read, never
+    // authorize a write.
+    observed = observeProxyRuntime("preparation", ["held-token-names"]);
   } catch {
     return skippable;
   }
+  const runtime = observed.runtime;
   if (runtime.state !== "ready" || !runtime.id || !runtime.storeGeneration) return skippable;
-  const held = listProxyRuntimeTokens(runtime.id);
+  const held = observed.observation?.heldTokenNames;
   if (!held) return skippable;
   const receipts = loadPersistedTokenReceipts();
   const now = Date.now();
@@ -3112,7 +3184,7 @@ function assertPreparedOnlyCovers(dueTokenNames: readonly string[]): void {
 }
 
 function assertEffectiveControlConvergedBeforeCredentialResolution(
-  options: Readonly<{ onBusy: "die" | "defer" }> = { onBusy: "die" },
+  options: Readonly<{ onBusy: "die" | "defer"; phase: CredentialObservationPhase }>,
 ): EffectiveCredentialSnapshot | undefined {
   if (currentAdminState().policyAccess !== "effective-read-only") return undefined;
   const discovered = projectInfo(projectRoot(), childEnv());
@@ -3137,16 +3209,20 @@ function assertEffectiveControlConvergedBeforeCredentialResolution(
     if (!active || !converged || converged.controlGeneration !== active.controlGeneration) {
       die("credential resolution requires a selected effective policy generation with complete convergence");
     }
-    const runtime = proxyRuntime();
+    // The consumers' acknowledgements are read in the same root exec as the
+    // validation marker, bound to the incarnation the runtime state names.
+    const observed = observeProxyRuntime(options.phase, ["firewall-status", "request-proxy-status"]);
+    const runtime = observed.runtime;
     if (runtime.state !== "ready" || !runtime.id) {
       die(`credential resolution requires a validated running proxy; runtime is ${runtime.state}${runtime.validationMessage ? ` (${runtime.validationMessage})` : ""}`);
     }
-    const status = readProxyPolicyStatusFiles(runtime.id);
-    const requestProxyMatches = status?.requestProxy?.controlGeneration === active.controlGeneration
-      && status.requestProxy.policyGeneration === converged.policyGeneration;
-    const firewallMatches = status?.firewall?.controlGeneration === active.controlGeneration
-      && status.firewall.policyGeneration === converged.policyGeneration
-      && status.firewall.rulesetVerified === true;
+    const requestProxy = observed.observation?.requestProxyStatus;
+    const firewall = observed.observation?.firewallStatus;
+    const requestProxyMatches = requestProxy?.controlGeneration === active.controlGeneration
+      && requestProxy.policyGeneration === converged.policyGeneration;
+    const firewallMatches = firewall?.controlGeneration === active.controlGeneration
+      && firewall.policyGeneration === converged.policyGeneration
+      && firewall.rulesetVerified === true;
     if (!requestProxyMatches || !firewallMatches) {
       die("credential resolution requires request-proxy and firewall acknowledgement of the selected effective policy generation");
     }
@@ -3191,7 +3267,7 @@ function syncTokensUnderLock(
             || Date.now() < Date.parse(rebind.recovery.allowance.lastObservedAt)))) {
         throw new EffectiveControlSelectionChanged("proxy replacement receipt or recovery allowance changed before credential write; resume runtime recover");
       }
-      const observed = readyProxyRuntime(exactRuntime.id as string);
+      const observed = observeExactProxyRuntime(exactRuntime);
       if (observed.state !== "ready" || observed.storeGeneration !== exactRuntime.storeGeneration
         || (readEffectiveControlPlaneV2(stateDir())?.selection.proxyContainerId ?? exactRuntime.id) !== exactRuntime.id) {
         throw new EffectiveControlSelectionChanged("exact proxy or token store changed during credential resolution; retry sync against fresh runtime evidence");
@@ -3210,7 +3286,12 @@ function syncTokensUnderLock(
   // `runtime` is the precheck's observation, reused rather than re-observed. If the
   // proxy restarted since — including while waiting for the token-store lock above —
   // assertSelection()'s store-generation fence refuses every write, and a retry observes the new proxy.
-  const runtime = effective?.runtime ?? options.observedRuntime ?? proxyRuntime();
+  // Without one, this phase observes the proxy itself, held names included.
+  const baseline = effective?.runtime ?? options.observedRuntime;
+  const observed: ProxyRuntimeObservation = baseline
+    ? { runtime: baseline }
+    : observeProxyRuntime("locked-sync", ["held-token-names"]);
+  const runtime = observed.runtime;
   exactRuntime = runtime;
   adminVerbose(options, `proxy runtime state is ${runtime.state}`);
 
@@ -3284,14 +3365,20 @@ function syncTokensUnderLock(
     return reportRunUnreachable();
   }
 
-  // Possession check: the single batched secret-dir listing for this run.
-  // Kept current across writes/removes below so end-of-run receipt pruning
+  // Possession check: the single batched secret-dir listing for this run,
+  // read in this phase's own proxy observation when it made one, else alone
+  // under the token-store lock. Kept current across writes/removes below so end-of-run receipt pruning
   // sees tokens written this run. A failed listing is a transport failure on
   // the same channel as writes — treated like proxy-unreachable, never as
   // evidence of absence.
   let heldTokens: Set<string> | undefined;
   if (runtime.state === "ready" && runtime.id) {
-    heldTokens = listProxyRuntimeTokens(runtime.id);
+    if (observed.observation) {
+      const held = lockedHeldTokenNames(observed.observation);
+      heldTokens = held && new Set(held);
+    } else {
+      heldTokens = listProxyRuntimeTokensUnderLock(runtime.id);
+    }
     if (heldTokens === undefined) {
       if (options.preparedOnly) throw new TokenSyncDeferredError("the proxy's held-token listing is unavailable");
       return reportRunUnreachable();
@@ -3430,7 +3517,9 @@ function syncTokensUnderLock(
   // Fences sit before each side-effect phase: the removal below, source
   // resolution, the proxy write, the failure removal, and the post-loop
   // cleanup and persistence. A token that is not due takes no action, so it
-  // needs no proxy re-observation.
+  // needs no proxy re-observation. A value read before the lock is taken from
+  // memory, which is no effect: the write's own fence is the next
+  // observation, and a source failure's removal fences itself.
   for (const [tokenName, tokenPolicy] of Object.entries(policy.tokens)) {
     const source = config[tokenName];
     if (!source) {
@@ -3506,13 +3595,12 @@ function syncTokensUnderLock(
           unprepared.push(tokenName);
           continue;
         }
-        fence();
         if (entry.kind === "source-failure") throw entry.error;
         value = entry.value;
         resolvedAt = entry.resolvedAt ?? syncNowMs;
       } else {
         adminVerbose(options, `${tokenName}: resolving ${describeSource(source)} source (${due.reason})`);
-        fence();
+        if (preparedTokenEntryKind(tokenName) !== "resolved") fence();
         value = resolvePreparedRuntimeTokenSource(tokenName, source, { ...options, sourceRegistry: registryForSource });
       }
       fence();

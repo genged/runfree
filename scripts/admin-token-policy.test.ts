@@ -37,6 +37,7 @@ import { mcpOAuthCallbackPort } from "../packages/cli/src/runtime/mcp.ts";
 import { activeRuntimePlanFromContext } from "../packages/cli/src/runtime/plan.ts";
 import { createRuntimeSecurityContract } from "../packages/cli/src/runtime/security-contract.ts";
 import { classifyOnePasswordFailure } from "../packages/cli/src/admin/admin-core.ts";
+import { CREDENTIAL_OBSERVATION_BATCH_HEADER } from "../packages/cli/src/admin/credential-observation.ts";
 import { createAdminState } from "../packages/cli/src/admin/context.ts";
 import {
   convergeProxyPolicy,
@@ -527,7 +528,7 @@ function verifyEs256Jwt(jwt: string, publicKeyPem: string): { header: Record<str
 // live proxy identity to be a real Docker object id (the control-plane rebind
 // journal only records 64-hex container ids and `runfree-<projectId>` compose
 // projects); every other caller keeps the short stand-ins.
-function installTokenSyncDockerFake(options: { composeProject?: string; onMarkerSwap?: () => void; proxyId?: string } = {}): { dockerLog: string; fakeBin: string } {
+function installTokenSyncDockerFake(options: { composeProject?: string; onMarkerSwap?: () => void; proxyId?: string } = {}): { dockerLog: string; fakeBin: string; heldTokens: Set<string> } {
   const proxyId = options.proxyId ?? "proxy-id";
   const onMarkerSwap = options.onMarkerSwap;
   const composeProjectLabel = options.composeProject ?? "fake-project";
@@ -549,6 +550,66 @@ function installTokenSyncDockerFake(options: { composeProject?: string; onMarker
     proxyId,
   });
   fs.mkdirSync(fakeBin, { recursive: true });
+  // The credential observation batch runs for real: its script executes in
+  // the host's POSIX shell against a scratch tree laid out like the proxy's
+  // /run, materialized from this fake's state, so the parser reads exactly
+  // the bytes a proxy would emit.
+  const fakeCredentialObservationBatch = (script: string, env: NodeJS.ProcessEnv): SpawnSyncReturns<string> => {
+    // A transient failure of the exec that lists the held tokens.
+    if (env.FAKE_DOCKER_SECRET_LIST_STATUS && script.includes("held-token-names")) {
+      return spawnResult({ status: Number(env.FAKE_DOCKER_SECRET_LIST_STATUS), stderr: "transient exec failure\n" });
+    }
+    if (script.includes("held-token-names") && env.FAKE_DOCKER_RESTART_ON_LISTING_ARM && fs.existsSync(env.FAKE_DOCKER_RESTART_ON_LISTING_ARM)) {
+      fs.writeFileSync(`${env.FAKE_DOCKER_RESTART_ON_LISTING_ARM}.restarted`, "");
+    }
+    if (script.includes("held-token-names") && env.FAKE_DOCKER_REPLACE_ON_LISTING_ARM && fs.existsSync(env.FAKE_DOCKER_REPLACE_ON_LISTING_ARM)) {
+      fs.writeFileSync(`${env.FAKE_DOCKER_REPLACE_ON_LISTING_ARM}.replaced`, "");
+    }
+    if (script.includes("request-proxy-status") && env.FAKE_DOCKER_RESTART_ON_STATUS_ARM && fs.existsSync(env.FAKE_DOCKER_RESTART_ON_STATUS_ARM)) {
+      fs.writeFileSync(`${env.FAKE_DOCKER_RESTART_ON_STATUS_ARM}.restarted`, "");
+    }
+    const root = fs.mkdtempSync(path.join(tmpBase, "fake-proxy-run-"));
+    try {
+      const at = (absolute: string): string => {
+        const file = path.join(root, absolute);
+        fs.mkdirSync(path.dirname(file), { recursive: true });
+        return file;
+      };
+      if (env.FAKE_DOCKER_VALIDATION_MARKER !== "missing") {
+        // Simulates the proxy's token store being replaced once the trigger
+        // file exists (the fake `op` creates its log on first resolution).
+        const swapTrigger = env.FAKE_DOCKER_MARKER_SWAP_AFTER ?? env.FAKE_DOCKER_MARKER_SWAP_FLAG;
+        fs.writeFileSync(at("/run/runfree-runtime-validation.json"), swapTrigger && fs.existsSync(swapTrigger)
+          ? JSON.stringify({ ...JSON.parse(validationMarkerJson), proofVersion: 999 })
+          : env.FAKE_DOCKER_VALIDATION_MARKER_JSON ?? validationMarkerJson);
+      }
+      const generation = env.FAKE_PROXY_STATUS_GENERATION ?? "";
+      if (generation) {
+        // Effective-control acknowledgement: both consumers name the selected
+        // effective policy generation as well as the network policy generation.
+        const control = env.FAKE_PROXY_STATUS_CONTROL_GENERATION
+          ? { controlGeneration: env.FAKE_PROXY_STATUS_CONTROL_GENERATION, policyGeneration: generation }
+          : {};
+        fs.writeFileSync(at("/run/runfree-proxy-status/firewall.json"), `${JSON.stringify({ generation, ...control, rulesetVerified: true, appliedAt: "2026-06-18T00:00:00.000Z" })}\n`);
+        fs.writeFileSync(at("/run/runfree-proxy-status/request-proxy/request-proxy.json"), `${JSON.stringify({ generation, ...control, appliedAt: "2026-06-18T00:00:00.000Z" })}\n`);
+      }
+      const secretDir = path.join(root, "run/runfree-proxy-secrets");
+      fs.mkdirSync(secretDir, { recursive: true });
+      for (const name of fakeProxySecretStore) fs.writeFileSync(path.join(secretDir, name), "fake-held-value");
+      const result = childProcess.spawnSync("/bin/sh", ["-c", script.replaceAll("'/run/", `'${root}/run/`)], { encoding: "utf8" });
+      // A proxy that answered with a damaged batch, while the arm exists.
+      const corrupt = env.FAKE_DOCKER_OBSERVATION_CORRUPT_ARM && fs.existsSync(env.FAKE_DOCKER_OBSERVATION_CORRUPT_ARM)
+        ? env.FAKE_DOCKER_OBSERVATION_CORRUPT
+        : undefined;
+      let stdout = result.stdout;
+      if (corrupt === "truncated") stdout = stdout.slice(0, Math.max(0, stdout.length - 12));
+      if (corrupt === "duplicate") stdout = stdout.replace(/\nend\n$/, `\n${stdout.split("\n").slice(1, 3).join("\n")}\nend\n`);
+      if (corrupt === "missing") stdout = `${stdout.split("\n")[0]}\nend\n`;
+      return spawnResult({ status: result.status ?? 1, stdout, stderr: result.stderr });
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  };
   registerFakeCommand(path.join(fakeBin, "docker"), (args, options) => {
     const env = envFromSpawnOptions(options);
     const stdin = spawnInputText(options.input);
@@ -565,6 +626,24 @@ function installTokenSyncDockerFake(options: { composeProject?: string; onMarker
       })}\n`);
     }
     const text = args.join(" ");
+    // A proxy replaced after an armed held-token listing: its exact ID no
+    // longer names a container.
+    if (env.FAKE_DOCKER_REPLACE_ON_LISTING_ARM && fs.existsSync(`${env.FAKE_DOCKER_REPLACE_ON_LISTING_ARM}.replaced`)
+      && (args[0] === "exec" || args[0] === "inspect") && args.includes(proxyId)) {
+      return spawnResult({ status: 1, stderr: `Error: No such container: ${proxyId}\n` });
+    }
+    // The proxy's incarnation as Docker reports it now: undefined models a
+    // reading that fails (FAKE_DOCKER_STARTED_AT_STATUS).
+    const startedAt = (): string | undefined => {
+      if (env.FAKE_DOCKER_STARTED_AT_STATUS) return undefined;
+      // A proxy restart that lands after an armed held-token listing, or
+      // after an armed precheck status-file read.
+      if ((env.FAKE_DOCKER_RESTART_ON_LISTING_ARM && fs.existsSync(`${env.FAKE_DOCKER_RESTART_ON_LISTING_ARM}.restarted`))
+        || (env.FAKE_DOCKER_RESTART_ON_STATUS_ARM && fs.existsSync(`${env.FAKE_DOCKER_RESTART_ON_STATUS_ARM}.restarted`))) {
+        return "2026-06-18T00:00:01.000000000Z";
+      }
+      return env.FAKE_DOCKER_STARTED_AT ?? "2026-06-18T00:00:00.000000000Z";
+    };
     if (args[0] === "info") return spawnResult();
     if (args[0] === "ps") {
       // Per-session runtime: no shared agent or Compose mcp_callback container.
@@ -577,7 +656,11 @@ function installTokenSyncDockerFake(options: { composeProject?: string; onMarker
     }
     if (args[0] === "inspect") {
       if (args[1] === "--format" && text.includes("io.runfree.agent-image-input-digest")) {
-        const rows = expectedTokenSyncComponentRows(args.slice(3), proxyId);
+        let rows = expectedTokenSyncComponentRows(args.slice(3), proxyId);
+        // The incarnation grouped into the component inspect.
+        if (text.includes("{{.State.StartedAt}}") && env.FAKE_DOCKER_COMPONENT_ROW_SHAPE !== "without-started-at") {
+          rows = rows.replace(/\n/g, `\t${startedAt() ?? ""}\n`);
+        }
         return spawnResult({
           stdout: env.FAKE_RUNTIME_COMPONENT_TAMPER === "1"
             // Container labels carry the composite v1 digests; the contract
@@ -589,23 +672,24 @@ function installTokenSyncDockerFake(options: { composeProject?: string; onMarker
       if (args[1] === proxyId || (args[1] === "agent-id" && args[2] === proxyId)) {
         return spawnResult({ stdout: dockerInspectSecurityEvidence(args.slice(1), proxyId) });
       }
+      if (text.includes(".State.Running") && text.includes(".State.StartedAt")) {
+        return spawnResult({ stdout: `true\t${startedAt() ?? ""}\n` });
+      }
       if (text.includes(".State.Running")) return spawnResult({ stdout: "true\n" });
       if (text.includes(".State.StartedAt")) {
-        if (env.FAKE_DOCKER_STARTED_AT_STATUS) {
+        const value = startedAt();
+        if (value === undefined) {
           return spawnResult({ status: Number(env.FAKE_DOCKER_STARTED_AT_STATUS), stderr: "transient inspect failure\n" });
         }
-        // A proxy restart that lands after an armed held-token listing, or
-        // after an armed precheck status-file read.
-        if ((env.FAKE_DOCKER_RESTART_ON_LISTING_ARM && fs.existsSync(`${env.FAKE_DOCKER_RESTART_ON_LISTING_ARM}.restarted`))
-          || (env.FAKE_DOCKER_RESTART_ON_STATUS_ARM && fs.existsSync(`${env.FAKE_DOCKER_RESTART_ON_STATUS_ARM}.restarted`))) {
-          return spawnResult({ stdout: "2026-06-18T00:00:01.000000000Z\n" });
-        }
-        return spawnResult({ stdout: "2026-06-18T00:00:00.000000000Z\n" });
+        return spawnResult({ stdout: `${value}\n` });
       }
       if (text.includes("com.docker.compose.project")) return spawnResult({ stdout: `${composeProjectLabel}\n` });
       return spawnResult();
     }
     if (args[0] !== "exec") return spawnResult();
+    if (text.includes(CREDENTIAL_OBSERVATION_BATCH_HEADER)) {
+      return fakeCredentialObservationBatch(String(args.at(-1)), env);
+    }
     if (text.includes("ls -1 '/run/runfree-proxy-secrets'")) {
       if (env.FAKE_DOCKER_SECRET_LIST_STATUS) {
         return spawnResult({ status: Number(env.FAKE_DOCKER_SECRET_LIST_STATUS), stderr: "transient exec failure\n" });
@@ -714,7 +798,7 @@ function installTokenSyncDockerFake(options: { composeProject?: string; onMarker
     }
     return spawnResult();
   });
-  return { dockerLog, fakeBin };
+  return { dockerLog, fakeBin, heldTokens: fakeProxySecretStore };
 }
 
 function installFakeOp(fakeBin: string, options: { exitCode?: number; logPath?: string; output?: string; stderr?: string } = {}): void {
@@ -868,6 +952,7 @@ function dockerExecCalls(logPath: string): Array<Record<string, unknown>> {
         && !args.includes("runfree_security_contract_probe")
         // Possession listing and generation status reads are sync bookkeeping,
         // not token traffic.
+        && !args.includes(CREDENTIAL_OBSERVATION_BATCH_HEADER)
         && !args.includes("ls -1 '/run/runfree-proxy-secrets'")
         && !args.includes("request-proxy.json");
     });
@@ -1797,10 +1882,13 @@ exit 0
     expect(dockerExecCalls(fakeDocker.dockerLog).map((entry) => entry.stdin)).toEqual(["onepassword-secret", "onepassword-secret", "three_secret", "three_secret"]);
     // Iteration 1 resolves all three; iteration 2 resolves three and skips one
     // and two. A token that is not due takes no action, so it costs no proxy
-    // re-observation; each iteration pays one post-loop fence.
+    // re-observation; each iteration pays one post-loop fence. A value the
+    // watcher read before its lock is taken from memory, so only its write
+    // is fenced.
     const markerReads = readJsonLines(fakeDocker.dockerLog).filter((entry) => Array.isArray(entry.args)
-      && entry.args[0] === "exec" && entry.args.join(" ").includes("cat /run/runfree-runtime-validation.json")).length;
-    expect(markerReads).toMatchInlineSnapshot(`12`);
+      && entry.args[0] === "exec" && entry.args.join(" ").includes(CREDENTIAL_OBSERVATION_BATCH_HEADER)
+      && entry.args.join(" ").includes("validation-marker")).length;
+    expect(markerReads).toMatchInlineSnapshot(`8`);
   });
 
   test("credential sync watch schedules non-multiple token intervals by each token's own due time", async () => {
@@ -3705,6 +3793,310 @@ describe("convergent proxy token store", () => {
       return { FAKE_PROXY_STATUS_CONTROL_GENERATION: ids.controlGeneration, FAKE_PROXY_STATUS_GENERATION: ids.policyGeneration };
     }
 
+    // Docker round trips per launch scenario, counted at the fake (call
+    // counts, not latency): preparation before the lock, then the locked
+    // receipt-gated sync, in the state a warm launch reaches (validated
+    // runtime proof, effective policy converged and acknowledged).
+    async function launchDockerCalls(
+      fakeDocker: { dockerLog: string; fakeBin: string },
+      hostOpBin: string,
+      env: NodeJS.ProcessEnv,
+    ): Promise<Readonly<{ status: number; stderr: string; prepare: number; sync: number }>> {
+      let start = 0;
+      let prepared = 0;
+      const result = await runAdmin(async () => {
+        start = readJsonLines(fakeDocker.dockerLog).length;
+        prepareRuntimeTokenSources({ mode: "convergence" });
+        prepared = readJsonLines(fakeDocker.dockerLog).length;
+        await credentialSyncIntent(warmSync);
+      }, { ...opEnv(fakeDocker, hostOpBin), ...env }, { policyAccess: "effective-read-only", validatedRuntime: tokenSyncValidatedRuntime() });
+      return { status: result.status, stderr: result.stderr, prepare: prepared - start, sync: readJsonLines(fakeDocker.dockerLog).length - prepared };
+    }
+
+    test("launch Docker call counts: clean zero-source launch", async () => {
+      writeFixtureRepo({ hosts: ["api.example.com"], tokens: {} });
+      selectEffectiveControlsFromProjectPolicy();
+      const fakeDocker = installTokenSyncDockerFake();
+      const launch = await launchDockerCalls(fakeDocker, makeHostOpBin(), await convergeSelectedGeneration());
+      expect(launch.status, launch.stderr).toBe(0);
+      // The shipped zero-token skip: nothing to spare, nothing to sync.
+      expect({ prepare: launch.prepare, sync: launch.sync }).toEqual({ prepare: 0, sync: 0 });
+    });
+
+    test("launch Docker call counts: fresh credential-bearing launch that reads no source", async () => {
+      writeGithubOnePasswordFixture();
+      const fakeDocker = installTokenSyncDockerFake();
+      const hostOpBin = makeHostOpBin();
+      installFakeOp(hostOpBin, { output: "ghp_secret\n" });
+      await populate(fakeDocker, hostOpBin);
+      const launch = await launchDockerCalls(fakeDocker, hostOpBin, await convergeSelectedGeneration());
+      expect(launch.status, launch.stderr).toBe(0);
+      // Preparation: one component inspect that also reads the incarnation, one
+      // root exec for the marker and the held names, one incarnation reading
+      // after it. Sync: the precheck's observation (marker and both
+      // acknowledgements in one exec), the held-token listing under the
+      // token-store lock, and the fence before persistence.
+      expect({ prepare: launch.prepare, sync: launch.sync }).toEqual({ prepare: 3, sync: 6 });
+    });
+
+    test("launch Docker call counts: due source re-read before the lock and written", async () => {
+      writeGithubOnePasswordFixture();
+      const fakeDocker = installTokenSyncDockerFake();
+      const hostOpBin = makeHostOpBin();
+      installFakeOp(hostOpBin, { output: "ghp_secret\n" });
+      await populate(fakeDocker, hostOpBin);
+      const [receipt] = readReceiptsFile();
+      fs.writeFileSync(receiptsFilePath(), `${JSON.stringify({ schemaVersion: 1, receipts: [{ ...receipt, resolvedAt: Date.now() - 16 * 60 * 1000 }] })}\n`);
+      const launch = await launchDockerCalls(fakeDocker, hostOpBin, await convergeSelectedGeneration());
+      expect(launch.status, launch.stderr).toBe(0);
+      // The written token adds only its write fence and the write: the value
+      // was read before the lock, so no fence precedes taking it from memory.
+      expect({ prepare: launch.prepare, sync: launch.sync }).toEqual({ prepare: 3, sync: 9 });
+    });
+
+    test("launch Docker call counts: proxy restarted since the receipt", async () => {
+      writeGithubOnePasswordFixture();
+      const fakeDocker = installTokenSyncDockerFake();
+      const hostOpBin = makeHostOpBin();
+      installFakeOp(hostOpBin, { output: "ghp_secret\n" });
+      await populate(fakeDocker, hostOpBin);
+      const launch = await launchDockerCalls(fakeDocker, hostOpBin, {
+        ...await convergeSelectedGeneration(),
+        FAKE_DOCKER_STARTED_AT: "2026-06-18T00:05:00.000000000Z",
+      });
+      expect(launch.status, launch.stderr).toBe(0);
+      // The receipt names the previous incarnation, so the source is re-read
+      // before the lock and written: the same calls as a due source.
+      expect({ prepare: launch.prepare, sync: launch.sync }).toEqual({ prepare: 3, sync: 9 });
+    });
+
+    describe("batched credential observations", () => {
+      const launchState = () => ({ policyAccess: "effective-read-only" as const, validatedRuntime: tokenSyncValidatedRuntime() });
+      const opLog = () => path.join(tmpBase, `batch-op-${Math.random().toString(16).slice(2)}.jsonl`);
+
+      async function populatedLaunch(): Promise<{ fakeDocker: ReturnType<typeof installTokenSyncDockerFake>; hostOpBin: string; opLogPath: string; ackEnv: NodeJS.ProcessEnv }> {
+        writeGithubOnePasswordFixture();
+        const fakeDocker = installTokenSyncDockerFake();
+        const hostOpBin = makeHostOpBin();
+        const opLogPath = opLog();
+        installFakeOp(hostOpBin, { logPath: opLogPath, output: "ghp_secret\n" });
+        await populate(fakeDocker, hostOpBin);
+        return { fakeDocker, hostOpBin, opLogPath, ackEnv: await convergeSelectedGeneration() };
+      }
+
+      function heldListings(logPath: string, from = 0): number {
+        return readJsonLines(logPath).slice(from).filter((entry) => Array.isArray(entry.args)
+          && entry.args.join(" ").includes(CREDENTIAL_OBSERVATION_BATCH_HEADER) && entry.args.join(" ").includes("held-token-names")).length;
+      }
+
+      test.each(["truncated", "duplicate", "missing"])("a %s batch section in preparation skips no source read", async (corrupt) => {
+        const { fakeDocker, hostOpBin, opLogPath, ackEnv } = await populatedLaunch();
+        const arm = path.join(tmpBase, `corrupt-${corrupt}.arm`);
+        const readsBefore = readJsonLines(opLogPath).length;
+
+        const launch = await runAdmin(async () => {
+          fs.writeFileSync(arm, "");
+          prepareRuntimeTokenSources({ mode: "convergence" });
+          fs.rmSync(arm);
+          await credentialSyncIntent(warmSync);
+        }, { ...opEnv(fakeDocker, hostOpBin), ...ackEnv, FAKE_DOCKER_OBSERVATION_CORRUPT: corrupt, FAKE_DOCKER_OBSERVATION_CORRUPT_ARM: arm }, launchState());
+
+        expect(launch.status, launch.stderr).toBe(0);
+        // The held value would have been spared; an unusable observation spares nothing.
+        expect(readJsonLines(opLogPath)).toHaveLength(readsBefore + 1);
+        expect(tokenWrites(fakeDocker.dockerLog)).toBe(2);
+      });
+
+      test.each(["truncated", "duplicate", "missing"])("a %s batch section in the locked sync refuses before any write, removal or persistence", async (corrupt) => {
+        const { fakeDocker, hostOpBin, ackEnv } = await populatedLaunch();
+        const [receipt] = readReceiptsFile();
+        fs.writeFileSync(receiptsFilePath(), `${JSON.stringify({ schemaVersion: 1, receipts: [{ ...receipt, resolvedAt: Date.now() - 16 * 60 * 1000 }] })}\n`);
+        const receiptsBefore = fs.readFileSync(receiptsFilePath(), "utf8");
+        const arm = path.join(tmpBase, `corrupt-locked-${corrupt}.arm`);
+
+        const launch = await runAdmin(async () => {
+          prepareRuntimeTokenSources({ mode: "convergence" });
+          fs.writeFileSync(arm, "");
+          await credentialSyncIntent(warmSync);
+        }, { ...opEnv(fakeDocker, hostOpBin), ...ackEnv, FAKE_DOCKER_OBSERVATION_CORRUPT: corrupt, FAKE_DOCKER_OBSERVATION_CORRUPT_ARM: arm }, launchState());
+
+        expect(launch.status).not.toBe(0);
+        expect(launch.stderr).toContain("runtime is proxy-unreachable");
+        expect(tokenWrites(fakeDocker.dockerLog)).toBe(1);
+        expect(tokenRemovalCount(fakeDocker.dockerLog)).toBe(0);
+        expect(fs.readFileSync(receiptsFilePath(), "utf8")).toBe(receiptsBefore);
+      });
+
+      test("a component inspect without the incarnation field refuses the runtime before any source read or write", async () => {
+        const { fakeDocker, hostOpBin, opLogPath, ackEnv } = await populatedLaunch();
+        const readsBefore = readJsonLines(opLogPath).length;
+
+        const launch = await runAdmin(async () => {
+          prepareRuntimeTokenSources({ mode: "convergence" });
+          await credentialSyncIntent(warmSync);
+        }, { ...opEnv(fakeDocker, hostOpBin), ...ackEnv, FAKE_DOCKER_COMPONENT_ROW_SHAPE: "without-started-at" }, launchState());
+
+        expect(launch.status).not.toBe(0);
+        expect(launch.stderr).toContain("runtime component container identities changed");
+        // Preparation skipped nothing (one read); the locked sync refused before writing it.
+        expect(readJsonLines(opLogPath)).toHaveLength(readsBefore + 1);
+        expect(tokenWrites(fakeDocker.dockerLog)).toBe(1);
+        expect(tokenRemovalCount(fakeDocker.dockerLog)).toBe(0);
+      });
+
+      test("a same-ID restart inside the preparation observation spares no read, and the locked sync writes to the new incarnation", async () => {
+        const { fakeDocker, hostOpBin, opLogPath, ackEnv } = await populatedLaunch();
+        const arm = path.join(tmpBase, "prepare-restart.arm");
+        fs.writeFileSync(arm, "");
+        const readsBefore = readJsonLines(opLogPath).length;
+        const result = await runAdmin(async () => {
+          prepareRuntimeTokenSources({ mode: "convergence" });
+          // The restart wiped the proxy tmpfs.
+          fakeDocker.heldTokens.clear();
+          await credentialSyncIntent(warmSync);
+        }, { ...opEnv(fakeDocker, hostOpBin), ...ackEnv, FAKE_DOCKER_RESTART_ON_LISTING_ARM: arm }, launchState());
+
+        expect(fs.existsSync(`${arm}.restarted`)).toBe(true);
+        expect(result.status, result.stderr).toBe(0);
+        expect(readJsonLines(opLogPath)).toHaveLength(readsBefore + 1);
+        expect(tokenWrites(fakeDocker.dockerLog)).toBe(2);
+        // The receipt binds the new incarnation: the next launch against it
+        // spares the read again.
+        const next = await launchDockerCalls(fakeDocker, hostOpBin, { ...ackEnv, FAKE_DOCKER_RESTART_ON_LISTING_ARM: arm });
+        expect(next.status, next.stderr).toBe(0);
+        expect(readJsonLines(opLogPath)).toHaveLength(readsBefore + 1);
+        expect(tokenWrites(fakeDocker.dockerLog)).toBe(2);
+      });
+
+      test("a proxy replaced after the locked listing refuses the write; a retry against the live proxy succeeds", async () => {
+        const { fakeDocker, hostOpBin, ackEnv } = await populatedLaunch();
+        const [receipt] = readReceiptsFile();
+        fs.writeFileSync(receiptsFilePath(), `${JSON.stringify({ schemaVersion: 1, receipts: [{ ...receipt, resolvedAt: Date.now() - 16 * 60 * 1000 }] })}\n`);
+        const arm = path.join(tmpBase, "replace.arm");
+
+        const refused = await runAdmin(async () => {
+          prepareRuntimeTokenSources({ mode: "convergence" });
+          fs.writeFileSync(arm, "");
+          await credentialSyncIntent(warmSync);
+        }, { ...opEnv(fakeDocker, hostOpBin), ...ackEnv, FAKE_DOCKER_REPLACE_ON_LISTING_ARM: arm }, launchState());
+
+        expect(fs.existsSync(`${arm}.replaced`)).toBe(true);
+        expect(refused.status).not.toBe(0);
+        expect(`${refused.stdout}${refused.stderr}`).toContain("exact proxy or token store changed during credential resolution");
+        expect(tokenWrites(fakeDocker.dockerLog)).toBe(1);
+        expect(tokenRemovalCount(fakeDocker.dockerLog)).toBe(0);
+
+        const retried = await launchDockerCalls(fakeDocker, hostOpBin, ackEnv);
+        expect(retried.status, retried.stderr).toBe(0);
+        expect(tokenWrites(fakeDocker.dockerLog)).toBe(2);
+      });
+
+      test("a held file deleted after preparation makes the token due, and the locked sync defers before any write", async () => {
+        const { fakeDocker, hostOpBin, opLogPath, ackEnv } = await populatedLaunch();
+        const readsBefore = readJsonLines(opLogPath).length;
+
+        const deferred = await runAdmin(async () => {
+          prepareRuntimeTokenSources({ mode: "convergence" });
+          fakeDocker.heldTokens.delete("github");
+          await credentialSyncIntent(warmSync);
+        }, { ...opEnv(fakeDocker, hostOpBin), ...ackEnv }, launchState());
+
+        expect(deferred.status).toBe(TOKEN_SYNC_DEFERRED_STATUS);
+        expect(deferred.stdout).toContain("github is due and its source was not read before the lock");
+        // The preparation's held set spared the read; the locked listing, not
+        // the preparation's evidence, decided the write.
+        expect(readJsonLines(opLogPath)).toHaveLength(readsBefore);
+        expect(tokenWrites(fakeDocker.dockerLog)).toBe(1);
+        expect(tokenRemovalCount(fakeDocker.dockerLog)).toBe(0);
+      });
+
+      test("a changed consumer acknowledgement refuses the locked sync before any write; matching acknowledgements reclaim it", async () => {
+        const { fakeDocker, hostOpBin, ackEnv } = await populatedLaunch();
+        const [receipt] = readReceiptsFile();
+        fs.writeFileSync(receiptsFilePath(), `${JSON.stringify({ schemaVersion: 1, receipts: [{ ...receipt, resolvedAt: Date.now() - 16 * 60 * 1000 }] })}\n`);
+
+        const refused = await runAdmin(async () => {
+          prepareRuntimeTokenSources({ mode: "convergence" });
+          await credentialSyncIntent(warmSync);
+        }, { ...opEnv(fakeDocker, hostOpBin), ...ackEnv, FAKE_PROXY_STATUS_GENERATION: "sha256:another-generation" }, launchState());
+
+        expect(refused.status).not.toBe(0);
+        expect(refused.stderr).toContain("credential resolution requires request-proxy and firewall acknowledgement of the selected effective policy generation");
+        expect(tokenWrites(fakeDocker.dockerLog)).toBe(1);
+        expect(tokenRemovalCount(fakeDocker.dockerLog)).toBe(0);
+
+        const reclaimed = await launchDockerCalls(fakeDocker, hostOpBin, ackEnv);
+        expect(reclaimed.status, reclaimed.stderr).toBe(0);
+        expect(tokenWrites(fakeDocker.dockerLog)).toBe(2);
+      });
+
+      test("an effective policy selected after preparation refuses the locked sync before any write; converging it reclaims", async () => {
+        const { fakeDocker, hostOpBin } = await populatedLaunch();
+        const [receipt] = readReceiptsFile();
+        fs.writeFileSync(receiptsFilePath(), `${JSON.stringify({ schemaVersion: 1, receipts: [{ ...receipt, resolvedAt: Date.now() - 16 * 60 * 1000 }] })}\n`);
+        const staleAckEnv = await convergeSelectedGeneration();
+
+        const refused = await runAdmin(async () => {
+          prepareRuntimeTokenSources({ mode: "convergence" });
+          // Another host reselects a policy generation between preparation and the lock.
+          const policy = readPolicy();
+          fs.writeFileSync(path.join(tmp, ".runfree/network-policy.json"), `${JSON.stringify({ ...policy, hosts: [...policy.hosts ?? [], "drift.example.com"] }, null, 2)}\n`);
+          selectEffectiveControlsFromProjectPolicy();
+          await credentialSyncIntent(warmSync);
+        }, { ...opEnv(fakeDocker, hostOpBin), ...staleAckEnv }, launchState());
+
+        expect(refused.status).not.toBe(0);
+        expect(tokenWrites(fakeDocker.dockerLog)).toBe(1);
+        expect(tokenRemovalCount(fakeDocker.dockerLog)).toBe(0);
+
+        const reclaimed = await launchDockerCalls(fakeDocker, hostOpBin, await convergeSelectedGeneration());
+        expect(reclaimed.status, reclaimed.stderr).toBe(0);
+        expect(tokenWrites(fakeDocker.dockerLog)).toBe(2);
+      });
+
+      test("token-store lock contention defers the locked sync before it lists held tokens", async () => {
+        const { fakeDocker, hostOpBin, ackEnv } = await populatedLaunch();
+        const lockPath = path.join(adminStateDir(), `token-store-sync-${projectHash(tmp)}.lock`);
+        const holder = childProcess.spawn(process.execPath, ["-e", "setTimeout(() => {}, 30000)"], { stdio: "ignore" });
+        let prepared = 0;
+        try {
+          fs.mkdirSync(lockPath, { recursive: true });
+          fs.writeFileSync(path.join(lockPath, "pid"), `${holder.pid}\n`);
+          const deferred = await runAdmin(async () => {
+            prepareRuntimeTokenSources({ mode: "convergence" });
+            prepared = readJsonLines(fakeDocker.dockerLog).length;
+            await credentialSyncIntent(warmSync);
+          }, { ...opEnv(fakeDocker, hostOpBin), ...ackEnv }, launchState());
+          expect(deferred.status).toBe(TOKEN_SYNC_DEFERRED_STATUS);
+          expect(heldListings(fakeDocker.dockerLog, prepared)).toBe(0);
+          expect(tokenWrites(fakeDocker.dockerLog)).toBe(1);
+        } finally {
+          holder.kill("SIGKILL");
+          fs.rmSync(lockPath, { recursive: true, force: true });
+        }
+        // Reclaim: once the holder is gone the same launch completes.
+        const free = await launchDockerCalls(fakeDocker, hostOpBin, ackEnv);
+        expect(free.status, free.stderr).toBe(0);
+      });
+
+      test("a receipt reused without a read keeps its age; past the warm bound it is read again", async () => {
+        const { fakeDocker, hostOpBin, opLogPath, ackEnv } = await populatedLaunch();
+        const [receipt] = readReceiptsFile();
+        const readsBefore = readJsonLines(opLogPath).length;
+
+        const reused = await launchDockerCalls(fakeDocker, hostOpBin, ackEnv);
+        expect(reused.status, reused.stderr).toBe(0);
+        expect(readJsonLines(opLogPath)).toHaveLength(readsBefore);
+        expect(readReceiptsFile()).toEqual([receipt]);
+
+        fs.writeFileSync(receiptsFilePath(), `${JSON.stringify({ schemaVersion: 1, receipts: [{ ...receipt, resolvedAt: Date.now() - 16 * 60 * 1000 }] })}\n`);
+        const expired = await launchDockerCalls(fakeDocker, hostOpBin, ackEnv);
+        expect(expired.status, expired.stderr).toBe(0);
+        expect(readJsonLines(opLogPath)).toHaveLength(readsBefore + 1);
+        expect(readReceiptsFile()[0].resolvedAt).toBeGreaterThan(receipt.resolvedAt);
+      });
+    });
+
     test("a warm sync with nothing to write observes the proxy once more for the write fence and never lists compose containers", async () => {
       writeGithubOnePasswordFixture();
       const fakeDocker = installTokenSyncDockerFake();
@@ -3727,10 +4119,12 @@ describe("convergent proxy token store", () => {
       expect(tokenWrites(fakeDocker.dockerLog)).toBe(writesBefore);
       const log = readJsonLines(fakeDocker.dockerLog).slice(logBefore).filter((entry) => Array.isArray(entry.args));
       const joined = log.map((entry) => (entry.args as string[]).join(" "));
-      const markerReads = joined.filter((args) => args.startsWith("exec") && args.includes("cat /run/runfree-runtime-validation.json")).length;
+      const markerReads = joined.filter((args) => args.startsWith("exec") && args.includes(CREDENTIAL_OBSERVATION_BATCH_HEADER) && args.includes("validation-marker")).length;
       const startedAtReads = joined.filter((args) => args.includes("{{.State.StartedAt}}")).length;
       const composeLookups = joined.filter((args) => args.startsWith("ps") || args.startsWith("container ls")).length;
-      expect({ markerReads, startedAtReads, composeLookups }).toEqual({ markerReads: 2, startedAtReads: 2, composeLookups: 0 });
+      // The precheck reads its incarnation before (grouped into the component
+      // inspect) and after its batch; the write fence reads it once more.
+      expect({ markerReads, startedAtReads, composeLookups }).toEqual({ markerReads: 2, startedAtReads: 3, composeLookups: 0 });
     });
 
     test("an effective-policy watcher reads no source while another control operation holds the control lock, and reads it once the lock is free", async () => {
@@ -3794,7 +4188,7 @@ describe("convergent proxy token store", () => {
       expect(readReceiptsFile()).toHaveLength(0);
     });
 
-    test("a warm sync refuses the token write when the proxy restarts during the precheck's own status read, and a retry then succeeds", async () => {
+    test("a warm sync refuses before any write when the proxy restarts during the precheck's own observation, and a retry then succeeds", async () => {
       writeGithubOnePasswordFixture();
       const fakeDocker = installTokenSyncDockerFake();
       const hostOpBin = makeHostOpBin();
@@ -3817,11 +4211,13 @@ describe("convergent proxy token store", () => {
         FAKE_DOCKER_RESTART_ON_STATUS_ARM: restartArm,
       }, { policyAccess: "effective-read-only", validatedRuntime: tokenSyncValidatedRuntime() });
 
-      // The restart happened during the precheck itself, before the sync's
-      // own work started; the later write fence still catches it.
+      // The restart happened inside the precheck's own batched observation
+      // (marker and acknowledgements in one exec): the incarnation read after
+      // it differs from the one read before, so nothing of that batch is
+      // evidence and the sync stops before its own work starts.
       expect(fs.existsSync(`${restartArm}.restarted`)).toBe(true);
       expect(refused.status).not.toBe(0);
-      expect(`${refused.stdout}${refused.stderr}`).toContain("exact proxy or token store changed during credential resolution");
+      expect(`${refused.stdout}${refused.stderr}`).toContain("credential resolution requires a validated running proxy; runtime is proxy-unreachable");
       expect(tokenWrites(fakeDocker.dockerLog)).toBe(0);
       expect(dockerExecCalls(fakeDocker.dockerLog).some((entry) => String((entry.args as string[]).at(-1)).includes("mv '/run/runfree-proxy-secrets/"))).toBe(false);
       expect(readReceiptsFile()).toHaveLength(0);
@@ -4263,7 +4659,8 @@ describe("convergent proxy token store", () => {
     };
     expect((await runAdmin(() => credentialSyncIntent(syncInput), env)).status).toBe(0);
     const listings = readJsonLines(fakeDocker.dockerLog).filter((entry) =>
-      Array.isArray(entry.args) && entry.args.join(" ").includes("ls -1 '/run/runfree-proxy-secrets'"));
+      Array.isArray(entry.args) && entry.args.join(" ").includes(CREDENTIAL_OBSERVATION_BATCH_HEADER)
+      && entry.args.join(" ").includes("held-token-names"));
     expect(listings).toHaveLength(1);
 
     // Corrupted receipts file: no receipts (fail-open to re-resolution), never a crash.
