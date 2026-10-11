@@ -332,6 +332,37 @@ describe("launch latency: sub-second launch plan Phase B", () => {
     }
   }, TEST_TIMEOUT_MS);
 
+  coreTest("concurrent launches beside a held live peer each succeed under the lock while the peer keeps being answered", async () => {
+    let peers: HeldPeer[] = [];
+    try {
+      peers = await startHeldPeers(fixture, 1);
+      releaseHoldMarker(fixture);
+      const sampler = samplePeerRequests(peers.map((peer) => peer.container), `https://${SHARED_CREDENTIAL_HOST}/`);
+      let launched: Array<Readonly<{ status: number | null; output: string }>> = [];
+      try {
+        launched = await Promise.all([0, 1].map(() => startRunfree(fixture, ["claude"], { RUNFREE_TIMINGS: "1" }).completion));
+      } finally {
+        const samples = await sampler.stop();
+        expect(samples.filter((sample) => !sample.answered), "a peer request was lost during the concurrent launches").toEqual([]);
+      }
+      for (const run of launched) {
+        expect(run.status, describeOutput(run.output, 4000)).toBe(0);
+        // Each judged under its own hold: a match, or a miss that validated
+        // fully (the other launch's session may be mid-teardown beside it).
+        const verdict = timing(run.output, "validation:warm-peer").at(-1) ?? "";
+        expect(verdict.startsWith("match") || verdict.startsWith("miss:"), describeOutput(run.output)).toBe(true);
+        if (verdict.startsWith("miss:")) expect(milliseconds(run.output, "runtime-validation")).toBeGreaterThan(0);
+      }
+      expect(launched.some((run) => timing(run.output, "validation:warm-peer").at(-1) === "match"),
+        "neither concurrent launch took the warm peer path").toBe(true);
+      expect(dockerOrThrow("peer state", ["inspect", "-f", "{{.State.Running}}", (peers[0] as HeldPeer).container])).toBe("true");
+    } finally {
+      releaseHoldMarker(fixture);
+      await endHeldPeers(peers);
+      await forceCleanSessions(fixture);
+    }
+  }, TEST_TIMEOUT_MS);
+
   coreTest("a peer whose owner died is a warm peer miss: the launch validates fully, reconciles it away, and the warm path comes back", async () => {
     let peers: HeldPeer[] = [];
     try {

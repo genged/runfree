@@ -456,6 +456,8 @@ describe("the warm-empty skip falls back to the full reconcile on a real orphan 
       expect(shim.fired(), `the shim never saw admission's network read: ${describeOutput(refused.output, 4000)}`).toBe(true);
       expect(timing(refused.output, "validation:warm-peer"), describeOutput(refused.output)).toContain("match");
       expect(refused.status, describeOutput(refused.output, 4000)).not.toBe(0);
+      // Refused by the exact participant baseline, not by any other failure.
+      expect(refused.output, describeOutput(refused.output, 4000)).toContain("Docker internal network contains an unknown participant");
       // Refused before allocation: no new session container exists.
       expect(sessionContainers(fixture).filter((id) => !before.has(id))).toEqual([]);
       // Reclaim: once the external container is gone, the next launch beside
