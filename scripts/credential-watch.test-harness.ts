@@ -111,7 +111,7 @@ async function runCredentialSync(argv: readonly string[]): Promise<void> {
 }
 
 // The stop-protocol probe. It holds the lifetime pipe the way the watcher
-// does after its fix (a socket, so the process can exit while the parent
+// does (a socket, so the process can exit while the parent
 // keeps the pipe), never exits on its own signal, and starts one child in its
 // own process group that records any SIGTERM it receives.
 function runStopProbe(probeDir: string): void {

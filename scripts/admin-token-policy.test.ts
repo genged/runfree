@@ -3726,6 +3726,36 @@ describe("convergent proxy token store", () => {
       expect({ markerReads, startedAtReads, composeLookups }).toEqual({ markerReads: 2, startedAtReads: 2, composeLookups: 0 });
     });
 
+    test("an effective-policy watcher reads no source while another control operation holds the control lock, and reads it once the lock is free", async () => {
+      // The watcher reads sources before its lock; the same precheck the
+      // locked pass runs still comes first.
+      writeGithubOnePasswordFixture();
+      const fakeDocker = installTokenSyncDockerFake();
+      const hostOpBin = makeHostOpBin();
+      const opLogPath = path.join(tmpBase, `watch-busy-op-${Math.random().toString(16).slice(2)}.jsonl`);
+      installFakeOp(hostOpBin, { logPath: opLogPath, output: "ghp_secret\n" });
+      await populate(fakeDocker, hostOpBin);
+      const ackEnv = await convergeSelectedGeneration();
+      const watchInput = { ...syncInput, watch: true, initialSourceTruth: true };
+      const watchEnv = { ...opEnv(fakeDocker, hostOpBin), ...ackEnv, RUNFREE_TEST_TOKEN_SYNC_WATCH_ITERATIONS: "1", RUNFREE_TEST_TOKEN_SYNC_WATCH_SLEEP_MS: "1" };
+      const stateOverrides = { policyAccess: "effective-read-only" as const, validatedRuntime: tokenSyncValidatedRuntime() };
+      const readsBefore = readJsonLines(opLogPath).length;
+      const held = tryAcquireControlLock(adminProjectInfoForTokenSync());
+      expect(held).toBeDefined();
+      try {
+        const busy = await runAdmin(() => credentialSyncIntent(watchInput), watchEnv, stateOverrides);
+        expect(busy.stderr).toContain("credential resolution cannot start while another control operation is in progress");
+        expect(readJsonLines(opLogPath)).toHaveLength(readsBefore);
+        expect(tokenRemovalCount(fakeDocker.dockerLog)).toBe(0);
+      } finally {
+        held?.release();
+      }
+      const free = await runAdmin(() => credentialSyncIntent(watchInput), watchEnv, stateOverrides);
+      expect(free.status, free.stderr).toBe(0);
+      expect(readJsonLines(opLogPath)).toHaveLength(readsBefore + 1);
+      expect(readTokenStatus().github).toMatchObject({ ok: true, state: "ok" });
+    });
+
     test("a warm sync refuses the token write when the proxy restarts after the precheck observed it", async () => {
       writeGithubOnePasswordFixture();
       const fakeDocker = installTokenSyncDockerFake();
@@ -4441,9 +4471,10 @@ describe("credential writes against a moving proxy replacement", () => {
   });
 });
 
-// F08: cancelling a credential watch — the session exits, its parent closes
-// the lifetime pipe and signals the watcher's process group — must never read
-// as a definitive provider failure that deletes a valid shared credential.
+// F08: cancelling a credential watch — the session exits (its parent closes
+// the lifetime pipe and signals the watcher), a Ctrl-C, a vanished parent, a
+// signal — must never read as a definitive provider failure that deletes a
+// valid shared credential.
 //
 // These are real-subprocess reproductions. The session parent is
 // scripts/credential-watch.test-harness.ts, which starts and stops the watcher
@@ -4455,12 +4486,12 @@ describe("credential writes against a moving proxy replacement", () => {
 // signals. Docker is the same in-process fake as the rest of this file, reached
 // from the watcher through a small executable bridge on a Unix socket.
 //
-// `reproduction` (a `test.fails`) marks a reproduction of the current
-// defect; the fix flips each to `test`. Until then a harness failure would
-// also count as the expected failure, so each reproduction marks the point
-// where its effect assertion runs, and the last test of the block fails if a
-// reproduction that started never got there. The plain tests pin behavior
-// that must not change: genuine failures while the parent is alive.
+// `reproduction` marks a test that reproduced the defect before the fix (as
+// an expected failure). Each marks the point where its effect assertion
+// runs, and the last test of the block fails if a reproduction that started
+// never got there, so a harness failure can never pass for evidence. The
+// other tests pin behavior that must not change: genuine failures while the
+// parent is alive.
 describe("credential watcher cancellation (F08)", () => {
   // Measured from the cancelling event: the watcher and every provider
   // process it started are gone, and nothing it does afterwards reaches the
@@ -4479,7 +4510,7 @@ describe("credential watcher cancellation (F08)", () => {
   const reproductionProgress = new Map<string, boolean>();
 
   function reproduction(name: string, body: () => Promise<void>): void {
-    test.fails(name, async () => {
+    test(name, async () => {
       reproductionProgress.set(expect.getState().currentTestName ?? name, false);
       await body();
     }, 60_000);
@@ -4577,6 +4608,10 @@ describe("credential watcher cancellation (F08)", () => {
       "  slow-fail) sleep 2; status=1 ;;",
       "  fail-empty) status=1 ;;",
       "  fail-unmatched) echo 'not a field secret reference' >&2; status=1 ;;",
+      // How a revocation at the source shows: a classified definitive failure.
+      "  fail-not-found) echo \"\\\"$item\\\" isn't an item in the \\\"Private\\\" vault\" >&2; status=1 ;;",
+      // A private key the test wrote next to the script (a JWT source's key).
+      "  pem) cat \"$dir/pem\" ;;",
       // The provider's own signal, with the parent alive.
       "  self-term) kill -TERM $$; sleep 5 ;;",
       "esac",
@@ -5205,6 +5240,141 @@ describe("credential watcher cancellation (F08)", () => {
     expect(tokenRemovalCount(fakeDocker.dockerLog, "github")).toBeGreaterThanOrEqual(1);
     expect(readReceiptNames()).toEqual([]);
     expect(readTokenStatus().github).toMatchObject({ ok: false, state: "failed", message: "op read failed" });
+  }, 60_000);
+
+  test("definitive revocation still deletes", async () => {
+    const { fakeDocker, op } = await oneTokenFixture();
+    await seed(fakeDocker, [op.bin]);
+    const { socketPath } = await startDockerBridge(fakeDocker.fakeBin);
+    op.setMode("read", "fail-not-found");
+
+    // The watcher's detached first pass keeps a value it merely cannot read,
+    // but a classified definitive failure is how a revocation shows.
+    const parent = await startWatchParent({ launch: "runtime", initialSourceTruth: true }, harnessEnv(fakeDocker, socketPath, [op.bin]));
+    expect(await waitUntil(() => fs.existsSync(`${parent.configPath}.done`), 30_000)).toBe(true);
+    parent.send("stop");
+
+    // The first pass removes it; the watch's retry of the failed source may
+    // remove the already absent file once more.
+    expect(tokenRemovalCount(fakeDocker.dockerLog, "github")).toBeGreaterThanOrEqual(1);
+    expect(readReceiptNames()).toEqual([]);
+    expect(readTokenStatus().github).toMatchObject({ ok: false, state: "failed" });
+    expect(readTokenStatus().github.message).toContain("isn't an item");
+  }, 60_000);
+
+  test("cancelled source preserves byte-identical receipt", async () => {
+    // A JWT source: the watcher's cancellation reaches the private key's read.
+    writeFixtureRepo({
+      hosts: ["api.appstoreconnect.apple.com"],
+      tokens: {
+        "appstore-connect": {
+          description: "App Store Connect token",
+          credentials: [{ host: "api.appstoreconnect.apple.com", header: "Authorization", scheme: "bearer" }],
+        },
+      },
+    });
+    const fakeDocker = installTokenSyncDockerFake();
+    const op = installScriptedProvider("op");
+    const { privateKey } = crypto.generateKeyPairSync("ec", { namedCurve: "P-256" });
+    fs.writeFileSync(path.join(op.dir, "pem"), privateKey.export({ format: "pem", type: "pkcs8" }).toString());
+    op.setMode("read", "pem");
+    const opEnv = { OP_SERVICE_ACCOUNT_TOKEN: "op-session", PATH: [fakeDocker.fakeBin, op.bin, process.env.PATH ?? ""].join(path.delimiter) };
+    expect((await runAdmin(() => sourceAddJwtIntent({
+      name: "appstore-connect-jwt",
+      replaceSource: false,
+      alg: "ES256",
+      privateKeyRef: "op://Private/AuthKey_KEY123",
+      ttl: "19m",
+      claims: ["iss=ISSUER123", "aud=appstoreconnect-v1"],
+      headers: ["kid=KEY123"],
+    }), opEnv)).status).toBe(0);
+    writeTokenConfig({ "appstore-connect": { source: "named", name: "appstore-connect-jwt" } });
+    await seed(fakeDocker, [op.bin]);
+    const { socketPath } = await startDockerBridge(fakeDocker.fakeBin);
+    const receiptsBefore = fs.readFileSync(tokenReceiptsFilePath());
+    const statusBefore = fs.readFileSync(tokenStatusFilePath());
+    op.setMode("read", "hang");
+
+    const parent = await startWatchParent({ launch: "runtime", initialSourceTruth: true }, harnessEnv(fakeDocker, socketPath, [op.bin]));
+    const keyRead = await waitForProviderStart(op, parent.watcherPid, "read", "AuthKey_KEY123");
+    parent.send("stop");
+    const cleanup = await settleAfterCancellation(parent.watcherPid, [keyRead.pid]);
+
+    expect(cleanup).toEqual({ watcherGone: true, providersRunning: [] });
+    expect(fs.readFileSync(tokenReceiptsFilePath()).equals(receiptsBefore)).toBe(true);
+    expect(fs.readFileSync(tokenStatusFilePath()).equals(statusBefore)).toBe(true);
+    expect(tokenRemovalCount(fakeDocker.dockerLog, "appstore-connect")).toBe(0);
+  }, 60_000);
+
+  test("next warm launch does not re-read due to cancellation damage", async () => {
+    const { fakeDocker, op } = await oneTokenFixture();
+    await seed(fakeDocker, [op.bin]);
+    const { socketPath } = await startDockerBridge(fakeDocker.fakeBin);
+    op.setMode("read", "hang");
+    const parent = await startWatchParent({ launch: "runtime", initialSourceTruth: true }, harnessEnv(fakeDocker, socketPath, [op.bin]));
+    const read = await waitForProviderStart(op, parent.watcherPid, "read", "GitHub");
+    parent.send("stop");
+    expect(await settleAfterCancellation(parent.watcherPid, [read.pid])).toEqual({ watcherGone: true, providersRunning: [] });
+    const readsBefore = op.events().filter((event) => event.kind === "start").length;
+    const writesBefore = tokenWriteCount(fakeDocker.dockerLog, "github");
+
+    // The next launch's receipt-gated preparation: the receipt and the held
+    // value the cancelled watch left behind still prove the token current.
+    selectEffectiveControlsFromProjectPolicy();
+    const warm = await runAdmin(async () => {
+      prepareRuntimeTokenSources({ mode: "convergence" });
+      await credentialSyncIntent({ ...syncInput, verbose: true, mode: "startup-convergence" });
+    }, { FAKE_DOCKER_LOG: fakeDocker.dockerLog, OP_SERVICE_ACCOUNT_TOKEN: "op-session", PATH: [fakeDocker.fakeBin, op.bin, process.env.PATH ?? ""].join(path.delimiter) });
+
+    expect(warm.status, warm.stderr).toBe(0);
+    expect(op.events().filter((event) => event.kind === "start").length).toBe(readsBefore);
+    expect(tokenWriteCount(fakeDocker.dockerLog, "github")).toBe(writesBefore);
+    expect(tokenRemovalCount(fakeDocker.dockerLog, "github")).toBe(0);
+  }, 60_000);
+
+  test("retry after interrupted watch succeeds", async () => {
+    const { fakeDocker, op } = await oneTokenFixture();
+    await seed(fakeDocker, [op.bin]);
+    const { socketPath } = await startDockerBridge(fakeDocker.fakeBin);
+    op.setMode("read", "hang");
+    const interrupted = await startWatchParent({ launch: "runtime", initialSourceTruth: true }, harnessEnv(fakeDocker, socketPath, [op.bin]));
+    const read = await waitForProviderStart(op, interrupted.watcherPid, "read", "GitHub");
+    interrupted.send("stop");
+    expect(await settleAfterCancellation(interrupted.watcherPid, [read.pid])).toEqual({ watcherGone: true, providersRunning: [] });
+    const [receiptBefore] = JSON.parse(fs.readFileSync(tokenReceiptsFilePath(), "utf8")).receipts as Array<{ resolvedAt: number }>;
+    const writesBefore = tokenWriteCount(fakeDocker.dockerLog, "github");
+
+    // Nothing the interrupted watch held (its locks, its providers) is in the
+    // way of the next session's watcher.
+    op.setMode("read", "ok");
+    const next = await startWatchParent({ launch: "runtime", initialSourceTruth: true }, harnessEnv(fakeDocker, socketPath, [op.bin]));
+    expect(await waitUntil(() => fs.existsSync(`${next.configPath}.done`), 30_000)).toBe(true);
+    next.send("stop");
+
+    expect(tokenWriteCount(fakeDocker.dockerLog, "github")).toBe(writesBefore + 1);
+    expect(readTokenStatus().github).toMatchObject({ ok: true, state: "ok" });
+    const [receiptAfter] = JSON.parse(fs.readFileSync(tokenReceiptsFilePath(), "utf8")).receipts as Array<{ resolvedAt: number }>;
+    expect(receiptAfter.resolvedAt).toBeGreaterThan(receiptBefore.resolvedAt);
+  }, 60_000);
+
+  test("a session exit leaves a peer session's watcher and the held credential intact", async () => {
+    const { fakeDocker, op } = await oneTokenFixture({ refreshEverySeconds: 60 });
+    await seed(fakeDocker, [op.bin]);
+    const { socketPath } = await startDockerBridge(fakeDocker.fakeBin);
+    // The peer's watcher waits for its next refresh (a long real sleep here).
+    const peerEnv = harnessEnv(fakeDocker, socketPath, [op.bin], { RUNFREE_TEST_TOKEN_SYNC_WATCH_SLEEP_MS: "30000" });
+    const peer = await startWatchParent({ launch: "runtime", initialSourceTruth: false }, peerEnv);
+    // The exiting session's watcher is mid-read when its session ends.
+    op.setMode("read", "hang");
+    const exiting = await startWatchParent({ launch: "runtime", initialSourceTruth: true }, harnessEnv(fakeDocker, socketPath, [op.bin]));
+    const read = await waitForProviderStart(op, exiting.watcherPid, "read", "GitHub");
+    const before = credentialSnapshot();
+    exiting.send("stop");
+    const cleanup = await settleAfterCancellation(exiting.watcherPid, [read.pid]);
+
+    expect({ ...cleanup, peerRunning: !processGone(peer.watcherPid), removals: tokenRemovalCount(fakeDocker.dockerLog, "github"), ...credentialSnapshot() })
+      .toEqual({ watcherGone: true, providersRunning: [], peerRunning: true, removals: 0, ...before });
+    peer.send("stop");
   }, 60_000);
 
   // Last in the block: a reproduction is only evidence of the defect if its

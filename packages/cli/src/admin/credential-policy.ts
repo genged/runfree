@@ -42,7 +42,9 @@ import {
   newTokenResolutionLedger,
   normalizeCliHost,
   parseDurationSeconds,
+  planWatchCredentialReads,
   printTokenSyncFailures,
+  type ProxyRuntime,
   proxyRuntime,
   type ProxyRuntimeState,
   removeProxyRuntimeToken,
@@ -52,7 +54,9 @@ import {
   saveTokenStatus,
   seedTokenResolutionLedger,
   syncTokens,
+  syncTokensSettlingSignals,
   TokenSyncDeferredError,
+  type TokenSyncResult,
   withAdminCallTimeout,
   tokenResolutionLedgerKey,
   type TokenSource,
@@ -61,8 +65,17 @@ import {
   type TokenSourceSelection,
   tokenSyncWatchNowMs,
   warmConvergenceSyncIsEmpty,
+  type WatchTokenPreparation,
   withTokenStoreLock,
 } from "./admin-core.ts";
+import {
+  ChildSignaledError,
+  CredentialCancellationError,
+  type CredentialLifetime,
+  createCredentialLifetime,
+  settleHostSignals,
+} from "./credential-cancellation.ts";
+import { type CredentialReadInput, readCredentialSource } from "./credential-source-reader.ts";
 import {
   TOKEN_SYNC_DEFERRED_STATUS,
   WARM_TOKEN_SYNC_CALL_TIMEOUT_MS,
@@ -248,40 +261,15 @@ function tokenSyncWatchSleepMs(intervalMs: number): number {
   return intervalMs;
 }
 
-// Parent liveness: primary signal is an inherited lifetime pipe — the parent
-// holds the write end and never writes; EOF/close on the watcher's read end
-// means the parent is gone. PIDs are recycled, so the legacy
-// `process.kill(pid, 0)` probe alone could keep a watcher (and its 1Password
-// access) alive under an unrelated process that landed on the parent's PID;
-// it remains only as a belt-and-suspenders secondary signal. The pipe sets a
-// flag that the ≤5s sleep chunks below poll — no promise race, so nothing
-// accumulates on a long-lived watch and exit latency stays within one tick.
-type ParentLifetimeWatch = {
-  closed: () => boolean;
-};
-
+// Parent liveness: the primary signal is an inherited lifetime pipe — the
+// parent holds the write end and never writes; its end of file means the
+// parent is gone. PIDs are recycled, so the `process.kill(pid, 0)` probe alone
+// could keep a watcher (and its 1Password access) alive under an unrelated
+// process that landed on the parent's PID; it remains only as a secondary
+// signal. Both, and SIGINT/SIGTERM/SIGHUP, stop the watch's lifetime, which
+// every read and every effect of a pass checks (credential-cancellation.ts).
 function parentLifetimePipeFd(): number | undefined {
   return inheritedFdFromEnv(childEnv().RUNFREE_TOKEN_SYNC_LIFETIME_FD);
-}
-
-function watchParentLifetimePipe(): ParentLifetimeWatch {
-  const fd = parentLifetimePipeFd();
-  if (fd === undefined) return { closed: () => false };
-  let closed = false;
-  const markClosed = () => {
-    closed = true;
-  };
-  let stream: fs.ReadStream;
-  try {
-    stream = fs.createReadStream("", { fd });
-  } catch {
-    return { closed: () => true };
-  }
-  stream.on("end", markClosed);
-  stream.on("close", markClosed);
-  stream.on("error", markClosed);
-  stream.resume();
-  return { closed: () => closed };
 }
 
 function tokenSyncWatchParentPidAlive(): boolean {
@@ -296,34 +284,55 @@ function tokenSyncWatchParentPidAlive(): boolean {
   }
 }
 
-function tokenSyncWatchParentAlive(lifetime: ParentLifetimeWatch): boolean {
-  if (lifetime.closed()) return false;
-  return tokenSyncWatchParentPidAlive();
+function lifetimeActive(lifetime: CredentialLifetime): boolean {
+  try {
+    lifetime.assertActive();
+    return true;
+  } catch (error) {
+    if (error instanceof CredentialCancellationError) return false;
+    throw error;
+  }
 }
 
 // Deliberately NOT unref'd: during a manual `runfree credential sync --watch` (no
 // lifetime pipe, no other pending handles) this timer is the only thing
 // keeping the event loop — and therefore the watch — alive through the sleep.
-function sleepWatchTick(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+// A stop wakes it at once.
+function sleepWatchTick(ms: number, lifetime: CredentialLifetime): Promise<void> {
+  return new Promise((resolve) => {
+    if (lifetime.signal.aborted) {
+      resolve();
+      return;
+    }
+    const wake = (): void => {
+      clearTimeout(timer);
+      resolve();
+    };
+    const timer = setTimeout(() => {
+      lifetime.signal.removeEventListener("abort", wake);
+      resolve();
+    }, ms);
+    lifetime.signal.addEventListener("abort", wake, { once: true });
+  });
 }
 
-async function sleepTokenSyncWatch(intervalMs: number, lifetime: ParentLifetimeWatch): Promise<boolean> {
+async function sleepTokenSyncWatch(intervalMs: number, lifetime: CredentialLifetime): Promise<boolean> {
   const sleepMs = tokenSyncWatchSleepMs(intervalMs);
   const deadline = Date.now() + sleepMs;
   while (Date.now() < deadline) {
-    if (!tokenSyncWatchParentAlive(lifetime)) return false;
+    if (!lifetimeActive(lifetime)) return false;
     const remaining = deadline - Date.now();
-    await sleepWatchTick(Math.min(remaining, 5_000));
+    // Chunks bound how late the PID probe can notice a vanished parent.
+    await sleepWatchTick(Math.min(remaining, 5_000), lifetime);
   }
-  const alive = tokenSyncWatchParentAlive(lifetime);
+  const alive = lifetimeActive(lifetime);
   if (alive && childEnv().RUNFREE_TEST_FAKE_DOCKER === "1" && childEnv().RUNFREE_TEST_TOKEN_SYNC_WATCH_SLEEP_MS !== undefined) {
     childEnv().RUNFREE_TEST_TOKEN_SYNC_WATCH_NOW_MS = String(tokenSyncWatchNowMs() + intervalMs);
   }
   return alive;
 }
 
-async function sleepUntilNextTokenSync(options: { quiet?: boolean; resolutionLedger: TokenResolutionLedger }, lifetime: ParentLifetimeWatch, snapshot?: TokenSyncRuntimeSnapshot): Promise<boolean> {
+async function sleepUntilNextTokenSync(options: { quiet?: boolean; resolutionLedger: TokenResolutionLedger }, lifetime: CredentialLifetime, snapshot?: TokenSyncRuntimeSnapshot): Promise<boolean> {
   const delayMs = nextTokenSyncDelayMs(options.resolutionLedger, snapshot);
   if (delayMs === undefined) {
     if (!options.quiet) console.log("credential sync watch stopped: no credential sources have refresh intervals");
@@ -333,9 +342,100 @@ async function sleepUntilNextTokenSync(options: { quiet?: boolean; resolutionLed
   return sleepTokenSyncWatch(delayMs, lifetime);
 }
 
+type WatchPassOptions = Readonly<{
+  mode?: "source-truth";
+  keepLastGoodOnAnyResolutionFailure?: boolean;
+  quiet?: boolean;
+  verbose?: boolean;
+  resolutionLedger: TokenResolutionLedger;
+  sourceSecretCache?: { jwtPrivateKeys: Map<string, JwtPrivateKeyCacheEntry> };
+}>;
+
+// Reads the planned sources before the lock, one at a time. A cancelled read
+// ends the pass with nothing stored for it: cancellation is never a source
+// failure.
+async function prepareWatchReads(reads: readonly CredentialReadInput[], lifetime: CredentialLifetime): Promise<WatchTokenPreparation> {
+  const preparation: WatchTokenPreparation = { preparedAt: Date.now(), entries: new Map() };
+  try {
+    for (const read of reads) {
+      const result = await readCredentialSource(read, lifetime);
+      if (result.kind === "cancelled") throw new CredentialCancellationError(lifetime.stopCause() ?? "lifetime-closed");
+      preparation.entries.set(read.tokenName, result.kind === "success"
+        ? { kind: "resolved", fingerprint: read.fingerprint, value: result.value, resolvedAt: result.resolvedAt }
+        : { kind: "source-failure", fingerprint: read.fingerprint, error: result.error });
+    }
+    return preparation;
+  } catch (error) {
+    preparation.entries.clear();
+    throw error;
+  }
+}
+
+async function lockedWatchPass(
+  options: WatchPassOptions,
+  lifetime: CredentialLifetime,
+  reads: readonly CredentialReadInput[],
+  observedRuntime: ProxyRuntime | undefined,
+): Promise<TokenSyncResult> {
+  const preparation = await prepareWatchReads(reads, lifetime);
+  try {
+    lifetime.assertActive();
+    return syncTokens({
+      exitOnFailure: false,
+      quiet: options.quiet,
+      verbose: options.verbose,
+      resolutionLedger: options.resolutionLedger,
+      sourceSecretCache: options.sourceSecretCache,
+      ...(options.mode ? { mode: options.mode } : {}),
+      ...(options.keepLastGoodOnAnyResolutionFailure ? { keepLastGoodOnAnyResolutionFailure: true } : {}),
+      lifetime,
+      watchPreparation: preparation,
+      ...(observedRuntime ? { observedRuntime } : {}),
+    });
+  } catch (error) {
+    // A Docker client ended by a signal: if that was the watch's own stop,
+    // the pass is cancelled; otherwise its outcome stays unknown and the
+    // pass fails without a verdict.
+    if (error instanceof ChildSignaledError) {
+      await settleHostSignals();
+      lifetime.assertActive();
+    }
+    throw error;
+  } finally {
+    preparation.entries.clear();
+  }
+}
+
+/**
+ * One watcher pass: plan its reads, read them before the lock, publish under
+ * it. A due token the plan did not foresee (the proxy lost a value it held)
+ * is read and published by one immediate follow-up pass.
+ */
+async function runWatchPass(options: WatchPassOptions, lifetime: CredentialLifetime, snapshot?: TokenSyncRuntimeSnapshot): Promise<TokenSyncResult> {
+  lifetime.assertActive();
+  const planInput = {
+    ledger: options.resolutionLedger,
+    quiet: options.quiet,
+    verbose: options.verbose,
+    sourceSecretCache: options.sourceSecretCache,
+  };
+  const planned = planWatchCredentialReads({ ...planInput, ...(options.mode ? { mode: options.mode } : {}), ...(snapshot ? { snapshot } : {}) });
+  const sync = await lockedWatchPass(options, lifetime, planned.reads, planned.observedRuntime);
+  if (sync.unprepared.length === 0) return sync;
+  const followUp = planWatchCredentialReads({
+    ...planInput,
+    only: new Set(sync.unprepared),
+    snapshot: { runtimeState: sync.runtimeState, storeGeneration: sync.storeGeneration },
+  });
+  const second = await lockedWatchPass(options, lifetime, followUp.reads, undefined);
+  return {
+    ...second,
+    failed: [...new Set([...sync.failed, ...second.failed])],
+    stale: [...new Set([...sync.stale, ...second.stale])],
+  };
+}
+
 async function syncTokensWatch(options: { cacheSourceSecrets?: boolean; delayFirstSync?: boolean; initialSourceTruth?: boolean; quiet?: boolean; verbose?: boolean } = {}): Promise<void> {
-  let iterations = 0;
-  const maxIterations = tokenSyncWatchIterationsForTests();
   if (
     childEnv().RUNFREE_TEST_FAKE_DOCKER === "1"
     && childEnv().RUNFREE_TEST_TOKEN_SYNC_WATCH_SLEEP_MS !== undefined
@@ -343,11 +443,37 @@ async function syncTokensWatch(options: { cacheSourceSecrets?: boolean; delayFir
   ) {
     childEnv().RUNFREE_TEST_TOKEN_SYNC_WATCH_NOW_MS = String(Date.now());
   }
-  const lifetime = watchParentLifetimePipe();
+  const lifetime = createCredentialLifetime({
+    lifetimeFd: parentLifetimePipeFd(),
+    parentAlive: tokenSyncWatchParentPidAlive,
+  });
+  try {
+    await watchCredentialSources(options, lifetime);
+  } catch (error) {
+    if (!(error instanceof CredentialCancellationError)) throw error;
+  } finally {
+    // Joins every provider the watch started before the process may exit.
+    await lifetime.close();
+  }
+  const cause = lifetime.stopCause();
+  if (cause === "SIGINT" || cause === "SIGTERM" || cause === "SIGHUP") process.exitCode = WATCH_SIGNAL_EXIT_CODES[cause];
+}
+
+const WATCH_SIGNAL_EXIT_CODES = Object.freeze({ SIGHUP: 129, SIGINT: 130, SIGTERM: 143 });
+
+async function watchCredentialSources(
+  options: { cacheSourceSecrets?: boolean; delayFirstSync?: boolean; initialSourceTruth?: boolean; quiet?: boolean; verbose?: boolean },
+  lifetime: CredentialLifetime,
+): Promise<void> {
+  // A lifetime that ended before the watch began reads and observes nothing.
+  lifetime.assertActive();
+  let iterations = 0;
+  const maxIterations = tokenSyncWatchIterationsForTests();
   const sourceSecretCache = options.cacheSourceSecrets === false
     ? undefined
     : { jwtPrivateKeys: new Map<string, JwtPrivateKeyCacheEntry>() };
   const resolutionLedger = newTokenResolutionLedger(readStartupTokenResolutionReceipts());
+  const passOptions = { quiet: options.quiet, verbose: options.verbose, resolutionLedger, sourceSecretCache };
   if (!options.quiet) console.log(`source secret cache: ${sourceSecretCache ? "memory-only" : "disabled"}`);
   if (options.initialSourceTruth) {
     // The launch reused saved credentials without re-reading their sources
@@ -358,39 +484,34 @@ async function syncTokensWatch(options: { cacheSourceSecrets?: boolean; delayFir
     // changes delete.
     let firstPass: TokenSyncRuntimeSnapshot | undefined;
     try {
-      const sync = syncTokens({
-        exitOnFailure: false,
-        quiet: options.quiet,
-        resolutionLedger,
-        sourceSecretCache,
-        verbose: options.verbose,
-        mode: "source-truth",
-        keepLastGoodOnAnyResolutionFailure: true,
-      });
+      const sync = await runWatchPass({ ...passOptions, mode: "source-truth", keepLastGoodOnAnyResolutionFailure: true }, lifetime);
       firstPass = { runtimeState: sync.runtimeState, storeGeneration: sync.storeGeneration };
       const problems = [...sync.failed, ...sync.stale];
       if (options.quiet && problems.length > 0) console.error(`credential sync watch failed for: ${problems.join(", ")}`);
     } catch (error) {
+      if (error instanceof CredentialCancellationError) throw error;
       console.error(`credential sync watch first source-truth pass failed: ${error instanceof Error ? error.message : String(error)}`);
     }
     if (!(await sleepUntilNextTokenSync({ ...options, resolutionLedger }, lifetime, firstPass))) return;
   } else if (options.delayFirstSync && !(await sleepUntilNextTokenSync({ ...options, resolutionLedger }, lifetime))) return;
+  let snapshot: TokenSyncRuntimeSnapshot | undefined;
   while (true) {
-    if (!tokenSyncWatchParentAlive(lifetime)) return;
-    // The lock is acquired inside syncTokens per iteration, never for the
-    // lifetime of the watch process.
+    if (!lifetimeActive(lifetime)) return;
+    // The lock is acquired inside each pass, never for the lifetime of the
+    // watch process.
     let syncThrew = false;
-    let syncSnapshot: TokenSyncRuntimeSnapshot | undefined;
     try {
-      const sync = syncTokens({ exitOnFailure: false, quiet: options.quiet, resolutionLedger, sourceSecretCache, verbose: options.verbose });
-      syncSnapshot = { runtimeState: sync.runtimeState, storeGeneration: sync.storeGeneration };
+      const sync = await runWatchPass(passOptions, lifetime, snapshot);
+      snapshot = { runtimeState: sync.runtimeState, storeGeneration: sync.storeGeneration };
       const problems = [...sync.failed, ...sync.stale];
       if (options.quiet && problems.length > 0) console.error(`credential sync watch failed for: ${problems.join(", ")}`);
     } catch (error) {
+      if (error instanceof CredentialCancellationError) throw error;
       // The watcher is the session's only token reconciler: a thrown sync —
       // e.g. the token-store lock timing out behind another command's
       // 1Password prompt — must cost one iteration, never the whole watch.
       syncThrew = true;
+      snapshot = undefined;
       console.error(`credential sync watch iteration failed: ${error instanceof Error ? error.message : String(error)}`);
     }
     iterations += 1;
@@ -399,7 +520,7 @@ async function syncTokensWatch(options: { cacheSourceSecrets?: boolean; delayFir
       if (!(await sleepTokenSyncWatch(TOKEN_SYNC_WATCH_ERROR_RETRY_MS, lifetime))) return;
       continue;
     }
-    if (!(await sleepUntilNextTokenSync({ ...options, resolutionLedger }, lifetime, syncSnapshot))) return;
+    if (!(await sleepUntilNextTokenSync({ ...options, resolutionLedger }, lifetime, snapshot))) return;
   }
 }
 
@@ -424,19 +545,18 @@ function prepareCredentialSource(input: CredentialSetSourceInput): TokenSource {
   return source;
 }
 
-function savePreparedCredentialSource(input: CredentialSetSourceInput, source: TokenSource): void {
-  const { sourceResult, syncFailed, runtimeState } = withTokenStoreLock(() => {
-    const savedSource = saveTokenSource(input.name, source, { replaceSource: input.replaceSource });
-    let failedSync = false;
-    let state: ProxyRuntimeState | "skipped" = "skipped";
-    if (input.sync) {
-      const result = syncTokens({ quiet: true, exitOnFailure: false, mode: "convergence" });
-      failedSync = result.failed.length > 0;
-      state = result.runtimeState;
-      printTokenSyncFailures(result);
-    }
-    return { sourceResult: savedSource, syncFailed: failedSync, runtimeState: state };
-  });
+async function savePreparedCredentialSource(input: CredentialSetSourceInput, source: TokenSource): Promise<void> {
+  const sourceResult = withTokenStoreLock(() => saveTokenSource(input.name, source, { replaceSource: input.replaceSource }));
+  // The sync takes the token-store lock itself, after the save released it,
+  // so a provider ended by a signal can be settled before any verdict.
+  let syncFailed = false;
+  let runtimeState: ProxyRuntimeState | "skipped" = "skipped";
+  if (input.sync) {
+    const result = await syncTokensSettlingSignals({ quiet: true, exitOnFailure: false, mode: "convergence" });
+    syncFailed = result.failed.length > 0;
+    runtimeState = result.runtimeState;
+    printTokenSyncFailures(result);
+  }
 
   const loadedPolicy = loadPolicy();
   const hosts = loadedPolicy.tokens[input.name]?.credentials.map((credential) => credential.host).join(", ") ?? "";
@@ -512,7 +632,7 @@ export async function credentialSetSourceIntent(input: CredentialSetSourceInput)
   assertNotReservedUserTokenName(input.name, "credential set-source");
   assertKnownCredential(input.name);
   const source = prepareCredentialSource(input);
-  savePreparedCredentialSource(input, source);
+  await savePreparedCredentialSource(input, source);
 }
 
 export async function credentialClearSourceIntent(input: CredentialClearSourceInput): Promise<void> {
@@ -630,7 +750,11 @@ export async function credentialSyncIntent(input: CredentialSyncInput): Promise<
       ), WARM_TOKEN_SYNC_TOTAL_TIMEOUT_MS);
       currentAdminState().tokenResolutionReceipts = result.receipts;
     } catch (error) {
-      if (!(error instanceof TokenSyncDeferredError)) throw error;
+      // A Docker client ended by a signal left its operation's outcome
+      // unknown: the host's own signal ends the launch during the settle;
+      // any other hands startup back the unlocked order, like a deferral.
+      if (error instanceof ChildSignaledError) await settleHostSignals();
+      else if (!(error instanceof TokenSyncDeferredError)) throw error;
       if (input.verbose) console.log(`credential sync deferred to a source-truth sync: ${error.message}`);
       process.exitCode = TOKEN_SYNC_DEFERRED_STATUS;
     }
@@ -646,7 +770,7 @@ export async function credentialSyncIntent(input: CredentialSyncInput): Promise<
     });
     return;
   }
-  const result = syncTokens({ exitOnFailure: true, verbose: input.verbose, mode: "source-truth" });
+  const result = await syncTokensSettlingSignals({ exitOnFailure: true, verbose: input.verbose, mode: "source-truth" });
   currentAdminState().tokenResolutionReceipts = result.receipts;
   if (result.failed.length === 0 && result.stale.length === 0) {
     console.log(result.runtimeState === "ready"

@@ -16,7 +16,10 @@
 //     contains the proxy, and the next launch reclaims the warm path;
 //   - a normal numeric exit takes the short teardown (spec open decision 3:
 //     the exited container's inspection proves it stopped before removal),
-//     and the session container is gone afterwards.
+//     and the session container is gone afterwards;
+//   - one session's exit while its credential watcher is mid-read stops that
+//     read without touching the shared proxy credential: a peer session's
+//     value, status and watcher carry on (credential watcher cancellation).
 //
 // The latency gate runs `LAUNCH_LATENCY_RUNS` (default 5) warm launches and
 // writes their timings to `LAUNCH_LATENCY_REPORT` when set. With
@@ -26,17 +29,20 @@
 // recorded by the benchmark script, not hard-coded here.
 
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 
-import { composeProjectName, composeServiceContainerId, dockerOrThrow } from "./docker.ts";
+import { startRunfree } from "./attached-support.ts";
+import { composeProjectName, composeServiceContainerId, docker, dockerOrThrow } from "./docker.ts";
 import {
   describeOutput,
   destroyLiveFixture,
   type LiveFixture,
   type LiveRuntimeBackend,
+  forceCleanSessions,
   MANAGED_HOLD_RELATIVE_PATH,
   provisionSandboxFixture,
 } from "./fixture.ts";
@@ -65,6 +71,66 @@ function requiredBackend(): LiveRuntimeBackend {
     throw new Error("TEST_RUNTIME_BACKEND must be docker-desktop for the launch latency tranche");
   }
   return backend;
+}
+
+// The sandbox fixture's seeded credential and its host environment source.
+const SHARED_CREDENTIAL = "sandbox-strip-probe";
+const SHARED_CREDENTIAL_ENV = "RUNFREE_SANDBOX_STRIP_TOKEN";
+const PEER_PROBE_SOURCE = "live-peer-probe";
+const PEER_PROBE_WAIT_MS = 120_000;
+// The watcher's provider bound (TERM, 2 s grace, KILL, 1 s join), with margin.
+const CANCELLATION_BOUND_MS = 8_000;
+
+async function waitUntil<T>(probe: () => T | undefined, timeoutMs: number, label: string): Promise<T> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const value = probe();
+    if (value !== undefined) return value;
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+  throw new Error(`timed out waiting for ${label}`);
+}
+
+function processGone(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return false;
+  } catch {
+    return true;
+  }
+}
+
+// A host command source that answers with a fixed placeholder, except that a
+// read by a credential watcher hangs while the hang file exists, unless that
+// watcher is the one named in the skip file (the peer's). It records every
+// watcher read as `<event> <watcher pid> <provider pid>`.
+function writePeerProbeProvider(dir: string): string {
+  const script = path.join(dir, "provider.sh");
+  fs.writeFileSync(script, [
+    "#!/bin/sh",
+    `dir='${dir}'`,
+    "case \"$(ps -o args= -p \"$PPID\" 2>/dev/null)\" in",
+    "  *'credential sync --watch'*)",
+    "    echo \"watch-start $PPID $$\" >> \"$dir/reads\"",
+    "    if [ -f \"$dir/hang\" ] && [ \"$PPID\" != \"$(cat \"$dir/skip\" 2>/dev/null)\" ]; then",
+    "      echo \"watch-hang $PPID $$\" >> \"$dir/reads\"",
+    "      while :; do sleep 1; done",
+    "    fi",
+    "    echo \"watch-done $PPID $$\" >> \"$dir/reads\" ;;",
+    "esac",
+    "printf '%s\\n' 'live-peer-placeholder-not-a-token'",
+    "",
+  ].join("\n"), { mode: 0o755 });
+  return script;
+}
+
+function peerProbeReads(dir: string): Array<Readonly<{ event: string; watcher: number; provider: number }>> {
+  const file = path.join(dir, "reads");
+  if (!fs.existsSync(file)) return [];
+  return fs.readFileSync(file, "utf8").split("\n").filter(Boolean).map((line) => {
+    const [event, watcher, provider] = line.split(" ");
+    return { event: event as string, watcher: Number(watcher), provider: Number(provider) };
+  });
 }
 
 function nearestRankP95(values: readonly number[]): number {
@@ -197,6 +263,70 @@ describe("launch latency: sub-second launch plan Phase B", () => {
     if (bound !== undefined) {
       const overhead = samples.map((sample) => Number(sample.startupTotalMs ?? Number.NaN) + Number(sample.admissionMs));
       expect(nearestRankP95(overhead)).toBeLessThanOrEqual(Number(bound));
+    }
+  }, TEST_TIMEOUT_MS);
+
+  // Last: it rebinds the shared credential's source for its duration, which
+  // would turn the warm launches above into source re-reads.
+  coreTest("one session exits while peer continues authenticated requests", async () => {
+    const providerDir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "runfree-live-peer-probe.")));
+    const provider = writePeerProbeProvider(providerDir);
+    const holdMarker = path.join(fixture.projectRoot, MANAGED_HOLD_RELATIVE_PATH);
+    const proxyId = composeServiceContainerId(composeProjectName(fixture), "proxy");
+    const heldValueDigest = (): string => dockerOrThrow("digest the shared proxy credential",
+      ["exec", "--user", "0:0", proxyId, "sha256sum", `/run/runfree-proxy-secrets/${SHARED_CREDENTIAL}`]);
+    const runs: Array<ReturnType<typeof startRunfree>> = [];
+    try {
+      for (const args of [
+        ["credential", "source", "add", PEER_PROBE_SOURCE, "--", provider],
+        ["credential", "set-source", SHARED_CREDENTIAL, "--from-source", PEER_PROBE_SOURCE, "--refresh-every", "10s", "--replace-source"],
+      ]) {
+        const result = fixture.runfree(args);
+        expect(result.status, describeOutput(result.output)).toBe(0);
+      }
+      fs.mkdirSync(path.dirname(holdMarker), { recursive: true });
+      fs.writeFileSync(holdMarker, "");
+
+      // The peer: attached, and its watcher has completed a read.
+      const idle = new Set(sessionContainers(fixture));
+      const peer = startRunfree(fixture, ["claude"]);
+      runs.push(peer);
+      const peerContainer = await waitUntil(() => sessionContainers(fixture).find((id) => !idle.has(id)), PEER_PROBE_WAIT_MS, "the peer session");
+      const peerWatcher = (await waitUntil(() => peerProbeReads(providerDir).find((read) => read.event === "watch-done"), PEER_PROBE_WAIT_MS, "the peer watcher's first read")).watcher;
+      fs.writeFileSync(path.join(providerDir, "skip"), String(peerWatcher));
+      fs.writeFileSync(path.join(providerDir, "hang"), "");
+      const digestBefore = heldValueDigest();
+
+      // The exiting session: its watcher's read hangs until the session ends.
+      const exiting = startRunfree(fixture, ["claude"]);
+      runs.push(exiting);
+      const exitingContainer = await waitUntil(() => sessionContainers(fixture).find((id) => !idle.has(id) && id !== peerContainer), PEER_PROBE_WAIT_MS, "the exiting session");
+      const hung = await waitUntil(() => peerProbeReads(providerDir).find((read) => read.event === "watch-hang" && read.watcher !== peerWatcher), PEER_PROBE_WAIT_MS, "the exiting watcher's read");
+      const peerReadsBefore = peerProbeReads(providerDir).filter((read) => read.event === "watch-done" && read.watcher === peerWatcher).length;
+      dockerOrThrow("end the exiting session", ["kill", exitingContainer]);
+      await exiting.completion;
+      const stopped = Date.now();
+      await waitUntil(() => processGone(hung.provider) && processGone(hung.watcher) ? true : undefined, CANCELLATION_BOUND_MS, "the exiting watcher and its read to end");
+      expect(Date.now() - stopped).toBeLessThan(CANCELLATION_BOUND_MS);
+
+      // The shared value is the one the peer's requests carry: unchanged,
+      // still `ok`, and the peer's watcher reads it again on schedule.
+      expect(heldValueDigest()).toBe(digestBefore);
+      const status = fixture.runfree(["credential", "status", SHARED_CREDENTIAL]);
+      expect(status.output, describeOutput(status.output)).toContain("last sync: ok");
+      expect(dockerOrThrow("peer state", ["inspect", "-f", "{{.State.Running}}", peerContainer])).toBe("true");
+      await waitUntil(() => peerProbeReads(providerDir).filter((read) => read.event === "watch-done" && read.watcher === peerWatcher).length > peerReadsBefore ? true : undefined,
+        PEER_PROBE_WAIT_MS, "the peer watcher's next read");
+      expect(heldValueDigest()).toBe(digestBefore);
+    } finally {
+      fs.rmSync(path.join(providerDir, "hang"), { force: true });
+      fs.rmSync(holdMarker, { force: true });
+      for (const id of sessionContainers(fixture)) docker(["kill", id]);
+      await Promise.allSettled(runs.map((run) => run.completion));
+      fixture.runfree(["credential", "set-source", SHARED_CREDENTIAL, "--from-env", SHARED_CREDENTIAL_ENV, "--replace-source"]);
+      fixture.runfree(["credential", "source", "remove", PEER_PROBE_SOURCE]);
+      fs.rmSync(providerDir, { recursive: true, force: true });
+      await forceCleanSessions(fixture);
     }
   }, TEST_TIMEOUT_MS);
 });

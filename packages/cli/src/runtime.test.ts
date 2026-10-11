@@ -3757,7 +3757,7 @@ describe("token auto refresh stop protocol", () => {
   // The watcher owns its providers' cleanup; a group signal from the parent
   // also kills an in-flight Docker client, turning a completed proxy write
   // into an unknown outcome.
-  test.fails("stop signals only the watcher, not the other members of its process group", async () => {
+  test("stop signals only the watcher, not the other members of its process group", async () => {
     const events = await stopProbeEvents();
     expect(events.some((event) => event.startsWith("watcher-sigterm"))).toBe(true);
     expect(events).not.toContain("group-member-sigterm");

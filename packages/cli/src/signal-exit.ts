@@ -8,6 +8,23 @@ export const SIGNAL_EXIT_CODES = Object.freeze({ SIGINT: 130, SIGTERM: 143 });
 
 type SignalName = keyof typeof SIGNAL_EXIT_CODES;
 
+// A long-lived credential watch must unwind through its locks and join its
+// providers before the process ends, so while a deferral is held the
+// handlers below only flush and restore; the watch observes the signal itself
+// and exits once its work has settled. Counted, so nested holders compose.
+let exitDeferrals = 0;
+
+/** Hold the signal exit until the returned release runs (idempotent). */
+export function deferSignalExit(): () => void {
+  exitDeferrals += 1;
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    exitDeferrals -= 1;
+  };
+}
+
 export type SignalExitHooks = {
   flush: () => void;
   restore: () => void;
@@ -15,7 +32,7 @@ export type SignalExitHooks = {
 };
 
 // Install one-shot SIGINT/SIGTERM handlers that flush buffered warnings,
-// restore the terminal, and exit 130/143. `once` means a second signal takes
+// restore the terminal, and exit 130/143 (unless a deferral is held). `once` means a second signal takes
 // the default action (immediate exit) without re-running the handlers, and
 // restoration is idempotent so a signal during a prompt or a half-initialized
 // command is safe. The flush is best-effort synchronous.
@@ -35,6 +52,7 @@ export function installSignalExit(
       } catch {
         // Same: exit regardless.
       }
+      if (exitDeferrals > 0) return;
       hooks.exit(SIGNAL_EXIT_CODES[signal]);
     });
   }

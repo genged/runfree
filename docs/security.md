@@ -203,7 +203,13 @@ agent sees: placeholder or runfree_oauth_* handle only
    cannot be read for a transient or unclassified reason (a locked vault, a
    prompt the detached watcher cannot show) keeps the held value, bounded by
    the keep-last-good age, until the next launch reads it interactively.
-   `runfree credential sync` always re-reads.
+   `runfree credential sync` always re-reads. Stopping a read is never a read
+   failure: when the session exits, its parent disappears, or Ctrl-C or
+   another signal stops the watcher or a one-shot sync, the held value, its
+   receipt and its status stay as they were. The watcher ends the providers it
+   started (SIGTERM, then SIGKILL after 2 s) and starts no further read. A
+   proxy token write replaces the held value only when the whole value
+   arrived.
 5. The proxy CA private key is mounted only into the proxy.
 
 ### Sessions

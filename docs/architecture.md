@@ -1754,7 +1754,14 @@ runs detached: a definitive failure (the item or variable is gone, access was
 denied) deletes the held value, as an explicit `runfree credential sync` does;
 a transient or unclassified failure (a locked vault, a source that needs a
 prompt) keeps it, bounded by the keep-last-good age, until the next launch
-reads it interactively.
+reads it interactively. The watcher reads sources outside the token-store lock, each provider in a
+process group the watcher owns, and publishes under the lock. A session's exit
+closes the watcher's lifetime pipe and signals the watcher only (never its
+process group), so an in-flight proxy write completes. A stopped watch writes,
+removes and records nothing more. A write that completed after the stop
+stands, without a new receipt. A Docker client ended by a signal has an
+unknown outcome, so it is never followed by a removal; the next pass or
+launch observes the proxy again.
 
 ## Services
 
