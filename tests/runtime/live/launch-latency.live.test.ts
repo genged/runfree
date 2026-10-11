@@ -586,11 +586,9 @@ describe("launch latency: sub-second launch plan Phase B", () => {
       await waitUntil(() => processGone(hung.provider) && processGone(hung.watcher) ? true : undefined, CANCELLATION_BOUND_MS, "the exiting watcher and its read to end");
       expect(Date.now() - stopped).toBeLessThan(CANCELLATION_BOUND_MS);
 
-      // The shared value is the one the peer's requests carry: unchanged,
-      // still `ok`, and the peer's watcher reads it again on schedule.
+      // The shared value is the one the peer's requests carry: unchanged, and
+      // the peer's watcher reads it again on schedule.
       expect(heldValueDigest()).toBe(digestBefore);
-      const status = fixture.runfree(["credential", "status", SHARED_CREDENTIAL]);
-      expect(status.output, describeOutput(status.output)).toContain("last sync: ok");
       expect(dockerOrThrow("peer state", ["inspect", "-f", "{{.State.Running}}", peerContainer])).toBe("true");
       const request = docker(["exec", peerContainer, "zsh", "-lc",
         curlProbeCommand(`https://${SHARED_CREDENTIAL_HOST}/`, { maxTimeSeconds: 15, retries: 3 })]);
@@ -598,6 +596,20 @@ describe("launch latency: sub-second launch plan Phase B", () => {
       await waitUntil(() => peerProbeReads(providerDir).filter((read) => read.event === "watch-done" && read.watcher === peerWatcher).length > peerReadsBefore ? true : undefined,
         PEER_PROBE_WAIT_MS, "the peer watcher's next read");
       expect(heldValueDigest()).toBe(digestBefore);
+      // Checked only after the peer's next read. The exiting watcher is stopped
+      // once its session's teardown finishes, and on a loaded host that can
+      // outlast the 10 s command-source timeout: the hung read then ends as a
+      // genuine timeout, and the shared status is honestly `stale` (the value
+      // kept, as the digest shows) until a later read succeeds. What must never
+      // happen is a revocation, which the digest and this status rule out.
+      // Polled: the provider logs `watch-done` before the watcher records the sync.
+      let status = "";
+      await waitUntil(() => {
+        status = fixture.runfree(["credential", "status", SHARED_CREDENTIAL]).output;
+        return status.includes("last sync: ok") ? true : undefined;
+      }, PEER_PROBE_WAIT_MS, "the shared credential's status to return to ok").catch((error: unknown) => {
+        throw new Error(`${error instanceof Error ? error.message : String(error)}; last status: ${describeOutput(status)}`);
+      });
     } finally {
       fs.rmSync(path.join(providerDir, "hang"), { force: true });
       fs.rmSync(holdMarker, { force: true });
