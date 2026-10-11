@@ -21,9 +21,10 @@ afterEach(() => {
   fs.rmSync(secrets, { recursive: true, force: true });
 });
 
-function write(tokenFile: string, declared: string, received: string): childProcess.SpawnSyncReturns<string> {
+function write(tokenFile: string, declared: string, received: string, env: NodeJS.ProcessEnv = process.env): childProcess.SpawnSyncReturns<string> {
   return childProcess.spawnSync("/bin/sh", ["-c", proxyTokenWriteScript(tokenFile, Buffer.byteLength(declared, "utf8"))], {
     encoding: "utf8",
+    env,
     input: received,
   });
 }
@@ -38,6 +39,22 @@ describe("proxy token write", () => {
 
     expect(result.status).not.toBe(0);
     expect(result.stderr).toContain("proxy token write incomplete; the held token is unchanged");
+    expect(fs.readFileSync(tokenFile, "utf8")).toBe("held-value");
+    expect(fs.existsSync(`${tokenFile}.tmp`)).toBe(false);
+  });
+
+  test("a byte count that cannot be obtained refuses the write", () => {
+    const tokenFile = path.join(secrets, "github");
+    fs.writeFileSync(tokenFile, "held-value", { mode: 0o600 });
+    // A `wc` that prints nothing and fails, ahead of the real tools.
+    const brokenTools = path.join(secrets, "broken-tools");
+    fs.mkdirSync(brokenTools);
+    fs.writeFileSync(path.join(brokenTools, "wc"), "#!/bin/sh\nexit 1\n", { mode: 0o755 });
+    const value = "rotated-value-0123456789";
+
+    const result = write(tokenFile, value, value, { ...process.env, PATH: `${brokenTools}${path.delimiter}${process.env.PATH ?? ""}` });
+
+    expect(result.status).not.toBe(0);
     expect(fs.readFileSync(tokenFile, "utf8")).toBe("held-value");
     expect(fs.existsSync(`${tokenFile}.tmp`)).toBe(false);
   });

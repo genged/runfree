@@ -2089,7 +2089,9 @@ export function proxyTokenWriteScript(tokenFile: string, byteLength: number): st
     "umask 077",
     `rm -f ${shellSingleQuote(tmpFile)}`,
     `cat > ${shellSingleQuote(tmpFile)}`,
-    `if [ $(wc -c < ${shellSingleQuote(tmpFile)}) -ne ${byteLength} ]; then rm -f ${shellSingleQuote(tmpFile)}; echo 'proxy token write incomplete; the held token is unchanged' >&2; exit 1; fi`,
+    // Fails closed: a count that cannot be read (an empty substitution makes
+    // the test itself fail) refuses the write exactly like a wrong count.
+    `[ "$(wc -c < ${shellSingleQuote(tmpFile)})" -eq ${byteLength} ] || { rm -f ${shellSingleQuote(tmpFile)}; echo 'proxy token write incomplete; the held token is unchanged' >&2; exit 1; }`,
     `chmod 600 ${shellSingleQuote(tmpFile)}`,
     `mv ${shellSingleQuote(tmpFile)} ${shellSingleQuote(tokenFile)}`,
   ].join("; ");
