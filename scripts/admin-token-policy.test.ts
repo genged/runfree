@@ -53,6 +53,8 @@ import {
 } from "../packages/cli/src/admin/options.ts";
 import { tryAcquireControlLock } from "../packages/cli/src/control/lock.ts";
 import {
+  admitPreparedRuntimeTokenSources,
+  clearPreparedRuntimeTokenSources,
   prepareRuntimeTokenSources,
   runCapture,
   TokenSyncDeferredError,
@@ -3935,6 +3937,118 @@ describe("convergent proxy token store", () => {
       const explicit = await runAdmin(() => credentialSyncIntent(syncInput), opEnv(fakeDocker, hostOpBin));
       expect(explicit.status).toBe(1);
       expect(tokenRemovalCount(fakeDocker.dockerLog)).toBe(1);
+    });
+  });
+
+  // F01: launch preparation shares a successful exact 1Password read across
+  // every destination in the same preparation pass that uses the identical
+  // reference. Only the resolved value is shared; each destination keeps its
+  // own fingerprint, policy, receipt and error.
+  describe("shared 1Password reads within one preparation (F01)", () => {
+    function writeSharedOnePasswordFixture(tokenNames: readonly string[], ref = "op://Private/GitHub/token"): void {
+      writeFixtureRepo({
+        hosts: tokenNames.map((name) => `${name}.example.com`),
+        tokens: Object.fromEntries(tokenNames.map((name) => [name, {
+          description: `${name} token`,
+          credentials: [{ host: `${name}.example.com`, header: "Authorization", scheme: "bearer" }],
+        }])),
+      });
+      writeTokenConfig(Object.fromEntries(tokenNames.map((name) => [name, { source: "1password", ref }])));
+    }
+
+    test("six destinations one exact ref make one read", async () => {
+      const names = ["dest1", "dest2", "dest3", "dest4", "dest5", "dest6"];
+      writeSharedOnePasswordFixture(names);
+      const fakeDocker = installTokenSyncDockerFake();
+      const hostOpBin = makeHostOpBin();
+      const opLogPath = path.join(tmpBase, `shared-op-${Math.random().toString(16).slice(2)}.jsonl`);
+      installFakeOp(hostOpBin, { logPath: opLogPath, output: "ghp_shared\n" });
+      selectEffectiveControlsFromProjectPolicy();
+
+      const prepared = await runAdmin(() => prepareRuntimeTokenSources(), opEnv(fakeDocker, hostOpBin));
+
+      expect(prepared.status, prepared.stderr).toBe(0);
+      expect(readJsonLines(opLogPath)).toHaveLength(1);
+      clearPreparedRuntimeTokenSources(adminProjectInfoForTokenSync());
+    });
+
+    test("distinct refs stay distinct", async () => {
+      const names = ["dest1", "dest2"];
+      writeFixtureRepo({
+        hosts: names.map((name) => `${name}.example.com`),
+        tokens: Object.fromEntries(names.map((name) => [name, {
+          description: `${name} token`,
+          credentials: [{ host: `${name}.example.com`, header: "Authorization", scheme: "bearer" }],
+        }])),
+      });
+      writeTokenConfig({
+        dest1: { source: "1password", ref: "op://Private/GitHub/token" },
+        dest2: { source: "1password", ref: "op://Private/GitHub/other" },
+      });
+      const fakeDocker = installTokenSyncDockerFake();
+      const hostOpBin = makeHostOpBin();
+      const opLogPath = path.join(tmpBase, `distinct-op-${Math.random().toString(16).slice(2)}.jsonl`);
+      installFakeOp(hostOpBin, { logPath: opLogPath, output: "ghp_distinct\n" });
+      selectEffectiveControlsFromProjectPolicy();
+
+      const prepared = await runAdmin(() => prepareRuntimeTokenSources(), opEnv(fakeDocker, hostOpBin));
+
+      expect(prepared.status, prepared.stderr).toBe(0);
+      expect(readJsonLines(opLogPath)).toHaveLength(2);
+      clearPreparedRuntimeTokenSources(adminProjectInfoForTokenSync());
+    });
+
+    test("next pass reads again", async () => {
+      const names = ["dest1", "dest2", "dest3"];
+      writeSharedOnePasswordFixture(names);
+      const fakeDocker = installTokenSyncDockerFake();
+      const hostOpBin = makeHostOpBin();
+      const opLogPath = path.join(tmpBase, `nextpass-op-${Math.random().toString(16).slice(2)}.jsonl`);
+      installFakeOp(hostOpBin, { logPath: opLogPath, output: "ghp_next\n" });
+      selectEffectiveControlsFromProjectPolicy();
+
+      const first = await runAdmin(() => prepareRuntimeTokenSources(), opEnv(fakeDocker, hostOpBin));
+      expect(first.status, first.stderr).toBe(0);
+      expect(readJsonLines(opLogPath)).toHaveLength(1);
+      clearPreparedRuntimeTokenSources(adminProjectInfoForTokenSync());
+
+      // A later preparation pass gets its own fresh scope: it reads again
+      // rather than reusing the first pass's shared value.
+      const second = await runAdmin(() => prepareRuntimeTokenSources(), opEnv(fakeDocker, hostOpBin));
+      expect(second.status, second.stderr).toBe(0);
+      expect(readJsonLines(opLogPath)).toHaveLength(2);
+      clearPreparedRuntimeTokenSources(adminProjectInfoForTokenSync());
+    });
+
+    // Launch preparation is fail-fast: the first resolution failure aborts
+    // the whole pass without visiting later destinations, so a shared
+    // failing read's "not cached" guarantee (every destination still makes
+    // its own attempt) is proved at the scope level instead, in
+    // credential-source-reader.test.ts ("failed read is not cached").
+
+    test("receipt/source-policy drift refuses before publication", async () => {
+      const names = ["dest1", "dest2"];
+      writeSharedOnePasswordFixture(names);
+      const fakeDocker = installTokenSyncDockerFake();
+      const hostOpBin = makeHostOpBin();
+      const opLogPath = path.join(tmpBase, `drift-op-${Math.random().toString(16).slice(2)}.jsonl`);
+      installFakeOp(hostOpBin, { logPath: opLogPath, output: "ghp_drift\n" });
+      selectEffectiveControlsFromProjectPolicy();
+
+      const prepared = await runAdmin(() => prepareRuntimeTokenSources(), opEnv(fakeDocker, hostOpBin));
+      expect(prepared.status, prepared.stderr).toBe(0);
+      expect(readJsonLines(opLogPath)).toHaveLength(1);
+
+      // One of the two destinations sharing the read gets a new reference
+      // before publication: its own fingerprint no longer matches what was
+      // prepared, so admission refuses, even though the shared value it
+      // reused was legitimately resolved.
+      writeTokenConfig({
+        dest1: { source: "1password", ref: "op://Private/GitHub/token" },
+        dest2: { source: "1password", ref: "op://Private/GitHub/rotated" },
+      });
+      expect(() => admitPreparedRuntimeTokenSources(adminProjectInfoForTokenSync())).toThrow("prepared credential source changed");
+      clearPreparedRuntimeTokenSources(adminProjectInfoForTokenSync());
     });
   });
 

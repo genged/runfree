@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
 
 import { TokenResolutionError } from "../token-resolution.ts";
-import { type CommandSourceInvocation, type OnePasswordRead, readOnePasswordRef } from "./admin-core.ts";
+import { type CommandSourceInvocation, type OnePasswordRead, createCredentialPreparationScope, readOnePasswordRef } from "./admin-core.ts";
 import { type CredentialLifetime, createCredentialLifetime } from "./credential-cancellation.ts";
 import { type CredentialReadInput, readCredentialSource, runOwnedProvider } from "./credential-source-reader.ts";
 
@@ -270,4 +270,118 @@ console.log("RESULT " + JSON.stringify(result));
     expect(line, `${run.stdout}${run.stderr}`).toBeDefined();
     expect(JSON.parse((line as string).slice("RESULT ".length))).toEqual({ watchHasTerminal: true, terminal: "tty-ok", own: "no-tty" });
   }, 60_000);
+});
+
+// F01: a fresh preparation-pass scope shares one successful direct 1Password
+// read across every destination that uses the identical executable and exact
+// reference. Only a success is ever shared; a failure or a cancellation is
+// not, so every destination still gets its own attempt.
+describe("createCredentialPreparationScope", () => {
+  function countingOp(name: string, logPath: string, output = "shared-value"): string {
+    return script(name, `printf 'x\\n' >> '${logPath}'; echo '${output}'`);
+  }
+
+  function invocationCount(logPath: string): number {
+    if (!fs.existsSync(logPath)) return 0;
+    return fs.readFileSync(logPath, "utf8").split("\n").filter(Boolean).length;
+  }
+
+  function onePasswordInput(tokenName: string, executable: string, ref = "op://Private/Item/field"): CredentialReadInput {
+    return { tokenName, fingerprint: "f".repeat(64), plan: { kind: "1password", read: onePasswordRead(executable, ref) } };
+  }
+
+  test("a successful read is shared for every destination using the identical executable and reference", async () => {
+    const log = path.join(tmp, "invocations.log");
+    const op = countingOp("op-shared", log);
+    const scope = createCredentialPreparationScope();
+    const lifetime = watchLifetime();
+    const first = await scope.read(onePasswordInput("one", op), lifetime);
+    const second = await scope.read(onePasswordInput("two", op), lifetime);
+    expect(first).toEqual({ kind: "success", value: "shared-value", resolvedAt: expect.any(Number) });
+    expect(second).toEqual(first);
+    expect(invocationCount(log)).toBe(1);
+  });
+
+  test("distinct refs stay distinct", async () => {
+    const log = path.join(tmp, "invocations.log");
+    const op = countingOp("op-distinct", log);
+    const scope = createCredentialPreparationScope();
+    const lifetime = watchLifetime();
+    await scope.read(onePasswordInput("one", op, "op://Private/Item/one"), lifetime);
+    await scope.read(onePasswordInput("two", op, "op://Private/Item/two"), lifetime);
+    expect(invocationCount(log)).toBe(2);
+  });
+
+  test("changed account or executable is not shared", async () => {
+    const log = path.join(tmp, "invocations.log");
+    const opAccountA = countingOp("op-account-a", log);
+    const opAccountB = countingOp("op-account-b", log);
+    const scope = createCredentialPreparationScope();
+    const lifetime = watchLifetime();
+    await scope.read(onePasswordInput("one", opAccountA), lifetime);
+    await scope.read(onePasswordInput("two", opAccountB), lifetime);
+    expect(invocationCount(log)).toBe(2);
+  });
+
+  test("a shared document-fallback result shares only the final value", async () => {
+    const log = path.join(tmp, "invocations.log");
+    // `op read` fails as "not a field secret reference" (the document
+    // fallback's trigger), then `op document get` succeeds. Only the final,
+    // fully-resolved value is ever shared: a second destination must not
+    // reuse an intermediate step, nor cause the two-step fallback to run
+    // again.
+    const op = script("op-doc-fallback", `printf 'x\\n' >> '${log}'; if [ "$1" = read ]; then echo 'not a field secret reference' >&2; exit 1; fi; echo document-value`);
+    const scope = createCredentialPreparationScope();
+    const lifetime = watchLifetime();
+    const first = await scope.read(onePasswordInput("one", op, "op://Private/AuthKey"), lifetime);
+    const second = await scope.read(onePasswordInput("two", op, "op://Private/AuthKey"), lifetime);
+    expect(first).toEqual({ kind: "success", value: "document-value", resolvedAt: expect.any(Number) });
+    expect(second).toEqual(first);
+    // Two invocations total: the first destination's own `read` then
+    // `document get`; the second destination makes none.
+    expect(invocationCount(log)).toBe(2);
+  });
+
+  test("next pass reads again", async () => {
+    const log = path.join(tmp, "invocations.log");
+    const op = countingOp("op-next-pass", log);
+    const lifetime = watchLifetime();
+    const firstPass = createCredentialPreparationScope();
+    await firstPass.read(onePasswordInput("one", op), lifetime);
+    await firstPass.read(onePasswordInput("two", op), lifetime);
+    expect(invocationCount(log)).toBe(1);
+    // A later preparation pass gets its own fresh scope: nothing persists
+    // from the first pass's cache.
+    const secondPass = createCredentialPreparationScope();
+    await secondPass.read(onePasswordInput("three", op), lifetime);
+    expect(invocationCount(log)).toBe(2);
+  });
+
+  test("failed read is not cached", async () => {
+    const log = path.join(tmp, "invocations.log");
+    const op = script("op-fails", `printf 'x\\n' >> '${log}'; echo 'connection reset by peer' >&2; exit 1`);
+    const scope = createCredentialPreparationScope();
+    const lifetime = watchLifetime();
+    const first = await scope.read(onePasswordInput("one", op), lifetime);
+    const second = await scope.read(onePasswordInput("two", op), lifetime);
+    expect(first.kind).toBe("source-failure");
+    expect(second.kind).toBe("source-failure");
+    // Not cached: each destination made its own attempt.
+    expect(invocationCount(log)).toBe(2);
+  });
+
+  test("cancelled read does not become a destination failure", async () => {
+    const marker = path.join(tmp, "started");
+    const op = script("op-hang", `touch '${marker}'; while :; do sleep 0.1; done`);
+    const scope = createCredentialPreparationScope();
+    const lifetime = watchLifetime();
+    const reading = scope.read(onePasswordInput("one", op), lifetime);
+    expect(await waitFor(() => fs.existsSync(marker))).toBe(true);
+    await lifetime.close();
+    expect(await reading).toEqual({ kind: "cancelled" });
+    // Never cached as a success or a failure: a later destination in the same
+    // (now-stopped) pass stays cancelled too, not a destination failure.
+    const second = await scope.read(onePasswordInput("two", op), lifetime);
+    expect(second).toEqual({ kind: "cancelled" });
+  });
 });

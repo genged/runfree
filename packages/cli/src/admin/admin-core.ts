@@ -143,7 +143,7 @@ import {
   isHostStopSignal,
   settleHostSignals,
 } from "./credential-cancellation.ts";
-import type { CredentialReadInput } from "./credential-source-reader.ts";
+import { type CredentialReadInput, type CredentialReadResult, readCredentialSource } from "./credential-source-reader.ts";
 import { stableJsonDroppingUndefined as stableJson, sha256Hex, isRecord } from "../strict-primitives.ts";
 import { remedy } from "../remedies.ts";
 
@@ -1560,6 +1560,69 @@ function resolveTokenSource(tokenName: string, source: TokenSource, options: Tok
   return runCredentialReadPlanSync(credentialReadPlan(tokenName, source, options));
 }
 
+/**
+ * Identifies one direct 1Password resolution's context for sharing within a
+ * preparation: the resolved provider executable and the exact reference
+ * bytes (no alias normalization). A preparation pass's environment, timeout
+ * and quiet setting are fixed for every destination it reads (they all come
+ * from the same ambient admin state), so the key does not also carry or
+ * compare the environment: there is nothing to hash or log, and binding to
+ * one preparation pass already pins it.
+ */
+export type ProviderReadKey = Readonly<{ executable: string; ref: string }>;
+
+/** One successful direct 1Password read, kept only long enough to share it with later destinations in the same preparation pass. */
+export type SuccessfulProviderRead = Readonly<{ value: string; resolvedAt: number }>;
+
+function providerReadKeyString(key: ProviderReadKey): string {
+  // A NUL byte cannot appear in a real executable path or an op:// reference,
+  // so the pair joins into one exact, collision-free string key.
+  return `${key.executable}\u0000${key.ref}`;
+}
+
+/**
+ * One preparation pass's shared-read cache. A successful direct 1Password
+ * read is reused for every later destination in the same pass with the
+ * identical resolved executable and exact reference; a source failure or a
+ * cancelled read is never stored, so every destination still gets its own
+ * attempt, classification, fingerprint and receipt. Arbitrary named
+ * commands and JWT private-key/signing reads are never shared (F01 covers
+ * direct 1Password resolution only). Create one fresh scope per preparation
+ * pass — launch preparation, or one watcher pass's reads before its lock —
+ * and let it go out of scope with that pass; never share or persist one
+ * across passes or module-level.
+ */
+export type CredentialPreparationScope = Readonly<{
+  /** For a synchronous preparation pass (launch preparation). Throws exactly as the plan's own synchronous run would; a thrown failure is never cached. */
+  readSync(plan: CredentialReadPlan): string;
+  /** For the watcher's owned asynchronous reads. A `source-failure` or `cancelled` result is never cached. */
+  read(input: CredentialReadInput, lifetime: CredentialLifetime): Promise<CredentialReadResult>;
+}>;
+
+export function createCredentialPreparationScope(): CredentialPreparationScope {
+  const successes = new Map<string, SuccessfulProviderRead>();
+  return Object.freeze({
+    readSync(plan: CredentialReadPlan): string {
+      if (plan.kind !== "1password") return runCredentialReadPlanSync(plan);
+      const key = providerReadKeyString({ executable: plan.read.executable, ref: plan.read.ref });
+      const cached = successes.get(key);
+      if (cached) return cached.value;
+      const value = runCredentialReadPlanSync(plan);
+      successes.set(key, { value, resolvedAt: Date.now() });
+      return value;
+    },
+    async read(input: CredentialReadInput, lifetime: CredentialLifetime): Promise<CredentialReadResult> {
+      if (input.plan.kind !== "1password") return readCredentialSource(input, lifetime);
+      const key = providerReadKeyString({ executable: input.plan.read.executable, ref: input.plan.read.ref });
+      const cached = successes.get(key);
+      if (cached) return { kind: "success", value: cached.value, resolvedAt: cached.resolvedAt };
+      const result = await readCredentialSource(input, lifetime);
+      if (result.kind === "success") successes.set(key, { value: result.value, resolvedAt: result.resolvedAt });
+      return result;
+    },
+  });
+}
+
 // A typed token-source selection (which `--from-*` the user chose), independent
 // of argv. The yargs command modules build this directly via
 // `credentialSourceSelectionFromArgs`.
@@ -2863,6 +2926,10 @@ export function prepareRuntimeTokenSources(options: Readonly<{ mode?: RuntimeTok
     ? warmSkippableTokens(policy, config, registry)
     : new Set<string>();
   const values = new Map<string, PreparedTokenSourceEntry>();
+  // Fresh per call, never module-level: several destinations sharing one
+  // exact 1Password reference cause one `op` read this pass, released with
+  // it. A later preparation pass reads again.
+  const scope = createCredentialPreparationScope();
   for (const [name, tokenPolicy] of Object.entries(policy.tokens)) {
     const source = config[name];
     if (!source) {
@@ -2873,7 +2940,7 @@ export function prepareRuntimeTokenSources(options: Readonly<{ mode?: RuntimeTok
     const fingerprint = tokenSourceFingerprint(source, sourceRegistry);
     values.set(name, skippable.has(name)
       ? { kind: "skipped", fingerprint }
-      : { kind: "resolved", fingerprint, value: resolveTokenSource(name, source, { quiet: true, sourceRegistry }) });
+      : { kind: "resolved", fingerprint, value: scope.readSync(credentialReadPlan(name, source, { quiet: true, sourceRegistry })) });
   }
   if (readActiveControlSelection(project)?.controlGeneration !== active.controlGeneration) {
     throw new EffectiveControlSelectionChanged("effective policy changed during credential preparation; retry before proxy disruption");

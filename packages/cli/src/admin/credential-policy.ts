@@ -15,6 +15,7 @@ import {
   assertTokenSourceCanBeSaved,
   assertValidTokenName,
   childEnv,
+  createCredentialPreparationScope,
   type CredentialAddInput,
   type CredentialClearSourceInput,
   type CredentialFieldsInput,
@@ -77,7 +78,7 @@ import {
   hasControllingTerminal,
   settleHostSignals,
 } from "./credential-cancellation.ts";
-import { type CredentialReadInput, readCredentialSource } from "./credential-source-reader.ts";
+import { type CredentialReadInput } from "./credential-source-reader.ts";
 import {
   TOKEN_SYNC_DEFERRED_STATUS,
   WARM_TOKEN_SYNC_CALL_TIMEOUT_MS,
@@ -355,12 +356,15 @@ type WatchPassOptions = Readonly<{
 
 // Reads the planned sources before the lock, one at a time. A cancelled read
 // ends the pass with nothing stored for it: cancellation is never a source
-// failure.
+// failure. A fresh scope shares a successful exact 1Password read across
+// every destination this pass that uses it; it is released with the pass,
+// never reused by a later one.
 async function prepareWatchReads(reads: readonly CredentialReadInput[], lifetime: CredentialLifetime): Promise<WatchTokenPreparation> {
   const preparation: WatchTokenPreparation = { preparedAt: Date.now(), entries: new Map() };
+  const scope = createCredentialPreparationScope();
   try {
     for (const read of reads) {
-      const result = await readCredentialSource(read, lifetime);
+      const result = await scope.read(read, lifetime);
       if (result.kind === "cancelled") throw new CredentialCancellationError(lifetime.stopCause() ?? "lifetime-closed");
       preparation.entries.set(read.tokenName, result.kind === "success"
         ? { kind: "resolved", fingerprint: read.fingerprint, value: result.value, resolvedAt: result.resolvedAt }
