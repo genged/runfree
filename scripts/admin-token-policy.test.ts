@@ -85,6 +85,7 @@ const fakeCommandHandlers = new Map<string, FakeCommandHandler>();
 
 function spawnResult(options: {
   error?: Error;
+  signal?: NodeJS.Signals;
   status?: number | null;
   stderr?: string;
   stdout?: string;
@@ -95,7 +96,7 @@ function spawnResult(options: {
     error: options.error,
     output: [null, stdout, stderr],
     pid: 0,
-    signal: null,
+    signal: options.signal ?? null,
     status: options.status === undefined ? 0 : options.status,
     stderr,
     stdout,
@@ -636,6 +637,10 @@ function installTokenSyncDockerFake(options: { composeProject?: string; onMarker
       }
       if (writeMatch) {
         fakeProxySecretStore.add(writeMatch[1]);
+        // The remote write landed, but its client was killed (or timed out)
+        // before it could report.
+        if (env.FAKE_DOCKER_TOKEN_WRITE_KILL === "timeout") return spawnTimeoutResult("docker");
+        if (env.FAKE_DOCKER_TOKEN_WRITE_KILL) return spawnResult({ signal: env.FAKE_DOCKER_TOKEN_WRITE_KILL as NodeJS.Signals, status: null });
         const writes = (fakeProxyWriteCounts.get(writeMatch[1]) ?? 0) + 1;
         fakeProxyWriteCounts.set(writeMatch[1], writes);
         // Simulates the proxy's token store being replaced right after the
@@ -5376,6 +5381,38 @@ describe("credential watcher cancellation (F08)", () => {
       .toEqual({ watcherGone: true, providersRunning: [], peerRunning: true, removals: 0, ...before });
     peer.send("stop");
   }, 60_000);
+
+  for (const kill of ["SIGKILL", "timeout"] as const) {
+    test(`a token write whose client ended by ${kill} removes nothing and makes the next pass re-read the source`, async () => {
+      const { fakeDocker, op } = await oneTokenFixture();
+      await seed(fakeDocker, [op.bin]);
+      const writesBefore = tokenWriteCount(fakeDocker.dockerLog, "github");
+      const env = { FAKE_DOCKER_LOG: fakeDocker.dockerLog, OP_SERVICE_ACCOUNT_TOKEN: "op-session", PATH: [fakeDocker.fakeBin, op.bin, process.env.PATH ?? ""].join(path.delimiter) };
+
+      const killed = await runAdmin(() => credentialSyncIntent(syncInput), { ...env, FAKE_DOCKER_TOKEN_WRITE_KILL: kill });
+
+      expect(killed.status).not.toBe(0);
+      expect(killed.stderr).toContain("its outcome is unknown and the next sync re-reads it");
+      expect(tokenWriteCount(fakeDocker.dockerLog, "github")).toBe(writesBefore + 1);
+      expect(tokenRemovalCount(fakeDocker.dockerLog, "github")).toBe(0);
+      // The status is left as it was; only the receipt stops claiming the value.
+      expect(readTokenStatus().github).toMatchObject({ ok: true, state: "ok" });
+      expect(readReceiptNames()).toEqual([]);
+
+      // Reclaim: the next launch's receipt-gated preparation finds the token
+      // unproven, re-reads it before the lock, and the locked sync writes it.
+      const readsBefore = op.events().filter((event) => event.kind === "start").length;
+      selectEffectiveControlsFromProjectPolicy();
+      const warm = await runAdmin(async () => {
+        prepareRuntimeTokenSources({ mode: "convergence" });
+        await credentialSyncIntent({ ...syncInput, mode: "startup-convergence" });
+      }, env);
+      expect(warm.status, warm.stderr).toBe(0);
+      expect(op.events().filter((event) => event.kind === "start").length).toBe(readsBefore + 1);
+      expect(tokenWriteCount(fakeDocker.dockerLog, "github")).toBe(writesBefore + 2);
+      expect(readReceiptNames()).toEqual(["github"]);
+    }, 60_000);
+  }
 
   // Last in the block: a reproduction is only evidence of the defect if its
   // harness reached the effect it asserts on.

@@ -2097,10 +2097,30 @@ export function proxyTokenWriteScript(tokenFile: string, byteLength: number): st
   ].join("; ");
 }
 
-// A Docker client that ended by a stop signal leaves its remote operation's
-// outcome unknown: never read as a failure that a removal could compensate.
-function assertDockerClientNotSignaled(result: CaptureResult): void {
-  if (!result.timedOut && isHostStopSignal(result.signal)) throw new ChildSignaledError("proxy-client", result.signal);
+/**
+ * A token write whose Docker client was killed (any signal, including the
+ * host's own timeout kill) has an unknown remote outcome. The write script
+ * never deletes the held token, so the proxy holds either the old or the new
+ * value: the token is never removed for it, but its receipt no longer proves
+ * which, so the destination is prepared afresh by the next pass.
+ */
+export class ProxyTokenWriteOutcomeUnknown extends Error {
+  readonly tokenName: string;
+
+  constructor(tokenName: string, cause: string) {
+    super(`${tokenName}: proxy token write ended by ${cause}; its outcome is unknown and the next sync re-reads it`);
+    this.name = "ProxyTokenWriteOutcomeUnknown";
+    this.tokenName = tokenName;
+  }
+}
+
+// A Docker client that ended by a stop signal may have been ended by the
+// host's own Ctrl-C or stop: the pass ends before any verdict
+// (`ChildSignaledError`). Any other kill of a write client is an unknown
+// outcome within the pass. Neither is ever compensated by a removal.
+function assertDockerClientNotSignaled(result: CaptureResult, write?: Readonly<{ tokenName: string }>): void {
+  if (!result.timedOut && isHostStopSignal(result.signal)) throw new ChildSignaledError("proxy-client", result.signal, write?.tokenName);
+  if (write && (result.timedOut || result.signal)) throw new ProxyTokenWriteOutcomeUnknown(write.tokenName, result.timedOut ? "its time bound" : result.signal as string);
 }
 
 function writeProxyRuntimeToken(proxyId: string, name: string, value: string): void {
@@ -2115,7 +2135,7 @@ function writeProxyRuntimeToken(proxyId: string, name: string, value: string): v
     { interactive: true, user: PROXY_RUNTIME_USER },
     { input: value },
   );
-  assertDockerClientNotSignaled(result);
+  assertDockerClientNotSignaled(result, { tokenName: name });
   if (result.status !== 0) {
     throw new Error(result.stderr.trim() || `failed to write ${name} token into proxy tmpfs`);
   }
@@ -2588,9 +2608,21 @@ export function syncTokens(options: TokenSyncOptions = {}): TokenSyncResult {
  * always was, by one rerun; a Docker client's outcome stays unknown and the
  * command fails without compensating for it.
  */
+/** Drops a token's resolutions from a ledger, so its next due decision reads it. */
+export function forgetLedgerResolutions(ledger: TokenResolutionLedger | undefined, tokenName: string): void {
+  if (!ledger) return;
+  for (const map of [ledger.lastResolvedAt, ledger.retryAfterFailureAt]) {
+    for (const key of [...map.keys()]) if (key.startsWith(`${tokenName}\0`)) map.delete(key);
+  }
+}
+
 export async function syncTokensSettlingSignals(options: TokenSyncOptions = {}): Promise<TokenSyncResult> {
-  const unknownOutcome = (error: ChildSignaledError): Error =>
-    new Error(`${error.message}; run \`runfree credential sync\` to re-observe the proxy`);
+  const unknownOutcome = (error: ChildSignaledError): Error => {
+    // Not the host's own stop (that exits during the settle): the write's
+    // outcome is unknown, so its receipt no longer proves the held value.
+    if (error.tokenName) retractPersistedTokenReceipts(error.tokenName);
+    return new Error(`${error.message}; run \`runfree credential sync\` to re-observe the proxy`);
+  };
   try {
     return syncTokens(options);
   } catch (error) {
@@ -3430,6 +3462,17 @@ function syncTokensUnderLock(
       if (error instanceof EffectiveControlSelectionChanged || error instanceof TokenSyncDeferredError
         || error instanceof CredentialCancellationError || error instanceof ChildSignaledError) throw error;
       assertActive();
+      if (error instanceof ProxyTokenWriteOutcomeUnknown) {
+        // Never a removal and never a source verdict: the value is re-read
+        // and written again by the next pass, whose due decision no longer
+        // finds a resolution for it.
+        retractReceipt(tokenName);
+        forgetLedgerResolutions(ledger, tokenName);
+        failed.push(tokenName);
+        failedMessages[tokenName] = error.message;
+        if (!options.quiet) console.error(error.message);
+        continue;
+      }
       clearCachedSourceSecret(source, options.sourceSecretCache);
       let failureFingerprint: string | undefined;
       try {

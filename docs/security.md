@@ -205,11 +205,15 @@ agent sees: placeholder or runfree_oauth_* handle only
    the keep-last-good age, until the next launch reads it interactively.
    `runfree credential sync` always re-reads. Stopping a read is never a read
    failure: when the session exits, its parent disappears, or Ctrl-C or
-   another signal stops the watcher or a one-shot sync, the held value, its
-   receipt and its status stay as they were. The watcher ends the providers it
-   started (SIGTERM, then SIGKILL after 2 s) and starts no further read. A
-   proxy token write replaces the held value only when the whole value
-   arrived.
+   another signal stops the watcher or a one-shot sync, nothing more is
+   written, removed or recorded. A write or removal that completed before the
+   stop stands, and the receipt and status for it may be stale until the next
+   pass. The watcher ends the providers it started (SIGTERM, then SIGKILL
+   after 2 s) and starts no further read. A proxy token write replaces the
+   held value only when the whole value arrived. A write whose client was
+   killed (any signal, or its time bound) has an unknown outcome: the token is
+   not removed, and its receipt is dropped so the next sync reads the source
+   again.
 5. The proxy CA private key is mounted only into the proxy.
 
 ### Sessions

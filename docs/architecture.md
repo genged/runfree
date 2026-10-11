@@ -1760,8 +1760,9 @@ closes the watcher's lifetime pipe and signals the watcher only (never its
 process group), so an in-flight proxy write completes. A stopped watch writes,
 removes and records nothing more. A write that completed after the stop
 stands, without a new receipt. A Docker client ended by a signal has an
-unknown outcome, so it is never followed by a removal; the next pass or
-launch observes the proxy again.
+unknown outcome, so it is never followed by a removal; a killed write client
+also drops that token's receipt, so the next pass or launch reads its source
+again.
 
 ## Services
 

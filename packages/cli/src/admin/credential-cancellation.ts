@@ -32,14 +32,17 @@ export class CredentialCancellationError extends Error {
 export class ChildSignaledError extends Error {
   readonly childKind: "provider" | "proxy-client";
   readonly signal: NodeJS.Signals;
+  /** A proxy token write's destination, when the child was its client. */
+  readonly tokenName?: string;
 
-  constructor(childKind: "provider" | "proxy-client", signal: NodeJS.Signals) {
+  constructor(childKind: "provider" | "proxy-client", signal: NodeJS.Signals, tokenName?: string) {
     super(childKind === "proxy-client"
       ? `a proxy token operation ended by ${signal}; its outcome is unknown`
       : `a credential source ended by ${signal}`);
     this.name = "ChildSignaledError";
     this.childKind = childKind;
     this.signal = signal;
+    if (tokenName !== undefined) this.tokenName = tokenName;
   }
 }
 

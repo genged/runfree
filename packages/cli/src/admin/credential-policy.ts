@@ -33,6 +33,7 @@ import {
   type EffectiveTokenRefresh,
   formatDelayMs,
   formatDurationSeconds,
+  forgetLedgerResolutions,
   isTokenResolutionReceipt,
   type JwtPrivateKeyCacheEntry,
   loadPolicy,
@@ -399,6 +400,12 @@ async function lockedWatchPass(
     if (error instanceof ChildSignaledError) {
       await settleHostSignals();
       lifetime.assertActive();
+      // Not the watch's own stop: an unknown write outcome, so the token's
+      // receipt and resolutions no longer prove the held value.
+      if (error.tokenName) {
+        retractPersistedTokenReceipts(error.tokenName);
+        forgetLedgerResolutions(options.resolutionLedger, error.tokenName);
+      }
     }
     throw error;
   } finally {
