@@ -8,6 +8,7 @@ import { runCommandApp } from "./commands/app.ts";
 import { createCommandContext } from "./commands/context.ts";
 import { printHelpTopic } from "./commands/help-topics.ts";
 import { CliError, die, renderUnexpectedError, UNEXPECTED_ERROR_RENDER_LIMITS } from "./errors.ts";
+import { installSignalExit } from "./signal-exit.ts";
 import { flushWarnings, runfreeError } from "./warnings.ts";
 
 type ParsedArgs = {
@@ -90,43 +91,7 @@ export async function runCli(argv: string[], env: NodeJS.ProcessEnv = process.en
   });
 }
 
-// Exit codes for a signal-terminated run (contract D3): the conventional
-// 128+signal values, so a wrapper can tell an interrupt from a refusal.
-export const SIGNAL_EXIT_CODES = Object.freeze({ SIGINT: 130, SIGTERM: 143 });
-
-type SignalName = keyof typeof SIGNAL_EXIT_CODES;
-
-export type SignalExitHooks = {
-  flush: () => void;
-  restore: () => void;
-  exit: (code: number) => void;
-};
-
-// Install one-shot SIGINT/SIGTERM handlers that flush buffered warnings,
-// restore the terminal, and exit 130/143. `once` means a second signal takes
-// the default action (immediate exit) without re-running the handlers, and
-// restoration is idempotent so a signal during a prompt or a half-initialized
-// command is safe. The flush is best-effort synchronous.
-export function installSignalExit(
-  hooks: SignalExitHooks,
-  target: Pick<NodeJS.Process, "once"> = process,
-): void {
-  for (const signal of Object.keys(SIGNAL_EXIT_CODES) as SignalName[]) {
-    target.once(signal, () => {
-      try {
-        hooks.flush();
-      } catch {
-        // Best effort: never let a failed flush block terminal restoration.
-      }
-      try {
-        hooks.restore();
-      } catch {
-        // Same: exit regardless.
-      }
-      hooks.exit(SIGNAL_EXIT_CODES[signal]);
-    });
-  }
-}
+export { installSignalExit, SIGNAL_EXIT_CODES, type SignalExitHooks } from "./signal-exit.ts";
 
 // `--verbose`/`-v` anywhere in argv turns on stack traces for unexpected
 // errors. Scanned rather than parsed: an unexpected error may have escaped
