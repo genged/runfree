@@ -328,27 +328,70 @@ A surviving session's launch process rebinds its own held authority after that t
 
 A warm session launch can skip the full runtime validation. A full validation
 records a warm-proof fingerprint in host state only after the startup session
-reconcile that follows it found nothing to repair; a reconcile that fails or
-repairs residue removes the record instead, so a later launch cannot match a
-fingerprint that names a participant the reconcile was about to remove. The
-fingerprint holds the proxy
-container id, `StartedAt`, PID, image, and network endpoints; both networks
-and their participants; the session volumes; the agent image; both generation
-families; the security contract hash; the Git layout; the proxy CA and agent
-bundle digests; the validation marker digest; the nftables ruleset shape (set
-members excluded); the Docker daemon id, version, and kernel; and the VM boot
-id. A later launch, with an empty lifecycle registry, an unchanged runtime
-plan, and an unchanged selected control plane, re-reads all of these in one
-type-less `docker inspect` and one root batch inside the proxy, re-runs the
-same topology, capability, route, nftables, security-contract, firewall
-readiness, and marker validators over that fresh evidence, and compares the
-facts. Only an exact match within 24 hours skips the full validation; it does
-not re-run the agent-position deny-probe helper, the server-UID denial batch,
-or the root DNS liveness probe, whose inputs the fingerprint binds. A daemon
-with live-restore never takes this path. Anything else deletes the record and
+reconcile that follows it found nothing to repair and after its restore of
+surviving sessions (below) completed; a reconcile that fails or repairs residue
+removes the record instead, so a later launch cannot match a fingerprint that
+names a participant the reconcile was about to remove or a run whose restore
+never finished. The record is written only when the proxy `StartedAt` it binds
+is the one the validation observed and, when a restore ran, the one that
+restore published eligibility against; a same-id restart in between writes no
+record. No record is written while an ephemeral helper or any other
+participant that is not an ingress forwarder is attached to the internal
+network. The fingerprint (record version 2; any other version reads as absent
+and is never converted) holds the proxy container id, `StartedAt`, PID, image,
+and network endpoints; both networks; every internal-network participant
+except the proxy, session agents, and their `mcp-callback` forwarders (so
+`vnc` and `port` forwarders are bound by id, address, endpoint, purpose, and
+target); the session volumes; the agent image; both generation families; the
+security contract hash; the Git layout; the proxy CA and agent bundle digests;
+the validation marker digest; the nftables ruleset shape (set members
+excluded); the `@host_service` members; the Docker daemon id, version, and
+kernel; and the VM boot id. A later launch, with an unchanged runtime plan and
+an unchanged selected control plane, re-reads all of these in one type-less
+`docker inspect` and one root batch inside the proxy, re-runs the same
+topology, capability, route, nftables, security-contract, firewall readiness,
+and marker validators over that fresh evidence, and compares the facts. Only
+an exact match within 24 hours skips the full validation; it does not re-run
+the agent-position deny-probe helper, the server-UID denial batch, or the root
+DNS liveness probe, whose inputs the fingerprint binds. A daemon with
+live-restore never takes this path. Anything else deletes the record and
 validates fully. `runfree up` always validates fully; `stop`, `destroy`, and
 `rebuild` remove the record. A launch also skips image cleanup when the
 host-side cleanup inputs have not changed since the last completed pass.
+
+With live sessions in the lifecycle registry, the fingerprint match is not
+enough on its own: the peers and their callback forwarders are participants
+the record does not bind. The launch then also judges, under the held
+lifecycle lock and inside the same proxy incarnation
+(`packages/cli/src/runtime/warm-peer-proof.ts`), that every peer is fully
+accounted for: the registry is legible with no quarantined record, no rebind
+journal, and at most 64 records; every record is `attached`, carries no
+terminal stamp, has a provably live owner (an owner that cannot be proved
+either way is a miss, never live and never dead), and is bound to the selected
+control plane generation and admission contract epoch; one host-wide container
+inventory classifies exactly every record's container and nothing else; each
+peer's container passes the same running proof restore uses, over an inspect
+whose container id, endpoint id, and `StartedAt` agree with the inventory and
+the network's endpoint map; each peer has exactly one current, eligible,
+correctly addressed session file and no file lacks a record; the kernel
+`@session_ipv4` set holds exactly the peers' addresses, the request proxy
+serves the selected effective policy generation, and each peer's IP assignment
+is ready and bound to it; every other internal-network participant is a peer's
+own `mcp-callback` forwarder or an exactly recorded forwarder, and a recorded
+forwarder that targets a session address must target a peer; and a fresh exact
+proxy inspect after the inventory shows the same `StartedAt` the observation
+began with. Any miss takes the full validation, reconcile, and restore exactly
+as before. A match still runs the startup reconcile, and it skips
+`restoreSameProxySessionAdmission` only when that reconcile found nothing at
+all to repair, a fresh proxy inspect shows the judged incarnation, no rebind
+journal or revoking record appeared, and the sealed one-shot judgement still
+binds the lock owner, proxy id and `StartedAt`, registry digest, and both
+generation families. Otherwise the launch refuses before credential sync and
+before any handoff, drops the record, and asks for a retry, which validates
+fully and restores. The judgement is never placed in the launch handoff, never
+restores or republishes a peer, and renews nothing: a peer whose owner dies
+afterwards keeps its authority only until its session file expires, and the
+reconcile that still runs tears it down.
 
 Startup mints one in-memory `PreparedRuntime` after durable selection and live proof agree. Public launches consume that exact authority once. A changed container or selection causes one bounded re-prepare attempt. Credential sync occurs only after this prepared authority exists.
 

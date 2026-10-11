@@ -185,6 +185,12 @@ import { createOperationHistogram, withOperationHistogram } from "./operation-hi
 import { remedy } from "../remedies.ts";
 import { sessionRegistryDigest } from "./launch-handoff.ts";
 import { proveWarmEmptySessionState, type WarmEmptySessionState } from "./warm-empty-session-state.ts";
+import {
+  consumeWarmPeerValidation,
+  tryWarmPeerValidation,
+  type WarmPeerConsumptionBinding,
+  type WarmPeerValidation,
+} from "./warm-peer-proof.ts";
 import { setMcpLogContext } from "./mcp.ts";
 
 const RETAINED_AGENT_TEMPLATE_REMEDY =
@@ -1555,12 +1561,16 @@ export async function startRuntime(
       if (upgradePlan.action !== "token-sync") return `upgrade-${upgradePlan.action}`;
       if (dependencyPlan.changed || gitLayout.changed) return "inputs-changed";
       const identity = { projectId: activePlan.projectId, composeProject: project };
-      if (listSessionContainerRecordsV2(activePlan.paths.stateDir, identity).length > 0) return "live-sessions";
+      // Enumerated first: the listing quarantines what it cannot read.
+      listSessionContainerRecordsV2(activePlan.paths.stateDir, identity);
       if (listQuarantinedSessionContainerRecordNamesV2(activePlan.paths.stateDir).length > 0) return "quarantined-records";
       if (readControlPlaneRebindTransaction(activePlan.paths.stateDir, identity)) return "pending-rebind";
       return undefined;
     };
-    const warmValidationForLaunch = (): WarmValidation | undefined => {
+    // A warm launch: the stable match, and beside live peers the judgement
+    // that accounted for every one of them (`warm-peer-proof.ts`).
+    type WarmLaunch = Readonly<{ warm: WarmValidation; peer?: WarmPeerValidation }>;
+    const warmValidationForLaunch = (): WarmLaunch | undefined => {
       let reason: string | undefined;
       try {
         reason = warmIneligibility();
@@ -1587,7 +1597,46 @@ export async function startRuntime(
         if (verdict.kind === "unavailable") reportRuntimeVerbose(verbose, `warm-proof unavailable: ${verdict.reason}`);
         return undefined;
       }
-      return verdict.validation;
+      const stable = verdict.validation;
+      const identity = { projectId: activePlan.projectId, composeProject: project };
+      let hasPeers: boolean;
+      let effective: ReturnType<typeof readEffectiveControlPlaneV2>;
+      try {
+        hasPeers = listSessionContainerRecordsV2(activePlan.paths.stateDir, identity).length > 0;
+        effective = readEffectiveControlPlaneV2(activePlan.paths.stateDir);
+      } catch (error) {
+        timings.report("validation:warm-peer", "miss:registry-unreadable");
+        reportRuntimeVerbose(verbose, `warm peer validation skipped: ${error instanceof Error ? error.message : String(error)}`);
+        return undefined;
+      }
+      if (!hasPeers) return { warm: stable };
+      // Beside live peers the stable match is extended by an exact account of
+      // every peer and participant; any miss takes the full path.
+      if (!effective) {
+        timings.report("validation:warm-peer", "miss:evidence-unreadable");
+        return undefined;
+      }
+      const effectiveSelection = effective;
+      const peerVerdict = timings.time("validation:warm-peer-check", () => tryWarmPeerValidation({
+        stable,
+        stateDir: activePlan.paths.stateDir,
+        expectedProject: identity,
+        effective: effectiveSelection.selection,
+        effectiveManifest: effectiveSelection.manifest,
+        effectivePolicyGeneration: input.effectivePolicyGeneration,
+        lifecycleLock: heldLifecycleLock,
+        io,
+        docker: adapters.docker,
+        dockerOptions: dockerClientEnvOptions(activeContext),
+        env: activeContext.env,
+        runfreeVersion: activePlan.runfreeVersion,
+      }));
+      timings.report("validation:warm-peer", peerVerdict.kind === "match" ? "match" : `miss:${peerVerdict.reason}`);
+      if (peerVerdict.kind !== "match") {
+        if (peerVerdict.detail) reportRuntimeVerbose(verbose, `warm peer validation missed (${peerVerdict.reason}): ${peerVerdict.detail}`);
+        return undefined;
+      }
+      return { warm: stable, peer: peerVerdict.validation };
     };
     const validateSelectAndSync = async (): Promise<RuntimeStartResult> => {
       runImageCleanupUnlessUnchanged({
@@ -1608,7 +1657,9 @@ export async function startRuntime(
       // the re-judged marker proof, so the control-plane selection below is
       // never asked to prove or select from warm evidence.
       heldLifecycleLock.assertHeld();
-      const warm = warmValidationForLaunch();
+      const warmLaunch = warmValidationForLaunch();
+      const warm = warmLaunch?.warm;
+      const warmPeer = warmLaunch?.peer;
       const dropWarmRecord = (why: string): void => {
         try {
           removeWarmProofRecord(activePlan.paths.stateDir);
@@ -1759,34 +1810,70 @@ export async function startRuntime(
         dropWarmRecord("a session reconcile that did not complete");
         return result(1, false, activeContext);
       }
-      // The record is written only after a reconcile that found nothing to
-      // repair: a record taken earlier could bind a participant the reconcile
-      // was about to remove, and a later launch would match it while that
-      // container still runs. A full validation just proved the runtime and
-      // the selection matches it, so record the warm-proof facts for the next
-      // launch (runfree up and launches alike; never a rebuild). Best effort.
-      if (reconciled && !reconciled.inventoryClean) {
-        dropWarmRecord("a session reconcile that repaired residue");
-      } else if (!warm && !removeExisting && reconciled?.inventoryClean) {
-        const input = warmProofInput();
-        const recorded = input ? recordWarmRuntimeProof(input) : "the warm-proof inputs are unavailable";
-        timings.report("validation:warm-proof", recorded === "written" ? "recorded" : "not-recorded");
-        if (recorded !== "written") reportRuntimeVerbose(verbose, `warm-proof record not written: ${recorded}`);
-      }
-      // A warm proxy that kept its container id can still have restarted in
-      // place, taking its session-file directory and eligibility with it. The
-      // restore re-proves every surviving session and republishes the
-      // eligibility unconditionally, so it runs whenever this project still has
-      // lifecycle records to restore.
-      if (listSessionContainerRecordsV2(activePlan.paths.stateDir, { projectId: activePlan.projectId, composeProject: project }).length) {
-        // The warm path runs only with an empty registry, checked under this
-        // same held lock, and reconcile adds no records; a record here means
-        // that premise broke, so nothing is restored from warm evidence.
-        if (!validation) {
-          warn("a lifecycle record appeared during a warm launch; retry the command to validate the runtime fully");
+      const sessionIdentity = { projectId: activePlan.projectId, composeProject: project };
+      if (warmPeer) {
+        // A warm launch beside live peers skips the restore only while the
+        // judgement's binding still holds after the reconcile. Anything short
+        // of that refuses: nothing is restored from warm evidence, and the
+        // retry, finding no record, validates fully and restores.
+        const refusal = warmPeerRestoreSkipRefusal({
+          validation: warmPeer,
+          reconciled,
+          io,
+          stateDir: activePlan.paths.stateDir,
+          expectedProject: sessionIdentity,
+          proxyId: runtimeProof.proxyId,
+          project: context.project,
+          lifecycleLock: heldLifecycleLock,
+          dockerOptions: dockerClientEnvOptions(activeContext),
+        });
+        if (refusal !== undefined) {
+          timings.report("startup:restore-sessions", `refused ${refusal}`);
+          reportRuntimeVerbose(verbose, `warm launch beside peers refused: ${refusal}`);
+          dropWarmRecord("a warm launch beside peers whose session state changed");
+          warn("the session state changed during a warm launch; retry the command to validate the runtime fully");
           return result(1, false, activeContext);
         }
-        await restoreSameProxySessionAdmission({ plan: activePlan, io, lifecycleLock: heldLifecycleLock, proxyId: runtimeProof.proxyId, validation });
+        timings.report("startup:restore-sessions", "skipped warm-peer");
+      } else {
+        if (reconciled && !reconciled.inventoryClean) dropWarmRecord("a session reconcile that repaired residue");
+        // A warm proxy that kept its container id can still have restarted in
+        // place, taking its session-file directory and eligibility with it. The
+        // restore re-proves every surviving session and republishes the
+        // eligibility unconditionally, so it runs whenever this project still has
+        // lifecycle records to restore.
+        let restoredProxyStartedAt: string | undefined;
+        if (listSessionContainerRecordsV2(activePlan.paths.stateDir, sessionIdentity).length) {
+          // The warm-empty path runs only with an empty registry, checked under
+          // this same held lock, and reconcile adds no records; a record here
+          // means that premise broke, so nothing is restored from warm evidence.
+          if (!validation) {
+            warn("a lifecycle record appeared during a warm launch; retry the command to validate the runtime fully");
+            return result(1, false, activeContext);
+          }
+          const fullValidation = validation;
+          restoredProxyStartedAt = await timings.timeAsync("startup:restore-sessions", () => restoreSameProxySessionAdmission({
+            plan: activePlan, io, lifecycleLock: heldLifecycleLock, proxyId: runtimeProof.proxyId, validation: fullValidation,
+          }));
+        }
+        // The record is written only after a reconcile that found nothing to
+        // repair and after the restore completed: a record taken earlier could
+        // bind a participant the reconcile was about to remove, or a run whose
+        // restore never finished, and a later launch would match it. Its proxy
+        // start must be the one this validation observed and, when a restore
+        // ran, the one that restore published against: a same-id restart in
+        // between records nothing. A full validation just proved the runtime
+        // and the selection matches it, so record the warm-proof facts for the
+        // next launch (runfree up and launches alike; never a rebuild). Best
+        // effort.
+        if (!warm && !removeExisting && reconciled?.inventoryClean && proxyStartedAt !== undefined) {
+          const input = warmProofInput();
+          const recorded = restoredProxyStartedAt !== undefined && restoredProxyStartedAt !== proxyStartedAt
+            ? "the proxy restarted between the validation and the restore"
+            : input ? recordWarmRuntimeProof(input, proxyStartedAt) : "the warm-proof inputs are unavailable";
+          timings.report("validation:warm-proof", recorded === "written" ? "recorded" : "not-recorded");
+          if (recorded !== "written") reportRuntimeVerbose(verbose, `warm-proof record not written: ${recorded}`);
+        }
       }
       const proxyRecreated = proxyRecreatedSinceStart(adapters.docker);
       const credentialMode = receiptGatedCredentials && !proxyRecreated ? "receipt-gated" : "source-truth";
@@ -2137,7 +2224,78 @@ export async function up(
   return (await startRuntime(context, io, removeExisting, rebuildOptions)).status;
 }
 
-/** Restore admission after an explicitly authorized restart of the same proxy. */
+/**
+ * Why a warm launch beside live peers may not skip
+ * `restoreSameProxySessionAdmission`, or undefined when it may. Runs after the
+ * startup reconcile, under the same held lock: the reconcile must have found
+ * nothing at all to repair, the proxy must still be the incarnation the
+ * judgement saw, there must be no rebind journal and no revoking record, and
+ * the one-shot judgement must still bind every re-read field. Only the last
+ * check consumes it. A lost lock throws.
+ */
+function warmPeerRestoreSkipRefusal(input: Readonly<{
+  validation: WarmPeerValidation;
+  reconciled: SessionReconcileResult | undefined;
+  io: RuntimeIO;
+  stateDir: string;
+  expectedProject: SessionContainerProjectIdentity;
+  proxyId: string;
+  project: RuntimeContext["project"];
+  lifecycleLock: ProjectLifecycleLock;
+  dockerOptions: ReturnType<typeof dockerClientEnvOptions>;
+}>): string | undefined {
+  const { reconciled } = input;
+  if (!reconciled) return "the startup reconcile did not run";
+  if (!reconciled.inventoryClean
+    || reconciled.orphanFilesDeleted.length > 0
+    || reconciled.deadOwnersRevoked.length > 0
+    || reconciled.orphanContainersRemoved.length > 0
+    || reconciled.unknownOwners.length > 0
+    || reconciled.recordsWithoutFiles.length > 0
+    || reconciled.orphanFiles.length > 0
+    || reconciled.quarantinedFiles.length > 0) {
+    return "the startup reconcile found session state to repair";
+  }
+  input.lifecycleLock.assertHeld();
+  let proxyStartedAt: string;
+  try {
+    proxyStartedAt = observeProxyStartedAt(input.io, input.proxyId, input.dockerOptions);
+  } catch (error) {
+    return `the proxy start is unavailable: ${error instanceof Error ? error.message : String(error)}`;
+  }
+  if (proxyStartedAt !== input.validation.proxyStartedAt) return "the proxy restarted since the warm peer judgement";
+  let binding: WarmPeerConsumptionBinding;
+  try {
+    const effective = readEffectiveControlPlaneV2(input.stateDir);
+    const policy = readActiveControlSelection(input.project);
+    if (!effective || !policy) return "the effective selection is unreadable";
+    if (readControlPlaneRebindTransaction(input.stateDir, input.expectedProject)) return "a control-plane rebind is pending";
+    if (listSessionContainerRecordsV2(input.stateDir, input.expectedProject).some((record) => record.state === "revoking")) {
+      return "a session record is revoking";
+    }
+    binding = {
+      lockOwnerToken: input.lifecycleLock.ownerToken,
+      proxyId: effective.selection.proxyContainerId,
+      proxyStartedAt,
+      registryDigest: sessionRegistryDigest(input.stateDir, input.expectedProject),
+      effectivePolicyGeneration: policy.controlGeneration,
+      controlPlaneGenerationDigest: effective.selection.controlPlaneGenerationDigest,
+      controlPlaneMaterializationDigest: effective.selection.controlPlaneMaterializationDigest,
+      admissionContractEpoch: effective.selection.admissionContractEpoch,
+    };
+  } catch (error) {
+    input.lifecycleLock.assertHeld();
+    return `the session state is unreadable: ${error instanceof Error ? error.message : String(error)}`;
+  }
+  input.lifecycleLock.assertHeld();
+  if (!consumeWarmPeerValidation(input.validation, binding)) return "the warm peer judgement no longer binds the runtime";
+  return undefined;
+}
+
+/**
+ * Restore admission after an explicitly authorized restart of the same proxy.
+ * Returns the proxy start its eligibility publication was observed against.
+ */
 export async function restoreSameProxySessionAdmission(input: {
   plan: ActiveRuntimePlan;
   io: RuntimeIO;
@@ -2149,7 +2307,7 @@ export async function restoreSameProxySessionAdmission(input: {
    * the validation runs the ephemeral helpers, which refuse without it.
    */
   containmentIO?: RuntimeIO;
-}): Promise<void> {
+}): Promise<string> {
   const { plan, io, lifecycleLock, proxyId } = input;
   const expectedProject = { projectId: plan.projectId, composeProject: plan.composeProjectName };
   lifecycleLock.assertHeld();
@@ -2238,9 +2396,10 @@ export async function restoreSameProxySessionAdmission(input: {
   const retained = readRetainedDesiredSessionAgentV2(plan.paths.stateDir);
   if (!retained) throw new Error(RETAINED_AGENT_TEMPLATE_REMEDY);
   assertAuthority();
+  const proxyStartedAt = observeProxyStartedAt(io, proxyId, dockerClientEnvOptions(context));
   ensureSessionEligibilityPublished({
     io, proxyId, stateDir: plan.paths.stateDir, effective, desired: retained, records,
-    proxyStartedAt: observeProxyStartedAt(io, proxyId, dockerClientEnvOptions(context)),
+    proxyStartedAt,
     ignorePublicationRecord: true,
     dockerOptions: dockerClientEnvOptions(context),
   });
@@ -2251,7 +2410,7 @@ export async function restoreSameProxySessionAdmission(input: {
     // assuming the loop ran.
     lifecycleLock.assertHeld();
     await waitForSessionAdmissionFirewallSetEmpty(io, proxyId, { assertAuthority: () => lifecycleLock.assertHeld(), dockerOptions: dockerClientEnvOptions(context) });
-    return;
+    return proxyStartedAt;
   }
   if (!("sessionTemplateArtifactSha256" in retained.manifest)) {
     throw new Error(RETAINED_AGENT_TEMPLATE_REMEDY);
@@ -2280,4 +2439,5 @@ export async function restoreSameProxySessionAdmission(input: {
   // eligibility was published above and the per-session heartbeats refill the
   // session files themselves.
   assertAuthority();
+  return proxyStartedAt;
 }

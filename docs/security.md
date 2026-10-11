@@ -255,6 +255,13 @@ proxy: firewall + request proxy read the file (on change; 100 ms backstop) -> se
     network's participants, an empty lifecycle registry, and one host-wide
     container listing all show no session state. Unreadable is never empty:
     a listing that fails, times out, or has a malformed row reconciles.
+11. **A skipped restore needs every peer accounted for.** A warm launch beside
+    live sessions skips the restore of surviving sessions only after an exact
+    judgement that every peer and every internal-network participant is
+    accounted for in one proxy incarnation, and only while that sealed,
+    one-shot judgement still binds after a startup reconcile that found
+    nothing to repair. Otherwise the launch refuses and the retry validates
+    fully. Warm evidence never restores, republishes, or renews a peer.
 
 Mechanics: [Session Admission](architecture.md#session-admission).
 
@@ -421,7 +428,15 @@ Details: [Write Approval Grants](architecture.md#write-approval-grants).
   server-UID denial probes, or the root DNS probe. It re-validates the
   topology, capabilities, routes, nftables ruleset, and security contract from
   fresh evidence, and binds the rest to the proxy instance, networks, images,
-  ruleset shape, daemon, and VM boot. `runfree up` always runs every probe.
+  ruleset shape, daemon, and VM boot. The probes are skipped the same way
+  beside live peer sessions: no probe runs per peer. Instead each peer is
+  re-proved by its own running proof over a fresh inspect (capabilities
+  dropped, one network, its exact address) and by exact agreement of the
+  registry, the container inventory, the proxy's session files, the kernel
+  session set, the request proxy's generation, and the IP assignments, and any
+  participant that is not an accounted peer, a peer's own callback forwarder,
+  or a recorded forwarder sends the launch to the full validation. `runfree up`
+  always runs every probe.
 - **Guest clock lag** is not tested live. The live fixture cannot shift the
   Docker VM clock. The rule that a lagging clock cannot extend a lease has
   unit tests only.

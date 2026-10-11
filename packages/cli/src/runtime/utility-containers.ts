@@ -445,3 +445,48 @@ export function internalNetworkSessionStateBlocker(
   }
   return undefined;
 }
+
+/** What one internal-network participant claims to be, by its labels and env alone. */
+export type InternalNetworkParticipantIdentity =
+  | Readonly<{ kind: "session-agent" }>
+  | Readonly<{
+      kind: "ingress-forwarder";
+      purpose: IngressPurpose;
+      hostPort: string;
+      target?: string;
+      /** The mcp-callback binding: present only when the forwarder sets both entries. */
+      callbackSessionId?: string;
+      callbackSessionContainerId?: string;
+    }>
+  | Readonly<{ kind: "ephemeral-helper" }>
+  | Readonly<{ kind: "other"; role?: string }>;
+
+/**
+ * Names what a participant claims to be. A claim, not a proof: call it only on
+ * participants the topology validation already accepted, which judged each
+ * one's shape. Anything that does not legibly claim a known role is `other`.
+ */
+export function describeInternalNetworkParticipant(
+  container: DockerContainerInspect,
+  projectId: string,
+): InternalNetworkParticipantIdentity {
+  const ingress = maybeIngressForwarder(container, projectId);
+  if (ingress) {
+    const env = envMap(container);
+    const sessionId = env[CALLBACK_SESSION_ID_ENV];
+    const sessionContainerId = env[CALLBACK_SESSION_CONTAINER_ENV];
+    return Object.freeze({
+      kind: "ingress-forwarder",
+      purpose: ingress.purpose,
+      hostPort: ingress.hostPort,
+      ...(env.INGRESS_TARGET !== undefined ? { target: env.INGRESS_TARGET } : {}),
+      ...(sessionId !== undefined && sessionContainerId !== undefined
+        ? { callbackSessionId: sessionId, callbackSessionContainerId: sessionContainerId }
+        : {}),
+    });
+  }
+  if (hasProjectRole(container, projectId, "session-agent")) return Object.freeze({ kind: "session-agent" });
+  if (hasProjectRole(container, projectId, "ephemeral-helper")) return Object.freeze({ kind: "ephemeral-helper" });
+  const role = labels(container)[CONTAINER_ROLE_LABEL];
+  return Object.freeze({ kind: "other", ...(role !== undefined ? { role } : {}) });
+}

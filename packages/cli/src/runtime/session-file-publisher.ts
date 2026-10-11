@@ -411,6 +411,11 @@ try {
 // regular, root-owned, single-link file of at most 512 bytes — including an
 // in-flight publish's temp file — fails the whole listing, so the caller falls
 // back to the single read rather than to a guess.
+//
+// Each address maps to `{ digest, sessionKey?, state? }`: the digest of the
+// exact bytes (the fence's CAS precondition) and, when those bytes are a
+// well-formed assignment for that address, the session it is bound to and its
+// state. Bytes that do not parse carry the digest alone: they bind nothing.
 const LIST_IP_ASSIGNMENTS_SCRIPT = `
 const fs = require("node:fs");
 const path = require("node:path");
@@ -426,7 +431,20 @@ for (const entry of fs.readdirSync(path.join(root, "requests")).sort()) {
   const target = path.join(root, "requests", entry);
   const stat = fs.lstatSync(target);
   if (!stat.isFile() || stat.isSymbolicLink() || stat.uid !== ownerUid || stat.nlink !== 1 || stat.size > 512) fail("unsafe IP assignment");
-  digests[match[1]] = crypto.createHash("sha256").update(fs.readFileSync(target)).digest("hex");
+  const bytes = fs.readFileSync(target);
+  const listed = { digest: crypto.createHash("sha256").update(bytes).digest("hex") };
+  try {
+    const value = JSON.parse(bytes.toString("utf8"));
+    if (value && typeof value === "object" && !Array.isArray(value) && value.v === 1 && value.sourceIp === match[1]
+      && typeof value.sessionKey === "string" && /^[a-f0-9]{64}$/.test(value.sessionKey)
+      && (value.state === "ready" || value.state === "draining")) {
+      listed.sessionKey = value.sessionKey;
+      listed.state = value.state;
+    }
+  } catch {
+    // Unparseable bytes bind no session; the digest still fences them.
+  }
+  digests[match[1]] = listed;
 }
 process.stdout.write(JSON.stringify(digests));
 `;
@@ -445,11 +463,21 @@ export function listIpAssignmentsScript(): string {
   return LIST_IP_ASSIGNMENTS_SCRIPT;
 }
 
+export type IpAssignmentBinding = Readonly<{ sessionKey: string; state: "draining" | "ready" }>;
+
+export type IpAssignmentListing = Readonly<{
+  /** `ip -> sha256 hex` of every assignment file's exact bytes. */
+  digests: Readonly<Record<string, string>>;
+  /** `ip -> binding` for every assignment whose bytes are a well-formed assignment for that address. */
+  bindings: Readonly<Record<string, IpAssignmentBinding>>;
+}>;
+
 /**
- * Parses the listing into `ip -> digest`; undefined for anything malformed.
- * An address the listing does not name has no assignment (`-`).
+ * Parses the listing; undefined for anything malformed. An address the listing
+ * does not name has no assignment (`-`); an address without a binding has
+ * bytes that bind no session.
  */
-export function parseIpAssignmentListing(stdout: string): Readonly<Record<string, string>> | undefined {
+export function parseIpAssignmentEntries(stdout: string): IpAssignmentListing | undefined {
   let parsed: unknown;
   try {
     parsed = JSON.parse(stdout);
@@ -458,11 +486,19 @@ export function parseIpAssignmentListing(stdout: string): Readonly<Record<string
   }
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
   const digests: Record<string, string> = {};
-  for (const [ip, digest] of Object.entries(parsed as Record<string, unknown>)) {
-    if (!isExactSessionSourceIpv4(ip) || typeof digest !== "string" || !/^[a-f0-9]{64}$/.test(digest)) return undefined;
+  const bindings: Record<string, IpAssignmentBinding> = {};
+  for (const [ip, entry] of Object.entries(parsed as Record<string, unknown>)) {
+    if (!isExactSessionSourceIpv4(ip) || !entry || typeof entry !== "object" || Array.isArray(entry)) return undefined;
+    const { digest, sessionKey, state, ...rest } = entry as Record<string, unknown>;
+    if (Object.keys(rest).length > 0 || typeof digest !== "string" || !/^[a-f0-9]{64}$/.test(digest)) return undefined;
     digests[ip] = digest;
+    if (sessionKey === undefined && state === undefined) continue;
+    if (typeof sessionKey !== "string" || !/^[a-f0-9]{64}$/.test(sessionKey) || (state !== "ready" && state !== "draining")) {
+      return undefined;
+    }
+    bindings[ip] = Object.freeze({ sessionKey, state });
   }
-  return Object.freeze(digests);
+  return Object.freeze({ digests: Object.freeze(digests), bindings: Object.freeze(bindings) });
 }
 
 export function sessionIpAssignmentReadCommand(proxyId: string, sourceIp: string): SessionAdmissionDockerCommand {

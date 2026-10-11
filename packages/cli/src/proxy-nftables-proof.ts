@@ -246,6 +246,31 @@ export function parseHostServiceSetMembers(rawJson: string, tableName = DEFAULT_
   return members;
 }
 
+/**
+ * The kernel `@session_ipv4` members (exact IPv4 addresses) from the whole
+ * table's `nft -j list table` output. Exactly one such set must be present
+ * and every element must be an exact IPv4 address; anything else returns
+ * undefined, so unreadable kernel state is never read as "no members".
+ */
+export function parseSessionSetMembers(rawJson: string, tableName = DEFAULT_TABLE_NAME): string[] | undefined {
+  const statements = parseNftJsonTable(rawJson);
+  if (!statements) return undefined;
+  const sets = statements.map((statement) => statement.set)
+    .filter((set): set is NftSet & { elem?: unknown } => set !== undefined
+      && nftStatementOwned(set, tableName) && set.name === DEFAULT_SESSION_SET_NAME);
+  if (sets.length !== 1) return undefined;
+  const [set] = sets;
+  if (set.elem === undefined) return [];
+  if (!Array.isArray(set.elem)) return undefined;
+  const members: string[] = [];
+  for (const element of set.elem) {
+    const value = isRecord(element) && isRecord(element.elem) ? element.elem.val : element;
+    if (typeof value !== "string" || !STRICT_IPV4_RE.test(value)) return undefined;
+    members.push(value);
+  }
+  return members;
+}
+
 function sameHostServiceMembers(left: readonly HostServiceSetEntry[], right: readonly HostServiceSetEntry[]): boolean {
   const leftKeys = sortHostServiceEntries(left).map(hostServiceEntryKey);
   const rightKeys = sortHostServiceEntries(right).map(hostServiceEntryKey);

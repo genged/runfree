@@ -166,7 +166,7 @@ export type DockerContainerInspect = {
     Type?: string;
   }> | null;
   NetworkSettings?: {
-    Networks?: Record<string, { NetworkID?: string; Gateway?: string; IPAddress?: string; GlobalIPv6Address?: string }>;
+    Networks?: Record<string, { NetworkID?: string; Gateway?: string; IPAddress?: string; GlobalIPv6Address?: string; EndpointID?: string }>;
     Ports?: DockerPortBindings | null;
   };
 };

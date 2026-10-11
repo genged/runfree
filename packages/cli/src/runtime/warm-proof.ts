@@ -13,9 +13,12 @@
 // The record selects a path; it never authorizes. Every compared fact is
 // observed live again, the record never feeds a validator, and anything short
 // of an exact match — a missing, malformed, older-than-24-hour record, one
-// changed fact, an unavailable observation, a live session in the registry —
-// takes the full validation path, which deletes the record first and writes a
-// fresh one after it succeeds. `runfree up` always takes the full path.
+// changed fact, an unavailable observation — takes the full validation path,
+// which deletes the record first and writes a fresh one after it succeeds
+// (and after its restore, when one ran). `runfree up` always takes the full
+// path. Beside live peers a match is not enough on its own: the session-bound
+// participants it does not bind are accounted for afresh by
+// `warm-peer-proof.ts`, and any miss there takes the full path too.
 //
 // What a match does not re-run (accepted, with its inputs bound): the
 // agent-position deny-probe helper (with its host gateway port probes), the
@@ -33,6 +36,7 @@ import {
   firewallStatusPath,
   hostServiceEntryKey,
   parseGenerationStatusLine,
+  requestProxyStatusPath,
   sortHostServiceEntries,
 } from "@runfree/runtime-contracts/proxy-status";
 
@@ -56,7 +60,7 @@ import {
   type EffectiveHostServices,
   type FirewallSectionResult,
 } from "./probes.ts";
-import { parseHostServiceSetMembers } from "../proxy-nftables-proof.ts";
+import { parseHostServiceSetMembers, parseSessionSetMembers } from "../proxy-nftables-proof.ts";
 import {
   createRuntimeSecurityContract,
   parseRuntimeSecurityContractProbe,
@@ -64,12 +68,13 @@ import {
   validateRuntimeSecurityContractEvidence,
 } from "./security-contract.ts";
 import { assertComposeManagedLocalVolume } from "./session-named-volume-proof.ts";
-import { listIpAssignmentsScript, parseIpAssignmentListing, servedSetReadScript } from "./session-file-publisher.ts";
+import { listIpAssignmentsScript, parseIpAssignmentEntries, servedSetReadScript } from "./session-file-publisher.ts";
 import { parseProxySessionFileListing } from "./session-reconcile.ts";
 import { runtimeValidationMarkerProof, type RuntimeValidationProof } from "./state.ts";
 import { validateRuntimeTopologyWithProof, type WarmTopologyEvidence } from "./topology.ts";
-import { internalNetworkSessionStateBlocker } from "./utility-containers.ts";
+import { describeInternalNetworkParticipant, internalNetworkSessionStateBlocker } from "./utility-containers.ts";
 import type { DockerContainerInspect, DockerNetworkInspect, RuntimeContext, RuntimeIO } from "./types.ts";
+import type { WarmFixedParticipant, WarmPeerEvidence } from "./warm-peer-proof.ts";
 
 export const WARM_PROOF_RECORD_NAME = "runtime-warm-proof.json";
 export const WARM_PROOF_MAX_AGE_MS = 24 * 60 * 60 * 1000;
@@ -98,7 +103,13 @@ export type WarmProofFacts = Readonly<{
     agentInternal: Readonly<{ id: string; name: string }>;
     proxyEgress: Readonly<{ id: string; name: string }>;
   }>;
-  participants: readonly Readonly<{ id: string; ipv4: string; endpointId: string }>[];
+  /**
+   * Every internal-network participant except the proxy (bound by its own
+   * facts), session agents, and their mcp-callback forwarders, which are
+   * session-bound and proved fresh beside live peers (`warm-peer-proof.ts`).
+   * Sorted by id.
+   */
+  fixedParticipants: readonly WarmFixedParticipant[];
   volumes: readonly Readonly<{
     name: string;
     createdAt: string;
@@ -125,10 +136,15 @@ export type WarmProofFacts = Readonly<{
   hostServiceMembers: readonly string[];
 }>;
 
-type WarmProofRecordV1 = Readonly<{ version: 1; facts: WarmProofFacts; writtenAt: string }>;
+/**
+ * Version 2 replaced v1's every-endpoint `participants` with
+ * `fixedParticipants`. A v1 (or any other) record reads as absent: nothing
+ * converts one, so no record can carry authority it was not written with.
+ */
+type WarmProofRecordV2 = Readonly<{ version: 2; facts: WarmProofFacts; writtenAt: string }>;
 
 const FACT_KEYS = [
-  "projectId", "composeProject", "daemon", "bootId", "proxy", "networks", "participants", "volumes",
+  "projectId", "composeProject", "daemon", "bootId", "proxy", "networks", "fixedParticipants", "volumes",
   "agentImageId", "controlPlaneGenerationDigest", "controlPlaneMaterializationDigest", "securityContractHash",
   "effectivePolicyGeneration", "gitLayoutSha256", "proxyCaCertSha256", "agentCaBundleSha256", "markerSha256",
   "nftShapeSha256", "hostServiceMembers",
@@ -166,6 +182,12 @@ export type WarmValidation = Readonly<{
    * compared fact: anything short of a clean listing is `blocked`.
    */
   sessionState: Readonly<{ kind: "empty" }> | Readonly<{ kind: "blocked"; reason: string }>;
+  /**
+   * The same observation's evidence about live peers, for the judgement
+   * beside them (`tryWarmPeerValidation`). Absent when any of its sections was
+   * unreadable: a launch beside peers then validates fully.
+   */
+  peerEvidence?: WarmPeerEvidence;
 }>;
 
 /**
@@ -241,6 +263,7 @@ function warmBatchCommands(plan: ActiveRuntimePlan, securityProbe: string): stri
     PROXY_HOST_SERVICE_GATEWAY_COMMAND,
     PROXY_ETC_HOSTS_STAT_COMMAND,
     `node -e ${`'${servedSetReadScript().replaceAll("'", "'\\''")}'`}`,
+    `cat ${requestProxyStatusPath()}`,
   ];
 }
 
@@ -349,8 +372,50 @@ function observeWarmRuntime(input: WarmProofInput): WarmObservation | string {
 }
 
 type WarmJudgement =
-  | Readonly<{ kind: "valid"; facts: WarmProofFacts; validation: WarmValidation }>
+  | Readonly<{
+      kind: "valid";
+      facts: WarmProofFacts;
+      validation: WarmValidation;
+      /** Why no record may be written from this observation, when one may not. */
+      unrecordable?: string;
+    }>
   | Readonly<{ kind: "invalid"; field: string }>;
+
+/**
+ * The peer evidence from this observation's sections, or undefined when one
+ * the peer judgement needs did not read. The request-proxy status alone may be
+ * missing: the judgement refuses that as a consumer that is not current.
+ */
+function warmPeerEvidence(input: Readonly<{
+  sessionFiles: ReturnType<typeof parseProxySessionFileListing>;
+  nftTable: FirewallSectionResult;
+  ipListing: ReturnType<typeof parseIpAssignmentEntries>;
+  requestProxyStatus: FirewallSectionResult | undefined;
+  internalEndpoints: NonNullable<DockerNetworkInspect["Containers"]>;
+  participants: readonly DockerContainerInspect[];
+  fixedParticipants: readonly WarmFixedParticipant[];
+}>): WarmPeerEvidence | undefined {
+  if (!input.sessionFiles || !input.ipListing) return undefined;
+  const sessionSetMembers = input.nftTable.exit === 0 ? parseSessionSetMembers(input.nftTable.body) : undefined;
+  if (!sessionSetMembers) return undefined;
+  const internalNetworkContainers: Record<string, Readonly<{ IPv4Address: string; EndpointID: string }>> = {};
+  for (const [id, endpoint] of Object.entries(input.internalEndpoints)) {
+    if (typeof endpoint.IPv4Address !== "string" || typeof endpoint.EndpointID !== "string") return undefined;
+    internalNetworkContainers[id] = Object.freeze({ IPv4Address: endpoint.IPv4Address, EndpointID: endpoint.EndpointID });
+  }
+  const requestProxy = input.requestProxyStatus?.exit === 0
+    ? parseGenerationStatusLine(input.requestProxyStatus.body.trim())
+    : undefined;
+  return Object.freeze({
+    sessionFiles: Object.freeze([...input.sessionFiles]),
+    sessionSetMembers: Object.freeze([...sessionSetMembers]),
+    ipAssignments: input.ipListing.bindings,
+    ...(requestProxy?.controlGeneration !== undefined ? { requestProxyGeneration: requestProxy.controlGeneration } : {}),
+    internalNetworkContainers: Object.freeze(internalNetworkContainers),
+    participants: Object.freeze([...input.participants]),
+    ...(input.fixedParticipants.length > 0 ? { fixedParticipants: Object.freeze([...input.fixedParticipants]) } : {}),
+  });
+}
 
 /** Re-runs every applicable validator over the fresh evidence and derives the facts. */
 function judgeWarmObservation(input: WarmProofInput, observation: WarmObservation): WarmJudgement {
@@ -358,7 +423,7 @@ function judgeWarmObservation(input: WarmProofInput, observation: WarmObservatio
   const { plan, effective } = input;
   const [
     uid, routeInternal, routeEgress, capBnd, nftTable, allowedSet, marker, firewallStatus, securityProbe, bootId, ipAssignments,
-    hostServiceSet, hostServiceGateway, etcHostsStat, sessionFiles,
+    hostServiceSet, hostServiceGateway, etcHostsStat, sessionFiles, requestProxyStatus,
   ] = observation.sections as FirewallSectionResult[];
   if (uid.exit !== 0 || uid.body.trim() !== "0") return invalid("batch-identity");
   const daemon = input.daemon;
@@ -476,11 +541,31 @@ function judgeWarmObservation(input: WarmProofInput, observation: WarmObservatio
   }
 
   const internalEndpoints = observation.internalNetwork.Containers ?? {};
-  const participants = Object.entries(internalEndpoints).map(([id, endpoint]) => Object.freeze({
-    id,
-    ipv4: endpoint.IPv4Address ?? "",
-    endpointId: endpoint.EndpointID ?? "",
-  })).sort((left, right) => left.id.localeCompare(right.id));
+  // Session agents and their callback forwarders come and go with sessions:
+  // the peer judgement proves them fresh. Every other participant is bound
+  // here. An ephemeral helper, or anything that is not an ingress forwarder,
+  // is accepted by the topology on its label alone, so it is bound (a later
+  // launch then mismatches) but never recorded.
+  const fixedParticipants: WarmFixedParticipant[] = [];
+  let unrecordable: string | undefined;
+  for (const [id, endpoint] of Object.entries(internalEndpoints)) {
+    if (id === effective.proxyContainerId) continue;
+    const container = observation.participants.find((participant) => participant.Id === id);
+    if (!container) return invalid("participants");
+    const identity = describeInternalNetworkParticipant(container, plan.projectId);
+    if (identity.kind === "session-agent") continue;
+    if (identity.kind === "ingress-forwarder" && identity.purpose === "mcp-callback") continue;
+    if (identity.kind !== "ingress-forwarder") unrecordable ??= `a ${identity.kind === "ephemeral-helper" ? "ephemeral helper" : "non-ingress participant"} is attached to the internal network`;
+    fixedParticipants.push(Object.freeze({
+      id,
+      ipv4: endpoint.IPv4Address ?? "",
+      endpointId: endpoint.EndpointID ?? "",
+      role: identity.kind === "other" ? identity.role ?? "" : identity.kind,
+      ...(identity.kind === "ingress-forwarder" ? { purpose: identity.purpose } : {}),
+      ...(identity.kind === "ingress-forwarder" && identity.target !== undefined ? { target: identity.target } : {}),
+    }));
+  }
+  fixedParticipants.sort((left, right) => left.id.localeCompare(right.id));
   const proxyInternalEndpoint = internalEndpoints[effective.proxyContainerId]?.EndpointID;
   const proxyEgressEndpoint = observation.egressNetwork.Containers?.[effective.proxyContainerId]?.EndpointID;
   if (!proxyInternalEndpoint || !proxyEgressEndpoint) return invalid("proxy-endpoints");
@@ -507,7 +592,7 @@ function judgeWarmObservation(input: WarmProofInput, observation: WarmObservatio
       agentInternal: Object.freeze({ id: observation.internalNetwork.Id as string, name: observation.internalNetwork.Name as string }),
       proxyEgress: Object.freeze({ id: observation.egressNetwork.Id as string, name: observation.egressNetwork.Name as string }),
     }),
-    participants: Object.freeze(participants),
+    fixedParticipants: Object.freeze(fixedParticipants),
     volumes: Object.freeze(volumes),
     agentImageId: observation.agentImageId,
     controlPlaneGenerationDigest: effective.controlPlaneGenerationDigest,
@@ -521,6 +606,16 @@ function judgeWarmObservation(input: WarmProofInput, observation: WarmObservatio
     nftShapeSha256: nftShape,
     hostServiceMembers: Object.freeze(sortHostServiceEntries(hostServiceMembers).map(hostServiceEntryKey)),
   });
+  const ipListing = ipAssignments?.exit === 0 ? parseIpAssignmentEntries(ipAssignments.body) : undefined;
+  const peerEvidence = warmPeerEvidence({
+    sessionFiles: listedSessionFiles,
+    nftTable,
+    ipListing,
+    requestProxyStatus,
+    internalEndpoints,
+    participants: observation.participants,
+    fixedParticipants,
+  });
   const validation = Object.freeze({
     runtimeProof: markerProof.proof,
     proxyStartedAt: startedAt,
@@ -529,20 +624,19 @@ function judgeWarmObservation(input: WarmProofInput, observation: WarmObservatio
     // Not a fact the proof compares: the IP assignments this batch read, for
     // the launch's IP fence to use as its CAS precondition under the same held
     // lock (Task 6). A listing that failed is simply absent.
-    ...(ipAssignments?.exit === 0 && parseIpAssignmentListing(ipAssignments.body)
-      ? { ipAssignmentDigests: parseIpAssignmentListing(ipAssignments.body) }
-      : {}),
+    ...(ipListing ? { ipAssignmentDigests: ipListing.digests } : {}),
     sessionState: Object.freeze(sessionState),
+    ...(peerEvidence ? { peerEvidence } : {}),
   });
   sealedValidations.add(validation);
-  return Object.freeze({ kind: "valid", facts, validation });
+  return Object.freeze({ kind: "valid", facts, validation, ...(unrecordable ? { unrecordable } : {}) });
 }
 
-function parseWarmProofRecord(value: unknown): WarmProofRecordV1 | undefined {
+function parseWarmProofRecord(value: unknown): WarmProofRecordV2 | undefined {
   if (!isRecord(value) || !exactKeySet(value, ["version", "facts", "writtenAt"])) return undefined;
-  if (value.version !== 1 || typeof value.writtenAt !== "string" || !Number.isFinite(Date.parse(value.writtenAt))) return undefined;
+  if (value.version !== 2 || typeof value.writtenAt !== "string" || !Number.isFinite(Date.parse(value.writtenAt))) return undefined;
   if (!isRecord(value.facts) || !exactKeySet(value.facts, FACT_KEYS)) return undefined;
-  return value as unknown as WarmProofRecordV1;
+  return value as unknown as WarmProofRecordV2;
 }
 
 export function warmProofRecordPath(stateDir: string): string {
@@ -583,14 +677,27 @@ export function tryWarmRuntimeValidation(input: WarmProofInput, now: () => numbe
  * but only when the same warm judgement accepts them — a record the next
  * launch could never match is not written. Best effort; a failure only means
  * the next launch validates fully.
+ *
+ * `expectedProxyStartedAt` is the proxy start the caller's validation (and
+ * its restore, when one ran) observed. This observation is a fresh one, so a
+ * same-id restart since then would otherwise record a run nothing validated
+ * or restored: a different start writes nothing.
  */
-export function recordWarmRuntimeProof(input: WarmProofInput, now: () => number = Date.now): "written" | string {
+export function recordWarmRuntimeProof(
+  input: WarmProofInput,
+  expectedProxyStartedAt: string,
+  now: () => number = Date.now,
+): "written" | string {
   try {
     const observation = observeWarmRuntime(input);
     if (typeof observation === "string") return observation;
     const judged = judgeWarmObservation(input, observation);
     if (judged.kind === "invalid") return `the fresh observation is not warm-valid: ${judged.field}`;
-    const record: WarmProofRecordV1 = { version: 1, facts: judged.facts, writtenAt: new Date(now()).toISOString() };
+    if (judged.facts.proxy.startedAt !== expectedProxyStartedAt) {
+      return "the proxy restarted since the validation it would record";
+    }
+    if (judged.unrecordable) return judged.unrecordable;
+    const record: WarmProofRecordV2 = { version: 2, facts: judged.facts, writtenAt: new Date(now()).toISOString() };
     writeLaunchHostRecord(input.plan.paths.stateDir, WARM_PROOF_RECORD_NAME, `${JSON.stringify(record)}\n`);
     return "written";
   } catch (error) {

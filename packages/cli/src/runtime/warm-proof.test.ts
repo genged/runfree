@@ -1,6 +1,7 @@
 import { expect, test } from "vitest";
 
 import { proxyNftablesTableJson } from "../proxy-nftables-proof.fixture.ts";
+import { parseSessionSetMembers } from "../proxy-nftables-proof.ts";
 import { dockerInfoServerError, parseDockerDaemonIdentity } from "./docker.ts";
 import { assertWarmValidation, nftRulesetShapeSha256 } from "./warm-proof.ts";
 
@@ -26,6 +27,27 @@ test("the ruleset shape ignores set members and nothing else", () => {
   expect(nftRulesetShapeSha256(added)).not.toBe(shape);
   expect(nftRulesetShapeSha256("{not json")).toBeUndefined();
   expect(nftRulesetShapeSha256(JSON.stringify({ tables: [] }))).toBeUndefined();
+});
+
+test("the peer evidence reads the kernel session set from the same table, and unreadable is never empty", () => {
+  const base = proxyNftablesTableJson();
+  expect(parseSessionSetMembers(base)).toEqual([]);
+  expect(parseSessionSetMembers(withSessionMembers(base, ["172.31.90.20", "172.31.90.21"]))).toEqual(["172.31.90.20", "172.31.90.21"]);
+  // A timed element carries its address under `elem.val`.
+  expect(parseSessionSetMembers(withSessionMembers(base, [{ elem: { val: "172.31.90.22", timeout: 60 } }] as unknown as string[])))
+    .toEqual(["172.31.90.22"]);
+  for (const broken of [
+    withSessionMembers(base, ["172.31.90.999"]),
+    withSessionMembers(base, ["sessions"]),
+    JSON.stringify({ nftables: [] }),
+    "{not json",
+  ]) {
+    expect(parseSessionSetMembers(broken)).toBeUndefined();
+  }
+  // A second session set statement is not one kernel set.
+  const parsed = JSON.parse(base) as { nftables: Array<Record<string, unknown>> };
+  const session = parsed.nftables.find((statement) => (statement.set as { name?: string } | undefined)?.name === "session_ipv4");
+  expect(parseSessionSetMembers(JSON.stringify({ nftables: [...parsed.nftables, session] }))).toBeUndefined();
 });
 
 test("the daemon identity parses only a complete docker info JSON", () => {

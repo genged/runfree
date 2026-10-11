@@ -78,6 +78,20 @@ vi.mock("./host-listener-snapshot.ts", async (importOriginal) => {
     },
   };
 });
+// Runs before each per-session running proof (restore's, and the warm peer
+// judgement's), so a test can fail one or act at that exact point. Unset by
+// default: every proof is the real one.
+const sessionProofSeam = vi.hoisted(() => ({ beforeValidate: undefined as undefined | (() => void) }));
+vi.mock("./runtime/session-container-proof.ts", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./runtime/session-container-proof.ts")>();
+  return {
+    ...actual,
+    validateSessionContainerInspect: (...args: Parameters<typeof actual.validateSessionContainerInspect>) => {
+      sessionProofSeam.beforeValidate?.();
+      return actual.validateSessionContainerInspect(...args);
+    },
+  };
+});
 vi.mock("./runtime/sessions.ts", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./runtime/sessions.ts")>();
   return {
@@ -151,9 +165,12 @@ import {
   createAllocatedSessionContainerRecordV2,
   transitionBoundAllocatedSessionContainerToProvisioningRunningV2,
   transitionProvisioningRunningSessionContainerToAttachedV2,
+  sessionContainerRecordPath,
   writeSessionContainerRecordV2,
+  type SessionContainerRecordV2,
 } from "./runtime/session-containers.ts";
-import { sessionContainerRecordFixture } from "./runtime/session-container.test-harness.ts";
+import { sessionContainerInspectJsonFixture, sessionContainerRecordFixture } from "./runtime/session-container.test-harness.ts";
+import { createRetainedSessionRebindProofPlan } from "./runtime/session-admission-driver-preflight.ts";
 import { hostBootId, hostProcessStart } from "./runtime/host-identity.ts";
 import { createSessionLaunchTarget } from "./runtime/session-launch.ts";
 import { buildTokenAutoRefreshSpawnPlan, containerMissingNetwork, resolveRunfreeSelfInvocation } from "./runtime.ts";
@@ -1116,6 +1133,8 @@ beforeEach(() => {
 afterEach(() => {
   flushWarnings();
   vi.restoreAllMocks();
+  fakeLivePeers.length = 0;
+  sessionProofSeam.beforeValidate = undefined;
   liveSessionSeam.active = undefined;
   activationSeam.calls = 0;
   activationSeam.fail = undefined;
@@ -1191,6 +1210,10 @@ const absenceListing = (args: readonly string[]): boolean => args[0] === "ps"
 const warmProofBatch = (args: readonly string[]): boolean => args[0] === "exec"
   && args.join(" ").includes("RUNFREE_FIREWALL_SECTION") && args.join(" ").includes("/proc/sys/kernel/random/boot_id");
 
+/** The warm proof's one type-less inspect of the proxy, both networks, the agent image, and the volumes. */
+const warmProofInspect = (args: readonly string[]): boolean => args[0] === "inspect"
+  && args[1] === FAKE_PROXY_CONTAINER_ID && args.includes(FAKE_AGENT_INTERNAL_NETWORK_ID);
+
 /**
  * The Docker calls after a launch's warm-proof batch. Image cleanup, which
  * runs before it, reads the same session-file listing and container inventory
@@ -1225,6 +1248,52 @@ function fakeExtraParticipant(composeProject: string): Record<string, unknown> |
     HostConfig: {},
     NetworkSettings: { Networks: { [`${composeProject}_agent_internal`]: { NetworkID: FAKE_AGENT_INTERNAL_NETWORK_ID } } },
   };
+}
+
+/**
+ * Live peer sessions the fake daemon reports: each one's running container
+ * (rendered from the exact proof plan restore and the warm peer judgement
+ * rebuild), its internal-network endpoint, its proxy session file, its kernel
+ * `@session_ipv4` member, and its ready IP assignment. Empty by default.
+ */
+type FakeLivePeer = Readonly<{ record: SessionContainerRecordV2; inspect: Record<string, unknown>; endpointId: string }>;
+const fakeLivePeers: FakeLivePeer[] = [];
+
+function fakeLivePeer(id: string): FakeLivePeer | undefined {
+  return fakeLivePeers.find((peer) => peer.inspect.Id === id);
+}
+
+function fakePeerSessionFiles(): unknown[] {
+  return fakeLivePeers.map(({ record }) => ({
+    sessionKey: record.sessionPrincipal,
+    name: `${record.sessionPrincipal}.json`,
+    sourceIp: record.sourceIp,
+    malformed: false,
+    aliveUntil: new Date(Date.now() + 60_000).toISOString(),
+    eligible: true,
+    wallActive: true,
+  }));
+}
+
+function fakePeerIpAssignments(): string {
+  return JSON.stringify(Object.fromEntries(fakeLivePeers.map(({ record }) => [record.sourceIp, {
+    digest: crypto.createHash("sha256").update(record.sourceIp).digest("hex"),
+    sessionKey: record.sessionPrincipal,
+    state: "ready",
+  }])));
+}
+
+/** The proxy's nft table with the live peers' addresses in `@session_ipv4`. */
+function fakeNftTableWithPeers(): string {
+  const raw = proxyNftablesTableJson();
+  if (fakeLivePeers.length === 0) return raw;
+  const parsed = JSON.parse(raw) as { nftables: Array<Record<string, unknown>> };
+  return JSON.stringify({
+    nftables: parsed.nftables.map((statement) => {
+      const set = statement.set as Record<string, unknown> | undefined;
+      return set && set.name === "session_ipv4" ? { set: { ...set, elem: fakeLivePeers.map(({ record }) => record.sourceIp) } } : statement;
+    }),
+  });
 }
 
 function inspectMount(destination: string, mode: "ro" | "rw" | "tmpfs" = "rw"): {
@@ -1478,6 +1547,12 @@ function createRuntimeIO(overrides: {
         LiveRestoreEnabled: process.env.FAKE_DOCKER_LIVE_RESTORE === "1",
       }));
     }
+    // The host-wide session-container inventory (unfiltered `ps --all
+    // --no-trunc --format {{.ID}}`): the live peers' containers.
+    if (args[0] === "ps" && args.includes("--all") && args.includes("--no-trunc") && args.includes("{{.ID}}")
+      && !args.includes("--filter")) {
+      return captureResult(0, fakeLivePeers.map((peer) => `${peer.inspect.Id as string}\n`).join(""));
+    }
     // The trust-setup exec's contract is that it returns 0 only after the
     // proxy published its CA into the shared host directory (the script waits
     // for it in-container). The double mirrors that side effect, because the
@@ -1686,10 +1761,11 @@ function createRuntimeIO(overrides: {
       const proxyImageId = sha256Digest(proxyImageRef);
       const requested = new Set(args.slice(2));
       return captureResult(0, JSON.stringify([
+        ...fakeLivePeers.filter((peer) => requested.has(peer.inspect.Id as string)).map((peer) => peer.inspect),
         ...(requested.has(FAKE_PROXY_CONTAINER_ID) ? [{
           Id: FAKE_PROXY_CONTAINER_ID,
           Image: proxyImageId,
-          State: { Running: true, StartedAt: "2026-06-13T00:00:00.000Z" },
+          State: { Running: true, StartedAt: process.env.FAKE_PROXY_STARTED_AT ?? "2026-06-13T00:00:00.000Z" },
           NetworkSettings: { Networks: {
             [`${observedProject}_agent_internal`]: { NetworkID: FAKE_AGENT_INTERNAL_NETWORK_ID },
             [`${observedProject}_proxy_egress`]: { NetworkID: FAKE_PROXY_EGRESS_NETWORK_ID },
@@ -1747,7 +1823,11 @@ function createRuntimeIO(overrides: {
         const withEndpoints = (network: Record<string, unknown> | undefined) => network && {
           ...network,
           Containers: Object.fromEntries(Object.entries((network.Containers ?? {}) as Record<string, Record<string, unknown>>)
-            .map(([id, endpoint]) => [id, { ...endpoint, EndpointID: `endpoint-${id.slice(0, 12)}`, IPv4Address: `${fixedNetwork.proxyIp}/24` }])),
+            .map(([id, endpoint]) => [id, {
+              ...endpoint,
+              EndpointID: endpoint.EndpointID ?? `endpoint-${id.slice(0, 12)}`,
+              IPv4Address: endpoint.IPv4Address ?? `${fixedNetwork.proxyIp}/24`,
+            }])),
         };
         if (target === FAKE_AGENT_INTERNAL_NETWORK_ID) return withEndpoints(single(["network", "inspect", `${observedProject}_agent_internal`]));
         if (target === FAKE_PROXY_EGRESS_NETWORK_ID) return withEndpoints(single(["network", "inspect", `${observedProject}_proxy_egress`]));
@@ -1808,8 +1888,13 @@ function createRuntimeIO(overrides: {
         },
       ];
       const extra = fakeExtraParticipant(observedProject);
-      return captureResult(0, JSON.stringify([...entries, ...(extra ? [extra] : [])]
+      return captureResult(0, JSON.stringify([...entries, ...(extra ? [extra] : []), ...fakeLivePeers.map((peer) => peer.inspect)]
         .filter((entry) => args.includes(entry.Id as string))));
+    }
+    // The warm proof inspects the internal network's other participants alone.
+    if (args[0] === "inspect" && args.length > 1 && args.slice(1).every((id) => fakeLivePeer(id) !== undefined
+      || (id === FAKE_EXTRA_PARTICIPANT_ID && fakeExtraParticipant(observedProject)))) {
+      return captureResult(0, JSON.stringify(args.slice(1).map((id) => fakeLivePeer(id)?.inspect ?? fakeExtraParticipant(observedProject))));
     }
     // The warm proof inspects the internal network's other participants alone.
     if (args[0] === "inspect" && args.includes(FAKE_EXTRA_PARTICIPANT_ID) && fakeExtraParticipant(observedProject)) {
@@ -1822,9 +1907,15 @@ function createRuntimeIO(overrides: {
         NetworkSettings: { Ports: {} },
       }]));
     }
+    // A live peer's container removal: the fake daemon forgets it.
+    if (args[0] === "container" && args[1] === "rm" && fakeLivePeer(args.at(-1) ?? "")) {
+      fakeLivePeers.splice(fakeLivePeers.findIndex((peer) => peer.inspect.Id === args.at(-1)), 1);
+      return captureResult(0, `${args.at(-1)}\n`);
+    }
     if (args[0] === "network" && args[1] === "inspect") {
       const networks: Array<Record<string, unknown>> = [];
-      if (args.includes(`${observedProject}_agent_internal`)) networks.push({
+      // By exact name, or by id as session teardown's absence proof asks.
+      if (args.includes(`${observedProject}_agent_internal`) || args.includes(FAKE_AGENT_INTERNAL_NETWORK_ID)) networks.push({
         Id: FAKE_AGENT_INTERNAL_NETWORK_ID,
         Name: `${observedProject}_agent_internal`,
         Internal: true,
@@ -1838,6 +1929,11 @@ function createRuntimeIO(overrides: {
           ...(fakeExtraParticipant(observedProject)
             ? { [FAKE_EXTRA_PARTICIPANT_ID]: { Name: `${observedProject}-participant` } }
             : {}),
+          ...Object.fromEntries(fakeLivePeers.map((peer) => [peer.inspect.Id as string, {
+            Name: peer.record.containerName,
+            IPv4Address: `${peer.record.sourceIp}/24`,
+            EndpointID: peer.endpointId,
+          }])),
         },
       });
       if (args.includes(`${observedProject}_proxy_egress`)) networks.push({
@@ -1875,7 +1971,7 @@ function createRuntimeIO(overrides: {
       });
     };
     const hostServiceSetJson = proxyHostServiceSetJson(overrides.hostServiceSet ?? []);
-    // The warm proof's one root batch: fourteen framed sections, answered with
+    // The warm proof's one root batch: sixteen framed sections, answered with
     // the same bytes the individual handlers give the full validation.
     if (args[0] === "exec" && args.includes(FAKE_PROXY_CONTAINER_ID) && args.includes("0:0")
       && text.includes("RUNFREE_FIREWALL_SECTION") && text.includes("/proc/sys/kernel/random/boot_id")) {
@@ -1893,17 +1989,20 @@ function createRuntimeIO(overrides: {
         { exit: 0, body: `${fixedNetwork.agentIp} dev eth0 src ${fixedNetwork.proxyIp} uid 1001` },
         { exit: 0, body: `1.1.1.1 via ${fixedNetwork.proxyEgressGateway} dev eth1 src ${fixedNetwork.proxyEgressIp} uid 1001` },
         { exit: 0, body: process.env.FAKE_WARM_CAPBND ?? "0000000000001000" },
-        { exit: 0, body: process.env.FAKE_WARM_NFT_TABLE ?? proxyNftablesTableJson() },
+        { exit: 0, body: process.env.FAKE_WARM_NFT_TABLE ?? fakeNftTableWithPeers() },
         { exit: 0, body: allowedSet },
         { exit: 0, body: body(["exec", "--user", "0:0", FAKE_PROXY_CONTAINER_ID, "cat", "/run/runfree-runtime-validation.json"]) },
         { exit: 0, body: body(["exec", "--user", "0:0", FAKE_PROXY_CONTAINER_ID, "cat", "/run/runfree-proxy-status/firewall.json"]) },
         { exit: 0, body: securityContractProbeOutput("proxy").replace(/\n$/, "") },
         { exit: 0, body: process.env.FAKE_WARM_BOOT_ID ?? "11111111-2222-3333-4444-555555555555" },
-        { exit: 0, body: process.env.FAKE_WARM_IP_ASSIGNMENTS ?? "{}" },
+        { exit: 0, body: process.env.FAKE_WARM_IP_ASSIGNMENTS ?? fakePeerIpAssignments() },
         { exit: 0, body: process.env.FAKE_WARM_HOST_SERVICE_SET ?? hostServiceSetJson },
         { exit: 0, body: hostServiceGatewayStatus() ?? "" },
         { exit: 0, body: "0 81a4" },
-        { exit: Number(process.env.FAKE_WARM_SESSION_FILES_EXIT ?? "0"), body: process.env.FAKE_WARM_SESSION_FILES ?? "[]" },
+        { exit: Number(process.env.FAKE_WARM_SESSION_FILES_EXIT ?? "0"), body: process.env.FAKE_WARM_SESSION_FILES ?? JSON.stringify(fakePeerSessionFiles()) },
+        // The request proxy's status: the same receipt the convergence read reports.
+        { exit: 0, body: body(["exec", "--user", "0:0", FAKE_PROXY_CONTAINER_ID, "sh", "-c",
+          "cat /run/runfree-proxy-status/firewall.json /run/runfree-proxy-status/request-proxy/request-proxy.json"]).split("\n")[1] ?? "" },
       ];
       return captureResult(0, `${sections.map((section, index) => [
         `RUNFREE_FIREWALL_SECTION ${index} exit=${section.exit}`,
@@ -1920,7 +2019,7 @@ function createRuntimeIO(overrides: {
     if (args[0] === "exec"
       && args.includes(FAKE_PROXY_CONTAINER_ID)
       && text.includes("fs.readdirSync(sessionsDir)")) {
-      return captureResult(0, "[]\n");
+      return captureResult(0, `${JSON.stringify(fakePeerSessionFiles())}\n`);
     }
     if (args[0] === "exec"
       && args.includes(FAKE_PROXY_CONTAINER_ID)
@@ -2055,7 +2154,7 @@ function createRuntimeIO(overrides: {
       return captureResult(1, "", "Operation not permitted\n");
     }
     if (args[0] === "exec" && args.includes(FAKE_PROXY_CONTAINER_ID) && text.includes("nft -j list table inet runfree_proxy")) {
-      return captureResult(0, proxyNftablesTableJson());
+      return captureResult(0, fakeNftTableWithPeers());
     }
     if (args[0] === "exec" && args.includes(FAKE_PROXY_CONTAINER_ID) && text.includes("nft list ruleset")) {
       return captureResult(1, "", "unexpected root nft ruleset inspection\n");
@@ -4250,7 +4349,6 @@ describe("runtime command flow", () => {
       ["an unreadable session-file listing", { FAKE_WARM_SESSION_FILES_EXIT: "1" }, undefined, "session-files-unreadable"],
       ["an unparseable session-file listing", { FAKE_WARM_SESSION_FILES: "not json" }, undefined, "session-files-unreadable"],
       ["a session agent on the internal network", { FAKE_INTERNAL_PARTICIPANT_ROLE: "session-agent" }, undefined, "session-participant"],
-      ["an ephemeral helper on the internal network", { FAKE_INTERNAL_PARTICIPANT_ROLE: "ephemeral-helper" }, undefined, "non-ingress-participant"],
       ["a container that may be a session", {}, "present", "session-containers-present"],
       ["an absence listing that timed out", {}, "timeout", "session-containers-unreadable"],
     ] as const)("a warm handoff launch with %s reconciles as before", async (_label, env, absence, reason) => {
@@ -4663,12 +4761,12 @@ describe("runtime command flow", () => {
       const io = createRuntimeIO();
       await warmedUp(context, io);
       const valid = JSON.parse(fs.readFileSync(recordPath(context), "utf8")) as Record<string, unknown>;
-      for (const contents of ["{not json", JSON.stringify({ ...valid, extra: 1 }), JSON.stringify({ ...valid, version: 2 })]) {
+      for (const contents of ["{not json", JSON.stringify({ ...valid, extra: 1 }), JSON.stringify({ ...valid, version: 3 })]) {
         fs.writeFileSync(recordPath(context), contents);
         const start = io.calls.length;
         expect((await startRuntime(context, io, false, { launch: true })).status).toBe(0);
         expect(denyProbeRuns(io.calls.slice(start))).toBe(1);
-        expect(JSON.parse(fs.readFileSync(recordPath(context), "utf8")).version).toBe(1);
+        expect(JSON.parse(fs.readFileSync(recordPath(context), "utf8")).version).toBe(2);
       }
     });
 
@@ -4701,7 +4799,7 @@ describe("runtime command flow", () => {
       expect(fs.existsSync(recordPath(context))).toBe(false);
     });
 
-    test("a launch with any lifecycle record takes the full path", async () => {
+    test("a launch beside a lifecycle record whose owner is gone takes the full path", async () => {
       const context = launchContext();
       const io = createRuntimeIO();
       await warmedUp(context, io);
@@ -4739,10 +4837,396 @@ describe("runtime command flow", () => {
         composeProject: desiredSessionAgent.selection.composeProject,
       }, attached);
       const start = io.calls.length;
-      expect((await startRuntime(context, io, false, { launch: true })).status).toBe(0);
-      // The record matched, but a registry with a session in it never takes
-      // the warm path: its restore re-proof must run.
+      vi.mocked(console.error).mockClear();
+      expect((await startRuntime({ ...context, env: { ...context.env, RUNFREE_TIMINGS: "1" } }, io, false, { launch: true })).status).toBe(0);
+      // The stable record matched, but the peer judgement cannot account for
+      // a session whose owner is gone: the full path validates, and its
+      // reconcile and restore handle the record.
+      expect(vi.mocked(console.error).mock.calls.flat().map(String))
+        .toContainEqual(expect.stringContaining("timing: validation:warm-peer miss:peer-owner-dead"));
       expect(denyProbeRuns(io.calls.slice(start))).toBe(1);
+    });
+  });
+
+  describe("warm launch beside live peers", () => {
+    const peerEnvKeys = ["FAKE_PROXY_STARTED_AT", "FAKE_PROXY_PID", "FAKE_INTERNAL_PARTICIPANT_ROLE"] as const;
+    const owners: Array<() => void> = [];
+    afterEach(() => {
+      for (const key of peerEnvKeys) delete process.env[key];
+      for (const stop of owners.splice(0)) stop();
+    });
+    function launchContext(): RuntimeContext {
+      const projectRoot = path.join(tmp, "project");
+      const project = prepareProject(projectRoot);
+      return {
+        projectRoot,
+        project,
+        runtimeRoot: path.join(tmp, "runtime"),
+        env: { PATH: "/fake-bin" },
+        network: fixedNetwork,
+      };
+    }
+    /** The same context with `RUNFREE_TIMINGS=1`, so startup reports its timing details. */
+    const timed = (context: RuntimeContext): RuntimeContext => ({ ...context, env: { ...context.env, RUNFREE_TIMINGS: "1" } });
+    const timings = (): string[] => vi.mocked(console.error).mock.calls.flat().map(String)
+      .filter((line) => line.includes("timing: "))
+      .map((line) => line.slice(line.indexOf("timing: ")));
+    const timingsFor = (name: string): string[] => timings().filter((line) => line.startsWith(`timing: ${name} `));
+    const recordPath = (context: RuntimeContext): string =>
+      path.join(context.project.paths.stateDir, "runtime", "v2", "launch", "runtime-warm-proof.json");
+    const denyProbeRuns = (calls: readonly RuntimeIoCall[]): number => calls.filter((call) => call.command === "docker"
+      && call.args[0] === "run" && call.args.includes("io.runfree.helper-purpose=deny-probe")).length;
+    const markerResets = (calls: readonly RuntimeIoCall[]): number => calls.filter((call) => call.command === "docker"
+      && call.args[0] === "exec" && call.args.join(" ").includes("rm -f '/run/runfree-runtime-validation.json'")).length;
+    const lockIsFree = (context: RuntimeContext): boolean => {
+      const lock = tryAcquireProjectLifecycleLock(context);
+      lock?.release();
+      return lock !== undefined;
+    };
+    const peerRecordBytes = (context: RuntimeContext, peer: FakeLivePeer): string | undefined => {
+      const file = sessionContainerRecordPath(context.project.paths.stateDir, peer.record.sessionId);
+      return fs.existsSync(file) ? fs.readFileSync(file, "utf8") : undefined;
+    };
+    /**
+     * A host process that owns a peer and can die on cue. It is a grandchild
+     * whose own parent shell reaps it, so once killed it is gone at once
+     * rather than a zombie this test process would only reap asynchronously.
+     */
+    async function spawnOwner(): Promise<number> {
+      const shell = childProcess.spawn("/bin/sh", ["-c", "sleep 120 & owner=$!; echo $owner; wait $owner"], {
+        stdio: ["ignore", "pipe", "ignore"],
+      });
+      const pid = await new Promise<number>((resolve, reject) => {
+        shell.stdout?.once("data", (chunk) => resolve(Number(String(chunk).trim())));
+        shell.once("error", reject);
+      });
+      owners.push(() => {
+        try { process.kill(pid, "SIGKILL"); } catch { /* Already gone. */ }
+        shell.kill("SIGKILL");
+      });
+      return pid;
+    }
+
+    /**
+     * Admits one live peer into the fake world the way a launch would leave
+     * it: an attached record owned by a live host process, its running
+     * container rendered from the exact proof plan restore rebuilds, its
+     * endpoint on the internal network, its session file, kernel member, and
+     * ready IP assignment.
+     */
+    function installLivePeer(
+      context: RuntimeContext,
+      io: ReturnType<typeof createRuntimeIO>,
+      options: { index?: number; ownerPid?: number } = {},
+    ): FakeLivePeer {
+      const stateDir = context.project.paths.stateDir;
+      const desired = readDesiredSessionAgentV2(stateDir);
+      const effective = readEffectiveControlPlaneV2(stateDir);
+      if (!desired || !effective) throw new Error("the cold launch did not publish the v2 selections");
+      const index = options.index ?? 0;
+      const ownerPid = options.ownerPid ?? process.pid;
+      const bootId = hostBootId(context.env);
+      const processStart = hostProcessStart(ownerPid, context.env);
+      const containerId = crypto.createHash("sha256").update(`fake-live-peer-${index}`).digest("hex");
+      const allocated = createAllocatedSessionContainerRecordV2({
+        sessionId: `rf-20261011-peer${String(index).padStart(2, "0")}x`,
+        displayName: `peer-${index}`,
+        command: "codex",
+        launch: createSessionLaunchTarget({
+          path: "/usr/local/bin/codex",
+          args: ["--dangerously-bypass-approvals-and-sandbox"],
+          interactive: true,
+          tty: true,
+        }),
+        sourceIp: `172.31.90.${20 + index}`,
+        materialization: desired.manifest,
+        effectiveControlPlane: effective.selection,
+        hostPid: ownerPid,
+        ...(bootId ? { hostBootId: bootId } : {}),
+        ...(processStart ? { hostProcessStart: processStart } : {}),
+        createdAt: new Date().toISOString(),
+      });
+      const record = transitionProvisioningRunningSessionContainerToAttachedV2(
+        transitionBoundAllocatedSessionContainerToProvisioningRunningV2(
+          bindAllocatedSessionContainerIdV2(allocated, containerId),
+          {
+            admittedAt: new Date().toISOString(),
+            leaseGeneration: "8".repeat(32),
+            leaseExpiresAt: new Date(Date.now() + 5 * 60_000).toISOString(),
+          },
+        ),
+      );
+      const expectedProject = { projectId: desired.selection.projectId, composeProject: desired.selection.composeProject };
+      writeSessionContainerRecordV2(stateDir, expectedProject, record);
+      const plan = createRetainedSessionRebindProofPlan({
+        stateDir,
+        expectedProject,
+        replacementRecord: record,
+        candidateControlPlane: effective.selection,
+        candidateMaterialization: effective.manifest,
+        docker: createRuntimeAdapters(context, io).docker,
+        lifecycleLock: { ownerToken: "fake-live-peer", assertHeld: () => undefined, release: () => undefined },
+        runfreeVersion: RUNFREE_VERSION,
+      });
+      const [inspect] = JSON.parse(sessionContainerInspectJsonFixture(plan, { running: true })) as Array<Record<string, unknown>>;
+      const endpointId = crypto.createHash("sha256").update(`fake-live-peer-endpoint-${index}`).digest("hex");
+      const networks = (inspect.NetworkSettings as { Networks: Record<string, Record<string, unknown>> }).Networks;
+      for (const network of Object.values(networks)) network.EndpointID = endpointId;
+      const peer: FakeLivePeer = { record, inspect, endpointId };
+      fakeLivePeers.push(peer);
+      return peer;
+    }
+
+    /** A cold launch, then a full-path launch that writes the warm-proof record. */
+    async function warmedUp(context: RuntimeContext, io: ReturnType<typeof createRuntimeIO>): Promise<void> {
+      expect((await startRuntime(context, io, false, { launch: true })).status).toBe(0);
+      expect((await startRuntime(context, io, false, { launch: true })).status).toBe(0);
+      expect(fs.existsSync(recordPath(context))).toBe(true);
+    }
+
+    test("a launch beside one fully accounted live peer skips the full validation and the restore", async () => {
+      const context = launchContext();
+      const io = createRuntimeIO();
+      await warmedUp(context, io);
+      const peer = installLivePeer(context, io);
+      const peerBytes = peerRecordBytes(context, peer);
+      const start = io.calls.length;
+      const warm = await startRuntime(timed(context), io, false, { launch: true, launchHandoff: true });
+      if (warm.kind !== "ready") throw new Error("warm launch beside a peer failed");
+      const handoff = takeLaunchHandoff(warm.preparedRuntime);
+      try {
+        const calls = io.calls.slice(start);
+        expect(timingsFor("validation:warm-peer")).toEqual(["timing: validation:warm-peer match"]);
+        // No deny-probe helper, no marker rewrite, no full validation span.
+        expect(denyProbeRuns(calls)).toBe(0);
+        expect(markerResets(calls)).toBe(0);
+        expect(timingsFor("runtime-validation")).toEqual([]);
+        // The startup reconcile still ran; the restore did not.
+        expect(dockerCallsAfterWarmProof(calls).filter((call) => servedSetRead(call.args)).length).toBeGreaterThan(0);
+        expect(timingsFor("startup:restore-sessions")).toEqual(["timing: startup:restore-sessions skipped warm-peer"]);
+        // The handoff carries the reconcile's clean state, never the peer judgement.
+        expect(handoff?.sessionState).toEqual({ kind: "reconciled", inventoryClean: true, reservedSourceIps: [peer.record.sourceIp] });
+        expect(peerRecordBytes(context, peer)).toBe(peerBytes);
+      } finally {
+        handoff?.lifecycleLock.release();
+      }
+    });
+
+    test("a proxy restart after the judgement refuses the launch; the retry validates fully and restores", async () => {
+      const context = launchContext();
+      let restartDuringReconcile = false;
+      let judged = false;
+      const io = createRuntimeIO({
+        capture: (_command, args) => {
+          // The first session-file read after the warm proof's observation is
+          // the reconcile's: the peer judgement has already matched by then.
+          if (restartDuringReconcile && warmProofInspect(args)) judged = true;
+          if (restartDuringReconcile && judged && servedSetRead(args)) {
+            restartDuringReconcile = false;
+            process.env.FAKE_PROXY_STARTED_AT = "2026-06-13T06:00:00.000Z";
+          }
+          return undefined;
+        },
+      });
+      await warmedUp(context, io);
+      const peer = installLivePeer(context, io);
+      const peerBytes = peerRecordBytes(context, peer);
+      restartDuringReconcile = true;
+      const start = io.calls.length;
+      const refused = await startRuntime(timed(context), io, false, { launch: true, launchHandoff: true });
+      expect(refused.status).toBe(1);
+      expect(timingsFor("validation:warm-peer")).toEqual(["timing: validation:warm-peer match"]);
+      expect(timingsFor("startup:restore-sessions")).toEqual([
+        "timing: startup:restore-sessions refused the proxy restarted since the warm peer judgement",
+      ]);
+      expect(pendingWarningsForTest().map((event) => event.message).join("\n"))
+        .toContain("the session state changed during a warm launch; retry the command to validate the runtime fully");
+      // Refused before credential sync and before any handoff.
+      expect(io.calls.slice(start).some((call) => call.method === "admin" && call.args.includes("--startup-convergence"))).toBe(false);
+      expect(refused.kind === "ready").toBe(false);
+      expect(lockIsFree(context)).toBe(true);
+      expect(fs.existsSync(recordPath(context))).toBe(false);
+      expect(peerRecordBytes(context, peer)).toBe(peerBytes);
+      // The retry: no record, so a full validation, and the restore runs.
+      vi.mocked(console.error).mockClear();
+      const retryStart = io.calls.length;
+      expect((await startRuntime(timed(context), io, false, { launch: true })).status).toBe(0);
+      expect(denyProbeRuns(io.calls.slice(retryStart))).toBe(1);
+      expect(timingsFor("startup:restore-sessions")).toHaveLength(1);
+      expect(timingsFor("startup:restore-sessions")[0]).toMatch(/^timing: startup:restore-sessions [0-9.]+ms$/);
+      expect(fs.existsSync(recordPath(context))).toBe(true);
+      expect(peerRecordBytes(context, peer)).toBe(peerBytes);
+    });
+
+    test("a peer whose owner dies after the judgement is torn down by the reconcile, and the launch refuses", async () => {
+      const context = launchContext();
+      let killOwnerDuringReconcile: (() => void) | undefined;
+      let judged = false;
+      const io = createRuntimeIO({
+        capture: (_command, args) => {
+          // As above: the reconcile's read is the first after the warm proof's observation.
+          if (killOwnerDuringReconcile && warmProofInspect(args)) judged = true;
+          if (killOwnerDuringReconcile && judged && servedSetRead(args)) {
+            killOwnerDuringReconcile();
+            killOwnerDuringReconcile = undefined;
+          }
+          return undefined;
+        },
+      });
+      await warmedUp(context, io);
+      const ownerPid = await spawnOwner();
+      const dying = installLivePeer(context, io, { index: 0, ownerPid });
+      const surviving = installLivePeer(context, io, { index: 1 });
+      const survivingBytes = peerRecordBytes(context, surviving);
+      killOwnerDuringReconcile = () => {
+        process.kill(ownerPid, "SIGKILL");
+        // Wait until the host no longer reports the process as alive.
+        const deadline = Date.now() + 5_000;
+        while (Date.now() < deadline) {
+          try {
+            process.kill(ownerPid, 0);
+          } catch {
+            return;
+          }
+          childProcess.spawnSync(process.execPath, ["-e", ""], { stdio: "ignore" });
+        }
+      };
+      const refused = await startRuntime(timed(context), io, false, { launch: true, launchHandoff: true });
+      expect(refused.status).toBe(1);
+      expect(timingsFor("validation:warm-peer")).toEqual(["timing: validation:warm-peer match"]);
+      expect(pendingWarningsForTest().map((event) => event.message).join("\n"))
+        .toContain("retry the command to validate the runtime fully");
+      expect(fs.existsSync(recordPath(context))).toBe(false);
+      // The reconcile ended the dead owner's session; the other peer is intact.
+      expect(peerRecordBytes(context, dying)).toBeUndefined();
+      expect(peerRecordBytes(context, surviving)).toBe(survivingBytes);
+      expect(lockIsFree(context)).toBe(true);
+    });
+
+    test("a v1 warm-proof record is a clean miss: the full path writes v2, and the next launches match empty and beside a peer", async () => {
+      const context = launchContext();
+      const io = createRuntimeIO();
+      await warmedUp(context, io);
+      const v2 = JSON.parse(fs.readFileSync(recordPath(context), "utf8")) as { version: number; facts: Record<string, unknown>; writtenAt: string };
+      expect(v2.version).toBe(2);
+      const { fixedParticipants: _fixed, ...v1Facts } = v2.facts;
+      fs.writeFileSync(recordPath(context), JSON.stringify({
+        version: 1,
+        facts: { ...v1Facts, participants: [{ id: FAKE_PROXY_CONTAINER_ID, ipv4: `${fixedNetwork.proxyIp}/24`, endpointId: "endpoint" }] },
+        writtenAt: v2.writtenAt,
+      }));
+      const fullStart = io.calls.length;
+      expect((await startRuntime(context, io, false, { launch: true })).status).toBe(0);
+      expect(denyProbeRuns(io.calls.slice(fullStart))).toBe(1);
+      expect(JSON.parse(fs.readFileSync(recordPath(context), "utf8")).version).toBe(2);
+      const emptyStart = io.calls.length;
+      expect((await startRuntime(context, io, false, { launch: true })).status).toBe(0);
+      expect(denyProbeRuns(io.calls.slice(emptyStart))).toBe(0);
+      installLivePeer(context, io);
+      const peerStart = io.calls.length;
+      expect((await startRuntime(timed(context), io, false, { launch: true })).status).toBe(0);
+      expect(denyProbeRuns(io.calls.slice(peerStart))).toBe(0);
+      expect(timingsFor("validation:warm-peer")).toEqual(["timing: validation:warm-peer match"]);
+    });
+
+    test("a full-path launch whose restore fails leaves no warm-proof record", async () => {
+      const context = launchContext();
+      const io = createRuntimeIO();
+      await warmedUp(context, io);
+      installLivePeer(context, io);
+      // Full path: a new proxy pid is a warm mismatch; the restore's per-session proof then fails.
+      process.env.FAKE_PROXY_PID = "5151";
+      sessionProofSeam.beforeValidate = () => {
+        sessionProofSeam.beforeValidate = undefined;
+        throw new Error("session container proof failed (injected)");
+      };
+      await expect(startRuntime(context, io, false, { launch: true })).rejects.toThrow("session container proof failed (injected)");
+      expect(fs.existsSync(recordPath(context))).toBe(false);
+      expect(lockIsFree(context)).toBe(true);
+      // Reclamation: the next launch validates fully, restores, and records.
+      const start = io.calls.length;
+      expect((await startRuntime(context, io, false, { launch: true })).status).toBe(0);
+      expect(denyProbeRuns(io.calls.slice(start))).toBe(1);
+      expect(fs.existsSync(recordPath(context))).toBe(true);
+    });
+
+    test("a proxy restart between the restore and the record write records nothing", async () => {
+      const context = launchContext();
+      const io = createRuntimeIO();
+      await warmedUp(context, io);
+      installLivePeer(context, io);
+      process.env.FAKE_PROXY_PID = "5151";
+      // The restore published eligibility against the proxy start it observed;
+      // the proxy restarts in place while the restore proves the peer.
+      sessionProofSeam.beforeValidate = () => {
+        sessionProofSeam.beforeValidate = undefined;
+        process.env.FAKE_PROXY_STARTED_AT = "2026-06-13T07:00:00.000Z";
+      };
+      expect((await startRuntime(timed(context), io, false, { launch: true })).status).toBe(0);
+      expect(timingsFor("startup:restore-sessions")[0]).toMatch(/^timing: startup:restore-sessions [0-9.]+ms$/);
+      expect(timingsFor("validation:warm-proof")).toContain("timing: validation:warm-proof not-recorded");
+      expect(fs.existsSync(recordPath(context))).toBe(false);
+      // The next launch validates fully against the restarted proxy and records.
+      const start = io.calls.length;
+      expect((await startRuntime(context, io, false, { launch: true })).status).toBe(0);
+      expect(denyProbeRuns(io.calls.slice(start))).toBe(1);
+      expect(fs.existsSync(recordPath(context))).toBe(true);
+    });
+
+    test("no warm-proof record is written while an ephemeral helper is on the internal network", async () => {
+      const context = launchContext();
+      const io = createRuntimeIO();
+      process.env.FAKE_INTERNAL_PARTICIPANT_ROLE = "ephemeral-helper";
+      expect((await startRuntime(context, io, false, { launch: true })).status).toBe(0);
+      expect(fs.existsSync(recordPath(context))).toBe(false);
+      const start = io.calls.length;
+      expect((await startRuntime(context, io, false, { launch: true })).status).toBe(0);
+      expect(denyProbeRuns(io.calls.slice(start))).toBe(1);
+      expect(fs.existsSync(recordPath(context))).toBe(false);
+      // Reclamation: once the helper is gone, the full path records again.
+      delete process.env.FAKE_INTERNAL_PARTICIPANT_ROLE;
+      expect((await startRuntime(context, io, false, { launch: true })).status).toBe(0);
+      expect(fs.existsSync(recordPath(context))).toBe(true);
+    });
+
+    test("runfree up beside a live peer validates fully and restores without asking the warm proof", async () => {
+      const context = launchContext();
+      const io = createRuntimeIO();
+      await warmedUp(context, io);
+      installLivePeer(context, io);
+      const start = io.calls.length;
+      expect((await startRuntime(timed(context), io, false, {})).status).toBe(0);
+      expect(denyProbeRuns(io.calls.slice(start))).toBe(1);
+      expect(timingsFor("validation:warm-proof-check")).toEqual([]);
+      expect(timingsFor("validation:warm-peer")).toEqual([]);
+      expect(timingsFor("startup:restore-sessions")[0]).toMatch(/^timing: startup:restore-sessions [0-9.]+ms$/);
+    });
+
+    test("a warm peer launch that held the lock past the handoff span releases it and hands nothing off", async () => {
+      const context = launchContext();
+      const realNow = performance.now.bind(performance);
+      let skew = 0;
+      let skewNext = false;
+      const clock = vi.spyOn(performance, "now").mockImplementation(() => realNow() + skew);
+      const io = createRuntimeIO({
+        admin: async (args) => {
+          if (skewNext && args.includes("--startup-convergence")) skew += LAUNCH_HANDOFF_STARTUP_SPAN_MAX_MS + 1;
+          return 0;
+        },
+      });
+      try {
+        await warmedUp(context, io);
+        installLivePeer(context, io);
+        skewNext = true;
+        const warm = await startRuntime(timed(context), io, false, { launch: true, launchHandoff: true });
+        if (warm.kind !== "ready") throw new Error("warm launch beside a peer failed");
+        expect(timingsFor("validation:warm-peer")).toEqual(["timing: validation:warm-peer match"]);
+        expect(takeLaunchHandoff(warm.preparedRuntime)).toBeUndefined();
+        expect(takeLaunchHandoffDeclined(warm.preparedRuntime)).toBe(true);
+        expect(lockIsFree(context)).toBe(true);
+      } finally {
+        clock.mockRestore();
+      }
     });
   });
 

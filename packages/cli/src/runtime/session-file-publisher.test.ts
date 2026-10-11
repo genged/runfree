@@ -30,7 +30,7 @@ import {
   eligibilityPublishCommand,
   executeSessionFileCommand,
   listIpAssignmentsScript,
-  parseIpAssignmentListing,
+  parseIpAssignmentEntries,
   sessionIpAssignmentReadCommand,
   sealCommand,
   servedSetReadCommand,
@@ -881,7 +881,7 @@ describe("IP assignment listing (sub-second launch plan Task 6)", () => {
       fs.writeFileSync(path.join(sandbox.requests, "172.31.90.21.json"), '{"v":1,"state":"draining"}\n');
       const listed = runScript(sandbox.localize(listIpAssignmentsScript()), []);
       expect(listed.status, listed.stderr).toBe(0);
-      const digests = parseIpAssignmentListing(listed.stdout);
+      const digests = parseIpAssignmentEntries(listed.stdout)?.digests;
       expect(Object.keys(digests ?? {})).toEqual(["172.31.90.20", "172.31.90.21"]);
       // Byte-for-byte the digest the fence's CAS compares, as the per-address
       // read reports it.
@@ -892,6 +892,35 @@ describe("IP assignment listing (sub-second launch plan Task 6)", () => {
         expect(single.status, single.stderr).toBe(0);
         expect(digests?.[ip] ?? "-").toBe(single.stdout);
       }
+    } finally {
+      sandbox.cleanup();
+    }
+  });
+
+  test("binds an address to its session only when the bytes are a well-formed assignment for that address", () => {
+    const sandbox = reuseSandbox();
+    try {
+      const key = "a".repeat(64);
+      const assignment = (sourceIp: string, extra: Record<string, unknown> = {}) => `${JSON.stringify({
+        v: 1, sourceIp, sessionKey: key, nonce: "0".repeat(32), state: "ready", ...extra,
+      })}\n`;
+      fs.writeFileSync(path.join(sandbox.requests, "172.31.90.20.json"), assignment("172.31.90.20"));
+      fs.writeFileSync(path.join(sandbox.requests, "172.31.90.21.json"), assignment("172.31.90.21", { state: "draining" }));
+      // Bytes naming another address, another schema, or an unknown state bind nothing.
+      fs.writeFileSync(path.join(sandbox.requests, "172.31.90.22.json"), assignment("172.31.90.99"));
+      fs.writeFileSync(path.join(sandbox.requests, "172.31.90.23.json"), assignment("172.31.90.23", { v: 2 }));
+      fs.writeFileSync(path.join(sandbox.requests, "172.31.90.24.json"), assignment("172.31.90.24", { state: "held" }));
+      fs.writeFileSync(path.join(sandbox.requests, "172.31.90.25.json"), "{not json\n");
+      const listed = runScript(sandbox.localize(listIpAssignmentsScript()), []);
+      expect(listed.status, listed.stderr).toBe(0);
+      const entries = parseIpAssignmentEntries(listed.stdout);
+      expect(Object.keys(entries?.digests ?? {})).toEqual(
+        ["172.31.90.20", "172.31.90.21", "172.31.90.22", "172.31.90.23", "172.31.90.24", "172.31.90.25"],
+      );
+      expect(entries?.bindings).toEqual({
+        "172.31.90.20": { sessionKey: key, state: "ready" },
+        "172.31.90.21": { sessionKey: key, state: "draining" },
+      });
     } finally {
       sandbox.cleanup();
     }
@@ -921,8 +950,19 @@ describe("IP assignment listing (sub-second launch plan Task 6)", () => {
 
   test("a malformed listing parses as unavailable, never as empty", () => {
     for (const stdout of ["", "{", "[]", JSON.stringify({ "not-an-ip": "a".repeat(64) }), JSON.stringify({ "172.31.90.20": "short" })]) {
-      expect(parseIpAssignmentListing(stdout)).toBeUndefined();
+      expect(parseIpAssignmentEntries(stdout)).toBeUndefined();
     }
-    expect(parseIpAssignmentListing("{}")).toEqual({});
+    expect(parseIpAssignmentEntries("{}")).toEqual({ digests: {}, bindings: {} });
+    // A binding is all or nothing: a half-present or malformed one is no listing.
+    const digest = "a".repeat(64);
+    for (const entry of [
+      { digest, sessionKey: "b".repeat(64) },
+      { digest, state: "ready" },
+      { digest, sessionKey: "short", state: "ready" },
+      { digest, sessionKey: "b".repeat(64), state: "held" },
+      { digest, extra: 1 },
+    ]) {
+      expect(parseIpAssignmentEntries(JSON.stringify({ "172.31.90.20": entry }))).toBeUndefined();
+    }
   });
 });
