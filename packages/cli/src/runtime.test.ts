@@ -209,7 +209,7 @@ import { runtimeDryRun } from "./runtime/front.ts";
 import { repairWorktreeLinks } from "./runtime/git-layout.ts";
 import { subprocessCategory } from "./runtime/operation-histogram.ts";
 import { COMPOSE_UP_FAILURE_REMEDY, restoreSameProxySessionAdmission, startRuntime, up } from "./runtime/startup.ts";
-import { TOKEN_SYNC_DEFERRED_STATUS } from "./runtime/constants.ts";
+import { TOKEN_SYNC_DEFERRED_STATUS, TOKEN_SYNC_REPREPARE_STATUS } from "./runtime/constants.ts";
 import { disposeLaunchHandoff, mintPreparedRuntime, preparedRuntimeProxyId, takeLaunchHandoff, takeLaunchHandoffDeclined } from "./runtime/prepared-runtime.ts";
 import { generatedRuntimeContextIfAvailable } from "./runtime/images.ts";
 import { createRuntimeSecurityContract } from "./runtime/security-contract.ts";
@@ -4593,7 +4593,9 @@ describe("runtime command flow", () => {
           expect(takeLaunchHandoff(spent.preparedRuntime)).toBeUndefined();
           expect(takeLaunchHandoffDeclined(spent.preparedRuntime)).toBe(true);
           expect(tokenSyncCalls(late.calls)).toEqual([["token", "sync"]]);
-          expect(lockFreeAtPrepare.at(-1)).toBe(true);
+          // Every provider ran once, before the lock: the fallback reuses
+          // that preparation rather than reading the sources again.
+          expect(lockFreeAtPrepare).toEqual([true]);
           expect(lockIsFree(context)).toBe(true);
           expect(syncTimings()).toEqual(expect.arrayContaining([
             "timing: token-sync deferred hold-span",
@@ -4623,23 +4625,26 @@ describe("runtime command flow", () => {
         }
       });
 
-      test("expired or incomplete prepared set defers before effects", async () => {
+      test.each([
+        ["a busy lock, an unready proxy or a failed write", TOKEN_SYNC_DEFERRED_STATUS, [true], "timing: token-sync deferred source-truth"],
+        ["an expired or incomplete prepared set", TOKEN_SYNC_REPREPARE_STATUS, [true, true], "timing: token-sync deferred re-prepare"],
+      ] as const)("expired or incomplete prepared set defers before effects: %s", async (_label, deferral, prepares, detail) => {
         const context = launchContext();
         const lockFreeAtPrepare: boolean[] = [];
-        // The sync reports the preparation unusable (expired, incomplete,
-        // rebound): a deferral, before any effect.
         const io = createRuntimeIO({
-          admin: async (args) => (args.includes("--prepared-source-truth") ? TOKEN_SYNC_DEFERRED_STATUS : 0),
+          admin: async (args) => (args.includes("--prepared-source-truth") ? deferral : 0),
         });
         io.prepareTokenSources = async (prepareContext) => {
           if (prepareContext.projectRoot === context.projectRoot) lockFreeAtPrepare.push(lockIsFree(context));
         };
-        const cold = await startRuntime(context, io, false, { launch: true, launchHandoff: true });
+        const cold = await startRuntime(timed(context), io, false, { launch: true, launchHandoff: true });
         if (cold.kind !== "ready") throw new Error("cold launch failed");
-        // The fallback succeeded: released, prepared again outside the lock,
-        // then the ordinary source-truth sync.
+        // The fallback succeeded: released, then the ordinary source-truth
+        // sync. Only a preparation that was itself the reason is read again
+        // (once, outside the lock); otherwise every provider ran once.
         expect(tokenSyncCalls(io.calls)).toEqual([["token", "sync", "--prepared-source-truth"], ["token", "sync"]]);
-        expect(lockFreeAtPrepare).toEqual([true, true]);
+        expect(lockFreeAtPrepare).toEqual(prepares);
+        expect(syncTimings()).toContain(detail);
         expect(takeLaunchHandoff(cold.preparedRuntime)).toBeUndefined();
         expect(takeLaunchHandoffDeclined(cold.preparedRuntime)).toBe(false);
         expect(cold.credentialFreshness).toBe("source-truth");
@@ -4691,7 +4696,7 @@ describe("runtime command flow", () => {
         handoff?.lifecycleLock.release();
       });
 
-      test("resume retains its recovery-claim ordering", async () => {
+      test("a start that asks for no handoff, as resume's does, keeps the unlocked source-truth order", async () => {
         const context = launchContext();
         const lockFreeAtSync: boolean[] = [];
         const io = createRuntimeIO({

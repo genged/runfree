@@ -81,6 +81,7 @@ import {
 import { type CredentialReadInput } from "./credential-source-reader.ts";
 import {
   TOKEN_SYNC_DEFERRED_STATUS,
+  TOKEN_SYNC_REPREPARE_STATUS,
   WARM_TOKEN_SYNC_CALL_TIMEOUT_MS,
   WARM_TOKEN_SYNC_TOTAL_TIMEOUT_MS,
 } from "../runtime/constants.ts";
@@ -755,15 +756,19 @@ export function credentialStatus(input: CredentialStatusInput = {}): void {
  * the complete preparation made before the lock (`preparedSourceTruth`). It
  * is bounded by the startup hold allowance, counted from the lock's original
  * acquisition: no child process starts past it. Anything it cannot finish
- * that way is a deferral (`TOKEN_SYNC_DEFERRED_STATUS`): startup releases the
- * lock, prepares again, and runs the ordinary source-truth sync, which
+ * that way is a deferral: startup releases the lock and runs the ordinary
+ * source-truth sync, first reading every source again when the preparation
+ * itself was the reason (`TOKEN_SYNC_REPREPARE_STATUS`, otherwise
+ * `TOKEN_SYNC_DEFERRED_STATUS`). That sync
  * re-observes the proxy before it writes. A deferral after some writes landed
  * records no receipt for them.
  */
 async function preparedSourceTruthSync(verbose: boolean, holdDeadlineMonotonicMs: number | undefined): Promise<void> {
-  const defer = (message: string): void => {
-    if (verbose) console.log(`credential sync deferred to a source-truth sync: ${message}`);
-    process.exitCode = TOKEN_SYNC_DEFERRED_STATUS;
+  const defer = (message: string, reprepare = false): void => {
+    if (verbose) {
+      console.log(`credential sync deferred to a source-truth sync${reprepare ? " that reads every source again" : ""}: ${message}`);
+    }
+    process.exitCode = reprepare ? TOKEN_SYNC_REPREPARE_STATUS : TOKEN_SYNC_DEFERRED_STATUS;
   };
   const remainingMs = holdDeadlineMonotonicMs === undefined || !Number.isFinite(holdDeadlineMonotonicMs)
     ? 0
@@ -783,7 +788,7 @@ async function preparedSourceTruthSync(verbose: boolean, holdDeadlineMonotonicMs
     // unlocked source-truth order re-observes and writes again.
     if (error instanceof ChildSignaledError) await settleHostSignals();
     else if (!(error instanceof TokenSyncDeferredError)) throw error;
-    defer(error.message);
+    defer(error.message, error instanceof TokenSyncDeferredError && error.deferredFor === "preparation");
   }
 }
 

@@ -1409,7 +1409,15 @@ describe("a crashed session with no record falls back from the warm-empty skip",
       const [victim] = peers as [HeldPeer];
       if (victim.run.pid === undefined) throw new Error("the cold launch's owner has no pid");
       victim.run.cancel();
-      await victim.run.completion;
+      const killed = await victim.run.completion;
+      // Which path the cold launch took before it was killed; both must
+      // recover. A minted handoff means the owner held startup's lock
+      // through admission.
+      const sync = timing(killed.output, "token-sync").filter((detail) => !/^[\d.]+ms$/.test(detail)).at(-1);
+      const handoff = timing(killed.output, "launch-handoff").at(-1);
+      expect(handoff, describeOutput(killed.output, 4000)).toBeDefined();
+      if (handoff === "minted") expect(sync, describeOutput(killed.output, 4000)).toBe("prepared-source-truth");
+      else expect(handoff, describeOutput(killed.output, 4000)).toMatch(/^skipped /);
       releaseHoldMarker(fixture);
       const recovered = runfreeTimed(fixture, ["claude"]);
       expect(recovered.status, describeOutput(recovered.output, 4000)).toBe(0);

@@ -317,9 +317,17 @@ type TokenSyncOptions = TokenResolutionOptions & {
  * waiting on a lock, or exceeding its time bounds. Never followed by a removal.
  */
 export class TokenSyncDeferredError extends Error {
-  constructor(message: string) {
+  /**
+   * `preparation`: the sources read before the lock are the reason (none,
+   * incomplete, expired, or no longer the current sources), so the caller
+   * must read them again. `runtime`: anything else (a busy lock, a proxy that
+   * is not ready, a failed write, a spent budget); the preparation still holds.
+   */
+  readonly deferredFor: "preparation" | "runtime";
+  constructor(message: string, deferredFor: "preparation" | "runtime" = "runtime") {
     super(message);
     this.name = "TokenSyncDeferredError";
+    this.deferredFor = deferredFor;
   }
 }
 
@@ -3194,10 +3202,10 @@ function preparedTokenEntryKind(name: string): PreparedTokenSourceEntry["kind"] 
 function assertPreparedOnlyCovers(dueTokenNames: readonly string[]): void {
   const project = currentAdminState().runtimeContext?.project ?? adminProjectInfo();
   const prepared = preparedRuntimeTokenSources.get(project.paths.stateDir);
-  if (!prepared) throw new TokenSyncDeferredError("no prepared credential set for a prepared-only sync");
+  if (!prepared) throw new TokenSyncDeferredError("no prepared credential set for a prepared-only sync", "preparation");
   for (const name of dueTokenNames) {
     if (prepared.values.get(name)?.kind !== "resolved") {
-      throw new TokenSyncDeferredError(`${name} is due and its source was not read before the lock`);
+      throw new TokenSyncDeferredError(`${name} is due and its source was not read before the lock`, "preparation");
     }
   }
 }
@@ -3528,7 +3536,7 @@ function syncTokensUnderLock(
     for (const [tokenName, tokenPolicy] of Object.entries(policy.tokens)) {
       if (config[tokenName]) covered.push(tokenName);
       else if (tokenPolicy.allowAnonymous !== true) {
-        throw new TokenSyncDeferredError(`${tokenName} is required and has no source`);
+        throw new TokenSyncDeferredError(`${tokenName} is required and has no source`, "preparation");
       }
     }
     assertPreparedOnlyCovers(covered);
@@ -3545,7 +3553,7 @@ function syncTokensUnderLock(
       for (const name of expectedNames) currentPreparedRuntimeTokenSource(name, config[name], { quiet: true, sourceRegistry: config[name].source === "named" ? sourceRegistry : undefined });
     } catch (error) {
       if (deferring && error instanceof EffectiveControlSelectionChanged) {
-        throw new TokenSyncDeferredError(`the prepared credential set no longer applies: ${error.message}`);
+        throw new TokenSyncDeferredError(`the prepared credential set no longer applies: ${error.message}`, "preparation");
       }
       throw error;
     }
@@ -3639,10 +3647,20 @@ function syncTokensUnderLock(
         adminVerbose(options, `${tokenName}: resolving ${describeSource(source)} source (${due.reason})`);
         if (preparedTokenEntryKind(tokenName) !== "resolved") {
           // Covered before the first effect; never a source read under the lock.
-          if (options.preparedSourceTruth) throw new TokenSyncDeferredError(`${tokenName} has no value read before the lock`);
+          if (options.preparedSourceTruth) throw new TokenSyncDeferredError(`${tokenName} has no value read before the lock`, "preparation");
           fence();
         }
-        value = resolvePreparedRuntimeTokenSource(tokenName, source, { ...options, sourceRegistry: registryForSource });
+        try {
+          value = resolvePreparedRuntimeTokenSource(tokenName, source, { ...options, sourceRegistry: registryForSource });
+        } catch (error) {
+          // The preparation expired or was rebound between two writes: under
+          // the held lock that is a deferral, never a refusal. Earlier writes
+          // stand without a receipt; the unlocked order writes them again.
+          if (options.preparedSourceTruth && error instanceof EffectiveControlSelectionChanged) {
+            throw new TokenSyncDeferredError(`the prepared credential set no longer applies: ${error.message}`, "preparation");
+          }
+          throw error;
+        }
         // The value is as old as the read before the lock: reusing it here
         // does not make it younger.
         if (options.preparedSourceTruth) resolvedAt = prepared?.readsStartedAt ?? syncNowMs;

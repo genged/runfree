@@ -61,7 +61,7 @@ import {
   TokenSyncDeferredError,
   withAdminCallTimeout,
 } from "../packages/cli/src/admin/admin-core.ts";
-import { TOKEN_SYNC_DEFERRED_STATUS } from "../packages/cli/src/runtime/constants.ts";
+import { TOKEN_SYNC_DEFERRED_STATUS, TOKEN_SYNC_REPREPARE_STATUS } from "../packages/cli/src/runtime/constants.ts";
 import { flushWarnings } from "../packages/cli/src/warnings.ts";
 import { cliEntryArgv, credentialWatchHarnessEntryArgv } from "../tests/support/prebuilt-entry.ts";
 import type { CredentialWatchHarnessConfig } from "./credential-watch.test-harness.ts";
@@ -528,9 +528,10 @@ function verifyEs256Jwt(jwt: string, publicKeyPem: string): { header: Record<str
 // live proxy identity to be a real Docker object id (the control-plane rebind
 // journal only records 64-hex container ids and `runfree-<projectId>` compose
 // projects); every other caller keeps the short stand-ins.
-function installTokenSyncDockerFake(options: { composeProject?: string; onMarkerSwap?: () => void; proxyId?: string } = {}): { dockerLog: string; fakeBin: string; heldTokens: Set<string> } {
+function installTokenSyncDockerFake(options: { composeProject?: string; onMarkerSwap?: () => void; onTokenWrite?: (tokenName: string) => void; proxyId?: string } = {}): { dockerLog: string; fakeBin: string; heldTokens: Set<string> } {
   const proxyId = options.proxyId ?? "proxy-id";
   const onMarkerSwap = options.onMarkerSwap;
+  const onTokenWrite = options.onTokenWrite;
   const composeProjectLabel = options.composeProject ?? "fake-project";
   const fakeBin = path.join(tmp, "fake-bin");
   const dockerLog = path.join(tmp, "docker-token-sync.jsonl");
@@ -717,12 +718,14 @@ function installTokenSyncDockerFake(options: { composeProject?: string; onMarker
     }
     {
       const writeMatch = /mv '\/run\/runfree-proxy-secrets\/[^']*' '\/run\/runfree-proxy-secrets\/([^']+)'/.exec(text);
-      if (writeMatch && env.FAKE_DOCKER_TOKEN_WRITE_STATUS) {
+      if (writeMatch && env.FAKE_DOCKER_TOKEN_WRITE_STATUS
+        && (!env.FAKE_DOCKER_TOKEN_WRITE_STATUS_TOKEN || env.FAKE_DOCKER_TOKEN_WRITE_STATUS_TOKEN === writeMatch[1])) {
         // A write whose client failed or was killed at its time bound.
         return spawnResult({ status: Number(env.FAKE_DOCKER_TOKEN_WRITE_STATUS), stderr: "token write timed out\n" });
       }
       if (writeMatch) {
         fakeProxySecretStore.add(writeMatch[1]);
+        onTokenWrite?.(writeMatch[1]);
         // The remote write landed, but its client was killed (or timed out)
         // before it could report.
         if (env.FAKE_DOCKER_TOKEN_WRITE_KILL === "timeout") return spawnTimeoutResult("docker");
@@ -3644,6 +3647,41 @@ describe("convergent proxy token store", () => {
       expect(tokenRemovalCount(fakeDocker.dockerLog)).toBe(0);
     });
 
+    test("a source changed after a re-read preparation defers instead of refusing, and a fresh preparation reclaims", async () => {
+      writeGithubOnePasswordFixture();
+      const fakeDocker = installTokenSyncDockerFake();
+      const hostOpBin = makeHostOpBin();
+      const opLogPath = path.join(tmpBase, `warm-reread-fp-op-${Math.random().toString(16).slice(2)}.jsonl`);
+      installFakeOp(hostOpBin, { logPath: opLogPath, output: "ghp_secret\n" });
+      await populate(fakeDocker, hostOpBin);
+      const [receipt] = readReceiptsFile();
+      // An old read: the preparation re-reads it, so its entry is resolved.
+      fs.writeFileSync(receiptsFilePath(), `${JSON.stringify({ schemaVersion: 1, receipts: [{ ...receipt, resolvedAt: Date.now() - 16 * 60 * 1000 }] })}\n`);
+      const writesBefore = tokenWrites(fakeDocker.dockerLog);
+      let readsBeforeSync = -1;
+
+      const deferred = await runAdmin(async () => {
+        prepareRuntimeTokenSources({ mode: "convergence" });
+        readsBeforeSync = readJsonLines(opLogPath).length;
+        // The resolved entry no longer names the current source.
+        writeTokenConfig({ github: { source: "1password", ref: "op://Private/GitHub/rotated" } });
+        await credentialSyncIntent(warmSync);
+      }, opEnv(fakeDocker, hostOpBin));
+
+      expect(deferred.status).toBe(TOKEN_SYNC_DEFERRED_STATUS);
+      expect(deferred.stdout).toContain("the prepared credential set no longer applies: prepared credential source changed");
+      expect(readJsonLines(opLogPath)).toHaveLength(readsBeforeSync);
+      expect(tokenWrites(fakeDocker.dockerLog)).toBe(writesBefore);
+      expect(tokenRemovalCount(fakeDocker.dockerLog)).toBe(0);
+
+      const reclaimed = await runAdmin(async () => {
+        prepareRuntimeTokenSources({ mode: "convergence" });
+        await credentialSyncIntent(warmSync);
+      }, opEnv(fakeDocker, hostOpBin));
+      expect(reclaimed.status, reclaimed.stderr).toBe(0);
+      expect(readJsonLines(opLogPath).at(-1)).toEqual({ args: ["read", "op://Private/GitHub/rotated"] });
+    });
+
     test("a preparation that expired before the locked sync defers instead of failing the launch", async () => {
       writeGithubOnePasswordFixture();
       const fakeDocker = installTokenSyncDockerFake();
@@ -4129,12 +4167,21 @@ describe("convergent proxy token store", () => {
         const { fakeDocker, hostOpBin, opLogPath, ackEnv } = await coldLaunch();
         let readsBeforeSync = -1;
         let preparedBefore = 0;
+        let preparedAfter = 0;
+        let syncStartedAt = 0;
+        const realNow = Date.now;
         const published = await runAdmin(async () => {
           preparedBefore = Date.now();
           prepareRuntimeTokenSources();
+          preparedAfter = Date.now();
           readsBeforeSync = readJsonLines(opLogPath).length;
+          // The lock is taken a while after the preparation finished.
+          Date.now = () => realNow() + 30_000;
+          restoreClock = () => { Date.now = realNow; };
+          syncStartedAt = Date.now();
           await credentialSyncIntent(coldSync());
         }, { ...opEnv(fakeDocker, hostOpBin), ...ackEnv }, launchState());
+        restoreClock();
 
         expect(published.status, published.stderr).toBe(0);
         expect(readsBeforeSync).toBe(1);
@@ -4146,6 +4193,8 @@ describe("convergent proxy token store", () => {
         const [receipt] = readReceiptsFile();
         expect(receipt.tokenName).toBe("github");
         expect(receipt.resolvedAt).toBeGreaterThanOrEqual(preparedBefore);
+        expect(receipt.resolvedAt).toBeLessThanOrEqual(preparedAfter);
+        expect(preparedAfter).toBeLessThan(syncStartedAt);
         expect(published.stdout).not.toContain("credential sync deferred");
       });
 
@@ -4210,8 +4259,9 @@ describe("convergent proxy token store", () => {
             readsBeforeSync = readJsonLines(opLogPath).length;
             await credentialSyncIntent(coldSync());
           }, { ...opEnv(fakeDocker, hostOpBin), ...ackEnv }, launchState());
-          expect(deferred.status, deferred.stderr).toBe(TOKEN_SYNC_DEFERRED_STATUS);
-          expect(deferred.stdout).toContain(`credential sync deferred to a source-truth sync: `);
+          // The preparation itself is the reason: the caller reads it again.
+          expect(deferred.status, deferred.stderr).toBe(TOKEN_SYNC_REPREPARE_STATUS);
+          expect(deferred.stdout).toContain("credential sync deferred to a source-truth sync that reads every source again");
           expect(deferred.stdout).toContain(reason);
         } finally {
           restoreClock();
@@ -4242,6 +4292,9 @@ describe("convergent proxy token store", () => {
           await credentialSyncIntent(coldSync());
         }, { ...opEnv(fakeDocker, hostOpBin), ...staleAckEnv }, launchState());
         expect(refused.status).not.toBe(0);
+        expect(refused.status).not.toBe(TOKEN_SYNC_DEFERRED_STATUS);
+        expect(refused.status).not.toBe(TOKEN_SYNC_REPREPARE_STATUS);
+        expect(refused.stderr).toContain("credential resolution requires");
         expect(tokenWrites(fakeDocker.dockerLog)).toBe(0);
         expect(tokenRemovalCount(fakeDocker.dockerLog)).toBe(0);
 
@@ -4251,6 +4304,151 @@ describe("convergent proxy token store", () => {
         }, { ...opEnv(fakeDocker, hostOpBin), ...await convergeSelectedGeneration() }, launchState());
         expect(reclaimed.status, reclaimed.stderr).toBe(0);
         expect(tokenWrites(fakeDocker.dockerLog)).toBe(1);
+      });
+
+      test("a named source changed while waiting for the lock defers before any read or write, and a fresh preparation reclaims", async () => {
+        writeGithubOnePasswordFixture();
+        selectEffectiveControlsFromProjectPolicy();
+        const fakeSource = installFakeCommandSource();
+        expect((await runAdmin(() => sourceAddCommandIntent({ name: "github-cli", replaceSource: false, command: ["gh", "auth", "token"] }), {
+          PATH: fakeSource.fakeBin,
+        })).status).toBe(0);
+        writeTokenConfig({ github: { source: "named", name: "github-cli" } });
+        const fakeDocker = installTokenSyncDockerFake();
+        const ackEnv = await convergeSelectedGeneration();
+        const env = { FAKE_DOCKER_LOG: fakeDocker.dockerLog, PATH: `${fakeDocker.fakeBin}${path.delimiter}${fakeSource.fakeBin}${path.delimiter}${process.env.PATH ?? ""}`, ...ackEnv };
+        const secretWrites = (): number => dockerExecCalls(fakeDocker.dockerLog).filter((entry) => entry.stdin === "command-secret").length;
+        let readsBeforeSync = -1;
+
+        const deferred = await runAdmin(async () => {
+          prepareRuntimeTokenSources();
+          readsBeforeSync = readCommandSourceLog(fakeSource.logPath).length;
+          // The named source is redefined between the preparation and the lock.
+          const registry = JSON.parse(fs.readFileSync(sourceRegistryPath(), "utf8")) as Record<string, Record<string, unknown>>;
+          const entry = registry["github-cli"] as Record<string, unknown>;
+          fs.writeFileSync(sourceRegistryPath(), `${JSON.stringify({ ...registry, "github-cli": { ...entry, argv: [...entry.argv as string[], "--hostname", "other.example"] } }, null, 2)}\n`);
+          await credentialSyncIntent(coldSync());
+        }, env, launchState());
+
+        expect(deferred.status, `${deferred.stdout}${deferred.stderr}`).toBe(TOKEN_SYNC_REPREPARE_STATUS);
+        expect(readCommandSourceLog(fakeSource.logPath)).toHaveLength(readsBeforeSync);
+        expect(secretWrites()).toBe(0);
+        expect(tokenRemovalCount(fakeDocker.dockerLog)).toBe(0);
+
+        const reclaimed = await runAdmin(async () => {
+          prepareRuntimeTokenSources();
+          await credentialSyncIntent(coldSync());
+        }, env, launchState());
+        expect(reclaimed.status, reclaimed.stderr).toBe(0);
+        expect(secretWrites()).toBe(1);
+      });
+
+      test("a preparation that expires between two writes defers for a re-read; the first write stands without a receipt and the fallback rewrites both", async () => {
+        writeFixtureRepo({
+          hosts: ["api.github.com", "api.example.com"],
+          tokens: {
+            github: { description: "GitHub token", credentials: [{ host: "api.github.com", header: "Authorization", scheme: "bearer" }] },
+            other: { description: "Other token", credentials: [{ host: "api.example.com", header: "Authorization", scheme: "bearer" }] },
+          },
+        });
+        writeTokenConfig({
+          github: { source: "1password", ref: "op://Private/GitHub/token" },
+          other: { source: "1password", ref: "op://Private/Other/token" },
+        });
+        selectEffectiveControlsFromProjectPolicy();
+        const realNow = Date.now;
+        let expireOnWrite = false;
+        const fakeDocker = installTokenSyncDockerFake({
+          onTokenWrite: () => {
+            if (!expireOnWrite) return;
+            expireOnWrite = false;
+            const at = realNow() + 121_000;
+            Date.now = () => at;
+            restoreClock = () => { Date.now = realNow; };
+          },
+        });
+        const hostOpBin = makeHostOpBin();
+        installFakeOp(hostOpBin, { output: "ghp_secret\n" });
+        const ackEnv = await convergeSelectedGeneration();
+
+        const deferred = await runAdmin(async () => {
+          prepareRuntimeTokenSources();
+          expireOnWrite = true;
+          await credentialSyncIntent(coldSync());
+        }, { ...opEnv(fakeDocker, hostOpBin), ...ackEnv }, launchState());
+        restoreClock();
+        restoreClock = () => {};
+
+        expect(deferred.status, deferred.stderr).toBe(TOKEN_SYNC_REPREPARE_STATUS);
+        expect(deferred.stdout).toContain("prepared credential inputs changed or expired");
+        expect(tokenWrites(fakeDocker.dockerLog)).toBe(1);
+        expect(tokenRemovalCount(fakeDocker.dockerLog, "github")).toBe(0);
+        expect(tokenRemovalCount(fakeDocker.dockerLog, "other")).toBe(0);
+        expect(readReceiptsFile()).toEqual([]);
+
+        // The unlocked fallback: read again, then the ordinary source-truth sync.
+        const fallback = await runAdmin(async () => {
+          prepareRuntimeTokenSources();
+          await credentialSyncIntent(syncInput);
+        }, { ...opEnv(fakeDocker, hostOpBin), ...ackEnv }, launchState());
+        expect(fallback.status, fallback.stderr).toBe(0);
+        expect(tokenWrites(fakeDocker.dockerLog)).toBe(3);
+        expect(readReceiptsFile().map((receipt) => receipt.tokenName).sort()).toEqual(["github", "other"]);
+      });
+
+      test("a partial publication (one write landed, the next failed) records no receipt, and the fallback reuses the preparation", async () => {
+        writeFixtureRepo({
+          hosts: ["api.github.com", "api.example.com"],
+          tokens: {
+            github: { description: "GitHub token", credentials: [{ host: "api.github.com", header: "Authorization", scheme: "bearer" }] },
+            other: { description: "Other token", credentials: [{ host: "api.example.com", header: "Authorization", scheme: "bearer" }] },
+          },
+        });
+        writeTokenConfig({
+          github: { source: "1password", ref: "op://Private/GitHub/token" },
+          other: { source: "1password", ref: "op://Private/Other/token" },
+        });
+        selectEffectiveControlsFromProjectPolicy();
+        const fakeDocker = installTokenSyncDockerFake();
+        const hostOpBin = makeHostOpBin();
+        const opLogPath = path.join(tmpBase, `cold-partial-op-${Math.random().toString(16).slice(2)}.jsonl`);
+        installFakeOp(hostOpBin, { logPath: opLogPath, output: "ghp_secret\n" });
+        const ackEnv = await convergeSelectedGeneration();
+
+        const deferred = await runAdmin(async () => {
+          prepareRuntimeTokenSources();
+          await credentialSyncIntent(coldSync());
+          // The fallback after a write failure: the same preparation, the
+          // ordinary source-truth sync, no second read.
+          await credentialSyncIntent(syncInput);
+        }, { ...opEnv(fakeDocker, hostOpBin), ...ackEnv, FAKE_DOCKER_TOKEN_WRITE_STATUS: "124", FAKE_DOCKER_TOKEN_WRITE_STATUS_TOKEN: "other" }, launchState());
+
+        expect(deferred.stdout).toContain("other: proxy token write failed");
+        // The first write landed; the held-lock pass persisted nothing.
+        expect(readJsonLines(opLogPath)).toHaveLength(2);
+        expect(tokenRemovalCount(fakeDocker.dockerLog, "github")).toBe(0);
+        // The fallback rewrote github and failed other again (the fake still fails it): receipts name only what it wrote.
+        expect(readReceiptsFile().map((receipt) => receipt.tokenName)).toEqual(["github"]);
+      });
+
+      test.each(["SIGTERM", "SIGKILL", "timeout"])("a write client ended by %s under the lock defers without a removal or receipt change, and the fallback writes again", async (kill) => {
+        const { fakeDocker, hostOpBin, ackEnv } = await coldLaunch();
+        const deferred = await runAdmin(async () => {
+          prepareRuntimeTokenSources();
+          await credentialSyncIntent(coldSync());
+        }, { ...opEnv(fakeDocker, hostOpBin), ...ackEnv, FAKE_DOCKER_TOKEN_WRITE_KILL: kill }, launchState());
+        expect(deferred.status, deferred.stderr).toBe(TOKEN_SYNC_DEFERRED_STATUS);
+        expect(tokenRemovalCount(fakeDocker.dockerLog)).toBe(0);
+        expect(readReceiptsFile()).toEqual([]);
+        const writesAfterKill = tokenWrites(fakeDocker.dockerLog);
+
+        const fallback = await runAdmin(async () => {
+          prepareRuntimeTokenSources();
+          await credentialSyncIntent(syncInput);
+        }, { ...opEnv(fakeDocker, hostOpBin), ...ackEnv }, launchState());
+        expect(fallback.status, fallback.stderr).toBe(0);
+        expect(tokenWrites(fakeDocker.dockerLog)).toBe(writesAfterKill + 1);
+        expect(readReceiptsFile().map((receipt) => receipt.tokenName)).toEqual(["github"]);
       });
 
       test("8s boundary uses original clock", async () => {

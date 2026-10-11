@@ -179,7 +179,7 @@ import {
   type WarmProofVerdict,
   type WarmValidation,
 } from "./warm-proof.ts";
-import { TOKEN_SYNC_DEFERRED_STATUS } from "./constants.ts";
+import { TOKEN_SYNC_DEFERRED_STATUS, TOKEN_SYNC_REPREPARE_STATUS } from "./constants.ts";
 import { imageCleanupStampMatches, writeImageCleanupStamp } from "./image-cleanup-stamp.ts";
 import { createOperationHistogram, withOperationHistogram } from "./operation-histogram.ts";
 import { remedy } from "../remedies.ts";
@@ -324,12 +324,14 @@ async function syncWarmLaunchTokens(input: Readonly<{
  * admission. Every source was read before the lock (a source-truth
  * preparation), so the `prepared-source-truth` sync publishes that set and
  * reads nothing, inside the startup hold allowance counted from the lock's
- * original acquisition. When it defers — an allowance already spent, an
- * expired, incomplete or rebound preparation, a busy lock, a runtime that is
- * not ready, a failed write — the lock is released before any source is read,
- * the sources are prepared again, and the ordinary source-truth sync runs.
- * That sync re-observes the proxy, so a publication the deferral cut short is
- * written again rather than trusted.
+ * original acquisition. When it defers, the lock is released and the
+ * ordinary source-truth sync runs. Only a deferral caused by the preparation
+ * itself (missing, incomplete, expired, or no longer the current sources)
+ * reads the sources again first, after the release; any other (an allowance
+ * already spent, a busy lock, a runtime that is not ready, a failed write)
+ * reuses the preparation, so no provider runs twice. That sync re-observes
+ * the proxy and checks the preparation's age and binding, so a publication
+ * the deferral cut short is written again rather than trusted.
  */
 async function syncColdLaunchTokens(input: Readonly<{
   context: RuntimeContext;
@@ -337,11 +339,12 @@ async function syncColdLaunchTokens(input: Readonly<{
   verbose?: boolean;
   timings: RuntimeTimings;
   lockAcquiredAtMonotonicMs: number;
-  /** Runs before any source is read (releases the held lifecycle lock). */
+  /** Runs before the unlocked fallback (releases the held lifecycle lock). */
   beforeSourceResolution: () => void;
 }>): Promise<Readonly<{ status: number; holdSpanSpent: boolean }>> {
   const admin = (intent: RuntimeAdminIntent) => input.io.admin(intent, input.context);
   const spent = (): boolean => !launchHandoffSpanFits(input.lockAcquiredAtMonotonicMs, performance.now());
+  let reprepare = false;
   if (!spent()) {
     reportRuntimeProgress("syncing proxy-managed tokens", input.verbose);
     const status = await admin({
@@ -350,15 +353,18 @@ async function syncColdLaunchTokens(input: Readonly<{
       mode: "prepared-source-truth",
       holdDeadlineMonotonicMs: input.lockAcquiredAtMonotonicMs + LAUNCH_HANDOFF_STARTUP_SPAN_MAX_MS,
     });
-    if (status !== TOKEN_SYNC_DEFERRED_STATUS) {
+    if (status !== TOKEN_SYNC_DEFERRED_STATUS && status !== TOKEN_SYNC_REPREPARE_STATUS) {
       if (status === 0) input.timings.report("token-sync", "prepared-source-truth");
       return { status, holdSpanSpent: false };
     }
+    reprepare = status === TOKEN_SYNC_REPREPARE_STATUS;
   }
   const holdSpanSpent = spent();
-  input.timings.report("token-sync", holdSpanSpent ? "deferred hold-span" : "deferred source-truth");
+  input.timings.report("token-sync", reprepare
+    ? "deferred re-prepare"
+    : holdSpanSpent ? "deferred hold-span" : "deferred source-truth");
   input.beforeSourceResolution();
-  await input.io.prepareTokenSources?.(input.context);
+  if (reprepare) await input.io.prepareTokenSources?.(input.context);
   return { status: await syncProxyManagedTokens(admin, input.verbose), holdSpanSpent };
 }
 

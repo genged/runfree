@@ -280,13 +280,20 @@ describe("launch latency: sub-second launch plan Phase B", () => {
     expect(milliseconds(output, "runtime-validation"), describeOutput(output)).toBeGreaterThan(0);
     const sync = timing(output, "token-sync").filter((detail) => !/^[\d.]+ms$/.test(detail));
     const handoff = timing(output, "launch-handoff").at(-1);
+    const preflight = timing(output, "admission:preflight-path").at(-1);
+    // Which path ran, kept beside the run's other evidence.
+    const pathTaken = { sync: sync.at(-1), handoff, preflight };
+    if (process.env.LAUNCH_COLD_PATH_REPORT) fs.writeFileSync(process.env.LAUNCH_COLD_PATH_REPORT, `${JSON.stringify(pathTaken)}\n`);
     if (sync.includes("prepared-source-truth")) {
       expect(["minted", "skipped hold-span"], describeOutput(output)).toContain(handoff);
     } else {
-      expect(sync.some((detail) => detail === "deferred hold-span" || detail === "deferred source-truth"), describeOutput(output))
-        .toBe(true);
+      expect(sync.some((detail) => detail.startsWith("deferred ")), describeOutput(output)).toBe(true);
       expect(handoff, describeOutput(output)).toMatch(/^skipped /);
     }
+    // A minted handoff is consumed: admission relied on startup's settled
+    // reconcile under the same lock instead of reconciling again. Otherwise
+    // admission took its own lock and ran its full preflight.
+    expect(preflight, `${JSON.stringify(pathTaken)}\n${describeOutput(output)}`).toBe(handoff === "minted" ? "handoff" : "full");
     expect(sessionContainers(fixture)).toEqual([]);
     // The cold launch recorded a warm proof; the next launch is warm again.
     const warm = launchClaudeTimed(fixture);
@@ -315,6 +322,7 @@ describe("launch latency: sub-second launch plan Phase B", () => {
         tokenSync: timing(launched.output, "token-sync").filter((detail) => !/^[\d.]+ms$/.test(detail)).at(-1),
         admissionMs: admission,
         handoff: timing(launched.output, "launch-handoff").at(-1),
+        preflightPath: timing(launched.output, "admission:preflight-path").at(-1),
       });
     }
     const report = process.env.LAUNCH_COLD_REPORT;

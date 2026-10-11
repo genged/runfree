@@ -616,8 +616,9 @@ only that prepared set, inside the 8 s startup allowance counted from the
 lock's acquisition. A preparation that is missing, older than two minutes,
 incomplete, or no longer matches the sources and policy, a busy lock, a proxy
 that is not ready, a failed write, or a spent allowance makes that sync defer
-before any effect: startup releases the lock, reads the sources again, runs
-the ordinary source-truth sync, and hands nothing off. Startup then hands the
+with no removal and no receipt: startup releases the lock, runs the ordinary source-truth
+sync, and hands nothing off. Only a deferral caused by the preparation itself
+reads the sources again first; otherwise each provider still runs once. Startup then hands the
 exact held lock to the launch, in process memory and at most once, with what
 it proved under it: the proxy id and
 `StartedAt`, the registry digest, and how the project's sessions were settled.
