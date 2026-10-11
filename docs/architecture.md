@@ -333,8 +333,10 @@ surviving sessions (below) completed; a reconcile that fails or repairs residue
 removes the record instead, so a later launch cannot match a fingerprint that
 names a participant the reconcile was about to remove or a run whose restore
 never finished. The record is written only when the proxy `StartedAt` it binds
-is the one the validation observed and, when a restore ran, the one that
-restore published eligibility against; a same-id restart in between writes no
+is the one the validation observed before its topology proof (the validation
+marker lives in the proxy's writable layer, so a same-id restart keeps it),
+the one startup published eligibility against, and, when a restore ran, the
+one that restore published against; a same-id restart in between writes no
 record. No record is written while an ephemeral helper or any other
 participant that is not an ingress forwarder is attached to the internal
 network. The fingerprint (record version 2; any other version reads as absent

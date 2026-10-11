@@ -918,6 +918,13 @@ type RuntimeTokenSyncPreparation = {
   denyByDefaultObservation?: DenyByDefaultObservationV1;
   proof?: RuntimeValidationProof;
   securityProof?: RuntimeSecurityContractProof;
+  /**
+   * The proxy start observed before the topology proof and the marker write.
+   * The marker lives in the proxy's writable layer, not on tmpfs, so a
+   * same-id restart keeps it: only this start says which incarnation the
+   * validation proved. Absent when it could not be observed.
+   */
+  proxyStartedAt?: string;
   status: number;
 };
 
@@ -1119,6 +1126,12 @@ async function prepareRuntimeForTokenSyncOrRemoveInvalid(
     warn(error instanceof Error ? error.message : String(error));
     return { status: 1, failureKind: error instanceof RuntimeObservationError ? error.evidence.kind : "unclassified" };
   }
+  let validatedProxyStartedAt: string | undefined;
+  try {
+    validatedProxyStartedAt = observeProxyStartedAt(io, readinessProxyId, dockerClientEnvOptions(context));
+  } catch {
+    // Unobserved: the validation still runs, but nothing may record it as warm.
+  }
   // The host services the firewall proof judges `@host_service` against come
   // from the same effective policy generation readiness waited for. An
   // unreadable generation refuses: the proof never assumes "none".
@@ -1152,6 +1165,7 @@ async function prepareRuntimeForTokenSyncOrRemoveInvalid(
     proof: marker.proof,
     securityProof: securityValidation.proof,
     denyByDefaultObservation: validation.denyByDefaultObservation,
+    ...(validatedProxyStartedAt !== undefined ? { proxyStartedAt: validatedProxyStartedAt } : {}),
     status: 0,
   };
 }
@@ -1599,23 +1613,29 @@ export async function startRuntime(
       }
       const stable = verdict.validation;
       const identity = { projectId: activePlan.projectId, composeProject: project };
+      const skipPeers = (reason: string, error?: unknown): undefined => {
+        timings.report("validation:warm-peer", `skipped ${reason}`);
+        if (error !== undefined) {
+          reportRuntimeVerbose(verbose, `warm peer validation skipped: ${error instanceof Error ? error.message : String(error)}`);
+        }
+        return undefined;
+      };
       let hasPeers: boolean;
-      let effective: ReturnType<typeof readEffectiveControlPlaneV2>;
       try {
         hasPeers = listSessionContainerRecordsV2(activePlan.paths.stateDir, identity).length > 0;
-        effective = readEffectiveControlPlaneV2(activePlan.paths.stateDir);
       } catch (error) {
-        timings.report("validation:warm-peer", "miss:registry-unreadable");
-        reportRuntimeVerbose(verbose, `warm peer validation skipped: ${error instanceof Error ? error.message : String(error)}`);
-        return undefined;
+        return skipPeers("registry-unreadable", error);
       }
       if (!hasPeers) return { warm: stable };
       // Beside live peers the stable match is extended by an exact account of
       // every peer and participant; any miss takes the full path.
-      if (!effective) {
-        timings.report("validation:warm-peer", "miss:evidence-unreadable");
-        return undefined;
+      let effective: ReturnType<typeof readEffectiveControlPlaneV2>;
+      try {
+        effective = readEffectiveControlPlaneV2(activePlan.paths.stateDir);
+      } catch (error) {
+        return skipPeers("effective-selection-unreadable", error);
       }
+      if (!effective) return skipPeers("effective-selection-absent");
       const effectiveSelection = effective;
       const peerVerdict = timings.time("validation:warm-peer-check", () => tryWarmPeerValidation({
         stable,
@@ -1868,9 +1888,11 @@ export async function startRuntime(
         // effort.
         if (!warm && !removeExisting && reconciled?.inventoryClean && proxyStartedAt !== undefined) {
           const input = warmProofInput();
-          const recorded = restoredProxyStartedAt !== undefined && restoredProxyStartedAt !== proxyStartedAt
-            ? "the proxy restarted between the validation and the restore"
-            : input ? recordWarmRuntimeProof(input, proxyStartedAt) : "the warm-proof inputs are unavailable";
+          const recorded = validation?.proxyStartedAt !== proxyStartedAt
+            ? "the proxy restarted during the validation"
+            : restoredProxyStartedAt !== undefined && restoredProxyStartedAt !== proxyStartedAt
+              ? "the proxy restarted between the validation and the restore"
+              : input ? recordWarmRuntimeProof(input, proxyStartedAt) : "the warm-proof inputs are unavailable";
           timings.report("validation:warm-proof", recorded === "written" ? "recorded" : "not-recorded");
           if (recorded !== "written") reportRuntimeVerbose(verbose, `warm-proof record not written: ${recorded}`);
         }
