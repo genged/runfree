@@ -613,7 +613,8 @@ not release the lock between startup and admission when its credential sync
 needed no source read under it. A warm launch's receipt-gated sync reads none;
 a cold launch read every source before the lock, and its locked sync publishes
 only that prepared set, inside the 8 s startup allowance counted from the
-lock's acquisition. A preparation that is missing, older than two minutes,
+lock's acquisition. A preparation that is missing, admitted more than two
+minutes ago (the age counts from the launch's admission, not from the read),
 incomplete, or no longer matches the sources and policy, a busy lock, a proxy
 that is not ready, a failed write, or a spent allowance makes that sync defer
 with no removal and no receipt: startup releases the lock, runs the ordinary source-truth
