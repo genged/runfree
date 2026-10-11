@@ -19,7 +19,8 @@
 //     and the session container is gone afterwards;
 //   - one session's exit while its credential watcher is mid-read stops that
 //     read without touching the shared proxy credential: a peer session's
-//     value, status and watcher carry on (credential watcher cancellation).
+//     value, status, watcher, and requests to the credential's host carry on
+//     (credential watcher cancellation).
 //
 // The latency gate runs `LAUNCH_LATENCY_RUNS` (default 5) warm launches and
 // writes their timings to `LAUNCH_LATENCY_REPORT` when set. With
@@ -53,6 +54,7 @@ import {
   sessionContainers,
   timing,
 } from "./launch-timing-support.ts";
+import { answeredByUpstream, curlProbeCommand, parseProbeAnswer } from "./proxy-answer.ts";
 import { liveTierSelected } from "./tiers.ts";
 
 // The fast paths are part of the trust boundary's proof (a warm launch must
@@ -76,6 +78,7 @@ function requiredBackend(): LiveRuntimeBackend {
 // The sandbox fixture's seeded credential and its host environment source.
 const SHARED_CREDENTIAL = "sandbox-strip-probe";
 const SHARED_CREDENTIAL_ENV = "RUNFREE_SANDBOX_STRIP_TOKEN";
+const SHARED_CREDENTIAL_HOST = "raw.githubusercontent.com";
 const PEER_PROBE_SOURCE = "live-peer-probe";
 const PEER_PROBE_WAIT_MS = 120_000;
 // The watcher's provider bound (TERM, 2 s grace, KILL, 1 s join), with margin.
@@ -268,7 +271,12 @@ describe("launch latency: sub-second launch plan Phase B", () => {
 
   // Last: it rebinds the shared credential's source for its duration, which
   // would turn the warm launches above into source re-reads.
-  coreTest("one session exits while peer continues authenticated requests", async () => {
+  // No live fixture echoes a credentialed request's headers (the sandbox's
+  // credential points at raw.githubusercontent.com, which does not), so the
+  // peer's injected header itself is not observed: the case proves the value
+  // the proxy injects is unchanged and that the peer's requests to that
+  // destination are still admitted and answered upstream.
+  coreTest("one session exits mid-read while a peer's held credential and its requests to the credential's host carry on", async () => {
     const providerDir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "runfree-live-peer-probe.")));
     const provider = writePeerProbeProvider(providerDir);
     const holdMarker = path.join(fixture.projectRoot, MANAGED_HOLD_RELATIVE_PATH);
@@ -315,6 +323,9 @@ describe("launch latency: sub-second launch plan Phase B", () => {
       const status = fixture.runfree(["credential", "status", SHARED_CREDENTIAL]);
       expect(status.output, describeOutput(status.output)).toContain("last sync: ok");
       expect(dockerOrThrow("peer state", ["inspect", "-f", "{{.State.Running}}", peerContainer])).toBe("true");
+      const request = docker(["exec", peerContainer, "zsh", "-lc",
+        curlProbeCommand(`https://${SHARED_CREDENTIAL_HOST}/`, { maxTimeSeconds: 15, retries: 3 })]);
+      expect(answeredByUpstream(parseProbeAnswer(request.stdout)), `the peer's request after the exit: ${describeOutput(request.output)}`).toBe(true);
       await waitUntil(() => peerProbeReads(providerDir).filter((read) => read.event === "watch-done" && read.watcher === peerWatcher).length > peerReadsBefore ? true : undefined,
         PEER_PROBE_WAIT_MS, "the peer watcher's next read");
       expect(heldValueDigest()).toBe(digestBefore);
