@@ -88,6 +88,7 @@ import {
 } from "../session-admission-crash.ts";
 import { sessionAdmissionCrashEntryArgv } from "../../support/prebuilt-entry.ts";
 import { liveTierSelected } from "./tiers.ts";
+import { startRunfree } from "./attached-support.ts";
 import {
   createDockerSideEffectShim,
   endHeldPeers,
@@ -1453,7 +1454,11 @@ describe("a crashed session with no record falls back from the warm-empty skip",
         fireOn: "{{.ID}}",
         sideEffect: `kill -9 ${victim.run.pid} 2>/dev/null`,
       });
-      const refused = runfreeTimed({ ...fixture, env: { ...fixture.env, ...shim.env } }, ["claude"]);
+      // Launched asynchronously, not with `runfreeTimed`: the killed owner is
+      // this test process's child, and a synchronous spawn would block the
+      // event loop that reaps it. An unreaped owner stays a zombie, which
+      // `kill(pid, 0)` reports alive, so the launch would rightly see a live peer.
+      const refused = await startRunfree(fixture, ["claude"], { RUNFREE_TIMINGS: "1", ...shim.env }).completion;
       expect(shim.fired(), `the shim never saw the judgement's inventory listing: ${describeOutput(refused.output, 4000)}`).toBe(true);
       expect(timing(refused.output, "validation:warm-peer"), describeOutput(refused.output)).toContain("match");
       expect(refused.status, describeOutput(refused.output, 4000)).not.toBe(0);
