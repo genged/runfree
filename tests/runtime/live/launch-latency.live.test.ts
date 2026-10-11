@@ -14,6 +14,9 @@
 //   - a firewall changed inside the running proxy (same container, same
 //     start time) is a warm-proof mismatch, full validation refuses it and
 //     contains the proxy, and the next launch reclaims the warm path;
+//   - a cold launch either publishes the sources it read before the lock
+//     under that lock and hands it to admission, or, past the 8 s startup
+//     allowance or on a deferral, releases it before reading them again;
 //   - a normal numeric exit takes the short teardown (spec open decision 3:
 //     the exited container's inspection proves it stopped before removal),
 //     and the session container is gone afterwards;
@@ -260,6 +263,63 @@ describe("launch latency: sub-second launch plan Phase B", () => {
     expect(timing(recorded.output, "validation:warm-proof"), describeOutput(recorded.output)).toContain("recorded");
     const warm = launchClaudeTimed(fixture);
     expect(timing(warm.output, "validation:warm-proof"), describeOutput(warm.output)).toContain("match");
+  }, TEST_TIMEOUT_MS);
+
+  // A cold launch (the runtime stopped, so startup recreates it) read every
+  // source before the lock. When startup still holds the lock within its 8 s
+  // allowance, it publishes that prepared set under the lock and hands the
+  // lock to admission. Past the allowance, or when the publication defers, it
+  // releases the lock, reads the sources again, and syncs outside it. Both
+  // are correct; which one a cold launch takes depends on how long the full
+  // validation held the lock, so the case pins each path's own consistency.
+  coreTest("a cold launch hands its lock straight to admission, or releases it before reading sources again", () => {
+    const stopped = runfreeTimed(fixture, ["stop"]);
+    expect(stopped.status, describeOutput(stopped.output)).toBe(0);
+    const cold = launchClaudeTimed(fixture);
+    const output = cold.output;
+    expect(milliseconds(output, "runtime-validation"), describeOutput(output)).toBeGreaterThan(0);
+    const sync = timing(output, "token-sync").filter((detail) => !/^[\d.]+ms$/.test(detail));
+    const handoff = timing(output, "launch-handoff").at(-1);
+    if (sync.includes("prepared-source-truth")) {
+      expect(["minted", "skipped hold-span"], describeOutput(output)).toContain(handoff);
+    } else {
+      expect(sync.some((detail) => detail === "deferred hold-span" || detail === "deferred source-truth"), describeOutput(output))
+        .toBe(true);
+      expect(handoff, describeOutput(output)).toMatch(/^skipped /);
+    }
+    expect(sessionContainers(fixture)).toEqual([]);
+    // The cold launch recorded a warm proof; the next launch is warm again.
+    const warm = launchClaudeTimed(fixture);
+    expect(timing(warm.output, "validation:warm-proof"), describeOutput(warm.output)).toContain("match");
+  }, TEST_TIMEOUT_MS);
+
+  // Measurement only: how many cold launches fit the startup allowance and
+  // take the handoff, and what each path costs. An ineligible cold launch
+  // saving nothing is a valid result; the allowance is not raised for it.
+  extendedTest("cold launches: eligible and ineligible handoffs, measured in the CLI", () => {
+    const runs = Number(process.env.LAUNCH_COLD_RUNS ?? "3");
+    expect(Number.isSafeInteger(runs) && runs > 0).toBe(true);
+    const samples: Array<Record<string, number | string | undefined>> = [];
+    for (let index = 0; index < runs; index += 1) {
+      const stopped = runfreeTimed(fixture, ["stop"]);
+      expect(stopped.status, describeOutput(stopped.output)).toBe(0);
+      const startedAt = performance.now();
+      const launched = launchClaudeTimed(fixture);
+      const wallMs = performance.now() - startedAt;
+      const admission = ["admission:preflight", "admission:allocate", "admission:create-started", "admission:prove-running", "admission:activate", "admission:await-handoff"]
+        .reduce((sum, phase) => sum + (milliseconds(launched.output, phase) ?? 0), 0);
+      samples.push({
+        wallMs,
+        startupTotalMs: milliseconds(launched.output, "startup-total"),
+        tokenSyncMs: milliseconds(launched.output, "token-sync"),
+        tokenSync: timing(launched.output, "token-sync").filter((detail) => !/^[\d.]+ms$/.test(detail)).at(-1),
+        admissionMs: admission,
+        handoff: timing(launched.output, "launch-handoff").at(-1),
+      });
+    }
+    const report = process.env.LAUNCH_COLD_REPORT;
+    if (report) fs.writeFileSync(report, `${JSON.stringify({ runs, samples }, null, 2)}\n`);
+    for (const sample of samples) expect(sample.handoff).toBeDefined();
   }, TEST_TIMEOUT_MS);
 
   extendedTest("latency gate: warm launches, measured in the CLI", () => {

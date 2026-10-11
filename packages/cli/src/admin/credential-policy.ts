@@ -749,12 +749,54 @@ export function credentialStatus(input: CredentialStatusInput = {}): void {
   }
 }
 
+/**
+ * A cold launch's source-truth sync while startup still holds the lifecycle
+ * lock it will hand to admission. It reads no source: every value comes from
+ * the complete preparation made before the lock (`preparedSourceTruth`). It
+ * is bounded by the startup hold allowance, counted from the lock's original
+ * acquisition: no child process starts past it. Anything it cannot finish
+ * that way is a deferral (`TOKEN_SYNC_DEFERRED_STATUS`): startup releases the
+ * lock, prepares again, and runs the ordinary source-truth sync, which
+ * re-observes the proxy before it writes. A deferral after some writes landed
+ * records no receipt for them.
+ */
+async function preparedSourceTruthSync(verbose: boolean, holdDeadlineMonotonicMs: number | undefined): Promise<void> {
+  const defer = (message: string): void => {
+    if (verbose) console.log(`credential sync deferred to a source-truth sync: ${message}`);
+    process.exitCode = TOKEN_SYNC_DEFERRED_STATUS;
+  };
+  const remainingMs = holdDeadlineMonotonicMs === undefined || !Number.isFinite(holdDeadlineMonotonicMs)
+    ? 0
+    : holdDeadlineMonotonicMs - performance.now();
+  if (!(remainingMs > 0)) {
+    defer("the startup lock-hold allowance is spent");
+    return;
+  }
+  try {
+    const result = withAdminCallTimeout(Math.min(WARM_TOKEN_SYNC_CALL_TIMEOUT_MS, remainingMs), () => (
+      syncTokens({ exitOnFailure: true, verbose, mode: "source-truth", preparedSourceTruth: true })
+    ), Math.min(WARM_TOKEN_SYNC_TOTAL_TIMEOUT_MS, remainingMs));
+    currentAdminState().tokenResolutionReceipts = result.receipts;
+  } catch (error) {
+    // A signal-ended Docker client left its write's outcome unknown: the
+    // host's own signal ends the launch during the settle; otherwise the
+    // unlocked source-truth order re-observes and writes again.
+    if (error instanceof ChildSignaledError) await settleHostSignals();
+    else if (!(error instanceof TokenSyncDeferredError)) throw error;
+    defer(error.message);
+  }
+}
+
 export async function credentialSyncIntent(input: CredentialSyncInput): Promise<void> {
   if (!input.watch && input.quiet) die("--quiet only applies with --watch");
   if (!input.watch && !input.cacheSourceSecrets) die("--no-cache-source-secrets only applies with --watch");
   if (!input.watch && input.delayFirstSync) die("--delay-first-sync only applies with --watch");
   if (!input.watch && input.initialSourceTruth) die("--initial-source-truth only applies with --watch");
-  if (input.watch && input.mode) die("a startup-convergence sync is one-shot");
+  if (input.watch && input.mode) die(`a ${input.mode} sync is one-shot`);
+  if (input.mode === "prepared-source-truth") {
+    await preparedSourceTruthSync(input.verbose, input.holdDeadlineMonotonicMs);
+    return;
+  }
   if (input.mode === "startup-convergence") {
     // Nothing to write, delete, or prune: the sync would only observe the proxy.
     if (warmConvergenceSyncIsEmpty()) {

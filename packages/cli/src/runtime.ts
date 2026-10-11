@@ -779,7 +779,9 @@ async function dispatchRuntimeAdmin(intent: RuntimeAdminIntent, context: Runtime
         quiet: false,
         delayFirstSync: false,
         cacheSourceSecrets: true,
-        ...(intent.mode ? { mode: intent.mode } : {}),
+        ...(intent.mode === "prepared-source-truth"
+          ? { mode: intent.mode, holdDeadlineMonotonicMs: intent.holdDeadlineMonotonicMs }
+          : intent.mode ? { mode: intent.mode } : {}),
       });
       return;
     case "prepare": {

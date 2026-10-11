@@ -608,10 +608,18 @@ The foreground admission driver requires a `SessionLockManager`; it has no
 raw-lock or optional lock-lease input that can retain the project lock across
 the attached wait ([driver](../packages/cli/src/runtime/session-admission-driver.ts)).
 
-A warm `claude`, `codex`, `pi`, `shell`, or `mcp auth` launch does not release
-the lock between startup and admission. When its credential sync needed no
-source read, startup hands the exact held lock to the launch, in process
-memory and at most once, with what it proved under it: the proxy id and
+A `claude`, `codex`, `pi`, `shell`, or `mcp auth` launch, warm or cold, does
+not release the lock between startup and admission when its credential sync
+needed no source read under it. A warm launch's receipt-gated sync reads none;
+a cold launch read every source before the lock, and its locked sync publishes
+only that prepared set, inside the 8 s startup allowance counted from the
+lock's acquisition. A preparation that is missing, older than two minutes,
+incomplete, or no longer matches the sources and policy, a busy lock, a proxy
+that is not ready, a failed write, or a spent allowance makes that sync defer
+before any effect: startup releases the lock, reads the sources again, runs
+the ordinary source-truth sync, and hands nothing off. Startup then hands the
+exact held lock to the launch, in process memory and at most once, with what
+it proved under it: the proxy id and
 `StartedAt`, the registry digest, and how the project's sessions were settled.
 That is either the startup reconcile's result (whether it saw only settled
 state, and the addresses the proxy's session files reserved) or a warm-empty
@@ -1785,7 +1793,9 @@ Supported source types include:
 The host CLI records the source and syncs resolved values into proxy-only token state. The proxy strips conflicting inbound credential headers and injects configured headers only for matching hosts and optional path prefixes. OAuth-backed services expose agent-visible handles, while token material remains mediated by the proxy.
 
 `runfree up`, a cold start, and a replaced proxy read every source before the
-lifecycle lock (source-truth). A warm session launch reuses what the proxy
+lifecycle lock (source-truth). A cold session launch then publishes those
+values under the lock it hands to admission, reading nothing there and keeping
+each receipt's age from the read before the lock. A warm session launch reuses what the proxy
 already holds: it skips re-reading a source only when a host receipt matches
 the source's fingerprint and the live token-store generation, the proxy holds
 the value, the last read is under 15 minutes old, and the source's refresh

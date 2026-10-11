@@ -1,5 +1,5 @@
 import { LIFECYCLE_OPERATION_BUDGET_MS, withLifecycleOperationBudget } from "./lifecycle-operation-budget.ts";
-import { launchHandoffSpanFits } from "./launch-lock-hold.ts";
+import { LAUNCH_HANDOFF_STARTUP_SPAN_MAX_MS, launchHandoffSpanFits } from "./launch-lock-hold.ts";
 import { captureRebindTrustReceipt } from "./rebind-trust-receipt.ts";
 import { isDeepStrictEqual } from "node:util";
 import { readConfig } from "../config.ts";
@@ -237,6 +237,12 @@ class LaunchHandoffSpanExceededError extends Error {
 }
 
 type LaunchHandoffRequest = Readonly<{
+  /**
+   * When startup took the lock it would hand off, on the `performance.now()`
+   * clock. The startup hold allowance is counted from here, through the
+   * credential sync and the handoff, never from a later step.
+   */
+  lockAcquiredAtMonotonicMs: number;
   build: () => LaunchHandoff;
   /** Releases the lock before a deferred sync reads a source. */
   releaseLock: () => void;
@@ -311,6 +317,49 @@ async function syncWarmLaunchTokens(input: Readonly<{
   input.beforeSourceResolution?.();
   await input.io.prepareTokenSources?.(input.context);
   return { status: await syncProxyManagedTokens(admin, input.verbose), freshness: "source-truth" };
+}
+
+/**
+ * A cold launch's credential sync while startup holds the lock it hands to
+ * admission. Every source was read before the lock (a source-truth
+ * preparation), so the `prepared-source-truth` sync publishes that set and
+ * reads nothing, inside the startup hold allowance counted from the lock's
+ * original acquisition. When it defers — an allowance already spent, an
+ * expired, incomplete or rebound preparation, a busy lock, a runtime that is
+ * not ready, a failed write — the lock is released before any source is read,
+ * the sources are prepared again, and the ordinary source-truth sync runs.
+ * That sync re-observes the proxy, so a publication the deferral cut short is
+ * written again rather than trusted.
+ */
+async function syncColdLaunchTokens(input: Readonly<{
+  context: RuntimeContext;
+  io: RuntimeIO;
+  verbose?: boolean;
+  timings: RuntimeTimings;
+  lockAcquiredAtMonotonicMs: number;
+  /** Runs before any source is read (releases the held lifecycle lock). */
+  beforeSourceResolution: () => void;
+}>): Promise<Readonly<{ status: number; holdSpanSpent: boolean }>> {
+  const admin = (intent: RuntimeAdminIntent) => input.io.admin(intent, input.context);
+  const spent = (): boolean => !launchHandoffSpanFits(input.lockAcquiredAtMonotonicMs, performance.now());
+  if (!spent()) {
+    reportRuntimeProgress("syncing proxy-managed tokens", input.verbose);
+    const status = await admin({
+      kind: "token-sync",
+      verbose: Boolean(input.verbose),
+      mode: "prepared-source-truth",
+      holdDeadlineMonotonicMs: input.lockAcquiredAtMonotonicMs + LAUNCH_HANDOFF_STARTUP_SPAN_MAX_MS,
+    });
+    if (status !== TOKEN_SYNC_DEFERRED_STATUS) {
+      if (status === 0) input.timings.report("token-sync", "prepared-source-truth");
+      return { status, holdSpanSpent: false };
+    }
+  }
+  const holdSpanSpent = spent();
+  input.timings.report("token-sync", holdSpanSpent ? "deferred hold-span" : "deferred source-truth");
+  input.beforeSourceResolution();
+  await input.io.prepareTokenSources?.(input.context);
+  return { status: await syncProxyManagedTokens(admin, input.verbose), holdSpanSpent };
 }
 
 async function finalizeValidatedRuntime(
@@ -390,16 +439,33 @@ async function finalizeValidatedRuntime(
   }
   let credentialFreshness: "source-truth" | "receipt-gated" = "source-truth";
   // A held-lock handoff (sub-second launch plan Task 3) keeps the lifecycle
-  // lock through the receipt-gated sync, which resolves no source; a deferral
-  // releases it before any source is read, and then there is no handoff.
-  const holdLockThroughSync = launchHandoff !== undefined && credentialMode === "receipt-gated";
+  // lock through a sync that resolves no source: the receipt-gated warm sync,
+  // or a cold launch's sync of the sources it read before the lock. A
+  // preparation that skipped held tokens cannot feed a source-truth sync, so
+  // that launch releases the lock first. A deferral releases it before any
+  // source is read, and then there is no handoff.
+  const holdLockThroughSync = launchHandoff !== undefined
+    && (credentialMode === "receipt-gated" || !preparedReceiptGated);
   let lockReleasedForSync = !holdLockThroughSync;
+  let holdSpanSpent = false;
   const runCredentialSync = holdLockThroughSync
     ? (work: () => Promise<number>) => work()
     : withCredentialResolution;
   const tokenSync = await timings.timeAsync(
     "token-sync",
     () => runCredentialSync(async () => {
+      if (credentialMode !== "receipt-gated" && holdLockThroughSync) {
+        const cold = await syncColdLaunchTokens({
+          context: activeContext,
+          io,
+          verbose,
+          timings,
+          lockAcquiredAtMonotonicMs: launchHandoff.lockAcquiredAtMonotonicMs,
+          beforeSourceResolution: () => { lockReleasedForSync = true; launchHandoff.releaseLock(); },
+        });
+        holdSpanSpent = cold.holdSpanSpent;
+        return cold.status;
+      }
       if (credentialMode !== "receipt-gated") {
         // A proxy replaced after a receipt-gated preparation needs every
         // source: re-read them, outside the lock, before the sync.
@@ -435,7 +501,12 @@ async function finalizeValidatedRuntime(
       reportRuntimeVerbose(verbose, `launch handoff not minted: ${error instanceof Error ? error.message : String(error)}`);
     }
   } else if (launchHandoff) {
-    timings.report("launch-handoff", lockReleasedForSync ? "skipped token-resolution" : "skipped");
+    // A sync that outlasted the startup allowance: the launch frame yields to
+    // a waiting command before it takes its own lock.
+    if (holdSpanSpent && tokenSync === 0) markLaunchHandoffDeclined(preparedRuntime);
+    timings.report("launch-handoff", holdSpanSpent
+      ? "skipped hold-span"
+      : lockReleasedForSync ? "skipped token-resolution" : "skipped");
   }
   const tokenResolutionReceipts = tokenSync === 0 ? io.takeTokenResolutionReceipts?.() ?? [] : [];
   if (tokenSync === 0) reportRuntimeProgress("runtime startup complete", verbose);
@@ -1908,6 +1979,7 @@ export async function startRuntime(
         && rebuildOptions.launch === true && !removeExisting && handoffLock !== undefined
         && proxyStartedAt !== undefined && (reconciled !== undefined || warmEmpty !== undefined)
         ? {
+            lockAcquiredAtMonotonicMs,
             build: () => {
               heldLifecycleLock.assertHeld();
               if (lifecycleLock !== handoffLock) throw new Error("the startup lock was replaced before the handoff");

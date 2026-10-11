@@ -1503,6 +1503,7 @@ function runtimeIntentToArgs(intent: RuntimeAdminIntent): string[] {
         "sync",
         ...(intent.verbose ? ["--verbose"] : []),
         ...(intent.mode ? [`--${intent.mode}`] : []),
+        ...(intent.mode === "prepared-source-truth" ? [`--hold-deadline-ms=${intent.holdDeadlineMonotonicMs}`] : []),
       ];
     case "prepare-token-sources":
       return intent.mode ? ["prepare-token-sources", `--${intent.mode}`] : ["prepare-token-sources"];
@@ -4496,20 +4497,218 @@ describe("runtime command flow", () => {
       expect(lockIsFree(context)).toBe(true);
     });
 
-    test("runfree up, a cold launch, and a launch that did not ask never hand off", async () => {
+    test("runfree up and a launch that did not ask never hand off", async () => {
       const context = launchContext();
       const io = createRuntimeIO();
-      const cold = await startRuntime(context, io, false, { launch: true, launchHandoff: true });
-      if (cold.kind !== "ready") throw new Error("cold launch failed");
-      expect(takeLaunchHandoff(cold.preparedRuntime)).toBeUndefined();
-      expect(lockIsFree(context)).toBe(true);
       const upResult = await startRuntime(context, io, false, { launchHandoff: true });
       if (upResult.kind !== "ready") throw new Error("up failed");
       expect(takeLaunchHandoff(upResult.preparedRuntime)).toBeUndefined();
+      expect(lockIsFree(context)).toBe(true);
       const unasked = await startRuntime(context, io, false, { launch: true });
       if (unasked.kind !== "ready") throw new Error("launch failed");
       expect(takeLaunchHandoff(unasked.preparedRuntime)).toBeUndefined();
       expect(lockIsFree(context)).toBe(true);
+    });
+
+    describe("cold launch handoff", () => {
+      const tokenSyncCalls = (calls: readonly RuntimeIoCall[]): string[][] => calls
+        .filter((call) => call.method === "admin" && call.args[0] === "token")
+        .map((call) => call.args.filter((arg) => !arg.startsWith("--hold-deadline-ms=")));
+      const holdDeadlines = (calls: readonly RuntimeIoCall[]): number[] => calls
+        .filter((call) => call.method === "admin" && call.args[0] === "token")
+        .flatMap((call) => call.args.filter((arg) => arg.startsWith("--hold-deadline-ms=")))
+        .map((arg) => Number(arg.slice("--hold-deadline-ms=".length)));
+      const syncTimings = (): string[] => vi.mocked(console.error).mock.calls.flat().map(String)
+        .filter((line) => line.includes("timing: token-sync ") || line.includes("timing: launch-handoff "))
+        .filter((line) => !/timing: token-sync [\d.]+ms$/.test(line))
+        .map((line) => line.slice(line.indexOf("timing: ")));
+
+      test("eligible cold path takes one lifecycle lock", async () => {
+        const context = launchContext();
+        const lockFreeAtPrepare: boolean[] = [];
+        const lockFreeAtSync: boolean[] = [];
+        const io = createRuntimeIO({
+          admin: async (args) => {
+            if (args[0] === "token") lockFreeAtSync.push(lockIsFree(context));
+            return 0;
+          },
+        });
+        io.prepareTokenSources = async (prepareContext) => {
+          if (prepareContext.projectRoot === context.projectRoot) lockFreeAtPrepare.push(lockIsFree(context));
+        };
+        const before = performance.now();
+        const cold = await startRuntime(timed(context), io, false, { launch: true, launchHandoff: true });
+        if (cold.kind !== "ready") throw new Error("cold launch failed");
+        const handoff = takeLaunchHandoff(cold.preparedRuntime);
+        try {
+          // Every source was read before the lock, once; the sync ran under
+          // the lock and read none; the lock was never released in between.
+          expect(lockFreeAtPrepare).toEqual([true]);
+          expect(tokenSyncCalls(io.calls)).toEqual([["token", "sync", "--prepared-source-truth"]]);
+          expect(lockFreeAtSync).toEqual([false]);
+          expect(lockIsFree(context)).toBe(false);
+          expect(handoff?.sessionState.kind).toBe("reconciled");
+          expect(handoff?.proxy.id).toBe(FAKE_PROXY_CONTAINER_ID);
+          expect(handoff?.lockOwnerToken).toBe(handoff?.lifecycleLock.ownerToken);
+          // The sync's allowance ends where the handoff's span does, both
+          // counted from the one acquisition.
+          expect(handoff?.lockAcquiredAtMonotonicMs).toBeGreaterThanOrEqual(before);
+          expect(holdDeadlines(io.calls)).toEqual([(handoff?.lockAcquiredAtMonotonicMs ?? Number.NaN) + LAUNCH_HANDOFF_STARTUP_SPAN_MAX_MS]);
+          expect(cold.credentialFreshness).toBe("source-truth");
+          expect(takeLaunchHandoffDeclined(cold.preparedRuntime)).toBe(false);
+          expect(syncTimings()).toEqual(expect.arrayContaining([
+            "timing: token-sync prepared-source-truth",
+            "timing: launch-handoff minted",
+          ]));
+        } finally {
+          handoff?.lifecycleLock.release();
+        }
+        expect(lockIsFree(context)).toBe(true);
+      });
+
+      test("8s boundary uses original clock", async () => {
+        const context = launchContext();
+        const realNow = performance.now.bind(performance);
+        let skew = 0;
+        const clock = vi.spyOn(performance, "now").mockImplementation(() => realNow() + skew);
+        try {
+          // Time spent after the lock was taken counts: past the allowance,
+          // nothing is dispatched under the lock, the lock is released before
+          // the sources are read again, and the frame is told to yield.
+          let skewed = false;
+          const lockFreeAtPrepare: boolean[] = [];
+          const late = createRuntimeIO({
+            capture: (command) => {
+              if (!skewed && command === "docker" && !lockIsFree(context)) {
+                skewed = true;
+                skew += LAUNCH_HANDOFF_STARTUP_SPAN_MAX_MS + 1;
+              }
+              return undefined;
+            },
+          });
+          late.prepareTokenSources = async () => { lockFreeAtPrepare.push(lockIsFree(context)); };
+          const spent = await startRuntime(timed(context), late, false, { launch: true, launchHandoff: true });
+          if (spent.kind !== "ready") throw new Error(`launch failed: ${pendingWarningsForTest().map((event) => event.message).join(" | ")}`);
+          expect(skewed).toBe(true);
+          expect(takeLaunchHandoff(spent.preparedRuntime)).toBeUndefined();
+          expect(takeLaunchHandoffDeclined(spent.preparedRuntime)).toBe(true);
+          expect(tokenSyncCalls(late.calls)).toEqual([["token", "sync"]]);
+          expect(lockFreeAtPrepare.at(-1)).toBe(true);
+          expect(lockIsFree(context)).toBe(true);
+          expect(syncTimings()).toEqual(expect.arrayContaining([
+            "timing: token-sync deferred hold-span",
+            "timing: launch-handoff skipped hold-span",
+          ]));
+        } finally {
+          clock.mockRestore();
+        }
+      });
+
+      test("a slow provider before the lock spends none of the startup allowance", async () => {
+        const context = launchContext();
+        const realNow = performance.now.bind(performance);
+        let skew = 0;
+        const clock = vi.spyOn(performance, "now").mockImplementation(() => realNow() + skew);
+        try {
+          const io = createRuntimeIO();
+          io.prepareTokenSources = async () => { skew += 2 * LAUNCH_HANDOFF_STARTUP_SPAN_MAX_MS; };
+          const cold = await startRuntime(context, io, false, { launch: true, launchHandoff: true });
+          if (cold.kind !== "ready") throw new Error("cold launch failed");
+          const handoff = takeLaunchHandoff(cold.preparedRuntime);
+          expect(handoff).toBeDefined();
+          expect(tokenSyncCalls(io.calls)).toEqual([["token", "sync", "--prepared-source-truth"]]);
+          handoff?.lifecycleLock.release();
+        } finally {
+          clock.mockRestore();
+        }
+      });
+
+      test("expired or incomplete prepared set defers before effects", async () => {
+        const context = launchContext();
+        const lockFreeAtPrepare: boolean[] = [];
+        // The sync reports the preparation unusable (expired, incomplete,
+        // rebound): a deferral, before any effect.
+        const io = createRuntimeIO({
+          admin: async (args) => (args.includes("--prepared-source-truth") ? TOKEN_SYNC_DEFERRED_STATUS : 0),
+        });
+        io.prepareTokenSources = async (prepareContext) => {
+          if (prepareContext.projectRoot === context.projectRoot) lockFreeAtPrepare.push(lockIsFree(context));
+        };
+        const cold = await startRuntime(context, io, false, { launch: true, launchHandoff: true });
+        if (cold.kind !== "ready") throw new Error("cold launch failed");
+        // The fallback succeeded: released, prepared again outside the lock,
+        // then the ordinary source-truth sync.
+        expect(tokenSyncCalls(io.calls)).toEqual([["token", "sync", "--prepared-source-truth"], ["token", "sync"]]);
+        expect(lockFreeAtPrepare).toEqual([true, true]);
+        expect(takeLaunchHandoff(cold.preparedRuntime)).toBeUndefined();
+        expect(takeLaunchHandoffDeclined(cold.preparedRuntime)).toBe(false);
+        expect(cold.credentialFreshness).toBe("source-truth");
+        expect(lockIsFree(context)).toBe(true);
+      });
+
+      test("a receipt-gated preparation never feeds a held-lock source-truth sync", async () => {
+        const context = launchContext();
+        const prepares: Array<Readonly<{ mode?: string }> | undefined> = [];
+        let replaceFirstProxyObservation = false;
+        const io = createRuntimeIO({
+          capture: (command, args) => {
+            if (!replaceFirstProxyObservation || command !== "docker" || args[0] !== "ps" || args[1] !== "--quiet") return undefined;
+            if (!args.includes("label=com.docker.compose.service=proxy")) return undefined;
+            replaceFirstProxyObservation = false;
+            return captureResult(0, `${"9".repeat(64)}\n`);
+          },
+        });
+        io.prepareTokenSources = async (_context, options) => { prepares.push(options); };
+        expect((await startRuntime(context, io, false, { launch: true })).status).toBe(0);
+        const start = io.calls.length;
+        prepares.length = 0;
+        replaceFirstProxyObservation = true;
+        const launched = await startRuntime(context, io, false, { launch: true, launchHandoff: true });
+        if (launched.kind !== "ready") throw new Error("launch failed");
+        // The warm preparation skipped held tokens: the lock is released
+        // before every source is read again, and nothing is handed off.
+        expect(tokenSyncCalls(io.calls.slice(start))).toEqual([["token", "sync"]]);
+        expect(prepares).toEqual([{ mode: "convergence" }, undefined]);
+        expect(takeLaunchHandoff(launched.preparedRuntime)).toBeUndefined();
+        expect(lockIsFree(context)).toBe(true);
+      });
+
+      test("a refused held-lock sync releases the lock, and a retry hands off", async () => {
+        const context = launchContext();
+        let refuse = true;
+        const io = createRuntimeIO({
+          // The sync refused (a same-ID proxy restart behind the write fence).
+          admin: async (args) => (refuse && args.includes("--prepared-source-truth") ? 1 : 0),
+        });
+        const refused = await startRuntime(context, io, false, { launch: true, launchHandoff: true });
+        expect(refused.kind).toBe("failed");
+        expect(lockIsFree(context)).toBe(true);
+        refuse = false;
+        const retried = await startRuntime(context, io, false, { launch: true, launchHandoff: true });
+        if (retried.kind !== "ready") throw new Error("retry failed");
+        const handoff = takeLaunchHandoff(retried.preparedRuntime);
+        expect(handoff).toBeDefined();
+        handoff?.lifecycleLock.release();
+      });
+
+      test("resume retains its recovery-claim ordering", async () => {
+        const context = launchContext();
+        const lockFreeAtSync: boolean[] = [];
+        const io = createRuntimeIO({
+          admin: async (args) => {
+            if (args[0] === "token") lockFreeAtSync.push(lockIsFree(context));
+            return 0;
+          },
+        });
+        // `runfree resume` starts the runtime without asking for a handoff:
+        // its recovery claim takes the lifecycle lock itself, after startup.
+        const resumed = await startRuntime(context, io, false, { launch: true });
+        if (resumed.kind !== "ready") throw new Error("resume start failed");
+        expect(tokenSyncCalls(io.calls)).toEqual([["token", "sync"]]);
+        expect(lockFreeAtSync).toEqual([true]);
+        expect(takeLaunchHandoff(resumed.preparedRuntime)).toBeUndefined();
+        expect(lockIsFree(context)).toBe(true);
+      });
     });
 
     test("a deferred token sync releases the lock before reading sources and hands nothing off", async () => {

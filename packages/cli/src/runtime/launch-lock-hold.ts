@@ -41,7 +41,9 @@ export const SESSION_CALLBACK_SETUP_BUDGET_MS = 12_000;
  * The longest startup may already have held the lock when it hands the lock
  * to admission (sub-second launch plan Task 3). Past it, startup releases the
  * lock and admission takes its own, so admission's own bounded steps still
- * fit the budget.
+ * fit the budget. A cold launch's credential publication under the held lock
+ * is bounded by the same span, counted from the same acquisition: no child
+ * process starts past it.
  */
 export const LAUNCH_HANDOFF_STARTUP_SPAN_MAX_MS =
   LAUNCH_LOCK_HOLD_BUDGET_MS - RUNNING_PROOF_TIMEOUT_MS - SESSION_CALLBACK_SETUP_BUDGET_MS;

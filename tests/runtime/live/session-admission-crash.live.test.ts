@@ -1396,6 +1396,32 @@ describe("a crashed session with no record falls back from the warm-empty skip",
     expect(timing(warm.output, "startup:warm-empty"), describeOutput(warm.output)).toContain("empty");
   }, TEST_TIMEOUT_MS);
 
+  // A cold launch (the runtime stopped first) may hand its startup lock
+  // straight to admission. Its owner killed once the session runs leaves no
+  // authority behind: the next launch reclaims the lock, reconciles the dead
+  // owner's session away, and is admitted.
+  coreTest("a cold launch's owner killed after admission leaves no authority, and the next launch recovers", async () => {
+    let peers: HeldPeer[] = [];
+    try {
+      const stopped = runfreeTimed(fixture, ["stop"]);
+      expect(stopped.status, describeOutput(stopped.output, 4000)).toBe(0);
+      peers = await startHeldPeers(fixture, 1, { RUNFREE_TIMINGS: "1" });
+      const [victim] = peers as [HeldPeer];
+      if (victim.run.pid === undefined) throw new Error("the cold launch's owner has no pid");
+      victim.run.cancel();
+      await victim.run.completion;
+      releaseHoldMarker(fixture);
+      const recovered = runfreeTimed(fixture, ["claude"]);
+      expect(recovered.status, describeOutput(recovered.output, 4000)).toBe(0);
+      expect(listSessionContainerRecordsV2(stateDir, expectedProject)).toEqual([]);
+      expect(sessionContainers(fixture)).not.toContain(victim.container);
+    } finally {
+      releaseHoldMarker(fixture);
+      await endHeldPeers(peers);
+      await forceCleanSessions(fixture);
+    }
+  }, TEST_TIMEOUT_MS);
+
   // A peer's owner killed while another launch judges that peer. The kill is
   // ordered by a Docker shim armed on the warm proof's root batch and fired on
   // the judgement's host-wide inventory listing (`--format {{.ID}}`), so the
