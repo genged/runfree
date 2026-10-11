@@ -51,6 +51,11 @@ export const SESSION_ADMISSION_MATRIX_ENTRY_SOURCE = path.join(repoRoot, "tests"
 export const SESSION_ADMISSION_CRASH_BUNDLE_PATH = path.join(path.dirname(CLI_BUNDLE_PATH), "session-admission-crash.mjs");
 export const SESSION_ADMISSION_MATRIX_BUNDLE_PATH = path.join(path.dirname(CLI_BUNDLE_PATH), "session-admission-matrix.mjs");
 
+// The credential watcher cancellation harness (scripts/credential-watch.test-harness.ts)
+// imports the CLI's admin and runtime modules, so it sits beside the CLI bundle too.
+export const CREDENTIAL_WATCH_HARNESS_ENTRY_SOURCE = path.join(repoRoot, "scripts", "credential-watch.test-harness.ts");
+export const CREDENTIAL_WATCH_HARNESS_BUNDLE_PATH = path.join(path.dirname(CLI_BUNDLE_PATH), "credential-watch-harness.mjs");
+
 function entryArgv(bundlePath: string, sourcePath: string): readonly string[] {
   return fs.existsSync(bundlePath)
     ? ["--enable-source-maps", bundlePath]
@@ -65,6 +70,11 @@ export function cliEntryArgv(): readonly string[] {
 /** Node argv (before server arguments) that runs the proxy server under test. */
 export function proxyServerEntryArgv(): readonly string[] {
   return entryArgv(PROXY_SERVER_BUNDLE_PATH, PROXY_SERVER_ENTRY_SOURCE);
+}
+
+/** Node argv (before harness arguments) that runs the credential watcher cancellation harness. */
+export function credentialWatchHarnessEntryArgv(): readonly string[] {
+  return entryArgv(CREDENTIAL_WATCH_HARNESS_BUNDLE_PATH, CREDENTIAL_WATCH_HARNESS_ENTRY_SOURCE);
 }
 
 /** Node argv (before runner arguments) that runs the live crash/launch runner. */

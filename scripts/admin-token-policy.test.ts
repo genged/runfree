@@ -60,7 +60,7 @@ import {
 } from "../packages/cli/src/admin/admin-core.ts";
 import { TOKEN_SYNC_DEFERRED_STATUS } from "../packages/cli/src/runtime/constants.ts";
 import { flushWarnings } from "../packages/cli/src/warnings.ts";
-import { cliEntryArgv } from "../tests/support/prebuilt-entry.ts";
+import { cliEntryArgv, credentialWatchHarnessEntryArgv } from "../tests/support/prebuilt-entry.ts";
 import type { CredentialWatchHarnessConfig } from "./credential-watch.test-harness.ts";
 
 const repoRoot = path.resolve(new URL("..", import.meta.url).pathname);
@@ -4455,15 +4455,18 @@ describe("credential writes against a moving proxy replacement", () => {
 // signals. Docker is the same in-process fake as the rest of this file, reached
 // from the watcher through a small executable bridge on a Unix socket.
 //
-// `test.fails` marks a reproduction of the current defect; T03 of the startup
-// top-ten plan flips each to `test`. The plain tests pin behavior that must
-// not change: genuine failures while the parent is alive.
+// `reproduction` (a `test.fails`) marks a reproduction of the current
+// defect; the fix flips each to `test`. Until then a harness failure would
+// also count as the expected failure, so each reproduction marks the point
+// where its effect assertion runs, and the last test of the block fails if a
+// reproduction that started never got there. The plain tests pin behavior
+// that must not change: genuine failures while the parent is alive.
 describe("credential watcher cancellation (F08)", () => {
   // Measured from the cancelling event: the watcher and every provider
   // process it started are gone, and nothing it does afterwards reaches the
   // proxy. Covers a TERM grace, a KILL, and the join (design addendum).
   const CANCELLATION_BOUND_MS = 8_000;
-  const HARNESS_ENTRY = path.join(repoRoot, "scripts", "credential-watch.test-harness.ts");
+  const harnessArgv = credentialWatchHarnessEntryArgv();
   const syncInput = { verbose: false, watch: false, quiet: false, delayFirstSync: false, cacheSourceSecrets: true } as const;
 
   type ProviderEvent = { kind: "start" | "end"; pid: number; ppid?: number; sub: string; item: string; status?: number };
@@ -4472,25 +4475,56 @@ describe("credential watcher cancellation (F08)", () => {
 
   let bridge: net.Server | undefined;
   let releaseHeldWrites: (() => void) | undefined;
-  const ownedPids = new Set<number>();
-  let providerDirs: string[] = [];
+  // Reproduction name -> whether it reached its effect assertion.
+  const reproductionProgress = new Map<string, boolean>();
+
+  function reproduction(name: string, body: () => Promise<void>): void {
+    test.fails(name, async () => {
+      reproductionProgress.set(expect.getState().currentTestName ?? name, false);
+      await body();
+    }, 60_000);
+  }
+
+  function reached(): void {
+    const name = expect.getState().currentTestName;
+    if (name !== undefined) reproductionProgress.set(name, true);
+  }
+
+  // Kills only processes this test can prove it owns, from a fresh listing:
+  // every harness, provider and bridge process carries this test's unique
+  // temporary directory in its argv, and their descendants (a provider's
+  // `sleep`) are found through the parent links of that same listing. A PID
+  // remembered from earlier is never signalled: it may have been reused.
+  function killOwnedProcesses(): void {
+    const listing = childProcess.spawnSync("ps", ["-A", "-ww", "-o", "pid=", "-o", "ppid=", "-o", "args="], { encoding: "utf8" });
+    if (listing.status !== 0) return;
+    const rows = listing.stdout.split("\n").flatMap((line) => {
+      const match = /^\s*(\d+)\s+(\d+)\s+(.*)$/.exec(line);
+      return match ? [{ pid: Number(match[1]), ppid: Number(match[2]), args: match[3] }] : [];
+    }).filter((row) => row.pid !== process.pid && row.pid !== listing.pid);
+    const owned = new Set(rows.filter((row) => row.args.includes(tmpBase)).map((row) => row.pid));
+    for (let grew = true; grew;) {
+      grew = false;
+      for (const row of rows) {
+        if (!owned.has(row.pid) && owned.has(row.ppid)) {
+          owned.add(row.pid);
+          grew = true;
+        }
+      }
+    }
+    for (const pid of owned) {
+      try {
+        process.kill(pid, "SIGKILL");
+      } catch {
+        // Exited since the listing.
+      }
+    }
+  }
 
   afterEach(async () => {
     releaseHeldWrites?.();
     releaseHeldWrites = undefined;
-    const pids = new Set(ownedPids);
-    for (const dir of providerDirs) {
-      for (const event of readProviderEvents(dir)) pids.add(event.pid);
-    }
-    for (const pid of pids) {
-      try {
-        process.kill(pid, "SIGKILL");
-      } catch {
-        // Already gone.
-      }
-    }
-    ownedPids.clear();
-    providerDirs = [];
+    killOwnedProcesses();
     await new Promise<void>((resolve) => {
       if (!bridge) return resolve();
       bridge.close(() => resolve());
@@ -4518,7 +4552,6 @@ describe("credential watcher cancellation (F08)", () => {
     const dir = fs.mkdtempSync(path.join(tmpBase, `${name}-provider-`));
     const bin = path.join(dir, "bin");
     fs.mkdirSync(bin);
-    providerDirs.push(dir);
     const script = [
       "#!/bin/sh",
       `dir='${dir}'`,
@@ -4533,13 +4566,15 @@ describe("credential watcher cancellation (F08)", () => {
       "status=0",
       "case \"$mode\" in",
       "  ok) echo \"dummy-$item-value\" ;;",
-      // Dies with the process group's SIGTERM, or with spawnSync's timeout kill.
-      "  hang) exec sleep 30 ;;",
+      // Dies with the process group's SIGTERM, or with spawnSync's timeout kill
+      // (an orphaned `sleep 1` holds the output pipe for at most a second).
+      "  hang) while :; do sleep 1; done ;;",
       // A provider that ignores SIGTERM (inherited by its `sleep`), then fails
       // with empty stderr: the shape the classifier calls definitive.
-      "  ignore-term-fail) trap '' TERM; sleep 15; status=1 ;;",
+      // Outlives the cancellation bound by a margin.
+      "  ignore-term-fail) trap '' TERM; sleep 10; status=1 ;;",
       // Not signaled (a crashed parent signals nobody): fails later.
-      "  slow-fail) sleep 4; status=1 ;;",
+      "  slow-fail) sleep 2; status=1 ;;",
       "  fail-empty) status=1 ;;",
       "  fail-unmatched) echo 'not a field secret reference' >&2; status=1 ;;",
       // The provider's own signal, with the parent alive.
@@ -4666,51 +4701,42 @@ describe("credential watcher cancellation (F08)", () => {
     env: NodeJS.ProcessEnv,
   ): Promise<WatchParent> {
     const configPath = writeHarnessConfig(config);
-    const child = childProcess.spawn(process.execPath, ["--import", "tsx", HARNESS_ENTRY, "parent", configPath], {
+    const child = childProcess.spawn(process.execPath, [...harnessArgv, "parent", configPath], {
       cwd: repoRoot,
       env,
       stdio: ["pipe", "pipe", "pipe"],
     });
-    if (child.pid !== undefined) ownedPids.add(child.pid);
     let stderr = "";
     child.stderr?.on("data", (chunk) => {
       stderr += String(chunk);
     });
-    const watcherPid = await new Promise<number>((resolve, reject) => {
-      let stdout = "";
-      const timeout = setTimeout(() => reject(new Error(`watch parent did not start: ${stdout} ${stderr}`)), 30_000);
-      child.on("exit", (code) => reject(new Error(`watch parent exited ${code}: ${stderr}`)));
-      child.stdout?.on("data", (chunk) => {
-        stdout += String(chunk);
-        const match = /parent-ready (\d+)/.exec(stdout);
-        if (match) {
-          clearTimeout(timeout);
-          resolve(Number(match[1]));
-        }
-      });
-    });
-    expect(watcherPid).toBeGreaterThan(0);
-    ownedPids.add(watcherPid);
+    child.on("error", () => {});
+    const watcherPid = await waitForWatcherPid(configPath, () => `watch parent: ${stderr}`);
     return { child, configPath, watcherPid, send: (command) => child.stdin?.write(`${command}\n`) };
   }
 
-  // The manual `runfree credential sync --watch` shape: no parent, no
-  // lifetime pipe, no startup flags, a process group of its own (a terminal's
-  // foreground job).
-  function startManualWatch(env: NodeJS.ProcessEnv): number {
-    const watchEnv: NodeJS.ProcessEnv = {
-      ...env,
-      RUNFREE_CREDENTIAL_WATCH_HARNESS_CONFIG: writeHarnessConfig({ launch: "plan", initialSourceTruth: false }),
-    };
-    delete watchEnv.RUNFREE_TOKEN_SYNC_LIFETIME_FD;
-    delete watchEnv.RUNFREE_TOKEN_SYNC_WATCH_PARENT_PID;
+  // The harness writes the watcher's own PID before it does anything else.
+  async function waitForWatcherPid(configPath: string, diagnostics: () => string): Promise<number> {
+    const pidPath = `${configPath}.pid`;
+    if (!(await waitUntil(() => fs.existsSync(pidPath) && /^\d+\n$/.test(fs.readFileSync(pidPath, "utf8")), 30_000))) {
+      throw new Error(`harness watcher never started: ${diagnostics()}`);
+    }
+    return Number(fs.readFileSync(pidPath, "utf8"));
+  }
+
+  // A foreground `runfree credential sync` run, as typed at a terminal: no
+  // parent, no lifetime pipe, a process group of its own (the terminal's
+  // foreground job). `--watch` makes it the manual watch.
+  async function startForegroundSync(env: NodeJS.ProcessEnv, options: { watch: boolean }): Promise<number> {
+    const configPath = writeHarnessConfig({ launch: "plan", initialSourceTruth: false });
+    const syncEnv: NodeJS.ProcessEnv = { ...env, RUNFREE_CREDENTIAL_WATCH_HARNESS_CONFIG: configPath };
+    delete syncEnv.RUNFREE_TOKEN_SYNC_LIFETIME_FD;
+    delete syncEnv.RUNFREE_TOKEN_SYNC_WATCH_PARENT_PID;
     const child = childProcess.spawn(process.execPath, [
-      "--import", "tsx", HARNESS_ENTRY, "--workspace", tmp, "credential", "sync", "--watch",
-    ], { cwd: repoRoot, env: watchEnv, detached: true, stdio: "ignore" });
+      ...harnessArgv, "--workspace", tmp, "credential", "sync", ...(options.watch ? ["--watch"] : []),
+    ], { cwd: repoRoot, env: syncEnv, detached: true, stdio: "ignore" });
     child.on("error", () => {});
-    if (child.pid === undefined) throw new Error("manual watch did not start");
-    ownedPids.add(child.pid);
-    return child.pid;
+    return waitForWatcherPid(configPath, () => "foreground sync");
   }
 
   // Gone, or a zombie nobody has reaped yet: either way it runs nothing more.
@@ -4802,7 +4828,7 @@ describe("credential watcher cancellation (F08)", () => {
     return { fakeDocker, op };
   }
 
-  test.fails("ordinary session exit during an op read keeps the held credential, its receipt and its status", async () => {
+  reproduction("ordinary session exit during an op read keeps the held credential, its receipt and its status", async () => {
     const { fakeDocker, op } = await oneTokenFixture();
     await seed(fakeDocker, [op.bin]);
     const { socketPath } = await startDockerBridge(fakeDocker.fakeBin);
@@ -4815,6 +4841,7 @@ describe("credential watcher cancellation (F08)", () => {
     parent.send("stop");
     const cleanup = await settleAfterCancellation(parent.watcherPid, [read.pid]);
 
+    reached();
     expect({
       ...cleanup,
       reads: op.events().filter((event) => event.kind === "start").length,
@@ -4822,9 +4849,9 @@ describe("credential watcher cancellation (F08)", () => {
       writes: tokenWriteCount(fakeDocker.dockerLog, "github") - writesBefore,
       ...credentialSnapshot(),
     }).toEqual({ watcherGone: true, providersRunning: [], reads: 2, removals: 0, writes: 0, ...before });
-  }, 60_000);
+  });
 
-  test.fails("ordinary session exit during the op document get fallback keeps the held credential", async () => {
+  reproduction("ordinary session exit during the op document get fallback keeps the held credential", async () => {
     const { fakeDocker, op } = await oneTokenFixture({ ref: "op://Private/AuthKey" });
     op.setMode("read", "fail-unmatched");
     op.setMode("document", "ok");
@@ -4839,11 +4866,12 @@ describe("credential watcher cancellation (F08)", () => {
     parent.send("stop");
     const cleanup = await settleAfterCancellation(parent.watcherPid, [fallback.pid]);
 
+    reached();
     expect({ ...cleanup, removals: tokenRemovalCount(fakeDocker.dockerLog, "github"), ...credentialSnapshot() })
       .toEqual({ watcherGone: true, providersRunning: [], removals: 0, ...before });
-  }, 60_000);
+  });
 
-  test.fails("ordinary session exit during an op read of a document reference starts no document fallback", async () => {
+  reproduction("ordinary session exit during an op read of a document reference starts no document fallback", async () => {
     const { fakeDocker, op } = await oneTokenFixture({ ref: "op://Private/AuthKey" });
     op.setMode("read", "fail-unmatched");
     op.setMode("document", "ok");
@@ -4858,6 +4886,7 @@ describe("credential watcher cancellation (F08)", () => {
     parent.send("stop");
     const cleanup = await settleAfterCancellation(parent.watcherPid, [read.pid]);
 
+    reached();
     expect({
       ...cleanup,
       fallbacks: op.events().filter((event) => event.kind === "start" && event.ppid === parent.watcherPid && event.sub === "document").length,
@@ -4865,9 +4894,9 @@ describe("credential watcher cancellation (F08)", () => {
       writes: tokenWriteCount(fakeDocker.dockerLog, "github") - writesBefore,
       ...credentialSnapshot(),
     }).toEqual({ watcherGone: true, providersRunning: [], fallbacks: 0, removals: 0, writes: 0, ...before });
-  }, 60_000);
+  });
 
-  test.fails("ordinary session exit during a later token's read leaves every token held", async () => {
+  reproduction("ordinary session exit during a later token's read leaves every token held", async () => {
     writeFixtureRepo(exampleTokenPolicy(["alpha", "beta"]));
     writeTokenConfig({
       alpha: { source: "1password", ref: "op://Private/Alpha/token" },
@@ -4889,6 +4918,7 @@ describe("credential watcher cancellation (F08)", () => {
 
     // The earlier token's completed write precedes the cancellation; nothing
     // after it may touch either token.
+    reached();
     expect({
       ...cleanup,
       removals: tokenRemovalCount(fakeDocker.dockerLog, "alpha") + tokenRemovalCount(fakeDocker.dockerLog, "beta"),
@@ -4896,9 +4926,9 @@ describe("credential watcher cancellation (F08)", () => {
       receipts: readReceiptNames(),
       betaStatus: (JSON.parse(credentialSnapshot().status ?? "{}") as Record<string, unknown>).beta,
     }).toEqual({ watcherGone: true, providersRunning: [], removals: 0, betaWrites: 0, receipts: ["alpha", "beta"], betaStatus: statusBefore.beta });
-  }, 60_000);
+  });
 
-  test.fails("EOF while provider ignores SIGTERM causes no revocation and bounded child cleanup", async () => {
+  reproduction("EOF while provider ignores SIGTERM causes no revocation and bounded child cleanup", async () => {
     const { fakeDocker, op } = await oneTokenFixture();
     await seed(fakeDocker, [op.bin]);
     const { socketPath } = await startDockerBridge(fakeDocker.fakeBin);
@@ -4912,15 +4942,16 @@ describe("credential watcher cancellation (F08)", () => {
     // KILL ends it inside the bound, before it can report a failure.
     const cleanup = await settleAfterCancellation(parent.watcherPid, [read.pid]);
 
+    reached();
     expect({
       ...cleanup,
       completed: op.events().some((event) => event.kind === "end" && event.pid === read.pid),
       removals: tokenRemovalCount(fakeDocker.dockerLog, "github"),
       ...credentialSnapshot(),
     }).toEqual({ watcherGone: true, providersRunning: [], completed: false, removals: 0, ...before });
-  }, 60_000);
+  });
 
-  test.fails("a parent crash (lifetime EOF, no signal) during an op read stops the provider and changes nothing", async () => {
+  reproduction("a parent crash (lifetime EOF, no signal) during an op read stops the provider and changes nothing", async () => {
     const { fakeDocker, op } = await oneTokenFixture();
     await seed(fakeDocker, [op.bin]);
     const { socketPath } = await startDockerBridge(fakeDocker.fakeBin);
@@ -4932,15 +4963,16 @@ describe("credential watcher cancellation (F08)", () => {
     parent.send("crash");
     const cleanup = await settleAfterCancellation(parent.watcherPid, [read.pid]);
 
+    reached();
     expect({
       ...cleanup,
       completed: op.events().some((event) => event.kind === "end" && event.pid === read.pid),
       removals: tokenRemovalCount(fakeDocker.dockerLog, "github"),
       ...credentialSnapshot(),
     }).toEqual({ watcherGone: true, providersRunning: [], completed: false, removals: 0, ...before });
-  }, 60_000);
+  });
 
-  test.fails("lifetime EOF while the parent PID still answers (a recycled PID) during an op read changes nothing", async () => {
+  reproduction("lifetime EOF while the parent PID still answers (a recycled PID) during an op read changes nothing", async () => {
     const { fakeDocker, op } = await oneTokenFixture();
     await seed(fakeDocker, [op.bin]);
     const { socketPath } = await startDockerBridge(fakeDocker.fakeBin);
@@ -4954,15 +4986,16 @@ describe("credential watcher cancellation (F08)", () => {
     parent.send("close-pipe");
     const cleanup = await settleAfterCancellation(parent.watcherPid, [read.pid]);
 
+    reached();
     expect({
       ...cleanup,
       completed: op.events().some((event) => event.kind === "end" && event.pid === read.pid),
       removals: tokenRemovalCount(fakeDocker.dockerLog, "github"),
       ...credentialSnapshot(),
     }).toEqual({ watcherGone: true, providersRunning: [], completed: false, removals: 0, ...before });
-  }, 60_000);
+  });
 
-  test.fails("a process-group SIGTERM without lifetime EOF during an op read changes nothing", async () => {
+  reproduction("a process-group SIGTERM without lifetime EOF during an op read changes nothing", async () => {
     const { fakeDocker, op } = await oneTokenFixture();
     await seed(fakeDocker, [op.bin]);
     const { socketPath } = await startDockerBridge(fakeDocker.fakeBin);
@@ -4977,11 +5010,12 @@ describe("credential watcher cancellation (F08)", () => {
     const cleanup = await settleAfterCancellation(parent.watcherPid, [read.pid]);
     parent.send("exit");
 
+    reached();
     expect({ ...cleanup, removals: tokenRemovalCount(fakeDocker.dockerLog, "github"), ...credentialSnapshot() })
       .toEqual({ watcherGone: true, providersRunning: [], removals: 0, ...before });
-  }, 60_000);
+  });
 
-  test.fails("an interrupted manual credential sync --watch (no lifetime pipe) during an op read changes nothing", async () => {
+  reproduction("an interrupted manual credential sync --watch (no lifetime pipe) during an op read changes nothing", async () => {
     const { fakeDocker, op } = await oneTokenFixture({ refreshEverySeconds: 60 });
     await seed(fakeDocker, [op.bin]);
     const { socketPath } = await startDockerBridge(fakeDocker.fakeBin);
@@ -4990,17 +5024,18 @@ describe("credential watcher cancellation (F08)", () => {
 
     // The first iteration finds the token current; the next one, a simulated
     // minute later, reads it.
-    const watcherPid = startManualWatch(harnessEnv(fakeDocker, socketPath, [op.bin], { RUNFREE_TEST_TOKEN_SYNC_WATCH_ITERATIONS: "3" }));
+    const watcherPid = await startForegroundSync(harnessEnv(fakeDocker, socketPath, [op.bin], { RUNFREE_TEST_TOKEN_SYNC_WATCH_ITERATIONS: "3" }), { watch: true });
     const read = await waitForProviderStart(op, watcherPid, "read", "GitHub");
     // Ctrl-C at the terminal: SIGINT to the foreground process group.
     process.kill(-watcherPid, "SIGINT");
     const cleanup = await settleAfterCancellation(watcherPid, [read.pid]);
 
+    reached();
     expect({ ...cleanup, removals: tokenRemovalCount(fakeDocker.dockerLog, "github"), ...credentialSnapshot() })
       .toEqual({ watcherGone: true, providersRunning: [], removals: 0, ...before });
-  }, 60_000);
+  });
 
-  test.fails("a lifetime already closed when the watcher starts reads no source", async () => {
+  reproduction("a lifetime already closed when the watcher starts reads no source", async () => {
     const { fakeDocker, op } = await oneTokenFixture();
     await seed(fakeDocker, [op.bin]);
     const { socketPath } = await startDockerBridge(fakeDocker.fakeBin);
@@ -5012,15 +5047,16 @@ describe("credential watcher cancellation (F08)", () => {
     const parent = await startWatchParent({ launch: "plan", initialSourceTruth: true, parentPid: process.pid, closePipeAtSpawn: true }, harnessEnv(fakeDocker, socketPath, [op.bin]));
     await waitUntil(() => processGone(parent.watcherPid), 30_000);
 
+    reached();
     expect({
       watcherGone: processGone(parent.watcherPid),
       reads: op.events().filter((event) => event.kind === "start" && event.ppid === parent.watcherPid).length,
       writes: tokenWriteCount(fakeDocker.dockerLog, "github") - writesBefore,
       ...credentialSnapshot(),
     }).toEqual({ watcherGone: true, reads: 0, writes: 0, ...before });
-  }, 60_000);
+  });
 
-  test.fails("ordinary session exit during a command source run keeps the held credential", async () => {
+  reproduction("ordinary session exit during a command source run keeps the held credential", async () => {
     githubOnePasswordPolicy();
     const fakeDocker = installTokenSyncDockerFake();
     const gh = installScriptedProvider("gh");
@@ -5040,11 +5076,12 @@ describe("credential watcher cancellation (F08)", () => {
     parent.send("stop");
     const cleanup = await settleAfterCancellation(parent.watcherPid, [run.pid]);
 
+    reached();
     expect({ ...cleanup, removals: tokenRemovalCount(fakeDocker.dockerLog, "github"), ...credentialSnapshot() })
       .toEqual({ watcherGone: true, providersRunning: [], removals: 0, ...before });
-  }, 60_000);
+  });
 
-  test.fails("an in-flight token write cut off by session exit is not compensated by a deletion", async () => {
+  reproduction("an in-flight token write cut off by session exit is not compensated by a deletion", async () => {
     const { fakeDocker, op } = await oneTokenFixture({ refreshEverySeconds: 60 });
     await seed(fakeDocker, [op.bin]);
     const { socketPath, heldWrite } = await startDockerBridge(fakeDocker.fakeBin, { holdTokenWrites: true });
@@ -5063,9 +5100,52 @@ describe("credential watcher cancellation (F08)", () => {
     releaseHeldWrites?.();
     const cleanup = await settleAfterCancellation(parent.watcherPid, []);
 
+    reached();
     expect({ ...cleanup, removals: tokenRemovalCount(fakeDocker.dockerLog, "github"), receipts: readReceiptNames() })
       .toEqual({ watcherGone: true, providersRunning: [], removals: 0, receipts: ["github"] });
-  }, 60_000);
+  });
+
+  reproduction("Ctrl-C during a foreground one-shot credential sync's op read keeps the held credential", async () => {
+    const { fakeDocker, op } = await oneTokenFixture();
+    await seed(fakeDocker, [op.bin]);
+    const { socketPath } = await startDockerBridge(fakeDocker.fakeBin);
+    const before = credentialSnapshot();
+    op.setMode("read", "hang");
+
+    // `runfree credential sync` at a terminal: the same F08 path without any
+    // watcher. The CLI's own SIGINT handler cannot run while `spawnSync`
+    // blocks, so the deletion lands before it does.
+    const syncPid = await startForegroundSync(harnessEnv(fakeDocker, socketPath, [op.bin]), { watch: false });
+    const read = await waitForProviderStart(op, syncPid, "read", "GitHub");
+    process.kill(-syncPid, "SIGINT");
+    const cleanup = await settleAfterCancellation(syncPid, [read.pid]);
+
+    reached();
+    expect({ ...cleanup, removals: tokenRemovalCount(fakeDocker.dockerLog, "github"), ...credentialSnapshot() })
+      .toEqual({ watcherGone: true, providersRunning: [], removals: 0, ...before });
+  });
+
+  reproduction("Ctrl-C at a manual credential sync --watch during an in-flight token write is not compensated by a deletion", async () => {
+    const { fakeDocker, op } = await oneTokenFixture({ refreshEverySeconds: 60 });
+    await seed(fakeDocker, [op.bin]);
+    const { socketPath, heldWrite } = await startDockerBridge(fakeDocker.fakeBin, { holdTokenWrites: true });
+    const writesBefore = tokenWriteCount(fakeDocker.dockerLog, "github");
+
+    // The terminal's SIGINT reaches the whole foreground group, the Docker
+    // client of the in-flight write included, whatever the session stop
+    // protocol does. Its failure is an unknown outcome, never a removal.
+    const watcherPid = await startForegroundSync(harnessEnv(fakeDocker, socketPath, [op.bin], { RUNFREE_TEST_TOKEN_SYNC_WATCH_ITERATIONS: "3" }), { watch: true });
+    await heldWrite;
+    expect(tokenWriteCount(fakeDocker.dockerLog, "github")).toBe(writesBefore + 1);
+    process.kill(-watcherPid, "SIGINT");
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    releaseHeldWrites?.();
+    const cleanup = await settleAfterCancellation(watcherPid, []);
+
+    reached();
+    expect({ ...cleanup, removals: tokenRemovalCount(fakeDocker.dockerLog, "github"), receipts: readReceiptNames() })
+      .toEqual({ watcherGone: true, providersRunning: [], removals: 0, receipts: ["github"] });
+  });
 
   // Behavior that must not change: genuine provider failures while the
   // parent is alive, through the same subprocess harness.
@@ -5126,4 +5206,10 @@ describe("credential watcher cancellation (F08)", () => {
     expect(readReceiptNames()).toEqual([]);
     expect(readTokenStatus().github).toMatchObject({ ok: false, state: "failed", message: "op read failed" });
   }, 60_000);
+
+  // Last in the block: a reproduction is only evidence of the defect if its
+  // harness reached the effect it asserts on.
+  test("every cancellation reproduction that ran reached its effect assertion", () => {
+    expect([...reproductionProgress].filter(([, done]) => !done).map(([name]) => name)).toEqual([]);
+  });
 });

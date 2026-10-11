@@ -185,6 +185,7 @@ import { runtimeValidationMarkerStatus } from "./runtime/state.ts";
 import { LAUNCH_HANDOFF_STARTUP_SPAN_MAX_MS } from "./runtime/launch-lock-hold.ts";
 import { SESSION_CONTAINER_ABSENCE_FORMAT } from "./runtime/session-container-reconciliation.ts";
 import { flushWarnings, pendingWarningsForTest } from "./warnings.ts";
+import { credentialWatchHarnessEntryArgv, repoRoot as harnessRepoRoot } from "../../../tests/support/prebuilt-entry.ts";
 import { readHostServicePortRegistry, recordProjectHostServicePorts } from "./host-service-registry.ts";
 import { projectLifecycleLockPath, tryAcquireProjectLifecycleLock, tryAcquireProjectLifecycleLockWithRetry } from "./runtime/sessions.ts";
 
@@ -3679,6 +3680,78 @@ describe("token auto refresh invocation", () => {
     expect(plan.options.env).toMatchObject({ RUNFREE_TOKEN_SYNC_LIFETIME_FD: "4" });
     expect(plan.receiptPayload).toContain("source-fingerprint");
   });
+});
+
+// The session's watcher stop protocol, run for real: the production
+// `nodeRuntimeIO.startTokenAutoRefresh` and its `stop()` in a session-parent
+// process, against a probe watcher (scripts/credential-watch.test-harness.ts)
+// that records the signals it and one member of its process group receive.
+describe("token auto refresh stop protocol", () => {
+  async function stopProbeEvents(): Promise<string[]> {
+    const projectRoot = path.join(tmp, "project");
+    const project = prepareProject(projectRoot);
+    const probeDir = fs.mkdtempSync(path.join(tmp, "stop-probe-"));
+    const configPath = path.join(probeDir, "config.json");
+    const eventsPath = path.join(probeDir, "events.log");
+    fs.writeFileSync(configPath, JSON.stringify({
+      projectRoot,
+      stateDir: project.paths.stateDir,
+      runtimeRoot: path.join(tmp, "runtime"),
+      project,
+      launch: "runtime",
+      initialSourceTruth: false,
+    }));
+    const events = (): string[] => fs.existsSync(eventsPath) ? fs.readFileSync(eventsPath, "utf8").split("\n").filter(Boolean) : [];
+    const waitFor = async (predicate: () => boolean, timeoutMs: number): Promise<boolean> => {
+      const deadline = Date.now() + timeoutMs;
+      while (!predicate() && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 50));
+      return predicate();
+    };
+    const parent = childProcess.spawn(process.execPath, [...credentialWatchHarnessEntryArgv(), "parent", configPath], {
+      cwd: harnessRepoRoot,
+      env: { ...process.env, RUNFREE_CREDENTIAL_WATCH_HARNESS_PROBE: probeDir },
+      stdio: ["pipe", "ignore", "ignore"],
+    });
+    const parentExited = new Promise<void>((resolve) => parent.on("exit", () => resolve()));
+    let watcherPid: number | undefined;
+    try {
+      // A harness that never got this far is a setup failure, not evidence.
+      if (!(await waitFor(() => events().includes("group-member-ready") && fs.existsSync(`${configPath}.pid`), 30_000))) {
+        throw new Error(`stop probe did not start: ${JSON.stringify(events())}`);
+      }
+      watcherPid = Number(fs.readFileSync(`${configPath}.pid`, "utf8"));
+      parent.stdin?.write("stop\n");
+      await parentExited;
+      await waitFor(() => events().some((event) => event.startsWith("watcher-sigterm")), 5_000);
+      // Room for a group signal to have reached the member too.
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      return events();
+    } finally {
+      parent.kill("SIGKILL");
+      // The probe outlives its parent on purpose; it is still running here
+      // (it ends itself after 20 s), so its group is ours to end.
+      if (watcherPid !== undefined) {
+        try {
+          process.kill(-watcherPid, "SIGKILL");
+        } catch {
+          // Already gone.
+        }
+      }
+    }
+  }
+
+  test("stop closes the lifetime pipe before it signals the watcher", async () => {
+    expect(await stopProbeEvents()).toContain("watcher-sigterm pipe-closed");
+  }, 60_000);
+
+  // The watcher owns its providers' cleanup; a group signal from the parent
+  // also kills an in-flight Docker client, turning a completed proxy write
+  // into an unknown outcome.
+  test.fails("stop signals only the watcher, not the other members of its process group", async () => {
+    const events = await stopProbeEvents();
+    expect(events.some((event) => event.startsWith("watcher-sigterm"))).toBe(true);
+    expect(events).not.toContain("group-member-sigterm");
+  }, 60_000);
 });
 
 describe("runtime command flow", () => {
