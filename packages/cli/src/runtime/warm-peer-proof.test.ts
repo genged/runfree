@@ -33,6 +33,8 @@ vi.mock("./session-admission-driver-preflight.ts", async (importOriginal) => {
 });
 
 import { sessionRegistryDigest } from "./launch-handoff.ts";
+import { sha256Digest, stableJson } from "../strict-primitives.ts";
+import { ingressForwarderInspectFixture } from "./ingress-forwarder.test-harness.ts";
 import { boundCallbackForwarder } from "./session-callback-ingress.test-harness.ts";
 import {
   classifySessionContainerReconciliation,
@@ -64,6 +66,7 @@ import {
   consumeWarmPeerValidation,
   tryWarmPeerValidation,
   type WarmPeerConsumptionBinding,
+  type WarmFixedParticipant,
   type WarmPeerEvidence,
   type WarmPeerMissReason,
   type WarmPeerProofInput,
@@ -83,6 +86,7 @@ const BOOT_THIS = "linux:11111111-2222-3333-4444-555555555555";
 const BOOT_PREVIOUS = "linux:66666666-7777-8888-9999-aaaaaaaaaaaa";
 const PROCESS_THIS = "linux:12345";
 const PROCESS_OTHER = "linux:54321";
+const BOOT_ID = "0b0b0b0b-1111-2222-3333-444444444444";
 
 /** Host identity under which the fixture owners are alive. */
 const ENV: NodeJS.ProcessEnv = Object.freeze({
@@ -197,19 +201,23 @@ function healthyEvidence(records: readonly SessionContainerRecordV2[]): WarmPeer
   };
 }
 
-/** A stable warm match carrying `evidence`; the seal is bypassed by the mock above. */
+/**
+ * A stable warm match carrying `evidence`; the seal is bypassed by the mock
+ * above. Evidence without `fixedParticipants` means the stable comparison
+ * matched no recorded non-session participant.
+ */
 function stable(evidence: WarmPeerEvidence | undefined, proxyStartedAt = PROXY_STARTED_AT): WarmValidation {
   return {
     runtimeProof: { proxyId: PROXY_ID },
     proxyStartedAt,
     proxyPid: 4242,
-    bootId: "0b0b0b0b-1111-2222-3333-444444444444",
+    bootId: BOOT_ID,
     sessionState: { kind: "blocked", reason: "session-files-present" },
     ...(evidence ? { peerEvidence: evidence } : {}),
   } as unknown as WarmValidation;
 }
 
-type FakeDocker = Readonly<{ io: RuntimeIO; calls: string[][] }>;
+type FakeDocker = Readonly<{ io: RuntimeIO; calls: string[][]; proxyRereads: () => number }>;
 
 /**
  * Docker answering the judgement's reads by argv: the host-wide inventory
@@ -222,10 +230,14 @@ function fakeDocker(options: {
   proxyAfter?: Readonly<{ running: boolean; startedAt: string }>;
   listStatus?: number;
   inspectStatus?: number | null;
+  /** Runs after each call is recorded and before it is answered. */
+  onCall?: (args: readonly string[]) => void;
 }): FakeDocker {
   const calls: string[][] = [];
+  let proxyRereads = 0;
   const capture = (_command: string, args: string[]): CaptureResult => {
     calls.push([...args]);
+    options.onCall?.(args);
     if (args[0] === "ps" && !args.includes("--filter")) {
       if (options.listStatus !== undefined) return { status: options.listStatus, stdout: "", stderr: "daemon unavailable" };
       return { status: 0, stdout: options.inventory.map((container) => `${container.Id}\n`).join(""), stderr: "" };
@@ -234,6 +246,7 @@ function fakeDocker(options: {
       : args[0] === "container" && args[1] === "inspect" ? args.slice(2).filter((arg) => /^[a-f0-9]{64}$/.test(arg))
         : undefined;
     if (inspectIds?.length === 1 && inspectIds[0] === PROXY_ID) {
+      proxyRereads += 1;
       const after = options.proxyAfter ?? { running: true, startedAt: PROXY_STARTED_AT };
       return {
         status: 0,
@@ -253,7 +266,39 @@ function fakeDocker(options: {
     }
     return { status: 1, stdout: "", stderr: `unexpected docker call: ${args.join(" ")}` };
   };
-  return { io: { capture } as unknown as RuntimeIO, calls };
+  return { io: { capture } as unknown as RuntimeIO, calls, proxyRereads: () => proxyRereads };
+}
+
+/** The participant digest the addendum defines, computed independently of the implementation. */
+function expectedParticipantDigest(evidence: WarmPeerEvidence): string {
+  return sha256Digest(stableJson(Object.entries(evidence.internalNetworkContainers)
+    .map(([containerId, endpoint]) => ({ containerId, ipv4Address: endpoint.IPv4Address, endpointId: endpoint.EndpointID }))
+    .sort((left, right) => left.containerId.localeCompare(right.containerId))));
+}
+
+/** A recorded `vnc` forwarder targeting `target`, as the stable comparison would report it. */
+function vncForwarder(id: string, target: string): Readonly<{ inspect: DockerContainerInspect; fixed: WarmFixedParticipant }> {
+  const inspect = ingressForwarderInspectFixture({
+    composeProject: SESSION_TEST_PROJECT.composeProject,
+    containerId: id,
+    hostPort: "5901",
+    projectId: SESSION_TEST_PROJECT.projectId,
+    purpose: "vnc",
+    target,
+    targetPort: "5900",
+  });
+  return {
+    inspect,
+    fixed: { id, ipv4: "172.31.90.13/24", endpointId: `${id.slice(0, 1)}${"9".repeat(63)}`, role: "ingress-forwarder", purpose: "vnc", target },
+  };
+}
+
+function withParticipant(evidence: WarmPeerEvidence, inspect: DockerContainerInspect, endpoint: Readonly<{ IPv4Address: string; EndpointID: string }>): WarmPeerEvidence {
+  return {
+    ...evidence,
+    internalNetworkContainers: { ...evidence.internalNetworkContainers, [inspect.Id as string]: endpoint },
+    participants: [...evidence.participants, inspect],
+  };
 }
 
 /** Every Docker call a verdict may make: reads only. */
@@ -362,7 +407,9 @@ describe("the sealed warm peer validation (runs today)", () => {
     expect(() => assertWarmPeerValidation(forged)).toThrow("warm peer validation was not minted by the warm peer judgement");
   });
 
-  test("a hand-built twin is never consumed", () => {
+  // Meaningful once minting exists: today nothing is ever minted, so this
+  // also passes against the stub. It pins that a copy never consumes.
+  test("a hand-built twin is never consumed (meaningful once minting lands)", () => {
     const binding: WarmPeerConsumptionBinding = {
       lockOwnerToken: "a".repeat(64),
       proxyId: PROXY_ID,
@@ -385,13 +432,27 @@ describe("tryWarmPeerValidation: matches (acceptance, fails until implemented)",
     const fake = fakeDocker({ inventory });
     const before = registryBytes();
     const lock = heldLock();
-    const verdict = tryWarmPeerValidation(input({ fake, stable: stable(evidence), lifecycleLock: lock }));
+    const stableMatch = stable(evidence);
+    const verdict = tryWarmPeerValidation(input({ fake, stable: stableMatch, lifecycleLock: lock }));
     expect(verdict.kind).toBe("match");
     if (verdict.kind !== "match") return;
     const validation: WarmPeerValidation = verdict.validation;
     expect(() => assertWarmPeerValidation(validation)).not.toThrow();
     expect(Object.isFrozen(validation)).toBe(true);
-    expect(validation.peers.map((peer) => peer.sessionId).sort()).toEqual(records.map((record) => record.sessionId).sort());
+    expect(validation.stable).toBe(stableMatch);
+    expect([...validation.peers].sort((left, right) => left.sessionId.localeCompare(right.sessionId))).toEqual(
+      [...records].sort((left, right) => left.sessionId.localeCompare(right.sessionId)).map((record) => expect.objectContaining({
+        sessionId: record.sessionId,
+        sessionPrincipal: record.sessionPrincipal,
+        sessionIncarnation: record.sessionIncarnation,
+        containerId: record.containerId,
+        sourceIp: record.sourceIp,
+        endpointId: endpointOf(record),
+      })),
+    );
+    expect(validation.participantDigest).toBe(expectedParticipantDigest(evidence));
+    expect(validation.proxyPid).toBe(4242);
+    expect(validation.bootId).toBe(BOOT_ID);
     expect(validation.registryDigest).toBe(sessionRegistryDigest(stateDir, SESSION_TEST_PROJECT));
     expect(validation.proxyId).toBe(PROXY_ID);
     expect(validation.proxyStartedAt).toBe(PROXY_STARTED_AT);
@@ -400,6 +461,10 @@ describe("tryWarmPeerValidation: matches (acceptance, fails until implemented)",
     expect(validation.lockOwnerToken).toBe(lock.ownerToken);
     expect(validation.effectivePolicyGeneration).toBe(EFFECTIVE_POLICY_GENERATION);
     expect(validation.controlPlaneGenerationDigest).toBe(EFFECTIVE.controlPlaneGenerationDigest);
+    expect(validation.controlPlaneMaterializationDigest).toBe(EFFECTIVE.controlPlaneMaterializationDigest);
+    expect(validation.admissionContractEpoch).toBe(EFFECTIVE.admissionContractEpoch);
+    // The incarnation re-read happened after the inventory.
+    expect(fake.proxyRereads()).toBeGreaterThan(0);
     // Judged under the held lock, with reads only, changing no record.
     expect(lock.assertHeld).toHaveBeenCalled();
     expect(onlyReads(fake.calls)).toBe(true);
@@ -431,6 +496,19 @@ describe("tryWarmPeerValidation: matches (acceptance, fails until implemented)",
     }));
     expect(verdict.kind).toBe("match");
     if (verdict.kind === "match") expect(verdict.validation.peers[0]?.callbackForwarderId).toBe(forwarder.Id);
+  });
+
+  test.fails("a recorded vnc forwarder targeting a peer matches", () => {
+    const { records, evidence, inventory } = healthyPeers(1);
+    const vnc = vncForwarder("a".repeat(64), (records[0] as SessionContainerRecordV2).sourceIp);
+    const verdict = tryWarmPeerValidation(input({
+      fake: fakeDocker({ inventory }),
+      stable: stable({
+        ...withParticipant(evidence, vnc.inspect, { IPv4Address: vnc.fixed.ipv4, EndpointID: vnc.fixed.endpointId }),
+        fixedParticipants: [vnc.fixed],
+      }),
+    }));
+    expect(verdict.kind).toBe("match");
   });
 
   test.fails("a matched validation is consumed once, only with its exact binding", () => {
@@ -756,6 +834,63 @@ const MISS_CASES: readonly MissCase[] = [
       return undefined;
     },
   },
+  {
+    label: "a vnc forwarder that replaced the recorded one (another container id)",
+    reason: "unaccounted-participant",
+    arrange: ({ records, evidence }) => {
+      const target = (records[0] as SessionContainerRecordV2).sourceIp;
+      const recorded = vncForwarder("a".repeat(64), target);
+      const replacement = vncForwarder("5".repeat(64), target);
+      return {
+        evidence: {
+          ...withParticipant(evidence, replacement.inspect, { IPv4Address: replacement.fixed.ipv4, EndpointID: replacement.fixed.endpointId }),
+          fixedParticipants: [recorded.fixed],
+        },
+      };
+    },
+  },
+  {
+    label: "a recorded vnc forwarder targeting a session-pool address no peer holds",
+    reason: "ingress-target-unaccounted",
+    arrange: ({ evidence }) => {
+      const vnc = vncForwarder("a".repeat(64), "172.31.90.50");
+      return {
+        evidence: {
+          ...withParticipant(evidence, vnc.inspect, { IPv4Address: vnc.fixed.ipv4, EndpointID: vnc.fixed.endpointId }),
+          fixedParticipants: [vnc.fixed],
+        },
+      };
+    },
+  },
+  {
+    label: "a peer whose inventory inspect shows another start than the participant inspect (restarted between the two reads)",
+    reason: "peer-container-mismatch",
+    arrange: ({ records, inventory }) => {
+      const id = (records[0] as SessionContainerRecordV2).containerId;
+      return {
+        inventory: inventory.map((container) => (container.Id !== id ? container : {
+          ...container,
+          State: { ...container.State, StartedAt: "2026-10-11T09:20:00.000000000Z" },
+        })),
+      };
+    },
+  },
+  {
+    label: "a peer whose network endpoint differs from the endpoint its inspect reports",
+    reason: "peer-container-mismatch",
+    arrange: ({ records, evidence }) => {
+      const first = records[0] as SessionContainerRecordV2;
+      return {
+        evidence: {
+          ...evidence,
+          internalNetworkContainers: {
+            ...evidence.internalNetworkContainers,
+            [first.containerId as string]: { IPv4Address: `${first.sourceIp}/24`, EndpointID: "6".repeat(64) },
+          },
+        },
+      };
+    },
+  },
 ];
 
 describe("tryWarmPeerValidation: misses (acceptance, fails until implemented)", () => {
@@ -791,6 +926,26 @@ describe("tryWarmPeerValidation: misses (acceptance, fails until implemented)", 
     expect(fake.calls).toEqual([]);
   });
 
+  test.fails("a judgement cancelled during the inventory listing misses with cancelled and makes no later Docker call", () => {
+    const { evidence, inventory } = healthyPeers(2);
+    const controller = new AbortController();
+    let callsAtAbort = -1;
+    const fake = fakeDocker({
+      inventory,
+      onCall: (args) => {
+        if (args[0] === "ps" && !controller.signal.aborted) {
+          controller.abort();
+          callsAtAbort = fake.calls.length;
+        }
+      },
+    });
+    const before = registryBytes();
+    expectMiss(tryWarmPeerValidation(input({ fake, stable: stable(evidence), signal: controller.signal })), "cancelled");
+    expect(callsAtAbort).toBeGreaterThan(0);
+    expect(fake.calls).toHaveLength(callsAtAbort);
+    expect(registryBytes()).toEqual(before);
+  });
+
   test.fails("a lifecycle lock that is not held refuses before any observation", () => {
     const { evidence, inventory } = healthyPeers(2);
     const fake = fakeDocker({ inventory });
@@ -807,18 +962,20 @@ describe("tryWarmPeerValidation: misses (acceptance, fails until implemented)", 
   test.fails("a lifecycle lock lost during the judgement refuses instead of returning a verdict", () => {
     const { evidence, inventory } = healthyPeers(2);
     const fake = fakeDocker({ inventory });
-    let checks = 0;
+    // Held through every read; lost only once the last read (the proxy
+    // incarnation re-read) has been answered, so only a check after that read
+    // can notice.
     const lock: ProjectLifecycleLock = {
       ownerToken: "a".repeat(64),
       assertHeld: vi.fn(() => {
-        checks += 1;
-        if (checks > 1) throw new Error("project lifecycle lock is no longer held");
+        if (fake.proxyRereads() > 0) throw new Error("project lifecycle lock is no longer held");
       }),
       release: vi.fn(),
     };
     const before = registryBytes();
     expect(() => tryWarmPeerValidation(input({ fake, stable: stable(evidence), lifecycleLock: lock })))
       .toThrow("project lifecycle lock is no longer held");
+    expect(fake.proxyRereads()).toBeGreaterThan(0);
     expect(onlyReads(fake.calls)).toBe(true);
     expect(registryBytes()).toEqual(before);
   });

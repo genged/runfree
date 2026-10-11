@@ -90,6 +90,22 @@ export type WarmPeerEvidence = Readonly<{
   internalNetworkContainers: Readonly<Record<string, Readonly<{ IPv4Address: string; EndpointID: string }>>>;
   /** The inspect of every container `internalNetworkContainers` names, the proxy included. */
   participants: readonly DockerContainerInspect[];
+  /**
+   * The non-session participants (`vnc`/`port` forwarders and any other
+   * utility) the stable comparison found exactly equal to the record's
+   * `fixedParticipants`. Absent means none.
+   */
+  fixedParticipants?: readonly WarmFixedParticipant[];
+}>;
+
+/** One recorded participant that is neither the proxy nor session-bound. */
+export type WarmFixedParticipant = Readonly<{
+  id: string;
+  ipv4: string;
+  endpointId: string;
+  role: string;
+  purpose?: string;
+  target?: string;
 }>;
 
 export type WarmPeerProofInput = Readonly<{
@@ -142,7 +158,12 @@ export type WarmPeerValidation = Readonly<{
   /** `sessionRegistryDigest` taken under the held lock during the judgement. */
   registryDigest: string;
   peers: readonly WarmPeer[];
-  /** sha256 of the sorted exact participant set: container id, IPv4, endpoint id. */
+  /**
+   * `sha256Digest(stableJson(entries))`, entries `{ containerId, ipv4Address,
+   * endpointId }` for every endpoint of the internal network (proxy included),
+   * `ipv4Address` exactly as the network inspect reported it, sorted by
+   * `containerId`.
+   */
   participantDigest: string;
   /** The incarnation bracket: StartedAt before the batch and after the last read. */
   observationEpoch: Readonly<{ startedAtBefore: string; startedAtAfter: string; observedAtEpochMs: number }>;
