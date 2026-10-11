@@ -24,7 +24,7 @@ import {
   readEffectiveHostServices,
 } from "../control/effective.ts";
 import { validateNetworkPolicy } from "@runfree/runtime-contracts/network-policy";
-import { hostServiceOwnerWarnings } from "../host-service-port-owner.ts";
+import { hostServiceOwnerWarningsFromSnapshot, probeHostListeners } from "../host-listener-snapshot.ts";
 import { projectHasRegisteredHostServicePorts, recordedHostServiceOwners, recordProjectHostServicePorts } from "../host-service-registry.ts";
 import type { EffectiveHostServices } from "./probes.ts";
 import {
@@ -1159,6 +1159,12 @@ async function prepareRuntimeForTokenSyncOrRemoveInvalid(
  * launch's own result -- the proxy's own enforcement, not this probe,
  * protects the agent.
  *
+ * F29: the live-owner check for the warning loop is one bounded listener
+ * observation (`probeHostListeners`) regardless of how many host services
+ * are approved, not one `lsof` call per service; zero approved services
+ * still makes zero calls. `admitHostServicePort` (`host-service add`) and
+ * `runfree status` are unchanged: they keep probing one port at a time.
+ *
  * R15: a project that never used host services must not take the
  * host-global registry lock on every launch, so the write is skipped unless
  * there is something to record or an existing row needs pruning.
@@ -1171,7 +1177,8 @@ async function refreshHostServicesAtLaunch(context: RuntimeContext, io: RuntimeI
     const projectId = projectHash(context.projectRoot);
     if (Object.keys(hostServices).length > 0) {
       const recorded = recordedHostServiceOwners(env, projectId);
-      for (const line of hostServiceOwnerWarnings(context, io, hostServices, recorded)) warn(line);
+      const snapshot = probeHostListeners(context, io);
+      for (const line of hostServiceOwnerWarningsFromSnapshot(snapshot, hostServices, recorded)) warn(line);
     }
     const ports = Array.from(new Set(Object.values(hostServices).map((entry) => entry.port))).sort((left, right) => left - right);
     if (ports.length > 0 || projectHasRegisteredHostServicePorts(env, projectId)) {

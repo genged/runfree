@@ -26,11 +26,12 @@ vi.mock("./control/effective.ts", async (importOriginal) => {
   };
 });
 
-// Records "probe" when the host-service launch-time re-check runs and "lock"
-// when the project lifecycle lock is acquired, so a test can prove the probe
-// never runs under the lock (design "Policy shape", Re-check, SR13). Both
-// wrappers delegate to the real implementation, so every other test's
-// behavior is unaffected.
+// Records "probe" when the host-service launch-time re-check runs (F29: one
+// batched listener observation, host-listener-snapshot.ts) and "lock" when
+// the project lifecycle lock is acquired, so a test can prove the probe never
+// runs under the lock (design "Policy shape", Re-check, SR13). Every wrapper
+// below delegates to the real implementation, so every other test's behavior
+// is unaffected.
 const hostServiceRecheckEvents = vi.hoisted(() => ({ events: [] as string[] }));
 // Lets a launch test report another live session in the project, and records
 // (or fails) the post-mutation activation a launch-time service enable needs
@@ -59,9 +60,21 @@ vi.mock("./host-service-port-owner.ts", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./host-service-port-owner.ts")>();
   return {
     ...actual,
+    // `runfree status` only; the launch-time path below is what a plain
+    // launch actually goes through since F29.
     hostServiceOwnerWarnings: (...args: Parameters<typeof actual.hostServiceOwnerWarnings>) => {
       hostServiceRecheckEvents.events.push("probe");
       return actual.hostServiceOwnerWarnings(...args);
+    },
+  };
+});
+vi.mock("./host-listener-snapshot.ts", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./host-listener-snapshot.ts")>();
+  return {
+    ...actual,
+    probeHostListeners: (...args: Parameters<typeof actual.probeHostListeners>) => {
+      hostServiceRecheckEvents.events.push("probe");
+      return actual.probeHostListeners(...args);
     },
   };
 });
@@ -4793,6 +4806,58 @@ describe("runtime command flow", () => {
       expect(hostServiceRecheckEvents.events).toContain("lock");
       expect(hostServiceRecheckEvents.events.indexOf("probe"))
         .toBeLessThan(hostServiceRecheckEvents.events.lastIndexOf("lock"));
+    });
+
+    describe("F29: one batched listener observation per launch, not one lsof call per service", () => {
+      const platformDescriptor = Object.getOwnPropertyDescriptor(process, "platform") as PropertyDescriptor;
+      afterEach(() => {
+        Object.defineProperty(process, "platform", platformDescriptor);
+      });
+
+      const lsofCalls = (io: { calls: RuntimeIoCall[] }): RuntimeIoCall[] => io.calls
+        .filter((call) => call.method === "capture" && call.command === "/usr/sbin/lsof");
+
+      test("zero approved host services makes zero live-owner probe calls", async () => {
+        Object.defineProperty(process, "platform", { value: "darwin" });
+        const projectRoot = path.join(tmp, "project");
+        const context: RuntimeContext = {
+          projectRoot,
+          project: prepareProject(projectRoot),
+          runtimeRoot: path.join(tmp, "runtime"),
+          env: { PATH: "/fake-bin", XDG_STATE_HOME: path.join(tmp, "xdg-state") },
+          network: fixedNetwork,
+        };
+        const io = createRuntimeIO();
+
+        expect((await startRuntime(context, io, false, { launch: true })).status).toBe(0);
+        expect(lsofCalls(io)).toHaveLength(0);
+      });
+
+      test("more than one approved host service still makes exactly one live-owner probe call", async () => {
+        Object.defineProperty(process, "platform", { value: "darwin" });
+        const projectRoot = path.join(tmp, "project");
+        const context: RuntimeContext = {
+          projectRoot,
+          project: prepareProjectWithHostServices(projectRoot, {
+            idb: { target: "host-loopback", port: 10882 },
+            other: { target: "host-loopback", port: 10883 },
+          }),
+          runtimeRoot: path.join(tmp, "runtime"),
+          env: { PATH: "/fake-bin", XDG_STATE_HOME: path.join(tmp, "xdg-state") },
+          network: fixedNetwork,
+        };
+        const io = createRuntimeIO({
+          hostServiceSet: [{ ip: "192.168.65.254", port: 10882 }, { ip: "192.168.65.254", port: 10883 }],
+          capture: (command) => (command === "/usr/sbin/lsof"
+            ? captureResult(0, "p4242\ncidb_companion\nf7\nn127.0.0.1:10882\np5151\ncother_process\nf8\nn127.0.0.1:10883\n")
+            : undefined),
+        });
+
+        const result = await startRuntime(context, io, false, { launch: true });
+        flushWarnings();
+        expect(result.status, vi.mocked(console.error).mock.calls.flat().join("\n")).toBe(0);
+        expect(lsofCalls(io)).toHaveLength(1);
+      });
     });
 
     // A host-service activation (`host-service add`) selects a new effective
