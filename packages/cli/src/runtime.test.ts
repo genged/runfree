@@ -5310,6 +5310,39 @@ describe("runtime command flow", () => {
       }
     });
 
+    test("a proxy restart during the full validation records nothing", async () => {
+      const context = launchContext();
+      let active = false;
+      let flipped = false;
+      const io = createRuntimeIO({
+        capture: (_command, args) => {
+          // The deny probe runs inside the topology proof: after the
+          // validation read the proxy start it proves, before the
+          // eligibility publication reads it again.
+          if (active && !flipped && args[0] === "run" && args.includes("io.runfree.helper-purpose=deny-probe")) {
+            flipped = true;
+            process.env.FAKE_PROXY_STARTED_AT = "2026-06-13T09:00:00.000Z";
+          }
+          return undefined;
+        },
+      });
+      await warmedUp(context, io);
+      // Full path: a new proxy pid is a warm mismatch.
+      process.env.FAKE_PROXY_PID = "5151";
+      vi.mocked(console.error).mockClear();
+      const start = io.calls.length;
+      active = true;
+      expect((await startRuntime(timed(context), io, false, { launch: true })).status).toBe(0);
+      expect(flipped).toBe(true);
+      expect(timingsFor("validation:warm-proof")).toContain("timing: validation:warm-proof not-recorded");
+      // Refused before any record observation: the only warm batch is the launch's own check.
+      expect(io.calls.slice(start).filter((call) => call.command === "docker" && warmProofBatch(call.args))).toHaveLength(1);
+      expect(fs.existsSync(recordPath(context))).toBe(false);
+      // The next launch validates fully against the restarted proxy and records.
+      expect((await startRuntime(context, io, false, { launch: true })).status).toBe(0);
+      expect(fs.existsSync(recordPath(context))).toBe(true);
+    });
+
     test("a proxy restart between the validation's eligibility and the restore records nothing", async () => {
       const context = launchContext();
       let active = false;
