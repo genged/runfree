@@ -55,6 +55,7 @@ import {
   startLiveTestContainer,
   waitUntil,
 } from "./docker.ts";
+import { PROJECT_ID_LABEL, RUNFREE_MANAGED_IMAGE_LABEL } from "../../../packages/cli/src/runtime/constants.ts";
 import { launchClaudeTimed, runfreeTimed, sessionContainers, timing } from "./launch-timing-support.ts";
 import { runNominalAdmissionSlice } from "./session-admission-slice.ts";
 import {
@@ -440,10 +441,16 @@ describe("the warm-empty skip falls back to the full reconcile on a real orphan 
     try {
       peers = await startHeldPeers(fixture, 1);
       releaseHoldMarker(fixture);
+      // The project image carries Runfree's managed and project-id labels, and a
+      // container inherits its image's labels. Left in place they would make this
+      // container look like an unproven session of this project, which the warm
+      // peer judgement and the startup reconcile refuse long before admission.
+      // Overriding both keeps it what the case needs: foreign to Runfree.
       const externalId = startLiveTestContainer({
         name: externalName,
         image: projectAgentImageId(project),
         networkId: "bridge",
+        runArgs: ["--label", `${RUNFREE_MANAGED_IMAGE_LABEL}=`, "--label", `${PROJECT_ID_LABEL}=`],
         command: ["sleep", "600"],
       });
       shim = createDockerSideEffectShim(fixture, {
