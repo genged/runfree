@@ -55,8 +55,15 @@ import {
   startLiveTestContainer,
   waitUntil,
 } from "./docker.ts";
-import { launchClaudeTimed, runfreeTimed, timing } from "./launch-timing-support.ts";
+import { launchClaudeTimed, runfreeTimed, sessionContainers, timing } from "./launch-timing-support.ts";
 import { runNominalAdmissionSlice } from "./session-admission-slice.ts";
+import {
+  createDockerSideEffectShim,
+  endHeldPeers,
+  releaseHoldMarker,
+  startHeldPeers,
+  type HeldPeer,
+} from "./warm-peer-support.ts";
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
 const PROVISION_TIMEOUT_MS = 30 * 60_000;
@@ -413,6 +420,54 @@ describe("the warm-empty skip falls back to the full reconcile on a real orphan 
       ).not.toBe(0);
     } finally {
       docker(["exec", "--user", "0:0", proxyId, "rm", "-f", plantedPath]);
+    }
+  }, TEST_TIMEOUT_MS);
+
+  // A warm launch beside a live peer judges every internal-network
+  // participant once, under the lock. A container attached after that
+  // judgement is outside what it proved; admission's own exact participant
+  // baseline, read fresh before allocation, is what must refuse it. The
+  // attach is ordered by a Docker shim armed on the warm proof's root batch
+  // and fired on the first later command naming the internal network, which
+  // is admission's own read: the judgement and the startup reconcile never
+  // name it.
+  test("an external container attached after the warm peer judgement is refused by admission's participant baseline, and removing it reclaims", async () => {
+    const project = composeProjectName(fixture);
+    const networkId = internalNetworkId(project);
+    const externalName = `runfree-live-external-${crypto.randomBytes(4).toString("hex")}`;
+    let peers: HeldPeer[] = [];
+    let shim: ReturnType<typeof createDockerSideEffectShim> | undefined;
+    try {
+      peers = await startHeldPeers(fixture, 1);
+      releaseHoldMarker(fixture);
+      const externalId = startLiveTestContainer({
+        name: externalName,
+        image: projectAgentImageId(project),
+        networkId: "bridge",
+        command: ["sleep", "600"],
+      });
+      shim = createDockerSideEffectShim(fixture, {
+        armOn: "*RUNFREE_FIREWALL_SECTION*",
+        fireOn: networkId,
+        sideEffect: `"$real_docker" network connect ${networkId} ${externalId} >/dev/null 2>&1`,
+      });
+      const before = new Set(sessionContainers(fixture));
+      const refused = runfreeTimed({ ...fixture, env: { ...fixture.env, ...shim.env } }, ["claude"]);
+      expect(shim.fired(), `the shim never saw admission's network read: ${describeOutput(refused.output, 4000)}`).toBe(true);
+      expect(timing(refused.output, "validation:warm-peer"), describeOutput(refused.output)).toContain("match");
+      expect(refused.status, describeOutput(refused.output, 4000)).not.toBe(0);
+      // Refused before allocation: no new session container exists.
+      expect(sessionContainers(fixture).filter((id) => !before.has(id))).toEqual([]);
+      // Reclaim: once the external container is gone, the next launch beside
+      // the peer is admitted.
+      forceRemoveContainer(externalName);
+      const reclaimed = runfreeTimed(fixture, ["claude"]);
+      expect(reclaimed.status, describeOutput(reclaimed.output, 4000)).toBe(0);
+    } finally {
+      shim?.dispose();
+      forceRemoveContainer(externalName);
+      releaseHoldMarker(fixture);
+      await endHeldPeers(peers);
     }
   }, TEST_TIMEOUT_MS);
 });

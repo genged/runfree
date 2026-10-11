@@ -1,5 +1,6 @@
 // Session-independence live tranche: a compatible proxy replacement preserves
-// and restores live sessions.
+// and restores live sessions, and a warm launch beside live sessions never
+// interrupts their service.
 //
 // Split from the attached tranche, whose header describes the shared setup.
 // This file owns the replacement-recovery family: sessions carried across a
@@ -55,6 +56,9 @@ import {
   startRunfree,
   type LaunchRun,
 } from "./attached-support.ts";
+import { FIRST_REQUEST_HOST } from "./agent-stub.ts";
+import { milliseconds, timing } from "./launch-timing-support.ts";
+import { samplePeerRequests } from "./warm-peer-support.ts";
 // ---------------------------------------------------------------------------
 // Session-independence live acceptance: the replacement cases.
 //
@@ -407,6 +411,35 @@ describe("session independence: a compatible replacement preserves and restores 
     expect(newProxyId, `${label}: the proxy container was not replaced`).not.toBe(before);
     return Object.freeze({ newProxyId, elapsedMs });
   }
+
+  test("live sessions keep being answered throughout a warm launch beside them, which neither revalidates nor restores them", async () => {
+    assertConsumersAdmitExactly(currentProxyId(), [], "before the warm peer case");
+    // A full validation with no session in the registry leaves the warm-proof
+    // record the launches below match.
+    const up = fixture.runfree(["up"]);
+    expect(up.status, describeOutput(up.output, 4000)).toBe(0);
+    const first = await startAttachedLaunch(fixture);
+    const second = await startAttachedLaunch(fixture, { allowExistingSessions: true });
+    const peers = second.attached.records.map((record) => String(record.containerId));
+    expect(peers, "the two peer sessions are not both attached").toHaveLength(2);
+    for (const peer of peers) await awaitAgentStarted(peer, `peer ${peer}`);
+    const sampler = samplePeerRequests(peers, `https://${FIRST_REQUEST_HOST}/`);
+    let judged: LaunchRun | undefined;
+    try {
+      judged = await startAttachedLaunch(fixture, { allowExistingSessions: true, extraEnv: { RUNFREE_TIMINGS: "1" } });
+    } finally {
+      const samples = await sampler.stop();
+      expect(samples.length, "no peer request was sampled during the launch").toBeGreaterThan(0);
+      expect(samples.filter((sample) => !sample.answered), "a peer request was lost during the warm peer launch").toEqual([]);
+    }
+    const output = judged.output();
+    expect(timing(output, "validation:warm-peer"), describeOutput(output, 4000)).toContain("match");
+    expect(milliseconds(output, "runtime-validation"), describeOutput(output, 4000)).toBeUndefined();
+    expect(timing(output, "startup:restore-sessions"), describeOutput(output, 4000)).toContain("skipped warm-peer");
+    // Every peer is still served, beside the new session, by both consumers.
+    assertConsumersAdmitExactly(currentProxyId(), judged.attached.records.map((record) => record.sourceIp), "after the warm peer launch");
+    expect(peers, "the first peer is not among the sampled sessions").toContain(String(first.attached.records[0]?.containerId));
+  }, TEST_TIMEOUT_MS);
 
   test("every attached session survives a compatible proxy replacement and is re-served without relaunch", async () => {
     // Sessions survive a compatible replacement (T6/L5). The guarantee is per
