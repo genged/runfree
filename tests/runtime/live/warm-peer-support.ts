@@ -14,7 +14,7 @@ import path from "node:path";
 
 import { startRunfree, type AsyncCliRun } from "./attached-support.ts";
 import { docker } from "./docker.ts";
-import { describeOutput, MANAGED_HOLD_RELATIVE_PATH, type LiveFixture } from "./fixture.ts";
+import { describeOutput, MANAGED_HELD_RELATIVE_PATH, MANAGED_HOLD_RELATIVE_PATH, type LiveFixture } from "./fixture.ts";
 import { milliseconds, sessionContainers, timing } from "./launch-timing-support.ts";
 import { answeredByUpstream, curlProbeCommand, parseProbeAnswer } from "./proxy-answer.ts";
 
@@ -37,8 +37,10 @@ async function waitFor<T>(probe: () => T | undefined, timeoutMs: number, label: 
  * Starts `count` `claude` sessions on a fixture whose Claude stand-in honors
  * the managed hold marker, one at a time, each held up by that marker. The
  * marker is left in place; a caller that then launches a one-shot session
- * removes it first (the stand-in reads it once, at start, so the held peers
- * stay up).
+ * removes it first. That is safe only once every peer's stand-in has read the
+ * marker: it reads it once, at its own start, which comes after the session
+ * entry and so after the container is already running. Each peer therefore
+ * counts as started only when its stand-in has acknowledged the hold.
  */
 export async function startHeldPeers(
   fixture: LiveFixture,
@@ -61,9 +63,26 @@ export async function startHeldPeers(
       const state = docker(["inspect", "-f", "{{.State.Running}}", id]);
       return state.status === 0 && state.stdout.trim() === "true" ? id : undefined;
     }, HELD_PEER_START_TIMEOUT_MS, `held peer ${index}`);
+    await waitFor(() => {
+      if (exited) throw new Error(`held peer ${index} ended before its stand-in acknowledged the hold`);
+      return heldAcknowledged(fixture, container) ? true : undefined;
+    }, HELD_PEER_START_TIMEOUT_MS, `held peer ${index}'s hold acknowledgement`);
     peers.push(Object.freeze({ container, run }));
   }
   return peers;
+}
+
+/** Whether the stand-in in `container` saw the hold marker and is staying up. */
+function heldAcknowledged(fixture: LiveFixture, container: string): boolean {
+  let acknowledged: string;
+  try {
+    acknowledged = fs.readFileSync(path.join(fixture.projectRoot, MANAGED_HELD_RELATIVE_PATH), "utf8");
+  } catch {
+    return false;
+  }
+  // A container's default hostname is its short (12-character) id.
+  const hostname = container.slice(0, 12);
+  return acknowledged.split("\n").some((line) => line.trim() === hostname);
 }
 
 /** Ends held peers the ordinary way (their agent dies) and waits for their owners to exit. */

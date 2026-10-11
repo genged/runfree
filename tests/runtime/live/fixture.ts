@@ -461,9 +461,17 @@ export const MANAGED_CLAUDE_ARGV_RELATIVE_PATH = path.join(MANAGED_ARGV_DIRNAME,
  * a D-3 refusal) runs with it absent so the command completes on its own.
  */
 export const MANAGED_HOLD_RELATIVE_PATH = path.join(MANAGED_ARGV_DIRNAME, "hold");
+/**
+ * One line per stand-in that saw the hold marker and is staying up: its
+ * container hostname (the short container id). A running container is not yet
+ * a held one — the stand-in reads the marker only once it starts, after the
+ * session entry — so a caller that removes the marker must first see this.
+ */
+export const MANAGED_HELD_RELATIVE_PATH = path.join(MANAGED_ARGV_DIRNAME, "held");
 /** The same paths as the container sees them. */
 export const MANAGED_CLAUDE_ARGV_CONTAINER_PATH = "/workspace/.runfree-managed-argv/claude.jsonl";
 export const MANAGED_HOLD_CONTAINER_PATH = "/workspace/.runfree-managed-argv/hold";
+export const MANAGED_HELD_CONTAINER_PATH = "/workspace/.runfree-managed-argv/held";
 
 // Never a real token and never reaches the agent: the audit-mode credential
 // strip proof needs a *configured* credential header name to exist so the union
@@ -501,8 +509,14 @@ if (args.includes("--resume")) {
   // foreground process can complete.
   setTimeout(() => process.exit(0), 45000);
 } else if (fs.existsSync("${MANAGED_HOLD_CONTAINER_PATH}")) {
-  // Held: keep the event loop alive without spinning; the host ends the session
-  // with \`docker kill\`.
+  // Held: acknowledge it, so the host knows the marker may now go, then keep the
+  // event loop alive without spinning; the host ends the session with
+  // \`docker kill\`.
+  try {
+    fs.appendFileSync("${MANAGED_HELD_CONTAINER_PATH}", require("node:os").hostname() + "\\n");
+  } catch (error) {
+    process.stderr.write("managed-claude-real: could not acknowledge hold: " + String(error) + "\\n");
+  }
   setInterval(() => {}, 1 << 30);
 } else {
   process.exit(0);
