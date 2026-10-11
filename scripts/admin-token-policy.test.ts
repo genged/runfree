@@ -4024,9 +4024,10 @@ describe("convergent proxy token store", () => {
     // the whole pass without visiting later destinations, so a shared
     // failing read's "not cached" guarantee (every destination still makes
     // its own attempt) is proved at the scope level instead, in
-    // credential-source-reader.test.ts ("failed read is not cached").
+    // credential-source-reader.test.ts ("failed read is not cached"). The
+    // watcher continues after a failure, so it is proved here instead, below.
 
-    test("receipt/source-policy drift refuses before publication", async () => {
+    test("a config fingerprint drift refuses admission before publication, even for a shared read", async () => {
       const names = ["dest1", "dest2"];
       writeSharedOnePasswordFixture(names);
       const fakeDocker = installTokenSyncDockerFake();
@@ -4042,13 +4043,110 @@ describe("convergent proxy token store", () => {
       // One of the two destinations sharing the read gets a new reference
       // before publication: its own fingerprint no longer matches what was
       // prepared, so admission refuses, even though the shared value it
-      // reused was legitimately resolved.
+      // reused was legitimately resolved. Preparation and admission touch no
+      // Docker/proxy state at all, so nothing was (or could have been)
+      // published before the refusal.
       writeTokenConfig({
         dest1: { source: "1password", ref: "op://Private/GitHub/token" },
         dest2: { source: "1password", ref: "op://Private/GitHub/rotated" },
       });
       expect(() => admitPreparedRuntimeTokenSources(adminProjectInfoForTokenSync())).toThrow("prepared credential source changed");
+      expect(dockerExecCalls(fakeDocker.dockerLog)).toHaveLength(0);
       clearPreparedRuntimeTokenSources(adminProjectInfoForTokenSync());
+    });
+
+    test("a receipt that disappears before the locked sync defers every shared destination before any write", async () => {
+      const names = ["dest1", "dest2", "dest3"];
+      writeSharedOnePasswordFixture(names);
+      const fakeDocker = installTokenSyncDockerFake();
+      const hostOpBin = makeHostOpBin();
+      const opLogPath = path.join(tmpBase, `drift-receipt-op-${Math.random().toString(16).slice(2)}.jsonl`);
+      installFakeOp(hostOpBin, { logPath: opLogPath, output: "ghp_drift_receipt\n" });
+      selectEffectiveControlsFromProjectPolicy();
+      // Seed a current receipt for every shared destination with a plain
+      // explicit sync (not shared: nothing is prepared yet).
+      const seeded = await runAdmin(() => credentialSyncIntent(syncInput), opEnv(fakeDocker, hostOpBin));
+      expect(seeded.status, seeded.stderr).toBe(0);
+      expect(readReceiptsFile().map((receipt) => receipt.tokenName).sort()).toEqual(names);
+      const execsBefore = dockerExecCalls(fakeDocker.dockerLog).length;
+      const warmSync = { ...syncInput, verbose: true, mode: "startup-convergence" as const };
+
+      const deferred = await runAdmin(async () => {
+        // Every receipt is current, so this warm preparation shares nothing
+        // (it skips every destination without reading). Between it and the
+        // locked sync every receipt disappears, so the sync finds every
+        // destination that would have shared the read due with nothing
+        // prepared for it.
+        prepareRuntimeTokenSources({ mode: "convergence" });
+        fs.rmSync(receiptsFilePath());
+        await credentialSyncIntent(warmSync);
+      }, opEnv(fakeDocker, hostOpBin));
+
+      expect(deferred.status).toBe(TOKEN_SYNC_DEFERRED_STATUS);
+      // Nothing published: no op read beyond the seeded baseline, no further
+      // docker exec, no removal, no resurrected receipt.
+      expect(readJsonLines(opLogPath)).toHaveLength(names.length);
+      const execsAfter = dockerExecCalls(fakeDocker.dockerLog).slice(execsBefore);
+      expect(execsAfter.filter((entry) => entry.stdin !== "")).toEqual([]);
+      for (const name of names) expect(tokenRemovalCount(fakeDocker.dockerLog, name)).toBe(0);
+      expect(readReceiptsFile()).toHaveLength(0);
+      clearPreparedRuntimeTokenSources(adminProjectInfoForTokenSync());
+    });
+
+    // The watcher continues after a failure (unlike launch preparation,
+    // which is fail-fast), so both the sharing and the not-cached-on-failure
+    // guarantees are observable through it.
+    describe("the watcher pass shares reads the same way", () => {
+      // No `initialSourceTruth`: that option runs an extra, uncounted
+      // source-truth pass before the one counted by
+      // RUNFREE_TEST_TOKEN_SYNC_WATCH_ITERATIONS, which would attempt every
+      // never-resolved shared destination a second time regardless of F01
+      // (each pass gets its own fresh scope by design — see "next pass
+      // reads again"). Omitting it keeps this at exactly one pass.
+      function runOneWatchPass(fakeDocker: { dockerLog: string; fakeBin: string }, hostOpBin: string): Promise<AdminRunResult> {
+        return runAdmin(() => credentialSyncIntent({
+          verbose: false,
+          watch: true,
+          quiet: true,
+          delayFirstSync: false,
+          cacheSourceSecrets: true,
+        }), {
+          ...opEnv(fakeDocker, hostOpBin),
+          RUNFREE_TEST_TOKEN_SYNC_WATCH_ITERATIONS: "1",
+          RUNFREE_TEST_TOKEN_SYNC_WATCH_SLEEP_MS: "1",
+        });
+      }
+
+      test("several due tokens with one ref make one read", async () => {
+        const names = ["dest1", "dest2", "dest3"];
+        writeSharedOnePasswordFixture(names);
+        const fakeDocker = installTokenSyncDockerFake();
+        const hostOpBin = makeHostOpBin();
+        const opLogPath = path.join(tmpBase, `watch-shared-op-${Math.random().toString(16).slice(2)}.jsonl`);
+        installFakeOp(hostOpBin, { logPath: opLogPath, output: "ghp_watch_shared\n" });
+
+        const watch = await runOneWatchPass(fakeDocker, hostOpBin);
+
+        expect(watch.status, watch.stderr).toBe(0);
+        expect(readJsonLines(opLogPath)).toHaveLength(1);
+      });
+
+      test("a failing shared ref is attempted once per token", async () => {
+        const names = ["dest1", "dest2", "dest3"];
+        writeSharedOnePasswordFixture(names);
+        const fakeDocker = installTokenSyncDockerFake();
+        const hostOpBin = makeHostOpBin();
+        const opLogPath = path.join(tmpBase, `watch-shared-fail-op-${Math.random().toString(16).slice(2)}.jsonl`);
+        installFakeOp(hostOpBin, { logPath: opLogPath, exitCode: 1, stderr: "connection reset by peer\n" });
+
+        const watch = await runOneWatchPass(fakeDocker, hostOpBin);
+
+        expect(watch.status, watch.stderr).toBe(0);
+        // The watcher continues after a failure: every destination sharing
+        // the failing reference still makes its own attempt, never cached.
+        expect(readJsonLines(opLogPath)).toHaveLength(names.length);
+        for (const name of names) expect(readTokenStatus()[name]).toMatchObject({ ok: false });
+      });
     });
   });
 

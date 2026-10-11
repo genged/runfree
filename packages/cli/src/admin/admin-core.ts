@@ -1563,11 +1563,12 @@ function resolveTokenSource(tokenName: string, source: TokenSource, options: Tok
 /**
  * Identifies one direct 1Password resolution's context for sharing within a
  * preparation: the resolved provider executable and the exact reference
- * bytes (no alias normalization). A preparation pass's environment, timeout
- * and quiet setting are fixed for every destination it reads (they all come
- * from the same ambient admin state), so the key does not also carry or
- * compare the environment: there is nothing to hash or log, and binding to
- * one preparation pass already pins it.
+ * bytes (no alias normalization). The account/context selection — anything
+ * in the provider's environment, `OP_ACCOUNT`, a service-account token, a
+ * Connect host/token — is not part of this key's bytes (nothing is hashed or
+ * logged); instead the owning scope binds to one exact environment (see
+ * `createCredentialPreparationScope`) and never shares across a difference
+ * in it, so two different accounts can never collide on the same key.
  */
 export type ProviderReadKey = Readonly<{ executable: string; ref: string }>;
 
@@ -1581,44 +1582,80 @@ function providerReadKeyString(key: ProviderReadKey): string {
 }
 
 /**
+ * Whether two provider environments are the identical account/context
+ * selection: same keys, same values. A plain in-memory comparison, never
+ * hashed or logged; used only to decide whether a read may be shared, never
+ * surfaced to a caller.
+ */
+function sameProviderEnvironment(a: NodeJS.ProcessEnv, b: NodeJS.ProcessEnv): boolean {
+  if (a === b) return true;
+  const aKeys = Object.keys(a);
+  if (aKeys.length !== Object.keys(b).length) return false;
+  return aKeys.every((name) => a[name] === b[name]);
+}
+
+/**
  * One preparation pass's shared-read cache. A successful direct 1Password
  * read is reused for every later destination in the same pass with the
- * identical resolved executable and exact reference; a source failure or a
- * cancelled read is never stored, so every destination still gets its own
- * attempt, classification, fingerprint and receipt. Arbitrary named
- * commands and JWT private-key/signing reads are never shared (F01 covers
- * direct 1Password resolution only). Create one fresh scope per preparation
- * pass — launch preparation, or one watcher pass's reads before its lock —
- * and let it go out of scope with that pass; never share or persist one
- * across passes or module-level.
+ * identical resolved executable, exact reference, and account/context
+ * selection; a source failure or a cancelled read is never stored, so every
+ * destination still gets its own attempt, classification, fingerprint and
+ * receipt. Arbitrary named commands and JWT private-key/signing reads are
+ * never shared (F01 covers direct 1Password resolution only). Create one
+ * fresh scope per preparation pass — launch preparation, or one watcher
+ * pass's reads before its lock — and dispose it with that pass; never share
+ * or persist one across passes or module-level.
  */
 export type CredentialPreparationScope = Readonly<{
   /** For a synchronous preparation pass (launch preparation). Throws exactly as the plan's own synchronous run would; a thrown failure is never cached. */
   readSync(plan: CredentialReadPlan): string;
   /** For the watcher's owned asynchronous reads. A `source-failure` or `cancelled` result is never cached. */
   read(input: CredentialReadInput, lifetime: CredentialLifetime): Promise<CredentialReadResult>;
+  /** Drops every shared value this scope holds. Idempotent; call once the pass that owns the scope is done with it (success, failure, cancellation, policy drift or expiration alike). */
+  dispose(): void;
 }>;
 
 export function createCredentialPreparationScope(): CredentialPreparationScope {
-  const successes = new Map<string, SuccessfulProviderRead>();
+  // Separate caches: a synchronous preparation pass has no read-start time
+  // worth keeping (its `resolved` entries have never carried one — the
+  // publish step always re-stamps its own clock), so `readSync`'s cache
+  // holds bare values. The watcher's `read` keeps the original `resolvedAt`
+  // it shares across destinations (receipt/keep-last-good ages on it).
+  const syncSuccesses = new Map<string, string>();
+  const asyncSuccesses = new Map<string, SuccessfulProviderRead>();
+  // Bound lazily to the first 1Password read's exact environment. A later
+  // read whose environment differs in any key or value never shares: it
+  // always runs its own read, uncached, rather than mixing accounts.
+  let boundEnvironment: NodeJS.ProcessEnv | undefined;
+  function sharedKeyFor(read: OnePasswordRead): string | undefined {
+    if (boundEnvironment === undefined) boundEnvironment = read.env;
+    else if (!sameProviderEnvironment(boundEnvironment, read.env)) return undefined;
+    return providerReadKeyString({ executable: read.executable, ref: read.ref });
+  }
   return Object.freeze({
     readSync(plan: CredentialReadPlan): string {
       if (plan.kind !== "1password") return runCredentialReadPlanSync(plan);
-      const key = providerReadKeyString({ executable: plan.read.executable, ref: plan.read.ref });
-      const cached = successes.get(key);
-      if (cached) return cached.value;
+      const key = sharedKeyFor(plan.read);
+      if (key === undefined) return runCredentialReadPlanSync(plan);
+      const cached = syncSuccesses.get(key);
+      if (cached !== undefined) return cached;
       const value = runCredentialReadPlanSync(plan);
-      successes.set(key, { value, resolvedAt: Date.now() });
+      syncSuccesses.set(key, value);
       return value;
     },
     async read(input: CredentialReadInput, lifetime: CredentialLifetime): Promise<CredentialReadResult> {
       if (input.plan.kind !== "1password") return readCredentialSource(input, lifetime);
-      const key = providerReadKeyString({ executable: input.plan.read.executable, ref: input.plan.read.ref });
-      const cached = successes.get(key);
+      const key = sharedKeyFor(input.plan.read);
+      if (key === undefined) return readCredentialSource(input, lifetime);
+      const cached = asyncSuccesses.get(key);
       if (cached) return { kind: "success", value: cached.value, resolvedAt: cached.resolvedAt };
       const result = await readCredentialSource(input, lifetime);
-      if (result.kind === "success") successes.set(key, { value: result.value, resolvedAt: result.resolvedAt });
+      if (result.kind === "success") asyncSuccesses.set(key, { value: result.value, resolvedAt: result.resolvedAt });
       return result;
+    },
+    dispose(): void {
+      syncSuccesses.clear();
+      asyncSuccesses.clear();
     },
   });
 }
@@ -2930,17 +2967,22 @@ export function prepareRuntimeTokenSources(options: Readonly<{ mode?: RuntimeTok
   // exact 1Password reference cause one `op` read this pass, released with
   // it. A later preparation pass reads again.
   const scope = createCredentialPreparationScope();
-  for (const [name, tokenPolicy] of Object.entries(policy.tokens)) {
-    const source = config[name];
-    if (!source) {
-      if (tokenPolicy.allowAnonymous) continue;
-      throw new Error(missingRequiredTokenSourceMessage(name));
+  try {
+    for (const [name, tokenPolicy] of Object.entries(policy.tokens)) {
+      const source = config[name];
+      if (!source) {
+        if (tokenPolicy.allowAnonymous) continue;
+        throw new Error(missingRequiredTokenSourceMessage(name));
+      }
+      const sourceRegistry = source.source === "named" ? registry : undefined;
+      const fingerprint = tokenSourceFingerprint(source, sourceRegistry);
+      values.set(name, skippable.has(name)
+        ? { kind: "skipped", fingerprint }
+        : { kind: "resolved", fingerprint, value: scope.readSync(credentialReadPlan(name, source, { quiet: true, sourceRegistry })) });
     }
-    const sourceRegistry = source.source === "named" ? registry : undefined;
-    const fingerprint = tokenSourceFingerprint(source, sourceRegistry);
-    values.set(name, skippable.has(name)
-      ? { kind: "skipped", fingerprint }
-      : { kind: "resolved", fingerprint, value: scope.readSync(credentialReadPlan(name, source, { quiet: true, sourceRegistry })) });
+  } finally {
+    // The pass is done with every value it shared, success or failure alike.
+    scope.dispose();
   }
   if (readActiveControlSelection(project)?.controlGeneration !== active.controlGeneration) {
     throw new EffectiveControlSelectionChanged("effective policy changed during credential preparation; retry before proxy disruption");

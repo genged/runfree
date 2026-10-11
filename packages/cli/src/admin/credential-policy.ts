@@ -363,17 +363,23 @@ async function prepareWatchReads(reads: readonly CredentialReadInput[], lifetime
   const preparation: WatchTokenPreparation = { preparedAt: Date.now(), entries: new Map() };
   const scope = createCredentialPreparationScope();
   try {
-    for (const read of reads) {
-      const result = await scope.read(read, lifetime);
-      if (result.kind === "cancelled") throw new CredentialCancellationError(lifetime.stopCause() ?? "lifetime-closed");
-      preparation.entries.set(read.tokenName, result.kind === "success"
-        ? { kind: "resolved", fingerprint: read.fingerprint, value: result.value, resolvedAt: result.resolvedAt }
-        : { kind: "source-failure", fingerprint: read.fingerprint, error: result.error });
+    try {
+      for (const read of reads) {
+        const result = await scope.read(read, lifetime);
+        if (result.kind === "cancelled") throw new CredentialCancellationError(lifetime.stopCause() ?? "lifetime-closed");
+        preparation.entries.set(read.tokenName, result.kind === "success"
+          ? { kind: "resolved", fingerprint: read.fingerprint, value: result.value, resolvedAt: result.resolvedAt }
+          : { kind: "source-failure", fingerprint: read.fingerprint, error: result.error });
+      }
+      return preparation;
+    } catch (error) {
+      preparation.entries.clear();
+      throw error;
     }
-    return preparation;
-  } catch (error) {
-    preparation.entries.clear();
-    throw error;
+  } finally {
+    // The pass is done with every value it shared, success, failure or
+    // cancellation alike.
+    scope.dispose();
   }
 }
 

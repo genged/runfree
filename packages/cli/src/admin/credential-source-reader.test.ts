@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
 
 import { TokenResolutionError } from "../token-resolution.ts";
-import { type CommandSourceInvocation, type OnePasswordRead, createCredentialPreparationScope, readOnePasswordRef } from "./admin-core.ts";
+import { type CommandSourceInvocation, type CredentialReadPlan, type OnePasswordRead, createCredentialPreparationScope, readOnePasswordRef } from "./admin-core.ts";
 import { type CredentialLifetime, createCredentialLifetime } from "./credential-cancellation.ts";
 import { type CredentialReadInput, readCredentialSource, runOwnedProvider } from "./credential-source-reader.ts";
 
@@ -46,8 +46,8 @@ function commandRead(executable: string, timeoutMs = 10_000): CredentialReadInpu
   return { tokenName: "probe", fingerprint: "f".repeat(64), plan: { kind: "command", invocation } };
 }
 
-function onePasswordRead(executable: string, ref = "op://Private/Item/field"): OnePasswordRead {
-  return { executable, ref, env, timeoutMs: 10_000, quiet: true };
+function onePasswordRead(executable: string, ref = "op://Private/Item/field", environment: NodeJS.ProcessEnv = env): OnePasswordRead {
+  return { executable, ref, env: environment, timeoutMs: 10_000, quiet: true };
 }
 
 function processGone(pid: number): boolean {
@@ -313,14 +313,30 @@ describe("createCredentialPreparationScope", () => {
   });
 
   test("changed account or executable is not shared", async () => {
-    const log = path.join(tmp, "invocations.log");
-    const opAccountA = countingOp("op-account-a", log);
-    const opAccountB = countingOp("op-account-b", log);
-    const scope = createCredentialPreparationScope();
+    // Executable axis: same account/context, different resolved binary.
+    const execLog = path.join(tmp, "exec-invocations.log");
+    const opAccountA = countingOp("op-exec-a", execLog);
+    const opAccountB = countingOp("op-exec-b", execLog);
+    const execScope = createCredentialPreparationScope();
     const lifetime = watchLifetime();
-    await scope.read(onePasswordInput("one", opAccountA), lifetime);
-    await scope.read(onePasswordInput("two", opAccountB), lifetime);
-    expect(invocationCount(log)).toBe(2);
+    await execScope.read(onePasswordInput("one", opAccountA), lifetime);
+    await execScope.read(onePasswordInput("two", opAccountB), lifetime);
+    expect(invocationCount(execLog)).toBe(2);
+
+    // Account axis: the identical executable and reference, but a different
+    // 1Password account selection in the environment (e.g. OP_ACCOUNT).
+    // Sharing must not cross accounts even though nothing else differs.
+    const accountLog = path.join(tmp, "account-invocations.log");
+    const op = countingOp("op-account", accountLog);
+    const accountScope = createCredentialPreparationScope();
+    const accountA: NodeJS.ProcessEnv = { ...env, OP_ACCOUNT: "team-a.1password.com" };
+    const accountB: NodeJS.ProcessEnv = { ...env, OP_ACCOUNT: "team-b.1password.com" };
+    const firstAccount = await accountScope.read({ tokenName: "one", fingerprint: "f".repeat(64), plan: { kind: "1password", read: onePasswordRead(op, "op://Private/Item/field", accountA) } }, lifetime);
+    await accountScope.read({ tokenName: "two", fingerprint: "f".repeat(64), plan: { kind: "1password", read: onePasswordRead(op, "op://Private/Item/field", accountB) } }, lifetime);
+    expect(firstAccount).toEqual({ kind: "success", value: "shared-value", resolvedAt: expect.any(Number) });
+    // The discriminating proof: a different account made its own real read
+    // rather than reusing the first account's value.
+    expect(invocationCount(accountLog)).toBe(2);
   });
 
   test("a shared document-fallback result shares only the final value", async () => {
@@ -372,16 +388,52 @@ describe("createCredentialPreparationScope", () => {
 
   test("cancelled read does not become a destination failure", async () => {
     const marker = path.join(tmp, "started");
-    const op = script("op-hang", `touch '${marker}'; while :; do sleep 0.1; done`);
+    // The first invocation touches the marker and hangs, to be cancelled.
+    // A second invocation of the identical executable and reference only
+    // happens if the cancelled attempt was never cached, and then succeeds
+    // for real: if it had been cached (as a success, or — the bug this test
+    // guards against — as if a cancellation were a destination failure),
+    // the script would never run again and this would not observe a fresh
+    // `success`.
+    const op = script("op-cancel-then-real", `if [ -f '${marker}' ]; then echo real-value; exit 0; fi; touch '${marker}'; while :; do sleep 0.1; done`);
     const scope = createCredentialPreparationScope();
     const lifetime = watchLifetime();
     const reading = scope.read(onePasswordInput("one", op), lifetime);
     expect(await waitFor(() => fs.existsSync(marker))).toBe(true);
     await lifetime.close();
     expect(await reading).toEqual({ kind: "cancelled" });
-    // Never cached as a success or a failure: a later destination in the same
-    // (now-stopped) pass stays cancelled too, not a destination failure.
-    const second = await scope.read(onePasswordInput("two", op), lifetime);
-    expect(second).toEqual({ kind: "cancelled" });
+
+    // A later destination with the identical executable and reference, on a
+    // fresh active lifetime, makes its own real read rather than reusing
+    // anything from the cancelled attempt.
+    const freshLifetime = watchLifetime();
+    const second = await scope.read(onePasswordInput("two", op), freshLifetime);
+    expect(second).toEqual({ kind: "success", value: "real-value", resolvedAt: expect.any(Number) });
+  });
+
+  test("dispose clears the scope's asynchronous shared-read cache", async () => {
+    const log = path.join(tmp, "invocations.log");
+    const op = countingOp("op-dispose-async", log);
+    const scope = createCredentialPreparationScope();
+    const lifetime = watchLifetime();
+    await scope.read(onePasswordInput("one", op), lifetime);
+    expect(invocationCount(log)).toBe(1);
+    scope.dispose();
+    // A later read for the identical executable and reference, after
+    // disposal, finds nothing cached: the provider runs again.
+    await scope.read(onePasswordInput("two", op), lifetime);
+    expect(invocationCount(log)).toBe(2);
+  });
+
+  test("dispose clears the scope's synchronous shared-read cache", () => {
+    const log = path.join(tmp, "invocations.log");
+    const op = countingOp("op-dispose-sync", log);
+    const scope = createCredentialPreparationScope();
+    const plan: CredentialReadPlan = { kind: "1password", read: onePasswordRead(op) };
+    expect(scope.readSync(plan)).toBe("shared-value");
+    expect(invocationCount(log)).toBe(1);
+    scope.dispose();
+    expect(scope.readSync(plan)).toBe("shared-value");
+    expect(invocationCount(log)).toBe(2);
   });
 });
