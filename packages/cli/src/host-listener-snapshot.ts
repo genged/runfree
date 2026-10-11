@@ -51,6 +51,15 @@ const PORT_SUFFIX_RE = /:(\d{1,5})$/u;
 function buildSnapshot(stdout: string): HostListenerSnapshot {
   const parsed = parseLsofProcessRecords(stdout);
   if (!Array.isArray(parsed)) return { kind: "unavailable", reason: parsed.reason };
+  // Mirrors `parseLsofFields`'s identical guard (host-service-port-owner.ts):
+  // lsof's own exit convention with an `-i` search option is 0 only when at
+  // least one match is found, so a clean `status === 0` with zero parsed
+  // records is itself an anomaly, not a legitimate "nothing listens" answer
+  // (that is the `status === 1`, empty-output branch above, in
+  // `probeHostListeners`). Falling through here would otherwise return the
+  // same `{ kind: "observed", byPort: new Map() }` shape as that genuine
+  // no-match case, silently suppressing every approved service's warning.
+  if (parsed.length === 0) return { kind: "unavailable", reason: "lsof exited 0 but reported no listening process" };
   const byPort = new Map<number, HostPortListener[]>();
   for (const record of parsed) {
     // One process can hold listeners on several ports (and several addresses

@@ -146,6 +146,21 @@ describe("probeHostListeners", () => {
     expect(probeHostListeners(context, io, "darwin")).toEqual({ kind: "observed", byPort: new Map() });
   });
 
+  test("exit 0 with no parsed records is unavailable, never the clean-no-match shape", () => {
+    // lsof's own exit convention with an `-i` search option is 0 only when at
+    // least one match is found, so a clean status 0 with empty stdout is an
+    // anomaly, not a legitimate "nothing listens" answer -- that is the exit
+    // 1/empty-output case above. This must not collapse to the same
+    // `{ kind: "observed", byPort: new Map() }` shape as that genuine
+    // no-match, which would silently suppress every service's warning.
+    const { io } = fakeIo({ status: 0, stdout: "", stderr: "" });
+
+    const snapshot = probeHostListeners(context, io, "darwin");
+    expect(snapshot).not.toEqual({ kind: "observed", byPort: new Map() });
+    expect(snapshot.kind).toBe("unavailable");
+    expect(snapshot.kind === "unavailable" ? snapshot.reason : "").toContain("lsof exited 0 but reported no listening process");
+  });
+
   test("exit 1 with stderr is unavailable, never a clean no-match", () => {
     const { io } = fakeIo({ status: 1, stdout: "", stderr: "lsof: WARNING: can't stat() nfs file system" });
 
