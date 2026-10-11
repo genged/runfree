@@ -1,6 +1,8 @@
+import childProcess from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
 
@@ -25,8 +27,8 @@ afterEach(async () => {
 });
 
 // A watch lifetime with no pipe and no signal listeners: only `close()` stops it.
-function watchLifetime(): CredentialLifetime {
-  const lifetime = createCredentialLifetime({ signals: [] });
+function watchLifetime(providerGroup: "own" | "terminal" = "own"): CredentialLifetime {
+  const lifetime = createCredentialLifetime({ signals: [], providerGroup });
   lifetimes.push(lifetime);
   return lifetime;
 }
@@ -208,4 +210,64 @@ describe("runOwnedProvider bounds", () => {
     const run = await runOwnedProvider(path.join(tmp, "absent"), [], { env, timeoutMs: 10_000, maxBytes: 1024 }, watchLifetime(), tight);
     expect(run.kind).toBe("spawn-error");
   });
+});
+
+describe("providers of a watch run at a terminal", () => {
+  function processGroup(pid: number): number {
+    return Number(childProcess.spawnSync("ps", ["-o", "pgid=", "-p", String(pid)], { encoding: "utf8" }).stdout.trim());
+  }
+
+  test("stay in the watch's own process group, and a stop still ends them as a cancellation", async () => {
+    const pidFile = path.join(tmp, "pid");
+    const provider = script("terminal-hang", `echo $$ > '${pidFile}'; while :; do sleep 0.1; done`);
+    const lifetime = watchLifetime("terminal");
+    const reading = readCredentialSource(commandRead(provider), lifetime);
+    expect(await waitFor(() => fs.existsSync(pidFile))).toBe(true);
+    const pid = readPid(pidFile);
+    expect(processGroup(pid)).toBe(processGroup(process.pid));
+    await lifetime.close();
+    expect(await reading).toEqual({ kind: "cancelled" });
+    expect(await waitFor(() => processGone(pid), 2_000)).toBe(true);
+  });
+
+  test("a watcher-owned provider leads its own process group", async () => {
+    const pidFile = path.join(tmp, "pid");
+    const provider = script("own-hang", `echo $$ > '${pidFile}'; while :; do sleep 0.1; done`);
+    const lifetime = watchLifetime("own");
+    const reading = readCredentialSource(commandRead(provider), lifetime);
+    expect(await waitFor(() => fs.existsSync(pidFile))).toBe(true);
+    const pid = readPid(pidFile);
+    expect(processGroup(pid)).toBe(pid);
+    await lifetime.close();
+    expect(await reading).toEqual({ kind: "cancelled" });
+  });
+
+  // A provider that prompts (`op` asking on /dev/tty) needs the controlling
+  // terminal, which a provider in a new session does not have. Needs a pty:
+  // util-linux `script`, as on the Linux CI host.
+  const utilLinuxScript = /util-linux/.test(childProcess.spawnSync("script", ["--version"], { encoding: "utf8" }).stdout ?? "");
+  test.skipIf(!utilLinuxScript)("can open the controlling terminal only when the watch keeps them in its group", () => {
+    const readerUrl = new URL("./credential-source-reader.ts", import.meta.url).href;
+    const cancellationUrl = new URL("./credential-cancellation.ts", import.meta.url).href;
+    const provider = script("tty-probe", "if (exec 3</dev/tty) 2>/dev/null; then echo tty-ok; else echo no-tty; fi");
+    const probe = path.join(tmp, "probe.mts");
+    fs.writeFileSync(probe, `
+import { runOwnedProvider } from ${JSON.stringify(readerUrl)};
+import { createCredentialLifetime, hasControllingTerminal } from ${JSON.stringify(cancellationUrl)};
+const result: Record<string, unknown> = { watchHasTerminal: hasControllingTerminal() };
+for (const providerGroup of ["terminal", "own"] as const) {
+  const lifetime = createCredentialLifetime({ signals: [], providerGroup });
+  const run = await runOwnedProvider(${JSON.stringify(provider)}, [], { env: process.env, timeoutMs: 10_000, maxBytes: 1024 }, lifetime);
+  result[providerGroup] = run.kind === "exited" ? run.stdout.trim() : run.kind;
+  await lifetime.close();
+}
+console.log("RESULT " + JSON.stringify(result));
+`);
+    const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "..", "..");
+    const command = [process.execPath, "--import", "tsx", probe].map((part) => `'${part.replaceAll("'", "'\\''")}'`).join(" ");
+    const run = childProcess.spawnSync("script", ["-qec", command, "/dev/null"], { cwd: repoRoot, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 60_000 });
+    const line = run.stdout.split(/\r?\n/).find((entry) => entry.startsWith("RESULT "));
+    expect(line, `${run.stdout}${run.stderr}`).toBeDefined();
+    expect(JSON.parse((line as string).slice("RESULT ".length))).toEqual({ watchHasTerminal: true, terminal: "tty-ok", own: "no-tty" });
+  }, 60_000);
 });

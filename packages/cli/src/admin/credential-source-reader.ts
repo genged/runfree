@@ -65,7 +65,9 @@ export type OwnedProviderRun =
  * owns: the group is what a cancellation, a timeout or an overflow ends, so a
  * descendant holding the output pipe cannot outlive the bound. A run ended by
  * the host never reports the provider's own result, even one that arrived
- * between the stop and the kill.
+ * between the stop and the kill. A watch at a terminal keeps the provider in
+ * its own foreground group instead (`CredentialLifetime.providerGroup`), and
+ * then ends only the provider process.
  */
 export function runOwnedProvider(
   command: string,
@@ -84,7 +86,7 @@ export function runOwnedProvider(
       child = childProcess.spawn(command, [...args], {
         cwd: options.cwd,
         env: options.env,
-        detached: process.platform !== "win32",
+        detached: process.platform !== "win32" && lifetime.providerGroup === "own",
         shell: false,
         stdio: ["ignore", "pipe", "pipe"],
         windowsHide: true,
@@ -118,7 +120,7 @@ export function runOwnedProvider(
     const signalGroup = (signal: NodeJS.Signals): void => {
       if (child.pid === undefined) return;
       try {
-        process.kill(process.platform === "win32" ? child.pid : -child.pid, signal);
+        process.kill(process.platform === "win32" || lifetime.providerGroup === "terminal" ? child.pid : -child.pid, signal);
       } catch {
         // The group is already gone.
       }

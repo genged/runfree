@@ -75,6 +75,14 @@ export type CredentialLifetime = Readonly<{
   own<T>(work: Promise<T>): Promise<T>;
   /** Stops (if active), joins owned work, and disposes listeners. Never throws. */
   close(): Promise<void>;
+  /**
+   * Where providers run. `own`: each leads a process group the watch owns and
+   * ends as a whole. `terminal`: a watch run by hand at a terminal keeps them
+   * in its own foreground group, so a provider can still prompt on the
+   * controlling terminal (a new session has none); there only the provider
+   * process itself is ended, and a terminal Ctrl-C reaches it directly.
+   */
+  providerGroup: "own" | "terminal";
 }>;
 
 export type CredentialLifetimeOptions = Readonly<{
@@ -84,7 +92,18 @@ export type CredentialLifetimeOptions = Readonly<{
   parentAlive?: () => boolean;
   /** Process signals that stop the lifetime. */
   signals?: readonly NodeJS.Signals[];
+  providerGroup?: "own" | "terminal";
 }>;
+
+/** Whether this process has a controlling terminal a provider could prompt on. */
+export function hasControllingTerminal(): boolean {
+  try {
+    fs.closeSync(fs.openSync("/dev/tty", "r"));
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 const LIFETIME_STOP_SIGNALS: readonly NodeJS.Signals[] = ["SIGINT", "SIGTERM", "SIGHUP"];
 
@@ -164,6 +183,7 @@ export function createCredentialLifetime(options: CredentialLifetimeOptions = {}
       if (cause !== undefined) throw new CredentialCancellationError(cause);
     },
     stopCause: () => cause,
+    providerGroup: options.providerGroup ?? "own",
     own<T>(work: Promise<T>): Promise<T> {
       owned.add(work);
       const forget = (): void => {

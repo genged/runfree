@@ -74,6 +74,7 @@ import {
   CredentialCancellationError,
   type CredentialLifetime,
   createCredentialLifetime,
+  hasControllingTerminal,
   settleHostSignals,
 } from "./credential-cancellation.ts";
 import { type CredentialReadInput, readCredentialSource } from "./credential-source-reader.ts";
@@ -450,9 +451,13 @@ async function syncTokensWatch(options: { cacheSourceSecrets?: boolean; delayFir
   ) {
     childEnv().RUNFREE_TEST_TOKEN_SYNC_WATCH_NOW_MS = String(Date.now());
   }
+  const lifetimeFd = parentLifetimePipeFd();
   const lifetime = createCredentialLifetime({
-    lifetimeFd: parentLifetimePipeFd(),
+    lifetimeFd,
     parentAlive: tokenSyncWatchParentPidAlive,
+    // A session's watcher is detached and has no terminal; a watch run by
+    // hand at one keeps its providers able to prompt there.
+    providerGroup: lifetimeFd === undefined && hasControllingTerminal() ? "terminal" : "own",
   });
   try {
     await watchCredentialSources(options, lifetime);

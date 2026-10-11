@@ -1755,7 +1755,9 @@ denied) deletes the held value, as an explicit `runfree credential sync` does;
 a transient or unclassified failure (a locked vault, a source that needs a
 prompt) keeps it, bounded by the keep-last-good age, until the next launch
 reads it interactively. The watcher reads sources outside the token-store lock, each provider in a
-process group the watcher owns, and publishes under the lock. A session's exit
+process group the watcher owns (a watch run by hand at a terminal keeps its
+providers in its foreground group, so they can still prompt there), and
+publishes under the lock. A session's exit
 closes the watcher's lifetime pipe and signals the watcher only (never its
 process group), so an in-flight proxy write completes. A stopped watch writes,
 removes and records nothing more. A write that completed after the stop
