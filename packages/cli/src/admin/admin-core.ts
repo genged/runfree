@@ -2797,6 +2797,14 @@ export function syncTokens(options: TokenSyncOptions = {}): TokenSyncResult {
   }
 }
 
+/** Drops a token's resolutions from a ledger, so its next due decision reads it. */
+export function forgetLedgerResolutions(ledger: TokenResolutionLedger | undefined, tokenName: string): void {
+  if (!ledger) return;
+  for (const map of [ledger.lastResolvedAt, ledger.retryAfterFailureAt]) {
+    for (const key of [...map.keys()]) if (key.startsWith(`${tokenName}\0`)) map.delete(key);
+  }
+}
+
 /**
  * `syncTokens` for a foreground, one-shot caller. A synchronous provider or
  * Docker client that ended by SIGINT, SIGTERM or SIGHUP leaves the sync
@@ -2807,14 +2815,6 @@ export function syncTokens(options: TokenSyncOptions = {}): TokenSyncResult {
  * always was, by one rerun; a Docker client's outcome stays unknown and the
  * command fails without compensating for it.
  */
-/** Drops a token's resolutions from a ledger, so its next due decision reads it. */
-export function forgetLedgerResolutions(ledger: TokenResolutionLedger | undefined, tokenName: string): void {
-  if (!ledger) return;
-  for (const map of [ledger.lastResolvedAt, ledger.retryAfterFailureAt]) {
-    for (const key of [...map.keys()]) if (key.startsWith(`${tokenName}\0`)) map.delete(key);
-  }
-}
-
 export async function syncTokensSettlingSignals(options: TokenSyncOptions = {}): Promise<TokenSyncResult> {
   const unknownOutcome = (error: ChildSignaledError): Error => {
     // Not the host's own stop (that exits during the settle): the write's
