@@ -29,6 +29,11 @@ function write(tokenFile: string, declared: string, received: string, env: NodeJ
   });
 }
 
+function temporaries(tokenFile: string): string[] {
+  const base = `${path.basename(tokenFile)}.tmp`;
+  return fs.readdirSync(path.dirname(tokenFile)).filter((name) => name === base || name.startsWith(`${base}.`));
+}
+
 describe("proxy token write", () => {
   test("a short stdin does not replace the existing token", () => {
     const tokenFile = path.join(secrets, "github");
@@ -38,9 +43,9 @@ describe("proxy token write", () => {
     const result = write(tokenFile, value, value.slice(0, 7));
 
     expect(result.status).not.toBe(0);
-    expect(result.stderr).toContain("proxy token write incomplete; the held token is unchanged");
+    expect(result.stderr).toContain("proxy token write incomplete; the partial value was discarded");
     expect(fs.readFileSync(tokenFile, "utf8")).toBe("held-value");
-    expect(fs.existsSync(`${tokenFile}.tmp`)).toBe(false);
+    expect(temporaries(tokenFile)).toEqual([]);
   });
 
   test("a byte count that cannot be obtained refuses the write", () => {
@@ -56,7 +61,7 @@ describe("proxy token write", () => {
 
     expect(result.status).not.toBe(0);
     expect(fs.readFileSync(tokenFile, "utf8")).toBe("held-value");
-    expect(fs.existsSync(`${tokenFile}.tmp`)).toBe(false);
+    expect(temporaries(tokenFile)).toEqual([]);
   });
 
   test("a stdin longer than declared is refused the same way", () => {
@@ -80,7 +85,37 @@ describe("proxy token write", () => {
     expect(result.status, result.stderr).toBe(0);
     expect(fs.readFileSync(tokenFile, "utf8")).toBe(value);
     expect(fs.statSync(tokenFile).mode & 0o777).toBe(0o600);
-    expect(fs.existsSync(`${tokenFile}.tmp`)).toBe(false);
+    expect(temporaries(tokenFile)).toEqual([]);
+  });
+
+  test("a lingering write keeps its own temporary file, so a later write cannot mix bytes with it", async () => {
+    const tokenFile = path.join(secrets, "github");
+    fs.writeFileSync(tokenFile, "held-value", { mode: 0o600 });
+    const lingering = "lingering-value-0123456789";
+    // A write whose client was killed but whose remote shell still runs: it
+    // has its temporary file open and only part of its value written.
+    const first = childProcess.spawn("/bin/sh", ["-c", proxyTokenWriteScript(tokenFile, Buffer.byteLength(lingering, "utf8"))], { stdio: ["pipe", "ignore", "pipe"] });
+    const firstExit = new Promise<number | null>((resolve) => first.on("exit", (code) => resolve(code)));
+    first.stdin.write(lingering.slice(0, 9));
+    const deadline = Date.now() + 5_000;
+    while (temporaries(tokenFile).length === 0 || fs.statSync(path.join(secrets, temporaries(tokenFile)[0])).size < 9) {
+      if (Date.now() > deadline) throw new Error("the first write never created its temporary file");
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    const [firstTemporary] = temporaries(tokenFile);
+
+    const next = "next-value-abcdefghijklmnop";
+    const second = write(tokenFile, next, next);
+    expect(second.status, second.stderr).toBe(0);
+    expect(fs.readFileSync(tokenFile, "utf8")).toBe(next);
+    // The later write neither removed nor wrote into the lingering one's file.
+    expect(temporaries(tokenFile)).toEqual([firstTemporary]);
+    expect(fs.readFileSync(path.join(secrets, firstTemporary), "utf8")).toBe(lingering.slice(0, 9));
+
+    first.stdin.end(lingering.slice(9));
+    expect(await firstExit).toBe(0);
+    expect(fs.readFileSync(tokenFile, "utf8")).toBe(lingering);
+    expect(temporaries(tokenFile)).toEqual([]);
   });
 
   test("a write with no bytes to declare is refused before any command is built", () => {

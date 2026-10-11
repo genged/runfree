@@ -717,7 +717,7 @@ function installTokenSyncDockerFake(options: { composeProject?: string; onMarker
       return spawnResult({ stdout: `${JSON.stringify({ generation, ...control, rulesetVerified: true, appliedAt: "2026-06-18T00:00:00.000Z" })}\n${JSON.stringify({ generation, ...control, appliedAt: "2026-06-18T00:00:00.000Z" })}\n` });
     }
     {
-      const writeMatch = /mv '\/run\/runfree-proxy-secrets\/[^']*' '\/run\/runfree-proxy-secrets\/([^']+)'/.exec(text);
+      const writeMatch = /mv "\$tmp" '\/run\/runfree-proxy-secrets\/([^']+)'/.exec(text);
       if (writeMatch && env.FAKE_DOCKER_TOKEN_WRITE_STATUS
         && (!env.FAKE_DOCKER_TOKEN_WRITE_STATUS_TOKEN || env.FAKE_DOCKER_TOKEN_WRITE_STATUS_TOKEN === writeMatch[1])) {
         // A write whose client failed or was killed at its time bound.
@@ -974,8 +974,7 @@ function proxyTokenRemovalIndexes(logPath: string, tokenName?: string): number[]
 
 function proxyTokenWriteIndexes(logPath: string, tokenName: string): number[] {
   return readJsonLines(logPath).flatMap((entry, index) => Array.isArray(entry.args) && entry.args[0] === "exec"
-    && String(entry.args.at(-1)).includes(`'/run/runfree-proxy-secrets/${tokenName}'`)
-    && String(entry.args.at(-1)).includes("mv '/run/runfree-proxy-secrets/") ? [index] : []);
+    && String(entry.args.at(-1)).includes(`mv "$tmp" '/run/runfree-proxy-secrets/${tokenName}'`) ? [index] : []);
 }
 
 function tokenReceiptsFilePath(): string {
@@ -2714,12 +2713,12 @@ exit 0
       "proxy-id",
       "sh",
       "-c",
-      expect.stringContaining("cat > '/run/runfree-proxy-secrets/github.tmp'"),
+      expect.stringMatching(/^set -e; umask 077; tmp='\/run\/runfree-proxy-secrets\/github\.tmp\.[0-9a-f]{16}'; /),
     ]);
     const command = String((execCalls[0].args as string[])[7]);
-    expect(command).toContain("umask 077");
-    expect(command).toContain("chmod 600 '/run/runfree-proxy-secrets/github.tmp'");
-    expect(command).toContain("mv '/run/runfree-proxy-secrets/github.tmp' '/run/runfree-proxy-secrets/github'");
+    expect(command).toContain(`cat > "$tmp"`);
+    expect(command).toContain(`chmod 600 "$tmp"`);
+    expect(command).toContain(`mv "$tmp" '/run/runfree-proxy-secrets/github'`);
     expect(execCalls[0].stdin).toBe("real-secret-value");
 
     const status = readTokenStatus();
@@ -3208,7 +3207,7 @@ exit 0
       "proxy-id",
       "sh",
       "-c",
-      "rm -f '/run/runfree-proxy-secrets/github' '/run/runfree-proxy-secrets/github.tmp'",
+      "rm -f '/run/runfree-proxy-secrets/github' '/run/runfree-proxy-secrets/github.tmp' '/run/runfree-proxy-secrets/github.tmp.'*",
     ]);
     expect(execCalls[0].stdin).toBe("");
 
@@ -3271,7 +3270,7 @@ exit 0
       "proxy-id",
       "sh",
       "-c",
-      "rm -f '/run/runfree-proxy-secrets/stale' '/run/runfree-proxy-secrets/stale.tmp'",
+      "rm -f '/run/runfree-proxy-secrets/stale' '/run/runfree-proxy-secrets/stale.tmp' '/run/runfree-proxy-secrets/stale.tmp.'*",
     ]);
     expect(readTokenStatus().stale).toMatchObject({
       source: "env",
@@ -4715,7 +4714,7 @@ describe("convergent proxy token store", () => {
       expect(refused.status).not.toBe(0);
       expect(`${refused.stdout}${refused.stderr}`).toContain("credential resolution requires a validated running proxy; runtime is proxy-unreachable");
       expect(tokenWrites(fakeDocker.dockerLog)).toBe(0);
-      expect(dockerExecCalls(fakeDocker.dockerLog).some((entry) => String((entry.args as string[]).at(-1)).includes("mv '/run/runfree-proxy-secrets/"))).toBe(false);
+      expect(dockerExecCalls(fakeDocker.dockerLog).some((entry) => String((entry.args as string[]).at(-1)).includes(`mv "$tmp" '/run/runfree-proxy-secrets/`))).toBe(false);
       expect(readReceiptsFile()).toHaveLength(0);
 
       // Reclaim: a retry that observes no restart succeeds and writes once.
@@ -5786,7 +5785,7 @@ describe("credential watcher cancellation (F08)", () => {
       socket.on("end", async () => {
         const request = JSON.parse(raw) as { args: string[]; env: NodeJS.ProcessEnv; input: string };
         const result = handler(request.args, { env: request.env, input: request.input }, dockerRealPath);
-        const isTokenWrite = request.args[0] === "exec" && /mv '\/run\/runfree-proxy-secrets\//.test(String(request.args.at(-1)));
+        const isTokenWrite = request.args[0] === "exec" && /mv "\$tmp" '\/run\/runfree-proxy-secrets\//.test(String(request.args.at(-1)));
         if (options.holdTokenWrites && isTokenWrite) {
           markWriteHeld();
           await released;

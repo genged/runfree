@@ -210,10 +210,13 @@ agent sees: placeholder or runfree_oauth_* handle only
    stop stands, and the receipt and status for it may be stale until the next
    pass. The watcher ends the providers it started (SIGTERM, then SIGKILL
    after 2 s) and starts no further read. A proxy token write replaces the
-   held value only when the whole value arrived. A write whose client was
-   killed (any signal, or its time bound) has an unknown outcome: the token is
-   not removed, and its receipt is dropped so the next sync reads the source
-   again.
+   held value only when the whole value arrived, and each write uses its own
+   temporary file. A write whose client was killed (any signal, or its time
+   bound) has an unknown outcome, and the token is not removed for it. An
+   ordinary sync drops the token's receipt, so the next sync reads the source
+   again. Under a launch's held lock, the launch defers instead: the receipt
+   stays as it was, and the launch's fallback source-truth sync writes the
+   token again from the value read before the lock.
 5. The proxy CA private key is mounted only into the proxy.
 
 ### Sessions

@@ -2255,21 +2255,27 @@ function proxyRuntimeValidationIssue(project: string, proxyId: string, agentId: 
  * declares its byte length, and the temporary file replaces the token only
  * when exactly that many bytes arrived. A Docker client killed mid-stdin can
  * hand the remote `cat` an early end of file; that short value is discarded
- * and the held token stays as it was.
+ * and never installed. Each write has its own temporary file: a killed
+ * client's remote shell may still be writing, and a later write never opens,
+ * removes, or installs that file.
  */
 export function proxyTokenWriteScript(tokenFile: string, byteLength: number): string {
   if (!Number.isSafeInteger(byteLength) || byteLength <= 0) throw new Error("internal: a proxy token write needs a positive byte length");
-  const tmpFile = `${tokenFile}.tmp`;
+  const tmpFile = `${tokenFile}.tmp.${crypto.randomBytes(8).toString("hex")}`;
   return [
     "set -e",
     "umask 077",
-    `rm -f ${shellSingleQuote(tmpFile)}`,
-    `cat > ${shellSingleQuote(tmpFile)}`,
+    `tmp=${shellSingleQuote(tmpFile)}`,
+    // Every exit, refusal or error, removes this write's temporary file; after
+    // the rename there is nothing left to remove.
+    `trap 'rm -f "$tmp"' EXIT`,
+    "trap 'exit 1' HUP INT TERM",
+    `cat > "$tmp"`,
     // Fails closed: a count that cannot be read (an empty substitution makes
     // the test itself fail) refuses the write exactly like a wrong count.
-    `[ "$(wc -c < ${shellSingleQuote(tmpFile)})" -eq ${byteLength} ] || { rm -f ${shellSingleQuote(tmpFile)}; echo 'proxy token write incomplete; the held token is unchanged' >&2; exit 1; }`,
-    `chmod 600 ${shellSingleQuote(tmpFile)}`,
-    `mv ${shellSingleQuote(tmpFile)} ${shellSingleQuote(tokenFile)}`,
+    `[ "$(wc -c < "$tmp")" -eq ${byteLength} ] || { echo 'proxy token write incomplete; the partial value was discarded' >&2; exit 1; }`,
+    `chmod 600 "$tmp"`,
+    `mv "$tmp" ${shellSingleQuote(tokenFile)}`,
   ].join("; ");
 }
 
@@ -2320,8 +2326,9 @@ function writeProxyRuntimeToken(proxyId: string, name: string, value: string): v
 export function removeProxyRuntimeToken(proxyId: string, name: string): void {
   assertTokenFilename(name);
   const tokenFile = `${CONTAINER_SECRET_DIR}/${name}`;
-  const tmpFile = `${tokenFile}.tmp`;
-  const command = `rm -f ${shellSingleQuote(tokenFile)} ${shellSingleQuote(tmpFile)}`;
+  // Also any temporary file a killed write left behind (`.tmp` is the name
+  // older binaries used).
+  const command = `rm -f ${shellSingleQuote(tokenFile)} ${shellSingleQuote(`${tokenFile}.tmp`)} ${shellSingleQuote(`${tokenFile}.tmp.`)}*`;
   const result = adminDockerClient().exec(proxyId, ["sh", "-c", command]);
   assertDockerClientNotSignaled(result);
   if (result.status !== 0) throw new Error(result.stderr.trim() || `failed to remove ${name} token from proxy tmpfs`);
