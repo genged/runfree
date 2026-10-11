@@ -4833,24 +4833,34 @@ describe("runtime command flow", () => {
         expect(lsofCalls(io)).toHaveLength(0);
       });
 
-      test("more than one approved host service still makes exactly one live-owner probe call", async () => {
+      // Ports and process names for `count` approved host services, built the
+      // same way regardless of count, so 1 and 10 exercise the identical
+      // shape the brief's "1/10 services each make one [call]" names.
+      const hostServicesOfSize = (count: number): Record<string, { target: "host-loopback"; port: number }> => Object.fromEntries(
+        Array.from({ length: count }, (_unused, index) => [`svc${index}`, { target: "host-loopback" as const, port: 10882 + index }]),
+      );
+      const hostServiceSetOfSize = (count: number): Array<{ ip: string; port: number }> => Array.from(
+        { length: count },
+        (_unused, index) => ({ ip: "192.168.65.254", port: 10882 + index }),
+      );
+      const lsofStdoutFor = (count: number): string => Array.from(
+        { length: count },
+        (_unused, index) => `p${4000 + index}\ncservice_${index}\nf7\nn127.0.0.1:${10882 + index}\n`,
+      ).join("");
+
+      test.each([1, 10])("%i approved host service(s) still make exactly one live-owner probe call", async (count) => {
         Object.defineProperty(process, "platform", { value: "darwin" });
         const projectRoot = path.join(tmp, "project");
         const context: RuntimeContext = {
           projectRoot,
-          project: prepareProjectWithHostServices(projectRoot, {
-            idb: { target: "host-loopback", port: 10882 },
-            other: { target: "host-loopback", port: 10883 },
-          }),
+          project: prepareProjectWithHostServices(projectRoot, hostServicesOfSize(count)),
           runtimeRoot: path.join(tmp, "runtime"),
           env: { PATH: "/fake-bin", XDG_STATE_HOME: path.join(tmp, "xdg-state") },
           network: fixedNetwork,
         };
         const io = createRuntimeIO({
-          hostServiceSet: [{ ip: "192.168.65.254", port: 10882 }, { ip: "192.168.65.254", port: 10883 }],
-          capture: (command) => (command === "/usr/sbin/lsof"
-            ? captureResult(0, "p4242\ncidb_companion\nf7\nn127.0.0.1:10882\np5151\ncother_process\nf8\nn127.0.0.1:10883\n")
-            : undefined),
+          hostServiceSet: hostServiceSetOfSize(count),
+          capture: (command) => (command === "/usr/sbin/lsof" ? captureResult(0, lsofStdoutFor(count)) : undefined),
         });
 
         const result = await startRuntime(context, io, false, { launch: true });
