@@ -4133,6 +4133,37 @@ describe("convergent proxy token store", () => {
         expect(readJsonLines(opLogPath)).toHaveLength(readsBefore + 1);
         expect(readReceiptsFile()[0].resolvedAt).toBeGreaterThan(receipt.resolvedAt);
       });
+
+      test("a value re-read before the lock keeps that read's age when the warm sync writes it", async () => {
+        const { fakeDocker, hostOpBin, opLogPath, ackEnv } = await populatedLaunch();
+        const [receipt] = readReceiptsFile();
+        fs.writeFileSync(receiptsFilePath(), `${JSON.stringify({ schemaVersion: 1, receipts: [{ ...receipt, resolvedAt: Date.now() - 16 * 60 * 1000 }] })}\n`);
+        const readsBefore = readJsonLines(opLogPath).length;
+        let preparedBefore = 0;
+        let preparedAfter = 0;
+        let syncStartedAt = 0;
+        const realNow = Date.now;
+        try {
+          const launch = await runAdmin(async () => {
+            preparedBefore = Date.now();
+            prepareRuntimeTokenSources({ mode: "convergence" });
+            preparedAfter = Date.now();
+            // The lock is taken a while after the preparation finished.
+            Date.now = () => realNow() + 30_000;
+            syncStartedAt = Date.now();
+            await credentialSyncIntent(warmSync);
+          }, { ...opEnv(fakeDocker, hostOpBin), ...ackEnv }, launchState());
+          expect(launch.status, launch.stderr).toBe(0);
+        } finally {
+          Date.now = realNow;
+        }
+
+        expect(readJsonLines(opLogPath)).toHaveLength(readsBefore + 1);
+        const [written] = readReceiptsFile();
+        expect(written.resolvedAt).toBeGreaterThanOrEqual(preparedBefore);
+        expect(written.resolvedAt).toBeLessThanOrEqual(preparedAfter);
+        expect(preparedAfter).toBeLessThan(syncStartedAt);
+      });
     });
 
     // A cold launch prepares every source before it takes the lifecycle lock;
@@ -4415,13 +4446,24 @@ describe("convergent proxy token store", () => {
         installFakeOp(hostOpBin, { logPath: opLogPath, output: "ghp_secret\n" });
         const ackEnv = await convergeSelectedGeneration();
 
+        let preparedBefore = 0;
+        let preparedAfter = 0;
+        let fallbackStartedAt = 0;
+        const realNow = Date.now;
         const deferred = await runAdmin(async () => {
+          preparedBefore = Date.now();
           prepareRuntimeTokenSources();
+          preparedAfter = Date.now();
+          // The lock is taken a while after the preparation finished.
+          Date.now = () => realNow() + 30_000;
+          restoreClock = () => { Date.now = realNow; };
           await credentialSyncIntent(coldSync());
           // The fallback after a write failure: the same preparation, the
           // ordinary source-truth sync, no second read.
+          fallbackStartedAt = Date.now();
           await credentialSyncIntent(syncInput);
         }, { ...opEnv(fakeDocker, hostOpBin), ...ackEnv, FAKE_DOCKER_TOKEN_WRITE_STATUS: "124", FAKE_DOCKER_TOKEN_WRITE_STATUS_TOKEN: "other" }, launchState());
+        restoreClock();
 
         expect(deferred.stdout).toContain("other: proxy token write failed");
         // The first write landed; the held-lock pass persisted nothing.
@@ -4429,6 +4471,34 @@ describe("convergent proxy token store", () => {
         expect(tokenRemovalCount(fakeDocker.dockerLog, "github")).toBe(0);
         // The fallback rewrote github and failed other again (the fake still fails it): receipts name only what it wrote.
         expect(readReceiptsFile().map((receipt) => receipt.tokenName)).toEqual(["github"]);
+        // The rewritten value is as old as the read before the lock: the
+        // fallback reusing it does not make it younger.
+        const [rewritten] = readReceiptsFile();
+        expect(rewritten.resolvedAt).toBeGreaterThanOrEqual(preparedBefore);
+        expect(rewritten.resolvedAt).toBeLessThanOrEqual(preparedAfter);
+        expect(preparedAfter).toBeLessThan(fallbackStartedAt);
+      });
+
+      test("a JWT signed before the lock is not recorded as younger than its signature, so its refresh lands before expiry", async () => {
+        const { fakeDocker, hostOpBin, publicKeyPem } = await configureAppStoreJwtFixture({ refreshEvery: "18m" });
+        selectEffectiveControlsFromProjectPolicy();
+        const ackEnv = await convergeSelectedGeneration();
+        const realNow = Date.now;
+        const synced = await runAdmin(async () => {
+          prepareRuntimeTokenSources();
+          // The ordinary sync (a non-handoff cold launch) runs a minute later.
+          Date.now = () => realNow() + 60_000;
+          restoreClock = () => { Date.now = realNow; };
+          await credentialSyncIntent(syncInput);
+        }, { ...opEnv(fakeDocker, hostOpBin), ...ackEnv }, launchState());
+        restoreClock();
+
+        expect(synced.status, synced.stderr).toBe(0);
+        const execCalls = dockerExecCalls(fakeDocker.dockerLog);
+        const jwt = verifyEs256Jwt(String(execCalls[execCalls.length - 1].stdin), publicKeyPem);
+        const [receipt] = readReceiptsFile();
+        expect(receipt.resolvedAt).toBeLessThanOrEqual((jwt.payload.iat as number) * 1000 + 999);
+        expect(receipt.resolvedAt + 18 * 60 * 1000).toBeLessThan((jwt.payload.exp as number) * 1000);
       });
 
       test.each(["SIGTERM", "SIGKILL", "timeout"])("a write client ended by %s under the lock defers without a removal or receipt change, and the fallback writes again", async (kill) => {

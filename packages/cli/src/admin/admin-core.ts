@@ -3176,16 +3176,26 @@ function currentPreparedRuntimeTokenSource(
   return entry;
 }
 
-function resolvePreparedRuntimeTokenSource(name: string, source: TokenSource, options: TokenResolutionOptions): string {
+/**
+ * The token's value, from the current preparation when there is one, else
+ * read now. `preparedReadStartedAt` is set only for a prepared value: the age
+ * it carries is that of the read before the lock, whichever sync reuses it.
+ */
+function resolvePreparedRuntimeTokenSource(
+  name: string,
+  source: TokenSource,
+  options: TokenResolutionOptions,
+): Readonly<{ value: string; preparedReadStartedAt?: number }> {
   const entry = currentPreparedRuntimeTokenSource(name, source, options);
-  if (!entry) return resolveTokenSource(name, source, options);
+  if (!entry) return { value: resolveTokenSource(name, source, options) };
   // A skipped entry holds no value by construction. A due token reaching here
   // with one is a preparation that disagrees with the sync; refuse rather than
   // resolve a source now.
   if (entry.kind !== "resolved") {
     throw new EffectiveControlSelectionChanged("a prepared credential was skipped but is due; resolve current sources and retry");
   }
-  return entry.value;
+  const project = currentAdminState().runtimeContext?.project ?? adminProjectInfo();
+  return { value: entry.value, preparedReadStartedAt: preparedRuntimeTokenSources.get(project.paths.stateDir)?.readsStartedAt };
 }
 
 /** What the current preparation decided for one token, if there is one. */
@@ -3651,7 +3661,12 @@ function syncTokensUnderLock(
           fence();
         }
         try {
-          value = resolvePreparedRuntimeTokenSource(tokenName, source, { ...options, sourceRegistry: registryForSource });
+          const resolved = resolvePreparedRuntimeTokenSource(tokenName, source, { ...options, sourceRegistry: registryForSource });
+          value = resolved.value;
+          // A prepared value is as old as the read before the lock, on every
+          // sync that reuses it: reuse never makes it younger. A value read
+          // now keeps the sync's start, which precedes the read.
+          if (resolved.preparedReadStartedAt !== undefined) resolvedAt = resolved.preparedReadStartedAt;
         } catch (error) {
           // The preparation expired or was rebound between two writes: under
           // the held lock that is a deferral, never a refusal. Earlier writes
@@ -3661,9 +3676,6 @@ function syncTokensUnderLock(
           }
           throw error;
         }
-        // The value is as old as the read before the lock: reusing it here
-        // does not make it younger.
-        if (options.preparedSourceTruth) resolvedAt = prepared?.readsStartedAt ?? syncNowMs;
       }
       fence();
       if (runtime.id) {

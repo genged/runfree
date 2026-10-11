@@ -1796,7 +1796,10 @@ The host CLI records the source and syncs resolved values into proxy-only token 
 `runfree up`, a cold start, and a replaced proxy read every source before the
 lifecycle lock (source-truth). A cold session launch then publishes those
 values under the lock it hands to admission, reading nothing there and keeping
-each receipt's age from the read before the lock. A warm session launch reuses what the proxy
+each receipt's age from the read before the lock. Every other sync that writes
+a value read before the lock (the fallback after a deferral, a cold launch
+that is not handed off, a warm launch's re-read) keeps that age too; reuse
+never makes a value younger. A warm session launch reuses what the proxy
 already holds: it skips re-reading a source only when a host receipt matches
 the source's fingerprint and the live token-store generation, the proxy holds
 the value, the last read is under 15 minutes old, and the source's refresh
