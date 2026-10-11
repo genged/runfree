@@ -3721,20 +3721,30 @@ describe("token auto refresh stop protocol", () => {
       }
       watcherPid = Number(fs.readFileSync(`${configPath}.pid`, "utf8"));
       parent.stdin?.write("stop\n");
-      await parentExited;
+      const exited = await Promise.race([
+        parentExited.then(() => true),
+        new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 15_000)),
+      ]);
+      if (!exited) throw new Error("stop probe parent did not exit after stop");
       await waitFor(() => events().some((event) => event.startsWith("watcher-sigterm")), 5_000);
       // Room for a group signal to have reached the member too.
       await new Promise((resolve) => setTimeout(resolve, 500));
       return events();
     } finally {
-      parent.kill("SIGKILL");
-      // The probe outlives its parent on purpose; it is still running here
-      // (it ends itself after 20 s), so its group is ours to end.
+      if (parent.exitCode === null && parent.signalCode === null) parent.kill("SIGKILL");
+      // The probe outlives its parent on purpose (it ends itself after 20 s).
+      // Its group is ended only after a fresh listing shows the PID still
+      // leads its own group and runs with this test's temporary directory in
+      // its argv: a PID read earlier may have been reused.
       if (watcherPid !== undefined) {
-        try {
-          process.kill(-watcherPid, "SIGKILL");
-        } catch {
-          // Already gone.
+        const row = childProcess.spawnSync("ps", ["-ww", "-o", "pgid=", "-o", "args=", "-p", String(watcherPid)], { encoding: "utf8" }).stdout.trim();
+        const match = /^(\d+)\s+(.*)$/.exec(row);
+        if (match && Number(match[1]) === watcherPid && match[2].includes(tmp)) {
+          try {
+            process.kill(-watcherPid, "SIGKILL");
+          } catch {
+            // Exited since the listing.
+          }
         }
       }
     }
