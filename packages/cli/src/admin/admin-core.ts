@@ -1834,18 +1834,30 @@ function proxyRuntimeValidationIssue(project: string, proxyId: string, agentId: 
   return liveRuntimeComponentValidationIssue(parsed, target);
 }
 
-function writeProxyRuntimeToken(proxyId: string, name: string, value: string): void {
-  assertTokenFilename(name);
-  const tokenFile = `${CONTAINER_SECRET_DIR}/${name}`;
+/**
+ * The proxy-side token write. The value arrives only on stdin; the host
+ * declares its byte length, and the temporary file replaces the token only
+ * when exactly that many bytes arrived. A Docker client killed mid-stdin can
+ * hand the remote `cat` an early end of file; that short value is discarded
+ * and the held token stays as it was.
+ */
+export function proxyTokenWriteScript(tokenFile: string, byteLength: number): string {
+  if (!Number.isSafeInteger(byteLength) || byteLength <= 0) throw new Error("internal: a proxy token write needs a positive byte length");
   const tmpFile = `${tokenFile}.tmp`;
-  const command = [
+  return [
     "set -e",
     "umask 077",
     `rm -f ${shellSingleQuote(tmpFile)}`,
     `cat > ${shellSingleQuote(tmpFile)}`,
+    `if [ $(wc -c < ${shellSingleQuote(tmpFile)}) -ne ${byteLength} ]; then rm -f ${shellSingleQuote(tmpFile)}; echo 'proxy token write incomplete; the held token is unchanged' >&2; exit 1; fi`,
     `chmod 600 ${shellSingleQuote(tmpFile)}`,
     `mv ${shellSingleQuote(tmpFile)} ${shellSingleQuote(tokenFile)}`,
   ].join("; ");
+}
+
+function writeProxyRuntimeToken(proxyId: string, name: string, value: string): void {
+  assertTokenFilename(name);
+  const command = proxyTokenWriteScript(`${CONTAINER_SECRET_DIR}/${name}`, Buffer.byteLength(value, "utf8"));
   // The token reaches the process only through `input` (stdin), never argv
   // or env; `adminDockerClient()` is the same client every other admin
   // docker call builds through.
