@@ -152,6 +152,13 @@ function runParent(configPath: string): void {
       handle.stop();
       process.stdout.write("stopped\n", () => process.exit(0));
     });
+    // The session CLI's own ending: stop, then simply return, so the process
+    // exits only once nothing it still references keeps its event loop alive.
+    commands.set("stop-and-return", () => {
+      handle.stop();
+      lines.close();
+      process.stdin.destroy();
+    });
   } else {
     const plan = buildTokenAutoRefreshSpawnPlan({
       base: { command: process.execPath, args: [...process.execArgv, process.argv[1] as string] },

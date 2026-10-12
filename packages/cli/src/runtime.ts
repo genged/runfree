@@ -377,6 +377,12 @@ function startTokenAutoRefreshProcess(
     stop: () => {
       closeTokenAutoRefreshLifetimePipe(child, plan);
       stopTokenAutoRefreshChild(child);
+      // The watcher now winds down on its own (in-flight writes finish, its
+      // providers are joined, all bounded) and is built to outlive this
+      // process. Waiting for it would add that wind-down to every session's
+      // exit, so nothing here keeps this process alive for it.
+      child.unref();
+      for (const stream of child.stdio) (stream as { unref?: () => void } | null)?.unref?.();
     },
   };
 }

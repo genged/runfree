@@ -3843,7 +3843,7 @@ describe("token auto refresh invocation", () => {
 // process, against a probe watcher (scripts/credential-watch.test-harness.ts)
 // that records the signals it and one member of its process group receive.
 describe("token auto refresh stop protocol", () => {
-  async function stopProbeEvents(): Promise<string[]> {
+  async function stopProbeEvents(command = "stop", timing: { exitMs?: number } = {}): Promise<string[]> {
     const projectRoot = path.join(tmp, "project");
     const project = prepareProject(projectRoot);
     const probeDir = fs.mkdtempSync(path.join(tmp, "stop-probe-"));
@@ -3876,12 +3876,14 @@ describe("token auto refresh stop protocol", () => {
         throw new Error(`stop probe did not start: ${JSON.stringify(events())}`);
       }
       watcherPid = Number(fs.readFileSync(`${configPath}.pid`, "utf8"));
-      parent.stdin?.write("stop\n");
+      const stoppedAt = Date.now();
+      parent.stdin?.write(`${command}\n`);
       const exited = await Promise.race([
         parentExited.then(() => true),
         new Promise<boolean>((resolve) => setTimeout(() => resolve(false), 15_000)),
       ]);
       if (!exited) throw new Error("stop probe parent did not exit after stop");
+      timing.exitMs = Date.now() - stoppedAt;
       await waitFor(() => events().some((event) => event.startsWith("watcher-sigterm")), 5_000);
       // Room for a group signal to have reached the member too.
       await new Promise((resolve) => setTimeout(resolve, 500));
@@ -3913,6 +3915,18 @@ describe("token auto refresh stop protocol", () => {
   // The watcher owns its providers' cleanup; a group signal from the parent
   // also kills an in-flight Docker client, turning a completed proxy write
   // into an unknown outcome.
+  // The watcher winds down on its own after the signal: it lets in-flight
+  // writes finish and joins its providers, bounded, and it is built to outlive
+  // its parent. The session CLI must not wait for that: the probe here stays
+  // up for 20 s after its signal, and the parent, which only returns, still
+  // has to exit at once.
+  test("stop does not keep the session process alive while the watcher winds down", async () => {
+    const timing: { exitMs?: number } = {};
+    const events = await stopProbeEvents("stop-and-return", timing);
+    expect(events.some((event) => event.startsWith("watcher-sigterm"))).toBe(true);
+    expect(timing.exitMs).toBeLessThan(5_000);
+  }, 60_000);
+
   test("stop signals only the watcher, not the other members of its process group", async () => {
     const events = await stopProbeEvents();
     expect(events.some((event) => event.startsWith("watcher-sigterm"))).toBe(true);
