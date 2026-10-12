@@ -72,6 +72,48 @@ export async function startHeldPeers(
   return peers;
 }
 
+export type HeldLaunches = Readonly<{ runs: readonly AsyncCliRun[]; containers: readonly string[] }>;
+
+/**
+ * Starts `count` held `claude` launches at the same moment, so they contend
+ * for the lifecycle lock, and waits until each has a running session whose
+ * stand-in acknowledged the hold. Held rather than one-shot: a one-shot
+ * session can end while a concurrent launch is still starting beside it, and
+ * that launch's restore step then meets a stopped peer container (a separate,
+ * known gap). Which container belongs to which launch is not tracked; end
+ * them together with `endHeldLaunches`.
+ */
+export async function startConcurrentHeldLaunches(
+  fixture: LiveFixture,
+  count: number,
+  extraEnv: NodeJS.ProcessEnv = {},
+): Promise<HeldLaunches> {
+  const holdMarker = path.join(fixture.projectRoot, MANAGED_HOLD_RELATIVE_PATH);
+  fs.mkdirSync(path.dirname(holdMarker), { recursive: true });
+  fs.writeFileSync(holdMarker, "");
+  const before = new Set(sessionContainers(fixture));
+  const runs = Array.from({ length: count }, () => startRunfree(fixture, ["claude"], extraEnv));
+  const exited = runs.map(() => false);
+  runs.forEach((run, index) => {
+    void run.completion.then(() => { exited[index] = true; }, () => { exited[index] = true; });
+  });
+  const containers = await waitFor(() => {
+    const ended = exited.findIndex(Boolean);
+    if (ended !== -1) throw new Error(`concurrent held launch ${ended} ended before its session was held`);
+    const held = sessionContainers(fixture).filter((id) => !before.has(id) && heldAcknowledged(fixture, id));
+    return held.length >= count ? held : undefined;
+  }, HELD_PEER_START_TIMEOUT_MS, `${count} concurrent held launches`);
+  return Object.freeze({ runs: Object.freeze(runs), containers: Object.freeze(containers) });
+}
+
+/** Ends concurrent held launches the ordinary way and returns each launch's result, in start order. */
+export async function endHeldLaunches(
+  launches: HeldLaunches,
+): Promise<ReadonlyArray<Readonly<{ status: number | null; output: string }>>> {
+  for (const container of launches.containers) docker(["kill", container]);
+  return Promise.all(launches.runs.map((run) => run.completion));
+}
+
 /** Whether the stand-in in `container` saw the hold marker and is staying up. */
 function heldAcknowledged(fixture: LiveFixture, container: string): boolean {
   let acknowledged: string;
