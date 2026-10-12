@@ -1295,7 +1295,7 @@ export async function startRuntime(
   const verbose = rebuildOptions.verbose === true;
   reportRuntimeStart(removeExisting ? "rebuilding runtime" : "starting runtime");
   const timings = createRuntimeTimings(context.env);
-  const operations = timings.enabled ? createOperationHistogram() : undefined;
+  const operations = timings.enabled ? createOperationHistogram(timings.operation) : undefined;
   if (operations) io = withOperationHistogram(io, operations);
   const containmentIO = io;
   const startupStartedAt = performance.now();

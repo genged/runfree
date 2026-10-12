@@ -21,7 +21,7 @@ const COMMAND_NAME = /^[a-z][a-z0-9._-]*$/;
 export type OperationHistogramBucket = Readonly<{ count: number; totalMs: number }>;
 
 export type OperationHistogram = Readonly<{
-  record(category: string, durationMs: number): void;
+  record(category: string, durationMs: number, startedAt?: number): void;
   lines(): string[];
   /** A copy of every category's count and total; keys are categories only. */
   snapshot(): Readonly<Record<string, OperationHistogramBucket>>;
@@ -38,14 +38,17 @@ export function subprocessCategory(command: string, args: readonly string[]): st
   return `docker ${first}`;
 }
 
-export function createOperationHistogram(): OperationHistogram {
+export function createOperationHistogram(
+  trace?: (category: string, startedAt: number, endedAt: number) => void,
+): OperationHistogram {
   const buckets = new Map<string, { count: number; totalMs: number }>();
   return Object.freeze({
-    record(category: string, durationMs: number): void {
+    record(category: string, durationMs: number, startedAt?: number): void {
       const bucket = buckets.get(category) ?? { count: 0, totalMs: 0 };
       bucket.count += 1;
       bucket.totalMs += durationMs;
       buckets.set(category, bucket);
+      if (startedAt !== undefined) trace?.(category, startedAt, startedAt + durationMs);
     },
     lines(): string[] {
       return [...buckets.entries()]
@@ -66,7 +69,7 @@ export function withOperationHistogram(io: RuntimeIO, histogram: OperationHistog
     try {
       return call();
     } finally {
-      histogram.record(subprocessCategory(command, args), performance.now() - startedAt);
+      histogram.record(subprocessCategory(command, args), performance.now() - startedAt, startedAt);
     }
   };
   const timedAsync = async <T>(command: string, args: string[], call: () => Promise<T>): Promise<T> => {
@@ -74,7 +77,7 @@ export function withOperationHistogram(io: RuntimeIO, histogram: OperationHistog
     try {
       return await call();
     } finally {
-      histogram.record(subprocessCategory(command, args), performance.now() - startedAt);
+      histogram.record(subprocessCategory(command, args), performance.now() - startedAt, startedAt);
     }
   };
   const { captureAsync } = io;

@@ -8,6 +8,7 @@ import { runCommandApp } from "./commands/app.ts";
 import { createCommandContext } from "./commands/context.ts";
 import { printHelpTopic } from "./commands/help-topics.ts";
 import { CliError, die, renderUnexpectedError, UNEXPECTED_ERROR_RENDER_LIMITS } from "./errors.ts";
+import { createRuntimeTimings } from "./runtime/timings.ts";
 import { installSignalExit } from "./signal-exit.ts";
 import { flushWarnings, runfreeError } from "./warnings.ts";
 
@@ -67,6 +68,10 @@ function parseArgs(argv: string[], env: NodeJS.ProcessEnv = process.env): Parsed
 }
 
 export async function runCli(argv: string[], env: NodeJS.ProcessEnv = process.env): Promise<number> {
+  const timings = createRuntimeTimings(env);
+  if (timings.enabled) {
+    timings.report("cli-entry", JSON.stringify({ pid: process.pid, processTimeOriginMs: performance.timeOrigin, entryMs: performance.now() }));
+  }
   const { projectRoot, invocationCwd, commandArgs } = parseArgs(argv, env);
   const command = commandArgs[0];
 
