@@ -72,9 +72,9 @@ new authority fails with exact `policy approve`/`control approve` commands.
 Created project files include:
 
 ```text
+.runfree/.gitignore
 .runfree/runfree.json
 .runfree/network-policy.json
-.runfree/config/
 ```
 
 ## Agent Runtime

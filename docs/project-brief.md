@@ -63,7 +63,7 @@ The primary audience is individual developers using Claude Code, Codex, or Pi wh
 
 ## Supported Release Shape
 
-As of `0.5.1`:
+As of `0.5.2`:
 
 - published binary: `darwin-arm64` only, ad-hoc signed and not notarized, with a SHA-256 manifest;
 - host: Apple Silicon macOS;
