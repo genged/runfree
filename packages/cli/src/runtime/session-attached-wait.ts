@@ -40,6 +40,19 @@ export function lostForegroundStream(completion: SessionContainerForegroundCompl
 }
 
 /**
+ * Whether the last written file's lease had lapsed by the time `next` was
+ * inspected. Both times come from the same host clock, so they compare
+ * directly. No previous file, or one whose deadline cannot be read, counts as
+ * lapsed: the session had no window to be served in.
+ */
+function leaseLapsedBefore(previousExpiry: string | undefined, next: SessionFileV1): boolean {
+  const expiry = previousExpiry === undefined ? Number.NaN : Date.parse(previousExpiry);
+  const inspected = Date.parse(next.inspectedAt);
+  if (!Number.isFinite(expiry) || !Number.isFinite(inspected)) return true;
+  return expiry <= inspected;
+}
+
+/**
  * What one confirming inspection says about a lost foreground stream.
  *
  *   reattach  the exact anchored incarnation is still running, and this session
@@ -250,8 +263,12 @@ export async function waitForAttachedSessionCompletion(
         const outcome = await ports.beat();
         beat = outcome;
         if (outcome.kind === "written") {
-          // Only after a gap: a healthy beat is silent.
-          if (failures > 0 || faulted) runfreeLog("session network restored");
+          // Only after a gap that actually cost the network: a healthy beat is
+          // silent, and so is a gap the previous file's lease outlasted — the
+          // proxy kept serving throughout, so there is nothing to restore.
+          if ((failures > 0 || faulted) && leaseLapsedBefore(ports.leaseExpiry(), outcome.file)) {
+            runfreeLog("session network restored");
+          }
           failures = 0;
           faulted = false;
           ports.onBeatWritten(outcome.file);

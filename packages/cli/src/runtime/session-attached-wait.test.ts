@@ -23,7 +23,10 @@ function foregroundHandle(): { handle: SessionContainerForegroundHandle; settle:
   return { handle: { completion } as unknown as SessionContainerForegroundHandle, settle };
 }
 
-const writtenFile = { aliveUntil: "2026-09-30T00:05:00.000Z" } as unknown as SessionFileV1;
+const writtenFile = {
+  inspectedAt: "2026-09-30T00:00:00.000Z",
+  aliveUntil: "2026-09-30T00:05:00.000Z",
+} as unknown as SessionFileV1;
 
 function ports(overrides: Partial<AttachedSessionWaitPorts> & { foreground: SessionContainerForegroundHandle }): AttachedSessionWaitPorts {
   return {
@@ -122,18 +125,25 @@ describe("attached session wait", () => {
     await expect(outcome).resolves.toEqual({ status: 0, signal: null });
   });
 
-  test("failing beats never end the session; a written beat after a gap is announced", async () => {
+  test.each([
+    { case: "a gap that outlived the lease is announced", previousExpiry: "2026-09-30T00:00:00.000Z", announced: true },
+    { case: "a gap the lease outlasted is silent", previousExpiry: "2026-09-30T00:00:00.001Z", announced: false },
+  ])("failing beats never end the session; $case", async ({ previousExpiry, announced }) => {
     const { handle, settle } = foregroundHandle();
     const outcomes: HeartbeatOutcome[] = [
       { kind: "unavailable", error: Object.assign(new Error("daemon busy")) } as HeartbeatOutcome,
       { kind: "unavailable", error: Object.assign(new Error("daemon busy")) } as HeartbeatOutcome,
       { kind: "written", file: writtenFile },
     ];
-    const wait = ports({ foreground: handle, beat: vi.fn(async (): Promise<HeartbeatOutcome> => outcomes.shift() ?? { kind: "written", file: writtenFile }) });
+    const wait = ports({
+      foreground: handle,
+      beat: vi.fn(async (): Promise<HeartbeatOutcome> => outcomes.shift() ?? { kind: "written", file: writtenFile }),
+      leaseExpiry: vi.fn(() => previousExpiry),
+    });
     const outcome = waitForAttachedSessionCompletion(wait);
     await vi.advanceTimersByTimeAsync(10_000);
     expect(wait.onBeatRetrying).toHaveBeenCalledTimes(2);
-    expect(lines.some((line) => line.includes("session network restored"))).toBe(true);
+    expect(lines.some((line) => line.includes("session network restored"))).toBe(announced);
     settle({ kind: "exit", code: 0, signal: null });
     await expect(outcome).resolves.toEqual({ status: 0, signal: null });
   });

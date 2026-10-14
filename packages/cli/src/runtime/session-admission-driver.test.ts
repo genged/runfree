@@ -2731,8 +2731,9 @@ describe("session admission under the per-session file source", () => {
       // file actually granted; a written beat stamps `served` again.
       expect(stamped()).toEqual(["served", "retrying", "retrying", "retrying", "served", "served"]);
       expect(mocks.writeHostStatus.mock.calls[1]?.[1]).toMatchObject({ aliveUntil: admitted.aliveUntil });
-      // Announced once, and only after a gap.
-      expect(output.drain().filter((line) => line.includes("session network restored"))).toHaveLength(1);
+      // Silent: the gap ended well inside the last file's lease, so the
+      // network was never lost.
+      expect(output.drain().filter((line) => line.includes("session network restored"))).toHaveLength(0);
       // No failing beat revoked, paused, or tore anything down.
       expect(input.sessionLockManager.withLock).not.toHaveBeenCalled();
       expect(mocks.events).not.toContain("session-file:delete");
@@ -2898,7 +2899,8 @@ describe("session admission under the per-session file source", () => {
       await vi.advanceTimersByTimeAsync(3_600);
       expect(beats()).toBe(2);
       expect(writes()).toBe(2);
-      expect(output.drain().filter((line) => line.includes("session network restored"))).toHaveLength(1);
+      // The fault ended inside the lease, so nothing was lost to restore.
+      expect(output.drain().filter((line) => line.includes("session network restored"))).toHaveLength(0);
       expect(output.drain().filter((line) => line.includes("host-side fault"))).toHaveLength(3);
 
       finishForeground({ kind: "exit", code: 0, signal: null });
