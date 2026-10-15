@@ -6,8 +6,8 @@ import {
 import { assertSessionContainerRecordProject } from "./session-containers.ts";
 import { isRecord } from "../strict-primitives.ts";
 
-export const SESSION_NAMED_VOLUME_INSPECT_MAX_BYTES = 256 * 1024;
-export const SESSION_NAMED_VOLUME_MAX_COUNT = 64;
+// Sized for SESSION_CONTAINER_MAX_MOUNTS volumes, the most a plan can mount.
+export const SESSION_NAMED_VOLUME_INSPECT_MAX_BYTES = 512 * 1024;
 
 const COMPOSE_RESOURCE_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.-]*$/;
 const CONTROL_CHARACTER_PATTERN = /[\u0000-\u001f\u007f-\u009f]/u;
@@ -105,9 +105,6 @@ export function sessionNamedVolumeExpectations(
     }
     targets.push(mount.target);
     byName.set(mount.source, { logicalName, targets });
-  }
-  if (byName.size > SESSION_NAMED_VOLUME_MAX_COUNT) {
-    throw new Error(`session container plan exceeds ${SESSION_NAMED_VOLUME_MAX_COUNT} named volumes`);
   }
   return Object.freeze([...byName.entries()]
     .sort(([left], [right]) => left.localeCompare(right))

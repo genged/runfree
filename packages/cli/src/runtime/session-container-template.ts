@@ -70,7 +70,9 @@ const COMPOSE_VOLUME_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.-]*$/;
 const COMPOSE_INTERPOLATION_PATTERN = /\$\{([A-Za-z_][A-Za-z0-9_]*)(?:(:-|-|:\?|\?)([^}]*))?\}/g;
 const ENVIRONMENT_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const MAX_TEMPLATE_ENVIRONMENT_ENTRIES = 512;
-const MAX_TEMPLATE_MOUNTS = 256;
+// The one bound on a session container's mounts. Named volumes are a subset of
+// these mounts, so it also bounds the named-volume proof.
+export const SESSION_CONTAINER_MAX_MOUNTS = 256;
 const MAX_TEMPLATE_TEXT_LENGTH = 16 * 1024;
 
 declare const sessionContainerTemplateBrand: unique symbol;
@@ -285,6 +287,13 @@ function sessionMounts(input: SessionContainerTemplateInput): SessionContainerMo
     }),
   ].sort((left, right) => left.target.localeCompare(right.target) || left.source.localeCompare(right.source));
 
+  if (mounts.length > SESSION_CONTAINER_MAX_MOUNTS) {
+    const overlayCount = input.dependencyOverlays.overlays.length + input.dependencyOverlays.storeVolumes.length;
+    throw new Error(
+      `session container needs ${mounts.length} mounts, more than the limit of ${SESSION_CONTAINER_MAX_MOUNTS}; `
+      + `${overlayCount} are dependency overlay volumes — set runtime.dependencyOverlays to "off" in .runfree/runfree.json to mount none`,
+    );
+  }
   const targets = new Set<string>();
   for (const mount of mounts) {
     if (targets.has(mount.target)) throw new Error(`duplicate session-container template mount: ${mount.target}`);
@@ -386,7 +395,7 @@ export function createSessionContainerTemplateFromArtifact(
     }
     environment[name] = entry;
   }
-  if (value.mounts.length > MAX_TEMPLATE_MOUNTS) {
+  if (value.mounts.length > SESSION_CONTAINER_MAX_MOUNTS) {
     throw new Error("session-template artifact has too many mounts");
   }
   const mounts: SessionContainerMount[] = [];

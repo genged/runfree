@@ -13,7 +13,10 @@ import {
   sessionContainerTemplateFixture,
   sessionTestDependencies,
 } from "./session-container.test-harness.ts";
-import type { SessionContainerCreatePlan } from "./session-container-template.ts";
+import {
+  SESSION_CONTAINER_MAX_MOUNTS,
+  type SessionContainerCreatePlan,
+} from "./session-container-template.ts";
 
 function digest(character: string): string {
   return `sha256:${character.repeat(64)}`;
@@ -21,6 +24,24 @@ function digest(character: string): string {
 
 function volume(logicalName: string): string {
   return `${PROJECT.composeProject}_${logicalName}`;
+}
+
+// `longNames` pads each physical volume name to Docker's 255-character limit.
+function overlayDependencies(count: number, longNames = false) {
+  const base = sessionTestDependencies();
+  const prefix = "runfree-deps-0123456789ab-";
+  const physicalPrefixLength = `${PROJECT.composeProject}_`.length;
+  return {
+    ...base,
+    overlays: Array.from({ length: count }, (_, index) => ({
+      path: `${base.projectRoot}/packages/p${index}/node_modules`,
+      hostRelativePath: `packages/p${index}/node_modules`,
+      volume: longNames
+        ? `${prefix}${String(index).padStart(3, "0")}`.padEnd(255 - physicalPrefixLength, "x")
+        : `${prefix}packages-p${index}-node_modules`,
+      reason: "pnpm workspace package",
+    })),
+  };
 }
 
 function plan(): SessionContainerCreatePlan {
@@ -60,6 +81,40 @@ describe("session named-volume inspection proof", () => {
     expect(() => assertSessionNamedVolumeProof(plan(), proof)).toThrow("different session plan");
     expect(() => validateSessionNamedVolumeInspect(JSON.stringify(inspect(plan())), value))
       .toThrow("exact expected volume set");
+  });
+
+  // A monorepo mounts one overlay per workspace package. The template's mount
+  // bound is the only volume bound, so a plan the template admits is provable.
+  test("proves a monorepo plan with more than 64 named volumes", () => {
+    const value = sessionContainerCreatePlanFixture({
+      template: sessionContainerTemplateFixture({ dependencyOverlays: overlayDependencies(100) }),
+    });
+    expect(sessionNamedVolumeInspectRequest(value)?.exactNames).toHaveLength(101);
+    const proof = validateSessionNamedVolumeInspect(JSON.stringify(inspect(value)), value);
+    expect(proof.volumes).toHaveLength(101);
+  });
+
+  test("the inspection of the largest admitted plan fits the size limit", () => {
+    const template = sessionContainerTemplateFixture({ dependencyOverlays: overlayDependencies(0) });
+    const fixedMounts = template.mounts.length - 1;
+    const value = sessionContainerCreatePlanFixture({
+      template: sessionContainerTemplateFixture({
+        dependencyOverlays: overlayDependencies(SESSION_CONTAINER_MAX_MOUNTS - fixedMounts - 1, true),
+      }),
+    });
+    expect(value.mounts).toHaveLength(SESSION_CONTAINER_MAX_MOUNTS);
+    expect(sessionNamedVolumeExpectations(value).every((volume) => volume.name.length <= 255)).toBe(true);
+    expect(sessionNamedVolumeExpectations(value).some((volume) => volume.name.length === 255)).toBe(true);
+    const evidence = JSON.stringify(inspect(value), null, 4);
+    expect(Buffer.byteLength(evidence)).toBeLessThan(SESSION_NAMED_VOLUME_INSPECT_MAX_BYTES);
+    expect(validateSessionNamedVolumeInspect(evidence, value).volumes.length)
+      .toBe(SESSION_CONTAINER_MAX_MOUNTS - fixedMounts);
+  });
+
+  test("refuses a plan over the mount limit when the template is built, naming the remedy", () => {
+    expect(() => sessionContainerTemplateFixture({
+      dependencyOverlays: overlayDependencies(SESSION_CONTAINER_MAX_MOUNTS),
+    })).toThrow(/more than the limit of 256; 257 are dependency overlay volumes — set runtime\.dependencyOverlays to "off"/);
   });
 
   test("inspects only exact physical names and returns a canonical proof", () => {
