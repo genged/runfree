@@ -22,9 +22,7 @@ import {
   TOKEN_NAME_PATTERN,
   type WriteAction,
   assertTokenName,
-  credentialSchemeList,
   describeRequestRule,
-  isCredentialScheme,
   isTokenName,
   normalizeHostname,
   normalizePathPrefix,
@@ -1332,31 +1330,17 @@ export function isUserServiceOwnedTokenSource(source: TokenSource | undefined, i
 // token add/link and host add. `host` is already normalized by the caller.
 export type CredentialFieldsInput = { host?: string; header?: string; scheme?: string; pathPrefix?: string };
 
-export function credentialFromHost(host: string, fields: CredentialFieldsInput): CredentialPolicyJson {
-  const header = fields.header ?? "Authorization";
-  if (header.trim() === "") die("--header must be non-empty");
-
-  const rawScheme = fields.scheme ?? "bearer";
-  if (!isCredentialScheme(rawScheme)) die(`--scheme must be one of: ${credentialSchemeList()}`);
-
-  if (fields.pathPrefix === undefined) return { host, header, scheme: rawScheme };
-
-  try {
-    return {
-      host,
-      header,
-      scheme: rawScheme,
-      pathPrefix: normalizePathPrefix(fields.pathPrefix),
-    };
-  } catch (error) {
-    die(error instanceof Error ? error.message : String(error));
-  }
+// `(scheme[:username][, path P][, protocol=X])`: everything that decides what is
+// sent and where, so two mappings on one host and header read apart.
+export function describeCredentialScope(credential: CredentialPolicyJson): string {
+  const scheme = credential.username !== undefined ? `${credential.scheme}:${credential.username}` : credential.scheme;
+  const pathScope = credential.pathPrefix ? `, path ${credential.pathPrefix}` : "";
+  const protocolScope = credential.protocol !== undefined ? `, protocol=${credential.protocol}` : "";
+  return `(${scheme}${pathScope}${protocolScope})`;
 }
 
-
 export function describeCredential(credential: CredentialPolicyJson): string {
-  const pathScope = credential.pathPrefix ? `, path ${credential.pathPrefix}` : "";
-  return `${credential.host} -> ${credential.header} (${credential.scheme}${pathScope})`;
+  return `${credential.host} -> ${credential.header} ${describeCredentialScope(credential)}`;
 }
 
 function childEnvForCommand(command: string): NodeJS.ProcessEnv {
