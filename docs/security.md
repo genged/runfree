@@ -269,7 +269,11 @@ mediated there (rule 6). Commands and the supported remote forms are in
      and other routes behind `/-/`, where a last segment can be any name
      (`…/repository/files/git-upload-pack` is a file API). A `github.com`
      owner named `api` is excluded too: the matcher does not guess per
-     provider.
+     provider. Dots and whitespace at either end of the first segment are
+     ignored for this check, so `%20api` and `.api` count as `api`;
+   - a path with a segment that starts with whitespace after decoding. An
+     origin that trims it could route the request somewhere other than the
+     path the matcher read.
 
    Anything else on the host gets no credential, and its write classification
    is unchanged. A `git-http` destination matches only git smart-HTTP
@@ -302,9 +306,18 @@ mediated there (rule 6). Commands and the supported remote forms are in
      spelled `operation`, whose value is `"download"`.
 
    Anything else is a write: an upload, a malformed or oversized body, a
-   second `Operation`-like key, a missing length, every lock request, and
-   every batch request on a host with no matching `git-lfs` destination. A
-   held request is re-checked without its body, so it stays a write.
+   second `Operation`-like key, a missing length, every `POST` lock request,
+   and every batch request on a host with no `git-lfs` destination that
+   matches the request path. The `GET` lock listing is a read like any `GET`,
+   and on `github.com` it carries the `git-lfs` credential. A held request is
+   re-checked without its body, so it stays a write.
+
+   A git handling rule alone does not make a download a read. The built-in
+   `bitbucket` service declares one on `bitbucket.org` but has no `git-lfs`
+   destination (it has no credential there), so every LFS batch request to
+   `bitbucket.org`, a public download included, waits for approval under
+   `ask`. The same holds on `gitlab.com` (rule 6) and on any host given a git
+   rule by hand, such as with `runfree host rules <host> --deny-git-push`.
 
    The git fetch exemption is narrow in the same way: only `POST` on a
    recognized `…/git-upload-pack` path, with at least one repository segment

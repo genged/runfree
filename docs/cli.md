@@ -506,10 +506,17 @@ desired policy version 3.
 
 A `git-lfs` destination also opts its host into Git LFS mediation: on a host
 with a git handling rule, a Git LFS batch request whose body proves it is a
-download is a read only when a `git-lfs` destination of that host matches it.
-Use it only for an LFS server whose batch responses do not hand back a
-credential broader than one object transfer (see
-[security.md](security.md#git-over-https)).
+download is a read only when a `git-lfs` destination of that host matches it
+(its `pathPrefix`, if any, covers the request path). Use it only for an LFS
+server whose batch responses do not hand back a credential broader than one
+object transfer (see [security.md](security.md#git-over-https)).
+
+A host with a git handling rule but no matching `git-lfs` destination gets no
+LFS read rule: every Git LFS batch request there, a download included, is a
+write and waits for approval under `ask`. This applies to `bitbucket.org`
+under the `bitbucket` service (its LFS downloads, public ones included, now
+wait for approval), to `gitlab.com`, and to any host you give a git rule by
+hand, such as with `runfree host rules <host> --deny-git-push`.
 
 These fields let a host with no curated service, such as GitHub Enterprise
 Server or self-hosted GitLab, get a git credential. One limitation: a
@@ -555,8 +562,9 @@ either, and get no credential:
 - a `POST` endpoint with a query string (only the `GET` lock listing takes
   one);
 - a ref discovery query that contains a `;`;
-- a path whose first segment is `api` (in any case or encoding), including a
-  `github.com` owner named `api`;
+- a path whose first segment is `api` (in any case or encoding, and with any
+  dots or whitespace around it), including a `github.com` owner named `api`;
+- a path with a segment that starts with whitespace, such as `%20repo`;
 - a path with a segment that is exactly `-`, such as GitLab's `/-/` routes.
 
 Any other path on the host gets no credential either.
@@ -572,9 +580,11 @@ runfree host rules github.com --deny-git-push
 ```
 
 On `github.com`, a Git LFS batch request whose body proves it is a download is
-a read; an upload batch and every lock request are writes. On `gitlab.com`,
-every LFS batch request is a write. The proof rules are in
-[security.md](security.md#git-over-https).
+a read; an upload batch and every `POST` lock request are writes. The `GET`
+lock listing is a read, and on `github.com` it carries the `git-lfs`
+credential. On `gitlab.com`, `bitbucket.org`, and every other host without a
+matching `git-lfs` destination, every LFS batch request is a write. The proof
+rules are in [security.md](security.md#git-over-https).
 
 #### SSH remotes
 
