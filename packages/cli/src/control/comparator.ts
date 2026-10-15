@@ -118,8 +118,46 @@ function mappingIsContained(
   return previousPath === undefined || prefixContains(previousPath, nextPath);
 }
 
+function mappingsByHost(
+  mappings: Array<{ credential: CredentialPolicyJson; tokenName: string }>,
+): Map<string, string[]> {
+  const byHost = new Map<string, string[]>();
+  for (const { credential, tokenName } of mappings) {
+    const forHost = byHost.get(credential.host) ?? [];
+    forHost.push(stableJson({ tokenName, credential }));
+    byHost.set(credential.host, forHost);
+  }
+  for (const forHost of byHost.values()) forHost.sort();
+  return byHost;
+}
+
+// The proxy selects a credential host-wide (the protocol tier, then the
+// longest matching pathPrefix, across every header), so on a host with more
+// than one mapping, narrowing, scoping, or removing one mapping can make a
+// different token's mapping win for requests that used to get the changed
+// one. Per-mapping containment cannot prove that is a reduction, so any
+// change to such a host's mapping set needs approval. Removing every mapping
+// of the host stays a reduction: no request there can get a credential.
+function compareMultiMappingHosts(
+  previousMappings: Array<{ credential: CredentialPolicyJson; tokenName: string }>,
+  nextMappings: Array<{ credential: CredentialPolicyJson; tokenName: string }>,
+  reasons: string[],
+): void {
+  const previousByHost = mappingsByHost(previousMappings);
+  const nextByHost = mappingsByHost(nextMappings);
+  for (const host of new Set([...previousByHost.keys(), ...nextByHost.keys()])) {
+    const before = previousByHost.get(host) ?? [];
+    const after = nextByHost.get(host) ?? [];
+    if (after.length === 0 || (before.length <= 1 && after.length <= 1)) continue;
+    if (stableJson(before) !== stableJson(after)) {
+      reasons.push(`${host}: credential mapping changed on a host with more than one mapping`);
+    }
+  }
+}
+
 function compareCredentialAuthority(previous: PolicyJson, next: PolicyJson, reasons: string[]): void {
   const previousMappings = credentialMappings(previous);
+  compareMultiMappingHosts(previousMappings, credentialMappings(next), reasons);
   for (const mapping of credentialMappings(next)) {
     if (!previousMappings.some((candidate) => mappingIsContained(candidate, mapping))) {
       reasons.push(`${mapping.credential.host}: credential mapping added or widened for ${mapping.tokenName}`);

@@ -167,6 +167,60 @@ describe("compareCompiledAuthority", () => {
     expect(compareCompiledAuthority(scopedBasic, scopedBearer)).toEqual({ provenReduction: false, reasons: widening });
   });
 
+  // Credential selection is host-wide (protocol tier, then longest
+  // pathPrefix), so on a host with several mappings a change to one mapping
+  // can make the proxy pick another token's mapping for a request that used
+  // to get the changed one. Per-mapping containment cannot see that.
+  describe("hosts with more than one credential mapping", () => {
+    type Credential = Record<string, string>;
+    const policyWith = (mappings: Record<string, Credential[]>) => compiled({
+      hosts: ["github.com"],
+      tokens: Object.fromEntries(Object.entries(mappings).map(([name, credentials]) => [name, {
+        description: name,
+        credentials: credentials.map((credential) => ({ host: "github.com", header: "Authorization", scheme: "raw", ...credential }) as never),
+      }])),
+    });
+    const changed = ["github.com: credential mapping changed on a host with more than one mapping"];
+
+    test("adding a protocol to the narrow mapping is not a reduction (it exposes the broad mapping)", () => {
+      const previous = policyWith({ narrow: [{ pathPrefix: "/org/" }], broad: [{}] });
+      const next = policyWith({ narrow: [{ pathPrefix: "/org/", protocol: "git-http" }], broad: [{}] });
+      expect(compareCompiledAuthority(previous, next)).toEqual({ provenReduction: false, reasons: changed });
+    });
+
+    test("narrowing the narrow mapping's prefix is not a reduction", () => {
+      const previous = policyWith({ narrow: [{ pathPrefix: "/org/" }], broad: [{}] });
+      const next = policyWith({ narrow: [{ pathPrefix: "/org/repo/" }], broad: [{}] });
+      expect(compareCompiledAuthority(previous, next)).toEqual({ provenReduction: false, reasons: changed });
+    });
+
+    test("removing a mapping that hides another one is not a reduction", () => {
+      const previous = policyWith({ git: [{ protocol: "git-http" }], broad: [{}] });
+      const next = policyWith({ broad: [{}] });
+      expect(compareCompiledAuthority(previous, next)).toEqual({ provenReduction: false, reasons: changed });
+      const hidingByPrefix = policyWith({ narrow: [{ pathPrefix: "/org/" }], broad: [{}] });
+      expect(compareCompiledAuthority(hidingByPrefix, next)).toEqual({ provenReduction: false, reasons: changed });
+    });
+
+    test("a mapping on another header still counts: selection is host-wide", () => {
+      const previous = policyWith({ git: [{ protocol: "git-http" }], api: [{ header: "X-Api-Key" }] });
+      const next = policyWith({ api: [{ header: "X-Api-Key" }] });
+      expect(compareCompiledAuthority(previous, next).provenReduction).toBe(false);
+    });
+
+    test("an unchanged mapping set, or removing every mapping of the host, is still a reduction", () => {
+      const both = policyWith({ narrow: [{ pathPrefix: "/org/" }], broad: [{}] });
+      expect(compareCompiledAuthority(both, both)).toEqual({ provenReduction: true, reasons: [] });
+      expect(compareCompiledAuthority(both, policyWith({}))).toEqual({ provenReduction: true, reasons: [] });
+    });
+
+    test("a single-mapping narrowing stays a reduction", () => {
+      const previous = policyWith({ only: [{ pathPrefix: "/org/" }] });
+      const next = policyWith({ only: [{ pathPrefix: "/org/repo/", protocol: "git-http" }] });
+      expect(compareCompiledAuthority(previous, next)).toEqual({ provenReduction: true, reasons: [] });
+    });
+  });
+
   test("treats Git and GraphQL changes as incomparable unless Git becomes deny", () => {
     const base = compiled({ hosts: ["git.example.com"], requests: { "git.example.com": { gitPush: "write" } } });
     expect(compareCompiledAuthority(base, compiled({ hosts: ["git.example.com"], requests: { "git.example.com": { gitPush: "deny" } } })).provenReduction)
