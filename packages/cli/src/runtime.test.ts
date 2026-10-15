@@ -3399,6 +3399,15 @@ describe("runtime recovery", () => {
       "[user]",
       "\tname = \"Repo Local\"",
       "\temail = \"repo-local@example.test\"",
+      "[url \"https://github.com/\"]",
+      "\tinsteadOf = git@github.com:",
+      "\tinsteadOf = ssh://git@github.com/",
+      "\tinsteadOf = ssh://git@github.com:22/",
+      "\tinsteadOf = ssh://git@ssh.github.com:443/",
+      "[url \"https://gitlab.com/\"]",
+      "\tinsteadOf = git@gitlab.com:",
+      "\tinsteadOf = ssh://git@gitlab.com/",
+      "\tinsteadOf = ssh://git@gitlab.com:22/",
       "",
     ].join("\n"));
     expect(fs.statSync(project.paths.gitConfigPath).mode & 0o777).toBe(0o644);
@@ -3441,6 +3450,15 @@ describe("runtime recovery", () => {
       "[user]",
       "\tname = \"Host Global\"",
       "\temail = \"host-global@example.test\"",
+      "[url \"https://github.com/\"]",
+      "\tinsteadOf = git@github.com:",
+      "\tinsteadOf = ssh://git@github.com/",
+      "\tinsteadOf = ssh://git@github.com:22/",
+      "\tinsteadOf = ssh://git@ssh.github.com:443/",
+      "[url \"https://gitlab.com/\"]",
+      "\tinsteadOf = git@gitlab.com:",
+      "\tinsteadOf = ssh://git@gitlab.com/",
+      "\tinsteadOf = ssh://git@gitlab.com:22/",
       "",
     ].join("\n"));
   });

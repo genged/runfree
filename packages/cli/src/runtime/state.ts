@@ -407,8 +407,34 @@ function sandboxGitConfigSource(name: string | undefined, email: string | undefi
     "[safe]",
     ...sandboxGitSafeDirectoryEntries(),
     ...(entries.length > 0 ? ["[user]", ...entries] : []),
+    ...sandboxGitSshToHttpsRewrites(),
     "",
   ].join("\n");
+}
+
+// SSH remote forms rewritten to HTTPS, per supported git host. This is
+// routing, not enforcement: the agent can override it with `git -c`,
+// `GIT_CONFIG_*` or repository config, and gains nothing, because SSH egress
+// stays blocked and HTTPS goes through the proxy either way. Emitted
+// unconditionally, so a remote on a host that is not enabled fails with the
+// proxy's denial and remedy instead of an opaque SSH connect error. Git's
+// prefix match does not equate `host/` with `host:22/`, so both are listed.
+const SANDBOX_GIT_SSH_TO_HTTPS: readonly { readonly base: string; readonly prefixes: readonly string[] }[] = [
+  {
+    base: "https://github.com/",
+    prefixes: ["git@github.com:", "ssh://git@github.com/", "ssh://git@github.com:22/", "ssh://git@ssh.github.com:443/"],
+  },
+  {
+    base: "https://gitlab.com/",
+    prefixes: ["git@gitlab.com:", "ssh://git@gitlab.com/", "ssh://git@gitlab.com:22/"],
+  },
+];
+
+function sandboxGitSshToHttpsRewrites(): string[] {
+  return SANDBOX_GIT_SSH_TO_HTTPS.flatMap(({ base, prefixes }) => [
+    `[url "${base}"]`,
+    ...prefixes.map((prefix) => `\tinsteadOf = ${prefix}`),
+  ]);
 }
 
 export function ensureSandboxGitConfig(
