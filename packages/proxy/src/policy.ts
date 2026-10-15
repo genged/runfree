@@ -345,18 +345,26 @@ function decodeToConvergence(value: string): string | undefined {
   return undefined;
 }
 
-// The name a routing origin may reduce a path's last segment to: decoded to a
-// fixed point, cut at a NUL, split on `/` and `\`, each segment stripped of
-// `;params` and trailing dots or whitespace, empty segments dropped, and
-// lowercased. Undefined when decoding does not converge.
-function canonicalPathSegments(pathName: string): string[] | undefined {
-  const decoded = decodeToConvergence(pathName);
-  if (decoded === undefined) return undefined;
+// The segment half of canonicalPathSegments, factored out so a caller that
+// already holds the converged decode (e.g. because it also needs to inspect
+// it for a NUL) can reuse it instead of decoding the same path twice: cut at
+// a NUL, split on `/` and `\`, each segment stripped of `;params` and
+// trailing dots or whitespace, empty segments dropped, and lowercased.
+function segmentsFromDecodedPath(decoded: string): string[] {
   const nul = decoded.indexOf("\0");
   return (nul === -1 ? decoded : decoded.slice(0, nul))
     .split(/[\\/]/u)
     .map((segment) => segment.split(";", 1)[0].replace(/[.\s]+$/u, "").toLowerCase())
     .filter((segment) => segment !== "");
+}
+
+// The name a routing origin may reduce a path's last segment to: decoded to a
+// fixed point, then segmentsFromDecodedPath. Undefined when decoding does not
+// converge.
+function canonicalPathSegments(pathName: string): string[] | undefined {
+  const decoded = decodeToConvergence(pathName);
+  if (decoded === undefined) return undefined;
+  return segmentsFromDecodedPath(decoded);
 }
 
 // The git-push decision is the only check that runs on a `{gitPush:"deny"}`-only
@@ -410,21 +418,22 @@ function hasMethodOverrideHeader(headers: Record<string, string | string[] | und
 // spelling would canonicalize to the same name as the exact RPC. So the
 // exemption only fires when every one of these holds: the path decodes to
 // convergence with no NUL anywhere in the result; its canonical last segment
-// (by the same parser isGitPushPath uses) is "git-upload-pack"; and — the
-// check with no decoding or normalization at all — the raw, merely
-// lower-cased pathName itself ends with the literal suffix
-// "/git-upload-pack". A real git client's upload-pack request already is
-// that exact literal path, so this costs it nothing; it only refuses every
-// encoded, decorated, or NUL-hiding variant that could make the proxy and an
-// origin disagree. Malformed or non-converging encoding, or any check that
-// does not hold, fails closed by NOT matching (the request then falls
+// (via segmentsFromDecodedPath, the same normalization isGitPushPath uses
+// through canonicalPathSegments — reused directly here on the
+// already-decoded string so the path is not decoded to convergence twice) is
+// "git-upload-pack"; and — the check with no decoding or normalization at
+// all — the raw, merely lower-cased pathName itself ends with the literal
+// suffix "/git-upload-pack". A real git client's upload-pack request already
+// is that exact literal path, so this costs it nothing; it only refuses
+// every encoded, decorated, or NUL-hiding variant that could make the proxy
+// and an origin disagree. Malformed or non-converging encoding, or any check
+// that does not hold, fails closed by NOT matching (the request then falls
 // through to the conservative write classification).
 function isGitUploadPackRead(method: string, pathName: string): boolean {
   if (method !== "POST") return false;
   const decoded = decodeToConvergence(pathName);
   if (decoded === undefined || decoded.includes("\0")) return false;
-  const segments = canonicalPathSegments(pathName);
-  if (segments === undefined || segments.at(-1) !== "git-upload-pack") return false;
+  if (segmentsFromDecodedPath(decoded).at(-1) !== "git-upload-pack") return false;
   return pathName.toLowerCase().endsWith("/git-upload-pack");
 }
 

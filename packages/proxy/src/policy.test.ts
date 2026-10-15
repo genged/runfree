@@ -1321,6 +1321,11 @@ describe("write classification (operation-aware read-only / approve-on-write)", 
       ["POST", "/owner/repo.git/git-upload-pack;x"],
       ["POST", "/owner/repo.git/git-upload-pack."],
       ["POST", "/owner/repo.git/git-upload-pack%20"],
+      // A decoy "git-upload-pack" before the NUL makes the truncated
+      // canonical segment and the raw suffix agree with each other, so this
+      // one depends on the decoded-NUL check specifically, not on either of
+      // the other two conditions disagreeing.
+      ["POST", "/o/git-upload-pack%00/git-upload-pack"],
     ] as const) {
       const denial = request(method, path);
       expect(denial.shape?.reason, `${method} ${path}`).toBe("write-denied");
