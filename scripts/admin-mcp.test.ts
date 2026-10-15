@@ -1320,6 +1320,38 @@ describe("runfree mcp enable", () => {
     expect(fs.existsSync(enabledFilePath())).toBe(false);
   });
 
+  test("a refused loopback MCP entry dies in enable before any approval write or lookup", async () => {
+    const refused: Record<string, { config: Record<string, unknown>; reason: string }> = {
+      repoLocalhost: {
+        config: { type: "http", url: "http://localhost:8089/mcp" },
+        reason: "loopback MCP must use 127.0.0.1, not localhost: localhost may resolve to ::1, which the session relay does not bind",
+      },
+      repoHeaders: {
+        config: { type: "http", url: "http://127.0.0.1:8089/mcp", headers: { Authorization: "Bearer ${T}" } },
+        reason: "loopback MCP cannot carry credentials or OAuth: its traffic does not pass the proxy",
+      },
+      repoSse: {
+        config: { type: "sse", url: "http://127.0.0.1:8089/mcp" },
+        reason: 'loopback MCP supports only Claude type "http", not sse',
+      },
+      repoReserved: {
+        config: { type: "http", url: "http://127.0.0.1:2375/mcp" },
+        reason: "loopback MCP port 2375 is reserved: ",
+      },
+    };
+    fs.writeFileSync(path.join(projectRoot, ".mcp.json"), JSON.stringify({
+      mcpServers: Object.fromEntries(Object.entries(refused).map(([name, { config }]) => [name, config])),
+    }));
+    for (const [server, { reason }] of Object.entries(refused)) {
+      const result = await runAdmin(() => mcpEnableIntent(enableInput({ server }), { discovery: NO_NETWORK, confirm: answers().confirm }).then(() => {}));
+      expect(result.status, server).not.toBe(0);
+      expect(result.stderr, server).toContain(`cannot enable MCP server claude ${server}`);
+      expect(result.stderr, server).toContain(reason);
+      expect(fs.existsSync(approvalFilePath()), server).toBe(false);
+      expect(fs.existsSync(enabledFilePath()), server).toBe(false);
+    }
+  });
+
   test("a refused or colliding server name is refused by enable before any write or lookup", async () => {
     fs.writeFileSync(path.join(projectRoot, ".mcp.json"), JSON.stringify({
       mcpServers: {

@@ -1,5 +1,6 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
+import { isIP } from "node:net";
 import os from "node:os";
 import path from "node:path";
 
@@ -24,6 +25,7 @@ import {
   type CredentialPolicyJson,
   type PolicyJson,
 } from "@runfree/runtime-contracts/network-policy";
+import { refusedHostServicePortReason } from "@runfree/runtime-contracts/host-services";
 import { parse as parseToml } from "smol-toml";
 import { isMcpAgentId, MCP_AGENT_IDS } from "../agents.ts";
 import type { ProjectInfo } from "../config.ts";
@@ -82,6 +84,9 @@ type PreparedMcpServer = {
     host: string;
     path: string;
   };
+  // `http-loopback` only: the TCP port the normalized URL dials (80 when the
+  // URL names none).
+  loopbackPort?: number;
   oauthPolicy?: McpOAuthServerPolicyJson;
   name: string;
   source: McpSourceScope;
@@ -106,6 +111,11 @@ export type McpInventoryEntry = {
   endpoint?: {
     host: string;
     path: string;
+  };
+  // `http-loopback` only: the normalized URL the agent config carries, and its port.
+  loopback?: {
+    port: number;
+    url: string;
   };
   mcpPolicy?: {
     defaultToolWriteAction?: McpWriteAction;
@@ -495,10 +505,25 @@ function collectCodexServers(projectRoot: string, env: NodeJS.ProcessEnv): Nativ
   return servers;
 }
 
-function nativeTransport(server: NativeMcpServer): "http" | "stdio" | undefined {
+// L1: a URL is loopback class when WHATWG parsing yields exactly `http:` and
+// `127.0.0.1`. WHATWG folds `127.1`, `2130706433`, `0x7f.0.0.1`, and
+// `127.0.0.1.` to `127.0.0.1`, the address every agent's parser dials.
+function loopbackUrl(raw: string): URL | undefined {
+  try {
+    const parsed = new URL(raw);
+    return parsed.protocol === "http:" && parsed.hostname === "127.0.0.1" ? parsed : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function nativeTransport(server: NativeMcpServer): McpTransport | undefined {
   const type = typeof server.config.type === "string" ? server.config.type : undefined;
-  if (type === "http") return "http";
   if (type === "stdio") return "stdio";
+  // Any other `type` with a loopback URL (Claude `sse`, `streamable-http`) is
+  // classed here and refused by name in `prepareLoopbackHttpServer` (N5).
+  if (typeof server.config.url === "string" && loopbackUrl(server.config.url)) return "http-loopback";
+  if (type === "http") return "http";
   if (typeof server.config.url === "string") return "http";
   if (typeof server.config.command === "string") return "stdio";
   return undefined;
@@ -509,6 +534,21 @@ function nativeTransport(server: NativeMcpServer): "http" | "stdio" | undefined 
 // warning line for it; `undefined` from a prepare function instead means the
 // entry is deliberately not imported and not a problem to report.
 type McpRefusal = { refused: string };
+
+const LOOPBACK_REASONS = {
+  userinfo: "loopback MCP URL must not contain a username or password",
+  fragment: "loopback MCP URL must not contain a fragment",
+  dollar: "loopback MCP URL must not contain $; the agent would expand it",
+  portZero: "loopback MCP port must be between 1 and 65535",
+  reserved: (port: number, why: string) => `loopback MCP port ${port} is reserved: ${why}`,
+  claudeType: (type: string) => `loopback MCP supports only Claude type "http", not ${type}`,
+  credentials: "loopback MCP cannot carry credentials or OAuth: its traffic does not pass the proxy",
+  key: (key: string) => `loopback MCP does not support config key ${key}`,
+  localhost: "loopback MCP must use 127.0.0.1, not localhost: localhost may resolve to ::1, which the session relay does not bind",
+  otherLoopback: "loopback MCP must use 127.0.0.1",
+  ipv6: "loopback MCP must use 127.0.0.1: the session relay binds IPv4 loopback only",
+  plainHttp: "remote HTTP MCP must use https; plain HTTP is allowed only to 127.0.0.1",
+} as const;
 
 function isMcpRefusal(value: PreparedMcpServer | McpRefusal | undefined): value is McpRefusal {
   return value !== undefined && "refused" in value;
@@ -521,7 +561,14 @@ function normalizeMcpUrl(url: string): McpRefusal | { host: string; pathPrefix: 
   } catch {
     return { refused: "invalid URL" };
   }
-  if (parsed.protocol !== "https:") return { refused: "remote HTTP MCP must use https" };
+  if (parsed.protocol !== "https:") {
+    if (parsed.protocol !== "http:") return { refused: "remote HTTP MCP must use https" };
+    // `http://127.0.0.1` is `http-loopback` and never reaches here.
+    if (parsed.hostname === "localhost") return { refused: LOOPBACK_REASONS.localhost };
+    if (parsed.hostname.startsWith("[")) return { refused: LOOPBACK_REASONS.ipv6 };
+    if (isIP(parsed.hostname) === 4 && parsed.hostname.startsWith("127.")) return { refused: LOOPBACK_REASONS.otherLoopback };
+    return { refused: LOOPBACK_REASONS.plainHttp };
+  }
   const bare = parsed.hostname.startsWith("[") ? parsed.hostname.slice(1, -1) : parsed.hostname;
   if (isIpLiteralHostname(bare)) return { refused: "HTTPS MCP endpoint must be a hostname, not an IP address" };
   let host: string;
@@ -870,6 +917,83 @@ function prepareHttpServer(server: NativeMcpServer, options: PrepareServerOption
   };
 }
 
+// L2: credential and OAuth keys of either agent. Loopback traffic never
+// passes the proxy, so a credential would have to live in the agent config.
+const LOOPBACK_CREDENTIAL_KEYS = new Set([
+  "authServerMetadataUrl",
+  "bearer_token_env_var",
+  "env_http_headers",
+  "headers",
+  "headersHelper",
+  "http_headers",
+  "http_headers_helper",
+  "mcp_oauth_callback_port",
+  "oauth",
+  "oauth_resource",
+  "scopes",
+]);
+
+// S3: the only keys a loopback entry may carry, per agent.
+const LOOPBACK_ALLOWED_KEYS: Record<McpAgent, ReadonlySet<string>> = {
+  claude: new Set(["type", "url"]),
+  codex: new Set(["url", "enabled", "required", "enabled_tools", "disabled_tools", "startup_timeout_sec", "tool_timeout_sec"]),
+};
+
+function pickCodexLoopbackOptions(config: Record<string, unknown>): CodexGeneratedServer {
+  return {
+    ...(stringArray(config.enabled_tools) ? { enabled_tools: stringArray(config.enabled_tools) } : {}),
+    ...(stringArray(config.disabled_tools) ? { disabled_tools: stringArray(config.disabled_tools) } : {}),
+    ...(boolValue(config.enabled) === undefined ? {} : { enabled: boolValue(config.enabled) }),
+    ...(boolValue(config.required) === undefined ? {} : { required: boolValue(config.required) }),
+    ...(numberValue(config.startup_timeout_sec) === undefined ? {} : { startup_timeout_sec: numberValue(config.startup_timeout_sec) }),
+    ...(numberValue(config.tool_timeout_sec) === undefined ? {} : { tool_timeout_sec: numberValue(config.tool_timeout_sec) }),
+  };
+}
+
+function loopbackKeyRefusal(server: NativeMcpServer): McpRefusal | undefined {
+  const keys = Object.keys(server.config);
+  if (hasOAuthConfig(server) || keys.some((key) => LOOPBACK_CREDENTIAL_KEYS.has(key))) {
+    return { refused: LOOPBACK_REASONS.credentials };
+  }
+  const unknown = keys.find((key) => !LOOPBACK_ALLOWED_KEYS[server.agent].has(key));
+  return unknown === undefined ? undefined : { refused: LOOPBACK_REASONS.key(printable(unknown)) };
+}
+
+// An `http-loopback` server: auth `none`, no endpoint, no OAuth policy, no
+// token bindings, so it projects nothing into any proxy policy (B1). Its
+// config carries the normalized `href`, so the approved digest and the running
+// config name the same target (S4).
+function prepareLoopbackHttpServer(server: NativeMcpServer, options: PrepareServerOptions = {}): PreparedMcpServer | McpRefusal | undefined {
+  if (server.scope === "project" && !options.allowProject) return undefined;
+  const raw = typeof server.config.url === "string" ? server.config.url : "";
+  const parsed = loopbackUrl(raw);
+  if (!parsed) return { refused: "invalid URL" };
+  if (raw.includes("$")) return { refused: LOOPBACK_REASONS.dollar };
+  if (parsed.username !== "" || parsed.password !== "") return { refused: LOOPBACK_REASONS.userinfo };
+  if (parsed.hash !== "" || parsed.href.endsWith("#")) return { refused: LOOPBACK_REASONS.fragment };
+  const port = parsed.port === "" ? 80 : Number(parsed.port);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) return { refused: LOOPBACK_REASONS.portZero };
+  const reserved = refusedHostServicePortReason(port);
+  if (reserved !== undefined) return { refused: LOOPBACK_REASONS.reserved(port, reserved) };
+  if (server.agent === "claude" && server.config.type !== undefined && server.config.type !== "http") {
+    return { refused: LOOPBACK_REASONS.claudeType(printable(String(server.config.type))) };
+  }
+  const keyRefusal = loopbackKeyRefusal(server);
+  if (keyRefusal) return keyRefusal;
+  logMcp(options, { kind: "imported", scope: server.scope, agent: server.agent, name: server.name, detail: "transport=http-loopback auth=none" });
+  return {
+    agent: server.agent,
+    auth: "none",
+    name: server.name,
+    source: server.scope,
+    transport: "http-loopback",
+    tokenBindings: [],
+    loopbackPort: port,
+    claudeConfig: server.agent === "claude" ? { type: "http", url: parsed.href } : undefined,
+    codexConfig: server.agent === "codex" ? { url: parsed.href, ...pickCodexLoopbackOptions(server.config) } : undefined,
+  };
+}
+
 function looksLikeHostPath(value: string, projectRoot: string): boolean {
   if (value.startsWith(projectRoot)) return true;
   if (/^\/(?:Users|Volumes|private|var\/folders)\//.test(value)) return true;
@@ -939,6 +1063,7 @@ function isDesktopBuiltIn(server: NativeMcpServer): boolean {
 
 function prepareServer(server: NativeMcpServer, projectRoot: string, options: PrepareServerOptions = {}): PreparedMcpServer | McpRefusal | undefined {
   const transport = nativeTransport(server);
+  if (transport === "http-loopback") return prepareLoopbackHttpServer(server, options);
   if (transport === "http") return prepareHttpServer(server, options);
   if (transport === "stdio") {
     // A Codex Desktop built-in is skipped before the generic STDIO rules, so
@@ -1246,6 +1371,12 @@ function mcpNameRefusals(servers: NativeMcpServer[]): Map<NativeMcpServer, McpNa
   return refusals;
 }
 
+function loopbackConfigUrl(prepared: PreparedMcpServer): string {
+  const url = prepared.claudeConfig?.url ?? prepared.codexConfig?.url;
+  if (typeof url !== "string") throw new Error(`loopback MCP server ${prepared.name} has no URL`);
+  return url;
+}
+
 function mcpInventoryRecords(options: { approvalPath?: string; env: NodeJS.ProcessEnv; projectRoot: string; rulesPath?: string }): McpInventoryRecord[] {
   const approvals = readMcpApprovals(options.projectRoot, options.approvalPath);
   const rules = readMcpRules(options.projectRoot, options.rulesPath);
@@ -1330,6 +1461,9 @@ function mcpInventoryRecords(options: { approvalPath?: string; env: NodeJS.Proce
         ...(reason ? { reason } : {}),
       },
       ...(prepared?.endpoint ? { endpoint: prepared.endpoint } : {}),
+      ...(prepared?.transport === "http-loopback" && prepared.loopbackPort !== undefined
+        ? { loopback: { url: loopbackConfigUrl(prepared), port: prepared.loopbackPort } }
+        : {}),
       ...(operationServerId
         ? {
           mcpPolicy: {
