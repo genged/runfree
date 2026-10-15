@@ -7,7 +7,8 @@
 // "hosts only" and a "hosts + credential" service is whether that block is set.
 //
 // Services are trusted CLI definitions. Enabling one writes a complete pinned
-// entry to desired network-policy v2: definition digest, revision, selection,
+// entry to desired network policy (version 2, or 3 when a credential uses the
+// basic scheme or a protocol scope): definition digest, revision, selection,
 // and resolved host/request/token/OAuth semantics. The host compiler later
 // emits the narrow effective proxy policy; runfree.json carries no service
 // authority.
@@ -481,7 +482,7 @@ export const SERVICES: Record<string, Service> = {
   github: {
     id: "github",
     label: "GitHub",
-    revision: 2,
+    revision: 3,
     hosts: [
       { host: "github.com" },
       { host: "api.github.com" },
@@ -506,15 +507,25 @@ export const SERVICES: Record<string, Service> = {
       "raw file content: raw.githubusercontent.com",
       "release assets and LFS objects: objects.githubusercontent.com (broad multi-tenant host)",
       "avatar images: avatars.githubusercontent.com",
+      "the credential is injected as Authorization: Bearer on every api.github.com and raw.githubusercontent.com request",
+      "on github.com the credential is injected as Authorization: Basic (username x-access-token) only on git smart-HTTP and Git LFS requests; other github.com paths, including the web UI, get no credential",
+      "an Authorization header the agent sends to github.com, api.github.com, or raw.githubusercontent.com is replaced or removed; with no token stored, requests go out anonymously",
     ],
     credential: {
       tokenName: "github",
-      tokenDescription: "GitHub API token for API and raw content requests",
+      tokenDescription: "GitHub token for API, raw content, and git over HTTPS requests",
       allowAnonymous: true,
       agentEnv: ["GH_TOKEN", "GITHUB_TOKEN"],
       credentials: [
         { host: "api.github.com", header: "Authorization", scheme: "bearer" },
         { host: "raw.githubusercontent.com", header: "Authorization", scheme: "bearer" },
+        {
+          host: "github.com",
+          header: "Authorization",
+          scheme: "basic",
+          username: "x-access-token",
+          protocol: "git-http",
+        },
       ],
     },
     readOnly: {
@@ -526,7 +537,7 @@ export const SERVICES: Record<string, Service> = {
   gitlab: {
     id: "gitlab",
     label: "GitLab",
-    revision: 1,
+    revision: 2,
     hosts: [
       { host: "gitlab.com" },
     ],
@@ -537,14 +548,23 @@ export const SERVICES: Record<string, Service> = {
     explanations: [
       "git over HTTPS, web UI, REST/GraphQL API, and package registries: gitlab.com (API under /api/)",
       "the GitLab Container Registry (registry.gitlab.com) is a separate broad host; allow it explicitly if you push or pull images",
-      "the credential is injected as Authorization: Bearer only on /api/ requests, so it never clobbers git-over-HTTPS auth on gitlab.com",
+      "the credential is injected as Authorization: Bearer on gitlab.com /api/ requests, and as Authorization: Basic (username oauth2) only on git smart-HTTP and Git LFS requests; other gitlab.com paths, including the web UI, get no credential",
+      "an Authorization header the agent sends to gitlab.com is removed or replaced on every path; with no token stored, requests go out anonymously",
     ],
     credential: {
       tokenName: "gitlab",
-      tokenDescription: "GitLab access token for API and registry requests",
+      tokenDescription: "GitLab access token for API, package registry, and git over HTTPS requests",
+      allowAnonymous: true,
       agentEnv: ["GITLAB_TOKEN", "GL_TOKEN"],
       credentials: [
         { host: "gitlab.com", header: "Authorization", scheme: "bearer", pathPrefix: "/api/" },
+        {
+          host: "gitlab.com",
+          header: "Authorization",
+          scheme: "basic",
+          username: "oauth2",
+          protocol: "git-http",
+        },
       ],
     },
     readOnly: {

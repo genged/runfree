@@ -33,7 +33,10 @@ import { activationReportLine } from "../../control/activation-report.ts";
 import { compileDesiredPolicies } from "../../control/compiler.ts";
 import { compareCompiledAuthority } from "../../control/comparator.ts";
 import { mutateDesiredService, type DesiredServiceLayer } from "../../control/service-mutation.ts";
-import type { DesiredServiceEntry } from "@runfree/runtime-contracts/desired-network-policy";
+import {
+  type DesiredServiceEntry,
+  withRequiredDesiredNetworkPolicyVersion,
+} from "@runfree/runtime-contracts/desired-network-policy";
 import { CliError } from "../../errors.ts";
 import { formatTerminalTable } from "../../terminal-table.ts";
 import { nodeRuntimeIO } from "../../runtime.ts";
@@ -218,7 +221,12 @@ async function diffDesiredServices(
       console.log(`  before ${JSON.stringify(current.resolved)}`);
       console.log(`  after  ${JSON.stringify(next.resolved)}`);
       changes.push({ id, layer, entry: next });
-      proposed[layer].services = { ...(proposed[layer].services ?? {}), [id]: next };
+      // A new revision can need a higher desired version (github revision 3's
+      // basic git-http mapping needs v3), so re-derive it for the comparison.
+      proposed[layer] = withRequiredDesiredNetworkPolicyVersion({
+        ...proposed[layer],
+        services: { ...(proposed[layer].services ?? {}), [id]: next },
+      });
     }
   }
   if (changes.length === 0) return;
