@@ -22,6 +22,13 @@ export const PROXY_SERVER_UID_GID = `${PROXY_SERVER_UID}:${PROXY_SERVER_GID}`;
  * takes the unlocked source-truth order instead.
  */
 export const TOKEN_SYNC_DEFERRED_STATUS = 75;
+/**
+ * The in-process status for a cold launch's held-lock sync that deferred
+ * because of the sources read before the lock themselves (none, incomplete,
+ * expired, or no longer current): startup reads them again before the
+ * unlocked source-truth sync. Any other deferral reuses that preparation.
+ */
+export const TOKEN_SYNC_REPREPARE_STATUS = 76;
 
 /**
  * Bounds on the receipt-gated warm-launch sync, which runs while the project

@@ -3430,6 +3430,30 @@ describe("session admission under the per-session file source", () => {
       expect(mocks.inventory).toHaveBeenCalled();
     });
 
+    test.each([
+      ["a settled handoff (a cold or warm startup's reconcile)", undefined, "handoff"],
+      ["a registry changed while the handoff waited", { registryDigest: `sha256:${"2".repeat(64)}` }, "full"],
+    ] as const)("with timings on, admission reports whether it relied on %s", async (_label, overrides, path) => {
+      const input = fixture();
+      (input.context.env as Record<string, string>).RUNFREE_TIMINGS = "1";
+      mocks.containerInspect = { status: 0, stdout: runningInspect(), stderr: "" };
+      proxyInspectAnswer(PROXY_STARTED_AT);
+      const output = captureOutput();
+      try {
+        const driver = createInternalSessionAdmissionDriver({
+          ...input,
+          handoff: handoffFor(input, overrides ?? {}),
+          nowEpochMs: () => Date.parse("2026-08-09T00:10:00.000Z"),
+        });
+        await expect(driver.launchBuiltin("codex")).resolves.toEqual({ status: 0, signal: null });
+        const lines = output.drain().map((line) => line.slice(Math.max(0, line.indexOf("timing: "))));
+        expect(lines).toContain(`timing: admission:preflight-path ${path}`);
+        expect(mocks.reconcileSessions).toHaveBeenCalledTimes(path === "full" ? 1 : 0);
+      } finally {
+        output.restore();
+      }
+    });
+
     test("an unreadable proxy inspection proves nothing: the full preflight decides", async () => {
       const input = fixture();
       mocks.containerInspect = { status: 0, stdout: runningInspect(), stderr: "" };

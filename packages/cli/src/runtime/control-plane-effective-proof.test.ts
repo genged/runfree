@@ -39,6 +39,7 @@ import type { ProjectLifecycleLock } from "./sessions.ts";
 import type { RuntimeIO } from "./types.ts";
 
 const PROXY_ID = "7".repeat(64);
+const PROXY_STARTED_AT = "2026-08-08T12:00:05.123456789Z";
 const PROXY_IMAGE_ID = sha256Digest("proxy-image-id");
 const INTERNAL_ID = "8".repeat(64);
 const EGRESS_ID = "9".repeat(64);
@@ -161,7 +162,7 @@ function liveIo(overrides: LiveOverrides = {}): RuntimeIO {
         Image: overrides.proxyImageId ?? PROXY_IMAGE_ID,
         // `StartedAt` is read by the eligibility publication's incarnation
         // check, which the restore path runs on this same inspection shape.
-        State: { Running: true, StartedAt: "2026-08-08T12:00:05.123456789Z" },
+        State: { Running: true, StartedAt: PROXY_STARTED_AT },
         NetworkSettings: { Networks: {
           [`${SESSION_TEST_PROJECT.composeProject}_agent_internal`]: { NetworkID: internalId },
           [`${SESSION_TEST_PROJECT.composeProject}_proxy_egress`]: { NetworkID: overrides.egressId ?? EGRESS_ID },
@@ -640,7 +641,8 @@ test.each(["missing", "conflicting", "image-drift"] as const)(
     const restore = () => restoreSameProxySessionAdmission({ plan, io, proxyId: PROXY_ID,
       lifecycleLock: lifecycleLock(), validation: { status: 0, proof: input.runtimeProof, securityProof: input.securityProof } });
     if (kind === "missing") {
-      await expect(restore()).resolves.toBeUndefined();
+      // The restore reports the proxy start its eligibility publication observed.
+      await expect(restore()).resolves.toBe(PROXY_STARTED_AT);
       expect(vi.mocked(io.capture).mock.calls.some(([, args]) => args.includes("node"))).toBe(true);
     } else {
       await expect(restore()).rejects.toThrow(kind === "conflicting" ? "no exact materialization identity" : "immutable image");
@@ -650,7 +652,7 @@ test.each(["missing", "conflicting", "image-drift"] as const)(
       plan.activeRuntime.controlPlaneMaterializationDigest = undefined;
       await expect(restoreSameProxySessionAdmission({ plan, io: liveIo(), proxyId: PROXY_ID,
         lifecycleLock: lifecycleLock(), validation: { status: 0, proof: input.runtimeProof, securityProof: input.securityProof } }))
-        .resolves.toBeUndefined();
+        .resolves.toBe(PROXY_STARTED_AT);
     }
     expect(readEffectiveControlPlaneV2(stateDir)?.selection).toEqual(selected);
   },

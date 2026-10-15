@@ -328,27 +328,72 @@ A surviving session's launch process rebinds its own held authority after that t
 
 A warm session launch can skip the full runtime validation. A full validation
 records a warm-proof fingerprint in host state only after the startup session
-reconcile that follows it found nothing to repair; a reconcile that fails or
-repairs residue removes the record instead, so a later launch cannot match a
-fingerprint that names a participant the reconcile was about to remove. The
-fingerprint holds the proxy
-container id, `StartedAt`, PID, image, and network endpoints; both networks
-and their participants; the session volumes; the agent image; both generation
-families; the security contract hash; the Git layout; the proxy CA and agent
-bundle digests; the validation marker digest; the nftables ruleset shape (set
-members excluded); the Docker daemon id, version, and kernel; and the VM boot
-id. A later launch, with an empty lifecycle registry, an unchanged runtime
-plan, and an unchanged selected control plane, re-reads all of these in one
-type-less `docker inspect` and one root batch inside the proxy, re-runs the
-same topology, capability, route, nftables, security-contract, firewall
-readiness, and marker validators over that fresh evidence, and compares the
-facts. Only an exact match within 24 hours skips the full validation; it does
-not re-run the agent-position deny-probe helper, the server-UID denial batch,
-or the root DNS liveness probe, whose inputs the fingerprint binds. A daemon
-with live-restore never takes this path. Anything else deletes the record and
+reconcile that follows it found nothing to repair and after its restore of
+surviving sessions (below) completed; a reconcile that fails or repairs residue
+removes the record instead, so a later launch cannot match a fingerprint that
+names a participant the reconcile was about to remove or a run whose restore
+never finished. The record is written only when the proxy `StartedAt` it binds
+is the one the validation observed before its topology proof (the validation
+marker lives in the proxy's writable layer, so a same-id restart keeps it),
+the one startup published eligibility against, and, when a restore ran, the
+one that restore published against; a same-id restart in between writes no
+record. No record is written while an ephemeral helper or any other
+participant that is not an ingress forwarder is attached to the internal
+network. The fingerprint (record version 2; any other version reads as absent
+and is never converted) holds the proxy container id, `StartedAt`, PID, image,
+and network endpoints; both networks; every internal-network participant
+except the proxy, session agents, and their `mcp-callback` forwarders (so
+`vnc` and `port` forwarders are bound by id, address, endpoint, purpose, and
+target); the session volumes; the agent image; both generation families; the
+security contract hash; the Git layout; the proxy CA and agent bundle digests;
+the validation marker digest; the nftables ruleset shape (set members
+excluded); the `@host_service` members; the Docker daemon id, version, and
+kernel; and the VM boot id. A later launch, with an unchanged runtime plan and
+an unchanged selected control plane, re-reads all of these in one type-less
+`docker inspect` and one root batch inside the proxy, re-runs the same
+topology, capability, route, nftables, security-contract, firewall readiness,
+and marker validators over that fresh evidence, and compares the facts. Only
+an exact match within 24 hours skips the full validation; it does not re-run
+the agent-position deny-probe helper, the server-UID denial batch, or the root
+DNS liveness probe, whose inputs the fingerprint binds. A daemon with
+live-restore never takes this path. Anything else deletes the record and
 validates fully. `runfree up` always validates fully; `stop`, `destroy`, and
 `rebuild` remove the record. A launch also skips image cleanup when the
 host-side cleanup inputs have not changed since the last completed pass.
+
+With live sessions in the lifecycle registry, the fingerprint match is not
+enough on its own: the peers and their callback forwarders are participants
+the record does not bind. The launch then also judges, under the held
+lifecycle lock and inside the same proxy incarnation
+(`packages/cli/src/runtime/warm-peer-proof.ts`), that every peer is fully
+accounted for: the registry is legible with no quarantined record, no rebind
+journal, and at most 64 records; every record is `attached`, carries no
+terminal stamp, has a provably live owner (an owner that cannot be proved
+either way is a miss, never live and never dead), and is bound to the selected
+control plane generation and admission contract epoch; one host-wide container
+inventory classifies exactly every record's container and nothing else; each
+peer's container passes the same running proof restore uses, over an inspect
+whose container id, endpoint id, and `StartedAt` agree with the inventory and
+the network's endpoint map; each peer has exactly one current, eligible,
+correctly addressed session file and no file lacks a record; the kernel
+`@session_ipv4` set holds exactly the peers' addresses, the request proxy
+serves the selected effective policy generation, and each peer's IP assignment
+is ready and bound to it; every other internal-network participant is a peer's
+own `mcp-callback` forwarder or an exactly recorded forwarder, and a recorded
+forwarder that targets a session address must target a peer; and a fresh exact
+proxy inspect after the inventory shows the same `StartedAt` the observation
+began with. Any miss takes the full validation, reconcile, and restore exactly
+as before. A match still runs the startup reconcile, and it skips
+`restoreSameProxySessionAdmission` only when that reconcile found nothing at
+all to repair, a fresh proxy inspect shows the judged incarnation, no rebind
+journal or revoking record appeared, and the sealed one-shot judgement still
+binds the lock owner, proxy id and `StartedAt`, registry digest, and both
+generation families. Otherwise the launch refuses before credential sync and
+before any handoff, drops the record, and asks for a retry, which validates
+fully and restores. The judgement is never placed in the launch handoff, never
+restores or republishes a peer, and renews nothing: a peer whose owner dies
+afterwards keeps its authority only until its session file expires, and the
+reconcile that still runs tears it down.
 
 Startup mints one in-memory `PreparedRuntime` after durable selection and live proof agree. Public launches consume that exact authority once. A changed container or selection causes one bounded re-prepare attempt. Credential sync occurs only after this prepared authority exists.
 
@@ -563,10 +608,20 @@ The foreground admission driver requires a `SessionLockManager`; it has no
 raw-lock or optional lock-lease input that can retain the project lock across
 the attached wait ([driver](../packages/cli/src/runtime/session-admission-driver.ts)).
 
-A warm `claude`, `codex`, `pi`, `shell`, or `mcp auth` launch does not release
-the lock between startup and admission. When its credential sync needed no
-source read, startup hands the exact held lock to the launch, in process
-memory and at most once, with what it proved under it: the proxy id and
+A `claude`, `codex`, `pi`, `shell`, or `mcp auth` launch, warm or cold, does
+not release the lock between startup and admission when its credential sync
+needed no source read under it. A warm launch's receipt-gated sync reads none;
+a cold launch read every source before the lock, and its locked sync publishes
+only that prepared set, inside the 8 s startup allowance counted from the
+lock's acquisition. A preparation that is missing, admitted more than two
+minutes ago (the age counts from the launch's admission, not from the read),
+incomplete, or no longer matches the sources and policy, a busy lock, a proxy
+that is not ready, a failed write, or a spent allowance makes that sync defer
+with no removal and no receipt: startup releases the lock, runs the ordinary source-truth
+sync, and hands nothing off. Only a deferral caused by the preparation itself
+reads the sources again first; otherwise each provider still runs once. Startup then hands the
+exact held lock to the launch, in process memory and at most once, with what
+it proved under it: the proxy id and
 `StartedAt`, the registry digest, and how the project's sessions were settled.
 That is either the startup reconcile's result (whether it saw only settled
 state, and the addresses the proxy's session files reserved) or a warm-empty
@@ -1740,7 +1795,12 @@ Supported source types include:
 The host CLI records the source and syncs resolved values into proxy-only token state. The proxy strips conflicting inbound credential headers and injects configured headers only for matching hosts and optional path prefixes. OAuth-backed services expose agent-visible handles, while token material remains mediated by the proxy.
 
 `runfree up`, a cold start, and a replaced proxy read every source before the
-lifecycle lock (source-truth). A warm session launch reuses what the proxy
+lifecycle lock (source-truth). A cold session launch then publishes those
+values under the lock it hands to admission, reading nothing there and keeping
+each receipt's age from the read before the lock. Every other sync that writes
+a value read before the lock (the fallback after a deferral, a cold launch
+that is not handed off, a warm launch's re-read) keeps that age too; reuse
+never makes a value younger. A warm session launch reuses what the proxy
 already holds: it skips re-reading a source only when a host receipt matches
 the source's fingerprint and the live token-store generation, the proxy holds
 the value, the last read is under 15 minutes old, and the source's refresh
@@ -1754,7 +1814,17 @@ runs detached: a definitive failure (the item or variable is gone, access was
 denied) deletes the held value, as an explicit `runfree credential sync` does;
 a transient or unclassified failure (a locked vault, a source that needs a
 prompt) keeps it, bounded by the keep-last-good age, until the next launch
-reads it interactively.
+reads it interactively. The watcher reads sources outside the token-store lock, each provider in a
+process group the watcher owns (a watch run by hand at a terminal keeps its
+providers in its foreground group, so they can still prompt there), and
+publishes under the lock. A session's exit
+closes the watcher's lifetime pipe and signals the watcher only (never its
+process group), so an in-flight proxy write completes. A stopped watch writes,
+removes and records nothing more. A write that completed after the stop
+stands, without a new receipt. A Docker client ended by a signal has an
+unknown outcome, so it is never followed by a removal; a killed write client
+also drops that token's receipt, so the next pass or launch reads its source
+again.
 
 ## Services
 

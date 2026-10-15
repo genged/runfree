@@ -141,7 +141,9 @@ function expectedAdminContractComponents(options: Parameters<typeof expectedAdmi
   return expectedAdminContract(options).components;
 }
 
-function dockerComponentEvidenceShell(options: Parameters<typeof expectedAdminTarget>[0]): string {
+const FAKE_PROXY_STARTED_AT = "2026-06-18T00:00:00.000000000Z";
+
+function dockerComponentEvidenceShell(options: Parameters<typeof expectedAdminTarget>[0], startedAt = FAKE_PROXY_STARTED_AT): string {
   const { plan } = expectedAdminTarget(options);
   const agentRow = [
     "agent-id",
@@ -186,18 +188,51 @@ function dockerComponentEvidenceShell(options: Parameters<typeof expectedAdminTa
 if [ "$1" = "inspect" ] && [ "$2" = "--format" ]; then
   case "$3" in
     *"io.runfree.agent-image-input-digest"*)
+      # The incarnation, when the inspect groups it after the label fields.
+      rf_started=''
+      case "$3" in *"State.StartedAt"*) rf_started=${JSON.stringify(`\t${startedAt}`)} ;; esac
       shift 3
       for id in "$@"; do
         case "$id" in
-          agent-id) printf '%b\\n' ${JSON.stringify(agentRow)} ;;
-          proxy-id) printf '%b\\n' ${JSON.stringify(proxyRow)} ;;
-          callback-id) printf '%b\\n' ${JSON.stringify(callbackRow)} ;;
+          agent-id) printf '%b%b\\n' ${JSON.stringify(agentRow)} "$rf_started" ;;
+          proxy-id) printf '%b%b\\n' ${JSON.stringify(proxyRow)} "$rf_started" ;;
+          callback-id) printf '%b%b\\n' ${JSON.stringify(callbackRow)} "$rf_started" ;;
         esac
       done
       exit 0
       ;;
   esac
 fi
+`;
+}
+
+// The credential observation batch runs for real: the fake runs the CLI's own
+// script in the host shell with the proxy's /run paths mapped onto this
+// test's files. A missing marker path or secret directory reads as absent or
+// unlistable, the way a proxy without them answers. Place it after
+// dockerComponentEvidenceShell, whose label inspect also names both fields.
+function dockerCredentialObservationShell(options: { markerPath?: string; secretsDir: string; startedAt?: string }): string {
+  fs.mkdirSync(options.secretsDir, { recursive: true });
+  const markerPath = options.markerPath ?? path.join(options.secretsDir, "..", "no-runtime-validation-marker");
+  return `
+if [ "$1" = "inspect" ] && [ "$2" = "--format" ]; then
+  case "$3" in
+    *"State.Running"*"State.StartedAt"*)
+      printf 'true\\t%s\\n' ${JSON.stringify(options.startedAt ?? FAKE_PROXY_STARTED_AT)}
+      exit 0
+      ;;
+  esac
+fi
+case "$*" in
+  *"runfree-credential-observation"*)
+    for rf_last; do :; done
+    rf_script=$(printf '%s' "$rf_last" | PATH=/usr/bin:/bin sed \\
+      -e "s#'/run/runfree-runtime-validation.json'#'${markerPath}'#" \\
+      -e "s#'/run/runfree-proxy-secrets'#'${options.secretsDir}'#")
+    PATH=/usr/bin:/bin /bin/sh -c "$rf_script"
+    exit $?
+    ;;
+esac
 `;
 }
 
@@ -422,6 +457,7 @@ test("token sync can reuse a runtime validation proof from startup", async () =>
   writeExecutable(path.join(fakeBin, "docker"), `#!/bin/sh
 printf '%s\\n' "$*" >> ${JSON.stringify(dockerLogPath)}
 ${dockerComponentEvidenceShell(contractOptions)}
+${dockerCredentialObservationShell({ markerPath, secretsDir: path.join(root, "proxy-secrets") })}
 if [ "$1" = "exec" ] && [ "$5" = "cat" ]; then
   /bin/cat ${JSON.stringify(markerPath)}
   exit 0
@@ -532,7 +568,8 @@ printf 'ghp_secret\\n'
 `);
   writeExecutable(path.join(fakeBin, "docker"), `#!/bin/sh
 printf '%s\\n' "$*" >> ${JSON.stringify(dockerLogPath)}
-${dockerComponentEvidenceShell(contractOptions)}
+${dockerComponentEvidenceShell(contractOptions, startedAt)}
+${dockerCredentialObservationShell({ markerPath, secretsDir, startedAt })}
 if [ "$1" = "info" ]; then
   exit 0
 fi
@@ -706,7 +743,8 @@ test.each([false, true])("policy reload preserves receipts and rejects source dr
   fs.writeFileSync(markerPath, `${JSON.stringify(marker)}\n`);
   writeExecutable(path.join(fakeBin, "docker"), `#!/bin/sh
 printf '%s\\n' "$*" >> ${JSON.stringify(dockerLogPath)}
-${dockerComponentEvidenceShell(contractOptions)}
+${dockerComponentEvidenceShell(contractOptions, startedAt)}
+${dockerCredentialObservationShell({ markerPath, secretsDir: path.join(root, "proxy-secrets"), startedAt })}
 if [ "$1" = "info" ]; then
   exit 0
 fi
@@ -853,6 +891,7 @@ test("direct token sync rejects a stale runtime security contract before writing
   })}\n`);
   writeExecutable(path.join(fakeBin, "docker"), `#!/bin/sh
 printf '%s\\n' "$*" >> ${JSON.stringify(dockerLogPath)}
+${dockerCredentialObservationShell({ markerPath, secretsDir: path.join(root, "proxy-secrets") })}
 if [ "$1" = "info" ]; then
   exit 0
 fi
@@ -965,10 +1004,13 @@ if [ "$1" = "read" ]; then
 fi
 exit 1
 `);
+  // A prevalidated proof leaves the marker unparsed; its bytes only name the store generation.
+  fs.writeFileSync(path.join(root, "runtime-validation.json"), "{}\n");
   writeExecutable(path.join(fakeBin, "docker"), `#!/bin/sh
 stdin="$(/bin/cat)"
 printf '%s\\t%s\\n' "$*" "$stdin" >> ${JSON.stringify(dockerLogPath)}
 ${dockerComponentEvidenceShell(contractOptions)}
+${dockerCredentialObservationShell({ markerPath: path.join(root, "runtime-validation.json"), secretsDir: path.join(root, "proxy-secrets") })}
 case "$*" in
   *"State.StartedAt"*)
     printf '%s\\n' '2026-06-18T00:00:00.000000000Z'

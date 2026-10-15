@@ -47,7 +47,7 @@ export function createSessionAdmissionDockerGateway(input: Readonly<{
   };
   const histogram = input.histogram;
   const record = (args: readonly string[], startedAt: number): void => {
-    histogram?.record(subprocessCategory("docker", args), performance.now() - startedAt);
+    histogram?.record(subprocessCategory("docker", args), performance.now() - startedAt, startedAt);
   };
   const counted = <T>(args: readonly string[], call: () => T): T => {
     count();

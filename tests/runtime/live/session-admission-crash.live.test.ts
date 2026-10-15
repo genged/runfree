@@ -88,6 +88,14 @@ import {
 } from "../session-admission-crash.ts";
 import { sessionAdmissionCrashEntryArgv } from "../../support/prebuilt-entry.ts";
 import { liveTierSelected } from "./tiers.ts";
+import { startRunfree } from "./attached-support.ts";
+import {
+  createDockerSideEffectShim,
+  endHeldPeers,
+  releaseHoldMarker,
+  startHeldPeers,
+  type HeldPeer,
+} from "./warm-peer-support.ts";
 
 // This file holds cases of both live tiers (see `tiers.ts`): per-conversation
 // concurrent resume is the trust-boundary property (exact ids keep two
@@ -1310,14 +1318,14 @@ describe("a crashed session with no record falls back from the warm-empty skip",
   // path. The reconcile only runs on a warm launch when the warm-empty check
   // is blocked, and a warm match needs no lifecycle record, no quarantined
   // record, and no session participant on agent_internal. A container
-  // created but never started is the one piece of residue that satisfies
-  // both: it is not a network participant, so the warm proof still matches,
-  // and the host-wide container listing still sees it, so warm-empty reports
-  // `session-containers-present` and the reconcile runs. A started orphan
-  // cannot serve here: as a participant it makes the warm proof mismatch
-  // (`mismatch:participants`) and the launch takes the full path, which never
-  // reaches this catch. With no residue at all, warm-empty is `empty` and the
-  // reconcile, and so the injected read failure, is skipped.
+  // created but never started is residue that satisfies both: it is not a
+  // network participant, and the host-wide container listing still sees it,
+  // so warm-empty reports `session-containers-present` and the reconcile
+  // runs. (The warm proof binds no session participant, so a started orphan
+  // would keep the warm match too, blocked as `session-participant`; the
+  // stopped one is the case this tranche crafts.) With no residue at all,
+  // warm-empty is `empty` and the reconcile, and so the injected read
+  // failure, is skipped.
   coreTest("a warm launch whose reconcile fails drops the warm-proof record, and the next launch recovers", async () => {
     // The case above reclaimed its orphan, and a reconcile that repaired
     // residue drops the warm-proof record, so there is no record on entry.
@@ -1387,5 +1395,87 @@ describe("a crashed session with no record falls back from the warm-empty skip",
     expect(warm.status, describeOutput(warm.output, 4000)).toBe(0);
     expect(timing(warm.output, "validation:warm-proof"), describeOutput(warm.output)).toContain("match");
     expect(timing(warm.output, "startup:warm-empty"), describeOutput(warm.output)).toContain("empty");
+  }, TEST_TIMEOUT_MS);
+
+  // A cold launch (the runtime stopped first) may hand its startup lock
+  // straight to admission. Its owner killed once the session runs leaves no
+  // authority behind: the next launch reclaims the lock, reconciles the dead
+  // owner's session away, and is admitted.
+  coreTest("a cold launch's owner killed after admission leaves no authority, and the next launch recovers", async () => {
+    let peers: HeldPeer[] = [];
+    try {
+      const stopped = runfreeTimed(fixture, ["stop"]);
+      expect(stopped.status, describeOutput(stopped.output, 4000)).toBe(0);
+      peers = await startHeldPeers(fixture, 1, { RUNFREE_TIMINGS: "1" });
+      const [victim] = peers as [HeldPeer];
+      if (victim.run.pid === undefined) throw new Error("the cold launch's owner has no pid");
+      victim.run.cancel();
+      const killed = await victim.run.completion;
+      // Which path the cold launch took before it was killed; both must
+      // recover. A minted handoff means the owner held startup's lock
+      // through admission.
+      const sync = timing(killed.output, "token-sync").filter((detail) => !/^[\d.]+ms$/.test(detail)).at(-1);
+      const handoff = timing(killed.output, "launch-handoff").at(-1);
+      expect(handoff, describeOutput(killed.output, 4000)).toBeDefined();
+      if (handoff === "minted") expect(sync, describeOutput(killed.output, 4000)).toBe("prepared-source-truth");
+      else expect(handoff, describeOutput(killed.output, 4000)).toMatch(/^skipped /);
+      releaseHoldMarker(fixture);
+      const recovered = runfreeTimed(fixture, ["claude"]);
+      expect(recovered.status, describeOutput(recovered.output, 4000)).toBe(0);
+      expect(listSessionContainerRecordsV2(stateDir, expectedProject)).toEqual([]);
+      expect(sessionContainers(fixture)).not.toContain(victim.container);
+    } finally {
+      releaseHoldMarker(fixture);
+      await endHeldPeers(peers);
+      await forceCleanSessions(fixture);
+    }
+  }, TEST_TIMEOUT_MS);
+
+  // A peer's owner killed while another launch judges that peer. The kill is
+  // ordered by a Docker shim armed on the warm proof's root batch and fired on
+  // the judgement's host-wide inventory listing (`--format {{.ID}}`), so the
+  // judgement has already seen the owner alive. Its startup reconcile then
+  // finds the owner dead and ends the session; the launch must refuse rather
+  // than skip a restore its judgement no longer covers, and the retry
+  // validates fully.
+  coreTest("a peer's owner killed during another launch's warm peer judgement is reconciled away, and the launch refuses until a retry validates fully", async () => {
+    let peers: HeldPeer[] = [];
+    let shim: ReturnType<typeof createDockerSideEffectShim> | undefined;
+    try {
+      // A clean launch with no session in the registry leaves a warm proof.
+      launchClaudeTimed(fixture);
+      expect(fs.existsSync(warmProofRecordPath(stateDir)), "no warm-proof record before the peer case").toBe(true);
+      peers = await startHeldPeers(fixture, 1);
+      releaseHoldMarker(fixture);
+      const [victim] = peers as [HeldPeer];
+      if (victim.run.pid === undefined) throw new Error("the peer's owner has no pid");
+      shim = createDockerSideEffectShim(fixture, {
+        armOn: "*RUNFREE_FIREWALL_SECTION*",
+        fireOn: "{{.ID}}",
+        sideEffect: `kill -9 ${victim.run.pid} 2>/dev/null`,
+      });
+      // Launched asynchronously, not with `runfreeTimed`: the killed owner is
+      // this test process's child, and a synchronous spawn would block the
+      // event loop that reaps it. An unreaped owner stays a zombie, which
+      // `kill(pid, 0)` reports alive, so the launch would rightly see a live peer.
+      const refused = await startRunfree(fixture, ["claude"], { RUNFREE_TIMINGS: "1", ...shim.env }).completion;
+      expect(shim.fired(), `the shim never saw the judgement's inventory listing: ${describeOutput(refused.output, 4000)}`).toBe(true);
+      expect(timing(refused.output, "validation:warm-peer"), describeOutput(refused.output)).toContain("match");
+      expect(refused.status, describeOutput(refused.output, 4000)).not.toBe(0);
+      expect(refused.output, describeOutput(refused.output, 4000)).toContain("retry the command to validate the runtime fully");
+      await victim.run.completion;
+      // The reconcile ended the dead owner's session: no record, no container.
+      expect(listSessionContainerRecordsV2(stateDir, expectedProject)).toEqual([]);
+      expect(sessionContainers(fixture)).not.toContain(victim.container);
+      expect(fs.existsSync(warmProofRecordPath(stateDir)), "a refused warm peer launch left its warm-proof record").toBe(false);
+      // The retry has no record, so it validates fully and is admitted.
+      const retried = runfreeTimed(fixture, ["claude"]);
+      expect(retried.status, describeOutput(retried.output, 4000)).toBe(0);
+      expect(timing(retried.output, "validation:warm-proof"), describeOutput(retried.output)).toContain("absent");
+    } finally {
+      shim?.dispose();
+      releaseHoldMarker(fixture);
+      await endHeldPeers(peers);
+    }
   }, TEST_TIMEOUT_MS);
 });

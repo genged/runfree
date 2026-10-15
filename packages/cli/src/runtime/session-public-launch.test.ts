@@ -315,6 +315,71 @@ describe("public launch through session admission", () => {
     expect(driverInput.lockHeldSinceMonotonicMs).toBe(acquiredAt);
   });
 
+  describe("a cold launch's handoff with its startup allowance almost spent", () => {
+    // What a cold startup hands over: its reconcile's settled state, under the
+    // lock it took before the compose start, full validation and publication.
+    function coldHandoff(held: NonNullable<ReturnType<typeof tryAcquireProjectLifecycleLock>>) {
+      return {
+        lifecycleLock: held,
+        lockOwnerToken: held.ownerToken,
+        lockAcquiredAtMonotonicMs: performance.now() - (LAUNCH_HANDOFF_STARTUP_SPAN_MAX_MS - 250),
+        sessionState: { kind: "reconciled", inventoryClean: true, reservedSourceIps: [] },
+      };
+    }
+    const lockIsFree = (): boolean => {
+      const lock = tryAcquireProjectLifecycleLock(runtimeContext());
+      lock?.release();
+      return lock !== undefined;
+    };
+
+    test("admission runs under it with no yield, its hold planned from the original acquisition, and a waiting command gets the lock next", async () => {
+      const prepared = preparedRuntime();
+      const held = tryAcquireProjectLifecycleLock(runtimeContext());
+      if (!held) throw new Error("fixture lock");
+      const handoff = coldHandoff(held);
+      mocks.handoffs.set(prepared, handoff);
+      const order: string[] = [];
+      const waiter = tryAcquireProjectLifecycleLockWithRetry(runtimeContext()).then((lock) => {
+        order.push("waiter-acquired");
+        lock?.release();
+      });
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      mocks.createDriver.mockImplementationOnce((input: { sessionLockManager: { lock: { assertHeld(): void; ownerToken: string } } }) => {
+        input.sessionLockManager.lock.assertHeld();
+        expect(input.sessionLockManager.lock.ownerToken).toBe(held.ownerToken);
+        order.push("admission-under-handoff");
+        return { launchBuiltin: mocks.launchBuiltin, launchShell: mocks.launchShell };
+      });
+
+      await expect(launchConfiguredAgentThroughAdmission({ preparedRuntime: prepared, io, agentName: "claude" })).resolves.toBe(0);
+      await waiter;
+
+      const driverInput = mocks.createDriver.mock.calls[0]?.[0] as { handoff?: unknown; lockHeldSinceMonotonicMs: number };
+      expect(driverInput.handoff).toBe(handoff);
+      expect(driverInput.lockHeldSinceMonotonicMs).toBe(handoff.lockAcquiredAtMonotonicMs);
+      expect(order).toEqual(["admission-under-handoff", "waiter-acquired"]);
+    });
+
+    test.each([
+      ["the MCP callback setup fails", () => mocks.launchBuiltin.mockRejectedValueOnce(new Error("MCP OAuth callback setup used its budget")), undefined],
+      ["the foreground agent exits non-zero", () => mocks.launchBuiltin.mockResolvedValueOnce({ status: 3, signal: null }), 3],
+      ["the foreground agent dies by a signal", () => mocks.launchBuiltin.mockResolvedValueOnce({ status: null, signal: "SIGKILL" }), 1],
+    ] as const)("when %s, the handed-off lock is released and the next command takes it", async (_label, arrange, status) => {
+      const prepared = preparedRuntime();
+      const held = tryAcquireProjectLifecycleLock(runtimeContext());
+      if (!held) throw new Error("fixture lock");
+      mocks.handoffs.set(prepared, coldHandoff(held));
+      arrange();
+
+      const launched = launchConfiguredAgentThroughAdmission({ preparedRuntime: prepared, io, agentName: "claude" });
+      if (status === undefined) await expect(launched).rejects.toThrow("callback setup");
+      else await expect(launched).resolves.toBe(status);
+
+      expect(mocks.handoffs.has(prepared)).toBe(false);
+      expect(lockIsFree()).toBe(true);
+    });
+  });
+
   test("releases a handed-off lock when the launch fails", async () => {
     const prepared = preparedRuntime();
     const held = tryAcquireProjectLifecycleLock(runtimeContext());

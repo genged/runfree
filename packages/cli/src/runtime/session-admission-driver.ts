@@ -550,6 +550,7 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
     owner: SessionCallbackOwner;
     reservation: ScopedTask<SessionCallbackReservation>;
   }>;
+  readonly #timings: RuntimeTimings;
   #displayIdentity?: Readonly<{ displayName: string; command: string; agentCommand: string }>;
   #sessionEvidence?: SessionMetadata;
 
@@ -560,6 +561,7 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
     launch?: SessionAdmissionLaunchOptions,
   ) {
     this.#input = input;
+    this.#timings = createRuntimeTimings(input.context.env);
     this.#gateway = gateway;
     this.agent = agent;
     this.#launch = launch;
@@ -574,6 +576,7 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
   /** How long this launch has held the lifecycle lock in its one continuous hold. */
   lockHoldMs = (): number => this.#nowMonotonicMs() - this.#lockHeldSinceMs;
   #teardownPath: "exited" | "full" = "full";
+  #preflightPath: "handoff" | "full" | undefined;
 
   // Locking invariant: every step asserts the lifecycle lock at entry (and
   // per-iteration around direct registry writes). Coordinator interiors are
@@ -897,6 +900,11 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
 
   /** Which revocation order the last teardown took; timing diagnostics only. */
   teardownPath = (): "exited" | "full" => this.#teardownPath;
+  /**
+   * Whether the preflight relied on startup's handed-off settlement or ran
+   * its own reconcile; undefined before a preflight. Timing diagnostics only.
+   */
+  preflightPath = (): "handoff" | "full" | undefined => this.#preflightPath;
 
   /**
    * Marks a blocked teardown in the durable record itself when its terminal
@@ -1462,6 +1470,7 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
     // revoked a dead owner or removed an orphan container, so no callback
     // forwarder went away since the participant proof above was taken.
     const settledByHandoff = this.#settledByHandoff();
+    this.#preflightPath = settledByHandoff ? "handoff" : "full";
     if (settledByHandoff) {
       // A warm-empty state saw no session file, so no address is reserved.
       this.#reservedSessionFileIps = settledByHandoff.sessionState.kind === "reconciled"
@@ -2171,7 +2180,7 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
     this.#ingress = Object.freeze({
       lifecycle,
       owner,
-      reservation: this.#tasks.start("session-ingress-reserve", () => lifecycle.reserve(owner)),
+      reservation: this.#tasks.start("session-ingress-reserve", () => this.#timings.timeAsync("admission:callback-reserve", () => lifecycle.reserve(owner))),
     });
   }
 
@@ -2186,9 +2195,9 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
   #completeSessionIngress = async (): Promise<void> => {
     const ingress = this.#ingress;
     if (!ingress) return;
-    const reserved = await ingress.reservation.result();
+    const reserved = await this.#timings.timeAsync("admission:callback-reservation-wait", () => ingress.reservation.result());
     this.#lock();
-    await ingress.lifecycle.complete(ingress.owner, reserved);
+    await this.#timings.timeAsync("admission:callback-complete", () => ingress.lifecycle.complete(ingress.owner, reserved));
   };
 
   /** Waits for every branch started beside the foreground steps, then asserts the lock. */
@@ -2617,7 +2626,7 @@ export function createInternalSessionAdmissionDriver(
     // operation count, surfaced per launch. Measurement only — the facade
     // delegates every step to the same object and never reorders or retries.
     const timings = createRuntimeTimings(resolvedInput.context.env);
-    const histogram = timings.enabled ? createOperationHistogram() : undefined;
+    const histogram = timings.enabled ? createOperationHistogram(timings.operation) : undefined;
     let steps: InternalBuiltinAdmissionProbeSteps | undefined;
     const attempt = async (): Promise<SessionAdmissionLaunchOutcome> => {
       steps = stepsFor(kind, options, histogram);
@@ -2663,6 +2672,8 @@ export function createInternalSessionAdmissionDriver(
     if (timings.enabled && finished) {
       timings.report("session-admission", `docker-operations=${finished.dockerOperationCount()}`);
       timings.report("teardown-path", finished.teardownPath());
+      const preflightPath = finished.preflightPath();
+      if (preflightPath) timings.report("admission:preflight-path", preflightPath);
     }
     inFlight = false;
     if (!result.ok) {

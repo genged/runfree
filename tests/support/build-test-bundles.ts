@@ -15,6 +15,8 @@ import type { TestProject } from "vitest/node";
 
 import {
   CLI_BUNDLE_PATH,
+  CREDENTIAL_WATCH_HARNESS_BUNDLE_PATH,
+  CREDENTIAL_WATCH_HARNESS_ENTRY_SOURCE,
   PROXY_SERVER_BUNDLE_PATH,
   repoRoot,
   SESSION_ADMISSION_CRASH_BUNDLE_PATH,
@@ -65,6 +67,9 @@ export const UNIT_BUNDLES: readonly BundleSpec[] = [
     outfile: PROXY_SERVER_BUNDLE_PATH,
     external: thirdPartyExternals(path.join(repoRoot, "packages", "proxy")),
   },
+  // Each credential watcher cancellation case boots it twice (session parent
+  // and watcher); through tsx that was most of the case's time.
+  { entry: CREDENTIAL_WATCH_HARNESS_ENTRY_SOURCE, outfile: CREDENTIAL_WATCH_HARNESS_BUNDLE_PATH, external: [] },
 ];
 
 /**

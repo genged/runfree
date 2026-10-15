@@ -78,6 +78,15 @@ export type RuntimeAdminIntent =
    * it would have to. Absent means today's source-truth sync.
    */
   | { kind: "token-sync"; verbose: boolean; mode?: "startup-convergence" }
+  /**
+   * `prepared-source-truth` is a cold launch's source-truth sync while startup
+   * holds the lifecycle lock it hands to admission: it publishes only the
+   * complete source-truth preparation made before the lock, reads no source,
+   * stops by `holdDeadlineMonotonicMs` (the `performance.now()` end of the
+   * startup hold allowance, counted from the lock's acquisition), and returns
+   * `TOKEN_SYNC_DEFERRED_STATUS` when it cannot.
+   */
+  | { kind: "token-sync"; verbose: boolean; mode: "prepared-source-truth"; holdDeadlineMonotonicMs: number }
   | { kind: "prepare-token-sources"; mode?: "source-truth" | "convergence" }
   | { kind: "prepare" };
 
@@ -166,7 +175,7 @@ export type DockerContainerInspect = {
     Type?: string;
   }> | null;
   NetworkSettings?: {
-    Networks?: Record<string, { NetworkID?: string; Gateway?: string; IPAddress?: string; GlobalIPv6Address?: string }>;
+    Networks?: Record<string, { NetworkID?: string; Gateway?: string; IPAddress?: string; GlobalIPv6Address?: string; EndpointID?: string }>;
     Ports?: DockerPortBindings | null;
   };
 };

@@ -70,6 +70,22 @@
 //   - A missing relay binary not changing the entry's exit code: that needs a
 //     project image without the relay; `scripts/session-entry.test.ts` covers
 //     it against the real entry script.
+//   - F29 (startup top-ten): the launch-time warning loop now answers every
+//     approved host service from one bounded `lsof -iTCP -sTCP:LISTEN -Fpcn`
+//     observation of every TCP listener on the host instead of one
+//     `lsof -iTCP:<port>` call per service (host-listener-snapshot.ts). The
+//     `up` assertion in `beforeAll` proves visibility and owner accuracy for
+//     this fixture's one real listener on a real macOS/Docker Desktop host,
+//     but a Docker sandbox has no way to stage "0 real listeners", "1 real
+//     listener", "10 real listeners", or a high ambient host-process count
+//     without faking the host's own process table -- the controller ruling
+//     for this task is explicit that the 0/1/10 real-listener measurements
+//     and this production-context visibility proof are OWED to the
+//     maintainer's macOS host, not simulated here. The parser's own fixture
+//     coverage (multi-owner, multi-address, malformed/truncated/timeout
+//     output, the ordered-warning-line equivalence with the per-port probe)
+//     is unit-level: host-listener-snapshot.test.ts.
+
 
 import childProcess from "node:child_process";
 import { randomBytes } from "node:crypto";
@@ -664,6 +680,19 @@ describe("approved host services", () => {
     // remove/add cycles restore this same policy content and session agent.
     const up = fixture.runfree(["up"]);
     expect(up.status, `runfree up did not select the host-service session agent: ${describeOutput(up.output)}`).toBe(0);
+    // F29 (startup top-ten): this launch's warning loop answers the owner
+    // check from one bounded `lsof` observation of every host listener
+    // (host-listener-snapshot.ts), not one `lsof -iTCP:<port>` call per
+    // approved service as before. `add` just recorded the echo server as
+    // this port's owner (the assertion above); a healthy launch immediately
+    // after must see that exact same owner from the batched snapshot and
+    // print no drift/visibility warning for it. Any regression in the batched
+    // parse -- a missed listener, a wrong address, an unavailable snapshot --
+    // would surface here as a "host service" warning line (see
+    // hostServiceWarningLines), so silence is the positive proof, not an
+    // absence of one.
+    expect(up.output, `a real host listener was not visible through the batched snapshot: ${describeOutput(up.output)}`)
+      .not.toMatch(/runfree warning:.*host service \S+ \(127\.0\.0\.1:\d+\):/u);
     await startSession();
   }, PROVISION_TIMEOUT_MS);
 

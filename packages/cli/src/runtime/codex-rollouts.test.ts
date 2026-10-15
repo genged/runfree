@@ -299,23 +299,24 @@ describe("scanCodexThreads", () => {
     expect(scan.complete).toBe(false);
   });
 
-  test(
-    "junk entries count against maxEntriesPerDir and never make the scan expensive by volume (F4)",
-    { timeout: 30_000 },
-    () => {
-      const dir = path.join(stateDir, "codex", "sessions", "2026", "10", "04");
-      fs.mkdirSync(dir, { recursive: true });
-      for (let i = 0; i < 100_000; i += 1) fs.writeFileSync(path.join(dir, `junk-${i}`), "");
-      const sessionsDir = path.join(stateDir, "codex", "sessions");
-      for (let i = 0; i < 10_000; i += 1) fs.mkdirSync(path.join(sessionsDir, `junkdir-${i}`));
-
-      const start = Date.now();
-      const scan = scanCodexThreads({ stateDir, windows: windowAround("2026-10-04T12:00:00.000Z") });
-
-      expect(Date.now() - start).toBeLessThan(3_000);
-      expect(scan).toEqual({ threads: [], complete: false });
-    },
-  );
+  test("junk entries count against maxEntriesPerDir at the exact boundary (F4)", () => {
+    const dir = path.join(stateDir, "codex", "sessions", "2026", "10", "04");
+    fs.mkdirSync(dir, { recursive: true });
+    for (let i = 0; i < CODEX_ROLLOUT_LIMITS.maxEntriesPerDir; i += 1) {
+      fs.writeFileSync(path.join(dir, `junk-${i}`), "");
+    }
+    // Freeze only the scan clock so the independent deadline cannot hide a
+    // broken entry budget. Fixture creation/cleanup need no 100k-file flood.
+    const clock = vi.spyOn(Date, "now").mockReturnValue(Date.now());
+    try {
+      const input = { stateDir, windows: windowAround("2026-10-04T12:00:00.000Z") };
+      expect(scanCodexThreads(input)).toEqual({ threads: [], complete: true });
+      fs.writeFileSync(path.join(dir, "one-too-many"), "");
+      expect(scanCodexThreads(input)).toEqual({ threads: [], complete: false });
+    } finally {
+      clock.mockRestore();
+    }
+  }, 30_000);
 
   // The naive version of this pair (symlinking the whole day *directory*
   // back to itself) is caught by `entryResolvesInsideDirectory`'s first,

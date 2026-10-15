@@ -55,6 +55,10 @@
 //         launch succeeds and all three are reclaimed.
 //   ext   Recovery (b): a compatible proxy replacement leaves a live callback
 //         forwarder and a port forward in place, loopback-only and reaching.
+//   core  A warm launch beside a live peer that owns a callback forwarder and
+//         is the target of a recorded port forward takes the warm peer path;
+//         once that peer ends, the forward left aimed at its address sends the
+//         next launch to the full validation.
 //   core  `runfree stop` and `runfree destroy` each remove a port forward
 //         (destroy also takes the host network).
 //   ext   Lock-hold budget: a warm launch that took the held-lock handoff,
@@ -152,6 +156,7 @@ import {
   type SpawnedCli,
 } from "./ingress-support.ts";
 import { liveTierSelected } from "./tiers.ts";
+import { milliseconds, timing } from "./launch-timing-support.ts";
 import { LAUNCH_LOCK_HOLD_BUDGET_MS } from "../../../packages/cli/src/runtime/launch-lock-hold.ts";
 
 // Mixed file (see `tiers.ts`): loopback publication, the one-way refusal, the
@@ -924,6 +929,44 @@ describe("ingress forwarders are loopback-only, one-way, per-session, and torn d
     expect(inspectContainer(forwarder.Id), `${label}: the forward was already gone before the runtime command`).toBeDefined();
     return forwarder.Id;
   }
+
+  // The warm record binds `vnc`/`port` forwarders by id, address, endpoint,
+  // purpose, and target, and binds no callback forwarder: those belong to a
+  // session and are proved fresh with it. A forward is opened against the
+  // peer, so the next launch (its fixed participants changed) validates fully
+  // and records it; the launch after that is judged beside the peer.
+  coreTest("a warm launch beside a peer with its callback forwarder and a recorded port forward to it takes the warm peer path", async () => {
+    ensureMcpOAuthEligible();
+    const peer = await launch(["claude"], "warm peer");
+    await awaitCallbackForwarder(peer);
+    const port = await freeLoopbackPort();
+    const opened = fixture.runfree(["forward", port]);
+    expect(opened.status, `runfree forward failed: ${describeOutput(opened.output, 4000)}`).toBe(0);
+    try {
+      const forward = inspectOrThrow(`runfree-ingress-port-${projectId}-${port}`, "peer forward");
+      expect(containerEnv(forward).INGRESS_TARGET, "the forward does not target the peer").toBe(peer.session.ip);
+      const recording = await launch(["claude"], "recording launch", { RUNFREE_TIMINGS: "1" });
+      expect(timing(recording.output(), "validation:warm-proof"), describeOutput(recording.output(), 4000))
+        .toContain("recorded");
+      const judged = await launch(["claude"], "judged launch", { RUNFREE_TIMINGS: "1" });
+      expect(timing(judged.output(), "validation:warm-peer"), describeOutput(judged.output(), 4000)).toContain("match");
+      expect(milliseconds(judged.output(), "runtime-validation")).toBeUndefined();
+      expect(timing(judged.output(), "startup:restore-sessions")).toContain("skipped warm-peer");
+      await assertCallbackTwoHop(judged);
+
+      // The forward outlives its target: beside the remaining peers it is
+      // aimed at a session address no peer holds, so it is not accounted for
+      // and the next launch validates fully.
+      await peer.end();
+      expect(inspectContainer(forward.Id), "the forward was gone before the stale-target launch").toBeDefined();
+      const stale = await launch(["claude"], "stale-target launch", { RUNFREE_TIMINGS: "1" });
+      expect(timing(stale.output(), "validation:warm-peer"), describeOutput(stale.output(), 4000))
+        .toContain("miss:ingress-target-unaccounted");
+      expect(milliseconds(stale.output(), "runtime-validation"), describeOutput(stale.output(), 4000)).toBeGreaterThan(0);
+    } finally {
+      fixture.runfree(["forward", port, "stop"]);
+    }
+  }, TEST_TIMEOUT_MS);
 
   coreTest("runfree stop removes an open port forward", async () => {
     const forwarderId = await forwardThatOutlivesItsSession("stop session");

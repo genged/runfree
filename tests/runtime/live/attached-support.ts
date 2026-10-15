@@ -133,6 +133,8 @@ export type LaunchRun = Readonly<{
    * a closed terminal leaves, and what the next launch's reconcile must clear.
    */
   killOwner: () => Promise<void>;
+  /** The owning host process: the pid the session's lifecycle record names. */
+  ownerPid: number | undefined;
 }>;
 
 /**
@@ -206,7 +208,7 @@ export async function startAttachedLaunch(
     child.stderr?.destroy();
     await completion.catch(() => undefined);
   };
-  return Object.freeze({ completion, attached, output: () => output, killOwner });
+  return Object.freeze({ completion, attached, output: () => output, killOwner, ownerPid: child.pid });
 }
 
 /**
@@ -641,7 +643,12 @@ export function readDurableSessionRecord(
  */
 const ASYNC_CLI_HANG_BACKSTOP_MS = 8 * 60_000;
 
-export type AsyncCliRun = Readonly<{ completion: Promise<Readonly<{ status: number | null; output: string }>>; cancel(): void }>;
+export type AsyncCliRun = Readonly<{
+  completion: Promise<Readonly<{ status: number | null; output: string }>>;
+  cancel(): void;
+  /** The spawned CLI's pid, which is also its process group (it runs detached). */
+  pid: number | undefined;
+}>;
 
 /** The fixture's CLI, spawned without blocking so the test can sample while it runs. */
 export function startRunfree(fixture: LiveFixture, args: readonly string[], extraEnv: NodeJS.ProcessEnv = {}): AsyncCliRun {
@@ -672,5 +679,5 @@ export function startRunfree(fixture: LiveFixture, args: readonly string[], extr
   };
   const timeout = setTimeout(cancel, ASYNC_CLI_HANG_BACKSTOP_MS);
   void completion.then(() => clearTimeout(timeout), () => clearTimeout(timeout));
-  return Object.freeze({ completion, cancel });
+  return Object.freeze({ completion, cancel, pid: child.pid });
 }

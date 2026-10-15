@@ -136,6 +136,28 @@ import {
   type TokenResolutionLedger,
   type TokenResolutionReceipt,
 } from "../token-resolution.ts";
+import {
+  ChildSignaledError,
+  CredentialCancellationError,
+  type CredentialLifetime,
+  isHostStopSignal,
+  settleHostSignals,
+} from "./credential-cancellation.ts";
+import { type CredentialReadInput, type CredentialReadResult, readCredentialSource } from "./credential-source-reader.ts";
+import {
+  type CredentialObservation,
+  type ProxyValidationMarker,
+  type CredentialObservationPhase,
+  type CredentialObservationResult,
+  type ProxyObservationPaths,
+  type ProxyObservationSection,
+  STARTED_AT_INSPECT_FIELD,
+  lockedHeldTokenNames,
+  observeCredentialRuntime,
+  inspectOutputRows,
+  readProxyObservationSections,
+  splitTrailingStartedAt,
+} from "./credential-observation.ts";
 import { stableJsonDroppingUndefined as stableJson, sha256Hex, isRecord } from "../strict-primitives.ts";
 import { remedy } from "../remedies.ts";
 
@@ -197,9 +219,11 @@ type TokenSyncRecord = {
 
 type TokenSyncStatus = Record<string, TokenSyncRecord>;
 export type ProxyRuntimeState = "ready" | "not-running" | "docker-unavailable" | "validation-required" | "proxy-unreachable";
-type ProxyRuntime = {
+export type ProxyRuntime = {
   id?: string;
   storeGeneration?: string;
+  /** The incarnation the store generation binds; a later observation must see the same one. */
+  startedAt?: string;
   state: ProxyRuntimeState;
   validationMessage?: string;
 };
@@ -250,6 +274,18 @@ type TokenSyncOptions = TokenResolutionOptions & {
    */
   preparedOnly?: boolean;
   /**
+   * A source-truth sync that resolves nothing (a cold launch handing its
+   * lifecycle lock to admission): every policy token is written from the
+   * complete source-truth preparation made before the lock, with the age of
+   * that read. Distinct from `preparedOnly`, which is receipt-gated: this
+   * pass skips nothing and keeps source-truth semantics (dropped-token
+   * deletion, every token due). It defers (`TokenSyncDeferredError`) before
+   * any effect on the same conditions as `preparedOnly`, and also when the
+   * preparation is missing, incomplete (a skipped entry, a required token
+   * with no source) or no longer binds the current sources.
+   */
+  preparedSourceTruth?: boolean;
+  /**
    * Keep the last good proxy value on an unclassified source-resolution
    * failure too, not only a transient one (still bounded by the keep-last-good
    * age). The watcher's first source-truth pass after a receipt-gated launch
@@ -259,6 +295,21 @@ type TokenSyncOptions = TokenResolutionOptions & {
    * changes (source removed, fingerprint changed, token dropped from policy).
    */
   keepLastGoodOnAnyResolutionFailure?: boolean;
+  /**
+   * Watcher passes only. Checked before every effect (each token write and
+   * removal, the persistence in `finish()`): once the watch is cancelled the
+   * pass stops with `CredentialCancellationError` and dispatches nothing more.
+   */
+  lifetime?: CredentialLifetime;
+  /**
+   * Watcher passes only: the sources read before the lock. A due token takes
+   * its value or its source failure from here and never resolves a source
+   * under the lock; a due token with no current entry is skipped and listed
+   * in `unprepared`, for the watcher to read before its next locked pass.
+   */
+  watchPreparation?: WatchTokenPreparation;
+  /** Watcher passes only: the runtime the preparation observed, used instead of a second observation. */
+  observedRuntime?: ProxyRuntime;
 };
 
 /**
@@ -266,9 +317,17 @@ type TokenSyncOptions = TokenResolutionOptions & {
  * waiting on a lock, or exceeding its time bounds. Never followed by a removal.
  */
 export class TokenSyncDeferredError extends Error {
-  constructor(message: string) {
+  /**
+   * `preparation`: the sources read before the lock are the reason (none,
+   * incomplete, expired, or no longer the current sources), so the caller
+   * must read them again. `runtime`: anything else (a busy lock, a proxy that
+   * is not ready, a failed write, a spent budget); the preparation still holds.
+   */
+  readonly deferredFor: "preparation" | "runtime";
+  constructor(message: string, deferredFor: "preparation" | "runtime" = "runtime") {
     super(message);
     this.name = "TokenSyncDeferredError";
+    this.deferredFor = deferredFor;
   }
 }
 
@@ -851,8 +910,69 @@ function parseOnePasswordDocumentRef(ref: string): OnePasswordDocumentRef | unde
   };
 }
 
-function readSpawnedOpOutput(result: childProcess.SpawnSyncReturns<string>, emptyMessage: string): string {
-  const value = typeof result.stdout === "string" ? result.stdout.replace(/\r?\n$/, "") : "";
+/**
+ * What one provider run produced: an exit, or the host's own verdict on it
+ * (it timed out, or could not run or overran its output bound). Shared by the
+ * synchronous adapter below and the watcher's owned asynchronous reader, so
+ * both classify a provider exactly the same way.
+ */
+export type ProviderExit = Readonly<{
+  status: number | null;
+  signal: NodeJS.Signals | null;
+  stdout: string;
+  stderr: string;
+  failure?: Readonly<{ kind: "timeout" }> | Readonly<{ kind: "spawn"; message: string }>;
+}>;
+
+// Under the rerun after a signal-ended child (see `syncTokensSettlingSignals`)
+// the synchronous adapters classify a signal-ended provider as before the
+// cancellation contract: `status ?? 1`, so a provider's own signal still revokes.
+const classifySignaledProviders = new AsyncLocalStorage<boolean>();
+
+function providerExitFromSpawnSync(result: childProcess.SpawnSyncReturns<string>): ProviderExit {
+  const errorCode = (result.error as NodeJS.ErrnoException | undefined)?.code;
+  const failure = result.error
+    ? errorCode === "ETIMEDOUT" ? { kind: "timeout" as const } : { kind: "spawn" as const, message: result.error.message }
+    : undefined;
+  const exit: ProviderExit = {
+    status: result.status ?? null,
+    signal: result.signal ?? null,
+    stdout: typeof result.stdout === "string" ? result.stdout : "",
+    stderr: typeof result.stderr === "string" ? result.stderr : "",
+    ...(failure ? { failure } : {}),
+  };
+  // A synchronous provider that ended by a stop signal may have been ended by
+  // a terminal Ctrl-C reaching the whole foreground group: never classified
+  // here, where the host's own handler cannot have run yet.
+  if (!exit.failure && isHostStopSignal(exit.signal) && classifySignaledProviders.getStore() !== true) {
+    throw new ChildSignaledError("provider", exit.signal);
+  }
+  return exit;
+}
+
+/**
+ * Runs a provider through the in-process test seam (`AdminState.processRunner`)
+ * when one is installed, synchronously, exactly as the synchronous resolver
+ * would; undefined otherwise, and the caller runs the real process.
+ */
+export function providerExitThroughTestSeam(
+  command: string,
+  args: readonly string[],
+  options: Readonly<{ cwd?: string; env: NodeJS.ProcessEnv; timeoutMs: number }>,
+): ProviderExit | undefined {
+  if (!currentAdminState().processRunner) return undefined;
+  return providerExitFromSpawnSync(adminSpawnSync(command, [...args], {
+    ...(options.cwd === undefined ? {} : { cwd: options.cwd }),
+    encoding: "utf8",
+    env: options.env,
+    maxBuffer: PROVIDER_OUTPUT_MAX_BYTES,
+    shell: false,
+    timeout: options.timeoutMs,
+  }));
+}
+
+function readSpawnedOpOutput(result: ProviderExit, emptyMessage: string): string {
+  const value = result.stdout.replace(/\r?\n$/, "");
   if (!value) {
     throw new TokenResolutionError({
       classification: "definitive",
@@ -897,45 +1017,58 @@ function opExitError(code: string, stderr: unknown, safeMessage: string): TokenR
   });
 }
 
-export function readOnePasswordRef(opPath: string, ref: string, options: { quiet?: boolean } = {}): string {
-  if (!options.quiet) runfreeLog("resolving 1Password credential source (Touch ID/passphrase prompt may appear)");
-  const timeoutMs = opReadTimeoutMs();
-  const result = adminSpawnSync(opPath, ["read", ref], {
-    encoding: "utf8",
-    env: childEnv(),
-    maxBuffer: 128 * 1024,
-    shell: false,
-    timeout: timeoutMs,
-  });
-  if (result.error) {
-    if ((result.error as NodeJS.ErrnoException).code === "ETIMEDOUT") {
-      throw opTransportError("op-timeout", `op read timed out waiting for 1Password after ${Math.round(timeoutMs / 1000)}s; unlock 1Password or run \`op signin\` and retry`);
-    }
-    throw opTransportError("op-spawn-failed", `op read failed: ${result.error.message}`);
-  }
-  if ((result.status ?? 1) === 0) return readSpawnedOpOutput(result, "op read returned an empty value");
+export type OnePasswordRead = Readonly<{
+  executable: string;
+  ref: string;
+  env: NodeJS.ProcessEnv;
+  timeoutMs: number;
+  quiet: boolean;
+}>;
 
-  const documentRef = parseOnePasswordDocumentRef(ref);
-  if (!documentRef) throw opExitError("op-read-failed", result.stderr, opReadFailureMessage(result.stderr));
+export const PROVIDER_OUTPUT_MAX_BYTES = 128 * 1024;
 
-  const documentResult = adminSpawnSync(opPath, ["document", "get", documentRef.item, "--vault", documentRef.vault], {
-    encoding: "utf8",
-    env: childEnv(),
-    maxBuffer: 128 * 1024,
-    shell: false,
-    timeout: timeoutMs,
-  });
-  if (documentResult.error) {
-    if ((documentResult.error as NodeJS.ErrnoException).code === "ETIMEDOUT") {
-      throw opTransportError("op-timeout", `op document get timed out waiting for 1Password after ${Math.round(timeoutMs / 1000)}s; unlock 1Password or run \`op signin\` and retry`);
-    }
-    throw opTransportError("op-spawn-failed", `op document get failed: ${documentResult.error.message}`);
+export function onePasswordReadArgs(read: OnePasswordRead): string[] {
+  return ["read", read.ref];
+}
+
+export function onePasswordDocumentArgs(documentRef: OnePasswordDocumentRef): string[] {
+  return ["document", "get", documentRef.item, "--vault", documentRef.vault];
+}
+
+export function announceOnePasswordRead(read: OnePasswordRead): void {
+  if (!read.quiet) runfreeLog("resolving 1Password credential source (Touch ID/passphrase prompt may appear)");
+}
+
+/**
+ * The first `op read` step: a value, or the document fallback to run. The
+ * fallback is never entered after a read the host ended (a timeout kill) or
+ * one that ended by a signal.
+ */
+export function onePasswordReadStep(
+  read: OnePasswordRead,
+  exit: ProviderExit,
+): Readonly<{ kind: "value"; value: string }> | Readonly<{ kind: "document"; documentRef: OnePasswordDocumentRef }> {
+  if (exit.failure?.kind === "timeout") {
+    throw opTransportError("op-timeout", `op read timed out waiting for 1Password after ${Math.round(read.timeoutMs / 1000)}s; unlock 1Password or run \`op signin\` and retry`);
   }
-  if ((documentResult.status ?? 1) !== 0) {
-    const combined = `${opReadFailureMessage(result.stderr)}; ${opDocumentGetFailureMessage(documentResult.stderr)}`;
+  if (exit.failure) throw opTransportError("op-spawn-failed", `op read failed: ${exit.failure.message}`);
+  if ((exit.status ?? 1) === 0) return { kind: "value", value: readSpawnedOpOutput(exit, "op read returned an empty value") };
+  const documentRef = exit.signal === null ? parseOnePasswordDocumentRef(read.ref) : undefined;
+  if (!documentRef) throw opExitError("op-read-failed", exit.stderr, opReadFailureMessage(exit.stderr));
+  return { kind: "document", documentRef };
+}
+
+/** The `op document get` fallback's verdict, given the failed read before it. */
+export function onePasswordDocumentStep(read: OnePasswordRead, readExit: ProviderExit, documentExit: ProviderExit): string {
+  if (documentExit.failure?.kind === "timeout") {
+    throw opTransportError("op-timeout", `op document get timed out waiting for 1Password after ${Math.round(read.timeoutMs / 1000)}s; unlock 1Password or run \`op signin\` and retry`);
+  }
+  if (documentExit.failure) throw opTransportError("op-spawn-failed", `op document get failed: ${documentExit.failure.message}`);
+  if ((documentExit.status ?? 1) !== 0) {
+    const combined = `${opReadFailureMessage(readExit.stderr)}; ${opDocumentGetFailureMessage(documentExit.stderr)}`;
     // A document fallback is transient only when both stages look transient.
     throw new TokenResolutionError({
-      classification: classifyOnePasswordFailure(result.stderr) === "transient" && classifyOnePasswordFailure(documentResult.stderr) === "transient"
+      classification: classifyOnePasswordFailure(readExit.stderr) === "transient" && classifyOnePasswordFailure(documentExit.stderr) === "transient"
         ? "transient"
         : "definitive",
       sourceKind: "1password",
@@ -943,50 +1076,103 @@ export function readOnePasswordRef(opPath: string, ref: string, options: { quiet
       safeMessage: combined,
     });
   }
-  return readSpawnedOpOutput(documentResult, "op document get returned an empty value");
+  return readSpawnedOpOutput(documentExit, "op document get returned an empty value");
 }
 
-export function runCommandSource(source: CommandSource): string {
+function onePasswordRead(opPath: string, ref: string, options: { quiet?: boolean } = {}): OnePasswordRead {
+  return { executable: opPath, ref, env: Object.freeze({ ...childEnv() }), timeoutMs: opReadTimeoutMs(), quiet: options.quiet === true };
+}
+
+function runOnePasswordReadSync(read: OnePasswordRead): string {
+  announceOnePasswordRead(read);
+  const spawnOptions = {
+    encoding: "utf8" as const,
+    env: read.env,
+    maxBuffer: PROVIDER_OUTPUT_MAX_BYTES,
+    shell: false,
+    timeout: read.timeoutMs,
+  };
+  const readExit = providerExitFromSpawnSync(adminSpawnSync(read.executable, onePasswordReadArgs(read), spawnOptions));
+  const step = onePasswordReadStep(read, readExit);
+  if (step.kind === "value") return step.value;
+  const documentExit = providerExitFromSpawnSync(adminSpawnSync(read.executable, onePasswordDocumentArgs(step.documentRef), spawnOptions));
+  return onePasswordDocumentStep(read, readExit, documentExit);
+}
+
+export function readOnePasswordRef(opPath: string, ref: string, options: { quiet?: boolean } = {}): string {
+  return runOnePasswordReadSync(onePasswordRead(opPath, ref, options));
+}
+
+export type CommandSourceInvocation = Readonly<{
+  executable: string;
+  args: readonly string[];
+  cwd: string;
+  env: NodeJS.ProcessEnv;
+  timeoutMs: number;
+  commandName: string;
+}>;
+
+function commandSourceError(classification: "transient" | "definitive", code: string, safeMessage: string): TokenResolutionError {
+  return new TokenResolutionError({ classification, sourceKind: "command", code, safeMessage });
+}
+
+/** Everything checked before a command source runs; throws the same refusals the run would. */
+export function commandSourceInvocation(source: CommandSource): CommandSourceInvocation {
   const executable = source.argv[0];
   const commandName = path.basename(executable);
-  const commandError = (classification: "transient" | "definitive", code: string, safeMessage: string) =>
-    new TokenResolutionError({ classification, sourceKind: "command", code, safeMessage });
   const realPath = regularExecutableRealpath(executable);
   if (!realPath || realPath !== executable) {
-    throw commandError("definitive", "command-missing", `${commandName} executable is missing or no longer canonical`);
+    throw commandSourceError("definitive", "command-missing", `${commandName} executable is missing or no longer canonical`);
   }
   assertSourceArgumentsOutsideProject(source.argv.slice(1));
-  const result = adminSpawnSync(executable, source.argv.slice(1), {
+  return {
+    executable,
+    args: source.argv.slice(1),
     cwd: hostOwnedSourceCwd(),
-    encoding: "utf8",
-    env: sourceExecutionEnv(),
-    maxBuffer: 128 * 1024,
-    shell: false,
-    timeout: commandSourceTimeoutMs(),
-  });
-  if (result.error) {
-    if ((result.error as NodeJS.ErrnoException).code === "ETIMEDOUT") {
-      throw commandError("transient", "command-timeout", `command source timed out: ${commandName}`);
-    }
-    throw commandError("definitive", "command-spawn-failed", `command source failed: ${commandName}: ${result.error.message}`);
+    env: Object.freeze(sourceExecutionEnv()),
+    timeoutMs: commandSourceTimeoutMs(),
+    commandName,
+  };
+}
+
+/** A command source run's verdict: its value, or the classified failure. */
+export function commandSourceStep(invocation: CommandSourceInvocation, exit: ProviderExit): string {
+  const { commandName } = invocation;
+  if (exit.failure?.kind === "timeout") throw commandSourceError("transient", "command-timeout", `command source timed out: ${commandName}`);
+  if (exit.failure) throw commandSourceError("definitive", "command-spawn-failed", `command source failed: ${commandName}: ${exit.failure.message}`);
+  if ((exit.status ?? 1) !== 0) {
+    const stderr = sanitizedStderrFirstLine(exit.stderr);
+    throw commandSourceError("definitive", "command-nonzero", `command source exited nonzero: ${commandName} status ${exit.status ?? 1}${stderr ? `: ${stderr}` : ""}`);
   }
-  if ((result.status ?? 1) !== 0) {
-    const stderr = sanitizedStderrFirstLine(result.stderr);
-    throw commandError("definitive", "command-nonzero", `command source exited nonzero: ${commandName} status ${result.status ?? 1}${stderr ? `: ${stderr}` : ""}`);
-  }
-  const stdout = typeof result.stdout === "string" ? result.stdout : "";
-  const value = stdout.replace(/\r?\n$/, "");
-  if (value === "") throw commandError("definitive", "empty-value", "command source returned an empty value");
+  const value = exit.stdout.replace(/\r?\n$/, "");
+  if (value === "") throw commandSourceError("definitive", "empty-value", "command source returned an empty value");
   return value;
 }
 
-function readSecretRef(ref: SecretRef, options: { quiet?: boolean; verbose?: boolean } = {}): string {
+export function runCommandSource(source: CommandSource): string {
+  const invocation = commandSourceInvocation(source);
+  const exit = providerExitFromSpawnSync(adminSpawnSync(invocation.executable, [...invocation.args], {
+    cwd: invocation.cwd,
+    encoding: "utf8",
+    env: invocation.env,
+    maxBuffer: PROVIDER_OUTPUT_MAX_BYTES,
+    shell: false,
+    timeout: invocation.timeoutMs,
+  }));
+  return commandSourceStep(invocation, exit);
+}
+
+function jwtPrivateKeyRead(ref: SecretRef, options: { quiet?: boolean; verbose?: boolean } = {}): OnePasswordRead {
   if (ref.source !== "1password") throw new Error("unsupported secret reference");
   if (!ref.ref.startsWith("op://")) throw new Error("1Password references must start with op://");
   const opPath = resolveHostExecutable("op");
   if (!opPath) throw new Error("op CLI not found on sanitized host PATH");
   adminVerbose(options, "reading JWT private key from 1Password");
-  return readOnePasswordRef(opPath, ref.ref, options);
+  return onePasswordRead(opPath, ref.ref, options);
+}
+
+function readSecretRef(ref: SecretRef, options: { quiet?: boolean; verbose?: boolean } = {}): string {
+  return runOnePasswordReadSync(jwtPrivateKeyRead(ref, options));
 }
 
 function base64UrlJson(value: unknown): string {
@@ -1003,25 +1189,34 @@ function jwtSourceFingerprint(source: JwtSource): string {
   })).digest("hex");
 }
 
-function jwtSigningKey(source: JwtSource, options: TokenResolutionOptions & { sourceName?: string } = {}): string | crypto.KeyObject {
+/** A cached signing key for this exact JWT source, if the watcher holds one. */
+function cachedJwtSigningKey(source: JwtSource, options: TokenResolutionOptions & { sourceName?: string }): crypto.KeyObject | undefined {
   const cache = options.sourceSecretCache;
-  if (!cache || !options.sourceName) return readSecretRef(source.privateKey, options);
-
-  const fingerprint = jwtSourceFingerprint(source);
+  if (!cache || !options.sourceName) return undefined;
   const cached = cache.jwtPrivateKeys.get(options.sourceName);
-  if (cached?.fingerprint === fingerprint) {
-    adminVerbose(options, `using cached JWT private key for source ${options.sourceName}`);
-    return cached.key;
-  }
+  if (cached?.fingerprint !== jwtSourceFingerprint(source)) return undefined;
+  adminVerbose(options, `using cached JWT private key for source ${options.sourceName}`);
+  return cached.key;
+}
 
-  const privateKeyPem = readSecretRef(source.privateKey, options);
+/** The signing key from a freshly read PEM, cached in watcher memory when caching is on. */
+export function jwtSigningKeyFromPem(source: JwtSource, privateKeyPem: string, options: TokenResolutionOptions & { sourceName?: string }): string | crypto.KeyObject {
+  const cache = options.sourceSecretCache;
+  if (!cache || !options.sourceName) return privateKeyPem;
   const key = crypto.createPrivateKey(privateKeyPem);
-  cache.jwtPrivateKeys.set(options.sourceName, { fingerprint, key });
+  cache.jwtPrivateKeys.set(options.sourceName, { fingerprint: jwtSourceFingerprint(source), key });
   return key;
 }
 
+function jwtSigningKey(source: JwtSource, options: TokenResolutionOptions & { sourceName?: string } = {}): string | crypto.KeyObject {
+  return cachedJwtSigningKey(source, options) ?? jwtSigningKeyFromPem(source, readSecretRef(source.privateKey, options), options);
+}
+
 export function signJwtSource(source: JwtSource, options: TokenResolutionOptions & { sourceName?: string } = {}): string {
-  const privateKey = jwtSigningKey(source, options);
+  return signJwtWithKey(source, jwtSigningKey(source, options));
+}
+
+export function signJwtWithKey(source: JwtSource, privateKey: string | crypto.KeyObject): string {
   const now = Math.floor(tokenSyncWatchNowMs() / 1000);
   const header = {
     typ: "JWT",
@@ -1042,9 +1237,39 @@ export function signJwtSource(source: JwtSource, options: TokenResolutionOptions
   return `${signingInput}.${signature.toString("base64url")}`;
 }
 
-function resolveNamedSource(source: NamedSource, options: TokenResolutionOptions & { sourceName?: string } = {}): string {
-  if (source.type === "command") return runCommandSource(source);
-  return signJwtSource(source, options);
+/**
+ * One source read, decided up to the point a provider would run. The
+ * synchronous resolver and the watcher's owned asynchronous reader both
+ * execute it, so the prechecks and their refusals are the same in both.
+ * `failure` holds a refusal decided without running anything (rethrown as
+ * is, so its classification is unchanged); `value` a value that needed no
+ * provider (a host environment source).
+ */
+export type CredentialReadPlan =
+  | Readonly<{ kind: "value"; value: string }>
+  | Readonly<{ kind: "failure"; error: unknown }>
+  | Readonly<{ kind: "1password"; read: OnePasswordRead }>
+  | Readonly<{ kind: "command"; invocation: CommandSourceInvocation }>
+  | Readonly<{
+    kind: "jwt";
+    source: JwtSource;
+    options: TokenResolutionOptions & { sourceName?: string };
+    signingKey: Readonly<{ kind: "cached"; key: crypto.KeyObject }> | Readonly<{ kind: "read"; read: OnePasswordRead }>;
+  }>;
+
+function planStep(build: () => CredentialReadPlan): CredentialReadPlan {
+  try {
+    return build();
+  } catch (error) {
+    return { kind: "failure", error };
+  }
+}
+
+function namedSourceReadPlan(source: NamedSource, options: TokenResolutionOptions & { sourceName?: string }): CredentialReadPlan {
+  if (source.type === "command") return planStep(() => ({ kind: "command", invocation: commandSourceInvocation(source) }));
+  const cachedKey = cachedJwtSigningKey(source, options);
+  if (cachedKey) return { kind: "jwt", source, options, signingKey: { kind: "cached", key: cachedKey } };
+  return planStep(() => ({ kind: "jwt", source, options, signingKey: { kind: "read", read: jwtPrivateKeyRead(source.privateKey, options) } }));
 }
 
 function semanticNamedSource(sourceName: string, registry: SourceRegistry | undefined): unknown {
@@ -1259,65 +1484,216 @@ function commandSourceMigrationInstructions(tokenName: string, prefix: string): 
   ].join("; ");
 }
 
-function resolveTokenSource(tokenName: string, source: TokenSource, options: TokenResolutionOptions = {}): string {
+/** Decides one source read up to the provider run (see `CredentialReadPlan`). */
+export function credentialReadPlan(tokenName: string, source: TokenSource, options: TokenResolutionOptions = {}): CredentialReadPlan {
   if (source.source === "env") {
     adminVerbose(options, `${tokenName}: reading host environment source ${source.env}`);
     const value = childEnv()[source.env];
     if (!value) {
-      throw new TokenResolutionError({
-        classification: "definitive",
-        sourceKind: "env",
-        code: "env-unset",
-        safeMessage: `${source.env} is unset or empty`,
-      });
+      return {
+        kind: "failure",
+        error: new TokenResolutionError({
+          classification: "definitive",
+          sourceKind: "env",
+          code: "env-unset",
+          safeMessage: `${source.env} is unset or empty`,
+        }),
+      };
     }
-    return value;
+    return { kind: "value", value };
   }
 
   if (source.source === "1password") {
     if (!source.ref.startsWith("op://")) {
-      throw new TokenResolutionError({
-        classification: "definitive",
-        sourceKind: "1password",
-        code: "invalid-reference",
-        safeMessage: "1Password references must start with op://",
-      });
+      return {
+        kind: "failure",
+        error: new TokenResolutionError({
+          classification: "definitive",
+          sourceKind: "1password",
+          code: "invalid-reference",
+          safeMessage: "1Password references must start with op://",
+        }),
+      };
     }
     const opPath = resolveHostExecutable("op");
     if (!opPath) {
       // The op binary disappearing from PATH is a host-tooling problem, not a
       // revocation gesture: the vault item may be untouched.
-      throw new TokenResolutionError({
-        classification: "transient",
-        sourceKind: "1password",
-        code: "op-unavailable",
-        safeMessage: "op CLI not found on sanitized host PATH",
-      });
+      return {
+        kind: "failure",
+        error: new TokenResolutionError({
+          classification: "transient",
+          sourceKind: "1password",
+          code: "op-unavailable",
+          safeMessage: "op CLI not found on sanitized host PATH",
+        }),
+      };
     }
     adminVerbose(options, `${tokenName}: reading 1Password source with op CLI`);
-    return readOnePasswordRef(opPath, source.ref, options);
+    return { kind: "1password", read: onePasswordRead(opPath, source.ref, options) };
   }
 
   if (source.source === "named") {
     adminVerbose(options, `${tokenName}: reading host named source ${source.name}`);
-    const registry = options.sourceRegistry ?? loadSourceRegistry();
+    let registry: SourceRegistry;
+    try {
+      registry = options.sourceRegistry ?? loadSourceRegistry();
+    } catch (error) {
+      return { kind: "failure", error };
+    }
     const namedSource = registry[source.name];
     if (!namedSource) {
-      throw new TokenResolutionError({
-        classification: "definitive",
-        sourceKind: "named",
-        code: "unknown-source",
-        safeMessage: `unknown source: ${source.name}`,
-      });
+      return {
+        kind: "failure",
+        error: new TokenResolutionError({
+          classification: "definitive",
+          sourceKind: "named",
+          code: "unknown-source",
+          safeMessage: `unknown source: ${source.name}`,
+        }),
+      };
     }
-    return resolveNamedSource(namedSource, { ...options, sourceName: source.name });
+    return namedSourceReadPlan(namedSource, { ...options, sourceName: source.name });
   }
 
   if (source.source === "cmd") {
-    throw new Error(commandSourceMigrationInstructions(tokenName, "unsupported command credential source in token config"));
+    return { kind: "failure", error: new Error(commandSourceMigrationInstructions(tokenName, "unsupported command credential source in token config")) };
   }
 
-  throw new Error("legacy local-file credential source is unsupported; reconfigure with --from-1password or --from-env");
+  return { kind: "failure", error: new Error("legacy local-file credential source is unsupported; reconfigure with --from-1password or --from-env") };
+}
+
+function runCredentialReadPlanSync(plan: CredentialReadPlan): string {
+  switch (plan.kind) {
+    case "value":
+      return plan.value;
+    case "failure":
+      throw plan.error;
+    case "1password":
+      return runOnePasswordReadSync(plan.read);
+    case "command": {
+      const { invocation } = plan;
+      const exit = providerExitFromSpawnSync(adminSpawnSync(invocation.executable, [...invocation.args], {
+        cwd: invocation.cwd,
+        encoding: "utf8",
+        env: invocation.env,
+        maxBuffer: PROVIDER_OUTPUT_MAX_BYTES,
+        shell: false,
+        timeout: invocation.timeoutMs,
+      }));
+      return commandSourceStep(invocation, exit);
+    }
+    case "jwt": {
+      const key = plan.signingKey.kind === "cached"
+        ? plan.signingKey.key
+        : jwtSigningKeyFromPem(plan.source, runOnePasswordReadSync(plan.signingKey.read), plan.options);
+      return signJwtWithKey(plan.source, key);
+    }
+  }
+}
+
+function resolveTokenSource(tokenName: string, source: TokenSource, options: TokenResolutionOptions = {}): string {
+  return runCredentialReadPlanSync(credentialReadPlan(tokenName, source, options));
+}
+
+/**
+ * Identifies one direct 1Password resolution's context for sharing within a
+ * preparation: the resolved provider executable and the exact reference
+ * bytes (no alias normalization). The account/context selection — anything
+ * in the provider's environment, `OP_ACCOUNT`, a service-account token, a
+ * Connect host/token — is not part of this key's bytes (nothing is hashed or
+ * logged); instead the owning scope binds to one exact environment (see
+ * `createCredentialPreparationScope`) and never shares across a difference
+ * in it, so two different accounts can never collide on the same key.
+ */
+export type ProviderReadKey = Readonly<{ executable: string; ref: string }>;
+
+/** One successful direct 1Password read, kept only long enough to share it with later destinations in the same preparation pass. */
+export type SuccessfulProviderRead = Readonly<{ value: string; resolvedAt: number }>;
+
+function providerReadKeyString(key: ProviderReadKey): string {
+  // A NUL byte cannot appear in a real executable path or an op:// reference,
+  // so the pair joins into one exact, collision-free string key.
+  return `${key.executable}\u0000${key.ref}`;
+}
+
+/**
+ * Whether two provider environments are the identical account/context
+ * selection: same keys, same values. A plain in-memory comparison, never
+ * hashed or logged; used only to decide whether a read may be shared, never
+ * surfaced to a caller.
+ */
+function sameProviderEnvironment(a: NodeJS.ProcessEnv, b: NodeJS.ProcessEnv): boolean {
+  if (a === b) return true;
+  const aKeys = Object.keys(a);
+  if (aKeys.length !== Object.keys(b).length) return false;
+  return aKeys.every((name) => a[name] === b[name]);
+}
+
+/**
+ * One preparation pass's shared-read cache. A successful direct 1Password
+ * read is reused for every later destination in the same pass with the
+ * identical resolved executable, exact reference, and account/context
+ * selection; a source failure or a cancelled read is never stored, so every
+ * destination still gets its own attempt, classification, fingerprint and
+ * receipt. Arbitrary named commands and JWT private-key/signing reads are
+ * never shared (F01 covers direct 1Password resolution only). Create one
+ * fresh scope per preparation pass — launch preparation, or one watcher
+ * pass's reads before its lock — and dispose it with that pass; never share
+ * or persist one across passes or module-level.
+ */
+export type CredentialPreparationScope = Readonly<{
+  /** For a synchronous preparation pass (launch preparation). Throws exactly as the plan's own synchronous run would; a thrown failure is never cached. */
+  readSync(plan: CredentialReadPlan): string;
+  /** For the watcher's owned asynchronous reads. A `source-failure` or `cancelled` result is never cached. */
+  read(input: CredentialReadInput, lifetime: CredentialLifetime): Promise<CredentialReadResult>;
+  /** Drops every shared value this scope holds. Idempotent; call once the pass that owns the scope is done with it (success, failure, cancellation, policy drift or expiration alike). */
+  dispose(): void;
+}>;
+
+export function createCredentialPreparationScope(): CredentialPreparationScope {
+  // Separate caches: a synchronous preparation pass has no read-start time
+  // worth keeping (its `resolved` entries have never carried one — the
+  // publish step always re-stamps its own clock), so `readSync`'s cache
+  // holds bare values. The watcher's `read` keeps the original `resolvedAt`
+  // it shares across destinations (receipt/keep-last-good ages on it).
+  const syncSuccesses = new Map<string, string>();
+  const asyncSuccesses = new Map<string, SuccessfulProviderRead>();
+  // Bound lazily to the first 1Password read's exact environment. A later
+  // read whose environment differs in any key or value never shares: it
+  // always runs its own read, uncached, rather than mixing accounts.
+  let boundEnvironment: NodeJS.ProcessEnv | undefined;
+  function sharedKeyFor(read: OnePasswordRead): string | undefined {
+    if (boundEnvironment === undefined) boundEnvironment = read.env;
+    else if (!sameProviderEnvironment(boundEnvironment, read.env)) return undefined;
+    return providerReadKeyString({ executable: read.executable, ref: read.ref });
+  }
+  return Object.freeze({
+    readSync(plan: CredentialReadPlan): string {
+      if (plan.kind !== "1password") return runCredentialReadPlanSync(plan);
+      const key = sharedKeyFor(plan.read);
+      if (key === undefined) return runCredentialReadPlanSync(plan);
+      const cached = syncSuccesses.get(key);
+      if (cached !== undefined) return cached;
+      const value = runCredentialReadPlanSync(plan);
+      syncSuccesses.set(key, value);
+      return value;
+    },
+    async read(input: CredentialReadInput, lifetime: CredentialLifetime): Promise<CredentialReadResult> {
+      if (input.plan.kind !== "1password") return readCredentialSource(input, lifetime);
+      const key = sharedKeyFor(input.plan.read);
+      if (key === undefined) return readCredentialSource(input, lifetime);
+      const cached = asyncSuccesses.get(key);
+      if (cached) return { kind: "success", value: cached.value, resolvedAt: cached.resolvedAt };
+      const result = await readCredentialSource(input, lifetime);
+      if (result.kind === "success") asyncSuccesses.set(key, { value: result.value, resolvedAt: result.resolvedAt });
+      return result;
+    },
+    dispose(): void {
+      syncSuccesses.clear();
+      asyncSuccesses.clear();
+    },
+  });
 }
 
 // A typed token-source selection (which `--from-*` the user chose), independent
@@ -1482,82 +1858,114 @@ function serviceContainerId(project: string, service: string, options: { running
   return ps.stdout.trim().split(/\s+/).filter(Boolean)[0];
 }
 
-function dockerContainerStartedAt(containerId: string): string | undefined {
-  const result = adminDockerClient().inspect([containerId], { format: "{{.State.StartedAt}}" });
-  const startedAt = result.stdout.trim();
-  if (result.status !== 0 || startedAt === "" || startedAt === "<no value>") return undefined;
-  return startedAt;
+function proxyObservationPaths(): ProxyObservationPaths {
+  return {
+    validationMarker: RUNTIME_VALIDATION_MARKER_PATH,
+    firewallStatus: firewallStatusPath(),
+    requestProxyStatus: requestProxyStatusPath(),
+    secretDir: CONTAINER_SECRET_DIR,
+  };
 }
 
-// One docker exec yields both consumers of the validation marker: the parsed
-// record for validation and its fingerprint for the store generation, so a
-// proxyRuntime() pass never reads the marker twice.
-type ProxyValidationMarker = { parsed?: unknown; fingerprint: string };
+/** A proxy runtime state and, when it is ready, the observation that proved it. */
+type ProxyRuntimeObservation = Readonly<{ runtime: ProxyRuntime; observation?: CredentialObservation }>;
 
-function readProxyValidationMarker(proxyId: string): ProxyValidationMarker | undefined {
-  const result = adminDockerClient().exec(proxyId, ["cat", RUNTIME_VALIDATION_MARKER_PATH], { user: "0:0" });
-  if (result.status !== 0) return undefined;
-  try {
-    const parsed = JSON.parse(result.stdout) as unknown;
-    return { parsed, fingerprint: sha256Json(parsed) };
-  } catch {
-    return { fingerprint: sha256Json({ raw: result.stdout }) };
+// The store generation must be deterministic for an unchanged container: a
+// transient docker-exec failure reading the validation marker (or a failed
+// StartedAt inspect, or a restart inside the observation) must fail the sync
+// run without fabricating a different generation — a fabricated generation
+// would spuriously invalidate receipts and flip a keep-last-good decision into
+// a delete. "proxy-unreachable" makes syncTokens report and change nothing.
+function proxyRuntimeFromObservation(result: CredentialObservationResult, proxyId: string): ProxyRuntimeObservation {
+  if (result.kind === "refused") return { runtime: { state: "validation-required", id: proxyId, validationMessage: result.message } };
+  if (result.kind !== "observed" || result.observation.storeGeneration === undefined) {
+    return { runtime: { state: "proxy-unreachable", id: proxyId } };
   }
+  const { observation } = result;
+  return {
+    runtime: { state: "ready", id: proxyId, storeGeneration: observation.storeGeneration, startedAt: observation.startedAt },
+    observation,
+  };
 }
 
-function proxyValidationMarkerFingerprint(proxyId: string): string | undefined {
-  return readProxyValidationMarker(proxyId)?.fingerprint;
-}
-
-function proxyTokenStoreGeneration(proxyId: string, validationIdentity: unknown): string | undefined {
-  const startedAt = dockerContainerStartedAt(proxyId);
-  if (!startedAt) return undefined;
-  return sha256Json({
+/**
+ * Observes the project's proxy for a credential operation of one phase: its
+ * validation, its incarnation, and, in the same root exec as the validation
+ * marker, any further proxy file the caller needs (consumer
+ * acknowledgements, held token names).
+ */
+function observeProxyRuntime(
+  phase: CredentialObservationPhase,
+  extraSections: readonly ProxyObservationSection[] = [],
+): ProxyRuntimeObservation {
+  const sections: ProxyObservationSection[] = ["validation-marker", ...extraSections];
+  const observe = (proxyId: string, before: string, after?: Parameters<typeof observeCredentialRuntime>[0]["after"]) => proxyRuntimeFromObservation(observeCredentialRuntime({
+    phase,
     proxyId,
-    startedAt,
-    validationIdentity,
-  });
-}
-
-export function proxyRuntime(): ProxyRuntime {
+    sections,
+    paths: proxyObservationPaths(),
+    docker: adminDockerClient(),
+    isTokenName,
+    before,
+    ...(after ? { after } : {}),
+  }), proxyId);
   const prevalidatedRuntime = validatedRuntime();
   if (prevalidatedRuntime
     && prevalidatedRuntime.projectId === projectId()
     && validatedRuntimeCallbackProofMatches(prevalidatedRuntime)) {
     const validation = validatedRuntimeSecurityContractIssue(prevalidatedRuntime);
-    if (validation) {
-      return { state: "validation-required", id: prevalidatedRuntime.proxyId, validationMessage: validation };
+    if ("issue" in validation) {
+      return { runtime: { state: "validation-required", id: prevalidatedRuntime.proxyId, validationMessage: validation.issue } };
     }
-    return readyProxyRuntime(prevalidatedRuntime.proxyId);
+    // The component inspect that proved the container also read its
+    // incarnation: the batch below must see the same one after it.
+    if (!validation.startedAt) return { runtime: { state: "proxy-unreachable", id: prevalidatedRuntime.proxyId } };
+    return observe(prevalidatedRuntime.proxyId, validation.startedAt);
   }
-  if (!dockerAvailable()) return { state: "docker-unavailable" };
+  if (!dockerAvailable()) return { runtime: { state: "docker-unavailable" } };
   const project = composeProject();
-  if (!project) return { state: "not-running" };
+  if (!project) return { runtime: { state: "not-running" } };
   // The per-session runtime has no shared agent service; token sync validates
   // the proxy control plane, and each session is validated by admission.
   const agentId = undefined;
   const id = proxyContainerId(project);
-  if (!id) return { state: "not-running" };
-  const running = adminDockerClient().inspect([id], { format: "{{.State.Running}}" });
-  if (running.status !== 0 || running.stdout.trim() !== "true") return { state: "not-running" };
-  const marker = readProxyValidationMarker(id);
-  const validation = proxyRuntimeValidationIssue(project, id, agentId, marker);
-  if (validation) return { state: "validation-required", id, validationMessage: validation };
-  return readyProxyRuntime(id, marker?.fingerprint);
+  if (!id) return { runtime: { state: "not-running" } };
+  const running = adminDockerClient().inspect([id], { format: `{{.State.Running}}\t${STARTED_AT_INSPECT_FIELD}` });
+  const runningRows = running.status === 0 ? inspectOutputRows(running.stdout) : [];
+  const runningRow = runningRows.length === 1 ? splitTrailingStartedAt(runningRows[0], 1) : undefined;
+  if (runningRow?.head !== "true") return { runtime: { state: "not-running" } };
+  if (!runningRow.startedAt) return { runtime: { state: "proxy-unreachable", id } };
+  // Validation runs on the batch's marker; its own component inspect is the
+  // incarnation reading after the batch.
+  return observe(id, runningRow.startedAt, (observed) => {
+    const validation = proxyRuntimeValidationIssue(project, id, agentId, observed.validationMarker);
+    if ("issue" in validation) return { kind: "refused", message: validation.issue };
+    return validation.startedAt
+      ? { kind: "started", startedAt: validation.startedAt }
+      : { kind: "unavailable", reason: "proxy StartedAt could not be inspected" };
+  });
 }
 
-// The store generation must be deterministic for an unchanged container: a
-// transient docker-exec failure reading the validation marker (or a failed
-// StartedAt inspect) must fail the sync run without fabricating a different
-// generation — a fabricated generation would spuriously invalidate receipts
-// and flip a keep-last-good decision into a delete. "proxy-unreachable" makes
-// syncTokens report and change nothing.
-function readyProxyRuntime(proxyId: string, knownValidationIdentity?: string): ProxyRuntime {
-  const validationIdentity = knownValidationIdentity ?? proxyValidationMarkerFingerprint(proxyId);
-  if (validationIdentity === undefined) return { state: "proxy-unreachable", id: proxyId };
-  const storeGeneration = proxyTokenStoreGeneration(proxyId, validationIdentity);
-  if (storeGeneration === undefined) return { state: "proxy-unreachable", id: proxyId };
-  return { state: "ready", id: proxyId, storeGeneration };
+export function proxyRuntime(): ProxyRuntime {
+  return observeProxyRuntime("preparation").runtime;
+}
+
+/**
+ * Re-observes the exact proxy a locked sync is acting on. The baseline's
+ * incarnation is the reading before the batch, so a restart since the
+ * baseline was proved cannot pass.
+ */
+function observeExactProxyRuntime(baseline: ProxyRuntime): ProxyRuntime {
+  if (!baseline.id || !baseline.startedAt) return { state: "proxy-unreachable", ...(baseline.id ? { id: baseline.id } : {}) };
+  return proxyRuntimeFromObservation(observeCredentialRuntime({
+    phase: "locked-sync",
+    proxyId: baseline.id,
+    sections: ["validation-marker"],
+    paths: proxyObservationPaths(),
+    docker: adminDockerClient(),
+    isTokenName,
+    before: baseline.startedAt,
+  }), baseline.id).runtime;
 }
 
 function runtimeStateMessage(state: ProxyRuntimeState, validationMessage?: string): string {
@@ -1638,28 +2046,36 @@ function currentRuntimeSecurityContract(): RuntimeSecurityContract | undefined {
   return currentRuntimeValidationTarget()?.contract;
 }
 
+/** A refusal, or the proved components' incarnation (undefined when Docker did not report it). */
+type RuntimeValidationOutcome = Readonly<{ issue: string }> | Readonly<{ startedAt?: string }>;
+
+const RUNTIME_CONTAINER_INSPECT_FIELDS = 11;
+
 function liveRuntimeComponentValidationIssue(
   proof: Record<string, unknown>,
   target: NonNullable<ReturnType<typeof currentRuntimeValidationTarget>>,
-): string | undefined {
+): RuntimeValidationOutcome {
   const agentId = typeof proof.agentId === "string" ? proof.agentId : undefined;
   const proxyId = typeof proof.proxyId === "string" ? proof.proxyId : undefined;
   // Shape-exact: the per-session proof binds no shared agent or retired relay
   // sidecar. A proof carrying either is stale, not merely malformed.
   if (agentId !== undefined || proof.mcpOAuthCallbackSidecarId !== undefined) {
-    return `runtime component identity is stale for the per-session runtime shape; run \`${remedy.up()}\``;
+    return { issue: `runtime component identity is stale for the per-session runtime shape; run \`${remedy.up()}\`` };
   }
-  if (!proxyId) return `runtime component container identity is malformed; run \`${remedy.up()}\``;
+  if (!proxyId) return { issue: `runtime component container identity is malformed; run \`${remedy.up()}\`` };
   const ids = [proxyId];
-  const inspect = adminDockerClient().inspect(ids, { format: runtimeContainerInspectFormat() });
-  if (inspect.status !== 0) return `runtime component labels cannot be inspected; run \`${remedy.up()}\``;
-  const containers = parseRuntimeContainerInspectRows(inspect.stdout);
+  // The incarnation is grouped into the component inspect: the credential
+  // observation needs it, and this call already names the exact container.
+  const inspect = adminDockerClient().inspect(ids, { format: `${runtimeContainerInspectFormat()}\t${STARTED_AT_INSPECT_FIELD}` });
+  if (inspect.status !== 0) return { issue: `runtime component labels cannot be inspected; run \`${remedy.up()}\`` };
+  const rows = inspectOutputRows(inspect.stdout).map((line) => splitTrailingStartedAt(line, RUNTIME_CONTAINER_INSPECT_FIELDS));
+  const containers = parseRuntimeContainerInspectRows(rows.map((row) => row?.head ?? "").join("\n"));
   const observedIds = new Set(containers.map((container) => container.id));
-  if (containers.length !== ids.length || ids.some((id) => !observedIds.has(id))) {
-    return `runtime component container identities changed; run \`${remedy.up()}\``;
+  if (rows.some((row) => row === undefined) || containers.length !== ids.length || ids.some((id) => !observedIds.has(id))) {
+    return { issue: `runtime component container identities changed; run \`${remedy.up()}\`` };
   }
   if (containers.some((container) => container.running !== true)) {
-    return `runtime component container is not running; run \`${remedy.up()}\``;
+    return { issue: `runtime component container is not running; run \`${remedy.up()}\`` };
   }
   const identity = {
     composeProject: target.plan.composeProjectName,
@@ -1678,12 +2094,12 @@ function liveRuntimeComponentValidationIssue(
         agent: target.plan.activeRuntime.agentImage,
         proxy: target.plan.activeRuntime.proxyImage,
       }, identity);
-  if (!issue) return undefined;
+  if (!issue) return { startedAt: rows[0]?.startedAt };
   // `runfree up` repairs a missing container by recreating the composition, but
   // it refuses duplicated or contradictory evidence by design, so pointing
   // those at `up` would name a command that fails the same way every time.
   const remedyLine = issue.kind === "missing" ? `run \`${remedy.up()}\`` : `run \`${remedy.rebuild()}\``;
-  return `${issue.message}; ${remedyLine}`;
+  return { issue: `${issue.message}; ${remedyLine}` };
 }
 
 function inspectById(inspects: DockerContainerInspect[] | undefined, id: string): DockerContainerInspect | undefined {
@@ -1766,17 +2182,17 @@ function runtimeSecurityContractValidationIssue(
   return `runtime security contract validation failed (${issue.container}: ${issue.code}: ${issue.detail}); run \`runfree up\``;
 }
 
-function validatedRuntimeSecurityContractIssue(proof: NonNullable<AdminState["validatedRuntime"]>): string | undefined {
+function validatedRuntimeSecurityContractIssue(proof: NonNullable<AdminState["validatedRuntime"]>): RuntimeValidationOutcome {
   if (proof.proofVersion !== 4 || typeof proof.contractHash !== "string" || proof.contractHash === "") {
-    return `runtime security contract cannot be checked; run \`${remedy.up()}\``;
+    return { issue: `runtime security contract cannot be checked; run \`${remedy.up()}\`` };
   }
   const target = currentRuntimeValidationTarget();
-  if (!target?.contract.contractHash) return `runtime security contract cannot be checked; run \`${remedy.up()}\``;
+  if (!target?.contract.contractHash) return { issue: `runtime security contract cannot be checked; run \`${remedy.up()}\`` };
   if (runtimeValidationComponentsIssue(proof.components, target.contract.components)) {
-    return `runtime validation marker is stale for runtime components; run \`${remedy.up()}\``;
+    return { issue: `runtime validation marker is stale for runtime components; run \`${remedy.up()}\`` };
   }
   if (proof.contractHash !== target.contract.contractHash) {
-    return `runtime validation marker is stale for runtime security contract; run \`${remedy.up()}\``;
+    return { issue: `runtime validation marker is stale for runtime security contract; run \`${remedy.up()}\`` };
   }
   return liveRuntimeComponentValidationIssue(proof, target);
 }
@@ -1792,29 +2208,29 @@ function runtimeValidationComponentsIssue(
   return undefined;
 }
 
-function proxyRuntimeValidationIssue(project: string, proxyId: string, agentId: string | undefined, marker: ProxyValidationMarker | undefined): string | undefined {
-  if (!marker) return `runtime validation required before proxy token sync; run \`${remedy.up()}\``;
+function proxyRuntimeValidationIssue(project: string, proxyId: string, agentId: string | undefined, marker: ProxyValidationMarker | undefined): RuntimeValidationOutcome {
+  if (!marker) return { issue: `runtime validation required before proxy token sync; run \`${remedy.up()}\`` };
   const parsed = marker.parsed;
-  if (parsed === undefined) return `runtime validation marker is malformed; run \`${remedy.up()}\``;
-  if (!isRecord(parsed)) return `runtime validation marker is malformed; run \`${remedy.up()}\``;
-  if (parsed.proofVersion !== 4) return `runtime validation marker has stale proof version; run \`${remedy.up()}\``;
-  if (parsed.projectId !== projectId()) return `runtime validation marker belongs to another project; run \`${remedy.up()}\``;
+  if (parsed === undefined) return { issue: `runtime validation marker is malformed; run \`${remedy.up()}\`` };
+  if (!isRecord(parsed)) return { issue: `runtime validation marker is malformed; run \`${remedy.up()}\`` };
+  if (parsed.proofVersion !== 4) return { issue: `runtime validation marker has stale proof version; run \`${remedy.up()}\`` };
+  if (parsed.projectId !== projectId()) return { issue: `runtime validation marker belongs to another project; run \`${remedy.up()}\`` };
   // Shape-exact: the per-session marker names no agent, so one carrying an
   // agent id was written for a different runtime shape than the one running.
   if (parsed.agentId !== undefined) {
-    return `runtime validation marker is stale for the per-session runtime shape; run \`${remedy.up()}\``;
+    return { issue: `runtime validation marker is stale for the per-session runtime shape; run \`${remedy.up()}\`` };
   }
   if (typeof parsed.proxyId !== "string" || parsed.proxyId === "") {
-    return `runtime validation marker is malformed; run \`${remedy.up()}\``;
+    return { issue: `runtime validation marker is malformed; run \`${remedy.up()}\`` };
   }
   if (parsed.proxyId !== proxyId) {
-    return `runtime validation marker belongs to another proxy container; run \`${remedy.up()}\``;
+    return { issue: `runtime validation marker belongs to another proxy container; run \`${remedy.up()}\`` };
   }
   if (parsed.mcpOAuthCallbackTopologyVersion !== 2) {
-    return `runtime validation marker is stale for MCP OAuth callback topology; run \`${remedy.up()}\``;
+    return { issue: `runtime validation marker is stale for MCP OAuth callback topology; run \`${remedy.up()}\`` };
   }
   if (parsed.mcpOAuthCallbackPort !== mcpOAuthCallbackPort(projectRoot())) {
-    return `runtime validation marker is stale for MCP OAuth callback port; run \`${remedy.up()}\``;
+    return { issue: `runtime validation marker is stale for MCP OAuth callback port; run \`${remedy.up()}\`` };
   }
   // A marker or live Compose service from the retired relay generation was
   // minted by an older binary; refuse it so the runtime revalidates.
@@ -1825,27 +2241,73 @@ function proxyRuntimeValidationIssue(project: string, proxyId: string, agentId: 
     || parsed.mcpOAuthCallbackSidecarIp !== undefined
     || parsed.mcpOAuthCallbackSidecarService !== undefined
   ) {
-    return `runtime validation marker is stale for MCP OAuth callback sidecar; run \`${remedy.up()}\``;
+    return { issue: `runtime validation marker is stale for MCP OAuth callback sidecar; run \`${remedy.up()}\`` };
   }
   const securityContractValidation = runtimeSecurityContractValidationIssue(parsed, agentId, proxyId);
-  if (securityContractValidation) return securityContractValidation;
+  if (securityContractValidation) return { issue: securityContractValidation };
   const target = currentRuntimeValidationTarget();
-  if (!target) return `runtime security contract cannot be checked; run \`${remedy.up()}\``;
+  if (!target) return { issue: `runtime security contract cannot be checked; run \`${remedy.up()}\`` };
   return liveRuntimeComponentValidationIssue(parsed, target);
+}
+
+/**
+ * The proxy-side token write. The value arrives only on stdin; the host
+ * declares its byte length, and the temporary file replaces the token only
+ * when exactly that many bytes arrived. A Docker client killed mid-stdin can
+ * hand the remote `cat` an early end of file; that short value is discarded
+ * and never installed. Each write has its own temporary file: a killed
+ * client's remote shell may still be writing, and a later write never opens,
+ * removes, or installs that file.
+ */
+export function proxyTokenWriteScript(tokenFile: string, byteLength: number): string {
+  if (!Number.isSafeInteger(byteLength) || byteLength <= 0) throw new Error("internal: a proxy token write needs a positive byte length");
+  const tmpFile = `${tokenFile}.tmp.${crypto.randomBytes(8).toString("hex")}`;
+  return [
+    "set -e",
+    "umask 077",
+    `tmp=${shellSingleQuote(tmpFile)}`,
+    // Every exit, refusal or error, removes this write's temporary file; after
+    // the rename there is nothing left to remove.
+    `trap 'rm -f "$tmp"' EXIT`,
+    "trap 'exit 1' HUP INT TERM",
+    `cat > "$tmp"`,
+    // Fails closed: a count that cannot be read (an empty substitution makes
+    // the test itself fail) refuses the write exactly like a wrong count.
+    `[ "$(wc -c < "$tmp")" -eq ${byteLength} ] || { echo 'proxy token write incomplete; the partial value was discarded' >&2; exit 1; }`,
+    `chmod 600 "$tmp"`,
+    `mv "$tmp" ${shellSingleQuote(tokenFile)}`,
+  ].join("; ");
+}
+
+/**
+ * A token write whose Docker client was killed (any signal, including the
+ * host's own timeout kill) has an unknown remote outcome. The write script
+ * never deletes the held token, so the proxy holds either the old or the new
+ * value: the token is never removed for it, but its receipt no longer proves
+ * which, so the destination is prepared afresh by the next pass.
+ */
+export class ProxyTokenWriteOutcomeUnknown extends Error {
+  readonly tokenName: string;
+
+  constructor(tokenName: string, cause: string) {
+    super(`${tokenName}: proxy token write ended by ${cause}; its outcome is unknown and the next sync re-reads it`);
+    this.name = "ProxyTokenWriteOutcomeUnknown";
+    this.tokenName = tokenName;
+  }
+}
+
+// A Docker client that ended by a stop signal may have been ended by the
+// host's own Ctrl-C or stop: the pass ends before any verdict
+// (`ChildSignaledError`). Any other kill of a write client is an unknown
+// outcome within the pass. Neither is ever compensated by a removal.
+function assertDockerClientNotSignaled(result: CaptureResult, write?: Readonly<{ tokenName: string }>): void {
+  if (!result.timedOut && isHostStopSignal(result.signal)) throw new ChildSignaledError("proxy-client", result.signal, write?.tokenName);
+  if (write && (result.timedOut || result.signal)) throw new ProxyTokenWriteOutcomeUnknown(write.tokenName, result.timedOut ? "its time bound" : result.signal as string);
 }
 
 function writeProxyRuntimeToken(proxyId: string, name: string, value: string): void {
   assertTokenFilename(name);
-  const tokenFile = `${CONTAINER_SECRET_DIR}/${name}`;
-  const tmpFile = `${tokenFile}.tmp`;
-  const command = [
-    "set -e",
-    "umask 077",
-    `rm -f ${shellSingleQuote(tmpFile)}`,
-    `cat > ${shellSingleQuote(tmpFile)}`,
-    `chmod 600 ${shellSingleQuote(tmpFile)}`,
-    `mv ${shellSingleQuote(tmpFile)} ${shellSingleQuote(tokenFile)}`,
-  ].join("; ");
+  const command = proxyTokenWriteScript(`${CONTAINER_SECRET_DIR}/${name}`, Buffer.byteLength(value, "utf8"));
   // The token reaches the process only through `input` (stdin), never argv
   // or env; `adminDockerClient()` is the same client every other admin
   // docker call builds through.
@@ -1855,6 +2317,7 @@ function writeProxyRuntimeToken(proxyId: string, name: string, value: string): v
     { interactive: true, user: PROXY_RUNTIME_USER },
     { input: value },
   );
+  assertDockerClientNotSignaled(result, { tokenName: name });
   if (result.status !== 0) {
     throw new Error(result.stderr.trim() || `failed to write ${name} token into proxy tmpfs`);
   }
@@ -1863,9 +2326,11 @@ function writeProxyRuntimeToken(proxyId: string, name: string, value: string): v
 export function removeProxyRuntimeToken(proxyId: string, name: string): void {
   assertTokenFilename(name);
   const tokenFile = `${CONTAINER_SECRET_DIR}/${name}`;
-  const tmpFile = `${tokenFile}.tmp`;
-  const command = `rm -f ${shellSingleQuote(tokenFile)} ${shellSingleQuote(tmpFile)}`;
+  // Also any temporary file a killed write left behind (`.tmp` is the name
+  // older binaries used).
+  const command = `rm -f ${shellSingleQuote(tokenFile)} ${shellSingleQuote(`${tokenFile}.tmp`)} ${shellSingleQuote(`${tokenFile}.tmp.`)}*`;
   const result = adminDockerClient().exec(proxyId, ["sh", "-c", command]);
+  assertDockerClientNotSignaled(result);
   if (result.status !== 0) throw new Error(result.stderr.trim() || `failed to remove ${name} token from proxy tmpfs`);
 }
 
@@ -2133,12 +2598,23 @@ export function withTokenStoreLock<T>(action: () => T, options: { wait?: boolean
 
 // Possession check: one batched listing of the proxy secret directory per sync
 // run (never one exec per token), over the same trusted host→proxy channel as
-// the token write path. Returns undefined when the listing itself fails — the
-// caller must then treat the proxy as unreachable rather than infer absence.
-function listProxyRuntimeTokens(proxyId: string): Set<string> | undefined {
-  const result = adminDockerClient().exec(proxyId, ["sh", "-c", `ls -1 ${shellSingleQuote(CONTAINER_SECRET_DIR)}`]);
-  if (result.status !== 0) return undefined;
-  return new Set(result.stdout.split(/\r?\n/).map((line) => line.trim()).filter((name) => isTokenName(name)));
+// the token write path. Names only, never a value. Returns undefined when the
+// listing itself fails — the caller must then treat the proxy as unreachable
+// rather than infer absence.
+//
+// Read under the token-store lock, after the baseline observation and before
+// the fence that precedes every effect and every persistence: those two
+// incarnation readings bracket it.
+function listProxyRuntimeTokensUnderLock(proxyId: string): Set<string> | undefined {
+  const read = readProxyObservationSections({
+    proxyId,
+    sections: ["held-token-names"],
+    paths: proxyObservationPaths(),
+    docker: adminDockerClient(),
+    isTokenName,
+  });
+  if (!read.ok || !read.sections.heldTokenNames) return undefined;
+  return new Set(read.sections.heldTokenNames);
 }
 
 export function importStartupTokenResolutionReceipts(input: {
@@ -2276,7 +2752,7 @@ export function tokenSyncWatchNowMs(): number {
   return Date.now();
 }
 
-type TokenSyncResult = {
+export type TokenSyncResult = {
   failed: string[];
   // Tokens whose resolution failed transiently but whose receipt-proven proxy
   // value was kept (status `stale`). Separate from `failed` so quiet
@@ -2288,6 +2764,8 @@ type TokenSyncResult = {
   changed: boolean;
   receipts: TokenResolutionReceipt[];
   runtimeState: ProxyRuntimeState;
+  /** Due tokens a watcher pass skipped because nothing was read for them before the lock. */
+  unprepared: string[];
   // Advisory snapshot for schedulers (the watcher's delay computation), so a
   // caller that just synced does not re-derive the runtime via docker.
   storeGeneration?: string;
@@ -2297,8 +2775,13 @@ export function syncTokens(options: TokenSyncOptions = {}): TokenSyncResult {
   if (options.preparedOnly && options.mode !== "convergence") {
     throw new Error("a prepared-only token sync is receipt-gated convergence");
   }
+  if (options.preparedSourceTruth && (options.mode !== "source-truth" || options.preparedOnly || options.resolutionLedger || options.watchPreparation)) {
+    throw new Error("a prepared source-truth token sync is a one-shot source-truth pass");
+  }
+  const deferring = options.preparedOnly === true || options.preparedSourceTruth === true;
   const effective = assertEffectiveControlConvergedBeforeCredentialResolution({
-    onBusy: options.preparedOnly ? "defer" : "die",
+    onBusy: deferring ? "defer" : "die",
+    phase: "locked-sync",
   });
   try {
     const policy = effective
@@ -2307,11 +2790,156 @@ export function syncTokens(options: TokenSyncOptions = {}): TokenSyncResult {
     ensureStateDirs();
     return withTokenStoreLock(
       () => syncTokensUnderLock(options, policy, effective),
-      options.preparedOnly ? { wait: false, onBusy: "defer" } : {},
+      deferring ? { wait: false, onBusy: "defer" } : {},
     );
   } finally {
     effective?.lock.release();
   }
+}
+
+/** Drops a token's resolutions from a ledger, so its next due decision reads it. */
+export function forgetLedgerResolutions(ledger: TokenResolutionLedger | undefined, tokenName: string): void {
+  if (!ledger) return;
+  for (const map of [ledger.lastResolvedAt, ledger.retryAfterFailureAt]) {
+    for (const key of [...map.keys()]) if (key.startsWith(`${tokenName}\0`)) map.delete(key);
+  }
+}
+
+/**
+ * `syncTokens` for a foreground, one-shot caller. A synchronous provider or
+ * Docker client that ended by SIGINT, SIGTERM or SIGHUP leaves the sync
+ * before any verdict on it (`ChildSignaledError`). After two immediates the
+ * host's own signal handler has run if the signal was the host's: the CLI then
+ * exits 130/143 there, with nothing changed. Still running means the signal
+ * came from somewhere else. A provider's own signal is then classified as it
+ * always was, by one rerun; a Docker client's outcome stays unknown and the
+ * command fails without compensating for it.
+ */
+export async function syncTokensSettlingSignals(options: TokenSyncOptions = {}): Promise<TokenSyncResult> {
+  const unknownOutcome = (error: ChildSignaledError): Error => {
+    // Not the host's own stop (that exits during the settle): the write's
+    // outcome is unknown, so its receipt no longer proves the held value.
+    if (error.tokenName) retractPersistedTokenReceipts(error.tokenName);
+    return new Error(`${error.message}; run \`runfree credential sync\` to re-observe the proxy`);
+  };
+  try {
+    return syncTokens(options);
+  } catch (error) {
+    if (!(error instanceof ChildSignaledError)) throw error;
+    await settleHostSignals();
+    if (error.childKind === "proxy-client") throw unknownOutcome(error);
+  }
+  try {
+    return classifySignaledProviders.run(true, () => syncTokens(options));
+  } catch (error) {
+    if (error instanceof ChildSignaledError) throw unknownOutcome(error);
+    throw error;
+  }
+}
+
+/** The sources a watcher pass reads before its lock, and the runtime it observed to decide them. */
+export type WatchCredentialReads = Readonly<{
+  observedRuntime?: ProxyRuntime;
+  reads: readonly CredentialReadInput[];
+}>;
+
+/**
+ * Decides, without the token-store lock, which sources a watcher pass reads
+ * before it: every token in a source-truth pass, the tokens named in `only`
+ * for a follow-up pass, and otherwise the tokens the ledger says are due
+ * (assuming the proxy holds what it last held; the locked pass sees the live
+ * listing and reports anything else as unprepared). No source is read for a
+ * runtime that needs validation or cannot be observed.
+ */
+export function planWatchCredentialReads(input: Readonly<{
+  ledger: TokenResolutionLedger;
+  mode?: TokenSyncMode;
+  only?: ReadonlySet<string>;
+  snapshot?: Readonly<{ runtimeState: ProxyRuntimeState; storeGeneration?: string }>;
+  quiet?: boolean;
+  verbose?: boolean;
+  sourceSecretCache?: SourceSecretCache;
+}>): WatchCredentialReads {
+  let observedRuntime: ProxyRuntime | undefined;
+  let runtimeState: ProxyRuntimeState;
+  let storeGeneration: string | undefined;
+  if (input.snapshot) {
+    runtimeState = input.snapshot.runtimeState;
+    storeGeneration = input.snapshot.storeGeneration;
+  } else {
+    observedRuntime = proxyRuntime();
+    runtimeState = observedRuntime.state;
+    storeGeneration = observedRuntime.storeGeneration;
+  }
+  if (runtimeState === "validation-required" || runtimeState === "proxy-unreachable") return { observedRuntime, reads: [] };
+  let policy: LoadedNetworkPolicy;
+  let config: TokenSourceConfig;
+  try {
+    policy = loadPolicy();
+    config = loadTokenConfig();
+  } catch {
+    // The locked pass reports an unreadable policy or source config.
+    return { observedRuntime, reads: [] };
+  }
+  let registry: SourceRegistry | undefined;
+  let registryReadable = true;
+  if (Object.values(config).some((source) => source.source === "named")) {
+    try {
+      registry = loadSourceRegistry();
+    } catch {
+      registryReadable = false;
+    }
+  }
+  if (storeGeneration && registryReadable) {
+    seedTokenResolutionLedger({ config, ledger: input.ledger, policy, proxyStoreGeneration: storeGeneration, sourceRegistry: registry });
+  }
+  const nowMs = tokenSyncWatchNowMs();
+  const assumedHeld = new Set(Object.keys(policy.tokens));
+  const reads: CredentialReadInput[] = [];
+  for (const tokenName of Object.keys(policy.tokens)) {
+    if (input.only && !input.only.has(tokenName)) continue;
+    const source = config[tokenName];
+    if (!source || source.source === "named" && !registryReadable) continue;
+    const sourceRegistry = source.source === "named" ? registry : undefined;
+    try {
+      const fingerprint = tokenSourceFingerprint(source, sourceRegistry);
+      if (!input.only && input.mode !== "source-truth") {
+        const refresh = effectiveTokenRefresh(source, sourceRegistry);
+        assertRefreshBeforeJwtExpiry(refresh);
+        const due = tokenDueDecision({
+          heldTokens: assumedHeld,
+          ledger: input.ledger,
+          nowMs,
+          proxyStoreGeneration: storeGeneration,
+          refresh,
+          source,
+          sourceRegistry,
+          tokenName,
+        });
+        if (!due.due) continue;
+      }
+      reads.push({
+        tokenName,
+        fingerprint,
+        plan: credentialReadPlan(tokenName, source, {
+          quiet: input.quiet,
+          verbose: input.verbose,
+          sourceRegistry,
+          sourceSecretCache: input.sourceSecretCache,
+        }),
+      });
+    } catch {
+      // The locked pass meets the same failure and owns its verdict.
+    }
+  }
+  if (reads.length > 0 && currentAdminState().policyAccess === "effective-read-only") {
+    // The same precheck the locked pass repeats: no source is read for a
+    // selection the proxy has not converged on.
+    const effective = assertEffectiveControlConvergedBeforeCredentialResolution({ onBusy: "die", phase: "preparation" });
+    effective?.lock.release();
+    observedRuntime ??= effective?.runtime;
+  }
+  return { observedRuntime, reads };
 }
 
 type EffectiveCredentialSnapshot = {
@@ -2332,12 +2960,41 @@ class EffectiveControlSelectionChanged extends Error {}
  * that finds such a token due defers instead of resolving it.
  */
 type PreparedTokenSourceEntry =
-  | Readonly<{ kind: "resolved"; fingerprint: string; value: string }>
-  | Readonly<{ kind: "skipped"; fingerprint: string }>;
+  | Readonly<{ kind: "resolved"; fingerprint: string; value: string; resolvedAt?: number }>
+  | Readonly<{ kind: "skipped"; fingerprint: string }>
+  // Watcher preparations only: the read's own verdict, rethrown under the lock
+  // so a definitive failure still reaches the per-destination revocation. A
+  // cancelled read is never stored as one.
+  | Readonly<{ kind: "source-failure"; fingerprint: string; error: unknown }>;
+
+/** A watcher pass's reads, made before the lock (see `TokenSyncOptions.watchPreparation`). */
+export type WatchTokenPreparation = Readonly<{
+  preparedAt: number;
+  entries: Map<string, PreparedTokenSourceEntry>;
+}>;
+
+const PREPARED_TOKEN_SOURCE_MAX_AGE_MS = 120_000;
+
+/** The watcher's entry for a due token, if one was read for this exact source and is still fresh. */
+function currentWatchPreparedEntry(
+  preparation: WatchTokenPreparation,
+  tokenName: string,
+  source: TokenSource,
+  sourceRegistry: SourceRegistry | undefined,
+): Extract<PreparedTokenSourceEntry, { kind: "resolved" | "source-failure" }> | undefined {
+  const entry = preparation.entries.get(tokenName);
+  if (!entry || entry.kind === "skipped") return undefined;
+  if (entry.fingerprint !== tokenSourceFingerprint(source, sourceRegistry)) return undefined;
+  const age = Date.now() - preparation.preparedAt;
+  if (age < 0 || age >= PREPARED_TOKEN_SOURCE_MAX_AGE_MS) return undefined;
+  return entry;
+}
 
 const preparedRuntimeTokenSources = new Map<string, {
   controlGeneration: string;
   preparedAt: number;
+  /** When the first source read began: the age a value read here carries. */
+  readsStartedAt: number;
   admittedAt?: number;
   tokenConfigPath: string;
   sourceConfigPath: string;
@@ -2358,14 +3015,18 @@ function warmSkippableTokens(
   registry: SourceRegistry | undefined,
 ): ReadonlySet<string> {
   const skippable = new Set<string>();
-  let runtime: ProxyRuntime;
+  let observed: ProxyRuntimeObservation;
   try {
-    runtime = proxyRuntime();
+    // Held names come from the same root exec as the validation marker, bound
+    // to one incarnation. Preparation evidence: it may spare a read, never
+    // authorize a write.
+    observed = observeProxyRuntime("preparation", ["held-token-names"]);
   } catch {
     return skippable;
   }
+  const runtime = observed.runtime;
   if (runtime.state !== "ready" || !runtime.id || !runtime.storeGeneration) return skippable;
-  const held = listProxyRuntimeTokens(runtime.id);
+  const held = observed.observation?.heldTokenNames;
   if (!held) return skippable;
   const receipts = loadPersistedTokenReceipts();
   const now = Date.now();
@@ -2395,6 +3056,7 @@ function warmSkippableTokens(
 export function prepareRuntimeTokenSources(options: Readonly<{ mode?: RuntimeTokenSourcePreparationMode }> = {}): void {
   const project = currentAdminState().runtimeContext?.project ?? adminProjectInfo();
   preparedRuntimeTokenSources.delete(project.paths.stateDir);
+  const readsStartedAt = Date.now();
   const active = readActiveEffectiveControl(project);
   if (!active) throw new Error("runtime credential preparation requires approved effective policy");
   const policy = validateNetworkPolicy(active.policy, active.networkPolicyPath);
@@ -2407,22 +3069,31 @@ export function prepareRuntimeTokenSources(options: Readonly<{ mode?: RuntimeTok
     ? warmSkippableTokens(policy, config, registry)
     : new Set<string>();
   const values = new Map<string, PreparedTokenSourceEntry>();
-  for (const [name, tokenPolicy] of Object.entries(policy.tokens)) {
-    const source = config[name];
-    if (!source) {
-      if (tokenPolicy.allowAnonymous) continue;
-      throw new Error(missingRequiredTokenSourceMessage(name));
+  // Fresh per call, never module-level: several destinations sharing one
+  // exact 1Password reference cause one `op` read this pass, released with
+  // it. A later preparation pass reads again.
+  const scope = createCredentialPreparationScope();
+  try {
+    for (const [name, tokenPolicy] of Object.entries(policy.tokens)) {
+      const source = config[name];
+      if (!source) {
+        if (tokenPolicy.allowAnonymous) continue;
+        throw new Error(missingRequiredTokenSourceMessage(name));
+      }
+      const sourceRegistry = source.source === "named" ? registry : undefined;
+      const fingerprint = tokenSourceFingerprint(source, sourceRegistry);
+      values.set(name, skippable.has(name)
+        ? { kind: "skipped", fingerprint }
+        : { kind: "resolved", fingerprint, value: scope.readSync(credentialReadPlan(name, source, { quiet: true, sourceRegistry })) });
     }
-    const sourceRegistry = source.source === "named" ? registry : undefined;
-    const fingerprint = tokenSourceFingerprint(source, sourceRegistry);
-    values.set(name, skippable.has(name)
-      ? { kind: "skipped", fingerprint }
-      : { kind: "resolved", fingerprint, value: resolveTokenSource(name, source, { quiet: true, sourceRegistry }) });
+  } finally {
+    // The pass is done with every value it shared, success or failure alike.
+    scope.dispose();
   }
   if (readActiveControlSelection(project)?.controlGeneration !== active.controlGeneration) {
     throw new EffectiveControlSelectionChanged("effective policy changed during credential preparation; retry before proxy disruption");
   }
-  preparedRuntimeTokenSources.set(project.paths.stateDir, { controlGeneration: active.controlGeneration, preparedAt: Date.now(), tokenConfigPath: tokenConfigPath(), sourceConfigPath: sourceConfigPath(), values });
+  preparedRuntimeTokenSources.set(project.paths.stateDir, { controlGeneration: active.controlGeneration, preparedAt: Date.now(), readsStartedAt, tokenConfigPath: tokenConfigPath(), sourceConfigPath: sourceConfigPath(), values });
 }
 
 /**
@@ -2512,16 +3183,26 @@ function currentPreparedRuntimeTokenSource(
   return entry;
 }
 
-function resolvePreparedRuntimeTokenSource(name: string, source: TokenSource, options: TokenResolutionOptions): string {
+/**
+ * The token's value, from the current preparation when there is one, else
+ * read now. `preparedReadStartedAt` is set only for a prepared value: the age
+ * it carries is that of the read before the lock, whichever sync reuses it.
+ */
+function resolvePreparedRuntimeTokenSource(
+  name: string,
+  source: TokenSource,
+  options: TokenResolutionOptions,
+): Readonly<{ value: string; preparedReadStartedAt?: number }> {
   const entry = currentPreparedRuntimeTokenSource(name, source, options);
-  if (!entry) return resolveTokenSource(name, source, options);
+  if (!entry) return { value: resolveTokenSource(name, source, options) };
   // A skipped entry holds no value by construction. A due token reaching here
   // with one is a preparation that disagrees with the sync; refuse rather than
   // resolve a source now.
   if (entry.kind !== "resolved") {
     throw new EffectiveControlSelectionChanged("a prepared credential was skipped but is due; resolve current sources and retry");
   }
-  return entry.value;
+  const project = currentAdminState().runtimeContext?.project ?? adminProjectInfo();
+  return { value: entry.value, preparedReadStartedAt: preparedRuntimeTokenSources.get(project.paths.stateDir)?.readsStartedAt };
 }
 
 /** What the current preparation decided for one token, if there is one. */
@@ -2538,16 +3219,16 @@ function preparedTokenEntryKind(name: string): PreparedTokenSourceEntry["kind"] 
 function assertPreparedOnlyCovers(dueTokenNames: readonly string[]): void {
   const project = currentAdminState().runtimeContext?.project ?? adminProjectInfo();
   const prepared = preparedRuntimeTokenSources.get(project.paths.stateDir);
-  if (!prepared) throw new TokenSyncDeferredError("no prepared credential set for a prepared-only sync");
+  if (!prepared) throw new TokenSyncDeferredError("no prepared credential set for a prepared-only sync", "preparation");
   for (const name of dueTokenNames) {
     if (prepared.values.get(name)?.kind !== "resolved") {
-      throw new TokenSyncDeferredError(`${name} is due and its source was not read before the lock`);
+      throw new TokenSyncDeferredError(`${name} is due and its source was not read before the lock`, "preparation");
     }
   }
 }
 
 function assertEffectiveControlConvergedBeforeCredentialResolution(
-  options: Readonly<{ onBusy: "die" | "defer" }> = { onBusy: "die" },
+  options: Readonly<{ onBusy: "die" | "defer"; phase: CredentialObservationPhase }>,
 ): EffectiveCredentialSnapshot | undefined {
   if (currentAdminState().policyAccess !== "effective-read-only") return undefined;
   const discovered = projectInfo(projectRoot(), childEnv());
@@ -2572,16 +3253,20 @@ function assertEffectiveControlConvergedBeforeCredentialResolution(
     if (!active || !converged || converged.controlGeneration !== active.controlGeneration) {
       die("credential resolution requires a selected effective policy generation with complete convergence");
     }
-    const runtime = proxyRuntime();
+    // The consumers' acknowledgements are read in the same root exec as the
+    // validation marker, bound to the incarnation the runtime state names.
+    const observed = observeProxyRuntime(options.phase, ["firewall-status", "request-proxy-status"]);
+    const runtime = observed.runtime;
     if (runtime.state !== "ready" || !runtime.id) {
       die(`credential resolution requires a validated running proxy; runtime is ${runtime.state}${runtime.validationMessage ? ` (${runtime.validationMessage})` : ""}`);
     }
-    const status = readProxyPolicyStatusFiles(runtime.id);
-    const requestProxyMatches = status?.requestProxy?.controlGeneration === active.controlGeneration
-      && status.requestProxy.policyGeneration === converged.policyGeneration;
-    const firewallMatches = status?.firewall?.controlGeneration === active.controlGeneration
-      && status.firewall.policyGeneration === converged.policyGeneration
-      && status.firewall.rulesetVerified === true;
+    const requestProxy = observed.observation?.requestProxyStatus;
+    const firewall = observed.observation?.firewallStatus;
+    const requestProxyMatches = requestProxy?.controlGeneration === active.controlGeneration
+      && requestProxy.policyGeneration === converged.policyGeneration;
+    const firewallMatches = firewall?.controlGeneration === active.controlGeneration
+      && firewall.policyGeneration === converged.policyGeneration
+      && firewall.rulesetVerified === true;
     if (!requestProxyMatches || !firewallMatches) {
       die("credential resolution requires request-proxy and firewall acknowledgement of the selected effective policy generation");
     }
@@ -2609,6 +3294,10 @@ function syncTokensUnderLock(
   effective?: EffectiveCredentialSnapshot,
 ): TokenSyncResult {
   let exactRuntime: ProxyRuntime | undefined;
+  // A sync that reads no source under the held lifecycle lock defers, before
+  // any effect, wherever a full sync would read, wait, or act on a runtime it
+  // cannot write to exactly.
+  const deferring = options.preparedOnly === true || options.preparedSourceTruth === true;
   // The journal's identity is always the derived name (its parser refuses any other), so no Docker lookup is needed.
   const rebindProject = { projectId: projectId(), composeProject: `runfree-${projectId()}` };
   const rebindAtStart = readControlPlaneRebindTransaction(stateDir(), rebindProject);
@@ -2626,19 +3315,31 @@ function syncTokensUnderLock(
             || Date.now() < Date.parse(rebind.recovery.allowance.lastObservedAt)))) {
         throw new EffectiveControlSelectionChanged("proxy replacement receipt or recovery allowance changed before credential write; resume runtime recover");
       }
-      const observed = readyProxyRuntime(exactRuntime.id as string);
+      const observed = observeExactProxyRuntime(exactRuntime);
       if (observed.state !== "ready" || observed.storeGeneration !== exactRuntime.storeGeneration
         || (readEffectiveControlPlaneV2(stateDir())?.selection.proxyContainerId ?? exactRuntime.id) !== exactRuntime.id) {
         throw new EffectiveControlSelectionChanged("exact proxy or token store changed during credential resolution; retry sync against fresh runtime evidence");
       }
     }
   };
-  assertSelection();
+  // The watcher's cancellation check runs beside every fence: the
+  // linearization point is the check, so nothing is dispatched after a stop.
+  const assertActive = (): void => options.lifetime?.assertActive();
+  const fence = (): void => {
+    assertActive();
+    assertSelection();
+  };
+  fence();
   const status = loadTokenStatus();
   // `runtime` is the precheck's observation, reused rather than re-observed. If the
   // proxy restarted since — including while waiting for the token-store lock above —
   // assertSelection()'s store-generation fence refuses every write, and a retry observes the new proxy.
-  const runtime = effective?.runtime ?? proxyRuntime();
+  // Without one, this phase observes the proxy itself, held names included.
+  const baseline = effective?.runtime ?? options.observedRuntime;
+  const observed: ProxyRuntimeObservation = baseline
+    ? { runtime: baseline }
+    : observeProxyRuntime("locked-sync", ["held-token-names"]);
+  const runtime = observed.runtime;
   exactRuntime = runtime;
   adminVerbose(options, `proxy runtime state is ${runtime.state}`);
 
@@ -2646,6 +3347,7 @@ function syncTokensUnderLock(
   const stale: string[] = [];
   const failedMessages: Record<string, string> = {};
   const receipts: TokenResolutionReceipt[] = [];
+  const unprepared: string[] = [];
   const syncNowMs = options.resolutionLedger ? tokenSyncWatchNowMs() : Date.now();
   let changed = false;
 
@@ -2660,9 +3362,10 @@ function syncTokensUnderLock(
   };
   const result = (runtimeState: ProxyRuntimeState): TokenSyncResult => {
     if ((failed.length > 0 || stale.length > 0) && options.exitOnFailure) process.exitCode = 1;
-    return { failed, stale, failedMessages, changed, receipts, runtimeState, storeGeneration: runtime.storeGeneration };
+    return { failed, stale, failedMessages, changed, receipts, runtimeState, storeGeneration: runtime.storeGeneration, unprepared };
   };
   const finish = (): TokenSyncResult => {
+    assertActive();
     saveTokenStatus(status);
     if (receiptsChanged) savePersistedTokenReceipts(persistedReceipts);
     return result(runtime.state);
@@ -2699,7 +3402,7 @@ function syncTokensUnderLock(
   // A prepared-only sync never acts on a runtime it cannot write to exactly:
   // anything but a ready proxy defers before any effect, including the
   // validation-required wipe below.
-  if (options.preparedOnly && (runtime.state !== "ready" || !runtime.id || !runtime.storeGeneration)) {
+  if (deferring && (runtime.state !== "ready" || !runtime.id || !runtime.storeGeneration)) {
     throw new TokenSyncDeferredError(`proxy runtime is ${runtime.state}`);
   }
 
@@ -2710,16 +3413,22 @@ function syncTokensUnderLock(
     return reportRunUnreachable();
   }
 
-  // Possession check: the single batched secret-dir listing for this run.
-  // Kept current across writes/removes below so end-of-run receipt pruning
+  // Possession check: the single batched secret-dir listing for this run,
+  // read in this phase's own proxy observation when it made one, else alone
+  // under the token-store lock. Kept current across writes/removes below so end-of-run receipt pruning
   // sees tokens written this run. A failed listing is a transport failure on
   // the same channel as writes — treated like proxy-unreachable, never as
   // evidence of absence.
   let heldTokens: Set<string> | undefined;
   if (runtime.state === "ready" && runtime.id) {
-    heldTokens = listProxyRuntimeTokens(runtime.id);
+    if (observed.observation) {
+      const held = lockedHeldTokenNames(observed.observation);
+      heldTokens = held && new Set(held);
+    } else {
+      heldTokens = listProxyRuntimeTokensUnderLock(runtime.id);
+    }
     if (heldTokens === undefined) {
-      if (options.preparedOnly) throw new TokenSyncDeferredError("the proxy's held-token listing is unavailable");
+      if (deferring) throw new TokenSyncDeferredError("the proxy's held-token listing is unavailable");
       return reportRunUnreachable();
     }
   }
@@ -2740,6 +3449,7 @@ function syncTokensUnderLock(
     options.resolutionLedger?.lastResolvedAt.clear();
     options.resolutionLedger?.retryAfterFailureAt.clear();
     const message = runtimeStateMessage(runtime.state, runtime.validationMessage);
+    assertActive();
     if (runtime.id) {
       changed = cleanupProxyRuntimeTokens(runtime.id, [
         ...Object.keys(policy.tokens),
@@ -2760,21 +3470,23 @@ function syncTokensUnderLock(
   try {
     config = loadTokenConfig();
   } catch (error) {
-    if (options.preparedOnly) throw new TokenSyncDeferredError("the credential source config is unreadable");
+    if (deferring) throw new TokenSyncDeferredError("the credential source config is unreadable");
     // Project-reachable parse/validation failure: unconditional fail-closed
     // delete (never keep-last-good), and every removal retracts its receipt.
     options.sourceSecretCache?.jwtPrivateKeys.clear();
     options.resolutionLedger?.lastResolvedAt.clear();
     options.resolutionLedger?.retryAfterFailureAt.clear();
     const message = error instanceof Error ? error.message : String(error);
-    assertSelection();
+    fence();
     for (const tokenName of Object.keys(policy.tokens)) {
+      assertActive();
       if (runtime.id) {
         try {
           removeProxyRuntimeToken(runtime.id, tokenName);
           changed = true;
           heldTokens?.delete(tokenName);
-        } catch {
+        } catch (removalError) {
+          if (removalError instanceof ChildSignaledError) throw removalError;
           // Keep the config validation failure as the primary user-facing error.
         }
       }
@@ -2832,19 +3544,33 @@ function syncTokensUnderLock(
     }
     assertPreparedOnlyCovers(dueTokenNames);
   }
+  if (options.preparedSourceTruth) {
+    if (sourceRegistryError) throw new TokenSyncDeferredError("the source registry is unreadable");
+    // Every token is due in a source-truth pass, so every configured token
+    // needs a value read before the lock, and a required token needs a
+    // source: the whole set is decided before the first effect.
+    const covered: string[] = [];
+    for (const [tokenName, tokenPolicy] of Object.entries(policy.tokens)) {
+      if (config[tokenName]) covered.push(tokenName);
+      else if (tokenPolicy.allowAnonymous !== true) {
+        throw new TokenSyncDeferredError(`${tokenName} is required and has no source`, "preparation");
+      }
+    }
+    assertPreparedOnlyCovers(covered);
+  }
   const prepared = preparedRuntimeTokenSources.get(stateDir());
   if (prepared) {
     if (sourceRegistryError) throw new EffectiveControlSelectionChanged("prepared source registry changed; restore its metadata before retrying sync");
-    const expectedNames = assertPreparedTokenSourceInputs(prepared, policy, config, sourceRegistry);
     // Binding and age are checked for every prepared entry, skipped ones too;
     // only a due token ever reads a value (in the loop below). Under the held
     // lock an expired or rebound preparation is a deferral: nothing was
     // written yet, and the source-truth order prepares afresh.
     try {
+      const expectedNames = assertPreparedTokenSourceInputs(prepared, policy, config, sourceRegistry);
       for (const name of expectedNames) currentPreparedRuntimeTokenSource(name, config[name], { quiet: true, sourceRegistry: config[name].source === "named" ? sourceRegistry : undefined });
     } catch (error) {
-      if (options.preparedOnly && error instanceof EffectiveControlSelectionChanged) {
-        throw new TokenSyncDeferredError(`the prepared credential set no longer applies: ${error.message}`);
+      if (deferring && error instanceof EffectiveControlSelectionChanged) {
+        throw new TokenSyncDeferredError(`the prepared credential set no longer applies: ${error.message}`, "preparation");
       }
       throw error;
     }
@@ -2853,11 +3579,13 @@ function syncTokensUnderLock(
   // Fences sit before each side-effect phase: the removal below, source
   // resolution, the proxy write, the failure removal, and the post-loop
   // cleanup and persistence. A token that is not due takes no action, so it
-  // needs no proxy re-observation.
+  // needs no proxy re-observation. A value read before the lock is taken from
+  // memory, which is no effect: the write's own fence is the next
+  // observation, and a source failure's removal fences itself.
   for (const [tokenName, tokenPolicy] of Object.entries(policy.tokens)) {
     const source = config[tokenName];
     if (!source) {
-      assertSelection();
+      fence();
       // Intentional local state change (source removed): immediate delete and
       // receipt retraction, never receipt-gated.
       if (runtime.id) {
@@ -2920,39 +3648,81 @@ function syncTokensUnderLock(
         adminVerbose(options, `${tokenName}: skipped (${due.reason})`);
         continue;
       }
-      adminVerbose(options, `${tokenName}: resolving ${describeSource(source)} source (${due.reason})`);
-      assertSelection();
-      const value = resolvePreparedRuntimeTokenSource(tokenName, source, { ...options, sourceRegistry: registryForSource });
-      assertSelection();
+      let value: string;
+      let resolvedAt = syncNowMs;
+      if (options.watchPreparation) {
+        const entry = currentWatchPreparedEntry(options.watchPreparation, tokenName, source, registryForSource);
+        if (!entry) {
+          adminVerbose(options, `${tokenName}: due (${due.reason}); its source is read before the next locked pass`);
+          unprepared.push(tokenName);
+          continue;
+        }
+        if (entry.kind === "source-failure") throw entry.error;
+        value = entry.value;
+        resolvedAt = entry.resolvedAt ?? syncNowMs;
+      } else {
+        adminVerbose(options, `${tokenName}: resolving ${describeSource(source)} source (${due.reason})`);
+        if (preparedTokenEntryKind(tokenName) !== "resolved") {
+          // Covered before the first effect; never a source read under the lock.
+          if (options.preparedSourceTruth) throw new TokenSyncDeferredError(`${tokenName} has no value read before the lock`, "preparation");
+          fence();
+        }
+        try {
+          const resolved = resolvePreparedRuntimeTokenSource(tokenName, source, { ...options, sourceRegistry: registryForSource });
+          value = resolved.value;
+          // A prepared value is as old as the read before the lock, on every
+          // sync that reuses it: reuse never makes it younger. A value read
+          // now keeps the sync's start, which precedes the read.
+          if (resolved.preparedReadStartedAt !== undefined) resolvedAt = resolved.preparedReadStartedAt;
+        } catch (error) {
+          // The preparation expired or was rebound between two writes: under
+          // the held lock that is a deferral, never a refusal. Earlier writes
+          // stand without a receipt; the unlocked order writes them again.
+          if (options.preparedSourceTruth && error instanceof EffectiveControlSelectionChanged) {
+            throw new TokenSyncDeferredError(`the prepared credential set no longer applies: ${error.message}`, "preparation");
+          }
+          throw error;
+        }
+      }
+      fence();
       if (runtime.id) {
         adminVerbose(options, `${tokenName}: writing token value to proxy-only tmpfs`);
         try {
           writeProxyRuntimeToken(runtime.id, tokenName, value);
         } catch (error) {
+          // A write whose client failed after the watch stopped has an
+          // unknown outcome: never compensated, never recorded.
+          assertActive();
+          // A signal-ended client is an unknown outcome the caller settles.
+          if (options.preparedSourceTruth && error instanceof ChildSignaledError) throw error;
           // Under the held lock every call is time-bounded, and a killed
           // client may still land its write: removing now could race it. The
           // unlocked source-truth order retries instead.
-          if (options.preparedOnly) {
+          if (deferring) {
             throw new TokenSyncDeferredError(`${tokenName}: proxy token write failed: ${error instanceof Error ? error.message : String(error)}`);
           }
           throw error;
         }
         changed = true;
         heldTokens?.add(tokenName);
+        // A write that completed after the watch stopped stands, but its
+        // bookkeeping is skipped: the older receipt only brings the next read
+        // forward.
+        assertActive();
       } else {
         adminVerbose(options, `${tokenName}: source verified; proxy tmpfs write skipped because runtime is ${runtime.state}`);
       }
       if (runtime.storeGeneration) {
         const sourceFingerprint = due.sourceFingerprint ?? tokenSourceFingerprint(source, registryForSource);
         if (due.key) {
-          ledger?.lastResolvedAt.set(due.key, syncNowMs);
+          ledger?.lastResolvedAt.set(due.key, resolvedAt);
           ledger?.retryAfterFailureAt.delete(due.key);
         }
         const receipt = {
           tokenName,
           sourceFingerprint,
           proxyStoreGeneration: runtime.storeGeneration,
-          resolvedAt: syncNowMs,
+          resolvedAt,
         };
         receipts.push(receipt);
         recordReceipt(receipt);
@@ -2966,7 +3736,23 @@ function syncTokensUnderLock(
       };
       if (!options.quiet) console.log(`${tokenName}: ${runtimeStateMessage(runtime.state, runtime.validationMessage)} from ${describeSource(source)}`);
     } catch (error) {
-      if (error instanceof EffectiveControlSelectionChanged || error instanceof TokenSyncDeferredError) throw error;
+      // Cancellation and a signal-ended child are not source verdicts: they
+      // leave before keep-last-good, the ledger's retry stamp, and the
+      // failure removal, and nothing of this pass is persisted.
+      if (error instanceof EffectiveControlSelectionChanged || error instanceof TokenSyncDeferredError
+        || error instanceof CredentialCancellationError || error instanceof ChildSignaledError) throw error;
+      assertActive();
+      if (error instanceof ProxyTokenWriteOutcomeUnknown) {
+        // Never a removal and never a source verdict: the value is re-read
+        // and written again by the next pass, whose due decision no longer
+        // finds a resolution for it.
+        retractReceipt(tokenName);
+        forgetLedgerResolutions(ledger, tokenName);
+        failed.push(tokenName);
+        failedMessages[tokenName] = error.message;
+        if (!options.quiet) console.error(error.message);
+        continue;
+      }
       clearCachedSourceSecret(source, options.sourceSecretCache);
       let failureFingerprint: string | undefined;
       try {
@@ -3018,13 +3804,14 @@ function syncTokensUnderLock(
       }
       // The failure may precede the pre-resolution fence (source registry,
       // refresh, or due checks), so fence the removal itself.
-      assertSelection();
+      fence();
       if (runtime.id) {
         try {
           removeProxyRuntimeToken(runtime.id, tokenName);
           changed = true;
           heldTokens?.delete(tokenName);
-        } catch {
+        } catch (removalError) {
+          if (removalError instanceof ChildSignaledError) throw removalError;
           // Keep the source-resolution failure as the primary user-facing error.
         }
       }
@@ -3045,11 +3832,13 @@ function syncTokensUnderLock(
 
     // Token dropped from policy: immediate delete plus receipt retraction.
     if (runtime.id) {
+      assertActive();
       try {
         removeProxyRuntimeToken(runtime.id, tokenName);
         changed = true;
         heldTokens?.delete(tokenName);
       } catch (error) {
+        if (error instanceof ChildSignaledError) throw error;
         const message = error instanceof Error ? error.message : String(error);
         markFailed(tokenName, message, { source: source.source, report: `cleanup failed (${message})` });
         continue;
@@ -3096,8 +3885,18 @@ export type CredentialSyncInput = {
   cacheSourceSecrets: boolean;
   /** Watch only: re-read every source once before the first wait (launch plan D4). */
   initialSourceTruth?: boolean;
-  /** One-shot only, in-process startup: the receipt-gated warm-launch sync. */
-  mode?: "startup-convergence";
+  /**
+   * One-shot only, in-process startup. `startup-convergence`: the
+   * receipt-gated warm-launch sync. `prepared-source-truth`: a cold launch's
+   * source-truth sync under its held lifecycle lock, publishing only the
+   * sources read before the lock, by `holdDeadlineMonotonicMs`.
+   */
+  mode?: "startup-convergence" | "prepared-source-truth";
+  /**
+   * `prepared-source-truth` only: the `performance.now()` time the startup
+   * hold allowance ends, counted from when startup took the lifecycle lock.
+   */
+  holdDeadlineMonotonicMs?: number;
 };
 
 // --- Source: typed intents + enforcement ------------------------------------
@@ -3733,8 +4532,8 @@ type ProxyReloadOptions = { continueOnTokenSyncFailure?: boolean; force?: boolea
 // stale keeps are warnings only — the proxy still injects a receipt-proven
 // value and the watcher/next sync retries — so a missed 1Password prompt on
 // an unrelated mutation or session start never fails the command.
-function runQuietTokenSync(mode: TokenSyncMode, options: ProxyReloadOptions, failureSuffix = ""): { ok: boolean; sync: TokenSyncResult } {
-  const sync = syncTokens({ quiet: true, exitOnFailure: false, mode });
+async function runQuietTokenSync(mode: TokenSyncMode, options: ProxyReloadOptions, failureSuffix = ""): Promise<{ ok: boolean; sync: TokenSyncResult }> {
+  const sync = await syncTokensSettlingSignals({ quiet: true, exitOnFailure: false, mode });
   currentAdminState().tokenResolutionReceipts = sync.receipts;
   printTokenSyncFailures(sync);
   if (sync.failed.length > 0) {
@@ -3761,8 +4560,8 @@ function printProxyReloadSummary(headline: string, policy: LoadedNetworkPolicy, 
 // report, and explain that policy and tokens apply on the next runfree. No
 // sync mode is threaded through: without a live store generation every token
 // is due regardless of mode, so the distinction is meaningless here.
-function syncTokensWithoutRunningProxy(message: string, options: ProxyReloadOptions): void {
-  if (!runQuietTokenSync("source-truth", options).ok) return;
+async function syncTokensWithoutRunningProxy(message: string, options: ProxyReloadOptions): Promise<void> {
+  if (!(await runQuietTokenSync("source-truth", options)).ok) return;
   console.log(message);
 }
 
@@ -3770,12 +4569,12 @@ function syncTokensWithoutRunningProxy(message: string, options: ProxyReloadOpti
 // cannot be fixed by restarting the container: only `runfree up` recreates
 // it, and its image may predate the convergence status files entirely, so a
 // restart would wipe the token store and then fail readiness for nothing.
-function reportRuntimeValidationRequired(runtime: ProxyRuntime, options: ProxyReloadOptions): void {
+async function reportRuntimeValidationRequired(runtime: ProxyRuntime, options: ProxyReloadOptions): Promise<void> {
   console.error(`runfree: ${runtime.validationMessage ?? "runtime validation required; run \`runfree up\`"}`);
   console.error(`runfree: a proxy restart cannot revalidate this runtime; run \`${remedy.up()}\` to recreate it`);
   // Mode is irrelevant here: validation-required syncs wipe fail-closed
   // before any due decision.
-  runQuietTokenSync("source-truth", options);
+  await runQuietTokenSync("source-truth", options);
 }
 
 /**
@@ -3851,7 +4650,7 @@ async function restartProxyAndSync(project: string, proxyId: string, policy: Loa
   }
   // Credential resolution rechecks the selected policy and exact proxy store.
   // Prompts run after the admission critical section has released its fence.
-  const { ok, sync } = runQuietTokenSync("source-truth", options, "; proxy tmpfs token files were removed");
+  const { ok, sync } = await runQuietTokenSync("source-truth", options, "; proxy tmpfs token files were removed");
   if (!ok) return;
   printProxyReloadSummary("proxy reload: done", policy, sync);
   } finally { clearPreparedRuntimeTokenSources(hostProject); }
@@ -3865,21 +4664,21 @@ export async function reloadProxy(options: ProxyReloadOptions = {}): Promise<voi
   const policy = loadPolicy();
 
   if (!dockerAvailable()) {
-    syncTokensWithoutRunningProxy("proxy not inspected: docker unavailable; policy and tokens will apply on next runfree", options);
+    await syncTokensWithoutRunningProxy("proxy not inspected: docker unavailable; policy and tokens will apply on next runfree", options);
     return;
   }
 
   const project = composeProject();
   const currentProxy = project ? proxyContainerId(project) : undefined;
   if (!project || !currentProxy) {
-    syncTokensWithoutRunningProxy("proxy not running; policy and tokens will apply on next runfree", options);
+    await syncTokensWithoutRunningProxy("proxy not running; policy and tokens will apply on next runfree", options);
     return;
   }
 
   if (containerRunning(currentProxy)) {
     const runtime = proxyRuntime();
     if (runtime.state === "validation-required") {
-      reportRuntimeValidationRequired(runtime, options);
+      await reportRuntimeValidationRequired(runtime, options);
       return;
     }
   }
@@ -3940,14 +4739,14 @@ export async function convergeProxyPolicy(options: ProxyReloadOptions = {}): Pro
   const policy = loadPolicy();
 
   if (!dockerAvailable()) {
-    syncTokensWithoutRunningProxy("proxy not inspected: docker unavailable; policy and tokens will apply on next runfree", options);
+    await syncTokensWithoutRunningProxy("proxy not inspected: docker unavailable; policy and tokens will apply on next runfree", options);
     return;
   }
 
   const project = composeProject();
   const currentProxy = project ? proxyContainerId(project) : undefined;
   if (!project || !currentProxy) {
-    syncTokensWithoutRunningProxy("proxy not running; policy and tokens will apply on next runfree", options);
+    await syncTokensWithoutRunningProxy("proxy not running; policy and tokens will apply on next runfree", options);
     return;
   }
 
@@ -3969,7 +4768,7 @@ export async function convergeProxyPolicy(options: ProxyReloadOptions = {}): Pro
     const runtime = proxyRuntime();
     if (runtime.state === "validation-required") {
       console.error(`runfree: proxy did not acknowledge policy generation ${policy.generation} (${ack.reason})`);
-      reportRuntimeValidationRequired(runtime, options);
+      await reportRuntimeValidationRequired(runtime, options);
       return;
     }
     console.error(`runfree: proxy did not acknowledge policy generation ${policy.generation} (${ack.reason}); falling back to a proxy restart`);
@@ -3980,7 +4779,7 @@ export async function convergeProxyPolicy(options: ProxyReloadOptions = {}): Pro
 
   // Receipt-gated: only genuinely new or changed tokens resolve. StartedAt is
   // unchanged, the store generation is stable, existing tokens are untouched.
-  const { ok, sync } = runQuietTokenSync("convergence", options);
+  const { ok, sync } = await runQuietTokenSync("convergence", options);
   if (!ok) return;
   printProxyReloadSummary("proxy policy converged (no restart)", policy, sync);
 }

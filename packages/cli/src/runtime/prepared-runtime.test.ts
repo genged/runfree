@@ -499,3 +499,59 @@ test("consumption under a handoff refuses one that proved another proxy than the
     handoff: { ...handoffFor(prepared, lock), proxy: { id: "9".repeat(64), startedAt: "2026-06-13T00:00:00.000Z" } },
   })).toThrow(StalePreparedRuntimeError);
 });
+
+/** A lock that stops proving itself once released, as the lifecycle lock does. */
+function releasableLock(ownerToken: string): ProjectLifecycleLock & { released: boolean } {
+  const lock = {
+    ownerToken,
+    released: false,
+    assertHeld: () => {
+      if (lock.released) throw new Error("project lifecycle lock is no longer held");
+    },
+    release: () => { lock.released = true; },
+  };
+  return lock;
+}
+
+test("one-shot handoff cannot replay", () => {
+  const prepared = fixture();
+  const authority = mintPreparedRuntime({ plan: prepared.activePlan, validationProof: prepared.proof });
+  const lock = releasableLock("a".repeat(64));
+  attachLaunchHandoff(authority, handoffFor(prepared, lock));
+  const taken = takeLaunchHandoff(authority);
+  if (!taken) throw new Error("the handoff was not attached");
+  // Neither the slot nor a second consumption hands the proof out again.
+  expect(takeLaunchHandoff(authority)).toBeUndefined();
+  expect(consumePreparedRuntime({ preparedRuntime: authority, lifecycleLock: lock, io: prepared.io, handoff: taken }).plan)
+    .toBe(prepared.activePlan);
+  expect(() => consumePreparedRuntime({ preparedRuntime: authority, lifecycleLock: lock, io: prepared.io, handoff: taken }))
+    .toThrow("already consumed");
+  // A taken handoff cannot be attached to the same authority a second time.
+  expect(() => attachLaunchHandoff(authority, taken)).toThrow("already carries a launch handoff");
+});
+
+test("release/reacquire cannot reuse proof", () => {
+  const prepared = fixture();
+  // A lock released before the handoff is attached carries nothing.
+  const released = releasableLock("b".repeat(64));
+  const handoff = handoffFor(prepared, released);
+  released.release();
+  const unattached = mintPreparedRuntime({ plan: prepared.activePlan, validationProof: prepared.proof });
+  expect(() => attachLaunchHandoff(unattached, handoff)).toThrow("no longer held");
+  expect(takeLaunchHandoff(unattached)).toBeUndefined();
+
+  // The proof startup took under one acquisition does not carry to the next:
+  // a reacquired lock has a new owner, and admission under it refuses.
+  const first = releasableLock("c".repeat(64));
+  const authority = mintPreparedRuntime({ plan: prepared.activePlan, validationProof: prepared.proof });
+  attachLaunchHandoff(authority, handoffFor(prepared, first));
+  const taken = takeLaunchHandoff(authority);
+  if (!taken) throw new Error("the handoff was not attached");
+  first.release();
+  const reacquired = releasableLock("d".repeat(64));
+  expect(() => consumePreparedRuntime({ preparedRuntime: authority, lifecycleLock: reacquired, io: prepared.io, handoff: taken }))
+    .toThrow("does not hold the lock");
+  // The refusal consumed nothing: the full path under the new lock re-proves.
+  expect(consumePreparedRuntime({ preparedRuntime: authority, lifecycleLock: prepared.lifecycleLock, io: prepared.io }).plan)
+    .toBe(prepared.activePlan);
+});

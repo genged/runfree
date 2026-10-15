@@ -312,7 +312,7 @@ function openTokenAutoRefreshLog(context: RuntimeContext): number | undefined {
 }
 
 // Close the parent's write end of the lifetime pipe so the watcher sees EOF
-// promptly, then signal. The pipe also closes automatically if this process
+// promptly, then signal it. The pipe also closes automatically if this process
 // dies uncleanly — that is the point of pipe-based liveness.
 function closeTokenAutoRefreshLifetimePipe(child: childProcess.ChildProcess, plan: TokenAutoRefreshSpawnPlan): void {
   try {
@@ -322,16 +322,12 @@ function closeTokenAutoRefreshLifetimePipe(child: childProcess.ChildProcess, pla
   }
 }
 
+// The watcher only: it ends the providers it started (each leads its own
+// process group) and joins them before it exits. A signal to its whole group
+// would also kill an in-flight Docker client, turning a completed proxy write
+// into an unknown outcome.
 function stopTokenAutoRefreshChild(child: childProcess.ChildProcess): void {
   if (child.exitCode !== null || child.signalCode !== null) return;
-  if (process.platform !== "win32" && child.pid !== undefined) {
-    try {
-      process.kill(-child.pid, "SIGTERM");
-      return;
-    } catch {
-      // Fall back to killing the direct child if process-group cleanup fails.
-    }
-  }
   child.kill("SIGTERM");
 }
 
@@ -381,6 +377,12 @@ function startTokenAutoRefreshProcess(
     stop: () => {
       closeTokenAutoRefreshLifetimePipe(child, plan);
       stopTokenAutoRefreshChild(child);
+      // The watcher now winds down on its own (in-flight writes finish, its
+      // providers are joined, all bounded) and is built to outlive this
+      // process. Waiting for it would add that wind-down to every session's
+      // exit, so nothing here keeps this process alive for it.
+      child.unref();
+      for (const stream of child.stdio) (stream as { unref?: () => void } | null)?.unref?.();
     },
   };
 }
@@ -783,7 +785,9 @@ async function dispatchRuntimeAdmin(intent: RuntimeAdminIntent, context: Runtime
         quiet: false,
         delayFirstSync: false,
         cacheSourceSecrets: true,
-        ...(intent.mode ? { mode: intent.mode } : {}),
+        ...(intent.mode === "prepared-source-truth"
+          ? { mode: intent.mode, holdDeadlineMonotonicMs: intent.holdDeadlineMonotonicMs }
+          : intent.mode ? { mode: intent.mode } : {}),
       });
       return;
     case "prepare": {

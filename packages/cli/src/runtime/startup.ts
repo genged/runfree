@@ -1,5 +1,5 @@
 import { LIFECYCLE_OPERATION_BUDGET_MS, withLifecycleOperationBudget } from "./lifecycle-operation-budget.ts";
-import { launchHandoffSpanFits } from "./launch-lock-hold.ts";
+import { LAUNCH_HANDOFF_STARTUP_SPAN_MAX_MS, launchHandoffSpanFits } from "./launch-lock-hold.ts";
 import { captureRebindTrustReceipt } from "./rebind-trust-receipt.ts";
 import { isDeepStrictEqual } from "node:util";
 import { readConfig } from "../config.ts";
@@ -24,7 +24,7 @@ import {
   readEffectiveHostServices,
 } from "../control/effective.ts";
 import { validateNetworkPolicy } from "@runfree/runtime-contracts/network-policy";
-import { hostServiceOwnerWarnings } from "../host-service-port-owner.ts";
+import { hostServiceOwnerWarningsFromSnapshot, probeHostListeners } from "../host-listener-snapshot.ts";
 import { projectHasRegisteredHostServicePorts, recordedHostServiceOwners, recordProjectHostServicePorts } from "../host-service-registry.ts";
 import type { EffectiveHostServices } from "./probes.ts";
 import {
@@ -179,12 +179,18 @@ import {
   type WarmProofVerdict,
   type WarmValidation,
 } from "./warm-proof.ts";
-import { TOKEN_SYNC_DEFERRED_STATUS } from "./constants.ts";
+import { TOKEN_SYNC_DEFERRED_STATUS, TOKEN_SYNC_REPREPARE_STATUS } from "./constants.ts";
 import { imageCleanupStampMatches, writeImageCleanupStamp } from "./image-cleanup-stamp.ts";
 import { createOperationHistogram, withOperationHistogram } from "./operation-histogram.ts";
 import { remedy } from "../remedies.ts";
 import { sessionRegistryDigest } from "./launch-handoff.ts";
 import { proveWarmEmptySessionState, type WarmEmptySessionState } from "./warm-empty-session-state.ts";
+import {
+  consumeWarmPeerValidation,
+  tryWarmPeerValidation,
+  type WarmPeerConsumptionBinding,
+  type WarmPeerValidation,
+} from "./warm-peer-proof.ts";
 import { setMcpLogContext } from "./mcp.ts";
 
 const RETAINED_AGENT_TEMPLATE_REMEDY =
@@ -231,6 +237,12 @@ class LaunchHandoffSpanExceededError extends Error {
 }
 
 type LaunchHandoffRequest = Readonly<{
+  /**
+   * When startup took the lock it would hand off, on the `performance.now()`
+   * clock. The startup hold allowance is counted from here, through the
+   * credential sync and the handoff, never from a later step.
+   */
+  lockAcquiredAtMonotonicMs: number;
   build: () => LaunchHandoff;
   /** Releases the lock before a deferred sync reads a source. */
   releaseLock: () => void;
@@ -305,6 +317,55 @@ async function syncWarmLaunchTokens(input: Readonly<{
   input.beforeSourceResolution?.();
   await input.io.prepareTokenSources?.(input.context);
   return { status: await syncProxyManagedTokens(admin, input.verbose), freshness: "source-truth" };
+}
+
+/**
+ * A cold launch's credential sync while startup holds the lock it hands to
+ * admission. Every source was read before the lock (a source-truth
+ * preparation), so the `prepared-source-truth` sync publishes that set and
+ * reads nothing, inside the startup hold allowance counted from the lock's
+ * original acquisition. When it defers, the lock is released and the
+ * ordinary source-truth sync runs. Only a deferral caused by the preparation
+ * itself (missing, incomplete, expired, or no longer the current sources)
+ * reads the sources again first, after the release; any other (an allowance
+ * already spent, a busy lock, a runtime that is not ready, a failed write)
+ * reuses the preparation, so no provider runs twice. That sync re-observes
+ * the proxy and checks the preparation's age and binding, so a publication
+ * the deferral cut short is written again rather than trusted.
+ */
+async function syncColdLaunchTokens(input: Readonly<{
+  context: RuntimeContext;
+  io: RuntimeIO;
+  verbose?: boolean;
+  timings: RuntimeTimings;
+  lockAcquiredAtMonotonicMs: number;
+  /** Runs before the unlocked fallback (releases the held lifecycle lock). */
+  beforeSourceResolution: () => void;
+}>): Promise<Readonly<{ status: number; holdSpanSpent: boolean }>> {
+  const admin = (intent: RuntimeAdminIntent) => input.io.admin(intent, input.context);
+  const spent = (): boolean => !launchHandoffSpanFits(input.lockAcquiredAtMonotonicMs, performance.now());
+  let reprepare = false;
+  if (!spent()) {
+    reportRuntimeProgress("syncing proxy-managed tokens", input.verbose);
+    const status = await admin({
+      kind: "token-sync",
+      verbose: Boolean(input.verbose),
+      mode: "prepared-source-truth",
+      holdDeadlineMonotonicMs: input.lockAcquiredAtMonotonicMs + LAUNCH_HANDOFF_STARTUP_SPAN_MAX_MS,
+    });
+    if (status !== TOKEN_SYNC_DEFERRED_STATUS && status !== TOKEN_SYNC_REPREPARE_STATUS) {
+      if (status === 0) input.timings.report("token-sync", "prepared-source-truth");
+      return { status, holdSpanSpent: false };
+    }
+    reprepare = status === TOKEN_SYNC_REPREPARE_STATUS;
+  }
+  const holdSpanSpent = spent();
+  input.timings.report("token-sync", reprepare
+    ? "deferred re-prepare"
+    : holdSpanSpent ? "deferred hold-span" : "deferred source-truth");
+  input.beforeSourceResolution();
+  if (reprepare) await input.io.prepareTokenSources?.(input.context);
+  return { status: await syncProxyManagedTokens(admin, input.verbose), holdSpanSpent };
 }
 
 async function finalizeValidatedRuntime(
@@ -384,16 +445,33 @@ async function finalizeValidatedRuntime(
   }
   let credentialFreshness: "source-truth" | "receipt-gated" = "source-truth";
   // A held-lock handoff (sub-second launch plan Task 3) keeps the lifecycle
-  // lock through the receipt-gated sync, which resolves no source; a deferral
-  // releases it before any source is read, and then there is no handoff.
-  const holdLockThroughSync = launchHandoff !== undefined && credentialMode === "receipt-gated";
+  // lock through a sync that resolves no source: the receipt-gated warm sync,
+  // or a cold launch's sync of the sources it read before the lock. A
+  // preparation that skipped held tokens cannot feed a source-truth sync, so
+  // that launch releases the lock first. A deferral releases it before any
+  // source is read, and then there is no handoff.
+  const holdLockThroughSync = launchHandoff !== undefined
+    && (credentialMode === "receipt-gated" || !preparedReceiptGated);
   let lockReleasedForSync = !holdLockThroughSync;
+  let holdSpanSpent = false;
   const runCredentialSync = holdLockThroughSync
     ? (work: () => Promise<number>) => work()
     : withCredentialResolution;
   const tokenSync = await timings.timeAsync(
     "token-sync",
     () => runCredentialSync(async () => {
+      if (credentialMode !== "receipt-gated" && holdLockThroughSync) {
+        const cold = await syncColdLaunchTokens({
+          context: activeContext,
+          io,
+          verbose,
+          timings,
+          lockAcquiredAtMonotonicMs: launchHandoff.lockAcquiredAtMonotonicMs,
+          beforeSourceResolution: () => { lockReleasedForSync = true; launchHandoff.releaseLock(); },
+        });
+        holdSpanSpent = cold.holdSpanSpent;
+        return cold.status;
+      }
       if (credentialMode !== "receipt-gated") {
         // A proxy replaced after a receipt-gated preparation needs every
         // source: re-read them, outside the lock, before the sync.
@@ -429,7 +507,12 @@ async function finalizeValidatedRuntime(
       reportRuntimeVerbose(verbose, `launch handoff not minted: ${error instanceof Error ? error.message : String(error)}`);
     }
   } else if (launchHandoff) {
-    timings.report("launch-handoff", lockReleasedForSync ? "skipped token-resolution" : "skipped");
+    // A sync that outlasted the startup allowance: the launch frame yields to
+    // a waiting command before it takes its own lock.
+    if (holdSpanSpent && tokenSync === 0) markLaunchHandoffDeclined(preparedRuntime);
+    timings.report("launch-handoff", holdSpanSpent
+      ? "skipped hold-span"
+      : lockReleasedForSync ? "skipped token-resolution" : "skipped");
   }
   const tokenResolutionReceipts = tokenSync === 0 ? io.takeTokenResolutionReceipts?.() ?? [] : [];
   if (tokenSync === 0) reportRuntimeProgress("runtime startup complete", verbose);
@@ -912,6 +995,13 @@ type RuntimeTokenSyncPreparation = {
   denyByDefaultObservation?: DenyByDefaultObservationV1;
   proof?: RuntimeValidationProof;
   securityProof?: RuntimeSecurityContractProof;
+  /**
+   * The proxy start observed before the topology proof and the marker write.
+   * The marker lives in the proxy's writable layer, not on tmpfs, so a
+   * same-id restart keeps it: only this start says which incarnation the
+   * validation proved. Absent when it could not be observed.
+   */
+  proxyStartedAt?: string;
   status: number;
 };
 
@@ -1113,6 +1203,12 @@ async function prepareRuntimeForTokenSyncOrRemoveInvalid(
     warn(error instanceof Error ? error.message : String(error));
     return { status: 1, failureKind: error instanceof RuntimeObservationError ? error.evidence.kind : "unclassified" };
   }
+  let validatedProxyStartedAt: string | undefined;
+  try {
+    validatedProxyStartedAt = observeProxyStartedAt(io, readinessProxyId, dockerClientEnvOptions(context));
+  } catch {
+    // Unobserved: the validation still runs, but nothing may record it as warm.
+  }
   // The host services the firewall proof judges `@host_service` against come
   // from the same effective policy generation readiness waited for. An
   // unreadable generation refuses: the proof never assumes "none".
@@ -1146,6 +1242,7 @@ async function prepareRuntimeForTokenSyncOrRemoveInvalid(
     proof: marker.proof,
     securityProof: securityValidation.proof,
     denyByDefaultObservation: validation.denyByDefaultObservation,
+    ...(validatedProxyStartedAt !== undefined ? { proxyStartedAt: validatedProxyStartedAt } : {}),
     status: 0,
   };
 }
@@ -1159,6 +1256,12 @@ async function prepareRuntimeForTokenSyncOrRemoveInvalid(
  * launch's own result -- the proxy's own enforcement, not this probe,
  * protects the agent.
  *
+ * F29: the live-owner check for the warning loop is one bounded listener
+ * observation (`probeHostListeners`) regardless of how many host services
+ * are approved, not one `lsof` call per service; zero approved services
+ * still makes zero calls. `admitHostServicePort` (`host-service add`) and
+ * `runfree status` are unchanged: they keep probing one port at a time.
+ *
  * R15: a project that never used host services must not take the
  * host-global registry lock on every launch, so the write is skipped unless
  * there is something to record or an existing row needs pruning.
@@ -1171,7 +1274,8 @@ async function refreshHostServicesAtLaunch(context: RuntimeContext, io: RuntimeI
     const projectId = projectHash(context.projectRoot);
     if (Object.keys(hostServices).length > 0) {
       const recorded = recordedHostServiceOwners(env, projectId);
-      for (const line of hostServiceOwnerWarnings(context, io, hostServices, recorded)) warn(line);
+      const snapshot = probeHostListeners(context, io);
+      for (const line of hostServiceOwnerWarningsFromSnapshot(snapshot, hostServices, recorded)) warn(line);
     }
     const ports = Array.from(new Set(Object.values(hostServices).map((entry) => entry.port))).sort((left, right) => left - right);
     if (ports.length > 0 || projectHasRegisteredHostServicePorts(env, projectId)) {
@@ -1191,7 +1295,7 @@ export async function startRuntime(
   const verbose = rebuildOptions.verbose === true;
   reportRuntimeStart(removeExisting ? "rebuilding runtime" : "starting runtime");
   const timings = createRuntimeTimings(context.env);
-  const operations = timings.enabled ? createOperationHistogram() : undefined;
+  const operations = timings.enabled ? createOperationHistogram(timings.operation) : undefined;
   if (operations) io = withOperationHistogram(io, operations);
   const containmentIO = io;
   const startupStartedAt = performance.now();
@@ -1548,12 +1652,16 @@ export async function startRuntime(
       if (upgradePlan.action !== "token-sync") return `upgrade-${upgradePlan.action}`;
       if (dependencyPlan.changed || gitLayout.changed) return "inputs-changed";
       const identity = { projectId: activePlan.projectId, composeProject: project };
-      if (listSessionContainerRecordsV2(activePlan.paths.stateDir, identity).length > 0) return "live-sessions";
+      // Enumerated first: the listing quarantines what it cannot read.
+      listSessionContainerRecordsV2(activePlan.paths.stateDir, identity);
       if (listQuarantinedSessionContainerRecordNamesV2(activePlan.paths.stateDir).length > 0) return "quarantined-records";
       if (readControlPlaneRebindTransaction(activePlan.paths.stateDir, identity)) return "pending-rebind";
       return undefined;
     };
-    const warmValidationForLaunch = (): WarmValidation | undefined => {
+    // A warm launch: the stable match, and beside live peers the judgement
+    // that accounted for every one of them (`warm-peer-proof.ts`).
+    type WarmLaunch = Readonly<{ warm: WarmValidation; peer?: WarmPeerValidation }>;
+    const warmValidationForLaunch = (): WarmLaunch | undefined => {
       let reason: string | undefined;
       try {
         reason = warmIneligibility();
@@ -1580,7 +1688,52 @@ export async function startRuntime(
         if (verdict.kind === "unavailable") reportRuntimeVerbose(verbose, `warm-proof unavailable: ${verdict.reason}`);
         return undefined;
       }
-      return verdict.validation;
+      const stable = verdict.validation;
+      const identity = { projectId: activePlan.projectId, composeProject: project };
+      const skipPeers = (reason: string, error?: unknown): undefined => {
+        timings.report("validation:warm-peer", `skipped ${reason}`);
+        if (error !== undefined) {
+          reportRuntimeVerbose(verbose, `warm peer validation skipped: ${error instanceof Error ? error.message : String(error)}`);
+        }
+        return undefined;
+      };
+      let hasPeers: boolean;
+      try {
+        hasPeers = listSessionContainerRecordsV2(activePlan.paths.stateDir, identity).length > 0;
+      } catch (error) {
+        return skipPeers("registry-unreadable", error);
+      }
+      if (!hasPeers) return { warm: stable };
+      // Beside live peers the stable match is extended by an exact account of
+      // every peer and participant; any miss takes the full path.
+      let effective: ReturnType<typeof readEffectiveControlPlaneV2>;
+      try {
+        effective = readEffectiveControlPlaneV2(activePlan.paths.stateDir);
+      } catch (error) {
+        return skipPeers("effective-selection-unreadable", error);
+      }
+      if (!effective) return skipPeers("effective-selection-absent");
+      const effectiveSelection = effective;
+      const peerVerdict = timings.time("validation:warm-peer-check", () => tryWarmPeerValidation({
+        stable,
+        stateDir: activePlan.paths.stateDir,
+        expectedProject: identity,
+        effective: effectiveSelection.selection,
+        effectiveManifest: effectiveSelection.manifest,
+        effectivePolicyGeneration: input.effectivePolicyGeneration,
+        lifecycleLock: heldLifecycleLock,
+        io,
+        docker: adapters.docker,
+        dockerOptions: dockerClientEnvOptions(activeContext),
+        env: activeContext.env,
+        runfreeVersion: activePlan.runfreeVersion,
+      }));
+      timings.report("validation:warm-peer", peerVerdict.kind === "match" ? "match" : `miss:${peerVerdict.reason}`);
+      if (peerVerdict.kind !== "match") {
+        if (peerVerdict.detail) reportRuntimeVerbose(verbose, `warm peer validation missed (${peerVerdict.reason}): ${peerVerdict.detail}`);
+        return undefined;
+      }
+      return { warm: stable, peer: peerVerdict.validation };
     };
     const validateSelectAndSync = async (): Promise<RuntimeStartResult> => {
       runImageCleanupUnlessUnchanged({
@@ -1601,7 +1754,9 @@ export async function startRuntime(
       // the re-judged marker proof, so the control-plane selection below is
       // never asked to prove or select from warm evidence.
       heldLifecycleLock.assertHeld();
-      const warm = warmValidationForLaunch();
+      const warmLaunch = warmValidationForLaunch();
+      const warm = warmLaunch?.warm;
+      const warmPeer = warmLaunch?.peer;
       const dropWarmRecord = (why: string): void => {
         try {
           removeWarmProofRecord(activePlan.paths.stateDir);
@@ -1752,34 +1907,72 @@ export async function startRuntime(
         dropWarmRecord("a session reconcile that did not complete");
         return result(1, false, activeContext);
       }
-      // The record is written only after a reconcile that found nothing to
-      // repair: a record taken earlier could bind a participant the reconcile
-      // was about to remove, and a later launch would match it while that
-      // container still runs. A full validation just proved the runtime and
-      // the selection matches it, so record the warm-proof facts for the next
-      // launch (runfree up and launches alike; never a rebuild). Best effort.
-      if (reconciled && !reconciled.inventoryClean) {
-        dropWarmRecord("a session reconcile that repaired residue");
-      } else if (!warm && !removeExisting && reconciled?.inventoryClean) {
-        const input = warmProofInput();
-        const recorded = input ? recordWarmRuntimeProof(input) : "the warm-proof inputs are unavailable";
-        timings.report("validation:warm-proof", recorded === "written" ? "recorded" : "not-recorded");
-        if (recorded !== "written") reportRuntimeVerbose(verbose, `warm-proof record not written: ${recorded}`);
-      }
-      // A warm proxy that kept its container id can still have restarted in
-      // place, taking its session-file directory and eligibility with it. The
-      // restore re-proves every surviving session and republishes the
-      // eligibility unconditionally, so it runs whenever this project still has
-      // lifecycle records to restore.
-      if (listSessionContainerRecordsV2(activePlan.paths.stateDir, { projectId: activePlan.projectId, composeProject: project }).length) {
-        // The warm path runs only with an empty registry, checked under this
-        // same held lock, and reconcile adds no records; a record here means
-        // that premise broke, so nothing is restored from warm evidence.
-        if (!validation) {
-          warn("a lifecycle record appeared during a warm launch; retry the command to validate the runtime fully");
+      const sessionIdentity = { projectId: activePlan.projectId, composeProject: project };
+      if (warmPeer) {
+        // A warm launch beside live peers skips the restore only while the
+        // judgement's binding still holds after the reconcile. Anything short
+        // of that refuses: nothing is restored from warm evidence, and the
+        // retry, finding no record, validates fully and restores.
+        const refusal = warmPeerRestoreSkipRefusal({
+          validation: warmPeer,
+          reconciled,
+          io,
+          stateDir: activePlan.paths.stateDir,
+          expectedProject: sessionIdentity,
+          proxyId: runtimeProof.proxyId,
+          project: context.project,
+          lifecycleLock: heldLifecycleLock,
+          dockerOptions: dockerClientEnvOptions(activeContext),
+        });
+        if (refusal !== undefined) {
+          timings.report("startup:restore-sessions", `refused ${refusal}`);
+          reportRuntimeVerbose(verbose, `warm launch beside peers refused: ${refusal}`);
+          dropWarmRecord("a warm launch beside peers whose session state changed");
+          warn("the session state changed during a warm launch; retry the command to validate the runtime fully");
           return result(1, false, activeContext);
         }
-        await restoreSameProxySessionAdmission({ plan: activePlan, io, lifecycleLock: heldLifecycleLock, proxyId: runtimeProof.proxyId, validation });
+        timings.report("startup:restore-sessions", "skipped warm-peer");
+      } else {
+        if (reconciled && !reconciled.inventoryClean) dropWarmRecord("a session reconcile that repaired residue");
+        // A warm proxy that kept its container id can still have restarted in
+        // place, taking its session-file directory and eligibility with it. The
+        // restore re-proves every surviving session and republishes the
+        // eligibility unconditionally, so it runs whenever this project still has
+        // lifecycle records to restore.
+        let restoredProxyStartedAt: string | undefined;
+        if (listSessionContainerRecordsV2(activePlan.paths.stateDir, sessionIdentity).length) {
+          // The warm-empty path runs only with an empty registry, checked under
+          // this same held lock, and reconcile adds no records; a record here
+          // means that premise broke, so nothing is restored from warm evidence.
+          if (!validation) {
+            warn("a lifecycle record appeared during a warm launch; retry the command to validate the runtime fully");
+            return result(1, false, activeContext);
+          }
+          const fullValidation = validation;
+          restoredProxyStartedAt = await timings.timeAsync("startup:restore-sessions", () => restoreSameProxySessionAdmission({
+            plan: activePlan, io, lifecycleLock: heldLifecycleLock, proxyId: runtimeProof.proxyId, validation: fullValidation,
+          }));
+        }
+        // The record is written only after a reconcile that found nothing to
+        // repair and after the restore completed: a record taken earlier could
+        // bind a participant the reconcile was about to remove, or a run whose
+        // restore never finished, and a later launch would match it. Its proxy
+        // start must be the one this validation observed and, when a restore
+        // ran, the one that restore published against: a same-id restart in
+        // between records nothing. A full validation just proved the runtime
+        // and the selection matches it, so record the warm-proof facts for the
+        // next launch (runfree up and launches alike; never a rebuild). Best
+        // effort.
+        if (!warm && !removeExisting && reconciled?.inventoryClean && proxyStartedAt !== undefined) {
+          const input = warmProofInput();
+          const recorded = validation?.proxyStartedAt !== proxyStartedAt
+            ? "the proxy restarted during the validation"
+            : restoredProxyStartedAt !== undefined && restoredProxyStartedAt !== proxyStartedAt
+              ? "the proxy restarted between the validation and the restore"
+              : input ? recordWarmRuntimeProof(input, proxyStartedAt) : "the warm-proof inputs are unavailable";
+          timings.report("validation:warm-proof", recorded === "written" ? "recorded" : "not-recorded");
+          if (recorded !== "written") reportRuntimeVerbose(verbose, `warm-proof record not written: ${recorded}`);
+        }
       }
       const proxyRecreated = proxyRecreatedSinceStart(adapters.docker);
       const credentialMode = receiptGatedCredentials && !proxyRecreated ? "receipt-gated" : "source-truth";
@@ -1792,6 +1985,7 @@ export async function startRuntime(
         && rebuildOptions.launch === true && !removeExisting && handoffLock !== undefined
         && proxyStartedAt !== undefined && (reconciled !== undefined || warmEmpty !== undefined)
         ? {
+            lockAcquiredAtMonotonicMs,
             build: () => {
               heldLifecycleLock.assertHeld();
               if (lifecycleLock !== handoffLock) throw new Error("the startup lock was replaced before the handoff");
@@ -2130,7 +2324,78 @@ export async function up(
   return (await startRuntime(context, io, removeExisting, rebuildOptions)).status;
 }
 
-/** Restore admission after an explicitly authorized restart of the same proxy. */
+/**
+ * Why a warm launch beside live peers may not skip
+ * `restoreSameProxySessionAdmission`, or undefined when it may. Runs after the
+ * startup reconcile, under the same held lock: the reconcile must have found
+ * nothing at all to repair, the proxy must still be the incarnation the
+ * judgement saw, there must be no rebind journal and no revoking record, and
+ * the one-shot judgement must still bind every re-read field. Only the last
+ * check consumes it. A lost lock throws.
+ */
+function warmPeerRestoreSkipRefusal(input: Readonly<{
+  validation: WarmPeerValidation;
+  reconciled: SessionReconcileResult | undefined;
+  io: RuntimeIO;
+  stateDir: string;
+  expectedProject: SessionContainerProjectIdentity;
+  proxyId: string;
+  project: RuntimeContext["project"];
+  lifecycleLock: ProjectLifecycleLock;
+  dockerOptions: ReturnType<typeof dockerClientEnvOptions>;
+}>): string | undefined {
+  const { reconciled } = input;
+  if (!reconciled) return "the startup reconcile did not run";
+  if (!reconciled.inventoryClean
+    || reconciled.orphanFilesDeleted.length > 0
+    || reconciled.deadOwnersRevoked.length > 0
+    || reconciled.orphanContainersRemoved.length > 0
+    || reconciled.unknownOwners.length > 0
+    || reconciled.recordsWithoutFiles.length > 0
+    || reconciled.orphanFiles.length > 0
+    || reconciled.quarantinedFiles.length > 0) {
+    return "the startup reconcile found session state to repair";
+  }
+  input.lifecycleLock.assertHeld();
+  let proxyStartedAt: string;
+  try {
+    proxyStartedAt = observeProxyStartedAt(input.io, input.proxyId, input.dockerOptions);
+  } catch (error) {
+    return `the proxy start is unavailable: ${error instanceof Error ? error.message : String(error)}`;
+  }
+  if (proxyStartedAt !== input.validation.proxyStartedAt) return "the proxy restarted since the warm peer judgement";
+  let binding: WarmPeerConsumptionBinding;
+  try {
+    const effective = readEffectiveControlPlaneV2(input.stateDir);
+    const policy = readActiveControlSelection(input.project);
+    if (!effective || !policy) return "the effective selection is unreadable";
+    if (readControlPlaneRebindTransaction(input.stateDir, input.expectedProject)) return "a control-plane rebind is pending";
+    if (listSessionContainerRecordsV2(input.stateDir, input.expectedProject).some((record) => record.state === "revoking")) {
+      return "a session record is revoking";
+    }
+    binding = {
+      lockOwnerToken: input.lifecycleLock.ownerToken,
+      proxyId: effective.selection.proxyContainerId,
+      proxyStartedAt,
+      registryDigest: sessionRegistryDigest(input.stateDir, input.expectedProject),
+      effectivePolicyGeneration: policy.controlGeneration,
+      controlPlaneGenerationDigest: effective.selection.controlPlaneGenerationDigest,
+      controlPlaneMaterializationDigest: effective.selection.controlPlaneMaterializationDigest,
+      admissionContractEpoch: effective.selection.admissionContractEpoch,
+    };
+  } catch (error) {
+    input.lifecycleLock.assertHeld();
+    return `the session state is unreadable: ${error instanceof Error ? error.message : String(error)}`;
+  }
+  input.lifecycleLock.assertHeld();
+  if (!consumeWarmPeerValidation(input.validation, binding)) return "the warm peer judgement no longer binds the runtime";
+  return undefined;
+}
+
+/**
+ * Restore admission after an explicitly authorized restart of the same proxy.
+ * Returns the proxy start its eligibility publication was observed against.
+ */
 export async function restoreSameProxySessionAdmission(input: {
   plan: ActiveRuntimePlan;
   io: RuntimeIO;
@@ -2142,7 +2407,7 @@ export async function restoreSameProxySessionAdmission(input: {
    * the validation runs the ephemeral helpers, which refuse without it.
    */
   containmentIO?: RuntimeIO;
-}): Promise<void> {
+}): Promise<string> {
   const { plan, io, lifecycleLock, proxyId } = input;
   const expectedProject = { projectId: plan.projectId, composeProject: plan.composeProjectName };
   lifecycleLock.assertHeld();
@@ -2231,9 +2496,10 @@ export async function restoreSameProxySessionAdmission(input: {
   const retained = readRetainedDesiredSessionAgentV2(plan.paths.stateDir);
   if (!retained) throw new Error(RETAINED_AGENT_TEMPLATE_REMEDY);
   assertAuthority();
+  const proxyStartedAt = observeProxyStartedAt(io, proxyId, dockerClientEnvOptions(context));
   ensureSessionEligibilityPublished({
     io, proxyId, stateDir: plan.paths.stateDir, effective, desired: retained, records,
-    proxyStartedAt: observeProxyStartedAt(io, proxyId, dockerClientEnvOptions(context)),
+    proxyStartedAt,
     ignorePublicationRecord: true,
     dockerOptions: dockerClientEnvOptions(context),
   });
@@ -2244,7 +2510,7 @@ export async function restoreSameProxySessionAdmission(input: {
     // assuming the loop ran.
     lifecycleLock.assertHeld();
     await waitForSessionAdmissionFirewallSetEmpty(io, proxyId, { assertAuthority: () => lifecycleLock.assertHeld(), dockerOptions: dockerClientEnvOptions(context) });
-    return;
+    return proxyStartedAt;
   }
   if (!("sessionTemplateArtifactSha256" in retained.manifest)) {
     throw new Error(RETAINED_AGENT_TEMPLATE_REMEDY);
@@ -2273,4 +2539,5 @@ export async function restoreSameProxySessionAdmission(input: {
   // eligibility was published above and the per-session heartbeats refill the
   // session files themselves.
   assertAuthority();
+  return proxyStartedAt;
 }

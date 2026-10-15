@@ -131,11 +131,17 @@ describe("proveWarmEmptySessionState", () => {
     expect(EMPTY_SESSION_REGISTRY_DIGEST).toBe(sessionRegistryDigest(stateDir, SESSION_TEST_PROJECT));
   });
 
-  test("blocked session-state evidence blocks with its own reason and no listing", () => {
-    expect(prove({ warm: warm({ kind: "blocked", reason: "session-files-present" }) }))
-      .toEqual({ kind: "blocked", reason: "session-files-present" });
-    expect(psCalls).toHaveLength(0);
-  });
+  // The participant reasons come from `internalNetworkSessionStateBlocker`
+  // (a helper or other non-ingress participant, a session agent); a warm
+  // launch can no longer reach them through a recorded helper, since no record
+  // is written beside one, so they are pinned here.
+  test.each(["session-files-present", "non-ingress-participant", "session-participant"])(
+    "blocked session-state evidence (%s) blocks with its own reason and no listing",
+    (reason) => {
+      expect(prove({ warm: warm({ kind: "blocked", reason }) })).toEqual({ kind: "blocked", reason });
+      expect(psCalls).toHaveLength(0);
+    },
+  );
 
   test("a lifecycle record blocks as a non-empty registry", () => {
     writeSessionContainerRecordV2(stateDir, SESSION_TEST_PROJECT, sessionContainerRecordFixture());

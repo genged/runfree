@@ -39,7 +39,7 @@ export type HostServicePortAdmission =
   | { ok: false; reason: string };
 
 export const LSOF_PATH = "/usr/sbin/lsof";
-const LSOF_TIMEOUT_MS = 5_000;
+export const LSOF_TIMEOUT_MS = 5_000;
 const PID_RE = /^[1-9][0-9]{0,9}$/u;
 const MAX_COMMAND_LENGTH = 256;
 const DOCKER_DESKTOP_COMMAND_PREFIX = "com.docker";
@@ -47,45 +47,62 @@ const DOCKER_DESKTOP_COMMAND_PREFIX = "com.docker";
 type ProbeContext = Pick<RuntimeContext, "env" | "projectRoot">;
 
 // Process names are host data printed to the operator's terminal and stored
-// in the registry: replace anything that is not printable ASCII.
-function printableCommand(raw: string): string {
+// in the registry: replace anything that is not printable ASCII. Shared with
+// the batched listener snapshot (host-listener-snapshot.ts, F29), so the two
+// lsof call shapes sanitize identically.
+export function printableCommand(raw: string): string {
   return raw.slice(0, MAX_COMMAND_LENGTH).replace(/[^\x20-\x7e]/gu, "?");
 }
 
-function parseLsofFields(stdout: string): HostPortOwner {
+export type LsofProcessRecord = { pid: number; command: string; addresses: string[] };
+
+/**
+ * Parses `lsof -Fpcn` field output (`p`id, `c`ommand, `n` listen address per
+ * process) into one record per process. Shared by the single-port probe
+ * below and the batched snapshot (host-listener-snapshot.ts, F29): any
+ * malformed field anywhere in the output fails the whole parse rather than
+ * trusting a partial prefix.
+ */
+export function parseLsofProcessRecords(stdout: string): LsofProcessRecord[] | { reason: string } {
   const processes: Array<{ pid: number; command?: string; addresses: string[] }> = [];
   for (const line of stdout.split("\n")) {
     if (line === "") continue;
     const field = line[0];
     const value = line.slice(1);
     if (field === "p") {
-      if (!PID_RE.test(value)) return { kind: "unavailable", reason: `lsof reported a malformed pid: ${printableCommand(value)}` };
+      if (!PID_RE.test(value)) return { reason: `lsof reported a malformed pid: ${printableCommand(value)}` };
       processes.push({ pid: Number(value), addresses: [] });
     } else if (field === "c") {
       const current = processes.at(-1);
       if (!current || current.command !== undefined || value === "") {
-        return { kind: "unavailable", reason: "lsof reported a process name outside a process record" };
+        return { reason: "lsof reported a process name outside a process record" };
       }
       current.command = printableCommand(value);
     } else if (field === "n") {
       const current = processes.at(-1);
-      if (!current || value === "") return { kind: "unavailable", reason: "lsof reported a listen address outside a process record" };
+      if (!current || value === "") return { reason: "lsof reported a listen address outside a process record" };
       current.addresses.push(printableCommand(value));
     }
     // Other fields (lsof always adds `f` file descriptor records) are ignored.
   }
-  const first = processes[0];
-  if (!first) return { kind: "unavailable", reason: "lsof exited 0 but reported no listening process" };
   if (processes.some((entry) => entry.command === undefined)) {
-    return { kind: "unavailable", reason: "lsof reported a listening process without its name" };
+    return { reason: "lsof reported a listening process without its name" };
   }
+  return processes.map((entry) => ({ pid: entry.pid, command: entry.command as string, addresses: entry.addresses }));
+}
+
+function parseLsofFields(stdout: string): HostPortOwner {
+  const parsed = parseLsofProcessRecords(stdout);
+  if (!Array.isArray(parsed)) return { kind: "unavailable", reason: parsed.reason };
+  const first = parsed[0];
+  if (!first) return { kind: "unavailable", reason: "lsof exited 0 but reported no listening process" };
   return {
     kind: "listener",
-    command: first.command as string,
+    command: first.command,
     pid: first.pid,
-    count: processes.length,
-    commands: processes.map((entry) => entry.command as string),
-    listeners: processes.map((entry) => ({ command: entry.command as string, pid: entry.pid, addresses: entry.addresses })),
+    count: parsed.length,
+    commands: parsed.map((entry) => entry.command),
+    listeners: parsed.map((entry) => ({ command: entry.command, pid: entry.pid, addresses: entry.addresses })),
   };
 }
 
@@ -165,24 +182,23 @@ export function admitHostServicePort(
 }
 
 /**
- * Live re-check (design "Policy shape", Re-check, SR13): every launch and
- * `runfree status` repeat the owner check for each approved host service, so
- * drift since `add` time (a stopped service, a different process, a port a
- * container now publishes) is never silent. `recorded` is the owner command
- * the port registry has on file for this port, if any; a warning fires only
- * when there is a problem, never on a clean match, and the function never
- * throws — an unavailable probe reports its own reason as the problem.
+ * The owner-check warning core, shared by the per-port probe below
+ * (`hostServiceOwnerWarnings`, used by `runtime status` and unchanged by
+ * F29) and the batched-snapshot path (`hostServiceOwnerWarningsFromSnapshot`
+ * in host-listener-snapshot.ts, the launch-time warning loop): both drive
+ * the identical label/classification/comparison logic through an
+ * owner-lookup callback, so the two call shapes can never diverge in the
+ * warning text they produce for the same observed owners.
  */
-export function hostServiceOwnerWarnings(
-  context: ProbeContext,
-  io: RuntimeIO,
+export function hostServiceWarningLines(
   services: HostServicesJson,
   recorded: ReadonlyMap<number, string>,
+  ownerFor: (port: number) => HostPortOwner,
 ): string[] {
   const lines: string[] = [];
   for (const [name, entry] of Object.entries(services).sort(([left], [right]) => left.localeCompare(right))) {
     const label = `host service ${name} (127.0.0.1:${entry.port})`;
-    const owner = probeHostPortOwner(context, io, entry.port);
+    const owner = ownerFor(entry.port);
     if (owner.kind === "none") {
       lines.push(`${label}: no listener`);
     } else if (owner.kind === "unavailable") {
@@ -202,4 +218,27 @@ export function hostServiceOwnerWarnings(
     }
   }
   return lines;
+}
+
+/**
+ * Live re-check (design "Policy shape", Re-check, SR13): `runfree status`
+ * repeats the owner check for each approved host service with one `lsof`
+ * call per service, so drift since `add` time (a stopped service, a
+ * different process, a port a container now publishes) is never silent.
+ * `recorded` is the owner command the port registry has on file for this
+ * port, if any; a warning fires only when there is a problem, never on a
+ * clean match, and the function never throws — an unavailable probe reports
+ * its own reason as the problem.
+ *
+ * The launch-time warning loop uses the batched snapshot instead
+ * (`hostServiceOwnerWarningsFromSnapshot`, host-listener-snapshot.ts, F29):
+ * this per-port probe is kept only for `status`, unchanged by that work.
+ */
+export function hostServiceOwnerWarnings(
+  context: ProbeContext,
+  io: RuntimeIO,
+  services: HostServicesJson,
+  recorded: ReadonlyMap<number, string>,
+): string[] {
+  return hostServiceWarningLines(services, recorded, (port) => probeHostPortOwner(context, io, port));
 }

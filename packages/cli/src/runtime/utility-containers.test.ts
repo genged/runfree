@@ -1,6 +1,7 @@
 import { describe, expect, test } from "vitest";
 
 import {
+  describeInternalNetworkParticipant,
   internalNetworkSessionStateBlocker,
   UTILITY_ROLE_LABEL,
   UTILITY_VERSION_LABEL,
@@ -629,5 +630,40 @@ describe("the session-state blocker", () => {
       [CONTAINER_ROLE_LABEL]: "session-agent",
     });
     expect(internalNetworkSessionStateBlocker([proxy, foreign], proxyId, projectId)).toBe("non-ingress-participant");
+  });
+});
+
+describe("describeInternalNetworkParticipant", () => {
+  test("names an mcp-callback forwarder's purpose, target, and session binding", () => {
+    expect(describeInternalNetworkParticipant(mcpCallbackForwarder(), projectId)).toEqual({
+      kind: "ingress-forwarder",
+      purpose: "mcp-callback",
+      hostPort: "47123",
+      target: SESSION_IP,
+      callbackSessionId: SESSION_ID,
+      callbackSessionContainerId: SESSION_CONTAINER_ID,
+    });
+    // Half a binding is no binding.
+    expect(describeInternalNetworkParticipant(mcpCallbackForwarder({ containerId: null }), projectId))
+      .not.toHaveProperty("callbackSessionId");
+  });
+
+  test("names a vnc forwarder, a session agent, and a helper by their project labels", () => {
+    expect(describeInternalNetworkParticipant(ingressForwarder("vnc", "5901"), projectId)).toEqual({
+      kind: "ingress-forwarder", purpose: "vnc", hostPort: "5901", target: agentName,
+    });
+    expect(describeInternalNetworkParticipant(sessionAgent(), projectId)).toEqual({ kind: "session-agent" });
+    const helper = container(`${project}-helper`, [internalNetwork]);
+    expect(describeInternalNetworkParticipant({
+      ...helper,
+      Config: { ...helper.Config, Labels: { [PROJECT_ID_LABEL]: projectId, [CONTAINER_ROLE_LABEL]: "ephemeral-helper" } },
+    }, projectId)).toEqual({ kind: "ephemeral-helper" });
+  });
+
+  test("another project's roles and unlabelled containers claim nothing", () => {
+    expect(describeInternalNetworkParticipant(sessionAgent(), "ffffffffffff")).toEqual({ kind: "other", role: "session-agent" });
+    expect(describeInternalNetworkParticipant(ingressForwarder("vnc", "5901"), "ffffffffffff"))
+      .toEqual({ kind: "other", role: "ingress-forwarder" });
+    expect(describeInternalNetworkParticipant(container("someone-elses", [internalNetwork]), projectId)).toEqual({ kind: "other" });
   });
 });
