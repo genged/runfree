@@ -69,6 +69,8 @@ describe("IP-literal HTTPS MCP endpoints", () => {
     for (const name of Object.keys(REFUSED)) {
       const entry = byName.get(name);
       expect(entry?.decision.status, name).toBe("unsupported");
+      expect(entry?.decision.reason, name).toBe(IP_LITERAL_REASON.slice("reason=".length));
+      expect(entry?.target, name).toBe("excluded");
       expect(lines.some((line) => line.includes(`server ${name} `) && line.includes(IP_LITERAL_REASON)), name).toBe(true);
     }
     for (const name of Object.keys(ACCEPTED)) {

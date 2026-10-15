@@ -502,29 +502,31 @@ function nativeTransport(server: NativeMcpServer): "http" | "stdio" | undefined 
   return undefined;
 }
 
-function normalizeMcpUrl(url: string, server: NativeMcpServer): { host: string; pathPrefix: string; url: string } | undefined {
+// A deliberate refusal to import an MCP server. The inventory turns it into
+// an `unsupported` decision carrying `refused` as the reason and prints the one
+// warning line for it; `undefined` from a prepare function instead means the
+// entry is deliberately not imported and not a problem to report.
+type McpRefusal = { refused: string };
+
+function isMcpRefusal(value: PreparedMcpServer | McpRefusal | undefined): value is McpRefusal {
+  return value !== undefined && "refused" in value;
+}
+
+function normalizeMcpUrl(url: string): McpRefusal | { host: string; pathPrefix: string; url: string } {
   let parsed: URL;
   try {
     parsed = new URL(url);
   } catch {
-    warn(`mcp: skipped ${server.agent} server ${printable(server.name)} reason=invalid URL`);
-    return undefined;
+    return { refused: "invalid URL" };
   }
-  if (parsed.protocol !== "https:") {
-    warn(`mcp: skipped ${server.agent} server ${printable(server.name)} reason=remote HTTP MCP must use https`);
-    return undefined;
-  }
+  if (parsed.protocol !== "https:") return { refused: "remote HTTP MCP must use https" };
   const bare = parsed.hostname.startsWith("[") ? parsed.hostname.slice(1, -1) : parsed.hostname;
-  if (isIpLiteralHostname(bare)) {
-    warn(`mcp: skipped ${server.agent} server ${printable(server.name)} reason=HTTPS MCP endpoint must be a hostname, not an IP address`);
-    return undefined;
-  }
+  if (isIpLiteralHostname(bare)) return { refused: "HTTPS MCP endpoint must be a hostname, not an IP address" };
   let host: string;
   try {
     host = normalizeHostname(parsed.hostname);
   } catch (error) {
-    warn(`mcp: skipped ${server.agent} server ${printable(server.name)} reason=${printable(error instanceof Error ? error.message : String(error))}`);
-    return undefined;
+    return { refused: error instanceof Error ? error.message : String(error) };
   }
   return {
     host,
@@ -753,11 +755,11 @@ export function mcpLogContextForTest(): { agent?: "claude" | "codex"; verbose?: 
   return mcpLogContext;
 }
 
-function prepareHttpServer(server: NativeMcpServer, options: PrepareServerOptions = {}): PreparedMcpServer | undefined {
+function prepareHttpServer(server: NativeMcpServer, options: PrepareServerOptions = {}): PreparedMcpServer | McpRefusal | undefined {
   if (server.scope === "project" && !options.allowProject) return undefined;
   const url = typeof server.config.url === "string" ? server.config.url : "";
-  const parsed = normalizeMcpUrl(url, server);
-  if (!parsed) return undefined;
+  const parsed = normalizeMcpUrl(url);
+  if ("refused" in parsed) return parsed;
   if (hasOAuthConfig(server)) {
     const oauthPolicy = oauthPolicyFor(server.config, parsed);
     const oauthConfig = sanitizedOauthConfig(server.config.oauth);
@@ -796,8 +798,7 @@ function prepareHttpServer(server: NativeMcpServer, options: PrepareServerOption
     const bearerEnv = typeof server.config.bearer_token_env_var === "string" ? server.config.bearer_token_env_var : undefined;
     if (bearerEnv) {
       if (!ENV_NAME_RE.test(bearerEnv)) {
-        warn(`mcp: skipped codex server ${server.name} reason=invalid bearer token env var`);
-        return undefined;
+        return { refused: "invalid bearer token env var" };
       }
       bindings.push(bindingFor(server.agent, server.name, parsed.host, parsed.pathPrefix, "Authorization", bearerEnv, "bearer"));
     }
@@ -805,8 +806,7 @@ function prepareHttpServer(server: NativeMcpServer, options: PrepareServerOption
     if (envHeaders) {
       for (const [header, envName] of Object.entries(envHeaders)) {
         if (!ENV_NAME_RE.test(envName)) {
-          warn(`mcp: skipped codex server ${server.name} reason=invalid env header source`);
-          return undefined;
+          return { refused: "invalid env header source" };
         }
         bindings.push(bindingFor(server.agent, server.name, parsed.host, parsed.pathPrefix, header, envName, "raw"));
       }
@@ -814,12 +814,10 @@ function prepareHttpServer(server: NativeMcpServer, options: PrepareServerOption
     if (isRecord(server.config.http_headers) && Object.keys(server.config.http_headers).length > 0) {
       const headers = stringRecord(server.config.http_headers);
       if (!headers) {
-        warn(`mcp: skipped codex server ${server.name} reason=invalid static HTTP headers`);
-        return undefined;
+        return { refused: "invalid static HTTP headers" };
       }
       if (server.scope !== "project") {
-        warn(`mcp: skipped codex server ${server.name} reason=literal static HTTP headers require host-owned credential source reconfiguration`);
-        return undefined;
+        return { refused: "literal static HTTP headers require host-owned credential source reconfiguration" };
       }
       for (const [header, value] of Object.entries(headers)) {
         bindings.push(bindingFor(server.agent, server.name, parsed.host, parsed.pathPrefix, header, undefined, literalHeaderScheme(value)));
@@ -827,8 +825,7 @@ function prepareHttpServer(server: NativeMcpServer, options: PrepareServerOption
     }
   } else {
     if (typeof server.config.headersHelper === "string") {
-      warn(`mcp: skipped claude server ${server.name} reason=headersHelper would execute a host command`);
-      return undefined;
+      return { refused: "headersHelper would execute a host command" };
     }
     const headers = stringRecord(server.config.headers);
     if (headers) {
@@ -836,8 +833,7 @@ function prepareHttpServer(server: NativeMcpServer, options: PrepareServerOption
         const reference = headerEnvReference(value);
         if (!reference) {
           if (server.scope !== "project") {
-            warn(`mcp: skipped claude server ${server.name} reason=literal static HTTP headers require host-owned credential source reconfiguration`);
-            return undefined;
+            return { refused: "literal static HTTP headers require host-owned credential source reconfiguration" };
           }
           bindings.push(bindingFor(server.agent, server.name, parsed.host, parsed.pathPrefix, header, undefined, literalHeaderScheme(value)));
           continue;
@@ -880,36 +876,33 @@ function looksLikeHostPath(value: string, projectRoot: string): boolean {
   return false;
 }
 
-function assertContainerLocalStdio(server: NativeMcpServer, projectRoot: string): boolean {
+function containerLocalStdioRefusal(server: NativeMcpServer, projectRoot: string): McpRefusal | undefined {
   const command = typeof server.config.command === "string" ? server.config.command : "";
   if (command.trim() === "" || command.includes("/") || command.includes("\\") || path.isAbsolute(command)) {
-    warn(`mcp: skipped ${server.agent} server ${printable(server.name)} reason=local stdio command must be installed in the container PATH`);
-    return false;
+    return { refused: "local stdio command must be installed in the container PATH" };
   }
   const args = stringArray(server.config.args) ?? [];
   for (const arg of args) {
     if (looksLikeHostPath(arg, projectRoot)) {
-      warn(`mcp: skipped ${server.agent} server ${printable(server.name)} reason=local stdio args contain a host path`);
-      return false;
+      return { refused: "local stdio args contain a host path" };
     }
   }
   const cwd = typeof server.config.cwd === "string" ? server.config.cwd : undefined;
   if (cwd && looksLikeHostPath(cwd, projectRoot)) {
-    warn(`mcp: skipped ${server.agent} server ${printable(server.name)} reason=local stdio cwd is a host path`);
-    return false;
+    return { refused: "local stdio cwd is a host path" };
   }
-  return true;
+  return undefined;
 }
 
-function prepareStdioServer(server: NativeMcpServer, projectRoot: string, options: PrepareServerOptions = {}): PreparedMcpServer | undefined {
+function prepareStdioServer(server: NativeMcpServer, projectRoot: string, options: PrepareServerOptions = {}): PreparedMcpServer | McpRefusal | undefined {
   if (server.scope === "project" && !options.allowProject) return undefined;
-  if (!assertContainerLocalStdio(server, projectRoot)) return undefined;
+  const refusal = containerLocalStdioRefusal(server, projectRoot);
+  if (refusal) return refusal;
   const command = server.config.command as string;
   const args = stringArray(server.config.args);
   const env = stringRecord(server.config.env);
   if (env && Object.keys(env).length > 0) {
-    warn(`mcp: skipped ${server.agent} server ${printable(server.name)} reason=local stdio env would expose host config values to the agent`);
-    return undefined;
+    return { refused: "local stdio env would expose host config values to the agent" };
   }
   const cwd = typeof server.config.cwd === "string" ? server.config.cwd : undefined;
   logMcp(options, { kind: "imported", scope: server.scope, agent: server.agent, name: server.name, detail: "transport=stdio auth=none" });
@@ -942,7 +935,7 @@ function isDesktopBuiltIn(server: NativeMcpServer): boolean {
   return nativeTransport(server) === "stdio" && isCodexDesktopBuiltIn({ agent: server.agent, name: server.name, config: server.config });
 }
 
-function prepareServer(server: NativeMcpServer, projectRoot: string, options: PrepareServerOptions = {}): PreparedMcpServer | undefined {
+function prepareServer(server: NativeMcpServer, projectRoot: string, options: PrepareServerOptions = {}): PreparedMcpServer | McpRefusal | undefined {
   const transport = nativeTransport(server);
   if (transport === "http") return prepareHttpServer(server, options);
   if (transport === "stdio") {
@@ -1274,7 +1267,10 @@ function mcpInventoryRecords(options: { approvalPath?: string; env: NodeJS.Proce
       };
     }
     const desktopBuiltIn = isDesktopBuiltIn(server);
-    const prepared = prepareServer(server, options.projectRoot, { allowProject: true, log: false });
+    const outcome = prepareServer(server, options.projectRoot, { allowProject: true, log: false });
+    const refused = isMcpRefusal(outcome) ? outcome.refused : undefined;
+    if (refused !== undefined) warn(`mcp: skipped ${server.agent} server ${printable(server.name)} reason=${printable(refused)}`);
+    const prepared = isMcpRefusal(outcome) ? undefined : outcome;
     const supported = prepared !== undefined;
     const digest = prepared ? descriptorDigest(options.projectRoot, server, prepared) : undefined;
     const descriptor = prepared ? mcpDescriptor(options.projectRoot, server, prepared) : undefined;
@@ -1286,6 +1282,9 @@ function mcpInventoryRecords(options: { approvalPath?: string; env: NodeJS.Proce
     if (desktopBuiltIn) {
       status = "skipped";
       reason = CODEX_DESKTOP_BUILTIN_REASON;
+    } else if (refused !== undefined) {
+      status = "unsupported";
+      reason = refused;
     } else if (!supported) {
       status = "unsupported";
       reason = "unsupported MCP transport or unsafe MCP configuration";
@@ -1344,7 +1343,7 @@ function mcpInventoryRecords(options: { approvalPath?: string; env: NodeJS.Proce
       server,
       source: server.scope,
       ...(server.sourcePath ? { sourcePath: server.sourcePath } : {}),
-      target: desktopBuiltIn || (server.scope === "project" && status !== "approved") ? "excluded" : "generated",
+      target: desktopBuiltIn || status === "unsupported" || (server.scope === "project" && status !== "approved") ? "excluded" : "generated",
       ...(prepared && prepared.tokenBindings.length > 0 ? { tokenBindings: prepared.tokenBindings } : {}),
       transport,
     };
@@ -1848,7 +1847,8 @@ export function prepareMcpRuntime(options: McpPrepareOptions): McpPrepareResult 
       allowProject: entry.source === "project",
       log: (event) => events.push(event),
     });
-    if (prepared) {
+    // A refusal here was already reported by the inventory pass above.
+    if (prepared && !isMcpRefusal(prepared)) {
       if (entry.descriptorDigest) prepared.descriptorDigest = entry.descriptorDigest;
       servers.push(prepared);
     }
