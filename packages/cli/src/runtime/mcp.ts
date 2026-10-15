@@ -70,6 +70,8 @@ type HeaderTokenBinding = {
   tokenName: string;
 };
 
+type McpTransport = "http" | "http-loopback" | "stdio";
+
 type PreparedMcpServer = {
   agent: McpAgent;
   auth: "public" | "static" | "oauth" | "none";
@@ -84,7 +86,7 @@ type PreparedMcpServer = {
   name: string;
   source: McpSourceScope;
   tokenBindings: HeaderTokenBinding[];
-  transport: "http" | "stdio";
+  transport: McpTransport;
 };
 
 // `skipped`: a Codex Desktop built-in that Runfree deliberately ignores (see
@@ -120,7 +122,7 @@ export type McpInventoryEntry = {
     env?: string;
     tokenName: string;
   }>;
-  transport: "http" | "stdio" | "unknown";
+  transport: McpTransport | "unknown";
 };
 
 export type McpInventory = {
@@ -142,7 +144,7 @@ export type McpApprovalRecord = {
   server: string;
   source: "project";
   summary: string;
-  transport: PreparedMcpServer["transport"];
+  transport: McpTransport;
 };
 
 export type McpApprovalFile = {
@@ -981,7 +983,7 @@ function isMcpApprovalRecord(value: unknown): value is McpApprovalRecord {
     && typeof value.server === "string"
     && typeof value.summary === "string"
     && (value.auth === "public" || value.auth === "static" || value.auth === "oauth" || value.auth === "none")
-    && (value.transport === "http" || value.transport === "stdio");
+    && (value.transport === "http" || value.transport === "http-loopback" || value.transport === "stdio");
 }
 
 export function readMcpApprovals(projectRoot: string, filePath?: string): McpApprovalFile {
@@ -1500,6 +1502,7 @@ function writeCodexRuntimeConfig(codexDir: string, servers: PreparedMcpServer[])
   // a login listens on an unforwarded ephemeral port and fails closed. No
   // `mcp_oauth_callback_url` either: the pinned Codex advertises that URL's
   // port while it listens on the override.
+  // A loopback server has auth "none", so it never asks for a callback.
   const hasCodexCallback = codexServers.some(
     (server) => (server.auth === "oauth" || server.auth === "public") && typeof server.codexConfig?.url === "string",
   );
@@ -1582,10 +1585,9 @@ function applyTokenBinding(policy: PolicyJson, tokenConfig: TokenSourceConfig, b
 
 function applyPolicyAndTokens(policy: PolicyJson, tokenConfig: TokenSourceConfig, servers: PreparedMcpServer[]): void {
   for (const server of servers) {
-    if (server.transport === "http" && (server.claudeConfig || server.codexConfig)) {
-      const url = (server.claudeConfig?.url ?? server.codexConfig?.url) as string | undefined;
-      if (url) ensureDomain(policy, new URL(url).hostname.toLowerCase());
-    }
+    // Only the prepared endpoint names an egress host. A generated config URL
+    // (a loopback server's `http://127.0.0.1:<port>`) never reaches the policy.
+    if (server.endpoint) ensureDomain(policy, server.endpoint.host);
     if (server.oauthPolicy?.oauth?.authServerMetadataUrl) {
       ensureDomain(policy, new URL(server.oauthPolicy.oauth.authServerMetadataUrl).hostname.toLowerCase());
     }
@@ -1597,6 +1599,8 @@ function applyPolicyAndTokens(policy: PolicyJson, tokenConfig: TokenSourceConfig
     }
   }
 }
+
+export const applyPolicyAndTokensForTest = applyPolicyAndTokens;
 
 export function mcpOAuthProviderId(agent: McpAgent, serverName: string): string {
   const key = `${agent}-${serverName}`.toLowerCase().replace(/[^a-z0-9_-]+/g, "-");
@@ -1655,6 +1659,7 @@ export function mcpOperationPolicyJson(
 ): McpOperationPolicyJson {
   const operationServers: McpOperationServerPolicyJson[] = [];
   for (const server of servers) {
+    // A loopback server is not proxy-mediated: no endpoint, no operation policy.
     if (server.transport !== "http" || !server.endpoint) continue;
     const id = mcpOperationServerId(server);
     const rule = rules[id];
