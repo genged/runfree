@@ -12,6 +12,7 @@ import {
   assertAllowedWebSocketRequest as authorizeWebSocketRequest,
   type CredentialPolicy,
   beforeAllowedRequest as authorizeRequest,
+  classifyWrite,
   configuredCredentialHeaderNames,
   GIT_REQUEST_KIND_PROTOCOL,
   gitHttpRequestKind,
@@ -914,6 +915,31 @@ describe("proxy policy", () => {
       // `api` only as the first segment; a `-` only as a whole segment.
       expect(gitHttpRequestKind("POST", new URL("https://github.com/owner/api/git-upload-pack"))).toBe("upload-pack");
       expect(gitHttpRequestKind("POST", new URL("https://github.com/my-org/re-po/git-upload-pack"))).toBe("upload-pack");
+    });
+
+    // An origin that trims whitespace may route ` api` to its API. Leading
+    // whitespace in any segment is refused, and a first segment that trims
+    // (whitespace and dots, both ends) to `api` is excluded with `api`.
+    test("F6: a whitespace- or dot-padded `api` first segment, or any leading-whitespace segment, is not a git request", () => {
+      for (const [method, url] of [
+        ["POST", "https://gitlab.com/%20api/v4/projects/1/repository/files/git-upload-pack"],
+        ["POST", "https://gitlab.com/%09api/v4/projects/1/repository/files/git-upload-pack"],
+        ["POST", "https://gitlab.com/ api/v4/projects/1/repository/files/git-upload-pack"],
+        ["POST", "https://gitlab.com/%2520api/v4/projects/1/repository/files/git-upload-pack"],
+        ["POST", "https://gitlab.com/%0Aapi/v4/projects/1/repository/files/git-upload-pack"],
+        ["POST", "https://gitlab.com/.api/v4/projects/1/repository/files/git-upload-pack"],
+        ["POST", "https://gitlab.com/api%20/v4/projects/1/repository/files/git-upload-pack"],
+        ["POST", "https://gitlab.com/owner/%20repo/git-upload-pack"],
+        ["POST", "https://gitlab.com/%20api/repo.git/info/lfs/objects/batch"],
+        ["GET", "https://gitlab.com/%20api/repo.git/info/refs?service=git-upload-pack"],
+      ] as const) {
+        expect(gitHttpRequestKind(method, new URL(url)), `${method} ${url}`).toBeUndefined();
+      }
+      const rule = { gitPush: "deny" as const };
+      expect(classifyWrite({ method: "POST", url: new URL("https://gitlab.com/%20api/v4/projects/1/repository/files/git-upload-pack"), rule }))
+        .toEqual({ write: true, category: "method" });
+      // A dot-led repository segment is still a git request.
+      expect(gitHttpRequestKind("POST", new URL("https://github.com/owner/.github/git-upload-pack"))).toBe("upload-pack");
     });
 
     test("T4: gist.github.com carries no github.com mapping, so a git request there passes untouched", () => {

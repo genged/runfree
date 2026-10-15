@@ -631,10 +631,15 @@ export function gitHttpRequestKind(method: string, url: URL): GitHttpRequestKind
   if (hasPathConfusion(pathName)) return undefined;
   const decoded = decodeToConvergence(pathName);
   if (decoded === undefined || decoded.includes("\0")) return undefined;
+  // A segment with leading whitespace is refused outright: canonical
+  // segments trim only trailing whitespace, and an origin that trims both
+  // ends may route ` api` (or ` repo`) differently than this matcher reads it.
+  if (decoded.split("/").some((segment) => /^\s/u.test(segment))) return undefined;
   const canonical = segmentsFromDecodedPath(decoded);
   // No endpoint suffix contains `api` first or a `-` segment, so this is
-  // the same as checking the segments before the suffix.
-  if (canonical[0] === "api" || canonical.includes("-")) return undefined;
+  // the same as checking the segments before the suffix. The first segment
+  // is trimmed of dots and whitespace at both ends, so `.api` is `api` too.
+  if (canonical[0]?.replace(/^[.\s]+/u, "") === "api" || canonical.includes("-")) return undefined;
   const rawSegments = pathName.split("/");
   for (const endpoint of GIT_HTTP_ENDPOINTS) {
     if (endpoint.method !== method) continue;
