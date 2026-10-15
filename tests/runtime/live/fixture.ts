@@ -557,6 +557,23 @@ function runOrThrow(fixture: LiveFixture, args: readonly string[]): void {
 }
 
 /**
+ * The minimum a project needs before `startStandingSession` can hold a session:
+ * the `agent-claude` operational service (built-in launches refuse without it;
+ * it is `credential: none`) and the recorder/long-lived Claude stand-in in the
+ * project image. Runs before the first `up`, like any `configure` step.
+ *
+ * Split out of `configureSandboxProject` for tranches whose policy must not
+ * carry the sandbox's seeded hosts and credential, such as a tranche that
+ * enables a service owning one of those destinations.
+ */
+export function configureStandingSessionImage(fixture: LiveFixture): void {
+  runOrThrow(fixture, ["service", "enable", "agent-claude", "--no-reload"]);
+  const imageDir = path.join(fixture.projectRoot, ".runfree", "image");
+  fs.writeFileSync(path.join(imageDir, MANAGED_CLAUDE_REAL_FILENAME), MANAGED_CLAUDE_REAL_SCRIPT, { mode: 0o755 });
+  fs.appendFileSync(path.join(imageDir, "Dockerfile"), MANAGED_IMAGE_DOCKERFILE_STANZA);
+}
+
+/**
  * Reproduces sandbox.sh's project preamble on a `provisionLiveFixture` project.
  *
  * Runs after `provisionLiveFixture`'s own `git init -b main` + package.json
@@ -583,9 +600,9 @@ export function configureSandboxProject(fixture: LiveFixture): void {
     "--header", "Authorization", "--scheme", "bearer",
     "--from-env", STRIP_TOKEN_ENV, "--no-reload",
   ]);
-  // Built-in launches refuse to start until their operational service is
-  // enabled; both are `credential: none`, so this binds no token source.
-  runOrThrow(fixture, ["service", "enable", "agent-claude", "--no-reload"]);
+  // The held-session image and its built-in launch service; agent-codex is
+  // `credential: none` too, so neither binds a token source.
+  configureStandingSessionImage(fixture);
   runOrThrow(fixture, ["service", "enable", "agent-codex", "--no-reload"]);
 
   fs.writeFileSync(path.join(projectRoot, ".mcp.json"), HOST_MCP_JSON);
@@ -594,10 +611,6 @@ export function configureSandboxProject(fixture: LiveFixture): void {
   // The legacy nested-image inbox mountpoint; startup must remove it safely
   // before creating the replacement `/runfree/inbox` mount.
   fs.mkdirSync(path.join(projectRoot, ".runfree-images"), { recursive: true });
-
-  const imageDir = path.join(projectRoot, ".runfree", "image");
-  fs.writeFileSync(path.join(imageDir, MANAGED_CLAUDE_REAL_FILENAME), MANAGED_CLAUDE_REAL_SCRIPT, { mode: 0o755 });
-  fs.appendFileSync(path.join(imageDir, "Dockerfile"), MANAGED_IMAGE_DOCKERFILE_STANZA);
 
   // Branch history for the MCP branch-checkout proof: `main` carries the host
   // sentinel, `mcp-update` a different one, `no-mcp` none at all.
