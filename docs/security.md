@@ -114,6 +114,7 @@ effective policy, the proxy CA private key, and host files outside the project.
 | CONNECTs to an unapproved `<name>.runfree.internal:<port>` | raw 403, no dial | proxy name and port pair check |
 | Dials the host gateway IP directly | no route | `agent_internal` has no egress; uid 1001-only firewall rule |
 | POSTs to an allowed host under `ask` | held for a host decision | write approval |
+| `git push` to `github.com` or `gitlab.com` with the service's token stored | held under `ask`; once approved, it **succeeds with your token** | write approval; `--deny-git-push` |
 | Uses an allowed token for a wrong purpose | **allowed** | token scope and request rules only |
 | Runs arbitrary code in the project | **allowed** | bounded by mounts and proxy |
 | Writes a fake Claude registry entry or Codex rollout file | labeled, non-default row in its own project's resume picker | sanitized display; never the default cursor or the one question; a resume still goes through normal admission |
@@ -165,13 +166,19 @@ Order, hardening, and firewall rules:
 2. The proxy never reads the project file. It reads an immutable effective
    generation from a read-only XDG mount.
 3. Unknown fields, duplicate keys, oversize input, unsafe paths, and any
-   authority growth without exact approval fail closed.
+   authority growth without exact approval fail closed. The CLI and the proxy
+   refuse unknown keys in every object of both desired and effective policy;
+   only maps keyed by name (hosts, tokens) take arbitrary keys.
 4. A mutation that runs beside live sessions approves the exact candidate it
    re-read under the lock, never a fresh read of the file.
    See [Desired-Policy Mutation](architecture.md#desired-policy-mutation-beside-live-sessions).
 5. Invalid or incomplete generations keep the previous effective policy.
 6. The project `.runfree/config/agent.env` is ignored. The agent environment
    comes from the selected effective policy generation.
+7. A policy an older reader would misread never reaches one. Desired policy
+   is version 3 only when it uses a field older releases do not know (see
+   [Older Readers](#older-readers)); those releases refuse it. A CLI applies
+   policy only to a proxy built from its own embedded assets.
 
 ### Credentials
 
@@ -218,6 +225,119 @@ agent sees: placeholder or runfree_oauth_* handle only
    stays as it was, and the launch's fallback source-truth sync writes the
    token again from the value read before the lock.
 5. The proxy CA private key is mounted only into the proxy.
+
+### Git Over HTTPS
+
+The `github` service (revision 3) and the `gitlab` service (revision 2) add a
+`protocol: "git-http"` Basic destination on `github.com` and `gitlab.com`.
+Commands and the supported remote forms are in
+[Git over HTTPS and SSH remotes](cli.md#git-over-https-and-ssh-remotes).
+
+1. **Token reach grows.** The `github` token was injected on
+   `api.github.com` and `raw.githubusercontent.com`; the `gitlab` token on
+   `gitlab.com/api/`. Both now also reach git smart-HTTP and Git LFS on every
+   repository the token can access. Use a fine-grained token limited to the
+   repositories the agent needs. The `protocol` scope limits which requests
+   carry the token, not which repositories: `api.github.com` still carries the
+   `github` token on every path.
+2. **An approved push succeeds.** Before, a push from the sandbox had no
+   credential and failed at the provider. Now a push that write approval
+   allows goes out with your token, so approving a git push is a real
+   decision. Write approval is the effective control. The default write
+   posture is `ask`; `--deny-git-push` refuses pushes before any connection
+   or token read.
+3. **The credential is attached only to recognized git requests.** The
+   request must be one of the listed method and path forms, with no path
+   confusion; the raw path and its decoded form must both end with the plain
+   endpoint, and the decoded path must hold no NUL. Ref discovery needs
+   exactly one `service` query parameter, spelled literally. Anything else on
+   the host gets no credential, and its write classification is unchanged.
+4. **Agent `Authorization` is removed on `github.com`.** Before, `github.com`
+   had no credential destination, so an agent-supplied `Authorization` went
+   upstream. Now it is stripped on every `github.com` path and replaced on git
+   requests, as on every host with a credential destination. One exception,
+   shared with every such host: a value shaped like a Runfree OAuth handle is
+   kept for the OAuth mediator. A `Bearer runfree_oauth_…` value must then be
+   a live handle of this project for this resource, or the request is refused
+   before any connection. A `Basic` value whose password has the handle shape
+   is forwarded unchanged on any path, and no token is injected for that
+   request. The stored token is never exposed this way; the agent can only
+   send its own value.
+5. **Git LFS download batches are reads.** The batch endpoint takes `POST`
+   for both download and upload. On a host with a git handling rule
+   (`gitPush`), under `ask` or `deny`, a batch request is a read only when the
+   proxy proves its body is a download:
+   - exactly `POST` on a recognized `…/info/lfs/objects/batch` path;
+   - one `Content-Type` of `application/vnd.git-lfs+json` (a `charset`, if
+     present, must be UTF-8), no content encoding other than identity, and
+     one `Content-Length` of at most 64 KiB that equals the body length;
+   - a body that decodes as strict UTF-8 with no byte order mark and parses
+     as JSON with no duplicate key at any depth;
+   - a top-level object with exactly one key that folds to `operation`,
+     spelled `operation`, whose value is `"download"`.
+
+   Anything else is a write: an upload, a malformed or oversized body, a
+   second `Operation`-like key, a missing length, and every lock request. A
+   held request is re-checked without its body, so it stays a write.
+6. **Object transfer credentials reach the agent.** A batch response gives
+   per-object action URLs and may give headers with short-lived,
+   object-scoped credentials issued by the provider. They pass to the agent
+   unchanged. They are not the stored token. The transfer itself goes to the
+   action host and follows that host's policy; on a host with an
+   `Authorization` destination, an agent-sent `Authorization` is stripped
+   there like any other.
+7. **GitLab forwards anonymously without a token.** The `gitlab` token now
+   allows anonymous forwarding, as `github` already did. With no token stored,
+   `gitlab.com` requests go out with `Authorization` stripped, so public
+   clones work. This is per token: `/api/` requests with no token also go out
+   anonymously instead of being refused, and GitLab answers private calls
+   with 401.
+8. **Redirects are not followed.** The proxy passes a redirect response to
+   the agent unchanged. Git follows it as a new proxied request, which gets
+   the credentials of the new host's policy, if any. The injected value never
+   reaches the agent, so the agent cannot carry it to another host.
+
+The SSH-to-HTTPS rewrite in the sandbox Git config is routing, not
+enforcement. The agent can remove it; SSH still has no route out.
+
+### Older Readers
+
+A newer policy can meet an older reader: a teammate's older CLI reading the
+committed `.runfree/network-policy.json`, a downgraded CLI, or, after an
+upgrade, a proxy still running the previous build.
+
+- Desired policy becomes version 3 only when it uses `basic`, `username`,
+  `protocol`, or two destinations for one host and header. Runfree releases
+  without version 3 refuse such a file with `version must be 2`, so they
+  cannot drop a `protocol` scope and inject on the whole host. A file without
+  those fields stays version 2, with an unchanged digest.
+- An effective policy generation is published only to a proxy of the same
+  build. Before it publishes and selects an effective policy generation, a
+  policy command (`host`, `host-service`, `credential`, `service`, `mcp`, and
+  `policy use-approved`) compares the running proxy's image-input label with
+  the proxy this CLI embeds. A
+  missing label counts as another build. On a mismatch:
+  - if the runtime can be replaced compatibly, the command prints that
+    running sessions lose network access for up to one heartbeat (30 s) plus
+    adoption, replaces the proxy as `runfree up` does, then applies the
+    change; a failed replacement stops with the change saved but not applied;
+  - if active sessions use an incompatible admission epoch or control-plane
+    topology, the change is saved and reported as not applied, with the
+    remedy: wait for the sessions to end, then `runfree policy use-approved`,
+    or `runfree rebuild` now;
+  - a session launch beside live sessions never replaces the proxy; it
+    reports the change as waiting and names `runfree up`, then
+    `runfree policy use-approved`.
+
+  If a proxy of another build appears while the effective policy generation is published, the
+  previous selection is restored and the command fails, asking for a retry.
+- Runtime startup does not use this check. A normal start beside live
+  sessions joins their effective policy generation and publishes nothing,
+  but a start that publishes approved policy beside live sessions can let a
+  proxy from an older release read the new effective policy generation. Such
+  a proxy refuses an effective policy generation that uses the new fields,
+  because the digest it recomputes does not match the published manifest, and it keeps its last
+  valid policy. The cost is availability, not authority.
 
 ### Sessions
 
@@ -445,6 +565,13 @@ Details: [Write Approval Grants](architecture.md#write-approval-grants).
   unit tests only.
 - **Audit set emptiness** in enforce mode is checked only by the proxy's own
   firewall supervisor. The host proof checks set shape, not members.
+- **Git provider behavior** is proven only by a gated live tranche that needs
+  provider credentials and is not part of `make test-runtime` (see
+  [testing.md](testing.md)). That GitHub accepts the token as the Basic
+  password with username `x-access-token`, and GitLab with `oauth2`, is
+  proven only for the token types that run uses.
+- **Older readers** are proven against the frozen policy readers of v0.5.2
+  only, replayed as source in a unit test, not by running an old binary.
 - **The release pipeline** runs the Test workflow's checks (static, unit,
   templates, packaged offline E2E), not the live runtime suite. `make test-runtime` needs a
   Docker host and runs by hand. A release has proven it only if its
@@ -482,6 +609,10 @@ Accepted, known risks:
 | Allowed hosts can be misused within their token scope | Runfree checks host, method, and path, not intent. Use narrow tokens first |
 | A permitted GET can carry data out in its query | Shape rules limit which requests pass, not their content |
 | `gitPush: "deny"` blocks only the git push endpoint | Pushes can still go through the provider's REST/GraphQL API; add method rules there |
+| The `github` and `gitlab` tokens reach git on every repository they can access | `protocol: "git-http"` limits which requests carry them, not which repositories; use fine-grained tokens and keep pushes under `ask` |
+| An agent `Basic` value whose password looks like a Runfree OAuth handle passes the `Authorization` strip | It is the agent's own value, and no token is injected for that request; the stored token is not exposed |
+| Git LFS action credentials reach the agent | They are issued by the provider, short-lived, and scoped to one object; they are not the stored token |
+| A user-defined git host has no git handling rule | Fetches and LFS batches there are writes and wait under `ask`; a push is a plain write, not a git push |
 | The agent can read and change the whole project, including `.git` | The project mount is read-write by design |
 | Native Claude, Codex, and Pi login state is readable by agent code | Agents need it to log in; it is per project |
 | Credentialless operational services (`agent-claude`, `agent-codex`) are open to any process in the agent | The user confirms them at launch; they carry no proxy credential |
