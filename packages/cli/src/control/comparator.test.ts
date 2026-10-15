@@ -167,6 +167,52 @@ describe("compareCompiledAuthority", () => {
     expect(compareCompiledAuthority(scopedBasic, scopedBearer)).toEqual({ provenReduction: false, reasons: widening });
   });
 
+  // A git-lfs mapping also opts its host into the LFS download read
+  // exemption, so scoping a mapping to git-lfs weakens write classification
+  // even though it narrows where the credential goes. Switching between the
+  // two protocols moves the credential to a disjoint request set.
+  test("scoping a mapping to git-lfs, or switching git-http and git-lfs, is not a reduction", () => {
+    const withCredential = (credential: Record<string, string>) => compiled({
+      hosts: ["git.example.com"],
+      tokens: {
+        git: {
+          description: "Git token",
+          credentials: [{ host: "git.example.com", header: "Authorization", scheme: "basic", username: "u", ...credential } as never],
+        },
+      },
+    });
+    const unscoped = withCredential({});
+    const http = withCredential({ protocol: "git-http" });
+    const lfs = withCredential({ protocol: "git-lfs" });
+    const changed = ["git.example.com: credential mapping added or widened for git"];
+    expect(compareCompiledAuthority(unscoped, lfs)).toEqual({ provenReduction: false, reasons: changed });
+    expect(compareCompiledAuthority(http, lfs)).toEqual({ provenReduction: false, reasons: changed });
+    expect(compareCompiledAuthority(lfs, http)).toEqual({ provenReduction: false, reasons: changed });
+    expect(compareCompiledAuthority(unscoped, http)).toEqual({ provenReduction: true, reasons: [] });
+    expect(compareCompiledAuthority(lfs, lfs)).toEqual({ provenReduction: true, reasons: [] });
+    // Removing the host's only mapping (git-lfs included) is a reduction.
+    expect(compareCompiledAuthority(lfs, compiled({ hosts: ["git.example.com"], tokens: {} })).provenReduction).toBe(true);
+  });
+
+  test("adding a git-lfs mapping beside a git-http one, or removing it, needs approval", () => {
+    const policy = (protocols: string[]) => compiled({
+      hosts: ["github.com"],
+      tokens: {
+        github: {
+          description: "GitHub token",
+          credentials: protocols.map((protocol) => ({
+            host: "github.com", header: "Authorization", scheme: "basic", username: "x-access-token", protocol,
+          }) as never),
+        },
+      },
+    });
+    expect(compareCompiledAuthority(policy(["git-http"]), policy(["git-http", "git-lfs"])).provenReduction).toBe(false);
+    expect(compareCompiledAuthority(policy(["git-http", "git-lfs"]), policy(["git-http"]))).toEqual({
+      provenReduction: false,
+      reasons: ["github.com: credential mapping changed on a host with more than one mapping"],
+    });
+  });
+
   // Credential selection is host-wide (protocol tier, then longest
   // pathPrefix), so on a host with several mappings a change to one mapping
   // can make the proxy pick another token's mapping for a request that used

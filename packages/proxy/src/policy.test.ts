@@ -13,6 +13,7 @@ import {
   type CredentialPolicy,
   beforeAllowedRequest as authorizeRequest,
   configuredCredentialHeaderNames,
+  GIT_REQUEST_KIND_PROTOCOL,
   gitHttpRequestKind,
   hostFromUrl,
   loadProxyPolicy,
@@ -680,7 +681,7 @@ describe("proxy policy", () => {
     expect(logs).toEqual(["proxy: injected Authorization for github.com using github"]);
   });
 
-  describe("git-http protocol-scoped credentials (T4, T5, T12)", () => {
+  describe("git-http and git-lfs protocol-scoped credentials (T4, T5, T12)", () => {
     const GITHUB_BASIC = {
       tokenName: "github",
       tokenDescription: "GitHub token",
@@ -690,22 +691,24 @@ describe("proxy policy", () => {
       username: "x-access-token",
       protocol: "git-http",
     } as const;
+    const GITHUB_LFS_BASIC = { ...GITHUB_BASIC, protocol: "git-lfs" } as const;
     const GITHUB_BASIC_VALUE = `Basic ${Buffer.from("x-access-token:real-token").toString("base64")}`;
 
-    function githubRequest(method: string, url: string) {
+    function githubRequest(method: string, url: string, mappings: CredentialPolicy[string] = [GITHUB_BASIC, GITHUB_LFS_BASIC]) {
       const tokenReader = vi.fn(() => "real-token");
+      const logs: string[] = [];
       const result = testBeforeAllowedRequest({
         method,
         url,
         headers: { Authorization: "Basic YWdlbnQ6cGxhY2Vob2xkZXI=", accept: "*/*" },
       }, {
         allowedHosts: ["github.com", "gist.github.com"],
-        credentials: { "github.com": [GITHUB_BASIC] },
+        credentials: { "github.com": mappings },
         writeApproval: "allow",
         tokenReader,
-        log: () => {},
+        log: (line) => logs.push(line),
       });
-      return { result, tokenReader };
+      return { result, tokenReader, logs };
     }
 
     // Every §4.2 row, with and without `.git`, and with a nested group.
@@ -722,15 +725,60 @@ describe("proxy policy", () => {
       { method: "POST", tail: "info/lfs/locks/123_abc-x.y/unlock", kind: "lfs-locks" },
     ];
     const REPOS = ["/owner/repo.git", "/owner/repo", "/group/sub/repo.git"];
+    const PROTOCOL_OF_KIND: Readonly<Record<string, "git-http" | "git-lfs">> = {
+      refs: "git-http",
+      "upload-pack": "git-http",
+      "receive-pack": "git-http",
+      "lfs-batch": "git-lfs",
+      "lfs-locks": "git-lfs",
+    };
 
-    test("T4: the git-http credential is attached for every §4.2 row in .git and non-.git forms", () => {
+    // The two protocols must recognize disjoint request sets: every git
+    // request kind belongs to exactly one protocol, smart-HTTP kinds to
+    // git-http and the LFS API kinds to git-lfs.
+    test("every git request kind maps to exactly one protocol, and the two request sets are disjoint", () => {
+      expect(GIT_REQUEST_KIND_PROTOCOL).toEqual(PROTOCOL_OF_KIND);
+      const byProtocol = new Map<string, Set<string>>();
+      for (const row of ELIGIBLE) {
+        const protocol = GIT_REQUEST_KIND_PROTOCOL[row.kind as keyof typeof GIT_REQUEST_KIND_PROTOCOL];
+        const set = byProtocol.get(protocol) ?? new Set<string>();
+        set.add(`${row.method} ${row.tail}`);
+        byProtocol.set(protocol, set);
+      }
+      const http = byProtocol.get("git-http") ?? new Set();
+      const lfs = byProtocol.get("git-lfs") ?? new Set();
+      expect(http.size).toBeGreaterThan(0);
+      expect(lfs.size).toBeGreaterThan(0);
+      expect([...http].filter((row) => lfs.has(row))).toEqual([]);
+      for (const row of lfs) expect(row, row).toMatch(/^(GET|POST) info\/lfs\//u);
+      for (const row of http) expect(row, row).not.toMatch(/info\/lfs/u);
+    });
+
+    test("a git-http mapping alone covers only smart-HTTP rows, and a git-lfs mapping alone only LFS rows", () => {
+      for (const row of ELIGIBLE) {
+        const url = `https://github.com/owner/repo.git/${row.tail}`;
+        const protocol = PROTOCOL_OF_KIND[row.kind];
+        for (const mapping of [GITHUB_BASIC, GITHUB_LFS_BASIC]) {
+          const { result, tokenReader } = githubRequest(row.method, url, [mapping]);
+          const injected = mapping.protocol === protocol;
+          expect(result, `${mapping.protocol} ${row.method} ${url}`).toEqual({
+            headers: injected ? { accept: "*/*", authorization: GITHUB_BASIC_VALUE } : { accept: "*/*" },
+          });
+          expect(tokenReader.mock.calls.length, `${mapping.protocol} ${row.method} ${url}`).toBe(injected ? 1 : 0);
+        }
+      }
+    });
+
+    test("T4: the git-http or git-lfs credential is attached for every §4.2 row in .git and non-.git forms", () => {
       for (const repo of REPOS) {
         for (const row of ELIGIBLE) {
           const url = `https://github.com${repo}/${row.tail}`;
           expect(gitHttpRequestKind(row.method, new URL(url)), `${row.method} ${url}`).toBe(row.kind);
-          const { result, tokenReader } = githubRequest(row.method, url);
+          const { result, tokenReader, logs } = githubRequest(row.method, url);
           expect(result, `${row.method} ${url}`).toEqual({ headers: { accept: "*/*", authorization: GITHUB_BASIC_VALUE } });
+          expect(tokenReader).toHaveBeenCalledTimes(1);
           expect(tokenReader).toHaveBeenCalledWith("github");
+          expect(logs.filter((line) => line.includes("inject")), `${row.method} ${url}`).toHaveLength(1);
         }
       }
     });
@@ -896,7 +944,7 @@ describe("proxy policy", () => {
       ],
     };
 
-    test("T5: gitlab /api/v4 gets Bearer, git requests get Basic oauth2:, and /api, /-/ and repo web paths get nothing", () => {
+    test("T5: gitlab /api/v4 gets Bearer, smart-HTTP requests get Basic oauth2:, and LFS, /api, /-/ and repo web paths get nothing", () => {
       const tokenReader = vi.fn(() => "real-token");
       const request = (method: string, url: string) => testBeforeAllowedRequest({
         method,
@@ -914,20 +962,22 @@ describe("proxy policy", () => {
         ["GET", "https://gitlab.com/group/sub/repo/info/refs?service=git-receive-pack"],
         ["POST", "https://gitlab.com/group/repo.git/git-upload-pack"],
         ["POST", "https://gitlab.com/group/repo.git/git-receive-pack"],
-        ["POST", "https://gitlab.com/group/repo.git/info/lfs/objects/batch"],
-        ["POST", "https://gitlab.com/group/repo.git/info/lfs/locks/verify"],
       ] as const) {
         expect(request(method, url), `${method} ${url}`).toEqual({ headers: { accept: "*/*", authorization: basic } });
       }
       tokenReader.mockClear();
-      for (const url of [
-        "https://gitlab.com/api",
-        "https://gitlab.com/-/profile",
-        "https://gitlab.com/-/user_settings/personal_access_tokens",
-        "https://gitlab.com/group/repo",
-        "https://gitlab.com/group/repo/-/merge_requests",
-      ]) {
-        expect(request("GET", url), url).toEqual({ headers: { accept: "*/*" } });
+      for (const [method, url] of [
+        ["GET", "https://gitlab.com/api"],
+        ["GET", "https://gitlab.com/-/profile"],
+        ["GET", "https://gitlab.com/-/user_settings/personal_access_tokens"],
+        ["GET", "https://gitlab.com/group/repo"],
+        ["GET", "https://gitlab.com/group/repo/-/merge_requests"],
+        // gitlab.com has no git-lfs mapping: LFS is not mediated there.
+        ["POST", "https://gitlab.com/group/repo.git/info/lfs/objects/batch"],
+        ["GET", "https://gitlab.com/group/repo.git/info/lfs/locks"],
+        ["POST", "https://gitlab.com/group/repo.git/info/lfs/locks/verify"],
+      ] as const) {
+        expect(request(method, url), `${method} ${url}`).toEqual({ headers: { accept: "*/*" } });
       }
       expect(tokenReader).not.toHaveBeenCalled();
     });
@@ -1470,6 +1520,21 @@ describe("write classification (operation-aware read-only / approve-on-write)", 
     ],
   };
 
+  function lfsCredentials(host: string): CredentialPolicy {
+    return {
+      [host]: [{
+        tokenName: "lfs",
+        tokenDescription: "LFS token",
+        host,
+        header: "Authorization",
+        scheme: "basic",
+        username: "u",
+        protocol: "git-lfs",
+        allowAnonymous: true,
+      }],
+    };
+  }
+
   function requestOptions(overrides: Record<string, unknown> = {}) {
     return {
       allowedHosts: ["api.example.com", "git.example.com"],
@@ -1650,7 +1715,9 @@ describe("write classification (operation-aware read-only / approve-on-write)", 
         testBeforeAllowedRequest({ method, url: `https://gitlab.com${path}`, headers: {} }, {
           ...requestOptions({
             allowedHosts: ["gitlab.com"],
-            credentials: {},
+            // A git-lfs mapping opts the host into the LFS read exemption, so
+            // only the matcher decides here.
+            credentials: lfsCredentials("gitlab.com"),
             requests: { "gitlab.com": { gitPush, writeAction: "deny" } },
             tokenReader: () => null,
           }),
@@ -1678,7 +1745,7 @@ describe("write classification (operation-aware read-only / approve-on-write)", 
   test("an LFS batch POST is a read only with a proven download body, on the exact batch endpoint of a git-declared host", () => {
     const options = (rule: Record<string, unknown>) => requestOptions({
       allowedHosts: ["git.example.com"],
-      credentials: {},
+      credentials: lfsCredentials("git.example.com"),
       requests: { "git.example.com": { writeAction: "deny", ...rule } },
       tokenReader: () => null,
     });
@@ -1725,6 +1792,83 @@ describe("write classification (operation-aware read-only / approve-on-write)", 
       const expected = query === "?" ? "read" : "method";
       expect(decide(`${batch}${query}`, { gitPush: "write" }, { lfsBodyClass: "download" }), query).toBe(expected);
     }
+  });
+
+  // GitLab's batch response for a user hands back a project-wide LFS token
+  // that can push, so the LFS read exemption needs the host's policy to opt
+  // into LFS mediation with a git-lfs mapping covering the request path.
+  // Without one the download batch is a write like any other POST.
+  test("the LFS read exemption needs a git-lfs mapping on the host that covers the request path", () => {
+    const batch = "https://git.example.com/org/repo.git/info/lfs/objects/batch";
+    const decide = (credentials: CredentialPolicy) => {
+      try {
+        testBeforeAllowedRequest({ method: "POST", url: batch, headers: {} }, requestOptions({
+          allowedHosts: ["git.example.com"],
+          credentials,
+          requests: { "git.example.com": { gitPush: "write", writeAction: "deny" } },
+          tokenReader: () => null,
+          lfsBodyClass: "download",
+        }));
+        return "read";
+      } catch (error) {
+        if (error instanceof ProxyPolicyDenialError) return error.shape?.writeCategory ?? error.message;
+        throw error;
+      }
+    };
+    const mapping = (extra: Record<string, string>) => ({
+      tokenName: "git",
+      tokenDescription: "git token",
+      host: "git.example.com",
+      header: "Authorization",
+      scheme: "basic" as const,
+      username: "u",
+      allowAnonymous: true,
+      ...extra,
+    });
+    expect(decide({})).toBe("method");
+    expect(decide({ "git.example.com": [mapping({ protocol: "git-http" })] as never })).toBe("method");
+    expect(decide({ "git.example.com": [mapping({})] as never })).toBe("method");
+    expect(decide({ "other.example.com": lfsCredentials("other.example.com")["other.example.com"] })).toBe("method");
+    expect(decide({ "git.example.com": [mapping({ protocol: "git-lfs", pathPrefix: "/team/" })] as never })).toBe("method");
+    expect(decide({ "git.example.com": [mapping({ protocol: "git-lfs", pathPrefix: "/org/" })] as never })).toBe("read");
+    expect(decide({ "git.example.com": [mapping({ protocol: "git-http" }), mapping({ protocol: "git-lfs" })] as never })).toBe("read");
+  });
+
+  // The shipped service shapes: github.com carries a git-lfs mapping,
+  // gitlab.com does not (security review Finding 2).
+  test("an LFS download batch reads with Basic on a github-shaped host and is held, uncredentialed, on a gitlab-shaped host", () => {
+    const basic = (host: string, username: string, protocol: "git-http" | "git-lfs") => ({
+      tokenName: host, tokenDescription: host, host, header: "Authorization", scheme: "basic" as const, username, protocol,
+    });
+    const credentials: CredentialPolicy = {
+      "github.com": [basic("github.com", "x-access-token", "git-http"), basic("github.com", "x-access-token", "git-lfs")],
+      "gitlab.com": [
+        { tokenName: "gitlab.com", tokenDescription: "gitlab.com", host: "gitlab.com", header: "Authorization", scheme: "bearer", pathPrefix: "/api/" },
+        basic("gitlab.com", "oauth2", "git-http"),
+      ],
+    };
+    const tokenReader = vi.fn(() => "real-token");
+    const request = (host: string) => testBeforeAllowedRequest({
+      method: "POST",
+      url: `https://${host}/group/repo.git/info/lfs/objects/batch`,
+      headers: { Authorization: "Basic YWdlbnQ6cGxhY2Vob2xkZXI=" },
+    }, requestOptions({
+      allowedHosts: ["github.com", "gitlab.com"],
+      credentials,
+      requests: { "github.com": { gitPush: "write" }, "gitlab.com": { gitPush: "write" } },
+      writeApproval: "ask",
+      tokenReader,
+      lfsBodyClass: "download",
+    }));
+
+    expect(request("github.com")).toEqual({
+      headers: { authorization: `Basic ${Buffer.from("x-access-token:real-token").toString("base64")}` },
+    });
+    expect(tokenReader).toHaveBeenCalledTimes(1);
+    tokenReader.mockClear();
+    const denial = shapeDenial(() => request("gitlab.com"));
+    expect(denial.shape).toMatchObject({ reason: "write-approval-required", host: "gitlab.com", writeCategory: "method" });
+    expect(tokenReader).not.toHaveBeenCalled();
   });
 
   // todo 118: the upload-pack read exemption ignored the HTTP method, so a

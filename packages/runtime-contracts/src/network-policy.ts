@@ -11,7 +11,12 @@ const HOST_LABEL_RE = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 export const CREDENTIAL_SCHEMES = ["bearer", "raw", "basic"] as const;
 // Wire protocols a credential destination may be scoped to. Each value is one
 // matcher in proxy code; the policy names the class, the code defines it.
-export const CREDENTIAL_PROTOCOLS = ["git-http"] as const;
+// `git-http` is git smart HTTP (refs advertisement, upload-pack,
+// receive-pack); `git-lfs` is the Git LFS batch and locks API. The proxy maps
+// each recognized git request to exactly one of them, so their request sets
+// are disjoint. A `git-lfs` mapping also opts its host into the LFS download
+// read exemption.
+export const CREDENTIAL_PROTOCOLS = ["git-http", "git-lfs"] as const;
 // RFC 7617 user-id for `basic`: policy data, not secret. Visible ASCII only
 // (0x21-0x7E, so no space or control byte) and no colon, 1-64 bytes.
 const CREDENTIAL_USERNAME_RE = /^[\x21-\x39\x3B-\x7E]{1,64}$/;
@@ -716,7 +721,9 @@ export function validateNetworkPolicy(raw: unknown, policyPath = INLINE_POLICY_L
 
         // Within one (host, header) the proxy selects by protocol tier, then
         // longest pathPrefix. Each (protocol, pathPrefix) pair must therefore
-        // be unique, and at most one mapping may be protocol-scoped, so no
+        // be unique, and at most one mapping may carry each protocol. The
+        // protocols recognize disjoint request sets, so at most one
+        // protocol-scoped mapping per header is eligible for a request and no
         // request can see two equally ranked mappings for one header.
         const ownerKey = `${host.toLowerCase()}\0${header.toLowerCase()}`;
         const owner = `${tokenName}.${host}.${header}`;
@@ -728,12 +735,13 @@ export function validateNetworkPolicy(raw: unknown, policyPath = INLINE_POLICY_L
           continue;
         }
         if (protocol !== undefined) {
-          const protocolOwner = protocolOwners.get(ownerKey);
+          const protocolKey = `${ownerKey}\0${protocol}`;
+          const protocolOwner = protocolOwners.get(protocolKey);
           if (protocolOwner) {
-            issues.push(`${prefix} is a second protocol-scoped mapping for (${host}, ${header}); ${protocolOwner} already has one`);
+            issues.push(`${prefix} is a second ${protocol} mapping for (${host}, ${header}); ${protocolOwner} already has one`);
             continue;
           }
-          protocolOwners.set(ownerKey, owner);
+          protocolOwners.set(protocolKey, owner);
         }
         owners.set(scopeKey, owner);
         credentialOwners.set(ownerKey, owners);

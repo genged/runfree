@@ -33,14 +33,18 @@ function approvalDirs(): ApprovalDirs {
   };
 }
 
-function lfsPolicy(writeAction: "deny" | "ask"): unknown {
+// `git-lfs` is the github.com shape (the host opts into LFS mediation);
+// `git-http` alone is the gitlab.com shape, where LFS is not mediated.
+type LfsProtocol = "git-lfs" | "git-http";
+
+function lfsPolicy(writeAction: "deny" | "ask", protocol: LfsProtocol): unknown {
   return {
     hosts: ["127.0.0.1"],
     tokens: {
       example: {
         description: "Example git token",
         credentials: [
-          { host: "127.0.0.1", header: "Authorization", scheme: "basic", username: "x-access-token", protocol: "git-http" },
+          { host: "127.0.0.1", header: "Authorization", scheme: "basic", username: "x-access-token", protocol },
         ],
       },
     },
@@ -50,7 +54,7 @@ function lfsPolicy(writeAction: "deny" | "ask"): unknown {
   };
 }
 
-async function startLfsProxy(writeAction: "deny" | "ask", dirs?: ApprovalDirs) {
+async function startLfsProxy(writeAction: "deny" | "ask", dirs?: ApprovalDirs, protocol: LfsProtocol = "git-lfs") {
   const upstream = await startHttpsUpstream();
   const proxy = await startProxy({
     extraEnv: {
@@ -64,7 +68,7 @@ async function startLfsProxy(writeAction: "deny" | "ask", dirs?: ApprovalDirs) {
         }
         : {}),
     },
-    policy: lfsPolicy(writeAction),
+    policy: lfsPolicy(writeAction, protocol),
     secretFiles: { example: "real-proxy-token\n" },
   });
   return { proxy, upstream };
@@ -82,7 +86,7 @@ function batchPost(proxyPort: number, targetPort: number, body: string, pathName
 }
 
 describe("proxy server Git LFS batch classification", () => {
-  test("under deny, a download batch forwards with the git-http credential; upload and lock POSTs are denied before upstream", async () => {
+  test("under deny, a download batch forwards with the git-lfs credential; upload and lock POSTs are denied before upstream", async () => {
     const { proxy, upstream } = await startLfsProxy("deny");
 
     const download = await batchPost(proxy.port, upstream.port, DOWNLOAD);
@@ -104,6 +108,15 @@ describe("proxy server Git LFS batch classification", () => {
       expect(denied.raw, label).not.toContain("real-proxy-token");
     }
     expect(upstream.requests).toHaveLength(1);
+  }, 30_000);
+
+  test("without a git-lfs mapping (the gitlab.com shape), a download batch is a write: denied under deny, with no credential and no upstream", async () => {
+    const { proxy, upstream } = await startLfsProxy("deny", undefined, "git-http");
+    const denied = await batchPost(proxy.port, upstream.port, DOWNLOAD);
+    expect(denied.statusCode).toBe(403);
+    expect(denied.raw).toContain("x-runfree-blocked: write-denied");
+    expect(denied.raw).not.toContain("real-proxy-token");
+    expect(upstream.requests).toHaveLength(0);
   }, 30_000);
 
   test("under ask with no approver, a download batch forwards and an upload batch needs approval", async () => {

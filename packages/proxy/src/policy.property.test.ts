@@ -10,6 +10,7 @@ import {
   assertAllowedWebSocketRequest,
   beforeAllowedRequest,
   classifyWrite,
+  GIT_REQUEST_KIND_PROTOCOL,
   gitHttpRequestKind,
   type PolicyOptions,
   type ProxyRequest,
@@ -461,7 +462,7 @@ describe("proxy policy path confusion properties", () => {
   // git-receive-pack, and no LFS request is a push. Independently of
   // policy.ts, an eligible request's raw pathname ends with the literal
   // endpoint, carries no encoded separator or dot, and hides no NUL.
-  it("P1.6: git-http eligibility agrees with push and upload-pack classification and with the raw literal endpoint", () => {
+  it("P1.6: git request eligibility agrees with push and upload-pack classification, the raw literal endpoint, and exactly one protocol", () => {
     const ENDPOINTS = [
       "info/refs",
       "git-upload-pack",
@@ -492,6 +493,16 @@ describe("proxy policy path confusion properties", () => {
         const url = new URL(`https://${HOST}${path}${query === "" ? "" : `?${query}`}`);
         const kind = gitHttpRequestKind(request.method, url);
         const where = `${request.method} ${url.pathname}${url.search} => ${String(kind)}`;
+
+        // git-http and git-lfs are disjoint: with one mapping of each on one
+        // header, a request gets at most one credential, from the protocol
+        // its kind maps to, and a non-git request gets none.
+        const injected = injectedProtocols(request.method, url);
+        // The expected protocol is read off the kind independently of
+        // GIT_REQUEST_KIND_PROTOCOL: the LFS API kinds are git-lfs.
+        const expectedProtocol = kind === undefined ? undefined : kind.startsWith("lfs-") ? "git-lfs" : "git-http";
+        expect(injected, where).toEqual(expectedProtocol === undefined ? [] : [expectedProtocol]);
+        if (kind !== undefined) expect(GIT_REQUEST_KIND_PROTOCOL[kind], where).toBe(expectedProtocol);
         if (kind === undefined) return;
 
         const raw = url.pathname.toLowerCase();
@@ -528,6 +539,31 @@ describe("proxy policy path confusion properties", () => {
       propertyParameters({ numRuns: 1000 }),
     );
   });
+
+  function injectedProtocols(method: string, url: URL): string[] {
+    const mapping = (protocol: "git-http" | "git-lfs") => ({
+      tokenName: protocol,
+      tokenDescription: protocol,
+      host: HOST,
+      header: "Authorization",
+      scheme: "raw" as const,
+      protocol,
+    });
+    const logs: string[] = [];
+    try {
+      beforeAllowedRequest(admissionFor(), { url: url.href, method, headers: {} }, {
+        allowedHosts: [HOST],
+        credentials: { [HOST]: [mapping("git-http"), mapping("git-lfs")] },
+        writeApproval: "allow",
+        tokenReader: (name) => name,
+        log: (line) => logs.push(line),
+      });
+    } catch (error) {
+      // A shape refusal injects nothing; any other error is a test bug.
+      if (!(error instanceof ProxyPolicyDenialError)) throw error;
+    }
+    return logs.flatMap((line) => /using (git-http|git-lfs)$/u.exec(line)?.slice(1) ?? []);
+  }
 
   it("P1.7: every undecorated §4.2 request with a repository segment is eligible", () => {
     const ROWS = [

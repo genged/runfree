@@ -199,7 +199,7 @@ const credentialArbitrary: fc.Arbitrary<CredentialPolicyJson> = fc.record({
   scheme: fc.constantFrom("bearer", "raw", "basic") as fc.Arbitrary<CredentialPolicyJson["scheme"]>,
   username: usernameArbitrary,
   pathPrefix: fc.option(fc.constantFrom("/", "/api/", "/group/repo.git"), { nil: undefined }),
-  protocol: fc.option(fc.constant("git-http" as const), { nil: undefined }),
+  protocol: fc.option(fc.constantFrom("git-http", "git-lfs") as fc.Arbitrary<NonNullable<CredentialPolicyJson["protocol"]>>, { nil: undefined }),
 }).map(({ scheme, username, pathPrefix, protocol }) => ({
   host: "gitlab.com",
   header: "Authorization",

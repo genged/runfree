@@ -18,6 +18,13 @@ describe("describeCredential", () => {
       pathPrefix: "/api/",
       protocol: "git-http",
     })).toBe("gitlab.com -> Authorization (bearer, path /api/, protocol=git-http)");
+    expect(describeCredential({
+      host: "github.com",
+      header: "Authorization",
+      scheme: "basic",
+      username: "x-access-token",
+      protocol: "git-lfs",
+    })).toBe("github.com -> Authorization (basic:x-access-token, protocol=git-lfs)");
   });
 
   test("credentials without the new fields read as before", () => {

@@ -74,7 +74,7 @@ describe("user service definitions (SR4/A1 reserved suffix)", () => {
   });
 });
 
-describe("user service definitions: basic scheme, username, and git-http protocol (O-8)", () => {
+describe("user service definitions: basic scheme, username, and git-http/git-lfs protocols (O-8)", () => {
   function definition(credentials: unknown[]): Record<string, unknown> {
     return {
       schemaVersion: 1,
@@ -142,15 +142,20 @@ describe("user service definitions: basic scheme, username, and git-http protoco
     ["basic without a username", { host: "git.forge.example", header: "Authorization", scheme: "basic" }, "credentials[0].username is required with scheme basic"],
     ["username with bearer", { host: "git.forge.example", header: "Authorization", scheme: "bearer", username: "oauth2" }, "credentials[0].username is valid only with scheme basic"],
     ["username with raw", { host: "git.forge.example", header: "X-Token", scheme: "raw", username: "oauth2" }, "credentials[0].username is valid only with scheme basic"],
-    ["unknown protocol", { ...basicGit, protocol: "git-ssh" }, "credentials[0].protocol must be one of: git-http"],
-    ["non-string protocol", { ...basicGit, protocol: ["git-http"] }, "credentials[0].protocol must be one of: git-http"],
+    ["unknown protocol", { ...basicGit, protocol: "git-ssh" }, "credentials[0].protocol must be one of: git-http, git-lfs"],
+    ["non-string protocol", { ...basicGit, protocol: ["git-http"] }, "credentials[0].protocol must be one of: git-http, git-lfs"],
     ["unknown scheme", { ...basicGit, scheme: "digest" }, "credentials[0].scheme must be one of: bearer, raw, basic"],
     ["unknown credential key", { ...basicGit, password: "x" }, "unknown key password"],
   ])("refuses %s", (_name, credential, message) => {
     expect(() => validateUserServiceDefinitionObject(definition([credential]))).toThrow(message);
   });
 
-  test("refuses two protocol-scoped mappings for one host and header through the shared validator", () => {
+  test("accepts one git-http and one git-lfs mapping on one host and header", () => {
+    const loaded = validateUserServiceDefinitionObject(definition([basicGit, { ...basicGit, protocol: "git-lfs" }]));
+    expect(loaded.svc.credential?.credentials.map((credential) => credential.protocol)).toEqual(["git-http", "git-lfs"]);
+  });
+
+  test("refuses two mappings with one protocol for one host and header through the shared validator", () => {
     expect(() => validateUserServiceDefinitionObject(definition([
       basicGit,
       { ...basicGit, username: "other" },
@@ -158,7 +163,7 @@ describe("user service definitions: basic scheme, username, and git-http protoco
     expect(() => validateUserServiceDefinitionObject(definition([
       basicGit,
       { ...basicGit, username: "other", pathPrefix: "/scoped/" },
-    ]))).toThrow("second protocol-scoped mapping");
+    ]))).toThrow("second git-http mapping");
   });
 
   test("a 64-byte username is accepted", () => {

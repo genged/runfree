@@ -53,9 +53,10 @@ describe("network policy token and credential-scheme validation", () => {
     expect(isCredentialScheme("raw")).toBe(true);
     expect(isCredentialScheme("basic")).toBe(true);
     expect(isCredentialScheme("digest")).toBe(false);
-    expect(CREDENTIAL_PROTOCOLS).toEqual(["git-http"]);
-    expect(credentialProtocolList()).toBe("git-http");
+    expect(CREDENTIAL_PROTOCOLS).toEqual(["git-http", "git-lfs"]);
+    expect(credentialProtocolList()).toBe("git-http, git-lfs");
     expect(isCredentialProtocol("git-http")).toBe(true);
+    expect(isCredentialProtocol("git-lfs")).toBe(true);
     expect(isCredentialProtocol("GIT-HTTP")).toBe(false);
   });
 
@@ -465,8 +466,8 @@ describe("basic scheme, username and protocol (T2, T12 validation half)", () => 
     ["empty username", { ...GITLAB_GIT_BASIC, username: "" }, "must be non-empty"],
     ["65-byte username", { ...GITLAB_GIT_BASIC, username: "u".repeat(65) }, "at most 64 bytes"],
     ["non-string username", { ...GITLAB_GIT_BASIC, username: 7 }, "must be a string"],
-    ["unknown protocol", { ...GITLAB_GIT_BASIC, protocol: "hg-http" }, "protocol must be one of: git-http"],
-    ["non-string protocol", { ...GITLAB_GIT_BASIC, protocol: ["git-http"] }, "protocol must be one of: git-http"],
+    ["unknown protocol", { ...GITLAB_GIT_BASIC, protocol: "hg-http" }, "protocol must be one of: git-http, git-lfs"],
+    ["non-string protocol", { ...GITLAB_GIT_BASIC, protocol: ["git-http"] }, "protocol must be one of: git-http, git-lfs"],
     ["unknown credential key", { ...GITLAB_API_BEARER, route: "git" }, "route is not a known credential field"],
   ])("refuses %s", (_name, credential, message) => {
     const issues = validationIssues(credentialPolicy([credential]));
@@ -484,11 +485,11 @@ describe("basic scheme, username and protocol (T2, T12 validation half)", () => 
     expect(loaded.credentials["gitlab.com"]).toHaveLength(2);
   });
 
-  test("refuses two protocol-scoped mappings for one host and header, across tokens and header case", () => {
+  test("refuses two mappings with one protocol for one host and header, across tokens and header case", () => {
     expect(validationIssues(credentialPolicy([
       GITLAB_GIT_BASIC,
       { ...GITLAB_GIT_BASIC, pathPrefix: "/group/" },
-    ])).join("\n")).toContain("second protocol-scoped mapping for (gitlab.com, Authorization)");
+    ])).join("\n")).toContain("second git-http mapping for (gitlab.com, Authorization)");
     expect(validationIssues({
       hosts: ["gitlab.com"],
       tokens: {
@@ -498,7 +499,23 @@ describe("basic scheme, username and protocol (T2, T12 validation half)", () => 
           credentials: [{ host: "gitlab.com", header: "authorization", scheme: "bearer", pathPrefix: "/x/", protocol: "git-http" }],
         },
       },
-    }).join("\n")).toContain("second protocol-scoped mapping");
+    }).join("\n")).toContain("second git-http mapping");
+    expect(validationIssues(credentialPolicy([
+      { ...GITLAB_GIT_BASIC, protocol: "git-lfs" },
+      { ...GITLAB_GIT_BASIC, protocol: "git-lfs", username: "other", pathPrefix: "/group/" },
+    ])).join("\n")).toContain("second git-lfs mapping for (gitlab.com, Authorization)");
+  });
+
+  // git-http and git-lfs recognize disjoint request sets (the proxy maps each
+  // git request kind to exactly one protocol), so one mapping of each on one
+  // header can never both be eligible for a request.
+  test("one git-http and one git-lfs mapping share one host and header", () => {
+    const loaded = validateNetworkPolicy(credentialPolicy([
+      GITLAB_API_BEARER,
+      GITLAB_GIT_BASIC,
+      { ...GITLAB_GIT_BASIC, protocol: "git-lfs" },
+    ]));
+    expect(loaded.credentials["gitlab.com"]?.map((mapping) => mapping.protocol)).toEqual([undefined, "git-http", "git-lfs"]);
   });
 
   test("refuses mappings that tie on (protocol, pathPrefix) for one host and header", () => {

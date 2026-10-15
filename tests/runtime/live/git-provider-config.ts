@@ -40,6 +40,12 @@ type ProviderDefinition = Readonly<{
   envPrefix: string;
   /** Extra `service enable` flags: skip broad multi-tenant hosts the tranche never needs. */
   enableFlags: readonly string[];
+  /**
+   * Whether the service mediates Git LFS on the host (it has a `git-lfs`
+   * mapping). gitlab does not: its batch response hands back a project-wide
+   * LFS token, so an LFS batch there is a held write with no credential.
+   */
+  lfsMediated: boolean;
 }>;
 
 const PROVIDERS: Readonly<Record<GitProviderId, ProviderDefinition>> = Object.freeze({
@@ -50,6 +56,7 @@ const PROVIDERS: Readonly<Record<GitProviderId, ProviderDefinition>> = Object.fr
     tokenName: "github",
     envPrefix: "TEST_RUNTIME_GITHUB",
     enableFlags: ["--skip-broad"],
+    lfsMediated: true,
   },
   gitlab: {
     id: "gitlab",
@@ -58,6 +65,7 @@ const PROVIDERS: Readonly<Record<GitProviderId, ProviderDefinition>> = Object.fr
     tokenName: "gitlab",
     envPrefix: "TEST_RUNTIME_GITLAB",
     enableFlags: [],
+    lfsMediated: false,
   },
 });
 
@@ -77,6 +85,7 @@ export type GitProviderInputs = Readonly<{
   service: string;
   tokenName: string;
   enableFlags: readonly string[];
+  lfsMediated: boolean;
   /** Env names, for failure messages that tell the operator what to set. */
   envNames: Readonly<{ repo: string; source: string; lfsRepo: string }>;
   repository: GitProviderRepository;
@@ -151,6 +160,7 @@ export function gitProviderSuiteConfig(env: NodeJS.ProcessEnv): GitProviderSuite
         service: definition.service,
         tokenName: definition.tokenName,
         enableFlags: definition.enableFlags,
+        lfsMediated: definition.lfsMediated,
         envNames,
         repository,
         source: sourceValue,

@@ -179,6 +179,8 @@ describe("desired network policy version on need (v3)", () => {
       ["tokens.gitlab.credentials[0].scheme basic", "tokens.gitlab.credentials[0].username"]],
     ["direct protocol on bearer", { hosts: ["gitlab.com"], tokens: { gitlab: { description: "d", credentials: [{ host: "gitlab.com", header: "Authorization", scheme: "bearer", protocol: "git-http" }] } } },
       ["tokens.gitlab.credentials[0].protocol"]],
+    ["direct git-lfs protocol", { hosts: ["gitlab.com"], tokens: { gitlab: { description: "d", credentials: [{ host: "gitlab.com", header: "Authorization", scheme: "bearer", protocol: "git-lfs" }] } } },
+      ["tokens.gitlab.credentials[0].protocol"]],
     ["service-resolved basic", { hosts: [], services: { gitlab: gitlabService([GITLAB_GIT_BASIC]) } },
       ["services.gitlab.resolved.tokens.gitlab.credentials[0].scheme basic"]],
     ["two direct mappings on one host and header", {
@@ -216,7 +218,7 @@ describe("desired network policy version on need (v3)", () => {
       version: 3,
       hosts: [],
       services: { gitlab: gitlabService([GITLAB_GIT_BASIC, { ...GITLAB_GIT_BASIC, pathPrefix: "/group/" }]) },
-    })).toContain("second protocol-scoped mapping");
+    })).toContain("second git-http mapping");
   });
 
   test("uniqueness is per validation scope: a direct and a service mapping on one host and header need no v3", () => {

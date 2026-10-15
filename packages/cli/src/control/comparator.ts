@@ -92,13 +92,17 @@ function credentialKey(tokenName: string, credential: CredentialPolicyJson): str
 }
 
 // A protocol scope narrows a mapping to the requests its matcher recognizes.
-// Adding one is contained by the same mapping without it; removing one widens
-// the mapping to every path of its prefix, and changing it is incomparable.
+// Adding `git-http` is contained by the same mapping without it; removing one
+// widens the mapping to every path of its prefix, and changing it is
+// incomparable. Adding `git-lfs` is never contained: a git-lfs mapping also
+// opts its host into the LFS download read exemption, so it weakens write
+// classification while it narrows the credential.
 function protocolIsContained(
   previous: CredentialPolicyJson["protocol"],
   next: CredentialPolicyJson["protocol"],
 ): boolean {
-  return previous === undefined || previous === next;
+  if (previous === next) return true;
+  return previous === undefined && next !== "git-lfs";
 }
 
 function credentialMappings(policy: PolicyJson): Array<{ credential: CredentialPolicyJson; tokenName: string }> {

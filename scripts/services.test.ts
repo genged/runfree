@@ -452,7 +452,7 @@ describe("service registry invariants", () => {
     expect(serviceHostNames(SERVICES.python)).toEqual(["pypi.org", "files.pythonhosted.org"]);
   });
 
-  test("github merges the full ecosystem with an optional credential on api/raw and github.com git-http", () => {
+  test("github merges the full ecosystem with an optional credential on api/raw and github.com git-http and git-lfs", () => {
     expect(serviceHostNames(SERVICES.github)).toEqual([
       "github.com",
       "api.github.com",
@@ -469,17 +469,22 @@ describe("service registry invariants", () => {
       { host: "api.github.com", header: "Authorization", scheme: "bearer" },
       { host: "raw.githubusercontent.com", header: "Authorization", scheme: "bearer" },
       { host: "github.com", header: "Authorization", scheme: "basic", username: "x-access-token", protocol: "git-http" },
+      { host: "github.com", header: "Authorization", scheme: "basic", username: "x-access-token", protocol: "git-lfs" },
     ]);
     expect(SERVICES.github.readOnly?.["github.com"]).toEqual({ gitPush: "write" });
   });
 
-  test("gitlab carries API Bearer and git-http Basic mappings on gitlab.com with anonymous fallback", () => {
+  // GitLab's LFS batch response for a user carries a project-wide LFS token
+  // that can push (security review Finding 2), so gitlab has no git-lfs
+  // mapping: LFS is not mediated on gitlab.com.
+  test("gitlab carries API Bearer and git-http Basic mappings on gitlab.com with anonymous fallback, and no git-lfs mapping", () => {
     expect(SERVICES.gitlab.revision).toBe(2);
     expect(SERVICES.gitlab.credential?.allowAnonymous).toBe(true);
     expect(SERVICES.gitlab.credential?.credentials).toEqual([
       { host: "gitlab.com", header: "Authorization", scheme: "bearer", pathPrefix: "/api/" },
       { host: "gitlab.com", header: "Authorization", scheme: "basic", username: "oauth2", protocol: "git-http" },
     ]);
+    expect(SERVICES.gitlab.explanations?.join("\n")).toContain("Git LFS is not mediated on gitlab.com");
     // Pushes stay classified as writes, so write approval governs a push that
     // now carries the credential.
     expect(SERVICES.gitlab.readOnly?.["gitlab.com"]?.gitPush).toBe("write");
@@ -509,7 +514,7 @@ describe("service registry invariants", () => {
 
   // The real definitions through the real compile path to the proxy's
   // request mutation: which requests carry the credential, in which form.
-  function proxyMutationFor(id: "github" | "gitlab", writeMode?: "read-only") {
+  function proxyMutationFor(id: "github" | "gitlab", writeMode?: "read-only", writeApproval: "allow" | "ask" = "allow") {
     const project = withRequiredDesiredNetworkPolicyVersion({
       hosts: [],
       services: { [id]: desiredServiceEntry(SERVICES[id], writeMode ? { writeMode } : {}) },
@@ -519,7 +524,12 @@ describe("service registry invariants", () => {
     );
     let serial = 0;
     const tokenReader = vi.fn((name: string) => (name === id ? "real-token" : null));
-    return (method: string, url: string, headers: Record<string, string> = { Authorization: "Bearer agent-supplied" }) => {
+    const request = (
+      method: string,
+      url: string,
+      headers: Record<string, string> = { Authorization: "Bearer agent-supplied" },
+      lfsBodyClass?: "download",
+    ) => {
       tokenReader.mockClear();
       serial += 1;
       const result = beforeAllowedRequest({
@@ -534,12 +544,14 @@ describe("service registry invariants", () => {
         allowedHosts: effective.allowedHosts,
         credentials: effective.credentials,
         requests: effective.requests,
-        writeApproval: "allow",
+        writeApproval,
         tokenReader,
         log: () => {},
+        ...(lfsBodyClass ? { lfsBodyClass } : {}),
       });
       return { result, tokenReader };
     };
+    return Object.assign(request, { tokenReader });
   }
 
   test("compiled github: Basic x-access-token on github.com git requests, nothing on web paths, Bearer on api/raw", () => {
@@ -551,6 +563,7 @@ describe("service registry invariants", () => {
       ["POST", "https://github.com/owner/repo.git/git-upload-pack"],
       ["POST", "https://github.com/owner/repo/git-receive-pack"],
       ["POST", "https://github.com/owner/repo.git/info/lfs/objects/batch"],
+      ["POST", "https://github.com/owner/repo.git/info/lfs/locks/verify"],
     ] as const) {
       expect(request(method, url).result, `${method} ${url}`).toEqual({ headers: { authorization: basic } });
     }
@@ -590,15 +603,44 @@ describe("service registry invariants", () => {
       ["GET", "https://gitlab.com/group/repo.git/info/refs?service=git-upload-pack"],
       ["POST", "https://gitlab.com/group/sub/repo.git/git-upload-pack"],
       ["POST", "https://gitlab.com/group/repo.git/git-receive-pack"],
-      ["POST", "https://gitlab.com/group/repo.git/info/lfs/objects/batch"],
     ] as const) {
       expect(request(method, url).result, `${method} ${url}`).toEqual({ headers: { authorization: basic } });
     }
-    for (const url of ["https://gitlab.com/api", "https://gitlab.com/group/repo", "https://gitlab.com/-/profile"]) {
-      const { result, tokenReader } = request("GET", url);
+    for (const [method, url] of [
+      ["GET", "https://gitlab.com/api"],
+      ["GET", "https://gitlab.com/group/repo"],
+      ["GET", "https://gitlab.com/-/profile"],
+      // LFS is not mediated on gitlab.com.
+      ["POST", "https://gitlab.com/group/repo.git/info/lfs/objects/batch"],
+      ["POST", "https://gitlab.com/group/repo.git/info/lfs/locks/verify"],
+    ] as const) {
+      const { result, tokenReader } = request(method, url);
       expect(result, url).toEqual({ headers: {} });
       expect(tokenReader).not.toHaveBeenCalled();
     }
+  });
+
+  // Security review Finding 2: the LFS download read exemption applies only
+  // where the service opts the host into LFS mediation (a git-lfs mapping).
+  test("compiled LFS download batch under ask: github reads with Basic, gitlab is a held write with no credential read", () => {
+    const github = proxyMutationFor("github", undefined, "ask");
+    expect(github("POST", "https://github.com/owner/repo.git/info/lfs/objects/batch", {}, "download").result)
+      .toEqual({ headers: { authorization: `Basic ${Buffer.from("x-access-token:real-token").toString("base64")}` } });
+
+    const gitlab = proxyMutationFor("gitlab", undefined, "ask");
+    let denial: unknown;
+    try {
+      gitlab("POST", "https://gitlab.com/group/repo.git/info/lfs/objects/batch", {}, "download");
+    } catch (error) {
+      denial = error;
+    }
+    expect(denial).toBeInstanceOf(ProxyPolicyDenialError);
+    expect((denial as ProxyPolicyDenialError).shape).toMatchObject({
+      reason: "write-approval-required",
+      host: "gitlab.com",
+      writeCategory: "method",
+    });
+    expect(gitlab.tokenReader).not.toHaveBeenCalled();
   });
 
   test("compiled gitlab: with no token stored, requests go out anonymously instead of being denied (O-6)", () => {
@@ -890,6 +932,7 @@ describe("desiredServicePolicy", () => {
         links: [
           { host: "api.github.com", header: "Authorization", scheme: "bearer" },
           { host: "github.com", header: "Authorization", scheme: "basic", username: "x-access-token", protocol: "git-http" },
+          { host: "github.com", header: "Authorization", scheme: "basic", username: "x-access-token", protocol: "git-lfs" },
           { host: "raw.githubusercontent.com", header: "Authorization", scheme: "bearer" },
         ],
         agentEnv: ["GH_TOKEN", "GITHUB_TOKEN"],

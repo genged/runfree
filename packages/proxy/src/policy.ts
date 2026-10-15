@@ -9,6 +9,7 @@ import {
   validateNetworkPolicy,
   type CredentialMapping,
   type CredentialPolicy,
+  type CredentialProtocol,
   type HttpMethod,
   type LoadedNetworkPolicy,
   type PolicyJson,
@@ -89,7 +90,8 @@ export type PolicyOptions = {
   // Per-request body-aware Git LFS batch verdict (see lfs-classify.ts),
   // precomputed by the async caller: "download" means the body was proven a
   // bounded, unambiguous `"operation": "download"` batch. Only consulted by
-  // classifyWrite for POST …/info/lfs/objects/batch on a gitPush-ruled host.
+  // classifyWrite for POST …/info/lfs/objects/batch on a gitPush-ruled host
+  // whose policy has an eligible git-lfs mapping (lfsMediatedRequest).
   lfsBodyClass?: "download";
   // Precomputed by the async server layer: this POST targets an exact,
   // recorded, statically mediated OAuth token or registration endpoint and is
@@ -267,39 +269,49 @@ function requestPath(url: URL): string {
   return url.pathname || "/";
 }
 
+// A protocol-scoped mapping is eligible for a request when the request's
+// protocol (gitRequestProtocol) is the mapping's protocol and the mapping's
+// pathPrefix, if any, matches. Each git request kind maps to exactly one
+// protocol, so a request is eligible for at most one protocol.
+function protocolMappingIsEligible(
+  mapping: CredentialMapping,
+  pathName: string,
+  requestProtocol: () => CredentialProtocol | undefined,
+): boolean {
+  if (mapping.protocol === undefined) return false;
+  if (mapping.pathPrefix !== undefined && !pathMatchesPrefix(pathName, mapping.pathPrefix)) return false;
+  switch (mapping.protocol) {
+    case "git-http":
+    case "git-lfs":
+      return requestProtocol() === mapping.protocol;
+    default: {
+      // A protocol added to the contract without a matcher here must fail
+      // to compile; at runtime an unknown value is never eligible.
+      const unknownProtocol: never = mapping.protocol;
+      void unknownProtocol;
+      return false;
+    }
+  }
+}
+
 // Selection is host-wide (one pass over every mapping of the host, whatever
 // its header), in three steps:
-//   (a) drop protocol-ineligible mappings: a `protocol: "git-http"` mapping is
-//       eligible only when gitHttpRequestKind recognizes the request (and its
-//       pathPrefix, if any, matches);
+//   (a) drop protocol-ineligible mappings (protocolMappingIsEligible): a
+//       `git-http` mapping is eligible only on git smart-HTTP requests and a
+//       `git-lfs` mapping only on Git LFS API requests;
 //   (b) if any eligible mapping is protocol-scoped, keep only the
 //       protocol-scoped ones (the protocol tier ranks above prefix length);
 //   (c) the longest-pathPrefix rule, with unscoped-by-path mappings as the
 //       fallback when no prefix matches.
-// Validation allows at most one protocol-scoped mapping per (host, header) and
-// unique (protocol, pathPrefix) pairs, so at most one mapping per header
-// survives.
+// Validation allows at most one mapping per (host, header, protocol) and
+// unique (protocol, pathPrefix) pairs, and the protocols' request sets are
+// disjoint, so at most one mapping per header survives.
 function selectedCredentialMappings(allMappings: CredentialMapping[], method: string, url: URL): CredentialMapping[] {
   const pathName = requestPath(url);
-  let gitKind: GitHttpRequestKind | undefined | null = null;
-  const gitHttpKind = (): GitHttpRequestKind | undefined => {
-    if (gitKind === null) gitKind = gitHttpRequestKind(method, url);
-    return gitKind;
-  };
+  const requestProtocol = lazyGitRequestProtocol(method, url);
   const eligible = allMappings.filter((mapping) => {
     if (mapping.protocol === undefined) return true;
-    if (mapping.pathPrefix !== undefined && !pathMatchesPrefix(pathName, mapping.pathPrefix)) return false;
-    switch (mapping.protocol) {
-      case "git-http":
-        return gitHttpKind() !== undefined;
-      default: {
-        // A protocol added to the contract without a matcher here must fail
-        // to compile; at runtime an unknown value is never eligible.
-        const unknownProtocol: never = mapping.protocol;
-        void unknownProtocol;
-        return false;
-      }
-    }
+    return protocolMappingIsEligible(mapping, pathName, requestProtocol);
   });
   const protocolScoped = eligible.filter((mapping) => mapping.protocol !== undefined);
   const mappings = protocolScoped.length > 0 ? protocolScoped : eligible;
@@ -475,21 +487,23 @@ function hasMethodOverrideHeader(headers: Record<string, string | string[] | und
   return Object.keys(headers).some((key) => METHOD_OVERRIDE_HEADERS.has(key.toLowerCase()));
 }
 
-// --- git smart HTTP / Git LFS request recognition (`protocol: "git-http"`) ---
+// --- git smart HTTP / Git LFS request recognition (`git-http`, `git-lfs`) ---
 //
-// Decides whether a request is one of the git smart-HTTP or Git LFS requests
-// a `protocol: "git-http"` credential may be attached to. The recognized
-// shapes, each requiring at least one repository segment before the suffix
-// (so `/info/refs` alone is not a git request):
+// Decides whether a request is one of the git smart-HTTP requests a
+// `protocol: "git-http"` credential may be attached to, or one of the Git LFS
+// API requests a `protocol: "git-lfs"` credential may be attached to
+// (GIT_REQUEST_KIND_PROTOCOL). The recognized shapes, each requiring at least
+// one repository segment before the suffix (so `/info/refs` alone is not a git
+// request):
 //
-//   refs         GET  …/info/refs?service=git-upload-pack|git-receive-pack
-//   upload-pack  POST …/git-upload-pack
-//   receive-pack POST …/git-receive-pack
-//   lfs-batch    POST …/info/lfs/objects/batch
-//   lfs-locks    GET  …/info/lfs/locks
-//                POST …/info/lfs/locks
-//                POST …/info/lfs/locks/verify
-//                POST …/info/lfs/locks/<id>/unlock   (raw id ^[A-Za-z0-9._-]+$)
+//   git-http  refs         GET  …/info/refs?service=git-upload-pack|git-receive-pack
+//             upload-pack  POST …/git-upload-pack
+//             receive-pack POST …/git-receive-pack
+//   git-lfs   lfs-batch    POST …/info/lfs/objects/batch
+//             lfs-locks    GET  …/info/lfs/locks
+//                          POST …/info/lfs/locks
+//                          POST …/info/lfs/locks/verify
+//                          POST …/info/lfs/locks/<id>/unlock   (raw id ^[A-Za-z0-9._-]+$)
 //
 // Methods are compared exactly (uppercase); HEAD, OPTIONS, and every other
 // method are not eligible on any row (a git client never sends them, and the
@@ -519,6 +533,48 @@ function hasMethodOverrideHeader(headers: Record<string, string | string[] | und
 // filters there). Anything not recognized returns
 // undefined: no credential, and write classification is unaffected.
 export type GitHttpRequestKind = "refs" | "upload-pack" | "receive-pack" | "lfs-batch" | "lfs-locks";
+
+// The credential protocol of each recognized git request kind. One matcher,
+// one protocol per kind: git smart HTTP is `git-http`, the Git LFS batch and
+// locks API is `git-lfs`, so the two protocols' request sets are disjoint by
+// construction.
+export const GIT_REQUEST_KIND_PROTOCOL: Readonly<Record<GitHttpRequestKind, CredentialProtocol>> = {
+  refs: "git-http",
+  "upload-pack": "git-http",
+  "receive-pack": "git-http",
+  "lfs-batch": "git-lfs",
+  "lfs-locks": "git-lfs",
+};
+
+export function gitRequestProtocol(method: string, url: URL): CredentialProtocol | undefined {
+  const kind = gitHttpRequestKind(method, url);
+  return kind === undefined ? undefined : GIT_REQUEST_KIND_PROTOCOL[kind];
+}
+
+function lazyGitRequestProtocol(method: string, url: URL): () => CredentialProtocol | undefined {
+  let computed = false;
+  let protocol: CredentialProtocol | undefined;
+  return () => {
+    if (!computed) {
+      protocol = gitRequestProtocol(method, url);
+      computed = true;
+    }
+    return protocol;
+  };
+}
+
+// The host's policy opts a request into Git LFS mediation when one of the
+// host's mappings has `protocol: "git-lfs"` and is eligible for the request
+// (it is a Git LFS API request under the mapping's pathPrefix, if any). Only
+// then may an LFS download batch classify as a read: on a host without one
+// (gitlab.com, whose batch response for a user carries a project-wide LFS
+// token that can push) the batch stays a write.
+export function lfsMediatedRequest(mappings: readonly CredentialMapping[] | undefined, method: string, url: URL): boolean {
+  if (mappings === undefined || !mappings.some((mapping) => mapping.protocol === "git-lfs")) return false;
+  const pathName = requestPath(url);
+  const requestProtocol = lazyGitRequestProtocol(method, url);
+  return mappings.some((mapping) => mapping.protocol === "git-lfs" && protocolMappingIsEligible(mapping, pathName, requestProtocol));
+}
 
 // Placeholder in an endpoint suffix for the LFS lock id segment.
 const GIT_LFS_LOCK_ID = Symbol("lock-id");
@@ -621,6 +677,9 @@ export function classifyWrite(input: {
   oauthProtocolRead?: boolean;
   // See PolicyOptions.lfsBodyClass. Absent means unproven => write.
   lfsBodyClass?: "download";
+  // lfsMediatedRequest for this request: the host's policy has an eligible
+  // git-lfs mapping. Absent means no => an LFS batch stays a write.
+  lfsMediated?: boolean;
 }): WriteClassification {
   // A wss:// upgrade is an opaque live channel the proxy cannot inspect
   // frame-by-frame, so the whole connection classifies as a write (HIGH-2).
@@ -679,13 +738,16 @@ export function classifyWrite(input: {
       return { write: false };
     }
     // A Git LFS batch request proven by its body to be a download. Same host
-    // gate as the upload-pack exemption (the host declares git handling); the
-    // request must be exactly POST on the canonical batch endpoint with an
-    // empty query (gitHttpRequestKind), so a Rails origin cannot read an
+    // gate as the upload-pack exemption (the host declares git handling),
+    // plus the host's policy must opt into LFS mediation with a git-lfs
+    // mapping eligible for the request (lfsMediatedRequest); the request must
+    // be exactly POST on the canonical batch endpoint with an empty query
+    // (gitHttpRequestKind), so a Rails origin cannot read an
     // `?operation=upload` the body classifier never saw. An upload
-    // batch, an unproven body, and every lock request stay writes.
+    // batch, an unproven body, a host without a git-lfs mapping, and every
+    // lock request stay writes.
     if (rule?.gitPush !== undefined && input.method === "POST" && input.lfsBodyClass === "download"
-      && gitHttpRequestKind(input.method, input.url) === "lfs-batch") {
+      && input.lfsMediated === true && gitHttpRequestKind(input.method, input.url) === "lfs-batch") {
       return { write: false };
     }
   }
@@ -705,6 +767,7 @@ function assertWriteAllowed(input: {
   webSocket?: boolean;
   graphqlBodyClass?: "read" | "write";
   lfsBodyClass?: "download";
+  lfsMediated?: boolean;
   oauthProtocolRead?: boolean;
   oauthUnlistedClientIdUrl?: boolean;
   hasWriteGrant?: PolicyOptions["hasWriteGrant"];
@@ -1011,6 +1074,7 @@ export function beforeAllowedRequest(admission: AdmissionRecord, req: ProxyReque
     headers: req.headers,
     graphqlBodyClass: options.graphqlBodyClass,
     lfsBodyClass: options.lfsBodyClass,
+    lfsMediated: options.lfsBodyClass === "download" && lfsMediatedRequest(credentials[host], req.method ?? "GET", url),
     oauthProtocolRead: options.oauthProtocolRead,
     oauthUnlistedClientIdUrl: options.oauthUnlistedClientIdUrl,
     hasWriteGrant: options.hasWriteGrant,

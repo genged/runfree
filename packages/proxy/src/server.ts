@@ -81,6 +81,7 @@ import {
   configuredCredentialHeaderNames,
   evaluateRequestWriteAsk,
   gitHttpRequestKind,
+  lfsMediatedRequest,
   hostFromUrl,
   loadProxyPolicy,
   isIpLiteralHostname,
@@ -1513,9 +1514,9 @@ async function graphqlBodyClassForRequest(req: ProxyRequest): Promise<"read" | "
 
 // Body-aware Git LFS batch classification: consulted only for POST on the
 // canonical …/info/lfs/objects/batch endpoint of a host that declares git
-// handling (a `gitPush` rule) under an ask/deny posture. "download" is the
-// only verdict that matters to classifyWrite; anything unproven is undefined
-// and stays a write. The body is the content-decoded buffer mockttp forwards;
+// handling (a `gitPush` rule) and has an eligible git-lfs mapping, under an
+// ask/deny posture. "download" is the only verdict that matters to
+// classifyWrite; anything unproven is undefined and stays a write. The body is the content-decoded buffer mockttp forwards;
 // the classifier refuses any non-identity encoding, so it equals the bytes on
 // the wire.
 async function lfsBodyClassForRequest(req: ProxyRequest): Promise<"download" | undefined> {
@@ -1531,6 +1532,9 @@ async function lfsBodyClassForRequest(req: ProxyRequest): Promise<"download" | u
   const writeAction = rule.writeAction ?? currentPolicy.writeApproval ?? DEFAULT_WRITE_ACTION;
   if (writeAction === "allow") return undefined;
   if (gitHttpRequestKind(req.method, url) !== "lfs-batch") return undefined;
+  // Without an eligible git-lfs mapping the batch is a write whatever its
+  // body says (classifyWrite), so do not read the body.
+  if (!lfsMediatedRequest(currentPolicy.credentials[url.hostname.toLowerCase()], req.method, url)) return undefined;
   const verdict = await classifyLfsBatchRequest({
     headers: req.headers,
     readBody: async () => await req.body?.getDecodedBuffer?.(),

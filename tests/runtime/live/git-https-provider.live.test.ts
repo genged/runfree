@@ -39,7 +39,10 @@
 //                              curl, and never follows the returned object
 //                              hrefs (their storage hosts are provider-owned
 //                              and outside the service bundle). The batch
-//                              request is the part Runfree classifies.
+//                              request is the part Runfree classifies. On
+//                              GitLab, where LFS is not mediated, L5 proves
+//                              the download batch is held for approval with
+//                              no credential instead.
 //
 // Never read: GH_TOKEN, GITHUB_TOKEN, GITLAB_TOKEN, `gh auth token`, or any
 // other ambient credential. Only the named source's command definition is
@@ -143,7 +146,7 @@ function countOccurrences(text: string, needle: string): number {
   return text.split(needle).length - 1;
 }
 
-/** The proxy's own line for a git-http injection on this provider's host. */
+/** The proxy's own line for a credential injection on this provider's host. */
 function injectedLine(provider: GitProviderInputs): string {
   return `proxy: injected Authorization for ${provider.host} using ${provider.tokenName}`;
 }
@@ -363,8 +366,13 @@ function defineProviderSuite(provider: GitProviderInputs): void {
         expect(head.status, describeOutput(head.output)).toBe(0);
       }, TEST_TIMEOUT_MS);
 
+      // Where the service mediates LFS (github), a download batch is a read
+      // carrying the credential. gitlab.com has no git-lfs mapping (its batch
+      // response hands a user a project-wide LFS token that can push), so
+      // there the download batch must be held as a write and carry no
+      // credential: L5 proves that refusal instead of skipping GitLab.
       test.skipIf(!provider.lfsRepository)(
-        `L5: an LFS batch download is a read and an LFS batch upload waits for approval${provider.lfsRepository ? "" : ` (skipped: ${provider.envNames.lfsRepo} is unset)`}`,
+        `L5: ${provider.lfsMediated ? "an LFS batch download is a read" : "LFS is not mediated: an LFS batch download waits for approval with no credential"}, and an LFS batch upload waits for approval${provider.lfsRepository ? "" : ` (skipped: ${provider.envNames.lfsRepo} is unset)`}`,
         async () => {
           const lfs = provider.lfsRepository;
           if (!lfs) return;
@@ -384,6 +392,7 @@ function defineProviderSuite(provider: GitProviderInputs): void {
           const size = Number(/^size (\d+)$/mu.exec(clone.stdout)?.[1]);
           expect(oid, `could not parse the LFS pointer: ${describeOutput(clone.stdout)}`).toBeDefined();
 
+          const injectedBeforeDownload = countOccurrences(proxyLogs(proxyId), injectedLine(provider));
           const download = await runDecidingHeldWrites({
             fixture, proxyId, sessionId,
             label: `${provider.id} lfs download`,
@@ -391,15 +400,28 @@ function defineProviderSuite(provider: GitProviderInputs): void {
               + " && cat /tmp/rf-l5-download.json",
             host: provider.host,
             pathPart: "/info/lfs/objects/batch",
-            // Any held download would be a failure; denying it keeps that loud.
+            // Mediated: any held download is a failure; denying it keeps that
+            // loud. Not mediated: the held download is denied, so it never
+            // reaches the provider.
             decision: "deny",
           });
-          expect(download.decided, "an LFS download batch request waited for write approval").toEqual([]);
-          expect(download.exitCode, `the LFS download batch request failed: ${describeOutput(download.log)}`).toBe(0);
-          const answer = parseProbeAnswer(download.log);
-          expect(answeredByUpstream(answer) && answer.code === "200", `the provider did not answer the download batch: ${describeOutput(download.log)}`)
-            .toBe(true);
-          expect(download.log, "the download batch answer offered no download action").toMatch(/"download"\s*:/u);
+          if (provider.lfsMediated) {
+            expect(download.decided, "an LFS download batch request waited for write approval").toEqual([]);
+            expect(download.exitCode, `the LFS download batch request failed: ${describeOutput(download.log)}`).toBe(0);
+            const answer = parseProbeAnswer(download.log);
+            expect(answeredByUpstream(answer) && answer.code === "200", `the provider did not answer the download batch: ${describeOutput(download.log)}`)
+              .toBe(true);
+            expect(download.log, "the download batch answer offered no download action").toMatch(/"download"\s*:/u);
+            expect(countOccurrences(proxyLogs(proxyId), injectedLine(provider)), "the download batch carried no credential")
+              .toBeGreaterThan(injectedBeforeDownload);
+          } else {
+            expect(download.decided, "the unmediated LFS download batch request was not held for approval").toHaveLength(1);
+            const refused = parseProbeAnswer(download.log);
+            expect(refused.code, `the denied download batch was not refused by the proxy: ${describeOutput(download.log)}`).toBe("403");
+            expect(refused.blocked, "the download refusal did not come from the proxy").toBeDefined();
+            expect(countOccurrences(proxyLogs(proxyId), injectedLine(provider)), "a credential was injected on an unmediated LFS batch")
+              .toBe(injectedBeforeDownload);
+          }
 
           const uploadOid = crypto.randomBytes(32).toString("hex");
           const upload = await runDecidingHeldWrites({

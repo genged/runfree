@@ -4,6 +4,8 @@ import path from "node:path";
 
 import { afterEach, describe, expect, test } from "vitest";
 
+import { SERVICES } from "../../../scripts/services.ts";
+
 import { gitProviderSuiteConfig, hostCommandSourceArgv, parseProviderRepository } from "./git-provider-config.ts";
 
 const GITHUB_INPUTS = {
@@ -70,6 +72,15 @@ describe("gitProviderSuiteConfig", () => {
     expect(github.repository.httpsUrl).toBe("https://github.com/runfree-test/private-probe.git");
     expect(github.source).toBe("git-probe-github");
     expect(github.lfsRepository?.sshUrl).toBe("git@github.com:runfree-test/lfs-probe.git");
+    // L5's expectation follows the shipped service: LFS is mediated where the
+    // service has a git-lfs mapping on the provider host.
+    for (const provider of config.providers) {
+      const mapped = (SERVICES[provider.service]?.credential?.credentials ?? [])
+        .some((credential) => credential.host === provider.host && credential.protocol === "git-lfs");
+      expect(provider.lfsMediated, provider.id).toBe(mapped);
+    }
+    expect(github.lfsMediated).toBe(true);
+    expect(gitlab.lfsMediated).toBe(false);
   });
 });
 

@@ -508,7 +508,8 @@ export const SERVICES: Record<string, Service> = {
       "release assets and LFS objects: objects.githubusercontent.com (broad multi-tenant host)",
       "avatar images: avatars.githubusercontent.com",
       "the credential is injected as Authorization: Bearer on every api.github.com and raw.githubusercontent.com request",
-      "on github.com the credential is injected as Authorization: Basic (username x-access-token) only on git smart-HTTP and Git LFS requests; other github.com paths, including the web UI, get no credential",
+      "on github.com the credential is injected as Authorization: Basic (username x-access-token) only on git smart-HTTP and Git LFS API requests; other github.com paths, including the web UI, get no credential",
+      "a Git LFS download batch request to github.com runs without approval; the object URLs and headers GitHub returns in it reach the agent",
       "an Authorization header the agent sends to github.com, api.github.com, or raw.githubusercontent.com is replaced or removed; with no token stored, requests go out anonymously",
     ],
     credential: {
@@ -525,6 +526,13 @@ export const SERVICES: Record<string, Service> = {
           scheme: "basic",
           username: "x-access-token",
           protocol: "git-http",
+        },
+        {
+          host: "github.com",
+          header: "Authorization",
+          scheme: "basic",
+          username: "x-access-token",
+          protocol: "git-lfs",
         },
       ],
     },
@@ -548,12 +556,13 @@ export const SERVICES: Record<string, Service> = {
     explanations: [
       "git over HTTPS, web UI, REST/GraphQL API, and package registries: gitlab.com (API under /api/)",
       "the GitLab Container Registry (registry.gitlab.com) is a separate broad host; allow it explicitly if you push or pull images",
-      "the credential is injected as Authorization: Bearer on gitlab.com /api/ requests, and as Authorization: Basic (username oauth2) only on git smart-HTTP and Git LFS requests; other gitlab.com paths, including the web UI, get no credential",
+      "the credential is injected as Authorization: Bearer on gitlab.com /api/ requests, and as Authorization: Basic (username oauth2) only on git smart-HTTP requests; other gitlab.com paths, including the web UI, get no credential",
+      "Git LFS is not mediated on gitlab.com: LFS batch requests carry no credential and need write approval, because GitLab answers them with a project-wide LFS token that can push",
       "an Authorization header the agent sends to gitlab.com is removed or replaced on every path; with no token stored, requests go out anonymously",
     ],
     credential: {
       tokenName: "gitlab",
-      tokenDescription: "GitLab access token for API, package registry, and git over HTTPS requests",
+      tokenDescription: "GitLab access token for API, package registry, and git over HTTPS requests (not Git LFS)",
       allowAnonymous: true,
       agentEnv: ["GITLAB_TOKEN", "GL_TOKEN"],
       credentials: [
