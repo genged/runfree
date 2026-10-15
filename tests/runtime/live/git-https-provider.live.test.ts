@@ -370,7 +370,9 @@ function defineProviderSuite(provider: GitProviderInputs): void {
       // carrying the credential. gitlab.com has no git-lfs mapping (its batch
       // response hands a user a project-wide LFS token that can push), so
       // there the download batch must be held as a write and carry no
-      // credential: L5 proves that refusal instead of skipping GitLab.
+      // credential: L5 approves the held batch so it reaches the provider,
+      // then proves the provider answered it anonymously (the LFS repository
+      // is private) and no credential was injected, instead of skipping GitLab.
       test.skipIf(!provider.lfsRepository)(
         `L5: ${provider.lfsMediated ? "an LFS batch download is a read" : "LFS is not mediated: an LFS batch download waits for approval with no credential"}, and an LFS batch upload waits for approval${provider.lfsRepository ? "" : ` (skipped: ${provider.envNames.lfsRepo} is unset)`}`,
         async () => {
@@ -401,9 +403,9 @@ function defineProviderSuite(provider: GitProviderInputs): void {
             host: provider.host,
             pathPart: "/info/lfs/objects/batch",
             // Mediated: any held download is a failure; denying it keeps that
-            // loud. Not mediated: the held download is denied, so it never
-            // reaches the provider.
-            decision: "deny",
+            // loud. Not mediated: the held download is approved, so it reaches
+            // the provider and the no-credential assertion below can fail.
+            decision: provider.lfsMediated ? "deny" : "approve",
           });
           if (provider.lfsMediated) {
             expect(download.decided, "an LFS download batch request waited for write approval").toEqual([]);
@@ -416,9 +418,11 @@ function defineProviderSuite(provider: GitProviderInputs): void {
               .toBeGreaterThan(injectedBeforeDownload);
           } else {
             expect(download.decided, "the unmediated LFS download batch request was not held for approval").toHaveLength(1);
-            const refused = parseProbeAnswer(download.log);
-            expect(refused.code, `the denied download batch was not refused by the proxy: ${describeOutput(download.log)}`).toBe("403");
-            expect(refused.blocked, "the download refusal did not come from the proxy").toBeDefined();
+            const answer = parseProbeAnswer(download.log);
+            expect(answeredByUpstream(answer), `the approved download batch did not reach the provider: ${describeOutput(download.log)}`)
+              .toBe(true);
+            expect(["401", "403", "404"], `the provider did not refuse the anonymous download batch: ${describeOutput(download.log)}`)
+              .toContain(answer.code);
             expect(countOccurrences(proxyLogs(proxyId), injectedLine(provider)), "a credential was injected on an unmediated LFS batch")
               .toBe(injectedBeforeDownload);
           }

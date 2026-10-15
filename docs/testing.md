@@ -40,8 +40,9 @@ repository. The tranche never reads `GH_TOKEN`, `GITLAB_TOKEN`, or `gh auth`.
 and name a repository with a committed Git LFS object; without them the LFS
 case skips. On GitHub the LFS case proves a download batch is a read with the
 credential; on GitLab, where LFS is not mediated, it proves the download batch
-waits for approval with no credential. When the gate names a provider and one of its inputs is missing,
-the run fails. The file header lists every input.
+waits for approval and, once approved, reaches GitLab with no credential and is
+refused there. When the gate names a provider and one of its inputs is
+missing, the run fails. The file header lists every input.
 
 `make test-all` runs every layer in this table plus Docker Compose template
 validation. It requires the Docker CLI and a reachable daemon.
