@@ -547,6 +547,7 @@ const LOOPBACK_REASONS = {
   claudeType: (type: string) => `loopback MCP supports only Claude type "http", not ${type}`,
   credentials: "loopback MCP cannot carry credentials or OAuth: its traffic does not pass the proxy",
   key: (key: string) => `loopback MCP does not support config key ${key}`,
+  keyType: (key: string, expected: string) => `loopback MCP config key ${key} must be ${expected}`,
   localhost: "loopback MCP must use 127.0.0.1, not localhost: localhost may resolve to ::1, which the session relay does not bind",
   otherLoopback: "loopback MCP must use 127.0.0.1",
   ipv6: "loopback MCP must use 127.0.0.1: the session relay binds IPv4 loopback only",
@@ -974,13 +975,32 @@ function pickCodexLoopbackOptions(config: Record<string, unknown>): CodexGenerat
   };
 }
 
+// F7: the type each allowlisted Codex option must have. A wrongly typed option
+// is refused, never dropped: a dropped `enabled_tools` would widen the tool set
+// to every tool the server offers. Loopback only; HTTPS keeps
+// `codexGeneratedOptions`, which drops it.
+const LOOPBACK_CODEX_OPTION_TYPES: Record<string, { expected: string; valid: (value: unknown) => boolean }> = {
+  enabled: { expected: "a boolean", valid: (value) => typeof value === "boolean" },
+  required: { expected: "a boolean", valid: (value) => typeof value === "boolean" },
+  enabled_tools: { expected: "an array of strings", valid: (value) => stringArray(value) !== undefined },
+  disabled_tools: { expected: "an array of strings", valid: (value) => stringArray(value) !== undefined },
+  startup_timeout_sec: { expected: "a finite number of at least 0", valid: (value) => (numberValue(value) ?? -1) >= 0 },
+  tool_timeout_sec: { expected: "a finite number of at least 0", valid: (value) => (numberValue(value) ?? -1) >= 0 },
+};
+
 function loopbackKeyRefusal(server: NativeMcpServer): McpRefusal | undefined {
   const keys = Object.keys(server.config);
   if (hasOAuthConfig(server) || keys.some((key) => LOOPBACK_CREDENTIAL_KEYS.has(key))) {
     return { refused: LOOPBACK_REASONS.credentials };
   }
   const unknown = keys.find((key) => !LOOPBACK_ALLOWED_KEYS[server.agent].has(key));
-  return unknown === undefined ? undefined : { refused: LOOPBACK_REASONS.key(printable(unknown)) };
+  if (unknown !== undefined) return { refused: LOOPBACK_REASONS.key(printable(unknown)) };
+  if (server.agent !== "codex") return undefined;
+  for (const key of keys) {
+    const type = LOOPBACK_CODEX_OPTION_TYPES[key];
+    if (type && !type.valid(server.config[key])) return { refused: LOOPBACK_REASONS.keyType(key, type.expected) };
+  }
+  return undefined;
 }
 
 // An `http-loopback` server: auth `none`, no endpoint, no OAuth policy, no

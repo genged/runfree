@@ -291,6 +291,7 @@ const LOOPBACK_REASONS = {
   claudeType: (type: string) => `loopback MCP supports only Claude type "http", not ${type}`,
   credentials: "loopback MCP cannot carry credentials or OAuth: its traffic does not pass the proxy",
   key: (key: string) => `loopback MCP does not support config key ${key}`,
+  keyType: (key: string, expected: string) => `loopback MCP config key ${key} must be ${expected}`,
   localhost: "loopback MCP must use 127.0.0.1, not localhost: localhost may resolve to ::1, which the session relay does not bind",
   otherLoopback: "loopback MCP must use 127.0.0.1",
   ipv6: "loopback MCP must use 127.0.0.1: the session relay binds IPv4 loopback only",
@@ -362,6 +363,14 @@ const CODEX_REFUSED: Record<string, { toml: string[]; reason: string }> = {
   cwd: { toml: ['cwd = "/x"'], reason: LOOPBACK_REASONS.key("cwd") },
   command: { toml: ['command = "x"'], reason: LOOPBACK_REASONS.key("command") },
   env: { toml: ['env = { A = "b" }'], reason: LOOPBACK_REASONS.key("env") },
+  // F7: an allowlisted key with the wrong type is refused, not dropped: a
+  // dropped `enabled_tools` would widen the tool set to every tool.
+  enabledString: { toml: ['enabled = "no"'], reason: LOOPBACK_REASONS.keyType("enabled", "a boolean") },
+  requiredNumber: { toml: ["required = 1"], reason: LOOPBACK_REASONS.keyType("required", "a boolean") },
+  enabledToolsString: { toml: ['enabled_tools = "a"'], reason: LOOPBACK_REASONS.keyType("enabled_tools", "an array of strings") },
+  disabledToolsTable: { toml: ["disabled_tools = { a = 1 }"], reason: LOOPBACK_REASONS.keyType("disabled_tools", "an array of strings") },
+  startupNegative: { toml: ["startup_timeout_sec = -1"], reason: LOOPBACK_REASONS.keyType("startup_timeout_sec", "a finite number of at least 0") },
+  toolTimeoutString: { toml: ['tool_timeout_sec = "5"'], reason: LOOPBACK_REASONS.keyType("tool_timeout_sec", "a finite number of at least 0") },
 };
 
 function codexTable(name: string, url: string, lines: string[]): string {
@@ -542,6 +551,27 @@ describe("http-loopback MCP classification and preparation", () => {
       expect(entry("codex", name).decision, name).toEqual({ status: "unsupported", reason });
     }
     expect(prepare().codex).not.toContain("mcp_servers");
+  });
+
+  test("F7: zero and fractional timeouts and empty tool lists are well-typed loopback options", () => {
+    writeUserCodex(codexTable("loop", "http://127.0.0.1:8089/mcp", [
+      "enabled_tools = []",
+      "startup_timeout_sec = 0",
+      "tool_timeout_sec = 1.5",
+    ]));
+    expect(entry("codex", "loop").decision).toEqual({ status: "imported" });
+    const codex = prepare().codex;
+    for (const line of ["enabled_tools = []", "startup_timeout_sec = 0", "tool_timeout_sec = 1.5"]) {
+      expect(codex).toContain(`\n${line}\n`);
+    }
+  });
+
+  test("F7: the type check is loopback-only; an HTTPS Codex entry still drops a wrongly typed option", () => {
+    writeUserCodex(codexTable("remote", "https://mcp.example.com/mcp", ['enabled = "no"', "tool_timeout_sec = -1"]));
+    expect(entry("codex", "remote").decision).toEqual({ status: "imported" });
+    const codex = prepare().codex;
+    expect(codex).toContain('[mcp_servers.remote]\nurl = "https://mcp.example.com/mcp"\n');
+    expect(codex).not.toMatch(/^enabled\s*=/m);
   });
 
   test("S3: allowed Codex keys survive into the generated TOML; no OAuth lines are emitted", () => {
