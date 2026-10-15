@@ -18,6 +18,7 @@ import {
   type OAuthSeedJson,
 } from "@runfree/runtime-contracts/oauth-mediation-policy";
 import {
+  isIpLiteralHostname,
   normalizeHostname,
   normalizePathPrefix,
   type CredentialPolicyJson,
@@ -511,6 +512,11 @@ function normalizeMcpUrl(url: string, server: NativeMcpServer): { host: string; 
   }
   if (parsed.protocol !== "https:") {
     warn(`mcp: skipped ${server.agent} server ${printable(server.name)} reason=remote HTTP MCP must use https`);
+    return undefined;
+  }
+  const bare = parsed.hostname.startsWith("[") ? parsed.hostname.slice(1, -1) : parsed.hostname;
+  if (isIpLiteralHostname(bare)) {
+    warn(`mcp: skipped ${server.agent} server ${printable(server.name)} reason=HTTPS MCP endpoint must be a hostname, not an IP address`);
     return undefined;
   }
   let host: string;
