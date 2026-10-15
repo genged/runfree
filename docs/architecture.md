@@ -223,7 +223,7 @@ The `proxy` service is the trusted network boundary. It enforces:
 - GraphQL query/mutation classification for declared GraphQL paths;
 - write actions: `allow`, `ask`, or `deny`;
 - credential header stripping and proxy-managed credential injection,
-  including credentials scoped to git smart-HTTP and Git LFS requests;
+  including credentials scoped to git smart-HTTP or Git LFS requests;
 - OAuth handle mediation;
 - opaque TCP splices to approved [host services](#host-services), and nothing
   else under the reserved `runfree.internal` suffix;
@@ -1343,9 +1343,11 @@ WebSocket upgrades (under `ask`/`deny`), a method-override header, git push,
 other than GET/HEAD/OPTIONS. `readPathPrefixes`, the git upload-pack
 exemption, and a Git LFS batch whose body proves it is a download make some
 POSTs reads; path confusion cancels those exemptions. The two git exemptions
-apply only on hosts that declare git handling. The proof rules for the LFS
-body are in [security.md](security.md#git-over-https). MCP
-tool calls are classified by operation policy.
+apply only on hosts that declare git handling, and the LFS one only where the
+host's policy also mediates Git LFS with a credential destination for it.
+The proof rules for the LFS body are in
+[security.md](security.md#git-over-https). MCP tool calls are classified by
+operation policy.
 
 **OAuth protocol reads.** On an `ask` host (never `deny`), a POST is a read
 when the OAuth mediator proves it is an exchange it mediates
@@ -1831,17 +1833,24 @@ fixed, non-secret username, which is what git over HTTPS expects. A
 destination can be narrowed by a path prefix, by a protocol scope, or both.
 
 A protocol scope names a kind of request that the proxy recognizes on its
-own. Today the only one is git over HTTPS: smart-HTTP fetch and push and Git
-LFS. Policy names the kind; proxy code defines it, and a request the proxy
-cannot recognize unambiguously gets nothing. A new kind is added only for a
-publicly specified wire protocol that the proxy can tell from the request
+own. There are two: git smart HTTP (ref discovery, fetch, and push) and the
+Git LFS batch and lock API. One recognizer sorts each git request into
+exactly one of them, so no request is both. Policy names the kind; proxy code
+defines it, and a request the proxy cannot recognize unambiguously gets
+nothing. A Git LFS scope also opts the host into treating a proven LFS
+download as a read, so the agent gets the LFS server's answer without
+approval. The `github` service has one. The `gitlab` service does not,
+because GitLab's answer carries a project-wide token that can push. A new
+kind is added only for a publicly specified wire protocol that the proxy can tell from the request
 itself, with its own fail-closed recognizer and tests. A vendor's own
 endpoint layout uses a path prefix or a request rule instead.
 
 For each request the proxy picks the most specific matching destination of
-the host, with a protocol match ranking above a path prefix, and validation
-refuses destinations that could tie. The exact rules are in
-[cli.md](cli.md#user-defined-services) and
+the host, with a protocol match ranking above a path prefix across all the
+host's headers, and validation refuses destinations that could tie. Because
+the choice is per host, any change to the destinations of a host that has
+more than one needs host approval, even one that looks like a narrowing. The
+exact rules are in [cli.md](cli.md#user-defined-services) and
 [security.md](security.md#git-over-https).
 
 `runfree up`, a cold start, and a replaced proxy read every source before the

@@ -38,7 +38,9 @@ existing `runfree credential source` whose token can only read and write that
 repository. The tranche never reads `GH_TOKEN`, `GITLAB_TOKEN`, or `gh auth`.
 `TEST_RUNTIME_GITHUB_LFS_REPO` and `TEST_RUNTIME_GITLAB_LFS_REPO` are optional
 and name a repository with a committed Git LFS object; without them the LFS
-case skips. When the gate names a provider and one of its inputs is missing,
+case skips. On GitHub the LFS case proves a download batch is a read with the
+credential; on GitLab, where LFS is not mediated, it proves the download batch
+waits for approval with no credential. When the gate names a provider and one of its inputs is missing,
 the run fails. The file header lists every input.
 
 `make test-all` runs every layer in this table plus Docker Compose template

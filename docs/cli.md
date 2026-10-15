@@ -457,8 +457,8 @@ Revision changes in this version:
 
 | Service | Revision | Change |
 | --- | --- | --- |
-| `github` | 2 -> 3 | Adds the `github` token as `Authorization: Basic` (username `x-access-token`) on `github.com`, only on git smart-HTTP and Git LFS requests (see [Git over HTTPS and SSH remotes](#git-over-https-and-ssh-remotes)). Other `github.com` paths, including the web UI, get no credential, and an `Authorization` header the agent sends to `github.com` is now removed or replaced. |
-| `gitlab` | 1 -> 2 | Adds the `gitlab` token as `Authorization: Basic` (username `oauth2`) on `gitlab.com` git smart-HTTP and Git LFS requests, beside the existing Bearer destination on `/api/`. With no token stored, `gitlab.com` requests now go out anonymously instead of being refused. |
+| `github` | 2 -> 3 | Adds the `github` token as `Authorization: Basic` (username `x-access-token`) on `github.com`, only on git smart-HTTP requests (`protocol: "git-http"`) and Git LFS requests (`protocol: "git-lfs"`) (see [Git over HTTPS and SSH remotes](#git-over-https-and-ssh-remotes)). Other `github.com` paths, including the web UI, get no credential, and an `Authorization` header the agent sends to `github.com` is now removed or replaced. |
+| `gitlab` | 1 -> 2 | Adds the `gitlab` token as `Authorization: Basic` (username `oauth2`) on `gitlab.com` git smart-HTTP requests (`protocol: "git-http"`), beside the existing Bearer destination on `/api/`. Git LFS is not mediated on `gitlab.com`: LFS requests get no credential, and an LFS batch request is a write. With no token stored, `gitlab.com` requests now go out anonymously instead of being refused. |
 
 Both new revisions use the `basic` scheme and a `protocol` scope, so applying
 either one makes `.runfree/network-policy.json` desired policy version 3.
@@ -490,15 +490,26 @@ Each destination has these fields:
 | `scheme` | yes | `bearer` (`Bearer <token>`), `raw` (the token as is), or `basic` (`Basic base64(<username>:<token>)`). |
 | `username` | with `basic` only | Required with `basic` and refused with any other scheme. 1 to 64 printable ASCII characters, with no space, control character, or `:`. It is policy data, not a secret. |
 | `pathPrefix` | no | Inject only on matching request paths. |
-| `protocol` | no | `git-http` is the only value: inject only on the git smart-HTTP and Git LFS requests listed in [Git over HTTPS and SSH remotes](#git-over-https-and-ssh-remotes). With a `pathPrefix` too, the request must match both. |
+| `protocol` | no | `git-http`: inject only on the git smart-HTTP requests (ref discovery, fetch, push) listed in [Git over HTTPS and SSH remotes](#git-over-https-and-ssh-remotes). `git-lfs`: inject only on the Git LFS batch and lock requests listed there. With a `pathPrefix` too, the request must match both. |
 
-On one host and header, at most one destination may have a `protocol`, and no
-two destinations may have the same `protocol` and `pathPrefix`. The proxy
-chooses among a host's destinations per host, not per header: when a
-`protocol` destination matches the request, only `protocol` destinations are
-used; otherwise the longest matching `pathPrefix` wins, as before. A definition that breaks a rule is refused
-before anything is written. Enabling a service whose destinations use
-`basic`, `username`, or `protocol` makes the desired policy version 3.
+On one host and header, at most one destination may have each `protocol`, and
+no two destinations may have the same `protocol` and `pathPrefix`. No request
+is both a `git-http` and a `git-lfs` request, so at most one `protocol`
+destination per header matches a request. The proxy chooses among a host's
+destinations per host, not per header: when any `protocol` destination of the
+host matches the request, only `protocol` destinations are used, and a
+destination without `protocol` is not injected on that request, even on
+another header. Otherwise the longest matching `pathPrefix` wins, as before. A
+definition that breaks a rule is refused before anything is written. Enabling
+a service whose destinations use `basic`, `username`, or `protocol` makes the
+desired policy version 3.
+
+A `git-lfs` destination also opts its host into Git LFS mediation: on a host
+with a git handling rule, a Git LFS batch request whose body proves it is a
+download is a read only when a `git-lfs` destination of that host matches it.
+Use it only for an LFS server whose batch responses do not hand back a
+credential broader than one object transfer (see
+[security.md](security.md#git-over-https)).
 
 These fields let a host with no curated service, such as GitHub Enterprise
 Server or self-hosted GitLab, get a git credential. One limitation: a
@@ -520,29 +531,49 @@ Basic auth (username `x-access-token` on `github.com`, `oauth2` on
 The proxy attaches it only to these requests, where `…` is at least one
 repository path segment:
 
-| Request | Method | Path ends with |
-| --- | --- | --- |
-| Ref discovery | `GET` | `/info/refs`, with exactly one `service=git-upload-pack` or `service=git-receive-pack` query parameter |
-| Fetch | `POST` | `/git-upload-pack` |
-| Push | `POST` | `/git-receive-pack` |
-| Git LFS batch | `POST` | `/info/lfs/objects/batch` |
-| Git LFS locks | `GET`, `POST` | `/info/lfs/locks` (`GET` or `POST`), `/info/lfs/locks/verify`, `/info/lfs/locks/<id>/unlock` (`POST`) |
+| Request | Method | Path ends with | `protocol` |
+| --- | --- | --- | --- |
+| Ref discovery | `GET` | `/info/refs`, with exactly one `service=git-upload-pack` or `service=git-receive-pack` query parameter | `git-http` |
+| Fetch | `POST` | `/git-upload-pack` | `git-http` |
+| Push | `POST` | `/git-receive-pack` | `git-http` |
+| Git LFS batch | `POST` | `/info/lfs/objects/batch` | `git-lfs` |
+| Git LFS locks | `GET`, `POST` | `/info/lfs/locks` (`GET` or `POST`), `/info/lfs/locks/verify`, `/info/lfs/locks/<id>/unlock` (`POST`) | `git-lfs` |
+
+The `github` service has both a `git-http` and a `git-lfs` destination on
+`github.com`. The `gitlab` service has only `git-http` on `gitlab.com`, so Git
+LFS is not mediated there in this release: LFS requests to `gitlab.com` get no
+credential, and every LFS batch request, a download included, is a write that
+waits for approval under `ask`. GitLab answers an authenticated batch request
+with a project-wide LFS token that can push, so the agent must not get one
+without your approval. A private GitLab LFS fetch therefore fails.
 
 Methods must match exactly, and the raw path and its decoded form must both
 end with the same plain endpoint. An encoded, `;param`, trailing `/` or `.`,
-or otherwise ambiguous spelling gets no credential. Any other path on the host
-gets no credential either.
+or otherwise ambiguous spelling gets no credential. These are not git requests
+either, and get no credential:
+
+- a `POST` endpoint with a query string (only the `GET` lock listing takes
+  one);
+- a ref discovery query that contains a `;`;
+- a path whose first segment is `api` (in any case or encoding), including a
+  `github.com` owner named `api`;
+- a path with a segment that is exactly `-`, such as GitLab's `/-/` routes.
+
+Any other path on the host gets no credential either.
 
 Write approval applies as before. A fetch is a read. A push is a git push
 write: under the default `ask` posture it waits for `runfree approve`, and
-once approved it goes out with your token. To refuse pushes outright:
+once approved it goes out with your token. A ref discovery request that names
+`service=git-receive-pack` in any case or encoding, or whose query contains a
+`;`, counts as a push. To refuse pushes outright:
 
 ```bash
 runfree host rules github.com --deny-git-push
 ```
 
-A Git LFS batch request whose body proves it is a download is a read; an
-upload batch and every lock request are writes. The proof rules are in
+On `github.com`, a Git LFS batch request whose body proves it is a download is
+a read; an upload batch and every lock request are writes. On `gitlab.com`,
+every LFS batch request is a write. The proof rules are in
 [security.md](security.md#git-over-https).
 
 #### SSH remotes
