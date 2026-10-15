@@ -20,6 +20,14 @@
 //      the host log shows that nonce arriving on P.
 //   2. unapproved pairs (wrong port, wrong name, the suffix on 443) get a raw
 //      403 from the proxy and the host sees no connection at all.
+//   2b. loopback MCP grants no reach (T1, S5): a project `.mcp.json` entry
+//      `http://127.0.0.1:<Q>/mcp` on the unapproved port, enabled without a
+//      terminal, lands in a new session's generated Claude config, leaves its
+//      `RUNFREE_HOST_SERVICES` unchanged, and gets no in-session listener on Q
+//      (while the relay's row on P shows the read works). An in-session dial
+//      to the URL's host and port is refused (ECONNREFUSED), the host listener
+//      on Q records zero accepts (and then one, for a direct host connection:
+//      the positive control), and the proxy logs nothing naming Q.
 //   3. no direct path: the session cannot connect to <gateway>:P; root in the
 //      proxy times out on it (a dropped SYN), while uid 1001 in the proxy
 //      connects (the positive control that makes root's timeout meaningful).
@@ -45,6 +53,13 @@
 //      The session's processes die with the container, so this does not
 //      separate the proxy's revoke-driven socket cut from an ordinary client
 //      close; it proves only that no splice outlives its session.
+//   8b. loopback MCP reaches an approved host service (T8, Claude): a host
+//      MCP stub on port P', approved as host service `mcpstub`, and a project
+//      loopback entry for it. After the session's relay listens on P', the
+//      pinned Claude lists its MCP servers with the session's own proxy
+//      environment; the stub logs `initialize` and `tools/list`, and the proxy
+//      logs no request to 127.0.0.1. The probe command is UNVERIFIED (see the
+//      case). Codex is a skipped case: no probe is known (spec Q2).
 //   9. gateway change and reclaim (HS8): a rewritten `/etc/hosts` alias makes
 //      host services refuse with `gateway address changed`; the firewall
 //      drains the pinned pair, and the request proxy's gateway watch cuts the
@@ -85,6 +100,10 @@
 //     coverage (multi-owner, multi-address, malformed/truncated/timeout
 //     output, the ordered-warning-line equivalence with the per-port probe)
 //     is unit-level: host-listener-snapshot.test.ts.
+//   - T8 for Codex (spec Q2): no command is known that makes the pinned
+//     codex-cli connect to its MCP servers without a model login, so case 8b
+//     has no Codex half. The Claude half's probe command is the plan's
+//     candidate and must be confirmed on a Docker host.
 
 
 import childProcess from "node:child_process";
@@ -608,6 +627,232 @@ function hostDataEvents(echo: EchoServer, id: number): number {
 }
 
 // ---------------------------------------------------------------------------
+// Loopback MCP (T1, T8): the host MCP stub, the in-session listener read, and
+// the generated config read.
+// ---------------------------------------------------------------------------
+
+/** The project `.mcp.json` entry T1 points at the unapproved port Q. */
+const LOOPBACK_PROBE_SERVER = "qprobe";
+/** The T8 MCP server name and the host service that backs its port. */
+const STUB_SERVER = "mcpstub";
+const STUB_SERVICE_NAME = "mcpstub";
+const SESSION_CLAUDE_MCP_CONFIG = "/runfree/mcp/claude.json";
+/**
+ * The pinned Claude binary in the sandbox project image. The fixture's image
+ * moves the real `claude-real` here and puts a recorder stand-in in its place
+ * (fixture.ts, MANAGED_IMAGE_DOCKERFILE_STANZA), so `claude` in the session is
+ * not the real agent. Calling this path directly skips the `claude` launcher,
+ * so the probe passes the two flags the launcher would prepend itself.
+ */
+const PINNED_CLAUDE = "/usr/local/libexec/runfree/claude-real-pinned";
+
+/**
+ * A minimal Streamable-HTTP MCP server for the host, run as a child process
+ * for the same reason as the echo server. It answers `initialize`,
+ * `notifications/initialized` (202, no body), `tools/list` (one tool, `ping`),
+ * and `ping`; GET on the endpoint gets 405 (no server-sent event stream), and
+ * any other path 404. Every request is logged before it is answered, with the
+ * JSON-RPC method names it carried: the log is the host's own view of which
+ * MCP calls arrived.
+ */
+const MCP_STUB_PROGRAM = `
+const http = require("node:http");
+const fs = require("node:fs");
+const log = process.argv[1];
+const record = (event) => fs.appendFileSync(log, JSON.stringify(event) + "\\n");
+const server = http.createServer((req, res) => {
+  let body = "";
+  req.setEncoding("utf8");
+  req.on("data", (chunk) => { body += chunk; if (body.length > 1048576) req.destroy(); });
+  req.on("end", () => {
+    let parsed;
+    try { parsed = body ? JSON.parse(body) : undefined; } catch { parsed = undefined; }
+    const batch = Array.isArray(parsed) ? parsed : parsed ? [parsed] : [];
+    const pathname = new URL(req.url || "/", "http://stub").pathname;
+    record({
+      httpMethod: req.method,
+      path: pathname,
+      rpc: batch.map((message) => message && typeof message.method === "string" ? message.method : null),
+      userAgent: req.headers["user-agent"] || null,
+    });
+    if (pathname !== "/mcp") { res.writeHead(404); res.end(); return; }
+    if (req.method !== "POST") { res.writeHead(405, { allow: "POST" }); res.end(); return; }
+    const answers = [];
+    for (const message of batch) {
+      if (!message || message.id === undefined || message.id === null) continue;
+      const reply = (result) => answers.push({ jsonrpc: "2.0", id: message.id, result });
+      if (message.method === "initialize") {
+        reply({
+          protocolVersion: (message.params && message.params.protocolVersion) || "2025-06-18",
+          capabilities: { tools: {} },
+          serverInfo: { name: "runfree-livetest-mcp-stub", version: "0.0.0" },
+        });
+      } else if (message.method === "tools/list") {
+        reply({ tools: [{ name: "ping", description: "Runfree live-test stub tool", inputSchema: { type: "object", properties: {} } }] });
+      } else if (message.method === "ping") {
+        reply({});
+      } else {
+        answers.push({ jsonrpc: "2.0", id: message.id, error: { code: -32601, message: "method not found" } });
+      }
+    }
+    if (answers.length === 0) { res.writeHead(202); res.end(); return; }
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify(Array.isArray(parsed) ? answers : answers[0]));
+  });
+});
+server.once("error", (error) => { process.stderr.write(String(error) + "\\n"); process.exit(1); });
+server.listen(0, "127.0.0.1", () => process.stdout.write(JSON.stringify({ port: server.address().port }) + "\\n"));
+`;
+
+type McpStubRequest = Readonly<{ httpMethod: string; path: string; rpc: readonly (string | null)[]; userAgent: string | null }>;
+
+type McpStub = Readonly<{
+  port: number;
+  requests(): readonly McpStubRequest[];
+  stop(): void;
+}>;
+
+async function startMcpStub(): Promise<McpStub> {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "runfree-host-service-mcp-stub."));
+  const logPath = path.join(dir, "requests.jsonl");
+  fs.writeFileSync(logPath, "");
+  const child = childProcess.spawn(process.execPath, ["-e", MCP_STUB_PROGRAM, logPath], { stdio: ["ignore", "pipe", "pipe"] });
+  let stdout = "";
+  let stderr = "";
+  child.stdout.on("data", (chunk) => { stdout += String(chunk); });
+  child.stderr.on("data", (chunk) => { stderr = (stderr + String(chunk)).slice(-4096); });
+  const deadline = Date.now() + 10_000;
+  while (!stdout.includes("\n")) {
+    if (child.exitCode !== null || Date.now() >= deadline) {
+      child.kill("SIGKILL");
+      fs.rmSync(dir, { recursive: true, force: true });
+      throw new Error(`the host MCP stub did not start: ${describeOutput(stderr)}`);
+    }
+    await sleep(50);
+  }
+  const { port: stubPort } = JSON.parse(stdout.split("\n")[0]) as { port: number };
+  return Object.freeze({
+    port: stubPort,
+    requests: () => fs.readFileSync(logPath, "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line) as McpStubRequest),
+    stop: () => {
+      child.kill("SIGKILL");
+      fs.rmSync(dir, { recursive: true, force: true });
+    },
+  });
+}
+
+/**
+ * One exchange from this test process straight to host `127.0.0.1:<port>`:
+ * the positive control that a host listener is live and that its log records
+ * the accept. Asynchronous is safe here: the listener is a child process.
+ */
+async function hostDirectEcho(hostPort: number, text: string): Promise<boolean> {
+  return await new Promise<boolean>((resolve) => {
+    let data = "";
+    const socket = net.connect({ host: "127.0.0.1", port: hostPort });
+    const finish = (echoed: boolean): void => {
+      clearTimeout(timer);
+      socket.destroy();
+      resolve(echoed);
+    };
+    const timer = setTimeout(() => finish(false), 5_000);
+    socket.on("connect", () => socket.write(`${text}\n`));
+    socket.on("data", (chunk) => { data += chunk.toString("utf8"); if (data.includes(text)) finish(true); });
+    socket.on("error", () => finish(false));
+    socket.on("close", () => finish(data.includes(text)));
+  });
+}
+
+/**
+ * The session's TCP listeners (state 0A), read from its own network
+ * namespace's `/proc/net/tcp` and, when present, `/proc/net/tcp6`: a direct
+ * kernel read, the same pattern as ESTABLISHED_FLOWS_PROGRAM. `address` is the
+ * kernel's hex form (`0100007F` is 127.0.0.1).
+ */
+const LISTENERS_PROGRAM = `
+const fs = require("node:fs");
+const listeners = [];
+for (const [family, file] of [["tcp", "/proc/net/tcp"], ["tcp6", "/proc/net/tcp6"]]) {
+  let text;
+  try { text = fs.readFileSync(file, "utf8"); } catch (error) { if (family === "tcp6") continue; throw error; }
+  for (const row of text.split("\\n").slice(1).filter(Boolean)) {
+    const fields = row.trim().split(/\\s+/);
+    if (fields[3] !== "0A") continue;
+    const [address, port] = fields[1].split(":");
+    listeners.push({ family, address, port: parseInt(port, 16) });
+  }
+}
+process.stdout.write(JSON.stringify(listeners) + "\\n");
+`;
+
+type SessionListener = Readonly<{ family: "tcp" | "tcp6"; address: string; port: number }>;
+
+function sessionListeners(sessionId: string): readonly SessionListener[] {
+  const text = dockerOrThrow("session listeners", ["exec", sessionId, "node", "-e", LISTENERS_PROGRAM]);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text.trim());
+  } catch {
+    throw new Error(`the session listener probe printed ${describeOutput(text)}`);
+  }
+  if (!Array.isArray(parsed)) throw new Error(`the session listener probe printed ${describeOutput(text)}`);
+  return parsed as SessionListener[];
+}
+
+const IPV4_LOOPBACK_HEX = "0100007F";
+
+/** True once the session's relay listens on 127.0.0.1:<port>. */
+function relayListening(sessionId: string, relayPort: number): boolean {
+  return sessionListeners(sessionId).some((listener) =>
+    listener.family === "tcp" && listener.address === IPV4_LOOPBACK_HEX && listener.port === relayPort);
+}
+
+function sessionEnvValue(sessionId: string, name: string): string | undefined {
+  const env = JSON.parse(dockerOrThrow("session env", ["inspect", "-f", "{{json .Config.Env}}", sessionId])) as string[];
+  const entry = env.find((line) => line.startsWith(`${name}=`));
+  return entry === undefined ? undefined : entry.slice(name.length + 1);
+}
+
+/** The generated Claude MCP config exactly as the session sees it. */
+function sessionClaudeMcpServers(sessionId: string): Record<string, unknown> {
+  const text = dockerOrThrow("session Claude MCP config", ["exec", sessionId, "cat", SESSION_CLAUDE_MCP_CONFIG]);
+  const parsed = JSON.parse(text) as { mcpServers?: Record<string, unknown> };
+  if (!parsed.mcpServers || typeof parsed.mcpServers !== "object") {
+    throw new Error(`${SESSION_CLAUDE_MCP_CONFIG} has no mcpServers: ${describeOutput(text)}`);
+  }
+  return parsed.mcpServers;
+}
+
+/** The proxy's structured log events (`proxy-request:` and `proxy-denial:` lines). */
+function proxyEvents(logs: string): readonly Readonly<{ line: string; fields: Record<string, unknown> }>[] {
+  const events: { line: string; fields: Record<string, unknown> }[] = [];
+  for (const line of logs.split("\n")) {
+    const match = /(?:proxy-request|proxy-denial): (\{.*\})\s*$/u.exec(line);
+    if (!match) continue;
+    try {
+      events.push({ line, fields: JSON.parse(match[1]) as Record<string, unknown> });
+    } catch {
+      // A truncated line is not evidence either way; the raw-text checks still see it.
+    }
+  }
+  return events;
+}
+
+function projectMcpJsonPath(projectRoot: string): string {
+  return path.join(projectRoot, ".mcp.json");
+}
+
+/** Adds one server to the project `.mcp.json`; returns the original bytes to restore. */
+function addProjectMcpServer(projectRoot: string, name: string, config: Record<string, unknown>): string {
+  const mcpPath = projectMcpJsonPath(projectRoot);
+  const original = fs.readFileSync(mcpPath, "utf8");
+  const current = JSON.parse(original) as { mcpServers?: Record<string, unknown> };
+  current.mcpServers = { ...(current.mcpServers ?? {}), [name]: config };
+  fs.writeFileSync(mcpPath, `${JSON.stringify(current)}\n`);
+  return original;
+}
+
+// ---------------------------------------------------------------------------
 // The tranche.
 // ---------------------------------------------------------------------------
 
@@ -751,6 +996,83 @@ describe("approved host services", () => {
     }
     expect(hostOpenCount(echo, "unapproved"), "the proxy dialled the unapproved host port").toBe(0);
     expect(hostOpenCount(echo, "approved"), "a refused CONNECT reached the approved host port").toBe(approvedOpensBefore);
+  }, TEST_TIMEOUT_MS);
+
+  test("a loopback MCP entry on an unapproved port grants no host reach (T1, S5)", async () => {
+    const unapprovedPort = echo.unapprovedPort;
+    const url = `http://127.0.0.1:${unapprovedPort}/mcp`;
+    const hostServicesBefore = sessionEnvValue(sessions[0].session.containerId, "RUNFREE_HOST_SERVICES");
+    expect(hostServicesBefore, "the standing session does not carry exactly the approved host service").toBe(`${SERVICE_NAME}:${port}`);
+    const originalMcpJson = addProjectMcpServer(fixture.projectRoot, LOOPBACK_PROBE_SERVER, { type: "http", url });
+    let probe: StandingSessionHandle | undefined;
+    let revoked = true;
+    try {
+      // No terminal (the fixture's stdin is not a TTY) and no --no-discover:
+      // a loopback entry makes no discovery call and needs no review prompt.
+      const enabled = fixture.runfree(["mcp", "enable", "claude", LOOPBACK_PROBE_SERVER, "--source", "project"]);
+      revoked = enabled.status !== 0;
+      expect(enabled.status, `mcp enable of a loopback entry failed without a terminal: ${describeOutput(enabled.output)}`).toBe(0);
+      expect(enabled.stdout).toContain(`Enable MCP server: claude ${LOOPBACK_PROBE_SERVER} (project, http-loopback/none)`);
+      expect(enabled.stdout, "enable did not show that the port has no host service")
+        .toContain(`reach=container-local 127.0.0.1:${unapprovedPort}:`);
+      expect(enabled.stdout).toContain(`enabled MCP server: claude ${LOOPBACK_PROBE_SERVER}`);
+      expect(enabled.output, "enable ran OAuth discovery for a loopback entry").not.toMatch(/Discovering OAuth hosts|discovers OAuth hosts only on a terminal/u);
+
+      probe = await startSession(true);
+      const sessionId = probe.session.containerId;
+      // The descriptor reached the session's generated config, as the
+      // normalized href...
+      const servers = sessionClaudeMcpServers(sessionId);
+      expect(servers[LOOPBACK_PROBE_SERVER], "the generated config does not carry the loopback entry").toEqual({ type: "http", url });
+      // ...and changed nothing about which host services the relay serves.
+      expect(sessionEnvValue(sessionId, "RUNFREE_HOST_SERVICES"), "mcp enable changed the session's host services")
+        .toBe(hostServicesBefore);
+
+      // Positive control for the listener read: the relay listens on the
+      // approved port P in this same session, so the reader sees relay rows.
+      await pollUntil(() => relayListening(sessionId, port), { timeoutMs: 20_000, label: `the relay to listen on 127.0.0.1:${port}` });
+      const onUnapproved = sessionListeners(sessionId).filter((listener) => listener.port === unapprovedPort);
+      expect(onUnapproved, `something in the session listens on the unapproved port ${unapprovedPort}`).toEqual([]);
+
+      // Use the entry the way a client would: dial the host and port the
+      // generated config names, from inside the session.
+      const target = new URL(String((servers[LOOPBACK_PROBE_SERVER] as { url?: unknown }).url));
+      expect(Number(target.port), "the generated URL does not name the unapproved port").toBe(unapprovedPort);
+      const opensBefore = hostOpenCount(echo, "unapproved");
+      const since = new Date().toISOString();
+      const attempt = sessionExchange(sessionId, target.hostname, Number(target.port), nonce("loopback-mcp"));
+      // ECONNREFUSED proves the dial was made and nothing in the session
+      // accepted it; a timeout or any data would not.
+      expect(attempt, `the in-session dial to 127.0.0.1:${unapprovedPort} was not refused locally`)
+        .toMatchObject({ outcome: "error", detail: "ECONNREFUSED" });
+      await sleep(2_000);
+      expect(hostOpenCount(echo, "unapproved"), "the host listener on the unapproved port accepted a connection").toBe(opensBefore);
+
+      const logs = proxyLogsSince(proxyId, since);
+      expect(logs, "the proxy logged a CONNECT for the unapproved port").not.toMatch(new RegExp(`runfree\\.internal:${unapprovedPort}\\b`, "u"));
+      const naming = proxyEvents(logs).filter(({ fields }) => fields.port === unapprovedPort);
+      expect(naming.map(({ line }) => line), "the proxy logged an event naming the unapproved port").toEqual([]);
+
+      // Positive control for the zero: the host listener on Q is live, and
+      // its log records an accept when one happens.
+      expect(await hostDirectEcho(unapprovedPort, nonce("host-control")), "the host listener on the unapproved port is not live").toBe(true);
+      await pollUntil(() => hostOpenCount(echo, "unapproved") === opensBefore + 1, {
+        timeoutMs: 5_000,
+        label: "the host log to record the control connection",
+      });
+
+      await stopSession(probe);
+      probe = undefined;
+      const revoke = fixture.runfree(["mcp", "revoke", "claude", LOOPBACK_PROBE_SERVER, "--source", "project"]);
+      revoked = revoke.status === 0;
+      expect(revoke.status, `mcp revoke failed: ${describeOutput(revoke.output)}`).toBe(0);
+      expect(revoke.stdout).toContain(`revoked project MCP server: claude ${LOOPBACK_PROBE_SERVER}`);
+    } finally {
+      // Best effort: a cleanup failure must not replace the case's own failure.
+      if (probe && sessions.includes(probe)) await stopSession(probe).catch((error: unknown) => console.warn(`T1 cleanup: ${String(error)}`));
+      if (!revoked) fixture.runfree(["mcp", "revoke", "claude", LOOPBACK_PROBE_SERVER, "--source", "project"]);
+      fs.writeFileSync(projectMcpJsonPath(fixture.projectRoot), originalMcpJson);
+    }
   }, TEST_TIMEOUT_MS);
 
   test("the gateway is reachable only by the request proxy user, and never from the session", () => {
@@ -989,6 +1311,105 @@ describe("approved host services", () => {
       label: "the host to see the splice close after its session ended",
     });
   }, TEST_TIMEOUT_MS);
+
+  // T8, Claude. UNVERIFIED PROBE COMMAND: `claude --mcp-config <file>
+  // --strict-mcp-config mcp list` is the plan's candidate for making the
+  // pinned Claude connect to its configured MCP servers without a model
+  // login. It has not been run against the pinned Claude (no Docker host was
+  // available when this case was written). Confirm on a Docker host that it
+  // (a) accepts the two flags before the `mcp list` subcommand, (b) connects
+  // to the servers in that file rather than only the user/project scopes, and
+  // (c) sends `tools/list` as well as `initialize`. If it does not, replace
+  // the command; never relax the stub assertions to fit it.
+  test("a loopback MCP entry reaches an approved host service through the relay: Claude (T8)", async () => {
+    const stub = await startMcpStub();
+    const stubPort = stub.port;
+    const url = `http://127.0.0.1:${stubPort}/mcp`;
+    let originalMcpJson: string | undefined;
+    let session: StandingSessionHandle | undefined;
+    let serviceAdded = false;
+    let enabled = false;
+    try {
+      expect(refusedHostServicePortReason(stubPort), `the OS chose a statically refused port ${stubPort}`).toBeUndefined();
+      runConverged(["host-service", "add", STUB_SERVICE_NAME, "--port", String(stubPort)]);
+      serviceAdded = true;
+      originalMcpJson = addProjectMcpServer(fixture.projectRoot, STUB_SERVER, { type: "http", url });
+      const enable = fixture.runfree(["mcp", "enable", "claude", STUB_SERVER, "--source", "project"]);
+      enabled = enable.status === 0;
+      expect(enable.status, `mcp enable failed: ${describeOutput(enable.output)}`).toBe(0);
+      expect(enable.stdout, "enable did not show the host-service reach").toContain(`reach=host-service ${STUB_SERVICE_NAME}:${stubPort}`);
+      // As in beforeAll: the session template renders host services, so the
+      // startup a production launch runs selects the agent that carries it.
+      const up = fixture.runfree(["up"]);
+      expect(up.status, `runfree up did not select the session agent: ${describeOutput(up.output)}`).toBe(0);
+
+      session = await startSession();
+      const sessionId = session.session.containerId;
+      expect(sessionEnvValue(sessionId, "RUNFREE_HOST_SERVICES"), "the session does not carry the stub's host service")
+        .toBe([`${SERVICE_NAME}:${port}`, `${STUB_SERVICE_NAME}:${stubPort}`].sort().join(","));
+      expect(sessionClaudeMcpServers(sessionId)[STUB_SERVER], "the generated config does not carry the stub entry").toEqual({ type: "http", url });
+      // Wait for the relay to bind before probing: a probe that runs first
+      // fails with a refused connection that proves nothing about the agent.
+      await pollUntil(() => relayListening(sessionId, stubPort), {
+        timeoutMs: 20_000,
+        label: `the relay to listen on 127.0.0.1:${stubPort}`,
+      });
+
+      const requestsBefore = stub.requests().length;
+      const since = new Date().toISOString();
+      // The session's own environment, proxy variables included: the threat
+      // (T8) is a client that ignores NO_PROXY and sends plain HTTP to the
+      // proxy, so the proxy variables must stay set for this probe.
+      const probe = docker([
+        "exec", sessionId, "timeout", "120",
+        PINNED_CLAUDE, "--mcp-config", SESSION_CLAUDE_MCP_CONFIG, "--strict-mcp-config", "mcp", "list",
+      ]);
+      const requests = stub.requests().slice(requestsBefore);
+      const calls = requests.flatMap((request) => request.rpc);
+      const context = `probe exit ${probe.status}, output: ${describeOutput(probe.output)}; stub saw: ${JSON.stringify(requests)}`;
+      expect(calls, `the stub never saw initialize from Claude; ${context}`).toContain("initialize");
+      expect(calls, `the stub never saw tools/list from Claude; ${context}`).toContain("tools/list");
+
+      const logs = proxyLogsSince(proxyId, since);
+      const plain = proxyEvents(logs).filter(({ fields }) => fields.host === "127.0.0.1");
+      expect(plain.map(({ line }) => line), "the proxy logged a request to 127.0.0.1 (a client ignored NO_PROXY)").toEqual([]);
+      expect(logs, "the proxy logged a plain-HTTP URL to 127.0.0.1").not.toContain(`http://127.0.0.1:${stubPort}`);
+
+      // Restore the tranche's state for the next case: no session, no stub
+      // entry, and only the echo service in the policy and the template.
+      await stopSession(session);
+      session = undefined;
+      const revoke = fixture.runfree(["mcp", "revoke", "claude", STUB_SERVER, "--source", "project"]);
+      enabled = revoke.status !== 0;
+      expect(revoke.status, `mcp revoke failed: ${describeOutput(revoke.output)}`).toBe(0);
+      runConverged(["host-service", "remove", STUB_SERVICE_NAME]);
+      serviceAdded = false;
+      const restored = fixture.runfree(["up"]);
+      expect(restored.status, `runfree up did not restore the session agent: ${describeOutput(restored.output)}`).toBe(0);
+    } finally {
+      // Best effort: a cleanup failure must not replace the case's own failure.
+      if (session && sessions.includes(session)) await stopSession(session).catch((error: unknown) => console.warn(`T8 cleanup: ${String(error)}`));
+      if (enabled) fixture.runfree(["mcp", "revoke", "claude", STUB_SERVER, "--source", "project"]);
+      if (originalMcpJson !== undefined) fs.writeFileSync(projectMcpJsonPath(fixture.projectRoot), originalMcpJson);
+      if (serviceAdded) {
+        fixture.runfree(["host-service", "remove", STUB_SERVICE_NAME]);
+        fixture.runfree(["up"]);
+      }
+      stub.stop();
+    }
+  }, TEST_TIMEOUT_MS);
+
+  // T8, Codex: no known probe. Spec open question Q2: the live per-agent
+  // probe needs a command that makes the agent connect to its configured MCP
+  // servers without a model login, and none is known for the pinned
+  // codex-cli 0.156.1 (to check on a Docker host: `codex mcp --help`). Until
+  // one is found this case stays skipped and T8 is unproven for Codex; the
+  // maintainer decides between shipping Claude-only (refusing Codex loopback
+  // entries with a named reason) and shipping both with this recorded gap.
+  // The body fails rather than passes if someone un-skips it without a probe.
+  test.skip("a loopback MCP entry reaches an approved host service through the relay: Codex (T8, spec Q2)", () => {
+    throw new Error("no Codex probe command is known (spec Q2); write one before enabling this case");
+  });
 
   test("a changed gateway refuses with a named cause, the request proxy cuts an open splice, and rebuild re-pins", async () => {
     const before = await startSession();
