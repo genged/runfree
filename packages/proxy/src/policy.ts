@@ -523,7 +523,14 @@ function isGitUploadPackRead(method: string, pathName: string): boolean {
 // trailing-`/`, trailing-`.` or NUL-hidden spelling is not a git request and
 // gets no credential. The `info/refs` form needs exactly one query parameter
 // whose (decoded, case-folded) name is `service`, spelled literally
-// `service=<value>` in the raw query. Anything not recognized returns
+// `service=<value>` in the raw query. Every POST form needs an empty query:
+// git's remote-curl posts to `<remote>/git-upload-pack|git-receive-pack`
+// and git-lfs posts batch and lock requests with their parameters in the
+// JSON body, while an origin that merges query parameters over body
+// parameters (Rails, so GitLab) would act on a query the proxy never read
+// (e.g. `objects/batch?operation=upload` with a download body). Only the GET
+// lock listing takes a query (git-lfs sends its path/id/cursor/limit/refspec
+// filters there). Anything not recognized returns
 // undefined: no credential, and write classification is unaffected.
 export type GitHttpRequestKind = "refs" | "upload-pack" | "receive-pack" | "lfs-batch" | "lfs-locks";
 
@@ -532,20 +539,25 @@ const GIT_LFS_LOCK_ID = Symbol("lock-id");
 const GIT_LFS_LOCK_ID_RE = /^[A-Za-z0-9._-]+$/u;
 const GIT_REFS_SERVICES = new Set(["git-upload-pack", "git-receive-pack"]);
 
+// What the query may carry: `service` is the info/refs rule
+// (hasSingleLiteralGitService); `none` means url.search is empty; `any` is
+// only the GET lock listing, whose filters git-lfs sends as query parameters.
 type GitHttpEndpoint = {
   kind: GitHttpRequestKind;
-  methods: ReadonlySet<string>;
+  method: "GET" | "POST";
   suffix: ReadonlyArray<string | typeof GIT_LFS_LOCK_ID>;
+  query: "service" | "none" | "any";
 };
 
 const GIT_HTTP_ENDPOINTS: readonly GitHttpEndpoint[] = [
-  { kind: "refs", methods: new Set(["GET"]), suffix: ["info", "refs"] },
-  { kind: "upload-pack", methods: new Set(["POST"]), suffix: ["git-upload-pack"] },
-  { kind: "receive-pack", methods: new Set(["POST"]), suffix: ["git-receive-pack"] },
-  { kind: "lfs-batch", methods: new Set(["POST"]), suffix: ["info", "lfs", "objects", "batch"] },
-  { kind: "lfs-locks", methods: new Set(["GET", "POST"]), suffix: ["info", "lfs", "locks"] },
-  { kind: "lfs-locks", methods: new Set(["POST"]), suffix: ["info", "lfs", "locks", "verify"] },
-  { kind: "lfs-locks", methods: new Set(["POST"]), suffix: ["info", "lfs", "locks", GIT_LFS_LOCK_ID, "unlock"] },
+  { kind: "refs", method: "GET", suffix: ["info", "refs"], query: "service" },
+  { kind: "upload-pack", method: "POST", suffix: ["git-upload-pack"], query: "none" },
+  { kind: "receive-pack", method: "POST", suffix: ["git-receive-pack"], query: "none" },
+  { kind: "lfs-batch", method: "POST", suffix: ["info", "lfs", "objects", "batch"], query: "none" },
+  { kind: "lfs-locks", method: "GET", suffix: ["info", "lfs", "locks"], query: "any" },
+  { kind: "lfs-locks", method: "POST", suffix: ["info", "lfs", "locks"], query: "none" },
+  { kind: "lfs-locks", method: "POST", suffix: ["info", "lfs", "locks", "verify"], query: "none" },
+  { kind: "lfs-locks", method: "POST", suffix: ["info", "lfs", "locks", GIT_LFS_LOCK_ID, "unlock"], query: "none" },
 ];
 
 // Exactly one query parameter names `service` (after decoding and ASCII case
@@ -578,7 +590,7 @@ export function gitHttpRequestKind(method: string, url: URL): GitHttpRequestKind
   const canonical = segmentsFromDecodedPath(decoded);
   const rawSegments = pathName.split("/");
   for (const endpoint of GIT_HTTP_ENDPOINTS) {
-    if (!endpoint.methods.has(method)) continue;
+    if (endpoint.method !== method) continue;
     const length = endpoint.suffix.length;
     // At least one repository segment before the endpoint suffix.
     if (canonical.length <= length || rawSegments.length <= length + 1) continue;
@@ -594,7 +606,8 @@ export function gitHttpRequestKind(method: string, url: URL): GitHttpRequestKind
       return raw.toLowerCase() === expected && canonicalTail[index] === expected;
     });
     if (!matches) continue;
-    if (endpoint.kind === "refs" && !hasSingleLiteralGitService(url)) return undefined;
+    if (endpoint.query === "service" && !hasSingleLiteralGitService(url)) return undefined;
+    if (endpoint.query === "none" && url.search !== "") return undefined;
     return endpoint.kind;
   }
   return undefined;
@@ -670,7 +683,9 @@ export function classifyWrite(input: {
     }
     // A Git LFS batch request proven by its body to be a download. Same host
     // gate as the upload-pack exemption (the host declares git handling); the
-    // request must be exactly POST on the canonical batch endpoint. An upload
+    // request must be exactly POST on the canonical batch endpoint with an
+    // empty query (gitHttpRequestKind), so a Rails origin cannot read an
+    // `?operation=upload` the body classifier never saw. An upload
     // batch, an unproven body, and every lock request stay writes.
     if (rule?.gitPush !== undefined && input.method === "POST" && input.lfsBodyClass === "download"
       && gitHttpRequestKind(input.method, input.url) === "lfs-batch") {

@@ -792,6 +792,36 @@ describe("proxy policy", () => {
       }
     });
 
+    // git's remote-curl posts to `<remote>/git-upload-pack|git-receive-pack`
+    // with no query, and git-lfs posts batch and lock requests to
+    // `<lfs endpoint>/objects/batch|locks|locks/verify|locks/<id>/unlock`
+    // with the parameters in the JSON body; only the GET lock listing takes a
+    // query. An origin that merges query parameters over body parameters
+    // (Rails, GitLab) would act on a query the proxy never inspected, so a
+    // POST git endpoint with any query is not a git request.
+    test("F3: a POST git endpoint with a query string gets no credential; the GET lock listing keeps its query", () => {
+      for (const repo of REPOS) {
+        for (const tail of [
+          "git-upload-pack?x=1",
+          "git-receive-pack?service=git-upload-pack",
+          "info/lfs/objects/batch?operation=upload",
+          "info/lfs/locks?path=a.bin",
+          "info/lfs/locks/verify?x",
+          "info/lfs/locks/1/unlock?force=true",
+        ]) {
+          const url = `https://github.com${repo}/${tail}`;
+          expect(gitHttpRequestKind("POST", new URL(url)), url).toBeUndefined();
+          const { result, tokenReader } = githubRequest("POST", url);
+          expect(result, url).toEqual({ headers: { accept: "*/*" } });
+          expect(tokenReader, url).not.toHaveBeenCalled();
+        }
+        // An empty query (a bare `?`) carries no parameter.
+        expect(gitHttpRequestKind("POST", new URL(`https://github.com${repo}/git-upload-pack?`))).toBe("upload-pack");
+        expect(gitHttpRequestKind("GET", new URL(`https://github.com${repo}/info/lfs/locks?path=a.bin&cursor=c&limit=10&refspec=refs%2Fheads%2Fmain`)))
+          .toBe("lfs-locks");
+      }
+    });
+
     test("T4: gist.github.com carries no github.com mapping, so a git request there passes untouched", () => {
       const { result, tokenReader } = githubRequest("GET", "https://gist.github.com/owner/abc.git/info/refs?service=git-upload-pack");
       expect(result).toEqual({});
@@ -1568,6 +1598,13 @@ describe("write classification (operation-aware read-only / approve-on-write)", 
     }
     // Only POST: other non-safe methods stay writes.
     expect(decide(batch, { gitPush: "write" }, { lfsBodyClass: "download" }, "PUT")).toBe("method");
+    // F3: GitLab (Rails) merges query parameters over the JSON body, so
+    // `?operation=upload` on a download body is an upload upstream. Any query
+    // disqualifies the read exemption.
+    for (const query of ["?operation=upload", "?x=1", "?"]) {
+      const expected = query === "?" ? "read" : "method";
+      expect(decide(`${batch}${query}`, { gitPush: "write" }, { lfsBodyClass: "download" }), query).toBe(expected);
+    }
   });
 
   // todo 118: the upload-pack read exemption ignored the HTTP method, so a

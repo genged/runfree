@@ -95,6 +95,8 @@ describe("proxy server Git LFS batch classification", () => {
       ["duplicate operation", '{"operation":"download","operation":"upload"}', BATCH_PATH],
       ["lock create", JSON.stringify({ path: "a.bin" }), "/owner/repo.git/info/lfs/locks"],
       ["download body on a decorated batch path", DOWNLOAD, `${BATCH_PATH};x`],
+      // GitLab (Rails) merges the query over the JSON body: an upload upstream.
+      ["download body with an operation query", DOWNLOAD, `${BATCH_PATH}?operation=upload`],
     ] as const) {
       const denied = await batchPost(proxy.port, upstream.port, body, pathName);
       expect(denied.statusCode, label).toBe(403);
