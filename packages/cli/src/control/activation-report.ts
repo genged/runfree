@@ -14,5 +14,7 @@ export function activationReportLine(activation: ControlActivationResult): strin
       return `${EFFECTIVE_POLICY_SAVED_LINE} (effective policy generation ${activation.controlGeneration})`;
     case "deferred":
       return EFFECTIVE_POLICY_SAVED_LINE;
+    case "waiting":
+      return `effective policy: saved, not applied: ${activation.reason}`;
   }
 }

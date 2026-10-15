@@ -466,17 +466,31 @@ export function clearActiveControlSelection(project: ProjectInfo): void {
   withControlLock(project, () => removeFileDurably(project.paths.controlProxyActivePath));
 }
 
-function publishEffectivePolicyGenerationUnlocked(
-  projectRoot: string,
-  project: ProjectInfo,
-  input: PublishEffectiveControlInput = {},
-): EffectivePolicyGeneration {
+/**
+ * The approved snapshots publication compiles, or the typed refusal raised
+ * when any is absent. Exported so activation can refuse before it inspects or
+ * replaces a running proxy, with the same refusal publication raises.
+ */
+export function requireApprovedControls(projectRoot: string, project: ProjectInfo): {
+  localPolicy: NonNullable<ReturnType<typeof readApprovedNetworkPolicy>>;
+  projectPolicy: NonNullable<ReturnType<typeof readApprovedNetworkPolicy>>;
+  runtimeIsolation: NonNullable<ReturnType<typeof readApprovedRuntimeIsolation>>;
+} {
   const projectPolicy = readApprovedNetworkPolicy(projectRoot, project, "network-project");
   const localPolicy = readApprovedNetworkPolicy(projectRoot, project, "network-local");
   const runtimeIsolation = readApprovedRuntimeIsolation(projectRoot, project);
   if (!projectPolicy || !localPolicy || !runtimeIsolation) {
     throw new ControlsNotApprovedError("network-project, network-local, and runtime-isolation approvals are required before control publication");
   }
+  return { projectPolicy, localPolicy, runtimeIsolation };
+}
+
+function publishEffectivePolicyGenerationUnlocked(
+  projectRoot: string,
+  project: ProjectInfo,
+  input: PublishEffectiveControlInput = {},
+): EffectivePolicyGeneration {
+  const { projectPolicy, localPolicy, runtimeIsolation } = requireApprovedControls(projectRoot, project);
   const selection = readControlApprovalSelection(projectRoot, project);
   if (!selection) throw new Error("control approval selection is missing");
   const compiled = compileDesiredPolicies({ project: projectPolicy, local: localPolicy });
