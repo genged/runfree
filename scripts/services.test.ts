@@ -1253,6 +1253,77 @@ describe("runfree service CLI: user-defined services", () => {
   });
 });
 
+describe("runfree service CLI: user-defined git-http credentials (O-8)", () => {
+  function forgeDefinition(credential: Record<string, unknown>): Record<string, unknown> {
+    return {
+      schemaVersion: 1,
+      id: "user-forge",
+      label: "Self-hosted forge",
+      revision: 1,
+      hosts: [{ host: "git.forge.example" }],
+      explanations: ["git over HTTPS: git.forge.example"],
+      credential: {
+        tokenDescription: "Forge token",
+        agentEnv: ["FORGE_TOKEN"],
+        credentials: [credential],
+      },
+    };
+  }
+  const basicGit = {
+    host: "git.forge.example",
+    header: "Authorization",
+    scheme: "basic",
+    username: "oauth2",
+    protocol: "git-http",
+  };
+
+  test.each([
+    ["a username with a colon", { ...basicGit, username: "a:b" }, "username must not contain ':'"],
+    ["a username with a space", { ...basicGit, username: "a b" }, "username must contain only printable ASCII"],
+    ["a username with a control character", { ...basicGit, username: "a\u001bb" }, "username must contain only printable ASCII"],
+    ["a username over 64 bytes", { ...basicGit, username: "u".repeat(65) }, "username must be at most 64 bytes"],
+    ["basic without a username", { host: "git.forge.example", header: "Authorization", scheme: "basic" }, "username is required with scheme basic"],
+    ["a username with bearer", { host: "git.forge.example", header: "Authorization", scheme: "bearer", username: "oauth2" }, "username is valid only with scheme basic"],
+    ["an unknown protocol", { ...basicGit, protocol: "git-ssh" }, "protocol must be one of: git-http"],
+  ])("custom add --from-file refuses %s before writing anything", (_name, credential, message) => {
+    writeFixtureRepo({ hosts: [], tokens: {} });
+    const source = path.join(tmpBase, "forge.json");
+    fs.writeFileSync(source, JSON.stringify(forgeDefinition(credential), null, 2));
+    const sourceBefore = fs.readFileSync(source);
+    const policyBefore = fs.readFileSync(path.join(tmp, ".runfree/network-policy.json"));
+
+    const result = runAdminCli(["service", "custom", "add", "user-forge", "--from-file", source, "--yes"]);
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain(message);
+    expect(fs.existsSync(userServicesDir())).toBe(false);
+    expect(fs.readFileSync(source)).toEqual(sourceBefore);
+    expect(fs.readFileSync(path.join(tmp, ".runfree/network-policy.json"))).toEqual(policyBefore);
+  });
+
+  test("custom add previews basic username and protocol, and enabling the service writes desired v3", () => {
+    writeApprovedDesiredFixture({ version: 2, hosts: [] });
+    const source = path.join(tmpBase, "forge.json");
+    fs.writeFileSync(source, JSON.stringify(forgeDefinition(basicGit), null, 2));
+
+    const imported = runAdminCli(["service", "custom", "add", "user-forge", "--from-file", source, "--yes"]);
+    expect(imported.status, imported.stderr).toBe(0);
+    expect(imported.stdout).toContain("credential: git.forge.example -> Authorization (basic:oauth2, protocol=git-http)");
+    const stored = JSON.parse(fs.readFileSync(path.join(userServicesDir(), "user-forge.json"), "utf8")) as {
+      schemaVersion: number;
+      credential: { credentials: unknown[] };
+    };
+    expect(stored.schemaVersion).toBe(1);
+    expect(stored.credential.credentials).toEqual([basicGit]);
+
+    const enabled = runAdminCli(["service", "enable", "user-forge", "--no-reload"]);
+    expect(enabled.status, enabled.stderr).toBe(0);
+    const policy = readDesiredPolicy();
+    expect(policy.version).toBe(3);
+    expect(policy.services?.["user-forge"]?.resolved.tokens?.["user-forge"]?.credentials).toEqual([basicGit]);
+  });
+});
+
 describe("runfree service CLI: desired disable", () => {
   test("disable removes compiled credential exposure, keeps the host-owned source, and refuses a null repeat", () => {
     writeApprovedDesiredFixture({ version: 2, hosts: [] });
