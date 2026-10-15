@@ -334,23 +334,26 @@ describe("bounded offline recovery inventory", () => {
     }
   });
 
-  test("bounds a directory flooded with non-matching junk entries", () => {
-    // Review F4: every directory entry counts against the name budget,
-    // matching or not, so a flood of junk names must not make the scan
-    // iterate (or stat) all of them.
+  test("counts non-matching junk entries at the directory name budget boundary", () => {
     const dir = path.join(stateDir, "claude", "sessions");
     fs.mkdirSync(dir, { recursive: true });
-    for (let index = 0; index < 100_000; index += 1) {
+    for (let index = 0; index < RECOVERY_LIMITS.maxNamesPerKindPerProject; index += 1) {
       fs.writeFileSync(path.join(dir, `junk-${index}.txt`), "x");
     }
-
-    const startedAtMs = Date.now();
-    const inventory = scanRecoveryInventory({ env });
-    const elapsedMs = Date.now() - startedAtMs;
-
-    expect(elapsedMs).toBeLessThan(3_000);
-    expect(inventory.truncated).toBe(true);
-    expect(inventory.items).toEqual([]);
+    // The deadline has its own test below. It must not mask a missing name
+    // limit here, even on a slow filesystem or a busy test host.
+    const clock = vi.spyOn(Date, "now").mockReturnValue(Date.now());
+    try {
+      const withinBudget = scanRecoveryInventory({ env });
+      expect(withinBudget.truncated).toBe(false);
+      expect(withinBudget.items).toEqual([]);
+      fs.writeFileSync(path.join(dir, "one-too-many.txt"), "x");
+      const overBudget = scanRecoveryInventory({ env });
+      expect(overBudget.truncated).toBe(true);
+      expect(overBudget.items).toEqual([]);
+    } finally {
+      clock.mockRestore();
+    }
   }, 30_000);
 
   test("bounds a directory scan by wall-clock deadline, independent of the name budget", () => {

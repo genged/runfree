@@ -16,7 +16,7 @@ import { createRequire } from "node:module";
 import net from "node:net";
 import path from "node:path";
 
-import { afterEach, beforeAll, describe, expect, test } from "vitest";
+import { afterEach, beforeAll, describe, expect, test, vi } from "vitest";
 
 import { BASE_AGENT_ENVIRONMENT } from "../packages/cli/src/runtime/agent-env.ts";
 import { parseHostServicesEnv } from "../packages/runtime-contracts/src/host-services.ts";
@@ -302,25 +302,24 @@ describe("startRelay", () => {
     const proxy = await fakeProxy(200);
     const ports = [await unusedPort(), await unusedPort()];
     const services = ports.map((port, index) => ({ name: `svc${index}`, port }));
-    const relay = await relayModule.startRelay({ services, proxyHost: "127.0.0.1", proxyPort: proxy.port });
+    const listening = vi.spyOn(net.Server.prototype, "listen");
+    let relay: Awaited<ReturnType<RelayModule["startRelay"]>> | undefined;
     try {
+      relay = await relayModule.startRelay({ services, proxyHost: "127.0.0.1", proxyPort: proxy.port });
       expect(relay.bound).toHaveLength(2);
-      const fs = await import("node:fs");
-      for (const { port } of relay.bound) {
-        const hexPort = port.toString(16).toUpperCase().padStart(4, "0");
-        const tcp4Listeners = fs.readFileSync("/proc/net/tcp", "utf8").split("\n").slice(1)
-          .map((line) => line.trim().split(/\s+/))
-          .filter((cols) => cols[1]?.endsWith(`:${hexPort}`) && cols[3] === "0A");
-        expect(tcp4Listeners.length).toBeGreaterThan(0);
-        for (const cols of tcp4Listeners) expect(cols[1]).toBe(`0100007F:${hexPort}`);
-
-        const tcp6Listeners = fs.readFileSync("/proc/net/tcp6", "utf8").split("\n").slice(1)
-          .map((line) => line.trim().split(/\s+/))
-          .filter((cols) => cols[1]?.endsWith(`:${hexPort}`) && cols[3] === "0A");
-        expect(tcp6Listeners).toHaveLength(0);
+      // Observe the actual sockets after listen completes, on macOS and Linux.
+      // The spy delegates to Node; it does not replace the binding operation.
+      const servers = [...new Set(listening.mock.contexts)];
+      expect(servers).toHaveLength(2);
+      const addresses = servers.map((server) => (server as net.Server).address() as net.AddressInfo);
+      expect(addresses.map(({ port }) => port).sort()).toEqual(relay.bound.map(({ port }) => port).sort());
+      for (const address of addresses) {
+        expect(address.address).toBe("127.0.0.1");
+        expect(address.family).toBe("IPv4");
       }
     } finally {
-      await relay.close();
+      listening.mockRestore();
+      await relay?.close();
     }
   });
 
