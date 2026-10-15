@@ -13,6 +13,7 @@ import childProcess from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, test } from "vitest";
+import { listSessionContainerRecordsV2 } from "../../../packages/cli/src/runtime/session-containers.ts";
 import { runfreeStateRoot } from "../../../packages/cli/src/paths.ts";
 import {
   REBIND_RECOVERY_BUDGET_MS,
@@ -35,6 +36,7 @@ import {
   type LiveFixture,
 } from "./fixture.ts";
 import {
+  ATTACHED_WAIT_TIMEOUT_MS,
   CONSUMER_CONVERGENCE_TIMEOUT_MS,
   PROVISION_TIMEOUT_MS,
   REPO_ROOT,
@@ -56,7 +58,7 @@ import {
   startRunfree,
   type LaunchRun,
 } from "./attached-support.ts";
-import { FIRST_REQUEST_HOST } from "./agent-stub.ts";
+import { answeredByUpstream, curlProbeCommand, parseProbeAnswer } from "./proxy-answer.ts";
 import { milliseconds, timing } from "./launch-timing-support.ts";
 import { samplePeerRequests } from "./warm-peer-support.ts";
 // ---------------------------------------------------------------------------
@@ -128,6 +130,7 @@ const SURVIVOR_TEARDOWN_BATCH = 4;
 const SURVIVOR_TEARDOWN_BATCH_TIMEOUT_MS = 120_000;
 /** Not seeded by the sandbox fixture, so it cannot be allowlisted sideways. */
 const ALLOWED_IP_CHANGE_HOST = "example.org";
+const WARM_PEER_REQUEST_URL = "https://example.com/";
 
 type ProcessIdentity = Readonly<{ id: string; pid: string; startedAt: string }>;
 
@@ -364,7 +367,18 @@ describe("session independence: a compatible replacement preserves and restores 
   }
 
   beforeAll(() => {
-    fixture = provisionLiveFixture({ repoRoot: REPO_ROOT, configure: configureAttachedProject });
+    fixture = provisionLiveFixture({
+      repoRoot: REPO_ROOT,
+      configure(candidate) {
+        configureAttachedProject(candidate);
+        // The judged public CLI enforces operational-service approval before
+        // startup; the admission-only peers do not run that review.
+        const enabled = candidate.runfree(["service", "enable", "agent-claude", "--no-reload"]);
+        expect(enabled.status, describeOutput(enabled.output, 4000)).toBe(0);
+        const added = candidate.runfree(["host", "add", new URL(WARM_PEER_REQUEST_URL).hostname, "--no-reload"]);
+        expect(added.status, describeOutput(added.output, 4000)).toBe(0);
+      },
+    });
     project = composeProjectName(fixture);
   }, PROVISION_TIMEOUT_MS);
 
@@ -418,27 +432,88 @@ describe("session independence: a compatible replacement preserves and restores 
     // record the launches below match.
     const up = fixture.runfree(["up"]);
     expect(up.status, describeOutput(up.output, 4000)).toBe(0);
-    const first = await startAttachedLaunch(fixture);
-    const second = await startAttachedLaunch(fixture, { allowExistingSessions: true });
-    const peers = second.attached.records.map((record) => String(record.containerId));
-    expect(peers, "the two peer sessions are not both attached").toHaveLength(2);
-    for (const peer of peers) await awaitAgentStarted(peer, `peer ${peer}`);
-    const sampler = samplePeerRequests(peers, `https://${FIRST_REQUEST_HOST}/`);
-    let judged: LaunchRun | undefined;
+    const runs: LaunchRun[] = [];
+    let judged: ReturnType<typeof startRunfree> | undefined;
+    const projectId = project.replace(/^runfree-/, "");
+    const stateDir = path.join(runfreeStateRoot(fixture.env), "projects", projectId);
+    const judgedRecords = () => listSessionContainerRecordsV2(stateDir, { projectId, composeProject: project })
+      .filter((record) => judged?.pid !== undefined && record.hostPid === judged.pid);
     try {
-      judged = await startAttachedLaunch(fixture, { allowExistingSessions: true, extraEnv: { RUNFREE_TIMINGS: "1" } });
-    } finally {
-      const samples = await sampler.stop();
+      const first = await startAttachedLaunch(fixture);
+      runs.push(first);
+      const second = await startAttachedLaunch(fixture, { allowExistingSessions: true });
+      runs.push(second);
+      // Each launch report contains only that launch's newly attached session.
+      expect(first.attached.records).toHaveLength(1);
+      expect(second.attached.records).toHaveLength(1);
+      const peerRecords = [...first.attached.records, ...second.attached.records];
+      const peers = peerRecords.map((record) => {
+        expect(record.containerId, `peer ${record.sessionId} has no container`).toBeTruthy();
+        return String(record.containerId);
+      });
+      expect(new Set(peers).size, "the peers must be distinct containers").toBe(2);
+      for (const peer of peers) {
+        await awaitAgentStarted(peer, `peer ${peer}`);
+        // The first-request stub uses .invalid to test admission decisions.
+        // This case proves continuous upstream service, so first establish it
+        // against a real allowlisted host before starting the judged launch.
+        const baseline = dockerOrThrow("warm peer baseline request", [
+          "exec", peer, "zsh", "-lc", curlProbeCommand(WARM_PEER_REQUEST_URL, { maxTimeSeconds: 15 }),
+        ]);
+        expect(answeredByUpstream(parseProbeAnswer(baseline)), describeOutput(baseline, 1000)).toBe(true);
+      }
+      const sampler = samplePeerRequests(peers, WARM_PEER_REQUEST_URL);
+      let samples: Awaited<ReturnType<typeof sampler.stop>>;
+      try {
+        // The admission-only harness skips startup, so it cannot prove the
+        // warm-peer optimization. Judge the real public CLI instead.
+        judged = startRunfree(fixture, ["claude"], { RUNFREE_TIMINGS: "1" });
+        await pollUntil(
+          () => judgedRecords().some((record) => record.state === "attached"),
+          ATTACHED_WAIT_TIMEOUT_MS,
+          "the public warm-peer launch to attach",
+          { label: "public warm-peer launch", completion: judged.completion, output: () => "launch still running" },
+        );
+      } finally {
+        samples = await sampler.stop();
+      }
       expect(samples.length, "no peer request was sampled during the launch").toBeGreaterThan(0);
       expect(samples.filter((sample) => !sample.answered), "a peer request was lost during the warm peer launch").toEqual([]);
+      // Every peer is still served, beside the new session, by both consumers.
+      const attached = judgedRecords();
+      expect(attached).toHaveLength(1);
+      expect(attached[0]?.state).toBe("attached");
+      expect(attached[0]?.containerId, "the public launch has no container").toBeTruthy();
+      const allSessions = [...peerRecords, ...attached];
+      expect(new Set(allSessions.map((record) => record.sourceIp)).size, "all three sessions must have distinct source IPs").toBe(3);
+      assertConsumersAdmitExactly(currentProxyId(), allSessions.map((record) => record.sourceIp), "after the warm peer launch");
+      dockerOrThrow("end the public warm-peer agent", ["kill", String(attached[0]?.containerId)]);
+      const completed = await judged.completion;
+      judged = undefined;
+      const output = completed.output;
+      expect(timing(output, "validation:warm-peer"), describeOutput(output, 4000)).toContain("match");
+      expect(milliseconds(output, "runtime-validation"), describeOutput(output, 4000)).toBeUndefined();
+      expect(timing(output, "startup:restore-sessions"), describeOutput(output, 4000)).toContain("skipped warm-peer");
+    } finally {
+      // End the agents and let their owners finish product teardown before
+      // afterEach verifies cleanup or afterAll removes the fixture state.
+      if (judged) {
+        const containers = judgedRecords().flatMap((record) => record.containerId ? [record.containerId] : []);
+        if (containers.length > 0) docker(["kill", ...containers]);
+        else judged.cancel();
+        await judged.completion.catch(() => undefined);
+      }
+      for (const run of runs) {
+        for (const record of run.attached.records) {
+          if (record.containerId) docker(["kill", String(record.containerId)]);
+        }
+      }
+      const reports = await Promise.all(runs.map((run) => run.completion));
+      for (const result of reports) {
+        const report = parseLaunchReport(result);
+        expect(report.failure, `a warm-peer session failed during teardown: ${report.failure}`).toBeUndefined();
+      }
     }
-    const output = judged.output();
-    expect(timing(output, "validation:warm-peer"), describeOutput(output, 4000)).toContain("match");
-    expect(milliseconds(output, "runtime-validation"), describeOutput(output, 4000)).toBeUndefined();
-    expect(timing(output, "startup:restore-sessions"), describeOutput(output, 4000)).toContain("skipped warm-peer");
-    // Every peer is still served, beside the new session, by both consumers.
-    assertConsumersAdmitExactly(currentProxyId(), judged.attached.records.map((record) => record.sourceIp), "after the warm peer launch");
-    expect(peers, "the first peer is not among the sampled sessions").toContain(String(first.attached.records[0]?.containerId));
   }, TEST_TIMEOUT_MS);
 
   test("every attached session survives a compatible proxy replacement and is re-served without relaunch", async () => {

@@ -125,6 +125,26 @@ async function waitUntil<T>(probe: () => T | undefined, timeoutMs: number, label
   throw new Error(`timed out waiting for ${label}`);
 }
 
+// Waits for a launch's session container, failing at once with the launch's
+// output if it exits first, and with its output so far on the timeout.
+async function waitForLaunchContainer(run: ReturnType<typeof startRunfree>, probe: () => string | undefined, label: string): Promise<string> {
+  let ended: Readonly<{ status: number | null; output: string }> | undefined;
+  void run.completion.then((result) => { ended = result; }, () => undefined);
+  try {
+    return await waitUntil(() => {
+      const found = probe();
+      if (found !== undefined) return found;
+      if (ended) throw new Error(`${label} exited ${ended.status} before its container appeared: ${describeOutput(ended.output, 4000)}`);
+      return undefined;
+    }, PEER_PROBE_WAIT_MS, label);
+  } catch (error) {
+    if (ended) throw error;
+    run.cancel();
+    const { output } = await run.completion;
+    throw new Error(`${error instanceof Error ? error.message : String(error)}: ${describeOutput(output, 4000)}`);
+  }
+}
+
 function processGone(pid: number): boolean {
   try {
     process.kill(pid, 0);
@@ -578,7 +598,7 @@ describe("launch latency: sub-second launch plan Phase B", () => {
       const idle = new Set(sessionContainers(fixture));
       const peer = startRunfree(fixture, ["claude"]);
       runs.push(peer);
-      const peerContainer = await waitUntil(() => sessionContainers(fixture).find((id) => !idle.has(id)), PEER_PROBE_WAIT_MS, "the peer session");
+      const peerContainer = await waitForLaunchContainer(peer, () => sessionContainers(fixture).find((id) => !idle.has(id)), "the peer session");
       const peerWatcher = (await waitUntil(() => peerProbeReads(providerDir).find((read) => read.event === "watch-done"), PEER_PROBE_WAIT_MS, "the peer watcher's first read")).watcher;
       fs.writeFileSync(path.join(providerDir, "skip"), String(peerWatcher));
       fs.writeFileSync(path.join(providerDir, "hang"), "");
@@ -587,7 +607,7 @@ describe("launch latency: sub-second launch plan Phase B", () => {
       // The exiting session: its watcher's read hangs until the session ends.
       const exiting = startRunfree(fixture, ["claude"]);
       runs.push(exiting);
-      const exitingContainer = await waitUntil(() => sessionContainers(fixture).find((id) => !idle.has(id) && id !== peerContainer), PEER_PROBE_WAIT_MS, "the exiting session");
+      const exitingContainer = await waitForLaunchContainer(exiting, () => sessionContainers(fixture).find((id) => !idle.has(id) && id !== peerContainer), "the exiting session");
       const hung = await waitUntil(() => peerProbeReads(providerDir).find((read) => read.event === "watch-hang" && read.watcher !== peerWatcher), PEER_PROBE_WAIT_MS, "the exiting watcher's read");
       const peerReadsBefore = peerProbeReads(providerDir).filter((read) => read.event === "watch-done" && read.watcher === peerWatcher).length;
       dockerOrThrow("end the exiting session", ["kill", exitingContainer]);
