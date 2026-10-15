@@ -397,24 +397,18 @@ function hasMethodOverrideHeader(headers: Record<string, string | string[] | und
 
 // Read-side counterpart of isGitPushPath: git fetch negotiation
 // (upload-pack). Only consulted for hosts that explicitly declare git
-// handling via a `gitPush` rule; malformed encoding fails closed by NOT
-// matching (the request then classifies by its method — POST => write).
-function isGitUploadPackPath(url: URL, pathName: string): boolean {
-  let canonicalPath: string;
-  try {
-    canonicalPath = decodeToFixedPoint(pathName);
-  } catch {
-    return false;
-  }
-  for (const candidate of [pathName, canonicalPath]) {
-    if (candidate.toLowerCase().endsWith("/git-upload-pack")) return true;
-  }
-  if (url.searchParams.get("service") === "git-upload-pack") {
-    for (const candidate of [pathName, canonicalPath]) {
-      if (candidate.toLowerCase().endsWith("/info/refs")) return true;
-    }
-  }
-  return false;
+// handling via a `gitPush` rule, and only for the RPC itself: the exemption
+// is POST-only (GET is already safe, and no non-GET info/refs request is a
+// git read, so that capability-probe form is not matched here at all). It
+// matches the canonical last path segment via the same parser isGitPushPath
+// uses, not a raw suffix, so encoding/case/separator tricks cannot forge a
+// read. Malformed or non-converging encoding fails closed by NOT matching
+// (the request then falls through to the conservative write classification).
+function isGitUploadPackRead(method: string, pathName: string): boolean {
+  if (method !== "POST") return false;
+  const segments = canonicalPathSegments(pathName);
+  if (segments === undefined) return false;
+  return segments.at(-1) === "git-upload-pack";
 }
 
 export type WriteClassification = { write: false } | { write: true; category: WriteCategory };
@@ -480,7 +474,7 @@ export function classifyWrite(input: {
       && rule.readPathPrefixes.some((prefix) => pathMatchesPrefix(pathName, prefix))) {
       return { write: false };
     }
-    if (rule?.gitPush !== undefined && isGitUploadPackPath(input.url, pathName)) {
+    if (rule?.gitPush !== undefined && isGitUploadPackRead(input.method, pathName)) {
       return { write: false };
     }
   }

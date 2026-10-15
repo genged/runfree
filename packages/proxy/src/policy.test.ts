@@ -1225,6 +1225,74 @@ describe("write classification (operation-aware read-only / approve-on-write)", 
     expect(undeclared.shape?.reason).toBe("write-denied");
   });
 
+  // todo 118: the upload-pack read exemption ignored the HTTP method, so a
+  // non-POST verb (or a POST to the info/refs capability probe, which has no
+  // POST form of its own) on an upload-pack path wrongly read through a
+  // `gitPush`-ruled host instead of hitting write approval/deny.
+  test("non-POST methods and POST info/refs on an upload-pack path classify as writes (todo 118)", () => {
+    const options = requestOptions({
+      requests: { "git.example.com": { gitPush: "write", writeAction: "deny" } },
+      tokenReader: () => null,
+    });
+    const request = (method: string, path: string) => shapeDenial(() => testBeforeAllowedRequest({
+      method,
+      url: `https://git.example.com${path}`,
+      headers: {},
+    }, options));
+
+    for (const [method, path] of [
+      ["DELETE", "/owner/repo.git/git-upload-pack"],
+      ["PUT", "/owner/repo.git/git-upload-pack"],
+      ["PATCH", "/owner/repo.git/git-upload-pack"],
+      ["POST", "/owner/repo.git/info/refs?service=git-upload-pack"],
+    ] as const) {
+      const denial = request(method, path);
+      expect(denial.shape?.reason, `${method} ${path}`).toBe("write-denied");
+      expect(denial.shape?.writeCategory, `${method} ${path}`).toBe("method");
+    }
+
+    // The canonical fetch RPC stays a read by POST, with or without `.git`,
+    // and the GET capability probe stays a read because GET is already safe.
+    expect(() => testBeforeAllowedRequest({
+      method: "POST",
+      url: "https://git.example.com/owner/repo.git/git-upload-pack",
+      headers: {},
+    }, options)).not.toThrow();
+    expect(() => testBeforeAllowedRequest({
+      method: "POST",
+      url: "https://git.example.com/owner/repo/git-upload-pack",
+      headers: {},
+    }, options)).not.toThrow();
+    expect(() => testBeforeAllowedRequest({
+      method: "GET",
+      url: "https://git.example.com/owner/repo.git/info/refs?service=git-upload-pack",
+      headers: {},
+    }, options)).not.toThrow();
+  });
+
+  // Look-alike last segments must not match the canonical name: a dash/suffix
+  // extension or an extra path segment after `git-upload-pack` is a write.
+  test("look-alike git-upload-pack segments stay writes (todo 118)", () => {
+    const options = requestOptions({
+      requests: { "git.example.com": { gitPush: "write", writeAction: "deny" } },
+      tokenReader: () => null,
+    });
+    const request = (method: string, path: string) => shapeDenial(() => testBeforeAllowedRequest({
+      method,
+      url: `https://git.example.com${path}`,
+      headers: {},
+    }, options));
+
+    for (const [method, path] of [
+      ["POST", "/x/git-upload-pack-not"],
+      ["POST", "/x/git-upload-pack/extra"],
+    ] as const) {
+      const denial = request(method, path);
+      expect(denial.shape?.reason, `${method} ${path}`).toBe("write-denied");
+      expect(denial.shape?.writeCategory, `${method} ${path}`).toBe("method");
+    }
+  });
+
   test("readPathPrefixes classify POST reads; path confusion disqualifies the exemption", () => {
     const options = requestOptions({
       requests: {
