@@ -13,6 +13,7 @@ import {
   type CredentialPolicy,
   beforeAllowedRequest as authorizeRequest,
   configuredCredentialHeaderNames,
+  gitHttpRequestKind,
   hostFromUrl,
   loadProxyPolicy,
   tokenPath,
@@ -679,9 +680,125 @@ describe("proxy policy", () => {
     expect(logs).toEqual(["proxy: injected Authorization for github.com using github"]);
   });
 
-  test("protocol-scoped mappings are never selected yet, and their header is still stripped", () => {
-    const tokenReader = vi.fn(() => "real-token");
-    const credentials: CredentialPolicy = {
+  describe("git-http protocol-scoped credentials (T4, T5, T12)", () => {
+    const GITHUB_BASIC = {
+      tokenName: "github",
+      tokenDescription: "GitHub token",
+      host: "github.com",
+      header: "Authorization",
+      scheme: "basic",
+      username: "x-access-token",
+      protocol: "git-http",
+    } as const;
+    const GITHUB_BASIC_VALUE = `Basic ${Buffer.from("x-access-token:real-token").toString("base64")}`;
+
+    function githubRequest(method: string, url: string) {
+      const tokenReader = vi.fn(() => "real-token");
+      const result = testBeforeAllowedRequest({
+        method,
+        url,
+        headers: { Authorization: "Basic YWdlbnQ6cGxhY2Vob2xkZXI=", accept: "*/*" },
+      }, {
+        allowedHosts: ["github.com", "gist.github.com"],
+        credentials: { "github.com": [GITHUB_BASIC] },
+        writeApproval: "allow",
+        tokenReader,
+        log: () => {},
+      });
+      return { result, tokenReader };
+    }
+
+    // Every §4.2 row, with and without `.git`, and with a nested group.
+    const ELIGIBLE: ReadonlyArray<{ method: string; tail: string; kind: string }> = [
+      { method: "GET", tail: "info/refs?service=git-upload-pack", kind: "refs" },
+      { method: "GET", tail: "info/refs?service=git-receive-pack", kind: "refs" },
+      { method: "POST", tail: "git-upload-pack", kind: "upload-pack" },
+      { method: "POST", tail: "git-receive-pack", kind: "receive-pack" },
+      { method: "POST", tail: "info/lfs/objects/batch", kind: "lfs-batch" },
+      { method: "GET", tail: "info/lfs/locks", kind: "lfs-locks" },
+      { method: "GET", tail: "info/lfs/locks?path=a.bin&limit=10", kind: "lfs-locks" },
+      { method: "POST", tail: "info/lfs/locks", kind: "lfs-locks" },
+      { method: "POST", tail: "info/lfs/locks/verify", kind: "lfs-locks" },
+      { method: "POST", tail: "info/lfs/locks/123_abc-x.y/unlock", kind: "lfs-locks" },
+    ];
+    const REPOS = ["/owner/repo.git", "/owner/repo", "/group/sub/repo.git"];
+
+    test("T4: the git-http credential is attached for every §4.2 row in .git and non-.git forms", () => {
+      for (const repo of REPOS) {
+        for (const row of ELIGIBLE) {
+          const url = `https://github.com${repo}/${row.tail}`;
+          expect(gitHttpRequestKind(row.method, new URL(url)), `${row.method} ${url}`).toBe(row.kind);
+          const { result, tokenReader } = githubRequest(row.method, url);
+          expect(result, `${row.method} ${url}`).toEqual({ headers: { accept: "*/*", authorization: GITHUB_BASIC_VALUE } });
+          expect(tokenReader).toHaveBeenCalledWith("github");
+        }
+      }
+    });
+
+    test("T4: web paths, look-alikes, decorated or encoded spellings, wrong methods, and HEAD get no credential", () => {
+      const ineligible: ReadonlyArray<[string, string]> = [
+        ["GET", "https://github.com/owner/repo"],
+        ["GET", "https://github.com/owner/repo/pulls"],
+        ["GET", "https://github.com/owner/repo.git"],
+        ["POST", "https://github.com/x/git-upload-pack-not"],
+        ["POST", "https://github.com/owner/repo/git-upload-pack%2Fx"],
+        ["POST", "https://github.com/owner%2Frepo/git-upload-pack"],
+        ["POST", "https://github.com/owner/repo/%67it-upload-pack"],
+        ["POST", "https://github.com/owner/repo/git-upload-pack;x"],
+        ["POST", "https://github.com/owner/repo/git-upload-pack/"],
+        ["POST", "https://github.com/owner/repo/git-upload-pack."],
+        ["POST", "https://github.com/owner/repo/git-upload-pack%20"],
+        ["POST", "https://github.com/owner/repo/git-upload-pack%00"],
+        ["POST", "https://github.com/owner/repo/git-upload-pack%00/rename"],
+        ["POST", "https://github.com/owner/repo/git-receive-pack%2500"],
+        ["POST", "https://github.com/owner/repo/info/lfs/objects/batch/"],
+        ["POST", "https://github.com/owner/repo/info/lfs/objects%2Fbatch"],
+        ["POST", "https://github.com/owner/repo/info/lfs/locks/a%20b/unlock"],
+        ["POST", "https://github.com/owner/repo/info/lfs/locks/a.../unlock"],
+        ["POST", "https://github.com/owner/repo/info/lfs/locks/a/unlock/"],
+        ["POST", "https://github.com/owner//repo/git-upload-pack"],
+        // Wrong methods for each row, and HEAD (never eligible).
+        ["GET", "https://github.com/owner/repo/git-upload-pack"],
+        ["PUT", "https://github.com/owner/repo/git-receive-pack"],
+        ["DELETE", "https://github.com/owner/repo/git-upload-pack"],
+        ["post", "https://github.com/owner/repo/git-upload-pack"],
+        ["POST", "https://github.com/owner/repo/info/refs?service=git-upload-pack"],
+        ["HEAD", "https://github.com/owner/repo/info/refs?service=git-upload-pack"],
+        ["HEAD", "https://github.com/owner/repo/info/lfs/locks"],
+        ["GET", "https://github.com/owner/repo/info/lfs/objects/batch"],
+        ["GET", "https://github.com/owner/repo/info/lfs/locks/verify"],
+        ["DELETE", "https://github.com/owner/repo/info/lfs/locks"],
+        // info/refs needs exactly one literal service of a known value.
+        ["GET", "https://github.com/owner/repo/info/refs"],
+        ["GET", "https://github.com/owner/repo/info/refs?service=git-upload-pack&service=git-receive-pack"],
+        ["GET", "https://github.com/owner/repo/info/refs?service=git-upload-pack&%73ervice=git-receive-pack"],
+        ["GET", "https://github.com/owner/repo/info/refs?service=git-upload-pack&Service=x"],
+        ["GET", "https://github.com/owner/repo/info/refs?service=%67it-upload-pack"],
+        ["GET", "https://github.com/owner/repo/info/refs?service=GIT-UPLOAD-PACK"],
+        ["GET", "https://github.com/owner/repo/info/refs?service=git-annex"],
+        ["GET", "https://github.com/owner/repo/info/refs?service"],
+        // No repository segment before the endpoint.
+        ["GET", "https://github.com/info/refs?service=git-upload-pack"],
+        ["POST", "https://github.com/git-upload-pack"],
+        ["POST", "https://github.com/info/lfs/objects/batch"],
+        ["POST", "https://github.com/%20/git-upload-pack"],
+      ];
+      for (const [method, url] of ineligible) {
+        expect(gitHttpRequestKind(method, new URL(url)), `${method} ${url}`).toBeUndefined();
+        const { result, tokenReader } = githubRequest(method, url);
+        // Stripped (the host maps Authorization), never injected.
+        expect(result, `${method} ${url}`).toEqual({ headers: { accept: "*/*" } });
+        expect(tokenReader, `${method} ${url}`).not.toHaveBeenCalled();
+      }
+    });
+
+    test("T4: gist.github.com carries no github.com mapping, so a git request there passes untouched", () => {
+      const { result, tokenReader } = githubRequest("GET", "https://gist.github.com/owner/abc.git/info/refs?service=git-upload-pack");
+      expect(result).toEqual({});
+      expect(tokenReader).not.toHaveBeenCalled();
+    });
+
+    const GITLAB: CredentialPolicy = {
       "gitlab.com": [
         {
           tokenName: "gitlab",
@@ -702,21 +819,121 @@ describe("proxy policy", () => {
         },
       ],
     };
-    const request = (url: string) => testBeforeAllowedRequest({
-      url,
-      headers: { Authorization: "Bearer agent-placeholder", accept: "*/*" },
-    }, { allowedHosts: ["gitlab.com"], credentials, tokenReader, log: () => {} });
 
-    for (const url of [
-      "https://gitlab.com/group/repo.git/info/refs?service=git-upload-pack",
-      "https://gitlab.com/group/repo/info/refs?service=git-upload-pack",
-      "https://gitlab.com/group/repo",
-    ]) {
-      expect(request(url)).toEqual({ headers: { accept: "*/*" } });
-    }
-    expect(tokenReader).not.toHaveBeenCalled();
-    expect(request("https://gitlab.com/api/v4/projects")).toEqual({
-      headers: { accept: "*/*", authorization: "Bearer real-token" },
+    test("T5: gitlab /api/v4 gets Bearer, git requests get Basic oauth2:, and /api, /-/ and repo web paths get nothing", () => {
+      const tokenReader = vi.fn(() => "real-token");
+      const request = (method: string, url: string) => testBeforeAllowedRequest({
+        method,
+        url,
+        headers: { Authorization: "Bearer agent-placeholder", accept: "*/*" },
+      }, { allowedHosts: ["gitlab.com"], credentials: GITLAB, writeApproval: "allow", tokenReader, log: () => {} });
+      const basic = `Basic ${Buffer.from("oauth2:real-token").toString("base64")}`;
+      expect(basic).toBe("Basic b2F1dGgyOnJlYWwtdG9rZW4=");
+
+      expect(request("GET", "https://gitlab.com/api/v4/projects")).toEqual({
+        headers: { accept: "*/*", authorization: "Bearer real-token" },
+      });
+      for (const [method, url] of [
+        ["GET", "https://gitlab.com/group/repo.git/info/refs?service=git-upload-pack"],
+        ["GET", "https://gitlab.com/group/sub/repo/info/refs?service=git-receive-pack"],
+        ["POST", "https://gitlab.com/group/repo.git/git-upload-pack"],
+        ["POST", "https://gitlab.com/group/repo.git/git-receive-pack"],
+        ["POST", "https://gitlab.com/group/repo.git/info/lfs/objects/batch"],
+        ["POST", "https://gitlab.com/group/repo.git/info/lfs/locks/verify"],
+      ] as const) {
+        expect(request(method, url), `${method} ${url}`).toEqual({ headers: { accept: "*/*", authorization: basic } });
+      }
+      tokenReader.mockClear();
+      for (const url of [
+        "https://gitlab.com/api",
+        "https://gitlab.com/-/profile",
+        "https://gitlab.com/-/user_settings/personal_access_tokens",
+        "https://gitlab.com/group/repo",
+        "https://gitlab.com/group/repo/-/merge_requests",
+      ]) {
+        expect(request("GET", url), url).toEqual({ headers: { accept: "*/*" } });
+      }
+      expect(tokenReader).not.toHaveBeenCalled();
+    });
+
+    test("T5: a gitlab git request on an /api/ path is still git: the protocol tier outranks the /api/ prefix", () => {
+      const result = testBeforeAllowedRequest({
+        method: "POST",
+        url: "https://gitlab.com/api/repo.git/git-upload-pack",
+        headers: {},
+      }, { allowedHosts: ["gitlab.com"], credentials: GITLAB, writeApproval: "allow", tokenReader: () => "t", log: () => {} });
+      expect(result).toEqual({ headers: { authorization: `Basic ${Buffer.from("oauth2:t").toString("base64")}` } });
+    });
+
+    test("T12: an unscoped Bearer and a git-http Basic on one header give Basic on git requests and Bearer elsewhere", () => {
+      const credentials: CredentialPolicy = {
+        "huggingface.co": [
+          {
+            tokenName: "hf",
+            tokenDescription: "Hugging Face token",
+            host: "huggingface.co",
+            header: "Authorization",
+            scheme: "bearer",
+          },
+          {
+            tokenName: "hf",
+            tokenDescription: "Hugging Face token",
+            host: "huggingface.co",
+            header: "Authorization",
+            scheme: "basic",
+            username: "hf_user",
+            protocol: "git-http",
+          },
+        ],
+      };
+      const logs: string[] = [];
+      const request = (method: string, url: string) => testBeforeAllowedRequest({
+        method,
+        url,
+        headers: { Authorization: "Bearer agent-placeholder" },
+      }, { allowedHosts: ["huggingface.co"], credentials, writeApproval: "allow", tokenReader: () => "hf-token", log: (line) => logs.push(line) });
+
+      expect(request("POST", "https://huggingface.co/org/model/git-upload-pack")).toEqual({
+        headers: { authorization: `Basic ${Buffer.from("hf_user:hf-token").toString("base64")}` },
+      });
+      expect(request("GET", "https://huggingface.co/org/model.git/info/refs?service=git-upload-pack")).toEqual({
+        headers: { authorization: `Basic ${Buffer.from("hf_user:hf-token").toString("base64")}` },
+      });
+      expect(request("GET", "https://huggingface.co/api/models/org/model")).toEqual({
+        headers: { authorization: "Bearer hf-token" },
+      });
+      expect(request("GET", "https://huggingface.co/org/model/resolve/main/config.json")).toEqual({
+        headers: { authorization: "Bearer hf-token" },
+      });
+      // One injection per request: exactly one mapping survived selection.
+      expect(logs).toHaveLength(4);
+    });
+
+    test("T12: a protocol mapping with a pathPrefix is eligible only on matching git requests", () => {
+      const credentials: CredentialPolicy = {
+        "git.example.com": [
+          {
+            tokenName: "scoped",
+            tokenDescription: "Scoped token",
+            host: "git.example.com",
+            header: "Authorization",
+            scheme: "basic",
+            username: "u",
+            protocol: "git-http",
+            pathPrefix: "/team/",
+          },
+        ],
+      };
+      const tokenReader = vi.fn(() => "t");
+      const request = (url: string) => testBeforeAllowedRequest({ method: "POST", url, headers: {} }, {
+        allowedHosts: ["git.example.com"], credentials, writeApproval: "allow", tokenReader, log: () => {},
+      });
+      expect(request("https://git.example.com/team/repo.git/git-upload-pack")).toEqual({
+        headers: { authorization: `Basic ${Buffer.from("u:t").toString("base64")}` },
+      });
+      expect(request("https://git.example.com/other/repo.git/git-upload-pack")).toEqual({});
+      expect(request("https://git.example.com/team/repo")).toEqual({});
+      expect(tokenReader).toHaveBeenCalledTimes(1);
     });
   });
 

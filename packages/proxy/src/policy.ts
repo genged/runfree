@@ -258,13 +258,42 @@ function requestPath(url: URL): string {
   return url.pathname || "/";
 }
 
-function selectedCredentialMappings(allMappings: CredentialMapping[], pathName: string): CredentialMapping[] {
-  // TEMPORARY STUB until the git-http matcher lands: a protocol-scoped mapping
-  // is never eligible, so its token is never attached. Its header is still
-  // stripped (the strip set is built from every mapping of the host). The
-  // matcher replaces this filter with protocol eligibility and the
-  // protocol-tier ranking.
-  const mappings = allMappings.filter((mapping) => mapping.protocol === undefined);
+// Selection is host-wide (one pass over every mapping of the host, whatever
+// its header), in three steps:
+//   (a) drop protocol-ineligible mappings: a `protocol: "git-http"` mapping is
+//       eligible only when gitHttpRequestKind recognizes the request (and its
+//       pathPrefix, if any, matches);
+//   (b) if any eligible mapping is protocol-scoped, keep only the
+//       protocol-scoped ones (the protocol tier ranks above prefix length);
+//   (c) the longest-pathPrefix rule, with unscoped-by-path mappings as the
+//       fallback when no prefix matches.
+// Validation allows at most one protocol-scoped mapping per (host, header) and
+// unique (protocol, pathPrefix) pairs, so at most one mapping per header
+// survives.
+function selectedCredentialMappings(allMappings: CredentialMapping[], method: string, url: URL): CredentialMapping[] {
+  const pathName = requestPath(url);
+  let gitKind: GitHttpRequestKind | undefined | null = null;
+  const gitHttpKind = (): GitHttpRequestKind | undefined => {
+    if (gitKind === null) gitKind = gitHttpRequestKind(method, url);
+    return gitKind;
+  };
+  const eligible = allMappings.filter((mapping) => {
+    if (mapping.protocol === undefined) return true;
+    if (mapping.pathPrefix !== undefined && !pathMatchesPrefix(pathName, mapping.pathPrefix)) return false;
+    switch (mapping.protocol) {
+      case "git-http":
+        return gitHttpKind() !== undefined;
+      default: {
+        // A protocol added to the contract without a matcher here must fail
+        // to compile; at runtime an unknown value is never eligible.
+        const unknownProtocol: never = mapping.protocol;
+        void unknownProtocol;
+        return false;
+      }
+    }
+  });
+  const protocolScoped = eligible.filter((mapping) => mapping.protocol !== undefined);
+  const mappings = protocolScoped.length > 0 ? protocolScoped : eligible;
   const scopedMatches = mappings.filter((mapping) => {
     return mapping.pathPrefix !== undefined && pathMatchesPrefix(pathName, mapping.pathPrefix);
   });
@@ -457,6 +486,109 @@ function isGitUploadPackRead(method: string, pathName: string): boolean {
   if (decoded === undefined || decoded.includes("\0")) return false;
   if (segmentsFromDecodedPath(decoded).at(-1) !== "git-upload-pack") return false;
   return pathName.toLowerCase().endsWith("/git-upload-pack");
+}
+
+// --- git smart HTTP / Git LFS request recognition (`protocol: "git-http"`) ---
+//
+// Decides whether a request is one of the git smart-HTTP or Git LFS requests
+// a `protocol: "git-http"` credential may be attached to. The recognized
+// shapes, each requiring at least one repository segment before the suffix
+// (so `/info/refs` alone is not a git request):
+//
+//   refs         GET  …/info/refs?service=git-upload-pack|git-receive-pack
+//   upload-pack  POST …/git-upload-pack
+//   receive-pack POST …/git-receive-pack
+//   lfs-batch    POST …/info/lfs/objects/batch
+//   lfs-locks    GET  …/info/lfs/locks
+//                POST …/info/lfs/locks
+//                POST …/info/lfs/locks/verify
+//                POST …/info/lfs/locks/<id>/unlock   (raw id ^[A-Za-z0-9._-]+$)
+//
+// Methods are compared exactly (uppercase); HEAD, OPTIONS, and every other
+// method are not eligible on any row (a git client never sends them, and the
+// §4.2 table does not list them). It uses the raw/decoded agreement rule of
+// isGitUploadPackRead: the path decodes to convergence with no NUL, carries
+// no path confusion (encoded or literal separators, `..`), its canonical
+// segments end with the endpoint, AND the raw lower-cased path's own trailing
+// segments are literally the endpoint — so an encoded, `;param`-decorated,
+// trailing-`/`, trailing-`.` or NUL-hidden spelling is not a git request and
+// gets no credential. The `info/refs` form needs exactly one query parameter
+// whose (decoded, case-folded) name is `service`, spelled literally
+// `service=<value>` in the raw query. Anything not recognized returns
+// undefined: no credential, and write classification is unaffected.
+export type GitHttpRequestKind = "refs" | "upload-pack" | "receive-pack" | "lfs-batch" | "lfs-locks";
+
+// Placeholder in an endpoint suffix for the LFS lock id segment.
+const GIT_LFS_LOCK_ID = Symbol("lock-id");
+const GIT_LFS_LOCK_ID_RE = /^[A-Za-z0-9._-]+$/u;
+const GIT_REFS_SERVICES = new Set(["git-upload-pack", "git-receive-pack"]);
+
+type GitHttpEndpoint = {
+  kind: GitHttpRequestKind;
+  methods: ReadonlySet<string>;
+  suffix: ReadonlyArray<string | typeof GIT_LFS_LOCK_ID>;
+};
+
+const GIT_HTTP_ENDPOINTS: readonly GitHttpEndpoint[] = [
+  { kind: "refs", methods: new Set(["GET"]), suffix: ["info", "refs"] },
+  { kind: "upload-pack", methods: new Set(["POST"]), suffix: ["git-upload-pack"] },
+  { kind: "receive-pack", methods: new Set(["POST"]), suffix: ["git-receive-pack"] },
+  { kind: "lfs-batch", methods: new Set(["POST"]), suffix: ["info", "lfs", "objects", "batch"] },
+  { kind: "lfs-locks", methods: new Set(["GET", "POST"]), suffix: ["info", "lfs", "locks"] },
+  { kind: "lfs-locks", methods: new Set(["POST"]), suffix: ["info", "lfs", "locks", "verify"] },
+  { kind: "lfs-locks", methods: new Set(["POST"]), suffix: ["info", "lfs", "locks", GIT_LFS_LOCK_ID, "unlock"] },
+];
+
+// Exactly one query parameter names `service` (after decoding and ASCII case
+// folding, so a `%73ervice` or `Service` duplicate an origin might read is
+// counted), and that one is spelled raw as `service=git-upload-pack` or
+// `service=git-receive-pack`. Malformed encoding in any name fails closed.
+function hasSingleLiteralGitService(url: URL): boolean {
+  const query = url.search.startsWith("?") ? url.search.slice(1) : url.search;
+  if (query === "") return false;
+  let literal = 0;
+  let named = 0;
+  for (const pair of query.split("&")) {
+    if (pair === "") continue;
+    const separator = pair.indexOf("=");
+    const rawName = separator === -1 ? pair : pair.slice(0, separator);
+    const decodedName = decodeToConvergence(rawName.replaceAll("+", " "));
+    if (decodedName === undefined) return false;
+    if (decodedName.trim().toLowerCase() !== "service") continue;
+    named += 1;
+    if (rawName === "service" && separator !== -1 && GIT_REFS_SERVICES.has(pair.slice(separator + 1))) literal += 1;
+  }
+  return named === 1 && literal === 1;
+}
+
+export function gitHttpRequestKind(method: string, url: URL): GitHttpRequestKind | undefined {
+  const pathName = requestPath(url);
+  if (hasPathConfusion(pathName)) return undefined;
+  const decoded = decodeToConvergence(pathName);
+  if (decoded === undefined || decoded.includes("\0")) return undefined;
+  const canonical = segmentsFromDecodedPath(decoded);
+  const rawSegments = pathName.split("/");
+  for (const endpoint of GIT_HTTP_ENDPOINTS) {
+    if (!endpoint.methods.has(method)) continue;
+    const length = endpoint.suffix.length;
+    // At least one repository segment before the endpoint suffix.
+    if (canonical.length <= length || rawSegments.length <= length + 1) continue;
+    const rawTail = rawSegments.slice(-length);
+    const canonicalTail = canonical.slice(-length);
+    const matches = endpoint.suffix.every((expected, index) => {
+      const raw = rawTail[index];
+      if (expected === GIT_LFS_LOCK_ID) {
+        // Unreserved characters only, so the raw id needs no decoding, and
+        // the canonical form must not have altered it (e.g. trailing dots).
+        return GIT_LFS_LOCK_ID_RE.test(raw) && canonicalTail[index] === raw.toLowerCase();
+      }
+      return raw.toLowerCase() === expected && canonicalTail[index] === expected;
+    });
+    if (!matches) continue;
+    if (endpoint.kind === "refs" && !hasSingleLiteralGitService(url)) return undefined;
+    return endpoint.kind;
+  }
+  return undefined;
 }
 
 export type WriteClassification = { write: false } | { write: true; category: WriteCategory };
@@ -880,7 +1012,7 @@ export function beforeAllowedRequest(admission: AdmissionRecord, req: ProxyReque
     }
   }
 
-  const selectedMappings = selectedCredentialMappings(mappings, requestPath(url));
+  const selectedMappings = selectedCredentialMappings(mappings, req.method ?? "GET", url);
   const touchedHeaders = new Set<string>();
   const touchedTokenNames = new Set<string>();
   let injectedCredential = false;
