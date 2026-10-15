@@ -71,6 +71,10 @@ function resolveMcpAuthEntry(input: McpAuthInput, context: RuntimeContext): McpI
   if (entry.transport === "stdio") {
     die(`no OAuth login is available for stdio MCP server ${entry.agent} ${entry.name}`);
   }
+  // L4: loopback traffic does not pass the proxy, so there is no mediated login.
+  if (entry.transport === "http-loopback") {
+    die(`no OAuth login is available for loopback MCP server ${entry.agent} ${entry.name}`);
+  }
   if (entry.auth === "static") {
     die(`static-header MCP server ${entry.agent} ${entry.name} uses a credential source, not OAuth login`);
   }

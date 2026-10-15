@@ -7,13 +7,17 @@ import {
   validateNetworkPolicy,
   type PolicyJson,
 } from "@runfree/runtime-contracts/network-policy";
+import type { HostServicesJson } from "@runfree/runtime-contracts/host-services";
 import { confirm as confirmPrompt, isCancel, select, text } from "@clack/prompts";
 import { agentChoiceLabel, isMcpAgentId, MCP_AGENT_IDS } from "../agents.ts";
+import type { HostPortOwner } from "../host-service-port-owner.ts";
 import {
+  loopbackHostServiceName,
   type McpAgent,
   mcpApprovalPath,
   mcpInventory,
   type McpInventoryEntry,
+  mcpLoopbackReach,
   mcpOAuthCallbackPort,
   mcpOAuthProviderId,
   mcpRuleKeyForEntry,
@@ -79,11 +83,60 @@ export type McpConfigureResult = {
   };
 };
 
-export function mcpListIntent(input: { json: boolean }): void {
+// L5: what the admin surfaces need to show a loopback server's reach: the
+// selected effective policy's host services, and a read-only host listener
+// check (`lsof`; it never connects to the port). The check runs only for a
+// review of a loopback server whose port has a host service.
+export type McpLoopbackDeps = {
+  hostServices: HostServicesJson;
+  owner: (port: number) => HostPortOwner;
+};
+
+export type McpLoopbackOptions = { loopback?: McpLoopbackDeps };
+
+// Without the deps (no selected effective policy generation is known), no
+// port has a host service and no owner is read.
+const NO_LOOPBACK_DEPS: McpLoopbackDeps = {
+  hostServices: {},
+  owner: () => ({ kind: "unavailable", reason: "the host listener check did not run" }),
+};
+
+const LOOPBACK_NO_PROXY_LINE = "tool calls to this server do not pass the proxy; write approval and runfree mcp rules do not apply";
+
+function loopbackEndpointLine(entry: McpInventoryEntry): string | undefined {
+  return entry.loopback ? `endpoint: ${printable(entry.loopback.url)} (loopback)` : undefined;
+}
+
+function loopbackHostServiceRemedy(entry: McpInventoryEntry, port: number, hostServices: HostServicesJson): string {
+  return remedy.hostServiceAdd(loopbackHostServiceName(entry.name, port, hostServices), port);
+}
+
+// L5/L6: the review lines for a loopback server (`mcp enable` and the
+// `mcp configure` approve choice), unindented; a nested line carries its own
+// extra indent. Reach is shown here, never granted.
+function loopbackReviewLines(entry: McpInventoryEntry, loopback: McpLoopbackDeps = NO_LOOPBACK_DEPS): string[] {
+  if (entry.transport !== "http-loopback" || !entry.loopback) return [];
+  const { port } = entry.loopback;
+  const reach = mcpLoopbackReach(port, loopback.hostServices);
+  const lines: string[] = [];
+  if (reach.kind === "host-service") {
+    lines.push(`reach=host-service ${reach.name}:${port}`);
+    const owner = loopback.owner(port);
+    const ownerText = owner.kind === "listener" ? `${printable(owner.command)}, pid ${owner.pid}` : "owner unknown";
+    lines.push(`    tools run in a host process (${ownerText}), outside the sandbox`);
+  } else {
+    lines.push(`reach=container-local 127.0.0.1:${port}: works only if a process in the session listens there; to reach the host: ${loopbackHostServiceRemedy(entry, port, loopback.hostServices)}`);
+  }
+  lines.push(LOOPBACK_NO_PROXY_LINE);
+  return lines;
+}
+
+export function mcpListIntent(input: { json: boolean }, deps: McpLoopbackOptions = {}): void {
   const inventory = mcpInventory({
     projectRoot: projectRoot(),
     env: childEnv(),
     approvalPath: mcpApprovalPath(stateDir()),
+    hostServices: deps.loopback?.hostServices,
     rulesPath: mcpRulesPath(stateDir()),
   });
   if (input.json) {
@@ -125,11 +178,12 @@ export function parseMcpSource(value: string | undefined): McpSourceScope | unde
   die("--source must be user, local, or project");
 }
 
-function findMcpEntry(agent: McpAgent, serverName: string, source?: McpSourceScope): McpInventoryEntry {
+function findMcpEntry(agent: McpAgent, serverName: string, source?: McpSourceScope, hostServices?: HostServicesJson): McpInventoryEntry {
   const inventory = mcpInventory({
     projectRoot: projectRoot(),
     env: childEnv(),
     approvalPath: mcpApprovalPath(stateDir()),
+    hostServices,
     rulesPath: mcpRulesPath(stateDir()),
   });
   const matches = inventory.entries.filter((candidate) => candidate.agent === agent && candidate.name === serverName && (source === undefined || candidate.source === source));
@@ -204,12 +258,20 @@ function assertApprovableProjectEntry(entry: McpInventoryEntry): void {
 
 // The "Approve project server" choice of `runfree mcp configure`: approve one
 // project entry and bind its credential source. It writes no OAuth host
-// record, so an earlier `mcp enable` record stays as it was.
-function approveProjectMcpServer(agent: McpAgent, serverName: string, tokenSource: TokenSourceSelection): void {
+// record, so an earlier `mcp enable` record stays as it was. Given `loopback`,
+// a loopback entry's reach and L6 lines print before the first write (S7);
+// `mcp configure` prints them in its own review and passes none.
+export function approveProjectMcpServer(agent: McpAgent, serverName: string, tokenSource: TokenSourceSelection, loopback?: McpLoopbackDeps): void {
   const approvalFile = mcpApprovalPath(stateDir());
   const entry = findMcpEntry(agent, serverName, "project");
   assertApprovableProjectEntry(entry);
-  planProjectCredentialSource(entry, { tokenSource, replaceSource: false }).apply();
+  const credential = planProjectCredentialSource(entry, { tokenSource, replaceSource: false });
+  if (loopback) {
+    for (const line of [loopbackEndpointLine(entry), ...loopbackReviewLines(entry, loopback)]) {
+      if (line) console.log(`  ${line}`);
+    }
+  }
+  credential.apply();
 
   const approval = saveMcpApproval(projectRoot(), approvalFile, entry);
   console.log(`approved project MCP server: ${agent} ${printable(serverName)}`);
@@ -234,7 +296,7 @@ function currentPolicyHosts(): string[] {
   }
 }
 
-export type McpEnableDeps = {
+export type McpEnableDeps = McpLoopbackOptions & {
   discovery?: DiscoveryDeps;
   // One yes/no question; defaults to a clack confirm (default No).
   confirm?: (message: string) => Promise<boolean>;
@@ -305,9 +367,18 @@ export async function mcpEnableIntent(input: McpEnableInput, deps: McpEnableDeps
   const confirm = deps.confirm ?? defaultConfirm;
   const shownName = printable(serverName);
   // 1. Resolve and validate the entry. No network call happens before this.
+  // The review reads `deps.loopback` only for a loopback entry.
   const entry = findMcpEntry(agent, serverName, input.source);
   if (entry.decision.status === "unsupported" || entry.decision.status === "skipped" || entry.decision.status === "conflict") {
     die(`cannot enable MCP server ${agent} ${shownName}: ${printable(entry.decision.reason ?? entry.decision.status)}`);
+  }
+  // L4: a loopback server's traffic does not pass the proxy. Decided from the
+  // transport alone, before any discovery request or socket and before any
+  // write: no discovery (it would dial the host's own loopback), no OAuth
+  // host record, no login.
+  const loopback = entry.transport === "http-loopback";
+  if (loopback && input.oauthHosts.length > 0) {
+    die("--oauth-host does not apply to loopback MCP servers: their traffic does not pass the proxy");
   }
   // The check above refuses every status assertApprovableProjectEntry does,
   // with the enable wording.
@@ -319,7 +390,7 @@ export async function mcpEnableIntent(input: McpEnableInput, deps: McpEnableDeps
 
   const identity = mcpRuleKeyForEntry(entry);
   const endpointUrl = entry.transport === "http" ? mcpEndpointUrl(entry) : undefined;
-  const oauthCapable = entry.transport === "http" && (entry.auth === "oauth" || entry.auth === "public")
+  const oauthCapable = !loopback && entry.transport === "http" && (entry.auth === "oauth" || entry.auth === "public")
     && entry.endpoint !== undefined && identity !== undefined && endpointUrl !== undefined;
   if (input.oauthHosts.length > 0 && !oauthCapable) {
     die("--oauth-host applies only to OAuth-capable HTTP MCP servers");
@@ -343,7 +414,7 @@ export async function mcpEnableIntent(input: McpEnableInput, deps: McpEnableDeps
   // only on a terminal, and for untrusted project config only after the
   // person agrees to contact the endpoint it names.
   let discovery: McpOAuthDiscoveryResult | undefined;
-  if (oauthCapable && input.discover) {
+  if (!loopback && oauthCapable && input.discover) {
     if (!input.interactive) {
       die([
         `mcp enable discovers OAuth hosts only on a terminal, where you review them before anything is saved`,
@@ -424,6 +495,8 @@ export async function mcpEnableIntent(input: McpEnableInput, deps: McpEnableDeps
 
   console.log(`Enable MCP server: ${agent} ${shownName} (${entry.source}, ${entry.transport}/${entry.auth})`);
   if (endpointUrl) console.log(`  endpoint: ${printable(endpointUrl)}`);
+  const loopbackEndpoint = loopbackEndpointLine(entry);
+  if (loopbackEndpoint) console.log(`  ${loopbackEndpoint}`);
   if (entry.sourcePath) console.log(`  config: ${printable(entry.sourcePath)}`);
   if (entry.descriptorDigest) console.log(`  descriptor: ${entry.descriptorDigest.slice(0, 16)}...`);
   console.log("Changes:");
@@ -431,6 +504,7 @@ export async function mcpEnableIntent(input: McpEnableInput, deps: McpEnableDeps
     console.log(`  approve project MCP server ${agent} ${shownName}${entry.decision.status === "approved" ? " (already approved)" : ""}`);
   }
   for (const line of credential.lines) console.log(`  ${line}`);
+  if (loopback) for (const line of loopbackReviewLines(entry, deps.loopback)) console.log(`  ${line}`);
   if (endpointHost && entry.transport === "http") console.log(`  allow host ${endpointHost}  [MCP endpoint]`);
   for (const host of hosts) {
     console.log(`  allow host ${host.host}  [OAuth, ${hostOriginLabel(host)}]`);
@@ -499,9 +573,9 @@ export async function mcpEnableIntent(input: McpEnableInput, deps: McpEnableDeps
   };
 }
 
-export function mcpExplainIntent(input: McpExplainInput): void {
+export function mcpExplainIntent(input: McpExplainInput, deps: McpLoopbackOptions = {}): void {
   const { agent, server: serverName, source, json } = input;
-  const entry = findMcpEntry(agent, serverName, source);
+  const entry = findMcpEntry(agent, serverName, source, deps.loopback?.hostServices);
   if (json) {
     console.log(JSON.stringify(entry, null, 2));
     return;
@@ -516,6 +590,16 @@ export function mcpExplainIntent(input: McpExplainInput): void {
   if (entry.decision.reason) console.log(`reason: ${entry.decision.reason}`);
   console.log(`target: ${entry.target}`);
   if (entry.endpoint) console.log(`endpoint: ${entry.endpoint.host}${entry.endpoint.path}`);
+  if (entry.loopback) {
+    console.log(loopbackEndpointLine(entry));
+    const { port, reach } = entry.loopback;
+    if (reach?.kind === "host-service") {
+      console.log(`reach: host-service ${reach.name}:${port}`);
+    } else if (reach) {
+      console.log(`reach: container-local; works only if a process in the session listens on 127.0.0.1:${port}; to reach the host: ${loopbackHostServiceRemedy(entry, port, deps.loopback?.hostServices ?? {})}`);
+    }
+    console.log(LOOPBACK_NO_PROXY_LINE);
+  }
   if (entry.mcpPolicy) {
     console.log(`server id: ${entry.mcpPolicy.operationServerId}`);
     console.log(`MCP tool default: ${entry.mcpPolicy.defaultToolWriteAction ?? "ask"}`);
@@ -626,9 +710,11 @@ async function promptTokenSourceForStatic(entry: McpInventoryEntry): Promise<Tok
 type ConfigureChange = {
   apply: () => Promise<void> | void;
   label: string;
+  // Lines the review prints under the label, before the save prompt.
+  review?: string[];
 };
 
-export async function mcpConfigureIntent(input: McpConfigureInput): Promise<McpConfigureResult> {
+export async function mcpConfigureIntent(input: McpConfigureInput, deps: McpLoopbackOptions = {}): Promise<McpConfigureResult> {
   if (!interactiveTty()) {
     die("runfree mcp configure requires a TTY; for scripts use mcp list, mcp enable, and mcp rules");
   }
@@ -636,6 +722,7 @@ export async function mcpConfigureIntent(input: McpConfigureInput): Promise<McpC
     projectRoot: projectRoot(),
     env: childEnv(),
     approvalPath: mcpApprovalPath(stateDir()),
+    hostServices: deps.loopback?.hostServices,
     rulesPath: mcpRulesPath(stateDir()),
   });
   const selectedAgents = input.agents?.length ? new Set(input.agents) : undefined;
@@ -681,9 +768,13 @@ export async function mcpConfigureIntent(input: McpConfigureInput): Promise<McpC
     if (approvalChoice === "approve") {
       const tokenSource = entry.auth === "static" ? await promptTokenSourceForStatic(entry) : { kind: "none" as const };
       if (!tokenSource) return {};
+      // S7: the same loopback reach and L6 lines `mcp enable` shows, in this
+      // review, so they are seen before the save prompt.
+      const review = [loopbackEndpointLine(entry), ...loopbackReviewLines(entry, deps.loopback)].filter((line) => line !== undefined);
       changes.push({
         label: `approve project ${entry.agent}/${entry.name}`,
         apply: () => approveProjectMcpServer(entry.agent, entry.name, tokenSource),
+        ...(review.length > 0 ? { review } : {}),
       });
     } else if (approvalChoice === "revoke") {
       selectedEntryWillRemain = false;
@@ -755,11 +846,16 @@ export async function mcpConfigureIntent(input: McpConfigureInput): Promise<McpC
     console.log(`static-header server ${entry.agent}/${entry.name} does not need OAuth login`);
   } else if (entry.transport === "stdio") {
     console.log(`stdio server ${entry.agent}/${entry.name} has no OAuth login`);
+  } else if (entry.transport === "http-loopback") {
+    console.log(`loopback server ${entry.agent}/${printable(entry.name)} has no OAuth login`);
   }
 
   console.log("Runfree will save these host-owned MCP settings:");
   if (changes.length === 0) console.log("  no host-owned policy changes");
-  for (const change of changes) console.log(`  ${change.label}`);
+  for (const change of changes) {
+    console.log(`  ${change.label}`);
+    for (const line of change.review ?? []) console.log(`  ${line}`);
+  }
   if (auth) {
     console.log(`After saving, Runfree will authenticate with: runfree mcp auth ${auth.agent} ${auth.server}${auth.source ? ` --source ${auth.source}` : ""}`);
   }
@@ -769,7 +865,7 @@ export async function mcpConfigureIntent(input: McpConfigureInput): Promise<McpC
 
   for (const change of changes) await change.apply();
   if (selectedEntryWillRemain) {
-    mcpExplainIntent({ agent: entry.agent, server: entry.name, source: entry.source, json: false });
+    mcpExplainIntent({ agent: entry.agent, server: entry.name, source: entry.source, json: false }, deps);
   }
   return auth ? { auth } : {};
 }

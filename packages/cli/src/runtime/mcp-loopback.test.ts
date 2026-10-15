@@ -679,10 +679,16 @@ describe("loopback MCP reach", () => {
   });
 
   test("the suggested host-service name is the server name only when it is a valid host-service name", () => {
-    expect(loopbackHostServiceName("astro", 8089)).toBe("astro");
-    expect(loopbackHostServiceName("Astro_MCP", 8089)).toBe("mcp-8089");
-    expect(loopbackHostServiceName("a".repeat(64), 8089)).toBe("mcp-8089");
-    expect(loopbackHostServiceName("a".repeat(63), 8089)).toBe("a".repeat(63));
+    expect(loopbackHostServiceName("astro", 8089, {})).toBe("astro");
+    expect(loopbackHostServiceName("Astro_MCP", 8089, {})).toBe("mcp-8089");
+    expect(loopbackHostServiceName("a".repeat(64), 8089, {})).toBe("mcp-8089");
+    expect(loopbackHostServiceName("a".repeat(63), 8089, {})).toBe("a".repeat(63));
+  });
+
+  test("the suggested name falls back to mcp-<port> when the server name is a host service on another port", () => {
+    // `runfree host-service add astro --port 3000` would fail: astro is taken.
+    expect(loopbackHostServiceName("astro", 3000, ASTRO_HOST_SERVICES)).toBe("mcp-3000");
+    expect(loopbackHostServiceName("devtools", 3000, ASTRO_HOST_SERVICES)).toBe("devtools");
   });
 });
 
@@ -767,7 +773,7 @@ describe("loopback MCP launch: policy invariance, OAuth isolation, and reach war
 
   function containerLocalWarning(agent: string, name: string, port: number): string {
     return `mcp: ${agent} server ${name} targets 127.0.0.1:${port}, which is not an approved host service;\n`
-      + `it works only if a process in the session listens there. To reach the host: ${remedy.hostServiceAdd(loopbackHostServiceName(name, port), port)}`;
+      + `it works only if a process in the session listens there. To reach the host: ${remedy.hostServiceAdd(loopbackHostServiceName(name, port, ASTRO_HOST_SERVICES), port)}`;
   }
 
   test("T6/S6: an approved project loopback entry and a user loopback entry leave every policy byte-identical", () => {
@@ -839,9 +845,11 @@ describe("loopback MCP launch: policy invariance, OAuth isolation, and reach war
       containerLocalWarning("claude", "Odd_Name", 4000),
       containerLocalWarning("claude", "astro", 3000),
     ].sort());
+    // The policy already has host service astro on 8089, so the suggestion
+    // for server astro on 3000 is mcp-3000: `host-service add astro` would fail.
     expect(containerLocalWarning("claude", "astro", 3000)).toBe(
       "mcp: claude server astro targets 127.0.0.1:3000, which is not an approved host service;\n"
-        + "it works only if a process in the session listens there. To reach the host: runfree host-service add astro --port 3000",
+        + "it works only if a process in the session listens there. To reach the host: runfree host-service add mcp-3000 --port 3000",
     );
     expect(reachLines.some((line) => line.includes("Odd_Name") && line.endsWith("runfree host-service add mcp-4000 --port 4000"))).toBe(true);
 

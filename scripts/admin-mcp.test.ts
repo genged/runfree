@@ -2,12 +2,33 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import util from "node:util";
-import { afterEach, beforeEach, describe, expect, test } from "vitest";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
+// `runfree mcp configure` drives clack prompts on a TTY. A test that sets
+// `clack.select`/`clack.confirm` answers them; every other test gets clack.
+const clack = vi.hoisted(() => ({
+  select: undefined as undefined | ((options: { message: string; options: Array<{ value: string; label: string }> }) => Promise<unknown>),
+  confirm: undefined as undefined | ((options: { message: string }) => Promise<unknown>),
+}));
+vi.mock("@clack/prompts", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@clack/prompts")>();
+  return {
+    ...actual,
+    select: ((options: Parameters<typeof actual.select>[0]) => clack.select
+      ? clack.select(options as never)
+      : actual.select(options)) as typeof actual.select,
+    confirm: ((options: Parameters<typeof actual.confirm>[0]) => clack.confirm
+      ? clack.confirm(options)
+      : actual.confirm(options)) as typeof actual.confirm,
+  };
+});
+
+import type { HostServicesJson } from "@runfree/runtime-contracts/host-services";
 import type { PolicyJson } from "@runfree/runtime-contracts/network-policy";
 import { createAdminState } from "../packages/cli/src/admin/context.ts";
 import type { McpEnableInput } from "../packages/cli/src/admin/admin-core.ts";
-import { printable } from "../packages/cli/src/admin/mcp-admin.ts";
+import { approveProjectMcpServer, type McpLoopbackDeps, printable } from "../packages/cli/src/admin/mcp-admin.ts";
+import type { HostPortOwner } from "../packages/cli/src/host-service-port-owner.ts";
 import type { DiscoveryDeps } from "../packages/cli/src/admin/mcp-discovery.ts";
 import {
   mcpConfigureIntent,
@@ -1627,5 +1648,253 @@ describe("runfree mcp enable", () => {
   test("printable escapes control, C1, and bidi characters from MCP config and metadata", () => {
     expect(printable("repo\u001b[2Jname‮\u0085")).toBe("repo\\u{1b}[2Jname\\u{202e}\\u{85}");
     expect(printable("plain-name_1")).toBe("plain-name_1");
+  });
+});
+
+// L3-L6, S7, T4: the admin surfaces for an `http-loopback` MCP server.
+const ASTRO_URL = "http://127.0.0.1:8089/mcp";
+const ASTRO_HOST_SERVICES: HostServicesJson = { astro: { target: "host-loopback", port: 8089 } };
+const NODE_LISTENER: HostPortOwner = {
+  kind: "listener",
+  command: "node",
+  pid: 42,
+  count: 1,
+  commands: ["node"],
+  listeners: [{ command: "node", pid: 42, addresses: ["127.0.0.1:8089"] }],
+};
+const L6_LINE = "tool calls to this server do not pass the proxy; write approval and runfree mcp rules do not apply";
+const HOSTED_REACH = "  reach=host-service astro:8089";
+const LISTENER_LINE = "      tools run in a host process (node, pid 42), outside the sandbox";
+const UNKNOWN_OWNER_LINE = "      tools run in a host process (owner unknown), outside the sandbox";
+const CONTAINER_LOCAL_REACH = "  reach=container-local 127.0.0.1:8089: works only if a process in the session listens there; to reach the host: runfree host-service add astro --port 8089";
+
+type OwnerProbe = { deps: McpLoopbackDeps; probed: number[] };
+
+function loopbackDeps(hostServices: HostServicesJson, owner: HostPortOwner = NODE_LISTENER): OwnerProbe {
+  const probed: number[] = [];
+  return {
+    probed,
+    deps: {
+      hostServices,
+      owner: (port) => {
+        probed.push(port);
+        return owner;
+      },
+    },
+  };
+}
+
+function writeProjectLoopbackServer(name = "astro", url = ASTRO_URL): void {
+  fs.writeFileSync(path.join(projectRoot, ".mcp.json"), JSON.stringify({ mcpServers: { [name]: { type: "http", url } } }));
+}
+
+function rulesFilePath(): string {
+  return path.join(stateDir, "mcp-rules.json");
+}
+
+async function withTty<T>(action: () => Promise<T>): Promise<T> {
+  const stdinTty = Object.getOwnPropertyDescriptor(process.stdin, "isTTY");
+  const stdoutTty = Object.getOwnPropertyDescriptor(process.stdout, "isTTY");
+  Object.defineProperty(process.stdin, "isTTY", { value: true, configurable: true });
+  Object.defineProperty(process.stdout, "isTTY", { value: true, configurable: true });
+  try {
+    return await action();
+  } finally {
+    if (stdinTty) Object.defineProperty(process.stdin, "isTTY", stdinTty);
+    else delete (process.stdin as { isTTY?: boolean }).isTTY;
+    if (stdoutTty) Object.defineProperty(process.stdout, "isTTY", stdoutTty);
+    else delete (process.stdout as { isTTY?: boolean }).isTTY;
+  }
+}
+
+describe("loopback MCP admin surfaces", () => {
+  afterEach(() => {
+    clack.select = undefined;
+    clack.confirm = undefined;
+  });
+
+  test("T4: enable of a loopback entry makes no network call, asks only for the approval, and offers no login", async () => {
+    writeProjectLoopbackServer();
+    const prompts = answers(true);
+    const probe = loopbackDeps(ASTRO_HOST_SERVICES);
+
+    const result = await runAdmin(async () => {
+      const outcome = await mcpEnableIntent(enableInput({ server: "astro", interactive: true, discover: true }), {
+        discovery: NO_NETWORK,
+        confirm: prompts.confirm,
+        loopback: probe.deps,
+      });
+      expect(outcome).toEqual({ applied: true });
+    });
+
+    expect(result.status, result.stderr).toBe(0);
+    expect(prompts.asked).toEqual(["Enable this MCP server?"]);
+    expect(result.stdout).toContain("Enable MCP server: claude astro (project, http-loopback/none)");
+    expect(result.stdout).toContain(`  endpoint: ${ASTRO_URL} (loopback)\n`);
+    expect(result.stdout).toContain(`${HOSTED_REACH}\n${LISTENER_LINE}\n`);
+    expect(result.stdout).toContain(`  ${L6_LINE}\n`);
+    expect(result.stdout).not.toContain("allow host 127.0.0.1");
+    expect(result.stdout).not.toContain("Discover");
+    expect(result.stdout).not.toContain("mcp auth");
+    expect(result.stdout).toContain("approved project MCP server: claude astro");
+    expect(probe.probed).toEqual([8089]);
+    expect(fs.existsSync(approvalFilePath())).toBe(true);
+    expect(fs.existsSync(enabledFilePath())).toBe(false);
+  });
+
+  test("T4: --oauth-host is refused for a loopback entry before any write", async () => {
+    writeProjectLoopbackServer();
+    const probe = loopbackDeps(ASTRO_HOST_SERVICES);
+    const result = await runAdmin(() => mcpEnableIntent(enableInput({ server: "astro", oauthHosts: ["auth.example.com"] }), {
+      discovery: NO_NETWORK,
+      confirm: answers().confirm,
+      loopback: probe.deps,
+    }).then(() => {}));
+
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain("--oauth-host does not apply to loopback MCP servers: their traffic does not pass the proxy");
+    expect(probe.probed).toEqual([]);
+    expect(fs.existsSync(approvalFilePath())).toBe(false);
+    expect(fs.existsSync(enabledFilePath())).toBe(false);
+  });
+
+  test("T4: enable without a terminal approves a loopback entry; there is no discovery to refuse", async () => {
+    writeProjectLoopbackServer();
+    const result = await runAdmin(() => mcpEnableIntent(enableInput({ server: "astro", interactive: false, discover: true }), {
+      discovery: NO_NETWORK,
+      loopback: loopbackDeps({}).deps,
+    }).then(() => {}));
+
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stderr).not.toContain("discovers OAuth hosts only on a terminal");
+    expect(result.stdout).toContain(`${CONTAINER_LOCAL_REACH}\n`);
+    expect(fs.existsSync(approvalFilePath())).toBe(true);
+    expect(fs.existsSync(enabledFilePath())).toBe(false);
+  });
+
+  test("L5: the review names an unknown owner when the listener check cannot read it", async () => {
+    writeProjectLoopbackServer();
+    const result = await runAdmin(() => mcpEnableIntent(enableInput({ server: "astro", interactive: false, discover: false }), {
+      discovery: NO_NETWORK,
+      loopback: loopbackDeps(ASTRO_HOST_SERVICES, { kind: "unavailable", reason: "x" }).deps,
+    }).then(() => {}));
+
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout).toContain(`${HOSTED_REACH}\n${UNKNOWN_OWNER_LINE}\n`);
+  });
+
+  test("L5: a server name taken by a host service on another port suggests mcp-<port>", async () => {
+    writeProjectLoopbackServer();
+    const result = await runAdmin(() => mcpEnableIntent(enableInput({ server: "astro", interactive: false, discover: false }), {
+      discovery: NO_NETWORK,
+      loopback: loopbackDeps({ astro: { target: "host-loopback", port: 9000 } }).deps,
+    }).then(() => {}));
+
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout).toContain("to reach the host: runfree host-service add mcp-8089 --port 8089\n");
+  });
+
+  test("S7: the configure approve path prints the reach and L6 lines before it writes", async () => {
+    writeProjectLoopbackServer();
+    const probe = loopbackDeps(ASTRO_HOST_SERVICES);
+    let approvalExistedAtReview: boolean | undefined;
+    const result = await runAdmin(() => {
+      approveProjectMcpServer("claude", "astro", { kind: "none" }, {
+        ...probe.deps,
+        owner: (port) => {
+          approvalExistedAtReview = fs.existsSync(approvalFilePath());
+          return probe.deps.owner(port);
+        },
+      });
+    });
+
+    expect(result.status, result.stderr).toBe(0);
+    expect(approvalExistedAtReview).toBe(false);
+    const reviewAt = result.stdout.indexOf(`${HOSTED_REACH}\n${LISTENER_LINE}\n  ${L6_LINE}\n`);
+    expect(reviewAt).toBeGreaterThanOrEqual(0);
+    expect(result.stdout.indexOf("approved project MCP server: claude astro")).toBeGreaterThan(reviewAt);
+    expect(result.stdout).not.toContain("allow host 127.0.0.1");
+    expect(fs.existsSync(approvalFilePath())).toBe(true);
+    expect(fs.existsSync(enabledFilePath())).toBe(false);
+  });
+
+  test("S7: configure shows the loopback review before the save prompt and offers no OAuth login", async () => {
+    writeProjectLoopbackServer();
+    const selects: string[] = [];
+    clack.select = async ({ message, options }) => {
+      selects.push(message);
+      expect(options.map((option) => option.value)).toEqual(["keep", "approve"]);
+      return "approve";
+    };
+    clack.confirm = async ({ message }) => {
+      console.log(`<<prompt: ${message}>>`);
+      return true;
+    };
+
+    const result = await withTty(() => runAdmin(async () => {
+      expect(await mcpConfigureIntent({ agents: [parseMcpAgent("claude")], server: "astro" }, { loopback: loopbackDeps(ASTRO_HOST_SERVICES).deps })).toEqual({});
+    }));
+
+    expect(result.status, result.stderr).toBe(0);
+    // One select: the approval. No tool-call rules choice, no OAuth login choice.
+    expect(selects).toHaveLength(1);
+    expect(selects[0]).toMatch(/^Project approval for .+ \/ astro$/);
+    expect(result.stdout).toContain("loopback server claude/astro has no OAuth login\n");
+    const promptAt = result.stdout.indexOf("<<prompt: Save these changes?>>");
+    expect(promptAt).toBeGreaterThan(0);
+    const reviewAt = result.stdout.indexOf(`${HOSTED_REACH}\n${LISTENER_LINE}\n`);
+    expect(reviewAt).toBeGreaterThanOrEqual(0);
+    expect(reviewAt).toBeLessThan(promptAt);
+    expect(result.stdout.indexOf(L6_LINE)).toBeLessThan(promptAt);
+    expect(result.stdout).not.toContain("OAuth login with");
+    expect(fs.existsSync(approvalFilePath())).toBe(true);
+  });
+
+  test("explain shows the loopback transport, reach, and the L6 line; --json carries loopback.reach", async () => {
+    writeClaudeNative({ mcpServers: { astro: { type: "http", url: ASTRO_URL }, devtools: { type: "http", url: "http://127.0.0.1:3000/mcp" } } });
+    const probe = loopbackDeps(ASTRO_HOST_SERVICES);
+
+    const hosted = await runAdmin(() => mcpExplainIntent({ agent: "claude", server: "astro", json: false }, { loopback: probe.deps }));
+    expect(hosted.status, hosted.stderr).toBe(0);
+    expect(hosted.stdout).toContain("transport: http-loopback\n");
+    expect(hosted.stdout).toContain(`endpoint: ${ASTRO_URL} (loopback)\n`);
+    expect(hosted.stdout).toContain("reach: host-service astro:8089\n");
+    expect(hosted.stdout).toContain(`${L6_LINE}\n`);
+
+    const local = await runAdmin(() => mcpExplainIntent({ agent: "claude", server: "devtools", json: false }, { loopback: probe.deps }));
+    expect(local.status, local.stderr).toBe(0);
+    expect(local.stdout).toContain("reach: container-local");
+    expect(local.stdout).toContain("runfree host-service add devtools --port 3000");
+
+    const json = await runAdmin(() => mcpExplainIntent({ agent: "claude", server: "astro", json: true }, { loopback: probe.deps }));
+    expect(json.status, json.stderr).toBe(0);
+    expect(json.stdout).toContain('"transport": "http-loopback"');
+    const parsed = JSON.parse(json.stdout) as { loopback?: { reach?: unknown } };
+    expect(parsed.loopback?.reach).toEqual({ kind: "host-service", name: "astro", port: 8089 });
+    // Explain never runs the host listener check.
+    expect(probe.probed).toEqual([]);
+  });
+
+  test("list shows http-loopback in TRANSPORT and the reach in --json", async () => {
+    writeClaudeNative({ mcpServers: { astro: { type: "http", url: ASTRO_URL } } });
+    const probe = loopbackDeps(ASTRO_HOST_SERVICES);
+
+    const table = await runAdmin(() => mcpListIntent({ json: false }, { loopback: probe.deps }));
+    expect(table.status, table.stderr).toBe(0);
+    const row = table.stdout.split("\n").find((line) => line.includes("astro"));
+    expect(row).toMatch(/\bhttp-loopback\b/);
+
+    const json = await runAdmin(() => mcpListIntent({ json: true }, { loopback: probe.deps }));
+    const entry = (JSON.parse(json.stdout) as { entries: Array<{ name: string; loopback?: { reach?: unknown } }> }).entries.find((candidate) => candidate.name === "astro");
+    expect(entry?.loopback?.reach).toEqual({ kind: "host-service", name: "astro", port: 8089 });
+    expect(probe.probed).toEqual([]);
+  });
+
+  test("L6: mcp rules refuses a loopback server and writes no rules file", async () => {
+    writeClaudeNative({ mcpServers: { astro: { type: "http", url: ASTRO_URL } } });
+    const result = await runAdmin(() => mcpRulesIntent({ agent: "claude", server: "astro", write: "allow" }));
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain("MCP rules apply only to HTTP MCP servers imported through the proxy");
+    expect(fs.existsSync(rulesFilePath())).toBe(false);
   });
 });

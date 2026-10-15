@@ -132,6 +132,20 @@ describe("MCP auth runtime", () => {
     expect(start).not.toHaveBeenCalled();
   });
 
+  test("rejects a loopback HTTP target before runtime startup", async () => {
+    const context = tempContext([
+      "[mcp_servers.astro]",
+      'url = "http://127.0.0.1:8089/mcp"',
+      "",
+    ].join("\n"));
+    const start = vi.fn();
+
+    await expect(mcpAuthRuntime({ agent: "codex", server: "astro" }, context, fakeIo(), { start })).rejects.toThrow(
+      "no OAuth login is available for loopback MCP server codex astro",
+    );
+    expect(start).not.toHaveBeenCalled();
+  });
+
   test("rejects unapproved project targets before runtime startup", async () => {
     const context = tempContext("");
     writeProjectCodexServer(context);

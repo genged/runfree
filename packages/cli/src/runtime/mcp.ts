@@ -1403,9 +1403,12 @@ export function mcpLoopbackReach(port: number, hostServices: HostServicesJson): 
 }
 
 // The host-service name suggested for a container-local loopback server: the
-// server name when it is a valid host-service name, else `mcp-<port>`.
-export function loopbackHostServiceName(serverName: string, port: number): string {
-  return HOST_SERVICE_NAME_RE.test(serverName) ? serverName : `mcp-${port}`;
+// server name when it is a valid host-service name that no host service on
+// another port already uses (so the printed `host-service add` can run), else
+// `mcp-<port>`.
+export function loopbackHostServiceName(serverName: string, port: number, hostServices: HostServicesJson): string {
+  const taken = Object.hasOwn(hostServices, serverName) && hostServices[serverName].port !== port;
+  return HOST_SERVICE_NAME_RE.test(serverName) && !taken ? serverName : `mcp-${port}`;
 }
 
 function mcpInventoryRecords(options: McpInventoryOptions): McpInventoryRecord[] {
@@ -2106,7 +2109,7 @@ export function prepareMcpRuntime(options: McpPrepareOptions): McpPrepareResult 
     const port = server.loopbackPort;
     if (mcpLoopbackReach(port, hostServices).kind !== "container-local") continue;
     warn(`mcp: ${server.agent} server ${printable(server.name)} targets 127.0.0.1:${port}, which is not an approved host service;\n`
-      + `it works only if a process in the session listens there. To reach the host: ${remedy.hostServiceAdd(loopbackHostServiceName(server.name, port), port)}`);
+      + `it works only if a process in the session listens there. To reach the host: ${remedy.hostServiceAdd(loopbackHostServiceName(server.name, port, hostServices), port)}`);
   }
 
   // The OAuth callback guidance is verbose-only: the host cannot see whether

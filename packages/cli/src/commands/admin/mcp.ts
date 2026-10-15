@@ -5,6 +5,7 @@
 // the shared MCP enforcement (which re-validates credential sources, descriptor
 // digests, and approval state). See the intent-vs-enforcement principle.
 
+import type { HostServicesJson } from "@runfree/runtime-contracts/host-services";
 import type { ArgumentsCamelCase, Argv } from "yargs";
 
 import { MCP_AGENT_IDS } from "../../agents.ts";
@@ -27,8 +28,10 @@ import {
   runAdminAction,
   credentialSourceSelectionFromArgs,
 } from "../../admin/options.ts";
-import { printable, type McpRevokeResult } from "../../admin/mcp-admin.ts";
+import { printable, type McpLoopbackDeps, type McpRevokeResult } from "../../admin/mcp-admin.ts";
 import { gatherOAuthStateClearEvidence, oauthStateClearLine } from "../../admin/mcp-oauth-clear.ts";
+import { readActiveEffectiveControl } from "../../control/effective.ts";
+import { probeHostPortOwner } from "../../host-service-port-owner.ts";
 import { mcpAuthRuntime } from "../../runtime/mcp-auth.ts";
 import { nodeRuntimeIO } from "../../runtime.ts";
 import type { RunfreeCommandContext } from "../context.ts";
@@ -69,6 +72,24 @@ function credentialSourceArgs(argv: ArgumentsCamelCase<EnableArgs>): McpEnableIn
   });
 }
 
+// L5: a loopback server's reach comes from the selected effective policy
+// generation's host services; its host owner from the read-only `lsof`
+// listener check, which never connects to the port. Both are read lazily:
+// list, explain, and configure read the host services for their inventory;
+// `mcp enable` reads them, and runs the owner check, only to review a loopback
+// entry, so enabling any other server reads no runtime state before its
+// approval is saved.
+function loopbackDeps(context: RunfreeCommandContext): McpLoopbackDeps {
+  let hostServices: HostServicesJson | undefined;
+  return {
+    get hostServices(): HostServicesJson {
+      hostServices ??= readActiveEffectiveControl(context.projectInfo())?.policy.hostServices ?? {};
+      return hostServices;
+    },
+    owner: (port) => probeHostPortOwner({ env: context.env, projectRoot: context.projectRoot }, nodeRuntimeIO, port),
+  };
+}
+
 export const mcpCommand: CommandModule = {
   name: "mcp",
   group: true,
@@ -89,7 +110,7 @@ export const mcpCommand: CommandModule = {
             (cmd) => cmd.option("json", { type: "boolean", describe: "Emit the entries and decisions as JSON" }),
             handler((argv: ArgumentsCamelCase<{ json?: boolean }>) => {
               const json = Boolean(argv.json);
-              return run(() => mcpListIntent({ json }));
+              return run(() => mcpListIntent({ json }, { loopback: loopbackDeps(context) }));
             }),
           )
           .command(
@@ -114,7 +135,7 @@ export const mcpCommand: CommandModule = {
               return (async () => {
                 let result: Awaited<ReturnType<typeof mcpConfigureIntent>> = {};
                 const status = await run(async () => {
-                  result = await mcpConfigureIntent(intent);
+                  result = await mcpConfigureIntent(intent, { loopback: loopbackDeps(context) });
                 });
                 if (status !== 0 || !result.auth) return status;
                 return mcpAuthRuntime(result.auth, context.runtimeContext(), nodeRuntimeIO);
@@ -135,7 +156,7 @@ export const mcpCommand: CommandModule = {
                 source: parseMcpSource(argv.source),
                 json: Boolean(argv.json),
               };
-              return run(() => mcpExplainIntent(intent));
+              return run(() => mcpExplainIntent(intent, { loopback: loopbackDeps(context) }));
             }),
           )
           .command(
@@ -177,7 +198,7 @@ export const mcpCommand: CommandModule = {
               return (async () => {
                 let result: McpEnableResult = { applied: false };
                 const status = await run(async () => {
-                  result = await mcpEnableIntent(intent);
+                  result = await mcpEnableIntent(intent, { loopback: loopbackDeps(context) });
                 });
                 if (status !== 0 || !result.applied) return status;
                 const activation = await activateApprovedControlsAfterMutation(context.runtimeContext(), nodeRuntimeIO);
