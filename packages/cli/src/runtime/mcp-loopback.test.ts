@@ -803,7 +803,7 @@ describe("loopback MCP launch: policy invariance, OAuth isolation, and reach war
 
   function containerLocalWarning(agent: string, name: string, port: number): string {
     return `mcp: ${agent} server ${name} targets 127.0.0.1:${port}, which is not an approved host service;\n`
-      + `it works only if a process in the session listens there. To reach the host: ${remedy.hostServiceAdd(loopbackHostServiceName(name, port, ASTRO_HOST_SERVICES), port)}`;
+      + `it works only if a process in the session listens there. To reach the host, and only if you trust the host process listening on port ${port}: ${remedy.hostServiceAdd(loopbackHostServiceName(name, port, ASTRO_HOST_SERVICES), port)}`;
   }
 
   test("T6/S6: an approved project loopback entry and a user loopback entry leave every policy byte-identical", () => {
@@ -879,7 +879,7 @@ describe("loopback MCP launch: policy invariance, OAuth isolation, and reach war
     // for server astro on 3000 is mcp-3000: `host-service add astro` would fail.
     expect(containerLocalWarning("claude", "astro", 3000)).toBe(
       "mcp: claude server astro targets 127.0.0.1:3000, which is not an approved host service;\n"
-        + "it works only if a process in the session listens there. To reach the host: runfree host-service add mcp-3000 --port 3000",
+        + "it works only if a process in the session listens there. To reach the host, and only if you trust the host process listening on port 3000: runfree host-service add mcp-3000 --port 3000",
     );
     expect(reachLines.some((line) => line.includes("Odd_Name") && line.endsWith("runfree host-service add mcp-4000 --port 4000"))).toBe(true);
 

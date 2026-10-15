@@ -2150,7 +2150,7 @@ export function prepareMcpRuntime(options: McpPrepareOptions): McpPrepareResult 
     const port = server.loopbackPort;
     if (mcpLoopbackReach(port, hostServices).kind !== "container-local") continue;
     warn(`mcp: ${server.agent} server ${printable(server.name)} targets 127.0.0.1:${port}, which is not an approved host service;\n`
-      + `it works only if a process in the session listens there. To reach the host: ${remedy.hostServiceAdd(loopbackHostServiceName(server.name, port, hostServices), port)}`);
+      + `it works only if a process in the session listens there. To reach the host, and only if you trust the host process listening on port ${port}: ${remedy.hostServiceAdd(loopbackHostServiceName(server.name, port, hostServices), port)}`);
   }
 
   // The OAuth callback guidance is verbose-only: the host cannot see whether
