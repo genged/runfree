@@ -10,7 +10,7 @@ import {
 import type { HostServicesJson } from "@runfree/runtime-contracts/host-services";
 import { confirm as confirmPrompt, isCancel, select, text } from "@clack/prompts";
 import { agentChoiceLabel, isMcpAgentId, MCP_AGENT_IDS } from "../agents.ts";
-import type { HostPortOwner } from "../host-service-port-owner.ts";
+import { gatewayReachableListener, type HostPortOwner } from "../host-service-port-owner.ts";
 import {
   loopbackHostServiceName,
   type McpAgent,
@@ -84,22 +84,71 @@ export type McpConfigureResult = {
 };
 
 // L5: what the admin surfaces need to show a loopback server's reach: the
-// selected effective policy's host services, and a read-only host listener
-// check (`lsof`; it never connects to the port). The check runs only for a
-// review of a loopback server whose port has a host service.
+// selected effective policy generation's host services, and a read-only host
+// listener check (`lsof`; it never connects to the port). `hostServices` is
+// undefined when no generation is selected and may throw when the selection
+// cannot be read; it is called only when an entry shown is loopback (F1), so a
+// broken selection never fails a command about other servers. The owner check
+// runs only for a review of a loopback server whose port has a host service.
 export type McpLoopbackDeps = {
-  hostServices: HostServicesJson;
+  hostServices: () => HostServicesJson | undefined;
   owner: (port: number) => HostPortOwner;
 };
 
 export type McpLoopbackOptions = { loopback?: McpLoopbackDeps };
 
-// Without the deps (no selected effective policy generation is known), no
-// port has a host service and no owner is read.
-const NO_LOOPBACK_DEPS: McpLoopbackDeps = {
-  hostServices: {},
-  owner: () => ({ kind: "unavailable", reason: "the host listener check did not run" }),
+type LoopbackHostServices = { ok: true; hostServices: HostServicesJson } | { ok: false; reason: string };
+
+// One command's view of the loopback deps: the host services are read at most
+// once, and only when first needed.
+type LoopbackView = {
+  hostServices: () => LoopbackHostServices;
+  owner: (port: number) => HostPortOwner;
 };
+
+function readLoopbackHostServices(deps: McpLoopbackDeps | undefined): LoopbackHostServices {
+  if (!deps) return { ok: false, reason: "the selected effective policy generation was not read" };
+  try {
+    const hostServices = deps.hostServices();
+    return hostServices ? { ok: true, hostServices } : { ok: false, reason: "no effective policy generation is selected" };
+  } catch (error) {
+    return { ok: false, reason: `cannot read the selected effective policy generation: ${printable(error instanceof Error ? error.message : String(error))}` };
+  }
+}
+
+function loopbackView(deps: McpLoopbackDeps | undefined): LoopbackView {
+  let resolved: LoopbackHostServices | undefined;
+  return {
+    hostServices: () => {
+      resolved ??= readLoopbackHostServices(deps);
+      return resolved;
+    },
+    owner: deps?.owner ?? (() => ({ kind: "unavailable", reason: "the host listener check did not run" })),
+  };
+}
+
+// Sets a loopback entry's shown reach; reads the host services only for a
+// loopback entry. An unreadable selection shows `unknown`, never
+// container-local.
+function withLoopbackReach(entry: McpInventoryEntry, view: LoopbackView): McpInventoryEntry {
+  if (!entry.loopback) return entry;
+  const services = view.hostServices();
+  entry.loopback.reach = services.ok
+    ? mcpLoopbackReach(entry.loopback.port, services.hostServices)
+    : { kind: "unknown", port: entry.loopback.port, reason: services.reason };
+  return entry;
+}
+
+function loopbackInventory(view: LoopbackView): ReturnType<typeof mcpInventory> {
+  const inventory = mcpInventory({
+    projectRoot: projectRoot(),
+    env: childEnv(),
+    approvalPath: mcpApprovalPath(stateDir()),
+    rulesPath: mcpRulesPath(stateDir()),
+  });
+  for (const entry of inventory.entries) withLoopbackReach(entry, view);
+  return inventory;
+}
 
 const LOOPBACK_NO_PROXY_LINE = "tool calls to this server do not pass the proxy; write approval and runfree mcp rules do not apply";
 
@@ -107,38 +156,43 @@ function loopbackEndpointLine(entry: McpInventoryEntry): string | undefined {
   return entry.loopback ? `endpoint: ${printable(entry.loopback.url)} (loopback)` : undefined;
 }
 
-function loopbackHostServiceRemedy(entry: McpInventoryEntry, port: number, hostServices: HostServicesJson): string {
-  return remedy.hostServiceAdd(loopbackHostServiceName(entry.name, port, hostServices), port);
+// Only called for a container-local reach, which means the host services
+// were read.
+function loopbackHostServiceRemedy(entry: McpInventoryEntry, port: number, view: LoopbackView): string {
+  const services = view.hostServices();
+  return remedy.hostServiceAdd(loopbackHostServiceName(entry.name, port, services.ok ? services.hostServices : {}), port);
+}
+
+// The host process that the review names: the listener the Docker Desktop
+// gateway reaches (127.0.0.1 or *), as host-service admission picks it (F4).
+// A listener only on [::1] or a LAN address is not the one the relay reaches.
+function loopbackOwnerText(owner: HostPortOwner, port: number): string {
+  const reachable = owner.kind === "listener" ? gatewayReachableListener(owner, port) : undefined;
+  return reachable ? `${printable(reachable.command)}, pid ${reachable.pid}` : "owner unknown";
 }
 
 // L5/L6: the review lines for a loopback server (`mcp enable` and the
 // `mcp configure` approve choice), unindented; a nested line carries its own
-// extra indent. Reach is shown here, never granted.
-function loopbackReviewLines(entry: McpInventoryEntry, loopback: McpLoopbackDeps = NO_LOOPBACK_DEPS): string[] {
+// extra indent. Reach is shown here, never granted. `entry` carries its
+// shown reach (`withLoopbackReach`).
+function loopbackReviewLines(entry: McpInventoryEntry, view: LoopbackView): string[] {
   if (entry.transport !== "http-loopback" || !entry.loopback) return [];
-  const { port } = entry.loopback;
-  const reach = mcpLoopbackReach(port, loopback.hostServices);
+  const { port, reach } = entry.loopback;
   const lines: string[] = [];
-  if (reach.kind === "host-service") {
+  if (reach?.kind === "host-service") {
     lines.push(`reach=host-service ${reach.name}:${port}`);
-    const owner = loopback.owner(port);
-    const ownerText = owner.kind === "listener" ? `${printable(owner.command)}, pid ${owner.pid}` : "owner unknown";
-    lines.push(`    tools run in a host process (${ownerText}), outside the sandbox`);
+    lines.push(`    tools run in a host process (${loopbackOwnerText(view.owner(port), port)}), outside the sandbox`);
+  } else if (reach?.kind === "container-local") {
+    lines.push(`reach=container-local 127.0.0.1:${port}: works only if a process in the session listens there; to reach the host: ${loopbackHostServiceRemedy(entry, port, view)}`);
   } else {
-    lines.push(`reach=container-local 127.0.0.1:${port}: works only if a process in the session listens there; to reach the host: ${loopbackHostServiceRemedy(entry, port, loopback.hostServices)}`);
+    lines.push(`reach=unknown (${reach?.reason ?? "the selected effective policy generation was not read"})`);
   }
   lines.push(LOOPBACK_NO_PROXY_LINE);
   return lines;
 }
 
 export function mcpListIntent(input: { json: boolean }, deps: McpLoopbackOptions = {}): void {
-  const inventory = mcpInventory({
-    projectRoot: projectRoot(),
-    env: childEnv(),
-    approvalPath: mcpApprovalPath(stateDir()),
-    hostServices: deps.loopback?.hostServices,
-    rulesPath: mcpRulesPath(stateDir()),
-  });
+  const inventory = loopbackInventory(loopbackView(deps.loopback));
   if (input.json) {
     console.log(JSON.stringify(inventory, null, 2));
     return;
@@ -178,12 +232,11 @@ export function parseMcpSource(value: string | undefined): McpSourceScope | unde
   die("--source must be user, local, or project");
 }
 
-function findMcpEntry(agent: McpAgent, serverName: string, source?: McpSourceScope, hostServices?: HostServicesJson): McpInventoryEntry {
+function findMcpEntry(agent: McpAgent, serverName: string, source?: McpSourceScope): McpInventoryEntry {
   const inventory = mcpInventory({
     projectRoot: projectRoot(),
     env: childEnv(),
     approvalPath: mcpApprovalPath(stateDir()),
-    hostServices,
     rulesPath: mcpRulesPath(stateDir()),
   });
   const matches = inventory.entries.filter((candidate) => candidate.agent === agent && candidate.name === serverName && (source === undefined || candidate.source === source));
@@ -258,19 +311,18 @@ function assertApprovableProjectEntry(entry: McpInventoryEntry): void {
 
 // The "Approve project server" choice of `runfree mcp configure`: approve one
 // project entry and bind its credential source. It writes no OAuth host
-// record, so an earlier `mcp enable` record stays as it was. Given `loopback`,
-// a loopback entry's reach and L6 lines print before the first write (S7);
-// `mcp configure` prints them in its own review and passes none.
-export function approveProjectMcpServer(agent: McpAgent, serverName: string, tokenSource: TokenSourceSelection, loopback?: McpLoopbackDeps): void {
+// record, so an earlier `mcp enable` record stays as it was. `reviewedDigest`
+// is the descriptor digest of the entry the person reviewed; the project
+// config is re-read here, and if the agent rewrote it during the review, the
+// approval is refused before any write (F2).
+function approveProjectMcpServer(agent: McpAgent, serverName: string, tokenSource: TokenSourceSelection, reviewedDigest: string | undefined): void {
   const approvalFile = mcpApprovalPath(stateDir());
   const entry = findMcpEntry(agent, serverName, "project");
+  if (reviewedDigest === undefined || entry.descriptorDigest !== reviewedDigest) {
+    die(`project MCP server ${agent} ${printable(serverName)} changed after the review; nothing was approved; review it again with: runfree mcp configure`);
+  }
   assertApprovableProjectEntry(entry);
   const credential = planProjectCredentialSource(entry, { tokenSource, replaceSource: false });
-  if (loopback) {
-    for (const line of [loopbackEndpointLine(entry), ...loopbackReviewLines(entry, loopback)]) {
-      if (line) console.log(`  ${line}`);
-    }
-  }
   credential.apply();
 
   const approval = saveMcpApproval(projectRoot(), approvalFile, entry);
@@ -493,6 +545,9 @@ export async function mcpEnableIntent(input: McpEnableInput, deps: McpEnableDeps
     ? { agent, server: serverName, source: entry.source }
     : undefined;
 
+  // L5: a loopback entry's reach, read only now, for the review.
+  const view = loopbackView(deps.loopback);
+  if (loopback) withLoopbackReach(entry, view);
   console.log(`Enable MCP server: ${agent} ${shownName} (${entry.source}, ${entry.transport}/${entry.auth})`);
   if (endpointUrl) console.log(`  endpoint: ${printable(endpointUrl)}`);
   const loopbackEndpoint = loopbackEndpointLine(entry);
@@ -504,7 +559,7 @@ export async function mcpEnableIntent(input: McpEnableInput, deps: McpEnableDeps
     console.log(`  approve project MCP server ${agent} ${shownName}${entry.decision.status === "approved" ? " (already approved)" : ""}`);
   }
   for (const line of credential.lines) console.log(`  ${line}`);
-  if (loopback) for (const line of loopbackReviewLines(entry, deps.loopback)) console.log(`  ${line}`);
+  if (loopback) for (const line of loopbackReviewLines(entry, view)) console.log(`  ${line}`);
   if (endpointHost && entry.transport === "http") console.log(`  allow host ${endpointHost}  [MCP endpoint]`);
   for (const host of hosts) {
     console.log(`  allow host ${host.host}  [OAuth, ${hostOriginLabel(host)}]`);
@@ -575,7 +630,8 @@ export async function mcpEnableIntent(input: McpEnableInput, deps: McpEnableDeps
 
 export function mcpExplainIntent(input: McpExplainInput, deps: McpLoopbackOptions = {}): void {
   const { agent, server: serverName, source, json } = input;
-  const entry = findMcpEntry(agent, serverName, source, deps.loopback?.hostServices);
+  const view = loopbackView(deps.loopback);
+  const entry = withLoopbackReach(findMcpEntry(agent, serverName, source), view);
   if (json) {
     console.log(JSON.stringify(entry, null, 2));
     return;
@@ -595,8 +651,10 @@ export function mcpExplainIntent(input: McpExplainInput, deps: McpLoopbackOption
     const { port, reach } = entry.loopback;
     if (reach?.kind === "host-service") {
       console.log(`reach: host-service ${reach.name}:${port}`);
+    } else if (reach?.kind === "container-local") {
+      console.log(`reach: container-local; works only if a process in the session listens on 127.0.0.1:${port}; to reach the host: ${loopbackHostServiceRemedy(entry, port, view)}`);
     } else if (reach) {
-      console.log(`reach: container-local; works only if a process in the session listens on 127.0.0.1:${port}; to reach the host: ${loopbackHostServiceRemedy(entry, port, deps.loopback?.hostServices ?? {})}`);
+      console.log(`reach: unknown (${reach.reason})`);
     }
     console.log(LOOPBACK_NO_PROXY_LINE);
   }
@@ -718,13 +776,8 @@ export async function mcpConfigureIntent(input: McpConfigureInput, deps: McpLoop
   if (!interactiveTty()) {
     die("runfree mcp configure requires a TTY; for scripts use mcp list, mcp enable, and mcp rules");
   }
-  const inventory = mcpInventory({
-    projectRoot: projectRoot(),
-    env: childEnv(),
-    approvalPath: mcpApprovalPath(stateDir()),
-    hostServices: deps.loopback?.hostServices,
-    rulesPath: mcpRulesPath(stateDir()),
-  });
+  const view = loopbackView(deps.loopback);
+  const inventory = loopbackInventory(view);
   const selectedAgents = input.agents?.length ? new Set(input.agents) : undefined;
   const entries = inventory.entries.filter((entry) =>
     (selectedAgents === undefined || selectedAgents.has(entry.agent))
@@ -770,10 +823,11 @@ export async function mcpConfigureIntent(input: McpConfigureInput, deps: McpLoop
       if (!tokenSource) return {};
       // S7: the same loopback reach and L6 lines `mcp enable` shows, in this
       // review, so they are seen before the save prompt.
-      const review = [loopbackEndpointLine(entry), ...loopbackReviewLines(entry, deps.loopback)].filter((line) => line !== undefined);
+      const review = [loopbackEndpointLine(entry), ...loopbackReviewLines(entry, view)].filter((line) => line !== undefined);
       changes.push({
         label: `approve project ${entry.agent}/${entry.name}`,
-        apply: () => approveProjectMcpServer(entry.agent, entry.name, tokenSource),
+        // F2: approve only the descriptor reviewed here.
+        apply: () => approveProjectMcpServer(entry.agent, entry.name, tokenSource, entry.descriptorDigest),
         ...(review.length > 0 ? { review } : {}),
       });
     } else if (approvalChoice === "revoke") {

@@ -114,10 +114,11 @@ export type McpInventoryEntry = {
     path: string;
   };
   // `http-loopback` only: the normalized URL the agent config carries, and its
-  // port. `reach` is present only when the caller supplied host services.
+  // port. `reach` is present only when the caller supplied host services, or
+  // when an admin surface could not read them (`unknown`).
   loopback?: {
     port: number;
-    reach?: McpLoopbackReach;
+    reach?: McpLoopbackShownReach;
     url: string;
   };
   mcpPolicy?: {
@@ -1437,6 +1438,11 @@ type McpInventoryOptions = {
 export type McpLoopbackReach =
   | { kind: "host-service"; name: string; port: number }
   | { kind: "container-local"; port: number };
+
+// What an admin surface shows: the reach, or `unknown` with the reason when
+// the selected effective policy generation cannot be read. Never a fallback to
+// container-local.
+export type McpLoopbackShownReach = McpLoopbackReach | { kind: "unknown"; port: number; reason: string };
 
 export function mcpLoopbackReach(port: number, hostServices: HostServicesJson): McpLoopbackReach {
   const match = Object.entries(hostServices).find(([, service]) => service.port === port);
