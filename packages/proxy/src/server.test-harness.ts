@@ -22,6 +22,7 @@ import {
 } from "@runfree/runtime-contracts/session-file";
 
 import { proxyServerEntryArgv } from "../../../tests/support/prebuilt-entry.ts";
+import { OBSERVE_LOG_ENV, observePreloadArgs, type ObservedRead, readObservedReads } from "./server-observe.test-harness.ts";
 
 const repoRoot = path.resolve(new URL("../../..", import.meta.url).pathname);
 
@@ -32,6 +33,8 @@ export const servers = new Set<https.Server>();
 export type RunningProxy = {
   caCertPath: string;
   caKeyPath: string;
+  // Present with `observe: true`: secret-dir and resolved-hosts reads so far.
+  observedReads?: () => ObservedRead[];
   output: () => string;
   policyPath: string;
   port: number;
@@ -277,6 +280,8 @@ export async function unusedTcpPort(): Promise<number> {
 
 export async function startProxy(options: {
   extraEnv?: NodeJS.ProcessEnv;
+  // Load the test-only read observer (server-observe.test-harness.ts).
+  observe?: boolean;
   policy: unknown;
   // Set false to spawn without any session-identity env (startup-refusal
   // tests). Callers that set RUNFREE_SESSION_IDENTITY_MODE in extraEnv manage
@@ -311,7 +316,9 @@ export async function startProxy(options: {
   }
   let output = "";
   const umaskArgs = options.umask === undefined ? [] : ["--import", `data:text/javascript,process.umask(${options.umask})`];
-  const child = childProcess.spawn(process.execPath, [...umaskArgs, ...proxyServerEntryArgv()], {
+  const observeLogPath = options.observe === true ? path.join(stateDir, "observed-reads.jsonl") : undefined;
+  const observeArgs = observeLogPath === undefined ? [] : observePreloadArgs();
+  const child = childProcess.spawn(process.execPath, [...umaskArgs, ...observeArgs, ...proxyServerEntryArgv()], {
     cwd: repoRoot,
     env: proxyServerEnv({
       PORT: "0",
@@ -325,6 +332,7 @@ export async function startProxy(options: {
       RUNFREE_APPROVALS_PENDING_DIR: fs.mkdtempSync(path.join(tmp, "proxy-approvals-pending-")),
       RUNFREE_APPROVALS_DECISIONS_DIR: fs.mkdtempSync(path.join(tmp, "proxy-approvals-decisions-")),
       ...options.extraEnv,
+      ...(observeLogPath === undefined ? {} : { [OBSERVE_LOG_ENV]: observeLogPath }),
     }),
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -361,6 +369,7 @@ export async function startProxy(options: {
   return {
     caCertPath,
     caKeyPath,
+    ...(observeLogPath !== undefined ? { observedReads: () => readObservedReads(observeLogPath) } : {}),
     output: () => output,
     policyPath,
     port,
