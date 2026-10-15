@@ -50,6 +50,10 @@ export type ProxyRequest = {
   // path, absent in synchronous policy checks.
   body?: {
     getText(): Promise<string | undefined>;
+    // The buffered body after content-encoding decoding (undefined when it
+    // cannot be decoded). Optional so synchronous test doubles can omit it;
+    // a classifier that needs it treats absence as unproven.
+    getDecodedBuffer?(): Promise<Buffer | undefined>;
   };
   destination?: {
     hostname?: string;
@@ -82,6 +86,11 @@ export type PolicyOptions = {
   // Per-request body-aware GraphQL verdict (see classifyWrite); precomputed
   // by the async caller because this check is synchronous and body-free.
   graphqlBodyClass?: "read" | "write";
+  // Per-request body-aware Git LFS batch verdict (see lfs-classify.ts),
+  // precomputed by the async caller: "download" means the body was proven a
+  // bounded, unambiguous `"operation": "download"` batch. Only consulted by
+  // classifyWrite for POST …/info/lfs/objects/batch on a gitPush-ruled host.
+  lfsBodyClass?: "download";
   // Precomputed by the async server layer: this POST targets an exact,
   // recorded, statically mediated OAuth token or registration endpoint and is
   // protocol-shaped (OAuthMediator.protocolReadEndpoint plus
@@ -606,6 +615,8 @@ export function classifyWrite(input: {
   // See PolicyOptions.oauthProtocolRead; assertWriteAllowed passes it only
   // for an `ask` host.
   oauthProtocolRead?: boolean;
+  // See PolicyOptions.lfsBodyClass. Absent means unproven => write.
+  lfsBodyClass?: "download";
 }): WriteClassification {
   // A wss:// upgrade is an opaque live channel the proxy cannot inspect
   // frame-by-frame, so the whole connection classifies as a write (HIGH-2).
@@ -657,6 +668,14 @@ export function classifyWrite(input: {
     if (rule?.gitPush !== undefined && isGitUploadPackRead(input.method, pathName)) {
       return { write: false };
     }
+    // A Git LFS batch request proven by its body to be a download. Same host
+    // gate as the upload-pack exemption (the host declares git handling); the
+    // request must be exactly POST on the canonical batch endpoint. An upload
+    // batch, an unproven body, and every lock request stay writes.
+    if (rule?.gitPush !== undefined && input.method === "POST" && input.lfsBodyClass === "download"
+      && gitHttpRequestKind(input.method, input.url) === "lfs-batch") {
+      return { write: false };
+    }
   }
 
   return { write: true, category: "method" };
@@ -673,6 +692,7 @@ function assertWriteAllowed(input: {
   headers?: Record<string, string | string[] | undefined>;
   webSocket?: boolean;
   graphqlBodyClass?: "read" | "write";
+  lfsBodyClass?: "download";
   oauthProtocolRead?: boolean;
   oauthUnlistedClientIdUrl?: boolean;
   hasWriteGrant?: PolicyOptions["hasWriteGrant"];
@@ -821,6 +841,8 @@ function assertAllowedRequestShape(
 // revalidate a held write when a decision arrives and on policy generation
 // changes — "ask" means the hold may still resolve, "denied" cancels it
 // fail-closed, "allowed" means the policy loosened and the request may flow.
+// It is body-free: no GraphQL or LFS body verdict is passed, so a held GraphQL
+// or LFS batch request revalidates as the write it was held as.
 export function evaluateRequestWriteAsk(
   admission: AdmissionRecord,
   req: ProxyRequest,
@@ -976,6 +998,7 @@ export function beforeAllowedRequest(admission: AdmissionRecord, req: ProxyReque
     writeAction,
     headers: req.headers,
     graphqlBodyClass: options.graphqlBodyClass,
+    lfsBodyClass: options.lfsBodyClass,
     oauthProtocolRead: options.oauthProtocolRead,
     oauthUnlistedClientIdUrl: options.oauthUnlistedClientIdUrl,
     hasWriteGrant: options.hasWriteGrant,

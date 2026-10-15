@@ -1525,6 +1525,51 @@ describe("write classification (operation-aware read-only / approve-on-write)", 
     expect(undeclared.shape?.reason).toBe("write-denied");
   });
 
+  test("an LFS batch POST is a read only with a proven download body, on the exact batch endpoint of a git-declared host", () => {
+    const options = (rule: Record<string, unknown>) => requestOptions({
+      allowedHosts: ["git.example.com"],
+      credentials: {},
+      requests: { "git.example.com": { writeAction: "deny", ...rule } },
+      tokenReader: () => null,
+    });
+    const batch = "https://git.example.com/org/repo.git/info/lfs/objects/batch";
+    const decide = (url: string, rule: Record<string, unknown>, extra: Partial<PolicyOptions> = {}, method = "POST") => {
+      try {
+        testBeforeAllowedRequest({ method, url, headers: {} }, { ...options(rule), ...extra });
+        return "read";
+      } catch (error) {
+        if (error instanceof ProxyPolicyDenialError) return error.shape?.writeCategory ?? error.message;
+        throw error;
+      }
+    };
+
+    expect(decide(batch, { gitPush: "write" }, { lfsBodyClass: "download" })).toBe("read");
+    expect(decide(batch, { gitPush: "deny" }, { lfsBodyClass: "download" })).toBe("read");
+    expect(decide("https://git.example.com/org/repo/info/lfs/objects/batch", { gitPush: "write" }, { lfsBodyClass: "download" })).toBe("read");
+    // Unproven body (upload, malformed, ...) => the verdict is absent => write.
+    expect(decide(batch, { gitPush: "write" })).toBe("method");
+    // D-4: no git declaration on the host => no exemption.
+    expect(decide(batch, {}, { lfsBodyClass: "download" })).toBe("method");
+    // An explicit write rule keeps precedence.
+    expect(decide(batch, { gitPush: "write", writePathPrefixes: ["/org/"] }, { lfsBodyClass: "download" })).toBe("write-path");
+    // Lock requests and decorated batch spellings stay writes even with a
+    // (misapplied) download verdict.
+    for (const url of [
+      "https://git.example.com/org/repo.git/info/lfs/locks",
+      "https://git.example.com/org/repo.git/info/lfs/locks/verify",
+      "https://git.example.com/org/repo.git/info/lfs/locks/1/unlock",
+      `${batch}/`,
+      `${batch};x`,
+      "https://git.example.com/org/repo.git/info/lfs/objects/%62atch",
+      "https://git.example.com/org/repo.git/info/lfs/objects%2Fbatch",
+      `${batch}%00`,
+    ]) {
+      expect(decide(url, { gitPush: "write" }, { lfsBodyClass: "download" }), url).toBe("method");
+    }
+    // Only POST: other non-safe methods stay writes.
+    expect(decide(batch, { gitPush: "write" }, { lfsBodyClass: "download" }, "PUT")).toBe("method");
+  });
+
   // todo 118: the upload-pack read exemption ignored the HTTP method, so a
   // non-POST verb (or a POST to the info/refs capability probe, which has no
   // POST form of its own) on an upload-pack path wrongly read through a

@@ -97,6 +97,7 @@ export const RUNTIME_ASSET_DESCRIPTORS: readonly RuntimeAssetDescriptor[] = [
   proxyImage("proxy/firewall/supervisor.js"),
   proxyImage("proxy/graphql-classify.js"),
   proxyImage("proxy/host-service-tunnel.js"),
+  proxyImage("proxy/lfs-classify.js"),
   proxyImage("proxy/mcp-classify.js"),
   proxyImage("proxy/mockttp-adapter.js"),
   proxyImage("proxy/oauth-mediation.js"),
