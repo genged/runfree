@@ -510,6 +510,23 @@ built-ins `node_repl` and `computer-use` are skipped silently: `runfree mcp
 list` shows them as `skipped`, and `--verbose` prints one line for each. See
 [Codex Desktop built-ins](architecture.md#codex-desktop-built-ins).
 
+Loopback HTTP MCP servers, such as a dev server's
+`{"type": "http", "url": "http://127.0.0.1:8089/mcp"}`, import without
+credentials. Use `127.0.0.1`, not `localhost`. Inside the session the URL
+reaches only a process in the session, unless a host service holds the port.
+To reach a dev server on the host, approve the port separately:
+
+```bash
+runfree host-service add astro --port 8089
+```
+
+`runfree mcp enable` and `runfree mcp explain` show the reach, and a launch
+warns when no host service backs the port. A loopback entry cannot carry
+headers, helpers, or OAuth settings, and its tool calls do not pass the proxy,
+so write approval and `runfree mcp rules` do not apply. Plain HTTP to any other
+host is refused, and an HTTPS URL must name a hostname, not an IP address.
+`runfree mcp list` shows a refused entry as `unsupported`, target `excluded`.
+
 OAuth login works in any session. When an approved MCP server can use OAuth,
 each `runfree claude`, `codex`, `pi`, or `shell` session gets its own loopback
 callback port. In Claude, type `/mcp` and select the server; in Codex or a

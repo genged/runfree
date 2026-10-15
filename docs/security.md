@@ -112,6 +112,8 @@ effective policy, the proxy CA private key, and host files outside the project.
 | Adds or re-ports a `hostServices` entry | no effect; never auto-approved | host review of every widening |
 | Connects to an approved host service at `127.0.0.1:<port>` | **allowed**, opaque bytes to the host port | `runfree host-service add` approval only |
 | CONNECTs to an unapproved `<name>.runfree.internal:<port>` | raw 403, no dial | proxy name and port pair check |
+| Configures a loopback HTTP MCP (`http://127.0.0.1:<port>`) on an unapproved port | no host reach | the relay binds only approved host-service ports; proxy name and port pair check |
+| Gives a loopback HTTP MCP a header, helper, or OAuth setting | entry skipped | loopback MCP config allowlist |
 | Dials the host gateway IP directly | no route | `agent_internal` has no egress; uid 1001-only firewall rule |
 | POSTs to an allowed host under `ask` | held for a host decision | write approval |
 | Uses an allowed token for a wrong purpose | **allowed** | token scope and request rules only |
@@ -294,10 +296,15 @@ Details: [Write Approval Grants](architecture.md#write-approval-grants).
 2. Claude gets a read-only approved config with strict MCP mode. This stops
    passive project descriptors at startup. It does not stop code already
    running in the agent from starting another binary or config.
-3. Static headers need a host-owned credential source.
-4. HTTP MCP tool calls follow the write-approval rules (`runfree mcp rules`).
-   STDIO MCP servers run inside the agent container; their calls do not pass
-   the proxy, so `runfree mcp rules` refuses them.
+3. Static headers need a host-owned credential source. An HTTPS MCP endpoint
+   must be a hostname; an entry whose HTTPS URL names an IP address is
+   skipped.
+4. HTTPS MCP tool calls follow the write-approval rules (`runfree mcp rules`).
+   STDIO MCP servers and loopback HTTP MCP servers (`http://127.0.0.1:<port>`)
+   do not pass the proxy, so write approval does not apply and `runfree mcp
+   rules` refuses them. A loopback entry carries no credentials or OAuth and
+   adds nothing to policy: a header, helper, or OAuth key skips it. Whether
+   its port reaches the host is decided only by `runfree host-service add`.
 5. No imported MCP descriptor starts a host process. Local STDIO commands run
    only in the agent container; a host-path command is skipped. Codex Desktop
    built-ins (`node_repl`, `computer-use`) are skipped and never enter the
@@ -474,6 +481,14 @@ Details: [Write Approval Grants](architecture.md#write-approval-grants).
   the other's session files and containers. A warm-empty skip refuses while
   the other root has a session file in the proxy, a session container, or a
   session on `agent_internal`; it cannot see the other root's records.
+- **A loopback MCP server reached through a host service runs on the host.**
+  When an approved host service holds the port of a loopback HTTP MCP entry,
+  the agent's tool calls run in that host process, outside the sandbox, and
+  no write approval applies. Reach is evaluated at each launch and review,
+  not pinned by the MCP approval digest: a later `runfree host-service add` on
+  the same port makes an approved, container-local entry reach the host. An
+  OAuth flow that a loopback server advertises at run time is not mediated;
+  its tokens land in the agent's own state.
 
 Accepted, known risks:
 
