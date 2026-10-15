@@ -30,7 +30,11 @@
 //      still refuses `echo.runfree.internal:<Q>` from that session with a raw
 //      403, the host listener on Q records zero accepts (and then one, for a
 //      direct host connection: the positive control), and the proxy logs
-//      nothing naming Q before the refusal probe.
+//      nothing naming Q before the refusal probe. The effective policy the
+//      proxy serves (read in the proxy once the request proxy applied it) has
+//      no IP-literal host, unchanged host services, and no OAuth mediation
+//      provider for the entry; raw CONNECTs to 127.0.0.1:Q (raw 403) and
+//      127.0.0.1:443 (denied, not allowlisted) dial nothing.
 //   3. no direct path: the session cannot connect to <gateway>:P; root in the
 //      proxy times out on it (a dropped SYN), while uid 1001 in the proxy
 //      connects (the positive control that makes root's timeout meaningful).
@@ -120,7 +124,11 @@ import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 
 import { runfreeStateRoot } from "../../../packages/cli/src/paths.ts";
+import { mcpOAuthProviderId } from "../../../packages/cli/src/runtime/mcp.ts";
+import { DEFAULT_EFFECTIVE_PROXY_ROOT } from "../../../packages/runtime-contracts/src/effective-control.ts";
 import { refusedHostServicePortReason } from "../../../packages/runtime-contracts/src/host-services.ts";
+import { isIpLiteralHostname, type PolicyJson } from "../../../packages/runtime-contracts/src/network-policy.ts";
+import { parseGenerationStatusLine, requestProxyStatusPath } from "../../../packages/runtime-contracts/src/proxy-status.ts";
 import { cliEntryArgv } from "../../support/prebuilt-entry.ts";
 import { composeProjectName, composeServiceContainerId, docker, dockerOrThrow, waitUntil } from "./docker.ts";
 import {
@@ -826,6 +834,46 @@ function sessionClaudeMcpServers(sessionId: string): Record<string, unknown> {
   return parsed.mcpServers;
 }
 
+type LiveEffectivePolicy = Readonly<{
+  controlGeneration: string;
+  network: PolicyJson;
+  oauth: { providers?: Record<string, unknown> };
+}>;
+
+/**
+ * The effective policy the proxy is serving, read inside the proxy container
+ * (F3): the selection at `<root>/active.json`, then that generation's
+ * `network-policy.json` and `oauth-mediation-policy.json`, the files the proxy
+ * loads (`loadEffectiveProxyControl`). The root is the proxy's
+ * `RUNFREE_EFFECTIVE_PROXY_ROOT` (the Compose template binds the host's
+ * effective proxy directory there, read-only). It is "live" only once the
+ * request proxy's status names the same control generation, which the caller
+ * polls for. UNVERIFIED on a Docker host: the generation directory name (the
+ * digest hex without `sha256:`, as `assertGenerationDirectory` builds it) and
+ * that root can read every file under the read-only bind.
+ */
+function proxyLiveEffectivePolicy(proxyId: string): LiveEffectivePolicy {
+  const root = DEFAULT_EFFECTIVE_PROXY_ROOT;
+  const read = (label: string, file: string): string => dockerOrThrow(label, ["exec", "--user", "0:0", proxyId, "cat", `${root}/${file}`]);
+  const active = JSON.parse(read("proxy effective selection", "active.json")) as { controlGeneration?: unknown };
+  if (typeof active.controlGeneration !== "string" || !/^sha256:[0-9a-f]{64}$/u.test(active.controlGeneration)) {
+    throw new Error(`the proxy's effective selection names no control generation: ${JSON.stringify(active)}`);
+  }
+  const generationDir = `generations/${active.controlGeneration.slice("sha256:".length)}`;
+  return {
+    controlGeneration: active.controlGeneration,
+    network: JSON.parse(read("proxy effective network policy", `${generationDir}/network-policy.json`)) as PolicyJson,
+    oauth: JSON.parse(read("proxy effective OAuth mediation policy", `${generationDir}/oauth-mediation-policy.json`)) as { providers?: Record<string, unknown> },
+  };
+}
+
+/** The control generation the request proxy last applied, from its status file. */
+function requestProxyControlGeneration(proxyId: string): string | undefined {
+  const result = docker(["exec", proxyId, "cat", requestProxyStatusPath()]);
+  if (result.status !== 0) return undefined;
+  return parseGenerationStatusLine(result.stdout.trim())?.controlGeneration;
+}
+
 /** The proxy's structured log events (`proxy-request:` and `proxy-denial:` lines). */
 function proxyEvents(logs: string): readonly Readonly<{ line: string; fields: Record<string, unknown> }>[] {
   const events: { line: string; fields: Record<string, unknown> }[] = [];
@@ -1014,10 +1062,13 @@ describe("approved host services", () => {
     // standing session is stopped first so `up` runs with no session
     // attached, as in `beforeAll`; the probe session started after `up`
     // replaces it as the standing session for the later cases.
-    await stopSession(sessions[0]);
-    const originalMcpJson = addProjectMcpServer(fixture.projectRoot, LOOPBACK_PROBE_SERVER, { type: "http", url });
+    // The stop is inside the try, so a throwing stop still reaches the
+    // finally, which restores a standing session for the later cases.
+    let originalMcpJson: string | undefined;
     let revoked = true;
     try {
+      await stopSession(sessions[0]);
+      originalMcpJson = addProjectMcpServer(fixture.projectRoot, LOOPBACK_PROBE_SERVER, { type: "http", url });
       // No terminal (the fixture's stdin is not a TTY) and no --no-discover:
       // a loopback entry makes no discovery call and needs no review prompt.
       const enabled = fixture.runfree(["mcp", "enable", "claude", LOOPBACK_PROBE_SERVER, "--source", "project"]);
@@ -1078,6 +1129,50 @@ describe("approved host services", () => {
       expect(refused, "the refusal does not name its reason").toContain("host-service-not-configured");
       expect(hostOpenCount(echo, "unapproved"), "the refused CONNECT reached the unapproved host port").toBe(opensBefore);
 
+      // F3: the runtime half of B1. The effective policy the proxy serves
+      // after the loopback enable and `up` projects nothing from the entry:
+      // no IP-literal host (so no 127.0.0.1), and no OAuth mediation provider
+      // for it. Read only once the request proxy has applied the selection.
+      let live: LiveEffectivePolicy | undefined;
+      await pollUntil(() => {
+        live = proxyLiveEffectivePolicy(proxyId);
+        return requestProxyControlGeneration(proxyId) === live.controlGeneration;
+      }, { timeoutMs: 40_000, intervalMs: 1000, label: "the request proxy to apply the selected effective policy generation" });
+      if (!live) throw new Error("the proxy's effective policy was not read");
+      const liveHosts = [...live.network.hosts, ...Object.keys(live.network.requests ?? {})];
+      expect(liveHosts.filter((host) => isIpLiteralHostname(host)), "the live effective policy allows an IP-literal host").toEqual([]);
+      expect(liveHosts, "the live effective policy allows 127.0.0.1").not.toContain("127.0.0.1");
+      expect(live.network.hostServices ?? {}, "the live effective policy's host services changed")
+        .toEqual({ [SERVICE_NAME]: { target: "host-loopback", port } });
+      expect(Object.keys(live.oauth.providers ?? {}), "the live OAuth mediation policy has a provider for the loopback entry")
+        .not.toContain(mcpOAuthProviderId("claude", LOOPBACK_PROBE_SERVER));
+
+      // F3: raw CONNECTs to the loopback URL's own authority, sent through
+      // the proxy as a client that ignores NO_PROXY would. Q is not 443, so
+      // the proxy refuses it raw before any dial.
+      const loopbackRefused = sessionRawConnect(sessionId, proxyIp, `127.0.0.1:${unapprovedPort}`);
+      expect(loopbackRefused.startsWith("HTTP/1.1 403"), `CONNECT 127.0.0.1:${unapprovedPort} was not refused with a raw 403: ${describeOutput(loopbackRefused)}`).toBe(true);
+      // 127.0.0.1:443 is not in the allowlist (asserted above). The proxy
+      // answers a non-allowlisted 443 CONNECT with its denied tunnel (a
+      // `200 Connection Established`, then the denial inside its own TLS) or,
+      // past the denied-tunnel cap, a raw 403; neither dials 127.0.0.1:443.
+      // UNVERIFIED on a Docker host: which of the two this session gets, and
+      // that the denial event names host 127.0.0.1 (events are rate-bounded
+      // per host and reason; no earlier case in this tranche denies it).
+      const since443 = new Date().toISOString();
+      const httpsRefused = sessionRawConnect(sessionId, proxyIp, "127.0.0.1:443");
+      expect(
+        httpsRefused.startsWith("HTTP/1.1 403") || httpsRefused.startsWith("HTTP/1.1 200 Connection Established"),
+        `CONNECT 127.0.0.1:443 got neither a raw 403 nor the denied tunnel: ${describeOutput(httpsRefused)}`,
+      ).toBe(true);
+      await pollUntil(() => proxyEvents(proxyLogsSince(proxyId, since443))
+        .some(({ fields }) => fields.host === "127.0.0.1" && fields.reason === "host-not-allowlisted"), {
+        timeoutMs: 15_000,
+        intervalMs: 1000,
+        label: "the proxy to log the 127.0.0.1:443 CONNECT as a host-not-allowlisted denial",
+      });
+      expect(hostOpenCount(echo, "unapproved"), "a CONNECT to 127.0.0.1 reached the unapproved host port").toBe(opensBefore);
+
       // Positive control for the zero: the host listener on Q is live, and
       // its log records an accept when one happens.
       expect(await hostDirectEcho(unapprovedPort, nonce("host-control")), "the host listener on the unapproved port is not live").toBe(true);
@@ -1094,7 +1189,7 @@ describe("approved host services", () => {
     } finally {
       // Best effort: a cleanup failure must not replace the case's own failure.
       if (!revoked) fixture.runfree(["mcp", "revoke", "claude", LOOPBACK_PROBE_SERVER, "--source", "project"]);
-      fs.writeFileSync(projectMcpJsonPath(fixture.projectRoot), originalMcpJson);
+      if (originalMcpJson !== undefined) fs.writeFileSync(projectMcpJsonPath(fixture.projectRoot), originalMcpJson);
       // Later cases need a standing session; restore one if this case failed
       // before its probe session started.
       if (sessions.length === 0) await startSession().catch((error: unknown) => console.warn(`T1 cleanup: ${String(error)}`));
