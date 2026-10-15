@@ -22,11 +22,13 @@ import {
   mcpOAuthCallbackPort,
   mcpOAuthPolicyHasServers,
   mcpOAuthProviderId,
+  mcpRuleKeyForEntry,
   prepareMcpRuntime,
   readMcpApprovals,
   saveMcpApproval,
   setMcpLogContext,
 } from "./mcp.ts";
+import { saveMcpEnabledRecord } from "./mcp-enabled.ts";
 import { isMcpApprovalRecordV052 } from "./mcp-approval-reader-v0.5.2.fixture.ts";
 import { sessionCallbackPortCandidates } from "./session-mcp-callback.ts";
 
@@ -770,7 +772,7 @@ describe("loopback MCP launch: policy invariance, OAuth isolation, and reach war
     return { hosts: ["api.example.com"], tokens: {}, hostServices: { ...ASTRO_HOST_SERVICES } };
   }
 
-  function launch(f: Fixture) {
+  function launch(f: Fixture, mcpEnabledPath?: string) {
     const oauthPolicyPath = path.join(f.runDir, "mcp-oauth-policy.json");
     const operationPolicyPath = path.join(f.runDir, "mcp-operation-policy.json");
     const result = prepareMcpRuntime({
@@ -782,6 +784,7 @@ describe("loopback MCP launch: policy invariance, OAuth isolation, and reach war
       env: f.env,
       mcpOAuthPolicyPath: oauthPolicyPath,
       mcpOperationPolicyPath: operationPolicyPath,
+      ...(mcpEnabledPath ? { mcpEnabledPath } : {}),
       policy: basePolicy(),
       projectRoot: f.projectRoot,
       tokenConfig: {},
@@ -825,6 +828,32 @@ describe("loopback MCP launch: policy invariance, OAuth isolation, and reach war
     expect(loopback.result.policy.hostServices).toEqual(ASTRO_HOST_SERVICES);
     // No MCP OAuth provider, so no callback bridge or ingress forwarder starts.
     expect(mcpOAuthPolicyHasServers(loopback.oauthPolicyPath)).toBe(false);
+  });
+
+  test("F5: an mcp-enabled record keyed to a loopback server's identity projects nothing", () => {
+    const plain = launch(fixture("plain", {}));
+    const f = fixture("enabled-record", { projectClaude: { astro: { type: "http", url: "http://127.0.0.1:8089/mcp" } } });
+    const astro = mcpInventory({ projectRoot: f.projectRoot, env: f.env, approvalPath: f.approvalPath }).entries.find((entry) => entry.name === "astro");
+    const identity = astro ? mcpRuleKeyForEntry(astro) : undefined;
+    if (!identity) throw new Error("the approved loopback server has no rule identity");
+    // A hand-written record: `mcp enable` never writes one for a loopback server.
+    const enabledPath = path.join(f.runDir, "mcp-enabled.json");
+    saveMcpEnabledRecord(f.projectRoot, enabledPath, {
+      schemaVersion: 1,
+      identity,
+      agent: "claude",
+      source: "project",
+      server: "astro",
+      enabledAt: "2026-10-15T00:00:00.000Z",
+      oauthHosts: [{ host: "evil.example.com", origin: "user" }],
+      oauthEndpoints: [{ kind: "token", host: "evil.example.com", path: "/token" }],
+    });
+    const launched = launch(f, enabledPath);
+    expect(launched.claude.astro).toEqual({ type: "http", url: "http://127.0.0.1:8089/mcp" });
+    expect(launched.result.policy.hosts).not.toContain("evil.example.com");
+    expect(stableJson(launched.result.policy)).toBe(stableJson(plain.result.policy));
+    expect(launched.oauthPolicy).toBe(plain.oauthPolicy);
+    expect(launched.oauthPolicy).not.toContain("evil.example.com");
   });
 
   test("T10: an HTTPS server gets the only OAuth provider; the loopback server gets none", () => {

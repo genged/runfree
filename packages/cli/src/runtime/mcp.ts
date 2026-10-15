@@ -2088,7 +2088,10 @@ export function prepareMcpRuntime(options: McpPrepareOptions): McpPrepareResult 
   // OAuth mediation policy written below.
   const enabled = options.mcpEnabledPath ? readMcpEnabled(options.projectRoot, options.mcpEnabledPath).file : undefined;
   const claimants = servers.map((server) => {
-    const identity = enabled
+    // F5: a loopback server claims no record, so whatever a record keyed to
+    // its identity names never reaches the policy ("adds nothing to policy"
+    // by construction, not because `mcp enable` writes none).
+    const identity = enabled && server.transport !== "http-loopback"
       ? mcpRuleKey({ agent: server.agent, descriptorDigest: server.descriptorDigest, endpoint: server.endpoint, server: server.name, source: server.source })
       : undefined;
     const record = identity ? enabled?.records[identity] : undefined;
