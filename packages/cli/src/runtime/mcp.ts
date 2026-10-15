@@ -22,10 +22,11 @@ import {
   isIpLiteralHostname,
   normalizeHostname,
   normalizePathPrefix,
+  validateNetworkPolicy,
   type CredentialPolicyJson,
   type PolicyJson,
 } from "@runfree/runtime-contracts/network-policy";
-import { refusedHostServicePortReason } from "@runfree/runtime-contracts/host-services";
+import { HOST_SERVICE_NAME_RE, type HostServicesJson, refusedHostServicePortReason } from "@runfree/runtime-contracts/host-services";
 import { parse as parseToml } from "smol-toml";
 import { isMcpAgentId, MCP_AGENT_IDS } from "../agents.ts";
 import type { ProjectInfo } from "../config.ts";
@@ -112,9 +113,11 @@ export type McpInventoryEntry = {
     host: string;
     path: string;
   };
-  // `http-loopback` only: the normalized URL the agent config carries, and its port.
+  // `http-loopback` only: the normalized URL the agent config carries, and its
+  // port. `reach` is present only when the caller supplied host services.
   loopback?: {
     port: number;
+    reach?: McpLoopbackReach;
     url: string;
   };
   mcpPolicy?: {
@@ -1377,7 +1380,35 @@ function loopbackConfigUrl(prepared: PreparedMcpServer): string {
   return url;
 }
 
-function mcpInventoryRecords(options: { approvalPath?: string; env: NodeJS.ProcessEnv; projectRoot: string; rulesPath?: string }): McpInventoryRecord[] {
+type McpInventoryOptions = {
+  approvalPath?: string;
+  env: NodeJS.ProcessEnv;
+  // The selected effective policy's host services. When given, loopback
+  // entries carry `loopback.reach`; when absent, no `reach` key.
+  hostServices?: HostServicesJson;
+  projectRoot: string;
+  rulesPath?: string;
+};
+
+// L5: reach is shown, never granted. A loopback port is reached on the host
+// only when the selected effective policy already has a host service on it;
+// otherwise the server works only if a process in the session listens there.
+export type McpLoopbackReach =
+  | { kind: "host-service"; name: string; port: number }
+  | { kind: "container-local"; port: number };
+
+export function mcpLoopbackReach(port: number, hostServices: HostServicesJson): McpLoopbackReach {
+  const match = Object.entries(hostServices).find(([, service]) => service.port === port);
+  return match ? { kind: "host-service", name: match[0], port } : { kind: "container-local", port };
+}
+
+// The host-service name suggested for a container-local loopback server: the
+// server name when it is a valid host-service name, else `mcp-<port>`.
+export function loopbackHostServiceName(serverName: string, port: number): string {
+  return HOST_SERVICE_NAME_RE.test(serverName) ? serverName : `mcp-${port}`;
+}
+
+function mcpInventoryRecords(options: McpInventoryOptions): McpInventoryRecord[] {
   const approvals = readMcpApprovals(options.projectRoot, options.approvalPath);
   const rules = readMcpRules(options.projectRoot, options.rulesPath);
   const importedByName = new Map<string, McpSourceScope>();
@@ -1462,7 +1493,13 @@ function mcpInventoryRecords(options: { approvalPath?: string; env: NodeJS.Proce
       },
       ...(prepared?.endpoint ? { endpoint: prepared.endpoint } : {}),
       ...(prepared?.transport === "http-loopback" && prepared.loopbackPort !== undefined
-        ? { loopback: { url: loopbackConfigUrl(prepared), port: prepared.loopbackPort } }
+        ? {
+          loopback: {
+            url: loopbackConfigUrl(prepared),
+            port: prepared.loopbackPort,
+            ...(options.hostServices ? { reach: mcpLoopbackReach(prepared.loopbackPort, options.hostServices) } : {}),
+          },
+        }
         : {}),
       ...(operationServerId
         ? {
@@ -1486,7 +1523,7 @@ function mcpInventoryRecords(options: { approvalPath?: string; env: NodeJS.Proce
   });
 }
 
-export function mcpInventory(options: { approvalPath?: string; env: NodeJS.ProcessEnv; projectRoot: string; rulesPath?: string }): McpInventory {
+export function mcpInventory(options: McpInventoryOptions): McpInventory {
   const entries = mcpInventoryRecords(options).map((record): McpInventoryEntry => {
     const {
       prepared: _prepared,
@@ -1959,6 +1996,9 @@ export function prepareMcpRuntime(options: McpPrepareOptions): McpPrepareResult 
   const originalPolicy = stableJson(options.policy);
   const originalTokenConfig = stableJson(options.tokenConfig);
   const callbackPort = options.callbackPort ?? mcpOAuthCallbackPort(options.projectRoot);
+  // L5 reach source: the approved base policy's host services. Validated
+  // before any write, so an invalid base policy fails before side effects.
+  const hostServices = validateNetworkPolicy(options.policy).hostServices;
   const servers: PreparedMcpServer[] = [];
   const events: McpLogEvent[] = [];
   const desktopBuiltIns: McpInventoryRecord[] = [];
@@ -2056,6 +2096,17 @@ export function prepareMcpRuntime(options: McpPrepareOptions): McpPrepareResult 
       if (mcpLogContext.agent !== undefined && entry.agent !== mcpLogContext.agent) continue;
       runfreeLog(`mcp: skipped Codex Desktop built-in ${entry.name}; not used in Runfree`);
     }
+  }
+
+  // L5: one warning per generated loopback server of the launched agent that
+  // no approved host service backs. Reach is shown here, never granted.
+  for (const server of servers) {
+    if (server.transport !== "http-loopback" || server.loopbackPort === undefined) continue;
+    if (mcpLogContext.agent !== undefined && server.agent !== mcpLogContext.agent) continue;
+    const port = server.loopbackPort;
+    if (mcpLoopbackReach(port, hostServices).kind !== "container-local") continue;
+    warn(`mcp: ${server.agent} server ${printable(server.name)} targets 127.0.0.1:${port}, which is not an approved host service;\n`
+      + `it works only if a process in the session listens there. To reach the host: ${remedy.hostServiceAdd(loopbackHostServiceName(server.name, port), port)}`);
   }
 
   // The OAuth callback guidance is verbose-only: the host cannot see whether

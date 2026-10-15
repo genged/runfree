@@ -6,18 +6,26 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
 
 import { refusedHostServicePortReason } from "@runfree/runtime-contracts/host-services";
+import type { HostServicesJson } from "@runfree/runtime-contracts/host-services";
 import type { PolicyJson } from "@runfree/runtime-contracts/network-policy";
+import { stableJson } from "@runfree/runtime-contracts/primitives";
 
 import { projectHash } from "../project-identity.ts";
-import { flushWarnings, setOutputWriterForTest } from "../warnings.ts";
+import { remedy } from "../remedies.ts";
+import { flushWarnings, pendingWarningsForTest, setOutputWriterForTest } from "../warnings.ts";
 import {
   applyPolicyAndTokensForTest,
+  loopbackHostServiceName,
   mcpApprovalPath,
   mcpInventory,
+  mcpLoopbackReach,
   mcpOAuthCallbackPort,
+  mcpOAuthPolicyHasServers,
+  mcpOAuthProviderId,
   prepareMcpRuntime,
   readMcpApprovals,
   saveMcpApproval,
+  setMcpLogContext,
 } from "./mcp.ts";
 import { isMcpApprovalRecordV052 } from "./mcp-approval-reader-v0.5.2.fixture.ts";
 import { sessionCallbackPortCandidates } from "./session-mcp-callback.ts";
@@ -656,5 +664,203 @@ describe("HTTPS MCP digest stability", () => {
     });
     const generated = JSON.parse(fs.readFileSync(path.join(runDir, "claude-mcp.json"), "utf8")) as { mcpServers: Record<string, unknown> };
     expect(generated.mcpServers.astro).toEqual({ type: "http", url: "https://MCP.Example.com/mcp" });
+  });
+});
+
+const ASTRO_HOST_SERVICES: HostServicesJson = { astro: { target: "host-loopback", port: 8089 } };
+
+// L5: reach is shown, never granted. The suggested host-service name is the
+// server name when valid, else `mcp-<port>`.
+describe("loopback MCP reach", () => {
+  test("a port with an approved host service reaches it; any other port is container-local", () => {
+    expect(mcpLoopbackReach(8089, ASTRO_HOST_SERVICES)).toEqual({ kind: "host-service", name: "astro", port: 8089 });
+    expect(mcpLoopbackReach(3000, ASTRO_HOST_SERVICES)).toEqual({ kind: "container-local", port: 3000 });
+    expect(mcpLoopbackReach(8089, {})).toEqual({ kind: "container-local", port: 8089 });
+  });
+
+  test("the suggested host-service name is the server name only when it is a valid host-service name", () => {
+    expect(loopbackHostServiceName("astro", 8089)).toBe("astro");
+    expect(loopbackHostServiceName("Astro_MCP", 8089)).toBe("mcp-8089");
+    expect(loopbackHostServiceName("a".repeat(64), 8089)).toBe("mcp-8089");
+    expect(loopbackHostServiceName("a".repeat(63), 8089)).toBe("a".repeat(63));
+  });
+});
+
+// T6/S6, T10, and the L5 launch warning.
+describe("loopback MCP launch: policy invariance, OAuth isolation, and reach warning", () => {
+  let tmp: string;
+
+  beforeEach(() => {
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), "runfree-mcp-loopback-launch-"));
+    flushWarnings();
+    setOutputWriterForTest(() => undefined);
+  });
+
+  afterEach(() => {
+    setMcpLogContext({});
+    flushWarnings();
+    setOutputWriterForTest(undefined);
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
+
+  type Fixture = {
+    env: NodeJS.ProcessEnv;
+    approvalPath: string;
+    projectRoot: string;
+    runDir: string;
+  };
+
+  function fixture(label: string, options: { projectClaude?: Record<string, unknown>; userClaude?: Record<string, unknown>; userCodex?: string }): Fixture {
+    const root = path.join(tmp, label);
+    const projectRoot = path.join(root, "project");
+    const hostHome = path.join(root, "host-home");
+    const stateDir = path.join(root, "state");
+    const runDir = path.join(root, "run");
+    for (const dir of [projectRoot, path.join(hostHome, ".codex"), stateDir, runDir]) fs.mkdirSync(dir, { recursive: true });
+    const env = { HOME: hostHome, CODEX_HOME: path.join(hostHome, ".codex") };
+    const approvalPath = mcpApprovalPath(stateDir);
+    if (options.userClaude) fs.writeFileSync(path.join(hostHome, ".claude.json"), `${JSON.stringify({ mcpServers: options.userClaude }, null, 2)}\n`);
+    if (options.userCodex) fs.writeFileSync(path.join(hostHome, ".codex", "config.toml"), options.userCodex);
+    if (options.projectClaude) {
+      fs.writeFileSync(path.join(projectRoot, ".mcp.json"), `${JSON.stringify({ mcpServers: options.projectClaude }, null, 2)}\n`);
+      for (const entry of mcpInventory({ projectRoot, env, approvalPath }).entries) {
+        if (entry.source === "project") saveMcpApproval(projectRoot, approvalPath, entry);
+      }
+    }
+    return { env, approvalPath, projectRoot, runDir };
+  }
+
+  function basePolicy(): PolicyJson {
+    return { hosts: ["api.example.com"], tokens: {}, hostServices: { ...ASTRO_HOST_SERVICES } };
+  }
+
+  function launch(f: Fixture) {
+    const oauthPolicyPath = path.join(f.runDir, "mcp-oauth-policy.json");
+    const operationPolicyPath = path.join(f.runDir, "mcp-operation-policy.json");
+    const result = prepareMcpRuntime({
+      approvalPath: f.approvalPath,
+      callbackPort: 47638,
+      claudeConfigPath: path.join(f.runDir, "claude.json"),
+      claudeMcpConfigPath: path.join(f.runDir, "claude-mcp.json"),
+      codexDir: path.join(f.runDir, "codex"),
+      env: f.env,
+      mcpOAuthPolicyPath: oauthPolicyPath,
+      mcpOperationPolicyPath: operationPolicyPath,
+      policy: basePolicy(),
+      projectRoot: f.projectRoot,
+      tokenConfig: {},
+    });
+    return {
+      result,
+      oauthPolicyPath,
+      oauthPolicy: fs.readFileSync(oauthPolicyPath, "utf8"),
+      operationPolicy: fs.readFileSync(operationPolicyPath, "utf8"),
+      claude: (JSON.parse(fs.readFileSync(path.join(f.runDir, "claude-mcp.json"), "utf8")) as { mcpServers: Record<string, unknown> }).mcpServers,
+    };
+  }
+
+  function warningMessages(): string[] {
+    const messages = pendingWarningsForTest().map((event) => event.message);
+    flushWarnings();
+    return messages;
+  }
+
+  function containerLocalWarning(agent: string, name: string, port: number): string {
+    return `mcp: ${agent} server ${name} targets 127.0.0.1:${port}, which is not an approved host service;\n`
+      + `it works only if a process in the session listens there. To reach the host: ${remedy.hostServiceAdd(loopbackHostServiceName(name, port), port)}`;
+  }
+
+  test("T6/S6: an approved project loopback entry and a user loopback entry leave every policy byte-identical", () => {
+    const plain = launch(fixture("plain", {}));
+    const loopback = launch(fixture("loopback", {
+      projectClaude: { astro: { type: "http", url: "http://127.0.0.1:8089/mcp" } },
+      userClaude: { devtools: { type: "http", url: "http://127.0.0.1:3000/mcp" } },
+    }));
+    // The loopback servers were generated, so the comparison is not vacuous.
+    expect(loopback.claude.astro).toEqual({ type: "http", url: "http://127.0.0.1:8089/mcp" });
+    expect(loopback.claude.devtools).toEqual({ type: "http", url: "http://127.0.0.1:3000/mcp" });
+    expect(stableJson(loopback.result.policy)).toBe(stableJson(plain.result.policy));
+    expect(loopback.operationPolicy).toBe(plain.operationPolicy);
+    expect(loopback.oauthPolicy).toBe(plain.oauthPolicy);
+    expect(loopback.result.policyChanged).toBe(false);
+    expect(loopback.result.tokenConfigChanged).toBe(false);
+    expect(loopback.result.policy.hosts).toEqual(["api.example.com"]);
+    expect(loopback.result.policy.hosts).not.toContain("127.0.0.1");
+    expect(loopback.result.policy.hostServices).toEqual(ASTRO_HOST_SERVICES);
+    // No MCP OAuth provider, so no callback bridge or ingress forwarder starts.
+    expect(mcpOAuthPolicyHasServers(loopback.oauthPolicyPath)).toBe(false);
+  });
+
+  test("T10: an HTTPS server gets the only OAuth provider; the loopback server gets none", () => {
+    const launched = launch(fixture("t10", {
+      projectClaude: {
+        astro: { type: "http", url: "http://127.0.0.1:8089/mcp" },
+        publicMcp: { type: "http", url: "https://mcp.example.com/mcp" },
+      },
+    }));
+    expect(launched.claude.astro).toEqual({ type: "http", url: "http://127.0.0.1:8089/mcp" });
+    const providers = (JSON.parse(launched.oauthPolicy) as { providers: Record<string, unknown> }).providers;
+    expect(Object.keys(providers)).toEqual([mcpOAuthProviderId("claude", "publicMcp")]);
+    expect(providers).not.toHaveProperty(mcpOAuthProviderId("claude", "astro"));
+    expect(mcpOAuthPolicyHasServers(launched.oauthPolicyPath)).toBe(true);
+  });
+
+  test("inventory reports loopback reach only when given host services", () => {
+    const f = fixture("inventory", {
+      userClaude: {
+        astro: { type: "http", url: "http://127.0.0.1:8089/mcp" },
+        devtools: { type: "http", url: "http://127.0.0.1:3000/mcp" },
+      },
+    });
+    const withReach = mcpInventory({ projectRoot: f.projectRoot, env: f.env, approvalPath: f.approvalPath, hostServices: ASTRO_HOST_SERVICES }).entries;
+    expect(withReach.find((entry) => entry.name === "astro")?.loopback).toEqual({
+      url: "http://127.0.0.1:8089/mcp",
+      port: 8089,
+      reach: { kind: "host-service", name: "astro", port: 8089 },
+    });
+    expect(withReach.find((entry) => entry.name === "devtools")?.loopback?.reach).toEqual({ kind: "container-local", port: 3000 });
+    const without = mcpInventory({ projectRoot: f.projectRoot, env: f.env, approvalPath: f.approvalPath }).entries;
+    for (const entry of without) expect(entry.loopback && "reach" in entry.loopback, entry.name).toBe(false);
+  });
+
+  test("L5: launch warns once per container-local server of the launched agent only", () => {
+    const f = fixture("warn", {
+      userClaude: {
+        astro: { type: "http", url: "http://127.0.0.1:3000/mcp" },
+        hosted: { type: "http", url: "http://127.0.0.1:8089/mcp" },
+        Odd_Name: { type: "http", url: "http://127.0.0.1:4000/mcp" },
+      },
+      userCodex: codexTable("codexlocal", "http://127.0.0.1:5000/mcp", []),
+    });
+    setMcpLogContext({ agent: "claude" });
+    launch(f);
+    const reachLines = warningMessages().filter((message) => message.includes("not an approved host service"));
+    expect(reachLines.sort()).toEqual([
+      containerLocalWarning("claude", "Odd_Name", 4000),
+      containerLocalWarning("claude", "astro", 3000),
+    ].sort());
+    expect(containerLocalWarning("claude", "astro", 3000)).toBe(
+      "mcp: claude server astro targets 127.0.0.1:3000, which is not an approved host service;\n"
+        + "it works only if a process in the session listens there. To reach the host: runfree host-service add astro --port 3000",
+    );
+    expect(reachLines.some((line) => line.includes("Odd_Name") && line.endsWith("runfree host-service add mcp-4000 --port 4000"))).toBe(true);
+
+    // Each call warns again, once.
+    launch(f);
+    expect(warningMessages().filter((message) => message.includes("not an approved host service"))).toHaveLength(2);
+
+    setMcpLogContext({ agent: "codex" });
+    launch(f);
+    expect(warningMessages().filter((message) => message.includes("not an approved host service"))).toEqual([
+      containerLocalWarning("codex", "codexlocal", 5000),
+    ]);
+  });
+
+  test("L5: an unapproved project loopback server is skipped, not reach-warned", () => {
+    const f = fixture("unapproved", {});
+    fs.writeFileSync(path.join(f.projectRoot, ".mcp.json"), `${JSON.stringify({ mcpServers: { astro: { type: "http", url: "http://127.0.0.1:3000/mcp" } } }, null, 2)}\n`);
+    setMcpLogContext({ agent: "claude" });
+    launch(f);
+    expect(warningMessages().filter((message) => message.includes("not an approved host service"))).toEqual([]);
   });
 });
