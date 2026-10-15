@@ -1293,6 +1293,53 @@ describe("write classification (operation-aware read-only / approve-on-write)", 
     }
   });
 
+  // Fix round 1 (todo 118 review): canonicalPathSegments truncates at the
+  // first NUL, so a NUL placed after the tail hid a real trailing segment —
+  // the request canonicalized to a last segment of "git-upload-pack" even
+  // though the raw request kept going past the NUL. The parser also
+  // normalizes away a trailing `/`, `;param`, `.`, or encoded space, so a
+  // decorated spelling canonicalized to the same name too. The exemption now
+  // also requires the raw path to literally end with "/git-upload-pack"
+  // (case-insensitively), so none of these read through.
+  test("a NUL after the tail, or a decorated spelling, stays a write (todo 118 review)", () => {
+    const options = requestOptions({
+      requests: { "git.example.com": { gitPush: "write", writeAction: "deny" } },
+      tokenReader: () => null,
+    });
+    const request = (method: string, path: string) => shapeDenial(() => testBeforeAllowedRequest({
+      method,
+      url: `https://git.example.com${path}`,
+      headers: {},
+    }, options));
+
+    for (const [method, path] of [
+      ["POST", "/o/r/branches/git-upload-pack%00/rename"],
+      ["POST", "/o/r/git-upload-pack%00/x"],
+      // Double-encoded NUL: one decode exposes %00, the next decodes to NUL.
+      ["POST", "/o/r/git-upload-pack%2500/rename"],
+      ["POST", "/owner/repo.git/git-upload-pack/"],
+      ["POST", "/owner/repo.git/git-upload-pack;x"],
+      ["POST", "/owner/repo.git/git-upload-pack."],
+      ["POST", "/owner/repo.git/git-upload-pack%20"],
+    ] as const) {
+      const denial = request(method, path);
+      expect(denial.shape?.reason, `${method} ${path}`).toBe("write-denied");
+      expect(denial.shape?.writeCategory, `${method} ${path}`).toBe("method");
+    }
+
+    // The exact canonical RPC, with or without `.git`, keeps reading.
+    expect(() => testBeforeAllowedRequest({
+      method: "POST",
+      url: "https://git.example.com/owner/repo.git/git-upload-pack",
+      headers: {},
+    }, options)).not.toThrow();
+    expect(() => testBeforeAllowedRequest({
+      method: "POST",
+      url: "https://git.example.com/owner/repo/git-upload-pack",
+      headers: {},
+    }, options)).not.toThrow();
+  });
+
   test("readPathPrefixes classify POST reads; path confusion disqualifies the exemption", () => {
     const options = requestOptions({
       requests: {

@@ -390,19 +390,40 @@ describe("proxy policy path confusion properties", () => {
   });
 
   // todo 118: the upload-pack read exemption must check the method, not just
-  // the path. Surrounding segments stay plain letters (never a confusing
-  // piece) and the tail's encoding level stays within the decode bound, so
-  // the only two dimensions in play are the method and the tail's spelling —
-  // exactly what classifyWrite's read exemption is keyed on.
-  it("P1.5: an upload-pack path classifies as a read iff the method is safe, or POST to the canonical git-upload-pack segment", () => {
+  // the path. Fix round 1 widened this past the method alone:
+  // canonicalPathSegments truncates at the first NUL (so a NUL placed after
+  // the tail hid a real trailing segment) and normalizes away a trailing
+  // `/`, `;param`, `.`, or decoded whitespace (so a decorated spelling
+  // canonicalized to the exact RPC name too). The oracle below is built
+  // without any call into policy.ts: it checks the raw (never decoded)
+  // pathname against the literal suffix, and separately decodes with this
+  // file's own independent decodeToFixedPoint (defined above, not the
+  // module under test) to rule out a hidden NUL — so a decorated or
+  // NUL-hiding spelling cannot look like the exact RPC to the oracle either.
+  it("P1.5: an upload-pack path classifies as a read iff the method is safe, or POST to a literal, undecorated git-upload-pack path with no hidden NUL", () => {
     const SAFE_METHODS = ["GET", "HEAD", "OPTIONS"] as const;
     const UNSAFE_METHODS = ["POST", "DELETE", "PUT", "PATCH", "TRACE"] as const;
     const UPLOAD_PACK_RULE: RequestPolicyJson = { gitPush: "deny" };
+
+    type Decoration = { name: string; apply: (core: string) => string };
+    const DECORATIONS: readonly Decoration[] = [
+      { name: "none", apply: (core) => core },
+      { name: "trailing-slash", apply: (core) => `${core}/` },
+      { name: "matrix-param", apply: (core) => `${core};x` },
+      { name: "trailing-dot", apply: (core) => `${core}.` },
+      { name: "trailing-encoded-space", apply: (core) => `${core}%20` },
+      { name: "nul-suffix", apply: (core) => `${core}%00/rename` },
+      { name: "double-encoded-nul-suffix", apply: (core) => `${core}%2500/rename` },
+      { name: "extra-segment", apply: (core) => `${core}/extra` },
+    ];
+
     // Capped below MAX_PATH_DECODE_ITERATIONS so every spelling here decodes
-    // to convergence; the decode-bound overflow itself is out of scope here.
+    // to convergence under the production bound; the decode-bound overflow
+    // itself is out of scope here.
     const tailArb = fc.record({
       text: fc.constantFrom("git-upload-pack", "git-upload-pack-not").chain(randomCase),
       levels: fc.integer({ min: 0, max: 5 }),
+      decoration: fc.constantFrom(...DECORATIONS),
     });
 
     fc.assert(
@@ -411,12 +432,21 @@ describe("proxy policy path confusion properties", () => {
         tailArb,
         fc.constantFrom(...SAFE_METHODS, ...UNSAFE_METHODS),
         (extraSegments, tail, method) => {
-          const path = `/owner/repo.git/${[...extraSegments, encodeLevels(tail.text, tail.levels)].join("/")}`;
+          const encodedTail = tail.decoration.apply(encodeLevels(tail.text, tail.levels));
+          const path = `/owner/repo.git/${[...extraSegments, encodedTail].join("/")}`;
           const url = new URL(`https://${HOST}${path}`);
           const classification = classifyWrite({ method, url, rule: UPLOAD_PACK_RULE });
+
           const isSafe = (SAFE_METHODS as readonly string[]).includes(method);
-          const expectRead = isSafe || (method === "POST" && tail.text.toLowerCase() === "git-upload-pack");
-          expect(classification.write, `${method} ${path}`).toBe(!expectRead);
+          const rawEndsWithLiteralRpc = url.pathname.toLowerCase().endsWith("/git-upload-pack");
+          let decodesWithoutNul: boolean;
+          try {
+            decodesWithoutNul = !decodeToFixedPoint(url.pathname).includes("\0");
+          } catch {
+            decodesWithoutNul = false;
+          }
+          const expectRead = isSafe || (method === "POST" && rawEndsWithLiteralRpc && decodesWithoutNul);
+          expect(classification.write, `${tail.decoration.name} ${method} ${path}`).toBe(!expectRead);
         },
       ),
       propertyParameters(),

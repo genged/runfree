@@ -399,16 +399,33 @@ function hasMethodOverrideHeader(headers: Record<string, string | string[] | und
 // (upload-pack). Only consulted for hosts that explicitly declare git
 // handling via a `gitPush` rule, and only for the RPC itself: the exemption
 // is POST-only (GET is already safe, and no non-GET info/refs request is a
-// git read, so that capability-probe form is not matched here at all). It
-// matches the canonical last path segment via the same parser isGitPushPath
-// uses, not a raw suffix, so encoding/case/separator tricks cannot forge a
-// read. Malformed or non-converging encoding fails closed by NOT matching
-// (the request then falls through to the conservative write classification).
+// git read, so that capability-probe form is not matched here at all).
+//
+// This is the one git-path check that must agree with the routing origin
+// about where the path ends, not just what it decodes to:
+// `canonicalPathSegments` truncates at the first NUL, so on its own a NUL
+// placed after the RPC name would hide a real trailing segment (an origin
+// that does not truncate there keeps routing past it) and it normalizes away
+// a trailing `/`, `;param`, `.`, or decoded whitespace, so a decorated
+// spelling would canonicalize to the same name as the exact RPC. So the
+// exemption only fires when every one of these holds: the path decodes to
+// convergence with no NUL anywhere in the result; its canonical last segment
+// (by the same parser isGitPushPath uses) is "git-upload-pack"; and — the
+// check with no decoding or normalization at all — the raw, merely
+// lower-cased pathName itself ends with the literal suffix
+// "/git-upload-pack". A real git client's upload-pack request already is
+// that exact literal path, so this costs it nothing; it only refuses every
+// encoded, decorated, or NUL-hiding variant that could make the proxy and an
+// origin disagree. Malformed or non-converging encoding, or any check that
+// does not hold, fails closed by NOT matching (the request then falls
+// through to the conservative write classification).
 function isGitUploadPackRead(method: string, pathName: string): boolean {
   if (method !== "POST") return false;
+  const decoded = decodeToConvergence(pathName);
+  if (decoded === undefined || decoded.includes("\0")) return false;
   const segments = canonicalPathSegments(pathName);
-  if (segments === undefined) return false;
-  return segments.at(-1) === "git-upload-pack";
+  if (segments === undefined || segments.at(-1) !== "git-upload-pack") return false;
+  return pathName.toLowerCase().endsWith("/git-upload-pack");
 }
 
 export type WriteClassification = { write: false } | { write: true; category: WriteCategory };
