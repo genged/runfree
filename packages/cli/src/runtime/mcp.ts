@@ -687,47 +687,65 @@ function httpsUrl(value: unknown): URL | undefined {
   }
 }
 
-function oauthAuthServerMetadataUrl(config: Record<string, unknown>): string | undefined {
-  if (typeof config.authServerMetadataUrl === "string" && httpsUrl(config.authServerMetadataUrl)) {
-    return config.authServerMetadataUrl;
+const OAUTH_METADATA_IP_REASON = "OAuth metadata URL must be a hostname, not an IP address";
+const OAUTH_TOKEN_ENDPOINT_IP_REASON = "OAuth token endpoint must be a hostname, not an IP address";
+
+// An OAuth URL host becomes an effective policy host, so it must be a name:
+// WHATWG folds decimal and hex IPv4 forms first, and IPv6 keeps its brackets.
+function ipLiteralUrlHost(parsed: URL): boolean {
+  const bare = parsed.hostname.startsWith("[") ? parsed.hostname.slice(1, -1) : parsed.hostname;
+  return isIpLiteralHostname(bare);
+}
+
+function oauthAuthServerMetadataUrl(config: Record<string, unknown>): McpRefusal | string | undefined {
+  const candidates = [config.authServerMetadataUrl, isRecord(config.oauth) ? config.oauth.authServerMetadataUrl : undefined];
+  for (const candidate of candidates) {
+    const parsed = httpsUrl(candidate);
+    if (parsed && ipLiteralUrlHost(parsed)) return { refused: OAUTH_METADATA_IP_REASON };
   }
-  if (isRecord(config.oauth) && typeof config.oauth.authServerMetadataUrl === "string" && httpsUrl(config.oauth.authServerMetadataUrl)) {
-    return config.oauth.authServerMetadataUrl;
+  for (const candidate of candidates) {
+    if (typeof candidate === "string" && httpsUrl(candidate)) return candidate;
   }
   return undefined;
 }
 
-function tokenEndpointFromConfigValue(value: unknown): { host: string; path: string } | undefined {
+function tokenEndpointFromConfigValue(value: unknown): McpRefusal | { host: string; path: string } | undefined {
   const parsed = httpsUrl(value);
   if (!parsed) return undefined;
-  return {
-    host: normalizeHostname(parsed.hostname),
-    path: normalizePathPrefix(parsed.pathname || "/"),
-  };
+  if (ipLiteralUrlHost(parsed)) return { refused: OAUTH_TOKEN_ENDPOINT_IP_REASON };
+  let host: string;
+  try {
+    host = normalizeHostname(parsed.hostname);
+  } catch (error) {
+    return { refused: `OAuth token endpoint: ${error instanceof Error ? error.message : String(error)}` };
+  }
+  return { host, path: normalizePathPrefix(parsed.pathname || "/") };
 }
 
-function oauthTokenEndpoints(config: Record<string, unknown>): Array<{ host: string; path: string }> {
+function oauthTokenEndpoints(config: Record<string, unknown>): McpRefusal | Array<{ host: string; path: string }> {
   const endpoints: Array<{ host: string; path: string }> = [];
-  for (const key of ["tokenEndpoint", "token_endpoint", "tokenUrl", "token_url"]) {
-    const endpoint = tokenEndpointFromConfigValue(config[key]);
-    if (endpoint) endpoints.push(endpoint);
-  }
-  if (isRecord(config.oauth)) {
+  const sources = [config, ...(isRecord(config.oauth) ? [config.oauth] : [])];
+  for (const source of sources) {
     for (const key of ["tokenEndpoint", "token_endpoint", "tokenUrl", "token_url"]) {
-      const endpoint = tokenEndpointFromConfigValue(config.oauth[key]);
-      if (endpoint) endpoints.push(endpoint);
+      const endpoint = tokenEndpointFromConfigValue(source[key]);
+      if (endpoint === undefined) continue;
+      if ("refused" in endpoint) return endpoint;
+      endpoints.push(endpoint);
     }
   }
   return Array.from(new Map(endpoints.map((endpoint) => [`${endpoint.host}\0${endpoint.path}`, endpoint])).values());
 }
 
-function oauthPolicyFor(config: Record<string, unknown>, parsed: { host: string; pathPrefix: string }): McpOAuthServerPolicyJson {
+function oauthPolicyFor(config: Record<string, unknown>, parsed: { host: string; pathPrefix: string }): McpRefusal | McpOAuthServerPolicyJson {
   const authServerMetadataUrl = oauthAuthServerMetadataUrl(config);
+  if (typeof authServerMetadataUrl === "object") return authServerMetadataUrl;
+  const tokenEndpoints = oauthTokenEndpoints(config);
+  if ("refused" in tokenEndpoints) return tokenEndpoints;
   return {
     resourceHost: parsed.host,
     resourcePathPrefix: parsed.pathPrefix,
     ...(authServerMetadataUrl ? { oauth: { authServerMetadataUrl } } : {}),
-    ...(oauthTokenEndpoints(config).length > 0 ? { tokenEndpoints: oauthTokenEndpoints(config) } : {}),
+    ...(tokenEndpoints.length > 0 ? { tokenEndpoints } : {}),
   };
 }
 
@@ -814,6 +832,7 @@ function prepareHttpServer(server: NativeMcpServer, options: PrepareServerOption
   if ("refused" in parsed) return parsed;
   if (hasOAuthConfig(server)) {
     const oauthPolicy = oauthPolicyFor(server.config, parsed);
+    if ("refused" in oauthPolicy) return oauthPolicy;
     const oauthConfig = sanitizedOauthConfig(server.config.oauth);
     logMcp(options, { kind: "imported", scope: server.scope, agent: server.agent, name: server.name, detail: "transport=http auth=oauth" });
     return {
@@ -896,6 +915,8 @@ function prepareHttpServer(server: NativeMcpServer, options: PrepareServerOption
   }
 
   const auth = bindings.length === 0 ? "public" : "static";
+  const publicOauthPolicy = auth === "public" ? oauthPolicyFor(server.config, parsed) : undefined;
+  if (publicOauthPolicy !== undefined && "refused" in publicOauthPolicy) return publicOauthPolicy;
   logMcp(options, { kind: "imported", scope: server.scope, agent: server.agent, name: server.name, detail: `transport=http auth=${auth}` });
   return {
     agent: server.agent,
@@ -914,7 +935,7 @@ function prepareHttpServer(server: NativeMcpServer, options: PrepareServerOption
     // only the already-allowlisted resource host is recorded, and the proxy
     // mediates tokens lazily behind the firewall. Static-header servers carry a
     // credential and never run OAuth, so they get no resource binding.
-    ...(auth === "public" ? { oauthPolicy: oauthPolicyFor(server.config, parsed) } : {}),
+    ...(publicOauthPolicy ? { oauthPolicy: publicOauthPolicy } : {}),
     claudeConfig: server.agent === "claude" ? { type: "http", url: parsed.url } : undefined,
     codexConfig: server.agent === "codex" ? codexGeneratedOptions(server.config, parsed.url) : undefined,
   };
