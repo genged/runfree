@@ -22,12 +22,15 @@
 //      403 from the proxy and the host sees no connection at all.
 //   2b. loopback MCP grants no reach (T1, S5): a project `.mcp.json` entry
 //      `http://127.0.0.1:<Q>/mcp` on the unapproved port, enabled without a
-//      terminal, lands in a new session's generated Claude config, leaves its
-//      `RUNFREE_HOST_SERVICES` unchanged, and gets no in-session listener on Q
-//      (while the relay's row on P shows the read works). An in-session dial
-//      to the URL's host and port is refused (ECONNREFUSED), the host listener
-//      on Q records zero accepts (and then one, for a direct host connection:
-//      the positive control), and the proxy logs nothing naming Q.
+//      terminal and re-rendered by `up` (the template never re-resolves the
+//      selection), lands in a new session's generated Claude config, leaves
+//      its `RUNFREE_HOST_SERVICES` unchanged, and gets no in-session listener
+//      on Q (while the relay's row on P shows the read works). An in-session
+//      dial to the URL's host and port is refused (ECONNREFUSED), the proxy
+//      still refuses `echo.runfree.internal:<Q>` from that session with a raw
+//      403, the host listener on Q records zero accepts (and then one, for a
+//      direct host connection: the positive control), and the proxy logs
+//      nothing naming Q before the refusal probe.
 //   3. no direct path: the session cannot connect to <gateway>:P; root in the
 //      proxy times out on it (a dropped SYN), while uid 1001 in the proxy
 //      connects (the positive control that makes root's timeout meaningful).
@@ -1003,8 +1006,16 @@ describe("approved host services", () => {
     const url = `http://127.0.0.1:${unapprovedPort}/mcp`;
     const hostServicesBefore = sessionEnvValue(sessions[0].session.containerId, "RUNFREE_HOST_SERVICES");
     expect(hostServicesBefore, "the standing session does not carry exactly the approved host service").toBe(`${SERVICE_NAME}:${port}`);
+    // The session template renders host services from the network policy the
+    // last startup selected and never re-resolves it, so this case must run
+    // `up` after the enable: otherwise a regression that made `mcp enable`
+    // add Q to the effective host services would leave the new session on the
+    // old selection, and every assertion below would pass vacuously. The
+    // standing session is stopped first so `up` runs with no session
+    // attached, as in `beforeAll`; the probe session started after `up`
+    // replaces it as the standing session for the later cases.
+    await stopSession(sessions[0]);
     const originalMcpJson = addProjectMcpServer(fixture.projectRoot, LOOPBACK_PROBE_SERVER, { type: "http", url });
-    let probe: StandingSessionHandle | undefined;
     let revoked = true;
     try {
       // No terminal (the fixture's stdin is not a TTY) and no --no-discover:
@@ -1018,7 +1029,10 @@ describe("approved host services", () => {
       expect(enabled.stdout).toContain(`enabled MCP server: claude ${LOOPBACK_PROBE_SERVER}`);
       expect(enabled.output, "enable ran OAuth discovery for a loopback entry").not.toMatch(/Discovering OAuth hosts|discovers OAuth hosts only on a terminal/u);
 
-      probe = await startSession(true);
+      const up = fixture.runfree(["up"]);
+      expect(up.status, `runfree up after the loopback enable failed: ${describeOutput(up.output)}`).toBe(0);
+
+      const probe = await startSession();
       const sessionId = probe.session.containerId;
       // The descriptor reached the session's generated config, as the
       // normalized href...
@@ -1048,10 +1062,21 @@ describe("approved host services", () => {
       await sleep(2_000);
       expect(hostOpenCount(echo, "unapproved"), "the host listener on the unapproved port accepted a connection").toBe(opensBefore);
 
+      // Secondary: without verbose logging the proxy logs denials, not splice
+      // admissions, so the host's zero-accept count above is the main proof.
       const logs = proxyLogsSince(proxyId, since);
       expect(logs, "the proxy logged a CONNECT for the unapproved port").not.toMatch(new RegExp(`runfree\\.internal:${unapprovedPort}\\b`, "u"));
       const naming = proxyEvents(logs).filter(({ fields }) => fields.port === unapprovedPort);
       expect(naming.map(({ line }) => line), "the proxy logged an event naming the unapproved port").toEqual([]);
+
+      // Startup-independent proof (it reads the proxy's live policy, not the
+      // session template): the proxy still refuses the unapproved pair from
+      // this session before any dial. Run after the log read above, since
+      // this refusal itself logs a denial naming Q.
+      const refused = sessionRawConnect(sessionId, proxyIp, `${SERVICE_NAME}.runfree.internal:${unapprovedPort}`);
+      expect(refused.startsWith("HTTP/1.1 403"), `the proxy did not refuse the unapproved pair: ${describeOutput(refused)}`).toBe(true);
+      expect(refused, "the refusal does not name its reason").toContain("host-service-not-configured");
+      expect(hostOpenCount(echo, "unapproved"), "the refused CONNECT reached the unapproved host port").toBe(opensBefore);
 
       // Positive control for the zero: the host listener on Q is live, and
       // its log records an accept when one happens.
@@ -1061,17 +1086,18 @@ describe("approved host services", () => {
         label: "the host log to record the control connection",
       });
 
-      await stopSession(probe);
-      probe = undefined;
+      // The probe session stays up: it is the standing session for later cases.
       const revoke = fixture.runfree(["mcp", "revoke", "claude", LOOPBACK_PROBE_SERVER, "--source", "project"]);
       revoked = revoke.status === 0;
       expect(revoke.status, `mcp revoke failed: ${describeOutput(revoke.output)}`).toBe(0);
       expect(revoke.stdout).toContain(`revoked project MCP server: claude ${LOOPBACK_PROBE_SERVER}`);
     } finally {
       // Best effort: a cleanup failure must not replace the case's own failure.
-      if (probe && sessions.includes(probe)) await stopSession(probe).catch((error: unknown) => console.warn(`T1 cleanup: ${String(error)}`));
       if (!revoked) fixture.runfree(["mcp", "revoke", "claude", LOOPBACK_PROBE_SERVER, "--source", "project"]);
       fs.writeFileSync(projectMcpJsonPath(fixture.projectRoot), originalMcpJson);
+      // Later cases need a standing session; restore one if this case failed
+      // before its probe session started.
+      if (sessions.length === 0) await startSession().catch((error: unknown) => console.warn(`T1 cleanup: ${String(error)}`));
     }
   }, TEST_TIMEOUT_MS);
 
@@ -1355,6 +1381,8 @@ describe("approved host services", () => {
         label: `the relay to listen on 127.0.0.1:${stubPort}`,
       });
 
+      const timeoutBinary = docker(["exec", sessionId, "sh", "-c", "command -v timeout"]);
+      expect(timeoutBinary.status, `the agent image has no timeout binary for the bounded probe: ${describeOutput(timeoutBinary.output)}`).toBe(0);
       const requestsBefore = stub.requests().length;
       const since = new Date().toISOString();
       // The session's own environment, proxy variables included: the threat
