@@ -1225,6 +1225,126 @@ describe("write classification (operation-aware read-only / approve-on-write)", 
     expect(undeclared.shape?.reason).toBe("write-denied");
   });
 
+  // todo 118: the upload-pack read exemption ignored the HTTP method, so a
+  // non-POST verb (or a POST to the info/refs capability probe, which has no
+  // POST form of its own) on an upload-pack path wrongly read through a
+  // `gitPush`-ruled host instead of hitting write approval/deny.
+  test("non-POST methods and POST info/refs on an upload-pack path classify as writes (todo 118)", () => {
+    const options = requestOptions({
+      requests: { "git.example.com": { gitPush: "write", writeAction: "deny" } },
+      tokenReader: () => null,
+    });
+    const request = (method: string, path: string) => shapeDenial(() => testBeforeAllowedRequest({
+      method,
+      url: `https://git.example.com${path}`,
+      headers: {},
+    }, options));
+
+    for (const [method, path] of [
+      ["DELETE", "/owner/repo.git/git-upload-pack"],
+      ["PUT", "/owner/repo.git/git-upload-pack"],
+      ["PATCH", "/owner/repo.git/git-upload-pack"],
+      ["POST", "/owner/repo.git/info/refs?service=git-upload-pack"],
+    ] as const) {
+      const denial = request(method, path);
+      expect(denial.shape?.reason, `${method} ${path}`).toBe("write-denied");
+      expect(denial.shape?.writeCategory, `${method} ${path}`).toBe("method");
+    }
+
+    // The canonical fetch RPC stays a read by POST, with or without `.git`,
+    // and the GET capability probe stays a read because GET is already safe.
+    expect(() => testBeforeAllowedRequest({
+      method: "POST",
+      url: "https://git.example.com/owner/repo.git/git-upload-pack",
+      headers: {},
+    }, options)).not.toThrow();
+    expect(() => testBeforeAllowedRequest({
+      method: "POST",
+      url: "https://git.example.com/owner/repo/git-upload-pack",
+      headers: {},
+    }, options)).not.toThrow();
+    expect(() => testBeforeAllowedRequest({
+      method: "GET",
+      url: "https://git.example.com/owner/repo.git/info/refs?service=git-upload-pack",
+      headers: {},
+    }, options)).not.toThrow();
+  });
+
+  // Look-alike last segments must not match the canonical name: a dash/suffix
+  // extension or an extra path segment after `git-upload-pack` is a write.
+  test("look-alike git-upload-pack segments stay writes (todo 118)", () => {
+    const options = requestOptions({
+      requests: { "git.example.com": { gitPush: "write", writeAction: "deny" } },
+      tokenReader: () => null,
+    });
+    const request = (method: string, path: string) => shapeDenial(() => testBeforeAllowedRequest({
+      method,
+      url: `https://git.example.com${path}`,
+      headers: {},
+    }, options));
+
+    for (const [method, path] of [
+      ["POST", "/x/git-upload-pack-not"],
+      ["POST", "/x/git-upload-pack/extra"],
+    ] as const) {
+      const denial = request(method, path);
+      expect(denial.shape?.reason, `${method} ${path}`).toBe("write-denied");
+      expect(denial.shape?.writeCategory, `${method} ${path}`).toBe("method");
+    }
+  });
+
+  // Fix round 1 (todo 118 review): canonicalPathSegments truncates at the
+  // first NUL, so a NUL placed after the tail hid a real trailing segment —
+  // the request canonicalized to a last segment of "git-upload-pack" even
+  // though the raw request kept going past the NUL. The parser also
+  // normalizes away a trailing `/`, `;param`, `.`, or encoded space, so a
+  // decorated spelling canonicalized to the same name too. The exemption now
+  // also requires the raw path to literally end with "/git-upload-pack"
+  // (case-insensitively), so none of these read through.
+  test("a NUL after the tail, or a decorated spelling, stays a write (todo 118 review)", () => {
+    const options = requestOptions({
+      requests: { "git.example.com": { gitPush: "write", writeAction: "deny" } },
+      tokenReader: () => null,
+    });
+    const request = (method: string, path: string) => shapeDenial(() => testBeforeAllowedRequest({
+      method,
+      url: `https://git.example.com${path}`,
+      headers: {},
+    }, options));
+
+    for (const [method, path] of [
+      ["POST", "/o/r/branches/git-upload-pack%00/rename"],
+      ["POST", "/o/r/git-upload-pack%00/x"],
+      // Double-encoded NUL: one decode exposes %00, the next decodes to NUL.
+      ["POST", "/o/r/git-upload-pack%2500/rename"],
+      ["POST", "/owner/repo.git/git-upload-pack/"],
+      ["POST", "/owner/repo.git/git-upload-pack;x"],
+      ["POST", "/owner/repo.git/git-upload-pack."],
+      ["POST", "/owner/repo.git/git-upload-pack%20"],
+      // A decoy "git-upload-pack" before the NUL makes the truncated
+      // canonical segment and the raw suffix agree with each other, so this
+      // one depends on the decoded-NUL check specifically, not on either of
+      // the other two conditions disagreeing.
+      ["POST", "/o/git-upload-pack%00/git-upload-pack"],
+    ] as const) {
+      const denial = request(method, path);
+      expect(denial.shape?.reason, `${method} ${path}`).toBe("write-denied");
+      expect(denial.shape?.writeCategory, `${method} ${path}`).toBe("method");
+    }
+
+    // The exact canonical RPC, with or without `.git`, keeps reading.
+    expect(() => testBeforeAllowedRequest({
+      method: "POST",
+      url: "https://git.example.com/owner/repo.git/git-upload-pack",
+      headers: {},
+    }, options)).not.toThrow();
+    expect(() => testBeforeAllowedRequest({
+      method: "POST",
+      url: "https://git.example.com/owner/repo/git-upload-pack",
+      headers: {},
+    }, options)).not.toThrow();
+  });
+
   test("readPathPrefixes classify POST reads; path confusion disqualifies the exemption", () => {
     const options = requestOptions({
       requests: {
