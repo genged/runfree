@@ -475,40 +475,6 @@ function hasMethodOverrideHeader(headers: Record<string, string | string[] | und
   return Object.keys(headers).some((key) => METHOD_OVERRIDE_HEADERS.has(key.toLowerCase()));
 }
 
-// Read-side counterpart of isGitPushPath: git fetch negotiation
-// (upload-pack). Only consulted for hosts that explicitly declare git
-// handling via a `gitPush` rule, and only for the RPC itself: the exemption
-// is POST-only (GET is already safe, and no non-GET info/refs request is a
-// git read, so that capability-probe form is not matched here at all).
-//
-// This is the one git-path check that must agree with the routing origin
-// about where the path ends, not just what it decodes to:
-// `canonicalPathSegments` truncates at the first NUL, so on its own a NUL
-// placed after the RPC name would hide a real trailing segment (an origin
-// that does not truncate there keeps routing past it) and it normalizes away
-// a trailing `/`, `;param`, `.`, or decoded whitespace, so a decorated
-// spelling would canonicalize to the same name as the exact RPC. So the
-// exemption only fires when every one of these holds: the path decodes to
-// convergence with no NUL anywhere in the result; its canonical last segment
-// (via segmentsFromDecodedPath, the same normalization isGitPushPath uses
-// through canonicalPathSegments — reused directly here on the
-// already-decoded string so the path is not decoded to convergence twice) is
-// "git-upload-pack"; and — the check with no decoding or normalization at
-// all — the raw, merely lower-cased pathName itself ends with the literal
-// suffix "/git-upload-pack". A real git client's upload-pack request already
-// is that exact literal path, so this costs it nothing; it only refuses
-// every encoded, decorated, or NUL-hiding variant that could make the proxy
-// and an origin disagree. Malformed or non-converging encoding, or any check
-// that does not hold, fails closed by NOT matching (the request then falls
-// through to the conservative write classification).
-function isGitUploadPackRead(method: string, pathName: string): boolean {
-  if (method !== "POST") return false;
-  const decoded = decodeToConvergence(pathName);
-  if (decoded === undefined || decoded.includes("\0")) return false;
-  if (segmentsFromDecodedPath(decoded).at(-1) !== "git-upload-pack") return false;
-  return pathName.toLowerCase().endsWith("/git-upload-pack");
-}
-
 // --- git smart HTTP / Git LFS request recognition (`protocol: "git-http"`) ---
 //
 // Decides whether a request is one of the git smart-HTTP or Git LFS requests
@@ -527,13 +493,21 @@ function isGitUploadPackRead(method: string, pathName: string): boolean {
 //
 // Methods are compared exactly (uppercase); HEAD, OPTIONS, and every other
 // method are not eligible on any row (a git client never sends them, and the
-// §4.2 table does not list them). It uses the raw/decoded agreement rule of
-// isGitUploadPackRead: the path decodes to convergence with no NUL, carries
+// §4.2 table does not list them). It requires raw/decoded agreement: the
+// path decodes to convergence with no NUL (a NUL would let
+// segmentsFromDecodedPath hide a trailing segment an origin keeps routing
+// past), carries
 // no path confusion (encoded or literal separators, `..`), its canonical
 // segments end with the endpoint, AND the raw lower-cased path's own trailing
 // segments are literally the endpoint — so an encoded, `;param`-decorated,
 // trailing-`/`, trailing-`.` or NUL-hidden spelling is not a git request and
-// gets no credential. The `info/refs` form needs exactly one query parameter
+// gets no credential. A path whose first canonical segment is `api`, or with
+// a `-` canonical segment, is never a git request: GitLab serves its REST API
+// under `/api/` and non-git routes after `/-/`, where a last segment can be a
+// user-chosen name (`/api/v4/projects/<id>/repository/files/git-upload-pack`
+// is the file API). That also excludes a github.com owner named `api`, on
+// purpose: fail closed rather than guess per provider. isGitPushPath does not
+// use this matcher, so those paths still count as pushes. The `info/refs` form needs exactly one query parameter
 // whose (decoded, case-folded) name is `service`, spelled literally
 // `service=<value>` in the raw query. Every POST form needs an empty query:
 // git's remote-curl posts to `<remote>/git-upload-pack|git-receive-pack`
@@ -602,6 +576,9 @@ export function gitHttpRequestKind(method: string, url: URL): GitHttpRequestKind
   const decoded = decodeToConvergence(pathName);
   if (decoded === undefined || decoded.includes("\0")) return undefined;
   const canonical = segmentsFromDecodedPath(decoded);
+  // No endpoint suffix contains `api` first or a `-` segment, so this is
+  // the same as checking the segments before the suffix.
+  if (canonical[0] === "api" || canonical.includes("-")) return undefined;
   const rawSegments = pathName.split("/");
   for (const endpoint of GIT_HTTP_ENDPOINTS) {
     if (endpoint.method !== method) continue;
@@ -692,7 +669,13 @@ export function classifyWrite(input: {
       && rule.readPathPrefixes.some((prefix) => pathMatchesPrefix(pathName, prefix))) {
       return { write: false };
     }
-    if (rule?.gitPush !== undefined && isGitUploadPackRead(input.method, pathName)) {
+    // git fetch negotiation (upload-pack) on a host that declares git
+    // handling. It uses the shared matcher, so only the exact POST RPC path a
+    // git client sends is a read: no encoded, decorated, NUL-hiding, or
+    // query-carrying spelling, and no `api` or `-` route (see
+    // gitHttpRequestKind). Push detection stays the separate, looser
+    // isGitPushPath, which runs first.
+    if (rule?.gitPush !== undefined && gitHttpRequestKind(input.method, input.url) === "upload-pack") {
       return { write: false };
     }
     // A Git LFS batch request proven by its body to be a download. Same host

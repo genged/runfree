@@ -840,6 +840,34 @@ describe("proxy policy", () => {
       }
     });
 
+    // F6: GitLab serves its REST API under `/api/...` and non-git routes
+    // behind a `-` segment, where a last segment may be any user-chosen name
+    // (`…/repository/files/git-upload-pack` is a file read/write API). Neither
+    // is a git request. A github.com owner named `api` is intentionally
+    // excluded with them: fail closed over guessing per provider.
+    test("F6: an `api` first segment or a `-` route segment is not a git request", () => {
+      for (const [method, url] of [
+        ["POST", "https://github.com/api/v4/projects/123/repository/files/git-upload-pack"],
+        ["POST", "https://github.com/API/v4/projects/123/repository/files/git-upload-pack"],
+        ["POST", "https://github.com/%61pi/v4/projects/123/repository/files/git-upload-pack"],
+        ["POST", "https://github.com/api/v4/projects/123/repository/files/git-receive-pack"],
+        ["POST", "https://github.com/api/repo.git/info/lfs/objects/batch"],
+        ["GET", "https://github.com/api/repo.git/info/refs?service=git-upload-pack"],
+        ["POST", "https://github.com/group/project/-/git-upload-pack"],
+        ["POST", "https://github.com/group/project/-/info/lfs/objects/batch"],
+        ["GET", "https://github.com/group/-/project/info/lfs/locks"],
+        ["POST", "https://github.com/group/project/-./git-upload-pack"],
+      ] as const) {
+        expect(gitHttpRequestKind(method, new URL(url)), `${method} ${url}`).toBeUndefined();
+        const { result, tokenReader } = githubRequest(method, url);
+        expect(result, `${method} ${url}`).toEqual({ headers: { accept: "*/*" } });
+        expect(tokenReader, `${method} ${url}`).not.toHaveBeenCalled();
+      }
+      // `api` only as the first segment; a `-` only as a whole segment.
+      expect(gitHttpRequestKind("POST", new URL("https://github.com/owner/api/git-upload-pack"))).toBe("upload-pack");
+      expect(gitHttpRequestKind("POST", new URL("https://github.com/my-org/re-po/git-upload-pack"))).toBe("upload-pack");
+    });
+
     test("T4: gist.github.com carries no github.com mapping, so a git request there passes untouched", () => {
       const { result, tokenReader } = githubRequest("GET", "https://gist.github.com/owner/abc.git/info/refs?service=git-upload-pack");
       expect(result).toEqual({});
@@ -904,13 +932,24 @@ describe("proxy policy", () => {
       expect(tokenReader).not.toHaveBeenCalled();
     });
 
-    test("T5: a gitlab git request on an /api/ path is still git: the protocol tier outranks the /api/ prefix", () => {
-      const result = testBeforeAllowedRequest({
-        method: "POST",
-        url: "https://gitlab.com/api/repo.git/git-upload-pack",
-        headers: {},
-      }, { allowedHosts: ["gitlab.com"], credentials: GITLAB, writeApproval: "allow", tokenReader: () => "t", log: () => {} });
-      expect(result).toEqual({ headers: { authorization: `Basic ${Buffer.from("oauth2:t").toString("base64")}` } });
+    // F6 (supersedes the earlier "an /api/ git path is still git" case): a
+    // path under `/api/` is never a git request (GitLab reserves the `api`
+    // namespace for its REST API, where `…/files/git-upload-pack` is a file
+    // endpoint), so the git-http mapping is not eligible and the `/api/`
+    // Bearer applies as for any API path. Protocol-tier precedence over a
+    // pathPrefix is covered by T12.
+    test("T5: a git-shaped /api/ path is an API request: it gets the /api/ Bearer, never the git-http Basic", () => {
+      for (const url of [
+        "https://gitlab.com/api/repo.git/git-upload-pack",
+        "https://gitlab.com/api/v4/projects/123/repository/files/git-upload-pack",
+      ]) {
+        const result = testBeforeAllowedRequest({
+          method: "POST",
+          url,
+          headers: {},
+        }, { allowedHosts: ["gitlab.com"], credentials: GITLAB, writeApproval: "allow", tokenReader: () => "t", log: () => {} });
+        expect(result, url).toEqual({ headers: { authorization: "Bearer t" } });
+      }
     });
 
     test("T12: an unscoped Bearer and a git-http Basic on one header give Basic on git requests and Bearer elsewhere", () => {
@@ -1600,6 +1639,40 @@ describe("write classification (operation-aware read-only / approve-on-write)", 
       url: "https://git.example.com/org/repo.git/info/refs?service=git-upload-pack",
       headers: {},
     }, options)).not.toThrow();
+  });
+
+  // F6: the upload-pack and LFS read exemptions use the shared git matcher,
+  // so a GitLab API or `-` route ending in an endpoint name is not a read,
+  // while push detection keeps matching any receive-pack last segment.
+  test("API and `-` routes ending in a git endpoint name get no read exemption and still count as pushes", () => {
+    const decide = (method: string, path: string, gitPush: "write" | "deny", extra: Partial<PolicyOptions> = {}) => {
+      try {
+        testBeforeAllowedRequest({ method, url: `https://gitlab.com${path}`, headers: {} }, {
+          ...requestOptions({
+            allowedHosts: ["gitlab.com"],
+            credentials: {},
+            requests: { "gitlab.com": { gitPush, writeAction: "deny" } },
+            tokenReader: () => null,
+          }),
+          ...extra,
+        });
+        return "read";
+      } catch (error) {
+        if (error instanceof ProxyPolicyDenialError) return error.shape?.writeCategory ?? error.shape?.reason;
+        throw error;
+      }
+    };
+    expect(decide("POST", "/api/v4/projects/123/repository/files/git-upload-pack", "write")).toBe("method");
+    expect(decide("POST", "/API/v4/projects/123/repository/files/git-upload-pack", "write")).toBe("method");
+    expect(decide("POST", "/group/project/-/git-upload-pack", "write")).toBe("method");
+    expect(decide("POST", "/api/v4/x/info/lfs/objects/batch", "write", { lfsBodyClass: "download" })).toBe("method");
+    expect(decide("POST", "/group/project/-/info/lfs/objects/batch", "write", { lfsBodyClass: "download" })).toBe("method");
+    // Push detection is unchanged: any receive-pack last segment is a push.
+    expect(decide("POST", "/api/v4/projects/123/repository/files/git-receive-pack", "write")).toBe("git-push");
+    expect(decide("POST", "/group/project/-/git-receive-pack", "deny")).toBe("git-push-denied");
+    // The real repository paths are still reads.
+    expect(decide("POST", "/group/project.git/git-upload-pack", "write")).toBe("read");
+    expect(decide("POST", "/group/project.git/info/lfs/objects/batch", "write", { lfsBodyClass: "download" })).toBe("read");
   });
 
   test("an LFS batch POST is a read only with a proven download body, on the exact batch endpoint of a git-declared host", () => {
