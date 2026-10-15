@@ -524,7 +524,8 @@ runfree host-service add astro --port 8089
 warns when no host service backs the port. A loopback entry cannot carry
 headers, helpers, or OAuth settings, and its tool calls do not pass the proxy,
 so write approval and `runfree mcp rules` do not apply. Plain HTTP to any other
-host is refused, and an HTTPS URL must name a hostname, not an IP address.
+host is refused. An HTTPS server URL, OAuth metadata URL, or OAuth token
+endpoint must name a hostname, not an IP address.
 `runfree mcp list` shows a refused entry as `unsupported`, target `excluded`.
 
 OAuth login works in any session. When an approved MCP server can use OAuth,
