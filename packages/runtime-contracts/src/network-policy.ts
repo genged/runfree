@@ -8,7 +8,17 @@ const INLINE_POLICY_LABEL = "<inline policy>";
 export const TOKEN_NAME_PATTERN = /^[a-z][a-z0-9_-]{0,63}$/;
 const HEADER_NAME_RE = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
 const HOST_LABEL_RE = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
-export const CREDENTIAL_SCHEMES = ["bearer", "raw"] as const;
+export const CREDENTIAL_SCHEMES = ["bearer", "raw", "basic"] as const;
+// Wire protocols a credential destination may be scoped to. Each value is one
+// matcher in proxy code; the policy names the class, the code defines it.
+export const CREDENTIAL_PROTOCOLS = ["git-http"] as const;
+// RFC 7617 user-id for `basic`: policy data, not secret. Visible ASCII only
+// (0x21-0x7E, so no space or control byte) and no colon, 1-64 bytes.
+const CREDENTIAL_USERNAME_RE = /^[\x21-\x39\x3B-\x7E]{1,64}$/;
+const CREDENTIAL_KEYS = ["host", "header", "scheme", "username", "pathPrefix", "protocol"] as const;
+const TOKEN_KEYS = ["description", "allowAnonymous", "credentials"] as const;
+// `domains` stays known: legacy migration input still reaches this validator.
+const POLICY_KEYS = ["hosts", "domains", "tokens", "requests", "writeApproval", "hostServices"] as const;
 export const HTTP_METHODS = ["GET", "HEAD", "OPTIONS", "POST", "PUT", "PATCH", "DELETE"] as const;
 export const READ_ONLY_METHODS = ["GET", "HEAD", "OPTIONS"] as const;
 // Tri-state action applied to the write operation class of requests to a host:
@@ -31,6 +41,7 @@ const LEGACY_DEFAULT_GITHUB_CREDENTIALS = [
 ] as const;
 
 export type CredentialScheme = typeof CREDENTIAL_SCHEMES[number];
+export type CredentialProtocol = typeof CREDENTIAL_PROTOCOLS[number];
 export type HttpMethod = typeof HTTP_METHODS[number];
 export type WriteAction = typeof WRITE_ACTIONS[number];
 
@@ -90,7 +101,10 @@ export type CredentialPolicyJson = {
   host: string;
   header: string;
   scheme: CredentialScheme;
+  // Present iff scheme is "basic".
+  username?: string;
   pathPrefix?: string;
+  protocol?: CredentialProtocol;
 };
 
 export type CredentialMapping = CredentialPolicyJson & {
@@ -139,6 +153,57 @@ export function isCredentialScheme(value: string): value is CredentialScheme {
 
 export function credentialSchemeList(): string {
   return CREDENTIAL_SCHEMES.join(", ");
+}
+
+export function isCredentialProtocol(value: string): value is CredentialProtocol {
+  return (CREDENTIAL_PROTOCOLS as readonly string[]).includes(value);
+}
+
+export function credentialProtocolList(): string {
+  return CREDENTIAL_PROTOCOLS.join(", ");
+}
+
+/** Problem with a `basic` username, or undefined when it is valid (D-7). */
+export function credentialUsernameProblem(value: unknown): string | undefined {
+  if (typeof value !== "string") return "must be a string";
+  if (value.length === 0) return "must be non-empty";
+  if (value.length > 64) return "must be at most 64 bytes";
+  if (value.includes(":")) return "must not contain ':'";
+  if (!CREDENTIAL_USERNAME_RE.test(value)) return "must contain only printable ASCII without spaces or control characters";
+  return undefined;
+}
+
+/**
+ * The credential in canonical key order. Optional fields are present only
+ * when set, so a credential without them keeps its pre-feature shape (and the
+ * effective policy generation that hashes it).
+ */
+export function canonicalCredential(credential: CredentialPolicyJson): CredentialPolicyJson {
+  return {
+    host: credential.host,
+    header: credential.header,
+    scheme: credential.scheme,
+    ...(credential.username !== undefined ? { username: credential.username } : {}),
+    ...(credential.pathPrefix !== undefined ? { pathPrefix: credential.pathPrefix } : {}),
+    ...(credential.protocol !== undefined ? { protocol: credential.protocol } : {}),
+  };
+}
+
+/**
+ * Identity of a credential destination for duplicate detection and stable
+ * sorting: every field that changes what is sent where. Header case is folded
+ * (HTTP field names are case-insensitive). username and protocol join only
+ * when present, so keys of credentials without them are unchanged.
+ */
+export function credentialIdentityKey(credential: CredentialPolicyJson): string {
+  return [
+    credential.host,
+    credential.header.toLowerCase(),
+    credential.scheme,
+    credential.pathPrefix ?? "",
+    ...(credential.username !== undefined ? [`username=${credential.username}`] : []),
+    ...(credential.protocol !== undefined ? [`protocol=${credential.protocol}`] : []),
+  ].join("\0");
 }
 
 export function isHttpMethod(value: string): value is HttpMethod {
@@ -265,11 +330,15 @@ function validateStoredHost(value: string, issues: string[]): string | undefined
 }
 
 function credentialKey(credential: CredentialPolicyJson): string {
+  // New fields join only when present, so the sort order (and so the
+  // generation) of a policy without them is unchanged.
   return [
     credential.host,
     credential.header,
     credential.scheme,
     credential.pathPrefix ?? "",
+    ...(credential.username !== undefined ? [`username=${credential.username}`] : []),
+    ...(credential.protocol !== undefined ? [`protocol=${credential.protocol}`] : []),
   ].join("\0");
 }
 
@@ -306,12 +375,7 @@ function policyGeneration(
         description: token.description,
         ...(token.allowAnonymous !== undefined ? { allowAnonymous: token.allowAnonymous } : {}),
         credentials: token.credentials
-          .map((credential) => ({
-            host: credential.host,
-            header: credential.header,
-            scheme: credential.scheme,
-            ...(credential.pathPrefix !== undefined ? { pathPrefix: credential.pathPrefix } : {}),
-          }))
+          .map(canonicalCredential)
           .sort((left, right) => compareStableText(credentialKey(left), credentialKey(right))),
       },
     ]));
@@ -345,6 +409,24 @@ function policyGeneration(
     ...(Object.keys(normalizedHostServices).length > 0 ? { hostServices: normalizedHostServices } : {}),
   };
   return sha256Digest(JSON.stringify(payload));
+}
+
+// Pushes one issue per key outside `known`; true when any was found.
+function unknownKeys(
+  value: Record<string, unknown>,
+  known: readonly string[],
+  prefix: string,
+  kind: string,
+  issues: string[],
+): boolean {
+  let found = false;
+  for (const key of Object.keys(value)) {
+    if (!known.includes(key)) {
+      issues.push(`${prefix}${key} is not a known ${kind} (known: ${known.join(", ")})`);
+      found = true;
+    }
+  }
+  return found;
 }
 
 function validatedPathPrefixList(fieldLabel: string, rawValue: unknown, issues: string[]): string[] | undefined {
@@ -419,6 +501,9 @@ export function validateNetworkPolicy(raw: unknown, policyPath = INLINE_POLICY_L
   if (!isRecord(raw)) {
     throw new PolicyValidationError(["policy must be a JSON object"]);
   }
+  // Strict (spec O-4 rule 1): an older reader that ignored an unknown field
+  // would enforce less than the writer meant.
+  unknownKeys(raw, POLICY_KEYS, "", "policy field", issues);
 
   const rawHosts = raw.hosts;
   const rawDomains = raw.domains;
@@ -516,7 +601,8 @@ export function validateNetworkPolicy(raw: unknown, policyPath = INLINE_POLICY_L
   const tokens: Record<string, TokenPolicyJson> = {};
   const credentials: CredentialPolicy = {};
   const credentialMappings: CredentialMapping[] = [];
-  const credentialOwners = new Map<string, string>();
+  const credentialOwners = new Map<string, Map<string, string>>();
+  const protocolOwners = new Map<string, string>();
 
   if (rawTokens !== undefined && !isRecord(rawTokens)) {
     issues.push("tokens must be an object when present");
@@ -529,6 +615,7 @@ export function validateNetworkPolicy(raw: unknown, policyPath = INLINE_POLICY_L
         issues.push(`${tokenName}: token policy must be an object`);
         continue;
       }
+      unknownKeys(tokenValue, TOKEN_KEYS, `${tokenName}.`, "token field", issues);
 
       const description = tokenValue.description;
       if (typeof description !== "string" || description.trim() === "") {
@@ -554,6 +641,7 @@ export function validateNetworkPolicy(raw: unknown, policyPath = INLINE_POLICY_L
           continue;
         }
 
+        if (unknownKeys(credential, CREDENTIAL_KEYS, `${prefix}.`, "credential field", issues)) continue;
         const host = credential.host;
         const header = credential.header;
         const scheme = credential.scheme;
@@ -605,18 +693,59 @@ export function validateNetworkPolicy(raw: unknown, policyPath = INLINE_POLICY_L
           }
         }
 
+        const rawUsername = credential.username;
+        if (scheme === "basic") {
+          const problem = credentialUsernameProblem(rawUsername);
+          if (problem !== undefined) {
+            issues.push(`${prefix}.username ${rawUsername === undefined ? "is required with scheme basic" : problem}`);
+            continue;
+          }
+        } else if (rawUsername !== undefined) {
+          issues.push(`${prefix}.username is valid only with scheme basic`);
+          continue;
+        }
+        const rawProtocol = credential.protocol;
+        let protocol: CredentialProtocol | undefined;
+        if (rawProtocol !== undefined) {
+          if (typeof rawProtocol !== "string" || !isCredentialProtocol(rawProtocol)) {
+            issues.push(`${prefix}.protocol must be one of: ${credentialProtocolList()}`);
+            continue;
+          }
+          protocol = rawProtocol;
+        }
+
+        // Within one (host, header) the proxy selects by protocol tier, then
+        // longest pathPrefix. Each (protocol, pathPrefix) pair must therefore
+        // be unique, and at most one mapping may be protocol-scoped, so no
+        // request can see two equally ranked mappings for one header.
         const ownerKey = `${host.toLowerCase()}\0${header.toLowerCase()}`;
-        const existingOwner = credentialOwners.get(ownerKey);
+        const owner = `${tokenName}.${host}.${header}`;
+        const scopeKey = `${protocol ?? ""}\0${pathPrefix ?? ""}`;
+        const owners = credentialOwners.get(ownerKey) ?? new Map<string, string>();
+        const existingOwner = owners.get(scopeKey);
         if (existingOwner) {
           issues.push(`${prefix} conflicts with ${existingOwner} for (${host}, ${header})`);
           continue;
         }
-        credentialOwners.set(ownerKey, `${tokenName}.${host}.${header}`);
+        if (protocol !== undefined) {
+          const protocolOwner = protocolOwners.get(ownerKey);
+          if (protocolOwner) {
+            issues.push(`${prefix} is a second protocol-scoped mapping for (${host}, ${header}); ${protocolOwner} already has one`);
+            continue;
+          }
+          protocolOwners.set(ownerKey, owner);
+        }
+        owners.set(scopeKey, owner);
+        credentialOwners.set(ownerKey, owners);
 
-        const normalized: CredentialPolicyJson = pathPrefix === undefined
-          ? { host, header, scheme: scheme as CredentialScheme }
-          : { host, header, scheme: scheme as CredentialScheme, pathPrefix };
-        normalizedCredentials.push(normalized);
+        normalizedCredentials.push(canonicalCredential({
+          host,
+          header,
+          scheme,
+          ...(typeof rawUsername === "string" ? { username: rawUsername } : {}),
+          ...(pathPrefix !== undefined ? { pathPrefix } : {}),
+          ...(protocol !== undefined ? { protocol } : {}),
+        }));
       }
 
       const allowAnonymous = typeof allowAnonymousRaw === "boolean"

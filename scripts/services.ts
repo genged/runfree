@@ -23,6 +23,7 @@
 
 import { isReservedRunfreeHostname } from "@runfree/runtime-contracts/host-services";
 import {
+  credentialIdentityKey,
   normalizeHostname,
   normalizePathPrefix,
   validateNetworkPolicy,
@@ -1021,7 +1022,7 @@ export function serviceNames(): string[] {
 }
 
 function credentialIdentityForValidation(credential: CredentialPolicyJson): string {
-  return `${credential.host}\0${credential.header.toLowerCase()}\0${credential.scheme}\0${credential.pathPrefix ?? ""}`;
+  return credentialIdentityKey(credential);
 }
 
 function exactJsonEqual(left: unknown, right: unknown): boolean {

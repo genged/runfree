@@ -233,16 +233,38 @@ export function configuredCredentialHeaderNames(credentials: CredentialPolicy): 
   return names;
 }
 
+// Exhaustive on purpose: a scheme added to the contract must fail to compile
+// here rather than fall through to sending the raw token.
 function formatCredentialValue(mapping: CredentialMapping, token: string): string {
-  if (mapping.scheme === "bearer") return `Bearer ${token}`;
-  return token;
+  switch (mapping.scheme) {
+    case "bearer":
+      return `Bearer ${token}`;
+    case "raw":
+      return token;
+    case "basic": {
+      // Validation guarantees username for basic; refuse rather than send a
+      // header with an empty user-id if that invariant is ever broken.
+      if (mapping.username === undefined) throw new Error(`basic credential ${mapping.tokenName} has no username`);
+      return `Basic ${Buffer.from(`${mapping.username}:${token}`, "utf8").toString("base64")}`;
+    }
+    default: {
+      const unreachable: never = mapping.scheme;
+      throw new Error(`unsupported credential scheme: ${String(unreachable)}`);
+    }
+  }
 }
 
 function requestPath(url: URL): string {
   return url.pathname || "/";
 }
 
-function selectedCredentialMappings(mappings: CredentialMapping[], pathName: string): CredentialMapping[] {
+function selectedCredentialMappings(allMappings: CredentialMapping[], pathName: string): CredentialMapping[] {
+  // TEMPORARY STUB until the git-http matcher lands: a protocol-scoped mapping
+  // is never eligible, so its token is never attached. Its header is still
+  // stripped (the strip set is built from every mapping of the host). The
+  // matcher replaces this filter with protocol eligibility and the
+  // protocol-tier ranking.
+  const mappings = allMappings.filter((mapping) => mapping.protocol === undefined);
   const scopedMatches = mappings.filter((mapping) => {
     return mapping.pathPrefix !== undefined && pathMatchesPrefix(pathName, mapping.pathPrefix);
   });

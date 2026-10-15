@@ -139,6 +139,34 @@ describe("compareCompiledAuthority", () => {
     ]));
   });
 
+  test("a protocol scope narrows a mapping; removing or changing it, or the username, widens", () => {
+    const withCredential = (credential: Record<string, string>) => compiled({
+      hosts: ["gitlab.com"],
+      tokens: {
+        gitlab: {
+          description: "GitLab token",
+          credentials: [{ host: "gitlab.com", header: "Authorization", ...credential } as never],
+        },
+      },
+    });
+    const unscopedBasic = withCredential({ scheme: "basic", username: "oauth2" });
+    const scopedBasic = withCredential({ scheme: "basic", username: "oauth2", protocol: "git-http" });
+    const scopedPrefixedBasic = withCredential({ scheme: "basic", username: "oauth2", pathPrefix: "/group/", protocol: "git-http" });
+    const otherUser = withCredential({ scheme: "basic", username: "x-access-token", protocol: "git-http" });
+    const scopedBearer = withCredential({ scheme: "bearer", protocol: "git-http" });
+
+    expect(compareCompiledAuthority(unscopedBasic, scopedBasic)).toEqual({ provenReduction: true, reasons: [] });
+    expect(compareCompiledAuthority(scopedBasic, scopedBasic)).toEqual({ provenReduction: true, reasons: [] });
+    expect(compareCompiledAuthority(scopedBasic, scopedPrefixedBasic)).toEqual({ provenReduction: true, reasons: [] });
+    expect(compareCompiledAuthority(unscopedBasic, scopedPrefixedBasic)).toEqual({ provenReduction: true, reasons: [] });
+
+    const widening = ["gitlab.com: credential mapping added or widened for gitlab"];
+    expect(compareCompiledAuthority(scopedBasic, unscopedBasic)).toEqual({ provenReduction: false, reasons: widening });
+    expect(compareCompiledAuthority(scopedPrefixedBasic, scopedBasic)).toEqual({ provenReduction: false, reasons: widening });
+    expect(compareCompiledAuthority(scopedBasic, otherUser)).toEqual({ provenReduction: false, reasons: widening });
+    expect(compareCompiledAuthority(scopedBasic, scopedBearer)).toEqual({ provenReduction: false, reasons: widening });
+  });
+
   test("treats Git and GraphQL changes as incomparable unless Git becomes deny", () => {
     const base = compiled({ hosts: ["git.example.com"], requests: { "git.example.com": { gitPush: "write" } } });
     expect(compareCompiledAuthority(base, compiled({ hosts: ["git.example.com"], requests: { "git.example.com": { gitPush: "deny" } } })).provenReduction)

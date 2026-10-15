@@ -1,6 +1,7 @@
 import { describe, expect, test } from "vitest";
 
 import {
+  CREDENTIAL_PROTOCOLS,
   CREDENTIAL_SCHEMES,
   DEFAULT_WRITE_ACTION,
   HTTP_METHODS,
@@ -8,11 +9,13 @@ import {
   READ_ONLY_METHODS,
   TOKEN_NAME_PATTERN,
   assertTokenName,
+  credentialProtocolList,
   credentialSchemeList,
   describeRequestRule,
   effectiveWriteAction,
   hostRulesCommand,
   httpMethodList,
+  isCredentialProtocol,
   isCredentialScheme,
   isHttpMethod,
   isTokenName,
@@ -44,11 +47,16 @@ describe("network policy token and credential-scheme validation", () => {
   });
 
   test("exports credential-scheme helpers used by CLI and proxy consumers", () => {
-    expect(CREDENTIAL_SCHEMES).toEqual(["bearer", "raw"]);
-    expect(credentialSchemeList()).toBe("bearer, raw");
+    expect(CREDENTIAL_SCHEMES).toEqual(["bearer", "raw", "basic"]);
+    expect(credentialSchemeList()).toBe("bearer, raw, basic");
     expect(isCredentialScheme("bearer")).toBe(true);
     expect(isCredentialScheme("raw")).toBe(true);
-    expect(isCredentialScheme("basic")).toBe(false);
+    expect(isCredentialScheme("basic")).toBe(true);
+    expect(isCredentialScheme("digest")).toBe(false);
+    expect(CREDENTIAL_PROTOCOLS).toEqual(["git-http"]);
+    expect(credentialProtocolList()).toBe("git-http");
+    expect(isCredentialProtocol("git-http")).toBe(true);
+    expect(isCredentialProtocol("GIT-HTTP")).toBe(false);
   });
 
   test("exports HTTP method helpers mirroring the credential-scheme idiom", () => {
@@ -70,7 +78,7 @@ describe("network policy token and credential-scheme validation", () => {
         "../bad": {
           description: "Bad token",
           credentials: [
-            { host: "api.example.com", header: "Authorization", scheme: "basic" },
+            { host: "api.example.com", header: "Authorization", scheme: "digest" },
           ],
         },
       },
@@ -81,11 +89,11 @@ describe("network policy token and credential-scheme validation", () => {
         good: {
           description: "Good token",
           credentials: [
-            { host: "api.example.com", header: "Authorization", scheme: "basic" },
+            { host: "api.example.com", header: "Authorization", scheme: "digest" },
           ],
         },
       },
-    })).toThrow(/scheme must be one of: bearer, raw/);
+    })).toThrow(/scheme must be one of: bearer, raw, basic/);
   });
 });
 
@@ -424,5 +432,122 @@ describe("hostServices", () => {
       tokens: { t: { description: "d", credentials: [{ host: "x.runfree.internal", header: "Authorization", scheme: "bearer" }] } },
     }).join("\n")).toContain("reserved");
     expect(validationIssues({ hosts: ["api.example.com"], tokens: {}, requests: { "x.runfree.internal": { methods: ["GET"] } } }).join("\n")).toContain("reserved");
+  });
+});
+
+function credentialPolicy(credentials: unknown[], hosts = ["gitlab.com"]): unknown {
+  return { hosts, tokens: { gitlab: { description: "GitLab token", credentials } } };
+}
+
+const GITLAB_API_BEARER = { host: "gitlab.com", header: "Authorization", scheme: "bearer", pathPrefix: "/api/" };
+const GITLAB_GIT_BASIC = { host: "gitlab.com", header: "Authorization", scheme: "basic", username: "oauth2", protocol: "git-http" };
+
+describe("basic scheme, username and protocol (T2, T12 validation half)", () => {
+  test("a basic git-http mapping validates and keeps its fields in canonical key order", () => {
+    const loaded = validateNetworkPolicy(credentialPolicy([
+      { protocol: "git-http", username: "oauth2", scheme: "basic", header: "Authorization", host: "gitlab.com" },
+    ]));
+    const [credential] = loaded.raw.tokens?.gitlab.credentials ?? [];
+    expect(Object.keys(credential)).toEqual(["host", "header", "scheme", "username", "protocol"]);
+    expect(loaded.credentialMappings[0]).toMatchObject({ scheme: "basic", username: "oauth2", protocol: "git-http" });
+  });
+
+  test.each([
+    ["basic without username", { host: "gitlab.com", header: "Authorization", scheme: "basic" }, "username is required with scheme basic"],
+    ["username with bearer", { host: "gitlab.com", header: "Authorization", scheme: "bearer", username: "oauth2" }, "username is valid only with scheme basic"],
+    ["username with raw", { host: "gitlab.com", header: "Authorization", scheme: "raw", username: "oauth2" }, "username is valid only with scheme basic"],
+    ["username with a colon", { ...GITLAB_GIT_BASIC, username: "a:b" }, "must not contain ':'"],
+    ["username with a control character", { ...GITLAB_GIT_BASIC, username: "a\u0001b" }, "printable ASCII"],
+    ["username with CR/LF", { ...GITLAB_GIT_BASIC, username: "a\r\nX-Injected: 1" }, "username"],
+    ["username with DEL", { ...GITLAB_GIT_BASIC, username: "a\u007f" }, "printable ASCII"],
+    ["username with a space", { ...GITLAB_GIT_BASIC, username: "a b" }, "printable ASCII"],
+    ["non-ASCII username", { ...GITLAB_GIT_BASIC, username: "é" }, "printable ASCII"],
+    ["empty username", { ...GITLAB_GIT_BASIC, username: "" }, "must be non-empty"],
+    ["65-byte username", { ...GITLAB_GIT_BASIC, username: "u".repeat(65) }, "at most 64 bytes"],
+    ["non-string username", { ...GITLAB_GIT_BASIC, username: 7 }, "must be a string"],
+    ["unknown protocol", { ...GITLAB_GIT_BASIC, protocol: "hg-http" }, "protocol must be one of: git-http"],
+    ["non-string protocol", { ...GITLAB_GIT_BASIC, protocol: ["git-http"] }, "protocol must be one of: git-http"],
+    ["unknown credential key", { ...GITLAB_API_BEARER, route: "git" }, "route is not a known credential field"],
+  ])("refuses %s", (_name, credential, message) => {
+    const issues = validationIssues(credentialPolicy([credential]));
+    expect(issues.join("\n")).toContain(message);
+  });
+
+  test("accepts the username boundaries: 1 and 64 visible ASCII bytes", () => {
+    for (const username of ["u", "u".repeat(64), "!~x-access-token"]) {
+      expect(validationIssues(credentialPolicy([{ ...GITLAB_GIT_BASIC, username }])), username).toEqual([]);
+    }
+  });
+
+  test("an /api/ Bearer and a git-http Basic mapping share one host and header", () => {
+    const loaded = validateNetworkPolicy(credentialPolicy([GITLAB_API_BEARER, GITLAB_GIT_BASIC]));
+    expect(loaded.credentials["gitlab.com"]).toHaveLength(2);
+  });
+
+  test("refuses two protocol-scoped mappings for one host and header, across tokens and header case", () => {
+    expect(validationIssues(credentialPolicy([
+      GITLAB_GIT_BASIC,
+      { ...GITLAB_GIT_BASIC, pathPrefix: "/group/" },
+    ])).join("\n")).toContain("second protocol-scoped mapping for (gitlab.com, Authorization)");
+    expect(validationIssues({
+      hosts: ["gitlab.com"],
+      tokens: {
+        first: { description: "first", credentials: [GITLAB_GIT_BASIC] },
+        second: {
+          description: "second",
+          credentials: [{ host: "gitlab.com", header: "authorization", scheme: "bearer", pathPrefix: "/x/", protocol: "git-http" }],
+        },
+      },
+    }).join("\n")).toContain("second protocol-scoped mapping");
+  });
+
+  test("refuses mappings that tie on (protocol, pathPrefix) for one host and header", () => {
+    // Two unscoped mappings, two equal prefixes, and two equal protocol scopes
+    // would leave the proxy two equally ranked candidates for one request.
+    expect(validationIssues(credentialPolicy([
+      { host: "gitlab.com", header: "Authorization", scheme: "bearer" },
+      { host: "gitlab.com", header: "authorization", scheme: "raw" },
+    ])).join("\n")).toContain("conflicts with gitlab.gitlab.com.Authorization");
+    expect(validationIssues({
+      hosts: ["gitlab.com"],
+      tokens: {
+        first: { description: "first", credentials: [GITLAB_API_BEARER] },
+        second: { description: "second", credentials: [GITLAB_API_BEARER] },
+      },
+    }).join("\n")).toContain("conflicts with first.gitlab.com.Authorization");
+  });
+
+  test("distinct path prefixes and different headers on one host stay valid", () => {
+    expect(validationIssues(credentialPolicy([
+      GITLAB_API_BEARER,
+      { host: "gitlab.com", header: "Authorization", scheme: "bearer", pathPrefix: "/api/v4/" },
+      { host: "gitlab.com", header: "Authorization", scheme: "bearer" },
+      { host: "gitlab.com", header: "PRIVATE-TOKEN", scheme: "raw", protocol: "git-http" },
+      GITLAB_GIT_BASIC,
+    ]))).toEqual([]);
+  });
+
+  test("the generation hashes username and protocol, and is unchanged without them", () => {
+    const bearer = { host: "gitlab.com", header: "Authorization", scheme: "bearer" };
+    const plain = validateNetworkPolicy(credentialPolicy([bearer])).generation;
+    const scoped = validateNetworkPolicy(credentialPolicy([{ ...bearer, protocol: "git-http" }])).generation;
+    const basicA = validateNetworkPolicy(credentialPolicy([{ ...GITLAB_GIT_BASIC, username: "a" }])).generation;
+    const basicB = validateNetworkPolicy(credentialPolicy([{ ...GITLAB_GIT_BASIC, username: "b" }])).generation;
+    expect(new Set([plain, scoped, basicA, basicB]).size).toBe(4);
+    // Key order in the input does not change the generation.
+    expect(validateNetworkPolicy(credentialPolicy([{ scheme: "bearer", header: "Authorization", host: "gitlab.com" }])).generation)
+      .toBe(plain);
+  });
+});
+
+describe("strict effective policy objects (T14 seed)", () => {
+  test("refuses an unknown top-level field and an unknown token field", () => {
+    expect(validationIssues({ hosts: [], version: 2 }).join("\n")).toContain("version is not a known policy field");
+    expect(validationIssues({ hosts: ["gitlab.com"], tokens: { gitlab: { description: "d", credentials: [], scope: "x" } } }).join("\n"))
+      .toContain("gitlab.scope is not a known token field");
+  });
+
+  test("legacy domains input stays known", () => {
+    expect(validateNetworkPolicy({ domains: ["api.example.com"] }).allowedHosts).toEqual(["api.example.com"]);
   });
 });

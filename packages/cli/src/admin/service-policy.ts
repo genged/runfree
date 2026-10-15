@@ -48,10 +48,11 @@ import type {
   DesiredServiceParameter,
   DesiredServiceResolved,
 } from "@runfree/runtime-contracts/desired-network-policy";
-import type {
-  CredentialPolicyJson,
-  HttpMethod,
-  RequestPolicyJson,
+import {
+  credentialIdentityKey,
+  type CredentialPolicyJson,
+  type HttpMethod,
+  type RequestPolicyJson,
 } from "@runfree/runtime-contracts/network-policy";
 import {
   withTokenStoreLock,
@@ -804,7 +805,7 @@ export function bindDesiredServiceCredentialSources(
 }
 
 function credentialIdentity(credential: CredentialPolicyJson): string {
-  return `${credential.host}\u0000${credential.header.toLowerCase()}\u0000${credential.scheme}\u0000${credential.pathPrefix ?? ""}`;
+  return credentialIdentityKey(credential);
 }
 
 function onePasswordItemFieldRef(itemRef: string, field: string): string {

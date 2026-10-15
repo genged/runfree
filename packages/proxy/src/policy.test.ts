@@ -1,4 +1,10 @@
+import fs from "node:fs";
+
 import { afterEach, describe, expect, test, vi } from "vitest";
+import {
+  desiredPolicyDirectProjection,
+  type DesiredNetworkPolicyJson,
+} from "@runfree/runtime-contracts/desired-network-policy";
 
 import {
   ProxyAdmissionHostMismatchError,
@@ -17,6 +23,14 @@ import {
 import type { AdmissionRecord } from "./admission.ts";
 
 let admissionSerial = 0;
+
+// The template is a desired policy (it carries `version`); the proxy reads its
+// direct projection, the same shape the CLI compiles for it.
+function templateEffectivePolicy() {
+  const templatePath = new URL("../../cli/templates/network-policy.json", import.meta.url).pathname;
+  const desired = JSON.parse(fs.readFileSync(templatePath, "utf8")) as DesiredNetworkPolicyJson;
+  return validateProxyPolicy(desiredPolicyDirectProjection(desired), templatePath);
+}
 
 function testAdmission(req: ProxyRequest, options: Pick<PolicyOptions, "allowedHosts"> = {}): AdmissionRecord {
   admissionSerial += 1;
@@ -60,7 +74,7 @@ describe("proxy policy", () => {
   });
 
   test("loads policy JSON and keeps credential hosts inside allowed hosts", () => {
-    const policy = loadProxyPolicy(new URL("../../cli/templates/network-policy.json", import.meta.url).pathname);
+    const policy = templateEffectivePolicy();
 
     for (const mapping of policy.credentialMappings) {
       expect(policy.allowedHosts, `${mapping.host} is credentialed but not allowlisted`).toContain(mapping.host);
@@ -68,7 +82,7 @@ describe("proxy policy", () => {
   });
 
   test("default desired policy grants no network or credential authority", () => {
-    const policy = loadProxyPolicy(new URL("../../cli/templates/network-policy.json", import.meta.url).pathname);
+    const policy = templateEffectivePolicy();
 
     expect(policy.allowedHosts).toEqual([]);
     expect(policy.credentialMappings).toEqual([]);
@@ -634,6 +648,75 @@ describe("proxy policy", () => {
       headers: {
         accept: "application/json",
       },
+    });
+  });
+
+  test("basic formats Basic base64(username:token) exactly (T1 golden)", () => {
+    const logs: string[] = [];
+    const tokenReader = vi.fn(() => "abc");
+    const result = testBeforeAllowedRequest({
+      url: "https://github.com/owner/repo.git/info/refs?service=git-upload-pack",
+      headers: { Authorization: "Basic YWdlbnQ6cGxhY2Vob2xkZXI=" },
+    }, {
+      allowedHosts: ["github.com"],
+      credentials: {
+        "github.com": [{
+          tokenName: "github",
+          tokenDescription: "GitHub token",
+          host: "github.com",
+          header: "Authorization",
+          scheme: "basic",
+          username: "x-access-token",
+        }],
+      },
+      tokenReader,
+      log: (line) => logs.push(line),
+    });
+
+    expect(result).toEqual({ headers: { authorization: "Basic eC1hY2Nlc3MtdG9rZW46YWJj" } });
+    expect(tokenReader).toHaveBeenCalledWith("github");
+    // The log names the header, host and token, never the encoded value.
+    expect(logs).toEqual(["proxy: injected Authorization for github.com using github"]);
+  });
+
+  test("protocol-scoped mappings are never selected yet, and their header is still stripped", () => {
+    const tokenReader = vi.fn(() => "real-token");
+    const credentials: CredentialPolicy = {
+      "gitlab.com": [
+        {
+          tokenName: "gitlab",
+          tokenDescription: "GitLab token",
+          host: "gitlab.com",
+          header: "Authorization",
+          scheme: "bearer",
+          pathPrefix: "/api/",
+        },
+        {
+          tokenName: "gitlab",
+          tokenDescription: "GitLab token",
+          host: "gitlab.com",
+          header: "Authorization",
+          scheme: "basic",
+          username: "oauth2",
+          protocol: "git-http",
+        },
+      ],
+    };
+    const request = (url: string) => testBeforeAllowedRequest({
+      url,
+      headers: { Authorization: "Bearer agent-placeholder", accept: "*/*" },
+    }, { allowedHosts: ["gitlab.com"], credentials, tokenReader, log: () => {} });
+
+    for (const url of [
+      "https://gitlab.com/group/repo.git/info/refs?service=git-upload-pack",
+      "https://gitlab.com/group/repo/info/refs?service=git-upload-pack",
+      "https://gitlab.com/group/repo",
+    ]) {
+      expect(request(url)).toEqual({ headers: { accept: "*/*" } });
+    }
+    expect(tokenReader).not.toHaveBeenCalled();
+    expect(request("https://gitlab.com/api/v4/projects")).toEqual({
+      headers: { accept: "*/*", authorization: "Bearer real-token" },
     });
   });
 

@@ -86,7 +86,19 @@ function requestRuleIsNoMorePermissive(
 }
 
 function credentialKey(tokenName: string, credential: CredentialPolicyJson): string {
-  return [tokenName, credential.host, credential.header.toLowerCase(), credential.scheme].join("\0");
+  // The username is part of what the upstream receives, so a changed username
+  // is a different mapping, never a contained one.
+  return [tokenName, credential.host, credential.header.toLowerCase(), credential.scheme, credential.username ?? ""].join("\0");
+}
+
+// A protocol scope narrows a mapping to the requests its matcher recognizes.
+// Adding one is contained by the same mapping without it; removing one widens
+// the mapping to every path of its prefix, and changing it is incomparable.
+function protocolIsContained(
+  previous: CredentialPolicyJson["protocol"],
+  next: CredentialPolicyJson["protocol"],
+): boolean {
+  return previous === undefined || previous === next;
 }
 
 function credentialMappings(policy: PolicyJson): Array<{ credential: CredentialPolicyJson; tokenName: string }> {
@@ -99,6 +111,7 @@ function mappingIsContained(
   next: { credential: CredentialPolicyJson; tokenName: string },
 ): boolean {
   if (credentialKey(previous.tokenName, previous.credential) !== credentialKey(next.tokenName, next.credential)) return false;
+  if (!protocolIsContained(previous.credential.protocol, next.credential.protocol)) return false;
   const previousPath = previous.credential.pathPrefix;
   const nextPath = next.credential.pathPrefix;
   if (nextPath === undefined) return previousPath === undefined;

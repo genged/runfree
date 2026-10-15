@@ -1,5 +1,6 @@
 import {
   validateDesiredNetworkPolicy,
+  withRequiredDesiredNetworkPolicyVersion,
   type DesiredNetworkPolicyJson,
   type DesiredOAuthProvider,
   type DesiredServiceEntry,
@@ -55,8 +56,9 @@ export function overlayDesiredPolicies(
       throw new Error(`host service ${name} is defined in both the project and checkout-local desired policy; remove it from one layer`);
     }
   }
-  return validateDesiredNetworkPolicy({
-    version: 2,
+  // The merge can need v3 although neither layer does (two layers' direct
+  // tokens on one host and header), so the version is derived, not copied.
+  return validateDesiredNetworkPolicy(withRequiredDesiredNetworkPolicyVersion({
     hosts: Array.from(new Set([...project.hosts, ...local.hosts])).sort(),
     services: { ...(project.services ?? {}), ...(local.services ?? {}) },
     requests: { ...(project.requests ?? {}), ...(local.requests ?? {}) },
@@ -66,7 +68,7 @@ export function overlayDesiredPolicies(
     // port claimed by two different names (within a layer or across layers) is
     // refused by validateHostServices below.
     hostServices: { ...(project.hostServices ?? {}), ...(local.hostServices ?? {}) },
-  });
+  }));
 }
 
 function assignOwned<T>(
