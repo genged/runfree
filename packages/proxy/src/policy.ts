@@ -440,11 +440,23 @@ function isGitPushPath(url: URL, pathName: string): boolean {
   const last = segments.at(-1);
   if (last === "git-receive-pack") return true;
   // Capability-probe form: GET .../info/refs?service=git-receive-pack. Every
-  // `service` value counts, since an origin may read the last one.
+  // `service` value counts, since an origin may read the last one, and so
+  // does every parameter whose decoded, case-folded name is `service` (the
+  // same set hasSingleLiteralGitService counts). A `;` anywhere in the query
+  // is a push: an origin that also splits on `;` (Python's parse_qs before
+  // 3.10, Perl CGI) may read a `service` this `&` split never sees, and a git
+  // client never sends one, so failing closed costs real git nothing.
   if (last === "refs" && segments.at(-2) === "info") {
-    return url.searchParams.getAll("service").some((service) => {
-      const decoded = decodeToConvergence(service);
-      return decoded === undefined || decoded.toLowerCase() === "git-receive-pack";
+    const query = url.search.startsWith("?") ? url.search.slice(1) : url.search;
+    if (query.includes(";")) return true;
+    return query.split("&").some((pair) => {
+      if (pair === "") return false;
+      const separator = pair.indexOf("=");
+      const name = decodeToConvergence((separator === -1 ? pair : pair.slice(0, separator)).replaceAll("+", " "));
+      if (name === undefined) return true;
+      if (name.trim().toLowerCase() !== "service") return false;
+      const value = decodeToConvergence((separator === -1 ? "" : pair.slice(separator + 1)).replaceAll("+", " "));
+      return value === undefined || value.trim().toLowerCase() === "git-receive-pack";
     });
   }
   return false;
@@ -563,10 +575,12 @@ const GIT_HTTP_ENDPOINTS: readonly GitHttpEndpoint[] = [
 // Exactly one query parameter names `service` (after decoding and ASCII case
 // folding, so a `%73ervice` or `Service` duplicate an origin might read is
 // counted), and that one is spelled raw as `service=git-upload-pack` or
-// `service=git-receive-pack`. Malformed encoding in any name fails closed.
+// `service=git-receive-pack`. Malformed encoding in any name, or any `;` in
+// the query, fails closed.
 function hasSingleLiteralGitService(url: URL): boolean {
   const query = url.search.startsWith("?") ? url.search.slice(1) : url.search;
-  if (query === "") return false;
+  // A `;` may split the query for some origins (see isGitPushPath).
+  if (query === "" || query.includes(";")) return false;
   let literal = 0;
   let named = 0;
   for (const pair of query.split("&")) {

@@ -822,6 +822,24 @@ describe("proxy policy", () => {
       }
     });
 
+    // Some origins (Python's parse_qs before 3.10, Perl CGI) also split a
+    // query on `;`, so `x=1;service=git-receive-pack&service=git-upload-pack`
+    // may name a second service the `&`-split count never saw.
+    test("F4: an info/refs query with any `;` gets no credential", () => {
+      for (const query of [
+        "service=git-upload-pack;x=1",
+        "x=1;service=git-receive-pack&service=git-upload-pack",
+        "service=git-upload-pack&x=1;y",
+        ";service=git-upload-pack",
+      ]) {
+        const url = `https://github.com/owner/repo.git/info/refs?${query}`;
+        expect(gitHttpRequestKind("GET", new URL(url)), url).toBeUndefined();
+        const { result, tokenReader } = githubRequest("GET", url);
+        expect(result, url).toEqual({ headers: { accept: "*/*" } });
+        expect(tokenReader, url).not.toHaveBeenCalled();
+      }
+    });
+
     test("T4: gist.github.com carries no github.com mapping, so a git request there passes untouched", () => {
       const { result, tokenReader } = githubRequest("GET", "https://gist.github.com/owner/abc.git/info/refs?service=git-upload-pack");
       expect(result).toEqual({});
@@ -1553,6 +1571,35 @@ describe("write classification (operation-aware read-only / approve-on-write)", 
       tokenReader: () => null,
     })));
     expect(undeclared.shape?.reason).toBe("write-denied");
+  });
+
+  // F4: an origin that splits the query on `;` may read a service the
+  // `&`-split URLSearchParams never shows, and a git client never sends `;`,
+  // so any `;` in an info/refs query is a push (fail closed). A `service`
+  // spelled with a different case or encoding is also read as a service.
+  test("an info/refs query with a `;` or a case/encoding-variant receive-pack service classifies as a push", () => {
+    const options = requestOptions({
+      requests: { "git.example.com": { gitPush: "deny", writeAction: "allow" } },
+      tokenReader: () => null,
+    });
+    for (const query of [
+      "x=1;service=git-receive-pack&service=git-upload-pack",
+      "service=git-upload-pack;service=git-receive-pack",
+      "service=git-upload-pack;x",
+      "Service=git-receive-pack",
+      "%73ervice=git-receive-pack",
+      "service=git-upload-pack&SERVICE=git-%72eceive-pack",
+    ]) {
+      const url = `https://git.example.com/org/repo.git/info/refs?${query}`;
+      const denial = shapeDenial(() => testBeforeAllowedRequest({ method: "GET", url, headers: {} }, options));
+      expect(denial.shape?.reason, url).toBe("git-push-denied");
+    }
+    // The plain fetch probe is still not a push.
+    expect(() => testBeforeAllowedRequest({
+      method: "GET",
+      url: "https://git.example.com/org/repo.git/info/refs?service=git-upload-pack",
+      headers: {},
+    }, options)).not.toThrow();
   });
 
   test("an LFS batch POST is a read only with a proven download body, on the exact batch endpoint of a git-declared host", () => {
