@@ -610,7 +610,18 @@ describe("launch latency: sub-second launch plan Phase B", () => {
       const exitingContainer = await waitForLaunchContainer(exiting, () => sessionContainers(fixture).find((id) => !idle.has(id) && id !== peerContainer), "the exiting session");
       const hung = await waitUntil(() => peerProbeReads(providerDir).find((read) => read.event === "watch-hang" && read.watcher !== peerWatcher), PEER_PROBE_WAIT_MS, "the exiting watcher's read");
       const peerReadsBefore = peerProbeReads(providerDir).filter((read) => read.event === "watch-done" && read.watcher === peerWatcher).length;
-      dockerOrThrow("end the exiting session", ["kill", exitingContainer]);
+      const killed = docker(["kill", exitingContainer]);
+      if (killed.status !== 0) {
+        // The session ended before the kill: its launch's own output says why.
+        const state = docker(["inspect", "-f", "{{json .State}}", exitingContainer]).output.trim();
+        const ended = await Promise.race([
+          exiting.completion,
+          new Promise<undefined>((resolve) => setTimeout(() => resolve(undefined), CANCELLATION_BOUND_MS)),
+        ]);
+        throw new Error(`the exiting session was not running when killed: ${describeOutput(killed.output)}; `
+          + `container state: ${state}; launch ${ended ? `exited ${ended.status}` : "still running"}: `
+          + describeOutput(ended?.output ?? "", 4000));
+      }
       await exiting.completion;
       const stopped = Date.now();
       await waitUntil(() => processGone(hung.provider) && processGone(hung.watcher) ? true : undefined, CANCELLATION_BOUND_MS, "the exiting watcher and its read to end");
