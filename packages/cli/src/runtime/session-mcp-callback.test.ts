@@ -643,6 +643,23 @@ describe("setup deadline IO", () => {
     expect(captureAsync).toHaveBeenCalledOnce();
   });
 
+  test("a call the deadline cuts off says so in its stderr, keeping what Docker wrote", async () => {
+    const captureAsync = vi.fn(async () => ({ status: 124, timedOut: true, stdout: "", stderr: "" }));
+    const capture = vi.fn(() => ({ status: 124, timedOut: true, stdout: "", stderr: "partial\n" }));
+    const io = withSetupDeadline({ capture, run: vi.fn(), captureAsync } as unknown as RuntimeIO, () => 700.6, 12_000);
+    const cut = await io.captureAsync?.("docker", ["run", "--rm", "img"]);
+    expect(cut?.status).toBe(124);
+    expect(cut?.stderr).toBe("docker run timed out after 700 ms (MCP OAuth callback setup budget 12000 ms)");
+    expect(io.capture("docker", ["network", "create", "n"]).stderr)
+      .toBe("partial\ndocker network timed out after 700 ms (MCP OAuth callback setup budget 12000 ms)");
+  });
+
+  test("a call that fails without timing out keeps its stderr unchanged", async () => {
+    const captureAsync = vi.fn(async () => ({ status: 1, stdout: "", stderr: "" }));
+    const io = withSetupDeadline({ capture: vi.fn(), run: vi.fn(), captureAsync } as unknown as RuntimeIO, () => 700, 12_000);
+    expect((await io.captureAsync?.("docker", ["run"]))?.stderr).toBe("");
+  });
+
   test("exposes no captureAsync when the inner IO has none", () => {
     const io = withSetupDeadline({ capture: vi.fn(), run: vi.fn() } as unknown as RuntimeIO, () => 1_000, 12_000);
     expect("captureAsync" in io).toBe(false);
