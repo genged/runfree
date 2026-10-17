@@ -154,7 +154,15 @@ Recovery](architecture.md#interrupted-session-recovery).
 
 Runfree policy is exact-host based. There are no wildcard hosts.
 
-`.runfree/network-policy.json` is writable desired policy v2. Editing it does
+`.runfree/network-policy.json` is writable desired policy, version 2 or 3.
+Runfree writes version 3 only when the content needs it: a credential
+destination with the `basic` scheme, a `username`, or a `protocol` scope, or
+two destinations for one host and header within the direct `tokens` or within
+one service entry. A file that uses
+none of these stays version 2, with the same bytes and digest as before. A
+file that declares version 2 but uses one of these is refused, and the error
+names the fields. Runfree releases before version 3 existed refuse a version 3
+file with `version must be 2`. Editing the file does
 not change a running proxy or authorize the next start. Runfree captures it
 while project agents are quiesced, compares it with host-owned approvals, and
 compiles an immutable effective policy generation only after exact approval.
@@ -376,7 +384,7 @@ Useful options:
 | Option | Applies to | Use |
 | --- | --- | --- |
 | `--header <name>` | `credential add`, `credential link`, `credential unlink` | Header to inject. Default is usually `Authorization`. |
-| `--scheme bearer|raw` | `credential add`, `credential link` | Prefix with `Bearer ` or inject raw value. |
+| `--scheme bearer|raw` | `credential add`, `credential link` | Prefix with `Bearer ` or inject raw value. `--scheme basic` is refused before any policy write: the `basic` scheme needs a username and is available only through [service definitions](#user-defined-services). |
 | `--path-prefix /path/` | credential destination | Inject only for matching request paths. |
 | `--refresh-every 15m` | `credential set-source`, `credential add` | Re-resolve source on an interval. |
 | `--from-env`, `--from-1password`, `--from-source`, `--from-stdin` | credential source binding | Choose one credential source. |
@@ -428,6 +436,35 @@ Important enable options:
 | `--local` | Write the checkout-local desired layer instead of the project layer. |
 | `--no-reload` | Leave effective controls unchanged after the desired mutation. |
 
+### Service revisions
+
+An enabled entry keeps the revision it was enabled with. A newer Runfree
+release does not upgrade it and does not warn. `runfree service diff` prints
+`<id> (<layer>): revision <old> -> <new>` with the resolved semantics before
+and after, and `runfree service diff --apply` writes the new entries:
+
+```bash
+runfree service diff
+runfree service diff --apply
+```
+
+`--apply` keeps each entry's recorded selection: skipped hosts and write mode.
+Re-running `runfree service enable <id>` also writes the current revision, but
+it builds the entry only from that run's flags, so an earlier `--skip-broad`,
+`--skip-host`, `--read-only`, or `--allow-write` is lost unless you repeat it.
+
+Revision changes in this version:
+
+| Service | Revision | Change |
+| --- | --- | --- |
+| `github` | 2 -> 3 | Adds the `github` token as `Authorization: Basic` (username `x-access-token`) on `github.com`, only on git smart-HTTP requests (`protocol: "git-http"`) and Git LFS requests (`protocol: "git-lfs"`) (see [Git over HTTPS and SSH remotes](#git-over-https-and-ssh-remotes)). Other `github.com` paths, including the web UI, get no credential, and an `Authorization` header the agent sends to `github.com` is now removed or replaced. |
+| `gitlab` | 1 -> 2 | Adds the `gitlab` token as `Authorization: Basic` (username `oauth2`) on `gitlab.com` git smart-HTTP requests (`protocol: "git-http"`), beside the existing Bearer destination on `/api/`. Git LFS is not mediated on `gitlab.com`: LFS requests get no credential, and an LFS batch request is a write. With no token stored, `gitlab.com` requests now go out anonymously instead of being refused. |
+
+Both new revisions use the `basic` scheme and a `protocol` scope, so applying
+either one makes `.runfree/network-policy.json` desired policy version 3.
+Everyone who reads that file needs a Runfree release that accepts version 3;
+older releases refuse it with `version must be 2`.
+
 ### User-defined services
 
 User-defined service ids use the `user-*` namespace and are not curated by Runfree.
@@ -441,6 +478,159 @@ runfree service custom remove user-internal-api
 ```
 
 A strict JSON user-service definition contains `schemaVersion`, `id`, `label`, `revision`, `hosts`, `explanations`, optional `detect`, optional `credential`, optional `parameters` (declared non-secret inputs: `key`, `envVar`, `description`, optional `pattern` and `example`; supplied with `--param` and projected into the agent env), and optional `neverAutoSuggest`.
+
+The optional `credential` object has `tokenDescription`, `agentEnv` (the
+placeholder env names), and `credentials`, a non-empty list of destinations.
+Each destination has these fields:
+
+| Field | Required | Rule |
+| --- | --- | --- |
+| `host` | yes | Exact normalized hostname; one of the service's hosts. |
+| `header` | yes | Header the proxy injects. |
+| `scheme` | yes | `bearer` (`Bearer <token>`), `raw` (the token as is), or `basic` (`Basic base64(<username>:<token>)`). |
+| `username` | with `basic` only | Required with `basic` and refused with any other scheme. 1 to 64 printable ASCII characters, with no space, control character, or `:`. It is policy data, not a secret. |
+| `pathPrefix` | no | Inject only on matching request paths. |
+| `protocol` | no | `git-http`: inject only on the git smart-HTTP requests (ref discovery, fetch, push) listed in [Git over HTTPS and SSH remotes](#git-over-https-and-ssh-remotes). `git-lfs`: inject only on the Git LFS batch and lock requests listed there. With a `pathPrefix` too, the request must match both. |
+
+On one host and header, at most one destination may have each `protocol`, and
+no two destinations may have the same `protocol` and `pathPrefix`. No request
+is both a `git-http` and a `git-lfs` request, so at most one `protocol`
+destination per header matches a request. The proxy chooses among a host's
+destinations per host, not per header: when any `protocol` destination of the
+host matches the request, only `protocol` destinations are used, and a
+destination without `protocol` is not injected on that request, even on
+another header. Otherwise the longest matching `pathPrefix` wins, as before. A
+definition that breaks a rule is refused before anything is written. Enabling
+a service whose destinations use `basic`, `username`, or `protocol` makes the
+desired policy version 3.
+
+A `git-lfs` destination also opts its host into Git LFS mediation: on a host
+with a git handling rule, a Git LFS batch request whose body proves it is a
+download is a read only when a `git-lfs` destination of that host matches it
+(its `pathPrefix`, if any, covers the request path). Use it only for an LFS
+server whose batch responses do not hand back a credential broader than one
+object transfer (see [security.md](security.md#git-over-https)).
+
+A host with a git handling rule but no matching `git-lfs` destination gets no
+LFS read rule: every Git LFS batch request there, a download included, is a
+write and waits for approval under `ask`. This applies to `bitbucket.org`
+under the `bitbucket` service (its LFS downloads, public ones included, now
+wait for approval), to `gitlab.com`, and to any host you give a git rule by
+hand, such as with `runfree host rules <host> --deny-git-push`.
+
+These fields let a host with no curated service, such as GitHub Enterprise
+Server or self-hosted GitLab, get a git credential. One limitation: a
+user-defined service cannot declare git handling for its hosts (the `gitPush`
+rule that curated `github` and `gitlab` carry). On such a host every git fetch
+(`POST …/git-upload-pack`) and every Git LFS batch request is a write by
+method, so under the default `ask` posture each one waits for approval, and a
+push is a plain write rather than a git push. The SSH remote rewriting below
+covers only `github.com` and `gitlab.com`.
+
+### Git over HTTPS and SSH remotes
+
+With the `github` or `gitlab` service enabled at its current revision and a
+token bound, `git clone`, `fetch`, `pull`, and `push` over HTTPS work in the
+sandbox. Git sends no credential of its own; the proxy adds the token as HTTP
+Basic auth (username `x-access-token` on `github.com`, `oauth2` on
+`gitlab.com`). The token never enters the container.
+
+The proxy attaches it only to these requests, where `…` is at least one
+repository path segment:
+
+| Request | Method | Path ends with | `protocol` |
+| --- | --- | --- | --- |
+| Ref discovery | `GET` | `/info/refs`, with exactly one `service=git-upload-pack` or `service=git-receive-pack` query parameter | `git-http` |
+| Fetch | `POST` | `/git-upload-pack` | `git-http` |
+| Push | `POST` | `/git-receive-pack` | `git-http` |
+| Git LFS batch | `POST` | `/info/lfs/objects/batch` | `git-lfs` |
+| Git LFS locks | `GET`, `POST` | `/info/lfs/locks` (`GET` or `POST`), `/info/lfs/locks/verify`, `/info/lfs/locks/<id>/unlock` (`POST`) | `git-lfs` |
+
+The `github` service has both a `git-http` and a `git-lfs` destination on
+`github.com`. The `gitlab` service has only `git-http` on `gitlab.com`, so Git
+LFS is not mediated there in this release: LFS requests to `gitlab.com` get no
+credential, and every LFS batch request, a download included, is a write that
+waits for approval under `ask`. GitLab answers an authenticated batch request
+with a project-wide LFS token that can push, so the agent must not get one
+without your approval. A private GitLab LFS fetch therefore fails.
+
+Methods must match exactly, and the raw path and its decoded form must both
+end with the same plain endpoint. An encoded, `;param`, trailing `/` or `.`,
+or otherwise ambiguous spelling gets no credential. These are not git requests
+either, and get no credential:
+
+- a `POST` endpoint with a query string (only the `GET` lock listing takes
+  one);
+- a ref discovery query that contains a `;`;
+- a path whose first segment is `api` (in any case or encoding, and with any
+  dots or whitespace around it), including a `github.com` owner named `api`;
+- a path with a segment that starts with whitespace, such as `%20repo`;
+- a path with a segment that is exactly `-`, such as GitLab's `/-/` routes.
+
+Any other path on the host gets no credential either.
+
+Write approval applies as before. A fetch is a read. A push is a git push
+write: under the default `ask` posture it waits for `runfree approve`, and
+once approved it goes out with your token. A ref discovery request that names
+`service=git-receive-pack` in any case or encoding, or whose query contains a
+`;`, counts as a push. To refuse pushes outright:
+
+```bash
+runfree host rules github.com --deny-git-push
+```
+
+On `github.com`, a Git LFS batch request whose body proves it is a download is
+a read; an upload batch and every `POST` lock request are writes. The `GET`
+lock listing is a read, and on `github.com` it carries the `git-lfs`
+credential. On `gitlab.com`, `bitbucket.org`, and every other host without a
+matching `git-lfs` destination, every LFS batch request is a write. The proof
+rules are in [security.md](security.md#git-over-https).
+
+#### SSH remotes
+
+The sandbox's global Git config, `/home/agent/.gitconfig`, is written by the
+host and mounted read-only. It rewrites exactly these remote prefixes to
+HTTPS:
+
+| Remote prefix | Rewritten to |
+| --- | --- |
+| `git@github.com:` | `https://github.com/` |
+| `ssh://git@github.com/` | `https://github.com/` |
+| `ssh://git@github.com:22/` | `https://github.com/` |
+| `ssh://git@ssh.github.com:443/` | `https://github.com/` |
+| `git@gitlab.com:` | `https://gitlab.com/` |
+| `ssh://git@gitlab.com/` | `https://gitlab.com/` |
+| `ssh://git@gitlab.com:22/` | `https://gitlab.com/` |
+
+- The rewrite is always present, whether or not the service is enabled. A
+  rewritten remote on a host that is not allowed fails with the proxy's
+  denial for that host, not an SSH connection error.
+- It is routing, not enforcement. The agent can undo it with `git -c`,
+  `GIT_CONFIG_*` variables, or repository config, and gains nothing: SSH has
+  no route out of the sandbox either way.
+- Your repository's `.git/config` is not changed; it keeps the SSH URL, and
+  host Git never reads the sandbox config. Inside the sandbox, `git remote -v`
+  shows the HTTPS URL, and an explicit `pushurl` and submodule URLs with these
+  prefixes are rewritten too.
+- Git uses the longest matching `insteadOf` prefix across all config files,
+  so a repository `insteadOf` overrides these only when its prefix is longer.
+- Other SSH forms are not rewritten and fail, because the sandbox has no SSH
+  egress: host aliases from your `~/.ssh/config` (for example
+  `git@github.com-work:`), other users or ports, and other hosts such as
+  GitHub Enterprise Server or self-hosted GitLab. Use an HTTPS remote for
+  those.
+
+#### Git failure modes
+
+| Condition | What happens |
+| --- | --- |
+| No `github` or `gitlab` token stored | The request goes out anonymously, with any agent `Authorization` removed. Public fetches work; private fetches and pushes get 401 from the provider. |
+| Token expired or revoked | 401 from the provider. Refresh the source, then run `runfree credential sync`. |
+| Token cannot reach the repository | 403 or 404 from the provider. |
+| Push refused by policy or approval | The proxy refuses with `git-push-denied`, `write-denied`, or a `write-approval-*` reason, before any upstream connection or token read. |
+| Path the proxy cannot read unambiguously | No credential is attached; write classification is unchanged. |
+| Agent points a remote back at SSH | The connection fails; the sandbox has no SSH egress. |
+| Service enabled at an older revision | Git requests carry no proxy credential, so private fetches and pushes get 401. Run `runfree service diff --apply`. |
 
 ## Approve-On-Write
 

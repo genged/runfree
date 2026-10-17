@@ -3,7 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import util from "node:util";
-import { afterEach, beforeEach, describe, expect, test, } from "vitest";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
 import {
   normalizeHostname,
@@ -14,6 +14,7 @@ import {
 } from "@runfree/runtime-contracts/network-policy";
 import {
   validateDesiredNetworkPolicy,
+  withRequiredDesiredNetworkPolicyVersion,
   type DesiredNetworkPolicyJson,
   type DesiredServiceEntry,
 } from "@runfree/runtime-contracts/desired-network-policy";
@@ -51,7 +52,7 @@ import { projectHash } from "../packages/cli/src/project-identity.ts";
 import { RUNFREE_RUNTIME_DIGEST } from "../packages/cli/src/embedded-assets.generated.ts";
 import { loadUserServiceCatalog, validateUserServiceDefinitionObject } from "../packages/cli/src/user-services.ts";
 import { flushWarnings } from "../packages/cli/src/warnings.ts";
-import { classifyWrite } from "../packages/proxy/src/policy.ts";
+import { ProxyPolicyDenialError, beforeAllowedRequest, classifyWrite, hostFromUrl } from "../packages/proxy/src/policy.ts";
 import { cliEntryArgv } from "../tests/support/prebuilt-entry.ts";
 
 const repoRoot = path.resolve(new URL("..", import.meta.url).pathname);
@@ -91,7 +92,7 @@ const REVISION_SNAPSHOT: Record<string, { revision: number; hosts: string[]; rem
     removedHosts: [],
   },
   github: {
-    revision: 2,
+    revision: 3,
     hosts: [
       "github.com",
       "api.github.com",
@@ -156,7 +157,7 @@ const REVISION_SNAPSHOT: Record<string, { revision: number; hosts: string[]; rem
   homebrew: { revision: 1, hosts: ["formulae.brew.sh", "ghcr.io"], removedHosts: [] },
   "debian-apt": { revision: 1, hosts: ["deb.debian.org", "security.debian.org"], removedHosts: [] },
   "alpine-apk": { revision: 1, hosts: ["dl-cdn.alpinelinux.org"], removedHosts: [] },
-  gitlab: { revision: 1, hosts: ["gitlab.com"], removedHosts: [] },
+  gitlab: { revision: 2, hosts: ["gitlab.com"], removedHosts: [] },
   bitbucket: { revision: 1, hosts: ["bitbucket.org", "api.bitbucket.org"], removedHosts: [] },
   mistral: { revision: 1, hosts: ["api.mistral.ai"], removedHosts: [] },
   groq: { revision: 1, hosts: ["api.groq.com"], removedHosts: [] },
@@ -451,7 +452,7 @@ describe("service registry invariants", () => {
     expect(serviceHostNames(SERVICES.python)).toEqual(["pypi.org", "files.pythonhosted.org"]);
   });
 
-  test("github merges the full ecosystem with an optional credential on api/raw", () => {
+  test("github merges the full ecosystem with an optional credential on api/raw and github.com git-http and git-lfs", () => {
     expect(serviceHostNames(SERVICES.github)).toEqual([
       "github.com",
       "api.github.com",
@@ -461,13 +462,217 @@ describe("service registry invariants", () => {
       "avatars.githubusercontent.com",
     ]);
     expect(SERVICES.github.credential?.tokenName).toBe("github");
-    expect(SERVICES.github.revision).toBe(2);
+    expect(SERVICES.github.revision).toBe(3);
     expect(SERVICES.github.credential?.allowAnonymous).toBe(true);
     expect(SERVICES.github.credential?.agentEnv).toEqual(["GH_TOKEN", "GITHUB_TOKEN"]);
-    expect(SERVICES.github.credential?.credentials.map((c) => c.host)).toEqual([
-      "api.github.com",
-      "raw.githubusercontent.com",
+    expect(SERVICES.github.credential?.credentials).toEqual([
+      { host: "api.github.com", header: "Authorization", scheme: "bearer" },
+      { host: "raw.githubusercontent.com", header: "Authorization", scheme: "bearer" },
+      { host: "github.com", header: "Authorization", scheme: "basic", username: "x-access-token", protocol: "git-http" },
+      { host: "github.com", header: "Authorization", scheme: "basic", username: "x-access-token", protocol: "git-lfs" },
     ]);
+    expect(SERVICES.github.readOnly?.["github.com"]).toEqual({ gitPush: "write" });
+  });
+
+  // GitLab's LFS batch response for a user carries a project-wide LFS token
+  // that can push (security review Finding 2), so gitlab has no git-lfs
+  // mapping: LFS is not mediated on gitlab.com.
+  test("gitlab carries API Bearer and git-http Basic mappings on gitlab.com with anonymous fallback, and no git-lfs mapping", () => {
+    expect(SERVICES.gitlab.revision).toBe(2);
+    expect(SERVICES.gitlab.credential?.allowAnonymous).toBe(true);
+    expect(SERVICES.gitlab.credential?.credentials).toEqual([
+      { host: "gitlab.com", header: "Authorization", scheme: "bearer", pathPrefix: "/api/" },
+      { host: "gitlab.com", header: "Authorization", scheme: "basic", username: "oauth2", protocol: "git-http" },
+    ]);
+    expect(SERVICES.gitlab.explanations?.join("\n")).toContain("Git LFS is not mediated on gitlab.com");
+    // Pushes stay classified as writes, so write approval governs a push that
+    // now carries the credential.
+    expect(SERVICES.gitlab.readOnly?.["gitlab.com"]?.gitPush).toBe("write");
+    expect(SERVICES.gitlab.explanations?.join("\n")).not.toContain("never clobbers");
+  });
+
+  test.each(["github", "gitlab"] as const)(
+    "%s desired entry needs desired v3, validates, and compiles to a valid effective policy",
+    (id) => {
+      const entry = desiredServiceEntry(SERVICES[id]);
+      const project = withRequiredDesiredNetworkPolicyVersion({ hosts: [], services: { [id]: entry } });
+      expect(project.version).toBe(3);
+      expect(() => validateDesiredNetworkPolicy({ ...project, version: 2 }))
+        .toThrow("version 2 cannot use these fields; declare version 3");
+      const validated = validateDesiredNetworkPolicy(project);
+      expect(validated.version).toBe(3);
+      expect(validated.services?.[id]).toEqual(entry);
+
+      const compiled = compileDesiredPolicies({ project: validated, local: { version: 2, hosts: [] } });
+      const effective = validateNetworkPolicy(compiled.policy);
+      expect(effective.tokens[id]?.allowAnonymous).toBe(true);
+      const definitionCredentials = SERVICES[id].credential?.credentials ?? [];
+      expect(effective.tokens[id]?.credentials).toHaveLength(definitionCredentials.length);
+      expect(effective.tokens[id]?.credentials).toEqual(expect.arrayContaining(definitionCredentials));
+    },
+  );
+
+  // The real definitions through the real compile path to the proxy's
+  // request mutation: which requests carry the credential, in which form.
+  function proxyMutationFor(id: "github" | "gitlab", writeMode?: "read-only", writeApproval: "allow" | "ask" = "allow") {
+    const project = withRequiredDesiredNetworkPolicyVersion({
+      hosts: [],
+      services: { [id]: desiredServiceEntry(SERVICES[id], writeMode ? { writeMode } : {}) },
+    });
+    const effective = validateNetworkPolicy(
+      compileDesiredPolicies({ project, local: { version: 2, hosts: [] } }).policy,
+    );
+    let serial = 0;
+    const tokenReader = vi.fn((name: string) => (name === id ? "real-token" : null));
+    const request = (
+      method: string,
+      url: string,
+      headers: Record<string, string> = { Authorization: "Bearer agent-supplied" },
+      lfsBodyClass?: "download",
+    ) => {
+      tokenReader.mockClear();
+      serial += 1;
+      const result = beforeAllowedRequest({
+        v: 1,
+        host: hostFromUrl(url),
+        port: 443,
+        policyGeneration: effective.generation,
+        admittedAtMs: Date.now(),
+        connectionSerial: serial,
+        stage: "request",
+      }, { method, url, headers }, {
+        allowedHosts: effective.allowedHosts,
+        credentials: effective.credentials,
+        requests: effective.requests,
+        writeApproval,
+        tokenReader,
+        log: () => {},
+        ...(lfsBodyClass ? { lfsBodyClass } : {}),
+      });
+      return { result, tokenReader };
+    };
+    return Object.assign(request, { tokenReader });
+  }
+
+  test("compiled github: Basic x-access-token on github.com git requests, nothing on web paths, Bearer on api/raw", () => {
+    const request = proxyMutationFor("github");
+    const basic = "Basic eC1hY2Nlc3MtdG9rZW46cmVhbC10b2tlbg==";
+    expect(basic).toBe(`Basic ${Buffer.from("x-access-token:real-token").toString("base64")}`);
+    for (const [method, url] of [
+      ["GET", "https://github.com/owner/repo.git/info/refs?service=git-upload-pack"],
+      ["POST", "https://github.com/owner/repo.git/git-upload-pack"],
+      ["POST", "https://github.com/owner/repo/git-receive-pack"],
+      ["POST", "https://github.com/owner/repo.git/info/lfs/objects/batch"],
+      ["POST", "https://github.com/owner/repo.git/info/lfs/locks/verify"],
+    ] as const) {
+      expect(request(method, url).result, `${method} ${url}`).toEqual({ headers: { authorization: basic } });
+    }
+    for (const url of [
+      "https://github.com/owner/repo",
+      "https://github.com/owner/repo/pulls",
+      "https://github.com/settings/tokens",
+    ]) {
+      const { result, tokenReader } = request("GET", url);
+      // The agent's header is stripped; no credential is read or attached.
+      expect(result, url).toEqual({ headers: {} });
+      expect(tokenReader).not.toHaveBeenCalled();
+    }
+    expect(request("GET", "https://api.github.com/repos/owner/repo").result)
+      .toEqual({ headers: { authorization: "Bearer real-token" } });
+    expect(request("GET", "https://raw.githubusercontent.com/owner/repo/main/README.md").result)
+      .toEqual({ headers: { authorization: "Bearer real-token" } });
+    // Hosts without a mapping are untouched.
+    expect(request("GET", "https://codeload.github.com/owner/repo/tar.gz/main").result).toEqual({});
+  });
+
+  test("compiled github read-only: a push is still a denied write before any credential read", () => {
+    const request = proxyMutationFor("github", "read-only");
+    const tokenReader = request("GET", "https://github.com/owner/repo").tokenReader;
+    expect(() => request("POST", "https://github.com/owner/repo.git/git-receive-pack")).toThrow(ProxyPolicyDenialError);
+    expect(tokenReader).not.toHaveBeenCalled();
+    expect(request("POST", "https://github.com/owner/repo.git/git-upload-pack").result)
+      .toEqual({ headers: { authorization: "Basic eC1hY2Nlc3MtdG9rZW46cmVhbC10b2tlbg==" } });
+  });
+
+  test("compiled gitlab: Bearer on /api/, Basic oauth2 on git requests, nothing elsewhere", () => {
+    const request = proxyMutationFor("gitlab");
+    const basic = `Basic ${Buffer.from("oauth2:real-token").toString("base64")}`;
+    expect(request("GET", "https://gitlab.com/api/v4/projects").result)
+      .toEqual({ headers: { authorization: "Bearer real-token" } });
+    for (const [method, url] of [
+      ["GET", "https://gitlab.com/group/repo.git/info/refs?service=git-upload-pack"],
+      ["POST", "https://gitlab.com/group/sub/repo.git/git-upload-pack"],
+      ["POST", "https://gitlab.com/group/repo.git/git-receive-pack"],
+    ] as const) {
+      expect(request(method, url).result, `${method} ${url}`).toEqual({ headers: { authorization: basic } });
+    }
+    for (const [method, url] of [
+      ["GET", "https://gitlab.com/api"],
+      ["GET", "https://gitlab.com/group/repo"],
+      ["GET", "https://gitlab.com/-/profile"],
+      // LFS is not mediated on gitlab.com.
+      ["POST", "https://gitlab.com/group/repo.git/info/lfs/objects/batch"],
+      ["POST", "https://gitlab.com/group/repo.git/info/lfs/locks/verify"],
+    ] as const) {
+      const { result, tokenReader } = request(method, url);
+      expect(result, url).toEqual({ headers: {} });
+      expect(tokenReader).not.toHaveBeenCalled();
+    }
+  });
+
+  // Security review Finding 2: the LFS download read exemption applies only
+  // where the service opts the host into LFS mediation (a git-lfs mapping).
+  test("compiled LFS download batch under ask: github reads with Basic, gitlab is a held write with no credential read", () => {
+    const github = proxyMutationFor("github", undefined, "ask");
+    expect(github("POST", "https://github.com/owner/repo.git/info/lfs/objects/batch", {}, "download").result)
+      .toEqual({ headers: { authorization: `Basic ${Buffer.from("x-access-token:real-token").toString("base64")}` } });
+
+    const gitlab = proxyMutationFor("gitlab", undefined, "ask");
+    let denial: unknown;
+    try {
+      gitlab("POST", "https://gitlab.com/group/repo.git/info/lfs/objects/batch", {}, "download");
+    } catch (error) {
+      denial = error;
+    }
+    expect(denial).toBeInstanceOf(ProxyPolicyDenialError);
+    expect((denial as ProxyPolicyDenialError).shape).toMatchObject({
+      reason: "write-approval-required",
+      host: "gitlab.com",
+      writeCategory: "method",
+    });
+    expect(gitlab.tokenReader).not.toHaveBeenCalled();
+  });
+
+  test("compiled gitlab: with no token stored, requests go out anonymously instead of being denied (O-6)", () => {
+    const project = withRequiredDesiredNetworkPolicyVersion({
+      hosts: [],
+      services: { gitlab: desiredServiceEntry(SERVICES.gitlab) },
+    });
+    const effective = validateNetworkPolicy(
+      compileDesiredPolicies({ project, local: { version: 2, hosts: [] } }).policy,
+    );
+    for (const [method, url] of [
+      ["POST", "https://gitlab.com/group/repo.git/git-upload-pack"],
+      ["GET", "https://gitlab.com/api/v4/projects"],
+    ] as const) {
+      const result = beforeAllowedRequest({
+        v: 1,
+        host: "gitlab.com",
+        port: 443,
+        policyGeneration: effective.generation,
+        admittedAtMs: Date.now(),
+        connectionSerial: 1,
+        stage: "request",
+      }, { method, url, headers: { Authorization: "Bearer agent-supplied" } }, {
+        allowedHosts: effective.allowedHosts,
+        credentials: effective.credentials,
+        requests: effective.requests,
+        writeApproval: "allow",
+        tokenReader: () => null,
+        log: () => {},
+      });
+      expect(result, url).toEqual({ headers: {} });
+    }
   });
 
   test("node owns only the npm bulk advisory read exemption and its exact adoption migration", () => {
@@ -722,10 +927,12 @@ describe("desiredServicePolicy", () => {
       },
       credential: {
         tokenName: "github",
-        description: "GitHub API token for API and raw content requests",
+        description: "GitHub token for API, raw content, and git over HTTPS requests",
         allowAnonymous: true,
         links: [
           { host: "api.github.com", header: "Authorization", scheme: "bearer" },
+          { host: "github.com", header: "Authorization", scheme: "basic", username: "x-access-token", protocol: "git-http" },
+          { host: "github.com", header: "Authorization", scheme: "basic", username: "x-access-token", protocol: "git-lfs" },
           { host: "raw.githubusercontent.com", header: "Authorization", scheme: "bearer" },
         ],
         agentEnv: ["GH_TOKEN", "GITHUB_TOKEN"],
@@ -1089,6 +1296,77 @@ describe("runfree service CLI: user-defined services", () => {
   });
 });
 
+describe("runfree service CLI: user-defined git-http credentials (O-8)", () => {
+  function forgeDefinition(credential: Record<string, unknown>): Record<string, unknown> {
+    return {
+      schemaVersion: 1,
+      id: "user-forge",
+      label: "Self-hosted forge",
+      revision: 1,
+      hosts: [{ host: "git.forge.example" }],
+      explanations: ["git over HTTPS: git.forge.example"],
+      credential: {
+        tokenDescription: "Forge token",
+        agentEnv: ["FORGE_TOKEN"],
+        credentials: [credential],
+      },
+    };
+  }
+  const basicGit = {
+    host: "git.forge.example",
+    header: "Authorization",
+    scheme: "basic",
+    username: "oauth2",
+    protocol: "git-http",
+  };
+
+  test.each([
+    ["a username with a colon", { ...basicGit, username: "a:b" }, "username must not contain ':'"],
+    ["a username with a space", { ...basicGit, username: "a b" }, "username must contain only printable ASCII"],
+    ["a username with a control character", { ...basicGit, username: "a\u001bb" }, "username must contain only printable ASCII"],
+    ["a username over 64 bytes", { ...basicGit, username: "u".repeat(65) }, "username must be at most 64 bytes"],
+    ["basic without a username", { host: "git.forge.example", header: "Authorization", scheme: "basic" }, "username is required with scheme basic"],
+    ["a username with bearer", { host: "git.forge.example", header: "Authorization", scheme: "bearer", username: "oauth2" }, "username is valid only with scheme basic"],
+    ["an unknown protocol", { ...basicGit, protocol: "git-ssh" }, "protocol must be one of: git-http"],
+  ])("custom add --from-file refuses %s before writing anything", (_name, credential, message) => {
+    writeFixtureRepo({ hosts: [], tokens: {} });
+    const source = path.join(tmpBase, "forge.json");
+    fs.writeFileSync(source, JSON.stringify(forgeDefinition(credential), null, 2));
+    const sourceBefore = fs.readFileSync(source);
+    const policyBefore = fs.readFileSync(path.join(tmp, ".runfree/network-policy.json"));
+
+    const result = runAdminCli(["service", "custom", "add", "user-forge", "--from-file", source, "--yes"]);
+
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain(message);
+    expect(fs.existsSync(userServicesDir())).toBe(false);
+    expect(fs.readFileSync(source)).toEqual(sourceBefore);
+    expect(fs.readFileSync(path.join(tmp, ".runfree/network-policy.json"))).toEqual(policyBefore);
+  });
+
+  test("custom add previews basic username and protocol, and enabling the service writes desired v3", () => {
+    writeApprovedDesiredFixture({ version: 2, hosts: [] });
+    const source = path.join(tmpBase, "forge.json");
+    fs.writeFileSync(source, JSON.stringify(forgeDefinition(basicGit), null, 2));
+
+    const imported = runAdminCli(["service", "custom", "add", "user-forge", "--from-file", source, "--yes"]);
+    expect(imported.status, imported.stderr).toBe(0);
+    expect(imported.stdout).toContain("credential: git.forge.example -> Authorization (basic:oauth2, protocol=git-http)");
+    const stored = JSON.parse(fs.readFileSync(path.join(userServicesDir(), "user-forge.json"), "utf8")) as {
+      schemaVersion: number;
+      credential: { credentials: unknown[] };
+    };
+    expect(stored.schemaVersion).toBe(1);
+    expect(stored.credential.credentials).toEqual([basicGit]);
+
+    const enabled = runAdminCli(["service", "enable", "user-forge", "--no-reload"]);
+    expect(enabled.status, enabled.stderr).toBe(0);
+    const policy = readDesiredPolicy();
+    expect(policy.version).toBe(3);
+    expect(policy.services?.["user-forge"]?.resolved.tokens?.["user-forge"]?.credentials).toEqual([basicGit]);
+  });
+});
+
 describe("runfree service CLI: desired disable", () => {
   test("disable removes compiled credential exposure, keeps the host-owned source, and refuses a null repeat", () => {
     writeApprovedDesiredFixture({ version: 2, hosts: [] });
@@ -1163,6 +1441,42 @@ describe("runfree service CLI: list, explain, diff", () => {
     expect(policy.services?.node).toEqual(desiredServiceEntry(SERVICES.node));
     expect(policy.services?.mystery).toEqual(unavailable);
     expect(readRawConfig().services).toBeUndefined();
+  });
+
+  test("diff upgrades a pinned github revision 2 entry to revision 3, keeps its selection, and emits desired v3", () => {
+    // The revision 2 definition as shipped before git-http mediation: no
+    // github.com credential mapping.
+    const githubCredential = SERVICES.github.credential;
+    if (!githubCredential) throw new Error("github credential missing");
+    const revision2: Service = {
+      ...SERVICES.github,
+      revision: 2,
+      credential: {
+        ...githubCredential,
+        tokenDescription: "GitHub API token for API and raw content requests",
+        credentials: githubCredential.credentials.filter((credential) => credential.host !== "github.com"),
+      },
+    };
+    const selection = { skippedHosts: ["objects.githubusercontent.com"], writeMode: "read-only" as const };
+    const pinned = desiredServiceEntry(revision2, selection);
+    writeApprovedDesiredFixture({ version: 2, hosts: [], services: { github: pinned } });
+    const before = fs.readFileSync(path.join(tmp, ".runfree/network-policy.json"), "utf8");
+
+    const diff = runAdminCli(["service", "diff", "--no-reload"]);
+    expect(diff.status, diff.stderr).toBe(0);
+    expect(diff.stdout).toContain("github (project): revision 2 -> 3");
+    expect(diff.stdout).toContain('"username":"x-access-token"');
+    expect(diff.stdout).toContain("apply with: runfree service diff --apply");
+    expect(fs.readFileSync(path.join(tmp, ".runfree/network-policy.json"), "utf8")).toBe(before);
+
+    const applied = runAdminCli(["service", "diff", "--apply", "--no-reload"]);
+    expect(applied.status, applied.stderr).toBe(0);
+    const policy = readDesiredPolicy();
+    expect(policy.version).toBe(3);
+    expect(policy.services?.github).toEqual(desiredServiceEntry(SERVICES.github, selection));
+    expect(policy.services?.github?.selection).toEqual(selection);
+    expect(policy.services?.github?.resolved.hosts).not.toContain("objects.githubusercontent.com");
+    expect(policy.services?.github?.resolved.requests?.["github.com"]).toEqual({ writeAction: "deny", gitPush: "write" });
   });
 
   test("diff rejects unapproved desired-policy drift before applying a replacement", () => {

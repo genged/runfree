@@ -5,6 +5,12 @@ import path from "node:path";
 
 import { isReservedRunfreeHostname } from "@runfree/runtime-contracts/host-services";
 import {
+  canonicalCredential,
+  credentialProtocolList,
+  credentialSchemeList,
+  credentialUsernameProblem,
+  isCredentialProtocol,
+  isCredentialScheme,
   normalizeHostname,
   normalizePathPrefix,
   type CredentialPolicyJson,
@@ -169,7 +175,7 @@ function parseDetectRule(value: unknown, owner: string): DetectRule {
 
 function parseCredentialPolicy(value: unknown, owner: string): CredentialPolicyJson {
   if (!isRecord(value)) throw new Error(`${owner} must be an object`);
-  ensureOnlyKeys(value, new Set(["host", "header", "scheme", "pathPrefix"]), owner);
+  ensureOnlyKeys(value, new Set(["host", "header", "scheme", "username", "pathPrefix", "protocol"]), owner);
   if (typeof value.host !== "string") throw new Error(`${owner}.host must be a string`);
   let host: string;
   try {
@@ -180,16 +186,46 @@ function parseCredentialPolicy(value: unknown, owner: string): CredentialPolicyJ
   if (host !== value.host) throw new Error(`${owner}.host must be stored as exact normalized hostname ${host}`);
   if (isReservedRunfreeHostname(host)) throw new Error(`${owner}.host ${host} uses the reserved runfree.internal suffix`);
   const header = safeDisplayText(value.header, `${owner}.header`, 120);
-  if (typeof value.scheme !== "string" || (value.scheme !== "bearer" && value.scheme !== "raw")) {
-    throw new Error(`${owner}.scheme must be bearer or raw`);
+  // Scheme, username, and protocol rules are the shared contract's, so a user
+  // definition admits exactly what the effective policy validator admits.
+  if (typeof value.scheme !== "string" || !isCredentialScheme(value.scheme)) {
+    throw new Error(`${owner}.scheme must be one of: ${credentialSchemeList()}`);
   }
-  if (value.pathPrefix === undefined) return { host, header, scheme: value.scheme };
-  if (typeof value.pathPrefix !== "string") throw new Error(`${owner}.pathPrefix must be a string`);
-  try {
-    return { host, header, scheme: value.scheme, pathPrefix: normalizePathPrefix(value.pathPrefix) };
-  } catch (error) {
-    throw new Error(`${owner}.pathPrefix: ${error instanceof Error ? error.message : String(error)}`);
+  const scheme = value.scheme;
+  let username: string | undefined;
+  if (scheme === "basic") {
+    const problem = credentialUsernameProblem(value.username);
+    if (problem !== undefined) {
+      throw new Error(`${owner}.username ${value.username === undefined ? "is required with scheme basic" : problem}`);
+    }
+    username = value.username as string;
+  } else if (value.username !== undefined) {
+    throw new Error(`${owner}.username is valid only with scheme basic`);
   }
+  let protocol: CredentialPolicyJson["protocol"];
+  if (value.protocol !== undefined) {
+    if (typeof value.protocol !== "string" || !isCredentialProtocol(value.protocol)) {
+      throw new Error(`${owner}.protocol must be one of: ${credentialProtocolList()}`);
+    }
+    protocol = value.protocol;
+  }
+  let pathPrefix: string | undefined;
+  if (value.pathPrefix !== undefined) {
+    if (typeof value.pathPrefix !== "string") throw new Error(`${owner}.pathPrefix must be a string`);
+    try {
+      pathPrefix = normalizePathPrefix(value.pathPrefix);
+    } catch (error) {
+      throw new Error(`${owner}.pathPrefix: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  return canonicalCredential({
+    host,
+    header,
+    scheme,
+    ...(username !== undefined ? { username } : {}),
+    ...(pathPrefix !== undefined ? { pathPrefix } : {}),
+    ...(protocol !== undefined ? { protocol } : {}),
+  });
 }
 
 function parseCredential(value: unknown, owner: string): Omit<ServiceCredential, "tokenName"> {

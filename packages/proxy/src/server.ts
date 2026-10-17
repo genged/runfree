@@ -80,6 +80,8 @@ import {
   beforeAllowedRequest,
   configuredCredentialHeaderNames,
   evaluateRequestWriteAsk,
+  gitHttpRequestKind,
+  lfsMediatedRequest,
   hostFromUrl,
   loadProxyPolicy,
   isIpLiteralHostname,
@@ -107,6 +109,7 @@ import {
   type ApprovalRequestPrincipal,
 } from "@runfree/runtime-contracts/session-registry";
 import { GRAPHQL_BODY_CAP_BYTES, classifyGraphqlRequestBody } from "./graphql-classify.js";
+import { classifyLfsBatchRequest } from "./lfs-classify.js";
 import {
   approvalsDecisionsDirFromEnv,
   approvalsPendingDirFromEnv,
@@ -1509,6 +1512,36 @@ async function graphqlBodyClassForRequest(req: ProxyRequest): Promise<"read" | "
   });
 }
 
+// Body-aware Git LFS batch classification: consulted only for POST on the
+// canonical …/info/lfs/objects/batch endpoint of a host that declares git
+// handling (a `gitPush` rule) and has an eligible git-lfs mapping, under an
+// ask/deny posture. "download" is the only verdict that matters to
+// classifyWrite; anything unproven is undefined and stays a write. The body is the content-decoded buffer mockttp forwards;
+// the classifier refuses any non-identity encoding, so it equals the bytes on
+// the wire.
+async function lfsBodyClassForRequest(req: ProxyRequest): Promise<"download" | undefined> {
+  if (req.method !== "POST") return undefined;
+  let url: URL;
+  try {
+    url = new URL(req.url);
+  } catch {
+    return undefined;
+  }
+  const rule = currentPolicy.requests[url.hostname.toLowerCase()];
+  if (rule?.gitPush === undefined) return undefined;
+  const writeAction = rule.writeAction ?? currentPolicy.writeApproval ?? DEFAULT_WRITE_ACTION;
+  if (writeAction === "allow") return undefined;
+  if (gitHttpRequestKind(req.method, url) !== "lfs-batch") return undefined;
+  // Without an eligible git-lfs mapping the batch is a write whatever its
+  // body says (classifyWrite), so do not read the body.
+  if (!lfsMediatedRequest(currentPolicy.credentials[url.hostname.toLowerCase()], req.method, url)) return undefined;
+  const verdict = await classifyLfsBatchRequest({
+    headers: req.headers,
+    readBody: async () => await req.body?.getDecodedBuffer?.(),
+  });
+  return verdict === "download" ? "download" : undefined;
+}
+
 async function mcpClassificationForRequest(req: ProxyRequest): Promise<McpClassification | undefined> {
   if (!currentMcpOperationPolicy) return undefined;
   let url: URL;
@@ -1607,6 +1640,7 @@ async function policedRequestMutation(
   const principal = currentAdmissionPrincipal(admission);
   if (principal === undefined) return missingAdmissionResponse(req);
   const graphqlBodyClass = await graphqlBodyClassForRequest(req);
+  const lfsBodyClass = await lfsBodyClassForRequest(req);
   const mcpClassification = await mcpClassificationForRequest(req);
   // Last await before classification: from here to the mediator's own
   // re-check nothing yields, so both see the same policy.
@@ -1621,6 +1655,7 @@ async function policedRequestMutation(
     requests: currentPolicy.requests,
     writeApproval: currentPolicy.writeApproval,
     graphqlBodyClass,
+    lfsBodyClass,
     oauthProtocolRead: protocolRead !== undefined,
     oauthUnlistedClientIdUrl: protocolReadResult !== undefined && "unlistedClientIdUrl" in protocolReadResult,
     mcpClassification,

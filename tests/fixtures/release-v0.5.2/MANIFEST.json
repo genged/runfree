@@ -1,0 +1,11 @@
+{
+  "tag": "v0.5.2",
+  "commit": "644de74e21831d42f2347a75f3c638dd7ffec979",
+  "files": {
+    "runtime-contracts/desired-network-policy.ts": { "source": "packages/runtime-contracts/src/desired-network-policy.ts", "blob": "8cc0023f941ceacdd96a61f0fa3aa5a6acf0cf7e" },
+    "runtime-contracts/effective-control.ts": { "source": "packages/runtime-contracts/src/effective-control.ts", "blob": "38a6702852f64cf866fdabe628eecc335204ed95" },
+    "runtime-contracts/network-policy.ts": { "source": "packages/runtime-contracts/src/network-policy.ts", "blob": "bd9d8638dcf23bdb95c0c0c814c3a0f2f5b82a20" },
+    "runtime-contracts/oauth-mediation-policy.ts": { "source": "packages/runtime-contracts/src/oauth-mediation-policy.ts", "blob": "e33e5b2b5bbfdd9d6e96ae8152ca4af2e8736393" },
+    "runtime-contracts/primitives.ts": { "source": "packages/runtime-contracts/src/primitives.ts", "blob": "b06060a3ab2289a2936b296968ccf28e7fc135f4" }
+  }
+}

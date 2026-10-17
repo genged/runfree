@@ -9,6 +9,7 @@ Runfree separates tests by the boundary they prove.
 | Live runtime security (release gate) | `make test-runtime` | Source-backed CLI plus real Docker | Both tiers below |
 | Live runtime core | `make test-runtime-core` | The trust-boundary subset of the layer above | Topology, capabilities, egress, CONNECT guard, request shape and write approval, inert policy edits and live revocation, managed-launch file safety, exact session admission, the pinned Claude and Pi `--session-id` contract on the built agent image, and two interrupted conversations resuming at the same time; run for every runtime, proxy, firewall, network, or credential change |
 | Live runtime extended | `make test-runtime-extended` | The rest of the live suite | Crash recovery, rolling upgrades and proxy replacement, renewal under load, session-entry ordering, helper cleanup, audit mode |
+| Live git providers (gated, before a release) | `TEST_RUNTIME_GIT_PROVIDERS=github,gitlab` with `tests/runtime/live/git-https-provider.live.test.ts` | Source-backed CLI, real Docker, and a real GitHub and GitLab private repository | SSH remotes reaching the provider over HTTPS, injected git credentials, a clean anonymous failure, approved and denied pushes, and Git LFS batch classification; skipped unless the gate is set |
 | Live runtime smoke | `make test-runtime-smoke` | One tranche of the layer above (`runtime-topology`) | Fixture drift against the CLI, topology, capability floor, egress containment, and the CONNECT guard; a per-commit subset, not a substitute |
 | Packaged CLI end to end | `make test-cli-e2e` | The compiled `dist/runfree` executable | Compilation, embedded assets, entrypoint, first-run workflows, safe refusals, and filesystem compatibility |
 | Packaged runtime end to end | `make test-cli-e2e-live` | The compiled executable plus real Docker | First startup, exact approvals, image build, managed session launch, reuse, and teardown |
@@ -17,6 +18,31 @@ Runfree separates tests by the boundary they prove.
 Test workflow runs on that commit: static checks, unit tests, template
 validation, and the offline packaged end-to-end lane. It needs the Docker CLI
 and Bun, but not a Docker daemon.
+
+Before a release is tagged, record one green run of the gated git provider
+tranche against both providers. The run is not part of `make test-runtime`,
+because it needs provider credentials:
+
+```bash
+TEST_RUNTIME_BACKEND=docker-desktop \
+TEST_RUNTIME_GIT_PROVIDERS=github,gitlab \
+TEST_RUNTIME_GITHUB_REPO=https://github.com/<owner>/<repo>.git \
+TEST_RUNTIME_GITHUB_SOURCE=<source> \
+TEST_RUNTIME_GITLAB_REPO=https://gitlab.com/<group>/<repo>.git \
+TEST_RUNTIME_GITLAB_SOURCE=<source> \
+pnpm exec vitest run --project runtime-live tests/runtime/live/git-https-provider.live.test.ts
+```
+
+Each repository is a dedicated private repository. Each `<source>` names an
+existing `runfree credential source` whose token can only read and write that
+repository. The tranche never reads `GH_TOKEN`, `GITLAB_TOKEN`, or `gh auth`.
+`TEST_RUNTIME_GITHUB_LFS_REPO` and `TEST_RUNTIME_GITLAB_LFS_REPO` are optional
+and name a repository with a committed Git LFS object; without them the LFS
+case skips. On GitHub the LFS case proves a download batch is a read with the
+credential; on GitLab, where LFS is not mediated, it proves the download batch
+waits for approval and, once approved, reaches GitLab with no credential and is
+refused there. When the gate names a provider and one of its inputs is
+missing, the run fails. The file header lists every input.
 
 `make test-all` runs every layer in this table plus Docker Compose template
 validation. It requires the Docker CLI and a reachable daemon.

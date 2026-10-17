@@ -16,6 +16,7 @@ import {
 } from "@runfree/runtime-contracts/network-policy";
 import {
   credentialRefsForHost,
+  describeCredentialScope,
   describeRequestRules,
   die,
   type DomainExplainInput,
@@ -110,7 +111,7 @@ export function domainExplainIntent(input: DomainExplainInput): void {
   console.log(`${host} is allowlisted`);
   if (credentialRefs.length > 0) {
     for (const { tokenName, credential } of credentialRefs) {
-      console.log(`credential: ${tokenName} -> ${credential.header} (${credential.scheme})`);
+      console.log(`credential: ${tokenName} -> ${credential.header} ${describeCredentialScope(credential)}`);
     }
   } else {
     console.log("credential: none");

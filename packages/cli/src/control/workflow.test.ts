@@ -188,6 +188,35 @@ describe("quiesced control workflow", () => {
     expect(readControlApprovalSelection(root, context.project)?.subjects["network-project"]?.digest).toBe(selectedBefore);
   });
 
+  test("scoping one of two mappings on a host is not an automatic reduction (host-wide selection)", async () => {
+    const policyPath = path.join(root, ".runfree", "network-policy.json");
+    const policy = (narrow: Record<string, string>) => JSON.stringify({
+      version: 3,
+      hosts: ["github.com"],
+      tokens: {
+        narrow: { description: "narrow", credentials: [{ host: "github.com", header: "Authorization", scheme: "raw", pathPrefix: "/org/", ...narrow }] },
+        broad: { description: "broad", credentials: [{ host: "github.com", header: "Authorization", scheme: "raw" }] },
+      },
+    });
+    fs.writeFileSync(policyPath, policy({}));
+    const first = await captureQuiescedDesiredPolicyCandidate(context, io());
+    await approveNetworkControl(context, io(), "network-project", {
+      expectedDigest: first.projectSubject.digest,
+      mechanism: "interactive",
+    });
+    await approveNetworkControl(context, io(), "network-local", {
+      expectedDigest: first.localSubject.digest,
+      mechanism: "interactive",
+    });
+    const selectedBefore = readControlApprovalSelection(root, context.project)?.subjects["network-project"]?.digest;
+
+    // GET /org/secret-page used to get `narrow`; with `narrow` scoped to git
+    // requests it would get `broad`.
+    fs.writeFileSync(policyPath, policy({ protocol: "git-http" }));
+    await expect(approveAutomaticNetworkReduction(context, io(), "network-project")).rejects.toThrow("not a proven authority reduction");
+    expect(readControlApprovalSelection(root, context.project)?.subjects["network-project"]?.digest).toBe(selectedBefore);
+  });
+
   test("an agent-added host service is widening, not an automatic reduction (SR1)", async () => {
     const first = await captureQuiescedDesiredPolicyCandidate(context, io());
     await approveNetworkControl(context, io(), "network-project", {

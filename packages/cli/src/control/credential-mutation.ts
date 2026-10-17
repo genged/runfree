@@ -5,7 +5,6 @@ import {
 } from "@runfree/runtime-contracts/desired-network-policy";
 import { isReservedRunfreeHostname } from "@runfree/runtime-contracts/host-services";
 import {
-  CREDENTIAL_SCHEMES,
   isTokenName,
   normalizeHostname,
   normalizePathPrefix,
@@ -52,6 +51,15 @@ function normalizeName(name: string): string {
   return name;
 }
 
+// The CLI's own subset of the contract schemes. `basic` needs a username and
+// is reachable only through service definitions, so `--scheme basic` is
+// refused here before any policy write even though the contract accepts it.
+const CLI_CREDENTIAL_SCHEMES = ["bearer", "raw"] as const;
+
+function isCliCredentialScheme(value: string): value is typeof CLI_CREDENTIAL_SCHEMES[number] {
+  return (CLI_CREDENTIAL_SCHEMES as readonly string[]).includes(value);
+}
+
 export function desiredCredentialFromFields(fields: CredentialFieldsInput): CredentialPolicyJson {
   if (!fields.host) throw new CliError("credential commands require --host <host>");
   const host = normalizeHostname(fields.host);
@@ -59,8 +67,8 @@ export function desiredCredentialFromFields(fields: CredentialFieldsInput): Cred
   const header = fields.header ?? "Authorization";
   if (header.trim() === "") throw new CliError("--header must be non-empty");
   const scheme = fields.scheme ?? "bearer";
-  if (scheme !== "bearer" && scheme !== "raw") {
-    throw new CliError(`--scheme must be one of: ${CREDENTIAL_SCHEMES.join(", ")}`);
+  if (!isCliCredentialScheme(scheme)) {
+    throw new CliError(`--scheme must be one of: ${CLI_CREDENTIAL_SCHEMES.join(", ")}`);
   }
   return {
     host,

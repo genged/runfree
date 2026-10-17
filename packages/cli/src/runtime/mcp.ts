@@ -18,6 +18,7 @@ import {
   type OAuthSeedJson,
 } from "@runfree/runtime-contracts/oauth-mediation-policy";
 import {
+  credentialIdentityKey,
   normalizeHostname,
   normalizePathPrefix,
   type CredentialPolicyJson,
@@ -1540,10 +1541,7 @@ function credentialOwner(policy: PolicyJson, credential: CredentialPolicyJson): 
 }
 
 function sameCredential(left: CredentialPolicyJson, right: CredentialPolicyJson): boolean {
-  return left.host === right.host
-    && left.header.toLowerCase() === right.header.toLowerCase()
-    && left.scheme === right.scheme
-    && (left.pathPrefix ?? "") === (right.pathPrefix ?? "");
+  return credentialIdentityKey(left) === credentialIdentityKey(right);
 }
 
 function applyTokenBinding(policy: PolicyJson, tokenConfig: TokenSourceConfig, binding: HeaderTokenBinding, options: { autoTokenSource: boolean }): void {

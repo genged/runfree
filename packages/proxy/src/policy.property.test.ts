@@ -10,6 +10,8 @@ import {
   assertAllowedWebSocketRequest,
   beforeAllowedRequest,
   classifyWrite,
+  GIT_REQUEST_KIND_PROTOCOL,
+  gitHttpRequestKind,
   type PolicyOptions,
   type ProxyRequest,
 } from "./policy.ts";
@@ -447,6 +449,143 @@ describe("proxy policy path confusion properties", () => {
           }
           const expectRead = isSafe || (method === "POST" && rawEndsWithLiteralRpc && decodesWithoutNul);
           expect(classification.write, `${tail.decoration.name} ${method} ${path}`).toBe(!expectRead);
+        },
+      ),
+      propertyParameters(),
+    );
+  });
+
+  // Credential eligibility (gitHttpRequestKind) and write classification must
+  // agree on what a git request is (spec §4.0, §4.2): an eligible receive-pack
+  // is a push, an eligible upload-pack POST is the upload-pack read, an
+  // eligible info/refs is a push exactly when its one service is
+  // git-receive-pack, and no LFS request is a push. Independently of
+  // policy.ts, an eligible request's raw pathname ends with the literal
+  // endpoint, carries no encoded separator or dot, and hides no NUL.
+  it("P1.6: git request eligibility agrees with push and upload-pack classification, the raw literal endpoint, and exactly one protocol", () => {
+    const ENDPOINTS = [
+      "info/refs",
+      "git-upload-pack",
+      "git-receive-pack",
+      "info/lfs/objects/batch",
+      "info/lfs/locks",
+      "info/lfs/locks/verify",
+      "info/lfs/locks/abc-1.2/unlock",
+      "git-upload-pack-not",
+    ] as const;
+    const DECORATIONS = ["", "/", ";x", ".", "%20", "%00/rename", "%2500", "/extra"] as const;
+    const GIT_RULE: RequestPolicyJson = { gitPush: "write" };
+    const requestArb = fc.record({
+      repo: fc.constantFrom([], ["owner"], ["owner", "repo.git"], ["owner", "repo"], ["group", "sub", "repo"]),
+      endpoint: fc.constantFrom(...ENDPOINTS).chain(randomCase),
+      levels: fc.oneof({ weight: 3, arbitrary: fc.constant(0) }, { weight: 1, arbitrary: fc.integer({ min: 1, max: 4 }) }),
+      decoration: fc.oneof({ weight: 3, arbitrary: fc.constant("") }, { weight: 2, arbitrary: fc.constantFrom(...DECORATIONS) }),
+      services: fc.array(serviceValueArb, { maxLength: 3 }),
+      method: fc.constantFrom("GET", "POST", "HEAD", "PUT", "DELETE", "post"),
+    });
+
+    fc.assert(
+      fc.property(requestArb, (request) => {
+        const segments = request.endpoint.split("/");
+        const last = encodeLevels(segments.pop() ?? "", request.levels);
+        const path = `/${[...request.repo, ...segments, `${last}${request.decoration}`].join("/")}`;
+        const query = request.services.map((service) => `service=${encodeLevels(service.text, service.levels)}`).join("&");
+        const url = new URL(`https://${HOST}${path}${query === "" ? "" : `?${query}`}`);
+        const kind = gitHttpRequestKind(request.method, url);
+        const where = `${request.method} ${url.pathname}${url.search} => ${String(kind)}`;
+
+        // git-http and git-lfs are disjoint: with one mapping of each on one
+        // header, a request gets at most one credential, from the protocol
+        // its kind maps to, and a non-git request gets none.
+        const injected = injectedProtocols(request.method, url);
+        // The expected protocol is read off the kind independently of
+        // GIT_REQUEST_KIND_PROTOCOL: the LFS API kinds are git-lfs.
+        const expectedProtocol = kind === undefined ? undefined : kind.startsWith("lfs-") ? "git-lfs" : "git-http";
+        expect(injected, where).toEqual(expectedProtocol === undefined ? [] : [expectedProtocol]);
+        if (kind !== undefined) expect(GIT_REQUEST_KIND_PROTOCOL[kind], where).toBe(expectedProtocol);
+        if (kind === undefined) return;
+
+        const raw = url.pathname.toLowerCase();
+        const literal = kind === "refs" ? "/info/refs"
+          : kind === "upload-pack" ? "/git-upload-pack"
+            : kind === "receive-pack" ? "/git-receive-pack"
+              : kind === "lfs-batch" ? "/info/lfs/objects/batch"
+                : undefined;
+        if (literal !== undefined) expect(raw.endsWith(literal), where).toBe(true);
+        else expect(/\/info\/lfs\/locks(?:\/verify|\/[a-z0-9._-]+\/unlock)?$/u.test(raw), where).toBe(true);
+        expect(/%2e|%2f|%5c/iu.test(raw), where).toBe(false);
+        expect(decodeToFixedPoint(url.pathname).includes("\0"), where).toBe(false);
+        // At least one repository segment before the endpoint.
+        expect(request.repo.length, where).toBeGreaterThan(0);
+
+        const classification = classifyWrite({ method: request.method, url, rule: GIT_RULE });
+        const pushCategory = classification.write && classification.category === "git-push";
+        switch (kind) {
+          case "receive-pack":
+            expect(pushCategory, where).toBe(true);
+            break;
+          case "upload-pack":
+            expect(classification.write, where).toBe(false);
+            break;
+          case "refs":
+            expect(request.method, where).toBe("GET");
+            expect(pushCategory, where).toBe(url.search === "?service=git-receive-pack");
+            expect(classification.write, where).toBe(pushCategory);
+            break;
+          default:
+            expect(pushCategory, where).toBe(false);
+        }
+      }),
+      propertyParameters({ numRuns: 1000 }),
+    );
+  });
+
+  function injectedProtocols(method: string, url: URL): string[] {
+    const mapping = (protocol: "git-http" | "git-lfs") => ({
+      tokenName: protocol,
+      tokenDescription: protocol,
+      host: HOST,
+      header: "Authorization",
+      scheme: "raw" as const,
+      protocol,
+    });
+    const logs: string[] = [];
+    try {
+      beforeAllowedRequest(admissionFor(), { url: url.href, method, headers: {} }, {
+        allowedHosts: [HOST],
+        credentials: { [HOST]: [mapping("git-http"), mapping("git-lfs")] },
+        writeApproval: "allow",
+        tokenReader: (name) => name,
+        log: (line) => logs.push(line),
+      });
+    } catch (error) {
+      // A shape refusal injects nothing; any other error is a test bug.
+      if (!(error instanceof ProxyPolicyDenialError)) throw error;
+    }
+    return logs.flatMap((line) => /using (git-http|git-lfs)$/u.exec(line)?.slice(1) ?? []);
+  }
+
+  it("P1.7: every undecorated §4.2 request with a repository segment is eligible", () => {
+    const ROWS = [
+      { method: "GET", tail: "info/refs?service=git-upload-pack", kind: "refs" },
+      { method: "GET", tail: "info/refs?service=git-receive-pack", kind: "refs" },
+      { method: "POST", tail: "git-upload-pack", kind: "upload-pack" },
+      { method: "POST", tail: "git-receive-pack", kind: "receive-pack" },
+      { method: "POST", tail: "info/lfs/objects/batch", kind: "lfs-batch" },
+      { method: "GET", tail: "info/lfs/locks", kind: "lfs-locks" },
+      { method: "POST", tail: "info/lfs/locks", kind: "lfs-locks" },
+      { method: "POST", tail: "info/lfs/locks/verify", kind: "lfs-locks" },
+      { method: "POST", tail: "info/lfs/locks/Lock_1.a-b/unlock", kind: "lfs-locks" },
+    ] as const;
+    fc.assert(
+      fc.property(
+        fc.array(letterPiece, { minLength: 1, maxLength: 4 }),
+        fc.boolean(),
+        fc.constantFrom(...ROWS),
+        (repo, dotGit, row) => {
+          const repoPath = `/${repo.join("/")}${dotGit ? ".git" : ""}`;
+          const url = new URL(`https://${HOST}${repoPath}/${row.tail}`);
+          expect(gitHttpRequestKind(row.method, url), url.href).toBe(row.kind);
         },
       ),
       propertyParameters(),

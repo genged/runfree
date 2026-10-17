@@ -13,7 +13,13 @@ import {
 } from "./network-policy.js";
 import { isRecord, stableJson, sha256Digest } from "./primitives.js";
 
-export const DESIRED_NETWORK_POLICY_VERSION = 2 as const;
+// Version on need (spec O-4 rule 2): a file that uses no v3 feature is written
+// as version 2 and keeps its v2 digest. Version 3 is required for a `basic`
+// scheme, a `username`, a `protocol`, or two credential mappings for one
+// (host, header) in one validation scope; every one of those an older reader
+// would misread. Readers accept a declared version >= the required one.
+export const DESIRED_NETWORK_POLICY_VERSIONS = [2, 3] as const;
+export type DesiredNetworkPolicyVersion = typeof DESIRED_NETWORK_POLICY_VERSIONS[number];
 const SHA256_PATTERN = /^sha256:[a-f0-9]{64}$/;
 const ENV_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const PARAMETER_KEY_PATTERN = /^[a-z][a-z0-9-]{0,31}$/;
@@ -71,7 +77,7 @@ export type DesiredNetworkPolicyJson = {
   requests?: Record<string, RequestPolicyJson>;
   services?: Record<string, DesiredServiceEntry>;
   tokens?: Record<string, TokenPolicyJson>;
-  version: typeof DESIRED_NETWORK_POLICY_VERSION;
+  version: DesiredNetworkPolicyVersion;
   writeApproval?: WriteAction;
 };
 
@@ -92,6 +98,63 @@ function exactKeys(value: Record<string, unknown>, allowed: readonly string[], p
   }
 }
 
+
+function credentialV3Features(rawTokens: unknown, scope: string): string[] {
+  if (!isRecord(rawTokens)) return [];
+  const features: string[] = [];
+  const owners = new Map<string, string>();
+  for (const [tokenName, token] of Object.entries(rawTokens)) {
+    if (!isRecord(token) || !Array.isArray(token.credentials)) continue;
+    for (const [index, credential] of token.credentials.entries()) {
+      if (!isRecord(credential)) continue;
+      const path = `${scope}tokens.${tokenName}.credentials[${index}]`;
+      if (credential.scheme === "basic") features.push(`${path}.scheme basic`);
+      if (credential.username !== undefined) features.push(`${path}.username`);
+      if (credential.protocol !== undefined) features.push(`${path}.protocol`);
+      if (typeof credential.host !== "string" || typeof credential.header !== "string") continue;
+      const key = `${credential.host}\0${credential.header.toLowerCase()}`;
+      const first = owners.get(key);
+      if (first === undefined) {
+        owners.set(key, path);
+      } else {
+        features.push(`${path} shares (${credential.host}, ${credential.header}) with ${first}`);
+      }
+    }
+  }
+  return features;
+}
+
+/**
+ * The fields of a desired policy, raw or validated, that need version 3. Each
+ * validation scope (direct tokens, and each service's resolved tokens) is
+ * checked on its own, because that is where credential uniqueness applies.
+ */
+export function desiredNetworkPolicyV3Features(raw: unknown): string[] {
+  if (!isRecord(raw)) return [];
+  const features = credentialV3Features(raw.tokens, "");
+  if (isRecord(raw.services)) {
+    for (const [serviceId, service] of Object.entries(raw.services)) {
+      if (!isRecord(service) || !isRecord(service.resolved)) continue;
+      features.push(...credentialV3Features(service.resolved.tokens, `services.${serviceId}.resolved.`));
+    }
+  }
+  return features;
+}
+
+export function requiredDesiredNetworkPolicyVersion(raw: unknown): DesiredNetworkPolicyVersion {
+  return desiredNetworkPolicyV3Features(raw).length > 0 ? 3 : 2;
+}
+
+/**
+ * For in-memory writers that build a candidate from parts: declare the version
+ * the content needs. Never apply this to a file read from disk; a stored file
+ * that declares too low a version must be refused, not upgraded.
+ */
+export function withRequiredDesiredNetworkPolicyVersion<T extends Record<string, unknown>>(
+  policy: T,
+): T & { version: DesiredNetworkPolicyVersion } {
+  return { ...policy, version: requiredDesiredNetworkPolicyVersion(policy) };
+}
 
 function stableUnique(values: readonly string[]): string[] {
   return Array.from(new Set(values)).sort((left, right) => left.localeCompare(right));
@@ -375,7 +438,13 @@ export function validateDesiredNetworkPolicy(raw: unknown): DesiredNetworkPolicy
   const issues: string[] = [];
   if (!isRecord(raw)) throw new DesiredNetworkPolicyValidationError(["policy must be a JSON object"]);
   exactKeys(raw, ["hosts", "hostServices", "requests", "services", "tokens", "version", "writeApproval"], "", issues);
-  if (raw.version !== DESIRED_NETWORK_POLICY_VERSION) issues.push(`version must be ${DESIRED_NETWORK_POLICY_VERSION}`);
+  const v3Features = desiredNetworkPolicyV3Features(raw);
+  const requiredVersion: DesiredNetworkPolicyVersion = v3Features.length > 0 ? 3 : 2;
+  if (raw.version !== 2 && raw.version !== 3) {
+    issues.push(`version must be one of: ${DESIRED_NETWORK_POLICY_VERSIONS.join(", ")}`);
+  } else if (raw.version < requiredVersion) {
+    issues.push(`version ${raw.version} cannot use these fields; declare version ${requiredVersion}: ${v3Features.join("; ")}`);
+  }
   let direct: ReturnType<typeof validateNetworkPolicy> | undefined;
   try {
     direct = validateNetworkPolicy({
@@ -411,7 +480,7 @@ export function validateDesiredNetworkPolicy(raw: unknown): DesiredNetworkPolicy
   }
   if (!direct || issues.length > 0) throw new DesiredNetworkPolicyValidationError(issues);
   return {
-    version: DESIRED_NETWORK_POLICY_VERSION,
+    version: requiredVersion,
     hosts: stableUnique(direct.allowedHosts),
     ...(Object.keys(services).length > 0 ? { services: Object.fromEntries(Object.entries(services).sort()) } : {}),
     ...(Object.keys(direct.requests).length > 0 ? { requests: direct.requests } : {}),

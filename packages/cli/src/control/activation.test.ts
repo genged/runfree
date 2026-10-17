@@ -5,10 +5,12 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
 import { projectInfo } from "../config.ts";
+import { RUNFREE_RUNTIME_COMPONENTS } from "../embedded-assets.generated.ts";
 import { composeProjectName } from "../runtime/env.ts";
 import { projectHash } from "../project-identity.ts";
 import type { RuntimeContext, RuntimeIO } from "../runtime/types.ts";
 import { activateApprovedControlsAfterMutation, withFencedReceiptRead } from "./activation.ts";
+import { activationReportLine } from "./activation-report.ts";
 import {
   approveNetworkCandidate,
   approveRuntimeIsolationControl,
@@ -90,6 +92,7 @@ describe("post-mutation control activation", () => {
     const result = await activateApprovedControlsAfterMutation(context, unusedIo, {
       consumer: {
         running: true,
+        proxyImageInputDigest: RUNFREE_RUNTIME_COMPONENTS.proxyImageInputDigest,
         probe: async () => {
           const active = readActiveControlSelection(context.project);
           if (!active) return {};
@@ -185,6 +188,237 @@ describe("post-mutation control activation", () => {
     expect(readActiveControlSelection(context.project)).toBeUndefined();
   });
 
+  describe("same-build fence (T15)", () => {
+    const embedded = RUNFREE_RUNTIME_COMPONENTS.proxyImageInputDigest;
+    const otherBuild = `sha256:${"0".repeat(64)}`;
+
+    type Snapshot = { bytes: string; mtimeMs: number };
+    function activeSnapshot(): Snapshot {
+      const file = context.project.paths.controlProxyActivePath;
+      return { bytes: fs.readFileSync(file, "utf8"), mtimeMs: fs.statSync(file).mtimeMs };
+    }
+
+    function convergedProbe() {
+      const active = readActiveControlSelection(context.project);
+      if (!active) return {};
+      const generation = verifyEffectivePolicyGeneration(context.project, active.controlGeneration);
+      const receipt = { generation: generation.policyGeneration, controlGeneration: generation.controlGeneration,
+        policyGeneration: generation.policyGeneration };
+      return { requestProxy: receipt, firewall: { ...receipt, rulesetVerified: true } };
+    }
+
+    function liveConsumer(proxyImageInputDigest: string | undefined) {
+      return {
+        running: true,
+        ...(proxyImageInputDigest ? { proxyImageInputDigest } : {}),
+        probe: async () => convergedProbe(),
+        stop: async () => { throw new Error("must not stop"); },
+      };
+    }
+
+    // A previous effective policy generation is selected and a changed one is
+    // approved: activation would write a different active selection.
+    function pendingChange(): Snapshot {
+      approveAll();
+      publishEffectivePolicyGeneration(root, context.project);
+      approveChangedProject(["example.com", "new.example.com"]);
+      // An mtime that a same-millisecond rewrite could not reproduce.
+      fs.utimesSync(context.project.paths.controlProxyActivePath, new Date(1_000_000), new Date(1_000_000));
+      return activeSnapshot();
+    }
+
+    const compatible = () => ({ action: "proxy-restart" as const, services: ["proxy"] });
+
+    test.each([
+      ["differs", otherBuild],
+      ["is missing", undefined],
+    ])("identity %s: the proxy is replaced before the active selection changes", async (_name, identity) => {
+      const before = pendingChange();
+      const consumer = liveConsumer(identity);
+      const events: string[] = [];
+      const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+      try {
+        const result = await activateApprovedControlsAfterMutation(context, unusedIo, {
+          consumer,
+          classifyProxyReplacement: () => { events.push("classify"); return compatible(); },
+          replaceProxy: async () => {
+            events.push("replace");
+            // The policy has not reached the old proxy: same bytes, same mtime.
+            expect(activeSnapshot()).toEqual(before);
+            // The warning came first.
+            expect(errors.mock.calls.flat().join("\n")).toContain("lose network access for up to one heartbeat (30 s) plus adoption");
+            Object.assign(consumer, { proxyImageInputDigest: embedded });
+            return 0;
+          },
+          timeoutMs: 0,
+        });
+        expect(events).toEqual(["classify", "replace"]);
+        expect(result.kind).toBe("converged");
+        expect(activeSnapshot().bytes).not.toBe(before.bytes);
+      } finally {
+        errors.mockRestore();
+      }
+    });
+
+    test.each([
+      ["admission-epoch", "admission epoch"],
+      ["control-plane-topology", "control-plane topology"],
+    ] as const)("an incompatible %s waits: no replacement and no selection write", async (reason, text) => {
+      const before = pendingChange();
+      const replaceProxy = vi.fn(async () => 0);
+      const result = await activateApprovedControlsAfterMutation(context, unusedIo, {
+        consumer: liveConsumer(otherBuild),
+        classifyProxyReplacement: () => ({ action: "blocked-incompatible", reason, services: [] }),
+        replaceProxy,
+      });
+      expect(result).toMatchObject({ kind: "waiting" });
+      expect(result.kind === "waiting" && result.reason).toContain(`incompatible ${text}`);
+      expect(activationReportLine(result)).toMatch(/^effective policy: saved, not applied: .*runfree policy use-approved.*runfree rebuild/);
+      expect(replaceProxy).not.toHaveBeenCalled();
+      expect(activeSnapshot()).toEqual(before);
+    });
+
+    test.each([
+      ["exits non-zero", 1, false, "was not replaced (status 1)"],
+      ["leaves the other build running", 0, false, "left a proxy from another Runfree build running"],
+      ["leaves an unlabeled proxy running", 0, true, "left a proxy from another Runfree build running"],
+    ])("a replacement that %s blocks activation and leaves the selection unchanged", async (_name, status, dropLabel, message) => {
+      const before = pendingChange();
+      const consumer = liveConsumer(otherBuild);
+      vi.spyOn(console, "error").mockImplementation(() => {});
+      await expect(activateApprovedControlsAfterMutation(context, unusedIo, {
+        consumer,
+        classifyProxyReplacement: compatible,
+        replaceProxy: async () => {
+          if (dropLabel) delete (consumer as { proxyImageInputDigest?: string }).proxyImageInputDigest;
+          return status;
+        },
+      })).rejects.toThrow(message);
+      expect(activeSnapshot()).toEqual(before);
+      vi.mocked(console.error).mockRestore();
+    });
+
+    test("invalid component evidence blocks activation without a replacement", async () => {
+      const before = pendingChange();
+      const replaceProxy = vi.fn(async () => 0);
+      await expect(activateApprovedControlsAfterMutation(context, unusedIo, {
+        consumer: liveConsumer(otherBuild),
+        classifyProxyReplacement: () => ({ action: "invalid", reason: "duplicate proxy", services: [] }),
+        replaceProxy,
+      })).rejects.toThrow("component evidence is invalid: duplicate proxy");
+      expect(replaceProxy).not.toHaveBeenCalled();
+      expect(activeSnapshot()).toEqual(before);
+    });
+
+    test("a launch asks to wait: a compatible proxy from another build is not replaced", async () => {
+      const before = pendingChange();
+      const replaceProxy = vi.fn(async () => 0);
+      const result = await activateApprovedControlsAfterMutation(context, unusedIo, {
+        consumer: liveConsumer(otherBuild),
+        classifyProxyReplacement: compatible,
+        proxyFromAnotherBuild: "wait",
+        replaceProxy,
+      });
+      expect(result).toMatchObject({ kind: "waiting" });
+      expect(activationReportLine(result)).toContain("replace the proxy with: runfree up, then apply the change with: runfree policy use-approved");
+      expect(replaceProxy).not.toHaveBeenCalled();
+      expect(activeSnapshot()).toEqual(before);
+    });
+
+    test("a matching identity runs neither classification nor replacement", async () => {
+      pendingChange();
+      const classify = vi.fn(compatible);
+      const replaceProxy = vi.fn(async () => 0);
+      const result = await activateApprovedControlsAfterMutation(context, unusedIo, {
+        consumer: liveConsumer(embedded),
+        classifyProxyReplacement: classify,
+        replaceProxy,
+        timeoutMs: 0,
+      });
+      expect(result.kind).toBe("converged");
+      expect(classify).not.toHaveBeenCalled();
+      expect(replaceProxy).not.toHaveBeenCalled();
+    });
+
+    test("no running proxy is not a mismatch", async () => {
+      pendingChange();
+      const replaceProxy = vi.fn(async () => 0);
+      const result = await activateApprovedControlsAfterMutation(context, unusedIo, {
+        consumer: { running: false, probe: async () => ({}), stop: async () => {} },
+        replaceProxy,
+      });
+      expect(result.kind).toBe("selected");
+      expect(replaceProxy).not.toHaveBeenCalled();
+    });
+
+    test("a proxy from another build that starts after the fence gets the previous selection back", async () => {
+      const before = pendingChange();
+      let reads = 0;
+      const consumer = {
+        running: true,
+        // The fence sees this build; the post-publication discovery does not.
+        get proxyImageInputDigest() { reads += 1; return reads === 1 ? embedded : otherBuild; },
+        probe: async () => convergedProbe(),
+        stop: async () => {},
+      };
+      await expect(activateApprovedControlsAfterMutation(context, unusedIo, { consumer }))
+        .rejects.toThrow("previous effective policy generation is restored");
+      expect(activeSnapshot().bytes).toBe(before.bytes);
+    });
+
+    test("discovery reads the proxy container label, and an unlabeled proxy is another build", async () => {
+      const before = pendingChange();
+      const proxyId = "c".repeat(64);
+      let label = "<no value>";
+      const io: RuntimeIO = { ...unusedIo, capture(_command, args) {
+        if (args[0] === "ps") return { status: 0, stdout: proxyId, stderr: "" };
+        if (args[0] === "container" && args[1] === "inspect" && args[2] === "--format") {
+          expect(args[3]).toContain("io.runfree.proxy-image-input-digest");
+          expect(args[4]).toBe(proxyId);
+          return { status: 0, stdout: [proxyId, "proxy", "2", "<no value>", label, "", "", "img", "true",
+            projectHash(root), composeProjectName(root)].join("\t"), stderr: "" };
+        }
+        if (args[0] === "exec") {
+          const { requestProxy, firewall } = convergedProbe();
+          return { status: 0, stdout: `${JSON.stringify(firewall ?? {})}\n${JSON.stringify(requestProxy ?? {})}\n`, stderr: "" };
+        }
+        throw new Error(`unexpected Docker effect: ${args.join(" ")}`);
+      } };
+      const replaceProxy = vi.fn(async () => {
+        expect(activeSnapshot()).toEqual(before);
+        label = embedded;
+        return 0;
+      });
+      vi.spyOn(console, "error").mockImplementation(() => {});
+      const result = await activateApprovedControlsAfterMutation(context, io, {
+        classifyProxyReplacement: compatible,
+        replaceProxy,
+        timeoutMs: 0,
+      });
+      vi.mocked(console.error).mockRestore();
+      expect(replaceProxy).toHaveBeenCalledOnce();
+      expect(result.kind).toBe("converged");
+    });
+
+    test("an identity row that is not this project's proxy refuses before any replacement", async () => {
+      const before = pendingChange();
+      const proxyId = "c".repeat(64);
+      const io: RuntimeIO = { ...unusedIo, capture(_command, args) {
+        if (args[0] === "ps") return { status: 0, stdout: proxyId, stderr: "" };
+        if (args[0] === "container" && args[1] === "inspect") {
+          return { status: 0, stdout: [proxyId, "proxy", "2", "", embedded, "", "", "img", "true",
+            "someone-else", composeProjectName(root)].join("\t"), stderr: "" };
+        }
+        throw new Error(`unexpected Docker effect: ${args.join(" ")}`);
+      } };
+      const replaceProxy = vi.fn(async () => 0);
+      await expect(activateApprovedControlsAfterMutation(context, io, { classifyProxyReplacement: compatible, replaceProxy }))
+        .rejects.toThrow("malformed or mismatched live proxy identity");
+      expect(replaceProxy).not.toHaveBeenCalled();
+      expect(activeSnapshot()).toEqual(before);
+    });
+  });
+
   test.each([false, true])("containment rechecks a replacement under the lock (already converged: %s)", async (converged) => {
     approveAll();
     publishEffectivePolicyGeneration(root, context.project);
@@ -213,6 +447,12 @@ describe("post-mutation control activation", () => {
         const status = converged && selected ? { generation: selected.policyGeneration,
           controlGeneration: selected.controlGeneration, policyGeneration: selected.policyGeneration, rulesetVerified: true } : {};
         return { status: 0, stdout: `${JSON.stringify(status)}\n${JSON.stringify(status)}\n`, stderr: "" };
+      }
+      if (args[0] === "container" && args[1] === "inspect" && args[2] === "--format") {
+        // The same-build fence reads the identity row of whichever proxy is live.
+        const id = args[4];
+        return { status: 0, stdout: [id, "proxy", "2", "", RUNFREE_RUNTIME_COMPONENTS.proxyImageInputDigest, "", "", "img",
+          "true", projectHash(root), composeProjectName(root)].join("\t"), stderr: "" };
       }
       if (args[0] === "container" && args[1] === "inspect") {
         expect(args[2]).toBe(replacementId);

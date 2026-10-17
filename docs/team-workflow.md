@@ -82,6 +82,11 @@ runfree service diff            # approved semantics vs this CLI's registry
 runfree service diff --apply    # write the reviewed entry after one confirmation
 ```
 
+Some revisions need desired policy version 3 (the `github` revision 3 and
+`gitlab` revision 2 git credentials do). Once one is applied and committed,
+every teammate needs a Runfree release that reads version 3; older releases
+refuse the file with `version must be 2`.
+
 For a bundle Runfree does not curate, define it once and commit it:
 
 ```bash

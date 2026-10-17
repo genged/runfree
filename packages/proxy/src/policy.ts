@@ -9,6 +9,7 @@ import {
   validateNetworkPolicy,
   type CredentialMapping,
   type CredentialPolicy,
+  type CredentialProtocol,
   type HttpMethod,
   type LoadedNetworkPolicy,
   type PolicyJson,
@@ -50,6 +51,10 @@ export type ProxyRequest = {
   // path, absent in synchronous policy checks.
   body?: {
     getText(): Promise<string | undefined>;
+    // The buffered body after content-encoding decoding (undefined when it
+    // cannot be decoded). Optional so synchronous test doubles can omit it;
+    // a classifier that needs it treats absence as unproven.
+    getDecodedBuffer?(): Promise<Buffer | undefined>;
   };
   destination?: {
     hostname?: string;
@@ -82,6 +87,12 @@ export type PolicyOptions = {
   // Per-request body-aware GraphQL verdict (see classifyWrite); precomputed
   // by the async caller because this check is synchronous and body-free.
   graphqlBodyClass?: "read" | "write";
+  // Per-request body-aware Git LFS batch verdict (see lfs-classify.ts),
+  // precomputed by the async caller: "download" means the body was proven a
+  // bounded, unambiguous `"operation": "download"` batch. Only consulted by
+  // classifyWrite for POST …/info/lfs/objects/batch on a gitPush-ruled host
+  // whose policy has an eligible git-lfs mapping (lfsMediatedRequest).
+  lfsBodyClass?: "download";
   // Precomputed by the async server layer: this POST targets an exact,
   // recorded, statically mediated OAuth token or registration endpoint and is
   // protocol-shaped (OAuthMediator.protocolReadEndpoint plus
@@ -233,16 +244,77 @@ export function configuredCredentialHeaderNames(credentials: CredentialPolicy): 
   return names;
 }
 
+// Exhaustive on purpose: a scheme added to the contract must fail to compile
+// here rather than fall through to sending the raw token.
 function formatCredentialValue(mapping: CredentialMapping, token: string): string {
-  if (mapping.scheme === "bearer") return `Bearer ${token}`;
-  return token;
+  switch (mapping.scheme) {
+    case "bearer":
+      return `Bearer ${token}`;
+    case "raw":
+      return token;
+    case "basic": {
+      // Validation guarantees username for basic; refuse rather than send a
+      // header with an empty user-id if that invariant is ever broken.
+      if (mapping.username === undefined) throw new Error(`basic credential ${mapping.tokenName} has no username`);
+      return `Basic ${Buffer.from(`${mapping.username}:${token}`, "utf8").toString("base64")}`;
+    }
+    default: {
+      const unreachable: never = mapping.scheme;
+      throw new Error(`unsupported credential scheme: ${String(unreachable)}`);
+    }
+  }
 }
 
 function requestPath(url: URL): string {
   return url.pathname || "/";
 }
 
-function selectedCredentialMappings(mappings: CredentialMapping[], pathName: string): CredentialMapping[] {
+// A protocol-scoped mapping is eligible for a request when the request's
+// protocol (gitRequestProtocol) is the mapping's protocol and the mapping's
+// pathPrefix, if any, matches. Each git request kind maps to exactly one
+// protocol, so a request is eligible for at most one protocol.
+function protocolMappingIsEligible(
+  mapping: CredentialMapping,
+  pathName: string,
+  requestProtocol: () => CredentialProtocol | undefined,
+): boolean {
+  if (mapping.protocol === undefined) return false;
+  if (mapping.pathPrefix !== undefined && !pathMatchesPrefix(pathName, mapping.pathPrefix)) return false;
+  switch (mapping.protocol) {
+    case "git-http":
+    case "git-lfs":
+      return requestProtocol() === mapping.protocol;
+    default: {
+      // A protocol added to the contract without a matcher here must fail
+      // to compile; at runtime an unknown value is never eligible.
+      const unknownProtocol: never = mapping.protocol;
+      void unknownProtocol;
+      return false;
+    }
+  }
+}
+
+// Selection is host-wide (one pass over every mapping of the host, whatever
+// its header), in three steps:
+//   (a) drop protocol-ineligible mappings (protocolMappingIsEligible): a
+//       `git-http` mapping is eligible only on git smart-HTTP requests and a
+//       `git-lfs` mapping only on Git LFS API requests;
+//   (b) if any eligible mapping is protocol-scoped, keep only the
+//       protocol-scoped ones (the protocol tier ranks above prefix length);
+//   (c) the longest-pathPrefix rule, with unscoped-by-path mappings as the
+//       fallback when no prefix matches.
+// Validation allows at most one mapping per (host, header, protocol) and
+// unique (protocol, pathPrefix) pairs, and the protocols' request sets are
+// disjoint, so at most one mapping per header survives.
+function selectedCredentialMappings(allMappings: CredentialMapping[], method: string, url: URL): CredentialMapping[] {
+  const pathName = requestPath(url);
+  const requestProtocol = lazyGitRequestProtocol(method, url);
+  const eligible = allMappings.filter((mapping) => {
+    if (mapping.protocol === undefined) return true;
+    return protocolMappingIsEligible(mapping, pathName, requestProtocol);
+  });
+  const protocolScoped = eligible.filter((mapping) => mapping.protocol !== undefined);
+  const mappings = protocolScoped.length > 0 ? protocolScoped : eligible;
   const scopedMatches = mappings.filter((mapping) => {
     return mapping.pathPrefix !== undefined && pathMatchesPrefix(pathName, mapping.pathPrefix);
   });
@@ -380,11 +452,23 @@ function isGitPushPath(url: URL, pathName: string): boolean {
   const last = segments.at(-1);
   if (last === "git-receive-pack") return true;
   // Capability-probe form: GET .../info/refs?service=git-receive-pack. Every
-  // `service` value counts, since an origin may read the last one.
+  // `service` value counts, since an origin may read the last one, and so
+  // does every parameter whose decoded, case-folded name is `service` (the
+  // same set hasSingleLiteralGitService counts). A `;` anywhere in the query
+  // is a push: an origin that also splits on `;` (Python's parse_qs before
+  // 3.10, Perl CGI) may read a `service` this `&` split never sees, and a git
+  // client never sends one, so failing closed costs real git nothing.
   if (last === "refs" && segments.at(-2) === "info") {
-    return url.searchParams.getAll("service").some((service) => {
-      const decoded = decodeToConvergence(service);
-      return decoded === undefined || decoded.toLowerCase() === "git-receive-pack";
+    const query = url.search.startsWith("?") ? url.search.slice(1) : url.search;
+    if (query.includes(";")) return true;
+    return query.split("&").some((pair) => {
+      if (pair === "") return false;
+      const separator = pair.indexOf("=");
+      const name = decodeToConvergence((separator === -1 ? pair : pair.slice(0, separator)).replaceAll("+", " "));
+      if (name === undefined) return true;
+      if (name.trim().toLowerCase() !== "service") return false;
+      const value = decodeToConvergence((separator === -1 ? "" : pair.slice(separator + 1)).replaceAll("+", " "));
+      return value === undefined || value.trim().toLowerCase() === "git-receive-pack";
     });
   }
   return false;
@@ -403,38 +487,182 @@ function hasMethodOverrideHeader(headers: Record<string, string | string[] | und
   return Object.keys(headers).some((key) => METHOD_OVERRIDE_HEADERS.has(key.toLowerCase()));
 }
 
-// Read-side counterpart of isGitPushPath: git fetch negotiation
-// (upload-pack). Only consulted for hosts that explicitly declare git
-// handling via a `gitPush` rule, and only for the RPC itself: the exemption
-// is POST-only (GET is already safe, and no non-GET info/refs request is a
-// git read, so that capability-probe form is not matched here at all).
+// --- git smart HTTP / Git LFS request recognition (`git-http`, `git-lfs`) ---
 //
-// This is the one git-path check that must agree with the routing origin
-// about where the path ends, not just what it decodes to:
-// `canonicalPathSegments` truncates at the first NUL, so on its own a NUL
-// placed after the RPC name would hide a real trailing segment (an origin
-// that does not truncate there keeps routing past it) and it normalizes away
-// a trailing `/`, `;param`, `.`, or decoded whitespace, so a decorated
-// spelling would canonicalize to the same name as the exact RPC. So the
-// exemption only fires when every one of these holds: the path decodes to
-// convergence with no NUL anywhere in the result; its canonical last segment
-// (via segmentsFromDecodedPath, the same normalization isGitPushPath uses
-// through canonicalPathSegments — reused directly here on the
-// already-decoded string so the path is not decoded to convergence twice) is
-// "git-upload-pack"; and — the check with no decoding or normalization at
-// all — the raw, merely lower-cased pathName itself ends with the literal
-// suffix "/git-upload-pack". A real git client's upload-pack request already
-// is that exact literal path, so this costs it nothing; it only refuses
-// every encoded, decorated, or NUL-hiding variant that could make the proxy
-// and an origin disagree. Malformed or non-converging encoding, or any check
-// that does not hold, fails closed by NOT matching (the request then falls
-// through to the conservative write classification).
-function isGitUploadPackRead(method: string, pathName: string): boolean {
-  if (method !== "POST") return false;
+// Decides whether a request is one of the git smart-HTTP requests a
+// `protocol: "git-http"` credential may be attached to, or one of the Git LFS
+// API requests a `protocol: "git-lfs"` credential may be attached to
+// (GIT_REQUEST_KIND_PROTOCOL). The recognized shapes, each requiring at least
+// one repository segment before the suffix (so `/info/refs` alone is not a git
+// request):
+//
+//   git-http  refs         GET  …/info/refs?service=git-upload-pack|git-receive-pack
+//             upload-pack  POST …/git-upload-pack
+//             receive-pack POST …/git-receive-pack
+//   git-lfs   lfs-batch    POST …/info/lfs/objects/batch
+//             lfs-locks    GET  …/info/lfs/locks
+//                          POST …/info/lfs/locks
+//                          POST …/info/lfs/locks/verify
+//                          POST …/info/lfs/locks/<id>/unlock   (raw id ^[A-Za-z0-9._-]+$)
+//
+// Methods are compared exactly (uppercase); HEAD, OPTIONS, and every other
+// method are not eligible on any row (a git client never sends them, and the
+// §4.2 table does not list them). It requires raw/decoded agreement: the
+// path decodes to convergence with no NUL (a NUL would let
+// segmentsFromDecodedPath hide a trailing segment an origin keeps routing
+// past), carries
+// no path confusion (encoded or literal separators, `..`), its canonical
+// segments end with the endpoint, AND the raw lower-cased path's own trailing
+// segments are literally the endpoint — so an encoded, `;param`-decorated,
+// trailing-`/`, trailing-`.` or NUL-hidden spelling is not a git request and
+// gets no credential. A path whose first canonical segment is `api`, or with
+// a `-` canonical segment, is never a git request: GitLab serves its REST API
+// under `/api/` and non-git routes after `/-/`, where a last segment can be a
+// user-chosen name (`/api/v4/projects/<id>/repository/files/git-upload-pack`
+// is the file API). That also excludes a github.com owner named `api`, on
+// purpose: fail closed rather than guess per provider. isGitPushPath does not
+// use this matcher, so those paths still count as pushes. The `info/refs` form needs exactly one query parameter
+// whose (decoded, case-folded) name is `service`, spelled literally
+// `service=<value>` in the raw query. Every POST form needs an empty query:
+// git's remote-curl posts to `<remote>/git-upload-pack|git-receive-pack`
+// and git-lfs posts batch and lock requests with their parameters in the
+// JSON body, while an origin that merges query parameters over body
+// parameters (Rails, so GitLab) would act on a query the proxy never read
+// (e.g. `objects/batch?operation=upload` with a download body). Only the GET
+// lock listing takes a query (git-lfs sends its path/id/cursor/limit/refspec
+// filters there). Anything not recognized returns
+// undefined: no credential, and write classification is unaffected.
+export type GitHttpRequestKind = "refs" | "upload-pack" | "receive-pack" | "lfs-batch" | "lfs-locks";
+
+// The credential protocol of each recognized git request kind. One matcher,
+// one protocol per kind: git smart HTTP is `git-http`, the Git LFS batch and
+// locks API is `git-lfs`, so the two protocols' request sets are disjoint by
+// construction.
+export const GIT_REQUEST_KIND_PROTOCOL: Readonly<Record<GitHttpRequestKind, CredentialProtocol>> = {
+  refs: "git-http",
+  "upload-pack": "git-http",
+  "receive-pack": "git-http",
+  "lfs-batch": "git-lfs",
+  "lfs-locks": "git-lfs",
+};
+
+export function gitRequestProtocol(method: string, url: URL): CredentialProtocol | undefined {
+  const kind = gitHttpRequestKind(method, url);
+  return kind === undefined ? undefined : GIT_REQUEST_KIND_PROTOCOL[kind];
+}
+
+function lazyGitRequestProtocol(method: string, url: URL): () => CredentialProtocol | undefined {
+  let computed = false;
+  let protocol: CredentialProtocol | undefined;
+  return () => {
+    if (!computed) {
+      protocol = gitRequestProtocol(method, url);
+      computed = true;
+    }
+    return protocol;
+  };
+}
+
+// The host's policy opts a request into Git LFS mediation when one of the
+// host's mappings has `protocol: "git-lfs"` and is eligible for the request
+// (it is a Git LFS API request under the mapping's pathPrefix, if any). Only
+// then may an LFS download batch classify as a read: on a host without one
+// (gitlab.com, whose batch response for a user carries a project-wide LFS
+// token that can push) the batch stays a write.
+export function lfsMediatedRequest(mappings: readonly CredentialMapping[] | undefined, method: string, url: URL): boolean {
+  if (mappings === undefined || !mappings.some((mapping) => mapping.protocol === "git-lfs")) return false;
+  const pathName = requestPath(url);
+  const requestProtocol = lazyGitRequestProtocol(method, url);
+  return mappings.some((mapping) => mapping.protocol === "git-lfs" && protocolMappingIsEligible(mapping, pathName, requestProtocol));
+}
+
+// Placeholder in an endpoint suffix for the LFS lock id segment.
+const GIT_LFS_LOCK_ID = Symbol("lock-id");
+const GIT_LFS_LOCK_ID_RE = /^[A-Za-z0-9._-]+$/u;
+const GIT_REFS_SERVICES = new Set(["git-upload-pack", "git-receive-pack"]);
+
+// What the query may carry: `service` is the info/refs rule
+// (hasSingleLiteralGitService); `none` means url.search is empty; `any` is
+// only the GET lock listing, whose filters git-lfs sends as query parameters.
+type GitHttpEndpoint = {
+  kind: GitHttpRequestKind;
+  method: "GET" | "POST";
+  suffix: ReadonlyArray<string | typeof GIT_LFS_LOCK_ID>;
+  query: "service" | "none" | "any";
+};
+
+const GIT_HTTP_ENDPOINTS: readonly GitHttpEndpoint[] = [
+  { kind: "refs", method: "GET", suffix: ["info", "refs"], query: "service" },
+  { kind: "upload-pack", method: "POST", suffix: ["git-upload-pack"], query: "none" },
+  { kind: "receive-pack", method: "POST", suffix: ["git-receive-pack"], query: "none" },
+  { kind: "lfs-batch", method: "POST", suffix: ["info", "lfs", "objects", "batch"], query: "none" },
+  { kind: "lfs-locks", method: "GET", suffix: ["info", "lfs", "locks"], query: "any" },
+  { kind: "lfs-locks", method: "POST", suffix: ["info", "lfs", "locks"], query: "none" },
+  { kind: "lfs-locks", method: "POST", suffix: ["info", "lfs", "locks", "verify"], query: "none" },
+  { kind: "lfs-locks", method: "POST", suffix: ["info", "lfs", "locks", GIT_LFS_LOCK_ID, "unlock"], query: "none" },
+];
+
+// Exactly one query parameter names `service` (after decoding and ASCII case
+// folding, so a `%73ervice` or `Service` duplicate an origin might read is
+// counted), and that one is spelled raw as `service=git-upload-pack` or
+// `service=git-receive-pack`. Malformed encoding in any name, or any `;` in
+// the query, fails closed.
+function hasSingleLiteralGitService(url: URL): boolean {
+  const query = url.search.startsWith("?") ? url.search.slice(1) : url.search;
+  // A `;` may split the query for some origins (see isGitPushPath).
+  if (query === "" || query.includes(";")) return false;
+  let literal = 0;
+  let named = 0;
+  for (const pair of query.split("&")) {
+    if (pair === "") continue;
+    const separator = pair.indexOf("=");
+    const rawName = separator === -1 ? pair : pair.slice(0, separator);
+    const decodedName = decodeToConvergence(rawName.replaceAll("+", " "));
+    if (decodedName === undefined) return false;
+    if (decodedName.trim().toLowerCase() !== "service") continue;
+    named += 1;
+    if (rawName === "service" && separator !== -1 && GIT_REFS_SERVICES.has(pair.slice(separator + 1))) literal += 1;
+  }
+  return named === 1 && literal === 1;
+}
+
+export function gitHttpRequestKind(method: string, url: URL): GitHttpRequestKind | undefined {
+  const pathName = requestPath(url);
+  if (hasPathConfusion(pathName)) return undefined;
   const decoded = decodeToConvergence(pathName);
-  if (decoded === undefined || decoded.includes("\0")) return false;
-  if (segmentsFromDecodedPath(decoded).at(-1) !== "git-upload-pack") return false;
-  return pathName.toLowerCase().endsWith("/git-upload-pack");
+  if (decoded === undefined || decoded.includes("\0")) return undefined;
+  // A segment with leading whitespace is refused outright: canonical
+  // segments trim only trailing whitespace, and an origin that trims both
+  // ends may route ` api` (or ` repo`) differently than this matcher reads it.
+  if (decoded.split("/").some((segment) => /^\s/u.test(segment))) return undefined;
+  const canonical = segmentsFromDecodedPath(decoded);
+  // No endpoint suffix contains `api` first or a `-` segment, so this is
+  // the same as checking the segments before the suffix. The first segment
+  // is trimmed of dots and whitespace at both ends, so `.api` is `api` too.
+  if (canonical[0]?.replace(/^[.\s]+/u, "") === "api" || canonical.includes("-")) return undefined;
+  const rawSegments = pathName.split("/");
+  for (const endpoint of GIT_HTTP_ENDPOINTS) {
+    if (endpoint.method !== method) continue;
+    const length = endpoint.suffix.length;
+    // At least one repository segment before the endpoint suffix.
+    if (canonical.length <= length || rawSegments.length <= length + 1) continue;
+    const rawTail = rawSegments.slice(-length);
+    const canonicalTail = canonical.slice(-length);
+    const matches = endpoint.suffix.every((expected, index) => {
+      const raw = rawTail[index];
+      if (expected === GIT_LFS_LOCK_ID) {
+        // Unreserved characters only, so the raw id needs no decoding, and
+        // the canonical form must not have altered it (e.g. trailing dots).
+        return GIT_LFS_LOCK_ID_RE.test(raw) && canonicalTail[index] === raw.toLowerCase();
+      }
+      return raw.toLowerCase() === expected && canonicalTail[index] === expected;
+    });
+    if (!matches) continue;
+    if (endpoint.query === "service" && !hasSingleLiteralGitService(url)) return undefined;
+    if (endpoint.query === "none" && url.search !== "") return undefined;
+    return endpoint.kind;
+  }
+  return undefined;
 }
 
 export type WriteClassification = { write: false } | { write: true; category: WriteCategory };
@@ -452,6 +680,11 @@ export function classifyWrite(input: {
   // See PolicyOptions.oauthProtocolRead; assertWriteAllowed passes it only
   // for an `ask` host.
   oauthProtocolRead?: boolean;
+  // See PolicyOptions.lfsBodyClass. Absent means unproven => write.
+  lfsBodyClass?: "download";
+  // lfsMediatedRequest for this request: the host's policy has an eligible
+  // git-lfs mapping. Absent means no => an LFS batch stays a write.
+  lfsMediated?: boolean;
 }): WriteClassification {
   // A wss:// upgrade is an opaque live channel the proxy cannot inspect
   // frame-by-frame, so the whole connection classifies as a write (HIGH-2).
@@ -500,7 +733,26 @@ export function classifyWrite(input: {
       && rule.readPathPrefixes.some((prefix) => pathMatchesPrefix(pathName, prefix))) {
       return { write: false };
     }
-    if (rule?.gitPush !== undefined && isGitUploadPackRead(input.method, pathName)) {
+    // git fetch negotiation (upload-pack) on a host that declares git
+    // handling. It uses the shared matcher, so only the exact POST RPC path a
+    // git client sends is a read: no encoded, decorated, NUL-hiding, or
+    // query-carrying spelling, and no `api` or `-` route (see
+    // gitHttpRequestKind). Push detection stays the separate, looser
+    // isGitPushPath, which runs first.
+    if (rule?.gitPush !== undefined && gitHttpRequestKind(input.method, input.url) === "upload-pack") {
+      return { write: false };
+    }
+    // A Git LFS batch request proven by its body to be a download. Same host
+    // gate as the upload-pack exemption (the host declares git handling),
+    // plus the host's policy must opt into LFS mediation with a git-lfs
+    // mapping eligible for the request (lfsMediatedRequest); the request must
+    // be exactly POST on the canonical batch endpoint with an empty query
+    // (gitHttpRequestKind), so a Rails origin cannot read an
+    // `?operation=upload` the body classifier never saw. An upload
+    // batch, an unproven body, a host without a git-lfs mapping, and every
+    // lock request stay writes.
+    if (rule?.gitPush !== undefined && input.method === "POST" && input.lfsBodyClass === "download"
+      && input.lfsMediated === true && gitHttpRequestKind(input.method, input.url) === "lfs-batch") {
       return { write: false };
     }
   }
@@ -519,6 +771,8 @@ function assertWriteAllowed(input: {
   headers?: Record<string, string | string[] | undefined>;
   webSocket?: boolean;
   graphqlBodyClass?: "read" | "write";
+  lfsBodyClass?: "download";
+  lfsMediated?: boolean;
   oauthProtocolRead?: boolean;
   oauthUnlistedClientIdUrl?: boolean;
   hasWriteGrant?: PolicyOptions["hasWriteGrant"];
@@ -667,6 +921,8 @@ function assertAllowedRequestShape(
 // revalidate a held write when a decision arrives and on policy generation
 // changes — "ask" means the hold may still resolve, "denied" cancels it
 // fail-closed, "allowed" means the policy loosened and the request may flow.
+// It is body-free: no GraphQL or LFS body verdict is passed, so a held GraphQL
+// or LFS batch request revalidates as the write it was held as.
 export function evaluateRequestWriteAsk(
   admission: AdmissionRecord,
   req: ProxyRequest,
@@ -822,6 +1078,8 @@ export function beforeAllowedRequest(admission: AdmissionRecord, req: ProxyReque
     writeAction,
     headers: req.headers,
     graphqlBodyClass: options.graphqlBodyClass,
+    lfsBodyClass: options.lfsBodyClass,
+    lfsMediated: options.lfsBodyClass === "download" && lfsMediatedRequest(credentials[host], req.method ?? "GET", url),
     oauthProtocolRead: options.oauthProtocolRead,
     oauthUnlistedClientIdUrl: options.oauthUnlistedClientIdUrl,
     hasWriteGrant: options.hasWriteGrant,
@@ -858,7 +1116,7 @@ export function beforeAllowedRequest(admission: AdmissionRecord, req: ProxyReque
     }
   }
 
-  const selectedMappings = selectedCredentialMappings(mappings, requestPath(url));
+  const selectedMappings = selectedCredentialMappings(mappings, req.method ?? "GET", url);
   const touchedHeaders = new Set<string>();
   const touchedTokenNames = new Set<string>();
   let injectedCredential = false;

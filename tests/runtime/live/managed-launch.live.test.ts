@@ -5,8 +5,10 @@
 // Runfree MCP argv, `mcp auth` uses that same adapter, a customized agent is
 // refused with the exact D-3 guidance before any Docker effect, the session can
 // author desired control input but never sees a trusted `agent.env`, the inbox
-// is delivered read-only from outside the project, and the project MCP file is
-// visible and survives branch changes without startup recreating it.
+// is delivered read-only from outside the project, the project MCP file is
+// visible and survives branch changes without startup recreating it, and that
+// the sandbox gitconfig rewrites SSH remotes to HTTPS inside a session while
+// the host `.git/config` stays byte-identical (git over HTTPS mediation, L4).
 //
 // The exec-based probes inspect a held session. One-shot launches (`mcp auth`,
 // the D-3 refusal) run after it ends, with the stand-in's hold marker removed
@@ -300,6 +302,76 @@ describe("managed built-in launch", () => {
       expect(fs.existsSync(mcpPath), "runtime startup recreated a removed project MCP file").toBe(false);
       git(fixture.projectRoot, ["checkout", "main"]);
       expect(fs.existsSync(mcpPath), "the main branch lost its project MCP file").toBe(true);
+    }, TEST_TIMEOUT_MS);
+  });
+
+  // L4 (git over HTTPS credential mediation): the sandbox gitconfig rewrites
+  // supported SSH remotes to HTTPS inside the session only. The repository's
+  // own `.git/config` keeps the SSH URL, and nothing in a session that does not
+  // run `git remote set-url` writes it. `--get-url` and `get-url` are local, so
+  // no network or provider credential is involved. The container's git version
+  // is printed for the record: the rendered rewrite blocks were characterized
+  // against host git 2.53.0, and this case is what confirms the image's git
+  // resolves them the same way.
+  describe("SSH remote rewriting inside a session", () => {
+    const remotes = Object.freeze({
+      origin: { ssh: "git@github.com:runfree-test/does-not-exist.git", https: "https://github.com/runfree-test/does-not-exist.git" },
+      "gitlab-port": { ssh: "ssh://git@gitlab.com:22/runfree-test/does-not-exist.git", https: "https://gitlab.com/runfree-test/does-not-exist.git" },
+    });
+    let gitConfigPath: string;
+    let gitConfigBefore: Buffer;
+    let standing: StandingSessionHandle | undefined;
+    let sessionId: string;
+
+    beforeAll(async () => {
+      for (const [name, remote] of Object.entries(remotes)) git(fixture.projectRoot, ["remote", "add", name, remote.ssh]);
+      gitConfigPath = path.join(fixture.projectRoot, ".git", "config");
+      gitConfigBefore = fs.readFileSync(gitConfigPath);
+      standing = await startStandingSession(fixture);
+      sessionId = standing.session.containerId;
+    }, PROVISION_TIMEOUT_MS);
+
+    afterAll(async () => {
+      try {
+        if (standing) await standing.release();
+      } finally {
+        for (const name of Object.keys(remotes)) {
+          childProcess.spawnSync("git", ["-C", fixture.projectRoot, "remote", "remove", name], { encoding: "utf8" });
+        }
+      }
+    }, PROVISION_TIMEOUT_MS);
+
+    test("the session resolves SSH remotes to HTTPS while the host .git/config stays byte-identical", async () => {
+      const probe = sessionExec(sessionId, `
+        set -euo pipefail
+        cd /workspace
+        printf 'container-git: %s\\n' "$(git --version)"
+        git remote -v | sed 's/^/remote-v: /'
+        for name in origin gitlab-port; do
+          printf 'get-url %s: %s\\n' "$name" "$(git ls-remote --get-url "$name")"
+          printf 'push-url %s: %s\\n' "$name" "$(git remote get-url --push "$name")"
+        done
+      `);
+      expect(probe.status, `git remote probe failed: ${describeOutput(probe.output)}`).toBe(0);
+      const version = probe.stdout.split("\n").find((line) => line.startsWith("container-git: "))?.slice("container-git: ".length) ?? "";
+      expect(version, `the container did not report its git version: ${describeOutput(probe.output)}`).toMatch(/^git version \d+\.\d+/u);
+      console.log(`managed launch L4: ${version} (rewrite blocks characterized against host git 2.53.0)`);
+      for (const [name, remote] of Object.entries(remotes)) {
+        expect(probe.stdout, `ls-remote --get-url ${name} was not rewritten`).toContain(`get-url ${name}: ${remote.https}\n`);
+        expect(probe.stdout, `get-url --push ${name} was not rewritten`).toContain(`push-url ${name}: ${remote.https}\n`);
+        expect(probe.stdout, `git remote -v fetch ${name} was not rewritten`).toContain(`remote-v: ${name}\t${remote.https} (fetch)`);
+        expect(probe.stdout, `git remote -v push ${name} was not rewritten`).toContain(`remote-v: ${name}\t${remote.https} (push)`);
+      }
+      expect(probe.stdout, "an SSH URL survived inside the session").not.toMatch(/git@(?:github|gitlab)\.com/u);
+
+      const session = standing;
+      standing = undefined;
+      await session?.release();
+      const gitConfigAfter = fs.readFileSync(gitConfigPath);
+      expect(gitConfigAfter.equals(gitConfigBefore), "the session changed the host .git/config bytes").toBe(true);
+      for (const remote of Object.values(remotes)) {
+        expect(gitConfigAfter.toString("utf8"), "the host .git/config lost the SSH remote").toContain(remote.ssh);
+      }
     }, TEST_TIMEOUT_MS);
   });
 });
