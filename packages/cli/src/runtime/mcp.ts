@@ -1529,9 +1529,13 @@ function ensureDomain(policy: PolicyJson, host: string): void {
   }
 }
 
+// A protocol-scoped mapping (git-http, git-lfs) applies only to git requests,
+// and MCP traffic is never one, so it cannot serve an MCP binding. The MCP
+// mapping is added beside it as its own unscoped mapping instead.
 function credentialOwner(policy: PolicyJson, credential: CredentialPolicyJson): string | undefined {
   for (const [tokenName, tokenPolicy] of Object.entries(policy.tokens ?? {})) {
     for (const existing of tokenPolicy.credentials) {
+      if (existing.protocol !== undefined) continue;
       if (existing.host === credential.host && existing.header.toLowerCase() === credential.header.toLowerCase()) {
         return tokenName;
       }
