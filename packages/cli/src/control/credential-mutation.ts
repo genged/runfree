@@ -156,6 +156,12 @@ export function reconcileDesiredCredential(
     if (!existing) throw new CliError(`unknown project credential: ${name}`);
     if (mutation.kind === "link") {
       const identity = credentialIdentity(mutation.credential);
+      // The exact destination already linked is the unchanged no-op, whatever
+      // other tokens hold on that host and header; the cross-token refusal
+      // below is only for an actual addition.
+      if (existing.credentials.some((entry) => credentialIdentity(entry) === identity && sameDestination(entry, mutation.credential))) {
+        return { changed: false, name, policy };
+      }
       for (const [otherName, token] of Object.entries(policy.tokens)) {
         const linked = token.credentials.find((entry) => credentialIdentity(entry) === identity);
         if (!linked) continue;

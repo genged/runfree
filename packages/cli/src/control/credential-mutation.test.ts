@@ -206,6 +206,30 @@ describe("desired credential mutations", () => {
       expect(snapshot()).toEqual(before);
     });
 
+    test("link of an exact destination is unchanged even when another token owns the host and header at another path", async () => {
+      const file = context.project.paths.policyPath;
+      fs.writeFileSync(file, `${JSON.stringify({ version: 3, hosts: ["git.example.com"], tokens: {
+        a: { description: "A token", credentials: [scoped("/a")] },
+        b: { description: "B token", credentials: [scoped("/b")] },
+      } })}\n`);
+      const candidate = captureDesiredPolicyCandidate(root, context.project.paths.controlCandidatesDir);
+      approveNetworkCandidate(root, context.project, candidate, "network-project", "interactive");
+      approveNetworkCandidate(root, context.project, candidate, "network-local", "interactive");
+      fs.utimesSync(file, new Date(1_000_000), new Date(1_000_000));
+      const before = snapshot();
+
+      const exact = desiredCredentialFromFields({ host: "git.example.com", pathPrefix: "/a" });
+      const result = await mutateDesiredCredential(context, io, { kind: "link", name: "a", credential: exact });
+      expect(result.changed).toBe(false);
+      expect(snapshot().bytes).toBe(before.bytes);
+
+      // An actual addition on that host and header still names the other token.
+      const added = desiredCredentialFromFields({ host: "git.example.com", pathPrefix: "/c" });
+      await expect(mutateDesiredCredential(context, io, { kind: "link", name: "a", credential: added }))
+        .rejects.toThrow("git.example.com Authorization is already credentialed by token b");
+      expect(snapshot()).toEqual(before);
+    });
+
     test.each(["add", "link"] as const)("%s of a destination already present is unchanged", async (kind) => {
       const before = approvedPolicy([scoped("/a"), scoped("/b")]);
       const credential = desiredCredentialFromFields({ host: "git.example.com", pathPrefix: "/b" });
