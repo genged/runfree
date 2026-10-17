@@ -21,6 +21,7 @@ import {
   credentialIdentityKey,
   normalizeHostname,
   normalizePathPrefix,
+  pathMatchesPrefix,
   type CredentialPolicyJson,
   type PolicyJson,
 } from "@runfree/runtime-contracts/network-policy";
@@ -1529,19 +1530,34 @@ function ensureDomain(policy: PolicyJson, host: string): void {
   }
 }
 
-// A protocol-scoped mapping (git-http, git-lfs) applies only to git requests,
-// and MCP traffic is never one, so it cannot serve an MCP binding. The MCP
-// mapping is added beside it as its own unscoped mapping instead.
+// The token the proxy would already inject on the MCP endpoint, or undefined.
+// This follows the proxy's host-wide selection (packages/proxy/src/policy.ts,
+// selectedCredentialMappings) for a request to the endpoint path:
+//   - a protocol-scoped mapping (git-http, git-lfs) applies only to git
+//     requests, and MCP traffic is never one, so it is never selected;
+//   - of the rest, the longest pathPrefix that matches the path wins, using
+//     the contract's boundary-aware pathMatchesPrefix; unscoped-by-path
+//     mappings apply only when no prefix matches.
+// A selected mapping with the binding's header owns it. A mapping with the
+// binding's exact scope owns it too even when not selected, because a second
+// one would conflict in validation. Otherwise the MCP mapping is added; at
+// its own path it is then the longest match, so it never ties.
 function credentialOwner(policy: PolicyJson, credential: CredentialPolicyJson): string | undefined {
-  for (const [tokenName, tokenPolicy] of Object.entries(policy.tokens ?? {})) {
-    for (const existing of tokenPolicy.credentials) {
-      if (existing.protocol !== undefined) continue;
-      if (existing.host === credential.host && existing.header.toLowerCase() === credential.header.toLowerCase()) {
-        return tokenName;
-      }
-    }
-  }
-  return undefined;
+  const endpointPath = credential.pathPrefix ?? "/";
+  const sameHeader = (existing: CredentialPolicyJson) => existing.header.toLowerCase() === credential.header.toLowerCase();
+  const candidates = Object.entries(policy.tokens ?? {}).flatMap(([tokenName, tokenPolicy]) =>
+    tokenPolicy.credentials
+      .filter((existing) => existing.protocol === undefined && existing.host === credential.host)
+      .map((existing) => ({ tokenName, existing })));
+  const exactScope = candidates.find(({ existing }) => sameHeader(existing) && existing.pathPrefix === credential.pathPrefix);
+  if (exactScope) return exactScope.tokenName;
+  const scopedMatches = candidates.filter(({ existing }) =>
+    existing.pathPrefix !== undefined && pathMatchesPrefix(endpointPath, existing.pathPrefix));
+  const longest = Math.max(...scopedMatches.map(({ existing }) => existing.pathPrefix?.length ?? 0));
+  const selected = scopedMatches.length > 0
+    ? scopedMatches.filter(({ existing }) => existing.pathPrefix?.length === longest)
+    : candidates.filter(({ existing }) => existing.pathPrefix === undefined);
+  return selected.find(({ existing }) => sameHeader(existing))?.tokenName;
 }
 
 function sameCredential(left: CredentialPolicyJson, right: CredentialPolicyJson): boolean {

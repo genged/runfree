@@ -30,6 +30,39 @@ function githubServicePolicy(): PolicyJson {
   };
 }
 
+function injectedAuthorization(policy: PolicyJson, tokens: Record<string, string>, method: string, url: string) {
+  const loaded = validateNetworkPolicy(policy);
+  const req: ProxyRequest = { method, url, headers: { Authorization: "Bearer agent-placeholder" } };
+  const mutation = beforeAllowedRequest({
+    v: 1,
+    host: new URL(url).hostname,
+    port: 443,
+    policyGeneration: "sha256:test-policy",
+    admittedAtMs: Date.now(),
+    connectionSerial: 1,
+    stage: "request",
+  }, req, {
+    allowedHosts: loaded.allowedHosts,
+    credentials: loaded.credentials,
+    writeApproval: "allow",
+    tokenReader: (name) => tokens[name] ?? null,
+    log: () => {},
+  });
+  return mutation.headers?.authorization;
+}
+
+function scopedPolicy(pathPrefix?: string): PolicyJson {
+  return {
+    hosts: ["mcp.example.com"],
+    tokens: {
+      existing: {
+        description: "existing token",
+        credentials: [{ host: "mcp.example.com", header: "Authorization", scheme: "bearer", ...(pathPrefix ? { pathPrefix } : {}) }],
+      },
+    },
+  };
+}
+
 describe("MCP header-token ownership with protocol-scoped mappings", () => {
   let tmp: string;
   let projectRoot: string;
@@ -134,5 +167,38 @@ describe("MCP header-token ownership with protocol-scoped mappings", () => {
     expect(result.warnings).toContain("mcp.example.com Authorization already uses proxy token existing");
     expect(Object.keys(result.policy.tokens ?? {})).toEqual(["existing"]);
     expect(result.tokenConfig).toEqual({});
+  });
+
+  // An existing mapping owns the MCP credential only when the proxy would
+  // select it for the MCP endpoint's path.
+  test("an existing mapping scoped to a disjoint path does not own the MCP credential", () => {
+    const result = prepare("https://mcp.example.com/mcp", scopedPolicy("/api"));
+
+    expect(result.warnings).not.toContain("already uses proxy token");
+    const tokenName = mcpTokenName(result.policy);
+    expect(result.policy.tokens?.[tokenName]?.credentials).toEqual([
+      { host: "mcp.example.com", header: "Authorization", scheme: "bearer", pathPrefix: "/mcp" },
+    ]);
+    const tokens = { existing: "existing-real-token", [tokenName]: MCP_TOKEN };
+    expect(injectedAuthorization(result.policy, tokens, "POST", "https://mcp.example.com/mcp")).toBe(`Bearer ${MCP_TOKEN}`);
+    expect(injectedAuthorization(result.policy, tokens, "GET", "https://mcp.example.com/api/items")).toBe("Bearer existing-real-token");
+  });
+
+  test("a prefix that only shares leading characters is disjoint, not covering", () => {
+    const result = prepare("https://mcp.example.com/apix/mcp", scopedPolicy("/api"));
+    expect(result.warnings).not.toContain("already uses proxy token");
+    expect(result.policy.tokens?.[mcpTokenName(result.policy)]?.credentials)
+      .toEqual([{ host: "mcp.example.com", header: "Authorization", scheme: "bearer", pathPrefix: "/apix/mcp" }]);
+  });
+
+  test("an existing mapping scoped to a covering path still owns the MCP credential", () => {
+    const policy = scopedPolicy("/api");
+    const result = prepare("https://mcp.example.com/api/v4/mcp", policy);
+
+    expect(result.warnings).toContain("mcp.example.com Authorization already uses proxy token existing");
+    expect(result.policy).toEqual(policy);
+    expect(result.tokenConfig).toEqual({});
+    expect(injectedAuthorization(result.policy, { existing: "existing-real-token" }, "POST", "https://mcp.example.com/api/v4/mcp"))
+      .toBe("Bearer existing-real-token");
   });
 });
