@@ -86,9 +86,9 @@ describe("MCP header-token ownership with protocol-scoped mappings", () => {
     fs.rmSync(tmp, { recursive: true, force: true });
   });
 
-  function prepare(url: string, policy: PolicyJson) {
+  function prepare(url: string, policy: PolicyJson, headers: Record<string, string> = { Authorization: "Bearer ${GH_MCP_TOKEN}" }) {
     fs.writeFileSync(path.join(hostHome, ".claude.json"), JSON.stringify({
-      mcpServers: { ghmcp: { type: "http", url, headers: { Authorization: "Bearer ${GH_MCP_TOKEN}" } } },
+      mcpServers: { ghmcp: { type: "http", url, headers } },
     }));
     const runDir = path.join(tmp, "run");
     const result = prepareMcpRuntime({
@@ -279,4 +279,45 @@ describe("MCP header-token ownership with protocol-scoped mappings", () => {
     expect(injectedAuthorization(result.policy, { apikey: "key", [tokenName]: MCP_TOKEN }, "POST", "https://mcp.example.com/"))
       .toBe(`Bearer ${MCP_TOKEN}`);
   });
+
+  // Selection is host-wide: adding Authorization at the endpoint's prefix
+  // moves the selected tier past the covering `/api` X-Api-Key mapping that an
+  // earlier binding reused. Both header orders end with both headers injected.
+  for (const order of ["X-Api-Key first", "Authorization first"] as const) {
+    test(`a multi-header MCP server gets every header injected whatever the header order (${order})`, () => {
+      const policy: PolicyJson = {
+        hosts: ["mcp.example.com"],
+        tokens: {
+          apikey: {
+            description: "api key",
+            credentials: [{ host: "mcp.example.com", header: "X-Api-Key", scheme: "raw", pathPrefix: "/api" }],
+          },
+        },
+      };
+      const apiKey = { "X-Api-Key": "${MCP_KEY}" };
+      const authorization = { Authorization: "Bearer ${GH_MCP_TOKEN}" };
+      const headers = order === "X-Api-Key first" ? { ...apiKey, ...authorization } : { ...authorization, ...apiKey };
+      const result = prepare("https://mcp.example.com/api/mcp", policy, headers);
+
+      const loaded = validateNetworkPolicy(result.policy);
+      const tokens: Record<string, string> = {
+        apikey: "existing-key",
+        "mcp-claude-ghmcp-auth": MCP_TOKEN,
+        "mcp-claude-ghmcp-x-api-key": "mcp-key",
+      };
+      const req: ProxyRequest = { method: "POST", url: "https://mcp.example.com/api/mcp", headers: { Authorization: "Bearer x", "X-Api-Key": "x" } };
+      const mutation = beforeAllowedRequest({
+        v: 1, host: "mcp.example.com", port: 443, policyGeneration: "sha256:test-policy",
+        admittedAtMs: Date.now(), connectionSerial: 1, stage: "request",
+      }, req, {
+        allowedHosts: loaded.allowedHosts,
+        credentials: loaded.credentials,
+        writeApproval: "allow",
+        tokenReader: (name) => tokens[name] ?? null,
+        log: () => {},
+      });
+      expect(mutation.headers?.authorization).toBe(`Bearer ${MCP_TOKEN}`);
+      expect(mutation.headers?.["x-api-key"]).toBe("mcp-key");
+    });
+  }
 });
