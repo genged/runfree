@@ -415,6 +415,9 @@ describe("MCP header-token ownership with protocol-scoped mappings", () => {
         .flatMap((token) => token.credentials)
         .filter((credential) => credential.header === "Authorization" && credential.pathPrefix === "/api/mcp");
       expect(authorizationMappings).toHaveLength(1);
+      // Token-name order, not config order, picks the shared mapping's token,
+      // so both server orders produce the same one.
+      expect(Object.keys(result.policy.tokens ?? {}).filter((name) => name.endsWith("-auth"))).toEqual(["mcp-claude-raw-auth"]);
       const headers = beforeAllowedRequest({
         v: 1, host: "mcp.example.com", port: 443, policyGeneration: "sha256:test-policy",
         admittedAtMs: Date.now(), connectionSerial: 1, stage: "request",
@@ -427,6 +430,38 @@ describe("MCP header-token ownership with protocol-scoped mappings", () => {
       }).headers;
       expect(headers?.authorization).toBeDefined();
       expect(headers?.["x-api-key"]).toBe("value-of-mcp-claude-bearer-x-api-key");
+    });
+  }
+
+  // A mapping generated in this pass for one MCP server never owns another
+  // server's binding at a different endpoint: each nested endpoint gets its
+  // own token, whatever the server order.
+  for (const order of ["outer server first", "nested server first"] as const) {
+    test(`nested MCP servers on one header each get their own token (${order})`, () => {
+      const outer = { outer: { type: "http", url: "https://mcp.example.com/api", headers: { Authorization: "Bearer ${OUTER}" } } };
+      const nested = { nested: { type: "http", url: "https://mcp.example.com/api/mcp", headers: { Authorization: "Bearer ${NESTED}" } } };
+      fs.writeFileSync(path.join(hostHome, ".claude.json"), JSON.stringify({
+        mcpServers: order === "outer server first" ? { ...outer, ...nested } : { ...nested, ...outer },
+      }));
+      const runDir = path.join(tmp, "run");
+      const result = prepareMcpRuntime({
+        callbackPort: 47638,
+        claudeConfigPath: path.join(runDir, "claude.json"),
+        claudeMcpConfigPath: path.join(runDir, "claude-mcp.json"),
+        codexDir: path.join(runDir, "codex"),
+        env: { HOME: hostHome, CODEX_HOME: path.join(hostHome, ".codex") },
+        mcpOAuthPolicyPath: path.join(runDir, "mcp-oauth-policy.json"),
+        policy: { hosts: ["mcp.example.com"] },
+        projectRoot,
+        tokenConfig: {},
+      });
+      flushWarnings();
+
+      expect(result.tokenConfig["mcp-claude-outer-auth"]).toEqual({ source: "env", env: "OUTER" });
+      expect(result.tokenConfig["mcp-claude-nested-auth"]).toEqual({ source: "env", env: "NESTED" });
+      const tokens: Record<string, string> = { "mcp-claude-outer-auth": "outer-token", "mcp-claude-nested-auth": "nested-token" };
+      expect(injectedAuthorization(result.policy, tokens, "POST", "https://mcp.example.com/api")).toBe("Bearer outer-token");
+      expect(injectedAuthorization(result.policy, tokens, "POST", "https://mcp.example.com/api/mcp")).toBe("Bearer nested-token");
     });
   }
 });

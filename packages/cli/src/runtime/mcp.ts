@@ -1538,14 +1538,21 @@ function ensureDomain(policy: PolicyJson, host: string): void {
 //   - of the rest, the longest pathPrefix that matches the path wins, using
 //     the contract's boundary-aware pathMatchesPrefix; unscoped-by-path
 //     mappings apply only when no prefix matches.
-// A selected mapping with the binding's header owns it. Otherwise a
-// path-scoped binding is added; at its own path it is then the longest match,
+// A selected mapping with the binding's header owns it if it was in the
+// input policy, or if this pass generated it for the binding's exact scope
+// (two servers at one endpoint coalesce). A broader mapping generated in this
+// pass for another MCP server never owns it: that would send one server's
+// token to another server's endpoint. Otherwise a path-scoped binding is added; at its own path it is then the longest match,
 // so the proxy selects it. A root endpoint's binding has no pathPrefix, and
 // the proxy never selects an unscoped mapping while a path-scoped mapping on
 // the host (any header) matches the path, so that binding is refused rather
 // than added where it would never be injected.
-function credentialOwner(policy: PolicyJson, credential: CredentialPolicyJson): string | undefined {
-  const { owner, scopedMatches } = selectedCredentialOwner(policy, credential);
+function credentialOwner(
+  policy: PolicyJson,
+  credential: CredentialPolicyJson,
+  generated: ReadonlySet<CredentialPolicyJson>,
+): string | undefined {
+  const { owner, scopedMatches } = selectedCredentialOwner(policy, credential, generated);
   if (owner) return owner;
   if (credential.pathPrefix === undefined && scopedMatches.length > 0) {
     const shadowing = [...new Set(scopedMatches.map(({ tokenName }) => tokenName))].sort().join(", ");
@@ -1557,8 +1564,13 @@ function credentialOwner(policy: PolicyJson, credential: CredentialPolicyJson): 
 }
 
 // The token the proxy selects for the binding's header at the endpoint path,
-// and the path-scoped mappings on the host that match that path.
-function selectedCredentialOwner(policy: PolicyJson, credential: CredentialPolicyJson): {
+// when that mapping may own the binding (see credentialOwner), and the
+// path-scoped mappings on the host that match that path.
+function selectedCredentialOwner(
+  policy: PolicyJson,
+  credential: CredentialPolicyJson,
+  generated: ReadonlySet<CredentialPolicyJson>,
+): {
   owner: string | undefined;
   scopedMatches: { tokenName: string; existing: CredentialPolicyJson }[];
 } {
@@ -1574,22 +1586,30 @@ function selectedCredentialOwner(policy: PolicyJson, credential: CredentialPolic
   const selected = scopedMatches.length > 0
     ? scopedMatches.filter(({ existing }) => existing.pathPrefix?.length === longest)
     : candidates.filter(({ existing }) => existing.pathPrefix === undefined);
-  return { owner: selected.find(({ existing }) => sameHeader(existing))?.tokenName, scopedMatches };
+  const owner = selected.find(({ existing }) => sameHeader(existing)
+    && (!generated.has(existing) || existing.pathPrefix === credential.pathPrefix));
+  return { owner: owner?.tokenName, scopedMatches };
 }
 
 function sameCredential(left: CredentialPolicyJson, right: CredentialPolicyJson): boolean {
   return credentialIdentityKey(left) === credentialIdentityKey(right);
 }
 
-function applyTokenBinding(policy: PolicyJson, tokenConfig: TokenSourceConfig, binding: HeaderTokenBinding, options: { autoTokenSource: boolean }): void {
+function applyTokenBinding(
+  policy: PolicyJson,
+  tokenConfig: TokenSourceConfig,
+  binding: HeaderTokenBinding,
+  options: { autoTokenSource: boolean },
+  generated: Set<CredentialPolicyJson>,
+): void {
   policy.tokens ??= {};
   ensureDomain(policy, binding.credential.host);
-  const owner = credentialOwner(policy, binding.credential);
+  const owner = credentialOwner(policy, binding.credential, generated);
   if (owner && owner !== binding.tokenName) {
     warn(`mcp: ${binding.credential.host} ${binding.credential.header} already uses proxy token ${owner}; generated MCP config will reuse existing proxy injection`);
     return;
   }
-  addTokenBinding(policy, tokenConfig, binding, options);
+  addTokenBinding(policy, tokenConfig, binding, options, generated);
 }
 
 // Selection is host-wide, so a binding added at its endpoint's path prefix
@@ -1607,6 +1627,7 @@ function reconcileTokenBindings(
   policy: PolicyJson,
   tokenConfig: TokenSourceConfig,
   bindings: readonly { binding: HeaderTokenBinding; options: { autoTokenSource: boolean } }[],
+  generated: Set<CredentialPolicyJson>,
 ): void {
   for (let round = 0; round <= bindings.length; round += 1) {
     let added = false;
@@ -1614,8 +1635,8 @@ function reconcileTokenBindings(
     // already serve a later binding for the same header and endpoint, which
     // then reuses it instead of adding a duplicate scope.
     for (const { binding, options } of bindings) {
-      if (selectedCredentialOwner(policy, binding.credential).owner !== undefined) continue;
-      addTokenBinding(policy, tokenConfig, binding, options);
+      if (selectedCredentialOwner(policy, binding.credential, generated).owner !== undefined) continue;
+      addTokenBinding(policy, tokenConfig, binding, options, generated);
       added = true;
     }
     if (!added) return;
@@ -1623,7 +1644,13 @@ function reconcileTokenBindings(
   throw new Error("mcp: credential bindings did not settle; review the MCP server URLs and network policy credentials for this host");
 }
 
-function addTokenBinding(policy: PolicyJson, tokenConfig: TokenSourceConfig, binding: HeaderTokenBinding, options: { autoTokenSource: boolean }): void {
+function addTokenBinding(
+  policy: PolicyJson,
+  tokenConfig: TokenSourceConfig,
+  binding: HeaderTokenBinding,
+  options: { autoTokenSource: boolean },
+  generated: Set<CredentialPolicyJson>,
+): void {
   policy.tokens ??= {};
   policy.tokens[binding.tokenName] ??= {
     description: `MCP ${binding.credential.host} credential`,
@@ -1632,6 +1659,7 @@ function addTokenBinding(policy: PolicyJson, tokenConfig: TokenSourceConfig, bin
   const credentials = policy.tokens[binding.tokenName].credentials;
   if (!credentials.some((credential) => sameCredential(credential, binding.credential))) {
     credentials.push(binding.credential);
+    generated.add(binding.credential);
     credentials.sort((left, right) => `${left.host}\0${left.header}`.localeCompare(`${right.host}\0${right.header}`));
   }
   const existingSource = tokenConfig[binding.tokenName];
@@ -1648,6 +1676,9 @@ function addTokenBinding(policy: PolicyJson, tokenConfig: TokenSourceConfig, bin
 
 function applyPolicyAndTokens(policy: PolicyJson, tokenConfig: TokenSourceConfig, servers: PreparedMcpServer[]): void {
   const applied: { binding: HeaderTokenBinding; options: { autoTokenSource: boolean } }[] = [];
+  // Mappings this pass adds; only input mappings, or a generated mapping of
+  // the exact scope, may own an MCP binding.
+  const generated = new Set<CredentialPolicyJson>();
   for (const server of servers) {
     if (server.transport === "http" && (server.claudeConfig || server.codexConfig)) {
       const url = (server.claudeConfig?.url ?? server.codexConfig?.url) as string | undefined;
@@ -1660,12 +1691,14 @@ function applyPolicyAndTokens(policy: PolicyJson, tokenConfig: TokenSourceConfig
       ensureDomain(policy, typeof endpoint === "string" ? new URL(endpoint).hostname.toLowerCase() : endpoint.host);
     }
     const options = { autoTokenSource: server.source !== "project" };
-    for (const binding of server.tokenBindings) {
-      applyTokenBinding(policy, tokenConfig, binding, options);
-      applied.push({ binding, options });
-    }
+    for (const binding of server.tokenBindings) applied.push({ binding, options });
   }
-  reconcileTokenBindings(policy, tokenConfig, applied);
+  // Bindings are applied in token-name order, not config order, so which of
+  // two servers at one endpoint supplies the shared mapping is the same on
+  // every run.
+  applied.sort((left, right) => left.binding.tokenName.localeCompare(right.binding.tokenName));
+  for (const { binding, options } of applied) applyTokenBinding(policy, tokenConfig, binding, options, generated);
+  reconcileTokenBindings(policy, tokenConfig, applied, generated);
 }
 
 export function mcpOAuthProviderId(agent: McpAgent, serverName: string): string {
