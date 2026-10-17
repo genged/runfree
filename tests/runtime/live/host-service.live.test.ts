@@ -1522,13 +1522,12 @@ describe("approved host services", () => {
     }
   }, TEST_TIMEOUT_MS);
 
-  // T8, Codex: no known probe. Spec open question Q2: the live per-agent
-  // probe needs a command that makes the agent connect to its configured MCP
-  // servers without a model login, and none is known for the pinned
-  // codex-cli 0.156.1 (to check on a Docker host: `codex mcp --help`). Until
-  // one is found this case stays skipped and T8 is unproven for Codex; the
-  // maintainer decides between shipping Claude-only (refusing Codex loopback
-  // entries with a named reason) and shipping both with this recorded gap.
+  // T8, Codex: no known probe. Spec Q2: the live per-agent probe needs a
+  // command that makes the agent connect to its configured MCP servers
+  // without a model login, and none is known for the pinned codex-cli
+  // 0.156.1 (to check on a Docker host: `codex mcp --help`). Until one is
+  // found this case stays skipped and T8 is unproven for Codex. Q2 is
+  // decided: Codex loopback entries ship with this recorded proof gap.
   // The body fails rather than passes if someone un-skips it without a probe.
   test.skip("a loopback MCP entry reaches an approved host service through the relay: Codex (T8, spec Q2)", () => {
     throw new Error("no Codex probe command is known (spec Q2); write one before enabling this case");
