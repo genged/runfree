@@ -8,6 +8,7 @@ import { projectInfo } from "../config.ts";
 import { RUNFREE_RUNTIME_COMPONENTS } from "../embedded-assets.generated.ts";
 import { composeProjectName } from "../runtime/env.ts";
 import { projectHash } from "../project-identity.ts";
+import { convergenceRollbackTarget } from "../runtime/startup.ts";
 import { pendingWarningsForTest } from "../warnings.ts";
 import type { RuntimeContext, RuntimeIO } from "../runtime/types.ts";
 import { activateApprovedControlsAfterMutation, withFencedReceiptRead } from "./activation.ts";
@@ -18,6 +19,7 @@ import {
 } from "./approvals.ts";
 import { captureDesiredPolicyCandidate } from "./candidates.ts";
 import {
+  convergeEffectivePolicyGeneration,
   publishEffectivePolicyGeneration,
   readActiveControlSelection,
   readActiveEffectiveControl,
@@ -428,6 +430,50 @@ describe("post-mutation control activation", () => {
       }
       expect(dockerCalls).toEqual([]);
       expect(activeSnapshot()).toEqual(before);
+    });
+
+    // The replacement's startup convergence must not roll back to a stale
+    // last-converged generation: selected A plus a receipt for B (left by an
+    // interrupted activation) would otherwise select B on a failed convergence.
+    test.each([
+      ["a keep-selected start leaves the selection", false],
+      ["a normal start rolls back to the last converged generation", true],
+    ])("failed startup convergence with a stale receipt: %s", async (_name, rollback) => {
+      approveAll();
+      const stale = publishEffectivePolicyGeneration(root, context.project);
+      // Converge B, leaving its receipt.
+      await convergeEffectivePolicyGeneration(context.project, {
+        probe: async () => convergedProbe(),
+        stopRuntime: async () => { throw new Error("must not stop"); },
+        timeoutMs: 0,
+      });
+      approveChangedProject(["example.com", "new.example.com"]);
+      const selected = publishEffectivePolicyGeneration(root, context.project);
+      expect(readConvergedPolicyReceipt(context.project)?.controlGeneration).toBe(stale.controlGeneration);
+      fs.utimesSync(context.project.paths.controlProxyActivePath, new Date(1_000_000), new Date(1_000_000));
+      const before = activeSnapshot();
+
+      const active = readActiveControlSelection(context.project);
+      if (!active) throw new Error("no selection");
+      const previous = convergenceRollbackTarget(context.project, active, rollback);
+      // The replacement acknowledges only the stale generation.
+      const staleOnly = async () => {
+        const current = readActiveControlSelection(context.project);
+        return current?.controlGeneration === stale.controlGeneration ? convergedProbe() : {};
+      };
+      const stopped = vi.fn(async () => {});
+      const converging = convergeEffectivePolicyGeneration(context.project, {
+        ...(previous ? { previous } : {}), probe: staleOnly, stopRuntime: stopped, timeoutMs: 0,
+      });
+      if (rollback) {
+        await expect(converging).rejects.toThrow(`rolled back to ${stale.controlGeneration}`);
+        expect(readActiveControlSelection(context.project)?.controlGeneration).toBe(stale.controlGeneration);
+      } else {
+        await expect(converging).rejects.toThrow("effective policy convergence and rollback failed; proxy stopped");
+        expect(stopped).toHaveBeenCalledOnce();
+        expect(activeSnapshot()).toEqual(before);
+        expect(readActiveControlSelection(context.project)?.controlGeneration).toBe(selected.controlGeneration);
+      }
     });
 
     test("discovery reads the proxy container label, and an unlabeled proxy is another build", async () => {
