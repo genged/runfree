@@ -374,5 +374,60 @@ describe("MCP header-token ownership with protocol-scoped mappings", () => {
       expect(send("https://mcp.example.com/api")?.authorization).toBe("Bearer outer-token");
     });
   }
+
+  // Two servers at one endpoint both reuse the unscoped Authorization mapping
+  // until a third header binding there shadows it. Reconciliation must add
+  // one Authorization mapping at the endpoint and let the other server reuse
+  // it, not add both (a duplicate scope that validation refuses).
+  for (const order of ["bearer server first", "raw server first"] as const) {
+    test(`two MCP servers at one endpoint share a reconciled Authorization mapping (${order})`, () => {
+      const policy: PolicyJson = {
+        hosts: ["mcp.example.com"],
+        tokens: {
+          existing: {
+            description: "existing token",
+            credentials: [{ host: "mcp.example.com", header: "Authorization", scheme: "bearer" }],
+          },
+        },
+      };
+      const url = "https://mcp.example.com/api/mcp";
+      const bearer = { bearer: { type: "http", url, headers: { Authorization: "Bearer ${BEARER_TOKEN}", "X-Api-Key": "${API_KEY}" } } };
+      const raw = { raw: { type: "http", url, headers: { Authorization: "${RAW_TOKEN}" } } };
+      fs.writeFileSync(path.join(hostHome, ".claude.json"), JSON.stringify({
+        mcpServers: order === "bearer server first" ? { ...bearer, ...raw } : { ...raw, ...bearer },
+      }));
+      const runDir = path.join(tmp, "run");
+      const result = prepareMcpRuntime({
+        callbackPort: 47638,
+        claudeConfigPath: path.join(runDir, "claude.json"),
+        claudeMcpConfigPath: path.join(runDir, "claude-mcp.json"),
+        codexDir: path.join(runDir, "codex"),
+        env: { HOME: hostHome, CODEX_HOME: path.join(hostHome, ".codex") },
+        mcpOAuthPolicyPath: path.join(runDir, "mcp-oauth-policy.json"),
+        policy,
+        projectRoot,
+        tokenConfig: {},
+      });
+      flushWarnings();
+
+      const loaded = validateNetworkPolicy(result.policy);
+      const authorizationMappings = Object.values(result.policy.tokens ?? {})
+        .flatMap((token) => token.credentials)
+        .filter((credential) => credential.header === "Authorization" && credential.pathPrefix === "/api/mcp");
+      expect(authorizationMappings).toHaveLength(1);
+      const headers = beforeAllowedRequest({
+        v: 1, host: "mcp.example.com", port: 443, policyGeneration: "sha256:test-policy",
+        admittedAtMs: Date.now(), connectionSerial: 1, stage: "request",
+      }, { method: "POST", url, headers: { Authorization: "Bearer x", "X-Api-Key": "x" } }, {
+        allowedHosts: loaded.allowedHosts,
+        credentials: loaded.credentials,
+        writeApproval: "allow",
+        tokenReader: (name) => `value-of-${name}`,
+        log: () => {},
+      }).headers;
+      expect(headers?.authorization).toBeDefined();
+      expect(headers?.["x-api-key"]).toBe("value-of-mcp-claude-bearer-x-api-key");
+    });
+  }
 });
 

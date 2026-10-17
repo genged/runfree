@@ -1609,9 +1609,16 @@ function reconcileTokenBindings(
   bindings: readonly { binding: HeaderTokenBinding; options: { autoTokenSource: boolean } }[],
 ): void {
   for (let round = 0; round <= bindings.length; round += 1) {
-    const unselected = bindings.filter(({ binding }) => selectedCredentialOwner(policy, binding.credential).owner === undefined);
-    if (unselected.length === 0) return;
-    for (const { binding, options } of unselected) addTokenBinding(policy, tokenConfig, binding, options);
+    let added = false;
+    // Selection is re-read before each insertion: a mapping just added can
+    // already serve a later binding for the same header and endpoint, which
+    // then reuses it instead of adding a duplicate scope.
+    for (const { binding, options } of bindings) {
+      if (selectedCredentialOwner(policy, binding.credential).owner !== undefined) continue;
+      addTokenBinding(policy, tokenConfig, binding, options);
+      added = true;
+    }
+    if (!added) return;
   }
   throw new Error("mcp: credential bindings did not settle; review the MCP server URLs and network policy credentials for this host");
 }
