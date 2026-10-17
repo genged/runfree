@@ -201,4 +201,82 @@ describe("MCP header-token ownership with protocol-scoped mappings", () => {
     expect(injectedAuthorization(result.policy, { existing: "existing-real-token" }, "POST", "https://mcp.example.com/api/v4/mcp"))
       .toBe("Bearer existing-real-token");
   });
+
+  // A root endpoint's binding has no pathPrefix, so it has the exact scope of
+  // an unscoped mapping. The owner is the token the proxy selects at `/`, not
+  // that exact-scope mapping.
+  test("a root endpoint reuses the `/` mapping that shadows an unscoped one, as the proxy selects", () => {
+    const policy: PolicyJson = {
+      hosts: ["mcp.example.com"],
+      tokens: {
+        existing: {
+          description: "existing token",
+          credentials: [{ host: "mcp.example.com", header: "Authorization", scheme: "bearer" }],
+        },
+        root: {
+          description: "root-scoped token",
+          credentials: [{ host: "mcp.example.com", header: "Authorization", scheme: "bearer", pathPrefix: "/" }],
+        },
+      },
+    };
+    const tokens = { existing: "existing-real-token", root: "root-real-token" };
+    expect(injectedAuthorization(policy, tokens, "POST", "https://mcp.example.com/")).toBe("Bearer root-real-token");
+
+    const result = prepare("https://mcp.example.com/", policy);
+    expect(result.warnings).toContain("mcp.example.com Authorization already uses proxy token root");
+    expect(result.policy).toEqual(policy);
+  });
+
+  // Selection is host-wide: a `/` mapping on another header shadows every
+  // unscoped mapping on the host, so a root endpoint's (unscoped) binding
+  // could never be injected. Refuse instead of claiming the unscoped token is
+  // reused or adding a mapping the proxy never selects.
+  test("a root endpoint shadowed by a path-scoped mapping refuses the MCP credential", () => {
+    const policy: PolicyJson = {
+      hosts: ["mcp.example.com"],
+      tokens: {
+        existing: {
+          description: "existing token",
+          credentials: [{ host: "mcp.example.com", header: "Authorization", scheme: "bearer" }],
+        },
+        apikey: {
+          description: "api key",
+          credentials: [{ host: "mcp.example.com", header: "X-Api-Key", scheme: "raw", pathPrefix: "/" }],
+        },
+      },
+    };
+    const before = structuredClone(policy);
+    expect(injectedAuthorization(policy, { existing: "existing-real-token", apikey: "key" }, "POST", "https://mcp.example.com/"))
+      .toBeUndefined();
+
+    expect(() => prepare("https://mcp.example.com/", policy))
+      .toThrow(/mcp\.example\.com Authorization cannot be injected .*proxy token apikey .*remove that path-scoped mapping/);
+    expect(policy).toEqual(before);
+
+    // Recovery, as the refusal names it: with the path-scoped mapping
+    // removed, the unscoped mapping is selected at the endpoint and owns it.
+    delete policy.tokens?.apikey;
+    const result = prepare("https://mcp.example.com/", policy);
+    expect(result.warnings).toContain("mcp.example.com Authorization already uses proxy token existing");
+    expect(injectedAuthorization(result.policy, { existing: "existing-real-token" }, "POST", "https://mcp.example.com/"))
+      .toBe("Bearer existing-real-token");
+  });
+
+  test("a root endpoint with no matching path-scoped mapping adds an unscoped MCP credential the proxy injects", () => {
+    const policy: PolicyJson = {
+      hosts: ["mcp.example.com"],
+      tokens: {
+        apikey: {
+          description: "api key",
+          credentials: [{ host: "mcp.example.com", header: "X-Api-Key", scheme: "raw", pathPrefix: "/api" }],
+        },
+      },
+    };
+    const result = prepare("https://mcp.example.com/", policy);
+    const tokenName = mcpTokenName(result.policy);
+    expect(result.policy.tokens?.[tokenName]?.credentials)
+      .toEqual([{ host: "mcp.example.com", header: "Authorization", scheme: "bearer" }]);
+    expect(injectedAuthorization(result.policy, { apikey: "key", [tokenName]: MCP_TOKEN }, "POST", "https://mcp.example.com/"))
+      .toBe(`Bearer ${MCP_TOKEN}`);
+  });
 });

@@ -1538,10 +1538,12 @@ function ensureDomain(policy: PolicyJson, host: string): void {
 //   - of the rest, the longest pathPrefix that matches the path wins, using
 //     the contract's boundary-aware pathMatchesPrefix; unscoped-by-path
 //     mappings apply only when no prefix matches.
-// A selected mapping with the binding's header owns it. A mapping with the
-// binding's exact scope owns it too even when not selected, because a second
-// one would conflict in validation. Otherwise the MCP mapping is added; at
-// its own path it is then the longest match, so it never ties.
+// A selected mapping with the binding's header owns it. Otherwise a
+// path-scoped binding is added; at its own path it is then the longest match,
+// so the proxy selects it. A root endpoint's binding has no pathPrefix, and
+// the proxy never selects an unscoped mapping while a path-scoped mapping on
+// the host (any header) matches the path, so that binding is refused rather
+// than added where it would never be injected.
 function credentialOwner(policy: PolicyJson, credential: CredentialPolicyJson): string | undefined {
   const endpointPath = credential.pathPrefix ?? "/";
   const sameHeader = (existing: CredentialPolicyJson) => existing.header.toLowerCase() === credential.header.toLowerCase();
@@ -1549,15 +1551,21 @@ function credentialOwner(policy: PolicyJson, credential: CredentialPolicyJson): 
     tokenPolicy.credentials
       .filter((existing) => existing.protocol === undefined && existing.host === credential.host)
       .map((existing) => ({ tokenName, existing })));
-  const exactScope = candidates.find(({ existing }) => sameHeader(existing) && existing.pathPrefix === credential.pathPrefix);
-  if (exactScope) return exactScope.tokenName;
   const scopedMatches = candidates.filter(({ existing }) =>
     existing.pathPrefix !== undefined && pathMatchesPrefix(endpointPath, existing.pathPrefix));
   const longest = Math.max(...scopedMatches.map(({ existing }) => existing.pathPrefix?.length ?? 0));
   const selected = scopedMatches.length > 0
     ? scopedMatches.filter(({ existing }) => existing.pathPrefix?.length === longest)
     : candidates.filter(({ existing }) => existing.pathPrefix === undefined);
-  return selected.find(({ existing }) => sameHeader(existing))?.tokenName;
+  const owner = selected.find(({ existing }) => sameHeader(existing));
+  if (owner) return owner.tokenName;
+  if (credential.pathPrefix === undefined && scopedMatches.length > 0) {
+    const shadowing = [...new Set(scopedMatches.map(({ tokenName }) => tokenName))].sort().join(", ");
+    throw new Error(`mcp: ${credential.host} ${credential.header} cannot be injected for this MCP endpoint: `
+      + `proxy token ${shadowing} is scoped to a path prefix that covers the endpoint, and the proxy prefers it on that host; `
+      + "remove that path-scoped mapping from the network policy, or point the MCP server at a URL with a path");
+  }
+  return undefined;
 }
 
 function sameCredential(left: CredentialPolicyJson, right: CredentialPolicyJson): boolean {
