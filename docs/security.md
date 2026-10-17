@@ -383,8 +383,10 @@ upgrade, a proxy still running the previous build.
   missing label counts as another build. On a mismatch:
   - if the runtime can be replaced compatibly, the command prints that
     running sessions lose network access for up to one heartbeat (30 s) plus
-    adoption, replaces the proxy as `runfree up` does, then applies the
-    change; a failed replacement stops with the change saved but not applied;
+    adoption, and replaces the proxy as `runfree up` does, but on the
+    effective policy generation already selected. It publishes the change
+    only after the new proxy's label matches. A failed replacement stops with
+    the change saved but not applied, and the selection is unchanged;
   - if active sessions use an incompatible admission epoch or control-plane
     topology, the change is saved and reported as not applied, with the
     remedy: wait for the sessions to end, then `runfree policy use-approved`,

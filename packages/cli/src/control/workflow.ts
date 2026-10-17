@@ -413,7 +413,7 @@ export async function usePreparedApprovedPolicyGeneration(
 
 export type StartupControlPreparation = {
   generation: EffectivePolicyGeneration;
-  mechanism: "active-session" | "already-approved" | "automatic-reduction" | "interactive" | "use-approved";
+  mechanism: "active-session" | "already-approved" | "automatic-reduction" | "interactive" | "kept-selected" | "use-approved";
 };
 
 function selectedDigest(
@@ -607,7 +607,7 @@ function joinActiveSessionGeneration(context: RuntimeContext): StartupControlPre
 export async function prepareEffectiveControlsForStartup(
   context: RuntimeContext,
   io: RuntimeIO,
-  options: { admitHostService?: HostServiceAdmit; useApprovedPolicy?: boolean } = {},
+  options: { admitHostService?: HostServiceAdmit; keepSelectedPolicyGeneration?: boolean; useApprovedPolicy?: boolean } = {},
 ): Promise<StartupControlPreparation> {
   // Before the active-session short-circuit on purpose. That path returns the
   // published generation without ever reading the selection, and
@@ -616,6 +616,16 @@ export async function prepareEffectiveControlsForStartup(
   // on an active-session entry would otherwise be the first thing to meet a
   // non-valid selection.
   await requireUsableApprovalSelection(context, io, { admitHostService: options.admitHostService });
+
+  // The same-build fence's proxy replacement: the proxy being replaced is from
+  // another Runfree build, so this start must not publish or select anything.
+  // It restarts on the generation already selected; activation publishes the
+  // approved one only after it has verified the replacement's build identity.
+  if (options.keepSelectedPolicyGeneration) {
+    const active = readActiveEffectiveControl(context.project);
+    if (!active) throw new Error("the proxy replacement keeps the selected effective policy generation, and none is selected");
+    return { generation: active, mechanism: "kept-selected" };
+  }
 
   if (options.useApprovedPolicy) {
     return { generation: await usePreparedApprovedPolicyGeneration(context, io), mechanism: "use-approved" };

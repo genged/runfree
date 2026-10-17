@@ -209,7 +209,10 @@ type ActivationOptions = {
    */
   proxyFromAnotherBuild?: "replace" | "wait";
   recoverInvalidActive?: boolean;
-  /** The compatible proxy replacement; default `up`. Returns its exit status. */
+  /**
+   * The compatible proxy replacement; default `up` on the selected effective
+   * policy generation, which publishes nothing. Returns its exit status.
+   */
   replaceProxy?: (context: RuntimeContext, io: RuntimeIO) => Promise<number>;
   timeoutMs?: number;
 };
@@ -249,7 +252,12 @@ async function fenceProxyFromAnotherBuild(
   const heartbeatSeconds = Math.round(SESSION_HEARTBEAT_CADENCE_MS / 1000);
   console.error(`warning: ${mismatch}; replacing it before the change applies`);
   console.error(`warning: running sessions lose network access for up to one heartbeat (${heartbeatSeconds} s) plus adoption while the proxy is replaced`);
-  const status = await (options.replaceProxy ?? ((ctx, rio) => up(ctx, rio)))(context, io);
+  // The replacement keeps the selected generation: a plain start on an idle
+  // runtime would publish the approved one before it replaced the proxy, so
+  // the old build would read it, and a failed replacement would leave it
+  // selected. Publication waits for the identity check below.
+  const status = await (options.replaceProxy
+    ?? ((ctx, rio) => up(ctx, rio, false, { keepSelectedPolicyGeneration: true })))(context, io);
   if (status !== 0) {
     throw new Error(`the proxy from another Runfree build was not replaced (status ${status}); the change is saved and was not applied; ${REPLACE_THEN_APPLY}`);
   }

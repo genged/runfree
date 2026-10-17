@@ -574,6 +574,31 @@ describe("quiesced control workflow", () => {
     expect(readActiveControlSelection(context.project)).toBeUndefined();
   });
 
+  test("a start that keeps the selected generation publishes nothing, and refuses when none is selected", async () => {
+    const quiet = io();
+    quiet.confirm = () => { throw new Error("keeping the selection must not prompt"); };
+    // Refusal: nothing is selected, so there is nothing to keep.
+    await expect(prepareEffectiveControlsForStartup(context, quiet, { keepSelectedPolicyGeneration: true }))
+      .rejects.toThrow("keeps the selected effective policy generation, and none is selected");
+    expect(readActiveControlSelection(context.project)).toBeUndefined();
+
+    // Reclamation: a plain start selects one.
+    const interactive = io();
+    interactive.isInteractive = () => true;
+    interactive.confirm = () => true;
+    const first = await prepareEffectiveControlsForStartup(context, interactive);
+    const activePath = context.project.paths.controlProxyActivePath;
+    const before = fs.readFileSync(activePath, "utf8");
+
+    // A changed desired policy is neither captured nor published.
+    fs.writeFileSync(path.join(root, ".runfree", "network-policy.json"), `{"version":2,"hosts":["example.com","new.example.com"]}`);
+    calls = [];
+    await expect(prepareEffectiveControlsForStartup(context, quiet, { keepSelectedPolicyGeneration: true }))
+      .resolves.toMatchObject({ mechanism: "kept-selected", generation: { controlGeneration: first.generation.controlGeneration } });
+    expect(fs.readFileSync(activePath, "utf8")).toBe(before);
+    expect(calls).toEqual([]);
+  });
+
   test("approves one exact interactive startup preflight and reuses it without prompting", async () => {
     const interactive = io();
     interactive.isInteractive = () => true;

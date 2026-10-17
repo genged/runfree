@@ -366,6 +366,39 @@ describe("post-mutation control activation", () => {
       expect(activeSnapshot().bytes).toBe(before.bytes);
     });
 
+    // The default replacement is the real runtime start, not a stub. On an
+    // idle runtime that start used to prepare and publish the newly approved
+    // generation before it touched Docker, so the old-build proxy could read it
+    // and a failed replacement left it selected. Docker fails here at the
+    // first call: every Docker call, and the end state, must see the previous
+    // selection's exact bytes.
+    test("the default replacement keeps the selected generation until it fails", async () => {
+      const before = pendingChange();
+      const seenAtDocker: Snapshot[] = [];
+      const io: RuntimeIO = { ...unusedIo, capture(command) {
+        if (command === "docker") {
+          seenAtDocker.push(activeSnapshot());
+          return { status: 1, stdout: "", stderr: "Cannot connect to the Docker daemon" };
+        }
+        return { status: 1, stdout: "", stderr: `${command}: not found` };
+      }, run(command) {
+        if (command === "docker") seenAtDocker.push(activeSnapshot());
+        return 1;
+      } };
+      const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+      try {
+        await expect(activateApprovedControlsAfterMutation(context, io, {
+          consumer: liveConsumer(otherBuild),
+          classifyProxyReplacement: compatible,
+        })).rejects.toThrow(/was not replaced|Docker/);
+      } finally {
+        errors.mockRestore();
+      }
+      expect(seenAtDocker.length).toBeGreaterThan(0);
+      for (const seen of seenAtDocker) expect(seen).toEqual(before);
+      expect(activeSnapshot()).toEqual(before);
+    });
+
     test("discovery reads the proxy container label, and an unlabeled proxy is another build", async () => {
       const before = pendingChange();
       const proxyId = "c".repeat(64);

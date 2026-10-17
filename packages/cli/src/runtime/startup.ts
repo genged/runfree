@@ -1347,6 +1347,7 @@ export async function startRuntime(
     try {
       const preparedControls = await timings.timeAsync("control-preparation", () => prepareEffectiveControlsForLaunch(context, io, {
         useApprovedPolicy: rebuildOptions.useApprovedPolicy,
+        keepSelectedPolicyGeneration: rebuildOptions.keepSelectedPolicyGeneration,
       }));
       reportRuntimeVerbose(
         verbose,
