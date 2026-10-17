@@ -8,6 +8,7 @@ import { projectInfo } from "../config.ts";
 import { RUNFREE_RUNTIME_COMPONENTS } from "../embedded-assets.generated.ts";
 import { composeProjectName } from "../runtime/env.ts";
 import { projectHash } from "../project-identity.ts";
+import { pendingWarningsForTest } from "../warnings.ts";
 import type { RuntimeContext, RuntimeIO } from "../runtime/types.ts";
 import { activateApprovedControlsAfterMutation, withFencedReceiptRead } from "./activation.ts";
 import { activationReportLine } from "./activation-report.ts";
@@ -396,6 +397,36 @@ describe("post-mutation control activation", () => {
       }
       expect(seenAtDocker.length).toBeGreaterThan(0);
       for (const seen of seenAtDocker) expect(seen).toEqual(before);
+      expect(activeSnapshot()).toEqual(before);
+    });
+
+    // Startup materializes the runtime from the project config. Unapproved
+    // runtime-isolation drift must stop the replacement before Docker, as a
+    // normal start would ask for approval first.
+    test("the default replacement refuses unapproved runtime-isolation drift before any Docker call", async () => {
+      const before = pendingChange();
+      const drifted: RuntimeContext = { ...context, project: { ...context.project, config: {
+        ...context.project.config, runtime: { ...context.project.config.runtime, dependencyOverlays: "off" } } } };
+      const dockerCalls: string[] = [];
+      const io: RuntimeIO = { ...unusedIo, capture(command, args) {
+        if (command === "docker") dockerCalls.push(args.join(" "));
+        return { status: 1, stdout: "", stderr: `${command}: unavailable` };
+      }, run(command, args) {
+        if (command === "docker") dockerCalls.push(args.join(" "));
+        return 1;
+      } };
+      const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+      try {
+        await expect(activateApprovedControlsAfterMutation(drifted, io, {
+          consumer: liveConsumer(otherBuild),
+          classifyProxyReplacement: compatible,
+        })).rejects.toThrow("was not replaced (status 1)");
+        expect(pendingWarningsForTest().map((event) => event.message).join("\n"))
+          .toContain("the proxy replacement starts only on approved controls, and runtime-isolation differs from the approved controls; review them with: runfree up");
+      } finally {
+        errors.mockRestore();
+      }
+      expect(dockerCalls).toEqual([]);
       expect(activeSnapshot()).toEqual(before);
     });
 

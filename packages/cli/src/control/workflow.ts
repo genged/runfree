@@ -598,6 +598,45 @@ function joinActiveSessionGeneration(context: RuntimeContext): StartupControlPre
 }
 
 /**
+ * Startup on the selected effective policy generation, for the same-build
+ * fence's proxy replacement. It runs every comparison the normal path runs and
+ * replaces only approval and publication with a refusal: startup materializes
+ * the runtime from the project config, not from the generation, so unapproved
+ * drift must not reach Docker by way of a replacement. The runtime-isolation
+ * comparison reads no desired input and runs first, beside live sessions too;
+ * the desired network comparison needs a quiesced capture, so beside live
+ * sessions it is skipped exactly as the normal path's join skips it.
+ */
+async function keepSelectedPolicyGeneration(context: RuntimeContext, io: RuntimeIO): Promise<StartupControlPreparation> {
+  const active = readActiveEffectiveControl(context.project);
+  if (!active) throw new Error("the proxy replacement keeps the selected effective policy generation, and none is selected");
+  const selection = readControlApprovalSelection(context.projectRoot, context.project);
+  const unapproved = (subjects: string[]): CliError => new CliError(
+    `the proxy replacement starts only on approved controls, and ${subjects.join(" and ")} ${subjects.length === 1 ? "differs" : "differ"} from the approved controls; `
+      + `review them with: ${remedy.up()}`,
+  );
+  if (selectedDigest(selection, "runtime-isolation") !== runtimeIsolationControlSubject(context.project.config).digest) {
+    throw unapproved(["runtime-isolation"]);
+  }
+  if (activeLifecycleSessions(context).length === 0) {
+    let candidate: DesiredPolicyCandidate | undefined;
+    try {
+      candidate = await captureQuiescedDesiredPolicyCandidate(context, io);
+    } catch (error) {
+      if (!(error instanceof LivePerSessionAgentsError && activeLifecycleSessions(context).length > 0)) throw error;
+    }
+    if (candidate) {
+      const drift = [
+        ...(selectedDigest(selection, "network-project") === candidate.projectSubject.digest ? [] : ["network-project"]),
+        ...(selectedDigest(selection, "network-local") === candidate.localSubject.digest ? [] : ["network-local"]),
+      ];
+      if (drift.length > 0) throw unapproved(drift);
+    }
+  }
+  return { generation: active, mechanism: "kept-selected" };
+}
+
+/**
  * Resolve startup authority before Docker planning, image work, credential
  * resolution, or attach. A concurrent launch reuses the verified active
  * generation without reading desired project input or publishing authority.
@@ -621,11 +660,7 @@ export async function prepareEffectiveControlsForStartup(
   // another Runfree build, so this start must not publish or select anything.
   // It restarts on the generation already selected; activation publishes the
   // approved one only after it has verified the replacement's build identity.
-  if (options.keepSelectedPolicyGeneration) {
-    const active = readActiveEffectiveControl(context.project);
-    if (!active) throw new Error("the proxy replacement keeps the selected effective policy generation, and none is selected");
-    return { generation: active, mechanism: "kept-selected" };
-  }
+  if (options.keepSelectedPolicyGeneration) return keepSelectedPolicyGeneration(context, io);
 
   if (options.useApprovedPolicy) {
     return { generation: await usePreparedApprovedPolicyGeneration(context, io), mechanism: "use-approved" };
