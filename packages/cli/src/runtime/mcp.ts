@@ -1592,27 +1592,28 @@ function applyTokenBinding(policy: PolicyJson, tokenConfig: TokenSourceConfig, b
   addTokenBinding(policy, tokenConfig, binding, options);
 }
 
-// Selection is host-wide, so a binding added at the endpoint's path prefix
-// moves the selected tier past any shorter covering mapping an earlier
-// binding of the same server reused. Once all of a server's bindings are
-// applied, a reused header the proxy no longer selects at the endpoint gets
-// its own mapping there, where it is then the longest match. The result does
-// not depend on the order the server's headers are listed in. A server's
-// bindings all share its endpoint's scope, and an unscoped addition never
-// shadows another unscoped mapping, so only path-scoped bindings reach the
-// second pass.
-function applyServerTokenBindings(
+// Selection is host-wide, so a binding added at its endpoint's path prefix
+// moves the selected tier past any shorter covering mapping that another
+// binding (of the same server or another server on the host) reused. After
+// every server's bindings are applied, a reused header the proxy no longer
+// selects at its endpoint gets its own mapping there, where it is then the
+// longest match; that can shadow another reuse, so this repeats until no
+// binding loses selection. Each round adds a mapping at a binding's own
+// scope, so it ends within one round per binding. The result does not depend
+// on the order of servers or of their headers. An unscoped (root) binding
+// never reaches this: unscoped additions never shadow another unscoped
+// mapping, and a covering path-scoped mapping already refused it.
+function reconcileTokenBindings(
   policy: PolicyJson,
   tokenConfig: TokenSourceConfig,
-  bindings: readonly HeaderTokenBinding[],
-  options: { autoTokenSource: boolean },
+  bindings: readonly { binding: HeaderTokenBinding; options: { autoTokenSource: boolean } }[],
 ): void {
-  for (const binding of bindings) applyTokenBinding(policy, tokenConfig, binding, options);
-  for (const binding of bindings) {
-    if (selectedCredentialOwner(policy, binding.credential).owner === undefined) {
-      addTokenBinding(policy, tokenConfig, binding, options);
-    }
+  for (let round = 0; round <= bindings.length; round += 1) {
+    const unselected = bindings.filter(({ binding }) => selectedCredentialOwner(policy, binding.credential).owner === undefined);
+    if (unselected.length === 0) return;
+    for (const { binding, options } of unselected) addTokenBinding(policy, tokenConfig, binding, options);
   }
+  throw new Error("mcp: credential bindings did not settle; review the MCP server URLs and network policy credentials for this host");
 }
 
 function addTokenBinding(policy: PolicyJson, tokenConfig: TokenSourceConfig, binding: HeaderTokenBinding, options: { autoTokenSource: boolean }): void {
@@ -1639,6 +1640,7 @@ function addTokenBinding(policy: PolicyJson, tokenConfig: TokenSourceConfig, bin
 }
 
 function applyPolicyAndTokens(policy: PolicyJson, tokenConfig: TokenSourceConfig, servers: PreparedMcpServer[]): void {
+  const applied: { binding: HeaderTokenBinding; options: { autoTokenSource: boolean } }[] = [];
   for (const server of servers) {
     if (server.transport === "http" && (server.claudeConfig || server.codexConfig)) {
       const url = (server.claudeConfig?.url ?? server.codexConfig?.url) as string | undefined;
@@ -1650,8 +1652,13 @@ function applyPolicyAndTokens(policy: PolicyJson, tokenConfig: TokenSourceConfig
     for (const endpoint of server.oauthPolicy?.tokenEndpoints ?? []) {
       ensureDomain(policy, typeof endpoint === "string" ? new URL(endpoint).hostname.toLowerCase() : endpoint.host);
     }
-    applyServerTokenBindings(policy, tokenConfig, server.tokenBindings, { autoTokenSource: server.source !== "project" });
+    const options = { autoTokenSource: server.source !== "project" };
+    for (const binding of server.tokenBindings) {
+      applyTokenBinding(policy, tokenConfig, binding, options);
+      applied.push({ binding, options });
+    }
   }
+  reconcileTokenBindings(policy, tokenConfig, applied);
 }
 
 export function mcpOAuthProviderId(agent: McpAgent, serverName: string): string {

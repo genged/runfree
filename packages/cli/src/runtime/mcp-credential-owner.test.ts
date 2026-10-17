@@ -320,4 +320,59 @@ describe("MCP header-token ownership with protocol-scoped mappings", () => {
       expect(mutation.headers?.["x-api-key"]).toBe("mcp-key");
     });
   }
+
+  // Reconciliation spans servers: a later server's binding at `/api` creates
+  // a tier that shadows, at `/api/mcp`, the unscoped X-Api-Key mapping an
+  // earlier server reused. Both server orders inject each server's header.
+  for (const order of ["nested server first", "outer server first"] as const) {
+    test(`MCP servers on one host get their headers injected whatever the server order (${order})`, () => {
+      const policy: PolicyJson = {
+        hosts: ["mcp.example.com"],
+        tokens: {
+          apikey: {
+            description: "api key",
+            credentials: [{ host: "mcp.example.com", header: "X-Api-Key", scheme: "raw" }],
+          },
+        },
+      };
+      const nested = { nested: { type: "http", url: "https://mcp.example.com/api/mcp", headers: { "X-Api-Key": "${NESTED_KEY}" } } };
+      const outer = { outer: { type: "http", url: "https://mcp.example.com/api", headers: { Authorization: "Bearer ${OUTER_TOKEN}" } } };
+      fs.writeFileSync(path.join(hostHome, ".claude.json"), JSON.stringify({
+        mcpServers: order === "nested server first" ? { ...nested, ...outer } : { ...outer, ...nested },
+      }));
+      const runDir = path.join(tmp, "run");
+      const result = prepareMcpRuntime({
+        callbackPort: 47638,
+        claudeConfigPath: path.join(runDir, "claude.json"),
+        claudeMcpConfigPath: path.join(runDir, "claude-mcp.json"),
+        codexDir: path.join(runDir, "codex"),
+        env: { HOME: hostHome, CODEX_HOME: path.join(hostHome, ".codex") },
+        mcpOAuthPolicyPath: path.join(runDir, "mcp-oauth-policy.json"),
+        policy,
+        projectRoot,
+        tokenConfig: {},
+      });
+      flushWarnings();
+
+      const loaded = validateNetworkPolicy(result.policy);
+      const tokens: Record<string, string> = {
+        apikey: "existing-key",
+        "mcp-claude-nested-x-api-key": "nested-key",
+        "mcp-claude-outer-auth": "outer-token",
+      };
+      const send = (url: string) => beforeAllowedRequest({
+        v: 1, host: "mcp.example.com", port: 443, policyGeneration: "sha256:test-policy",
+        admittedAtMs: Date.now(), connectionSerial: 1, stage: "request",
+      }, { method: "POST", url, headers: { Authorization: "Bearer x", "X-Api-Key": "x" } }, {
+        allowedHosts: loaded.allowedHosts,
+        credentials: loaded.credentials,
+        writeApproval: "allow",
+        tokenReader: (name) => tokens[name] ?? null,
+        log: () => {},
+      }).headers;
+      expect(send("https://mcp.example.com/api/mcp")?.["x-api-key"]).toBeDefined();
+      expect(send("https://mcp.example.com/api")?.authorization).toBe("Bearer outer-token");
+    });
+  }
 });
+
