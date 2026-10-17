@@ -10,6 +10,7 @@ import {
   normalizePathPrefix,
   type CredentialPolicyJson,
 } from "@runfree/runtime-contracts/network-policy";
+import { describeCredential } from "../admin/credential-describe.ts";
 import type { CredentialFieldsInput } from "../admin/options.ts";
 import { CliError } from "../errors.ts";
 import type { RuntimeContext, RuntimeIO } from "../runtime/types.ts";
@@ -35,6 +36,39 @@ export type DesiredCredentialMutationResult = {
 
 function credentialIdentity(credential: CredentialPolicyJson): string {
   return `${credential.host}\0${credential.header.toLowerCase()}`;
+}
+
+// Desired policy v3 allows several destinations of one token on one host and
+// header, set apart by protocol or path prefix. The CLI's --host/--header
+// selector cannot name one of them yet, so a mutation that would have to pick
+// one refuses before any policy write rather than act on the first match.
+const NO_DESTINATION_SELECTOR = "the CLI cannot yet select one destination of several on the same host and header";
+
+function sameDestination(a: CredentialPolicyJson, b: CredentialPolicyJson): boolean {
+  return a.scheme === b.scheme && a.username === b.username && a.pathPrefix === b.pathPrefix && a.protocol === b.protocol;
+}
+
+function destinationList(destinations: readonly CredentialPolicyJson[]): string {
+  return destinations.map(describeCredential).join("; ");
+}
+
+/**
+ * Whether `credential` is already one of `name`'s destinations. A destination
+ * on the same host and header that differs in scope refuses: adding beside it
+ * would need a second destination on that host and header, and doing nothing
+ * would report success for a scope that was never written.
+ */
+function destinationAlreadyLinked(name: string, linked: readonly CredentialPolicyJson[], credential: CredentialPolicyJson): boolean {
+  const identity = credentialIdentity(credential);
+  const matches = linked.filter((entry) => credentialIdentity(entry) === identity);
+  if (matches.length === 0) return false;
+  if (matches.some((entry) => sameDestination(entry, credential))) return true;
+  const [only] = matches;
+  if (matches.length === 1 && only && only.scheme !== credential.scheme) {
+    throw new CliError(`${name} is already linked to ${credential.host} ${credential.header} with scheme ${only.scheme}`);
+  }
+  throw new CliError(`${name} already has a destination for ${credential.host} ${credential.header} with another scope: `
+    + `${destinationList(matches)}; requested ${describeCredential(credential)}; ${NO_DESTINATION_SELECTOR}`);
 }
 
 function assertNotReservedHost(host: string): void {
@@ -113,12 +147,9 @@ export function reconcileDesiredCredential(
       if (mutation.description !== undefined && mutation.description.trim() === "") {
         throw new CliError("--description must be non-empty");
       }
-      const identity = credentialIdentity(mutation.credential);
-      const linked = existing.credentials.find((entry) => credentialIdentity(entry) === identity);
-      if (linked && linked.scheme !== mutation.credential.scheme) {
-        throw new CliError(`${name} is already linked to ${mutation.credential.host} ${mutation.credential.header} with scheme ${linked.scheme}`);
+      if (!destinationAlreadyLinked(name, existing.credentials, mutation.credential)) {
+        existing.credentials.push(mutation.credential);
       }
-      if (!linked) existing.credentials.push(mutation.credential);
     }
   } else {
     const existing = policy.tokens[name];
@@ -131,9 +162,8 @@ export function reconcileDesiredCredential(
         if (otherName !== name) {
           throw new CliError(`${mutation.credential.host} ${mutation.credential.header} is already credentialed by token ${otherName}`);
         }
-        if (linked.scheme !== mutation.credential.scheme) {
-          throw new CliError(`${name} is already linked to ${mutation.credential.host} ${mutation.credential.header} with scheme ${linked.scheme}`);
-        }
+      }
+      if (destinationAlreadyLinked(name, existing.credentials, mutation.credential)) {
         return { changed: false, name, policy };
       }
       existing.credentials.push(mutation.credential);
@@ -142,10 +172,14 @@ export function reconcileDesiredCredential(
       assertNotReservedHost(host);
       const header = mutation.header ?? "Authorization";
       if (header.trim() === "") throw new CliError("--header must be non-empty");
-      const index = existing.credentials.findIndex((entry) =>
+      const matches = existing.credentials.filter((entry) =>
         entry.host === host && entry.header.toLowerCase() === header.toLowerCase());
-      if (index < 0) throw new CliError(`${name} has no destination for ${host} ${header}`);
-      existing.credentials.splice(index, 1);
+      if (matches.length === 0) throw new CliError(`${name} has no destination for ${host} ${header}`);
+      if (matches.length > 1) {
+        throw new CliError(`${name} has ${matches.length} destinations for ${host} ${header}: ${destinationList(matches)}; `
+          + `${NO_DESTINATION_SELECTOR}, so none was unlinked`);
+      }
+      existing.credentials.splice(existing.credentials.indexOf(matches[0] as CredentialPolicyJson), 1);
     } else {
       delete policy.tokens[name];
     }

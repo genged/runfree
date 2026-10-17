@@ -11,6 +11,8 @@ import {
   desiredCredentialFromFields,
   mutateDesiredCredential,
 } from "./credential-mutation.ts";
+import { approveNetworkCandidate } from "./approvals.ts";
+import { captureDesiredPolicyCandidate } from "./candidates.ts";
 import { mutateDesiredHost } from "./local-host-mutation.ts";
 
 describe("desired credential mutations", () => {
@@ -149,5 +151,67 @@ describe("desired credential mutations", () => {
     })).rejects.toThrow("reserved runfree.internal suffix");
 
     expect(fs.readFileSync(context.project.paths.policyPath, "utf8")).toBe(before);
+  });
+
+  describe("several destinations on one host and header (desired policy v3)", () => {
+    const scoped = (pathPrefix: string, protocol?: "git-http" | "git-lfs") => ({
+      host: "git.example.com", header: "Authorization", scheme: "bearer" as const, pathPrefix,
+      ...(protocol ? { protocol } : {}),
+    });
+
+    // A hand-written, approved v3 policy: the CLI cannot write two destinations
+    // on one host and header itself.
+    function approvedPolicy(credentials: Array<ReturnType<typeof scoped>>): { bytes: string; mtimeMs: number } {
+      const file = context.project.paths.policyPath;
+      fs.writeFileSync(file, `${JSON.stringify({ version: credentials.length > 1 ? 3 : 2, hosts: ["git.example.com"],
+        tokens: { git: { description: "Git token", credentials } } })}\n`);
+      const candidate = captureDesiredPolicyCandidate(root, context.project.paths.controlCandidatesDir);
+      approveNetworkCandidate(root, context.project, candidate, "network-project", "interactive");
+      approveNetworkCandidate(root, context.project, candidate, "network-local", "interactive");
+      fs.utimesSync(file, new Date(1_000_000), new Date(1_000_000));
+      return snapshot();
+    }
+
+    function snapshot(): { bytes: string; mtimeMs: number } {
+      const file = context.project.paths.policyPath;
+      return { bytes: fs.readFileSync(file, "utf8"), mtimeMs: fs.statSync(file).mtimeMs };
+    }
+
+    test.each([
+      ["two path prefixes", [scoped("/a"), scoped("/b")], /path \/a\).*path \/b\)/],
+      ["git-http and git-lfs", [scoped("/repo", "git-http"), scoped("/repo", "git-lfs")], /protocol=git-http\).*protocol=git-lfs\)/],
+    ])("unlink refuses before any write when %s match", async (_name, credentials, named) => {
+      const before = approvedPolicy(credentials);
+      const refusal = mutateDesiredCredential(context, io, { kind: "unlink", name: "git", host: "git.example.com" });
+      await expect(refusal).rejects.toThrow("git has 2 destinations for git.example.com Authorization");
+      await expect(refusal).rejects.toThrow(named);
+      await expect(refusal).rejects.toThrow("cannot yet select one destination of several on the same host and header, so none was unlinked");
+      expect(snapshot()).toEqual(before);
+    });
+
+    test("unlink of the only destination on a host and header still removes it", async () => {
+      approvedPolicy([scoped("/a")]);
+      const result = await mutateDesiredCredential(context, io, { kind: "unlink", name: "git", host: "git.example.com" });
+      expect(result.changed).toBe(true);
+      expect(policy().tokens?.git.credentials).toEqual([]);
+    });
+
+    test.each(["add", "link"] as const)("%s with another path prefix on a linked host and header refuses, not a silent no-op", async (kind) => {
+      const before = approvedPolicy([scoped("/a")]);
+      const credential = desiredCredentialFromFields({ host: "git.example.com", pathPrefix: "/b" });
+      await expect(mutateDesiredCredential(context, io, { kind, name: "git", credential })).rejects.toThrow(
+        "git already has a destination for git.example.com Authorization with another scope: "
+          + "git.example.com -> Authorization (bearer, path /a); requested git.example.com -> Authorization (bearer, path /b)",
+      );
+      expect(snapshot()).toEqual(before);
+    });
+
+    test.each(["add", "link"] as const)("%s of a destination already present is unchanged", async (kind) => {
+      const before = approvedPolicy([scoped("/a"), scoped("/b")]);
+      const credential = desiredCredentialFromFields({ host: "git.example.com", pathPrefix: "/b" });
+      const result = await mutateDesiredCredential(context, io, { kind, name: "git", credential });
+      expect(result.changed).toBe(false);
+      expect(snapshot().bytes).toBe(before.bytes);
+    });
   });
 });

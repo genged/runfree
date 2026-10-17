@@ -1330,18 +1330,7 @@ export function isUserServiceOwnedTokenSource(source: TokenSource | undefined, i
 // token add/link and host add. `host` is already normalized by the caller.
 export type CredentialFieldsInput = { host?: string; header?: string; scheme?: string; pathPrefix?: string };
 
-// `(scheme[:username][, path P][, protocol=X])`: everything that decides what is
-// sent and where, so two mappings on one host and header read apart.
-export function describeCredentialScope(credential: CredentialPolicyJson): string {
-  const scheme = credential.username !== undefined ? `${credential.scheme}:${credential.username}` : credential.scheme;
-  const pathScope = credential.pathPrefix ? `, path ${credential.pathPrefix}` : "";
-  const protocolScope = credential.protocol !== undefined ? `, protocol=${credential.protocol}` : "";
-  return `(${scheme}${pathScope}${protocolScope})`;
-}
-
-export function describeCredential(credential: CredentialPolicyJson): string {
-  return `${credential.host} -> ${credential.header} ${describeCredentialScope(credential)}`;
-}
+export { describeCredential, describeCredentialScope } from "./credential-describe.ts";
 
 function childEnvForCommand(command: string): NodeJS.ProcessEnv {
   return command === "docker" ? dockerChildEnv() : childEnv();

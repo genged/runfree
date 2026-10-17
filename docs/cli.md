@@ -389,6 +389,14 @@ Useful options:
 | `--refresh-every 15m` | `credential set-source`, `credential add` | Re-resolve source on an interval. |
 | `--from-env`, `--from-1password`, `--from-source`, `--from-stdin` | credential source binding | Choose one credential source. |
 
+The CLI selects a destination by host and header only. When a credential
+already has a destination on that host and header with a different scope
+(path prefix or protocol), `credential add` and `credential link` refuse
+rather than report it unchanged. `credential unlink` refuses when more than
+one destination of the credential matches. Each refusal names the matching
+destinations and writes no policy. To change one of several destinations,
+edit `.runfree/network-policy.json`, then approve it with `runfree policy approve --project`.
+
 Credential commands never widen network policy. Use `service enable` or `mcp enable` when you want a reviewed composite workflow that manages hosts and credentials together.
 
 ## Services
