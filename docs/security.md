@@ -397,6 +397,10 @@ upgrade, a proxy still running the previous build.
 
   If a proxy of another build appears while the effective policy generation is published, the
   previous selection is restored and the command fails, asking for a retry.
+  The identity check and publication are not serialized with a concurrent
+  runtime start by another Runfree build; every reader older than this
+  release refuses a policy that uses the new fields (its manifest generation
+  check fails), so the outcome is availability, not wider credential reach.
 - Runtime startup does not use this check. A normal start beside live
   sessions joins their effective policy generation and publishes nothing,
   but a start that publishes approved policy beside live sessions can let a
