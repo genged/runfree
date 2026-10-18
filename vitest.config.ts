@@ -166,7 +166,10 @@ const cliE2eLiveProject: TestProjectConfiguration = {
 
 export default defineConfig({
   test: {
-    pool: "threads",
+    // Forks, not threads: threads share one process, so a fork from any other
+    // file inherits a fake executable this file is still writing, and its
+    // spawn fails with ETXTBSY until that child execs.
+    pool: "forks",
     globals: false,
     // Subprocess-spawning tests slow down under parallel worker contention;
     // the timeout is a hang backstop, not a performance budget.
@@ -189,6 +192,9 @@ export default defineConfig({
           // per project) and builds once per invocation, so another project
           // may declare it too.
           globalSetup: ["tests/support/build-test-bundles.ts"],
+          // Many files spawn subprocesses, so a worker per core oversubscribes
+          // the CPU and starves those children past their timing bounds.
+          maxWorkers: "50%",
           sequence: { groupOrder: 0 },
         },
       },
