@@ -111,15 +111,37 @@ describe("IP-literal HTTPS MCP endpoints", () => {
 
 // The OAuth metadata URL and token endpoints of an HTTPS entry also become
 // effective policy hosts, so an IP literal there is refused the same way.
-const METADATA_REASON = "OAuth metadata URL must be a hostname, not an IP address";
-const TOKEN_REASON = "OAuth token endpoint must be a hostname, not an IP address";
-const IP_FORMS: Record<string, string> = {
-  v4: "https://10.0.0.2",
-  v6: "https://[fd00::2]",
-  decimal: "https://2130706433",
+const IP_SUITE = {
+  title: "IP-literal OAuth metadata and token endpoint hosts",
+  metadataReason: "OAuth metadata URL must be a hostname, not an IP address",
+  tokenReason: "OAuth token endpoint must be a hostname, not an IP address",
+  forms: {
+    v4: "https://10.0.0.2",
+    v6: "https://[fd00::2]",
+    decimal: "https://2130706433",
+  } as Record<string, string>,
 };
 
-describe("IP-literal OAuth metadata and token endpoint hosts", () => {
+// A non-https OAuth URL on an HTTPS MCP server can never reach its issuer:
+// plain HTTP to the proxy is refused, and http://127.0.0.1 reaches the agent
+// container's own loopback, outside OAuth mediation. It was ignored for policy
+// but still copied into the generated agent config, so it is refused instead.
+// Loopback MCP servers (http://127.0.0.1:<port> as the server URL) are a
+// separate class that carries no OAuth keys at all; one is included below to
+// show this refusal does not touch it.
+const SCHEME_SUITE = {
+  title: "non-https OAuth metadata and token endpoint URLs",
+  metadataReason: "OAuth metadata URL must use https",
+  tokenReason: "OAuth token endpoint must use https",
+  forms: {
+    loopback: "http://127.0.0.1:8089",
+    plainhttp: "http://auth.example.com",
+    ftp: "ftp://files.example.com",
+    relative: "not-a-url",
+  } as Record<string, string>,
+};
+
+for (const { title, metadataReason: METADATA_REASON, tokenReason: TOKEN_REASON, forms: IP_FORMS } of [IP_SUITE, SCHEME_SUITE]) describe(title, () => {
   let tmp: string;
   let projectRoot: string;
   let hostHome: string;
@@ -144,6 +166,8 @@ describe("IP-literal OAuth metadata and token endpoint hosts", () => {
         oauth: { tokenEndpoint: "https://token.ok.example.com/token" },
       },
     };
+    // A loopback MCP server: its own URL is plain HTTP, and it must still import.
+    mcpServers.devserver = { type: "http", url: "http://127.0.0.1:8089/mcp" };
     const toml: string[] = [
       "[mcp_servers.okcodex]",
       'url = "https://okc.example.com/mcp"',
@@ -193,6 +217,8 @@ describe("IP-literal OAuth metadata and token endpoint hosts", () => {
     }
     expect(byKey.get("claude:okclaude")?.decision.status).toBe("imported");
     expect(byKey.get("codex:okcodex")?.decision.status).toBe("imported");
+    expect(byKey.get("claude:devserver")?.decision.status).toBe("imported");
+    expect(byKey.get("claude:devserver")?.transport).toBe("http-loopback");
   });
 
   test("launch projects no IP-literal policy host", () => {

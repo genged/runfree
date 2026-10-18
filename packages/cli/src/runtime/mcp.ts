@@ -693,6 +693,8 @@ function httpsUrl(value: unknown): URL | undefined {
 
 const OAUTH_METADATA_IP_REASON = "OAuth metadata URL must be a hostname, not an IP address";
 const OAUTH_TOKEN_ENDPOINT_IP_REASON = "OAuth token endpoint must be a hostname, not an IP address";
+const OAUTH_METADATA_SCHEME_REASON = "OAuth metadata URL must use https";
+const OAUTH_TOKEN_ENDPOINT_SCHEME_REASON = "OAuth token endpoint must use https";
 
 // An OAuth URL host becomes an effective policy host, so it must be a name:
 // WHATWG folds decimal and hex IPv4 forms first, and IPv6 keeps its brackets.
@@ -701,22 +703,34 @@ function ipLiteralUrlHost(parsed: URL): boolean {
   return isIpLiteralHostname(bare);
 }
 
+// A configured OAuth URL on an HTTPS MCP server. Absent is fine; anything else
+// must be an https URL naming a host. A non-https value can never reach its
+// issuer (the proxy refuses plain HTTP, and http://127.0.0.1 is the agent's own
+// loopback, outside OAuth mediation), yet it would still be copied into the
+// generated agent config, so it is refused rather than ignored.
+function configuredOAuthUrl(value: unknown, reasons: { scheme: string; ip: string }): McpRefusal | URL | undefined {
+  if (value === undefined || value === null) return undefined;
+  const parsed = httpsUrl(value);
+  if (!parsed) return { refused: reasons.scheme };
+  if (ipLiteralUrlHost(parsed)) return { refused: reasons.ip };
+  return parsed;
+}
+
 function oauthAuthServerMetadataUrl(config: Record<string, unknown>): McpRefusal | string | undefined {
   const candidates = [config.authServerMetadataUrl, isRecord(config.oauth) ? config.oauth.authServerMetadataUrl : undefined];
+  let selected: string | undefined;
   for (const candidate of candidates) {
-    const parsed = httpsUrl(candidate);
-    if (parsed && ipLiteralUrlHost(parsed)) return { refused: OAUTH_METADATA_IP_REASON };
+    const parsed = configuredOAuthUrl(candidate, { scheme: OAUTH_METADATA_SCHEME_REASON, ip: OAUTH_METADATA_IP_REASON });
+    if (parsed === undefined) continue;
+    if ("refused" in parsed) return parsed;
+    selected ??= candidate as string;
   }
-  for (const candidate of candidates) {
-    if (typeof candidate === "string" && httpsUrl(candidate)) return candidate;
-  }
-  return undefined;
+  return selected;
 }
 
 function tokenEndpointFromConfigValue(value: unknown): McpRefusal | { host: string; path: string } | undefined {
-  const parsed = httpsUrl(value);
-  if (!parsed) return undefined;
-  if (ipLiteralUrlHost(parsed)) return { refused: OAUTH_TOKEN_ENDPOINT_IP_REASON };
+  const parsed = configuredOAuthUrl(value, { scheme: OAUTH_TOKEN_ENDPOINT_SCHEME_REASON, ip: OAUTH_TOKEN_ENDPOINT_IP_REASON });
+  if (parsed === undefined || "refused" in parsed) return parsed;
   let host: string;
   try {
     host = normalizeHostname(parsed.hostname);

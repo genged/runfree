@@ -490,7 +490,9 @@ Details: [Write Approval Grants](architecture.md#write-approval-grants).
    running in the agent from starting another binary or config.
 3. Static headers need a host-owned credential source. An HTTPS MCP endpoint,
    OAuth metadata URL, and OAuth token endpoint must name a hostname; an entry
-   where any of them names an IP address is skipped.
+   where any of them names an IP address is skipped. An OAuth metadata URL or
+   token endpoint that is not `https:` is skipped too, because it would send the
+   OAuth exchange outside the proxy's mediation.
 4. HTTPS MCP tool calls follow the write-approval rules (`runfree mcp rules`).
    STDIO MCP servers and loopback HTTP MCP servers (`http://127.0.0.1:<port>`)
    do not pass the proxy, so write approval does not apply and `runfree mcp
