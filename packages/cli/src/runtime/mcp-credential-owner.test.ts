@@ -470,14 +470,20 @@ describe("MCP header-token ownership with protocol-scoped mappings", () => {
   // secret. Refused before any policy change, in both orders.
   for (const order of ["Authorization first", "Auth first"] as const) {
     test(`two headers that generate one token name are refused (${order})`, () => {
-      const policy: PolicyJson = { hosts: ["mcp.example.com"] };
+      // The endpoint host is not yet allowed, so a refusal after the policy
+      // was widened would show here.
+      const policy: PolicyJson = { hosts: [] };
       const before = structuredClone(policy);
+      const runDir = path.join(tmp, "run");
+      fs.mkdirSync(runDir, { recursive: true });
+      fs.writeFileSync(path.join(runDir, "claude-mcp.json"), "previous\n");
       const authorization = { Authorization: "Bearer ${A_TOKEN}" };
       const auth = { Auth: "${B_TOKEN}" };
       const headers = order === "Authorization first" ? { ...authorization, ...auth } : { ...auth, ...authorization };
       expect(() => prepare("https://mcp.example.com/mcp", policy, headers))
         .toThrow(/both map to proxy token mcp-claude-ghmcp-auth/);
       expect(policy).toEqual(before);
+      expect(fs.readFileSync(path.join(runDir, "claude-mcp.json"), "utf8")).toBe("previous\n");
 
       // Recovery: with only one of the two headers, the server prepares.
       const result = prepare("https://mcp.example.com/mcp", policy, authorization);

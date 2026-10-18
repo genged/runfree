@@ -1939,6 +1939,11 @@ export function claudeMcpConfigMount(
   };
 }
 
+function replaceObjectContents<T extends object>(target: T, source: T): void {
+  for (const key of Object.keys(target)) delete (target as Record<string, unknown>)[key];
+  Object.assign(target, source);
+}
+
 export function prepareMcpRuntime(options: McpPrepareOptions): McpPrepareResult {
   const originalPolicy = stableJson(options.policy);
   const originalTokenConfig = stableJson(options.tokenConfig);
@@ -1976,9 +1981,17 @@ export function prepareMcpRuntime(options: McpPrepareOptions): McpPrepareResult 
     }
   }
 
+  // Policy and token bindings are computed on copies before any file is
+  // written, so a refusal (a shadowed root endpoint, a token-name collision)
+  // leaves the caller's policy and token config and the generated agent
+  // configs unchanged.
+  const policyDraft = structuredClone(options.policy);
+  const tokenConfigDraft = structuredClone(options.tokenConfig);
+  applyPolicyAndTokens(policyDraft, tokenConfigDraft, servers);
   writeClaudeRuntimeConfig(options.claudeConfigPath, options.claudeMcpConfigPath, servers);
   writeCodexRuntimeConfig(options.codexDir, servers);
-  applyPolicyAndTokens(options.policy, options.tokenConfig, servers);
+  replaceObjectContents(options.policy, policyDraft);
+  replaceObjectContents(options.tokenConfig, tokenConfigDraft);
   // `runfree mcp enable` records join the servers prepared in this pass by the
   // MCP rules identity (descriptor digest for project servers, endpoint for
   // user/local servers): a changed or deleted server matches no record. Their
