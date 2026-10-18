@@ -85,11 +85,11 @@ function ownerText(owner: HostPortOwner): string {
 
 /**
  * The ports of the effective policy generation an activation left selected:
- * the one it selected, else whatever is still selected (a deferred
- * activation), else none.
+ * the one it selected, else whatever is still selected (a deferred or
+ * waiting activation), else none.
  */
 function selectedEffectiveHostServicePorts(runtime: RuntimeContext, activation: ControlActivationResult): number[] {
-  const controlGeneration = activation.kind === "deferred"
+  const controlGeneration = activation.kind === "deferred" || activation.kind === "waiting"
     ? readActiveControlSelection(runtime.project)?.controlGeneration
     : activation.controlGeneration;
   return controlGeneration === undefined ? [] : readEffectiveHostServices(runtime.project, controlGeneration).ports;

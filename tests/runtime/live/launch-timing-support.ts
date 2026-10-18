@@ -69,7 +69,9 @@ export function runfreeTimed(target: LiveFixture, args: readonly string[]): Capt
 export function launchClaudeTimed(target: LiveFixture): CaptureResult {
   const launched = runfreeTimed(target, ["claude"]);
   // Timing lines fill the tail describeOutput keeps; a failure needs the errors.
-  const withoutTimings = launched.output.split("\n").filter((line) => !line.includes(" timing: ")).join("\n");
+  // The admission phases stay: they show which step of a failed launch overran.
+  const withoutTimings = launched.output.split("\n")
+    .filter((line) => !line.includes(" timing: ") || line.includes(" timing: admission:")).join("\n");
   expect(launched.status, describeOutput(withoutTimings, 4000)).toBe(0);
   return launched;
 }

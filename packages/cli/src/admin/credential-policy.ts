@@ -7,9 +7,6 @@ import type {
   TokenResolutionReceipt,
 } from "../token-resolution.ts";
 import {
-  type CredentialPolicyJson,
-} from "@runfree/runtime-contracts/network-policy";
-import {
   assertNotReservedUserTokenName,
   assertRefreshBeforeJwtExpiry,
   assertTokenSourceCanBeSaved,
@@ -18,8 +15,6 @@ import {
   createCredentialPreparationScope,
   type CredentialAddInput,
   type CredentialClearSourceInput,
-  type CredentialFieldsInput,
-  credentialFromHost,
   credentialOwner,
   credentialOwnerRemediation,
   type CredentialSetSourceInput,
@@ -42,7 +37,6 @@ import {
   loadTokenConfig,
   loadTokenStatus,
   newTokenResolutionLedger,
-  normalizeCliHost,
   parseDurationSeconds,
   planWatchCredentialReads,
   printTokenSyncFailures,
@@ -100,11 +94,6 @@ For a non-login proxy credential, create a credential policy first:
 create a proxy credential first, for example:
   runfree credential add ${name} --host <host>`);
   }
-}
-
-function _credentialFromInput(fields: CredentialFieldsInput): CredentialPolicyJson {
-  if (!fields.host) die("credential commands require --host <host>");
-  return credentialFromHost(normalizeCliHost(fields.host), fields);
 }
 
 // Typed front-end builder for the yargs command modules: turn the parsed

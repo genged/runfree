@@ -215,14 +215,26 @@ export function withSetupDeadline(io: RuntimeIO, remainingMs: () => number, budg
     if (left <= 0) throw new Error(`the callback setup used its whole ${budgetMs} ms budget`);
     return { ...(options ?? {}), timeout: Math.min(options?.timeout ?? left, left), killSignal: "SIGKILL" };
   };
+  // A killed call leaves stderr empty, so callers' `stderr || "failed to …"`
+  // messages would hide that the cut, not Docker, ended it.
+  const named = (command: string, args: string[], bound: childProcess.SpawnSyncOptions, result: CaptureResult): CaptureResult => {
+    if (!result.timedOut) return result;
+    const note = `${[command, args[0]].filter(Boolean).join(" ")} timed out after ${bound.timeout} ms (MCP OAuth callback setup budget ${budgetMs} ms)`;
+    return { ...result, stderr: result.stderr.trim() ? `${result.stderr.trimEnd()}\n${note}` : note };
+  };
   const { captureAsync } = io;
   return {
     ...io,
-    capture: (command, args, options) => io.capture(command, args, bounded(options)),
+    capture: (command, args, options) => {
+      const bound = bounded(options);
+      return named(command, args, bound, io.capture(command, args, bound));
+    },
     run: (command, args, options) => io.run(command, args, bounded(options)),
     ...(captureAsync ? {
-      captureAsync: async (command: string, args: string[], options?: childProcess.SpawnSyncOptions) =>
-        captureAsync.call(io, command, args, bounded(options)),
+      captureAsync: async (command: string, args: string[], options?: childProcess.SpawnSyncOptions) => {
+        const bound = bounded(options);
+        return named(command, args, bound, await captureAsync.call(io, command, args, bound));
+      },
     } : {}),
   };
 }

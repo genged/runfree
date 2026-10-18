@@ -31,8 +31,9 @@ describe("desired service entries", () => {
       skippedHosts: ["objects.githubusercontent.com"],
       writeMode: "read-only",
     });
+    // The github.com git-http Basic mapping needs desired version 3.
     const policy = validateDesiredNetworkPolicy({
-      version: 2,
+      version: 3,
       hosts: [],
       services: { github: entry },
     });
@@ -40,7 +41,7 @@ describe("desired service entries", () => {
     expect(policy.services?.github).toEqual(entry);
     expect(entry.resolved.hosts).not.toContain("objects.githubusercontent.com");
     expect(entry.resolved.tokens?.github).toMatchObject({
-      description: "GitHub API token for API and raw content requests",
+      description: "GitHub token for API, raw content, and git over HTTPS requests",
     });
     expect(entry.resolved.agentEnv).toEqual(["GH_TOKEN", "GITHUB_TOKEN"]);
     expect(JSON.stringify(entry)).not.toMatch(/from-env|from-source|op:\/\/|sourceCommand|secretRef/);

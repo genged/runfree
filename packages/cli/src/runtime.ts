@@ -502,11 +502,14 @@ async function operationalServiceIds(context: RuntimeContext, io: RuntimeIO): Pr
 // so without this the new session runs on a policy that still denies the hosts
 // just approved. With no live session, startup prepares the approved policy
 // itself. The enable is already saved and approved; a failed activation stops
-// the launch and names the command that applies it.
+// the launch and names the command that applies it. A proxy from another
+// Runfree build is never replaced from here: that would nest a runtime start
+// inside this launch's own. The change is reported as waiting instead, and the
+// launch goes on with the selected effective policy generation.
 async function activateLaunchServiceBesideLiveSessions(context: RuntimeContext, io: RuntimeIO): Promise<number> {
   if (activeLifecycleSessions(context).length === 0) return 0;
   try {
-    console.log(activationReportLine(await activateApprovedControlsAfterMutation(context, io)));
+    console.log(activationReportLine(await activateApprovedControlsAfterMutation(context, io, { proxyFromAnotherBuild: "wait" })));
     return 0;
   } catch (error) {
     console.error(`could not apply the enabled service beside the live session: ${error instanceof Error ? error.message : String(error)}`);

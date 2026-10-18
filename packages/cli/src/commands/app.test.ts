@@ -2319,3 +2319,48 @@ describe("approvals flag precedence", () => {
       .rejects.toThrow("reached the approvals runtime");
   });
 });
+
+// T8: `basic` is in the shared contract scheme list, but it needs a username
+// and is reachable only through service definitions. The CLI checks its own
+// subset and refuses before the desired-policy transaction writes anything.
+describe("credential --scheme basic", () => {
+  test("credential add and link refuse --scheme basic before any policy or state write", async () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "runfree-credential-basic-"));
+    tempDirs.push(tmp);
+    const projectRoot = path.join(tmp, "project");
+    const stateDir = path.join(tmp, "state");
+    fs.mkdirSync(path.join(projectRoot, ".runfree"), { recursive: true });
+    fs.mkdirSync(stateDir, { recursive: true });
+    const policyPath = path.join(projectRoot, ".runfree", "network-policy.json");
+    fs.writeFileSync(policyPath, `${JSON.stringify({ version: 2, hosts: ["api.example.com"] })}\n`);
+    const past = new Date(Date.now() - 60_000);
+    fs.utimesSync(policyPath, past, past);
+    const env = {
+      HOME: path.join(tmp, "home"),
+      RUNFREE_TEST_FAKE_DOCKER: "1",
+      XDG_CONFIG_HOME: path.join(tmp, "config"),
+      XDG_STATE_HOME: stateDir,
+    };
+    const context = strictContext({
+      env,
+      projectRoot,
+      adminContext: () => ({ env, packageRoot: tmp, projectRoot, stateDir }),
+      runtimeContext: () => ({ projectRoot, project: projectInfo(projectRoot, env), runtimeRoot: projectRoot, env }),
+    });
+    const before = { bytes: fs.readFileSync(policyPath, "utf8"), mtimeMs: fs.statSync(policyPath).mtimeMs };
+    const runDefault = vi.fn(async () => 0);
+
+    for (const argv of [
+      ["credential", "add", "gh", "--host", "api.example.com", "--scheme", "basic", "--no-reload"],
+      ["credential", "link", "gh", "--host", "api.example.com", "--scheme", "basic", "--no-reload"],
+    ]) {
+      await expect(runCommandApp(context, argv, runDefault), argv.join(" "))
+        .rejects.toThrow("--scheme must be one of: bearer, raw");
+    }
+
+    expect(fs.readFileSync(policyPath, "utf8")).toBe(before.bytes);
+    expect(fs.statSync(policyPath).mtimeMs).toBe(before.mtimeMs);
+    expect(fs.readdirSync(stateDir, { recursive: true })).toEqual([]);
+    expect(runDefault).not.toHaveBeenCalled();
+  });
+});

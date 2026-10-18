@@ -22,9 +22,7 @@ import {
   TOKEN_NAME_PATTERN,
   type WriteAction,
   assertTokenName,
-  credentialSchemeList,
   describeRequestRule,
-  isCredentialScheme,
   isTokenName,
   normalizeHostname,
   normalizePathPrefix,
@@ -1332,32 +1330,7 @@ export function isUserServiceOwnedTokenSource(source: TokenSource | undefined, i
 // token add/link and host add. `host` is already normalized by the caller.
 export type CredentialFieldsInput = { host?: string; header?: string; scheme?: string; pathPrefix?: string };
 
-export function credentialFromHost(host: string, fields: CredentialFieldsInput): CredentialPolicyJson {
-  const header = fields.header ?? "Authorization";
-  if (header.trim() === "") die("--header must be non-empty");
-
-  const rawScheme = fields.scheme ?? "bearer";
-  if (!isCredentialScheme(rawScheme)) die(`--scheme must be one of: ${credentialSchemeList()}`);
-
-  if (fields.pathPrefix === undefined) return { host, header, scheme: rawScheme };
-
-  try {
-    return {
-      host,
-      header,
-      scheme: rawScheme,
-      pathPrefix: normalizePathPrefix(fields.pathPrefix),
-    };
-  } catch (error) {
-    die(error instanceof Error ? error.message : String(error));
-  }
-}
-
-
-export function describeCredential(credential: CredentialPolicyJson): string {
-  const pathScope = credential.pathPrefix ? `, path ${credential.pathPrefix}` : "";
-  return `${credential.host} -> ${credential.header} (${credential.scheme}${pathScope})`;
-}
+export { describeCredential, describeCredentialScope } from "./credential-describe.ts";
 
 function childEnvForCommand(command: string): NodeJS.ProcessEnv {
   return command === "docker" ? dockerChildEnv() : childEnv();

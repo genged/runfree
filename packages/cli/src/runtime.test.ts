@@ -43,6 +43,8 @@ const activationSeam = vi.hoisted(() => ({
   calls: 0,
   fail: undefined as undefined | Error,
   enabled: false,
+  options: [] as unknown[],
+  result: undefined as undefined | { kind: "waiting"; reason: string },
 }));
 vi.mock("./control/activation.ts", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./control/activation.ts")>();
@@ -51,8 +53,9 @@ vi.mock("./control/activation.ts", async (importOriginal) => {
     activateApprovedControlsAfterMutation: async (...args: Parameters<typeof actual.activateApprovedControlsAfterMutation>) => {
       if (!activationSeam.enabled) return actual.activateApprovedControlsAfterMutation(...args);
       activationSeam.calls += 1;
+      activationSeam.options.push(args[2]);
       if (activationSeam.fail) throw activationSeam.fail;
-      return { kind: "converged" as const, controlGeneration: "sha256:seam" };
+      return activationSeam.result ?? { kind: "converged" as const, controlGeneration: "sha256:seam" };
     },
   };
 });
@@ -1142,6 +1145,8 @@ afterEach(() => {
   activationSeam.calls = 0;
   activationSeam.fail = undefined;
   activationSeam.enabled = false;
+  activationSeam.options = [];
+  activationSeam.result = undefined;
   if (previousPath === undefined) {
     delete process.env.PATH;
   } else {
@@ -3399,6 +3404,15 @@ describe("runtime recovery", () => {
       "[user]",
       "\tname = \"Repo Local\"",
       "\temail = \"repo-local@example.test\"",
+      "[url \"https://github.com/\"]",
+      "\tinsteadOf = git@github.com:",
+      "\tinsteadOf = ssh://git@github.com/",
+      "\tinsteadOf = ssh://git@github.com:22/",
+      "\tinsteadOf = ssh://git@ssh.github.com:443/",
+      "[url \"https://gitlab.com/\"]",
+      "\tinsteadOf = git@gitlab.com:",
+      "\tinsteadOf = ssh://git@gitlab.com/",
+      "\tinsteadOf = ssh://git@gitlab.com:22/",
       "",
     ].join("\n"));
     expect(fs.statSync(project.paths.gitConfigPath).mode & 0o777).toBe(0o644);
@@ -3441,6 +3455,15 @@ describe("runtime recovery", () => {
       "[user]",
       "\tname = \"Host Global\"",
       "\temail = \"host-global@example.test\"",
+      "[url \"https://github.com/\"]",
+      "\tinsteadOf = git@github.com:",
+      "\tinsteadOf = ssh://git@github.com/",
+      "\tinsteadOf = ssh://git@github.com:22/",
+      "\tinsteadOf = ssh://git@ssh.github.com:443/",
+      "[url \"https://gitlab.com/\"]",
+      "\tinsteadOf = git@gitlab.com:",
+      "\tinsteadOf = ssh://git@gitlab.com/",
+      "\tinsteadOf = ssh://git@gitlab.com:22/",
       "",
     ].join("\n"));
   });
@@ -10093,6 +10116,33 @@ describe("runtime command flow", () => {
     expect(activationSeam.calls).toBe(1);
     expect(vi.mocked(console.log).mock.calls.flat().join("\n"))
       .toContain("effective policy: live now (effective policy generation sha256:seam)");
+  });
+
+  // D-3: replacing a proxy from another build is a runtime start, and the
+  // launch is about to run its own. The launch asks activation to report the
+  // change as waiting instead, and goes on.
+  test("a launch-time service enable beside a proxy from another build reports waiting and does not stop the launch", async () => {
+    const projectRoot = path.join(tmp, "project");
+    const project = prepareProject(projectRoot);
+    const io = createRuntimeIO();
+    liveSessionSeam.active = [{ command: "claude", containerTty: "/dev/pts/0", name: "rf-live", processCount: 1 }];
+    activationSeam.enabled = true;
+    activationSeam.result = { kind: "waiting", reason: "the running proxy is from another Runfree build; replace the proxy with: runfree up" };
+
+    await runAgentCommand({
+      projectRoot,
+      project,
+      runtimeRoot: path.join(tmp, "runtime"),
+      env: { PATH: "/fake-bin" },
+      network: fixedNetwork,
+    }, io, "codex", { quiet: false, verbose: false }).catch(() => 1);
+
+    expect(activationSeam.calls).toBe(1);
+    expect(activationSeam.options).toEqual([{ proxyFromAnotherBuild: "wait" }]);
+    expect(vi.mocked(console.log).mock.calls.flat().join("\n"))
+      .toContain("effective policy: saved, not applied: the running proxy is from another Runfree build; replace the proxy with: runfree up");
+    expect(vi.mocked(console.error).mock.calls.flat().join("\n")).not.toContain("could not apply the enabled service");
+    expect(JSON.parse(fs.readFileSync(project.paths.policyPath, "utf8")).services).toHaveProperty("agent-codex");
   });
 
   test("a failed activation beside a live session stops the launch before the runtime starts", async () => {

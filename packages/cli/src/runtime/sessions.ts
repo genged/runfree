@@ -96,6 +96,13 @@ export type RebuildOptions = {
   recoveryRetry?: boolean;
   assumeYes?: boolean;
   useApprovedPolicy?: boolean;
+  /**
+   * Start on the effective policy generation already selected: prepare and
+   * publish nothing. Only the same-build fence's proxy replacement sets it
+   * (`control/activation.ts`); the proxy it replaces is from another build and
+   * must never see a newly published generation.
+   */
+  keepSelectedPolicyGeneration?: boolean;
   verbose?: boolean;
   /**
    * The start is for a public session launch (`claude`/`codex`/`pi`, `shell`,

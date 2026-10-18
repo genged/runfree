@@ -2,7 +2,10 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import type { DesiredServiceEntry } from "@runfree/runtime-contracts/desired-network-policy";
+import {
+  type DesiredServiceEntry,
+  withRequiredDesiredNetworkPolicyVersion,
+} from "@runfree/runtime-contracts/desired-network-policy";
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
 
 import { SERVICES } from "../../../../scripts/services.ts";
@@ -180,11 +183,12 @@ describe("desired service reconciliation", () => {
     ["github", SERVICES.github],
     ["appstore-connect", SERVICES["appstore-connect"]],
   ])("disable removes %s static credential links and placeholder declarations", (id, definition) => {
-    const current = {
-      version: 2 as const,
+    // github's git-http Basic mapping needs desired version 3; the enable path
+    // derives the version the same way.
+    const current = withRequiredDesiredNetworkPolicyVersion({
       hosts: [],
       services: { [id]: desiredServiceEntry(definition) },
-    };
+    });
     const before = compileDesiredPolicies({ project: current, local: { version: 2, hosts: [] } });
     expect(Object.keys(before.policy.tokens ?? {})).not.toHaveLength(0);
     expect(before.agentEnv).not.toHaveLength(0);
@@ -224,7 +228,7 @@ describe("desired service reconciliation", () => {
 
   test("disable removes the complete service-owned read-only request profile", () => {
     const current = {
-      version: 2 as const,
+      version: 3 as const,
       hosts: [],
       services: {
         github: desiredServiceEntry(SERVICES.github, { writeMode: "read-only" }),

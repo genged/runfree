@@ -279,7 +279,7 @@ export const policyCommand: CommandModule = {
             const activation = await activateApprovedControlsAfterMutation(runtimeContext, nodeRuntimeIO, {
               recoverInvalidActive: true,
             });
-            if (activation.kind === "deferred") {
+            if (activation.kind === "deferred" || activation.kind === "waiting") {
               throw new CliError(`no effective policy generation was selected: ${activation.reason}`);
             }
             console.log(`selected approved effective policy generation: ${activation.controlGeneration}`);

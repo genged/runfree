@@ -189,6 +189,12 @@ runfree credential source add github-cli -- gh auth token
 runfree service enable github --from-source github-cli
 ```
 
+The proxy then adds the token to git over HTTPS for `github.com`, so private
+clones and approved pushes work. Inside the sandbox, SSH remotes for GitHub and
+GitLab (`git@github.com:owner/repo.git`) are rewritten to HTTPS; your
+`.git/config` is not changed. See
+[Git over HTTPS and SSH remotes](docs/cli.md#git-over-https-and-ssh-remotes).
+
 To allow a single host, read-only:
 
 ```bash

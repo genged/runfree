@@ -22,6 +22,7 @@ import {
   readActiveEffectiveControl,
   readConvergedPolicyReceipt,
   readEffectiveHostServices,
+  type ActiveControlSelection,
 } from "../control/effective.ts";
 import { validateNetworkPolicy } from "@runfree/runtime-contracts/network-policy";
 import { hostServiceOwnerWarningsFromSnapshot, probeHostListeners } from "../host-listener-snapshot.ts";
@@ -368,6 +369,24 @@ async function syncColdLaunchTokens(input: Readonly<{
   return { status: await syncProxyManagedTokens(admin, input.verbose), holdSpanSpent };
 }
 
+/**
+ * The generation a failed startup convergence may roll back to: the last
+ * converged one when it differs from the selection. A keep-selected start
+ * (`rollbackToLastConverged` false) gets none, so a failure leaves the
+ * selection it found, even with a stale receipt from an interrupted activation.
+ */
+export function convergenceRollbackTarget(
+  project: RuntimeContext["project"],
+  selected: ActiveControlSelection,
+  rollbackToLastConverged: boolean,
+): ActiveControlSelection | undefined {
+  if (!rollbackToLastConverged) return undefined;
+  const lastConverged = readConvergedPolicyReceipt(project);
+  return lastConverged && lastConverged.controlGeneration !== selected.controlGeneration
+    ? effectiveControlSelectionForGeneration(project, lastConverged.controlGeneration)
+    : undefined;
+}
+
 async function finalizeValidatedRuntime(
   plan: ActiveRuntimePlan,
   io: RuntimeIO,
@@ -380,6 +399,12 @@ async function finalizeValidatedRuntime(
   launchHandoff?: LaunchHandoffRequest,
   /** The preparation skipped held tokens (launch plan D4): a source-truth sync must re-read them first. */
   preparedReceiptGated = false,
+  /**
+   * Whether a failed convergence may select the last converged generation
+   * instead. A keep-selected start (the same-build fence's proxy replacement)
+   * passes false: it must leave the selection exactly as it found it.
+   */
+  rollbackToLastConverged = true,
 ): Promise<RuntimeStartResult> {
   const context = runtimeContextFromActivePlan(plan);
   const activeContext = { ...context, validatedRuntime: proof };
@@ -397,10 +422,7 @@ async function finalizeValidatedRuntime(
       warn("effective policy selection is missing before credential sync");
       return { kind: "failed", fastPath: false, status: 1 };
     }
-    const lastConverged = readConvergedPolicyReceipt(activeContext.project);
-    const previous = lastConverged && lastConverged.controlGeneration !== selected.controlGeneration
-      ? effectiveControlSelectionForGeneration(activeContext.project, lastConverged.controlGeneration)
-      : undefined;
+    const previous = convergenceRollbackTarget(activeContext.project, selected, rollbackToLastConverged);
     reportRuntimeProgress("proving effective policy convergence", verbose);
     try {
       lifecycleLock?.assertHeld();
@@ -1347,6 +1369,7 @@ export async function startRuntime(
     try {
       const preparedControls = await timings.timeAsync("control-preparation", () => prepareEffectiveControlsForLaunch(context, io, {
         useApprovedPolicy: rebuildOptions.useApprovedPolicy,
+        keepSelectedPolicyGeneration: rebuildOptions.keepSelectedPolicyGeneration,
       }));
       reportRuntimeVerbose(
         verbose,
@@ -2028,6 +2051,7 @@ export async function startRuntime(
         credentialMode,
         launchHandoff,
         receiptGatedCredentials,
+        !rebuildOptions.keepSelectedPolicyGeneration,
       );
     };
     if (upgradePlan.action === "component-select" && runningWarmRuntime(activeContext, adapters.docker)) {
@@ -2243,6 +2267,10 @@ export async function startRuntime(
                   if (!outcome.ok) throw outcome.error;
                   return outcome.value;
                 },
+                "source-truth",
+                undefined,
+                false,
+                !rebuildOptions.keepSelectedPolicyGeneration,
               );
               if (finalized.kind === "failed") {
                 throw new Error(`candidate proxy finalization failed with status ${finalized.status}`);

@@ -1,6 +1,7 @@
 import {
   canonicalDesiredNetworkPolicy,
   validateDesiredNetworkPolicy,
+  withRequiredDesiredNetworkPolicyVersion,
   type DesiredNetworkPolicyJson,
   type DesiredServiceEntry,
 } from "@runfree/runtime-contracts/desired-network-policy";
@@ -75,7 +76,9 @@ export function reconcileDesiredService(
     delete policy.services[id];
     if (Object.keys(policy.services).length === 0) delete policy.services;
   }
-  const validated = validateDesiredNetworkPolicy(policy);
+  // A service entry can bring v3 fields (basic, username, protocol); the
+  // candidate declares what its content needs.
+  const validated = validateDesiredNetworkPolicy(withRequiredDesiredNetworkPolicyVersion(policy));
   return {
     changed: canonicalDesiredNetworkPolicy(validated) !== before,
     id,

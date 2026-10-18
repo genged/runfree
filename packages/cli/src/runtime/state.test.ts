@@ -195,6 +195,118 @@ test("generated Git config declares the sandbox repository roots safe by path", 
   expect(declared).not.toContain("*");
 });
 
+const GITHUB_SSH_PREFIXES = ["git@github.com:", "ssh://git@github.com/", "ssh://git@github.com:22/", "ssh://git@ssh.github.com:443/"];
+const GITLAB_SSH_PREFIXES = ["git@gitlab.com:", "ssh://git@gitlab.com/", "ssh://git@gitlab.com:22/"];
+
+// Generates the sandbox gitconfig with no host identity (every `config --get`
+// fails), so only the static sections are rendered.
+function generatedSandboxGitConfig(): string {
+  const projectRoot = path.join(tmp, "project");
+  const context = { projectRoot, project: projectInfo(projectRoot), runtimeRoot: "/runtime" } as RuntimeContext;
+  const io = {
+    run: () => 0,
+    capture: () => ({ status: 1, stdout: "", stderr: "" }),
+    commandExists: () => true,
+    confirm: () => true,
+    admin: async () => 0,
+  } satisfies RuntimeIO;
+  ensureSandboxGitConfig(context, io, { supported: true, version: "2.53.0", found: true });
+  return context.project.paths.gitConfigPath;
+}
+
+// Real host Git reading the generated file as its only global config: no
+// system config, no proxy variables, no prompts, and SSH that cannot run, so
+// nothing here can reach the network or block.
+function sandboxGit(globalConfig: string) {
+  const env: NodeJS.ProcessEnv = {};
+  for (const [key, value] of Object.entries(process.env)) {
+    if (!/^(?:https?|all|no)_proxy$|^GIT_|^NODE_USE_ENV_PROXY$/i.test(key)) env[key] = value;
+  }
+  Object.assign(env, {
+    GIT_CONFIG_GLOBAL: globalConfig,
+    GIT_CONFIG_NOSYSTEM: "1",
+    GIT_TERMINAL_PROMPT: "0",
+    GIT_SSH_COMMAND: "false",
+  });
+  return (cwd: string, args: string[]) => childProcess.spawnSync("git", ["-C", cwd, ...args], { encoding: "utf8", env });
+}
+
+test("generated Git config rewrites the GitHub and GitLab SSH remote forms to HTTPS", () => {
+  const generated = generatedSandboxGitConfig();
+  const values = (key: string) => {
+    const result = childProcess.spawnSync("git", ["config", "--file", generated, "--get-all", key], { encoding: "utf8" });
+    expect(result.status).toBe(0);
+    return result.stdout.trim().split("\n");
+  };
+  expect(values("url.https://github.com/.insteadof")).toEqual(GITHUB_SSH_PREFIXES);
+  expect(values("url.https://gitlab.com/.insteadof")).toEqual(GITLAB_SSH_PREFIXES);
+  // The existing sections are unchanged by the rewrite blocks.
+  expect(values("worktree.userelativepaths")).toEqual(["true"]);
+  expect(values("safe.directory")).toEqual(["/workspace", "/workspace/*", "/runfree/git-layout", "/runfree/git-layout/*"]);
+});
+
+test("real Git resolves every supported SSH remote form to HTTPS through the generated config", () => {
+  const git = sandboxGit(generatedSandboxGitConfig());
+  const repo = path.join(tmp, "repo");
+  fs.mkdirSync(repo);
+  expect(git(repo, ["init", "-q"]).status).toBe(0);
+  const getUrl = (url: string) => {
+    const result = git(repo, ["ls-remote", "--get-url", url]);
+    expect(result.status).toBe(0);
+    return result.stdout.trim();
+  };
+
+  for (const prefix of GITHUB_SSH_PREFIXES) expect(getUrl(`${prefix}o/r.git`)).toBe("https://github.com/o/r.git");
+  for (const prefix of GITLAB_SSH_PREFIXES) expect(getUrl(`${prefix}g/r.git`)).toBe("https://gitlab.com/g/r.git");
+  // SSH host aliases are not supported forms and stay as written.
+  expect(getUrl("git@github.com-work:o/r.git")).toBe("git@github.com-work:o/r.git");
+
+  // Push resolves through the same rewrite, with and without an explicit pushurl.
+  expect(git(repo, ["remote", "add", "origin", "git@github.com:o/r.git"]).status).toBe(0);
+  const pushUrl = () => {
+    const result = git(repo, ["remote", "get-url", "--push", "origin"]);
+    expect(result.status).toBe(0);
+    return result.stdout.trim();
+  };
+  expect(pushUrl()).toBe("https://github.com/o/r.git");
+  expect(git(repo, ["config", "remote.origin.pushurl", "ssh://git@gitlab.com:22/g/p.git"]).status).toBe(0);
+  expect(pushUrl()).toBe("https://gitlab.com/g/p.git");
+  // Repository config keeps the SSH URL; only resolution is rewritten.
+  expect(git(repo, ["config", "remote.origin.url"]).stdout.trim()).toBe("git@github.com:o/r.git");
+});
+
+test("repository-level insteadOf can override the generated rewrite (recorded Git 2.53.0 behavior)", () => {
+  // Recorded behavior, not a requirement: the rewrite is routing, and the agent
+  // may override it freely because SSH egress is blocked either way. Git picks
+  // the longest matching insteadOf prefix across all config levels; on an
+  // equal-length tie the first one read wins, and global is read before the
+  // repository. So a longer repository prefix wins, and an identical one loses.
+  const git = sandboxGit(generatedSandboxGitConfig());
+  const repo = path.join(tmp, "repo");
+  fs.mkdirSync(repo);
+  expect(git(repo, ["init", "-q"]).status).toBe(0);
+  const getUrl = () => git(repo, ["ls-remote", "--get-url", "git@github.com:o/r.git"]).stdout.trim();
+
+  expect(git(repo, ["config", "url.https://tie.test/.insteadOf", "git@github.com:"]).status).toBe(0);
+  expect(getUrl()).toBe("https://github.com/o/r.git");
+  expect(git(repo, ["config", "url.https://longer.test/.insteadOf", "git@github.com:o/"]).status).toBe(0);
+  expect(getUrl()).toBe("https://longer.test/r.git");
+});
+
+test("a submodule declared with an SSH URL is fetched over HTTPS through the generated config", () => {
+  const git = sandboxGit(generatedSandboxGitConfig());
+  const repo = path.join(tmp, "repo");
+  fs.mkdirSync(repo);
+  expect(git(repo, ["init", "-q"]).status).toBe(0);
+  // The clone goes to a proxy port that refuses at once, so the attempt fails
+  // offline and fast, and its error names the URL Git actually tried.
+  const added = git(repo, ["-c", "http.proxy=http://127.0.0.1:1", "submodule", "add", "git@github.com:o/sub.git", "sub"]);
+  expect(added.status).not.toBe(0);
+  expect(added.stderr).toContain("'https://github.com/o/sub.git/'");
+  // `GIT_SSH_COMMAND=false` would have produced this had SSH been attempted.
+  expect(added.stderr).not.toContain("Could not read from remote repository");
+});
+
 test.each([true, false])("generated Git config creates portable worktrees, identity present: %s", (hasIdentity) => {
   const projectRoot = path.join(tmp, "project");
   fs.mkdirSync(projectRoot);
