@@ -464,5 +464,25 @@ describe("MCP header-token ownership with protocol-scoped mappings", () => {
       expect(injectedAuthorization(result.policy, tokens, "POST", "https://mcp.example.com/api/mcp")).toBe("Bearer nested-token");
     });
   }
+
+  // `Authorization` and `Auth` both generate the token name `...-auth`; one
+  // token has one source, so either order would send one header the other's
+  // secret. Refused before any policy change, in both orders.
+  for (const order of ["Authorization first", "Auth first"] as const) {
+    test(`two headers that generate one token name are refused (${order})`, () => {
+      const policy: PolicyJson = { hosts: ["mcp.example.com"] };
+      const before = structuredClone(policy);
+      const authorization = { Authorization: "Bearer ${A_TOKEN}" };
+      const auth = { Auth: "${B_TOKEN}" };
+      const headers = order === "Authorization first" ? { ...authorization, ...auth } : { ...auth, ...authorization };
+      expect(() => prepare("https://mcp.example.com/mcp", policy, headers))
+        .toThrow(/both map to proxy token mcp-claude-ghmcp-auth/);
+      expect(policy).toEqual(before);
+
+      // Recovery: with only one of the two headers, the server prepares.
+      const result = prepare("https://mcp.example.com/mcp", policy, authorization);
+      expect(result.tokenConfig["mcp-claude-ghmcp-auth"]).toEqual({ source: "env", env: "A_TOKEN" });
+    });
+  }
 });
 

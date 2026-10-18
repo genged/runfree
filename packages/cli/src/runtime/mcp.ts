@@ -1674,6 +1674,25 @@ function addTokenBinding(
   }
 }
 
+// Generated token names are slugs (an Authorization header becomes `auth`,
+// and punctuation folds to `-`), so two different headers or sources can map
+// to one token. One token has one source, so the second header would be sent
+// the first one's secret. Refuse before any policy change rather than pick one.
+function refuseTokenNameCollisions(bindings: readonly HeaderTokenBinding[]): void {
+  const byName = new Map<string, HeaderTokenBinding>();
+  for (const binding of bindings) {
+    const first = byName.get(binding.tokenName);
+    if (!first) {
+      byName.set(binding.tokenName, binding);
+      continue;
+    }
+    if (first.credential.header.toLowerCase() !== binding.credential.header.toLowerCase() || first.env !== binding.env) {
+      throw new Error(`mcp: MCP headers ${first.credential.header} and ${binding.credential.header} both map to proxy token ${binding.tokenName}, `
+        + "so one would be sent the other's credential; rename one of the headers or MCP servers");
+    }
+  }
+}
+
 function applyPolicyAndTokens(policy: PolicyJson, tokenConfig: TokenSourceConfig, servers: PreparedMcpServer[]): void {
   const applied: { binding: HeaderTokenBinding; options: { autoTokenSource: boolean } }[] = [];
   // Mappings this pass adds; only input mappings, or a generated mapping of
@@ -1697,6 +1716,7 @@ function applyPolicyAndTokens(policy: PolicyJson, tokenConfig: TokenSourceConfig
   // two servers at one endpoint supplies the shared mapping is the same on
   // every run.
   applied.sort((left, right) => left.binding.tokenName.localeCompare(right.binding.tokenName));
+  refuseTokenNameCollisions(applied.map(({ binding }) => binding));
   for (const { binding, options } of applied) applyTokenBinding(policy, tokenConfig, binding, options, generated);
   reconcileTokenBindings(policy, tokenConfig, applied, generated);
 }
