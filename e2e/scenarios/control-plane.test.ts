@@ -107,7 +107,7 @@ describe("host control workflows through the packaged CLI", () => {
 
       const policy = readJson<DesiredPolicy>(policyPath);
       const github = policy.services?.github;
-      expect(policy.version).toBe(2);
+      expect(policy.version).toBe(3);
       expect(github?.definitionDigest).toMatch(/^sha256:[a-f0-9]{64}$/u);
       expect(github?.revision).toBeGreaterThan(0);
       expect(github?.resolved.hosts).toContain("api.github.com");
