@@ -490,5 +490,38 @@ describe("MCP header-token ownership with protocol-scoped mappings", () => {
       expect(result.tokenConfig["mcp-claude-ghmcp-auth"]).toEqual({ source: "env", env: "A_TOKEN" });
     });
   }
+
+  // Codex can name one variable both as the bearer token and as a raw
+  // Authorization header: one token name, header and source, but two
+  // schemes. Refused before any generated config or the policy changes.
+  test("one Codex variable used as bearer token and raw Authorization header is refused before any write", () => {
+    fs.writeFileSync(path.join(hostHome, ".codex", "config.toml"), [
+      "[mcp_servers.dual]",
+      'url = "https://mcp.example.com/mcp"',
+      'bearer_token_env_var = "DUAL_TOKEN"',
+      "[mcp_servers.dual.env_http_headers]",
+      'Authorization = "DUAL_TOKEN"',
+      "",
+    ].join("\n"));
+    const policy: PolicyJson = { hosts: [] };
+    const before = structuredClone(policy);
+    const runDir = path.join(tmp, "run");
+    const tokenConfig = {};
+    expect(() => prepareMcpRuntime({
+      callbackPort: 47638,
+      claudeConfigPath: path.join(runDir, "claude.json"),
+      claudeMcpConfigPath: path.join(runDir, "claude-mcp.json"),
+      codexDir: path.join(runDir, "codex"),
+      env: { HOME: hostHome, CODEX_HOME: path.join(hostHome, ".codex") },
+      mcpOAuthPolicyPath: path.join(runDir, "mcp-oauth-policy.json"),
+      policy,
+      projectRoot,
+      tokenConfig,
+    })).toThrow(/both map to proxy token mcp-codex-dual-auth/);
+    expect(policy).toEqual(before);
+    expect(tokenConfig).toEqual({});
+    expect(fs.existsSync(path.join(runDir, "codex"))).toBe(false);
+    expect(fs.existsSync(path.join(runDir, "claude-mcp.json"))).toBe(false);
+  });
 });
 

@@ -24,6 +24,7 @@ import {
   pathMatchesPrefix,
   type CredentialPolicyJson,
   type PolicyJson,
+  validateNetworkPolicy,
 } from "@runfree/runtime-contracts/network-policy";
 import { parse as parseToml } from "smol-toml";
 import { isMcpAgentId, MCP_AGENT_IDS } from "../agents.ts";
@@ -1686,7 +1687,9 @@ function refuseTokenNameCollisions(bindings: readonly HeaderTokenBinding[]): voi
       byName.set(binding.tokenName, binding);
       continue;
     }
-    if (first.credential.header.toLowerCase() !== binding.credential.header.toLowerCase() || first.env !== binding.env) {
+    if (first.credential.header.toLowerCase() !== binding.credential.header.toLowerCase()
+      || first.env !== binding.env
+      || first.credential.scheme !== binding.credential.scheme) {
       throw new Error(`mcp: MCP headers ${first.credential.header} and ${binding.credential.header} both map to proxy token ${binding.tokenName}, `
         + "so one would be sent the other's credential; rename one of the headers or MCP servers");
     }
@@ -1988,6 +1991,9 @@ export function prepareMcpRuntime(options: McpPrepareOptions): McpPrepareResult 
   const policyDraft = structuredClone(options.policy);
   const tokenConfigDraft = structuredClone(options.tokenConfig);
   applyPolicyAndTokens(policyDraft, tokenConfigDraft, servers);
+  // The completed draft must validate before anything is written; a refusal
+  // here leaves every output unchanged.
+  validateNetworkPolicy(policyDraft);
   writeClaudeRuntimeConfig(options.claudeConfigPath, options.claudeMcpConfigPath, servers);
   writeCodexRuntimeConfig(options.codexDir, servers);
   replaceObjectContents(options.policy, policyDraft);
