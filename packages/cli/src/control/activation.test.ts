@@ -156,7 +156,7 @@ describe("post-mutation control activation", () => {
     };
 
     await expect(activateApprovedControlsAfterMutation(context, io))
-      .rejects.toThrow("could not identify the live proxy consumer");
+      .rejects.toThrow("could not identify the live proxy consumer: docker timed out after 5000 ms");
     expect(readActiveControlSelection(context.project)?.controlGeneration).toBe(previous.controlGeneration);
 
     wedged = false;

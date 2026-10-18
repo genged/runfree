@@ -69,6 +69,16 @@ function proxyBuildMismatchDetail(consumer: ActivationConsumer): string {
     : "the running proxy carries no proxy image input label, so it is treated as another Runfree build";
 }
 
+// Bound for the docker queries that identify the live proxy. Generous enough
+// that a loaded host (or Docker Desktop under load) does not fail a policy
+// change after it was written; a timeout still fails closed.
+const LIVE_PROXY_QUERY_TIMEOUT_MS = 5_000;
+
+function captureFailureDetail(result: { stderr: string; timedOut?: boolean }): string {
+  if (result.timedOut) return `docker timed out after ${LIVE_PROXY_QUERY_TIMEOUT_MS} ms`;
+  return result.stderr.replace(/\s+/g, " ").trim();
+}
+
 /** The upgrade planner's verdict on the running runtime, as `runfree status` computes it. */
 function classifyProxyReplacement(context: RuntimeContext, io: RuntimeIO): RuntimeUpgradePlan {
   const desired = createRuntimePlan(
@@ -87,10 +97,10 @@ function readProxyImageInputDigest(context: RuntimeContext, io: RuntimeIO, proxy
   const inspect = createDockerClient(io, dockerClientEnvOptions(context)).inspect(
     [proxyId],
     { type: "container", format: runtimeContainerInspectFormat() },
-    { timeout: 1000, maxBuffer: 8192 },
+    { timeout: LIVE_PROXY_QUERY_TIMEOUT_MS, maxBuffer: 8192 },
   );
   if (inspect.status !== 0) {
-    const detail = inspect.stderr.replace(/\s+/g, " ").trim();
+    const detail = captureFailureDetail(inspect);
     throw new Error(`could not inspect the live proxy build identity${detail ? `: ${detail}` : ""}`);
   }
   const rows = parseRuntimeContainerInspectRows(inspect.stdout);
@@ -117,9 +127,9 @@ export function discoverLiveProxyId(context: RuntimeContext, io: RuntimeIO): str
       composeProject,
       "proxy",
     )),
-  }, { timeout: 1000, maxBuffer: 8192 });
+  }, { timeout: LIVE_PROXY_QUERY_TIMEOUT_MS, maxBuffer: 8192 });
   if (discovery.status !== 0 || discovery.stderr.trim()) {
-    const detail = discovery.stderr.replace(/\s+/g, " ").trim();
+    const detail = captureFailureDetail(discovery);
     throw new Error(`could not identify the live proxy consumer${detail ? `: ${detail}` : ""}`);
   }
   const ids = discovery.stdout.trim().split(/\s+/).filter(Boolean);
