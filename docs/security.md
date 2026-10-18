@@ -383,8 +383,12 @@ upgrade, a proxy still running the previous build.
   missing label counts as another build. On a mismatch:
   - if the runtime can be replaced compatibly, the command prints that
     running sessions lose network access for up to one heartbeat (30 s) plus
-    adoption, replaces the proxy as `runfree up` does, then applies the
-    change; a failed replacement stops with the change saved but not applied;
+    adoption, and replaces the proxy as `runfree up` does, but on the
+    effective policy generation already selected. That replacement refuses
+    before any Docker work when the runtime isolation settings or desired
+    policy differ from the approved controls. It publishes the change only
+    after the new proxy's label matches. A failed replacement stops with
+    the change saved but not applied, and the selection is unchanged;
   - if active sessions use an incompatible admission epoch or control-plane
     topology, the change is saved and reported as not applied, with the
     remedy: wait for the sessions to end, then `runfree policy use-approved`,
@@ -395,6 +399,10 @@ upgrade, a proxy still running the previous build.
 
   If a proxy of another build appears while the effective policy generation is published, the
   previous selection is restored and the command fails, asking for a retry.
+  The identity check and publication are not serialized with a concurrent
+  runtime start by another Runfree build; every reader older than this
+  release refuses a policy that uses the new fields (its manifest generation
+  check fails), so the outcome is availability, not wider credential reach.
 - Runtime startup does not use this check. A normal start beside live
   sessions joins their effective policy generation and publishes nothing,
   but a start that publishes approved policy beside live sessions can let a

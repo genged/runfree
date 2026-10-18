@@ -574,6 +574,49 @@ describe("quiesced control workflow", () => {
     expect(readActiveControlSelection(context.project)).toBeUndefined();
   });
 
+  test("a start that keeps the selected generation publishes nothing, and refuses with no selection or unapproved drift", async () => {
+    const quiet = io();
+    quiet.confirm = () => { throw new Error("keeping the selection must not prompt"); };
+    // Refusal: nothing is selected, so there is nothing to keep.
+    await expect(prepareEffectiveControlsForStartup(context, quiet, { keepSelectedPolicyGeneration: true }))
+      .rejects.toThrow("keeps the selected effective policy generation, and none is selected");
+    expect(readActiveControlSelection(context.project)).toBeUndefined();
+
+    // Reclamation: a plain start selects one.
+    const interactive = io();
+    interactive.isInteractive = () => true;
+    interactive.confirm = () => true;
+    const first = await prepareEffectiveControlsForStartup(context, interactive);
+    const activePath = context.project.paths.controlProxyActivePath;
+    const before = fs.readFileSync(activePath, "utf8");
+
+    // Unchanged approved controls: the selected generation is kept, nothing published.
+    await expect(prepareEffectiveControlsForStartup(context, quiet, { keepSelectedPolicyGeneration: true }))
+      .resolves.toMatchObject({ mechanism: "kept-selected", generation: { controlGeneration: first.generation.controlGeneration } });
+    expect(fs.readFileSync(activePath, "utf8")).toBe(before);
+
+    // Unapproved runtime-isolation drift refuses before any Docker call: the
+    // runtime is materialized from the config, not from the generation.
+    const drifted: RuntimeContext = { ...context, project: { ...context.project, config: {
+      ...context.project.config, runtime: { ...context.project.config.runtime, dependencyOverlays: "off" } } } };
+    calls = [];
+    await expect(prepareEffectiveControlsForStartup(drifted, quiet, { keepSelectedPolicyGeneration: true }))
+      .rejects.toThrow("the proxy replacement starts only on approved controls, and runtime-isolation differs from the approved controls; review them with: runfree up");
+    expect(calls).toEqual([]);
+    expect(fs.readFileSync(activePath, "utf8")).toBe(before);
+
+    // Unapproved desired network drift refuses as well, where the normal path would ask.
+    fs.writeFileSync(path.join(root, ".runfree", "network-policy.json"), `{"version":2,"hosts":["example.com","new.example.com"]}`);
+    await expect(prepareEffectiveControlsForStartup(context, quiet, { keepSelectedPolicyGeneration: true }))
+      .rejects.toThrow("and network-project differs from the approved controls");
+    expect(fs.readFileSync(activePath, "utf8")).toBe(before);
+
+    // Reclamation: a normal start approves the drift, then the kept start proceeds.
+    const reapproved = await prepareEffectiveControlsForStartup(context, interactive);
+    await expect(prepareEffectiveControlsForStartup(context, quiet, { keepSelectedPolicyGeneration: true }))
+      .resolves.toMatchObject({ mechanism: "kept-selected", generation: { controlGeneration: reapproved.generation.controlGeneration } });
+  });
+
   test("approves one exact interactive startup preflight and reuses it without prompting", async () => {
     const interactive = io();
     interactive.isInteractive = () => true;

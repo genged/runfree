@@ -1775,7 +1775,9 @@ effective policy generation this CLI publishes, so a policy command never
 publishes to one. The check runs before the command publishes and selects the
 effective policy generation, because the selection is what a running proxy
 reads. A proxy of another build is replaced first, or the change waits
-when it cannot be. A release that leaves the proxy's
+when it cannot be. The replacement starts on the effective policy generation
+already selected, and the command publishes only after it has checked the new
+proxy's build identity. A release that leaves the proxy's
 inputs unchanged keeps the same build identity, so no replacement happens.
 Outcomes and remedies are in [security.md](security.md#older-readers).
 

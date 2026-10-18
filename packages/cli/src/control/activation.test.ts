@@ -8,6 +8,8 @@ import { projectInfo } from "../config.ts";
 import { RUNFREE_RUNTIME_COMPONENTS } from "../embedded-assets.generated.ts";
 import { composeProjectName } from "../runtime/env.ts";
 import { projectHash } from "../project-identity.ts";
+import { convergenceRollbackTarget } from "../runtime/startup.ts";
+import { pendingWarningsForTest } from "../warnings.ts";
 import type { RuntimeContext, RuntimeIO } from "../runtime/types.ts";
 import { activateApprovedControlsAfterMutation, withFencedReceiptRead } from "./activation.ts";
 import { activationReportLine } from "./activation-report.ts";
@@ -17,6 +19,7 @@ import {
 } from "./approvals.ts";
 import { captureDesiredPolicyCandidate } from "./candidates.ts";
 import {
+  convergeEffectivePolicyGeneration,
   publishEffectivePolicyGeneration,
   readActiveControlSelection,
   readActiveEffectiveControl,
@@ -364,6 +367,113 @@ describe("post-mutation control activation", () => {
       await expect(activateApprovedControlsAfterMutation(context, unusedIo, { consumer }))
         .rejects.toThrow("previous effective policy generation is restored");
       expect(activeSnapshot().bytes).toBe(before.bytes);
+    });
+
+    // The default replacement is the real runtime start, not a stub. On an
+    // idle runtime that start used to prepare and publish the newly approved
+    // generation before it touched Docker, so the old-build proxy could read it
+    // and a failed replacement left it selected. Docker fails here at the
+    // first call: every Docker call, and the end state, must see the previous
+    // selection's exact bytes.
+    test("the default replacement keeps the selected generation until it fails", async () => {
+      const before = pendingChange();
+      const seenAtDocker: Snapshot[] = [];
+      const io: RuntimeIO = { ...unusedIo, capture(command) {
+        if (command === "docker") {
+          seenAtDocker.push(activeSnapshot());
+          return { status: 1, stdout: "", stderr: "Cannot connect to the Docker daemon" };
+        }
+        return { status: 1, stdout: "", stderr: `${command}: not found` };
+      }, run(command) {
+        if (command === "docker") seenAtDocker.push(activeSnapshot());
+        return 1;
+      } };
+      const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+      try {
+        await expect(activateApprovedControlsAfterMutation(context, io, {
+          consumer: liveConsumer(otherBuild),
+          classifyProxyReplacement: compatible,
+        })).rejects.toThrow(/was not replaced|Docker/);
+      } finally {
+        errors.mockRestore();
+      }
+      expect(seenAtDocker.length).toBeGreaterThan(0);
+      for (const seen of seenAtDocker) expect(seen).toEqual(before);
+      expect(activeSnapshot()).toEqual(before);
+    });
+
+    // Startup materializes the runtime from the project config. Unapproved
+    // runtime-isolation drift must stop the replacement before Docker, as a
+    // normal start would ask for approval first.
+    test("the default replacement refuses unapproved runtime-isolation drift before any Docker call", async () => {
+      const before = pendingChange();
+      const drifted: RuntimeContext = { ...context, project: { ...context.project, config: {
+        ...context.project.config, runtime: { ...context.project.config.runtime, dependencyOverlays: "off" } } } };
+      const dockerCalls: string[] = [];
+      const io: RuntimeIO = { ...unusedIo, capture(command, args) {
+        if (command === "docker") dockerCalls.push(args.join(" "));
+        return { status: 1, stdout: "", stderr: `${command}: unavailable` };
+      }, run(command, args) {
+        if (command === "docker") dockerCalls.push(args.join(" "));
+        return 1;
+      } };
+      const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+      try {
+        await expect(activateApprovedControlsAfterMutation(drifted, io, {
+          consumer: liveConsumer(otherBuild),
+          classifyProxyReplacement: compatible,
+        })).rejects.toThrow("was not replaced (status 1)");
+        expect(pendingWarningsForTest().map((event) => event.message).join("\n"))
+          .toContain("the proxy replacement starts only on approved controls, and runtime-isolation differs from the approved controls; review them with: runfree up");
+      } finally {
+        errors.mockRestore();
+      }
+      expect(dockerCalls).toEqual([]);
+      expect(activeSnapshot()).toEqual(before);
+    });
+
+    // The replacement's startup convergence must not roll back to a stale
+    // last-converged generation: selected A plus a receipt for B (left by an
+    // interrupted activation) would otherwise select B on a failed convergence.
+    test.each([
+      ["a keep-selected start leaves the selection", false],
+      ["a normal start rolls back to the last converged generation", true],
+    ])("failed startup convergence with a stale receipt: %s", async (_name, rollback) => {
+      approveAll();
+      const stale = publishEffectivePolicyGeneration(root, context.project);
+      // Converge B, leaving its receipt.
+      await convergeEffectivePolicyGeneration(context.project, {
+        probe: async () => convergedProbe(),
+        stopRuntime: async () => { throw new Error("must not stop"); },
+        timeoutMs: 0,
+      });
+      approveChangedProject(["example.com", "new.example.com"]);
+      const selected = publishEffectivePolicyGeneration(root, context.project);
+      expect(readConvergedPolicyReceipt(context.project)?.controlGeneration).toBe(stale.controlGeneration);
+      fs.utimesSync(context.project.paths.controlProxyActivePath, new Date(1_000_000), new Date(1_000_000));
+      const before = activeSnapshot();
+
+      const active = readActiveControlSelection(context.project);
+      if (!active) throw new Error("no selection");
+      const previous = convergenceRollbackTarget(context.project, active, rollback);
+      // The replacement acknowledges only the stale generation.
+      const staleOnly = async () => {
+        const current = readActiveControlSelection(context.project);
+        return current?.controlGeneration === stale.controlGeneration ? convergedProbe() : {};
+      };
+      const stopped = vi.fn(async () => {});
+      const converging = convergeEffectivePolicyGeneration(context.project, {
+        ...(previous ? { previous } : {}), probe: staleOnly, stopRuntime: stopped, timeoutMs: 0,
+      });
+      if (rollback) {
+        await expect(converging).rejects.toThrow(`rolled back to ${stale.controlGeneration}`);
+        expect(readActiveControlSelection(context.project)?.controlGeneration).toBe(stale.controlGeneration);
+      } else {
+        await expect(converging).rejects.toThrow("effective policy convergence and rollback failed; proxy stopped");
+        expect(stopped).toHaveBeenCalledOnce();
+        expect(activeSnapshot()).toEqual(before);
+        expect(readActiveControlSelection(context.project)?.controlGeneration).toBe(selected.controlGeneration);
+      }
     });
 
     test("discovery reads the proxy container label, and an unlabeled proxy is another build", async () => {
