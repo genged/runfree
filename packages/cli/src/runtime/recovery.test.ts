@@ -63,9 +63,11 @@ beforeEach(() => {
   );
 });
 
+// The name-budget test leaves 16k files; removing them can outrun the default
+// hook timeout on a loaded host.
 afterEach(() => {
   fs.rmSync(tmp, { recursive: true, force: true });
-});
+}, 30_000);
 
 function hostEvidence(id = "rf-20260731-abcdef", overrides: Record<string, unknown> = {}): string {
   const filePath = path.join(stateDir, "sessions", `${id}.json`);
@@ -337,8 +339,13 @@ describe("bounded offline recovery inventory", () => {
   test("counts non-matching junk entries at the directory name budget boundary", () => {
     const dir = path.join(stateDir, "claude", "sessions");
     fs.mkdirSync(dir, { recursive: true });
+    // Pass 1 counts names and never stats a non-matching one, so hard links
+    // to one file prove the same boundary at a fraction of the cost of 16k
+    // file creations on a loaded host.
+    const junk = path.join(tmp, "junk-source.txt");
+    fs.writeFileSync(junk, "x");
     for (let index = 0; index < RECOVERY_LIMITS.maxNamesPerKindPerProject; index += 1) {
-      fs.writeFileSync(path.join(dir, `junk-${index}.txt`), "x");
+      fs.linkSync(junk, path.join(dir, `junk-${index}.txt`));
     }
     // The deadline has its own test below. It must not mask a missing name
     // limit here, even on a slow filesystem or a busy test host.

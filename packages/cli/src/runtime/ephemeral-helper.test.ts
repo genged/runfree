@@ -592,12 +592,14 @@ describe("the real-process bound", () => {
   });
 
   test("control: the default SIGTERM waits for a client that ignores it (why D-A needs SIGKILL)", () => {
-    const bin = fakeDockerBin("trap '' TERM; exec sleep 1");
+    // The timeout must outlast shell startup on a busy host: a SIGTERM that
+    // lands before the trap is installed kills the stub and proves nothing.
+    const bin = fakeDockerBin("trap '' TERM; exec sleep 2");
     try {
       const startedAt = performance.now();
-      const result = nodeRuntimeIO.capture("docker", ["run"], { env: { PATH: `${bin.dir}:/usr/bin:/bin` }, timeout: 300 });
+      const result = nodeRuntimeIO.capture("docker", ["run"], { env: { PATH: `${bin.dir}:/usr/bin:/bin` }, timeout: 1_000 });
       const elapsed = performance.now() - startedAt;
-      expect(elapsed).toBeGreaterThan(700);
+      expect(elapsed).toBeGreaterThan(1_500);
       expect(result).toMatchObject({ timedOut: true });
       expect(result.signal).toBeUndefined();
     } finally {
