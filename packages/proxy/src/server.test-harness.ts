@@ -240,7 +240,9 @@ export function replaceFileAtomically(filePath: string, contents: string): void 
   fs.renameSync(tmpPath, filePath);
 }
 
-export async function waitUntil(predicate: () => boolean, label: string, timeoutMs = 8_000): Promise<void> {
+// A hang backstop, not a budget: every caller waits for something that must
+// happen, and a loaded host can take well past 8 s to start a proxy child.
+export async function waitUntil(predicate: () => boolean, label: string, timeoutMs = 20_000): Promise<void> {
   const started = Date.now();
   while (Date.now() - started < timeoutMs) {
     if (predicate()) return;

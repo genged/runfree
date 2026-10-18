@@ -156,7 +156,9 @@ describe("captureAsync refuses invalid options before spawning", () => {
   }
 
   test("each timeout the sync capture refuses, the async capture refuses; each it runs, it runs the same", async () => {
-    for (const timeout of [Number.NaN, Number.POSITIVE_INFINITY, -1, 0, undefined, 1.5, 100]) {
+    // A finite timeout neither run can reach: a short one races node startup
+    // on a loaded host, so the two runs could disagree on timing alone.
+    for (const timeout of [Number.NaN, Number.POSITIVE_INFINITY, -1, 0, undefined, 1.5, 30_000]) {
       const options = timeout === undefined ? {} : { timeout };
       let sync: { status: number } | "refused";
       try { sync = nodeRuntimeIO.capture(node, ["-e", "0"], options); } catch { sync = "refused"; }

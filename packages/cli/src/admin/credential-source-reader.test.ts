@@ -69,6 +69,12 @@ function readPid(file: string): number {
   return Number(fs.readFileSync(file, "utf8").trim());
 }
 
+// `echo $$ > file` creates the file before it writes the PID, so existence
+// alone can yield an empty read (PID 0) on a busy host.
+function pidWritten(file: string): boolean {
+  return fs.existsSync(file) && readPid(file) > 0;
+}
+
 describe("readCredentialSource", () => {
   test("a successful read carries its value and the time the read started", async () => {
     const before = Date.now();
@@ -163,7 +169,7 @@ describe("runOwnedProvider bounds", () => {
     const provider = script("ignore-term", `trap '' TERM; echo $$ > '${pidFile}'; sleep 30`);
     const lifetime = watchLifetime();
     const running = runOwnedProvider(provider, [], { env, timeoutMs: 30_000, maxBytes: 1024 }, lifetime, tight);
-    expect(await waitFor(() => fs.existsSync(pidFile))).toBe(true);
+    expect(await waitFor(() => pidWritten(pidFile))).toBe(true);
     const started = Date.now();
     await lifetime.close();
     expect(await running).toEqual({ kind: "cancelled" });
@@ -222,7 +228,7 @@ describe("providers of a watch run at a terminal", () => {
     const provider = script("terminal-hang", `echo $$ > '${pidFile}'; while :; do sleep 0.1; done`);
     const lifetime = watchLifetime("terminal");
     const reading = readCredentialSource(commandRead(provider), lifetime);
-    expect(await waitFor(() => fs.existsSync(pidFile))).toBe(true);
+    expect(await waitFor(() => pidWritten(pidFile))).toBe(true);
     const pid = readPid(pidFile);
     expect(processGroup(pid)).toBe(processGroup(process.pid));
     await lifetime.close();
@@ -235,7 +241,7 @@ describe("providers of a watch run at a terminal", () => {
     const provider = script("own-hang", `echo $$ > '${pidFile}'; while :; do sleep 0.1; done`);
     const lifetime = watchLifetime("own");
     const reading = readCredentialSource(commandRead(provider), lifetime);
-    expect(await waitFor(() => fs.existsSync(pidFile))).toBe(true);
+    expect(await waitFor(() => pidWritten(pidFile))).toBe(true);
     const pid = readPid(pidFile);
     expect(processGroup(pid)).toBe(pid);
     await lifetime.close();
