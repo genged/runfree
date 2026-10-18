@@ -12,6 +12,7 @@
 import childProcess from "node:child_process";
 
 import { captureAsync } from "../../packages/cli/src/runtime/async-capture.ts";
+import { failClosedSpawnStatus } from "../../packages/cli/src/runtime/spawn-status.ts";
 import type { RuntimeIO } from "../../packages/cli/src/runtime/types.ts";
 
 const CAPTURE_MAX_BYTES = 32 * 1024 * 1024;
@@ -29,9 +30,13 @@ export function createMatrixRuntimeIO(): RuntimeIO {
         maxBuffer: CAPTURE_MAX_BYTES,
         ...options,
       });
-      if (result.error) throw result.error;
+      // Mapped the way the production capture maps it (`runtime.ts`), never
+      // thrown: the driver reads a timed-out bounded observation as status 124
+      // and classifies it as unavailable. Throwing here turned one slow
+      // `docker` call under suite load into a raw "spawnSync docker
+      // ETIMEDOUT" launch failure the product would have survived.
       return {
-        status: result.status ?? 1,
+        ...failClosedSpawnStatus(result),
         stdout: typeof result.stdout === "string" ? result.stdout : "",
         stderr: typeof result.stderr === "string" ? result.stderr : "",
       };
