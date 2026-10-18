@@ -265,7 +265,7 @@ describe("project MCP config reading properties", () => {
         }
         takeOutput();
         const runDir = fs.mkdtempSync(path.join(tmp, "run-"));
-        expect(() => prepareMcpRuntime({
+        const prepare = () => prepareMcpRuntime({
           approvalPath: approvalPath(),
           callbackPort: 47638,
           claudeConfigPath: path.join(runDir, "claude.json"),
@@ -277,7 +277,17 @@ describe("project MCP config reading properties", () => {
           policy: { hosts: [], tokens: {} },
           projectRoot,
           tokenConfig: {},
-        }), `${content}\n${toml}`).not.toThrow();
+        });
+        // Two different headers whose generated token names fold to one slug
+        // are refused on purpose (mcp-credential-owner.test.ts covers it);
+        // that is the only refusal allowed here.
+        try {
+          prepare();
+        } catch (error) {
+          expect(String(error), `${content}\n${toml}`).toMatch(/^Error: mcp: MCP headers \S+ and \S+ both map to proxy token mcp-[a-z0-9_-]+, /u);
+          fs.rmSync(runDir, { recursive: true, force: true });
+          return;
+        }
         expectNoControlCharacters(takeOutput(), `${content}\n${toml}`);
         const generated = JSON.parse(fs.readFileSync(path.join(runDir, "claude-mcp.json"), "utf8")) as { mcpServers?: Record<string, unknown> };
         for (const name of Object.keys(generated.mcpServers ?? {})) expect(allowed("claude", name), name).toBe(true);
