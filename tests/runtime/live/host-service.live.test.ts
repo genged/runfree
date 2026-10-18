@@ -65,8 +65,8 @@
 //      loopback entry for it. After the session's relay listens on P', the
 //      pinned Claude lists its MCP servers with the session's own proxy
 //      environment; the stub logs `initialize` and `tools/list`, and the proxy
-//      logs no request to 127.0.0.1. The probe command is UNVERIFIED (see the
-//      case). Codex is a skipped case: no probe is known (spec Q2).
+//      logs no request to 127.0.0.1. Codex is a skipped case: no probe is
+//      known (spec Q2).
 //   9. gateway change and reclaim (HS8): a rewritten `/etc/hosts` alias makes
 //      host services refuse with `gateway address changed`; the firewall
 //      drains the pinned pair, and the request proxy's gateway watch cuts the
@@ -109,8 +109,10 @@
 //     is unit-level: host-listener-snapshot.test.ts.
 //   - T8 for Codex (spec Q2): no command is known that makes the pinned
 //     codex-cli connect to its MCP servers without a model login, so case 8b
-//     has no Codex half. The Claude half's probe command is the plan's
-//     candidate and must be confirmed on a Docker host.
+//     has no Codex half (Q2 decided: Codex ships with this recorded gap).
+//   - T8 for Claude drives `claude mcp list` against a user-scope copy of
+//     the generated entry, not the launcher's `--mcp-config` path, because
+//     the `mcp list` subcommand ignores `--mcp-config` (see case 8b).
 
 
 import childProcess from "node:child_process";
@@ -652,8 +654,8 @@ const SESSION_CLAUDE_MCP_CONFIG = "/runfree/mcp/claude.json";
  * The pinned Claude binary in the sandbox project image. The fixture's image
  * moves the real `claude-real` here and puts a recorder stand-in in its place
  * (fixture.ts, MANAGED_IMAGE_DOCKERFILE_STANZA), so `claude` in the session is
- * not the real agent. Calling this path directly skips the `claude` launcher,
- * so the probe passes the two flags the launcher would prepend itself.
+ * not the real agent. Calling this path directly skips the `claude` launcher
+ * and its `--mcp-config` flags, which `mcp list` ignores anyway (case 8b).
  */
 const PINNED_CLAUDE = "/usr/local/libexec/runfree/claude-real-pinned";
 
@@ -1433,15 +1435,17 @@ describe("approved host services", () => {
     });
   }, TEST_TIMEOUT_MS);
 
-  // T8, Claude. UNVERIFIED PROBE COMMAND: `claude --mcp-config <file>
-  // --strict-mcp-config mcp list` is the plan's candidate for making the
-  // pinned Claude connect to its configured MCP servers without a model
-  // login. It has not been run against the pinned Claude (no Docker host was
-  // available when this case was written). Confirm on a Docker host that it
-  // (a) accepts the two flags before the `mcp list` subcommand, (b) connects
-  // to the servers in that file rather than only the user/project scopes, and
-  // (c) sends `tools/list` as well as `initialize`. If it does not, replace
-  // the command; never relax the stub assertions to fit it.
+  // T8, Claude. `claude mcp list` is the only command found that makes the
+  // pinned Claude (2.1.280) connect to MCP servers without a model login, and
+  // it ignores `--mcp-config`/`--strict-mcp-config`: it reads only the user
+  // config and the working directory's `.mcp.json`, where a project server
+  // waits for approval and is never contacted. So the probe copies the
+  // generated entry verbatim into a user-scope config under a throwaway HOME
+  // and CLAUDE_CONFIG_DIR, and runs `mcp list` from that empty directory.
+  // Checked against Claude 2.1.280 with a local stub: the health check sends
+  // `initialize` and `tools/list`. The session's proxy variables stay set, so
+  // the NO_PROXY path is the one a real session uses. Never relax the stub
+  // assertions to fit a probe.
   test("a loopback MCP entry reaches an approved host service through the relay: Claude (T8)", async () => {
     const stub = await startMcpStub();
     const stubPort = stub.port;
@@ -1483,9 +1487,21 @@ describe("approved host services", () => {
       // The session's own environment, proxy variables included: the threat
       // (T8) is a client that ignores NO_PROXY and sends plain HTTP to the
       // proxy, so the proxy variables must stay set for this probe.
+      const generatedEntry = sessionClaudeMcpServers(sessionId)[STUB_SERVER];
       const probe = docker([
-        "exec", sessionId, "timeout", "120",
-        PINNED_CLAUDE, "--mcp-config", SESSION_CLAUDE_MCP_CONFIG, "--strict-mcp-config", "mcp", "list",
+        "exec", sessionId, "sh", "-c",
+        [
+          "set -eu",
+          'claude="$1"; name="$2"; entry="$3"',
+          'dir="$(mktemp -d)"',
+          'trap \'rm -rf "$dir"\' EXIT',
+          'cd "$dir"',
+          'export HOME="$dir" CLAUDE_CONFIG_DIR="$dir/config"',
+          'mkdir "$CLAUDE_CONFIG_DIR"',
+          '"$claude" mcp add-json -s user "$name" "$entry"',
+          'timeout 120 "$claude" mcp list',
+        ].join("\n"),
+        "t8-probe", PINNED_CLAUDE, STUB_SERVER, JSON.stringify(generatedEntry),
       ]);
       const requests = stub.requests().slice(requestsBefore);
       const calls = requests.flatMap((request) => request.rpc);
