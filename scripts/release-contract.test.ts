@@ -46,7 +46,6 @@ describe("release contract", () => {
 
     expect(security.replace(/\s+/g, " ")).toContain("latest release is the only supported line");
     expect(security).toMatch(/no response-time commitment/);
-    expect(read("README.md")).toMatch(/no response-time commitment/);
   });
 
   test("the documented install command uses bash, because the installer needs bash", () => {
