@@ -2,7 +2,7 @@
   <img src="docs/logo.png" alt="Runfree logo" width="200" />
 </p>
 <h1 align="center">Runfree</h1>
-<h3 align="center">Let your coding agent run without permission prompts, in a container with no open internet and none of your credentials</h3>
+<h3 align="center">Let your coding agent run without permission prompts, in a container with no open internet and no access to your API tokens</h3>
 <p align="center">
 <a href="https://github.com/genged/runfree/actions/workflows/test.yml">
   <img src="https://github.com/genged/runfree/actions/workflows/test.yml/badge.svg" alt="Test status" />
@@ -26,11 +26,11 @@ attaches your real service credentials itself. The agent never holds them.
   tests without asking. It does that in a container, not in your shell.
 - **Deny-by-default network.** Outbound HTTPS/WSS reaches only hosts you
   approved. The agent can edit the policy file; editing it grants nothing.
-- **Credentials stay out of reach.** An API key or access token comes from
+- **API tokens stay out of reach.** A service token comes from
   `gh auth token`, 1Password, or an environment variable on your host. The
-  agent's environment gets a placeholder.
-- **Writes can wait for you.** Set a host to hold write requests until you run
-  `runfree approve <id>` on the host.
+  agent's environment gets a placeholder. The agent's own Claude or Codex
+  login is the exception: it lives in the project's agent state, where the
+  agent can read it.
 
 ```bash
 brew install genged/tap/runfree
@@ -45,6 +45,79 @@ review before any policy or credential source is written.
 
 Requires Apple Silicon macOS and Docker Desktop. Each claim above has a limit
 worth knowing before you rely on it: see [Limitations](#limitations).
+
+## Features
+
+### Push to GitHub and GitLab without handing over your token <img src="https://img.shields.io/badge/New_in-0.6.0-2ea44f" alt="New in 0.6.0" />
+
+```bash
+# inside a session, with the github service enabled (Quickstart step 4)
+git push origin my-branch
+```
+
+Clone, pull, and push your private repos over HTTPS, `git@github.com:` remotes
+included. The proxy adds your token only to recognized git requests, so
+`printenv` in the sandbox finds a placeholder, and each push waits for your
+approval unless you allow it. [More](docs/cli.md#git-over-https-and-ssh-remotes)
+
+### Three agents and a shell, one sandbox
+
+```bash
+runfree claude
+runfree codex
+runfree pi
+runfree shell
+```
+
+Claude Code, Codex, and Pi share the project's sandbox and policy. Run several
+at once: each session gets its own container, and `runfree sessions` lists them.
+
+### Whole ecosystems in one command
+
+```bash
+runfree service enable node
+runfree service list --all
+```
+
+A curated service allows the hosts an ecosystem's tools need, so you are not
+hunting hostnames one 403 at a time. [More](docs/cli.md#services)
+
+### Blocked requests tell you how to fix them
+
+```bash
+runfree doctor
+```
+
+An unapproved host is refused before any DNS lookup, and `runfree doctor`
+prints the exact command that would allow it.
+
+### MCP servers: one review, one login <img src="https://img.shields.io/badge/New_in-0.6.0-2ea44f" alt="New in 0.6.0" />
+
+```bash
+runfree mcp list
+runfree mcp enable claude my-server
+```
+
+`mcp list` shows the servers from your Claude and Codex config. `mcp enable`
+reviews the approval, credential, and OAuth hosts on one screen, applies them
+to the running sandbox, and opens the login. [More](docs/cli.md#mcp)
+
+### And more
+
+- [Your dev server, database, or simulator, from the agent](#feature-host-services) <img src="https://img.shields.io/badge/New_in-0.6.0-2ea44f" alt="New in 0.6.0" />
+- [Resume in the same terminal](#feature-resume) <img src="https://img.shields.io/badge/New_in-0.6.0-2ea44f" alt="New in 0.6.0" />
+- [Writes wait for you](#feature-write-approval)
+- [Credentials from wherever you keep them, including host-signed JWTs](#feature-credentials)
+- [OAuth tokens the agent never holds](#feature-oauth-handles)
+- [Per-tool MCP rules](#feature-mcp-tool-rules)
+- [Read-only and path-scoped hosts](#feature-request-rules)
+- [Your private API as a service](#feature-private-apis)
+- [Find out what a project needs](#feature-audit)
+- [Preview, paste, and see the screen](#feature-preview)
+- [Team policy in git](#feature-team-policy)
+- [Service updates you review](#feature-service-updates)
+- [A clean checkout](#feature-clean-checkout)
+- [Task guides built in](#feature-task-guides)
 
 ## Why
 
@@ -161,10 +234,19 @@ runfree codex
 runfree pi
 ```
 
-The first start asks you to review the policy before anything runs. Starting
-Claude or Codex includes its credentialless operational service in that review,
-so the login and model hosts are allowed without configuring credential injection.
-Pi's provider setup stays explicit.
+The first start asks you to review the policy before anything runs. How the
+agent then logs in depends on the agent:
+
+- **Claude Code and Codex** log in the way they always do, with your
+  subscription or account, on first start in each project. The review
+  includes the hosts that login and the model API need, so there is nothing
+  to configure. The login is stored in that project's agent state, inside
+  the agent's reach, not behind the proxy.
+- **Pi** has no implicit setup. Enable its provider's API-key service, for
+  example
+  `runfree service enable anthropic --from-env ANTHROPIC_API_KEY`. Pi then
+  sees a placeholder `ANTHROPIC_API_KEY`, and the proxy swaps in the real key
+  on requests to `api.anthropic.com`.
 
 Around a session:
 
@@ -182,18 +264,13 @@ The wizard covers the common cases. Everything it does is also a command, for
 changes after `init` or for projects set up without it.
 
 Credentials are resolved on the host and injected only by the proxy. To reuse a
-GitHub CLI login without the credential entering the container:
+GitHub CLI login without the credential entering the container, which also
+turns on git push over HTTPS:
 
 ```bash
 runfree credential source add github-cli -- gh auth token
 runfree service enable github --from-source github-cli
 ```
-
-The proxy then adds the token to git over HTTPS for `github.com`, so private
-clones and approved pushes work. Inside the sandbox, SSH remotes for GitHub and
-GitLab (`git@github.com:owner/repo.git`) are rewritten to HTTPS; your
-`.git/config` is not changed. See
-[Git over HTTPS and SSH remotes](docs/cli.md#git-over-https-and-ssh-remotes).
 
 To allow a single host, read-only:
 
@@ -201,17 +278,6 @@ To allow a single host, read-only:
 runfree host add api.example.com --read-only
 runfree host explain api.example.com
 ```
-
-To let the agent use a service that runs on your machine's loopback (a dev
-server, a database, a model server, a device bridge), approve its port. New
-sessions reach it at `127.0.0.1:<port>`, with the client unchanged:
-
-```bash
-runfree host-service add <name> --port <port>
-runfree host-service list
-```
-
-See [Host Services](docs/cli.md#host-services) for the checks and limits.
 
 To discover what a project actually needs, during a trusted onboarding task:
 
@@ -224,30 +290,166 @@ runfree audit off
 [`docs/cli.md`](docs/cli.md) is the full command reference.
 `runfree help <topic>` has task guides.
 
-## Also included
+## More features
 
-- **Curated services.** One command allows a whole ecosystem's hosts instead of
-  hunting hostnames: `runfree service enable node`, `python`, `github`, and
-  more. `runfree service list --all` prints them. See
-  [Services](docs/cli.md#services).
-- **Approve-on-write.** `runfree host rules api.example.com --write ask` holds
-  writes to that host; `runfree approvals --watch` shows them and
-  `runfree approve <id>` decides, for one request or for the session. See
-  [Approve-On-Write](docs/cli.md#approve-on-write).
-- **Credential sources.** Host commands, environment variables, 1Password
-  refs, stdin, and signed JWTs. See [Credentials](docs/cli.md#credentials).
-- **MCP servers.** `runfree mcp enable <agent> <server>` reviews the endpoint,
-  credential, and OAuth hosts once, then runs the login. See
-  [MCP](docs/cli.md#mcp).
-- **Resume.** `runfree resume` picks up interrupted Claude, Codex, or Pi work
-  for the project.
-- **Preview and paste.** `runfree forward 3000` publishes a dev server the
-  agent runs to your loopback; `runfree inbox paste` hands the agent a
-  clipboard image. See
-  [Optional Runtime Helpers](docs/cli.md#optional-runtime-helpers).
-- **Clean checkout.** Dependency directories such as `node_modules` live in
-  Runfree-owned volumes, and `.runfree/image/Dockerfile` extends the base image
-  with project tooling.
+<a id="feature-host-services"></a>
+### Your dev server, database, or simulator, from the agent <img src="https://img.shields.io/badge/New_in-0.6.0-2ea44f" alt="New in 0.6.0" />
+
+```bash
+runfree host-service add postgres --port 5432
+# inside a new session, the unmodified client just works
+psql -h 127.0.0.1 -p 5432 -U <user> <database>
+```
+
+The same goes for a dev server on `:3000`, Ollama, or an iOS simulator through
+`idb_companion`. Before approving, Runfree shows which process holds the port,
+and `runfree status` warns if that changes. The tunnel is opaque, so approve
+only services you would let the agent use freely.
+[More](docs/cli.md#host-services)
+
+<a id="feature-resume"></a>
+### Resume in the same terminal <img src="https://img.shields.io/badge/New_in-0.6.0-2ea44f" alt="New in 0.6.0" />
+
+```bash
+runfree resume
+```
+
+The laptop slept or the tab closed? Run `runfree resume` in that terminal,
+answer "Resume it", and you are back in the same Claude or Pi conversation.
+Anything else shows up in a picker, newest first. [More](docs/cli.md#resume)
+
+<a id="feature-write-approval"></a>
+### Writes wait for you
+
+```bash
+runfree host rules api.example.com --write ask
+runfree approvals --watch
+runfree approve <id>
+```
+
+Reads go straight through. A request to that host that counts as a write
+waits until you approve it on the host, for one request or for the rest of the
+session. [More](docs/cli.md#approve-on-write)
+
+<a id="feature-credentials"></a>
+### Credentials from wherever you keep them
+
+```bash
+runfree credential set-source github --from-1password op://vault/item/token
+runfree credential set-source github --from-env GITHUB_TOKEN
+runfree credential set-source github --from-env GITHUB_TOKEN --refresh-every 15m
+```
+
+Credentials can come from a host command, an environment variable, 1Password,
+or stdin, and can be re-resolved on a schedule. Runfree can also sign a
+short-lived JWT on the host from your private key, for APIs like App Store
+Connect. The value is resolved on the host and held by the proxy.
+[More](docs/cli.md#credentials)
+
+<a id="feature-oauth-handles"></a>
+### OAuth tokens the agent never holds
+
+```bash
+runfree service enable google-ads --from-1password-item op://<vault>/<item>
+```
+
+For OAuth services such as `google-ads`, the proxy keeps the refresh token and
+client secret. The agent works with `runfree_oauth_*` handles, and the proxy
+swaps them for the real tokens on the way out. [More](docs/cli.md#services)
+
+<a id="feature-mcp-tool-rules"></a>
+### Per-tool MCP rules
+
+```bash
+runfree mcp rules claude my-server --tool create_issue --write ask
+```
+
+Hold or deny one MCP tool instead of the whole server. [More](docs/cli.md#mcp)
+
+<a id="feature-request-rules"></a>
+### Read-only and path-scoped hosts
+
+```bash
+runfree host add api.example.com --read-only
+runfree host rules api.example.com --method GET --request-path-prefix /v1/
+runfree host rules github.com --deny-git-push
+```
+
+`--read-only` allows only `GET`, `HEAD`, and `OPTIONS`. A request rule narrows
+a host to the methods and paths you name, and `--deny-git-push` keeps fetch but
+refuses pushes. [More](docs/cli.md#manage-hosts)
+
+<a id="feature-private-apis"></a>
+### Your private API as a service
+
+```bash
+runfree service custom add user-internal-api --from-file ./internal-api.runfree-service.json
+runfree service enable user-internal-api --from-source internal-token
+```
+
+Describe your API's hosts and credential once, then enable it like a curated
+service. [More](docs/cli.md#user-defined-services)
+
+<a id="feature-audit"></a>
+### Find out what a project needs
+
+```bash
+runfree up --audit-network=30m
+runfree audit report
+```
+
+During a trusted onboarding task, audit mode lets traffic through for a fixed
+window and records it. The report suggests exact `runfree host add` commands
+and never edits policy itself.
+
+<a id="feature-preview"></a>
+### Preview, paste, and see the screen
+
+```bash
+runfree forward 3000      # the agent's dev server on your loopback
+runfree inbox paste       # hand the agent a clipboard image
+runfree vnc               # watch a headed browser the agent drives
+```
+
+[More](docs/cli.md#optional-runtime-helpers)
+
+<a id="feature-team-policy"></a>
+### Team policy in git
+
+Commit `.runfree/` and review policy changes like code. Each developer binds
+their own credentials and approves policy on their own machine, so a pull
+request cannot grant network access by itself.
+[More](docs/team-workflow.md)
+
+<a id="feature-service-updates"></a>
+### Service updates you review
+
+```bash
+runfree service diff
+runfree service diff --apply
+```
+
+When a curated service changes in a new release, your project keeps the old
+revision until you look at the diff and apply it. [More](docs/cli.md#service-revisions)
+
+<a id="feature-clean-checkout"></a>
+### A clean checkout
+
+`node_modules` and other dependency directories live in Runfree-owned volumes
+instead of your working tree, and `.runfree/image/Dockerfile` adds project
+tooling to the base image.
+
+<a id="feature-task-guides"></a>
+### Task guides built in
+
+```bash
+runfree help quickstart
+runfree help network
+runfree help credentials
+```
+
+Workflow guides for setup, network policy, credentials, services, MCP, and
+more, from the terminal.
 
 ## How it works
 
@@ -319,29 +521,6 @@ Worth reading before you rely on it. The full threat model is
   time-boxed discovery tool, not a default.
 - **Docker and the host are trusted.** This is not VM isolation.
 
-## Project status
-
-Runfree is a security-sensitive beta. The latest release is the only supported
-line, on a best-effort basis with no response-time commitment.
-
-Implemented: the Docker/proxy runtime, exact-host network policy, proxy-held
-static credentials, OAuth handle mediation, MCP import and approval, dependency
-overlays, approve-on-write, audit mode, interrupted-session recovery, and
-Homebrew packaging.
-
-Not in this release: Linux and Intel macOS binaries, prebuilt runtime images,
-npm distribution, and artifact provenance attestations. OrbStack is not tested
-or supported.
-
-The published binary is ad-hoc signed, not notarized. Install with Homebrew or
-`scripts/install.sh` — both fetch over curl, which sets no quarantine
-attribute. If you download the tarball in a browser instead, macOS quarantines
-it and Gatekeeper refuses to run it. Verify what you downloaded against the
-release's SHA-256 manifest.
-
-Please do not open a public issue for a suspected vulnerability. Use GitHub
-private vulnerability reporting, as described in [`SECURITY.md`](SECURITY.md).
-
 ## Development
 
 ```bash
@@ -361,5 +540,5 @@ rest, including what review will ask about.
 - [`docs/security.md`](docs/security.md) — threat model and verification
 - [`docs/cli.md`](docs/cli.md) — full command reference
 - [`docs/troubleshooting.md`](docs/troubleshooting.md) — refusals and recovery
-- [`docs/whats-new-0.5.2.md`](docs/whats-new-0.5.2.md) — current release
+- [`docs/whats-new-0.6.0.md`](docs/whats-new-0.6.0.md) — current release
 - [`AGENTS.md`](AGENTS.md) — guidance for coding agents working in this repo
