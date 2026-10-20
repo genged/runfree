@@ -24,8 +24,8 @@ project policy lives under `.runfree/`.
   into skill references.
 - Maintainer-only implementation plans, draft specs, research notes, stack
   notes, todo tracking, and implementation lessons may exist under an ignored
-  local `local/` directory in this clone. Do not add public docs that require
-  `local/` to exist.
+  local `local/` directory in this clone; read it before large architectural
+  changes. Do not add public docs that require `local/` to exist.
 - Check the maintainer todo (`local/todo/INDEX.md`, when `local/` exists) and
   recent commits before assuming a design is finished. There is no public
   TODO file.
@@ -38,18 +38,19 @@ project policy lives under `.runfree/`.
 
 | Task | Location | Notes |
 | --- | --- | --- |
-| CLI entrypoint and public commands | `packages/cli/src/cli.ts`, `packages/cli/src/commands/`, `src/cli.ts`, `bin/runfree.js` | `cli.ts` builds the command context and runs the yargs command app (`commands/app.ts`); each command is a typed module under `commands/` that builds a typed intent and calls shared enforcement directly (no legacy string dispatcher). `src/cli.ts` is a compatibility delegate. |
-| Project config and init | `packages/cli/src/config.ts`, `packages/cli/src/init-wizard.ts`, `packages/cli/templates/` | Current config version is 4; older versions and legacy keys are refused, not migrated. The init wizard runs only on a TTY without `--yes`. |
+| CLI entrypoint and public commands | `packages/cli/src/cli.ts`, `packages/cli/src/commands/`, `src/cli.ts`, `bin/runfree.js` | `cli.ts` builds the command context and runs the yargs command app (`commands/app.ts`); each command is a typed module under `commands/` that builds a typed intent and calls shared enforcement directly. `src/cli.ts` is a compatibility delegate. |
+| Project config and init | `packages/cli/src/config.ts`, `packages/cli/src/init-wizard.ts`, `packages/cli/templates/` | Current config version is 4; config versions below 4 are refused, not migrated. The init wizard runs only on a TTY without `--yes`. |
 | Runtime lifecycle | `packages/cli/src/runtime.ts`, `packages/cli/src/runtime/env.ts`, `packages/cli/src/network.ts` | Docker Compose orchestration, project state, network selection, stale runtime checks. |
 | Per-session admission | `packages/cli/src/runtime/session-admission-{probe,driver}.ts`, `session-file-{publisher,heartbeat,teardown}.ts`, `session-container-{proof,template}.ts`, `session-containers.ts`, `session-internal-network-baseline.ts` | Source-IP session identity, lifecycle records, and Docker-inspection proofs. Reached by every public launch (`claude`/`codex`/`pi`, `shell`, `resume`, `mcp auth`) through `session-public-launch.ts`. See `docs/security.md`. |
 | Interrupted session recovery | `packages/cli/src/runtime/recovery.ts`, `runtime/resume-selection.ts`, `runtime/terminal-identity.ts`, `runtime/codex-rollouts.ts`, `runtime/session-admission-resume.ts`, `packages/cli/src/commands/resume.ts`, `commands/resume-prompt.ts` | Host records, offline inventory, terminal matching, per-conversation claims and consumption, the bounded Codex time match, and the `runfree resume` prompt. Agent-written registry and rollout files are hostile input. See `docs/architecture.md` and `docs/security.md`. |
 | Project custom agent images | `packages/cli/src/agent-image.ts`, `.runfree/image/Dockerfile` | Project Dockerfiles extend `RUNFREE_BASE_IMAGE`; full image overrides are not supported. |
 | Embedded runtime assets | `packages/agent-runtime/agent/`, `packages/proxy/src/`, `dist/runtime/` | `pnpm build:runtime` creates `dist/runtime`, then assets are materialized into XDG data state by `packages/cli/src/assets.ts`. The agent image's session entry is `packages/agent-runtime/agent/session-entry.sh`; its readiness probe is TypeScript at `packages/agent-runtime/src/session-ready-probe.cts`, compiled by the same `tsc -b` step as the proxy into `dist/runtime/agent/session-ready-probe.cjs`. The probe embeds the readiness request bytes, pinned to the contract by `scripts/session-entry.test.ts`. |
-| Proxy policy and credential injection | `packages/runtime-contracts/src/network-policy.ts`, `packages/runtime-contracts/src/oauth-mediation-policy.ts`, `packages/proxy/src/policy.ts`, `packages/proxy/src/oauth-mediation.ts`, `packages/proxy/src/server.ts` | HTTPS/WSS allowlisting, request-shape rules, header stripping, proxy-only token reads, and OAuth handle mediation. Denial feedback lives in `packages/proxy/src/denial.ts`; audit mode in `packages/proxy/src/audit.ts`. |
+| Proxy policy and credential injection | `packages/runtime-contracts/src/{desired-network-policy,network-policy}.ts`, `packages/runtime-contracts/src/oauth-mediation-policy.ts`, `packages/proxy/src/policy.ts`, `packages/proxy/src/oauth-mediation.ts`, `packages/proxy/src/server.ts` | HTTPS/WSS allowlisting, request-shape rules, header stripping, proxy-only token reads, and OAuth handle mediation. Denial feedback lives in `packages/proxy/src/denial.ts`; audit mode in `packages/proxy/src/audit.ts`. |
 | Admin policy/token commands | `packages/cli/src/commands/admin/`, `packages/cli/src/admin/admin-core.ts`, `packages/cli/src/admin/{domain,allow,token,source,service}-policy.ts`, `packages/cli/src/admin/{mcp-admin,diagnostics}.ts`, `scripts/services.ts`, `scripts/domain-diagnostics.ts` | The yargs modules under `commands/admin/` build typed intents; enforcement lives in the per-family `*-policy.ts`/`mcp-admin`/`diagnostics` modules over the shared `admin-core.ts` base (ambient admin state, policy/token/source stores, proxy runtime, token sync, `reloadProxy`). `admin/options.ts` is a thin re-export barrel. `scripts/services.ts` is the unified service registry (host bundles ± static or OAuth credential mode). |
+| Host services | `packages/cli/src/commands/admin/host-service.ts`, `packages/cli/src/control/host-service-mutation.ts`, `packages/cli/src/host-service-registry.ts`, `packages/proxy/src/host-service-tunnel.ts`, `packages/proxy/src/firewall/host-service-gateway.ts`, `packages/agent-runtime/src/host-service-relay.cts` | CLI command and policy mutation, the registry, the proxy tunnel and firewall gateway, and the agent-side relay. |
 | Safe host project writes | `packages/cli/src/safe-fs.ts` | Use these helpers for writes under project-controlled paths such as `.runfree/`. |
-| Live runtime proof | `tests/runtime/live/*.live.test.ts` (Vitest `runtime-live` project), shared `tests/runtime/live/*fixture*.ts` | Per-session live Docker proof: topology/caps, egress containment, CONNECT guard, request-shape, audit SSRF + teardown, allowlist lifecycle, and session admission. Run the whole suite with `make test-runtime`; one tranche as a per-commit Docker smoke with `make test-runtime-smoke`; the migrated non-admission tranches alone with `make test-runtime-live`. The fixture and tranches spawn the Bun-prebuilt CLI and runner bundles from `tests/support/prebuilt-entry.ts` (tsx fallback without Bun). Replaced the retired pre-flip `sandbox.sh`. |
-| Release packaging | `scripts/generate-assets.ts`, `scripts/package-homebrew-artifacts.sh`, `scripts/install.sh` | Bun compiles release binaries; generated assets are embedded before packaging; public release artifacts are currently macOS-only. |
+| Live runtime proof | `tests/runtime/live/*.live.test.ts` (Vitest `runtime-live` project), shared `tests/runtime/live/*fixture*.ts` | Per-session live Docker proof: topology/caps, egress containment, CONNECT guard, request-shape, audit SSRF + teardown, allowlist lifecycle, and session admission. Run the whole suite with `make test-runtime`; one tranche as a per-commit Docker smoke with `make test-runtime-smoke`; the non-admission tranches alone with `make test-runtime-live`. The fixture and tranches spawn the Bun-prebuilt CLI and runner bundles from `tests/support/prebuilt-entry.ts` (tsx fallback without Bun). |
+| Release packaging | `scripts/build-bin.ts`, `scripts/generate-assets.ts`, `scripts/package-homebrew-artifacts.sh`, `scripts/install.sh` | Bun compiles release binaries; generated assets are embedded before packaging; public release artifacts are currently macOS-only. |
 | Gate completeness | `scripts/check-test-inventory.ts`, `Makefile` `test-static` | Run by `make test-static`. Compares what `vitest list --filesOnly` would load against the test files git tracks, and checks that every Makefile test filter still names a real file — an unmatched Vitest filter is silently green. `test-static` discovers scripts to syntax-check from `git ls-files` rather than a list. |
 
 ## Development Commands
@@ -117,13 +118,10 @@ project policy lives under `.runfree/`.
 - Never put real service tokens in the agent container. Agent env vars may use
   placeholders only; real proxy-managed tokens belong in host-resolved sources
   and proxy-only tmpfs.
-- Keep `.runfree/network-policy.json` as the fixed project policy path. Desired
-  policy v2/v3 is an exact-hostname allowlist plus per-host `requests` rules
-  (methods, path prefixes, git-push deny), `services` records, `tokens`
-  (credential destinations), `hostServices`, and an optional `writeApproval`
-  default (v3 only when a destination uses `basic`, `username`, or
-  `protocol`); still no wildcard hosts, notes, or category metadata. Service host bundles expand to
-  exact hostnames at CLI time and never change the policy format.
+- Keep `.runfree/network-policy.json` as the fixed project policy path. It
+  allows exact hostnames only: no wildcard hosts. Service host bundles expand
+  to exact hostnames at CLI time. The format is in `docs/cli.md` "Network
+  Policy".
 - Host-side writes to project-controlled paths must reject symlinks, hard
   links, and special files. Use `safeReplaceProjectFile`,
   `ensureSafeProjectDir`, and related helpers.
@@ -154,22 +152,13 @@ both the refusal and the reclamation.
 
 ## Verification
 
-Run the narrowest relevant tests first, then broaden based on risk. For normal
-TypeScript changes, run the affected Vitest file plus `pnpm test` and
-`pnpm typecheck`. After every change, run both `pnpm check` and
-`pnpm typecheck` before committing or reporting completion. For runtime asset
-changes, regenerate embedded assets and run tests that cover asset sync. For
-sandbox, proxy, firewall, Docker network, or credential-boundary changes, run
-`make test-runtime-core` when the Docker CLI and a reachable Docker daemon are
-available. Before a release, or for lifecycle, recovery, upgrade, or cleanup
-changes, run the full `make test-runtime` or `make test-all`.
-
-
-## Local only docs
-
-If `local/` exists locally, it is a separate local only directory.
-Read `local/` before large architectural changes.
-Do not create public references that require `local/` to exist.
+Run the affected Vitest file first, then `pnpm test`; after every change run
+`pnpm check` and `pnpm typecheck` before committing or reporting completion.
+Runtime asset changes: regenerate assets and run the asset-sync tests. Sandbox,
+proxy, firewall, Docker network, or credential-boundary changes: run
+`make test-runtime-core` when a Docker daemon is reachable. Releases and
+lifecycle, recovery, upgrade, or cleanup changes: run `make test-runtime` or
+`make test-all`.
 
 ## User Override
 

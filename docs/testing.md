@@ -73,12 +73,6 @@ and a bounded world tree. Known secret values are redacted.
 
 ## Packaged Scenario Scope
 
-The long-horizon scenario catalog is maintainer-only planning material. This
-public document describes only the test layers that exist in this checkout.
-
-The packaged suite implements a focused subset of that catalog. It keeps one
-scenario per packaging-specific contract area.
-
 The packaged suite covers one scenario per major public contract area:
 
 - artifact, version, and hierarchical help;
@@ -99,53 +93,21 @@ blanket retries. A flake is a harness or product defect.
 
 Every test declares one evidence label. The reporter prints the label and can
 write a JSON inventory through `RUNFREE_E2E_REPORT`. Each record also names its
-`LH-*` scenario, physical layer, cadence, implementation status, selected
-owned-state areas, required programs, cleanup contract, exact test file, and
-exact test name. The report includes all 38 program statuses and separately
-lists blocked work. Modeled steps name their limits. The required lane has no
-real service credentials.
-
-The offline lane has 24 tests. All 24 passed on 2026-09-26 (`make test-cli-e2e`,
-7 files, 24 tests).
-
-No scenario is `Implemented-failing`. LH-09, LH-12, and LH-23 carried that
-status for defects that are now fixed, and their tests still assert the
-original invariants. A second unchanged `service enable --no-reload` leaves
-owned state unchanged (LH-09). `inbox clean --all` keeps a forged hard link
-(LH-23). The packaged live lifecycle passed managed-session liveness on Docker
-Desktop on 2026-09-18 (LH-12). All three are `Partial`, because each still has
-unproved parts.
-
-The LH-10 refusal proves that `runfree image init` rejects a symlinked
-`.runfree/runfree.json` before it writes project, XDG config, XDG data, or XDG
-state. The LH-03 tests prove that every command, `init` included, refuses a
-pre-v4 config with the remedy and leaves owned state unchanged.
+scenario, physical layer, cadence, implementation status, selected owned-state
+areas, required programs, cleanup contract, exact test file, and exact test
+name, and the report lists blocked work separately. Modeled steps name their
+limits. The required lane has no real service credentials.
 
 ## Output Gates
 
-Two static tests keep user-facing text honest and run inside `pnpm test`
-and `make test-static`:
-
-- `scripts/emitted-commands.test.ts` parses every `runfree ...` command the
-  CLI can print — the remedy registry in `packages/cli/src/remedies.ts` plus
-  every hand-written `runfree <command>` string literal in the emitting
-  modules — under the real command parser. A remedy that names a command,
-  subcommand, or flag that does not exist fails the suite. Emit next-step
-  commands through the registry rather than as string literals. The same
-  parse runs over every `runfree ...` example in the public docs, fenced or
-  inline, except release notes and "what's new" pages.
-- `scripts/check-terminology.ts` rejects the bare word "generation" in
-  user-visible strings and in the public docs: name the family (effective
-  policy generation, control plane generation, session agent generation,
-  runtime generation, ...) as `docs/architecture.md` "Generation Families"
-  requires.
-
-[Writing documentation](writing-docs.md) lists every check the public docs
-must pass.
-
-When writing a failure message, make the last line state what did not happen
-in the user's nouns, reserve "deferred" for work that is actually queued, and
-never end a message with the internal step that was about to run.
+`scripts/emitted-commands.test.ts` (run by `pnpm test` and `make test-static`)
+parses every `runfree ...` command the CLI can print — the remedy registry in
+`packages/cli/src/remedies.ts` plus every hand-written `runfree <command>`
+string literal in the emitting modules — under the real command parser. A
+remedy that names a command, subcommand, or flag that does not exist fails the
+suite. Emit next-step commands through the registry rather than as string
+literals. The checks on public docs and user-visible terminology are listed in
+[What the checks enforce](writing-docs.md#what-the-checks-enforce).
 
 ## Proof Limits
 
@@ -159,8 +121,9 @@ never end a message with the internal step that was about to run.
 - The suite does not yet allocate a pseudo-terminal. Interactive wizard and
   color-on-terminal cells require an approved maintained PTY dependency.
 - Pull-request CI validates the candidate it compiled from source. The release
-  pipeline runs only unit tests; it does not run this lane against the signed
-  archive.
+  pipeline runs the Test workflow's checks (static checks, unit tests, template
+  validation, offline packaged E2E on a binary built from source); it does not
+  run this lane against the signed archive.
 - Nothing in these layers proves the live runtime on a platform where
   `make test-runtime` has not been run. Source tests passing on Linux CI is not
   evidence about macOS with Docker Desktop.

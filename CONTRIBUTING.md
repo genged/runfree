@@ -128,15 +128,13 @@ for exactly that.
 
 ## Compatibility
 
-- Project config version 4 is current. Older versions and legacy keys are refused, not migrated.
+- Project config version 4 is current. Config versions below 4 are refused, not migrated.
 - `.runfree/network-policy.json` is a fixed path. Do not move it.
-- Desired policy is version 2 or 3: an exact-hostname allowlist plus per-host
-  `requests` rules, `services`, `tokens`, `hostServices`, and an optional
-  `writeApproval` default. Runfree writes version 3 only when a credential
-  destination uses the `basic` scheme, a `username`, or a `protocol` scope, or
-  when one host and header has two destinations. No wildcard hosts.
-A change that breaks an existing project's state needs a migration and an entry
-in the release notes.
+- Desired policy allows exact hostnames only, no wildcards; its format is in
+  [`docs/cli.md`](docs/cli.md#network-policy).
+
+A change that breaks an existing project's state needs either a migration or a
+refusal that names the remedy, and an entry in the release notes.
 
 ## Documentation
 
@@ -145,15 +143,11 @@ in the release notes.
 before changing runtime, proxy, network, mount, credential, or sandbox
 behavior — the intended flow is not the same thing as the trust boundary.
 
-Public documentation must work in a clone that has nothing else:
-`make test-static` fails on a relative link or heading anchor that would not
-resolve there.
-
 [`docs/writing-docs.md`](docs/writing-docs.md) says which page owns which
 topic and how to write for it. A user-visible change updates its owning page in
 the same pull request, or the pull request says why nothing needs to change.
-`make test` also fails when a documented `runfree ...` example no longer parses
-or a page uses a bare generation phrase.
+The checks the docs must pass are in
+[What the checks enforce](docs/writing-docs.md#what-the-checks-enforce).
 
 ## Reporting bugs
 
@@ -174,6 +168,10 @@ The maintainer is the default reviewer for runtime and proxy changes, release
 workflows, and documentation, and is the only person who approves a release.
 Support is best effort, with no response-time commitment; that applies to pull
 requests too.
+
+Review also checks failure messages: the last line states what did not happen
+in the user's nouns, "deferred" is reserved for work that is actually queued,
+and no message ends with the internal step that was about to run.
 
 There is no formal code of conduct yet, because there is no designated
 enforcement contact to make one mean anything. Be decent to each other in the

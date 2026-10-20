@@ -12,9 +12,6 @@ page is the map.
 | [Team workflow](team-workflow.md) | Sharing policy across a team without sharing credentials |
 | [Troubleshooting](troubleshooting.md) | A refusal you do not understand, or a runtime that will not start |
 | [What's new in 0.6.0](whats-new-0.6.0.md) | Host services, git over HTTPS, `runfree mcp enable`, same-terminal resume |
-| [What's new in 0.5.2](whats-new-0.5.2.md) | Release gate runs the full verification, `make test-release` |
-| [What's new in 0.5.1](whats-new-0.5.1.md) | Pre-v4 config refusal, startup hardening, upgrade steps |
-| [What's new in 0.5.0](whats-new-0.5.0.md) | Supported platform, authentication routes, limitations |
 
 ## Understanding Runfree
 

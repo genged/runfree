@@ -44,6 +44,23 @@ That separation is deliberate: the agent can write the desired file, and writing
 it must not grant network authority. See
 [`security.md`](security.md#trust-boundary).
 
+## A policy change is saved but not applied (proxy from another build)
+
+A policy command (`host`, `host-service`, `credential`, `service`, `mcp`, or
+`policy use-approved`) publishes an effective policy generation only to a
+proxy built from the same release as the CLI. After an upgrade or downgrade,
+the running proxy can be from another build (a missing image-input label
+counts as another build). What happens then:
+
+| Situation | What happens | Remedy |
+| --- | --- | --- |
+| The runtime can be replaced compatibly | The command warns that running sessions lose network access for up to one heartbeat (30 s) plus adoption, replaces the proxy as `runfree up` does on the effective policy generation already selected, and publishes only after the new proxy's label matches. It refuses before any Docker work if the runtime isolation settings or desired policy differ from the approved controls. | None if it succeeds. If the replacement fails, the change is saved but not applied and the selection is unchanged; fix the reported cause and rerun the command. |
+| Active sessions use an incompatible admission epoch or control-plane topology | The change is saved and reported as not applied. | Wait for the sessions to end, then run `runfree policy use-approved`; or run `runfree rebuild` now. |
+| A session launch beside live sessions | The launch never replaces the proxy; it reports the change as waiting. | Run `runfree up`, then `runfree policy use-approved`. |
+| A proxy of another build appears while the change is being published | The previous selection is restored and the command fails. | Retry the command. |
+
+See [Older Readers](security.md#older-readers) for why the check exists.
+
 ## A host cannot be removed
 
 `runfree host remove` refuses a host something still references. Usually a
@@ -67,8 +84,8 @@ runfree resources    # every Runfree Docker resource for this project
 
 Common cases:
 
-- **An unclaimed container.** A leftover container from an older Runfree layout
-  hits the unclaimed-container refusal. `runfree rebuild` is the remedy;
+- **An unclaimed container.** A container with this project's label that
+  Runfree does not recognize hits the unclaimed-container refusal. `runfree rebuild` is the remedy;
   `runfree destroy` is the heavier one.
 - **A live session blocks the operation.** `runfree stop` and
   `runfree runtime reload-policy` refuse while sessions are live. Close the
@@ -83,32 +100,15 @@ Common cases:
 - **The launch exits 111.** The session entry did not see the proxy activate
   the session in time, so it stopped and teardown removed it. Run the command
   again; if it repeats, check `runfree status` and `runfree logs proxy`.
+- **Docker died under a live session.** The next start finishes the
+  interrupted teardown only when Docker can prove it safe; otherwise it
+  refuses. Retry once Docker answers or the owning `runfree` process has
+  exited. Use `runfree destroy --force` when the owner cannot be proved dead,
+  or `runfree rebuild` when the session container is still running.
 - **`runfree stop` kept the control-plane selection.** If stop warns `could not
   prove the stopped runtime's proxy and networks are gone, so its
   control-plane selection was kept` and the next start refuses, run
   `runfree destroy`.
-
-## The config is refused as pre-v4
-
-```text
-runfree error: .runfree/runfree.json uses config version 3, which this release no longer migrates
-  move .runfree aside and run `runfree init` to create a current configuration, then re-add hosts and services
-```
-
-Since 0.5.1, a `.runfree/runfree.json` below version 4, or one that still has
-the removed `agent`, `paths`, or `project.*` keys (other than `project.name`),
-is refused by every command, `init` included. Only pre-release installs can
-have one: 0.5.0 already wrote version 4. The refusal happens before anything is
-written.
-
-```bash
-mv .runfree .runfree.pre-v4
-runfree init
-runfree host add <host>        # re-add what the old policy allowed
-```
-
-Use `.runfree.pre-v4/network-policy.json` as the list of hosts and services to
-re-add, then delete the old directory.
 
 ## Leftover helpers could not be confirmed removed
 
@@ -229,19 +229,9 @@ host from the main checkout.
 ## A write is being held
 
 With approve-on-write active, an outbound write waits for a host-side decision.
-
-```bash
-runfree approvals            # what is held
-runfree approvals --watch    # stay attached as the approver
-runfree approve <id>
-runfree approve <id> --deny
-```
-
-If you told Runfree to stop asking and want the prompts back:
-
-```bash
-runfree approvals --clear-deny
-```
+Run `runfree approvals --watch` to stay attached as the approver, and
+`runfree approvals --clear-deny` to bring back prompts you told Runfree to stop.
+The rest of the flow is in [Approve-On-Write](cli.md#approve-on-write).
 
 ## An interrupted session will not resume
 
@@ -260,6 +250,35 @@ If a resume fails after you chose to resume it, the same question appears the
 next time. Choose "Forget it" to stop being asked about that session; it
 starts nothing and only marks the record done.
 
+## Git over HTTPS fails
+
+| Condition | What happens |
+| --- | --- |
+| No `github` or `gitlab` token stored | The request goes out anonymously, with any agent `Authorization` removed. Public fetches work; private fetches and pushes get 401 from the provider. |
+| Token expired or revoked | 401 from the provider. Refresh the source, then run `runfree credential sync`. |
+| Token cannot reach the repository | 403 or 404 from the provider. |
+| Push refused by policy or approval | The proxy refuses with `git-push-denied`, `write-denied`, or a `write-approval-*` reason, before any upstream connection or token read. |
+| Path the proxy cannot read unambiguously | No credential is attached; write classification is unchanged. |
+| Agent points a remote back at SSH | The connection fails; the sandbox has no SSH egress. |
+| Service enabled at an older revision | Git requests carry no proxy credential, so private fetches and pushes get 401. Run `runfree service diff --apply`. |
+
+See [Git over HTTPS and SSH remotes](cli.md#git-over-https-and-ssh-remotes).
+
+## An MCP login waits for approval
+
+On an `ask` host, an MCP login or refresh normally passes as an OAuth protocol
+read. If one waits for approval and the denial says:
+
+```text
+This OAuth token request names a client metadata URL as its client_id that
+Runfree does not recognize. ...
+```
+
+the client sent a URL `client_id` other than the published Claude Code or
+Codex one. The issuer would fetch that URL, so the request counts as a write.
+The denial does not repeat the URL. Approve it with `runfree approve <id>` only
+if you expect that client. See [MCP](cli.md#mcp).
+
 ## Credentials are not reaching the proxy
 
 ```bash
@@ -272,40 +291,22 @@ a placeholder, that is correct. An empty or stale value usually means the host
 source failed: run the source command yourself and check it prints a token.
 
 A native Claude or Codex login is a different thing and does not appear here.
-See [`whats-new-0.5.0.md`](whats-new-0.5.0.md#authentication-routes).
+See the login steps in [the README](../README.md#3-run-an-agent).
 
 ## Dependencies behave oddly inside the container
 
 Dependency directories live in Runfree-owned volumes, not in the host checkout.
-
-```bash
-runfree deps plan       # what is mounted where
-runfree deps doctor     # drift and host artifact risks
-runfree deps install
-runfree deps reset      # remove the volumes and start over
-```
-
-## Discovering what a project actually needs
-
-For a trusted onboarding task, audit mode records non-allowlisted hosts instead
-of denying them, for a bounded window:
-
-```bash
-runfree up --audit-network=30m
-runfree audit status
-runfree audit report          # suggested host add commands; never edits policy
-runfree audit off
-```
-
-Audit mode widens what the agent can reach while it is on. Use it deliberately
-and close it when you are done; `runfree audit off` severs in-flight audited
-connections immediately.
+Start with `runfree deps doctor`, then see
+[Dependency Overlays](cli.md#dependency-overlays).
 
 ## Still stuck
 
 - `runfree help <topic>` has task guides for network, credentials, services,
   MCP, dependencies, images, and diagnostics.
 - [`cli.md`](cli.md) is the full command reference.
+- To find the hosts a project needs, see
+  [Audit network discovery](cli.md#audit-network-discovery). Audit mode widens
+  what the agent can reach while it is on; close it with `runfree audit off`.
 - Bugs and feature requests go to GitHub Issues with the version, host and
   Docker versions, the command, and a sanitized reproduction.
 - A suspected vulnerability goes to private reporting, never a public issue. See

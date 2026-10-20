@@ -89,7 +89,7 @@ Created project files include:
 | `runfree up` | Start or reuse the Docker Compose runtime without attaching an agent. |
 | `runfree rebuild [--yes]` | Rebuild/recreate the runtime. Confirms before killing active sessions unless `--yes` is used. |
 | `runfree stop [--force]` | Stop this project's services. Requires `--force` while live or unprovable session owners remain, while a control-plane rebind is pending, or while any session is mid-teardown. |
-| `runfree destroy [--force]` | Destroy the whole project runtime: delete this project's session files from the proxy, remove session containers by their lifecycle records, run the Compose teardown (volumes, local images, orphans), then clear the lifecycle records. Without `--force` it refuses whenever ending work or losing state is possible: live sessions, running project containers no record or Compose claims, quarantined unreadable lifecycle records, an unreadable control-plane rebind journal, or a registry that cannot be enumerated. |
+| `runfree destroy [--force]` | Destroy the whole project runtime: session containers, volumes, local images, and orphans (see [Lifecycle](architecture.md#runtime-lifecycle)). Without `--force` it refuses on live sessions, running project containers no record or Compose claims, quarantined unreadable lifecycle records, an unreadable control-plane rebind journal, or a registry that cannot be enumerated. |
 | `runfree sessions` | List active sessions plus interrupted or unverified recovery evidence for this project. The CONTAINER TTY column reports each session's heartbeat: `attached, served until <aliveUntil>`, or `attached, NOT served since <lastHeartbeatAt> (heartbeat retrying)`. It also compares the proxy's session files with this project's records, without changing either: a session whose owning host process can be proved neither alive nor dead is named, with `runfree destroy --force` as the remedy, and session files no record claims are named with `runfree up` as the remedy. |
 | `runfree resume` | Pick and resume interrupted Claude, Codex, or Pi work for the current project. |
 | `runfree resume --list` / `--json` | Inspect the current project's bounded recovery inventory offline without contacting Docker. |
@@ -98,7 +98,9 @@ Created project files include:
 | `runfree status` | List containers, desired/effective runtime component identities and upgrade action, audit state, and the proxy's session files with, for each, either `served until <aliveUntil>` or `on disk, not served (<reason>)`. With approved [host services](#host-services), it also lists each one with its current listener and the host-service gateway state, and warns about drift. |
 | `runfree resources` | List Runfree Docker resources for this project. |
 | `runfree logs proxy` | Follow proxy logs. Use `--verbose` for sanitized allowed request metadata. |
-| `runfree runtime reload-policy [--force]` | Reload runtime policy and sync proxy-managed tokens. Refuses under the same conditions as `runfree stop` unless `--force` is given; a restarted proxy republishes session eligibility and the per-session heartbeats refill its session files. |
+| `runfree runtime reload-policy [--force]` | Restart the proxy, reload runtime policy, and sync proxy-managed tokens. Refuses under the same conditions as `runfree stop` unless `--force` is given. |
+| `runfree runtime recover` | Resume a pending compatible proxy replacement (a control-plane rebind) with the approved policy. Refuses with `no proxy replacement is pending; use runfree up to prove the current runtime` when none is pending. |
+| `runfree runtime recover --retry` | Same, and grant the pending replacement a new allowance (120 seconds, at most two proxy creations). Use it after `automatic allowance ended; sessions remain running` and after you repair the reported failure. See [architecture.md](architecture.md#runtime-lifecycle). |
 | `runfree project-id` | Print the stable project id. |
 | `runfree project-id --compose-name` | Print the Docker Compose project name. |
 
@@ -106,19 +108,6 @@ The agent commands run the agent's configured command and pass it no extra
 arguments. An unknown flag, such as `runfree claude --resume`, is refused with
 `Unknown argument` before any project or Docker work; use `runfree resume` to
 resume a conversation.
-
-Runtime examples:
-
-```bash
-runfree --verbose
-runfree shell
-runfree resume --list
-runfree resume --all
-runfree resume --agent codex
-runfree logs proxy --verbose
-runfree runtime reload-policy
-runfree rebuild --yes
-```
 
 ### Resume
 
@@ -138,22 +127,15 @@ resumed that session asks one question, default "Resume it":
 "Not now" leaves the record for the next `runfree resume`; "Forget it"
 discards it immediately.
 
-Any other case shows a picker instead — strong terminal matches first, then
-weak matches, then the rest, newest first. Choosing a row asks "Resume it" /
-"Forget it" / "Back", so any row can be forgotten, not only a strong match.
-`--all` and `--project` show their own labelled picker, each row prefixed
-with its project name; it only resumes a row or returns to the list, and
-never asks the one question.
+Any other case shows a picker, newest first after terminal matches; choosing
+a row asks "Resume it" / "Forget it" / "Back". `--all` and `--project` show a
+labelled picker, each row prefixed with its project name, that never asks the
+one question. Without a TTY, or with `--list`, `runfree resume` only prints the
+inventory table. Records with no record version are listed only by `--list`.
 
-Without a TTY, or with `--list`, `runfree resume` only prints the inventory
-table; `--json` is unchanged. Records from before this feature, with no
-record version, are hidden from the one question and the picker, but still
-listed by `--list`.
-
-`runfree claude`, `runfree codex`, and `runfree pi` never scan for
-interrupted work and never ask: they always start a fresh session. Resuming
-only ever happens through `runfree resume`. See [Interrupted Session
-Recovery](architecture.md#interrupted-session-recovery).
+`runfree claude`, `runfree codex`, and `runfree pi` always start a fresh
+session; resuming happens only through `runfree resume`. See [Interrupted
+Session Recovery](architecture.md#interrupted-session-recovery).
 
 ## Network Policy
 
@@ -163,11 +145,9 @@ Runfree policy is exact-host based. There are no wildcard hosts.
 Runfree writes version 3 only when the content needs it: a credential
 destination with the `basic` scheme, a `username`, or a `protocol` scope, or
 two destinations for one host and header within the direct `tokens` or within
-one service entry. A file that uses
-none of these stays version 2, with the same bytes and digest as before. A
-file that declares version 2 but uses one of these is refused, and the error
-names the fields. Runfree releases before version 3 existed refuse a version 3
-file with `version must be 2`. Editing the file does
+one service entry. Otherwise the file stays version 2; a version 2 file that
+uses these is refused with the fields named, and older releases refuse
+version 3 with `version must be 2`. Editing the file does
 not change a running proxy or authorize the next start. Runfree captures it
 while project agents are quiesced, compares it with host-owned approvals, and
 compiles an immutable effective policy generation only after exact approval.
@@ -210,8 +190,7 @@ runfree host rules <host> --clear
 `--read-only` is shorthand for `GET`, `HEAD`, and `OPTIONS`. Re-running `host add` or `host rules` with request-rule flags replaces that host's request rules. `host rules --write` sets the action for write-class requests to that host.
 
 `--local` writes the checkout-local ignored desired layer; project scope is the
-default. Pre-v4 configs are not migrated: move `.runfree` aside and run
-`runfree init` to start a current configuration.
+default.
 
 ### Audit network discovery
 
@@ -252,17 +231,9 @@ a device or simulator bridge, or any other service you run on the host. Clients
 in the agent use it unmodified at `127.0.0.1:<port>`, even when they ignore
 proxy settings.
 
-1. Start the service on the host. It must listen on `127.0.0.1:<port>` or
-   `*:<port>`.
-2. Approve it for the project:
-
-   ```bash
-   runfree host-service add <name> --port <port>
-   ```
-
-3. Start a new session. Inside it, point the client at `127.0.0.1:<port>`.
-
-For example, with a dev server on the host at `127.0.0.1:3000`:
+Start the service on the host listening on `127.0.0.1:<port>` or
+`*:<port>`, approve it, then start a new session. For example, with a dev
+server on the host at `127.0.0.1:3000`:
 
 ```bash
 runfree host-service add devserver --port 3000
@@ -320,17 +291,13 @@ psql -h 127.0.0.1 -p 5432 -U <user> <database>
   listener or with any listener owned by Docker Desktop (`com.docker.*`, a
   published container port). The output names the process and pid you
   approved.
-- Each new session starts a relay on `127.0.0.1:<port>` inside the session
-  for each approved service. A service added while a session runs appears in
-  the next session. `remove` cuts open connections at once in every session,
-  and reports `live now` only after the proxy and the firewall have both cut
-  the service. If the relay cannot bind a port, it skips that service with a
-  warning and the session still starts; a later process in the session that
-  wants the port gets `EADDRINUSE`.
-- A connection to a host service that is not approved is refused. When `add`
-  would accept that name and port, the refusal and `runfree doctor` suggest
-  `runfree host-service add <name> --port <port>`, labelled as requested by
-  the agent; check it before you run it.
+- A service added while a session runs appears in the next session.
+  `remove` cuts open connections in every session and reports `live now` once
+  the proxy and the firewall have both cut it. A port the in-session relay
+  cannot bind is skipped with a warning.
+- An unapproved host-service connection is refused; the refusal and
+  `runfree doctor` may suggest `runfree host-service add <name> --port <port>`,
+  labelled as requested by the agent. Check it before you run it.
 - `list` prints the effective host services and who listens on each port now.
   `runfree status` repeats that check and warns when the listener is gone,
   changed, or owned by Docker Desktop. It also prints the gateway state:
@@ -338,25 +305,16 @@ psql -h 127.0.0.1 -p 5432 -U <user> <database>
   `host-service gateway: unknown (proxy not running)` with no warning when the
   proxy is stopped, or `host-service gateway: unknown` with a warning when the
   proxy's gateway status cannot be read or is malformed. These lines never change the exit code.
-- An approved port is recorded in a host-global registry. `runfree forward`
-  and `runfree vnc` in any other project refuse it and name every owning
-  project; several projects may approve the same port. If the registry is
-  corrupt, they refuse until `runfree host-service list --repair` rebuilds it.
-  The repair refuses, writes nothing, and exits non-zero when a known
-  project's state cannot be read; it names that project. A completed
-  `runfree destroy` removes the project's ports from the registry, and MCP
-  callback ports skip every registered port.
+- `runfree forward` and `runfree vnc` in other projects refuse an approved
+  port; `runfree host-service list --repair` rebuilds a corrupt port registry
+  (see [troubleshooting.md](troubleshooting.md#a-host-service-is-refused-or-unreachable)).
 - The tunnel is opaque: no request rules, write approval, or credential
   injection apply, and the host service's own authentication is the only
   check on what the agent does there. Access is per project. See
   [Residual Risks](security.md#residual-risks).
-- If the host gateway address changes while the proxy runs, the proxy cuts
-  open host-service connections and new ones refuse. `runfree status` then
-  shows `host-service gateway: unavailable (... gateway address changed ...)`,
-  and `runfree logs proxy` shows the refusals and the cut as
-  `proxy: host-service splices cut: <count>; reason: <reason>`. Host services stay
-  refused until `runfree rebuild`, which recreates the proxy and ends every
-  session.
+- If the host gateway address changes, host services stay refused until
+  `runfree rebuild`, and `runfree logs proxy` shows
+  `proxy: host-service splices cut: <count>; reason: <reason>`.
 
 ## Credentials
 
@@ -468,29 +426,17 @@ Important enable options:
 An enabled entry keeps the revision it was enabled with. A newer Runfree
 release does not upgrade it and does not warn. `runfree service diff` prints
 `<id> (<layer>): revision <old> -> <new>` with the resolved semantics before
-and after, and `runfree service diff --apply` writes the new entries:
-
-```bash
-runfree service diff
-runfree service diff --apply
-```
+and after, and `runfree service diff --apply` writes the new entries.
 
 `--apply` keeps each entry's recorded selection: skipped hosts and write mode.
 Re-running `runfree service enable <id>` also writes the current revision, but
 it builds the entry only from that run's flags, so an earlier `--skip-broad`,
 `--skip-host`, `--read-only`, or `--allow-write` is lost unless you repeat it.
 
-Revision changes in this version:
-
-| Service | Revision | Change |
-| --- | --- | --- |
-| `github` | 2 -> 3 | Adds the `github` token as `Authorization: Basic` (username `x-access-token`) on `github.com`, only on git smart-HTTP requests (`protocol: "git-http"`) and Git LFS requests (`protocol: "git-lfs"`) (see [Git over HTTPS and SSH remotes](#git-over-https-and-ssh-remotes)). Other `github.com` paths, including the web UI, get no credential, and an `Authorization` header the agent sends to `github.com` is now removed or replaced. |
-| `gitlab` | 1 -> 2 | Adds the `gitlab` token as `Authorization: Basic` (username `oauth2`) on `gitlab.com` git smart-HTTP requests (`protocol: "git-http"`), beside the existing Bearer destination on `/api/`. Git LFS is not mediated on `gitlab.com`: LFS requests get no credential, and an LFS batch request is a write. With no token stored, `gitlab.com` requests now go out anonymously instead of being refused. |
-
-Both new revisions use the `basic` scheme and a `protocol` scope, so applying
-either one makes `.runfree/network-policy.json` desired policy version 3.
-Everyone who reads that file needs a Runfree release that accepts version 3;
-older releases refuse it with `version must be 2`.
+A `github` or `gitlab` service enabled at an older revision gets no
+git-over-HTTPS credential until you run `runfree service diff --apply`.
+Applying either one makes `.runfree/network-policy.json` desired policy
+version 3.
 
 ### User-defined services
 
@@ -520,39 +466,17 @@ Each destination has these fields:
 | `protocol` | no | `git-http`: inject only on the git smart-HTTP requests (ref discovery, fetch, push) listed in [Git over HTTPS and SSH remotes](#git-over-https-and-ssh-remotes). `git-lfs`: inject only on the Git LFS batch and lock requests listed there. With a `pathPrefix` too, the request must match both. |
 
 On one host and header, at most one destination may have each `protocol`, and
-no two destinations may have the same `protocol` and `pathPrefix`. No request
-is both a `git-http` and a `git-lfs` request, so at most one `protocol`
-destination per header matches a request. The proxy chooses among a host's
-destinations per host, not per header: when any `protocol` destination of the
-host matches the request, only `protocol` destinations are used, and a
-destination without `protocol` is not injected on that request, even on
-another header. Otherwise the longest matching `pathPrefix` wins, as before. A
+no two destinations may have the same `protocol` and `pathPrefix`. A
 definition that breaks a rule is refused before anything is written. Enabling
 a service whose destinations use `basic`, `username`, or `protocol` makes the
-desired policy version 3.
+desired policy version 3. How the proxy chooses among a host's destinations,
+and the Git LFS read rule a `git-lfs` destination turns on, are in
+[security.md](security.md#git-over-https).
 
-A `git-lfs` destination also opts its host into Git LFS mediation: on a host
-with a git handling rule, a Git LFS batch request whose body proves it is a
-download is a read only when a `git-lfs` destination of that host matches it
-(its `pathPrefix`, if any, covers the request path). Use it only for an LFS
-server whose batch responses do not hand back a credential broader than one
-object transfer (see [security.md](security.md#git-over-https)).
-
-A host with a git handling rule but no matching `git-lfs` destination gets no
-LFS read rule: every Git LFS batch request there, a download included, is a
-write and waits for approval under `ask`. This applies to `bitbucket.org`
-under the `bitbucket` service (its LFS downloads, public ones included, now
-wait for approval), to `gitlab.com`, and to any host you give a git rule by
-hand, such as with `runfree host rules <host> --deny-git-push`.
-
-These fields let a host with no curated service, such as GitHub Enterprise
-Server or self-hosted GitLab, get a git credential. One limitation: a
-user-defined service cannot declare git handling for its hosts (the `gitPush`
-rule that curated `github` and `gitlab` carry). On such a host every git fetch
-(`POST …/git-upload-pack`) and every Git LFS batch request is a write by
-method, so under the default `ask` posture each one waits for approval, and a
-push is a plain write rather than a git push. The SSH remote rewriting below
-covers only `github.com` and `gitlab.com`.
+These fields give a git credential to a host with no curated service, such as
+GitHub Enterprise Server or self-hosted GitLab. A user-defined service cannot
+declare git handling, so there every fetch and LFS batch is a write that waits
+under `ask` (see [Residual Risks](security.md#residual-risks)).
 
 ### Git over HTTPS and SSH remotes
 
@@ -574,44 +498,20 @@ repository path segment:
 | Git LFS locks | `GET`, `POST` | `/info/lfs/locks` (`GET` or `POST`), `/info/lfs/locks/verify`, `/info/lfs/locks/<id>/unlock` (`POST`) | `git-lfs` |
 
 The `github` service has both a `git-http` and a `git-lfs` destination on
-`github.com`. The `gitlab` service has only `git-http` on `gitlab.com`, so Git
-LFS is not mediated there in this release: LFS requests to `gitlab.com` get no
-credential, and every LFS batch request, a download included, is a write that
-waits for approval under `ask`. GitLab answers an authenticated batch request
-with a project-wide LFS token that can push, so the agent must not get one
-without your approval. A private GitLab LFS fetch therefore fails.
+`github.com`. The `gitlab` service has only `git-http`, so Git LFS is not
+mediated on `gitlab.com`: LFS requests there get no credential, every LFS batch
+request is a write, and a private GitLab LFS fetch fails (see
+[security.md](security.md#git-over-https)).
 
-Methods must match exactly, and the raw path and its decoded form must both
-end with the same plain endpoint. An encoded, `;param`, trailing `/` or `.`,
-or otherwise ambiguous spelling gets no credential. These are not git requests
-either, and get no credential:
-
-- a `POST` endpoint with a query string (only the `GET` lock listing takes
-  one);
-- a ref discovery query that contains a `;`;
-- a path whose first segment is `api` (in any case or encoding, and with any
-  dots or whitespace around it), including a `github.com` owner named `api`;
-- a path with a segment that starts with whitespace, such as `%20repo`;
-- a path with a segment that is exactly `-`, such as GitLab's `/-/` routes.
-
-Any other path on the host gets no credential either.
-
-Write approval applies as before. A fetch is a read. A push is a git push
-write: under the default `ask` posture it waits for `runfree approve`, and
-once approved it goes out with your token. A ref discovery request that names
-`service=git-receive-pack` in any case or encoding, or whose query contains a
-`;`, counts as a push. To refuse pushes outright:
+Any other path, or an ambiguous spelling of one of these, gets no credential.
+A fetch is a read. A push is a git push write: under the default `ask` posture
+it waits for `runfree approve`, and once approved it goes out with your token.
+On `github.com`, a Git LFS download batch is a read and an upload is a write.
+To refuse pushes outright:
 
 ```bash
 runfree host rules github.com --deny-git-push
 ```
-
-On `github.com`, a Git LFS batch request whose body proves it is a download is
-a read; an upload batch and every `POST` lock request are writes. The `GET`
-lock listing is a read, and on `github.com` it carries the `git-lfs`
-credential. On `gitlab.com`, `bitbucket.org`, and every other host without a
-matching `git-lfs` destination, every LFS batch request is a write. The proof
-rules are in [security.md](security.md#git-over-https).
 
 #### SSH remotes
 
@@ -631,10 +531,8 @@ HTTPS:
 
 - The rewrite is always present, whether or not the service is enabled. A
   rewritten remote on a host that is not allowed fails with the proxy's
-  denial for that host, not an SSH connection error.
-- It is routing, not enforcement. The agent can undo it with `git -c`,
-  `GIT_CONFIG_*` variables, or repository config, and gains nothing: SSH has
-  no route out of the sandbox either way.
+  denial for that host. It is routing, not enforcement: undoing it gains the
+  agent nothing, because SSH has no route out of the sandbox.
 - Your repository's `.git/config` is not changed; it keeps the SSH URL, and
   host Git never reads the sandbox config. Inside the sandbox, `git remote -v`
   shows the HTTPS URL, and an explicit `pushurl` and submodule URLs with these
@@ -647,17 +545,8 @@ HTTPS:
   GitHub Enterprise Server or self-hosted GitLab. Use an HTTPS remote for
   those.
 
-#### Git failure modes
-
-| Condition | What happens |
-| --- | --- |
-| No `github` or `gitlab` token stored | The request goes out anonymously, with any agent `Authorization` removed. Public fetches work; private fetches and pushes get 401 from the provider. |
-| Token expired or revoked | 401 from the provider. Refresh the source, then run `runfree credential sync`. |
-| Token cannot reach the repository | 403 or 404 from the provider. |
-| Push refused by policy or approval | The proxy refuses with `git-push-denied`, `write-denied`, or a `write-approval-*` reason, before any upstream connection or token read. |
-| Path the proxy cannot read unambiguously | No credential is attached; write classification is unchanged. |
-| Agent points a remote back at SSH | The connection fails; the sandbox has no SSH egress. |
-| Service enabled at an older revision | Git requests carry no proxy credential, so private fetches and pushes get 401. Run `runfree service diff --apply`. |
+Git failures and their remedies are in
+[troubleshooting.md](troubleshooting.md#git-over-https-fails).
 
 ## Approve-On-Write
 
@@ -759,14 +648,11 @@ OAuth login works in any session. When an approved MCP server can use OAuth,
 each `runfree claude`, `codex`, `pi`, or `shell` session gets its own loopback
 callback port. In Claude, type `/mcp` and select the server; in Codex or a
 shell, run `codex mcp login <server>`. Then open the URL the client prints.
-Two sessions can log in at the same time. `runfree mcp auth` launches a session
-and prints these steps. A provider that accepts only one pre-registered
-callback port works only while its session holds the project's first port.
-Each session tries up to 32 callback ports; when all are taken by other
-sessions or host processes, the launch fails with a retry instruction. A
-login refused only because its `client_id` is not a pinned agent client
-metadata URL goes to write approval, and the denial says so without
-repeating the URL.
+Two sessions can log in at the same time. `runfree mcp auth` launches a
+session and prints these steps. A provider that accepts only one
+pre-registered callback port works only while its session holds the project's
+first port. Each session tries up to 32 callback ports; when all are taken,
+the launch fails with a retry instruction.
 
 ### Enable an MCP server in one step
 
@@ -785,32 +671,10 @@ and then runs the OAuth login (`runfree mcp auth`) for OAuth servers. Pass
 `--no-login` to skip the login.
 
 To find the OAuth hosts, Runfree reads the server's OAuth metadata from this
-computer: RFC 9728 protected-resource metadata on the MCP endpoint host, then
-RFC 8414 authorization-server metadata or OpenID configuration from each
-authorization server it names. The requests are plain HTTPS GETs with no
-credentials, no cookies, no proxy, and no redirects. They go only to public
-addresses, with strict time and size limits. For a project entry, Runfree
-first asks before it contacts the host that the project file names.
-
-Discovery adds a host only when valid metadata names a token endpoint that the
-proxy mediates for this server. When nothing else allows it, a host found by
-discovery is limited to GET, HEAD, OPTIONS, and POST on paths that start with
-`/.well-known` or one of its OAuth endpoint paths. The
-proxy mediates those endpoints, so the agent sees only `runfree_oauth_*`
-handles. The browser sign-in page opens on your computer and is never
-allowlisted.
-
-Login and refresh do not wait for write approval. On an `ask` host, a POST to
-exactly one of the token or registration endpoints that discovery recorded for
-this server is an OAuth protocol read, but only while the proxy mediates that
-endpoint for this server alone. The body must be a plain login or refresh
-(`authorization_code` or `refresh_token` form grant, a `client_id` that is not
-a URL, and a `resource` only for the server itself), or a client registration
-whose redirect URIs are loopback `http` URLs only, with no other URL field. Any
-other method, path (sub-paths too), query, body, an endpoint that another
-server also uses, and an `--oauth-host` host with no recorded endpoint follow
-the project's write approval setting. A host set to `deny` stays denied. Each
-server gets at most 30 such reads a minute; after that, they need approval.
+computer with plain HTTPS GETs that carry no credentials, and asks first
+before it contacts a host a project file names. Login and refresh at the
+recorded endpoints skip write approval, at most 30 a minute per server; a host
+set to `deny` stays denied. The rules are in [security.md](security.md#mcp).
 
 | Option | Meaning |
 | --- | --- |
@@ -846,9 +710,8 @@ login. Revoke prints one of these lines:
 
 If Runfree finds its record of cleared servers damaged or missing, it clears
 the OAuth state of every MCP server, and each server needs a new login. A
-damaged record also prints a warning. The first start after an upgrade to a
-version with this feature creates the record, so each MCP OAuth server needs
-one new login then.
+damaged record also prints a warning; a missing one (the first start after
+upgrading from a release without it) does not.
 
 ## Dependency Overlays
 
@@ -905,12 +768,11 @@ with `start`. A bare `stop` closes all of this project's port forwards; `stop`
 with a port closes that one. The host-facing network is derived from the project
 id, so a forward cannot be pointed at a shared bridge.
 
-The forward is host→agent only and never carries egress, so it is not a path
-around proxy policy. Two consequences are worth knowing: the splice reaches the
+The forward is host→agent only and never carries egress. It reaches the
 agent's network interface, not its loopback, so a service bound only to
-`127.0.0.1` inside the session is unreachable and the forward still reports
-success; and content served through the forward renders in your unsandboxed
-browser, outside the proxy, so treat it as untrusted output from the agent.
+`127.0.0.1` inside the session is unreachable while the forward still reports
+success. Treat what it serves as untrusted agent output in your unsandboxed
+browser (see [Trust Boundary](security.md#trust-boundary)).
 
 ### Runfree inbox
 
@@ -921,7 +783,7 @@ runfree inbox clean
 runfree inbox clean --all
 ```
 
-On macOS, `inbox paste` imports a clipboard image into Runfree state and prints its read-only `/runfree/inbox/...` container path. `runfree paste-image` remains as a deprecated compatibility alias.
+On macOS, `inbox paste` imports a clipboard image into Runfree state and prints its read-only `/runfree/inbox/...` container path.
 
 ### Git worktrees
 
@@ -1020,25 +882,6 @@ lifecycle records or pending transactions referencing them. Use
 
 ## Common Workflows
 
-### Enable Node and GitHub
-
-```bash
-runfree init
-runfree credential source add github-cli -- gh auth token
-runfree service enable node
-runfree service enable github --from-source github-cli
-runfree
-```
-
-### Discover required hosts safely
-
-```bash
-runfree up --audit-network=30m
-runfree
-runfree audit report
-runfree audit off
-```
-
 ### Add a private API
 
 ```bash
@@ -1050,11 +893,4 @@ runfree host add api.internal.example.com \
 runfree credential add internal-api \
   --host api.internal.example.com \
   --from-source internal-api
-```
-
-### Keep writes reviewable
-
-```bash
-runfree host rules api.example.com --write ask
-runfree approvals --watch
 ```

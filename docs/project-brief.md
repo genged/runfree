@@ -55,15 +55,11 @@ add`, `runfree credential add`, and `runfree mcp enable`.
 
 Runfree is not a VM isolation layer, a cloud service, or a replacement for code review. It does not make an untrusted project safe to execute arbitrary native code on your host. It narrows the default blast radius for local coding agents by combining Docker isolation, proxy-mediated egress, exact-host policy, and proxy-side credential storage.
 
-Runfree also does not publish Linux or Intel macOS release binaries. They can be built from source; a source build is not a support claim. Public release artifacts are restricted to targets with recorded acceptance evidence.
-
 ## Audience
 
 The primary audience is individual developers using Claude Code, Codex, or Pi who want project tooling in a container and service credentials mediated by a host-controlled proxy. Team use is supported by committing desired policy and reviewing it like code — each developer still binds their own credential sources and approves policy on their own machine — but it is secondary. Runfree makes no enterprise or certification claims.
 
 ## Supported Release Shape
-
-As of `0.6.0`:
 
 - published binary: `darwin-arm64` only, ad-hoc signed and not notarized, with a SHA-256 manifest;
 - host: Apple Silicon macOS;
@@ -73,23 +69,10 @@ As of `0.6.0`:
 
 The release target list lives in [`../scripts/release-targets.txt`](../scripts/release-targets.txt), which packaging, signing, checksums, and the CI build matrix all read.
 
-Runtime/security changes should be validated with `make test-runtime-core` on a Docker-capable host, and releases with the full `make test-runtime` or `make test-all`.
-
 ## Source Map
 
-| Area | Primary files |
-| --- | --- |
-| CLI entrypoint and command app | `packages/cli/src/cli.ts`, `packages/cli/src/commands/` |
-| Project config and init wizard | `packages/cli/src/config.ts`, `packages/cli/src/init-wizard.ts`, `packages/cli/templates/` |
-| Runtime lifecycle and Docker Compose orchestration | `packages/cli/src/runtime.ts`, `packages/cli/src/runtime/env.ts`, `packages/cli/src/network.ts` |
-| Interrupted session recovery and `runfree resume` | `packages/cli/src/runtime/recovery.ts`, `packages/cli/src/runtime/resume-selection.ts`, `packages/cli/src/runtime/terminal-identity.ts`, `packages/cli/src/runtime/codex-rollouts.ts`, `packages/cli/src/commands/resume.ts` |
-| Host services | `packages/cli/src/commands/admin/host-service.ts`, `packages/cli/src/control/host-service-mutation.ts`, `packages/cli/src/host-service-registry.ts`, `packages/proxy/src/host-service-tunnel.ts`, `packages/proxy/src/firewall/host-service-gateway.ts`, `packages/agent-runtime/src/host-service-relay.cts` |
-| Desired/effective network contracts | `packages/runtime-contracts/src/desired-network-policy.ts`, `packages/runtime-contracts/src/network-policy.ts` |
-| OAuth mediation contracts | `packages/runtime-contracts/src/oauth-mediation-policy.ts` |
-| Proxy enforcement | `packages/proxy/src/` |
-| Admin policy/token/service/MCP enforcement | `packages/cli/src/admin/`, `scripts/services.ts` |
-| Runtime assets | `packages/agent-runtime/agent/`, `packages/proxy/`, `dist/runtime/` |
-| Release packaging | `scripts/build-bin.ts`, `scripts/package-homebrew-artifacts.sh`, `scripts/install.sh` |
+The map from each area to its source files lives in
+[`AGENTS.md`](../AGENTS.md#where-to-look).
 
 See also [`index.md`](index.md), [`architecture.md`](architecture.md),
 [`security.md`](security.md), and [`cli.md`](cli.md).
