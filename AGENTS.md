@@ -118,10 +118,11 @@ project policy lives under `.runfree/`.
   placeholders only; real proxy-managed tokens belong in host-resolved sources
   and proxy-only tmpfs.
 - Keep `.runfree/network-policy.json` as the fixed project policy path. Desired
-  policy v2 is an exact-hostname allowlist plus per-host `requests` rules
+  policy v2/v3 is an exact-hostname allowlist plus per-host `requests` rules
   (methods, path prefixes, git-push deny), `services` records, `tokens`
-  (credential destinations), and an optional `writeApproval` default; still no
-  wildcard hosts, notes, or category metadata. Service host bundles expand to
+  (credential destinations), `hostServices`, and an optional `writeApproval`
+  default (v3 only when a destination uses `basic`, `username`, or
+  `protocol`); still no wildcard hosts, notes, or category metadata. Service host bundles expand to
   exact hostnames at CLI time and never change the policy format.
 - Host-side writes to project-controlled paths must reject symlinks, hard
   links, and special files. Use `safeReplaceProjectFile`,

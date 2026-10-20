@@ -5,7 +5,7 @@ Runfree separates tests by the boundary they prove.
 | Layer | Command | Boundary | Main faults found |
 | --- | --- | --- | --- |
 | Unit and integration | `pnpm test` | TypeScript modules and the source-backed CLI shim | Logic, parsing, state transitions, and component wiring |
-| Property soak | `make test-property-soak` | The path, GraphQL, and MCP property tests at 100,000 cases each, run by hand | Rare agent-controlled inputs that 200 cases per change miss; run before a release that changes those classifiers. Not part of any other target |
+| Property soak | `make test-property-soak` | The path, GraphQL, MCP, and `.mcp.json` property tests at 100,000 cases each, run by hand | Rare agent-controlled inputs that 200 cases per change miss; run before a release that changes those classifiers. Not part of any other target |
 | Live runtime security (release gate) | `make test-runtime` | Source-backed CLI plus real Docker | Both tiers below |
 | Live runtime core | `make test-runtime-core` | The trust-boundary subset of the layer above | Topology, capabilities, egress, CONNECT guard, request shape and write approval, inert policy edits and live revocation, managed-launch file safety, exact session admission, the pinned Claude and Pi `--session-id` contract on the built agent image, and two interrupted conversations resuming at the same time; run for every runtime, proxy, firewall, network, or credential change |
 | Live runtime extended | `make test-runtime-extended` | The rest of the live suite | Crash recovery, rolling upgrades and proxy replacement, renewal under load, session-entry ordering, helper cleanup, audit mode |

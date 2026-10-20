@@ -156,6 +156,20 @@ point to the mechanism.
    not Docker Desktop) on every host approval path, not only at
    `host-service add`. IP-literal CONNECT hosts are never audit-passed, and
    policy hosts cannot be IP literals.
+7. **Host-service limits.** Adding a host service, or changing its port or
+   target, always needs host review; only a removal applies without review.
+   The gateway must be one private (RFC 1918) IPv4 address that is not
+   loopback, link-local, a runtime subnet, or a proxy address. Until a valid
+   gateway is read, and while the firewall cannot update its host-service
+   sets, the gateway is withheld and host services refuse with a named cause.
+   A dial that fails or takes more than 5 s is refused before the proxy
+   answers 200. The proxy holds at most 32 host-service splices per session,
+   256 in all, and 64 pending dials; a refusal at a cap clears as splices
+   close. Each launch proves the proxy's host-gateway entry and that the
+   firewall's host-service pairs equal the effective policy. A full
+   validation also proves that the agent cannot reach the gateway, that root
+   in the proxy cannot reach an approved port, and that the request proxy
+   cannot reach an unapproved one.
 
 Order, hardening, and firewall rules:
 [Proxy Enforcement Details](architecture.md#proxy-enforcement-details).
@@ -516,7 +530,10 @@ Details: [Write Approval Grants](architecture.md#write-approval-grants).
    connection. It adds a host only when valid metadata names a token endpoint
    the proxy mediates for that server. The hosts live in host-owned state, not
    in desired policy, and stop applying when the reviewed server config
-   changes. `runfree mcp revoke` removes exactly them.
+   changes. `runfree mcp revoke` removes exactly them. A damaged record grants
+   nothing; the next `mcp enable` or `mcp revoke` rewrites the file without
+   it. An endpoint that two servers record is not mediated statically for
+   either; it is left to run-time mediation and follows write approval.
 8. **Revoke clears the proxy's OAuth state for the server.** Revoke first
    saves a new random state epoch for the server in host-owned state. Every
    policy publishes an epoch for each MCP OAuth server. The proxy stamps
@@ -526,7 +543,11 @@ Details: [Write Approval Grants](architecture.md#write-approval-grants).
    blocked, not stored. The clear works when no proxy runs (it happens at the
    next start). Revoke says "cleared" only when the running proxy confirmed
    the exact policy generation. A damaged or missing epoch record clears the
-   OAuth state of every MCP server.
+   OAuth state of every MCP server. A rotated refresh token retires the
+   handle it replaced. Each MCP OAuth server keeps at most 256 token handles
+   and 32 registration handles, evicting expired access handles first and
+   never the newest refresh handle. Past 1024 exchanges in flight, a new one
+   is refused rather than evicting another.
 9. **Protocol reads are exact.** On an `ask` host, a POST is a read, with no
    approval, only when its exact path (no normalization, query, or encoding)
    is a token or registration endpoint that `mcp enable` recorded for one
@@ -535,7 +556,11 @@ Details: [Write Approval Grants](architecture.md#write-approval-grants).
    an issuer may fetch at a URL the agent chose: a URL-valued `client_id`
    must equal, byte for byte, a pinned agent client metadata URL (Claude
    Code's or Codex's published document), and no `resource` may name another
-   host. Each server gets at most 30 a minute. Everything else
+   host. The body must be identity-encoded and declare its length, at most
+   16 KiB. Each server gets at most 30 a minute, counted only for requests that
+   pass every other check. The live `mcp-enable` tranche checks that each
+   pinned client metadata URL appears in the pinned agent binary, so a vendor
+   change fails the gate. Everything else
    on the host stays a write. A request that selected the unmediated proxy
    rule while its endpoint became mediated is refused, so a token never
    reaches the agent unmediated. This covers the token and registration
@@ -621,6 +646,29 @@ Details: [Write Approval Grants](architecture.md#write-approval-grants).
    When one step fails while another, such as the callback reservation, is
    still running, the launch waits for it under the lifecycle lock before it
    removes anything or releases the lock.
+7. **Lock holds are bounded.** Other commands wait up to one minute for the
+   lifecycle lock. A launch plans its continuous hold at 50 s or less,
+   including a wait of at most 10 s for the session entry to hand off to the
+   agent. Fault paths (the IP fence, a slow first session-file write, cleanup
+   after a failed admission, or a hung Docker call) can run past the minute;
+   a waiting command then defers with a retry instruction, and nothing is
+   admitted or removed on its behalf. If the handoff wait ends first, a proxy
+   replacement can land before the agent starts, and the entry falls back to
+   its own timeout.
+8. **A session that is never activated stops itself.** If the session entry
+   does not see the proxy report the session active within 60 s, it exits
+   111; the launch exits 111 and normal teardown removes the session.
+9. **The short teardown after a normal exit needs exact proof.** After the
+   agent exits with a code, the owner skips the network disconnect and stop
+   only when one inspection shows the same container and start time, exited
+   with that code, not restarting or paused, with restart policy `no`. Any
+   other answer, and every reconcile, runs the full revoke.
+10. **A deferred credential sync removes nothing.** When a launch's locked
+    credential sync defers (stale or changed preparation, busy lock, proxy not
+    ready, failed write, or spent allowance), it removes no proxy credential
+    and writes no receipt; the ordinary sync runs after the lock is released.
+    If neither the session-file delete nor the terminal stamp succeeds, the
+    record is marked revoking, so peers never read it as a live session.
 
 ## What Runfree Does Not Prove
 
@@ -639,8 +687,13 @@ Details: [Write Approval Grants](architecture.md#write-approval-grants).
   registry, the container inventory, the proxy's session files, the kernel
   session set, the request proxy's generation, and the IP assignments, and any
   participant that is not an accounted peer, a peer's own callback forwarder,
-  or a recorded forwarder sends the launch to the full validation. `runfree up`
-  always runs every probe.
+  or a recorded forwarder sends the launch to the full validation. A warm proof
+  older than 24 hours never matches, and a Docker daemon with live-restore
+  enabled always validates fully. `runfree up` always runs every probe.
+- **Docker command lines outside the client module.** The static check that
+  keeps Docker command lines in one module sees only literal `docker` strings
+  outside its reviewed allowlist. It does not see command lines built from a
+  parameter, or new ones added inside an allowlisted file.
 - **Guest clock lag** is not tested live. The live fixture cannot shift the
   Docker VM clock. The rule that a lagging clock cannot extend a lease has
   unit tests only.
@@ -726,6 +779,8 @@ Accepted, known risks:
 | A publication that appears on an approved port mid-session stays reachable; the next launch or `runfree status` only warns | Another project's `forward` and `vnc` refuse registered ports. A third-party publication on an approved port is reported by the next launch or `runfree status` owner check, which warns but neither refuses nor cuts |
 | A host gateway address change, or a withdrawn gateway, stops host services until `runfree rebuild` | Two independent cuts act at once: the request proxy destroys every open splice to the old or withdrawn address, and the firewall drops every flow to a gateway it pinned whose pair is not currently approved, for as long as that holds. New CONNECTs refuse with the named cause; `runfree rebuild` re-pins and drains every session |
 | The permanent firewall cut covers only gateways pinned by the running supervisor | The pinned-gateway set is in memory and the ruleset install recreates it empty, so a proxy restart forgets earlier gateways. A restart also recreates the whole table, so no earlier flow is accepted by it; the cut matters only within one supervisor lifetime |
+| Host-service splices have no idle timeout | Both legs use TCP keepalive, so a dead peer is found, but an idle open splice stays open until either side or a removal closes it |
+| Two `runfree mcp revoke` runs at the same moment, with no proxy running, can lose one clear | The epoch store has no lock; run that revoke again |
 | New host-service CONNECTs refuse for about 2 s after any policy reload | The request proxy dials only when the gateway file names its current effective policy generation; until the supervisor republishes the file on its next maintenance pass, a new CONNECT refuses with `host-service-unavailable`. Open splices are not affected |
 
 Approving a write, allowing a broad host, or adding a credential gives the

@@ -75,6 +75,18 @@ Common cases:
   sessions, or pass `--force` once you know what it ends.
 - **Docker is not reachable.** Runfree needs Docker Desktop running with Docker
   Compose. Check `docker version` first.
+- **A warm launch asks for a retry.** `the session state changed during a warm
+  launch; retry the command to validate the runtime fully` (or `a lifecycle
+  record appeared during a warm launch; ...`) means another session changed
+  while this launch checked it. Run the same command again; the retry
+  validates the runtime fully.
+- **The launch exits 111.** The session entry did not see the proxy activate
+  the session in time, so it stopped and teardown removed it. Run the command
+  again; if it repeats, check `runfree status` and `runfree logs proxy`.
+- **`runfree stop` kept the control-plane selection.** If stop warns `could not
+  prove the stopped runtime's proxy and networks are gone, so its
+  control-plane selection was kept` and the next start refuses, run
+  `runfree destroy`.
 
 ## The config is refused as pre-v4
 
@@ -154,6 +166,65 @@ arguments, ids, or output, so the lines are safe to paste into an issue.
 
 The first start after an upgrade that changes the agent image inputs
 rebuilds the image and is expected to be slow.
+
+## A host service is refused or unreachable
+
+`runfree host-service add` checks the port before it writes any policy:
+
+| Refusal | Remedy |
+| --- | --- |
+| `port <port> is refused: ...` | The port is Docker's, Runfree's own, or in Runfree's MCP callback block. Run the service on another port. |
+| `no process listens on 127.0.0.1:<port>` | Start the service on the host first. |
+| `no visible listener on 127.0.0.1:<port> or *:<port> (found: ...)` | The service listens only on another address, such as `[::1]`. Bind it to `127.0.0.1`. |
+| `127.0.0.1:<port> is owned by Docker Desktop (a published container port)` | A container publishes the port. A container is not a host service; stop publishing the port or use another one. |
+
+After approval, `runfree status` warns when the service drifts:
+`host service <name> (127.0.0.1:<port>): no listener`, `owned by Docker
+Desktop`, or `listener changed to <command>`. Restart the service, or remove
+and add it again to approve the new process.
+
+A service added while a session runs appears only in the next session. If
+`runfree status` shows `host-service gateway: unavailable (...)`, every host
+service stays refused until `runfree rebuild`, which ends every session. If
+another project's `runfree forward` or `runfree vnc` refuses a port because the
+host-service registry is corrupt, run:
+
+```bash
+runfree host-service list --repair
+```
+
+If the repair names a project whose state cannot be read, repair or destroy
+that project, or remove its state directory when the checkout is gone, then
+run the repair again.
+
+`runfree doctor` reports host-service denials apart from host denials:
+`host-service-not-configured` suggests `runfree host-service add` when the
+name and port are valid, and `host-service-unavailable` or
+`host-service-capacity` point to `runfree status`.
+
+See [Host Services](cli.md#host-services).
+
+## Host Git is too old or missing
+
+Runfree needs host Git 2.48 or newer for full worktree support (see
+[Git worktrees](cli.md#git-worktrees)). Upgrading Git fixes every message
+below; on Ubuntu, `sudo add-apt-repository ppa:git-core/ppa && sudo apt install git`.
+
+| Message | What to do |
+| --- | --- |
+| `host Git <version> is older than 2.48: Git worktrees created inside the sandbox will make this repository unreadable to host Git; ...` | A warning; the launch continues. Do not create worktrees inside the sandbox until you upgrade. |
+| `host Git <version> is older than 2.48 and cannot read this repository, which uses relative worktree links; ...` | A warning; the repository already uses relative links, so host Git cannot read it now. Upgrade. |
+| `host Git not found: Git worktrees created inside the sandbox will make this repository unreadable to host Git older than 2.48; ...` | A warning for a non-Git project. Install Git 2.48 or newer. |
+| `host Git not found: Runfree needs Git to check this repository's worktree layout; ...` | A refusal in a Git repository, before any state is written. Install Git. |
+| `this Git worktree layout requires host Git >= 2.48 (found <version>); remove or move the nested worktree ...` | Remove or move the nested worktree (`git worktree remove <path>`), or upgrade. |
+| `this Git worktree layout requires host Git >= 2.48 (found <version>); run runfree from the main checkout ...` | Run Runfree from the main checkout, or upgrade. |
+| `repairing worktree links requires host Git >= 2.48 (found <version>); upgrade Git` | Upgrade, then run `runfree git repair-worktree-links` again. |
+
+The same refusals apply to commands that write checkout-local policy, such as
+`runfree init`, and to a running runtime that finds its Git layout changed
+(a reused launch, a proxy restart, or dependency overlay planning). On Git
+2.48+ an unsupported layout instead names the repair command to run on the
+host from the main checkout.
 
 ## A write is being held
 

@@ -130,9 +130,11 @@ for exactly that.
 
 - Project config version 4 is current. Older versions and legacy keys are refused, not migrated.
 - `.runfree/network-policy.json` is a fixed path. Do not move it.
-- Desired policy v2 is an exact-hostname allowlist plus per-host `requests`
-  rules, `services`, `tokens`, and an optional `writeApproval` default. No
-  wildcard hosts.
+- Desired policy is version 2 or 3: an exact-hostname allowlist plus per-host
+  `requests` rules, `services`, `tokens`, `hostServices`, and an optional
+  `writeApproval` default. Runfree writes version 3 only when a credential
+  destination uses the `basic` scheme, a `username`, or a `protocol` scope, or
+  when one host and header has two destinations. No wildcard hosts.
 A change that breaks an existing project's state needs a migration and an entry
 in the release notes.
 

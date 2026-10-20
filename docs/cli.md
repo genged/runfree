@@ -102,6 +102,11 @@ Created project files include:
 | `runfree project-id` | Print the stable project id. |
 | `runfree project-id --compose-name` | Print the Docker Compose project name. |
 
+The agent commands run the agent's configured command and pass it no extra
+arguments. An unknown flag, such as `runfree claude --resume`, is refused with
+`Unknown argument` before any project or Docker work; use `runfree resume` to
+resume a conversation.
+
 Runtime examples:
 
 ```bash
@@ -305,7 +310,10 @@ psql -h 127.0.0.1 -p 5432 -U <user> <database>
 - `add` writes a `hostServices` entry to the desired policy (`--local` for the
   checkout-local layer) and approves it. The name matches
   `[a-z][a-z0-9-]{0,62}`; the agent-facing name is
-  `<name>.runfree.internal`, which the agent never needs to use.
+  `<name>.runfree.internal`, which the agent never needs to use. A policy
+  holds at most 64 host services. A name may be approved in only one layer,
+  and a port may appear only once across the project and checkout-local
+  layers.
 - Before any policy write, `add` refuses these ports: 2375 and 2376 (Docker
   Engine), 3128, 5901 (Runfree's VNC default), and 47100–48099 (Runfree's MCP
   callback block). It then runs `lsof` and refuses a port with no visible
@@ -314,7 +322,15 @@ psql -h 127.0.0.1 -p 5432 -U <user> <database>
   approved.
 - Each new session starts a relay on `127.0.0.1:<port>` inside the session
   for each approved service. A service added while a session runs appears in
-  the next session. `remove` cuts open connections at once in every session.
+  the next session. `remove` cuts open connections at once in every session,
+  and reports `live now` only after the proxy and the firewall have both cut
+  the service. If the relay cannot bind a port, it skips that service with a
+  warning and the session still starts; a later process in the session that
+  wants the port gets `EADDRINUSE`.
+- A connection to a host service that is not approved is refused. When `add`
+  would accept that name and port, the refusal and `runfree doctor` suggest
+  `runfree host-service add <name> --port <port>`, labelled as requested by
+  the agent; check it before you run it.
 - `list` prints the effective host services and who listens on each port now.
   `runfree status` repeats that check and warns when the listener is gone,
   changed, or owned by Docker Desktop. It also prints the gateway state:
@@ -327,7 +343,9 @@ psql -h 127.0.0.1 -p 5432 -U <user> <database>
   project; several projects may approve the same port. If the registry is
   corrupt, they refuse until `runfree host-service list --repair` rebuilds it.
   The repair refuses, writes nothing, and exits non-zero when a known
-  project's state cannot be read; it names that project.
+  project's state cannot be read; it names that project. A completed
+  `runfree destroy` removes the project's ports from the registry, and MCP
+  callback ports skip every registered port.
 - The tunnel is opaque: no request rules, write approval, or credential
   injection apply, and the host service's own authentication is the only
   check on what the agent does there. Access is per project. See
@@ -335,7 +353,8 @@ psql -h 127.0.0.1 -p 5432 -U <user> <database>
 - If the host gateway address changes while the proxy runs, the proxy cuts
   open host-service connections and new ones refuse. `runfree status` then
   shows `host-service gateway: unavailable (... gateway address changed ...)`,
-  and `runfree logs proxy` shows the refusals and the cut. Host services stay
+  and `runfree logs proxy` shows the refusals and the cut as
+  `proxy: host-service splices cut: <count>; reason: <reason>`. Host services stay
   refused until `runfree rebuild`, which recreates the proxy and ends every
   session.
 
@@ -710,7 +729,13 @@ list` shows them as `skipped`, and `--verbose` prints one line for each. See
 
 Loopback HTTP MCP servers, such as a dev server's
 `{"type": "http", "url": "http://127.0.0.1:8089/mcp"}`, import without
-credentials. Use `127.0.0.1`, not `localhost`. Inside the session the URL
+credentials. Use `127.0.0.1`, not `localhost`: forms such as `127.1`
+normalize to it, and `localhost`, `[::1]`, other `127.x` addresses, a URL with
+userinfo, a fragment, or `$`, port 0, and a port Runfree reserves are refused.
+A loopback entry keeps only `type` and `url` for Claude, and `url`, `enabled`,
+`required`, `enabled_tools`, `disabled_tools`, `startup_timeout_sec`, and
+`tool_timeout_sec` for Codex; a listed Codex key of the wrong type is refused.
+Inside the session the URL
 reaches only a process in the session, unless a host service holds the port.
 To reach a dev server on the host, approve the port separately:
 
@@ -718,8 +743,11 @@ To reach a dev server on the host, approve the port separately:
 runfree host-service add astro --port 8089
 ```
 
-`runfree mcp enable` and `runfree mcp explain` show the reach, and a launch
-warns when no host service backs the port. A loopback entry cannot carry
+`runfree mcp enable` and `runfree mcp explain` show the reach as
+`host-service`, `container-local`, or `unknown` with a reason, and a launch
+warns when no host service backs the port. For a loopback entry, `mcp enable`
+makes no discovery call and refuses `--oauth-host`, and `runfree mcp auth`
+refuses it. A loopback entry cannot carry
 headers, helpers, or OAuth settings, and its tool calls do not pass the proxy,
 so write approval and `runfree mcp rules` do not apply. Plain HTTP to any other
 host is refused. An HTTPS server URL, OAuth metadata URL, or OAuth token
@@ -734,6 +762,11 @@ shell, run `codex mcp login <server>`. Then open the URL the client prints.
 Two sessions can log in at the same time. `runfree mcp auth` launches a session
 and prints these steps. A provider that accepts only one pre-registered
 callback port works only while its session holds the project's first port.
+Each session tries up to 32 callback ports; when all are taken by other
+sessions or host processes, the launch fails with a retry instruction. A
+login refused only because its `client_id` is not a pinned agent client
+metadata URL goes to write approval, and the denial says so without
+repeating the URL.
 
 ### Enable an MCP server in one step
 
@@ -898,85 +931,27 @@ runfree git repair-worktree-links
 
 Repairs host Git metadata to use relative worktree links.
 
-Runfree detects host Git's worktree capability by checking whether
-`git worktree add -h` and `git worktree repair -h` both advertise
-`--relative-paths` (Git 2.48+); the version named in messages below comes
-from `git --version`, or `unknown` when that fails.
+Create worktrees inside the mounted project, for example `.worktrees/feature`,
+so the host and the sandbox can both reach them. Sandbox Git uses relative
+worktree links by default. On the host, use `git worktree add --relative-paths`,
+or set `git config --local worktree.useRelativePaths true` once for the
+repository. Both need host Git 2.48 or newer.
 
-Sandbox Git defaults to relative worktree links, with an environment setting
-that takes precedence over repository includes and per-worktree config.
-Explicit Git command-line options can still override it. Create worktrees inside the
-mounted project, for example `.worktrees/feature`, so both environments can
-reach them. On the host, use `git worktree add --relative-paths`, or set
-`git config --local worktree.useRelativePaths true` once for the repository.
+With older host Git, or none, Runfree still launches where it safely can:
 
-On host Git older than 2.48, launching a normal repository or a non-Git
-project continues with a warning, because sandbox Git still defaults to
-relative links and a worktree created inside the sandbox would otherwise make
-the repository unreadable to host Git:
+| Host Git | What happens |
+| --- | --- |
+| Older than 2.48 | Launch continues with one warning: a worktree created inside the sandbox would make the repository unreadable to host Git. |
+| Older than 2.48, with a nested worktree or launched from a linked worktree | Launch refuses before writing any state, because the layout needs 2.48+. `runfree git repair-worktree-links` refuses too. |
+| Not installed, non-Git project | Launch continues with a warning. |
+| Not installed, Git repository | Launch refuses, because Runfree reads the repository's layout through Git. |
+| 2.48+ with an unsupported layout (absolute links, such as a stale `/workspace` link) | Startup stops and names the repair command to run on the host from the main checkout. |
 
-`host Git <version> is older than 2.48: Git worktrees created inside the sandbox will make this repository unreadable to host Git; upgrade host Git (Ubuntu: sudo add-apt-repository ppa:git-core/ppa && sudo apt install git)`
-
-When the main checkout's Git config already sets
-`extensions.relativeWorktrees = true`, host Git older than 2.48 already
-cannot read the repository, so the warning says so instead:
-
-`host Git <version> is older than 2.48 and cannot read this repository, which uses relative worktree links; upgrade host Git (Ubuntu: sudo add-apt-repository ppa:git-core/ppa && sudo apt install git)`
-
-When `git --version` fails, for example because Git is not installed,
-launching a non-Git project continues with this warning instead:
-
-`host Git not found: Git worktrees created inside the sandbox will make this repository unreadable to host Git older than 2.48; install Git 2.48 or newer`
-
-Each launch prints at most one of these three warnings.
-
-Runfree reads a Git repository's config through Git to check its worktree
-layout. So when `git --version` fails and the project has a `.git` entry,
-launch refuses before writing any state:
-
-`host Git not found: Runfree needs Git to check this repository's worktree layout; install Git 2.48 or newer`
-
-When launched from the main checkout, Runfree also checks registered nested
-worktrees before starting the runtime. An unsupported layout — absolute
-links, including a stale `/workspace` link from a sandbox — stops startup. On
-host Git 2.48+ it shows the repair command to run on the host from the main
-checkout, which also sets the repository's relative-path default. On older
-host Git, that check instead refuses before writing any state, since the
-repair itself needs 2.48+:
-
-`this Git worktree layout requires host Git >= 2.48 (found <version>); remove or move the nested worktree (e.g. git worktree remove <path>), or upgrade Git`
-
-Launching directly from a linked worktree on older host Git refuses the same
-way, naming the main checkout instead, since running from there is itself a
-fix:
-
-`this Git worktree layout requires host Git >= 2.48 (found <version>); run runfree from the main checkout, or upgrade Git`
-
-Host-only worktrees outside the mounted project are outside this check.
-
-Commands that write checkout-local policy, such as `runfree init`, refuse
-with the same linked-worktree message on older host Git when run from a
-linked worktree. Without host Git, they refuse in any Git repository with
-the missing-Git message above. Both refusals come before Runfree asks Git
-whether that policy file is tracked, and before it writes the Git exclude
-file.
-
-Revalidating a running runtime (a launch that reuses it, or a proxy restart)
-and dependency overlay planning can find a Git layout that became unsupported
-after the runtime started. On host Git 2.48+ that refusal shows the repair
-commands, as above. On older host Git it shows the matching version
-requirement message above instead, because the repair needs 2.48+.
-
-`runfree git repair-worktree-links` itself refuses the same way on host Git
-older than 2.48:
-
-`repairing worktree links requires host Git >= 2.48 (found <version>); upgrade Git`
-
-Upgrading host Git recovers from any of these refusals; removing or moving
-the nested worktree also recovers the main-checkout refusal above. `runfree
-status` always prints host Git's version and worktree capability:
-
-`host git: <version> (worktrees: enabled|disabled)`
+Upgrading host Git fixes every case. `runfree status` prints host Git's
+version and worktree capability:
+`host git: <version> (worktrees: enabled|disabled)`. The exact messages and
+their remedies are in
+[troubleshooting.md](troubleshooting.md#host-git-is-too-old-or-missing).
 
 ## Assets, Updates, And Version
 

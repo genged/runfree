@@ -63,7 +63,7 @@ The primary audience is individual developers using Claude Code, Codex, or Pi wh
 
 ## Supported Release Shape
 
-As of `0.5.2`:
+As of `0.6.0`:
 
 - published binary: `darwin-arm64` only, ad-hoc signed and not notarized, with a SHA-256 manifest;
 - host: Apple Silicon macOS;
@@ -83,6 +83,7 @@ Runtime/security changes should be validated with `make test-runtime-core` on a 
 | Project config and init wizard | `packages/cli/src/config.ts`, `packages/cli/src/init-wizard.ts`, `packages/cli/templates/` |
 | Runtime lifecycle and Docker Compose orchestration | `packages/cli/src/runtime.ts`, `packages/cli/src/runtime/env.ts`, `packages/cli/src/network.ts` |
 | Interrupted session recovery and `runfree resume` | `packages/cli/src/runtime/recovery.ts`, `packages/cli/src/runtime/resume-selection.ts`, `packages/cli/src/runtime/terminal-identity.ts`, `packages/cli/src/runtime/codex-rollouts.ts`, `packages/cli/src/commands/resume.ts` |
+| Host services | `packages/cli/src/commands/admin/host-service.ts`, `packages/cli/src/control/host-service-mutation.ts`, `packages/cli/src/host-service-registry.ts`, `packages/proxy/src/host-service-tunnel.ts`, `packages/proxy/src/firewall/host-service-gateway.ts`, `packages/agent-runtime/src/host-service-relay.cts` |
 | Desired/effective network contracts | `packages/runtime-contracts/src/desired-network-policy.ts`, `packages/runtime-contracts/src/network-policy.ts` |
 | OAuth mediation contracts | `packages/runtime-contracts/src/oauth-mediation-policy.ts` |
 | Proxy enforcement | `packages/proxy/src/` |
