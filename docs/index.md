@@ -11,6 +11,7 @@ page is the map.
 | [Host services](cli.md#host-services) | Letting the agent use a service that runs on your machine's loopback |
 | [Team workflow](team-workflow.md) | Sharing policy across a team without sharing credentials |
 | [Troubleshooting](troubleshooting.md) | A refusal you do not understand, or a runtime that will not start |
+| [What's new in 0.6.0](whats-new-0.6.0.md) | Host services, git over HTTPS, `runfree mcp enable`, same-terminal resume |
 | [What's new in 0.5.2](whats-new-0.5.2.md) | Release gate runs the full verification, `make test-release` |
 | [What's new in 0.5.1](whats-new-0.5.1.md) | Pre-v4 config refusal, startup hardening, upgrade steps |
 | [What's new in 0.5.0](whats-new-0.5.0.md) | Supported platform, authentication routes, limitations |
@@ -39,6 +40,7 @@ summarizes them, the shorter page is the summary and they are the contract.
 
 | Release | Notes |
 | --- | --- |
+| 0.6.0 | [Release body](release-notes/0.6.0.md), [detail](whats-new-0.6.0.md) |
 | 0.5.2 | [Release body](release-notes/0.5.2.md), [detail](whats-new-0.5.2.md) |
 | 0.5.1 | [Release body](release-notes/0.5.1.md), [detail](whats-new-0.5.1.md) |
 | 0.5.0 | [Release body](release-notes/0.5.0.md), [detail](whats-new-0.5.0.md) |

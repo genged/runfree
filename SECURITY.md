@@ -9,7 +9,8 @@ immutable and are never replaced in place.
 
 | Version | Supported |
 | --- | --- |
-| 0.5.x | Yes, latest patch only |
+| 0.6.x | Yes, latest patch only |
+| 0.5.x | No |
 
 Support is best effort. There is no response-time commitment, including for
 security reports. That is a statement of capacity, not of priority: security
