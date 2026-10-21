@@ -440,6 +440,27 @@ function shapeDenialLines(host: string, reason: DenialReason, details: ShapeDeni
   return lines;
 }
 
+// The host placeholder in a WebSocket refusal body. mockttp rejects an
+// upgrade with a body fixed per rule, so the body cannot name the request's
+// host; the structured denial event carries the host, method, and path.
+export const WEBSOCKET_DENIAL_HOST_PLACEHOLDER = "<host>";
+
+/**
+ * The fixed body of a refused WebSocket upgrade where the proxy guards
+ * OAuth: the same explanation and remedy lines as the HTTPS denial, for one
+ * (target, finding) pair, with `<host>` in place of the host.
+ */
+export function webSocketOAuthDenialBody(details: Pick<OAuthEndpointDenialDetails, "finding" | "target">): string {
+  return `${[
+    "Runfree blocked this WebSocket upgrade.",
+    "",
+    `  reason: ${DENIAL_REASON_TEXT["oauth-endpoint-not-mediated"]}`,
+    "",
+    ...oauthEndpointLines(WEBSOCKET_DENIAL_HOST_PLACEHOLDER, { finding: details.finding, target: details.target }),
+    `Current rules: runfree host explain ${WEBSOCKET_DENIAL_HOST_PLACEHOLDER}`,
+  ].join("\n")}\n`;
+}
+
 export function syntheticDenialBody(rawHost: string, reason: DenialReason, details?: ShapeDenialBodyDetails): string {
   const host = displayHostname(rawHost);
   if (SHAPE_DENIAL_REASONS.has(reason)) {

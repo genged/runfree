@@ -24,6 +24,7 @@ import {
   denialReasonText,
   safePathname,
   syntheticDenialBody,
+  webSocketOAuthDenialBody,
   type DenialReason,
   type ShapeDenialBodyDetails,
 } from "./denial.js";
@@ -1461,7 +1462,18 @@ function isAllowedWebSocket(admission: AdmissionRecord, req: ProxyRequest): bool
 // mockttp returns a non-101 upstream reply to the agent unread, so an
 // upgrade GET with a grant in its query could fetch real tokens. No events:
 // it also runs as a rule matcher. An admission mismatch keeps its own rule.
+// One decision per upgrade request: the allow matcher and every rejection
+// rule matcher see the same refusal, and the state file is read once.
+const webSocketOAuthRefusals = new WeakMap<ProxyRequest, UnmediatedOAuthRequestRefusal | null>();
 function webSocketOAuthRefusal(admission: AdmissionRecord, req: ProxyRequest): UnmediatedOAuthRequestRefusal | undefined {
+  const cached = webSocketOAuthRefusals.get(req);
+  if (cached !== undefined) return cached ?? undefined;
+  const refusal = computeWebSocketOAuthRefusal(admission, req);
+  webSocketOAuthRefusals.set(req, refusal ?? null);
+  return refusal;
+}
+
+function computeWebSocketOAuthRefusal(admission: AdmissionRecord, req: ProxyRequest): UnmediatedOAuthRequestRefusal | undefined {
   if (currentAdmissionPrincipal(admission) === undefined) return undefined;
   if (webSocketAdmissionMismatchStatus(admission, req) !== undefined) return undefined;
   const refusal = oauthMediator.webSocketUpgradeRefusal(req);
@@ -1949,18 +1961,28 @@ for (const statusCode of [421, 403] as const) {
       "blocked by agent proxy policy\nrequest host did not match the admitted CONNECT host\n",
     );
 }
-await server.forAnyWebSocket()
-  .matching((admission: AdmissionRecord, req: ProxyRequest) => webSocketOAuthRefusal(admission, req) !== undefined)
-  .always()
-  .thenRejectConnection(
-    403,
-    "Forbidden",
-    {
-      "content-type": "text/plain; charset=utf-8",
-      "x-runfree-blocked": "oauth-endpoint-not-mediated",
-    },
-    "blocked by agent proxy policy\nthe proxy guards OAuth on this host or endpoint and cannot read the reply to a WebSocket upgrade\n",
-  );
+// OAuth-guarded upgrades: one rule per (target, finding) pair, because the
+// rejection body is fixed per rule. Each body carries the explanation and
+// remedy of the HTTPS denial, with `<host>` in place of the host.
+for (const target of ["record-only-host", "mediated-endpoint", "blocked-endpoint", "endpoint-collision", "record-endpoint-host", "policy-unavailable"] as const) {
+  for (const finding of ["websocket", "grant-shaped"] as const) {
+    await server.forAnyWebSocket()
+      .matching((admission: AdmissionRecord, req: ProxyRequest) => {
+        const refusal = webSocketOAuthRefusal(admission, req);
+        return refusal?.target === target && refusal.finding.kind === finding;
+      })
+      .always()
+      .thenRejectConnection(
+        403,
+        "Forbidden",
+        {
+          "content-type": "text/plain; charset=utf-8",
+          "x-runfree-blocked": "oauth-endpoint-not-mediated",
+        },
+        webSocketOAuthDenialBody({ finding, target }),
+      );
+  }
+}
 // Shape-denied upgrades get the matching x-runfree-blocked reason. The
 // rejection body is static per rule (mockttp limitation); per-request host,
 // method, and path details travel through the structured denial events.

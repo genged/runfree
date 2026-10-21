@@ -410,6 +410,8 @@ describe("proxy server: WebSocket upgrades where the proxy guards OAuth", () => 
       expect(response.statusCode, label).toBe(403);
       expect(response.raw, label).toContain("x-runfree-blocked: oauth-endpoint-not-mediated");
       expect(response.raw, label).not.toContain("real-access-token");
+      expect(response.body, label).toContain("Runfree blocked this WebSocket upgrade.");
+      expect(response.body, label).toContain("Current rules: runfree host explain <host>");
       expect(started.upstream.acceptedConnections(), `${label}: upstream connection`).toBe(before);
       // No deny-then-approve retry approval is noted for a refused upgrade.
       expect(pendingRecords(started), label).toEqual([]);
@@ -417,6 +419,15 @@ describe("proxy server: WebSocket upgrades where the proxy guards OAuth", () => 
     expect(started.upstream.requests).toHaveLength(0);
     expect(fs.readFileSync(stateFile(started), "utf8")).toBe(started.seededState);
     expect(started.proxy.output()).toContain('"reason":"oauth-endpoint-not-mediated"');
+
+    // Each refusal carries its own remedy.
+    const mediated = await webSocketUpgrade(started, BROAD, "/oauth/token");
+    expect(mediated.body).toContain("Send this request over HTTPS instead.");
+    const recordOnly = await webSocketUpgrade(started, RECORD_ONLY, "/socket");
+    expect(recordOnly.body).toContain("  runfree mcp revoke <agent> <server>");
+    expect(recordOnly.body).toContain("  runfree host add <host>");
+    const query = await webSocketUpgrade(started, ENDPOINT_HOST, "/socket?grant_type=refresh_token");
+    expect(query.body).toContain("The request carries an OAuth grant field.");
 
   }, 60_000);
 

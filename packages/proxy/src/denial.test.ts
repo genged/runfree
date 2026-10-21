@@ -7,6 +7,7 @@ import {
   safePathname,
   syntheticDenialBody,
   UNPARSEABLE_HOST,
+  webSocketOAuthDenialBody,
 } from "./denial.ts";
 
 const GENERATION_A = `sha256:${"a".repeat(64)}`;
@@ -210,6 +211,31 @@ describe("oauth-endpoint-not-mediated denial bodies", () => {
     expect(mediated).toContain("for HTTPS requests only");
     expect(mediated).toContain("Send this request over HTTPS instead.");
     expect(mediated).not.toContain("runfree mcp");
+  });
+
+  test("a refused WebSocket upgrade gets the same explanation and remedy, with a host placeholder", () => {
+    const mediated = webSocketOAuthDenialBody({ finding: "websocket", target: "mediated-endpoint" });
+    expect(mediated).toBe([
+      "Runfree blocked this WebSocket upgrade.",
+      "",
+      "  reason: an OAuth token or client registration request to an endpoint the proxy does not mediate",
+      "",
+      "The proxy mediates this OAuth endpoint for HTTPS requests only.",
+      "This is a WebSocket upgrade. The proxy cannot read its reply, which",
+      "could carry real tokens, so the upgrade was not sent.",
+      "",
+      "Send this request over HTTPS instead.",
+      "",
+      "Current rules: runfree host explain <host>",
+      "",
+    ].join("\n"));
+    const recordOnly = webSocketOAuthDenialBody({ finding: "websocket", target: "record-only-host" });
+    expect(recordOnly).toContain("  runfree mcp enable <agent> <server>");
+    expect(recordOnly).toContain("If this host should also take WebSocket connections");
+    expect(recordOnly).toContain("  runfree host add <host>");
+    const query = webSocketOAuthDenialBody({ finding: "grant-shaped", target: "record-endpoint-host" });
+    expect(query).toContain("The request carries an OAuth grant field.");
+    expect(query).not.toContain("runfree host add");
   });
 
   test("a collision names both providers and the revoke remedy only", () => {
