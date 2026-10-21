@@ -799,9 +799,11 @@ async function dispatchRuntimeAdmin(intent: RuntimeAdminIntent, context: Runtime
       if (!projectPolicy || !localPolicy) {
         throw new ControlsNotApprovedError("approved project and local network controls are required before effective preparation");
       }
+      const compiled = compileDesiredPolicies({ project: projectPolicy, local: localPolicy });
       prepareEffectiveRuntimeIntent({
-        basePolicy: compileDesiredPolicies({ project: projectPolicy, local: localPolicy }).policy,
+        basePolicy: compiled.policy,
         outputPath: context.project.paths.controlMcpNetworkPolicyPath,
+        serviceOAuthProviders: compiled.oauth,
       });
       return;
     }

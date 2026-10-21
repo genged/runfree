@@ -40,6 +40,13 @@ export const remedy = {
   // `--source project` keeps the command exact when a user or local entry
   // shares the server name.
   mcpEnableProject: (agent: string, server: string): string => `runfree mcp enable ${agent} ${server} --source project`,
+  mcpEnable: (agent: string, server: string, source: string): string => `runfree mcp enable ${agent} ${server} --source ${source}`,
+  // R20: the static-token reclaim path for a project server whose OAuth
+  // endpoint is on a well-known host.
+  mcpEnableProjectFromEnv: (agent: string, server: string, env: string): string =>
+    `runfree mcp enable ${agent} ${server} --source project --from-env ${env}`,
+  mcpRevoke: (agent: string, server: string): string => `runfree mcp revoke ${agent} ${server}`,
+  credentialSetSourceFromEnv: (name: string, env: string): string => `runfree credential set-source ${name} --from-env ${env}`,
   credentialAdd: (name: string, host: string, source: string): string =>
     `runfree credential add ${name} --host ${host} --from-source ${source}`,
   credentialUnlink: (name: string, host: string): string => `runfree credential unlink ${name} --host ${host}`,
@@ -87,6 +94,10 @@ export function sampleRemedyRenderings(): string[] {
     remedy.serviceEnableHelp(),
     remedy.serviceExplain("github"),
     remedy.mcpEnableProject("claude", "srv"),
+    remedy.mcpEnable("codex", "srv", "user"),
+    remedy.mcpEnableProjectFromEnv("claude", "github", "GITHUB_MCP_TOKEN"),
+    remedy.mcpRevoke("claude", "srv"),
+    remedy.credentialSetSourceFromEnv("mcp-claude-github-auth", "GITHUB_MCP_TOKEN"),
     remedy.credentialAdd("github", "api.github.com", "github-cli"),
     remedy.credentialUnlink("github", "api.github.com"),
     remedy.imageApproveContext(),

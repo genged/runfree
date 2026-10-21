@@ -679,7 +679,7 @@ set to `deny` stays denied. The rules are in [security.md](security.md#mcp).
 | Option | Meaning |
 | --- | --- |
 | `--source user\|local\|project` | Choose the entry when more than one matches. User and local entries need no approval; `enable` records only their OAuth hosts. |
-| `--oauth-host <host>` | Also allow this exact host for the server (repeatable). It is allowed as given, like `runfree host add`. The proxy mediates only the endpoints the review lists: a login at another token endpoint on this host returns the real access and refresh tokens to the agent. |
+| `--oauth-host <host>` | Also allow this exact host for the server (repeatable). It is allowed as given, like `runfree host add`. The proxy mediates a token or registration endpoint there that the server's OAuth metadata names. While only MCP records allow the host, the proxy refuses any other OAuth token or registration request to it. |
 | `--no-discover` | Make no network call. Use only `--oauth-host` hosts. |
 | `--no-login` | Do not run the OAuth login after enabling. |
 | `--from-env`, `--from-1password`, `--from-source`, `--from-stdin` | Bind a project entry's static header to a host-owned credential source. Choose one. |

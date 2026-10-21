@@ -38,13 +38,24 @@ import { atomicReplaceFile, isPathInsideByRealpath, safeReadProjectFile } from "
 import { runfreeLog, warn } from "../warnings.ts";
 import { updateCodexConfig } from "./codex-config.ts";
 import { CODEX_DESKTOP_BUILTIN_REASON, isCodexDesktopBuiltIn } from "./mcp-desktop-builtins.ts";
+import { checkPolicyHostname } from "../admin/mcp-discovery.ts";
 import {
+  type McpEnabledRecord,
   projectEnabledOAuthEndpoints,
   projectEnabledOAuthHosts,
   readMcpEnabled,
+  saveMcpShareGroups,
   withoutSharedEnabledEndpoints,
 } from "./mcp-enabled.ts";
+import { credentialDestinationHosts, curatedServiceHosts, type ClaimUse } from "./mcp-oauth-claims.ts";
 import { mcpOAuthStateEpoch, updateMcpOAuthEpochs } from "./mcp-oauth-epochs.ts";
+import {
+  type ClaimServerView,
+  claimRulesFor,
+  filterClaims,
+  type FilteredClaims,
+  settleShareGroupOwners,
+} from "./mcp-oauth-projection.ts";
 import { RUNFREE_RUNTIME_TARGETS, workspaceMetadataTarget } from "./mount-target-policy.ts";
 import { sha256Hex, isRecord } from "../strict-primitives.ts";
 import { remedy } from "../remedies.ts";
@@ -220,12 +231,21 @@ type McpOAuthServerPolicyJson = {
     authServerMetadataUrl?: string;
   };
   tokenEndpoints?: OAuthTokenEndpointJson[];
-  registrationEndpoints?: OAuthTokenEndpointJson[];
+  registrationEndpoints?: Array<OAuthTokenEndpointJson | { exact?: true; host: string; path: string }>;
   // Set only by the effective preparation, never from MCP config: the
-  // recorded mediated endpoints (`mcp enable`) and the revoke epoch.
+  // recorded mediated endpoints (`mcp enable`), the revoke epoch, the user
+  // hosts the proxy binds (P1-b), and the share group non-owner mark (R16).
   protocolReadEndpoints?: Array<{ host: string; path: string }>;
+  bindingHosts?: string[];
+  captureOwner?: false;
   seeds?: OAuthSeedJson[];
   stateEpoch?: string;
+};
+
+// A service OAuth provider's endpoints, for the MCP claim rules (X4, R6).
+export type ServiceOAuthEndpoints = {
+  tokenEndpoints: ReadonlyArray<{ host: string; path: string }>;
+  registrationEndpoints?: ReadonlyArray<{ host: string; path: string }>;
 };
 
 export type McpMaskPaths = {
@@ -260,6 +280,9 @@ export type McpPrepareOptions = {
   mcpRulesPath?: string;
   policy: PolicyJson;
   projectRoot: string;
+  // The approved service OAuth providers (compiled desired policy). An MCP
+  // endpoint that overlaps one of theirs is dropped (X4, R6).
+  serviceOAuthProviders?: Record<string, ServiceOAuthEndpoints>;
   tokenConfig: TokenSourceConfig;
 };
 
@@ -621,6 +644,11 @@ function headerEnvReference(value: string): { env: string; scheme: "bearer" | "r
   const raw = /^(?:\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*))$/.exec(trimmed);
   if (raw) return { env: raw[1] ?? raw[2], scheme: "raw" };
   return undefined;
+}
+
+// The proxy token name a static header of an MCP server is bound to.
+export function mcpStaticTokenName(agent: McpAgent, serverName: string, header: string): string {
+  return tokenNameFor(agent, serverName, header);
 }
 
 function tokenNameFor(agent: McpAgent, serverName: string, header: string): string {
@@ -1316,6 +1344,28 @@ function descriptorDigest(projectRoot: string, server: NativeMcpServer, prepared
   return sha256Hex(canonicalJson(mcpDescriptor(projectRoot, server, prepared)));
 }
 
+/**
+ * The agent-free digest of an OAuth-capable MCP server (R16): the servers of
+ * one share group are the same server, source, endpoint, and OAuth policy for
+ * different agents. The agent, its generated config, and the auth label
+ * (public or oauth; both are mediated the same way) are left out, so the same
+ * server enabled for Claude and for Codex forms one group.
+ */
+export function mcpShareGroupDigest(
+  projectRoot: string,
+  server: { name: string; source: McpSourceScope; transport: string; endpoint?: { host: string; path: string }; oauthPolicy?: unknown },
+): string {
+  return sha256Hex(canonicalJson({
+    schemaVersion: 1,
+    projectHash: projectHash(projectRoot),
+    source: server.source,
+    server: server.name,
+    transport: server.transport,
+    ...(server.endpoint ? { endpoint: server.endpoint } : {}),
+    ...(server.oauthPolicy ? { oauthPolicy: server.oauthPolicy } : {}),
+  }));
+}
+
 function mcpRuleKey(input: {
   agent: McpAgent;
   descriptorDigest?: string;
@@ -1601,6 +1651,65 @@ export function mcpInventory(options: McpInventoryOptions): McpInventory {
   return { entries };
 }
 
+function declaredTokenEndpointsOf(oauthPolicy: { tokenEndpoints?: unknown } | undefined): Array<{ host: string; path: string }> {
+  const endpoints = Array.isArray(oauthPolicy?.tokenEndpoints) ? oauthPolicy.tokenEndpoints as unknown[] : [];
+  return endpoints.flatMap((endpoint) => {
+    if (typeof endpoint === "string") {
+      const parsed = safeEndpoint(endpoint);
+      return parsed ? [parsed] : [];
+    }
+    return isRecord(endpoint) && typeof endpoint.host === "string" && typeof endpoint.path === "string"
+      ? [{ host: endpoint.host, path: endpoint.path }]
+      : [];
+  });
+}
+
+/**
+ * The claimants `mcp enable` checks one entry against: every entry a
+ * projection would prepare (imported user and local entries, approved project
+ * entries), plus the entry itself, grouped into share groups exactly as the
+ * projection groups them (R16), with the enable records joined by identity.
+ * `selfKey` names the entry's own claimant; the records of the entry itself
+ * are left out, since the enable being reviewed replaces them.
+ */
+export function mcpEnableClaimViews(
+  projectRoot: string,
+  entries: readonly McpInventoryEntry[],
+  records: Readonly<Record<string, McpEnabledRecord>>,
+  self: McpInventoryEntry,
+): { views: ClaimServerView[]; selfKey: string } {
+  const isSelf = (entry: McpInventoryEntry): boolean => entry.agent === self.agent && entry.name === self.name && entry.source === self.source;
+  const members = entries.filter((entry) => isSelf(entry) || entry.decision.status === "imported" || entry.decision.status === "approved");
+  const keyOf = (entry: McpInventoryEntry): string => {
+    const oauthPolicy = entry.descriptor?.oauthPolicy;
+    return oauthPolicy !== undefined && entry.transport === "http"
+      ? mcpShareGroupDigest(projectRoot, { name: entry.name, source: entry.source, transport: entry.transport, endpoint: entry.endpoint, oauthPolicy })
+      : `server\0${entry.agent}\0${entry.source}\0${entry.name}`;
+  };
+  const groups = new Map<string, McpInventoryEntry[]>();
+  for (const entry of members) groups.set(keyOf(entry), [...(groups.get(keyOf(entry)) ?? []), entry]);
+  const views = [...groups.entries()].map(([key, group]): ClaimServerView => {
+    const first = group[0] as McpInventoryEntry;
+    const oauthPolicy = first.descriptor?.oauthPolicy as { oauth?: { authServerMetadataUrl?: unknown }; tokenEndpoints?: unknown } | undefined;
+    const metadataUrl = oauthPolicy?.oauth?.authServerMetadataUrl;
+    const agents = [...new Set(group.map((entry) => entry.agent))].sort();
+    return {
+      key,
+      label: `${agents.join(" and ")} server ${printable(first.name)}`,
+      ...(first.endpoint ? { resourceHost: first.endpoint.host } : {}),
+      ...(typeof metadataUrl === "string" ? { declaredMetadataUrl: metadataUrl } : {}),
+      declaredTokenEndpoints: declaredTokenEndpointsOf(oauthPolicy),
+      records: group.flatMap((entry) => {
+        if (isSelf(entry) || entry.transport === "http-loopback") return [];
+        const identity = mcpRuleKeyForEntry(entry);
+        const record = identity ? records[identity] : undefined;
+        return record ? [record] : [];
+      }),
+    };
+  });
+  return { views, selfKey: keyOf(self) };
+}
+
 function loadClaudeRuntimeConfig(filePath: string): Record<string, unknown> {
   try {
     const parsed = JSON.parse(fs.readFileSync(filePath, "utf8")) as unknown;
@@ -1763,6 +1872,15 @@ function warnOnOperatorCodexCallbackUrl(operatorConfig: string): void {
   if (!/^[ \t]*mcp_oauth_callback_url[ \t]*=/m.test(topLevel)) return;
   warn("mcp: the Codex config sets mcp_oauth_callback_url; Runfree forwards only the session's own callback port, "
     + "so Codex MCP OAuth logins in this project cannot complete until that setting is removed");
+}
+
+function safeEndpoint(raw: string): { host: string; path: string } | undefined {
+  try {
+    const url = new URL(raw);
+    return { host: url.hostname.toLowerCase(), path: url.pathname || "/" };
+  } catch {
+    return undefined;
+  }
 }
 
 function ensureDomain(policy: PolicyJson, host: string): void {
@@ -1972,16 +2090,16 @@ export function mcpOAuthProviderId(agent: McpAgent, serverName: string): string 
   return `mcp:${key}`;
 }
 
+// The host-owned top-level OAuth policy fields the MCP projection computes.
+// Service providers are merged later, by the effective policy generation.
+export type McpOAuthTopLevel = Omit<OAuthMediationPolicyJson, "providers">;
+
 export function mcpOAuthPolicyJson(
   servers: PreparedMcpServer[],
   callbackPort: number,
-  serviceProviders: Record<string, OAuthProviderPolicyForWrite> = {},
+  topLevel: McpOAuthTopLevel = {},
 ): OAuthMediationPolicyForWrite {
   const providers: Record<string, OAuthProviderPolicyJson> = {};
-  for (const [providerId, provider] of Object.entries(serviceProviders)) {
-    if (providers[providerId]) throw new Error(`duplicate OAuth provider id: ${providerId}`);
-    providers[providerId] = provider;
-  }
   for (const server of servers) {
     if (!server.oauthPolicy) continue;
     const providerId = mcpOAuthProviderId(server.agent, server.name);
@@ -1993,6 +2111,10 @@ export function mcpOAuthPolicyJson(
       port: callbackPort,
       url: `http://localhost:${callbackPort}/callback`,
     },
+    ...(topLevel.blockedEndpoints?.length ? { blockedEndpoints: topLevel.blockedEndpoints } : {}),
+    ...(topLevel.recordEndpointHosts?.length ? { recordEndpointHosts: topLevel.recordEndpointHosts } : {}),
+    ...(topLevel.recordOnlyHosts?.length ? { recordOnlyHosts: topLevel.recordOnlyHosts } : {}),
+    ...(topLevel.refusedHosts?.length ? { refusedHosts: topLevel.refusedHosts } : {}),
     providers,
   };
   validateOAuthMediationPolicy(policy);
@@ -2008,8 +2130,8 @@ export function writeOAuthMediationPolicy(filePath: string, policy: OAuthMediati
   fs.chmodSync(filePath, 0o644);
 }
 
-function writeMcpOAuthPolicy(filePath: string, servers: PreparedMcpServer[], callbackPort: number): void {
-  writeOAuthMediationPolicy(filePath, mcpOAuthPolicyJson(servers, callbackPort));
+function writeMcpOAuthPolicy(filePath: string, servers: PreparedMcpServer[], callbackPort: number, topLevel: McpOAuthTopLevel = {}): void {
+  writeOAuthMediationPolicy(filePath, mcpOAuthPolicyJson(servers, callbackPort, topLevel));
 }
 
 function mcpOperationServerId(server: Pick<PreparedMcpServer, "agent" | "name" | "source">): string {
@@ -2232,10 +2354,113 @@ export function prepareMcpRuntime(options: McpPrepareOptions): McpPrepareResult 
     }
   }
 
+  // `runfree mcp enable` records join the servers prepared in this pass by the
+  // MCP rules identity (descriptor digest for project servers, endpoint for
+  // user/local servers): a changed or deleted server matches no record.
+  const enabledRead = options.mcpEnabledPath ? readMcpEnabled(options.projectRoot, options.mcpEnabledPath) : undefined;
+  const enabled = enabledRead?.file;
+  const recordOf = new Map<PreparedMcpServer, McpEnabledRecord>();
+  for (const server of servers) {
+    // F5: a loopback server claims no record, so whatever a record keyed to
+    // its identity names never reaches the policy ("adds nothing to policy"
+    // by construction, not because `mcp enable` writes none).
+    const identity = enabled && server.transport !== "http-loopback"
+      ? mcpRuleKey({ agent: server.agent, descriptorDigest: server.descriptorDigest, endpoint: server.endpoint, server: server.name, source: server.source })
+      : undefined;
+    const record = identity ? enabled?.records[identity] : undefined;
+    if (record) recordOf.set(server, record);
+  }
+
+  // R16: the same OAuth server for several agents forms one share group,
+  // which claims once and is captured by one owner. Every other prepared
+  // server is a claimant of its own. The digest is taken before this pass
+  // changes any OAuth policy.
+  const groups = new Map<string, PreparedMcpServer[]>();
+  const oauthGroupKeys = new Set<string>();
+  for (const server of servers) {
+    const shared = server.oauthPolicy !== undefined && server.transport === "http";
+    const key = shared ? mcpShareGroupDigest(options.projectRoot, server) : `server\0${server.agent}\0${server.source}\0${server.name}`;
+    if (shared) oauthGroupKeys.add(key);
+    groups.set(key, [...(groups.get(key) ?? []), server]);
+  }
+
+  // X1, R1, R2, R9, R17: every declared and recorded claim passes the claim
+  // rules again here, so a later credential destination, curated host,
+  // service endpoint, or other server's use drops it. A dropped token or
+  // registration endpoint becomes a blocked endpoint below (R3).
+  const credentialHosts = credentialDestinationHosts(options.policy.tokens);
+  for (const server of servers) {
+    for (const binding of server.tokenBindings) credentialHosts.add(binding.credential.host);
+  }
+  const serviceUses: ClaimUse[] = Object.entries(options.serviceOAuthProviders ?? {}).map(([providerId, provider]) => ({
+    label: `service OAuth provider ${providerId}`,
+    hosts: [],
+    endpoints: [
+      ...provider.tokenEndpoints.map((endpoint) => ({ kind: "token" as const, host: endpoint.host, path: endpoint.path })),
+      ...(provider.registrationEndpoints ?? []).map((endpoint) => ({ kind: "registration" as const, host: endpoint.host, path: endpoint.path })),
+    ],
+  }));
+  const claimBase = { credentialHosts, curatedHosts: curatedServiceHosts(), serviceUses };
+  const views: ClaimServerView[] = [...groups.entries()].map(([key, members]) => {
+    const first = members[0] as PreparedMcpServer;
+    const agents = [...new Set(members.map((member) => member.agent))].sort();
+    return {
+      key,
+      label: `${agents.join(" and ")} server ${printable(first.name)}`,
+      ...(first.endpoint ? { resourceHost: first.endpoint.host } : {}),
+      ...(first.oauthPolicy?.oauth?.authServerMetadataUrl ? { declaredMetadataUrl: first.oauthPolicy.oauth.authServerMetadataUrl } : {}),
+      declaredTokenEndpoints: (first.oauthPolicy?.tokenEndpoints ?? []).flatMap((endpoint) => {
+        if (typeof endpoint !== "string") return [{ host: endpoint.host, path: endpoint.path }];
+        try {
+          const url = new URL(endpoint);
+          return [{ host: url.hostname.toLowerCase(), path: url.pathname || "/" }];
+        } catch {
+          return [];
+        }
+      }),
+      records: members.flatMap((member) => {
+        const record = recordOf.get(member);
+        return record ? [record] : [];
+      }),
+    };
+  });
+  const filtered = new Map<string, FilteredClaims>();
+  for (const view of views) {
+    const result = filterClaims(view, claimRulesFor(views, view.key, claimBase));
+    filtered.set(view.key, result);
+    const members = groups.get(view.key) ?? [];
+    const first = members[0];
+    for (const { subject, refusal } of result.drops) {
+      const wellKnown = refusal.use === "curated"
+        ? "; for a well-known host, use a static token instead: add an Authorization header to the server entry"
+        : "";
+      warn(`mcp: ${view.label}: ${subject} is not used: ${refusal.reason}; the proxy blocks token requests there${wellKnown}; `
+        + `to restore it, remove the conflicting use and run ${remedy.mcpEnable(first?.agent ?? "claude", first?.name ?? "", first?.source ?? "user")}, `
+        + `or remove the server's OAuth hosts with ${remedy.mcpRevoke(first?.agent ?? "claude", first?.name ?? "")}`);
+    }
+    // R9, R17: a refused declared endpoint is not static and its host is not
+    // allowed for this server; a refused metadata URL is dropped, so its host
+    // never becomes a binding host.
+    for (const member of members) {
+      const policy = member.oauthPolicy;
+      if (!policy) continue;
+      if (result.refusedDeclaredTokenEndpoints.length > 0 && policy.tokenEndpoints) {
+        const refused = new Set(result.refusedDeclaredTokenEndpoints.map((endpoint) => `${endpoint.host}\0${endpoint.path}`));
+        policy.tokenEndpoints = policy.tokenEndpoints.filter((endpoint) => {
+          const parsed = typeof endpoint === "string" ? safeEndpoint(endpoint) : endpoint;
+          return !parsed || !refused.has(`${parsed.host}\0${parsed.path}`);
+        });
+        if (policy.tokenEndpoints.length === 0) delete policy.tokenEndpoints;
+      }
+      if (result.metadataUrlRefused) delete policy.oauth;
+    }
+  }
+
   // Policy and token bindings are computed on copies before any file is
   // written, so a refusal (a shadowed root endpoint, a token-name collision)
   // leaves the caller's policy and token config and the generated agent
   // configs unchanged.
+  const baseHosts = new Set(options.policy.hosts ?? []);
   const policyDraft = structuredClone(options.policy);
   const tokenConfigDraft = structuredClone(options.tokenConfig);
   applyPolicyAndTokens(policyDraft, tokenConfigDraft, servers);
@@ -2246,48 +2471,160 @@ export function prepareMcpRuntime(options: McpPrepareOptions): McpPrepareResult 
   writeCodexRuntimeConfig(options.codexDir, servers);
   replaceObjectContents(options.policy, policyDraft);
   replaceObjectContents(options.tokenConfig, tokenConfigDraft);
-  // `runfree mcp enable` records join the servers prepared in this pass by the
-  // MCP rules identity (descriptor digest for project servers, endpoint for
-  // user/local servers): a changed or deleted server matches no record. Their
-  // hosts are projected after the servers' own hosts, so only hosts nothing
-  // else allows get narrowed request rules; their endpoints then join the
-  // OAuth mediation policy written below.
-  const enabled = options.mcpEnabledPath ? readMcpEnabled(options.projectRoot, options.mcpEnabledPath).file : undefined;
-  const claimants = servers.map((server) => {
-    // F5: a loopback server claims no record, so whatever a record keyed to
-    // its identity names never reaches the policy ("adds nothing to policy"
-    // by construction, not because `mcp enable` writes none).
-    const identity = enabled && server.transport !== "http-loopback"
-      ? mcpRuleKey({ agent: server.agent, descriptorDigest: server.descriptorDigest, endpoint: server.endpoint, server: server.name, source: server.source })
-      : undefined;
-    const record = identity ? enabled?.records[identity] : undefined;
-    return {
-      serverKey: `${server.agent}\0${server.source}\0${server.name}`,
-      label: `${server.agent} server ${server.name}`,
-      ...(server.oauthPolicy ? { policy: server.oauthPolicy } : {}),
+
+  // R16: settle each share group's sticky owner. Without a readable enable
+  // file there is nowhere to keep the owner, so no group is recorded as
+  // formed and no OAuth state is cleared for it.
+  const persistGroups = options.mcpEnabledPath !== undefined && enabledRead !== undefined && !enabledRead.malformed;
+  const settlement = settleShareGroupOwners(
+    [...oauthGroupKeys].map((digest) => ({
+      digest,
+      members: (groups.get(digest) ?? []).map((member) => ({
+        providerId: mcpOAuthProviderId(member.agent, member.name),
+        ...(recordOf.get(member) ? { enabledAt: recordOf.get(member)?.enabledAt } : {}),
+      })),
+    })),
+    persistGroups ? enabled?.shareGroups ?? {} : {},
+  );
+  const groupBumps = persistGroups ? settlement.bumps : [];
+
+  // The OAuth endpoints a group's records name, merged onto its owner: only
+  // the owner carries them, so the proxy never sees one endpoint on two
+  // providers of the same server (R10, R16).
+  const ownerOf = (key: string): PreparedMcpServer | undefined => {
+    const members = groups.get(key) ?? [];
+    const owner = settlement.owners.get(key);
+    return members.find((member) => mcpOAuthProviderId(member.agent, member.name) === owner) ?? members[0];
+  };
+  const mergedRecord = (key: string): McpEnabledRecord | undefined => {
+    const records = filtered.get(key)?.records ?? [];
+    const [first] = records;
+    if (!first) return undefined;
+    const hosts = new Map<string, McpEnabledRecord["oauthHosts"][number]>();
+    const endpoints = new Map<string, NonNullable<McpEnabledRecord["oauthEndpoints"]>[number]>();
+    for (const record of records) {
+      for (const host of record.oauthHosts) if (!hosts.has(host.host) || host.origin === "user") hosts.set(host.host, host);
+      for (const endpoint of record.oauthEndpoints ?? []) endpoints.set(`${endpoint.kind}\0${endpoint.host}\0${endpoint.path}\0${endpoint.exact === true}`, endpoint);
+    }
+    return { ...first, oauthHosts: [...hosts.values()], oauthEndpoints: [...endpoints.values()] };
+  };
+  const claimants = [...groups.keys()].flatMap((key) => {
+    const owner = ownerOf(key);
+    const record = mergedRecord(key);
+    if (!owner?.oauthPolicy && !record) return [];
+    return [{
+      serverKey: key,
+      label: views.find((view) => view.key === key)?.label ?? key,
+      ...(owner?.oauthPolicy ? { policy: owner.oauthPolicy } : {}),
       ...(record ? { record } : {}),
-    };
+    }];
   });
   const mediation = withoutSharedEnabledEndpoints(claimants);
   for (const message of mediation.dropped) warn(message);
-  servers.forEach((server, index) => {
+  claimants.forEach((claimant, index) => {
     const record = mediation.records[index];
-    if (!record || !server.oauthPolicy) return;
-    const applied = projectEnabledOAuthEndpoints(server.oauthPolicy, record);
-    if (applied.length > 0) server.oauthPolicy.protocolReadEndpoints = applied;
+    const owner = ownerOf(claimant.serverKey);
+    if (!owner?.oauthPolicy) return;
+    if (record) {
+      const applied = projectEnabledOAuthEndpoints(owner.oauthPolicy, record);
+      if (applied.length > 0) owner.oauthPolicy.protocolReadEndpoints = applied;
+    }
+    // P1-b: the record's user hosts bind the endpoints the server's own
+    // metadata names there.
+    const userHosts = [...new Set((filtered.get(claimant.serverKey)?.records ?? [])
+      .flatMap((entry) => entry.oauthHosts.filter((host) => host.origin === "user").map((host) => host.host)))]
+      .filter((host) => host !== owner.oauthPolicy?.resourceHost)
+      .sort();
+    if (userHosts.length > 0) owner.oauthPolicy.bindingHosts = userHosts;
   });
+  // Non-owners keep only their resource binding: no endpoint copy, and the
+  // proxy never matches metadata to them.
+  for (const key of oauthGroupKeys) {
+    const owner = ownerOf(key);
+    for (const member of groups.get(key) ?? []) {
+      if (member === owner || !member.oauthPolicy) continue;
+      member.oauthPolicy = {
+        resourceHost: member.oauthPolicy.resourceHost,
+        resourcePathPrefix: member.oauthPolicy.resourcePathPrefix,
+        captureOwner: false,
+      };
+    }
+  }
+
   const oauthCapable = servers.filter((server) => server.oauthPolicy !== undefined);
   if (options.mcpOAuthEpochsPath && oauthCapable.length > 0) {
-    const epochs = updateMcpOAuthEpochs(options.projectRoot, options.mcpOAuthEpochsPath);
+    const bumpIds = [...new Set(groupBumps.flatMap((bump) => bump.providerIds))].sort();
+    const epochs = updateMcpOAuthEpochs(options.projectRoot, options.mcpOAuthEpochsPath, { revoke: bumpIds });
     if (epochs.reset === "reclaimed") {
       warn(`mcp: the MCP OAuth state epoch store ${options.mcpOAuthEpochsPath} was invalid; Runfree replaced it, so the proxy clears all MCP OAuth state and every MCP server needs a new OAuth login`);
+    }
+    for (const bump of groupBumps) {
+      const label = views.find((view) => view.key === bump.digest)?.label ?? bump.providerIds.join(", ");
+      warn(bump.reason === "formed"
+        ? `mcp: ${label} now shares one OAuth login across agents; Runfree cleared its proxy OAuth state, so each agent needs a new OAuth login`
+        : `mcp: ${label}: the agent that held its shared OAuth login left, so Runfree moved the login and cleared its proxy OAuth state; each agent needs a new OAuth login`);
     }
     for (const server of oauthCapable) {
       if (server.oauthPolicy) server.oauthPolicy.stateEpoch = mcpOAuthStateEpoch(epochs, mcpOAuthProviderId(server.agent, server.name));
     }
   }
-  projectEnabledOAuthHosts(options.policy, claimants.flatMap((claimant) => claimant.record ? [claimant.record] : []));
-  writeMcpOAuthPolicy(options.mcpOAuthPolicyPath, servers, callbackPort);
+  // Bumps are recorded before the owner: if the owner write fails, the next
+  // projection forms the group again and clears its state again.
+  if (persistGroups && options.mcpEnabledPath) saveMcpShareGroups(options.projectRoot, options.mcpEnabledPath, settlement.state);
+
+  // Hosts only records add get narrowed rules; their union is the record-only
+  // host set (R6), minus every prepared server's endpoint host.
+  const filteredRecords = [...filtered.values()].flatMap((entry) => entry.records);
+  const recordAdded = projectEnabledOAuthHosts(options.policy, filteredRecords);
+  const endpointHosts = new Set(servers.flatMap((server) => server.endpoint ? [server.endpoint.host] : []));
+  const recordOnlyHosts = recordAdded.filter((host) => !endpointHosts.has(host));
+  // R15: a host a record names that also serves an MCP endpoint, and that
+  // nothing outside MCP allows, gets the narrower endpoint-host check.
+  const recordNamedHosts = new Set(filteredRecords.flatMap((record) => [
+    ...record.oauthHosts.map((host) => host.host),
+    ...(record.oauthEndpoints ?? []).map((endpoint) => endpoint.host),
+  ]));
+  const recordEndpointHosts = [...recordNamedHosts].filter((host) => endpointHosts.has(host) && !baseHosts.has(host)).sort();
+
+  // R3: every token or registration endpoint a record names, and every
+  // refused declared token endpoint, that no provider mediates statically (an
+  // MCP provider here, or a service provider in the effective generation) is
+  // a blocked endpoint, so its token request never passes unmediated on a
+  // host something else allows.
+  const staticKeys = new Set([
+    ...servers.flatMap((server) => [
+      ...(server.oauthPolicy?.tokenEndpoints ?? []),
+      ...(server.oauthPolicy?.registrationEndpoints ?? []),
+    ].flatMap((endpoint) => {
+      const parsed = typeof endpoint === "string" ? safeEndpoint(endpoint) : endpoint;
+      return parsed ? [`${parsed.host}\0${parsed.path}`] : [];
+    })),
+    ...serviceUses.flatMap((use) => use.endpoints.map((endpoint) => `${endpoint.host}\0${endpoint.path}`)),
+  ]);
+  const blocked = new Map<string, { host: string; path: string }>();
+  for (const view of views) {
+    const candidates = [
+      ...view.records.flatMap((record) => (record.oauthEndpoints ?? []).filter((endpoint) => endpoint.kind !== "metadata")),
+      ...(filtered.get(view.key)?.refusedDeclaredTokenEndpoints ?? []),
+    ];
+    for (const endpoint of candidates) {
+      const key = `${endpoint.host}\0${endpoint.path}`;
+      if (!staticKeys.has(key)) blocked.set(key, { host: endpoint.host, path: endpoint.path });
+    }
+  }
+  const hasMcpProvider = servers.some((server) => server.oauthPolicy !== undefined);
+  const refusedHosts = hasMcpProvider
+    ? [...new Set([...credentialHosts, ...claimBase.curatedHosts])].filter((host) => {
+      const checked = checkPolicyHostname(host);
+      return checked.ok && checked.host === host;
+    }).sort()
+    : [];
+  writeMcpOAuthPolicy(options.mcpOAuthPolicyPath, servers, callbackPort, {
+    blockedEndpoints: [...blocked.values()].sort((left, right) => `${left.host}\0${left.path}`.localeCompare(`${right.host}\0${right.path}`)),
+    recordEndpointHosts,
+    recordOnlyHosts,
+    refusedHosts,
+  });
   writeMcpOperationPolicy(
     options.mcpOperationPolicyPath ?? mcpOperationPolicyPath(path.dirname(options.mcpOAuthPolicyPath)),
     mcpOperationPolicyJson(servers, mcpOperationRulesForServers(servers, readMcpRules(options.projectRoot, options.mcpRulesPath))),

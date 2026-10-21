@@ -155,11 +155,11 @@ function effectivePolicyOutputPath(): string {
   return path.join(stateDir, "control", "mcp-network-policy.json");
 }
 
-function prepareRuntime(): void {
+function prepareRuntime(serviceOAuthProviders?: Parameters<typeof prepareEffectiveRuntimeIntent>[0]["serviceOAuthProviders"]): void {
   const base = JSON.parse(
     fs.readFileSync(path.join(projectRoot, ".runfree/network-policy.json"), "utf8"),
   ) as PolicyJson;
-  prepareEffectiveRuntimeIntent({ basePolicy: base, outputPath: effectivePolicyOutputPath() });
+  prepareEffectiveRuntimeIntent({ basePolicy: base, outputPath: effectivePolicyOutputPath(), ...(serviceOAuthProviders ? { serviceOAuthProviders } : {}) });
 }
 
 function readPolicy(): PolicyJson {
@@ -1162,6 +1162,61 @@ function oauthRoutes(resource = "https://repo-oauth.example.com/mcp"): Record<st
   };
 }
 
+// The Ahrefs shape: the issuer the resource names puts its token endpoint on
+// another host.
+function crossHostRoutes(): Record<string, Record<string, unknown>> {
+  const routes = oauthRoutes();
+  routes["https://auth.oauth-idp.example/.well-known/oauth-authorization-server"] = {
+    issuer: "https://auth.oauth-idp.example",
+    authorization_endpoint: "https://auth.oauth-idp.example/authorize",
+    token_endpoint: "https://tokens.elsewhere.example/oauth/token",
+    registration_endpoint: "https://auth.oauth-idp.example/oauth/register",
+  };
+  return routes;
+}
+
+function sharedIdpRoutes(host: string): Record<string, Record<string, unknown>> {
+  return {
+    [`https://${host}/.well-known/oauth-protected-resource/mcp`]: { resource: `https://${host}/mcp`, authorization_servers: ["https://shared-idp.example.com"] },
+    "https://shared-idp.example.com/.well-known/oauth-authorization-server": {
+      issuer: "https://shared-idp.example.com",
+      token_endpoint: "https://shared-idp.example.com/oauth/token",
+    },
+  };
+}
+
+type OAuthPolicyFile = {
+  blockedEndpoints?: Array<{ host: string; path: string }>;
+  providers: Record<string, {
+    bindingHosts?: string[];
+    captureOwner?: false;
+    protocolReadEndpoints?: Array<{ host: string; path: string }>;
+    registrationEndpoints?: Array<{ exact?: true; host: string; path: string }>;
+    resourceHost?: string;
+    stateEpoch?: string;
+    tokenEndpoints?: Array<{ host: string; path: string }>;
+    oauth?: unknown;
+  }>;
+  recordEndpointHosts?: string[];
+  recordOnlyHosts?: string[];
+  refusedHosts?: string[];
+};
+
+type EnabledFile = {
+  records: Record<string, {
+    agent: string;
+    server: string;
+    enabledAt: string;
+    oauthHosts: Array<{ host: string; origin: string; crossHost?: true; crossHostKinds?: string[] }>;
+    oauthEndpoints?: Array<{ kind: string; host: string; path: string; exact?: true }>;
+  }>;
+  shareGroups?: Record<string, { owner: string; released?: true }>;
+};
+
+function readEnabledFile(): EnabledFile {
+  return JSON.parse(fs.readFileSync(path.join(stateDir, "mcp-enabled.json"), "utf8")) as EnabledFile;
+}
+
 function writeProjectOauthServer(name = "repoOauth", url = "https://repo-oauth.example.com/mcp"): void {
   const mcpPath = path.join(projectRoot, ".mcp.json");
   const existing = fs.existsSync(mcpPath)
@@ -1440,8 +1495,8 @@ describe("runfree mcp enable", () => {
     expect(result.status, result.stderr).toBe(0);
     expect(result.stdout).toContain("allow host sso.example.org  [OAuth, --oauth-host]");
     expect(result.stdout).toContain("note: repo-oauth.example.com is the MCP endpoint host");
-    expect(result.stdout).toContain("warning: --oauth-host hosts are allowed as given");
-    expect(result.stdout).toContain("returns the real access and refresh tokens to the agent");
+    expect(result.stdout).toContain("note: --oauth-host hosts are allowed as given");
+    expect(result.stdout).toContain("it refuses any other token request to it");
 
     const prepare = await runAdmin(() => prepareRuntime());
     expect(prepare.status, prepare.stderr).toBe(0);
@@ -1449,8 +1504,14 @@ describe("runfree mcp enable", () => {
     // A user-named host is allowed as given, like `runfree host add`.
     expect(readPolicy().requests?.["sso.example.org"]).toBeUndefined();
     // No recorded endpoint, so no POST on it is ever an OAuth protocol read.
-    const provider = (readMcpOAuthPolicy() as { providers: Record<string, { protocolReadEndpoints?: unknown }> }).providers["mcp:claude-repooauth"];
+    const oauth = readMcpOAuthPolicy() as OAuthPolicyFile;
+    const provider = oauth.providers["mcp:claude-repooauth"];
     expect(provider?.protocolReadEndpoints).toBeUndefined();
+    // P1-b, R6: the user host binds endpoints the server's own metadata names
+    // there, and only the record allows it, so it is record-only.
+    expect(provider?.bindingHosts).toEqual(["sso.example.org"]);
+    expect(oauth.recordOnlyHosts).toEqual(["sso.example.org"]);
+    expect(oauth.recordEndpointHosts).toBeUndefined();
   });
 
   test("invalid --oauth-host values are refused before any write", async () => {
@@ -1464,32 +1525,62 @@ describe("runfree mcp enable", () => {
     expect(fs.existsSync(enabledFilePath())).toBe(false);
   });
 
-  test("an unbound token endpoint in discovery output adds no host and no endpoint", async () => {
+  test("X1/X2: a token endpoint on another host is labeled, recorded with crossHost, and mediated statically", async () => {
     writeProjectOauthServer();
-    const routes = oauthRoutes();
-    routes["https://auth.oauth-idp.example/.well-known/oauth-authorization-server"] = {
-      issuer: "https://auth.oauth-idp.example",
-      token_endpoint: "https://tokens.elsewhere.example/token",
-    };
-    const result = await runAdmin(() => mcpEnableIntent(enableInput(), { discovery: fakeDiscovery(routes).deps, confirm: answers(true, true).confirm }).then(() => {}));
+    const result = await runAdmin(() => mcpEnableIntent(enableInput(), { discovery: fakeDiscovery(crossHostRoutes()).deps, confirm: answers(true, true).confirm }).then(() => {}));
     expect(result.status, result.stderr).toBe(0);
-    expect(result.stdout).toContain("not added: token_endpoint https://tokens.elsewhere.example/token");
-    expect(fs.existsSync(enabledFilePath())).toBe(false);
+    expect(result.stdout).toContain([
+      "  allow host tokens.elsewhere.example  [OAuth, token endpoint on another host]",
+      "      token_endpoint https://tokens.elsewhere.example/oauth/token",
+      "      named by authorization server https://auth.oauth-idp.example/ (its metadata issuer matches)",
+      "      which https://repo-oauth.example.com/.well-known/oauth-protected-resource/mcp named",
+      "      this server's OAuth tokens and refresh tokens will be sent to this host",
+      "      other apps that log in at https://tokens.elsewhere.example/oauth/token will stop working in the sandbox",
+      "      limited to GET, HEAD, OPTIONS, and POST on paths starting with /.well-known, /oauth/token",
+    ].join("\n"));
+    expect(result.stdout).toContain("  proxy mediates token endpoint https://tokens.elsewhere.example/oauth/token");
+    const saved = Object.values(readEnabledFile().records)[0];
+    expect(saved?.oauthHosts).toContainEqual(expect.objectContaining({
+      host: "tokens.elsewhere.example",
+      origin: "discovered",
+      crossHost: true,
+      crossHostKinds: ["token"],
+    }));
+
     const prepare = await runAdmin(() => prepareRuntime());
     expect(prepare.status, prepare.stderr).toBe(0);
-    expect(readPolicy().hosts).toEqual(["repo-oauth.example.com"]);
+    expect(readPolicy().hosts).toEqual(["auth.oauth-idp.example", "repo-oauth.example.com", "tokens.elsewhere.example"]);
+    expect(readPolicy().requests?.["tokens.elsewhere.example"]).toEqual({
+      methods: ["GET", "HEAD", "OPTIONS", "POST"],
+      pathPrefixes: ["/.well-known", "/oauth/token"],
+    });
+    const oauth = readMcpOAuthPolicy() as OAuthPolicyFile;
+    expect(oauth.providers["mcp:claude-repooauth"]).toMatchObject({
+      tokenEndpoints: [{ host: "tokens.elsewhere.example", path: "/oauth/token" }],
+      protocolReadEndpoints: expect.arrayContaining([{ host: "tokens.elsewhere.example", path: "/oauth/token" }]),
+    });
+    // R6: hosts only the record allows; the endpoint host is never record-only.
+    expect(oauth.recordOnlyHosts).toEqual(["auth.oauth-idp.example", "tokens.elsewhere.example"]);
+    expect(oauth.blockedEndpoints).toBeUndefined();
+    expect(oauth.refusedHosts).toEqual(expect.arrayContaining(["api.github.com", "github.com"]));
+    const explain = await runAdmin(() => mcpExplainIntent({ agent: parseMcpAgent("claude"), server: "repoOauth", json: false }));
+    expect(explain.stdout).toContain("OAuth host: tokens.elsewhere.example (discovered, token endpoint on another host; added by mcp enable)");
   });
 
-  test("revoke removes exactly the hosts enable added; desired and shared hosts stay", async () => {
+  test("revoke removes exactly the hosts enable added; desired and other servers' hosts stay", async () => {
     writeFixtureRepo({ hosts: ["sso.example.org"], tokens: {} });
     writeProjectOauthServer("serverA", "https://a.example.com/mcp");
     writeProjectOauthServer("serverB", "https://b.example.com/mcp");
+    const hostsFor: Record<string, string[]> = {
+      serverA: ["shared-idp.example.com", "sso.example.org", "only-servera.example.com"],
+      serverB: ["only-serverb.example.com"],
+    };
     for (const server of ["serverA", "serverB"]) {
       const result = await runAdmin(() => mcpEnableIntent(enableInput({
         server,
         interactive: false,
         discover: false,
-        oauthHosts: ["shared-idp.example.com", "sso.example.org", `only-${server.toLowerCase()}.example.com`],
+        oauthHosts: hostsFor[server] ?? [],
       }), { discovery: NO_NETWORK }).then(() => {}));
       expect(result.status, result.stderr).toBe(0);
     }
@@ -1503,9 +1594,29 @@ describe("runfree mcp enable", () => {
     expect(revoke.stdout).toContain("OAuth hosts no longer allowed for this server: only-servera.example.com, shared-idp.example.com, sso.example.org");
 
     expect((await runAdmin(() => prepareRuntime())).status).toBe(0);
-    // serverA's endpoint and its only host are gone; the desired-policy host and
-    // the host serverB also named stay.
-    expect(readPolicy().hosts).toEqual(["b.example.com", "only-serverb.example.com", "shared-idp.example.com", "sso.example.org"]);
+    // serverA's endpoint and its hosts are gone; the desired-policy host and
+    // serverB's own host stay.
+    expect(readPolicy().hosts).toEqual(["b.example.com", "only-serverb.example.com", "sso.example.org"]);
+  });
+
+  test("R2: a host another server's record names is refused before any write; revoking that server reclaims it", async () => {
+    writeProjectOauthServer("serverA", "https://a.example.com/mcp");
+    writeProjectOauthServer("serverB", "https://b.example.com/mcp");
+    const enableA = await runAdmin(() => mcpEnableIntent(enableInput({ server: "serverA", interactive: false, discover: false, oauthHosts: ["shared-idp.example.com"] }), { discovery: NO_NETWORK }).then(() => {}));
+    expect(enableA.status, enableA.stderr).toBe(0);
+    const before = fs.readFileSync(enabledFilePath(), "utf8");
+    const approvalsBefore = fs.readFileSync(approvalFilePath(), "utf8");
+
+    const refused = await runAdmin(() => mcpEnableIntent(enableInput({ server: "serverB", interactive: false, discover: false, oauthHosts: ["shared-idp.example.com"] }), { discovery: NO_NETWORK }).then(() => {}));
+    expect(refused.status).not.toBe(0);
+    expect(refused.stderr).toContain("cannot use --oauth-host shared-idp.example.com for claude serverB:");
+    expect(refused.stderr).toContain("shared-idp.example.com is used by claude server serverA");
+    expect(fs.readFileSync(enabledFilePath(), "utf8")).toBe(before);
+    expect(fs.readFileSync(approvalFilePath(), "utf8")).toBe(approvalsBefore);
+
+    expect((await runAdmin(() => { mcpRevokeIntent({ agent: parseMcpAgent("claude"), server: "serverA" }); })).status).toBe(0);
+    const reclaimed = await runAdmin(() => mcpEnableIntent(enableInput({ server: "serverB", interactive: false, discover: false, oauthHosts: ["shared-idp.example.com"] }), { discovery: NO_NETWORK }).then(() => {}));
+    expect(reclaimed.status, reclaimed.stderr).toBe(0);
   });
 
   test("a changed project descriptor stops projecting the hosts enable added", async () => {
@@ -1623,36 +1734,440 @@ describe("runfree mcp enable", () => {
     expect(readPolicy().requests).toBeUndefined();
   });
 
-  test("a token endpoint two enabled servers share is not mediated statically for either", async () => {
+  test("R2: a second server's discovery claim on another server's issuer is refused and records nothing", async () => {
     writeProjectOauthServer("serverA", "https://a.example.com/mcp");
     writeProjectOauthServer("serverB", "https://b.example.com/mcp");
     for (const [server, host] of [["serverA", "a.example.com"], ["serverB", "b.example.com"]] as const) {
-      const routes = {
-        [`https://${host}/.well-known/oauth-protected-resource/mcp`]: { resource: `https://${host}/mcp`, authorization_servers: ["https://shared-idp.example.com"] },
-        "https://shared-idp.example.com/.well-known/oauth-authorization-server": {
-          issuer: "https://shared-idp.example.com",
-          token_endpoint: "https://shared-idp.example.com/oauth/token",
-        },
-      };
-      const result = await runAdmin(() => mcpEnableIntent(enableInput({ server }), { discovery: fakeDiscovery(routes).deps, confirm: answers(true, true).confirm }).then(() => {}));
+      const result = await runAdmin(() => mcpEnableIntent(enableInput({ server }), { discovery: fakeDiscovery(sharedIdpRoutes(host)).deps, confirm: answers(true, true).confirm }).then(() => {}));
       expect(result.status, result.stderr).toBe(0);
+      if (server === "serverB") {
+        expect(result.stdout).toContain("not added: authorization server metadata https://shared-idp.example.com/.well-known/oauth-authorization-server cannot be used for this server: shared-idp.example.com is used by claude server serverA");
+        expect(result.stdout).toContain("OAuth hosts: none");
+      }
     }
+    expect(Object.values(readEnabledFile().records).map((record) => record.server)).toEqual(["serverA"]);
+  });
+
+  test("R2, R3: two records that claim one issuer both lose it, the endpoint is blocked, and revoking one reclaims the other", async () => {
+    writeProjectOauthServer("serverA", "https://a.example.com/mcp");
+    writeProjectOauthServer("serverB", "https://b.example.com/mcp");
+    for (const server of ["serverA", "serverB"]) {
+      const placeholder = `${server.toLowerCase()}-idp.example.com`;
+      expect((await runAdmin(() => mcpEnableIntent(enableInput({ server, interactive: false, discover: false, oauthHosts: [placeholder] }), { discovery: NO_NETWORK }).then(() => {}))).status).toBe(0);
+    }
+    // Records written before the claim rules existed: both name the issuer.
+    const file = readEnabledFile();
+    for (const record of Object.values(file.records)) {
+      record.oauthHosts = [{ host: "shared-idp.example.com", origin: "discovered" }];
+      record.oauthEndpoints = [{ kind: "token", host: "shared-idp.example.com", path: "/oauth/token" }];
+    }
+    fs.writeFileSync(enabledFilePath(), JSON.stringify(file));
+
     const prepare = await runAdmin(() => prepareRuntime());
     expect(prepare.status, prepare.stderr).toBe(0);
-    expect(prepare.stderr).toContain("token endpoint https://shared-idp.example.com/oauth/token is also used by another MCP server");
-    const providers = (readMcpOAuthPolicy() as { providers: Record<string, { protocolReadEndpoints?: unknown[]; tokenEndpoints?: unknown[] }> }).providers;
-    expect(providers["mcp:claude-servera"]?.tokenEndpoints ?? []).toEqual([]);
-    expect(providers["mcp:claude-serverb"]?.tokenEndpoints ?? []).toEqual([]);
-    // A shared endpoint is never an OAuth protocol read for either server.
-    expect(providers["mcp:claude-servera"]?.protocolReadEndpoints).toBeUndefined();
-    expect(providers["mcp:claude-serverb"]?.protocolReadEndpoints).toBeUndefined();
-    // The path stays reachable for the login, as with `host add`.
-    expect(readPolicy().requests?.["shared-idp.example.com"]?.pathPrefixes).toContain("/oauth/token");
+    expect(prepare.stderr).toContain("mcp: claude server serverA: OAuth host shared-idp.example.com is not used: shared-idp.example.com is used by claude server serverB");
+    expect(prepare.stderr).toContain("runfree mcp revoke claude serverA");
+    let oauth = readMcpOAuthPolicy() as OAuthPolicyFile;
+    expect(oauth.providers["mcp:claude-servera"]?.tokenEndpoints ?? []).toEqual([]);
+    expect(oauth.providers["mcp:claude-serverb"]?.tokenEndpoints ?? []).toEqual([]);
+    expect(oauth.providers["mcp:claude-servera"]?.protocolReadEndpoints).toBeUndefined();
+    expect(oauth.blockedEndpoints).toEqual([{ host: "shared-idp.example.com", path: "/oauth/token" }]);
+    // Neither record's narrowed rule for the host is projected.
+    expect(readPolicy().hosts).not.toContain("shared-idp.example.com");
+    expect(readPolicy().requests?.["shared-idp.example.com"]).toBeUndefined();
+
+    expect((await runAdmin(() => { mcpRevokeIntent({ agent: parseMcpAgent("claude"), server: "serverA" }); })).status).toBe(0);
+    expect((await runAdmin(() => prepareRuntime())).status).toBe(0);
+    oauth = readMcpOAuthPolicy() as OAuthPolicyFile;
+    expect(oauth.providers["mcp:claude-serverb"]?.tokenEndpoints).toEqual([{ host: "shared-idp.example.com", path: "/oauth/token" }]);
+    expect(oauth.blockedEndpoints).toBeUndefined();
   });
 
   test("printable escapes control, C1, and bidi characters from MCP config and metadata", () => {
     expect(printable("repo\u001b[2Jname‮\u0085")).toBe("repo\\u{1b}[2Jname\\u{202e}\\u{85}");
     expect(printable("plain-name_1")).toBe("plain-name_1");
+  });
+});
+
+// Cross-host token endpoint design: the review labels (X2, R21), the claim
+// rules at enable and at every projection (X1, X3, R1-R3, R9, R17, R20), and
+// share groups (R16).
+describe("runfree mcp enable: cross-host endpoints and claim rules", () => {
+  const CROSS_TOKEN = { host: "tokens.elsewhere.example", path: "/oauth/token" };
+
+  async function enableCrossHost(): Promise<void> {
+    writeProjectOauthServer();
+    const result = await runAdmin(() => mcpEnableIntent(enableInput(), { discovery: fakeDiscovery(crossHostRoutes()).deps, confirm: answers(true, true).confirm }).then(() => {}));
+    expect(result.status, result.stderr).toBe(0);
+  }
+
+  function oauthFile(): OAuthPolicyFile {
+    return readMcpOAuthPolicy() as OAuthPolicyFile;
+  }
+
+  test("declining the cross-host review writes nothing", async () => {
+    writeProjectOauthServer();
+    const result = await runAdmin(async () => {
+      expect(await mcpEnableIntent(enableInput(), { discovery: fakeDiscovery(crossHostRoutes()).deps, confirm: answers(true, false).confirm })).toEqual({ applied: false });
+    });
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout).toContain("[OAuth, token endpoint on another host]");
+    expect(fs.existsSync(approvalFilePath())).toBe(false);
+    expect(fs.existsSync(enabledFilePath())).toBe(false);
+  });
+
+  test("X2, R21: on a host the policy already allows, the label says so, the rules stay, and only the endpoint is claimed (G4)", async () => {
+    writeFixtureRepo({ hosts: [CROSS_TOKEN.host], tokens: {} });
+    await (async () => {
+      writeProjectOauthServer();
+      const result = await runAdmin(() => mcpEnableIntent(enableInput(), { discovery: fakeDiscovery(crossHostRoutes()).deps, confirm: answers(true, true).confirm }).then(() => {}));
+      expect(result.status, result.stderr).toBe(0);
+      expect(result.stdout).toContain([
+        "  allow host tokens.elsewhere.example  [OAuth, token endpoint on another host]",
+        "      token_endpoint https://tokens.elsewhere.example/oauth/token",
+        "      named by authorization server https://auth.oauth-idp.example/ (its metadata issuer matches)",
+        "      which https://repo-oauth.example.com/.well-known/oauth-protected-resource/mcp named",
+        "      tokens.elsewhere.example is ALREADY ALLOWED for all paths (current policy); its rules stay",
+        "      token replies from https://tokens.elsewhere.example/oauth/token will be held by the proxy for MCP server claude repoOauth",
+        "      approve only if this address belongs to the same service",
+        "      other apps that log in at https://tokens.elsewhere.example/oauth/token will stop working in the sandbox",
+      ].join("\n"));
+      expect(result.stdout).not.toContain("starting with /.well-known, /oauth/token");
+    })();
+    expect((await runAdmin(() => prepareRuntime())).status).toBe(0);
+    expect(readPolicy().requests?.[CROSS_TOKEN.host]).toBeUndefined();
+    const oauth = oauthFile();
+    expect(oauth.providers["mcp:claude-repooauth"]?.tokenEndpoints).toEqual([CROSS_TOKEN]);
+    expect(oauth.recordOnlyHosts).toEqual(["auth.oauth-idp.example"]);
+  });
+
+  test("G4: a later host add widens a claimed host and keeps the claim", async () => {
+    await enableCrossHost();
+    expect((await runAdmin(() => prepareRuntime())).status).toBe(0);
+    expect(oauthFile().recordOnlyHosts).toContain(CROSS_TOKEN.host);
+
+    writeFixtureRepo({ hosts: [CROSS_TOKEN.host], tokens: {} });
+    const prepare = await runAdmin(() => prepareRuntime());
+    expect(prepare.status, prepare.stderr).toBe(0);
+    expect(prepare.stderr).not.toContain("is not used");
+    expect(readPolicy().requests?.[CROSS_TOKEN.host]).toBeUndefined();
+    const oauth = oauthFile();
+    expect(oauth.providers["mcp:claude-repooauth"]?.tokenEndpoints).toEqual([CROSS_TOKEN]);
+    expect(oauth.recordOnlyHosts).not.toContain(CROSS_TOKEN.host);
+    expect(oauth.blockedEndpoints).toBeUndefined();
+  });
+
+  test("X3, R3, R5: a later credential destination drops the claim and blocks the endpoint; removing it or revoking reclaims", async () => {
+    await enableCrossHost();
+    writeFixtureRepo({
+      hosts: [CROSS_TOKEN.host],
+      tokens: { elsewhere: { description: "elsewhere token", credentials: [{ host: CROSS_TOKEN.host, header: "Authorization", scheme: "bearer" }] } },
+    });
+    const prepare = await runAdmin(() => prepareRuntime());
+    expect(prepare.status, prepare.stderr).toBe(0);
+    expect(prepare.stderr).toContain("OAuth host tokens.elsewhere.example is not used: tokens.elsewhere.example is a credential destination");
+    expect(prepare.stderr).toContain("the proxy blocks token requests there");
+    let oauth = oauthFile();
+    expect(oauth.providers["mcp:claude-repooauth"]?.tokenEndpoints ?? []).toEqual([]);
+    expect(oauth.providers["mcp:claude-repooauth"]?.protocolReadEndpoints ?? []).not.toContainEqual(CROSS_TOKEN);
+    expect(oauth.blockedEndpoints).toEqual([CROSS_TOKEN]);
+    // The narrowed record rule is gone; the host keeps its desired-policy use.
+    expect(readPolicy().requests?.[CROSS_TOKEN.host]).toBeUndefined();
+
+    // Reclaim 1: remove the conflicting use.
+    writeFixtureRepo({ hosts: [], tokens: {} });
+    expect((await runAdmin(() => prepareRuntime())).status).toBe(0);
+    oauth = oauthFile();
+    expect(oauth.providers["mcp:claude-repooauth"]?.tokenEndpoints).toEqual([CROSS_TOKEN]);
+    expect(oauth.blockedEndpoints).toBeUndefined();
+
+    // Reclaim 2: revoke clears the blocked endpoint with the record.
+    writeFixtureRepo({
+      hosts: [CROSS_TOKEN.host],
+      tokens: { elsewhere: { description: "elsewhere token", credentials: [{ host: CROSS_TOKEN.host, header: "Authorization", scheme: "bearer" }] } },
+    });
+    expect((await runAdmin(() => prepareRuntime())).status).toBe(0);
+    expect(oauthFile().blockedEndpoints).toEqual([CROSS_TOKEN]);
+    expect((await runAdmin(() => { mcpRevokeIntent({ agent: parseMcpAgent("claude"), server: "repoOauth" }); })).status).toBe(0);
+    expect((await runAdmin(() => prepareRuntime())).status).toBe(0);
+    expect(oauthFile().blockedEndpoints).toBeUndefined();
+  });
+
+  test("X3, R20: a record claim on a curated host is dropped and blocked, with the static-token hint", async () => {
+    await enableCrossHost();
+    const file = readEnabledFile();
+    const record = Object.values(file.records)[0];
+    if (!record) throw new Error("expected a record");
+    // As if the host had since joined a curated service bundle.
+    record.oauthHosts = record.oauthHosts.map((host) => host.host === CROSS_TOKEN.host ? { ...host, host: "api.github.com" } : host);
+    record.oauthEndpoints = (record.oauthEndpoints ?? []).map((endpoint) => endpoint.host === CROSS_TOKEN.host ? { ...endpoint, host: "api.github.com" } : endpoint);
+    fs.writeFileSync(enabledFilePath(), JSON.stringify(file));
+    const prepare = await runAdmin(() => prepareRuntime());
+    expect(prepare.status, prepare.stderr).toBe(0);
+    expect(prepare.stderr).toContain("OAuth host api.github.com is not used: api.github.com is a well-known host");
+    expect(prepare.stderr).toContain("use a static token instead");
+    expect(readPolicy().hosts).not.toContain("api.github.com");
+    expect(oauthFile().blockedEndpoints).toEqual([{ host: "api.github.com", path: "/oauth/token" }]);
+  });
+
+  test("X4, R6: a record endpoint that overlaps a service provider's endpoint is dropped at projection", async () => {
+    await enableCrossHost();
+    // The same exact endpoint: the service mediates it, so it is not blocked.
+    const exact = await runAdmin(() => prepareRuntime({ svc: { tokenEndpoints: [CROSS_TOKEN] } }));
+    expect(exact.status, exact.stderr).toBe(0);
+    expect(exact.stderr).toContain("token endpoint https://tokens.elsewhere.example/oauth/token is not used: https://tokens.elsewhere.example/oauth/token overlaps service OAuth provider svc's token endpoint");
+    expect(oauthFile().providers["mcp:claude-repooauth"]?.tokenEndpoints ?? []).toEqual([]);
+    expect(oauthFile().blockedEndpoints).toBeUndefined();
+    // A service registration prefix that covers the endpoint: blocked.
+    const prefix = await runAdmin(() => prepareRuntime({ svc: { tokenEndpoints: [{ host: CROSS_TOKEN.host, path: "/other" }], registrationEndpoints: [{ host: CROSS_TOKEN.host, path: "/oauth" }] } }));
+    expect(prefix.status, prefix.stderr).toBe(0);
+    expect(oauthFile().blockedEndpoints).toEqual([CROSS_TOKEN]);
+    // Without the service, the claim is mediated again.
+    expect((await runAdmin(() => prepareRuntime())).status).toBe(0);
+    expect(oauthFile().providers["mcp:claude-repooauth"]?.tokenEndpoints).toEqual([CROSS_TOKEN]);
+  });
+
+  test("Q8: a registration endpoint on the cross-host token host is recorded and projected exact", async () => {
+    writeProjectOauthServer();
+    const routes = crossHostRoutes();
+    routes["https://auth.oauth-idp.example/.well-known/oauth-authorization-server"] = {
+      issuer: "https://auth.oauth-idp.example",
+      token_endpoint: "https://tokens.elsewhere.example/oauth/token",
+      registration_endpoint: "https://tokens.elsewhere.example/oauth/register",
+    };
+    const result = await runAdmin(() => mcpEnableIntent(enableInput(), { discovery: fakeDiscovery(routes).deps, confirm: answers(true, true).confirm }).then(() => {}));
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout).toContain("allow host tokens.elsewhere.example  [OAuth, token and registration endpoints on another host]");
+    const record = Object.values(readEnabledFile().records)[0];
+    expect(record?.oauthEndpoints).toContainEqual({ kind: "registration", host: CROSS_TOKEN.host, path: "/oauth/register", exact: true });
+    expect((await runAdmin(() => prepareRuntime())).status).toBe(0);
+    expect(oauthFile().providers["mcp:claude-repooauth"]?.registrationEndpoints).toEqual([{ exact: true, host: CROSS_TOKEN.host, path: "/oauth/register" }]);
+  });
+
+  test("revoke removes the cross-host host and its claim", async () => {
+    await enableCrossHost();
+    const revoke = await runAdmin(() => { mcpRevokeIntent({ agent: parseMcpAgent("claude"), server: "repoOauth" }); });
+    expect(revoke.status, revoke.stderr).toBe(0);
+    expect(revoke.stdout).toContain("OAuth hosts no longer allowed for this server: auth.oauth-idp.example, tokens.elsewhere.example");
+    expect((await runAdmin(() => prepareRuntime())).status).toBe(0);
+    expect(readPolicy().hosts).not.toContain(CROSS_TOKEN.host);
+    expect(oauthFile().recordOnlyHosts).toBeUndefined();
+  });
+
+  test("R15: a host serving an MCP endpoint that a record names gets the endpoint-host check unless policy allows it", async () => {
+    writeProjectOauthServer();
+    const network = fakeDiscovery({
+      "https://repo-oauth.example.com/.well-known/oauth-protected-resource/mcp": {
+        resource: "https://repo-oauth.example.com/mcp",
+        authorization_servers: ["https://repo-oauth.example.com"],
+      },
+      "https://repo-oauth.example.com/.well-known/oauth-authorization-server": {
+        issuer: "https://repo-oauth.example.com",
+        token_endpoint: "https://tokens.elsewhere.example/oauth/token",
+        registration_endpoint: "https://repo-oauth.example.com/mcp/register",
+      },
+    });
+    expect((await runAdmin(() => mcpEnableIntent(enableInput(), { discovery: network.deps, confirm: answers(true, true).confirm }).then(() => {}))).status).toBe(0);
+    expect((await runAdmin(() => prepareRuntime())).status).toBe(0);
+    expect(oauthFile().recordEndpointHosts).toEqual(["repo-oauth.example.com"]);
+    expect(oauthFile().recordOnlyHosts).toEqual([CROSS_TOKEN.host]);
+    writeFixtureRepo({ hosts: ["repo-oauth.example.com"], tokens: {} });
+    expect((await runAdmin(() => prepareRuntime())).status).toBe(0);
+    expect(oauthFile().recordEndpointHosts).toBeUndefined();
+  });
+
+  test("R20: a discovered issuer on a well-known host stops enable with the static-token remedy; nothing is saved", async () => {
+    writeProjectOauthServer("gh", "https://mcp.gh.example/mcp");
+    const network = fakeDiscovery({
+      "https://mcp.gh.example/.well-known/oauth-protected-resource/mcp": {
+        resource: "https://mcp.gh.example/mcp",
+        authorization_servers: ["https://github.com/login/oauth"],
+      },
+      "https://github.com/.well-known/oauth-authorization-server/login/oauth": {
+        issuer: "https://github.com/login/oauth",
+        token_endpoint: "https://github.com/login/oauth/access_token",
+      },
+    });
+    const result = await runAdmin(() => mcpEnableIntent(enableInput({ server: "gh" }), { discovery: network.deps, confirm: answers(true).confirm }).then(() => {}));
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain("cannot use https://github.com/.well-known/oauth-authorization-server/login/oauth as authorization server metadata for claude gh:");
+    expect(result.stderr).toContain("github.com is a well-known host; other logins there would be captured.");
+    expect(result.stderr).toContain('use a token instead: add "headers": {"Authorization": "Bearer ${GH_MCP_TOKEN}"} to the server entry, remove its OAuth settings, and run');
+    expect(result.stderr).toContain("runfree mcp enable claude gh --source project --from-env GH_MCP_TOKEN");
+    expect(fs.existsSync(approvalFilePath())).toBe(false);
+    expect(fs.existsSync(enabledFilePath())).toBe(false);
+  });
+
+  test("R9, R20: a declared token endpoint on a well-known host is refused at enable before any lookup or write", async () => {
+    fs.writeFileSync(path.join(projectRoot, ".mcp.json"), JSON.stringify({
+      mcpServers: { gh: { type: "http", url: "https://mcp.gh.example/mcp", oauth: { tokenEndpoint: "https://github.com/login/oauth/access_token" } } },
+    }));
+    const project = await runAdmin(() => mcpEnableIntent(enableInput({ server: "gh" }), { discovery: NO_NETWORK, confirm: answers().confirm }).then(() => {}));
+    expect(project.status).not.toBe(0);
+    expect(project.stderr).toContain("cannot use the declared https://github.com/login/oauth/access_token as a token endpoint for claude gh:");
+    expect(project.stderr).toContain("runfree mcp enable claude gh --source project --from-env GH_MCP_TOKEN");
+    expect(fs.existsSync(approvalFilePath())).toBe(false);
+    expect(fs.existsSync(enabledFilePath())).toBe(false);
+
+    // A user entry binds the token with credential set-source; Codex reads
+    // the token from bearer_token_env_var.
+    writeCodexNative([
+      "[mcp_servers.gh]",
+      'url = "https://mcp.gh.example/mcp"',
+      'oauth = { tokenEndpoint = "https://github.com/login/oauth/access_token" }',
+      "",
+    ].join("\n"));
+    const codex = await runAdmin(() => mcpEnableIntent(enableInput({ agent: parseMcpAgent("codex"), server: "gh", discover: false, interactive: false }), { discovery: NO_NETWORK }).then(() => {}));
+    expect(codex.status).not.toBe(0);
+    expect(codex.stderr).toContain('use a token instead: set bearer_token_env_var = "GH_MCP_TOKEN" in the server entry');
+    expect(codex.stderr).toContain("runfree credential set-source mcp-codex-gh-auth --from-env GH_MCP_TOKEN");
+    expect(fs.existsSync(enabledFilePath())).toBe(false);
+  });
+
+  test("R9, R17: at projection a refused declared endpoint is not static, its host is not allowed, and it is blocked", async () => {
+    writeClaudeNative({
+      mcpServers: {
+        gh: { type: "http", url: "https://mcp.gh.example/mcp", oauth: { tokenEndpoint: "https://github.com/login/oauth/access_token" } },
+        meta: { type: "http", url: "https://mcp.meta.example/mcp", authServerMetadataUrl: "https://api.github.com/.well-known/oauth-authorization-server" },
+      },
+    });
+    const prepare = await runAdmin(() => prepareRuntime());
+    expect(prepare.status, prepare.stderr).toBe(0);
+    expect(prepare.stderr).toContain("declared token endpoint https://github.com/login/oauth/access_token is not used: github.com is a well-known host");
+    expect(prepare.stderr).toContain("declared metadata URL https://api.github.com/.well-known/oauth-authorization-server is not used");
+    expect(readPolicy().hosts).toEqual(["mcp.gh.example", "mcp.meta.example"]);
+    const oauth = oauthFile();
+    expect(oauth.providers["mcp:claude-gh"]?.tokenEndpoints).toBeUndefined();
+    expect(oauth.providers["mcp:claude-meta"]?.oauth).toBeUndefined();
+    expect(oauth.blockedEndpoints).toEqual([{ host: "github.com", path: "/login/oauth/access_token" }]);
+  });
+});
+
+// R16: one server for several agents shares one OAuth login.
+describe("runfree mcp enable: share groups", () => {
+  const SHARED_URL = "https://mcp.shared.example/mcp";
+
+  function sharedRoutes(): Record<string, Record<string, unknown>> {
+    return {
+      "https://mcp.shared.example/.well-known/oauth-protected-resource/mcp": { resource: SHARED_URL, authorization_servers: ["https://mcp.shared.example/"] },
+      "https://mcp.shared.example/.well-known/oauth-authorization-server": {
+        issuer: "https://mcp.shared.example/",
+        token_endpoint: "https://shared.example/oauth/token",
+        registration_endpoint: "https://mcp.shared.example/mcp/register",
+      },
+    };
+  }
+
+  function writeSharedServers(): void {
+    writeClaudeNative({ mcpServers: { ahrefs: { type: "http", url: SHARED_URL } } });
+    writeCodexNative(["[mcp_servers.ahrefs]", `url = "${SHARED_URL}"`, ""].join("\n"));
+  }
+
+  async function enableShared(agent: "claude" | "codex"): Promise<AdminRunResult> {
+    return runAdmin(() => mcpEnableIntent(enableInput({ agent: parseMcpAgent(agent), server: "ahrefs" }), {
+      discovery: fakeDiscovery(sharedRoutes()).deps,
+      confirm: answers(true).confirm,
+    }).then(() => {}));
+  }
+
+  function providers(): OAuthPolicyFile["providers"] {
+    return (readMcpOAuthPolicy() as OAuthPolicyFile).providers;
+  }
+
+  test("Codex first, then Claude: Codex stays the owner; Claude is no claimant and carries no endpoint copy", async () => {
+    writeSharedServers();
+    expect((await enableShared("codex")).status).toBe(0);
+    expect((await runAdmin(() => prepareRuntime())).status).toBe(0);
+    const codexEpoch = providers()["mcp:codex-ahrefs"]?.stateEpoch;
+
+    const claude = await enableShared("claude");
+    // The other agent's record is the same server: no R2 refusal.
+    expect(claude.status, claude.stderr).toBe(0);
+    expect(claude.stdout).toContain("allow host shared.example  [OAuth, token endpoint on another host]");
+    const prepare = await runAdmin(() => prepareRuntime());
+    expect(prepare.status, prepare.stderr).toBe(0);
+    expect(prepare.stderr).not.toContain("is not used");
+    expect(prepare.stderr).not.toContain("new OAuth login");
+    const current = providers();
+    expect(current["mcp:codex-ahrefs"]).toMatchObject({
+      tokenEndpoints: [{ host: "shared.example", path: "/oauth/token" }],
+      registrationEndpoints: [{ host: "mcp.shared.example", path: "/mcp/register" }],
+      stateEpoch: codexEpoch,
+    });
+    expect(current["mcp:codex-ahrefs"]?.captureOwner).toBeUndefined();
+    expect(current["mcp:claude-ahrefs"]).toEqual({
+      kind: "mcp",
+      resourceHost: "mcp.shared.example",
+      resourcePathPrefix: "/mcp",
+      captureOwner: false,
+      stateEpoch: expect.any(String),
+    });
+    expect((readMcpOAuthPolicy() as OAuthPolicyFile).blockedEndpoints).toBeUndefined();
+  });
+
+  test("revoking the owner moves ownership, clears every member's OAuth state, and says so", async () => {
+    writeSharedServers();
+    expect((await enableShared("codex")).status).toBe(0);
+    expect((await runAdmin(() => prepareRuntime())).status).toBe(0);
+    expect((await enableShared("claude")).status).toBe(0);
+    expect((await runAdmin(() => prepareRuntime())).status).toBe(0);
+    const before = providers();
+
+    const revoke = await runAdmin(() => { mcpRevokeIntent({ agent: parseMcpAgent("codex"), server: "ahrefs" }); });
+    expect(revoke.status, revoke.stderr).toBe(0);
+    expect(revoke.stdout).toContain("claude and codex both need a new OAuth login");
+    const prepare = await runAdmin(() => prepareRuntime());
+    expect(prepare.status, prepare.stderr).toBe(0);
+    expect(prepare.stderr).toContain("the agent that held its shared OAuth login left");
+    const after = providers();
+    expect(after["mcp:claude-ahrefs"]?.tokenEndpoints).toEqual([{ host: "shared.example", path: "/oauth/token" }]);
+    expect(after["mcp:codex-ahrefs"]?.captureOwner).toBe(false);
+    expect(after["mcp:claude-ahrefs"]?.stateEpoch).not.toBe(before["mcp:claude-ahrefs"]?.stateEpoch);
+    expect(after["mcp:codex-ahrefs"]?.stateEpoch).not.toBe(before["mcp:codex-ahrefs"]?.stateEpoch);
+    // Settled: the next projection is quiet and stable.
+    const next = await runAdmin(() => prepareRuntime());
+    expect(next.stderr).not.toContain("new OAuth login");
+    expect(providers()["mcp:claude-ahrefs"]?.stateEpoch).toBe(after["mcp:claude-ahrefs"]?.stateEpoch);
+  });
+
+  test("upgrade: a group that forms from members that may already hold handles clears every member's state once", async () => {
+    writeSharedServers();
+    // Two agents' servers that existed before share groups: the first
+    // projection forms the group.
+    expect((await runAdmin(() => prepareRuntime())).status).toBe(0);
+    const enabledPath = enabledFilePath();
+    const groups = readEnabledFile().shareGroups ?? {};
+    expect(Object.values(groups)).toHaveLength(1);
+    // Simulate the pre-group state: no stored owner.
+    const file = readEnabledFile();
+    delete file.shareGroups;
+    fs.writeFileSync(enabledPath, JSON.stringify(file));
+    const before = providers();
+    const prepare = await runAdmin(() => prepareRuntime());
+    expect(prepare.status, prepare.stderr).toBe(0);
+    expect(prepare.stderr).toContain("now shares one OAuth login across agents");
+    const after = providers();
+    expect(after["mcp:claude-ahrefs"]?.stateEpoch).not.toBe(before["mcp:claude-ahrefs"]?.stateEpoch);
+    expect(after["mcp:codex-ahrefs"]?.stateEpoch).not.toBe(before["mcp:codex-ahrefs"]?.stateEpoch);
+    expect([after["mcp:claude-ahrefs"]?.captureOwner, after["mcp:codex-ahrefs"]?.captureOwner].filter((value) => value === false)).toHaveLength(1);
+    expect((await runAdmin(() => prepareRuntime())).stderr).not.toContain("new OAuth login");
+  });
+
+  test("a different server with the same endpoint is refused", async () => {
+    writeClaudeNative({ mcpServers: { ahrefs: { type: "http", url: SHARED_URL }, other: { type: "http", url: "https://mcp.other.example/mcp" } } });
+    expect((await enableShared("claude")).status).toBe(0);
+    const before = fs.readFileSync(enabledFilePath(), "utf8");
+    const routes = {
+      "https://mcp.other.example/.well-known/oauth-protected-resource/mcp": { resource: "https://mcp.other.example/mcp", authorization_servers: ["https://mcp.other.example/"] },
+      "https://mcp.other.example/.well-known/oauth-authorization-server": { issuer: "https://mcp.other.example/", token_endpoint: "https://shared.example/oauth/token" },
+    };
+    const other = await runAdmin(() => mcpEnableIntent(enableInput({ server: "other" }), { discovery: fakeDiscovery(routes).deps, confirm: answers(true).confirm }).then(() => {}));
+    expect(other.status, other.stderr).toBe(0);
+    expect(other.stdout).toContain("shared.example is used by claude server ahrefs");
+    expect(other.stdout).toContain("OAuth hosts: none");
+    const after = JSON.parse(fs.readFileSync(enabledFilePath(), "utf8")) as EnabledFile;
+    expect(Object.values(after.records).map((record) => record.server)).toEqual(["ahrefs"]);
+    expect(JSON.stringify(after.records)).toBe(JSON.stringify((JSON.parse(before) as EnabledFile).records));
   });
 });
 
