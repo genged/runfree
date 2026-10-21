@@ -45,6 +45,8 @@ export type CurlProbeOptions = Readonly<{
   insecure?: boolean;
   /** Where curl saves the response body; discarded by default. */
   bodyFile?: string;
+  /** Forces HTTP/1.1, so a WebSocket upgrade request is sent as one. */
+  http1?: boolean;
 }>;
 
 const CODE_MARKER = "runfree-probe-http-code=";
@@ -57,6 +59,7 @@ const CODE_MARKER = "runfree-probe-http-code=";
 export function curlProbeCommand(url: string, options: CurlProbeOptions): string {
   const flags = ["-sS"];
   if (options.insecure) flags.push("-k");
+  if (options.http1) flags.push("--http1.1");
   if (options.retries !== undefined) flags.push("--retry", String(options.retries), "--retry-delay", "1", "--retry-all-errors");
   flags.push("--max-time", String(options.maxTimeSeconds));
   if (options.method !== undefined) flags.push("-X", options.method);

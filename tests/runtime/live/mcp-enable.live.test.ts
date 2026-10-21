@@ -127,7 +127,7 @@ function probe(
   sessionId: string,
   url: string,
   method?: string,
-  request: { body?: string; headers?: readonly string[] } = {},
+  request: { body?: string; headers?: readonly string[]; http1?: boolean } = {},
 ): ProbeAnswer & { detail: string; body: string } {
   const command = curlProbeCommand(url, { maxTimeSeconds: 15, insecure: true, bodyFile: PROBE_BODY_FILE, ...(method ? { method } : {}), ...request });
   const result = sessionExec(sessionId, `rm -f ${PROBE_BODY_FILE}; ${command}; printf '%s\\n' ${PROBE_BODY_MARKER}; cat ${PROBE_BODY_FILE} 2>/dev/null`);
@@ -268,6 +268,29 @@ function addEnableRecords(fixture: LiveFixture, stateDir: string, records: reado
 /** The response carries no OAuth token field and no Runfree handle. */
 function expectNoTokenInReply(answer: { body: string; detail: string }, label: string): void {
   expect(answer.body, `${label}: the agent received token material: ${answer.detail}`).not.toMatch(/"(?:access|refresh|id)_token"\s*:|runfree_oauth_/u);
+}
+
+/**
+ * A WebSocket upgrade request, sent over HTTP/1.1 through the proxy. The URL
+ * is https: curl sends the upgrade headers itself, so this needs no curl
+ * build with WebSocket support; the proxy routes it by its headers.
+ */
+function webSocketUpgrade(sessionId: string, url: string): ReturnType<typeof probe> {
+  return probe(sessionId, url, undefined, {
+    http1: true,
+    headers: [
+      "Connection: Upgrade",
+      "Upgrade: websocket",
+      "Sec-WebSocket-Version: 13",
+      "Sec-WebSocket-Key: cnVuZnJlZS1saXZlLXByb2Jl",
+    ],
+  });
+}
+
+/** Structured `oauth-endpoint-not-mediated` denial events for `host`, over the whole proxy log. */
+function oauthDenialEventCount(fixture: LiveFixture, host: string): number {
+  const logs = dockerOrThrow("proxy logs", ["logs", proxyContainerId(fixture)]);
+  return logs.split(`"reason":"oauth-endpoint-not-mediated","host":"${host}"`).length - 1;
 }
 
 function proxyLogs(fixture: LiveFixture): string {
@@ -674,6 +697,42 @@ describe("one-step MCP enable and exact revoke", () => {
       expectNoTokenInReply(refused, "refused token POST");
       expect(admittedToUnresolvableHost(metadata), `the --oauth-host metadata GET was not admitted: ${metadata.detail}`).toBe(true);
       expect(proxyAdmittedEventCount(proxyId, BOUND_AUTH_HOST), "the proxy logged no admission for the metadata GET").toBeGreaterThan(admittedAfterRefusal);
+    }, TEST_TIMEOUT_MS);
+
+    // The proxy cannot read the reply to a WebSocket upgrade (a non-101
+    // upstream answer reaches the agent unread), so an upgrade where it
+    // guards OAuth is refused before any upstream connection: on a
+    // record-only host whatever the path, and on a mediated endpoint.
+    test("a WebSocket upgrade to the --oauth-host token path or the cross-host token endpoint is refused; elsewhere it is not", () => {
+      const targets = [
+        [BOUND_AUTH_HOST, `https://${BOUND_AUTH_HOST}${TOKEN_PATH}?grant_type=refresh_token&refresh_token=x`],
+        [CROSS_TOKEN_HOST, `https://${CROSS_TOKEN_HOST}${TOKEN_PATH}`],
+      ] as const;
+      const stateBefore = readProxyOAuthState(proxyId);
+      const before = targets.map(([host]) => ({ admitted: proxyAdmittedEventCount(proxyId, host), denials: oauthDenialEventCount(fixture, host) }));
+      const controlDenialsBefore = oauthDenialEventCount(fixture, USER_HOST);
+      const verbose = enableProxyVerboseLogging(proxyId, "mcp-cross-host-websocket");
+      let answers: Array<ReturnType<typeof probe>>;
+      let control: ReturnType<typeof probe>;
+      try {
+        answers = targets.map(([, url]) => webSocketUpgrade(sessionId, url));
+        // Positive control: the same grant-shaped upgrade to a host the user
+        // allowed, where the proxy guards no OAuth endpoint.
+        control = webSocketUpgrade(sessionId, `https://${USER_HOST}${TOKEN_PATH}?grant_type=refresh_token&refresh_token=x`);
+      } finally {
+        verbose.disable();
+      }
+      targets.forEach(([host, url], index) => {
+        const answer = answers[index] as ReturnType<typeof probe>;
+        expect(answer.code, `${url}: not a 403: ${answer.detail}`).toBe("403");
+        expect(answer.blocked, `${url}: not refused as an unmediated OAuth upgrade: ${answer.detail}`).toBe(OAUTH_NOT_MEDIATED);
+        expect(oauthDenialEventCount(fixture, host), `${url}: no structured denial event`).toBeGreaterThan(before[index]?.denials ?? 0);
+        expect(proxyAdmittedEventCount(proxyId, host), `${url}: the refused upgrade reached the upstream`).toBe(before[index]?.admitted);
+        expectNoTokenInReply(answer, `${url} upgrade`);
+      });
+      expect(readProxyOAuthState(proxyId), "a refused upgrade changed the proxy OAuth state").toBe(stateBefore);
+      expect(control.blocked, `the upgrade to ${USER_HOST} was refused as an OAuth upgrade: ${control.detail}`).not.toBe(OAUTH_NOT_MEDIATED);
+      expect(oauthDenialEventCount(fixture, USER_HOST)).toBe(controlDenialsBefore);
     }, TEST_TIMEOUT_MS);
 
     // L2, and the reclaim of L3: the proxy binds an endpoint on a user host
