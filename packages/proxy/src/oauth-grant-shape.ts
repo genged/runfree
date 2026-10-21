@@ -65,6 +65,11 @@ export type GrantShapeInput = {
   // undefined when the request carries none.
   body: Buffer | undefined;
   failClosed: boolean;
+  // Deep scope reads every body as a form too, even one declared as JSON
+  // that parses (default). False reads a parsed JSON body declared as JSON
+  // by its keys only, so a string value that quotes an OAuth URL is not
+  // mistaken for a form grant (the host-wide scan of a broadly allowed host).
+  formReadDeclaredJson?: boolean;
   headers: Record<string, HeaderValue> | undefined;
   scope: GrantShapeScope;
   url: URL;
@@ -262,7 +267,7 @@ export function classifyGrantShape(input: GrantShapeInput): GrantShapeFinding | 
     else if (failClosed && declaredJson) return { kind: "undecodable" };
     // Also read as a form whatever the content type: an issuer that parses
     // forms would find a grant smuggled inside JSON string text.
-    addFormFields(fields, text);
+    if (input.formReadDeclaredJson !== false || !json.ok || !declaredJson) addFormFields(fields, text);
   } else {
     if (json.ok) addJsonFieldsTopLevel(fields, json.value);
     // A body not declared as JSON is read as a form too, even when it

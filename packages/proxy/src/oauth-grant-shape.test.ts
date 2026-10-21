@@ -10,6 +10,7 @@ function classify(options: {
   contentType?: string;
   encoding?: string;
   failClosed?: boolean;
+  formReadDeclaredJson?: boolean;
   headers?: Record<string, string>;
   length?: "auto" | "none" | string;
   scope?: GrantShapeScope;
@@ -25,6 +26,7 @@ function classify(options: {
   return classifyGrantShape({
     body,
     failClosed: options.failClosed ?? true,
+    ...(options.formReadDeclaredJson !== undefined ? { formReadDeclaredJson: options.formReadDeclaredJson } : {}),
     headers,
     scope: options.scope ?? "deep",
     url: new URL(options.url ?? URL_BASE),
@@ -223,6 +225,25 @@ describe("classifyGrantShape: lenient mode resists cheap bypasses", () => {
     expect(classify({ body, contentType: "application/json", scope: "top-level", failClosed: false })).toBeUndefined();
     const rpc = JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { q: "&grant_type=x&" } });
     expect(classify({ body: rpc, contentType: "application/json; charset=utf-8", scope: "top-level", failClosed: false })).toBeUndefined();
+  });
+});
+
+describe("classifyGrantShape: formReadDeclaredJson", () => {
+  const quoting = JSON.stringify({ body: "see https://x.example/cb?state=1&refresh_token=abc" });
+
+  test("false reads a parsed JSON body declared as JSON by its keys only", () => {
+    expect(classify({ body: quoting, contentType: "application/json", failClosed: false, formReadDeclaredJson: false })).toBeUndefined();
+    expect(classify({ body: JSON.stringify({ a: { refresh_token: "r" } }), contentType: "application/json", failClosed: false, formReadDeclaredJson: false }))
+      .toEqual({ kind: "grant-shaped", field: "refresh_token" });
+  });
+
+  test("false still form-reads a body not declared as JSON, or one that does not parse", () => {
+    expect(classify({ body: quoting, contentType: "text/plain", failClosed: false, formReadDeclaredJson: false })).toMatchObject({ kind: "grant-shaped" });
+    expect(classify({ body: "{bad&refresh_token=r", contentType: "application/json", failClosed: false, formReadDeclaredJson: false })).toMatchObject({ kind: "grant-shaped" });
+  });
+
+  test("the default form-reads it", () => {
+    expect(classify({ body: quoting, contentType: "application/json", failClosed: false })).toMatchObject({ kind: "grant-shaped" });
   });
 });
 

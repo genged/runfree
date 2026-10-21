@@ -504,6 +504,24 @@ describe("path variants of blocked and colliding endpoints", () => {
       .toMatchObject({ finding: { kind: "multipart" } });
   });
 
+  test("a JSON body quoting an OAuth URL passes elsewhere on the host, but is refused at the exact blocked endpoint", async () => {
+    const target = mediator({ blockedEndpoints: [{ host: TOKEN_HOST, path: "/oauth/token" }], providers: {} });
+    const quoting = JSON.stringify({ body: "see https://x.example/cb?state=1&refresh_token=abc" });
+    expect(await target.unmediatedRequestRefusal(request("POST", `https://${TOKEN_HOST}/issues/1/comments`, quoting, JSON_TYPE), { allowlisted: true })).toBeUndefined();
+    expect(await target.unmediatedRequestRefusal(request("POST", TOKEN_URL, quoting, JSON_TYPE), { allowlisted: true }))
+      .toMatchObject({ target: "blocked-endpoint", finding: { kind: "grant-shaped", field: "refresh_token" } });
+    // Not declared as JSON, the same text is still read as a form host-wide.
+    expect(await target.unmediatedRequestRefusal(request("POST", `https://${TOKEN_HOST}/issues/1/comments`, quoting, { "content-type": "text/plain" }), { allowlisted: true }))
+      .toMatchObject({ target: "blocked-endpoint" });
+  });
+
+  test("on a record-only host a JSON body quoting an OAuth URL is still refused", async () => {
+    const target = mediator({ recordOnlyHosts: [TOKEN_HOST], providers: {} });
+    const quoting = JSON.stringify({ body: "see https://x.example/cb?state=1&refresh_token=abc" });
+    expect(await target.unmediatedRequestRefusal(request("POST", `https://${TOKEN_HOST}/api`, quoting, JSON_TYPE), { allowlisted: true }))
+      .toMatchObject({ target: "record-only-host" });
+  });
+
   test("a host with a colliding endpoint gets the same host-wide scan, naming both providers", async () => {
     const SHARED = "auth.example.com";
     const target = mediator({

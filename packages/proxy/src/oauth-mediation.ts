@@ -1209,8 +1209,9 @@ export class OAuthMediator {
       scope: GrantShapeScope,
       failClosed: boolean,
       providers: string[],
+      formReadDeclaredJson = true,
     ): UnmediatedOAuthRequestRefusal | undefined => {
-      const finding = classifyGrantShape({ body, failClosed, headers: req.headers, scope, url });
+      const finding = classifyGrantShape({ body, failClosed, formReadDeclaredJson, headers: req.headers, scope, url });
       if (finding === undefined) return undefined;
       return { finding, host, path: url.pathname || "/", providers, target };
     };
@@ -1231,12 +1232,14 @@ export class OAuthMediator {
     if (policy.recordOnlyHosts.includes(host)) return check("record-only-host", "deep", true, userHostOwners());
     // Path variants of a blocked or colliding endpoint: a deep scan of the
     // whole host, without fail-closed rules, so ordinary traffic there is
-    // never refused for its size or encoding.
+    // never refused for its size or encoding. These hosts are broadly
+    // allowed, so a JSON body is read by its keys, not as a form: a string
+    // value quoting an OAuth URL is ordinary content there.
     const hostClaim = hostBlockOrCollision(policy, state, host);
     if (hostClaim?.kind === "collision") {
-      return check("endpoint-collision", "deep", false, hostClaim.servers.map((server) => server.name));
+      return check("endpoint-collision", "deep", false, hostClaim.servers.map((server) => server.name), false);
     }
-    if (hostClaim?.kind === "blocked") return check("blocked-endpoint", "deep", false, []);
+    if (hostClaim?.kind === "blocked") return check("blocked-endpoint", "deep", false, [], false);
     if (policy.recordEndpointHosts.includes(host)) return check("record-endpoint-host", "top-level", false, userHostOwners());
     return undefined;
   }
