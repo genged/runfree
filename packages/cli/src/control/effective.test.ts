@@ -11,6 +11,10 @@ import {
   approveRuntimeIsolationControl,
 } from "./approvals.ts";
 import { captureDesiredPolicyCandidate } from "./candidates.ts";
+import type { CompiledDesiredPolicy } from "./compiler.ts";
+import { validateNetworkPolicy } from "@runfree/runtime-contracts/network-policy";
+import { validateOAuthMediationPolicy } from "@runfree/runtime-contracts/oauth-mediation-policy";
+import { flushWarnings, pendingWarningsForTest } from "../warnings.ts";
 import {
   clearConvergedPolicyReceipt,
   cleanupEffectivePolicyGenerations,
@@ -19,6 +23,7 @@ import {
   readActiveControlSelection,
   readConvergedPolicyReceipt,
   readEffectiveControlProvenance,
+  reconcileMcpOAuthProvidersForTest,
   selectEffectivePolicyGeneration,
   verifyEffectivePolicyGeneration,
 } from "./effective.ts";
@@ -154,6 +159,72 @@ describe("effective control generations", () => {
     });
     const second = publishEffectivePolicyGeneration(root, project, { baseOAuthPolicy: policy(["ahrefs.com", "other.example.com"]) });
     expect(second.controlGeneration).not.toBe(first.controlGeneration);
+  });
+
+  test("X5, R5: a protocol-read endpoint on a credential destination is dropped with a warning, and the generation still publishes", () => {
+    const project = approvedProject();
+    const generation = publishEffectivePolicyGeneration(root, project, {
+      baseOAuthPolicy: {
+        providers: {
+          "mcp:claude-linear": {
+            kind: "mcp",
+            resourceHost: "mcp.example.com",
+            tokenEndpoints: [{ host: "auth.example.com", path: "/oauth/token" }, { host: "mcp.example.com", path: "/token" }],
+            protocolReadEndpoints: [{ host: "auth.example.com", path: "/oauth/token" }, { host: "mcp.example.com", path: "/token" }],
+          },
+        },
+      },
+      effectiveNetworkPolicy: {
+        hosts: ["auth.example.com", "example.com", "mcp.example.com"],
+        tokens: { auth: { description: "auth", credentials: [{ host: "auth.example.com", header: "Authorization", scheme: "bearer" }] } },
+      },
+    });
+    const warnings = pendingWarningsForTest().map((event) => event.message);
+    flushWarnings();
+    const payload = JSON.parse(fs.readFileSync(generation.oauthPolicyPath, "utf8")) as { providers: Record<string, Record<string, unknown>> };
+    // The endpoint stays mediated; only its protocol-read status goes.
+    expect(payload.providers["mcp:claude-linear"]?.tokenEndpoints).toEqual([{ host: "auth.example.com", path: "/oauth/token" }, { host: "mcp.example.com", path: "/token" }]);
+    expect(payload.providers["mcp:claude-linear"]?.protocolReadEndpoints).toEqual([{ host: "mcp.example.com", path: "/token" }]);
+    expect(JSON.stringify(warnings)).toContain("is on a credential destination host");
+  });
+
+  test("X4: an MCP endpoint that overlaps a service provider's endpoint is dropped in either direction, never thrown", () => {
+    const compiledWith = (oauth: CompiledDesiredPolicy["oauth"]) => ({ oauth } as CompiledDesiredPolicy);
+    const network = validateNetworkPolicy({ hosts: ["auth.example.com"], tokens: {} });
+    const mcp = (registration: { exact?: true; host: string; path: string }) => validateOAuthMediationPolicy({
+      blockedEndpoints: [{ host: "auth.example.com", path: "/oauth/token" }],
+      providers: {
+        "mcp:claude-linear": {
+          kind: "mcp",
+          resourceHost: "mcp.example.com",
+          tokenEndpoints: [{ host: "auth.example.com", path: "/oauth/token" }],
+          registrationEndpoints: [registration],
+          protocolReadEndpoints: [{ host: "auth.example.com", path: "/oauth/token" }, { host: registration.host, path: registration.path }],
+        },
+      },
+    });
+    // The service mediates the exact token endpoint; a prefix registration
+    // endpoint of the MCP server covers the service's token path.
+    const service = compiledWith({ svc: { resourceHost: "api.example.com", tokenEndpoints: [{ host: "auth.example.com", path: "/oauth/token" }] } });
+    const first = reconcileMcpOAuthProvidersForTest(mcp({ host: "auth.example.com", path: "/oauth" }), service, network);
+    expect(first.providers["mcp:claude-linear"]).toMatchObject({ tokenEndpoints: [], registrationEndpoints: [] });
+    expect(first.providers["mcp:claude-linear"]?.protocolReadEndpoints).toBeUndefined();
+    // The service mediates /oauth/token, so it is not blocked; the MCP-only
+    // registration prefix is.
+    expect(first.blockedEndpoints).toEqual([{ host: "auth.example.com", path: "/oauth" }]);
+
+    // The other direction: a service registration prefix covers the MCP endpoint.
+    const prefixService = compiledWith({ svc: { resourceHost: "api.example.com", tokenEndpoints: [], registrationEndpoints: [{ host: "auth.example.com", path: "/register" }] } });
+    const second = reconcileMcpOAuthProvidersForTest(mcp({ exact: true, host: "auth.example.com", path: "/register/client" }), prefixService, network);
+    expect(second.providers["mcp:claude-linear"]?.registrationEndpoints).toEqual([]);
+    expect(second.providers["mcp:claude-linear"]?.tokenEndpoints).toEqual([{ host: "auth.example.com", path: "/oauth/token" }]);
+    expect(second.blockedEndpoints).toContainEqual({ host: "auth.example.com", path: "/register/client" });
+    expect(pendingWarningsForTest().map((event) => event.message).join("\n")).toContain("overlaps service OAuth provider svc's registration endpoint");
+    flushWarnings();
+
+    // No overlap, no change.
+    const clear = reconcileMcpOAuthProvidersForTest(mcp({ host: "auth.example.com", path: "/register" }), compiledWith({ svc: { resourceHost: "api.example.com", tokenEndpoints: [{ host: "other.example.com", path: "/token" }] } }), network);
+    expect(clear.providers["mcp:claude-linear"]?.registrationEndpoints).toEqual([{ host: "auth.example.com", path: "/register" }]);
   });
 
   test("changes generation when a host-only runtime payload changes", () => {
