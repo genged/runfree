@@ -43,13 +43,16 @@ export type CurlProbeOptions = Readonly<{
   /** Retries transient failures; an upstream's 408/429/5xx is retried too. */
   retries?: number;
   insecure?: boolean;
+  /** Where curl saves the response body; discarded by default. */
+  bodyFile?: string;
 }>;
 
 const CODE_MARKER = "runfree-probe-http-code=";
 
 /**
  * A curl command whose output `parseProbeAnswer` reads: the response headers
- * of every response on stdout (the body is discarded), then the final code.
+ * of every response on stdout (the body is discarded unless `bodyFile` names
+ * a file to save it in), then the final code.
  */
 export function curlProbeCommand(url: string, options: CurlProbeOptions): string {
   const flags = ["-sS"];
@@ -60,7 +63,7 @@ export function curlProbeCommand(url: string, options: CurlProbeOptions): string
   const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
   for (const header of options.headers ?? []) flags.push("-H", quote(header));
   if (options.body !== undefined) flags.push("--data-raw", quote(options.body));
-  return `curl ${flags.join(" ")} -D - -o /dev/null -w '\\n${CODE_MARKER}%{http_code}\\n' ${quote(url)}`;
+  return `curl ${flags.join(" ")} -D - -o ${options.bodyFile === undefined ? "/dev/null" : quote(options.bodyFile)} -w '\\n${CODE_MARKER}%{http_code}\\n' ${quote(url)}`;
 }
 
 /**
