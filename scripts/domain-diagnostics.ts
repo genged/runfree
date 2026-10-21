@@ -7,7 +7,7 @@ import { hostRulesCommand, isHttpMethod, normalizeHostname, type PolicyJson } fr
 
 import { remedy } from "../packages/cli/src/remedies.ts";
 
-export type BlockedHostStatus = "missing" | "allowlisted" | "request-shape" | "host-service";
+export type BlockedHostStatus = "missing" | "allowlisted" | "request-shape" | "host-service" | "oauth-endpoint";
 
 export type BlockedHostDiagnostic = {
   host: string;
@@ -46,6 +46,12 @@ export type McpOAuthIssuerDiagnostic = {
 // Shape denials are diagnosed per (host, reason, method) so each distinct
 // denied method gets its own exact widening command.
 const SHAPE_DENIAL_REASONS = new Set(["method-not-allowed", "path-not-allowed", "git-push-denied"]);
+
+// An OAuth grant or client registration request the proxy refused because it
+// does not mediate the endpoint (cross-host token endpoint design, P1-a). The
+// host is allowed, so neither `host add` nor a rule change is the remedy:
+// the MCP server whose login uses it is enabled again, or revoked.
+const OAUTH_ENDPOINT_DENIAL_REASON = "oauth-endpoint-not-mediated";
 
 // Structured `proxy-denial:` event from proxy stdout. Unknown fields are
 // tolerated; only the fields used here are typed.
@@ -179,6 +185,7 @@ type DenialOccurrence = {
   reason?: string;
   method?: string;
   hostServiceReason?: string;
+  oauthEndpoint?: true;
   port?: number;
   mcpOAuthIssuer?: McpOAuthIssuerDiagnostic;
   count: number;
@@ -236,6 +243,10 @@ function denialOccurrencesFromEvents(events: ProxyDenialEvent[]): DenialOccurren
         ...(port !== undefined ? { port } : {}),
         count: suppressed ?? 1,
       });
+      continue;
+    }
+    if (event.reason === OAUTH_ENDPOINT_DENIAL_REASON) {
+      occurrences.push({ host, key: `${host}\0${OAUTH_ENDPOINT_DENIAL_REASON}`, oauthEndpoint: true, count: suppressed ?? 1 });
       continue;
     }
     occurrences.push({
@@ -306,6 +317,16 @@ export function diagnoseBlockedHosts(logs: string, policy: PolicyJson, limit = 5
     const count = counts.get(occurrence.key) ?? 1;
     if (occurrence.hostServiceReason !== undefined) {
       return hostServiceDiagnostic(host, occurrence.hostServiceReason, occurrence.port, count);
+    }
+    if (occurrence.oauthEndpoint) {
+      return {
+        host,
+        status: "oauth-endpoint" as const,
+        reason: OAUTH_ENDPOINT_DENIAL_REASON,
+        command: remedy.hostExplain(host),
+        commandKind: "inspect" as const,
+        count,
+      };
     }
     if (reason !== undefined) {
       return {

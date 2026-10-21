@@ -40,7 +40,7 @@ export const remedy = {
   // `--source project` keeps the command exact when a user or local entry
   // shares the server name.
   mcpEnableProject: (agent: string, server: string): string => `runfree mcp enable ${agent} ${server} --source project`,
-  mcpEnable: (agent: string, server: string, source: string): string => `runfree mcp enable ${agent} ${server} --source ${source}`,
+  mcpEnable: (agent: string, server: string, source?: string): string => `runfree mcp enable ${agent} ${server}${source ? ` --source ${source}` : ""}`,
   // R20: the static-token reclaim path for a project server whose OAuth
   // endpoint is on a well-known host.
   mcpEnableProjectFromEnv: (agent: string, server: string, env: string): string =>
@@ -95,6 +95,7 @@ export function sampleRemedyRenderings(): string[] {
     remedy.serviceExplain("github"),
     remedy.mcpEnableProject("claude", "srv"),
     remedy.mcpEnable("codex", "srv", "user"),
+    remedy.mcpEnable("<agent>", "<server>"),
     remedy.mcpEnableProjectFromEnv("claude", "github", "GITHUB_MCP_TOKEN"),
     remedy.mcpRevoke("claude", "srv"),
     remedy.credentialSetSourceFromEnv("mcp-claude-github-auth", "GITHUB_MCP_TOKEN"),

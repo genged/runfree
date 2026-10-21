@@ -254,6 +254,21 @@ describe("domain diagnostics", () => {
     ]);
   });
 
+  test("an unmediated OAuth endpoint denial is its own diagnosis, never a host add or rule change", () => {
+    const logs = [
+      denialLine({ reason: "oauth-endpoint-not-mediated", host: "ahrefs.com", method: "POST", path: "/oauth/token" }),
+      denialLine({ reason: "oauth-endpoint-not-mediated", host: "ahrefs.com", method: "PUT", path: "/oauth/token", suppressed: 2 }),
+    ].join("\n");
+    expect(diagnoseBlockedHosts(logs, { hosts: ["ahrefs.com"], tokens: {} })).toEqual([{
+      host: "ahrefs.com",
+      status: "oauth-endpoint",
+      reason: "oauth-endpoint-not-mediated",
+      command: "runfree host explain ahrefs.com",
+      commandKind: "inspect",
+      count: 3,
+    }]);
+  });
+
   test("shape events with unvalidatable methods never reach a suggested command", () => {
     const logs = [
       denialLine({ reason: "method-not-allowed", host: "api.github.com", method: "FET[31mCH" }),
