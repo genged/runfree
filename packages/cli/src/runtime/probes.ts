@@ -65,6 +65,7 @@ export const MCP_CALLBACK_BRIDGE_SOURCE = [
   "if (!probeToken || !allowedPeer || !portFile || !Number.isInteger(port)) process.exit(1);",
   "const temporary = `${portFile}.${process.pid}`;",
   "fs.writeFileSync(temporary, `${port}\\n`, { flag: 'wx', mode: 0o644 });",
+  "fs.chmodSync(temporary, 0o644);",
   "fs.renameSync(temporary, portFile);",
   "const peerAddress = (address) => typeof address === 'string' && address.startsWith('::ffff:') ? address.slice(7) : address;",
   "const server = net.createServer((client) => {",

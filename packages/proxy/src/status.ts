@@ -35,6 +35,8 @@ export function writeGenerationStatusFile(
   const tmpPath = `${filePath}.${process.pid}.${Date.now().toString(36)}.tmp`;
   try {
     fs.writeFileSync(tmpPath, serializeGenerationStatus(status), { mode: 0o644 });
+    // The umask masks the create mode; readers under another uid need 0644.
+    fs.chmodSync(tmpPath, 0o644);
     fs.renameSync(tmpPath, filePath);
   } catch (error) {
     fs.rmSync(tmpPath, { force: true });
