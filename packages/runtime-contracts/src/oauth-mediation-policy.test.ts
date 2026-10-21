@@ -216,6 +216,7 @@ describe("cross-host token endpoint contract fields", () => {
   test("absent fields load as empty and leave the provider unchanged", () => {
     const loaded = validate({});
     expect(loaded.recordOnlyHosts).toEqual([]);
+    expect(loaded.recordEndpointHosts).toEqual([]);
     expect(loaded.refusedHosts).toEqual([]);
     expect(loaded.blockedEndpoints).toEqual([]);
     expect(loaded.providers[0].bindingHosts).toEqual([]);
@@ -256,6 +257,7 @@ describe("cross-host token endpoint contract fields", () => {
 
   test("round-trips every new field through the JSON form", () => {
     const loaded = validate({
+      recordEndpointHosts: ["api.ahrefs.com"],
       recordOnlyHosts: ["ahrefs.com"],
       refusedHosts: ["github.com"],
       blockedEndpoints: [{ host: "blocked.example.com", path: "/oauth/token" }],
@@ -299,6 +301,10 @@ describe("cross-host token endpoint contract fields", () => {
     expect(() => validate({ recordOnlyHosts: [host] })).toThrow(message);
   });
 
+  test.each(hostCases)("recordEndpointHosts refuses %s", (_label, host, message) => {
+    expect(() => validate({ recordEndpointHosts: [host] })).toThrow(message);
+  });
+
   test.each(hostCases)("refusedHosts refuses %s", (_label, host, message) => {
     expect(() => validate({ refusedHosts: [host] })).toThrow(message);
   });
@@ -314,6 +320,7 @@ describe("cross-host token endpoint contract fields", () => {
   test.each([
     ["recordOnlyHosts", { recordOnlyHosts: ["a.example.com", "a.example.com"] }, {}, /recordOnlyHosts\[1\] duplicates a\.example\.com/],
     ["refusedHosts", { refusedHosts: ["a.example.com", "a.example.com"] }, {}, /refusedHosts\[1\] duplicates/],
+    ["recordEndpointHosts", { recordEndpointHosts: ["a.example.com", "a.example.com"] }, {}, /recordEndpointHosts\[1\] duplicates/],
     ["bindingHosts", {}, { bindingHosts: ["a.example.com", "a.example.com"] }, /bindingHosts\[1\] duplicates/],
     ["blockedEndpoints", {
       blockedEndpoints: [{ host: "a.example.com", path: "/t" }, { host: "a.example.com", path: "/t" }],
@@ -324,6 +331,7 @@ describe("cross-host token endpoint contract fields", () => {
 
   test.each([
     ["recordOnlyHosts that is not an array", { recordOnlyHosts: "ahrefs.com" }, {}, /recordOnlyHosts must be an array/],
+    ["recordEndpointHosts that is not an array", { recordEndpointHosts: "api.ahrefs.com" }, {}, /recordEndpointHosts must be an array/],
     ["refusedHosts that is not an array", { refusedHosts: { host: "github.com" } }, {}, /refusedHosts must be an array/],
     ["bindingHosts that is not an array", {}, { bindingHosts: "ahrefs.com" }, /bindingHosts must be an array/],
     ["blockedEndpoints that is not an array", { blockedEndpoints: "https://a.example.com/t" }, {}, /blockedEndpoints must be an array/],
@@ -380,6 +388,20 @@ describe("cross-host token endpoint contract fields", () => {
       protocolReadEndpoints: [{ host: "ahrefs.com", path: "/r" }],
     });
     expect(loaded.providers[0].protocolReadEndpoints).toEqual([{ host: "ahrefs.com", path: "/r" }]);
+  });
+
+  test("loads recordEndpointHosts sorted and keeps it out of the JSON form when empty", () => {
+    const loaded = validate({ recordEndpointHosts: ["z.example.com", "api.ahrefs.com"] });
+    expect(loaded.recordEndpointHosts).toEqual(["api.ahrefs.com", "z.example.com"]);
+    expect(oauthMediationPolicyJson(loaded).recordEndpointHosts).toEqual(["api.ahrefs.com", "z.example.com"]);
+    expect("recordEndpointHosts" in oauthMediationPolicyJson(validate({}))).toBe(false);
+  });
+
+  test("refuses a host listed as both record-only and a record endpoint host", () => {
+    expect(() => validate({
+      recordOnlyHosts: ["ahrefs.com", "b.example.com"],
+      recordEndpointHosts: ["api.ahrefs.com", "b.example.com"],
+    })).toThrow(/recordEndpointHosts lists b\.example\.com, which recordOnlyHosts also lists/);
   });
 
   test("refusedHosts exempt only the provider's own resource host", () => {

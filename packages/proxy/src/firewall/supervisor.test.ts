@@ -136,7 +136,7 @@ describe("proxy firewall DNS supervisor", () => {
       },
       networkPolicy,
       networkPolicyPath: "/effective/network-policy.json",
-      oauthPolicy: { blockedEndpoints: [], providers: [], recordOnlyHosts: [], refusedHosts: [] },
+      oauthPolicy: { blockedEndpoints: [], providers: [], recordEndpointHosts: [], recordOnlyHosts: [], refusedHosts: [] },
       oauthPolicyPath: "/effective/oauth-mediation-policy.json",
     };
   }

@@ -72,6 +72,14 @@ export type OAuthProviderPolicyJson = {
  *   prepared server's endpoint host. The proxy refuses an unmediated
  *   OAuth-grant- or registration-shaped request to them before any upstream
  *   connection.
+ * - `recordEndpointHosts`: hosts that an MCP enable record names and that
+ *   also serve a prepared MCP server endpoint, so they are not record-only.
+ *   The proxy applies a narrower request check there: it refuses a request
+ *   whose top-level query or body keys (or each top-level array element's
+ *   keys) are grant- or registration-shaped, so MCP JSON-RPC traffic, whose
+ *   nested `params` and `error` are never scanned, still passes, and it does
+ *   not fail closed on bodies it cannot read. A host is never in both this
+ *   list and `recordOnlyHosts`.
  * - `blockedEndpoints`: exact endpoints that a record names but the
  *   projection does not make static (dropped cross-host claims, refused
  *   declared endpoints, shared drops). The proxy keeps them on the
@@ -95,6 +103,7 @@ export type OAuthProviderPolicyJson = {
 export type OAuthMediationPolicyJson = {
   blockedEndpoints?: OAuthExactEndpointJson[];
   providers: Record<string, OAuthProviderPolicyJson>;
+  recordEndpointHosts?: string[];
   recordOnlyHosts?: string[];
   refusedHosts?: string[];
 };
@@ -133,6 +142,7 @@ export type LoadedOAuthMediationPolicy = {
   blockedEndpoints: OAuthTokenEndpoint[];
   policyPath?: string;
   providers: OAuthProviderPolicy[];
+  recordEndpointHosts: string[];
   recordOnlyHosts: string[];
   refusedHosts: string[];
 };
@@ -613,12 +623,13 @@ export function oauthProviderPolicyJson(provider: OAuthProviderPolicy): OAuthPro
  * Callers that re-emit a loaded policy spread this beside `providers`.
  */
 export function oauthMediationPolicyTopLevelJson(
-  policy: Pick<LoadedOAuthMediationPolicy, "blockedEndpoints" | "recordOnlyHosts" | "refusedHosts">,
+  policy: Pick<LoadedOAuthMediationPolicy, "blockedEndpoints" | "recordEndpointHosts" | "recordOnlyHosts" | "refusedHosts">,
 ): Omit<OAuthMediationPolicyJson, "providers"> {
   return {
     ...(policy.blockedEndpoints.length > 0
       ? { blockedEndpoints: policy.blockedEndpoints.map(({ host, path }) => ({ host, path })) }
       : {}),
+    ...(policy.recordEndpointHosts.length > 0 ? { recordEndpointHosts: [...policy.recordEndpointHosts] } : {}),
     ...(policy.recordOnlyHosts.length > 0 ? { recordOnlyHosts: [...policy.recordOnlyHosts] } : {}),
     ...(policy.refusedHosts.length > 0 ? { refusedHosts: [...policy.refusedHosts] } : {}),
   };
@@ -652,6 +663,14 @@ export function validateOAuthMediationPolicy(raw: unknown, policyPath?: string):
   }
 
   const recordOnlyHosts = storedHostList(issues, "recordOnlyHosts", raw.recordOnlyHosts);
+  const recordEndpointHosts = storedHostList(issues, "recordEndpointHosts", raw.recordEndpointHosts);
+  // The two lists select different request checks for one host; a host in
+  // both means the projection disagrees with itself about whether the host
+  // serves an MCP endpoint.
+  const recordOnly = new Set(recordOnlyHosts);
+  for (const host of recordEndpointHosts) {
+    if (recordOnly.has(host)) issues.push(`recordEndpointHosts lists ${host}, which recordOnlyHosts also lists`);
+  }
   const refusedHosts = storedHostList(issues, "refusedHosts", raw.refusedHosts);
   const blockedEndpoints = storedExactEndpointList(issues, "blockedEndpoints", raw.blockedEndpoints);
 
@@ -660,6 +679,7 @@ export function validateOAuthMediationPolicy(raw: unknown, policyPath?: string):
     blockedEndpoints,
     ...(policyPath !== undefined ? { policyPath } : {}),
     providers,
+    recordEndpointHosts,
     recordOnlyHosts,
     refusedHosts,
   };
