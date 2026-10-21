@@ -9,6 +9,10 @@
 // validate every record; an invalid record grants nothing. The next write
 // (enable or revoke) keeps only the valid records, which reclaims a corrupt
 // file without widening anything.
+//
+// The file also holds the sticky owner of each MCP share group (R16): one
+// server enabled for several agents is captured by exactly one owner
+// provider, chosen when the group first forms and kept while it is a member.
 
 import fs from "node:fs";
 import path from "node:path";
@@ -32,10 +36,17 @@ export const MCP_ENABLED_LIMITS = Object.freeze({
 
 export type McpEnabledHostOrigin = "discovered" | "user";
 
+export type McpCrossHostKind = "token" | "registration";
+
 export type McpEnabledHost = {
   host: string;
   origin: McpEnabledHostOrigin;
   evidence?: string[];
+  // Provenance (X3, Q3): a discovered host outside the server's binding set
+  // that serves the token endpoint (and possibly an exact registration
+  // endpoint) its metadata named. Discovered hosts only.
+  crossHost?: true;
+  crossHostKinds?: McpCrossHostKind[];
 };
 
 export type McpEnabledEndpointKind = "metadata" | "token" | "registration";
@@ -47,6 +58,9 @@ export type McpEnabledEndpoint = {
   kind: McpEnabledEndpointKind;
   host: string;
   path: string;
+  // A cross-host registration endpoint (Q8): the proxy matches it by exact
+  // path, not by prefix. Registration endpoints on a cross-host host only.
+  exact?: true;
 };
 
 export type McpEnabledRecord = {
@@ -60,10 +74,19 @@ export type McpEnabledRecord = {
   oauthEndpoints?: McpEnabledEndpoint[];
 };
 
+// Keyed by the share group digest (`mcpShareGroupDigest`). `released` is set
+// by `mcp revoke` of the owner: the next projection moves ownership to
+// another member and clears every member's OAuth state.
+export type McpShareGroupState = {
+  owner: string;
+  released?: true;
+};
+
 export type McpEnabledFile = {
   schemaVersion: 1;
   projectHash: string;
   records: Record<string, McpEnabledRecord>;
+  shareGroups?: Record<string, McpShareGroupState>;
 };
 
 export type McpEnabledRead = {
@@ -75,11 +98,14 @@ export type McpEnabledRead = {
 };
 
 const RECORD_KEYS = new Set(["schemaVersion", "identity", "agent", "source", "server", "enabledAt", "oauthHosts", "oauthEndpoints"]);
-const HOST_KEYS = new Set(["host", "origin", "evidence"]);
-const ENDPOINT_KEYS = new Set(["kind", "host", "path"]);
+const HOST_KEYS = new Set(["host", "origin", "evidence", "crossHost", "crossHostKinds"]);
+const ENDPOINT_KEYS = new Set(["kind", "host", "path", "exact"]);
 // Evidence and paths are rendered to the terminal: printable ASCII only.
 const PRINTABLE_ASCII = /^[\x20-\x7e]*$/;
-const FILE_KEYS = new Set(["schemaVersion", "projectHash", "records"]);
+const FILE_KEYS = new Set(["schemaVersion", "projectHash", "records", "shareGroups"]);
+const SHARE_GROUP_KEY = /^[a-f0-9]{64}$/;
+const SHARE_GROUP_OWNER = /^mcp:[a-z0-9_-]+$/;
+const CROSS_HOST_KINDS: readonly McpCrossHostKind[] = ["registration", "token"];
 
 export function mcpEnabledPath(stateDir: string): string {
   return path.join(stateDir, MCP_ENABLED_FILE);
@@ -112,10 +138,19 @@ function validHost(value: unknown): McpEnabledHost | undefined {
       if (typeof line !== "string" || line.length > MCP_ENABLED_LIMITS.maxEvidenceChars || !PRINTABLE_ASCII.test(line)) return undefined;
     }
   }
+  // Cross-host provenance: discovered hosts only, with a sorted, non-empty,
+  // duplicate-free list of the endpoint kinds the host serves.
+  if (value.crossHost !== undefined || value.crossHostKinds !== undefined) {
+    if (value.crossHost !== true || value.origin !== "discovered") return undefined;
+    const kinds = value.crossHostKinds;
+    if (!Array.isArray(kinds) || kinds.length === 0) return undefined;
+    if (!kinds.every((kind, index) => CROSS_HOST_KINDS.includes(kind as McpCrossHostKind) && (index === 0 || (kinds[index - 1] as string) < (kind as string)))) return undefined;
+  }
   return {
     host: value.host,
     origin: value.origin,
     ...(value.evidence !== undefined ? { evidence: [...value.evidence as string[]] } : {}),
+    ...(value.crossHost === true ? { crossHost: true as const, crossHostKinds: [...value.crossHostKinds as McpCrossHostKind[]] } : {}),
   };
 }
 
@@ -126,7 +161,8 @@ function validEndpoint(value: unknown): McpEnabledEndpoint | undefined {
   // The same predicate discovery filters with, so every reviewed endpoint can
   // be saved and nothing else can be read back.
   if (!isRecordableEndpoint(value.kind, value.host, value.path)) return undefined;
-  return { kind: value.kind, host: value.host, path: value.path };
+  if (value.exact !== undefined && (value.exact !== true || value.kind !== "registration")) return undefined;
+  return { kind: value.kind, host: value.host, path: value.path, ...(value.exact === true ? { exact: true as const } : {}) };
 }
 
 /** Validate a record before it is shown for approval or saved. */
@@ -154,10 +190,25 @@ function validRecord(key: string, value: unknown): McpEnabledRecord | undefined 
     for (const entry of value.oauthEndpoints) {
       const endpoint = validEndpoint(entry);
       if (!endpoint) return undefined;
-      if (!endpoints.some((existing) => existing.kind === endpoint.kind && existing.host === endpoint.host && existing.path === endpoint.path)) {
-        endpoints.push(endpoint);
-      }
+      const existing = endpoints.find((other) => other.kind === endpoint.kind && other.host === endpoint.host && other.path === endpoint.path);
+      // One endpoint listed both exact and by prefix is a conflict, as in the
+      // OAuth mediation contract.
+      if (existing && existing.exact !== endpoint.exact) return undefined;
+      if (!existing) endpoints.push(endpoint);
     }
+  }
+  // Every cross-host host lists the kinds it serves, and an exact
+  // registration endpoint sits only on a cross-host host that lists it.
+  for (const host of hosts) {
+    if (!host.crossHost) continue;
+    for (const kind of host.crossHostKinds ?? []) {
+      if (!endpoints.some((endpoint) => endpoint.host === host.host && endpoint.kind === kind)) return undefined;
+    }
+  }
+  for (const endpoint of endpoints) {
+    if (!endpoint.exact) continue;
+    const host = hosts.find((entry) => entry.host === endpoint.host);
+    if (!host?.crossHost || !host.crossHostKinds?.includes("registration")) return undefined;
   }
   return {
     schemaVersion: 1,
@@ -224,18 +275,44 @@ export function readMcpEnabled(projectRoot: string, filePath: string | undefined
       : "unknown server";
     report(`mcp: ignored an invalid MCP enable record (${label}); its OAuth hosts are not applied; remove it with runfree mcp revoke or re-run runfree mcp enable`);
   }
-  return { file: { schemaVersion: 1, projectHash: projectHash(projectRoot), records }, invalidRecords, malformed: false };
+  const shareGroups = validShareGroups(parsed.shareGroups);
+  return {
+    file: {
+      schemaVersion: 1,
+      projectHash: projectHash(projectRoot),
+      records,
+      ...(Object.keys(shareGroups).length > 0 ? { shareGroups } : {}),
+    },
+    invalidRecords,
+    malformed: false,
+  };
+}
+
+// Share group owners. An invalid entry is dropped on its own: the group then
+// forms again at the next projection, which clears its OAuth state (a new
+// login), so a corrupt entry never keeps a stale owner.
+function validShareGroups(value: unknown): Record<string, McpShareGroupState> {
+  const groups: Record<string, McpShareGroupState> = {};
+  if (!isRecord(value)) return groups;
+  for (const [key, entry] of Object.entries(value)) {
+    if (!SHARE_GROUP_KEY.test(key) || !isRecord(entry) || !onlyKeys(entry, new Set(["owner", "released"]))) continue;
+    if (typeof entry.owner !== "string" || !SHARE_GROUP_OWNER.test(entry.owner)) continue;
+    if (entry.released !== undefined && entry.released !== true) continue;
+    groups[key] = { owner: entry.owner, ...(entry.released === true ? { released: true as const } : {}) };
+  }
+  return groups;
 }
 
 // --- Projection --------------------------------------------------------------
 
 type OAuthEndpointJson = string | { host: string; path: string };
+type OAuthRegistrationEndpointJson = string | { exact?: true; host: string; path: string };
 
 export type EnabledOAuthPolicyTarget = {
   resourceHost: string;
   oauth?: { authServerMetadataUrl?: string };
   tokenEndpoints?: OAuthEndpointJson[];
-  registrationEndpoints?: OAuthEndpointJson[];
+  registrationEndpoints?: OAuthRegistrationEndpointJson[];
 };
 
 function endpointHost(endpoint: OAuthEndpointJson): string | undefined {
@@ -247,7 +324,7 @@ function endpointHost(endpoint: OAuthEndpointJson): string | undefined {
   }
 }
 
-function hasEndpoint(list: OAuthEndpointJson[], host: string, pathName: string): boolean {
+function hasEndpoint(list: OAuthRegistrationEndpointJson[], host: string, pathName: string): boolean {
   return list.some((entry) => typeof entry !== "string" && entry.host === host && entry.path === pathName);
 }
 
@@ -279,10 +356,12 @@ export function projectEnabledOAuthEndpoints(policy: EnabledOAuthPolicyTarget, r
     if (host) bound.add(host);
   }
   // Endpoints come only from discovery, which accepted them only on the
-  // resource host, declared hosts, or issuer hosts the resource metadata named
-  // (all of which are recorded hosts or the resource host). A `user` host
-  // (`--oauth-host`) adds no endpoint: a token endpoint there is not mediated,
-  // so its token response reaches the agent unchanged.
+  // resource host, declared hosts, issuer hosts the resource metadata named,
+  // user hosts, or a cross-host token host (all of which are recorded hosts
+  // or the resource host). An endpoint on a user host (`--oauth-host`) that
+  // discovery did not record is not static: the proxy binds it when the
+  // server's own metadata names it there (`bindingHosts`), and otherwise
+  // refuses a token request to it while only MCP records allow the host.
   for (const host of record.oauthHosts) bound.add(host.host);
   for (const endpoint of record.oauthEndpoints ?? []) {
     if (!bound.has(endpoint.host)) continue;
@@ -291,7 +370,9 @@ export function projectEnabledOAuthEndpoints(policy: EnabledOAuthPolicyTarget, r
       if (!hasEndpoint(policy.tokenEndpoints, endpoint.host, endpoint.path)) policy.tokenEndpoints.push({ host: endpoint.host, path: endpoint.path });
     } else if (endpoint.kind === "registration") {
       policy.registrationEndpoints ??= [];
-      if (!hasEndpoint(policy.registrationEndpoints, endpoint.host, endpoint.path)) policy.registrationEndpoints.push({ host: endpoint.host, path: endpoint.path });
+      if (!hasEndpoint(policy.registrationEndpoints, endpoint.host, endpoint.path)) {
+        policy.registrationEndpoints.push({ ...(endpoint.exact ? { exact: true as const } : {}), host: endpoint.host, path: endpoint.path });
+      }
     } else {
       continue;
     }
@@ -303,7 +384,8 @@ export function projectEnabledOAuthEndpoints(policy: EnabledOAuthPolicyTarget, r
 }
 
 export type EnabledEndpointClaimant = {
-  // Unique per prepared server (agent, source, name).
+  // Unique per claimant: a prepared server, or one share group (R16), whose
+  // members count as one claimant.
   serverKey: string;
   // Shown in the warning.
   label: string;
@@ -378,7 +460,9 @@ export function withoutSharedEnabledEndpoints(claimants: readonly EnabledEndpoin
 const OAUTH_HOST_METHODS = ["GET", "HEAD", "OPTIONS", "POST"] as const;
 
 /**
- * Add each record's OAuth hosts to the host-only effective policy copy.
+ * Add each record's OAuth hosts to the host-only effective policy copy, and
+ * return the hosts this added: hosts nothing but these records allows (the
+ * input for `recordOnlyHosts`, R6).
  *
  * A host that the policy already allows (desired policy, a service, or an MCP
  * endpoint projection) keeps its existing rules untouched. A host only records
@@ -391,7 +475,7 @@ const OAUTH_HOST_METHODS = ["GET", "HEAD", "OPTIONS", "POST"] as const;
 export function projectEnabledOAuthHosts(
   policy: { hosts?: string[]; requests?: Record<string, { methods?: string[]; pathPrefixes?: string[] }> },
   records: readonly McpEnabledRecord[],
-): void {
+): string[] {
   const existing = new Set(policy.hosts ?? []);
   const broad = new Set<string>();
   const paths = new Map<string, Set<string>>();
@@ -406,7 +490,7 @@ export function projectEnabledOAuthHosts(
       paths.set(host.host, set);
     }
   }
-  if (paths.size === 0) return;
+  if (paths.size === 0) return [];
   policy.hosts = [...new Set([...(policy.hosts ?? []), ...paths.keys()])].sort((left, right) => left.localeCompare(right));
   for (const [host, set] of paths) {
     if (broad.has(host)) continue;
@@ -416,6 +500,7 @@ export function projectEnabledOAuthHosts(
       pathPrefixes: [...set].sort(),
     };
   }
+  return [...paths.keys()].sort();
 }
 
 function writeMcpEnabled(projectRoot: string, filePath: string, file: McpEnabledFile): void {
@@ -436,6 +521,8 @@ export type McpEnabledWriteResult = {
   droppedInvalid: number;
   // Records this write removed.
   removed: McpEnabledRecord[];
+  // Share groups whose stored owner this write cleared.
+  clearedOwners?: number;
 };
 
 /**
@@ -459,13 +546,15 @@ export function saveMcpEnabledRecord(projectRoot: string, filePath: string, reco
 }
 
 /**
- * Remove every record for an agent and server (optionally one source). Writes
- * only when something changes, including dropping invalid records.
+ * Remove every record for an agent and server (optionally one source), and
+ * release every share group that one of `clearOwners` owns (so ownership
+ * moves at the next projection, R16). Writes only when something changes,
+ * including dropping invalid records.
  */
 export function removeMcpEnabledRecords(
   projectRoot: string,
   filePath: string,
-  target: { agent: McpAgent; server: string; source?: McpSourceScope },
+  target: { agent: McpAgent; server: string; source?: McpSourceScope; clearOwners?: readonly string[] },
 ): McpEnabledWriteResult {
   const current = readMcpEnabled(projectRoot, filePath, { quiet: true });
   const removed: McpEnabledRecord[] = [];
@@ -475,8 +564,45 @@ export function removeMcpEnabledRecords(
       delete current.file.records[key];
     }
   }
-  if (removed.length > 0 || current.invalidRecords > 0 || current.malformed) {
+  let clearedOwners = 0;
+  for (const group of Object.values(current.file.shareGroups ?? {})) {
+    if (target.clearOwners?.includes(group.owner) && !group.released) {
+      group.released = true;
+      clearedOwners += 1;
+    }
+  }
+  if (removed.length > 0 || clearedOwners > 0 || current.invalidRecords > 0 || current.malformed) {
     writeMcpEnabled(projectRoot, filePath, current.file);
   }
-  return { droppedInvalid: current.invalidRecords, removed };
+  return { droppedInvalid: current.invalidRecords, removed, clearedOwners };
+}
+
+/**
+ * Store the share group owners a projection settled on. Writes only when they
+ * changed, and never over a file that did not read cleanly (that file grants
+ * nothing until enable or revoke reclaims it). Only the owners change: the
+ * records, including any invalid one, stay exactly as they are, so enable
+ * and revoke remain the only reclaim path and report what they drop.
+ */
+export function saveMcpShareGroups(
+  projectRoot: string,
+  filePath: string,
+  groups: Record<string, McpShareGroupState>,
+): boolean {
+  const current = readMcpEnabled(projectRoot, filePath, { quiet: true });
+  if (current.malformed) return false;
+  const next = Object.fromEntries(Object.entries(groups).sort(([left], [right]) => left.localeCompare(right)));
+  if (JSON.stringify(current.file.shareGroups ?? {}) === JSON.stringify(next)) return false;
+  let raw: Record<string, unknown>;
+  try {
+    // readMcpEnabled just validated the file's shape (or found none).
+    raw = JSON.parse(fs.readFileSync(filePath, "utf8")) as Record<string, unknown>;
+  } catch (error) {
+    if (!(error && typeof error === "object" && "code" in error && error.code === "ENOENT")) throw error;
+    raw = { ...current.file };
+  }
+  if (Object.keys(next).length > 0) raw.shareGroups = next;
+  else delete raw.shareGroups;
+  writeMcpEnabled(projectRoot, filePath, raw as McpEnabledFile);
+  return true;
 }
