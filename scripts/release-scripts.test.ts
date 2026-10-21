@@ -12,6 +12,10 @@ const expectedIdentifier = childProcess
   .execFileSync(path.join(repoRoot, "scripts", "macos-code-signing.sh"), ["identifier"], { encoding: "utf8" })
   .trim();
 
+// The fake PATH Bun reports the declared version, so `./bunw` takes its fast
+// path and runs it.
+const declaredBunVersion = fs.readFileSync(path.join(repoRoot, ".bun-version"), "utf8").trim();
+
 let tmp: string;
 let fakeBin: string;
 let artifactDir: string;
@@ -30,7 +34,7 @@ printf '0.1.0'
   writeExecutable(path.join(fakeBin, "bun"), `#!/usr/bin/env bash
 set -euo pipefail
 if [ "\${1:-}" = "--version" ]; then
-  printf '%s\\n' "\${RUNFREE_FAKE_BUN_VERSION:-\${RUNFREE_BUN_VERSION:-1.3.14}}"
+  printf '%s\\n' "\${RUNFREE_FAKE_BUN_VERSION:-${declaredBunVersion}}"
   exit 0
 fi
 printf '%s\\n' "$*" >> "$RUNFREE_FAKE_LOG"
@@ -248,15 +252,20 @@ describe("release packaging scripts", () => {
     expect(log).toMatch(/-czf .*runfree-0\.1\.0-darwin-arm64\.tar\.gz runfree LICENSE NOTICE/);
   });
 
-  test("package script verifies pinned Bun version when release CI sets one", () => {
+  test("package script refuses a PATH Bun other than the declared one when bunw cannot download", () => {
+    const emptyCache = path.join(tmp, "bun-cache");
     const result = runScript("scripts/package-homebrew-artifacts.sh", ["darwin-arm64"], {
-      RUNFREE_FAKE_BUN_VERSION: "1.3.14",
-      RUNFREE_BUN_VERSION: "1.3.15",
+      RUNFREE_FAKE_BUN_VERSION: "1.3.15",
+      RUNFREE_BUN_CACHE: emptyCache,
+      // Nothing listens on port 9 here, so the download fails at once.
+      RUNFREE_BUN_REGISTRY: "http://127.0.0.1:9",
       RUNFREE_SKIP_CHECKSUM: "1",
     });
 
     expect(result.status).not.toBe(0);
-    expect(result.stderr).toContain("bun version mismatch: expected 1.3.15, got 1.3.14");
+    expect(result.stderr).toContain("bunw: no Bun was run.");
+    expect(fs.existsSync(fakeLog) ? fs.readFileSync(fakeLog, "utf8") : "").not.toMatch(/^build /m);
+    expect(fs.existsSync(path.join(artifactDir, "runfree-0.1.0-darwin-arm64.tar.gz"))).toBe(false);
   });
 
   test("checksum script hashes only the advertised release tarballs", () => {

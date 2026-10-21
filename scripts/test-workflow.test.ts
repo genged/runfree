@@ -71,8 +71,27 @@ describe("verification lane", () => {
     expect(bunSetupIndex).toBeGreaterThan(pnpmIndex);
     expect(installIndex).toBeGreaterThan(bunSetupIndex);
     expect(buildIndex).toBeGreaterThan(installIndex);
-    expect(workflow).toContain("RUNFREE_BUN_VERSION: 1.3.14");
     expect(workflow).toContain("RUNFREE_PNPM_VERSION: 10.28.0");
+  });
+
+  // `.bun-version` is the one declaration of the Bun that builds the binaries;
+  // `./bunw` reads the same file locally, so CI and local builds cannot drift.
+  test.each([".github/workflows/verify.yml", ".github/workflows/release-lane.yml"])(
+    "%s reads Bun from .bun-version and prints its revision",
+    (workflowPath) => {
+      const lane = readRepoFile(workflowPath);
+      const setupIndex = lane.indexOf("uses: oven-sh/setup-bun@");
+
+      expect(lane).toContain("bun-version-file: .bun-version");
+      expect(lane).not.toContain("bun-version:");
+      expect(lane).not.toContain("RUNFREE_BUN_VERSION");
+      expect(setupIndex).toBeGreaterThanOrEqual(0);
+      expect(lane.indexOf("run: bun --revision")).toBeGreaterThan(setupIndex);
+    },
+  );
+
+  test(".bun-version holds one X.Y.Z version", () => {
+    expect(readRepoFile(".bun-version")).toMatch(/^\d+\.\d+\.\d+\n$/);
   });
 
   test("stays unprivileged, because it runs on pull requests from forks", () => {

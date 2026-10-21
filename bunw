@@ -1,0 +1,151 @@
+#!/bin/sh
+# Run the Bun version declared in .bun-version, whatever Bun is on PATH.
+#
+#   ./bunw <bun args>          run the declared Bun with PATH starting at its dir
+#   ./bunw --print-bin-dir     print the directory that holds the declared Bun
+#
+# A PATH Bun that already reports the declared version is used as is (CI gets
+# it from setup-bun). Otherwise the binary comes from a per-user cache, filled
+# on first use from the npm package @oven/bun-<platform>, after its sha512 is
+# compared with the registry integrity value. This never falls back to another
+# Bun, never installs Bun globally, and never writes inside the repository.
+#
+# Environment:
+#   RUNFREE_BUN_CACHE     cache root (default ${XDG_CACHE_HOME:-$HOME/.cache}/runfree-dev/bun)
+#   RUNFREE_BUN_REGISTRY  npm registry (default https://registry.npmjs.org)
+set -eu
+
+say() { printf 'bunw: %s\n' "$*" >&2; }
+die() { say "$@"; exit 1; }
+
+repo_root="$(cd -P "$(dirname "$0")" && pwd)"
+version_file="${repo_root}/.bun-version"
+
+# 1. The declared version. Only X.Y.Z is accepted; nothing is guessed.
+[ -f "${version_file}" ] || die "cannot read ${version_file}"
+version="$(cat "${version_file}")"
+case "${version}" in
+  *[!0-9.]*) version_ok=0 ;;
+  *) version_ok=1 ;;
+esac
+if [ "${version_ok}" = 0 ] || ! printf '%s\n' "${version}" | grep -Eqx '[0-9]+\.[0-9]+\.[0-9]+'; then
+  die "${version_file} must hold one version X.Y.Z and a newline, found '${version}'"
+fi
+
+print_bin_dir=0
+if [ "$#" -eq 1 ] && [ "$1" = --print-bin-dir ]; then
+  print_bin_dir=1
+  shift
+fi
+
+# 5. Print the directory, or run the Bun in it with that directory first on
+# PATH. Arguments are the Bun arguments; $run_dir names the directory.
+run() {
+  if [ "${print_bin_dir}" = 1 ]; then
+    printf '%s\n' "${run_dir}"
+    exit 0
+  fi
+  PATH="${run_dir}:${PATH}"
+  export PATH
+  exec "${run_dir}/bun" "$@"
+}
+
+# 2. Fast path: the PATH Bun is already the declared version.
+if path_bun="$(command -v bun 2>/dev/null)" && [ -n "${path_bun}" ] \
+  && [ "$("${path_bun}" --version 2>/dev/null || true)" = "${version}" ]; then
+  run_dir="$(cd -P "$(dirname "${path_bun}")" && pwd)"
+  run "$@"
+fi
+
+# 3. The cache.
+case "$(uname -s)" in
+  Darwin) os=darwin ;;
+  Linux) os=linux ;;
+  *) die "no Bun package for this system: $(uname -s) $(uname -m)" ;;
+esac
+case "$(uname -m)" in
+  arm64 | aarch64) arch=aarch64 ;;
+  x86_64 | amd64) arch=x64 ;;
+  *) die "no Bun package for this system: $(uname -s) $(uname -m)" ;;
+esac
+platform="${os}-${arch}"
+if [ "${os}" = linux ]; then
+  for loader in /lib/ld-musl-*; do
+    [ -e "${loader}" ] && platform="${platform}-musl"
+    break
+  done
+fi
+
+cache_root="${RUNFREE_BUN_CACHE:-${XDG_CACHE_HOME:-${HOME}/.cache}/runfree-dev/bun}"
+bin_dir="${cache_root}/${version}/${platform}/bin"
+if [ -x "${bin_dir}/bun" ]; then
+  run_dir="${bin_dir}"
+  run "$@"
+fi
+
+# 4. Download on a cache miss.
+for tool in curl tar openssl base64; do
+  command -v "${tool}" >/dev/null 2>&1 || die "${tool} is required to download Bun ${version}"
+done
+
+registry="${RUNFREE_BUN_REGISTRY:-https://registry.npmjs.org}"
+registry="${registry%/}"
+package="@oven/bun-${platform}"
+doc_url="${registry}/${package}/${version}"
+say "Bun ${version} is not in ${cache_root}. Downloading ${package}@${version} from ${registry}"
+
+mkdir -p "${cache_root}"
+work="$(mktemp -d "${cache_root}/.download.XXXXXX")"
+trap 'rm -rf "${work}"' EXIT
+trap 'exit 1' HUP INT TERM
+
+fetch() {
+  # $1 URL, $2 output file
+  status=0
+  curl -fsSL --retry 2 -o "$2" "$1" 2>"${work}/curl.err" || status=$?
+  if [ "${status}" -ne 0 ]; then
+    detail="$(head -n 1 "${work}/curl.err" | sed 's/^curl: ([0-9]*) //')"
+    say "cannot read $1: curl exit ${status}${detail:+ (${detail})}"
+    die "no Bun was run. Connect to the network, or put Bun ${version} first on PATH."
+  fi
+}
+
+fetch "${doc_url}" "${work}/doc.json"
+tarball_url="$(grep -o '"tarball" *: *"[^"]*"' "${work}/doc.json" | sed 's/.*: *"\(.*\)"/\1/')"
+integrity="$(grep -o '"integrity" *: *"sha512-[^"]*"' "${work}/doc.json" | sed 's/.*: *"sha512-\(.*\)"/\1/')"
+[ "$(printf '%s\n' "${tarball_url}" | grep -c .)" = 1 ] \
+  || die "${doc_url} does not name exactly one tarball for ${package}@${version}"
+[ "$(printf '%s\n' "${integrity}" | grep -c .)" = 1 ] \
+  || die "${doc_url} does not give exactly one sha512 integrity value for ${package}@${version}"
+
+fetch "${tarball_url}" "${work}/bun.tgz"
+actual="$(openssl dgst -sha512 -binary "${work}/bun.tgz" | base64 | tr -d '\n')"
+if [ "${actual}" != "${integrity}" ]; then
+  say "sha512 of ${tarball_url} does not match the registry integrity value"
+  say "  registry: sha512-${integrity}"
+  say "  download: sha512-${actual}"
+  die "no Bun was run."
+fi
+say "sha512 matches the registry integrity value"
+
+mkdir "${work}/x"
+tar -xzf "${work}/bun.tgz" -C "${work}/x" package/bin/bun \
+  || die "${tarball_url} does not hold package/bin/bun"
+candidate="${work}/x/package/bin/bun"
+chmod 755 "${candidate}"
+reported="$("${candidate}" --version 2>/dev/null || true)"
+[ "${reported}" = "${version}" ] \
+  || die "the downloaded ${package}@${version} reports version '${reported}'; no Bun was run."
+revision="$("${candidate}" --revision 2>/dev/null || true)"
+
+# Rename the checked file, not a directory, so a concurrent install that won
+# the race is replaced by an identical file instead of failing or nesting.
+mkdir -p "${bin_dir}"
+mv -f "${candidate}" "${bin_dir}/bun"
+say "installed Bun ${version} (revision ${revision:-unknown}) at ${bin_dir}/bun"
+
+# exec skips the EXIT trap, so the download directory goes first.
+rm -rf "${work}"
+trap - EXIT
+run_dir="${bin_dir}"
+run "$@"

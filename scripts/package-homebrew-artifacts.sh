@@ -40,20 +40,12 @@ for target in "${targets[@]}"; do
   fi
 done
 
-for command in node bun tar; do
+for command in node tar; do
   if ! command -v "${command}" >/dev/null 2>&1; then
     printf 'missing required command: %s\n' "${command}" >&2
     exit 1
   fi
 done
-
-if [ -n "${RUNFREE_BUN_VERSION:-}" ]; then
-  actual_bun_version="$(bun --version)"
-  if [ "${actual_bun_version}" != "${RUNFREE_BUN_VERSION}" ]; then
-    printf 'bun version mismatch: expected %s, got %s\n' "${RUNFREE_BUN_VERSION}" "${actual_bun_version}" >&2
-    exit 1
-  fi
-fi
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 version="$(
@@ -99,7 +91,8 @@ for target in "${targets[@]}"; do
   bun_cwd="$(mktemp -d)"
   if ! (
     cd "${bun_cwd}"
-    bun build "${repo_root}/packages/cli/src/cli.ts" \
+    # bunw runs the Bun in .bun-version and refuses any other.
+    "${repo_root}/bunw" build "${repo_root}/packages/cli/src/cli.ts" \
       --compile \
       --target "bun-${target}" \
       --outfile "${binary}"

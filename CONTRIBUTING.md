@@ -20,11 +20,15 @@ pnpm install --frozen-lockfile
 | --- | --- | --- |
 | Node | 22 | Everything |
 | pnpm | 10.28.0 | Everything. Do not substitute another package manager. |
-| Bun | 1.3.14 | `pnpm run build:bin` and release packaging |
 | Docker | Docker Desktop with Compose | The live runtime and packaged live tests only |
 
-Bun is easy to miss: the source build works without it right up until
-`pnpm run build:bin`, which runs `bun build --compile`.
+You do not need to install Bun. `pnpm run build:bin`, the test bundles, and
+release packaging run Bun through `./bunw`, which uses the version in
+`.bun-version`. If the `bun` on your PATH reports a different version, `./bunw`
+downloads the declared one from npm on first use, checks its sha512 against the
+registry, and caches it in `~/.cache/runfree-dev/bun` (set `RUNFREE_BUN_CACHE`
+to move it). The download needs `curl`, `tar`, `openssl`, and `base64`. To
+change the Bun version, edit `.bun-version`; CI reads the same file.
 
 Unit tests and static checks do not need Docker.
 

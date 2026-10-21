@@ -23,7 +23,6 @@ permissions:
   contents: read
 
 env:
-  RUNFREE_BUN_VERSION: 1.3.14
   RUNFREE_PNPM_VERSION: 10.28.0
 
 jobs:
@@ -58,7 +57,12 @@ jobs:
       - name: Set up Bun
         uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
-          bun-version: ${{ env.RUNFREE_BUN_VERSION }}
+          bun-version-file: .bun-version
+
+      # setup-bun downloads a GitHub release zip and ./bunw an npm tarball;
+      # print the build so a reader can compare the two logs.
+      - name: Print Bun revision
+        run: bun --revision
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile

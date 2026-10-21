@@ -17,8 +17,10 @@ function build(): number {
   const buildCwd = fs.mkdtempSync(path.join(os.tmpdir(), "runfree-bun-build-"));
   try {
     fs.mkdirSync(path.join(repoRoot, "dist"), { recursive: true });
+    // `bunw` runs the Bun in `.bun-version`, downloading it on first use, and
+    // fails rather than fall back to whatever Bun is on PATH.
     const status = run(
-      "bun",
+      path.join(repoRoot, "bunw"),
       ["build", path.join(repoRoot, "packages", "cli", "src", "cli.ts"), "--compile", "--outfile", binary],
       { cwd: buildCwd },
     );

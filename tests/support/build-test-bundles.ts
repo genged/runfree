@@ -4,7 +4,9 @@
 //
 // Bun is the same bundler `pnpm build:bin` compiles the shipped binary with, so
 // the bundles exercise the release compilation path more closely than tsx did.
-// Without Bun on PATH this deletes any leftover bundles and returns: the
+// The Bun is the one `./bunw` provides (the version in `.bun-version`), never
+// whatever Bun is on PATH. When `./bunw` cannot provide it (offline with an
+// empty cache, say) this deletes any leftover bundles and returns: the
 // harnesses fall back to tsx spawns, and correctness does not depend on Bun.
 
 import childProcess from "node:child_process";
@@ -84,19 +86,27 @@ export const LIVE_BUNDLES: readonly BundleSpec[] = [
   { entry: SESSION_ADMISSION_MATRIX_ENTRY_SOURCE, outfile: SESSION_ADMISSION_MATRIX_BUNDLE_PATH, external: [] },
 ];
 
-function bunAvailable(): boolean {
-  const probe = childProcess.spawnSync("bun", ["--version"], { stdio: "ignore" });
-  return !probe.error && probe.status === 0;
+const BUNW_PATH = path.join(repoRoot, "bunw");
+
+export type BunResolution = Readonly<{ bun: string }> | Readonly<{ unavailable: string }>;
+
+/** The declared Bun, through `bunw --print-bin-dir`; never the PATH Bun. */
+export function resolveDeclaredBun(bunw: string = BUNW_PATH): BunResolution {
+  const probe = childProcess.spawnSync(bunw, ["--print-bin-dir"], { encoding: "utf8" });
+  const binDir = probe.stdout?.trim() ?? "";
+  if (!probe.error && probe.status === 0 && binDir !== "") return { bun: path.join(binDir, "bun") };
+  const firstLine = probe.stderr?.split("\n").find((line) => line.trim() !== "");
+  return { unavailable: firstLine?.trim() ?? String(probe.error ?? `exit ${probe.status}`) };
 }
 
-function buildBundle(entry: string, outfile: string, external: readonly string[]): void {
+function buildBundle(bun: string, entry: string, outfile: string, external: readonly string[]): void {
   fs.mkdirSync(path.dirname(outfile), { recursive: true });
   // Build to a temporary name and rename into place: a concurrently running
   // Vitest invocation spawning the bundle must see the previous complete file
   // or the new one, never a partial write.
   const staging = `${outfile}.building-${process.pid}`;
   const result = childProcess.spawnSync(
-    "bun",
+    bun,
     [
       "build",
       entry,
@@ -110,9 +120,9 @@ function buildBundle(entry: string, outfile: string, external: readonly string[]
   );
   if (result.error || result.status !== 0) {
     fs.rmSync(staging, { force: true });
-    // Bun is present but cannot bundle the entry. Fail the run instead of
-    // silently falling back: the release binary is built the same way, so this
-    // is a real breakage worth surfacing here.
+    // The declared Bun is present but cannot bundle the entry. Fail the run
+    // instead of silently falling back: the release binary is built the same
+    // way, so this is a real breakage worth surfacing here.
     throw new Error(
       `test bundle build failed for ${path.relative(repoRoot, entry)}:\n${result.stderr ?? String(result.error)}`,
     );
@@ -120,17 +130,18 @@ function buildBundle(entry: string, outfile: string, external: readonly string[]
   fs.renameSync(staging, outfile);
 }
 
-function buildAll(bundles: readonly BundleSpec[]): void {
-  if (!bunAvailable()) {
+export function buildAll(bundles: readonly BundleSpec[], bunw: string = BUNW_PATH): void {
+  const resolution = resolveDeclaredBun(bunw);
+  if ("unavailable" in resolution) {
     // Never leave a stale bundle behind for the harnesses to prefer over
     // current sources.
     for (const { outfile } of bundles) fs.rmSync(outfile, { force: true });
     process.stderr.write(
-      "test bundles: bun not found on PATH; subprocess tests will spawn through tsx (slower)\n",
+      `test bundles: ./bunw could not provide the declared Bun (${resolution.unavailable}); subprocess tests will spawn through tsx (slower)\n`,
     );
     return;
   }
-  for (const { entry, outfile, external } of bundles) buildBundle(entry, outfile, external);
+  for (const { entry, outfile, external } of bundles) buildBundle(resolution.bun, entry, outfile, external);
 }
 
 const builtThisInvocation = new Set<string>();

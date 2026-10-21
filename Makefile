@@ -59,7 +59,7 @@ test-static:
 	@# parses only `a` and turns the rest into positional parameters, so each
 	@# file also needs its own invocation. The empty check keeps a failed
 	@# discovery from passing as "nothing to check".
-	@scripts="$$(git ls-files -- '*.sh')"; \
+	@scripts="$$(git ls-files -- '*.sh' bunw)"; \
 	test -n "$$scripts" || { echo 'test-static: found no tracked shell scripts; the syntax gate would pass vacuously' >&2; exit 1; }; \
 	for script in $$scripts; do \
 		echo "syntax: $$script"; \
