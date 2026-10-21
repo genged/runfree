@@ -194,6 +194,24 @@ describe("oauth-endpoint-not-mediated denial bodies", () => {
     },
   );
 
+  test("the host add remedy says it ends the grant refusal on that host", () => {
+    const text = body({ oauthEndpoint: { finding: "oversize", target: "record-only-host" } });
+    expect(text).toContain("If this host should also take ordinary uploads");
+    expect(text).toContain("The proxy then stops refusing OAuth token");
+    expect(text).toContain("so their real tokens\nwould reach the agent");
+  });
+
+  test("a WebSocket upgrade names why it was refused; a mediated endpoint points at HTTPS", () => {
+    const recordOnly = body({ oauthEndpoint: { finding: "websocket", target: "record-only-host" } });
+    expect(recordOnly).toContain("This is a WebSocket upgrade. The proxy cannot read its reply");
+    expect(recordOnly).toContain("If this host should also take WebSocket connections");
+    expect(recordOnly).toContain("  runfree host add ahrefs.com");
+    const mediated = body({ oauthEndpoint: { finding: "websocket", providers: ["mcp:claude-ahrefs"], target: "mediated-endpoint" } });
+    expect(mediated).toContain("for HTTPS requests only");
+    expect(mediated).toContain("Send this request over HTTPS instead.");
+    expect(mediated).not.toContain("runfree mcp");
+  });
+
   test("a collision names both providers and the revoke remedy only", () => {
     const text = body({ oauthEndpoint: { finding: "grant-shaped", field: "code", providers: ["mcp:claude-a", "mcp:codex-b"], target: "endpoint-collision" } });
     expect(text).toContain("More than one OAuth server claims this endpoint");

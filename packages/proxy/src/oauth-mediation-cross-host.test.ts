@@ -477,3 +477,91 @@ describe("unmediated token replies on the response-mediating rule", () => {
     expect(stateSnapshot()).toBeNull();
   });
 });
+
+describe("path variants of blocked and colliding endpoints", () => {
+  const variants = ["/oauth/token/", "/OAuth/token", "/oauth/%74oken", "/oauth//token", "/other"];
+
+  test.each(variants)("a grant to %s on a host with a blocked endpoint is refused by the host-wide scan", async (variant) => {
+    const target = mediator({ blockedEndpoints: [{ host: TOKEN_HOST, path: "/oauth/token" }], providers: {} });
+    expect(await target.unmediatedRequestRefusal(request("POST", `https://${TOKEN_HOST}${variant}`, GRANT, FORM), { allowlisted: true }))
+      .toMatchObject({ target: "blocked-endpoint", finding: { kind: "grant-shaped" } });
+    // A nested grant field counts too (deep scan).
+    expect(await target.unmediatedRequestRefusal(request("POST", `https://${TOKEN_HOST}${variant}`, JSON.stringify({ a: { refresh_token: "r" } }), JSON_TYPE), { allowlisted: true }))
+      .toMatchObject({ target: "blocked-endpoint" });
+  });
+
+  test("the host-wide scan has no fail-closed rules: ordinary traffic passes whatever its size or encoding", async () => {
+    const target = mediator({ blockedEndpoints: [{ host: TOKEN_HOST, path: "/oauth/token" }], providers: {} });
+    for (const req of [
+      request("POST", `https://${TOKEN_HOST}/upload`, "x".repeat(64 * 1024), { "content-type": "text/plain" }),
+      request("POST", `https://${TOKEN_HOST}/upload`, "--b--", { "content-type": "multipart/form-data; boundary=b" }),
+      request("POST", `https://${TOKEN_HOST}/upload`, "abc", { "content-encoding": "x-custom" }),
+    ]) {
+      expect(await target.unmediatedRequestRefusal(req, { allowlisted: true })).toBeUndefined();
+    }
+    // The exact blocked endpoint keeps its fail-closed rules.
+    expect(await target.unmediatedRequestRefusal(request("POST", TOKEN_URL, "--b--", { "content-type": "multipart/form-data; boundary=b" }), { allowlisted: true }))
+      .toMatchObject({ finding: { kind: "multipart" } });
+  });
+
+  test("a host with a colliding endpoint gets the same host-wide scan, naming both providers", async () => {
+    const SHARED = "auth.example.com";
+    const target = mediator({
+      providers: {
+        "mcp:claude-first": ahrefs({ resourceHost: "first.example.com", tokenEndpoints: [{ host: SHARED, path: "/token" }] }),
+        "mcp:claude-second": ahrefs({ resourceHost: "second.example.com", tokenEndpoints: [{ host: SHARED, path: "/token" }] }),
+      },
+    });
+    expect(await target.unmediatedRequestRefusal(request("POST", `https://${SHARED}/Token`, GRANT, FORM), { allowlisted: true }))
+      .toMatchObject({ target: "endpoint-collision", providers: ["mcp:claude-first", "mcp:claude-second"] });
+    expect(await target.unmediatedRequestRefusal(request("GET", `https://${SHARED}/page`), { allowlisted: true })).toBeUndefined();
+  });
+
+  test("reclaim: without the blocked endpoint the host is unguarded again", async () => {
+    const target = mediator({ blockedEndpoints: [{ host: TOKEN_HOST, path: "/oauth/token" }], providers: {} });
+    activate(target, { providers: {} });
+    expect(await target.unmediatedRequestRefusal(request("POST", `https://${TOKEN_HOST}/oauth/token/`, GRANT, FORM), { allowlisted: true })).toBeUndefined();
+  });
+});
+
+describe("WebSocket upgrades where the proxy guards OAuth", () => {
+  const ws = (url: string) => ({ url, headers: { upgrade: "websocket" } });
+
+  test("an upgrade to a record-only host is refused, whatever its query", () => {
+    const target = mediator({ recordOnlyHosts: [TOKEN_HOST], providers: {} });
+    expect(target.webSocketUpgradeRefusal(ws(`wss://${TOKEN_HOST}/oauth/token?grant_type=refresh_token&refresh_token=R`)))
+      .toMatchObject({ target: "record-only-host", finding: { kind: "websocket" } });
+    expect(target.webSocketUpgradeRefusal(ws(`wss://${TOKEN_HOST}/socket`))).toMatchObject({ target: "record-only-host" });
+  });
+
+  test("an upgrade to any claimed URL is refused: mediated, blocked, or colliding", () => {
+    const target = mediator({
+      blockedEndpoints: [{ host: "blocked.example.com", path: "/token" }],
+      providers: {
+        "mcp:claude-ahrefs": ahrefs({ tokenEndpoints: [{ host: TOKEN_HOST, path: "/oauth/token" }] }),
+        "mcp:claude-a": ahrefs({ resourceHost: "a.example.com", tokenEndpoints: [{ host: "shared.example.com", path: "/t" }] }),
+        "mcp:claude-b": ahrefs({ resourceHost: "b.example.com", tokenEndpoints: [{ host: "shared.example.com", path: "/t" }] }),
+      },
+    });
+    expect(target.webSocketUpgradeRefusal(ws(`wss://${TOKEN_HOST}/oauth/token`))).toMatchObject({ target: "mediated-endpoint", providers: ["mcp:claude-ahrefs"] });
+    expect(target.webSocketUpgradeRefusal(ws("wss://blocked.example.com/token"))).toMatchObject({ target: "blocked-endpoint" });
+    expect(target.webSocketUpgradeRefusal(ws("wss://shared.example.com/t"))).toMatchObject({ target: "endpoint-collision" });
+    // Elsewhere on a blocked host only a grant-shaped query is refused.
+    expect(target.webSocketUpgradeRefusal(ws("wss://blocked.example.com/Token?refresh_token=R"))).toMatchObject({ target: "blocked-endpoint", finding: { kind: "grant-shaped" } });
+    expect(target.webSocketUpgradeRefusal(ws("wss://blocked.example.com/socket"))).toBeUndefined();
+  });
+
+  test("on a host a record names, only an upgrade with a grant-shaped query is refused", () => {
+    const target = mediator({ recordEndpointHosts: [RESOURCE], providers: { "mcp:claude-ahrefs": ahrefs() } });
+    expect(target.webSocketUpgradeRefusal(ws(`wss://${RESOURCE}/socket?grant_type=refresh_token`)))
+      .toMatchObject({ target: "record-endpoint-host", finding: { kind: "grant-shaped", field: "grant_type" } });
+    expect(target.webSocketUpgradeRefusal(ws(`wss://${RESOURCE}/mcp/socket?session=1`))).toBeUndefined();
+    expect(target.webSocketUpgradeRefusal(ws("wss://unrelated.example.com/socket?grant_type=x"))).toBeUndefined();
+  });
+
+  test("reclaim: a policy that stops guarding the host lets the upgrade through", () => {
+    const target = mediator({ recordOnlyHosts: [TOKEN_HOST], providers: {} });
+    activate(target, { providers: {} });
+    expect(target.webSocketUpgradeRefusal(ws(`wss://${TOKEN_HOST}/socket`))).toBeUndefined();
+  });
+});

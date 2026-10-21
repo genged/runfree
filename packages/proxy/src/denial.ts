@@ -160,9 +160,9 @@ export type ShapeDenialBodyDetails = {
 export type OAuthEndpointDenialDetails = {
   // A closed set of OAuth field names (never request data).
   field?: "code" | "grant_type" | "redirect_uris" | "refresh_token";
-  finding: "grant-shaped" | "missing-length" | "multipart" | "oversize" | "undecodable";
+  finding: "grant-shaped" | "missing-length" | "multipart" | "oversize" | "undecodable" | "websocket";
   providers?: readonly string[];
-  target: "blocked-endpoint" | "endpoint-collision" | "policy-unavailable" | "record-endpoint-host" | "record-only-host";
+  target: "blocked-endpoint" | "endpoint-collision" | "mediated-endpoint" | "policy-unavailable" | "record-endpoint-host" | "record-only-host";
 };
 
 const OAUTH_FIELD_TEXT: Record<NonNullable<OAuthEndpointDenialDetails["field"]>, string> = {
@@ -172,7 +172,7 @@ const OAUTH_FIELD_TEXT: Record<NonNullable<OAuthEndpointDenialDetails["field"]>,
   refresh_token: "refresh_token (a token refresh)",
 };
 
-const OAUTH_UNREADABLE_TEXT: Record<Exclude<OAuthEndpointDenialDetails["finding"], "grant-shaped">, string> = {
+const OAUTH_UNREADABLE_TEXT: Record<Exclude<OAuthEndpointDenialDetails["finding"], "grant-shaped" | "websocket">, string> = {
   "missing-length": "its body has no Content-Length",
   multipart: "it is multipart/form-data",
   oversize: "its body is larger than 16 KiB",
@@ -183,6 +183,9 @@ const OAUTH_TARGET_TEXT: Record<OAuthEndpointDenialDetails["target"], string[]> 
   "blocked-endpoint": [
     "The OAuth settings of an MCP server name this endpoint, but the proxy does",
     "not mediate it: another use of the host conflicts with that claim.",
+  ],
+  "mediated-endpoint": [
+    "The proxy mediates this OAuth endpoint for HTTPS requests only.",
   ],
   "endpoint-collision": [
     "More than one OAuth server claims this endpoint, so none of them mediates",
@@ -222,6 +225,11 @@ function oauthEndpointLines(host: string, details: OAuthEndpointDenialDetails | 
         `The request carries ${field}. Its reply would hand real tokens`,
         "to the agent instead of handles, so the request was not sent.",
       );
+    } else if (details.finding === "websocket") {
+      lines.push(
+        "This is a WebSocket upgrade. The proxy cannot read its reply, which",
+        "could carry real tokens, so the upgrade was not sent.",
+      );
     } else {
       lines.push(
         `The proxy cannot check this request for an OAuth token exchange: ${OAUTH_UNREADABLE_TEXT[details.finding]}.`,
@@ -239,6 +247,10 @@ function oauthEndpointLines(host: string, details: OAuthEndpointDenialDetails | 
       "The person operating Runfree can inspect the proxy by running",
       "`runfree doctor` on the host machine.",
     );
+    return lines;
+  }
+  if (details?.target === "mediated-endpoint") {
+    lines.push("Send this request over HTTPS instead.", "");
     return lines;
   }
   if (details?.target === "endpoint-collision") {
@@ -264,11 +276,14 @@ function oauthEndpointLines(host: string, details: OAuthEndpointDenialDetails | 
     );
   }
   if (details?.target === "record-only-host" && details.finding !== "grant-shaped" && host !== UNPARSEABLE_HOST) {
-    // A broad --oauth-host host also takes ordinary uploads; allowing it
-    // outside MCP stops it being record-only.
+    // A broad --oauth-host host also takes ordinary traffic; allowing it
+    // outside MCP stops it being record-only, and so ends the grant refusal.
+    const traffic = details.finding === "websocket" ? "WebSocket connections" : "ordinary uploads";
     lines.push(
-      "If this host should also take ordinary uploads, the person operating",
-      "Runfree can allow it outside MCP:",
+      `If this host should also take ${traffic}, the person operating Runfree`,
+      "can allow it outside MCP. The proxy then stops refusing OAuth token",
+      "requests to this host that it does not mediate, so their real tokens",
+      "would reach the agent:",
       "",
       `  runfree host add ${host}`,
       "",

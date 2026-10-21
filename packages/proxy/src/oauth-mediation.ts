@@ -170,14 +170,19 @@ export type OAuthBeforeRequestOptions = {
 // record names that also serves an MCP endpoint, a host-owned blocked
 // endpoint, an endpoint more than one provider claims, or any allowlisted
 // host while the OAuth policy is invalid.
+//
+// A WebSocket upgrade is refused outright (finding `websocket`) where the
+// proxy guards OAuth: mockttp hands a non-101 upstream reply straight back to
+// the agent, and no rule can read it. `mediated-endpoint` is a WebSocket
+// upgrade to an endpoint a provider mediates for HTTPS requests only.
 export type UnmediatedOAuthRequestRefusal = {
-  finding: GrantShapeFinding;
+  finding: GrantShapeFinding | { kind: "websocket" };
   host: string;
   path: string;
   // The providers involved, when known: the colliding claimants, or the MCP
   // providers whose user hosts include this host.
   providers: string[];
-  target: "blocked-endpoint" | "endpoint-collision" | "policy-unavailable" | "record-endpoint-host" | "record-only-host";
+  target: "blocked-endpoint" | "endpoint-collision" | "mediated-endpoint" | "policy-unavailable" | "record-endpoint-host" | "record-only-host";
 };
 
 export type OAuthIssuerDenialContext = {
@@ -545,6 +550,29 @@ function matchingRegistrationServer(policy: LoadedMcpOAuthPolicy, state: StoredM
 function endpointBlocked(policy: LoadedMcpOAuthPolicy, state: StoredMcpOAuthState, url: URL): boolean {
   const claim = endpointClaim(policy, state, url);
   return claim?.kind === "blocked" || claim?.kind === "collision";
+}
+
+// A host that carries a blocked or colliding endpoint. Endpoint matching is
+// by exact path, but many routers also serve `/oauth/token/`,
+// `/OAuth/token`, or `/oauth/%74oken`, which would take the plain rule; so
+// the whole host gets a lenient deep scan for grant shapes.
+function hostBlockOrCollision(
+  policy: LoadedMcpOAuthPolicy,
+  state: StoredMcpOAuthState,
+  host: string,
+): { kind: "blocked" } | { kind: "collision"; servers: McpOAuthServerPolicy[] } | undefined {
+  const paths = new Set<string>();
+  for (const server of policy.servers) {
+    for (const endpoint of [...tokenEndpointList(server, state), ...registrationEndpointList(server, state)]) {
+      if (endpoint.host === host) paths.add(endpoint.path);
+    }
+  }
+  for (const endpointPath of paths) {
+    const url = parseUrl(`https://${host}${endpointPath}`);
+    const claim = url ? endpointClaim(policy, state, url) : undefined;
+    if (claim?.kind === "collision") return claim;
+  }
+  return policy.blockedEndpoints.some((endpoint) => endpoint.host === host) ? { kind: "blocked" } : undefined;
 }
 
 // A share-group non-owner (`captureOwner: false`) never captures metadata:
@@ -1201,9 +1229,67 @@ export class OAuthMediator {
     }
     if (claim?.kind === "blocked") return check("blocked-endpoint", "deep", true, []);
     if (policy.recordOnlyHosts.includes(host)) return check("record-only-host", "deep", true, userHostOwners());
+    // Path variants of a blocked or colliding endpoint: a deep scan of the
+    // whole host, without fail-closed rules, so ordinary traffic there is
+    // never refused for its size or encoding.
+    const hostClaim = hostBlockOrCollision(policy, state, host);
+    if (hostClaim?.kind === "collision") {
+      return check("endpoint-collision", "deep", false, hostClaim.servers.map((server) => server.name));
+    }
+    if (hostClaim?.kind === "blocked") return check("blocked-endpoint", "deep", false, []);
     if (policy.recordEndpointHosts.includes(host)) return check("record-endpoint-host", "top-level", false, userHostOwners());
     return undefined;
   }
+
+  /**
+   * The refusal for a WebSocket upgrade where the proxy guards OAuth, or
+   * undefined. mockttp returns a non-101 upstream reply to the agent as is,
+   * so an upgrade GET with a grant in its query could fetch real tokens. An
+   * upgrade is refused to a record-only host, to any URL a provider claims
+   * or blocks (mediated, blocked, or colliding), to a host with a blocked or
+   * colliding endpoint when its query is grant-shaped, and to a host a
+   * record names when its query is grant-shaped. While the OAuth policy is
+   * invalid, any grant-shaped query is refused. Synchronous: it runs in the
+   * WebSocket rule matcher.
+   */
+  webSocketUpgradeRefusal = (req: { headers?: Record<string, HeaderValue>; url: string }): UnmediatedOAuthRequestRefusal | undefined => {
+    const url = parseUrl(req.url);
+    if (!url) return undefined;
+    const host = url.hostname.toLowerCase();
+    const pathName = url.pathname || "/";
+    const policyState = this.currentPolicyState();
+    const policy = policyState.policy;
+    const refuse = (
+      target: UnmediatedOAuthRequestRefusal["target"],
+      providers: string[],
+      finding: UnmediatedOAuthRequestRefusal["finding"] = { kind: "websocket" },
+    ): UnmediatedOAuthRequestRefusal => ({ finding, host, path: pathName, providers, target });
+    const queryGrant = () => classifyGrantShape({ body: undefined, failClosed: false, headers: req.headers, scope: "top-level", url });
+    const userHostOwners = () => policy.servers.filter((server) => server.bindingHosts.includes(host)).map((server) => server.name);
+    if (!policyState.valid) {
+      if (policy.recordOnlyHosts.includes(host)) return refuse("record-only-host", userHostOwners());
+      const finding = queryGrant();
+      return finding ? refuse("policy-unavailable", [], finding) : undefined;
+    }
+    let state: StoredMcpOAuthState;
+    try {
+      state = this.currentState();
+    } catch {
+      state = {};
+    }
+    const claim = endpointClaim(policy, state, url);
+    if (claim?.kind === "mediated") return refuse("mediated-endpoint", [claim.server.name]);
+    if (claim?.kind === "collision") return refuse("endpoint-collision", claim.servers.map((server) => server.name));
+    if (claim?.kind === "blocked") return refuse("blocked-endpoint", []);
+    if (policy.recordOnlyHosts.includes(host)) return refuse("record-only-host", userHostOwners());
+    const finding = queryGrant();
+    if (finding === undefined) return undefined;
+    const hostClaim = hostBlockOrCollision(policy, state, host);
+    if (hostClaim?.kind === "collision") return refuse("endpoint-collision", hostClaim.servers.map((server) => server.name), finding);
+    if (hostClaim?.kind === "blocked") return refuse("blocked-endpoint", [], finding);
+    if (policy.recordEndpointHosts.includes(host)) return refuse("record-endpoint-host", userHostOwners(), finding);
+    return undefined;
+  };
 
   private unmediatedRequestResult(req: OAuthProxyRequest, refusal: UnmediatedOAuthRequestRefusal): OAuthRequestResult {
     this.log(`proxy: oauth unmediated request refused host=${refusal.host} target=${refusal.target} finding=${refusal.finding.kind}`);

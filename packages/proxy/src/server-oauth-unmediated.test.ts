@@ -14,6 +14,7 @@ import { describe, expect, test } from "vitest";
 import {
   APPROVALS_PROCESS_EPOCH_FILE,
   APPROVALS_WATCHER_HEARTBEAT_FILE,
+  parsePendingApprovalRecord,
 } from "@runfree/runtime-contracts/write-approvals";
 import { writeResolvedHostsFile } from "./resolved-hosts.ts";
 import {
@@ -83,9 +84,12 @@ async function startUpstream(): Promise<Upstream> {
 }
 
 type Started = {
+  decisionsDir: string;
   oauthPolicyPath: string;
   oauthStateDir: string;
   pendingDir: string;
+  // The OAuth state file as seeded before the proxy started.
+  seededState: string;
   proxy: RunningProxy;
   upstream: Upstream;
 };
@@ -103,6 +107,11 @@ async function startOAuthProxy(options: {
   const oauthPolicyPath = path.join(tmp, "oauth-mediation-policy.json");
   const oauthStateDir = path.join(tmp, "oauth-state");
   writeJson(oauthPolicyPath, options.oauthPolicy);
+  // An existing state file, so a refusal is proven to leave it byte-identical
+  // rather than only to create nothing.
+  const seededState = `${JSON.stringify({ discovered: {}, handles: {} }, null, 2)}\n`;
+  fs.mkdirSync(oauthStateDir, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(oauthStateDir, "handles.json"), seededState, { mode: 0o600 });
   const pendingDir = fs.mkdtempSync(path.join(tmp, "approvals-pending-"));
   const decisionsDir = fs.mkdtempSync(path.join(tmp, "approvals-decisions-"));
   fs.writeFileSync(path.join(decisionsDir, APPROVALS_WATCHER_HEARTBEAT_FILE), "watch-requested");
@@ -125,7 +134,7 @@ async function startOAuthProxy(options: {
     path.join(decisionsDir, APPROVALS_WATCHER_HEARTBEAT_FILE),
     fs.readFileSync(path.join(pendingDir, APPROVALS_PROCESS_EPOCH_FILE), "utf8"),
   );
-  return { oauthPolicyPath, oauthStateDir, pendingDir, proxy, upstream };
+  return { decisionsDir, oauthPolicyPath, oauthStateDir, pendingDir, proxy, seededState, upstream };
 }
 
 function send(started: Started, host: string, request: { body?: string; headers?: Record<string, string>; method?: string; path: string }): Promise<ProxyResponse> {
@@ -175,7 +184,57 @@ function expectRefusedBeforeUpstream(started: Started, response: ProxyResponse, 
   expect(started.upstream.acceptedConnections(), `${label}: upstream connection`).toBe(connectionsBefore);
   expect(started.upstream.requests, `${label}: upstream request`).toHaveLength(0);
   expect(pendingRecords(started), `${label}: pending approval record`).toEqual([]);
-  expect(fs.existsSync(stateFile(started)), `${label}: OAuth state write`).toBe(false);
+  expect(fs.readFileSync(stateFile(started), "utf8"), `${label}: OAuth state write`).toBe(started.seededState);
+}
+
+function approve(started: Started, id: string, scope: "request" | "session"): void {
+  fs.writeFileSync(path.join(started.decisionsDir, `${id}.json`), `${JSON.stringify({
+    v: 1,
+    processEpoch: fs.readFileSync(path.join(started.pendingDir, APPROVALS_PROCESS_EPOCH_FILE), "utf8"),
+    id,
+    decidedAt: new Date().toISOString(),
+    decision: "approve",
+    scope,
+  })}\n`);
+}
+
+function touchPolicy(filePath: string, value: unknown): void {
+  writeJson(filePath, value);
+  const future = new Date(Date.now() + 2_000);
+  fs.utimesSync(filePath, future, future);
+}
+
+// A WebSocket upgrade over a fresh tunnel; resolves with whatever came back.
+async function webSocketUpgrade(started: Started, host: string, pathName: string): Promise<ProxyResponse> {
+  const tunnel = await openConnectTunnel({ authority: `${host}:443`, proxyPort: started.proxy.port });
+  if (tunnel.head.statusCode !== 200) return tunnel.head;
+  const socket = await tlsHandshakeOverTunnel(tunnel.socket, host);
+  socket.on("error", () => {});
+  socket.write([
+    `GET ${pathName} HTTP/1.1`,
+    `Host: ${host}:${started.upstream.port}`,
+    "Upgrade: websocket",
+    "Connection: Upgrade",
+    "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==",
+    "Sec-WebSocket-Version: 13",
+    "",
+    "",
+  ].join("\r\n"));
+  const chunks: Buffer[] = [];
+  await new Promise<void>((resolve) => {
+    const timer = setTimeout(() => {
+      socket.destroy();
+      resolve();
+    }, 5_000);
+    const done = () => {
+      clearTimeout(timer);
+      resolve();
+    };
+    socket.on("data", (chunk: Buffer) => chunks.push(chunk));
+    socket.once("end", done);
+    socket.once("close", done);
+  });
+  return parseHttpResponse(Buffer.concat(chunks));
 }
 
 describe("proxy server: unmediated OAuth grants are refused before upstream", () => {
@@ -246,6 +305,7 @@ describe("proxy server: unmediated OAuth grants are refused before upstream", ()
     expect(upload.body).toContain("larger than 16 KiB");
     expect(upload.body).toContain(`runfree host add ${RECORD_ONLY}`);
     expect(started.upstream.requests).toHaveLength(0);
+    expect(fs.readFileSync(stateFile(started), "utf8")).toBe(started.seededState);
   }, 30_000);
 
   test("on a host a record names that serves an MCP endpoint, a top-level grant is refused and JSON-RPC passes", async () => {
@@ -297,11 +357,20 @@ describe("proxy server: unmediated OAuth grants are refused before upstream", ()
     // Plain traffic on the same broadly allowed host is unaffected (G4).
     expect((await send(started, BROAD, { path: "/blog" })).body).toContain("real-access-token");
 
+    // A path variant the exact match misses is caught by the host-wide scan.
+    for (const variant of ["/oauth/token/", "/OAuth/token", "/oauth/%74oken"]) {
+      const before = started.upstream.acceptedConnections();
+      const requestsBefore = started.upstream.requests.length;
+      const refused = await send(started, BROAD, { method: "POST", path: variant, headers: FORM, body: GRANT });
+      expect(refused.raw, variant).toContain("x-runfree-blocked: oauth-endpoint-not-mediated");
+      expect(started.upstream.acceptedConnections(), variant).toBe(before);
+      expect(started.upstream.requests, variant).toHaveLength(requestsBefore);
+    }
+    expect(fs.readFileSync(stateFile(started), "utf8")).toBe(started.seededState);
+
     // Reclaim: the projection drops the blocked endpoint (conflict removed
     // or the server revoked); the next request is plain again.
-    writeJson(started.oauthPolicyPath, { providers: blocked.providers });
-    const future = new Date(Date.now() + 2_000);
-    fs.utimesSync(started.oauthPolicyPath, future, future);
+    touchPolicy(started.oauthPolicyPath, { providers: blocked.providers });
     expect((await send(started, BROAD, { path: "/oauth/token" })).body).toContain("real-access-token");
   }, 30_000);
 
@@ -316,5 +385,84 @@ describe("proxy server: unmediated OAuth grants are refused before upstream", ()
     expect(refused.raw).toContain("x-runfree-blocked: oauth-endpoint-not-mediated");
     expect(refused.body).toContain("runfree doctor");
     expect(started.upstream.requests).toHaveLength(requestsBefore);
+  }, 30_000);
+});
+
+describe("proxy server: WebSocket upgrades where the proxy guards OAuth", () => {
+  test("an upgrade to a record-only host, a claimed endpoint, or with a grant query is refused before upstream and notes no retry approval", async () => {
+    const started = await startOAuthProxy({
+      oauthPolicy: {
+        recordOnlyHosts: [RECORD_ONLY],
+        recordEndpointHosts: [ENDPOINT_HOST],
+        providers: { "mcp:claude-ahrefs": { kind: "mcp", resourceHost: ENDPOINT_HOST, tokenEndpoints: [{ host: BROAD, path: "/oauth/token" }] } },
+      },
+      writeApproval: "ask",
+    });
+    for (const [host, pathName] of [
+      [RECORD_ONLY, "/oauth/token?grant_type=refresh_token&refresh_token=R"],
+      [RECORD_ONLY, "/socket"],
+      [BROAD, "/oauth/token"],
+      [ENDPOINT_HOST, "/socket?grant_type=refresh_token&refresh_token=R"],
+    ] as const) {
+      const label = `${host}${pathName}`;
+      const before = started.upstream.acceptedConnections();
+      const response = await webSocketUpgrade(started, host, pathName);
+      expect(response.statusCode, label).toBe(403);
+      expect(response.raw, label).toContain("x-runfree-blocked: oauth-endpoint-not-mediated");
+      expect(response.raw, label).not.toContain("real-access-token");
+      expect(started.upstream.acceptedConnections(), `${label}: upstream connection`).toBe(before);
+      // No deny-then-approve retry approval is noted for a refused upgrade.
+      expect(pendingRecords(started), label).toEqual([]);
+    }
+    expect(started.upstream.requests).toHaveLength(0);
+    expect(fs.readFileSync(stateFile(started), "utf8")).toBe(started.seededState);
+    expect(started.proxy.output()).toContain('"reason":"oauth-endpoint-not-mediated"');
+
+  }, 60_000);
+
+  test("positive control: an unguarded upgrade is admitted and handed to mockttp's passthrough", async () => {
+    // mockttp's WebSocket passthrough dials port 443 whatever the Host port,
+    // so this harness cannot serve the upstream 200 token reply (the live
+    // suite can). The proof here is that the same upgrade is admitted to
+    // the passthrough once the host is not guarded, and refused before it
+    // while guarded.
+    const started = await startOAuthProxy({ oauthPolicy: { recordOnlyHosts: [RECORD_ONLY], providers: {} }, writeApproval: "allow" });
+    fs.writeFileSync(path.join(started.proxy.verboseDir, "enabled"), "");
+    const target = "/oauth/token?grant_type=refresh_token&refresh_token=R";
+    const admitted = /proxy: allowed method=GET scheme=wss host=ahrefs\.com/;
+    const refused = await webSocketUpgrade(started, RECORD_ONLY, target);
+    expect(refused.raw).toContain("x-runfree-blocked: oauth-endpoint-not-mediated");
+    expect(started.proxy.output()).not.toMatch(admitted);
+
+    touchPolicy(started.oauthPolicyPath, { providers: {} });
+    const passed = await webSocketUpgrade(started, RECORD_ONLY, target);
+    expect(passed.raw).not.toContain("oauth-endpoint-not-mediated");
+    await started.proxy.waitForOutput(admitted);
+  }, 60_000);
+});
+
+describe("proxy server: a held write is re-checked when it is released", () => {
+  test("a grant held for approval is refused on release when the host became record-only meanwhile", async () => {
+    const started = await startOAuthProxy({
+      oauthPolicy: { providers: { "mcp:claude-ahrefs": { kind: "mcp", resourceHost: ENDPOINT_HOST } } },
+      writeApproval: "ask",
+    });
+    // Not guarded yet: the grant reaches write classification and is held.
+    const responsePromise = send(started, RECORD_ONLY, { method: "POST", path: "/oauth/token", headers: FORM, body: GRANT });
+    await waitUntil(() => pendingRecords(started).length > 0, "pending approval record");
+    const record = parsePendingApprovalRecord(fs.readFileSync(path.join(started.pendingDir, pendingRecords(started)[0]), "utf8"));
+    if (!record) throw new Error("pending approval record did not parse");
+
+    // The projection makes the host record-only while the request is held.
+    touchPolicy(started.oauthPolicyPath, { recordOnlyHosts: [RECORD_ONLY], providers: { "mcp:claude-ahrefs": { kind: "mcp", resourceHost: ENDPOINT_HOST } } });
+    approve(started, record.id, "request");
+
+    const response = await responsePromise;
+    expect(response.statusCode).toBe(403);
+    expect(response.raw).toContain("x-runfree-blocked: oauth-endpoint-not-mediated");
+    expect(response.body).not.toContain("real-access-token");
+    expect(started.upstream.acceptedConnections()).toBe(0);
+    expect(started.upstream.requests).toHaveLength(0);
+    expect(fs.readFileSync(stateFile(started), "utf8")).toBe(started.seededState);
   }, 30_000);
 });

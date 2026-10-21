@@ -1366,6 +1366,17 @@ function isAllowedWebSocket(admission: AdmissionRecord, req: ProxyRequest): bool
     });
     return false;
   }
+  // Checked before the shape rules, so a refused upgrade notes no pending
+  // retry approval.
+  if (webSocketOAuthRefusal(admission, req) !== undefined) {
+    emitDenial({
+      reason: "oauth-endpoint-not-mediated",
+      host: requestHost(req),
+      method: req.method ?? "GET",
+      path: req.url,
+    });
+    return false;
+  }
   try {
     assertAllowedWebSocketRequest(admission, req, {
       allowedHosts: currentPolicy.allowedHosts,
@@ -1444,6 +1455,19 @@ function isAllowedWebSocket(admission: AdmissionRecord, req: ProxyRequest): bool
     }
     return false;
   }
+}
+
+// A WebSocket upgrade where the proxy guards OAuth (P1-a for upgrades):
+// mockttp returns a non-101 upstream reply to the agent unread, so an
+// upgrade GET with a grant in its query could fetch real tokens. No events:
+// it also runs as a rule matcher. An admission mismatch keeps its own rule.
+function webSocketOAuthRefusal(admission: AdmissionRecord, req: ProxyRequest): UnmediatedOAuthRequestRefusal | undefined {
+  if (currentAdmissionPrincipal(admission) === undefined) return undefined;
+  if (webSocketAdmissionMismatchStatus(admission, req) !== undefined) return undefined;
+  const refusal = oauthMediator.webSocketUpgradeRefusal(req);
+  // The invalid-policy rule covers allowlisted hosts only (audit is outside).
+  if (refusal?.target === "policy-unavailable" && !currentPolicy.allowedHostSet.has(requestHost(req))) return undefined;
+  return refusal;
 }
 
 function webSocketAdmissionMismatchStatus(admission: AdmissionRecord, req: ProxyRequest): 403 | 421 | undefined {
@@ -1925,6 +1949,18 @@ for (const statusCode of [421, 403] as const) {
       "blocked by agent proxy policy\nrequest host did not match the admitted CONNECT host\n",
     );
 }
+await server.forAnyWebSocket()
+  .matching((admission: AdmissionRecord, req: ProxyRequest) => webSocketOAuthRefusal(admission, req) !== undefined)
+  .always()
+  .thenRejectConnection(
+    403,
+    "Forbidden",
+    {
+      "content-type": "text/plain; charset=utf-8",
+      "x-runfree-blocked": "oauth-endpoint-not-mediated",
+    },
+    "blocked by agent proxy policy\nthe proxy guards OAuth on this host or endpoint and cannot read the reply to a WebSocket upgrade\n",
+  );
 // Shape-denied upgrades get the matching x-runfree-blocked reason. The
 // rejection body is static per rule (mockttp limitation); per-request host,
 // method, and path details travel through the structured denial events.
