@@ -53,8 +53,11 @@ import {
   type OAuthClaimRules,
 } from "../runtime/mcp-oauth-claims.ts";
 import { mcpOAuthEpochsPath, mcpOAuthStateEpoch, updateMcpOAuthEpochs } from "../runtime/mcp-oauth-epochs.ts";
-import { claimRulesFor } from "../runtime/mcp-oauth-projection.ts";
+import { claimRulesFor, serviceClaimUses } from "../runtime/mcp-oauth-projection.ts";
 import { atomicReplaceFile } from "../safe-fs.ts";
+import { projectControlPaths, projectInfo } from "../config.ts";
+import { readApprovedNetworkPolicy } from "../control/approvals.ts";
+import { compileDesiredPolicies } from "../control/compiler.ts";
 import { remedy } from "../remedies.ts";
 import {
   checkPolicyHostname,
@@ -387,6 +390,18 @@ function currentCredentialHosts(): Set<string> {
   }
 }
 
+// The service OAuth providers of the approved desired policy, the same input
+// the projection checks against (X1, X4). Without an approved selection there
+// are none yet; the projection checks again when one exists.
+function approvedServiceOAuthProviders(): Record<string, ServiceOAuthEndpoints> {
+  const discovered = projectInfo(projectRoot(), childEnv());
+  const project = { ...discovered, paths: { ...discovered.paths, ...projectControlPaths(stateDir()), stateDir: stateDir() } };
+  const projectPolicy = readApprovedNetworkPolicy(projectRoot(), project, "network-project");
+  const localPolicy = readApprovedNetworkPolicy(projectRoot(), project, "network-local");
+  if (!projectPolicy || !localPolicy) return {};
+  return compileDesiredPolicies({ project: projectPolicy, local: localPolicy }).oauth;
+}
+
 // The host env var the static-token remedy names, for example GITHUB_MCP_TOKEN.
 function staticTokenEnvName(serverName: string): string {
   const base = serverName.toUpperCase().replace(/[^A-Z0-9]+/g, "_").replace(/^_+|_+$/g, "");
@@ -431,6 +446,9 @@ function crossHostLabel(kinds: readonly string[]): string {
 
 export type McpEnableDeps = McpLoopbackOptions & {
   discovery?: DiscoveryDeps;
+  // The approved service OAuth providers the claim rules check against;
+  // defaults to the compiled approved desired policy.
+  serviceOAuthProviders?: () => Record<string, ServiceOAuthEndpoints>;
   // One yes/no question; defaults to a clack confirm (default No).
   confirm?: (message: string) => Promise<boolean>;
 };
@@ -557,7 +575,7 @@ export async function mcpEnableIntent(input: McpEnableInput, deps: McpEnableDeps
     claimRules = claimRulesFor(views, selfKey, {
       credentialHosts: currentCredentialHosts(),
       curatedHosts: curatedServiceHosts(),
-      serviceUses: [],
+      serviceUses: serviceClaimUses((deps.serviceOAuthProviders ?? approvedServiceOAuthProviders)()),
     });
     for (const host of planned.values()) {
       const refusal = oauthHostRefusal(claimRules, host.host, endpointHost);
@@ -1099,22 +1117,34 @@ export function mcpRevokeIntent(input: McpRevokeInput): McpRevokeResult {
   const shownName = printable(serverName);
   // The OAuth state clear comes first: if its tombstone cannot be written,
   // revoke fails before it changes anything else. The proxy keys OAuth state
-  // by agent and server name, so this covers every source of that name. R16:
-  // one server for several agents shares one login, so the state of every
-  // agent's provider for this server name is cleared; the share group is not
-  // recomputed, because its membership can drift.
+  // by agent and server name, so this covers every source of that name.
+  // R16: one server for several agents shares one login, so another agent's
+  // provider is cleared too when that agent has an entry with this server
+  // name and source (the same share group, or a member whose config has
+  // drifted from it). The group is not recomputed, because its membership can
+  // drift; an agent with no such entry keeps its state. When the revoked
+  // agent owned a group and its entry is gone, the next projection moves
+  // ownership and clears every member.
+  const approvalFile = mcpApprovalPath(stateDir());
+  const inventory = mcpInventory({ projectRoot: projectRoot(), env: childEnv(), approvalPath: approvalFile }).entries;
+  const entry = inventory.find((candidate) => candidate.source === "project" && candidate.agent === agent && candidate.name === serverName);
+  const revokedSources = new Set(inventory
+    .filter((candidate) => candidate.agent === agent && candidate.name === serverName && (input.source === undefined || candidate.source === input.source))
+    .map((candidate) => candidate.source));
+  const clearedAgents = MCP_AGENT_IDS.filter((each) => each === agent
+    || inventory.some((candidate) => candidate.agent === each && candidate.name === serverName && revokedSources.has(candidate.source)));
   const oauthProviderId = mcpOAuthProviderId(agent, serverName);
-  const sharedProviderIds = MCP_AGENT_IDS.map((each) => mcpOAuthProviderId(each, serverName));
-  const epochs = updateMcpOAuthEpochs(projectRoot(), mcpOAuthEpochsPath(stateDir()), { revoke: sharedProviderIds });
+  const epochs = updateMcpOAuthEpochs(projectRoot(), mcpOAuthEpochsPath(stateDir()), {
+    revoke: clearedAgents.map((each) => mcpOAuthProviderId(each, serverName)),
+  });
   const oauthStateEpoch = mcpOAuthStateEpoch(epochs, oauthProviderId);
   if (epochs.reset === "reclaimed") {
     console.log("the MCP OAuth state epoch store was invalid and was replaced; the proxy clears all MCP OAuth state, so every MCP server needs a new OAuth login");
   }
   console.log(`proxy OAuth state for ${agent} ${shownName}: clear requested`);
-  console.log(`a login for ${shownName} is shared by every agent that uses the same server, so ${MCP_AGENT_IDS.join(" and ")} both need a new OAuth login for it`);
-  const approvalFile = mcpApprovalPath(stateDir());
-  const entry = mcpInventory({ projectRoot: projectRoot(), env: childEnv(), approvalPath: approvalFile })
-    .entries.find((candidate) => candidate.source === "project" && candidate.agent === agent && candidate.name === serverName);
+  if (clearedAgents.length > 1) {
+    console.log(`${clearedAgents.join(" and ")} share one OAuth login for ${shownName} (same server name and source), so each needs a new OAuth login for it`);
+  }
   if (input.source === undefined || input.source === "project") {
     const result = revokeMcpApproval(projectRoot(), approvalFile, agent, serverName);
     if (result.changed) {

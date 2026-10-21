@@ -1944,6 +1944,42 @@ describe("runfree mcp enable: cross-host endpoints and claim rules", () => {
     expect(oauthFile().providers["mcp:claude-repooauth"]?.registrationEndpoints).toEqual([{ exact: true, host: CROSS_TOKEN.host, path: "/oauth/register" }]);
   });
 
+  test("X1, X4: an endpoint that overlaps an approved service OAuth provider is refused at enable, before any write", async () => {
+    writeProjectOauthServer();
+    const result = await runAdmin(() => mcpEnableIntent(enableInput(), {
+      discovery: fakeDiscovery(crossHostRoutes()).deps,
+      confirm: answers(true, true).confirm,
+      serviceOAuthProviders: () => ({ svc: { tokenEndpoints: [CROSS_TOKEN] } }),
+    }).then(() => {}));
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout).toContain("token_endpoint https://tokens.elsewhere.example/oauth/token cannot be used for this server: https://tokens.elsewhere.example/oauth/token overlaps service OAuth provider svc's token endpoint");
+    expect(result.stdout).not.toContain("allow host tokens.elsewhere.example");
+    expect(result.stdout).toContain("OAuth hosts: none");
+    expect(fs.existsSync(enabledFilePath())).toBe(false);
+  });
+
+  test("R20: when another token endpoint survives, the review still shows the well-known refusal and its remedy", async () => {
+    writeProjectOauthServer();
+    const routes = oauthRoutes();
+    routes["https://repo-oauth.example.com/.well-known/oauth-protected-resource/mcp"] = {
+      resource: "https://repo-oauth.example.com/mcp",
+      authorization_servers: ["https://auth.oauth-idp.example", "https://github.com/login/oauth"],
+    };
+    routes["https://github.com/.well-known/oauth-authorization-server/login/oauth"] = {
+      issuer: "https://github.com/login/oauth",
+      token_endpoint: "https://github.com/login/oauth/access_token",
+    };
+    const result = await runAdmin(() => mcpEnableIntent(enableInput(), { discovery: fakeDiscovery(routes).deps, confirm: answers(true, true).confirm }).then(() => {}));
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout).toContain([
+      "  cannot use https://github.com/.well-known/oauth-authorization-server/login/oauth as authorization server metadata for claude repoOauth:",
+      "    github.com is a well-known host; other logins there would be captured.",
+      '    use a token instead: add "headers": {"Authorization": "Bearer ${REPOOAUTH_MCP_TOKEN}"} to the server entry, remove its OAuth settings, and run',
+      "      runfree mcp enable claude repoOauth --source project --from-env REPOOAUTH_MCP_TOKEN",
+    ].join("\n"));
+    expect(result.stdout).toContain("proxy mediates token endpoint https://auth.oauth-idp.example/oauth/token");
+  });
+
   test("revoke removes the cross-host host and its claim", async () => {
     await enableCrossHost();
     const revoke = await runAdmin(() => { mcpRevokeIntent({ agent: parseMcpAgent("claude"), server: "repoOauth" }); });
@@ -2115,7 +2151,7 @@ describe("runfree mcp enable: share groups", () => {
 
     const revoke = await runAdmin(() => { mcpRevokeIntent({ agent: parseMcpAgent("codex"), server: "ahrefs" }); });
     expect(revoke.status, revoke.stderr).toBe(0);
-    expect(revoke.stdout).toContain("claude and codex both need a new OAuth login");
+    expect(revoke.stdout).toContain("claude and codex share one OAuth login for ahrefs (same server name and source), so each needs a new OAuth login for it");
     const prepare = await runAdmin(() => prepareRuntime());
     expect(prepare.status, prepare.stderr).toBe(0);
     expect(prepare.stderr).toContain("the agent that held its shared OAuth login left");
@@ -2151,6 +2187,34 @@ describe("runfree mcp enable: share groups", () => {
     expect(after["mcp:codex-ahrefs"]?.stateEpoch).not.toBe(before["mcp:codex-ahrefs"]?.stateEpoch);
     expect([after["mcp:claude-ahrefs"]?.captureOwner, after["mcp:codex-ahrefs"]?.captureOwner].filter((value) => value === false)).toHaveLength(1);
     expect((await runAdmin(() => prepareRuntime())).stderr).not.toContain("new OAuth login");
+  });
+
+  test("revoke clears another agent's state only for the same server name and source", async () => {
+    type Epochs = { providers: Record<string, { epoch: string }> };
+    const epochs = (): Epochs => JSON.parse(fs.readFileSync(path.join(stateDir, "mcp-oauth-epochs.json"), "utf8")) as Epochs;
+    // Claude has the server as a user entry; Codex has a same-named project
+    // entry, which is a different server.
+    writeClaudeNative({ mcpServers: { ahrefs: { type: "http", url: SHARED_URL } } });
+    fs.mkdirSync(path.join(projectRoot, ".codex"), { recursive: true });
+    fs.writeFileSync(path.join(projectRoot, ".codex/config.toml"), ["[mcp_servers.ahrefs]", 'url = "https://other.example.com/mcp"', ""].join("\n"));
+    const differentSource = await runAdmin(() => { mcpRevokeIntent({ agent: parseMcpAgent("claude"), server: "ahrefs" }); });
+    expect(differentSource.status, differentSource.stderr).toBe(0);
+    expect(differentSource.stdout).not.toContain("share one OAuth login");
+    expect(Object.keys(epochs().providers)).toEqual(["mcp:claude-ahrefs"]);
+
+    // Only one agent has the server at all.
+    fs.rmSync(path.join(projectRoot, ".codex/config.toml"));
+    const alone = await runAdmin(() => { mcpRevokeIntent({ agent: parseMcpAgent("claude"), server: "ahrefs" }); });
+    expect(alone.stdout).not.toContain("share one OAuth login");
+    expect(Object.keys(epochs().providers)).toEqual(["mcp:claude-ahrefs"]);
+
+    // The same server name and source for both agents: both are cleared.
+    writeSharedServers();
+    const before = epochs().providers["mcp:claude-ahrefs"]?.epoch;
+    const shared = await runAdmin(() => { mcpRevokeIntent({ agent: parseMcpAgent("claude"), server: "ahrefs" }); });
+    expect(shared.stdout).toContain("claude and codex share one OAuth login for ahrefs");
+    expect(Object.keys(epochs().providers).sort()).toEqual(["mcp:claude-ahrefs", "mcp:codex-ahrefs"]);
+    expect(epochs().providers["mcp:claude-ahrefs"]?.epoch).not.toBe(before);
   });
 
   test("a different server with the same endpoint is refused", async () => {
