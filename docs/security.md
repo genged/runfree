@@ -690,7 +690,10 @@ Details: [Write Approval Grants](architecture.md#write-approval-grants).
    query is grant-shaped to an endpoint host or to a host with a blocked or
    colliding endpoint, and, while the OAuth policy is invalid, to any
    allowlisted host. The refusal runs before the WebSocket shape rules, so it
-   notes no pending retry approval.
+   notes no pending retry approval. The 403 body explains the refusal and
+   gives the same remedy as the HTTPS denial, with a literal `<host>` in
+   place of the host name; the denial event for `runfree doctor` carries the
+   real host.
 10. **Revoke clears the proxy's OAuth state for the server.** It saves a new
     state epoch for the server (see [MCP Model](architecture.md#mcp-model));
     the proxy refuses a stale handle at use and blocks, not stores, a token
