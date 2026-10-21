@@ -470,7 +470,7 @@ export async function mcpEnableIntent(input: McpEnableInput, deps: McpEnableDeps
     if (!input.interactive) {
       die([
         `mcp enable discovers OAuth hosts only on a terminal, where you review them before anything is saved`,
-        `without a terminal, name the hosts yourself: runfree mcp enable ${agent} ${shellWord(serverName)} --source ${entry.source} --no-discover --oauth-host <host>`,
+        `run it on a terminal, or enable the server with no discovered OAuth hosts: runfree mcp enable ${agent} ${shellWord(serverName)} --source ${entry.source} --no-discover`,
       ].join("\n"));
     }
     const endpoint = new URL(endpointUrl);
@@ -479,7 +479,7 @@ export async function mcpEnableIntent(input: McpEnableInput, deps: McpEnableDeps
       console.log(`Project MCP server ${agent} ${shownName} names the endpoint ${endpoint.origin}.`);
       console.log("To find its OAuth hosts, Runfree fetches OAuth metadata (HTTPS GET, no credentials) from that host and from the authorization servers it names.");
       if (!await confirm(`Contact ${endpoint.hostname} to discover OAuth hosts?`)) {
-        console.log("No hosts contacted and no changes saved. To skip discovery, pass --no-discover (with --oauth-host <host> when the login needs other hosts).");
+        console.log("No hosts contacted and no changes saved. To skip discovery, pass --no-discover.");
         return { applied: false };
       }
     }
@@ -491,7 +491,7 @@ export async function mcpEnableIntent(input: McpEnableInput, deps: McpEnableDeps
         declaredTokenHosts: declared.tokenHosts,
       }, deps.discovery);
     } catch (error) {
-      die(`cannot discover OAuth hosts for ${agent} ${shownName}: ${error instanceof Error ? error.message : String(error)}; pass --no-discover with --oauth-host <host> instead`);
+      die(`cannot discover OAuth hosts for ${agent} ${shownName}: ${error instanceof Error ? error.message : String(error)}; pass --no-discover to enable it with no discovered OAuth hosts`);
     }
     for (const found of discovery.hosts) {
       const existing = planned.get(found.host);
@@ -524,7 +524,7 @@ export async function mcpEnableIntent(input: McpEnableInput, deps: McpEnableDeps
     }
     : undefined;
   if (record && !validateMcpEnabledRecord(record)) {
-    die(`cannot enable MCP server ${agent} ${shownName}: the planned OAuth host record is invalid; pass --no-discover with --oauth-host <host> instead`);
+    die(`cannot enable MCP server ${agent} ${shownName}: the planned OAuth host record is invalid; pass --no-discover to enable it with no discovered OAuth hosts`);
   }
 
   // 4. The one review.
@@ -584,10 +584,11 @@ export async function mcpEnableIntent(input: McpEnableInput, deps: McpEnableDeps
     for (const origin of discovery.authorizationEndpoints) {
       console.log(`  browser sign-in at ${origin} (opened on this computer; not allowlisted)`);
     }
-    if (!discovery.oauthDetected) console.log("  no valid OAuth metadata found; add hosts with --oauth-host if the login needs them");
+    if (!discovery.oauthDetected) console.log("  no valid OAuth metadata found; no OAuth hosts added");
   }
   if (hosts.some((host) => host.origin === "user")) {
-    console.log("  --oauth-host hosts are allowed as given (like runfree host add); the proxy mediates tokens there only for endpoints the server's metadata names");
+    console.log("  warning: --oauth-host hosts are allowed as given (like runfree host add). The proxy mediates only the endpoints listed above;");
+    console.log("  a login at any other token endpoint on these hosts returns the real access and refresh tokens to the agent");
   }
   if (hosts.length > 0) {
     console.log("  OAuth login, refresh, and client registration at the mediated endpoints need no write approval;");

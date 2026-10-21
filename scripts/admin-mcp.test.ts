@@ -1402,6 +1402,7 @@ describe("runfree mcp enable", () => {
     });
     expect(result.status, result.stderr).toBe(0);
     expect(result.stdout).toContain("No hosts contacted and no changes saved.");
+    expect(result.stdout).not.toContain("--oauth-host");
     expect(fs.existsSync(approvalFilePath())).toBe(false);
     expect(fs.existsSync(enabledFilePath())).toBe(false);
   });
@@ -1411,7 +1412,9 @@ describe("runfree mcp enable", () => {
     const result = await runAdmin(() => mcpEnableIntent(enableInput({ interactive: false }), { discovery: NO_NETWORK }).then(() => {}));
     expect(result.status).not.toBe(0);
     expect(result.stderr).toContain("mcp enable discovers OAuth hosts only on a terminal");
-    expect(result.stderr).toContain("runfree mcp enable claude repoOauth --source project --no-discover --oauth-host <host>");
+    expect(result.stderr).toContain("runfree mcp enable claude repoOauth --source project --no-discover");
+    // The remedy never points at --oauth-host: tokens on such a host are not mediated.
+    expect(result.stderr).not.toContain("--oauth-host");
     expect(fs.existsSync(approvalFilePath())).toBe(false);
     expect(fs.existsSync(enabledFilePath())).toBe(false);
   });
@@ -1437,6 +1440,8 @@ describe("runfree mcp enable", () => {
     expect(result.status, result.stderr).toBe(0);
     expect(result.stdout).toContain("allow host sso.example.org  [OAuth, --oauth-host]");
     expect(result.stdout).toContain("note: repo-oauth.example.com is the MCP endpoint host");
+    expect(result.stdout).toContain("warning: --oauth-host hosts are allowed as given");
+    expect(result.stdout).toContain("returns the real access and refresh tokens to the agent");
 
     const prepare = await runAdmin(() => prepareRuntime());
     expect(prepare.status, prepare.stderr).toBe(0);

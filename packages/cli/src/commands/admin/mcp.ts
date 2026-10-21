@@ -170,7 +170,7 @@ export const mcpCommand: CommandModule = {
                   array: true,
                   requiresArg: true,
                   nargs: 1,
-                  describe: "Also allow this exact OAuth host for the server (repeatable)",
+                  describe: "Also allow this exact OAuth host for the server (repeatable); the proxy mediates tokens there only at endpoints discovery records",
                 })
                 .option("no-discover", {
                   type: "boolean",

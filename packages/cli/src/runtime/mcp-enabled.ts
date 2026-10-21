@@ -280,7 +280,9 @@ export function projectEnabledOAuthEndpoints(policy: EnabledOAuthPolicyTarget, r
   }
   // Endpoints come only from discovery, which accepted them only on the
   // resource host, declared hosts, or issuer hosts the resource metadata named
-  // (all of which are recorded hosts or the resource host).
+  // (all of which are recorded hosts or the resource host). A `user` host
+  // (`--oauth-host`) adds no endpoint: a token endpoint there is not mediated,
+  // so its token response reaches the agent unchanged.
   for (const host of record.oauthHosts) bound.add(host.host);
   for (const endpoint of record.oauthEndpoints ?? []) {
     if (!bound.has(endpoint.host)) continue;
