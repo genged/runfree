@@ -48,6 +48,20 @@ function recordClaimEndpoint(endpoint: McpEnabledEndpoint): ClaimEndpoint {
   return { kind: endpoint.kind, host: endpoint.host, path: endpoint.path, ...(endpoint.exact ? { exact: true as const } : {}) };
 }
 
+/** Service OAuth providers as claim uses: their endpoints only (X4, R6). */
+export function serviceClaimUses(
+  providers: Readonly<Record<string, { tokenEndpoints: ReadonlyArray<{ host: string; path: string }>; registrationEndpoints?: ReadonlyArray<{ host: string; path: string }> }>>,
+): ClaimUse[] {
+  return Object.entries(providers).map(([providerId, provider]) => ({
+    label: `service OAuth provider ${providerId}`,
+    hosts: [],
+    endpoints: [
+      ...provider.tokenEndpoints.map((endpoint) => ({ kind: "token" as const, host: endpoint.host, path: endpoint.path })),
+      ...(provider.registrationEndpoints ?? []).map((endpoint) => ({ kind: "registration" as const, host: endpoint.host, path: endpoint.path })),
+    ],
+  }));
+}
+
 /** Every host and endpoint a claimant uses, as another claimant's rules see them (R2). */
 export function claimUseOf(view: ClaimServerView): ClaimUse {
   const hosts = new Set<string>();

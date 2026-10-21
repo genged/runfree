@@ -47,13 +47,14 @@ import {
   saveMcpShareGroups,
   withoutSharedEnabledEndpoints,
 } from "./mcp-enabled.ts";
-import { credentialDestinationHosts, curatedServiceHosts, type ClaimUse } from "./mcp-oauth-claims.ts";
+import { credentialDestinationHosts, curatedServiceHosts } from "./mcp-oauth-claims.ts";
 import { mcpOAuthStateEpoch, updateMcpOAuthEpochs } from "./mcp-oauth-epochs.ts";
 import {
   type ClaimServerView,
   claimRulesFor,
   filterClaims,
   type FilteredClaims,
+  serviceClaimUses,
   settleShareGroupOwners,
 } from "./mcp-oauth-projection.ts";
 import { RUNFREE_RUNTIME_TARGETS, workspaceMetadataTarget } from "./mount-target-policy.ts";
@@ -2392,14 +2393,7 @@ export function prepareMcpRuntime(options: McpPrepareOptions): McpPrepareResult 
   for (const server of servers) {
     for (const binding of server.tokenBindings) credentialHosts.add(binding.credential.host);
   }
-  const serviceUses: ClaimUse[] = Object.entries(options.serviceOAuthProviders ?? {}).map(([providerId, provider]) => ({
-    label: `service OAuth provider ${providerId}`,
-    hosts: [],
-    endpoints: [
-      ...provider.tokenEndpoints.map((endpoint) => ({ kind: "token" as const, host: endpoint.host, path: endpoint.path })),
-      ...(provider.registrationEndpoints ?? []).map((endpoint) => ({ kind: "registration" as const, host: endpoint.host, path: endpoint.path })),
-    ],
-  }));
+  const serviceUses = serviceClaimUses(options.serviceOAuthProviders ?? {});
   const claimBase = { credentialHosts, curatedHosts: curatedServiceHosts(), serviceUses };
   const views: ClaimServerView[] = [...groups.entries()].map(([key, members]) => {
     const first = members[0] as PreparedMcpServer;
@@ -2488,10 +2482,50 @@ export function prepareMcpRuntime(options: McpPrepareOptions): McpPrepareResult 
   );
   const groupBumps = persistGroups ? settlement.bumps : [];
 
+  // Bumps are recorded before the owners: if the owner write fails, the next
+  // projection forms the group again and clears its state again.
+  const oauthCapable = servers.filter((server) => server.oauthPolicy !== undefined);
+  let epochs: ReturnType<typeof updateMcpOAuthEpochs> | undefined;
+  if (options.mcpOAuthEpochsPath && oauthCapable.length > 0) {
+    const bumpIds = [...new Set(groupBumps.flatMap((bump) => bump.providerIds))].sort();
+    epochs = updateMcpOAuthEpochs(options.projectRoot, options.mcpOAuthEpochsPath, { revoke: bumpIds });
+    if (epochs.reset === "reclaimed") {
+      warn(`mcp: the MCP OAuth state epoch store ${options.mcpOAuthEpochsPath} was invalid; Runfree replaced it, so the proxy clears all MCP OAuth state and every MCP server needs a new OAuth login`);
+    }
+    for (const bump of groupBumps) {
+      const label = views.find((view) => view.key === bump.digest)?.label ?? bump.providerIds.join(", ");
+      warn(bump.reason === "formed"
+        ? `mcp: ${label} now shares one OAuth login across agents; Runfree cleared its proxy OAuth state, so each agent needs a new OAuth login`
+        : `mcp: ${label}: the agent that held its shared OAuth login left, so Runfree moved the login and cleared its proxy OAuth state; each agent needs a new OAuth login`);
+    }
+  }
+  // A group whose new owner cannot be stored is unsettled: no member captures
+  // or carries its endpoints, which become blocked endpoints, so its login
+  // fails closed for this launch instead of the launch failing. The next
+  // projection that can write the file settles it.
+  const unsettled = new Set<string>();
+  if (persistGroups && options.mcpEnabledPath) {
+    try {
+      saveMcpShareGroups(options.projectRoot, options.mcpEnabledPath, settlement.state);
+    } catch (error) {
+      const stored = enabled?.shareGroups ?? {};
+      for (const [digest, state] of Object.entries(settlement.state)) {
+        if (stored[digest]?.owner !== state.owner || stored[digest]?.released) unsettled.add(digest);
+      }
+      for (const digest of unsettled) {
+        const label = views.find((view) => view.key === digest)?.label ?? digest;
+        warn(`mcp: ${label}: Runfree could not store which agent holds its shared OAuth login in ${options.mcpEnabledPath} `
+          + `(${error instanceof Error ? error.message : String(error)}); the proxy blocks its OAuth login until that file can be written. `
+          + `Make the file and its directory writable, or remove the server's OAuth hosts with ${remedy.mcpRevoke((groups.get(digest) ?? [])[0]?.agent ?? "claude", (groups.get(digest) ?? [])[0]?.name ?? "")}`);
+      }
+    }
+  }
+
   // The OAuth endpoints a group's records name, merged onto its owner: only
   // the owner carries them, so the proxy never sees one endpoint on two
   // providers of the same server (R10, R16).
   const ownerOf = (key: string): PreparedMcpServer | undefined => {
+    if (unsettled.has(key)) return undefined;
     const members = groups.get(key) ?? [];
     const owner = settlement.owners.get(key);
     return members.find((member) => mcpOAuthProviderId(member.agent, member.name) === owner) ?? members[0];
@@ -2508,7 +2542,7 @@ export function prepareMcpRuntime(options: McpPrepareOptions): McpPrepareResult 
     }
     return { ...first, oauthHosts: [...hosts.values()], oauthEndpoints: [...endpoints.values()] };
   };
-  const claimants = [...groups.keys()].flatMap((key) => {
+  const claimants = [...groups.keys()].filter((key) => !unsettled.has(key)).flatMap((key) => {
     const owner = ownerOf(key);
     const record = mergedRecord(key);
     if (!owner?.oauthPolicy && !record) return [];
@@ -2551,26 +2585,11 @@ export function prepareMcpRuntime(options: McpPrepareOptions): McpPrepareResult 
     }
   }
 
-  const oauthCapable = servers.filter((server) => server.oauthPolicy !== undefined);
-  if (options.mcpOAuthEpochsPath && oauthCapable.length > 0) {
-    const bumpIds = [...new Set(groupBumps.flatMap((bump) => bump.providerIds))].sort();
-    const epochs = updateMcpOAuthEpochs(options.projectRoot, options.mcpOAuthEpochsPath, { revoke: bumpIds });
-    if (epochs.reset === "reclaimed") {
-      warn(`mcp: the MCP OAuth state epoch store ${options.mcpOAuthEpochsPath} was invalid; Runfree replaced it, so the proxy clears all MCP OAuth state and every MCP server needs a new OAuth login`);
-    }
-    for (const bump of groupBumps) {
-      const label = views.find((view) => view.key === bump.digest)?.label ?? bump.providerIds.join(", ");
-      warn(bump.reason === "formed"
-        ? `mcp: ${label} now shares one OAuth login across agents; Runfree cleared its proxy OAuth state, so each agent needs a new OAuth login`
-        : `mcp: ${label}: the agent that held its shared OAuth login left, so Runfree moved the login and cleared its proxy OAuth state; each agent needs a new OAuth login`);
-    }
+  if (epochs) {
     for (const server of oauthCapable) {
       if (server.oauthPolicy) server.oauthPolicy.stateEpoch = mcpOAuthStateEpoch(epochs, mcpOAuthProviderId(server.agent, server.name));
     }
   }
-  // Bumps are recorded before the owner: if the owner write fails, the next
-  // projection forms the group again and clears its state again.
-  if (persistGroups && options.mcpEnabledPath) saveMcpShareGroups(options.projectRoot, options.mcpEnabledPath, settlement.state);
 
   // Hosts only records add get narrowed rules; their union is the record-only
   // host set (R6), minus every prepared server's endpoint host.
@@ -2606,6 +2625,7 @@ export function prepareMcpRuntime(options: McpPrepareOptions): McpPrepareResult 
     const candidates = [
       ...view.records.flatMap((record) => (record.oauthEndpoints ?? []).filter((endpoint) => endpoint.kind !== "metadata")),
       ...(filtered.get(view.key)?.refusedDeclaredTokenEndpoints ?? []),
+      ...(unsettled.has(view.key) ? view.declaredTokenEndpoints : []),
     ];
     for (const endpoint of candidates) {
       const key = `${endpoint.host}\0${endpoint.path}`;
