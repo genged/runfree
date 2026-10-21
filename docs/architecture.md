@@ -802,7 +802,11 @@ A request that fails a step reads no token, does no OAuth mediation, and
 opens no upstream connection. One exception: when a request's class depends
 on its body (a non-read request to a declared GraphQL endpoint, an MCP call,
 or a POST to a recorded OAuth endpoint), the proxy reads the body locally
-before the shape check.
+before the shape check. Before write classification, the proxy also refuses
+an OAuth grant or client registration that no server mediates, sent to a host
+or endpoint that the OAuth mediation policy guards (see
+[MCP OAuth Mediation](#mcp-oauth-mediation)), so such a request never waits
+for approval.
 
 **Request shape.** On hosts with method or path rules, the proxy enforces the
 allowed methods and path prefixes, strips method-override headers, and refuses
@@ -1103,6 +1107,54 @@ Runfree imports supported Claude and Codex MCP entries into sanitized per-agent 
 - Remote HTTP servers must use HTTPS and a hostname, so MCP never adds an IP address to policy. A loopback HTTP server (`http://127.0.0.1:<port>`) imports without credentials, headers, helpers, or OAuth and adds nothing to policy; it reaches the host only through a separately approved host service.
 - OAuth login works from any session: every session with an OAuth-capable approved server gets its own loopback callback path ([Session MCP OAuth Callbacks](#session-mcp-oauth-callbacks)).
 - Side-effecting tool calls on HTTPS servers follow write approval (`runfree mcp rules`). STDIO and loopback HTTP servers do not pass the proxy, so their calls are not write-governed.
+
+### MCP OAuth Mediation
+
+The proxy keeps the real OAuth tokens of MCP servers and gives the agent
+handles. To do that, it must know before a login which token and
+registration endpoints belong to which server. The host builds this
+knowledge into the OAuth mediation policy of each effective policy
+generation, from the `mcp enable` records and the servers' declared OAuth
+settings:
+
+- **Recorded endpoints.** `mcp enable` records the token, registration, and
+  metadata endpoints that discovery found, and the proxy mediates them for
+  that server from the start. A token endpoint may be on another host than
+  the MCP endpoint when an authorization server the endpoint named, or a
+  declared metadata URL, puts it there. The record marks such a host as
+  cross-host, with the endpoint kinds it serves, so every later launch knows
+  that the host exists only for those endpoints. A registration endpoint on
+  a cross-host host is matched by exact path; other registration endpoints
+  match their path and everything under it.
+- **Binding hosts.** The server's `--oauth-host` hosts. At run time the proxy
+  also accepts a token or registration endpoint that the server's own
+  metadata names on one of them, and mediates it.
+- **Refused hosts.** Credential destinations and every curated service host.
+  No server may bind an issuer or endpoint there, except on its own MCP
+  endpoint host. The host applies the same rule, plus every other server's
+  hosts and endpoints, at `mcp enable` and at every launch, and drops a
+  claim that now fails it.
+- **Blocked endpoints.** Endpoints that a record or a declared setting names
+  but that no provider mediates: a dropped claim, or one that collides with
+  another provider. The proxy reads the replies there and blocks real
+  tokens, so a dropped claim fails closed rather than leaking.
+- **Record-only hosts.** Hosts that only `mcp enable` records allow. The
+  proxy never reads replies there, so responses keep streaming. Instead it
+  refuses, before any upstream connection, a request that looks like an
+  OAuth grant or client registration and that no server mediates.
+- **Endpoint hosts.** Hosts that a record names and that also serve an MCP
+  endpoint. They get a lighter form of the same request check that leaves
+  MCP traffic alone.
+- **Share groups.** One server enabled for Claude and for Codex is one
+  claimant. The host keeps a sticky owner for the group in the enable state,
+  and only the owner carries the endpoints and captures metadata, so the two
+  agents' providers never collide. A revoke clears both agents' OAuth
+  state; a new group, or an owner change, clears it once more.
+
+Service OAuth providers are merged in when the effective policy generation is
+built. There, an MCP endpoint that overlaps a service's endpoint is dropped
+and blocked, and a protocol-read endpoint on a credential destination is
+dropped. The rules and their limits are in [security.md](security.md#mcp).
 
 ### Codex Desktop Built-ins
 

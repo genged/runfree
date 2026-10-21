@@ -664,7 +664,10 @@ review lists every change:
   `--from-1password`, `--from-source`, or `--from-stdin`);
 - the MCP endpoint host;
 - each OAuth host, with where it came from: `discovered` (and the metadata
-  that named it) or `--oauth-host`.
+  that named it) or `--oauth-host`;
+- for each recorded token endpoint, the line `other apps that log in at
+  <url> will stop working in the sandbox`: the proxy mediates every login at
+  that exact URL for this server.
 
 After you accept, Runfree saves the changes, applies them to a running proxy,
 and then runs the OAuth login (`runfree mcp auth`) for OAuth servers. Pass
@@ -679,7 +682,7 @@ set to `deny` stays denied. The rules are in [security.md](security.md#mcp).
 | Option | Meaning |
 | --- | --- |
 | `--source user\|local\|project` | Choose the entry when more than one matches. User and local entries need no approval; `enable` records only their OAuth hosts. |
-| `--oauth-host <host>` | Also allow this exact host for the server (repeatable). It is allowed as given, like `runfree host add`. The proxy mediates a token or registration endpoint there that the server's OAuth metadata names. While only MCP records allow the host, the proxy refuses any other OAuth token or registration request to it. |
+| `--oauth-host <host>` | Also allow this exact host for the server (repeatable). It is allowed as given, like `runfree host add`, and it must pass the [host rule](#oauth-hosts-on-another-host). The proxy mediates a token or registration endpoint there that the server's OAuth metadata names. While only MCP records allow the host, the proxy refuses any other OAuth token or registration request to it, and any request with a body it cannot check (see below). |
 | `--no-discover` | Make no network call. Use only `--oauth-host` hosts. |
 | `--no-login` | Do not run the OAuth login after enabling. |
 | `--from-env`, `--from-1password`, `--from-source`, `--from-stdin` | Bind a project entry's static header to a host-owned credential source. Choose one. |
@@ -689,18 +692,131 @@ Discovery needs a terminal. Without one, `mcp enable` refuses before any DNS
 lookup unless you pass `--no-discover`; then the command line names every
 change and is itself the approval.
 
+#### OAuth hosts on another host
+
+A server's OAuth metadata may put its token endpoint on another host than the
+MCP endpoint: for example, the server at `api.example.com` and the token
+endpoint at `example.com`. `mcp enable` accepts such an endpoint only when the
+metadata came from an authorization server that the server's
+protected-resource metadata named, or from a declared `authServerMetadataUrl`.
+A registration endpoint on another host is accepted only on the host of that
+token endpoint, and the proxy matches it by exact path. The review labels the
+host:
+
+```text
+  allow host example.com  [OAuth, token endpoint on another host]
+      token_endpoint https://example.com/oauth/token
+      named by authorization server https://api.example.com/ (its metadata issuer matches)
+      which https://api.example.com/.well-known/oauth-protected-resource/mcp named
+      this server's OAuth tokens and refresh tokens will be sent to this host
+      other apps that log in at https://example.com/oauth/token will stop working in the sandbox
+      limited to GET, HEAD, OPTIONS, and POST on paths starting with /.well-known, /oauth/token
+```
+
+If the current policy already allows the host (desired policy or `host add`),
+its rules stay, and the proxy mediates only the exact endpoint. The label
+then says so:
+
+```text
+  allow host example.com  [OAuth, token endpoint on another host]
+      token_endpoint https://example.com/oauth/token
+      named by authorization server https://api.example.com/ (its metadata issuer matches)
+      which https://api.example.com/.well-known/oauth-protected-resource/mcp named
+      example.com is ALREADY ALLOWED for all paths (current policy); its rules stay
+      token replies from https://example.com/oauth/token will be held by the proxy for MCP server claude my-server
+      approve only if this address belongs to the same service
+      other apps that log in at https://example.com/oauth/token will stop working in the sandbox
+```
+
+`for all paths` is left out when the host has request rules. A host with both
+endpoints is labeled `[OAuth, token and registration endpoints on another
+host]`. `runfree mcp explain` shows the host as `discovered, token endpoint on
+another host`, and an exact-path registration endpoint with `(exact path)`.
+
+**Host rule.** An MCP server cannot use an OAuth host or endpoint where
+another login's tokens pass. This applies to discovered hosts and endpoints,
+`--oauth-host` hosts, and the server's declared token endpoint and
+`authServerMetadataUrl`. Runfree refuses the host or endpoint when:
+
+- the proxy injects a credential on the host;
+- the host belongs to a curated service, enabled or not (for example
+  `github.com` or `oauth2.googleapis.com`; `runfree service list --all` lists
+  the services and `runfree service explain <id>` their hosts);
+- another MCP server in the project uses the host as its endpoint host, a
+  declared OAuth host, or a recorded OAuth host. The same server enabled for
+  both agents counts as one server, so two servers cannot share an OAuth host;
+- the endpoint is another OAuth provider's token or registration endpoint, or
+  overlaps one.
+
+The server's own MCP endpoint host is never refused for itself. At `mcp
+enable`:
+
+- A refused `--oauth-host` host or declared endpoint stops the command before
+  any discovery call. Nothing is saved.
+- A refused endpoint in discovered metadata drops that whole metadata
+  document. The review lists it under `not added`.
+- When a well-known host is refused and no token endpoint is left, the command
+  stops and names a static token instead:
+
+```text
+cannot use https://github.com/login/oauth/access_token as a token endpoint for claude gh:
+  github.com is a well-known host; other logins there would be captured.
+  use a token instead: add "headers": {"Authorization": "Bearer ${GH_MCP_TOKEN}"} to the server entry, remove its OAuth settings, and run
+    runfree mcp enable claude gh --source project --from-env GH_MCP_TOKEN
+nothing was saved
+```
+
+For Codex the header step is `set bearer_token_env_var = "GH_MCP_TOKEN" in
+the server entry`. For a user or local entry the command is `runfree
+credential set-source <token-name> --from-env <ENV>`, with the token name
+Runfree prints. The proxy keeps the token and injects it; the agent sees a
+placeholder.
+
+Each launch checks the same rules again. If a later change makes one apply (a
+new credential, a service, or another server on the host), Runfree drops the
+claim with a warning, and the proxy refuses token requests at its endpoints.
+To restore it, remove the conflicting use and run `runfree mcp enable` again,
+or remove the server with `runfree mcp revoke`. A later `runfree host add` for
+the host does not drop the claim: the host gets its new rules, and the exact
+endpoint stays mediated.
+
+**Hosts only MCP allows.** A host that only `mcp enable` records allow, and
+not desired policy, `host add`, a service, or an MCP endpoint, is a
+record-only host. On a record-only host the proxy refuses a request that no
+server mediates, with any method, before any upstream connection and before
+any approval prompt, when:
+
+- its query or body carries `grant_type`, `refresh_token`, `redirect_uris`,
+  or `code` together with `code_verifier`;
+- it is `multipart/form-data`, its body has no `Content-Length` or is larger
+  than 16 KiB, or its body cannot be decoded.
+
+The denial reason is `oauth-endpoint-not-mediated`. An `--oauth-host` host is
+record-only too, so the second rule can refuse a large upload there; `runfree
+host add <host>` allows the host outside MCP and ends the rule. See
+[An OAuth request was refused as not mediated](troubleshooting.md#an-oauth-request-was-refused-as-not-mediated).
+
+**One server for both agents.** When the same server (name, source,
+endpoint, and OAuth settings) is enabled for Claude and for Codex, both agents
+share one OAuth login. The proxy files its tokens under one owner agent: the
+one enabled first. When the shared group first forms, and once after an
+upgrade, Runfree clears the server's proxy OAuth state and warns that each
+agent needs a new login.
+
 OAuth hosts are not written to `.runfree/network-policy.json`. They are
 host-owned records bound to the reviewed server config: if a project entry
 changes, or a user entry is deleted, its hosts stop applying. `runfree mcp
 revoke <agent> <server>` removes exactly the hosts that `enable` added. A host
-that desired policy, a service, or another enabled MCP server also names stays
-allowed. `runfree mcp explain` lists the recorded hosts and endpoints.
+that desired policy or a service also names stays allowed. `runfree mcp
+explain` lists the recorded hosts and endpoints.
 
 `runfree mcp revoke` also clears the proxy's OAuth state for the server: its
 tokens, its `runfree_oauth_*` handles, and the issuers and endpoints the proxy
-found at run time. It does this for every source of that agent and server
-name, including user and local entries. A later `mcp enable` needs a new
-login. Revoke prints one of these lines:
+found at run time. It does this for every source of that server name, and for
+both agents, because one server shares its login across agents. If the
+revoked agent owned a shared login, the next launch moves it to the other
+agent and clears the state again. A later `mcp enable` needs a new login.
+Revoke prints one of these lines:
 
 | Line | Meaning |
 | --- | --- |
