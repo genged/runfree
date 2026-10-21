@@ -17,8 +17,12 @@
 // what the user approves. A host is proposed only when validated metadata
 // shows an endpoint that the proxy's OAuth mediator binds for this server
 // (`packages/proxy/src/oauth-mediation.ts` `serverBindingHosts` /
-// `effectiveBindingHosts`); the endpoints themselves are recorded too, so the
-// proxy mediates them statically instead of relying on run-time capture.
+// `effectiveBindingHosts`), or a cross-host token endpoint (X1): one that
+// metadata from a named issuer or a declared metadata URL puts on another
+// host. The endpoints themselves are recorded too, so the proxy mediates them
+// statically instead of relying on run-time capture. Every proposed host and
+// endpoint passes the host-side claim rules (`runtime/mcp-oauth-claims.ts`)
+// first; a refused one is reported, never proposed.
 
 import dns from "node:dns";
 import net from "node:net";
@@ -26,6 +30,13 @@ import tls from "node:tls";
 
 import { isReservedRunfreeHostname } from "@runfree/runtime-contracts/host-services";
 import { normalizeHostname, normalizePathPrefix } from "@runfree/runtime-contracts/network-policy";
+import {
+  type ClaimEndpoint,
+  type ClaimRefusal,
+  oauthEndpointRefusal,
+  oauthHostRefusal,
+  type OAuthClaimRules,
+} from "../runtime/mcp-oauth-claims.ts";
 
 export const DISCOVERY_LIMITS = Object.freeze({
   requestTimeoutMs: 5_000,
@@ -58,11 +69,22 @@ export type McpOAuthDiscoveryInput = {
   // Declared, host-trusted OAuth configuration from the reviewed descriptor.
   declaredMetadataUrls: string[];
   declaredTokenHosts: string[];
+  // X6: `--oauth-host` hosts. They join the binding set, so endpoints the
+  // metadata names there are recorded and mediated statically.
+  userHosts?: string[];
+  // The claim rules every proposed host and endpoint must pass (X1, R1, R2).
+  // Absent means no rule beyond the binding set (tests of transport only).
+  claimRules?: OAuthClaimRules;
 };
+
+export type CrossHostEndpointKind = "token" | "registration";
 
 export type DiscoveredOAuthHost = {
   host: string;
   evidence: string[];
+  // Set on a host outside the binding set that serves the token endpoint
+  // (and possibly an exact registration endpoint) of validated metadata.
+  crossHost?: CrossHostEndpointKind[];
 };
 
 export type OAuthEndpointKind = "metadata" | "token" | "registration";
@@ -71,6 +93,16 @@ export type DiscoveredOAuthEndpoint = {
   kind: OAuthEndpointKind;
   host: string;
   path: string;
+  // A cross-host registration endpoint (Q8), matched by exact path.
+  exact?: true;
+};
+
+// A metadata document refused because it names an endpoint on a curated
+// (well-known) host (R20). The caller prints the static-token remedy.
+export type WellKnownRefusal = {
+  kind: OAuthEndpointKind;
+  url: string;
+  host: string;
 };
 
 export type DiscoveryContact = {
@@ -90,6 +122,8 @@ export type McpOAuthDiscoveryResult = {
   covered: string[];
   // Human-readable refusals: sources dropped and endpoints not added.
   rejected: string[];
+  // Documents refused for an endpoint on a curated host (also in `rejected`).
+  wellKnownRefusals: WellKnownRefusal[];
   // Browser-facing authorization endpoint origins (display only).
   authorizationEndpoints: string[];
   // Whether any valid OAuth metadata was found.
@@ -678,6 +712,17 @@ async function fetchAuthServerMetadata(
   return undefined;
 }
 
+type FoundMetadata = {
+  metadata: AuthServerMetadata;
+  via: string;
+  // How the metadata was found. Only a named issuer or a declared metadata
+  // URL may yield a cross-host endpoint (X1); the resource-origin fallback
+  // never does (E4 item 4).
+  source: "named" | "declared" | "fallback";
+  // How the issuer was named, for the cross-host review label (X2).
+  namedBy: string[];
+};
+
 export async function discoverMcpOAuthHosts(
   input: McpOAuthDiscoveryInput,
   deps: DiscoveryDeps = {},
@@ -686,6 +731,7 @@ export async function discoverMcpOAuthHosts(
   if (!endpoint) throw new Error("MCP endpoint must be an HTTPS URL on a policy-valid hostname");
   const session = new DiscoverySession(deps);
   const rejected: string[] = [];
+  const wellKnownRefusals: WellKnownRefusal[] = [];
   const endpointHost = endpoint.hostname;
   const declaredHosts = new Set<string>();
   const declaredMetadata: URL[] = [];
@@ -734,66 +780,130 @@ export async function discoverMcpOAuthHosts(
     break;
   }
 
-  // The mediator's binding set: the endpoint host, declared hosts, and the
-  // issuer hosts that the endpoint host's own metadata named.
-  const bindingHosts = new Set<string>([endpointHost, ...declaredHosts, ...issuers.map((issuer) => issuer.hostname)]);
+  // The mediator's binding set: the endpoint host, declared hosts, the issuer
+  // hosts that the endpoint host's own metadata named, and the user hosts
+  // (X6; the proxy binds them too, as `bindingHosts`).
+  const bindingHosts = new Set<string>([
+    endpointHost,
+    ...declaredHosts,
+    ...issuers.map((issuer) => issuer.hostname),
+    ...(input.userHosts ?? []),
+  ]);
 
   // 2. Authorization-server metadata: named issuers, declared metadata URLs,
   // and the 2025-03-26 resource-origin fallback.
-  const found: Array<{ metadata: AuthServerMetadata; via: string }> = [];
+  const found: FoundMetadata[] = [];
   for (const issuer of issuers) {
     const metadata = await fetchAuthServerMetadata(session, issuer, rejected);
-    if (metadata) found.push({ metadata, via: `authorization server ${issuer.href} named by ${protectedResourceUrl?.href ?? endpoint.origin}` });
-    else rejected.push(`${issuer.href}: no valid authorization-server metadata; its host is not added`);
+    const namedBy = `authorization server ${issuer.href} named by ${protectedResourceUrl?.href ?? endpoint.origin}`;
+    if (metadata) {
+      found.push({
+        metadata,
+        via: namedBy,
+        source: "named",
+        namedBy: [
+          `named by authorization server ${issuer.href} (its metadata issuer matches)`,
+          `which ${protectedResourceUrl?.href ?? endpoint.origin} named`,
+        ],
+      });
+    } else rejected.push(`${issuer.href}: no valid authorization-server metadata; its host is not added`);
   }
   for (const url of declaredMetadata) {
     const outcome = await session.fetchJson(url.href);
     if (outcome.kind !== "json") continue;
     const metadata = validateAuthServerMetadata(outcome.value, outcome.url, new URL(`https://${url.hostname}`), rejected);
-    if (metadata) found.push({ metadata, via: `declared metadata ${url.href}` });
+    if (metadata) found.push({ metadata, via: `declared metadata ${url.href}`, source: "declared", namedBy: [`named by declared metadata ${url.href}`] });
   }
   if (!protectedResourceUrl && declaredMetadata.length === 0) {
     const metadata = await fetchAuthServerMetadata(session, new URL(`https://${endpointHost}`), rejected);
-    if (metadata) found.push({ metadata, via: `authorization server at ${endpoint.origin}` });
+    if (metadata) found.push({ metadata, via: `authorization server at ${endpoint.origin}`, source: "fallback", namedBy: [] });
   }
 
   // 3. Candidates: a host is proposed only with validated metadata and a
-  // token endpoint inside the binding set.
-  const candidates = new Map<string, string[]>();
+  // token endpoint inside the binding set, or a cross-host token endpoint
+  // (X1), and only when every endpoint the document names passes the claim
+  // rules. A refusal drops the whole document, so a hostile issuer cannot
+  // keep half of a claim.
+  const candidates = new Map<string, { evidence: string[]; crossHost: Set<CrossHostEndpointKind> }>();
   const covered = new Set<string>();
   const endpoints = new Map<string, DiscoveredOAuthEndpoint>();
-  const addHost = (host: string, evidence: string): void => {
+  const addHost = (host: string, evidence: string[], crossHost?: CrossHostEndpointKind): void => {
     if (projected.has(host)) {
       covered.add(host);
       return;
     }
-    const list = candidates.get(host) ?? [];
-    if (!list.includes(evidence)) list.push(evidence);
-    candidates.set(host, list);
+    const entry = candidates.get(host) ?? { evidence: [], crossHost: new Set<CrossHostEndpointKind>() };
+    for (const line of evidence) if (!entry.evidence.includes(line)) entry.evidence.push(line);
+    if (crossHost) entry.crossHost.add(crossHost);
+    candidates.set(host, entry);
   };
-  const addEndpoint = (kind: OAuthEndpointKind, url: URL): void => {
-    endpoints.set(`${kind}\0${url.hostname}\0${url.pathname}`, { kind, host: url.hostname, path: url.pathname });
+  const addEndpoint = (kind: OAuthEndpointKind, url: URL, exact?: true): void => {
+    endpoints.set(`${kind}\0${url.hostname}\0${url.pathname}`, { kind, host: url.hostname, path: url.pathname, ...(exact ? { exact } : {}) });
+  };
+  const refusal = (claim: ClaimEndpoint): ClaimRefusal | undefined => {
+    if (!input.claimRules) return undefined;
+    return claim.kind === "metadata"
+      ? oauthHostRefusal(input.claimRules, claim.host, endpointHost)
+      : oauthEndpointRefusal(input.claimRules, claim, endpointHost);
   };
   const authorizationEndpoints: string[] = [];
-  for (const { metadata, via } of found) {
+  for (const { metadata, via, source, namedBy } of found) {
     const token = metadata.tokenEndpoint;
-    if (!bindingHosts.has(token.hostname)) {
-      rejected.push(`token_endpoint ${token.origin}${token.pathname} is not on the MCP endpoint host or a named authorization server; the proxy would not mediate its tokens, so ${metadata.metadataUrl.hostname} is not added`);
+    const tokenText = `${token.origin}${token.pathname}`;
+    const crossHostToken = !bindingHosts.has(token.hostname);
+    if (crossHostToken && source === "fallback") {
+      rejected.push(`token_endpoint ${tokenText} is not on the MCP endpoint host or a named authorization server; the proxy would not mediate its tokens, so ${metadata.metadataUrl.hostname} is not added`);
       continue;
     }
-    addHost(metadata.metadataUrl.hostname, `${via}; metadata ${metadata.metadataUrl.href}`);
+    const registration = metadata.registrationEndpoint;
+    let registrationClaim: ClaimEndpoint | undefined;
+    if (registration) {
+      if (bindingHosts.has(registration.hostname)) {
+        registrationClaim = { kind: "registration", host: registration.hostname, path: registration.pathname };
+      } else if (crossHostToken && registration.hostname === token.hostname) {
+        // Q8: a cross-host registration endpoint only on the accepted
+        // cross-host token host, matched by exact path.
+        registrationClaim = { kind: "registration", host: registration.hostname, path: registration.pathname, exact: true };
+      } else {
+        rejected.push(`registration_endpoint ${registration.origin}${registration.pathname} is not on the MCP endpoint host, a named authorization server, or the host of the token endpoint; not added`);
+      }
+    }
+    const claims: ClaimEndpoint[] = [
+      { kind: "metadata", host: metadata.metadataUrl.hostname, path: metadata.metadataUrl.pathname },
+      { kind: "token", host: token.hostname, path: token.pathname },
+      ...(registrationClaim ? [registrationClaim] : []),
+    ];
+    let refused = false;
+    for (const claim of claims) {
+      const reason = refusal(claim);
+      if (!reason) continue;
+      const shown = claim.kind === "metadata" ? `authorization server metadata ${metadata.metadataUrl.href}` : `${claim.kind}_endpoint https://${claim.host}${claim.path}`;
+      rejected.push(`${shown} cannot be used for this server: ${reason.reason}; nothing from ${metadata.metadataUrl.href} is added`);
+      if (reason.use === "curated") {
+        wellKnownRefusals.push({ kind: claim.kind, url: claim.kind === "metadata" ? metadata.metadataUrl.href : `https://${claim.host}${claim.path}`, host: claim.host });
+      }
+      refused = true;
+      break;
+    }
+    if (refused) continue;
+    addHost(metadata.metadataUrl.hostname, [`${via}; metadata ${metadata.metadataUrl.href}`]);
     if (isRecordableEndpoint("metadata", metadata.metadataUrl.hostname, metadata.metadataUrl.pathname)) {
       addEndpoint("metadata", metadata.metadataUrl);
     }
-    addHost(token.hostname, `token_endpoint ${token.origin}${token.pathname}`);
+    if (crossHostToken) {
+      addHost(token.hostname, [`token_endpoint ${tokenText}`, ...namedBy], "token");
+    } else {
+      addHost(token.hostname, [`token_endpoint ${tokenText}`]);
+    }
     addEndpoint("token", token);
-    const registration = metadata.registrationEndpoint;
-    if (registration) {
-      if (bindingHosts.has(registration.hostname)) {
-        addHost(registration.hostname, `registration_endpoint ${registration.origin}${registration.pathname}`);
-        addEndpoint("registration", registration);
+    if (registration && registrationClaim) {
+      const registrationText = `registration_endpoint ${registration.origin}${registration.pathname}`;
+      if (registrationClaim.exact) {
+        addHost(registration.hostname, [registrationText], "registration");
+        addEndpoint("registration", registration, true);
       } else {
-        rejected.push(`registration_endpoint ${registration.origin}${registration.pathname} is not on the MCP endpoint host or a named authorization server; not added`);
+        addHost(registration.hostname, [registrationText]);
+        addEndpoint("registration", registration);
       }
     }
     if (metadata.authorizationEndpoint && !authorizationEndpoints.includes(metadata.authorizationEndpoint.origin)) {
@@ -801,14 +911,18 @@ export async function discoverMcpOAuthHosts(
     }
   }
 
-  const hosts = [...candidates.entries()]
+  const hosts: DiscoveredOAuthHost[] = [...candidates.entries()]
     .sort(([left], [right]) => left.localeCompare(right))
-    .map(([host, evidence]) => ({ host, evidence }));
+    .map(([host, entry]) => ({
+      host,
+      evidence: entry.evidence,
+      ...(entry.crossHost.size > 0 ? { crossHost: [...entry.crossHost].sort() } : {}),
+    }));
   if (hosts.length > DISCOVERY_LIMITS.maxHosts) {
     rejected.push(`more than ${DISCOVERY_LIMITS.maxHosts} OAuth hosts; kept the first ${DISCOVERY_LIMITS.maxHosts}`);
     hosts.length = DISCOVERY_LIMITS.maxHosts;
   }
-  const keptHosts = new Set([...hosts.map((entry) => entry.host), ...projected]);
+  const keptHosts = new Set([...hosts.map((entry) => entry.host), ...projected, ...(input.userHosts ?? [])]);
   return {
     contacted: session.contacted,
     hosts,
@@ -817,6 +931,7 @@ export async function discoverMcpOAuthHosts(
       .sort((left, right) => `${left.kind}\0${left.host}\0${left.path}`.localeCompare(`${right.kind}\0${right.host}\0${right.path}`)),
     covered: [...covered].sort(),
     rejected,
+    wellKnownRefusals,
     authorizationEndpoints,
     oauthDetected: found.length > 0,
   };
