@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 
 import {
-  oauthProviderPolicyJson,
+  oauthMediationPolicyJson,
   validateOAuthMediationPolicy,
   type OAuthMediationPolicyJson,
 } from "@runfree/runtime-contracts/oauth-mediation-policy";
@@ -373,9 +373,7 @@ export function useApprovedPolicyGeneration(context: RuntimeContext): EffectiveP
     const loaded = validateOAuthMediationPolicy(
       parseStrictJson(source),
     );
-    baseOAuthPolicy = {
-      providers: Object.fromEntries(loaded.providers.map((provider) => [provider.providerId, oauthProviderPolicyJson(provider)])),
-    };
+    baseOAuthPolicy = oauthMediationPolicyJson(loaded);
   } catch (error) {
     if (!(error && typeof error === "object" && "code" in error && error.code === "ENOENT")) throw error;
   }

@@ -121,6 +121,41 @@ describe("effective control generations", () => {
     expect(second.controlGeneration).not.toBe(first.controlGeneration);
   });
 
+  test("carries the cross-host contract fields into the proxy payload, and a changed field is a new generation", () => {
+    const project = approvedProject();
+    const policy = (recordOnlyHosts: string[]) => ({
+      blockedEndpoints: [{ host: "blocked.example.com", path: "/oauth/token" }],
+      recordOnlyHosts,
+      refusedHosts: ["github.com"],
+      providers: {
+        "mcp:claude-ahrefs": {
+          kind: "mcp" as const,
+          resourceHost: "api.ahrefs.com",
+          bindingHosts: ["ahrefs.com"],
+          captureOwner: false as const,
+          tokenEndpoints: [{ host: "ahrefs.com", path: "/oauth/token" }],
+          registrationEndpoints: [{ host: "ahrefs.com", path: "/oauth/register", exact: true as const }],
+        },
+      },
+    });
+    const first = publishEffectivePolicyGeneration(root, project, { baseOAuthPolicy: policy(["ahrefs.com"]) });
+    const payload = JSON.parse(fs.readFileSync(first.oauthPolicyPath, "utf8")) as Record<string, unknown> & {
+      providers: Record<string, Record<string, unknown>>;
+    };
+    expect(payload).toMatchObject({
+      blockedEndpoints: [{ host: "blocked.example.com", path: "/oauth/token" }],
+      recordOnlyHosts: ["ahrefs.com"],
+      refusedHosts: ["github.com"],
+    });
+    expect(payload.providers["mcp:claude-ahrefs"]).toMatchObject({
+      bindingHosts: ["ahrefs.com"],
+      captureOwner: false,
+      registrationEndpoints: [{ exact: true, host: "ahrefs.com", path: "/oauth/register" }],
+    });
+    const second = publishEffectivePolicyGeneration(root, project, { baseOAuthPolicy: policy(["ahrefs.com", "other.example.com"]) });
+    expect(second.controlGeneration).not.toBe(first.controlGeneration);
+  });
+
   test("changes generation when a host-only runtime payload changes", () => {
     const project = approvedProject();
     const first = publishEffectivePolicyGeneration(root, project, { runtimeNetwork: { subnet: "172.30.1.0/24" } });

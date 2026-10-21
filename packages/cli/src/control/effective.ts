@@ -7,6 +7,7 @@ import {
   type PolicyJson,
 } from "@runfree/runtime-contracts/network-policy";
 import {
+  oauthMediationPolicyTopLevelJson,
   oauthProviderPolicyJson,
   validateOAuthMediationPolicy,
   type OAuthMediationPolicyJson,
@@ -169,7 +170,12 @@ function effectiveOAuthPolicy(
       } : {}),
     };
   }
-  const policy = { providers: Object.fromEntries(Object.entries(providers).sort()) };
+  // Host-owned top-level fields (record-only hosts, blocked endpoints,
+  // refused hosts) pass through from the base policy unchanged.
+  const policy = {
+    ...oauthMediationPolicyTopLevelJson(base),
+    providers: Object.fromEntries(Object.entries(providers).sort()),
+  };
   validateOAuthMediationPolicy(policy);
   return policy;
 }
