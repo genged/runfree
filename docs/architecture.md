@@ -1137,22 +1137,30 @@ settings:
 - **Blocked endpoints.** Endpoints that a record or a declared setting names
   but that no provider mediates: a dropped claim, or one that collides with
   another provider. The proxy reads the replies there and blocks real
-  tokens, so a dropped claim fails closed rather than leaking.
+  tokens, so a dropped claim fails closed rather than leaking. The rest of
+  such a host gets the same request check without its strict body rules, so
+  a variant of the endpoint's path is refused too.
 - **Record-only hosts.** Hosts that only `mcp enable` records allow. The
   proxy never reads replies there, so responses keep streaming. Instead it
   refuses, before any upstream connection, a request that looks like an
-  OAuth grant or client registration and that no server mediates.
+  OAuth grant or client registration and that no server mediates, and any
+  body it cannot check. It also refuses WebSocket upgrades there and to every
+  claimed endpoint, because it cannot read an upgrade's reply.
 - **Endpoint hosts.** Hosts that a record names and that also serve an MCP
   endpoint. They get a lighter form of the same request check that leaves
   MCP traffic alone.
 - **Share groups.** One server enabled for Claude and for Codex is one
   claimant. The host keeps a sticky owner for the group in the enable state,
   and only the owner carries the endpoints and captures metadata, so the two
-  agents' providers never collide. A revoke clears both agents' OAuth
-  state; a new group, or an owner change, clears it once more.
+  agents' providers never collide. A revoke also clears the other agent's
+  OAuth state when it has the same server name and source; a new group, or
+  an owner change, clears it once more. If the owner cannot be stored, the
+  group's endpoints are blocked for that launch, and the next launch that can
+  write the state settles it.
 
-Service OAuth providers are merged in when the effective policy generation is
-built. There, an MCP endpoint that overlaps a service's endpoint is dropped
+`mcp enable` refuses an endpoint that overlaps an approved service OAuth
+provider's endpoint. Service OAuth providers are merged in when the effective
+policy generation is built. There, an MCP endpoint that overlaps a service's endpoint is dropped
 and blocked, and a protocol-read endpoint on a credential destination is
 dropped. The rules and their limits are in [security.md](security.md#mcp).
 

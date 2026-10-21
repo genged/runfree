@@ -789,11 +789,20 @@ any approval prompt, when:
 - its query or body carries `grant_type`, `refresh_token`, `redirect_uris`,
   or `code` together with `code_verifier`;
 - it is `multipart/form-data`, its body has no `Content-Length` or is larger
-  than 16 KiB, or its body cannot be decoded.
+  than 16 KiB, its body or content encoding cannot be decoded, it declares a
+  charset other than UTF-8 or US-ASCII, or its body contains a NUL byte;
+- it is a WebSocket upgrade. The proxy cannot read an upgrade's reply, so it
+  also refuses upgrades to any endpoint URL a server claims; send those
+  requests over HTTPS.
 
 The denial reason is `oauth-endpoint-not-mediated`. An `--oauth-host` host is
-record-only too, so the second rule can refuse a large upload there; `runfree
-host add <host>` allows the host outside MCP and ends the rule. See
+record-only too, so the second and third rules can refuse a large upload or a
+WebSocket there. `runfree host add <host>` allows the host outside MCP and
+ends these rules, and with them the grant refusal: a token request there that
+the proxy does not mediate then returns real tokens to the agent. On a host
+where a dropped or disputed claim left a blocked endpoint, the proxy refuses
+grant-shaped requests on every path, so variants such as `/oauth/token/` are
+caught too. See
 [An OAuth request was refused as not mediated](troubleshooting.md#an-oauth-request-was-refused-as-not-mediated).
 
 **One server for both agents.** When the same server (name, source,
@@ -801,7 +810,9 @@ endpoint, and OAuth settings) is enabled for Claude and for Codex, both agents
 share one OAuth login. The proxy files its tokens under one owner agent: the
 one enabled first. When the shared group first forms, and once after an
 upgrade, Runfree clears the server's proxy OAuth state and warns that each
-agent needs a new login.
+agent needs a new login. If Runfree cannot store the owner in its state
+directory, it warns, and the proxy refuses the server's logins until a later
+launch can write the file.
 
 OAuth hosts are not written to `.runfree/network-policy.json`. They are
 host-owned records bound to the reviewed server config: if a project entry
@@ -812,10 +823,14 @@ explain` lists the recorded hosts and endpoints.
 
 `runfree mcp revoke` also clears the proxy's OAuth state for the server: its
 tokens, its `runfree_oauth_*` handles, and the issuers and endpoints the proxy
-found at run time. It does this for every source of that server name, and for
-both agents, because one server shares its login across agents. If the
+found at run time. It does this for every source of that agent and server
+name. It also clears the other agent's state when that agent has an entry with
+the same server name and source, because such a server shares its login, and
+prints `claude and codex share one OAuth login for <server> ...`. If the
 revoked agent owned a shared login, the next launch moves it to the other
-agent and clears the state again. A later `mcp enable` needs a new login.
+agent and clears the state again. Revoking only the agent that does not own
+the login does not stop that agent from logging in through the owner's
+endpoint while the owner stays enabled; revoke both to end it. A later `mcp enable` needs a new login.
 Revoke prints one of these lines:
 
 | Line | Meaning |
