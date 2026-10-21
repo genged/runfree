@@ -155,6 +155,77 @@ describe("classifyGrantShape: top-level scope (hosts that also serve an MCP endp
   });
 });
 
+describe("classifyGrantShape: charset and NUL bytes under fail-closed rules", () => {
+  test.each([
+    ["a UTF-16 charset", "application/x-www-form-urlencoded; charset=utf-16"],
+    ["a Latin-1 charset", "application/x-www-form-urlencoded; charset=ISO-8859-1"],
+    ["a quoted unknown charset", 'application/json; charset="shift_jis"'],
+  ])("refuses %s", (_label, contentType) => {
+    expect(classify({ body: "a=b", contentType })).toEqual({ kind: "undecodable" });
+  });
+
+  test.each([
+    ["utf-8", "application/x-www-form-urlencoded; charset=utf-8"],
+    ["quoted UTF-8", 'application/json; charset="UTF-8"'],
+    ["us-ascii", "text/plain; charset=us-ascii"],
+  ])("reads a declared %s charset", (_label, contentType) => {
+    expect(classify({ body: "{\"a\":1}", contentType })).toBeUndefined();
+  });
+
+  test("refuses a NUL byte, which an issuer might treat as the end of the body", () => {
+    expect(classify({ body: Buffer.from("a=b\0&grant_type=x"), contentType: FORM })).toEqual({ kind: "undecodable" });
+    expect(classify({ body: Buffer.from("a=b\0"), contentType: FORM })).toEqual({ kind: "undecodable" });
+  });
+
+  test("lenient mode reads past a NUL byte and an unknown charset", () => {
+    expect(classify({ body: Buffer.from("a=b\0&grant_type=x"), contentType: "text/plain; charset=utf-16", failClosed: false }))
+      .toEqual({ kind: "grant-shaped", field: "grant_type" });
+  });
+});
+
+describe("classifyGrantShape: lenient mode resists cheap bypasses", () => {
+  const scopes = ["top-level", "deep"] as const;
+
+  test.each(scopes)("%s: an invalid UTF-8 byte does not hide a form grant", (scope) => {
+    const body = Buffer.concat([Buffer.from("grant_type=refresh_token&refresh_token=R&z="), Buffer.from([0xff])]);
+    expect(classify({ body, contentType: FORM, scope, failClosed: false })).toEqual({ kind: "grant-shaped", field: "grant_type" });
+  });
+
+  test.each(scopes)("%s: an unknown content encoding on a plain form body is read as sent", (scope) => {
+    expect(classify({ body: "grant_type=refresh_token&refresh_token=R", encoding: "x-anything", contentType: FORM, scope, failClosed: false }))
+      .toEqual({ kind: "grant-shaped", field: "grant_type" });
+  });
+
+  test.each(scopes)("%s: a stacked or broken encoding on a plain body is read as sent", (scope) => {
+    for (const encoding of ["gzip, br", "gzip"]) {
+      expect(classify({ body: "refresh_token=R", encoding, contentType: FORM, scope, failClosed: false }), encoding)
+        .toEqual({ kind: "grant-shaped", field: "refresh_token" });
+    }
+  });
+
+  test.each(scopes)("%s: a known encoding is still decoded", (scope) => {
+    expect(classify({ body: zlib.gzipSync("grant_type=x"), encoding: "gzip", contentType: FORM, scope, failClosed: false }))
+      .toEqual({ kind: "grant-shaped", field: "grant_type" });
+  });
+
+  test.each([
+    ["a form content type", FORM],
+    ["text/plain", "text/plain"],
+    ["no content type", undefined],
+  ])("top-level: valid JSON sent as %s is also read as a form", (_label, contentType) => {
+    const body = JSON.stringify(["&grant_type=refresh_token&refresh_token=R&x="]);
+    expect(classify({ body, ...(contentType !== undefined ? { contentType } : {}), scope: "top-level", failClosed: false }))
+      .toEqual({ kind: "grant-shaped", field: "grant_type" });
+  });
+
+  test("top-level: the same body declared as JSON is not form-read (JSON-RPC pass-through)", () => {
+    const body = JSON.stringify(["&grant_type=refresh_token&refresh_token=R&x="]);
+    expect(classify({ body, contentType: "application/json", scope: "top-level", failClosed: false })).toBeUndefined();
+    const rpc = JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { q: "&grant_type=x&" } });
+    expect(classify({ body: rpc, contentType: "application/json; charset=utf-8", scope: "top-level", failClosed: false })).toBeUndefined();
+  });
+});
+
 describe("responseCarriesOAuthSecret", () => {
   test.each([
     ["a flat token response", { access_token: "real" }],

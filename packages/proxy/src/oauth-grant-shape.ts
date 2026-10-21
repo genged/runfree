@@ -23,9 +23,16 @@
 //   and whose arguments sit under `params`, is never refused by a deep scan.
 // - `failClosed` (record-only hosts, blocked endpoints, colliding
 //   endpoints): a body the proxy cannot read is itself a finding: multipart,
-//   an encoding, charset, or JSON body it cannot decode, a body without
-//   Content-Length, and a wire or decoded body over 16 KiB. Without it an
-//   unreadable or oversized body passes, and only its query is matched.
+//   a content encoding it cannot decode, a declared charset other than
+//   UTF-8 or US-ASCII, bytes that are not valid UTF-8, a NUL byte, a JSON
+//   body that does not parse, a body without Content-Length, and a wire or
+//   decoded body over 16 KiB.
+// - Without it (lenient) nothing is refused for being unreadable, but the
+//   scan is hardened so that cheap tricks do not skip it: bytes that are not
+//   valid UTF-8 are decoded with replacement characters, a body whose
+//   content encoding is unknown, stacked, or does not decode is scanned as
+//   the raw bytes, and any body not declared as JSON is also read as a form.
+//   Only a body over the lenient cap (256 KiB) is not scanned.
 
 import zlib from "node:zlib";
 
@@ -170,14 +177,23 @@ function decodeBody(raw: Buffer, encodings: string[], cap: number): DecodedBody 
 }
 
 const UTF8 = new TextDecoder("utf-8", { fatal: true });
+const UTF8_LENIENT = new TextDecoder("utf-8", { fatal: false });
 
-function decodeText(bytes: Buffer): string | undefined {
+function decodeText(bytes: Buffer, fatal: boolean): string | undefined {
   try {
-    return UTF8.decode(bytes);
+    return (fatal ? UTF8 : UTF8_LENIENT).decode(bytes);
   } catch {
     return undefined;
   }
 }
+
+// The charset a Content-Type declares, lowercased and unquoted, if any.
+function declaredCharset(contentType: string): string | undefined {
+  const match = /(?:^|;)\s*charset\s*=\s*("?)([^";,\s]*)\1/i.exec(contentType);
+  return match ? match[2].toLowerCase() : undefined;
+}
+
+const READABLE_CHARSETS = new Set(["utf-8", "utf8", "us-ascii", "ascii"]);
 
 function declaredContentLength(headers: Record<string, HeaderValue> | undefined): "absent" | "invalid" | number {
   const values = headerValues(headers, "content-length");
@@ -222,23 +238,38 @@ export function classifyGrantShape(input: GrantShapeInput): GrantShapeFinding | 
   }
 
   const decoded = decodeBody(raw, headerValues(input.headers, "content-encoding"), cap);
-  const text = decoded.ok ? decodeText(decoded.bytes) : undefined;
-  if (text === undefined) {
-    if (!failClosed) return undefined;
-    return decoded.ok ? { kind: "undecodable" } : { kind: decoded.reason };
+  let bytes: Buffer;
+  if (decoded.ok) {
+    bytes = decoded.bytes;
+  } else if (failClosed) {
+    return { kind: decoded.reason };
+  } else {
+    // An issuer may ignore a coding it does not know: read the bytes as sent.
+    bytes = raw;
   }
+  if (failClosed) {
+    const charset = declaredCharset(contentType);
+    if (charset !== undefined && !READABLE_CHARSETS.has(charset)) return { kind: "undecodable" };
+    if (bytes.includes(0)) return { kind: "undecodable" };
+  }
+  const text = decodeText(bytes, failClosed);
+  if (text === undefined) return { kind: "undecodable" };
 
   const json = parseJson(text.trim());
+  const declaredJson = contentType.includes("json");
   if (deep) {
     if (json.ok) addJsonFieldsDeep(fields, json.value);
-    else if (failClosed && contentType.includes("json")) return { kind: "undecodable" };
+    else if (failClosed && declaredJson) return { kind: "undecodable" };
     // Also read as a form whatever the content type: an issuer that parses
     // forms would find a grant smuggled inside JSON string text.
     addFormFields(fields, text);
-  } else if (json.ok) {
-    addJsonFieldsTopLevel(fields, json.value);
   } else {
-    addFormFields(fields, text);
+    if (json.ok) addJsonFieldsTopLevel(fields, json.value);
+    // A body not declared as JSON is read as a form too, even when it
+    // happens to parse as JSON: an issuer that reads forms would find a
+    // grant in `["&grant_type=...&x="]`. JSON-RPC is declared as JSON, so
+    // its nested params are never form-read.
+    if (!json.ok || !declaredJson) addFormFields(fields, text);
   }
   const field = grantField(fields);
   return field !== undefined ? { kind: "grant-shaped", field } : undefined;
