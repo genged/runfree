@@ -43,6 +43,7 @@ export const DENIAL_REASONS = [
   "host-service-not-configured",
   "host-service-unavailable",
   "host-service-capacity",
+  "oauth-endpoint-not-mediated",
   "policy-denied",
 ] as const;
 
@@ -96,6 +97,7 @@ const DENIAL_REASON_TEXT: Record<DenialReason, string> = {
   "host-service-not-configured": "this host service is not approved for the project",
   "host-service-unavailable": "the host-service gateway or the host service is not available",
   "host-service-capacity": "too many host-service connections are already open",
+  "oauth-endpoint-not-mediated": "an OAuth token or client registration request to an endpoint the proxy does not mediate",
   // Defensive catch-all for a denial no earlier classification arm named. The
   // 403 body carries the precise message; this text serves doctor/summary.
   "policy-denied": "blocked by proxy policy",
@@ -149,7 +151,131 @@ export type ShapeDenialBodyDetails = {
   // The request was an OAuth token POST whose client_id is a client metadata
   // URL Runfree does not recognize (fixed text; the value is never echoed).
   oauthUnlistedClientIdUrl?: boolean;
+  // Why an OAuth-shaped request was refused as not mediated.
+  oauthEndpoint?: OAuthEndpointDenialDetails;
 };
+
+// The parts of an unmediated-OAuth refusal a denial body shows. Every value
+// is from a closed set except `providers`, which is re-sanitized here.
+export type OAuthEndpointDenialDetails = {
+  // A closed set of OAuth field names (never request data).
+  field?: "code" | "grant_type" | "redirect_uris" | "refresh_token";
+  finding: "grant-shaped" | "missing-length" | "multipart" | "oversize" | "undecodable";
+  providers?: readonly string[];
+  target: "blocked-endpoint" | "endpoint-collision" | "policy-unavailable" | "record-endpoint-host" | "record-only-host";
+};
+
+const OAUTH_FIELD_TEXT: Record<NonNullable<OAuthEndpointDenialDetails["field"]>, string> = {
+  code: "code with code_verifier (an authorization code exchange)",
+  grant_type: "grant_type (a token exchange)",
+  redirect_uris: "redirect_uris (a client registration)",
+  refresh_token: "refresh_token (a token refresh)",
+};
+
+const OAUTH_UNREADABLE_TEXT: Record<Exclude<OAuthEndpointDenialDetails["finding"], "grant-shaped">, string> = {
+  "missing-length": "its body has no Content-Length",
+  multipart: "it is multipart/form-data",
+  oversize: "its body is larger than 16 KiB",
+  undecodable: "its body or content encoding cannot be decoded",
+};
+
+const OAUTH_TARGET_TEXT: Record<OAuthEndpointDenialDetails["target"], string[]> = {
+  "blocked-endpoint": [
+    "The OAuth settings of an MCP server name this endpoint, but the proxy does",
+    "not mediate it: another use of the host conflicts with that claim.",
+  ],
+  "endpoint-collision": [
+    "More than one OAuth server claims this endpoint, so none of them mediates",
+    "it: a token reply here could be filed under the wrong server.",
+  ],
+  "policy-unavailable": [
+    "The OAuth mediation policy of the proxy is unavailable, so it refuses",
+    "every OAuth token request it cannot mediate.",
+  ],
+  "record-endpoint-host": [
+    "The OAuth settings of an MCP server name this host, and the proxy does",
+    "not mediate this endpoint.",
+  ],
+  "record-only-host": [
+    "Only MCP OAuth settings allow this host, and the proxy does not mediate",
+    "this endpoint.",
+  ],
+};
+
+function displayProviderId(raw: string): string {
+  return raw.replace(/[^A-Za-z0-9_.:-]/g, "-").slice(0, 80);
+}
+
+function oauthEndpointLines(host: string, details: OAuthEndpointDenialDetails | undefined): string[] {
+  const lines: string[] = [];
+  if (details === undefined) {
+    lines.push(
+      "The proxy holds the real OAuth tokens of MCP servers and gives the agent handles.",
+      "It does not mediate this endpoint, so the request was not sent.",
+      "",
+    );
+  } else {
+    lines.push(...OAUTH_TARGET_TEXT[details.target]);
+    if (details.finding === "grant-shaped") {
+      const field = details.field !== undefined ? OAUTH_FIELD_TEXT[details.field] : "an OAuth grant field";
+      lines.push(
+        `The request carries ${field}. Its reply would hand real tokens`,
+        "to the agent instead of handles, so the request was not sent.",
+      );
+    } else {
+      lines.push(
+        `The proxy cannot check this request for an OAuth token exchange: ${OAUTH_UNREADABLE_TEXT[details.finding]}.`,
+        "The request was not sent.",
+      );
+    }
+    const providers = (details.providers ?? []).map(displayProviderId).filter((id) => id !== "").slice(0, 4);
+    if (providers.length > 0) {
+      lines.push(`OAuth providers involved: ${providers.join(", ")}`);
+    }
+    lines.push("");
+  }
+  if (details?.target === "policy-unavailable") {
+    lines.push(
+      "The person operating Runfree can inspect the proxy by running",
+      "`runfree doctor` on the host machine.",
+    );
+    return lines;
+  }
+  if (details?.target === "endpoint-collision") {
+    lines.push(
+      "The person operating Runfree can revoke one of the servers on the host",
+      "machine, so the other one mediates the endpoint:",
+      "",
+      "  runfree mcp revoke <agent> <server>",
+      "",
+    );
+  } else {
+    lines.push(
+      "If the login of an MCP server uses this endpoint, the person operating",
+      "Runfree can enable the server again on the host machine, so the proxy",
+      "records and mediates the endpoint:",
+      "",
+      "  runfree mcp enable <agent> <server>",
+      "",
+      "or remove the server and its OAuth hosts:",
+      "",
+      "  runfree mcp revoke <agent> <server>",
+      "",
+    );
+  }
+  if (details?.target === "record-only-host" && details.finding !== "grant-shaped" && host !== UNPARSEABLE_HOST) {
+    // A broad --oauth-host host also takes ordinary uploads; allowing it
+    // outside MCP stops it being record-only.
+    lines.push(
+      "If this host should also take ordinary uploads, the person operating",
+      "Runfree can allow it outside MCP:",
+      "",
+      `  runfree host add ${host}`,
+      "",
+    );
+  }
+  return lines;
+}
 
 // The exact widening command for a method denial. Repeating `runfree host rules`
 // with rule flags replaces the host's entry, so the suggestion reproduces the
@@ -313,6 +439,21 @@ export function syntheticDenialBody(rawHost: string, reason: DenialReason, detai
     "This block is enforced by the Runfree proxy outside the agent container.",
   ];
   const allowlistDenial = reason === "host-not-allowlisted" || reason === "websocket-host-not-allowlisted";
+  if (reason === "oauth-endpoint-not-mediated") {
+    const method = details?.method !== undefined ? displayMethod(details.method) : undefined;
+    const path = safePathname(details?.path);
+    return `${[
+      "Runfree blocked this request.",
+      "",
+      `  host:   ${host}`,
+      ...(method !== undefined ? [`  method: ${method}`] : []),
+      ...(path !== undefined ? [`  path:   ${path}`] : []),
+      `  reason: ${DENIAL_REASON_TEXT[reason]}`,
+      "",
+      ...oauthEndpointLines(host, details?.oauthEndpoint),
+      ...(host !== UNPARSEABLE_HOST ? [`Current rules: runfree host explain ${host}`] : []),
+    ].join("\n")}\n`;
+  }
   if (reason === "missing-admission-record" && host !== UNPARSEABLE_HOST) {
     // A connection denied at CONNECT stays denied even after the host is
     // allowlisted: the guard cannot upgrade it in place. The remedy is a new

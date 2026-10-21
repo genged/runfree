@@ -100,6 +100,7 @@ export const RUNTIME_ASSET_DESCRIPTORS: readonly RuntimeAssetDescriptor[] = [
   proxyImage("proxy/lfs-classify.js"),
   proxyImage("proxy/mcp-classify.js"),
   proxyImage("proxy/mockttp-adapter.js"),
+  proxyImage("proxy/oauth-grant-shape.js"),
   proxyImage("proxy/oauth-mediation.js"),
   proxyImage("proxy/oauth-protocol-read.js"),
   proxyImage("proxy/package-lock.json"),

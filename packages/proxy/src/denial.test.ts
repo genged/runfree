@@ -167,6 +167,54 @@ describe("denial display helpers", () => {
   });
 });
 
+describe("oauth-endpoint-not-mediated denial bodies", () => {
+  const body = (details: Parameters<typeof syntheticDenialBody>[2]) => syntheticDenialBody("ahrefs.com", "oauth-endpoint-not-mediated", details);
+
+  test("a grant to a record-only host names the field, the path (never the query), and the MCP remedies", () => {
+    const text = body({
+      method: "POST",
+      path: "/oauth/token?code=secret",
+      oauthEndpoint: { field: "grant_type", finding: "grant-shaped", providers: ["mcp:claude-ahrefs"], target: "record-only-host" },
+    });
+    expect(text).toContain("host:   ahrefs.com");
+    expect(text).toContain("path:   /oauth/token");
+    expect(text).not.toContain("secret");
+    expect(text).toContain("grant_type (a token exchange)");
+    expect(text).toContain("OAuth providers involved: mcp:claude-ahrefs");
+    expect(text).toContain("  runfree mcp enable <agent> <server>");
+    expect(text).toContain("  runfree mcp revoke <agent> <server>");
+    expect(text).not.toContain("runfree host add");
+  });
+
+  test.each(["oversize", "multipart", "missing-length", "undecodable"] as const)(
+    "an unreadable %s body on a record-only host also names host add",
+    (finding) => {
+      expect(body({ oauthEndpoint: { finding, target: "record-only-host" } })).toContain("  runfree host add ahrefs.com");
+      expect(body({ oauthEndpoint: { finding, target: "blocked-endpoint" } })).not.toContain("runfree host add");
+    },
+  );
+
+  test("a collision names both providers and the revoke remedy only", () => {
+    const text = body({ oauthEndpoint: { finding: "grant-shaped", field: "code", providers: ["mcp:claude-a", "mcp:codex-b"], target: "endpoint-collision" } });
+    expect(text).toContain("More than one OAuth server claims this endpoint");
+    expect(text).toContain("OAuth providers involved: mcp:claude-a, mcp:codex-b");
+    expect(text).toContain("  runfree mcp revoke <agent> <server>");
+    expect(text).not.toContain("runfree mcp enable");
+  });
+
+  test("an unavailable policy points at doctor", () => {
+    const text = body({ oauthEndpoint: { finding: "grant-shaped", field: "refresh_token", target: "policy-unavailable" } });
+    expect(text).toContain("runfree doctor");
+    expect(text).not.toContain("runfree mcp");
+  });
+
+  test("provider ids are sanitized and bounded", () => {
+    const text = body({ oauthEndpoint: { finding: "grant-shaped", providers: ["mcp:evil\x1b[31m\nname", "a", "b", "c", "d"], target: "record-only-host" } });
+    expect(text).toContain("OAuth providers involved: mcp:evil--31m-name, a, b, c\n");
+    expect(text).not.toContain("\x1b");
+  });
+});
+
 describe("denial event emitter", () => {
   function emitterWithClock() {
     const lines: string[] = [];

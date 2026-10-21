@@ -50,6 +50,8 @@ export type ProxyRequest = {
   // mockttp's buffered request body accessor; present on the async server
   // path, absent in synchronous policy checks.
   body?: {
+    // The raw buffered body, still content-encoded, exactly as forwarded.
+    buffer?: Buffer;
     getText(): Promise<string | undefined>;
     // The buffered body after content-encoding decoding (undefined when it
     // cannot be decoded). Optional so synchronous test doubles can omit it;

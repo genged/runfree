@@ -34,6 +34,7 @@ import {
   type OAuthProxyResponse,
   type OAuthRequestResult,
   type ProtocolReadMatch,
+  type UnmediatedOAuthRequestRefusal,
 } from "./oauth-mediation.js";
 import {
   PROTOCOL_READ_BODY_CAP_BYTES,
@@ -219,10 +220,26 @@ let policyRevalidationCandidate: {
   mcpOperationGeneration: string | undefined;
 } | undefined;
 const oauthMediator = new OAuthMediator({
+  // X5: hosts that receive static credential injection, from the network
+  // policy current at the call.
+  credentialHosts: () => credentialDestinationHosts(currentPolicy),
   ...(currentEffectiveControl ? { pairedPolicy: currentEffectiveControl.oauthPolicy } : {}),
+  unmediatedRequestResponse: (req, refusal) => oauthEndpointNotMediatedResponse(req as ProxyRequest, refusal),
 });
 const admissionRegistry = new AdmissionRegistry();
 const sessionSockets = new Map<string, Set<net.Socket>>();
+
+// Hosts with at least one credential mapping: the proxy injects a static
+// credential there. Cached per loaded policy object.
+const credentialHostCache = new WeakMap<LoadedProxyPolicy, ReadonlySet<string>>();
+function credentialDestinationHosts(policy: LoadedProxyPolicy): ReadonlySet<string> {
+  let hosts = credentialHostCache.get(policy);
+  if (hosts === undefined) {
+    hosts = new Set(Object.entries(policy.credentials).filter(([, mappings]) => mappings.length > 0).map(([host]) => host));
+    credentialHostCache.set(policy, hosts);
+  }
+  return hosts;
+}
 
 function revokeSessionContexts(sessionKey: string): void {
   writeApprovals.revokeSession(sessionKey);
@@ -1130,7 +1147,7 @@ async function auditedRequestMutation(admission: AdmissionRecord, req: ProxyRequ
     ...req,
     headers: headers ?? req.headers,
   };
-  const oauthMutation = await oauthMediator.beforeRequest(nextReq, { responseMediated });
+  const oauthMutation = await oauthMediator.beforeRequest(nextReq, { allowlisted: false, responseMediated });
   return combineRequestMutations(headers ? { headers } : {}, oauthMutation);
 }
 
@@ -1639,6 +1656,15 @@ async function policedRequestMutation(
   let credential: CredentialMutationSummary | undefined;
   const principal = currentAdmissionPrincipal(admission);
   if (principal === undefined) return missingAdmissionResponse(req);
+  // P1-a: an OAuth grant- or registration-shaped request that no provider
+  // mediates, to a host or endpoint the OAuth policy guards, is refused
+  // before write classification and the approval hold (no prompt, no pending
+  // record), before credential injection, and before any upstream connection
+  // or OAuth state write. A held request re-runs this path when released.
+  const unmediated = await oauthMediator.unmediatedRequestRefusal(req, {
+    allowlisted: currentPolicy.allowedHostSet.has(requestHost(req)),
+  });
+  if (unmediated) return oauthEndpointNotMediatedResponse(req, unmediated);
   const graphqlBodyClass = await graphqlBodyClassForRequest(req);
   const lfsBodyClass = await lfsBodyClassForRequest(req);
   const mcpClassification = await mcpClassificationForRequest(req);
@@ -1722,6 +1748,24 @@ function policyDenialResponse(req: ProxyRequest, error: Error) {
     };
   }
   return blockedResponse(requestHost(req), error.message);
+}
+
+function oauthEndpointNotMediatedResponse(req: ProxyRequest, refusal: UnmediatedOAuthRequestRefusal) {
+  const host = requestHost(req);
+  const method = req.method ?? "<unknown>";
+  emitDenial({ reason: "oauth-endpoint-not-mediated", host, method, path: req.url });
+  return {
+    response: syntheticDenialResponseFields(host, "oauth-endpoint-not-mediated", {
+      method,
+      path: refusal.path,
+      oauthEndpoint: {
+        ...(refusal.finding.kind === "grant-shaped" ? { field: refusal.finding.field } : {}),
+        finding: refusal.finding.kind,
+        providers: refusal.providers,
+        target: refusal.target,
+      },
+    }),
+  };
 }
 
 function writeApprovalDenial(req: ProxyRequest, shape: ShapeDenialDetails, reason: DenialReason) {

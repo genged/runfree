@@ -273,10 +273,27 @@ describe("OAuthMediator.protocolReadEndpoint", () => {
     expect(target.protocolReadEndpoint({ method: "POST", url: REGISTER_URL })).toEqual({ provider: "mcp:claude-linear", kind: "registration", resourceHost: "mcp.example.test" });
   });
 
-  test("does not match an endpoint another server discovered at run time", async () => {
+  test("another server cannot bind an issuer on this server's token host, so the protocol read stays", async () => {
     const target = mediator({
       "mcp:claude-linear": linear(),
       "mcp:claude-other": { kind: "mcp", resourceHost: "other.example.test" },
+    });
+    // The other server's resource names this server's issuer host: R2
+    // refuses the binding, so the other server never claims the endpoint.
+    await target.beforeResponse({
+      body: { getText: async () => JSON.stringify({ authorization_servers: ["https://auth.example.test"] }) },
+      statusCode: 200,
+    }, { method: "GET", url: "https://other.example.test/.well-known/oauth-protected-resource" });
+    expect(fs.existsSync(path.join(stateDir, "handles.json"))).toBe(false);
+    expect(target.protocolReadEndpoint({ method: "POST", url: TOKEN_URL })).toEqual({ provider: "mcp:claude-linear", kind: "token", resourceHost: "mcp.example.test" });
+  });
+
+  test("does not match an endpoint another server discovered at run time", async () => {
+    const target = mediator({
+      "mcp:claude-linear": linear(),
+      // The other server's user hosts include the shared issuer host, so its
+      // capture there is bound and the discovery collides.
+      "mcp:claude-other": { kind: "mcp", resourceHost: "other.example.test", bindingHosts: ["auth.example.test"] },
     });
     // The other server's resource names the shared issuer, which advertises
     // the same token endpoint.
