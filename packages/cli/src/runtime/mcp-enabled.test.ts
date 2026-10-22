@@ -140,13 +140,14 @@ describe("mcp-enabled store", () => {
         [digest]: { owner: "mcp:codex-srv" },
         ["b".repeat(64)]: { owner: "not a provider" },
         short: { owner: "mcp:claude-srv" },
+        // An entry with an unknown key is dropped too.
         ["c".repeat(64)]: { owner: "mcp:claude-srv", released: true },
       },
     });
     const read = readMcpEnabled(projectRoot, mcpEnabledPath(stateDir), { quiet: true });
     expect(read.malformed).toBe(false);
     expect(read.file.records["project:claude:srv:abc"]).toEqual(record());
-    expect(read.file.shareGroups).toEqual({ [digest]: { owner: "mcp:codex-srv" }, ["c".repeat(64)]: { owner: "mcp:claude-srv", released: true } });
+    expect(read.file.shareGroups).toEqual({ [digest]: { owner: "mcp:codex-srv" } });
   });
 
   test("storing share group owners changes nothing else, not even an invalid record", () => {
@@ -166,14 +167,13 @@ describe("mcp-enabled store", () => {
     expect(fs.readFileSync(mcpEnabledPath(stateDir), "utf8")).toBe("{not json");
   });
 
-  test("removing a server releases the share groups its provider owns, and keeps the others", () => {
+  test("removing a server keeps the stored share group owners", () => {
     const owned = "e".repeat(64);
     const other = "f".repeat(64);
     writeRaw({ a: record({ identity: "a" }) }, { shareGroups: { [owned]: { owner: "mcp:claude-srv" }, [other]: { owner: "mcp:codex-srv" } } });
-    const result = removeMcpEnabledRecords(projectRoot, mcpEnabledPath(stateDir), { agent: "claude", server: "srv", clearOwners: ["mcp:claude-srv"] });
-    expect(result.clearedOwners).toBe(1);
+    removeMcpEnabledRecords(projectRoot, mcpEnabledPath(stateDir), { agent: "claude", server: "srv" });
     expect(readMcpEnabled(projectRoot, mcpEnabledPath(stateDir), { quiet: true }).file.shareGroups).toEqual({
-      [owned]: { owner: "mcp:claude-srv", released: true },
+      [owned]: { owner: "mcp:claude-srv" },
       [other]: { owner: "mcp:codex-srv" },
     });
   });
@@ -236,7 +236,7 @@ describe("mcp-enabled store", () => {
     writeRaw({ c: record({ identity: "c", server: "other" }) });
     const before = fs.statSync(mcpEnabledPath(stateDir)).mtimeMs;
     const result = removeMcpEnabledRecords(projectRoot, mcpEnabledPath(stateDir), { agent: "claude", server: "srv" });
-    expect(result).toEqual({ droppedInvalid: 0, removed: [], clearedOwners: 0 });
+    expect(result).toEqual({ droppedInvalid: 0, removed: [] });
     expect(fs.statSync(mcpEnabledPath(stateDir)).mtimeMs).toBe(before);
   });
 

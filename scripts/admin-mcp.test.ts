@@ -1210,7 +1210,7 @@ type EnabledFile = {
     oauthHosts: Array<{ host: string; origin: string; crossHost?: true; crossHostKinds?: string[] }>;
     oauthEndpoints?: Array<{ kind: string; host: string; path: string; exact?: true }>;
   }>;
-  shareGroups?: Record<string, { owner: string; released?: true }>;
+  shareGroups?: Record<string, { owner: string }>;
 };
 
 function readEnabledFile(): EnabledFile {
@@ -2141,29 +2141,58 @@ describe("runfree mcp enable: share groups", () => {
     expect((readMcpOAuthPolicy() as OAuthPolicyFile).blockedEndpoints).toBeUndefined();
   });
 
-  test("revoking the owner moves ownership, clears every member's OAuth state, and says so", async () => {
+  test("revoking the owner clears every member's OAuth state through the revoke's own epochs; a still-configured owner keeps ownership", async () => {
     writeSharedServers();
     expect((await enableShared("codex")).status).toBe(0);
     expect((await runAdmin(() => prepareRuntime())).status).toBe(0);
     expect((await enableShared("claude")).status).toBe(0);
     expect((await runAdmin(() => prepareRuntime())).status).toBe(0);
     const before = providers();
+    type Epochs = { providers: Record<string, { epoch: string }> };
+    const epochs = (): Epochs => JSON.parse(fs.readFileSync(path.join(stateDir, "mcp-oauth-epochs.json"), "utf8")) as Epochs;
 
     const revoke = await runAdmin(() => { mcpRevokeIntent({ agent: parseMcpAgent("codex"), server: "ahrefs" }); });
     expect(revoke.status, revoke.stderr).toBe(0);
     expect(revoke.stdout).toContain("claude and codex share one OAuth login for ahrefs (same server name and source), so each needs a new OAuth login for it");
+    const revoked = epochs().providers;
     const prepare = await runAdmin(() => prepareRuntime());
     expect(prepare.status, prepare.stderr).toBe(0);
-    expect(prepare.stderr).toContain("the agent that held its shared OAuth login left");
+    // The revoke already cleared both members; the projection publishes
+    // exactly the revoke's epochs, so the proxy can confirm the clear.
+    expect(prepare.stderr).not.toContain("new OAuth login");
     const after = providers();
-    expect(after["mcp:claude-ahrefs"]?.tokenEndpoints).toEqual([{ host: "shared.example", path: "/oauth/token" }]);
-    expect(after["mcp:codex-ahrefs"]?.captureOwner).toBe(false);
     expect(after["mcp:claude-ahrefs"]?.stateEpoch).not.toBe(before["mcp:claude-ahrefs"]?.stateEpoch);
     expect(after["mcp:codex-ahrefs"]?.stateEpoch).not.toBe(before["mcp:codex-ahrefs"]?.stateEpoch);
-    // Settled: the next projection is quiet and stable.
-    const next = await runAdmin(() => prepareRuntime());
-    expect(next.stderr).not.toContain("new OAuth login");
-    expect(providers()["mcp:claude-ahrefs"]?.stateEpoch).toBe(after["mcp:claude-ahrefs"]?.stateEpoch);
+    expect(after["mcp:claude-ahrefs"]?.stateEpoch).toBe(revoked["mcp:claude-ahrefs"]?.epoch);
+    expect(after["mcp:codex-ahrefs"]?.stateEpoch).toBe(revoked["mcp:codex-ahrefs"]?.epoch);
+    // Codex's user entry is still configured, so it stays the owner.
+    expect(after["mcp:codex-ahrefs"]?.captureOwner).toBeUndefined();
+    expect(after["mcp:claude-ahrefs"]?.captureOwner).toBe(false);
+
+    // An owner whose entry is gone moves ownership, with a clear.
+    writeCodexNative("");
+    const moved = await runAdmin(() => prepareRuntime());
+    expect(moved.status, moved.stderr).toBe(0);
+    expect(moved.stderr).toContain("the agent that held its shared OAuth login left");
+    expect(providers()["mcp:claude-ahrefs"]?.captureOwner).toBeUndefined();
+    expect(providers()["mcp:claude-ahrefs"]?.stateEpoch).not.toBe(after["mcp:claude-ahrefs"]?.stateEpoch);
+  });
+
+  test("a revoke of a server alone publishes the revoke's epoch at the next projection (no second clear)", async () => {
+    writeClaudeNative({ mcpServers: { ahrefs: { type: "http", url: SHARED_URL } } });
+    expect((await enableShared("claude")).status).toBe(0);
+    expect((await runAdmin(() => prepareRuntime())).status).toBe(0);
+    type Epochs = { providers: Record<string, { epoch: string }> };
+    const epochs = (): Epochs => JSON.parse(fs.readFileSync(path.join(stateDir, "mcp-oauth-epochs.json"), "utf8")) as Epochs;
+    for (const source of ["user", "project"] as const) {
+      const revoke = await runAdmin(() => { mcpRevokeIntent({ agent: parseMcpAgent("claude"), server: "ahrefs", source }); });
+      expect(revoke.status, revoke.stderr).toBe(0);
+      const revoked = epochs().providers["mcp:claude-ahrefs"]?.epoch;
+      const prepare = await runAdmin(() => prepareRuntime());
+      expect(prepare.status, prepare.stderr).toBe(0);
+      expect(prepare.stderr, source).not.toContain("new OAuth login");
+      expect(providers()["mcp:claude-ahrefs"]?.stateEpoch, source).toBe(revoked);
+    }
   });
 
   test("upgrade: a group that forms from members that may already hold handles clears every member's state once", async () => {

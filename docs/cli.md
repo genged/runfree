@@ -826,9 +826,10 @@ tokens, its `runfree_oauth_*` handles, and the issuers and endpoints the proxy
 found at run time. It does this for every source of that agent and server
 name. It also clears the other agent's state when that agent has an entry with
 the same server name and source, because such a server shares its login, and
-prints `claude and codex share one OAuth login for <server> ...`. If the
-revoked agent owned a shared login, the next launch moves it to the other
-agent and clears the state again. Revoking only the agent that does not own
+prints `claude and codex share one OAuth login for <server> ...`. The login
+stays with its owner while the owner's entry is configured; when the owner's
+entry is gone, the next launch moves the login to the other agent and clears
+the state again. Revoking only the agent that does not own
 the login does not stop that agent from logging in through the owner's
 endpoint while the owner stays enabled; revoke both to end it. A later `mcp enable` needs a new login.
 Revoke prints one of these lines:

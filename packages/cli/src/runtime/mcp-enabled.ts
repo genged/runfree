@@ -74,12 +74,10 @@ export type McpEnabledRecord = {
   oauthEndpoints?: McpEnabledEndpoint[];
 };
 
-// Keyed by the share group digest (`mcpShareGroupDigest`). `released` is set
-// by `mcp revoke` of the owner: the next projection moves ownership to
-// another member and clears every member's OAuth state.
+// Keyed by the share group digest (`mcpShareGroupDigest`): the group's
+// sticky owner. It moves only when the owner is no longer a member.
 export type McpShareGroupState = {
   owner: string;
-  released?: true;
 };
 
 export type McpEnabledFile = {
@@ -295,10 +293,9 @@ function validShareGroups(value: unknown): Record<string, McpShareGroupState> {
   const groups: Record<string, McpShareGroupState> = {};
   if (!isRecord(value)) return groups;
   for (const [key, entry] of Object.entries(value)) {
-    if (!SHARE_GROUP_KEY.test(key) || !isRecord(entry) || !onlyKeys(entry, new Set(["owner", "released"]))) continue;
+    if (!SHARE_GROUP_KEY.test(key) || !isRecord(entry) || !onlyKeys(entry, new Set(["owner"]))) continue;
     if (typeof entry.owner !== "string" || !SHARE_GROUP_OWNER.test(entry.owner)) continue;
-    if (entry.released !== undefined && entry.released !== true) continue;
-    groups[key] = { owner: entry.owner, ...(entry.released === true ? { released: true as const } : {}) };
+    groups[key] = { owner: entry.owner };
   }
   return groups;
 }
@@ -522,7 +519,6 @@ export type McpEnabledWriteResult = {
   // Records this write removed.
   removed: McpEnabledRecord[];
   // Share groups whose stored owner this write cleared.
-  clearedOwners?: number;
 };
 
 /**
@@ -546,15 +542,13 @@ export function saveMcpEnabledRecord(projectRoot: string, filePath: string, reco
 }
 
 /**
- * Remove every record for an agent and server (optionally one source), and
- * release every share group that one of `clearOwners` owns (so ownership
- * moves at the next projection, R16). Writes only when something changes,
- * including dropping invalid records.
+ * Remove every record for an agent and server (optionally one source).
+ * Writes only when something changes, including dropping invalid records.
  */
 export function removeMcpEnabledRecords(
   projectRoot: string,
   filePath: string,
-  target: { agent: McpAgent; server: string; source?: McpSourceScope; clearOwners?: readonly string[] },
+  target: { agent: McpAgent; server: string; source?: McpSourceScope },
 ): McpEnabledWriteResult {
   const current = readMcpEnabled(projectRoot, filePath, { quiet: true });
   const removed: McpEnabledRecord[] = [];
@@ -564,17 +558,10 @@ export function removeMcpEnabledRecords(
       delete current.file.records[key];
     }
   }
-  let clearedOwners = 0;
-  for (const group of Object.values(current.file.shareGroups ?? {})) {
-    if (target.clearOwners?.includes(group.owner) && !group.released) {
-      group.released = true;
-      clearedOwners += 1;
-    }
-  }
-  if (removed.length > 0 || clearedOwners > 0 || current.invalidRecords > 0 || current.malformed) {
+  if (removed.length > 0 || current.invalidRecords > 0 || current.malformed) {
     writeMcpEnabled(projectRoot, filePath, current.file);
   }
-  return { droppedInvalid: current.invalidRecords, removed, clearedOwners };
+  return { droppedInvalid: current.invalidRecords, removed };
 }
 
 /**

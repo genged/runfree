@@ -95,14 +95,14 @@ describe("share group owners (R16)", () => {
     expect(formed.state).toEqual({ [digest]: { owner: "mcp:codex-srv" } });
   });
 
-  test("an owner that left or was released moves, with a clear; unrelated stored groups are forgotten", () => {
+  test("an owner that left moves, with a clear; an owner still a member stays; unrelated stored groups are forgotten", () => {
     const left = settleShareGroupOwners([{ digest, members: [members[0] as never] }], { [digest]: { owner: "mcp:codex-srv" }, ["b".repeat(64)]: { owner: "mcp:x-y" } });
     expect(left.owners.get(digest)).toBe("mcp:claude-srv");
     expect(left.bumps[0]?.reason).toBe("moved");
     expect(Object.keys(left.state)).toEqual([digest]);
-    const released = settleShareGroupOwners([{ digest, members }], { [digest]: { owner: "mcp:codex-srv", released: true } });
-    expect(released.owners.get(digest)).toBe("mcp:claude-srv");
-    expect(released.bumps).toEqual([{ digest, providerIds: ["mcp:claude-srv", "mcp:codex-srv"], reason: "moved" }]);
-    expect(released.state[digest]).toEqual({ owner: "mcp:claude-srv" });
+    const stays = settleShareGroupOwners([{ digest, members }], { [digest]: { owner: "mcp:codex-srv" } });
+    expect(stays.owners.get(digest)).toBe("mcp:codex-srv");
+    expect(stays.bumps).toEqual([]);
+    expect(stays.state[digest]).toEqual({ owner: "mcp:codex-srv" });
   });
 });

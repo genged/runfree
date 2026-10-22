@@ -711,8 +711,9 @@ Details: [Write Approval Grants](architecture.md#write-approval-grants).
     run time. Revoke also clears the other agent's state when it has an
     entry with the same server name and source; an agent with no such entry
     keeps its state. When a group first forms from members that may hold
-    handles (including the first launch after an upgrade), and when a revoke
-    moves ownership, every member's state is cleared, with a warning. If the
+    handles (including the first launch after an upgrade), and when the
+    owner's entry is gone and ownership moves, every member's state is
+    cleared, with a warning. If the
     new owner cannot be stored, no member mediates the group's endpoints for
     that launch: they become blocked endpoints, a warning names the file, and
     the next launch that can write it settles the owner.

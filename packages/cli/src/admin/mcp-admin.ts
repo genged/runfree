@@ -1122,9 +1122,10 @@ export function mcpRevokeIntent(input: McpRevokeInput): McpRevokeResult {
   // provider is cleared too when that agent has an entry with this server
   // name and source (the same share group, or a member whose config has
   // drifted from it). The group is not recomputed, because its membership can
-  // drift; an agent with no such entry keeps its state. When the revoked
-  // agent owned a group and its entry is gone, the next projection moves
-  // ownership and clears every member.
+  // drift; an agent with no such entry keeps its state. Every handle of a
+  // group is filed under its owner's provider, so this epoch bump clears the
+  // group; the owner moves only when its entry is gone, at the next
+  // projection, which clears every member again.
   const approvalFile = mcpApprovalPath(stateDir());
   const inventory = mcpInventory({ projectRoot: projectRoot(), env: childEnv(), approvalPath: approvalFile }).entries;
   const entry = inventory.find((candidate) => candidate.source === "project" && candidate.agent === agent && candidate.name === serverName);
@@ -1158,13 +1159,10 @@ export function mcpRevokeIntent(input: McpRevokeInput): McpRevokeResult {
   // projects the union of the remaining records, so a host another server
   // (or desired policy, or a service) still names stays allowed.
   const enabledFile = mcpEnabledPath(stateDir());
-  // A share group this server's provider owned forgets its owner, so
-  // ownership moves at the next projection (R16).
   const removed = removeMcpEnabledRecords(projectRoot(), enabledFile, {
     agent,
     server: serverName,
     ...(input.source !== undefined ? { source: input.source } : {}),
-    clearOwners: [oauthProviderId],
   });
   const removedHosts = [...new Set(removed.removed.flatMap((record) => record.oauthHosts.map((host) => host.host)))].sort();
   if (removedHosts.length > 0) console.log(`OAuth hosts no longer allowed for this server: ${removedHosts.join(", ")}`);

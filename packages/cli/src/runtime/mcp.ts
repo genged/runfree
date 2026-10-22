@@ -2510,7 +2510,7 @@ export function prepareMcpRuntime(options: McpPrepareOptions): McpPrepareResult 
     } catch (error) {
       const stored = enabled?.shareGroups ?? {};
       for (const [digest, state] of Object.entries(settlement.state)) {
-        if (stored[digest]?.owner !== state.owner || stored[digest]?.released) unsettled.add(digest);
+        if (stored[digest]?.owner !== state.owner) unsettled.add(digest);
       }
       for (const digest of unsettled) {
         const label = views.find((view) => view.key === digest)?.label ?? digest;

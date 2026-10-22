@@ -189,7 +189,7 @@ export type ShareGroupSettlement = {
   bumps: ShareGroupBump[];
 };
 
-export type StoredShareGroup = { owner: string; released?: true };
+export type StoredShareGroup = { owner: string };
 
 // The member that owns a group that has no valid stored owner: the one
 // enabled first, then the lexically smallest provider id.
@@ -210,10 +210,11 @@ function pickOwner(members: ShareGroupInput["members"]): string {
  * stays. A group with no stored owner forms now: a group of one needs no
  * clear, but a group that forms with several members may hold handles from
  * before it shared (the upgrade case), so every member's OAuth state is
- * cleared. An owner that left, or that `mcp revoke` released, moves to
- * another member, which clears every member's state, because handles are tied
- * to the owner's server identity. Groups with no member in this projection
- * are forgotten.
+ * cleared. An owner that left moves to another member, which clears every
+ * member's state, because handles are tied to the owner's server identity.
+ * A revoked owner that is still configured stays: the revoke's own epoch
+ * bump already cleared the group's handles. Groups with no member in this
+ * projection are forgotten.
  */
 export function settleShareGroupOwners(
   groups: readonly ShareGroupInput[],
@@ -226,7 +227,7 @@ export function settleShareGroupOwners(
     const providerIds = [...new Set(group.members.map((member) => member.providerId))].sort();
     const previous = stored[group.digest];
     let owner: string;
-    if (previous !== undefined && !previous.released && providerIds.includes(previous.owner)) {
+    if (previous !== undefined && providerIds.includes(previous.owner)) {
       owner = previous.owner;
     } else if (previous !== undefined) {
       const others = group.members.filter((member) => member.providerId !== previous.owner);
