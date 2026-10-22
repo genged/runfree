@@ -778,6 +778,10 @@ describe("one-step MCP enable and exact revoke", () => {
         "--host", DROP_TOKEN_HOST, "--header", "Authorization", "--scheme", "bearer",
         "--from-env", DROP_CREDENTIAL_ENV,
       ]).output;
+      // `credential add` binds the source but syncs it only at the next
+      // converged runtime; until the token reaches the proxy, every request
+      // to the destination is refused as missing its token.
+      runOk(fixture, ["credential", "sync"]);
       proxyId = proxyContainerId(fixture);
       standing = await startStandingSession(fixture);
       sessionId = standing.session.containerId;
