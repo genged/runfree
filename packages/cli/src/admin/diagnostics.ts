@@ -12,6 +12,7 @@ import {
   serviceSuggestionLines,
 } from "../../../../scripts/services.ts";
 import { projectInfo, resolveAgentCommand } from "../config.ts";
+import { remedy } from "../remedies.ts";
 import { RUNFREE_RUNTIME_TARGETS } from "../runtime/mount-target-policy.ts";
 import { combinedServiceRegistry } from "../user-services.ts";
 import {
@@ -103,6 +104,12 @@ export function doctorIntent(input: DoctorInput): void {
       } else {
         console.log(`${diagnostic.commandKind === "inspect" ? "inspect" : "suggested fix (requested by the agent)"}: ${diagnostic.command}`);
       }
+    } else if (diagnostic.status === "oauth-endpoint") {
+      console.log(`${host}: an OAuth token or client registration request the proxy does not mediate was refused (${requests})`);
+      console.log("the host is allowed; if an MCP server's login uses this endpoint, enable that server again so the proxy records and mediates it:");
+      console.log(`  ${remedy.mcpEnable("<agent>", "<server>")}`);
+      console.log(`  or remove the server and its OAuth hosts: ${remedy.mcpRevoke("<agent>", "<server>")}`);
+      console.log(`inspect: ${diagnostic.command}`);
     } else if (diagnostic.status === "request-shape") {
       const method = diagnostic.method ? ` method ${sanitizeForTerminal(diagnostic.method)}` : "";
       console.log(`${host} blocked by request rules (${sanitizeForTerminal(diagnostic.reason ?? "request-shape")}${method}, ${requests})`);

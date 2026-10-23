@@ -14,6 +14,8 @@ import {
   readMcpEnabled,
   removeMcpEnabledRecords,
   saveMcpEnabledRecord,
+  saveMcpShareGroups,
+  validateMcpEnabledRecord,
   withoutSharedEnabledEndpoints,
 } from "./mcp-enabled.ts";
 
@@ -88,6 +90,92 @@ describe("mcp-enabled store", () => {
     const read = readMcpEnabled(projectRoot, mcpEnabledPath(stateDir), { quiet: true });
     expect(read.file.records).toEqual({});
     expect(read.invalidRecords).toBe(bad.length);
+  });
+
+  // X3, Q3, Q8: cross-host provenance and exact registration endpoints.
+  function crossHostRecord(overrides: Partial<McpEnabledRecord> = {}): McpEnabledRecord {
+    return record({
+      oauthHosts: [{ host: "api.other.example", origin: "discovered", crossHost: true, crossHostKinds: ["registration", "token"] }],
+      oauthEndpoints: [
+        { kind: "registration", host: "api.other.example", path: "/login/oauth/register", exact: true },
+        { kind: "token", host: "api.other.example", path: "/login/oauth/token" },
+      ],
+      ...overrides,
+    });
+  }
+
+  test("a cross-host host and an exact registration endpoint round-trip", () => {
+    saveMcpEnabledRecord(projectRoot, mcpEnabledPath(stateDir), crossHostRecord());
+    const read = readMcpEnabled(projectRoot, mcpEnabledPath(stateDir), { quiet: true });
+    expect(read.file.records["project:claude:srv:abc"]).toEqual(crossHostRecord());
+  });
+
+  test("inconsistent cross-host provenance grants nothing", () => {
+    const host = { host: "api.other.example", origin: "discovered" as const };
+    const token = { kind: "token" as const, host: "api.other.example", path: "/login/oauth/token" };
+    const exact = { kind: "registration" as const, host: "api.other.example", path: "/r", exact: true as const };
+    const bad: McpEnabledRecord[] = [
+      // crossHost on a user host, or without its kinds
+      crossHostRecord({ oauthHosts: [{ ...host, origin: "user", crossHost: true, crossHostKinds: ["token"] }], oauthEndpoints: [token] }),
+      crossHostRecord({ oauthHosts: [{ ...host, crossHost: true }], oauthEndpoints: [token] }),
+      crossHostRecord({ oauthHosts: [{ ...host, crossHost: true, crossHostKinds: [] }], oauthEndpoints: [token] }),
+      crossHostRecord({ oauthHosts: [{ ...host, crossHost: true, crossHostKinds: ["token", "registration"] }], oauthEndpoints: [token, exact] }),
+      crossHostRecord({ oauthHosts: [{ ...host, crossHost: true, crossHostKinds: ["authorize" as "token"] }], oauthEndpoints: [token] }),
+      // a listed kind with no endpoint of that kind on the host
+      crossHostRecord({ oauthHosts: [{ ...host, crossHost: true, crossHostKinds: ["registration", "token"] }], oauthEndpoints: [token] }),
+      // exact only on registration endpoints, and only on a cross-host host that lists it
+      crossHostRecord({ oauthHosts: [{ ...host, crossHost: true, crossHostKinds: ["token"] }], oauthEndpoints: [{ ...token, exact: true }] }),
+      crossHostRecord({ oauthHosts: [host], oauthEndpoints: [token, exact] }),
+      crossHostRecord({ oauthHosts: [{ ...host, crossHost: true, crossHostKinds: ["token"] }], oauthEndpoints: [token, exact] }),
+      // one endpoint both exact and by prefix
+      crossHostRecord({ oauthEndpoints: [token, exact, { kind: "registration", host: "api.other.example", path: "/r" }] }),
+    ];
+    for (const [index, entry] of bad.entries()) expect(validateMcpEnabledRecord(entry), String(index)).toBeUndefined();
+  });
+
+  test("share group owners round-trip; an invalid owner entry alone is dropped", () => {
+    const digest = "a".repeat(64);
+    writeRaw({ "project:claude:srv:abc": record() }, {
+      shareGroups: {
+        [digest]: { owner: "mcp:codex-srv" },
+        ["b".repeat(64)]: { owner: "not a provider" },
+        short: { owner: "mcp:claude-srv" },
+        // An entry with an unknown key is dropped too.
+        ["c".repeat(64)]: { owner: "mcp:claude-srv", released: true },
+      },
+    });
+    const read = readMcpEnabled(projectRoot, mcpEnabledPath(stateDir), { quiet: true });
+    expect(read.malformed).toBe(false);
+    expect(read.file.records["project:claude:srv:abc"]).toEqual(record());
+    expect(read.file.shareGroups).toEqual({ [digest]: { owner: "mcp:codex-srv" } });
+  });
+
+  test("storing share group owners changes nothing else, not even an invalid record", () => {
+    writeRaw({ "project:claude:srv:abc": record(), broken: { nope: true } });
+    const digest = "d".repeat(64);
+    expect(saveMcpShareGroups(projectRoot, mcpEnabledPath(stateDir), { [digest]: { owner: "mcp:claude-srv" } })).toBe(true);
+    const raw = JSON.parse(fs.readFileSync(mcpEnabledPath(stateDir), "utf8")) as { records: Record<string, unknown>; shareGroups: unknown };
+    expect(raw.records.broken).toEqual({ nope: true });
+    expect(raw.shareGroups).toEqual({ [digest]: { owner: "mcp:claude-srv" } });
+    // Unchanged owners write nothing.
+    const before = fs.statSync(mcpEnabledPath(stateDir)).mtimeMs;
+    expect(saveMcpShareGroups(projectRoot, mcpEnabledPath(stateDir), { [digest]: { owner: "mcp:claude-srv" } })).toBe(false);
+    expect(fs.statSync(mcpEnabledPath(stateDir)).mtimeMs).toBe(before);
+    // A malformed file is never overwritten by a projection.
+    fs.writeFileSync(mcpEnabledPath(stateDir), "{not json");
+    expect(saveMcpShareGroups(projectRoot, mcpEnabledPath(stateDir), { [digest]: { owner: "mcp:claude-srv" } })).toBe(false);
+    expect(fs.readFileSync(mcpEnabledPath(stateDir), "utf8")).toBe("{not json");
+  });
+
+  test("removing a server keeps the stored share group owners", () => {
+    const owned = "e".repeat(64);
+    const other = "f".repeat(64);
+    writeRaw({ a: record({ identity: "a" }) }, { shareGroups: { [owned]: { owner: "mcp:claude-srv" }, [other]: { owner: "mcp:codex-srv" } } });
+    removeMcpEnabledRecords(projectRoot, mcpEnabledPath(stateDir), { agent: "claude", server: "srv" });
+    expect(readMcpEnabled(projectRoot, mcpEnabledPath(stateDir), { quiet: true }).file.shareGroups).toEqual({
+      [owned]: { owner: "mcp:claude-srv" },
+      [other]: { owner: "mcp:codex-srv" },
+    });
   });
 
   test("a file inside the project, for another project, oversized, or not a regular file grants nothing", () => {

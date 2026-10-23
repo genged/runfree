@@ -56,6 +56,14 @@ describe("buildSessionDenialSummary", () => {
     expect(hostLine).not.toContain("runfree host add now-allowed.example.com");
   });
 
+  test("an unmediated OAuth endpoint denial points at doctor, not at host add", () => {
+    const logs = denialLine({ reason: "oauth-endpoint-not-mediated", host: "ahrefs.com", method: "POST", path: "/oauth/token" });
+    const lines = buildSessionDenialSummary(logs, { hosts: ["ahrefs.com"], tokens: {} });
+    expect(lines.join("\n")).toContain("runfree host explain ahrefs.com");
+    expect(lines.join("\n")).toContain("an OAuth token request the proxy does not mediate; see runfree doctor for the remedy");
+    expect(lines.join("\n")).not.toContain("runfree host add");
+  });
+
   test("shape denials suggest the exact widening command instead of a redundant host add", () => {
     const ruledPolicy: PolicyJson = {
       hosts: ["api.github.com"],

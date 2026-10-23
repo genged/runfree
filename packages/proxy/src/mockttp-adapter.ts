@@ -23,6 +23,19 @@ type RequestUtilsModule = {
   buildInitiatedRequest: (request: unknown) => object;
   waitForCompletedRequest: (request: unknown) => Promise<object>;
 };
+// The rejection step for WebSocket upgrades. Its `handle` writes the head,
+// calls `socket.end(body)`, then destroys the socket at once, which drops
+// the still-buffered body over TLS, so a refusal never reached the agent
+// with its explanation.
+type RejectWebSocketStep = {
+  body?: Buffer | string;
+  headers?: Record<string, string>;
+  statusCode: number;
+  statusMessage?: string;
+};
+type WebSocketStepImplsModule = {
+  RejectWebSocketStepImpl?: { prototype: { handle?: unknown } };
+};
 type RawRequest = ProxyRequest & {
   [trustedAdmissionSerial]?: number;
   socket?: Record<PropertyKey, unknown>;
@@ -44,12 +57,14 @@ function loadMockttpInternals(): {
   metadata: SocketMetadataModule;
   requestUtils: RequestUtilsModule;
   socketExtensions: SocketExtensionsModule;
+  webSocketSteps: WebSocketStepImplsModule;
 } {
   try {
     return {
       metadata: require("mockttp/dist/util/socket-metadata") as SocketMetadataModule,
       requestUtils: require("mockttp/dist/util/request-utils") as RequestUtilsModule,
       socketExtensions: require("mockttp/dist/util/socket-extensions") as SocketExtensionsModule,
+      webSocketSteps: require("mockttp/dist/rules/websockets/websocket-step-impls") as WebSocketStepImplsModule,
     };
   } catch (error) {
     throw new MockttpAdapterContractError(`cannot load pinned mockttp adapter internals: ${String(error)}`);
@@ -78,7 +93,7 @@ function attachTrustedSerial(request: object, serial: number | undefined): objec
 }
 
 function installSecurityPatches(): void {
-  const { metadata, requestUtils, socketExtensions } = loadMockttpInternals();
+  const { metadata, requestUtils, socketExtensions, webSocketSteps } = loadMockttpInternals();
   if (typeof metadata.getSocketMetadataFromProxyAuth !== "function") {
     throw new MockttpAdapterContractError("mockttp proxy-auth metadata parser has an unexpected shape");
   }
@@ -89,10 +104,36 @@ function installSecurityPatches(): void {
     || typeof requestUtils.waitForCompletedRequest !== "function") {
     throw new MockttpAdapterContractError("mockttp request mapping has an unexpected shape");
   }
+  const rejectStep = webSocketSteps.RejectWebSocketStepImpl?.prototype;
+  if (rejectStep === undefined || typeof rejectStep.handle !== "function") {
+    throw new MockttpAdapterContractError("mockttp WebSocket rejection step has an unexpected shape");
+  }
   socketMetadataKey = socketExtensions.SocketMetadata;
 
   if (securityPatchesInstalled) return;
   securityPatchesInstalled = true;
+
+  // A WebSocket refusal delivers its body: head and body go out in one
+  // write with a Content-Length, the socket is ended, and it is destroyed
+  // only once closed or after a short grace period. The status and headers
+  // are the rule's own, unchanged.
+  rejectStep.handle = async function handle(this: RejectWebSocketStep, _request: unknown, socket: net.Socket): Promise<void> {
+    const body = this.body === undefined ? Buffer.alloc(0) : Buffer.from(this.body);
+    const headers = Object.entries(this.headers ?? {})
+      .filter(([name]) => name.toLowerCase() !== "content-length" && name.toLowerCase() !== "connection");
+    const head = [
+      `HTTP/1.1 ${this.statusCode} ${this.statusMessage ?? ""}`.trimEnd(),
+      ...headers.map(([name, value]) => `${name}: ${value}`),
+      `content-length: ${body.length}`,
+      "connection: close",
+      "",
+      "",
+    ].join("\r\n");
+    const timer = setTimeout(() => socket.destroy(), 2_000);
+    timer.unref();
+    socket.once("close", () => clearTimeout(timer));
+    socket.end(Buffer.concat([Buffer.from(head), body]));
+  };
 
   // The header channel is closed at its sole interpreter. Existing trusted
   // metadata is preserved, but no agent-authored value is parsed or merged.

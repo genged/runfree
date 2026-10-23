@@ -72,6 +72,9 @@ export function buildSessionDenialSummary(logs: string, policy: PolicyJson, limi
     // Secondary option only: the exact host above stays the primary
     // suggestion; the owning service is named but never auto-applied, with
     // broad-host warnings inlined by serviceSuggestionLines.
+    if (diagnostic.status === "oauth-endpoint") {
+      lines.push("      an OAuth token request the proxy does not mediate; see runfree doctor for the remedy");
+    }
     if (diagnostic.status === "missing") {
       if (diagnostic.mcpOAuthIssuer) {
         lines.push(`      OAuth issuer for MCP server ${diagnostic.mcpOAuthIssuer.serverName} (resource ${diagnostic.mcpOAuthIssuer.resourceHost})`);

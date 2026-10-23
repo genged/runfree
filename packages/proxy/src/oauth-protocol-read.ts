@@ -30,6 +30,7 @@ const TOKEN_FIELDS = new Set([
   "resource",
 ]);
 const REGISTRATION_FIELDS = new Set([
+  "application_type",
   "client_name",
   "redirect_uris",
   "grant_types",
@@ -143,30 +144,40 @@ function tokenBodyAllowed(bodyText: string, resourceHost: string): boolean {
   return redirect === null || loopbackRedirect(redirect);
 }
 
-function registrationBodyAllowed(bodyText: string): boolean {
+// Field names are agent-chosen bytes: only a short, plain-identifier form of
+// each reaches the proxy log, never a value.
+function loggableFieldNames(keys: string[]): string {
+  return keys.slice(0, 5).map((key) => (/^[A-Za-z0-9_]{1,40}$/.test(key) ? key : "?")).join(",");
+}
+
+function registrationBodyRefusal(bodyText: string): string | undefined {
   const parsed = parseJsonStrict(bodyText);
   const value = parsed.value;
-  if (parsed.reason !== undefined || value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  if (parsed.reason !== undefined || value === null || typeof value !== "object" || Array.isArray(value)) return "registration-not-json-object";
   const body = value as Record<string, unknown>;
-  if (!Object.keys(body).every((key) => REGISTRATION_FIELDS.has(key))) return false;
+  const unknownFields = Object.keys(body).filter((key) => !REGISTRATION_FIELDS.has(key));
+  if (unknownFields.length > 0) return `registration-field=${loggableFieldNames(unknownFields)}`;
   if (!Array.isArray(body.redirect_uris) || body.redirect_uris.length === 0 || body.redirect_uris.length > 8
     || !body.redirect_uris.every(loopbackRedirect)) {
-    return false;
+    return "registration-redirect_uris";
   }
   if (body.client_name !== undefined
     && (typeof body.client_name !== "string" || body.client_name.length > 200 || !PRINTABLE_ASCII.test(body.client_name))) {
-    return false;
+    return "registration-client_name";
   }
-  if (body.grant_types !== undefined && !stringSubset(body.grant_types, TOKEN_GRANTS)) return false;
-  if (body.response_types !== undefined && !stringSubset(body.response_types, new Set(["code"]))) return false;
+  // The MCP SDK derives application_type from the redirect URIs: "native" for
+  // loopback ones, the only kind allowed above. It names no URL to fetch.
+  if (body.application_type !== undefined && body.application_type !== "native") return "registration-application_type";
+  if (body.grant_types !== undefined && !stringSubset(body.grant_types, TOKEN_GRANTS)) return "registration-grant_types";
+  if (body.response_types !== undefined && !stringSubset(body.response_types, new Set(["code"]))) return "registration-response_types";
   if (body.token_endpoint_auth_method !== undefined
     && (typeof body.token_endpoint_auth_method !== "string" || !REGISTRATION_AUTH_METHODS.has(body.token_endpoint_auth_method))) {
-    return false;
+    return "registration-token_endpoint_auth_method";
   }
   if (body.scope !== undefined && (typeof body.scope !== "string" || body.scope.length > 1000 || !PRINTABLE_ASCII.test(body.scope))) {
-    return false;
+    return "registration-scope";
   }
-  return true;
+  return undefined;
 }
 
 /**
@@ -179,26 +190,42 @@ function registrationBodyAllowed(bodyText: string): boolean {
  * must be one of CLIENT_ID_METADATA_URLS, and a `resource` must name the
  * server's own resource host.
  */
-export function protocolReadBodyAllowed(input: {
+export function protocolReadBodyAllowed(input: ProtocolReadBodyInput): boolean {
+  return protocolReadBodyRefusal(input) === undefined;
+}
+
+type ProtocolReadBodyInput = {
   bodyText: string | undefined;
   headers: Record<string, HeaderValue> | undefined;
   kind: ProtocolReadKind;
   // The MCP server's resource host, the only host a `resource` may name.
   resourceHost: string;
-}): boolean {
+};
+
+/**
+ * Why a request is not protocol-shaped, as a short log-safe reason code, or
+ * undefined when it is. Codes name the failed check, never a header or body
+ * value.
+ */
+export function protocolReadBodyRefusal(input: ProtocolReadBodyInput): string | undefined {
   const contentType = singleHeader(input.headers, "content-type");
   const contentEncoding = singleHeader(input.headers, "content-encoding");
   const contentLength = singleHeader(input.headers, "content-length");
-  if (typeof contentType !== "string" || contentEncoding === null || typeof contentLength !== "string") return false;
-  if (contentEncoding !== undefined && contentEncoding.trim().toLowerCase() !== "identity") return false;
-  if (singleHeader(input.headers, "transfer-encoding") !== undefined) return false;
-  if (!/^\d{1,6}$/.test(contentLength) || Number(contentLength) > PROTOCOL_READ_BODY_CAP_BYTES) return false;
+  if (typeof contentType !== "string") return contentType === null ? "content-type-repeated" : "content-type-missing";
+  if (contentEncoding === null) return "content-encoding-repeated";
+  if (typeof contentLength !== "string") return contentLength === null ? "content-length-repeated" : "content-length-missing";
+  if (contentEncoding !== undefined && contentEncoding.trim().toLowerCase() !== "identity") return "content-encoding";
+  if (singleHeader(input.headers, "transfer-encoding") !== undefined) return "transfer-encoding";
+  if (!/^\d{1,6}$/.test(contentLength) || Number(contentLength) > PROTOCOL_READ_BODY_CAP_BYTES) return "content-length-invalid";
   const bodyText = input.bodyText;
-  if (bodyText === undefined || Buffer.byteLength(bodyText) !== Number(contentLength)) return false;
+  if (bodyText === undefined) return "body-unreadable";
+  if (Buffer.byteLength(bodyText) !== Number(contentLength)) return "content-length-mismatch";
   if (input.kind === "token") {
-    return mediaType(contentType) === "application/x-www-form-urlencoded" && tokenBodyAllowed(bodyText, input.resourceHost);
+    if (mediaType(contentType) !== "application/x-www-form-urlencoded") return "token-media-type";
+    return tokenBodyAllowed(bodyText, input.resourceHost) ? undefined : "token-body";
   }
-  return mediaType(contentType) === "application/json" && registrationBodyAllowed(bodyText);
+  if (mediaType(contentType) !== "application/json") return "registration-media-type";
+  return registrationBodyRefusal(bodyText);
 }
 
 /**

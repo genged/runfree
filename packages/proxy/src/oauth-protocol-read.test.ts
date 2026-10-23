@@ -9,6 +9,7 @@ import {
   CLIENT_ID_METADATA_URLS,
   plainRequestPath,
   protocolReadBodyAllowed,
+  protocolReadBodyRefusal,
   ProtocolReadRateLimiter,
   unlistedClientIdMetadataUrl,
 } from "./oauth-protocol-read.ts";
@@ -195,6 +196,41 @@ describe("protocolReadBodyAllowed", () => {
   test("refuses a registration sent as a form", () => {
     expect(protocolReadBodyAllowed({ resourceHost: "mcp.example.test", kind: "registration", bodyText: registration, headers: formHeaders(registration) })).toBe(false);
   });
+
+  test("names the failed check without echoing a value", () => {
+    const refusal = (bodyText: string | undefined, headers: Record<string, string | string[]>, kind: "registration" | "token" = "registration") =>
+      protocolReadBodyRefusal({ resourceHost: "mcp.example.test", kind, bodyText, headers });
+    expect(refusal(registration, jsonHeaders(registration))).toBeUndefined();
+    const { "content-length": _length, ...chunked } = jsonHeaders(registration);
+    expect(refusal(registration, { ...chunked, "transfer-encoding": "chunked" })).toBe("content-length-missing");
+    expect(refusal(registration, jsonHeaders(registration, { "transfer-encoding": "chunked" }))).toBe("transfer-encoding");
+    expect(refusal(registration, jsonHeaders(registration, { "content-encoding": "gzip" }))).toBe("content-encoding");
+    expect(refusal(registration, formHeaders(registration))).toBe("registration-media-type");
+    expect(refusal(undefined, jsonHeaders(registration))).toBe("body-unreadable");
+    expect(refusal(`${registration} `, jsonHeaders(registration))).toBe("content-length-mismatch");
+    const extra = JSON.stringify({ ...JSON.parse(registration) as object, client_uri: "https://secret.example/x", "bad key": 1 });
+    expect(refusal(extra, jsonHeaders(extra))).toBe("registration-field=client_uri,?");
+    const remote = JSON.stringify({ ...JSON.parse(registration) as object, redirect_uris: ["https://evil.example/cb"] });
+    expect(refusal(remote, jsonHeaders(remote))).toBe("registration-redirect_uris");
+    expect(refusal("grant_type=password", formHeaders("grant_type=password"), "token")).toBe("token-body");
+  });
+
+  test("accepts the registration Claude Code's MCP SDK sends, with application_type native only", () => {
+    const claude = JSON.stringify({
+      client_name: "Claude Code (ahrefs)",
+      redirect_uris: ["http://localhost:47886/callback"],
+      grant_types: ["authorization_code", "refresh_token"],
+      response_types: ["code"],
+      token_endpoint_auth_method: "none",
+      application_type: "native",
+    });
+    expect(protocolReadBodyAllowed({ resourceHost: "mcp.example.test", kind: "registration", bodyText: claude, headers: jsonHeaders(claude) })).toBe(true);
+    for (const applicationType of ["web", "Native", 1, null]) {
+      const body = JSON.stringify({ ...JSON.parse(claude) as object, application_type: applicationType });
+      expect(protocolReadBodyRefusal({ resourceHost: "mcp.example.test", kind: "registration", bodyText: body, headers: jsonHeaders(body) }))
+        .toBe("registration-application_type");
+    }
+  });
 });
 
 describe("ProtocolReadRateLimiter", () => {
@@ -273,10 +309,27 @@ describe("OAuthMediator.protocolReadEndpoint", () => {
     expect(target.protocolReadEndpoint({ method: "POST", url: REGISTER_URL })).toEqual({ provider: "mcp:claude-linear", kind: "registration", resourceHost: "mcp.example.test" });
   });
 
-  test("does not match an endpoint another server discovered at run time", async () => {
+  test("another server cannot bind an issuer on this server's token host, so the protocol read stays", async () => {
     const target = mediator({
       "mcp:claude-linear": linear(),
       "mcp:claude-other": { kind: "mcp", resourceHost: "other.example.test" },
+    });
+    // The other server's resource names this server's issuer host: R2
+    // refuses the binding, so the other server never claims the endpoint.
+    await target.beforeResponse({
+      body: { getText: async () => JSON.stringify({ authorization_servers: ["https://auth.example.test"] }) },
+      statusCode: 200,
+    }, { method: "GET", url: "https://other.example.test/.well-known/oauth-protected-resource" });
+    expect(fs.existsSync(path.join(stateDir, "handles.json"))).toBe(false);
+    expect(target.protocolReadEndpoint({ method: "POST", url: TOKEN_URL })).toEqual({ provider: "mcp:claude-linear", kind: "token", resourceHost: "mcp.example.test" });
+  });
+
+  test("does not match an endpoint another server discovered at run time", async () => {
+    const target = mediator({
+      "mcp:claude-linear": linear(),
+      // The other server's user hosts include the shared issuer host, so its
+      // capture there is bound and the discovery collides.
+      "mcp:claude-other": { kind: "mcp", resourceHost: "other.example.test", bindingHosts: ["auth.example.test"] },
     });
     // The other server's resource names the shared issuer, which advertises
     // the same token endpoint.

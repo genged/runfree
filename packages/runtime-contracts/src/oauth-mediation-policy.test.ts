@@ -1,6 +1,8 @@
 import { describe, expect, test } from "vitest";
 
 import {
+  oauthHostRefusedForProvider,
+  oauthMediationPolicyJson,
   oauthProviderPolicyJson,
   validateOAuthMediationPolicy,
   type OAuthMediationPolicyJson,
@@ -202,5 +204,214 @@ describe("OAuth provider serialization", () => {
       metadataEndpoints: [],
       seeds: [],
     });
+  });
+});
+
+describe("cross-host token endpoint contract fields", () => {
+  const MCP = { kind: "mcp" as const, resourceHost: "api.ahrefs.com", tokenEndpoints: [{ host: "ahrefs.com", path: "/oauth/token" }] };
+
+  const validate = (top: Record<string, unknown>, provider: Record<string, unknown> = {}) =>
+    validateOAuthMediationPolicy({ ...top, providers: { "mcp:claude-ahrefs": { ...MCP, ...provider } } });
+
+  test("absent fields load as empty and leave the provider unchanged", () => {
+    const loaded = validate({});
+    expect(loaded.recordOnlyHosts).toEqual([]);
+    expect(loaded.recordEndpointHosts).toEqual([]);
+    expect(loaded.refusedHosts).toEqual([]);
+    expect(loaded.blockedEndpoints).toEqual([]);
+    expect(loaded.providers[0].bindingHosts).toEqual([]);
+    expect(loaded.providers[0].captureOwner).toBeUndefined();
+    expect(oauthMediationPolicyJson(loaded)).toEqual({
+      providers: { "mcp:claude-ahrefs": oauthProviderPolicyJson(loaded.providers[0]) },
+    });
+    expect(Object.keys(oauthMediationPolicyJson(loaded))).toEqual(["providers"]);
+  });
+
+  test("loads valid fields with host lists and blocked endpoints sorted", () => {
+    const loaded = validate({
+      recordOnlyHosts: ["zeta.example.com", "ahrefs.com"],
+      refusedHosts: ["github.com", "api.anthropic.com"],
+      blockedEndpoints: [
+        { host: "b.example.com", path: "/token" },
+        { host: "a.example.com", path: "/z" },
+        { host: "a.example.com", path: "/a" },
+      ],
+    }, {
+      bindingHosts: ["user.example.com", "ahrefs.com"],
+      captureOwner: false,
+      registrationEndpoints: [{ host: "ahrefs.com", path: "/oauth/register", exact: true }],
+    });
+    expect(loaded.recordOnlyHosts).toEqual(["ahrefs.com", "zeta.example.com"]);
+    expect(loaded.refusedHosts).toEqual(["api.anthropic.com", "github.com"]);
+    expect(loaded.blockedEndpoints).toEqual([
+      { host: "a.example.com", path: "/a" },
+      { host: "a.example.com", path: "/z" },
+      { host: "b.example.com", path: "/token" },
+    ]);
+    expect(loaded.providers[0]).toMatchObject({
+      bindingHosts: ["ahrefs.com", "user.example.com"],
+      captureOwner: false,
+      registrationEndpoints: [{ host: "ahrefs.com", path: "/oauth/register", exact: true }],
+    });
+  });
+
+  test("round-trips every new field through the JSON form", () => {
+    const loaded = validate({
+      recordEndpointHosts: ["api.ahrefs.com"],
+      recordOnlyHosts: ["ahrefs.com"],
+      refusedHosts: ["github.com"],
+      blockedEndpoints: [{ host: "blocked.example.com", path: "/oauth/token" }],
+    }, {
+      bindingHosts: ["ahrefs.com"],
+      captureOwner: false,
+      registrationEndpoints: [
+        { host: "ahrefs.com", path: "/oauth/register", exact: true },
+        { host: "api.ahrefs.com", path: "/mcp/register" },
+      ],
+    });
+    const json = oauthMediationPolicyJson(loaded);
+    expect(json.providers["mcp:claude-ahrefs"].registrationEndpoints).toEqual([
+      { exact: true, host: "ahrefs.com", path: "/oauth/register" },
+      { host: "api.ahrefs.com", path: "/mcp/register" },
+    ]);
+    expect(validateOAuthMediationPolicy(JSON.parse(JSON.stringify(json)))).toEqual(loaded);
+  });
+
+  test("a URL-string registration endpoint stays prefix-matched", () => {
+    const loaded = validate({}, { registrationEndpoints: ["https://api.ahrefs.com/mcp/register"] });
+    expect(loaded.providers[0].registrationEndpoints).toEqual([{ host: "api.ahrefs.com", path: "/mcp/register" }]);
+  });
+
+  const hostCases: Array<[string, unknown, RegExp]> = [
+    ["an uppercase host", "Ahrefs.com", /exact normalized hostname ahrefs\.com/],
+    ["a host with surrounding whitespace", " ahrefs.com", /exact normalized hostname/],
+    ["a trailing-dot host", "ahrefs.com.", /must not end with a dot/],
+    ["an IPv4 literal", "192.0.2.1", /not an IP address/],
+    ["a numeric last label", "foo.0x7f", /not an IP address/],
+    ["an IPv6 literal", "::1", /without port|hostname/],
+    ["a localhost name", "app.localhost", /localhost/],
+    ["a reserved runfree.internal name", "gateway.runfree.internal", /runfree\.internal/],
+    ["a single-label host", "intranet", /fully-qualified/],
+    ["a URL", "https://ahrefs.com", /got URL/],
+    ["a wildcard", "*.ahrefs.com", /wildcard/],
+    ["a non-string", 7, /must be a hostname string/],
+  ];
+
+  test.each(hostCases)("recordOnlyHosts refuses %s", (_label, host, message) => {
+    expect(() => validate({ recordOnlyHosts: [host] })).toThrow(message);
+  });
+
+  test.each(hostCases)("recordEndpointHosts refuses %s", (_label, host, message) => {
+    expect(() => validate({ recordEndpointHosts: [host] })).toThrow(message);
+  });
+
+  test.each(hostCases)("refusedHosts refuses %s", (_label, host, message) => {
+    expect(() => validate({ refusedHosts: [host] })).toThrow(message);
+  });
+
+  test.each(hostCases)("bindingHosts refuses %s", (_label, host, message) => {
+    expect(() => validate({}, { bindingHosts: [host] })).toThrow(message);
+  });
+
+  test.each(hostCases)("blockedEndpoints refuses a host that is %s", (_label, host, message) => {
+    expect(() => validate({ blockedEndpoints: [{ host, path: "/token" }] })).toThrow(message);
+  });
+
+  test.each([
+    ["recordOnlyHosts", { recordOnlyHosts: ["a.example.com", "a.example.com"] }, {}, /recordOnlyHosts\[1\] duplicates a\.example\.com/],
+    ["refusedHosts", { refusedHosts: ["a.example.com", "a.example.com"] }, {}, /refusedHosts\[1\] duplicates/],
+    ["recordEndpointHosts", { recordEndpointHosts: ["a.example.com", "a.example.com"] }, {}, /recordEndpointHosts\[1\] duplicates/],
+    ["bindingHosts", {}, { bindingHosts: ["a.example.com", "a.example.com"] }, /bindingHosts\[1\] duplicates/],
+    ["blockedEndpoints", {
+      blockedEndpoints: [{ host: "a.example.com", path: "/t" }, { host: "a.example.com", path: "/t" }],
+    }, {}, /blockedEndpoints\[1\] duplicates a\.example\.com\/t/],
+  ])("refuses duplicates in %s", (_label, top, provider, message) => {
+    expect(() => validate(top, provider)).toThrow(message);
+  });
+
+  test.each([
+    ["recordOnlyHosts that is not an array", { recordOnlyHosts: "ahrefs.com" }, {}, /recordOnlyHosts must be an array/],
+    ["recordEndpointHosts that is not an array", { recordEndpointHosts: "api.ahrefs.com" }, {}, /recordEndpointHosts must be an array/],
+    ["refusedHosts that is not an array", { refusedHosts: { host: "github.com" } }, {}, /refusedHosts must be an array/],
+    ["bindingHosts that is not an array", {}, { bindingHosts: "ahrefs.com" }, /bindingHosts must be an array/],
+    ["blockedEndpoints that is not an array", { blockedEndpoints: "https://a.example.com/t" }, {}, /blockedEndpoints must be an array/],
+    ["a blocked endpoint as a URL string", { blockedEndpoints: ["https://a.example.com/t"] }, {}, /blockedEndpoints\[0\] must be a \{host,path\} object/],
+    ["a blocked endpoint with a non-string path", { blockedEndpoints: [{ host: "a.example.com", path: 1 }] }, {}, /blockedEndpoints\[0\]\.path must be a string/],
+    ["a blocked endpoint path with a query", { blockedEndpoints: [{ host: "a.example.com", path: "/t?x=1" }] }, {}, /query or fragment/],
+    ["a relative blocked endpoint path", { blockedEndpoints: [{ host: "a.example.com", path: "t" }] }, {}, /must start with \//],
+    ["a blocked endpoint path with whitespace", { blockedEndpoints: [{ host: "a.example.com", path: "/t " }] }, {}, /without surrounding whitespace/],
+    ["a blocked endpoint with an exact flag", { blockedEndpoints: [{ host: "a.example.com", path: "/t", exact: true }] }, {}, /unsupported fields: exact/],
+    ["captureOwner true", {}, { captureOwner: true }, /captureOwner must be false/],
+    ["captureOwner as a string", {}, { captureOwner: "false" }, /captureOwner must be false/],
+  ])("refuses %s", (_label, top, provider, message) => {
+    expect(() => validate(top, provider)).toThrow(message);
+  });
+
+  test.each([
+    ["bindingHosts", { bindingHosts: ["ahrefs.com"] }, /bindingHosts are only supported for mcp providers/],
+    ["captureOwner", { captureOwner: false }, /captureOwner is only supported for mcp providers/],
+  ])("refuses %s on a service provider", (_label, extra, message) => {
+    expect(() => validateOAuthMediationPolicy({
+      providers: { "service:x": { kind: "service", resourceHost: "api.example.com", tokenEndpoints: ["https://auth.example.com/t"], ...extra } },
+    })).toThrow(message);
+  });
+
+  test.each([
+    ["a token endpoint", { tokenEndpoints: [{ host: "ahrefs.com", path: "/oauth/token", exact: true }] }, /tokenEndpoints\[0\]\.exact is only supported on registration endpoints/],
+    ["a metadata endpoint", { metadataEndpoints: [{ host: "ahrefs.com", path: "/.well-known/x", exact: true }] }, /metadataEndpoints\[0\]\.exact is only supported/],
+    ["a protocol-read endpoint", {
+      protocolReadEndpoints: [{ host: "ahrefs.com", path: "/oauth/token", exact: true }],
+    }, /protocolReadEndpoints\[0\]\.exact is only supported/],
+  ])("refuses the exact flag on %s", (_label, extra, message) => {
+    expect(() => validate({}, extra)).toThrow(message);
+  });
+
+  test.each([
+    ["false", false],
+    ["a string", "true"],
+  ])("refuses a registration exact flag that is %s", (_label, exact) => {
+    expect(() => validate({}, { registrationEndpoints: [{ host: "ahrefs.com", path: "/r", exact }] })).toThrow(/exact must be true/);
+  });
+
+  test("refuses one registration endpoint listed both exact and by prefix", () => {
+    expect(() => validate({}, {
+      registrationEndpoints: [
+        { host: "ahrefs.com", path: "/r", exact: true },
+        "https://ahrefs.com/r",
+      ],
+    })).toThrow(/ahrefs\.com\/r both exact and by prefix/);
+  });
+
+  test("an exact registration endpoint can be a protocol-read endpoint", () => {
+    const loaded = validate({}, {
+      registrationEndpoints: [{ host: "ahrefs.com", path: "/r", exact: true }],
+      protocolReadEndpoints: [{ host: "ahrefs.com", path: "/r" }],
+    });
+    expect(loaded.providers[0].protocolReadEndpoints).toEqual([{ host: "ahrefs.com", path: "/r" }]);
+  });
+
+  test("loads recordEndpointHosts sorted and keeps it out of the JSON form when empty", () => {
+    const loaded = validate({ recordEndpointHosts: ["z.example.com", "api.ahrefs.com"] });
+    expect(loaded.recordEndpointHosts).toEqual(["api.ahrefs.com", "z.example.com"]);
+    expect(oauthMediationPolicyJson(loaded).recordEndpointHosts).toEqual(["api.ahrefs.com", "z.example.com"]);
+    expect("recordEndpointHosts" in oauthMediationPolicyJson(validate({}))).toBe(false);
+  });
+
+  test("refuses a host listed as both record-only and a record endpoint host", () => {
+    expect(() => validate({
+      recordOnlyHosts: ["ahrefs.com", "b.example.com"],
+      recordEndpointHosts: ["api.ahrefs.com", "b.example.com"],
+    })).toThrow(/recordEndpointHosts lists b\.example\.com, which recordOnlyHosts also lists/);
+  });
+
+  test("refusedHosts exempt only the provider's own resource host", () => {
+    const loaded = validate({ refusedHosts: ["api.ahrefs.com", "github.com"] }, { bindingHosts: ["github.com"] });
+    const [provider] = loaded.providers;
+    expect(oauthHostRefusedForProvider(loaded, provider, "api.ahrefs.com")).toBe(false);
+    // A binding (user) host is not exempt.
+    expect(oauthHostRefusedForProvider(loaded, provider, "github.com")).toBe(true);
+    expect(oauthHostRefusedForProvider(loaded, provider, "ahrefs.com")).toBe(false);
+    expect(oauthHostRefusedForProvider(loaded, { resourceHost: "github.com" }, "github.com")).toBe(false);
+    expect(oauthHostRefusedForProvider(loaded, { resourceHost: "github.com" }, "api.ahrefs.com")).toBe(true);
   });
 });

@@ -59,6 +59,15 @@ describe("curlProbeCommand", () => {
         + " -w '\\nrunfree-probe-http-code=%{http_code}\\n' 'https://h.invalid/it'\\''s'",
     );
   });
+
+  test("saves the body to a quoted file when asked", () => {
+    const command = curlProbeCommand("https://h.invalid/", { maxTimeSeconds: 5, bodyFile: "/tmp/probe body" });
+    expect(command).toContain(" -D - -o '/tmp/probe body' -w ");
+  });
+
+  test("forces HTTP/1.1 when asked", () => {
+    expect(curlProbeCommand("https://h.invalid/", { maxTimeSeconds: 5, http1: true })).toMatch(/^curl -sS --http1\.1 --max-time 5 /u);
+  });
 });
 
 describe("countAdmittedEvents", () => {

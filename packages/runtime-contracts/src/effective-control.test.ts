@@ -24,7 +24,7 @@ describe("effective proxy control loading", () => {
 
   afterEach(() => fs.rmSync(root, { recursive: true, force: true }));
 
-  function publish(input: { hosts?: string[]; oauthProviders?: Record<string, unknown> } = {}) {
+  function publish(input: { hosts?: string[]; mcpPolicy?: Record<string, unknown>; oauthProviders?: Record<string, unknown> } = {}) {
     const networkSource = `${JSON.stringify({ hosts: input.hosts ?? ["api.example.com"] }, null, 2)}\n`;
     const oauthSource = `${JSON.stringify({ providers: input.oauthProviders ?? {} }, null, 2)}\n`;
     const policyGeneration = validateNetworkPolicy(JSON.parse(networkSource)).generation;
@@ -33,6 +33,8 @@ describe("effective proxy control loading", () => {
     fs.mkdirSync(generationDir, { recursive: true });
     fs.writeFileSync(path.join(generationDir, "network-policy.json"), networkSource);
     fs.writeFileSync(path.join(generationDir, "oauth-mediation-policy.json"), oauthSource);
+    const mcpSource = input.mcpPolicy ? `${JSON.stringify(input.mcpPolicy, null, 2)}\n` : undefined;
+    if (mcpSource !== undefined) fs.writeFileSync(path.join(generationDir, "mcp-operation-policy.json"), mcpSource);
     const manifestSource = `${JSON.stringify({
       schemaVersion: 1,
       compilerVersion: EFFECTIVE_CONTROL_COMPILER_VERSION,
@@ -41,6 +43,7 @@ describe("effective proxy control loading", () => {
       files: {
         "network-policy.json": digest(networkSource),
         "oauth-mediation-policy.json": digest(oauthSource),
+        ...(mcpSource !== undefined ? { "mcp-operation-policy.json": digest(mcpSource) } : {}),
       },
     }, null, 2)}\n`;
     fs.writeFileSync(path.join(generationDir, "manifest.json"), manifestSource);
@@ -51,8 +54,56 @@ describe("effective proxy control loading", () => {
       hostManifestDigest: `sha256:${"b".repeat(64)}`,
     };
     fs.writeFileSync(path.join(root, "active.json"), `${JSON.stringify(active, null, 2)}\n`);
-    return { active, generationDir, manifestSource, networkSource, oauthSource };
+    return { active, generationDir, manifestSource, mcpSource, networkSource, oauthSource };
   }
+
+  const MCP_POLICY = {
+    schemaVersion: 1,
+    servers: [{
+      id: "claude:project:ahrefs",
+      agent: "claude",
+      name: "ahrefs",
+      source: "project",
+      host: "api.ahrefs.com",
+      path: "/mcp/mcp",
+      tools: { "site-explorer": { writeAction: "allow" } },
+    }],
+  };
+
+  test("loads the MCP operation policy from the selected generation", () => {
+    publish({ mcpPolicy: MCP_POLICY });
+    const loaded = loadEffectiveProxyControl(root);
+
+    expect(loaded.mcpOperationPolicy?.servers.map((server) => server.id)).toEqual(["claude:project:ahrefs"]);
+    expect(loaded.mcpOperationPolicy?.endpointMap.has("api.ahrefs.com\0/mcp/mcp")).toBe(true);
+  });
+
+  test("a generation without an MCP operation policy loads with none", () => {
+    publish();
+    expect(loadEffectiveProxyControl(root).mcpOperationPolicy).toBeUndefined();
+  });
+
+  test("rejects the whole generation when its MCP operation policy is truncated", () => {
+    // The failure a single-file bind mount produced: new bytes cut to the old
+    // size. Here the digest catches it before any payload is returned.
+    const { generationDir, mcpSource } = publish({ mcpPolicy: MCP_POLICY });
+    fs.writeFileSync(path.join(generationDir, "mcp-operation-policy.json"), (mcpSource ?? "").slice(0, 120));
+
+    expect(() => loadEffectiveProxyControl(root)).toThrow("payload digest");
+  });
+
+  test("rejects a manifest that lists an MCP operation policy the generation does not hold", () => {
+    const { generationDir } = publish({ mcpPolicy: MCP_POLICY });
+    fs.rmSync(path.join(generationDir, "mcp-operation-policy.json"));
+
+    expect(() => loadEffectiveProxyControl(root)).toThrow();
+  });
+
+  test("rejects a digest-matching MCP operation policy that fails validation", () => {
+    publish({ mcpPolicy: { schemaVersion: 1, servers: [{ id: "x", agent: "claude" }] } });
+
+    expect(() => loadEffectiveProxyControl(root)).toThrow("invalid MCP operation policy");
+  });
 
   test("loads network and OAuth policy from one manifest-selected generation", () => {
     const fixture = publish({

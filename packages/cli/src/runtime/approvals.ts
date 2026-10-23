@@ -560,14 +560,21 @@ async function applyPreDecisionSideEffects(
     runfreeLog(error instanceof Error ? error.message : String(error));
     return false;
   }
-  const prepare = await io.admin({ kind: "prepare" }, context);
-  if (prepare !== 0) {
-    runfreeLog("saved MCP rule, but runtime policy generation failed; leaving the held request pending");
+  // The MCP operation policy reaches the proxy only inside a published
+  // effective policy generation, so the saved rule goes through the same
+  // fenced activation as `mcp enable`: a proxy of another build is replaced
+  // or waited on first, then prepare, publish, and converge. Loaded lazily:
+  // activation pulls in the runtime startup graph.
+  const { activateApprovedControlsAfterMutation } = await import("../control/activation.ts");
+  let activation: Awaited<ReturnType<typeof activateApprovedControlsAfterMutation>>;
+  try {
+    activation = await activateApprovedControlsAfterMutation(context, io);
+  } catch (error) {
+    runfreeLog(`saved MCP rule, but policy activation failed (${error instanceof Error ? error.message : String(error)}); leaving the held request pending`);
     return false;
   }
-  const converge = await io.admin({ kind: "converge-proxy-policy" }, context);
-  if (converge !== 0) {
-    runfreeLog("saved MCP rule, but proxy policy reload failed; leaving the held request pending");
+  if (activation.kind === "deferred" || activation.kind === "waiting") {
+    runfreeLog(`saved MCP rule; it applies once the proxy can take it (${activation.reason}); leaving the held request pending`);
     return false;
   }
   return true;

@@ -3,14 +3,17 @@ import fs from "node:fs";
 import path from "node:path";
 
 import {
+  oauthHostRefusedForProvider,
   validateOAuthMediationPolicy,
   type LoadedOAuthMediationPolicy,
   type OAuthProviderPolicy,
+  type OAuthRegistrationEndpoint,
   type OAuthSeed,
   type OAuthTokenEndpoint,
 } from "@runfree/runtime-contracts/oauth-mediation-policy";
 import { normalizeHostname, normalizePathPrefix, pathMatchesPrefix, readTokenFile } from "./policy.js";
 import { isRecord } from "@runfree/runtime-contracts/primitives";
+import { classifyGrantShape, responseCarriesOAuthSecret, type GrantShapeFinding, type GrantShapeScope } from "./oauth-grant-shape.js";
 import { plainRequestPath, type ProtocolReadKind } from "./oauth-protocol-read.js";
 
 const ACCESS_HANDLE_PREFIX = "runfree_oauth_access_";
@@ -24,6 +27,9 @@ type HeaderValue = string | string[] | undefined;
 
 export type OAuthProxyRequest = {
   body?: {
+    // mockttp's raw buffered body, still content-encoded, exactly as it is
+    // forwarded upstream. Test doubles may omit it and supply getText only.
+    buffer?: Buffer;
     getText(): Promise<string | undefined>;
   };
   headers?: Record<string, HeaderValue>;
@@ -34,6 +40,7 @@ export type OAuthProxyRequest = {
 
 export type OAuthProxyResponse = {
   body: {
+    buffer?: Buffer;
     getText(): Promise<string | undefined>;
   };
   headers?: Record<string, HeaderValue>;
@@ -58,11 +65,15 @@ export type OAuthResponseResult = {
 type TokenEndpoint = OAuthTokenEndpoint;
 
 type McpOAuthServerPolicy = {
+  // User (`--oauth-host`) hosts: binding hosts for run-time capture.
+  bindingHosts: string[];
+  // False for a share-group non-owner, which never captures metadata.
+  captureOwner: boolean;
   kind: "mcp" | "service";
   metadataEndpoints: TokenEndpoint[];
   name: string;
   protocolReadEndpoints: TokenEndpoint[];
-  registrationEndpoints: TokenEndpoint[];
+  registrationEndpoints: OAuthRegistrationEndpoint[];
   resourceHost: string;
   resourcePathPrefix: string;
   seeds: OAuthSeed[];
@@ -71,9 +82,24 @@ type McpOAuthServerPolicy = {
 };
 
 type LoadedMcpOAuthPolicy = {
+  blockedEndpoints: TokenEndpoint[];
   policyPath?: string;
+  recordEndpointHosts: string[];
+  recordOnlyHosts: string[];
+  refusedHosts: string[];
   servers: McpOAuthServerPolicy[];
 };
+
+function emptyPolicy(policyPath?: string): LoadedMcpOAuthPolicy {
+  return {
+    blockedEndpoints: [],
+    ...(policyPath !== undefined ? { policyPath } : {}),
+    recordEndpointHosts: [],
+    recordOnlyHosts: [],
+    refusedHosts: [],
+    servers: [],
+  };
+}
 
 type CurrentMcpOAuthPolicy = {
   policy: LoadedMcpOAuthPolicy;
@@ -125,6 +151,10 @@ export type ProtocolReadMatch = {
 };
 
 export type OAuthBeforeRequestOptions = {
+  // False for a host outside the allowlist (an audited host). The rule that
+  // refuses grant-shaped requests to any host while the OAuth policy is
+  // invalid covers allowlisted hosts only. Absent means allowlisted.
+  allowlisted?: boolean;
   // Which proxy rule the request selected: true for the response-mediating
   // rule. The rule is chosen before the request is handled, so a policy or
   // discovery change in between can leave a now-mediated token request on the
@@ -133,6 +163,26 @@ export type OAuthBeforeRequestOptions = {
   // The protocol-read match the write classification relied on; re-checked
   // before any handle is swapped.
   protocolRead?: ProtocolReadMatch;
+};
+
+// Why the proxy refused an OAuth-shaped request that no provider mediates.
+// `target` says which rule applied: a host only MCP records allow, a host a
+// record names that also serves an MCP endpoint, a host-owned blocked
+// endpoint, an endpoint more than one provider claims, or any allowlisted
+// host while the OAuth policy is invalid.
+//
+// A WebSocket upgrade is refused outright (finding `websocket`) where the
+// proxy guards OAuth: mockttp hands a non-101 upstream reply straight back to
+// the agent, and no rule can read it. `mediated-endpoint` is a WebSocket
+// upgrade to an endpoint a provider mediates for HTTPS requests only.
+export type UnmediatedOAuthRequestRefusal = {
+  finding: GrantShapeFinding | { kind: "websocket" };
+  host: string;
+  path: string;
+  // The providers involved, when known: the colliding claimants, or the MCP
+  // providers whose user hosts include this host.
+  providers: string[];
+  target: "blocked-endpoint" | "endpoint-collision" | "mediated-endpoint" | "policy-unavailable" | "record-endpoint-host" | "record-only-host";
 };
 
 export type OAuthIssuerDenialContext = {
@@ -211,6 +261,8 @@ function tokenEndpointFromUrl(value: unknown): TokenEndpoint | undefined {
 
 function serverPolicyFromProvider(provider: OAuthProviderPolicy): McpOAuthServerPolicy {
   return {
+    bindingHosts: provider.bindingHosts,
+    captureOwner: provider.captureOwner !== false,
     kind: provider.kind,
     metadataEndpoints: provider.metadataEndpoints,
     name: provider.providerId,
@@ -225,7 +277,7 @@ function serverPolicyFromProvider(provider: OAuthProviderPolicy): McpOAuthServer
 }
 
 function loadPolicy(policyPath: string | undefined): LoadedMcpOAuthPolicy {
-  if (!policyPath) return { servers: [] };
+  if (!policyPath) return emptyPolicy();
   const raw = JSON.parse(fs.readFileSync(policyPath, "utf8")) as unknown;
   const loaded = validateOAuthMediationPolicy(raw, policyPath);
   return mediatorPolicy(loaded);
@@ -233,7 +285,11 @@ function loadPolicy(policyPath: string | undefined): LoadedMcpOAuthPolicy {
 
 function mediatorPolicy(loaded: LoadedOAuthMediationPolicy): LoadedMcpOAuthPolicy {
   return {
+    blockedEndpoints: loaded.blockedEndpoints,
     ...(loaded.policyPath ? { policyPath: loaded.policyPath } : {}),
+    recordEndpointHosts: loaded.recordEndpointHosts,
+    recordOnlyHosts: loaded.recordOnlyHosts,
+    refusedHosts: loaded.refusedHosts,
     servers: loaded.providers.map(serverPolicyFromProvider),
   };
 }
@@ -397,7 +453,7 @@ function tokenEndpointList(server: McpOAuthServerPolicy, state: StoredMcpOAuthSt
   ];
 }
 
-function registrationEndpointList(server: McpOAuthServerPolicy, state: StoredMcpOAuthState): TokenEndpoint[] {
+function registrationEndpointList(server: McpOAuthServerPolicy, state: StoredMcpOAuthState): OAuthRegistrationEndpoint[] {
   const discovered = discoveredEntry(server, state)?.registrationEndpoints ?? [];
   return [
     ...server.registrationEndpoints,
@@ -406,13 +462,13 @@ function registrationEndpointList(server: McpOAuthServerPolicy, state: StoredMcp
 }
 
 // Hosts a server's discovered endpoints may legitimately point at: the MCP
-// resource host plus any statically-configured (host-trusted) metadata, token,
-// or registration hosts. Discovered endpoints are deliberately excluded so one
+// resource host, the user (`--oauth-host`) hosts the record names, plus any
+// statically-configured (host-trusted) metadata, token, or registration hosts. Discovered endpoints are deliberately excluded so one
 // runtime-discovered endpoint cannot bootstrap trust for an unrelated one. This
 // bounds the "resource-host metadata names an unrelated host for token relay"
 // attack: a discovered token/registration endpoint outside this set is ignored.
 function serverBindingHosts(server: McpOAuthServerPolicy): Set<string> {
-  const hosts = new Set<string>([server.resourceHost]);
+  const hosts = new Set<string>([server.resourceHost, ...server.bindingHosts]);
   for (const endpoint of [...server.metadataEndpoints, ...server.tokenEndpoints, ...server.registrationEndpoints]) {
     hosts.add(endpoint.host);
   }
@@ -442,25 +498,90 @@ function issuerSelfConsistent(issuer: unknown, host: string): boolean {
   return parsed?.protocol === "https:" && parsed.hostname.toLowerCase() === host;
 }
 
-function matchingTokenServer(policy: LoadedMcpOAuthPolicy, state: StoredMcpOAuthState, url: URL): McpOAuthServerPolicy | undefined {
-  return policy.servers.find((server) => {
+// A registration endpoint matches by path prefix (the registration client
+// URI sits under it), unless it is flagged exact: a cross-host registration
+// claim never widens response mediation to a subtree.
+function registrationEndpointMatches(endpoint: OAuthRegistrationEndpoint, url: URL): boolean {
+  if (endpoint.host !== url.hostname.toLowerCase()) return false;
+  const pathName = url.pathname || "/";
+  return endpoint.exact === true ? pathName === endpoint.path : pathMatchesPrefix(pathName, endpoint.path);
+}
+
+// Who claims a token or registration URL. Exactly one claimant mediates it.
+// More than one (a run-time discovery that collides with another provider's
+// endpoint) mediates none: the endpoint is blocked like a host-owned blocked
+// endpoint, so neither provider can capture the other's tokens. No claimant
+// and a host-owned `blockedEndpoints` entry is blocked. Static and bound
+// endpoints therefore always match before the block.
+type EndpointClaim =
+  | { kind: "mediated"; endpointKind: "registration" | "token"; server: McpOAuthServerPolicy }
+  | { kind: "collision"; servers: McpOAuthServerPolicy[] }
+  | { kind: "blocked" };
+
+function endpointClaim(policy: LoadedMcpOAuthPolicy, state: StoredMcpOAuthState, url: URL): EndpointClaim | undefined {
+  const tokenClaimants = policy.servers.filter((server) => {
     return tokenEndpointList(server, state).some((endpoint) => tokenEndpointMatches(endpoint, url));
   });
+  const registrationClaimants = policy.servers.filter((server) => {
+    return registrationEndpointList(server, state).some((endpoint) => registrationEndpointMatches(endpoint, url));
+  });
+  const claimants = [...new Set([...tokenClaimants, ...registrationClaimants])];
+  if (claimants.length > 1) return { kind: "collision", servers: claimants };
+  if (claimants.length === 1) {
+    const server = claimants[0];
+    return { kind: "mediated", endpointKind: tokenClaimants.includes(server) ? "token" : "registration", server };
+  }
+  if (policy.blockedEndpoints.some((endpoint) => tokenEndpointMatches(endpoint, url))) return { kind: "blocked" };
+  return undefined;
+}
+
+function matchingTokenServer(policy: LoadedMcpOAuthPolicy, state: StoredMcpOAuthState, url: URL): McpOAuthServerPolicy | undefined {
+  const claim = endpointClaim(policy, state, url);
+  return claim?.kind === "mediated" && claim.endpointKind === "token" ? claim.server : undefined;
 }
 
 function matchingRegistrationServer(policy: LoadedMcpOAuthPolicy, state: StoredMcpOAuthState, url: URL): McpOAuthServerPolicy | undefined {
-  return policy.servers.find((server) => {
-    return registrationEndpointList(server, state).some((endpoint) => {
-      return endpoint.host === url.hostname.toLowerCase()
-        && pathMatchesPrefix(url.pathname || "/", endpoint.path);
-    });
-  });
+  const claim = endpointClaim(policy, state, url);
+  return claim?.kind === "mediated" && claim.endpointKind === "registration" ? claim.server : undefined;
 }
 
+// A blocked or colliding endpoint: on the response-mediating rule, with no
+// provider that mediates it.
+function endpointBlocked(policy: LoadedMcpOAuthPolicy, state: StoredMcpOAuthState, url: URL): boolean {
+  const claim = endpointClaim(policy, state, url);
+  return claim?.kind === "blocked" || claim?.kind === "collision";
+}
+
+// A host that carries a blocked or colliding endpoint. Endpoint matching is
+// by exact path, but many routers also serve `/oauth/token/`,
+// `/OAuth/token`, or `/oauth/%74oken`, which would take the plain rule; so
+// the whole host gets a lenient deep scan for grant shapes.
+function hostBlockOrCollision(
+  policy: LoadedMcpOAuthPolicy,
+  state: StoredMcpOAuthState,
+  host: string,
+): { kind: "blocked" } | { kind: "collision"; servers: McpOAuthServerPolicy[] } | undefined {
+  const paths = new Set<string>();
+  for (const server of policy.servers) {
+    for (const endpoint of [...tokenEndpointList(server, state), ...registrationEndpointList(server, state)]) {
+      if (endpoint.host === host) paths.add(endpoint.path);
+    }
+  }
+  for (const endpointPath of paths) {
+    const url = parseUrl(`https://${host}${endpointPath}`);
+    const claim = url ? endpointClaim(policy, state, url) : undefined;
+    if (claim?.kind === "collision") return claim;
+  }
+  return policy.blockedEndpoints.some((endpoint) => endpoint.host === host) ? { kind: "blocked" } : undefined;
+}
+
+// A share-group non-owner (`captureOwner: false`) never captures metadata:
+// exactly one provider per shared server records its discoveries.
 function matchingMetadataServer(policy: LoadedMcpOAuthPolicy, state: StoredMcpOAuthState, url: URL): McpOAuthServerPolicy | undefined {
   if (!url.pathname.includes("/.well-known/")) return undefined;
   const host = url.hostname.toLowerCase();
   return policy.servers.find((server) => {
+    if (!server.captureOwner) return false;
     return server.metadataEndpoints.some((endpoint) => tokenEndpointMatches(endpoint, url))
       || server.resourceHost === host
       || discoveredIssuerHosts(server, state).includes(host);
@@ -488,6 +609,47 @@ function rememberIssuerHost(state: StoredMcpOAuthState, server: McpOAuthServerPo
 
 function sameEndpoint(left: TokenEndpoint, right: TokenEndpoint): boolean {
   return left.host === right.host && left.path === right.path;
+}
+
+// Hosts where another provider's tokens pass: every other provider's
+// resource host, user binding hosts, and static metadata, token, and
+// registration hosts. A server's metadata may not bind an issuer or an
+// endpoint there, unless the host is in its own static binding set (its own
+// resource host, its own user hosts, its own host-trusted static endpoints).
+function otherProviderHostOwners(policy: LoadedMcpOAuthPolicy, server: McpOAuthServerPolicy, host: string): string[] {
+  if (serverBindingHosts(server).has(host)) return [];
+  return policy.servers
+    .filter((other) => other !== server && serverBindingHosts(other).has(host))
+    .map((other) => other.name);
+}
+
+function endpointsOverlap(
+  left: OAuthRegistrationEndpoint & { prefix: boolean },
+  right: OAuthRegistrationEndpoint & { prefix: boolean },
+): boolean {
+  if (left.host !== right.host) return false;
+  return left.path === right.path
+    || (left.prefix && pathMatchesPrefix(right.path, left.path))
+    || (right.prefix && pathMatchesPrefix(left.path, right.path));
+}
+
+// Other providers whose static or discovered token or registration endpoint
+// equals or overlaps (by registration prefix) this candidate.
+function collidingProviders(
+  policy: LoadedMcpOAuthPolicy,
+  state: StoredMcpOAuthState,
+  server: McpOAuthServerPolicy,
+  candidate: TokenEndpoint,
+  field: "registrationEndpoints" | "tokenEndpoints",
+): string[] {
+  const subject = { ...candidate, prefix: field === "registrationEndpoints" };
+  return policy.servers
+    .filter((other) => other !== server)
+    .filter((other) => {
+      return tokenEndpointList(other, state).some((endpoint) => endpointsOverlap(subject, { ...endpoint, prefix: false }))
+        || registrationEndpointList(other, state).some((endpoint) => endpointsOverlap(subject, { ...endpoint, prefix: endpoint.exact !== true }));
+    })
+    .map((other) => other.name);
 }
 
 function rememberEndpoint(
@@ -583,16 +745,36 @@ function capProviderHandles(state: StoredMcpOAuthState, serverName: string, newH
   evict(tokens, MAX_HANDLES_PER_PROVIDER, new Set([newHandle, newestRefresh]));
 }
 
-// A response on the response-mediating rule that no server mediates now (a
-// revoke or reload landed while it was in flight). Real tokens in it must not
-// reach the agent.
-function unmediatedTokenResponse(text: string | undefined, headers: Record<string, HeaderValue> | undefined): OAuthResponseResult | undefined {
-  if (!text) return undefined;
-  const parsed = parseBodyAsJson(text);
-  const sensitive = parsed
-    ? sensitiveOauthResponseFields(parsed).length > 0
-    : /(?:^|&)(?:access_token|refresh_token|id_token|client_secret|registration_access_token)=/.test(text);
-  return sensitive ? blockedTokenEndpointResponse("OAuth token response from an endpoint that is no longer mediated", headers) : undefined;
+// A response on the response-mediating rule that no server mediates: a
+// revoke or reload landed while it was in flight, or the endpoint is blocked
+// (a host-owned blocked endpoint, or one more than one provider claims). Real
+// tokens in it must not reach the agent, at any status and at any depth of
+// the body. A body that does not decode is blocked too: what it carries
+// cannot be proven harmless.
+function unmediatedTokenResponse(
+  text: string | undefined,
+  rawLength: number,
+  headers: Record<string, HeaderValue> | undefined,
+): OAuthResponseResult | undefined {
+  if (text === undefined) {
+    return rawLength > 0
+      ? blockedTokenEndpointResponse("undecodable response from an OAuth endpoint the proxy does not mediate", headers)
+      : undefined;
+  }
+  return responseCarriesOAuthSecret(text)
+    ? blockedTokenEndpointResponse("OAuth token response from an endpoint that is no longer mediated, or never was", headers)
+    : undefined;
+}
+
+async function requestBodyFromText(req: OAuthProxyRequest): Promise<Buffer | undefined> {
+  if (!req.body) return undefined;
+  let text: string | undefined;
+  try {
+    text = await req.body.getText();
+  } catch {
+    text = undefined;
+  }
+  return text === undefined ? undefined : Buffer.from(text, "utf8");
 }
 
 function tokenTypeForSeed(seed: OAuthSeed): "refresh" | "secret" {
@@ -841,6 +1023,10 @@ export class OAuthMediator {
   private stateQueue: Promise<void> = Promise.resolve();
 
   constructor(private readonly options: {
+    // Hosts that receive static credential injection from the loaded network
+    // policy. A request to one is never an OAuth protocol read (X5): the
+    // mediator sees only the OAuth policy, so the server supplies these.
+    credentialHosts?: () => ReadonlySet<string>;
     log?: (line: string) => void;
     now?: () => Date;
     pairedPolicy?: LoadedOAuthMediationPolicy;
@@ -848,6 +1034,10 @@ export class OAuthMediator {
     projectId?: string;
     stateDir?: string;
     tokenDir?: string;
+    // Renders the refusal of an unmediated OAuth-shaped request that the
+    // final in-mediator check catches (P1-c). The server supplies its
+    // structured denial; the default is a plain 403.
+    unmediatedRequestResponse?: (req: OAuthProxyRequest, refusal: UnmediatedOAuthRequestRefusal) => OAuthRequestResult;
   } = {}) {
     if (options.pairedPolicy) this.activatePairedPolicy(options.pairedPolicy);
   }
@@ -883,18 +1073,41 @@ export class OAuthMediator {
     req: OAuthProxyRequest,
     options: OAuthBeforeRequestOptions = {},
   ): Promise<OAuthRequestResult | undefined> => {
+    // Read the body before the policy: from the policy read to the return
+    // below nothing yields, so the final unmediated-request check sees the
+    // policy the request is forwarded under. mockttp's buffered body is
+    // synchronous; only a test double without one is awaited.
+    const body = req.body === undefined ? undefined : req.body.buffer ?? await requestBodyFromText(req);
     const policyState = this.currentPolicyState();
     const url = parseUrl(req.url);
     if (!url || url.protocol !== "https:") return undefined;
     const state = this.currentState();
+    const allowlisted = options.allowlisted !== false;
     if (!policyState.valid) {
-      return this.rejectRequestWhilePolicyUnavailable(req, policyState.policy, state, url);
+      const rejected = this.rejectRequestWhilePolicyUnavailable(req, policyState.policy, state, url);
+      if (rejected) return rejected;
+      const refusal = this.unmediatedRequestRefusalFor(req, url, body, policyState, state, allowlisted);
+      return refusal ? this.unmediatedRequestResult(req, refusal) : undefined;
     }
     const policy = policyState.policy;
-    if (options.responseMediated === false
-      && (matchingTokenServer(policy, state, url) !== undefined || matchingRegistrationServer(policy, state, url) !== undefined)) {
-      return forbidden("OAuth endpoint became mediated while this request was in flight; retry it");
+    // P1-c: the rule was chosen before this request was handled. A policy or
+    // discovery change in between can leave a now-mediated or now-blocked
+    // endpoint on the plain rule, whose reply is never read.
+    if (options.responseMediated === false) {
+      const claim = endpointClaim(policy, state, url);
+      if (claim?.kind === "mediated") {
+        return forbidden("OAuth endpoint became mediated while this request was in flight; retry it");
+      }
+      if (claim !== undefined) {
+        return forbidden("OAuth endpoint became blocked while this request was in flight; retry it");
+      }
     }
+    // The last check before the request is forwarded: a grant- or
+    // registration-shaped request that no provider mediates, to a host or
+    // endpoint the policy guards. It repeats the server's early check, which
+    // ran before write classification, against the policy current now.
+    const refusal = this.unmediatedRequestRefusalFor(req, url, body, policyState, state, allowlisted);
+    if (refusal) return this.unmediatedRequestResult(req, refusal);
     if (options.protocolRead) {
       const current = this.protocolReadMatch(req, policy, state);
       if (current?.provider !== options.protocolRead.provider || current.kind !== options.protocolRead.kind) {
@@ -931,22 +1144,162 @@ export class OAuthMediator {
   // `/.well-known/` metadata, token, and registration endpoints) so MCP resource
   // responses keep streaming. The predicate is a superset of what beforeResponse
   // acts on, so a non-match can never strand a response that needed rewriting.
+  //
+  // Blocked and colliding endpoints are matched too: their replies are read
+  // and sensitive bodies are blocked. Record-only hosts are deliberately not
+  // matched (their replies are never buffered); the request-side check
+  // guards them.
   requestNeedsResponseMediation = (req: { url: string }): boolean => {
     const url = parseUrl(req.url);
     if (!url || url.protocol !== "https:") return false;
     const policyState = this.currentPolicyState();
-    if (!policyState.valid || policyState.policy.servers.length === 0) return false;
+    if (!policyState.valid) return false;
+    const policy = policyState.policy;
+    if (policy.servers.length === 0 && policy.blockedEndpoints.length === 0) return false;
     let state: StoredMcpOAuthState;
     try {
       state = this.currentState();
     } catch {
       return false;
     }
-    const policy = policyState.policy;
     return matchingMetadataServer(policy, state, url) !== undefined
-      || matchingTokenServer(policy, state, url) !== undefined
-      || matchingRegistrationServer(policy, state, url) !== undefined;
+      || endpointClaim(policy, state, url) !== undefined;
   };
+
+  /**
+   * P1-a, the server's early check: the refusal for an OAuth grant- or
+   * registration-shaped request that no provider mediates, to a record-only
+   * host, a host a record names that also serves an MCP endpoint, a blocked
+   * or colliding endpoint, or (while the OAuth policy is invalid) any
+   * allowlisted host. The server runs it before write classification and the
+   * approval hold, so a refused request creates no prompt, no pending
+   * record, no upstream connection, and no state write.
+   */
+  unmediatedRequestRefusal = async (
+    req: OAuthProxyRequest,
+    options: { allowlisted: boolean },
+  ): Promise<UnmediatedOAuthRequestRefusal | undefined> => {
+    const body = req.body === undefined ? undefined : req.body.buffer ?? await requestBodyFromText(req);
+    const url = parseUrl(req.url);
+    if (!url || url.protocol !== "https:") return undefined;
+    const policyState = this.currentPolicyState();
+    let state: StoredMcpOAuthState;
+    try {
+      state = this.currentState();
+    } catch {
+      // Without readable state no discovered endpoint is known, so nothing
+      // discovered is exempt: the check stays at least as strict.
+      state = {};
+    }
+    return this.unmediatedRequestRefusalFor(req, url, body, policyState, state, options.allowlisted);
+  };
+
+  private unmediatedRequestRefusalFor(
+    req: OAuthProxyRequest,
+    url: URL,
+    body: Buffer | undefined,
+    policyState: CurrentMcpOAuthPolicy,
+    state: StoredMcpOAuthState,
+    allowlisted: boolean,
+  ): UnmediatedOAuthRequestRefusal | undefined {
+    const host = url.hostname.toLowerCase();
+    const policy = policyState.policy;
+    const check = (
+      target: UnmediatedOAuthRequestRefusal["target"],
+      scope: GrantShapeScope,
+      failClosed: boolean,
+      providers: string[],
+      formReadDeclaredJson = true,
+    ): UnmediatedOAuthRequestRefusal | undefined => {
+      const finding = classifyGrantShape({ body, failClosed, formReadDeclaredJson, headers: req.headers, scope, url });
+      if (finding === undefined) return undefined;
+      return { finding, host, path: url.pathname || "/", providers, target };
+    };
+    const userHostOwners = () => policy.servers.filter((server) => server.bindingHosts.includes(host)).map((server) => server.name);
+    if (!policyState.valid) {
+      // The last valid policy's record-only hosts keep their full rule; any
+      // other allowlisted host refuses a readable grant shape. Audited hosts
+      // are outside the allowlist and outside this rule.
+      if (policy.recordOnlyHosts.includes(host)) return check("record-only-host", "deep", true, userHostOwners());
+      return allowlisted ? check("policy-unavailable", "deep", false, []) : undefined;
+    }
+    const claim = endpointClaim(policy, state, url);
+    if (claim?.kind === "mediated") return undefined;
+    if (claim?.kind === "collision") {
+      return check("endpoint-collision", "deep", true, claim.servers.map((server) => server.name));
+    }
+    if (claim?.kind === "blocked") return check("blocked-endpoint", "deep", true, []);
+    if (policy.recordOnlyHosts.includes(host)) return check("record-only-host", "deep", true, userHostOwners());
+    // Path variants of a blocked or colliding endpoint: a deep scan of the
+    // whole host, without fail-closed rules, so ordinary traffic there is
+    // never refused for its size or encoding. These hosts are broadly
+    // allowed, so a JSON body is read by its keys, not as a form: a string
+    // value quoting an OAuth URL is ordinary content there.
+    const hostClaim = hostBlockOrCollision(policy, state, host);
+    if (hostClaim?.kind === "collision") {
+      return check("endpoint-collision", "deep", false, hostClaim.servers.map((server) => server.name), false);
+    }
+    if (hostClaim?.kind === "blocked") return check("blocked-endpoint", "deep", false, [], false);
+    if (policy.recordEndpointHosts.includes(host)) return check("record-endpoint-host", "top-level", false, userHostOwners());
+    return undefined;
+  }
+
+  /**
+   * The refusal for a WebSocket upgrade where the proxy guards OAuth, or
+   * undefined. mockttp returns a non-101 upstream reply to the agent as is,
+   * so an upgrade GET with a grant in its query could fetch real tokens. An
+   * upgrade is refused to a record-only host, to any URL a provider claims
+   * or blocks (mediated, blocked, or colliding), to a host with a blocked or
+   * colliding endpoint when its query is grant-shaped, and to a host a
+   * record names when its query is grant-shaped. While the OAuth policy is
+   * invalid, any grant-shaped query is refused. Synchronous: it runs in the
+   * WebSocket rule matcher.
+   */
+  webSocketUpgradeRefusal = (req: { headers?: Record<string, HeaderValue>; url: string }): UnmediatedOAuthRequestRefusal | undefined => {
+    const url = parseUrl(req.url);
+    if (!url) return undefined;
+    const host = url.hostname.toLowerCase();
+    const pathName = url.pathname || "/";
+    const policyState = this.currentPolicyState();
+    const policy = policyState.policy;
+    const refuse = (
+      target: UnmediatedOAuthRequestRefusal["target"],
+      providers: string[],
+      finding: UnmediatedOAuthRequestRefusal["finding"] = { kind: "websocket" },
+    ): UnmediatedOAuthRequestRefusal => ({ finding, host, path: pathName, providers, target });
+    const queryGrant = () => classifyGrantShape({ body: undefined, failClosed: false, headers: req.headers, scope: "top-level", url });
+    const userHostOwners = () => policy.servers.filter((server) => server.bindingHosts.includes(host)).map((server) => server.name);
+    if (!policyState.valid) {
+      if (policy.recordOnlyHosts.includes(host)) return refuse("record-only-host", userHostOwners());
+      const finding = queryGrant();
+      return finding ? refuse("policy-unavailable", [], finding) : undefined;
+    }
+    let state: StoredMcpOAuthState;
+    try {
+      state = this.currentState();
+    } catch {
+      state = {};
+    }
+    const claim = endpointClaim(policy, state, url);
+    if (claim?.kind === "mediated") return refuse("mediated-endpoint", [claim.server.name]);
+    if (claim?.kind === "collision") return refuse("endpoint-collision", claim.servers.map((server) => server.name));
+    if (claim?.kind === "blocked") return refuse("blocked-endpoint", []);
+    if (policy.recordOnlyHosts.includes(host)) return refuse("record-only-host", userHostOwners());
+    const finding = queryGrant();
+    if (finding === undefined) return undefined;
+    const hostClaim = hostBlockOrCollision(policy, state, host);
+    if (hostClaim?.kind === "collision") return refuse("endpoint-collision", hostClaim.servers.map((server) => server.name), finding);
+    if (hostClaim?.kind === "blocked") return refuse("blocked-endpoint", [], finding);
+    if (policy.recordEndpointHosts.includes(host)) return refuse("record-endpoint-host", userHostOwners(), finding);
+    return undefined;
+  };
+
+  private unmediatedRequestResult(req: OAuthProxyRequest, refusal: UnmediatedOAuthRequestRefusal): OAuthRequestResult {
+    this.log(`proxy: oauth unmediated request refused host=${refusal.host} target=${refusal.target} finding=${refusal.finding.kind}`);
+    if (typeof req.id === "string") this.pendingSensitiveRequests.delete(req.id);
+    return this.options.unmediatedRequestResponse?.(req, refusal)
+      ?? forbidden(`OAuth ${refusal.finding.kind} request to an endpoint the proxy does not mediate`);
+  }
 
   beforeResponse = async (
     res: OAuthProxyResponse,
@@ -955,11 +1308,15 @@ export class OAuthMediator {
     const pending = this.takeSensitiveRequest(req);
     const requestUrl = parseUrl(req.url);
     if (!requestUrl || requestUrl.protocol !== "https:") return undefined;
-    if (res.statusCode < 200 || res.statusCode >= 300) return undefined;
     // Every response on the response-mediating rule is read, even when the
     // policy no longer names a server: a token response that nothing mediates
     // any more is blocked below rather than passed to the agent.
     const text = await res.body.getText();
+    const rawLength = res.body.buffer?.length ?? 0;
+    // A reply that is not a success is never mediated, but it is still read:
+    // an endpoint that returns real tokens with an error status must not get
+    // them to the agent.
+    if (res.statusCode < 200 || res.statusCode >= 300) return unmediatedTokenResponse(text, rawLength, res.headers);
     return await this.withStateLock(() => {
       // Re-read the policy after the body arrived: an activation (a revoke's
       // new state epoch) may have pruned this server's state meanwhile, and
@@ -973,6 +1330,10 @@ export class OAuthMediator {
         return blockedTokenEndpointResponse("MCP OAuth server was revoked during the exchange", res.headers);
       }
       const state = this.currentState();
+      // A blocked or colliding endpoint is mediated by nobody.
+      if (live.valid && !pending && endpointBlocked(livePolicy, state, requestUrl)) {
+        return unmediatedTokenResponse(text, rawLength, res.headers);
+      }
       const couldBeMetadata = live.valid && matchingMetadataServer(livePolicy, state, requestUrl) !== undefined;
       const server = pending?.kind === "token"
         ? pending.server
@@ -980,7 +1341,7 @@ export class OAuthMediator {
       const registrationServer = pending?.kind === "registration"
         ? pending.server
         : live.valid ? matchingRegistrationServer(livePolicy, state, requestUrl) : undefined;
-      if (!server && !registrationServer && !couldBeMetadata) return unmediatedTokenResponse(text, res.headers);
+      if (!server && !registrationServer && !couldBeMetadata) return unmediatedTokenResponse(text, rawLength, res.headers);
       if (!text) {
         return server || registrationServer
           ? blockedTokenEndpointResponse("empty OAuth token response", res.headers)
@@ -1063,6 +1424,9 @@ export class OAuthMediator {
       return undefined;
     }
     const host = url.hostname.toLowerCase();
+    // X5: a host that receives static credential injection never gets
+    // protocol reads; its writes follow write approval.
+    if (this.options.credentialHosts?.().has(host)) return undefined;
     const exact = (endpoint: TokenEndpoint) => endpoint.host === host && endpoint.path === pathName;
     const listed = policy.servers.filter((server) => server.kind === "mcp" && server.protocolReadEndpoints.some(exact));
     if (listed.length !== 1) return undefined;
@@ -1070,11 +1434,8 @@ export class OAuthMediator {
     const isToken = server.tokenEndpoints.some(exact);
     const isRegistration = server.registrationEndpoints.some(exact);
     if (isToken === isRegistration) return undefined;
-    const claimants = policy.servers.filter((candidate) => {
-      return tokenEndpointList(candidate, state).some((endpoint) => tokenEndpointMatches(endpoint, url))
-        || registrationEndpointList(candidate, state).some((endpoint) => endpoint.host === host && pathMatchesPrefix(url.pathname, endpoint.path));
-    });
-    if (claimants.length !== 1 || claimants[0] !== server) return undefined;
+    const claim = endpointClaim(policy, state, url);
+    if (claim?.kind !== "mediated" || claim.server !== server) return undefined;
     // The mediator picks a token server before a registration server; the
     // match must be the one it will actually use.
     const tokenServer = matchingTokenServer(policy, state, url);
@@ -1384,6 +1745,51 @@ export class OAuthMediator {
     return false;
   }
 
+  // R1/R9/R2: a host where this server's metadata may never bind an issuer or
+  // an endpoint: a host-owned refused host (credential destinations, curated
+  // service hosts; only the server's own resource host is exempt), or a host
+  // where another provider's tokens pass. Checked before any state is
+  // touched, so a refusal writes nothing.
+  private captureHostRefused(
+    policy: LoadedMcpOAuthPolicy,
+    server: McpOAuthServerPolicy,
+    host: string,
+    field: "issuer" | "token_endpoint" | "registration_endpoint",
+  ): boolean {
+    if (oauthHostRefusedForProvider(policy, server, host)) {
+      this.log(`proxy: mcp oauth discovery rejected name=${server.name} ${field}_host=${host} reason=refused-host`);
+      return true;
+    }
+    const owners = otherProviderHostOwners(policy, server, host);
+    if (owners.length > 0) {
+      this.log(`proxy: mcp oauth discovery rejected name=${server.name} ${field}_host=${host} reason=other-provider-host providers=${owners.join(",")}`);
+      return true;
+    }
+    return false;
+  }
+
+  private capturableEndpoint(
+    policy: LoadedMcpOAuthPolicy,
+    state: StoredMcpOAuthState,
+    server: McpOAuthServerPolicy,
+    bindingHosts: Set<string>,
+    endpoint: TokenEndpoint,
+    field: "registrationEndpoints" | "tokenEndpoints",
+  ): boolean {
+    const label = field === "tokenEndpoints" ? "token_endpoint" : "registration_endpoint";
+    if (!this.assertBoundDiscoveredEndpoint(server, bindingHosts, endpoint, label)) return false;
+    if (this.captureHostRefused(policy, server, endpoint.host, label)) return false;
+    // R2: an endpoint that another provider also claims is remembered, not
+    // dropped: a request that more than one provider claims is mediated by
+    // none and blocked, so neither provider can capture the other's tokens,
+    // and neither silently wins. `runfree mcp revoke` on one reclaims it.
+    const colliding = collidingProviders(policy, state, server, endpoint, field);
+    if (colliding.length > 0) {
+      this.log(`proxy: mcp oauth endpoint-collision name=${server.name} ${label}_host=${endpoint.host} providers=${colliding.join(",")}; requests to it are blocked`);
+    }
+    return true;
+  }
+
   private captureMetadataEndpoint(
     policy: LoadedMcpOAuthPolicy,
     state: StoredMcpOAuthState,
@@ -1402,6 +1808,7 @@ export class OAuthMediator {
     if (host === server.resourceHost && Array.isArray(parsed.authorization_servers)) {
       for (const entry of parsed.authorization_servers) {
         const issuer = tokenEndpointFromUrl(entry);
+        if (issuer && this.captureHostRefused(policy, server, issuer.host, "issuer")) continue;
         if (issuer && rememberIssuerHost(state, server, issuer.host)) {
           changed = true;
           this.log(`proxy: mcp oauth issuer bound name=${server.name} issuer_host=${issuer.host}`);
@@ -1420,10 +1827,10 @@ export class OAuthMediator {
       const tokenEndpoint = tokenEndpointFromUrl(parsed.token_endpoint);
       const registrationEndpoint = tokenEndpointFromUrl(parsed.registration_endpoint);
       let endpointChanged = false;
-      if (tokenEndpoint && this.assertBoundDiscoveredEndpoint(server, bindingHosts, tokenEndpoint, "token_endpoint")) {
+      if (tokenEndpoint && this.capturableEndpoint(policy, state, server, bindingHosts, tokenEndpoint, "tokenEndpoints")) {
         endpointChanged = rememberEndpoint(state, server, tokenEndpoint, "tokenEndpoints") || endpointChanged;
       }
-      if (registrationEndpoint && this.assertBoundDiscoveredEndpoint(server, bindingHosts, registrationEndpoint, "registration_endpoint")) {
+      if (registrationEndpoint && this.capturableEndpoint(policy, state, server, bindingHosts, registrationEndpoint, "registrationEndpoints")) {
         endpointChanged = rememberEndpoint(state, server, registrationEndpoint, "registrationEndpoints") || endpointChanged;
       }
       if (endpointChanged) {
@@ -1444,9 +1851,7 @@ export class OAuthMediator {
   ): OAuthRequestResult | undefined {
     if (bearerHandle(req.headers)) return forbidden("OAuth policy unavailable");
     if (policy.servers.length === 0) return forbidden("OAuth policy unavailable");
-    if (matchingTokenServer(policy, state, url)
-      || matchingRegistrationServer(policy, state, url)
-      || matchingMetadataServer(policy, state, url)) {
+    if (endpointClaim(policy, state, url) !== undefined || matchingMetadataServer(policy, state, url)) {
       return forbidden("OAuth policy unavailable");
     }
     return undefined;
@@ -1457,7 +1862,7 @@ export class OAuthMediator {
     const policyPath = this.options.policyPath
       ?? process.env.RUNFREE_OAUTH_POLICY
       ?? process.env.RUNFREE_MCP_OAUTH_POLICY;
-    if (!policyPath) return { policy: { servers: [] }, valid: true };
+    if (!policyPath) return { policy: emptyPolicy(), valid: true };
     let stat: fs.Stats;
     try {
       stat = fs.statSync(policyPath);
@@ -1494,7 +1899,7 @@ export class OAuthMediator {
       this.lastPolicyReloadFailure = cacheKey;
     }
     return {
-      policy: this.loadedPolicy ?? { policyPath, servers: [] },
+      policy: this.loadedPolicy ?? emptyPolicy(policyPath),
       valid: false,
     };
   }

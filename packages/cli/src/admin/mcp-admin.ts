@@ -17,9 +17,11 @@ import {
   mcpApprovalPath,
   mcpInventory,
   type McpInventoryEntry,
+  mcpEnableClaimViews,
   mcpLoopbackReach,
   mcpOAuthCallbackPort,
   mcpOAuthProviderId,
+  mcpStaticTokenName,
   mcpRuleKeyForEntry,
   mcpRulesPath,
   readMcpRules,
@@ -28,6 +30,7 @@ import {
   printable,
   revokeMcpApproval,
   saveMcpApproval,
+  type ServiceOAuthEndpoints,
   writeMcpRules,
 } from "../runtime/mcp.ts";
 import {
@@ -41,8 +44,20 @@ import {
   removeMcpEnabledRecords,
   saveMcpEnabledRecord,
 } from "../runtime/mcp-enabled.ts";
+import {
+  type ClaimRefusal,
+  credentialDestinationHosts,
+  curatedServiceHosts,
+  oauthEndpointRefusal,
+  oauthHostRefusal,
+  type OAuthClaimRules,
+} from "../runtime/mcp-oauth-claims.ts";
 import { mcpOAuthEpochsPath, mcpOAuthStateEpoch, updateMcpOAuthEpochs } from "../runtime/mcp-oauth-epochs.ts";
+import { claimRulesFor, serviceClaimUses } from "../runtime/mcp-oauth-projection.ts";
 import { atomicReplaceFile } from "../safe-fs.ts";
+import { projectControlPaths, projectInfo } from "../config.ts";
+import { readApprovedNetworkPolicy } from "../control/approvals.ts";
+import { compileDesiredPolicies } from "../control/compiler.ts";
 import { remedy } from "../remedies.ts";
 import {
   checkPolicyHostname,
@@ -233,6 +248,14 @@ export function parseMcpSource(value: string | undefined): McpSourceScope | unde
 }
 
 function findMcpEntry(agent: McpAgent, serverName: string, source?: McpSourceScope): McpInventoryEntry {
+  return findMcpEntryWithInventory(agent, serverName, source).entry;
+}
+
+function findMcpEntryWithInventory(
+  agent: McpAgent,
+  serverName: string,
+  source?: McpSourceScope,
+): { entry: McpInventoryEntry; inventory: ReturnType<typeof mcpInventory> } {
   const inventory = mcpInventory({
     projectRoot: projectRoot(),
     env: childEnv(),
@@ -246,7 +269,7 @@ function findMcpEntry(agent: McpAgent, serverName: string, source?: McpSourceSco
   if (matches.length > 1) {
     die(`multiple MCP entries match ${agent} ${serverName}; pass --source user, --source local, or --source project`);
   }
-  return matches[0];
+  return { entry: matches[0], inventory };
 }
 
 function interactiveTty(): boolean {
@@ -348,8 +371,84 @@ function currentPolicyHosts(): string[] {
   }
 }
 
+// Whether the current policy narrows a host with request rules (display only).
+function currentPolicyNarrows(host: string): boolean {
+  try {
+    return loadPolicy().raw.requests?.[host] !== undefined;
+  } catch {
+    return false;
+  }
+}
+
+// The credential destinations of the current policy, when it can be read.
+// The projection checks the claim rules again against the policy it builds.
+function currentCredentialHosts(): Set<string> {
+  try {
+    return credentialDestinationHosts(loadPolicy().raw.tokens);
+  } catch {
+    return new Set();
+  }
+}
+
+// The service OAuth providers of the approved desired policy, the same input
+// the projection checks against (X1, X4). Without an approved selection there
+// are none yet; the projection checks again when one exists.
+function approvedServiceOAuthProviders(): Record<string, ServiceOAuthEndpoints> {
+  const discovered = projectInfo(projectRoot(), childEnv());
+  const project = { ...discovered, paths: { ...discovered.paths, ...projectControlPaths(stateDir()), stateDir: stateDir() } };
+  const projectPolicy = readApprovedNetworkPolicy(projectRoot(), project, "network-project");
+  const localPolicy = readApprovedNetworkPolicy(projectRoot(), project, "network-local");
+  if (!projectPolicy || !localPolicy) return {};
+  return compileDesiredPolicies({ project: projectPolicy, local: localPolicy }).oauth;
+}
+
+// The host env var the static-token remedy names, for example GITHUB_MCP_TOKEN.
+function staticTokenEnvName(serverName: string): string {
+  const base = serverName.toUpperCase().replace(/[^A-Z0-9]+/g, "_").replace(/^_+|_+$/g, "");
+  return /^[A-Z]/.test(base) ? `${base}_MCP_TOKEN` : `MCP_${base ? `${base}_` : ""}TOKEN`;
+}
+
+// R20: a server whose OAuth login runs on a well-known host can use a static
+// token instead. The proxy keeps it and injects it; the agent sees a
+// placeholder. Claude reads `headers` with an env reference, Codex reads
+// `bearer_token_env_var` (both parsed by prepareHttpServer). A project entry
+// binds the source with `mcp enable --from-env`; a user or local entry's
+// source is bound with `credential set-source`.
+function staticTokenRemedyLines(entry: McpInventoryEntry): string[] {
+  const env = staticTokenEnvName(entry.name);
+  const header = entry.agent === "codex"
+    ? `set bearer_token_env_var = "${env}" in the server entry`
+    : `add "headers": {"Authorization": "Bearer \${${env}}"} to the server entry`;
+  const command = entry.source === "project"
+    ? remedy.mcpEnableProjectFromEnv(entry.agent, shellWord(entry.name), env)
+    : remedy.credentialSetSourceFromEnv(mcpStaticTokenName(entry.agent, entry.name, "Authorization"), env);
+  return [`  use a token instead: ${header}, remove its OAuth settings, and run`, `    ${command}`];
+}
+
+// A claim refusal for the person: what was refused, why, and the way back.
+function claimRefusalLines(entry: McpInventoryEntry, subject: string, refusal: ClaimRefusal): string[] {
+  const lines = [`cannot use ${printable(subject)} for ${entry.agent} ${printable(entry.name)}:`];
+  if (refusal.use === "curated") {
+    lines.push(`  ${printable(refusal.reason)}.`, ...staticTokenRemedyLines(entry));
+  } else {
+    lines.push(`  ${printable(refusal.reason)}`);
+  }
+  return lines;
+}
+
+function endpointKindText(kind: "metadata" | "token" | "registration"): string {
+  return kind === "metadata" ? "authorization server metadata" : `a ${kind} endpoint`;
+}
+
+function crossHostLabel(kinds: readonly string[]): string {
+  return kinds.length > 1 ? "token and registration endpoints on another host" : `${kinds[0] ?? "token"} endpoint on another host`;
+}
+
 export type McpEnableDeps = McpLoopbackOptions & {
   discovery?: DiscoveryDeps;
+  // The approved service OAuth providers the claim rules check against;
+  // defaults to the compiled approved desired policy.
+  serviceOAuthProviders?: () => Record<string, ServiceOAuthEndpoints>;
   // One yes/no question; defaults to a clack confirm (default No).
   confirm?: (message: string) => Promise<boolean>;
 };
@@ -420,7 +519,7 @@ export async function mcpEnableIntent(input: McpEnableInput, deps: McpEnableDeps
   const shownName = printable(serverName);
   // 1. Resolve and validate the entry. No network call happens before this.
   // The review reads `deps.loopback` only for a loopback entry.
-  const entry = findMcpEntry(agent, serverName, input.source);
+  const { entry, inventory } = findMcpEntryWithInventory(agent, serverName, input.source);
   if (entry.decision.status === "unsupported" || entry.decision.status === "skipped" || entry.decision.status === "conflict") {
     die(`cannot enable MCP server ${agent} ${shownName}: ${printable(entry.decision.reason ?? entry.decision.status)}`);
   }
@@ -462,6 +561,48 @@ export async function mcpEnableIntent(input: McpEnableInput, deps: McpEnableDeps
     planned.set(checked.host, { host: checked.host, origin: "user" });
   }
 
+  // 2b. The claim rules (X1, R1, R2, R9, R17, R20), the same ones every
+  // projection applies: no credential destination, no well-known (curated
+  // service) host, no host another prepared MCP server uses, and no endpoint
+  // another provider uses. A refused user host or declared endpoint stops the
+  // enable here, before any network call or write.
+  const enabledFile = mcpEnabledPath(stateDir());
+  const previous = readMcpEnabled(projectRoot(), enabledFile, { quiet: true }).file;
+  let claimRules: OAuthClaimRules | undefined;
+  let declaredTokenEndpointCount = 0;
+  if (oauthCapable && endpointHost) {
+    const { views, selfKey } = mcpEnableClaimViews(projectRoot(), inventory.entries, previous.records, entry);
+    claimRules = claimRulesFor(views, selfKey, {
+      credentialHosts: currentCredentialHosts(),
+      curatedHosts: curatedServiceHosts(),
+      serviceUses: serviceClaimUses((deps.serviceOAuthProviders ?? approvedServiceOAuthProviders)()),
+    });
+    for (const host of planned.values()) {
+      const refusal = oauthHostRefusal(claimRules, host.host, endpointHost);
+      if (refusal) die([...claimRefusalLines(entry, `--oauth-host ${host.host}`, refusal), "nothing was saved"].join("\n"));
+    }
+    const self = views.find((view) => view.key === selfKey);
+    declaredTokenEndpointCount = self?.declaredTokenEndpoints.length ?? 0;
+    for (const declared of self?.declaredTokenEndpoints ?? []) {
+      const refusal = oauthEndpointRefusal(claimRules, { kind: "token", host: declared.host, path: declared.path }, endpointHost);
+      if (refusal) {
+        die([...claimRefusalLines(entry, `the declared https://${declared.host}${declared.path} as a token endpoint`, refusal), "nothing was saved"].join("\n"));
+      }
+    }
+    if (self?.declaredMetadataUrl) {
+      let metadataHost: string | undefined;
+      try {
+        metadataHost = new URL(self.declaredMetadataUrl).hostname.toLowerCase();
+      } catch {
+        metadataHost = undefined;
+      }
+      const refusal = metadataHost ? oauthHostRefusal(claimRules, metadataHost, endpointHost) : undefined;
+      if (refusal) {
+        die([...claimRefusalLines(entry, `the declared ${self.declaredMetadataUrl} as authorization server metadata`, refusal), "nothing was saved"].join("\n"));
+      }
+    }
+  }
+
   // 3. Host-side discovery: only for a resolved, valid, OAuth-capable entry,
   // only on a terminal, and for untrusted project config only after the
   // person agrees to contact the endpoint it names.
@@ -489,9 +630,24 @@ export async function mcpEnableIntent(input: McpEnableInput, deps: McpEnableDeps
         endpointUrl,
         declaredMetadataUrls: declared.metadataUrls,
         declaredTokenHosts: declared.tokenHosts,
+        userHosts: [...planned.keys()],
+        ...(claimRules ? { claimRules } : {}),
       }, deps.discovery);
     } catch (error) {
       die(`cannot discover OAuth hosts for ${agent} ${shownName}: ${error instanceof Error ? error.message : String(error)}; pass --no-discover to enable it with no discovered OAuth hosts`);
+    }
+    // R20: when every token endpoint the metadata names is on a well-known
+    // host, there is no OAuth login Runfree can mediate: stop before any
+    // write and name the static-token path.
+    const [wellKnown] = discovery.wellKnownRefusals;
+    if (wellKnown && declaredTokenEndpointCount === 0 && !discovery.endpoints.some((endpointEntry) => endpointEntry.kind === "token")) {
+      die([
+        ...claimRefusalLines(entry, `${wellKnown.url} as ${endpointKindText(wellKnown.kind)}`, {
+          use: "curated",
+          reason: `${wellKnown.host} is a well-known host; other logins there would be captured`,
+        }),
+        "nothing was saved",
+      ].join("\n"));
     }
     for (const found of discovery.hosts) {
       const existing = planned.get(found.host);
@@ -500,6 +656,7 @@ export async function mcpEnableIntent(input: McpEnableInput, deps: McpEnableDeps
         origin: existing ? "user" : "discovered",
         evidence: boundedEvidence(found.evidence),
         ...(existing ? { alsoUser: true } : {}),
+        ...(!existing && found.crossHost ? { crossHost: true as const, crossHostKinds: [...found.crossHost] } : {}),
       });
     }
   }
@@ -520,7 +677,9 @@ export async function mcpEnableIntent(input: McpEnableInput, deps: McpEnableDeps
       server: serverName,
       enabledAt: new Date().toISOString(),
       oauthHosts: hosts.map(({ alsoUser: _alsoUser, ...host }) => host),
-      ...(endpoints.length > 0 ? { oauthEndpoints: endpoints.map(({ kind, host, path: endpointPath }) => ({ kind, host, path: endpointPath })) } : {}),
+      ...(endpoints.length > 0
+        ? { oauthEndpoints: endpoints.map(({ kind, host, path: endpointPath, exact }) => ({ kind, host, path: endpointPath, ...(exact ? { exact } : {}) })) }
+        : {}),
     }
     : undefined;
   if (record && !validateMcpEnabledRecord(record)) {
@@ -528,8 +687,6 @@ export async function mcpEnableIntent(input: McpEnableInput, deps: McpEnableDeps
   }
 
   // 4. The one review.
-  const enabledFile = mcpEnabledPath(stateDir());
-  const previous = readMcpEnabled(projectRoot(), enabledFile, { quiet: true }).file;
   // Hosts the narrowing leaves broad: already allowed by the current policy,
   // or named as `--oauth-host` by another server's record.
   const broadHosts = new Set<string>([...currentPolicyHosts(), ...(endpointHost ? [endpointHost] : [])]);
@@ -562,11 +719,26 @@ export async function mcpEnableIntent(input: McpEnableInput, deps: McpEnableDeps
   if (loopback) for (const line of loopbackReviewLines(entry, view)) console.log(`  ${line}`);
   if (endpointHost && entry.transport === "http") console.log(`  allow host ${endpointHost}  [MCP endpoint]`);
   for (const host of hosts) {
-    console.log(`  allow host ${host.host}  [OAuth, ${hostOriginLabel(host)}]`);
+    const crossKinds = host.crossHost ? host.crossHostKinds ?? [] : [];
+    console.log(`  allow host ${host.host}  [OAuth, ${crossKinds.length > 0 ? crossHostLabel(crossKinds) : hostOriginLabel(host)}]`);
     for (const evidence of host.evidence ?? []) console.log(`      ${evidence}`);
     const hostEndpoints = endpoints.filter((endpointEntry) => endpointEntry.host === host.host);
-    if (host.origin === "discovered" && broadHosts.has(host.host)) {
-      console.log("      already allowed by the current policy; its existing rules stay");
+    const tokenUrls = hostEndpoints.filter((endpointEntry) => endpointEntry.kind === "token").map((endpointEntry) => `https://${endpointEntry.host}${endpointEntry.path}`);
+    const alreadyAllowed = host.origin === "discovered" && broadHosts.has(host.host);
+    // X2: a cross-host claim says where the tokens go and, on a host the
+    // policy already allows, that its rules stay and only the exact endpoint
+    // is held by the proxy for this server.
+    if (crossKinds.length > 0 && alreadyAllowed) {
+      console.log(`      ${host.host} is ALREADY ALLOWED${currentPolicyNarrows(host.host) ? "" : " for all paths"} (current policy); its rules stay`);
+      for (const url of tokenUrls) console.log(`      token replies from ${url} will be held by the proxy for MCP server ${agent} ${shownName}`);
+      console.log("      approve only if this address belongs to the same service");
+    } else if (crossKinds.length > 0) {
+      console.log("      this server's OAuth tokens and refresh tokens will be sent to this host");
+    }
+    // R21: a recorded token endpoint captures every login at that exact URL.
+    for (const url of tokenUrls) console.log(`      other apps that log in at ${url} will stop working in the sandbox`);
+    if (alreadyAllowed) {
+      if (crossKinds.length === 0) console.log("      already allowed by the current policy; its existing rules stay");
     } else if (host.origin === "discovered") {
       console.log(`      limited to GET, HEAD, OPTIONS, and POST on paths starting with /.well-known${hostEndpoints.map((endpointEntry) => `, ${endpointEntry.path}`).join("")}`);
     }
@@ -581,14 +753,21 @@ export async function mcpEnableIntent(input: McpEnableInput, deps: McpEnableDeps
     for (const contact of discovery.contacted) console.log(`  GET ${contact.url}: ${contact.outcome}`);
     for (const host of discovery.covered) console.log(`  ${host}: already allowed with the server`);
     for (const reason of discovery.rejected) console.log(`  not added: ${printable(reason)}`);
+    for (const refusal of discovery.wellKnownRefusals) {
+      const lines = claimRefusalLines(entry, `${refusal.url} as ${endpointKindText(refusal.kind)}`, {
+        use: "curated",
+        reason: `${refusal.host} is a well-known host; other logins there would be captured`,
+      });
+      for (const line of lines) console.log(`  ${line}`);
+    }
     for (const origin of discovery.authorizationEndpoints) {
       console.log(`  browser sign-in at ${origin} (opened on this computer; not allowlisted)`);
     }
     if (!discovery.oauthDetected) console.log("  no valid OAuth metadata found; no OAuth hosts added");
   }
   if (hosts.some((host) => host.origin === "user")) {
-    console.log("  warning: --oauth-host hosts are allowed as given (like runfree host add). The proxy mediates only the endpoints listed above;");
-    console.log("  a login at any other token endpoint on these hosts returns the real access and refresh tokens to the agent");
+    console.log("  note: --oauth-host hosts are allowed as given (like runfree host add). The proxy mediates the token and registration");
+    console.log("  endpoints this server's OAuth metadata names there; while only MCP records allow such a host, it refuses any other token request to it");
   }
   if (hosts.length > 0) {
     console.log("  OAuth login, refresh, and client registration at the mediated endpoints need no write approval;");
@@ -672,10 +851,11 @@ export function mcpExplainIntent(input: McpExplainInput, deps: McpLoopbackOption
   const identity = mcpRuleKeyForEntry(entry);
   const enabled = identity ? readMcpEnabled(projectRoot(), mcpEnabledPath(stateDir())).file.records[identity] : undefined;
   for (const host of enabled?.oauthHosts ?? []) {
-    console.log(`OAuth host: ${host.host} (${host.origin === "user" ? "--oauth-host" : "discovered"}; added by mcp enable)`);
+    const origin = host.origin === "user" ? "--oauth-host" : host.crossHost ? `discovered, ${crossHostLabel(host.crossHostKinds ?? [])}` : "discovered";
+    console.log(`OAuth host: ${host.host} (${origin}; added by mcp enable)`);
   }
   for (const endpoint of enabled?.oauthEndpoints ?? []) {
-    if (endpoint.kind !== "metadata") console.log(`OAuth ${endpoint.kind} endpoint: https://${endpoint.host}${endpoint.path}`);
+    if (endpoint.kind !== "metadata") console.log(`OAuth ${endpoint.kind} endpoint: https://${endpoint.host}${endpoint.path}${endpoint.exact ? " (exact path)" : ""}`);
   }
   for (const binding of entry.tokenBindings ?? []) {
     console.log(`credential binding: ${binding.tokenName} -> ${binding.credential.host} ${binding.credential.header} ${binding.credential.scheme}${binding.credential.pathPrefix ? ` ${binding.credential.pathPrefix}` : ""}`);
@@ -938,16 +1118,34 @@ export function mcpRevokeIntent(input: McpRevokeInput): McpRevokeResult {
   // The OAuth state clear comes first: if its tombstone cannot be written,
   // revoke fails before it changes anything else. The proxy keys OAuth state
   // by agent and server name, so this covers every source of that name.
+  // R16: one server for several agents shares one login, so another agent's
+  // provider is cleared too when that agent has an entry with this server
+  // name and source (the same share group, or a member whose config has
+  // drifted from it). The group is not recomputed, because its membership can
+  // drift; an agent with no such entry keeps its state. Every handle of a
+  // group is filed under its owner's provider, so this epoch bump clears the
+  // group; the owner moves only when its entry is gone, at the next
+  // projection, which clears every member again.
+  const approvalFile = mcpApprovalPath(stateDir());
+  const inventory = mcpInventory({ projectRoot: projectRoot(), env: childEnv(), approvalPath: approvalFile }).entries;
+  const entry = inventory.find((candidate) => candidate.source === "project" && candidate.agent === agent && candidate.name === serverName);
+  const revokedSources = new Set(inventory
+    .filter((candidate) => candidate.agent === agent && candidate.name === serverName && (input.source === undefined || candidate.source === input.source))
+    .map((candidate) => candidate.source));
+  const clearedAgents = MCP_AGENT_IDS.filter((each) => each === agent
+    || inventory.some((candidate) => candidate.agent === each && candidate.name === serverName && revokedSources.has(candidate.source)));
   const oauthProviderId = mcpOAuthProviderId(agent, serverName);
-  const epochs = updateMcpOAuthEpochs(projectRoot(), mcpOAuthEpochsPath(stateDir()), { revoke: [oauthProviderId] });
+  const epochs = updateMcpOAuthEpochs(projectRoot(), mcpOAuthEpochsPath(stateDir()), {
+    revoke: clearedAgents.map((each) => mcpOAuthProviderId(each, serverName)),
+  });
   const oauthStateEpoch = mcpOAuthStateEpoch(epochs, oauthProviderId);
   if (epochs.reset === "reclaimed") {
     console.log("the MCP OAuth state epoch store was invalid and was replaced; the proxy clears all MCP OAuth state, so every MCP server needs a new OAuth login");
   }
   console.log(`proxy OAuth state for ${agent} ${shownName}: clear requested`);
-  const approvalFile = mcpApprovalPath(stateDir());
-  const entry = mcpInventory({ projectRoot: projectRoot(), env: childEnv(), approvalPath: approvalFile })
-    .entries.find((candidate) => candidate.source === "project" && candidate.agent === agent && candidate.name === serverName);
+  if (clearedAgents.length > 1) {
+    console.log(`${clearedAgents.join(" and ")} share one OAuth login for ${shownName} (same server name and source), so each needs a new OAuth login for it`);
+  }
   if (input.source === undefined || input.source === "project") {
     const result = revokeMcpApproval(projectRoot(), approvalFile, agent, serverName);
     if (result.changed) {
@@ -987,6 +1185,9 @@ export function mcpRevokeIntent(input: McpRevokeInput): McpRevokeResult {
 export function prepareEffectiveRuntimeIntent(input: {
   basePolicy: PolicyJson;
   outputPath: string;
+  // The approved service OAuth providers; MCP claims may not overlap their
+  // endpoints (X4, R6).
+  serviceOAuthProviders?: Record<string, ServiceOAuthEndpoints>;
 }): void {
   ensureStateDirs();
   const base = validateNetworkPolicy(input.basePolicy);
@@ -1004,6 +1205,7 @@ export function prepareEffectiveRuntimeIntent(input: {
     mcpOAuthEpochsPath: mcpOAuthEpochsPath(stateDir()),
     policy: structuredClone(base.raw),
     projectRoot: projectRoot(),
+    ...(input.serviceOAuthProviders ? { serviceOAuthProviders: input.serviceOAuthProviders } : {}),
     tokenConfig: loadTokenConfig(),
   });
   if (result.tokenConfigChanged) saveTokenConfig(result.tokenConfig);

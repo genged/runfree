@@ -24,6 +24,7 @@ import {
   denialReasonText,
   safePathname,
   syntheticDenialBody,
+  webSocketOAuthDenialBody,
   type DenialReason,
   type ShapeDenialBodyDetails,
 } from "./denial.js";
@@ -34,11 +35,12 @@ import {
   type OAuthProxyResponse,
   type OAuthRequestResult,
   type ProtocolReadMatch,
+  type UnmediatedOAuthRequestRefusal,
 } from "./oauth-mediation.js";
 import {
   PROTOCOL_READ_BODY_CAP_BYTES,
   ProtocolReadRateLimiter,
-  protocolReadBodyAllowed,
+  protocolReadBodyRefusal,
   unlistedClientIdMetadataUrl,
   protocolReadGrantType,
 } from "./oauth-protocol-read.js";
@@ -213,16 +215,32 @@ let currentEffectiveControl: LoadedEffectiveProxyControl | undefined = effective
   ? loadEffectiveProxyControl(effectiveProxyRoot)
   : undefined;
 let currentPolicy = currentEffectiveControl?.networkPolicy ?? loadProxyPolicy();
-let currentMcpOperationPolicy = loadMcpOperationPolicy();
+let currentMcpOperationPolicy = loadMcpOperationPolicy(currentEffectiveControl);
 let policyRevalidationCandidate: {
   policy: LoadedProxyPolicy;
   mcpOperationGeneration: string | undefined;
 } | undefined;
 const oauthMediator = new OAuthMediator({
+  // X5: hosts that receive static credential injection, from the network
+  // policy current at the call.
+  credentialHosts: () => credentialDestinationHosts(currentPolicy),
   ...(currentEffectiveControl ? { pairedPolicy: currentEffectiveControl.oauthPolicy } : {}),
+  unmediatedRequestResponse: (req, refusal) => oauthEndpointNotMediatedResponse(req as ProxyRequest, refusal),
 });
 const admissionRegistry = new AdmissionRegistry();
 const sessionSockets = new Map<string, Set<net.Socket>>();
+
+// Hosts with at least one credential mapping: the proxy injects a static
+// credential there. Cached per loaded policy object.
+const credentialHostCache = new WeakMap<LoadedProxyPolicy, ReadonlySet<string>>();
+function credentialDestinationHosts(policy: LoadedProxyPolicy): ReadonlySet<string> {
+  let hosts = credentialHostCache.get(policy);
+  if (hosts === undefined) {
+    hosts = new Set(Object.entries(policy.credentials).filter(([, mappings]) => mappings.length > 0).map(([host]) => host));
+    credentialHostCache.set(policy, hosts);
+  }
+  return hosts;
+}
 
 function revokeSessionContexts(sessionKey: string): void {
   writeApprovals.revokeSession(sessionKey);
@@ -643,7 +661,12 @@ function mcpOperationPolicyPath(): string | undefined {
   return process.env.RUNFREE_MCP_OPERATION_POLICY_PATH;
 }
 
-function loadMcpOperationPolicy(): LoadedMcpOperationPolicy | undefined {
+// Under an effective proxy root the MCP operation policy is a payload of the
+// selected generation, loaded and digest-verified with the network and OAuth
+// policies; a generation without one (an older release's) holds none. The
+// separately mounted file is read only without an effective root.
+function loadMcpOperationPolicy(effectiveControl: LoadedEffectiveProxyControl | undefined): LoadedMcpOperationPolicy | undefined {
+  if (effectiveProxyRoot) return effectiveControl?.mcpOperationPolicy;
   const policyPath = mcpOperationPolicyPath();
   if (!policyPath) return undefined;
   try {
@@ -692,7 +715,7 @@ function reloadPolicy(): void {
       ? loadEffectiveProxyControl(effectiveProxyRoot)
       : undefined;
     const nextPolicy = nextEffectiveControl?.networkPolicy ?? loadProxyPolicy();
-    const nextMcpOperationPolicy = loadMcpOperationPolicy();
+    const nextMcpOperationPolicy = loadMcpOperationPolicy(nextEffectiveControl);
     if (nextPolicy.generation === previous.generation
       && nextMcpOperationPolicy?.generation === currentMcpOperationPolicy?.generation
       && nextEffectiveControl?.active.controlGeneration === currentEffectiveControl?.active.controlGeneration) {
@@ -742,7 +765,7 @@ function reloadPolicy(): void {
 }
 
 const selectedPolicyPath = effectiveProxyRoot ? path.join(effectiveProxyRoot, "active.json") : currentPolicy.policyPath;
-const currentMcpPolicyPath = mcpOperationPolicyPath();
+const currentMcpPolicyPath = effectiveProxyRoot ? undefined : mcpOperationPolicyPath();
 
 type WatchedFileRevision = {
   exists: boolean;
@@ -1130,7 +1153,7 @@ async function auditedRequestMutation(admission: AdmissionRecord, req: ProxyRequ
     ...req,
     headers: headers ?? req.headers,
   };
-  const oauthMutation = await oauthMediator.beforeRequest(nextReq, { responseMediated });
+  const oauthMutation = await oauthMediator.beforeRequest(nextReq, { allowlisted: false, responseMediated });
   return combineRequestMutations(headers ? { headers } : {}, oauthMutation);
 }
 
@@ -1349,6 +1372,17 @@ function isAllowedWebSocket(admission: AdmissionRecord, req: ProxyRequest): bool
     });
     return false;
   }
+  // Checked before the shape rules, so a refused upgrade notes no pending
+  // retry approval.
+  if (webSocketOAuthRefusal(admission, req) !== undefined) {
+    emitDenial({
+      reason: "oauth-endpoint-not-mediated",
+      host: requestHost(req),
+      method: req.method ?? "GET",
+      path: req.url,
+    });
+    return false;
+  }
   try {
     assertAllowedWebSocketRequest(admission, req, {
       allowedHosts: currentPolicy.allowedHosts,
@@ -1427,6 +1461,30 @@ function isAllowedWebSocket(admission: AdmissionRecord, req: ProxyRequest): bool
     }
     return false;
   }
+}
+
+// A WebSocket upgrade where the proxy guards OAuth (P1-a for upgrades):
+// mockttp returns a non-101 upstream reply to the agent unread, so an
+// upgrade GET with a grant in its query could fetch real tokens. No events:
+// it also runs as a rule matcher. An admission mismatch keeps its own rule.
+// One decision per upgrade request: the allow matcher and every rejection
+// rule matcher see the same refusal, and the state file is read once.
+const webSocketOAuthRefusals = new WeakMap<ProxyRequest, UnmediatedOAuthRequestRefusal | null>();
+function webSocketOAuthRefusal(admission: AdmissionRecord, req: ProxyRequest): UnmediatedOAuthRequestRefusal | undefined {
+  const cached = webSocketOAuthRefusals.get(req);
+  if (cached !== undefined) return cached ?? undefined;
+  const refusal = computeWebSocketOAuthRefusal(admission, req);
+  webSocketOAuthRefusals.set(req, refusal ?? null);
+  return refusal;
+}
+
+function computeWebSocketOAuthRefusal(admission: AdmissionRecord, req: ProxyRequest): UnmediatedOAuthRequestRefusal | undefined {
+  if (currentAdmissionPrincipal(admission) === undefined) return undefined;
+  if (webSocketAdmissionMismatchStatus(admission, req) !== undefined) return undefined;
+  const refusal = oauthMediator.webSocketUpgradeRefusal(req);
+  // The invalid-policy rule covers allowlisted hosts only (audit is outside).
+  if (refusal?.target === "policy-unavailable" && !currentPolicy.allowedHostSet.has(requestHost(req))) return undefined;
+  return refusal;
 }
 
 function webSocketAdmissionMismatchStatus(admission: AdmissionRecord, req: ProxyRequest): 403 | 421 | undefined {
@@ -1598,17 +1656,28 @@ async function oauthProtocolReadForRequest(
   if ((rule?.writeAction ?? currentPolicy.writeApproval ?? DEFAULT_WRITE_ACTION) !== "ask") return undefined;
   const match = oauthMediator.protocolReadEndpoint(req);
   if (!match) return undefined;
+  // Says which check made a recorded endpoint's POST a write; reason codes
+  // only, never a header or body value.
+  const notRead = (reason: string) => {
+    console.log(`proxy: oauth protocol-read refused name=${match.provider} kind=${match.kind} reason=${reason}; the request follows write approval`);
+  };
   const contentLengthRaw = firstHeader(req.headers, ["content-length"]);
   if (contentLengthRaw === undefined || !/^\d{1,6}$/.test(contentLengthRaw) || Number(contentLengthRaw) > PROTOCOL_READ_BODY_CAP_BYTES) {
+    notRead(contentLengthRaw === undefined
+      ? `content-length-missing${firstHeader(req.headers, ["transfer-encoding"]) !== undefined ? " transfer-encoding=present" : ""}`
+      : "content-length-invalid");
     return undefined;
   }
   let bodyText: string | undefined;
   try {
     bodyText = await req.body?.getText();
   } catch {
+    notRead("body-unreadable");
     return undefined;
   }
-  if (!protocolReadBodyAllowed({ bodyText, headers: req.headers, kind: match.kind, resourceHost: match.resourceHost })) {
+  const refusal = protocolReadBodyRefusal({ bodyText, headers: req.headers, kind: match.kind, resourceHost: match.resourceHost });
+  if (refusal !== undefined) {
+    notRead(refusal);
     // Display only: lets the write denial say why this was not a read.
     return match.kind === "token" && bodyText !== undefined && unlistedClientIdMetadataUrl(bodyText)
       ? { unlistedClientIdUrl: true }
@@ -1617,7 +1686,10 @@ async function oauthProtocolReadForRequest(
   // The body read awaited: a policy reload may have landed. Decide on the
   // policy that is current now, synchronously with the classification.
   const current = oauthMediator.protocolReadEndpoint(req);
-  if (current?.provider !== match.provider || current.kind !== match.kind) return undefined;
+  if (current?.provider !== match.provider || current.kind !== match.kind) {
+    notRead("policy-changed");
+    return undefined;
+  }
   // Checked here, spent only once the request passes every policy check, so
   // requests the policy refuses cannot drain the budget.
   if (!protocolReadLimiter.available(match.provider)) {
@@ -1639,6 +1711,15 @@ async function policedRequestMutation(
   let credential: CredentialMutationSummary | undefined;
   const principal = currentAdmissionPrincipal(admission);
   if (principal === undefined) return missingAdmissionResponse(req);
+  // P1-a: an OAuth grant- or registration-shaped request that no provider
+  // mediates, to a host or endpoint the OAuth policy guards, is refused
+  // before write classification and the approval hold (no prompt, no pending
+  // record), before credential injection, and before any upstream connection
+  // or OAuth state write. A held request re-runs this path when released.
+  const unmediated = await oauthMediator.unmediatedRequestRefusal(req, {
+    allowlisted: currentPolicy.allowedHostSet.has(requestHost(req)),
+  });
+  if (unmediated) return oauthEndpointNotMediatedResponse(req, unmediated);
   const graphqlBodyClass = await graphqlBodyClassForRequest(req);
   const lfsBodyClass = await lfsBodyClassForRequest(req);
   const mcpClassification = await mcpClassificationForRequest(req);
@@ -1722,6 +1803,24 @@ function policyDenialResponse(req: ProxyRequest, error: Error) {
     };
   }
   return blockedResponse(requestHost(req), error.message);
+}
+
+function oauthEndpointNotMediatedResponse(req: ProxyRequest, refusal: UnmediatedOAuthRequestRefusal) {
+  const host = requestHost(req);
+  const method = req.method ?? "<unknown>";
+  emitDenial({ reason: "oauth-endpoint-not-mediated", host, method, path: req.url });
+  return {
+    response: syntheticDenialResponseFields(host, "oauth-endpoint-not-mediated", {
+      method,
+      path: refusal.path,
+      oauthEndpoint: {
+        ...(refusal.finding.kind === "grant-shaped" ? { field: refusal.finding.field } : {}),
+        finding: refusal.finding.kind,
+        providers: refusal.providers,
+        target: refusal.target,
+      },
+    }),
+  };
 }
 
 function writeApprovalDenial(req: ProxyRequest, shape: ShapeDenialDetails, reason: DenialReason) {
@@ -1880,6 +1979,28 @@ for (const statusCode of [421, 403] as const) {
       },
       "blocked by agent proxy policy\nrequest host did not match the admitted CONNECT host\n",
     );
+}
+// OAuth-guarded upgrades: one rule per (target, finding) pair, because the
+// rejection body is fixed per rule. Each body carries the explanation and
+// remedy of the HTTPS denial, with `<host>` in place of the host.
+for (const target of ["record-only-host", "mediated-endpoint", "blocked-endpoint", "endpoint-collision", "record-endpoint-host", "policy-unavailable"] as const) {
+  for (const finding of ["websocket", "grant-shaped"] as const) {
+    await server.forAnyWebSocket()
+      .matching((admission: AdmissionRecord, req: ProxyRequest) => {
+        const refusal = webSocketOAuthRefusal(admission, req);
+        return refusal?.target === target && refusal.finding.kind === finding;
+      })
+      .always()
+      .thenRejectConnection(
+        403,
+        "Forbidden",
+        {
+          "content-type": "text/plain; charset=utf-8",
+          "x-runfree-blocked": "oauth-endpoint-not-mediated",
+        },
+        webSocketOAuthDenialBody({ finding, target }),
+      );
+  }
 }
 // Shape-denied upgrades get the matching x-runfree-blocked reason. The
 // rejection body is static per rule (mockttp limitation); per-request host,

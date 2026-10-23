@@ -340,6 +340,28 @@ This block is enforced by the Runfree proxy outside the agent container.
 The person operating Runfree can inspect recent denials by running
 \`runfree doctor\` on the host machine.
 ",
+  "oauth-endpoint-not-mediated": "Runfree blocked this request.
+
+  host:   api.example.com
+  method: POST
+  path:   /api/v1/things
+  reason: an OAuth token or client registration request to an endpoint the proxy does not mediate
+
+The proxy holds the real OAuth tokens of MCP servers and gives the agent handles.
+It does not mediate this endpoint, so the request was not sent.
+
+If the login of an MCP server uses this endpoint, the person operating
+Runfree can enable the server again on the host machine, so the proxy
+records and mediates the endpoint:
+
+  runfree mcp enable <agent> <server>
+
+or remove the server and its OAuth hosts:
+
+  runfree mcp revoke <agent> <server>
+
+Current rules: runfree host explain api.example.com
+",
   "path-not-allowed": "Runfree blocked this request.
 
   host:   api.example.com

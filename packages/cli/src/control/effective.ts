@@ -3,18 +3,28 @@ import fs from "node:fs";
 import path from "node:path";
 
 import {
+  validateMcpOperationPolicy,
+  type McpOperationPolicyJson,
+} from "@runfree/runtime-contracts/mcp-operation-policy";
+import {
+  type LoadedNetworkPolicy,
   validateNetworkPolicy,
   type PolicyJson,
 } from "@runfree/runtime-contracts/network-policy";
 import {
+  oauthMediationPolicyTopLevelJson,
   oauthProviderPolicyJson,
   validateOAuthMediationPolicy,
+  type LoadedOAuthMediationPolicy,
   type OAuthMediationPolicyJson,
   type OAuthProviderPolicyJson,
+  type OAuthTokenEndpoint,
 } from "@runfree/runtime-contracts/oauth-mediation-policy";
 import type { ParsedGenerationStatus } from "@runfree/runtime-contracts/proxy-status";
 import type { ProjectInfo } from "../config.ts";
 import { atomicReplaceFile } from "../safe-fs.ts";
+import { type ClaimEndpoint, credentialDestinationHosts, oauthEndpointsOverlap } from "../runtime/mcp-oauth-claims.ts";
+import { warn } from "../warnings.ts";
 import {
   CONTROL_APPROVAL_HISTORICAL_VERSIONS,
   CONTROL_APPROVAL_SELECTION_VERSION,
@@ -48,6 +58,10 @@ const HOST_PAYLOADS = ["agent/agent.env", "runtime/control.json"] as const;
 // disk may still list it; it stays verifiable but is never written or required.
 const LEGACY_OPTIONAL_HOST_PAYLOADS = ["runtime/provenance.json"] as const;
 const PROXY_PAYLOADS = ["network-policy.json", "oauth-mediation-policy.json"] as const;
+// Written when the prepared MCP operation policy lists a server; absent means
+// none, which keeps a project without HTTPS MCP servers on the same
+// generation bytes older readers load.
+const OPTIONAL_PROXY_PAYLOADS = ["mcp-operation-policy.json"] as const;
 
 type FileDigests<T extends string> = Record<T, string>;
 export type EffectiveHostManifest = {
@@ -63,7 +77,8 @@ export type EffectiveHostManifest = {
 export type EffectiveProxyManifest = {
   compilerVersion: string;
   controlGeneration: string;
-  files: FileDigests<typeof PROXY_PAYLOADS[number]>;
+  files: FileDigests<typeof PROXY_PAYLOADS[number]>
+    & Partial<FileDigests<typeof OPTIONAL_PROXY_PAYLOADS[number]>>;
   policyGeneration: string;
   schemaVersion: typeof EFFECTIVE_CONTROL_SCHEMA_VERSION;
 };
@@ -143,14 +158,78 @@ function generationName(digest: string): string {
   return digest.slice("sha256:".length);
 }
 
+function endpointKey(endpoint: { host: string; path: string }): string {
+  return `${endpoint.host}\0${endpoint.path}`;
+}
+
+/**
+ * The second line of the MCP claim rules, where every provider is known
+ * (design X4, X5, R5). Never throws: an offending entry is dropped with a
+ * warning, so the generation still publishes.
+ *
+ * - X4: an MCP provider's static token or registration endpoint that equals
+ *   or overlaps (by registration prefix, in either direction) a service
+ *   provider's endpoint is dropped from the MCP provider; the service, which
+ *   desired policy approved, keeps it. Unless the service mediates that exact
+ *   endpoint, it becomes a blocked endpoint, so its token request never
+ *   passes unmediated.
+ * - X5: a protocol-read endpoint on a credential destination host is
+ *   dropped, so a POST there follows write approval.
+ */
+function reconcileMcpOAuthProviders(
+  base: LoadedOAuthMediationPolicy,
+  compiled: ReturnType<typeof compileDesiredPolicies>,
+  networkPolicy: LoadedNetworkPolicy,
+): { providers: Record<string, OAuthProviderPolicyJson>; blockedEndpoints: OAuthTokenEndpoint[] } {
+  const serviceEndpoints: Array<ClaimEndpoint & { providerId: string }> = Object.entries(compiled.oauth).flatMap(([providerId, provider]) => [
+    ...provider.tokenEndpoints.map((endpoint) => ({ kind: "token" as const, host: endpoint.host, path: endpoint.path, providerId })),
+    ...(provider.registrationEndpoints ?? []).map((endpoint) => ({ kind: "registration" as const, host: endpoint.host, path: endpoint.path, providerId })),
+  ]);
+  const serviceExact = new Set(serviceEndpoints.map(endpointKey));
+  const credentialHosts = credentialDestinationHosts(networkPolicy.raw.tokens);
+  const blocked = new Map(base.blockedEndpoints.map((endpoint) => [endpointKey(endpoint), endpoint]));
+  const providers: Record<string, OAuthProviderPolicyJson> = {};
+  for (const provider of base.providers) {
+    if (provider.kind !== "mcp") {
+      providers[provider.providerId] = oauthProviderPolicyJson(provider);
+      continue;
+    }
+    const dropped = new Set<string>();
+    const keep = (kind: "token" | "registration", endpoint: OAuthTokenEndpoint & { exact?: true }): boolean => {
+      const claim: ClaimEndpoint = { kind, host: endpoint.host, path: endpoint.path, ...(endpoint.exact ? { exact: true as const } : {}) };
+      const collision = serviceEndpoints.find((service) => oauthEndpointsOverlap(claim, service));
+      if (!collision) return true;
+      warn(`mcp: OAuth provider ${provider.providerId} ${kind} endpoint https://${endpoint.host}${endpoint.path} overlaps service OAuth provider `
+        + `${collision.providerId}'s ${collision.kind} endpoint https://${collision.host}${collision.path}; the service keeps it and the MCP server does not use it`);
+      dropped.add(endpointKey(endpoint));
+      if (!serviceExact.has(endpointKey(endpoint))) blocked.set(endpointKey(endpoint), { host: endpoint.host, path: endpoint.path });
+      return false;
+    };
+    const tokenEndpoints = provider.tokenEndpoints.filter((endpoint) => keep("token", endpoint));
+    const registrationEndpoints = provider.registrationEndpoints.filter((endpoint) => keep("registration", endpoint));
+    const protocolReadEndpoints = provider.protocolReadEndpoints.filter((endpoint) => {
+      if (dropped.has(endpointKey(endpoint))) return false;
+      if (!credentialHosts.has(endpoint.host)) return true;
+      warn(`mcp: OAuth provider ${provider.providerId} endpoint https://${endpoint.host}${endpoint.path} is on a credential destination host; `
+        + "requests there are not OAuth protocol reads and follow write approval");
+      return false;
+    });
+    providers[provider.providerId] = oauthProviderPolicyJson({ ...provider, tokenEndpoints, registrationEndpoints, protocolReadEndpoints });
+  }
+  for (const key of serviceExact) blocked.delete(key);
+  return { providers, blockedEndpoints: [...blocked.values()] };
+}
+
+export const reconcileMcpOAuthProvidersForTest = reconcileMcpOAuthProviders;
+
 function effectiveOAuthPolicy(
   compiled: ReturnType<typeof compileDesiredPolicies>,
   input: PublishEffectiveControlInput,
+  networkPolicy: LoadedNetworkPolicy,
 ): OAuthMediationPolicyJson {
   const base = validateOAuthMediationPolicy(input.baseOAuthPolicy ?? { providers: {} });
-  const providers: Record<string, OAuthProviderPolicyJson> = Object.fromEntries(
-    base.providers.map((provider) => [provider.providerId, oauthProviderPolicyJson(provider)]),
-  );
+  const reconciled = reconcileMcpOAuthProviders(base, compiled, networkPolicy);
+  const providers: Record<string, OAuthProviderPolicyJson> = reconciled.providers;
   for (const [providerId, provider] of Object.entries(compiled.oauth)) {
     if (providers[providerId]) throw new Error(`OAuth provider ${providerId} conflicts with host-owned OAuth policy`);
     const handles = input.oauthSeedHandles?.[providerId] ?? {};
@@ -169,7 +248,16 @@ function effectiveOAuthPolicy(
       } : {}),
     };
   }
-  const policy = { providers: Object.fromEntries(Object.entries(providers).sort()) };
+  // Host-owned top-level fields (record-only hosts, blocked endpoints,
+  // refused hosts) pass through from the base policy, plus the endpoints the
+  // service reconciliation above blocked.
+  const policy = {
+    ...oauthMediationPolicyTopLevelJson({
+      ...base,
+      blockedEndpoints: [...reconciled.blockedEndpoints].sort((left, right) => endpointKey(left).localeCompare(endpointKey(right))),
+    }),
+    providers: Object.fromEntries(Object.entries(providers).sort()),
+  };
   validateOAuthMediationPolicy(policy);
   return policy;
 }
@@ -206,6 +294,7 @@ export type PublishEffectiveControlInput = {
   agentEnvValues?: Record<string, string>;
   baseOAuthPolicy?: OAuthMediationPolicyJson;
   effectiveNetworkPolicy?: PolicyJson;
+  mcpOperationPolicy?: McpOperationPolicyJson;
   oauthSeedHandles?: Record<string, Record<string, string>>;
   runtimeNetwork?: Record<string, unknown>;
 };
@@ -275,7 +364,7 @@ function parseProxyManifest(source: string): EffectiveProxyManifest {
     compilerVersion: CONTROL_COMPILER_VERSION,
     controlGeneration: raw.controlGeneration,
     policyGeneration: raw.policyGeneration,
-    files: validateDigestMap(raw.files, PROXY_PAYLOADS, "proxy manifest files") as EffectiveProxyManifest["files"],
+    files: validateDigestMap(raw.files, PROXY_PAYLOADS, "proxy manifest files", OPTIONAL_PROXY_PAYLOADS) as EffectiveProxyManifest["files"],
   };
 }
 
@@ -341,6 +430,9 @@ export function verifyEffectivePolicyGeneration(
   const policy = validateNetworkPolicy(parseStrictJson(regularContents(proxyDirectory, "network-policy.json")));
   if (policy.generation !== hostManifest.policyGeneration) throw new Error("effective network policy generation does not match the manifests");
   validateOAuthMediationPolicy(parseStrictJson(regularContents(proxyDirectory, "oauth-mediation-policy.json")));
+  if (proxyManifest.files["mcp-operation-policy.json"] !== undefined) {
+    validateMcpOperationPolicy(parseStrictJson(regularContents(proxyDirectory, "mcp-operation-policy.json")));
+  }
   return {
     controlGeneration,
     policyGeneration: policy.generation,
@@ -495,7 +587,8 @@ function publishEffectivePolicyGenerationUnlocked(
   if (!selection) throw new Error("control approval selection is missing");
   const compiled = compileDesiredPolicies({ project: projectPolicy, local: localPolicy });
   const loadedPolicy = validateNetworkPolicy(input.effectiveNetworkPolicy ?? compiled.policy);
-  const oauthPolicy = effectiveOAuthPolicy(compiled, input);
+  const oauthPolicy = effectiveOAuthPolicy(compiled, input, loadedPolicy);
+  const mcpOperationPolicy = input.mcpOperationPolicy ? validateMcpOperationPolicy(input.mcpOperationPolicy).raw : undefined;
   const hostPayloads = {
     "agent/agent.env": effectiveAgentEnv(compiled, input),
     "runtime/control.json": `${JSON.stringify({ isolation: runtimeIsolation, network: input.runtimeNetwork ?? {} }, null, 2)}\n`,
@@ -503,6 +596,9 @@ function publishEffectivePolicyGenerationUnlocked(
   const proxyPayloads = {
     "network-policy.json": `${JSON.stringify(loadedPolicy.raw, null, 2)}\n`,
     "oauth-mediation-policy.json": `${JSON.stringify(oauthPolicy, null, 2)}\n`,
+    ...(mcpOperationPolicy && mcpOperationPolicy.servers.length > 0
+      ? { "mcp-operation-policy.json": `${JSON.stringify(mcpOperationPolicy, null, 2)}\n` }
+      : {}),
   };
   const selectedSubjects = Object.fromEntries(Object.entries(selection.subjects).sort().map(([name, approval]) => [name, approval?.digest]));
   const payloadDigests = Object.fromEntries(Object.entries({ ...hostPayloads, ...proxyPayloads }).sort()

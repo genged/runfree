@@ -19,6 +19,7 @@ import {
   pinnedHttpsGet,
   protectedResourceMetadataUrls,
 } from "./mcp-discovery.ts";
+import { curatedServiceHosts, type OAuthClaimRules } from "../runtime/mcp-oauth-claims.ts";
 
 type Route = DiscoveryHttpResult | Record<string, unknown>;
 
@@ -134,16 +135,24 @@ describe("discoverMcpOAuthHosts", () => {
     expect(net.requested).toEqual([PRM_PATH, PRM_ROOT, AS_META]);
   });
 
-  test("an issuer whose token endpoint is outside the mediator binding set is not added", async () => {
+  test("an issuer whose token endpoint is on another host yields a cross-host candidate", async () => {
     const net = fakeNetwork({
       [PRM_PATH]: { resource: ENDPOINT, authorization_servers: ["https://auth.example.com"] },
-      [AS_META]: { issuer: "https://auth.example.com", token_endpoint: "https://tokens.attacker.example/token" },
+      [AS_META]: { issuer: "https://auth.example.com", token_endpoint: "https://tokens.other.example/token" },
     });
     const result = await discoverMcpOAuthHosts(input(), net.deps);
-    expect(result.hosts).toEqual([]);
-    expect(result.endpoints).toEqual([]);
-    expect(result.rejected.join("\n")).toContain("tokens.attacker.example");
-    expect(result.rejected.join("\n")).toContain("would not mediate");
+    expect(result.hosts.map((entry) => entry.host)).toEqual(["auth.example.com", "tokens.other.example"]);
+    expect(result.hosts[0]?.crossHost).toBeUndefined();
+    expect(result.hosts[1]).toEqual({
+      host: "tokens.other.example",
+      crossHost: ["token"],
+      evidence: [
+        "token_endpoint https://tokens.other.example/token",
+        "named by authorization server https://auth.example.com/ (its metadata issuer matches)",
+        `which ${PRM_PATH} named`,
+      ],
+    });
+    expect(result.endpoints).toContainEqual({ kind: "token", host: "tokens.other.example", path: "/token" });
   });
 
   test("a registration endpoint outside the binding set is dropped, the rest kept", async () => {
@@ -351,6 +360,100 @@ describe("discoverMcpOAuthHosts", () => {
     for (const entry of result.endpoints) expect(isRecordableEndpoint(entry.kind, entry.host, entry.path), entry.path).toBe(true);
   });
 
+  test("X1: the Ahrefs shape records the cross-host token endpoint and keeps the issuer-host registration by prefix", async () => {
+    const net = fakeNetwork({
+      [PRM_PATH]: { resource: ENDPOINT, authorization_servers: ["https://mcp.example.com/"] },
+      "https://mcp.example.com/.well-known/oauth-authorization-server": {
+        issuer: "https://mcp.example.com/",
+        registration_endpoint: "https://mcp.example.com/mcp/register",
+        authorization_endpoint: "https://app.example.com/web/oauth/authorize",
+        token_endpoint: "https://example.com/oauth/token",
+      },
+    });
+    const result = await discoverMcpOAuthHosts(input(), net.deps);
+    expect(result.hosts).toEqual([{
+      host: "example.com",
+      crossHost: ["token"],
+      evidence: [
+        "token_endpoint https://example.com/oauth/token",
+        "named by authorization server https://mcp.example.com/ (its metadata issuer matches)",
+        `which ${PRM_PATH} named`,
+      ],
+    }]);
+    expect(result.endpoints).toEqual([
+      { kind: "metadata", host: "mcp.example.com", path: "/.well-known/oauth-authorization-server" },
+      { kind: "registration", host: "mcp.example.com", path: "/mcp/register" },
+      { kind: "token", host: "example.com", path: "/oauth/token" },
+    ]);
+    expect(result.authorizationEndpoints).toEqual(["https://app.example.com"]);
+  });
+
+  test("Q8: a registration endpoint on the cross-host token host is recorded exact; on a third host it is refused", async () => {
+    const vercel = fakeNetwork({
+      [PRM_PATH]: { resource: ENDPOINT, authorization_servers: ["https://auth.example.com"] },
+      [AS_META]: {
+        issuer: "https://auth.example.com",
+        token_endpoint: "https://api.other.example/login/oauth/token",
+        registration_endpoint: "https://api.other.example/login/oauth/register",
+      },
+    });
+    const accepted = await discoverMcpOAuthHosts(input(), vercel.deps);
+    expect(accepted.hosts.find((entry) => entry.host === "api.other.example")?.crossHost).toEqual(["registration", "token"]);
+    expect(accepted.endpoints).toContainEqual({ kind: "registration", host: "api.other.example", path: "/login/oauth/register", exact: true });
+    expect(accepted.endpoints).toContainEqual({ kind: "token", host: "api.other.example", path: "/login/oauth/token" });
+
+    const third = fakeNetwork({
+      [PRM_PATH]: { resource: ENDPOINT, authorization_servers: ["https://auth.example.com"] },
+      [AS_META]: {
+        issuer: "https://auth.example.com",
+        token_endpoint: "https://api.other.example/login/oauth/token",
+        registration_endpoint: "https://register.third.example/register",
+      },
+    });
+    const refused = await discoverMcpOAuthHosts(input(), third.deps);
+    expect(refused.endpoints.some((entry) => entry.kind === "registration")).toBe(false);
+    expect(refused.hosts.map((entry) => entry.host)).not.toContain("register.third.example");
+    expect(refused.hosts.find((entry) => entry.host === "api.other.example")?.crossHost).toEqual(["token"]);
+    expect(refused.rejected.join("\n")).toContain("registration_endpoint https://register.third.example/register is not on the MCP endpoint host");
+  });
+
+  test("X1: a declared metadata URL may name a cross-host token endpoint", async () => {
+    const declared = "https://login.example.org/.well-known/oauth-authorization-server";
+    const net = fakeNetwork({
+      [declared]: { issuer: "https://login.example.org", token_endpoint: "https://tokens.other.example/token" },
+    });
+    const result = await discoverMcpOAuthHosts(input({ declaredMetadataUrls: [declared] }), net.deps);
+    expect(result.hosts).toEqual([{
+      host: "tokens.other.example",
+      crossHost: ["token"],
+      evidence: ["token_endpoint https://tokens.other.example/token", `named by declared metadata ${declared}`],
+    }]);
+  });
+
+  test("X1: a cross-host endpoint at the root, with a query, or on an IP is refused", async () => {
+    for (const token of ["https://tokens.other.example/", "https://tokens.other.example/token?x=1", "https://10.1.2.3/token", "https://tokens.other.example:8443/token"]) {
+      const net = fakeNetwork({
+        [PRM_PATH]: { resource: ENDPOINT, authorization_servers: ["https://auth.example.com"] },
+        [AS_META]: { issuer: "https://auth.example.com", token_endpoint: token },
+      });
+      const result = await discoverMcpOAuthHosts(input(), net.deps);
+      expect(result.hosts, token).toEqual([]);
+      expect(result.endpoints, token).toEqual([]);
+    }
+  });
+
+  test("X6: a user host binds the endpoints its metadata names there; it is not a cross-host claim", async () => {
+    const net = fakeNetwork({
+      [PRM_PATH]: { resource: ENDPOINT, authorization_servers: ["https://auth.example.com"] },
+      [AS_META]: { issuer: "https://auth.example.com", token_endpoint: "https://sso.example.org/token" },
+    });
+    const result = await discoverMcpOAuthHosts(input({ userHosts: ["sso.example.org"] }), net.deps);
+    const sso = result.hosts.find((entry) => entry.host === "sso.example.org");
+    expect(sso?.crossHost).toBeUndefined();
+    expect(sso?.evidence).toEqual(["token_endpoint https://sso.example.org/token"]);
+    expect(result.endpoints).toContainEqual({ kind: "token", host: "sso.example.org", path: "/token" });
+  });
+
   test("a declared metadata URL with a port or query is not fetched", async () => {
     const net = fakeNetwork({});
     const result = await discoverMcpOAuthHosts(input({ declaredMetadataUrls: ["https://login.example.org:444/.well-known/x", "https://login.example.org/m?x=1"] }), net.deps);
@@ -392,6 +495,107 @@ describe("discoverMcpOAuthHosts", () => {
     await expect(discoverMcpOAuthHosts(input({ endpointUrl: "http://mcp.example.com/mcp" }), net.deps)).rejects.toThrow("HTTPS");
     await expect(discoverMcpOAuthHosts(input({ endpointUrl: "https://127.0.0.1/mcp" }), net.deps)).rejects.toThrow("HTTPS");
     expect(net.resolved).toEqual([]);
+  });
+});
+
+// X1, R1, R2, R20: the claim rules discovery applies to every document. A
+// refusal drops the whole document (no host, no endpoint), with the reason.
+describe("discovery claim rules", () => {
+  function rules(overrides: Partial<OAuthClaimRules> = {}): OAuthClaimRules {
+    return { credentialHosts: new Set(), curatedHosts: curatedServiceHosts(), others: [], ...overrides };
+  }
+
+  function crossHostNetwork(token: string, registration?: string) {
+    return fakeNetwork({
+      [PRM_PATH]: { resource: ENDPOINT, authorization_servers: ["https://auth.example.com"] },
+      [AS_META]: { issuer: "https://auth.example.com", token_endpoint: token, ...(registration ? { registration_endpoint: registration } : {}) },
+    });
+  }
+
+  test("R20: a token endpoint on a curated service host is refused and reported as well-known", async () => {
+    const result = await discoverMcpOAuthHosts(input({ claimRules: rules() }), crossHostNetwork("https://github.com/login/oauth/access_token").deps);
+    expect(result.hosts).toEqual([]);
+    expect(result.endpoints).toEqual([]);
+    expect(result.wellKnownRefusals).toEqual([{ kind: "token", url: "https://github.com/login/oauth/access_token", host: "github.com" }]);
+    expect(result.rejected.join("\n")).toContain("github.com is a well-known host");
+    expect(result.oauthDetected).toBe(true);
+  });
+
+  test("R1: an issuer the resource names on a curated host is refused, endpoints and all", async () => {
+    const net = fakeNetwork({
+      [PRM_PATH]: { resource: ENDPOINT, authorization_servers: ["https://github.com/login/oauth"] },
+      "https://github.com/.well-known/oauth-authorization-server/login/oauth": {
+        issuer: "https://github.com/login/oauth",
+        token_endpoint: "https://github.com/login/oauth/access_token",
+      },
+    });
+    const result = await discoverMcpOAuthHosts(input({ claimRules: rules() }), net.deps);
+    expect(result.hosts).toEqual([]);
+    expect(result.endpoints).toEqual([]);
+    expect(result.wellKnownRefusals.map((entry) => entry.host)).toEqual(["github.com"]);
+  });
+
+  test("every curated service host is refused as a token host", () => {
+    // The fixed refuse list is the registry itself, not a copy of it.
+    const curated = curatedServiceHosts();
+    for (const host of ["api.anthropic.com", "api.openai.com", "auth.openai.com", "github.com", "api.github.com", "gitlab.com", "oauth2.googleapis.com"]) {
+      expect(curated.has(host), host).toBe(true);
+    }
+  });
+
+  test("a credential destination host is refused", async () => {
+    const result = await discoverMcpOAuthHosts(
+      input({ claimRules: rules({ credentialHosts: new Set(["tokens.other.example"]) }) }),
+      crossHostNetwork("https://tokens.other.example/token").deps,
+    );
+    expect(result.hosts).toEqual([]);
+    expect(result.endpoints).toEqual([]);
+    expect(result.wellKnownRefusals).toEqual([]);
+    expect(result.rejected.join("\n")).toContain("tokens.other.example is a credential destination");
+  });
+
+  test("R2: a host another MCP server uses is refused", async () => {
+    const result = await discoverMcpOAuthHosts(
+      input({ claimRules: rules({ others: [{ label: "claude server other", hosts: ["tokens.other.example"], endpoints: [] }] }) }),
+      crossHostNetwork("https://tokens.other.example/token").deps,
+    );
+    expect(result.hosts).toEqual([]);
+    expect(result.rejected.join("\n")).toContain("tokens.other.example is used by claude server other");
+  });
+
+  test("another provider's endpoint is refused exactly, and a registration endpoint by prefix overlap", async () => {
+    const tokenCollision = await discoverMcpOAuthHosts(
+      input({ claimRules: rules({ others: [{ label: "service OAuth provider svc", hosts: [], endpoints: [{ kind: "token", host: "auth.example.com", path: "/token" }] }] }) }),
+      crossHostNetwork("https://auth.example.com/token").deps,
+    );
+    expect(tokenCollision.hosts).toEqual([]);
+    expect(tokenCollision.rejected.join("\n")).toContain("overlaps service OAuth provider svc's token endpoint https://auth.example.com/token");
+
+    const prefix = await discoverMcpOAuthHosts(
+      input({ claimRules: rules({ others: [{ label: "claude server other", hosts: [], endpoints: [{ kind: "token", host: "auth.example.com", path: "/register/client" }] }] }) }),
+      crossHostNetwork("https://auth.example.com/token", "https://auth.example.com/register").deps,
+    );
+    expect(prefix.hosts).toEqual([]);
+    expect(prefix.rejected.join("\n")).toContain("registration_endpoint https://auth.example.com/register cannot be used");
+
+    // A different path on a host nobody else uses is no collision.
+    const clear = await discoverMcpOAuthHosts(
+      input({ claimRules: rules({ others: [{ label: "claude server other", hosts: [], endpoints: [{ kind: "token", host: "auth.example.com", path: "/other" }] }] }) }),
+      crossHostNetwork("https://auth.example.com/token").deps,
+    );
+    expect(clear.hosts.map((entry) => entry.host)).toEqual(["auth.example.com"]);
+  });
+
+  test("the server's own resource host is exempt from the host rules", async () => {
+    const net = fakeNetwork({
+      [PRM_PATH]: { resource: ENDPOINT, authorization_servers: ["https://mcp.example.com"] },
+      "https://mcp.example.com/.well-known/oauth-authorization-server": { issuer: "https://mcp.example.com", token_endpoint: "https://mcp.example.com/token" },
+    });
+    const result = await discoverMcpOAuthHosts(
+      input({ claimRules: rules({ credentialHosts: new Set(["mcp.example.com"]), curatedHosts: new Set(["mcp.example.com"]) }) }),
+      net.deps,
+    );
+    expect(result.endpoints).toContainEqual({ kind: "token", host: "mcp.example.com", path: "/token" });
   });
 });
 

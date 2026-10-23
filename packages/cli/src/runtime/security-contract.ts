@@ -184,7 +184,6 @@ const STARTUP_MOUNT_INVARIANTS = new Set([
   "proxy-ca-private-mounted",
   "proxy-ca-public-mounted",
   "proxy-effective-control-read-only",
-  "proxy-mcp-operation-policy-read-only",
   "proxy-token-store-tmpfs",
   "proxy-audit-tmpfs",
   "proxy-audit-spool-tmpfs",
@@ -238,7 +237,6 @@ export function hashRuntimeSecurityContract(contract: RuntimeSecurityContract): 
 }
 
 function proxyMounts(plan: ActiveRuntimePlan): RuntimeMountInvariant[] {
-  const mcpOperationPolicyPath = plan.paths.mcpOperationPolicyPath ?? path.join(plan.paths.stateDir, "mcp-operation-policy.json");
   return [
     {
       code: "proxy-ca-private-mounted",
@@ -260,12 +258,6 @@ function proxyMounts(plan: ActiveRuntimePlan): RuntimeMountInvariant[] {
       source: plan.paths.controlProxyDir,
       requiredMode: "ro",
       sourceMustExist: true,
-    },
-    {
-      code: "proxy-mcp-operation-policy-read-only",
-      containerPath: "/app/proxy/mcp-operation-policy.json",
-      source: mcpOperationPolicyPath,
-      requiredMode: "ro",
     },
     {
       code: "proxy-token-store-tmpfs",

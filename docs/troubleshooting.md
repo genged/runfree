@@ -279,6 +279,48 @@ Codex one. The issuer would fetch that URL, so the request counts as a write.
 The denial does not repeat the URL. Approve it with `runfree approve <id>` only
 if you expect that client. See [MCP](cli.md#mcp).
 
+## An OAuth request was refused as not mediated
+
+The agent gets a 403 with reason `oauth-endpoint-not-mediated`, and `runfree
+doctor` prints:
+
+```text
+<host>: an OAuth token or client registration request the proxy does not mediate was refused (1 request)
+```
+
+The host is allowed, but the proxy holds MCP OAuth tokens and does not
+mediate this endpoint, so it refused the request before it reached the host.
+The denial names the cause:
+
+| Denial says | Cause | Remedy |
+| --- | --- | --- |
+| `Only MCP OAuth settings allow this host`, or `The OAuth settings of an MCP server name this host` | A token or registration request to an endpoint that no server's metadata named, on a host that `mcp enable` added. | If an MCP server's login uses it, run `runfree mcp enable <agent> <server>` again so the endpoint is recorded. Otherwise `runfree mcp revoke <agent> <server>`. |
+| `its body is larger than 16 KiB`, `it is multipart/form-data`, `its body has no Content-Length`, or `cannot be decoded` | The proxy could not check the body of a request to a host only MCP allows. A declared charset other than UTF-8 or US-ASCII, or a NUL byte, counts as undecodable. This can refuse an ordinary upload to an `--oauth-host` host. | If the host should take ordinary uploads, `runfree host add <host>`. This also ends the token-request refusal there: a token request the proxy does not mediate then returns real tokens to the agent. |
+| `Runfree blocked this WebSocket upgrade.` and `This is a WebSocket upgrade. The proxy cannot read its reply` | A WebSocket upgrade where the proxy guards OAuth: to a host only MCP allows, to an OAuth endpoint a server claims, or with a grant in its query to a host the OAuth settings guard. The reply could carry real tokens. The body names the cause with the same lines as above, but shows a literal `<host>`; `runfree doctor` shows the real host. | The body gives the remedy. With `The proxy mediates this OAuth endpoint for HTTPS requests only`, send the request over HTTPS instead. On a host only MCP allows, it also offers `runfree host add <host>` for a host that should take WebSocket connections, with the same warning as above. Otherwise follow the matching row above. |
+| `another use of the host conflicts with that claim` | A server's claim on this endpoint was dropped: a credential, a service, or another MCP server now uses the host. The launch printed a warning that names it. | Remove the conflicting use and run `runfree mcp enable <agent> <server>`, or `runfree mcp revoke <agent> <server>`. |
+| `More than one OAuth server claims this endpoint` | Two servers' metadata name the same endpoint, so neither mediates it. | `runfree mcp revoke <agent> <server>` for one of them. |
+| `The OAuth mediation policy of the proxy is unavailable` | The proxy could not load its OAuth policy, so it refuses every token request it cannot mediate. | Run `runfree doctor` on the host. |
+
+## A shared MCP login is blocked
+
+A launch warns `Runfree could not store which agent holds its shared OAuth
+login in <file>`. One server enabled for both agents shares one login, and
+Runfree stores which agent owns it. Until it can write that file, the proxy
+blocks the server's OAuth login. Make the file and its directory writable and
+launch again, or remove the server's OAuth hosts with
+`runfree mcp revoke <agent> <server>`.
+
+## `mcp enable` refuses an OAuth host
+
+`mcp enable` stops with `cannot use <url or host> for <agent> <server>:` and
+`nothing was saved` when the host or endpoint fails the
+[host rule](cli.md#oauth-hosts-on-another-host): the proxy injects a
+credential there, a curated service uses the host, or another MCP server uses
+it. For a well-known host such as `github.com`, the message names the
+static-token path: add an `Authorization` header to the server entry and bind
+it with `--from-env`. For a host another server uses, revoke that server
+first or remove the `--oauth-host`.
+
 ## Credentials are not reaching the proxy
 
 ```bash

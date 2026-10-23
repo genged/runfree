@@ -114,6 +114,8 @@ effective policy, the proxy CA private key, and host files outside the project.
 | CONNECTs to an unapproved `<name>.runfree.internal:<port>` | raw 403, no dial | proxy name and port pair check |
 | Configures a loopback HTTP MCP (`http://127.0.0.1:<port>`) on an unapproved port | no host reach | proxy name and port pair check; uid 1001-only firewall rule |
 | Gives a loopback HTTP MCP a header, helper, or OAuth setting | entry skipped | loopback MCP config allowlist |
+| Sends an OAuth token or registration request to an endpoint the proxy does not mediate, on a host only MCP records allow | 403 `oauth-endpoint-not-mediated`, no upstream connect, no approval prompt | proxy grant check ([MCP](#mcp) rule 9) |
+| Names `github.com` or another host where other logins pass as an MCP server's token endpoint | refused at `mcp enable` and at every launch | MCP host rule ([MCP](#mcp) rule 8) |
 | Dials the host gateway IP directly | no route | `agent_internal` has no egress; uid 1001-only firewall rule |
 | POSTs to an allowed host under `ask` | held for a host decision | write approval |
 | `git push` to `github.com` or `gitlab.com` with the service's token stored | held under `ask`; once approved, it **succeeds with your token** | write approval; `--deny-git-push` |
@@ -581,50 +583,163 @@ Details: [Write Approval Grants](architecture.md#write-approval-grants).
    an orphan session container that no record claims is removed. The bridge
    accepts only its forwarder. The port is a routing value, not an
    authorization secret: the client keeps state, PKCE, and issuer checks.
-7. `runfree mcp enable` adds OAuth hosts only after one host-side review, and
-   only when valid metadata names a token endpoint the proxy mediates for
-   that server. Discovery of a project-named host runs only after the user
-   agrees on a terminal: plain HTTPS GETs from the host, with no credentials,
-   cookies, proxy, or redirects, to public, checked addresses over a pinned
-   connection, with strict time and size limits. Unless something else allows
-   it, a discovered host is limited to GET, HEAD, OPTIONS, and POST on paths
-   under `/.well-known` or its recorded OAuth endpoint paths. The browser
-   sign-in page opens on the host and is never allowlisted. The hosts live in
-   host-owned state, not desired policy, stop applying when the reviewed
-   server config changes, and `runfree mcp revoke` removes exactly them. A
-   damaged record grants nothing. An endpoint that two servers record is not
-   mediated statically for either and follows write approval.
-8. **Revoke clears the proxy's OAuth state for the server.** It saves a new
-   state epoch for the server (see [MCP Model](architecture.md#mcp-model));
-   the proxy refuses a stale handle at use and blocks, not stores, a token
-   response from an exchange that started before the revoke. With no proxy
-   running, the clear happens at the next start. Revoke says "cleared" only
-   when the running proxy confirmed the exact policy generation. A damaged or
-   missing epoch record clears the OAuth state of every MCP server. A rotated
-   refresh token retires the handle it replaced. Each server keeps at most
-   256 token handles and 32 registration handles, evicting expired access
-   handles first and never the newest refresh handle; past 1024 exchanges in
-   flight, a new one is refused rather than evicting another.
-9. **Protocol reads are exact.** On an `ask` host, a POST is a read, with no
-   approval, only when its exact path (no normalization, query, or encoding)
-   is a token or registration endpoint that `mcp enable` recorded for one
-   server, the proxy mediates it for that server alone, and the body is a
-   plain login, refresh, or loopback-only client registration with no field
-   an issuer may fetch at a URL the agent chose: a URL-valued `client_id`
-   must equal, byte for byte, a pinned agent client metadata URL (Claude
-   Code's or Codex's published document), and no `resource` may name another
-   host. The body must be identity-encoded and declare its length, at most
-   16 KiB. Each server gets at most 30 a minute, counted only for requests that
-   pass every other check. The live `mcp-enable` tranche checks that each
-   pinned client metadata URL appears in the pinned agent binary, so a vendor
-   change fails the gate. Everything else
-   on the host stays a write. A request that selected the unmediated proxy
-   rule while its endpoint became mediated is refused, so a token never
-   reaches the agent unmediated. This covers the token and registration
-   POSTs only: an authorization GET with a URL `client_id` to an issuer host
-   the project allows broadly (`--oauth-host`, desired policy, or the MCP
-   host itself) is an ordinary read, and an issuer that supports client ID
-   metadata documents may fetch that URL.
+7. **`runfree mcp enable` adds OAuth hosts only after one host-side review**,
+   and only when valid metadata names a token endpoint that the proxy then
+   mediates for that server. Discovery of a project-named host runs only
+   after the user agrees on a terminal: plain HTTPS GETs from the host, with
+   no credentials, cookies, proxy, or redirects, to public, checked addresses
+   over a pinned connection, with strict time and size limits. A token
+   endpoint may be on another host than the MCP endpoint and its named
+   authorization servers only when its metadata came from an authorization
+   server that the endpoint's protected-resource metadata named, or from a
+   declared metadata URL; the resource-origin fallback never yields one. A
+   registration endpoint on another host is accepted only on that token
+   endpoint's host, and the proxy matches it by exact path, never as a
+   prefix. The review labels such a host `token endpoint on another host`
+   and says where the tokens go. A token or registration endpoint that the
+   server's metadata names on one of its `--oauth-host` hosts is mediated:
+   discovery records it, and the proxy binds it at run time. Unless something
+   else allows it, a discovered host is limited to GET, HEAD, OPTIONS, and
+   POST on paths under `/.well-known` or its recorded OAuth endpoint paths.
+   The browser sign-in page opens on the host and is never allowlisted. The
+   hosts live in host-owned state, not desired policy, stop applying when the
+   reviewed server config changes, and `runfree mcp revoke` removes exactly
+   them. A damaged record grants nothing.
+8. **An MCP server cannot claim a host where another login's tokens pass.**
+   The same rule runs at `mcp enable`, before any write, and again at every
+   launch. It covers every OAuth host and endpoint a server would use:
+   discovered, given with `--oauth-host`, or declared in its config (a token
+   endpoint key or `authServerMetadataUrl`). The host or endpoint is refused
+   when:
+   - the host is a credential destination;
+   - the host belongs to any curated service, enabled or not (a well-known
+     host such as `github.com`, `api.openai.com`, or
+     `oauth2.googleapis.com`);
+   - another MCP server in the project uses the host: its endpoint host,
+     declared hosts, or recorded OAuth hosts. One server enabled for both
+     agents counts once;
+   - the endpoint equals another OAuth provider's token or registration
+     endpoint, or overlaps a prefix-matched registration endpoint.
+
+   The server's own MCP endpoint host is exempt. At enable, a refused
+   `--oauth-host` host or declared endpoint stops the command before any
+   discovery call; a refused endpoint in discovered metadata drops that whole
+   document; and when a well-known host leaves no token endpoint, the command
+   stops and names the static-token path, where the proxy holds the token and
+   injects it. An endpoint that overlaps an approved service OAuth
+   provider's endpoint is refused at review too, and checked again when the
+   effective policy is built, where the service keeps the endpoint. At a
+   launch, a claim that a rule now refuses is dropped with a warning, and its
+   token and registration endpoints become blocked endpoints (rule 9). The
+   proxy holds the same credential and curated host list and checks it, and
+   every other provider's hosts, before it remembers an issuer or endpoint it
+   sees at run time; a refusal writes no state. An endpoint that two
+   providers claim at run time is mediated by neither and is blocked. On a
+   host the user already allows for plain traffic, a claim is allowed: the
+   host keeps its rules, only the exact endpoint is mediated, and the review
+   says the host is `ALREADY ALLOWED`. Plain traffic carries no token reply;
+   the residual is a login the user runs by hand at that exact URL
+   ([Residual Risks](#residual-risks)).
+9. **A token request the proxy does not mediate never leaves for a host only
+   MCP allows.** The proxy checks a request to:
+   - a record-only host: one that only `mcp enable` records allow, and not
+     desired policy, `host add`, a service, or an MCP endpoint;
+   - a blocked endpoint: an exact endpoint that a record or declared config
+     names but that no provider mediates;
+   - an endpoint that more than one provider claims at run time;
+   - any other path on a host that carries a blocked or colliding endpoint,
+     so path variants such as `/oauth/token/` or `/OAuth/token` are caught;
+   - an endpoint host: a host that a record names and that also serves an MCP
+     endpoint, when nothing outside MCP allows it.
+
+   With any method, it refuses a request whose query or body carries
+   `grant_type`, `refresh_token`, `redirect_uris`, or `code` together with
+   `code_verifier`. JSON is scanned at every depth, including top-level
+   arrays, and every body is also read as a form whatever its content type.
+   On record-only hosts and at the exact blocked or colliding endpoint the
+   check also fails closed: it refuses `multipart/form-data`, a body without
+   `Content-Length`, a wire or decoded body over 16 KiB, a content encoding
+   it cannot decode, a declared charset other than UTF-8 or US-ASCII, bytes
+   that are not valid UTF-8, any NUL byte, and a body declared as JSON that
+   does not parse. Elsewhere on a host with a blocked or colliding endpoint
+   the scan is just as deep but does not fail closed, so ordinary traffic is
+   not refused for its size or encoding. On an endpoint host only top-level
+   keys (and each top-level array element's keys) are matched, so MCP
+   JSON-RPC, whose `code` sits under `error`, passes. Where the check does
+   not fail closed, it is hardened instead: invalid UTF-8 is decoded with
+   replacement characters, a body with an unknown, stacked, or broken content
+   encoding is scanned as the raw bytes, and a body not declared as JSON is
+   also read as a form; only a body over 256 KiB is not scanned. A static or
+   run-time-bound endpoint that exactly one server mediates is never refused.
+   The check runs before write classification and the approval hold, so a
+   refused request creates no prompt and no pending record; it also runs
+   before credential injection, any upstream connection, and any OAuth state
+   write. The denial is `oauth-endpoint-not-mediated`. The mediator repeats
+   the check against the current policy just before it forwards. While the
+   OAuth policy is invalid, the last valid record-only hosts keep this rule,
+   and every other allowlisted host refuses a readable grant shape; audited
+   hosts are outside that rule. Replies on record-only hosts are never read,
+   so they stream. On blocked and colliding endpoints the proxy reads every
+   reply, at any status, and blocks one that carries a real token at any
+   depth or that it cannot decode.
+
+   The proxy cannot read the reply to a WebSocket upgrade, so it refuses an
+   upgrade, with a 403 and `x-runfree-blocked: oauth-endpoint-not-mediated`,
+   to a record-only host and to any endpoint URL that a provider mediates,
+   blocks, or claims with another provider. It also refuses an upgrade whose
+   query is grant-shaped to an endpoint host or to a host with a blocked or
+   colliding endpoint, and, while the OAuth policy is invalid, to any
+   allowlisted host. The refusal runs before the WebSocket shape rules, so it
+   notes no pending retry approval. The 403 body explains the refusal and
+   gives the same remedy as the HTTPS denial, with a literal `<host>` in
+   place of the host name; the denial event for `runfree doctor` carries the
+   real host.
+10. **Revoke clears the proxy's OAuth state for the server.** It saves a new
+    state epoch for the server (see [MCP Model](architecture.md#mcp-model));
+    the proxy refuses a stale handle at use and blocks, not stores, a token
+    response from an exchange that started before the revoke. With no proxy
+    running, the clear happens at the next start. Revoke says "cleared" only
+    when the running proxy confirmed the exact policy generation. A damaged or
+    missing epoch record clears the OAuth state of every MCP server. A rotated
+    refresh token retires the handle it replaced. Each server keeps at most
+    256 token handles and 32 registration handles, evicting expired access
+    handles first and never the newest refresh handle; past 1024 exchanges in
+    flight, a new one is refused rather than evicting another. One server
+    enabled for Claude and for Codex (same name, source, endpoint, and OAuth
+    settings) shares one login: the proxy mediates its endpoints for one
+    owner, the member enabled first, and only the owner captures metadata at
+    run time. Revoke also clears the other agent's state when it has an
+    entry with the same server name and source; an agent with no such entry
+    keeps its state. When a group first forms from members that may hold
+    handles (including the first launch after an upgrade), and when the
+    owner's entry is gone and ownership moves, every member's state is
+    cleared, with a warning. If the
+    new owner cannot be stored, no member mediates the group's endpoints for
+    that launch: they become blocked endpoints, a warning names the file, and
+    the next launch that can write it settles the owner.
+11. **Protocol reads are exact.** On an `ask` host, a POST is a read, with no
+    approval, only when its exact path (no normalization, query, or encoding)
+    is a token or registration endpoint that `mcp enable` recorded for one
+    server, the proxy mediates it for that server alone, and the body is a
+    plain login, refresh, or loopback-only client registration with no field
+    an issuer may fetch at a URL the agent chose: a URL-valued `client_id`
+    must equal, byte for byte, a pinned agent client metadata URL (Claude
+    Code's or Codex's published document), and no `resource` may name another
+    host. The body must be identity-encoded and declare its length, at most
+    16 KiB. Each server gets at most 30 a minute, counted only for requests that
+    pass every other check. The live `mcp-enable` tranche checks that each
+    pinned client metadata URL appears in the pinned agent binary, so a vendor
+    change fails the gate. A host that receives static credential injection
+    never has protocol reads: the host side drops such an endpoint with a
+    warning when it builds the effective policy, and the proxy checks again
+    against its loaded network policy. Everything else on the host stays a
+    write. A request that selected the unmediated proxy rule while its
+    endpoint became mediated or blocked is refused, so a token never reaches
+    the agent unmediated. This covers the token and registration
+    POSTs only: an authorization GET with a URL `client_id` to an issuer host
+    the project allows broadly (`--oauth-host`, desired policy, or the MCP
+    host itself) is an ordinary read, and an issuer that supports client ID
+    metadata documents may fetch that URL.
 
 ### Agent Container
 
@@ -857,10 +972,22 @@ Accepted, known risks:
 | Credentialless operational services (`agent-claude`, `agent-codex`) are open to any process in the agent | The user confirms them at launch; they carry no proxy credential |
 | Project image builds run before the sandbox exists | The build uses host Docker networking; review Dockerfiles and wide contexts (`runfree image approve-context`) |
 | `mcp enable` discovery tells the named host that you ran it (your IP and the time) | It asks first for project entries and sends no credentials; `--no-discover` makes no call |
-| An `--oauth-host` host is allowed like `host add`, and the proxy does not mediate a token endpoint there that discovery did not record: after one write approval, a login returns the real access and refresh tokens to the agent | The user named the host, and the `mcp enable` review warns. The token POST is a write and waits under `ask`. Do not name a token host with `--oauth-host` |
-| A request rule path prefix on a discovered host also admits sub-paths the proxy does not mediate (for example `/oauth/token/`) | Discovered hosts get exact-endpoint rules; a sub-path or an unrecorded endpoint still follows write approval |
+| A host that desired policy or `host add` allows broadly can serve a token endpoint that no MCP record names; a login there is not mediated and returns real tokens to the agent | The user allowed the host outside MCP. The grant check ([MCP](#mcp) rule 9) covers only hosts only MCP allows and blocked endpoints. A token endpoint that a server's metadata names is recorded and mediated even on such a host |
+| On a broadly allowed host, a path variant of a mediated endpoint (for example `/oauth/token/` beside `/oauth/token`) takes the plain proxy rule, and a login there returns real tokens to the agent | The same class as the row above: the host-wide scan covers only hosts with a blocked or colliding endpoint, and hosts only MCP allows |
+| An `--oauth-host` host is allowed like `host add`; the proxy mediates a token endpoint there only when the server's own metadata names it | While only MCP records allow the host, the proxy refuses a grant- or registration-shaped request to any other endpoint on it before it connects upstream, and a body it cannot check. Once desired policy or `host add` also allows it, the two rows above apply |
+| A request rule path prefix on a discovered host also admits sub-paths the proxy does not mediate (for example `/oauth/token/`) | Discovered hosts get exact-endpoint rules; a sub-path or an unrecorded endpoint follows write approval, and a grant-shaped request there is refused while only MCP records allow the host |
+| A `/.well-known` GET with any query reaches a host that serves a token endpoint for another host's MCP server | Discovered hosts allow GET under `/.well-known`; it is the same channel out as on other discovered hosts ([Network](#network)) |
+| A later `host add` or desired-policy entry widens a host that an MCP server claims, with no new warning | The claim stays and only its exact endpoint is mediated; the warning was shown at `mcp enable` |
+| On a broadly allowed host that is not curated, an approved hostile MCP server can claim the exact URL of a login the user runs by hand there; that login then gets a handle, not a token, and the handle works at the claiming server's MCP host | The review says the host is `ALREADY ALLOWED` and asks to approve only if the address belongs to the same service. Curated hosts, credential destinations, and other providers' endpoints are refused |
+| A recorded token endpoint on a shared login host that is not curated (for example a Microsoft Entra or Okta tenant) captures every other login at that exact URL in the sandbox | The review prints `other apps that log in at <url> will stop working in the sandbox`; curated hosts are refused |
+| At run time the proxy files captured metadata under the first server it matches. A hostile approved server that binds an issuer first can capture another, unrecorded server's logins at an issuer host the user allows broadly | The same class as the hand-run login row above. Recording the other server with `mcp enable` makes its endpoints static, and a claim by two servers is blocked |
+| Revoking the agent that does not own a shared login does not stop that agent logging in through the owner's endpoint | The endpoint belongs to the shared server, which the other agent still uses; revoke the server for both agents to remove it |
+| If another agent's entry with the same server name is removed from its config between the last launch and a revoke, that revoke does not clear the other agent's state, and handles it minted stay redeemable at the same MCP host until the next launch | Low. The window ends at the next launch, which rebuilds the OAuth mediation policy without that entry |
+| The grant check matches the standard OAuth fields only: an agent can send a grant in a non-standard shape (a renamed field) that an issuer still accepts, and its reply reaches the agent | The agent holds the authorization code and the PKCE verifier, so it chooses the request shape |
+| On an endpoint host (a host a record names that also serves an MCP endpoint), and on the other paths of a host with a blocked or colliding endpoint, a body over 256 KiB passes the grant check unscanned | Ordinary traffic there can be large, so these scans do not fail closed; smaller bodies are scanned even when they do not decode cleanly, and an endpoint host matches only top-level keys |
 | Login, refresh, and client registration at a recorded, mediated endpoint run without approval | The issuer was reviewed at `mcp enable`; bodies are limited to the protocol's own fields and 16 KiB, responses become handles, and each server gets 30 a minute. The agent can still register a client with a loopback redirect or send its own authorization code |
 | Audit mode allows non-listed hosts for a time window | It is explicit (`up --audit-network`) and never edits policy |
+| While the OAuth mediation policy is invalid, audited hosts do not refuse grant-shaped requests | Audited hosts are outside policy, so none of them is record-only; allowlisted hosts keep the refusal |
 | Audited WSS upgrades pass configured credential headers as-is | The WebSocket passthrough cannot rewrite upgrade headers; enforce mode is not affected |
 | Checkout binding cannot tell apart volumes mounted at the same path | It is a scope key, not an authority; see [Checkout Binding](architecture.md#checkout-binding) |
 | A helper container can be created after the CLI dies | After a killed Docker client the helper marker is kept for 180 s and every lock holder in that window sweeps again, but an orphaned `docker run` client of a dead CLI has no timeout and can start the helper later. The firewall drops that unadmitted source, and a later deny probe that needs its address fails closed. A wall-clock jump can end the window early; `destroy` clears the marker, and a container created after that needs `runfree destroy --force` |

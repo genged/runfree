@@ -54,7 +54,6 @@ export const RUNTIME_COMPOSE_INTERPOLATION_CLASSES = Object.freeze({
   RUNFREE_GIT_CONFIG: "topology-input",
   RUNFREE_INBOX_DIR: "topology-input",
   RUNFREE_EFFECTIVE_PROXY_DIR: "topology-input",
-  RUNFREE_MCP_OPERATION_POLICY_HOST_PATH: "topology-input",
   RUNFREE_PROJECT_COMPAT_ROOT: "topology-input",
   RUNFREE_PROJECT_CONTAINER_ROOT: "topology-input",
   RUNFREE_PROJECT_ID: "topology-input",
