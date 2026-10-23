@@ -1666,16 +1666,39 @@ describe("runfree service CLI: list, explain, diff", () => {
     expect(fs.readFileSync(path.join(tmp, ".runfree/network-policy.local.json"), "utf8")).toBe(localBefore);
   });
 
-  test("diff --apply takes over an identical direct rule and warns about a different one", () => {
+  test("diff --apply keeps an identical direct rule that restricts, with the warning (S1)", () => {
     const selection = { writeMode: "read-only" as const };
     const fresh = desiredServiceEntry(SERVICES.node, selection);
     const npmRule = fresh.resolved.requests?.["registry.npmjs.org"];
     expect(npmRule).toEqual({ readPathPrefixes: ["/-/npm/v1/security/advisories/bulk"], writeAction: "deny" });
     writeApprovedDesiredFixture({
       version: 2,
+      hosts: ["registry.npmjs.org"],
+      requests: { "registry.npmjs.org": npmRule ?? {} },
+      services: { node: { ...staleNodeDesiredEntry(), selection } },
+    });
+
+    const applied = runAdminCli(["service", "diff", "--apply", "--no-reload"]);
+
+    expect(applied.status, applied.stderr).toBe(0);
+    expect(applied.stdout).not.toContain("now belongs to the service");
+    expect(applied.stderr).toContain(
+      "runfree warning: registry.npmjs.org has a direct rule that replaces the rule from service node; remove it with: runfree host rules registry.npmjs.org --clear",
+    );
+    expect(readDesiredPolicy().requests).toEqual({ "registry.npmjs.org": npmRule });
+  });
+
+  test("diff --apply takes over an identical classification-only direct rule", () => {
+    const fresh = desiredServiceEntry(SERVICES.node);
+    const npmRule = fresh.resolved.requests?.["registry.npmjs.org"];
+    expect(npmRule).toEqual({ readPathPrefixes: ["/-/npm/v1/security/advisories/bulk"] });
+    // registry.yarnpkg.com: the service sets no rule there, so a direct rule
+    // is an ordinary direct rule (R3), neither taken over nor warned about.
+    writeApprovedDesiredFixture({
+      version: 2,
       hosts: ["registry.npmjs.org", "registry.yarnpkg.com"],
       requests: { "registry.npmjs.org": npmRule ?? {}, "registry.yarnpkg.com": { writeAction: "allow" } },
-      services: { node: { ...staleNodeDesiredEntry(), selection } },
+      services: { node: staleNodeDesiredEntry() },
     });
 
     const applied = runAdminCli(["service", "diff", "--apply", "--no-reload"]);
@@ -1684,9 +1707,7 @@ describe("runfree service CLI: list, explain, diff", () => {
     expect(applied.stdout).toContain(
       "registry.npmjs.org: the direct rule matched service node's rule and now belongs to the service; service disable removes it",
     );
-    expect(applied.stderr).toContain(
-      "runfree warning: registry.yarnpkg.com has a direct rule that replaces the rule from service node; remove it with: runfree host rules registry.yarnpkg.com --clear",
-    );
+    expect(applied.stderr).not.toContain("runfree warning:");
     const policy = readDesiredPolicy();
     expect(policy.requests).toEqual({ "registry.yarnpkg.com": { writeAction: "allow" } });
     expect(policy.hosts).toEqual(["registry.npmjs.org", "registry.yarnpkg.com"]);

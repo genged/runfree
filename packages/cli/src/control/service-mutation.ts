@@ -1,6 +1,7 @@
 import {
   canonicalDesiredNetworkPolicy,
   overlayServiceHostRule,
+  serviceHostRuleGitPushFits,
   serviceHostRuleNarrowingIssues,
   validateDesiredNetworkPolicy,
   withRequiredDesiredNetworkPolicyVersion,
@@ -8,6 +9,7 @@ import {
   type DesiredServiceEntry,
   type DesiredServiceHostRule,
 } from "@runfree/runtime-contracts/desired-network-policy";
+import type { RequestPolicyJson, WriteAction } from "@runfree/runtime-contracts/network-policy";
 import { CliError } from "../errors.ts";
 import { remedy } from "../remedies.ts";
 import type { RuntimeContext, RuntimeIO } from "../runtime/types.ts";
@@ -21,7 +23,7 @@ import {
   type DesiredPolicyLayer,
 } from "./desired-policy-transaction.ts";
 import { ensureCheckoutLocalPolicyExcluded } from "./git-exclude.ts";
-import { legacyDirectRuleMessage, otherLayer } from "./host-rule-owner.ts";
+import { layerPolicyLabel, legacyDirectRuleMessage, otherLayer, ownValue } from "./host-rule-owner.ts";
 import type { DesiredPolicyCandidate } from "./candidates.ts";
 
 export type DesiredServiceLayer = DesiredPolicyLayer;
@@ -54,10 +56,6 @@ function serviceApprovalSubject(layer: DesiredServiceLayer): DesiredPolicyApprov
   return { layer, missingBaseSubject: `${layer} desired policy`, driftSubject: `${layer} desired policy` };
 }
 
-function ownValue<T>(record: Readonly<Record<string, T>> | undefined, key: string): T | undefined {
-  return record !== undefined && Object.hasOwn(record, key) ? record[key] : undefined;
-}
-
 /**
  * Why a saved `selection.hostRules` setting cannot ride along into
  * `nextEntry` (spec §4.5, §4.7): its host is skipped or no longer in the
@@ -80,7 +78,12 @@ export function serviceHostRulesFitIssues(
         : `service ${id} revision ${nextEntry.revision} no longer allows ${host}, which has a host rule setting; remove it first with: ${clear}`);
       continue;
     }
-    const narrowing = serviceHostRuleNarrowingIssues(ownValue(nextEntry.resolved.requests, host), hostRules[host]);
+    const serviceRule = ownValue(nextEntry.resolved.requests, host);
+    if (!serviceHostRuleGitPushFits(serviceRule, hostRules[host])) {
+      issues.push(`service ${id} revision ${nextEntry.revision} has no git handling for ${host}, which has a --deny-git-push setting; remove it with: ${clear}`);
+      continue;
+    }
+    const narrowing = serviceHostRuleNarrowingIssues(serviceRule, hostRules[host]);
     if (narrowing.length > 0) {
       issues.push(`the host rule setting for ${host} is broader than service ${id} revision ${nextEntry.revision} allows (${
         narrowing.join("; ")}); remove it with: ${clear}`);
@@ -101,6 +104,41 @@ export function assertServiceHostRulesFit(
   if (issues.length > 0) throw new CliError(issues.join("\n"));
 }
 
+// Most to least restrictive. A per-host write setting outranks the service's
+// write mode (spec §4.3), so one that is weaker than the mode deserves a word.
+const WRITE_ACTION_RANK: Readonly<Record<WriteAction, number>> = { deny: 0, ask: 1, allow: 2 };
+
+/**
+ * Warnings for carried `hostRules` write settings weaker than the write
+ * action the entry's write mode stamps on that host (S2): the per-host
+ * setting wins, so the service-wide mode does not hold there.
+ */
+export function weakerHostWriteSettingWarnings(
+  idInput: string,
+  hostRules: Readonly<Record<string, DesiredServiceHostRule>>,
+  entry: DesiredServiceEntry,
+  options: { local?: boolean } = {},
+): string[] {
+  const id = idInput.toLowerCase();
+  const mode = entry.selection?.writeMode;
+  if (mode === undefined) return [];
+  const warnings: string[] = [];
+  for (const host of Object.keys(hostRules).sort()) {
+    const own = hostRules[host].writeAction;
+    const service = ownValue(entry.resolved.requests, host)?.writeAction;
+    if (own === undefined || service === undefined || WRITE_ACTION_RANK[own] <= WRITE_ACTION_RANK[service]) continue;
+    warnings.push(`${host} keeps its own write setting (${own}) from host rules, which is weaker than service ${id}'s ${mode} write mode; remove it with: ${
+      remedy.hostRulesClear(host, { local: options.local, service: id })}`);
+  }
+  return warnings;
+}
+
+// The fields of a request rule that restrict requests, as opposed to the
+// fields that only classify them (spec §4.2).
+function hasPermissionField(rule: RequestPolicyJson): boolean {
+  return rule.methods !== undefined || rule.pathPrefixes !== undefined || rule.writeAction !== undefined || rule.gitPush === "deny";
+}
+
 /**
  * Direct rules in `policy` on the service's hosts that replace the service's
  * rule (compiler.ts applies direct rules last). Pure: callers decide what to
@@ -109,8 +147,8 @@ export function assertServiceHostRulesFit(
 function directRulesOverService(
   policy: DesiredNetworkPolicyJson,
   entry: DesiredServiceEntry,
-): Array<{ direct: unknown; host: string; serviceRule: unknown }> {
-  const found: Array<{ direct: unknown; host: string; serviceRule: unknown }> = [];
+): Array<{ direct: RequestPolicyJson; host: string; serviceRule: RequestPolicyJson }> {
+  const found: Array<{ direct: RequestPolicyJson; host: string; serviceRule: RequestPolicyJson }> = [];
   for (const host of entry.resolved.hosts) {
     const direct = ownValue(policy.requests, host);
     if (direct === undefined) continue;
@@ -134,6 +172,17 @@ export function otherLayerDirectRuleWarnings(
   return directRulesOverService(other, entry).map(({ host }) => legacyDirectRuleMessage(host, id, otherLayerName));
 }
 
+/**
+ * S4: a checkout-local entry replaces the project entry of the same id in the
+ * compiled policy, so the project entry's `host rules` settings stop applying.
+ */
+export function shadowedProjectHostRulesWarnings(id: string, project: DesiredNetworkPolicyJson): string[] {
+  const hosts = Object.keys(ownValue(project.services, id)?.selection?.hostRules ?? {}).sort();
+  if (hosts.length === 0) return [];
+  return [`service ${id} in the ${layerPolicyLabel("local")} desired policy replaces the project entry, so its host rule settings for ${
+    hosts.join(", ")} no longer apply; remove the local entry with: ${remedy.serviceDisable(id, { local: true })}`];
+}
+
 export function reconcileDesiredService(
   current: DesiredNetworkPolicyJson,
   mutation: DesiredServiceMutation,
@@ -155,16 +204,19 @@ export function reconcileDesiredService(
     if (hostRules !== undefined) {
       assertServiceHostRulesFit(id, hostRules, entry, { local: layer === "local" });
       entry.selection = { ...entry.selection, hostRules: structuredClone(hostRules) };
+      warnings.push(...weakerHostWriteSettingWarnings(id, hostRules, entry, { local: layer === "local" }));
     }
     policy.services = { ...(policy.services ?? {}), [id]: entry };
     // Spec §4.6, O-2: a same-layer direct rule equal to the service's rule is
     // the service's rule written by hand, so the service takes it over (the
-    // hosts entry stays: it only allows the host). One that differs still
-    // replaces the service rule; warn, never refuse, so a project with such a
-    // rule can still upgrade its services. A takeover moves any permission
-    // field in that rule to the service, so `service disable` removes it (R15).
+    // hosts entry stays: it only allows the host). Only a rule of
+    // classification fields moves: one that carries a permission field (a
+    // restriction) stays direct, because a takeover would let `service
+    // disable` remove that restriction while the host stays allowed. A rule
+    // that stays still replaces the service rule; warn, never refuse, so a
+    // project with such a rule can still upgrade its services.
     for (const { direct, host, serviceRule } of directRulesOverService(policy, entry)) {
-      if (sameControlValue(direct, serviceRule)) {
+      if (!hasPermissionField(direct) && sameControlValue(direct, serviceRule)) {
         delete policy.requests?.[host];
         notices.push(`${host}: the direct rule matched service ${id}'s rule and now belongs to the service; service disable removes it`);
       } else {
@@ -263,9 +315,14 @@ export async function mutateDesiredService(
       // take over, so they only warn.
       const other = otherLayer(layer);
       const enabled = mutation.kind === "enable" ? ownValue(planned.policy.services, planned.id) : undefined;
+      const approvedOther = approvedPolicies()[other];
       return {
         ...planned,
-        warnings: [...planned.warnings, ...otherLayerDirectRuleWarnings(planned.id, approvedPolicies()[other], other, enabled)],
+        warnings: [
+          ...planned.warnings,
+          ...otherLayerDirectRuleWarnings(planned.id, approvedOther, other, enabled),
+          ...(layer === "local" && enabled ? shadowedProjectHostRulesWarnings(planned.id, approvedOther) : []),
+        ],
       };
     },
     result: ({ candidate, plan, selection }) => {

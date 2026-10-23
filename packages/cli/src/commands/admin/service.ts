@@ -262,6 +262,14 @@ export function planServiceRevisionChanges(
   return { changes, lines, proposed };
 }
 
+/**
+ * One `  refuses:` line per refusal of every change, so `service diff` names
+ * each conflicting setting at once rather than the first only.
+ */
+export function serviceRevisionRefusalLines(changes: readonly ServiceRevisionChange[]): string[] {
+  return changes.flatMap((change) => change.refusals.map((refusal) => `  refuses: ${refusal}`));
+}
+
 function reportServiceMutation(result: { notices: readonly string[]; warnings: readonly string[] }): void {
   for (const notice of result.notices) console.log(notice);
   for (const warning of result.warnings) warn(warning);
@@ -283,11 +291,12 @@ async function diffDesiredServices(
   if (changes.length === 0) return;
   // A saved host rule setting the new revision cannot hold refuses the whole
   // batch before the first mutation, so no layer is left half-upgraded. The
-  // proposed pair would not validate, so there is no authority to compare.
+  // proposed pair would not validate, so there is no authority to compare;
+  // every refusal is still listed.
   const refusals = changes.flatMap((change) => change.refusals);
   if (refusals.length > 0) {
     if (input.apply) throw new CliError(refusals.join("\n"));
-    for (const refusal of refusals) console.log(`  refuses: ${refusal}`);
+    for (const line of serviceRevisionRefusalLines(changes)) console.log(line);
     return;
   }
   const comparison = compareCompiledAuthority(

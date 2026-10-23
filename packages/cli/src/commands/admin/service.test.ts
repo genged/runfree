@@ -7,7 +7,7 @@ import {
 
 import { SERVICES, type Service } from "../../../../../scripts/services.ts";
 import { desiredServiceEntry } from "../../admin/service-policy.ts";
-import { formatServiceListTable, planServiceRevisionChanges, serviceListRows } from "./service.ts";
+import { formatServiceListTable, planServiceRevisionChanges, serviceListRows, serviceRevisionRefusalLines } from "./service.ts";
 
 function entry(revision: number, hosts: string[]): DesiredServiceEntry {
   return {
@@ -145,5 +145,25 @@ describe("planServiceRevisionChanges", () => {
     expect(plan.changes.map((change) => change.refusals)).toEqual([[
       `service node revision ${SERVICES.node.revision} no longer allows gone.npm.example, which has a host rule setting; remove it first with: runfree host rules gone.npm.example --clear --service node`,
     ]]);
+  });
+
+  test("lists every refusal of every conflicting change, not only the first", () => {
+    const old: Service = {
+      ...SERVICES.node,
+      revision: 1,
+      hosts: [...SERVICES.node.hosts, { host: "gone.npm.example" }, { host: "gone2.npm.example" }],
+    };
+    const projectStale = desiredServiceEntry(old, { hostRules: { "gone.npm.example": { writeAction: "deny" } } });
+    const localStale = desiredServiceEntry(old, {
+      hostRules: { "gone.npm.example": { writeAction: "deny" }, "gone2.npm.example": { writeAction: "ask" } },
+    });
+    const plan = planServiceRevisionChanges({ project: layer({ node: projectStale }), local: layer({ node: localStale }) }, SERVICES, {});
+    const gone = (host: string, local: boolean) =>
+      `  refuses: service node revision ${SERVICES.node.revision} no longer allows ${host}, which has a host rule setting; remove it first with: runfree host rules ${host} --clear --service node${local ? " --local" : ""}`;
+    expect(serviceRevisionRefusalLines(plan.changes)).toEqual([
+      gone("gone.npm.example", false),
+      gone("gone.npm.example", true),
+      gone("gone2.npm.example", true),
+    ]);
   });
 });
