@@ -80,6 +80,7 @@ import { afterAll, beforeAll, describe, expect, test } from "vitest";
 import { projectInfo } from "../../../packages/cli/src/config.ts";
 import { nodeRuntimeIO } from "../../../packages/cli/src/runtime.ts";
 import { readPendingApprovals, touchWatcherHeartbeat } from "../../../packages/cli/src/runtime/approvals.ts";
+import type { PendingApprovalRecord } from "../../../packages/runtime-contracts/src/write-approvals.ts";
 
 import { composeProjectName, composeServiceContainerId, docker, dockerOrThrow } from "./docker.ts";
 import {
@@ -159,17 +160,33 @@ async function sleep(ms: number): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+type DecidedHold = Readonly<Pick<PendingApprovalRecord, "id" | "method" | "path" | "category">>;
+
 type ApprovalRun = Readonly<{
   exitCode: number;
   log: string;
-  /** Ids this tranche decided, in order; empty means nothing was ever held. */
-  decided: readonly string[];
+  /** Holds this tranche decided, in order; empty means nothing was ever held. */
+  decided: readonly DecidedHold[];
 }>;
+
+/** Matches the LFS batch POST; held records carry the pathname only. */
+function isLfsBatchHold(record: PendingApprovalRecord): boolean {
+  return record.method === "POST" && record.path.endsWith("/info/lfs/objects/batch");
+}
+
+/**
+ * Matches both requests of a git push: the `GET …/info/refs` probe (its
+ * `?service=git-receive-pack` query is stripped from the held record) and the
+ * `POST …/git-receive-pack`. The proxy classifies both as `git-push`.
+ */
+function isGitPushHold(record: PendingApprovalRecord): boolean {
+  return record.category === "git-push";
+}
 
 /**
  * Runs `script` detached in the session with an approver attached, deciding
- * every write it holds on `host` whose path contains `pathPart`, until the
- * script exits. The same root-owned decision channel `request-shape` uses:
+ * every write it holds on `host` that `match` accepts, until the script
+ * exits. The same root-owned decision channel `request-shape` uses:
  * the watcher heartbeat registers the approver, `readPendingApprovals` reads
  * the held records, and `runfree approve` decides them.
  */
@@ -180,7 +197,7 @@ async function runDecidingHeldWrites(input: Readonly<{
   label: string;
   script: string;
   host: string;
-  pathPart: string;
+  match: (record: PendingApprovalRecord) => boolean;
   decision: "approve" | "deny";
 }>): Promise<ApprovalRun> {
   const { fixture, proxyId, sessionId } = input;
@@ -202,13 +219,13 @@ async function runDecidingHeldWrites(input: Readonly<{
   dockerOrThrow(`start ${input.label}`, ["exec", "-d", sessionId, "zsh", "-lc",
     `{ ${input.script} ; } > ${logFile} 2>&1; echo $? > ${codeFile}`]);
 
-  const decided: string[] = [];
+  const decided: DecidedHold[] = [];
   const deadline = Date.now() + APPROVAL_WAIT_MS;
   for (;;) {
     heartbeat();
     const pending = readPendingApprovals(context, nodeRuntimeIO, proxyId)
-      .filter((record) => record.host === input.host && record.method === "POST" && record.path.includes(input.pathPart))
-      .filter((record) => !decided.includes(record.id));
+      .filter((record) => record.host === input.host && input.match(record))
+      .filter((record) => !decided.some((hold) => hold.id === record.id));
     for (const record of pending) {
       const args = input.decision === "approve" ? ["approve", record.id] : ["approve", record.id, "--deny"];
       const result = fixture.runfree(args);
@@ -216,7 +233,7 @@ async function runDecidingHeldWrites(input: Readonly<{
       if (!result.output.includes(expected)) {
         throw new Error(`${input.label}: runfree ${args.join(" ")} did not decide the held write: ${describeOutput(result.output)}`);
       }
-      decided.push(record.id);
+      decided.push(Object.freeze({ id: record.id, method: record.method, path: record.path, category: record.category }));
     }
     const code = docker(["exec", sessionId, "cat", codeFile]);
     if (code.status === 0 && /^\d+$/u.test(code.stdout.trim())) {
@@ -401,7 +418,7 @@ function defineProviderSuite(provider: GitProviderInputs): void {
             script: lfsBatchScript(lfs, lfsBatchBody("download", oid as string, size), "/tmp/rf-l5-download.json")
               + " && cat /tmp/rf-l5-download.json",
             host: provider.host,
-            pathPart: "/info/lfs/objects/batch",
+            match: isLfsBatchHold,
             // Mediated: any held download is a failure; denying it keeps that
             // loud. Not mediated: the held download is approved, so it reaches
             // the provider and the no-credential assertion below can fail.
@@ -433,7 +450,7 @@ function defineProviderSuite(provider: GitProviderInputs): void {
             label: `${provider.id} lfs upload`,
             script: lfsBatchScript(lfs, lfsBatchBody("upload", uploadOid, 1), "/tmp/rf-l5-upload.json"),
             host: provider.host,
-            pathPart: "/info/lfs/objects/batch",
+            match: isLfsBatchHold,
             // Denied, so nothing reaches the provider and nothing is uploaded.
             decision: "deny",
           });
@@ -462,11 +479,16 @@ function defineProviderSuite(provider: GitProviderInputs): void {
             label: `${provider.id} push`,
             script: pushScript(dir, `HEAD:refs/heads/${branch}`),
             host: provider.host,
-            pathPart: "/git-receive-pack",
+            match: isGitPushHold,
             decision: "approve",
           });
           pushed = push.exitCode === 0;
           expect(push.decided.length, `the push was never held for approval: ${describeOutput(push.log)}`).toBeGreaterThanOrEqual(1);
+          // A push is held twice: the receive-pack capability probe, then the pack.
+          expect(push.decided.some((hold) => hold.method === "GET" && hold.path.endsWith("/info/refs")),
+            `the receive-pack probe was not held: ${JSON.stringify(push.decided)}`).toBe(true);
+          expect(push.decided.some((hold) => hold.method === "POST" && hold.path.endsWith("/git-receive-pack")),
+            `the receive-pack POST was not held: ${JSON.stringify(push.decided)}`).toBe(true);
           expect(push.exitCode, `the approved push failed: ${describeOutput(push.log)}`).toBe(0);
           const remote = sessionExec(sessionId,
             `timeout ${GIT_COMMAND_TIMEOUT_SECONDS} ${NO_PROMPT_GIT} -C ${dir} ls-remote origin ${shellQuote(`refs/heads/${branch}`)}`);
@@ -481,9 +503,9 @@ function defineProviderSuite(provider: GitProviderInputs): void {
           label: `${provider.id} delete scratch branch`,
           script: pushScript(dir, `:refs/heads/${branch}`),
           host: provider.host,
-          pathPart: "/git-receive-pack",
+          match: isGitPushHold,
           decision: "approve",
-        }).catch((error: unknown) => ({ exitCode: -1, log: String(error), decided: [] as readonly string[] }));
+        }).catch((error: unknown) => ({ exitCode: -1, log: String(error), decided: [] as readonly DecidedHold[] }));
         if (cleanup.exitCode !== 0) {
           const message = `could not delete scratch branch ${branch} from ${provider.repository.httpsUrl}; delete it by hand: ${describeOutput(cleanup.log)}`;
           if (pushed && failure === undefined) failure = new Error(message);
@@ -529,7 +551,7 @@ function defineProviderSuite(provider: GitProviderInputs): void {
             label: `${provider.id} denied push`,
             script: pushScript(dir, `HEAD:refs/heads/${scratchBranch()}`),
             host: provider.host,
-            pathPart: "/git-receive-pack",
+            match: isGitPushHold,
             decision: "approve",
           });
         } finally {
