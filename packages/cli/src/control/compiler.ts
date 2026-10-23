@@ -1,4 +1,5 @@
 import {
+  overlayServiceHostRule,
   validateDesiredNetworkPolicy,
   withRequiredDesiredNetworkPolicyVersion,
   type DesiredNetworkPolicyJson,
@@ -123,7 +124,16 @@ export function compileDesiredPolicies(input: {
       hostSources[host] ??= [];
       hostSources[host].push(source);
     }
-    for (const [host, rule] of Object.entries(entry.resolved.requests ?? {})) {
+    // The user's per-host setting (selection.hostRules) is laid over the stored
+    // resolved rule here, so the result keeps the service as its one owner.
+    // Validation already holds each setting to a host of this service and to
+    // no broader methods or paths than the service set.
+    const serviceRequests: Record<string, RequestPolicyJson> = { ...entry.resolved.requests };
+    for (const [host, setting] of Object.entries(entry.selection?.hostRules ?? {})) {
+      const rule = overlayServiceHostRule(Object.hasOwn(serviceRequests, host) ? serviceRequests[host] : undefined, setting);
+      if (rule) serviceRequests[host] = rule;
+    }
+    for (const [host, rule] of Object.entries(serviceRequests)) {
       assignOwned(requests, requestOwners, host, rule, owner, "request rule");
       requestSources[host] = source;
     }

@@ -136,6 +136,18 @@ describe("v0.5.2 proxy control loader over a generation this release publishes",
     expect(old.networkPolicy.generation).toBe(current.networkPolicy.generation);
   });
 
+  test("a v4 desired policy with service hostRules compiles to an effective policy the old loader reads unchanged", () => {
+    // hostRules exist only in desired policy: the compiler lays them over the
+    // service rule and emits an ordinary request rule, so the effective shape
+    // and its generation are the same for both readers.
+    const proxyRoot = publish(desiredWithHostRules());
+    const current = loadEffectiveProxyControl(proxyRoot);
+    expect(current.networkPolicy.requests["github.com"]).toEqual({ gitPush: "deny" });
+    const old = loadEffectiveProxyControlV052(proxyRoot);
+    expect(old.networkPolicy.generation).toBe(current.networkPolicy.generation);
+    expect(old.networkPolicy.requests["github.com"]).toEqual({ gitPush: "deny" });
+  });
+
   test("a protocol-scoped bearer mapping fails the old generation/manifest check", () => {
     const proxyRoot = publish(desiredWith(BEARER_GIT_HTTP));
     expect(loadEffectiveProxyControl(proxyRoot).networkPolicy.credentialMappings[0]?.protocol).toBe("git-http");

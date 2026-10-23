@@ -37,7 +37,12 @@ function approvalDirs(): ApprovalDirs {
 // `git-http` alone is the gitlab.com shape, where LFS is not mediated.
 type LfsProtocol = "git-lfs" | "git-http";
 
-function lfsPolicy(writeAction: "deny" | "ask", protocol: LfsProtocol): unknown {
+// `deny` is what a user's `host rules <host> --deny-git-push` compiles to on a
+// service host (spec 2026-10-23 service host rules §4.3): it replaces the
+// service's `write` and must keep the host's git handling.
+type GitPush = "write" | "deny";
+
+function lfsPolicy(writeAction: "deny" | "ask", protocol: LfsProtocol, gitPush: GitPush): unknown {
   return {
     hosts: ["127.0.0.1"],
     tokens: {
@@ -49,12 +54,12 @@ function lfsPolicy(writeAction: "deny" | "ask", protocol: LfsProtocol): unknown 
       },
     },
     requests: {
-      "127.0.0.1": { writeAction, gitPush: "write" },
+      "127.0.0.1": { writeAction, gitPush },
     },
   };
 }
 
-async function startLfsProxy(writeAction: "deny" | "ask", dirs?: ApprovalDirs, protocol: LfsProtocol = "git-lfs") {
+async function startLfsProxy(writeAction: "deny" | "ask", dirs?: ApprovalDirs, protocol: LfsProtocol = "git-lfs", gitPush: GitPush = "write") {
   const upstream = await startHttpsUpstream();
   const proxy = await startProxy({
     extraEnv: {
@@ -68,7 +73,7 @@ async function startLfsProxy(writeAction: "deny" | "ask", dirs?: ApprovalDirs, p
         }
         : {}),
     },
-    policy: lfsPolicy(writeAction, protocol),
+    policy: lfsPolicy(writeAction, protocol, gitPush),
     secretFiles: { example: "real-proxy-token\n" },
   });
   return { proxy, upstream };
@@ -107,6 +112,33 @@ describe("proxy server Git LFS batch classification", () => {
       expect(denied.raw, label).toContain("x-runfree-blocked: write-denied");
       expect(denied.raw, label).not.toContain("real-proxy-token");
     }
+    expect(upstream.requests).toHaveLength(1);
+  }, 30_000);
+
+  test("with gitPush deny, a download batch is still a read and forwards with the credential; upload and push are denied", async () => {
+    const { proxy, upstream } = await startLfsProxy("deny", undefined, "git-lfs", "deny");
+
+    const download = await batchPost(proxy.port, upstream.port, DOWNLOAD);
+    expect(download.statusCode).toBe(200);
+    expect(upstream.requests).toHaveLength(1);
+    expect(upstream.requests[0].headers.authorization).toBe(BASIC);
+
+    const upload = await batchPost(proxy.port, upstream.port, UPLOAD);
+    expect(upload.statusCode).toBe(403);
+    expect(upload.raw).toContain("x-runfree-blocked: write-denied");
+    expect(upload.raw).not.toContain("real-proxy-token");
+
+    const push = await httpsViaProxy({
+      proxyPort: proxy.port,
+      targetPort: upstream.port,
+      method: "POST",
+      path: "/owner/repo.git/git-receive-pack",
+      headers: { "content-type": "application/x-git-receive-pack-request", Authorization: "Basic YWdlbnQ6Zm9yZ2Vk" },
+      body: "0000",
+    });
+    expect(push.statusCode).toBe(403);
+    expect(push.raw).toContain("x-runfree-blocked: git-push-denied");
+    expect(push.raw).not.toContain("real-proxy-token");
     expect(upstream.requests).toHaveLength(1);
   }, 30_000);
 
