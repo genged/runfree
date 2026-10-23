@@ -9,6 +9,7 @@ import {
   CLIENT_ID_METADATA_URLS,
   plainRequestPath,
   protocolReadBodyAllowed,
+  protocolReadBodyRefusal,
   ProtocolReadRateLimiter,
   unlistedClientIdMetadataUrl,
 } from "./oauth-protocol-read.ts";
@@ -194,6 +195,24 @@ describe("protocolReadBodyAllowed", () => {
 
   test("refuses a registration sent as a form", () => {
     expect(protocolReadBodyAllowed({ resourceHost: "mcp.example.test", kind: "registration", bodyText: registration, headers: formHeaders(registration) })).toBe(false);
+  });
+
+  test("names the failed check without echoing a value", () => {
+    const refusal = (bodyText: string | undefined, headers: Record<string, string | string[]>, kind: "registration" | "token" = "registration") =>
+      protocolReadBodyRefusal({ resourceHost: "mcp.example.test", kind, bodyText, headers });
+    expect(refusal(registration, jsonHeaders(registration))).toBeUndefined();
+    const { "content-length": _length, ...chunked } = jsonHeaders(registration);
+    expect(refusal(registration, { ...chunked, "transfer-encoding": "chunked" })).toBe("content-length-missing");
+    expect(refusal(registration, jsonHeaders(registration, { "transfer-encoding": "chunked" }))).toBe("transfer-encoding");
+    expect(refusal(registration, jsonHeaders(registration, { "content-encoding": "gzip" }))).toBe("content-encoding");
+    expect(refusal(registration, formHeaders(registration))).toBe("registration-media-type");
+    expect(refusal(undefined, jsonHeaders(registration))).toBe("body-unreadable");
+    expect(refusal(`${registration} `, jsonHeaders(registration))).toBe("content-length-mismatch");
+    const extra = JSON.stringify({ ...JSON.parse(registration) as object, client_uri: "https://secret.example/x", "bad key": 1 });
+    expect(refusal(extra, jsonHeaders(extra))).toBe("registration-field=client_uri,?");
+    const remote = JSON.stringify({ ...JSON.parse(registration) as object, redirect_uris: ["https://evil.example/cb"] });
+    expect(refusal(remote, jsonHeaders(remote))).toBe("registration-redirect_uris");
+    expect(refusal("grant_type=password", formHeaders("grant_type=password"), "token")).toBe("token-body");
   });
 });
 

@@ -40,7 +40,7 @@ import {
 import {
   PROTOCOL_READ_BODY_CAP_BYTES,
   ProtocolReadRateLimiter,
-  protocolReadBodyAllowed,
+  protocolReadBodyRefusal,
   unlistedClientIdMetadataUrl,
   protocolReadGrantType,
 } from "./oauth-protocol-read.js";
@@ -1651,17 +1651,28 @@ async function oauthProtocolReadForRequest(
   if ((rule?.writeAction ?? currentPolicy.writeApproval ?? DEFAULT_WRITE_ACTION) !== "ask") return undefined;
   const match = oauthMediator.protocolReadEndpoint(req);
   if (!match) return undefined;
+  // Says which check made a recorded endpoint's POST a write; reason codes
+  // only, never a header or body value.
+  const notRead = (reason: string) => {
+    console.log(`proxy: oauth protocol-read refused name=${match.provider} kind=${match.kind} reason=${reason}; the request follows write approval`);
+  };
   const contentLengthRaw = firstHeader(req.headers, ["content-length"]);
   if (contentLengthRaw === undefined || !/^\d{1,6}$/.test(contentLengthRaw) || Number(contentLengthRaw) > PROTOCOL_READ_BODY_CAP_BYTES) {
+    notRead(contentLengthRaw === undefined
+      ? `content-length-missing${firstHeader(req.headers, ["transfer-encoding"]) !== undefined ? " transfer-encoding=present" : ""}`
+      : "content-length-invalid");
     return undefined;
   }
   let bodyText: string | undefined;
   try {
     bodyText = await req.body?.getText();
   } catch {
+    notRead("body-unreadable");
     return undefined;
   }
-  if (!protocolReadBodyAllowed({ bodyText, headers: req.headers, kind: match.kind, resourceHost: match.resourceHost })) {
+  const refusal = protocolReadBodyRefusal({ bodyText, headers: req.headers, kind: match.kind, resourceHost: match.resourceHost });
+  if (refusal !== undefined) {
+    notRead(refusal);
     // Display only: lets the write denial say why this was not a read.
     return match.kind === "token" && bodyText !== undefined && unlistedClientIdMetadataUrl(bodyText)
       ? { unlistedClientIdUrl: true }
@@ -1670,7 +1681,10 @@ async function oauthProtocolReadForRequest(
   // The body read awaited: a policy reload may have landed. Decide on the
   // policy that is current now, synchronously with the classification.
   const current = oauthMediator.protocolReadEndpoint(req);
-  if (current?.provider !== match.provider || current.kind !== match.kind) return undefined;
+  if (current?.provider !== match.provider || current.kind !== match.kind) {
+    notRead("policy-changed");
+    return undefined;
+  }
   // Checked here, spent only once the request passes every policy check, so
   // requests the policy refuses cannot drain the budget.
   if (!protocolReadLimiter.available(match.provider)) {
