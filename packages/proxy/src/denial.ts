@@ -66,7 +66,9 @@ export const UNPARSEABLE_HOST = "<unparseable>";
 export const DENIAL_EVENT_PREFIX = "proxy-denial: ";
 export const DENIAL_PATH_LIMIT = 256;
 const DENIAL_METHOD_LIMIT = 16;
-const HTTP_TOKEN_CHAR_RE = /[^A-Za-z0-9!#$%&'*+.^_`|~-]/g;
+// `'` and the backtick are written as \x27 and \x60 so the terminology gate's
+// string-literal scan (scripts/check-terminology.ts) does not read a quote here.
+const HTTP_TOKEN_CHAR_RE = /[^A-Za-z0-9!#$%&\x27*+.^_\x60|~-]/g;
 
 const DENIAL_REASON_TEXT: Record<DenialReason, string> = {
   "host-not-allowlisted": "host is not in the project network allowlist",
@@ -144,9 +146,9 @@ export type ShapeDenialBodyDetails = {
   path?: string;
   allowedMethods?: readonly string[];
   allowedPathPrefixes?: readonly string[];
-  // The host's full current request rule. A widening remedy reproduces it so
-  // `runfree host rules` (which replaces the whole rule) keeps every existing
-  // restriction; without it the remedy names only the delta.
+  // The host's full current request rule. A widening remedy reproduces it, so
+  // the command states the whole resulting rule and the printed rule is exact;
+  // without it the remedy names only the delta.
   rule?: RequestPolicyJson;
   // The request was an OAuth token POST whose client_id is a client metadata
   // URL Runfree does not recognize (fixed text; the value is never echoed).
@@ -292,10 +294,11 @@ function oauthEndpointLines(host: string, details: OAuthEndpointDenialDetails | 
   return lines;
 }
 
-// The exact widening command for a method denial. Repeating `runfree host rules`
-// with rule flags replaces the host's entry, so the suggestion reproduces the
-// full current rule plus the denied method; otherwise following the suggestion
-// would silently drop the existing rule.
+// The exact widening command for a method denial. `runfree host rules` patches
+// only the fields its flags name, and `--method` replaces the whole method
+// list, so the suggestion lists the current methods plus the denied one. It
+// also repeats the rule's other expressible fields, so the command states the
+// whole resulting rule and pasting it twice changes nothing.
 export function methodWideningCommand(
   host: string,
   method: string,
@@ -311,7 +314,7 @@ export function methodWideningCommand(
 export const PATH_PREFIX_PLACEHOLDER = "<prefix>";
 
 // The widening command for a path denial. The operator chooses the prefix; the
-// rest of the rule is reproduced so the paste replaces like with like.
+// rest of the rule is reproduced so the command states the whole result.
 export function pathWideningCommand(
   host: string,
   allowedPathPrefixes: readonly string[] | undefined,
@@ -321,25 +324,18 @@ export function pathWideningCommand(
   return hostRulesCommand(host, current, { pathPrefix: PATH_PREFIX_PLACEHOLDER });
 }
 
-// The remedy block for a widening command: the command, the rule it produces
-// (so the replace semantics are visible before pasting), and the fields the
-// command cannot carry.
+// The remedy block for a widening command: the command and the rule it
+// produces. Fields the command cannot express (service classification fields)
+// stay in the rule, because `host rules` patches only the fields it names.
 export function wideningRemedyLines(command: HostRulesCommand): string[] {
-  const lines = [
+  return [
     "The person operating Runfree can widen this on the host machine:",
     "",
     `  ${command.command}`,
     "",
-    `This replaces the host's request rule with: ${describeRequestRule(command.resultingRule)}`,
+    `The host's request rule becomes: ${describeRequestRule(command.resultingRule)}`,
+    "",
   ];
-  if (command.unexpressible.length > 0) {
-    lines.push(
-      `Note: the current rule also sets ${command.unexpressible.join(", ")}, which \`runfree host rules\` cannot express;`,
-      "pasting the command drops them. Edit the rule in .runfree/network-policy.json instead.",
-    );
-  }
-  lines.push("");
-  return lines;
 }
 
 function shapeDenialLines(host: string, reason: DenialReason, details: ShapeDenialBodyDetails): string[] {

@@ -7,6 +7,7 @@
 // re-validates the host and mutates policy) run inside the admin state. See the
 // spec's "Intent And Enforcement Are Separate" principle.
 
+import type { RequestPolicyJson } from "@runfree/runtime-contracts/network-policy";
 import type { ArgumentsCamelCase, Argv } from "yargs";
 
 import { describeRequestRules } from "../../admin/admin-core.ts";
@@ -21,6 +22,7 @@ import {
   mutateDesiredHost,
   readDesiredHostRules,
   type DesiredHostMutation,
+  type DesiredHostRulesResult,
   type DesiredHostScope,
   type HostRuleOwnerLabel,
 } from "../../control/local-host-mutation.ts";
@@ -96,6 +98,37 @@ function ownerLine(owner: HostRuleOwnerLabel, layer: DesiredHostScope | undefine
   return `owner: service ${owner.slice("service:".length)}${where}`;
 }
 
+// Only the fields a rule sets, for the `service rule:` and `your setting:`
+// lines: `gitPush=deny writeAction=ask`, or `none`. `describeRequestRules`
+// spells out defaults instead, which would hide which layer set what.
+export function describeRuleFields(full: RequestPolicyJson | undefined): string {
+  if (!full) return "none";
+  const fields = [
+    ...(full.methods !== undefined ? [`methods=${full.methods.join(",")}`] : []),
+    ...(full.pathPrefixes !== undefined ? [`pathPrefixes=${full.pathPrefixes.join(",")}`] : []),
+    ...(full.gitPush !== undefined ? [`gitPush=${full.gitPush}`] : []),
+    ...(full.writeAction !== undefined ? [`writeAction=${full.writeAction}`] : []),
+    ...(full.readPathPrefixes !== undefined ? [`readPathPrefixes=${full.readPathPrefixes.join(",")}`] : []),
+    ...(full.writePathPrefixes !== undefined ? [`writePathPrefixes=${full.writePathPrefixes.join(",")}`] : []),
+    ...(full.graphql !== undefined ? [`graphql=${full.graphql.endpoints.join(",")}`] : []),
+  ];
+  return fields.length === 0 ? "none" : fields.join(" ");
+}
+
+/** The `host rules <host>` show text (spec §4.10). Line 2 is pinned by live tests. */
+export function hostRulesShowLines(result: DesiredHostRulesResult): string[] {
+  const lines = [
+    `scope: ${result.scope === "local" ? "checkout-local" : "project"}`,
+    `${result.host}: ${describeRequestRules(result.enforced)}`,
+    ownerLine(result.owner, result.ownerLayer),
+  ];
+  if (result.owner.startsWith("service:")) {
+    lines.push(`  service rule: ${describeRuleFields(result.serviceRule)}`);
+    lines.push(`  your setting: ${describeRuleFields(result.userSetting)}`);
+  }
+  return lines;
+}
+
 function requestRuleFromArgs(argv: RequestRuleArgs): RequestRuleInput | undefined {
   const rule = {
     readOnly: Boolean(argv["read-only"]),
@@ -123,7 +156,11 @@ export const hostCommand: CommandModule = {
       const result = await mutateDesiredHost(runtime, nodeRuntimeIO, scope, mutation);
       console.log(`scope: ${scope === "local" ? "checkout-local" : "project"}`);
       console.log(`${result.host} ${result.changed ? "updated" : "unchanged"}`);
-      if (mutation.kind === "rules") console.log(ownerLine(result.owner, result.ownerLayer));
+      if (mutation.kind === "rules" || (mutation.kind === "add" && mutation.requestRule !== undefined)) {
+        console.log(ownerLine(result.owner, result.ownerLayer));
+        console.log(`before: ${describeRequestRules(result.before)}`);
+        console.log(`after: ${describeRequestRules(result.after)}`);
+      }
       for (const warning of result.warnings) console.log(`warning: ${warning}`);
       console.log(`updated .runfree/network-policy${scope === "local" ? ".local" : ""}.json`);
       console.log(`approved ${scope} desired policy: ${result.digest.slice(0, 19)}… (approval record id)`);
@@ -136,9 +173,7 @@ export const hostCommand: CommandModule = {
     };
     const showRules = async (scope: DesiredHostScope, host: string): Promise<void> => {
       const result = await readDesiredHostRules(context.runtimeContext(), nodeRuntimeIO, scope, host);
-      console.log(`scope: ${scope === "local" ? "checkout-local" : "project"}`);
-      console.log(`${result.host}: ${describeRequestRules(result.enforced)}`);
-      console.log(ownerLine(result.owner, result.ownerLayer));
+      for (const line of hostRulesShowLines(result)) console.log(line);
     };
     return parser.command(
       "host",

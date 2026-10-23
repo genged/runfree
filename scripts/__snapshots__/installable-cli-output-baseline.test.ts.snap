@@ -80,6 +80,8 @@ exports[`output baseline: command transcripts > policy mutation before the first
   "stdout": "scope: project
 pre.example updated
 owner: direct (project)
+before: none (all methods, all paths, git push allowed)
+after: methods=GET,HEAD,OPTIONS pathPrefixes=all gitPush=allow
 updated .runfree/network-policy.json
 approved project desired policy: sha256:<digest> (approval record id)
 effective policy: unchanged (--no-reload)
@@ -290,7 +292,7 @@ The person operating Runfree can widen this on the host machine:
 
   runfree host rules api.example.com --method GET --method HEAD --method POST --request-path-prefix /api/ --deny-git-push --write ask
 
-This replaces the host's request rule with: methods=GET,HEAD,POST pathPrefixes=/api/ gitPush=deny writeAction=ask
+The host's request rule becomes: methods=GET,HEAD,POST pathPrefixes=/api/ gitPush=deny writeAction=ask
 
 Current rules: runfree host explain api.example.com
 ",
@@ -375,7 +377,7 @@ The person operating Runfree can widen this on the host machine:
 
   runfree host rules api.example.com --method GET --method HEAD --request-path-prefix /api/ --request-path-prefix <prefix> --deny-git-push --write ask
 
-This replaces the host's request rule with: methods=GET,HEAD pathPrefixes=/api/,<prefix> gitPush=deny writeAction=ask
+The host's request rule becomes: methods=GET,HEAD pathPrefixes=/api/,<prefix> gitPush=deny writeAction=ask
 
 Current rules: runfree host explain api.example.com
 ",

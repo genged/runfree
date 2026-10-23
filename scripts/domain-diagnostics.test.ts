@@ -201,7 +201,7 @@ describe("domain diagnostics", () => {
       tokens: {},
       requests: {
         // The api rule carries more than methods: the widening command must
-        // reproduce every field, because `host rules` replaces the whole rule.
+        // reproduce every field, so it states the whole resulting rule.
         "api.github.com": { methods: ["GET", "HEAD"], pathPrefixes: ["/repos/"], gitPush: "deny", writeAction: "ask" },
         "github.com": { gitPush: "deny" },
       },

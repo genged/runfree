@@ -74,12 +74,11 @@ export function domainAddCommandForHost(host: string): string {
   return `runfree host add ${host}`;
 }
 
-// The exact widening command for a method denial. `runfree host rules` with
-// rule flags replaces the host's requests entry, so the command enumerates the
-// currently allowed methods plus the denied one instead of suggesting a bare
-// `--method <M>` that would drop the existing rule.
-// `runfree host rules` replaces the host's whole rule, so every widening
-// command reproduces the full current rule plus the delta (shared builder).
+// The exact widening command for a method denial. `--method` replaces the
+// host's whole method list, so the command enumerates the currently allowed
+// methods plus the denied one instead of a bare `--method <M>`. Every widening
+// command reproduces the full current rule plus the delta (shared builder), so
+// it states the whole resulting rule.
 export function methodWideningCommand(policy: PolicyJson, host: string, method: string): string {
   const rule = policy.requests?.[host];
   if (!isHttpMethod(method)) return hostRulesCommand(host, rule).command;

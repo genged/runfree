@@ -98,7 +98,7 @@ describe("denial display helpers", () => {
       "  runfree host rules api.github.com --method GET --method HEAD --method POST --request-path-prefix /repos/ --deny-git-push --write ask",
     );
     expect(body).toContain(
-      "This replaces the host's request rule with: methods=GET,HEAD,POST pathPrefixes=/repos/ gitPush=deny writeAction=ask",
+      "The host's request rule becomes: methods=GET,HEAD,POST pathPrefixes=/repos/ gitPush=deny writeAction=ask",
     );
     expect(body).not.toContain("cannot express");
   });
@@ -113,10 +113,10 @@ describe("denial display helpers", () => {
     expect(body).toContain(
       "  runfree host rules internal.example.com --method GET --request-path-prefix /api/v2/ --request-path-prefix <prefix> --write deny",
     );
-    expect(body).toContain("This replaces the host's request rule with: methods=GET pathPrefixes=/api/v2/,<prefix> gitPush=allow writeAction=deny");
+    expect(body).toContain("The host's request rule becomes: methods=GET pathPrefixes=/api/v2/,<prefix> gitPush=allow writeAction=deny");
   });
 
-  test("widening notes the rule fields host rules cannot express and quotes adversarial prefixes", () => {
+  test("widening keeps the rule fields host rules cannot express and quotes adversarial prefixes", () => {
     const body = syntheticDenialBody("h.example", "method-not-allowed", {
       method: "POST",
       path: "/x",
@@ -124,8 +124,13 @@ describe("denial display helpers", () => {
       rule: { methods: ["GET"], pathPrefixes: ["/a b/;rm -rf /"], readPathPrefixes: ["/r/"], graphql: { endpoints: ["/graphql"], writeOps: "mutation" } },
     });
     expect(body).toContain("runfree host rules h.example --method GET --method POST --request-path-prefix '/a b/;rm -rf /'");
-    expect(body).toContain("Note: the current rule also sets readPathPrefixes, graphql, which `runfree host rules` cannot express;");
-    expect(body).toContain("Edit the rule in .runfree/network-policy.json instead.");
+    // `host rules` patches only the fields it names, so the classification
+    // fields stay and the resulting rule shows them; no "drops them" note.
+    expect(body).toContain(
+      "The host's request rule becomes: methods=GET,POST pathPrefixes=/a b/;rm -rf / gitPush=allow readPathPrefixes=/r/ graphql=/graphql",
+    );
+    expect(body).not.toContain("cannot express");
+    expect(body).not.toContain("network-policy.json");
   });
 
   test("a stale denied tunnel names the new-connection remedy, not doctor", () => {

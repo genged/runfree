@@ -942,12 +942,13 @@ export function validateNetworkPolicy(raw: unknown, policyPath = INLINE_POLICY_L
 // ---------------------------------------------------------------------------
 // Rule-preserving `runfree host rules` remedies.
 //
-// `runfree host rules <host>` with any rule flag REPLACES the host's whole
-// request rule. A remedy that names only the widened element would, if pasted,
-// silently drop the host's other restrictions (methods, path prefixes, git-push
-// deny, write action). Every emitted widening command is therefore built here
-// from the host's full current rule plus the delta, and callers print the
-// resulting rule beside it so the replace semantics are visible before pasting.
+// `runfree host rules <host>` patches the fields its flags name and keeps the
+// rest; a flag given again replaces that field (a new `--method` list replaces
+// the old list). A remedy that names only the widened element would therefore
+// replace the method or prefix list with that one element. Every emitted
+// widening command is built here from the host's full current rule plus the
+// delta, so pasting it gives `resultingRule` exactly and a second paste
+// changes nothing; callers print the resulting rule beside it.
 // This module only renders text; it changes no enforcement.
 // ---------------------------------------------------------------------------
 
@@ -966,8 +967,8 @@ export type HostRulesCommand = {
   command: string;
   // The rule the command produces if pasted, as `host explain` would show it.
   resultingRule: RequestPolicyJson | undefined;
-  // Rule fields `runfree host rules` cannot express; pasting the command would
-  // drop them, so callers must say so.
+  // Rule fields `runfree host rules` cannot express (service classification
+  // fields). Pasting the command keeps them, because `host rules` patches.
   unexpressible: string[];
 };
 

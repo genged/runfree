@@ -91,6 +91,12 @@ describe("installable runfree CLI: admin policy", () => {
     expect(runCli(["service", "enable", "user-rules-kept", "--no-reload"]).status).toBe(0);
     const set = runCli(["host", "rules", "kept-b.example.com", "--write", "deny", "--no-reload"]);
     expect(set.status, set.stderr).toBe(0);
+    expect(set.stdout).toContain([
+      "kept-b.example.com updated",
+      "owner: service user-rules-kept (project)",
+      "before: none (all methods, all paths, git push allowed)",
+      "after: methods=all pathPrefixes=all gitPush=allow writeAction=deny",
+    ].join("\n"));
     selectCurrentDesiredControlsForTsCliProject();
     hostRuleService("user-rules-kept", 2, ["kept-a.example.com", "kept-b.example.com", "kept-c.example.com"]);
 
@@ -101,8 +107,14 @@ describe("installable runfree CLI: admin policy", () => {
     expect(policy.services["user-rules-kept"].revision).toBe(2);
     expect(policy.services["user-rules-kept"].selection).toEqual({ hostRules: { "kept-b.example.com": { writeAction: "deny" } } });
     const shown = runCli(["host", "rules", "kept-b.example.com"]);
-    expect(shown.stdout).toContain("writeAction=deny");
-    expect(shown.stdout).toContain("owner: service user-rules-kept (project)");
+    expect(shown.stdout).toBe([
+      "scope: project",
+      "kept-b.example.com: methods=all pathPrefixes=all gitPush=allow writeAction=deny",
+      "owner: service user-rules-kept (project)",
+      "  service rule: none",
+      "  your setting: writeAction=deny",
+      "",
+    ].join("\n"));
   });
 
   test("service diff --apply refuses the whole batch and leaves both layers untouched", () => {
