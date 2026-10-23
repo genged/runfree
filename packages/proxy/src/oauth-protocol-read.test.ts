@@ -214,6 +214,23 @@ describe("protocolReadBodyAllowed", () => {
     expect(refusal(remote, jsonHeaders(remote))).toBe("registration-redirect_uris");
     expect(refusal("grant_type=password", formHeaders("grant_type=password"), "token")).toBe("token-body");
   });
+
+  test("accepts the registration Claude Code's MCP SDK sends, with application_type native only", () => {
+    const claude = JSON.stringify({
+      client_name: "Claude Code (ahrefs)",
+      redirect_uris: ["http://localhost:47886/callback"],
+      grant_types: ["authorization_code", "refresh_token"],
+      response_types: ["code"],
+      token_endpoint_auth_method: "none",
+      application_type: "native",
+    });
+    expect(protocolReadBodyAllowed({ resourceHost: "mcp.example.test", kind: "registration", bodyText: claude, headers: jsonHeaders(claude) })).toBe(true);
+    for (const applicationType of ["web", "Native", 1, null]) {
+      const body = JSON.stringify({ ...JSON.parse(claude) as object, application_type: applicationType });
+      expect(protocolReadBodyRefusal({ resourceHost: "mcp.example.test", kind: "registration", bodyText: body, headers: jsonHeaders(body) }))
+        .toBe("registration-application_type");
+    }
+  });
 });
 
 describe("ProtocolReadRateLimiter", () => {

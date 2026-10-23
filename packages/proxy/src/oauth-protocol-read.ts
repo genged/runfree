@@ -30,6 +30,7 @@ const TOKEN_FIELDS = new Set([
   "resource",
 ]);
 const REGISTRATION_FIELDS = new Set([
+  "application_type",
   "client_name",
   "redirect_uris",
   "grant_types",
@@ -164,6 +165,9 @@ function registrationBodyRefusal(bodyText: string): string | undefined {
     && (typeof body.client_name !== "string" || body.client_name.length > 200 || !PRINTABLE_ASCII.test(body.client_name))) {
     return "registration-client_name";
   }
+  // The MCP SDK derives application_type from the redirect URIs: "native" for
+  // loopback ones, the only kind allowed above. It names no URL to fetch.
+  if (body.application_type !== undefined && body.application_type !== "native") return "registration-application_type";
   if (body.grant_types !== undefined && !stringSubset(body.grant_types, TOKEN_GRANTS)) return "registration-grant_types";
   if (body.response_types !== undefined && !stringSubset(body.response_types, new Set(["code"]))) return "registration-response_types";
   if (body.token_endpoint_auth_method !== undefined
