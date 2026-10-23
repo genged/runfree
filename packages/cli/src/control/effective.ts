@@ -3,6 +3,10 @@ import fs from "node:fs";
 import path from "node:path";
 
 import {
+  validateMcpOperationPolicy,
+  type McpOperationPolicyJson,
+} from "@runfree/runtime-contracts/mcp-operation-policy";
+import {
   type LoadedNetworkPolicy,
   validateNetworkPolicy,
   type PolicyJson,
@@ -54,6 +58,10 @@ const HOST_PAYLOADS = ["agent/agent.env", "runtime/control.json"] as const;
 // disk may still list it; it stays verifiable but is never written or required.
 const LEGACY_OPTIONAL_HOST_PAYLOADS = ["runtime/provenance.json"] as const;
 const PROXY_PAYLOADS = ["network-policy.json", "oauth-mediation-policy.json"] as const;
+// Written when the prepared MCP operation policy lists a server; absent means
+// none, which keeps a project without HTTPS MCP servers on the same
+// generation bytes older readers load.
+const OPTIONAL_PROXY_PAYLOADS = ["mcp-operation-policy.json"] as const;
 
 type FileDigests<T extends string> = Record<T, string>;
 export type EffectiveHostManifest = {
@@ -69,7 +77,8 @@ export type EffectiveHostManifest = {
 export type EffectiveProxyManifest = {
   compilerVersion: string;
   controlGeneration: string;
-  files: FileDigests<typeof PROXY_PAYLOADS[number]>;
+  files: FileDigests<typeof PROXY_PAYLOADS[number]>
+    & Partial<FileDigests<typeof OPTIONAL_PROXY_PAYLOADS[number]>>;
   policyGeneration: string;
   schemaVersion: typeof EFFECTIVE_CONTROL_SCHEMA_VERSION;
 };
@@ -285,6 +294,7 @@ export type PublishEffectiveControlInput = {
   agentEnvValues?: Record<string, string>;
   baseOAuthPolicy?: OAuthMediationPolicyJson;
   effectiveNetworkPolicy?: PolicyJson;
+  mcpOperationPolicy?: McpOperationPolicyJson;
   oauthSeedHandles?: Record<string, Record<string, string>>;
   runtimeNetwork?: Record<string, unknown>;
 };
@@ -354,7 +364,7 @@ function parseProxyManifest(source: string): EffectiveProxyManifest {
     compilerVersion: CONTROL_COMPILER_VERSION,
     controlGeneration: raw.controlGeneration,
     policyGeneration: raw.policyGeneration,
-    files: validateDigestMap(raw.files, PROXY_PAYLOADS, "proxy manifest files") as EffectiveProxyManifest["files"],
+    files: validateDigestMap(raw.files, PROXY_PAYLOADS, "proxy manifest files", OPTIONAL_PROXY_PAYLOADS) as EffectiveProxyManifest["files"],
   };
 }
 
@@ -420,6 +430,9 @@ export function verifyEffectivePolicyGeneration(
   const policy = validateNetworkPolicy(parseStrictJson(regularContents(proxyDirectory, "network-policy.json")));
   if (policy.generation !== hostManifest.policyGeneration) throw new Error("effective network policy generation does not match the manifests");
   validateOAuthMediationPolicy(parseStrictJson(regularContents(proxyDirectory, "oauth-mediation-policy.json")));
+  if (proxyManifest.files["mcp-operation-policy.json"] !== undefined) {
+    validateMcpOperationPolicy(parseStrictJson(regularContents(proxyDirectory, "mcp-operation-policy.json")));
+  }
   return {
     controlGeneration,
     policyGeneration: policy.generation,
@@ -575,6 +588,7 @@ function publishEffectivePolicyGenerationUnlocked(
   const compiled = compileDesiredPolicies({ project: projectPolicy, local: localPolicy });
   const loadedPolicy = validateNetworkPolicy(input.effectiveNetworkPolicy ?? compiled.policy);
   const oauthPolicy = effectiveOAuthPolicy(compiled, input, loadedPolicy);
+  const mcpOperationPolicy = input.mcpOperationPolicy ? validateMcpOperationPolicy(input.mcpOperationPolicy).raw : undefined;
   const hostPayloads = {
     "agent/agent.env": effectiveAgentEnv(compiled, input),
     "runtime/control.json": `${JSON.stringify({ isolation: runtimeIsolation, network: input.runtimeNetwork ?? {} }, null, 2)}\n`,
@@ -582,6 +596,9 @@ function publishEffectivePolicyGenerationUnlocked(
   const proxyPayloads = {
     "network-policy.json": `${JSON.stringify(loadedPolicy.raw, null, 2)}\n`,
     "oauth-mediation-policy.json": `${JSON.stringify(oauthPolicy, null, 2)}\n`,
+    ...(mcpOperationPolicy && mcpOperationPolicy.servers.length > 0
+      ? { "mcp-operation-policy.json": `${JSON.stringify(mcpOperationPolicy, null, 2)}\n` }
+      : {}),
   };
   const selectedSubjects = Object.fromEntries(Object.entries(selection.subjects).sort().map(([name, approval]) => [name, approval?.digest]));
   const payloadDigests = Object.fromEntries(Object.entries({ ...hostPayloads, ...proxyPayloads }).sort()

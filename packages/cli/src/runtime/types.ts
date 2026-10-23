@@ -70,7 +70,6 @@ export type CaptureResult = {
 // and the executor dispatches each straight to the typed admin enforcement. See
 // the spec's "Programmatic callers speak intent, not strings."
 export type RuntimeAdminIntent =
-  | { kind: "converge-proxy-policy" }
   | { kind: "ensure-agent-service"; id: string; quiet: boolean }
   /**
    * `startup-convergence` is the receipt-gated warm-launch sync (launch plan

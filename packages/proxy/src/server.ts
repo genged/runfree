@@ -215,7 +215,7 @@ let currentEffectiveControl: LoadedEffectiveProxyControl | undefined = effective
   ? loadEffectiveProxyControl(effectiveProxyRoot)
   : undefined;
 let currentPolicy = currentEffectiveControl?.networkPolicy ?? loadProxyPolicy();
-let currentMcpOperationPolicy = loadMcpOperationPolicy();
+let currentMcpOperationPolicy = loadMcpOperationPolicy(currentEffectiveControl);
 let policyRevalidationCandidate: {
   policy: LoadedProxyPolicy;
   mcpOperationGeneration: string | undefined;
@@ -661,7 +661,12 @@ function mcpOperationPolicyPath(): string | undefined {
   return process.env.RUNFREE_MCP_OPERATION_POLICY_PATH;
 }
 
-function loadMcpOperationPolicy(): LoadedMcpOperationPolicy | undefined {
+// Under an effective proxy root the MCP operation policy is a payload of the
+// selected generation, loaded and digest-verified with the network and OAuth
+// policies; a generation without one (an older release's) holds none. The
+// separately mounted file is read only without an effective root.
+function loadMcpOperationPolicy(effectiveControl: LoadedEffectiveProxyControl | undefined): LoadedMcpOperationPolicy | undefined {
+  if (effectiveProxyRoot) return effectiveControl?.mcpOperationPolicy;
   const policyPath = mcpOperationPolicyPath();
   if (!policyPath) return undefined;
   try {
@@ -710,7 +715,7 @@ function reloadPolicy(): void {
       ? loadEffectiveProxyControl(effectiveProxyRoot)
       : undefined;
     const nextPolicy = nextEffectiveControl?.networkPolicy ?? loadProxyPolicy();
-    const nextMcpOperationPolicy = loadMcpOperationPolicy();
+    const nextMcpOperationPolicy = loadMcpOperationPolicy(nextEffectiveControl);
     if (nextPolicy.generation === previous.generation
       && nextMcpOperationPolicy?.generation === currentMcpOperationPolicy?.generation
       && nextEffectiveControl?.active.controlGeneration === currentEffectiveControl?.active.controlGeneration) {
@@ -760,7 +765,7 @@ function reloadPolicy(): void {
 }
 
 const selectedPolicyPath = effectiveProxyRoot ? path.join(effectiveProxyRoot, "active.json") : currentPolicy.policyPath;
-const currentMcpPolicyPath = mcpOperationPolicyPath();
+const currentMcpPolicyPath = effectiveProxyRoot ? undefined : mcpOperationPolicyPath();
 
 type WatchedFileRevision = {
   exists: boolean;

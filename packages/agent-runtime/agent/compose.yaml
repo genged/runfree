@@ -59,10 +59,6 @@ services:
         source: ${RUNFREE_EFFECTIVE_PROXY_DIR:?RUNFREE_EFFECTIVE_PROXY_DIR is required}
         target: /app/runfree-effective
         read_only: true
-      - type: bind
-        source: ${RUNFREE_MCP_OPERATION_POLICY_HOST_PATH:?RUNFREE_MCP_OPERATION_POLICY_HOST_PATH is required}
-        target: /app/proxy/mcp-operation-policy.json
-        read_only: true
       - type: volume
         source: runfree-oauth-state
         target: /run/runfree-oauth
@@ -102,7 +98,6 @@ services:
       PROXY_AUDIT_MARKER_PATH: /run/runfree-proxy-audit/active.json
       PROXY_AUDIT_SPOOL_PATH: /run/runfree-proxy-audit-spool/spool.txt
       PROXY_AUDIT_RESOLVED_HOSTS_PATH: /run/runfree-proxy-audit/resolved-hosts.json
-      RUNFREE_MCP_OPERATION_POLICY_PATH: /app/proxy/mcp-operation-policy.json
       RUNFREE_OAUTH_STATE_DIR: /run/runfree-oauth
       RUNFREE_APPROVALS_PENDING_DIR: /run/runfree-approvals/pending
       RUNFREE_APPROVALS_DECISIONS_DIR: /run/runfree-approvals/decisions

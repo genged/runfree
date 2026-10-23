@@ -7,6 +7,10 @@ import {
   type OAuthMediationPolicyJson,
 } from "@runfree/runtime-contracts/oauth-mediation-policy";
 import {
+  validateMcpOperationPolicy,
+  type McpOperationPolicyJson,
+} from "@runfree/runtime-contracts/mcp-operation-policy";
+import {
   validateNetworkPolicy,
   type PolicyJson,
 } from "@runfree/runtime-contracts/network-policy";
@@ -377,6 +381,14 @@ export function useApprovedPolicyGeneration(context: RuntimeContext): EffectiveP
   } catch (error) {
     if (!(error && typeof error === "object" && "code" in error && error.code === "ENOENT")) throw error;
   }
+  // The prepared MCP operation policy is a host-only input; the proxy reads it
+  // from the published generation. Absent means none prepared yet (empty).
+  const mcpOperationPolicySource = readHostControlFile(
+    context.project.paths.mcpOperationPolicyPath ?? path.join(context.project.paths.stateDir, "mcp-operation-policy.json"),
+  );
+  const mcpOperationPolicy: McpOperationPolicyJson | undefined = mcpOperationPolicySource === undefined
+    ? undefined
+    : validateMcpOperationPolicy(parseStrictJson(mcpOperationPolicySource)).raw;
   const projectPolicy = readApprovedNetworkPolicy(context.projectRoot, context.project, "network-project");
   const localPolicy = readApprovedNetworkPolicy(context.projectRoot, context.project, "network-local");
   const compiled = projectPolicy && localPolicy
@@ -387,6 +399,7 @@ export function useApprovedPolicyGeneration(context: RuntimeContext): EffectiveP
     : undefined;
   return publishEffectivePolicyGeneration(context.projectRoot, context.project, {
     ...(baseOAuthPolicy ? { baseOAuthPolicy } : {}),
+    ...(mcpOperationPolicy ? { mcpOperationPolicy } : {}),
     ...(compiled ? {
       agentEnvValues: readHostAgentEnv(context.project.paths.controlAgentEnvPath),
       ...(effectiveNetworkPolicy ? { effectiveNetworkPolicy } : {}),

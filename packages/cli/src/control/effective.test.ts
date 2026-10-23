@@ -227,6 +227,48 @@ describe("effective control generations", () => {
     expect(clear.providers["mcp:claude-linear"]?.registrationEndpoints).toEqual([{ host: "auth.example.com", path: "/register" }]);
   });
 
+  test("publishes the prepared MCP operation policy as a digest-verified proxy payload, and a rule change is a new generation", () => {
+    const project = approvedProject();
+    const policy = (writeAction: "allow" | "ask") => ({
+      schemaVersion: 1 as const,
+      servers: [{
+        id: "claude:project:ahrefs",
+        agent: "claude" as const,
+        name: "ahrefs",
+        source: "project" as const,
+        host: "api.ahrefs.com",
+        path: "/mcp/mcp",
+        defaultToolWriteAction: writeAction,
+      }],
+    });
+    const first = publishEffectivePolicyGeneration(root, project, { mcpOperationPolicy: policy("ask") });
+    const payloadPath = path.join(first.proxyDirectory, "mcp-operation-policy.json");
+    expect(JSON.parse(fs.readFileSync(payloadPath, "utf8"))).toEqual(policy("ask"));
+    expect(first.proxyManifest.files["mcp-operation-policy.json"]).toMatch(/^sha256:/);
+    expect(fs.statSync(payloadPath).mode & 0o777).toBe(0o444);
+    const second = publishEffectivePolicyGeneration(root, project, { mcpOperationPolicy: policy("allow") });
+    expect(second.controlGeneration).not.toBe(first.controlGeneration);
+    expect(second.policyGeneration).toBe(first.policyGeneration);
+  });
+
+  test("an MCP operation policy with no servers adds no payload and keeps the generation", () => {
+    const project = approvedProject();
+    const without = publishEffectivePolicyGeneration(root, project);
+    const empty = publishEffectivePolicyGeneration(root, project, { mcpOperationPolicy: { schemaVersion: 1, servers: [] } });
+    expect(empty.controlGeneration).toBe(without.controlGeneration);
+    expect(empty.proxyManifest.files).not.toHaveProperty("mcp-operation-policy.json");
+    expect(fs.existsSync(path.join(empty.proxyDirectory, "mcp-operation-policy.json"))).toBe(false);
+  });
+
+  test("refuses an invalid MCP operation policy before publishing anything", () => {
+    const project = approvedProject();
+    const before = readActiveControlSelection(project);
+    expect(() => publishEffectivePolicyGeneration(root, project, {
+      mcpOperationPolicy: { schemaVersion: 1, servers: [{ id: "x" }] } as never,
+    })).toThrow("invalid MCP operation policy");
+    expect(readActiveControlSelection(project)).toEqual(before);
+  });
+
   test("changes generation when a host-only runtime payload changes", () => {
     const project = approvedProject();
     const first = publishEffectivePolicyGeneration(root, project, { runtimeNetwork: { subnet: "172.30.1.0/24" } });

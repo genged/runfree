@@ -75,14 +75,14 @@ describe("v0.5.2 proxy control loader over a generation this release publishes",
 
   // The real publication path: approve the desired policy, then publish and
   // select the effective generation the proxy polls.
-  function publish(desired: unknown): string {
+  function publish(desired: unknown, input: Parameters<typeof publishEffectivePolicyGeneration>[2] = {}): string {
     fs.writeFileSync(path.join(root, ".runfree", "network-policy.json"), `${JSON.stringify(desired)}\n`);
     const project = projectInfo(root, { XDG_STATE_HOME: stateHome, XDG_CONFIG_HOME: path.join(stateHome, "config") });
     const candidate = captureDesiredPolicyCandidate(root, project.paths.controlCandidatesDir);
     approveNetworkCandidate(root, project, candidate, "network-project", "interactive");
     approveNetworkCandidate(root, project, candidate, "network-local", "interactive");
     approveRuntimeIsolationControl(root, project, "interactive");
-    publishEffectivePolicyGeneration(root, project);
+    publishEffectivePolicyGeneration(root, project, input);
     return project.paths.controlProxyDir;
   }
 
@@ -98,6 +98,19 @@ describe("v0.5.2 proxy control loader over a generation this release publishes",
     expect(loadEffectiveProxyControl(proxyRoot).networkPolicy.credentialMappings[0]?.protocol).toBe("git-http");
     expect(() => loadEffectiveProxyControlV052(proxyRoot))
       .toThrow("selected network policy generation does not match its manifest");
+  });
+
+  test("a generation carrying an MCP operation policy fails the old manifest check", () => {
+    // Fails closed: the old proxy keeps its last valid policy. The same-build
+    // fence replaces such a proxy before this CLI publishes to it.
+    const proxyRoot = publish(desiredWith({ host: "gitlab.com", header: "Authorization", scheme: "bearer" }, 2), {
+      mcpOperationPolicy: {
+        schemaVersion: 1,
+        servers: [{ id: "claude:project:ahrefs", agent: "claude", name: "ahrefs", source: "project", host: "api.ahrefs.com", path: "/mcp/mcp" }],
+      },
+    });
+    expect(loadEffectiveProxyControl(proxyRoot).mcpOperationPolicy?.servers).toHaveLength(1);
+    expect(() => loadEffectiveProxyControlV052(proxyRoot)).toThrow("effective proxy manifest files fields are malformed");
   });
 
   test("a basic mapping is refused by the old scheme enum", () => {

@@ -1498,8 +1498,6 @@ function applyAgentServiceIntentForTest(intent: Extract<RuntimeAdminIntent, { ki
 
 function runtimeIntentToArgs(intent: RuntimeAdminIntent): string[] {
   switch (intent.kind) {
-    case "converge-proxy-policy":
-      return ["converge-proxy-policy"];
     case "ensure-agent-service":
       return ["service", "ensure", intent.id, ...(intent.quiet ? ["--quiet"] : [])];
     case "token-sync":
@@ -6627,27 +6625,12 @@ describe("runtime command flow", () => {
       ).toThrow("token-sync requires a selected effective policy generation");
     });
 
-    test("v4 converge-proxy-policy fails closed when no effective control is selected", () => {
-      // Regression guard: converge-proxy-policy is a real v4 intent — the MCP-rule
-      // approval flow issues it right after a prepare that selects a generation —
-      // so it must fail closed on a missing selection, not be rejected outright as
-      // an unreachable v4 intent.
-      const projectRoot = path.join(tmp, "fresh-converge");
-      const project = prepareProject(projectRoot);
-      clearActiveControlSelection(project);
-
-      expect(() =>
-        resolveRuntimeAdminEnvironment({ kind: "converge-proxy-policy" }, adminContext(projectRoot, project)),
-      ).toThrow("converge-proxy-policy requires a selected effective policy generation");
-    });
-
     test("v4 live intents take the full runtime env once a control is selected", () => {
       const projectRoot = path.join(tmp, "selected-live");
       const project = prepareProject(projectRoot); // publishes AND selects a generation
 
       for (const intent of [
         { kind: "token-sync", verbose: false },
-        { kind: "converge-proxy-policy" },
       ] satisfies RuntimeAdminIntent[]) {
         const { env, activeEffective } = resolveRuntimeAdminEnvironment(intent, adminContext(projectRoot, project));
         expect(activeEffective).toBeDefined();

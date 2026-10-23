@@ -1,3 +1,5 @@
+import fs from "node:fs";
+
 import { describe, expect, test } from "vitest";
 
 import type { RuntimeNetwork } from "../network.ts";
@@ -52,7 +54,6 @@ function plan(overrides: {
         RUNFREE_PROXY_CA_CERT_DIR: paths.proxyCaCertDir,
         RUNFREE_PROXY_CA_KEY_DIR: paths.proxyCaKeyDir,
         RUNFREE_EFFECTIVE_PROXY_DIR: paths.controlProxyDir,
-        RUNFREE_MCP_OPERATION_POLICY_HOST_PATH: "/host/state/mcp-operation-policy.json",
         RUNFREE_SUBNET: selectedNetwork.subnet,
         RUNFREE_PROXY_IP: selectedNetwork.proxyIp,
         RUNFREE_CONTAINER_IP: selectedNetwork.agentIp,
@@ -96,12 +97,6 @@ describe("control-plane topology projection v2", () => {
       ],
     });
     expect(projection.proxy.mounts).toEqual([
-      {
-        type: "bind",
-        source: "/host/state/mcp-operation-policy.json",
-        target: "/app/proxy/mcp-operation-policy.json",
-        readOnly: true,
-      },
       {
         type: "bind",
         source: "/host/state/control/effective/proxy",
@@ -193,12 +188,32 @@ describe("control-plane topology projection v2", () => {
       .toBe("files");
   });
 
+  // A single-file bind mount stays on the inode it had at mount time, so a
+  // host write-then-rename leaves the proxy reading stale or truncated bytes
+  // (Docker Desktop shows the new bytes cut to the old size). Proxy policy
+  // must arrive through the effective generation directory instead.
+  test("binds only directories into the proxy, never a host-replaced policy file", () => {
+    const projection = controlPlaneTopologyProjectionV2(plan());
+    const binds = projection.proxy.mounts.filter((mount) => mount.type === "bind");
+    expect(binds.map((mount) => mount.source).sort()).toEqual([
+      "/host/state/control/effective/proxy",
+      "/host/state/proxy-ca/private",
+      "/host/state/proxy-ca/public",
+    ]);
+    expect(binds.some((mount) => mount.target.endsWith(".json"))).toBe(false);
+    expect(projection.proxy.environment).not.toHaveProperty("RUNFREE_MCP_OPERATION_POLICY_PATH");
+
+    const compose = fs.readFileSync(new URL("../../../agent-runtime/agent/compose.yaml", import.meta.url), "utf8");
+    expect(compose).not.toContain("mcp-operation-policy");
+    expect(compose).not.toMatch(/target: \S+\.json\s*$/m);
+  });
+
   test("fails closed for contradictory plan inputs before producing a projection", () => {
     expect(() => controlPlaneTopologyProjectionV2(plan({
       composeEnv: { RUNFREE_PROXY_IP: "172.30.40.99" },
     }))).toThrow("contradicts the runtime plan");
     expect(() => controlPlaneTopologyProjectionV2(plan({
-      composeEnv: { RUNFREE_MCP_OPERATION_POLICY_HOST_PATH: undefined },
+      composeEnv: { RUNFREE_PROXY_CA_KEY_DIR: undefined },
     }))).toThrow("must be non-empty bounded text");
     expect(() => controlPlaneTopologyProjectionV2(plan({
       composeEnv: { RUNFREE_WRITE_APPROVAL_HOLD_SECONDS: "301" },

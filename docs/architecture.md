@@ -214,7 +214,15 @@ The `proxy` service is the trusted network boundary. It enforces:
 - structured denial logs for `runfree doctor`.
 
 The proxy reads one selected effective policy generation, which pairs network
-and OAuth policy, from a read-only host-state mount. It never reads project
+and OAuth policy with the MCP operation policy, from a read-only host-state
+directory mount. Each payload is digest-checked against the effective
+policy generation's manifest, and an effective policy generation that fails
+any check is refused whole, so the proxy keeps the last valid set. The proxy has no single-file bind mount: such
+a mount stays on the inode it had at mount time, so a host
+write-then-rename would leave the proxy reading old or truncated bytes. An
+effective policy generation published before this payload existed carries
+no MCP operation policy; if a rollback selects one, MCP requests follow the
+host's write posture until the next publication. It never reads project
 policy directly. It also reads proxy-side token state. It does not rely on
 agent environment variables as an enforcement mechanism.
 
@@ -264,7 +272,7 @@ different authority families. Always name the family; the bare phrase
 
 | Family | Serialized key | What it identifies |
 | --- | --- | --- |
-| Effective policy generation | `controlGeneration` | The compiled, immutable host/proxy policy generation built from approved `.runfree/` desired policy: network policy, OAuth mediation policy, agent environment, runtime control. |
+| Effective policy generation | `controlGeneration` | The compiled, immutable host/proxy policy generation built from approved `.runfree/` desired policy: network policy, OAuth mediation policy, MCP operation policy, agent environment, runtime control. |
 | Control plane generation | `controlPlaneGenerationDigest` | The runtime control plane a session binds to: proxy image, Compose topology, and admission contract epoch. |
 | Temporary access generation | (reserved) | Session-scoped temporary network access records; designed, not yet built. |
 

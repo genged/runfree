@@ -134,13 +134,11 @@ requireCommand("docker");
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "runfree-compose-config-"));
 try {
-  const mcpOperationPolicy = path.join(tmp, "mcp-operation-policy.json");
   const effectiveProxyDir = path.join(tmp, "effective-proxy");
   const proxyCaPrivate = path.join(tmp, "proxy-ca-private");
   const proxyCaPublic = path.join(tmp, "proxy-ca-public");
   const composeFile = path.join(tmp, "runtime", "agent", "compose.yaml");
 
-  fs.writeFileSync(mcpOperationPolicy, "{\"schemaVersion\":1,\"servers\":[]}\n");
   for (const dir of [effectiveProxyDir, proxyCaPrivate, proxyCaPublic]) {
     fs.mkdirSync(dir, { recursive: true });
   }
@@ -155,7 +153,6 @@ try {
       RUNFREE_PROJECT_ID: "static-check",
       RUNFREE_COMPOSE_PROJECT_NAME: "runfree-static-check",
       RUNFREE_EFFECTIVE_PROXY_DIR: effectiveProxyDir,
-      RUNFREE_MCP_OPERATION_POLICY_HOST_PATH: mcpOperationPolicy,
       RUNFREE_PROXY_CA_KEY_DIR: proxyCaPrivate,
       RUNFREE_PROXY_CA_CERT_DIR: proxyCaPublic,
       RUNFREE_PROXY_IMAGE: "runfree/proxy-runtime:static-compose-check",

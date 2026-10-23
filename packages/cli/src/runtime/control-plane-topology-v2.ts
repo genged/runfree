@@ -181,12 +181,6 @@ function proxyMounts(
 ): readonly ControlPlaneMountV2[] {
   const mounts: ControlPlaneMountV2[] = [
     { type: "bind", source: plan.paths.controlProxyDir, target: "/app/runfree-effective", readOnly: true },
-    {
-      type: "bind",
-      source: requiredEnvironment(plan, "RUNFREE_MCP_OPERATION_POLICY_HOST_PATH"),
-      target: "/app/proxy/mcp-operation-policy.json",
-      readOnly: true,
-    },
     { type: "bind", source: plan.paths.proxyCaKeyDir, target: "/ca/private", readOnly: false },
     { type: "bind", source: plan.paths.proxyCaCertDir, target: "/ca/public", readOnly: false },
     { type: "volume", source: oauthVolume, target: "/run/runfree-oauth", readOnly: false },
@@ -220,7 +214,6 @@ function proxyEnvironment(
     RUNFREE_APPROVALS_DECISIONS_DIR: "/run/runfree-approvals/decisions",
     RUNFREE_APPROVALS_PENDING_DIR: "/run/runfree-approvals/pending",
     RUNFREE_EFFECTIVE_PROXY_ROOT: "/app/runfree-effective",
-    RUNFREE_MCP_OPERATION_POLICY_PATH: "/app/proxy/mcp-operation-policy.json",
     RUNFREE_OAUTH_STATE_DIR: "/run/runfree-oauth",
     RUNFREE_PROJECT_ID: plan.projectId,
     RUNFREE_PROXY_EGRESS_GATEWAY: plan.network.proxyEgressGateway,

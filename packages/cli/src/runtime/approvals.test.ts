@@ -28,10 +28,20 @@ import { ROOT_UID_GID } from "./constants.ts";
 import { mcpRulesPath, readMcpRules } from "./mcp.ts";
 import type { CaptureResult, RuntimeContext, RuntimeIO } from "./types.ts";
 
+// The saved-rule path activates through the fenced publication; the tests pin
+// that it is called and that its outcomes gate the decision.
+const activation = vi.hoisted(() => ({
+  activate: vi.fn<(...args: unknown[]) => Promise<unknown>>(),
+}));
+vi.mock("../control/activation.ts", () => ({
+  activateApprovedControlsAfterMutation: activation.activate,
+}));
+
 const tempDirs: string[] = [];
 
 afterEach(() => {
   for (const dir of tempDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
+  activation.activate.mockReset();
 });
 
 function mcpToolRecord(): PendingApprovalRecord {
@@ -93,7 +103,7 @@ function captureResult(status: number, stdout = "", stderr = ""): CaptureResult 
   return { status, stdout, stderr };
 }
 
-function approvalIo(record: PendingApprovalRecord, adminStatus: Partial<Record<"prepare" | "converge-proxy-policy", number>> = {}): RuntimeIO & {
+function approvalIo(record: PendingApprovalRecord): RuntimeIO & {
   decisions: ApprovalDecisionRecord[];
   events: string[];
 } {
@@ -104,7 +114,7 @@ function approvalIo(record: PendingApprovalRecord, adminStatus: Partial<Record<"
     events,
     admin: async (intent) => {
       events.push(intent.kind);
-      return adminStatus[intent.kind as "prepare" | "converge-proxy-policy"] ?? 0;
+      return 0;
     },
     capture: (_command, args) => {
       if (args[0] === "ps") return captureResult(0, "proxy-id\n");
@@ -218,9 +228,15 @@ describe("approval rendering", () => {
     });
   });
 
-  test("saved-rule approval regenerates and reloads policy before deciding the held request", async () => {
+  test("saved-rule approval publishes and converges an effective policy generation before deciding the held request", async () => {
     const context = tempMcpContext();
     const io = approvalIo(mcpToolRecord());
+    activation.activate.mockImplementation(async () => {
+      // The rule is saved before activation reads it.
+      expect(Object.values(readMcpRules(context.projectRoot, mcpRulesPath(context.project.paths.stateDir)).rules)).toHaveLength(1);
+      io.events.push("activate");
+      return { kind: "converged", controlGeneration: `sha256:${"c".repeat(64)}` };
+    });
 
     await expect(approveRuntime({
       deny: false,
@@ -228,7 +244,10 @@ describe("approval rendering", () => {
       saveMcpRule: "tool",
     }, context, io)).resolves.toBe(0);
 
-    expect(io.events).toEqual(["prepare", "converge-proxy-policy", "write-decision"]);
+    expect(activation.activate).toHaveBeenCalledWith(context, io);
+    // No bare prepare or network-only convergence: those published no
+    // generation, so the saved rule never reached the proxy.
+    expect(io.events).toEqual(["activate", "write-decision"]);
     expect(io.decisions).toMatchObject([{ decision: "approve", id: mcpToolRecord().id, saveMcpRule: "tool", scope: "request" }]);
     const rules = Object.values(readMcpRules(context.projectRoot, mcpRulesPath(context.project.paths.stateDir)).rules);
     expect(rules[0]).toMatchObject({
@@ -238,13 +257,15 @@ describe("approval rendering", () => {
     });
   });
 
-  test("saved-rule approval leaves the request pending when policy regeneration or reload fails", async () => {
-    for (const [failedStep, expectedEvents] of [
-      ["prepare", ["prepare"]],
-      ["converge-proxy-policy", ["prepare", "converge-proxy-policy"]],
-    ] as const) {
+  test("saved-rule approval leaves the request pending when activation fails, waits on another build, or is deferred", async () => {
+    for (const outcome of [
+      async () => { throw new Error("effective policy convergence failed; rolled back"); },
+      async () => ({ kind: "waiting", reason: "the running proxy is from another Runfree build" }),
+      async () => ({ kind: "deferred", reason: "approvals are required" }),
+    ]) {
       const context = tempMcpContext();
-      const io = approvalIo(mcpToolRecord(), { [failedStep]: 1 });
+      const io = approvalIo(mcpToolRecord());
+      activation.activate.mockImplementationOnce(outcome);
 
       await expect(approveRuntime({
         deny: false,
@@ -252,8 +273,11 @@ describe("approval rendering", () => {
         saveMcpRule: "server-tools",
       }, context, io)).resolves.toBe(1);
 
-      expect(io.events).toEqual(expectedEvents);
+      expect(io.events).toEqual([]);
       expect(io.decisions).toEqual([]);
+      // Reclaim: the rule is saved, so a retry once the proxy can take it
+      // activates again and decides.
+      expect(Object.values(readMcpRules(context.projectRoot, mcpRulesPath(context.project.paths.stateDir)).rules)).toHaveLength(1);
     }
   });
 

@@ -15,7 +15,7 @@ import { effectiveRuntimeDigest } from "./agent-image.ts";
 import { builtinAgent } from "./agents.ts";
 import { createAdminState } from "./admin/context.ts";
 import { prepareRuntimeTokenSources, clearPreparedRuntimeTokenSources, admitPreparedRuntimeTokenSources } from "./admin/admin-core.ts";
-import { convergeProxyPolicy, credentialSyncIntent, prepareEffectiveRuntimeIntent, runAdminAction } from "./admin/options.ts";
+import { credentialSyncIntent, prepareEffectiveRuntimeIntent, runAdminAction } from "./admin/options.ts";
 import { planDesiredServiceEnable } from "./admin/service-policy.ts";
 import { activateApprovedControlsAfterMutation } from "./control/activation.ts";
 import { activationReportLine } from "./control/activation-report.ts";
@@ -754,9 +754,6 @@ export async function runAgentCommand(
 // closed union; it only guards against a cast-in invalid intent.
 async function dispatchRuntimeAdmin(intent: RuntimeAdminIntent, context: RuntimeContext, io: RuntimeIO): Promise<void> {
   switch (intent.kind) {
-    case "converge-proxy-policy":
-      await convergeProxyPolicy();
-      return;
     case "ensure-agent-service": {
       const plan = planDesiredServiceEnable({
         id: intent.id,
@@ -821,8 +818,7 @@ async function dispatchRuntimeAdmin(intent: RuntimeAdminIntent, context: Runtime
 // (which creates the first generation) and `ensure-agent-service` (which mutates
 // desired policy via `context`, not the admin-state env). They must take a
 // minimal env, never the full runtime env, or a fresh project cannot enable
-// its first service. The live intents — `token-sync` and `converge-proxy-policy`
-// — act on the selected generation and must fail closed when none is selected,
+// its first service. The live intent — `token-sync` — acts on the selected generation and must fail closed when none is selected,
 // before the admin state (and any credential side effect) is constructed. An
 // unknown/cast-in intent is neither live nor authoring: it takes the minimal env
 // and is rejected by the dispatch default branch, unchanged.
@@ -833,7 +829,7 @@ export function resolveRuntimeAdminEnvironment(
   const activeEffective = intent.kind !== "prepare"
     ? readActiveEffectiveControl(context.project)
     : undefined;
-  const liveIntent = intent.kind === "token-sync" || intent.kind === "converge-proxy-policy";
+  const liveIntent = intent.kind === "token-sync";
   if (liveIntent && !activeEffective) {
     throw new Error(`${intent.kind} requires a selected effective policy generation`);
   }

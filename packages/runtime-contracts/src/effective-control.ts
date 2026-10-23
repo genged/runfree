@@ -3,6 +3,10 @@ import fs from "node:fs";
 import path from "node:path";
 
 import {
+  validateMcpOperationPolicy,
+  type LoadedMcpOperationPolicy,
+} from "./mcp-operation-policy.js";
+import {
   validateNetworkPolicy,
   type LoadedNetworkPolicy,
 } from "./network-policy.js";
@@ -18,8 +22,14 @@ export const DEFAULT_EFFECTIVE_PROXY_ROOT = "/app/runfree-effective";
 const MAX_CONTROL_FILE_BYTES = 1024 * 1024;
 const DIGEST_PATTERN = /^sha256:[a-f0-9]{64}$/;
 const PROXY_PAYLOAD_NAMES = ["network-policy.json", "oauth-mediation-policy.json"] as const;
+// Written when the prepared MCP operation policy lists a server. A generation
+// without it (no HTTPS MCP servers, or one published by an older release)
+// leaves the proxy with no MCP operation policy, so MCP requests follow the
+// host's write posture.
+const OPTIONAL_PROXY_PAYLOAD_NAMES = ["mcp-operation-policy.json"] as const;
 
 type ProxyPayloadName = typeof PROXY_PAYLOAD_NAMES[number];
+type OptionalProxyPayloadName = typeof OPTIONAL_PROXY_PAYLOAD_NAMES[number];
 
 export type ActiveEffectiveControlSelection = {
   schemaVersion: typeof EFFECTIVE_CONTROL_SCHEMA_VERSION;
@@ -33,7 +43,7 @@ export type EffectiveProxyManifest = {
   compilerVersion: typeof EFFECTIVE_CONTROL_COMPILER_VERSION;
   controlGeneration: string;
   policyGeneration: string;
-  files: Record<ProxyPayloadName, string>;
+  files: Record<ProxyPayloadName, string> & Partial<Record<OptionalProxyPayloadName, string>>;
 };
 
 export type LoadedEffectiveProxyControl = {
@@ -41,6 +51,7 @@ export type LoadedEffectiveProxyControl = {
   manifest: EffectiveProxyManifest;
   networkPolicy: LoadedNetworkPolicy;
   networkPolicyPath: string;
+  mcpOperationPolicy?: LoadedMcpOperationPolicy;
   oauthPolicy: LoadedOAuthMediationPolicy;
   oauthPolicyPath: string;
 };
@@ -53,9 +64,9 @@ function record(value: unknown, label: string): Record<string, unknown> {
   return value as Record<string, unknown>;
 }
 
-function exactKeys(value: Record<string, unknown>, expected: readonly string[], label: string): void {
+function exactKeys(value: Record<string, unknown>, expected: readonly string[], label: string, optional: readonly string[] = []): void {
   const actual = Object.keys(value).sort();
-  const wanted = [...expected].sort();
+  const wanted = [...expected, ...optional.filter((key) => Object.hasOwn(value, key))].sort();
   if (actual.length !== wanted.length || actual.some((key, index) => key !== wanted[index])) {
     throw new Error(`${label} fields are malformed`);
   }
@@ -217,7 +228,7 @@ function parseManifest(source: string): EffectiveProxyManifest {
   if (raw.schemaVersion !== EFFECTIVE_CONTROL_SCHEMA_VERSION) throw new Error("effective proxy manifest schema version is unsupported");
   if (raw.compilerVersion !== EFFECTIVE_CONTROL_COMPILER_VERSION) throw new Error("effective proxy manifest compiler version is unsupported");
   const files = record(raw.files, "effective proxy manifest files");
-  exactKeys(files, PROXY_PAYLOAD_NAMES, "effective proxy manifest files");
+  exactKeys(files, PROXY_PAYLOAD_NAMES, "effective proxy manifest files", OPTIONAL_PROXY_PAYLOAD_NAMES);
   return {
     schemaVersion: EFFECTIVE_CONTROL_SCHEMA_VERSION,
     compilerVersion: EFFECTIVE_CONTROL_COMPILER_VERSION,
@@ -226,6 +237,9 @@ function parseManifest(source: string): EffectiveProxyManifest {
     files: {
       "network-policy.json": digest(files["network-policy.json"], "network policy digest"),
       "oauth-mediation-policy.json": digest(files["oauth-mediation-policy.json"], "OAuth policy digest"),
+      ...(Object.hasOwn(files, "mcp-operation-policy.json")
+        ? { "mcp-operation-policy.json": digest(files["mcp-operation-policy.json"], "MCP operation policy digest") }
+        : {}),
     },
   };
 }
@@ -259,6 +273,18 @@ export function loadEffectiveProxyControl(root = effectiveProxyRootFromEnv() ?? 
   const networkPolicy = validateNetworkPolicy(parseStrictJson(networkSource), networkPolicyPath);
   if (networkPolicy.generation !== manifest.policyGeneration) throw new Error("selected network policy generation does not match its manifest");
   const oauthPolicy = validateOAuthMediationPolicy(parseStrictJson(oauthSource), oauthPolicyPath);
+  // The MCP operation policy travels in the generation, digest-verified with
+  // the other payloads, never as a separately mounted file: a host rename
+  // under a single-file bind mount leaves the container reading a stale or
+  // truncated inode.
+  let mcpOperationPolicy: LoadedMcpOperationPolicy | undefined;
+  const mcpDigest = manifest.files["mcp-operation-policy.json"];
+  if (mcpDigest !== undefined) {
+    const mcpPolicyPath = path.join(generationDirectory, "mcp-operation-policy.json");
+    const mcpSource = readRegularFile(mcpPolicyPath, "effective MCP operation policy");
+    if (sha256(mcpSource) !== mcpDigest) throw new Error("selected effective proxy payload digest does not match its manifest");
+    mcpOperationPolicy = validateMcpOperationPolicy(parseStrictJson(mcpSource), mcpPolicyPath);
+  }
 
   // The pointer is the only mutable selector. If it changed while the immutable
   // files were read, reject this attempt; the next level-triggered poll loads
@@ -266,5 +292,13 @@ export function loadEffectiveProxyControl(root = effectiveProxyRootFromEnv() ?? 
   if (readRegularFile(activePath, "active effective control selection") !== activeSource) {
     throw new Error("active effective control selection changed while loading");
   }
-  return { active, manifest, networkPolicy, networkPolicyPath, oauthPolicy, oauthPolicyPath };
+  return {
+    active,
+    manifest,
+    networkPolicy,
+    networkPolicyPath,
+    ...(mcpOperationPolicy ? { mcpOperationPolicy } : {}),
+    oauthPolicy,
+    oauthPolicyPath,
+  };
 }

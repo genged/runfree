@@ -72,7 +72,6 @@ export const RUNTIME_COMPOSE_INTERPOLATION_PROJECTIONS_V2 = Object.freeze({
   RUNFREE_GIT_COMMON_DIR: "session-template-input",
   RUNFREE_GIT_CONFIG: "session-template-input",
   RUNFREE_INBOX_DIR: "session-template-input",
-  RUNFREE_MCP_OPERATION_POLICY_HOST_PATH: "control-plane-topology-input",
   RUNFREE_PROJECT_COMPAT_ROOT: "session-template-input",
   RUNFREE_PROJECT_CONTAINER_ROOT: "session-template-input",
   RUNFREE_PROJECT_ID: "shared-topology-input",

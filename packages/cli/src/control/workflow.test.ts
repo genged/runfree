@@ -791,6 +791,33 @@ describe("quiesced control workflow", () => {
       .toMatchObject({ providers: { "mcp:example": { kind: "mcp", resourceHost: "example.com" } } });
   });
 
+  test("pairs the prepared MCP operation policy into the selected generation, and refuses a corrupt one before selecting", async () => {
+    const policyPath = context.project.paths.mcpOperationPolicyPath ?? path.join(context.project.paths.stateDir, "mcp-operation-policy.json");
+    const prepared = {
+      schemaVersion: 1,
+      servers: [{ id: "claude:project:ahrefs", agent: "claude", name: "ahrefs", source: "project", host: "api.ahrefs.com", path: "/mcp/mcp" }],
+    };
+    fs.mkdirSync(path.dirname(policyPath), { recursive: true });
+    fs.writeFileSync(policyPath, JSON.stringify(prepared));
+    const interactive = io();
+    interactive.isInteractive = () => true;
+    interactive.confirm = () => true;
+
+    const startup = await prepareEffectiveControlsForStartup(context, interactive);
+    expect(JSON.parse(fs.readFileSync(path.join(startup.generation.proxyDirectory, "mcp-operation-policy.json"), "utf8")))
+      .toEqual(prepared);
+
+    // A truncated host file (a torn write) is refused; the selection stays.
+    const selected = readActiveControlSelection(context.project);
+    fs.writeFileSync(policyPath, JSON.stringify(prepared).slice(0, 40));
+    expect(() => useApprovedPolicyGeneration(context)).toThrow();
+    expect(readActiveControlSelection(context.project)).toEqual(selected);
+
+    // Reclaim: the next prepare rewrites the file and publication resumes.
+    fs.writeFileSync(policyPath, JSON.stringify(prepared));
+    expect(useApprovedPolicyGeneration(context).controlGeneration).toBe(startup.generation.controlGeneration);
+  });
+
   test("projects only host-owned OAuth handles and declared parameter values into effective controls", async () => {
     const appleAds = service("apple-ads");
     if (!appleAds) throw new Error("apple-ads service missing");

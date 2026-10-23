@@ -145,11 +145,8 @@ test("runtime security contract includes the fixed proxy invariants and is agent
     containerPath: "/app/runfree-effective",
     requiredMode: "ro",
   }));
-  expect(proxy?.mounts).toContainEqual(expect.objectContaining({
-    code: "proxy-mcp-operation-policy-read-only",
-    containerPath: "/app/proxy/mcp-operation-policy.json",
-    requiredMode: "ro",
-  }));
+  // The MCP operation policy is an effective-generation payload, not a mount.
+  expect(proxy?.mounts.some((mount) => mount.containerPath.includes("mcp-operation-policy"))).toBe(false);
   expect(proxy?.mounts).toContainEqual(expect.objectContaining({
     code: "proxy-token-store-tmpfs",
     containerPath: "/run/runfree-proxy-secrets",
@@ -221,7 +218,6 @@ function validStartupEvidence(contract: ReturnType<typeof createRuntimeSecurityC
           Type: "bind",
           RW: false,
         },
-        { Destination: "/app/proxy/mcp-operation-policy.json", Type: "bind", RW: false },
       ], {
         "/run/runfree-proxy-secrets": "",
         "/run/runfree-proxy-audit": "",
@@ -302,18 +298,18 @@ test("startup refuses a read-only proxy mount that Docker inspect reports writab
   const contract = createRuntimeSecurityContract(makeActivePlan(projectRoot));
   const evidence = validStartupEvidence(contract);
   const policyMount = evidence.proxy.inspect.Mounts
-    ?.find((mount) => mount.Destination === "/app/proxy/mcp-operation-policy.json");
-  if (!policyMount) throw new Error("test fixture missing mcp operation policy mount");
+    ?.find((mount) => mount.Destination === "/app/runfree-effective");
+  if (!policyMount) throw new Error("test fixture missing effective control mount");
   policyMount.RW = true;
 
   const { boundaryViolated, proof } = startupProof(contract, evidence);
 
-  expect(evidence.proxy.mountProbes["/app/proxy/mcp-operation-policy.json"].options).toBe("ro,relatime");
+  expect(evidence.proxy.mountProbes["/app/runfree-effective"].options).toMatch(/^ro,/);
   expect(proof.ok).toBe(false);
   expect(proof.issues).toContainEqual({
-    code: "proxy-mcp-operation-policy-read-only",
+    code: "proxy-effective-control-read-only",
     container: "proxy",
-    detail: "/app/proxy/mcp-operation-policy.json is not mounted as ro",
+    detail: "/app/runfree-effective is not mounted as ro",
   });
   expect(boundaryViolated).toBe(true);
 });
