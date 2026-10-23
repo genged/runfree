@@ -48,11 +48,12 @@ arguments, ids, or output. See
 
 A failure's last line states what did not happen in your nouns ("claude did
 not start", "nothing was destroyed"). A next step is always a complete
-`runfree ...` command you can paste; a widening suggestion for a host rule
-reproduces the host's whole current rule, because `runfree host rules` with
-any rule flag replaces the rule rather than adding to it. A policy change made
-before the runtime is started reports `effective policy: saved; applies when
-the runtime starts` and exits 0.
+`runfree ...` command you can paste. A widening suggestion for a host rule
+repeats the host's whole current rule plus the change, and prints the rule you
+get. `runfree host rules` changes only the fields its flags name, but a new
+`--method` or `--request-path-prefix` list replaces the old list. A policy
+change made before the runtime is started reports `effective policy: saved;
+applies when the runtime starts` and exits 0.
 
 ## First Run
 
@@ -141,13 +142,21 @@ Session Recovery](architecture.md#interrupted-session-recovery).
 
 Runfree policy is exact-host based. There are no wildcard hosts.
 
-`.runfree/network-policy.json` is writable desired policy, version 2 or 3.
-Runfree writes version 3 only when the content needs it: a credential
-destination with the `basic` scheme, a `username`, or a `protocol` scope, or
-two destinations for one host and header within the direct `tokens` or within
-one service entry. Otherwise the file stays version 2; a version 2 file that
-uses these is refused with the fields named, and older releases refuse
-version 3 with `version must be 2`. Editing the file does
+`.runfree/network-policy.json` is writable desired policy, version 2, 3, or 4.
+Runfree writes the lowest version that holds the content:
+
+- Version 4: a service entry has request rule settings
+  (`services.<id>.selection.hostRules`, written by `host rules` on a service
+  host).
+- Version 3: a credential destination with the `basic` scheme, a `username`,
+  or a `protocol` scope, or two destinations for one host and header within
+  the direct `tokens` or within one service entry.
+- Version 2: everything else.
+
+A file that declares a lower version than its content needs is refused with
+the fields named. Older releases refuse a newer version: releases that read
+only version 2 say `version must be 2`, and releases that read versions 2 and
+3 say `version must be one of: 2, 3`. Editing the file does
 not change a running proxy or authorize the next start. Runfree captures it
 while project agents are quiesced, compares it with host-owned approvals, and
 compiles an immutable effective policy generation only after exact approval.
@@ -187,7 +196,50 @@ runfree host rules <host> --write allow|ask|deny
 runfree host rules <host> --clear
 ```
 
-`--read-only` is shorthand for `GET`, `HEAD`, and `OPTIONS`. Re-running `host add` or `host rules` with request-rule flags replaces that host's request rules. `host rules --write` sets the action for write-class requests to that host.
+`--read-only` is shorthand for `GET`, `HEAD`, and `OPTIONS`. `host rules --write` sets the action for write-class requests to that host.
+
+`host add` and `host rules` with request-rule flags change only the fields
+those flags set. The other fields of the host's rule stay. A field you give
+again replaces that field: a new `--method` list replaces the old list.
+`--clear` removes the whole rule; there is no way to remove one field.
+
+A host that an enabled service allows gets its rule from that service. On
+such a host, `host rules` stores your setting with the service, in
+`services.<id>.selection.hostRules`. The enforced rule is the service's rule
+with your fields laid over it. `service disable` removes your setting with the
+service. Only the permission fields can be set (`--method`,
+`--request-path-prefix`, `--read-only`, `--deny-git-push`, `--write`). The
+service's own classification fields, such as GraphQL endpoints and read path
+prefixes, stay. If the service sets the methods or path prefixes (an OAuth
+token endpoint), your setting can only narrow them.
+
+- Run `host rules` in the layer that holds the service entry: with `--local`
+  for a checkout-local service, without it for a project service.
+- If two services allow the host, name the owner with `--service <id>`.
+- `host add <host>` with rule flags on a service host is refused. Add the host
+  without rule flags, then use `host rules`.
+- `host remove` on a host that only a service allows is refused. The message
+  names `service disable <id>`, and `service enable <id> --skip-host <host>`
+  when the service can skip that host.
+- An older policy can hold a direct rule on a host where a service also sets
+  a rule. The direct rule replaces the service's whole rule. A set on such a
+  host is refused and names `runfree host rules <host> --clear`. The first
+  `--clear` removes the direct rule; a second `--clear` removes your service
+  setting.
+
+`host rules <host>` without flags prints the enforced rule and who owns it:
+
+```text
+scope: project
+github.com: methods=all pathPrefixes=all gitPush=deny
+owner: service github (project)
+  service rule: gitPush=write
+  your setting: gitPush=deny
+```
+
+The owner is `service <id> (<layer>)`, `direct (<layer>)`, or `none`. A set or
+`--clear` prints the owner and the enforced rule `before:` and `after:` the
+change.
 
 `--local` writes the checkout-local ignored desired layer; project scope is the
 default.
@@ -428,10 +480,27 @@ release does not upgrade it and does not warn. `runfree service diff` prints
 `<id> (<layer>): revision <old> -> <new>` with the resolved semantics before
 and after, and `runfree service diff --apply` writes the new entries.
 
-`--apply` keeps each entry's recorded selection: skipped hosts and write mode.
-Re-running `runfree service enable <id>` also writes the current revision, but
-it builds the entry only from that run's flags, so an earlier `--skip-broad`,
-`--skip-host`, `--read-only`, or `--allow-write` is lost unless you repeat it.
+`--apply` keeps each entry's recorded selection: skipped hosts, write mode,
+and the request rule settings made with `host rules`. Re-running
+`runfree service enable <id>` also writes the current revision. It keeps the
+`host rules` settings, but it builds the rest of the entry only from that
+run's flags, so an earlier `--skip-broad`, `--skip-host`, `--read-only`, or
+`--allow-write` is lost unless you repeat it. `service configure` keeps the
+whole selection.
+
+A saved `host rules` setting must still fit the entry. `service diff --apply`
+refuses before it writes if the new revision no longer allows a host that has
+a setting, or if a setting is broader than the new revision's methods or path
+prefixes for that host. A `service enable` that newly skips such a host is
+refused the same way. Each refusal names
+`runfree host rules <host> --clear`. Without `--apply`, `service diff` lists
+these as `refuses:` lines.
+
+`service enable` and `service diff --apply` also check for a direct rule on
+one of the service's hosts. A direct rule equal to the service's rule moves to
+the service, with a notice; `service disable` then removes it. A different
+direct rule stays and replaces the service's rule, with a warning that names
+`runfree host rules <host> --clear`.
 
 A `github` or `gitlab` service enabled at an older revision gets no
 git-over-HTTPS credential until you run `runfree service diff --apply`.

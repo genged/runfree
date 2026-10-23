@@ -234,9 +234,19 @@ Order, hardening, and firewall rules:
 6. The project `.runfree/config/agent.env` is ignored. The agent environment
    comes from the selected effective policy generation.
 7. A policy an older reader would misread never reaches one. Desired policy
-   is version 3 only when it uses a field older releases do not know (see
-   [Older Readers](#older-readers)); those releases refuse it. A CLI applies
-   policy only to a proxy built from its own embedded assets.
+   is version 3 or 4 only when it uses a field older releases do not know
+   (see [Older Readers](#older-readers)); those releases refuse it. A CLI
+   applies policy only to a proxy built from its own embedded assets.
+8. A `host rules` setting on a service host is stored in the service entry
+   (`selection.hostRules`). It is valid only for a host in the service's
+   resolved hosts, so it never adds an allowlist entry. It holds only
+   permission fields: methods, path prefixes, the write action, and
+   `gitPush: "deny"`. The service's classification fields (read and write
+   path prefixes, GraphQL endpoints, the git handling rule) stay, so a
+   setting cannot turn a GraphQL mutation into an unclassified `POST`. Where
+   the service sets methods or path prefixes, a setting can only narrow them;
+   a broader one is refused before any write. A setting can loosen the write
+   action, as `host rules --write allow` can on any host.
 
 ### Credentials
 
@@ -304,7 +314,9 @@ rule instead.
 2. **An approved push succeeds.** A push that write approval allows goes out
    with your token, so approving a git push is a real decision. Write
    approval is the effective control. The default write posture is `ask`;
-   `--deny-git-push` refuses pushes before any connection or token read.
+   `--deny-git-push` refuses pushes before any connection or token read. It
+   does not refuse Git LFS uploads: an upload batch is an ordinary write under
+   the host's write action.
 3. **The credential is attached only to recognized git requests.** The
    request must be one of the listed method and path forms, with no path
    confusion; the raw path and its decoded form must both end with the plain
@@ -427,6 +439,11 @@ upgrade, a proxy still running the previous build.
   version 3 refuse such a file (`version must be 2`), so they cannot drop a
   `protocol` scope and inject on the whole host. Any other file stays version
   2, with an unchanged digest.
+- Desired policy becomes version 4 only when a service entry has
+  `selection.hostRules`. Releases without version 4 refuse such a file
+  (`version must be 2`, or `version must be one of: 2, 3`), so they cannot
+  drop a `--deny-git-push` set on a service host. They also refuse the
+  unknown `hostRules` field.
 - An effective policy generation is published only to a proxy of the same
   build. Policy commands compare the running proxy's image-input label (a
   missing label counts as another build) with the proxy this CLI embeds; on a

@@ -751,7 +751,8 @@ not the proxy's runtime policy.
 
 The version changes only when an older reader would misread the content.
 Runfree writes the lowest version that can hold the content, so most
-projects stay on version 2; git credential destinations need version 3.
+projects stay on version 2; git credential destinations need version 3, and
+`host rules` settings on a service host need version 4.
 Older releases refuse a newer file instead of dropping fields they do not
 know. The exact triggers are in [cli.md](cli.md#network-policy).
 
@@ -780,9 +781,13 @@ know. The exact triggers are in [cli.md](cli.md#network-policy).
 The direct allowlist is exact hostnames only. `services` entries, when present,
 contain the complete pinned resolved semantics that were reviewed: definition
 digest, revision, selected exclusions/write mode, hosts, requests, token
-destinations, and OAuth topology. The compiler overlays project and
-checkout-local desired layers, expands services, rejects ownership conflicts,
-and emits the narrow effective policy. Token values remain separate host-owned
+destinations, and OAuth topology. A service's selection can also hold
+`hostRules`: per-host permission fields set with `host rules`. The compiler
+overlays project and checkout-local desired layers, expands services, lays
+each service's `hostRules` over its resolved request rule for that host (the
+service stays the rule's one owner), rejects ownership conflicts, and emits
+the narrow effective policy. A direct `requests` rule on a service host still
+replaces the service's whole rule. Token values remain separate host-owned
 inputs and are streamed only to proxy-side state after convergence.
 
 Write action precedence is:

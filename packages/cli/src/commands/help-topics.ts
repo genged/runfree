@@ -88,9 +88,9 @@ Allow exact hosts:
   runfree host remove <host> [--local]
   runfree host list
   runfree host explain <host>
-  runfree host rules <host> [--write allow|ask|deny] [--local]
-  runfree host rules <host> [--read-only] [--method <M>]... [--request-path-prefix /path/] [--local]
-  runfree host rules <host> [--clear] [--local]
+  runfree host rules <host> [--write allow|ask|deny] [--service <id>] [--local]
+  runfree host rules <host> [--read-only] [--method <M>]... [--request-path-prefix /path/] [--deny-git-push] [--service <id>] [--local]
+  runfree host rules <host> [--clear] [--service <id>] [--local]
 
 Approve a service on the host's loopback (agent reaches 127.0.0.1:<port>):
   runfree host-service add <name> --port <port> [--local] [--no-reload]
@@ -399,15 +399,17 @@ Network policy:
   runfree host add <host> [--read-only | --method <M>]... [--request-path-prefix /path/]... [--deny-git-push] [--local] [--no-reload]
       Add a host to the allowlist and optionally restrict its requests.
       --read-only is shorthand for --method GET --method HEAD --method OPTIONS.
-      Re-running with rule flags replaces the host's request rules.
+      Rule flags change only the fields they set; a new --method list replaces the old list.
   runfree host remove <host> [--local] [--no-reload]
       Remove an unreferenced host from the allowlist
   runfree host list
       Print allowlisted hosts
   runfree host explain <host>
       Show a host's allowlist status, credentials, and request rules
-  runfree host rules <host> [--write allow|ask|deny] [--read-only | --method <M>]... [--request-path-prefix /path/]... [--deny-git-push] [--clear] [--local] [--no-reload]
-      Show/change effective request rules; --write sets write handling, rule flags replace request-shape rules, and --clear removes rules
+  runfree host rules <host> [--write allow|ask|deny] [--read-only | --method <M>]... [--request-path-prefix /path/]... [--deny-git-push] [--clear] [--service <id>] [--local] [--no-reload]
+      Show/change effective request rules and their owner; each flag sets only its own field, and --clear removes the rule.
+      On a service host the setting is stored with the service and removed by service disable;
+      --service <id> names the owner when several services allow the host.
   runfree host-service add <name> --port <port> [--local] [--no-reload]
       Approve agent access to 127.0.0.1:<port> on the host. Refuses Docker Engine, runfree's own ports,
       a port with no visible listener, and a Docker Desktop-owned port; review names the listening process.
