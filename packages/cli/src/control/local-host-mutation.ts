@@ -1,5 +1,6 @@
 import {
   canonicalDesiredNetworkPolicy,
+  serviceHostRuleGitPushFits,
   serviceHostRuleNarrowingIssues,
   validateDesiredNetworkPolicy,
   withRequiredDesiredNetworkPolicyVersion,
@@ -9,7 +10,6 @@ import {
 import { isReservedRunfreeHostname } from "@runfree/runtime-contracts/host-services";
 import {
   HTTP_METHODS,
-  hostRulesCommand,
   isHttpMethod,
   normalizeHostname,
   normalizePathPrefix,
@@ -39,6 +39,7 @@ import {
   assertServiceLayer,
   directRuleFor,
   hostRuleProviders,
+  hostRulesRemedy,
   layerPolicyLabel,
   legacyDirectRuleMessage,
   namedProvider,
@@ -49,6 +50,7 @@ import {
   unskippableServiceHostReason,
   type HostRuleOwner,
   type HostRulePair,
+  type HostRulesRequest,
 } from "./host-rule-owner.ts";
 import { withQuiescedProject } from "./quiesce.ts";
 
@@ -78,6 +80,8 @@ export type DesiredHostMutationResult = {
   changed: boolean;
   digest: string;
   host: string;
+  // Stdout lines that explain an unchanged result.
+  notices: string[];
   owner: HostRuleOwnerLabel;
   ownerLayer?: DesiredHostScope;
   scope: DesiredHostScope;
@@ -153,10 +157,10 @@ function normalizeMutationHost(host: string): string {
 }
 
 function pairFor(
-  candidate: { local: DesiredNetworkPolicyJson; project: DesiredNetworkPolicyJson },
+  candidate: HostRulePair,
   scope: DesiredHostScope,
   policy: DesiredNetworkPolicyJson,
-): { local: DesiredNetworkPolicyJson; project: DesiredNetworkPolicyJson } {
+): HostRulePair {
   return scope === "local"
     ? { project: candidate.project, local: policy }
     : { project: policy, local: candidate.local };
@@ -256,8 +260,17 @@ function patchServiceSetting(
   const entry = editedServiceEntry(policy, owner.id);
   const provider = { entry, id: owner.id, layer: owner.layer };
   const next: DesiredServiceHostRule = { ...serviceSettingFor(provider, host), ...delta };
-  // Named here, before any write; the schema refuses the same (spec §4.5).
-  const issues = serviceHostRuleNarrowingIssues(serviceRuleFor(provider, host), next);
+  const serviceRule = serviceRuleFor(provider, host);
+  // Named here, before any write; the schema refuses the same. A git push
+  // deny replaces only the service's own git handling rule.
+  if (!serviceHostRuleGitPushFits(serviceRule, next)) {
+    throw new CliError(
+      `service ${owner.id} has no git handling for ${host}, so --deny-git-push cannot be set there; restrict it with --method or --write deny instead, e.g.: ${
+        hostRulesRemedy(host, { kind: "set", delta: { writeAction: "deny" } }, owner)}`,
+    );
+  }
+  // Spec §4.5.
+  const issues = serviceHostRuleNarrowingIssues(serviceRule, next);
   if (issues.length > 0) {
     throw new CliError(
       `service ${owner.id} sets the methods or path prefixes for ${host}, and a host rule there can only narrow them: ${issues.join("; ")}`,
@@ -270,7 +283,8 @@ function patchServiceSetting(
  * `--clear` removes one thing per run, in this order (plan R7): the edited
  * layer's direct rule; else refuse while the other layer holds a direct rule
  * on this service host; else the owning service's setting. Nothing to clear
- * leaves the policy unchanged.
+ * leaves the policy unchanged; the returned notices say why when the
+ * operator named a service.
  */
 function clearHostRule(
   pair: HostRulePair,
@@ -278,16 +292,16 @@ function clearHostRule(
   scope: DesiredHostScope,
   host: string,
   service: string | undefined,
-): void {
+): string[] {
   if (directRuleFor(policy, host) !== undefined) {
     removeDirectRule(policy, host);
-    return;
+    return [];
   }
   const providers = hostRuleProviders(pair, host);
   const named = namedProvider(providers, host, service);
   if (providers.length === 0) {
     assertDirectHost(pair, scope, host);
-    return;
+    return [];
   }
   const other = otherLayer(scope);
   if (directRuleFor(pair[other], host) !== undefined) {
@@ -299,7 +313,7 @@ function clearHostRule(
         remedy.hostRulesClear(host, { local: other === "local" })}`);
   }
   const holders = (named ? [named] : providers).filter((provider) => serviceSettingFor(provider, host) !== undefined);
-  if (holders.length === 0) return;
+  if (holders.length === 0) return named ? [`service ${named.id} has no host rule setting for ${host}`] : [];
   if (holders.length > 1) {
     throw new CliError([
       `${host} has settings in ${holders.length} services (${holders.map((provider) => provider.id).join(", ")}); name one:`,
@@ -307,7 +321,7 @@ function clearHostRule(
     ].join("\n"));
   }
   const target = holders[0];
-  assertServiceLayer(target, scope, host);
+  assertServiceLayer(target, scope, host, { kind: "clear" });
   const entry = editedServiceEntry(policy, target.id);
   const hostRules = { ...entry.selection?.hostRules };
   delete hostRules[host];
@@ -316,6 +330,7 @@ function clearHostRule(
   const nextSelection = Object.keys(hostRules).length > 0 ? { ...selection, hostRules } : selection;
   if (Object.keys(nextSelection).length > 0) entry.selection = nextSelection;
   else delete entry.selection;
+  return [];
 }
 
 function serviceOnlyHostRemoveRefusal(host: string, providers: ReturnType<typeof hostRuleProviders>, scope: DesiredHostScope): CliError {
@@ -344,31 +359,29 @@ function mutatePolicy(
   pair: HostRulePair,
   mutation: DesiredHostMutation,
   scope: DesiredHostScope,
-): { changed: boolean; host: string; policy: DesiredNetworkPolicyJson } {
+): { changed: boolean; host: string; notices: string[]; policy: DesiredNetworkPolicyJson } {
   const policy = structuredClone(pair[scope]);
   const host = normalizeMutationHost(mutation.host);
   const before = canonicalDesiredNetworkPolicy(policy);
   const layer = layerPolicyLabel(scope);
+  let notices: string[] = [];
 
   if (mutation.kind === "add") {
     const delta = hasRequestRuleFlags(mutation.requestRule) ? requestRule(mutation.requestRule) : undefined;
-    if (delta) {
-      // A direct rule on a service host would replace the service's rule
-      // (spec §4.6, plan R5): the rule belongs with the service.
-      const providers = hostRuleProviders(pair, host);
-      if (providers.length > 0) {
-        const provider = providers.find((candidate) =>
-          serviceRuleFor(candidate, host) !== undefined || serviceSettingFor(candidate, host) !== undefined) ?? providers[0];
-        const rules = [
-          hostRulesCommand(host, delta).command,
-          ...(provider.layer === "local" ? ["--local"] : []),
-          ...(providers.length > 1 ? ["--service", provider.id] : []),
-        ].join(" ");
-        throw new CliError(`${host} gets its request rules from service ${provider.id}; add it without rule flags and set them with: ${rules}`);
-      }
-    }
     if (!policy.hosts.includes(host)) policy.hosts = [...policy.hosts, host].sort();
-    if (delta) patchDirectRule(policy, host, delta);
+    if (delta) {
+      // The rule goes where `host rules` would put it, with the host added.
+      // A direct rule on a host whose rule a service owns would replace the
+      // service's rule (spec §4.6, plan R5): that rule belongs with the
+      // service. A service host the service sets no rule for stays direct (R3).
+      const request: HostRulesRequest = { kind: "set", delta };
+      const owner = resolveHostRuleOwner({ host, scope, pair: pairFor(pair, scope, policy), request });
+      if (owner.kind === "service") {
+        throw new CliError(`${host} gets its request rules from service ${owner.id}; add it without rule flags and set them with: ${
+          hostRulesRemedy(host, request, owner)}`);
+      }
+      patchDirectRule(policy, host, delta);
+    }
   } else if (mutation.kind === "remove") {
     if (!policy.hosts.includes(host)) {
       const providers = hostRuleProviders(pair, host);
@@ -389,10 +402,10 @@ function mutatePolicy(
     }
     const service = mutation.service?.toLowerCase();
     if (mutation.clear) {
-      clearHostRule(pair, policy, scope, host, service);
+      notices = clearHostRule(pair, policy, scope, host, service);
     } else {
-      const owner = resolveHostRuleOwner({ host, scope, pair, service });
       const delta = requestRule(ruleInput ?? NO_RULE_FLAGS, mutation.write);
+      const owner = resolveHostRuleOwner({ host, scope, pair, request: { kind: "set", delta }, service });
       if (Object.keys(delta).length > 0) {
         if (owner.kind === "direct") patchDirectRule(policy, host, delta);
         else patchServiceSetting(policy, owner, host, delta);
@@ -403,7 +416,7 @@ function mutatePolicy(
   // A hostRules setting needs desired policy version 4, and clearing the last
   // one lowers it again: the edited layer declares what its content needs.
   const validated = validateDesiredNetworkPolicy(withRequiredDesiredNetworkPolicyVersion(policy));
-  return { changed: canonicalDesiredNetworkPolicy(validated) !== before, host, policy: validated };
+  return { changed: canonicalDesiredNetworkPolicy(validated) !== before, host, notices, policy: validated };
 }
 
 // The refusal nouns this family has always used: `checkout-local policy` in the
@@ -435,6 +448,8 @@ export async function readDesiredHostRules(
   io: RuntimeIO,
   scope: DesiredHostScope,
   rawHost: string,
+  // `--service` without set flags: it must name a provider of the host.
+  service?: string,
 ): Promise<DesiredHostRulesResult> {
   return withQuiescedProject(context, io, () => {
     const candidate = captureDesiredPolicyCandidate(context.projectRoot, context.project.paths.controlCandidatesDir);
@@ -453,6 +468,7 @@ export async function readDesiredHostRules(
       throw new CliError(`${host} is not allowlisted in project or checkout-local policy; add it with: ${
         remedy.hostAdd(host, { local: scope === "local" })}`);
     }
+    namedProvider(hostRuleProviders(pair, host), host, service?.toLowerCase());
     const owner = compiledRuleOwner(compiled, host);
     const enforced = compiledRule(compiled, host);
     const result: DesiredHostRulesResult = { host, scope, ...owner, ...(enforced ? { enforced } : {}) };
@@ -482,12 +498,17 @@ export async function mutateDesiredHost(
       if (scope === "local") ensureCheckoutLocalPolicyExcluded(context.projectRoot, io, context.env);
     },
     plan: (before) => {
-      const planned = mutatePolicy(approvedPair(context, before, scope), mutation, scope);
+      const pair = approvedPair(context, before, scope);
+      const planned = mutatePolicy(pair, mutation, scope);
       // Schema validation sees one layer; only the compiler resolves project and
       // local together. Compile the planned pair before the write so no host
       // mutation can persist a desired policy that later refuses to compile.
-      const compiledBefore = compileDesiredPolicies({ project: before.project, local: before.local });
-      const compiledAfter = compileDesiredPolicies(pairFor(before, scope, planned.policy));
+      compileDesiredPolicies(pairFor(before, scope, planned.policy));
+      // What the operator is shown (owner, before, after, warnings) reads the
+      // pair owner resolution used (plan R1): the other layer as approved,
+      // never its unapproved worktree file.
+      const compiledBefore = compileDesiredPolicies(pair);
+      const compiledAfter = compileDesiredPolicies(pairFor(pair, scope, planned.policy));
       const warnings = compiledWarnings(compiledBefore, compiledAfter, mutation, planned.host);
       const ruleBefore = compiledRule(compiledBefore, planned.host);
       const ruleAfter = compiledRule(compiledAfter, planned.host);
@@ -505,6 +526,7 @@ export async function mutateDesiredHost(
       changed: plan.changed,
       digest: desiredLayerSubject(candidate, scope).digest,
       host: plan.host,
+      notices: plan.notices,
       owner: plan.owner,
       ...(plan.ownerLayer ? { ownerLayer: plan.ownerLayer } : {}),
       scope,

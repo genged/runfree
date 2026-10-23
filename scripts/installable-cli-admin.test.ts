@@ -97,6 +97,14 @@ describe("installable runfree CLI: admin policy", () => {
       "before: none (all methods, all paths, git push allowed)",
       "after: methods=all pathPrefixes=all gitPush=allow writeAction=deny",
     ].join("\n"));
+    // C5: a --clear aimed at a service with no setting for the host says so.
+    const noSetting = runCli(["host", "rules", "kept-a.example.com", "--clear", "--service", "user-rules-kept", "--no-reload"]);
+    expect(noSetting.status, noSetting.stderr).toBe(0);
+    expect(noSetting.stdout).toContain("kept-a.example.com unchanged\nservice user-rules-kept has no host rule setting for kept-a.example.com\n");
+    // C2: a show with --service checks that the service provides the host.
+    const wrongService = runCli(["host", "rules", "kept-b.example.com", "--service", "user-other"]);
+    expect(wrongService.status).toBe(1);
+    expect(wrongService.stderr).toContain("service user-other does not provide kept-b.example.com; services that provide it: user-rules-kept");
     selectCurrentDesiredControlsForTsCliProject();
     hostRuleService("user-rules-kept", 2, ["kept-a.example.com", "kept-b.example.com", "kept-c.example.com"]);
 

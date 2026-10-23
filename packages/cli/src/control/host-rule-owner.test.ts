@@ -1,9 +1,15 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+
 import type { DesiredNetworkPolicyJson, DesiredServiceEntry } from "@runfree/runtime-contracts/desired-network-policy";
 import type { RequestPolicyJson } from "@runfree/runtime-contracts/network-policy";
 import { describe, expect, test } from "vitest";
 
+import { parseEmittedCommandArgs } from "../commands/app.ts";
+import { createCommandContext } from "../commands/context.ts";
 import { CliError } from "../errors.ts";
-import { hostRuleProviders, resolveHostRuleOwner, type HostRulePair } from "./host-rule-owner.ts";
+import { hostRuleProviders, resolveHostRuleOwner as resolveOwner, type HostRulePair } from "./host-rule-owner.ts";
 
 const DIGEST = `sha256:${"b".repeat(64)}`;
 
@@ -26,6 +32,13 @@ function layer(partial: Partial<DesiredNetworkPolicyJson> = {}): DesiredNetworkP
 
 function pair(project: Partial<DesiredNetworkPolicyJson> = {}, local: Partial<DesiredNetworkPolicyJson> = {}): HostRulePair {
   return { project: layer(project), local: layer(local) };
+}
+
+// The set these cases resolve: `--deny-git-push`.
+const DENY_PUSH = { kind: "set" as const, delta: { gitPush: "deny" as const } };
+
+function resolveHostRuleOwner(input: Omit<Parameters<typeof resolveOwner>[0], "request"> & { request?: Parameters<typeof resolveOwner>[0]["request"] }) {
+  return resolveOwner({ request: DENY_PUSH, ...input });
 }
 
 function refusal(action: () => unknown): string {
@@ -96,8 +109,8 @@ describe("resolveHostRuleOwner", () => {
       beta: service(["shared.example.com"]),
     };
     const message = refusal(() => resolveHostRuleOwner({ host: "shared.example.com", scope: "project", pair: pair({ services }) }));
-    expect(message).toContain("runfree host rules shared.example.com --service alpha");
-    expect(message).toContain("runfree host rules shared.example.com --service beta");
+    expect(message).toContain("runfree host rules shared.example.com --deny-git-push --service alpha");
+    expect(message).toContain("runfree host rules shared.example.com --deny-git-push --service beta");
 
     expect(resolveHostRuleOwner({ host: "shared.example.com", scope: "project", pair: pair({ services }), service: "alpha" }))
       .toEqual({ kind: "service", id: "alpha", layer: "project" });
@@ -119,11 +132,74 @@ describe("resolveHostRuleOwner", () => {
   test("a service in the other layer refuses in both directions, naming the right form (R2)", () => {
     const projectService = pair({ services: { github: service(["github.com"]) } });
     expect(refusal(() => resolveHostRuleOwner({ host: "github.com", scope: "local", pair: projectService })))
-      .toMatch(/service github, which is enabled in the project desired policy; run the command without --local, e\.g\.: runfree host rules github\.com$/);
+      .toMatch(/service github, which is enabled in the project desired policy; run the command without --local: runfree host rules github\.com --deny-git-push --service github$/);
     const localService = pair({}, { services: { github: service(["github.com"]) } });
     expect(refusal(() => resolveHostRuleOwner({ host: "github.com", scope: "project", pair: localService })))
-      .toMatch(/service github, which is enabled in the checkout-local desired policy; run the command with --local, e\.g\.: runfree host rules github\.com --local$/);
+      .toMatch(/service github, which is enabled in the checkout-local desired policy; run the command with --local: runfree host rules github\.com --deny-git-push --service github --local$/);
     expect(resolveHostRuleOwner({ host: "github.com", scope: "local", pair: localService }))
       .toEqual({ kind: "service", id: "github", layer: "local" });
+  });
+});
+
+// C1: every command a refusal prints is the operator's own command, ready to
+// paste: it parses under the real command app and carries every flag they gave.
+describe("host rules refusal remedies", () => {
+  const delta = { methods: ["GET" as const, "POST" as const], pathPrefixes: ["/api/"], gitPush: "deny" as const, writeAction: "ask" as const };
+  const request = { kind: "set" as const, delta };
+  const userFlags = ["--method", "GET", "--method", "POST", "--request-path-prefix", "/api/", "--deny-git-push", "--write", "ask"];
+
+  function emitted(message: string): string[][] {
+    return Array.from(message.matchAll(/runfree host rules [^\n]*/g), (match) => match[0].split(" ").slice(1));
+  }
+
+  async function expectPasteable(message: string, expected: { local: boolean; service: string }[]): Promise<void> {
+    const commands = emitted(message);
+    expect(commands).toHaveLength(expected.length);
+    const projectRoot = fs.mkdtempSync(path.join(os.tmpdir(), "runfree-host-rule-remedy-"));
+    try {
+      const context = createCommandContext({ projectRoot, invocationCwd: projectRoot, commandName: "", env: { ...process.env } });
+      for (const [index, argv] of commands.entries()) {
+        await parseEmittedCommandArgs(context, argv);
+        const { local, service: id } = expected[index];
+        expect(argv).toEqual(["host", "rules", "shared.example.com", ...userFlags, "--service", id, ...(local ? ["--local"] : [])]);
+      }
+    } finally {
+      fs.rmSync(projectRoot, { recursive: true, force: true });
+    }
+  }
+
+  test("the two-provider refusal names each provider with the user's flags", async () => {
+    const message = refusal(() => resolveHostRuleOwner({
+      host: "shared.example.com",
+      scope: "project",
+      request,
+      pair: pair({ services: { alpha: service(["shared.example.com"]) } }, { services: { beta: service(["shared.example.com"]) } }),
+    }));
+    await expectPasteable(message, [{ local: false, service: "alpha" }, { local: true, service: "beta" }]);
+  });
+
+  test("the other-owner refusal names the owning service with the user's flags", async () => {
+    const message = refusal(() => resolveHostRuleOwner({
+      host: "shared.example.com",
+      scope: "project",
+      request,
+      service: "beta",
+      pair: pair({ services: {
+        alpha: service(["shared.example.com"], { "shared.example.com": { gitPush: "write" } }),
+        beta: service(["shared.example.com"]),
+      } }),
+    }));
+    expect(message).toMatch(/^shared\.example\.com already has a request rule from service alpha; a host rule has one owner, set it with: /);
+    await expectPasteable(message, [{ local: false, service: "alpha" }]);
+  });
+
+  test("the wrong-layer refusal names the right layer with the user's flags", async () => {
+    const message = refusal(() => resolveHostRuleOwner({
+      host: "shared.example.com",
+      scope: "project",
+      request,
+      pair: pair({}, { services: { alpha: service(["shared.example.com"]) } }),
+    }));
+    await expectPasteable(message, [{ local: true, service: "alpha" }]);
   });
 });

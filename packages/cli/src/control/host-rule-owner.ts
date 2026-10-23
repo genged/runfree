@@ -36,7 +36,8 @@ export function layerPolicyLabel(layer: DesiredPolicyLayer): string {
   return layer === "local" ? "checkout-local" : "project";
 }
 
-function ownValue<T>(record: Readonly<Record<string, T>> | undefined, key: string): T | undefined {
+/** An own property of a policy record, never an inherited one such as `__proto__`. */
+export function ownValue<T>(record: Readonly<Record<string, T>> | undefined, key: string): T | undefined {
   return record !== undefined && Object.hasOwn(record, key) ? record[key] : undefined;
 }
 
@@ -87,13 +88,30 @@ export function namedProvider(providers: HostRuleProvider[], host: string, servi
     : `service ${service} does not provide ${host}; services that provide it: ${providers.map((provider) => provider.id).join(", ")}`);
 }
 
+/**
+ * What the operator asked `host rules` to do, so a refusal can print the
+ * same command with the owner and layer fixed: a set with the fields its
+ * flags set, or a `--clear`.
+ */
+export type HostRulesRequest = { kind: "clear" } | { kind: "set"; delta: DesiredServiceHostRule };
+
+/** The operator's command, aimed at `provider` in the layer that holds it. */
+export function hostRulesRemedy(host: string, request: HostRulesRequest, provider: Pick<HostRuleProvider, "id" | "layer">): string {
+  const options = { local: provider.layer === "local", service: provider.id };
+  return request.kind === "clear" ? remedy.hostRulesClear(host, options) : remedy.hostRulesSet(host, request.delta, options);
+}
+
 /** A service's settings live in the layer that holds the service entry (§4.8). */
-export function assertServiceLayer(provider: HostRuleProvider, scope: DesiredPolicyLayer, host: string): void {
+export function assertServiceLayer(
+  provider: HostRuleProvider,
+  scope: DesiredPolicyLayer,
+  host: string,
+  request: HostRulesRequest,
+): void {
   if (provider.layer === scope) return;
   const where = `${host} gets its request rules from service ${provider.id}, which is enabled in the ${layerPolicyLabel(provider.layer)} desired policy`;
-  throw new CliError(provider.layer === "project"
-    ? `${where}; run the command without --local, e.g.: ${remedy.hostRules(host)}`
-    : `${where}; run the command with --local, e.g.: ${remedy.hostRules(host, { local: true })}`);
+  throw new CliError(`${where}; run the command ${provider.layer === "project" ? "without" : "with"} --local: ${
+    hostRulesRemedy(host, request, provider)}`);
 }
 
 export function legacyDirectRuleMessage(host: string, serviceId: string, directLayer: DesiredPolicyLayer): string {
@@ -111,10 +129,12 @@ export function legacyDirectRuleMessage(host: string, serviceId: string, directL
 export function resolveHostRuleOwner(input: {
   host: string;
   pair: HostRulePair;
+  // The set being resolved; refusals repeat its flags.
+  request: Extract<HostRulesRequest, { kind: "set" }>;
   scope: DesiredPolicyLayer;
   service?: string;
 }): HostRuleOwner {
-  const { host, pair, scope } = input;
+  const { host, pair, request, scope } = input;
   const providers = hostRuleProviders(pair, host);
   const named = namedProvider(providers, host, input.service);
   if (providers.length === 0) {
@@ -138,19 +158,19 @@ export function resolveHostRuleOwner(input: {
     if (other) {
       throw new CliError(
         `${host} already has a request rule from service ${other.id}; a host rule has one owner, set it with: ${
-          remedy.hostRulesForService(host, other.id, { local: other.layer === "local" })}`,
+          hostRulesRemedy(host, request, other)}`,
       );
     }
     chosen = named;
   } else if (providers.length > 1) {
     throw new CliError([
-      `${host} is provided by ${providers.length} services (${providers.map((provider) => provider.id).join(", ")}); name the one that owns its rule and repeat your flags:`,
-      ...providers.map((provider) => `  ${remedy.hostRulesForService(host, provider.id, { local: provider.layer === "local" })}`),
+      `${host} is provided by ${providers.length} services (${providers.map((provider) => provider.id).join(", ")}); name the one that owns its rule:`,
+      ...providers.map((provider) => `  ${hostRulesRemedy(host, request, provider)}`),
     ].join("\n"));
   } else {
     chosen = providers[0];
   }
-  assertServiceLayer(chosen, scope, host);
+  assertServiceLayer(chosen, scope, host, request);
   return { kind: "service", id: chosen.id, layer: chosen.layer };
 }
 

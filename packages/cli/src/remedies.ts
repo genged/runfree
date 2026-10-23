@@ -11,6 +11,8 @@
 // unattended operation; a non-TTY alone is not consent to a destructive
 // default, so `rebuildUnattended` is reserved for those callers.
 
+import { hostRulesCommand, type RequestPolicyJson } from "@runfree/runtime-contracts/network-policy";
+
 export const remedy = {
   up: (): string => "runfree up",
   stop: (): string => "runfree stop",
@@ -27,12 +29,16 @@ export const remedy = {
   policyUseApproved: (): string => "runfree policy use-approved",
   hostAdd: (host: string, options: { local?: boolean } = {}): string => `runfree host add ${host}${options.local ? " --local" : ""}`,
   hostExplain: (host: string): string => `runfree host explain ${host}`,
-  hostRules: (host: string, options: { local?: boolean } = {}): string => `runfree host rules ${host}${options.local ? " --local" : ""}`,
+  hostRules: (host: string): string => `runfree host rules ${host}`,
   hostRulesClear: (host: string, options: { local?: boolean; service?: string } = {}): string =>
     `runfree host rules ${host} --clear${options.service ? ` --service ${options.service}` : ""}${options.local ? " --local" : ""}`,
-  // Names the owning service when more than one service provides the host.
-  hostRulesForService: (host: string, id: string, options: { local?: boolean } = {}): string =>
-    `runfree host rules ${host} --service ${id}${options.local ? " --local" : ""}`,
+  // A set repeated with the flags the operator gave (`delta`, the fields
+  // those flags set), the owning service, and the layer that holds it.
+  hostRulesSet: (host: string, delta: RequestPolicyJson, options: { local?: boolean; service?: string } = {}): string => [
+    hostRulesCommand(host, delta).command,
+    ...(options.service ? [`--service ${options.service}`] : []),
+    ...(options.local ? ["--local"] : []),
+  ].join(" "),
   serviceEnable: (id: string): string => `runfree service enable ${id}`,
   serviceDisable: (id: string, options: { local?: boolean } = {}): string => `runfree service disable ${id}${options.local ? " --local" : ""}`,
   // A re-run of `service enable` rebuilds the selection from its own flags,
@@ -105,12 +111,17 @@ export function sampleRemedyRenderings(): string[] {
     remedy.hostAdd("api.example.com", { local: true }),
     remedy.hostExplain("api.example.com"),
     remedy.hostRules("api.example.com"),
-    remedy.hostRules("api.example.com", { local: true }),
     remedy.hostRulesClear("api.example.com"),
     remedy.hostRulesClear("api.example.com", { local: true }),
     remedy.hostRulesClear("api.example.com", { local: true, service: "github" }),
-    remedy.hostRulesForService("api.example.com", "github"),
-    remedy.hostRulesForService("api.example.com", "github", { local: true }),
+    remedy.hostRulesSet("api.example.com", { gitPush: "deny" }, { service: "github" }),
+    remedy.hostRulesSet("api.example.com", {
+      methods: ["GET", "POST"],
+      pathPrefixes: ["/api/"],
+      gitPush: "deny",
+      writeAction: "ask",
+    }, { local: true, service: "github" }),
+    remedy.hostRulesSet("api.example.com", { writeAction: "deny" }),
     remedy.serviceEnable("github"),
     remedy.serviceDisable("github"),
     remedy.serviceDisable("github", { local: true }),

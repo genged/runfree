@@ -156,6 +156,7 @@ export const hostCommand: CommandModule = {
       const result = await mutateDesiredHost(runtime, nodeRuntimeIO, scope, mutation);
       console.log(`scope: ${scope === "local" ? "checkout-local" : "project"}`);
       console.log(`${result.host} ${result.changed ? "updated" : "unchanged"}`);
+      for (const notice of result.notices) console.log(notice);
       if (mutation.kind === "rules" || (mutation.kind === "add" && mutation.requestRule !== undefined)) {
         console.log(ownerLine(result.owner, result.ownerLayer));
         console.log(`before: ${describeRequestRules(result.before)}`);
@@ -171,8 +172,8 @@ export const hostCommand: CommandModule = {
       const activation = await activateApprovedControlsAfterMutation(runtime, nodeRuntimeIO);
       console.log(activationReportLine(activation));
     };
-    const showRules = async (scope: DesiredHostScope, host: string): Promise<void> => {
-      const result = await readDesiredHostRules(context.runtimeContext(), nodeRuntimeIO, scope, host);
+    const showRules = async (scope: DesiredHostScope, host: string, service: string | undefined): Promise<void> => {
+      const result = await readDesiredHostRules(context.runtimeContext(), nodeRuntimeIO, scope, host, service);
       for (const line of hostRulesShowLines(result)) console.log(line);
     };
     return parser.command(
@@ -239,7 +240,7 @@ export const hostCommand: CommandModule = {
               const scope = argv.local ? "local" : "project";
               const requestRule = requestRuleFromArgs(argv);
               if (!argv.clear && argv.write === undefined && requestRule === undefined) {
-                return showRules(scope, argv.host);
+                return showRules(scope, argv.host, argv.service);
               }
               return runMutation(scope, {
                   kind: "rules",
