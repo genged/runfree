@@ -211,11 +211,25 @@ service. Only the permission fields can be set (`--method`,
 `--request-path-prefix`, `--read-only`, `--deny-git-push`, `--write`). The
 service's own classification fields, such as GraphQL endpoints and read path
 prefixes, stay. If the service sets the methods or path prefixes (an OAuth
-token endpoint), your setting can only narrow them.
+token endpoint), your setting can only narrow them. `--deny-git-push` is
+accepted only on a host where the service has git handling (such as
+`github.com`); elsewhere use `--method` or `--write deny`.
+
+A `--write` setting on one host outranks the service's write mode
+(`--read-only` or `--allow-write`) for that host. If your setting is weaker
+than the write mode, for example `--write allow` under a `--read-only`
+service, `service enable`, `service configure`, and `service diff --apply`
+warn and name `runfree host rules <host> --clear --service <id>`.
 
 - Run `host rules` in the layer that holds the service entry: with `--local`
   for a checkout-local service, without it for a project service.
-- If two services allow the host, name the owner with `--service <id>`.
+- If two services allow the host, name the owner with `--service <id>`. A
+  refusal prints your command again with `--service <id>` (and `--local`
+  where needed). Without set flags, `--service <id>` must name a service that
+  allows the host.
+- A checkout-local `service enable <id> --local` replaces the project entry
+  of the same id, so the project entry's `host rules` settings stop applying.
+  The command warns and names the hosts.
 - `host add <host>` with rule flags on a service host is refused. Add the host
   without rule flags, then use `host rules`.
 - `host remove` on a host that only a service allows is refused. The message
@@ -491,16 +505,20 @@ whole selection.
 A saved `host rules` setting must still fit the entry. `service diff --apply`
 refuses before it writes if the new revision no longer allows a host that has
 a setting, or if a setting is broader than the new revision's methods or path
-prefixes for that host. A `service enable` that newly skips such a host is
-refused the same way. Each refusal names
-`runfree host rules <host> --clear`. Without `--apply`, `service diff` lists
-these as `refuses:` lines.
+prefixes for that host, or if it sets `--deny-git-push` on a host where the
+new revision has no git handling. A `service enable` that newly skips such a
+host is refused the same way. Each refusal names
+`runfree host rules <host> --clear --service <id>`, plus `--local` for a
+checkout-local service. Without `--apply`, `service diff` lists every one of
+these as a `refuses:` line.
 
 `service enable` and `service diff --apply` also check for a direct rule on
 one of the service's hosts. A direct rule equal to the service's rule moves to
-the service, with a notice; `service disable` then removes it. A different
-direct rule stays and replaces the service's rule, with a warning that names
-`runfree host rules <host> --clear`.
+the service, with a notice, only when it holds no permission field (no
+methods, path prefixes, write action, or git push deny); `service disable`
+then removes it. Any other direct rule stays and replaces the service's rule,
+with a warning that names `runfree host rules <host> --clear`. A direct rule
+that restricts the host therefore stays after `service disable`.
 
 A `github` or `gitlab` service enabled at an older revision gets no
 git-over-HTTPS credential until you run `runfree service diff --apply`.

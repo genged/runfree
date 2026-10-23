@@ -245,8 +245,15 @@ Order, hardening, and firewall rules:
    path prefixes, GraphQL endpoints, the git handling rule) stay, so a
    setting cannot turn a GraphQL mutation into an unclassified `POST`. Where
    the service sets methods or path prefixes, a setting can only narrow them;
-   a broader one is refused before any write. A setting can loosen the write
-   action, as `host rules --write allow` can on any host.
+   a broader one is refused before any write. `gitPush: "deny"` is accepted
+   only on a host where the service's rule has `gitPush: "write"`, so a
+   setting cannot add git classification (the upload-pack read exemption) to
+   a host the service gives no git handling. A setting can loosen the write
+   action, as `host rules --write allow` can on any host; a per-host write
+   setting outranks the service's write mode, and a weaker one is warned
+   about on each service enable, configure, and `service diff --apply`.
+   `service enable` takes over an identical direct rule only when it holds no
+   permission field, so `service disable` never drops a user's restriction.
 
 ### Credentials
 
