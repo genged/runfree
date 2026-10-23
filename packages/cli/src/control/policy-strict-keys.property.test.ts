@@ -53,7 +53,7 @@ function effectiveSample(): Record<string, unknown> {
 
 function desiredSample(): Record<string, unknown> {
   return {
-    version: 3,
+    version: 4,
     hosts: ["api.example.com"],
     tokens: {
       example: { description: "Example token", credentials: [{ host: "api.example.com", header: "x-api-key", scheme: "raw" }] },
@@ -65,7 +65,11 @@ function desiredSample(): Record<string, unknown> {
       gitlab: {
         revision: 2,
         definitionDigest: digest,
-        selection: { skippedHosts: ["uploads.gitlab.com"], writeMode: "read-only" },
+        selection: {
+          skippedHosts: ["uploads.gitlab.com"],
+          writeMode: "read-only",
+          hostRules: { "gitlab.com": { methods: ["GET"], gitPush: "deny", writeAction: "deny" } },
+        },
         resolved: {
           hosts: ["gitlab.com"],
           requests: { "gitlab.com": FULL_REQUEST_RULE },
@@ -98,6 +102,7 @@ const DESIRED_MAPS = new Set([
   "requests",
   "hostServices",
   "services",
+  "services.*.selection.hostRules",
   "services.*.resolved.tokens",
   "services.*.resolved.requests",
   "services.*.resolved.oauth",
@@ -148,6 +153,7 @@ describe("strict keys at every object path (T14)", () => {
       "",
       "services.gitlab",
       "services.gitlab.selection",
+      "services.gitlab.selection.hostRules.gitlab.com",
       "services.gitlab.resolved",
       "services.gitlab.resolved.tokens.gitlab.credentials.1",
       "services.gitlab.resolved.requests.gitlab.com.graphql",
@@ -159,7 +165,7 @@ describe("strict keys at every object path (T14)", () => {
       "services.gitlab.resolved.oauth.gitlab.passthrough.0",
     ]));
     expect(effectivePaths).toHaveLength(9);
-    expect(desiredPaths).toHaveLength(19);
+    expect(desiredPaths).toHaveLength(20);
   });
 
   test("the proxy validates with the same contract function", () => {

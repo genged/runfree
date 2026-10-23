@@ -4,8 +4,12 @@ import {
   canonicalDesiredNetworkPolicy,
   desiredNetworkPolicyDigest,
   desiredNetworkPolicyV3Features,
+  desiredNetworkPolicyV4Features,
   desiredPolicyDirectProjection,
+  overlayServiceHostRule,
   requiredDesiredNetworkPolicyVersion,
+  SERVICE_HOST_RULE_FIELDS,
+  serviceHostRuleNarrowingIssues,
   validateDesiredNetworkPolicy,
   withRequiredDesiredNetworkPolicyVersion,
   type DesiredNetworkPolicyJson,
@@ -169,8 +173,8 @@ describe("desired network policy version on need (v3)", () => {
   });
 
   test("refuses unsupported version values", () => {
-    for (const version of [1, 4, "3", undefined, 2.5]) {
-      expect(desiredIssues({ version, hosts: [] }), String(version)).toContain("version must be one of: 2, 3");
+    for (const version of [1, 5, "3", undefined, 2.5]) {
+      expect(desiredIssues({ version, hosts: [] }), String(version)).toContain("version must be one of: 2, 3, 4");
     }
   });
 
@@ -238,5 +242,174 @@ describe("desired network policy version on need (v3)", () => {
     });
     expect(withBasic.version).toBe(3);
     expect(withRequiredDesiredNetworkPolicyVersion({ version: 3, hosts: [] }).version).toBe(2);
+  });
+});
+
+// Spec 2026-10-23 service host rules §4.2, §4.5, §4.9: a user setting stored
+// with the service it restricts. Only permission fields, only on the service's
+// own hosts, and never broader than a service-set method or path.
+const GITLAB_RULE = {
+  gitPush: "write",
+  readPathPrefixes: ["/api/v4/search"],
+  graphql: { endpoints: ["/api/graphql"], writeOps: "mutation" },
+};
+const OAUTH_RULE = { methods: ["POST"], pathPrefixes: ["/oauth/token"] };
+
+function serviceWithHostRules(hostRules: unknown, selection: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    version: 4,
+    hosts: [],
+    services: {
+      gitlab: {
+        revision: 2,
+        definitionDigest: digest,
+        selection: { ...selection, hostRules },
+        resolved: {
+          hosts: ["gitlab.com", "auth.example.com"],
+          requests: { "gitlab.com": GITLAB_RULE, "auth.example.com": OAUTH_RULE },
+        },
+      },
+    },
+  };
+}
+
+describe("desired network policy v4: service hostRules", () => {
+  test("exports the permission fields a user can set", () => {
+    expect(SERVICE_HOST_RULE_FIELDS).toEqual(["gitPush", "methods", "pathPrefixes", "writeAction"]);
+  });
+
+  test("accepts permission fields on a service host and canonicalizes them byte-stably", () => {
+    const raw = serviceWithHostRules({ "gitlab.com": { gitPush: "deny", methods: ["GET", "POST"], writeAction: "deny" } });
+    const policy = validateDesiredNetworkPolicy(raw);
+    expect(policy.version).toBe(4);
+    expect(policy.services?.gitlab.selection).toEqual({
+      hostRules: { "gitlab.com": { gitPush: "deny", methods: ["GET", "POST"], writeAction: "deny" } },
+    });
+    expect(policy.services?.gitlab.resolved.requests?.["gitlab.com"]).toEqual(GITLAB_RULE);
+    const again = validateDesiredNetworkPolicy(JSON.parse(JSON.stringify(policy)));
+    expect(canonicalDesiredNetworkPolicy(again)).toBe(canonicalDesiredNetworkPolicy(policy));
+    expect(JSON.stringify(again)).toBe(JSON.stringify(policy));
+  });
+
+  test("keeps other selection fields beside hostRules", () => {
+    const policy = validateDesiredNetworkPolicy(serviceWithHostRules(
+      { "gitlab.com": { writeAction: "allow" } },
+      { writeMode: "read-only", skippedHosts: ["uploads.gitlab.com"] },
+    ));
+    expect(policy.services?.gitlab.selection).toEqual({
+      writeMode: "read-only",
+      skippedHosts: ["uploads.gitlab.com"],
+      hostRules: { "gitlab.com": { writeAction: "allow" } },
+    });
+  });
+
+  test.each([
+    ["an unknown field", { "gitlab.com": { methodz: ["GET"] } },
+      "services.gitlab.selection.hostRules.gitlab.com.methodz is not a known field (known: gitPush, methods, pathPrefixes, writeAction)"],
+    ["a host the service does not allow", { "example.org": { gitPush: "deny" } },
+      "services.gitlab.selection.hostRules.example.org is not a host of this service"],
+    ["a non-normalized host", { "GitLab.com": { gitPush: "deny" } },
+      "services.gitlab.selection.hostRules.GitLab.com must be stored as gitlab.com"],
+    ["__proto__ as a host", JSON.parse('{"__proto__": {"gitPush": "deny"}}'),
+      "services.gitlab.selection.hostRules.__proto__"],
+    ["readPathPrefixes", { "gitlab.com": { readPathPrefixes: ["/x"] } },
+      "services.gitlab.selection.hostRules.gitlab.com.readPathPrefixes is set by the service and cannot be set in hostRules"],
+    ["writePathPrefixes", { "gitlab.com": { writePathPrefixes: ["/x"] } },
+      "services.gitlab.selection.hostRules.gitlab.com.writePathPrefixes is set by the service and cannot be set in hostRules"],
+    ["graphql", { "gitlab.com": { graphql: { endpoints: ["/g"], writeOps: "mutation" } } },
+      "services.gitlab.selection.hostRules.gitlab.com.graphql is set by the service and cannot be set in hostRules"],
+    ["gitPush write", { "gitlab.com": { gitPush: "write" } },
+      "services.gitlab.selection.hostRules.gitlab.com.gitPush must be \"deny\""],
+    ["an empty hostRules", {}, "services.gitlab.selection.hostRules must not be empty"],
+    ["a non-object hostRules", ["gitlab.com"], "services.gitlab.selection.hostRules must be an object"],
+    ["an empty rule", { "gitlab.com": {} },
+      "services.gitlab.selection.hostRules.gitlab.com must set at least one of: gitPush, methods, pathPrefixes, writeAction"],
+    ["a non-object rule", { "gitlab.com": "deny" }, "services.gitlab.selection.hostRules.gitlab.com must be an object"],
+    ["empty methods", { "gitlab.com": { methods: [] } }, "services.gitlab.selection.hostRules.gitlab.com.methods must be non-empty"],
+    ["an unknown method", { "gitlab.com": { methods: ["BREW"] } }, "services.gitlab.selection.hostRules.gitlab.com.methods[0] must be one of"],
+    ["a non-normalized path prefix", { "gitlab.com": { pathPrefixes: [" /api/"] } },
+      "services.gitlab.selection.hostRules.gitlab.com.pathPrefixes[0] must be stored as exact normalized path prefix /api/"],
+    ["an unknown writeAction", { "gitlab.com": { writeAction: "maybe" } },
+      "services.gitlab.selection.hostRules.gitlab.com.writeAction must be one of: allow, ask, deny"],
+    ["a broader method on an OAuth token host", { "auth.example.com": { methods: ["POST", "PUT"] } },
+      "services.gitlab.selection.hostRules.auth.example.com.methods includes PUT, which the service rule does not allow (service methods: POST)"],
+    ["a broader path on an OAuth token host", { "auth.example.com": { pathPrefixes: ["/"] } },
+      "services.gitlab.selection.hostRules.auth.example.com.pathPrefixes includes /, which is not under a service path prefix (service pathPrefixes: /oauth/token)"],
+    ["a sibling path on an OAuth token host", { "auth.example.com": { pathPrefixes: ["/oauth/tokenx"] } },
+      "pathPrefixes includes /oauth/tokenx, which is not under a service path prefix"],
+  ])("refuses %s", (_name, hostRules, message) => {
+    expect(desiredIssues(serviceWithHostRules(hostRules))).toContain(message);
+  });
+
+  test("refuses a rule on a host the selection skipped", () => {
+    // A skipped host is not in resolved.hosts, so a rule on it would restrict
+    // nothing and must not survive as a stale entry.
+    expect(desiredIssues(serviceWithHostRules({ "uploads.gitlab.com": { gitPush: "deny" } }, { skippedHosts: ["uploads.gitlab.com"] })))
+      .toContain("services.gitlab.selection.hostRules.uploads.gitlab.com is not a host of this service");
+  });
+
+  test("accepts a narrower method and path on an OAuth token host", () => {
+    const policy = validateDesiredNetworkPolicy(serviceWithHostRules({
+      "auth.example.com": { methods: ["POST"], pathPrefixes: ["/oauth/token/refresh"], writeAction: "deny" },
+    }));
+    expect(policy.services?.gitlab.selection?.hostRules?.["auth.example.com"])
+      .toEqual({ methods: ["POST"], pathPrefixes: ["/oauth/token/refresh"], writeAction: "deny" });
+  });
+
+  test("v4 is derived from the presence of hostRules, even when empty", () => {
+    expect(desiredNetworkPolicyV4Features(serviceWithHostRules({}))).toEqual(["services.gitlab.selection.hostRules"]);
+    expect(requiredDesiredNetworkPolicyVersion(serviceWithHostRules({ "gitlab.com": { gitPush: "deny" } }))).toBe(4);
+    expect(requiredDesiredNetworkPolicyVersion({ hosts: [], services: { gitlab: gitlabService([GITLAB_GIT_BASIC]) } })).toBe(3);
+    expect(withRequiredDesiredNetworkPolicyVersion({ ...serviceWithHostRules({ "gitlab.com": { gitPush: "deny" } }), version: 2 }).version).toBe(4);
+  });
+
+  test.each([2, 3])("a declared v%s file with hostRules is refused naming the field", (version) => {
+    const message = desiredIssues({ ...serviceWithHostRules({ "gitlab.com": { gitPush: "deny" } }), version });
+    expect(message).toContain(`version ${version} cannot use these fields; declare version 4: services.gitlab.selection.hostRules`);
+  });
+
+  test("a declared v2 file with v3 and v4 features names both; a declared v3 file names only the v4 one", () => {
+    const body = serviceWithHostRules({ "gitlab.com": { gitPush: "deny" } });
+    const gitlab = (body.services as Record<string, Record<string, unknown>>).gitlab;
+    const withBasic = {
+      ...body,
+      services: { gitlab: { ...gitlab, resolved: { ...(gitlab.resolved as object), tokens: { gitlab: { description: "d", credentials: [GITLAB_GIT_BASIC] } } } } },
+    };
+    expect(desiredIssues({ ...withBasic, version: 2 })).toContain(
+      "version 2 cannot use these fields; declare version 4: services.gitlab.resolved.tokens.gitlab.credentials[0].scheme basic; "
+        + "services.gitlab.resolved.tokens.gitlab.credentials[0].username; services.gitlab.resolved.tokens.gitlab.credentials[0].protocol; "
+        + "services.gitlab.selection.hostRules",
+    );
+    expect(desiredIssues({ ...withBasic, version: 3 })).toContain(
+      "version 3 cannot use these fields; declare version 4: services.gitlab.selection.hostRules",
+    );
+    expect(validateDesiredNetworkPolicy({ ...withBasic, version: 4 }).version).toBe(4);
+  });
+
+  test("a policy without hostRules declared 4 is written as version 2 and keeps its digest", () => {
+    const v2: DesiredNetworkPolicyJson = { version: 2, hosts: ["api.example.com"] };
+    expect(validateDesiredNetworkPolicy({ ...v2, version: 4 })).toEqual(validateDesiredNetworkPolicy(v2));
+    expect(desiredNetworkPolicyDigest({ ...v2, version: 4 })).toBe(desiredNetworkPolicyDigest(v2));
+  });
+
+  test("overlayServiceHostRule lays the user setting over the service rule field by field", () => {
+    expect(overlayServiceHostRule(undefined, undefined)).toBeUndefined();
+    expect(overlayServiceHostRule({ gitPush: "write" }, undefined)).toEqual({ gitPush: "write" });
+    expect(overlayServiceHostRule(undefined, { gitPush: "deny" })).toEqual({ gitPush: "deny" });
+    expect(overlayServiceHostRule(
+      { gitPush: "write", readPathPrefixes: ["/api/v4/search"], writeAction: "ask" },
+      { gitPush: "deny", writeAction: "deny" },
+    )).toEqual({ gitPush: "deny", readPathPrefixes: ["/api/v4/search"], writeAction: "deny" });
+  });
+
+  test("serviceHostRuleNarrowingIssues checks only the fields the service set", () => {
+    expect(serviceHostRuleNarrowingIssues(undefined, { methods: ["DELETE"], pathPrefixes: ["/"] })).toEqual([]);
+    expect(serviceHostRuleNarrowingIssues({ gitPush: "write" }, { methods: ["DELETE"] })).toEqual([]);
+    expect(serviceHostRuleNarrowingIssues({ methods: ["POST"], pathPrefixes: ["/oauth/token"] }, { pathPrefixes: ["/oauth/token"] })).toEqual([]);
+    expect(serviceHostRuleNarrowingIssues({ methods: ["POST"], pathPrefixes: ["/oauth/token"] }, { methods: ["GET", "POST"], pathPrefixes: ["/a", "/oauth/token/x"] }))
+      .toEqual([
+        "methods includes GET, which the service rule does not allow (service methods: POST)",
+        "pathPrefixes includes /a, which is not under a service path prefix (service pathPrefixes: /oauth/token)",
+      ]);
   });
 });

@@ -5,7 +5,9 @@ import {
   normalizeHostname,
   normalizePathPrefix,
   isIpLiteralHostname,
+  pathMatchesPrefix,
   validateNetworkPolicy,
+  type HttpMethod,
   type PolicyJson,
   type RequestPolicyJson,
   type TokenPolicyJson,
@@ -17,15 +19,33 @@ import { isRecord, stableJson, sha256Digest } from "./primitives.js";
 // as version 2 and keeps its v2 digest. Version 3 is required for a `basic`
 // scheme, a `username`, a `protocol`, or two credential mappings for one
 // (host, header) in one validation scope; every one of those an older reader
-// would misread. Readers accept a declared version >= the required one.
-export const DESIRED_NETWORK_POLICY_VERSIONS = [2, 3] as const;
+// would misread. Version 4 is required for a service's `selection.hostRules`
+// (spec 2026-10-23 service host rules §4.9), which an older reader refuses as
+// an unknown selection field. Readers accept a declared version >= the
+// required one.
+export const DESIRED_NETWORK_POLICY_VERSIONS = [2, 3, 4] as const;
 export type DesiredNetworkPolicyVersion = typeof DESIRED_NETWORK_POLICY_VERSIONS[number];
 const SHA256_PATTERN = /^sha256:[a-f0-9]{64}$/;
 const ENV_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const PARAMETER_KEY_PATTERN = /^[a-z][a-z0-9-]{0,31}$/;
 const OAUTH_FIELD_PATTERN = /^[a-z][a-z0-9_]{0,31}$/;
 
+// A user setting on one of a service's hosts, laid over the service's
+// resolved rule at compile time. Only permission fields: classification
+// fields (readPathPrefixes, writePathPrefixes, graphql, gitPush "write")
+// describe the service's API and stay the service's.
+export type DesiredServiceHostRule = {
+  gitPush?: "deny";
+  methods?: HttpMethod[];
+  pathPrefixes?: string[];
+  writeAction?: WriteAction;
+};
+
+export const SERVICE_HOST_RULE_FIELDS = ["gitPush", "methods", "pathPrefixes", "writeAction"] as const;
+const SERVICE_CLASSIFICATION_FIELDS = ["graphql", "readPathPrefixes", "writePathPrefixes"] as const;
+
 export type DesiredServiceSelection = {
+  hostRules?: Record<string, DesiredServiceHostRule>;
   skippedHosts?: string[];
   writeMode?: "allow-write" | "read-only";
 };
@@ -141,8 +161,65 @@ export function desiredNetworkPolicyV3Features(raw: unknown): string[] {
   return features;
 }
 
+/**
+ * The fields of a desired policy, raw or validated, that need version 4: one
+ * entry per service whose selection carries `hostRules`, even an empty one.
+ */
+export function desiredNetworkPolicyV4Features(raw: unknown): string[] {
+  if (!isRecord(raw) || !isRecord(raw.services)) return [];
+  const features: string[] = [];
+  for (const [serviceId, service] of Object.entries(raw.services)) {
+    if (!isRecord(service) || !isRecord(service.selection)) continue;
+    if (Object.hasOwn(service.selection, "hostRules")) features.push(`services.${serviceId}.selection.hostRules`);
+  }
+  return features;
+}
+
 export function requiredDesiredNetworkPolicyVersion(raw: unknown): DesiredNetworkPolicyVersion {
+  if (desiredNetworkPolicyV4Features(raw).length > 0) return 4;
   return desiredNetworkPolicyV3Features(raw).length > 0 ? 3 : 2;
+}
+
+/**
+ * The service's rule with the user's setting laid over it, field by field.
+ * The user setting carries only permission fields, so the service's
+ * classification fields always survive.
+ */
+export function overlayServiceHostRule(
+  serviceRule?: RequestPolicyJson,
+  user?: DesiredServiceHostRule,
+): RequestPolicyJson | undefined {
+  if (serviceRule === undefined && user === undefined) return undefined;
+  return { ...serviceRule, ...user };
+}
+
+/**
+ * Where a service itself sets methods or path prefixes (an OAuth token host),
+ * a user setting may only narrow them (spec §4.5). Issues are relative to the
+ * rule, e.g. "methods includes PUT, ...".
+ */
+export function serviceHostRuleNarrowingIssues(
+  serviceRule: RequestPolicyJson | undefined,
+  user: DesiredServiceHostRule,
+): string[] {
+  const issues: string[] = [];
+  const serviceMethods = serviceRule?.methods;
+  if (serviceMethods !== undefined) {
+    for (const method of user.methods ?? []) {
+      if (!serviceMethods.includes(method)) {
+        issues.push(`methods includes ${method}, which the service rule does not allow (service methods: ${serviceMethods.join(", ")})`);
+      }
+    }
+  }
+  const servicePrefixes = serviceRule?.pathPrefixes;
+  if (servicePrefixes !== undefined) {
+    for (const prefix of user.pathPrefixes ?? []) {
+      if (!servicePrefixes.some((servicePrefix) => pathMatchesPrefix(prefix, servicePrefix))) {
+        issues.push(`pathPrefixes includes ${prefix}, which is not under a service path prefix (service pathPrefixes: ${servicePrefixes.join(", ")})`);
+      }
+    }
+  }
+  return issues;
 }
 
 /**
@@ -289,6 +366,96 @@ function validateOAuthProvider(value: unknown, prefix: string, issues: string[])
   };
 }
 
+function validateServiceHostRules(
+  raw: unknown,
+  prefix: string,
+  resolvedHosts: ReadonlySet<string>,
+  resolvedRequests: Readonly<Record<string, RequestPolicyJson>>,
+  issues: string[],
+): Record<string, DesiredServiceHostRule> | undefined {
+  if (!isRecord(raw)) {
+    issues.push(`${prefix} must be an object`);
+    return undefined;
+  }
+  const entries = Object.entries(raw);
+  if (entries.length === 0) issues.push(`${prefix} must not be empty; remove it instead`);
+  const rules: Array<[string, DesiredServiceHostRule]> = [];
+  for (const [key, value] of entries) {
+    const itemPrefix = `${prefix}.${key}`;
+    let host: string;
+    try {
+      host = normalizeHostname(key);
+    } catch (error) {
+      issues.push(`${itemPrefix}: ${error instanceof Error ? error.message : String(error)}`);
+      continue;
+    }
+    if (host !== key) {
+      issues.push(`${itemPrefix} must be stored as ${host}`);
+      continue;
+    }
+    // Only a host the service allows: a user setting never adds an allowlist
+    // entry, and a skipped host is absent from resolved.hosts.
+    if (!resolvedHosts.has(host)) {
+      issues.push(`${itemPrefix} is not a host of this service`);
+      continue;
+    }
+    if (!isRecord(value)) {
+      issues.push(`${itemPrefix} must be an object`);
+      continue;
+    }
+    let fieldsOk = true;
+    for (const field of Object.keys(value)) {
+      if ((SERVICE_CLASSIFICATION_FIELDS as readonly string[]).includes(field)) {
+        issues.push(`${itemPrefix}.${field} is set by the service and cannot be set in hostRules`);
+        fieldsOk = false;
+      } else if (!(SERVICE_HOST_RULE_FIELDS as readonly string[]).includes(field)) {
+        issues.push(`${itemPrefix}.${field} is not a known field (known: ${SERVICE_HOST_RULE_FIELDS.join(", ")})`);
+        fieldsOk = false;
+      }
+    }
+    if (!fieldsOk) continue;
+    if (Object.keys(value).length === 0) {
+      issues.push(`${itemPrefix} must set at least one of: ${SERVICE_HOST_RULE_FIELDS.join(", ")}`);
+      continue;
+    }
+    if (value.gitPush !== undefined && value.gitPush !== "deny") {
+      issues.push(`${itemPrefix}.gitPush must be "deny"`);
+      continue;
+    }
+    // The field shapes are a direct rule's: reuse its validator so the two
+    // canonicalize the same way.
+    const requestPrefix = `requests.${host}`;
+    let validated: RequestPolicyJson | undefined;
+    try {
+      validated = validateNetworkPolicy({ hosts: [host], requests: { [host]: value } }).requests[host];
+    } catch (error) {
+      const nested = error && typeof error === "object" && "issues" in error && Array.isArray(error.issues)
+        ? error.issues.map(String)
+        : [error instanceof Error ? error.message : String(error)];
+      for (const issue of nested) {
+        issues.push(issue.startsWith(requestPrefix) ? `${itemPrefix}${issue.slice(requestPrefix.length)}` : `${itemPrefix}: ${issue}`);
+      }
+      continue;
+    }
+    if (validated === undefined) continue;
+    const rule: DesiredServiceHostRule = {
+      ...(validated.gitPush === "deny" ? { gitPush: "deny" as const } : {}),
+      ...(validated.methods !== undefined ? { methods: validated.methods } : {}),
+      ...(validated.pathPrefixes !== undefined ? { pathPrefixes: validated.pathPrefixes } : {}),
+      ...(validated.writeAction !== undefined ? { writeAction: validated.writeAction } : {}),
+    };
+    const narrowing = serviceHostRuleNarrowingIssues(Object.hasOwn(resolvedRequests, host) ? resolvedRequests[host] : undefined, rule);
+    if (narrowing.length > 0) {
+      issues.push(...narrowing.map((issue) => `${itemPrefix}.${issue}`));
+      continue;
+    }
+    rules.push([host, rule]);
+  }
+  // Keys were checked against the service's normalized hostnames above, so no
+  // unvalidated key (such as __proto__) reaches the object.
+  return Object.fromEntries(rules.sort(([left], [right]) => left.localeCompare(right)));
+}
+
 function validateServiceEntry(value: unknown, serviceId: string, issues: string[]): DesiredServiceEntry | undefined {
   const prefix = `services.${serviceId}`;
   if (!/^[a-z][a-z0-9-]{0,63}$/.test(serviceId)) issues.push(`${prefix} has an invalid service id`);
@@ -306,7 +473,7 @@ function validateServiceEntry(value: unknown, serviceId: string, issues: string[
     if (!isRecord(value.selection)) {
       issues.push(`${prefix}.selection must be an object`);
     } else {
-      exactKeys(value.selection, ["skippedHosts", "writeMode"], `${prefix}.selection.`, issues);
+      exactKeys(value.selection, ["hostRules", "skippedHosts", "writeMode"], `${prefix}.selection.`, issues);
       const writeMode = value.selection.writeMode;
       if (writeMode !== undefined && writeMode !== "allow-write" && writeMode !== "read-only") {
         issues.push(`${prefix}.selection.writeMode must be allow-write or read-only`);
@@ -419,6 +586,17 @@ function validateServiceEntry(value: unknown, serviceId: string, issues: string[
     }
   }
   if (!policy) return undefined;
+  // After resolved: a host rule is valid only on a host the service allows.
+  if (selection && isRecord(value.selection) && value.selection.hostRules !== undefined) {
+    const hostRules = validateServiceHostRules(
+      value.selection.hostRules,
+      `${prefix}.selection.hostRules`,
+      policy.allowedHostSet,
+      policy.requests,
+      issues,
+    );
+    if (hostRules) selection = { ...selection, hostRules };
+  }
   return {
     definitionDigest: typeof value.definitionDigest === "string" ? value.definitionDigest : "",
     revision: Number.isSafeInteger(value.revision) ? Number(value.revision) : 0,
@@ -439,11 +617,15 @@ export function validateDesiredNetworkPolicy(raw: unknown): DesiredNetworkPolicy
   if (!isRecord(raw)) throw new DesiredNetworkPolicyValidationError(["policy must be a JSON object"]);
   exactKeys(raw, ["hosts", "hostServices", "requests", "services", "tokens", "version", "writeApproval"], "", issues);
   const v3Features = desiredNetworkPolicyV3Features(raw);
-  const requiredVersion: DesiredNetworkPolicyVersion = v3Features.length > 0 ? 3 : 2;
-  if (raw.version !== 2 && raw.version !== 3) {
+  const v4Features = desiredNetworkPolicyV4Features(raw);
+  const requiredVersion: DesiredNetworkPolicyVersion = v4Features.length > 0 ? 4 : v3Features.length > 0 ? 3 : 2;
+  const declared = raw.version;
+  if (!(DESIRED_NETWORK_POLICY_VERSIONS as readonly unknown[]).includes(declared)) {
     issues.push(`version must be one of: ${DESIRED_NETWORK_POLICY_VERSIONS.join(", ")}`);
-  } else if (raw.version < requiredVersion) {
-    issues.push(`version ${raw.version} cannot use these fields; declare version ${requiredVersion}: ${v3Features.join("; ")}`);
+  } else if ((declared as DesiredNetworkPolicyVersion) < requiredVersion) {
+    // Name only the fields above the declared version.
+    const above = [...((declared as DesiredNetworkPolicyVersion) < 3 ? v3Features : []), ...v4Features];
+    issues.push(`version ${declared} cannot use these fields; declare version ${requiredVersion}: ${above.join("; ")}`);
   }
   let direct: ReturnType<typeof validateNetworkPolicy> | undefined;
   try {

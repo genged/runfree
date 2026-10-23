@@ -1,0 +1,10 @@
+{
+  "tag": "v0.6.0",
+  "commit": "151bc5644880397e0056638a3917dc6669ea3aed",
+  "files": {
+    "runtime-contracts/desired-network-policy.ts": { "source": "packages/runtime-contracts/src/desired-network-policy.ts", "blob": "1f2035776abfa8b0cf9605ba98706a6a35c77e67" },
+    "runtime-contracts/host-services.ts": { "source": "packages/runtime-contracts/src/host-services.ts", "blob": "ca62f0b09096f7e07608e1ea01283a4a3e831cc1" },
+    "runtime-contracts/network-policy.ts": { "source": "packages/runtime-contracts/src/network-policy.ts", "blob": "14b3caf22bbb4ae8351297a4fe5f98a3d6f08776" },
+    "runtime-contracts/primitives.ts": { "source": "packages/runtime-contracts/src/primitives.ts", "blob": "b06060a3ab2289a2936b296968ccf28e7fc135f4" }
+  }
+}

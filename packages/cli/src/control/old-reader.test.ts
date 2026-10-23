@@ -10,6 +10,7 @@ import { loadEffectiveProxyControl } from "@runfree/runtime-contracts/effective-
 import { validateDesiredNetworkPolicy as validateDesiredV052 } from "../../../../tests/fixtures/release-v0.5.2/runtime-contracts/desired-network-policy.ts";
 import { loadEffectiveProxyControl as loadEffectiveProxyControlV052 } from "../../../../tests/fixtures/release-v0.5.2/runtime-contracts/effective-control.ts";
 import { validateNetworkPolicy as validateNetworkPolicyV052 } from "../../../../tests/fixtures/release-v0.5.2/runtime-contracts/network-policy.ts";
+import { validateDesiredNetworkPolicy as validateDesiredV060 } from "../../../../tests/fixtures/release-v0.6.0/runtime-contracts/desired-network-policy.ts";
 import { projectInfo } from "../config.ts";
 import { approveNetworkCandidate, approveRuntimeIsolationControl } from "./approvals.ts";
 import { captureDesiredPolicyCandidate } from "./candidates.ts";
@@ -57,6 +58,48 @@ describe("v0.5.2 readers against this release's policy", () => {
       expect(() => validateDesiredNetworkPolicy(desiredWith(credential as Record<string, string>, 2)))
         .toThrow("version 2 cannot use these fields; declare version 3");
     }
+  });
+});
+
+// Spec 2026-10-23 service host rules §4.9: a service's selection.hostRules
+// needs desired policy version 4. Both released readers refuse such a file;
+// neither may drop the setting and enforce the service rule alone.
+const SERVICE_DIGEST = `sha256:${"a".repeat(64)}`;
+
+function desiredWithHostRules() {
+  return {
+    version: 4,
+    hosts: [],
+    services: {
+      github: {
+        revision: 3,
+        definitionDigest: SERVICE_DIGEST,
+        selection: { hostRules: { "github.com": { gitPush: "deny" } } },
+        resolved: { hosts: ["github.com"], requests: { "github.com": { gitPush: "write" } } },
+      },
+    },
+  };
+}
+
+describe("released desired readers against service hostRules (v4)", () => {
+  test("this release accepts the file, emits version 4, and keeps hostRules byte-stable", () => {
+    const current = validateDesiredNetworkPolicy(desiredWithHostRules());
+    expect(current.version).toBe(4);
+    expect(current.services?.github.selection?.hostRules).toEqual({ "github.com": { gitPush: "deny" } });
+    expect(JSON.stringify(validateDesiredNetworkPolicy(JSON.parse(JSON.stringify(current))))).toBe(JSON.stringify(current));
+  });
+
+  test("the v0.6.0 desired validator refuses it on the version and on the unknown selection field", () => {
+    expect(() => validateDesiredV060(desiredWithHostRules())).toThrow("version must be one of: 2, 3");
+    // Even a file that misdeclares version 3 is refused by the closed selection.
+    expect(() => validateDesiredV060({ ...desiredWithHostRules(), version: 3 }))
+      .toThrow("services.github.selection.hostRules is not a known field");
+  });
+
+  test("the v0.5.2 desired validator refuses it", () => {
+    expect(() => validateDesiredV052(desiredWithHostRules())).toThrow("version must be 2");
+    expect(() => validateDesiredV052({ ...desiredWithHostRules(), version: 2 }))
+      .toThrow("services.github.selection.hostRules is not a known field");
   });
 });
 
