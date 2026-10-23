@@ -194,6 +194,19 @@ export function overlayServiceHostRule(
 }
 
 /**
+ * `gitPush: "deny"` in a user setting only replaces a service's own git
+ * handling rule (`gitPush: "write"`). On a host the service gives no git
+ * handling it would add git classification (the upload-pack POST read
+ * exemption) the service never set, so it is refused there.
+ */
+export function serviceHostRuleGitPushFits(
+  serviceRule: RequestPolicyJson | undefined,
+  user: DesiredServiceHostRule,
+): boolean {
+  return user.gitPush !== "deny" || serviceRule?.gitPush === "write";
+}
+
+/**
  * Where a service itself sets methods or path prefixes (an OAuth token host),
  * a user setting may only narrow them (spec §4.5). Issues are relative to the
  * rule, e.g. "methods includes PUT, ...".
@@ -444,7 +457,12 @@ function validateServiceHostRules(
       ...(validated.pathPrefixes !== undefined ? { pathPrefixes: validated.pathPrefixes } : {}),
       ...(validated.writeAction !== undefined ? { writeAction: validated.writeAction } : {}),
     };
-    const narrowing = serviceHostRuleNarrowingIssues(Object.hasOwn(resolvedRequests, host) ? resolvedRequests[host] : undefined, rule);
+    const serviceRule = Object.hasOwn(resolvedRequests, host) ? resolvedRequests[host] : undefined;
+    if (!serviceHostRuleGitPushFits(serviceRule, rule)) {
+      issues.push(`${itemPrefix}.gitPush "deny" is valid only where the service's rule for the host has gitPush "write"`);
+      continue;
+    }
+    const narrowing = serviceHostRuleNarrowingIssues(serviceRule, rule);
     if (narrowing.length > 0) {
       issues.push(...narrowing.map((issue) => `${itemPrefix}.${issue}`));
       continue;

@@ -361,7 +361,6 @@ describe("hostRulesCommand (rule-preserving remedies)", () => {
       gitPush: "deny",
       writeAction: "ask",
     });
-    expect(command.unexpressible).toEqual([]);
   });
 
   test("round-trips a rule unchanged when nothing is widened", () => {
@@ -383,13 +382,12 @@ describe("hostRulesCommand (rule-preserving remedies)", () => {
     expect(command.command).toBe("runfree host rules h.example --request-path-prefix /api/v2/ --request-path-prefix <prefix>");
   });
 
-  test("names the fields the command cannot express", () => {
+  test("renders only the flag fields; classification fields have no flag", () => {
     const command = hostRulesCommand(
       "h.example",
       { methods: ["GET"], gitPush: "write", readPathPrefixes: ["/r/"], writePathPrefixes: ["/w/"], graphql: { endpoints: ["/graphql"], writeOps: "mutation" } },
       { method: "POST" },
     );
-    expect(command.unexpressible).toEqual(["gitPush=write", "readPathPrefixes", "writePathPrefixes", "graphql"]);
     expect(command.command).toBe("runfree host rules h.example --method GET --method POST");
   });
 

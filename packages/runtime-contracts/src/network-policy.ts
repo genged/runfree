@@ -966,10 +966,9 @@ export type HostRulesCommand = {
   // The shell-safe rendering (`runfree host rules ...`).
   command: string;
   // The rule the command produces if pasted, as `host explain` would show it.
+  // Service classification fields it holds have no flag; pasting the command
+  // keeps them, because `host rules` patches.
   resultingRule: RequestPolicyJson | undefined;
-  // Rule fields `runfree host rules` cannot express (service classification
-  // fields). Pasting the command keeps them, because `host rules` patches.
-  unexpressible: string[];
 };
 
 const SHELL_SAFE_TOKEN = /^[A-Za-z0-9_.,:@%+=\/<>-]+$/;
@@ -1005,22 +1004,16 @@ export function hostRulesCommand(
 ): HostRulesCommand {
   const resultingRule = widenedRequestRule(rule, widening);
   const argv = ["host", "rules", host];
-  const unexpressible: string[] = [];
   if (resultingRule) {
     for (const method of resultingRule.methods ?? []) argv.push("--method", method);
     for (const prefix of resultingRule.pathPrefixes ?? []) argv.push("--request-path-prefix", prefix);
     if (resultingRule.gitPush === "deny") argv.push("--deny-git-push");
     if (resultingRule.writeAction !== undefined) argv.push("--write", resultingRule.writeAction);
-    if (resultingRule.gitPush === "write") unexpressible.push("gitPush=write");
-    if (resultingRule.readPathPrefixes !== undefined) unexpressible.push("readPathPrefixes");
-    if (resultingRule.writePathPrefixes !== undefined) unexpressible.push("writePathPrefixes");
-    if (resultingRule.graphql !== undefined) unexpressible.push("graphql");
   }
   return {
     argv,
     command: ["runfree", ...argv.map(shellQuoteToken)].join(" "),
     resultingRule,
-    unexpressible,
   };
 }
 

@@ -201,13 +201,13 @@ describe("desired policy compiler: service hostRules overlay", () => {
     const second: DesiredServiceEntry = {
       revision: 1,
       definitionDigest: digest,
-      selection: { hostRules: { "git.example.com": { gitPush: "deny" } } },
+      selection: { hostRules: { "git.example.com": { writeAction: "deny" } } },
       resolved: { hosts: ["git.example.com"] },
     };
     expect(() => compileProject({ first, second }))
       .toThrow("request rule git.example.com conflicts between service:first and service:second");
     // An identical overlaid rule from a second service is still two owners.
-    const denying = { ...first, resolved: { ...first.resolved, requests: { "git.example.com": { gitPush: "deny" as const } } } };
+    const denying = { ...first, resolved: { ...first.resolved, requests: { "git.example.com": { writeAction: "deny" as const } } } };
     expect(() => compileProject({ first: denying, second }))
       .toThrow("request rule git.example.com has duplicate owners service:first and service:second");
   });

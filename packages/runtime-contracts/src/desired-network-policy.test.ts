@@ -337,6 +337,10 @@ describe("desired network policy v4: service hostRules", () => {
       "services.gitlab.selection.hostRules.auth.example.com.pathPrefixes includes /, which is not under a service path prefix (service pathPrefixes: /oauth/token)"],
     ["a sibling path on an OAuth token host", { "auth.example.com": { pathPrefixes: ["/oauth/tokenx"] } },
       "pathPrefixes includes /oauth/tokenx, which is not under a service path prefix"],
+    // S3: on a host without the service's git handling, a git push deny
+    // would add git classification the service never set.
+    ["gitPush deny on a host without the service's git handling", { "auth.example.com": { gitPush: "deny" } },
+      "services.gitlab.selection.hostRules.auth.example.com.gitPush \"deny\" is valid only where the service's rule for the host has gitPush \"write\""],
   ])("refuses %s", (_name, hostRules, message) => {
     expect(desiredIssues(serviceWithHostRules(hostRules))).toContain(message);
   });
