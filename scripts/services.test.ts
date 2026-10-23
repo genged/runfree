@@ -5,6 +5,26 @@ import path from "node:path";
 import util from "node:util";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
+// `service configure` drives clack prompts on a TTY. A test that sets
+// `clack.answer` accepts each prompt's initial value and confirms; every other
+// test gets the real clack.
+const clack = vi.hoisted(() => ({ answer: false }));
+vi.mock("@clack/prompts", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@clack/prompts")>();
+  return {
+    ...actual,
+    multiselect: ((options: Parameters<typeof actual.multiselect>[0]) => clack.answer
+      ? Promise.resolve(options.initialValues ?? [])
+      : actual.multiselect(options)) as typeof actual.multiselect,
+    select: ((options: Parameters<typeof actual.select>[0]) => clack.answer
+      ? Promise.resolve(options.initialValue)
+      : actual.select(options)) as typeof actual.select,
+    confirm: ((options: Parameters<typeof actual.confirm>[0]) => clack.answer
+      ? Promise.resolve(true)
+      : actual.confirm(options)) as typeof actual.confirm,
+  };
+});
+
 import {
   normalizeHostname,
   normalizePathPrefix,
@@ -38,6 +58,7 @@ import {
   desiredServicePolicy,
   doctorIntent,
   parseServiceRecords,
+  planDesiredServiceEnable,
   runAdminAction,
   serviceConfigureIntent,
   serviceHostKeepReason,
@@ -48,6 +69,7 @@ import { projectInfo } from "../packages/cli/src/config.ts";
 import { approveNetworkCandidate } from "../packages/cli/src/control/approvals.ts";
 import { captureDesiredPolicyCandidate } from "../packages/cli/src/control/candidates.ts";
 import { compileDesiredPolicies } from "../packages/cli/src/control/compiler.ts";
+import { mutateDesiredService } from "../packages/cli/src/control/service-mutation.ts";
 import { projectHash } from "../packages/cli/src/project-identity.ts";
 import { RUNFREE_RUNTIME_DIGEST } from "../packages/cli/src/embedded-assets.generated.ts";
 import { loadUserServiceCatalog, validateUserServiceDefinitionObject } from "../packages/cli/src/user-services.ts";
@@ -1278,6 +1300,50 @@ describe("runfree service CLI: user-defined services", () => {
     expect(fs.existsSync(path.join(tmp, ".runfree/network-policy.json"))).toBe(false);
   });
 
+  test("configure keeps a saved hostRules setting when it re-enables the service", async () => {
+    const hostRules = { "registry.npmjs.org": { writeAction: "deny" as const } };
+    const saved = desiredServiceEntry(SERVICES.node, { hostRules, writeMode: "read-only" });
+    writeApprovedDesiredFixture(withRequiredDesiredNetworkPolicyVersion({
+      version: 2 as const,
+      hosts: [] as string[],
+      services: { node: saved },
+    }));
+    const env = adminTestEnv();
+    const context = { projectRoot: tmp, project: projectInfo(tmp, env), runtimeRoot: path.join(tmpBase, "runtime"), env };
+    const io = {
+      capture: (_command: string, args: string[]) => {
+        if (args[0] === "ps") return { status: 0, stdout: "", stderr: "" };
+        throw new Error(`unexpected Docker call: ${args.join(" ")}`);
+      },
+      run: () => 0,
+      commandExists: () => true,
+      confirm: () => false,
+      admin: async () => 0,
+    };
+    const tty = { stdin: process.stdin.isTTY, stdout: process.stdout.isTTY };
+    Object.defineProperty(process.stdin, "isTTY", { configurable: true, value: true });
+    Object.defineProperty(process.stdout, "isTTY", { configurable: true, value: true });
+    clack.answer = true;
+    try {
+      // The apply mirrors `service configure`'s enableDesired: plan, then the
+      // typed desired mutation.
+      const result = await runAdmin(() => serviceConfigureIntent({ id: "node", reloadProxy: false }, {
+        currentEntry: saved,
+        apply: async (input) => {
+          const plan = planDesiredServiceEnable(input);
+          await mutateDesiredService(context, io, "project", { kind: "enable", id: plan.id, entry: plan.entry });
+        },
+      }));
+      expect(result.status, result.stderr).toBe(0);
+    } finally {
+      clack.answer = false;
+      Object.defineProperty(process.stdin, "isTTY", { configurable: true, value: tty.stdin });
+      Object.defineProperty(process.stdout, "isTTY", { configurable: true, value: tty.stdout });
+    }
+
+    expect(readDesiredPolicy().services?.node).toEqual(saved);
+  });
+
   test("custom add --from-file requires review unless --yes, then imports to the id-derived XDG path", () => {
     writeFixtureRepo({ hosts: [], tokens: {} });
     const source = path.join(tmpBase, "downloaded-definition.json");
@@ -1533,6 +1599,98 @@ describe("runfree service CLI: list, explain, diff", () => {
     const desired = readDesiredPolicy();
     expect(desired.requests?.["registry.npmjs.org"]?.readPathPrefixes).toEqual(nearMatch);
     expect(desired.services?.node).toEqual(desiredServiceEntry(SERVICES.node));
+  });
+
+  test("diff --apply keeps a saved hostRules setting through a revision change", () => {
+    const stale = staleNodeDesiredEntry();
+    const hostRules = { "registry.npmjs.org": { writeAction: "deny" as const } };
+    writeApprovedDesiredFixture(withRequiredDesiredNetworkPolicyVersion({
+      version: 2 as const,
+      hosts: [] as string[],
+      services: { node: { ...stale, selection: { hostRules } } },
+    }));
+
+    const applied = runAdminCli(["service", "diff", "--apply", "--no-reload"]);
+
+    expect(applied.status, applied.stderr).toBe(0);
+    const policy = readDesiredPolicy();
+    expect(policy.version).toBe(4);
+    expect(policy.services?.node).toEqual(desiredServiceEntry(SERVICES.node, { hostRules }));
+    const compiled = compileDesiredPolicies({ project: policy, local: { version: 2, hosts: [] } });
+    expect(compiled.policy.requests?.["registry.npmjs.org"]?.writeAction).toBe("deny");
+    expect(runAdminCli(["service", "diff", "--no-reload"]).stdout).toContain("node (project): current");
+  });
+
+  test("diff refuses the whole batch while a saved setting is on a host the new revision removes", () => {
+    const githubCredential = SERVICES.github.credential;
+    if (!githubCredential) throw new Error("github credential missing");
+    // Project: a github revision 2 entry that upgrades cleanly.
+    const revision2: Service = {
+      ...SERVICES.github,
+      revision: 2,
+      credential: {
+        ...githubCredential,
+        credentials: githubCredential.credentials.filter((credential) => credential.host !== "github.com"),
+      },
+    };
+    // Local: a node entry whose old revision had a host that now is gone.
+    const oldNode: Service = { ...SERVICES.node, revision: 1, hosts: [...SERVICES.node.hosts, { host: "gone.npm.example" }] };
+    writeFixtureRepo({ version: 2, hosts: [], services: { github: desiredServiceEntry(revision2) } }, {
+      version: 4,
+      agents: { default: "claude" },
+      runtime: {},
+    });
+    fs.writeFileSync(path.join(tmp, ".runfree/network-policy.local.json"), `${JSON.stringify(withRequiredDesiredNetworkPolicyVersion({
+      version: 2 as const,
+      hosts: [] as string[],
+      services: { node: desiredServiceEntry(oldNode, { hostRules: { "gone.npm.example": { writeAction: "deny" } } }) },
+    }), null, 2)}\n`);
+    const project = projectInfo(tmp, adminTestEnv());
+    const candidate = captureDesiredPolicyCandidate(tmp, project.paths.controlCandidatesDir);
+    approveNetworkCandidate(tmp, project, candidate, "network-project", "interactive");
+    approveNetworkCandidate(tmp, project, candidate, "network-local", "interactive");
+    const projectBefore = fs.readFileSync(path.join(tmp, ".runfree/network-policy.json"), "utf8");
+    const localBefore = fs.readFileSync(path.join(tmp, ".runfree/network-policy.local.json"), "utf8");
+    const refusal = `service node revision ${SERVICES.node.revision} no longer allows gone.npm.example, which has a host rule setting; remove it first with: runfree host rules gone.npm.example --clear --service node --local`;
+
+    const shown = runAdminCli(["service", "diff", "--no-reload"]);
+    expect(shown.status, shown.stderr).toBe(0);
+    expect(shown.stdout).toContain("github (project): revision 2 -> 3");
+    expect(shown.stdout).toContain(`  refuses: ${refusal}`);
+    expect(shown.stdout).not.toContain("apply with:");
+
+    const applied = runAdminCli(["service", "diff", "--apply", "--no-reload"]);
+    expect(applied.status).toBe(1);
+    expect(applied.stderr).toContain(refusal);
+    expect(fs.readFileSync(path.join(tmp, ".runfree/network-policy.json"), "utf8")).toBe(projectBefore);
+    expect(fs.readFileSync(path.join(tmp, ".runfree/network-policy.local.json"), "utf8")).toBe(localBefore);
+  });
+
+  test("diff --apply takes over an identical direct rule and warns about a different one", () => {
+    const selection = { writeMode: "read-only" as const };
+    const fresh = desiredServiceEntry(SERVICES.node, selection);
+    const npmRule = fresh.resolved.requests?.["registry.npmjs.org"];
+    expect(npmRule).toEqual({ readPathPrefixes: ["/-/npm/v1/security/advisories/bulk"], writeAction: "deny" });
+    writeApprovedDesiredFixture({
+      version: 2,
+      hosts: ["registry.npmjs.org", "registry.yarnpkg.com"],
+      requests: { "registry.npmjs.org": npmRule ?? {}, "registry.yarnpkg.com": { writeAction: "allow" } },
+      services: { node: { ...staleNodeDesiredEntry(), selection } },
+    });
+
+    const applied = runAdminCli(["service", "diff", "--apply", "--no-reload"]);
+
+    expect(applied.status, applied.stderr).toBe(0);
+    expect(applied.stdout).toContain(
+      "registry.npmjs.org: the direct rule matched service node's rule and now belongs to the service; service disable removes it",
+    );
+    expect(applied.stderr).toContain(
+      "runfree warning: registry.yarnpkg.com has a direct rule that replaces the rule from service node; remove it with: runfree host rules registry.yarnpkg.com --clear",
+    );
+    const policy = readDesiredPolicy();
+    expect(policy.requests).toEqual({ "registry.yarnpkg.com": { writeAction: "allow" } });
+    expect(policy.hosts).toEqual(["registry.npmjs.org", "registry.yarnpkg.com"]);
+    expect(policy.services?.node).toEqual(fresh);
   });
 
   test("doctor names the owning service as a secondary option for blocked members", async () => {

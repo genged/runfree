@@ -47,6 +47,7 @@ import type {
   DesiredServiceEntry,
   DesiredServiceParameter,
   DesiredServiceResolved,
+  DesiredServiceSelection,
 } from "@runfree/runtime-contracts/desired-network-policy";
 import {
   credentialIdentityKey,
@@ -256,7 +257,7 @@ function serviceDefinitionDigest(svc: Service, sourceDigest?: string): string {
  */
 export function desiredServiceEntry(
   svc: Service,
-  selection: { skippedHosts?: string[]; writeMode?: ServiceWriteMode } = {},
+  selection: { hostRules?: DesiredServiceSelection["hostRules"]; skippedHosts?: string[]; writeMode?: ServiceWriteMode } = {},
   sourceDigest?: string,
 ): DesiredServiceEntry {
   const projected = desiredServicePolicy(svc, selection);
@@ -304,7 +305,12 @@ export function desiredServiceEntry(
     ...(serviceHasOAuthCredential(svc) ? svc.oauthCredential.seeds.map((seed) => seed.envVar) : []),
     ...parameters.map((parameter) => parameter.envVar),
   ])).sort();
+  // `hostRules` is the user's per-host setting, carried verbatim; the
+  // schema checks it against the resolved hosts and rules below.
   const normalizedSelection = {
+    ...(selection.hostRules && Object.keys(selection.hostRules).length > 0
+      ? { hostRules: structuredClone(selection.hostRules) }
+      : {}),
     ...(selection.writeMode ? { writeMode: selection.writeMode } : {}),
     ...(selection.skippedHosts && selection.skippedHosts.length > 0
       ? { skippedHosts: [...selection.skippedHosts].sort() }

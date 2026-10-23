@@ -248,6 +248,142 @@ describe("desired service reconciliation", () => {
   });
 });
 
+describe("service host rules through the service lifecycle", () => {
+  const ruled = (overrides: Partial<DesiredServiceEntry> = {}): DesiredServiceEntry => ({
+    revision: 1,
+    definitionDigest: digest("a"),
+    selection: { hostRules: { "b.example.com": { gitPush: "deny" } } },
+    resolved: {
+      hosts: ["a.example.com", "b.example.com"],
+      requests: { "b.example.com": { gitPush: "write" } },
+    },
+    ...overrides,
+  });
+  const rebuilt = (overrides: Partial<DesiredServiceEntry> = {}): DesiredServiceEntry => {
+    const value = ruled(overrides);
+    if (!overrides.selection) delete value.selection;
+    return value;
+  };
+  const enabled = (policy: Record<string, unknown> = {}) => withRequiredDesiredNetworkPolicyVersion({
+    version: 2 as const,
+    hosts: [] as string[],
+    services: { git: ruled() },
+    ...policy,
+  });
+
+  test("a re-enable keeps the saved hostRules and the policy compiles with them", () => {
+    const result = reconcileDesiredService(enabled(), { kind: "enable", id: "git", entry: rebuilt() });
+    expect(result.policy.services?.git.selection?.hostRules).toEqual({ "b.example.com": { gitPush: "deny" } });
+    expect(result.policy.version).toBe(4);
+    expect(result.changed).toBe(false);
+    const compiled = compileDesiredPolicies({ project: result.policy, local: { version: 2, hosts: [] } });
+    expect(compiled.policy.requests?.["b.example.com"]).toEqual({ gitPush: "deny" });
+  });
+
+  test("a re-enable that skips a host with a setting refuses and names the clear", () => {
+    expect(() => reconcileDesiredService(enabled(), {
+      kind: "enable",
+      id: "git",
+      entry: rebuilt({
+        selection: { skippedHosts: ["b.example.com"] },
+        resolved: { hosts: ["a.example.com"] },
+      }),
+    })).toThrow(
+      "--skip-host b.example.com cannot skip b.example.com in service git: it has a host rule setting; remove it first with: runfree host rules b.example.com --clear --service git",
+    );
+  });
+
+  test("a new revision that removes a host with a setting refuses", () => {
+    expect(() => reconcileDesiredService(enabled(), {
+      kind: "enable",
+      id: "git",
+      entry: rebuilt({ revision: 2, resolved: { hosts: ["a.example.com"] } }),
+    }, { layer: "local" })).toThrow(
+      "service git revision 2 no longer allows b.example.com, which has a host rule setting; remove it first with: runfree host rules b.example.com --clear --service git --local",
+    );
+  });
+
+  test("a setting broader than the new revision's OAuth rule refuses", () => {
+    const current = withRequiredDesiredNetworkPolicyVersion({
+      version: 2 as const,
+      hosts: [] as string[],
+      services: {
+        oauth: {
+          revision: 1,
+          definitionDigest: digest("a"),
+          selection: { hostRules: { "auth.example.com": { pathPrefixes: ["/oauth/token/v1"] } } },
+          resolved: {
+            hosts: ["auth.example.com"],
+            requests: { "auth.example.com": { methods: ["POST" as const], pathPrefixes: ["/oauth/token"] } },
+          },
+        },
+      },
+    });
+    expect(() => reconcileDesiredService(current, {
+      kind: "enable",
+      id: "oauth",
+      entry: {
+        revision: 2,
+        definitionDigest: digest("b"),
+        resolved: {
+          hosts: ["auth.example.com"],
+          requests: { "auth.example.com": { methods: ["POST"], pathPrefixes: ["/oauth/v2/token"] } },
+        },
+      },
+    })).toThrow(
+      /^the host rule setting for auth\.example\.com is broader than service oauth revision 2 allows \(pathPrefixes includes \/oauth\/token\/v1, .*\); remove it with: runfree host rules auth\.example\.com --clear --service oauth$/,
+    );
+  });
+
+  test("disable removes the setting with the entry and the layer validates", () => {
+    const result = reconcileDesiredService(enabled({ hosts: ["a.example.com"] }), { kind: "disable", id: "git" });
+    expect(result.policy).toEqual({ version: 2, hosts: ["a.example.com"] });
+    expect(JSON.stringify(result.policy)).not.toContain("hostRules");
+  });
+
+  test("an identical direct rule is taken over by the service; its hosts entry stays", () => {
+    const result = reconcileDesiredService(withRequiredDesiredNetworkPolicyVersion({
+      version: 2 as const,
+      hosts: ["b.example.com"],
+      requests: { "b.example.com": { gitPush: "deny" as const } },
+      services: { git: ruled() },
+    }), { kind: "enable", id: "git", entry: rebuilt() });
+    expect(result.policy.requests).toBeUndefined();
+    expect(result.policy.hosts).toEqual(["b.example.com"]);
+    expect(result.warnings).toEqual([]);
+    expect(result.notices).toEqual([
+      "b.example.com: the direct rule matched service git's rule and now belongs to the service; service disable removes it",
+    ]);
+    const compiled = compileDesiredPolicies({ project: result.policy, local: { version: 2, hosts: [] } });
+    expect(compiled.provenance.requests["b.example.com"]).toBe("service:git");
+  });
+
+  test("a different direct rule is kept with a warning naming the clear", () => {
+    const current = {
+      version: 2 as const,
+      hosts: ["b.example.com"],
+      requests: { "b.example.com": { writeAction: "allow" as const } },
+    };
+    const result = reconcileDesiredService(current, { kind: "enable", id: "git", entry: rebuilt() }, { layer: "local" });
+    expect(result.policy.requests).toEqual({ "b.example.com": { writeAction: "allow" } });
+    expect(result.notices).toEqual([]);
+    expect(result.warnings).toEqual([
+      "b.example.com has a direct rule that replaces the rule from service git; remove it with: runfree host rules b.example.com --clear --local",
+    ]);
+  });
+
+  test("a direct rule on a service host without a service rule is not legacy", () => {
+    const result = reconcileDesiredService({
+      version: 2,
+      hosts: ["a.example.com"],
+      requests: { "a.example.com": { methods: ["GET"] } },
+    }, { kind: "enable", id: "git", entry: rebuilt() });
+    expect(result.warnings).toEqual([]);
+    expect(result.notices).toEqual([]);
+    expect(result.policy.requests).toEqual({ "a.example.com": { methods: ["GET"] } });
+  });
+});
+
 describe("typed desired service mutation", () => {
   let root: string;
   let stateHome: string;
@@ -468,5 +604,84 @@ describe("typed desired service mutation", () => {
       entry: entry("local.example.com"),
     })).rejects.toThrow("the directory at this path was replaced");
     expect(fs.readFileSync(approvalsPath, "utf8")).toBe(mismatched);
+  });
+  test("a re-enable that skips a ruled host refuses before any write or host-state bind", async () => {
+    const policyPath = path.join(root, ".runfree", "network-policy.json");
+    const ruledEntry: DesiredServiceEntry = {
+      revision: 1,
+      definitionDigest: digest("a"),
+      selection: { hostRules: { "b.example.com": { writeAction: "deny" } } },
+      resolved: { hosts: ["a.example.com", "b.example.com"] },
+    };
+    fs.writeFileSync(policyPath, JSON.stringify({ version: 4, hosts: [], services: { git: ruledEntry } }));
+    const candidate = captureDesiredPolicyCandidate(root, context.project.paths.controlCandidatesDir);
+    approveNetworkCandidate(root, context.project, candidate, "network-project", "interactive");
+    const before = fs.readFileSync(policyPath, "utf8");
+    const approvalsBefore = fs.readFileSync(context.project.paths.controlApprovalsPath, "utf8");
+    let bound = false;
+
+    await expect(mutateDesiredService(context, io, "project", {
+      kind: "enable",
+      id: "git",
+      entry: {
+        revision: 1,
+        definitionDigest: digest("a"),
+        selection: { skippedHosts: ["b.example.com"] },
+        resolved: { hosts: ["a.example.com"] },
+      },
+    }, {
+      beforeWrite: () => {
+        bound = true;
+        return undefined;
+      },
+    })).rejects.toThrow("--skip-host b.example.com cannot skip b.example.com in service git: it has a host rule setting");
+    expect(bound).toBe(false);
+    expect(fs.readFileSync(policyPath, "utf8")).toBe(before);
+    expect(fs.readFileSync(context.project.paths.controlApprovalsPath, "utf8")).toBe(approvalsBefore);
+  });
+
+  test("warns about a direct rule in the other layer that replaces the service rule", async () => {
+    fs.writeFileSync(path.join(root, ".runfree", "network-policy.local.json"), JSON.stringify({
+      version: 2,
+      hosts: ["api.example.com"],
+      requests: { "api.example.com": { writeAction: "allow" } },
+    }));
+    const candidate = captureDesiredPolicyCandidate(root, context.project.paths.controlCandidatesDir);
+    approveNetworkCandidate(root, context.project, candidate, "network-local", "interactive");
+
+    const result = await mutateDesiredService(context, io, "project", {
+      kind: "enable",
+      id: "api",
+      entry: entry("api.example.com"),
+    });
+
+    expect(result.warnings).toEqual([
+      "api.example.com has a direct rule that replaces the rule from service api; remove it with: runfree host rules api.example.com --clear --local",
+    ]);
+    expect(result.notices).toEqual([]);
+  });
+
+  test("takes over an identical same-layer direct rule and reports it", async () => {
+    fs.writeFileSync(path.join(root, ".runfree", "network-policy.json"), JSON.stringify({
+      version: 2,
+      hosts: ["api.example.com"],
+      requests: { "api.example.com": { methods: ["GET"] } },
+    }));
+    const candidate = captureDesiredPolicyCandidate(root, context.project.paths.controlCandidatesDir);
+    approveNetworkCandidate(root, context.project, candidate, "network-project", "interactive");
+
+    const result = await mutateDesiredService(context, io, "project", {
+      kind: "enable",
+      id: "api",
+      entry: entry("api.example.com"),
+    });
+
+    const written = JSON.parse(fs.readFileSync(path.join(root, ".runfree", "network-policy.json"), "utf8"));
+    expect(written.requests).toBeUndefined();
+    expect(written.hosts).toEqual(["api.example.com"]);
+    expect(result.warnings).toEqual([]);
+    expect(result.notices).toEqual([
+      "api.example.com: the direct rule matched service api's rule and now belongs to the service; service disable removes it",
+    ]);
   });
 });

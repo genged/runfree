@@ -1,11 +1,15 @@
 import {
   canonicalDesiredNetworkPolicy,
+  overlayServiceHostRule,
+  serviceHostRuleNarrowingIssues,
   validateDesiredNetworkPolicy,
   withRequiredDesiredNetworkPolicyVersion,
   type DesiredNetworkPolicyJson,
   type DesiredServiceEntry,
+  type DesiredServiceHostRule,
 } from "@runfree/runtime-contracts/desired-network-policy";
 import { CliError } from "../errors.ts";
+import { remedy } from "../remedies.ts";
 import type { RuntimeContext, RuntimeIO } from "../runtime/types.ts";
 import { readApprovedNetworkPolicy, type ControlApprovalSelection } from "./approvals.ts";
 import { compileDesiredPolicies, sameControlValue } from "./compiler.ts";
@@ -17,6 +21,7 @@ import {
   type DesiredPolicyLayer,
 } from "./desired-policy-transaction.ts";
 import { ensureCheckoutLocalPolicyExcluded } from "./git-exclude.ts";
+import { legacyDirectRuleMessage, otherLayer } from "./host-rule-owner.ts";
 import type { DesiredPolicyCandidate } from "./candidates.ts";
 
 export type DesiredServiceLayer = DesiredPolicyLayer;
@@ -29,7 +34,19 @@ export type DesiredServiceMutationResult = {
   id: string;
   layer: DesiredServiceLayer;
   layerDigest: string;
+  // Stdout lines: a direct rule the service took over (spec §4.6).
+  notices: string[];
   selection: ControlApprovalSelection;
+  // `runfree warning:` lines: a direct rule that still replaces the service rule.
+  warnings: string[];
+};
+
+export type DesiredServiceReconciliation = {
+  changed: boolean;
+  id: string;
+  notices: string[];
+  policy: DesiredNetworkPolicyJson;
+  warnings: string[];
 };
 
 // Both refusals use the bare layer name for this family.
@@ -37,16 +54,124 @@ function serviceApprovalSubject(layer: DesiredServiceLayer): DesiredPolicyApprov
   return { layer, missingBaseSubject: `${layer} desired policy`, driftSubject: `${layer} desired policy` };
 }
 
+function ownValue<T>(record: Readonly<Record<string, T>> | undefined, key: string): T | undefined {
+  return record !== undefined && Object.hasOwn(record, key) ? record[key] : undefined;
+}
+
+/**
+ * Why a saved `selection.hostRules` setting cannot ride along into
+ * `nextEntry` (spec §4.5, §4.7): its host is skipped or no longer in the
+ * service, or it is broader than the service's new OAuth token-host rule.
+ * Each issue names the clear that reclaims it.
+ */
+export function serviceHostRulesFitIssues(
+  idInput: string,
+  hostRules: Readonly<Record<string, DesiredServiceHostRule>>,
+  nextEntry: DesiredServiceEntry,
+  options: { local?: boolean } = {},
+): string[] {
+  const id = idInput.toLowerCase();
+  const issues: string[] = [];
+  for (const host of Object.keys(hostRules).sort()) {
+    const clear = remedy.hostRulesClear(host, { local: options.local, service: id });
+    if (!nextEntry.resolved.hosts.includes(host)) {
+      issues.push((nextEntry.selection?.skippedHosts ?? []).includes(host)
+        ? `--skip-host ${host} cannot skip ${host} in service ${id}: it has a host rule setting; remove it first with: ${clear}`
+        : `service ${id} revision ${nextEntry.revision} no longer allows ${host}, which has a host rule setting; remove it first with: ${clear}`);
+      continue;
+    }
+    const narrowing = serviceHostRuleNarrowingIssues(ownValue(nextEntry.resolved.requests, host), hostRules[host]);
+    if (narrowing.length > 0) {
+      issues.push(`the host rule setting for ${host} is broader than service ${id} revision ${nextEntry.revision} allows (${
+        narrowing.join("; ")}); remove it with: ${clear}`);
+    }
+  }
+  return issues;
+}
+
+/** Refuses, before any write, a saved setting the next entry cannot hold. */
+export function assertServiceHostRulesFit(
+  id: string,
+  hostRules: Readonly<Record<string, DesiredServiceHostRule>> | undefined,
+  nextEntry: DesiredServiceEntry,
+  options: { local?: boolean } = {},
+): void {
+  if (hostRules === undefined) return;
+  const issues = serviceHostRulesFitIssues(id, hostRules, nextEntry, options);
+  if (issues.length > 0) throw new CliError(issues.join("\n"));
+}
+
+/**
+ * Direct rules in `policy` on the service's hosts that replace the service's
+ * rule (compiler.ts applies direct rules last). Pure: callers decide what to
+ * do with each.
+ */
+function directRulesOverService(
+  policy: DesiredNetworkPolicyJson,
+  entry: DesiredServiceEntry,
+): Array<{ direct: unknown; host: string; serviceRule: unknown }> {
+  const found: Array<{ direct: unknown; host: string; serviceRule: unknown }> = [];
+  for (const host of entry.resolved.hosts) {
+    const direct = ownValue(policy.requests, host);
+    if (direct === undefined) continue;
+    const serviceRule = overlayServiceHostRule(ownValue(entry.resolved.requests, host), ownValue(entry.selection?.hostRules, host));
+    // R3: a direct rule on a service host the service sets no rule for is an
+    // ordinary direct rule, not a replacement.
+    if (serviceRule === undefined) continue;
+    found.push({ direct, host, serviceRule });
+  }
+  return found;
+}
+
+/** Warnings for direct rules in the layer this mutation does not edit. */
+export function otherLayerDirectRuleWarnings(
+  id: string,
+  other: DesiredNetworkPolicyJson,
+  otherLayerName: DesiredPolicyLayer,
+  entry: DesiredServiceEntry | undefined,
+): string[] {
+  if (entry === undefined) return [];
+  return directRulesOverService(other, entry).map(({ host }) => legacyDirectRuleMessage(host, id, otherLayerName));
+}
+
 export function reconcileDesiredService(
   current: DesiredNetworkPolicyJson,
   mutation: DesiredServiceMutation,
-): { changed: boolean; id: string; policy: DesiredNetworkPolicyJson } {
+  options: { layer?: DesiredPolicyLayer } = {},
+): DesiredServiceReconciliation {
+  const layer = options.layer ?? "project";
   const policy = structuredClone(validateDesiredNetworkPolicy(current));
   const id = mutation.id.toLowerCase();
   const before = canonicalDesiredNetworkPolicy(policy);
+  const warnings: string[] = [];
+  const notices: string[] = [];
   if (mutation.kind === "enable") {
     const entry = structuredClone(mutation.entry);
+    // A re-enable rebuilds the entry from its own flags; the user's per-host
+    // settings are the one selection field carried across (spec §4.7). A
+    // setting the new entry cannot hold refuses here, in plan, before any
+    // write or host-state bind.
+    const hostRules = entry.selection?.hostRules ?? ownValue(policy.services, id)?.selection?.hostRules;
+    if (hostRules !== undefined) {
+      assertServiceHostRulesFit(id, hostRules, entry, { local: layer === "local" });
+      entry.selection = { ...entry.selection, hostRules: structuredClone(hostRules) };
+    }
     policy.services = { ...(policy.services ?? {}), [id]: entry };
+    // Spec §4.6, O-2: a same-layer direct rule equal to the service's rule is
+    // the service's rule written by hand, so the service takes it over (the
+    // hosts entry stays: it only allows the host). One that differs still
+    // replaces the service rule; warn, never refuse, so a project with such a
+    // rule can still upgrade its services. A takeover moves any permission
+    // field in that rule to the service, so `service disable` removes it (R15).
+    for (const { direct, host, serviceRule } of directRulesOverService(policy, entry)) {
+      if (sameControlValue(direct, serviceRule)) {
+        delete policy.requests?.[host];
+        notices.push(`${host}: the direct rule matched service ${id}'s rule and now belongs to the service; service disable removes it`);
+      } else {
+        warnings.push(legacyDirectRuleMessage(host, id, layer));
+      }
+    }
+    if (policy.requests && Object.keys(policy.requests).length === 0) delete policy.requests;
     // A token has exactly one owner in the compiled policy. A direct token of
     // the same name is the pre-service form of the same credential
     // destination: legacy migration keeps every legacy token direct precisely
@@ -82,7 +207,9 @@ export function reconcileDesiredService(
   return {
     changed: canonicalDesiredNetworkPolicy(validated) !== before,
     id,
+    notices,
     policy: validated,
+    warnings,
   };
 }
 
@@ -104,7 +231,7 @@ export async function mutateDesiredService(
     project: readApprovedNetworkPolicy(context.projectRoot, context.project, "network-project") ?? { version: 2 as const, hosts: [] },
     local: readApprovedNetworkPolicy(context.projectRoot, context.project, "network-local") ?? { version: 2 as const, hosts: [] },
   });
-  return withDesiredPolicyTransaction<ReturnType<typeof reconcileDesiredService>, DesiredServiceMutationResult>(context, io, {
+  return withDesiredPolicyTransaction<DesiredServiceReconciliation, DesiredServiceMutationResult>(context, io, {
     approvalSubject: serviceApprovalSubject(layer),
     writeSubject: "desired service write",
     transactionNoun: "service",
@@ -122,7 +249,7 @@ export async function mutateDesiredService(
       if (layer === "local") ensureCheckoutLocalPolicyExcluded(context.projectRoot, io, context.env);
     },
     plan: (before) => {
-      const planned = reconcileDesiredService(desiredLayerPolicy(before, layer), mutation);
+      const planned = reconcileDesiredService(desiredLayerPolicy(before, layer), mutation, { layer });
       // Schema validation alone cannot see cross-layer ownership: only the
       // compiler resolves project and local together. Compile the planned pair
       // before the write so no mutation can persist a desired policy that later
@@ -131,7 +258,15 @@ export async function mutateDesiredService(
         project: layer === "project" ? planned.policy : before.project,
         local: layer === "local" ? planned.policy : before.local,
       });
-      return planned;
+      // The other layer is read from its approval, as the host commands
+      // resolve owners (plan R1): its direct rules are not this write's to
+      // take over, so they only warn.
+      const other = otherLayer(layer);
+      const enabled = mutation.kind === "enable" ? ownValue(planned.policy.services, planned.id) : undefined;
+      return {
+        ...planned,
+        warnings: [...planned.warnings, ...otherLayerDirectRuleWarnings(planned.id, approvedPolicies()[other], other, enabled)],
+      };
     },
     result: ({ candidate, plan, selection }) => {
       return {
@@ -139,7 +274,9 @@ export async function mutateDesiredService(
         id: plan.id,
         layer,
         layerDigest: desiredLayerSubject(candidate, layer).digest,
+        notices: plan.notices,
         selection,
+        warnings: plan.warnings,
       };
     },
   });

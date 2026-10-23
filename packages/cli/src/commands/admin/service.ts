@@ -30,15 +30,21 @@ import {
 import { readApprovedNetworkPolicy } from "../../control/approvals.ts";
 import { activateApprovedControlsAfterMutation } from "../../control/activation.ts";
 import { activationReportLine } from "../../control/activation-report.ts";
-import { compileDesiredPolicies } from "../../control/compiler.ts";
+import { compileDesiredPolicies, sameControlValue } from "../../control/compiler.ts";
 import { compareCompiledAuthority } from "../../control/comparator.ts";
-import { mutateDesiredService, type DesiredServiceLayer } from "../../control/service-mutation.ts";
 import {
+  mutateDesiredService,
+  serviceHostRulesFitIssues,
+  type DesiredServiceLayer,
+} from "../../control/service-mutation.ts";
+import {
+  type DesiredNetworkPolicyJson,
   type DesiredServiceEntry,
   withRequiredDesiredNetworkPolicyVersion,
 } from "@runfree/runtime-contracts/desired-network-policy";
 import { CliError } from "../../errors.ts";
 import { formatTerminalTable } from "../../terminal-table.ts";
+import { warn } from "../../warnings.ts";
 import { nodeRuntimeIO } from "../../runtime.ts";
 import type { RuntimeContext } from "../../runtime/types.ts";
 import { combinedServiceRegistry, loadUserServiceCatalog } from "../../user-services.ts";
@@ -189,38 +195,62 @@ function explainDesiredService(runtime: RuntimeContext, idInput: string): void {
   }, null, 2));
 }
 
-async function diffDesiredServices(
-  runtime: RuntimeContext,
-  input: { apply: boolean; reloadProxy: boolean },
-): Promise<void> {
-  const approved = approvedDesiredServices(runtime);
-  const registry = combinedServiceRegistry(runtime.projectRoot, runtime.env);
-  const userCatalog = loadUserServiceCatalog(runtime.projectRoot, runtime.env);
-  const changes: Array<{ id: string; layer: DesiredServiceLayer; entry: ReturnType<typeof desiredServiceEntry> }> = [];
+export type ServiceRevisionChange = {
+  current: DesiredServiceEntry;
+  entry: DesiredServiceEntry;
+  id: string;
+  layer: DesiredServiceLayer;
+  // Why the change cannot carry the saved host rule settings (spec §4.5,
+  // §4.7); `--apply` refuses the whole batch while any change has one.
+  refusals: string[];
+};
+
+export type ServiceRevisionPlan = {
+  changes: ServiceRevisionChange[];
+  lines: string[];
+  proposed: { local: DesiredNetworkPolicyJson; project: DesiredNetworkPolicyJson };
+};
+
+/**
+ * Pure: compare each approved service entry with the entry the current
+ * definition builds from the same selection. The user's `hostRules` setting
+ * rides along, so an entry that differs from a fresh build only by that
+ * setting is current; comparison is key-order independent (R12).
+ */
+export function planServiceRevisionChanges(
+  approved: { local: DesiredNetworkPolicyJson; project: DesiredNetworkPolicyJson },
+  registry: Readonly<Record<string, Service>>,
+  userDigests: Readonly<Record<string, string>>,
+): ServiceRevisionPlan {
+  const lines: string[] = [];
+  const changes: ServiceRevisionChange[] = [];
   const proposed = {
     project: structuredClone(approved.project),
     local: structuredClone(approved.local),
   };
   for (const layer of ["project", "local"] as const) {
     for (const [id, current] of Object.entries(approved[layer].services ?? {}).sort(([left], [right]) => left.localeCompare(right))) {
-      const definition = registry[id];
+      const definition = Object.hasOwn(registry, id) ? registry[id] : undefined;
       if (!definition) {
-        console.log(`${id} (${layer}): definition unavailable; approved semantics retained`);
+        lines.push(`${id} (${layer}): definition unavailable; approved semantics retained`);
         continue;
       }
+      const hostRules = current.selection?.hostRules;
       const next = desiredServiceEntry(definition, {
+        hostRules,
         skippedHosts: current.selection?.skippedHosts,
         writeMode: current.selection?.writeMode,
-      }, userCatalog.services[id]?.digest);
-      if (JSON.stringify(current) === JSON.stringify(next)) {
-        console.log(`${id} (${layer}): current`);
+      }, Object.hasOwn(userDigests, id) ? userDigests[id] : undefined);
+      if (sameControlValue(current, next)) {
+        lines.push(`${id} (${layer}): current`);
         continue;
       }
-      console.log(`${id} (${layer}): revision ${current.revision} -> ${next.revision}`);
-      console.log(`  definition ${current.definitionDigest} -> ${next.definitionDigest}`);
-      console.log(`  before ${JSON.stringify(current.resolved)}`);
-      console.log(`  after  ${JSON.stringify(next.resolved)}`);
-      changes.push({ id, layer, entry: next });
+      lines.push(`${id} (${layer}): revision ${current.revision} -> ${next.revision}`);
+      lines.push(`  definition ${current.definitionDigest} -> ${next.definitionDigest}`);
+      lines.push(`  before ${JSON.stringify(current.resolved)}`);
+      lines.push(`  after  ${JSON.stringify(next.resolved)}`);
+      const refusals = hostRules ? serviceHostRulesFitIssues(id, hostRules, next, { local: layer === "local" }) : [];
+      changes.push({ current, entry: next, id, layer, refusals });
       // A new revision can need a higher desired version (github revision 3's
       // basic git-http mapping needs v3), so re-derive it for the comparison.
       proposed[layer] = withRequiredDesiredNetworkPolicyVersion({
@@ -229,7 +259,37 @@ async function diffDesiredServices(
       });
     }
   }
+  return { changes, lines, proposed };
+}
+
+function reportServiceMutation(result: { notices: readonly string[]; warnings: readonly string[] }): void {
+  for (const notice of result.notices) console.log(notice);
+  for (const warning of result.warnings) warn(warning);
+}
+
+async function diffDesiredServices(
+  runtime: RuntimeContext,
+  input: { apply: boolean; reloadProxy: boolean },
+): Promise<void> {
+  const approved = approvedDesiredServices(runtime);
+  const registry = combinedServiceRegistry(runtime.projectRoot, runtime.env);
+  const userCatalog = loadUserServiceCatalog(runtime.projectRoot, runtime.env);
+  const { changes, lines, proposed } = planServiceRevisionChanges(
+    approved,
+    registry,
+    Object.fromEntries(Object.entries(userCatalog.services).map(([id, entry]) => [id, entry.digest])),
+  );
+  for (const line of lines) console.log(line);
   if (changes.length === 0) return;
+  // A saved host rule setting the new revision cannot hold refuses the whole
+  // batch before the first mutation, so no layer is left half-upgraded. The
+  // proposed pair would not validate, so there is no authority to compare.
+  const refusals = changes.flatMap((change) => change.refusals);
+  if (refusals.length > 0) {
+    if (input.apply) throw new CliError(refusals.join("\n"));
+    for (const refusal of refusals) console.log(`  refuses: ${refusal}`);
+    return;
+  }
   const comparison = compareCompiledAuthority(
     compileDesiredPolicies({ project: approved.project, local: approved.local }),
     compileDesiredPolicies(proposed),
@@ -247,11 +307,11 @@ async function diffDesiredServices(
     values: planServiceParameterUpdate(registry[change.id]),
   }));
   for (const change of updates) {
-    await mutateDesiredService(runtime, nodeRuntimeIO, change.layer, {
+    reportServiceMutation(await mutateDesiredService(runtime, nodeRuntimeIO, change.layer, {
       kind: "enable",
       id: change.id,
       entry: change.entry,
-    }, serviceHostState(change.id, () => setAgentEnvValues(change.values)));
+    }, serviceHostState(change.id, () => setAgentEnvValues(change.values))));
   }
   if (!input.reloadProxy) {
     console.log("effective policy: unchanged (--no-reload)");
@@ -285,6 +345,7 @@ export const serviceCommand: CommandModule = {
         boundSources = bindDesiredServiceCredentialSources(plan, intent.replaceSource);
       }));
       console.log(`service ${plan.id}: ${result.changed ? "updated" : "unchanged"} in ${layer} desired policy`);
+      reportServiceMutation(result);
       console.log(`${layer} digest: ${result.layerDigest}`);
       if (boundSources.length > 0) console.log(`host-owned credential sources: ${boundSources.join(", ")} bound`);
       if (!intent.reloadProxy) {

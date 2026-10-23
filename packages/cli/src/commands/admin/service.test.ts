@@ -1,8 +1,13 @@
 import { describe, expect, test } from "vitest";
-import type { DesiredServiceEntry } from "@runfree/runtime-contracts/desired-network-policy";
+import {
+  type DesiredServiceEntry,
+  validateDesiredNetworkPolicy,
+  withRequiredDesiredNetworkPolicyVersion,
+} from "@runfree/runtime-contracts/desired-network-policy";
 
-import type { Service } from "../../../../../scripts/services.ts";
-import { formatServiceListTable, serviceListRows } from "./service.ts";
+import { SERVICES, type Service } from "../../../../../scripts/services.ts";
+import { desiredServiceEntry } from "../../admin/service-policy.ts";
+import { formatServiceListTable, planServiceRevisionChanges, serviceListRows } from "./service.ts";
 
 function entry(revision: number, hosts: string[]): DesiredServiceEntry {
   return {
@@ -101,5 +106,44 @@ describe("formatServiceListTable", () => {
 
   test("never emits tab characters", () => {
     expect(formatServiceListTable(rows, { all: true })).not.toContain("\t");
+  });
+});
+
+describe("planServiceRevisionChanges", () => {
+  const empty = { version: 2 as const, hosts: [] as string[] };
+  const layer = (services: Record<string, DesiredServiceEntry>) =>
+    validateDesiredNetworkPolicy(withRequiredDesiredNetworkPolicyVersion({ ...empty, services }));
+
+  test("an entry that differs from a fresh build only by its hostRules setting is current", () => {
+    const fresh = desiredServiceEntry(SERVICES.github, { writeMode: "read-only" });
+    const saved = { ...fresh, selection: { ...fresh.selection, hostRules: { "github.com": { gitPush: "deny" as const } } } };
+    const plan = planServiceRevisionChanges({ project: layer({ github: saved }), local: empty }, SERVICES, {});
+    expect(plan.lines).toEqual(["github (project): current"]);
+    expect(plan.changes).toEqual([]);
+  });
+
+  test("a revision change carries the saved hostRules into the next entry", () => {
+    const stale = desiredServiceEntry({ ...SERVICES.node, revision: 1 }, { hostRules: { "registry.npmjs.org": { writeAction: "deny" } } });
+    const plan = planServiceRevisionChanges({ project: empty, local: layer({ node: stale }) }, SERVICES, {});
+    expect(plan.lines[0]).toBe(`node (local): revision 1 -> ${SERVICES.node.revision}`);
+    expect(plan.changes).toHaveLength(1);
+    expect(plan.changes[0].refusals).toEqual([]);
+    expect(plan.changes[0].entry.selection?.hostRules).toEqual({ "registry.npmjs.org": { writeAction: "deny" } });
+    expect(plan.changes[0].entry.revision).toBe(SERVICES.node.revision);
+    expect(plan.proposed.local.version).toBe(4);
+    expect(() => validateDesiredNetworkPolicy(plan.proposed.local)).not.toThrow();
+  });
+
+  test("lists a refusal for a saved setting on a host the new revision removes", () => {
+    const old: Service = {
+      ...SERVICES.node,
+      revision: 1,
+      hosts: [...SERVICES.node.hosts, { host: "gone.npm.example" }],
+    };
+    const stale = desiredServiceEntry(old, { hostRules: { "gone.npm.example": { writeAction: "deny" } } });
+    const plan = planServiceRevisionChanges({ project: layer({ node: stale }), local: empty }, SERVICES, {});
+    expect(plan.changes.map((change) => change.refusals)).toEqual([[
+      `service node revision ${SERVICES.node.revision} no longer allows gone.npm.example, which has a host rule setting; remove it first with: runfree host rules gone.npm.example --clear --service node`,
+    ]]);
   });
 });

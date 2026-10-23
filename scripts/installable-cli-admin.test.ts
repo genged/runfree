@@ -74,6 +74,71 @@ describe("installable runfree CLI: admin policy", () => {
     expect(fs.readFileSync(policyPath, "utf8")).toBe(before);
   });
 
+  function hostRuleService(id: string, revision: number, hosts: string[]): void {
+    writeUserServiceDefinition(tmp, tsCliEnv(), {
+      schemaVersion: 1,
+      id,
+      label: id,
+      revision,
+      hosts: hosts.map((host) => ({ host })),
+      explanations: ["Test host rule settings across revisions."],
+    }, { replace: revision > 1 });
+  }
+
+  test("service diff --apply keeps a host rule setting set through host rules", () => {
+    expect(runCli(["init"]).status).toBe(0);
+    hostRuleService("user-rules-kept", 1, ["kept-a.example.com", "kept-b.example.com"]);
+    expect(runCli(["service", "enable", "user-rules-kept", "--no-reload"]).status).toBe(0);
+    const set = runCli(["host", "rules", "kept-b.example.com", "--write", "deny", "--no-reload"]);
+    expect(set.status, set.stderr).toBe(0);
+    selectCurrentDesiredControlsForTsCliProject();
+    hostRuleService("user-rules-kept", 2, ["kept-a.example.com", "kept-b.example.com", "kept-c.example.com"]);
+
+    const applied = runTsCli(["service", "diff", "--apply", "--no-reload"]);
+
+    expect(applied.status, applied.stderr).toBe(0);
+    const policy = JSON.parse(fs.readFileSync(path.join(tmp, ".runfree/network-policy.json"), "utf8"));
+    expect(policy.services["user-rules-kept"].revision).toBe(2);
+    expect(policy.services["user-rules-kept"].selection).toEqual({ hostRules: { "kept-b.example.com": { writeAction: "deny" } } });
+    const shown = runCli(["host", "rules", "kept-b.example.com"]);
+    expect(shown.stdout).toContain("writeAction=deny");
+    expect(shown.stdout).toContain("owner: service user-rules-kept (project)");
+  });
+
+  test("service diff --apply refuses the whole batch and leaves both layers untouched", () => {
+    expect(runCli(["init"]).status).toBe(0);
+    hostRuleService("user-rules-project", 1, ["project.example.com"]);
+    hostRuleService("user-rules-local", 1, ["local-a.example.com", "local-b.example.com"]);
+    expect(runCli(["service", "enable", "user-rules-project", "--no-reload"]).status).toBe(0);
+    expect(runCli(["service", "enable", "user-rules-local", "--local", "--no-reload"]).status).toBe(0);
+    const set = runCli(["host", "rules", "local-b.example.com", "--write", "deny", "--local", "--no-reload"]);
+    expect(set.status, set.stderr).toBe(0);
+    selectCurrentDesiredControlsForTsCliProject();
+    hostRuleService("user-rules-project", 2, ["project.example.com", "project-new.example.com"]);
+    hostRuleService("user-rules-local", 2, ["local-a.example.com"]);
+    const projectPath = path.join(tmp, ".runfree/network-policy.json");
+    const localPath = path.join(tmp, ".runfree/network-policy.local.json");
+    const projectBefore = fs.readFileSync(projectPath, "utf8");
+    const localBefore = fs.readFileSync(localPath, "utf8");
+
+    const applied = runTsCli(["service", "diff", "--apply", "--no-reload"]);
+
+    expect(applied.status).toBe(1);
+    expect(applied.stderr).toContain(
+      "service user-rules-local revision 2 no longer allows local-b.example.com, which has a host rule setting; remove it first with: runfree host rules local-b.example.com --clear --service user-rules-local --local",
+    );
+    expect(fs.readFileSync(projectPath, "utf8")).toBe(projectBefore);
+    expect(fs.readFileSync(localPath, "utf8")).toBe(localBefore);
+
+    // Reclaim: clearing the setting lets the same batch apply.
+    const cleared = runTsCli(["host", "rules", "local-b.example.com", "--clear", "--service", "user-rules-local", "--local", "--no-reload"]);
+    expect(cleared.status, cleared.stderr).toBe(0);
+    const retried = runTsCli(["service", "diff", "--apply", "--no-reload"]);
+    expect(retried.status, retried.stderr).toBe(0);
+    expect(JSON.parse(fs.readFileSync(projectPath, "utf8")).services["user-rules-project"].revision).toBe(2);
+    expect(JSON.parse(fs.readFileSync(localPath, "utf8")).services["user-rules-local"].revision).toBe(2);
+  });
+
   test("service enable refuses policy drift before writing host credential or parameter state", () => {
     expect(runCli(["init"]).status).toBe(0);
     const policyPath = path.join(tmp, ".runfree/network-policy.json");
