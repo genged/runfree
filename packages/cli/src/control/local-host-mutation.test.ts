@@ -3,15 +3,33 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+import {
+  withRequiredDesiredNetworkPolicyVersion,
+  type DesiredNetworkPolicyJson,
+  type DesiredServiceEntry,
+} from "@runfree/runtime-contracts/desired-network-policy";
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
 
+import { service as registryService } from "../../../../scripts/services.ts";
+import { desiredServiceEntry } from "../admin/service-policy.ts";
 import { projectInfo } from "../config.ts";
 import { writeLiveAttachedSessionContainerRecordFixture } from "../runtime/session-container.test-harness.ts";
 import type { CaptureResult, RuntimeContext, RuntimeIO } from "../runtime/types.ts";
 import { approveNetworkCandidate, readControlApprovalSelection } from "./approvals.ts";
 import { captureDesiredPolicyCandidate } from "./candidates.ts";
+import { compileDesiredPolicies } from "./compiler.ts";
 import { LOCAL_POLICY_EXCLUDE_PATTERN } from "./git-exclude.ts";
 import { mutateDesiredHost, readDesiredHostRules } from "./local-host-mutation.ts";
+
+type RequestRuleFlags = { readOnly: boolean; methods: string[]; pathPrefixes: string[]; denyGitPush: boolean };
+
+const DIGEST = `sha256:${"b".repeat(64)}`;
+
+function registryEntry(id: string, selection: { skippedHosts?: string[]; writeMode?: "allow-write" | "read-only" } = {}): DesiredServiceEntry {
+  const svc = registryService(id);
+  if (!svc) throw new Error(`no registry service ${id}`);
+  return desiredServiceEntry(svc, selection);
+}
 
 function command(commandName: string, args: string[]): CaptureResult {
   const result = childProcess.spawnSync(commandName, args, { encoding: "utf8" });
@@ -74,6 +92,66 @@ describe("checkout-local host mutations", () => {
     return JSON.parse(fs.readFileSync(localPolicyPath, "utf8")) as Record<string, unknown>;
   }
 
+  function projectPolicy(): Record<string, unknown> {
+    return JSON.parse(fs.readFileSync(projectPolicyPath, "utf8")) as Record<string, unknown>;
+  }
+
+  function readLayer(file: string): DesiredNetworkPolicyJson {
+    return fs.existsSync(file)
+      ? JSON.parse(fs.readFileSync(file, "utf8")) as DesiredNetworkPolicyJson
+      : { version: 2, hosts: [] };
+  }
+
+  // Writes and approves both layers, as a typed command would have left them.
+  function useLayers(project: Omit<DesiredNetworkPolicyJson, "version">, local?: Omit<DesiredNetworkPolicyJson, "version">): void {
+    fs.writeFileSync(projectPolicyPath, `${JSON.stringify(withRequiredDesiredNetworkPolicyVersion(project))}\n`);
+    if (local) fs.writeFileSync(localPolicyPath, `${JSON.stringify(withRequiredDesiredNetworkPolicyVersion(local))}\n`);
+    approveDesiredBases();
+  }
+
+  function compiledRule(host: string) {
+    return compileDesiredPolicies({ project: readLayer(projectPolicyPath), local: readLayer(localPolicyPath) }).policy.requests?.[host];
+  }
+
+  function hostRulesOf(file: string, id: string): unknown {
+    return readLayer(file).services?.[id]?.selection?.hostRules;
+  }
+
+  // Both files' bytes and both approval digests: a refusal must change none.
+  function state(): string {
+    const selection = readControlApprovalSelection(root, context.project);
+    return JSON.stringify({
+      project: fs.readFileSync(projectPolicyPath, "utf8"),
+      local: fs.existsSync(localPolicyPath) ? fs.readFileSync(localPolicyPath, "utf8") : null,
+      approvedProject: selection?.subjects["network-project"]?.digest,
+      approvedLocal: selection?.subjects["network-local"]?.digest,
+    });
+  }
+
+  async function refusesUnchanged(run: () => Promise<unknown>, message: string | RegExp): Promise<void> {
+    const before = state();
+    await expect(run()).rejects.toThrow(message);
+    expect(state()).toBe(before);
+  }
+
+  function rules(host: string, flags: Partial<RequestRuleFlags> & { write?: "allow" | "ask" | "deny"; service?: string } = {}) {
+    const { write, service, ...rule } = flags;
+    const requestRule = { readOnly: false, methods: [], pathPrefixes: [], denyGitPush: false, ...rule };
+    const hasRule = requestRule.readOnly || requestRule.methods.length > 0 || requestRule.pathPrefixes.length > 0 || requestRule.denyGitPush;
+    return {
+      kind: "rules" as const,
+      host,
+      clear: false,
+      ...(hasRule ? { requestRule } : {}),
+      ...(write ? { write } : {}),
+      ...(service ? { service } : {}),
+    };
+  }
+
+  function clear(host: string, service?: string) {
+    return { kind: "rules" as const, host, clear: true, ...(service ? { service } : {}) };
+  }
+
   test("adds, changes rules, and removes only the checkout-local host", async () => {
     const originalProject = fs.readFileSync(projectPolicyPath, "utf8");
     const added = await mutateDesiredHost(context, io(), "local", {
@@ -102,7 +180,9 @@ describe("checkout-local host mutations", () => {
     });
     await expect(readDesiredHostRules(context, io(), "local", "LOCAL.EXAMPLE.COM")).resolves.toMatchObject({
       host: "local.example.com",
-      rule: { methods: ["GET", "HEAD", "OPTIONS"], writeAction: "deny" },
+      enforced: { methods: ["GET", "HEAD", "OPTIONS"], writeAction: "deny" },
+      owner: "direct",
+      ownerLayer: "local",
       scope: "local",
     });
 
@@ -135,7 +215,7 @@ describe("checkout-local host mutations", () => {
       write: "ask",
     });
     await expect(readDesiredHostRules(context, io(), "project", "typed.example.com")).resolves.toMatchObject({
-      rule: { methods: ["POST"], pathPrefixes: ["/v1/"], gitPush: "deny", writeAction: "ask" },
+      enforced: { methods: ["POST"], pathPrefixes: ["/v1/"], gitPush: "deny", writeAction: "ask" },
     });
 
     await mutateDesiredHost(context, io(), "project", { kind: "remove", host: "typed.example.com" });
@@ -220,7 +300,10 @@ describe("checkout-local host mutations", () => {
     expect(result.warnings.join("\n")).toMatch(/runfree service disable api/);
   });
 
-  test("says a direct request rule replaced the whole rule a service owned", async () => {
+  test("a rule set on a host a service provides goes to the service, not over it", async () => {
+    // The host also has a direct hosts entry, but no direct rule: the service
+    // owns the rule (spec §4.4), so the setting is laid over its gitPush
+    // classification instead of replacing it.
     fs.writeFileSync(projectPolicyPath, JSON.stringify({
       version: 2,
       hosts: ["api.example.com"],
@@ -241,9 +324,18 @@ describe("checkout-local host mutations", () => {
       write: "allow",
     });
 
-    // The service's gitPush classification is gone, not merged with the new rule.
-    expect(result.warnings.join("\n")).toMatch(/replaces the whole request rule service:api/);
-    expect(result.warnings.join("\n")).toMatch(/gitPush/);
+    expect(result).toMatchObject({
+      changed: true,
+      owner: "service:api",
+      ownerLayer: "project",
+      before: { writeAction: "deny", gitPush: "write" },
+      after: { writeAction: "allow", gitPush: "write" },
+      warnings: [],
+    });
+    const written = projectPolicy();
+    expect(written.version).toBe(4);
+    expect(written.requests).toBeUndefined();
+    expect(written.services).toMatchObject({ api: { selection: { hostRules: { "api.example.com": { writeAction: "allow" } } } } });
   });
 
   test("refuses a tracked local policy before changing either policy or exclude", async () => {
@@ -295,6 +387,336 @@ describe("checkout-local host mutations", () => {
     expect(added.selection.subjects["network-project"]?.mechanism).toBe("typed-host-command");
     await expect(readDesiredHostRules(context, io(), "project", "live.example.com")).resolves.toMatchObject({
       host: "live.example.com",
+    });
+  });
+
+  // Spec 2026-10-23 service host rules §6. The numbers name the spec's items.
+  describe("request rules on service hosts", () => {
+    test("1: --deny-git-push on a service-only host writes the service's hostRules at version 4 (G5)", async () => {
+      useLayers({ hosts: [], services: { github: registryEntry("github") } });
+      const resolvedBefore = readLayer(projectPolicyPath).services?.github?.resolved;
+
+      const result = await mutateDesiredHost(context, io(), "project", rules("github.com", { denyGitPush: true }));
+
+      expect(result).toMatchObject({
+        changed: true,
+        owner: "service:github",
+        ownerLayer: "project",
+        before: { gitPush: "write" },
+        after: { gitPush: "deny" },
+        warnings: [],
+      });
+      const written = readLayer(projectPolicyPath);
+      expect(written.version).toBe(4);
+      expect(written.hosts).toEqual([]);
+      expect(written.requests).toBeUndefined();
+      expect(written.services?.github?.selection).toEqual({ hostRules: { "github.com": { gitPush: "deny" } } });
+      expect(written.services?.github?.resolved).toEqual(resolvedBefore);
+      expect(compiledRule("github.com")).toEqual({ gitPush: "deny" });
+      await expect(readDesiredHostRules(context, io(), "project", "github.com")).resolves.toEqual({
+        host: "github.com",
+        scope: "project",
+        owner: "service:github",
+        ownerLayer: "project",
+        enforced: { gitPush: "deny" },
+        serviceRule: { gitPush: "write" },
+        userSetting: { gitPush: "deny" },
+      });
+    });
+
+    test("2: every permission flag and --write patch a gitlab-shaped host and keep its graphql classification", async () => {
+      useLayers({ hosts: [], services: { gitlab: registryEntry("gitlab") } });
+      const serviceRule = readLayer(projectPolicyPath).services?.gitlab?.resolved.requests?.["gitlab.com"];
+      expect(serviceRule?.graphql).toBeDefined();
+
+      await mutateDesiredHost(context, io(), "project", rules("gitlab.com", { methods: ["get", "POST"] }));
+      await mutateDesiredHost(context, io(), "project", rules("gitlab.com", { pathPrefixes: ["/api/"] }));
+      await mutateDesiredHost(context, io(), "project", rules("gitlab.com", { denyGitPush: true }));
+      await mutateDesiredHost(context, io(), "project", rules("gitlab.com", { write: "deny" }));
+      expect(hostRulesOf(projectPolicyPath, "gitlab")).toEqual({
+        "gitlab.com": { gitPush: "deny", methods: ["GET", "POST"], pathPrefixes: ["/api/"], writeAction: "deny" },
+      });
+      await mutateDesiredHost(context, io(), "project", rules("gitlab.com", { readOnly: true }));
+
+      expect(compiledRule("gitlab.com")).toEqual({
+        ...serviceRule,
+        gitPush: "deny",
+        methods: ["GET", "HEAD", "OPTIONS"],
+        pathPrefixes: ["/api/"],
+        writeAction: "deny",
+      });
+      expect(compiledRule("gitlab.com")?.graphql).toEqual(serviceRule?.graphql);
+    });
+
+    test("3: --clear removes the setting, restores the service rule, and lowers the version", async () => {
+      useLayers({ hosts: [], services: { github: registryEntry("github") } });
+      const versionBefore = readLayer(projectPolicyPath).version;
+      await mutateDesiredHost(context, io(), "project", rules("github.com", { denyGitPush: true }));
+      expect(readLayer(projectPolicyPath).version).toBe(4);
+
+      const cleared = await mutateDesiredHost(context, io(), "project", clear("github.com"));
+
+      expect(cleared).toMatchObject({ changed: true, owner: "service:github", before: { gitPush: "deny" }, after: { gitPush: "write" } });
+      const written = readLayer(projectPolicyPath);
+      expect(written.version).toBe(versionBefore);
+      expect(written.services?.github?.selection).toBeUndefined();
+      expect(compiledRule("github.com")).toEqual({ gitPush: "write" });
+      // Nothing left to clear: unchanged, not a refusal.
+      await expect(mutateDesiredHost(context, io(), "project", clear("github.com"))).resolves.toMatchObject({ changed: false });
+    });
+
+    test("3: --clear keeps the service's other settings", async () => {
+      useLayers({ hosts: [], services: { github: registryEntry("github", { writeMode: "read-only" }) } });
+      await mutateDesiredHost(context, io(), "project", rules("github.com", { denyGitPush: true }));
+      await mutateDesiredHost(context, io(), "project", rules("api.github.com", { write: "ask" }));
+
+      await mutateDesiredHost(context, io(), "project", clear("github.com"));
+
+      expect(readLayer(projectPolicyPath).services?.github?.selection).toEqual({
+        hostRules: { "api.github.com": { writeAction: "ask" } },
+        writeMode: "read-only",
+      });
+    });
+
+    test("4: a legacy direct rule refuses a set with no change; --clear removes it, then the set succeeds", async () => {
+      useLayers({
+        hosts: ["github.com"],
+        requests: { "github.com": { writeAction: "allow" } },
+        services: { github: registryEntry("github") },
+      });
+
+      await refusesUnchanged(
+        () => mutateDesiredHost(context, io(), "project", rules("github.com", { denyGitPush: true })),
+        "github.com has a direct rule that replaces the rule from service github; remove it with: runfree host rules github.com --clear",
+      );
+
+      const cleared = await mutateDesiredHost(context, io(), "project", clear("github.com"));
+      expect(cleared).toMatchObject({ changed: true, before: { writeAction: "allow" }, after: { gitPush: "write" }, owner: "service:github" });
+      expect(readLayer(projectPolicyPath)).toMatchObject({ hosts: ["github.com"] });
+      expect(readLayer(projectPolicyPath).requests).toBeUndefined();
+
+      await mutateDesiredHost(context, io(), "project", rules("github.com", { denyGitPush: true }));
+      expect(hostRulesOf(projectPolicyPath, "github")).toEqual({ "github.com": { gitPush: "deny" } });
+      expect(compiledRule("github.com")).toEqual({ gitPush: "deny" });
+    });
+
+    test("4: a legacy direct rule in the other layer is named by its own --clear, which reclaims it", async () => {
+      useLayers(
+        { hosts: [], services: { github: registryEntry("github") } },
+        { hosts: ["github.com"], requests: { "github.com": { writeAction: "allow" } } },
+      );
+      const legacy = "github.com has a direct rule that replaces the rule from service github; remove it with: runfree host rules github.com --clear --local";
+
+      await refusesUnchanged(() => mutateDesiredHost(context, io(), "project", rules("github.com", { denyGitPush: true })), legacy);
+      await refusesUnchanged(() => mutateDesiredHost(context, io(), "project", clear("github.com")), legacy);
+
+      await mutateDesiredHost(context, io(), "local", clear("github.com"));
+      expect(readLayer(localPolicyPath).requests).toBeUndefined();
+      await mutateDesiredHost(context, io(), "project", rules("github.com", { denyGitPush: true }));
+      expect(compiledRule("github.com")).toEqual({ gitPush: "deny" });
+    });
+
+    test("8: on an OAuth token host a narrower setting is accepted and a broader one refused before any write", async () => {
+      useLayers({ hosts: [], services: { "google-ads": registryEntry("google-ads") } });
+      expect(compiledRule("oauth2.googleapis.com")).toEqual({ methods: ["POST"], pathPrefixes: ["/token"] });
+
+      await mutateDesiredHost(context, io(), "project", rules("oauth2.googleapis.com", { methods: ["POST"], pathPrefixes: ["/token/v2"] }));
+      expect(compiledRule("oauth2.googleapis.com")).toEqual({ methods: ["POST"], pathPrefixes: ["/token/v2"] });
+
+      await refusesUnchanged(
+        () => mutateDesiredHost(context, io(), "project", rules("oauth2.googleapis.com", { methods: ["GET"] })),
+        "service google-ads sets the methods or path prefixes for oauth2.googleapis.com, and a host rule there can only narrow them: methods includes GET, which the service rule does not allow (service methods: POST)",
+      );
+      await refusesUnchanged(
+        () => mutateDesiredHost(context, io(), "project", rules("oauth2.googleapis.com", { readOnly: true })),
+        /can only narrow them: methods includes GET/,
+      );
+      await refusesUnchanged(
+        () => mutateDesiredHost(context, io(), "project", rules("oauth2.googleapis.com", { pathPrefixes: ["/other"] })),
+        /pathPrefixes includes \/other, which is not under a service path prefix \(service pathPrefixes: \/token\)/,
+      );
+      // A writeAction only is not a method or path widening.
+      await mutateDesiredHost(context, io(), "project", rules("oauth2.googleapis.com", { write: "ask" }));
+      expect(compiledRule("oauth2.googleapis.com")).toEqual({ methods: ["POST"], pathPrefixes: ["/token/v2"], writeAction: "ask" });
+    });
+
+    test("9: two services on one host refuse without --service and accept the service that owns the rule", async () => {
+      const shared = (requests?: DesiredServiceEntry["resolved"]["requests"]): DesiredServiceEntry => ({
+        revision: 1,
+        definitionDigest: DIGEST,
+        resolved: { hosts: ["shared.example.com"], ...(requests ? { requests } : {}) },
+      });
+      useLayers({ hosts: [], services: { alpha: shared({ "shared.example.com": { gitPush: "write" } }), beta: shared() } });
+
+      await refusesUnchanged(
+        () => mutateDesiredHost(context, io(), "project", rules("shared.example.com", { denyGitPush: true })),
+        /provided by 2 services \(alpha, beta\)[\s\S]*runfree host rules shared\.example\.com --service alpha[\s\S]*runfree host rules shared\.example\.com --service beta/,
+      );
+      await refusesUnchanged(
+        () => mutateDesiredHost(context, io(), "project", rules("shared.example.com", { denyGitPush: true, service: "beta" })),
+        /already has a request rule from service alpha/,
+      );
+      await refusesUnchanged(
+        () => mutateDesiredHost(context, io(), "project", rules("shared.example.com", { denyGitPush: true, service: "gamma" })),
+        "service gamma does not provide shared.example.com; services that provide it: alpha, beta",
+      );
+
+      const result = await mutateDesiredHost(context, io(), "project", rules("shared.example.com", { denyGitPush: true, service: "alpha" }));
+      expect(result).toMatchObject({ changed: true, owner: "service:alpha" });
+      expect(hostRulesOf(projectPolicyPath, "alpha")).toEqual({ "shared.example.com": { gitPush: "deny" } });
+      expect(hostRulesOf(projectPolicyPath, "beta")).toBeUndefined();
+      expect(compiledRule("shared.example.com")).toEqual({ gitPush: "deny" });
+    });
+
+    test("9: with no service rule on the host, --service picks the owner", async () => {
+      const shared: DesiredServiceEntry = { revision: 1, definitionDigest: DIGEST, resolved: { hosts: ["shared.example.com"] } };
+      useLayers({ hosts: [], services: { alpha: shared, beta: shared } });
+
+      await mutateDesiredHost(context, io(), "project", rules("shared.example.com", { write: "deny", service: "beta" }));
+
+      expect(hostRulesOf(projectPolicyPath, "beta")).toEqual({ "shared.example.com": { writeAction: "deny" } });
+      expect(compiledRule("shared.example.com")).toEqual({ writeAction: "deny" });
+      await mutateDesiredHost(context, io(), "project", clear("shared.example.com"));
+      expect(hostRulesOf(projectPolicyPath, "beta")).toBeUndefined();
+    });
+
+    test("10: --local against a project service refuses, and a project write against a local service refuses", async () => {
+      useLayers({ hosts: [], services: { github: registryEntry("github") } });
+      await refusesUnchanged(
+        () => mutateDesiredHost(context, io(), "local", rules("github.com", { denyGitPush: true })),
+        "github.com gets its request rules from service github, which is enabled in the project desired policy; run the command without --local, e.g.: runfree host rules github.com",
+      );
+      expect(fs.existsSync(localPolicyPath)).toBe(false);
+
+      useLayers({ hosts: [] }, { hosts: [], services: { github: registryEntry("github") } });
+      await refusesUnchanged(
+        () => mutateDesiredHost(context, io(), "project", rules("github.com", { denyGitPush: true })),
+        "github.com gets its request rules from service github, which is enabled in the checkout-local desired policy; run the command with --local, e.g.: runfree host rules github.com --local",
+      );
+      await mutateDesiredHost(context, io(), "local", rules("github.com", { denyGitPush: true }));
+      expect(hostRulesOf(localPolicyPath, "github")).toEqual({ "github.com": { gitPush: "deny" } });
+      await expect(readDesiredHostRules(context, io(), "project", "github.com")).resolves.toMatchObject({
+        owner: "service:github",
+        ownerLayer: "local",
+        enforced: { gitPush: "deny" },
+      });
+    });
+
+    test("12: host remove on a service-only host refuses with the remedy; an unskippable host gets no --skip-host", async () => {
+      useLayers({ hosts: [], services: { github: registryEntry("github", { skippedHosts: ["codeload.github.com"], writeMode: "read-only" }) } });
+
+      await refusesUnchanged(
+        () => mutateDesiredHost(context, io(), "project", { kind: "remove", host: "avatars.githubusercontent.com" }),
+        [
+          "avatars.githubusercontent.com is allowlisted by service github, not by a host entry in project policy",
+          "remove the service with: runfree service disable github",
+          "or keep the service without this host: runfree service enable github --skip-host avatars.githubusercontent.com --skip-host codeload.github.com --read-only",
+        ].join("\n"),
+      );
+      const before = state();
+      const refusal = await mutateDesiredHost(context, io(), "project", { kind: "remove", host: "github.com" }).catch((error: Error) => error);
+      expect(state()).toBe(before);
+      expect(refusal).toBeInstanceOf(Error);
+      expect((refusal as Error).message).toBe([
+        "github.com is allowlisted by service github, not by a host entry in project policy",
+        "remove the service with: runfree service disable github",
+        "service github cannot skip github.com: it receives the github credential",
+      ].join("\n"));
+    });
+
+    test("12: a local service names the --local forms", async () => {
+      useLayers({ hosts: [] }, { hosts: [], services: { github: registryEntry("github") } });
+      await refusesUnchanged(
+        () => mutateDesiredHost(context, io(), "local", { kind: "remove", host: "avatars.githubusercontent.com" }),
+        /runfree service disable github --local\nor keep the service without this host: runfree service enable github --skip-host avatars\.githubusercontent\.com --local$/,
+      );
+    });
+
+    test("14: on a direct host, set flags patch their own fields and --clear removes the whole rule", async () => {
+      useLayers({ hosts: ["a.example.com"] });
+
+      await mutateDesiredHost(context, io(), "project", rules("a.example.com", { denyGitPush: true }));
+      const patched = await mutateDesiredHost(context, io(), "project", rules("a.example.com", { methods: ["GET"] }));
+      expect(patched).toMatchObject({ owner: "direct", ownerLayer: "project", before: { gitPush: "deny" }, after: { gitPush: "deny", methods: ["GET"] } });
+      await mutateDesiredHost(context, io(), "project", rules("a.example.com", { methods: ["POST", "PUT"] }));
+      expect(projectPolicy().requests).toEqual({ "a.example.com": { gitPush: "deny", methods: ["POST", "PUT"] } });
+
+      await mutateDesiredHost(context, io(), "project", clear("a.example.com"));
+      expect(projectPolicy()).toEqual({ version: 2, hosts: ["a.example.com"] });
+    });
+
+    test("14: on a service host, set flags patch the setting and --clear removes it", async () => {
+      useLayers({ hosts: [], services: { github: registryEntry("github") } });
+
+      await mutateDesiredHost(context, io(), "project", rules("github.com", { denyGitPush: true }));
+      await mutateDesiredHost(context, io(), "project", rules("github.com", { methods: ["GET"] }));
+      expect(hostRulesOf(projectPolicyPath, "github")).toEqual({ "github.com": { gitPush: "deny", methods: ["GET"] } });
+      await mutateDesiredHost(context, io(), "project", rules("github.com", { methods: ["GET", "POST"] }));
+      expect(compiledRule("github.com")).toEqual({ gitPush: "deny", methods: ["GET", "POST"] });
+
+      await mutateDesiredHost(context, io(), "project", clear("github.com"));
+      expect(compiledRule("github.com")).toEqual({ gitPush: "write" });
+    });
+
+    test("14: host add with rule flags patches a direct rule, and refuses on a service host", async () => {
+      useLayers({ hosts: ["a.example.com"], requests: { "a.example.com": { gitPush: "deny" } }, services: { github: registryEntry("github") } });
+
+      await mutateDesiredHost(context, io(), "project", {
+        kind: "add",
+        host: "a.example.com",
+        requestRule: { readOnly: true, methods: [], pathPrefixes: [], denyGitPush: false },
+      });
+      expect(projectPolicy().requests).toEqual({ "a.example.com": { gitPush: "deny", methods: ["GET", "HEAD", "OPTIONS"] } });
+
+      await refusesUnchanged(
+        () => mutateDesiredHost(context, io(), "project", {
+          kind: "add",
+          host: "github.com",
+          requestRule: { readOnly: false, methods: [], pathPrefixes: [], denyGitPush: true },
+        }),
+        "github.com gets its request rules from service github; add it without rule flags and set them with: runfree host rules github.com --deny-git-push",
+      );
+      // Without rule flags, add still writes only the direct hosts entry.
+      await mutateDesiredHost(context, io(), "project", { kind: "add", host: "github.com" });
+      expect(projectPolicy()).toMatchObject({ hosts: ["a.example.com", "github.com"] });
+      expect(compiledRule("github.com")).toEqual({ gitPush: "write" });
+    });
+
+    test("show reads any host the layer pair allows, from the other layer's approved policy", async () => {
+      useLayers({ hosts: [], services: { github: registryEntry("github") } }, { hosts: ["local.example.com"] });
+
+      await expect(readDesiredHostRules(context, io(), "local", "github.com")).resolves.toMatchObject({
+        owner: "service:github",
+        ownerLayer: "project",
+        enforced: { gitPush: "write" },
+        serviceRule: { gitPush: "write" },
+      });
+      await expect(readDesiredHostRules(context, io(), "project", "local.example.com")).resolves.toEqual({
+        host: "local.example.com",
+        owner: "none",
+        scope: "project",
+      });
+      await expect(readDesiredHostRules(context, io(), "project", "absent.example.com"))
+        .rejects.toThrow("absent.example.com is not allowlisted in project or checkout-local policy");
+    });
+
+    test("owner resolution reads the other layer's approved policy, not its unapproved file (R1)", async () => {
+      useLayers({ hosts: ["github.com"] });
+      // Unapproved local drift that would make github.com a local service host.
+      const drift = `${JSON.stringify(withRequiredDesiredNetworkPolicyVersion({
+        hosts: [],
+        services: { github: registryEntry("github") },
+      }))}\n`;
+      fs.writeFileSync(localPolicyPath, drift);
+      const approvedLocal = readControlApprovalSelection(root, context.project)?.subjects["network-local"]?.digest;
+
+      const result = await mutateDesiredHost(context, io(), "project", rules("github.com", { denyGitPush: true }));
+
+      // The approved local layer has no service, so the host is direct.
+      expect(result.owner).toBe("direct");
+      expect(projectPolicy().requests).toEqual({ "github.com": { gitPush: "deny" } });
+      expect(fs.readFileSync(localPolicyPath, "utf8")).toBe(drift);
+      expect(readControlApprovalSelection(root, context.project)?.subjects["network-local"]?.digest).toBe(approvedLocal);
     });
   });
 });

@@ -2130,6 +2130,21 @@ describe("admin credential/host/mcp commands", () => {
         runDefault,
       ),
     ).rejects.toThrow("runtimeContext() must not be called");
+    await expect(
+      runCommandApp(
+        strictContext(),
+        ["host", "rules", "shared.example.com", "--service", "github", "--deny-git-push", "--no-reload"],
+        runDefault,
+      ),
+    ).rejects.toThrow("runtimeContext() must not be called");
+    // --service takes a value.
+    await expect(
+      runCommandApp(strictContext(), ["host", "rules", "shared.example.com", "--deny-git-push", "--service"], runDefault),
+    ).rejects.toBeInstanceOf(CliError);
+    // --service is a `host rules` flag only.
+    await expect(
+      runCommandApp(strictContext(), ["host", "add", "shared.example.com", "--service", "github"], runDefault),
+    ).rejects.toMatchObject({ message: expect.stringContaining("Unknown argument: service") });
     expect(runDefault).not.toHaveBeenCalled();
   });
 

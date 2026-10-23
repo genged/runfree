@@ -27,8 +27,26 @@ export const remedy = {
   policyUseApproved: (): string => "runfree policy use-approved",
   hostAdd: (host: string, options: { local?: boolean } = {}): string => `runfree host add ${host}${options.local ? " --local" : ""}`,
   hostExplain: (host: string): string => `runfree host explain ${host}`,
-  hostRules: (host: string): string => `runfree host rules ${host}`,
+  hostRules: (host: string, options: { local?: boolean } = {}): string => `runfree host rules ${host}${options.local ? " --local" : ""}`,
+  hostRulesClear: (host: string, options: { local?: boolean; service?: string } = {}): string =>
+    `runfree host rules ${host} --clear${options.service ? ` --service ${options.service}` : ""}${options.local ? " --local" : ""}`,
+  // Names the owning service when more than one service provides the host.
+  hostRulesForService: (host: string, id: string, options: { local?: boolean } = {}): string =>
+    `runfree host rules ${host} --service ${id}${options.local ? " --local" : ""}`,
   serviceEnable: (id: string): string => `runfree service enable ${id}`,
+  serviceDisable: (id: string, options: { local?: boolean } = {}): string => `runfree service disable ${id}${options.local ? " --local" : ""}`,
+  // A re-run of `service enable` rebuilds the selection from its own flags,
+  // so the rendering repeats the hosts already skipped and the write mode.
+  serviceEnableSkipHost: (
+    id: string,
+    host: string,
+    options: { alreadySkipped?: readonly string[]; local?: boolean; writeMode?: "allow-write" | "read-only" } = {},
+  ): string => [
+    `runfree service enable ${id}`,
+    ...Array.from(new Set([...(options.alreadySkipped ?? []), host])).sort().map((skipped) => `--skip-host ${skipped}`),
+    ...(options.writeMode === "read-only" ? ["--read-only"] : options.writeMode === "allow-write" ? ["--allow-write"] : []),
+    ...(options.local ? ["--local"] : []),
+  ].join(" "),
   // `sourceArgs` repeats the credential-source flags the operator already gave
   // ("--from-source src"), so the rendered command is the one they ran plus
   // the missing parameter.
@@ -87,7 +105,22 @@ export function sampleRemedyRenderings(): string[] {
     remedy.hostAdd("api.example.com", { local: true }),
     remedy.hostExplain("api.example.com"),
     remedy.hostRules("api.example.com"),
+    remedy.hostRules("api.example.com", { local: true }),
+    remedy.hostRulesClear("api.example.com"),
+    remedy.hostRulesClear("api.example.com", { local: true }),
+    remedy.hostRulesClear("api.example.com", { local: true, service: "github" }),
+    remedy.hostRulesForService("api.example.com", "github"),
+    remedy.hostRulesForService("api.example.com", "github", { local: true }),
     remedy.serviceEnable("github"),
+    remedy.serviceDisable("github"),
+    remedy.serviceDisable("github", { local: true }),
+    remedy.serviceEnableSkipHost("github", "avatars.githubusercontent.com"),
+    remedy.serviceEnableSkipHost("github", "avatars.githubusercontent.com", {
+      alreadySkipped: ["codeload.github.com"],
+      local: true,
+      writeMode: "read-only",
+    }),
+    remedy.serviceEnableSkipHost("github", "avatars.githubusercontent.com", { writeMode: "allow-write" }),
     remedy.serviceEnableParam("apple-ads", "client-id"),
     remedy.serviceEnableParam("apple-ads", "client-id", { sourceArgs: "--from-source src" }),
     remedy.serviceEnableFromItem("apple-ads"),

@@ -76,6 +76,42 @@ describe("desired credential mutations", () => {
     expect(result.selection.subjects["network-project"]?.mechanism).toBe("typed-host-command");
   });
 
+  test("a credential write keeps a service's hostRules setting set by host rules", async () => {
+    // Every re-serializer of desired policy must carry selection.hostRules
+    // (service host rules plan §0 (b)).
+    fs.writeFileSync(context.project.paths.policyPath, `${JSON.stringify({
+      version: 2,
+      hosts: ["api.example.com"],
+      services: {
+        svc: {
+          revision: 1,
+          definitionDigest: `sha256:${"b".repeat(64)}`,
+          resolved: { hosts: ["svc.example.com"], requests: { "svc.example.com": { gitPush: "write" } } },
+        },
+      },
+    })}\n`);
+    const candidate = captureDesiredPolicyCandidate(root, context.project.paths.controlCandidatesDir);
+    approveNetworkCandidate(root, context.project, candidate, "network-project", "interactive");
+    approveNetworkCandidate(root, context.project, candidate, "network-local", "interactive");
+    await mutateDesiredHost(context, io, "project", {
+      kind: "rules",
+      host: "svc.example.com",
+      clear: false,
+      requestRule: { readOnly: false, methods: [], pathPrefixes: [], denyGitPush: true },
+    });
+
+    await mutateDesiredCredential(context, io, {
+      kind: "add",
+      name: "example",
+      credential: desiredCredentialFromFields({ host: "api.example.com" }),
+    });
+
+    const written = JSON.parse(fs.readFileSync(context.project.paths.policyPath, "utf8"));
+    expect(written.version).toBe(4);
+    expect(written.services.svc.selection).toEqual({ hostRules: { "svc.example.com": { gitPush: "deny" } } });
+    expect(written.tokens.example).toBeDefined();
+  });
+
   test("adds, links, unlinks, and removes a direct token through approved v2 transactions", async () => {
     await allow("api.example.com");
     await allow("uploads.example.com");

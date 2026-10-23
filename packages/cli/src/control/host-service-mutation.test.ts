@@ -253,4 +253,32 @@ describe("typed host-service mutations", () => {
     expect(admit).toHaveBeenCalledWith(expect.anything(), expect.anything(), 10882);
     expect(writes.replaced).toEqual([]);
   });
+
+  test("a host-service write keeps a service's hostRules setting and its version 4", async () => {
+    // Every re-serializer of desired policy must carry selection.hostRules
+    // (plan §0 (b)); a dropped key would silently remove the user's rule.
+    const policy = {
+      version: 4,
+      hosts: [],
+      services: {
+        api: {
+          revision: 1,
+          definitionDigest: `sha256:${"b".repeat(64)}`,
+          selection: { hostRules: { "api.example.com": { gitPush: "deny" } } },
+          resolved: { hosts: ["api.example.com"], requests: { "api.example.com": { gitPush: "write" } } },
+        },
+      },
+    };
+    fs.writeFileSync(projectPolicyPath, `${JSON.stringify(policy)}\n`);
+    const candidate = captureDesiredPolicyCandidate(root, context.project.paths.controlCandidatesDir);
+    approveNetworkCandidate(root, context.project, candidate, "network-project", "interactive", new Date("2026-10-04T00:00:00.000Z"));
+
+    await mutateDesiredHostService(context, io(), "project", { kind: "add", name: "idb", port: 10882 }, { admit: ADMIT_IDB });
+
+    const written = JSON.parse(fs.readFileSync(projectPolicyPath, "utf8"));
+    expect(written.version).toBe(4);
+    expect(written.services.api.selection).toEqual({ hostRules: { "api.example.com": { gitPush: "deny" } } });
+    expect(readApprovedNetworkPolicy(root, context.project, "network-project")?.services?.api?.selection)
+      .toEqual({ hostRules: { "api.example.com": { gitPush: "deny" } } });
+  });
 });

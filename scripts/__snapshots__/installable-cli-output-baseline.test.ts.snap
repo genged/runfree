@@ -79,6 +79,7 @@ exports[`output baseline: command transcripts > policy mutation before the first
   "stderr": "",
   "stdout": "scope: project
 pre.example updated
+owner: direct (project)
 updated .runfree/network-policy.json
 approved project desired policy: sha256:<digest> (approval record id)
 effective policy: unchanged (--no-reload)
@@ -92,6 +93,7 @@ exports[`output baseline: command transcripts > policy mutation before the first
   "stderr": "",
   "stdout": "scope: project
 pre.example: methods=GET,HEAD,OPTIONS pathPrefixes=all gitPush=allow
+owner: direct (project)
 ",
 }
 `;

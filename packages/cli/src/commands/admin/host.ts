@@ -22,6 +22,7 @@ import {
   readDesiredHostRules,
   type DesiredHostMutation,
   type DesiredHostScope,
+  type HostRuleOwnerLabel,
 } from "../../control/local-host-mutation.ts";
 import { activateApprovedControlsAfterMutation } from "../../control/activation.ts";
 import { activationReportLine } from "../../control/activation-report.ts";
@@ -42,7 +43,13 @@ type RequestRuleArgs = {
 };
 type AddArgs = HostArgs & RequestRuleArgs & { local?: boolean; "no-reload"?: boolean };
 type RemoveArgs = HostArgs & { local?: boolean; "no-reload"?: boolean };
-type RulesArgs = HostArgs & RequestRuleArgs & { clear?: boolean; local?: boolean; write?: string; "no-reload"?: boolean };
+type RulesArgs = HostArgs & RequestRuleArgs & {
+  clear?: boolean;
+  local?: boolean;
+  service?: string;
+  write?: string;
+  "no-reload"?: boolean;
+};
 
 const hostPositional = (cmd: Argv): Argv =>
   cmd.positional("host", { type: "string", demandOption: true, describe: "exact hostname" });
@@ -80,6 +87,15 @@ const localScopeOption = (cmd: Argv): Argv =>
     describe: "Mutate the checkout-local desired policy instead of project policy",
   });
 
+// `owner: service github (project)`, `owner: direct (checkout-local)`, or
+// `owner: none` when the host has no request rule.
+function ownerLine(owner: HostRuleOwnerLabel, layer: DesiredHostScope | undefined): string {
+  const where = layer === undefined ? "" : ` (${layer === "local" ? "checkout-local" : "project"})`;
+  if (owner === "none") return "owner: none";
+  if (owner === "direct") return `owner: direct${where}`;
+  return `owner: service ${owner.slice("service:".length)}${where}`;
+}
+
 function requestRuleFromArgs(argv: RequestRuleArgs): RequestRuleInput | undefined {
   const rule = {
     readOnly: Boolean(argv["read-only"]),
@@ -107,6 +123,7 @@ export const hostCommand: CommandModule = {
       const result = await mutateDesiredHost(runtime, nodeRuntimeIO, scope, mutation);
       console.log(`scope: ${scope === "local" ? "checkout-local" : "project"}`);
       console.log(`${result.host} ${result.changed ? "updated" : "unchanged"}`);
+      if (mutation.kind === "rules") console.log(ownerLine(result.owner, result.ownerLayer));
       for (const warning of result.warnings) console.log(`warning: ${warning}`);
       console.log(`updated .runfree/network-policy${scope === "local" ? ".local" : ""}.json`);
       console.log(`approved ${scope} desired policy: ${result.digest.slice(0, 19)}… (approval record id)`);
@@ -120,7 +137,8 @@ export const hostCommand: CommandModule = {
     const showRules = async (scope: DesiredHostScope, host: string): Promise<void> => {
       const result = await readDesiredHostRules(context.runtimeContext(), nodeRuntimeIO, scope, host);
       console.log(`scope: ${scope === "local" ? "checkout-local" : "project"}`);
-      console.log(`${result.host}: ${describeRequestRules(result.rule)}`);
+      console.log(`${result.host}: ${describeRequestRules(result.enforced)}`);
+      console.log(ownerLine(result.owner, result.ownerLayer));
     };
     return parser.command(
       "host",
@@ -170,6 +188,11 @@ export const hostCommand: CommandModule = {
             (cmd) =>
               localScopeOption(requestRuleOptions(hostPositional(cmd)))
                 .option("clear", { type: "boolean", describe: "Remove the host's request rules" })
+                .option("service", {
+                  type: "string",
+                  requiresArg: true,
+                  describe: "Name the service that owns the rule when several services provide the host",
+                })
                 .option("write", {
                   type: "string",
                   requiresArg: true,
@@ -189,6 +212,7 @@ export const hostCommand: CommandModule = {
                   clear: Boolean(argv.clear),
                   write: argv.write as "allow" | "ask" | "deny" | undefined,
                   requestRule,
+                  ...(argv.service === undefined ? {} : { service: argv.service }),
                 }, !argv["no-reload"]);
             }),
           );
