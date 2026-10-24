@@ -755,6 +755,20 @@ describe("checkout-local host mutations", () => {
       await expect(mutateDesiredHost(context, io(), "project", clear("github.com"))).resolves.toMatchObject({ changed: false, notices: [] });
     });
 
+    test("--clear reaches a project setting that a same-id local service entry replaces", async () => {
+      // The local entry shadows the project entry in the compiled policy, but
+      // a project-layer `service diff --apply` still checks the project
+      // setting and names this command as the way out, so it must work.
+      const ruled = { ...registryEntry("github"), selection: { hostRules: { "github.com": { gitPush: "deny" as const } } } };
+      useLayers({ hosts: [], services: { github: ruled } }, { hosts: [], services: { github: registryEntry("github") } });
+
+      const cleared = await mutateDesiredHost(context, io(), "project", clear("github.com", "github"));
+
+      expect(cleared).toMatchObject({ changed: true });
+      expect(readLayer(projectPolicyPath).services?.github?.selection).toBeUndefined();
+      expect(readLayer(localPolicyPath).services?.github).toEqual(registryEntry("github"));
+    });
+
     test("the owner and rules a set prints read the other layer's approved policy, not its unapproved file (R1, S5)", async () => {
       useLayers({ hosts: [], services: { github: registryEntry("github") } });
       // Unapproved local drift: a local github entry would replace the

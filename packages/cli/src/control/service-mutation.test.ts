@@ -280,6 +280,18 @@ describe("service host rules through the service lifecycle", () => {
     expect(compiled.policy.requests?.["b.example.com"]).toEqual({ gitPush: "deny" });
   });
 
+  test("the settings come from the policy read under the lock, not from a planned entry", () => {
+    // `service diff --apply` plans its entries before it takes the lock; a
+    // setting approved in between must survive the apply.
+    const planned = ruled({ selection: { hostRules: { "b.example.com": { writeAction: "ask" } } } });
+    const current = enabled({ services: { git: ruled({ selection: { hostRules: { "b.example.com": { writeAction: "deny" } } } }) } });
+    const kept = reconcileDesiredService(current, { kind: "enable", id: "git", entry: planned });
+    expect(kept.policy.services?.git.selection?.hostRules).toEqual({ "b.example.com": { writeAction: "deny" } });
+    // A setting cleared in between is not brought back by the planned copy.
+    const cleared = reconcileDesiredService(enabled({ services: { git: rebuilt() } }), { kind: "enable", id: "git", entry: planned });
+    expect(cleared.policy.services?.git.selection).toBeUndefined();
+  });
+
   test("a re-enable that skips a host with a setting refuses and names the clear", () => {
     expect(() => reconcileDesiredService(enabled(), {
       kind: "enable",

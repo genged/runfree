@@ -199,8 +199,16 @@ export function reconcileDesiredService(
     // A re-enable rebuilds the entry from its own flags; the user's per-host
     // settings are the one selection field carried across (spec §4.7). A
     // setting the new entry cannot hold refuses here, in plan, before any
-    // write or host-state bind.
-    const hostRules = entry.selection?.hostRules ?? ownValue(policy.services, id)?.selection?.hostRules;
+    // write or host-state bind. The settings come from the policy read under
+    // the lock, never from the planned entry: `service diff --apply` plans
+    // before it takes the lock, and a `host rules` change approved in between
+    // must not be reverted to the planned copy.
+    const hostRules = ownValue(policy.services, id)?.selection?.hostRules;
+    if (entry.selection?.hostRules !== undefined) {
+      const { hostRules: _planned, ...selection } = entry.selection;
+      if (Object.keys(selection).length > 0) entry.selection = selection;
+      else delete entry.selection;
+    }
     if (hostRules !== undefined) {
       assertServiceHostRulesFit(id, hostRules, entry, { local: layer === "local" });
       entry.selection = { ...entry.selection, hostRules: structuredClone(hostRules) };

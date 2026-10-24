@@ -5,6 +5,7 @@ import {
   validateDesiredNetworkPolicy,
   withRequiredDesiredNetworkPolicyVersion,
   type DesiredNetworkPolicyJson,
+  type DesiredServiceEntry,
   type DesiredServiceHostRule,
 } from "@runfree/runtime-contracts/desired-network-policy";
 import { isReservedRunfreeHostname } from "@runfree/runtime-contracts/host-services";
@@ -44,6 +45,7 @@ import {
   legacyDirectRuleMessage,
   namedProvider,
   otherLayer,
+  ownValue,
   resolveHostRuleOwner,
   serviceRuleFor,
   serviceSettingFor,
@@ -297,6 +299,15 @@ function clearHostRule(
     removeDirectRule(policy, host);
     return [];
   }
+  // A project entry that a checkout-local entry of the same id replaces is
+  // not a provider in the compiled policy, but its setting still binds a
+  // project-layer `service diff --apply`, which names this command as the
+  // way out. Clear it from the edited layer directly.
+  const shadowed = shadowedServiceSettings(pair, policy, scope, host, service);
+  if (shadowed.length === 1) {
+    removeServiceSetting(editedServiceEntry(policy, shadowed[0]), host);
+    return [];
+  }
   const providers = hostRuleProviders(pair, host);
   const named = namedProvider(providers, host, service);
   if (providers.length === 0) {
@@ -322,7 +333,31 @@ function clearHostRule(
   }
   const target = holders[0];
   assertServiceLayer(target, scope, host, { kind: "clear" });
-  const entry = editedServiceEntry(policy, target.id);
+  removeServiceSetting(editedServiceEntry(policy, target.id), host);
+  return [];
+}
+
+/**
+ * Edited-layer service entries with a setting for `host` that the other
+ * layer replaces (a local entry of the same id shadows a project entry), so
+ * `hostRuleProviders` cannot see them. Narrowed to `service` when named.
+ */
+function shadowedServiceSettings(
+  pair: HostRulePair,
+  policy: DesiredNetworkPolicyJson,
+  scope: DesiredHostScope,
+  host: string,
+  service: string | undefined,
+): string[] {
+  if (scope !== "project") return [];
+  return Object.entries(policy.services ?? {})
+    .filter(([id, entry]) => (service === undefined || id === service)
+      && ownValue(pair.local.services, id) !== undefined
+      && ownValue(entry.selection?.hostRules, host) !== undefined)
+    .map(([id]) => id);
+}
+
+function removeServiceSetting(entry: DesiredServiceEntry, host: string): void {
   const hostRules = { ...entry.selection?.hostRules };
   delete hostRules[host];
   const selection = { ...entry.selection };
@@ -330,7 +365,6 @@ function clearHostRule(
   const nextSelection = Object.keys(hostRules).length > 0 ? { ...selection, hostRules } : selection;
   if (Object.keys(nextSelection).length > 0) entry.selection = nextSelection;
   else delete entry.selection;
-  return [];
 }
 
 function serviceOnlyHostRemoveRefusal(host: string, providers: ReturnType<typeof hostRuleProviders>, scope: DesiredHostScope): CliError {
