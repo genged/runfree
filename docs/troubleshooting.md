@@ -75,6 +75,34 @@ runfree service disable <id>   # removes the service's hosts unless still requir
 `service disable` leaves a host you added yourself with `runfree host add`,
 because that is a separate authority. Remove that one afterwards.
 
+If no `runfree host add` entry exists, the host comes only from a service.
+`runfree host remove` then refuses and names `runfree service disable <id>`,
+or `runfree service enable <id> --skip-host <host>` when the service can skip
+that host.
+
+## A host rule on a service host is refused
+
+`runfree host rules <host>` stores a setting on a service host with the
+service. It refuses in these cases:
+
+- **`<host> has a direct rule that replaces the rule from service <id>`.** An
+  older direct rule overrides the service rule. Run the printed
+  `runfree host rules <host> --clear`, then set the rule again.
+- **Two services allow the host.** Repeat the command with
+  `--service <id>` for the service that owns the rule.
+- **The host's service is in the other layer.** Add or drop `--local` as the
+  message says.
+- **The setting is broader than the service allows.** On an OAuth token host
+  you can only narrow the service's methods and paths.
+- **`service <id> has no git handling for <host>`.** `--deny-git-push` works
+  only on a host where the service handles git. Use `--method` or
+  `--write deny` instead.
+
+`runfree service diff --apply` and a re-run of `runfree service enable` refuse
+when a saved setting no longer fits the service. Each message names
+`runfree host rules <host> --clear --service <id>`. See
+[Manage hosts](cli.md#manage-hosts).
+
 ## The runtime will not start
 
 ```bash

@@ -87,6 +87,13 @@ Some revisions need desired policy version 3 (the `github` revision 3 and
 every teammate needs a Runfree release that reads version 3; older releases
 refuse the file with `version must be 2`.
 
+A `runfree host rules` setting on a host that a service allows, such as
+`runfree host rules github.com --deny-git-push`, needs desired policy version
+4. Once it is committed, every teammate needs a Runfree release that reads
+version 4; older releases refuse the file (`version must be 2`, or
+`version must be one of: 2, 3`). `runfree host rules <host> --clear` removes
+the setting, and the file goes back to the lower version.
+
 For a bundle Runfree does not curate, define it once and commit it:
 
 ```bash
