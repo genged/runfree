@@ -186,7 +186,7 @@ export function shadowedProjectHostRulesWarnings(id: string, project: DesiredNet
 export function reconcileDesiredService(
   current: DesiredNetworkPolicyJson,
   mutation: DesiredServiceMutation,
-  options: { layer?: DesiredPolicyLayer } = {},
+  options: { layer?: DesiredPolicyLayer; shadowed?: boolean } = {},
 ): DesiredServiceReconciliation {
   const layer = options.layer ?? "project";
   const policy = structuredClone(validateDesiredNetworkPolicy(current));
@@ -223,8 +223,12 @@ export function reconcileDesiredService(
     // disable` remove that restriction while the host stays allowed. A rule
     // that stays still replaces the service rule; warn, never refuse, so a
     // project with such a rule can still upgrade its services.
+    // A project entry that a same-id checkout-local entry replaces is not the
+    // rule the compiler picks, so matching it proves nothing about the
+    // enforced rule: deleting the direct rule would expose the local entry's
+    // rule instead. Keep the direct rule there and warn.
     for (const { direct, host, serviceRule } of directRulesOverService(policy, entry)) {
-      if (!hasPermissionField(direct) && sameControlValue(direct, serviceRule)) {
+      if (!options.shadowed && !hasPermissionField(direct) && sameControlValue(direct, serviceRule)) {
         delete policy.requests?.[host];
         notices.push(`${host}: the direct rule matched service ${id}'s rule and now belongs to the service; service disable removes it`);
       } else {
@@ -309,7 +313,13 @@ export async function mutateDesiredService(
       if (layer === "local") ensureCheckoutLocalPolicyExcluded(context.projectRoot, io, context.env);
     },
     plan: (before) => {
-      const planned = reconcileDesiredService(desiredLayerPolicy(before, layer), mutation, { layer });
+      const other = otherLayer(layer);
+      const approvedOther = approvedPolicies()[other];
+      // Either copy of the local layer counts: skipping a takeover is the
+      // conservative choice when the two disagree.
+      const shadowed = layer === "project" && (ownValue(approvedOther.services, mutation.id.toLowerCase()) !== undefined
+        || ownValue(before.local.services, mutation.id.toLowerCase()) !== undefined);
+      const planned = reconcileDesiredService(desiredLayerPolicy(before, layer), mutation, { layer, shadowed });
       // Schema validation alone cannot see cross-layer ownership: only the
       // compiler resolves project and local together. Compile the planned pair
       // before the write so no mutation can persist a desired policy that later
@@ -321,9 +331,7 @@ export async function mutateDesiredService(
       // The other layer is read from its approval, as the host commands
       // resolve owners (plan R1): its direct rules are not this write's to
       // take over, so they only warn.
-      const other = otherLayer(layer);
       const enabled = mutation.kind === "enable" ? ownValue(planned.policy.services, planned.id) : undefined;
-      const approvedOther = approvedPolicies()[other];
       return {
         ...planned,
         warnings: [

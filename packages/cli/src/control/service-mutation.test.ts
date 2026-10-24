@@ -808,6 +808,42 @@ describe("typed desired service mutation", () => {
     ]);
   });
 
+  test("keeps a matching project direct rule when a same-id local entry shadows the project entry", async () => {
+    // The compiler picks the local entry, so the project entry matching the
+    // direct rule proves nothing: deleting the direct rule would expose the
+    // local entry's writeAction: allow on a host that now asks.
+    const classifying: DesiredServiceEntry = {
+      revision: 1,
+      definitionDigest: digest("a"),
+      resolved: { hosts: ["api.example.com"], requests: { "api.example.com": { readPathPrefixes: ["/search"] } } },
+    };
+    const projectPath = path.join(root, ".runfree", "network-policy.json");
+    const directRule = { readPathPrefixes: ["/search"] };
+    fs.writeFileSync(projectPath, JSON.stringify({ version: 2, hosts: ["api.example.com"], requests: { "api.example.com": directRule } }));
+    fs.writeFileSync(path.join(root, ".runfree", "network-policy.local.json"), JSON.stringify({
+      version: 2,
+      hosts: [],
+      services: { api: { ...classifying, resolved: { ...classifying.resolved, requests: { "api.example.com": { ...directRule, writeAction: "allow" } } } } },
+    }));
+    const candidate = captureDesiredPolicyCandidate(root, context.project.paths.controlCandidatesDir);
+    approveNetworkCandidate(root, context.project, candidate, "network-project", "interactive");
+    approveNetworkCandidate(root, context.project, candidate, "network-local", "interactive");
+
+    const result = await mutateDesiredService(context, io, "project", { kind: "enable", id: "api", entry: classifying });
+
+    const written = JSON.parse(fs.readFileSync(projectPath, "utf8"));
+    expect(written.requests).toEqual({ "api.example.com": directRule });
+    expect(result.notices).toEqual([]);
+    expect(result.warnings).toContain(
+      "api.example.com has a direct rule that replaces the rule from service api; remove it with: runfree host rules api.example.com --clear",
+    );
+    const compiled = compileDesiredPolicies({
+      project: written,
+      local: JSON.parse(fs.readFileSync(path.join(root, ".runfree", "network-policy.local.json"), "utf8")),
+    });
+    expect(compiled.policy.requests?.["api.example.com"]).toEqual(directRule);
+  });
+
   test("keeps an identical direct rule that restricts, so service disable leaves the restriction (S1)", async () => {
     const policyPath = path.join(root, ".runfree", "network-policy.json");
     fs.writeFileSync(policyPath, JSON.stringify({
