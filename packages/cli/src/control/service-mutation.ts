@@ -48,6 +48,8 @@ export type DesiredServiceReconciliation = {
   id: string;
   notices: string[];
   policy: DesiredNetworkPolicyJson;
+  /** Direct rules this enable deleted because the service took them over. */
+  takenOver: Array<{ direct: RequestPolicyJson; host: string }>;
   warnings: string[];
 };
 
@@ -186,7 +188,7 @@ export function shadowedProjectHostRulesWarnings(id: string, project: DesiredNet
 export function reconcileDesiredService(
   current: DesiredNetworkPolicyJson,
   mutation: DesiredServiceMutation,
-  options: { layer?: DesiredPolicyLayer; shadowed?: boolean } = {},
+  options: { layer?: DesiredPolicyLayer; keepDirect?: ReadonlySet<string> } = {},
 ): DesiredServiceReconciliation {
   const layer = options.layer ?? "project";
   const policy = structuredClone(validateDesiredNetworkPolicy(current));
@@ -194,6 +196,7 @@ export function reconcileDesiredService(
   const before = canonicalDesiredNetworkPolicy(policy);
   const warnings: string[] = [];
   const notices: string[] = [];
+  const takenOver: Array<{ direct: RequestPolicyJson; host: string }> = [];
   if (mutation.kind === "enable") {
     const entry = structuredClone(mutation.entry);
     // A re-enable rebuilds the entry from its own flags; the user's per-host
@@ -223,13 +226,13 @@ export function reconcileDesiredService(
     // disable` remove that restriction while the host stays allowed. A rule
     // that stays still replaces the service rule; warn, never refuse, so a
     // project with such a rule can still upgrade its services.
-    // A project entry that a same-id checkout-local entry replaces is not the
-    // rule the compiler picks, so matching it proves nothing about the
-    // enforced rule: deleting the direct rule would expose the local entry's
-    // rule instead. Keep the direct rule there and warn.
+    // `keepDirect` names hosts where the caller found that the other layer
+    // would change the enforced rule if this one were deleted
+    // (unsafeServiceTakeovers).
     for (const { direct, host, serviceRule } of directRulesOverService(policy, entry)) {
-      if (!options.shadowed && !hasPermissionField(direct) && sameControlValue(direct, serviceRule)) {
+      if (!options.keepDirect?.has(host) && !hasPermissionField(direct) && sameControlValue(direct, serviceRule)) {
         delete policy.requests?.[host];
+        takenOver.push({ direct, host });
         notices.push(`${host}: the direct rule matched service ${id}'s rule and now belongs to the service; service disable removes it`);
       } else {
         warnings.push(legacyDirectRuleMessage(host, id, layer));
@@ -273,8 +276,38 @@ export function reconcileDesiredService(
     id,
     notices,
     policy: validated,
+    takenOver,
     warnings,
   };
+}
+
+/**
+ * Hosts whose takeover would change the enforced rule once the other layer
+ * is compiled in: a same-id local entry that replaces the project entry, or a
+ * direct rule in the other layer that the deleted one was overriding. A
+ * policy pair that does not compile counts as unsafe.
+ */
+export function unsafeServiceTakeovers(
+  planned: DesiredServiceReconciliation,
+  layer: DesiredPolicyLayer,
+  others: readonly DesiredNetworkPolicyJson[],
+): Set<string> {
+  const unsafe = new Set<string>();
+  const enforced = (edited: DesiredNetworkPolicyJson, other: DesiredNetworkPolicyJson, host: string) =>
+    ownValue(compileDesiredPolicies(layer === "project" ? { project: edited, local: other } : { project: other, local: edited })
+      .policy.requests, host);
+  for (const { direct, host } of planned.takenOver) {
+    const restored = structuredClone(planned.policy);
+    restored.requests = { ...restored.requests, [host]: direct };
+    for (const other of others) {
+      try {
+        if (!sameControlValue(enforced(planned.policy, other, host), enforced(restored, other, host))) unsafe.add(host);
+      } catch {
+        unsafe.add(host);
+      }
+    }
+  }
+  return unsafe;
 }
 
 export async function mutateDesiredService(
@@ -315,11 +348,13 @@ export async function mutateDesiredService(
     plan: (before) => {
       const other = otherLayer(layer);
       const approvedOther = approvedPolicies()[other];
-      // Either copy of the local layer counts: skipping a takeover is the
-      // conservative choice when the two disagree.
-      const shadowed = layer === "project" && (ownValue(approvedOther.services, mutation.id.toLowerCase()) !== undefined
-        || ownValue(before.local.services, mutation.id.toLowerCase()) !== undefined);
-      const planned = reconcileDesiredService(desiredLayerPolicy(before, layer), mutation, { layer, shadowed });
+      const current = desiredLayerPolicy(before, layer);
+      let planned = reconcileDesiredService(current, mutation, { layer });
+      // A takeover must leave the enforced rule as it was. Either copy of the
+      // other layer counts: skipping a takeover is the conservative choice
+      // when the two disagree.
+      const keepDirect = unsafeServiceTakeovers(planned, layer, [approvedOther, desiredLayerPolicy(before, other)]);
+      if (keepDirect.size > 0) planned = reconcileDesiredService(current, mutation, { layer, keepDirect });
       // Schema validation alone cannot see cross-layer ownership: only the
       // compiler resolves project and local together. Compile the planned pair
       // before the write so no mutation can persist a desired policy that later

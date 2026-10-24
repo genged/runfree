@@ -844,6 +844,36 @@ describe("typed desired service mutation", () => {
     expect(compiled.policy.requests?.["api.example.com"]).toEqual(directRule);
   });
 
+  test("keeps a matching local direct rule that overrides a different project direct rule", async () => {
+    // Deleting the local rule would let the project rule (writeAction: allow)
+    // override the service rule, so writes that asked would be allowed.
+    const classifying: DesiredServiceEntry = {
+      revision: 1,
+      definitionDigest: digest("a"),
+      resolved: { hosts: ["api.example.com"], requests: { "api.example.com": { readPathPrefixes: ["/search"] } } },
+    };
+    const localPath = path.join(root, ".runfree", "network-policy.local.json");
+    const projectPath = path.join(root, ".runfree", "network-policy.json");
+    const localRule = { readPathPrefixes: ["/search"] };
+    fs.writeFileSync(projectPath, JSON.stringify({
+      version: 2,
+      hosts: ["api.example.com"],
+      requests: { "api.example.com": { writeAction: "allow" } },
+    }));
+    fs.writeFileSync(localPath, JSON.stringify({ version: 2, hosts: ["api.example.com"], requests: { "api.example.com": localRule } }));
+    const candidate = captureDesiredPolicyCandidate(root, context.project.paths.controlCandidatesDir);
+    approveNetworkCandidate(root, context.project, candidate, "network-project", "interactive");
+    approveNetworkCandidate(root, context.project, candidate, "network-local", "interactive");
+
+    const result = await mutateDesiredService(context, io, "local", { kind: "enable", id: "api", entry: classifying });
+
+    const written = JSON.parse(fs.readFileSync(localPath, "utf8"));
+    expect(written.requests).toEqual({ "api.example.com": localRule });
+    expect(result.notices).toEqual([]);
+    const compiled = compileDesiredPolicies({ project: JSON.parse(fs.readFileSync(projectPath, "utf8")), local: written });
+    expect(compiled.policy.requests?.["api.example.com"]).toEqual(localRule);
+  });
+
   test("keeps an identical direct rule that restricts, so service disable leaves the restriction (S1)", async () => {
     const policyPath = path.join(root, ".runfree", "network-policy.json");
     fs.writeFileSync(policyPath, JSON.stringify({
