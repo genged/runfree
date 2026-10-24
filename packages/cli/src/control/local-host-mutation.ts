@@ -295,21 +295,23 @@ function clearHostRule(
   host: string,
   service: string | undefined,
 ): string[] {
-  if (directRuleFor(policy, host) !== undefined) {
-    removeDirectRule(policy, host);
-    return [];
-  }
   // A project entry that a checkout-local entry of the same id replaces is
   // not a provider in the compiled policy, but its setting still binds a
   // project-layer `service diff --apply`, which names this command as the
   // way out. Clear it from the edited layer directly.
   const shadowed = shadowedServiceSettings(pair, policy, scope, host, service);
+  const providers = hostRuleProviders(pair, host);
+  // A `--service` that names no provider refuses before anything is removed,
+  // the direct rule included, as show and set refuse it.
+  const named = shadowed.length === 0 ? namedProvider(providers, host, service) : undefined;
+  if (directRuleFor(policy, host) !== undefined) {
+    removeDirectRule(policy, host);
+    return [];
+  }
   if (shadowed.length === 1) {
     removeServiceSetting(editedServiceEntry(policy, shadowed[0]), host);
     return [];
   }
-  const providers = hostRuleProviders(pair, host);
-  const named = namedProvider(providers, host, service);
   if (providers.length === 0) {
     assertDirectHost(pair, scope, host);
     return [];

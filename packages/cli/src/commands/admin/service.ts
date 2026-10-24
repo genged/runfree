@@ -292,7 +292,11 @@ async function diffDesiredServices(
   // A saved host rule setting the new revision cannot hold refuses the whole
   // batch before the first mutation, so no layer is left half-upgraded. The
   // proposed pair would not validate, so there is no authority to compare;
-  // every refusal is still listed.
+  // every refusal is still listed. Like the parameter preflight below, this
+  // reads the approvals before any lock: a setting approved concurrently is
+  // refused by that service's own locked fit check (reconcileDesiredService),
+  // which fails closed and leaves earlier services applied; rerunning
+  // `service diff --apply` after the named --clear finishes the batch.
   const refusals = changes.flatMap((change) => change.refusals);
   if (refusals.length > 0) {
     if (input.apply) throw new CliError(refusals.join("\n"));

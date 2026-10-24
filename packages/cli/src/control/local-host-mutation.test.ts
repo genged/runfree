@@ -755,6 +755,22 @@ describe("checkout-local host mutations", () => {
       await expect(mutateDesiredHost(context, io(), "project", clear("github.com"))).resolves.toMatchObject({ changed: false, notices: [] });
     });
 
+    test("--clear --service naming a service that does not provide the host refuses before removing a direct rule", async () => {
+      useLayers({
+        hosts: ["a.example.com"],
+        requests: { "a.example.com": { writeAction: "deny" } },
+        services: { github: registryEntry("github") },
+      });
+
+      await refusesUnchanged(
+        () => mutateDesiredHost(context, io(), "project", clear("a.example.com", "github")),
+        "service github does not provide a.example.com",
+      );
+      // Without the wrong selector, the direct-first clear still works.
+      await expect(mutateDesiredHost(context, io(), "project", clear("a.example.com"))).resolves.toMatchObject({ changed: true });
+      expect(readLayer(projectPolicyPath).requests).toBeUndefined();
+    });
+
     test("--clear reaches a project setting that a same-id local service entry replaces", async () => {
       // The local entry shadows the project entry in the compiled policy, but
       // a project-layer `service diff --apply` still checks the project
