@@ -1073,7 +1073,7 @@ Supported source types include:
 - 1Password secret refs;
 - host-owned commands such as `gh auth token`;
 - stdin for one-shot setup;
-- generated JWT sources;
+- generated JWT sources: ES256 signers, and Google service-account signers whose key stays in 1Password and is read on the host for each signature;
 - service-specific OAuth seed material.
 
 The host CLI records the source and syncs resolved values into proxy-only token state. The proxy strips conflicting inbound credential headers and injects configured headers only for matching hosts and optional path prefixes. OAuth-backed services expose agent-visible handles, while token material remains mediated by the proxy.

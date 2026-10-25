@@ -428,6 +428,8 @@ Credentials:
       Add a reusable host-owned JWT source
   runfree credential source add google-service-account <name> --key-json-from-1password op://... --scope <scope> [--ttl 55m]
       Add a reusable host-owned Google service-account source (RS256 JWT, key JSON stays in 1Password)
+      --replace-source refuses to add the webmasters write scope while a binding project allows
+      searchconsole.googleapis.com writes without approval
   runfree credential source list
   runfree credential source show <name>
   runfree credential source remove <name>

@@ -148,7 +148,7 @@ const sourceAddBuilder = (cmd: Argv): Argv =>
     .option("claim", { type: "string", array: true, requiresArg: true, nargs: 1, group: JWT_SOURCE_GROUP, describe: "JWT claim key=value (repeatable)" })
     .option("header", { type: "string", array: true, requiresArg: true, nargs: 1, group: JWT_SOURCE_GROUP, describe: "JWT header key=value (repeatable)" })
     .option("key-json-from-1password", { type: "string", requiresArg: true, group: GOOGLE_SA_SOURCE_GROUP, describe: "Service-account key JSON 1Password ref" })
-    .option("scope", { type: "string", array: true, requiresArg: true, nargs: 1, group: GOOGLE_SA_SOURCE_GROUP, describe: "OAuth scope for the JWT (repeatable)" });
+    .option("scope", { type: "string", array: true, requiresArg: true, nargs: 1, group: GOOGLE_SA_SOURCE_GROUP, describe: "OAuth scope for the JWT (repeatable): https://www.googleapis.com/auth/webmasters.readonly or https://www.googleapis.com/auth/webmasters" });
 
 type SourceAddFlags = ReadonlyArray<readonly [keyof SourceAddArgs, string]>;
 const JWT_ONLY_FLAGS: SourceAddFlags = [

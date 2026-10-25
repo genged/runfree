@@ -327,7 +327,7 @@ function writeRegistryFile(stateRoot: string, file: RegistryFile): void {
 // recorded root still hashes back to its own directory name.
 // ---------------------------------------------------------------------------
 
-function knownProjectPointers(stateRoot: string): Array<{ id: string; root: string }> {
+export function knownProjectPointers(stateRoot: string): Array<{ id: string; root: string }> {
   const projectsRoot = path.join(stateRoot, "projects");
   let directory: fs.Dir;
   try {

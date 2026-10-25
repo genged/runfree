@@ -1,13 +1,14 @@
 import { describe, expect, test } from "vitest";
 
 import { SERVICES } from "../../../../scripts/services.ts";
-import type { SourceRegistry } from "./admin-core.ts";
+import type { NamedSource, SourceRegistry } from "./admin-core.ts";
 import {
   SEARCH_CONSOLE_HOST,
   SEARCH_CONSOLE_TOKEN,
   searchConsoleBindingScope,
   searchConsoleWarningFor,
   searchConsoleWriteScopeWarning,
+  scopesAddWrite,
 } from "./search-console-write-guard.ts";
 
 const REMEDY = "runfree host rules searchconsole.googleapis.com --write ask";
@@ -68,5 +69,48 @@ describe("search console write-scope guard (spec §5.1)", () => {
     expect(searchConsoleWarningFor({ policy: hostAskOverDefaultAllow, binding, registry: commandRegistry })).toBeUndefined();
     expect(searchConsoleWarningFor({ policy: defaultPosture, binding, registry: commandRegistry })).toBeUndefined();
     expect(searchConsoleWarningFor({ policy: allowByHost, binding: undefined, registry: undefined })).toBeUndefined();
+  });
+});
+
+describe("search console write-scope guard: google-service-account scope (spec §5.1, Phase 2)", () => {
+  const RO = "https://www.googleapis.com/auth/webmasters.readonly";
+  const W = "https://www.googleapis.com/auth/webmasters";
+  const binding = { source: "named", name: "gsc" } as const;
+  const allowByHost = { requests: { [SEARCH_CONSOLE_HOST]: { writeAction: "allow" as const } } };
+
+  function saSource(scopes: string[]): NamedSource {
+    return {
+      type: "google-service-account",
+      keyJson: { source: "1password", ref: "op://Private/gsc-sa/credential.json" },
+      clientEmail: "gsc-reader@my-project-123.iam.gserviceaccount.com",
+      scopes,
+      ttlSeconds: 3300,
+      createdAt: "2026-10-25T00:00:00.000Z",
+    };
+  }
+
+  test("a service-account source proves its scope from the registry record", () => {
+    expect(searchConsoleBindingScope(binding, { gsc: saSource([RO]) })).toBe("read-only");
+    expect(searchConsoleBindingScope(binding, { gsc: saSource([W]) })).toBe("write");
+    expect(searchConsoleBindingScope(binding, { gsc: saSource([W, RO]) })).toBe("write");
+  });
+
+  test("a read-only service-account source is safe under allow; a write scope warns as such", () => {
+    expect(searchConsoleWarningFor({ policy: allowByHost, binding, registry: { gsc: saSource([RO]) } })).toBeUndefined();
+    const warning = searchConsoleWarningFor({ policy: allowByHost, binding, registry: { gsc: saSource([W, RO]) } });
+    expect(warning).toContain("has a Search Console write scope");
+    expect(warning).toContain(REMEDY);
+  });
+
+  test("scopesAddWrite: only a change that can newly grant webmasters writes", () => {
+    expect(scopesAddWrite(undefined, [W])).toBe(true);
+    expect(scopesAddWrite(saSource([RO]), [RO, W])).toBe(true);
+    expect(scopesAddWrite(saSource([RO, W]), [W])).toBe(false);
+    expect(scopesAddWrite(saSource([W]), [RO])).toBe(false);
+    // A command source's scope is unknown, so a write scope is new.
+    expect(scopesAddWrite(commandRegistry.gsc, [W])).toBe(true);
+    for (const previous of [undefined, saSource([RO]), saSource([W]), commandRegistry.gsc]) {
+      expect(scopesAddWrite(previous, [RO])).toBe(false);
+    }
   });
 });

@@ -398,12 +398,51 @@ runfree credential source add jwt appstore \
   --private-key-from-1password op://vault/appstore/key \
   --claim iss=ISSUER_ID \
   --ttl 19m
+runfree credential source add google-service-account gsc \
+  --key-json-from-1password op://vault/gsc-sa/credential.json \
+  --scope https://www.googleapis.com/auth/webmasters.readonly
 runfree credential source list
 runfree credential source show github-cli
 runfree credential source remove github-cli
 ```
 
 Everything after `--` in `credential source add <name> -- <command>` is source command argv, not Runfree options.
+
+A `google-service-account` source signs a Google self-signed RS256 JWT on the
+host for the [`google-search-console`](#google-search-console) service. The
+key JSON stays in 1Password: the CLI reads it for each signature and never
+stores the key JSON, the private key, or the key id; the proxy gets only the
+signed JWT.
+
+- `--scope` is required and repeatable. Only
+  `https://www.googleapis.com/auth/webmasters.readonly` and
+  `https://www.googleapis.com/auth/webmasters` are accepted.
+- `--ttl` is the JWT lifetime, from `5m` to `60m`; the default is `55m`. A
+  binding without `--refresh-every` refreshes one minute before the JWT
+  expires (every `54m` at the default), and an explicit `--refresh-every`
+  must be shorter than the TTL.
+- `add` reads the key JSON once to check it and to sign a test JWT. It refuses
+  a key that is not a service-account key, not RSA, shorter than 2048 bits, or
+  encrypted, and refuses a `universe_domain` other than `googleapis.com`. The
+  refusal names the field and never prints the key.
+- The source pins the key's `client_email`. A key JSON for another service
+  account fails every later sync until you rerun the same `add` command with
+  `--replace-source`, which pins the new account.
+- `credential sync --watch` keeps the parsed key in memory for at most 4
+  hours, then reads 1Password again. It stops using a key removed from
+  1Password within 4 hours plus one TTL (5 hours at the defaults). To stop a
+  key at once, delete it in Google Cloud IAM.
+- The service account needs no Google Cloud IAM roles. Search Console access
+  comes from the account being a user on each property.
+- `add --replace-source` refuses, before it reads 1Password, a change that
+  adds the `webmasters` write scope while a project that binds the source to
+  `google-search-console` has write action `allow` on
+  `searchconsole.googleapis.com` in its approved policy. The refusal names
+  each such project. Run
+  `runfree host rules searchconsole.googleapis.com --write ask` in that
+  project and replace again, or keep only the read-only scope. A binding
+  project whose checkout Runfree cannot find (it records the path at launch)
+  is not checked; the command prints a warning with its project id instead.
 
 ### Credential policy and destinations
 
@@ -495,7 +534,20 @@ only the placeholder `GOOGLE_SEARCH_CONSOLE_TOKEN`. The token belongs to a
 Google service account. In Search Console, add the service account's email as
 a user on each property the agent may read.
 
-A `gcloud` command source works now, with no key JSON on the host:
+With the service account's key JSON in 1Password, add a
+[`google-service-account` source](#host-owned-sources) and bind it:
+
+```bash
+runfree credential source add google-service-account gsc \
+  --key-json-from-1password op://vault/gsc-sa/credential.json \
+  --scope https://www.googleapis.com/auth/webmasters.readonly
+runfree service enable google-search-console --from-source gsc
+```
+
+The binding refreshes the JWT on its own (every `54m` at the default TTL).
+
+Without a key JSON, a `gcloud` command source impersonates the service account
+instead:
 
 ```bash
 runfree credential source add gsc -- gcloud auth print-access-token \
@@ -525,11 +577,16 @@ For read-only use without a prompt per query:
 2. Run `runfree host rules searchconsole.googleapis.com --write allow`.
 
 This is safe only while the scope stays read-only, and Google's refusal of
-writes under that scope is not yet proven against the live API. Runfree cannot
-read the scope of a command, env, or 1Password source. While the host's write
-action is `allow` and such a source is bound, `service enable`,
-`service configure`, `host rules`, and every `credential status` print a
-warning that names `runfree host rules searchconsole.googleapis.com --write ask`.
+writes under that scope is not yet proven against the live API. Runfree reads
+the scope of a `google-service-account` source from its record; it cannot read
+the scope of a command, env, or 1Password source. While the host's write
+action is `allow` and the bound source has the `webmasters` write scope or a
+scope Runfree cannot read, `service enable`, `service configure`,
+`host rules`, and every `credential status` print a warning that names
+`runfree host rules searchconsole.googleapis.com --write ask`. A
+`google-service-account` source with only the read-only scope does not warn.
+A `credential source add google-service-account --replace-source` that would
+create that pair is refused (see [Host-owned sources](#host-owned-sources)).
 
 ### Service revisions
 

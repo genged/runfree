@@ -6,10 +6,11 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import util from "node:util";
-import { afterEach, beforeAll, beforeEach, describe, expect, test } from "vitest";
+import { afterEach, beforeAll, beforeEach, describe, expect, test, vi } from "vitest";
 
+import type { DesiredNetworkPolicyJson } from "@runfree/runtime-contracts/desired-network-policy";
 import { validateNetworkPolicy, type PolicyJson } from "@runfree/runtime-contracts/network-policy";
-import { defaultConfig, projectControlPaths, type ProjectInfo } from "../packages/cli/src/config.ts";
+import { defaultConfig, projectControlPaths, projectInfo, type ProjectInfo } from "../packages/cli/src/config.ts";
 import { approveNetworkCandidate, approveRuntimeIsolationControl } from "../packages/cli/src/control/approvals.ts";
 import { captureDesiredPolicyCandidate } from "../packages/cli/src/control/candidates.ts";
 import {
@@ -46,6 +47,8 @@ import {
 import { signGoogleServiceAccountJwt } from "../packages/cli/src/admin/google-service-account.ts";
 import { CREDENTIAL_OBSERVATION_BATCH_HEADER } from "../packages/cli/src/admin/credential-observation.ts";
 import { createAdminState } from "../packages/cli/src/admin/context.ts";
+import { desiredServiceEntry } from "../packages/cli/src/admin/service-policy.ts";
+import { SERVICES } from "./services.ts";
 import {
   convergeProxyPolicy,
   runAdminAction,
@@ -7106,6 +7109,31 @@ describe("google-service-account sources", () => {
     expect(result.stdout).not.toContain(GSC_REF);
   });
 
+  test("credential status warns for a write-scope service-account source under allow, and not for a read-only one (§5.1)", async () => {
+    const policy = {
+      hosts: ["searchconsole.googleapis.com"],
+      tokens: {
+        [GSC_TOKEN]: {
+          description: "Search Console",
+          credentials: [{ host: "searchconsole.googleapis.com", header: "Authorization", scheme: "bearer" }],
+        },
+      },
+      requests: { "searchconsole.googleapis.com": { writeAction: "allow" } },
+    };
+    writeFixtureRepo(policy);
+    writeTokenConfig({ [GSC_TOKEN]: { source: "named", name: "gsc" } });
+    writeGscRegistry(gscRegistryEntry({ scopes: [GSC_RO] }));
+    const readOnly = await runAdmin(() => credentialStatus());
+    writeGscRegistry(gscRegistryEntry({ scopes: [GSC_RW] }));
+    const write = await runAdmin(() => credentialStatus());
+
+    expect(readOnly.status, readOnly.stderr).toBe(0);
+    expect(readOnly.stdout).toContain(`${GSC_TOKEN}: configured`);
+    expect(readOnly.stdout).not.toContain("warning:");
+    expect(write.status, write.stderr).toBe(0);
+    expect(write.stdout).toMatch(/\n {2}warning: searchconsole\.googleapis\.com writes run without approval[^\n]*has a Search Console write scope[^\n]*runfree host rules searchconsole\.googleapis\.com --write ask\n/);
+  });
+
   describe("credential source add google-service-account (§4.2)", () => {
     function hostConfigBytes(): { sources: string | undefined; tokens: string | undefined; status: string | undefined; receipts: string | undefined } {
       const read = (p: string) => (fs.existsSync(p) ? fs.readFileSync(p, "utf8") : undefined);
@@ -7213,6 +7241,26 @@ describe("google-service-account sources", () => {
       expectNoKeyMaterial([result.stdout, result.stderr]);
     });
 
+    test("an unexpected signing failure at add prints only the fixed catch-all message and writes nothing (M4)", async () => {
+      bindGscToken();
+      const op = installGscOp(() => gscKeyJson());
+      const before = hostConfigBytes();
+      const sign = vi.spyOn(crypto, "sign").mockImplementationOnce(() => {
+        throw new Error(`signer exploded near ${GSC_SENTINEL}`);
+      });
+      try {
+        const result = await addGsc(op);
+        expect(sign).toHaveBeenCalledTimes(1);
+        expect(result.status).toBe(1);
+        expect(result.stderr).toContain("service account JWT signing failed");
+        expect(op.reads()).toBe(1);
+        expect(hostConfigBytes()).toEqual(before);
+        expectNoKeyMaterial([result.stdout, result.stderr]);
+      } finally {
+        sign.mockRestore();
+      }
+    });
+
     test("a second identical add is unchanged and writes nothing", async () => {
       const op = installGscOp(() => gscKeyJson());
       expect((await addGsc(op)).status).toBe(0);
@@ -7251,6 +7299,148 @@ describe("google-service-account sources", () => {
       expect(result.status).toBe(1);
       expect(result.stderr).toContain(`gsc source is already configured; pass --replace-source to change it; used by credential bindings: ${GSC_TOKEN}`);
       expect(hostConfigBytes()).toEqual(before);
+    });
+
+    // Spec §5.1 refusal (plan P-D1, P-D2): a --replace-source that adds a
+    // write scope is refused, before any 1Password read, while a project
+    // that binds the source has write action allow on the host in its
+    // approved desired policy.
+    describe("the write-scope refusal (§5.1)", () => {
+      const SC_HOST = "searchconsole.googleapis.com";
+      const RECLAIM = "runfree host rules searchconsole.googleapis.com --write ask";
+      const KEEP_READ_ONLY = `--scope ${GSC_RO}`;
+      const gscToken = {
+        [GSC_TOKEN]: {
+          description: "Search Console",
+          credentials: [{ host: SC_HOST, header: "Authorization" as const, scheme: "bearer" as const }],
+        },
+      };
+
+      function stateEnv(): NodeJS.ProcessEnv {
+        return {
+          ...process.env,
+          HOME: home,
+          XDG_CONFIG_HOME: path.join(home, ".config"),
+          XDG_DATA_HOME: path.join(home, ".local/share"),
+          XDG_STATE_HOME: path.join(home, ".local/state"),
+        };
+      }
+
+      function directPolicy(extra: Partial<DesiredNetworkPolicyJson> = {}): DesiredNetworkPolicyJson {
+        return { version: 2, hosts: [SC_HOST], tokens: gscToken, ...extra };
+      }
+
+      function servicePolicy(hostRules?: Record<string, { writeAction: "allow" | "ask" }>): DesiredNetworkPolicyJson {
+        const service = SERVICES["google-search-console"];
+        if (!service) throw new Error("google-search-console is not in the registry");
+        const entry = desiredServiceEntry(service, { writeMode: "allow-write", ...(hostRules ? { hostRules } : {}) });
+        return { version: hostRules ? 4 : 2, hosts: [], services: { "google-search-console": entry } };
+      }
+
+      /** Writes the project layer and approves it the way the operator would. */
+      function approveProjectPolicy(policy: DesiredNetworkPolicyJson): void {
+        fs.mkdirSync(path.join(tmp, ".runfree"), { recursive: true });
+        fs.writeFileSync(path.join(tmp, ".runfree/network-policy.json"), `${JSON.stringify(policy, null, 2)}\n`);
+        const project = projectInfo(tmp, stateEnv());
+        const candidate = captureDesiredPolicyCandidate(tmp, project.paths.controlCandidatesDir);
+        approveNetworkCandidate(tmp, project, candidate, "network-project", "interactive");
+        approveNetworkCandidate(tmp, project, candidate, "network-local", "interactive");
+      }
+
+      /** The state pointer a launch writes (runtime/recovery.ts writeProjectRecoveryPointer). */
+      function writeProjectPointer(): void {
+        const stateDir = path.join(home, ".local/state/runfree/projects", projectHash(tmp));
+        fs.mkdirSync(stateDir, { recursive: true });
+        fs.writeFileSync(path.join(stateDir, "project.json"), `${JSON.stringify({ projectRoot: tmp, updatedAt: "2026-10-25T00:00:00.000Z" })}\n`);
+      }
+
+      function boundProject(policy: DesiredNetworkPolicyJson): void {
+        writeGscRegistry();
+        bindGscToken();
+        approveProjectPolicy(policy);
+        writeProjectPointer();
+      }
+
+      async function expectRefused(): Promise<void> {
+        const op = installGscOp(() => gscKeyJson());
+        const before = hostConfigBytes();
+        const result = await addGsc(op, { replaceSource: true, scopes: [GSC_RO, GSC_RW] });
+        expect(result.status).toBe(1);
+        expect(op.reads()).toBe(0);
+        expect(result.stderr).toContain(SC_HOST);
+        expect(result.stderr).toContain(tmp);
+        expect(result.stderr).toContain(RECLAIM);
+        expect(result.stderr).toContain(KEEP_READ_ONLY);
+        expect(hostConfigBytes()).toEqual(before);
+      }
+
+      async function expectReplaced(extra: { warning?: string } = {}): Promise<AdminRunResult> {
+        const op = installGscOp(() => gscKeyJson());
+        const result = await addGsc(op, { replaceSource: true, scopes: [GSC_RO, GSC_RW] });
+        expect(result.status, result.stderr).toBe(0);
+        expect(result.stdout).toContain("gsc source replaced");
+        const registry = JSON.parse(fs.readFileSync(sourceRegistryPath(), "utf8")) as Record<string, Record<string, unknown>>;
+        expect(registry.gsc.scopes).toEqual([GSC_RW, GSC_RO].sort());
+        if (extra.warning) expect(result.stderr).toContain(extra.warning);
+        return result;
+      }
+
+      test("refuses before the 1Password read under a direct host write action allow, and host rules --write ask reclaims it", async () => {
+        boundProject(directPolicy({ requests: { [SC_HOST]: { writeAction: "allow" } } }));
+        await expectRefused();
+        approveProjectPolicy(directPolicy({ requests: { [SC_HOST]: { writeAction: "ask" } } }));
+        const replaced = await expectReplaced();
+        expect(replaced.stderr).not.toContain("warning");
+      });
+
+      test("refuses when the allow comes from service enable --allow-write, and a service host rule ask reclaims it", async () => {
+        boundProject(servicePolicy());
+        await expectRefused();
+        approveProjectPolicy(servicePolicy({ [SC_HOST]: { writeAction: "ask" } }));
+        await expectReplaced();
+      });
+
+      test("refuses when the allow comes from the policy-wide writeApproval, and a per-host ask reclaims it", async () => {
+        boundProject(directPolicy({ writeApproval: "allow" }));
+        await expectRefused();
+        approveProjectPolicy(directPolicy({ writeApproval: "allow", requests: { [SC_HOST]: { writeAction: "ask" } } }));
+        await expectReplaced();
+      });
+
+      test("does not refuse when no project binds the source", async () => {
+        writeGscRegistry();
+        approveProjectPolicy(directPolicy({ requests: { [SC_HOST]: { writeAction: "allow" } } }));
+        writeProjectPointer();
+        await expectReplaced();
+      });
+
+      test("does not refuse when the source is bound to another credential", async () => {
+        writeGscRegistry();
+        writeTokenConfig({ other: { source: "named", name: "gsc" } });
+        approveProjectPolicy(directPolicy({ requests: { [SC_HOST]: { writeAction: "allow" } } }));
+        writeProjectPointer();
+        await expectReplaced();
+      });
+
+      test("does not refuse a replace whose scopes stay read-only", async () => {
+        writeGscRegistry(gscRegistryEntry({ scopes: [GSC_RW] }));
+        bindGscToken();
+        approveProjectPolicy(directPolicy({ requests: { [SC_HOST]: { writeAction: "allow" } } }));
+        writeProjectPointer();
+        const op = installGscOp(() => gscKeyJson());
+        const result = await addGsc(op, { replaceSource: true, scopes: [GSC_RO] });
+        expect(result.status, result.stderr).toBe(0);
+        expect(result.stdout).toContain("gsc source replaced");
+      });
+
+      test("a binding project whose checkout cannot be found warns with its project id instead of refusing", async () => {
+        writeGscRegistry();
+        bindGscToken();
+        approveProjectPolicy(directPolicy({ requests: { [SC_HOST]: { writeAction: "allow" } } }));
+        // No state pointer: the project id cannot be mapped to its checkout.
+        const result = await expectReplaced({ warning: projectHash(tmp) });
+        expect(result.stderr).toContain("warning");
+      });
     });
 
     test("a ttl given at add bounds the explicit refresh of a binding", async () => {

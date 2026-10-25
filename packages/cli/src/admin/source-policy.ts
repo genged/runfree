@@ -42,6 +42,7 @@ import {
   googleServiceAccountFailure,
   normalizeGoogleServiceAccountScopes,
 } from "./google-service-account.ts";
+import { assertReplaceKeepsSearchConsoleApproval, SEARCH_CONSOLE_TOKEN } from "./search-console-write-guard.ts";
 
 function saveSourceRegistry(registry: SourceRegistry): void {
   writeJsonFile(sourceConfigPath(), registry, 0o600);
@@ -100,17 +101,19 @@ function namedSourcesEqual(left: NamedSource, right: NamedSource): boolean {
   }
 }
 
-function sourceUsers(registryName: string): string[] {
-  const users: string[] = [];
+/** Every credential binding of a named source, across the host's projects. */
+function sourceBindings(registryName: string): Array<{ projectId: string; tokenName: string }> {
+  const bindings: Array<{ projectId: string; tokenName: string }> = [];
   const projectsDir = path.join(runfreeConfigRoot(childEnv()), "projects");
-  let projectDirs: string[] = [];
+  let projectIds: string[] = [];
   try {
-    projectDirs = fs.readdirSync(projectsDir).map((entry) => path.join(projectsDir, entry));
+    projectIds = fs.readdirSync(projectsDir);
   } catch (error) {
-    if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") return users;
+    if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") return bindings;
     throw error;
   }
-  for (const dir of projectDirs) {
+  for (const projectId of projectIds) {
+    const dir = path.join(projectsDir, projectId);
     let stat: fs.Stats;
     try {
       stat = fs.statSync(dir);
@@ -120,10 +123,14 @@ function sourceUsers(registryName: string): string[] {
     if (!stat.isDirectory()) continue;
     const config = parseTokenSourceConfig(readJsonFile<unknown>(path.join(dir, "tokens.json"), {}), path.join(dir, "tokens.json"));
     for (const [tokenName, source] of Object.entries(config)) {
-      if (source.source === "named" && source.name === registryName) users.push(tokenName);
+      if (source.source === "named" && source.name === registryName) bindings.push({ projectId, tokenName });
     }
   }
-  return Array.from(new Set(users)).sort();
+  return bindings;
+}
+
+function sourceUsers(registryName: string): string[] {
+  return Array.from(new Set(sourceBindings(registryName).map((binding) => binding.tokenName))).sort();
 }
 
 function parseKeyValueOption(flag: string, value: string): { key: string; value: string } {
@@ -285,8 +292,16 @@ export function sourceAddGoogleServiceAccountIntent(input: SourceAddGoogleServic
   } catch (error) {
     die(errorMessage(error));
   }
-  // §5.1 refusal point (plan Task 6): reads only the registry and approved
-  // policies, so it must stay here, before the 1Password read.
+  // Spec §5.1 refusal: reads only the registry, host credential config, and
+  // approved policies, so it runs here, before the 1Password read.
+  assertReplaceKeepsSearchConsoleApproval({
+    sourceName: name,
+    previous: loadSourceRegistry()[name],
+    nextScopes: scopes,
+    bindingProjectIds: Array.from(new Set(sourceBindings(name)
+      .filter((binding) => binding.tokenName === SEARCH_CONSOLE_TOKEN)
+      .map((binding) => binding.projectId))),
+  });
 
   ensureStateDirs();
   const keyJson = { source: "1password" as const, ref: keyJsonRef };
