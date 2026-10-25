@@ -82,9 +82,12 @@ RUN groupadd --gid 1001 --system runfree-proxy \
 WORKDIR /app/proxy
 
 COPY package.json package-lock.json ./
-RUN npm ci --omit=dev --ignore-scripts \
+# --omit=optional keeps mockttp's optional native tls-impersonate addon (only
+# loaded for mirrorTlsFingerprint, which the proxy never enables) out of the
+# trust-boundary image.
+RUN npm ci --omit=dev --omit=optional --ignore-scripts \
  && npm cache clean --force
-RUN --network=none npm rebuild --omit=dev
+RUN --network=none npm rebuild --omit=dev --omit=optional
 
 COPY *.js ./
 COPY firewall ./firewall
