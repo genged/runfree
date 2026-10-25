@@ -31,8 +31,9 @@ const binWrapperTests = ["scripts/installable-cli-wrapper.test.ts"];
 
 // Live tranches start Docker, take minutes, and must never run inside the
 // ordinary suite. The project that owns them exists only when a backend is
-// named, so `pnpm test` cannot pick them up even by accident, and they are
-// excluded from the parallel project's `**/*.test.ts` glob regardless.
+// named or the command line selects it (`liveRuntimeSelectedByArgv`), so
+// `pnpm test` cannot pick them up even by accident, and they are excluded
+// from the parallel project's `**/*.test.ts` glob regardless.
 const liveRuntimeTests = ["tests/runtime/**/*.live.test.ts"];
 const cliE2eTests = ["e2e/**/*.test.ts"];
 const cliE2eLiveTests = ["e2e/**/*.live.test.ts"];
@@ -71,10 +72,39 @@ function liveRuntimeWorkers(): number {
   return Number(configured);
 }
 
-const liveRuntimeBackend = process.env.TEST_RUNTIME_BACKEND;
-const liveRuntimeEnabled = liveRuntimeBackend === "docker-desktop";
+// Docker Desktop is the only supported backend, so it is the default. An
+// explicitly named backend still decides: any other value keeps the live
+// project unregistered, as before.
+const DEFAULT_LIVE_RUNTIME_BACKEND = "docker-desktop";
+const LIVE_RUNTIME_PROJECT = "runtime-live";
+
+/**
+ * Whether this vitest command line asks for the live project by name
+ * (`--project runtime-live`) or by a live file filter
+ * (`vitest run tests/runtime/live/x.live.test.ts`). Bare `vitest run` and
+ * `pnpm test` select neither, so the live suite stays opt-in.
+ */
+function liveRuntimeSelectedByArgv(argv: readonly string[]): boolean {
+  for (let index = 0; index < argv.length; index += 1) {
+    const arg = argv[index];
+    if (arg === "--project" && argv[index + 1] === LIVE_RUNTIME_PROJECT) return true;
+    if (arg === `--project=${LIVE_RUNTIME_PROJECT}`) return true;
+    if (!arg.startsWith("-") && (arg.includes("tests/runtime/live") || arg.endsWith(".live.test.ts"))) {
+      // e2e/**/*.live.test.ts belongs to cli-e2e-live, not this project.
+      if (!arg.startsWith("e2e/")) return true;
+    }
+  }
+  return false;
+}
+
+const liveRuntimeBackendNamed = Boolean(process.env.TEST_RUNTIME_BACKEND);
+const liveRuntimeBackend = process.env.TEST_RUNTIME_BACKEND || DEFAULT_LIVE_RUNTIME_BACKEND;
+const liveRuntimeEnabled = liveRuntimeBackend === "docker-desktop"
+  && (liveRuntimeBackendNamed || liveRuntimeSelectedByArgv(process.argv.slice(2)));
 const cliE2eEnabled = Boolean(process.env.RUNFREE_E2E_ARTIFACT);
-const cliE2eLiveEnabled = cliE2eEnabled && liveRuntimeEnabled && Boolean(process.env.RUNFREE_E2E_DOCKER_HOST);
+const cliE2eLiveEnabled = cliE2eEnabled
+  && liveRuntimeBackend === "docker-desktop"
+  && Boolean(process.env.RUNFREE_E2E_DOCKER_HOST);
 
 const commonExclude = [
   ...liveRuntimeTests,
@@ -94,8 +124,10 @@ const commonExclude = [
 const liveRuntimeProject: TestProjectConfiguration = {
   extends: true,
   test: {
-    name: "runtime-live",
+    name: LIVE_RUNTIME_PROJECT,
     include: liveRuntimeInclude,
+    // The tranches assert the backend themselves; hand them the defaulted one.
+    env: { TEST_RUNTIME_BACKEND: liveRuntimeBackend },
     exclude: [...commonExclude.filter((pattern) => !liveRuntimeTests.includes(pattern)), ...liveRuntimeTierExclude],
     // Forks, not threads: a live tranche spawns Docker work and must be
     // killable as a process.
@@ -154,6 +186,7 @@ const cliE2eLiveProject: TestProjectConfiguration = {
     name: "cli-e2e-live",
     include: cliE2eLiveTests,
     exclude: commonExclude.filter((pattern) => !cliE2eTests.includes(pattern)),
+    env: { TEST_RUNTIME_BACKEND: liveRuntimeBackend },
     setupFiles: ["e2e/support/setup.ts"],
     pool: "forks",
     maxWorkers: 1,

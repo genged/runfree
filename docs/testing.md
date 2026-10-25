@@ -14,6 +14,12 @@ Runfree separates tests by the boundary they prove.
 | Packaged CLI end to end | `make test-cli-e2e` | The compiled `dist/runfree` executable | Compilation, embedded assets, entrypoint, first-run workflows, safe refusals, and filesystem compatibility |
 | Packaged runtime end to end | `make test-cli-e2e-live` | The compiled executable plus real Docker | First startup, exact approvals, image build, managed session launch, reuse, and teardown |
 
+`pnpm exec vitest run` runs a live tranche directly when the command selects
+it, by `--project runtime-live` or by a `tests/runtime/live/` file path.
+`TEST_RUNTIME_BACKEND` defaults to `docker-desktop`, the only supported
+backend, so it does not need to be set. Bare `vitest run` and `pnpm test`
+never select the live project.
+
 `make test-release` is the pre-tag gate for a release commit. It runs what the
 Test workflow runs on that commit: static checks, unit tests, template
 validation, and the offline packaged end-to-end lane. It needs the Docker CLI
@@ -24,7 +30,6 @@ tranche against both providers. The run is not part of `make test-runtime`,
 because it needs provider credentials:
 
 ```bash
-TEST_RUNTIME_BACKEND=docker-desktop \
 TEST_RUNTIME_GIT_PROVIDERS=github,gitlab \
 TEST_RUNTIME_GITHUB_REPO=https://github.com/<owner>/<repo>.git \
 TEST_RUNTIME_GITHUB_SOURCE=<source> \
