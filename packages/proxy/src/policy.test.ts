@@ -2079,15 +2079,23 @@ describe("write classification (operation-aware read-only / approve-on-write)", 
     expect(at("PUT", "/webmasters/v3/sites/https%3A%2F%2Fexample.com%2F/sitemaps/https%3A%2F%2Fexample.com%2Fs.xml").write).toBe(true);
     expect(at("DELETE", "/webmasters/v3/sites/https%3A%2F%2Fexample.com%2F").write).toBe(true);
     expect(at("GET", "/webmasters/v3/sites").write).toBe(false);
+    // Google's batch endpoint carries inner writes, so under the service rule
+    // it asks like any other write.
+    expect(at("POST", "/batch").write).toBe(true);
+    expect(at("POST", "/batch/webmasters/v3").write).toBe(true);
   });
 
-  test("google-search-console read-only method rule: GET and POST pass without approval, PUT and DELETE are refused by method", () => {
+  test("google-search-console read-only rule: GET and POST under the API prefixes pass without approval; PUT, DELETE, and every path outside them are refused before a token read", () => {
     // What `runfree host rules searchconsole.googleapis.com --method GET
-    // --method POST --write allow` projects on top of the service rule, under
-    // the default ask posture. Every Search Console POST is a read in Google;
-    // the writes are PUT and DELETE.
+    // --method POST --request-path-prefix /webmasters/v3 --request-path-prefix
+    // /v1 --write allow` projects on top of the service rule, under the
+    // default ask posture. Every Search Console POST under those prefixes is a
+    // read in Google; the writes are PUT and DELETE. The path prefixes keep
+    // out Google's batch endpoint, a POST whose multipart body carries inner
+    // PUT and DELETE requests under the outer Authorization header.
     const host = "searchconsole.googleapis.com";
-    const site = "/webmasters/v3/sites/https%3A%2F%2Fexample.com%2F";
+    const site = "/webmasters/v3/sites/sc-domain:example.com";
+    const urlPrefixSite = "/webmasters/v3/sites/https%3A%2F%2Fexample.com%2F";
     const tokenReader = vi.fn(() => "real-proxy-token");
     const hasWriteGrant = vi.fn(() => false);
     const options: PolicyOptions = {
@@ -2096,7 +2104,12 @@ describe("write classification (operation-aware read-only / approve-on-write)", 
         [host]: [{ tokenName: "google-search-console", tokenDescription: "Google Search Console", host, header: "Authorization", scheme: "bearer" }],
       },
       requests: {
-        [host]: { methods: ["GET", "POST"], writeAction: "allow", readPathPrefixes: ["/v1/urlInspection/index:inspect"] },
+        [host]: {
+          methods: ["GET", "POST"],
+          pathPrefixes: ["/v1", "/webmasters/v3"],
+          writeAction: "allow",
+          readPathPrefixes: ["/v1/urlInspection/index:inspect"],
+        },
       },
       tokenReader,
       hasWriteGrant,
@@ -2107,10 +2120,11 @@ describe("write classification (operation-aware read-only / approve-on-write)", 
     const injected = { headers: { authorization: "Bearer real-proxy-token" } };
 
     expect(request("GET", "/webmasters/v3/sites")).toEqual(injected);
+    expect(request("GET", `${site}/sitemaps`)).toEqual(injected);
     expect(request("POST", `${site}/searchAnalytics/query`)).toEqual(injected);
     expect(request("POST", "/v1/urlInspection/index:inspect")).toEqual(injected);
     expect(hasWriteGrant).not.toHaveBeenCalled();
-    expect(tokenReader).toHaveBeenCalledTimes(3);
+    expect(tokenReader).toHaveBeenCalledTimes(4);
 
     tokenReader.mockClear();
     for (const [method, p] of [["PUT", `${site}/sitemaps/https%3A%2F%2Fexample.com%2Fs.xml`], ["PUT", site], ["DELETE", site], ["DELETE", `${site}/sitemaps/x`]]) {
@@ -2118,6 +2132,47 @@ describe("write classification (operation-aware read-only / approve-on-write)", 
       expect(denial.shape).toMatchObject({ reason: "method-not-allowed", host, method, allowedMethods: ["GET", "POST"] });
     }
     expect(tokenReader).not.toHaveBeenCalled();
+
+    // Google's batch endpoint and every other path outside the two prefixes:
+    // near-miss spellings, dot segments (new URL() resolves literal and %2e
+    // ones to /batch), encoded and doubled separators, and Google's upload and
+    // discovery paths.
+    for (const p of [
+      "/batch",
+      "/batch/webmasters/v3",
+      "/batch/searchconsole/v1",
+      "/Batch",
+      "/webmasters/v3/../batch",
+      "/webmasters/v3/%2e%2e/batch",
+      "/webmasters/v3/%2E%2E/%2E%2E/batch",
+      "/webmasters/v3/%252e%252e/batch",
+      "/webmasters/v3/..;/batch",
+      "/webmasters/v3%2F..%2Fbatch",
+      "/webmasters/v3/..%2Fbatch",
+      "/webmasters/v3/..%5Cbatch",
+      "/webmasters/v3//batch",
+      "//batch",
+      "/webmasters/v3batch",
+      "/webmasters/v30/x",
+      "/v1batch",
+      "/v1%2Fbatch",
+      "/v1:batch",
+      "/upload/webmasters/v3/sites",
+      "/resumable/upload/webmasters/v3/sites",
+      "/$discovery/rest",
+      "/",
+    ]) {
+      const denial = shapeDenial(() => request("POST", p));
+      expect(denial.shape, p).toMatchObject({ reason: "path-not-allowed", host, method: "POST", allowedPathPrefixes: ["/v1", "/webmasters/v3"] });
+    }
+    // A URL-prefix property's site URL is percent-encoded with %2F, which the
+    // path rule reads as path confusion: such a request is refused too.
+    for (const [method, p] of [["GET", urlPrefixSite], ["POST", `${urlPrefixSite}/searchAnalytics/query`]]) {
+      const denial = shapeDenial(() => request(method, p));
+      expect(denial.shape, p).toMatchObject({ reason: "path-not-allowed", host, method });
+    }
+    expect(tokenReader).not.toHaveBeenCalled();
+    expect(hasWriteGrant).not.toHaveBeenCalled();
 
     // A header method override cannot turn an admitted POST into a DELETE:
     // every override header is stripped before the request leaves the proxy.

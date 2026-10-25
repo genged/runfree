@@ -310,8 +310,10 @@ agent sees: placeholder or runfree_oauth_* handle only
    1Password stops being used within 4 hours plus one JWT lifetime; deleting
    the key in Google Cloud IAM stops it at once. The scope is not the
    control that keeps Search Console read-only: the documented procedure is
-   a host rule that allows only `GET` and `POST` (every `POST` on that API is
-   a read), so the proxy refuses `PUT` and `DELETE` by method and strips the
+   a host rule that allows only `GET` and `POST` under the `/webmasters/v3`
+   and `/v1` path prefixes (every `POST` there is a read), so the proxy
+   refuses `PUT` and `DELETE` by method, refuses Google's `/batch` endpoint
+   (a `POST` whose body carries inner writes) by path, and strips the
    method-override headers ([Network](#network) rule 7) whatever the scope.
    A method override in the query string or body is not stripped; the
    read-only scope covers that residual, though Google's enforcement of it is

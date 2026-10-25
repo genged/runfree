@@ -565,27 +565,39 @@ write: under the default `ask` posture, each query asks for approval. Only URL
 Inspection (`/v1/urlInspection/index:inspect`) is a read.
 
 For read-only use without a prompt per query, allow only the read methods
-and let them through without approval:
+and the two API paths, and let them through without approval:
 
 ```bash
-runfree host rules searchconsole.googleapis.com --method GET --method POST --write allow
+runfree host rules searchconsole.googleapis.com --method GET --method POST \
+  --request-path-prefix /webmasters/v3 --request-path-prefix /v1 --write allow
 ```
 
-On this API every `POST` is a read (Search Analytics queries and URL
-Inspection); the writes are `PUT` (add a site, submit a sitemap) and `DELETE`
-(remove a site or a sitemap). The proxy refuses `PUT` and `DELETE` by method,
-whatever the scope of the bound credential, and strips the
+On this API every `POST` under these paths is a read (Search Analytics queries
+and URL Inspection); the writes are `PUT` (add a site, submit a sitemap) and
+`DELETE` (remove a site or a sitemap). The proxy refuses `PUT` and `DELETE` by
+method, whatever the scope of the bound credential, and strips the
 `X-HTTP-Method-Override`, `X-HTTP-Method`, and `X-Method-Override` headers on
-this host. To let the agent submit a sitemap or change a site, change the rule
-again, for example with
-`runfree host rules searchconsole.googleapis.com --clear`, which restores the
-service rule: under the default `ask` posture each write-class request, a
-Search Analytics query included, then asks for approval.
+this host. The path prefixes keep out Google's `/batch` endpoint: a batch
+request is a `POST` whose body carries inner `PUT` and `DELETE` requests that
+use the outer credential. A prefix matches the path itself or a path below it,
+so `/v1batch` and `/batch/webmasters/v3` are refused too.
+
+This rule works only for Domain properties (`sc-domain:example.com`). A
+URL-prefix property puts its encoded URL in the path
+(`https%3A%2F%2Fexample.com%2F`), and the proxy refuses an encoded `/` on a
+host with path prefixes. For a URL-prefix property, keep the service rule:
+each query then asks for approval.
+
+To let the agent submit a sitemap or change a site, change the rule again, for
+example with `runfree host rules searchconsole.googleapis.com --clear`, which
+restores the service rule: under the default `ask` posture each write-class
+request, a Search Analytics query or a batch request included, then asks for
+approval.
 
 The proxy does not strip a method override in the query string or the body.
 Bind a source with only the `webmasters.readonly` scope, as above, so Google
 also refuses a write that reaches it (not yet proven against the live API).
-The scope is defence in depth: the method rule does not depend on it.
+The scope is defence in depth: the method and path rule does not depend on it.
 
 ### Service revisions
 

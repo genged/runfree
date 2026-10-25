@@ -540,19 +540,20 @@ describe("checkout-local host mutations", () => {
       expect(compiledRule("oauth2.googleapis.com")).toEqual({ methods: ["POST"], pathPrefixes: ["/token/v2"], writeAction: "ask" });
     });
 
-    test("the google-search-console read-only procedure: --method GET --method POST --write allow is stored on the service and keeps its read path", async () => {
+    test("the google-search-console read-only procedure: --method GET --method POST with the two API path prefixes and --write allow is stored on the service and keeps its read path", async () => {
       useLayers({ hosts: [], services: { "google-search-console": registryEntry("google-search-console") } });
       const host = "searchconsole.googleapis.com";
       const serviceRule = { readPathPrefixes: ["/v1/urlInspection/index:inspect"] };
       expect(compiledRule(host)).toEqual(serviceRule);
 
-      const result = await mutateDesiredHost(context, io(), "project", rules(host, { methods: ["GET", "POST"], write: "allow" }));
+      const result = await mutateDesiredHost(context, io(), "project", rules(host, { methods: ["GET", "POST"], pathPrefixes: ["/webmasters/v3", "/v1"], write: "allow" }));
 
       expect(result).toMatchObject({ changed: true, owner: "service:google-search-console", ownerLayer: "project", warnings: [] });
-      expect(hostRulesOf(projectPolicyPath, "google-search-console")).toEqual({ [host]: { methods: ["GET", "POST"], writeAction: "allow" } });
+      expect(hostRulesOf(projectPolicyPath, "google-search-console")).toEqual({ [host]: { methods: ["GET", "POST"], pathPrefixes: ["/v1", "/webmasters/v3"], writeAction: "allow" } });
       expect(readLayer(projectPolicyPath).requests).toBeUndefined();
-      // The rule the proxy enforces (proxy policy.test.ts proves PUT and DELETE refused under it).
-      expect(compiledRule(host)).toEqual({ ...serviceRule, methods: ["GET", "POST"], writeAction: "allow" });
+      // The rule the proxy enforces (proxy policy.test.ts proves PUT, DELETE,
+      // and Google's /batch endpoint refused under it).
+      expect(compiledRule(host)).toEqual({ ...serviceRule, methods: ["GET", "POST"], pathPrefixes: ["/v1", "/webmasters/v3"], writeAction: "allow" });
     });
 
     test("9: two services on one host refuse without --service and accept the service that owns the rule", async () => {
