@@ -165,6 +165,7 @@ const REVISION_SNAPSHOT: Record<string, { revision: number; hosts: string[]; rem
     hosts: ["googleads.googleapis.com", "oauth2.googleapis.com"],
     removedHosts: [],
   },
+  "google-search-console": { revision: 1, hosts: ["searchconsole.googleapis.com"], removedHosts: [] },
   ruby: { revision: 1, hosts: ["rubygems.org", "index.rubygems.org"], removedHosts: [] },
   java: {
     revision: 1,
@@ -210,6 +211,7 @@ const ALL_SERVICE_IDS = [
   "gitlab",
   "go",
   "google-ads",
+  "google-search-console",
   "groq",
   "homebrew",
   "java",
@@ -298,6 +300,7 @@ describe("service registry invariants", () => {
         "github",
         "gitlab",
         "google-ads",
+        "google-search-console",
         "groq",
         "mistral",
         "openai",
@@ -305,6 +308,30 @@ describe("service registry invariants", () => {
         "perplexity",
         "xai",
       ]);
+  });
+
+  test("google-search-console injects a host-signed bearer token and exempts only URL inspection", () => {
+    const svc = SERVICES["google-search-console"];
+    expect(svc.revision).toBe(1);
+    expect(svc.hosts).toEqual([{ host: "searchconsole.googleapis.com" }]);
+    expect(svc.detect).toEqual([]);
+    expect(svc.oauthCredential).toBeUndefined();
+    expect(svc.credential).toEqual({
+      tokenName: "google-search-console",
+      tokenDescription: expect.any(String),
+      agentEnv: ["GOOGLE_SEARCH_CONSOLE_TOKEN"],
+      credentials: [{ host: "searchconsole.googleapis.com", header: "Authorization", scheme: "bearer" }],
+    });
+    expect(svc.readOnly).toEqual({
+      "searchconsole.googleapis.com": { readPathPrefixes: ["/v1/urlInspection/index:inspect"] },
+    });
+    // §6: no token exchange host and no legacy multi-API host.
+    expect(serviceHostNames(svc)).not.toContain("oauth2.googleapis.com");
+    expect(serviceHostNames(svc)).not.toContain("www.googleapis.com");
+    const text = svc.explanations.join("\n");
+    expect(text).toContain("service account");
+    expect(text).toContain("--from-source");
+    expect(text).toMatch(/client_email|service account email/);
   });
 
   test("oauth credentials stay curated to service hosts and narrow fields", () => {
@@ -408,8 +435,8 @@ describe("service registry invariants", () => {
       }
     }
     // The services carrying a read-only profile: git hosts (fetch stays a
-    // read, push classifies write), GraphQL endpoints, and the POST-read
-    // model providers (MED-6).
+    // read, push classifies write), GraphQL endpoints, the POST-read
+    // model providers (MED-6), and Search Console URL inspection.
     expect(Object.values(SERVICES).filter((svc) => svc.readOnly).map((svc) => svc.id).sort())
       .toEqual([
         "anthropic",
@@ -418,6 +445,7 @@ describe("service registry invariants", () => {
         "gemini",
         "github",
         "gitlab",
+        "google-search-console",
         "groq",
         "mistral",
         "node",

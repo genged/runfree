@@ -1040,6 +1040,37 @@ export const SERVICES: Record<string, Service> = {
       },
     ],
   },
+  "google-search-console": {
+    id: "google-search-console",
+    label: "Google Search Console API",
+    revision: 1,
+    hosts: [
+      { host: "searchconsole.googleapis.com" },
+    ],
+    detect: [],
+    explanations: [
+      "Google Search Console API: a Google service-account JWT presented directly as Authorization: Bearer (no OAuth token exchange)",
+      "The host signs the JWT from a service-account source (or a host command that prints an access token); the proxy injects it, and the agent never holds the key or the token",
+      "Bind the source with: runfree service enable google-search-console --from-source <source>",
+      "Add the service account's client_email as a user on each Search Console property; Runfree cannot do this step",
+      "Search Analytics queries are POST requests and ask for approval; only URL inspection is a read",
+    ],
+    // Static credential, the appstore-connect shape: the value is a short-lived
+    // bearer token from a host-owned source; only a placeholder reaches the agent.
+    credential: {
+      tokenName: "google-search-console",
+      tokenDescription: "Google Search Console API bearer token (service-account JWT), injected as Authorization: Bearer",
+      agentEnv: ["GOOGLE_SEARCH_CONSOLE_TOKEN"],
+      credentials: [
+        { host: "searchconsole.googleapis.com", header: "Authorization", scheme: "bearer" },
+      ],
+    },
+    // Exact match or prefix + "/" (pathMatchesPrefix), so index:inspectX and an
+    // encoded %3A stay writes; path confusion voids the exemption.
+    readOnly: {
+      "searchconsole.googleapis.com": { readPathPrefixes: ["/v1/urlInspection/index:inspect"] },
+    },
+  },
 };
 
 export function service(id: string): Service | undefined {

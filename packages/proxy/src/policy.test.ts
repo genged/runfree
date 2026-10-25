@@ -2058,6 +2058,29 @@ describe("write classification (operation-aware read-only / approve-on-write)", 
     }
   });
 
+  test("google-search-console: only exact URL inspection is a read; the query and sitemap writes stay writes", () => {
+    // The rule the google-search-console service projects (scripts/services.ts).
+    const rule = { writeAction: "ask" as const, readPathPrefixes: ["/v1/urlInspection/index:inspect"] };
+    const at = (method: string, p: string, headers?: Record<string, string>) =>
+      classifyWrite({ method, url: new URL(`https://searchconsole.googleapis.com${p}`), rule, headers });
+    expect(at("POST", "/v1/urlInspection/index:inspect")).toEqual({ write: false });
+    // pathMatchesPrefix accepts the prefix plus "/", so the confusion cases below
+    // would be reads without the path-confusion check.
+    expect(at("POST", "/v1/urlInspection/index:inspect/x")).toEqual({ write: false });
+    expect(at("POST", "/v1/urlInspection/index:inspectX").write).toBe(true);
+    expect(at("POST", "/v1/urlInspection/index%3Ainspect").write).toBe(true);
+    // new URL() resolves a literal or %2e%2e segment before classification, so
+    // these keep the prefix and rely on hasPathConfusion.
+    expect(at("POST", "/v1/urlInspection/index:inspect/%252e%252e/x").write).toBe(true);
+    expect(at("POST", "/v1/urlInspection/index:inspect/%2fx").write).toBe(true);
+    expect(at("POST", "/v1/urlInspection/index:inspect//x").write).toBe(true);
+    expect(at("POST", "/v1/urlInspection/index:inspect", { "x-http-method-override": "DELETE" }).write).toBe(true);
+    expect(at("POST", "/webmasters/v3/sites/https%3A%2F%2Fexample.com%2F/searchAnalytics/query").write).toBe(true);
+    expect(at("PUT", "/webmasters/v3/sites/https%3A%2F%2Fexample.com%2F/sitemaps/https%3A%2F%2Fexample.com%2Fs.xml").write).toBe(true);
+    expect(at("DELETE", "/webmasters/v3/sites/https%3A%2F%2Fexample.com%2F").write).toBe(true);
+    expect(at("GET", "/webmasters/v3/sites").write).toBe(false);
+  });
+
   test("writePathPrefixes classify writes regardless of method", () => {
     const denial = shapeDenial(() => testBeforeAllowedRequest({
       method: "POST",
