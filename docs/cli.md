@@ -410,9 +410,11 @@ Everything after `--` in `credential source add <name> -- <command>` is source c
 
 A `google-service-account` source signs a Google self-signed RS256 JWT on the
 host for the [`google-search-console`](#google-search-console) service. The
-key JSON stays in 1Password: the CLI reads it for each signature and never
-stores the key JSON, the private key, or the key id; the proxy gets only the
-signed JWT.
+key JSON stays in 1Password: a one-shot sync reads it for its signature, and
+`credential sync --watch` keeps the parsed key in memory for at most 4 hours
+and signs each refresh with it (see below). The CLI never stores the key
+JSON, the private key, or the key id on disk; the proxy gets only the signed
+JWT.
 
 - `--scope` is required and repeatable. Only
   `https://www.googleapis.com/auth/webmasters.readonly` and
@@ -440,9 +442,15 @@ signed JWT.
   `searchconsole.googleapis.com` in its approved policy. The refusal names
   each such project. Run
   `runfree host rules searchconsole.googleapis.com --write ask` in that
-  project and replace again, or keep only the read-only scope. A binding
-  project whose checkout Runfree cannot find (it records the path at launch)
-  is not checked; the command prints a warning with its project id instead.
+  project and replace again, or keep only the read-only scope. Run in a
+  project checkout, the command checks that checkout even if it has never
+  launched. Any other binding project is found through the path Runfree
+  records at launch; one it cannot find is not checked, and the command
+  prints a warning with its project id instead. That project's next launch
+  or `credential sync` warns if its writes run without approval.
+- A command or `jwt` source's scope is unknown, so `add --replace-source` of
+  such a source bound to `google-search-console` under write action `allow`
+  warns and does not refuse.
 
 ### Credential policy and destinations
 
@@ -582,7 +590,9 @@ the scope of a `google-service-account` source from its record; it cannot read
 the scope of a command, env, or 1Password source. While the host's write
 action is `allow` and the bound source has the `webmasters` write scope or a
 scope Runfree cannot read, `service enable`, `service configure`,
-`host rules`, and every `credential status` print a warning that names
+`host rules`, `credential set-source google-search-console`, every launch,
+every one-shot `credential sync`, and every `credential status` print a
+warning that names
 `runfree host rules searchconsole.googleapis.com --write ask`. A
 `google-service-account` source with only the read-only scope does not warn.
 A `credential source add google-service-account --replace-source` that would

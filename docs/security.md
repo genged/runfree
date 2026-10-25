@@ -311,8 +311,10 @@ agent sees: placeholder or runfree_oauth_* handle only
    the key in Google Cloud IAM stops it at once. The write scope and the
    host's write action live in different places: Runfree warns when the
    Search Console write action is `allow` with a source whose scope is not
-   provably read-only, and refuses a source replace that adds the write scope
-   under `allow` in a project it can find. Google's enforcement of the
+   provably read-only (at enable, `host rules`, `set-source`, every launch
+   and `credential sync`, and `credential status`), and refuses a source
+   replace that adds the write scope under `allow` in a project it can find
+   (the current checkout, or one recorded at launch). Google's enforcement of the
    read-only scope is not yet proven against the live API.
 
 ### Git Over HTTPS
