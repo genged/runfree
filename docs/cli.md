@@ -436,21 +436,6 @@ JWT.
   key at once, delete it in Google Cloud IAM.
 - The service account needs no Google Cloud IAM roles. Search Console access
   comes from the account being a user on each property.
-- `add --replace-source` refuses, before it reads 1Password, a change that
-  adds the `webmasters` write scope while a project that binds the source to
-  `google-search-console` has write action `allow` on
-  `searchconsole.googleapis.com` in its approved policy. The refusal names
-  each such project. Run
-  `runfree host rules searchconsole.googleapis.com --write ask` in that
-  project and replace again, or keep only the read-only scope. Run in a
-  project checkout, the command checks that checkout even if it has never
-  launched. Any other binding project is found through the path Runfree
-  records at launch; one it cannot find is not checked, and the command
-  prints a warning with its project id instead. That project's next launch
-  or `credential sync` warns if its writes run without approval.
-- A command or `jwt` source's scope is unknown, so `add --replace-source` of
-  such a source bound to `google-search-console` under write action `allow`
-  warns and does not refuse.
 
 ### Credential policy and destinations
 
@@ -579,24 +564,28 @@ covers sitemap `PUT` and site `DELETE`. Runfree therefore keeps the query a
 write: under the default `ask` posture, each query asks for approval. Only URL
 Inspection (`/v1/urlInspection/index:inspect`) is a read.
 
-For read-only use without a prompt per query:
+For read-only use without a prompt per query, allow only the read methods
+and let them through without approval:
 
-1. Bind a source that has only the `webmasters.readonly` scope, as above.
-2. Run `runfree host rules searchconsole.googleapis.com --write allow`.
+```bash
+runfree host rules searchconsole.googleapis.com --method GET --method POST --write allow
+```
 
-This is safe only while the scope stays read-only, and Google's refusal of
-writes under that scope is not yet proven against the live API. Runfree reads
-the scope of a `google-service-account` source from its record; it cannot read
-the scope of a command, env, or 1Password source. While the host's write
-action is `allow` and the bound source has the `webmasters` write scope or a
-scope Runfree cannot read, `service enable`, `service configure`,
-`host rules`, `credential set-source google-search-console`, every launch,
-every one-shot `credential sync`, and every `credential status` print a
-warning that names
-`runfree host rules searchconsole.googleapis.com --write ask`. A
-`google-service-account` source with only the read-only scope does not warn.
-A `credential source add google-service-account --replace-source` that would
-create that pair is refused (see [Host-owned sources](#host-owned-sources)).
+On this API every `POST` is a read (Search Analytics queries and URL
+Inspection); the writes are `PUT` (add a site, submit a sitemap) and `DELETE`
+(remove a site or a sitemap). The proxy refuses `PUT` and `DELETE` by method,
+whatever the scope of the bound credential, and strips the
+`X-HTTP-Method-Override`, `X-HTTP-Method`, and `X-Method-Override` headers on
+this host. To let the agent submit a sitemap or change a site, change the rule
+again, for example with
+`runfree host rules searchconsole.googleapis.com --clear`, which restores the
+service rule: under the default `ask` posture each write-class request, a
+Search Analytics query included, then asks for approval.
+
+The proxy does not strip a method override in the query string or the body.
+Bind a source with only the `webmasters.readonly` scope, as above, so Google
+also refuses a write that reaches it (not yet proven against the live API).
+The scope is defence in depth: the method rule does not depend on it.
 
 ### Service revisions
 

@@ -12,7 +12,6 @@ import type { ArgumentsCamelCase, Argv } from "yargs";
 
 import { describeRequestRules } from "../../admin/admin-core.ts";
 import { createAdminState } from "../../admin/context.ts";
-import { SEARCH_CONSOLE_HOST, searchConsoleWarningForApprovedPolicy } from "../../admin/search-console-write-guard.ts";
 import {
   type RequestRuleInput,
   domainExplainIntent as hostExplainIntent,
@@ -152,9 +151,8 @@ export const hostCommand: CommandModule = {
       scope: DesiredHostScope,
       mutation: DesiredHostMutation,
       reload: boolean,
-    ): Promise<number> => {
+    ): Promise<void> => {
       const runtime = context.runtimeContext();
-      let exitStatus = 0;
       const result = await mutateDesiredHost(runtime, nodeRuntimeIO, scope, mutation);
       console.log(`scope: ${scope === "local" ? "checkout-local" : "project"}`);
       console.log(`${result.host} ${result.changed ? "updated" : "unchanged"}`);
@@ -165,25 +163,14 @@ export const hostCommand: CommandModule = {
         console.log(`after: ${describeRequestRules(result.after)}`);
       }
       for (const warning of result.warnings) console.log(`warning: ${warning}`);
-      if (result.host === SEARCH_CONSOLE_HOST) {
-        // Spec §5.1: the binding lives in host credential config, read only
-        // inside an admin action and after the policy lock is released. A
-        // config read failure renders and becomes the exit status; the
-        // mutation above already stands, so the command still reports it.
-        exitStatus = await run(() => {
-          const writeScopeWarning = searchConsoleWarningForApprovedPolicy(runtime);
-          if (writeScopeWarning) console.log(`warning: ${writeScopeWarning}`);
-        });
-      }
       console.log(`updated .runfree/network-policy${scope === "local" ? ".local" : ""}.json`);
       console.log(`approved ${scope} desired policy: ${result.digest.slice(0, 19)}… (approval record id)`);
       if (!reload) {
         console.log("effective policy: unchanged (--no-reload)");
-        return exitStatus;
+        return;
       }
       const activation = await activateApprovedControlsAfterMutation(runtime, nodeRuntimeIO);
       console.log(activationReportLine(activation));
-      return exitStatus;
     };
     const showRules = async (scope: DesiredHostScope, host: string, service: string | undefined): Promise<void> => {
       const result = await readDesiredHostRules(context.runtimeContext(), nodeRuntimeIO, scope, host, service);

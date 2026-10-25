@@ -159,41 +159,6 @@ describe("installable runfree CLI: admin policy", () => {
     expect(JSON.parse(fs.readFileSync(localPath, "utf8")).services["user-rules-local"].revision).toBe(2);
   });
 
-  test("service enable and host rules warn on the google-search-console unsafe write pair (spec §5.1)", () => {
-    expect(runCli(["init"]).status).toBe(0);
-    const remedyText = "restore the prompt with: runfree host rules searchconsole.googleapis.com --write ask";
-    const env = { GSC_TOKEN: "ya29.search-console" };
-
-    const prompting = runTsCli(["service", "enable", "google-search-console", "--from-env", "GSC_TOKEN", "--no-reload"], env);
-    expect(prompting.status, prompting.stderr).toBe(0);
-    expect(`${prompting.stdout}${prompting.stderr}`).not.toContain(remedyText);
-
-    const allowWrite = runTsCli(["service", "enable", "google-search-console", "--from-env", "GSC_TOKEN", "--allow-write", "--no-reload"], env);
-    expect(allowWrite.status, allowWrite.stderr).toBe(0);
-    expect(allowWrite.stderr).toContain("runfree warning: searchconsole.googleapis.com writes run without approval");
-    expect(allowWrite.stderr).toContain("env GSC_TOKEN");
-    expect(allowWrite.stderr).toContain(remedyText);
-    expect(allowWrite.stderr).not.toContain(`${remedyText} --local`);
-    expect(`${allowWrite.stdout}${allowWrite.stderr}`).not.toContain("ya29.search-console");
-
-    const ask = runCli(["host", "rules", "searchconsole.googleapis.com", "--write", "ask", "--no-reload"]);
-    expect(ask.status, ask.stderr).toBe(0);
-    expect(`${ask.stdout}${ask.stderr}`).not.toContain(remedyText);
-
-    const allow = runCli(["host", "rules", "searchconsole.googleapis.com", "--write", "allow", "--no-reload"]);
-    expect(allow.status, allow.stderr).toBe(0);
-    expect(allow.stdout).toMatch(/\nwarning: searchconsole\.googleapis\.com writes run without approval[^\n]*restore the prompt with: runfree host rules searchconsole\.googleapis\.com --write ask\nupdated \.runfree\/network-policy\.json\n/);
-  });
-
-  test("the google-search-console write-pair remedy names the checkout-local layer that holds the service", () => {
-    expect(runCli(["init"]).status).toBe(0);
-    const enabled = runTsCli([
-      "service", "enable", "google-search-console", "--from-env", "GSC_TOKEN", "--allow-write", "--local", "--no-reload",
-    ], { GSC_TOKEN: "ya29.search-console" });
-    expect(enabled.status, enabled.stderr).toBe(0);
-    expect(enabled.stderr).toContain("restore the prompt with: runfree host rules searchconsole.googleapis.com --write ask --local");
-  });
-
   test("service enable refuses policy drift before writing host credential or parameter state", () => {
     expect(runCli(["init"]).status).toBe(0);
     const policyPath = path.join(tmp, ".runfree/network-policy.json");

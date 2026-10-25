@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "vitest";
+import { describe, expect, test } from "vitest";
 import {
   type DesiredServiceEntry,
   validateDesiredNetworkPolicy,
@@ -7,15 +7,7 @@ import {
 
 import { SERVICES, type Service } from "../../../../../scripts/services.ts";
 import { desiredServiceEntry } from "../../admin/service-policy.ts";
-import type { RuntimeContext } from "../../runtime/types.ts";
-import { flushWarnings, pendingWarningsForTest, setOutputWriterForTest } from "../../warnings.ts";
-import {
-  formatServiceListTable,
-  planServiceRevisionChanges,
-  reportSearchConsoleWritePair,
-  serviceListRows,
-  serviceRevisionRefusalLines,
-} from "./service.ts";
+import { formatServiceListTable, planServiceRevisionChanges, serviceListRows, serviceRevisionRefusalLines } from "./service.ts";
 
 function entry(revision: number, hosts: string[]): DesiredServiceEntry {
   return {
@@ -173,38 +165,5 @@ describe("planServiceRevisionChanges", () => {
       gone("gone.npm.example", true),
       gone("gone2.npm.example", true),
     ]);
-  });
-});
-
-// Review L3: the §5.1 check runs after the enable committed, so its failure
-// must not skip the activation that follows (host rules isolates it the same
-// way). It warns and sets the exit status instead of throwing.
-describe("reportSearchConsoleWritePair", () => {
-  const runtime = { projectRoot: "/nonexistent" } as unknown as RuntimeContext;
-  const previousExitCode = process.exitCode;
-
-  afterEach(() => {
-    process.exitCode = previousExitCode;
-    setOutputWriterForTest(() => {});
-    flushWarnings();
-    setOutputWriterForTest(undefined);
-  });
-
-  test("a failing check warns, sets exit status 1, and does not throw", () => {
-    expect(() => reportSearchConsoleWritePair(runtime, () => {
-      throw new Error("approval record unreadable at /x/\u001b[31mroot");
-    })).not.toThrow();
-    expect(process.exitCode).toBe(1);
-    const messages = pendingWarningsForTest().map((event) => event.message);
-    expect(messages).toHaveLength(1);
-    expect(messages[0]).toContain("searchconsole.googleapis.com write action was not checked");
-    expect(messages[0]).not.toContain("\u001b");
-  });
-
-  test("a warning from the check is emitted and leaves the exit status alone", () => {
-    process.exitCode = undefined;
-    reportSearchConsoleWritePair(runtime, () => "pair warning");
-    expect(process.exitCode).toBeUndefined();
-    expect(pendingWarningsForTest().map((event) => event.message)).toEqual(["pair warning"]);
   });
 });

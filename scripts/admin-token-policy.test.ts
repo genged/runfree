@@ -8,9 +8,8 @@ import path from "node:path";
 import util from "node:util";
 import { afterEach, beforeAll, beforeEach, describe, expect, test, vi } from "vitest";
 
-import type { DesiredNetworkPolicyJson } from "@runfree/runtime-contracts/desired-network-policy";
 import { validateNetworkPolicy, type PolicyJson } from "@runfree/runtime-contracts/network-policy";
-import { defaultConfig, projectControlPaths, projectInfo, type ProjectInfo } from "../packages/cli/src/config.ts";
+import { defaultConfig, projectControlPaths, type ProjectInfo } from "../packages/cli/src/config.ts";
 import { approveNetworkCandidate, approveRuntimeIsolationControl } from "../packages/cli/src/control/approvals.ts";
 import { captureDesiredPolicyCandidate } from "../packages/cli/src/control/candidates.ts";
 import {
@@ -47,8 +46,6 @@ import {
 import { signGoogleServiceAccountJwt } from "../packages/cli/src/admin/google-service-account.ts";
 import { CREDENTIAL_OBSERVATION_BATCH_HEADER } from "../packages/cli/src/admin/credential-observation.ts";
 import { createAdminState } from "../packages/cli/src/admin/context.ts";
-import { desiredServiceEntry } from "../packages/cli/src/admin/service-policy.ts";
-import { SERVICES } from "./services.ts";
 import {
   convergeProxyPolicy,
   runAdminAction,
@@ -183,7 +180,7 @@ function writeFixtureRepo(policy: unknown): void {
 async function runAdmin(
   action: () => void | Promise<void>,
   extraEnv: NodeJS.ProcessEnv = {},
-  stateOverrides: Readonly<{ policyAccess?: "effective-read-only"; projectRoot?: string; validatedRuntime?: ReturnType<typeof tokenSyncValidatedRuntime> }> = {},
+  stateOverrides: Readonly<{ policyAccess?: "effective-read-only"; validatedRuntime?: ReturnType<typeof tokenSyncValidatedRuntime> }> = {},
 ): Promise<AdminRunResult> {
   fs.mkdirSync(home, { recursive: true });
   const env = {
@@ -2169,42 +2166,6 @@ exit 0
     expect(status.stdout).toContain("github: configured");
     expect(status.stdout).toContain("refresh: manual");
     expect(status.stdout).not.toContain(privateKeyPem.trim());
-  });
-
-  test("credential status warns on the google-search-console unsafe write pair (spec §5.1)", async () => {
-    const searchConsolePolicy = (writeAction: "allow" | "ask") => ({
-      hosts: ["searchconsole.googleapis.com"],
-      tokens: {
-        "google-search-console": {
-          description: "Google Search Console",
-          credentials: [
-            { host: "searchconsole.googleapis.com", header: "Authorization", scheme: "bearer" },
-          ],
-        },
-      },
-      requests: { "searchconsole.googleapis.com": { writeAction } },
-    });
-    writeFixtureRepo(searchConsolePolicy("allow"));
-    const fakeSource = installFakeCommandSource({ name: "gcloud", output: "ya29.search-console\n" });
-    const add = await runAdmin(() => sourceAddCommandIntent({
-      name: "gsc",
-      replaceSource: false,
-      command: ["gcloud", "auth", "print-access-token"],
-    }), { PATH: fakeSource.fakeBin });
-    expect(add.status, add.stderr).toBe(0);
-    writeTokenConfig({ "google-search-console": { source: "named", name: "gsc" } });
-
-    const unsafe = await runAdmin(() => credentialStatus());
-    fs.writeFileSync(path.join(tmp, ".runfree/network-policy.json"), `${JSON.stringify(searchConsolePolicy("ask"), null, 2)}\n`);
-    const prompting = await runAdmin(() => credentialStatus());
-
-    expect(unsafe.status, unsafe.stderr).toBe(0);
-    expect(unsafe.stdout).toContain("google-search-console: configured");
-    expect(unsafe.stdout).toMatch(/\n {2}warning: searchconsole\.googleapis\.com writes run without approval[^\n]*source gsc[^\n]*runfree host rules searchconsole\.googleapis\.com --write ask\n/);
-    expect(unsafe.stdout).not.toContain("ya29.search-console");
-    expect(prompting.status, prompting.stderr).toBe(0);
-    expect(prompting.stdout).toContain("google-search-console: configured");
-    expect(prompting.stdout).not.toContain("warning:");
   });
 
   test("a google-search-console command-source binding takes a refresh after enable (docs Services, P-D4)", async () => {
@@ -7119,31 +7080,6 @@ describe("google-service-account sources", () => {
     expect(result.stdout).not.toContain(GSC_REF);
   });
 
-  test("credential status warns for a write-scope service-account source under allow, and not for a read-only one (§5.1)", async () => {
-    const policy = {
-      hosts: ["searchconsole.googleapis.com"],
-      tokens: {
-        [GSC_TOKEN]: {
-          description: "Search Console",
-          credentials: [{ host: "searchconsole.googleapis.com", header: "Authorization", scheme: "bearer" }],
-        },
-      },
-      requests: { "searchconsole.googleapis.com": { writeAction: "allow" } },
-    };
-    writeFixtureRepo(policy);
-    writeTokenConfig({ [GSC_TOKEN]: { source: "named", name: "gsc" } });
-    writeGscRegistry(gscRegistryEntry({ scopes: [GSC_RO] }));
-    const readOnly = await runAdmin(() => credentialStatus());
-    writeGscRegistry(gscRegistryEntry({ scopes: [GSC_RW] }));
-    const write = await runAdmin(() => credentialStatus());
-
-    expect(readOnly.status, readOnly.stderr).toBe(0);
-    expect(readOnly.stdout).toContain(`${GSC_TOKEN}: configured`);
-    expect(readOnly.stdout).not.toContain("warning:");
-    expect(write.status, write.stderr).toBe(0);
-    expect(write.stdout).toMatch(/\n {2}warning: searchconsole\.googleapis\.com writes run without approval[^\n]*has a Search Console write scope[^\n]*runfree host rules searchconsole\.googleapis\.com --write ask\n/);
-  });
-
   describe("credential source add google-service-account (§4.2)", () => {
     function hostConfigBytes(): { sources: string | undefined; tokens: string | undefined; status: string | undefined; receipts: string | undefined } {
       const read = (p: string) => (fs.existsSync(p) ? fs.readFileSync(p, "utf8") : undefined);
@@ -7324,323 +7260,6 @@ describe("google-service-account sources", () => {
       expect(result.status).toBe(1);
       expect(result.stderr).toContain(`gsc source is already configured; pass --replace-source to change it; used by credential bindings: ${GSC_TOKEN}`);
       expect(hostConfigBytes()).toEqual(before);
-    });
-
-    // Spec §5.1 refusal (plan P-D1, P-D2): a --replace-source that adds a
-    // write scope is refused, before any 1Password read, while a project
-    // that binds the source has write action allow on the host in its
-    // approved desired policy.
-    describe("the write-scope refusal (§5.1)", () => {
-      const SC_HOST = "searchconsole.googleapis.com";
-      const RECLAIM = "runfree host rules searchconsole.googleapis.com --write ask";
-      const KEEP_READ_ONLY = `--scope ${GSC_RO}`;
-      const gscToken = {
-        [GSC_TOKEN]: {
-          description: "Search Console",
-          credentials: [{ host: SC_HOST, header: "Authorization" as const, scheme: "bearer" as const }],
-        },
-      };
-
-      function stateEnv(): NodeJS.ProcessEnv {
-        return {
-          ...process.env,
-          HOME: home,
-          XDG_CONFIG_HOME: path.join(home, ".config"),
-          XDG_DATA_HOME: path.join(home, ".local/share"),
-          XDG_STATE_HOME: path.join(home, ".local/state"),
-        };
-      }
-
-      function directPolicy(extra: Partial<DesiredNetworkPolicyJson> = {}): DesiredNetworkPolicyJson {
-        return { version: 2, hosts: [SC_HOST], tokens: gscToken, ...extra };
-      }
-
-      function servicePolicy(hostRules?: Record<string, { writeAction: "allow" | "ask" }>): DesiredNetworkPolicyJson {
-        const service = SERVICES["google-search-console"];
-        if (!service) throw new Error("google-search-console is not in the registry");
-        const entry = desiredServiceEntry(service, { writeMode: "allow-write", ...(hostRules ? { hostRules } : {}) });
-        return { version: hostRules ? 4 : 2, hosts: [], services: { "google-search-console": entry } };
-      }
-
-      /** Writes the project layer and approves it the way the operator would. */
-      function approveProjectPolicy(policy: DesiredNetworkPolicyJson): void {
-        fs.mkdirSync(path.join(tmp, ".runfree"), { recursive: true });
-        fs.writeFileSync(path.join(tmp, ".runfree/network-policy.json"), `${JSON.stringify(policy, null, 2)}\n`);
-        const project = projectInfo(tmp, stateEnv());
-        const candidate = captureDesiredPolicyCandidate(tmp, project.paths.controlCandidatesDir);
-        approveNetworkCandidate(tmp, project, candidate, "network-project", "interactive");
-        approveNetworkCandidate(tmp, project, candidate, "network-local", "interactive");
-      }
-
-      /** The state pointer a launch writes (runtime/recovery.ts writeProjectRecoveryPointer). */
-      function writeProjectPointer(): void {
-        const stateDir = path.join(home, ".local/state/runfree/projects", projectHash(tmp));
-        fs.mkdirSync(stateDir, { recursive: true });
-        fs.writeFileSync(path.join(stateDir, "project.json"), `${JSON.stringify({ projectRoot: tmp, updatedAt: "2026-10-25T00:00:00.000Z" })}\n`);
-      }
-
-      function boundProject(policy: DesiredNetworkPolicyJson): void {
-        writeGscRegistry();
-        bindGscToken();
-        approveProjectPolicy(policy);
-        writeProjectPointer();
-      }
-
-      async function expectRefused(): Promise<void> {
-        const op = installGscOp(() => gscKeyJson());
-        const before = hostConfigBytes();
-        const result = await addGsc(op, { replaceSource: true, scopes: [GSC_RO, GSC_RW] });
-        expect(result.status).toBe(1);
-        expect(op.reads()).toBe(0);
-        expect(result.stderr).toContain(SC_HOST);
-        expect(result.stderr).toContain(tmp);
-        expect(result.stderr).toContain(RECLAIM);
-        expect(result.stderr).toContain(KEEP_READ_ONLY);
-        expect(hostConfigBytes()).toEqual(before);
-      }
-
-      async function expectReplaced(extra: { warning?: string } = {}): Promise<AdminRunResult> {
-        const op = installGscOp(() => gscKeyJson());
-        const result = await addGsc(op, { replaceSource: true, scopes: [GSC_RO, GSC_RW] });
-        expect(result.status, result.stderr).toBe(0);
-        expect(result.stdout).toContain("gsc source replaced");
-        const registry = JSON.parse(fs.readFileSync(sourceRegistryPath(), "utf8")) as Record<string, Record<string, unknown>>;
-        expect(registry.gsc.scopes).toEqual([GSC_RW, GSC_RO].sort());
-        if (extra.warning) expect(result.stderr).toContain(extra.warning);
-        return result;
-      }
-
-      test("refuses before the 1Password read under a direct host write action allow, and host rules --write ask reclaims it", async () => {
-        boundProject(directPolicy({ requests: { [SC_HOST]: { writeAction: "allow" } } }));
-        await expectRefused();
-        approveProjectPolicy(directPolicy({ requests: { [SC_HOST]: { writeAction: "ask" } } }));
-        const replaced = await expectReplaced();
-        expect(replaced.stderr).not.toContain("warning");
-      });
-
-      test("refuses when the allow comes from service enable --allow-write, and a service host rule ask reclaims it", async () => {
-        boundProject(servicePolicy());
-        await expectRefused();
-        approveProjectPolicy(servicePolicy({ [SC_HOST]: { writeAction: "ask" } }));
-        await expectReplaced();
-      });
-
-      test("refuses when the allow comes from the policy-wide writeApproval, and a per-host ask reclaims it", async () => {
-        boundProject(directPolicy({ writeApproval: "allow" }));
-        await expectRefused();
-        approveProjectPolicy(directPolicy({ writeApproval: "allow", requests: { [SC_HOST]: { writeAction: "ask" } } }));
-        await expectReplaced();
-      });
-
-      test("does not refuse when no project binds the source", async () => {
-        writeGscRegistry();
-        approveProjectPolicy(directPolicy({ requests: { [SC_HOST]: { writeAction: "allow" } } }));
-        writeProjectPointer();
-        await expectReplaced();
-      });
-
-      test("does not refuse when the source is bound to another credential", async () => {
-        writeGscRegistry();
-        writeTokenConfig({ other: { source: "named", name: "gsc" } });
-        approveProjectPolicy(directPolicy({ requests: { [SC_HOST]: { writeAction: "allow" } } }));
-        writeProjectPointer();
-        await expectReplaced();
-      });
-
-      test("does not refuse a replace whose scopes stay read-only", async () => {
-        writeGscRegistry(gscRegistryEntry({ scopes: [GSC_RW] }));
-        bindGscToken();
-        approveProjectPolicy(directPolicy({ requests: { [SC_HOST]: { writeAction: "allow" } } }));
-        writeProjectPointer();
-        const op = installGscOp(() => gscKeyJson());
-        const result = await addGsc(op, { replaceSource: true, scopes: [GSC_RO] });
-        expect(result.status, result.stderr).toBe(0);
-        expect(result.stdout).toContain("gsc source replaced");
-      });
-
-      test("a binding project whose checkout cannot be found warns with its project id instead of refusing", async () => {
-        writeGscRegistry();
-        bindGscToken();
-        approveProjectPolicy(directPolicy({ requests: { [SC_HOST]: { writeAction: "allow" } } }));
-        // No state pointer, and the command runs outside the checkout: the
-        // project id cannot be mapped to its checkout.
-        const elsewhere = path.join(tmpBase, "elsewhere");
-        fs.mkdirSync(elsewhere, { recursive: true });
-        const op = installGscOp(() => gscKeyJson());
-        const result = await runAdmin(() => sourceAddGoogleServiceAccountIntent(addInput({ replaceSource: true, scopes: [GSC_RO, GSC_RW] })), {
-          OP_SERVICE_ACCOUNT_TOKEN: "op-session",
-          PATH: `${op.bin}${path.delimiter}${process.env.PATH ?? ""}`,
-        }, { projectRoot: elsewhere });
-        expect(result.status, result.stderr).toBe(0);
-        expect(result.stdout).toContain("gsc source replaced");
-        expect(result.stderr).toContain(`runfree warning: gsc source: project ${projectHash(tmp)} binds ${GSC_TOKEN} to it`);
-        expect(result.stderr).toContain("the Search Console write-scope refusal could not be checked");
-        expect(result.stderr).toContain("its next launch or credential sync warns");
-      });
-
-      test("refuses a bound project at the current checkout that has never launched (no state pointer), and host rules --write ask reclaims it", async () => {
-        writeGscRegistry();
-        bindGscToken();
-        approveProjectPolicy(directPolicy({ requests: { [SC_HOST]: { writeAction: "allow" } } }));
-        // No writeProjectPointer(): the command runs inside the checkout.
-        await expectRefused();
-        approveProjectPolicy(directPolicy({ requests: { [SC_HOST]: { writeAction: "ask" } } }));
-        await expectReplaced();
-      });
-
-      test("the refusal escapes control characters in a checkout path", async () => {
-        const escapedRoot = path.join(tmpBase, "esc\u001b[31mroot");
-        fs.mkdirSync(path.join(escapedRoot, ".runfree"), { recursive: true });
-        const policy = directPolicy({ requests: { [SC_HOST]: { writeAction: "allow" } } });
-        fs.writeFileSync(path.join(escapedRoot, ".runfree/network-policy.json"), `${JSON.stringify(policy, null, 2)}\n`);
-        const project = projectInfo(escapedRoot, stateEnv());
-        const candidate = captureDesiredPolicyCandidate(escapedRoot, project.paths.controlCandidatesDir);
-        approveNetworkCandidate(escapedRoot, project, candidate, "network-project", "interactive");
-        approveNetworkCandidate(escapedRoot, project, candidate, "network-local", "interactive");
-        writeGscRegistry();
-        const tokensPath = path.join(home, ".config/runfree/projects", projectHash(escapedRoot), "tokens.json");
-        fs.mkdirSync(path.dirname(tokensPath), { recursive: true });
-        fs.writeFileSync(tokensPath, `${JSON.stringify({ [GSC_TOKEN]: { source: "named", name: "gsc" } })}\n`);
-        const op = installGscOp(() => gscKeyJson());
-        const result = await runAdmin(() => sourceAddGoogleServiceAccountIntent(addInput({ replaceSource: true, scopes: [GSC_RO, GSC_RW] })), {
-          OP_SERVICE_ACCOUNT_TOKEN: "op-session",
-          PATH: `${op.bin}${path.delimiter}${process.env.PATH ?? ""}`,
-        }, { projectRoot: escapedRoot });
-        expect(result.status).toBe(1);
-        expect(op.reads()).toBe(0);
-        expect(result.stderr).toContain(RECLAIM);
-        expect(result.stderr).not.toContain("\u001b");
-        expect(result.stderr).toContain("esc\\u{1b}[31mroot");
-      });
-
-      describe("launch and credential sync warn on the unsafe pair (§5.1)", () => {
-        function syncFixture(scopes: string[]): void {
-          approveProjectPolicy(directPolicy({ requests: { [SC_HOST]: { writeAction: "allow" } } }));
-          // The effective policy the sync publishes to (the approved desired layer stays as approved).
-          writeFixtureRepo({ hosts: [SC_HOST], tokens: gscToken });
-          writeGscRegistry(gscRegistryEntry({ scopes }));
-          bindGscToken();
-        }
-
-        const PAIR_WARNING = "runfree warning: searchconsole.googleapis.com writes run without approval";
-
-        test.each<[string, Partial<typeof syncInput> & { mode?: "startup-convergence" }]>([
-          ["credential sync", {}],
-          ["a launch's receipt-gated sync", { mode: "startup-convergence" }],
-        ])("%s warns for a write-scope service-account source under allow", async (_label, extra) => {
-          syncFixture([GSC_RW]);
-          const fakeDocker = installTokenSyncDockerFake();
-          const op = installGscOp(() => gscKeyJson());
-          const result = await runAdmin(() => credentialSyncIntent({ ...syncInput, ...extra }), gscEnv(fakeDocker, op.bin));
-          if (extra.mode === undefined) {
-            expect(result.status, result.stderr).toBe(0);
-            expect(result.stdout).toContain(`${GSC_TOKEN}: synced to proxy tmpfs from source gsc`);
-          }
-          expect(result.stderr).toContain(PAIR_WARNING);
-          expect(result.stderr).toContain("has a Search Console write scope");
-          expect(result.stderr).toContain(RECLAIM);
-          expect(result.stderr.split(PAIR_WARNING)).toHaveLength(2);
-        });
-
-        test("credential sync does not warn for a read-only service-account source, or under write action ask", async () => {
-          syncFixture([GSC_RO]);
-          const fakeDocker = installTokenSyncDockerFake();
-          const op = installGscOp(() => gscKeyJson());
-          const readOnly = await runAdmin(() => credentialSyncIntent(syncInput), gscEnv(fakeDocker, op.bin));
-          expect(readOnly.status, readOnly.stderr).toBe(0);
-          expect(readOnly.stderr).not.toContain(PAIR_WARNING);
-
-          writeGscRegistry(gscRegistryEntry({ scopes: [GSC_RW] }));
-          approveProjectPolicy(directPolicy({ requests: { [SC_HOST]: { writeAction: "ask" } } }));
-          const ask = await runAdmin(() => credentialSyncIntent(syncInput), gscEnv(fakeDocker, op.bin));
-          expect(ask.stderr).not.toContain(PAIR_WARNING);
-        });
-      });
-
-      describe("jwt and command source replaces warn, never refuse (§5.1)", () => {
-        function boundOtherSource(entry: Record<string, unknown>, writeAction: "allow" | "ask"): void {
-          fs.mkdirSync(path.dirname(sourceRegistryPath()), { recursive: true });
-          fs.writeFileSync(sourceRegistryPath(), `${JSON.stringify({ gsc: entry }, null, 2)}\n`, { mode: 0o600 });
-          bindGscToken();
-          approveProjectPolicy(directPolicy({ requests: { [SC_HOST]: { writeAction } } }));
-        }
-
-        const UNKNOWN_SCOPE = "has a scope Runfree cannot read";
-
-        async function replaceWithCommand(): Promise<AdminRunResult> {
-          const fakeSource = installFakeCommandSource({ name: "gcloud", output: "ya29.replacement" });
-          return runAdmin(() => sourceAddCommandIntent({ name: "gsc", replaceSource: true, command: ["gcloud", "auth", "print-access-token"] }), {
-            PATH: `${fakeSource.fakeBin}${path.delimiter}${process.env.PATH ?? ""}`,
-          });
-        }
-
-        async function replaceWithJwt(): Promise<AdminRunResult> {
-          const ecPem = crypto.generateKeyPairSync("ec", { namedCurve: "P-256" }).privateKey.export({ type: "pkcs8", format: "pem" }).toString();
-          const op = installGscOp(() => ecPem);
-          return runAdmin(() => sourceAddJwtIntent({
-            name: "gsc",
-            replaceSource: true,
-            alg: "ES256",
-            privateKeyRef: "op://Private/gsc-jwt/key",
-            ttl: "19m",
-            claims: ["iss=ISSUER"],
-            headers: [],
-          }), { OP_SERVICE_ACCOUNT_TOKEN: "op-session", PATH: `${op.bin}${path.delimiter}${process.env.PATH ?? ""}` });
-        }
-
-        test.each<[string, () => Promise<AdminRunResult>]>([
-          ["command", replaceWithCommand],
-          ["jwt", replaceWithJwt],
-        ])("a %s --replace-source of a source bound under allow warns and replaces", async (kind, replace) => {
-          boundOtherSource(gscRegistryEntry({ scopes: [GSC_RO] }), "allow");
-          const result = await replace();
-          expect(result.status, result.stderr).toBe(0);
-          expect(result.stdout).toContain("gsc source replaced");
-          expect(result.stderr).toContain(`runfree warning: gsc source is bound to ${GSC_TOKEN} in ${tmp}`);
-          expect(result.stderr).toContain(UNKNOWN_SCOPE);
-          expect(result.stderr).toContain(RECLAIM);
-          const registry = JSON.parse(fs.readFileSync(sourceRegistryPath(), "utf8")) as Record<string, Record<string, unknown>>;
-          expect(registry.gsc.type).toBe(kind);
-        });
-
-        test.each<[string, () => Promise<AdminRunResult>]>([
-          ["command", replaceWithCommand],
-          ["jwt", replaceWithJwt],
-        ])("a %s --replace-source under write action ask does not warn", async (_kind, replace) => {
-          boundOtherSource(gscRegistryEntry({ scopes: [GSC_RO] }), "ask");
-          const result = await replace();
-          expect(result.status, result.stderr).toBe(0);
-          expect(result.stderr).not.toContain(UNKNOWN_SCOPE);
-        });
-
-        test("credential set-source of google-search-console warns for an unknown-scope source under allow, and not for a read-only service-account source", async () => {
-          approveProjectPolicy(directPolicy({ requests: { [SC_HOST]: { writeAction: "allow" } } }));
-          // The effective policy set-source reads (the approved desired layer stays as approved).
-          writeFixtureRepo({ hosts: [SC_HOST], tokens: gscToken });
-          fs.mkdirSync(path.dirname(sourceRegistryPath()), { recursive: true });
-          fs.writeFileSync(sourceRegistryPath(), `${JSON.stringify({
-            gsc: gscRegistryEntry({ scopes: [GSC_RO] }),
-            cmd: { type: "command", argv: ["/usr/bin/true"], displayArgv: ["true"], createdAt: "2026-10-25T00:00:00.000Z" },
-          }, null, 2)}\n`, { mode: 0o600 });
-          const setSource = (name: string, replaceSource: boolean) => runAdmin(() => credentialSetSourceIntent({
-            name: GSC_TOKEN,
-            tokenSource: { kind: "named", name },
-            refreshEvery: "50m",
-            replaceSource,
-            sync: false,
-          }));
-
-          const readOnly = await setSource("gsc", false);
-          expect(readOnly.status, readOnly.stderr).toBe(0);
-          expect(readOnly.stderr).not.toContain("writes run without approval");
-
-          const unknown = await setSource("cmd", true);
-          expect(unknown.status, unknown.stderr).toBe(0);
-          expect(unknown.stderr).toContain("runfree warning: searchconsole.googleapis.com writes run without approval");
-          expect(unknown.stderr).toContain(`credential ${GSC_TOKEN} uses source cmd, which ${UNKNOWN_SCOPE}`);
-          expect(unknown.stderr).toContain(RECLAIM);
-        });
-      });
     });
 
     test("a ttl given at add bounds the explicit refresh of a binding", async () => {

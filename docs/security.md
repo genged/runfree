@@ -308,14 +308,14 @@ agent sees: placeholder or runfree_oauth_* handle only
    and prints a fixed message that names the field, never the key. A watcher
    keeps the parsed key in memory for at most 4 hours, so a key removed from
    1Password stops being used within 4 hours plus one JWT lifetime; deleting
-   the key in Google Cloud IAM stops it at once. The write scope and the
-   host's write action live in different places: Runfree warns when the
-   Search Console write action is `allow` with a source whose scope is not
-   provably read-only (at enable, `host rules`, `set-source`, every launch
-   and `credential sync`, and `credential status`), and refuses a source
-   replace that adds the write scope under `allow` in a project it can find
-   (the current checkout, or one recorded at launch). Google's enforcement of the
-   read-only scope is not yet proven against the live API.
+   the key in Google Cloud IAM stops it at once. The scope is not the
+   control that keeps Search Console read-only: the documented procedure is
+   a host rule that allows only `GET` and `POST` (every `POST` on that API is
+   a read), so the proxy refuses `PUT` and `DELETE` by method and strips the
+   method-override headers ([Network](#network) rule 7) whatever the scope.
+   A method override in the query string or body is not stripped; the
+   read-only scope covers that residual, though Google's enforcement of it is
+   not yet proven against the live API.
 
 ### Git Over HTTPS
 
