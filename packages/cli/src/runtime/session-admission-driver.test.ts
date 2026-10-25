@@ -5084,6 +5084,37 @@ describe("session admission under the per-session file source", () => {
       expect(mocks.markSessionInterrupted).toHaveBeenCalledTimes(1);
     });
 
+    // Spec §3.5 order: the container is stopped only once its file is gone. A
+    // delete this host could not prove leaves the file granting authority, so
+    // the cancel issues no stop and the checked teardown reports unconfirmed.
+    test("a cancel whose session-file delete fails issues no stop: the teardown is unconfirmed and keeps the record", async () => {
+      const input = fixture();
+      mocks.containerInspect = { status: 0, stdout: runningInspect(), stderr: "" };
+      const finishForeground = heldForeground();
+      const captureAsync = withAsyncCapture(input.io);
+      const control = cancellable();
+      const driver = createInternalSessionAdmissionDriver({
+        ...input,
+        sessionLockManager: orderedSessionLockManager(input.sessionLockManager),
+        nowEpochMs: () => Date.parse("2026-08-09T00:10:00.000Z"),
+      });
+
+      const launch = driver.launchBuiltin("codex", { cancellation: control.cancellation });
+      await vi.waitFor(() => expect(mocks.events).toContain("release-attached-lock"));
+      const attachedAt = mocks.events.length;
+      mocks.effectAnswers.set("session-file:delete", [{ status: 1, stdout: "", stderr: "proxy exec failed" }]);
+      control.cancel();
+      await vi.waitFor(() => expect(mocks.events.slice(attachedAt)).toContain("session-file:delete"));
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(captureAsync).not.toHaveBeenCalled();
+      finishForeground({ kind: "exit", code: 143, signal: null });
+
+      await expect(launch).rejects.toBeInstanceOf(SessionTeardownIncompleteError);
+      expect(captureAsync).not.toHaveBeenCalled();
+      expect(mocks.events.slice(attachedAt).filter((event) => event.includes("container stop"))).toEqual([]);
+      expect(mocks.events).not.toContain("remove-exact-record:rf-20260809-abcdef");
+    });
+
     test("after a cancel, a Docker that never answers is cut off by the headless IO's client deadline: the teardown is unconfirmed, not hung", async () => {
       const input = fixture();
       mocks.containerInspect = { status: 0, stdout: runningInspect(), stderr: "" };

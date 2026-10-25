@@ -6,6 +6,8 @@ import { fileURLToPath } from "node:url";
 
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
+import { adminDockerClient, runAdminAction, runCapture } from "./admin/admin-core.ts";
+import { createAdminState } from "./admin/context.ts";
 import { mcpConfigureIntent } from "./admin/mcp-admin.ts";
 import { serviceConfigureIntent } from "./admin/service-policy.ts";
 import { nodeRuntimeIO, withWriteApprovalSession } from "./runtime.ts";
@@ -187,6 +189,47 @@ describe("headless runtime IO", () => {
       io.run("docker", ["build", "-t", "x", "."]);
       expect(seen[0]?.options).toBeUndefined();
     });
+  });
+});
+
+// Warm credential preparation (`RuntimeIO.admin`, `prepareTokenSources`)
+// reaches Docker through admin's own synchronous runner, not runtime IO, so
+// that runner applies the same headless deadline.
+describe("the admin Docker runner under the headless mode", () => {
+  const deadline = { timeout: SESSION_DOCKER_CALL_TIMEOUT_MS, killSignal: "SIGKILL" };
+  function stalledAdmin() {
+    const seen: Array<{ command: string; args: string[]; options: childProcess.SpawnSyncOptions }> = [];
+    const processRunner = vi.fn((command: string, args: string[], options: childProcess.SpawnSyncOptions) => {
+      seen.push({ command, args, options });
+      return { status: null, stdout: "", stderr: "", pid: 1, signal: "SIGKILL", output: [], error: Object.assign(new Error("ETIMEDOUT"), { code: "ETIMEDOUT" }) };
+    });
+    const state = createAdminState({ env: { PATH: process.env.PATH }, processRunner } as Parameters<typeof createAdminState>[0]);
+    return { seen, run: (action: () => void) => runAdminAction(state, action) };
+  }
+
+  test("bounds a stalled call with no deadline of its own", async () => {
+    headless();
+    const { seen, run } = stalledAdmin();
+    await run(() => { adminDockerClient().info(); });
+    expect(seen[0]?.args[0]).toBe("info");
+    expect(seen[0]?.options).toMatchObject(deadline);
+  });
+
+  test("keeps a tighter deadline and leaves an image build unbounded", async () => {
+    headless();
+    const { seen, run } = stalledAdmin();
+    await run(() => {
+      adminDockerClient().info(undefined, { timeout: 5_000 });
+      runCapture("docker", ["build", "-t", "x", "."]);
+    });
+    expect(seen[0]?.options.timeout).toBe(5_000);
+    expect(seen[1]?.options.timeout).toBeUndefined();
+  });
+
+  test("an interactive call is unchanged", async () => {
+    const { seen, run } = stalledAdmin();
+    await run(() => { adminDockerClient().info(); });
+    expect(seen[0]?.options.timeout).toBeUndefined();
   });
 });
 

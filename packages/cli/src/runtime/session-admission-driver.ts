@@ -1217,11 +1217,13 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
    * without blocking the event loop, so a second signal can still shorten the
    * grace while the first stop runs. Settles once every stop it issued has.
    * Never rejects: the ordinary teardown that follows stops and removes the
-   * container again and is what confirms it.
+   * container again and is what confirms it. Issues nothing while the session
+   * file may still exist (spec §3.5 order: a delete this host could not prove
+   * leaves the stop to the checked teardown, which then reports unconfirmed).
    */
   async #stopForCancellation(record: SessionContainerRecordV2): Promise<void> {
     const escalate = this.#launch?.cancellation?.escalate;
-    if (!escalate) return;
+    if (!escalate || this.#fileWritten !== undefined) return;
     if (escalate.aborted) {
       await this.#cancelStop(record, 0);
       return;

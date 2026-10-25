@@ -104,11 +104,12 @@ type JsonEvent = Readonly<Record<string, unknown>>;
 
 /**
  * Per-stream state for one agent format: `observe` sees every parsed JSON
- * object in order, `final` gives the final event so far (`undefined` while
- * none has arrived). Neither may throw; the parser guards them anyway.
+ * object in order and answers whether it was a final event, `final` gives the
+ * final event so far (`undefined` while none has arrived). Neither may throw;
+ * the parser guards them anyway.
  */
 type FinalEventTracker = Readonly<{
-  observe(event: JsonEvent): void;
+  observe(event: JsonEvent): boolean;
   final(): FinalEvent | undefined;
 }>;
 
@@ -126,7 +127,9 @@ function claudeTracker(): FinalEventTracker {
   let final: FinalEvent | undefined;
   return {
     observe(event) {
-      final = readClaudeFinalEvent(event) ?? final;
+      const read = readClaudeFinalEvent(event);
+      final = read ?? final;
+      return read !== undefined;
     },
     final: () => final,
   };
@@ -142,15 +145,20 @@ function codexTracker(): FinalEventTracker {
       const type = event[names.typeField];
       if (type === names.turnFailedType || type === names.errorType) {
         failed = true;
-      } else if (type === names.turnCompletedType) {
+        return true;
+      }
+      if (type === names.turnCompletedType) {
         completed = true;
-      } else if (type === names.itemCompletedType) {
+        return true;
+      }
+      if (type === names.itemCompletedType) {
         const item = event[names.itemField];
         if (isPlainObject(item) && item[names.itemTypeField] === names.agentMessageItemType) {
           const text = item[names.agentMessageTextField];
           if (typeof text === "string") message = text;
         }
       }
+      return false;
     },
     final() {
       if (!completed && !failed) return undefined;
@@ -191,7 +199,9 @@ function piTracker(): FinalEventTracker {
   let final: FinalEvent | undefined;
   return {
     observe(event) {
-      final = readPiFinalEvent(event) ?? final;
+      const read = readPiFinalEvent(event);
+      final = read ?? final;
+      return read !== undefined;
     },
     final: () => final,
   };
@@ -203,7 +213,7 @@ const FINAL_EVENT_TRACKERS: Readonly<Record<HeadlessOutputFormat, () => FinalEve
   "pi-json": piTracker,
 });
 
-const NO_FINAL_EVENT: FinalEventTracker = Object.freeze({ observe() {}, final: () => undefined });
+const NO_FINAL_EVENT: FinalEventTracker = Object.freeze({ observe: () => false, final: () => undefined });
 
 function truncateUtf8(value: string, capBytes: number): { value: string; truncated: boolean } {
   const bytes = Buffer.from(value, "utf8");
@@ -235,6 +245,13 @@ export function createHeadlessOutputParser(
   // The last stream ended inside a line that did not parse: a truncated tail.
   let brokenTail = false;
   let malformedLines = 0;
+  // A dropped line may have been the event that changed the outcome, so it
+  // voids the success so far until a later final event re-establishes one.
+  let droppedSinceFinal = false;
+  const drop = (): void => {
+    malformedLines += 1;
+    droppedSinceFinal = true;
+  };
 
   const parseLine = (line: Buffer): void => {
     let end = line.length;
@@ -243,12 +260,12 @@ export function createHeadlessOutputParser(
     try {
       const value: unknown = JSON.parse(decoder.decode(line.subarray(0, end)));
       if (!isPlainObject(value)) {
-        malformedLines += 1;
+        drop();
         return;
       }
-      tracker.observe(value);
+      if (tracker.observe(value)) droppedSinceFinal = false;
     } catch {
-      malformedLines += 1;
+      drop();
     }
   };
 
@@ -265,7 +282,7 @@ export function createHeadlessOutputParser(
       pending = [];
       pendingBytes = 0;
       discarding = true;
-      malformedLines += 1;
+      drop();
       return;
     }
     pending.push(part);
@@ -335,7 +352,7 @@ export function createHeadlessOutputParser(
         : truncateUtf8(final.message, HEADLESS_FINAL_MESSAGE_CAP_BYTES);
       return Object.freeze({
         complete: ended && !overflowed && !brokenTail,
-        finalSuccess: final?.success === true,
+        finalSuccess: final?.success === true && !droppedSinceFinal,
         ...(truncated ? { finalMessage: truncated.value } : {}),
         finalMessageTruncated: truncated?.truncated ?? false,
         malformedLines,

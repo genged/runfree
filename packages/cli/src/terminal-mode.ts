@@ -58,9 +58,10 @@ export function hostStdoutIsTty(stream: TtyStream = process.stdout): boolean {
  * The client deadline a headless call gets: a Docker call with no timeout of
  * its own gets `SESSION_DOCKER_CALL_TIMEOUT_MS` and SIGKILL. An image build
  * is the one exception: it can rightly take minutes, and it never waits on a
- * session.
+ * session. Admin's own Docker runner applies it too while the mode is held
+ * (`adminSpawnSync`), so warm credential preparation is bounded the same way.
  */
-function headlessCallOptions(command: string, args: readonly string[], options: SpawnSyncOptions | undefined): SpawnSyncOptions | undefined {
+export function headlessCallOptions(command: string, args: readonly string[], options: SpawnSyncOptions | undefined): SpawnSyncOptions | undefined {
   if (command !== "docker" || args[0] === "build") return options;
   if (typeof options?.timeout === "number" && options.timeout > 0) return options;
   return { ...options, timeout: SESSION_DOCKER_CALL_TIMEOUT_MS, killSignal: "SIGKILL" };

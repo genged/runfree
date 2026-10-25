@@ -91,6 +91,21 @@ describe("claude stream-json parser", () => {
     expect(result.finalMessage).toBeUndefined();
   });
 
+  // A dropped line may have been the event that changed the outcome, so it
+  // voids an earlier success until a later final event re-establishes one.
+  test("a success followed by a dropped line is not a success until a later final event", () => {
+    const oversized = "a".repeat(HEADLESS_OUTPUT_LINE_CAP_BYTES + 1);
+    for (const dropped of [oversized, "{\"type\":\"result\",\"subtype\":"]) {
+      const result = parse(claudeStream(SUCCESS_EVENT, dropped));
+      expect(result).toMatchObject({ complete: true, finalSuccess: false, malformedLines: 1 });
+      expect(decideHeadlessOutcome({ agentStatus: 0, streamsDrained: true, parser: result }).outcome).toBe("unverified");
+    }
+    expect(parse(claudeStream("not json", SUCCESS_EVENT))).toMatchObject({ complete: true, finalSuccess: true, malformedLines: 1 });
+    expect(parse(claudeStream(SUCCESS_EVENT, "not json", SUCCESS_EVENT)).finalSuccess).toBe(true);
+    expect(parseAs("codex-exec-json", Buffer.concat([CODEX_SUCCESS, Buffer.from("not json\n")])).finalSuccess).toBe(false);
+    expect(parseAs("pi-json", Buffer.concat([PI_SUCCESS, Buffer.from("not json\n")])).finalSuccess).toBe(false);
+  });
+
   test("a line over the line cap is discarded to the next newline and counted", () => {
     const parser = createHeadlessOutputParser("claude-stream-json");
     const huge = Buffer.alloc(2 * 1024 * 1024, 0x61);

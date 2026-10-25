@@ -158,6 +158,7 @@ import {
 } from "./credential-observation.ts";
 import { stableJsonDroppingUndefined as stableJson, sha256Hex, isRecord } from "../strict-primitives.ts";
 import { remedy } from "../remedies.ts";
+import { headlessCallOptions, headlessTerminalModeActive } from "../terminal-mode.ts";
 
 
 export type TokenSource =
@@ -1358,8 +1359,9 @@ export function withAdminCallTimeout<T>(timeoutMs: number, action: () => T, tota
 function adminSpawnSync(
   command: string,
   args: string[],
-  options: childProcess.SpawnSyncOptions = {},
+  callerOptions: childProcess.SpawnSyncOptions = {},
 ): childProcess.SpawnSyncReturns<string> {
+  const options = headlessTerminalModeActive() ? headlessCallOptions(command, args, callerOptions) ?? callerOptions : callerOptions;
   const deadline = adminLifecycleDeadline.getStore();
   const remaining = deadline === undefined ? undefined : deadline - performance.now();
   if (remaining !== undefined && remaining <= 0) throw new Error("proxy reload lifecycle budget ended; sessions were preserved; retry runtime reload-policy --force");
