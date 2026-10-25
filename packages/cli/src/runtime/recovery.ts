@@ -1251,11 +1251,15 @@ function codexMatchItemsForProject(
   }
 }
 
+/** A crashed headless run's assumed end when none was recorded: 24 hours is the longest `--timeout`. */
+const HEADLESS_UNKNOWN_END_BOUND_MS = 24 * 60 * 60 * 1_000;
+
 /**
  * A headless record's claim window: its own Codex window when it has one,
- * else (no end time and no lifecycle record) from its start to its last
- * heartbeat, or to now while its owner is still alive. Wider is the safe
- * direction here, because the window only removes threads from the picker.
+ * else (no end time and no lifecycle record) from its start to
+ * `HEADLESS_UNKNOWN_END_BOUND_MS` after it, or to now while its owner is still
+ * alive. Wider is the safe direction here, because the window only removes
+ * threads from the picker.
  */
 function headlessCodexWindow(
   item: RecoveryItem,
@@ -1264,7 +1268,7 @@ function headlessCodexWindow(
   const window = codexWindowForItem(item, lifecycleRecords);
   if (window) return window;
   const startMs = Date.parse(item.startedAt ?? "");
-  const endMs = item.ownerState === "dead" ? Date.parse(item.hostMetadata?.lastSeenAt ?? "") : Date.now();
+  const endMs = item.ownerState === "dead" ? startMs + HEADLESS_UNKNOWN_END_BOUND_MS : Date.now();
   return Number.isFinite(startMs) && Number.isFinite(endMs) ? { startMs, endMs } : undefined;
 }
 

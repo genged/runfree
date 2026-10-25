@@ -2850,6 +2850,35 @@ describe("headless host evidence is never offered (headless-run plan C1)", () =>
     ]);
   });
 
+  test("a crashed headless Codex run with no recorded end claims the threads of the next 24 hours, not a zero-length window", () => {
+    const CRASHED_HEADLESS_THREAD = "01a0692c-7f74-7750-ad42-fb36200a0104";
+    // Dead owner, no endedAt, no lifecycle record; heartbeats never move
+    // lastSeenAt, so it still equals startedAt.
+    hostEvidence("rf-20261025-hdlcrs", {
+      command: "codex",
+      hostPid: DEAD_PID,
+      recordVersion: 2,
+      launchMode: "headless",
+      startedAt: "2026-07-31T00:10:00.000Z",
+      lastSeenAt: "2026-07-31T00:10:00.000Z",
+    });
+    hostEvidence("rf-20261025-intcd3", {
+      command: "codex",
+      hostPid: DEAD_PID,
+      recordVersion: 2,
+      outcome: "interrupted",
+      startedAt: "2026-07-31T00:00:00.000Z",
+      endedAt: "2026-07-31T00:30:00.000Z",
+    });
+    codexRollout("2026/07/31", CRASHED_HEADLESS_THREAD, "2026-07-31T00:15:00.000Z");
+
+    const inventory = scanRecoveryInventory({ env, projectRoot, includeCodexMatches: true });
+
+    expect(inventory.items.map((item) => [item.sourceId, item.conversationSource])).toEqual([
+      ["rf-20261025-intcd3", undefined],
+    ]);
+  });
+
   test("host evidence with any other launchMode is refused as malformed", () => {
     hostEvidence("rf-20261025-batch1", { launchMode: "batch" });
     hostEvidence("rf-20261025-batch2", { launchMode: "interactive" });

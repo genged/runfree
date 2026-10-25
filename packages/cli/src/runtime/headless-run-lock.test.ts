@@ -12,7 +12,22 @@ import {
   headlessRunLockPath,
   type AcquireHeadlessRunLockInput,
 } from "./headless-run-lock.ts";
+import { lockHolderIsDead } from "./sessions.ts";
 import type { CaptureResult } from "./types.ts";
+
+// Pass-through by default; one test runs a step inside the liveness check.
+const liveness = vi.hoisted(() => ({ during: undefined as (() => void) | undefined }));
+vi.mock("./sessions.ts", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./sessions.ts")>();
+  return {
+    ...actual,
+    lockHolderIsDead: vi.fn((...args: Parameters<typeof actual.lockHolderIsDead>) => {
+      const dead = actual.lockHolderIsDead(...args);
+      liveness.during?.();
+      return dead;
+    }),
+  };
+});
 
 const BOOT_A = "linux:11111111-2222-3333-4444-555555555555";
 const BOOT_B = "linux:66666666-7777-8888-9999-aaaaaaaaaaaa";
@@ -36,6 +51,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  liveness.during = undefined;
   vi.restoreAllMocks();
   fs.rmSync(tmp, { recursive: true, force: true });
 });
@@ -204,6 +220,23 @@ test("a dead holder that recorded no session is reclaimed without a Docker call"
   expect(fs.existsSync(path.join(lock.path, "session.json"))).toBe(false);
   expect(inboxNames()).toEqual([IMAGE]);
   lock.release();
+});
+
+test("a session the holder records while its liveness is judged is honored: reclaim still needs its container gone", () => {
+  // The holder records its session, then crashes, between the contender's
+  // first look and its liveness verdict. A read taken before the verdict would
+  // see no session and reclaim without asking Docker.
+  const lockPath = writeHolder({ pid: reapedPid(), boot: BOOT_B });
+  liveness.during = () => {
+    fs.writeFileSync(path.join(lockPath, "session.json"), `${JSON.stringify({ v: 1, sessionId: SESSION_ID, containerName: CONTAINER_NAME, containerId: CONTAINER_ID })}\n`);
+  };
+  const io = dockerIo(present);
+
+  const held = expectHeld(() => acquireHeadlessRunLock(input(io)));
+
+  expect(lockHolderIsDead).toHaveBeenCalled();
+  expect(held.holder.containerId).toBe(CONTAINER_ID);
+  expect(io.capture.mock.calls[0]?.[1]).toEqual(["container", "inspect", CONTAINER_ID]);
 });
 
 test("a dead holder whose container inspects as present keeps the lock", () => {

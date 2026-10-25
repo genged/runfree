@@ -5124,6 +5124,52 @@ describe("session admission under the per-session file source", () => {
       expect(mocks.events).not.toContain("remove-exact-record:rf-20260809-abcdef");
     });
 
+    test.each([
+      ["a headless run bounds every call", true],
+      ["an interactive launch is unchanged", false],
+    ])("after a normal exit, a Docker that never answers during teardown: %s", async (_name, headless) => {
+      mocks.builtinAgent.mockReturnValue({
+        id: "claude",
+        label: "Claude",
+        defaultCommand: "claude",
+        launchConversationIdFlag: "--session-id",
+      });
+      const input = fixture();
+      mocks.containerInspect = { status: 0, stdout: runningInspect(), stderr: "" };
+      const finishForeground = heldForeground();
+      // Once the agent exits, the fake Docker never returns: a synchronous call
+      // with no deadline would block the event loop, so the run timer and the
+      // signal handlers could never fire. One with a deadline is killed at it.
+      const answer = input.io.capture;
+      const unbounded: string[] = [];
+      let stalled = false;
+      input.io.capture = vi.fn((command: string, args: string[], options?: Parameters<RuntimeIO["capture"]>[2]) => {
+        if (!stalled) return answer(command, args, options);
+        const label = effectLabel(args);
+        mocks.events.push(label);
+        if (!(typeof options?.timeout === "number" && options.timeout > 0 && options.killSignal === "SIGKILL")) unbounded.push(label);
+        return { status: 124, stdout: "", stderr: "" };
+      }) as unknown as RuntimeIO["capture"];
+      const driver = createInternalSessionAdmissionDriver({
+        ...input,
+        sessionLockManager: orderedSessionLockManager(input.sessionLockManager),
+      });
+
+      const launch = driver.launchBuiltin("claude", {
+        launchConversationId: "0f8b1a2c-3d4e-4f5a-8b6c-7d8e9f0a1b2c",
+        ...(headless ? { headless: { promptContainerPath: "/runfree/inbox/run-20261025T101500Z-0a1b2c3d.prompt" } } : {}),
+      });
+      await vi.waitFor(() => expect(mocks.events).toContain("release-attached-lock"));
+      stalled = true;
+      finishForeground({ kind: "exit", code: 0, signal: null });
+
+      await expect(launch).rejects.toBeInstanceOf(SessionTeardownIncompleteError);
+      expect(mocks.events).toContain("session-file:delete");
+      if (headless) expect(unbounded).toEqual([]);
+      else expect(unbounded).toContain("session-file:delete");
+      expect(mocks.events).not.toContain("remove-exact-record:rf-20260809-abcdef");
+    });
+
     test("a second signal during the stop issues a no-grace stop while the first is still pending", async () => {
       const input = fixture();
       mocks.containerInspect = { status: 0, stdout: runningInspect(), stderr: "" };

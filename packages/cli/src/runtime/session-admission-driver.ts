@@ -328,8 +328,8 @@ const CANCELLED_STREAM_END_BOUND_MS = 5_000;
  */
 const CANCEL_STOP_CLIENT_SLACK_MS = 20_000;
 /**
- * The client deadline on every synchronous Docker call of a cancelled launch:
- * long enough for the teardown's own graceful stop.
+ * The client deadline on every synchronous Docker call of a headless run or a
+ * cancelled launch: long enough for the teardown's own graceful stop.
  */
 const CANCELLED_DOCKER_CALL_TIMEOUT_MS = SESSION_CONTAINER_STOP_SECONDS * 1_000 + CANCEL_STOP_CLIENT_SLACK_MS;
 
@@ -658,12 +658,13 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
       env: this.#input.plan.execution.dockerClientEnv,
       shell: false as const,
       maxBuffer,
-      // Once a launch is cancelled, every synchronous Docker call (the stop
-      // routine's delete, the teardown after it) gets a client deadline: a
-      // stalled daemon would otherwise block the event loop, so neither the
-      // run timeout nor a second signal could advance. A call cut off counts
-      // as not done, and the teardown ends unconfirmed.
-      ...(this.#launch?.cancellation?.signal.aborted
+      // A headless run's every synchronous Docker call, and a cancelled
+      // launch's (the stop routine's delete, the teardown after it), gets a
+      // client deadline: a stalled daemon would otherwise block the event
+      // loop, so neither the run timeout nor a signal could advance, even in
+      // a teardown after a normal exit. A call cut off counts as not done, and
+      // the teardown ends unconfirmed.
+      ...(this.#launch?.headless !== undefined || this.#launch?.cancellation?.signal.aborted
         ? { timeout: CANCELLED_DOCKER_CALL_TIMEOUT_MS, killSignal: "SIGKILL" as const }
         : {}),
     };

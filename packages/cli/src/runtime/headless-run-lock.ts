@@ -211,21 +211,23 @@ function judgeExistingLock(lockPath: string, input: AcquireHeadlessRunLockInput)
   // Gone (or replaced by a non-directory) since mkdir failed: contend again.
   if (identity === undefined) return undefined;
   const ownerToken = readLifecycleLockOwnerToken(lockPath);
-  const session = readLockSession(lockPath);
-  const held = (reason: string): Judgement => ({ kind: "held", error: new HeadlessRunLockHeldError(lockPath, holderOf(lockPath, session), reason) });
+  const held = (reason: string, session = readLockSession(lockPath)): Judgement => ({ kind: "held", error: new HeadlessRunLockHeldError(lockPath, holderOf(lockPath, session), reason) });
   // Liveness first: a live holder is refused before any Docker call.
   if (!lockHolderIsDead(lockPath, input.env)) return held("its holder is still running");
-  if (session.kind === "malformed") return held(`${session.reason}, so its container cannot be proven gone`);
+  // Read only once the holder is dead: a session it recorded before dying is
+  // then always seen, so reclaim needs that session's container gone.
+  const session = readLockSession(lockPath);
+  if (session.kind === "malformed") return held(`${session.reason}, so its container cannot be proven gone`, session);
   if (session.kind === "recorded") {
     const reference = session.record.containerId ?? session.record.containerName;
     const inspected = createDockerClient(input.io).inspect([reference], { type: "container" }, {
       timeout: INSPECT_TIMEOUT_MS,
       maxBuffer: INSPECT_MAX_BYTES,
     });
-    if (inspected.status === 0) return held(`its holder exited, but its session container ${reference} still exists`);
+    if (inspected.status === 0) return held(`its holder exited, but its session container ${reference} still exists`, session);
     if (!provesContainerAbsent(inspected.stderr, reference)) {
       const observation = (inspected.stderr.trim() || inspected.stdout.trim() || `exit ${inspected.status}`).split("\n")[0];
-      return held(`its holder exited, but Docker could not prove its session container ${reference} is gone (${observation})`);
+      return held(`its holder exited, but Docker could not prove its session container ${reference} is gone (${observation})`, session);
     }
   }
   return { kind: "reclaim", identity, ...(ownerToken !== undefined ? { ownerToken } : {}) };
