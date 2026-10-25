@@ -127,6 +127,23 @@ describe("public launch through session admission", () => {
     reacquired?.release();
   });
 
+  test("threads a headless option into the driver beside the host-chosen conversation id", async () => {
+    const observer = { allocated: vi.fn(), containerCreated: vi.fn() };
+    const headless = { promptContainerPath: "/runfree/inbox/run-20261025T101500Z-0a1b2c3d.prompt", observer };
+    const status = await launchConfiguredAgentThroughAdmission({
+      preparedRuntime: preparedRuntime(),
+      io,
+      agentName: "claude",
+      headless,
+    });
+
+    expect(status).toBe(0);
+    expect(mocks.launchBuiltin).toHaveBeenCalledWith(
+      "claude",
+      { launchConversationId: expect.stringMatching(UUID_PATTERN), headless },
+    );
+  });
+
   test("maps a signal death to exit status 1", async () => {
     mocks.launchBuiltin.mockResolvedValueOnce({ status: null, signal: "SIGKILL" });
 

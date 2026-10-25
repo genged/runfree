@@ -298,6 +298,11 @@ export type SessionMetadata = {
   terminalIds?: TerminalIdentity;
   // The host-chosen conversation id a fresh Claude or Pi launch started with.
   launchConversationId?: string;
+  // Present only for a headless run (`runfree run`, headless-run spec §3.3).
+  // Absent means interactive: every record written before this field existed
+  // came from an interactive launch. A headless record carries no host TTY
+  // and no terminal ids.
+  launchMode?: "headless";
   hostInbox: string;
   containerInbox: string;
   hostParentPid?: number;

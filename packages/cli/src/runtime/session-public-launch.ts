@@ -23,7 +23,10 @@ import { builtinAgent } from "../agents.ts";
 import { CliError } from "../errors.ts";
 import { warn } from "../warnings.ts";
 import { LIFECYCLE_LOCK_WAITER_YIELD_MS, launchHandoffSpanFits } from "./launch-lock-hold.ts";
-import { createInternalSessionAdmissionDriver } from "./session-admission-driver.ts";
+import {
+  createInternalSessionAdmissionDriver,
+  type SessionAdmissionLaunchOptions,
+} from "./session-admission-driver.ts";
 import {
   disposeLaunchHandoff,
   preparedRuntimeContext,
@@ -52,6 +55,13 @@ export type SessionPublicLaunchInput = Readonly<{
   foregroundSpawner?: SessionContainerForegroundSpawner;
   /** Trusted startup finalizer retry used only for valid concurrent drift. */
   reprepare?: () => Promise<PreparedRuntime>;
+  /**
+   * A headless run (headless-run spec §3.3): the driver's headless launch
+   * kind, passed through unchanged. The frame's one retry follows a
+   * stale-prepared-runtime refusal, which the driver raises before allocation,
+   * so the observer sees at most one allocated session.
+   */
+  headless?: SessionAdmissionLaunchOptions["headless"];
 }>;
 
 /**
@@ -109,7 +119,10 @@ export async function launchConfiguredAgentThroughAdmission(
     `${input.agentName} did not start`,
     () => withSessionLaunchFrame(
       input,
-      (driver) => driver.launchBuiltin(agent, launchConversationId !== undefined ? { launchConversationId } : {}),
+      (driver) => driver.launchBuiltin(agent, {
+        ...(launchConversationId !== undefined ? { launchConversationId } : {}),
+        ...(input.headless ? { headless: input.headless } : {}),
+      }),
     ),
   );
 }

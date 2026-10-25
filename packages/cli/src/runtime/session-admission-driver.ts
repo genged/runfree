@@ -201,6 +201,7 @@ import {
 import { createTaskScope, type ScopedTask } from "./task-scope.ts";
 import { launchLockHoldDeadline, RUNNING_PROOF_TIMEOUT_MS } from "./launch-lock-hold.ts";
 import { remedy } from "../remedies.ts";
+import { HEADLESS_PROMPT_CONTAINER_PATH_PATTERN } from "./session-launch.ts";
 
 const DEFAULT_INTERNAL_PROBE_LEASE_DURATION_MS = SESSION_ADMISSION_LEASE_MAX_DURATION_MS;
 
@@ -328,6 +329,20 @@ function completionOutcomeFromFailure(failure: unknown): SessionAdmissionLaunchO
   return undefined;
 }
 
+/**
+ * What a headless run's caller learns about its session as it comes into
+ * being (headless-run spec §3.5): the run lock records the deterministic
+ * container name before any container exists, then the exact id once it does.
+ * Called synchronously from inside the ladder; a throw fails the launch, and
+ * the ladder's ordinary cleanup removes whatever was already created.
+ */
+export type HeadlessLaunchObserver = Readonly<{
+  /** The lifecycle record is durable; nothing has been created yet. */
+  allocated(session: Readonly<{ sessionId: string; containerName: string }>): void;
+  /** The container exists under this exact id, bound into the durable record, before its start. */
+  containerCreated(containerId: string): void;
+}>;
+
 export type SessionAdmissionLaunchOptions = Readonly<{
   /**
    * Launches the recovery spec's typed resume argv for this agent instead of
@@ -349,6 +364,16 @@ export type SessionAdmissionLaunchOptions = Readonly<{
    * given no id.
    */
   launchConversationId?: string;
+  /**
+   * A headless run (headless-run spec §3.1-§3.3): the same admission ladder
+   * with a headless launch target, whose session entry opens the inbox prompt
+   * at `promptContainerPath` as the agent's stdin, with neither stdin nor a
+   * TTY on the container. The lifecycle record (and so the session file the
+   * proxy reads) is marked `launchMode: "headless"`, and host evidence carries
+   * the mark and no terminal identity. Refused with `resume` and for the
+   * shell, before any effect.
+   */
+  headless?: Readonly<{ promptContainerPath: string; observer?: HeadlessLaunchObserver }>;
 }>;
 
 export type InternalSessionAdmissionDriver = Readonly<{
@@ -1390,6 +1415,9 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
       // already had to sweep for once.
       if (!this.#launch) throw new Error("a shell session is launch-only; it has no probe mode");
       if (this.#launch.resume) throw new Error("a shell session cannot resume a conversation");
+      // Unreachable through `launchShell` today, which takes no options; kept
+      // so a future caller cannot mark a login shell headless.
+      if (this.#launch.headless) throw new Error("a shell session cannot be a headless run");
       launch = { kind: "shell" };
     } else {
       const descriptor = builtinAgent(this.agent);
@@ -1404,6 +1432,14 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
       // back to the same-terminal conversation that started it.
       if (this.#launch?.resume && this.#launch.launchConversationId !== undefined) {
         throw new Error("a resume launch cannot carry a host-chosen conversation id");
+      }
+      // A headless run is one fresh turn; resume argv is interactive recovery
+      // authority. The prompt path shape is refused here too, before
+      // preflight's first read, though the launch builder checks it again.
+      const headless = this.#launch?.headless;
+      if (headless && this.#launch?.resume) throw new Error("a headless run cannot resume a conversation");
+      if (headless && !HEADLESS_PROMPT_CONTAINER_PATH_PATTERN.test(headless.promptContainerPath)) {
+        throw new Error("headless prompt path must be one run file directly in /runfree/inbox");
       }
       if (this.#launch && !this.#launch.resume && descriptor.launchConversationIdFlag
         && this.#launch.launchConversationId === undefined) {
@@ -1427,6 +1463,9 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
         ...(this.#launch?.resume ? { resume: this.#launch.resume } : {}),
         ...(this.#launch?.launchConversationId !== undefined
           ? { launchConversationId: this.#launch.launchConversationId }
+          : {}),
+        ...(this.#launch?.headless
+          ? { headless: Object.freeze({ promptContainerPath: this.#launch.headless.promptContainerPath }) }
           : {}),
       };
     }
@@ -1614,7 +1653,9 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
     }
     const descriptor = this.#require(builtinAgent(this.agent), "built-in agent descriptor");
     return Object.freeze({
-      displayName: this.#launch?.resume ? `${descriptor.label} resume` : `${descriptor.label} admission probe`,
+      displayName: this.#launch?.headless
+        ? `${descriptor.label} headless run`
+        : this.#launch?.resume ? `${descriptor.label} resume` : `${descriptor.label} admission probe`,
       command: descriptor.id,
       agentCommand: descriptor.defaultCommand,
     });
@@ -1661,12 +1702,18 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
       hostBootId: hostBootId(this.#input.context.env),
       hostProcessStart: hostProcessStart(process.pid, this.#input.context.env),
       createdAt: new Date(createdAtMs).toISOString(),
-      launchMode: "interactive",
+      // The request's mark, never derived from the target's terminal flags
+      // (spec §3.5); the preflight refuses a mark its target disagrees with.
+      launchMode: this.#launch?.headless ? "headless" : "interactive",
     });
     writeSessionContainerRecordV2(this.#input.plan.paths.stateDir, preflight.expectedProject, record);
     this.#record = record;
     this.#persistedRecord = record;
     this.#plan = createSessionContainerCreatePlanFromPreflight(preflight, record);
+    this.#launch?.headless?.observer?.allocated(Object.freeze({
+      sessionId: record.sessionId,
+      containerName: record.containerName,
+    }));
   };
 
   #proveNamedVolumes(plan: SessionContainerCreatePlan): SessionNamedVolumeProof {
@@ -1742,6 +1789,7 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
     this.#persistedRecord = bound;
     const boundPlan = bindSessionContainerCreatePlanRecord(plan, bound);
     this.#plan = boundPlan;
+    this.#launch?.headless?.observer?.containerCreated(creation.containerId);
     const provisioning = transitionBoundAllocatedSessionContainerToProvisioningRunningV2(
       bound,
       mintSessionContainerLeaseV2({
@@ -1792,6 +1840,7 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
           sessionContainerName: provisioningPlan.record.containerName,
           ...(resumeConversationId !== undefined ? { resumeConversationId } : {}),
           ...(launchConversationId !== undefined ? { launchConversationId } : {}),
+          ...(this.#launch.headless ? { headless: true as const } : {}),
         },
       );
       writeSessionMetadata(this.#input.context, metadata);

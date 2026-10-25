@@ -1182,6 +1182,43 @@ test("writes a fresh launch's host-chosen conversation id and the current record
   expect(metadata.recordVersion).toBe(2);
 });
 
+test("headless evidence carries the mark and no terminal identity, even with a host TTY on stdin", () => {
+  // Headless-run spec §3.3 and plan conflict C3: a tmux pane has a TTY, and a
+  // headless run must record neither it nor the terminal ids resume matches on.
+  const runtimeContext = hostContext({
+    ...harnessEnv(BOOT_B, PROCESS_B),
+    TERM_PROGRAM: "iTerm.app",
+    TERM_PROGRAM_VERSION: "3.5",
+    ITERM_SESSION_ID: "w0t0p0:ABC",
+    TERM_SESSION_ID: "apple-session",
+    WT_SESSION: "wt-session",
+    TMUX: "/tmp/tmux-1000/default,4242,0",
+    TMUX_PANE: "%3",
+  });
+  const capture = vi.fn(() => ({ status: 0, stdout: "/dev/ttys004\n", stderr: "" }));
+  const io = { capture } as unknown as RuntimeIO;
+  const descriptor = Object.getOwnPropertyDescriptor(process.stdin, "isTTY");
+  Object.defineProperty(process.stdin, "isTTY", { value: true, configurable: true });
+  try {
+    const interactive = createSessionMetadata(runtimeContext, io, "claude");
+    expect(interactive.hostTty).toBe("/dev/ttys004");
+    expect(interactive.terminalIds).toBeDefined();
+    expect(interactive).not.toHaveProperty("launchMode");
+    capture.mockClear();
+
+    const headless = createSessionMetadata(runtimeContext, io, "claude", undefined, { headless: true });
+    expect(headless.launchMode).toBe("headless");
+    expect(capture).not.toHaveBeenCalled();
+    for (const key of ["hostTty", "terminalIds", "termProgram", "termProgramVersion", "termSessionId", "itermSessionId", "wtSession"]) {
+      expect(headless).not.toHaveProperty(key);
+    }
+    expect(headless.name).toMatch(/^claude /);
+  } finally {
+    if (descriptor) Object.defineProperty(process.stdin, "isTTY", descriptor);
+    else delete (process.stdin as { isTTY?: boolean }).isTTY;
+  }
+});
+
 test("normalizes bounded session names by Unicode characters", () => {
   expect(normalizeSessionName("  payments refactor  ")).toBe("payments refactor");
   expect(normalizeSessionName("😀".repeat(80))).toBe("😀".repeat(80));

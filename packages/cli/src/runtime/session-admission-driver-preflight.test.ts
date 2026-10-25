@@ -325,6 +325,7 @@ function fixture() {
           configuredCommand: string;
           resume: { conversationId?: string };
           launchConversationId: string;
+          headless: { promptContainerPath: string };
         }>
       | Readonly<{ kind: "shell" }> = {},
   ) =>
@@ -344,6 +345,7 @@ function fixture() {
             ...(launchOverrides.launchConversationId !== undefined
               ? { launchConversationId: launchOverrides.launchConversationId }
               : {}),
+            ...(launchOverrides.headless ? { headless: launchOverrides.headless } : {}),
           },
     });
   return {
@@ -469,6 +471,67 @@ describe("session admission driver preflight", () => {
       command: "pi",
     });
     expect(record.launchArgs.slice(-2)).toEqual(["--session-id", ID]);
+  });
+
+  test("mints the headless target for a headless claude launch and binds it into a headless record", () => {
+    // Headless-run spec §3.1-§3.3: the entry gets the prompt path, the
+    // container gets neither stdin nor a TTY, and the record's launchMode is
+    // the request's mark.
+    const value = fixture();
+    const ID = "0f8b1a2c-3d4e-4f5a-8b6c-7d8e9f0a1b2c";
+    const PROMPT = "/runfree/inbox/run-20261025T101500Z-0a1b2c3d.prompt";
+    const preflight = value.build({
+      agentId: "claude",
+      configuredCommand: builtinAgent("claude")?.defaultCommand ?? "",
+      launchConversationId: ID,
+      headless: { promptContainerPath: PROMPT },
+    });
+
+    expect(preflight.launch).toMatchObject({ path: SESSION_ENTRY_PATH, interactive: false, tty: false });
+    expect(preflight.launch.args).toEqual([
+      "--stdin-file",
+      PROMPT,
+      "/usr/local/bin/claude",
+      "--dangerously-skip-permissions",
+      "--add-dir",
+      "/runfree/inbox",
+      "--session-id",
+      ID,
+      "-p",
+      "--output-format",
+      "stream-json",
+      "--verbose",
+    ]);
+    const record = createAllocatedSessionContainerRecordFromPreflight(preflight, {
+      ...recordInput(),
+      command: "claude",
+      launchMode: "headless",
+    });
+    expect(record).toMatchObject({ launchMode: "headless", interactive: false, tty: false });
+    expect(createSessionContainerCreatePlanFromPreflight(preflight, record).launch.args[0]).toBe("--stdin-file");
+  });
+
+  test("refuses a headless target allocated without the headless mark, and the mark without the headless target", () => {
+    // A headless session marked interactive would have its ask writes held
+    // for an approver who never comes, instead of denied (spec §3.5).
+    const value = fixture();
+    const headless = value.build({
+      agentId: "claude",
+      configuredCommand: builtinAgent("claude")?.defaultCommand ?? "",
+      launchConversationId: "0f8b1a2c-3d4e-4f5a-8b6c-7d8e9f0a1b2c",
+      headless: { promptContainerPath: "/runfree/inbox/run-20261025T101500Z-0a1b2c3d.prompt" },
+    });
+    expect(() => createAllocatedSessionContainerRecordFromPreflight(headless, { ...recordInput(), command: "claude" }))
+      .toThrow("launch mode interactive does not match its headless launch target");
+    const interactive = value.build();
+    expect(() => createAllocatedSessionContainerRecordFromPreflight(interactive, { ...recordInput(), launchMode: "headless" }))
+      .toThrow("launch mode headless does not match its interactive launch target");
+  });
+
+  test("refuses a headless launch of an agent without headless argv before any container authority", () => {
+    const value = fixture();
+    expect(() => value.build({ headless: { promptContainerPath: "/runfree/inbox/run-20261025T101500Z-0a1b2c3d.prompt" } }))
+      .toThrow("does not support headless runs");
   });
 
   test("mints the login-shell target for a shell session and binds it into the record", () => {

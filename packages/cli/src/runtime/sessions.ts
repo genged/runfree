@@ -141,6 +141,13 @@ export type CreateSessionMetadataOptions = {
    * keyed to the exact conversation this terminal started.
    */
   launchConversationId?: string;
+  /**
+   * A headless run's evidence (headless-run spec §3.3, plan conflict C3): the
+   * host's own TTY and terminal ids are never read, because a tmux pane has
+   * them and they are resume's terminal-identity input. Marks the record
+   * `launchMode: "headless"`.
+   */
+  headless?: true;
 };
 
 const CONTROL_CHARACTERS = /[\u0000-\u001f\u007f-\u009f]/u;
@@ -297,13 +304,15 @@ export function createSessionMetadata(
   const now = (options.now ?? new Date()).toISOString();
   const bootId = hostBootId(context.env);
   const processStart = hostProcessStart(process.pid, context.env);
-  const hostTty = captureHostTty(context, io);
-  const termProgram = optionalEnv(context.env, "TERM_PROGRAM");
-  const termProgramVersion = optionalEnv(context.env, "TERM_PROGRAM_VERSION");
-  const termSessionId = optionalEnv(context.env, "TERM_SESSION_ID");
-  const itermSessionId = optionalEnv(context.env, "ITERM_SESSION_ID");
-  const wtSession = optionalEnv(context.env, "WT_SESSION");
-  const terminalIds = captureTerminalIdentity(context.env);
+  const headless = options.headless === true;
+  const terminalEnv = headless ? undefined : context.env;
+  const hostTty = headless ? undefined : captureHostTty(context, io);
+  const termProgram = optionalEnv(terminalEnv, "TERM_PROGRAM");
+  const termProgramVersion = optionalEnv(terminalEnv, "TERM_PROGRAM_VERSION");
+  const termSessionId = optionalEnv(terminalEnv, "TERM_SESSION_ID");
+  const itermSessionId = optionalEnv(terminalEnv, "ITERM_SESSION_ID");
+  const wtSession = optionalEnv(terminalEnv, "WT_SESSION");
+  const terminalIds = headless ? {} : captureTerminalIdentity(context.env);
   const requestedName = options.name ?? optionalEnv(context.env, "RUNFREE_SESSION_NAME");
   const name = requestedName === undefined
     ? synthesizeSessionName({ command, hostTty, termProgram, startedAt: now })
@@ -322,6 +331,7 @@ export function createSessionMetadata(
     ...(options.sessionContainerName !== undefined ? { sessionContainerName: options.sessionContainerName } : {}),
     ...(options.resumeConversationId !== undefined ? { resumeConversationId: options.resumeConversationId } : {}),
     ...(options.launchConversationId !== undefined ? { launchConversationId: options.launchConversationId } : {}),
+    ...(headless ? { launchMode: "headless" as const } : {}),
     recordVersion: SESSION_RECORD_VERSION,
     ...(Object.keys(terminalIds).length > 0 ? { terminalIds } : {}),
     hostInbox: context.project.paths.inboxDir,

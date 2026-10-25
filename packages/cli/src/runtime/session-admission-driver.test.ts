@@ -1378,6 +1378,128 @@ describe("internal session admission driver", () => {
     );
   });
 
+  // Headless-run spec §3.3: the same admission path with a headless launch
+  // kind. The mark is the request's, never derived from the terminal flags.
+  describe("headless launch option", () => {
+    const ID = "0f8b1a2c-3d4e-4f5a-8b6c-7d8e9f0a1b2c";
+    const PROMPT = "/runfree/inbox/run-20261025T101500Z-0a1b2c3d.prompt";
+    const claude = () => mocks.builtinAgent.mockReturnValue({
+      id: "claude",
+      label: "Claude",
+      defaultCommand: "claude",
+      launchConversationIdFlag: "--session-id",
+    });
+
+    test("threads the prompt path into preflight, marks the record headless, and reports allocation and creation in order", async () => {
+      claude();
+      const observer = {
+        allocated: vi.fn((value: { sessionId: string; containerName: string }) => {
+          mocks.events.push(`observer-allocated:${value.sessionId}:${value.containerName}`);
+        }),
+        containerCreated: vi.fn((containerId: string) => { mocks.events.push(`observer-created:${containerId}`); }),
+      };
+      const driver = createInternalSessionAdmissionDriver({
+        ...fixture(),
+        nowEpochMs: () => Date.parse("2026-08-09T00:00:00.000Z"),
+      });
+
+      const outcome = await driver.launchBuiltin("claude", {
+        launchConversationId: ID,
+        headless: { promptContainerPath: PROMPT, observer },
+      });
+
+      expect(outcome).toEqual({ status: 0, signal: null });
+      expect(mocks.createPreflight).toHaveBeenCalledWith(expect.objectContaining({
+        launch: expect.objectContaining({
+          kind: "builtin",
+          agentId: "claude",
+          launchConversationId: ID,
+          headless: { promptContainerPath: PROMPT },
+        }),
+      }));
+      expect(mocks.createAllocated).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ launchMode: "headless", displayName: "Claude headless run", command: "claude" }),
+      );
+      const allocatedEvent = "observer-allocated:rf-20260809-abcdef:runfree-session-0123456789ab-rf-20260809-abcdef";
+      expect(mocks.events.indexOf("write-allocated")).toBeLessThan(mocks.events.indexOf(allocatedEvent));
+      expect(mocks.events.indexOf(allocatedEvent)).toBeLessThan(mocks.events.indexOf("create"));
+      expect(mocks.events.indexOf("bind-container-id")).toBeLessThan(mocks.events.indexOf(`observer-created:${CONTAINER_ID}`));
+      expect(mocks.events.indexOf(`observer-created:${CONTAINER_ID}`)).toBeLessThan(mocks.events.indexOf("start-foreground"));
+      expect(observer.allocated).toHaveBeenCalledTimes(1);
+      expect(observer.containerCreated).toHaveBeenCalledTimes(1);
+      // Host evidence carries the mark; terminal capture is the evidence
+      // writer's (sessions.ts), told by this option.
+      expect(mocks.createSessionMetadata).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.anything(),
+        "claude",
+        "claude",
+        expect.objectContaining({ headless: true, launchConversationId: ID }),
+      );
+    });
+
+    test("an interactive launch stays interactive and carries no headless evidence option", async () => {
+      claude();
+      const driver = createInternalSessionAdmissionDriver({
+        ...fixture(),
+        nowEpochMs: () => Date.parse("2026-08-09T00:00:00.000Z"),
+      });
+
+      await driver.launchBuiltin("claude", { launchConversationId: ID });
+
+      expect(mocks.createPreflight).toHaveBeenCalledWith(expect.objectContaining({
+        launch: expect.not.objectContaining({ headless: expect.anything() }),
+      }));
+      expect(mocks.createAllocated).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ launchMode: "interactive", displayName: "Claude admission probe" }),
+      );
+      expect(mocks.createSessionMetadata).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.anything(),
+        "claude",
+        "claude",
+        expect.not.objectContaining({ headless: expect.anything() }),
+      );
+    });
+
+    test("a headless resume is refused before preflight, allocation, or any Docker call", async () => {
+      claude();
+      const observer = { allocated: vi.fn(), containerCreated: vi.fn() };
+      const input = fixture();
+      const driver = createInternalSessionAdmissionDriver({ ...input, nowEpochMs: () => Date.parse("2026-08-09T00:00:00.000Z") });
+
+      await expect(driver.launchBuiltin("claude", {
+        resume: { conversationId: ID },
+        headless: { promptContainerPath: PROMPT, observer },
+      })).rejects.toThrow("a headless run cannot resume a conversation");
+
+      expect(mocks.createPreflight).not.toHaveBeenCalled();
+      expect(mocks.createAllocated).not.toHaveBeenCalled();
+      expect(mocks.writeRecord).not.toHaveBeenCalled();
+      expect(input.io.capture).not.toHaveBeenCalled();
+      expect(observer.allocated).not.toHaveBeenCalled();
+    });
+
+    test.each([
+      "/tmp/run-20261025T101500Z-0a1b2c3d.prompt",
+      "/runfree/inbox/run-x/../../etc/passwd.prompt",
+      "",
+    ])("a headless prompt path %j outside the inbox run pattern is refused before preflight", async (promptContainerPath) => {
+      claude();
+      const input = fixture();
+      const driver = createInternalSessionAdmissionDriver({ ...input, nowEpochMs: () => Date.parse("2026-08-09T00:00:00.000Z") });
+
+      await expect(driver.launchBuiltin("claude", { launchConversationId: ID, headless: { promptContainerPath } }))
+        .rejects.toThrow("headless prompt path");
+
+      expect(mocks.createPreflight).not.toHaveBeenCalled();
+      expect(mocks.writeRecord).not.toHaveBeenCalled();
+      expect(input.io.capture).not.toHaveBeenCalled();
+    });
+  });
+
   // A teardown the proxy blocks is the owner's failure to report, and it must
   // not be confused with the agent's own exit: the process ended cleanly, so
   // its session evidence is consumed rather than preserved as interrupted.

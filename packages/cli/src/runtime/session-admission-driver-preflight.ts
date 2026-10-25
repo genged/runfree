@@ -24,6 +24,7 @@ import type { RuntimeDocker } from "./docker.ts";
 import { inspectReusableManagedImage, type ManagedImageExpectation } from "./image-identity.ts";
 import type { ActiveRuntimePlan } from "./plan.ts";
 import {
+  createBuiltinSessionHeadlessLaunchTarget,
   createBuiltinSessionLaunchTarget,
   createBuiltinSessionResumeLaunchTarget,
   createBuiltinSessionShellLaunchTarget,
@@ -45,7 +46,7 @@ import {
   createSessionImageDeclarationProof,
   type SessionImageDeclarationProof,
 } from "./session-image-declarations.ts";
-import { createSessionLaunchTarget, type SessionLaunchTarget } from "./session-launch.ts";
+import { createSessionLaunchTarget, SESSION_ENTRY_STDIN_FILE_FLAG, type SessionLaunchTarget } from "./session-launch.ts";
 import type { ProjectLifecycleLock } from "./sessions.ts";
 import { stableJson } from "../strict-primitives.ts";
 import { CliError } from "../errors.ts";
@@ -251,6 +252,13 @@ export type SessionAdmissionPreflightLaunch =
        * `createBuiltinSessionLaunchTarget` below it is already validated shape.
        */
       launchConversationId?: string;
+      /**
+       * A headless run (headless-run spec §3.1-§3.3): the builder mints the
+       * headless target, whose session entry opens this inbox prompt as the
+       * agent's stdin, with neither stdin nor a TTY on the container. Never
+       * present together with `resume`; the driver refuses that first.
+       */
+      headless?: Readonly<{ promptContainerPath: string }>;
     }>
   | Readonly<{ kind: "shell" }>;
 
@@ -323,13 +331,22 @@ export function createSessionAdmissionDriverPreflight(input: Readonly<{
             ? { conversationId: input.launch.resume.conversationId }
             : {}),
         })
-      : createBuiltinSessionLaunchTarget({
-          agentId: input.launch.agentId,
-          configuredCommand: input.launch.configuredCommand,
-          ...(input.launch.launchConversationId !== undefined
-            ? { launchConversationId: input.launch.launchConversationId }
-            : {}),
-        });
+      : input.launch.headless
+        ? createBuiltinSessionHeadlessLaunchTarget({
+            agentId: input.launch.agentId,
+            configuredCommand: input.launch.configuredCommand,
+            promptPath: input.launch.headless.promptContainerPath,
+            ...(input.launch.launchConversationId !== undefined
+              ? { launchConversationId: input.launch.launchConversationId }
+              : {}),
+          })
+        : createBuiltinSessionLaunchTarget({
+            agentId: input.launch.agentId,
+            configuredCommand: input.launch.configuredCommand,
+            ...(input.launch.launchConversationId !== undefined
+              ? { launchConversationId: input.launch.launchConversationId }
+              : {}),
+          });
   const imageExpectation = expectedManagedImage(snapshot.desired.manifest);
 
   input.lifecycleLock.assertHeld();
@@ -488,6 +505,17 @@ export function createAllocatedSessionContainerRecordFromPreflight(
   input: SessionAdmissionAllocatedRecordInput,
 ): SessionContainerRecordV2 {
   const binding = assertCurrentPreflight(preflight);
+  // The mark is the launch request's, carried by the caller, and never derived
+  // from the target. It must still agree with the target this preflight
+  // minted: a headless target recorded as interactive would have its `ask`
+  // writes held for an approver who never comes rather than denied, and an
+  // interactive target marked headless would deny a person at a terminal.
+  const targetMode = binding.launch.args[0] === SESSION_ENTRY_STDIN_FILE_FLAG ? "headless" : "interactive";
+  if (input.launchMode !== targetMode) {
+    throw new Error(
+      `allocated session-container launch mode ${String(input.launchMode)} does not match its ${targetMode} launch target`,
+    );
+  }
   const record = Object.freeze(createAllocatedSessionContainerRecordV2({
     ...input,
     materialization: binding.sessionAgentMaterialization,

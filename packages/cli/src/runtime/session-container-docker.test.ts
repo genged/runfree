@@ -116,6 +116,30 @@ function nonInteractiveAttached(): SessionContainerRecordV2 {
   );
 }
 
+const HEADLESS_PROMPT = "/runfree/inbox/run-20261025T101500Z-0a1b2c3d.prompt";
+const ENTRY_AGENT_ARGS = Object.freeze(["/usr/local/bin/claude", "--dangerously-skip-permissions"]);
+
+/** An entry-launched session, interactive or headless, otherwise identical (headless-run spec §3.2). */
+function entryLaunched(mode: "interactive" | "headless", containerId?: string): SessionContainerRecordV2 {
+  return sessionContainerRecordFixture({
+    ...(containerId !== undefined ? { containerId } : {}),
+    overrides: {
+      sessionIncarnation: "1".repeat(64),
+      sessionPrincipal: "2".repeat(64),
+      displayName: "payments refactor",
+      hostPid: 1234,
+      createdAt: "2026-08-05T12:00:00.000Z",
+      launchPath: SESSION_ENTRY_PATH,
+      launchArgs: mode === "headless"
+        ? Object.freeze(["--stdin-file", HEADLESS_PROMPT, ...ENTRY_AGENT_ARGS, "-p"])
+        : ENTRY_AGENT_ARGS,
+      interactive: mode === "interactive",
+      tty: mode === "interactive",
+      launchMode: mode,
+    },
+  });
+}
+
 function attachIdentity(record: SessionContainerRecordV2): SessionContainerAttachIdentity {
   return {
     projectId: record.projectId,
@@ -193,6 +217,41 @@ describe("typed session-container Docker operations", () => {
     const plan = createPlan(allocated(), sessionContainerLegacyTemplateFixture());
     const command = sessionContainerCreateCommand(plan, namedVolumeProof(plan));
     expect(command.args).not.toContain("--init");
+  });
+
+  test("creates a headless session without --interactive or --tty and otherwise exactly like an interactive one", () => {
+    const interactivePlan = createPlan(entryLaunched("interactive"));
+    const headlessPlan = createPlan(entryLaunched("headless"));
+    const interactive = sessionContainerCreateCommand(interactivePlan, namedVolumeProof(interactivePlan)).args;
+    const headless = sessionContainerCreateCommand(headlessPlan, namedVolumeProof(headlessPlan)).args;
+
+    expect(interactive).toContain("--interactive");
+    expect(interactive).toContain("--tty");
+    expect(headless).not.toContain("--interactive");
+    expect(headless).not.toContain("--tty");
+    // Mounts, capabilities, security options, environment, labels, network:
+    // everything before the image is the same apart from the two flags.
+    const imageId = headlessPlan.record.selectedAgentImageId;
+    const before = (args: readonly string[]) => args.slice(0, args.lastIndexOf(imageId));
+    expect(before(headless)).toEqual(before(interactive).filter((arg) => arg !== "--interactive" && arg !== "--tty"));
+    expect(headless.slice(headless.lastIndexOf(imageId) + 1)).toEqual(headlessPlan.launch.args);
+    // The prompt path is entry argv: it appears once, right after the flag.
+    expect(headless.filter((arg) => arg === HEADLESS_PROMPT)).toHaveLength(1);
+  });
+
+  test("starts and re-attaches a headless session without binding this host's stdin", () => {
+    const bound = entryLaunched("headless", CONTAINER_ID);
+    const provisioning = transitionBoundAllocatedSessionContainerToProvisioningRunningV2(bound, {
+      admittedAt: "2026-08-05T12:00:01.000Z",
+      leaseGeneration: "a".repeat(32),
+      leaseExpiresAt: "2026-08-05T12:02:01.000Z",
+    });
+    expect(sessionContainerStartAttachCommand(provisioning, PROJECT).args).not.toContain("--interactive");
+    // No `--sig-proxy` anywhere: `docker start` has no such option (spec §3.2).
+    expect(sessionContainerStartAttachCommand(provisioning, PROJECT).args.some((arg) => arg.startsWith("--sig-proxy")))
+      .toBe(false);
+    expect(sessionContainerAttachCommand(transitionProvisioningRunningSessionContainerToAttachedV2(provisioning), PROJECT).args)
+      .toEqual(["container", "attach", "--no-stdin", CONTAINER_ID]);
   });
 
   test("creates stopped from the selected image with exact network, launch, and confinement", () => {
