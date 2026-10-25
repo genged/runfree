@@ -1,7 +1,12 @@
 import path from "node:path";
 
 import { builtinAgent, type BuiltinAgentDescriptor } from "../agents.ts";
-import { createSessionLaunchTarget, SESSION_ENTRY_PATH, type SessionLaunchTarget } from "./session-launch.ts";
+import {
+  createSessionLaunchTarget,
+  SESSION_ENTRY_PATH,
+  SESSION_ENTRY_STDIN_FILE_FLAG,
+  type SessionLaunchTarget,
+} from "./session-launch.ts";
 
 const CONVERSATION_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
@@ -20,7 +25,24 @@ const HOST_CHOSEN_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab]
  * execs the inner launch; without it the agent's first request lands in the
  * pre-activation window and is answered 403 (activation-gate design, 2026-09-03).
  */
-function sessionEntryLaunchTarget(inner: Readonly<{ path: string; args: readonly string[] }>): SessionLaunchTarget {
+/**
+ * With `promptPath` the target is headless (headless-run spec §3.2): the
+ * entry opens that inbox file as the agent's stdin, so the container gets
+ * neither stdin nor a TTY, and the path is entry argv, never agent argv.
+ * `createSessionLaunchTarget` validates the path and the terminal contract.
+ */
+function sessionEntryLaunchTarget(
+  inner: Readonly<{ path: string; args: readonly string[] }>,
+  options: Readonly<{ promptPath?: string }> = {},
+): SessionLaunchTarget {
+  if (options.promptPath !== undefined) {
+    return createSessionLaunchTarget({
+      path: SESSION_ENTRY_PATH,
+      args: [SESSION_ENTRY_STDIN_FILE_FLAG, options.promptPath, inner.path, ...inner.args],
+      interactive: false,
+      tty: false,
+    });
+  }
   return createSessionLaunchTarget({
     path: SESSION_ENTRY_PATH,
     args: [inner.path, ...inner.args],
@@ -28,6 +50,13 @@ function sessionEntryLaunchTarget(inner: Readonly<{ path: string; args: readonly
     tty: true,
   });
 }
+
+// Headless argv appended to the built-in default command (spec §3.1). Only
+// Claude until the descriptors carry their own headless argv; an agent absent
+// here has no headless run.
+const HEADLESS_AGENT_ARGS: Readonly<Record<string, readonly string[]>> = Object.freeze({
+  claude: Object.freeze(["-p", "--output-format", "stream-json", "--verbose"]),
+});
 
 function requireExactBuiltin(input: Readonly<{ agentId: string; configuredCommand: string }>): BuiltinAgentDescriptor {
   const descriptor = builtinAgent(input.agentId);
@@ -82,17 +111,46 @@ export function createBuiltinSessionLaunchTarget(input: Readonly<{
 }>): SessionLaunchTarget {
   const descriptor = requireExactBuiltin(input);
   if (input.launchConversationId === undefined) return sessionEntryLaunchTarget(descriptor.directLaunch);
+  return sessionEntryLaunchTarget({
+    path: descriptor.directLaunch.path,
+    args: [...descriptor.directLaunch.args, ...hostChosenConversationArgs(descriptor, input.launchConversationId)],
+  });
+}
+
+function hostChosenConversationArgs(descriptor: BuiltinAgentDescriptor, launchConversationId: string): readonly string[] {
   if (!descriptor.launchConversationIdFlag) {
     throw new Error(`built-in session agent ${descriptor.id} does not accept a host-chosen conversation id`);
   }
   // Last host-owned step before the value becomes container argv (spec §2).
-  if (!HOST_CHOSEN_ID_PATTERN.test(input.launchConversationId)) {
+  if (!HOST_CHOSEN_ID_PATTERN.test(launchConversationId)) {
     throw new Error("host-chosen conversation id is not a valid conversation UUID");
   }
+  return [descriptor.launchConversationIdFlag, launchConversationId];
+}
+
+/**
+ * Mints the typed headless launch target for one built-in agent: the exact
+ * default command, the host-chosen conversation id when given (before the
+ * headless flags, as in the interactive launch), then the agent's headless
+ * argv. The prompt is never argv to the agent: `promptPath` names the
+ * host-minted inbox copy that the session entry opens as the agent's stdin.
+ */
+export function createBuiltinSessionHeadlessLaunchTarget(input: Readonly<{
+  agentId: string;
+  configuredCommand: string;
+  launchConversationId?: string;
+  promptPath: string;
+}>): SessionLaunchTarget {
+  const descriptor = requireExactBuiltin(input);
+  const headlessArgs = Object.hasOwn(HEADLESS_AGENT_ARGS, descriptor.id) ? HEADLESS_AGENT_ARGS[descriptor.id] : undefined;
+  if (!headlessArgs) throw new Error(`built-in session agent ${descriptor.id} does not support headless runs`);
+  const conversationArgs = input.launchConversationId === undefined
+    ? []
+    : hostChosenConversationArgs(descriptor, input.launchConversationId);
   return sessionEntryLaunchTarget({
     path: descriptor.directLaunch.path,
-    args: [...descriptor.directLaunch.args, descriptor.launchConversationIdFlag, input.launchConversationId],
-  });
+    args: [...descriptor.directLaunch.args, ...conversationArgs, ...headlessArgs],
+  }, { promptPath: input.promptPath });
 }
 
 /**

@@ -28,6 +28,23 @@ export type SessionLaunchTarget = Readonly<{
  */
 export const SESSION_ENTRY_PATH = "/usr/local/libexec/runfree/session-entry";
 
+/**
+ * The session entry's one option: `[--stdin-file <promptPath>] agentPath ...`.
+ *
+ * A headless run (headless-run spec §3.2) hands the agent its prompt as stdin,
+ * never as argv. The host copies the prompt into the project inbox, mounted
+ * read-only at `/runfree/inbox`, and names that copy here; the entry opens it
+ * as the agent's stdin in its final `exec`.
+ */
+export const SESSION_ENTRY_STDIN_FILE_FLAG = "--stdin-file";
+
+/**
+ * The only prompt path a headless target may name: one host-minted run file
+ * directly inside the read-only inbox mount (`run-<UTC stamp>-<8 hex>.prompt`).
+ * No other directory, no nesting, and no traversal is representable.
+ */
+export const HEADLESS_PROMPT_CONTAINER_PATH_PATTERN = /^\/runfree\/inbox\/run-[0-9]{8}T[0-9]{6}Z-[a-f0-9]{8}\.prompt$/;
+
 const validatedLaunchTargets = new WeakSet<object>();
 
 function utf8Bytes(value: string): number {
@@ -70,11 +87,29 @@ export function createSessionLaunchTarget(input: {
   // bounded canonical absolute agent path would let the entry search PATH or
   // exec something it was never minted for. Refused here, at the one builder,
   // rather than in the entry script, which is cooperation and not proof.
-  if (input.path === SESSION_ENTRY_PATH && !isBoundedCanonicalAbsolutePath(args[0])) {
-    throw new Error("session entry launch requires a bounded canonical absolute agent path as its first argument");
+  //
+  // A headless entry target carries the prompt path first and the agent path
+  // third. The prompt and a terminal are exclusive on the agent's stdin, so
+  // such a target has neither `--interactive` nor `--tty` (spec §3.2): no
+  // keystroke from the host's terminal can reach the agent.
+  const headless = args[0] === SESSION_ENTRY_STDIN_FILE_FLAG;
+  if (headless && input.path !== SESSION_ENTRY_PATH) {
+    throw new Error("only the session entry accepts a prompt path");
+  }
+  if (headless && !HEADLESS_PROMPT_CONTAINER_PATH_PATTERN.test(args[1] ?? "")) {
+    throw new Error("session entry prompt path must be one run file directly in /runfree/inbox");
+  }
+  const agentPathIndex = headless ? 2 : 0;
+  if (input.path === SESSION_ENTRY_PATH && !isBoundedCanonicalAbsolutePath(args[agentPathIndex])) {
+    throw new Error(`session entry launch requires a bounded canonical absolute agent path ${
+      headless ? "after its prompt path" : "as its first argument"
+    }`);
   }
   if (typeof input.interactive !== "boolean" || typeof input.tty !== "boolean") {
     throw new Error("session launch terminal contract is invalid");
+  }
+  if (headless && (input.interactive || input.tty)) {
+    throw new Error("headless session entry launch requires no stdin and no TTY");
   }
   if (input.tty && !input.interactive) {
     throw new Error("session launch TTY requires an interactive stdin contract");

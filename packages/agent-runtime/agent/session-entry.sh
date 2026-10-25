@@ -3,7 +3,13 @@
 # Runfree session entry: the session container's first project-controlled
 # process (under Docker's init in a new session; PID 1 in an older one).
 #
-# Argv is the typed agent launch, `[agentPath, ...agentArgs]`. The entry polls
+# Argv is the typed agent launch, `[agentPath, ...agentArgs]`, optionally
+# preceded by `--stdin-file <promptPath>` for a headless run (headless-run
+# spec §3.2). The prompt path must name one host-minted run file directly in
+# the read-only inbox mount (`/runfree/inbox/run-*.prompt`); the entry opens
+# it as the agent's stdin in the final `exec`, so the prompt is data on stdin
+# and never agent argv. The host's launch builder is the authority on that
+# path; the check here only refuses a malformed argv early. The entry polls
 # the request proxy with the exact admission readiness request (see
 # `session-ready-probe`) until the proxy reports the session active, then
 # replaces itself with the agent. Before activation the proxy answers every
@@ -31,6 +37,9 @@
 #   143  SIGTERM while waiting (the container was stopped)
 #   130  SIGINT while waiting
 #    64  invalid argv or an invalid host-rendered wait bound
+#    66  the `--stdin-file` prompt cannot be read (checked before the wait;
+#        the final `exec` opens it again, and a shell that survives a failed
+#        redirection there also exits 66 rather than run the agent)
 #
 # The wait bound is `RUNFREE_SESSION_ENTRY_TIMEOUT_MS` (host-rendered into the
 # pinned session environment; default 60000 when absent).
@@ -45,6 +54,43 @@ RUNFREE_SESSION_ENTRY_DEFAULT_TIMEOUT_MS=60000
 RUNFREE_SESSION_ENTRY_POLL_SLEEP=0.02
 RUNFREE_SESSION_ENTRY_NOTICE_AFTER_S=2
 
+RUNFREE_SESSION_ENTRY_NO_INPUT_EXIT=66
+
+# Test seam only: unit tests cannot write the fixed read-only inbox mount. The
+# session environment is host-pinned and never renders this name, so a
+# session always names the fixed inbox.
+inbox_dir="${RUNFREE_SESSION_ENTRY_INBOX_DIR:-/runfree/inbox}"
+case "$inbox_dir" in
+  /*) ;;
+  *)
+    echo "runfree: session entry RUNFREE_SESSION_ENTRY_INBOX_DIR must be absolute, got: $inbox_dir" >&2
+    exit "$RUNFREE_SESSION_ENTRY_USAGE_EXIT"
+    ;;
+esac
+
+stdin_file=""
+if [ "$#" -gt 0 ] && [ "$1" = "--stdin-file" ]; then
+  if [ "$#" -lt 2 ]; then
+    echo "runfree: session entry --stdin-file requires a prompt path" >&2
+    exit "$RUNFREE_SESSION_ENTRY_USAGE_EXIT"
+  fi
+  # One run file directly in the inbox: the prefix is matched literally, and
+  # the rest may hold no `/`, so no nesting and no `..` component is possible.
+  prompt_name="${2#"$inbox_dir"/}"
+  case "$2" in
+    "$inbox_dir"/run-*.prompt) ;;
+    *) prompt_name="/" ;;
+  esac
+  case "$prompt_name" in
+    */*)
+      echo "runfree: session entry prompt path must be one run file directly in $inbox_dir: $2" >&2
+      exit "$RUNFREE_SESSION_ENTRY_USAGE_EXIT"
+      ;;
+  esac
+  stdin_file="$2"
+  shift 2
+fi
+
 if [ "$#" -eq 0 ]; then
   echo "runfree: session entry requires the agent path as its first argument" >&2
   exit "$RUNFREE_SESSION_ENTRY_USAGE_EXIT"
@@ -56,6 +102,13 @@ case "$1" in
     exit "$RUNFREE_SESSION_ENTRY_USAGE_EXIT"
     ;;
 esac
+
+# A missing prompt fails here, before the wait, rather than after the
+# session is already active and served.
+if [ -n "$stdin_file" ] && { [ ! -f "$stdin_file" ] || [ ! -r "$stdin_file" ]; }; then
+  echo "runfree: session entry cannot read the prompt file: $stdin_file" >&2
+  exit "$RUNFREE_SESSION_ENTRY_NO_INPUT_EXIT"
+fi
 
 timeout_ms="${RUNFREE_SESSION_ENTRY_TIMEOUT_MS:-$RUNFREE_SESSION_ENTRY_DEFAULT_TIMEOUT_MS}"
 case "$timeout_ms" in
@@ -152,5 +205,14 @@ done
 # entry, or until a 10 s ceiling. So this exec must stay the entry's last act
 # once the probe has answered active: anything the entry did in between would
 # run while the session is already served but not yet reported attached. Changing the poll above (its sleep, its probe)
-# only changes how soon this line is reached.
+# only changes how soon this line is reached. A headless run's prompt is
+# opened here, as part of the exec itself, and nowhere earlier: no probe or
+# relay child ever holds it.
+if [ -n "$stdin_file" ]; then
+  exec "$@" <"$stdin_file"
+  # A POSIX shell exits on a failed redirection of `exec`; this covers one
+  # that keeps going, so the agent never runs with some other stdin.
+  echo "runfree: session entry cannot read the prompt file: $stdin_file" >&2
+  exit "$RUNFREE_SESSION_ENTRY_NO_INPUT_EXIT"
+fi
 exec "$@"

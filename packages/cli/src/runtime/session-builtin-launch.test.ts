@@ -1,8 +1,9 @@
 import { describe, expect, test } from "vitest";
 
 import { builtinAgent } from "../agents.ts";
-import { assertSessionLaunchTarget, SESSION_ENTRY_PATH } from "./session-launch.ts";
+import { assertSessionLaunchTarget, createSessionLaunchTarget, SESSION_ENTRY_PATH } from "./session-launch.ts";
 import {
+  createBuiltinSessionHeadlessLaunchTarget,
   createBuiltinSessionLaunchTarget,
   createBuiltinSessionResumeLaunchTarget,
   createBuiltinSessionShellLaunchTarget,
@@ -234,5 +235,94 @@ describe("host-chosen conversation id", () => {
       configuredCommand: requireDefaultCommand("codex"),
       conversationId: ID,
     }).args).toEqual(["/usr/local/bin/codex", "-c", "check_for_update_on_startup=false", "resume", "--dangerously-bypass-approvals-and-sandbox", ID]);
+  });
+});
+
+// Headless-run spec §3.1-§3.2: the headless target is the same session entry
+// with the host-minted prompt path as entry argv, the built-in default
+// command plus the per-agent headless flags as the agent argv, and no stdin
+// or TTY on the container.
+describe("built-in session headless launch", () => {
+  const ID = "3f1c2b9e-8a4d-4c1e-9f2a-0b6d7e8f9a10";
+  const PROMPT_PATH = "/runfree/inbox/run-20261025T101500Z-0a1b2c3d.prompt";
+  const CLAUDE_DEFAULT = "claude --dangerously-skip-permissions --add-dir /runfree/inbox";
+
+  test("mints the exact claude headless target: prompt path as entry argv, agent path third, no terminal", () => {
+    const target = createBuiltinSessionHeadlessLaunchTarget({
+      agentId: "claude",
+      configuredCommand: CLAUDE_DEFAULT,
+      launchConversationId: ID,
+      promptPath: PROMPT_PATH,
+    });
+
+    expect(target).toMatchObject({
+      path: SESSION_ENTRY_PATH,
+      args: [
+        "--stdin-file",
+        PROMPT_PATH,
+        "/usr/local/bin/claude",
+        "--dangerously-skip-permissions",
+        "--add-dir",
+        "/runfree/inbox",
+        "--session-id",
+        ID,
+        "-p",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+      ],
+      interactive: false,
+      tty: false,
+    });
+    expect(target.args[2]).toBe("/usr/local/bin/claude");
+    expect(() => assertSessionLaunchTarget(target)).not.toThrow();
+    // The prompt reaches the agent only as stdin: its path is never agent argv.
+    expect(target.args.slice(3)).not.toContain(PROMPT_PATH);
+  });
+
+  test("the interactive target for the same agent is unchanged", () => {
+    expect(createBuiltinSessionLaunchTarget({ agentId: "claude", configuredCommand: CLAUDE_DEFAULT, launchConversationId: ID }))
+      .toMatchObject({
+        args: ["/usr/local/bin/claude", "--dangerously-skip-permissions", "--add-dir", "/runfree/inbox", "--session-id", ID],
+        interactive: true,
+        tty: true,
+      });
+  });
+
+  test("refuses a configured non-default command (D-3)", () => {
+    expect(() => createBuiltinSessionHeadlessLaunchTarget({
+      agentId: "claude",
+      configuredCommand: "claude --dangerously-skip-permissions",
+      promptPath: PROMPT_PATH,
+    })).toThrow("exact claude built-in command");
+  });
+
+  test.each([
+    "/tmp/run-20261025T101500Z-0a1b2c3d.prompt",
+    "/runfree/inbox/../etc/run-20261025T101500Z-0a1b2c3d.prompt",
+    "/runfree/inbox/task.md",
+  ])("refuses the prompt path %j before minting", (promptPath) => {
+    expect(() => createBuiltinSessionHeadlessLaunchTarget({ agentId: "claude", configuredCommand: CLAUDE_DEFAULT, promptPath }))
+      .toThrow("session entry prompt path");
+  });
+
+  test("refuses a malformed host-chosen id and an agent without headless argv yet", () => {
+    expect(() => createBuiltinSessionHeadlessLaunchTarget({
+      agentId: "claude",
+      configuredCommand: CLAUDE_DEFAULT,
+      launchConversationId: ID.toUpperCase(),
+      promptPath: PROMPT_PATH,
+    })).toThrow("not a valid conversation UUID");
+    expect(() => createBuiltinSessionHeadlessLaunchTarget({
+      agentId: "codex",
+      configuredCommand: requireDefaultCommand("codex"),
+      promptPath: PROMPT_PATH,
+    })).toThrow("does not support headless runs");
+  });
+
+  test("the canonical builder refuses a headless argv carried on an interactive or TTY target", () => {
+    const target = createBuiltinSessionHeadlessLaunchTarget({ agentId: "claude", configuredCommand: CLAUDE_DEFAULT, promptPath: PROMPT_PATH });
+    expect(() => createSessionLaunchTarget({ path: target.path, args: target.args, interactive: true, tty: true }))
+      .toThrow("headless session entry launch requires no stdin and no TTY");
   });
 });

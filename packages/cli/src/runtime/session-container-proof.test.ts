@@ -412,6 +412,31 @@ describe("session container live inspection proof", () => {
       .toThrow("effective Path/Args differ from the exact launch contract");
   });
 
+  test("proves a headless session container has neither stdin nor a TTY (headless-run spec §3.2)", () => {
+    const promptPath = "/runfree/inbox/run-20261025T101500Z-0a1b2c3d.prompt";
+    const launchArgs = Object.freeze(["--stdin-file", promptPath, "/usr/local/bin/claude", "-p"]);
+    const value = plan({
+      launchPath: SESSION_ENTRY_PATH,
+      launchArgs,
+      interactive: false,
+      tty: false,
+      launchMode: "headless",
+    });
+    expect(value.launch).toMatchObject({ args: launchArgs, interactive: false, tty: false });
+
+    const evidence = inspect(value, { running: true });
+    expect(evidence[0].Config).toMatchObject({ OpenStdin: false, Tty: false });
+    expect(validateSessionContainerInspect(JSON.stringify(evidence), value, { kind: "provisioning-running" }).phase)
+      .toBe("provisioning-running");
+
+    for (const key of ["OpenStdin", "Tty"] as const) {
+      const opened = inspect(value, { running: true });
+      opened[0].Config[key] = true;
+      expect(() => validateSessionContainerInspect(JSON.stringify(opened), value, { kind: "provisioning-running" }))
+        .toThrow("session container terminal contract differs");
+    }
+  });
+
   test.each([
     ["selected immutable image", (evidence: MutableInspect) => { evidence[0].Image = `sha256:${"f".repeat(64)}`; }],
     ["effective launch path", (evidence: MutableInspect) => { evidence[0].Path = "/project/entrypoint"; }],

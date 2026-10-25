@@ -200,6 +200,9 @@ beforeEach(() => {
     "  argv: process.argv.slice(2),",
     "  pid: process.pid,",
     "}));",
+    // Reads stdin to EOF only when asked: the default spawn's stdin is
+    // ignored, and a headless test needs the exact bytes the entry opened.
+    "if (process.env.RUNFREE_TEST_STDIN_PATH) fs.writeFileSync(process.env.RUNFREE_TEST_STDIN_PATH, fs.readFileSync(0));",
     // A test proving the relay survives past the exec needs a window where
     // the exec'd process is still alive but has already recorded its argv;
     // zero (the default) exits as fast as before.
@@ -853,4 +856,136 @@ describe("session entry: host-service relay (T6)", () => {
     expect(result.status, result.stderr).toBe(111);
     expect(await waitForRefusal(relayPort, 1_500)).toBe(true);
   }, 10_000);
+});
+
+// Headless-run spec §3.2: `--stdin-file <promptPath>` before the agent path.
+// The entry opens that file as the agent's stdin in its final `exec`, so the
+// prompt is never agent argv. The fixed inbox mount `/runfree/inbox` is
+// read-only on every host that runs this suite, so the stdin cases point the
+// entry's test seam `RUNFREE_SESSION_ENTRY_INBOX_DIR` at a temporary inbox;
+// the refusal cases run against the fixed root with no seam.
+describe("session entry: --stdin-file (headless runs)", () => {
+  const RUN_NAME = "run-20261025T101500Z-0a1b2c3d.prompt";
+  let inboxDir: string;
+  let stdinPath: string;
+
+  beforeEach(() => {
+    inboxDir = path.join(tmp, "inbox");
+    fs.mkdirSync(inboxDir);
+    stdinPath = path.join(tmp, "stdin.bin");
+  });
+
+  test("execs the agent with exactly the prompt file's bytes on stdin, then EOF, and never as argv", async () => {
+    const prompt = Buffer.from("Fix the failing test.\n\nKeep -p and --flags as data: $(not run)\n\u00e9\u0000end", "utf8");
+    const promptPath = path.join(inboxDir, RUN_NAME);
+    fs.writeFileSync(promptPath, prompt);
+    const proxy = await fakeProxy([REFUSED_RESPONSE, ACTIVE_RESPONSE]);
+    const result = await runEntry(
+      ["--stdin-file", promptPath, fakeAgentPath, "-p", "--verbose"],
+      entryEnv(proxy.port, { RUNFREE_SESSION_ENTRY_INBOX_DIR: inboxDir, RUNFREE_TEST_STDIN_PATH: stdinPath }),
+    );
+
+    expect(result.status, result.stderr).toBe(0);
+    const recorded = recordedAgentRun();
+    expect(recorded.argv).toEqual(["-p", "--verbose"]);
+    expect(recorded.pid).toBe(result.pid);
+    // readFileSync(0) returns only at EOF: the agent saw the file and its end.
+    expect(fs.readFileSync(stdinPath).equals(prompt)).toBe(true);
+    expect(proxy.requests.length).toBeGreaterThanOrEqual(2);
+  });
+
+  test("without the option the agent's stdin is unchanged (the caller's, here empty)", async () => {
+    const proxy = await fakeProxy([ACTIVE_RESPONSE]);
+    const result = await runEntry([fakeAgentPath], entryEnv(proxy.port, { RUNFREE_TEST_STDIN_PATH: stdinPath }));
+    expect(result.status, result.stderr).toBe(0);
+    expect(fs.readFileSync(stdinPath).byteLength).toBe(0);
+  });
+
+  test.each([
+    ["a missing operand", () => ["--stdin-file"]],
+    ["a missing agent path", () => ["--stdin-file", `/runfree/inbox/${RUN_NAME}`]],
+    ["a relative agent path", () => ["--stdin-file", `/runfree/inbox/${RUN_NAME}`, "fake-agent"]],
+    ["a path outside the inbox", () => ["--stdin-file", `/tmp/${RUN_NAME}`, fakeAgentPath]],
+    ["a traversal out of the inbox", () => ["--stdin-file", `/runfree/inbox/x/../../../etc/${RUN_NAME}`, fakeAgentPath]],
+    ["a traversal behind a run- prefix", () => ["--stdin-file", "/runfree/inbox/run-x/../../../etc/passwd.prompt", fakeAgentPath]],
+    ["a nested inbox path", () => ["--stdin-file", `/runfree/inbox/sub/${RUN_NAME}`, fakeAgentPath]],
+    ["a name that is not a run prompt", () => ["--stdin-file", "/runfree/inbox/notes.md", fakeAgentPath]],
+    ["a relative prompt path", () => ["--stdin-file", RUN_NAME, fakeAgentPath]],
+  ])("refuses %s with 64 before probing", async (_label, args) => {
+    const proxy = await fakeProxy([ACTIVE_RESPONSE]);
+    const result = await runEntry(args(), entryEnv(proxy.port));
+
+    expect(result.status, result.stderr).toBe(64);
+    expect(result.stderr).toContain("runfree: session entry");
+    expect(proxy.connections()).toBe(0);
+    expect(fs.existsSync(argvPath)).toBe(false);
+  });
+
+  test("refuses a nested path under the seam's inbox too, before probing", async () => {
+    fs.mkdirSync(path.join(inboxDir, "sub"));
+    const nested = path.join(inboxDir, "sub", RUN_NAME);
+    fs.writeFileSync(nested, "prompt");
+    const proxy = await fakeProxy([ACTIVE_RESPONSE]);
+    const result = await runEntry(
+      ["--stdin-file", nested, fakeAgentPath],
+      entryEnv(proxy.port, { RUNFREE_SESSION_ENTRY_INBOX_DIR: inboxDir }),
+    );
+    expect(result.status, result.stderr).toBe(64);
+    expect(proxy.connections()).toBe(0);
+  });
+
+  test("a missing prompt file ends the entry with 66 without probing or exec'ing the agent", async () => {
+    const proxy = await fakeProxy([ACTIVE_RESPONSE]);
+    const result = await runEntry(
+      ["--stdin-file", path.join(inboxDir, RUN_NAME), fakeAgentPath],
+      entryEnv(proxy.port, { RUNFREE_SESSION_ENTRY_INBOX_DIR: inboxDir }),
+    );
+    expect(result.status, result.stderr).toBe(66);
+    expect(result.stderr).toContain("runfree: session entry cannot read the prompt file");
+    expect(proxy.connections()).toBe(0);
+    expect(fs.existsSync(argvPath)).toBe(false);
+  });
+
+  test("a prompt file removed during the wait ends the entry nonzero without exec'ing the agent", async () => {
+    // The stop routine deletes the inbox copy; an entry still waiting must
+    // not then exec the agent with some other stdin.
+    const promptPath = path.join(inboxDir, RUN_NAME);
+    fs.writeFileSync(promptPath, "prompt");
+    const proxy = await fakeProxy([REFUSED_RESPONSE, ACTIVE_RESPONSE]);
+    const result = await runEntry(
+      ["--stdin-file", promptPath, fakeAgentPath],
+      entryEnv(proxy.port, { RUNFREE_SESSION_ENTRY_INBOX_DIR: inboxDir }),
+      {
+        onSpawn: () => {
+          const started = Date.now();
+          const tick = () => {
+            if (proxy.requests.length === 0 && Date.now() - started < 5_000) {
+              setTimeout(tick, 5);
+              return;
+            }
+            fs.rmSync(promptPath, { force: true });
+          };
+          tick();
+        },
+      },
+    );
+    expect(result.status).not.toBe(0);
+    expect(fs.existsSync(argvPath)).toBe(false);
+  });
+
+  test.each(["relative/inbox", ""])("refuses the seam value %j before probing", async (seam) => {
+    const proxy = await fakeProxy([ACTIVE_RESPONSE]);
+    const result = await runEntry(
+      ["--stdin-file", `/runfree/inbox/${RUN_NAME}`, fakeAgentPath],
+      entryEnv(proxy.port, { RUNFREE_SESSION_ENTRY_INBOX_DIR: seam }),
+    );
+    if (seam === "") {
+      // Empty selects the fixed root, like the other `${VAR:-default}` seams;
+      // the fixed root holds no such run file here, so the read refusal fires.
+      expect(result.status, result.stderr).toBe(66);
+    } else {
+      expect(result.status, result.stderr).toBe(64);
+    }
+    expect(proxy.connections()).toBe(0);
+  });
 });
