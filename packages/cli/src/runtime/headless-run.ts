@@ -46,6 +46,7 @@ import {
 } from "./headless-run-lock.ts";
 import {
   createHeadlessRunId,
+  assertRunRecordOutsideProject,
   createRunRecord,
   summaryLines,
   type HeadlessRunJson,
@@ -334,6 +335,13 @@ async function runUnderLock(input: RunInput): Promise<number> {
     startedAt: startedAt.toISOString(),
     acceptDeniedWrites: options.acceptDeniedWrites,
   };
+
+  try {
+    assertRunRecordOutsideProject(stateDir, runId, context.projectRoot);
+  } catch (error) {
+    runfreeError(`the headless run did not start: ${errorText(error)}`);
+    return HEADLESS_RUN_EXIT.refused;
+  }
 
   let lock: HeadlessRunLock;
   try {

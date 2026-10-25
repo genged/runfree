@@ -16,6 +16,13 @@
 // into `unverified`. An undrained capture SIGKILLs any client still running
 // and destroys every pipe, so a client wedged on the daemon cannot keep the
 // process alive.
+//
+// Every termination of a captured client is SIGKILL, whatever signal the
+// caller names. Without a TTY, `docker start --attach` and `docker attach`
+// proxy a caught SIGTERM to the container, so the driver's detach (sent even
+// when a failed session-file delete kept the container running for
+// revocation) would stop it. SIGKILL cannot be caught, so only the local
+// client dies.
 
 import * as childProcess from "node:child_process";
 import type { Readable } from "node:stream";
@@ -123,6 +130,8 @@ export function createHeadlessForegroundSpawner(
 
   const spawn: SessionContainerForegroundSpawner = (executable, args, spawnOptions) => {
     const child = spawnProcess(executable, args, { env: spawnOptions.env, shell: false, stdio: PIPED_STDIO });
+    const killClient = child.kill.bind(child);
+    Object.defineProperty(child, "kill", { value: (): boolean => killClient("SIGKILL") });
     spawned += 1;
     children.push(child);
     const { stdout, stderr } = child;

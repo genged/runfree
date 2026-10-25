@@ -20,7 +20,9 @@ class FakeChild extends EventEmitter {
   pid = 4242;
   exitCode: number | null = null;
   signalCode: NodeJS.Signals | null = null;
-  kill(): boolean {
+  readonly signals: string[] = [];
+  kill(signal: string): boolean {
+    this.signals.push(signal);
     return true;
   }
 
@@ -188,6 +190,16 @@ describe("headless foreground spawner", () => {
     expect(flush).toHaveBeenCalledTimes(1);
   });
 
+  test("terminating an attach client sends SIGKILL, never SIGTERM, so Docker cannot forward it into the container", () => {
+    // Docker's non-TTY `start --attach` and `attach` proxy a caught SIGTERM to
+    // the container. The driver's detach and start-failure paths call
+    // `kill("SIGTERM")`; for a headless capture only the local client may die.
+    const { children, spawn } = harness();
+    spawn().kill("SIGTERM");
+    spawn(["attach", "--no-stdin", "c1"]).kill("SIGTERM");
+    expect(children.map((child) => child.signals)).toEqual([["SIGKILL"], ["SIGKILL"]]);
+  });
+
   test("an attach client that ignores SIGTERM and holds its pipes open is killed at the drain bound, its pipes closed", async () => {
     // A Docker client wedged on an unresponsive daemon: it ignores SIGTERM and
     // keeps both pipes open. Left alive, it and its pipes would keep Runfree's
@@ -207,7 +219,6 @@ describe("headless foreground spawner", () => {
       const child = capture.spawn("docker", ["start", "--attach", "c1"], { shell: false, stdio: "inherit", env: {} }) as unknown as childProcess.ChildProcess;
       await vi.waitFor(() => expect(Buffer.concat(output).toString()).toBe("ready\n"));
       const exited = new Promise<NodeJS.Signals | null>((resolve) => child.once("exit", (_code, signal) => resolve(signal)));
-      child.kill("SIGTERM");
 
       expect(await capture.drain(200)).toEqual({ drained: false });
 

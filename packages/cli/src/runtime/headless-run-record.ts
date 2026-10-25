@@ -115,6 +115,18 @@ type CappedFile = { fd?: number; bytes: number; truncated: boolean; failed: bool
  * land inside `projectRoot`, `runs/` is not a plain directory, or the run
  * directory already exists (so nothing pre-planted in it is ever followed).
  */
+/**
+ * Refuses a run record that would land in the project (a state directory
+ * under the workspace). The run calls it before the lock too, so the refusal
+ * comes before any host write or delete under the state directory.
+ */
+export function assertRunRecordOutsideProject(stateDir: string, runId: string, projectRoot: string): void {
+  const dir = path.join(stateDir, "runs", runId);
+  if (isPathInsideByRealpath(projectRoot, dir)) {
+    throw recordError(`must be outside the project: ${dir}`);
+  }
+}
+
 export function createRunRecord(
   stateDir: string,
   runId: string,
@@ -123,9 +135,7 @@ export function createRunRecord(
   if (!HEADLESS_RUN_ID_PATTERN.test(runId)) throw recordError(`run id is malformed: ${JSON.stringify(runId)}`);
   const runsDir = path.join(stateDir, "runs");
   const dir = path.join(runsDir, runId);
-  if (isPathInsideByRealpath(options.projectRoot, dir)) {
-    throw recordError(`must be outside the project: ${dir}`);
-  }
+  assertRunRecordOutsideProject(stateDir, runId, options.projectRoot);
   ensureRunsDirectory(runsDir);
   try {
     fs.mkdirSync(dir, { mode: 0o700 });

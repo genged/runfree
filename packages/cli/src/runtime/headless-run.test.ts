@@ -514,6 +514,30 @@ describe("runHeadlessAgent", () => {
     }
   });
 
+  test("a state directory inside the project refuses with 65 before the lock, the inbox sweep, or a record", async () => {
+    // XDG_STATE_HOME inside the workspace: the lock, the stale-prompt sweep,
+    // the session-record prune, and the run record would all be host writes
+    // or deletes in the project.
+    stateDir = path.join(projectRoot, ".state", "projects", "0123456789ab");
+    inboxDir = path.join(stateDir, "inbox");
+    const sessionsDir = path.join(stateDir, "sessions");
+    fs.mkdirSync(inboxDir, { recursive: true, mode: 0o700 });
+    fs.mkdirSync(sessionsDir, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(path.join(inboxDir, "run-20261025T110000Z-0123abcd.prompt"), "stale\n");
+    context = { ...context, project: { paths: { stateDir, inboxDir, sessionsDir } } } as unknown as RuntimeContext;
+    const before = treeSnapshot(projectRoot);
+    const h = harness();
+
+    expect(await run(h)).toBe(65);
+
+    expect(h.lockCalls()).toBe(0);
+    expect(h.runtimeCalls()).toBe(0);
+    expect(treeSnapshot(projectRoot)).toEqual(before);
+    expect(fs.existsSync(headlessRunLockPath(stateDir))).toBe(false);
+    expect(vi.mocked(console.error).mock.calls.flat().join("\n")).toContain("must be outside the project");
+    expect(headlessTerminalModeActive()).toBe(false);
+  });
+
   test.each([
     ["a symlink", () => {
       const target = path.join(tmp, "real.md");
