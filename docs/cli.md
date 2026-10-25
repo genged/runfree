@@ -146,13 +146,27 @@ Session Recovery](architecture.md#interrupted-session-recovery).
 runfree --workspace ~/proj run claude --prompt-file task.md
 runfree run claude --prompt-file task.md --timeout 30m
 runfree run claude --prompt-file task.md --accept-denied-writes
+runfree run codex --prompt-file task.md
+runfree run pi --prompt-file task.md
 ```
 
 `runfree run` runs one agent turn without a terminal: from launchd, cron, a
 script, or a detached tmux pane. It starts a normal per-session container
 through the same admission path as `runfree claude`. The agent works on the
-live project folder, and its results are the files it writes there. Claude is
-the only agent with a headless mode in this release.
+live project folder, and its results are the files it writes there.
+
+Runfree sets each agent's headless mode and reads its JSON event stream to
+decide the result:
+
+| Agent | Mode Runfree adds | Final success |
+| --- | --- | --- |
+| `claude` | `-p --output-format stream-json --verbose` | the last `result` event has subtype `success` and `is_error: false` |
+| `codex` | `exec --json -` | a `turn.completed` event, and no `turn.failed` or `error` event |
+| `pi` | `--mode json -p` | the last `agent_end` event is not retried, and its last assistant message has stop reason `stop` |
+
+Pi in JSON mode exits 0 even when its model request failed, so a Pi run with a
+failed request ends unverified (1), not as success. Codex reports a reconnect
+it recovered from as an `error` event, so such a run also ends unverified.
 
 | Option | Use |
 | --- | --- |

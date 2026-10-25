@@ -306,18 +306,72 @@ describe("built-in session headless launch", () => {
       .toThrow("session entry prompt path");
   });
 
-  test("refuses a malformed host-chosen id and an agent without headless argv yet", () => {
+  test("refuses a malformed host-chosen id", () => {
     expect(() => createBuiltinSessionHeadlessLaunchTarget({
       agentId: "claude",
       configuredCommand: CLAUDE_DEFAULT,
       launchConversationId: ID.toUpperCase(),
       promptPath: PROMPT_PATH,
     })).toThrow("not a valid conversation UUID");
-    expect(() => createBuiltinSessionHeadlessLaunchTarget({
+  });
+
+  // Plan Task 15, headless-run spec §3.1 table. Codex has no launch-time id
+  // flag, so its headless argv carries none; Pi keeps `--session-id` (C10).
+  test("mints the exact codex headless target, without a conversation id", () => {
+    const target = createBuiltinSessionHeadlessLaunchTarget({
       agentId: "codex",
       configuredCommand: requireDefaultCommand("codex"),
       promptPath: PROMPT_PATH,
-    })).toThrow("does not support headless runs");
+    });
+    expect(target).toMatchObject({
+      path: SESSION_ENTRY_PATH,
+      args: [
+        "--stdin-file",
+        PROMPT_PATH,
+        "/usr/local/bin/codex",
+        "-c",
+        "check_for_update_on_startup=false",
+        "--dangerously-bypass-approvals-and-sandbox",
+        "exec",
+        "--json",
+        "-",
+      ],
+      interactive: false,
+      tty: false,
+    });
+    expect(() => assertSessionLaunchTarget(target)).not.toThrow();
+    expect(() => createBuiltinSessionHeadlessLaunchTarget({
+      agentId: "codex",
+      configuredCommand: requireDefaultCommand("codex"),
+      launchConversationId: ID,
+      promptPath: PROMPT_PATH,
+    })).toThrow("does not accept a host-chosen conversation id");
+  });
+
+  test("mints the exact pi headless target with its host-chosen id", () => {
+    const target = createBuiltinSessionHeadlessLaunchTarget({
+      agentId: "pi",
+      configuredCommand: requireDefaultCommand("pi"),
+      launchConversationId: ID,
+      promptPath: PROMPT_PATH,
+    });
+    expect(target).toMatchObject({
+      path: SESSION_ENTRY_PATH,
+      args: [
+        "--stdin-file",
+        PROMPT_PATH,
+        "/usr/local/bin/pi",
+        "--session-id",
+        ID,
+        "--mode",
+        "json",
+        "-p",
+      ],
+      interactive: false,
+      tty: false,
+    });
+    expect(() => assertSessionLaunchTarget(target)).not.toThrow();
+    expect(target.args.slice(3)).not.toContain(PROMPT_PATH);
   });
 
   test("the headless argv is the descriptor's own, appended after the host-chosen id", () => {

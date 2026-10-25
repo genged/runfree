@@ -519,8 +519,8 @@ describe("runHeadlessAgent", () => {
     expect(headlessTerminalModeActive()).toBe(false);
   });
 
-  test("an agent that is not a built-in, or has no headless mode yet, is a usage error (64)", async () => {
-    for (const agent of ["aider", "codex"]) {
+  test("an agent that is not a built-in is a usage error (64)", async () => {
+    for (const agent of ["aider", "nobody"]) {
       const h = harness();
       expect(await run(h, {}, agent)).toBe(64);
       expect(h.lockCalls()).toBe(0);

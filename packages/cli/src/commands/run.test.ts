@@ -97,9 +97,6 @@ describe("runfree run", () => {
       [["run", "claude", "--prompt-file", "task.md", "--", "--dangerously-skip-permissions"], /Unknown argument/],
       [["run", "shell", "--prompt-file", "task.md"], /Invalid values/],
       [["run", "nobody", "--prompt-file", "task.md"], /Invalid values/],
-      // Codex and Pi have no headless mode yet (plan Task 15).
-      [["run", "codex", "--prompt-file", "task.md"], /Invalid values/],
-      [["run", "pi", "--prompt-file", "task.md"], /Invalid values/],
       [["run", "claude", "--prompt-file", "task.md", "--timeout", "soon"], /--timeout/],
       [["run", "claude", "--prompt-file", "task.md", "--timeout", "0"], /--timeout/],
       [["run", "claude", "--prompt-file", "task.md", "--timeout", "25h"], /--timeout must be at most 24h/],
@@ -156,6 +153,22 @@ describe("runfree run", () => {
       acceptDeniedWrites: true,
       verbose: true,
     });
+  });
+
+  // Plan Task 15: Codex and Pi have headless modes, so `run` accepts them.
+  test.each(["codex", "pi"])("run %s reaches the orchestrator with that agent", async (agentId) => {
+    const cwd = tempDir();
+    fs.writeFileSync(path.join(cwd, "task.md"), "do the thing\n");
+    const rc = runtimeContextStub();
+    seams.result = async () => 0;
+    const status = await runCommandApp(
+      strictContext(cwd, { runtimeContext: () => rc }),
+      ["run", agentId, "--prompt-file", "task.md"],
+      neverDelegate,
+    );
+    expect(status).toBe(0);
+    expect(seams.calls).toHaveLength(1);
+    expect(seams.calls[0]?.[2]).toBe(agentId);
   });
 
   test("without optional flags no timeout is set and denied writes are not accepted", async () => {

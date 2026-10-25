@@ -139,6 +139,13 @@ const DESCRIPTORS: BuiltinAgentDescriptor[] = [
         bootstrap: { type: "codex-file-credential-store" },
       },
     ],
+    // Top-level flags stay before the `exec` subcommand; `-` reads the prompt
+    // from stdin (pinned 0.156.1 `codex exec --help`). No conversation id:
+    // Codex has no launch-time id flag.
+    headless: {
+      args: ["exec", "--json", "-"],
+      outputFormat: "codex-exec-json",
+    },
     requiredServices: ["agent-codex"],
     processNames: ["codex"],
     resume: {
@@ -184,6 +191,11 @@ const DESCRIPTORS: BuiltinAgentDescriptor[] = [
         bootstrap: { type: "empty-directory" },
       },
     ],
+    // `-p` reads a piped prompt from stdin (pinned 0.87.1 `main.js`).
+    headless: {
+      args: ["--mode", "json", "-p"],
+      outputFormat: "pi-json",
+    },
     requiredServices: [],
     launchConversationIdFlag: "--session-id",
     processNames: ["pi"],

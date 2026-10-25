@@ -528,10 +528,24 @@ describe("session admission driver preflight", () => {
       .toThrow("launch mode headless does not match its interactive launch target");
   });
 
-  test("refuses a headless launch of an agent without headless argv before any container authority", () => {
+  // Every built-in agent now has headless argv (plan Task 15), so no
+  // built-in id is left to show the "does not support headless runs" refusal
+  // through this fixture; `session-builtin-launch.ts` keeps that guard.
+  test("mints the codex headless target, with no conversation id, for a headless codex launch", () => {
     const value = fixture();
-    expect(() => value.build({ headless: { promptContainerPath: "/runfree/inbox/run-20261025T101500Z-0a1b2c3d.prompt" } }))
-      .toThrow("does not support headless runs");
+    const preflight = value.build({ headless: { promptContainerPath: "/runfree/inbox/run-20261025T101500Z-0a1b2c3d.prompt" } });
+    expect(preflight.launch).toMatchObject({ interactive: false, tty: false });
+    expect(preflight.launch.args).toEqual([
+      "--stdin-file",
+      "/runfree/inbox/run-20261025T101500Z-0a1b2c3d.prompt",
+      "/usr/local/bin/codex",
+      "-c",
+      "check_for_update_on_startup=false",
+      "--dangerously-bypass-approvals-and-sandbox",
+      "exec",
+      "--json",
+      "-",
+    ]);
   });
 
   test("mints the login-shell target for a shell session and binds it into the record", () => {

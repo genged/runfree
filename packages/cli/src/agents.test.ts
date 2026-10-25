@@ -142,13 +142,12 @@ describe("built-in agent descriptors", () => {
     ])).toThrow("resume argv must not carry --session-id");
   });
 
-  // Headless-run spec §3.1: the headless argv lives on the descriptor, and
-  // only Claude has one until plan Task 15.
-  test("carries the Claude headless argv and output format on the descriptor", () => {
-    expect(BUILTIN_AGENT_DESCRIPTORS.map((descriptor) => descriptor.headless)).toEqual([
-      { args: ["-p", "--output-format", "stream-json", "--verbose"], outputFormat: "claude-stream-json" },
-      undefined,
-      undefined,
+  // Headless-run spec §3.1 table: the headless argv lives on the descriptor.
+  test("carries each agent's headless argv and output format on the descriptor", () => {
+    expect(BUILTIN_AGENT_DESCRIPTORS.map((descriptor) => [descriptor.id, descriptor.headless])).toEqual([
+      ["claude", { args: ["-p", "--output-format", "stream-json", "--verbose"], outputFormat: "claude-stream-json" }],
+      ["codex", { args: ["exec", "--json", "-"], outputFormat: "codex-exec-json" }],
+      ["pi", { args: ["--mode", "json", "-p"], outputFormat: "pi-json" }],
     ]);
   });
 

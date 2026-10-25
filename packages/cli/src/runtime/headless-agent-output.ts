@@ -7,10 +7,10 @@
 // (`HEADLESS_TRANSCRIPT_CAP_BYTES` by default). It only ever `JSON.parse`s one
 // bounded line, and `push`/`endStream`/`result` never throw.
 //
-// The per-agent event field names are unverified hypotheses (spec §3.1
-// "Hypothesis") until the agent-CLI contract (plan Task 16) pins them. Each
-// agent's names live in one exported constant so the contract can import and
-// check them. A mismatch means the parser sees no final success event, and the
+// The per-agent event field names are hypotheses (spec §3.1 "Hypothesis")
+// that the agent-CLI contract (plan Task 16) checks against the pinned tools.
+// Each agent's names live in one exported constant so the contract can import
+// and check them. A mismatch means the parser sees no final success event, and the
 // outcome rule turns that into `unverified`, never into success.
 
 import type { HeadlessOutputFormat } from "../agents.ts";
@@ -52,12 +52,67 @@ export type HeadlessOutputParser = Readonly<{
   result(): HeadlessOutputParserResult;
 }>;
 
+/**
+ * Codex `exec --json` events (plan Task 15; event names recorded from the
+ * pinned 0.156.1 run offline, field names pinned by the agent-tool contract,
+ * plan Task 16). A run is a success only when a `turn.completed` arrives and
+ * no `turn.failed` or top-level `error` event appears anywhere in the stream.
+ * The final message is the `text` of the last completed `agent_message` item.
+ *
+ * Codex also emits `error` for a transient reconnect ("Reconnecting... 2/5")
+ * it later recovers from; such a run counts as `unverified`, never success.
+ */
+export const CODEX_EXEC_JSON_EVENTS = Object.freeze({
+  typeField: "type",
+  turnCompletedType: "turn.completed",
+  turnFailedType: "turn.failed",
+  errorType: "error",
+  itemCompletedType: "item.completed",
+  itemField: "item",
+  itemTypeField: "type",
+  agentMessageItemType: "agent_message",
+  agentMessageTextField: "text",
+} as const);
+
+/**
+ * Pi `--mode json` final event (plan Task 15; shapes recorded from the pinned
+ * 0.87.1 run offline). Pi emits one `agent_end` per agent run, including each
+ * auto-retry, and exits 0 in JSON mode even after a failed request (its
+ * `print-mode.ts` sets a nonzero code only in text mode). The last
+ * `agent_end` is a success only when `willRetry` is exactly `false` and its
+ * last assistant message has a `stopReason` in `successStopReasons`; `error`,
+ * `aborted`, `length` (a cut-off reply), and anything unknown are not. The
+ * final message is that message's `text` parts, joined by newlines.
+ */
+export const PI_JSON_AGENT_END_EVENT = Object.freeze({
+  typeField: "type",
+  typeValue: "agent_end",
+  messagesField: "messages",
+  willRetryField: "willRetry",
+  roleField: "role",
+  assistantRole: "assistant",
+  stopReasonField: "stopReason",
+  successStopReasons: Object.freeze(["stop"] as const),
+  contentField: "content",
+  textPartType: "text",
+  textField: "text",
+} as const);
+
 type FinalEvent = Readonly<{ success: boolean; message?: string }>;
 
-/** Reads one parsed JSON object; `undefined` when it is not a final event. */
-type FinalEventReader = (event: Readonly<Record<string, unknown>>) => FinalEvent | undefined;
+type JsonEvent = Readonly<Record<string, unknown>>;
 
-function readClaudeFinalEvent(event: Readonly<Record<string, unknown>>): FinalEvent | undefined {
+/**
+ * Per-stream state for one agent format: `observe` sees every parsed JSON
+ * object in order, `final` gives the final event so far (`undefined` while
+ * none has arrived). Neither may throw; the parser guards them anyway.
+ */
+type FinalEventTracker = Readonly<{
+  observe(event: JsonEvent): void;
+  final(): FinalEvent | undefined;
+}>;
+
+function readClaudeFinalEvent(event: JsonEvent): FinalEvent | undefined {
   const names = CLAUDE_STREAM_JSON_RESULT_EVENT;
   if (event[names.typeField] !== names.typeValue) return undefined;
   const message = event[names.messageField];
@@ -67,13 +122,88 @@ function readClaudeFinalEvent(event: Readonly<Record<string, unknown>>): FinalEv
   return typeof message === "string" ? { success, message } : { success };
 }
 
-// Codex and Pi get their readers with their headless argv (plan Task 15).
-// Until then nothing they print is a final success, so a run is unverified.
-const FINAL_EVENT_READERS: Readonly<Record<HeadlessOutputFormat, FinalEventReader>> = Object.freeze({
-  "claude-stream-json": readClaudeFinalEvent,
-  "codex-exec-json": () => undefined,
-  "pi-json": () => undefined,
+function claudeTracker(): FinalEventTracker {
+  let final: FinalEvent | undefined;
+  return {
+    observe(event) {
+      final = readClaudeFinalEvent(event) ?? final;
+    },
+    final: () => final,
+  };
+}
+
+function codexTracker(): FinalEventTracker {
+  const names = CODEX_EXEC_JSON_EVENTS;
+  let completed = false;
+  let failed = false;
+  let message: string | undefined;
+  return {
+    observe(event) {
+      const type = event[names.typeField];
+      if (type === names.turnFailedType || type === names.errorType) {
+        failed = true;
+      } else if (type === names.turnCompletedType) {
+        completed = true;
+      } else if (type === names.itemCompletedType) {
+        const item = event[names.itemField];
+        if (isPlainObject(item) && item[names.itemTypeField] === names.agentMessageItemType) {
+          const text = item[names.agentMessageTextField];
+          if (typeof text === "string") message = text;
+        }
+      }
+    },
+    final() {
+      if (!completed && !failed) return undefined;
+      const success = completed && !failed;
+      return message === undefined ? { success } : { success, message };
+    },
+  };
+}
+
+function readPiFinalEvent(event: JsonEvent): FinalEvent | undefined {
+  const names = PI_JSON_AGENT_END_EVENT;
+  if (event[names.typeField] !== names.typeValue) return undefined;
+  const messages = event[names.messagesField];
+  if (!Array.isArray(messages)) return { success: false };
+  let assistant: Record<string, unknown> | undefined;
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const candidate: unknown = messages[index];
+    if (isPlainObject(candidate) && candidate[names.roleField] === names.assistantRole) {
+      assistant = candidate;
+      break;
+    }
+  }
+  if (!assistant) return { success: false };
+  const stopReason = assistant[names.stopReasonField];
+  const success = event[names.willRetryField] === false
+    && (names.successStopReasons as readonly unknown[]).includes(stopReason);
+  const content = assistant[names.contentField];
+  const texts = Array.isArray(content)
+    ? content.flatMap((part: unknown) =>
+      isPlainObject(part) && part.type === names.textPartType && typeof part[names.textField] === "string"
+        ? [part[names.textField] as string]
+        : [])
+    : [];
+  return texts.length > 0 ? { success, message: texts.join("\n") } : { success };
+}
+
+function piTracker(): FinalEventTracker {
+  let final: FinalEvent | undefined;
+  return {
+    observe(event) {
+      final = readPiFinalEvent(event) ?? final;
+    },
+    final: () => final,
+  };
+}
+
+const FINAL_EVENT_TRACKERS: Readonly<Record<HeadlessOutputFormat, () => FinalEventTracker>> = Object.freeze({
+  "claude-stream-json": claudeTracker,
+  "codex-exec-json": codexTracker,
+  "pi-json": piTracker,
 });
+
+const NO_FINAL_EVENT: FinalEventTracker = Object.freeze({ observe() {}, final: () => undefined });
 
 function truncateUtf8(value: string, capBytes: number): { value: string; truncated: boolean } {
   const bytes = Buffer.from(value, "utf8");
@@ -92,7 +222,7 @@ export function createHeadlessOutputParser(
   format: HeadlessOutputFormat,
   options: Readonly<{ totalCapBytes?: number }> = {},
 ): HeadlessOutputParser {
-  const readFinal = Object.hasOwn(FINAL_EVENT_READERS, format) ? FINAL_EVENT_READERS[format] : () => undefined;
+  const tracker = Object.hasOwn(FINAL_EVENT_TRACKERS, format) ? FINAL_EVENT_TRACKERS[format]() : NO_FINAL_EVENT;
   const totalCapBytes = options.totalCapBytes ?? HEADLESS_TRANSCRIPT_CAP_BYTES;
   const decoder = new TextDecoder("utf-8", { fatal: true });
 
@@ -103,7 +233,6 @@ export function createHeadlessOutputParser(
   let overflowed = false;
   let ended = false;
   let malformedLines = 0;
-  let final: FinalEvent | undefined;
 
   const parseLine = (line: Buffer): void => {
     let end = line.length;
@@ -115,8 +244,7 @@ export function createHeadlessOutputParser(
         malformedLines += 1;
         return;
       }
-      const event = readFinal(value);
-      if (event) final = event;
+      tracker.observe(value);
     } catch {
       malformedLines += 1;
     }
@@ -191,6 +319,12 @@ export function createHeadlessOutputParser(
       ended = true;
     },
     result(): HeadlessOutputParserResult {
+      let final: FinalEvent | undefined;
+      try {
+        final = tracker.final();
+      } catch {
+        final = undefined;
+      }
       const truncated = final?.message === undefined
         ? undefined
         : truncateUtf8(final.message, HEADLESS_FINAL_MESSAGE_CAP_BYTES);
