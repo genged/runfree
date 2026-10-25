@@ -23,11 +23,15 @@ export const HEADLESS_STDERR_CAP_BYTES = 16 * 1024 * 1024;
 export type HeadlessRunOutcome = "success" | "failed" | "unverified" | "refused" | "skipped" | "timeout" | "signal";
 export type HeadlessRunTeardown = "confirmed" | "unconfirmed" | "not-started";
 
+export type HeadlessUncheckedAuthoritySource = "hostServices" | "oauthExchanges" | "localMcpServers";
+
 /** Authority a headless run allows without write posture (spec §3.5); names only. */
 export type HeadlessUncheckedAuthority = Readonly<{
   hostServices: readonly string[];
   oauthExchanges: readonly string[];
   localMcpServers: readonly string[];
+  /** Sources that could not be read, so their list is unknown rather than empty. */
+  unreadable: readonly HeadlessUncheckedAuthoritySource[];
 }>;
 
 export type HeadlessRunJson = Readonly<{

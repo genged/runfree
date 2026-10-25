@@ -56,7 +56,7 @@ function runJson(overrides: Partial<HeadlessRunJson> = {}): HeadlessRunJson {
     containerId: "a".repeat(64),
     headlessDenials: 0,
     acceptDeniedWrites: false,
-    uncheckedAuthority: { hostServices: [], oauthExchanges: [], localMcpServers: [] },
+    uncheckedAuthority: { hostServices: [], oauthExchanges: [], localMcpServers: [], unreadable: [] },
     streamsDrained: true,
     reattached: false,
     transcriptBytes: 0,
