@@ -383,6 +383,9 @@ function parseHostEvidence(value: unknown, fileSessionId: string): SessionMetada
   if (value.terminalIds !== undefined && parseTerminalIdentity(value.terminalIds) === undefined) return undefined;
   if (value.launchConversationId !== undefined
     && (typeof value.launchConversationId !== "string" || !UUID_RE.test(value.launchConversationId))) return undefined;
+  // Absent means interactive (every record before the mark existed); the
+  // only value ever written is "headless" (`createSessionMetadata`).
+  if (value.launchMode !== undefined && value.launchMode !== "headless") return undefined;
   return value as unknown as SessionMetadata;
 }
 
@@ -1187,8 +1190,10 @@ function codexMatchItemsForProject(
   mapping: ProjectMapping,
   hostItems: readonly RecoveryItem[],
   env: NodeJS.ProcessEnv,
+  headlessItems: readonly RecoveryItem[] = [],
 ): RecoveryItem[] {
   try {
+
     // Every Codex v2 host record, newest `startedAt` first: active and
     // already-exact records are kept here so their windows still count
     // toward ambiguity, even though neither is ever scanned or rowed below.
@@ -1227,13 +1232,40 @@ function codexMatchItemsForProject(
       }
     }
 
-    const matches = matchCodexThreads(matchInputs, Array.from(threadsById.values()))
+    // Headless runs (headless-run plan C1) claim every thread inside their
+    // own window: such a thread is never matched to an interactive record,
+    // even one whose window overlaps, and a headless record never gets a
+    // row. Their windows need no scan of their own, because a thread that
+    // only a headless window holds matches no interactive record anyway.
+    const threads = Array.from(threadsById.values());
+    const headlessInputs: CodexMatchInput[] = headlessItems
+      .filter((item) => item.agent === "codex")
+      .map((item) => ({ itemId: item.id, window: headlessCodexWindow(item, lifecycleRecords) }));
+    const headlessThreadIds = new Set(matchCodexThreads(headlessInputs, threads).map((match) => match.thread.id));
+    const matches = matchCodexThreads(matchInputs, threads.filter((thread) => !headlessThreadIds.has(thread.id)))
       .filter((match) => rowEligibleIds.has(match.itemId));
     const eligible = codexItems.filter((item) => rowEligibleIds.has(item.id));
     return codexMatchRows(projectId, mapping, eligible, matches, env);
   } catch {
     return [];
   }
+}
+
+/**
+ * A headless record's claim window: its own Codex window when it has one,
+ * else (no end time and no lifecycle record) from its start to its last
+ * heartbeat, or to now while its owner is still alive. Wider is the safe
+ * direction here, because the window only removes threads from the picker.
+ */
+function headlessCodexWindow(
+  item: RecoveryItem,
+  lifecycleRecords: readonly SessionContainerRecordV2[],
+): CodexMatchInput["window"] {
+  const window = codexWindowForItem(item, lifecycleRecords);
+  if (window) return window;
+  const startMs = Date.parse(item.startedAt ?? "");
+  const endMs = item.ownerState === "dead" ? Date.parse(item.hostMetadata?.lastSeenAt ?? "") : Date.now();
+  return Number.isFinite(startMs) && Number.isFinite(endMs) ? { startMs, endMs } : undefined;
 }
 
 /** Groups `matches` by host item, newest thread first, within `CODEX_MATCH_LIMITS` (5 rows per host item, 50 in total — security review F5). Host items are already newest-`startedAt`-first, so the running total cap drops the oldest items' rows first. */
@@ -1332,11 +1364,23 @@ export function scanRecoveryInventory(input: {
       const claudeEvidence = scanClaudeEvidence(stateDir, global);
       const mapping = projectMapping(stateDir, entry.name, hostEvidence);
       if (requestedRoot && mapping.projectRoot !== requestedRoot) continue;
-      const hostItems = hostEvidence.map((evidence) => itemFromHost(entry.name, stateDir, mapping, evidence, env));
+      // A headless run's evidence is never offered (headless-run spec §3.3,
+      // plan C1). It still names the conversation that run used, so the
+      // agent-written Claude registry entry and Codex rollout of that run are
+      // dropped too, within this project only.
+      const allHostItems = hostEvidence.map((evidence) => itemFromHost(entry.name, stateDir, mapping, evidence, env));
+      const headlessItems = allHostItems.filter((item) => item.hostMetadata?.launchMode === "headless");
+      const hostItems = allHostItems.filter((item) => item.hostMetadata?.launchMode !== "headless");
+      const headlessConversations = new Set(headlessItems.flatMap((item) => [
+        validConversationId(item.hostMetadata?.launchConversationId),
+        validConversationId(item.hostMetadata?.resumeConversationId),
+      ].filter((id): id is string => id !== undefined)));
       items.push(...hostItems);
-      items.push(...claudeEvidence.map((evidence) => itemFromClaude(entry.name, stateDir, mapping, evidence, env)));
+      items.push(...claudeEvidence
+        .filter((evidence) => !headlessConversations.has(evidence.registry.sessionId))
+        .map((evidence) => itemFromClaude(entry.name, stateDir, mapping, evidence, env)));
       if (requestedRoot && input.includeCodexMatches === true) {
-        items.push(...codexMatchItemsForProject(entry.name, stateDir, mapping, hostItems, env));
+        items.push(...codexMatchItemsForProject(entry.name, stateDir, mapping, hostItems, env, headlessItems));
       }
       if (global.files >= RECOVERY_LIMITS.maxFilesGlobal) {
         global.truncated = true;

@@ -2692,3 +2692,167 @@ describe("agent-writable evidence swapped for a FIFO", () => {
     }
   });
 });
+
+// Headless-run spec §3.3/§5 "resume skips headless records", plan C1:
+// `runfree resume` reads host evidence, not the lifecycle record, so the
+// `launchMode: "headless"` mark on host evidence is what keeps a headless
+// conversation out of every listing, and it anchors the exclusion of the
+// agent-written Claude registry and Codex rollouts of that run.
+describe("headless host evidence is never offered (headless-run plan C1)", () => {
+  const HEADLESS_CONVERSATION = "22222222-3333-4444-8555-666666666666";
+  const INTERACTIVE_CONVERSATION = "33333333-4444-4555-8666-777777777777";
+
+  function interruptedHeadless(id = "rf-20261025-hdls01", overrides: Record<string, unknown> = {}): string {
+    return hostEvidence(id, {
+      hostPid: DEAD_PID,
+      recordVersion: 2,
+      outcome: "interrupted",
+      launchMode: "headless",
+      launchConversationId: HEADLESS_CONVERSATION,
+      endedAt: "2026-07-31T00:05:00.000Z",
+      ...overrides,
+    });
+  }
+
+  function interruptedInteractive(id = "rf-20261025-intr01", overrides: Record<string, unknown> = {}): string {
+    return hostEvidence(id, {
+      hostPid: DEAD_PID,
+      recordVersion: 2,
+      outcome: "interrupted",
+      launchConversationId: INTERACTIVE_CONVERSATION,
+      endedAt: "2026-07-31T00:05:00.000Z",
+      ...overrides,
+    });
+  }
+
+  test("an interrupted headless record is absent from the inventory, --list, and --json; an interactive one beside it stays", () => {
+    interruptedHeadless();
+    interruptedInteractive();
+
+    for (const inventory of [
+      scanRecoveryInventory({ env }),
+      scanRecoveryInventory({ env, projectRoot }),
+      scanRecoveryInventory({ env, projectRoot, includeCodexMatches: true }),
+    ]) {
+      expect(inventory.items.map((item) => item.sourceId)).toEqual(["rf-20261025-intr01"]);
+      // A headless record is excluded on purpose, not counted as malformed.
+      expect(inventory.invalidFiles).toBe(0);
+      expect(formatRecoveryInventory(inventory)).not.toContain("rf-20261025-hdls01");
+      expect(recoveryInventoryJson(inventory)).not.toContain("rf-20261025-hdls01");
+      expect(recoveryInventoryJson(inventory)).not.toContain(HEADLESS_CONVERSATION);
+    }
+  });
+
+  test("a Claude registry entry naming the headless run's conversation is not offered; another one still is", () => {
+    interruptedHeadless();
+    claudeEvidence({ sessionId: HEADLESS_CONVERSATION }, 5001);
+    claudeEvidence({ sessionId: INTERACTIVE_CONVERSATION }, 5002);
+
+    const inventory = scanRecoveryInventory({ env, projectRoot, includeCodexMatches: true });
+
+    expect(inventory.items.map((item) => [item.evidenceKind, item.conversationId])).toEqual([
+      ["claude", INTERACTIVE_CONVERSATION],
+    ]);
+  });
+
+  test("a Claude registry entry is dropped by a headless resume lineage id too", () => {
+    interruptedHeadless("rf-20261025-hdls02", { launchConversationId: undefined, resumeConversationId: HEADLESS_CONVERSATION });
+    claudeEvidence({ sessionId: HEADLESS_CONVERSATION }, 5003);
+
+    expect(scanRecoveryInventory({ env }).items).toEqual([]);
+  });
+
+  test("a headless record in another project does not hide this project's Claude entry with the same id", () => {
+    claudeEvidence({ sessionId: HEADLESS_CONVERSATION }, 5004);
+    const otherRoot = path.join(tmp, "other-project");
+    fs.mkdirSync(otherRoot, { recursive: true });
+    const otherState = path.join(env.XDG_STATE_HOME as string, "runfree", "projects", projectHash(otherRoot));
+    fs.mkdirSync(path.join(otherState, "sessions"), { recursive: true });
+    fs.writeFileSync(path.join(otherState, "project.json"), `${JSON.stringify({ projectRoot: otherRoot, updatedAt: "2026-07-31T00:00:00.000Z" })}\n`);
+    fs.writeFileSync(path.join(otherState, "sessions", "rf-20261025-hdls03.json"), `${JSON.stringify({
+      id: "rf-20261025-hdls03",
+      projectRoot: otherRoot,
+      composeProject: composeProjectName(otherRoot),
+      command: "claude",
+      hostPid: DEAD_PID,
+      startedAt: "2026-07-31T00:00:00.000Z",
+      lastSeenAt: "2026-07-31T00:01:00.000Z",
+      launchMode: "headless",
+      launchConversationId: HEADLESS_CONVERSATION,
+    })}\n`);
+
+    const inventory = scanRecoveryInventory({ env });
+
+    expect(inventory.items.map((item) => [item.projectId, item.conversationId])).toEqual([
+      [projectHash(projectRoot), HEADLESS_CONVERSATION],
+    ]);
+  });
+
+  test("a Codex rollout inside a headless record's window is neither offered nor matched to an overlapping interactive record", () => {
+    const HEADLESS_THREAD = "01a0692c-7f74-7750-ad42-fb36200a0101";
+    const INTERACTIVE_THREAD = "01a0692c-7f74-7750-ad42-fb36200a0102";
+    interruptedHeadless("rf-20261025-hdlcdx", {
+      command: "codex",
+      launchConversationId: undefined,
+      startedAt: "2026-07-31T00:10:00.000Z",
+      endedAt: "2026-07-31T00:20:00.000Z",
+    });
+    hostEvidence("rf-20261025-intcdx", {
+      command: "codex",
+      hostPid: DEAD_PID,
+      recordVersion: 2,
+      outcome: "interrupted",
+      startedAt: "2026-07-31T00:00:00.000Z",
+      endedAt: "2026-07-31T00:30:00.000Z",
+    });
+    codexRollout("2026/07/31", HEADLESS_THREAD, "2026-07-31T00:15:00.000Z");
+    codexRollout("2026/07/31", INTERACTIVE_THREAD, "2026-07-31T00:05:00.000Z");
+
+    const inventory = scanRecoveryInventory({ env, projectRoot, includeCodexMatches: true });
+    const matches = inventory.items.filter((item) => item.conversationSource === "codex-match");
+
+    expect(inventory.items.some((item) => item.sourceId === "rf-20261025-hdlcdx")).toBe(false);
+    expect(matches.map((item) => item.conversationId)).toEqual([INTERACTIVE_THREAD]);
+    // The headless window took the headless thread, so the remaining match
+    // is unambiguous.
+    expect(matches[0]?.codexMatchTabs).toBe(1);
+  });
+
+  test("a still-running headless Codex run with no end time claims the threads started since its start", () => {
+    const LIVE_HEADLESS_THREAD = "01a0692c-7f74-7750-ad42-fb36200a0103";
+    // Live owner (this process), no endedAt, and no lifecycle record.
+    hostEvidence("rf-20261025-hdllve", {
+      command: "codex",
+      recordVersion: 2,
+      launchMode: "headless",
+      startedAt: "2026-07-31T00:10:00.000Z",
+    });
+    hostEvidence("rf-20261025-intcd2", {
+      command: "codex",
+      hostPid: DEAD_PID,
+      recordVersion: 2,
+      outcome: "interrupted",
+      startedAt: "2026-07-31T00:00:00.000Z",
+      endedAt: "2026-07-31T00:30:00.000Z",
+    });
+    codexRollout("2026/07/31", LIVE_HEADLESS_THREAD, "2026-07-31T00:15:00.000Z");
+
+    const inventory = scanRecoveryInventory({ env, projectRoot, includeCodexMatches: true });
+
+    expect(inventory.items.map((item) => [item.sourceId, item.conversationSource])).toEqual([
+      ["rf-20261025-intcd2", undefined],
+    ]);
+  });
+
+  test("host evidence with any other launchMode is refused as malformed", () => {
+    hostEvidence("rf-20261025-batch1", { launchMode: "batch" });
+    hostEvidence("rf-20261025-batch2", { launchMode: "interactive" });
+    hostEvidence("rf-20261025-batch3", { launchMode: null });
+    hostEvidence("rf-20261025-batch4", { launchMode: true });
+
+    const inventory = scanRecoveryInventory({ env });
+
+    expect(inventory.items).toEqual([]);
+    expect(inventory.invalidFiles).toBe(4);
+  });
+});

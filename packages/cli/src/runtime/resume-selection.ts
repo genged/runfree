@@ -64,6 +64,9 @@ export function sanitizeAgentText(value: string, max: number): string {
 function eligible(item: RecoveryItem): boolean {
   if (item.state === "claimed" || item.state === "unrecoverable" || item.state === "active") return false;
   if (item.claimUnprovable) return false;
+  // A headless run is never resumed (headless-run spec §3.3). The inventory
+  // already drops it; this keeps any other caller from offering it.
+  if (item.hostMetadata?.launchMode === "headless") return false;
   if (item.evidenceKind === "claude") return true; // claude-reported rows
   if (item.recordVersion !== 2) return false; // decision 3: no record version means an older Runfree
   return item.ownerState === "dead";

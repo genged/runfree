@@ -81,6 +81,21 @@ describe("selectResumeCandidates", () => {
     expect(result.row.source).toBe("host");
   });
 
+  // Headless-run plan C1: the inventory already drops headless evidence;
+  // selection refuses it again so no future caller can put it in the picker.
+  test("a headless host row (or a codex-match row derived from one) is never asked or listed", () => {
+    const headlessMetadata = { launchMode: "headless" } as unknown as NonNullable<RecoveryItem["hostMetadata"]>;
+    const headless = hostItem({ hostMetadata: headlessMetadata });
+    const headlessMatch = hostItem({ agent: "codex", conversationSource: "codex-match", hostMetadata: headlessMetadata });
+    expect(selectResumeCandidates({ items: [headless, headlessMatch], current: CURRENT, now: NOW }).kind).toBe("none");
+
+    const interactive = hostItem();
+    const result = selectResumeCandidates({ items: [headless, interactive], current: CURRENT, now: NOW });
+    expect(result.kind).toBe("one-question");
+    if (result.kind !== "one-question") throw new Error("unreachable");
+    expect(result.row.item.id).toBe(interactive.id);
+  });
+
   test("the same row with only a weak match shows the picker, first, as the default", () => {
     const item = hostItem({ terminal: WEAK_TERMINAL });
     const result = selectResumeCandidates({ items: [item], current: CURRENT, now: NOW });
