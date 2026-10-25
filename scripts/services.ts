@@ -1050,7 +1050,7 @@ export const SERVICES: Record<string, Service> = {
     detect: [],
     explanations: [
       "Google Search Console API: a Google service-account JWT presented directly as Authorization: Bearer (no OAuth token exchange)",
-      "The host signs the JWT from a service-account source (or a host command that prints an access token); the proxy injects it, and the agent never holds the key or the token",
+      "The host signs the JWT from a `runfree credential source add google-service-account` source (or a host command that prints an access token); the proxy injects it, and the agent never holds the key or the token",
       "Bind the source with: runfree service enable google-search-console --from-source <source>",
       "Add the service account's client_email as a user on each Search Console property; Runfree cannot do this step",
       "Search Analytics queries are POST requests and ask for approval; only URL inspection is a read",

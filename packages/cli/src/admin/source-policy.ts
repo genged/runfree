@@ -26,14 +26,22 @@ import {
   regularExecutableRealpath,
   resolveHostExecutable,
   runCommandSource,
+  signGoogleServiceAccountSource,
   signJwtSource,
   type SourceAddCommandInput,
+  type SourceAddGoogleServiceAccountInput,
   type SourceAddJwtInput,
   sourceConfigPath,
   type SourceNameInput,
   type SourceRegistry,
   writeJsonFile,
 } from "./admin-core.ts";
+import {
+  assertGoogleServiceAccountTtl,
+  GOOGLE_SA_TTL_DEFAULT_SECONDS,
+  googleServiceAccountFailure,
+  normalizeGoogleServiceAccountScopes,
+} from "./google-service-account.ts";
 
 function saveSourceRegistry(registry: SourceRegistry): void {
   writeJsonFile(sourceConfigPath(), registry, 0o600);
@@ -244,6 +252,77 @@ export function sourceAddJwtIntent(input: SourceAddJwtInput): void {
   console.log(`${name} source ${existing ? "replaced" : "configured"}`);
   console.log("type: jwt");
   for (const line of jwtDisplay(source)) console.log(line);
+  console.log("agent exposure: no");
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+// Typed enforcement for `runfree credential source add google-service-account
+// <name> ...` (spec 2026-10-24 google-service-account-source §4.2). Every flag
+// is checked before the 1Password read. The client_email is pinned from the
+// verification read, so the "unchanged" compare runs after that read: a key
+// JSON for another service account is a change that needs --replace-source,
+// never "unchanged" (plan P-D5). Nothing is written before every check passed.
+export function sourceAddGoogleServiceAccountIntent(input: SourceAddGoogleServiceAccountInput): void {
+  const { name } = input;
+  if (!name) die("usage: runfree credential source add google-service-account <name> [--replace-source] --key-json-from-1password op://... --scope <scope> [--ttl 55m]");
+  assertKnownSourceName(name);
+
+  const keyJsonRef = singleJwtOption(input.keyJsonRef, "--key-json-from-1password");
+  const ttlValue = singleJwtOption(input.ttl, "--ttl");
+  if (!keyJsonRef) die("credential source add google-service-account requires --key-json-from-1password op://...");
+  if (!keyJsonRef.startsWith("op://")) die("1Password references must start with op://");
+  if (input.scopes.length === 0) die("credential source add google-service-account requires --scope");
+  let scopes: string[];
+  let ttlSeconds: number;
+  try {
+    // Both validators throw fixed text that never quotes a secret.
+    scopes = normalizeGoogleServiceAccountScopes(input.scopes);
+    ttlSeconds = ttlValue === undefined ? GOOGLE_SA_TTL_DEFAULT_SECONDS : parseDurationSeconds(ttlValue, "--ttl");
+    assertGoogleServiceAccountTtl(ttlSeconds);
+  } catch (error) {
+    die(errorMessage(error));
+  }
+  // §5.1 refusal point (plan Task 6): reads only the registry and approved
+  // policies, so it must stay here, before the 1Password read.
+
+  ensureStateDirs();
+  const keyJson = { source: "1password" as const, ref: keyJsonRef };
+  let clientEmail: string;
+  try {
+    ({ clientEmail } = signGoogleServiceAccountSource({ keyJson, scopes, ttlSeconds }, { sourceName: name, pin: undefined }));
+  } catch (error) {
+    // The catch-all: only a fixed message, never the key JSON (§4.3, M4).
+    die(googleServiceAccountFailure(error, name).safeMessage);
+  }
+  const source: GoogleServiceAccountSource = {
+    type: "google-service-account",
+    keyJson,
+    clientEmail,
+    scopes,
+    ttlSeconds,
+    createdAt: new Date().toISOString(),
+  };
+  const registry = loadSourceRegistry();
+  const existing = registry[name];
+  if (existing && namedSourcesEqual(existing, source)) {
+    console.log(`${name} source unchanged`);
+    console.log(`type: ${sourceTypeDisplay(existing)}`);
+    for (const line of namedSourceDisplay(existing)) console.log(line);
+    console.log("agent exposure: no");
+    return;
+  }
+  if (existing && !input.replaceSource) {
+    const users = sourceUsers(name);
+    die(`${name} source is already configured; pass --replace-source to change it${users.length > 0 ? `; used by credential bindings: ${users.join(", ")}` : ""}`);
+  }
+  registry[name] = source;
+  saveSourceRegistry(registry);
+  console.log(`${name} source ${existing ? "replaced" : "configured"}`);
+  console.log("type: google-service-account");
+  for (const line of googleServiceAccountDisplay(source)) console.log(line);
   console.log("agent exposure: no");
 }
 

@@ -4124,6 +4124,15 @@ export type SourceAddJwtInput = {
   claims: string[];
   headers: string[];
 };
+// `credential source add google-service-account <name> ...`. The client_email
+// is not an input: it is read from the key JSON at add time and pinned.
+export type SourceAddGoogleServiceAccountInput = {
+  name: string | undefined;
+  replaceSource: boolean;
+  keyJsonRef: string | string[] | undefined;
+  scopes: string[];
+  ttl: string | string[] | undefined;
+};
 
 type OAuthSeedHandleStore = {
   schemaVersion: 1;

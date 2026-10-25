@@ -130,6 +130,7 @@ export const COMMAND_EXAMPLES = {
   ],
   credential: [
     { cmd: "runfree credential source add github-cli -- gh auth token", blurb: "Add a reusable host-owned command source" },
+    { cmd: "runfree credential source add google-service-account gsc --key-json-from-1password op://vault/gsc-sa/credential.json --scope https://www.googleapis.com/auth/webmasters.readonly", blurb: "Add a Google service-account source for the google-search-console service" },
     { cmd: "runfree host add api.github.com", blurb: "Allow a custom credential destination first" },
     { cmd: "runfree credential add github --host api.github.com --from-source github-cli", blurb: "Create a credential destination and bind its source" },
     { cmd: "runfree credential link github --host uploads.github.com", blurb: "Add another already-allowlisted destination" },

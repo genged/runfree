@@ -1987,6 +1987,75 @@ describe("admin credential source command (typed)", () => {
     ).rejects.toThrow("sourceAdminContext() must not be called");
     expect(runDefault).not.toHaveBeenCalled();
   });
+
+  describe("credential source add google-service-account", () => {
+    const RO = "https://www.googleapis.com/auth/webmasters.readonly";
+    const gsa = ["credential", "source", "add", "google-service-account", "gsc", "--key-json-from-1password", "op://x", "--scope", RO];
+
+    test("valid input reaches enforcement", async () => {
+      const runDefault = vi.fn(async () => 0);
+      await expect(runCommandApp(strictContext(), [...gsa, "--ttl", "30m", "--replace-source"], runDefault))
+        .rejects.toThrow("sourceAdminContext() must not be called");
+      await expect(runCommandApp(strictContext(), [...gsa, "--scope", "https://www.googleapis.com/auth/webmasters"], runDefault))
+        .rejects.toThrow("sourceAdminContext() must not be called");
+      expect(runDefault).not.toHaveBeenCalled();
+    });
+
+    test.each([
+      ["--alg", "ES256"],
+      ["--private-key-from-1password", "op://y"],
+      ["--claim", "iss=ID"],
+      ["--header", "kid=K"],
+    ])("refuses the jwt-only flag %s", async (flag, value) => {
+      const runDefault = vi.fn(async () => 0);
+      await expect(runCommandApp(strictContext(), [...gsa, flag, value], runDefault))
+        .rejects.toMatchObject({ message: expect.stringContaining(`unknown option: ${flag}`) });
+      expect(runDefault).not.toHaveBeenCalled();
+    });
+
+    test.each([
+      ["--key-json-from-1password", "op://x"],
+      ["--scope", RO],
+    ])("jwt refuses the google-service-account-only flag %s", async (flag, value) => {
+      const runDefault = vi.fn(async () => 0);
+      await expect(runCommandApp(
+        strictContext(),
+        ["credential", "source", "add", "jwt", "appstore", "--alg", "ES256", "--private-key-from-1password", "op://x", "--claim", "iss=ID", "--ttl", "19m", flag, value],
+        runDefault,
+      )).rejects.toMatchObject({ message: expect.stringContaining(`unknown option: ${flag}`) });
+      expect(runDefault).not.toHaveBeenCalled();
+    });
+
+    test.each([
+      ["--ttl", "5m"],
+      ["--scope", RO],
+      ["--key-json-from-1password", "op://x"],
+    ])("a command source refuses %s", async (flag, value) => {
+      const runDefault = vi.fn(async () => 0);
+      await expect(runCommandApp(strictContext(), ["credential", "source", "add", "gsc", flag, value, "--", "gh", "auth", "token"], runDefault))
+        .rejects.toMatchObject({ message: expect.stringContaining(`unknown option: ${flag}`) });
+      expect(runDefault).not.toHaveBeenCalled();
+    });
+
+    test("refuses tokens after -- and an extra positional", async () => {
+      const runDefault = vi.fn(async () => 0);
+      await expect(runCommandApp(strictContext(), [...gsa, "--", "extra"], runDefault))
+        .rejects.toMatchObject({ message: expect.stringContaining("unexpected tokens after -- in credential source add google-service-account: extra") });
+      await expect(runCommandApp(strictContext(), [...gsa, "more"], runDefault))
+        .rejects.toMatchObject({ message: expect.stringContaining("unexpected credential source add argument: more") });
+      expect(runDefault).not.toHaveBeenCalled();
+    });
+
+    test("source add --help lists the google service-account options", async () => {
+      const out = captureStdout();
+      const runDefault = vi.fn(async () => 0);
+      expect(await runCommandApp(strictContext(), ["credential", "source", "add", "--help"], runDefault)).toBe(0);
+      expect(out.text()).toContain("Google service-account source (credential source add google-service-account ...):");
+      expect(out.text()).toContain("--key-json-from-1password");
+      expect(out.text()).toContain("--scope");
+      expect(runDefault).not.toHaveBeenCalled();
+    });
+  });
 });
 
 describe("admin service command (typed)", () => {

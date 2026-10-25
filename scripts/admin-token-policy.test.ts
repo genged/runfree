@@ -50,7 +50,9 @@ import {
   convergeProxyPolicy,
   runAdminAction,
   sourceAddCommandIntent,
+  sourceAddGoogleServiceAccountIntent,
   sourceAddJwtIntent,
+  type SourceAddGoogleServiceAccountInput,
   sourceList,
   sourceRemoveIntent,
   sourceShowIntent,
@@ -7102,5 +7104,179 @@ describe("google-service-account sources", () => {
     expect(result.stdout).toContain(`used by: ${GSC_TOKEN}`);
     expect(result.stdout).toContain("agent exposure: no");
     expect(result.stdout).not.toContain(GSC_REF);
+  });
+
+  describe("credential source add google-service-account (§4.2)", () => {
+    function hostConfigBytes(): { sources: string | undefined; tokens: string | undefined; status: string | undefined; receipts: string | undefined } {
+      const read = (p: string) => (fs.existsSync(p) ? fs.readFileSync(p, "utf8") : undefined);
+      return { sources: read(sourceRegistryPath()), tokens: read(tokenConfigPath()), status: read(tokenStatusFilePath()), receipts: read(tokenReceiptsFilePath()) };
+    }
+
+    function addInput(overrides: Partial<SourceAddGoogleServiceAccountInput> = {}): SourceAddGoogleServiceAccountInput {
+      return { name: "gsc", replaceSource: false, keyJsonRef: GSC_REF, scopes: [GSC_RO], ttl: undefined, ...overrides };
+    }
+
+    async function addGsc(op: { bin: string }, overrides: Partial<SourceAddGoogleServiceAccountInput> = {}): Promise<AdminRunResult> {
+      return runAdmin(() => sourceAddGoogleServiceAccountIntent(addInput(overrides)), {
+        OP_SERVICE_ACCOUNT_TOKEN: "op-session",
+        PATH: `${op.bin}${path.delimiter}${process.env.PATH ?? ""}`,
+      });
+    }
+
+    function bindGscToken(): void {
+      writeTokenConfig({ [GSC_TOKEN]: { source: "named", name: "gsc" } });
+    }
+
+    test("add verifies the key JSON, pins its client_email, and stores no key material", async () => {
+      const op = installGscOp(() => gscKeyJson());
+      const result = await addGsc(op);
+      expect(result.status, result.stderr).toBe(0);
+      expect(op.reads()).toBe(1);
+      expect(result.stdout).toContain("gsc source configured");
+      expect(result.stdout).toContain("type: google-service-account");
+      expect(result.stdout).toContain(`service account: ${GSC_EMAIL}`);
+      expect(result.stdout).toContain(`scope: ${GSC_RO}`);
+      expect(result.stdout).toContain("ttl: 55m");
+      expect(result.stdout).toContain("agent exposure: no");
+      expect(result.stdout).not.toContain(GSC_REF);
+      const registryText = fs.readFileSync(sourceRegistryPath(), "utf8");
+      expect(JSON.parse(registryText)).toEqual({
+        gsc: {
+          type: "google-service-account",
+          keyJson: { source: "1password", ref: GSC_REF },
+          clientEmail: GSC_EMAIL,
+          scopes: [GSC_RO],
+          ttlSeconds: 3300,
+          createdAt: expect.any(String),
+        },
+      });
+      for (const secret of ["private_key", "PRIVATE KEY", GSC_KEY_ID, GSC_SENTINEL, pemBody(keyA)]) {
+        expect(registryText).not.toContain(secret);
+      }
+      expectNoKeyMaterial([result.stdout, result.stderr]);
+    });
+
+    test("scopes are stored sorted and an explicit ttl is kept", async () => {
+      const op = installGscOp(() => gscKeyJson());
+      const result = await addGsc(op, { scopes: [GSC_RW, GSC_RO], ttl: "30m" });
+      expect(result.status, result.stderr).toBe(0);
+      const registry = JSON.parse(fs.readFileSync(sourceRegistryPath(), "utf8")) as Record<string, Record<string, unknown>>;
+      expect(registry.gsc.scopes).toEqual([GSC_RW, GSC_RO].sort());
+      expect(registry.gsc.ttlSeconds).toBe(1800);
+    });
+
+    test.each<[string, Partial<SourceAddGoogleServiceAccountInput>, string]>([
+      ["a scope outside the allowlist", { scopes: ["https://www.googleapis.com/auth/cloud-platform"] }, "--scope is not an allowed scope"],
+      ["an unknown scope", { scopes: ["https://www.googleapis.com/auth/webmasters.write"] }, "--scope is not an allowed scope"],
+      ["duplicate scopes", { scopes: [GSC_RO, GSC_RO] }, "--scope has a duplicate value"],
+      ["no scope", { scopes: [] }, "credential source add google-service-account requires --scope"],
+      ["a ttl under 5m", { ttl: "4m" }, "--ttl must be a whole number of seconds from 300 to 3600"],
+      ["a ttl over 60m", { ttl: "61m" }, "--ttl must be a whole number of seconds from 300 to 3600"],
+      ["two ttls", { ttl: ["30m", "40m"] }, "--ttl may only be given once"],
+      ["no key JSON reference", { keyJsonRef: undefined }, "credential source add google-service-account requires --key-json-from-1password op://..."],
+      ["two key JSON references", { keyJsonRef: [GSC_REF, GSC_REF] }, "--key-json-from-1password may only be given once"],
+      ["a reference without op://", { keyJsonRef: "Private/gsc-sa/credential.json" }, "1Password references must start with op://"],
+      ["a bad source name", { name: "bad name" }, "source name"],
+      ["no source name", { name: undefined }, "usage: runfree credential source add google-service-account <name>"],
+    ])("refuses %s before any 1Password read and writes nothing", async (_label, overrides, message) => {
+      bindGscToken();
+      const op = installGscOp(() => gscKeyJson());
+      const before = hostConfigBytes();
+      const result = await addGsc(op, overrides);
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain(message);
+      expect(op.reads()).toBe(0);
+      expect(hostConfigBytes()).toEqual(before);
+    });
+
+    test.each<[string, () => string, string]>([
+      ["not JSON (with a sentinel)", () => `{"a": ${GSC_SENTINEL}`, "key JSON is not valid JSON"],
+      ["a user credential", () => gscKeyJson({ type: "authorized_user" }), "key JSON field type is not service_account"],
+      ["an EC key", () => gscKeyJson({ private_key: crypto.generateKeyPairSync("ec", { namedCurve: "P-256" }).privateKey.export({ type: "pkcs8", format: "pem" }).toString() }), "key JSON field private_key is not an RSA key"],
+      ["an RSA 1024 key", () => gscKeyJson({ private_key: crypto.generateKeyPairSync("rsa", { modulusLength: 1024 }).privateKey.export({ type: "pkcs8", format: "pem" }).toString() }), "key JSON field private_key is shorter than 2048 bits"],
+      ["an encrypted PEM", () => gscKeyJson({ private_key: keyA.privateKey.export({ type: "pkcs8", format: "pem", cipher: "aes-256-cbc", passphrase: "pw" }).toString() }), "key JSON field private_key is encrypted"],
+      ["a bad private_key_id", () => gscKeyJson({ private_key_id: "XYZ" }), "key JSON field private_key_id is not 40 lowercase hex characters"],
+      ["a client_email with an escape", () => gscKeyJson({ client_email: "a\u001b[31m@b.iam.gserviceaccount.com" }), "key JSON field client_email is not a service account email"],
+      ["another universe", () => gscKeyJson({ universe_domain: "example.com" }), "key JSON field universe_domain is not googleapis.com"],
+      ["bad PEM bytes with a sentinel", () => gscKeyJson({ private_key: `-----BEGIN PRIVATE KEY-----\n${GSC_SENTINEL}\n-----END PRIVATE KEY-----\n` }), "key JSON field private_key is not a valid private key"],
+    ])("refuses a key JSON that is %s after the verification read and writes nothing", async (_label, output, message) => {
+      bindGscToken();
+      const text = output();
+      const op = installGscOp(() => text);
+      const before = hostConfigBytes();
+      const result = await addGsc(op);
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain(message);
+      expect(result.stderr).not.toContain("\u001b");
+      expect(op.reads()).toBe(1);
+      expect(hostConfigBytes()).toEqual(before);
+      expectNoKeyMaterial([result.stdout, result.stderr]);
+    });
+
+    test("a second identical add is unchanged and writes nothing", async () => {
+      const op = installGscOp(() => gscKeyJson());
+      expect((await addGsc(op)).status).toBe(0);
+      const before = hostConfigBytes();
+      const again = await addGsc(op);
+      expect(again.status, again.stderr).toBe(0);
+      expect(again.stdout).toContain("gsc source unchanged");
+      expect(again.stdout).toContain(`service account: ${GSC_EMAIL}`);
+      expect(hostConfigBytes()).toEqual(before);
+    });
+
+    test("a key JSON for another service account repins only through --replace-source", async () => {
+      writeGscRegistry();
+      const op = installGscOp(() => gscKeyJson({ client_email: GSC_OTHER_EMAIL }));
+      const before = hostConfigBytes();
+      const plain = await addGsc(op);
+      expect(plain.status).toBe(1);
+      expect(plain.stdout).not.toContain("unchanged");
+      expect(plain.stderr).toContain("gsc source is already configured; pass --replace-source to change it");
+      expect(hostConfigBytes()).toEqual(before);
+
+      const replaced = await addGsc(op, { replaceSource: true });
+      expect(replaced.status, replaced.stderr).toBe(0);
+      expect(replaced.stdout).toContain("gsc source replaced");
+      expect(replaced.stdout).toContain(`service account: ${GSC_OTHER_EMAIL}`);
+      const registry = JSON.parse(fs.readFileSync(sourceRegistryPath(), "utf8")) as Record<string, Record<string, unknown>>;
+      expect(registry.gsc.clientEmail).toBe(GSC_OTHER_EMAIL);
+    });
+
+    test("a changed source that is in use names its credential bindings", async () => {
+      writeGscRegistry();
+      bindGscToken();
+      const op = installGscOp(() => gscKeyJson());
+      const before = hostConfigBytes();
+      const result = await addGsc(op, { scopes: [GSC_RW] });
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain(`gsc source is already configured; pass --replace-source to change it; used by credential bindings: ${GSC_TOKEN}`);
+      expect(hostConfigBytes()).toEqual(before);
+    });
+
+    test("a ttl given at add bounds the explicit refresh of a binding", async () => {
+      writeFixtureRepo({
+        hosts: ["searchconsole.googleapis.com"],
+        tokens: {
+          [GSC_TOKEN]: {
+            description: "Search Console",
+            credentials: [{ host: "searchconsole.googleapis.com", header: "Authorization", scheme: "bearer" }],
+          },
+        },
+      });
+      const op = installGscOp(() => gscKeyJson());
+      expect((await addGsc(op, { ttl: "30m" })).status).toBe(0);
+      const bind = (refreshEvery: string) => runAdmin(() => credentialSetSourceIntent({
+        name: GSC_TOKEN,
+        tokenSource: { kind: "named", name: "gsc" },
+        refreshEvery,
+        replaceSource: true,
+        sync: false,
+      }));
+      const refused = await bind("30m");
+      expect(refused.status).toBe(1);
+      expect(refused.stderr).toContain("--refresh-every must be shorter than source ttl 30m");
+      const accepted = await bind("29m");
+      expect(accepted.status, accepted.stderr).toBe(0);
+    });
   });
 });

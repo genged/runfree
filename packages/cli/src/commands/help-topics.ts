@@ -124,6 +124,7 @@ Custom host:
 Credential commands:
   runfree credential source add <name> -- <command> [args...]
   runfree credential source add jwt <name> --alg ES256 --private-key-from-1password op://... --claim key=value --ttl 19m
+  runfree credential source add google-service-account <name> --key-json-from-1password op://... --scope <scope> [--ttl 55m]
   runfree credential add <name> --host <already-allowlisted-host> [--from-env ENV | --from-1password op://... | --from-source <name>]
   runfree credential link <name> --host <already-allowlisted-host>
   runfree credential unlink <name> --host <host> [--header <header>]
@@ -425,6 +426,8 @@ Credentials:
       Add a reusable host-owned command source
   runfree credential source add jwt <name> --alg <alg> --private-key-from-1password op://... --claim key=value --ttl 19m
       Add a reusable host-owned JWT source
+  runfree credential source add google-service-account <name> --key-json-from-1password op://... --scope <scope> [--ttl 55m]
+      Add a reusable host-owned Google service-account source (RS256 JWT, key JSON stays in 1Password)
   runfree credential source list
   runfree credential source show <name>
   runfree credential source remove <name>

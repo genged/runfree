@@ -15,6 +15,7 @@ import {
   runAdminAction,
   revokeDesiredCredentialState,
   sourceAddCommandIntent,
+  sourceAddGoogleServiceAccountIntent,
   sourceAddJwtIntent,
   sourceList,
   sourceRemoveIntent,
@@ -38,6 +39,7 @@ import { NO_RELOAD_DESCRIBE } from "./no-reload.ts";
 const SOURCE_GROUP = "Credential source (choose at most one):";
 const POLICY_GROUP = "Credential destination:";
 const JWT_SOURCE_GROUP = "JWT source (credential source add jwt ...):";
+const GOOGLE_SA_SOURCE_GROUP = "Google service-account source (credential source add google-service-account ...):";
 
 type NameArgs = { name: string };
 type CredentialArgs = {
@@ -77,6 +79,8 @@ type SourceAddArgs = {
   ttl?: string | string[];
   claim?: string[];
   header?: string[];
+  "key-json-from-1password"?: string | string[];
+  scope?: string[];
   "--"?: string[];
 };
 
@@ -136,21 +140,37 @@ const sourceNamePositional = (cmd: Argv): Argv =>
 const sourceAddBuilder = (cmd: Argv): Argv =>
   cmd
     .parserConfiguration({ "populate--": true })
-    .positional("args", { type: "string", array: true, describe: "<name> -- <command> | jwt <name> [jwt options]" })
+    .positional("args", { type: "string", array: true, describe: "<name> -- <command> | jwt <name> [jwt options] | google-service-account <name> [options]" })
     .option("replace-source", { type: "boolean", describe: "Overwrite an existing source" })
     .option("alg", { type: "string", requiresArg: true, group: JWT_SOURCE_GROUP, describe: "JWT signing algorithm (e.g. ES256)" })
     .option("private-key-from-1password", { type: "string", requiresArg: true, group: JWT_SOURCE_GROUP, describe: "JWT private-key 1Password ref" })
-    .option("ttl", { type: "string", requiresArg: true, group: JWT_SOURCE_GROUP, describe: "JWT lifetime (e.g. 19m)" })
+    .option("ttl", { type: "string", requiresArg: true, group: JWT_SOURCE_GROUP, describe: "JWT lifetime (jwt, google-service-account; e.g. 19m)" })
     .option("claim", { type: "string", array: true, requiresArg: true, nargs: 1, group: JWT_SOURCE_GROUP, describe: "JWT claim key=value (repeatable)" })
-    .option("header", { type: "string", array: true, requiresArg: true, nargs: 1, group: JWT_SOURCE_GROUP, describe: "JWT header key=value (repeatable)" });
+    .option("header", { type: "string", array: true, requiresArg: true, nargs: 1, group: JWT_SOURCE_GROUP, describe: "JWT header key=value (repeatable)" })
+    .option("key-json-from-1password", { type: "string", requiresArg: true, group: GOOGLE_SA_SOURCE_GROUP, describe: "Service-account key JSON 1Password ref" })
+    .option("scope", { type: "string", array: true, requiresArg: true, nargs: 1, group: GOOGLE_SA_SOURCE_GROUP, describe: "OAuth scope for the JWT (repeatable)" });
 
-const JWT_ONLY_FLAGS: ReadonlyArray<readonly [keyof SourceAddArgs, string]> = [
+type SourceAddFlags = ReadonlyArray<readonly [keyof SourceAddArgs, string]>;
+const JWT_ONLY_FLAGS: SourceAddFlags = [
   ["alg", "--alg"],
   ["private-key-from-1password", "--private-key-from-1password"],
-  ["ttl", "--ttl"],
   ["claim", "--claim"],
   ["header", "--header"],
 ];
+const GOOGLE_SA_ONLY_FLAGS: SourceAddFlags = [
+  ["key-json-from-1password", "--key-json-from-1password"],
+  ["scope", "--scope"],
+];
+// Both signed source types take --ttl; only command sources refuse it.
+const SIGNED_SOURCE_FLAGS: SourceAddFlags = [["ttl", "--ttl"]];
+
+function refuseSourceAddFlags(argv: SourceAddArgs, ...lists: SourceAddFlags[]): void {
+  for (const list of lists) {
+    for (const [key, flag] of list) {
+      if (argv[key] !== undefined) throw new CliError(`unknown option: ${flag}`);
+    }
+  }
+}
 
 export const credentialCommand: CommandModule = {
   name: "credential",
@@ -307,18 +327,32 @@ export const credentialCommand: CommandModule = {
           )
           .command(
             "source",
-            "Manage reusable host-owned command and JWT sources",
+            "Manage reusable host-owned command, JWT, and Google service-account sources",
             (source) => source
               .command(
                 "add [args..]",
-                "Add a host-owned command or JWT source",
+                "Add a host-owned command, JWT, or Google service-account source",
                 sourceAddBuilder,
                 handler((argv: ArgumentsCamelCase<SourceAddArgs>) => {
                   const positionals = argv.args ?? [];
+                  if (positionals[0] === "google-service-account") {
+                    if (positionals.length > 2) throw new CliError(`unexpected credential source add argument: ${positionals[2]}`);
+                    const afterSeparator = argv["--"] ?? [];
+                    if (afterSeparator.length > 0) throw new CliError(`unexpected tokens after -- in credential source add google-service-account: ${afterSeparator[0]}`);
+                    refuseSourceAddFlags(argv, JWT_ONLY_FLAGS);
+                    return runSource(() => sourceAddGoogleServiceAccountIntent({
+                      name: positionals[1],
+                      replaceSource: Boolean(argv["replace-source"]),
+                      keyJsonRef: argv["key-json-from-1password"],
+                      scopes: argv.scope ?? [],
+                      ttl: argv.ttl,
+                    }));
+                  }
                   if (positionals[0] === "jwt") {
                     if (positionals.length > 2) throw new CliError(`unexpected credential source add argument: ${positionals[2]}`);
                     const afterSeparator = argv["--"] ?? [];
                     if (afterSeparator.length > 0) throw new CliError(`unexpected tokens after -- in credential source add jwt: ${afterSeparator[0]}`);
+                    refuseSourceAddFlags(argv, GOOGLE_SA_ONLY_FLAGS);
                     return runSource(() => sourceAddJwtIntent({
                       name: positionals[1],
                       replaceSource: Boolean(argv["replace-source"]),
@@ -330,9 +364,7 @@ export const credentialCommand: CommandModule = {
                     }));
                   }
                   if (positionals.length > 1) throw new CliError(`unexpected credential source add argument before --: ${positionals[1]}`);
-                  for (const [key, flag] of JWT_ONLY_FLAGS) {
-                    if (argv[key] !== undefined) throw new CliError(`unknown option: ${flag}`);
-                  }
+                  refuseSourceAddFlags(argv, JWT_ONLY_FLAGS, GOOGLE_SA_ONLY_FLAGS, SIGNED_SOURCE_FLAGS);
                   return runSource(() => sourceAddCommandIntent({
                     name: positionals[0],
                     replaceSource: Boolean(argv["replace-source"]),
