@@ -40,6 +40,7 @@ export const DENIAL_REASONS = [
   "write-approval-timeout",
   "write-approval-capacity",
   "write-approval-session-denied",
+  "write-approval-headless-denied",
   "host-service-not-configured",
   "host-service-unavailable",
   "host-service-capacity",
@@ -60,6 +61,7 @@ export const SHAPE_DENIAL_REASONS = new Set<DenialReason>([
   "write-approval-timeout",
   "write-approval-capacity",
   "write-approval-session-denied",
+  "write-approval-headless-denied",
 ]);
 
 export const UNPARSEABLE_HOST = "<unparseable>";
@@ -96,6 +98,7 @@ const DENIAL_REASON_TEXT: Record<DenialReason, string> = {
   // A session-wide deny covers this session until the operator clears it;
   // the reason code stays stable as a wire identifier.
   "write-approval-session-denied": "the operator denied writes for this session until they clear the deny",
+  "write-approval-headless-denied": "writes that need approval are denied in an unattended run",
   "host-service-not-configured": "this host service is not approved for the project",
   "host-service-unavailable": "the host-service gateway or the host service is not available",
   "host-service-capacity": "too many host-service connections are already open",
@@ -407,6 +410,16 @@ function shapeDenialLines(host: string, reason: DenialReason, details: ShapeDeni
     );
   } else if (reason === "write-approval-session-denied") {
     // Deliberate operator decision: no remedy line.
+  } else if (reason === "write-approval-headless-denied") {
+    // No approver can see this request, so no approval remedy applies.
+    lines.push(
+      "This session runs without a person to approve writes, so a write that",
+      "needs approval is denied at once. Retrying does not help. The person",
+      "operating Runfree can review this host's write rule for later runs:",
+      "",
+      `  runfree host rules ${host}`,
+      "",
+    );
   } else if (reason === "method-not-allowed") {
     const command = method !== undefined && details.allowedMethods !== undefined
       ? methodWideningCommand(host, method, details.allowedMethods, details.rule)

@@ -183,10 +183,13 @@ export function writeHarnessSessionFiles(registryDir: string, files: readonly Se
   }
 }
 
-function provisionHarnessSessionIdentity(stateDir: string): { registryDir: string; env: NodeJS.ProcessEnv } {
+function provisionHarnessSessionIdentity(
+  stateDir: string,
+  sessionFile: Partial<SessionFileV1> = {},
+): { registryDir: string; env: NodeJS.ProcessEnv } {
   const registryDir = path.join(stateDir, "session-registry");
   fs.mkdirSync(registryDir, { recursive: true, mode: 0o755 });
-  writeHarnessSessionFiles(registryDir, [harnessSessionFile()]);
+  writeHarnessSessionFiles(registryDir, [harnessSessionFile(sessionFile)]);
   return {
     registryDir,
     env: {
@@ -291,6 +294,9 @@ export async function startProxy(options: {
   // identity themselves and skip the default fixture automatically.
   provisionSession?: boolean;
   secretFiles?: Record<string, string>;
+  // Overrides for the default served session file (for example a headless
+  // launchMode). Ignored when the caller manages identity itself.
+  sessionFile?: Partial<SessionFileV1>;
   stateDir?: string;
   umask?: number;
 }): Promise<RunningProxy> {
@@ -308,7 +314,7 @@ export async function startProxy(options: {
   }
   const sessionIdentity = options.provisionSession !== false
     && options.extraEnv?.RUNFREE_SESSION_IDENTITY_MODE === undefined
-    ? provisionHarnessSessionIdentity(stateDir)
+    ? provisionHarnessSessionIdentity(stateDir, options.sessionFile)
     : undefined;
 
   const registryRoot = options.extraEnv?.RUNFREE_SESSION_REGISTRY_DIR ?? sessionIdentity?.registryDir;

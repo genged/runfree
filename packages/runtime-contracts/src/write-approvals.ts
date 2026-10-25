@@ -25,6 +25,24 @@ export const APPROVAL_WATCHER_FRESH_MS = 45_000;
 
 export const APPROVAL_REQUEST_EVENT_PREFIX = "proxy-approval-request: ";
 export const APPROVAL_EVENT_PREFIX = "proxy-approval: ";
+// One line per `ask` write the proxy refused because the session is headless
+// (no hold, no pending record). Logged without repeat suppression so a host
+// reading the proxy log can count every denial of one session.
+export const APPROVAL_HEADLESS_DENIED_EVENT_PREFIX = "proxy-approval-headless-denied: ";
+
+// Payload after APPROVAL_HEADLESS_DENIED_EVENT_PREFIX. `sessionId` is the
+// session's public id; the principal key is never logged. host, method, and
+// path are bounded the same way as a pending record.
+export type ApprovalHeadlessDeniedEvent = {
+  v: 1;
+  ts: string;
+  sessionId: string;
+  host: string;
+  method: string;
+  path: string;
+  category: ApprovalWriteCategory;
+  mcp?: PendingApprovalMcp;
+};
 
 // Level-triggered approval-state snapshot the request proxy writes into its
 // own uid-1001 status subdirectory (same channel as request-proxy.json). The

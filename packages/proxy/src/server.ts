@@ -1883,6 +1883,9 @@ async function holdWriteForApproval(admission: AdmissionRecord, req: ProxyReques
   if (outcome.kind === "session-denied") {
     return writeApprovalDenial(req, shape, "write-approval-session-denied");
   }
+  if (outcome.kind === "headless-denied") {
+    return writeApprovalDenial(req, shape, "write-approval-headless-denied");
+  }
   // denied / no-watcher / cancelled all read as "needs an approval that is
   // not there": the agent-side takeaway is retry after a human acts.
   return writeApprovalDenial(req, shape, "write-approval-required");

@@ -154,6 +154,34 @@ describe("denial display helpers", () => {
     expect(body).toContain("Current rules: runfree host explain github.com");
   });
 
+  test("a headless write-approval denial says no approver can help and points at the rule, not an approver", () => {
+    const body = syntheticDenialBody("api.example.com", "write-approval-headless-denied", {
+      method: "POST",
+      path: "/v1/things?token=secret",
+    });
+    expect(body).toContain("reason: writes that need approval are denied in an unattended run");
+    expect(body).toContain("path:   /v1/things");
+    expect(body).not.toContain("token=secret");
+    expect(body).not.toContain("runfree approvals");
+    expect(body).not.toContain("--write allow");
+    expect(body).toContain("runfree host rules api.example.com");
+    expect(body).toContain("Current rules: runfree host explain api.example.com");
+  });
+
+  test("headless write-approval denials coalesce per method like other shape denials", () => {
+    const lines: string[] = [];
+    const emitter = createDenialEventEmitter({
+      log: (line) => lines.push(line),
+      now: () => new Date("2026-10-25T12:00:00.000Z"),
+      maxEventsPerWindow: 1,
+    });
+    for (const method of ["POST", "POST", "PUT"]) {
+      emitter.emit({ reason: "write-approval-headless-denied", host: "api.example.com", method, path: "/a", generation: GENERATION_A });
+    }
+    expect(lines.map(parseEventLine).map((event) => [event.reason, event.method]))
+      .toEqual([["write-approval-headless-denied", "POST"], ["write-approval-headless-denied", "PUT"]]);
+  });
+
   test("shape denial bodies bound attacker-controlled method values", () => {
     expect(displayMethod("P\x1b[31mOST\nINJECTED")).toBe("P31mOSTINJECTED");
     expect(displayMethod("\x1b[31m")).toBe("31m");

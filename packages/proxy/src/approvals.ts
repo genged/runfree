@@ -33,6 +33,7 @@ import {
   APPROVAL_PROCESS_EPOCH_PATTERN,
   APPROVAL_CONTROL_SCAN_LIMIT,
   APPROVAL_EVENT_PREFIX,
+  APPROVAL_HEADLESS_DENIED_EVENT_PREFIX,
   APPROVAL_REQUEST_EVENT_PREFIX,
   APPROVALS_WATCHER_HEARTBEAT_FILE,
   WRITE_APPROVAL_GRANT_TTL_MAX_MS,
@@ -66,6 +67,9 @@ export type HoldOutcome =
   | { kind: "timeout" }
   | { kind: "no-watcher" }
   | { kind: "capacity" }
+  // The session runs headless (`runfree run`): nobody can answer an approval,
+  // so an `ask` write is refused at once with no hold and no pending record.
+  | { kind: "headless-denied" }
   | { kind: "cancelled"; reason: "policy-changed" | "client-disconnected" | "session-ended" | "shutdown" };
 
 export type HoldInput = {
@@ -344,6 +348,23 @@ export function createWriteApprovalManager(options: WriteApprovalManagerOptions)
       method: input.method.slice(0, 128),
       ...(input.tool !== undefined ? { tool: input.tool.slice(0, 128) } : {}),
     };
+  }
+
+  // Headless sessions never get a hold, whatever the watcher heartbeat says:
+  // an attached approver may belong to another session, and an unattended run
+  // must not wait on it. Logs one event per refusal through emitEvent, which
+  // has no repeat suppression, so the host can count this session's denials.
+  function refuseHeadless(input: Omit<HoldInput, "requestId">): boolean {
+    const session = authenticatedSession(input.principal);
+    if (session?.launchMode !== "headless") return false;
+    const mcp = boundedMcp(input.mcp);
+    emitEvent(APPROVAL_HEADLESS_DENIED_EVENT_PREFIX, {
+      sessionId: session.sessionId,
+      ...boundedRecordFields(input as HoldInput),
+      category: input.category,
+      ...(mcp ? { mcp } : {}),
+    });
+    return true;
   }
 
   function sessionDisplay(session: ApprovalRequestSession): PendingApprovalSession {
@@ -917,6 +938,9 @@ export function createWriteApprovalManager(options: WriteApprovalManagerOptions)
 
   async function hold(input: HoldInput, retry = false): Promise<HoldOutcome> {
     if (disposed) return { kind: "cancelled", reason: "shutdown" };
+    // Before the session deny, the cap, and the watcher check: a headless
+    // write is never held, so none of them applies.
+    if (refuseHeadless(input)) return { kind: "headless-denied" };
     const subject = grantSubject(input.principal);
     if (subject && sessionDenyGrants.has(subject.key)) return { kind: "session-denied" };
     if (input.mcp && subject && matchingMcpGrant(mcpDenyGrants, input.mcp, subject.key)) {
@@ -925,7 +949,7 @@ export function createWriteApprovalManager(options: WriteApprovalManagerOptions)
     // Held-connection cap (MED-1): past the cap, fast-deny instead of holding
     // so an agent cannot pin the proxy by spamming writes.
     if (holds.size >= maxHeld) return { kind: "capacity" };
-    // Headless fast-deny (LOW-1): with no attached approver a write denies
+    // No-approver fast-deny (LOW-1): with no attached approver a write denies
     // immediately instead of stalling for the full hold window.
     if (!watcherAttached()) return { kind: "no-watcher" };
 
@@ -992,7 +1016,10 @@ export function createWriteApprovalManager(options: WriteApprovalManagerOptions)
   }
 
   function notePendingRetryApproval(input: Omit<HoldInput, "requestId">): void {
-    if (disposed || holds.size >= maxHeld || !watcherAttached()) return;
+    if (disposed) return;
+    // Same order as hold(): a headless session gets no retry approval.
+    if (refuseHeadless(input)) return;
+    if (holds.size >= maxHeld || !watcherAttached()) return;
     const bounded = boundedRecordFields(input as HoldInput);
     const duplicate = Array.from(holds.values()).some((hold) => hold.record.host === bounded.host
       && hold.record.method === bounded.method

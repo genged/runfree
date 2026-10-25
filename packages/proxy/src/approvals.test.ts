@@ -4,6 +4,7 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
 
 import {
+  APPROVAL_HEADLESS_DENIED_EVENT_PREFIX,
   APPROVALS_WATCHER_HEARTBEAT_FILE,
   APPROVALS_PROCESS_EPOCH_FILE,
   parsePendingApprovalRecord,
@@ -1420,4 +1421,189 @@ test("an old process control cannot clear a current session denial; a current co
   writeControl({ sessionId: SESSION_A.sessionId, denyId: approvals.denyState().id });
   await sleep(60);
   expect(sessionDenyActive(approvals)).toBe(false);
+});
+
+describe("headless session writes (spec §3.5)", () => {
+  const HEADLESS_A: ApprovalRequestSession = { ...SESSION_A, launchMode: "headless" };
+
+  function headlessEvents(lines: string[]): Record<string, unknown>[] {
+    return lines
+      .filter((line) => line.startsWith(APPROVAL_HEADLESS_DENIED_EVENT_PREFIX))
+      .map((line) => JSON.parse(line.slice(APPROVAL_HEADLESS_DENIED_EVENT_PREFIX.length)) as Record<string, unknown>);
+  }
+
+  test("with a fresh watcher a headless ask write is denied at once and leaves no pending record", async () => {
+    attachWatcher();
+    const lines: string[] = [];
+    const approvals = manager({ log: (line) => lines.push(line) });
+    const startedAt = Date.now();
+    await expect(approvals.hold(holdInput({ principal: HEADLESS_A, path: "/v1/things?token=secret" })))
+      .resolves.toEqual({ kind: "headless-denied" });
+    expect(Date.now() - startedAt).toBeLessThan(500);
+    await sleep(50);
+    expect(pendingIds()).toEqual([]);
+    const events = headlessEvents(lines);
+    expect(events).toEqual([{
+      v: 1,
+      ts: expect.any(String),
+      sessionId: HEADLESS_A.sessionId,
+      host: "api.example.com",
+      method: "POST",
+      path: "/v1/things",
+      category: "method",
+    }]);
+    // The event names the session by its public id, never by the principal key.
+    expect(lines.join("\n")).not.toContain(HEADLESS_A.sessionKey);
+    expect(lines.some((line) => line.startsWith("proxy-approval-request: "))).toBe(false);
+  });
+
+  test("the same write from an interactive session is held with a pending record", async () => {
+    attachWatcher();
+    const lines: string[] = [];
+    const approvals = manager({ log: (line) => lines.push(line) });
+    const held = approvals.hold(holdInput({ principal: SESSION_A }));
+    await sleep(50);
+    expect(pendingIds()).toHaveLength(1);
+    expect(headlessEvents(lines)).toEqual([]);
+    writeDecision(pendingIds()[0], { decision: "deny" });
+    await expect(held).resolves.toEqual({ kind: "denied" });
+  });
+
+  test("an MCP headless denial carries the bounded MCP context", async () => {
+    attachWatcher();
+    const lines: string[] = [];
+    const approvals = manager({ log: (line) => lines.push(line) });
+    await expect(approvals.hold({ ...mcpHoldInput(DESTRUCTIVE_TOOL), principal: HEADLESS_A }))
+      .resolves.toEqual({ kind: "headless-denied" });
+    expect(pendingIds()).toEqual([]);
+    expect(headlessEvents(lines)).toEqual([expect.objectContaining({
+      sessionId: HEADLESS_A.sessionId,
+      host: MCP_HOST,
+      category: "mcp-tool",
+      mcp: DESTRUCTIVE_TOOL,
+    })]);
+  });
+
+  test("the headless check wins over a standing session deny", async () => {
+    attachWatcher();
+    const approvals = manager();
+    await denyAllWrites(approvals);
+    // Same session key, so the session deny would match if it ran first.
+    await expect(approvals.hold(holdInput({ principal: HEADLESS_A }))).resolves.toEqual({ kind: "headless-denied" });
+  });
+
+  test("the headless check wins over a scoped MCP deny", async () => {
+    attachWatcher();
+    const approvals = manager();
+    await denyMcpTool(approvals, DESTRUCTIVE_TOOL);
+    await expect(approvals.hold({ ...mcpHoldInput(DESTRUCTIVE_TOOL), principal: HEADLESS_A }))
+      .resolves.toEqual({ kind: "headless-denied" });
+  });
+
+  test("the headless check wins over the held-connection cap", async () => {
+    attachWatcher();
+    const approvals = manager({ maxHeld: 1 });
+    const held = approvals.hold(holdInput({ path: "/one" }));
+    await sleep(50);
+    expect(pendingIds()).toHaveLength(1);
+    await expect(approvals.hold(holdInput({ path: "/two" }))).resolves.toEqual({ kind: "capacity" });
+    await expect(approvals.hold(holdInput({ principal: HEADLESS_A, path: "/two" })))
+      .resolves.toEqual({ kind: "headless-denied" });
+    expect(pendingIds()).toHaveLength(1);
+    writeDecision(pendingIds()[0], { decision: "deny" });
+    await expect(held).resolves.toEqual({ kind: "denied" });
+  });
+
+  test("the headless check wins over a missing watcher", async () => {
+    const approvals = manager();
+    await expect(approvals.hold(holdInput())).resolves.toEqual({ kind: "no-watcher" });
+    await expect(approvals.hold(holdInput({ principal: HEADLESS_A }))).resolves.toEqual({ kind: "headless-denied" });
+    expect(pendingIds()).toEqual([]);
+  });
+
+  test("a disposed manager still answers shutdown and logs no headless event", async () => {
+    attachWatcher();
+    const lines: string[] = [];
+    const approvals = manager({ log: (line) => lines.push(line) });
+    approvals.dispose();
+    await expect(approvals.hold(holdInput({ principal: HEADLESS_A })))
+      .resolves.toEqual({ kind: "cancelled", reason: "shutdown" });
+    expect(headlessEvents(lines)).toEqual([]);
+  });
+
+  test("the WebSocket retry path writes no pending record for a headless session and logs one event", async () => {
+    attachWatcher();
+    const lines: string[] = [];
+    const approvals = manager({ log: (line) => lines.push(line) });
+    const input = {
+      host: "ws.example.com",
+      method: "GET",
+      path: "/live",
+      category: "websocket" as const,
+      tokenNames: [],
+      revalidate: () => true,
+    };
+    approvals.notePendingRetryApproval({ ...input, principal: HEADLESS_A });
+    await sleep(50);
+    expect(pendingIds()).toEqual([]);
+    expect(headlessEvents(lines)).toEqual([expect.objectContaining({
+      sessionId: HEADLESS_A.sessionId,
+      host: "ws.example.com",
+      method: "GET",
+      path: "/live",
+      category: "websocket",
+    })]);
+    // An interactive session on the same path still gets its retry approval.
+    approvals.notePendingRetryApproval({ ...input, principal: SESSION_A });
+    await sleep(50);
+    expect(pendingIds()).toHaveLength(1);
+    expect(headlessEvents(lines)).toHaveLength(1);
+  });
+
+  test("the WebSocket retry path logs the headless event even when the held-connection cap is full", async () => {
+    attachWatcher();
+    const lines: string[] = [];
+    const approvals = manager({ maxHeld: 1, log: (line) => lines.push(line) });
+    const held = approvals.hold(holdInput({ path: "/one" }));
+    await sleep(50);
+    approvals.notePendingRetryApproval({
+      host: "ws.example.com",
+      method: "GET",
+      path: "/live",
+      category: "websocket",
+      tokenNames: [],
+      principal: HEADLESS_A,
+      revalidate: () => true,
+    });
+    expect(headlessEvents(lines)).toHaveLength(1);
+    expect(pendingIds()).toHaveLength(1);
+    writeDecision(pendingIds()[0], { decision: "deny" });
+    await expect(held).resolves.toEqual({ kind: "denied" });
+  });
+
+  test("repeated denials past the denial emitter's repeat limit each log one event with the session id", async () => {
+    attachWatcher();
+    const lines: string[] = [];
+    const approvals = manager({ log: (line) => lines.push(line) });
+    for (let index = 0; index < 25; index += 1) {
+      await expect(approvals.hold(holdInput({ principal: HEADLESS_A }))).resolves.toEqual({ kind: "headless-denied" });
+    }
+    const events = headlessEvents(lines);
+    expect(events).toHaveLength(25);
+    for (const event of events) expect(event.sessionId).toBe(HEADLESS_A.sessionId);
+    expect(pendingIds()).toEqual([]);
+  });
+
+  test("a decision file that names no pending hold cannot approve a headless write", async () => {
+    attachWatcher();
+    const approvals = manager();
+    const forgedId = "f".repeat(32);
+    writeDecision(forgedId, { decision: "approve", scope: "session" });
+    await sleep(60);
+    await expect(approvals.hold(holdInput({ principal: HEADLESS_A }))).resolves.toEqual({ kind: "headless-denied" });
+    await sleep(60);
+    expect(approvals.hasGrant(detailsFor({ host: "api.example.com", method: "POST", path: "/v1/things" }), HEADLESS_A))
+      .toBe(false);
+    expect(approvals.grantSummaries()).toEqual([]);
+  });
 });

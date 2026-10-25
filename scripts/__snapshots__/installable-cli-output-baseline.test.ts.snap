@@ -459,6 +459,21 @@ The person operating Runfree can decide the pending approvals with
 \`runfree approvals\`, then retry the request.
 Current rules: runfree host explain api.example.com
 ",
+  "write-approval-headless-denied": "Runfree blocked this request.
+
+  host:   api.example.com
+  method: POST
+  path:   /api/v1/things
+  reason: writes that need approval are denied in an unattended run
+
+This session runs without a person to approve writes, so a write that
+needs approval is denied at once. Retrying does not help. The person
+operating Runfree can review this host's write rule for later runs:
+
+  runfree host rules api.example.com
+
+Current rules: runfree host explain api.example.com
+",
   "write-approval-required": "Runfree blocked this request.
 
   host:   api.example.com

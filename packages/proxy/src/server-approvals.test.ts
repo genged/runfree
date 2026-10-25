@@ -6,6 +6,7 @@ import path from "node:path";
 import { describe, expect, test } from "vitest";
 
 import {
+  APPROVAL_HEADLESS_DENIED_EVENT_PREFIX,
   APPROVALS_WATCHER_HEARTBEAT_FILE,
   APPROVALS_PROCESS_EPOCH_FILE,
   parsePendingApprovalRecord,
@@ -84,12 +85,17 @@ function writeDecision(dirs: ApprovalDirs, id: string, fields: Record<string, un
   })}\n`);
 }
 
-async function startAskProxy(dirs: ApprovalDirs, policy: unknown = askPolicy()): Promise<{ proxy: RunningProxy; upstream: Awaited<ReturnType<typeof startHttpsUpstream>> }> {
+async function startAskProxy(
+  dirs: ApprovalDirs,
+  policy: unknown = askPolicy(),
+  sessionFile: Parameters<typeof startProxy>[0]["sessionFile"] = undefined,
+): Promise<{ proxy: RunningProxy; upstream: Awaited<ReturnType<typeof startHttpsUpstream>> }> {
   const upstream = await startHttpsUpstream();
   const proxy = await startProxy({
     extraEnv: approvalEnv(dirs),
     policy,
     secretFiles: { example: "real-proxy-token\n" },
+    ...(sessionFile !== undefined ? { sessionFile } : {}),
   });
   if (fs.existsSync(path.join(dirs.decisionsDir, APPROVALS_WATCHER_HEARTBEAT_FILE))) attachWatcher(dirs);
   return { proxy, upstream };
@@ -121,6 +127,45 @@ describe("proxy server approve-on-write", () => {
       targetPort: upstream.port,
       path: "/v1/things",
     });
+    expect(read.statusCode).toBe(200);
+    expect(upstream.requests).toHaveLength(1);
+  }, 20_000);
+
+  test("a headless session's ask write gets an immediate 403 with a fresh watcher, no pending record, and no upstream contact", async () => {
+    const dirs = approvalDirs();
+    attachWatcher(dirs);
+    // startAskProxy refreshes the heartbeat for this proxy's approval epoch.
+    const { proxy, upstream } = await startAskProxy(dirs, askPolicy(), { launchMode: "headless" });
+
+    const startedAt = Date.now();
+    const denied = await httpsViaProxy({
+      proxyPort: proxy.port,
+      targetPort: upstream.port,
+      method: "POST",
+      path: "/v1/things?token=secret",
+      headers: { Authorization: "Bearer agent-forged" },
+      body: "payload",
+    });
+    expect(denied.statusCode).toBe(403);
+    expect(denied.raw).toContain("x-runfree-blocked: write-approval-headless-denied");
+    expect(denied.body).toContain("writes that need approval are denied in an unattended run");
+    expect(Date.now() - startedAt).toBeLessThan(4_000);
+    expect(upstream.requests).toHaveLength(0);
+    expect(denied.raw).not.toContain("real-proxy-token");
+    expect(fs.readdirSync(dirs.pendingDir).filter((entry) => entry.endsWith(".json"))).toEqual([]);
+    await proxy.waitForOutput(`${APPROVAL_HEADLESS_DENIED_EVENT_PREFIX}{"v":1`);
+    const eventLine = proxy.output().split("\n").find((line) => line.startsWith(APPROVAL_HEADLESS_DENIED_EVENT_PREFIX));
+    expect(JSON.parse(eventLine?.slice(APPROVAL_HEADLESS_DENIED_EVENT_PREFIX.length) ?? "null")).toMatchObject({
+      sessionId: "rf-20260805-aaaaaa",
+      host: "127.0.0.1",
+      method: "POST",
+      path: "/v1/things",
+      category: "method",
+    });
+    expect(proxy.output()).not.toContain("proxy-approval-request: ");
+
+    // Reads still flow, with the credential injected.
+    const read = await httpsViaProxy({ proxyPort: proxy.port, targetPort: upstream.port, path: "/v1/things" });
     expect(read.statusCode).toBe(200);
     expect(upstream.requests).toHaveLength(1);
   }, 20_000);
