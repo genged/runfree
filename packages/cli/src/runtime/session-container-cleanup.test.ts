@@ -9,6 +9,7 @@ import {
   creationAuthorizedSessionContainerRemoveCommand,
   creationAuthorizedSessionContainerStopCommand,
   executeSessionContainerCleanupCommand,
+  executeSessionContainerCleanupCommandAsync,
   executeSessionContainerCreate,
   proveSessionContainerAbsent,
   removeAbsentSessionContainerRecordV2,
@@ -269,6 +270,54 @@ describe("pre-admission session-container cleanup authority", () => {
     ]);
     expect(remove.args).not.toContain("--force");
   });
+
+  // Headless-run spec §3.5 step 2: a cancelled run stops with the normal
+  // grace, and a second signal shortens it, down to none at all.
+  test("a creation-authorized stop takes a bounded whole-second grace", async () => {
+    const created = createAuthority();
+    const calls: string[][] = [];
+    const executor: SessionContainerCleanupExecutor = (_executable, args) => {
+      calls.push([...args]);
+      return success();
+    };
+    for (const graceSeconds of [0, 3, 10]) {
+      executeSessionContainerCleanupCommand(
+        creationAuthorizedSessionContainerStopCommand(created.record, SESSION_TEST_PROJECT, created.receipt, { graceSeconds }),
+        executor,
+      );
+    }
+    expect(calls).toEqual([
+      ["container", "stop", "--time", "0", CONTAINER_ID],
+      ["container", "stop", "--time", "3", CONTAINER_ID],
+      ["container", "stop", "--time", "10", CONTAINER_ID],
+    ]);
+
+    // The async twin spends the same sealed command, and only a sealed one.
+    const asyncCalls: string[][] = [];
+    const asyncExecutor = vi.fn(async (_executable: "docker", args: readonly string[]) => {
+      asyncCalls.push([...args]);
+      return success();
+    });
+    const stop = creationAuthorizedSessionContainerStopCommand(created.record, SESSION_TEST_PROJECT, created.receipt, { graceSeconds: 0 });
+    await expect(executeSessionContainerCleanupCommandAsync(stop, asyncExecutor)).resolves.toEqual(success());
+    expect(asyncCalls).toEqual([["container", "stop", "--time", "0", CONTAINER_ID]]);
+    expect(() => executeSessionContainerCleanupCommandAsync({ ...stop } as SessionContainerCleanupCommand, asyncExecutor))
+      .toThrow("unsealed");
+    expect(asyncExecutor).toHaveBeenCalledTimes(1);
+  });
+
+  test.each([11, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY])(
+    "refuses a stop grace of %s before building a command",
+    (graceSeconds) => {
+      const created = createAuthority();
+      expect(() => creationAuthorizedSessionContainerStopCommand(
+        created.record,
+        SESSION_TEST_PROJECT,
+        created.receipt,
+        { graceSeconds },
+      )).toThrow("stop grace");
+    },
+  );
 
   test("rejects creation-authorized cleanup for a forged receipt or different incarnation", () => {
     const first = createAuthority();

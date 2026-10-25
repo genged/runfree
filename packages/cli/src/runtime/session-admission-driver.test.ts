@@ -50,6 +50,7 @@ const mocks = vi.hoisted(() => ({
   creationAuthorizedStop: vi.fn(),
   creationAuthorizedRemove: vi.fn(),
   cleanupCommand: vi.fn(),
+  cleanupCommandAsync: vi.fn(),
   createContainer: vi.fn(),
   proveAbsent: vi.fn(),
   proveOrphanAbsent: vi.fn(),
@@ -169,6 +170,7 @@ vi.mock("./session-container-cleanup.ts", () => ({
   creationAuthorizedSessionContainerStopCommand: mocks.creationAuthorizedStop,
   creationAuthorizedSessionContainerRemoveCommand: mocks.creationAuthorizedRemove,
   executeSessionContainerCleanupCommand: mocks.cleanupCommand,
+  executeSessionContainerCleanupCommandAsync: mocks.cleanupCommandAsync,
   executeSessionContainerCreate: mocks.createContainer,
   proveSessionContainerAbsent: mocks.proveAbsent,
   proveSessionContainerOrphanAbsent: mocks.proveOrphanAbsent,
@@ -299,7 +301,7 @@ import { sessionRegistryDigest } from "./launch-handoff.ts";
 import { StalePreparedRuntimeError, type LaunchHandoff } from "./prepared-runtime.ts";
 import { createInternalSessionAdmissionDriver, SESSION_HANDOFF_WAIT_CEILING_MS } from "./session-admission-driver.ts";
 import { LAUNCH_LOCK_HOLD_BUDGET_MS } from "./launch-lock-hold.ts";
-import { SessionTeardownIncompleteError } from "./session-admission-probe.ts";
+import { SessionLaunchCancelledError, SessionTeardownIncompleteError } from "./session-admission-probe.ts";
 import { flushWarnings, setOutputWriterForTest } from "../warnings.ts";
 import type { ActiveRuntimePlan } from "./plan.ts";
 import {
@@ -704,10 +706,10 @@ beforeEach(() => {
     if (mocks.failRunningProof) throw new Error("running proof failed closed");
     return { record: provisioning };
   });
-  mocks.creationAuthorizedStop.mockReturnValue({
+  mocks.creationAuthorizedStop.mockImplementation((_record, _project, _receipt, options?: { graceSeconds?: number }) => ({
     executable: "docker",
-    args: ["container", "stop", "--time", "10", CONTAINER_ID],
-  });
+    args: ["container", "stop", "--time", String(options?.graceSeconds ?? 10), CONTAINER_ID],
+  }));
   mocks.creationAuthorizedRemove.mockReturnValue({
     executable: "docker",
     args: ["container", "rm", CONTAINER_ID],
@@ -737,6 +739,7 @@ beforeEach(() => {
   });
   mocks.orphanRemove.mockReturnValue({ executable: "docker", args: ["container", "rm", CONTAINER_ID] });
   mocks.cleanupCommand.mockImplementation((command, execute) => execute(command.executable, command.args));
+  mocks.cleanupCommandAsync.mockImplementation((command, execute, options) => execute(command.executable, command.args, options));
   mocks.proveOrphanAbsent.mockImplementation(ordered("prove-orphan-absent"));
 });
 
@@ -4904,6 +4907,287 @@ describe("session admission under the per-session file source", () => {
         expect(output.drain().filter((line) => line.includes("had to release the project lifecycle lock"))).toHaveLength(1);
       } finally {
         output.restore();
+      }
+    });
+  });
+  // Headless-run spec §3.5 "Stop routine": cancellation goes through the
+  // driver, so the session file goes first, the exact container is stopped
+  // under its creation receipt without blocking a second signal, and the
+  // attached wait never spends a re-attach on a cancelled session.
+  describe("cancellation", () => {
+    function cancellable() {
+      const signal = new AbortController();
+      const escalate = new AbortController();
+      return {
+        cancellation: Object.freeze({ signal: signal.signal, escalate: escalate.signal }),
+        cancel: () => signal.abort(),
+        escalate: () => escalate.abort(),
+      };
+    }
+
+    /**
+     * Gives the fixture IO an async capture whose calls are recorded as
+     * `async <label>`. Each call answers through `answer`, which may hold it.
+     */
+    function withAsyncCapture(
+      io: RuntimeIO,
+      answer: (label: string) => Promise<{ status: number; stdout: string; stderr: string }> = async () => ({ status: 0, stdout: "", stderr: "" }),
+    ): Mock {
+      const captureAsync = vi.fn(async (_command: string, args: string[]) => {
+        const label = `async ${effectLabel(args)}`;
+        mocks.events.push(label);
+        return await answer(label);
+      });
+      io.captureAsync = captureAsync as unknown as RuntimeIO["captureAsync"];
+      return captureAsync;
+    }
+
+    const STOP_10 = `docker:container stop --time 10 ${CONTAINER_ID}`;
+    const STOP_0 = `docker:container stop --time 0 ${CONTAINER_ID}`;
+
+    test("a cancel before the launch starts throws before preflight, any record, or any Docker call", async () => {
+      const input = fixture();
+      const captureAsync = withAsyncCapture(input.io);
+      const control = cancellable();
+      control.cancel();
+      const driver = createInternalSessionAdmissionDriver(input);
+
+      await expect(driver.launchBuiltin("codex", { cancellation: control.cancellation }))
+        .rejects.toBeInstanceOf(SessionLaunchCancelledError);
+      expect(mocks.events).not.toContain("preflight");
+      expect(input.io.capture).not.toHaveBeenCalled();
+      expect(captureAsync).not.toHaveBeenCalled();
+      expect(mocks.writeRecord).not.toHaveBeenCalled();
+      expect(mocks.writeSessionMetadata).not.toHaveBeenCalled();
+    });
+
+    test("a cancel during preflight throws before allocation: no record, no create", async () => {
+      const input = fixture();
+      const control = cancellable();
+      const preflight = mocks.createPreflight.getMockImplementation();
+      mocks.createPreflight.mockImplementationOnce((...args: unknown[]) => {
+        control.cancel();
+        return preflight?.(...args);
+      });
+      const driver = createInternalSessionAdmissionDriver(input);
+
+      await expect(driver.launchBuiltin("codex", { cancellation: control.cancellation }))
+        .rejects.toBeInstanceOf(SessionLaunchCancelledError);
+      expect(mocks.events).toContain("preflight");
+      expect(mocks.events).not.toContain("allocate");
+      expect(mocks.writeRecord).not.toHaveBeenCalled();
+      expect(mocks.createContainer).not.toHaveBeenCalled();
+    });
+
+    test.each([
+      ["the normal grace", false, STOP_10],
+      ["no grace after a second signal", true, STOP_0],
+    ])("a cancel after the start, before activation, cleans the exact container up unadmitted with %s", async (_name, escalated, stop) => {
+      const input = fixture();
+      const control = cancellable();
+      const start = mocks.startForeground.getMockImplementation();
+      mocks.startForeground.mockImplementationOnce(async (...args: unknown[]) => {
+        control.cancel();
+        if (escalated) control.escalate();
+        return await start?.(...args);
+      });
+      const driver = createInternalSessionAdmissionDriver(input);
+
+      await expect(driver.launchBuiltin("codex", { cancellation: control.cancellation }))
+        .rejects.toBeInstanceOf(SessionLaunchCancelledError);
+      expect(mocks.events).not.toContain("running-proof");
+      expect(mocks.events).not.toContain("session-file:write");
+      const stopAt = mocks.events.indexOf(stop);
+      expect(stopAt).toBeGreaterThan(mocks.events.indexOf("start-foreground"));
+      expect(mocks.events.indexOf(`docker:container rm ${CONTAINER_ID}`)).toBeGreaterThan(stopAt);
+      expect(mocks.events.indexOf("remove-record")).toBeGreaterThan(mocks.events.indexOf("prove-absent"));
+      expect(mocks.cancelForeground).toHaveBeenCalledTimes(1);
+      // Interrupted host evidence survives a cancelled launch, like any other.
+      expect(mocks.markSessionInterrupted).toHaveBeenCalledTimes(1);
+    });
+
+    test("a cancel while attached deletes the session file, then stops the exact container, then tears down", async () => {
+      const input = fixture();
+      mocks.containerInspect = { status: 0, stdout: runningInspect(), stderr: "" };
+      const finishForeground = heldForeground();
+      const captureAsync = withAsyncCapture(input.io, async (label) => {
+        // The container stopping is what ends the attached stream.
+        if (label === `async ${STOP_10}`) finishForeground({ kind: "exit", code: 143, signal: null });
+        return { status: 0, stdout: "", stderr: "" };
+      });
+      const control = cancellable();
+      const driver = createInternalSessionAdmissionDriver({
+        ...input,
+        sessionLockManager: orderedSessionLockManager(input.sessionLockManager),
+        nowEpochMs: () => Date.parse("2026-08-09T00:10:00.000Z"),
+      });
+
+      const launch = driver.launchBuiltin("codex", { cancellation: control.cancellation });
+      await vi.waitFor(() => expect(mocks.events).toContain("release-attached-lock"));
+      const attachedAt = mocks.events.length;
+      control.cancel();
+
+      await expect(launch).resolves.toEqual({ status: 143, signal: null, cancelled: true });
+      const after = mocks.events.slice(attachedAt).filter((event) => event.startsWith("docker:")
+        || event.startsWith("async ")
+        || event.startsWith("session-file:")
+        || event.startsWith("remove-exact-record")
+        || event === "stamp-revoking"
+        || event === "reacquire-teardown-lock");
+      expect(after).toEqual([
+        // The stop routine, with the lifecycle lock still released.
+        "stamp-revoking",
+        "session-file:delete",
+        `async ${STOP_10}`,
+        // Then the ordinary teardown, under the reacquired lock.
+        "reacquire-teardown-lock",
+        "stamp-revoking",
+        "session-file:delete",
+        `docker:container inspect ${CONTAINER_ID}`,
+        `docker:network disconnect ${NETWORK_ID} ${CONTAINER_ID}`,
+        STOP_10,
+        `docker:container rm --force ${CONTAINER_ID}`,
+        "remove-exact-record:rf-20260809-abcdef",
+      ]);
+      expect(captureAsync).toHaveBeenCalledTimes(1);
+      expect(captureAsync.mock.calls[0]?.[2]).toMatchObject({ timeout: expect.any(Number), killSignal: "SIGKILL" });
+      expect(mocks.creationAuthorizedStop).toHaveBeenCalledWith(
+        expect.objectContaining({ state: "attached", containerId: CONTAINER_ID }),
+        EXPECTED_PROJECT,
+        { containerId: CONTAINER_ID },
+        { graceSeconds: 10 },
+      );
+      expect(mocks.markSessionInterrupted).toHaveBeenCalledTimes(1);
+    });
+
+    test("a second signal during the stop issues a no-grace stop while the first is still pending", async () => {
+      const input = fixture();
+      mocks.containerInspect = { status: 0, stdout: runningInspect(), stderr: "" };
+      const finishForeground = heldForeground();
+      let finishFirstStop!: () => void;
+      const captureAsync = withAsyncCapture(input.io, (label) => {
+        if (label === `async ${STOP_10}`) {
+          return new Promise((resolve) => { finishFirstStop = () => resolve({ status: 0, stdout: "", stderr: "" }); });
+        }
+        finishForeground({ kind: "exit", code: 137, signal: null });
+        return Promise.resolve({ status: 0, stdout: "", stderr: "" });
+      });
+      const control = cancellable();
+      const driver = createInternalSessionAdmissionDriver({
+        ...input,
+        sessionLockManager: orderedSessionLockManager(input.sessionLockManager),
+      });
+
+      const launch = driver.launchBuiltin("codex", { cancellation: control.cancellation });
+      let settled = false;
+      launch.then(() => { settled = true; }, () => { settled = true; });
+      await vi.waitFor(() => expect(mocks.events).toContain("release-attached-lock"));
+      control.cancel();
+      await vi.waitFor(() => expect(captureAsync).toHaveBeenCalledTimes(1));
+      expect(settled).toBe(false);
+
+      control.escalate();
+      await vi.waitFor(() => expect(captureAsync).toHaveBeenCalledTimes(2));
+      expect(mocks.events.filter((event) => event.startsWith("async "))).toEqual([`async ${STOP_10}`, `async ${STOP_0}`]);
+      // The launch waits for both stops before its teardown.
+      expect(mocks.events).not.toContain("reacquire-teardown-lock");
+      finishFirstStop();
+
+      await expect(launch).resolves.toEqual({ status: 137, signal: null, cancelled: true });
+      expect(mocks.events.indexOf("reacquire-teardown-lock")).toBeGreaterThan(mocks.events.indexOf(`async ${STOP_0}`));
+    });
+
+    test("a second signal before the stop begins stops without any grace", async () => {
+      const input = fixture();
+      mocks.containerInspect = { status: 0, stdout: runningInspect(), stderr: "" };
+      const finishForeground = heldForeground();
+      withAsyncCapture(input.io, async () => {
+        finishForeground({ kind: "exit", code: 137, signal: null });
+        return { status: 0, stdout: "", stderr: "" };
+      });
+      const control = cancellable();
+      const driver = createInternalSessionAdmissionDriver({
+        ...input,
+        sessionLockManager: orderedSessionLockManager(input.sessionLockManager),
+      });
+
+      const launch = driver.launchBuiltin("codex", { cancellation: control.cancellation });
+      await vi.waitFor(() => expect(mocks.events).toContain("release-attached-lock"));
+      control.cancel();
+      control.escalate();
+      await expect(launch).resolves.toEqual({ status: 137, signal: null, cancelled: true });
+      expect(mocks.events.filter((event) => event.startsWith("async "))).toEqual([`async ${STOP_0}`]);
+    });
+
+    test("a stream lost after the cancel is never re-attached", async () => {
+      const input = fixture();
+      mocks.containerInspect = { status: 0, stdout: runningInspect(), stderr: "" };
+      const foreground = attachableForeground();
+      withAsyncCapture(input.io, async () => {
+        // Docker drops the attach stream without the container's code.
+        foreground.end({ kind: "exit", code: null, signal: "SIGHUP" });
+        return { status: 0, stdout: "", stderr: "" };
+      });
+      const control = cancellable();
+      const driver = createInternalSessionAdmissionDriver({
+        ...input,
+        sessionLockManager: orderedSessionLockManager(input.sessionLockManager),
+      });
+
+      const launch = driver.launchBuiltin("codex", { cancellation: control.cancellation });
+      await vi.waitFor(() => expect(mocks.events).toContain("release-attached-lock"));
+      control.cancel();
+      await expect(launch).resolves.toEqual({ status: null, signal: "SIGHUP", cancelled: true });
+      expect(foreground.reattaches()).toBe(0);
+      expect(mocks.attachCommand).not.toHaveBeenCalled();
+      expect(mocks.events).toContain("remove-exact-record:rf-20260809-abcdef");
+    });
+
+    test("a cancel while the entry has not handed off revokes, stops, and tears down without reporting attached", async () => {
+      const input = fixture();
+      mocks.transitionAttached.mockImplementation((value: FakeRecord) => {
+        mocks.events.push("transition-attached");
+        return { ...value, state: "attached" };
+      });
+      mocks.effectAnswers.set(TOP_LABEL, [{ status: 0, stdout: topListing("entry"), stderr: "" }]);
+      const foreground = attachableForeground();
+      withAsyncCapture(input.io, async () => {
+        foreground.end({ kind: "exit", code: 143, signal: null });
+        return { status: 0, stdout: "", stderr: "" };
+      });
+      const control = cancellable();
+      let polls = 0;
+      mocks.topCommand.mockImplementation(() => {
+        polls += 1;
+        if (polls === 2) control.cancel();
+        return { executable: "docker", args: ["container", "top", CONTAINER_ID, "-o", "pid,ppid,args"] };
+      });
+      const driver = createInternalSessionAdmissionDriver(input);
+
+      await expect(driver.launchBuiltin("codex", { cancellation: control.cancellation }))
+        .rejects.toBeInstanceOf(SessionLaunchCancelledError);
+      expect(mocks.transitionAttached).not.toHaveBeenCalled();
+      const write = mocks.events.indexOf("session-file:write");
+      const revoke = mocks.events.indexOf("session-file:delete");
+      const stop = mocks.events.indexOf(`async ${STOP_10}`);
+      expect(write).toBeGreaterThan(-1);
+      expect(revoke).toBeGreaterThan(write);
+      expect(stop).toBeGreaterThan(revoke);
+      expect(mocks.events.indexOf(`docker:container rm --force ${CONTAINER_ID}`)).toBeGreaterThan(stop);
+      expect(mocks.events.indexOf("remove-exact-record:rf-20260809-abcdef"))
+        .toBeGreaterThan(mocks.events.indexOf(`docker:container rm --force ${CONTAINER_ID}`));
+    });
+
+    test("an unfired cancellation, and no cancellation at all, issue no async stop and report the plain outcome", async () => {
+      for (const options of [{ cancellation: cancellable().cancellation }, {}]) {
+        mocks.events.length = 0;
+        const input = fixture();
+        mocks.containerInspect = { status: 0, stdout: runningInspect(), stderr: "" };
+        const captureAsync = withAsyncCapture(input.io);
+        const driver = createInternalSessionAdmissionDriver(input);
+        await expect(driver.launchBuiltin("codex", options)).resolves.toEqual({ status: 0, signal: null });
+        expect(captureAsync).not.toHaveBeenCalled();
+        expect(mocks.events.filter((event) => event === "stamp-revoking")).toHaveLength(1);
       }
     });
   });

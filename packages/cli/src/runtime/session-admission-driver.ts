@@ -63,11 +63,14 @@ import {
 
 import {
   waitForAttachedSessionCompletion,
+  type AttachedSessionCancellationPorts,
   type LostForegroundStreamDecision,
 } from "./session-attached-wait.ts";
+import { SESSION_CONTAINER_STOP_SECONDS } from "./session-container-contract.ts";
 import {
   runInternalSessionAdmissionLaunch,
   runInternalSessionAdmissionProbe,
+  SessionLaunchCancelledError,
   type SessionAdmissionLaunchOutcome,
   type SessionAdmissionLaunchSteps,
   type SessionAdmissionProbeAgent,
@@ -83,6 +86,7 @@ import {
   creationAuthorizedSessionContainerRemoveCommand,
   creationAuthorizedSessionContainerStopCommand,
   executeSessionContainerCleanupCommand,
+  executeSessionContainerCleanupCommandAsync,
   executeSessionContainerCreate,
   orphanSessionContainerRemoveCommand,
   orphanSessionContainerStopCommand,
@@ -309,6 +313,21 @@ const SESSION_HANDOFF_POLL_MS = 100;
  */
 const SESSION_HANDOFF_MIN_READ_MS = 250;
 
+/**
+ * How long a cancelled session's stream may take to end once its stop has
+ * settled. `docker container stop` returns only after the container stopped,
+ * so the attach child normally ends at once; a stream that does not is cut
+ * loose here and the ordinary teardown, which stops and removes the container
+ * again, decides whether the teardown is confirmed.
+ */
+const CANCELLED_STREAM_END_BOUND_MS = 5_000;
+/**
+ * The Docker client's own bound on one cancel stop, beyond the grace it asks
+ * Docker for. A stop that outlives it is killed and counts as not done
+ * (`docs/security.md` "Lifecycle" 2); the teardown that follows repeats it.
+ */
+const CANCEL_STOP_CLIENT_SLACK_MS = 20_000;
+
 class PostCompletionAdmissionRecoveryError extends Error {
   readonly outcome: SessionAdmissionLaunchOutcome;
 
@@ -374,7 +393,24 @@ export type SessionAdmissionLaunchOptions = Readonly<{
    * shell, before any effect.
    */
   headless?: Readonly<{ promptContainerPath: string; observer?: HeadlessLaunchObserver }>;
+  /**
+   * Cancels the launch (headless-run spec §3.5 "Stop routine").
+   *
+   * `signal` is checked before every ladder step, so a launch cancelled before
+   * it is attached throws `SessionLaunchCancelledError` and the ladder's own
+   * cleanup removes whatever exists. Once the session file may exist (the
+   * handoff wait and the attached wait), an abort runs the stop routine: the
+   * session file is deleted first, then the exact container is stopped under
+   * its creation receipt without blocking, with the normal grace. `escalate`
+   * shortens that grace: an abort of it issues a second stop with no grace,
+   * even while the first is still running. The attached wait spends no
+   * re-attach on a cancelled session, and its outcome carries `cancelled`.
+   */
+  cancellation?: SessionLaunchCancellation;
 }>;
+
+/** The abort pair a cancellable launch is given; see `SessionAdmissionLaunchOptions.cancellation`. */
+export type SessionLaunchCancellation = Readonly<{ signal: AbortSignal; escalate: AbortSignal }>;
 
 export type InternalSessionAdmissionDriver = Readonly<{
   /** Runs proof through provisioning, then always revokes it. Never activates. */
@@ -1163,6 +1199,89 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
     if (result.status !== 0) throw dockerFailure(label, result);
   }
 
+  /** Refuses the next ladder step of a cancelled launch (headless-run spec §3.5). */
+  #throwIfCancelled(step: string): void {
+    if (this.#launch?.cancellation?.signal.aborted) throw new SessionLaunchCancelledError(step);
+  }
+
+  /**
+   * Stop routine step 1 for a session whose file may exist: the terminal
+   * stamp, then the session file. The proxy stops serving the session at once
+   * rather than at its lease end. Never throws: the teardown that follows
+   * deletes the file again and stops on a delete it cannot prove.
+   */
+  #revokeForCancellation(record: SessionContainerRecordV2): void {
+    this.#stampSessionTerminal(record);
+    this.#deleteSessionFileBestEffort(record);
+  }
+
+  /**
+   * Stop routine step 2: stops the exact container under its creation receipt,
+   * without blocking the event loop, so a second signal can still shorten the
+   * grace while the first stop runs. Settles once every stop it issued has.
+   * Never rejects: the ordinary teardown that follows stops and removes the
+   * container again and is what confirms it.
+   */
+  async #stopForCancellation(record: SessionContainerRecordV2): Promise<void> {
+    const escalate = this.#launch?.cancellation?.escalate;
+    if (!escalate) return;
+    if (escalate.aborted) {
+      await this.#cancelStop(record, 0);
+      return;
+    }
+    let onEscalate: (() => void) | undefined;
+    const escalated = new Promise<"escalated">((resolve) => {
+      onEscalate = () => resolve("escalated");
+      escalate.addEventListener("abort", onEscalate, { once: true });
+    });
+    try {
+      const first = this.#cancelStop(record, SESSION_CONTAINER_STOP_SECONDS);
+      if (await Promise.race([first.then(() => "stopped" as const), escalated]) === "escalated") {
+        await Promise.all([first, this.#cancelStop(record, 0)]);
+      }
+    } finally {
+      if (onEscalate) escalate.removeEventListener("abort", onEscalate);
+    }
+  }
+
+  /** One creation-authorized stop with `graceSeconds`. Never rejects. */
+  async #cancelStop(record: SessionContainerRecordV2, graceSeconds: number): Promise<void> {
+    const receipt = this.#creationReceipt;
+    if (!receipt) return;
+    const label = "Docker did not stop the cancelled session container";
+    try {
+      const command = creationAuthorizedSessionContainerStopCommand(
+        record,
+        this.#projectIdentity(),
+        receipt,
+        { graceSeconds },
+      );
+      const options = {
+        ...this.#dockerOptions(),
+        timeout: graceSeconds * 1_000 + CANCEL_STOP_CLIENT_SLACK_MS,
+        killSignal: "SIGKILL" as const,
+      };
+      const io = this.#gateway.io;
+      const captureAsync = io.captureAsync;
+      const result = captureAsync
+        ? await executeSessionContainerCleanupCommandAsync(
+          command,
+          (executable, args, spawnOptions) => captureAsync(executable, [...args], spawnOptions),
+          options,
+        )
+        // An IO without an async capture cannot overlap the stop with a
+        // second signal; the grace it asked for still bounds it.
+        : executeSessionContainerCleanupCommand(
+          command,
+          (executable, args, spawnOptions) => io.capture(executable, [...args], spawnOptions),
+          options,
+        );
+      if (result.status !== 0) warn(`${dockerFailure(label, result).message}; its teardown stops it again`);
+    } catch (error) {
+      warn(`${label}: ${error instanceof Error ? error.message : String(error)}; its teardown stops it again`);
+    }
+  }
+
   #cleanExactOrphan(classification: Extract<SessionReconciliationClassification, { kind: "container-only" }>): void {
     const preflight = this.#require(this.#preflight, "canonical preflight");
     const authority = authorizeSessionContainerOrphanCleanup(
@@ -1405,6 +1524,7 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
   }
 
   preflight = async (): Promise<void> => {
+    this.#throwIfCancelled("preflight");
     this.#lock();
     const docker = createRuntimeDocker(this.#input.context, this.#gateway.io);
     let launch: SessionAdmissionPreflightLaunch;
@@ -1685,6 +1805,7 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
   }
 
   allocate = async (): Promise<void> => {
+    this.#throwIfCancelled("allocation");
     this.#lock();
     const preflight = this.#require(this.#preflight, "canonical preflight");
     const identity = this.#sessionDisplayIdentity();
@@ -1753,6 +1874,7 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
    * together replace the deleted pre-start network-target re-read.
    */
   createStarted = async (): Promise<void> => {
+    this.#throwIfCancelled("the session container was created");
     this.#lock();
     const plan = this.#require(this.#plan, "allocated create plan");
     const namedVolumeProof = this.#proveNamedVolumes(plan);
@@ -1858,6 +1980,7 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
   };
 
   proveRunning = async (): Promise<void> => {
+    this.#throwIfCancelled("the running proof");
     this.#lock();
     const provisioningPlan = this.#require(this.#plan, "provisioning create plan");
     const runningProof = await waitForRunningSessionContainerProof(
@@ -2142,6 +2265,13 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
     };
     for (;;) {
       this.#lock();
+      // The session file exists from here: a cancel runs the stop routine's
+      // first two steps itself, and the ladder's ordered teardown does the rest.
+      if (this.#launch?.cancellation?.signal.aborted) {
+        this.#revokeForCancellation(record);
+        await this.#stopForCancellation(record);
+        throw new SessionLaunchCancelledError("the entry handed off to the agent");
+      }
       if (foregroundEnded || currentSessionContainerForegroundCompletion(foreground)) break;
       const remaining = remainingMs();
       if (remaining <= 0) {
@@ -2199,6 +2329,7 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
    * that evidence once.
    */
   activate = async (): Promise<void> => {
+    this.#throwIfCancelled("activation");
     this.#lock();
     const provisioning = this.#require(this.#provisioningAuthorization, "provisioning-running authority");
     await this.#completeSessionIngress();
@@ -2257,6 +2388,63 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
   pendingTasks = (): number => this.#tasks.pending();
 
   /**
+   * The attached wait's cancellation ports, for a cancellable launch only.
+   *
+   * The stop acts on the record every beat re-proves, read when the stop
+   * runs, so a rebind adopted during the session is the one it stops. The
+   * outcome becomes this launch's foreground outcome, so the teardown's
+   * exited proof can still take the short path after a clean stop.
+   */
+  #attachedCancellation(): Readonly<{ ports: AttachedSessionCancellationPorts; dispose(): void }> | undefined {
+    const signal = this.#launch?.cancellation?.signal;
+    if (!signal) return undefined;
+    let dispose = (): void => {};
+    const requested = new Promise<void>((resolve) => {
+      if (signal.aborted) {
+        resolve();
+        return;
+      }
+      const onAbort = (): void => resolve();
+      signal.addEventListener("abort", onAbort, { once: true });
+      dispose = () => signal.removeEventListener("abort", onAbort);
+    });
+    const held = (): SessionContainerRecordV2 => this.#require(this.#fileRecord, "session file lifecycle record");
+    return Object.freeze({
+      dispose: () => dispose(),
+      ports: Object.freeze({
+        requested,
+        isRequested: () => signal.aborted,
+        revoke: () => {
+          try {
+            this.#revokeForCancellation(held());
+          } catch {
+            // Never throws by contract; the teardown deletes the file again.
+          }
+        },
+        stop: async () => {
+          let record: SessionContainerRecordV2;
+          try {
+            record = held();
+          } catch {
+            return;
+          }
+          await this.#stopForCancellation(record);
+        },
+        streamEndBoundMs: CANCELLED_STREAM_END_BOUND_MS,
+        reportCancelled: (completion: SessionContainerForegroundCompletion | undefined) => {
+          const exited = completion?.kind === "exit" ? completion : undefined;
+          this.#foregroundOutcome = Object.freeze({
+            status: exited ? exited.code : null,
+            signal: exited ? exited.signal : null,
+            cancelled: true as const,
+          });
+          return this.#foregroundOutcome;
+        },
+      }),
+    });
+  }
+
+  /**
    * Holds the session for the life of the attached process, beating its file.
    *
    * The heartbeat runs inside the wait rather than beside it because the file's
@@ -2274,6 +2462,7 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
     if (this.#preAttachCompletion) return this.#preAttachCompletion;
     const foreground = this.#require(this.#foreground, "foreground attach handle");
     const sessionLockManager = this.#input.sessionLockManager;
+    const cancellation = this.#attachedCancellation();
     const waitForCompletion = (): Promise<SessionAdmissionLaunchOutcome> => waitForAttachedSessionCompletion({
       foreground,
       cadenceMs: sessionHeartbeatCadenceMs(),
@@ -2305,6 +2494,7 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
         this.#foregroundOutcome = Object.freeze({ status, signal: null });
         return this.#foregroundOutcome;
       },
+      ...(cancellation ? { cancellation: cancellation.ports } : {}),
     });
 
     // The session file is durable and the proxy serves from it. The project
@@ -2319,6 +2509,8 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
       completion = { ok: true, outcome: await waitForCompletion() };
     } catch (error) {
       completion = { ok: false, error };
+    } finally {
+      cancellation?.dispose();
     }
     let recoveryFailure: unknown;
     try {
@@ -2405,11 +2597,10 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
       // a bound allocated record and a provisioning-running record whose
       // foreground start never converged tear down the same way.
       for (const [label, command] of [
-        ["Docker failed to stop the unadmitted session container", creationAuthorizedSessionContainerStopCommand(
-          record,
-          preflight.expectedProject,
-          this.#creationReceipt,
-        )],
+        ["Docker failed to stop the unadmitted session container", this.#launch?.cancellation?.escalate.aborted
+          // A second signal already asked for no grace (headless-run spec §3.5).
+          ? creationAuthorizedSessionContainerStopCommand(record, preflight.expectedProject, this.#creationReceipt, { graceSeconds: 0 })
+          : creationAuthorizedSessionContainerStopCommand(record, preflight.expectedProject, this.#creationReceipt)],
         ["Docker failed to remove the unadmitted session container", creationAuthorizedSessionContainerRemoveCommand(
           record,
           preflight.expectedProject,

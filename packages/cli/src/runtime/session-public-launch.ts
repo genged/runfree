@@ -26,6 +26,7 @@ import { LIFECYCLE_LOCK_WAITER_YIELD_MS, launchHandoffSpanFits } from "./launch-
 import {
   createInternalSessionAdmissionDriver,
   type SessionAdmissionLaunchOptions,
+  type SessionLaunchCancellation,
 } from "./session-admission-driver.ts";
 import {
   disposeLaunchHandoff,
@@ -37,6 +38,8 @@ import {
 } from "./prepared-runtime.ts";
 import {
   BUILTIN_SESSION_ADMISSION_PROBE_AGENTS,
+  SessionLaunchCancelledError,
+  type SessionAdmissionLaunchOutcome,
   type SessionAdmissionProbeAgent,
 } from "./session-admission-probe.ts";
 import type { SessionContainerForegroundSpawner } from "./session-container-start.ts";
@@ -108,29 +111,91 @@ export async function launchConfiguredAgentThroughAdmission(
   input: SessionPublicLaunchInput,
 ): Promise<number> {
   const agent = assertBuiltinLaunchAgent(input.agentName);
-  // Minted once per public launch, outside `withSessionLaunchFrame`'s retry
-  // loop, so an admission retry with a re-prepared runtime keeps the same
-  // conversation instead of starting a second one (spec §2, plan decision
-  // P1). Only an agent that declares the flag gets one; Codex has none.
-  const launchConversationId = builtinAgent(agent)?.launchConversationIdFlag
-    ? crypto.randomUUID()
-    : undefined;
+  const launchConversationId = mintLaunchConversationId(agent);
   return await withOutcomeLine(
     `${input.agentName} did not start`,
-    () => withSessionLaunchFrame(
+    async () => exitStatus(await withSessionLaunchFrame(
       input,
       (driver) => driver.launchBuiltin(agent, {
         ...(launchConversationId !== undefined ? { launchConversationId } : {}),
         ...(input.headless ? { headless: input.headless } : {}),
       }),
-    ),
+    )),
   );
+}
+
+/**
+ * Minted once per public launch, outside `withSessionLaunchFrame`'s retry
+ * loop, so an admission retry with a re-prepared runtime keeps the same
+ * conversation instead of starting a second one (spec §2, plan decision P1).
+ * Only an agent that declares the flag gets one; Codex has none.
+ */
+function mintLaunchConversationId(agent: SessionAdmissionProbeAgent): string | undefined {
+  return builtinAgent(agent)?.launchConversationIdFlag ? crypto.randomUUID() : undefined;
+}
+
+/** A non-numeric exit (signal death, lost stream) maps to 1. */
+function exitStatus(outcome: Readonly<{ status: number | null }>): number {
+  return typeof outcome.status === "number" ? outcome.status : 1;
+}
+
+export type SessionHeadlessLaunchInput = Omit<SessionPublicLaunchInput, "headless"> & Readonly<{
+  headless: NonNullable<SessionAdmissionLaunchOptions["headless"]>;
+  /**
+   * The run's abort pair (headless-run spec §3.5): `signal` starts the stop
+   * routine inside the driver, `escalate` shortens its stop grace to none.
+   */
+  cancellation: SessionLaunchCancellation;
+}>;
+
+export type SessionHeadlessLaunchResult = Readonly<{
+  /**
+   * The agent's exit status, or null when it has none: a signal death, a
+   * stream that ended without one, or a launch cancelled before it attached.
+   * Never mapped, so the caller's outcome rule can tell "lost" from "1".
+   */
+  status: number | null;
+  /** Whether the launch's cancellation ended it. */
+  cancelled: boolean;
+}>;
+
+/**
+ * Launches one built-in agent as a headless run (headless-run spec §3.3).
+ *
+ * The same frame, lock, and driver as an interactive launch, plus the run's
+ * cancellation. A launch cancelled before it attached (`SessionLaunchCancelledError`
+ * from a ladder step, whose cleanup completed) is reported as cancelled; a
+ * cancelled launch whose cleanup also failed propagates its aggregate, so the
+ * caller never reads an unconfirmed teardown as a clean cancel.
+ */
+export async function launchHeadlessAgentThroughAdmission(
+  input: SessionHeadlessLaunchInput,
+): Promise<SessionHeadlessLaunchResult> {
+  const agent = assertBuiltinLaunchAgent(input.agentName);
+  const launchConversationId = mintLaunchConversationId(agent);
+  try {
+    const outcome = await withOutcomeLine(
+      `${input.agentName} did not start`,
+      () => withSessionLaunchFrame<SessionAdmissionLaunchOutcome>(
+        input,
+        (driver) => driver.launchBuiltin(agent, {
+          ...(launchConversationId !== undefined ? { launchConversationId } : {}),
+          headless: input.headless,
+          cancellation: input.cancellation,
+        }),
+      ),
+    );
+    return Object.freeze({ status: outcome.status, cancelled: outcome.cancelled === true });
+  } catch (error) {
+    if (error instanceof SessionLaunchCancelledError) return Object.freeze({ status: null, cancelled: true });
+    throw error;
+  }
 }
 
 // Outcome-first failure text (contract D5): a refusal anywhere in the launch
 // ladder ends with what did not happen in the user's nouns. Only refusals are
 // annotated; unexpected errors keep their own rendering.
-async function withOutcomeLine(outcome: string, launch: () => Promise<number>): Promise<number> {
+async function withOutcomeLine<T>(outcome: string, launch: () => Promise<T>): Promise<T> {
   try {
     return await launch();
   } catch (error) {
@@ -160,16 +225,16 @@ export type SessionPublicShellInput = Readonly<{
 export async function launchShellThroughAdmission(input: SessionPublicShellInput): Promise<number> {
   return await withOutcomeLine(
     "the shell session did not start",
-    () => withSessionLaunchFrame(input, (driver) => driver.launchShell()),
+    async () => exitStatus(await withSessionLaunchFrame(input, (driver) => driver.launchShell())),
   );
 }
 
 type SessionLaunchDriver = ReturnType<typeof createInternalSessionAdmissionDriver>;
 
-async function withSessionLaunchFrame(
+async function withSessionLaunchFrame<T>(
   input: SessionPublicShellInput,
-  launch: (driver: SessionLaunchDriver) => Promise<Readonly<{ status: number | null }>>,
-): Promise<number> {
+  launch: (driver: SessionLaunchDriver) => Promise<T>,
+): Promise<T> {
   let preparedRuntime = input.preparedRuntime;
   try {
     for (let attempt = 0; attempt < 2; attempt += 1) {
@@ -234,8 +299,7 @@ async function withSessionLaunchFrame(
           ...(handoff ? { handoff } : {}),
           lockHeldSinceMonotonicMs,
         });
-        const outcome = await launch(driver);
-        return typeof outcome.status === "number" ? outcome.status : 1;
+        return await launch(driver);
       } catch (error) {
         if (!(error instanceof StalePreparedRuntimeError)) throw error;
         if (attempt !== 0 || !input.reprepare) {

@@ -444,19 +444,38 @@ function exactCreationAuthorizedRecord(
 }
 
 /**
+ * The stop grace a caller may ask for: whole seconds, from none up to the
+ * session container's own stop grace. A cancelled headless run shortens the
+ * grace on a second signal (headless-run spec §3.5); nothing may lengthen it.
+ */
+function boundedStopGraceSeconds(graceSeconds: number | undefined): number {
+  if (graceSeconds === undefined) return SESSION_CONTAINER_STOP_SECONDS;
+  if (!Number.isSafeInteger(graceSeconds) || graceSeconds < 0 || graceSeconds > SESSION_CONTAINER_STOP_SECONDS) {
+    throw new Error(`session-container stop grace must be a whole number of seconds from 0 to ${SESSION_CONTAINER_STOP_SECONDS}`);
+  }
+  return graceSeconds;
+}
+
+/**
  * Process-local fallback cleanup for the exact container created under this
  * sealed receipt. It remains valid across lifecycle transitions but cannot
  * authorize a different container, project, or session incarnation.
+ *
+ * `graceSeconds` shortens Docker's stop grace (default
+ * `SESSION_CONTAINER_STOP_SECONDS`); anything outside `0..that` is refused
+ * before a command exists.
  */
 export function creationAuthorizedSessionContainerStopCommand(
   record: SessionContainerRecordV2,
   expectedProject: SessionContainerProjectIdentity,
   creationReceipt: SessionContainerCreationReceipt,
+  options: Readonly<{ graceSeconds?: number }> = {},
 ): SessionContainerCleanupCommand {
+  const graceSeconds = boundedStopGraceSeconds(options.graceSeconds);
   const parsed = exactCreationAuthorizedRecord(creationReceipt, record, expectedProject);
   return sealedCleanupCommand({
     executable: "docker",
-    args: ["container", "stop", "--time", String(SESSION_CONTAINER_STOP_SECONDS), parsed.containerId as string],
+    args: ["container", "stop", "--time", String(graceSeconds), parsed.containerId as string],
     effect: "stop-creation-authorized-session-container",
     exactTarget: parsed.containerId as string,
   });
@@ -481,6 +500,29 @@ export function executeSessionContainerCleanupCommand(
   executor: SessionContainerCleanupExecutor,
   options: childProcess.SpawnSyncOptions = {},
 ): CaptureResult {
+  if (!cleanupCommands.has(command)) throw new Error("refusing an unsealed session-container cleanup command");
+  const orphanAuthority = orphanCleanupCommandAuthorities.get(command);
+  if (orphanAuthority) assertSessionContainerOrphanCleanupAuthority(orphanAuthority, true);
+  return executor(command.executable, command.args, options);
+}
+
+export type SessionContainerAsyncCleanupExecutor = (
+  executable: "docker",
+  args: readonly string[],
+  options?: childProcess.SpawnSyncOptions,
+) => Promise<CaptureResult>;
+
+/**
+ * `executeSessionContainerCleanupCommand` without blocking, so a caller can
+ * still act while a stop's grace runs (a cancelled headless run's second
+ * signal). The same sealed-command and orphan-authority checks run, and they
+ * throw synchronously, before any executor call.
+ */
+export function executeSessionContainerCleanupCommandAsync(
+  command: SessionContainerCleanupCommand,
+  executor: SessionContainerAsyncCleanupExecutor,
+  options: childProcess.SpawnSyncOptions = {},
+): Promise<CaptureResult> {
   if (!cleanupCommands.has(command)) throw new Error("refusing an unsealed session-container cleanup command");
   const orphanAuthority = orphanCleanupCommandAuthorities.get(command);
   if (orphanAuthority) assertSessionContainerOrphanCleanupAuthority(orphanAuthority, true);

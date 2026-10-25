@@ -115,7 +115,31 @@ export type SessionAdmissionLaunchOutcome = Readonly<{
    * exit status itself is non-zero.
    */
   resumeRecordKept?: boolean;
+  /**
+   * Set only when the launch's cancellation (headless-run spec §3.5) ended an
+   * attached session: the stop routine revoked the session file and stopped
+   * the container, so `status` is whatever that stop left the agent with, or
+   * null when the stream did not end within its bound.
+   */
+  cancelled?: true;
 }>;
+
+/**
+ * A launch cancelled before its session was attached.
+ *
+ * Raised by the driver at a ladder step boundary, so the ladder's ordinary
+ * routing removes whatever exists: nothing before allocation, the unadmitted
+ * cleanup before the session file, and the ordered teardown after it.
+ */
+export class SessionLaunchCancelledError extends Error {
+  readonly step: string;
+
+  constructor(step: string) {
+    super(`session launch cancelled before ${step}`);
+    this.name = "SessionLaunchCancelledError";
+    this.step = step;
+  }
+}
 
 /**
  * Internal launch sequence for one per-session container.

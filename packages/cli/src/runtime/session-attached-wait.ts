@@ -86,6 +86,33 @@ export type LostForegroundStreamDecision =
  */
 export type AdoptionFailureClass = "abort" | "preserve" | "fatal";
 
+/**
+ * What the attached wait asks of the driver when its launch is cancelled
+ * (headless-run spec §3.5 "Stop routine").
+ *
+ * The wait owns the order: the heartbeat is stopped and settled first, so no
+ * beat can write the file back; then the file is revoked; then the container
+ * is stopped; then the stream is given a bounded time to end. A cancelled
+ * session never spends a re-attach — the stream ending is the stop working.
+ */
+export type AttachedSessionCancellationPorts = Readonly<{
+  /** Resolves once the launch is cancelled. Never rejects. */
+  requested: Promise<void>;
+  /** Whether the launch is cancelled now. */
+  isRequested(): boolean;
+  /** Takes this session's file away. Must never throw. */
+  revoke(): void;
+  /** Stops the exact container and settles once the stop has. Must never reject. */
+  stop(): Promise<void>;
+  /** How long the stream may take to end once the stop has settled. */
+  streamEndBoundMs: number;
+  /**
+   * This launch's answer for a cancelled session: the completion the stream
+   * ended with, or `undefined` when it did not end within the bound.
+   */
+  reportCancelled(completion: SessionContainerForegroundCompletion | undefined): SessionAdmissionLaunchOutcome;
+}>;
+
 /** Everything the attached wait asks of the driver that owns the session. */
 export type AttachedSessionWaitPorts = Readonly<{
   /** The foreground stream the session was admitted with. */
@@ -113,6 +140,8 @@ export type AttachedSessionWaitPorts = Readonly<{
   reportCompletion(completion: SessionContainerForegroundCompletion): SessionAdmissionLaunchOutcome;
   /** This launch's answer for an exit the confirming inspection proved. */
   reportInspectedExit(status: number): SessionAdmissionLaunchOutcome;
+  /** Present only for a cancellable launch. */
+  cancellation?: AttachedSessionCancellationPorts;
 }>;
 
 type LostStream = {
@@ -316,6 +345,51 @@ export async function waitForAttachedSessionCompletion(
   };
   const renewalLoop = heartbeatLoop();
 
+  /** Ends the renewal loop and waits until no beat is in flight. Idempotent. */
+  const stopRenewal = async (): Promise<void> => {
+    finished = true;
+    renewalLockAcquisition.abort();
+    wakeRenewal?.();
+    await renewalLoop.catch(() => undefined);
+  };
+
+  const cancellation = ports.cancellation;
+  const neverCancelled = new Promise<never>(() => {});
+  const cancelRequested = cancellation
+    ? cancellation.requested.then(() => ({ kind: "cancelled" as const }))
+    : neverCancelled;
+
+  /**
+   * The stop routine's attached half (headless-run spec §3.5 steps 1-2).
+   *
+   * `ended` is a completion the race already holds; without one the stream
+   * this session is attached to is given `streamEndBoundMs` after the stop.
+   */
+  const endCancelled = async (
+    control: AttachedSessionCancellationPorts,
+    ended: SessionContainerForegroundCompletion | undefined,
+  ): Promise<SessionAdmissionLaunchOutcome> => {
+    // No beat may be in flight, or come after: a beat that wrote after the
+    // revoke would hand the stopping session its authority back.
+    await stopRenewal();
+    control.revoke();
+    await control.stop();
+    if (ended) return control.reportCancelled(ended);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const completion = await Promise.race([
+        attachedForeground.completion,
+        new Promise<undefined>((resolve) => {
+          timer = setTimeout(() => resolve(undefined), control.streamEndBoundMs);
+          timer.unref?.();
+        }),
+      ]);
+      return control.reportCancelled(completion);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  };
+
   /**
    * The completion race.
    *
@@ -334,11 +408,20 @@ export async function waitForAttachedSessionCompletion(
         ? await Promise.race([
           waiting.settled.then((decision) => ({ kind: "decided" as const, decision, lost: waiting.lost })),
           renewalLoop.then(() => ({ kind: "renewal" as const })),
+          cancelRequested,
         ])
         : await Promise.race([
           attachedForeground.completion.then((completion) => ({ kind: "foreground" as const, completion })),
           renewalLoop.then(() => ({ kind: "renewal" as const })),
+          cancelRequested,
         ]);
+      // A cancelled launch ends through the stop routine whatever the race
+      // saw: an exit, a lost stream, or a beat's late answer about one.
+      if (cancellation && (settled.kind === "cancelled" || cancellation.isRequested())) {
+        const ended = settled.kind === "foreground" ? settled.completion : waiting?.lost;
+        return await endCancelled(cancellation, ended);
+      }
+      if (settled.kind === "cancelled") continue;
       if (settled.kind === "renewal") {
         throw new Error("session lease renewal stopped before the attached process finished");
       }
@@ -366,6 +449,9 @@ export async function waitForAttachedSessionCompletion(
         awaitLostStream(lost, decision.observation);
         continue;
       }
+      // The cancel may have landed during the confirming inspection: a
+      // re-attach would only reopen the view the stop routine is closing.
+      if (cancellation?.isRequested()) return await endCancelled(cancellation, lost);
       try {
         attachedForeground = await ports.reattach(attachedForeground);
         runfreeLog("session output stream ended while the container is still running; re-attached");
@@ -381,9 +467,6 @@ export async function waitForAttachedSessionCompletion(
   try {
     return await awaitFileSourceCompletion();
   } finally {
-    finished = true;
-    renewalLockAcquisition.abort();
-    wakeRenewal?.();
-    await renewalLoop.catch(() => undefined);
+    await stopRenewal();
   }
 }

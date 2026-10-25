@@ -37,8 +37,10 @@ import { defaultConfig } from "../config.ts";
 import { projectHash } from "../project-identity.ts";
 import {
   launchConfiguredAgentThroughAdmission,
+  launchHeadlessAgentThroughAdmission,
   launchShellThroughAdmission,
 } from "./session-public-launch.ts";
+import { SessionLaunchCancelledError } from "./session-admission-probe.ts";
 import { StalePreparedRuntimeError } from "./prepared-runtime.ts";
 import { tryAcquireProjectLifecycleLock, tryAcquireProjectLifecycleLockWithRetry } from "./sessions.ts";
 import { LAUNCH_HANDOFF_STARTUP_SPAN_MAX_MS } from "./launch-lock-hold.ts";
@@ -142,6 +144,77 @@ describe("public launch through session admission", () => {
       "claude",
       { launchConversationId: expect.stringMatching(UUID_PATTERN), headless },
     );
+  });
+
+  describe("headless launch", () => {
+    const headless = { promptContainerPath: "/runfree/inbox/run-20261025T101500Z-0a1b2c3d.prompt" };
+    function cancellation() {
+      return { signal: new AbortController().signal, escalate: new AbortController().signal };
+    }
+
+    test("threads the headless option and the cancellation pair, and returns the raw status", async () => {
+      const pair = cancellation();
+      mocks.launchBuiltin.mockResolvedValueOnce({ status: null, signal: "SIGKILL" });
+      await expect(launchHeadlessAgentThroughAdmission({
+        preparedRuntime: preparedRuntime(),
+        io,
+        agentName: "claude",
+        headless,
+        cancellation: pair,
+      })).resolves.toEqual({ status: null, cancelled: false });
+      expect(mocks.launchBuiltin).toHaveBeenCalledWith(
+        "claude",
+        { launchConversationId: expect.stringMatching(UUID_PATTERN), headless, cancellation: pair },
+      );
+    });
+
+    test("reports a cancelled attached session as cancelled with its status", async () => {
+      mocks.launchBuiltin.mockResolvedValueOnce({ status: 143, signal: null, cancelled: true });
+      await expect(launchHeadlessAgentThroughAdmission({
+        preparedRuntime: preparedRuntime(),
+        io,
+        agentName: "claude",
+        headless,
+        cancellation: cancellation(),
+      })).resolves.toEqual({ status: 143, cancelled: true });
+    });
+
+    test("reports a launch cancelled before it attached as cancelled with no status, and frees the lock", async () => {
+      mocks.launchBuiltin.mockRejectedValueOnce(new SessionLaunchCancelledError("allocation"));
+      await expect(launchHeadlessAgentThroughAdmission({
+        preparedRuntime: preparedRuntime(),
+        io,
+        agentName: "claude",
+        headless,
+        cancellation: cancellation(),
+      })).resolves.toEqual({ status: null, cancelled: true });
+      const reacquired = tryAcquireProjectLifecycleLock(runtimeContext());
+      expect(reacquired).toBeDefined();
+      reacquired?.release();
+    });
+
+    test("a cancelled launch whose cleanup failed is not reported as a clean cancel", async () => {
+      const failure = new AggregateError([new SessionLaunchCancelledError("activation"), new Error("docker down")], "cleanup failed");
+      mocks.launchBuiltin.mockRejectedValueOnce(failure);
+      await expect(launchHeadlessAgentThroughAdmission({
+        preparedRuntime: preparedRuntime(),
+        io,
+        agentName: "claude",
+        headless,
+        cancellation: cancellation(),
+      })).rejects.toBe(failure);
+    });
+
+    test("refuses a non-builtin agent before the lock or the driver", async () => {
+      await expect(launchHeadlessAgentThroughAdmission({
+        preparedRuntime: preparedRuntime(),
+        io,
+        agentName: "aider",
+        headless,
+        cancellation: cancellation(),
+      })).rejects.toThrow("supports only the built-in agents");
+      expect(mocks.createDriver).not.toHaveBeenCalled();
+    });
   });
 
   test("maps a signal death to exit status 1", async () => {

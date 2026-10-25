@@ -6,6 +6,7 @@ import { setOutputWriterForTest } from "../warnings.ts";
 import {
   lostForegroundStream,
   waitForAttachedSessionCompletion,
+  type AttachedSessionCancellationPorts,
   type AttachedSessionWaitPorts,
   type LostForegroundStreamDecision,
 } from "./session-attached-wait.ts";
@@ -193,5 +194,191 @@ describe("attached session wait", () => {
     expect(wait.reportInspectedExit).toHaveBeenCalledWith(7);
     expect(wait.reportCompletion).not.toHaveBeenCalled();
     expect(lines.some((line) => line.includes("session container exited with code 7"))).toBe(true);
+  });
+  // Headless-run spec §3.5: cancellation goes through the attached wait, so a
+  // stream that ends because the stop routine stopped the container is never
+  // spent on a re-attach, and the session file goes before the container.
+  describe("cancellation", () => {
+    function cancellation(events: string[], overrides: Partial<AttachedSessionCancellationPorts> = {}): {
+      ports: AttachedSessionCancellationPorts;
+      cancel: () => void;
+    } {
+      let cancel!: () => void;
+      let requested = false;
+      const promise = new Promise<void>((resolve) => { cancel = () => { requested = true; resolve(); }; });
+      return {
+        cancel: () => cancel(),
+        ports: {
+          requested: promise,
+          isRequested: () => requested,
+          revoke: vi.fn(() => { events.push("revoke"); }),
+          stop: vi.fn(async () => { events.push("stop"); }),
+          streamEndBoundMs: 5_000,
+          reportCancelled: vi.fn((completion: SessionContainerForegroundCompletion | undefined) => ({
+            status: completion?.kind === "exit" ? completion.code : null,
+            signal: completion?.kind === "exit" ? completion.signal : null,
+            cancelled: true as const,
+          })),
+          ...overrides,
+        },
+      };
+    }
+
+    test("stops the heartbeat, revokes the file, then stops the container, and reports the stopped stream", async () => {
+      const events: string[] = [];
+      const { handle, settle } = foregroundHandle();
+      const control = cancellation(events, {
+        stop: vi.fn(async () => {
+          events.push("stop");
+          // The container stopping is what ends the attached stream.
+          settle({ kind: "exit", code: 143, signal: null });
+        }),
+      });
+      const wait = ports({
+        foreground: handle,
+        beat: vi.fn(async (): Promise<HeartbeatOutcome> => {
+          events.push("beat");
+          return { kind: "written", file: writtenFile };
+        }),
+        cancellation: control.ports,
+      });
+      const outcome = waitForAttachedSessionCompletion(wait);
+      await vi.advanceTimersByTimeAsync(1_500);
+      control.cancel();
+      await expect(outcome).resolves.toEqual({ status: 143, signal: null, cancelled: true });
+      expect(events).toEqual(["beat", "revoke", "stop"]);
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(wait.beat).toHaveBeenCalledTimes(1);
+      expect(wait.reportCompletion).not.toHaveBeenCalled();
+      expect(wait.classifyLostStream).not.toHaveBeenCalled();
+    });
+
+    test("a beat in flight when the cancel arrives finishes before the file is revoked", async () => {
+      const events: string[] = [];
+      const { handle, settle } = foregroundHandle();
+      let finishBeat!: () => void;
+      const control = cancellation(events, {
+        stop: vi.fn(async () => {
+          events.push("stop");
+          settle({ kind: "exit", code: 143, signal: null });
+        }),
+      });
+      const wait = ports({
+        foreground: handle,
+        beat: vi.fn(() => new Promise<HeartbeatOutcome>((resolve) => {
+          events.push("beat-start");
+          finishBeat = () => {
+            events.push("beat-end");
+            resolve({ kind: "written", file: writtenFile });
+          };
+        })),
+        cancellation: control.ports,
+      });
+      const outcome = waitForAttachedSessionCompletion(wait);
+      await vi.advanceTimersByTimeAsync(1_000);
+      control.cancel();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(events).toEqual(["beat-start"]);
+      finishBeat();
+      await expect(outcome).resolves.toMatchObject({ cancelled: true });
+      expect(events).toEqual(["beat-start", "beat-end", "revoke", "stop"]);
+    });
+
+    test.each([
+      ["a stream error", { kind: "error", error: new Error("attach stream closed") }],
+      ["a signal-only exit", { kind: "exit", code: null, signal: "SIGHUP" }],
+    ] as const)("a lost stream after the cancel (%s) is never re-attached", async (_name, lost) => {
+      const events: string[] = [];
+      const first = foregroundHandle();
+      const control = cancellation(events, {
+        stop: vi.fn(async () => {
+          events.push("stop");
+          first.settle(lost);
+        }),
+      });
+      const wait = ports({
+        foreground: first.handle,
+        classifyLostStream: vi.fn((): LostForegroundStreamDecision => ({ kind: "reattach" })),
+        reattach: vi.fn(async () => foregroundHandle().handle),
+        cancellation: control.ports,
+      });
+      const outcome = waitForAttachedSessionCompletion(wait);
+      control.cancel();
+      await expect(outcome).resolves.toMatchObject({ cancelled: true });
+      expect(wait.reattach).not.toHaveBeenCalled();
+      expect(wait.classifyLostStream).not.toHaveBeenCalled();
+      expect(control.ports.reportCancelled).toHaveBeenCalledWith(lost);
+    });
+
+    test("a stream lost just before the cancel is not re-attached either", async () => {
+      const events: string[] = [];
+      const first = foregroundHandle();
+      const control = cancellation(events);
+      const wait = ports({
+        foreground: first.handle,
+        classifyLostStream: vi.fn((): LostForegroundStreamDecision => {
+          // The cancel lands while the lost stream is being classified.
+          control.cancel();
+          return { kind: "reattach" };
+        }),
+        reattach: vi.fn(async () => foregroundHandle().handle),
+        cancellation: control.ports,
+      });
+      const outcome = waitForAttachedSessionCompletion(wait);
+      const lost = { kind: "exit" as const, code: null, signal: "SIGHUP" as const };
+      first.settle(lost);
+      await expect(outcome).resolves.toMatchObject({ cancelled: true });
+      expect(wait.reattach).not.toHaveBeenCalled();
+      expect(events).toEqual(["revoke", "stop"]);
+      expect(control.ports.reportCancelled).toHaveBeenCalledWith(lost);
+    });
+
+    test("a cancel while an unconfirmed lost stream waits ends the wait without the beat's answer", async () => {
+      const events: string[] = [];
+      const { handle, settle } = foregroundHandle();
+      const control = cancellation(events);
+      const wait = ports({ foreground: handle, cancellation: control.ports });
+      const outcome = waitForAttachedSessionCompletion(wait);
+      const lost = { kind: "exit" as const, code: null, signal: "SIGTERM" as const };
+      settle(lost);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(wait.classifyLostStream).toHaveBeenCalledTimes(1);
+      control.cancel();
+      await expect(outcome).resolves.toEqual({ status: null, signal: "SIGTERM", cancelled: true });
+      expect(events).toEqual(["revoke", "stop"]);
+      expect(wait.reportCompletion).not.toHaveBeenCalled();
+    });
+
+    test("a stream that does not end within the bound after the stop is reported as no completion", async () => {
+      const events: string[] = [];
+      const { handle } = foregroundHandle();
+      const control = cancellation(events);
+      const wait = ports({ foreground: handle, cancellation: control.ports });
+      const outcome = waitForAttachedSessionCompletion(wait);
+      control.cancel();
+      let settled = false;
+      void outcome.then(() => { settled = true; });
+      await vi.advanceTimersByTimeAsync(4_999);
+      expect(settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      await expect(outcome).resolves.toEqual({ status: null, signal: null, cancelled: true });
+      expect(control.ports.reportCancelled).toHaveBeenCalledWith(undefined);
+    });
+
+    test("a cancel already requested when the wait starts runs the stop routine at once", async () => {
+      const events: string[] = [];
+      const { handle, settle } = foregroundHandle();
+      const control = cancellation(events, {
+        stop: vi.fn(async () => {
+          events.push("stop");
+          settle({ kind: "exit", code: 137, signal: null });
+        }),
+      });
+      control.cancel();
+      const wait = ports({ foreground: handle, cancellation: control.ports });
+      await expect(waitForAttachedSessionCompletion(wait)).resolves.toEqual({ status: 137, signal: null, cancelled: true });
+      expect(wait.beat).not.toHaveBeenCalled();
+      expect(events).toEqual(["revoke", "stop"]);
+    });
   });
 });
