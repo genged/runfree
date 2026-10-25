@@ -348,7 +348,7 @@ describe("one-step MCP enable and exact revoke", () => {
       // The second server: approved (enable with no OAuth hosts writes no
       // record), then given a record in the shape a reviewed discovery writes
       // (discovered origin, exact endpoints).
-      const approved = runOk(fixture, ["mcp", "enable", "claude", NARROW_SERVER, "--source", "project", "--no-discover", "--no-login"]);
+      const approved = runOk(fixture, ["mcp", "enable", "claude", NARROW_SERVER, "--source", "project", "--no-discover"]);
       stateDir = stateDirFrom(approved.stdout);
       const identity = `project:claude:${NARROW_SERVER}:${descriptorDigest(fixture, NARROW_SERVER)}`;
       const enabledPath = path.join(stateDir, "mcp-enabled.json");
@@ -375,7 +375,7 @@ describe("one-step MCP enable and exact revoke", () => {
       // The one command: approval, endpoint, OAuth hosts, activation.
       const enabled = runOk(fixture, [
         "mcp", "enable", "claude", ENABLE_SERVER, "--source", "project",
-        "--no-discover", "--oauth-host", ENABLE_OAUTH_HOST, "--oauth-host", USER_HOST, "--no-login",
+        "--no-discover", "--oauth-host", ENABLE_OAUTH_HOST, "--oauth-host", USER_HOST,
       ]);
       enableOutput = enabled.output;
       standing = await startStandingSession(fixture);
@@ -603,7 +603,7 @@ describe("one-step MCP enable and exact revoke", () => {
       // Approve the two cross-host servers (no OAuth hosts: no record yet),
       // then give each the record a reviewed cross-host discovery writes.
       for (const server of [CROSS_SERVER, DROP_SERVER]) {
-        runOk(fixture, ["mcp", "enable", "claude", server, "--source", "project", "--no-discover", "--no-login"]);
+        runOk(fixture, ["mcp", "enable", "claude", server, "--source", "project", "--no-discover"]);
       }
       addEnableRecords(fixture, stateDir, [
         crossHostRecord(fixture, CROSS_SERVER, CROSS_IDP_HOST, CROSS_TOKEN_HOST),
@@ -613,7 +613,7 @@ describe("one-step MCP enable and exact revoke", () => {
       // projects the hand-written records.
       boundEnableOutput = runOk(fixture, [
         "mcp", "enable", "claude", BOUND_SERVER, "--source", "project",
-        "--no-discover", "--oauth-host", BOUND_AUTH_HOST, "--no-login",
+        "--no-discover", "--oauth-host", BOUND_AUTH_HOST,
       ]).output;
       proxyId = proxyContainerId(fixture);
       standing = await startStandingSession(fixture);

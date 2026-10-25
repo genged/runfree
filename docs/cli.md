@@ -786,7 +786,7 @@ runfree mcp configure --agent claude --agent codex
 runfree mcp explain claude my-server
 runfree mcp explain claude my-server --source project --json
 runfree mcp enable claude my-server
-runfree mcp enable claude my-server --no-discover --oauth-host auth.example.com --no-login
+runfree mcp enable claude my-server --no-discover --oauth-host auth.example.com
 runfree mcp enable claude my-server --from-source op-token
 runfree mcp auth claude my-server
 runfree mcp rules claude my-server
@@ -868,9 +868,10 @@ review lists every change:
   <url> will stop working in the sandbox`: the proxy mediates every login at
   that exact URL for this server.
 
-After you accept, Runfree saves the changes, applies them to a running proxy,
-and then runs the OAuth login (`runfree mcp auth`) for OAuth servers. Pass
-`--no-login` to skip the login.
+After you accept, Runfree saves the changes and applies them to a running
+proxy. For OAuth servers it then prints the login command
+(`runfree mcp auth`). Pass `--login` to run that login at once; it needs a
+terminal.
 
 To find the OAuth hosts, Runfree reads the server's OAuth metadata from this
 computer with plain HTTPS GETs that carry no credentials, and asks first
@@ -883,7 +884,7 @@ set to `deny` stays denied. The rules are in [security.md](security.md#mcp).
 | `--source user\|local\|project` | Choose the entry when more than one matches. User and local entries need no approval; `enable` records only their OAuth hosts. |
 | `--oauth-host <host>` | Also allow this exact host for the server (repeatable). It is allowed as given, like `runfree host add`, and it must pass the [host rule](#oauth-hosts-on-another-host). The proxy mediates a token or registration endpoint there that the server's OAuth metadata names. While only MCP records allow the host, the proxy refuses any other OAuth token or registration request to it, and any request with a body it cannot check (see below). |
 | `--no-discover` | Make no network call. Use only `--oauth-host` hosts. |
-| `--no-login` | Do not run the OAuth login after enabling. |
+| `--login` | Run the OAuth login (`runfree mcp auth`) after enabling. It starts an agent session and needs a terminal. Without it, `enable` prints the login command. |
 | `--from-env`, `--from-1password`, `--from-source`, `--from-stdin` | Bind a project entry's static header to a host-owned credential source. Choose one. |
 | `--replace-source` | Replace an existing credential source for this server. |
 

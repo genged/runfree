@@ -234,7 +234,7 @@ describe("ingress forwarders are loopback-only, one-way, per-session, and torn d
    */
   function ensureMcpOAuthEligible(): void {
     if (mcpEligible) return;
-    const approved = fixture.runfree(["mcp", "enable", "claude", MCP_FIXTURE_SERVER, "--source", "project", "--no-discover", "--no-login"]);
+    const approved = fixture.runfree(["mcp", "enable", "claude", MCP_FIXTURE_SERVER, "--source", "project", "--no-discover"]);
     expect(approved.status, `mcp enable failed: ${describeOutput(approved.output, 4000)}`).toBe(0);
     upWithExactApprovals(fixture);
     mcpEligible = true;

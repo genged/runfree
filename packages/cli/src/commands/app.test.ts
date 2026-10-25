@@ -2302,6 +2302,22 @@ describe("admin credential/host/mcp commands", () => {
     expect(runDefault).not.toHaveBeenCalled();
   });
 
+  // The login is opt-in (`--login`); `--no-login` from when it was the default
+  // still parses, but cannot be combined with `--login`.
+  test("mcp enable accepts --login and the legacy --no-login, not both", async () => {
+    const runDefault = vi.fn(async () => 0);
+    for (const flag of ["--login", "--no-login"]) {
+      await expect(
+        runCommandApp(strictContext(), ["mcp", "enable", "claude", "srv", "--no-discover", flag], runDefault),
+      ).rejects.toThrow("adminContext() must not be called");
+    }
+    const refusal = await cliRefusal(
+      runCommandApp(strictContext(), ["mcp", "enable", "claude", "srv", "--no-discover", "--login", "--no-login"], runDefault),
+    );
+    expect(refusal.message).toMatch(/mutually exclusive/);
+    expect(runDefault).not.toHaveBeenCalled();
+  });
+
   // `runfree mcp approve` was removed outright; `mcp enable` replaces it. No
   // alias may parse, with or without arguments.
   test("mcp approve is an unknown command", async () => {

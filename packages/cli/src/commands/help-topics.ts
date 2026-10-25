@@ -168,7 +168,7 @@ Runfree import and project approval:
   runfree mcp list [--json]
   runfree mcp configure [--agent <agent>]... [--server <name>]
   runfree mcp explain <agent> <server> [--source user|local|project]
-  runfree mcp enable <agent> <server> [--source user|local|project] [--oauth-host <host>]... [--no-discover] [--no-login] [--from-env ENV | --from-1password op://... | --from-source <name> | --from-stdin] [--replace-source]
+  runfree mcp enable <agent> <server> [--source user|local|project] [--oauth-host <host>]... [--no-discover] [--login] [--from-env ENV | --from-1password op://... | --from-source <name> | --from-stdin] [--replace-source]
   runfree mcp auth <agent> <server> [--source user|local|project]
   runfree mcp rules <agent> <server> [--tool <tool>] [--write allow|ask|deny]
   runfree mcp revoke <agent> <server> [--source user|local|project]
@@ -480,7 +480,7 @@ MCP servers:
                                   Configure MCP imports and tool-call rules interactively
   runfree mcp explain <agent> <server> [--source user|local|project] [--json]
                                   Show the normalized descriptor and import/approval decision
-  runfree mcp enable <agent> <server> [--source user|local|project] [--oauth-host <host>]... [--no-discover] [--no-login] [--from-env ENV | --from-1password op://... | --from-source <name> | --from-stdin] [--replace-source]
+  runfree mcp enable <agent> <server> [--source user|local|project] [--oauth-host <host>]... [--no-discover] [--login] [--from-env ENV | --from-1password op://... | --from-source <name> | --from-stdin] [--replace-source]
                                   Enable a server in one review: approval, OAuth hosts (discovered or named), credential source, then login;
                                   static headers on a project server require a host-owned credential source
   runfree mcp auth <agent> <server> [--source user|local|project]
