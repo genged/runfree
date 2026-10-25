@@ -258,7 +258,7 @@ Order, hardening, and firewall rules:
 ### Credentials
 
 ```text
-host source (env, 1Password, command, stdin, JWT, OAuth seed)
+host source (env, 1Password, command, stdin, JWT, Google service account, OAuth seed)
    | runfree credential sync  (host resolves)
    v
 proxy-only tmpfs  --->  proxy strips agent auth headers
@@ -297,6 +297,27 @@ agent sees: placeholder or runfree_oauth_* handle only
    never removes the token. A deferred sync under a launch's lock follows
    [Lifecycle](#lifecycle) rule 10.
 5. The proxy CA private key is mounted only into the proxy.
+6. **A Google service-account key stays on the host.** The CLI reads the key
+   JSON from 1Password only to sign, and never stores the key JSON, the
+   private key, or its key id in the source registry, receipts, the token
+   status file, or logs. The signed JWT lives at most 1 hour and goes only to
+   proxy tmpfs. The source pins the service account's email, so a changed
+   1Password item cannot switch it to another account; the scope comes from a
+   two-entry allowlist (Search Console read-only, or read and write) set on
+   the host, never by the agent. Every failure after the read is definitive
+   and prints a fixed message that names the field, never the key. A watcher
+   keeps the parsed key in memory for at most 4 hours, so a key removed from
+   1Password stops being used within 4 hours plus one JWT lifetime; deleting
+   the key in Google Cloud IAM stops it at once. The scope is not the
+   control that keeps Search Console read-only: the documented procedure is
+   a host rule that allows only `GET` and `POST` under the `/webmasters/v3`
+   and `/v1` path prefixes (every `POST` there is a read), so the proxy
+   refuses `PUT` and `DELETE` by method, refuses Google's `/batch` endpoint
+   (a `POST` whose body carries inner writes) by path, and strips the
+   method-override headers ([Network](#network) rule 7) whatever the scope.
+   A method override in the query string or body is not stripped; the
+   read-only scope covers that residual, though Google's enforcement of it is
+   not yet proven against the live API.
 
 ### Git Over HTTPS
 

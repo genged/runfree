@@ -182,6 +182,7 @@ describe("desired service reconciliation", () => {
   test.each([
     ["github", SERVICES.github],
     ["appstore-connect", SERVICES["appstore-connect"]],
+    ["google-search-console", SERVICES["google-search-console"]],
   ])("disable removes %s static credential links and placeholder declarations", (id, definition) => {
     // github's git-http Basic mapping needs desired version 3; the enable path
     // derives the version the same way.
