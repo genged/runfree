@@ -20,6 +20,7 @@ import { withControlPlaneRebindRefusal } from "../runtime/control-plane-rebind-r
 import { runtimeDryRun } from "../runtime/front.ts";
 import { HeadlessPromptFileError, readPromptFileBounded } from "../runtime/headless-prompt.ts";
 import { HEADLESS_RUN_EXIT, headlessAgentIds, runHeadlessAgent } from "../runtime/headless-run.ts";
+import type { RuntimeContext } from "../runtime/types.ts";
 import type { RunfreeCommandContext } from "./context.ts";
 import { withExamples } from "./examples.ts";
 import type { CommandHandlerFactory, CommandModule } from "./types.ts";
@@ -100,7 +101,16 @@ export const runCommand: CommandModule = {
           if (error instanceof HeadlessPromptFileError) throw new CliError(error.message, HEADLESS_RUN_EXIT.usage);
           throw error;
         }
-        const rc = context.runtimeContext();
+        let rc: RuntimeContext;
+        try {
+          rc = context.runtimeContext();
+        } catch (error) {
+          // An invalid project config or network policy refuses before the launch.
+          throw new CliError(
+            `${error instanceof Error ? error.message : String(error)}\nthe headless run did not start`,
+            HEADLESS_RUN_EXIT.refused,
+          );
+        }
         const dry = runtimeDryRun(rc, nodeRuntimeIO, "run");
         if (dry !== undefined) return dry;
         const verbose = Boolean(argv.verbose);

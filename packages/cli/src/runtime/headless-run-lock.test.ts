@@ -7,6 +7,7 @@ import { afterEach, beforeEach, expect, test, vi } from "vitest";
 
 import {
   acquireHeadlessRunLock,
+  HEADLESS_SESSION_EVIDENCE_RETENTION_MS,
   HeadlessRunLockHeldError,
   headlessRunLockPath,
   type AcquireHeadlessRunLockInput,
@@ -24,11 +25,13 @@ const CONTAINER_ID = "a".repeat(64);
 let tmp: string;
 let stateDir: string;
 let inboxDir: string;
+let sessionsDir: string;
 
 beforeEach(() => {
   tmp = fs.mkdtempSync(path.join(os.tmpdir(), "runfree-headless-lock-"));
   stateDir = path.join(tmp, "state");
   inboxDir = path.join(stateDir, "inbox");
+  sessionsDir = path.join(stateDir, "sessions");
   fs.mkdirSync(inboxDir, { recursive: true, mode: 0o700 });
 });
 
@@ -72,7 +75,7 @@ function dockerIo(inspect: Inspect) {
 }
 
 function input(io: { capture: ReturnType<typeof dockerIo>["capture"] }, env: NodeJS.ProcessEnv = harnessEnv(BOOT_B)): AcquireHeadlessRunLockInput {
-  return { stateDir, inboxDir, io, env };
+  return { stateDir, inboxDir, sessionsDir, io, env };
 }
 
 // A lock left by another `run`: its stamps, and the session it recorded.
@@ -116,6 +119,38 @@ function expectHeld(fn: () => unknown): HeadlessRunLockHeldError {
   expect(held.message).toContain("runfree stop");
   return held;
 }
+
+test("acquisition prunes headless host records past the retention and keeps younger and interactive ones", () => {
+  fs.mkdirSync(sessionsDir, { mode: 0o700 });
+  const DAY_MS = 24 * 60 * 60 * 1000;
+  expect(HEADLESS_SESSION_EVIDENCE_RETENTION_MS).toBe(7 * DAY_MS);
+  const ago = (ms: number): string => new Date(Date.now() - ms).toISOString();
+  const record = (id: string, fields: Record<string, unknown>): void => {
+    fs.writeFileSync(path.join(sessionsDir, `${id}.json`), `${JSON.stringify({
+      id,
+      startedAt: ago(30 * DAY_MS),
+      lastSeenAt: ago(30 * DAY_MS),
+      ...fields,
+    })}\n`);
+  };
+  record("rf-20261001-hdlold", { launchMode: "headless", endedAt: ago(8 * DAY_MS), exitStatus: 0, outcome: "interrupted" });
+  // A run that crashed before its end was stamped ages by its last heartbeat.
+  record("rf-20261001-hdlcrs", { launchMode: "headless", lastSeenAt: ago(8 * DAY_MS) });
+  record("rf-20261001-hdlnew", { launchMode: "headless", endedAt: ago(6 * DAY_MS), exitStatus: 0, outcome: "interrupted" });
+  record("rf-20261001-intold", { endedAt: ago(30 * DAY_MS), outcome: "interrupted" });
+  // Not followed: a link is never read or removed as a record.
+  fs.writeFileSync(path.join(tmp, "elsewhere.json"), JSON.stringify({ id: "rf-20261001-hdllnk", launchMode: "headless", endedAt: ago(30 * DAY_MS) }));
+  fs.symlinkSync(path.join(tmp, "elsewhere.json"), path.join(sessionsDir, "rf-20261001-hdllnk.json"));
+
+  acquireHeadlessRunLock(input(dockerIo(present))).release();
+
+  expect(fs.readdirSync(sessionsDir).sort()).toEqual([
+    "rf-20261001-hdllnk.json",
+    "rf-20261001-hdlnew.json",
+    "rf-20261001-intold.json",
+  ]);
+  expect(fs.existsSync(path.join(tmp, "elsewhere.json"))).toBe(true);
+});
 
 test("a fresh acquisition stamps the holder and sweeps only stale run prompts from the inbox", () => {
   seedInbox();

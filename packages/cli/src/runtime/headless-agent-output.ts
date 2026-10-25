@@ -35,7 +35,7 @@ export const CLAUDE_STREAM_JSON_RESULT_EVENT = Object.freeze({
 } as const);
 
 export type HeadlessOutputParserResult = Readonly<{
-  /** The last stream ended (`endStream`) and no byte was dropped past the total cap. */
+  /** The last stream ended (`endStream`) on a parsed line, and no byte was dropped past the total cap. */
   complete: boolean;
   /** The last final event the agent emitted was a success. */
   finalSuccess: boolean;
@@ -232,6 +232,8 @@ export function createHeadlessOutputParser(
   let totalBytes = 0;
   let overflowed = false;
   let ended = false;
+  // The last stream ended inside a line that did not parse: a truncated tail.
+  let brokenTail = false;
   let malformedLines = 0;
 
   const parseLine = (line: Buffer): void => {
@@ -292,6 +294,7 @@ export function createHeadlessOutputParser(
     push(chunk: Buffer): void {
       try {
         ended = false;
+        brokenTail = false;
         if (overflowed || !Buffer.isBuffer(chunk) || chunk.length === 0) return;
         const room = totalCapBytes - totalBytes;
         const accepted = chunk.length > room ? chunk.subarray(0, Math.max(room, 0)) : chunk;
@@ -309,7 +312,9 @@ export function createHeadlessOutputParser(
     },
     endStream(): void {
       try {
+        const malformedBefore = malformedLines;
         if (!overflowed && !discarding && pendingBytes > 0) parseLine(takePending());
+        brokenTail = discarding || malformedLines > malformedBefore;
         pending = [];
         pendingBytes = 0;
         discarding = false;
@@ -329,7 +334,7 @@ export function createHeadlessOutputParser(
         ? undefined
         : truncateUtf8(final.message, HEADLESS_FINAL_MESSAGE_CAP_BYTES);
       return Object.freeze({
-        complete: ended && !overflowed,
+        complete: ended && !overflowed && !brokenTail,
         finalSuccess: final?.success === true,
         ...(truncated ? { finalMessage: truncated.value } : {}),
         finalMessageTruncated: truncated?.truncated ?? false,

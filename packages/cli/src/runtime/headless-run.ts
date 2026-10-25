@@ -324,7 +324,7 @@ type RunInput = Readonly<{
 
 async function runUnderLock(input: RunInput): Promise<number> {
   const { context, io, agentName, options, deps } = input;
-  const { stateDir, inboxDir } = context.project.paths;
+  const { stateDir, inboxDir, sessionsDir } = context.project.paths;
   const startedAt = deps.now();
   const runId = createHeadlessRunId(startedAt);
   const baseRun = {
@@ -337,7 +337,7 @@ async function runUnderLock(input: RunInput): Promise<number> {
 
   let lock: HeadlessRunLock;
   try {
-    lock = deps.acquireLock({ stateDir, inboxDir, io, ...(context.env ? { env: context.env } : {}) });
+    lock = deps.acquireLock({ stateDir, inboxDir, sessionsDir, io, ...(context.env ? { env: context.env } : {}) });
   } catch (error) {
     if (!(error instanceof HeadlessRunLockHeldError)) {
       runfreeError(`the headless run did not start: ${errorText(error)}`);
@@ -472,7 +472,7 @@ async function runUnderLock(input: RunInput): Promise<number> {
       warn(`the headless run's inbox prompt could not be removed: ${errorText(error)}`);
     }
   }
-  const run: HeadlessRunJson = {
+  let run: HeadlessRunJson = {
     ...baseRun,
     endedAt: deps.now().toISOString(),
     agentStatus: launchResult?.status ?? null,
@@ -495,6 +495,8 @@ async function runUnderLock(input: RunInput): Promise<number> {
       record.finalize(run, parsed.finalMessage !== undefined ? { finalMessage: parsed.finalMessage } : {});
     } catch (error) {
       warn(`the headless run record could not be finalized: ${errorText(error)}`);
+      // A success needs its record: without it the run is unverified.
+      if (run.exitCode === 0) run = { ...run, outcome: "unverified", exitCode: 1 };
     }
   }
 
@@ -514,7 +516,7 @@ async function runUnderLock(input: RunInput): Promise<number> {
     }
   }
   // Step 5.
-  return decision.exitCode;
+  return run.exitCode;
 }
 
 /** The record of a run skipped by a held lock; best effort, the exit is 66 regardless. */

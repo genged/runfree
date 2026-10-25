@@ -227,7 +227,7 @@ confirmed. A second signal only shortens the container stop.
 | 0 | Success: the agent exited 0 and reported a final success. |
 | 1–63 | The agent failed (its own code; a code above 63 becomes 1), or the result is unverified (1): no final success, a lost status, an incomplete output stream, or denied writes that could not be counted. |
 | 64 | Usage error: a bad flag, agent, timeout, or prompt file. Nothing was started. |
-| 65 | Refused before the launch: approval, service review, login or credential source, or write posture. |
+| 65 | Refused before the launch: an invalid project config or network policy, approval, service review, login or credential source, or write posture. |
 | 66 | Skipped: another run holds the project lock. |
 | 67 | Timeout or signal, whatever the agent returned. |
 | 68 | The agent succeeded, but writes were denied and `--accept-denied-writes` was not given. |
@@ -251,7 +251,10 @@ When the run ends, it prints the final message, any warning (for example
 a scheduler's log shows them. A run does not need tmux:
 `tail -f <record>/transcript.jsonl` follows its progress. An expired agent
 login shows as a failure or an unverified result, never as success.
-`runfree resume` never offers a headless run's conversation.
+`runfree resume` never offers a headless run's conversation. Runfree keeps a
+headless run's host session record, even after a success, so a Codex run's
+conversation is never matched to an interactive session that overlapped it;
+the next `runfree run` in the project deletes records older than 7 days.
 
 #### Scheduling on macOS
 

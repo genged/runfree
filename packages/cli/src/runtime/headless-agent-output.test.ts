@@ -132,6 +132,20 @@ describe("claude stream-json parser", () => {
     expect(parse(Buffer.from(SUCCESS_EVENT)).finalSuccess).toBe(true);
   });
 
+  test("a success event followed by a truncated trailing event is incomplete", () => {
+    const result = parse(Buffer.concat([claudeStream(SUCCESS_EVENT), Buffer.from(SUCCESS_EVENT.slice(0, 20))]));
+    expect(result).toMatchObject({ complete: false, malformedLines: 1 });
+    expect(decideHeadlessOutcome({ agentStatus: 0, streamsDrained: true, parser: result }).outcome).toBe("unverified");
+  });
+
+  test("an over-cap trailing line without a newline makes the stream incomplete", () => {
+    const parser = createHeadlessOutputParser("claude-stream-json");
+    parser.push(claudeStream(SUCCESS_EVENT));
+    parser.push(Buffer.alloc(HEADLESS_OUTPUT_LINE_CAP_BYTES + 1, 0x61));
+    parser.endStream();
+    expect(parser.result().complete).toBe(false);
+  });
+
   test("a stream that has not ended is incomplete", () => {
     const parser = createHeadlessOutputParser("claude-stream-json");
     parser.push(claudeStream(SUCCESS_EVENT));

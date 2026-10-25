@@ -327,6 +327,11 @@ const CANCELLED_STREAM_END_BOUND_MS = 5_000;
  * (`docs/security.md` "Lifecycle" 2); the teardown that follows repeats it.
  */
 const CANCEL_STOP_CLIENT_SLACK_MS = 20_000;
+/**
+ * The client deadline on every synchronous Docker call of a cancelled launch:
+ * long enough for the teardown's own graceful stop.
+ */
+const CANCELLED_DOCKER_CALL_TIMEOUT_MS = SESSION_CONTAINER_STOP_SECONDS * 1_000 + CANCEL_STOP_CLIENT_SLACK_MS;
 
 class PostCompletionAdmissionRecoveryError extends Error {
   readonly outcome: SessionAdmissionLaunchOutcome;
@@ -653,6 +658,14 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
       env: this.#input.plan.execution.dockerClientEnv,
       shell: false as const,
       maxBuffer,
+      // Once a launch is cancelled, every synchronous Docker call (the stop
+      // routine's delete, the teardown after it) gets a client deadline: a
+      // stalled daemon would otherwise block the event loop, so neither the
+      // run timeout nor a second signal could advance. A call cut off counts
+      // as not done, and the teardown ends unconfirmed.
+      ...(this.#launch?.cancellation?.signal.aborted
+        ? { timeout: CANCELLED_DOCKER_CALL_TIMEOUT_MS, killSignal: "SIGKILL" as const }
+        : {}),
     };
   }
 
@@ -2702,7 +2715,7 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
 
   /**
    * Applies the outcome-aware session evidence rule after a launch: status 0
-   * consumes the evidence; any other outcome (nonzero, signal, or a thrown
+   * consumes the evidence (a headless run keeps it as ended); any other outcome (nonzero, signal, or a thrown
    * failure passed as `undefined`) preserves it as interrupted host evidence.
    * A resume launch that never reached `attached` always removes its
    * transient evidence instead, so one failed attempt cannot mint a second,
@@ -2726,7 +2739,12 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
     // whole-registry admission generation. Finalize it even if bounded teardown
     // reacquisition failed; otherwise one lock timeout leaves both registry
     // residue and misleading open host evidence.
-    if (outcome?.status === 0 || (this.#launch?.resume !== undefined && !this.#attached)) {
+    // A headless run's evidence outlives its success: its window keeps that
+    // run's Codex rollout from matching an overlapping interactive session.
+    // Resume never offers it, and the next run prunes it after
+    // `HEADLESS_SESSION_EVIDENCE_RETENTION_MS` (`headless-run-lock.ts`).
+    const headlessSuccess = this.#launch?.headless !== undefined && outcome?.status === 0;
+    if (!headlessSuccess && (outcome?.status === 0 || (this.#launch?.resume !== undefined && !this.#attached))) {
       removeSessionMetadata(this.#input.context, metadata.id);
     } else {
       markSessionInterrupted(this.#input.context, metadata, outcome?.status ?? undefined);

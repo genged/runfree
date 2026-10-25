@@ -198,6 +198,21 @@ describe("runfree run", () => {
     expect(error.status).toBe(3);
   });
 
+  test("a project setup refusal before the launch (config, network policy) exits 65", async () => {
+    const cwd = tempDir();
+    fs.writeFileSync(path.join(cwd, "task.md"), "x");
+    for (const failure of [new CliError("Unsupported .runfree/config.json version 3"), new Error("network policy is invalid")]) {
+      const error = await refusal(runCommandApp(
+        strictContext(cwd, { runtimeContext: () => { throw failure; } }),
+        ["run", "claude", "--prompt-file", "task.md"],
+        neverDelegate,
+      ));
+      expect(error.status).toBe(65);
+      expect(error.message).toContain(failure.message);
+    }
+    expect(seams.calls).toEqual([]);
+  });
+
   test("a contradictory control-plane rebind is refused with 65", async () => {
     const cwd = tempDir();
     fs.writeFileSync(path.join(cwd, "task.md"), "x");

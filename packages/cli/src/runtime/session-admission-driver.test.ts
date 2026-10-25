@@ -1442,6 +1442,26 @@ describe("internal session admission driver", () => {
       );
     });
 
+    test("a successful headless run keeps its host evidence as ended, so its window still claims its rollout", async () => {
+      claude();
+      const driver = createInternalSessionAdmissionDriver({
+        ...fixture(),
+        nowEpochMs: () => Date.parse("2026-08-09T00:00:00.000Z"),
+      });
+
+      await expect(driver.launchBuiltin("claude", {
+        launchConversationId: ID,
+        headless: { promptContainerPath: PROMPT },
+      })).resolves.toEqual({ status: 0, signal: null });
+
+      expect(mocks.removeSessionMetadata).not.toHaveBeenCalled();
+      expect(mocks.markSessionInterrupted).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ id: "rf-20260809-abcdef" }),
+        0,
+      );
+    });
+
     test("an interactive launch stays interactive and carries no headless evidence option", async () => {
       claude();
       const driver = createInternalSessionAdmissionDriver({
@@ -1465,6 +1485,9 @@ describe("internal session admission driver", () => {
         "claude",
         expect.not.objectContaining({ headless: expect.anything() }),
       );
+      // An interactive success still consumes its evidence.
+      expect(mocks.removeSessionMetadata).toHaveBeenCalledOnce();
+      expect(mocks.markSessionInterrupted).not.toHaveBeenCalled();
     });
 
     test("a headless resume is refused before preflight, allocation, or any Docker call", async () => {
@@ -5058,6 +5081,47 @@ describe("session admission under the per-session file source", () => {
         { graceSeconds: 10 },
       );
       expect(mocks.markSessionInterrupted).toHaveBeenCalledTimes(1);
+    });
+
+    test("after a cancel, a Docker that never answers is cut off by a client deadline: the teardown is unconfirmed, not hung", async () => {
+      const input = fixture();
+      mocks.containerInspect = { status: 0, stdout: runningInspect(), stderr: "" };
+      const finishForeground = heldForeground();
+      withAsyncCapture(input.io, async (label) => {
+        if (label === `async ${STOP_10}`) finishForeground({ kind: "exit", code: 143, signal: null });
+        return { status: 0, stdout: "", stderr: "" };
+      });
+      // The fake Docker never returns: a synchronous call with no deadline
+      // would block the event loop forever. One with a deadline is killed at
+      // it, which `capture` reports as status 124.
+      const answer = input.io.capture;
+      const unbounded: string[] = [];
+      let cancelled = false;
+      input.io.capture = vi.fn((command: string, args: string[], options?: Parameters<RuntimeIO["capture"]>[2]) => {
+        if (!cancelled) return answer(command, args, options);
+        const label = effectLabel(args);
+        mocks.events.push(label);
+        if (!(typeof options?.timeout === "number" && options.timeout > 0 && options.killSignal === "SIGKILL")) unbounded.push(label);
+        return { status: 124, stdout: "", stderr: "" };
+      }) as unknown as RuntimeIO["capture"];
+      const control = cancellable();
+      const driver = createInternalSessionAdmissionDriver({
+        ...input,
+        sessionLockManager: orderedSessionLockManager(input.sessionLockManager),
+      });
+
+      const launch = driver.launchBuiltin("codex", { cancellation: control.cancellation });
+      await vi.waitFor(() => expect(mocks.events).toContain("release-attached-lock"));
+      const attachedAt = mocks.events.length;
+      cancelled = true;
+      control.cancel();
+
+      await expect(launch).rejects.toBeInstanceOf(SessionTeardownIncompleteError);
+      // The stop routine's delete, then the teardown's (the ladder retries a
+      // teardown that reported a failure).
+      expect(mocks.events.slice(attachedAt).filter((event) => event === "session-file:delete").length).toBeGreaterThanOrEqual(2);
+      expect(unbounded).toEqual([]);
+      expect(mocks.events).not.toContain("remove-exact-record:rf-20260809-abcdef");
     });
 
     test("a second signal during the stop issues a no-grace stop while the first is still pending", async () => {

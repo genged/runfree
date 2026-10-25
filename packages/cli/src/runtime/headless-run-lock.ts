@@ -53,6 +53,13 @@ const CONTAINER_ID_PATTERN = /^[a-f0-9]{64}$/;
 const CONTAINER_NAME_PATTERN = /^runfree-[a-f0-9]{12}-session-(rf-[0-9]{8}-[a-z0-9]{6,32})$/;
 const INSPECT_TIMEOUT_MS = 5_000;
 const INSPECT_MAX_BYTES = 1024 * 1024;
+/**
+ * How long a headless run's host session record is kept after it ends. It is
+ * never offered by resume; it stays only so its window keeps that run's Codex
+ * rollout from matching an overlapping interactive session.
+ */
+export const HEADLESS_SESSION_EVIDENCE_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+const SESSION_EVIDENCE_MAX_BYTES = 64 * 1024;
 /** The inbox prompt files headless runs write (`<runId>.prompt`). */
 const INBOX_PROMPT_PATTERN = new RegExp(`^${HEADLESS_RUN_ID_PATTERN.source.slice(1, -1)}\\.prompt$`);
 
@@ -106,6 +113,8 @@ export type HeadlessRunLock = Readonly<{
 export type AcquireHeadlessRunLockInput = Readonly<{
   stateDir: string;
   inboxDir: string;
+  /** The project's host session records; headless ones past the retention are pruned. */
+  sessionsDir: string;
   /** Runs `docker container inspect` for a dead holder's container. */
   io: DockerIo;
   env?: NodeJS.ProcessEnv;
@@ -259,8 +268,49 @@ function sweepStaleInboxPrompts(inboxDir: string): void {
 }
 
 /**
+ * Deletes headless host session records that ended (or, after a crash, were
+ * last seen) more than `HEADLESS_SESSION_EVIDENCE_RETENTION_MS` ago. Safe only
+ * under the lock: no headless run is live. Interactive records, links, and
+ * anything unreadable are left alone. Best effort: housekeeping never refuses
+ * a run.
+ */
+function pruneExpiredHeadlessSessionRecords(sessionsDir: string, nowMs: number): void {
+  let entries: string[];
+  try {
+    entries = fs.readdirSync(sessionsDir);
+  } catch {
+    return;
+  }
+  for (const name of entries) {
+    const sessionId = name.endsWith(".json") ? name.slice(0, -".json".length) : "";
+    if (!SESSION_ID_PATTERN.test(sessionId)) continue;
+    const filePath = path.join(sessionsDir, name);
+    try {
+      const stat = fs.lstatSync(filePath);
+      if (!stat.isFile() || stat.nlink !== 1 || stat.size > SESSION_EVIDENCE_MAX_BYTES) continue;
+      const fd = fs.openSync(filePath, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+      let text: string;
+      try {
+        text = fs.readFileSync(fd, "utf8");
+      } finally {
+        fs.closeSync(fd);
+      }
+      const record: unknown = JSON.parse(text);
+      if (record === null || typeof record !== "object" || Array.isArray(record)) continue;
+      const fields = record as Record<string, unknown>;
+      if (fields.id !== sessionId || fields.launchMode !== "headless") continue;
+      const endedMs = Date.parse(String(fields.endedAt ?? fields.lastSeenAt ?? fields.startedAt));
+      if (Number.isFinite(endedMs) && nowMs - endedMs > HEADLESS_SESSION_EVIDENCE_RETENTION_MS) fs.unlinkSync(filePath);
+    } catch {
+      // Unreadable or already gone: kept for the next run, or nothing to do.
+    }
+  }
+}
+
+/**
  * Takes the project's headless run lock, reclaiming a dead holder's lock only
- * when its container is proven absent, and sweeps stale inbox prompts.
+ * when its container is proven absent, sweeps stale inbox prompts, and prunes
+ * expired headless session records.
  * Throws `HeadlessRunLockHeldError` when the lock is held; that refusal has
  * no side effect beyond the Docker inspection of a dead holder's container.
  */
@@ -326,6 +376,7 @@ export function acquireHeadlessRunLock(input: AcquireHeadlessRunLockInput): Head
       release();
       throw error;
     }
+    pruneExpiredHeadlessSessionRecords(input.sessionsDir, Date.now());
     return Object.freeze({
       path: lockPath,
       recordSession({ sessionId, containerName }) {

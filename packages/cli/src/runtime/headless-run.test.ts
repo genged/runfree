@@ -10,6 +10,7 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { APPROVAL_HEADLESS_DENIED_EVENT_PREFIX } from "@runfree/runtime-contracts/write-approvals";
 import { CliError } from "../errors.ts";
 import { headlessTerminalModeActive, hostTerminalInteractive } from "../terminal-mode.ts";
+import { pendingWarningsForTest } from "../warnings.ts";
 import type { HeadlessRuntimeHooks, HeadlessRuntimeResult } from "../runtime.ts";
 import type { HeadlessForegroundCapture, HeadlessForegroundSinks } from "./headless-foreground.ts";
 import { acquireHeadlessRunLock, headlessRunLockPath, type HeadlessRunLock } from "./headless-run-lock.ts";
@@ -57,7 +58,7 @@ beforeEach(() => {
   fs.writeFileSync(promptPath, "write the summary to report.md\n");
   context = {
     projectRoot,
-    project: { paths: { stateDir, inboxDir } },
+    project: { paths: { stateDir, inboxDir, sessionsDir: path.join(stateDir, "sessions") } },
     runtimeRoot: path.join(tmp, "runtime"),
     env: ENV,
   } as unknown as RuntimeContext;
@@ -463,6 +464,26 @@ describe("runHeadlessAgent", () => {
     expect(failed.released()).toBe(true);
   });
 
+  test.each([
+    ["a success becomes unverified", 0, 1],
+    ["an agent failure keeps its code", 2, 2],
+  ])("a run record that cannot be finalized: %s", async (_name, agentStatus, exitCode) => {
+    const h = harness({
+      launch: async (input, out) => {
+        input.headless.observer?.allocated({ sessionId: SESSION_ID, containerName: CONTAINER_NAME });
+        input.headless.observer?.containerCreated(CONTAINER_ID);
+        out.stdout(Buffer.from(SUCCESS_LINE));
+        out.stdoutEnded?.();
+        // run.json cannot be replaced: the record's final write fails.
+        fs.mkdirSync(path.join(stateDir, "runs", runDirs()[0] as string, "run.json"));
+        return { status: agentStatus, cancelled: false };
+      },
+    });
+    // The plain lock: the harness's release asserts a readable run.json.
+    expect(await run({ ...h, deps: { ...h.deps, acquireLock: acquireHeadlessRunLock } })).toBe(exitCode);
+    expect(pendingWarningsForTest().map((event) => event.message).join("\n")).toContain("the headless run record could not be finalized");
+  });
+
   test("an unconfirmed teardown keeps the lock and says so; the prompt is still deleted", async () => {
     const h = harness({
       launch: async (input) => {
@@ -480,7 +501,7 @@ describe("runHeadlessAgent", () => {
   });
 
   test("a held lock exits 66 with a skipped record and does no runtime work and no inbox write", async () => {
-    const holder = acquireHeadlessRunLock({ stateDir, inboxDir, io: baseIO, env: ENV });
+    const holder = acquireHeadlessRunLock({ stateDir, inboxDir, sessionsDir: path.join(stateDir, "sessions"), io: baseIO, env: ENV });
     try {
       const h = harness();
       expect(await run(h)).toBe(66);

@@ -2788,7 +2788,12 @@ describe("headless host evidence is never offered (headless-run plan C1)", () =>
     ]);
   });
 
-  test("a Codex rollout inside a headless record's window is neither offered nor matched to an overlapping interactive record", () => {
+  // A successful headless run keeps its record too (exit status 0), so its
+  // window claims its rollout the same way an interrupted one does.
+  test.each([
+    ["an interrupted", {}],
+    ["a successful", { exitStatus: 0 }],
+  ])("a Codex rollout inside %s headless record's window is neither offered nor matched to an overlapping interactive record", (_name, ending) => {
     const HEADLESS_THREAD = "01a0692c-7f74-7750-ad42-fb36200a0101";
     const INTERACTIVE_THREAD = "01a0692c-7f74-7750-ad42-fb36200a0102";
     interruptedHeadless("rf-20261025-hdlcdx", {
@@ -2796,6 +2801,7 @@ describe("headless host evidence is never offered (headless-run plan C1)", () =>
       launchConversationId: undefined,
       startedAt: "2026-07-31T00:10:00.000Z",
       endedAt: "2026-07-31T00:20:00.000Z",
+      ...ending,
     });
     hostEvidence("rf-20261025-intcdx", {
       command: "codex",
