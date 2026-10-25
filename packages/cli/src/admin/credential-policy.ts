@@ -73,6 +73,7 @@ import {
   settleHostSignals,
 } from "./credential-cancellation.ts";
 import { type CredentialReadInput } from "./credential-source-reader.ts";
+import { SEARCH_CONSOLE_TOKEN, searchConsoleWarningFor } from "./search-console-write-guard.ts";
 import {
   TOKEN_SYNC_DEFERRED_STATUS,
   TOKEN_SYNC_REPREPARE_STATUS,
@@ -723,6 +724,11 @@ export function credentialStatus(input: CredentialStatusInput = {}): void {
     const owner = credentialOwner(name);
     console.log(`  owner: ${owner ? describeCredentialOwner(owner) : "manual"}`);
     console.log(`  refresh: ${describeEffectiveRefresh(refresh)}`);
+    // Spec §5.1: the unsafe write pair is reported on every status run.
+    const writeScopeWarning = name === SEARCH_CONSOLE_TOKEN
+      ? searchConsoleWarningFor({ policy, binding: source, registry })
+      : undefined;
+    if (writeScopeWarning) console.log(`  warning: ${writeScopeWarning}`);
     console.log("  agent exposure: no");
     if (!credentialPolicy && source) {
       console.log(name.startsWith("user-")

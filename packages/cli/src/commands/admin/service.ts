@@ -14,6 +14,7 @@ import type { ArgumentsCamelCase, Argv } from "yargs";
 import { readAgentEnv, setAgentEnvValues } from "../../admin/admin-core.ts";
 import { planServiceParameterUpdate, serviceHostState } from "../../admin/service-policy.ts";
 import { createAdminState } from "../../admin/context.ts";
+import { SEARCH_CONSOLE_SERVICE, searchConsoleWarningForApprovedPolicy } from "../../admin/search-console-write-guard.ts";
 import {
   bindDesiredServiceCredentialSources,
   promptForMissingServiceParameters,
@@ -361,6 +362,10 @@ export const serviceCommand: CommandModule = {
       reportServiceMutation(result);
       console.log(`${layer} digest: ${result.layerDigest}`);
       if (boundSources.length > 0) console.log(`host-owned credential sources: ${boundSources.join(", ")} bound`);
+      if (plan.id === SEARCH_CONSOLE_SERVICE) {
+        const writeScopeWarning = searchConsoleWarningForApprovedPolicy(runtime);
+        if (writeScopeWarning) warn(writeScopeWarning);
+      }
       if (!intent.reloadProxy) {
         console.log("effective policy: unchanged (--no-reload)");
       } else {

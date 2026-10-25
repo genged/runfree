@@ -487,6 +487,50 @@ Important enable options:
 | `--local` | Write the checkout-local desired layer instead of the project layer. |
 | `--no-reload` | Leave effective controls unchanged after the desired mutation. |
 
+#### Google Search Console
+
+`google-search-console` allows one host, `searchconsole.googleapis.com`. The
+proxy injects the credential as `Authorization: Bearer <token>`; the agent gets
+only the placeholder `GOOGLE_SEARCH_CONSOLE_TOKEN`. The token belongs to a
+Google service account. In Search Console, add the service account's email as
+a user on each property the agent may read.
+
+A `gcloud` command source works now, with no key JSON on the host:
+
+```bash
+runfree credential source add gsc -- gcloud auth print-access-token \
+  --impersonate-service-account=<sa-email> \
+  --scopes=https://www.googleapis.com/auth/webmasters.readonly
+runfree service enable google-search-console --from-source gsc
+runfree credential set-source google-search-console --from-source gsc --refresh-every 50m --replace-source
+```
+
+This needs `gcloud` on the host and the `roles/iam.serviceAccountTokenCreator`
+role for your account on the service account. Keep the `--scopes` flag:
+without it, `gcloud` may mint a broad `cloud-platform` token. `service enable`
+has no `--refresh-every`; the `set-source` line adds the 50-minute refresh to
+the binding the enable made, and `--replace-source` is required because the
+credential is already bound.
+
+Search Analytics queries are writes. A query is a `POST` to
+`/webmasters/v3/sites/{siteUrl}/searchAnalytics/query`. The site URL sits in
+the middle of the path, so the only path prefix that covers the query also
+covers sitemap `PUT` and site `DELETE`. Runfree therefore keeps the query a
+write: under the default `ask` posture, each query asks for approval. Only URL
+Inspection (`/v1/urlInspection/index:inspect`) is a read.
+
+For read-only use without a prompt per query:
+
+1. Bind a source that has only the `webmasters.readonly` scope, as above.
+2. Run `runfree host rules searchconsole.googleapis.com --write allow`.
+
+This is safe only while the scope stays read-only, and Google's refusal of
+writes under that scope is not yet proven against the live API. Runfree cannot
+read the scope of a command, env, or 1Password source. While the host's write
+action is `allow` and such a source is bound, `service enable`,
+`service configure`, `host rules`, and every `credential status` print a
+warning that names `runfree host rules searchconsole.googleapis.com --write ask`.
+
 ### Service revisions
 
 An enabled entry keeps the revision it was enabled with. A newer Runfree

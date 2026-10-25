@@ -2159,6 +2159,85 @@ exit 0
     expect(status.stdout).not.toContain(privateKeyPem.trim());
   });
 
+  test("credential status warns on the google-search-console unsafe write pair (spec §5.1)", async () => {
+    const searchConsolePolicy = (writeAction: "allow" | "ask") => ({
+      hosts: ["searchconsole.googleapis.com"],
+      tokens: {
+        "google-search-console": {
+          description: "Google Search Console",
+          credentials: [
+            { host: "searchconsole.googleapis.com", header: "Authorization", scheme: "bearer" },
+          ],
+        },
+      },
+      requests: { "searchconsole.googleapis.com": { writeAction } },
+    });
+    writeFixtureRepo(searchConsolePolicy("allow"));
+    const fakeSource = installFakeCommandSource({ name: "gcloud", output: "ya29.search-console\n" });
+    const add = await runAdmin(() => sourceAddCommandIntent({
+      name: "gsc",
+      replaceSource: false,
+      command: ["gcloud", "auth", "print-access-token"],
+    }), { PATH: fakeSource.fakeBin });
+    expect(add.status, add.stderr).toBe(0);
+    writeTokenConfig({ "google-search-console": { source: "named", name: "gsc" } });
+
+    const unsafe = await runAdmin(() => credentialStatus());
+    fs.writeFileSync(path.join(tmp, ".runfree/network-policy.json"), `${JSON.stringify(searchConsolePolicy("ask"), null, 2)}\n`);
+    const prompting = await runAdmin(() => credentialStatus());
+
+    expect(unsafe.status, unsafe.stderr).toBe(0);
+    expect(unsafe.stdout).toContain("google-search-console: configured");
+    expect(unsafe.stdout).toMatch(/\n {2}warning: searchconsole\.googleapis\.com writes run without approval[^\n]*source gsc[^\n]*runfree host rules searchconsole\.googleapis\.com --write ask\n/);
+    expect(unsafe.stdout).not.toContain("ya29.search-console");
+    expect(prompting.status, prompting.stderr).toBe(0);
+    expect(prompting.stdout).toContain("google-search-console: configured");
+    expect(prompting.stdout).not.toContain("warning:");
+  });
+
+  test("a google-search-console command-source binding takes a refresh after enable (docs Services, P-D4)", async () => {
+    writeFixtureRepo({
+      hosts: ["searchconsole.googleapis.com"],
+      tokens: {
+        "google-search-console": {
+          description: "Google Search Console",
+          credentials: [
+            { host: "searchconsole.googleapis.com", header: "Authorization", scheme: "bearer" },
+          ],
+        },
+      },
+    });
+    const fakeSource = installFakeCommandSource({ name: "gcloud", output: "ya29.search-console\n" });
+    expect((await runAdmin(() => sourceAddCommandIntent({
+      name: "gsc",
+      replaceSource: false,
+      command: ["gcloud", "auth", "print-access-token"],
+    }), { PATH: fakeSource.fakeBin })).status).toBe(0);
+    // What `service enable google-search-console --from-source gsc` binds: no refresh.
+    writeTokenConfig({ "google-search-console": { source: "named", name: "gsc" } });
+
+    const withoutReplace = await runAdmin(() => credentialSetSourceIntent({
+      name: "google-search-console",
+      tokenSource: { kind: "named", name: "gsc" },
+      refreshEvery: "50m",
+      replaceSource: false,
+      sync: false,
+    }));
+    const withReplace = await runAdmin(() => credentialSetSourceIntent({
+      name: "google-search-console",
+      tokenSource: { kind: "named", name: "gsc" },
+      refreshEvery: "50m",
+      replaceSource: true,
+      sync: false,
+    }));
+    const status = await runAdmin(() => credentialStatus({ name: "google-search-console" }));
+
+    expect(withoutReplace.status).not.toBe(0);
+    expect(withoutReplace.stderr).toContain("--replace-source");
+    expect(withReplace.status, withReplace.stderr).toBe(0);
+    expect(status.stdout).toContain("refresh: every 50m");
+  });
+
   test("source remove refuses sources still used by credential bindings", async () => {
     writeFixtureRepo({
       hosts: ["api.github.com"],
