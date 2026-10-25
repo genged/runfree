@@ -2081,6 +2081,54 @@ describe("write classification (operation-aware read-only / approve-on-write)", 
     expect(at("GET", "/webmasters/v3/sites").write).toBe(false);
   });
 
+  test("google-search-console read-only method rule: GET and POST pass without approval, PUT and DELETE are refused by method", () => {
+    // What `runfree host rules searchconsole.googleapis.com --method GET
+    // --method POST --write allow` projects on top of the service rule, under
+    // the default ask posture. Every Search Console POST is a read in Google;
+    // the writes are PUT and DELETE.
+    const host = "searchconsole.googleapis.com";
+    const site = "/webmasters/v3/sites/https%3A%2F%2Fexample.com%2F";
+    const tokenReader = vi.fn(() => "real-proxy-token");
+    const hasWriteGrant = vi.fn(() => false);
+    const options: PolicyOptions = {
+      allowedHosts: [host],
+      credentials: {
+        [host]: [{ tokenName: "google-search-console", tokenDescription: "Google Search Console", host, header: "Authorization", scheme: "bearer" }],
+      },
+      requests: {
+        [host]: { methods: ["GET", "POST"], writeAction: "allow", readPathPrefixes: ["/v1/urlInspection/index:inspect"] },
+      },
+      tokenReader,
+      hasWriteGrant,
+      log: () => {},
+    };
+    const request = (method: string, p: string, headers: Record<string, string> = {}) =>
+      testBeforeAllowedRequest({ method, url: `https://${host}${p}`, headers: { Authorization: "Bearer placeholder", ...headers } }, options);
+    const injected = { headers: { authorization: "Bearer real-proxy-token" } };
+
+    expect(request("GET", "/webmasters/v3/sites")).toEqual(injected);
+    expect(request("POST", `${site}/searchAnalytics/query`)).toEqual(injected);
+    expect(request("POST", "/v1/urlInspection/index:inspect")).toEqual(injected);
+    expect(hasWriteGrant).not.toHaveBeenCalled();
+    expect(tokenReader).toHaveBeenCalledTimes(3);
+
+    tokenReader.mockClear();
+    for (const [method, p] of [["PUT", `${site}/sitemaps/https%3A%2F%2Fexample.com%2Fs.xml`], ["PUT", site], ["DELETE", site], ["DELETE", `${site}/sitemaps/x`]]) {
+      const denial = shapeDenial(() => request(method, p));
+      expect(denial.shape).toMatchObject({ reason: "method-not-allowed", host, method, allowedMethods: ["GET", "POST"] });
+    }
+    expect(tokenReader).not.toHaveBeenCalled();
+
+    // A header method override cannot turn an admitted POST into a DELETE:
+    // every override header is stripped before the request leaves the proxy.
+    expect(request("POST", site, {
+      "X-HTTP-Method-Override": "DELETE",
+      "x-http-method": "DELETE",
+      "X-Method-Override": "DELETE",
+    })).toEqual(injected);
+    expect(hasWriteGrant).not.toHaveBeenCalled();
+  });
+
   test("writePathPrefixes classify writes regardless of method", () => {
     const denial = shapeDenial(() => testBeforeAllowedRequest({
       method: "POST",
