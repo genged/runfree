@@ -131,6 +131,12 @@ async function startFakeProxy(responses: readonly string[]): Promise<FakeProxy> 
   });
 }
 
+// A port that refuses every connection. Port 1 is below the ephemeral range,
+// so no test server can be handed it between a "free port" check and the
+// probe; a released ephemeral port can be reused by a parallel test, which
+// then answers and the probe reads EXIT_UNEXPECTED instead of unreachable.
+const CLOSED_PORT = 1;
+
 async function unusedPort(): Promise<number> {
   const server = net.createServer();
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -524,8 +530,7 @@ describe("session readiness probe against the real request proxy", () => {
   });
 
   test("exits unreachable when the proxy port is closed", async () => {
-    const port = await unusedPort();
-    const result = await runProbe({ PROXY_IP: "127.0.0.1", RUNFREE_SESSION_READY_PROBE_PORT: String(port) });
+    const result = await runProbe({ PROXY_IP: "127.0.0.1", RUNFREE_SESSION_READY_PROBE_PORT: String(CLOSED_PORT) });
     expect(result.status, result.stderr).toBe(probeModule.EXIT_UNREACHABLE);
   });
 
@@ -636,8 +641,7 @@ describe("session entry", () => {
     // Registration precedes reachability: before the firewall admits the
     // session's address the probe cannot connect at all. That must read as
     // "not yet", not as a failure.
-    const port = await unusedPort();
-    const result = await runEntry([fakeAgentPath], entryEnv(port, { RUNFREE_SESSION_ENTRY_TIMEOUT_MS: "1200" }));
+    const result = await runEntry([fakeAgentPath], entryEnv(CLOSED_PORT, { RUNFREE_SESSION_ENTRY_TIMEOUT_MS: "1200" }));
     expect(result.status, result.stderr).toBe(111);
     expect(fs.existsSync(argvPath)).toBe(false);
   });
