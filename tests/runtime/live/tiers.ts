@@ -45,6 +45,7 @@ export const MIXED_LIVE_FILES = [
   "tests/runtime/live/session-admission-crash.live.test.ts",
   "tests/runtime/live/ingress-forwarder.live.test.ts",
   "tests/runtime/live/launch-latency.live.test.ts",
+  "tests/runtime/live/headless-run.live.test.ts",
 ] as const;
 
 /**
