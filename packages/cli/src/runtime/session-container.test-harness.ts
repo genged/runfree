@@ -413,6 +413,7 @@ export function sessionContainerRecordFixture(input: {
       effectiveControlPlane: effectiveControlPlaneFixture({ target }),
       hostPid: 123,
       createdAt: "2026-08-08T12:00:00.000Z",
+      launchMode: "interactive",
     }),
     ...input.overrides,
   };

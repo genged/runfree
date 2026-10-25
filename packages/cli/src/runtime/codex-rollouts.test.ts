@@ -140,6 +140,7 @@ function minimalSessionContainerRecord(overrides: Partial<SessionContainerRecord
     launchArgs: [],
     interactive: true,
     tty: true,
+    launchMode: "interactive",
     state: "attached",
     containerName: `runfree-000000000000-session-${sessionId}`,
     sourceIp: "172.31.90.20",

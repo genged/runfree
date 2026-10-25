@@ -336,6 +336,7 @@ test("stores and reuses the exact session template snapshot despite post-plan ag
     effectiveControlPlane,
     hostPid: 123,
     createdAt: "2026-08-08T12:00:00.000Z",
+    launchMode: "interactive",
   });
   const createPlan = createSessionContainerCreatePlan({
     expectedProject: { projectId: plan.projectId, composeProject: plan.composeProjectName },

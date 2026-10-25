@@ -1661,6 +1661,7 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
       hostBootId: hostBootId(this.#input.context.env),
       hostProcessStart: hostProcessStart(process.pid, this.#input.context.env),
       createdAt: new Date(createdAtMs).toISOString(),
+      launchMode: "interactive",
     });
     writeSessionContainerRecordV2(this.#input.plan.paths.stateDir, preflight.expectedProject, record);
     this.#record = record;

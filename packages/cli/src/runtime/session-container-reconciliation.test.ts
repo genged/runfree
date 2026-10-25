@@ -69,6 +69,7 @@ function allocated(index = 0): SessionContainerRecordV2 {
     effectiveControlPlane: effectiveControlPlaneFixture(),
     hostPid: 1234 + index,
     createdAt: "2026-08-05T12:00:00.000Z",
+    launchMode: "interactive",
   });
 }
 

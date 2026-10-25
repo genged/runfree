@@ -4254,6 +4254,7 @@ describe("runtime command flow", () => {
       // A lapsed lease does not prove death. This record has a dead owner.
       hostPid: 99_999_999,
       createdAt: "2026-08-23T19:00:00.000Z",
+      launchMode: "interactive",
     });
     const bound = bindAllocatedSessionContainerIdV2(allocated, "7".repeat(64));
     const attached = transitionProvisioningRunningSessionContainerToAttachedV2(
@@ -5107,6 +5108,7 @@ describe("runtime command flow", () => {
         effectiveControlPlane: effectiveControlPlane.selection,
         hostPid: 99_999_999,
         createdAt: "2026-08-23T19:00:00.000Z",
+        launchMode: "interactive",
       });
       const attached = transitionProvisioningRunningSessionContainerToAttachedV2(
         transitionBoundAllocatedSessionContainerToProvisioningRunningV2(
@@ -5233,6 +5235,7 @@ describe("runtime command flow", () => {
         // the owner either way: the owner reads as unknown.
         ...(processStart && !options.unknownOwner ? { hostProcessStart: processStart } : {}),
         createdAt: new Date().toISOString(),
+        launchMode: "interactive",
       });
       const record = transitionProvisioningRunningSessionContainerToAttachedV2(
         transitionBoundAllocatedSessionContainerToProvisioningRunningV2(

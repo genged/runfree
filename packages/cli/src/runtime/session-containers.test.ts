@@ -43,6 +43,7 @@ import {
   writeSessionContainerRecordV2,
 } from "./session-containers.ts";
 import { createSessionLaunchTarget } from "./session-launch.ts";
+import { stableJson } from "../strict-primitives.ts";
 
 const roots: string[] = [];
 const PROJECT = { projectId: "0123456789ab", composeProject: "runfree-0123456789ab" };
@@ -87,6 +88,7 @@ function allocated(overrides: Partial<SessionContainerRecordV2> = {}): SessionCo
       hostBootId: "linux:boot-id",
       hostProcessStart: "linux:123",
       createdAt: "2026-08-05T12:00:00.000Z",
+      launchMode: "interactive",
     }),
     ...overrides,
   };
@@ -275,6 +277,7 @@ describe("session-container lifecycle records", () => {
       effectiveControlPlane: controlPlane,
       hostPid: 1234,
       createdAt: "2026-08-05T12:00:00.000Z",
+      launchMode: "interactive",
       imageRef: "attacker.example/forged:latest",
       imageId: digest("0"),
     } as never);
@@ -679,6 +682,136 @@ describe("session-container lifecycle records", () => {
     expect(fs.existsSync(sessionContainerRecordPath(stateDir, SESSION_ID))).toBe(true);
     expect(removeExactSessionContainerRecordV2(stateDir, PROJECT, record)).toBe(true);
     expect(removeExactSessionContainerRecordV2(stateDir, PROJECT, record)).toBe(false);
+  });
+});
+
+// The exact pre-launchMode record shape: the schema-4 key set a host from
+// before headless runs wrote, which only ever launched interactive sessions.
+function legacyV4(record: SessionContainerRecordV2): Record<string, unknown> {
+  const { launchMode: _launchMode, ...rest } = record;
+  return { ...rest, schemaVersion: 4 };
+}
+
+function legacyV4Source(record: SessionContainerRecordV2): string {
+  return `${stableJson(legacyV4(record) as never)}\n`;
+}
+
+describe("session-container launch mode", () => {
+  test("a schema-5 record requires an exact launchMode", () => {
+    const record = allocated();
+    const { launchMode: _launchMode, ...missing } = record;
+    expect(parseSessionContainerRecordV2(missing)).toBeUndefined();
+    for (const launchMode of ["batch", null, true, "", "Headless", 1]) {
+      expect(parseSessionContainerRecordV2({ ...record, launchMode })).toBeUndefined();
+    }
+  });
+
+  test("interactive and headless records round-trip through serialization", () => {
+    for (const launchMode of ["interactive", "headless"] as const) {
+      const record = allocated({ launchMode });
+      const serialized = serializeSessionContainerRecordV2(record);
+      expect(JSON.parse(serialized)).toMatchObject({ schemaVersion: 5, launchMode });
+      expect(parseSessionContainerRecordV2(JSON.parse(serialized))).toEqual(record);
+    }
+  });
+
+  test("allocation takes the launch mode from its input", () => {
+    expect(allocated().launchMode).toBe("interactive");
+    const headless = createAllocatedSessionContainerRecordV2({
+      sessionId: SESSION_ID,
+      displayName: "payments refactor",
+      command: "codex",
+      launch: createSessionLaunchTarget({
+        path: "/usr/local/bin/codex",
+        args: ["--dangerously-bypass-approvals-and-sandbox"],
+        interactive: true,
+        tty: true,
+      }),
+      sourceIp: "172.31.90.20",
+      materialization: sessionAgentMaterializationFixture(),
+      effectiveControlPlane: effectiveControlPlaneFixture(),
+      hostPid: 1234,
+      createdAt: "2026-08-05T12:00:00.000Z",
+      launchMode: "headless",
+    });
+    expect(headless.launchMode).toBe("headless");
+    expect(() => createAllocatedSessionContainerRecordV2({
+      sessionId: SESSION_ID,
+      displayName: "payments refactor",
+      command: "codex",
+      launch: createSessionLaunchTarget({ path: "/usr/local/bin/codex", args: [], interactive: true, tty: true }),
+      sourceIp: "172.31.90.20",
+      materialization: sessionAgentMaterializationFixture(),
+      effectiveControlPlane: effectiveControlPlaneFixture(),
+      hostPid: 1234,
+      createdAt: "2026-08-05T12:00:00.000Z",
+    } as never)).toThrow("lifecycle record is invalid");
+  });
+
+  test("a transition cannot change the launch mode", () => {
+    const record = allocated();
+    expect(() => assertSessionContainerTransitionV2(record, { ...state(record, "revoking"), launchMode: "headless" }))
+      .toThrow("changed immutable launchMode");
+    const headless = allocated({ launchMode: "headless" });
+    expect(() => transitionSessionContainerToRevokingV2(headless)).not.toThrow();
+    expect(transitionSessionContainerToRevokingV2(headless).launchMode).toBe("headless");
+  });
+
+  test("an exact schema-4 record reads as interactive and is written back as schema 5", () => {
+    const record = allocated();
+    const legacy = legacyV4(record);
+    const parsed = parseSessionContainerRecordV2(legacy);
+    expect(parsed).toEqual(record);
+    expect(parsed?.schemaVersion).toBe(5);
+    expect(parsed?.launchMode).toBe("interactive");
+    expect(JSON.parse(serializeSessionContainerRecordV2(parsed as SessionContainerRecordV2)))
+      .toMatchObject({ schemaVersion: 5, launchMode: "interactive" });
+    // Schema 4 never carried the field, so either value there is forged.
+    expect(parseSessionContainerRecordV2({ ...legacy, launchMode: "interactive" })).toBeUndefined();
+    expect(parseSessionContainerRecordV2({ ...legacy, launchMode: "headless" })).toBeUndefined();
+    // The legacy read is still the full strict parse.
+    expect(parseSessionContainerRecordV2({ ...legacy, sourceIp: "not-an-address" })).toBeUndefined();
+    expect(parseSessionContainerRecordV2({ ...legacy, schemaVersion: 3 })).toBeUndefined();
+  });
+
+  test("a schema-4 record on disk is listed, not quarantined, and its lifecycle continues", () => {
+    const stateDir = temporaryState();
+    const record = allocated();
+    const filePath = sessionContainerRecordPath(stateDir, SESSION_ID);
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
+    fs.writeFileSync(filePath, legacyV4Source(record), { mode: 0o600 });
+
+    const enumeration = enumerateSessionContainerRecordsV2(stateDir, PROJECT);
+    expect(enumeration.records).toEqual([record]);
+    expect(enumeration.quarantined).toEqual([]);
+    expect(listSessionContainerRecordsV2(stateDir, PROJECT)).toEqual([record]);
+    expect(listQuarantinedSessionContainerRecordNamesV2(stateDir)).toEqual([]);
+    expect(readSessionContainerRecordV2(stateDir, PROJECT, SESSION_ID)).toEqual(record);
+
+    // Teardown of a pre-upgrade session replaces the schema-4 bytes exactly
+    // once and writes the schema-5 form.
+    const revoking = transitionSessionContainerToRevokingV2(record);
+    replaceExactSessionContainerRecordV2(stateDir, PROJECT, record, revoking);
+    expect(fs.readFileSync(filePath, "utf8")).toBe(serializeSessionContainerRecordV2(revoking));
+    expect(removeExactSessionContainerRecordV2(stateDir, PROJECT, revoking)).toBe(true);
+  });
+
+  test("a schema-4 record on disk is not replaced from a stale headless expectation", () => {
+    const stateDir = temporaryState();
+    const record = allocated();
+    const filePath = sessionContainerRecordPath(stateDir, SESSION_ID);
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
+    const legacySource = legacyV4Source(record);
+    fs.writeFileSync(filePath, legacySource, { mode: 0o600 });
+
+    const headless = allocated({ launchMode: "headless" });
+    expect(() => replaceExactSessionContainerRecordV2(
+      stateDir,
+      PROJECT,
+      headless,
+      transitionSessionContainerToRevokingV2(headless),
+    )).toThrow("changed before replacement");
+    expect(fs.readFileSync(filePath, "utf8")).toBe(legacySource);
   });
 });
 

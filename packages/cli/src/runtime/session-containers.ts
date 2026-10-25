@@ -24,7 +24,11 @@ import { readBoundedRegularFile, isRecord } from "../strict-primitives.ts";
 import { fsyncDirectory } from "../safe-fs.ts";
 import { stableJson } from "../strict-primitives.ts";
 
-export const SESSION_CONTAINER_RECORD_SCHEMA_VERSION = 4 as const;
+export const SESSION_CONTAINER_RECORD_SCHEMA_VERSION = 5 as const;
+// Schema 4 is the exact record before `launchMode`. A host of that version
+// only launched interactive sessions, so its records still read, as
+// interactive; writers only ever write the current schema.
+const LEGACY_INTERACTIVE_RECORD_SCHEMA_VERSION = 4;
 export const SESSION_CONTAINER_RECORD_SCAN_LIMIT = 256;
 export const SESSION_CONTAINER_LEASE_MIN_DURATION_MS = 1_000;
 export const SESSION_CONTAINER_LEASE_MAX_DURATION_MS = SESSION_ADMISSION_LEASE_MAX_DURATION_MS;
@@ -48,6 +52,15 @@ export const SESSION_CONTAINER_STATES = [
 
 export type SessionContainerStateV2 = typeof SESSION_CONTAINER_STATES[number];
 
+export const SESSION_LAUNCH_MODES = ["interactive", "headless"] as const;
+
+/**
+ * How the host drives the session. Set once at allocation from the launch
+ * request, never derived from `interactive` or `tty`, and projected into the
+ * session file so the proxy can tell a headless session from an attended one.
+ */
+export type SessionLaunchMode = typeof SESSION_LAUNCH_MODES[number];
+
 export type SessionContainerRecordV2 = {
   schemaVersion: typeof SESSION_CONTAINER_RECORD_SCHEMA_VERSION;
   projectId: string;
@@ -61,6 +74,7 @@ export type SessionContainerRecordV2 = {
   launchArgs: readonly string[];
   interactive: boolean;
   tty: boolean;
+  launchMode: SessionLaunchMode;
   state: SessionContainerStateV2;
   containerName: string;
   containerId?: string;
@@ -108,6 +122,7 @@ export type AllocatedSessionContainerInputV2 = Pick<
   | "hostBootId"
   | "hostProcessStart"
   | "createdAt"
+  | "launchMode"
 > & {
   materialization: SessionAgentMaterializationManifestV2;
   effectiveControlPlane: ControlPlaneEffectiveSelectionV2;
@@ -154,6 +169,7 @@ const REQUIRED_RECORD_KEYS = [
   "launchArgs",
   "interactive",
   "tty",
+  "launchMode",
   "state",
   "containerName",
   "sourceIp",
@@ -196,6 +212,7 @@ const IMMUTABLE_RECORD_KEYS = [
   "launchPath",
   "interactive",
   "tty",
+  "launchMode",
   "containerName",
   "sourceIp",
   "selectedAgentImageRef",
@@ -219,6 +236,35 @@ function hasExactRecordKeys(value: Record<string, unknown>): boolean {
   const keys = new Set([...REQUIRED_RECORD_KEYS, ...OPTIONAL_RECORD_KEYS]);
   return REQUIRED_RECORD_KEYS.every((key) => Object.hasOwn(value, key))
     && Object.keys(value).every((key) => keys.has(key as never));
+}
+
+function launchModeIs(value: unknown): value is SessionLaunchMode {
+  return typeof value === "string" && (SESSION_LAUNCH_MODES as readonly string[]).includes(value);
+}
+
+/**
+ * Lifts an exact schema-4 record to the current schema. The legacy shape must
+ * not carry `launchMode` at all: schema 4 never had it, so a value there is
+ * forged rather than legacy. Everything else is left to the one strict parse.
+ */
+function liftLegacyInteractiveRecord(value: Record<string, unknown>): Record<string, unknown> {
+  if (value.schemaVersion !== LEGACY_INTERACTIVE_RECORD_SCHEMA_VERSION || Object.hasOwn(value, "launchMode")) {
+    return value;
+  }
+  return { ...value, schemaVersion: SESSION_CONTAINER_RECORD_SCHEMA_VERSION, launchMode: "interactive" };
+}
+
+function legacyInteractiveRecordSource(record: SessionContainerRecordV2): string | undefined {
+  if (record.launchMode !== "interactive") return undefined;
+  const { launchMode: _launchMode, ...legacy } = record;
+  return `${stableJson({ ...legacy, schemaVersion: LEGACY_INTERACTIVE_RECORD_SCHEMA_VERSION } as unknown as StrictJson)}\n`;
+}
+
+// The exact bytes on disk must be `record` as the host wrote it: the current
+// serialization, or the exact schema-4 bytes an interactive record read from.
+function recordSourceIs(source: string, record: SessionContainerRecordV2): boolean {
+  return source === serializeSessionContainerRecordV2(record)
+    || source === legacyInteractiveRecordSource(record);
 }
 
 function boundedText(value: unknown, maximum: number): value is string {
@@ -356,9 +402,12 @@ export function mintSessionContainerLeaseV2(
   return Object.freeze({ admittedAt, leaseGeneration, leaseExpiresAt });
 }
 
-export function parseSessionContainerRecordV2(value: unknown): SessionContainerRecordV2 | undefined {
-  if (!isRecord(value) || !hasExactRecordKeys(value)) return undefined;
+export function parseSessionContainerRecordV2(input: unknown): SessionContainerRecordV2 | undefined {
+  if (!isRecord(input)) return undefined;
+  const value = liftLegacyInteractiveRecord(input);
+  if (!hasExactRecordKeys(value)) return undefined;
   if (value.schemaVersion !== SESSION_CONTAINER_RECORD_SCHEMA_VERSION) return undefined;
+  if (!launchModeIs(value.launchMode)) return undefined;
   if (typeof value.projectId !== "string" || !PROJECT_ID_PATTERN.test(value.projectId)) return undefined;
   if (value.composeProject !== `runfree-${value.projectId}`) return undefined;
   if (typeof value.sessionId !== "string" || !SESSION_ID_PATTERN.test(value.sessionId)) return undefined;
@@ -458,6 +507,7 @@ export function createAllocatedSessionContainerRecordV2(
     launchArgs: Object.freeze([...input.launch.args]),
     interactive: input.launch.interactive,
     tty: input.launch.tty,
+    launchMode: input.launchMode,
     state: "allocated",
     containerName: sessionContainerName(materialization.projectId, input.sessionId),
     sourceIp: input.sourceIp,
@@ -830,7 +880,7 @@ export function replaceExactSessionContainerRecordV2(
   }
   const filePath = sessionContainerRecordPath(stateDir, current.sessionId);
   const observed = readRegularStateFile(filePath);
-  if (!observed || observed.source !== serializeSessionContainerRecordV2(current)) {
+  if (!observed || !recordSourceIs(observed.source, current)) {
     throw new Error("session-container lifecycle record changed before replacement");
   }
   atomicReplaceStateFile(stateDir, filePath, serializeSessionContainerRecordV2(next), observed);
@@ -889,7 +939,7 @@ export function replaceExactSessionContainerRecordForControlPlaneRebindV2(
   }
   const filePath = sessionContainerRecordPath(stateDir, current.sessionId);
   const observed = readRegularStateFile(filePath);
-  if (!observed || observed.source !== serializeSessionContainerRecordV2(current)) {
+  if (!observed || !recordSourceIs(observed.source, current)) {
     throw new Error("session-container lifecycle record changed before control-plane rebind");
   }
   atomicReplaceStateFile(stateDir, filePath, serializeSessionContainerRecordV2(next), observed);
@@ -909,7 +959,7 @@ export function bindExactAllocatedSessionContainerRecordIdV2(
   }
   const filePath = sessionContainerRecordPath(stateDir, current.sessionId);
   const observed = readRegularStateFile(filePath);
-  if (!observed || observed.source !== serializeSessionContainerRecordV2(current)) {
+  if (!observed || !recordSourceIs(observed.source, current)) {
     throw new Error("session-container lifecycle record changed before container-id binding");
   }
   atomicReplaceStateFile(stateDir, filePath, serializeSessionContainerRecordV2(next), observed);

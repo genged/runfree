@@ -368,6 +368,7 @@ function recordInput() {
     sourceIp: "172.83.0.20",
     hostPid: 1234,
     createdAt: "2026-08-09T12:00:01.000Z",
+    launchMode: "interactive",
   } as const;
 }
 
