@@ -132,7 +132,7 @@ describe("runtime asset materialization", () => {
     expect(lockEnv.RUNFREE_PROXY_BASE_IMAGE).toBe(lockEnv.RUNFREE_AGENT_BASE_IMAGE);
     expect(lockEnv.RUNFREE_APT_SOURCE_UBUNTU_URL).toBe("http://archive.ubuntu.com/ubuntu");
     expect(lockEnv.RUNFREE_APT_SOURCE_UBUNTU_SECURITY_URL).toBe("http://security.ubuntu.com/ubuntu");
-    expect(lockEnv.RUNFREE_APT_PACKAGE_GIT).toBe("1:2.53.0-1ubuntu1");
+    expect(lockEnv.RUNFREE_APT_PACKAGE_GIT).toBe("1:2.53.0-1ubuntu1.1");
     expect(lockEnv.RUNFREE_APT_PACKAGE_NODEJS).toBe("22.22.1+dfsg+~cs22.19.15-1ubuntu1");
     expect(lockEnv.RUNFREE_APT_PACKAGE_NPM).toBe("9.2.0~ds3-1");
   });

@@ -2,13 +2,13 @@
   "schemaVersion": 1,
   "images": {
     "agentBase": {
-      "ref": "ubuntu:26.04@sha256:f3d28607ddd78734bb7f71f117f3c6706c666b8b76cbff7c9ff6e5718d46ff64"
+      "ref": "ubuntu:26.04@sha256:c098726dd9b9733f3e885f8de0ef375206a311b0a317eadc40d347b1115fb944"
     },
     "uv": {
-      "ref": "ghcr.io/astral-sh/uv:0.5.27@sha256:5adf09a5a526f380237408032a9308000d14d5947eafa687ad6c6a2476787b4f"
+      "ref": "ghcr.io/astral-sh/uv:0.13.5@sha256:32a7bb39b496babbd997b0a39a4d66c126bdaf5661b302bf6f06abda8deca6ff"
     },
     "proxyBase": {
-      "ref": "ubuntu:26.04@sha256:f3d28607ddd78734bb7f71f117f3c6706c666b8b76cbff7c9ff6e5718d46ff64"
+      "ref": "ubuntu:26.04@sha256:c098726dd9b9733f3e885f8de0ef375206a311b0a317eadc40d347b1115fb944"
     }
   },
   "apt": {
@@ -41,19 +41,19 @@
     "packages": {
       "bash": "5.3-2ubuntu1",
       "bind9-dnsutils": "1:9.20.24-1ubuntu0.4",
-      "ca-certificates": "20260223",
+      "ca-certificates": "20260816ubuntu0.26.04.1",
       "curl": "8.18.0-1ubuntu2.8",
       "dumb-init": "1.2.5-3build1",
-      "git": "1:2.53.0-1ubuntu1",
-      "iproute2": "6.19.0-1ubuntu1",
+      "git": "1:2.53.0-1ubuntu1.1",
+      "iproute2": "6.19.0-1ubuntu1.1",
       "jq": "1.8.1-4ubuntu2",
       "netcat-openbsd": "1.234-1",
       "nftables": "1.1.6-1",
       "nodejs": "22.22.1+dfsg+~cs22.19.15-1ubuntu1",
       "npm": "9.2.0~ds3-1",
       "ripgrep": "15.1.0-1ubuntu1",
-      "sudo": "1.9.17p2-1ubuntu3",
-      "util-linux": "2.41.3-3ubuntu2",
+      "sudo": "1.9.17p2-1ubuntu3.2",
+      "util-linux": "2.41.3-3ubuntu2.2",
       "zsh": "5.9-8ubuntu3"
     }
   },
