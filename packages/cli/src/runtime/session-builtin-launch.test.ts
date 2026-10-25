@@ -320,6 +320,20 @@ describe("built-in session headless launch", () => {
     })).toThrow("does not support headless runs");
   });
 
+  test("the headless argv is the descriptor's own, appended after the host-chosen id", () => {
+    const descriptor = builtinAgent("claude");
+    if (!descriptor?.headless) throw new Error("claude descriptor has no headless argv");
+    const target = createBuiltinSessionHeadlessLaunchTarget({
+      agentId: "claude",
+      configuredCommand: CLAUDE_DEFAULT,
+      launchConversationId: ID,
+      promptPath: PROMPT_PATH,
+    });
+    expect(target.args.slice(-descriptor.headless.args.length)).toEqual(descriptor.headless.args);
+    expect(target.args.slice(-descriptor.headless.args.length - 2, -descriptor.headless.args.length))
+      .toEqual(["--session-id", ID]);
+  });
+
   test("the canonical builder refuses a headless argv carried on an interactive or TTY target", () => {
     const target = createBuiltinSessionHeadlessLaunchTarget({ agentId: "claude", configuredCommand: CLAUDE_DEFAULT, promptPath: PROMPT_PATH });
     expect(() => createSessionLaunchTarget({ path: target.path, args: target.args, interactive: true, tty: true }))

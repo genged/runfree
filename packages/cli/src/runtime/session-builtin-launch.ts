@@ -51,13 +51,6 @@ function sessionEntryLaunchTarget(
   });
 }
 
-// Headless argv appended to the built-in default command (spec §3.1). Only
-// Claude until the descriptors carry their own headless argv; an agent absent
-// here has no headless run.
-const HEADLESS_AGENT_ARGS: Readonly<Record<string, readonly string[]>> = Object.freeze({
-  claude: Object.freeze(["-p", "--output-format", "stream-json", "--verbose"]),
-});
-
 function requireExactBuiltin(input: Readonly<{ agentId: string; configuredCommand: string }>): BuiltinAgentDescriptor {
   const descriptor = builtinAgent(input.agentId);
   if (!descriptor) throw new Error(`unknown built-in session agent: ${input.agentId || "<empty>"}`);
@@ -142,7 +135,7 @@ export function createBuiltinSessionHeadlessLaunchTarget(input: Readonly<{
   promptPath: string;
 }>): SessionLaunchTarget {
   const descriptor = requireExactBuiltin(input);
-  const headlessArgs = Object.hasOwn(HEADLESS_AGENT_ARGS, descriptor.id) ? HEADLESS_AGENT_ARGS[descriptor.id] : undefined;
+  const headlessArgs = descriptor.headless?.args;
   if (!headlessArgs) throw new Error(`built-in session agent ${descriptor.id} does not support headless runs`);
   const conversationArgs = input.launchConversationId === undefined
     ? []

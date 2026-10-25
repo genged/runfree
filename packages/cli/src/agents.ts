@@ -16,6 +16,9 @@ export type AgentStateMount = {
   mode: number;
 };
 
+export const HEADLESS_OUTPUT_FORMATS = ["claude-stream-json", "codex-exec-json", "pi-json"] as const;
+export type HeadlessOutputFormat = (typeof HEADLESS_OUTPUT_FORMATS)[number];
+
 export type BuiltinAgentDescriptor = {
   directLaunch: {
     args: string[];
@@ -24,6 +27,12 @@ export type BuiltinAgentDescriptor = {
   defaultCommand: string;
   legacyDefaultCommands?: string[];
   env: Record<string, string>;
+  /**
+   * Headless-run argv appended to the default command after any host-chosen
+   * conversation id (headless-run spec §3.1, plan C10), and the stdout event
+   * format its parser reads. An agent without it has no `runfree run`.
+   */
+  headless?: Readonly<{ args: readonly string[]; outputFormat: HeadlessOutputFormat }>;
   id: string;
   label: string;
   /**
@@ -83,6 +92,10 @@ const DESCRIPTORS: BuiltinAgentDescriptor[] = [
         bootstrap: { type: "empty-json-file" },
       },
     ],
+    headless: {
+      args: ["-p", "--output-format", "stream-json", "--verbose"],
+      outputFormat: "claude-stream-json",
+    },
     requiredServices: ["agent-claude"],
     launchConversationIdFlag: "--session-id",
     processNames: ["claude"],
@@ -248,6 +261,19 @@ export function validateBuiltinAgentDescriptors(descriptors: readonly BuiltinAge
     }
     if (descriptor.launchConversationIdFlag !== undefined && descriptor.launchConversationIdFlag !== "--session-id") {
       throw new Error(`built-in agent ${descriptor.id} launch conversation id flag must be --session-id`);
+    }
+    if (descriptor.headless !== undefined) {
+      const { args, outputFormat } = descriptor.headless;
+      // Control characters (C0 and DEL) never belong in host-minted argv.
+      if (args.length === 0 || args.some((entry) => entry === "" || /[\u0000-\u001f\u007f]/.test(entry))) {
+        throw new Error(`built-in agent ${descriptor.id} headless argv must contain safe non-empty elements`);
+      }
+      if (args.includes("--session-id")) {
+        throw new Error(`built-in agent ${descriptor.id} headless argv must not carry --session-id`);
+      }
+      if (!HEADLESS_OUTPUT_FORMATS.includes(outputFormat)) {
+        throw new Error(`built-in agent ${descriptor.id} headless output format is not known`);
+      }
     }
     for (const command of descriptor.legacyDefaultCommands ?? []) {
       if (command.trim() === "" || command === descriptor.defaultCommand) {

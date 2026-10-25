@@ -141,4 +141,34 @@ describe("built-in agent descriptors", () => {
       cloneDescriptor({ resume: { pickerArgv: ["claude", "--session-id", "x"] } }),
     ])).toThrow("resume argv must not carry --session-id");
   });
+
+  // Headless-run spec §3.1: the headless argv lives on the descriptor, and
+  // only Claude has one until plan Task 15.
+  test("carries the Claude headless argv and output format on the descriptor", () => {
+    expect(BUILTIN_AGENT_DESCRIPTORS.map((descriptor) => descriptor.headless)).toEqual([
+      { args: ["-p", "--output-format", "stream-json", "--verbose"], outputFormat: "claude-stream-json" },
+      undefined,
+      undefined,
+    ]);
+  });
+
+  test.each([
+    [["-p", ""], "headless argv"],
+    [["-p", "a\nb"], "headless argv"],
+    [["-p", "a\u0007"], "headless argv"],
+    [[], "headless argv"],
+    [["--session-id"], "headless argv must not carry --session-id"],
+  ])("rejects unsafe headless argv %j", (args, message) => {
+    expect(() => validateBuiltinAgentDescriptors([
+      cloneDescriptor({ headless: { args, outputFormat: "claude-stream-json" } }),
+    ])).toThrow(message);
+  });
+
+  test("rejects an unknown headless output format", () => {
+    expect(() => validateBuiltinAgentDescriptors([
+      cloneDescriptor({
+        headless: { args: ["-p"], outputFormat: "text" as unknown as "claude-stream-json" },
+      }),
+    ])).toThrow("headless output format");
+  });
 });
