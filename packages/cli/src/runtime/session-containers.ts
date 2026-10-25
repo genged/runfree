@@ -4,8 +4,10 @@ import path from "node:path";
 
 import {
   isExactSessionSourceIpv4,
+  isSessionLaunchMode,
   SESSION_ADMISSION_LEASE_MAX_DURATION_MS,
   SESSION_DISPLAY_COMMAND_MAX_CHARACTERS,
+  type SessionLaunchMode,
 } from "@runfree/runtime-contracts/session-registry";
 
 import { parseStrictJson } from "../control/strict-json.ts";
@@ -52,15 +54,6 @@ export const SESSION_CONTAINER_STATES = [
 
 export type SessionContainerStateV2 = typeof SESSION_CONTAINER_STATES[number];
 
-export const SESSION_LAUNCH_MODES = ["interactive", "headless"] as const;
-
-/**
- * How the host drives the session. Set once at allocation from the launch
- * request, never derived from `interactive` or `tty`, and projected into the
- * session file so the proxy can tell a headless session from an attended one.
- */
-export type SessionLaunchMode = typeof SESSION_LAUNCH_MODES[number];
-
 export type SessionContainerRecordV2 = {
   schemaVersion: typeof SESSION_CONTAINER_RECORD_SCHEMA_VERSION;
   projectId: string;
@@ -74,6 +67,8 @@ export type SessionContainerRecordV2 = {
   launchArgs: readonly string[];
   interactive: boolean;
   tty: boolean;
+  // Set once at allocation from the launch request, never derived from
+  // `interactive` or `tty`, and projected into the session file.
   launchMode: SessionLaunchMode;
   state: SessionContainerStateV2;
   containerName: string;
@@ -236,10 +231,6 @@ function hasExactRecordKeys(value: Record<string, unknown>): boolean {
   const keys = new Set([...REQUIRED_RECORD_KEYS, ...OPTIONAL_RECORD_KEYS]);
   return REQUIRED_RECORD_KEYS.every((key) => Object.hasOwn(value, key))
     && Object.keys(value).every((key) => keys.has(key as never));
-}
-
-function launchModeIs(value: unknown): value is SessionLaunchMode {
-  return typeof value === "string" && (SESSION_LAUNCH_MODES as readonly string[]).includes(value);
 }
 
 /**
@@ -407,7 +398,7 @@ export function parseSessionContainerRecordV2(input: unknown): SessionContainerR
   const value = liftLegacyInteractiveRecord(input);
   if (!hasExactRecordKeys(value)) return undefined;
   if (value.schemaVersion !== SESSION_CONTAINER_RECORD_SCHEMA_VERSION) return undefined;
-  if (!launchModeIs(value.launchMode)) return undefined;
+  if (!isSessionLaunchMode(value.launchMode)) return undefined;
   if (typeof value.projectId !== "string" || !PROJECT_ID_PATTERN.test(value.projectId)) return undefined;
   if (value.composeProject !== `runfree-${value.projectId}`) return undefined;
   if (typeof value.sessionId !== "string" || !SESSION_ID_PATTERN.test(value.sessionId)) return undefined;

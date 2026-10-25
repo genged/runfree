@@ -95,6 +95,7 @@ function makeFile(overrides: FileOverrides = {}): SessionFileV1 {
     sessionAgentGenerationDigest: AGENT_DIGEST,
     controlPlaneGenerationDigest: CONTROL_DIGEST,
     admissionContractEpoch: EPOCH,
+    launchMode: "interactive",
     name: "claude",
     command: "claude",
     startedAt: "2026-09-07T06:59:00.000Z",
@@ -186,6 +187,7 @@ test("file present ⇒ served; aliveUntil passed on the wall clock ⇒ expired i
     kind: "session",
     sessionKey: KEY_A,
     authenticated: true,
+    launchMode: "interactive",
     sessionId: "rf-20260907-abc123",
     name: "claude",
     command: "claude",
@@ -320,6 +322,35 @@ test("removal ⇒ 'removed'; rewrite with the same identity preserves; rewrite w
   expect(registry.refresh()).toEqual({ kind: "ok", served: 0 });
   expect(invalidations).toEqual([[KEY_A, "replaced"], [KEY_A, "removed"]]);
   expect(registry.lookup(IP_A)).toEqual({ kind: "rejected", reason: "missing" });
+});
+
+test("the served principal carries the file's launchMode", () => {
+  const { root, registry } = harness();
+  writeFile(root, makeFile({ launchMode: "headless" }));
+  writeFile(root, makeFile({ sessionKey: KEY_B, sourceIp: IP_B, sessionId: "rf-20260907-def456" }));
+  expect(registry.refresh()).toEqual({ kind: "ok", served: 2 });
+
+  const headless = registry.lookup(IP_A);
+  if (headless.kind !== "active") throw new Error("headless session was not served");
+  expect(headless.file.launchMode).toBe("headless");
+  expect(headless.session.launchMode).toBe("headless");
+  const interactive = registry.lookup(IP_B);
+  if (interactive.kind !== "active") throw new Error("interactive session was not served");
+  expect(interactive.session.launchMode).toBe("interactive");
+});
+
+test("a rewrite that changes only launchMode is a replaced session", () => {
+  const { root, registry, invalidations, advance } = harness();
+  writeFile(root, makeFile());
+  expect(registry.refresh()).toEqual({ kind: "ok", served: 1 });
+
+  advance(1_000, 1_000);
+  writeFile(root, makeFile({ nonce: "b".repeat(32), inspectedAtMs: T0 + 1_000, launchMode: "headless" }));
+  expect(registry.refresh()).toEqual({ kind: "ok", served: 1 });
+  expect(invalidations).toEqual([[KEY_A, "replaced"]]);
+  const lookup = registry.lookup(IP_A);
+  if (lookup.kind !== "active") throw new Error("rewritten session was not served");
+  expect(lookup.session.launchMode).toBe("headless");
 });
 
 test("unreadable directory ⇒ every previously served key is invalidated 'removed' and lookup rejects registry-unavailable", () => {

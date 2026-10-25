@@ -27,6 +27,7 @@ describe("proxy admission registry", () => {
     const principal = {
       kind: "session" as const,
       authenticated: true as const,
+      launchMode: "interactive" as const,
       sessionKey: "a".repeat(64),
       sessionId: "rf-20260805-aaaaaa",
       name: "payments",
@@ -99,6 +100,7 @@ describe("proxy admission registry", () => {
       sessionAgentGenerationDigest: `sha256:${"f".repeat(64)}`,
       controlPlaneGenerationDigest: `sha256:${"1".repeat(64)}`,
       admissionContractEpoch: 1,
+      launchMode: "interactive" as const,
     };
     const session = registry.mint("api.example.com", "sha256:policy", { sessionBinding });
     const other = registry.mint("api.example.com", "sha256:policy");

@@ -34,6 +34,7 @@ function session(letter: string, name: string): ApprovalRequestSession {
   return {
     kind: "session",
     authenticated: true,
+    launchMode: "interactive",
     sessionKey: letter.repeat(64),
     sessionId: `rf-20260805-${letter.repeat(6)}`,
     name,

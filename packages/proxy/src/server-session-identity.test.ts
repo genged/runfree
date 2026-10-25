@@ -73,6 +73,7 @@ function sessionFile(sessionKey: string, overrides: Partial<SessionFileV1> = {})
     sessionAgentGenerationDigest: DIGEST,
     controlPlaneGenerationDigest: DIGEST,
     admissionContractEpoch: 1,
+    launchMode: "interactive",
     name: sessionKey === KEY_A ? "payments" : "release",
     command: "codex",
     startedAt: new Date(Date.now() - 60_000).toISOString(),

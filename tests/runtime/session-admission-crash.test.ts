@@ -164,6 +164,7 @@ describe("per-session file crash points", () => {
     sessionAgentGenerationDigest: DIGEST,
     controlPlaneGenerationDigest: DIGEST,
     admissionContractEpoch: 1,
+    launchMode: "interactive",
     name: "claude",
     command: "runfree claude",
     startedAt: "2026-09-07T00:00:00.000Z",

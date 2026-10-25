@@ -171,6 +171,7 @@ export class SessionFileRegistry {
         kind: "session",
         sessionKey: file.sessionKey,
         authenticated: true,
+        launchMode: file.launchMode,
         ...pendingApprovalSession(file),
       },
     };

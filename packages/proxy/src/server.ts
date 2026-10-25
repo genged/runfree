@@ -359,6 +359,7 @@ function identityForPeer(address: string | undefined):
         sessionAgentGenerationDigest: result.file.sessionAgentGenerationDigest,
         controlPlaneGenerationDigest: result.file.controlPlaneGenerationDigest,
         admissionContractEpoch: result.file.admissionContractEpoch,
+        launchMode: result.file.launchMode,
       },
     },
   };

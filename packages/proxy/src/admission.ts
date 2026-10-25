@@ -1,5 +1,8 @@
 import { normalizeHostname } from "@runfree/runtime-contracts/network-policy";
-import type { ApprovalRequestPrincipal } from "@runfree/runtime-contracts/session-registry";
+import type {
+  ApprovalRequestPrincipal,
+  ProxySessionStableIdentity,
+} from "@runfree/runtime-contracts/session-registry";
 
 export type AdmissionStage = "connect" | "sni" | "request";
 
@@ -13,17 +16,7 @@ export type AdmissionRecord = Readonly<{
   stage: AdmissionStage;
   sourceIp?: string;
   principal?: ApprovalRequestPrincipal;
-  sessionBinding?: Readonly<{
-    sessionKey: string;
-    sessionIncarnation: string;
-    containerId: string;
-    sourceIp: string;
-    networkId: string;
-    selectedAgentImageId: string;
-    sessionAgentGenerationDigest: string;
-    controlPlaneGenerationDigest: string;
-    admissionContractEpoch: number;
-  }>;
+  sessionBinding?: Readonly<ProxySessionStableIdentity>;
 }>;
 
 export type AdmissionObservation =

@@ -61,6 +61,7 @@ function fileAt(aliveUntilEpochMs: number, overrides: Partial<SessionFileV1> = {
     sessionAgentGenerationDigest: `sha256:${"b".repeat(64)}`,
     controlPlaneGenerationDigest: `sha256:${"d".repeat(64)}`,
     admissionContractEpoch: 3,
+    launchMode: "interactive",
     name: "claude",
     command: "claude",
     startedAt: new Date(aliveUntilEpochMs - LEASE_MS - 10_000).toISOString(),

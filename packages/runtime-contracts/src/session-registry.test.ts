@@ -7,23 +7,14 @@ import {
   pendingApprovalSession,
   proxySessionStableIdentity,
   sameProxySessionStableIdentity,
+  type ProxySessionStableIdentity,
 } from "./session-registry.ts";
 
 const DIGEST_A = `sha256:${"a".repeat(64)}`;
 const DIGEST_B = `sha256:${"b".repeat(64)}`;
 const KEY = "c".repeat(64);
 
-type StableIdentity = {
-  sessionKey: string;
-  sessionIncarnation: string;
-  containerId: string;
-  sourceIp: string;
-  networkId: string;
-  selectedAgentImageId: string;
-  sessionAgentGenerationDigest: string;
-  controlPlaneGenerationDigest: string;
-  admissionContractEpoch: number;
-};
+type StableIdentity = ProxySessionStableIdentity;
 
 function session(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {
@@ -49,6 +40,7 @@ function identity(overrides: Partial<StableIdentity> = {}): StableIdentity {
     sessionAgentGenerationDigest: DIGEST_A,
     controlPlaneGenerationDigest: DIGEST_B,
     admissionContractEpoch: 1,
+    launchMode: "interactive",
     ...overrides,
   };
 }
@@ -102,7 +94,9 @@ describe("proxy session identity contract", () => {
     for (const field of Object.keys(base) as Array<keyof StableIdentity>) {
       const current = base[field];
       const changed = identity({
-        [field]: typeof current === "number" ? current + 1 : `${current}0`,
+        [field]: typeof current === "number"
+          ? current + 1
+          : field === "launchMode" ? "headless" : `${current}0`,
       } as Partial<StableIdentity>);
       expect(sameProxySessionStableIdentity(base, changed), field).toBe(false);
     }

@@ -144,6 +144,7 @@ export function harnessSessionFile(overrides: Partial<SessionFileV1> = {}): Sess
     sessionAgentGenerationDigest: HARNESS_DIGEST,
     controlPlaneGenerationDigest: HARNESS_DIGEST,
     admissionContractEpoch: 1,
+    launchMode: "interactive",
     name: "harness",
     command: "codex",
     startedAt: new Date(Date.now() - 60_000).toISOString(),

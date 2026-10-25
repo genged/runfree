@@ -69,6 +69,7 @@ function sessionFile(sessionKey: string, file: DiskFile): SessionFileV1 {
     sessionAgentGenerationDigest: `sha256:${"b".repeat(64)}`,
     controlPlaneGenerationDigest: `sha256:${"d".repeat(64)}`,
     admissionContractEpoch: 3,
+    launchMode: "interactive",
     name: "claude",
     command: "claude",
     startedAt: "2026-09-07T06:59:00.000Z",

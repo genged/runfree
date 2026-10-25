@@ -1365,6 +1365,7 @@ describe("proxy firewall session file admission", () => {
       sessionAgentGenerationDigest: SESSION_AGENT_GENERATION,
       controlPlaneGenerationDigest: SESSION_CONTROL_GENERATION,
       admissionContractEpoch: 1,
+      launchMode: "interactive",
       name: `session ${suffix}`,
       command: "codex",
       startedAt: "2026-09-07T06:59:00.000Z",

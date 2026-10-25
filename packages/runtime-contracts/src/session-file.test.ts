@@ -1,6 +1,7 @@
 import { describe, expect, test } from "vitest";
 
 import { createSessionAdmissionEligibility, type SessionAdmissionEligibility } from "./session-admission.ts";
+import { proxySessionStableIdentity, sameProxySessionStableIdentity } from "./session-registry.ts";
 import {
   isSessionFileEligible,
   mintSessionFileNonce,
@@ -26,6 +27,7 @@ const base: SessionFileV1 = {
   sessionAgentGenerationDigest: `sha256:${"b".repeat(64)}`,
   controlPlaneGenerationDigest: `sha256:${"d".repeat(64)}`,
   admissionContractEpoch: 3,
+  launchMode: "interactive",
   name: "claude",
   command: "claude",
   startedAt: "2026-09-07T07:00:00.000Z",
@@ -102,6 +104,41 @@ describe("session file contract", () => {
 
   test("refuses an admissionContractEpoch below the registry's minimum", () => {
     expect(parseSessionFileV1(serializeSessionFileV1({ ...base, admissionContractEpoch: 0 }), SESSION_KEY)).toBeUndefined();
+  });
+
+  test("requires an exact launchMode", () => {
+    const { launchMode: _launchMode, ...missing } = base;
+    expect(parseSessionFileV1(`${JSON.stringify(missing)}\n`, SESSION_KEY)).toBeUndefined();
+    for (const launchMode of ["batch", "", "Headless", null, true, 1]) {
+      expect(parseSessionFileV1(`${JSON.stringify({ ...base, launchMode })}\n`, SESSION_KEY)).toBeUndefined();
+    }
+    const headless = { ...base, launchMode: "headless" as const };
+    expect(parseSessionFileV1(serializeSessionFileV1(headless), SESSION_KEY)).toEqual(headless);
+  });
+
+  test("a parser from before launchMode refuses a current file", () => {
+    // The exact key set at 549828a0. That parser refuses any key outside it,
+    // so a proxy that predates launchMode fails closed on a current file
+    // rather than serving a headless session as an attended one.
+    const PRE_LAUNCH_MODE_KEYS = [
+      "v", "projectId", "sessionKey", "sessionId", "sessionIncarnation", "sourceIp", "containerId",
+      "networkId", "selectedAgentImageId", "sessionAgentGenerationDigest", "controlPlaneGenerationDigest",
+      "admissionContractEpoch", "name", "command", "agentCommand", "hostTty", "hostTermProgram",
+      "startedAt", "nonce", "inspectedAt", "aliveUntil",
+    ];
+    expect(PRE_LAUNCH_MODE_KEYS).toHaveLength(21);
+    for (const launchMode of ["interactive", "headless"] as const) {
+      const keys = Object.keys(JSON.parse(serializeSessionFileV1({ ...base, launchMode })));
+      expect(keys.filter((key) => !PRE_LAUNCH_MODE_KEYS.includes(key))).toEqual(["launchMode"]);
+    }
+  });
+
+  test("launchMode is part of the stable session identity", () => {
+    const headless = { ...base, launchMode: "headless" as const };
+    expect(proxySessionStableIdentity(headless)).not.toBe(proxySessionStableIdentity(base));
+    expect(sameProxySessionStableIdentity(base, headless)).toBe(false);
+    const rewritten: SessionFileV1 = { ...base, nonce: "1".repeat(32) };
+    expect(sameProxySessionStableIdentity(base, rewritten)).toBe(true);
   });
 
   test("eligibility requires a matching agent generation digest", () => {

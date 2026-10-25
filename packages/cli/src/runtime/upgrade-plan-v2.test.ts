@@ -3,6 +3,7 @@ import { describe, expect, test } from "vitest";
 import {
   createSessionAgentDesiredSelectionV2,
   createSessionAgentMaterializationManifestV2,
+  RUNTIME_ADMISSION_CONTRACT_EPOCH,
 } from "./component-state-v2.ts";
 import { createRuntimeGenerationTargetV2 } from "./generation-plan-v2.ts";
 import { sha256Digest } from "./component-state.ts";
@@ -75,6 +76,19 @@ describe("schema-v2 runtime upgrade planner", () => {
       .toEqual({ kind: "block-incompatible", reason: "admission-epoch" });
     expect(planRuntimeUpgradeV2({ desired: target({ control: "other" }), ...current, lifecycleRecords: active }))
       .toEqual({ kind: "block-incompatible", reason: "control-plane-topology" });
+  });
+
+  test("the launchMode session file is admission epoch 5, which an epoch-4 control plane cannot serve", () => {
+    // Epoch 4 proxies refuse a session file that carries launchMode, so a
+    // live epoch-4 proxy must not be kept beside lifecycle records, and is
+    // replaced once no session depends on it.
+    expect(RUNTIME_ADMISSION_CONTRACT_EPOCH).toBe(5);
+    const current = state(target({ epoch: 4 }));
+    const desired = target({ epoch: RUNTIME_ADMISSION_CONTRACT_EPOCH });
+    expect(planRuntimeUpgradeV2({ desired, ...current, lifecycleRecords: [sessionContainerRecordFixture()] }))
+      .toEqual({ kind: "block-incompatible", reason: "admission-epoch" });
+    expect(planRuntimeUpgradeV2({ desired, ...current, lifecycleRecords: [] }))
+      .toEqual({ kind: "restart-compatible-proxy" });
   });
 
   test("does not reduce a missing desired session selection to a warm token sync", () => {

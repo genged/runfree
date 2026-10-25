@@ -24,6 +24,7 @@ let admissionSerial = 0;
 const SESSION_A: ApprovalRequestSession = {
   kind: "session",
   authenticated: true,
+  launchMode: "interactive",
   sessionKey: "a".repeat(64),
   sessionId: "rf-20260805-aaaaaa",
   name: "payments",

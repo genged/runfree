@@ -6,7 +6,7 @@ import { fsyncDirectory } from "../safe-fs.ts";
 import { strictStableJson } from "../strict-primitives.ts";
 
 export const RUNTIME_STATE_SCHEMA_VERSION_V2 = 2 as const;
-export const RUNTIME_ADMISSION_CONTRACT_EPOCH = 4 as const;
+export const RUNTIME_ADMISSION_CONTRACT_EPOCH = 5 as const;
 export const CONTROL_PLANE_PROOF_SCHEMA_VERSION = 1 as const;
 
 const SHA256_PATTERN = /^sha256:[a-f0-9]{64}$/;

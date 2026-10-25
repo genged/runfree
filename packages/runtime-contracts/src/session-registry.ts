@@ -25,6 +25,19 @@ export const SESSION_ID_PATTERN = /^rf-[0-9]{8}-[a-z0-9]{6,32}$/;
 export const SESSION_KEY_PATTERN = /^[a-f0-9]{64}$/;
 const CONTROL_CHARACTERS = /[\u0000-\u001f\u007f-\u009f]/u;
 
+export const SESSION_LAUNCH_MODES = ["interactive", "headless"] as const;
+
+/**
+ * How the host drives the session: attended in a terminal, or a headless run
+ * nobody can answer a prompt for. The host sets it once at allocation; it is
+ * never derived from the container's TTY settings.
+ */
+export type SessionLaunchMode = typeof SESSION_LAUNCH_MODES[number];
+
+export function isSessionLaunchMode(value: unknown): value is SessionLaunchMode {
+  return typeof value === "string" && (SESSION_LAUNCH_MODES as readonly string[]).includes(value);
+}
+
 /**
  * The identity a session keeps for as long as it is the same session.
  *
@@ -43,6 +56,7 @@ export type ProxySessionStableIdentity = {
   sessionAgentGenerationDigest: string;
   controlPlaneGenerationDigest: string;
   admissionContractEpoch: number;
+  launchMode: SessionLaunchMode;
 };
 
 export function proxySessionStableIdentity(record: ProxySessionStableIdentity): string {
@@ -56,6 +70,7 @@ export function proxySessionStableIdentity(record: ProxySessionStableIdentity): 
     record.sessionAgentGenerationDigest,
     record.controlPlaneGenerationDigest,
     record.admissionContractEpoch,
+    record.launchMode,
   ].join("\0");
 }
 
@@ -81,6 +96,9 @@ export type ApprovalRequestSession = PendingApprovalSession & {
   kind: "session";
   sessionKey: string;
   authenticated: true;
+  // Policy input, not display: it stays off PendingApprovalSession so pending
+  // approval records keep their shape.
+  launchMode: SessionLaunchMode;
 };
 
 export type ApprovalRequestOnlyPrincipal = {

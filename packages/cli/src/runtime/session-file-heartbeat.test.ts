@@ -7,6 +7,7 @@ import { describe, expect, test } from "vitest";
 
 import {
   parseSessionFileV1,
+  serializeSessionFileV1,
   sessionFilePath,
   type SessionFileV1,
 } from "@runfree/runtime-contracts/session-file";
@@ -275,6 +276,22 @@ describe("sealed inspect-and-write session file heartbeat", () => {
     const write = run.calls[1] as Call;
     expect(write.args.slice(0, 5)).toEqual(["exec", "--user", "0:0", "-i", PROXY_ID]);
     expect(write.args).toContain(sessionFilePath(attachedRecord.sessionPrincipal));
+  });
+
+  test("the written file carries the record's launchMode in the admitting write", async () => {
+    const interactive = scripted();
+    await heartbeat(interactive.io);
+    expect(writtenFile(interactive.calls).launchMode).toBe("interactive");
+
+    const headlessRecord: SessionContainerRecordV2 = { ...attachedRecord, launchMode: "headless" };
+    const run = scripted();
+    const outcome = await heartbeat(run.io, { record: headlessRecord });
+    expect(outcome.kind).toBe("written");
+    // No extra write: the one write that admits the session carries the mark.
+    expect(run.effects).toEqual(["inspect-session-container", "write-session-file"]);
+    const file = writtenFile(run.calls);
+    expect(file.launchMode).toBe("headless");
+    expect(parseSessionFileV1(serializeSessionFileV1(file), headlessRecord.sessionPrincipal)).toEqual(file);
   });
 
   test("the lease defaults to the contract maximum and every write mints a fresh nonce", async () => {

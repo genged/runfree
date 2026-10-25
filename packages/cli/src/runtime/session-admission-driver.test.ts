@@ -351,6 +351,7 @@ function record(state: string, containerId?: string): FakeRecord {
     launchArgs: [],
     interactive: true,
     tty: true,
+    launchMode: "interactive",
     sourceIp: SOURCE_IP,
     selectedAgentImageRef: "runfree-agent-0123456789ab:local",
     selectedAgentImageId: AGENT_IMAGE_ID,

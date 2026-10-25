@@ -224,6 +224,7 @@ function buildSessionFile(
     sessionAgentGenerationDigest: input.eligibilityBindings.sessionAgentGenerationDigest,
     controlPlaneGenerationDigest: input.eligibilityBindings.controlPlaneGenerationDigest,
     admissionContractEpoch: input.eligibilityBindings.admissionContractEpoch,
+    launchMode: input.record.launchMode,
     name: input.display.name,
     command: input.display.command,
     ...(input.display.agentCommand !== undefined ? { agentCommand: input.display.agentCommand } : {}),

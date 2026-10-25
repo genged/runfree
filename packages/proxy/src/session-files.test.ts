@@ -73,6 +73,7 @@ function makeFile(overrides: Partial<SessionFileV1> = {}): SessionFileV1 {
     sessionAgentGenerationDigest: AGENT_DIGEST,
     controlPlaneGenerationDigest: CONTROL_DIGEST,
     admissionContractEpoch: EPOCH,
+    launchMode: "interactive",
     name: "claude",
     command: "claude",
     startedAt: "2026-09-07T07:00:00.000Z",

@@ -116,6 +116,7 @@ function sessionFile(session: (typeof SESSIONS)[number], file: DiskFile): Sessio
     sessionAgentGenerationDigest: AGENT_DIGEST,
     controlPlaneGenerationDigest: CONTROL_DIGEST,
     admissionContractEpoch: 3,
+    launchMode: "interactive",
     name: "claude",
     command: "claude",
     startedAt: "2026-09-07T06:59:00.000Z",

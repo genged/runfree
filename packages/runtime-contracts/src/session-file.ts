@@ -12,6 +12,7 @@ import {
   SESSION_KEY_PATTERN,
   SESSION_SAFE_ID_PATTERN,
   isExactSessionSourceIpv4,
+  isSessionLaunchMode,
   type ProxySessionStableIdentity,
 } from "./session-registry.js";
 
@@ -60,6 +61,7 @@ const KEYS = [
   "sessionAgentGenerationDigest",
   "controlPlaneGenerationDigest",
   "admissionContractEpoch",
+  "launchMode",
   "name",
   "command",
   "agentCommand",
@@ -136,6 +138,7 @@ export function parseSessionFileV1(raw: string, expectedKeyFromName: string): Se
   if (typeof value.admissionContractEpoch !== "number"
     || !Number.isSafeInteger(value.admissionContractEpoch)
     || value.admissionContractEpoch < 1) return undefined;
+  if (!isSessionLaunchMode(value.launchMode)) return undefined;
   if (typeof value.nonce !== "string" || !SESSION_FILE_NONCE_PATTERN.test(value.nonce)) return undefined;
 
   const inspectedAt = isoTimestamp(value.inspectedAt);
