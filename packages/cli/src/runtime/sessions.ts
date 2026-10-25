@@ -492,12 +492,12 @@ export const LOCK_PIDLESS_GRACE_MS = 2_000;
 const LIFECYCLE_LOCK_OWNER_TOKEN_FILE = "owner-token";
 const LIFECYCLE_LOCK_OWNER_TOKEN = /^[a-f0-9]{64}$/;
 
-type LifecycleLockIdentity = Readonly<{
+export type LifecycleLockIdentity = Readonly<{
   device: bigint;
   inode: bigint;
 }>;
 
-function lifecycleLockIdentity(lockPath: string): LifecycleLockIdentity | undefined {
+export function lifecycleLockIdentity(lockPath: string): LifecycleLockIdentity | undefined {
   try {
     const stat = fs.lstatSync(lockPath, { bigint: true });
     if (!stat.isDirectory() || stat.isSymbolicLink()) return undefined;
@@ -517,7 +517,7 @@ function sameLifecycleLockIdentity(
     && left.inode === right.inode;
 }
 
-function readLifecycleLockOwnerToken(lockPath: string): string | undefined {
+export function readLifecycleLockOwnerToken(lockPath: string): string | undefined {
   try {
     const token = fs.readFileSync(path.join(lockPath, LIFECYCLE_LOCK_OWNER_TOKEN_FILE), "utf8").trim();
     return LIFECYCLE_LOCK_OWNER_TOKEN.test(token) ? token : undefined;
@@ -526,7 +526,7 @@ function readLifecycleLockOwnerToken(lockPath: string): string | undefined {
   }
 }
 
-function lifecycleLockIsOwned(
+export function lifecycleLockIsOwned(
   lockPath: string,
   expectedIdentity: LifecycleLockIdentity,
   expectedOwnerToken: string,
@@ -579,7 +579,7 @@ function quarantineExactLifecycleLock(
   return undefined;
 }
 
-function removeExactLifecycleLock(
+export function removeExactLifecycleLock(
   lockPath: string,
   expectedIdentity: LifecycleLockIdentity,
   expectedOwnerToken?: string,
@@ -645,10 +645,15 @@ export function lockAgeMs(lockPath: string): number {
   }
 }
 
-function removeStaleLifecycleLock(lockPath: string, env?: NodeJS.ProcessEnv): boolean {
-  const staleCandidateIdentity = lifecycleLockIdentity(lockPath);
-  if (staleCandidateIdentity === undefined) return false;
-  const staleCandidateOwnerToken = readLifecycleLockOwnerToken(lockPath);
+/**
+ * Whether the holder recorded in a pid/boot/process-start stamped lock
+ * directory is provably gone: stamped on a previous boot, its PID is not
+ * running, or the PID now belongs to a different process (process-start
+ * mismatch). A pid-less lock is judged dead only past
+ * `LOCK_PIDLESS_GRACE_MS`. Shared by the project lifecycle lock and the
+ * headless run lock (`headless-run-lock.ts`), so both apply one rule.
+ */
+export function lockHolderIsDead(lockPath: string, env?: NodeJS.ProcessEnv): boolean {
   // The boot check runs first because PID liveness is meaningless across a
   // reboot: PIDs are reissued from low numbers, so a lock left behind by a
   // crash during `runfree up` can match an unrelated live process and defer
@@ -680,6 +685,14 @@ function removeStaleLifecycleLock(lockPath: string, env?: NodeJS.ProcessEnv): bo
     }
     if ((pid === undefined || !Number.isInteger(pid)) && lockAgeMs(lockPath) < LOCK_PIDLESS_GRACE_MS) return false;
   }
+  return true;
+}
+
+function removeStaleLifecycleLock(lockPath: string, env?: NodeJS.ProcessEnv): boolean {
+  const staleCandidateIdentity = lifecycleLockIdentity(lockPath);
+  if (staleCandidateIdentity === undefined) return false;
+  const staleCandidateOwnerToken = readLifecycleLockOwnerToken(lockPath);
+  if (!lockHolderIsDead(lockPath, env)) return false;
   // Staleness takes several syscalls to judge. Quarantine the path and validate
   // the object that was actually moved before deleting it. If another contender
   // replaced the stale directory after the judgment, its inode/token differ and
