@@ -736,6 +736,88 @@ async function runConfiguredAgent(
   return status;
 }
 
+export type HeadlessRuntimeLaunchInput = Readonly<{
+  preparedRuntime: PreparedRuntime;
+  /** The prepared runtime's context: the one the proxy and policy belong to. */
+  activeContext: RuntimeContext;
+  proxyId: string;
+  reprepare: () => Promise<PreparedRuntime>;
+}>;
+
+export type HeadlessRuntimeHooks<T> = Readonly<{
+  /**
+   * After the runtime is ready and before the launch. Returns a status to
+   * refuse the launch, or undefined to go on.
+   */
+  beforeLaunch(activeContext: RuntimeContext): number | undefined;
+  launch(input: HeadlessRuntimeLaunchInput): Promise<T>;
+}>;
+
+export type HeadlessRuntimeResult<T> =
+  | Readonly<{ kind: "refused"; status: number }>
+  | Readonly<{ kind: "launched"; value: T }>;
+
+/**
+ * The runtime half of a headless run (headless-run spec §3.3): the same
+ * steps as `runConfiguredAgent`, in the same order, without the interactive
+ * parts. Every review runs on the caller's non-interactive IO, so a review
+ * that would ask refuses instead. It never starts the approvals heartbeat
+ * (`withWriteApprovalSession`) and prints no session denial summary: a run's
+ * ask writes are denied at once and counted by the caller.
+ *
+ * A review or startup that refuses returns `refused` with its status, and the
+ * launch hook is never called. Anything thrown before the launch propagates.
+ */
+export async function runHeadlessAgentRuntime<T>(
+  context: RuntimeContext,
+  io: RuntimeIO,
+  agentName: string,
+  options: Readonly<{ verbose?: boolean }>,
+  hooks: HeadlessRuntimeHooks<T>,
+): Promise<HeadlessRuntimeResult<T>> {
+  assertBuiltinLaunchAgent(agentName);
+  await requireUsableApprovalSelection(context, io);
+  const providerReview = agentName === "pi"
+    ? await reviewPiProvider(context, io, false)
+    : { changed: false, status: 0 };
+  if (providerReview.status !== 0) return { kind: "refused", status: providerReview.status };
+  const serviceEnsure = await reviewAgentOperationalServices(context, io, agentName, false);
+  if (serviceEnsure.status !== 0) return { kind: "refused", status: serviceEnsure.status };
+  setMcpLogContext({
+    ...(agentName === "claude" || agentName === "codex" ? { agent: agentName } : {}),
+    verbose: options.verbose === true,
+  });
+  const runtime = await startRuntime(context, io, false, {
+    verbose: options.verbose,
+    launch: true,
+    launchHandoff: true,
+  });
+  if (runtime.kind === "failed") return { kind: "refused", status: runtime.status };
+  try {
+    const activeContext = preparedRuntimeContext(runtime.preparedRuntime);
+    const proxyId = preparedRuntimeProxyId(runtime.preparedRuntime);
+    flushWarnings();
+    const refusal = hooks.beforeLaunch(activeContext);
+    if (refusal !== undefined) return { kind: "refused", status: refusal };
+    let value: T | undefined;
+    let launched = false;
+    await withTokenAutoRefresh(activeContext, io, runtime, async () => {
+      value = await hooks.launch({
+        preparedRuntime: runtime.preparedRuntime,
+        activeContext,
+        proxyId,
+        reprepare: () => repreparePublicLaunchRuntime(context, io, options.verbose, true),
+      });
+      launched = true;
+      return 0;
+    });
+    if (!launched) throw new Error("headless launch did not report a result");
+    return { kind: "launched", value: value as T };
+  } finally {
+    disposeLaunchHandoff(runtime.preparedRuntime);
+  }
+}
+
 // Typed core for the `$0 [agent]` default command. Resolves the optional agent
 // name against project config: an omitted/empty name runs the default agent, a
 // configured name runs that agent, and anything else is an unknown command. The

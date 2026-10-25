@@ -178,6 +178,7 @@ import { boundCallbackForwarder } from "./runtime/session-callback-ingress.test-
 import { INGRESS_FORWARDER_IMAGE } from "./runtime/ingress-forwarder.ts";
 import { hostBootId, hostProcessStart } from "./runtime/host-identity.ts";
 import { createSessionLaunchTarget } from "./runtime/session-launch.ts";
+import { createHeadlessRuntimeIO } from "./terminal-mode.ts";
 import { buildTokenAutoRefreshSpawnPlan, containerMissingNetwork, resolveRunfreeSelfInvocation } from "./runtime.ts";
 import {
   destroyRuntime,
@@ -187,6 +188,7 @@ import {
   resolveRuntimeAdminEnvironment,
   resourcesRuntime,
   runAgentCommand,
+  runHeadlessAgentRuntime,
   sessionsRuntime,
   statusRuntime,
   stopRuntime,
@@ -10042,6 +10044,34 @@ describe("runtime command flow", () => {
     expect(io.calls.some((call) => call.method === "admin")).toBe(false);
     expect(composeUpCall(io)).toBeUndefined();
     expect(configuredAgentExecCall(io)).toBeUndefined();
+  });
+
+  // Headless-run spec §3.3: the run's runtime half uses the same reviews on
+  // a non-interactive IO, so a review that would ask refuses before any
+  // policy mutation, runtime start, or launch.
+  test("a headless runtime refuses a review that would ask, before startup and before its hooks", async () => {
+    const projectRoot = path.join(tmp, "project");
+    const project = prepareProject(projectRoot);
+    const before = fs.readFileSync(project.paths.policyPath, "utf8");
+    const io = createRuntimeIO();
+    const hooks = { beforeLaunch: vi.fn(() => undefined), launch: vi.fn(async () => 0) };
+
+    const result = await runHeadlessAgentRuntime({
+      projectRoot,
+      project,
+      runtimeRoot: path.join(tmp, "runtime"),
+      env: { PATH: "/fake-bin" },
+      network: fixedNetwork,
+    }, createHeadlessRuntimeIO(io), "claude", {}, hooks);
+
+    expect(result).toEqual({ kind: "refused", status: 1 });
+    expect(vi.mocked(console.error).mock.calls.flat().join("\n")).toContain("Run: runfree service enable agent-claude");
+    expect(io.calls.some((call) => call.method === "confirm")).toBe(false);
+    expect(fs.readFileSync(project.paths.policyPath, "utf8")).toBe(before);
+    expect(io.calls.some((call) => call.method === "admin")).toBe(false);
+    expect(composeUpCall(io)).toBeUndefined();
+    expect(hooks.beforeLaunch).not.toHaveBeenCalled();
+    expect(hooks.launch).not.toHaveBeenCalled();
   });
 
   test("declining exact-host Claude review leaves policy and runtime untouched", async () => {

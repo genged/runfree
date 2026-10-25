@@ -42,8 +42,8 @@ export const DOCKER_LITERAL_ALLOWLIST: Readonly<Record<string, DockerLiteralAllo
     count: 11,
   },
   "packages/cli/src/runtime/session-container-cleanup.ts": {
-    reason: "sealed-session: SessionContainerCleanupCommand/Executor type signatures plus sealedCleanupCommand({ executable: \"docker\", effect, ... }) builders only; executeSessionContainerCleanupCommand executes via command.executable, not the literal",
-    count: 8,
+    reason: "sealed-session: SessionContainerCleanupCommand/Executor and SessionContainerAsyncCleanupExecutor type signatures plus sealedCleanupCommand({ executable: \"docker\", effect, ... }) builders only; executeSessionContainerCleanupCommand and its async twin execute via command.executable, not the literal",
+    count: 9,
   },
   "packages/cli/src/runtime/session-container-running-proof.ts": {
     reason: "sealed-session: SessionContainerRunningProofExecutor type signature only",
@@ -55,6 +55,10 @@ export const DOCKER_LITERAL_ALLOWLIST: Readonly<Record<string, DockerLiteralAllo
   },
   "packages/cli/src/runtime/session-container-start.ts": {
     reason: "sealed-session: SessionContainerForegroundSpawner type signature and defaultSpawner's typed parameter only; spawn(executable, ...) uses the parameter, not the literal",
+    count: 2,
+  },
+  "packages/cli/src/runtime/headless-foreground.ts": {
+    reason: "sealed-session: HeadlessPipedSpawn type signature and defaultPipedSpawn's typed parameter only; it spawns the executable and args the driver's sealed foreground command passes, not the literal",
     count: 2,
   },
   "packages/cli/src/runtime/session-file-publisher.ts": {
