@@ -71,6 +71,10 @@ export const DOCKER_LITERAL_ALLOWLIST: Readonly<Record<string, DockerLiteralAllo
     reason: "classifier: `command !== \"docker\"` routes histogram categorization; builds no argv",
     count: 1,
   },
+  "packages/cli/src/terminal-mode.ts": {
+    reason: "classifier: `command !== \"docker\"` gates the headless IO's default client deadline by command name; builds no argv",
+    count: 1,
+  },
   "packages/cli/src/runtime/control-plane-rebind-budget.ts": {
     reason: "classifier: `command === \"docker\"` gates budget accounting by command name; builds no argv",
     count: 1,

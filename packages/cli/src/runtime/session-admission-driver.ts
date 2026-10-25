@@ -66,7 +66,7 @@ import {
   type AttachedSessionCancellationPorts,
   type LostForegroundStreamDecision,
 } from "./session-attached-wait.ts";
-import { SESSION_CONTAINER_STOP_SECONDS } from "./session-container-contract.ts";
+import { SESSION_CONTAINER_STOP_SECONDS, SESSION_STOP_CLIENT_SLACK_MS } from "./session-container-contract.ts";
 import {
   runInternalSessionAdmissionLaunch,
   runInternalSessionAdmissionProbe,
@@ -321,17 +321,6 @@ const SESSION_HANDOFF_MIN_READ_MS = 250;
  * again, decides whether the teardown is confirmed.
  */
 const CANCELLED_STREAM_END_BOUND_MS = 5_000;
-/**
- * The Docker client's own bound on one cancel stop, beyond the grace it asks
- * Docker for. A stop that outlives it is killed and counts as not done
- * (`docs/security.md` "Lifecycle" 2); the teardown that follows repeats it.
- */
-const CANCEL_STOP_CLIENT_SLACK_MS = 20_000;
-/**
- * The client deadline on every synchronous Docker call of a headless run or a
- * cancelled launch: long enough for the teardown's own graceful stop.
- */
-const CANCELLED_DOCKER_CALL_TIMEOUT_MS = SESSION_CONTAINER_STOP_SECONDS * 1_000 + CANCEL_STOP_CLIENT_SLACK_MS;
 
 class PostCompletionAdmissionRecoveryError extends Error {
   readonly outcome: SessionAdmissionLaunchOutcome;
@@ -658,15 +647,9 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
       env: this.#input.plan.execution.dockerClientEnv,
       shell: false as const,
       maxBuffer,
-      // A headless run's every synchronous Docker call, and a cancelled
-      // launch's (the stop routine's delete, the teardown after it), gets a
-      // client deadline: a stalled daemon would otherwise block the event
-      // loop, so neither the run timeout nor a signal could advance, even in
-      // a teardown after a normal exit. A call cut off counts as not done, and
+      // A headless run's IO gives each of these calls a client deadline
+      // (`createHeadlessRuntimeIO`); a call cut off counts as not done, and
       // the teardown ends unconfirmed.
-      ...(this.#launch?.headless !== undefined || this.#launch?.cancellation?.signal.aborted
-        ? { timeout: CANCELLED_DOCKER_CALL_TIMEOUT_MS, killSignal: "SIGKILL" as const }
-        : {}),
     };
   }
 
@@ -1272,7 +1255,7 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
       );
       const options = {
         ...this.#dockerOptions(),
-        timeout: graceSeconds * 1_000 + CANCEL_STOP_CLIENT_SLACK_MS,
+        timeout: graceSeconds * 1_000 + SESSION_STOP_CLIENT_SLACK_MS,
         killSignal: "SIGKILL" as const,
       };
       const io = this.#gateway.io;

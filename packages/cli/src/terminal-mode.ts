@@ -11,6 +11,9 @@
 // "not interactive", and outside it each reader answers exactly as it did
 // before this module existed.
 
+import type { SpawnSyncOptions } from "node:child_process";
+
+import { SESSION_DOCKER_CALL_TIMEOUT_MS } from "./runtime/session-container-contract.ts";
 import type { RuntimeIO } from "./runtime/types.ts";
 
 type TtyStream = Readonly<{ isTTY?: boolean }>;
@@ -52,14 +55,36 @@ export function hostStdoutIsTty(stream: TtyStream = process.stdout): boolean {
 }
 
 /**
+ * The client deadline a headless call gets: a Docker call with no timeout of
+ * its own gets `SESSION_DOCKER_CALL_TIMEOUT_MS` and SIGKILL. An image build
+ * is the one exception: it can rightly take minutes, and it never waits on a
+ * session.
+ */
+function headlessCallOptions(command: string, args: readonly string[], options: SpawnSyncOptions | undefined): SpawnSyncOptions | undefined {
+  if (command !== "docker" || args[0] === "build") return options;
+  if (typeof options?.timeout === "number" && options.timeout > 0) return options;
+  return { ...options, timeout: SESSION_DOCKER_CALL_TIMEOUT_MS, killSignal: "SIGKILL" };
+}
+
+/**
  * The runtime IO a headless run uses for its whole life: it never asks
- * (`confirm` answers no, the Pi chooser offers nothing) and is never
- * interactive; everything else is the base IO's. `captureAsync` is present
- * exactly when the base has one (`RuntimeIO.captureAsync`).
+ * (`confirm` answers no, the Pi chooser offers nothing), is never
+ * interactive, and gives every Docker call a client deadline
+ * (`headlessCallOptions`). A synchronous call blocks the event loop, so with
+ * a stalled daemon and no deadline neither the run timer nor a signal could
+ * fire. Everything else is the base IO's. `captureAsync` is present exactly
+ * when the base has one (`RuntimeIO.captureAsync`).
  */
 export function createHeadlessRuntimeIO(base: RuntimeIO): RuntimeIO {
+  const { captureAsync } = base;
   return {
     ...base,
+    run: (command, args, options) => base.run(command, args, headlessCallOptions(command, args, options)),
+    capture: (command, args, options) => base.capture(command, args, headlessCallOptions(command, args, options)),
+    ...(captureAsync ? {
+      captureAsync: (command: string, args: string[], options?: SpawnSyncOptions) => (
+        captureAsync.call(base, command, args, headlessCallOptions(command, args, options))),
+    } : {}),
     confirm: () => false,
     choosePiProvider: () => undefined,
     isInteractive: () => false,

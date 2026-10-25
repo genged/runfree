@@ -302,6 +302,7 @@ import { StalePreparedRuntimeError, type LaunchHandoff } from "./prepared-runtim
 import { createInternalSessionAdmissionDriver, SESSION_HANDOFF_WAIT_CEILING_MS } from "./session-admission-driver.ts";
 import { LAUNCH_LOCK_HOLD_BUDGET_MS } from "./launch-lock-hold.ts";
 import { SessionLaunchCancelledError, SessionTeardownIncompleteError } from "./session-admission-probe.ts";
+import { createHeadlessRuntimeIO } from "../terminal-mode.ts";
 import { flushWarnings, setOutputWriterForTest } from "../warnings.ts";
 import type { ActiveRuntimePlan } from "./plan.ts";
 import {
@@ -5083,7 +5084,7 @@ describe("session admission under the per-session file source", () => {
       expect(mocks.markSessionInterrupted).toHaveBeenCalledTimes(1);
     });
 
-    test("after a cancel, a Docker that never answers is cut off by a client deadline: the teardown is unconfirmed, not hung", async () => {
+    test("after a cancel, a Docker that never answers is cut off by the headless IO's client deadline: the teardown is unconfirmed, not hung", async () => {
       const input = fixture();
       mocks.containerInspect = { status: 0, stdout: runningInspect(), stderr: "" };
       const finishForeground = heldForeground();
@@ -5107,6 +5108,7 @@ describe("session admission under the per-session file source", () => {
       const control = cancellable();
       const driver = createInternalSessionAdmissionDriver({
         ...input,
+        io: createHeadlessRuntimeIO(input.io),
         sessionLockManager: orderedSessionLockManager(input.sessionLockManager),
       });
 
@@ -5152,6 +5154,8 @@ describe("session admission under the per-session file source", () => {
       }) as unknown as RuntimeIO["capture"];
       const driver = createInternalSessionAdmissionDriver({
         ...input,
+        // A headless run's IO (`headless-run.ts`) is what bounds its calls.
+        io: headless ? createHeadlessRuntimeIO(input.io) : input.io,
         sessionLockManager: orderedSessionLockManager(input.sessionLockManager),
       });
 

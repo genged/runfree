@@ -13,7 +13,9 @@
 // sinks' own flush, all within one bound. A broken stream, a sink failure, a
 // re-attach that could not be ordered after the stream before it, or the
 // bound passing all report `drained: false`, which the outcome rule turns
-// into `unverified`.
+// into `unverified`. An undrained capture SIGKILLs any client still running
+// and destroys every pipe, so a client wedged on the daemon cannot keep the
+// process alive.
 
 import * as childProcess from "node:child_process";
 import type { Readable } from "node:stream";
@@ -26,6 +28,7 @@ import type {
 export type HeadlessPipedChild = SessionContainerForegroundChild & Readonly<{
   stdout: Readable | null;
   stderr: Readable | null;
+  kill(signal: "SIGTERM" | "SIGKILL"): boolean;
 }>;
 
 export type HeadlessPipedSpawn = (
@@ -101,6 +104,7 @@ export function createHeadlessForegroundSpawner(
   const spawnProcess = options.spawnProcess ?? defaultPipedSpawn;
   const orderBoundMs = options.orderBoundMs ?? HEADLESS_REATTACH_ORDER_BOUND_MS;
   const streams: Promise<boolean>[] = [];
+  const children: HeadlessPipedChild[] = [];
   let spawned = 0;
   let healthy = true;
   // Closes when the latest stdout stream closed; a re-attach's stdout is
@@ -120,6 +124,7 @@ export function createHeadlessForegroundSpawner(
   const spawn: SessionContainerForegroundSpawner = (executable, args, spawnOptions) => {
     const child = spawnProcess(executable, args, { env: spawnOptions.env, shell: false, stdio: PIPED_STDIO });
     spawned += 1;
+    children.push(child);
     const { stdout, stderr } = child;
     const stdoutClosed = streamClosed(stdout);
     streams.push(stdoutClosed, streamClosed(stderr));
@@ -166,6 +171,16 @@ export function createHeadlessForegroundSpawner(
         return true;
       })();
       const result = await Promise.race([settled, boundedDelay(boundMs)]);
+      if (result !== true) {
+        // An undrained client may be wedged on an unresponsive daemon, past
+        // the SIGTERM the teardown sent: kill it and close its pipes, so
+        // neither keeps this process alive after the run returns its code.
+        for (const child of children) {
+          if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+          child.stdout?.destroy();
+          child.stderr?.destroy();
+        }
+      }
       return { drained: result === true && healthy };
     },
     reattached: () => spawned > 1,

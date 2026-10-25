@@ -1,3 +1,4 @@
+import * as childProcess from "node:child_process";
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 import { describe, expect, test, vi } from "vitest";
@@ -185,5 +186,36 @@ describe("headless foreground spawner", () => {
     children[0]?.stderr.end();
     expect(await capture.drain(1_000)).toEqual({ drained: false });
     expect(flush).toHaveBeenCalledTimes(1);
+  });
+
+  test("an attach client that ignores SIGTERM and holds its pipes open is killed at the drain bound, its pipes closed", async () => {
+    // A Docker client wedged on an unresponsive daemon: it ignores SIGTERM and
+    // keeps both pipes open. Left alive, it and its pipes would keep Runfree's
+    // process running after the run returned its exit code.
+    const spawned: childProcess.ChildProcess[] = [];
+    const spawnProcess: HeadlessPipedSpawn = (_executable, _args, options) => {
+      const child = childProcess.spawn(process.execPath, [
+        "-e",
+        "process.on('SIGTERM', () => {}); process.stdout.write('ready\\n'); setInterval(() => {}, 1000);",
+      ], { stdio: [...options.stdio] });
+      spawned.push(child);
+      return child as unknown as HeadlessPipedChild;
+    };
+    const output: Buffer[] = [];
+    const capture = createHeadlessForegroundSpawner({ stdout: (chunk) => output.push(chunk), stderr: () => {} }, { spawnProcess });
+    try {
+      const child = capture.spawn("docker", ["start", "--attach", "c1"], { shell: false, stdio: "inherit", env: {} }) as unknown as childProcess.ChildProcess;
+      await vi.waitFor(() => expect(Buffer.concat(output).toString()).toBe("ready\n"));
+      const exited = new Promise<NodeJS.Signals | null>((resolve) => child.once("exit", (_code, signal) => resolve(signal)));
+      child.kill("SIGTERM");
+
+      expect(await capture.drain(200)).toEqual({ drained: false });
+
+      expect(child.stdout?.destroyed).toBe(true);
+      expect(child.stderr?.destroyed).toBe(true);
+      expect(await Promise.race([exited, new Promise((resolve) => setTimeout(() => resolve("still running"), 2_000))])).toBe("SIGKILL");
+    } finally {
+      for (const child of spawned) child.kill("SIGKILL");
+    }
   });
 });

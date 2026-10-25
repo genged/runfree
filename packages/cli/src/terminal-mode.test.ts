@@ -9,6 +9,8 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { mcpConfigureIntent } from "./admin/mcp-admin.ts";
 import { serviceConfigureIntent } from "./admin/service-policy.ts";
 import { nodeRuntimeIO, withWriteApprovalSession } from "./runtime.ts";
+import { createRuntimeDocker } from "./runtime/docker.ts";
+import { SESSION_DOCKER_CALL_TIMEOUT_MS } from "./runtime/session-container-contract.ts";
 import { captureHostTty } from "./runtime/sessions.ts";
 import type { RuntimeContext, RuntimeIO } from "./runtime/types.ts";
 import {
@@ -131,6 +133,60 @@ describe("headless runtime IO", () => {
   test("defines captureAsync only when the base IO has one", () => {
     expect(createHeadlessRuntimeIO(baseIO(false))).not.toHaveProperty("captureAsync");
     expect(createHeadlessRuntimeIO(baseIO(true))).toHaveProperty("captureAsync");
+  });
+
+  // A synchronous Docker call blocks the event loop, so with a stalled daemon
+  // and no deadline neither the run timer nor a signal could ever fire.
+  describe("bounds every Docker call that carries no deadline of its own", () => {
+    function stalledDocker() {
+      const seen: Array<{ args: string[]; options: childProcess.SpawnSyncOptions | undefined }> = [];
+      // The deadline is the only way such a call ends: it reports a kill.
+      const stalled = (_command: string, args: string[], options?: childProcess.SpawnSyncOptions) => {
+        seen.push({ args, options });
+        return { status: null as unknown as number, stdout: "", stderr: "", timedOut: true };
+      };
+      const base: RuntimeIO = { ...baseIO(true), capture: vi.fn(stalled), run: vi.fn((command: string, args: string[], options?: childProcess.SpawnSyncOptions) => {
+        stalled(command, args, options);
+        return 1;
+      }) };
+      return { seen, io: createHeadlessRuntimeIO(base), base };
+    }
+    const context = { projectRoot: "/workspace/project", env: {} } as unknown as RuntimeContext;
+    const deadline = { timeout: SESSION_DOCKER_CALL_TIMEOUT_MS, killSignal: "SIGKILL" };
+
+    test("the startup daemon probe (docker info)", () => {
+      const { seen, io } = stalledDocker();
+      expect(() => createRuntimeDocker(context, io).assertAvailable()).toThrow();
+      expect(seen[0]?.args[0]).toBe("info");
+      expect(seen[0]?.options).toMatchObject(deadline);
+    });
+
+    test("the admission preflight's image inspection", () => {
+      const { seen, io } = stalledDocker();
+      expect(createRuntimeDocker(context, io).inspectImage("runfree-agent:test")).toBeUndefined();
+      expect(seen.map((call) => call.args.slice(0, 2))).toEqual([["image", "inspect"]]);
+      expect(seen[0]?.options).toMatchObject(deadline);
+    });
+
+    test("async and terminal calls too; a call's own deadline and non-Docker commands are kept", async () => {
+      const { seen, io, base } = stalledDocker();
+      await io.captureAsync?.("docker", ["ps"]);
+      expect(base.captureAsync).toHaveBeenCalledWith("docker", ["ps"], expect.objectContaining(deadline));
+      io.run("docker", ["image", "rm", "x"]);
+      io.capture("docker", ["container", "stop", "c"], { timeout: 45_000 });
+      io.capture("git", ["status"]);
+      expect(seen.map((call) => call.options)).toEqual([
+        expect.objectContaining(deadline),
+        { timeout: 45_000 },
+        undefined,
+      ]);
+    });
+
+    test("an image build, which can rightly take minutes, is left unbounded", () => {
+      const { seen, io } = stalledDocker();
+      io.run("docker", ["build", "-t", "x", "."]);
+      expect(seen[0]?.options).toBeUndefined();
+    });
   });
 });
 
