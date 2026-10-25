@@ -1069,7 +1069,7 @@ function writeRuntimeInputLock(runtimeRoot: string): void {
       },
       packages: {
         "ca-certificates": "20260223",
-        curl: "8.18.0-1ubuntu2.5",
+        curl: "8.18.0-1ubuntu2.8",
         sudo: "1.9.17p2-1ubuntu3",
         git: "1:2.53.0-1ubuntu1",
         jq: "1.8.1-4ubuntu2",
@@ -1077,7 +1077,7 @@ function writeRuntimeInputLock(runtimeRoot: string): void {
         zsh: "5.9-8ubuntu3",
         iproute2: "6.19.0-1ubuntu1",
         "netcat-openbsd": "1.234-1",
-        "bind9-dnsutils": "1:9.20.24-1ubuntu0.3",
+        "bind9-dnsutils": "1:9.20.24-1ubuntu0.4",
         "dumb-init": "1.2.5-3build1",
         nftables: "1.1.6-1",
         bash: "5.3-2ubuntu1",

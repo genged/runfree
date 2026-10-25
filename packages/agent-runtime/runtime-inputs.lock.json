@@ -40,9 +40,9 @@
     },
     "packages": {
       "bash": "5.3-2ubuntu1",
-      "bind9-dnsutils": "1:9.20.24-1ubuntu0.3",
+      "bind9-dnsutils": "1:9.20.24-1ubuntu0.4",
       "ca-certificates": "20260223",
-      "curl": "8.18.0-1ubuntu2.5",
+      "curl": "8.18.0-1ubuntu2.8",
       "dumb-init": "1.2.5-3build1",
       "git": "1:2.53.0-1ubuntu1",
       "iproute2": "6.19.0-1ubuntu1",
