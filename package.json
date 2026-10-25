@@ -15,7 +15,7 @@
   "bin": {
     "runfree": "./bin/runfree.js"
   },
-  "packageManager": "pnpm@10.28.0",
+  "packageManager": "pnpm@10.34.8",
   "engines": {
     "node": ">=22"
   },
@@ -38,18 +38,18 @@
     "@clack/prompts": "^1.6.0",
     "@runfree/proxy": "workspace:*",
     "@runfree/runtime-contracts": "workspace:*",
-    "smol-toml": "^1.6.1",
-    "tsx": "^4.20.0",
+    "smol-toml": "^1.9.1",
+    "tsx": "^4.23.15",
     "yargs": "^17.7.3"
   },
   "devDependencies": {
     "@biomejs/biome": "2.4.16",
     "@types/node": "^22.0.0",
     "@types/yargs": "^17.0.35",
-    "@vitest/coverage-v8": "4.1.11",
+    "@vitest/coverage-v8": "4.1.12",
     "fast-check": "4.10.2",
     "graphql": "16.13.2",
     "typescript": "^5.9.0",
-    "vitest": "^4.1.11"
+    "vitest": "^4.1.12"
   }
 }
