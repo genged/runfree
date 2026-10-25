@@ -14,6 +14,12 @@ import {
   usage,
   type AgentToolUpdateDeps,
 } from "./update-agent-tools.ts";
+import { headlessContractReport, RECORDED_HEADLESS_STREAMS } from "./agent-headless-contract.fixtures.ts";
+
+/** The headless contract script embeds its fake model server; the --session-id one does not. */
+function isHeadlessContractRun(argv: readonly string[]): boolean {
+  return argv.some((arg) => arg.includes("RUNFREE_FAKE_MODEL"));
+}
 
 const OK_CONTRACT_STDOUT =
   "claude-transcript=ok\nclaude-resume-refused=ok\npi-session-id=ok\npi-resume-refused=ok\n";
@@ -147,12 +153,15 @@ describe("defaultSessionIdContractGate: host npm targets the container platform"
         return spawnSyncResult({});
       }
       if (command === "docker" && argv[0] === "run") {
-        return spawnSyncResult({ stdout: OK_CONTRACT_STDOUT });
+        return spawnSyncResult({ stdout: isHeadlessContractRun(argv) ? headlessContractReport() : OK_CONTRACT_STDOUT });
       }
       throw new Error(`unexpected spawnSync(${command}, ${JSON.stringify(argv)})`);
     });
 
     expect(() => defaultSessionIdContractGate({ packageJsonPath, packageLockPath })).not.toThrow();
+    // Both contracts ran in the throwaway container: --session-id, then headless.
+    const runs = spy.mock.calls.filter(([command, args]) => command === "docker" && (args as string[])[0] === "run");
+    expect(runs.map(([, args]) => isHeadlessContractRun(args as string[]))).toEqual([false, true]);
 
     const npmCall = spy.mock.calls.find(([command]) => command === "npm");
     expect(npmCall).toBeDefined();
@@ -160,6 +169,34 @@ describe("defaultSessionIdContractGate: host npm targets the container platform"
     expect(npmArgs).toEqual(expect.arrayContaining(["--os=linux", "--cpu=x64", "--libc=glibc"]));
 
     fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("a headless contract failure fails the gate (plan Task 16)", () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "runfree-contract-gate-test-"));
+    const packageJsonPath = path.join(dir, "package.json");
+    const packageLockPath = path.join(dir, "package-lock.json");
+    fs.writeFileSync(packageJsonPath, "{}");
+    fs.writeFileSync(packageLockPath, "{}");
+    vi.spyOn(childProcess, "spawnSync").mockImplementation((command, args) => {
+      const argv = (args ?? []) as string[];
+      if (command === "docker" && argv[0] === "version") return spawnSyncResult({ stdout: "aarch64\n" });
+      if (command === "npm") return spawnSyncResult({});
+      if (command === "docker" && argv[0] === "run") {
+        // Pi's failed request read as success: the contract must refuse it.
+        return spawnSyncResult({
+          stdout: isHeadlessContractRun(argv)
+            ? headlessContractReport({ "pi-fail": { status: 0, stdout: RECORDED_HEADLESS_STREAMS.pi.ok.stdout } })
+            : OK_CONTRACT_STDOUT,
+        });
+      }
+      throw new Error(`unexpected spawnSync(${command}, ${JSON.stringify(argv)})`);
+    });
+    try {
+      expect(() => defaultSessionIdContractGate({ packageJsonPath, packageLockPath }))
+        .toThrow(/headless contract failed \(pi-fail: a failed model request gave outcome success/);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   test("an architecture Docker reports that npm's --cpu does not recognize is refused before any npm call", () => {
@@ -205,7 +242,7 @@ describe("defaultSessionIdContractGate: host npm targets the container platform"
     };
 
     await expect(main(["claude@2.1.171", "--no-assets"], deps)).rejects.toThrow(
-      "agent tools left unchanged: --session-id contract failed",
+      "agent tools left unchanged: agent-tool contract failed",
     );
 
     // Exactly the "docker version" probe ran — no npm ci, no docker run.
@@ -359,7 +396,7 @@ describe("main(): --session-id contract gate wiring", () => {
     };
 
     await expect(main(["claude@2.1.171", "--no-assets"], deps)).rejects.toThrow(
-      "agent tools left unchanged: --session-id contract failed",
+      "agent tools left unchanged: agent-tool contract failed",
     );
 
     expect(fs.readFileSync(fixture.packageJsonPath)).toEqual(fixture.originalJson);
@@ -404,7 +441,7 @@ describe("main(): --session-id contract gate wiring", () => {
     await main(["claude@2.1.171", "--no-assets", "--no-contract"], deps);
 
     expect(gate).not.toHaveBeenCalled();
-    expect(logSpy.mock.calls.map((call) => call[0])).toContain("session-id contract: skipped (--no-contract)");
+    expect(logSpy.mock.calls.map((call) => call[0])).toContain("agent-tool contracts: skipped (--no-contract)");
     expect(JSON.parse(fs.readFileSync(fixture.packageJsonPath, "utf8"))).toEqual(fixturePackageJson(AFTER_VERSIONS));
   });
 });

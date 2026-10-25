@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
+import { assertAgentHeadlessContract } from "./agent-headless-contract.ts";
 import {
   assertAgentSessionIdContract,
   dockerServerCpuArch,
@@ -67,7 +68,7 @@ With no package arguments, updates all bundled coding agents to npm latest.
 
 Options:
   --no-assets     Only update package.json/package-lock.json; skip runtime asset rebuild
-  --no-contract   Skip the pinned --session-id contract gate (needs Docker)
+  --no-contract   Skip the pinned agent-tool contract gates (needs Docker)
   --dry-run       Print the npm specs and follow-up steps without mutating files
   -h, --help      Show this help
 
@@ -282,6 +283,9 @@ function rebuildRuntimeAssets(): void {
  * (`dockerServerCpuArch`, through the same restricted spawn every Docker
  * call here uses) before the temp dir is even created, so a missing or
  * unreachable Docker fails before any download.
+ *
+ * It runs both pinned-tool contracts on the same download: --session-id
+ * (`agent-session-id-contract.ts`) and headless (`agent-headless-contract.ts`).
  */
 export function defaultSessionIdContractGate(paths: { packageJsonPath: string; packageLockPath: string }): void {
   const cpu = dockerServerCpuArch();
@@ -293,7 +297,11 @@ export function defaultSessionIdContractGate(paths: { packageJsonPath: string; p
       "ci", "--ignore-scripts", "--omit=dev", "--fund=false", "--audit=false",
       "--os=linux", `--cpu=${cpu}`, "--libc=glibc",
     ], { cwd: tmp });
-    assertAgentSessionIdContract(lockedToolsContractRunner(tmp));
+    const runner = lockedToolsContractRunner(tmp);
+    assertAgentSessionIdContract(runner);
+    // Headless-run spec §5 "Contract": the same throwaway container proves
+    // each tool's headless argv, stdin prompt, and event stream.
+    assertAgentHeadlessContract(runner);
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true });
   }
@@ -303,7 +311,7 @@ function printPlan(specs: AgentToolPackageSpec[], options: AgentToolUpdateOption
   console.log(`agent tools: ${path.relative(repoRoot, agentToolsDir)}`);
   console.log(`npm specs: ${specs.map((spec) => spec.npmSpec).join(" ")}`);
   console.log(`runtime assets: ${options.rebuildAssets ? "rebuild and regenerate" : "skipped (--no-assets)"}`);
-  if (options.skipContract) console.log("session-id contract: skipped (--no-contract)");
+  if (options.skipContract) console.log("agent-tool contracts: skipped (--no-contract)");
 }
 
 /**
@@ -362,7 +370,7 @@ export async function main(argv = process.argv.slice(2), deps: AgentToolUpdateDe
     phase = "lockfile verification";
     verifyAgentToolsLockfiles({ packageJsonPath: deps.packageJsonPath, packageLockPath: deps.packageLockPath });
     if (!options.skipContract) {
-      phase = "--session-id contract";
+      phase = "agent-tool contract";
       deps.runSessionIdContractGate();
     }
   } catch (error) {

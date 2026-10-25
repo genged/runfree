@@ -1,5 +1,6 @@
 // Live core proof for the pinned-tool --session-id contract (same-terminal
-// session resume, task 4).
+// session resume, task 4) and the headless contract (headless-run plan
+// Task 16).
 //
 // Tasks 2-3 made every Claude and Pi launch pass `--session-id <uuid>`. The
 // unit suite (`scripts/agent-session-id-contract.test.ts`) proves the gate's
@@ -22,6 +23,7 @@ import { fileURLToPath } from "node:url";
 
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 
+import { assertAgentHeadlessContract } from "../../../scripts/agent-headless-contract.ts";
 import { assertAgentSessionIdContract, imageContractRunner } from "../../../scripts/agent-session-id-contract.ts";
 import { composeProjectName, projectAgentImageId } from "./docker.ts";
 import {
@@ -61,5 +63,13 @@ describe("pinned claude/pi --session-id contract on the built agent image", () =
 
   test("the exact pinned claude and pi binaries accept and refuse --session-id the way the launch and resume paths assume", () => {
     expect(() => assertAgentSessionIdContract(imageContractRunner(agentImage))).not.toThrow();
+  });
+
+  // Headless-run spec §5 "Contract" (plan Task 16): each pinned tool accepts
+  // its `runfree run` argv, reads the prompt from a stdin file, prints the
+  // event stream the host parser reads, and a failed model request is never a
+  // success. Same throwaway container rules as above.
+  test("the exact pinned claude, codex, and pi binaries keep the headless contract runfree run assumes", () => {
+    expect(() => assertAgentHeadlessContract(imageContractRunner(agentImage))).not.toThrow();
   });
 });

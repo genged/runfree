@@ -77,7 +77,9 @@ project policy lives under `.runfree/`.
 - `pnpm run update:agent-tools -- [all|claude|codex|pi@<version>]` updates the
   embedded Claude/Codex/Pi CLI pins and regenerates runtime assets. It first
   checks that the new Claude and Pi accept `--session-id` the way launch and
-  resume assume (`scripts/agent-session-id-contract.ts`): the host only
+  resume assume (`scripts/agent-session-id-contract.ts`), and that each tool's
+  headless argv, stdin prompt, and event stream match `runfree run`
+  (`scripts/agent-headless-contract.ts`): the host only
   downloads the locked tools with `--ignore-scripts`, and the rebuild and
   probes run in a pinned `node:22` container with no network. This needs a
   reachable Docker daemon; a failed check restores the previous lockfile.
