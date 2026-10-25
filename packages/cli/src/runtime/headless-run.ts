@@ -290,6 +290,14 @@ export async function runHeadlessAgent(
   deps.signals.on("SIGINT", onSignal);
   deps.signals.on("SIGTERM", onSignal);
   const cancelTimer = options.timeoutMs !== undefined ? deps.setTimer(options.timeoutMs, () => abort("timeout")) : () => {};
+  // The timer alone is not enough: a synchronous startup call can block past
+  // the deadline and the run then settle before the overdue timer runs. Every
+  // read of the abort reason first honors an elapsed deadline.
+  const deadlineMs = options.timeoutMs !== undefined ? deps.now().getTime() + options.timeoutMs : undefined;
+  const abortReason = (): AbortReason | undefined => {
+    if (aborted === undefined && deadlineMs !== undefined && deps.now().getTime() >= deadlineMs) abort("timeout");
+    return aborted;
+  };
   try {
     return await runUnderLock({
       context,
@@ -300,7 +308,7 @@ export async function runHeadlessAgent(
       prompt,
       outputFormat: headless.outputFormat,
       cancellation: { signal: cancel.signal, escalate: escalate.signal },
-      aborted: () => aborted,
+      aborted: abortReason,
     });
   } finally {
     cancelTimer();

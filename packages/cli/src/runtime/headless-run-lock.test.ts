@@ -239,6 +239,41 @@ test("a session the holder records while its liveness is judged is honored: recl
   expect(io.capture.mock.calls[0]?.[1]).toEqual(["container", "inspect", CONTAINER_ID]);
 });
 
+test("a reclaim whose rename moves a replacement lock refuses instead of taking the lock again", () => {
+  // A passes the ownership check on the dead holder's lock; B reclaims it and
+  // stamps its own before A's rename, which then quarantines B's lock. A must
+  // not mkdir again: nothing proved B dead or its container gone.
+  seedInbox();
+  const lockPath = writeHolder({ pid: reapedPid(), boot: BOOT_B });
+  fs.writeFileSync(path.join(lockPath, "owner-token"), `${"1".repeat(64)}\n`);
+  const originalRename = fs.renameSync;
+  let replaced = false;
+  vi.spyOn(fs, "renameSync").mockImplementation((from, to) => {
+    if (!replaced && from === lockPath) {
+      replaced = true;
+      fs.rmSync(lockPath, { recursive: true, force: true });
+      // Same inode is possible after rm + mkdir; the owner token tells them apart.
+      writeHolder({ pid: process.pid, boot: BOOT_B, processStart: PROCESS_B });
+      fs.writeFileSync(path.join(lockPath, "owner-token"), `${"2".repeat(64)}\n`);
+    }
+    originalRename(from, to);
+  });
+  const mkdir = vi.spyOn(fs, "mkdirSync");
+  const io = dockerIo(absent);
+
+  expectHeld(() => acquireHeadlessRunLock(input(io)));
+
+  expect(replaced).toBe(true);
+  // One acquire mkdir (non-recursive); the replacement's mkdir is recursive.
+  const acquireAttempts = mkdir.mock.calls.filter(([target, options]) => target === lockPath && !(typeof options === "object" && options?.recursive));
+  expect(acquireAttempts).toHaveLength(1);
+  expect(fs.existsSync(lockPath)).toBe(false);
+  const quarantined = fs.readdirSync(stateDir).filter((name) => name.startsWith("headless-run.lock.quarantine-"));
+  expect(quarantined).toHaveLength(1);
+  expect(fs.readFileSync(path.join(stateDir, quarantined[0] ?? "", "pid"), "utf8").trim()).toBe(String(process.pid));
+  expect(inboxNames()).toEqual([IMAGE, STALE_PROMPT].sort());
+});
+
 test("a dead holder whose container inspects as present keeps the lock", () => {
   seedInbox();
   writeHolder({ pid: reapedPid(), boot: BOOT_B, session: { v: 1, sessionId: SESSION_ID, containerName: CONTAINER_NAME, containerId: CONTAINER_ID } });

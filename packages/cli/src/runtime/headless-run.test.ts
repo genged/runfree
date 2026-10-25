@@ -610,6 +610,27 @@ describe("one stop routine for every way a run ends (spec §3.5)", () => {
     expect(inboxPrompts()).toEqual([]);
   });
 
+  test("a startup that blocks past the timeout and then fails ends as a timeout (67), though the timer never ran", async () => {
+    // A synchronous Docker call blocks the event loop past the deadline; the
+    // failure then settles through microtasks, before the overdue timer runs.
+    let clockMs = Date.parse("2026-10-25T12:00:00.000Z");
+    const h = harness({
+      runtime: async () => {
+        const until = Date.now() + 40;
+        while (Date.now() < until) {
+          // Blocking, like a synchronous docker call.
+        }
+        clockMs += 40;
+        throw new Error("docker compose up failed");
+      },
+    });
+    expect(await run({ ...h, deps: { ...h.deps, now: () => new Date(clockMs) } }, { timeoutMs: 20 })).toBe(67);
+    expect(h.launchCalls()).toBe(0);
+    expect(runJson()).toMatchObject({ outcome: "timeout", exitCode: 67, teardown: "not-started" });
+    expect(inboxPrompts()).toEqual([]);
+    expect(h.released()).toBe(true);
+  });
+
   test("a signal during the run ends through the routine with 67, whatever the agent returned", async () => {
     const h = harness({ launch: attachedDriver() });
     const pending = run(h);

@@ -322,7 +322,6 @@ export function acquireHeadlessRunLock(input: AcquireHeadlessRunLockInput): Head
   // Resolved before mkdir, never inside the acquisition window (`stampLockOwner`).
   const bootId = hostBootId(input.env);
   const processStart = hostProcessStart(process.pid, input.env);
-  let lastHeld: HeadlessRunLockHeldError | undefined;
   for (let attempt = 0; attempt < 3; attempt += 1) {
     const ownerToken = crypto.randomBytes(32).toString("hex");
     let identity: LifecycleLockIdentity | undefined;
@@ -335,10 +334,13 @@ export function acquireHeadlessRunLock(input: AcquireHeadlessRunLockInput): Head
       const judgement = judgeExistingLock(lockPath, input);
       if (judgement === undefined) continue;
       if (judgement.kind === "held") throw judgement.error;
-      // Removes only the exact object judged: a contender that replaced it
-      // in between keeps its lock, and this attempt contends again.
+      // Removes only the exact object judged. When that fails, a contender
+      // replaced it in between, and the rename may even have moved the
+      // contender's lock to quarantine, leaving the path free. Refuse rather
+      // than contend again: nothing proved that contender dead or its
+      // container gone. The next run judges whatever lock it then finds.
       if (!removeExactLifecycleLock(lockPath, judgement.identity, judgement.ownerToken)) {
-        lastHeld = new HeadlessRunLockHeldError(lockPath, holderOf(lockPath, readLockSession(lockPath)), "another run took it while this one reclaimed it");
+        throw new HeadlessRunLockHeldError(lockPath, holderOf(lockPath, readLockSession(lockPath)), "another run took it while this one reclaimed it");
       }
       continue;
     }
@@ -396,5 +398,5 @@ export function acquireHeadlessRunLock(input: AcquireHeadlessRunLockInput): Head
       release,
     });
   }
-  throw lastHeld ?? new HeadlessRunLockHeldError(lockPath, holderOf(lockPath, readLockSession(lockPath)), "it could not be taken");
+  throw new HeadlessRunLockHeldError(lockPath, holderOf(lockPath, readLockSession(lockPath)), "it could not be taken");
 }
