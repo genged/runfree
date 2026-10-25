@@ -23,7 +23,7 @@ permissions:
   contents: read
 
 env:
-  RUNFREE_PNPM_VERSION: 10.28.0
+  RUNFREE_PNPM_VERSION: 10.34.8
 
 jobs:
   verify:
