@@ -38,7 +38,8 @@ spaces. When stderr is not a terminal, every line carries an ISO timestamp;
 `RUNFREE_LOG_TIMESTAMPS=1` or `=0` overrides that choice. Warnings observed
 during a command print before the command's result or its final error, with
 the time they were observed. Ctrl-C and SIGTERM restore the terminal and exit
-130 or 143.
+130 or 143; `runfree run` stops its session first and exits 67 (see
+[Headless runs](#headless-runs)).
 
 `RUNFREE_TIMINGS=1` adds `timing:` lines on stderr: one per lifecycle phase,
 and one `startup-ops` line per subprocess category with its count and total
@@ -87,6 +88,7 @@ Created project files include:
 | `runfree codex` | Run Codex in the sandbox. |
 | `runfree pi` | Run Pi in the sandbox. |
 | `runfree shell` | Open a zsh shell in the agent container. |
+| `runfree run <agent> --prompt-file <file>` | Run one agent turn without a terminal, for a scheduler or a script. See [Headless runs](#headless-runs). |
 | `runfree up` | Start or reuse the Docker Compose runtime without attaching an agent. |
 | `runfree rebuild [--yes]` | Rebuild/recreate the runtime. Confirms before killing active sessions unless `--yes` is used. |
 | `runfree stop [--force]` | Stop this project's services. Requires `--force` while live or unprovable session owners remain, while a control-plane rebind is pending, or while any session is mid-teardown. |
@@ -137,6 +139,163 @@ inventory table. Records with no record version are listed only by `--list`.
 `runfree claude`, `runfree codex`, and `runfree pi` always start a fresh
 session; resuming happens only through `runfree resume`. See [Interrupted
 Session Recovery](architecture.md#interrupted-session-recovery).
+
+### Headless runs
+
+```bash
+runfree --workspace ~/proj run claude --prompt-file task.md
+runfree run claude --prompt-file task.md --timeout 30m
+runfree run claude --prompt-file task.md --accept-denied-writes
+```
+
+`runfree run` runs one agent turn without a terminal: from launchd, cron, a
+script, or a detached tmux pane. It starts a normal per-session container
+through the same admission path as `runfree claude`. The agent works on the
+live project folder, and its results are the files it writes there. Claude is
+the only agent with a headless mode in this release.
+
+| Option | Use |
+| --- | --- |
+| `--prompt-file <file>` | Required. The prompt, given to the agent as its stdin. The path is resolved from the directory you run `runfree` in, not from `--workspace`. It must be a regular file, not a symlink, and at most 1 MiB. |
+| `--timeout <duration>` | Stop the run after this long, from `1s` to `24h` (for example `30m` or `2h`). The run exits 67. |
+| `--accept-denied-writes` | Run even if some writes would ask for approval. The proxy denies them, and they do not change the exit code. |
+| `--verbose`, `-v` | Print extra startup diagnostics. |
+
+The agent gets no other arguments: Runfree sets the agent's command line, and
+an unknown flag or a word after `--` is a usage error (64). Runfree copies the
+prompt into the project inbox, the session entry opens the copy as the agent's
+stdin, and the run deletes the copy when it ends. The prompt is never part of
+the agent's command line. The container has no TTY and no open stdin, so no
+keystroke from a terminal reaches the agent.
+
+A run never prompts. A step that needs an answer refuses instead (exit 65):
+new authority that `runfree policy approve` or `runfree control approve` must
+approve, a service review, and a host credential source
+that cannot be read (for example, a locked 1Password).
+
+**The default write action is `ask`, so most projects are refused at first.**
+A headless session has no approver, so the proxy denies an `ask` write at
+once instead of holding it. Before the launch, `run` refuses with 65 if any
+write can resolve to `ask`, and lists each case:
+
+- an allowed host without an explicit write rule (the default is `ask`), or
+  with `--write ask`;
+- an MCP server, or one of its tools, whose rule is `ask`;
+- MCP methods that are not classified, which use the global write action
+  (`ask` by default), while any MCP server is configured.
+
+Set each one to `allow` or `deny` (`runfree host rules <host> --write deny`,
+`runfree mcp rules claude my-server --write allow`), or pass
+`--accept-denied-writes` to run and let those writes be denied. The check is
+an early warning; the proxy enforces the denial even if a rule changes to
+`ask` during the run. Each denied write is counted. Without
+`--accept-denied-writes`, a run that would succeed with any denied write exits
+68.
+
+Some authority does not pass write approval: [host services](#host-services),
+mediated OAuth exchanges, and STDIO or loopback MCP servers. A run allows them
+and lists them in `run.json` under `uncheckedAuthority`.
+
+One run at a time per project. Each run takes a project run lock first; a
+second run exits 66 and does nothing. Interactive sessions do not take the
+lock. If the stop of a run's container could not be confirmed, the lock stays
+until that container is gone. The next run reclaims the lock when its holder
+is dead and its container is proven gone; find the session with
+`runfree sessions` and remove it with `runfree stop`.
+
+A timeout, SIGINT, SIGTERM, a failure after the launch, and a normal end all
+take the same stop routine: revoke the session, stop its container, delete the
+prompt copy, finish the run record, and release the lock if the stop was
+confirmed. A second signal only shortens the container stop.
+
+| Exit code | Meaning |
+| --- | --- |
+| 0 | Success: the agent exited 0 and reported a final success. |
+| 1–63 | The agent failed (its own code; a code above 63 becomes 1), or the result is unverified (1): no final success, a lost status, an incomplete output stream, or denied writes that could not be counted. |
+| 64 | Usage error: a bad flag, agent, timeout, or prompt file. Nothing was started. |
+| 65 | Refused before the launch: approval, service review, login or credential source, or write posture. |
+| 66 | Skipped: another run holds the project lock. |
+| 67 | Timeout or signal, whatever the agent returned. |
+| 68 | The agent succeeded, but writes were denied and `--accept-denied-writes` was not given. |
+
+Each run keeps a record on the host only, in the project's state directory
+(by default `~/.local/state/runfree/projects/<project-hash>/runs/<run-id>/`).
+No session can read it, and Runfree writes nothing into the project tree. To
+get a summary file in the project, ask for one in the prompt.
+
+```text
+runs/<run-id>/
+  transcript.jsonl   the agent's raw stdout
+  stderr.log         the agent's and Runfree's stderr
+  result.md          the agent's final message
+  run.json           agent, agentStatus, outcome, exitCode, times, teardown,
+                     headlessDenials, uncheckedAuthority
+```
+
+When the run ends, it prints the final message, any warning (for example
+`warning: 2 writes were denied (headless)`), and the record path to stdout, so
+a scheduler's log shows them. A run does not need tmux:
+`tail -f <record>/transcript.jsonl` follows its progress. An expired agent
+login shows as a failure or an unverified result, never as success.
+`runfree resume` never offers a headless run's conversation.
+
+#### Scheduling on macOS
+
+Use a launchd `LaunchAgent`, which runs in your GUI login session. cron is not
+supported: a cron job has no login keychain and no 1Password session, and it
+may not find the Docker Desktop socket. A credential source that cannot be
+read refuses the run (65). Save this as
+`~/Library/LaunchAgents/com.example.runfree-nightly.plist`, with your own
+paths:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.example.runfree-nightly</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/homebrew/bin/runfree</string>
+    <string>--workspace</string>
+    <string>/Users/me/proj</string>
+    <string>run</string>
+    <string>claude</string>
+    <string>--prompt-file</string>
+    <string>/Users/me/prompts/nightly.md</string>
+    <string>--timeout</string>
+    <string>30m</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+  </dict>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>
+    <integer>3</integer>
+    <key>Minute</key>
+    <integer>0</integer>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>/Users/me/Library/Logs/runfree-nightly.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/me/Library/Logs/runfree-nightly.log</string>
+</dict>
+</plist>
+```
+
+Load it, and start it once to test it:
+
+```bash
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.example.runfree-nightly.plist
+launchctl kickstart gui/$(id -u)/com.example.runfree-nightly
+```
+
+Docker Desktop must be running. Give the prompt file an absolute path, because
+launchd does not start the job in your project folder.
 
 ## Network Policy
 

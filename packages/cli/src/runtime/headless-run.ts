@@ -21,10 +21,12 @@
 import path from "node:path";
 
 import { APPROVAL_HEADLESS_DENIED_EVENT_PREFIX } from "@runfree/runtime-contracts/write-approvals";
-import { builtinAgent } from "../agents.ts";
+import { BUILTIN_AGENT_DESCRIPTORS, builtinAgent } from "../agents.ts";
+import { remedy } from "../remedies.ts";
 import { runHeadlessAgentRuntime, type HeadlessRuntimeHooks, type HeadlessRuntimeResult } from "../runtime.ts";
 import { deferSignalExit } from "../signal-exit.ts";
 import { createHeadlessRuntimeIO, enterHeadlessTerminalMode } from "../terminal-mode.ts";
+import { runfreeError, warn } from "../warnings.ts";
 import {
   createHeadlessOutputParser,
   decideHeadlessOutcome,
@@ -139,6 +141,16 @@ const DEFAULT_DEPS: HeadlessRunDeps = Object.freeze({
   stdout: (line: string) => console.log(line),
 });
 
+/** Built-in agents with a headless mode: the only `run` targets. */
+export function headlessAgentIds(): string[] {
+  return BUILTIN_AGENT_DESCRIPTORS.filter((descriptor) => descriptor.headless !== undefined).map((descriptor) => descriptor.id);
+}
+
+/** A `--timeout` value for a printed command: whole seconds, at least 1. */
+function formatTimeout(timeoutMs: number): string {
+  return `${Math.max(1, Math.ceil(timeoutMs / 1000))}s`;
+}
+
 function errorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
@@ -225,7 +237,7 @@ export function countHeadlessDenials(input: HeadlessDenialCountInput): number | 
 }
 
 function usage(message: string): number {
-  console.error(`headless run: ${message}`);
+  runfreeError(message);
   return HEADLESS_RUN_EXIT.usage;
 }
 
@@ -248,7 +260,7 @@ export async function runHeadlessAgent(
     return usage(errorText(error));
   }
   const headless = builtinAgent(agentName)?.headless;
-  if (!headless) return usage(`${agentName} has no headless mode yet`);
+  if (!headless) return usage(`${agentName} has no headless mode yet; agents with one: ${headlessAgentIds().join(", ")}`);
   if (options.timeoutMs !== undefined && (!Number.isSafeInteger(options.timeoutMs) || options.timeoutMs <= 0)) {
     return usage(`the timeout must be a positive whole number of milliseconds, not ${options.timeoutMs}`);
   }
@@ -328,10 +340,10 @@ async function runUnderLock(input: RunInput): Promise<number> {
     lock = deps.acquireLock({ stateDir, inboxDir, io, ...(context.env ? { env: context.env } : {}) });
   } catch (error) {
     if (!(error instanceof HeadlessRunLockHeldError)) {
-      console.error(`the headless run did not start: ${errorText(error)}`);
+      runfreeError(`the headless run did not start: ${errorText(error)}`);
       return HEADLESS_RUN_EXIT.refused;
     }
-    console.error(error.message);
+    runfreeError(error.message);
     writeSkippedRecord(input, baseRun);
     return HEADLESS_RUN_EXIT.skipped;
   }
@@ -372,7 +384,13 @@ async function runUnderLock(input: RunInput): Promise<number> {
           if (input.aborted() !== undefined) return HEADLESS_RUN_EXIT.interrupted;
           const posture = deps.writePosture(activeContext, { acceptDeniedWrites: options.acceptDeniedWrites });
           if (posture.kind === "refuse") {
-            console.error(posture.message);
+            runfreeError([
+              posture.message,
+              `Rerun accepting the denials: ${remedy.runAcceptDeniedWrites(agentName, options.promptFile, {
+                ...(options.timeoutMs !== undefined ? { timeout: formatTimeout(options.timeoutMs) } : {}),
+              })}`,
+              "the headless run did not start",
+            ].join("\n"));
             return posture.status;
           }
           return undefined;
@@ -408,7 +426,7 @@ async function runUnderLock(input: RunInput): Promise<number> {
     }
   } catch (error) {
     launchError = error;
-    console.error(`headless run: ${errorText(error)}`);
+    runfreeError(`the headless run failed: ${errorText(error)}`);
     // Nothing ran yet: a failure before the container exists is a refusal.
     if (session.containerId === undefined) refused = true;
   }
@@ -451,7 +469,7 @@ async function runUnderLock(input: RunInput): Promise<number> {
     try {
       deleteInboxPrompt(inboxDir, runId);
     } catch (error) {
-      console.error(`headless run: the inbox prompt could not be removed: ${errorText(error)}`);
+      warn(`the headless run's inbox prompt could not be removed: ${errorText(error)}`);
     }
   }
   const run: HeadlessRunJson = {
@@ -476,7 +494,7 @@ async function runUnderLock(input: RunInput): Promise<number> {
     try {
       record.finalize(run, parsed.finalMessage !== undefined ? { finalMessage: parsed.finalMessage } : {});
     } catch (error) {
-      console.error(`headless run: the run record could not be finalized: ${errorText(error)}`);
+      warn(`the headless run record could not be finalized: ${errorText(error)}`);
     }
   }
 
@@ -486,7 +504,7 @@ async function runUnderLock(input: RunInput): Promise<number> {
     try {
       lock.release();
     } catch (error) {
-      console.error(`headless run: the run lock could not be released: ${errorText(error)}`);
+      warn(`the headless run lock could not be released: ${errorText(error)}`);
     }
   }
 
@@ -525,6 +543,6 @@ function writeSkippedRecord(
     record.finalize(run, {});
     for (const line of summaryLines({ run, recordDir: record.dir })) input.deps.stdout(line);
   } catch (error) {
-    console.error(`headless run: the skipped run could not be recorded: ${errorText(error)}`);
+    warn(`the skipped headless run could not be recorded: ${errorText(error)}`);
   }
 }

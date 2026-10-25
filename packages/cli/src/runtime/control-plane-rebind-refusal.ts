@@ -6,6 +6,8 @@ export type ControlPlaneRebindRefusalOutcome = Readonly<{
   final: string;
   subject: string;
   verbose: boolean;
+  /** The exit status of the refusal; 1 unless the command reserves its own (`run`: 65). */
+  status?: number;
 }>;
 
 function controlPlaneRebindRefusal(
@@ -25,7 +27,7 @@ function controlPlaneRebindRefusal(
     );
   }
   lines.push(outcome.final);
-  return Object.assign(new CliError(lines.join("\n"), 1), { cause: error });
+  return Object.assign(new CliError(lines.join("\n"), outcome.status ?? 1), { cause: error });
 }
 
 export async function withControlPlaneRebindRefusal<T>(

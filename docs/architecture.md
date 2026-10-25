@@ -373,8 +373,8 @@ discover candidates but authorize nothing.
 
 The runtime admits one agent process per container, each with its own address
 on `agent_internal`. Every public command (`runfree claude`/`codex`/`pi`,
-`runfree shell`, `runfree resume`, and `runfree mcp auth`) reaches it through
-one shared launch path. See [Security](security.md#sessions) for the identity
+`runfree shell`, `runfree resume`, `runfree run`, and `runfree mcp auth`)
+reaches it through one shared launch path. See [Security](security.md#sessions) for the identity
 and proof model and for what it does not establish.
 
 Three participants hold the state, and they can disagree only after a crash:
@@ -522,8 +522,9 @@ refuses with the remedy (see [security.md](security.md#lifecycle)).
 Only the host writes session files, through a root-only channel into a
 root-owned proxy directory; the request proxy can read them but not write
 them. A session file names the session's identity (project, session,
-incarnation, address, container, network), its bindings (control plane
-generation, admission contract epoch, images), and its lease. The lease is
+incarnation, address, container, network, and launch mode: `interactive` or
+`headless`), its bindings (control plane generation, admission contract
+epoch, images), and its lease. The lease is
 anchored to the Docker inspection that authorized the write, not to the write
 itself, so write latency cannot extend the time between proof and authority.
 The parse is exact, and a malformed or contradictory file serves nobody. The
@@ -701,6 +702,55 @@ the lifecycle lock, that the forwarder has the expected shape, image, and
 networks. The network baseline keeps the forwarder's address out of use; it
 grants no session-file authority. A forwarder that fails this check is
 repaired or stopped, or the project is reset with `runfree destroy --force`.
+
+#### Headless Runs
+
+`runfree run` launches through the same admission path as an interactive
+session. It differs in the launch target, the prompt, and the host IO:
+
+```text
+runfree run claude --prompt-file task.md
+  check the agent, flags, and prompt file           usage: 64
+  take the project run lock                         held: 66
+  copy the prompt to <state>/inbox/<run-id>.prompt
+  approval gate, reviews, runtime start             refused: 65
+  write-posture preflight                           a write can ask: 65
+  admission, headless:
+    create the container without a TTY or open stdin
+    session file carries launchMode "headless"
+    the entry opens /runfree/inbox/<run-id>.prompt as the agent's stdin
+  capture stdout and stderr into <state>/runs/<run-id>/
+  stop routine (completion, failure, timeout, signal):
+    delete the session file, stop the container under its creation receipt,
+    delete the prompt copy, finish run.json,
+    release the lock only if the stop was confirmed
+  exit with the run's code
+```
+
+- **Never interactive.** The command replaces the runtime IO for its whole
+  life: nothing prompts, a confirmation answers no, the approvals heartbeat
+  never starts, and the host's own TTYs are ignored even in a tmux pane. A
+  step that needs an answer refuses before the launch.
+- **Launch target.** The headless target is built next to the interactive
+  one and still runs through the session entry, so the readiness gate is
+  unchanged. Runfree sets the whole agent command line; the prompt is stdin,
+  never an argument.
+- **Launch mode.** The lifecycle record and the session file carry
+  `launchMode`, set at allocation and never derived from the TTY. The proxy
+  denies an `ask` write from a headless session at once (see
+  [Write Approval](security.md#write-approval)). Host recovery evidence
+  carries it too, so `runfree resume` skips headless runs.
+- **Run lock.** One run at a time per project, under the project's host
+  state. The lock names the holder process, and the session's container name
+  before create and its ID after. It is reclaimed only when the holder is
+  dead and that container is proven gone, so a run never starts beside an
+  orphan from an earlier run. Interactive sessions do not take it.
+- **Cancellation.** A timeout or the first SIGINT or SIGTERM cancels the
+  launch through the admission driver, which deletes the session file first
+  and then stops the exact container; a second signal shortens the stop.
+- **Record.** The run record is host state only; nothing is written into the
+  project tree. The outcome needs both the agent's exit status and a final
+  success event from its bounded output parser.
 
 ### Interrupted Session Recovery
 

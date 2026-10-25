@@ -64,6 +64,8 @@ describe("installable runfree CLI: help and usage", () => {
       "runfree codex",
       "runfree pi",
       "runfree shell",
+      "runfree run <agent> --prompt-file <file>",
+      "runfree run claude --prompt-file task.md",
       "runfree deps plan",
       "runfree deps install",
       "runfree deps doctor",

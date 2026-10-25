@@ -61,6 +61,9 @@ Start or attach:
   runfree shell
   runfree up [--verbose]
 
+Headless (cron, launchd, scripts):
+  runfree run claude --prompt-file <file> [--timeout <duration>] [--accept-denied-writes]
+
 Held writes:
   runfree approvals [--watch] [--no-bell] [--clear-deny]
   runfree approve <id> [--deny] [--scope request|session|deny-session] [--ttl 15m]
@@ -304,6 +307,11 @@ Agent runtime:
   runfree pi [--quiet]            Start/reuse the sandbox and run the configured Pi agent
                                   --quiet suppresses the session-end blocked-host summary
   runfree shell                   Start/reuse the sandbox and open zsh
+  runfree run <agent> --prompt-file <file> [--timeout <duration>] [--accept-denied-writes]
+      Run one agent turn without a terminal, with the file as its prompt; never
+      prompts or holds a write. Exit 0 success, 1-63 agent failed or unverified,
+      64 usage, 65 refused before launch, 66 another run holds the project lock,
+      67 timeout or signal, 68 writes were denied without --accept-denied-writes
   runfree [--verbose]             Start/reuse the sandbox with extra startup diagnostics
   runfree up [--verbose]          Start/reuse the Docker Compose runtime
   runfree up --audit-network[=<duration>]

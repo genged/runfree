@@ -50,6 +50,12 @@ export const COMMAND_EXAMPLES = {
     { cmd: "runfree resume --all", blurb: "Pick from interrupted sessions across all Runfree projects" },
     { cmd: "runfree resume --all --json", blurb: "Print the offline cross-project inventory as JSON" },
   ],
+  run: [
+    { cmd: "runfree run claude --prompt-file task.md", blurb: "Run one headless Claude turn with task.md as its prompt" },
+    { cmd: "runfree run claude --prompt-file task.md --timeout 30m", blurb: "Stop the run after 30 minutes (exit 67)" },
+    { cmd: "runfree run claude --prompt-file task.md --accept-denied-writes", blurb: "Run even if writes would ask for approval; they are denied" },
+    { cmd: "runfree --workspace ~/proj run claude --prompt-file task.md", blurb: "Run in another project folder, as a scheduler does" },
+  ],
   up: [
     { cmd: "runfree up", blurb: "Start the Docker Compose runtime" },
     { cmd: "runfree up --verbose", blurb: "Start with extra startup diagnostics" },
@@ -193,6 +199,7 @@ const HELP_ALL_ORDER: readonly CommandExampleKey[] = [
   "init",
   "image",
   "default",
+  "run",
   "inbox",
   "vnc",
   "forward",

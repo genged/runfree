@@ -309,7 +309,12 @@ describe("emitted commands parse under the real command app", () => {
     const rendered = sampleRemedyRenderings();
     for (const [name, render] of Object.entries(remedy)) {
       const sample = (render as (...args: string[]) => string)("x.example", "y.example", "z");
-      const root = sample.split(" ").slice(0, 3).join(" ");
+      // The command words before the first sample argument (at most three),
+      // so a remedy whose first word is a positional (`run <agent>`) still
+      // names its own root.
+      const words = sample.split(" ");
+      const firstArgument = words.findIndex((word) => /x\.example|y\.example|^z$/.test(word));
+      const root = words.slice(0, Math.min(3, firstArgument === -1 ? 3 : firstArgument)).join(" ");
       expect(rendered.some((line) => line.startsWith(root)), `${name} has no sample`).toBe(true);
     }
   });

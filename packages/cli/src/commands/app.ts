@@ -11,6 +11,7 @@ import { CliError } from "../errors.ts";
 import { nodeRuntimeIO, runAgentCommand } from "../runtime.ts";
 import { withControlPlaneRebindRefusal } from "../runtime/control-plane-rebind-refusal.ts";
 import { runtimeDryRun } from "../runtime/front.ts";
+import { HEADLESS_RUN_EXIT } from "../runtime/headless-run.ts";
 import { normalizeSessionName } from "../runtime/sessions.ts";
 import { credentialCommand } from "./admin/credential.ts";
 import { doctorCommand, runtimeAdminCommand } from "./admin/diagnostics.ts";
@@ -28,6 +29,7 @@ import { projectIdCommand } from "./project-id.ts";
 import { policyCommand } from "./policy.ts";
 import { controlCommand } from "./control.ts";
 import { resumeCommand } from "./resume.ts";
+import { runCommand } from "./run.ts";
 import {
   approvalsCommand,
   approveCommand,
@@ -77,6 +79,7 @@ const COMMAND_MODULES: readonly CommandModule[] = [
   stopCommand,
   destroyCommand,
   shellCommand,
+  runCommand,
   rebuildCommand,
   logsCommand,
   vncCommand,
@@ -302,7 +305,13 @@ export async function runCommandApp(
     // CliError/AdminExit/handler errors and never reinterpret them as usage
     // errors. Only pre-handler parser/validation failures become usage errors.
     if (handlerStarted) throw error;
-    throw withDefaultCommandHint(asUsageError(error), migrated ? [] : commandArgs);
+    const usage = withDefaultCommandHint(asUsageError(error), migrated ? [] : commandArgs);
+    // `run` is driven by schedulers, so its usage errors carry their own
+    // code (headless-run spec §3.6, plan C4); every other command keeps 1.
+    if (migrated?.name === runCommand.name) {
+      throw new CliError(usage.message, HEADLESS_RUN_EXIT.usage, usage.detail === undefined ? {} : { detail: usage.detail });
+    }
+    throw usage;
   }
   return status;
 }

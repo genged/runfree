@@ -416,7 +416,11 @@ describe("runHeadlessAgent", () => {
     const h = harness({ refusePosture: true });
     expect(await run(h)).toBe(65);
     expect(h.launchCalls()).toBe(0);
-    expect(vi.mocked(console.error).mock.calls.flat().join("\n")).toContain("host api.example.com: writes ask");
+    const stderr = vi.mocked(console.error).mock.calls.flat().join("\n");
+    expect(stderr).toContain("host api.example.com: writes ask");
+    // The remedy is the same run plus the flag, and it parses
+    // (scripts/emitted-commands.test.ts covers the registry rendering).
+    expect(stderr).toMatch(/Rerun accepting the denials: runfree run claude --prompt-file \S+ --accept-denied-writes/);
     expect(runJson()).toMatchObject({ outcome: "refused", exitCode: 65, teardown: "not-started", agentStatus: null });
     expect(inboxPrompts()).toEqual([]);
     expect(h.released()).toBe(true);

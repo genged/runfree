@@ -573,6 +573,24 @@ because the agent must POST to model APIs.
    the host with a root `docker exec`. Approval ids are single-use, an
    approved request re-runs the full policy check, and a policy change
    cancels holds that no longer pass.
+7. **Headless sessions never hold.** A session that `runfree run` starts
+   carries `launchMode: "headless"` in its root-owned session file, in the
+   same write that admits it, so there is no window before its first request.
+   The mark is part of the session's stable identity, and the admission
+   contract epoch changed with it, so an older proxy refuses the file and the
+   run fails closed. The request proxy reads the mark on every request. An
+   `ask` write from a headless session is denied at once
+   (`headless-denied`), whatever the approver heartbeat says: no hold and no
+   pending record, on the HTTP path and on the WebSocket retry path. The
+   mark is never derived from the container's TTY. A run inherits no grants,
+   and a decision needs a pending hold, so a grant cannot let a write
+   through. Each denial logs one event that names the session, with no repeat
+   suppression; `run` counts them into its record. The `run` preflight that
+   refuses `ask` exposure is only an early warning: the proxy enforces.
+8. **Some authority is not checked by write approval.** Host-service tunnels,
+   mediated OAuth exchanges, and STDIO or loopback MCP servers do not pass
+   write approval. A headless run allows them and lists them in its record
+   (`uncheckedAuthority`).
 
 Details: [Write Approval Grants](architecture.md#write-approval-grants).
 
@@ -813,6 +831,16 @@ Details: [Write Approval Grants](architecture.md#write-approval-grants).
    that started it (`TERM_SESSION_ID`, `ITERM_SESSION_ID`, `TMUX_PANE`, and
    similar) are captured only from the host launcher's own environment. They
    are never forwarded into a session container's environment.
+5. A headless run (`runfree run`) writes nothing into the project tree,
+   because a host write into the agent's tree can be raced. It reads the
+   prompt file with a size bound, without following a symlink or opening a
+   special file, and copies it only into the read-only inbox, which it
+   deletes at the end. Its run record and run lock live in the project's
+   host state directory, which no session mounts. The agent's output is
+   hostile input: it is parsed with line and size bounds, and a malformed
+   stream gives an unverified result, never a success. A headless session
+   records no host terminal identity, and `runfree resume` never offers its
+   conversation.
 
 ### Lifecycle
 
