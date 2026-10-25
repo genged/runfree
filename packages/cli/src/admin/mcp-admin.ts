@@ -59,6 +59,7 @@ import { projectControlPaths, projectInfo } from "../config.ts";
 import { readApprovedNetworkPolicy } from "../control/approvals.ts";
 import { compileDesiredPolicies } from "../control/compiler.ts";
 import { remedy } from "../remedies.ts";
+import { hostTerminalInteractive } from "../terminal-mode.ts";
 import {
   checkPolicyHostname,
   type DiscoveryDeps,
@@ -272,9 +273,9 @@ function findMcpEntryWithInventory(
   return { entry: matches[0], inventory };
 }
 
-function interactiveTty(): boolean {
-  return process.stdin.isTTY === true && process.stdout.isTTY === true;
-}
+// Through the headless terminal mode (headless-run spec §3.3), like every
+// direct TTY read.
+const interactiveTty = (): boolean => hostTerminalInteractive();
 
 type StaticCredentialPlan = {
   // What the review shows.

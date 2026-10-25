@@ -1,7 +1,8 @@
+import childProcess from "node:child_process";
 import { EventEmitter } from "node:events";
-import { afterEach, describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 
-import { installSignalExit, main, SIGNAL_EXIT_CODES, verboseRequested } from "./cli.ts";
+import { commandNameFromArgv, installSignalExit, main, SIGNAL_EXIT_CODES, verboseRequested } from "./cli.ts";
 import { CliError } from "./errors.ts";
 import { setOutputWriterForTest, warn } from "./warnings.ts";
 
@@ -109,5 +110,56 @@ describe("main() error channel", () => {
     expect(verboseRequested(["host", "list"])).toBe(false);
     expect(verboseRequested(["host", "list", "--verbose"])).toBe(true);
     expect(verboseRequested(["-v"])).toBe(true);
+  });
+});
+
+// Headless-run spec §3.3: the stty save in `main` reads the host terminal
+// directly, so `run` skips it (and the matching restore) entirely.
+describe("terminal mode save and restore", () => {
+  const descriptors: Array<[{ isTTY?: boolean }, PropertyDescriptor | undefined]> = [];
+  function stubTty(stream: { isTTY?: boolean }): void {
+    descriptors.push([stream, Object.getOwnPropertyDescriptor(stream, "isTTY")]);
+    Object.defineProperty(stream, "isTTY", { configurable: true, value: true });
+  }
+  afterEach(() => {
+    for (const [stream, descriptor] of descriptors.reverse()) {
+      if (descriptor) Object.defineProperty(stream, "isTTY", descriptor);
+      else delete (stream as { isTTY?: boolean }).isTTY;
+    }
+    descriptors.length = 0;
+    vi.restoreAllMocks();
+  });
+
+  function sttyCalls(): Array<readonly string[]> {
+    const spawnSync = childProcess.spawnSync as unknown as { mock: { calls: unknown[][] } };
+    return spawnSync.mock.calls
+      .filter((call) => call[0] === "stty")
+      .map((call) => call[1] as readonly string[]);
+  }
+
+  test("the command name is the first token after the global --workspace options", () => {
+    expect(commandNameFromArgv(["--workspace", "/tmp/project", "run", "claude"])).toBe("run");
+    expect(commandNameFromArgv(["--workspace=/tmp/project", "run"])).toBe("run");
+    expect(commandNameFromArgv(["run", "--workspace", "/x"])).toBe("run");
+    expect(commandNameFromArgv(["status"])).toBe("status");
+    expect(commandNameFromArgv([])).toBeUndefined();
+    // A malformed global option is the command's error to report, not this scan's.
+    expect(commandNameFromArgv(["--workspace"])).toBeUndefined();
+  });
+
+  test("a run never spawns stty, even with a TTY on both streams", async () => {
+    stubTty(process.stdin);
+    stubTty(process.stdout);
+    vi.spyOn(childProcess, "spawnSync").mockImplementation((() => ({ status: 0, stdout: "saved-mode", stderr: "" })) as never);
+    await runMain(async () => 0, ["--workspace", "/tmp/project", "run", "claude", "--prompt-file", "p.md"]);
+    expect(sttyCalls()).toEqual([]);
+  });
+
+  test("every other command still saves and restores the terminal mode", async () => {
+    stubTty(process.stdin);
+    stubTty(process.stdout);
+    vi.spyOn(childProcess, "spawnSync").mockImplementation((() => ({ status: 0, stdout: "saved-mode", stderr: "" })) as never);
+    await runMain(async () => 0, ["--workspace", "/tmp/project", "status"]);
+    expect(sttyCalls()).toEqual([["-g"], ["saved-mode"]]);
   });
 });

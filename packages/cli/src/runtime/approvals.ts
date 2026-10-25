@@ -46,6 +46,7 @@ import {
 } from "./mcp.ts";
 import type { CaptureResult, RuntimeContext, RuntimeIO } from "./types.ts";
 import { remedy } from "../remedies.ts";
+import { hostTerminalInteractive } from "../terminal-mode.ts";
 
 const WATCH_POLL_MS = 1_000;
 const WATCH_HEARTBEAT_MS = 10_000;
@@ -580,9 +581,9 @@ async function applyPreDecisionSideEffects(
   return true;
 }
 
-function interactiveTty(): boolean {
-  return process.stdout.isTTY === true && process.stdin.isTTY === true;
-}
+// Through the headless terminal mode (headless-run spec §3.3), like every
+// direct TTY read.
+const interactiveTty = (): boolean => hostTerminalInteractive();
 
 // One clack picker round for a pending record. Returns the decision, or
 // undefined when the user cancelled (leaves the item pending: ignoring a

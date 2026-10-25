@@ -98,6 +98,27 @@ export async function runCli(argv: string[], env: NodeJS.ProcessEnv = process.en
 
 export { installSignalExit, SIGNAL_EXIT_CODES, type SignalExitHooks } from "./signal-exit.ts";
 
+/**
+ * The command a raw argv names: the first token after the leading global
+ * `--workspace` options, exactly as `runCli` resolves it. Undefined for an
+ * empty or malformed argv, which `runCli` itself reports.
+ */
+export function commandNameFromArgv(argv: string[]): string | undefined {
+  try {
+    return parseArgs(argv, {}).commandArgs[0];
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Commands that never touch the host terminal's mode. `run` is unattended
+ * (headless-run spec §3.3): saving the mode runs `stty -g` on the inherited
+ * stdin, a direct TTY read the headless terminal mode cannot reach because it
+ * happens before the command starts.
+ */
+const TERMINAL_MODE_EXEMPT_COMMANDS: ReadonlySet<string> = new Set(["run"]);
+
 // `--verbose`/`-v` anywhere in argv turns on stack traces for unexpected
 // errors. Scanned rather than parsed: an unexpected error may have escaped
 // before or during parsing.
@@ -111,8 +132,12 @@ export async function main(
   run: (argv: string[]) => Promise<number> = runCli,
   argv: string[] = process.argv.slice(2),
 ): Promise<void> {
-  const terminalMode = currentTerminalMode();
-  const restore = onceOnly(() => restoreTerminal(terminalMode));
+  const command = commandNameFromArgv(argv);
+  const keepsTerminal = command !== undefined && TERMINAL_MODE_EXEMPT_COMMANDS.has(command);
+  const terminalMode = keepsTerminal ? undefined : currentTerminalMode();
+  const restore = onceOnly(() => {
+    if (!keepsTerminal) restoreTerminal(terminalMode);
+  });
   installSignalExit({ flush: flushWarnings, restore, exit: (code) => process.exit(code) });
   try {
     process.exitCode = await run(argv);

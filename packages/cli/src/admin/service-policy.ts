@@ -91,6 +91,7 @@ import { sha256Digest } from "../strict-primitives.ts";
 import { compileDesiredPolicies } from "../control/compiler.ts";
 import type { DesiredPolicyCandidate } from "../control/candidates.ts";
 import { remedy } from "../remedies.ts";
+import { hostTerminalInteractive } from "../terminal-mode.ts";
 
 
 type ResolvedService = {
@@ -831,7 +832,7 @@ function stableServiceDiffJson(value: unknown): string {
 }
 
 function requireInteractive(label: string): void {
-  if (!process.stdin.isTTY || !process.stdout.isTTY) {
+  if (!hostTerminalInteractive()) {
     die(`${label} requires an interactive TTY; use the non-interactive service enable/define flags instead`);
   }
 }

@@ -29,6 +29,7 @@ import {
   requireUsableApprovalSelection,
 } from "./control/workflow.ts";
 import { die } from "./errors.ts";
+import { hostStdoutIsTty, hostStreamIsTty, hostTerminalInteractive } from "./terminal-mode.ts";
 import { hostServiceOwnerWarnings, probeHostPortOwner } from "./host-service-port-owner.ts";
 import { recordedHostServiceOwners, removeProjectHostServicePorts } from "./host-service-registry.ts";
 import { composeProjectName, projectHash, runtimeEnvironment } from "./runtime/env.ts";
@@ -139,7 +140,7 @@ function commandExists(command: string, options: childProcess.SpawnSyncOptions =
 }
 
 function confirm(question: string): boolean {
-  if (!process.stdin.isTTY || !process.stderr.isTTY) return false;
+  if (!hostStreamIsTty(process.stdin) || !hostStreamIsTty(process.stderr)) return false;
   // Defined flush point: the warnings that motivate a prompt print before it.
   flushWarnings();
   process.stderr.write(question);
@@ -164,7 +165,7 @@ const PI_PROVIDER_OPTIONS: readonly PiProviderOption[] = [
 ];
 
 function choosePiProvider(options: readonly PiProviderOption[]): PiProviderChoice | undefined {
-  if (!process.stdin.isTTY || !process.stderr.isTTY) return undefined;
+  if (!hostStreamIsTty(process.stdin) || !hostStreamIsTty(process.stderr)) return undefined;
   process.stderr.write(`Choose Pi provider access:\n${options.map((option, index) => `  ${index + 1}. ${option.label}`).join("\n")}\nChoice [1-${options.length}]: `);
   const buffer = Buffer.alloc(1);
   let answer = "";
@@ -464,13 +465,25 @@ export function clearRetiredWriteApprovalOverride(context: RuntimeContext): void
   fs.rmSync(path.join(context.project.paths.stateDir, "write-approval-override.json"), { force: true });
 }
 
-async function withWriteApprovalSession(
+/**
+ * Runs an attached session with the approvals heartbeat beside it when a
+ * person is watching stdout and some write may be held for approval.
+ *
+ * Never starts the heartbeat in headless terminal mode (headless-run spec
+ * §3.3): a run's ask writes are denied at once, and its host stdout may be a
+ * TTY nobody is at. `deps` is a test seam only.
+ */
+export async function withWriteApprovalSession(
   context: RuntimeContext,
   runSession: () => number | Promise<number>,
+  deps: Readonly<{
+    anyAskHost: (context: RuntimeContext) => boolean;
+    startHeartbeat: (context: RuntimeContext) => { stop: () => void };
+  }> = { anyAskHost: anyEffectiveAskHost, startHeartbeat: startApprovalsHeartbeatProcess },
 ): Promise<number> {
-  if (process.stdout.isTTY !== true || !anyEffectiveAskHost(context)) return await runSession();
+  if (!hostStdoutIsTty() || !deps.anyAskHost(context)) return await runSession();
   console.log("writes need your approval this session — run 'runfree approvals' in another terminal to review them");
-  const heartbeat = startApprovalsHeartbeatProcess(context);
+  const heartbeat = deps.startHeartbeat(context);
   try {
     return await runSession();
   } finally {
@@ -581,7 +594,7 @@ async function reviewPiProvider(
   if ((await operationalServiceIds(context, io)).size > 0 || hasRememberedCustomPiProvider(context)) {
     return { changed: false, status: 0 };
   }
-  if (!(io.isInteractive?.() ?? (process.stdin.isTTY === true && process.stdout.isTTY === true))) {
+  if (!(io.isInteractive?.() ?? hostTerminalInteractive())) {
     console.error("Pi has no recognized provider route; continuing with custom/no provider and deny-all network policy.");
     console.error("configure provider access with: runfree service enable <id>");
     console.error("service ids are listed by: runfree service enable --help");
@@ -628,7 +641,7 @@ async function reviewAgentOperationalServices(
   const missing = descriptor.requiredServices.filter((id) => !enabled.has(id));
   if (missing.length === 0) return { changed: false, status: 0 };
 
-  if (!(io.isInteractive?.() ?? (process.stdin.isTTY === true && process.stdout.isTTY === true))) {
+  if (!(io.isInteractive?.() ?? hostTerminalInteractive())) {
     const commands = missing.map((id) => `runfree service enable ${id}`);
     console.error(`${descriptor.label} operational network access is not enabled.`);
     for (const command of commands) console.error(`Run: ${command}`);
@@ -861,7 +874,7 @@ function createNodeRuntimeIO(): RuntimeIO {
     commandExists,
     confirm,
     choosePiProvider,
-    isInteractive: () => process.stdin.isTTY === true && process.stdout.isTTY === true,
+    isInteractive: () => hostTerminalInteractive(),
     admin: async (intent: RuntimeAdminIntent, context: RuntimeContext): Promise<number> => {
       const { env, activeEffective } = resolveRuntimeAdminEnvironment(intent, context);
       const state = createAdminState({

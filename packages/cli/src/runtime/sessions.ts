@@ -51,6 +51,7 @@ import type {
   SessionProcess,
 } from "./types.ts";
 import { remedy } from "../remedies.ts";
+import { hostStreamIsTty } from "../terminal-mode.ts";
 
 export type ProjectLifecycleLock = {
   readonly ownerToken: string;
@@ -279,7 +280,9 @@ export function createSessionId(context: RuntimeContext, now = new Date()): stri
 }
 
 export function captureHostTty(context: RuntimeContext, io: RuntimeIO): string | undefined {
-  if (!process.stdin.isTTY) return undefined;
+  // A headless run records no terminal (headless-run plan conflict C3), and
+  // `tty` would read the inherited stdin.
+  if (!hostStreamIsTty(process.stdin)) return undefined;
   const result = io.capture("tty", [], {
     ...envOptions(context.env),
     stdio: ["inherit", "pipe", "ignore"],
