@@ -340,6 +340,15 @@ describe("google-service-account catch-all (spec §4.3, review M4)", () => {
     expect(error.safeMessage).toBe(MISMATCH);
   });
 
+  test("the pin refusal names the source when the caller knows it", () => {
+    const error = googleServiceAccountFailure(refusal(keyJson({ client_email: "other@my-project-123.iam.gserviceaccount.com" })), "gsc");
+    expect(error.safeMessage).toBe(MISMATCH.replace("<name>", "gsc"));
+    expect(error.classification).toBe("definitive");
+    // Only the pin refusal takes the name.
+    const other = googleServiceAccountFailure(refusal(keyJson({ type: "user" })), "gsc");
+    expect(other.safeMessage).not.toContain("gsc");
+  });
+
   test("a TokenResolutionError passes through unchanged", () => {
     const transient = new TokenResolutionError({ classification: "transient", sourceKind: "1password", code: "op-locked", safeMessage: "1Password is locked" });
     expect(googleServiceAccountFailure(transient)).toBe(transient);

@@ -14,6 +14,7 @@ import {
   die,
   ensureStateDirs,
   formatDurationSeconds,
+  type GoogleServiceAccountSource,
   type JwtAlgorithm,
   type JwtSource,
   loadSourceRegistry,
@@ -63,18 +64,32 @@ function commandSourcesEqual(left: CommandSource, right: CommandSource): boolean
     && left.displayArgv.every((entry, index) => entry === right.displayArgv[index]);
 }
 
+// A switch with a `never` default: a new source type must answer here, or the
+// "unchanged" path silently never runs for it (spec 2026-10-24 §4.5).
 function namedSourcesEqual(left: NamedSource, right: NamedSource): boolean {
-  if (left.type !== right.type) return false;
-  if (left.type === "command" && right.type === "command") return commandSourcesEqual(left, right);
-  if (left.type === "jwt" && right.type === "jwt") {
-    return left.alg === right.alg
-      && left.privateKey.source === right.privateKey.source
-      && left.privateKey.ref === right.privateKey.ref
-      && left.ttlSeconds === right.ttlSeconds
-      && policyJson(left.headers) === policyJson(right.headers)
-      && policyJson(left.claims) === policyJson(right.claims);
+  switch (left.type) {
+    case "command":
+      return right.type === "command" && commandSourcesEqual(left, right);
+    case "jwt":
+      return right.type === "jwt"
+        && left.alg === right.alg
+        && left.privateKey.source === right.privateKey.source
+        && left.privateKey.ref === right.privateKey.ref
+        && left.ttlSeconds === right.ttlSeconds
+        && policyJson(left.headers) === policyJson(right.headers)
+        && policyJson(left.claims) === policyJson(right.claims);
+    case "google-service-account":
+      return right.type === "google-service-account"
+        && left.keyJson.source === right.keyJson.source
+        && left.keyJson.ref === right.keyJson.ref
+        && left.clientEmail === right.clientEmail
+        && left.ttlSeconds === right.ttlSeconds
+        && policyJson(left.scopes) === policyJson(right.scopes);
+    default: {
+      const unknownSource: never = left;
+      throw new Error(`unsupported named source type: ${String((unknownSource as { type?: unknown }).type)}`);
+    }
   }
-  return false;
 }
 
 function sourceUsers(registryName: string): string[] {
@@ -138,6 +153,31 @@ function jwtDisplay(source: JwtSource): string[] {
   return lines;
 }
 
+// The 1Password reference is not shown, as for a jwt private key.
+function googleServiceAccountDisplay(source: GoogleServiceAccountSource): string[] {
+  return [
+    "key JSON: 1password",
+    `service account: ${source.clientEmail}`,
+    ...source.scopes.map((scope) => `scope: ${scope}`),
+    `ttl: ${formatDurationSeconds(source.ttlSeconds)}`,
+  ];
+}
+
+function namedSourceDisplay(source: NamedSource): string[] {
+  switch (source.type) {
+    case "command":
+      return [`command: ${commandDisplay(source)}`];
+    case "jwt":
+      return jwtDisplay(source);
+    case "google-service-account":
+      return googleServiceAccountDisplay(source);
+    default: {
+      const unknownSource: never = source;
+      throw new Error(`unsupported named source type: ${String((unknownSource as { type?: unknown }).type)}`);
+    }
+  }
+}
+
 // Typed enforcement for `runfree credential source add jwt <name> ...`. Re-validates the
 // algorithm, 1Password key reference, TTL, and generated-claim/header rules,
 // signs once to verify, and stores the source.
@@ -186,10 +226,7 @@ export function sourceAddJwtIntent(input: SourceAddJwtInput): void {
   if (existing && namedSourcesEqual(existing, source)) {
     console.log(`${name} source unchanged`);
     console.log(`type: ${sourceTypeDisplay(existing)}`);
-    const details = existing.type === "jwt"
-      ? jwtDisplay(existing)
-      : [`command: ${commandDisplay(existing)}`];
-    for (const line of details) console.log(line);
+    for (const line of namedSourceDisplay(existing)) console.log(line);
     console.log("agent exposure: no");
     return;
   }
@@ -275,11 +312,7 @@ export function sourceShowIntent(input: SourceNameInput): void {
   const users = sourceUsers(input.name);
   console.log(`${input.name}: configured`);
   console.log(`type: ${sourceTypeDisplay(source)}`);
-  if (source.type === "command") {
-    console.log(`command: ${commandDisplay(source)}`);
-  } else {
-    for (const line of jwtDisplay(source)) console.log(line);
-  }
+  for (const line of namedSourceDisplay(source)) console.log(line);
   console.log(`used by: ${users.join(", ") || "none"}`);
   console.log("agent exposure: no");
   console.log("executes during: credential sync");

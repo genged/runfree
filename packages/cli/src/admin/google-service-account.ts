@@ -24,8 +24,16 @@ export const GOOGLE_SA_CLIENT_EMAIL_RE = /^[a-z0-9-]+@[a-z0-9-]+\.iam\.gservicea
 export const GOOGLE_SA_KEY_ID_RE = /^[0-9a-f]{40}$/;
 const GOOGLE_SA_MIN_MODULUS_BITS = 2048;
 
-const CLIENT_EMAIL_MISMATCH_MESSAGE =
-  "key JSON client_email does not match the pinned service account; run credential source add google-service-account <name> --replace-source to change it";
+/**
+ * The pin refusal (§4.3). A caller that knows the source name passes it to
+ * `googleServiceAccountFailure`, which substitutes it for `<name>`; the name
+ * matches the source-name pattern, so it carries no control characters.
+ */
+function clientEmailMismatchMessage(sourceName = "<name>"): string {
+  return `key JSON client_email does not match the pinned service account; run credential source add google-service-account ${sourceName} --replace-source to change it`;
+}
+
+const CLIENT_EMAIL_MISMATCH_CODE = "client-email-mismatch";
 
 export type GoogleServiceAccountSource = {
   type: "google-service-account";
@@ -104,7 +112,7 @@ export function parseGoogleServiceAccountKeyJson(text: string, pinnedClientEmail
     refuse("key-json-field", "key JSON field client_email is not a service account email");
   }
   if (pinnedClientEmail !== undefined && clientEmail !== pinnedClientEmail) {
-    refuse("client-email-mismatch", CLIENT_EMAIL_MISMATCH_MESSAGE);
+    refuse(CLIENT_EMAIL_MISMATCH_CODE, clientEmailMismatchMessage());
   }
 
   const keyId = field("private_key_id");
@@ -165,16 +173,17 @@ export function signGoogleServiceAccountJwt(
 /**
  * The catch-all (§4.3, review M4): a TokenResolutionError (the 1Password read)
  * passes through unchanged; anything else becomes definitive with a fixed
- * message. The `message` of any other error is never read.
+ * message. The `message` of any other error is never read. `sourceName`, when
+ * given, replaces `<name>` in the pin refusal's remedy.
  */
-export function googleServiceAccountFailure(error: unknown): TokenResolutionError {
+export function googleServiceAccountFailure(error: unknown, sourceName?: string): TokenResolutionError {
   if (error instanceof TokenResolutionError) return error;
   if (error instanceof GoogleServiceAccountKeyError) {
     return new TokenResolutionError({
       classification: "definitive",
       sourceKind: "google-service-account",
       code: error.code,
-      safeMessage: error.message,
+      safeMessage: error.code === CLIENT_EMAIL_MISMATCH_CODE ? clientEmailMismatchMessage(sourceName) : error.message,
     });
   }
   return new TokenResolutionError({

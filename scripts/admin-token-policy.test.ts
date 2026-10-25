@@ -6,7 +6,7 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import util from "node:util";
-import { afterEach, beforeEach, describe, expect, test } from "vitest";
+import { afterEach, beforeAll, beforeEach, describe, expect, test } from "vitest";
 
 import { validateNetworkPolicy, type PolicyJson } from "@runfree/runtime-contracts/network-policy";
 import { defaultConfig, projectControlPaths, type ProjectInfo } from "../packages/cli/src/config.ts";
@@ -36,7 +36,14 @@ import {
 import { mcpOAuthCallbackPort } from "../packages/cli/src/runtime/mcp.ts";
 import { activeRuntimePlanFromContext } from "../packages/cli/src/runtime/plan.ts";
 import { createRuntimeSecurityContract } from "../packages/cli/src/runtime/security-contract.ts";
-import { classifyOnePasswordFailure } from "../packages/cli/src/admin/admin-core.ts";
+import {
+  classifyOnePasswordFailure,
+  type GoogleServiceAccountSource,
+  googleServiceAccountKeyFromJson,
+  type JwtPrivateKeyCacheEntry,
+  tokenSourceFingerprint,
+} from "../packages/cli/src/admin/admin-core.ts";
+import { signGoogleServiceAccountJwt } from "../packages/cli/src/admin/google-service-account.ts";
 import { CREDENTIAL_OBSERVATION_BATCH_HEADER } from "../packages/cli/src/admin/credential-observation.ts";
 import { createAdminState } from "../packages/cli/src/admin/context.ts";
 import {
@@ -6601,5 +6608,499 @@ describe("credential watcher cancellation (F08)", () => {
   // harness reached the effect it asserts on.
   test("every cancellation reproduction that ran reached its effect assertion", () => {
     expect([...reproductionProgress].filter(([, done]) => !done).map(([name]) => name)).toEqual([]);
+  });
+});
+
+// Spec 2026-10-24 google-service-account-source §4.1, §4.3-§4.5: a
+// `google-service-account` named source resolves through `credential sync`
+// and the watcher into a host-signed RS256 JWT in proxy tmpfs.
+describe("google-service-account sources", () => {
+  const GSC_EMAIL = "gsc-reader@my-project-123.iam.gserviceaccount.com";
+  const GSC_OTHER_EMAIL = "other@my-project-123.iam.gserviceaccount.com";
+  const GSC_KEY_ID = "0123456789abcdef0123456789abcdef01234567";
+  const GSC_KEY_ID_B = "fedcba9876543210fedcba9876543210fedcba98";
+  const GSC_RO = "https://www.googleapis.com/auth/webmasters.readonly";
+  const GSC_RW = "https://www.googleapis.com/auth/webmasters";
+  const GSC_SENTINEL = "SENTINEL-7f3a91c2-do-not-print";
+  const GSC_REF = "op://Private/gsc-sa/credential.json";
+  const GSC_TOKEN = "google-search-console";
+  const GSC_START_MS = 1_800_000_000_000;
+  const syncInput = { verbose: false, watch: false, quiet: false, delayFirstSync: false, cacheSourceSecrets: true } as const;
+  const watchInput = { ...syncInput, watch: true } as const;
+  let keyA: crypto.KeyPairKeyObjectResult;
+  let keyB: crypto.KeyPairKeyObjectResult;
+
+  beforeAll(() => {
+    keyA = crypto.generateKeyPairSync("rsa", { modulusLength: 2048 });
+    keyB = crypto.generateKeyPairSync("rsa", { modulusLength: 2048 });
+  });
+
+  function pemOf(keyPair: crypto.KeyPairKeyObjectResult): string {
+    return keyPair.privateKey.export({ type: "pkcs8", format: "pem" }).toString();
+  }
+
+  function pemBody(keyPair: crypto.KeyPairKeyObjectResult): string {
+    return pemOf(keyPair).split("\n")[1];
+  }
+
+  function gscKeyJson(overrides: Record<string, unknown> = {}, keyPair = keyA, keyId = GSC_KEY_ID): string {
+    return `${JSON.stringify({
+      type: "service_account",
+      project_id: "my-project-123",
+      private_key_id: keyId,
+      private_key: pemOf(keyPair),
+      client_email: GSC_EMAIL,
+      universe_domain: "googleapis.com",
+      note: GSC_SENTINEL,
+      ...overrides,
+    })}\n`;
+  }
+
+  function gscRegistryEntry(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+    return {
+      type: "google-service-account",
+      keyJson: { source: "1password", ref: GSC_REF },
+      clientEmail: GSC_EMAIL,
+      scopes: [GSC_RO],
+      ttlSeconds: 3300,
+      createdAt: "2026-10-25T00:00:00.000Z",
+      ...overrides,
+    };
+  }
+
+  function writeGscRegistry(entry: Record<string, unknown> = gscRegistryEntry()): void {
+    fs.mkdirSync(path.dirname(sourceRegistryPath()), { recursive: true });
+    fs.writeFileSync(sourceRegistryPath(), `${JSON.stringify({ gsc: entry }, null, 2)}\n`, { mode: 0o600 });
+  }
+
+  function writeGscFixture(options: { entry?: Record<string, unknown>; refreshEverySeconds?: number } = {}): void {
+    writeFixtureRepo({
+      hosts: ["searchconsole.googleapis.com"],
+      tokens: {
+        [GSC_TOKEN]: {
+          description: "Search Console",
+          credentials: [{ host: "searchconsole.googleapis.com", header: "Authorization", scheme: "bearer" }],
+        },
+      },
+    });
+    writeTokenConfig({
+      [GSC_TOKEN]: {
+        source: "named",
+        name: "gsc",
+        ...(options.refreshEverySeconds ? { refreshEverySeconds: options.refreshEverySeconds } : {}),
+      },
+    });
+    writeGscRegistry(options.entry);
+  }
+
+  /** A fake op whose output can change between calls; logs every call. */
+  function installGscOp(outputs: (call: number) => string): { bin: string; reads: () => number } {
+    const bin = path.join(tmpBase, `gsc-op-${Math.random().toString(16).slice(2)}`);
+    const logPath = `${bin}.jsonl`;
+    fs.mkdirSync(bin);
+    let calls = 0;
+    registerFakeCommand(path.join(bin, "op"), (args, spawnOptions) => {
+      fs.appendFileSync(logPath, `${JSON.stringify({ args })}\n`);
+      const env = envFromSpawnOptions(spawnOptions);
+      if (args[0] !== "read") return spawnResult({ status: 2 });
+      if (!env.HOME || !env.OP_SERVICE_ACCOUNT_TOKEN) return spawnResult({ status: 3 });
+      calls += 1;
+      return spawnResult({ stdout: outputs(calls) });
+    });
+    return { bin, reads: () => readJsonLines(logPath).length };
+  }
+
+  function gscEnv(fakeDocker: { dockerLog: string; fakeBin: string }, opBin: string, extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
+    return {
+      FAKE_DOCKER_LOG: fakeDocker.dockerLog,
+      OP_SERVICE_ACCOUNT_TOKEN: "op-session",
+      PATH: `${fakeDocker.fakeBin}${path.delimiter}${opBin}${path.delimiter}${process.env.PATH ?? ""}`,
+      ...extra,
+    };
+  }
+
+  function gscWatchEnv(fakeDocker: { dockerLog: string; fakeBin: string }, opBin: string, iterations: number, extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
+    return gscEnv(fakeDocker, opBin, {
+      RUNFREE_TEST_TOKEN_SYNC_WATCH_ITERATIONS: String(iterations),
+      RUNFREE_TEST_TOKEN_SYNC_WATCH_SLEEP_MS: "1",
+      RUNFREE_TEST_TOKEN_SYNC_WATCH_NOW_MS: String(GSC_START_MS),
+      ...extra,
+    });
+  }
+
+  function writtenJwts(dockerLog: string): string[] {
+    return dockerExecCalls(dockerLog)
+      .filter((entry) => String((entry.args as string[]).at(-1)).includes(`'/run/runfree-proxy-secrets/${GSC_TOKEN}'`) && typeof entry.stdin === "string" && entry.stdin !== "")
+      .map((entry) => String(entry.stdin));
+  }
+
+  function verifyRs256Jwt(jwt: string, keyPair: crypto.KeyPairKeyObjectResult): { header: Record<string, unknown>; payload: Record<string, unknown> } {
+    const parts = jwt.split(".");
+    expect(parts).toHaveLength(3);
+    const verified = crypto.verify("sha256", Buffer.from(`${parts[0]}.${parts[1]}`), keyPair.publicKey, Buffer.from(parts[2], "base64url"));
+    expect(verified).toBe(true);
+    return { header: decodeJwtPart(parts[0]), payload: decodeJwtPart(parts[1]) };
+  }
+
+  /** Runs `before`/`after` around every fake docker call. */
+  function wrapFakeDocker(fakeBin: string, hooks: { before?: (text: string) => void; after?: (text: string) => void }): void {
+    const dockerPath = fs.realpathSync(path.join(fakeBin, "docker"));
+    const inner = fakeCommandHandlers.get(dockerPath);
+    if (!inner) throw new Error("fake docker is not installed");
+    fakeCommandHandlers.set(dockerPath, (args, options, commandPath) => {
+      const text = args.join(" ");
+      hooks.before?.(text);
+      const result = inner(args, options, commandPath);
+      hooks.after?.(text);
+      return result;
+    });
+  }
+
+  function expectNoKeyMaterial(texts: string[], extra: string[] = []): void {
+    for (const text of texts) {
+      expect(text).not.toContain(GSC_SENTINEL);
+      expect(text).not.toContain(pemBody(keyA));
+      for (const secret of extra) expect(text).not.toContain(secret);
+    }
+  }
+
+  function readIfExists(filePath: string): string {
+    return fs.existsSync(filePath) ? fs.readFileSync(filePath, "utf8") : "";
+  }
+
+  test("registry validation refuses a bad entry before any 1Password read and removes the proxy token", async () => {
+    const bad: Array<[Record<string, unknown>, string]> = [
+      [gscRegistryEntry({ scopes: ["https://www.googleapis.com/auth/cloud-platform"] }), "scopes"],
+      [gscRegistryEntry({ scopes: [GSC_RO, GSC_RW] }), "scopes"],
+      [gscRegistryEntry({ ttlSeconds: 60 }), "ttlSeconds"],
+      [gscRegistryEntry({ clientEmail: "a\u001b[31m@b.iam.gserviceaccount.com" }), "clientEmail"],
+      [gscRegistryEntry({ keyJson: { source: "1password", ref: "Private/gsc" } }), "keyJson"],
+      [gscRegistryEntry({ privateKey: { source: "1password", ref: GSC_REF } }), "privateKey"],
+    ];
+    for (const [entry, field] of bad) {
+      writeGscFixture({ entry });
+      const fakeDocker = installTokenSyncDockerFake();
+      const op = installGscOp(() => gscKeyJson());
+      const result = await runAdmin(() => credentialSyncIntent(syncInput), gscEnv(fakeDocker, op.bin));
+      expect(result.status).toBe(1);
+      expect(result.stderr).toMatch(new RegExp(`${GSC_TOKEN}: sync failed \\(gsc: google-service-account [^\\n]*${field}`));
+      expect(result.stderr).not.toContain("\u001b");
+      expect(op.reads()).toBe(0);
+      expectProxyTokenRemoval(fakeDocker.dockerLog, GSC_TOKEN);
+      fs.rmSync(path.join(tmp, "node_modules"));
+    }
+  });
+
+  test("sync signs a verified RS256 JWT and writes only the JWT to proxy tmpfs", async () => {
+    writeGscFixture();
+    const fakeDocker = installTokenSyncDockerFake();
+    const op = installGscOp(() => gscKeyJson());
+
+    const result = await runAdmin(() => credentialSyncIntent(syncInput), gscEnv(fakeDocker, op.bin));
+
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout).toContain(`${GSC_TOKEN}: synced to proxy tmpfs from source gsc`);
+    expect(op.reads()).toBe(1);
+    const [jwt, ...more] = writtenJwts(fakeDocker.dockerLog);
+    expect(more).toEqual([]);
+    const { header, payload } = verifyRs256Jwt(jwt, keyA);
+    expect(header).toEqual({ typ: "JWT", alg: "RS256", kid: GSC_KEY_ID });
+    expect(payload).toMatchObject({ iss: GSC_EMAIL, sub: GSC_EMAIL, scope: GSC_RO });
+    expect((payload.exp as number) - (payload.iat as number)).toBe(3300);
+    expect(payload).not.toHaveProperty("aud");
+    expectNoKeyMaterial([result.stdout, result.stderr, readIfExists(tokenStatusFilePath()), readIfExists(tokenReceiptsFilePath())], [jwt]);
+  });
+
+  test("a key JSON for a different service account deletes the proxy token, retracts the receipt, and leaves the registry", async () => {
+    writeGscFixture();
+    const fakeDocker = installTokenSyncDockerFake();
+    let emailNow = GSC_EMAIL;
+    const op = installGscOp(() => gscKeyJson({ client_email: emailNow }));
+    const first = await runAdmin(() => credentialSyncIntent(syncInput), gscEnv(fakeDocker, op.bin));
+    expect(first.status, first.stderr).toBe(0);
+    expect(readIfExists(tokenReceiptsFilePath())).toContain(GSC_TOKEN);
+    const registryBytes = fs.readFileSync(sourceRegistryPath());
+
+    emailNow = GSC_OTHER_EMAIL;
+    const mismatch = await runAdmin(() => credentialSyncIntent(syncInput), gscEnv(fakeDocker, op.bin));
+
+    const message = "key JSON client_email does not match the pinned service account; run credential source add google-service-account gsc --replace-source to change it";
+    expect(mismatch.status).toBe(1);
+    expect(mismatch.stderr).toContain(message);
+    expect(mismatch.stderr).not.toContain(GSC_OTHER_EMAIL);
+    expect(proxyTokenRemovalIndexes(fakeDocker.dockerLog, GSC_TOKEN)).not.toEqual([]);
+    expect(readIfExists(tokenReceiptsFilePath())).not.toContain(GSC_TOKEN);
+    expect(readTokenStatus()[GSC_TOKEN]).toMatchObject({ ok: false, state: "failed", message });
+    expect(fs.readFileSync(sourceRegistryPath()).equals(registryBytes)).toBe(true);
+
+    // The detached first source-truth pass keeps a value on any read failure
+    // except a classified definitive one: the mismatch is never kept.
+    emailNow = GSC_EMAIL;
+    expect((await runAdmin(() => credentialSyncIntent(syncInput), gscEnv(fakeDocker, op.bin))).status).toBe(0);
+    const removalsBefore = proxyTokenRemovalIndexes(fakeDocker.dockerLog, GSC_TOKEN).length;
+    emailNow = GSC_OTHER_EMAIL;
+    const watch = await runAdmin(() => credentialSyncIntent({ ...watchInput, initialSourceTruth: true }), gscWatchEnv(fakeDocker, op.bin, 1));
+    expect(watch.stderr).not.toContain("keeping last-good proxy value");
+    expect(proxyTokenRemovalIndexes(fakeDocker.dockerLog, GSC_TOKEN).length).toBeGreaterThan(removalsBefore);
+    expect(readTokenStatus()[GSC_TOKEN]).toMatchObject({ ok: false, state: "failed", message });
+    expect(fs.readFileSync(sourceRegistryPath()).equals(registryBytes)).toBe(true);
+  });
+
+  test("the refresh derives from the source ttl, and an override must be shorter than it", async () => {
+    writeGscFixture();
+    const fakeDocker = installTokenSyncDockerFake();
+    const op = installGscOp(() => gscKeyJson());
+
+    const status = await runAdmin(() => credentialStatus());
+    expect(status.status, status.stderr).toBe(0);
+    expect(status.stdout).toContain("refresh: every 54m (derived from source ttl 55m)");
+
+    for (const refreshEvery of ["55m", "1h"]) {
+      const refused = await runAdmin(() => credentialSetSourceIntent({
+        name: GSC_TOKEN,
+        tokenSource: { kind: "named", name: "gsc" },
+        refreshEvery,
+        replaceSource: true,
+        sync: false,
+      }), gscEnv(fakeDocker, op.bin));
+      expect(refused.status).toBe(1);
+      expect(refused.stderr).toContain("--refresh-every must be shorter than source ttl 55m");
+    }
+    expect(op.reads()).toBe(0);
+    const accepted = await runAdmin(() => credentialSetSourceIntent({
+      name: GSC_TOKEN,
+      tokenSource: { kind: "named", name: "gsc" },
+      refreshEvery: "50m",
+      replaceSource: true,
+      sync: false,
+    }), gscEnv(fakeDocker, op.bin));
+    expect(accepted.status, accepted.stderr).toBe(0);
+    expect(op.reads()).toBe(0);
+
+    writeTokenConfig({ [GSC_TOKEN]: { source: "named", name: "gsc" } });
+    const watch = await runAdmin(() => credentialSyncIntent(watchInput), gscWatchEnv(fakeDocker, op.bin, 2));
+    expect(watch.status, watch.stderr).toBe(0);
+    expect(watch.stdout).toContain("next credential sync in 54m");
+  });
+
+  test("no failure after the 1Password read prints the key JSON or the PEM (catch-all)", async () => {
+    const outputs = [
+      { text: gscKeyJson({ private_key: `-----BEGIN PRIVATE KEY-----\n${GSC_SENTINEL}\n-----END PRIVATE KEY-----\n` }), message: "key JSON field private_key is not a valid private key" },
+      { text: `{"a": ${GSC_SENTINEL}`, message: "key JSON is not valid JSON" },
+    ];
+    for (const output of outputs) {
+      for (const watch of [false, true]) {
+        writeGscFixture();
+        const fakeDocker = installTokenSyncDockerFake();
+        const op = installGscOp(() => output.text);
+        const result = watch
+          ? await runAdmin(() => credentialSyncIntent(watchInput), gscWatchEnv(fakeDocker, op.bin, 2))
+          : await runAdmin(() => credentialSyncIntent(syncInput), gscEnv(fakeDocker, op.bin));
+        expect(result.stderr).toContain(output.message);
+        expect(readTokenStatus()[GSC_TOKEN]).toMatchObject({ ok: false, message: output.message });
+        expect(op.reads()).toBeGreaterThan(0);
+        expectNoKeyMaterial([result.stdout, result.stderr, readIfExists(tokenStatusFilePath()), readIfExists(tokenReceiptsFilePath())]);
+        fs.rmSync(path.join(tmp, "node_modules"));
+      }
+    }
+  });
+
+  test("the source fingerprint covers the scopes, the reference, the pin, and the ttl", () => {
+    const fingerprint = (overrides: Record<string, unknown>) => tokenSourceFingerprint(
+      { source: "named", name: "gsc" },
+      { gsc: gscRegistryEntry(overrides) as unknown as GoogleServiceAccountSource },
+    );
+    const all = [
+      fingerprint({}),
+      fingerprint({ scopes: [GSC_RW] }),
+      fingerprint({ keyJson: { source: "1password", ref: "op://Private/gsc-sa-2/credential.json" } }),
+      fingerprint({ clientEmail: GSC_OTHER_EMAIL }),
+      fingerprint({ ttlSeconds: 3000 }),
+    ];
+    expect(new Set(all).size).toBe(all.length);
+    expect(fingerprint({ createdAt: "2027-01-01T00:00:00.000Z" })).toBe(all[0]);
+  });
+
+  test("a scope change voids the receipt: receipt-gated convergence re-reads the source", async () => {
+    writeGscFixture();
+    const fakeDocker = installTokenSyncDockerFake();
+    const op = installGscOp(() => gscKeyJson());
+    expect((await runAdmin(() => credentialSyncIntent(syncInput), gscEnv(fakeDocker, op.bin))).status).toBe(0);
+    expect(op.reads()).toBe(1);
+    const generation = validateNetworkPolicy(readPolicy()).generation;
+
+    const held = await runAdmin(() => convergeProxyPolicy(), gscEnv(fakeDocker, op.bin, { FAKE_PROXY_STATUS_GENERATION: generation }));
+    expect(held.status, held.stderr).toBe(0);
+    expect(op.reads()).toBe(1);
+
+    writeGscRegistry(gscRegistryEntry({ scopes: [GSC_RW] }));
+    const changed = await runAdmin(() => convergeProxyPolicy(), gscEnv(fakeDocker, op.bin, { FAKE_PROXY_STATUS_GENERATION: generation }));
+    expect(changed.status, changed.stderr).toBe(0);
+    expect(op.reads()).toBe(2);
+    expect(verifyRs256Jwt(writtenJwts(fakeDocker.dockerLog).at(-1) ?? "", keyA).payload.scope).toBe(GSC_RW);
+  });
+
+  describe("watcher key cache (§4.4)", () => {
+    test("a cached key signs every refresh without another 1Password read", async () => {
+      writeGscFixture();
+      const fakeDocker = installTokenSyncDockerFake();
+      const op = installGscOp(() => gscKeyJson());
+      const result = await runAdmin(() => credentialSyncIntent(watchInput), gscWatchEnv(fakeDocker, op.bin, 3));
+      expect(result.status, result.stderr).toBe(0);
+      expect(op.reads()).toBe(1);
+      const jwts = writtenJwts(fakeDocker.dockerLog);
+      expect(jwts).toHaveLength(3);
+      const iats = jwts.map((jwt) => verifyRs256Jwt(jwt, keyA).payload.iat as number);
+      expect(iats[1]).toBeGreaterThan(iats[0]);
+      expect(iats[2]).toBeGreaterThan(iats[1]);
+      expect(new Set(jwts).size).toBe(3);
+    });
+
+    test("without the cache every refresh reads 1Password", async () => {
+      writeGscFixture();
+      const fakeDocker = installTokenSyncDockerFake();
+      const op = installGscOp(() => gscKeyJson());
+      const result = await runAdmin(() => credentialSyncIntent({ ...watchInput, cacheSourceSecrets: false }), gscWatchEnv(fakeDocker, op.bin, 3));
+      expect(result.status, result.stderr).toBe(0);
+      expect(op.reads()).toBe(3);
+    });
+
+    test("a changed source config is a cache miss", async () => {
+      writeGscFixture();
+      let writes = 0;
+      const fakeDocker = installTokenSyncDockerFake({
+        onTokenWrite: () => {
+          writes += 1;
+          if (writes === 1) writeGscRegistry(gscRegistryEntry({ scopes: [GSC_RW] }));
+        },
+      });
+      const op = installGscOp(() => gscKeyJson());
+      const result = await runAdmin(() => credentialSyncIntent(watchInput), gscWatchEnv(fakeDocker, op.bin, 2));
+      expect(result.status, result.stderr).toBe(0);
+      expect(op.reads()).toBe(2);
+      const jwts = writtenJwts(fakeDocker.dockerLog);
+      expect(jwts).toHaveLength(2);
+      expect(verifyRs256Jwt(jwts[1], keyA).payload.scope).toBe(GSC_RW);
+    });
+
+    test("an entry older than 4 h is a cache miss, and a re-read with the same key id resets its age", async () => {
+      writeGscFixture();
+      const fakeDocker = installTokenSyncDockerFake();
+      const op = installGscOp(() => gscKeyJson());
+      // t0, +54m, +108m, +162m, +216m read once; +270m is past 4 h; +324m and
+      // +378m are within 4 h of that re-read.
+      const result = await runAdmin(() => credentialSyncIntent(watchInput), gscWatchEnv(fakeDocker, op.bin, 8));
+      expect(result.status, result.stderr).toBe(0);
+      const jwts = writtenJwts(fakeDocker.dockerLog);
+      expect(jwts).toHaveLength(8);
+      expect(op.reads()).toBe(2);
+      const iats = jwts.map((jwt) => verifyRs256Jwt(jwt, keyA).payload.iat as number);
+      expect(iats.map((iat) => (iat - iats[0]) / 60)).toEqual([0, 54, 108, 162, 216, 270, 324, 378]);
+    });
+
+    test("a re-read with a new private_key_id replaces the cached key", async () => {
+      writeGscFixture();
+      const fakeDocker = installTokenSyncDockerFake();
+      const op = installGscOp((call) => call === 1 ? gscKeyJson() : gscKeyJson({}, keyB, GSC_KEY_ID_B));
+      const result = await runAdmin(() => credentialSyncIntent(watchInput), gscWatchEnv(fakeDocker, op.bin, 6));
+      expect(result.status, result.stderr).toBe(0);
+      expect(op.reads()).toBe(2);
+      const jwts = writtenJwts(fakeDocker.dockerLog);
+      expect(jwts).toHaveLength(6);
+      for (const jwt of jwts.slice(0, 5)) expect(verifyRs256Jwt(jwt, keyA).header.kid).toBe(GSC_KEY_ID);
+      expect(verifyRs256Jwt(jwts[5], keyB).header.kid).toBe(GSC_KEY_ID_B);
+    });
+
+    test("a validation-required runtime clears the cached key", async () => {
+      writeGscFixture();
+      const swap = path.join(tmpBase, "gsc-marker-swap");
+      let writes = 0;
+      const fakeDocker = installTokenSyncDockerFake({
+        onTokenWrite: () => {
+          writes += 1;
+          if (writes === 1) fs.writeFileSync(swap, "");
+        },
+      });
+      // After the first write the runtime proof is stale until the
+      // validation-required wipe runs.
+      let wipes = 0;
+      wrapFakeDocker(fakeDocker.fakeBin, {
+        after: (text) => {
+          if (text.includes(`rm -f '/run/runfree-proxy-secrets/${GSC_TOKEN}'`) && fs.existsSync(swap)) {
+            wipes += 1;
+            fs.rmSync(swap);
+          }
+        },
+      });
+      const op = installGscOp(() => gscKeyJson());
+      const result = await runAdmin(() => credentialSyncIntent(watchInput), gscWatchEnv(fakeDocker, op.bin, 4, { FAKE_DOCKER_MARKER_SWAP_AFTER: swap }));
+      expect(wipes).toBe(1);
+      expect(result.stderr).toContain("runtime validation marker has stale proof version");
+      expect(writtenJwts(fakeDocker.dockerLog)).toHaveLength(3);
+      expect(op.reads()).toBe(2);
+    });
+
+    test("an unreadable source config clears the cached key", async () => {
+      writeGscFixture();
+      const tokens = fs.readFileSync(tokenConfigPath(), "utf8");
+      let writes = 0;
+      let armed = false;
+      const fakeDocker = installTokenSyncDockerFake({
+        onTokenWrite: () => {
+          writes += 1;
+          if (writes === 1) armed = true;
+        },
+      });
+      // Corrupt tokens.json at the next pass's held-token listing, which runs
+      // before that pass loads it; restore it once the fail-closed removal ran.
+      wrapFakeDocker(fakeDocker.fakeBin, {
+        before: (text) => {
+          if (armed && text.includes("held-token-names")) {
+            armed = false;
+            fs.writeFileSync(tokenConfigPath(), "{");
+          }
+        },
+        after: (text) => {
+          if (text.includes(`rm -f '/run/runfree-proxy-secrets/${GSC_TOKEN}'`)) fs.writeFileSync(tokenConfigPath(), tokens);
+        },
+      });
+      const op = installGscOp(() => gscKeyJson());
+      const result = await runAdmin(() => credentialSyncIntent(watchInput), gscWatchEnv(fakeDocker, op.bin, 3));
+      expect(proxyTokenRemovalIndexes(fakeDocker.dockerLog, GSC_TOKEN)).not.toEqual([]);
+      expect(writtenJwts(fakeDocker.dockerLog)).toHaveLength(2);
+      expect(op.reads(), result.stderr).toBe(2);
+    });
+
+    test("the cache entry holds the key and never the JWT", () => {
+      const cache = { jwtPrivateKeys: new Map<string, JwtPrivateKeyCacheEntry>() };
+      const source = gscRegistryEntry() as unknown as GoogleServiceAccountSource;
+      const key = googleServiceAccountKeyFromJson(source, gscKeyJson(), { sourceName: "gsc", sourceSecretCache: cache });
+      const jwt = signGoogleServiceAccountJwt(source, key, 1_800_000_000);
+      const entry = cache.jwtPrivateKeys.get("gsc");
+      expect(entry).toBeDefined();
+      expect(Object.keys(entry ?? {}).sort()).toEqual(["fingerprint", "key", "keyId", "kind", "readAt"]);
+      expect(entry?.kind).toBe("google-service-account");
+      expect(entry?.key).toBeInstanceOf(crypto.KeyObject);
+      for (const value of Object.values(entry ?? {})) {
+        if (typeof value === "string") {
+          expect(value).not.toContain(jwt);
+          expect(jwt.split(".")).not.toContain(value);
+        }
+      }
+    });
+  });
+
+  test("source show prints the pinned identity, scopes, and ttl, never the reference", async () => {
+    writeGscFixture();
+    const result = await runAdmin(() => sourceShowIntent({ name: "gsc" }));
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout).toContain("type: google-service-account");
+    expect(result.stdout).toContain("key JSON: 1password");
+    expect(result.stdout).toContain(`service account: ${GSC_EMAIL}`);
+    expect(result.stdout).toContain(`scope: ${GSC_RO}`);
+    expect(result.stdout).toContain("ttl: 55m");
+    expect(result.stdout).toContain(`used by: ${GSC_TOKEN}`);
+    expect(result.stdout).toContain("agent exposure: no");
+    expect(result.stdout).not.toContain(GSC_REF);
   });
 });

@@ -10,6 +10,7 @@ import {
   announceOnePasswordRead,
   commandSourceStep,
   type CredentialReadPlan,
+  googleServiceAccountStep,
   jwtSigningKeyFromPem,
   onePasswordDocumentArgs,
   onePasswordDocumentStep,
@@ -241,6 +242,13 @@ async function executeReadPlan(plan: CredentialReadPlan, lifetime: CredentialLif
         : jwtSigningKeyFromPem(plan.source, await readOnePasswordOwned(plan.signingKey.read, lifetime), plan.options);
       lifetime.assertActive();
       return signJwtWithKey(plan.source, key);
+    }
+    case "google-service-account": {
+      const keyJsonText = plan.signingKey.kind === "read"
+        ? await readOnePasswordOwned(plan.signingKey.read, lifetime)
+        : undefined;
+      lifetime.assertActive();
+      return googleServiceAccountStep(plan, keyJsonText);
     }
   }
 }
