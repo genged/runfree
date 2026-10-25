@@ -73,13 +73,19 @@ import {
   settleHostSignals,
 } from "./credential-cancellation.ts";
 import { type CredentialReadInput } from "./credential-source-reader.ts";
-import { SEARCH_CONSOLE_TOKEN, searchConsoleWarningFor } from "./search-console-write-guard.ts";
+import {
+  SEARCH_CONSOLE_TOKEN,
+  searchConsoleWarningFor,
+  searchConsoleWarningForCurrentProject,
+  warnSearchConsoleWritePairAtSync,
+} from "./search-console-write-guard.ts";
 import {
   TOKEN_SYNC_DEFERRED_STATUS,
   TOKEN_SYNC_REPREPARE_STATUS,
   WARM_TOKEN_SYNC_CALL_TIMEOUT_MS,
   WARM_TOKEN_SYNC_TOTAL_TIMEOUT_MS,
 } from "../runtime/constants.ts";
+import { warn } from "../warnings.ts";
 
 function assertKnownCredential(name: string): void {
   const policy = loadPolicy();
@@ -645,7 +651,13 @@ export async function credentialSetSourceIntent(input: CredentialSetSourceInput)
   assertNotReservedUserTokenName(input.name, "credential set-source");
   assertKnownCredential(input.name);
   const source = prepareCredentialSource(input);
+  // Spec §5.1: the new binding against the approved policy, as service
+  // enable checks it. Decided before the save, emitted after it.
+  const writeScopeWarning = input.name === SEARCH_CONSOLE_TOKEN
+    ? searchConsoleWarningForCurrentProject(source)
+    : undefined;
   await savePreparedCredentialSource(input, source);
+  if (writeScopeWarning) warn(writeScopeWarning);
 }
 
 export async function credentialClearSourceIntent(input: CredentialClearSourceInput): Promise<void> {
@@ -793,6 +805,9 @@ export async function credentialSyncIntent(input: CredentialSyncInput): Promise<
   if (!input.watch && input.delayFirstSync) die("--delay-first-sync only applies with --watch");
   if (!input.watch && input.initialSourceTruth) die("--initial-source-truth only applies with --watch");
   if (input.watch && input.mode) die(`a ${input.mode} sync is one-shot`);
+  // Spec §5.1: every launch and every one-shot credential sync warns for the
+  // unsafe write pair. The watcher's output goes to a log, so it does not.
+  if (!input.watch) warnSearchConsoleWritePairAtSync();
   if (input.mode === "prepared-source-truth") {
     await preparedSourceTruthSync(input.verbose, input.holdDeadlineMonotonicMs);
     return;

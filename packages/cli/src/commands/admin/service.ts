@@ -14,7 +14,11 @@ import type { ArgumentsCamelCase, Argv } from "yargs";
 import { readAgentEnv, setAgentEnvValues } from "../../admin/admin-core.ts";
 import { planServiceParameterUpdate, serviceHostState } from "../../admin/service-policy.ts";
 import { createAdminState } from "../../admin/context.ts";
-import { SEARCH_CONSOLE_SERVICE, searchConsoleWarningForApprovedPolicy } from "../../admin/search-console-write-guard.ts";
+import {
+  SEARCH_CONSOLE_HOST,
+  SEARCH_CONSOLE_SERVICE,
+  searchConsoleWarningForApprovedPolicy,
+} from "../../admin/search-console-write-guard.ts";
 import {
   bindDesiredServiceCredentialSources,
   promptForMissingServiceParameters,
@@ -47,6 +51,7 @@ import { CliError } from "../../errors.ts";
 import { formatTerminalTable } from "../../terminal-table.ts";
 import { warn } from "../../warnings.ts";
 import { nodeRuntimeIO } from "../../runtime.ts";
+import { printable } from "../../runtime/mcp.ts";
 import type { RuntimeContext } from "../../runtime/types.ts";
 import { combinedServiceRegistry, loadUserServiceCatalog } from "../../user-services.ts";
 import { type Service, serviceOriginLabel } from "../../../../../scripts/services.ts";
@@ -335,6 +340,27 @@ async function diffDesiredServices(
   console.log(activationReportLine(activation));
 }
 
+/**
+ * Spec §5.1 warning after a committed `service enable` (review L3). The
+ * enable already stands, so a failure to compute the warning must not skip
+ * the activation that follows: it warns and makes the exit status 1, as
+ * `host rules` does by running the same check in its own admin action.
+ */
+export function reportSearchConsoleWritePair(
+  runtime: RuntimeContext,
+  check: (runtime: RuntimeContext) => string | undefined = searchConsoleWarningForApprovedPolicy,
+): void {
+  let writeScopeWarning: string | undefined;
+  try {
+    writeScopeWarning = check(runtime);
+  } catch (error) {
+    warn(`the service is enabled, but the ${SEARCH_CONSOLE_HOST} write action was not checked against the bound source: ${printable(error instanceof Error ? error.message : String(error))}; run runfree credential status to check it`);
+    process.exitCode = 1;
+    return;
+  }
+  if (writeScopeWarning) warn(writeScopeWarning);
+}
+
 export const serviceCommand: CommandModule = {
   name: "service",
   group: true,
@@ -362,10 +388,7 @@ export const serviceCommand: CommandModule = {
       reportServiceMutation(result);
       console.log(`${layer} digest: ${result.layerDigest}`);
       if (boundSources.length > 0) console.log(`host-owned credential sources: ${boundSources.join(", ")} bound`);
-      if (plan.id === SEARCH_CONSOLE_SERVICE) {
-        const writeScopeWarning = searchConsoleWarningForApprovedPolicy(runtime);
-        if (writeScopeWarning) warn(writeScopeWarning);
-      }
+      if (plan.id === SEARCH_CONSOLE_SERVICE) reportSearchConsoleWritePair(runtime);
       if (!intent.reloadProxy) {
         console.log("effective policy: unchanged (--no-reload)");
       } else {

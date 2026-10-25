@@ -6,6 +6,7 @@ import path from "node:path";
 import {
   runfreeConfigRoot,
 } from "../paths.ts";
+import { warn } from "../warnings.ts";
 import {
   assertKnownSourceName,
   assertSourceArgumentsOutsideProject,
@@ -22,6 +23,7 @@ import {
   parseDurationSeconds,
   parseTokenSourceConfig,
   policyJson,
+  projectRoot,
   readJsonFile,
   regularExecutableRealpath,
   resolveHostExecutable,
@@ -42,7 +44,11 @@ import {
   googleServiceAccountFailure,
   normalizeGoogleServiceAccountScopes,
 } from "./google-service-account.ts";
-import { assertReplaceKeepsSearchConsoleApproval, SEARCH_CONSOLE_TOKEN } from "./search-console-write-guard.ts";
+import {
+  assertReplaceKeepsSearchConsoleApproval,
+  replaceWithUnknownScopeWarnings,
+  SEARCH_CONSOLE_TOKEN,
+} from "./search-console-write-guard.ts";
 
 function saveSourceRegistry(registry: SourceRegistry): void {
   writeJsonFile(sourceConfigPath(), registry, 0o600);
@@ -127,6 +133,28 @@ function sourceBindings(registryName: string): Array<{ projectId: string; tokenN
     }
   }
   return bindings;
+}
+
+/** Project ids that bind google-search-console to a named source. */
+function searchConsoleBindingProjectIds(registryName: string): string[] {
+  return Array.from(new Set(sourceBindings(registryName)
+    .filter((binding) => binding.tokenName === SEARCH_CONSOLE_TOKEN)
+    .map((binding) => binding.projectId)));
+}
+
+// Warn-only (spec §5.1), so a host credential config it cannot read never
+// fails the add: it becomes a warning of its own.
+function unknownScopeWarnings(name: string, sourceType: "command" | "jwt"): string[] {
+  try {
+    return replaceWithUnknownScopeWarnings({
+      sourceName: name,
+      sourceType,
+      bindingProjectIds: searchConsoleBindingProjectIds(name),
+      cwdProjectRoot: projectRoot(),
+    });
+  } catch {
+    return [`${name} source: the host credential config could not be read, so the Search Console write-scope warning was not checked`];
+  }
 }
 
 function sourceUsers(registryName: string): string[] {
@@ -249,6 +277,9 @@ export function sourceAddJwtIntent(input: SourceAddJwtInput): void {
     const users = sourceUsers(name);
     die(`${name} source is already configured; pass --replace-source to change it${users.length > 0 ? `; used by credential bindings: ${users.join(", ")}` : ""}`);
   }
+  // Spec §5.1: a jwt source's scope is unknown, so a bound source warns and
+  // never refuses. Decided before the save, emitted after it.
+  const writeScopeWarnings = unknownScopeWarnings(name, "jwt");
   try {
     signJwtSource(source);
   } catch (error) {
@@ -256,6 +287,7 @@ export function sourceAddJwtIntent(input: SourceAddJwtInput): void {
   }
   registry[name] = source;
   saveSourceRegistry(registry);
+  for (const warning of writeScopeWarnings) warn(warning);
   console.log(`${name} source ${existing ? "replaced" : "configured"}`);
   console.log("type: jwt");
   for (const line of jwtDisplay(source)) console.log(line);
@@ -298,9 +330,8 @@ export function sourceAddGoogleServiceAccountIntent(input: SourceAddGoogleServic
     sourceName: name,
     previous: loadSourceRegistry()[name],
     nextScopes: scopes,
-    bindingProjectIds: Array.from(new Set(sourceBindings(name)
-      .filter((binding) => binding.tokenName === SEARCH_CONSOLE_TOKEN)
-      .map((binding) => binding.projectId))),
+    bindingProjectIds: searchConsoleBindingProjectIds(name),
+    cwdProjectRoot: projectRoot(),
   });
 
   ensureStateDirs();
@@ -374,6 +405,9 @@ export function sourceAddCommandIntent(input: SourceAddCommandInput): void {
     const users = sourceUsers(name);
     die(`${name} source is already configured; pass --replace-source to change it${users.length > 0 ? `; used by credential bindings: ${users.join(", ")}` : ""}`);
   }
+  // Spec §5.1: a command source's scope is unknown, so a bound source warns
+  // and never refuses. Decided before the save, emitted after it.
+  const writeScopeWarnings = unknownScopeWarnings(name, "command");
   try {
     runCommandSource(source);
   } catch (error) {
@@ -381,6 +415,7 @@ export function sourceAddCommandIntent(input: SourceAddCommandInput): void {
   }
   registry[name] = source;
   saveSourceRegistry(registry);
+  for (const warning of writeScopeWarnings) warn(warning);
   console.log(`${name} source ${existing ? "replaced" : "configured"}`);
   console.log(`type: command`);
   console.log(`command: ${commandDisplay(source)}`);

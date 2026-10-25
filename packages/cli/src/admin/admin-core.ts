@@ -1226,15 +1226,18 @@ export function runCommandSource(source: CommandSource): string {
   return commandSourceStep(invocation, exit);
 }
 
+/** A refusal before `op` runs. Its message is fixed text, never a value read. */
+class SecretRefReadPrecheckError extends Error {}
+
 function jwtPrivateKeyRead(
   ref: SecretRef,
   options: { quiet?: boolean; verbose?: boolean } = {},
   label = "JWT private key",
 ): OnePasswordRead {
-  if (ref.source !== "1password") throw new Error("unsupported secret reference");
-  if (!ref.ref.startsWith("op://")) throw new Error("1Password references must start with op://");
+  if (ref.source !== "1password") throw new SecretRefReadPrecheckError("unsupported secret reference");
+  if (!ref.ref.startsWith("op://")) throw new SecretRefReadPrecheckError("1Password references must start with op://");
   const opPath = resolveHostExecutable("op");
-  if (!opPath) throw new Error("op CLI not found on sanitized host PATH");
+  if (!opPath) throw new SecretRefReadPrecheckError("op CLI not found on sanitized host PATH");
   adminVerbose(options, `reading ${label} from 1Password`);
   return onePasswordRead(opPath, ref.ref, options);
 }
@@ -1330,6 +1333,23 @@ export function googleServiceAccountKeyFromJson(
   return parsed;
 }
 
+/**
+ * The 1Password read stage of a service-account signature (review L6): a
+ * classified `op` failure keeps its own safe message, a precheck refusal its
+ * fixed text, and anything else a fixed read message. No key JSON exists yet
+ * at this stage, and no other error's text is read.
+ */
+function keyJsonReadFailure(error: unknown): TokenResolutionError {
+  if (error instanceof TokenResolutionError) return error;
+  const precheck = error instanceof SecretRefReadPrecheckError;
+  return new TokenResolutionError({
+    classification: "definitive",
+    sourceKind: "1password",
+    code: precheck ? "op-read-precheck" : "op-read-unexpected",
+    safeMessage: precheck ? error.message : "1Password read of the service account key JSON failed",
+  });
+}
+
 export type GoogleServiceAccountPlan = Extract<CredentialReadPlan, { kind: "google-service-account" }>;
 
 /**
@@ -1366,7 +1386,12 @@ export function signGoogleServiceAccountSource(
   source: Pick<GoogleServiceAccountSource, "keyJson" | "scopes" | "ttlSeconds">,
   options: TokenResolutionOptions & { sourceName?: string; pin: string | undefined },
 ): { jwt: string; clientEmail: string } {
-  const keyJsonText = runOnePasswordReadSync(jwtPrivateKeyRead(source.keyJson, options, "service account key JSON"));
+  let keyJsonText: string;
+  try {
+    keyJsonText = runOnePasswordReadSync(jwtPrivateKeyRead(source.keyJson, options, "service account key JSON"));
+  } catch (error) {
+    throw keyJsonReadFailure(error);
+  }
   try {
     const key = parseGoogleServiceAccountKeyJson(keyJsonText, options.pin);
     const jwt = signGoogleServiceAccountJwt({ ...source, clientEmail: key.clientEmail }, key, Math.floor(tokenSyncWatchNowMs() / 1000));

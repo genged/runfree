@@ -4,6 +4,8 @@
 // unsafe pair (a google-search-console binding whose scope is not proven
 // read-only, plus write action allow on the host) from those two inputs
 // only. It never reads 1Password.
+import path from "node:path";
+
 import {
   effectiveWriteAction,
   type PolicyJson,
@@ -15,9 +17,11 @@ import { readApprovedNetworkPolicy } from "../control/approvals.ts";
 import { compileDesiredPolicies } from "../control/compiler.ts";
 import { knownProjectPointers } from "../host-service-registry.ts";
 import { runfreeStateRoot } from "../paths.ts";
+import { projectHash } from "../project-identity.ts";
 import { remedy } from "../remedies.ts";
+import { printable } from "../runtime/mcp.ts";
 import type { RuntimeContext } from "../runtime/types.ts";
-import { warn } from "../warnings.ts";
+import { warn, warnOnce } from "../warnings.ts";
 import {
   childEnv,
   describeSource,
@@ -25,6 +29,7 @@ import {
   loadSourceRegistry,
   loadTokenConfig,
   type NamedSource,
+  projectRoot,
   type SourceRegistry,
   type TokenSource,
 } from "./admin-core.ts";
@@ -121,23 +126,124 @@ function approvedSearchConsolePair(projectRoot: string, project: ProjectInfo): A
   };
 }
 
+type ProjectLocation = Pick<RuntimeContext, "projectRoot" | "project">;
+
+/**
+ * The warning for a checkout's approved desired pair and `binding`, or
+ * undefined. Reads the approval records, the source registry, and nothing
+ * else. The remedy names the layer that holds the service entry.
+ */
+function approvedPolicyWarning(location: ProjectLocation, binding: TokenSource | undefined): string | undefined {
+  if (!binding) return undefined;
+  const pair = approvedSearchConsolePair(location.projectRoot, location.project);
+  if (!pair) return undefined;
+  return searchConsoleWarningFor({
+    policy: pair.policy,
+    binding,
+    registry: binding.source === "named" ? loadSourceRegistry() : undefined,
+    local: pair.local,
+  });
+}
+
 /**
  * The warning for the project's approved desired pair and its current
  * binding, or undefined. Runs inside an admin action (it reads the host
  * credential config) and after the desired-policy transaction, never under
- * its lock. The remedy names the layer that holds the service entry.
+ * its lock.
  */
-export function searchConsoleWarningForApprovedPolicy(runtime: RuntimeContext): string | undefined {
-  const pair = approvedSearchConsolePair(runtime.projectRoot, runtime.project);
-  if (!pair) return undefined;
-  const binding = loadTokenConfig()[SEARCH_CONSOLE_TOKEN];
-  return searchConsoleWarningFor({
-    policy: pair.policy,
-    binding,
-    registry: binding?.source === "named" ? loadSourceRegistry() : undefined,
-    local: pair.local,
-  });
+export function searchConsoleWarningForApprovedPolicy(runtime: ProjectLocation): string | undefined {
+  return approvedPolicyWarning(runtime, loadTokenConfig()[SEARCH_CONSOLE_TOKEN]);
 }
+
+/**
+ * The warning for the admin action's own project (its approved desired pair)
+ * and `binding`, or undefined. Warn-only, so it never throws: a policy or
+ * source it cannot read becomes a warning of its own.
+ */
+export function searchConsoleWarningForCurrentProject(binding: TokenSource | undefined): string | undefined {
+  if (!binding) return undefined;
+  try {
+    const root = projectRoot();
+    return approvedPolicyWarning({ projectRoot: root, project: projectInfo(root, childEnv()) }, binding);
+  } catch {
+    return `${SEARCH_CONSOLE_TOKEN} is bound, but its approved policy or source could not be read, so the ${SEARCH_CONSOLE_HOST} write action was not checked against its scope; run runfree credential status to check it`;
+  }
+}
+
+/**
+ * Spec §5.1 at every launch and `credential sync` (both run
+ * credentialSyncIntent): warns for the unsafe pair of the admin action's
+ * project. Never fails the sync. A project with no google-search-console
+ * binding reads nothing more than its credential config. `warnOnce`, because
+ * a launch whose first sync defers runs a second one.
+ */
+export function warnSearchConsoleWritePairAtSync(): void {
+  let binding: TokenSource | undefined;
+  try {
+    binding = loadTokenConfig()[SEARCH_CONSOLE_TOKEN];
+  } catch {
+    // The sync itself reports an unreadable credential config.
+    return;
+  }
+  const message = searchConsoleWarningForCurrentProject(binding);
+  if (message) warnOnce(message);
+}
+
+type BindingProject =
+  | { id: string; root: string; pair: ApprovedSearchConsolePair | undefined }
+  | { id: string; root: undefined };
+
+/**
+ * Maps each binding project id to its checkout and approved pair. The
+ * current checkout (the admin action's project root) is resolved directly,
+ * so a project that never launched is checked when the command runs in it;
+ * every other id goes through the state pointer a launch writes. An id with
+ * no checkout, or whose checkout or approval cannot be read, has no root.
+ */
+function bindingProjects(bindingProjectIds: readonly string[], cwdProjectRoot: string | undefined): BindingProject[] {
+  const env = childEnv();
+  const roots = new Map(knownProjectPointers(runfreeStateRoot(env)).map((pointer) => [pointer.id, pointer.root]));
+  if (cwdProjectRoot !== undefined) {
+    const cwdRoot = path.resolve(cwdProjectRoot);
+    const cwdId = projectHash(cwdRoot);
+    if (bindingProjectIds.includes(cwdId)) roots.set(cwdId, cwdRoot);
+  }
+  const result: BindingProject[] = [];
+  for (const id of [...new Set(bindingProjectIds)].sort()) {
+    const root = roots.get(id);
+    try {
+      if (root === undefined) throw new Error("no project checkout");
+      result.push({ id, root, pair: approvedSearchConsolePair(root, projectInfo(root, env)) });
+    } catch {
+      result.push({ id, root: undefined });
+    }
+  }
+  return result;
+}
+
+function unsafeProject(project: BindingProject): project is { id: string; root: string; pair: ApprovedSearchConsolePair } {
+  return project.root !== undefined
+    && project.pair !== undefined
+    && project.pair.hostAllowed
+    && effectiveWriteAction(project.pair.policy, SEARCH_CONSOLE_HOST) === "allow";
+}
+
+function restorePromptRemedy(pair: ApprovedSearchConsolePair): string {
+  return remedy.hostRulesSet(SEARCH_CONSOLE_HOST, { writeAction: "ask" }, { local: pair.local });
+}
+
+// P-D1: a binding project that cannot be resolved warns and does not refuse.
+function uncheckedProjectWarning(sourceName: string, id: string, check: "refusal" | "warning"): string {
+  return `${sourceName} source: project ${printable(id)} binds ${SEARCH_CONSOLE_TOKEN} to it, but its checkout or approved policy cannot be read, so the Search Console write-scope ${check} could not be checked for it; run this command inside that checkout to check it, and its next launch or credential sync warns if its ${SEARCH_CONSOLE_HOST} writes run without approval`;
+}
+
+type BindingInput = {
+  sourceName: string;
+  /** Project ids whose host credential config binds google-search-console to this source. */
+  bindingProjectIds: readonly string[];
+  /** The admin action's project root (the current checkout), when there is one. */
+  cwdProjectRoot?: string;
+};
 
 /**
  * Spec §5.1 refusal (plans P-D1, P-D2). A source change that adds a write
@@ -146,37 +252,50 @@ export function searchConsoleWarningForApprovedPolicy(runtime: RuntimeContext): 
  * desired policy: that change removes the approval prompt for sitemap PUT
  * and site DELETE, and nobody would see it. Reads the state pointers and
  * approved policies only; never 1Password. A binding project whose checkout
- * or approval cannot be read cannot launch, so it warns and does not refuse
- * (the warning names its project id; `credential status`, `service enable`,
- * and `host rules` warn there once the checkout is back).
+ * or approval cannot be read warns and does not refuse; its next launch or
+ * credential sync warns (warnSearchConsoleWritePairAtSync).
  */
-export function assertReplaceKeepsSearchConsoleApproval(input: {
-  sourceName: string;
+export function assertReplaceKeepsSearchConsoleApproval(input: BindingInput & {
   previous: NamedSource | undefined;
   nextScopes: readonly string[];
-  /** Project ids whose host credential config binds google-search-console to this source. */
-  bindingProjectIds: readonly string[];
 }): void {
   if (input.bindingProjectIds.length === 0 || !scopesAddWrite(input.previous, input.nextScopes)) return;
-  const env = childEnv();
-  const roots = new Map(knownProjectPointers(runfreeStateRoot(env)).map((pointer) => [pointer.id, pointer.root]));
   const unsafe: string[] = [];
-  for (const id of [...input.bindingProjectIds].sort()) {
-    const root = roots.get(id);
-    let pair: ApprovedSearchConsolePair | undefined;
-    try {
-      if (root === undefined) throw new Error("no project pointer");
-      pair = approvedSearchConsolePair(root, projectInfo(root, env));
-    } catch {
-      warn(`${input.sourceName} source: project ${id} binds ${SEARCH_CONSOLE_TOKEN} to it, but its checkout or approved policy cannot be read, so its Search Console write action was not checked; once that checkout is back, credential status in it reports an unsafe write pair`);
+  for (const project of bindingProjects(input.bindingProjectIds, input.cwdProjectRoot)) {
+    if (project.root === undefined) {
+      warn(uncheckedProjectWarning(input.sourceName, project.id, "refusal"));
       continue;
     }
-    if (!pair?.hostAllowed || effectiveWriteAction(pair.policy, SEARCH_CONSOLE_HOST) !== "allow") continue;
-    unsafe.push(`${root} (restore the prompt there with: ${remedy.hostRulesSet(SEARCH_CONSOLE_HOST, { writeAction: "ask" }, { local: pair.local })})`);
+    if (!unsafeProject(project)) continue;
+    unsafe.push(`${printable(project.root)} (restore the prompt there with: ${restorePromptRemedy(project.pair)})`);
   }
   if (unsafe.length === 0) return;
   die([
     `${input.sourceName} source change adds a Search Console write scope, and ${SEARCH_CONSOLE_HOST} writes run without approval (write action allow) in a project that binds ${SEARCH_CONSOLE_TOKEN} to it: ${unsafe.join("; ")};`,
     `then run the replace again, or keep --scope ${GOOGLE_SA_READ_ONLY_SCOPE}`,
   ].join(" "));
+}
+
+/**
+ * Spec §5.1 for a jwt or command source: its scope is unknown, so a replace
+ * of a source bound to google-search-console under write action allow warns
+ * and never refuses. Returns the warnings, so the caller emits them only
+ * once the replace is saved. Reads what the refusal reads; never 1Password.
+ */
+export function replaceWithUnknownScopeWarnings(input: BindingInput & { sourceType: "command" | "jwt" }): string[] {
+  if (input.bindingProjectIds.length === 0) return [];
+  const warnings: string[] = [];
+  for (const project of bindingProjects(input.bindingProjectIds, input.cwdProjectRoot)) {
+    if (project.root === undefined) {
+      warnings.push(uncheckedProjectWarning(input.sourceName, project.id, "warning"));
+      continue;
+    }
+    if (!unsafeProject(project)) continue;
+    warnings.push([
+      `${input.sourceName} source is bound to ${SEARCH_CONSOLE_TOKEN} in ${printable(project.root)}, where ${SEARCH_CONSOLE_HOST} writes run without approval (write action allow), and a ${input.sourceType} source has a scope Runfree cannot read;`,
+      "sitemap PUT and site DELETE will not prompt if it grants the webmasters write scope;",
+      `restore the prompt there with: ${restorePromptRemedy(project.pair)}`,
+    ].join(" "));
+  }
+  return warnings;
 }

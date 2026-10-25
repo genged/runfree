@@ -101,6 +101,13 @@ export function warn(message: string): void {
   buffer.push({ severity: "warning", message, at: new Date() });
 }
 
+// Buffered warning, skipped when the same message is already waiting for the
+// next flush (a step that can run twice in one command).
+export function warnOnce(message: string): void {
+  if (buffer.some((event) => event.message === message)) return;
+  warn(message);
+}
+
 export function pendingWarningsForTest(): readonly OutputEvent[] {
   return buffer;
 }
