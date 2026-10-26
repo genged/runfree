@@ -7,9 +7,9 @@
     "node": ">=22"
   },
   "dependencies": {
-    "@anthropic-ai/claude-code": "2.1.280",
-    "@earendil-works/pi-coding-agent": "0.87.1",
-    "@openai/codex": "0.156.1",
+    "@anthropic-ai/claude-code": "2.1.310",
+    "@earendil-works/pi-coding-agent": "1.4.0",
+    "@openai/codex": "0.164.0",
     "pnpm": "10.34.8",
     "tsx": "4.23.15"
   }
