@@ -164,6 +164,8 @@ ARG USERNAME=agent
 ARG UID=1000
 ARG GID=1000
 
+# The agent-home block below is held equal to agentHomeMountParents() plus
+# ~/.local/bin by packages/cli/src/runtime/agent-home-dirs.test.ts.
 RUN set -eu \
  && existing_user="$(getent passwd "${UID}" | cut -d: -f1 || true)" \
  && if [ -n "$existing_user" ] && [ "$existing_user" != "$USERNAME" ]; then userdel -r "$existing_user" 2>/dev/null || userdel "$existing_user"; fi \
@@ -175,8 +177,16 @@ RUN set -eu \
  && mkdir -p "/home/${USERNAME}" \
  && chown "${USERNAME}:${USERNAME}" "/home/${USERNAME}" \
  && install -d -m 0755 -o "${USERNAME}" -g "${USERNAME}" \
+      # runfree:agent-home-dirs:begin
+      "/home/${USERNAME}/.bun" \
+      "/home/${USERNAME}/.bun/install" \
+      "/home/${USERNAME}/.cache" \
       "/home/${USERNAME}/.local" \
-      "/home/${USERNAME}/.local/bin"
+      "/home/${USERNAME}/.local/bin" \
+      "/home/${USERNAME}/.local/share" \
+      "/home/${USERNAME}/.local/share/pnpm" \
+      "/home/${USERNAME}/.pi"
+# runfree:agent-home-dirs:end
 
 RUN printf 'export PATH=$PATH:/home/%s/.local/bin\nautoload -Uz compinit && compinit\n' "${USERNAME}" \
       > "/home/${USERNAME}/.zshrc" \
