@@ -1504,6 +1504,54 @@ describe("runfree service CLI: desired disable", () => {
 
 describe("runfree service CLI: list, explain, diff", () => {
 
+  test("explain prints a curated definition's notes without approved controls and writes nothing", () => {
+    writeFixtureRepo({ version: 2, hosts: [] }, { version: 4, agents: { default: "claude" }, runtime: {} });
+    const before = fs.readFileSync(path.join(tmp, ".runfree/network-policy.json"), "utf8");
+
+    const explained = runAdminCli(["service", "explain", "google-search-console"]);
+    expect(explained.status, explained.stderr).toBe(0);
+    expect(explained.stdout).toContain("state: not enabled; current revision 1");
+    for (const note of SERVICES["google-search-console"].explanations) expect(explained.stdout).toContain(note);
+    expect(fs.readFileSync(path.join(tmp, ".runfree/network-policy.json"), "utf8")).toBe(before);
+
+    const json = runAdminCli(["service", "explain", "google-search-console", "--json"]);
+    expect(json.status, json.stderr).toBe(0);
+    const parsed = JSON.parse(json.stdout) as { state: string; definition: { explanations: string[] } };
+    expect(parsed.state).toBe("available");
+    expect(parsed.definition.explanations).toEqual(SERVICES["google-search-console"].explanations);
+
+    const unknown = runAdminCli(["service", "explain", "no-such-service"]);
+    expect(unknown.status).toBe(1);
+    expect(unknown.stderr).toContain("unknown service: no-such-service");
+  });
+
+  test("explain of an enabled service shows its layer, approved entry, and parameter state", () => {
+    writeApprovedDesiredFixture({ version: 2, hosts: [] });
+    const enabled = runAdminCli(
+      ["service", "enable", "github", "--from-env", "MY_GH_TOKEN", "--skip-broad", "--no-reload"],
+      { extraEnv: { MY_GH_TOKEN: "host-secret" } },
+    );
+    expect(enabled.status, enabled.stderr).toBe(0);
+    // `service enable` writes desired policy only; explain reads approved state.
+    writeApprovedDesiredFixture(readDesiredPolicy());
+
+    const explained = runAdminCli(["service", "explain", "github"]);
+    expect(explained.status, explained.stderr).toBe(0);
+    expect(explained.stdout).toContain("state: enabled (project layer), approved revision 3");
+    expect(explained.stdout).toContain("objects.githubusercontent.com (broad, skipped)");
+    expect(explained.stdout).toContain("github.com -> Authorization (basic:x-access-token, protocol=git-lfs)");
+    expect(explained.stdout).not.toContain("host-secret");
+
+    const json = JSON.parse(runAdminCli(["service", "explain", "github", "--json"]).stdout) as {
+      layer: string;
+      revision: number;
+      selection: { skippedHosts?: string[] };
+    };
+    expect(json.layer).toBe("project");
+    expect(json.revision).toBe(3);
+    expect(json.selection.skippedHosts).toEqual(["objects.githubusercontent.com"]);
+  });
+
   test("diff reports approved service drift, retains unavailable definitions, and applies exact replacements", () => {
     const unavailable: DesiredServiceEntry = {
       definitionDigest: `sha256:${"b".repeat(64)}`,
