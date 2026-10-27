@@ -49,6 +49,7 @@ type EnableArgs = AgentServerArgs & {
   source?: string;
   "oauth-host"?: string[];
   "no-discover"?: boolean;
+  login?: boolean;
   "no-login"?: boolean;
   "from-env"?: string;
   "from-1password"?: string;
@@ -176,7 +177,11 @@ export const mcpCommand: CommandModule = {
                   type: "boolean",
                   describe: "Make no network call: skip OAuth metadata discovery and use only --oauth-host hosts",
                 })
-                .option("no-login", { type: "boolean", describe: "Do not run the OAuth login after enabling" })
+                .option("login", { type: "boolean", describe: "Run the OAuth login (runfree mcp auth) after enabling; needs a terminal" })
+                // Kept so scripts written when login was the default still
+                // parse; skipping the login is now the default.
+                .option("no-login", { type: "boolean", hidden: true })
+                .conflicts("login", "no-login")
                 .option("from-env", { type: "string", requiresArg: true, group: TOKEN_SOURCE_GROUP, describe: "Read the token from this host env var" })
                 .option("from-1password", { type: "string", requiresArg: true, group: TOKEN_SOURCE_GROUP, describe: "Read the token from a 1Password secret ref (op://...)" })
                 .option("from-source", { type: "string", requiresArg: true, group: TOKEN_SOURCE_GROUP, describe: "Bind a previously-saved host-owned source" })
@@ -204,7 +209,8 @@ export const mcpCommand: CommandModule = {
                 const activation = await activateApprovedControlsAfterMutation(context.runtimeContext(), nodeRuntimeIO);
                 console.log(activationReportLine(activation));
                 if (!result.login) return 0;
-                if (argv["no-login"] || !interactive) {
+                if (!argv.login || !interactive) {
+                  if (argv.login) console.log("--login needs a terminal; the OAuth login was not run");
                   if (result.loginCommand) console.log(`log in with: ${result.loginCommand}`);
                   return 0;
                 }

@@ -14,6 +14,7 @@ import {
   die,
   ensureStateDirs,
   formatDurationSeconds,
+  type GoogleServiceAccountSource,
   type JwtAlgorithm,
   type JwtSource,
   loadSourceRegistry,
@@ -25,14 +26,22 @@ import {
   regularExecutableRealpath,
   resolveHostExecutable,
   runCommandSource,
+  signGoogleServiceAccountSource,
   signJwtSource,
   type SourceAddCommandInput,
+  type SourceAddGoogleServiceAccountInput,
   type SourceAddJwtInput,
   sourceConfigPath,
   type SourceNameInput,
   type SourceRegistry,
   writeJsonFile,
 } from "./admin-core.ts";
+import {
+  assertGoogleServiceAccountTtl,
+  GOOGLE_SA_TTL_DEFAULT_SECONDS,
+  googleServiceAccountFailure,
+  normalizeGoogleServiceAccountScopes,
+} from "./google-service-account.ts";
 
 function saveSourceRegistry(registry: SourceRegistry): void {
   writeJsonFile(sourceConfigPath(), registry, 0o600);
@@ -63,18 +72,32 @@ function commandSourcesEqual(left: CommandSource, right: CommandSource): boolean
     && left.displayArgv.every((entry, index) => entry === right.displayArgv[index]);
 }
 
+// A switch with a `never` default: a new source type must answer here, or the
+// "unchanged" path silently never runs for it (spec 2026-10-24 §4.5).
 function namedSourcesEqual(left: NamedSource, right: NamedSource): boolean {
-  if (left.type !== right.type) return false;
-  if (left.type === "command" && right.type === "command") return commandSourcesEqual(left, right);
-  if (left.type === "jwt" && right.type === "jwt") {
-    return left.alg === right.alg
-      && left.privateKey.source === right.privateKey.source
-      && left.privateKey.ref === right.privateKey.ref
-      && left.ttlSeconds === right.ttlSeconds
-      && policyJson(left.headers) === policyJson(right.headers)
-      && policyJson(left.claims) === policyJson(right.claims);
+  switch (left.type) {
+    case "command":
+      return right.type === "command" && commandSourcesEqual(left, right);
+    case "jwt":
+      return right.type === "jwt"
+        && left.alg === right.alg
+        && left.privateKey.source === right.privateKey.source
+        && left.privateKey.ref === right.privateKey.ref
+        && left.ttlSeconds === right.ttlSeconds
+        && policyJson(left.headers) === policyJson(right.headers)
+        && policyJson(left.claims) === policyJson(right.claims);
+    case "google-service-account":
+      return right.type === "google-service-account"
+        && left.keyJson.source === right.keyJson.source
+        && left.keyJson.ref === right.keyJson.ref
+        && left.clientEmail === right.clientEmail
+        && left.ttlSeconds === right.ttlSeconds
+        && policyJson(left.scopes) === policyJson(right.scopes);
+    default: {
+      const unknownSource: never = left;
+      throw new Error(`unsupported named source type: ${String((unknownSource as { type?: unknown }).type)}`);
+    }
   }
-  return false;
 }
 
 function sourceUsers(registryName: string): string[] {
@@ -138,6 +161,31 @@ function jwtDisplay(source: JwtSource): string[] {
   return lines;
 }
 
+// The 1Password reference is not shown, as for a jwt private key.
+function googleServiceAccountDisplay(source: GoogleServiceAccountSource): string[] {
+  return [
+    "key JSON: 1password",
+    `service account: ${source.clientEmail}`,
+    ...source.scopes.map((scope) => `scope: ${scope}`),
+    `ttl: ${formatDurationSeconds(source.ttlSeconds)}`,
+  ];
+}
+
+function namedSourceDisplay(source: NamedSource): string[] {
+  switch (source.type) {
+    case "command":
+      return [`command: ${commandDisplay(source)}`];
+    case "jwt":
+      return jwtDisplay(source);
+    case "google-service-account":
+      return googleServiceAccountDisplay(source);
+    default: {
+      const unknownSource: never = source;
+      throw new Error(`unsupported named source type: ${String((unknownSource as { type?: unknown }).type)}`);
+    }
+  }
+}
+
 // Typed enforcement for `runfree credential source add jwt <name> ...`. Re-validates the
 // algorithm, 1Password key reference, TTL, and generated-claim/header rules,
 // signs once to verify, and stores the source.
@@ -186,10 +234,7 @@ export function sourceAddJwtIntent(input: SourceAddJwtInput): void {
   if (existing && namedSourcesEqual(existing, source)) {
     console.log(`${name} source unchanged`);
     console.log(`type: ${sourceTypeDisplay(existing)}`);
-    const details = existing.type === "jwt"
-      ? jwtDisplay(existing)
-      : [`command: ${commandDisplay(existing)}`];
-    for (const line of details) console.log(line);
+    for (const line of namedSourceDisplay(existing)) console.log(line);
     console.log("agent exposure: no");
     return;
   }
@@ -207,6 +252,74 @@ export function sourceAddJwtIntent(input: SourceAddJwtInput): void {
   console.log(`${name} source ${existing ? "replaced" : "configured"}`);
   console.log("type: jwt");
   for (const line of jwtDisplay(source)) console.log(line);
+  console.log("agent exposure: no");
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+// Typed enforcement for `runfree credential source add google-service-account
+// <name> ...` (spec 2026-10-24 google-service-account-source §4.2). Every flag
+// is checked before the 1Password read. The client_email is pinned from the
+// verification read, so the "unchanged" compare runs after that read: a key
+// JSON for another service account is a change that needs --replace-source,
+// never "unchanged" (plan P-D5). Nothing is written before every check passed.
+export function sourceAddGoogleServiceAccountIntent(input: SourceAddGoogleServiceAccountInput): void {
+  const { name } = input;
+  if (!name) die("usage: runfree credential source add google-service-account <name> [--replace-source] --key-json-from-1password op://... --scope <scope> [--ttl 55m]");
+  assertKnownSourceName(name);
+
+  const keyJsonRef = singleJwtOption(input.keyJsonRef, "--key-json-from-1password");
+  const ttlValue = singleJwtOption(input.ttl, "--ttl");
+  if (!keyJsonRef) die("credential source add google-service-account requires --key-json-from-1password op://...");
+  if (!keyJsonRef.startsWith("op://")) die("1Password references must start with op://");
+  if (input.scopes.length === 0) die("credential source add google-service-account requires --scope");
+  let scopes: string[];
+  let ttlSeconds: number;
+  try {
+    // Both validators throw fixed text that never quotes a secret.
+    scopes = normalizeGoogleServiceAccountScopes(input.scopes);
+    ttlSeconds = ttlValue === undefined ? GOOGLE_SA_TTL_DEFAULT_SECONDS : parseDurationSeconds(ttlValue, "--ttl");
+    assertGoogleServiceAccountTtl(ttlSeconds);
+  } catch (error) {
+    die(errorMessage(error));
+  }
+  ensureStateDirs();
+  const keyJson = { source: "1password" as const, ref: keyJsonRef };
+  let clientEmail: string;
+  try {
+    ({ clientEmail } = signGoogleServiceAccountSource({ keyJson, scopes, ttlSeconds }, { sourceName: name, pin: undefined }));
+  } catch (error) {
+    // The catch-all: only a fixed message, never the key JSON (§4.3, M4).
+    die(googleServiceAccountFailure(error, name).safeMessage);
+  }
+  const source: GoogleServiceAccountSource = {
+    type: "google-service-account",
+    keyJson,
+    clientEmail,
+    scopes,
+    ttlSeconds,
+    createdAt: new Date().toISOString(),
+  };
+  const registry = loadSourceRegistry();
+  const existing = registry[name];
+  if (existing && namedSourcesEqual(existing, source)) {
+    console.log(`${name} source unchanged`);
+    console.log(`type: ${sourceTypeDisplay(existing)}`);
+    for (const line of namedSourceDisplay(existing)) console.log(line);
+    console.log("agent exposure: no");
+    return;
+  }
+  if (existing && !input.replaceSource) {
+    const users = sourceUsers(name);
+    die(`${name} source is already configured; pass --replace-source to change it${users.length > 0 ? `; used by credential bindings: ${users.join(", ")}` : ""}`);
+  }
+  registry[name] = source;
+  saveSourceRegistry(registry);
+  console.log(`${name} source ${existing ? "replaced" : "configured"}`);
+  console.log("type: google-service-account");
+  for (const line of googleServiceAccountDisplay(source)) console.log(line);
   console.log("agent exposure: no");
 }
 
@@ -275,11 +388,7 @@ export function sourceShowIntent(input: SourceNameInput): void {
   const users = sourceUsers(input.name);
   console.log(`${input.name}: configured`);
   console.log(`type: ${sourceTypeDisplay(source)}`);
-  if (source.type === "command") {
-    console.log(`command: ${commandDisplay(source)}`);
-  } else {
-    for (const line of jwtDisplay(source)) console.log(line);
-  }
+  for (const line of namedSourceDisplay(source)) console.log(line);
   console.log(`used by: ${users.join(", ") || "none"}`);
   console.log("agent exposure: no");
   console.log("executes during: credential sync");

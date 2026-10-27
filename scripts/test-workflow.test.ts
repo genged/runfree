@@ -71,7 +71,7 @@ describe("verification lane", () => {
     expect(bunSetupIndex).toBeGreaterThan(pnpmIndex);
     expect(installIndex).toBeGreaterThan(bunSetupIndex);
     expect(buildIndex).toBeGreaterThan(installIndex);
-    expect(workflow).toContain("RUNFREE_PNPM_VERSION: 10.28.0");
+    expect(workflow).toContain("RUNFREE_PNPM_VERSION: 10.34.8");
   });
 
   // `.bun-version` is the one declaration of the Bun that builds the binaries;

@@ -189,7 +189,7 @@ That downloads the latest release for your architecture, verifies its SHA-256
 checksum against the published manifest, and installs to `~/.local/bin/runfree`.
 It needs `bash`, not `sh`.
 
-To build from source instead, you need Node 22 and pnpm 10.28.0. The build
+To build from source instead, you need Node 22 and pnpm 10.34.8. The build
 fetches the Bun version in `.bun-version` through `./bunw`
 (see [CONTRIBUTING.md](CONTRIBUTING.md)):
 

@@ -258,7 +258,7 @@ Order, hardening, and firewall rules:
 ### Credentials
 
 ```text
-host source (env, 1Password, command, stdin, JWT, OAuth seed)
+host source (env, 1Password, command, stdin, JWT, Google service account, OAuth seed)
    | runfree credential sync  (host resolves)
    v
 proxy-only tmpfs  --->  proxy strips agent auth headers
@@ -297,6 +297,20 @@ agent sees: placeholder or runfree_oauth_* handle only
    never removes the token. A deferred sync under a launch's lock follows
    [Lifecycle](#lifecycle) rule 10.
 5. The proxy CA private key is mounted only into the proxy.
+6. **A Google service-account key stays on the host.** The CLI reads the key
+   JSON from 1Password only to sign, and never stores the key JSON, the
+   private key, or its key id in the source registry, receipts, the token
+   status file, or logs. The signed JWT lives at most 1 hour and goes only to
+   proxy tmpfs. The source pins the service account's email, so a changed
+   1Password item cannot switch it to another account; the scope comes from a
+   fixed allowlist set on the host, never by the agent. Every failure after
+   the read is definitive and prints a fixed message that names the field,
+   never the key. A watcher keeps the parsed key in memory for at most 4
+   hours, so a key removed from 1Password stops being used within 4 hours
+   plus one JWT lifetime; deleting the key in Google Cloud IAM stops it at
+   once. A credential's scope is not what keeps a host read-only: a host
+   rule's methods and path prefixes are, and the proxy enforces them whatever
+   the scope ([Network](#network) rules 1 and 7).
 
 ### Git Over HTTPS
 

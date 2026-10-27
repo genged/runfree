@@ -375,6 +375,28 @@ runfree host rules <host> --clear
 
 `--read-only` is shorthand for `GET`, `HEAD`, and `OPTIONS`. `host rules --write` sets the action for write-class requests to that host.
 
+Some APIs send reads as `POST`, such as a query endpoint. To keep such an API
+read-only without an approval prompt per request, allow only `GET` and `POST`
+under the API paths, and let those requests through:
+
+```bash
+runfree host rules api.example.com --method GET --method POST \
+  --request-path-prefix /v1 --write allow
+```
+
+Use this only when every `POST` under the prefixes is a read. The proxy
+refuses every other method on the host, and on a method-ruled host it strips
+the `X-HTTP-Method-Override`, `X-HTTP-Method`, and `X-Method-Override`
+headers. A prefix matches the path itself or a path below it, so `/v1batch` is
+outside `/v1`. Keep an endpoint whose body carries other requests, such as a
+`/batch` endpoint, outside the prefixes: its inner requests use the outer
+credential. The proxy does not strip a method override in the query string or
+the body, so also bind a read-only credential where the provider offers one.
+On a host with path prefixes the proxy refuses an encoded `/` (`%2F`) in the
+path, so an endpoint that puts an encoded identifier containing `/` in the
+path is refused under such a rule. `runfree service explain <id>` lists a
+service's own setup steps.
+
 `host add` and `host rules` with request-rule flags change only the fields
 those flags set. The other fields of the host's rule stay. A field you give
 again replaces that field: a new `--method` list replaces the old list.
@@ -575,12 +597,45 @@ runfree credential source add jwt appstore \
   --private-key-from-1password op://vault/appstore/key \
   --claim iss=ISSUER_ID \
   --ttl 19m
+runfree credential source add google-service-account gsc \
+  --key-json-from-1password op://vault/gsc-sa/credential.json \
+  --scope https://www.googleapis.com/auth/webmasters.readonly
 runfree credential source list
 runfree credential source show github-cli
 runfree credential source remove github-cli
 ```
 
 Everything after `--` in `credential source add <name> -- <command>` is source command argv, not Runfree options.
+
+A `google-service-account` source signs a Google self-signed RS256 JWT on the
+host for the `google-search-console` service, whose setup
+`runfree service explain google-search-console` lists. The key JSON stays in
+1Password: a one-shot sync reads it for its signature, and
+`credential sync --watch` keeps the parsed key in memory for at most 4 hours
+and signs each refresh with it (see below). The CLI never stores the key
+JSON, the private key, or the key id on disk; the proxy gets only the signed
+JWT.
+
+- `--scope` is required and repeatable. Only
+  `https://www.googleapis.com/auth/webmasters.readonly` and
+  `https://www.googleapis.com/auth/webmasters` are accepted.
+- `--ttl` is the JWT lifetime, from `5m` to `60m`; the default is `55m`. A
+  binding without `--refresh-every` refreshes one minute before the JWT
+  expires (every `54m` at the default), and an explicit `--refresh-every`
+  must be shorter than the TTL.
+- `add` reads the key JSON once to check it and to sign a test JWT. It refuses
+  a key that is not a service-account key, not RSA, shorter than 2048 bits, or
+  encrypted, and refuses a `universe_domain` other than `googleapis.com`. The
+  refusal names the field and never prints the key.
+- The source pins the key's `client_email`. A key JSON for another service
+  account fails every later sync until you rerun the same `add` command with
+  `--replace-source`, which pins the new account.
+- `credential sync --watch` keeps the parsed key in memory for at most 4
+  hours, then reads 1Password again. It stops using a key removed from
+  1Password within 4 hours plus one TTL (5 hours at the defaults). To stop a
+  key at once, delete it in Google Cloud IAM.
+- The service account needs no Google Cloud IAM roles. Its access comes from
+  the account being a user in the Google product the service calls.
 
 ### Credential policy and destinations
 
@@ -851,7 +906,7 @@ runfree mcp configure --agent claude --agent codex
 runfree mcp explain claude my-server
 runfree mcp explain claude my-server --source project --json
 runfree mcp enable claude my-server
-runfree mcp enable claude my-server --no-discover --oauth-host auth.example.com --no-login
+runfree mcp enable claude my-server --no-discover --oauth-host auth.example.com
 runfree mcp enable claude my-server --from-source op-token
 runfree mcp auth claude my-server
 runfree mcp rules claude my-server
@@ -933,9 +988,10 @@ review lists every change:
   <url> will stop working in the sandbox`: the proxy mediates every login at
   that exact URL for this server.
 
-After you accept, Runfree saves the changes, applies them to a running proxy,
-and then runs the OAuth login (`runfree mcp auth`) for OAuth servers. Pass
-`--no-login` to skip the login.
+After you accept, Runfree saves the changes and applies them to a running
+proxy. For OAuth servers it then prints the login command
+(`runfree mcp auth`). Pass `--login` to run that login at once; it needs a
+terminal.
 
 To find the OAuth hosts, Runfree reads the server's OAuth metadata from this
 computer with plain HTTPS GETs that carry no credentials, and asks first
@@ -948,7 +1004,7 @@ set to `deny` stays denied. The rules are in [security.md](security.md#mcp).
 | `--source user\|local\|project` | Choose the entry when more than one matches. User and local entries need no approval; `enable` records only their OAuth hosts. |
 | `--oauth-host <host>` | Also allow this exact host for the server (repeatable). It is allowed as given, like `runfree host add`, and it must pass the [host rule](#oauth-hosts-on-another-host). The proxy mediates a token or registration endpoint there that the server's OAuth metadata names. While only MCP records allow the host, the proxy refuses any other OAuth token or registration request to it, and any request with a body it cannot check (see below). |
 | `--no-discover` | Make no network call. Use only `--oauth-host` hosts. |
-| `--no-login` | Do not run the OAuth login after enabling. |
+| `--login` | Run the OAuth login (`runfree mcp auth`) after enabling. It starts an agent session and needs a terminal. Without it, `enable` prints the login command. |
 | `--from-env`, `--from-1password`, `--from-source`, `--from-stdin` | Bind a project entry's static header to a host-owned credential source. Choose one. |
 | `--replace-source` | Replace an existing credential source for this server. |
 

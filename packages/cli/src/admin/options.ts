@@ -28,6 +28,7 @@ export {
   type ServiceRecord,
   type ServiceRecords,
   type SourceAddCommandInput,
+  type SourceAddGoogleServiceAccountInput,
   type SourceAddJwtInput,
   type SourceNameInput,
   type TokenSourceSelection,
@@ -53,6 +54,7 @@ export {
 } from "./credential-policy.ts";
 export {
   sourceAddCommandIntent,
+  sourceAddGoogleServiceAccountIntent,
   sourceAddJwtIntent,
   sourceList,
   sourceRemoveIntent,

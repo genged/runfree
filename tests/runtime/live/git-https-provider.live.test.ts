@@ -51,7 +51,6 @@
 //
 // Example:
 //
-//   TEST_RUNTIME_BACKEND=docker-desktop \
 //   TEST_RUNTIME_GIT_PROVIDERS=github,gitlab \
 //   TEST_RUNTIME_GITHUB_REPO=https://github.com/<owner>/<repo>.git \
 //   TEST_RUNTIME_GITHUB_SOURCE=<source> \

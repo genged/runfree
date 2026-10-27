@@ -1917,7 +1917,7 @@ const handleBeforeRequest = async (admission: AdmissionRecord, req: ProxyRequest
   }
 };
 
-// mockttp 4.4.2 buffers the *entire* upstream response whenever a pass-through
+// mockttp 4.6.5 buffers the *entire* upstream response whenever a pass-through
 // rule carries a beforeResponse callback (request-step-impls.ts:
 // `originalBody = await streamToBuffer(serverRes)`), which defeats SSE and other
 // streaming responses. Attaching beforeResponse to forAnyRequest() therefore
@@ -1946,7 +1946,7 @@ await server.forAnyRequest()
     beforeRequest: (admission: AdmissionRecord, req: ProxyRequest) => handleBeforeRequest(admission, req, false),
   });
 
-// KNOWN LIMITATION (mockttp 4.4.2): the WebSocket passthrough step mirrors the
+// KNOWN LIMITATION (mockttp 4.6.5): the WebSocket passthrough step mirrors the
 // client's raw upgrade headers exactly (`setDefaultHeaders: false`) and exposes
 // no per-request callback (no `beforeRequest`) and no header transform — its
 // only `transformRequest` covers host/path/query match-replace. So the union

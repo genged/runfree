@@ -64,6 +64,19 @@ import {
 } from "../host-path.ts";
 import { flushWarnings, runfreeError, runfreeLog, warn } from "../warnings.ts";
 import {
+  assertGoogleServiceAccountTtl,
+  GOOGLE_SA_CLIENT_EMAIL_RE,
+  GOOGLE_SA_KEY_CACHE_MAX_AGE_MS,
+  GOOGLE_SA_TTL_MAX_SECONDS,
+  GOOGLE_SA_TTL_MIN_SECONDS,
+  type GoogleServiceAccountKey,
+  type GoogleServiceAccountSource,
+  googleServiceAccountFailure,
+  normalizeGoogleServiceAccountScopes,
+  parseGoogleServiceAccountKeyJson,
+  signGoogleServiceAccountJwt,
+} from "./google-service-account.ts";
+import {
   mcpApprovalPath,
   mcpInventory,
   mcpOAuthCallbackPort,
@@ -198,7 +211,9 @@ export type JwtSource = {
   createdAt: string;
 };
 
-export type NamedSource = CommandSource | JwtSource;
+export type { GoogleServiceAccountSource };
+
+export type NamedSource = CommandSource | JwtSource | GoogleServiceAccountSource;
 
 export type SourceRegistry = Record<string, NamedSource>;
 
@@ -226,10 +241,12 @@ export type ProxyRuntime = {
   state: ProxyRuntimeState;
   validationMessage?: string;
 };
-export type JwtPrivateKeyCacheEntry = {
-  fingerprint: string;
-  key: crypto.KeyObject;
-};
+// One map for every signed source type, so each existing clear point clears
+// them all (spec 2026-10-24 google-service-account-source §4.4, review M2).
+// The entry never holds a signed token.
+export type JwtPrivateKeyCacheEntry =
+  | { kind: "jwt"; fingerprint: string; key: crypto.KeyObject }
+  | { kind: "google-service-account"; fingerprint: string; key: crypto.KeyObject; keyId: string; readAt: number };
 
 type SourceSecretCache = {
   jwtPrivateKeys: Map<string, JwtPrivateKeyCacheEntry>;
@@ -765,6 +782,51 @@ function validateJwtSource(name: string, value: Record<string, unknown>): JwtSou
   };
 }
 
+const GOOGLE_SA_REGISTRY_FIELDS = new Set(["type", "keyJson", "clientEmail", "scopes", "ttlSeconds", "createdAt"]);
+
+// The §4.2 add-time rules again (§4.1): a hand-edited entry is held to them,
+// and a mix of source shapes fails closed. No message shows a field value.
+function validateGoogleServiceAccountSource(name: string, value: Record<string, unknown>): GoogleServiceAccountSource {
+  for (const key of Object.keys(value)) {
+    if (!GOOGLE_SA_REGISTRY_FIELDS.has(key)) die(`${name}: google-service-account has unknown field ${JSON.stringify(key)}`);
+  }
+  if (!isRecord(value.keyJson) || value.keyJson.source !== "1password" || typeof value.keyJson.ref !== "string" || !value.keyJson.ref.startsWith("op://")
+    || Object.keys(value.keyJson).some((key) => key !== "source" && key !== "ref")) {
+    die(`${name}: google-service-account keyJson must be a 1Password reference`);
+  }
+  if (typeof value.clientEmail !== "string" || !GOOGLE_SA_CLIENT_EMAIL_RE.test(value.clientEmail)) {
+    die(`${name}: google-service-account clientEmail must be a service account email`);
+  }
+  const scopes = value.scopes;
+  let normalizedScopes: string[] | undefined;
+  if (Array.isArray(scopes) && scopes.every((scope) => typeof scope === "string")) {
+    try {
+      normalizedScopes = normalizeGoogleServiceAccountScopes(scopes);
+    } catch {
+      normalizedScopes = undefined;
+    }
+  }
+  if (!normalizedScopes || !isDeepStrictEqual(normalizedScopes, scopes)) {
+    die(`${name}: google-service-account scopes must be a sorted, unique, non-empty list of allowed scopes`);
+  }
+  if (typeof value.ttlSeconds !== "number") die(`${name}: google-service-account ttlSeconds must be a number`);
+  const ttlSeconds = value.ttlSeconds;
+  try {
+    assertGoogleServiceAccountTtl(ttlSeconds);
+  } catch {
+    die(`${name}: google-service-account ttlSeconds must be a whole number from ${GOOGLE_SA_TTL_MIN_SECONDS} to ${GOOGLE_SA_TTL_MAX_SECONDS}`);
+  }
+  if (typeof value.createdAt !== "string" || value.createdAt.trim() === "") die(`${name}: createdAt must be a string`);
+  return {
+    type: "google-service-account",
+    keyJson: { source: "1password", ref: value.keyJson.ref },
+    clientEmail: value.clientEmail,
+    scopes: normalizedScopes,
+    ttlSeconds,
+    createdAt: value.createdAt,
+  };
+}
+
 function validateSourceRegistry(raw: unknown, registryPath = sourceConfigPath()): SourceRegistry {
   if (!isRecord(raw)) die(`${displayProjectPath(registryPath)} must be a JSON object`);
   const registry: SourceRegistry = {};
@@ -775,7 +837,11 @@ function validateSourceRegistry(raw: unknown, registryPath = sourceConfigPath())
       registry[name] = validateJwtSource(name, value);
       continue;
     }
-    if (value.type !== "command") die(`${name}: source must be a command or jwt object`);
+    if (value.type === "google-service-account") {
+      registry[name] = validateGoogleServiceAccountSource(name, value);
+      continue;
+    }
+    if (value.type !== "command") die(`${name}: source must be a command, jwt, or google-service-account object`);
     if (!Array.isArray(value.argv) || value.argv.length === 0 || !value.argv.every((item) => typeof item === "string")) {
       die(`${name}: argv must be a non-empty string array`);
     }
@@ -1161,12 +1227,19 @@ export function runCommandSource(source: CommandSource): string {
   return commandSourceStep(invocation, exit);
 }
 
-function jwtPrivateKeyRead(ref: SecretRef, options: { quiet?: boolean; verbose?: boolean } = {}): OnePasswordRead {
-  if (ref.source !== "1password") throw new Error("unsupported secret reference");
-  if (!ref.ref.startsWith("op://")) throw new Error("1Password references must start with op://");
+/** A refusal before `op` runs. Its message is fixed text, never a value read. */
+class SecretRefReadPrecheckError extends Error {}
+
+function jwtPrivateKeyRead(
+  ref: SecretRef,
+  options: { quiet?: boolean; verbose?: boolean } = {},
+  label = "JWT private key",
+): OnePasswordRead {
+  if (ref.source !== "1password") throw new SecretRefReadPrecheckError("unsupported secret reference");
+  if (!ref.ref.startsWith("op://")) throw new SecretRefReadPrecheckError("1Password references must start with op://");
   const opPath = resolveHostExecutable("op");
-  if (!opPath) throw new Error("op CLI not found on sanitized host PATH");
-  adminVerbose(options, "reading JWT private key from 1Password");
+  if (!opPath) throw new SecretRefReadPrecheckError("op CLI not found on sanitized host PATH");
+  adminVerbose(options, `reading ${label} from 1Password`);
   return onePasswordRead(opPath, ref.ref, options);
 }
 
@@ -1188,12 +1261,23 @@ function jwtSourceFingerprint(source: JwtSource): string {
   })).digest("hex");
 }
 
+function googleServiceAccountSourceFingerprint(source: GoogleServiceAccountSource): string {
+  return crypto.createHash("sha256").update(policyJson({
+    type: source.type,
+    keyJson: source.keyJson,
+    clientEmail: source.clientEmail,
+    scopes: source.scopes,
+    ttlSeconds: source.ttlSeconds,
+  })).digest("hex");
+}
+
 /** A cached signing key for this exact JWT source, if the watcher holds one. */
 function cachedJwtSigningKey(source: JwtSource, options: TokenResolutionOptions & { sourceName?: string }): crypto.KeyObject | undefined {
   const cache = options.sourceSecretCache;
   if (!cache || !options.sourceName) return undefined;
   const cached = cache.jwtPrivateKeys.get(options.sourceName);
-  if (cached?.fingerprint !== jwtSourceFingerprint(source)) return undefined;
+  // The kind check keeps a service-account key from ever signing a JWT source.
+  if (cached?.kind !== "jwt" || cached.fingerprint !== jwtSourceFingerprint(source)) return undefined;
   adminVerbose(options, `using cached JWT private key for source ${options.sourceName}`);
   return cached.key;
 }
@@ -1203,8 +1287,119 @@ export function jwtSigningKeyFromPem(source: JwtSource, privateKeyPem: string, o
   const cache = options.sourceSecretCache;
   if (!cache || !options.sourceName) return privateKeyPem;
   const key = crypto.createPrivateKey(privateKeyPem);
-  cache.jwtPrivateKeys.set(options.sourceName, { fingerprint: jwtSourceFingerprint(source), key });
+  cache.jwtPrivateKeys.set(options.sourceName, { kind: "jwt", fingerprint: jwtSourceFingerprint(source), key });
   return key;
+}
+
+/**
+ * §4.4: a cached service-account key for this exact source config, read from
+ * 1Password no more than 4 h ago. Past that age the entry is a miss, so the
+ * watcher sees a rotated or removed key within 4 h plus one ttl.
+ */
+function cachedGoogleServiceAccountKey(
+  source: GoogleServiceAccountSource,
+  options: TokenResolutionOptions & { sourceName?: string },
+): Pick<GoogleServiceAccountKey, "key" | "keyId"> | undefined {
+  const cache = options.sourceSecretCache;
+  if (!cache || !options.sourceName) return undefined;
+  const cached = cache.jwtPrivateKeys.get(options.sourceName);
+  if (cached?.kind !== "google-service-account" || cached.fingerprint !== googleServiceAccountSourceFingerprint(source)) return undefined;
+  if (tokenSyncWatchNowMs() - cached.readAt > GOOGLE_SA_KEY_CACHE_MAX_AGE_MS) return undefined;
+  adminVerbose(options, `using cached service account key for source ${options.sourceName}`);
+  return { key: cached.key, keyId: cached.keyId };
+}
+
+/**
+ * §4.3 steps 2-3 against the pinned client_email, then the §4.4 cache update:
+ * the same `private_key_id` keeps the cached key and resets its age; a new
+ * one replaces it. Throws GoogleServiceAccountKeyError; callers run it inside
+ * the catch-all.
+ */
+export function googleServiceAccountKeyFromJson(
+  source: GoogleServiceAccountSource,
+  keyJsonText: string,
+  options: TokenResolutionOptions & { sourceName?: string },
+): GoogleServiceAccountKey {
+  const parsed = parseGoogleServiceAccountKeyJson(keyJsonText, source.clientEmail);
+  const cache = options.sourceSecretCache;
+  if (!cache || !options.sourceName) return parsed;
+  const fingerprint = googleServiceAccountSourceFingerprint(source);
+  const readAt = tokenSyncWatchNowMs();
+  const cached = cache.jwtPrivateKeys.get(options.sourceName);
+  if (cached?.kind === "google-service-account" && cached.fingerprint === fingerprint && cached.keyId === parsed.keyId) {
+    cache.jwtPrivateKeys.set(options.sourceName, { ...cached, readAt });
+    return { ...parsed, key: cached.key };
+  }
+  cache.jwtPrivateKeys.set(options.sourceName, { kind: "google-service-account", fingerprint, key: parsed.key, keyId: parsed.keyId, readAt });
+  return parsed;
+}
+
+/**
+ * The 1Password read stage of a service-account signature (review L6): a
+ * classified `op` failure keeps its own safe message, a precheck refusal its
+ * fixed text, and anything else a fixed read message. No key JSON exists yet
+ * at this stage, and no other error's text is read.
+ */
+function keyJsonReadFailure(error: unknown): TokenResolutionError {
+  if (error instanceof TokenResolutionError) return error;
+  const precheck = error instanceof SecretRefReadPrecheckError;
+  return new TokenResolutionError({
+    classification: "definitive",
+    sourceKind: "1password",
+    code: precheck ? "op-read-precheck" : "op-read-unexpected",
+    safeMessage: precheck ? error.message : "1Password read of the service account key JSON failed",
+  });
+}
+
+export type GoogleServiceAccountPlan = Extract<CredentialReadPlan, { kind: "google-service-account" }>;
+
+/**
+ * The §4.3 catch-all (review M4), shared by the synchronous and the watcher
+ * executors: from the key JSON parse to the signature every failure is a
+ * definitive TokenResolutionError with a fixed message. The 1Password read
+ * ran before this call and keeps its own classification. `keyJsonText` is
+ * undefined when the plan holds a cached key.
+ */
+export function googleServiceAccountStep(plan: GoogleServiceAccountPlan, keyJsonText: string | undefined): string {
+  try {
+    const key = keyJsonText === undefined
+      ? cachedPlanKey(plan)
+      : googleServiceAccountKeyFromJson(plan.source, keyJsonText, plan.options);
+    return signGoogleServiceAccountJwt(plan.source, key, Math.floor(tokenSyncWatchNowMs() / 1000));
+  } catch (error) {
+    throw googleServiceAccountFailure(error, plan.options.sourceName);
+  }
+}
+
+function cachedPlanKey(plan: GoogleServiceAccountPlan): Pick<GoogleServiceAccountKey, "key" | "keyId"> {
+  if (plan.signingKey.kind !== "cached") throw new Error("service account plan has no cached key");
+  return { key: plan.signingKey.key, keyId: plan.signingKey.keyId };
+}
+
+/**
+ * Reads the key JSON from 1Password synchronously and signs one JWT. `pin` is
+ * the pinned client_email, or undefined at first add (§4.2), when the key
+ * JSON's own client_email is returned to be pinned. Never touches the cache.
+ * A 1Password read failure keeps its own classification; everything after it
+ * goes through the catch-all.
+ */
+export function signGoogleServiceAccountSource(
+  source: Pick<GoogleServiceAccountSource, "keyJson" | "scopes" | "ttlSeconds">,
+  options: TokenResolutionOptions & { sourceName?: string; pin: string | undefined },
+): { jwt: string; clientEmail: string } {
+  let keyJsonText: string;
+  try {
+    keyJsonText = runOnePasswordReadSync(jwtPrivateKeyRead(source.keyJson, options, "service account key JSON"));
+  } catch (error) {
+    throw keyJsonReadFailure(error);
+  }
+  try {
+    const key = parseGoogleServiceAccountKeyJson(keyJsonText, options.pin);
+    const jwt = signGoogleServiceAccountJwt({ ...source, clientEmail: key.clientEmail }, key, Math.floor(tokenSyncWatchNowMs() / 1000));
+    return { jwt, clientEmail: key.clientEmail };
+  } catch (error) {
+    throw googleServiceAccountFailure(error, options.sourceName);
+  }
 }
 
 function jwtSigningKey(source: JwtSource, options: TokenResolutionOptions & { sourceName?: string } = {}): string | crypto.KeyObject {
@@ -1254,6 +1449,12 @@ export type CredentialReadPlan =
     source: JwtSource;
     options: TokenResolutionOptions & { sourceName?: string };
     signingKey: Readonly<{ kind: "cached"; key: crypto.KeyObject }> | Readonly<{ kind: "read"; read: OnePasswordRead }>;
+  }>
+  | Readonly<{
+    kind: "google-service-account";
+    source: GoogleServiceAccountSource;
+    options: TokenResolutionOptions & { sourceName?: string };
+    signingKey: Readonly<{ kind: "cached"; key: crypto.KeyObject; keyId: string }> | Readonly<{ kind: "read"; read: OnePasswordRead }>;
   }>;
 
 function planStep(build: () => CredentialReadPlan): CredentialReadPlan {
@@ -1265,30 +1466,65 @@ function planStep(build: () => CredentialReadPlan): CredentialReadPlan {
 }
 
 function namedSourceReadPlan(source: NamedSource, options: TokenResolutionOptions & { sourceName?: string }): CredentialReadPlan {
-  if (source.type === "command") return planStep(() => ({ kind: "command", invocation: commandSourceInvocation(source) }));
-  const cachedKey = cachedJwtSigningKey(source, options);
-  if (cachedKey) return { kind: "jwt", source, options, signingKey: { kind: "cached", key: cachedKey } };
-  return planStep(() => ({ kind: "jwt", source, options, signingKey: { kind: "read", read: jwtPrivateKeyRead(source.privateKey, options) } }));
+  switch (source.type) {
+    case "command":
+      return planStep(() => ({ kind: "command", invocation: commandSourceInvocation(source) }));
+    case "jwt": {
+      const cachedKey = cachedJwtSigningKey(source, options);
+      if (cachedKey) return { kind: "jwt", source, options, signingKey: { kind: "cached", key: cachedKey } };
+      return planStep(() => ({ kind: "jwt", source, options, signingKey: { kind: "read", read: jwtPrivateKeyRead(source.privateKey, options) } }));
+    }
+    case "google-service-account": {
+      const cached = cachedGoogleServiceAccountKey(source, options);
+      if (cached) return { kind: "google-service-account", source, options, signingKey: { kind: "cached", key: cached.key, keyId: cached.keyId } };
+      return planStep(() => ({
+        kind: "google-service-account",
+        source,
+        options,
+        signingKey: { kind: "read", read: jwtPrivateKeyRead(source.keyJson, options, "service account key JSON") },
+      }));
+    }
+    default: {
+      const unknownSource: never = source;
+      throw new Error(`unsupported named source type: ${String((unknownSource as { type?: unknown }).type)}`);
+    }
+  }
 }
 
 function semanticNamedSource(sourceName: string, registry: SourceRegistry | undefined): unknown {
   const source = registry?.[sourceName];
   if (!source) throw new Error(`unknown source: ${sourceName}`);
-  if (source.type === "command") {
-    return {
-      type: "command",
-      argv: source.argv,
-      displayArgv: source.displayArgv,
-    };
+  switch (source.type) {
+    case "command":
+      return {
+        type: "command",
+        argv: source.argv,
+        displayArgv: source.displayArgv,
+      };
+    case "jwt":
+      return {
+        type: "jwt",
+        alg: source.alg,
+        privateKey: source.privateKey,
+        headers: source.headers,
+        claims: source.claims,
+        ttlSeconds: source.ttlSeconds,
+      };
+    case "google-service-account":
+      // A change to only the scopes or only the reference changes the
+      // token's fingerprint, so its receipt no longer proves the held value.
+      return {
+        type: "google-service-account",
+        keyJson: source.keyJson,
+        clientEmail: source.clientEmail,
+        scopes: source.scopes,
+        ttlSeconds: source.ttlSeconds,
+      };
+    default: {
+      const unknownSource: never = source;
+      throw new Error(`unsupported named source type: ${String((unknownSource as { type?: unknown }).type)}`);
+    }
   }
-  return {
-    type: "jwt",
-    alg: source.alg,
-    privateKey: source.privateKey,
-    headers: source.headers,
-    claims: source.claims,
-    ttlSeconds: source.ttlSeconds,
-  };
 }
 
 export function tokenSourceFingerprint(source: TokenSource, registry: SourceRegistry | undefined): string {
@@ -1564,6 +1800,10 @@ function runCredentialReadPlanSync(plan: CredentialReadPlan): string {
         : jwtSigningKeyFromPem(plan.source, runOnePasswordReadSync(plan.signingKey.read), plan.options);
       return signJwtWithKey(plan.source, key);
     }
+    case "google-service-account": {
+      const keyJsonText = plan.signingKey.kind === "read" ? runOnePasswordReadSync(plan.signingKey.read) : undefined;
+      return googleServiceAccountStep(plan, keyJsonText);
+    }
   }
 }
 
@@ -1715,33 +1955,48 @@ export function tokenSourceFromSelection(selection: TokenSourceSelection, requir
   }
 }
 
-function namedJwtSource(source: TokenSource | undefined, registry?: SourceRegistry): { name: string; source: JwtSource } | undefined {
+/**
+ * The named source that signs a token with an expiry, if any: it sets the
+ * derived refresh and the `--refresh-every` bound. Each source type answers
+ * here explicitly, so a new type cannot fall to `manual` unnoticed.
+ */
+function namedSignedSource(source: TokenSource | undefined, registry?: SourceRegistry): { name: string; ttlSeconds: number } | undefined {
   if (!source || source.source !== "named") return undefined;
   const sourceRegistry = registry ?? loadSourceRegistry();
   const namedSource = sourceRegistry[source.name];
-  if (namedSource?.type !== "jwt") return undefined;
-  return { name: source.name, source: namedSource };
+  if (!namedSource) return undefined;
+  switch (namedSource.type) {
+    case "command":
+      return undefined;
+    case "jwt":
+    case "google-service-account":
+      return { name: source.name, ttlSeconds: namedSource.ttlSeconds };
+    default: {
+      const unknownSource: never = namedSource;
+      throw new Error(`unsupported named source type: ${String((unknownSource as { type?: unknown }).type)}`);
+    }
+  }
 }
 
 export function effectiveTokenRefresh(source: TokenSource | undefined, registry?: SourceRegistry): EffectiveTokenRefresh {
   if (!source) return { mode: "manual" };
-  const jwt = namedJwtSource(source, registry);
+  const signed = namedSignedSource(source, registry);
   if (source.refreshEverySeconds !== undefined) {
     return {
       mode: "explicit",
       seconds: source.refreshEverySeconds,
-      sourceName: jwt?.name,
-      ttlSeconds: jwt?.source.ttlSeconds,
+      sourceName: signed?.name,
+      ttlSeconds: signed?.ttlSeconds,
     };
   }
-  if (!jwt) return { mode: "manual" };
-  const seconds = jwt.source.ttlSeconds - 60;
+  if (!signed) return { mode: "manual" };
+  const seconds = signed.ttlSeconds - 60;
   if (seconds <= 0) return { mode: "manual" };
   return {
     mode: "derived",
     seconds,
-    sourceName: jwt.name,
-    ttlSeconds: jwt.source.ttlSeconds,
+    sourceName: signed.name,
+    ttlSeconds: signed.ttlSeconds,
   };
 }
 
@@ -3895,6 +4150,15 @@ export type SourceAddJwtInput = {
   ttl: string | string[] | undefined;
   claims: string[];
   headers: string[];
+};
+// `credential source add google-service-account <name> ...`. The client_email
+// is not an input: it is read from the key JSON at add time and pinned.
+export type SourceAddGoogleServiceAccountInput = {
+  name: string | undefined;
+  replaceSource: boolean;
+  keyJsonRef: string | string[] | undefined;
+  scopes: string[];
+  ttl: string | string[] | undefined;
 };
 
 type OAuthSeedHandleStore = {

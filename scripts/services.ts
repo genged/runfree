@@ -1040,6 +1040,45 @@ export const SERVICES: Record<string, Service> = {
       },
     ],
   },
+  "google-search-console": {
+    id: "google-search-console",
+    label: "Google Search Console API",
+    revision: 1,
+    hosts: [
+      { host: "searchconsole.googleapis.com" },
+    ],
+    detect: [],
+    explanations: [
+      "Google Search Console API: a Google service-account JWT presented directly as Authorization: Bearer (no OAuth token exchange)",
+      "The host signs the JWT from a `runfree credential source add google-service-account` source (or a host command that prints an access token); the proxy injects it, and the agent never holds the key or the token",
+      "Add the service account's client_email as a user on each Search Console property; Runfree cannot do this step",
+      "Key JSON in 1Password: runfree credential source add google-service-account gsc --key-json-from-1password op://vault/gsc-sa/credential.json --scope https://www.googleapis.com/auth/webmasters.readonly",
+      "Bind the source with: runfree service enable google-search-console --from-source gsc",
+      "A google-service-account binding refreshes the JWT on its own (every 54m at the default TTL)",
+      "Without a key JSON, a gcloud command source impersonates the service account: runfree credential source add gsc -- gcloud auth print-access-token --impersonate-service-account=<sa-email> --scopes=https://www.googleapis.com/auth/webmasters.readonly",
+      "The gcloud source needs gcloud on the host and roles/iam.serviceAccountTokenCreator on the service account; keep --scopes, or gcloud may mint a broad cloud-platform token",
+      "After enable, add the refresh to a gcloud binding: runfree credential set-source google-search-console --from-source gsc --refresh-every 50m --replace-source",
+      "Search Analytics queries are POST requests and ask for approval; only URL inspection is a read",
+      "Read-only without a prompt per query: runfree host rules searchconsole.googleapis.com --method GET --method POST --request-path-prefix /webmasters/v3 --request-path-prefix /v1 --write allow",
+      "On this API every POST under /webmasters/v3 and /v1 is a read; under that rule the proxy refuses PUT and DELETE (site and sitemap changes) and the /batch endpoint",
+      "That rule works only for Domain properties (sc-domain:example.com); a URL-prefix property puts an encoded / in the path, so keep the default rule for it",
+    ],
+    // Static credential, the appstore-connect shape: the value is a short-lived
+    // bearer token from a host-owned source; only a placeholder reaches the agent.
+    credential: {
+      tokenName: "google-search-console",
+      tokenDescription: "Google Search Console API bearer token (service-account JWT), injected as Authorization: Bearer",
+      agentEnv: ["GOOGLE_SEARCH_CONSOLE_TOKEN"],
+      credentials: [
+        { host: "searchconsole.googleapis.com", header: "Authorization", scheme: "bearer" },
+      ],
+    },
+    // Exact match or prefix + "/" (pathMatchesPrefix), so index:inspectX and an
+    // encoded %3A stay writes; path confusion voids the exemption.
+    readOnly: {
+      "searchconsole.googleapis.com": { readPathPrefixes: ["/v1/urlInspection/index:inspect"] },
+    },
+  },
 };
 
 export function service(id: string): Service | undefined {
