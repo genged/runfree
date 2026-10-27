@@ -48,6 +48,7 @@ import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 
 import { validateProxyNftablesTableJson } from "../../../packages/cli/src/proxy-nftables-proof.ts";
+import { AGENT_HOME, agentHomeMountParents } from "../../../packages/cli/src/runtime/agent-home-dirs.ts";
 import { NON_RESOLVING_CONNECT_PROBE_HOST } from "../../../packages/cli/src/runtime/probes.ts";
 import { parseSessionContainerTopHandoff } from "../../../packages/cli/src/runtime/session-container-docker.ts";
 import { SESSION_ENTRY_PATH } from "../../../packages/cli/src/runtime/session-launch.ts";
@@ -458,6 +459,30 @@ describe("runtime topology and capability floor on real Docker", () => {
     const setuid = containerExec(sessionId, ["/usr/local/bin/runfree-setuid-id", "-u"], "1000:1000");
     expect(setuid.status, `setuid probe failed: ${describeOutput(setuid.output)}`).toBe(0);
     expect(setuid.stdout.trim(), "a setuid helper still runs as uid 1000").toBe("1000");
+  }, TEST_TIMEOUT_MS);
+
+  test("every agent-home mount parent is an agent-owned directory and the mounts still land", () => {
+    const user = "1000:1000";
+    for (const dir of agentHomeMountParents()) {
+      const stat = containerExec(sessionId, ["stat", "-c", "%F %U:%G %a", dir], user);
+      expect(stat.status, `stat ${dir}: ${describeOutput(stat.output)}`).toBe(0);
+      expect(stat.stdout.trim(), dir).toBe("directory agent:agent 755");
+    }
+    for (const target of [`${AGENT_HOME}/.local/share/pnpm/store`, `${AGENT_HOME}/.pi/agent`]) {
+      const mounted = containerExec(sessionId, ["mountpoint", "-q", target], user);
+      expect(mounted.status, `${target} is not a mount point: ${describeOutput(mounted.output)}`).toBe(0);
+    }
+    const probes = [`${AGENT_HOME}/.local/share/pnpm/.tools/runfree-probe`, `${AGENT_HOME}/.pi/runfree-probe`];
+    // `.tools` itself is created by this probe (pnpm hasn't claimed it yet), so
+    // clean it up too; the trailing `|| true` tolerates pnpm having already
+    // populated `.tools` by the time this runs, since the directory is shared
+    // by the standing session.
+    const write = containerExec(
+      sessionId,
+      ["sh", "-c", 'mkdir -p "$1" && mkdir "$2" && rmdir "$1" "$2" && { rmdir "$(dirname "$1")" 2>/dev/null || true; }', "sh", ...probes],
+      user,
+    );
+    expect(write.status, `agent cannot create XDG data dirs: ${describeOutput(write.output)}`).toBe(0);
   }, TEST_TIMEOUT_MS);
 
   test("the session runs under Docker's init: Init is true and PID 1 is the daemon's init, not the entry", () => {

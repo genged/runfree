@@ -177,12 +177,21 @@ export function runtimeAssetMode(relativePath: string): number {
   return descriptor.executable === true ? RUNTIME_ASSET_EXECUTABLE_MODE : RUNTIME_ASSET_REGULAR_MODE;
 }
 
-function logicalDockerfileLines(dockerfile: string): string[] {
+export function logicalDockerfileLines(dockerfile: string): string[] {
   const logical: string[] = [];
   let pending = "";
   for (const rawLine of dockerfile.split(/\r?\n/)) {
     const line = rawLine.trim();
-    if (pending === "" && (line === "" || line.startsWith("#"))) continue;
+    // BuildKit drops a bare comment line before joining a continuation
+    // (comments do not support their own continuation), so this lexer skips
+    // a comment whether or not an instruction is open. A blank line is not
+    // the same: this lexer only skips it between instructions. Inside a
+    // continuation it falls through to the segment logic below and ends the
+    // logical line there, where BuildKit instead continues through it. No
+    // Dockerfile in this repo has a blank line inside a continuation, so
+    // that gap is left unfixed and untested here.
+    if (line.startsWith("#")) continue;
+    if (pending === "" && line === "") continue;
     const continued = line.endsWith("\\");
     const segment = continued ? line.slice(0, -1).trimEnd() : line;
     pending = pending === "" ? segment : `${pending} ${segment}`;
