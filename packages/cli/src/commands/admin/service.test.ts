@@ -7,7 +7,7 @@ import {
 
 import { SERVICES, type Service } from "../../../../../scripts/services.ts";
 import { desiredServiceEntry } from "../../admin/service-policy.ts";
-import { formatServiceListTable, planServiceRevisionChanges, serviceListRows, serviceRevisionRefusalLines } from "./service.ts";
+import { formatServiceExplanation, formatServiceListTable, planServiceRevisionChanges, serviceListRows, serviceRevisionRefusalLines } from "./service.ts";
 
 function entry(revision: number, hosts: string[]): DesiredServiceEntry {
   return {
@@ -165,5 +165,50 @@ describe("planServiceRevisionChanges", () => {
       gone("gone.npm.example", true),
       gone("gone2.npm.example", true),
     ]);
+  });
+});
+
+describe("formatServiceExplanation", () => {
+  test("strips terminal escapes from author-supplied text of a user-defined service", () => {
+    const svc = {
+      ...definition("user-acme", 1, ["api.acme.example"]),
+      label: "Acme\u001b[2J",
+      explanations: ["setup\u001b[31m step"],
+      credential: {
+        tokenName: "user-acme",
+        tokenDescription: "Acme\u0007 token",
+        agentEnv: ["ACME_TOKEN"],
+        credentials: [{ host: "api.acme.example", header: "Authorization", scheme: "bearer" }],
+      },
+    } as unknown as Service;
+    const text = formatServiceExplanation({ id: "user-acme", definition: svc, enabled: undefined, parameterValues: {} }).join("\n");
+    expect(text).not.toMatch(/[\u0000-\u0008\u000b-\u001f\u007f]/);
+    expect(text).toContain("origin: user-defined");
+    expect(text).toContain("  - setup step");
+    expect(text).toContain("  api.acme.example -> Authorization (bearer)");
+  });
+
+  test("an enabled entry behind the registry names the diff, and a vanished definition keeps the entry", () => {
+    const enabled = { entry: entry(2, ["registry.npmjs.org"]), layer: "local" as const };
+    const behind = formatServiceExplanation({ id: "node", definition: registry.node, enabled, parameterValues: {} });
+    expect(behind).toContain("state: enabled (local layer), approved revision 2");
+    expect(behind).toContain("current revision: 3; review with: runfree service diff");
+
+    const vanished = formatServiceExplanation({ id: "mystery", definition: undefined, enabled, parameterValues: {} });
+    expect(vanished).toContain("definition: unavailable; approved semantics retained");
+    expect(vanished).not.toContain("notes:");
+  });
+
+  test("parameter values are reported only for an enabled service", () => {
+    const svc = SERVICES["apple-ads"];
+    const available = formatServiceExplanation({ id: "apple-ads", definition: svc, enabled: undefined, parameterValues: {} });
+    expect(available.some((line) => line.startsWith("  --param client-id=<value> or APPLE_ADS_CLIENT_ID:") && !line.endsWith("; unset"))).toBe(true);
+    const enabled = formatServiceExplanation({
+      id: "apple-ads",
+      definition: svc,
+      enabled: { entry: entry(svc.revision, ["api.searchads.apple.com"]), layer: "project" },
+      parameterValues: { "client-id": "set" },
+    });
+    expect(enabled.some((line) => line.endsWith("; set"))).toBe(true);
   });
 });

@@ -42,12 +42,14 @@ import {
   type DesiredServiceEntry,
   withRequiredDesiredNetworkPolicyVersion,
 } from "@runfree/runtime-contracts/desired-network-policy";
+import { describeCredential } from "../../admin/credential-describe.ts";
 import { CliError } from "../../errors.ts";
 import { formatTerminalTable } from "../../terminal-table.ts";
 import { warn } from "../../warnings.ts";
 import { nodeRuntimeIO } from "../../runtime.ts";
 import type { RuntimeContext } from "../../runtime/types.ts";
 import { combinedServiceRegistry, loadUserServiceCatalog } from "../../user-services.ts";
+import { sanitizeForTerminal } from "../../../../../scripts/domain-diagnostics.ts";
 import { type Service, serviceOriginLabel } from "../../../../../scripts/services.ts";
 import type { RunfreeCommandContext } from "../context.ts";
 import { withExamples } from "../examples.ts";
@@ -178,20 +180,110 @@ export function formatServiceListTable(rows: readonly ServiceListRow[], input: {
   });
 }
 
-function explainDesiredService(runtime: RuntimeContext, idInput: string): void {
-  const id = idInput.toLowerCase();
-  const approved = approvedDesiredServices(runtime);
-  const entry = approved.selected[id];
-  if (!entry) throw new CliError(`service is not approved: ${id}`);
-  const parameters = entry.resolved.parameters ?? [];
+export type ServiceExplanationInput = {
+  id: string;
+  // The curated or user-defined definition; absent when only an approved
+  // entry names the id (its definition left the registry).
+  definition: Service | undefined;
+  // The approved entry and its layer when the service is enabled.
+  enabled: { entry: DesiredServiceEntry; layer: DesiredServiceLayer } | undefined;
+  // Set/unset per declared parameter key, from the host-owned agent env.
+  parameterValues: Record<string, "set" | "unset">;
+};
+
+/**
+ * Pure: the human-readable `service explain` text. Every author-supplied
+ * string goes through `sanitizeForTerminal`, because a user-defined
+ * definition's label, explanations, and descriptions are not trusted text.
+ */
+export function formatServiceExplanation(input: ServiceExplanationInput): string[] {
+  const { definition, enabled } = input;
+  const text = (value: string): string => sanitizeForTerminal(value);
+  const lines: string[] = [];
+  lines.push(`service ${input.id}${definition ? `: ${text(definition.label)}` : ""}`);
+  lines.push(`origin: ${serviceOriginLabel(input.id)}`);
+  if (enabled) {
+    lines.push(`state: enabled (${enabled.layer} layer), approved revision ${enabled.entry.revision}`);
+    if (!definition) lines.push("definition: unavailable; approved semantics retained");
+    else if (definition.revision !== enabled.entry.revision) {
+      lines.push(`current revision: ${definition.revision}; review with: runfree service diff`);
+    }
+  } else {
+    lines.push(`state: not enabled; current revision ${definition?.revision ?? "-"}`);
+  }
+  if (!definition) return lines;
+
+  const skipped = new Set(enabled?.entry.selection?.skippedHosts ?? []);
+  lines.push("hosts:");
+  for (const host of definition.hosts) {
+    const marks = [host.broad ? "broad" : "", skipped.has(host.host) ? "skipped" : ""].filter(Boolean);
+    lines.push(`  ${host.host}${marks.length > 0 ? ` (${marks.join(", ")})` : ""}`);
+  }
+  if (definition.credential) {
+    lines.push(`credential: ${text(definition.credential.tokenDescription)}`);
+    for (const credential of definition.credential.credentials) lines.push(`  ${describeCredential(credential)}`);
+    lines.push(`  agent env placeholders: ${definition.credential.agentEnv.join(", ")}`);
+    if (definition.credential.allowAnonymous) lines.push("  with no token stored, requests go out without one");
+  }
+  if (definition.oauthCredential) {
+    lines.push(`oauth: token endpoint ${definition.oauthCredential.tokenEndpoint}, resource host ${definition.oauthCredential.resourceHost}`);
+    for (const seed of definition.oauthCredential.seeds) {
+      lines.push(`  seed ${seed.envVar} (${seed.field}): ${text(seed.description)}`);
+    }
+  }
+  const parameters = definition.parameters ?? [];
+  if (parameters.length > 0) {
+    lines.push("parameters:");
+    for (const parameter of parameters) {
+      const value = enabled ? `; ${input.parameterValues[parameter.key] ?? "unset"}` : "";
+      const example = parameter.example ? ` (example: ${text(parameter.example)})` : "";
+      lines.push(`  --param ${parameter.key}=<value> or ${parameter.envVar}: ${text(parameter.description)}${example}${value}`);
+    }
+  }
+  lines.push("notes:");
+  for (const explanation of definition.explanations) lines.push(`  - ${text(explanation)}`);
+  return lines;
+}
+
+function explainDesiredService(runtime: RuntimeContext, input: { id: string; json: boolean }): void {
+  const id = input.id.toLowerCase();
+  const definition = combinedServiceRegistry(runtime.projectRoot, runtime.env)[id];
+  const project = readApprovedNetworkPolicy(runtime.projectRoot, runtime.project, "network-project");
+  const local = readApprovedNetworkPolicy(runtime.projectRoot, runtime.project, "network-local");
+  const entry = project && local ? compileDesiredPolicies({ project, local }).selectedServices[id] : undefined;
+  if (!definition && !entry) throw new CliError(`unknown service: ${id}; list every known service with: runfree service list --all`);
+  const layer: DesiredServiceLayer = local?.services?.[id] ? "local" : "project";
+  const enabled = entry ? { entry, layer } : undefined;
+  const parameters = entry?.resolved.parameters ?? definition?.parameters ?? [];
+  const parameterValues = entry && parameters.length > 0 ? serviceParameterStatus(parameters, readAgentEnv()) : {};
+  if (!input.json) {
+    for (const line of formatServiceExplanation({ id, definition, enabled, parameterValues })) console.log(line);
+    return;
+  }
   console.log(JSON.stringify({
     id,
-    layer: approved.local.services?.[id] ? "local" : "project",
-    definitionDigest: entry.definitionDigest,
-    revision: entry.revision,
-    selection: entry.selection ?? {},
-    resolved: entry.resolved,
-    ...(parameters.length > 0 ? { parameterValues: serviceParameterStatus(parameters, readAgentEnv()) } : {}),
+    origin: serviceOriginLabel(id),
+    state: enabled ? "enabled" : "available",
+    ...(definition
+      ? {
+          definition: {
+            label: definition.label,
+            revision: definition.revision,
+            explanations: definition.explanations,
+            ...(definition.parameters ? { parameters: definition.parameters } : {}),
+          },
+        }
+      : {}),
+    ...(enabled
+      ? {
+          layer,
+          definitionDigest: enabled.entry.definitionDigest,
+          revision: enabled.entry.revision,
+          selection: enabled.entry.selection ?? {},
+          resolved: enabled.entry.resolved,
+          ...(parameters.length > 0 ? { parameterValues } : {}),
+        }
+      : {}),
   }, null, 2));
 }
 
@@ -458,11 +550,12 @@ export const serviceCommand: CommandModule = {
           )
           .command(
             "explain <id>",
-            "Show a service's hosts, credential, origin, and enable state",
-            (cmd) => idPositional(cmd),
-            handler((argv: ArgumentsCamelCase<IdArgs>) => {
-              const intent = { id: argv.id };
-              return run(() => explainDesiredService(context.runtimeContext(), intent.id));
+            "Show a service's hosts, credential, parameters, setup notes, and enable state",
+            (cmd) => idPositional(cmd)
+              .option("json", { type: "boolean", describe: "Emit the definition and any approved entry as JSON" }),
+            handler((argv: ArgumentsCamelCase<IdArgs & { json?: boolean }>) => {
+              const intent = { id: argv.id, json: Boolean(argv.json) };
+              return run(() => explainDesiredService(context.runtimeContext(), intent));
             }),
           )
           .command(
