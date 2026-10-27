@@ -453,7 +453,7 @@ every view, read under the held lock, shows no session state; an unreadable
 view never counts as empty. A launch plans its lock hold to end before other
 commands stop waiting for the lock, and image builds and credential-source
 reads finish before the lock is taken. Ordinary heartbeats take no lock. The
-bounds are in [security.md](security.md#lifecycle).
+bounds are in [security-rules.md](security-rules.md#lifecycle).
 
 **Heartbeat.** While the foreground runs, the owner periodically adopts a
 completed compatible rebind if the durable selection changed, inspects the
@@ -514,7 +514,7 @@ sockets and in-flight OAuth exchanges can end and are not replayed.
 A record with a terminal host status stamp is an interrupted teardown, not a
 session; the usual cause is a Docker daemon that died under a live session.
 The next start finishes it when Docker can prove it safe, and otherwise
-refuses with the remedy (see [security.md](security.md#lifecycle)).
+refuses with the remedy (see [security-rules.md](security-rules.md#lifecycle)).
 
 #### Session File Contract
 
@@ -881,7 +881,7 @@ WebSocket upgrades (under `ask`/`deny`), a method-override header, git push,
 other than GET/HEAD/OPTIONS. Some POSTs are reads: `readPathPrefixes`, git
 fetches on hosts that declare git handling, and Git LFS download batches
 where the host's policy mediates Git LFS (see
-[security.md](security.md#git-over-https)). Path confusion cancels those
+[security-rules.md](security-rules.md#git-over-https)). Path confusion cancels those
 exemptions. MCP tool calls are classified by operation policy.
 
 **OAuth protocol reads.** On an `ask` host (never `deny`), an OAuth login,
@@ -892,7 +892,7 @@ other provider would mediate it, the body holds only the protocol's own
 fields, and the server's rate limit is not spent. Anything else on the host
 stays a write. Every write rule above runs first, and the mediator checks the
 match again before it swaps any handle, so a token response never reaches the
-agent unmediated. The exact rules are in [security.md](security.md#mcp).
+agent unmediated. The exact rules are in [security-rules.md](security-rules.md#mcp).
 
 **Holds.** Under `ask` the proxy holds the request for a bounded time while a
 host approver decides; with no approver attached, it refuses at once. The
@@ -1134,7 +1134,7 @@ API), or both. A request the proxy cannot classify for certain gets no
 credential. When several destinations of one host match, the proxy picks the
 most specific, and policy that could tie is refused. The rules are in
 [cli.md](cli.md#user-defined-services) and
-[security.md](security.md#git-over-https).
+[security-rules.md](security-rules.md#git-over-https).
 
 Sources are read on the host, never while the lifecycle lock is held.
 `runfree up`, a cold start, and a replaced proxy read every source first. A
@@ -1142,7 +1142,7 @@ warm session launch may reuse a value the proxy already holds when a host
 receipt shows it is current; right after the launch, a background watcher
 re-reads every source, so a value rotated or revoked at its source reaches the
 proxy seconds later. The reuse and failure rules are in
-[security.md](security.md#credentials).
+[security-rules.md](security-rules.md#credentials).
 
 ## Services
 
@@ -1223,7 +1223,7 @@ settings:
 provider's endpoint. Service OAuth providers are merged in when the effective
 policy generation is built. There, an MCP endpoint that overlaps a service's endpoint is dropped
 and blocked, and a protocol-read endpoint on a credential destination is
-dropped. The rules and their limits are in [security.md](security.md#mcp).
+dropped. The rules and their limits are in [security-rules.md](security-rules.md#mcp).
 
 ### Codex Desktop Built-ins
 

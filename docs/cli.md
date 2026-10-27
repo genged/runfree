@@ -845,7 +845,8 @@ definition that breaks a rule is refused before anything is written. These
 fields raise the desired policy version (see [Network Policy](#network-policy)).
 How the proxy chooses among a host's destinations,
 and the Git LFS read rule a `git-lfs` destination turns on, are in
-[security.md](security.md#git-over-https).
+[security-rules.md](security-rules.md#git-over-https) (`GIT-5`, `GIT-9`,
+`GIT-10`).
 
 These fields give a git credential to a host with no curated service, such as
 GitHub Enterprise Server or self-hosted GitLab. A user-defined service cannot
@@ -877,7 +878,7 @@ repository path segment:
 Git LFS is mediated only on a host where the service has a `git-lfs`
 destination. On a git host without one, LFS requests get no credential, every
 LFS batch request is a write, and a private LFS fetch fails (see
-[security.md](security.md#git-over-https)).
+[GIT-6](security-rules.md#git-over-https)).
 
 Any other path, or an ambiguous spelling of one of these, gets no credential.
 A fetch is a read. A push is a git push write: under the default `ask` posture
@@ -1054,7 +1055,7 @@ To find the OAuth hosts, Runfree reads the server's OAuth metadata from this
 computer with plain HTTPS GETs that carry no credentials, and asks first
 before it contacts a host a project file names. Login and refresh at the
 recorded endpoints skip write approval, at most 30 a minute per server; a host
-set to `deny` stays denied. The rules are in [security.md](security.md#mcp).
+set to `deny` stays denied. The rules are in [security-rules.md](security-rules.md#mcp).
 
 | Option | Meaning |
 | --- | --- |

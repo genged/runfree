@@ -1,7 +1,7 @@
 // Live runtime tiers: which live proofs run on every security-relevant change
 // (core) and which run only in the full release gate (extended).
 //
-// Core proves the trust boundary itself (docs/security.md "Core Rules"): the
+// Core proves the trust boundary itself (docs/security-rules.md): the
 // network shape and capability floor, egress containment, request shape and
 // write approval, inert agent policy edits and live revocation, managed-launch
 // host-file safety, exact per-session admission, the approved host-service

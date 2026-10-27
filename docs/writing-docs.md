@@ -14,7 +14,8 @@ Three groups read these pages, and each page is written for one of them:
   [troubleshooting.md](troubleshooting.md). They want the command to run and
   what it changes.
 - People deciding whether to trust Runfree read [security.md](security.md),
-  [architecture.md](architecture.md), and `SECURITY.md`. They want the
+  [architecture.md](architecture.md), and `SECURITY.md`. Reviewers also read
+  [security-rules.md](security-rules.md). They want the
   mechanism, its limits, and the proof.
 - Contributors read `CONTRIBUTING.md`, [testing.md](testing.md), and
   [project-brief.md](project-brief.md).
@@ -30,11 +31,11 @@ so a change only has to be documented once.
 | [cli.md](cli.md) | Every command, flag, and default; output conventions; config and policy file formats as a user edits them |
 | [architecture.md](architecture.md) | How the CLI, proxy, and agent container fit together; lifecycle, state, generation families, policy and credential models |
 | [security.md](security.md) | The threat model, trust boundary, what stops what, residual risks, and what Runfree's launch checks do not prove |
+| [security-rules.md](security-rules.md) | The rules the code must keep, one ID per rule (`GIT-5`), each with why and where it is tested; security.md keeps a short card per topic and links here |
 | `SECURITY.md` | Supported versions, how to report a vulnerability, and a short boundary summary that links to security.md |
 | [team-workflow.md](team-workflow.md) | What a team commits under `.runfree/`, and how policy and service changes are reviewed |
 | [troubleshooting.md](troubleshooting.md) | Symptoms, the error text a user sees, and the remedy for each |
 | [testing.md](testing.md) | What each test layer proves and where its proof stops |
-| `explanations` in `scripts/services.ts` | One service's setup steps and provider-specific rules, printed by `runfree service explain <id>` |
 | [project-brief.md](project-brief.md) | The problem, product model, audience, and release shape; it links to `AGENTS.md` for the source map |
 | `CONTRIBUTING.md` | Setup, the checks to run before a pull request, review expectations, and this standard's place in it |
 | `AGENTS.md` | Instructions for coding agents working on this repository: the source map and project rules |

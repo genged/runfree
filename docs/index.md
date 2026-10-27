@@ -20,8 +20,9 @@ page is the map.
 | [Project brief](project-brief.md) | The product model, audience, and supported release shape |
 | [Architecture](architecture.md) | Runtime, proxy, policy, state, and lifecycle |
 | [Security](security.md) | Threat model, trust boundary, enforcement, and residual risk |
+| [Security rules](security-rules.md) | The rules the code must keep, with IDs such as `GIT-5`, for reviewers |
 
-`architecture.md` and `security.md` are authoritative. Where a shorter page
+`architecture.md`, `security.md`, and `security-rules.md` are authoritative. Where a shorter page
 summarizes them, the shorter page is the summary and they are the contract.
 
 ## Contributing

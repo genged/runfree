@@ -3,7 +3,7 @@ export const SESSION_CONTAINER_STOP_SECONDS = 10;
 /**
  * The Docker client's own bound on one session stop, beyond the grace it asks
  * Docker for. A stop that outlives it is killed and counts as not done
- * (`docs/security.md` "Lifecycle" 2); the teardown that follows repeats it.
+ * (`docs/security-rules.md` `LIFE-2`); the teardown that follows repeats it.
  */
 export const SESSION_STOP_CLIENT_SLACK_MS = 20_000;
 /**

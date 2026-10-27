@@ -16,12 +16,12 @@ project policy lives under `.runfree/`.
 
 - Keep this file short and universally applicable. Prefer pointers to source
   files and docs over copying details here.
-- Read `docs/project-brief.md`, `docs/architecture.md`, and
-  `docs/security.md` before changing runtime, proxy, network, mount,
-  credential, or sandbox behavior. Together with the source map below, these
-  are the canonical project-owned context for current security reviews; shared
-  skills must discover and follow them rather than copy Runfree architecture
-  into skill references.
+- Read `docs/project-brief.md`, `docs/architecture.md`, `docs/security.md`,
+  and `docs/security-rules.md` (rule IDs such as `NET-1`) before changing
+  runtime, proxy, network, mount, credential, or sandbox behavior. Together
+  with the source map below, these are the canonical project-owned context for
+  current security reviews; shared skills must discover and follow them rather
+  than copy Runfree architecture into skill references.
 - Maintainer-only implementation plans, draft specs, research notes, stack
   notes, todo tracking, and implementation lessons may exist under an ignored
   local `local/` directory in this clone; read it before large architectural

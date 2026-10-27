@@ -1,12 +1,14 @@
 # Security
 
-Runfree runs a coding agent in Docker. The rule behind every design choice:
+Runfree runs a coding agent in Docker. One rule is behind every design
+choice:
 
 > **The agent is untrusted. The proxy is the trust boundary** for outbound
 > HTTPS/WSS and for proxy-managed credentials.
 
-This page is the security model: what Runfree protects, from whom, the rules
-the code must keep, and the risks that remain. The mechanics are in
+This page is for users who want to know what Runfree protects and what it
+does not. Each topic has a short card. The exact rules, with IDs such as
+`NET-1`, are in [security-rules.md](security-rules.md). The mechanics are in
 [architecture.md](architecture.md). To report a vulnerability, see
 [SECURITY.md](../SECURITY.md).
 
@@ -16,26 +18,27 @@ Runfree must:
 
 1. Keep real service credentials out of the agent container.
 2. Stop the agent from widening its own authority. The agent can edit desired
-   policy, but only a host-approved copy takes effect.
+   policy, but only a copy that the host approves takes effect.
 3. Send all outbound HTTPS/WSS through a proxy that enforces policy.
 4. Block direct egress with Docker topology and a firewall, not with
    environment variables.
 5. Allow exact hosts only, with optional method and path rules.
-6. Hold write requests for a host decision when policy says `ask`.
+6. Hold a write request for a host decision when policy says `ask`.
 7. Import project MCP config only after host approval.
 8. Show denials in session summaries, proxy logs, and `runfree doctor`.
 
 ## Threat Model
 
 **Assets:** proxy-managed tokens, host secrets, host-owned approvals and
-effective policy, the proxy CA private key, and host files outside the project.
+effective policy, the proxy CA private key, and host files outside the
+project.
 
 | Trusted | Untrusted |
 | --- | --- |
 | The host user who runs `runfree` | Prompts, model output, and tool calls in the agent |
-| The Runfree CLI and its embedded runtime assets | Project code and scripts the agent runs |
+| The Runfree CLI and its embedded runtime assets | Project code and scripts that the agent runs |
 | The proxy container and its token state | Project files: `.runfree/`, `.mcp.json`, `.codex/config.toml`, package and install hooks |
-| Credential helpers the user picks (`gh`, `op`, custom commands) | Responses from allowed hosts |
+| Credential helpers that the user picks (`gh`, `op`, custom commands) | Responses from allowed hosts |
 | Docker Desktop, the Docker daemon, and the host OS | VNC display content and clipboard data |
 
 **In scope:**
@@ -43,7 +46,8 @@ effective policy, the proxy CA private key, and host files outside the project.
 - A prompt injection that asks the agent to leak a token.
 - A project script that tries to reach the internet directly.
 - A malicious project MCP descriptor that asks for credentials or tools.
-- A confused-deputy request to an allowed host that carries a proxy credential.
+- A confused-deputy request to an allowed host that carries a proxy
+  credential.
 - A write sent where policy expects a read.
 - Symlink or hard-link attacks on host-side writes under `.runfree/`.
 
@@ -51,7 +55,7 @@ effective policy, the proxy CA private key, and host files outside the project.
 
 - A malicious Docker daemon, host OS, shell profile, or credential helper.
 - Kernel or container escape.
-- Code the user runs on the host outside Runfree.
+- Code that the user runs on the host outside Runfree.
 - Whether an allowed request is safe for the upstream service.
 - VM-grade isolation of hostile native code.
 
@@ -85,16 +89,20 @@ effective policy, the proxy CA private key, and host files outside the project.
 ```
 
 - Each agent process runs in its own session container on `agent_internal`.
-  That network has no internet route. Only the proxy is also on
-  `proxy_egress`.
-- Ingress forwarders (VNC, `runfree forward`, MCP OAuth callback) connect the
-  host loopback to a session. They are one-way transport, not an authority
-  boundary. See [Utility Participants](architecture.md#utility-participants).
-- Host services carry the agent to an approved port on the host's loopback.
-  The session relay holds no authority: the proxy admits only an exact
-  approved `<name>.runfree.internal:<port>` pair and splices it to the pinned
-  Docker Desktop gateway, and the firewall lets only the request proxy's
-  uid 1001 reach that pair. See [Host Services](architecture.md#host-services).
+  That network has no route to the internet.
+- Only the proxy is on both `agent_internal` and `proxy_egress`.
+- Ingress forwarders (VNC, `runfree forward`, the MCP OAuth callback) connect
+  the host loopback to a session. They carry bytes in one direction. They are
+  not an authority boundary. See
+  [Utility Participants](architecture.md#utility-participants).
+- A host service carries the agent to an approved port on the host's
+  loopback. The session relay holds no authority:
+  - The proxy admits only an exact approved `<name>.runfree.internal:<port>`
+    pair.
+  - The proxy splices that pair to the pinned Docker Desktop gateway.
+  - The firewall lets only the request proxy's uid 1001 reach that pair.
+
+  See [Host Services](architecture.md#host-services).
 - Proxy environment variables only route cooperative clients. They are not
   enforcement.
 
@@ -114,8 +122,8 @@ effective policy, the proxy CA private key, and host files outside the project.
 | CONNECTs to an unapproved `<name>.runfree.internal:<port>` | raw 403, no dial | proxy name and port pair check |
 | Configures a loopback HTTP MCP (`http://127.0.0.1:<port>`) on an unapproved port | no host reach | proxy name and port pair check; uid 1001-only firewall rule |
 | Gives a loopback HTTP MCP a header, helper, or OAuth setting | entry skipped | loopback MCP config allowlist |
-| Sends an OAuth token or registration request to an endpoint the proxy does not mediate, on a host only MCP records allow | 403 `oauth-endpoint-not-mediated`, no upstream connect, no approval prompt | proxy grant check ([MCP](#mcp) rule 9) |
-| Names `github.com` or another host where other logins pass as an MCP server's token endpoint | refused at `mcp enable` and at every launch | MCP host rule ([MCP](#mcp) rule 8) |
+| Sends an OAuth token or registration request to an endpoint the proxy does not mediate, on a host only MCP records allow | 403 `oauth-endpoint-not-mediated`, no upstream connect, no approval prompt | proxy grant check ([`MCP-9`](security-rules.md#mcp)) |
+| Names `github.com` or another host where other logins pass as an MCP server's token endpoint | refused at `mcp enable` and at every launch | MCP host rule ([`MCP-8`](security-rules.md#mcp)) |
 | Dials the host gateway IP directly | no route | `agent_internal` has no egress; uid 1001-only firewall rule |
 | POSTs to an allowed host under `ask` | held for a host decision | write approval |
 | `git push` to `github.com` or `gitlab.com` with the service's token stored | held under `ask`; once approved, it **succeeds with your token** | write approval; `--deny-git-push` |
@@ -124,937 +132,493 @@ effective policy, the proxy CA private key, and host files outside the project.
 | Writes a fake Claude registry entry or Codex rollout file | labeled, non-default row in its own project's resume picker | sanitized display; never the default cursor or the one question; a resume still goes through normal admission |
 | Sets terminal-multiplexer env vars hoping to match a host session | no effect | terminal ids are read only from the host launcher's own environment, never read from or forwarded into the container |
 
+## What You Decide
+
+The agent cannot widen its own authority. Only you can, from the host. Each
+row below is a security decision.
+
+```text
+ agent asks  --->  you approve on the host  --->  agent gets more power
+ (edits policy,    (review, approve, add,          (a host, a token,
+  sends a write)    enable)                         a write, a port)
+```
+
+| You run or approve | The agent gets | Keep it narrow |
+| --- | --- | --- |
+| `runfree host add <host>`, or a desired-policy change at review | Requests to that host, and a channel for data to leave | Add exact hosts only; use `--skip-broad` for multi-tenant hosts |
+| A credential binding (`credential add`, `service enable --from-…`) | Use of the token on its destinations, within the token's scope | Bind a fine-grained, read-only token where the provider has one |
+| A held write, with `runfree approve` | The write goes out with your token | Read what is held; use `--deny-git-push` or `host rules` to refuse a class |
+| `service enable --allow-write`, or a `--write allow` host rule | Writes to that host without a prompt | Keep the default `ask` posture |
+| `runfree mcp enable` | The MCP server's tools, and its OAuth hosts | Approve only servers you would run yourself |
+| `runfree host-service add` | An opaque tunnel to a port on your host's loopback | Approve only services the agent may use freely |
+| `runfree forward`, `runfree vnc` | Content that renders in your browser or viewer | Treat it as untrusted agent output |
+| `runfree up --audit-network` | Hosts outside the allowlist, for a bounded time | Use it to discover hosts, then turn it off |
+| `runfree image approve-context` | A project image build with host Docker networking, before the sandbox exists | Review the Dockerfile and the build context |
+
 ## Core Rules
 
-Each rule says what must stay true. Changes must not break a rule. Links
-point to the mechanism.
+Each card below says what a topic protects, what you decide, and its limits.
+The exact rules are in [security-rules.md](security-rules.md). A change must
+not break a rule.
 
 ### Network
 
-1. The proxy checks policy **before** DNS lookup, credential read, OAuth
-   mediation, and upstream connect. Plain HTTP, hosts not on the list, raw
-   tunnels other than an approved host service, method or path violations,
-   and unapproved writes stop there.
-2. Hosts are exact names. No wildcards, and no IP literals; an IP-literal
-   CONNECT host is never audit-passed.
-3. The root firewall allows traffic to a destination only if it is in the DNS
-   allow set built from the same policy generation as the request proxy, or
-   is an approved host-service pair (rule 6). Input to the proxy port `:8080`
-   is accepted only from the admitted session set. Output is default drop
-   except loopback, established flows, and TCP 443 to the allowed (and, in
-   audit mode, audited) sets on the egress interface. Uid 1001 DNS on port 53
-   is rejected before Docker's DNS rewrite, and IPv6 is loopback only. The
-   supervisor drops loopback, private, link-local, CGNAT, documentation,
-   benchmark, multicast, reserved, broadcast, and runtime-subnet DNS answers;
-   the request proxy answers `dns.lookup` only from the supervisor's snapshot
-   and does no DNS of its own.
-4. Denied CONNECT requests get feedback in the tunnel: a denied 443 CONNECT
-   gets one static `blocked.invalid` certificate and a synthetic 403. At most
-   32 denied tunnels run at once and idle ones close after 5 s; past that cap,
-   and for any non-443 CONNECT other than an exact approved host-service pair,
-   the answer is a raw pre-TLS 403. Denials go to `runfree doctor`;
-   `proxy-denial:` events are coalesced to 10 per minute per host and reason.
-5. `runfree.internal` and every name under it are reserved. Every hostname
-   validator refuses them, and the proxy classifies them first, on every
-   port and in every mode, before any DNS lookup, audit spool write, or dial.
-6. **Host services are opaque TCP tunnels** to the host's loopback, approved
-   per exact name and port. Adding one, or changing its port or target,
-   always needs host review; only a removal applies without it. No request
-   rules, write approval, or credential injection apply inside them.
-   - Only the request proxy's uid 1001 can reach the pinned gateway's
-     approved pairs; root and the agent get no path to them. The gateway comes
-     from the daemon's `extra_hosts` entry, never from DNS, never enters the
-     DNS allow set, and must be one private (RFC 1918) IPv4 address that is
-     not loopback, link-local, a runtime subnet, or a proxy address. Until a
-     valid gateway is read, and while the firewall cannot update its
-     host-service sets, host services refuse with a named cause.
-   - A removal, gateway change, or withdrawn gateway is cut by two independent
-     consumers: the request proxy destroys open splices, and the firewall
-     drops every packet, from any uid, to a gateway it pinned on a pair that is
-     not currently approved, above the established accept, for the
-     supervisor's lifetime.
-   - A port is admitted (a visible listener on `127.0.0.1` or `*`, not Docker
-     Desktop) on every host approval path. A dial that fails or takes more
-     than 5 s is refused before the proxy answers 200. Caps: 32 splices per
-     session, 256 in all, 64 pending dials; a refusal at a cap clears as
-     splices close. If the in-session relay cannot bind an approved port, it
-     skips that service with a warning and the session still starts; a later
-     process that wants the port gets `EADDRINUSE`.
-   - Each launch proves the proxy's host-gateway entry and that the
-     firewall's host-service pairs equal the effective policy. A full
-     validation also proves that the agent cannot reach the gateway, that root
-     in the proxy cannot reach an approved port, and that the request proxy
-     cannot reach an unapproved one.
+This keeps the agent from reaching any host that policy does not allow. The
+agent has no route out. All its traffic goes through the proxy.
 
-   Mechanism: [Host Services](architecture.md#host-services).
-7. **Request shape fails closed.** On method-ruled hosts, and on any host
-   whose write action is not `allow`, the proxy strips
-   `X-HTTP-Method-Override`, `X-HTTP-Method`, and `X-Method-Override`. On
-   path-ruled hosts the path is decoded up to five times, and an encoded dot,
-   slash, or backslash, a literal `\`, `//`, `..`, `..;param`, or a malformed
-   encoding fails closed. WebSocket upgrades are checked as GET. Denials carry
-   `x-runfree-blocked: method-not-allowed`, `path-not-allowed`,
-   `git-push-denied`, `write-denied`, or a `write-approval-*` reason.
-8. **Audit mode is bounded.** It defaults to 60 min, at most 8 h, and is
-   HTTPS-only and 443-only; shape rules and write classification do not
-   apply to audited hosts. The host writes the audit marker with a root
-   `docker exec` into a root-owned directory, and the request proxy and
-   firewall share one clamp, `min(expiresAt, min(enabledAt, proxyNow) + 8h)`,
-   so a skewed clock cannot extend it. Audited addresses go to `audit_ipv4`
-   (256 by default). At expiry or `audit off`, audited addresses not also
-   allowed move to `audit_draining_ipv4`, whose drop rule sits above the
-   established accept, so in-flight audited uploads are cut.
-9. **The request proxy holds no privilege.** The proxy container adds
-   `NET_ADMIN` and drops `NET_RAW`. The root entrypoint starts the request
-   proxy via `setpriv` as uid/gid 1001 with no supplementary groups, no
-   inheritable or ambient capabilities, `NET_ADMIN`/`NET_RAW` removed from the
-   bounding set, and `no_new_privs`, and checks this at runtime. If the Docker
-   backend makes the internal interface the default route, the entrypoint
-   replaces it with the egress gateway, and the host verifies the route.
+```text
+ agent (no route out)       proxy                         internet
+ CONNECT host:443   ---->  exact host on the list?  yes -> allowed host
+                           method, path, write OK?
+                           no  -> 403, no DNS, no token read
+ other port         ---->  raw 403 (except an approved host service)
+                           firewall: only TCP 443 to the allowed set
+```
 
-Order, hardening, and firewall rules:
-[Proxy Enforcement Details](architecture.md#proxy-enforcement-details).
+| Traffic | What happens |
+| --- | --- |
+| HTTPS to an allowed host | Goes out through the proxy, after request rules. |
+| HTTPS to any other host | 403 in the tunnel, before any DNS lookup. |
+| Plain HTTP, or a port other than 443 | Refused. |
+| An approved host service | An opaque TCP tunnel to one port on the host's loopback. |
+| Audit mode | Allows hosts not on the list for a bounded time, 443 only. |
+
+You decide:
+
+- Each host you allow. Hosts are exact names, with no wildcards.
+- Each host service. Adding one, or changing its port or target, needs your
+  review.
+- Audit mode. `runfree up --audit-network` turns it on for 60 min by default
+  and 8 h at most.
+
+Limits:
+
+- Inside a host-service tunnel, no request rules, write approval, or
+  credential injection apply.
+- In audit mode, request shape rules and write classification do not apply
+  to audited hosts.
+- Proxy environment variables only route cooperative clients. The firewall
+  and the network topology are the enforcement.
+
+The rules are in [Network rules](security-rules.md#network) (`NET-1` to
+`NET-9`). The commands are in [cli.md](cli.md#network-policy).
 
 ### Policy
 
-1. `.runfree/network-policy.json` is desired input. The agent can edit it.
-   Its edits do nothing until a host transaction captures, verifies, and
-   approves the exact bytes.
-2. The proxy never reads the project file. It reads an immutable effective
-   generation from a read-only XDG mount.
-3. Unknown fields, duplicate keys, oversize input, unsafe paths, and any
-   authority growth without exact approval fail closed. The CLI and the proxy
-   refuse unknown keys in every object of both desired and effective policy;
-   only maps keyed by name (hosts, tokens) take arbitrary keys. Desired
-   policy version 1 is refused, not converted.
-4. A mutation that runs beside live sessions approves the exact candidate it
-   re-read under the lock, never a fresh read of the file.
-   See [Desired-Policy Mutation](architecture.md#desired-policy-mutation-beside-live-sessions).
-5. Invalid or incomplete generations keep the previous effective policy.
-6. The project `.runfree/config/agent.env` is ignored. The agent environment
-   comes from the selected effective policy generation.
-7. A policy an older reader would misread never reaches one. Desired policy
-   is version 3 or 4 only when it uses a field older releases do not know
-   (see [Older Readers](#older-readers)); those releases refuse it. A CLI
-   applies policy only to a proxy built from its own embedded assets.
-8. A `host rules` setting on a service host is stored in the service entry
-   (`selection.hostRules`). It is valid only for a host in the service's
-   resolved hosts, so it never adds an allowlist entry. It holds only
-   permission fields: methods, path prefixes, the write action, and
-   `gitPush: "deny"`. The service's classification fields (read and write
-   path prefixes, GraphQL endpoints, the git handling rule) stay, so a
-   setting cannot turn a GraphQL mutation into an unclassified `POST`. Where
-   the service sets methods or path prefixes, a setting can only narrow them;
-   a broader one is refused before any write. `gitPush: "deny"` is accepted
-   only on a host where the service's rule has `gitPush: "write"`, so a
-   setting cannot add git classification (the upload-pack read exemption) to
-   a host the service gives no git handling. A setting can loosen the write
-   action, as `host rules --write allow` can on any host; a per-host write
-   setting outranks the service's write mode, and a weaker one is warned
-   about on each service enable, configure, and `service diff --apply`.
-   `service enable` takes over an identical direct rule only when it holds no
-   permission field, so `service disable` never drops a user's restriction.
+This protects your network authority. The agent can edit desired policy, but
+only a copy that you approve takes effect.
+
+```text
+ .runfree/network-policy.json   (agent can edit; no effect)
+        |
+        v
+ you approve the exact bytes  -->  effective policy  -->  proxy
+                                   (host-owned, read-only to the proxy)
+```
+
+- The proxy never reads the project file.
+- Unknown fields, duplicate keys, and authority growth without approval are
+  refused.
+- If a new effective policy generation is invalid, the proxy keeps the
+  previous policy.
+- `.runfree/config/agent.env` is ignored. The agent environment comes from
+  approved policy.
+
+You decide:
+
+- Each policy change, when you approve it.
+- A `host rules` setting on a service host. It can narrow the service's
+  methods and paths. It can also loosen the write action.
+
+Limits:
+
+- A setting that loosens the write action gives the agent more power. Runfree
+  warns about it, but it does not refuse it.
+
+The rules are in [Policy rules](security-rules.md#policy) (`POL-1` to
+`POL-8`).
 
 ### Credentials
 
+This protects your real tokens. The agent never holds one. The proxy adds
+the token to an allowed request.
+
 ```text
-host source (env, 1Password, command, stdin, JWT, Google service account, OAuth seed)
-   | runfree credential sync  (host resolves)
-   v
-proxy-only tmpfs  --->  proxy strips agent auth headers
-                        policy allows?  --no-->  deny, no token read
-                            | yes
-                            v
-                        inject credential  --->  upstream
-agent sees: placeholder or runfree_oauth_* handle only
+ host source  --credential sync-->  proxy tmpfs
+ (env, 1Password, command, ...)         |
+                                        v
+ agent (placeholder only) --request--> proxy: allowed? --> add token --> upstream
+                                              no --> deny, no token read
 ```
 
-1. Real tokens never go into the agent environment, project files,
-   `.runfree/runfree.json`, or `.runfree/network-policy.json`.
-2. Desired policy (`tokens`) says which credential may go to which host,
-   header, and path. The source config that says where the value comes from
-   is host-owned.
-3. Credential writes happen only after the runtime is validated and a
-   prepared runtime exists. Prepared values must be admitted within 120 s of
-   preparation and used within a further 120 s. No source is read while the
-   lifecycle lock is held. Before committing, startup recaptures
-   configuration, approval, image identities, and the effective selection;
-   credential admission recaptures the required source set and named-source
-   fingerprints before any proxy disruption; and each credential write
-   rechecks the exact proxy, token-store generation, effective policy, and
-   pending recovery receipt.
-4. **A held value is reused only while provably current.** A warm launch may
-   reuse a proxy-held value without re-reading its source only under a
-   current host receipt whose last read is under 15 minutes old; the launch's
-   watcher re-reads every source right after the launch, and
-   `runfree credential sync` always re-reads. A definitive read failure (the
-   source was revoked at its origin) drops the value. A transient or
-   unclassified failure (a locked vault, a prompt the watcher cannot show)
-   keeps it, bounded by the keep-last-good age. Stopping a read (session exit,
-   Ctrl-C, or another signal) is never a failure: nothing more is written,
-   removed, or recorded. A write replaces the held value only when the whole
-   value arrived, and a write with an unknown outcome (its client was killed)
-   never removes the token. A deferred sync under a launch's lock follows
-   [Lifecycle](#lifecycle) rule 10.
-5. The proxy CA private key is mounted only into the proxy.
-6. **A Google service-account key stays on the host.** The CLI reads the key
-   JSON from 1Password only to sign, and never stores the key JSON, the
-   private key, or its key id in the source registry, receipts, the token
-   status file, or logs. The signed JWT lives at most 1 hour and goes only to
-   proxy tmpfs. The source pins the service account's email, so a changed
-   1Password item cannot switch it to another account; the scope comes from a
-   fixed allowlist set on the host, never by the agent. Every failure after
-   the read is definitive and prints a fixed message that names the field,
-   never the key. A watcher keeps the parsed key in memory for at most 4
-   hours, so a key removed from 1Password stops being used within 4 hours
-   plus one JWT lifetime; deleting the key in Google Cloud IAM stops it at
-   once. A credential's scope is not what keeps a host read-only: a host
-   rule's methods and path prefixes are, and the proxy enforces them whatever
-   the scope ([Network](#network) rules 1 and 7).
+- The agent sees a placeholder or a `runfree_oauth_*` handle, never the
+  value.
+- Real tokens never go into the agent environment or project files.
+- The proxy CA private key is mounted only into the proxy.
+- A value revoked at its source is dropped at the next read. A short outage,
+  such as a locked vault, keeps the last good value.
+
+You decide:
+
+- Which source each credential comes from. The source config is host-owned.
+- How broad each token is. Runfree checks host, method, and path, not the
+  token's scope.
+
+Limits:
+
+- A token can do anything its scope allows on the hosts where the proxy adds
+  it.
+- A Google service-account key removed from 1Password can stay in use for
+  up to 4 hours plus one JWT lifetime. Delete the key in Google Cloud IAM to
+  stop it at once.
+
+The rules are in [Credentials rules](security-rules.md#credentials) (`CRED-1`
+to `CRED-6`).
 
 ### Git Over HTTPS
 
-A service's credential destination can carry a `protocol` scope:
-`protocol: "git-http"` for git smart HTTP and `protocol: "git-lfs"` for the
-Git LFS batch and lock API. Such a destination uses the `basic` scheme with a
-username that the service declares. The curated `github` and `gitlab`
-services have them; `runfree service explain <id>` lists each service's
-destinations and whether it mediates Git LFS. Commands and the supported
-remote forms are in
-[Git over HTTPS and SSH remotes](cli.md#git-over-https-and-ssh-remotes). New
-`protocol` scopes are added only for public wire protocols the proxy can
-recognize reliably; a vendor's own endpoints use a path prefix or a request
-rule instead.
+This protects your git token. The agent runs git with no token. The proxy
+adds the token only to git requests that it recognizes.
 
-1. **Token reach covers git.** A token on a `git-http` or `git-lfs`
-   destination reaches every repository the token can access, so use a
-   fine-grained token limited to the repositories the agent needs. The
-   `protocol` scope limits which requests carry the token, not which
-   repositories. A destination without `protocol` on another host of the
-   same service still carries the token on every path it matches.
-2. **An approved push succeeds.** A push that write approval allows goes out
-   with your token, so approving a git push is a real decision. Write
-   approval is the effective control. The default write posture is `ask`;
-   `--deny-git-push` refuses pushes before any connection or token read. It
-   does not refuse Git LFS uploads: an upload batch is an ordinary write under
-   the host's write action.
-3. **The credential is attached only to recognized git requests.** The
-   request must be one of the listed method and path forms, with no path
-   confusion; the raw path and its decoded form must both end with the plain
-   endpoint, and the decoded path must hold no NUL. Ref discovery needs
-   exactly one `service` query parameter, spelled literally; a parameter whose
-   decoded, case-folded name is `service` counts toward that one. These are
-   never git requests:
-   - a `POST` endpoint (fetch, push, LFS batch, LFS lock) with any query
-     string. Git and git-lfs send none, and an origin that merges query
-     parameters over the body would act on a query the proxy never read,
-     such as `?operation=upload` on a download batch;
-   - a ref discovery query that contains a `;`. Some origins also split a
-     query on `;` and could read a second `service` the proxy never counted.
-     Push detection treats such a query as a push;
-   - a path whose first segment decodes to `api` in any case, or that has a
-     segment that is exactly `-`. Some origins serve a REST API under `/api/`
-     and other routes behind `/-/`, where a last segment can be any name
-     (`…/repository/files/git-upload-pack` can be a file API). The matcher
-     does not guess per provider, so a repository owner named `api` is
-     excluded on every host. Dots and whitespace at either end of the first
-     segment are ignored for this check, so `%20api` and `.api` count as
-     `api`;
-   - a path with a segment that starts with whitespace after decoding. An
-     origin that trims it could route the request somewhere other than the
-     path the matcher read.
+```text
+ agent (no token)            proxy                            provider
+ git fetch / clone  ---->  read:  add the token now  ---->  github.com,
+ git push           ---->  write: wait for approval  ---->  gitlab.com, ...
+                           (or refuse: --deny-git-push)
+ other paths        ---->  no git token
+```
 
-   Anything else on the host gets no credential, and its write classification
-   is unchanged. A `git-http` destination matches only git smart-HTTP
-   requests and a `git-lfs` destination only Git LFS requests; no request is
-   both.
-4. **Agent `Authorization` is removed on a credential host.** On a host with an
-   `Authorization` credential destination, the agent's value is stripped on
-   every path and replaced on requests a destination matches. One exception,
-   shared with every such host: a value shaped like a Runfree OAuth handle is
-   kept for the OAuth mediator. A `Bearer runfree_oauth_…` value must then be
-   a live handle of this project for this resource, or the request is refused
-   before any connection. A `Basic` value whose password has the handle shape
-   is forwarded unchanged on any path, and no token is injected for that
-   request. The stored token is never exposed this way; the agent can only
-   send its own value.
-5. **Git LFS download batches are reads where LFS is mediated.** The batch
-   endpoint takes `POST` for both download and upload. On a host with a git
-   handling rule (`gitPush`) and a `git-lfs` destination that matches the
-   request, under `ask` or `deny`, a batch request is a read only when the
-   proxy proves its body is a download:
-   - exactly `POST` on a recognized `…/info/lfs/objects/batch` path, with an
-     empty query;
-   - one `Content-Type` of `application/vnd.git-lfs+json` (a `charset`, if
-     present, must be UTF-8), no content encoding other than identity, and
-     one `Content-Length` of at most 64 KiB that equals the body length;
-   - a body that decodes as strict UTF-8 with no byte order mark and parses
-     as JSON with no duplicate key at any depth;
-   - a top-level object with exactly one key that folds to `operation`,
-     spelled `operation`, whose value is `"download"`.
+| Request | What happens |
+| --- | --- |
+| Fetch, clone | A read. The proxy adds the token. |
+| Push | A write. Under `ask`, it waits for `runfree approve`. After approval, it goes out with your token. |
+| Git LFS download | A read only where the service mediates LFS, and only if the proxy proves that the body is a download. |
+| Git LFS upload or lock | A write. |
+| Any other path on the host | No git token. |
 
-   Anything else is a write: an upload, a malformed or oversized body, a
-   second `Operation`-like key, a missing length, every `POST` lock request,
-   and every batch request on a host with no `git-lfs` destination that
-   matches the request path. The `GET` lock listing is a read like any `GET`,
-   and carries the credential of a `git-lfs` destination that matches it. A
-   held request is re-checked without its body, so it stays a write.
+You decide:
 
-   A git handling rule alone does not make a download a read. On a host with
-   a git handling rule but no `git-lfs` destination, such as a curated
-   service's git host where the service has no credential or does not
-   mediate LFS, or a host given a rule by hand with
-   `runfree host rules <host> --deny-git-push`, every LFS batch request, a
-   public download included, waits for approval under `ask`.
+- Which token you bind. It reaches every repository that it can access. Use
+  a fine-grained token.
+- Each push. To refuse pushes outright, run
+  `runfree host rules <host> --deny-git-push`.
 
-   The git fetch exemption is narrow in the same way: only `POST` on a
-   recognized `…/git-upload-pack` path, with at least one repository segment
-   before it, an empty query, and none of the excluded paths in rule 3, is a
-   read.
-6. **Object transfer credentials reach the agent.** A batch response gives
-   per-object action URLs and may give headers with credentials issued by the
-   provider. They pass to the agent unchanged. They are not the stored token,
-   and Runfree does not limit their scope or lifetime. Because a download
-   batch is a read where LFS is mediated, a `git-lfs` destination lets the
-   agent obtain those credentials without approval. A service whose
-   provider's batch answer carries a credential that can push therefore has
-   no `git-lfs` destination: an LFS request to that host gets no credential,
-   every batch request there is a write, and a private LFS fetch fails. The
-   transfer itself goes to the action host and follows that host's policy;
-   on a host with an `Authorization` destination, an agent-sent
-   `Authorization` is stripped there like any other.
-7. **A service can forward anonymously without a token.** For a service that
-   allows it, a host with no token stored forwards its requests with
-   `Authorization` stripped, so public clones work and private calls get 401.
-   `runfree service explain <id>` says whether a service does this.
-8. **Redirects are not followed.** The proxy passes a redirect response to
-   the agent unchanged. Git follows it as a new proxied request, which gets
-   the credentials of the new host's policy, if any. The injected value never
-   reaches the agent, so the agent cannot carry it to another host.
-9. **The protocol tier is host-wide.** When any `protocol` destination of a
-   host matches a request, only `protocol` destinations are injected on it.
-   A destination without `protocol` on another header of the same host is
-   not injected on a recognized git request.
-10. **Changes to a host with several destinations need approval.** The proxy
-    picks a destination per host, so on a host with more than one
-    credential destination, narrowing, scoping, or removing one of them can
-    make another token's destination win for requests that used to get the
-    changed one. Any change to such a host's destinations therefore needs
-    host approval; removing every destination of the host still applies
-    without review. Scoping a destination to `git-lfs` also needs approval,
-    because it turns on the LFS download read rule for that host.
+Limits:
 
-The SSH-to-HTTPS rewrite in the sandbox Git config is routing, not
-enforcement. The agent can remove it; SSH still has no route out.
+- `--deny-git-push` does not stop a Git LFS upload. It also does not stop a
+  push through the provider's REST or GraphQL API.
+- A Git LFS answer can carry provider credentials. They reach the agent.
+- The SSH-to-HTTPS rewrite is routing only. SSH has no route out.
+
+The rules are in [Git over HTTPS rules](security-rules.md#git-over-https)
+(`GIT-1` to `GIT-10`). The commands are in
+[cli.md](cli.md#git-over-https-and-ssh-remotes).
 
 ### Older Readers
 
-A newer policy can meet an older reader: a teammate's older CLI reading the
-committed `.runfree/network-policy.json`, a downgraded CLI, or, after an
-upgrade, a proxy still running the previous build.
+This protects policy from a reader that does not know its newest fields. An
+older reader refuses new policy. It never drops a field and widens access.
 
-- Desired policy takes a higher version only when it holds a field that an
-  older reader would misread; the triggers are in
-  [cli.md](cli.md#network-policy). A release that does not read that version
-  refuses the file, so it cannot drop a `protocol` scope and inject on the
-  whole host, or drop a `--deny-git-push` set on a service host. A file with
-  none of those fields keeps the lowest version and an unchanged digest.
-- An effective policy generation is published only to a proxy of the same
-  build. Policy commands compare the running proxy's image-input label (a
-  missing label counts as another build) with the proxy this CLI embeds; on a
-  mismatch they either replace the proxy compatibly before publishing or save
-  the change unapplied and name the remedy (see
-  [troubleshooting.md](troubleshooting.md)).
-- The identity check is not serialized with a concurrent runtime start by
-  another build, and a runtime start that publishes approved policy beside
-  live sessions can let an older-release proxy read the new effective policy
-  generation. Every older reader refuses one that uses the new fields (the
-  digest it recomputes does not match the manifest) and keeps its last valid
-  policy. The cost is availability, not authority.
-- Older releases cannot read project-image build-context approval records; a
-  downgrade needs re-approval.
+```text
+ newer policy --> teammate's older CLI  --> refuses the file
+              --> proxy of another build --> replaced first, or change saved unapplied
+              --> older proxy (race)     --> refuses it, keeps the last valid policy
+```
+
+| Reader | What happens |
+| --- | --- |
+| Older CLI, newer desired file | Refuses the file, for example `version must be 2`. |
+| Running proxy of another build | The CLI replaces the proxy first, or saves the change unapplied and names the remedy. |
+| Older proxy that reads a newer generation | Refuses it and keeps its last valid policy. |
+| Older CLI after a downgrade | Cannot read project-image build-context approvals. Approve them again. |
+
+You decide:
+
+- When the team moves to a release that reads the new version. Until then,
+  older CLIs refuse the committed file.
+
+Limits:
+
+- The cost of a mismatch is availability, not authority. A refused policy
+  stops the older reader's change; it does not widen access.
+
+The rules are in [Older Readers rules](security-rules.md#older-readers)
+(`OLD-1` to `OLD-4`).
 
 ### Sessions
 
-A session's identity is its source IP on `agent_internal`. This is a network
-identity: it says which container is speaking, not which user or prompt.
-`source-ip-v1` is the only mode; the proxy refuses to start without it.
+This keeps each agent process separate and makes sure that only an admitted
+session can send traffic. A session's identity is its source IP on
+`agent_internal`. It tells which container speaks, not which user or prompt.
 
 ```text
-host: allocate IP -> fence IP -> create+start container -> inspect once
-                                                              |
-      <- heartbeat every 30 s: inspect, rewrite file  <- write session file
-                                                              |
-proxy: firewall + request proxy read the file (on change; 100 ms backstop) -> serve IP
+ host                                    proxy
+ inspect container --> session file -->  firewall + request proxy
+ every 30 s: inspect and rewrite         serve the IP while the file is valid
+ host stops writing                      IP stops within 5 minutes
+ session ends: delete file first         IP no longer served
 ```
 
-1. **No file, no traffic.** An IP is served only while a root-owned,
-   well-formed, eligible, unexpired session file names it and no other file
-   claims it. Only the host writes these files. The parse refuses an unknown
-   or missing key, a file name that is not the embedded session key, a
-   payload over 8 KiB, and a lease end more than five minutes after the
-   authorizing inspection. Each write proves the parent directory is
-   root-owned and not group- or other-writable, and does not follow links;
-   the root firewall checks the file's owner uid, not its gid.
-2. **No write without inspection.** Each write comes from a Docker inspection
-   in the same call. A proven identity mismatch deletes the file at once. An
-   inspection that fails deletes nothing.
-3. **Bounded lease.** A host that stops writing loses the session within the
-   five-minute maximum lease, on the proxy's own clocks. The heartbeat
-   cadence stays at or below one third of the lease, so a guest clock skew of
-   up to the lease minus the cadence still serves sessions.
-4. **Both consumers read the same files.** The firewall and the request proxy
-   decide on their own, with the same rule. Neither trusts the other.
-5. **No IP reuse without a fence.** Before a new container gets an old IP,
-   the host proves both consumers dropped the old owner and the kernel has no
-   old sockets. The fence executor holds a kernel lock on the root-owned
-   assignment directory and requires the assignment to still match the exact
-   bytes the host read, so a delayed executor cannot replace a later
-   assignment; a lock timeout refuses creation, and a retry is safe. A launch
-   that took over startup's lock compares against what startup read under
-   that lock and proxy instance. During the fence the request proxy keeps
-   destroying sockets from draining addresses (Linux can keep unaccepted
-   sockets after the kill), and the host retries the zero-sockets query until
-   its deadline; the ingress listener binds IPv4 so that query covers it, and
-   TIME_WAIT entries carry no stream and do not block reuse. See
-   [IP Reuse Fence](architecture.md#ip-reuse-fence).
-6. **Fail closed on contradiction.** Two files for one IP, wrong bindings, a
-   bad file, or a name/key mismatch: nobody involved is served.
-7. **Peers never touch a live owner.** Reconcile acts only on records whose
-   owner process is proven dead. Unknown means keep.
-8. **Revoke file first, record last.** The record reserves the IP, so it goes
-   last. A failed file delete stops teardown.
-9. **Heartbeats never kill the agent.** They control only the session file.
-10. **Unreadable is never empty.** A warm launch skips the startup reconcile
-    only when every listing it relies on reads empty; a listing that fails,
-    times out, or has a malformed row reconciles. The warm-empty result is
-    single-use and bound to one proxy instance and lock holder; a copy, a
-    second use, or a mismatch runs full preflight. Startup hands its lock to
-    admission only after a credential sync that read no source under the lock
-    and a startup that finished quickly; `runfree up` and `runfree resume`
-    never hand off.
-11. **Warm evidence never restores or renews a peer.** A warm launch beside
-    live sessions skips the restore only when every peer is accounted for in
-    one proxy incarnation; a peer owner proved neither alive nor dead is a
-    miss, and the launch validates fully. A peer whose owner dies afterwards
-    keeps access only until its session file expires and reconcile tears it
-    down.
-12. **Addresses are allocated only from the session pool.** Session
-    addresses start at `.20`, bounded by the session-concurrency cap; `.10` is
-    the proxy and `.11`/`.12` are reserved. A container on a low reserved
-    address is an unknown participant and fails allocation closed. The
-    deny-probe helper takes a pinned address from `.13`–`.19`, skipping the
-    proxy, agent, callback, gateway, and attached addresses; when that block
-    is exhausted the probes fail as not run. The
-    session-file publisher and the IP fence refuse any address outside the
-    pool. Every address a well-formed session file names is reserved, and a
-    session-file listing the host cannot read refuses the launch.
-13. **Re-attach is bounded but never ends a session.** When the attached
-    stream ends while the same incarnation still runs, the driver re-attaches
-    at most three times in a rolling 60 s window; reaching the cap does not
-    end the session.
+| If | Then |
+| --- | --- |
+| No valid session file names the IP | The proxy drops the traffic. |
+| Two files claim one IP, or a file is bad | The proxy serves nobody involved. |
+| The host stops writing heartbeats | The lease ends within five minutes. |
+| An IP goes to a new container | The host first proves that the old owner is gone. |
+| The host cannot read a listing | It does not count the listing as empty. |
 
-Mechanics: [Session Admission](architecture.md#session-admission).
+Limits:
+
+- The identity is a network identity. It does not tell which user or prompt
+  made a request.
+- A peer whose owner process dies keeps access until its session file
+  expires, at most five minutes.
+- Runfree checks session shape only with host-side `docker inspect`. That
+  shows what Docker created, not what the process does.
+
+The rules are in [Sessions rules](security-rules.md#sessions) (`SESS-1` to `SESS-13`).
 
 ### Write Approval
 
-A request is a read or a write. The write action is `allow`, `deny`, or `ask`.
-The default is `ask`. AI provider hosts in the initial template use `allow`
-because the agent must POST to model APIs.
+This protects your upstream accounts from writes that you did not agree to.
+The proxy puts each request in one of two classes: read or write. A request
+that the proxy cannot prove is a read is a write.
 
-1. Decisions are made on the host (`runfree approvals --watch`,
-   `runfree approve <id>`).
-2. A grant belongs to one session. It ends when that session's authority ends.
-3. Positive grants have a lifetime (`request` 5 min, `ttl` up to 8 h). Each
-   grant expires on the wall clock or the monotonic clock, whichever runs out
-   first, so a clock step or host sleep cannot extend it.
-4. Denies do not expire. Only `runfree approvals --clear-deny` removes them,
-   through a root-owned channel that the agent cannot reach. Clearing goes
-   back to `ask`, never to `allow`.
-5. Activating new policy never removes a deny.
-6. **Holds are bounded and host-decided.** A hold lasts
-   `runtime.writeApprovalHoldSeconds` (default 120 s, range 5–300 s), at most
-   16 at once. Without an attached approver (a root-owned heartbeat under
-   45 s old for the current approval epoch) the answer is an immediate 403.
-   Pending records live in a uid-1001 0700 directory; decision files, control
-   files, and the approver heartbeat must be root-owned and are written by
-   the host with a root `docker exec`. Approval ids are single-use, an
-   approved request re-runs the full policy check, and a policy change
-   cancels holds that no longer pass.
-7. **Headless sessions never hold.** A session that `runfree run` starts
-   carries `launchMode: "headless"` in its root-owned session file, in the
-   same write that admits it, so there is no window before its first request.
-   The mark is part of the session's stable identity, and the admission
-   contract epoch changed with it, so an older proxy refuses the file and the
-   run fails closed. The request proxy reads the mark on every request. An
-   `ask` write from a headless session is denied at once
-   (`headless-denied`), whatever the approver heartbeat says: no hold and no
-   pending record, on the HTTP path and on the WebSocket retry path. The
-   mark is never derived from the container's TTY. A run inherits no grants,
-   and a decision needs a pending hold, so a grant cannot let a write
-   through. Each denial logs one event that names the session, with no repeat
-   suppression; `run` counts them into its record. The `run` preflight that
-   refuses `ask` exposure is only an early warning: the proxy enforces.
-8. **Some authority is not checked by write approval.** Host-service tunnels,
-   mediated OAuth exchanges, and STDIO or loopback MCP servers do not pass
-   write approval. A headless run allows them and lists them in its record
-   (`uncheckedAuthority`).
+```text
+ agent                    proxy                            you (host)
+ GET, fetch   ---->  read:  forward
+ POST, push   ---->  write: hold  ------------------->  runfree approvals --watch
+                            |                           approve / deny
+                            +-- no approver: 403 at once
+                            +-- no decision in time: 403
+```
 
-Details: [Write Approval Grants](architecture.md#write-approval-grants).
+| Write action | What happens to a write |
+| --- | --- |
+| `ask` (the default) | It waits for your decision. |
+| `allow` | It goes out. AI provider hosts in the initial template use `allow`. |
+| `deny` | It is refused. |
+
+You decide:
+
+- Each held write, or a grant for a request, a time, or the session.
+- A deny. It stays until you run `runfree approvals --clear-deny`.
+
+Limits:
+
+- A headless run (`runfree run`) never holds. Its `ask` writes are denied.
+- Host-service tunnels, mediated OAuth exchanges, and STDIO or loopback MCP
+  servers do not pass write approval.
+- An approved write goes out with the real credential.
+
+The rules are in [Write Approval rules](security-rules.md#write-approval)
+(`WRITE-1` to `WRITE-8`).
 
 ### MCP
 
-1. Project entries from `.mcp.json` and `.codex/config.toml` load only after
-   `runfree mcp enable`.
-2. Claude gets a read-only approved config with strict MCP mode. This stops
-   passive project descriptors at startup. It does not stop code already
-   running in the agent from starting another binary or config.
-3. Static headers need a host-owned credential source. An HTTPS MCP endpoint,
-   OAuth metadata URL, and OAuth token endpoint must name a hostname; an entry
-   where any of them names an IP address is skipped. An OAuth metadata URL or
-   token endpoint that is not `https:` is skipped too, because it would send the
-   OAuth exchange outside the proxy's mediation.
-4. HTTPS MCP tool calls follow the write-approval rules (`runfree mcp rules`).
-   STDIO MCP servers and loopback HTTP MCP servers (`http://127.0.0.1:<port>`)
-   do not pass the proxy, so write approval does not apply and `runfree mcp
-   rules` refuses them. A loopback entry carries no credentials or OAuth and
-   adds nothing to policy: a header, helper, or OAuth key skips it. Whether
-   its port reaches the host is decided only by `runfree host-service add`.
-5. No imported MCP descriptor starts a host process. Local STDIO commands run
-   only in the agent container; a host-path command is skipped. Codex Desktop
-   built-ins (`node_repl`, `computer-use`) are skipped and never enter the
-   generated agent config. Only their exact app-bundled commands identify
-   them; any other entry, even one with the same name, keeps the normal STDIO
-   rules.
-6. **Each session owns its OAuth callback path.** When an approved MCP server
-   can use OAuth, every session gets its own loopback port, forwarder, and
-   in-session bridge before it starts. The forwarder is bound to that session
-   and removed before the session's record releases its address, and before
-   an orphan session container that no record claims is removed. The bridge
-   accepts only its forwarder. The port is a routing value, not an
-   authorization secret: the client keeps state, PKCE, and issuer checks.
-7. **`runfree mcp enable` adds OAuth hosts only after one host-side review**,
-   and only when valid metadata names a token endpoint that the proxy then
-   mediates for that server. Discovery of a project-named host runs only
-   after the user agrees on a terminal: plain HTTPS GETs from the host, with
-   no credentials, cookies, proxy, or redirects, to public, checked addresses
-   over a pinned connection, with strict time and size limits. A token
-   endpoint may be on another host than the MCP endpoint and its named
-   authorization servers only when its metadata came from an authorization
-   server that the endpoint's protected-resource metadata named, or from a
-   declared metadata URL; the resource-origin fallback never yields one. A
-   registration endpoint on another host is accepted only on that token
-   endpoint's host, and the proxy matches it by exact path, never as a
-   prefix. The review labels such a host `token endpoint on another host`
-   and says where the tokens go. A token or registration endpoint that the
-   server's metadata names on one of its `--oauth-host` hosts is mediated:
-   discovery records it, and the proxy binds it at run time. Unless something
-   else allows it, a discovered host is limited to GET, HEAD, OPTIONS, and
-   POST on paths under `/.well-known` or its recorded OAuth endpoint paths.
-   The browser sign-in page opens on the host and is never allowlisted. The
-   hosts live in host-owned state, not desired policy, stop applying when the
-   reviewed server config changes, and `runfree mcp revoke` removes exactly
-   them. A damaged record grants nothing.
-8. **An MCP server cannot claim a host where another login's tokens pass.**
-   The same rule runs at `mcp enable`, before any write, and again at every
-   launch. It covers every OAuth host and endpoint a server would use:
-   discovered, given with `--oauth-host`, or declared in its config (a token
-   endpoint key or `authServerMetadataUrl`). The host or endpoint is refused
-   when:
-   - the host is a credential destination;
-   - the host belongs to any curated service, enabled or not (a well-known
-     host such as `github.com`, `api.openai.com`, or
-     `oauth2.googleapis.com`);
-   - another MCP server in the project uses the host: its endpoint host,
-     declared hosts, or recorded OAuth hosts. One server enabled for both
-     agents counts once;
-   - the endpoint equals another OAuth provider's token or registration
-     endpoint, or overlaps a prefix-matched registration endpoint.
+This protects your host and your OAuth tokens from MCP servers that a project
+names. A project MCP entry does nothing until you approve it. The proxy keeps
+real OAuth tokens; the agent gets `runfree_oauth_…` handles.
 
-   The server's own MCP endpoint host is exempt. At enable, a refused
-   `--oauth-host` host or declared endpoint stops the command before any
-   discovery call; a refused endpoint in discovered metadata drops that whole
-   document; and when a well-known host leaves no token endpoint, the command
-   stops and names the static-token path, where the proxy holds the token and
-   injects it. An endpoint that overlaps an approved service OAuth
-   provider's endpoint is refused at review too, and checked again when the
-   effective policy is built, where the service keeps the endpoint. At a
-   launch, a claim that a rule now refuses is dropped with a warning, and its
-   token and registration endpoints become blocked endpoints (rule 9). The
-   proxy holds the same credential and curated host list and checks it, and
-   every other provider's hosts, before it remembers an issuer or endpoint it
-   sees at run time; a refusal writes no state. An endpoint that two
-   providers claim at run time is mediated by neither and is blocked. On a
-   host the user already allows for plain traffic, a claim is allowed: the
-   host keeps its rules, only the exact endpoint is mediated, and the review
-   says the host is `ALREADY ALLOWED`. Plain traffic carries no token reply;
-   the residual is a login the user runs by hand at that exact URL
-   ([Residual Risks](#residual-risks)).
-9. **A token request the proxy does not mediate never leaves for a host only
-   MCP allows.** The proxy checks a request to:
-   - a record-only host: one that only `mcp enable` records allow, and not
-     desired policy, `host add`, a service, or an MCP endpoint;
-   - a blocked endpoint: an exact endpoint that a record or declared config
-     names but that no provider mediates;
-   - an endpoint that more than one provider claims at run time;
-   - any other path on a host that carries a blocked or colliding endpoint,
-     so path variants such as `/oauth/token/` or `/OAuth/token` are caught;
-   - an endpoint host: a host that a record names and that also serves an MCP
-     endpoint, when nothing outside MCP allows it.
+```text
+ .mcp.json / .codex/config.toml
+        |  runfree mcp enable  (one host-side review)
+        v
+ approved MCP record  --->  agent config (read-only)
+        |
+ agent: MCP call, Bearer handle  --->  proxy: handle -> real token  --->  MCP host
+ agent: token request            --->  mediated endpoint? yes: forward
+                                       no, on a guarded host: 403
+                                       oauth-endpoint-not-mediated
+```
 
-   With any method, it refuses a request whose query or body carries
-   `grant_type`, `refresh_token`, `redirect_uris`, or `code` together with
-   `code_verifier`. JSON is scanned at every depth, including top-level
-   arrays, and every body is also read as a form whatever its content type.
-   On record-only hosts and at the exact blocked or colliding endpoint the
-   check also fails closed: it refuses `multipart/form-data`, a body without
-   `Content-Length`, a wire or decoded body over 16 KiB, a content encoding
-   it cannot decode, a declared charset other than UTF-8 or US-ASCII, bytes
-   that are not valid UTF-8, any NUL byte, and a body declared as JSON that
-   does not parse. Elsewhere on a host with a blocked or colliding endpoint
-   the scan is just as deep but does not fail closed, so ordinary traffic is
-   not refused for its size or encoding. On an endpoint host only top-level
-   keys (and each top-level array element's keys) are matched, so MCP
-   JSON-RPC, whose `code` sits under `error`, passes. Where the check does
-   not fail closed, it is hardened instead: invalid UTF-8 is decoded with
-   replacement characters, a body with an unknown, stacked, or broken content
-   encoding is scanned as the raw bytes, and a body not declared as JSON is
-   also read as a form; only a body over 256 KiB is not scanned. A static or
-   run-time-bound endpoint that exactly one server mediates is never refused.
-   The check runs before write classification and the approval hold, so a
-   refused request creates no prompt and no pending record; it also runs
-   before credential injection, any upstream connection, and any OAuth state
-   write. The denial is `oauth-endpoint-not-mediated`. The mediator repeats
-   the check against the current policy just before it forwards. While the
-   OAuth policy is invalid, the last valid record-only hosts keep this rule,
-   and every other allowlisted host refuses a readable grant shape; audited
-   hosts are outside that rule. Replies on record-only hosts are never read,
-   so they stream. On blocked and colliding endpoints the proxy reads every
-   reply, at any status, and blocks one that carries a real token at any
-   depth or that it cannot decode.
+| Server kind | Passes the proxy | Write approval |
+| --- | --- | --- |
+| HTTPS | Yes | Yes (`runfree mcp rules`) |
+| STDIO, in the agent container | No | No |
+| Loopback HTTP (`http://127.0.0.1:<port>`) | No | No; it reaches the host only through `runfree host-service add` |
 
-   The proxy cannot read the reply to a WebSocket upgrade, so it refuses an
-   upgrade, with a 403 and `x-runfree-blocked: oauth-endpoint-not-mediated`,
-   to a record-only host and to any endpoint URL that a provider mediates,
-   blocks, or claims with another provider. It also refuses an upgrade whose
-   query is grant-shaped to an endpoint host or to a host with a blocked or
-   colliding endpoint, and, while the OAuth policy is invalid, to any
-   allowlisted host. The refusal runs before the WebSocket shape rules, so it
-   notes no pending retry approval. The 403 body explains the refusal and
-   gives the same remedy as the HTTPS denial, with a literal `<host>` in
-   place of the host name; the denial event for `runfree doctor` carries the
-   real host.
-10. **Revoke clears the proxy's OAuth state for the server.** It saves a new
-    state epoch for the server (see [MCP Model](architecture.md#mcp-model));
-    the proxy refuses a stale handle at use and blocks, not stores, a token
-    response from an exchange that started before the revoke. With no proxy
-    running, the clear happens at the next start. Revoke says "cleared" only
-    when the running proxy confirmed the exact policy generation. A damaged or
-    missing epoch record clears the OAuth state of every MCP server. A rotated
-    refresh token retires the handle it replaced. Each server keeps at most
-    256 token handles and 32 registration handles, evicting expired access
-    handles first and never the newest refresh handle; past 1024 exchanges in
-    flight, a new one is refused rather than evicting another. One server
-    enabled for Claude and for Codex (same name, source, endpoint, and OAuth
-    settings) shares one login: the proxy mediates its endpoints for one
-    owner, the member enabled first, and only the owner captures metadata at
-    run time. Revoke also clears the other agent's state when it has an
-    entry with the same server name and source; an agent with no such entry
-    keeps its state. When a group first forms from members that may hold
-    handles (including the first launch after an upgrade), and when the
-    owner's entry is gone and ownership moves, every member's state is
-    cleared, with a warning. If the
-    new owner cannot be stored, no member mediates the group's endpoints for
-    that launch: they become blocked endpoints, a warning names the file, and
-    the next launch that can write it settles the owner.
-11. **Protocol reads are exact.** On an `ask` host, a POST is a read, with no
-    approval, only when its exact path (no normalization, query, or encoding)
-    is a token or registration endpoint that `mcp enable` recorded for one
-    server, the proxy mediates it for that server alone, and the body is a
-    plain login, refresh, or loopback-only client registration with no field
-    an issuer may fetch at a URL the agent chose: a URL-valued `client_id`
-    must equal, byte for byte, a pinned agent client metadata URL (Claude
-    Code's or Codex's published document), and no `resource` may name another
-    host. The body must be identity-encoded and declare its length, at most
-    16 KiB. Each server gets at most 30 a minute, counted only for requests that
-    pass every other check. The live `mcp-enable` tranche checks that each
-    pinned client metadata URL appears in the pinned agent binary, so a vendor
-    change fails the gate. A host that receives static credential injection
-    never has protocol reads: the host side drops such an endpoint with a
-    warning when it builds the effective policy, and the proxy checks again
-    against its loaded network policy. Everything else on the host stays a
-    write. A request that selected the unmediated proxy rule while its
-    endpoint became mediated or blocked is refused, so a token never reaches
-    the agent unmediated. This covers the token and registration
-    POSTs only: an authorization GET with a URL `client_id` to an issuer host
-    the project allows broadly (`--oauth-host`, desired policy, or the MCP
-    host itself) is an ordinary read, and an issuer that supports client ID
-    metadata documents may fetch that URL.
+You decide:
+
+- Each server, at `runfree mcp enable`. The review shows its OAuth hosts and
+  where the tokens go.
+- Discovery calls. Runfree contacts a project-named host only after you
+  agree.
+- Each MCP tool call under `ask`.
+- `runfree mcp revoke`. It removes the server's hosts and clears its OAuth
+  state.
+
+Limits:
+
+- No imported descriptor starts a host process. STDIO commands run in the
+  agent container.
+- A server cannot claim a credential host, a curated host, or another
+  server's host.
+- Strict MCP mode stops passive descriptors only. Code that already runs in
+  the agent can start another binary.
+- A login that you run by hand on a broadly allowed host can still return
+  real tokens to the agent ([Residual Risks](#residual-risks)).
+
+The rules are in [MCP rules](security-rules.md#mcp) (`MCP-1` to `MCP-11`).
 
 ### Agent Container
 
-1. The agent runs as uid 1000 with `no-new-privileges`, and `NET_ADMIN` and
-   `NET_RAW` dropped.
-2. **Localhost inside the agent is not a trust boundary.** Dev tools need
-   loopback TCP, so it stays open. A helper in or near the agent namespace
-   must authenticate its callers (capability, nonce, Unix socket permissions).
-   It must never treat "came from 127.0.0.1" as authorization.
-3. Agent CLIs run with their own sandbox off (`--dangerously-skip-permissions`,
-   `--dangerously-bypass-approvals-and-sandbox`). The container is the
-   sandbox, so agent-side permission rules add nothing to it.
-4. **Docker's init is PID 1, not a boundary.** Session containers run with
-   `--init`. The init runs as the same uid 1000 with the same capabilities
-   and `no-new-privileges`, so the agent gains nothing by reaching it. Its
-   bind mount is added by the daemon and is outside the inspection proof. A
-   project image can make PID 1 something else, which costs only the fast
-   stop. Project `TINI_*` variables are honored; none changes identity,
-   capabilities, mounts, or network. Downgrading Runfree while sessions from
-   a newer release are live is not supported: run `runfree destroy --force`
-   first.
-5. The agent trusts the proxy CA through a bundle an ephemeral helper renders
-   into the read-only `/etc/proxy-ca` mount (`SSL_CERT_FILE`,
-   `NODE_EXTRA_CA_CERTS`, and similar point at it), so the agent never needs
-   root to install trust.
+This protects the host from the agent process. The container is the
+sandbox. The agent runs as an ordinary user, with no way to gain privileges.
+
+```text
+ agent CLI (uid 1000, own sandbox off)
+   |  setuid binary          -> no-new-privileges: no gain
+   |  raw socket, change net -> NET_ADMIN, NET_RAW dropped
+   |  reach PID 1            -> same uid 1000: no gain
+   |  trust the proxy CA     -> read-only bundle; no root needed
+   v
+ nothing inside the container is a boundary; the mounts and proxy are
+```
+
+| Agent tries | Result |
+| --- | --- |
+| Gain root through a setuid binary | Fails: `no-new-privileges` |
+| Open a raw socket or change the network | Fails: `NET_ADMIN` and `NET_RAW` dropped |
+| Take over PID 1 | Gains nothing: it runs as the same uid 1000 |
+| Connect to a helper on 127.0.0.1 | Open. The helper must authenticate its callers |
+
+You decide:
+
+- What your project image puts in the container. It can change PID 1, which
+  costs only the fast stop.
+
+Limits:
+
+- Loopback inside the container is open. A helper that trusts 127.0.0.1
+  trusts the agent.
+- Agent CLIs run with their own permission prompts off.
+- A downgrade while sessions from a newer release are live is not supported.
+  Run `runfree destroy --force` first.
+
+The rules are in [Agent Container rules](security-rules.md#agent-container)
+(`AGENT-1` to `AGENT-5`).
 
 ### Host Files
 
-1. Host writes under project paths reject symlinks, hard links, and special
-   files (`safe-fs.ts`).
-2. No host-wide secrets or home config are mounted into the agent.
-   Intended exceptions: per-project agent state, sanitized per-agent config,
-   generated Git identity, dependency volumes, and the read-only inbox.
-3. Host code treats agent-writable state (Codex config, Claude session
-   registry, Codex rollout and session-index files) as hostile input. Which
-   directory it opens is fixed (the Claude registry) or computed only from
-   the host's own session timestamps (a Codex day directory); it never
-   discovers a directory by listing `sessions/` or any year or month
-   directory. Inside every directory it does open, every entry, whether or
-   not its name matches, counts against an entry budget and a time limit;
-   entries that match are opened without following links or blocking, and
-   count against file and byte budgets. Rows built from it (a
-   Claude-registry name, a Codex time-matched thread) are sanitized, labeled
-   ("Claude reported", "Codex match"), and never the resume prompt's default
-   row or its one-question path.
-4. Terminal identifiers used to match a resumable session to the terminal
-   that started it (`TERM_SESSION_ID`, `ITERM_SESSION_ID`, `TMUX_PANE`, and
-   similar) are captured only from the host launcher's own environment. They
-   are never forwarded into a session container's environment.
-5. A headless run (`runfree run`) writes nothing into the project tree,
-   because a host write into the agent's tree can be raced. It reads the
-   prompt file with a size bound, without following a symlink or opening a
-   special file, and copies it only into the read-only inbox, which it
-   deletes at the end. Its run record and run lock live in the project's
-   host state directory, which no session mounts. The agent's output is
-   hostile input: it is parsed with line and size bounds, and a malformed
-   stream gives an unverified result, never a success. A headless session
-   records no host terminal identity, and `runfree resume` never offers its
-   conversation.
+This protects files on your host. The agent sees only the project and a few
+named mounts. Host code treats every file that the agent can write as
+hostile.
+
+```text
+ host                                  session container
+ project tree  <---- read-write ---->  /workspace
+ .runfree/     host writes: no links, no special files
+ ~/.ssh, ~/.aws, home config   X       not mounted
+ agent state   <---- read as hostile input, with budgets
+ headless run prompt  ------------->   read-only inbox
+```
+
+| Mounted into the agent | Not mounted |
+| --- | --- |
+| The project, read-write | Host-wide secrets |
+| Per-project agent state and sanitized per-agent config | Home config, such as `~/.ssh` or `~/.aws` |
+| Generated Git identity | Host terminal identifiers (never forwarded) |
+| Dependency volumes and the read-only inbox | The host state directory of `runfree run` |
+
+Limits:
+
+- The agent can read and change the whole project, including `.git`.
+- Resume rows built from agent-written files are labeled "Claude reported"
+  or "Codex match". They are never the default choice.
+- The result of a headless run with malformed agent output is unverified,
+  never a success.
+
+The rules are in [Host Files rules](security-rules.md#host-files)
+(`FILE-1` to `FILE-5`).
 
 ### Lifecycle
 
-1. Every refusal names its recovery command: `runfree up` to retry,
-   `runfree destroy --force` to reset the project.
-2. A Docker call that times out never counts as success. An empty listing
-   after a timeout does not prove absence.
-3. Cleanup and teardown remove containers and images only by exact inspected
-   ID with proven ownership labels. Names find candidates; they authorize
-   nothing.
-   - `rebuild` and `destroy` revoke first and release last: records become
-     revoking, the session files leave the still-running proxy, then the
-     proxy, session containers, and Compose resources go, and only then the
-     runtime selection, pending rebind, and records. A session's file always
-     leaves the proxy before the record that reserves its address. Each step
-     is durable before the next, so an interrupted run resumes.
-   - Forced `destroy` skips the strict utility-ownership check, so malformed
-     utility leftovers cannot block its sweep of project-labeled containers,
-     but it still removes only the exact Docker IDs it found. Leftover session
-     volumes go only when they carry this project's exact label and name,
-     never forced. The ingress bridge goes only if it carries Runfree's
-     ownership labels, its full network ID is exact, and Docker proves it has
-     no endpoints.
-   - Ingress forwarder teardown needs this project's exact project label, the
-     expected role label, an inspected image ID equal to Docker's resolved ID
-     for the pinned ingress image, and removal by the inspected full container
-     ID. A foreign-labeled bridge lookalike is refused with no Docker
-     mutation, and partial or conflicting labels are always refused. A new
-     bridge is inspected for its full local-bridge shape before a listener
-     starts, and every endpoint is validated before a forwarder or the bridge
-     is removed.
-4. `runfree stop` and `runtime reload-policy` need `--force` while live or
-   unknown sessions, a pending rebind, or an interrupted teardown exist. A
-   reload of the same proxy container republishes eligibility and re-proves
-   every surviving session; when no record can still hold authority, it
-   proves the firewall's session set empty from the live kernel set before
-   reporting success.
-5. A start finishes an interrupted teardown only on Docker's proof: the owner
-   is dead, the session container is absent or stopped, and no proxy can
-   serve the session file. The record goes only after Docker proves the
-   container absent. Anything Docker cannot prove keeps the record and refuses
-   with the reason and its remedy. Plain `destroy`'s record scan skips
-   records with a terminal status stamp (interrupted teardowns);
-   `destroy --force` reclaims one whose owner cannot be proved dead.
-6. Every Docker call a launch started settles before cleanup or lock release.
-   When one step fails while another, such as the callback reservation, is
-   still running, the launch waits for it under the lifecycle lock before it
-   removes anything or releases the lock.
-7. **Lock holds are bounded.** Other commands wait up to one minute for the
-   lifecycle lock. A launch plans its continuous hold at 50 s or less,
-   including a wait of at most 10 s for the session entry to hand off to the
-   agent. Fault paths (the IP fence, a slow first session-file write, cleanup
-   after a failed admission, or a hung Docker call) can run past the minute;
-   a waiting command then defers with a retry instruction, and nothing is
-   admitted or removed on its behalf. If the handoff wait ends first, a proxy
-   replacement can land before the agent starts, and the entry falls back to
-   its own timeout. Startup and explicit reload bound held subprocess work to
-   90 s per lock span (shared with heartbeat adoption) and refuse lock
-   acquisition after about 60 s. These are refusal limits, not restoration
-   guarantees: host suspension and filesystem stalls can exceed them.
-   Heartbeat adoption's lock-priority tickets grant no lease and no lock
-   ownership; a clock change cannot discard a live or unknown requester's
-   priority, and an aged ticket is reclaimed automatically only on proved
-   requester death.
-8. **A session that is never activated stops itself.** If the session entry
-   does not see the proxy report the session active within 60 s, it exits
-   111; the launch exits 111 and normal teardown removes the session.
-9. **The short teardown after a normal exit needs exact proof.** After the
-   agent exits with a code, the owner skips the network disconnect and stop
-   only when one inspection shows the same container and start time, exited
-   with that code, not restarting or paused, with restart policy `no`. Any
-   other answer, and every reconcile, runs the full revoke.
-10. **A deferred credential sync removes nothing.** When a launch's locked
-    credential sync defers (stale or changed preparation, busy lock, proxy not
-    ready, failed write, or spent allowance), it removes no proxy credential
-    and writes no receipt; the ordinary sync runs after the lock is released.
-    If neither the session-file delete nor the terminal stamp succeeds, the
-    record is marked revoking, so peers never read it as a live session.
-11. **Proxy recovery is bounded and checked.** Compatible-replacement
-    recovery shares one project-wide allowance of 120 s and at most two proxy
-    creations, which ordinary launches cannot reset
-    (`runtime recover --retry` grants a new one). A stopped owned candidate is
-    removed only after exact inspection. Candidate creation checks the
-    retained network, the CA certificate and key identity, and the exact
-    project OAuth volume before mounting them into the approved proxy image.
-    Containment refuses a container whose ID looks right but lacks this
-    project's id, container-role, and Compose project and service labels.
-12. **Ephemeral helpers are bounded.** Helpers run with `--pull never`; the
-    Docker client is killed at 30 s for the deny probes and 120 s for other
-    helpers, or earlier if the lifecycle budget is shorter. The helper sweep
-    runs under the lock, bounded at about 15 s plus up to 2 s for the last
-    listing. A listing that fails or times out never counts as empty, and an
-    unconfirmed sweep refuses, naming `runfree up` and
-    `runfree destroy --force`. See
-    [Ephemeral Helpers](architecture.md#ephemeral-helpers).
+This protects you from leftover authority. A crash, a timeout, or a
+concurrent command must not leave a session that can still reach the proxy.
+Cleanup must not delete anything that Runfree does not own.
+
+```text
+ start ---> lock ---> launch ---> agent runs ---> agent exits ---> teardown
+              |          |                                           |
+        bounded wait   active within 60 s,            revoke first, release last;
+        (1 minute)     or exit 111                    remove only exact inspected IDs
+```
+
+| Situation | What Runfree does |
+| --- | --- |
+| A Docker call times out | Never counts as success. An empty listing does not prove absence |
+| A teardown was interrupted | The next start finishes it only on Docker's proof |
+| A command waits too long for the lock | It defers with a retry instruction. Nothing is done on its behalf |
+| Runfree cannot prove a state | It refuses and names `runfree up` or `runfree destroy --force` |
+
+You decide:
+
+- `runfree stop --force` or `runtime reload-policy --force` while sessions
+  are live or unknown.
+- `runfree destroy --force` to reset the project when Runfree cannot prove
+  that a session owner is dead.
+
+Limits:
+
+- The lock limits are refusal limits, not restoration guarantees. Host
+  suspension and filesystem stalls can exceed them.
+- Names find cleanup candidates but authorize nothing. A container with
+  partial or conflicting labels is refused, and it can need manual action.
+
+The rules are in [Lifecycle rules](security-rules.md#lifecycle) (`LIFE-1` to
+`LIFE-12`).
 
 ## What Runfree Does Not Prove
 
-These are limits of the checks Runfree runs at launch. The limits of the test
-suite are in [testing.md](testing.md#proof-limits).
+These are limits of the checks that Runfree runs at launch. The limits of the
+test suite are in [testing.md](testing.md#proof-limits).
 
-- **Nothing from inside the container.** Session shape is proven by host-side
-  `docker inspect` only. That shows what the daemon created, not what the
-  process does.
-- **Agent-position egress on every launch.** A warm launch whose warm-proof
-  fingerprint matches does not re-run the agent-position deny probes, the
-  server-UID denial probes, or the root DNS probe, and beside live peer
-  sessions no probe runs per peer; it binds the skipped proof to the proxy
-  instance, networks, images, ruleset shape, daemon, and VM boot. A
-  fingerprint is recorded only when the following reconcile found nothing to
-  repair, any restore of surviving sessions finished, the proxy did not
-  restart, and no ephemeral helper is attached; `stop`, `destroy`, and
-  `rebuild` delete it. A warm proof older than 24 hours never matches, and a
-  Docker daemon with live-restore enabled always validates fully.
-  `runfree up` always runs every probe.
-- **Audit set emptiness** in enforce mode is checked only by the proxy's own
-  firewall supervisor. The host proof checks set shape, not members.
+- **Nothing from inside the container.** Runfree checks session shape only
+  with host-side `docker inspect`. That shows what the daemon created. It
+  does not show what the process does.
+- **Agent-position egress on every launch.** A warm launch skips some probes
+  when its warm-proof fingerprint matches:
+  - It does not run the agent-position deny probes, the server-UID denial
+    probes, or the root DNS probe.
+  - Beside live peer sessions, no probe runs for each peer.
+  - The skipped proof is bound to the proxy instance, networks, images,
+    ruleset shape, daemon, and VM boot.
+- **When a fingerprint is recorded.** Runfree records a fingerprint only when
+  all of these are true:
+  - The next reconcile found nothing to repair.
+  - Any restore of surviving sessions finished.
+  - The proxy did not restart.
+  - No ephemeral helper is attached.
+- **When a fingerprint stops matching.** `stop`, `destroy`, and `rebuild`
+  delete it. A warm proof older than 24 hours never matches. A Docker daemon
+  with live-restore on always validates fully. `runfree up` always runs every
+  probe.
+- **Audit set emptiness.** In enforce mode, only the proxy's own firewall
+  supervisor checks that the audit set is empty. The host proof checks the
+  set's shape, not its members.
 
 ## Residual Risks
 
-- **The OAuth callback page reaches the host browser.** An eligible session
-  answers its own callback URL, and the operator's browser renders that answer
-  on `localhost`. A compromised session can use the page to send data out
-  through the browser, or to reach other localhost services with same-site
-  requests. This is the same channel `runfree forward` and `runfree vnc` open,
-  but it exists in every eligible session. Open callback URLs only for logins
-  you started.
-- **A callback forwarder that dies mid-session frees its address.** The
-  forwarder's `agent_internal` address is dynamic. If the forwarder exits while
-  its session runs, that address can go to a later session, which then passes
-  the bridge's peer check. It can only reach the first session's loopback
-  callback listener, which still checks OAuth state. The host port is also
-  freed and could be taken by another project; PKCE stops the code from being
-  redeemed there.
-- **Two state roots on one project path share one runtime.** The project id
-  and the Compose project come from the project path, so two state roots for
-  one path (for example `scripts/dev-runfree.sh` without a scratch
-  `--workspace`) share one proxy, one network, and one project id, but each
-  has its own lifecycle registry and lock. Either root's reconcile can remove
-  the other's session files and containers. A warm-empty skip refuses while
-  the other root has a session file in the proxy, a session container, or a
-  session on `agent_internal`; it cannot see the other root's records.
-- **A loopback MCP server reached through a host service runs on the host.**
-  When an approved host service holds the port of a loopback HTTP MCP entry,
-  the agent's tool calls run in that host process, outside the sandbox, and
-  no write approval applies. Reach is evaluated at each launch and review,
-  not pinned by the MCP approval digest: a later `runfree host-service add` on
-  the same port makes an approved, container-local entry reach the host. An
-  OAuth flow that a loopback server advertises at run time is not mediated;
-  its tokens land in the agent's own state.
+These are the 10 known risks with the most impact, worst first.
 
-Accepted, known risks:
-
-| Risk | Why it remains |
-| --- | --- |
-| Allowed hosts can be misused within their token scope | Runfree checks host, method, and path, not intent. Use narrow tokens first |
-| A permitted GET can carry data out in its query | Shape rules limit which requests pass, not their content |
-| `gitPush: "deny"` blocks only the git push endpoint | Pushes can still go through the provider's REST/GraphQL API; add method rules there |
-| A git credential reaches every repository its token can access | Use fine-grained tokens and keep pushes under `ask` ([Git rule 1](#git-over-https)) |
-| An agent `Basic` value with a handle-shaped password passes the `Authorization` strip | It is the agent's own value; no token is injected (Git rule 4) |
-| Git LFS action credentials from a host with a `git-lfs` destination reach the agent without approval | Provider-issued, not the stored token; Runfree does not limit their scope or lifetime. A service whose provider issues push-capable batch credentials gets no `git-lfs` destination (Git rule 6) |
-| A user-defined git host has no git handling rule | Fetches and LFS batches there are writes and wait under `ask`; a push is a plain write, not a git push |
-| The agent can read and change the whole project, including `.git` | The project mount is read-write by design |
-| Native Claude, Codex, and Pi login state is readable by agent code | Agents need it to log in; it is per project |
-| Credentialless operational services (`agent-claude`, `agent-codex`) are open to any process in the agent | The user confirms them at launch; they carry no proxy credential |
-| Project image builds run before the sandbox exists | The build uses host Docker networking; review Dockerfiles and wide contexts (`runfree image approve-context`) |
-| `mcp enable` discovery tells the named host that you ran it (your IP and the time) | It asks first for project entries and sends no credentials; `--no-discover` makes no call |
-| A host that desired policy or `host add` allows broadly can serve a token endpoint that no MCP record names; a login there is not mediated and returns real tokens to the agent | The user allowed the host outside MCP. The grant check ([MCP](#mcp) rule 9) covers only hosts only MCP allows and blocked endpoints. A token endpoint that a server's metadata names is recorded and mediated even on such a host |
-| On a broadly allowed host, a path variant of a mediated endpoint (for example `/oauth/token/` beside `/oauth/token`) takes the plain proxy rule, and a login there returns real tokens to the agent | The same class as the row above: the host-wide scan covers only hosts with a blocked or colliding endpoint, and hosts only MCP allows |
-| An `--oauth-host` host is allowed like `host add`; the proxy mediates a token endpoint there only when the server's own metadata names it | While only MCP records allow the host, the proxy refuses a grant- or registration-shaped request to any other endpoint on it before it connects upstream, and a body it cannot check. Once desired policy or `host add` also allows it, the two rows above apply |
-| A request rule path prefix on a discovered host also admits sub-paths the proxy does not mediate (for example `/oauth/token/`) | Discovered hosts get exact-endpoint rules; a sub-path or an unrecorded endpoint follows write approval, and a grant-shaped request there is refused while only MCP records allow the host |
-| A `/.well-known` GET with any query reaches a host that serves a token endpoint for another host's MCP server | Discovered hosts allow GET under `/.well-known`; it is the same channel out as on other discovered hosts ([Network](#network)) |
-| A later `host add` or desired-policy entry widens a host that an MCP server claims, with no new warning | The claim stays and only its exact endpoint is mediated; the warning was shown at `mcp enable` |
-| On a broadly allowed host that is not curated, an approved hostile MCP server can claim the exact URL of a login the user runs by hand there; that login then gets a handle, not a token, and the handle works at the claiming server's MCP host | The review says the host is `ALREADY ALLOWED` and asks to approve only if the address belongs to the same service. Curated hosts, credential destinations, and other providers' endpoints are refused |
-| A recorded token endpoint on a shared login host that is not curated (for example a Microsoft Entra or Okta tenant) captures every other login at that exact URL in the sandbox | The review prints `other apps that log in at <url> will stop working in the sandbox`; curated hosts are refused |
-| At run time the proxy files captured metadata under the first server it matches. A hostile approved server that binds an issuer first can capture another, unrecorded server's logins at an issuer host the user allows broadly | The same class as the hand-run login row above. Recording the other server with `mcp enable` makes its endpoints static, and a claim by two servers is blocked |
-| Revoking the agent that does not own a shared login does not stop that agent logging in through the owner's endpoint | The endpoint belongs to the shared server, which the other agent still uses; revoke the server for both agents to remove it |
-| If another agent's entry with the same server name is removed from its config between the last launch and a revoke, that revoke does not clear the other agent's state, and handles it minted stay redeemable at the same MCP host until the next launch | Low. The window ends at the next launch, which rebuilds the OAuth mediation policy without that entry |
-| The grant check matches the standard OAuth fields only: an agent can send a grant in a non-standard shape (a renamed field) that an issuer still accepts, and its reply reaches the agent | The agent holds the authorization code and the PKCE verifier, so it chooses the request shape |
-| On an endpoint host (a host a record names that also serves an MCP endpoint), and on the other paths of a host with a blocked or colliding endpoint, a body over 256 KiB passes the grant check unscanned | Ordinary traffic there can be large, so these scans do not fail closed; smaller bodies are scanned even when they do not decode cleanly, and an endpoint host matches only top-level keys |
-| Login, refresh, and client registration at a recorded, mediated endpoint run without approval | The issuer was reviewed at `mcp enable`; bodies are limited to the protocol's own fields and 16 KiB, responses become handles, and each server gets 30 a minute. The agent can still register a client with a loopback redirect or send its own authorization code |
-| Audit mode allows non-listed hosts for a time window | It is explicit (`up --audit-network`) and never edits policy |
-| While the OAuth mediation policy is invalid, audited hosts do not refuse grant-shaped requests | Audited hosts are outside policy, so none of them is record-only; allowlisted hosts keep the refusal |
-| Audited WSS upgrades pass configured credential headers as-is | The WebSocket passthrough cannot rewrite upgrade headers; enforce mode is not affected |
-| Checkout binding cannot tell apart volumes mounted at the same path | It is a scope key, not an authority; see [Checkout Binding](architecture.md#checkout-binding) |
-| A helper container can be created after the CLI dies | After a killed Docker client the helper marker is kept for 180 s and every lock holder in that window sweeps again, but an orphaned `docker run` client of a dead CLI has no timeout and can start the helper later. The firewall drops that unadmitted source, and a later deny probe that needs its address fails closed. A wall-clock jump can end the window early; `destroy` clears the marker, and a container created after that needs `runfree destroy --force` |
-| A concurrent helper sweep can fail another CLI's in-progress build | A project Dockerfile can put the helper labels on legacy-builder intermediate containers; BuildKit, the default, creates none |
-| Helper cleanup selects containers by label | Only a Docker-socket holder can mint the labels; the agent has none |
-| A same-host writer can mint Runfree labels on a pinned-image container | That needs Docker socket access; the Docker daemon is trusted |
-| Content served through `runfree forward` renders in the user's unsandboxed browser, outside the proxy | Treat it as untrusted agent output |
-| VNC viewers parse display data from the agent | Use a maintained viewer and the default random password |
-| Transitive apt packages in runtime images can drift | The runtime inputs lock pins base images by digest, exact direct apt package versions, and release artifact checksums (a missing or malformed lock fails before any build), but the apt sources are live archives |
-| Homebrew installs trust the tap formula and release assets | Use fully qualified installs; check checksums for script installs |
-| A host-service tunnel is opaque | No content audit, request rules, or write approval apply inside it; approve only services you would let the agent use freely |
-| An approved host service's own authentication and bugs are reachable from the agent | Every session in the project gets whatever the approved service allows its clients to do, for example full read and write on a local database or full control of a device bridge |
-| Host-service access is per project, not per session | Approval persists like an allowed host and applies to every session of the project |
-| Whatever holds an approved port on the host's loopback is reachable | If the approved service stops and another process takes the port, the agent reaches that process. The gateway reaches every host loopback listener, including root services, IDE servers, and other containers' published ports; the refused ports and the owner check at approval cover only the known dangerous cases. A root-owned listener is invisible to the unprivileged `lsof`, so it is refused only as "no visible listener", never identified |
-| A publication that appears on an approved port mid-session stays reachable; the next launch or `runfree status` only warns | Another project's `forward` and `vnc` refuse registered ports. A third-party publication on an approved port is reported by the next launch or `runfree status` owner check, which warns but neither refuses nor cuts |
-| A host gateway address change, or a withdrawn gateway, stops host services until `runfree rebuild` | Both consumers cut at once ([Network](#network) rule 6); new CONNECTs refuse with the named cause; `runfree rebuild` re-pins and drains every session |
-| The permanent firewall cut covers only gateways pinned by the running supervisor | The pinned set is in memory; a proxy restart forgets it but also recreates the whole table, so no earlier flow survives |
-| Host-service splices have no idle timeout | Both legs use TCP keepalive, so a dead peer is found, but an idle open splice stays open until either side or a removal closes it |
-| Two `runfree mcp revoke` runs at the same moment, with no proxy running, can lose one clear | The epoch store has no lock; run that revoke again |
-| New host-service CONNECTs refuse for about 2 s after any policy reload | The request proxy dials only when the gateway file names its current effective policy generation; until the supervisor republishes the file on its next maintenance pass, a new CONNECT refuses with `host-service-unavailable`. Open splices are not affected |
+| Risk | Worst case | You can |
+| --- | --- | --- |
+| An approved push goes out with your real token, and the token reaches every repository it can access. | The agent changes any repository the token reaches. | Use fine-grained tokens. Keep pushes under `ask`, or use `--deny-git-push`. |
+| An allowed host gets what the agent sends. Runfree checks host, method, and path, not intent or content. | The agent does anything the token allows there. Data leaves, for example in a permitted `GET` query. | Use narrow tokens. Allow only the hosts that the work needs. Add method and path rules. |
+| A host-service tunnel is opaque, and it reaches whatever holds the approved port on your loopback. | The agent uses the host service freely, or reaches a process that took over the port. | Approve only services that you would let the agent use freely. When you stop a service, remove its approval with `runfree host-service remove <name>`. |
+| A loopback MCP entry reaches a host process when a host service holds its port, even one that you add later. | The agent's tool calls run outside the sandbox, with no write approval. | Before you approve, read the reach that `runfree mcp explain` shows. Review host-service ports before you add them. |
+| The OAuth callback page renders in your browser on `localhost`. | A compromised session sends data out through your browser, or reaches other localhost services. | Open callback URLs only for logins that you started. |
+| A login on a broadly allowed host is not mediated when no MCP record names its token endpoint. | Real OAuth tokens reach the agent. | Keep OAuth hosts MCP-only. Allow broad hosts only on purpose. Record MCP servers with `runfree mcp enable`. |
+| An approved hostile MCP server claims another login at a broadly allowed issuer that is not curated. | That login gets a handle that works at the hostile server's MCP host. | Approve an `ALREADY ALLOWED` claim only if the address belongs to the same service. |
+| `--deny-git-push` blocks only the git push endpoint. | The agent pushes through the provider's REST or GraphQL API. | Add method rules on the API host. |
+| Content from `runfree forward` and VNC reaches your unsandboxed browser or viewer. | Hostile agent output runs in your browser or viewer. | Treat it as untrusted. Use a maintained viewer and the default random password. |
+| Audit mode allows hosts that are not on the list, for a time window. | The agent reaches any host during the window. | Use `up --audit-network` only on purpose. |
 
 Approving a write, allowing a broad host, or adding a credential gives the
 agent real power upstream. Treat each one as a security decision.
+
+All risks, grouped by topic, are in [security-rules.md](security-rules.md#residual-risks).
 
 ## Platform Status
 

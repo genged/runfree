@@ -142,10 +142,13 @@ refusal that names the remedy, and an entry in the release notes.
 
 ## Documentation
 
-[`docs/architecture.md`](docs/architecture.md) and
-[`docs/security.md`](docs/security.md) are authoritative. Read the relevant one
-before changing runtime, proxy, network, mount, credential, or sandbox
+[`docs/architecture.md`](docs/architecture.md),
+[`docs/security.md`](docs/security.md), and
+[`docs/security-rules.md`](docs/security-rules.md) are authoritative. Read the
+relevant one before changing runtime, proxy, network, mount, credential, or sandbox
 behavior — the intended flow is not the same thing as the trust boundary.
+A change must not break a rule in `docs/security-rules.md`; cite its ID (for
+example `NET-1`) in the pull request when a change touches one.
 
 [`docs/writing-docs.md`](docs/writing-docs.md) says which page owns which
 topic and how to write for it. A user-visible change updates its owning page in
