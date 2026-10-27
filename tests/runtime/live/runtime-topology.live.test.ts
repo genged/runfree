@@ -473,7 +473,15 @@ describe("runtime topology and capability floor on real Docker", () => {
       expect(mounted.status, `${target} is not a mount point: ${describeOutput(mounted.output)}`).toBe(0);
     }
     const probes = [`${AGENT_HOME}/.local/share/pnpm/.tools/runfree-probe`, `${AGENT_HOME}/.pi/runfree-probe`];
-    const write = containerExec(sessionId, ["sh", "-c", 'mkdir -p "$1" && mkdir "$2" && rmdir "$1" "$2"', "sh", ...probes], user);
+    // `.tools` itself is created by this probe (pnpm hasn't claimed it yet), so
+    // clean it up too; the trailing `|| true` tolerates pnpm having already
+    // populated `.tools` by the time this runs, since the directory is shared
+    // by the standing session.
+    const write = containerExec(
+      sessionId,
+      ["sh", "-c", 'mkdir -p "$1" && mkdir "$2" && rmdir "$1" "$2" && { rmdir "$(dirname "$1")" 2>/dev/null || true; }', "sh", ...probes],
+      user,
+    );
     expect(write.status, `agent cannot create XDG data dirs: ${describeOutput(write.output)}`).toBe(0);
   }, TEST_TIMEOUT_MS);
 
