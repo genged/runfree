@@ -177,12 +177,17 @@ export function runtimeAssetMode(relativePath: string): number {
   return descriptor.executable === true ? RUNTIME_ASSET_EXECUTABLE_MODE : RUNTIME_ASSET_REGULAR_MODE;
 }
 
-function logicalDockerfileLines(dockerfile: string): string[] {
+export function logicalDockerfileLines(dockerfile: string): string[] {
   const logical: string[] = [];
   let pending = "";
   for (const rawLine of dockerfile.split(/\r?\n/)) {
     const line = rawLine.trim();
-    if (pending === "" && (line === "" || line.startsWith("#"))) continue;
+    // BuildKit drops a bare comment line before joining a continuation
+    // (comments do not support their own continuation), so a comment is
+    // skipped whether or not an instruction is still open; a blank line is
+    // only skipped between instructions, not inside one.
+    if (line.startsWith("#")) continue;
+    if (pending === "" && line === "") continue;
     const continued = line.endsWith("\\");
     const segment = continued ? line.slice(0, -1).trimEnd() : line;
     pending = pending === "" ? segment : `${pending} ${segment}`;

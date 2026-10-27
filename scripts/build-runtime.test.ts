@@ -10,6 +10,7 @@ import {
   assertRuntimeAssetDescriptors,
   expectedRuntimeAssetPaths,
   isDirectEntrypoint,
+  logicalDockerfileLines,
   RUNTIME_ASSET_DESCRIPTORS,
   RUNTIME_ASSET_EXECUTABLE_MODE,
   RUNTIME_ASSET_REGULAR_MODE,
@@ -150,6 +151,25 @@ describe("runtime bundle build", () => {
       "RUN curl https://example.invalid/tool\n",
       "agent-image",
     )).toThrow("unlocked external URL");
+  });
+
+  test("drops a comment line inside a continuation like BuildKit", () => {
+    const dockerfile = [
+      "RUN echo hello \\",
+      "# this is a comment",
+      "&& echo world",
+    ].join("\n");
+    expect(logicalDockerfileLines(dockerfile)).toEqual(["RUN echo hello && echo world"]);
+  });
+
+  test("still treats an ordinary top-level comment as its own skipped line", () => {
+    const dockerfile = [
+      "# a comment between instructions",
+      "RUN echo hello",
+      "# another comment",
+      "RUN echo world",
+    ].join("\n");
+    expect(logicalDockerfileLines(dockerfile)).toEqual(["RUN echo hello", "RUN echo world"]);
   });
 
   test("entrypoint detection handles URL-encoded checkout paths", () => {
