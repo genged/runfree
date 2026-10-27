@@ -161,12 +161,13 @@ decide the result:
 | Agent | Mode Runfree adds | Final success |
 | --- | --- | --- |
 | `claude` | `-p --output-format stream-json --verbose` | the last `result` event has subtype `success` and `is_error: false` |
-| `codex` | `exec --json -` | a `turn.completed` event, and no `turn.failed` or `error` event |
+| `codex` | `exec --json -` | a `turn.completed` event, no `turn.failed` event, and no `error` event after the last `turn.completed` |
 | `pi` | `--mode json -p` | the last `agent_end` event is not retried, and its last assistant message has stop reason `stop` |
 
 Pi in JSON mode exits 0 even when its model request failed, so a Pi run with a
 failed request ends unverified (1), not as success. Codex reports a reconnect
-it recovered from as an `error` event, so such a run also ends unverified.
+it recovered from as an `error` event; a `turn.completed` after it still counts
+as success.
 
 | Option | Use |
 | --- | --- |

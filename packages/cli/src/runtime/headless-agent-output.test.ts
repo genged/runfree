@@ -322,12 +322,24 @@ describe("codex exec --json parser", () => {
   test.each([
     ["turn.failed after turn.completed", [CODEX_AGENT_MESSAGE, CODEX_TURN_COMPLETED, { type: "turn.failed", error: { message: "x" } }]],
     ["turn.failed before turn.completed", [{ type: "turn.failed", error: { message: "x" } }, CODEX_AGENT_MESSAGE, CODEX_TURN_COMPLETED]],
-    ["an error event before turn.completed", [{ type: "error", message: "Reconnecting... 2/5" }, CODEX_AGENT_MESSAGE, CODEX_TURN_COMPLETED]],
+    ["an error event after the last turn.completed", [CODEX_AGENT_MESSAGE, CODEX_TURN_COMPLETED, { type: "error", message: "stream lost" }]],
     ["no turn.completed", [CODEX_AGENT_MESSAGE]],
     ["a turn.completed spelled differently", [CODEX_AGENT_MESSAGE, { ...CODEX_TURN_COMPLETED, type: "turn.complete" }]],
     ["only a Claude result event", [{ type: "result", subtype: "success", is_error: false, result: "x" }]],
   ])("%s is not a final success", (_label, events) => {
     expect(parseAs("codex-exec-json", jsonLines([...CODEX_THREAD_START, ...events])).finalSuccess).toBe(false);
+  });
+
+  test("a recovered reconnect error followed by turn.completed is a success", () => {
+    const result = parseAs("codex-exec-json", jsonLines([
+      ...CODEX_THREAD_START,
+      { type: "error", message: "Reconnecting... 2/5" },
+      CODEX_AGENT_MESSAGE,
+      CODEX_TURN_COMPLETED,
+    ]));
+    expect(result.finalSuccess).toBe(true);
+    expect(decideHeadlessOutcome({ agentStatus: 0, streamsDrained: true, parser: result }))
+      .toEqual({ outcome: "success", exitCode: 0 });
   });
 
   test("an error item is not the final message, and the last agent message wins", () => {

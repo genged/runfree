@@ -55,12 +55,14 @@ export type HeadlessOutputParser = Readonly<{
 /**
  * Codex `exec --json` events (plan Task 15; event names recorded from the
  * pinned 0.156.1 run offline, field names pinned by the agent-tool contract,
- * plan Task 16). A run is a success only when a `turn.completed` arrives and
- * no `turn.failed` or top-level `error` event appears anywhere in the stream.
- * The final message is the `text` of the last completed `agent_message` item.
+ * plan Task 16). A run is a success only when a `turn.completed` arrives, no
+ * `turn.failed` appears anywhere, and no top-level `error` follows the last
+ * `turn.completed`. The final message is the `text` of the last completed
+ * `agent_message` item.
  *
  * Codex also emits `error` for a transient reconnect ("Reconnecting... 2/5")
- * it later recovers from; such a run counts as `unverified`, never success.
+ * it later recovers from; a `turn.completed` after it is a success
+ * (maintainer decision, 2026-10-27).
  */
 export const CODEX_EXEC_JSON_EVENTS = Object.freeze({
   typeField: "type",
@@ -137,18 +139,26 @@ function claudeTracker(): FinalEventTracker {
 
 function codexTracker(): FinalEventTracker {
   const names = CODEX_EXEC_JSON_EVENTS;
+  // `turn.failed` anywhere is final. An `error` counts only when no later
+  // `turn.completed` follows it, so a recovered reconnect is still a success.
   let completed = false;
-  let failed = false;
+  let turnFailed = false;
+  let errorAfterCompleted = false;
   let message: string | undefined;
   return {
     observe(event) {
       const type = event[names.typeField];
-      if (type === names.turnFailedType || type === names.errorType) {
-        failed = true;
+      if (type === names.turnFailedType) {
+        turnFailed = true;
+        return true;
+      }
+      if (type === names.errorType) {
+        errorAfterCompleted = true;
         return true;
       }
       if (type === names.turnCompletedType) {
         completed = true;
+        errorAfterCompleted = false;
         return true;
       }
       if (type === names.itemCompletedType) {
@@ -161,6 +171,7 @@ function codexTracker(): FinalEventTracker {
       return false;
     },
     final() {
+      const failed = turnFailed || errorAfterCompleted;
       if (!completed && !failed) return undefined;
       const success = completed && !failed;
       return message === undefined ? { success } : { success, message };
