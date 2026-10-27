@@ -198,6 +198,28 @@ runfree host rules <host> --clear
 
 `--read-only` is shorthand for `GET`, `HEAD`, and `OPTIONS`. `host rules --write` sets the action for write-class requests to that host.
 
+Some APIs send reads as `POST`, such as a query endpoint. To keep such an API
+read-only without an approval prompt per request, allow only `GET` and `POST`
+under the API paths, and let those requests through:
+
+```bash
+runfree host rules api.example.com --method GET --method POST \
+  --request-path-prefix /v1 --write allow
+```
+
+Use this only when every `POST` under the prefixes is a read. The proxy
+refuses every other method on the host, and on a method-ruled host it strips
+the `X-HTTP-Method-Override`, `X-HTTP-Method`, and `X-Method-Override`
+headers. A prefix matches the path itself or a path below it, so `/v1batch` is
+outside `/v1`. Keep an endpoint whose body carries other requests, such as a
+`/batch` endpoint, outside the prefixes: its inner requests use the outer
+credential. The proxy does not strip a method override in the query string or
+the body, so also bind a read-only credential where the provider offers one.
+On a host with path prefixes the proxy refuses an encoded `/` (`%2F`) in the
+path, so an endpoint that puts an encoded identifier containing `/` in the
+path is refused under such a rule. `runfree service explain <id>` lists a
+service's own setup steps.
+
 `host add` and `host rules` with request-rule flags change only the fields
 those flags set. The other fields of the host's rule stay. A field you give
 again replaces that field: a new `--method` list replaces the old list.
@@ -409,8 +431,9 @@ runfree credential source remove github-cli
 Everything after `--` in `credential source add <name> -- <command>` is source command argv, not Runfree options.
 
 A `google-service-account` source signs a Google self-signed RS256 JWT on the
-host for the [`google-search-console`](#google-search-console) service. The
-key JSON stays in 1Password: a one-shot sync reads it for its signature, and
+host for the `google-search-console` service, whose setup
+`runfree service explain google-search-console` lists. The key JSON stays in
+1Password: a one-shot sync reads it for its signature, and
 `credential sync --watch` keeps the parsed key in memory for at most 4 hours
 and signs each refresh with it (see below). The CLI never stores the key
 JSON, the private key, or the key id on disk; the proxy gets only the signed
@@ -434,8 +457,8 @@ JWT.
   hours, then reads 1Password again. It stops using a key removed from
   1Password within 4 hours plus one TTL (5 hours at the defaults). To stop a
   key at once, delete it in Google Cloud IAM.
-- The service account needs no Google Cloud IAM roles. Search Console access
-  comes from the account being a user on each property.
+- The service account needs no Google Cloud IAM roles. Its access comes from
+  the account being a user in the Google product the service calls.
 
 ### Credential policy and destinations
 
@@ -518,86 +541,6 @@ Important enable options:
 | `--allow-write` | Let writes to service hosts proceed without approval. |
 | `--local` | Write the checkout-local desired layer instead of the project layer. |
 | `--no-reload` | Leave effective controls unchanged after the desired mutation. |
-
-#### Google Search Console
-
-`google-search-console` allows one host, `searchconsole.googleapis.com`. The
-proxy injects the credential as `Authorization: Bearer <token>`; the agent gets
-only the placeholder `GOOGLE_SEARCH_CONSOLE_TOKEN`. The token belongs to a
-Google service account. In Search Console, add the service account's email as
-a user on each property the agent may read.
-
-With the service account's key JSON in 1Password, add a
-[`google-service-account` source](#host-owned-sources) and bind it:
-
-```bash
-runfree credential source add google-service-account gsc \
-  --key-json-from-1password op://vault/gsc-sa/credential.json \
-  --scope https://www.googleapis.com/auth/webmasters.readonly
-runfree service enable google-search-console --from-source gsc
-```
-
-The binding refreshes the JWT on its own (every `54m` at the default TTL).
-
-Without a key JSON, a `gcloud` command source impersonates the service account
-instead:
-
-```bash
-runfree credential source add gsc -- gcloud auth print-access-token \
-  --impersonate-service-account=<sa-email> \
-  --scopes=https://www.googleapis.com/auth/webmasters.readonly
-runfree service enable google-search-console --from-source gsc
-runfree credential set-source google-search-console --from-source gsc --refresh-every 50m --replace-source
-```
-
-This needs `gcloud` on the host and the `roles/iam.serviceAccountTokenCreator`
-role for your account on the service account. Keep the `--scopes` flag:
-without it, `gcloud` may mint a broad `cloud-platform` token. `service enable`
-has no `--refresh-every`; the `set-source` line adds the 50-minute refresh to
-the binding the enable made, and `--replace-source` is required because the
-credential is already bound.
-
-Search Analytics queries are writes. A query is a `POST` to
-`/webmasters/v3/sites/{siteUrl}/searchAnalytics/query`. The site URL sits in
-the middle of the path, so the only path prefix that covers the query also
-covers sitemap `PUT` and site `DELETE`. Runfree therefore keeps the query a
-write: under the default `ask` posture, each query asks for approval. Only URL
-Inspection (`/v1/urlInspection/index:inspect`) is a read.
-
-For read-only use without a prompt per query, allow only the read methods
-and the two API paths, and let them through without approval:
-
-```bash
-runfree host rules searchconsole.googleapis.com --method GET --method POST \
-  --request-path-prefix /webmasters/v3 --request-path-prefix /v1 --write allow
-```
-
-On this API every `POST` under these paths is a read (Search Analytics queries
-and URL Inspection); the writes are `PUT` (add a site, submit a sitemap) and
-`DELETE` (remove a site or a sitemap). The proxy refuses `PUT` and `DELETE` by
-method, whatever the scope of the bound credential, and strips the
-`X-HTTP-Method-Override`, `X-HTTP-Method`, and `X-Method-Override` headers on
-this host. The path prefixes keep out Google's `/batch` endpoint: a batch
-request is a `POST` whose body carries inner `PUT` and `DELETE` requests that
-use the outer credential. A prefix matches the path itself or a path below it,
-so `/v1batch` and `/batch/webmasters/v3` are refused too.
-
-This rule works only for Domain properties (`sc-domain:example.com`). A
-URL-prefix property puts its encoded URL in the path
-(`https%3A%2F%2Fexample.com%2F`), and the proxy refuses an encoded `/` on a
-host with path prefixes. For a URL-prefix property, keep the service rule:
-each query then asks for approval.
-
-To let the agent submit a sitemap or change a site, change the rule again, for
-example with `runfree host rules searchconsole.googleapis.com --clear`, which
-restores the service rule: under the default `ask` posture each write-class
-request, a Search Analytics query or a batch request included, then asks for
-approval.
-
-The proxy does not strip a method override in the query string or the body.
-Bind a source with only the `webmasters.readonly` scope, as above, so Google
-also refuses a write that reaches it (not yet proven against the live API).
-The scope is defence in depth: the method and path rule does not depend on it.
 
 ### Service revisions
 

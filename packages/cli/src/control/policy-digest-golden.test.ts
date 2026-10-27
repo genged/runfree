@@ -169,7 +169,7 @@ const SERVICE_GOLDENS: Record<string, Golden> = {
     generation: "sha256:68ccb7998b6e2c874774b94465a1115ed7d0ff34e955937c84b8c3acef227583",
   },
   "google-search-console": {
-    digest: "sha256:c8e63781dc52c6bab7389bc9cf0847997c3158c8b7935ee97bab648bf7777f73",
+    digest: "sha256:d292bafff86e5e67ad9ac207abfded425d7448d5340d1fb08f805f333b8f9994",
     generation: "sha256:28c213e942987ce85a9dbbf1f316f36d5ec9bf4f8c35fb088feba3bafd73a2c4",
   },
   "groq": {

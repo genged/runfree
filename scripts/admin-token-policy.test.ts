@@ -2168,7 +2168,7 @@ exit 0
     expect(status.stdout).not.toContain(privateKeyPem.trim());
   });
 
-  test("a google-search-console command-source binding takes a refresh after enable (docs Services, P-D4)", async () => {
+  test("a google-search-console command-source binding takes a refresh after enable (service explanations, P-D4)", async () => {
     writeFixtureRepo({
       hosts: ["searchconsole.googleapis.com"],
       tokens: {
