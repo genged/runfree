@@ -49,9 +49,24 @@ export function parseAgentHomeDirsBlock(dockerfile: string): { username: string;
   const begin = markerLine(lines, AGENT_HOME_DIRS_BEGIN);
   const end = markerLine(lines, AGENT_HOME_DIRS_END);
   if (end <= begin) throw new Error(`agent Dockerfile "${AGENT_HOME_DIRS_END}" must follow "${AGENT_HOME_DIRS_BEGIN}"`);
-  const dirs = lines.slice(begin + 1, end).map((line) => {
-    const match = /^"([^"]+)"\s*\\?$/u.exec(line.trim());
-    if (!match?.[1]) throw new Error(`agent Dockerfile agent-home block has an unparsable line: ${line.trim()}`);
+  const blockLines = lines.slice(begin + 1, end);
+  const dirs = blockLines.map((line, index) => {
+    const trimmed = line.trim();
+    const match = /^"([^"]+)"\s*(\\)?$/u.exec(trimmed);
+    if (!match?.[1]) throw new Error(`agent Dockerfile agent-home block line ${index + 1} is unparsable: ${trimmed}`);
+    const isLast = index === blockLines.length - 1;
+    const hasContinuation = match[2] !== undefined;
+    // Every line but the last must continue the install -d instruction, and
+    // the last line must end it: a misplaced "\" here does not fail the
+    // build (install -d still gets a list of quoted paths), it just hands
+    // BuildKit the wrong one — either swallowing the end marker and the next
+    // instruction into this one, or splitting the block mid-continuation.
+    if (!isLast && !hasContinuation) {
+      throw new Error(`agent Dockerfile agent-home block line ${index + 1} is missing its trailing "\\" to continue the install -d instruction: ${trimmed}`);
+    }
+    if (isLast && hasContinuation) {
+      throw new Error(`agent Dockerfile agent-home block line ${index + 1} must not end with "\\": it is the last entry and ends the install -d instruction: ${trimmed}`);
+    }
     return match[1].replaceAll("${USERNAME}", username);
   });
   return { username, dirs: dirs.sort() };

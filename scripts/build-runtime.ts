@@ -183,9 +183,13 @@ export function logicalDockerfileLines(dockerfile: string): string[] {
   for (const rawLine of dockerfile.split(/\r?\n/)) {
     const line = rawLine.trim();
     // BuildKit drops a bare comment line before joining a continuation
-    // (comments do not support their own continuation), so a comment is
-    // skipped whether or not an instruction is still open; a blank line is
-    // only skipped between instructions, not inside one.
+    // (comments do not support their own continuation), so this lexer skips
+    // a comment whether or not an instruction is open. A blank line is not
+    // the same: this lexer only skips it between instructions. Inside a
+    // continuation it falls through to the segment logic below and ends the
+    // logical line there, where BuildKit instead continues through it. No
+    // Dockerfile in this repo has a blank line inside a continuation, so
+    // that gap is left unfixed and untested here.
     if (line.startsWith("#")) continue;
     if (pending === "" && line === "") continue;
     const continued = line.endsWith("\\");

@@ -149,4 +149,22 @@ describe("agent Dockerfile agent-home block", () => {
     expect(() => parseAgentHomeDirsBlock(fixtureDockerfile(expectedDirs()).replace("ARG USERNAME=agent\n", "")))
       .toThrow(/ARG USERNAME/);
   });
+
+  test("a missing continuation mid-block is refused by line and problem", () => {
+    const dirs = expectedDirs();
+    const correct = fixtureDockerfile(dirs);
+    const firstQuoted = `"${dirs[0].replace(AGENT_HOME, "/home/${USERNAME}")}"`;
+    const mutated = correct.replace(`${firstQuoted} \\`, firstQuoted);
+    expect(mutated).not.toBe(correct);
+    expect(() => parseAgentHomeDirsBlock(mutated)).toThrow('line 1 is missing its trailing "\\"');
+  });
+
+  test("a trailing continuation on the last line is refused by line and problem", () => {
+    const dirs = expectedDirs();
+    const correct = fixtureDockerfile(dirs);
+    const lastQuoted = `"${dirs[dirs.length - 1].replace(AGENT_HOME, "/home/${USERNAME}")}"`;
+    const mutated = correct.replace(lastQuoted, `${lastQuoted} \\`);
+    expect(mutated).not.toBe(correct);
+    expect(() => parseAgentHomeDirsBlock(mutated)).toThrow(`line ${dirs.length} must not end with "\\"`);
+  });
 });
