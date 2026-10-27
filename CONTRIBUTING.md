@@ -19,7 +19,7 @@ pnpm install --frozen-lockfile
 | Tool | Version | Needed for |
 | --- | --- | --- |
 | Node | 22 | Everything |
-| pnpm | 10.34.8 | Everything. Do not substitute another package manager. |
+| pnpm | The `packageManager` version in `package.json` | Everything. Do not substitute another package manager. |
 | Docker | Docker Desktop with Compose | The live runtime and packaged live tests only |
 
 You do not need to install Bun. `pnpm run build:bin`, the test bundles, and

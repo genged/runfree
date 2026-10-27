@@ -430,18 +430,33 @@ runfree credential source remove github-cli
 
 Everything after `--` in `credential source add <name> -- <command>` is source command argv, not Runfree options.
 
-A `google-service-account` source signs a Google self-signed RS256 JWT on the
-host for the `google-search-console` service, whose setup
-`runfree service explain google-search-console` lists. The key JSON stays in
-1Password: a one-shot sync reads it for its signature, and
-`credential sync --watch` keeps the parsed key in memory for at most 4 hours
-and signs each refresh with it (see below). The CLI never stores the key
-JSON, the private key, or the key id on disk; the proxy gets only the signed
-JWT.
+A `jwt` source signs a JWT on the host each time the credential is read. The
+proxy gets only the signed token; the private key stays in 1Password, and the
+source registry records its `op://` reference, never the key.
 
-- `--scope` is required and repeatable. Only
-  `https://www.googleapis.com/auth/webmasters.readonly` and
-  `https://www.googleapis.com/auth/webmasters` are accepted.
+- `--alg` is required and must be `ES256`. `--private-key-from-1password`
+  takes the `op://` reference of the PEM private key.
+- `--claim key=value` and `--header key=value` are repeatable and add string
+  claims and header fields. Runfree generates the `alg` header and the `iat`
+  and `exp` claims, and refuses them as flags; `typ` defaults to `JWT`.
+- `--ttl` is required and sets `exp` to the signing time plus the TTL. A
+  binding without `--refresh-every` refreshes one minute before the token
+  expires, and an explicit `--refresh-every` must be shorter than the TTL.
+- `add` reads the key once and signs a test token; a key that cannot sign is
+  refused before the source is saved. `credential sync --watch` keeps the
+  parsed key in memory while it runs and signs each refresh with it;
+  `--no-cache-source-secrets` reads 1Password for every signature instead.
+
+A `google-service-account` source signs a Google self-signed RS256 JWT on the
+host. The key JSON stays in 1Password: a one-shot sync reads it for its
+signature, and `credential sync --watch` keeps the parsed key in memory for at
+most 4 hours and signs each refresh with it (see below). The CLI never stores
+the key JSON, the private key, or the key id on disk; the proxy gets only the
+signed JWT. A service that uses one lists its setup in
+`runfree service explain <id>`.
+
+- `--scope` is required and repeatable. Only the scopes that
+  `runfree credential source add --help` lists are accepted.
 - `--ttl` is the JWT lifetime, from `5m` to `60m`; the default is `55m`. A
   binding without `--refresh-every` refreshes one minute before the JWT
   expires (every `54m` at the default), and an explicit `--refresh-every`
@@ -528,6 +543,14 @@ runfree service diff --apply
 and host count. `service list --all` also prints every curated and
 user-defined service that is not enabled, with an `ORIGIN` and `STATE` column.
 
+`service explain <id>` prints a service's hosts, credential destinations,
+OAuth seeds, declared parameters, and notes, whether or not it is enabled.
+The notes hold the service's own setup steps and provider-specific rules,
+such as which username a git credential uses or which requests are reads.
+For an enabled service it also prints the layer, the approved revision, the
+skipped hosts, and whether each parameter is set. `--json` prints the
+definition and the approved entry as JSON.
+
 Important enable options:
 
 | Option | Use |
@@ -541,6 +564,40 @@ Important enable options:
 | `--allow-write` | Let writes to service hosts proceed without approval. |
 | `--local` | Write the checkout-local desired layer instead of the project layer. |
 | `--no-reload` | Leave effective controls unchanged after the desired mutation. |
+
+### OAuth services
+
+Some curated services reach an API through an OAuth token exchange. The
+agent runs the exchange itself, but every secret in it stays in the proxy:
+
+- The service declares OAuth seeds: a refresh token, a client secret, or
+  both. Each seed is a host-owned credential source like any other, and the
+  agent env var named for it holds a `runfree_oauth_*` handle, not the value.
+  A non-secret value such as the client id is a declared parameter.
+- `--from-1password-item op://<vault>/<item>` binds every seed from one
+  1Password item. Each seed, the service's static credential, and each
+  parameter is read from the item field named after its agent env var, and
+  every field is read once before anything is written. A service with one
+  seed and no static credential also takes `--from-source`, `--from-env`, or
+  `--from-1password` for that seed.
+- The token endpoint host gets a request rule that allows only `POST` on the
+  endpoint path. The agent sends its token request there with handles in
+  place of the seeds; the proxy replaces each handle with the real value and
+  replaces the access token in the answer with a new handle. An answer that
+  carries any other secret, such as a new refresh token, is refused.
+- A `Bearer runfree_oauth_…` handle sent to the service's resource host is
+  replaced with the real access token. A handle from another project, for
+  another resource, or past its expiry is refused before any connection.
+
+For example, `google-ads` has a refresh-token and a client-secret seed, a
+static developer token, and a client-id parameter:
+
+```bash
+runfree service explain google-ads
+runfree service enable google-ads --from-1password-item op://<vault>/<item>
+```
+
+User-defined services cannot declare OAuth seeds.
 
 ### Service revisions
 
@@ -575,10 +632,8 @@ then removes it. Any other direct rule stays and replaces the service's rule,
 with a warning that names `runfree host rules <host> --clear`. A direct rule
 that restricts the host therefore stays after `service disable`.
 
-A `github` or `gitlab` service enabled at an older revision gets no
-git-over-HTTPS credential until you run `runfree service diff --apply`.
-Applying either one makes `.runfree/network-policy.json` desired policy
-version 3.
+A new revision can need a higher desired policy version; `--apply` writes
+the version the content needs (see [Network Policy](#network-policy)).
 
 ### User-defined services
 
@@ -609,9 +664,9 @@ Each destination has these fields:
 
 On one host and header, at most one destination may have each `protocol`, and
 no two destinations may have the same `protocol` and `pathPrefix`. A
-definition that breaks a rule is refused before anything is written. Enabling
-a service whose destinations use `basic`, `username`, or `protocol` makes the
-desired policy version 3. How the proxy chooses among a host's destinations,
+definition that breaks a rule is refused before anything is written. These
+fields raise the desired policy version (see [Network Policy](#network-policy)).
+How the proxy chooses among a host's destinations,
 and the Git LFS read rule a `git-lfs` destination turns on, are in
 [security.md](security.md#git-over-https).
 
@@ -622,11 +677,14 @@ under `ask` (see [Residual Risks](security.md#residual-risks)).
 
 ### Git over HTTPS and SSH remotes
 
-With the `github` or `gitlab` service enabled at its current revision and a
-token bound, `git clone`, `fetch`, `pull`, and `push` over HTTPS work in the
-sandbox. Git sends no credential of its own; the proxy adds the token as HTTP
-Basic auth (username `x-access-token` on `github.com`, `oauth2` on
-`gitlab.com`). The token never enters the container.
+With a service that has git credential destinations enabled at its current
+revision and a token bound, `git clone`, `fetch`, `pull`, and `push` over
+HTTPS work in the sandbox. The curated `github` and `gitlab` services have
+them, and a [user-defined service](#user-defined-services) can declare them
+for another host. Git sends no credential of its own; the proxy adds the token
+as HTTP Basic auth with the username the service declares. The token never
+enters the container. `runfree service explain <id>` lists a service's git
+destinations and provider rules.
 
 The proxy attaches it only to these requests, where `…` is at least one
 repository path segment:
@@ -639,17 +697,16 @@ repository path segment:
 | Git LFS batch | `POST` | `/info/lfs/objects/batch` | `git-lfs` |
 | Git LFS locks | `GET`, `POST` | `/info/lfs/locks` (`GET` or `POST`), `/info/lfs/locks/verify`, `/info/lfs/locks/<id>/unlock` (`POST`) | `git-lfs` |
 
-The `github` service has both a `git-http` and a `git-lfs` destination on
-`github.com`. The `gitlab` service has only `git-http`, so Git LFS is not
-mediated on `gitlab.com`: LFS requests there get no credential, every LFS batch
-request is a write, and a private GitLab LFS fetch fails (see
+Git LFS is mediated only on a host where the service has a `git-lfs`
+destination. On a git host without one, LFS requests get no credential, every
+LFS batch request is a write, and a private LFS fetch fails (see
 [security.md](security.md#git-over-https)).
 
 Any other path, or an ambiguous spelling of one of these, gets no credential.
 A fetch is a read. A push is a git push write: under the default `ask` posture
 it waits for `runfree approve`, and once approved it goes out with your token.
-On `github.com`, a Git LFS download batch is a read and an upload is a write.
-To refuse pushes outright:
+On a curated service's git host where LFS is mediated, a Git LFS download
+batch is a read and an upload is a write. To refuse pushes outright:
 
 ```bash
 runfree host rules github.com --deny-git-push

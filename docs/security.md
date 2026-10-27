@@ -314,24 +314,24 @@ agent sees: placeholder or runfree_oauth_* handle only
 
 ### Git Over HTTPS
 
-The `github` service (revision 3) adds two Basic destinations on
-`github.com`: `protocol: "git-http"` for git smart HTTP and
-`protocol: "git-lfs"` for the Git LFS batch and lock API. The `gitlab` service
-(revision 2) adds only the `git-http` one on `gitlab.com`; Git LFS is not
-mediated there (rule 6). Commands and the supported remote forms are in
+A service's credential destination can carry a `protocol` scope:
+`protocol: "git-http"` for git smart HTTP and `protocol: "git-lfs"` for the
+Git LFS batch and lock API. Such a destination uses the `basic` scheme with a
+username that the service declares. The curated `github` and `gitlab`
+services have them; `runfree service explain <id>` lists each service's
+destinations and whether it mediates Git LFS. Commands and the supported
+remote forms are in
 [Git over HTTPS and SSH remotes](cli.md#git-over-https-and-ssh-remotes). New
 `protocol` scopes are added only for public wire protocols the proxy can
 recognize reliably; a vendor's own endpoints use a path prefix or a request
 rule instead.
 
-1. **Token reach covers git.** The `github` token is injected on
-   `api.github.com`, `raw.githubusercontent.com`, and git smart HTTP and Git
-   LFS on `github.com`; the `gitlab` token on `gitlab.com/api/` and git smart
-   HTTP. Both reach every repository the token can access, so use a
+1. **Token reach covers git.** A token on a `git-http` or `git-lfs`
+   destination reaches every repository the token can access, so use a
    fine-grained token limited to the repositories the agent needs. The
    `protocol` scope limits which requests carry the token, not which
-   repositories: `api.github.com` still carries the `github` token on every
-   path.
+   repositories. A destination without `protocol` on another host of the
+   same service still carries the token on every path it matches.
 2. **An approved push succeeds.** A push that write approval allows goes out
    with your token, so approving a git push is a real decision. Write
    approval is the effective control. The default write posture is `ask`;
@@ -347,19 +347,19 @@ rule instead.
    never git requests:
    - a `POST` endpoint (fetch, push, LFS batch, LFS lock) with any query
      string. Git and git-lfs send none, and an origin that merges query
-     parameters over the body (GitLab is a Rails application) would act on a
-     query the proxy never read, such as `?operation=upload` on a download
-     batch;
+     parameters over the body would act on a query the proxy never read,
+     such as `?operation=upload` on a download batch;
    - a ref discovery query that contains a `;`. Some origins also split a
      query on `;` and could read a second `service` the proxy never counted.
      Push detection treats such a query as a push;
    - a path whose first segment decodes to `api` in any case, or that has a
-     segment that is exactly `-`. GitLab serves its REST API under `/api/`
+     segment that is exactly `-`. Some origins serve a REST API under `/api/`
      and other routes behind `/-/`, where a last segment can be any name
-     (`…/repository/files/git-upload-pack` is a file API). A `github.com`
-     owner named `api` is excluded too: the matcher does not guess per
-     provider. Dots and whitespace at either end of the first segment are
-     ignored for this check, so `%20api` and `.api` count as `api`;
+     (`…/repository/files/git-upload-pack` can be a file API). The matcher
+     does not guess per provider, so a repository owner named `api` is
+     excluded on every host. Dots and whitespace at either end of the first
+     segment are ignored for this check, so `%20api` and `.api` count as
+     `api`;
    - a path with a segment that starts with whitespace after decoding. An
      origin that trims it could route the request somewhere other than the
      path the matcher read.
@@ -368,9 +368,9 @@ rule instead.
    is unchanged. A `git-http` destination matches only git smart-HTTP
    requests and a `git-lfs` destination only Git LFS requests; no request is
    both.
-4. **Agent `Authorization` is removed on `github.com`.** It is stripped on
-   every `github.com` path and replaced on git requests, as on every host
-   with a credential destination. One exception,
+4. **Agent `Authorization` is removed on a credential host.** On a host with an
+   `Authorization` credential destination, the agent's value is stripped on
+   every path and replaced on requests a destination matches. One exception,
    shared with every such host: a value shaped like a Runfree OAuth handle is
    kept for the OAuth mediator. A `Bearer runfree_oauth_…` value must then be
    a live handle of this project for this resource, or the request is refused
@@ -397,38 +397,36 @@ rule instead.
    second `Operation`-like key, a missing length, every `POST` lock request,
    and every batch request on a host with no `git-lfs` destination that
    matches the request path. The `GET` lock listing is a read like any `GET`,
-   and on `github.com` it carries the `git-lfs` credential. A held request is
-   re-checked without its body, so it stays a write.
+   and carries the credential of a `git-lfs` destination that matches it. A
+   held request is re-checked without its body, so it stays a write.
 
-   A git handling rule alone does not make a download a read. The built-in
-   `bitbucket` service declares one on `bitbucket.org` but has no `git-lfs`
-   destination (it has no credential there), so every LFS batch request to
-   `bitbucket.org`, a public download included, waits for approval under
-   `ask`. The same holds on `gitlab.com` (rule 6) and on any host given a git
-   rule by hand, such as with `runfree host rules <host> --deny-git-push`.
+   A git handling rule alone does not make a download a read. On a host with
+   a git handling rule but no `git-lfs` destination, such as a curated
+   service's git host where the service has no credential or does not
+   mediate LFS, or a host given a rule by hand with
+   `runfree host rules <host> --deny-git-push`, every LFS batch request, a
+   public download included, waits for approval under `ask`.
 
    The git fetch exemption is narrow in the same way: only `POST` on a
    recognized `…/git-upload-pack` path, with at least one repository segment
    before it, an empty query, and none of the excluded paths in rule 3, is a
    read.
-6. **Object transfer credentials reach the agent; Git LFS on `gitlab.com` is
-   not mediated.** A batch response gives per-object action URLs and may give
-   headers with credentials issued by the provider. They pass to the agent
-   unchanged, and they are not the stored token. Runfree accepts GitHub's as
-   server-issued; their exact scope and lifetime are not verified. GitLab's
-   answer to a user's batch request carries `Authorization: Basic` with a
-   project-wide LFS token that is valid for hours and can push. Had the
-   download batch been a read, the agent could have taken that token without
-   approval and pushed from outside the sandbox, past write approval and
-   `--deny-git-push`. So the `gitlab` service has no `git-lfs` destination:
-   an LFS request to `gitlab.com` gets no credential, every batch request
-   there is a write, and a private GitLab LFS fetch fails. The transfer
-   itself goes to the action host and follows that host's policy; on a host
-   with an `Authorization` destination, an agent-sent `Authorization` is
-   stripped there like any other.
-7. **GitLab forwards anonymously without a token.** With no `gitlab` token
-   stored, `gitlab.com` requests, `/api/` included, go out with
+6. **Object transfer credentials reach the agent.** A batch response gives
+   per-object action URLs and may give headers with credentials issued by the
+   provider. They pass to the agent unchanged. They are not the stored token,
+   and Runfree does not limit their scope or lifetime. Because a download
+   batch is a read where LFS is mediated, a `git-lfs` destination lets the
+   agent obtain those credentials without approval. A service whose
+   provider's batch answer carries a credential that can push therefore has
+   no `git-lfs` destination: an LFS request to that host gets no credential,
+   every batch request there is a write, and a private LFS fetch fails. The
+   transfer itself goes to the action host and follows that host's policy;
+   on a host with an `Authorization` destination, an agent-sent
+   `Authorization` is stripped there like any other.
+7. **A service can forward anonymously without a token.** For a service that
+   allows it, a host with no token stored forwards its requests with
    `Authorization` stripped, so public clones work and private calls get 401.
+   `runfree service explain <id>` says whether a service does this.
 8. **Redirects are not followed.** The proxy passes a redirect response to
    the agent unchanged. Git follows it as a new proxied request, which gets
    the credentials of the new host's policy, if any. The injected value never
@@ -455,16 +453,12 @@ A newer policy can meet an older reader: a teammate's older CLI reading the
 committed `.runfree/network-policy.json`, a downgraded CLI, or, after an
 upgrade, a proxy still running the previous build.
 
-- Desired policy becomes version 3 only when it uses `basic`, `username`,
-  `protocol`, or two destinations for one host and header. Releases without
-  version 3 refuse such a file (`version must be 2`), so they cannot drop a
-  `protocol` scope and inject on the whole host. Any other file stays version
-  2, with an unchanged digest.
-- Desired policy becomes version 4 only when a service entry has
-  `selection.hostRules`. Releases without version 4 refuse such a file
-  (`version must be 2`, or `version must be one of: 2, 3`), so they cannot
-  drop a `--deny-git-push` set on a service host. They also refuse the
-  unknown `hostRules` field.
+- Desired policy takes a higher version only when it holds a field that an
+  older reader would misread; the triggers are in
+  [cli.md](cli.md#network-policy). A release that does not read that version
+  refuses the file, so it cannot drop a `protocol` scope and inject on the
+  whole host, or drop a `--deny-git-push` set on a service host. A file with
+  none of those fields keeps the lowest version and an unchanged digest.
 - An effective policy generation is published only to a proxy of the same
   build. Policy commands compare the running proxy's image-input label (a
   missing label counts as another build) with the proxy this CLI embeds; on a
@@ -925,6 +919,9 @@ Details: [Write Approval Grants](architecture.md#write-approval-grants).
 
 ## What Runfree Does Not Prove
 
+These are limits of the checks Runfree runs at launch. The limits of the test
+suite are in [testing.md](testing.md#proof-limits).
+
 - **Nothing from inside the container.** Session shape is proven by host-side
   `docker inspect` only. That shows what the daemon created, not what the
   process does.
@@ -939,26 +936,8 @@ Details: [Write Approval Grants](architecture.md#write-approval-grants).
   `rebuild` delete it. A warm proof older than 24 hours never matches, and a
   Docker daemon with live-restore enabled always validates fully.
   `runfree up` always runs every probe.
-- **Docker command lines outside the client module.** The static check that
-  keeps Docker command lines in one module sees only literal `docker` strings
-  outside its reviewed allowlist. It does not see command lines built from a
-  parameter, or new ones added inside an allowlisted file.
-- **Guest clock lag** is not tested live. The live fixture cannot shift the
-  Docker VM clock. The rule that a lagging clock cannot extend a lease has
-  unit tests only.
 - **Audit set emptiness** in enforce mode is checked only by the proxy's own
   firewall supervisor. The host proof checks set shape, not members.
-- **Git provider behavior** is proven only by a gated live tranche that needs
-  provider credentials and is not part of `make test-runtime` (see
-  [testing.md](testing.md)). That GitHub accepts the token as the Basic
-  password with username `x-access-token`, and GitLab with `oauth2`, is
-  proven only for the token types that run uses.
-- **Older readers** are proven against the frozen policy readers of v0.5.2
-  only, replayed as source in a unit test, not by running an old binary.
-- **The release pipeline** runs the Test workflow's checks (static, unit,
-  templates, packaged offline E2E), not the live runtime suite. `make test-runtime` needs a
-  Docker host and runs by hand. A release has proven it only if its
-  acceptance record says so.
 
 ## Residual Risks
 
@@ -1000,10 +979,9 @@ Accepted, known risks:
 | Allowed hosts can be misused within their token scope | Runfree checks host, method, and path, not intent. Use narrow tokens first |
 | A permitted GET can carry data out in its query | Shape rules limit which requests pass, not their content |
 | `gitPush: "deny"` blocks only the git push endpoint | Pushes can still go through the provider's REST/GraphQL API; add method rules there |
-| The `github` and `gitlab` tokens reach git on every repository they can access | Use fine-grained tokens and keep pushes under `ask` ([Git rule 1](#git-over-https)) |
+| A git credential reaches every repository its token can access | Use fine-grained tokens and keep pushes under `ask` ([Git rule 1](#git-over-https)) |
 | An agent `Basic` value with a handle-shaped password passes the `Authorization` strip | It is the agent's own value; no token is injected (Git rule 4) |
-| Git LFS action credentials from `github.com` reach the agent | Server-issued, not the stored token; scope and lifetime unverified (Git rule 6) |
-| Git LFS on `gitlab.com` is not mediated | Its batch token can push, so batches there are credentialless writes (Git rule 6) |
+| Git LFS action credentials from a host with a `git-lfs` destination reach the agent without approval | Provider-issued, not the stored token; Runfree does not limit their scope or lifetime. A service whose provider issues push-capable batch credentials gets no `git-lfs` destination (Git rule 6) |
 | A user-defined git host has no git handling rule | Fetches and LFS batches there are writes and wait under `ask`; a push is a plain write, not a git push |
 | The agent can read and change the whole project, including `.git` | The project mount is read-write by design |
 | Native Claude, Codex, and Pi login state is readable by agent code | Agents need it to log in; it is per project |

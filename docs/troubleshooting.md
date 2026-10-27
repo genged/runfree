@@ -282,7 +282,7 @@ starts nothing and only marks the record done.
 
 | Condition | What happens |
 | --- | --- |
-| No `github` or `gitlab` token stored | The request goes out anonymously, with any agent `Authorization` removed. Public fetches work; private fetches and pushes get 401 from the provider. |
+| No token stored for the service | For a service that allows it, the request goes out anonymously, with any agent `Authorization` removed. Public fetches work; private fetches and pushes get 401 from the provider. |
 | Token expired or revoked | 401 from the provider. Refresh the source, then run `runfree credential sync`. |
 | Token cannot reach the repository | 403 or 404 from the provider. |
 | Push refused by policy or approval | The proxy refuses with `git-push-denied`, `write-denied`, or a `write-approval-*` reason, before any upstream connection or token read. |

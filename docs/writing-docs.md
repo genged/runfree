@@ -29,11 +29,12 @@ so a change only has to be documented once.
 | `README.md` | What Runfree is, install, the quickstart, and the link to the current release's "what's new" page |
 | [cli.md](cli.md) | Every command, flag, and default; output conventions; config and policy file formats as a user edits them |
 | [architecture.md](architecture.md) | How the CLI, proxy, and agent container fit together; lifecycle, state, generation families, policy and credential models |
-| [security.md](security.md) | The threat model, trust boundary, what stops what, residual risks, and what the tests do and do not prove |
+| [security.md](security.md) | The threat model, trust boundary, what stops what, residual risks, and what Runfree's launch checks do not prove |
 | `SECURITY.md` | Supported versions, how to report a vulnerability, and a short boundary summary that links to security.md |
 | [team-workflow.md](team-workflow.md) | What a team commits under `.runfree/`, and how policy and service changes are reviewed |
 | [troubleshooting.md](troubleshooting.md) | Symptoms, the error text a user sees, and the remedy for each |
 | [testing.md](testing.md) | What each test layer proves and where its proof stops |
+| `explanations` in `scripts/services.ts` | One service's setup steps and provider-specific rules, printed by `runfree service explain <id>` |
 | [project-brief.md](project-brief.md) | The problem, product model, audience, and release shape; it links to `AGENTS.md` for the source map |
 | `CONTRIBUTING.md` | Setup, the checks to run before a pull request, review expectations, and this standard's place in it |
 | `AGENTS.md` | Instructions for coding agents working on this repository: the source map and project rules |
@@ -69,8 +70,18 @@ managing hosts easy" is not.
   type names, field names, constants, limits, and step-by-step algorithms; the
   code and its tests own those. Name a source file only when the idea cannot
   be explained without it. Exact commands and flags stay in
-  [cli.md](cli.md); security limits and proof stay in
-  [security.md](security.md).
+  [cli.md](cli.md); security limits stay in [security.md](security.md).
+- Document the generic mechanism, not one service. A rule that holds for one
+  provider only (a username, a token's reach, which of its requests are
+  reads, its setup steps) goes in that service's `explanations` in
+  `scripts/services.ts`; the docs name the mechanism and point to
+  `runfree service explain <id>`. A single service may appear as an example.
+  Editing a shipped service's `explanations` changes its definition digest,
+  so `runfree service diff` reports every project that enabled it.
+- State behavior as fact. Do not add proof-status notes ("verified",
+  "unverified", "not yet tested", "proven only by"). What a test layer does not
+  cover goes in [testing.md](testing.md#proof-limits); whether a change was
+  run live belongs in the pull request, not the docs.
 - Keep each page's existing heading style.
 
 ## Release documents

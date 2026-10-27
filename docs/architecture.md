@@ -274,7 +274,6 @@ different authority families. Always name the family; the bare phrase
 | --- | --- | --- |
 | Effective policy generation | `controlGeneration` | The compiled, immutable host/proxy policy generation built from approved `.runfree/` desired policy: network policy, OAuth mediation policy, MCP operation policy, agent environment, runtime control. |
 | Control plane generation | `controlPlaneGenerationDigest` | The runtime control plane a session binds to: proxy image, Compose topology, and admission contract epoch. |
-| Temporary access generation | (reserved) | Session-scoped temporary network access records; designed, not yet built. |
 
 A live policy change advances the
 effective policy generation only — it neither invalidates held session
@@ -751,8 +750,7 @@ not the proxy's runtime policy.
 
 The version changes only when an older reader would misread the content.
 Runfree writes the lowest version that can hold the content, so most
-projects stay on version 2; git credential destinations need version 3, and
-`host rules` settings on a service host need version 4.
+projects stay on version 2.
 Older releases refuse a newer file instead of dropping fields they do not
 know. The exact triggers are in [cli.md](cli.md#network-policy).
 
@@ -1101,7 +1099,7 @@ proxy seconds later. The reuse and failure rules are in
 Services are named host bundles. Curated services live in `scripts/services.ts`; user-defined services use `user-*` ids and are stored under the Runfree XDG config root. Credentialless `agent-claude` and `agent-codex` services cover native subscription/login traffic and are distinct from the credential-bearing `anthropic` and `openai` API-key services.
 
 A service may declare `parameters`: non-secret inputs it needs beside its
-secrets (an OAuth client id today), which `service enable` resolves and
+secrets (such as an OAuth client id), which `service enable` resolves and
 records in the host-owned agent environment. Anything that must stay out of
 the agent container is a credential or an OAuth seed, never a parameter.
 

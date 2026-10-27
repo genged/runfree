@@ -132,6 +132,19 @@ literals. The checks on public docs and user-visible terminology are listed in
 - Nothing in these layers proves the live runtime on a platform where
   `make test-runtime` has not been run. Source tests passing on Linux CI is not
   evidence about macOS with Docker Desktop.
+- `make test-runtime` needs a Docker host and runs by hand; neither
+  pull-request CI nor the release pipeline runs it.
+- The git provider tranche covers only the token types its sources use. It
+  is the only layer that talks to a real git provider.
+- Older-reader compatibility is tested by replaying the policy readers of
+  earlier releases, frozen as source under `tests/fixtures/release-*`, not by
+  running an old binary.
+- The live fixture cannot shift the Docker VM clock. The rule that a lagging
+  guest clock cannot extend a lease has unit tests only.
+- The static check that keeps Docker command lines in one module sees only
+  literal `docker` strings outside its reviewed allowlist. It does not see
+  command lines built from a parameter, or new ones added inside an
+  allowlisted file.
 
 The harness is POSIX-only. Process groups, signals, permission modes, `umask`,
 and symlinks need different implementations for Windows.

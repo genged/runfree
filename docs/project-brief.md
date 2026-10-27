@@ -65,7 +65,7 @@ The primary audience is individual developers using Claude Code, Codex, or Pi wh
 - host: Apple Silicon macOS;
 - container backend: Docker Desktop with Docker Compose;
 - package manager: Homebrew tap plus the GitHub release install script (`bash`, not `sh`);
-- source build: Node 22 and pnpm 10.34.8; `./bunw` fetches the Bun in `.bun-version` for `pnpm run build:bin`;
+- source build: Node 22 and the pnpm version in `package.json`; `./bunw` fetches the Bun in `.bun-version` for `pnpm run build:bin`;
 
 The release target list lives in [`../scripts/release-targets.txt`](../scripts/release-targets.txt), which packaging, signing, checksums, and the CI build matrix all read.
 
