@@ -13,6 +13,9 @@
 //     live, the run session's `ask` write is denied at once and counted,
 //     while the interactive session's write is held;
 //   - a rule changed to `ask` during a run gives `headless-denied` and 68;
+//   - an `ask` rule at launch does not refuse: the run starts, warns once,
+//     records the host under run.json `askExposure`, its write is denied as
+//     `headless-denied`, and it exits 68;
 //   - a pending approval is refused with 65 before any session container is
 //     created;
 //   - after a timeout whose teardown was not confirmed, the next run gets 66
@@ -778,6 +781,36 @@ describe("headless runs (runfree run) on the real backend", () => {
         acceptDeniedWrites: false,
         teardown: "confirmed",
       });
+    } finally {
+      await abandonRun(run, fixture, tag);
+      setWriteAction(fixture, "allow");
+      await forceCleanSessions(fixture);
+    }
+  }, TEST_TIMEOUT_MS);
+
+  coreTest("an ask rule at launch warns, runs, records the exposure, and exits 68", async () => {
+    const tag = "ask-at-launch";
+    let run: StartedRun | undefined;
+    try {
+      setWriteAction(fixture, "ask");
+      run = startRun(fixture, writePrompt(fixture, { tag, post: `https://${WRITE_HOST}/ask-at-launch` }));
+      const outcome = await finishRun(run, RUN_READY_TIMEOUT_MS + RUN_FINISH_TIMEOUT_MS, "ask-at-launch run");
+      expect(outcome.status, `an ask rule at launch did not exit 68: ${describeOutput(outcome.output, 4000)}`).toBe(68);
+      const warnings = outcome.output.split("\n").filter((line) => line.includes("headless run: writes that would ask for approval are denied"));
+      expect(warnings, `the posture warning is not printed once: ${describeOutput(outcome.output, 4000)}`).toHaveLength(1);
+      expect(outcome.output, "the run was refused").not.toContain("refusing a headless run");
+      const post = readStubPost(fixture, tag);
+      expect(post.code, `the write was not refused: ${post.stderr}`).toBe("403");
+      expect(post.blocked, "the write was not refused as headless-denied").toBe("write-approval-headless-denied");
+      const recorded = readRunJson(outcome);
+      expect(recorded, "ask-at-launch run.json").toMatchObject({
+        outcome: "success",
+        exitCode: 68,
+        headlessDenials: 1,
+        acceptDeniedWrites: false,
+        teardown: "confirmed",
+      });
+      expect(recorded.askExposure?.ruleAskHosts, "run.json askExposure").toContain(WRITE_HOST);
     } finally {
       await abandonRun(run, fixture, tag);
       setWriteAction(fixture, "allow");
