@@ -55,6 +55,7 @@ import {
   readControlPlaneMaterializationV2,
   readRetainedDesiredSessionAgentV2,
   type ControlPlaneEffectiveSelectionV2,
+  type ControlPlaneMaterializationManifestV2,
 } from "./component-state-v2.ts";
 import {
   effectiveControlPlaneMatchesLiveRuntimeValidationV2,
@@ -154,7 +155,7 @@ import {
 } from "./control-plane-rebind-coordinator.ts";
 import { readControlPlaneRebindTransaction } from "./control-plane-rebind.ts";
 import { createRetainedSessionRebindProofPlan } from "./session-admission-driver-preflight.ts";
-import { validateSessionContainerInspect } from "./session-container-proof.ts";
+import { type SessionContainerProof, validateSessionContainerInspect } from "./session-container-proof.ts";
 import { compileAllowedSessionAgentMaterializationsV2 } from "./session-materialization-eligibility.ts";
 import {
   ensureSessionEligibilityPublished,
@@ -2217,34 +2218,16 @@ export async function startRuntime(
             reproveCandidate,
             participantIsAbsent: (record) => rebindParticipantIsAbsent({ containerId: record.containerId, io: rebindIO,
               env: activePlan.execution.dockerClientEnv, assertAuthority: () => heldLifecycleLock.assertHeld() }),
-            proveSession: (replacementRecord) => {
-              heldLifecycleLock.assertHeld();
-              const transactionCandidate = readControlPlaneRebindTransaction(
-                activePlan.paths.stateDir,
-                { projectId: activePlan.projectId, composeProject: activePlan.composeProjectName },
-              )?.candidateControlPlane;
-              const exactCandidateSelection = candidateSelection ?? transactionCandidate;
-              if (!exactCandidateSelection) {
-                throw new Error("control-plane rebind candidate proof is missing before session proof");
-              }
-              const proofPlan = createRetainedSessionRebindProofPlan({
-                stateDir: activePlan.paths.stateDir,
-                expectedProject: { projectId: activePlan.projectId, composeProject: activePlan.composeProjectName },
-                replacementRecord,
-                candidateControlPlane: exactCandidateSelection,
-                candidateMaterialization,
-                docker: rebindDocker,
-                lifecycleLock: heldLifecycleLock,
-                runfreeVersion: activePlan.runfreeVersion,
-              });
-              const inspect = createDockerClient(rebindIO, dockerClientEnvOptions(activeContext)).inspect(
-                [replacementRecord.containerId as string],
-                { type: "container" },
-              );
-              if (inspect.status !== 0) throw new RuntimeObservationError({ kind: "observation-unavailable", subject: "session",
-                expectedIdentity: replacementRecord.containerId as string, phase: "sessions-revalidated", observation: `session ${replacementRecord.sessionId} inspection failed` });
-              return validateSessionContainerInspect(inspect.stdout, proofPlan, { kind: "active-running" });
-            },
+            proveSession: (replacementRecord) => proveRebindSession({
+              plan: activePlan,
+              replacementRecord,
+              candidateSelection,
+              candidateMaterialization,
+              docker: rebindDocker,
+              io: rebindIO,
+              dockerOptions: dockerClientEnvOptions(activeContext),
+              lifecycleLock: heldLifecycleLock,
+            }),
             finalize: async () => {
               heldLifecycleLock.assertHeld();
               // Receipt gate (Increment 6): fails closed before any credential
@@ -2448,6 +2431,50 @@ function warmPeerRestoreSkipRefusal(input: Readonly<{
   input.lifecycleLock.assertHeld();
   if (!consumeWarmPeerValidation(input.validation, binding)) return "the warm peer judgement no longer binds the runtime";
   return undefined;
+}
+
+/**
+ * Prove one live session before a compatible proxy replacement rebinds its
+ * record to the candidate. The session already existed, so it may predate this
+ * CLI: it proves as `active-running`, which accepts its creator's version label.
+ * `candidateSelection` is this run's proved candidate; a resumed rebind reads
+ * the one its journal recorded.
+ */
+export function proveRebindSession(input: Readonly<{
+  plan: ActiveRuntimePlan;
+  replacementRecord: SessionContainerRecordV2;
+  candidateSelection: ControlPlaneEffectiveSelectionV2 | undefined;
+  candidateMaterialization: ControlPlaneMaterializationManifestV2;
+  docker: Pick<RuntimeDocker, "inspectImage">;
+  io: RuntimeIO;
+  dockerOptions: ReturnType<typeof dockerClientEnvOptions>;
+  lifecycleLock: ProjectLifecycleLock;
+}>): SessionContainerProof {
+  const { plan, replacementRecord, lifecycleLock } = input;
+  lifecycleLock.assertHeld();
+  const expectedProject = { projectId: plan.projectId, composeProject: plan.composeProjectName };
+  const transactionCandidate = readControlPlaneRebindTransaction(plan.paths.stateDir, expectedProject)?.candidateControlPlane;
+  const exactCandidateSelection = input.candidateSelection ?? transactionCandidate;
+  if (!exactCandidateSelection) {
+    throw new Error("control-plane rebind candidate proof is missing before session proof");
+  }
+  const proofPlan = createRetainedSessionRebindProofPlan({
+    stateDir: plan.paths.stateDir,
+    expectedProject,
+    replacementRecord,
+    candidateControlPlane: exactCandidateSelection,
+    candidateMaterialization: input.candidateMaterialization,
+    docker: input.docker,
+    lifecycleLock,
+    runfreeVersion: plan.runfreeVersion,
+  });
+  const inspect = createDockerClient(input.io, input.dockerOptions).inspect(
+    [replacementRecord.containerId as string],
+    { type: "container" },
+  );
+  if (inspect.status !== 0) throw new RuntimeObservationError({ kind: "observation-unavailable", subject: "session",
+    expectedIdentity: replacementRecord.containerId as string, phase: "sessions-revalidated", observation: `session ${replacementRecord.sessionId} inspection failed` });
+  return validateSessionContainerInspect(inspect.stdout, proofPlan, { kind: "active-running" });
 }
 
 /**
