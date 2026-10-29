@@ -72,6 +72,16 @@ runfree shell
 Claude Code, Codex, and Pi share the project's sandbox and policy. Run several
 at once: each session gets its own container, and `runfree sessions` lists them.
 
+### Scheduled agent runs, no terminal needed <img src="https://img.shields.io/badge/New_in-0.7.0-2ea44f" alt="New in 0.7.0" />
+
+```bash
+runfree run claude --prompt-file task.md --timeout 30m
+```
+
+Run one agent turn from launchd, a script, or a detached pane, in the same
+sandbox. It never prompts, denies writes that would wait for approval, and
+exits with a code a scheduler can act on. [More](docs/cli.md#headless-runs)
+
 ### Whole ecosystems in one command
 
 ```bash
@@ -100,7 +110,7 @@ runfree mcp enable claude my-server
 
 `mcp list` shows the servers from your Claude and Codex config. `mcp enable`
 reviews the approval, credential, and OAuth hosts on one screen, applies them
-to the running sandbox, and opens the login. [More](docs/cli.md#mcp)
+to the running sandbox, and prints the login command (`--login` runs it). [More](docs/cli.md#mcp)
 
 ### And more
 
@@ -543,5 +553,5 @@ rest, including what review will ask about.
 - [`docs/security.md`](docs/security.md) — threat model and verification
 - [`docs/cli.md`](docs/cli.md) — full command reference
 - [`docs/troubleshooting.md`](docs/troubleshooting.md) — refusals and recovery
-- [`docs/whats-new-0.6.0.md`](docs/whats-new-0.6.0.md) — current release
+- [`docs/whats-new-0.7.0.md`](docs/whats-new-0.7.0.md) — current release
 - [`AGENTS.md`](AGENTS.md) — guidance for coding agents working in this repo

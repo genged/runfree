@@ -150,8 +150,8 @@ runfree run codex --prompt-file task.md
 runfree run pi --prompt-file task.md
 ```
 
-`runfree run` runs one agent turn without a terminal: from launchd, cron, a
-script, or a detached tmux pane. It starts a normal per-session container
+`runfree run` runs one agent turn without a terminal: from launchd, a script,
+or a detached tmux pane. It starts a normal per-session container
 through the same admission path as `runfree claude`. The agent works on the
 live project folder, and its results are the files it writes there.
 

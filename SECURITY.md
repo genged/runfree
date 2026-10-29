@@ -9,7 +9,8 @@ immutable and are never replaced in place.
 
 | Version | Supported |
 | --- | --- |
-| 0.6.x | Yes, latest patch only |
+| 0.7.x | Yes, latest patch only |
+| 0.6.x | No |
 | 0.5.x | No |
 
 Support is best effort. There is no response-time commitment, including for

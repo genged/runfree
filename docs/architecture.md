@@ -217,9 +217,7 @@ The proxy reads one selected effective policy generation, which pairs network
 and OAuth policy with the MCP operation policy, from a read-only host-state
 directory mount. Each payload is digest-checked against the effective
 policy generation's manifest, and an effective policy generation that fails
-any check is refused whole, so the proxy keeps the last valid set. The proxy has no single-file bind mount: such
-a mount stays on the inode it had at mount time, so a host
-write-then-rename would leave the proxy reading old or truncated bytes. An
+any check is refused whole, so the proxy keeps the last valid set. An
 effective policy generation published before this payload existed carries
 no MCP operation policy; if a rollback selects one, MCP requests follow the
 host's write posture until the next publication. It never reads project
@@ -705,26 +703,12 @@ repaired or stopped, or the project is reset with `runfree destroy --force`.
 #### Headless Runs
 
 `runfree run` launches through the same admission path as an interactive
-session. It differs in the launch target, the prompt, and the host IO:
-
-```text
-runfree run claude --prompt-file task.md
-  check the agent, flags, and prompt file           usage: 64
-  take the project run lock                         held: 66
-  copy the prompt to <state>/inbox/<run-id>.prompt
-  approval gate, reviews, runtime start             refused: 65
-  write-posture preflight                           a write can ask: 65
-  admission, headless:
-    create the container without a TTY or open stdin
-    session file carries launchMode "headless"
-    the entry opens /runfree/inbox/<run-id>.prompt as the agent's stdin
-  capture stdout and stderr into <state>/runs/<run-id>/
-  stop routine (completion, failure, timeout, signal):
-    delete the session file, stop the container under its creation receipt,
-    delete the prompt copy, finish run.json,
-    release the lock only if the stop was confirmed
-  exit with the run's code
-```
+session. It adds a usage check and a one-run-per-project lock before the
+launch, a write-posture check after the approval gate, and a container with no
+TTY and no open stdin. Every ending, including a timeout or a signal, runs the
+same shutdown, so none of them can skip stopping the container or releasing
+the lock. The exit codes and the record's layout are
+in [Headless runs](cli.md#headless-runs).
 
 - **Never interactive.** The command replaces the runtime IO for its whole
   life: nothing prompts, a confirmation answers no, the approvals heartbeat
@@ -734,8 +718,9 @@ runfree run claude --prompt-file task.md
   one and still runs through the session entry, so the readiness gate is
   unchanged. Runfree sets the whole agent command line; the prompt is stdin,
   never an argument.
-- **Launch mode.** The lifecycle record and the session file carry
-  `launchMode`, set at allocation and never derived from the TTY. The proxy
+- **Launch mode.** The lifecycle record and the session file record whether
+  the launch is interactive or headless, set at allocation and never derived
+  from the TTY. The proxy
   denies an `ask` write from a headless session at once (see
   [Write Approval](security.md#write-approval)). Host recovery evidence
   carries it too, so `runfree resume` skips headless runs.
@@ -830,9 +815,9 @@ The direct allowlist is exact hostnames only. `services` entries, when present,
 contain the complete pinned resolved semantics that were reviewed: definition
 digest, revision, selected exclusions/write mode, hosts, requests, token
 destinations, and OAuth topology. A service's selection can also hold
-`hostRules`: per-host permission fields set with `host rules`. The compiler
+per-host permission settings made with `host rules`. The compiler
 overlays project and checkout-local desired layers, expands services, lays
-each service's `hostRules` over its resolved request rule for that host (the
+each service's per-host settings over its resolved request rule for that host (the
 service stays the rule's one owner), rejects ownership conflicts, and emits
 the narrow effective policy. A direct `requests` rule on a service host still
 replaces the service's whole rule. Token values remain separate host-owned
@@ -1121,7 +1106,7 @@ Supported source types include:
 - 1Password secret refs;
 - host-owned commands such as `gh auth token`;
 - stdin for one-shot setup;
-- generated JWT sources: ES256 signers, and Google service-account signers whose key stays in 1Password and is read on the host for each signature;
+- generated JWT sources: host-signed JWTs from a private key you supply, and Google service-account signers whose key stays in 1Password and is read on the host for each signature;
 - service-specific OAuth seed material.
 
 The host CLI records the source and syncs resolved values into proxy-only token state. The proxy strips conflicting inbound credential headers and injects configured headers only for matching hosts and optional path prefixes. OAuth-backed services expose agent-visible handles, while token material remains mediated by the proxy.
@@ -1185,8 +1170,7 @@ settings:
   declared metadata URL, puts it there. The record marks such a host as
   cross-host, with the endpoint kinds it serves, so every later launch knows
   that the host exists only for those endpoints. A registration endpoint on
-  a cross-host host is matched by exact path; other registration endpoints
-  match their path and everything under it.
+  such a host is matched more narrowly than one on the MCP endpoint's host.
 - **Binding hosts.** The server's `--oauth-host` hosts. At run time the proxy
   also accepts a token or registration endpoint that the server's own
   metadata names on one of them, and mediates it.
@@ -1211,13 +1195,10 @@ settings:
   endpoint. They get a lighter form of the same request check that leaves
   MCP traffic alone.
 - **Share groups.** One server enabled for Claude and for Codex is one
-  claimant. The host keeps a sticky owner for the group in the enable state,
-  and only the owner carries the endpoints and captures metadata, so the two
-  agents' providers never collide. A revoke also clears the other agent's
-  OAuth state when it has the same server name and source; a new group, or
-  an owner change, clears it once more. If the owner cannot be stored, the
-  group's endpoints are blocked for that launch, and the next launch that can
-  write the state settles it.
+  claimant with one OAuth login. The host records which agent owns the
+  login, so the two agents' providers never collide, and a revoke clears the
+  shared state. When the host cannot record the owner, it blocks the group's
+  endpoints until a later launch can.
 
 `mcp enable` refuses an endpoint that overlaps an approved service OAuth
 provider's endpoint. Service OAuth providers are merged in when the effective
@@ -1235,6 +1216,11 @@ app-bundled commands and skipped; `runfree mcp list` shows them as `skipped`.
 ## Dependency Overlays
 
 Dependency overlays mount common dependency directories and caches from Runfree-owned Docker volumes. This keeps generated dependency artifacts container-owned and reduces host artifact drift. The default is `dependencyOverlays: "auto"`; the `runfree deps` commands are in [cli.md](cli.md#dependency-overlays).
+
+The agent image creates the directories under the agent's home that lead to
+these mounts and to the per-project agent state, owned by the agent user. A
+tool can still write next to a mount, for example when pnpm installs a pinned
+pnpm version, instead of hitting a directory that Docker created as root.
 
 ## Project Image Customization
 
