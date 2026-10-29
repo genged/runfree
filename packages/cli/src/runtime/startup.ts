@@ -751,17 +751,24 @@ function comparableEffectiveControlPlaneSelection(stateDir: string): unknown {
   }
 }
 
-function applyRuntimeUpgradePlan(context: RuntimeContext, docker: RuntimeDocker, plan: RuntimeUpgradePlan): number {
+export function applyRuntimeUpgradePlan(
+  context: RuntimeContext,
+  docker: RuntimeDocker,
+  plan: RuntimeUpgradePlan,
+  // The unlocked pass previews the plan and the locked pass re-plans and acts;
+  // only the locked pass announces, so a start says it once.
+  options: Readonly<{ announce: boolean }>,
+): number {
   switch (plan.action) {
     case "none":
     case "token-sync":
       return 0;
     case "proxy-restart": {
-      warn(`runtime upgrade plan: proxy restart (${serviceList(plan.services)})`);
+      if (options.announce) warn(`runtime upgrade plan: proxy restart (${serviceList(plan.services)})`);
       return 0;
     }
     case "component-select":
-      warn("runtime upgrade plan: select new host materialization");
+      if (options.announce) warn("runtime upgrade plan: select new host materialization");
       return 0;
     case "blocked-incompatible":
       warn(`the runtime was not updated: active sessions use an incompatible ${plan.reason === "admission-epoch" ? "admission epoch" : "control-plane topology"}`);
@@ -1483,7 +1490,7 @@ export async function startRuntime(
           stateDir: preparedPlan.paths.stateDir,
         })) reportRuntimeVerbose(true, line);
       }
-      const upgradeStatus = timings.time("startup:upgrade-apply", () => applyRuntimeUpgradePlan(existingContext, adapters.docker, upgradePlan));
+      const upgradeStatus = timings.time("startup:upgrade-apply", () => applyRuntimeUpgradePlan(existingContext, adapters.docker, upgradePlan, { announce: false }));
       if (upgradeStatus !== 0) return result(upgradeStatus, false, existingContext);
       // Diagnostic only: the marker status picks between two verbose lines and
       // validation replaces the marker right after, so a quiet start skips the
@@ -1634,7 +1641,7 @@ export async function startRuntime(
     timings.time("startup:select-session-agent", () => selectPreparedSessionAgent(activePlan, adapters.docker));
     if (!removeExisting) {
       upgradePlan = timings.time("startup:upgrade-plan-locked", () => planRuntimeUpgradeFromV2State(preparedPlan, existingContext, adapters.docker));
-      const status = timings.time("startup:upgrade-apply-locked", () => applyRuntimeUpgradePlan(existingContext, adapters.docker, upgradePlan));
+      const status = timings.time("startup:upgrade-apply-locked", () => applyRuntimeUpgradePlan(existingContext, adapters.docker, upgradePlan, { announce: true }));
       if (status !== 0) return result(status, false, existingContext);
     }
     const activeContext = runtimeContextFromActivePlan(activePlan, {

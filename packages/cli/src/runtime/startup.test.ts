@@ -5,14 +5,18 @@ import path from "node:path";
 import { expect, test } from "vitest";
 
 import {
+  applyRuntimeUpgradePlan,
   ephemeralHelperImage,
   planValidatedIngressForwardersForRebuild,
   planRuntimeUpgradeFromV2State,
+  type RuntimeUpgradePlan,
 } from "./startup.ts";
 import { planValidatedIngressForwarders } from "./ingress-forwarder-ownership.ts";
 import type { RuntimePlan } from "./plan.ts";
 import type { CaptureResult, DockerContainerInspect, RuntimeContext, RuntimeIO } from "./types.ts";
 import { sha256Digest } from "./component-state.ts";
+import type { RuntimeDocker } from "./docker.ts";
+import { flushWarnings, pendingWarningsForTest } from "../warnings.ts";
 import {
   createControlPlaneGenerationV2,
   createRuntimeTopologyGenerationV2,
@@ -496,4 +500,24 @@ test("ephemeral helpers run the bound selected image id only when it belongs to 
   expect(ephemeralHelperImage(plan())).toBe("runfree-agent:abc");
   expect(ephemeralHelperImage(plan({ selectedAgentImageRef: "runfree-agent:other", selectedAgentImageId }))).toBe("runfree-agent:abc");
   expect(ephemeralHelperImage(plan({ selectedAgentImageRef: "runfree-agent:abc", selectedAgentImageId: "abc" }))).toBe("runfree-agent:abc");
+});
+
+test("the unlocked upgrade preview does not announce a proxy restart; the locked pass does", () => {
+  flushWarnings();
+  const context = {} as RuntimeContext;
+  const docker = {} as RuntimeDocker;
+  const plan: RuntimeUpgradePlan = { action: "proxy-restart", services: ["proxy"] };
+  expect(applyRuntimeUpgradePlan(context, docker, plan, { announce: false })).toBe(0);
+  expect(pendingWarningsForTest()).toEqual([]);
+  expect(applyRuntimeUpgradePlan(context, docker, plan, { announce: true })).toBe(0);
+  expect(pendingWarningsForTest().map((event) => event.message)).toEqual(["runtime upgrade plan: proxy restart (proxy)"]);
+  flushWarnings();
+});
+
+test("a blocked upgrade plan refuses and warns even unannounced", () => {
+  flushWarnings();
+  const plan: RuntimeUpgradePlan = { action: "blocked-incompatible", reason: "admission-epoch", services: [] };
+  expect(applyRuntimeUpgradePlan({} as RuntimeContext, {} as RuntimeDocker, plan, { announce: false })).toBe(1);
+  expect(pendingWarningsForTest()[0]?.message).toContain("the runtime was not updated");
+  flushWarnings();
 });
