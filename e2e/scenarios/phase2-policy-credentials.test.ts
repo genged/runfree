@@ -329,7 +329,7 @@ describe("Phase 2 user-defined service evolution through the packaged CLI", () =
       assertExit(unavailableDiff, 0);
       assertOutputContains(unavailableDiff, "user-acme (project): definition unavailable; approved semantics retained");
       expect(fs.readFileSync(policyPath(world))).toEqual(pinnedV2Bytes);
-      const explanation = await world.runfree(["service", "explain", "user-acme"]);
+      const explanation = await world.runfree(["service", "explain", "user-acme", "--json"]);
       assertExit(explanation, 0);
       assertOutputContains(explanation, '"revision": 2');
       assertOutputContains(explanation, '"api-v2.acme.example"');
