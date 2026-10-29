@@ -3,9 +3,10 @@
 //
 // Preflight. A headless session has no approver, so the proxy denies every
 // write that resolves to `ask` (`headless-denied`). Before launch, `run`
-// refuses with 65 when any write can resolve to `ask`, unless
-// `--accept-denied-writes` was given. The preflight is an early warning only:
-// the proxy is the enforcement. It reads what the proxy enforces (the active
+// lists every way a write can resolve to `ask`, warns in one line, and
+// records the list in run.json; it does not refuse (maintainer decision
+// 2026-10-29, reversing headless-run spec §7 decision 2). The proxy is the
+// enforcement. The preflight reads what the proxy enforces (the active
 // effective policy generation, including its MCP operation policy payload)
 // and resolves every action with the proxy's own shared resolvers from
 // runtime-contracts, never a copy:
@@ -18,8 +19,10 @@
 //     a host with no rule (the proxy's `writeApproval ?? DEFAULT_WRITE_ACTION`).
 //
 // `DEFAULT_WRITE_ACTION` is `ask` (plan C7), so a project with an allowlisted
-// host and no write rules refuses: that is spec decision 2, not a defect.
-// Anything the preflight cannot read is exposure (fail closed).
+// host and no write rules warns. Anything the preflight cannot read is named
+// in the warning. The proxy picks an MCP rule by endpoint, not by the
+// session's agent, so a Codex server's rule applies to a Claude run too; the
+// listing keeps every server and names it by endpoint.
 //
 // Unchecked authority. Host-service tunnels, mediated OAuth exchanges, and
 // stdio or loopback MCP servers do not pass write posture
@@ -63,6 +66,9 @@ export type HeadlessAskMcpServer = Readonly<{
   serverId: string;
   agent: string;
   name: string;
+  /** The endpoint the proxy matches the rule by, for every session (mcp-classify.ts). */
+  host: string;
+  path: string;
   /** An unlisted tool resolves to `ask` (the server default, else the global action). */
   defaultAsk: boolean;
   /** Listed tools whose own rule resolves to `ask`. */
@@ -70,17 +76,16 @@ export type HeadlessAskMcpServer = Readonly<{
 }>;
 
 export type HeadlessAskExposure = Readonly<{
-  askHosts: readonly string[];
+  /** Hosts with no per-host write rule; their writes use the global action, which is `ask`. */
+  defaultAskHosts: readonly string[];
+  /** Hosts whose own write rule (direct or a service's) is `ask`. */
+  ruleAskHosts: readonly string[];
   askMcp: readonly HeadlessAskMcpServer[];
   /** MCP servers are configured and the global action, which unclassified MCP methods use, is `ask`. */
   globalAskWithMcp: boolean;
-  /** Why the enforced policy could not be read; any entry is exposure. */
+  /** Why the enforced policy could not be read. */
   unreadable: readonly string[];
 }>;
-
-export type HeadlessWritePosturePreflight =
-  | Readonly<{ kind: "pass"; accepted: boolean; exposure: HeadlessAskExposure }>
-  | Readonly<{ kind: "refuse"; status: 65; message: string; exposure: HeadlessAskExposure }>;
 
 function errorText(error: unknown): string {
   return (error instanceof Error ? error.message : String(error)).split("\n")[0] ?? "unknown error";
@@ -89,6 +94,7 @@ function errorText(error: unknown): string {
 /** The exposure of one loaded policy pair, resolved with the proxy's shared resolvers. */
 export function askExposureOf(controls: Readonly<{ policy: LoadedNetworkPolicy; mcp?: LoadedMcpOperationPolicy }>): HeadlessAskExposure {
   const { policy } = controls;
+  const ruled = (host: string): boolean => policy.requests[host]?.writeAction !== undefined;
   const askHosts = policy.allowedHosts.filter((host) => effectiveWriteAction(policy, host) === "ask");
   const globalWriteAction = effectiveWriteAction({ requests: {}, writeApproval: policy.writeApproval }, NO_RULE_HOST);
   const servers = controls.mcp?.servers ?? [];
@@ -96,11 +102,12 @@ export function askExposureOf(controls: Readonly<{ policy: LoadedNetworkPolicy; 
     const defaultAsk = effectiveMcpToolAction({ ...server, tools: {} }, UNLISTED_TOOL, globalWriteAction) === "ask";
     const askTools = Object.keys(server.tools).filter((tool) => effectiveMcpToolAction(server, tool, globalWriteAction) === "ask");
     return defaultAsk || askTools.length > 0
-      ? [{ serverId: server.id, agent: server.agent, name: server.name, defaultAsk, askTools }]
+      ? [{ serverId: server.id, agent: server.agent, name: server.name, host: server.host, path: server.path, defaultAsk, askTools }]
       : [];
   });
   return {
-    askHosts,
+    defaultAskHosts: askHosts.filter((host) => !ruled(host)),
+    ruleAskHosts: askHosts.filter(ruled),
     askMcp,
     globalAskWithMcp: servers.length > 0 && globalWriteAction === "ask",
     unreadable: [],
@@ -134,54 +141,43 @@ function readEnforcedControls(context: Pick<RuntimeContext, "project">): Enforce
   return { policy, generation, ...(mcp ? { mcp } : {}) };
 }
 
-/** Every way a write of this project can resolve to `ask` now; unreadable state is exposure. */
+/** Every way a write of this project can resolve to `ask` now; unreadable state is named. */
 export function headlessAskExposure(context: Pick<RuntimeContext, "project">): HeadlessAskExposure {
   try {
     return askExposureOf(readEnforcedControls(context));
   } catch (error) {
-    return { askHosts: [], askMcp: [], globalAskWithMcp: false, unreadable: [`the effective policy could not be read: ${errorText(error)}`] };
+    return { defaultAskHosts: [], ruleAskHosts: [], askMcp: [], globalAskWithMcp: false, unreadable: [`the effective policy could not be read: ${errorText(error)}`] };
   }
 }
 
 export function hasAskExposure(exposure: HeadlessAskExposure): boolean {
-  return exposure.askHosts.length > 0 || exposure.askMcp.length > 0 || exposure.globalAskWithMcp || exposure.unreadable.length > 0;
+  return exposure.defaultAskHosts.length > 0
+    || exposure.ruleAskHosts.length > 0
+    || exposure.askMcp.length > 0
+    || exposure.globalAskWithMcp
+    || exposure.unreadable.length > 0;
 }
 
-function exposureLines(exposure: HeadlessAskExposure): string[] {
-  return [
-    ...exposure.unreadable.map((reason) => `  - ${reason}`),
-    ...exposure.askHosts.map((host) => `  - host ${host}: writes ask`),
-    ...exposure.askMcp.map((server) => {
-      const parts = [
-        ...(server.defaultAsk ? ["unlisted tools ask"] : []),
-        ...(server.askTools.length > 0 ? [`tools ask: ${server.askTools.join(", ")}`] : []),
-      ];
-      return `  - MCP server ${server.agent} ${server.name}: ${parts.join("; ")}`;
-    }),
-    ...(exposure.globalAskWithMcp ? ["  - MCP methods that are not classified use the global write action, which is ask"] : []),
-  ];
+function counted(count: number, singular: string, plural: string): string {
+  return `${count} ${count === 1 ? singular : plural}`;
 }
 
-/**
- * Refuses (65) when any write can resolve to `ask`, unless the operator
- * accepted denied writes. A pass with exposure is `accepted: true`.
- */
-export function headlessWritePosturePreflight(
+/** The one-line launch warning, or undefined when nothing would ask or the operator accepted denials. */
+export function headlessWritePostureWarning(
   exposure: HeadlessAskExposure,
   options: Readonly<{ acceptDeniedWrites: boolean }>,
-): HeadlessWritePosturePreflight {
-  if (!hasAskExposure(exposure)) return { kind: "pass", accepted: false, exposure };
-  if (options.acceptDeniedWrites) return { kind: "pass", accepted: true, exposure };
-  return {
-    kind: "refuse",
-    status: 65,
-    exposure,
-    message: [
-      "refusing a headless run: these writes would ask for approval, and a headless session denies them:",
-      ...exposureLines(exposure),
-      "Set each to allow or deny with host or MCP write rules, or pass --accept-denied-writes to run and let them be denied.",
-    ].join("\n"),
-  };
+): string | undefined {
+  if (options.acceptDeniedWrites || !hasAskExposure(exposure)) return undefined;
+  if (exposure.unreadable.length > 0) {
+    return `headless run: the write posture could not be read (${exposure.unreadable.join("; ")}); writes that would ask for approval are denied`;
+  }
+  const hosts = exposure.defaultAskHosts.length + exposure.ruleAskHosts.length;
+  const parts = [
+    ...(hosts > 0 ? [counted(hosts, "host", "hosts")] : []),
+    ...(exposure.askMcp.length > 0 ? [counted(exposure.askMcp.length, "MCP endpoint", "MCP endpoints")] : []),
+    ...(exposure.globalAskWithMcp ? ["unclassified MCP methods"] : []),
+  ];
+  return `headless run: writes that would ask for approval are denied (${parts.join(", ")}); run.json lists them`;
 }
 
 const UNCHECKED_SOURCES: readonly HeadlessUncheckedAuthoritySource[] = ["hostServices", "oauthExchanges", "localMcpServers"];

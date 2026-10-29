@@ -71,7 +71,7 @@ export const runCommand: CommandModule = {
             .option("accept-denied-writes", {
               type: "boolean",
               default: false,
-              describe: "Run even if writes would ask for approval; they are denied and the exit code ignores them",
+              describe: "Exit 0 even if the proxy denied writes that would ask for approval (otherwise 68)",
             })
             .option("verbose", { type: "boolean", alias: "v", describe: "Show extra startup diagnostics" })
             // Strict mode does not see words after `--`; yargs keeps them in
@@ -86,7 +86,7 @@ export const runCommand: CommandModule = {
             .epilogue(
               "The run never prompts and never holds a write for approval. "
                 + "Exit codes: 0 success, 1-63 the agent failed or the result is unverified, 64 usage, "
-                + "65 refused before launch, 66 another run holds the project lock, 67 timeout or signal, "
+                + "65 refused before launch (an approval, service review, or credential source), 66 another run holds the project lock, 67 timeout or signal, "
                 + "68 success but writes were denied without --accept-denied-writes. "
                 + "The run record is kept in Runfree state under runs/<run-id>/, never in the project.",
             ),

@@ -22,11 +22,10 @@ import path from "node:path";
 
 import { APPROVAL_HEADLESS_DENIED_EVENT_PREFIX } from "@runfree/runtime-contracts/write-approvals";
 import { BUILTIN_AGENT_DESCRIPTORS, builtinAgent } from "../agents.ts";
-import { remedy } from "../remedies.ts";
 import { runHeadlessAgentRuntime, type HeadlessRuntimeHooks, type HeadlessRuntimeResult } from "../runtime.ts";
 import { deferSignalExit } from "../signal-exit.ts";
 import { createHeadlessRuntimeIO, enterHeadlessTerminalMode } from "../terminal-mode.ts";
-import { runfreeError, warn } from "../warnings.ts";
+import { flushWarnings, runfreeError, warn } from "../warnings.ts";
 import {
   createHeadlessOutputParser,
   decideHeadlessOutcome,
@@ -57,9 +56,9 @@ import {
 } from "./headless-run-record.ts";
 import {
   headlessAskExposure,
-  headlessWritePosturePreflight,
+  headlessWritePostureWarning,
   uncheckedAuthority,
-  type HeadlessWritePosturePreflight,
+  type HeadlessAskExposure,
 } from "./headless-write-posture.ts";
 import { dockerClientEnvOptions } from "./docker.ts";
 import { createDockerClient } from "./docker-client.ts";
@@ -114,7 +113,7 @@ export type HeadlessRunDeps = Readonly<{
   ) => Promise<HeadlessRuntimeResult<T>>;
   launch: (input: SessionHeadlessLaunchInput) => Promise<SessionHeadlessLaunchResult>;
   createSpawner: (sinks: HeadlessForegroundSinks) => HeadlessForegroundCapture;
-  writePosture: (activeContext: RuntimeContext, options: Readonly<{ acceptDeniedWrites: boolean }>) => HeadlessWritePosturePreflight;
+  writePosture: (activeContext: RuntimeContext) => HeadlessAskExposure;
   uncheckedAuthority: (activeContext: RuntimeContext, agentName: string) => HeadlessUncheckedAuthority;
   countDenials: (input: HeadlessDenialCountInput) => number | null;
   acquireLock: (input: AcquireHeadlessRunLockInput) => HeadlessRunLock;
@@ -128,8 +127,7 @@ const DEFAULT_DEPS: HeadlessRunDeps = Object.freeze({
   runtime: runHeadlessAgentRuntime,
   launch: launchHeadlessAgentThroughAdmission,
   createSpawner: (sinks: HeadlessForegroundSinks) => createHeadlessForegroundSpawner(sinks),
-  writePosture: (activeContext: RuntimeContext, options: Readonly<{ acceptDeniedWrites: boolean }>) =>
-    headlessWritePosturePreflight(headlessAskExposure(activeContext), options),
+  writePosture: headlessAskExposure,
   uncheckedAuthority,
   countDenials: countHeadlessDenials,
   acquireLock: acquireHeadlessRunLock,
@@ -145,11 +143,6 @@ const DEFAULT_DEPS: HeadlessRunDeps = Object.freeze({
 /** Built-in agents with a headless mode: the only `run` targets. */
 export function headlessAgentIds(): string[] {
   return BUILTIN_AGENT_DESCRIPTORS.filter((descriptor) => descriptor.headless !== undefined).map((descriptor) => descriptor.id);
-}
-
-/** A `--timeout` value for a printed command: whole seconds, at least 1. */
-function formatTimeout(timeoutMs: number): string {
-  return `${Math.max(1, Math.ceil(timeoutMs / 1000))}s`;
 }
 
 function errorText(error: unknown): string {
@@ -383,6 +376,7 @@ async function runUnderLock(input: RunInput): Promise<number> {
   let launchResult: SessionHeadlessLaunchResult | undefined;
   let launchError: unknown;
   let unchecked: HeadlessUncheckedAuthority | null = null;
+  let askExposure: HeadlessAskExposure | null = null;
   let active: Readonly<{ context: RuntimeContext; proxyId: string }> | undefined;
 
   try {
@@ -398,16 +392,17 @@ async function runUnderLock(input: RunInput): Promise<number> {
           unchecked = deps.uncheckedAuthority(activeContext, agentName);
           // A startup signal skips the launch; the abort decides the code.
           if (input.aborted() !== undefined) return HEADLESS_RUN_EXIT.interrupted;
-          const posture = deps.writePosture(activeContext, { acceptDeniedWrites: options.acceptDeniedWrites });
-          if (posture.kind === "refuse") {
-            runfreeError([
-              posture.message,
-              `Rerun accepting the denials: ${remedy.runAcceptDeniedWrites(agentName, options.promptFile, {
-                ...(options.timeoutMs !== undefined ? { timeout: formatTimeout(options.timeoutMs) } : {}),
-              })}`,
-              "the headless run did not start",
-            ].join("\n"));
-            return posture.status;
+          // Early warning only: the proxy denies every ask write of a headless
+          // session, so an exposed run still starts (maintainer decision
+          // 2026-10-29). The list goes to run.json, one line to the terminal.
+          askExposure = deps.writePosture(activeContext);
+          const warning = headlessWritePostureWarning(askExposure, { acceptDeniedWrites: options.acceptDeniedWrites });
+          if (warning !== undefined) {
+            warn(warning);
+            // `warn` only buffers, and the runtime flushed the buffer just
+            // before this hook. Flush now, so the line prints before the
+            // launch and lands in the run's stderr.log tee, not at CLI exit.
+            flushWarnings();
           }
           return undefined;
         },
@@ -499,6 +494,7 @@ async function runUnderLock(input: RunInput): Promise<number> {
     ...(session.containerId !== undefined ? { containerId: session.containerId } : {}),
     headlessDenials: denials,
     uncheckedAuthority: unchecked,
+    askExposure,
     streamsDrained,
     reattached: capture.reattached(),
     transcriptBytes: record?.transcriptBytes() ?? 0,
@@ -551,6 +547,7 @@ function writeSkippedRecord(
       teardown: "not-started",
       headlessDenials: 0,
       uncheckedAuthority: null,
+      askExposure: null,
       streamsDrained: false,
       reattached: false,
       transcriptBytes: 0,

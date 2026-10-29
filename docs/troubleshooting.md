@@ -265,18 +265,15 @@ The rest of the flow is in [Approve-On-Write](cli.md#approve-on-write).
 
 `runfree run` never prompts, so a step that would ask refuses instead:
 
-- **65, `refusing a headless run: these writes would ask for approval`.** A
-  headless session has no approver. Set each listed host or MCP rule to
-  `allow` or `deny` (`runfree host rules <host> --write deny`,
-  `runfree mcp rules claude my-server --write allow`), or pass
-  `--accept-denied-writes`. Other 65 refusals name the approval, service
-  review, or credential source to fix in a terminal first.
+- **65, `the headless run did not start`.** Fix the named approval, service
+  review, or credential source in a terminal first.
 - **66, `another headless run holds this project's run lock`.** Wait for the
   other run. If it is gone, find its session with `runfree sessions` and
   remove it with `runfree stop`; the next run reclaims the lock.
 - **68, `warning: <n> writes were denied (headless)`.** The agent succeeded,
   but the proxy denied writes. Allow or deny those writes explicitly, or pass
-  `--accept-denied-writes` if the denials are expected.
+  `--accept-denied-writes` if the denials are expected. `run.json` lists,
+  under `askExposure`, every host and MCP endpoint that would ask.
 
 `run.json` in the run record counts the denied writes. See
 [Headless runs](cli.md#headless-runs).

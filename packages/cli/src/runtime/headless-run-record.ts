@@ -16,6 +16,7 @@ import path from "node:path";
 
 import { atomicReplaceFile, isPathInsideByRealpath, statKind } from "../safe-fs.ts";
 import { HEADLESS_TRANSCRIPT_CAP_BYTES } from "./headless-agent-output.ts";
+import type { HeadlessAskExposure } from "./headless-write-posture.ts";
 
 export const HEADLESS_RUN_ID_PATTERN = /^run-[0-9]{8}T[0-9]{6}Z-[a-f0-9]{8}$/;
 export const HEADLESS_STDERR_CAP_BYTES = 16 * 1024 * 1024;
@@ -52,6 +53,8 @@ export type HeadlessRunJson = Readonly<{
   acceptDeniedWrites: boolean;
   /** `null` when the run ended before the listing was made. */
   uncheckedAuthority: HeadlessUncheckedAuthority | null;
+  /** Every way a write could resolve to ask at launch; `null` when the run ended before the check. */
+  askExposure: HeadlessAskExposure | null;
   streamsDrained: boolean;
   reattached: boolean;
   transcriptBytes: number;
@@ -236,9 +239,13 @@ export function summaryLines(input: Readonly<{
   recordDir: string;
 }>): string[] {
   const lines: string[] = [];
-  lines.push(input.finalMessage ?? `(no final message from the agent; outcome: ${input.run.outcome})`);
+  const started = input.run.teardown !== "not-started";
+  lines.push(input.finalMessage
+    ?? (started
+      ? `(no final message from the agent; outcome: ${input.run.outcome})`
+      : `(the run did not start; outcome: ${input.run.outcome})`));
   const denials = input.run.headlessDenials;
-  if (denials === null && input.run.teardown !== "not-started") {
+  if (denials === null && started) {
     lines.push("warning: the headless write denials could not be counted");
   } else if (denials !== null && denials > 0) {
     lines.push(`warning: ${denials} ${denials === 1 ? "write was" : "writes were"} denied (headless)`);

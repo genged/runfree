@@ -173,7 +173,7 @@ as success.
 | --- | --- |
 | `--prompt-file <file>` | Required. The prompt, given to the agent as its stdin. The path is resolved from the directory you run `runfree` in, not from `--workspace`. It must be a regular file, not a symlink, and at most 1 MiB. |
 | `--timeout <duration>` | Stop the run after this long, from `1s` to `24h` (for example `30m` or `2h`). The run exits 67. |
-| `--accept-denied-writes` | Run even if some writes would ask for approval. The proxy denies them, and they do not change the exit code. |
+| `--accept-denied-writes` | Exit 0 even if the proxy denied writes that would ask for approval. Without it, a run that succeeds with denied writes exits 68. |
 | `--verbose`, `-v` | Print extra startup diagnostics. |
 
 The agent gets no other arguments: Runfree sets the agent's command line, and
@@ -185,27 +185,29 @@ keystroke from a terminal reaches the agent.
 
 A run never prompts. A step that needs an answer refuses instead (exit 65):
 new authority that `runfree policy approve` or `runfree control approve` must
-approve, a service review, and a host credential source
-that cannot be read (for example, a locked 1Password).
+approve, a service review, and a host credential source that cannot be read
+(for example, a locked 1Password).
 
-**The default write action is `ask`, so most projects are refused at first.**
-A headless session has no approver, so the proxy denies an `ask` write at
-once instead of holding it. Before the launch, `run` refuses with 65 if any
-write can resolve to `ask`, and lists each case:
+**Writes that would ask are denied, not held.** A headless session has no
+approver, so the proxy denies an `ask` write at once. Interactive sessions in
+the same project still ask. Before the launch, `run` checks what could ask,
+prints one warning with the counts, and records the full list in `run.json`
+under `askExposure`:
 
-- an allowed host without an explicit write rule (the default is `ask`), or
-  with `--write ask`;
-- an MCP server, or one of its tools, whose rule is `ask`;
-- MCP methods that are not classified, which use the global write action
-  (`ask` by default), while any MCP server is configured.
+- allowed hosts that follow the default write action (`ask` unless the project
+  sets `writeApproval`), and hosts whose own write rule is `ask`;
+- MCP endpoints, or their tools, whose rule is `ask`. The proxy applies an MCP
+  rule by endpoint, so a server from either agent's config counts;
+- MCP methods that are not classified, while any MCP server is configured.
 
-Set each one to `allow` or `deny` (`runfree host rules <host> --write deny`,
-`runfree mcp rules claude my-server --write allow`), or pass
-`--accept-denied-writes` to run and let those writes be denied. The check is
-an early warning; the proxy enforces the denial even if a rule changes to
-`ask` during the run. Each denied write is counted. Without
-`--accept-denied-writes`, a run that would succeed with any denied write exits
-68.
+The run starts either way. The check is an early warning; the proxy enforces
+the denial even if a rule changes to `ask` during the run. Each denied write is
+counted. A run that would succeed with any denied write exits 68, unless you
+pass `--accept-denied-writes`. To let a host's writes through in headless runs,
+set `runfree host rules <host> --write allow` (or
+`runfree mcp rules claude my-server --write allow` for an MCP server); to
+silence one, set `--write deny`. Both settings apply to interactive sessions
+too.
 
 Some authority does not pass write approval: [host services](#host-services),
 mediated OAuth exchanges, and STDIO or loopback MCP servers. A run allows them
@@ -228,7 +230,7 @@ confirmed. A second signal only shortens the container stop.
 | 0 | Success: the agent exited 0 and reported a final success. |
 | 1–63 | The agent failed (its own code; a code above 63 becomes 1), or the result is unverified (1): no final success, a lost status, an incomplete output stream, or denied writes that could not be counted. |
 | 64 | Usage error: a bad flag, agent, timeout, or prompt file. Nothing was started. |
-| 65 | Refused before the launch: an invalid project config or network policy, approval, service review, login or credential source, or write posture. |
+| 65 | Refused before the launch: an invalid project config or network policy, approval, service review, login or credential source. |
 | 66 | Skipped: another run holds the project lock. |
 | 67 | Timeout or signal, whatever the agent returned. |
 | 68 | The agent succeeded, but writes were denied and `--accept-denied-writes` was not given. |

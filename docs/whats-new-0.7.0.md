@@ -31,10 +31,11 @@ runfree run pi --prompt-file task.md --accept-denied-writes
 - A run never prompts. A step that needs an answer, such as a policy approval,
   a service review, or a locked credential source, refuses with 65.
 - A headless session has no approver, so the proxy denies an `ask` write at
-  once instead of holding it. Before the launch, `run` refuses with 65 and
-  lists each host and MCP rule that can resolve to `ask`. Set each one to
-  `allow` or `deny`, or pass `--accept-denied-writes`. A run that succeeds with
-  denied writes and without that flag exits 68.
+  once instead of holding it. Before the launch, `run` prints one warning with
+  the counts of hosts and MCP endpoints that can resolve to `ask`, and lists
+  them in `run.json` under `askExposure`. The run starts either way.
+  Interactive sessions still ask. A run that succeeds with denied writes exits
+  68 unless you pass `--accept-denied-writes`.
 - One run at a time per project: a second run exits 66. `--timeout` and
   signals exit 67.
 - Each run keeps a record on the host only, under the project's state

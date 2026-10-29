@@ -87,7 +87,8 @@ type Harness = Readonly<{
   launchCalls: () => number;
   lockCalls: () => number;
   released: () => boolean;
-  postureOptions: () => unknown[];
+  /** The captured stderr when the launch began, or undefined before it. */
+  stderrAtLaunch: () => string | undefined;
 }>;
 
 function promptHostPath(input: SessionHeadlessLaunchInput): string {
@@ -97,7 +98,7 @@ function promptHostPath(input: SessionHeadlessLaunchInput): string {
 function harness(options: Readonly<{
   launch?: FakeLaunch;
   runtime?: (hooks: HeadlessRuntimeHooks<SessionHeadlessLaunchResult>) => Promise<HeadlessRuntimeResult<SessionHeadlessLaunchResult>>;
-  refusePosture?: boolean;
+  askPosture?: boolean;
   denials?: number | null;
   drained?: boolean;
 }> = {}): Harness {
@@ -106,7 +107,7 @@ function harness(options: Readonly<{
   let launchCalls = 0;
   let lockCalls = 0;
   let released = false;
-  const postureOptions: unknown[] = [];
+  let stderrAtLaunch: string | undefined;
   let sinks: HeadlessForegroundSinks | undefined;
   const launch: FakeLaunch = options.launch ?? (async (input, out) => {
     input.headless.observer?.allocated({ sessionId: SESSION_ID, containerName: CONTAINER_NAME });
@@ -138,6 +139,7 @@ function harness(options: Readonly<{
     },
     launch: async (input) => {
       launchCalls += 1;
+      stderrAtLaunch = vi.mocked(console.error).mock.calls.flat().join("\n");
       events.push("launch");
       if (!sinks) throw new Error("no capture sinks");
       return await launch(input, sinks);
@@ -152,12 +154,13 @@ function harness(options: Readonly<{
         reattached: () => false,
       };
     },
-    writePosture: (_active, postureInput) => {
-      postureOptions.push(postureInput);
-      return options.refusePosture && !postureInput.acceptDeniedWrites
-        ? { kind: "refuse", status: 65, message: "refusing a headless run: host api.example.com: writes ask", exposure: { askHosts: ["api.example.com"], askMcp: [], globalAskWithMcp: false, unreadable: [] } }
-        : { kind: "pass", accepted: postureInput.acceptDeniedWrites, exposure: { askHosts: [], askMcp: [], globalAskWithMcp: false, unreadable: [] } };
-    },
+    writePosture: () => ({
+      defaultAskHosts: [],
+      ruleAskHosts: options.askPosture ? ["api.example.com"] : [],
+      askMcp: [],
+      globalAskWithMcp: false,
+      unreadable: [],
+    }),
     uncheckedAuthority: () => ({ hostServices: ["db"], oauthExchanges: [], localMcpServers: [], unreadable: [] }),
     countDenials: () => {
       events.push("count-denials");
@@ -195,7 +198,7 @@ function harness(options: Readonly<{
     launchCalls: () => launchCalls,
     lockCalls: () => lockCalls,
     released: () => released,
-    postureOptions: () => postureOptions,
+    stderrAtLaunch: () => stderrAtLaunch,
   };
 }
 
@@ -396,10 +399,9 @@ describe("runHeadlessAgent", () => {
     expect(stdout).toContain("warning: 3 writes were denied (headless)");
   });
 
-  test("--accept-denied-writes skips the posture refusal and keeps a success with denials at 0", async () => {
-    const h = harness({ refusePosture: true, denials: 2 });
+  test("--accept-denied-writes keeps a success with denials at 0", async () => {
+    const h = harness({ askPosture: true, denials: 2 });
     expect(await run(h, { acceptDeniedWrites: true })).toBe(0);
-    expect(h.postureOptions()).toEqual([{ acceptDeniedWrites: true }]);
     expect(runJson()).toMatchObject({ outcome: "success", exitCode: 0, headlessDenials: 2, acceptDeniedWrites: true });
     expect(stdout).toContain("warning: 2 writes were denied (headless)");
   });
@@ -413,18 +415,35 @@ describe("runHeadlessAgent", () => {
     expect(await run(harness({ denials: null }), { acceptDeniedWrites: true })).toBe(0);
   });
 
-  test("a write-posture exposure refuses with 65 before the launch, and cleans up", async () => {
-    const h = harness({ refusePosture: true });
-    expect(await run(h)).toBe(65);
-    expect(h.launchCalls()).toBe(0);
+  test("a write-posture exposure warns, launches, and records the exposure", async () => {
+    const h = harness({ askPosture: true });
+    expect(await run(h)).toBe(0);
+    expect(h.launchCalls()).toBe(1);
+    const warning = "headless run: writes that would ask for approval are denied (1 host); run.json lists them";
+    // Flushed before the launch, so it lands in the run's stderr.log tee.
+    expect(h.stderrAtLaunch()).toContain(warning);
     const stderr = vi.mocked(console.error).mock.calls.flat().join("\n");
-    expect(stderr).toContain("host api.example.com: writes ask");
-    // The remedy is the same run plus the flag, and it parses
-    // (scripts/emitted-commands.test.ts covers the registry rendering).
-    expect(stderr).toMatch(/Rerun accepting the denials: runfree run claude --prompt-file \S+ --accept-denied-writes/);
-    expect(runJson()).toMatchObject({ outcome: "refused", exitCode: 65, teardown: "not-started", agentStatus: null });
-    expect(inboxPrompts()).toEqual([]);
-    expect(h.released()).toBe(true);
+    expect(stderr.split(warning)).toHaveLength(2);
+    expect(stderr).not.toContain("refusing a headless run");
+    expect(runJson()).toMatchObject({
+      outcome: "success",
+      exitCode: 0,
+      askExposure: { ruleAskHosts: ["api.example.com"], defaultAskHosts: [] },
+    });
+  });
+
+  test("with --accept-denied-writes the exposure is recorded but not warned", async () => {
+    const h = harness({ askPosture: true });
+    expect(await run(h, { acceptDeniedWrites: true })).toBe(0);
+    const stderr = vi.mocked(console.error).mock.calls.flat().join("\n");
+    expect(stderr).not.toContain("headless run: writes that would ask");
+    expect(runJson()).toMatchObject({ askExposure: { ruleAskHosts: ["api.example.com"] } });
+  });
+
+  test("an exposed run whose writes were denied still exits 68", async () => {
+    const h = harness({ askPosture: true, denials: 2 });
+    expect(await run(h)).toBe(68);
+    expect(runJson()).toMatchObject({ outcome: "success", exitCode: 68, headlessDenials: 2 });
   });
 
   test.each([
@@ -436,7 +455,7 @@ describe("runHeadlessAgent", () => {
     const h = harness({ runtime });
     expect(await run(h)).toBe(65);
     expect(h.launchCalls()).toBe(0);
-    expect(runJson()).toMatchObject({ outcome: "refused", exitCode: 65, teardown: "not-started" });
+    expect(runJson()).toMatchObject({ outcome: "refused", exitCode: 65, teardown: "not-started", askExposure: null });
     expect(inboxPrompts()).toEqual([]);
     expect(h.released()).toBe(true);
   });
@@ -749,7 +768,7 @@ const status = await runHeadlessAgent(context, nodeRuntimeIO, "claude", { prompt
     sinks = out;
     return { spawn: () => { throw new Error("unused"); }, drain: async () => ({ drained: true }), reattached: () => false };
   },
-  writePosture: () => ({ kind: "pass", accepted: false, exposure: { askHosts: [], askMcp: [], globalAskWithMcp: false, unreadable: [] } }),
+  writePosture: () => ({ defaultAskHosts: [], ruleAskHosts: [], askMcp: [], globalAskWithMcp: false, unreadable: [] }),
   uncheckedAuthority: () => ({ hostServices: [], oauthExchanges: [], localMcpServers: [], unreadable: [] }),
   countDenials: () => 0,
 });

@@ -13,13 +13,6 @@
 
 import { hostRulesCommand, type RequestPolicyJson } from "@runfree/runtime-contracts/network-policy";
 
-// One shell word for a pasted command: plain words stay bare, anything else
-// is single-quoted. Control characters never reach the terminal.
-function shellWord(value: string): string {
-  const visible = value.replace(/[\u0000-\u001f\u007f]/g, "?");
-  return /^[A-Za-z0-9._@%+=:,/-]+$/.test(visible) ? visible : `'${visible.replaceAll("'", "'\\''")}'`;
-}
-
 export const remedy = {
   up: (): string => "runfree up",
   stop: (): string => "runfree stop",
@@ -95,12 +88,6 @@ export const remedy = {
   hostServiceRemove: (name: string): string => `runfree host-service remove ${name}`,
   hostServiceList: (): string => "runfree host-service list",
   hostServiceRepair: (): string => "runfree host-service list --repair",
-  // The headless run repeated with the flags that matter, accepting denials.
-  runAcceptDeniedWrites: (agent: string, promptFile: string, options: { timeout?: string } = {}): string => [
-    `runfree run ${agent} --prompt-file ${shellWord(promptFile)}`,
-    ...(options.timeout ? [`--timeout ${options.timeout}`] : []),
-    "--accept-denied-writes",
-  ].join(" "),
 } as const;
 
 // One sample rendering per registry entry, for the parse gate.
@@ -172,7 +159,5 @@ export function sampleRemedyRenderings(): string[] {
     remedy.hostServiceRemove("devserver"),
     remedy.hostServiceList(),
     remedy.hostServiceRepair(),
-    remedy.runAcceptDeniedWrites("claude", "/tmp/task.md"),
-    remedy.runAcceptDeniedWrites("claude", "task.md", { timeout: "1800s" }),
   ];
 }

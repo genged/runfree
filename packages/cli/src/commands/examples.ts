@@ -53,7 +53,7 @@ export const COMMAND_EXAMPLES = {
   run: [
     { cmd: "runfree run claude --prompt-file task.md", blurb: "Run one headless Claude turn with task.md as its prompt" },
     { cmd: "runfree run claude --prompt-file task.md --timeout 30m", blurb: "Stop the run after 30 minutes (exit 67)" },
-    { cmd: "runfree run claude --prompt-file task.md --accept-denied-writes", blurb: "Run even if writes would ask for approval; they are denied" },
+    { cmd: "runfree run claude --prompt-file task.md --accept-denied-writes", blurb: "Exit 0 even if writes that would ask were denied" },
     { cmd: "runfree --workspace ~/proj run claude --prompt-file task.md", blurb: "Run in another project folder, as a scheduler does" },
   ],
   up: [

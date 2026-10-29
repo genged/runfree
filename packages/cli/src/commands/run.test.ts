@@ -4,7 +4,6 @@ import path from "node:path";
 import { afterEach, describe, expect, test, vi } from "vitest";
 
 import { CliError } from "../errors.ts";
-import { remedy } from "../remedies.ts";
 import { ControlPlaneRebindCandidateMismatchError } from "../runtime/control-plane-rebind-coordinator.ts";
 import type { RuntimeContext } from "../runtime/types.ts";
 import { runCommandApp } from "./app.ts";
@@ -265,13 +264,5 @@ describe("runfree run", () => {
     expect(help).toContain("--timeout");
     expect(help).toContain("--accept-denied-writes");
     expect(help).toContain("runfree run claude --prompt-file task.md");
-  });
-
-  test("the accept-denied-writes remedy repeats the run and quotes a prompt path for the shell", () => {
-    expect(remedy.runAcceptDeniedWrites("claude", "/tmp/task.md", { timeout: "1800s" }))
-      .toBe("runfree run claude --prompt-file /tmp/task.md --timeout 1800s --accept-denied-writes");
-    expect(remedy.runAcceptDeniedWrites("claude", "/tmp/my task's.md"))
-      .toBe("runfree run claude --prompt-file '/tmp/my task'\\''s.md' --accept-denied-writes");
-    expect(remedy.runAcceptDeniedWrites("claude", "/tmp/a\nb.md")).toBe("runfree run claude --prompt-file '/tmp/a?b.md' --accept-denied-writes");
   });
 });

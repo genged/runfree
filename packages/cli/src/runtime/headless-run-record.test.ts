@@ -57,6 +57,7 @@ function runJson(overrides: Partial<HeadlessRunJson> = {}): HeadlessRunJson {
     headlessDenials: 0,
     acceptDeniedWrites: false,
     uncheckedAuthority: { hostServices: [], oauthExchanges: [], localMcpServers: [], unreadable: [] },
+    askExposure: null,
     streamsDrained: true,
     reattached: false,
     transcriptBytes: 0,
@@ -229,6 +230,16 @@ describe("summaryLines", () => {
       .toContain("warning: 1 write was denied (headless)");
     expect(summaryLines({ run: runJson({ headlessDenials: null }), finalMessage: "ok", recordDir: dir }))
       .toContain("warning: the headless write denials could not be counted");
+  });
+
+  test("a run refused before launch says it did not start, not that the agent sent nothing", () => {
+    const lines = summaryLines({ run: runJson({ outcome: "refused", exitCode: 65, teardown: "not-started", headlessDenials: null }), recordDir: dir });
+    expect(lines).toEqual(["(the run did not start; outcome: refused)", `run record: ${dir}`]);
+  });
+
+  test("a skipped run says it did not start", () => {
+    const lines = summaryLines({ run: runJson({ outcome: "skipped", teardown: "not-started", headlessDenials: null }), recordDir: dir });
+    expect(lines[0]).toBe("(the run did not start; outcome: skipped)");
   });
 });
 

@@ -16,7 +16,7 @@ import type { McpInventoryEntry } from "./mcp.ts";
 import {
   askExposureOf,
   headlessAskExposure,
-  headlessWritePosturePreflight,
+  headlessWritePostureWarning,
   uncheckedAuthority,
   uncheckedAuthorityOf,
   type HeadlessAskExposure,
@@ -38,10 +38,10 @@ function server(
   return { id, agent: "claude", name: id, source: "user", host: "mcp.example.com", path: "/mcp", ...extra };
 }
 
-const NONE: HeadlessAskExposure = { askHosts: [], askMcp: [], globalAskWithMcp: false, unreadable: [] };
+const NONE: HeadlessAskExposure = { defaultAskHosts: [], ruleAskHosts: [], askMcp: [], globalAskWithMcp: false, unreadable: [] };
 
 describe("askExposureOf", () => {
-  test("every host allow or deny and no MCP: no exposure, and the preflight passes", () => {
+  test("every host allow or deny and no MCP: no exposure, and no warning", () => {
     const exposure = askExposureOf({
       policy: policy({
         hosts: ["a.example.com", "b.example.com"],
@@ -49,25 +49,63 @@ describe("askExposureOf", () => {
       }),
     });
     expect(exposure).toEqual(NONE);
-    expect(headlessWritePosturePreflight(exposure, { acceptDeniedWrites: false })).toMatchObject({ kind: "pass", accepted: false });
+    expect(headlessWritePostureWarning(exposure, { acceptDeniedWrites: false })).toBeUndefined();
   });
 
   test("a host without writeAction and no writeApproval resolves to the default ask (plan C7)", () => {
     const exposure = askExposureOf({
       policy: policy({ hosts: ["a.example.com", "b.example.com"], requests: { "a.example.com": { writeAction: "allow" } } }),
     });
-    expect(exposure.askHosts).toEqual(["b.example.com"]);
-    const preflight = headlessWritePosturePreflight(exposure, { acceptDeniedWrites: false });
-    expect(preflight.kind).toBe("refuse");
-    if (preflight.kind !== "refuse") throw new Error("unreachable");
-    expect(preflight.status).toBe(65);
-    expect(preflight.message).toContain("b.example.com");
-    expect(preflight.message).toContain("--accept-denied-writes");
+    expect(exposure).toMatchObject({ defaultAskHosts: ["b.example.com"], ruleAskHosts: [] });
+    expect(headlessWritePostureWarning(exposure, { acceptDeniedWrites: false })).toBe(
+      "headless run: writes that would ask for approval are denied (1 host); run.json lists them",
+    );
   });
 
-  test("--accept-denied-writes skips the refusal but keeps the exposure", () => {
+  test("--accept-denied-writes silences the warning; the exposure is unchanged", () => {
     const exposure = askExposureOf({ policy: policy({ hosts: ["b.example.com"] }) });
-    expect(headlessWritePosturePreflight(exposure, { acceptDeniedWrites: true })).toEqual({ kind: "pass", accepted: true, exposure });
+    expect(exposure.defaultAskHosts).toEqual(["b.example.com"]);
+    expect(headlessWritePostureWarning(exposure, { acceptDeniedWrites: true })).toBeUndefined();
+  });
+
+  test("a host with its own ask rule is listed apart from hosts that follow the default", () => {
+    const exposure = askExposureOf({
+      policy: policy({ hosts: ["a.example.com", "b.example.com"], requests: { "a.example.com": { writeAction: "ask" } } }),
+    });
+    expect(exposure).toMatchObject({ defaultAskHosts: ["b.example.com"], ruleAskHosts: ["a.example.com"] });
+  });
+
+  test("an MCP server of another agent is still exposure: the proxy matches rules by endpoint, not agent", () => {
+    const exposure = askExposureOf({
+      policy: policy({ hosts: ["mcp.context7.com"], requests: { "mcp.context7.com": { writeAction: "allow" } } }),
+      mcp: mcpPolicy([server("ctx", { agent: "codex", name: "context7", host: "mcp.context7.com", path: "/mcp" })]),
+    });
+    expect(exposure.askMcp).toEqual([{
+      serverId: "ctx", agent: "codex", name: "context7", host: "mcp.context7.com", path: "/mcp", defaultAsk: true, askTools: [],
+    }]);
+  });
+
+  test("the warning is one line with counts, never a host list", () => {
+    const hosts = Array.from({ length: 47 }, (_, index) => `h${String(index).padStart(2, "0")}.example.com`);
+    const exposure = askExposureOf({
+      policy: policy({ hosts: [...hosts, "mcp.context7.com"], requests: { "mcp.context7.com": { writeAction: "allow" } } }),
+      mcp: mcpPolicy([
+        server("a", { host: "mcp.context7.com", path: "/mcp" }),
+        server("b", { agent: "codex", host: "mcp.context7.com", path: "/mcp" }),
+        server("c", { host: "mcp.context7.com", path: "/other" }),
+      ]),
+    });
+    // Counts servers: two of the three share one endpoint, and each entry names its endpoint.
+    expect(headlessWritePostureWarning(exposure, { acceptDeniedWrites: false })).toBe(
+      "headless run: writes that would ask for approval are denied (47 hosts, 3 MCP endpoints, unclassified MCP methods); run.json lists them",
+    );
+  });
+
+  test("an unreadable policy warns that it could not be read; it does not refuse", () => {
+    const exposure: HeadlessAskExposure = { ...NONE, unreadable: ["the effective policy could not be read: no effective policy generation is selected"] };
+    expect(headlessWritePostureWarning(exposure, { acceptDeniedWrites: false })).toBe(
+      "headless run: the write posture could not be read (the effective policy could not be read: no effective policy generation is selected); writes that would ask for approval are denied",
+    );
   });
 
   test("host allow with an MCP tool override of ask is exposure, even under writeApproval deny", () => {
@@ -75,10 +113,14 @@ describe("askExposureOf", () => {
       policy: policy({ hosts: ["mcp.example.com"], requests: { "mcp.example.com": { writeAction: "allow" } }, writeApproval: "deny" }),
       mcp: mcpPolicy([server("srv", { tools: { create_issue: { writeAction: "ask" }, search: { writeAction: "allow" } } })]),
     });
-    expect(exposure.askHosts).toEqual([]);
+    expect(exposure).toMatchObject({ defaultAskHosts: [], ruleAskHosts: [] });
     expect(exposure.globalAskWithMcp).toBe(false);
-    expect(exposure.askMcp).toEqual([{ serverId: "srv", agent: "claude", name: "srv", defaultAsk: false, askTools: ["create_issue"] }]);
-    expect(headlessWritePosturePreflight(exposure, { acceptDeniedWrites: false }).kind).toBe("refuse");
+    expect(exposure.askMcp).toEqual([{
+      serverId: "srv", agent: "claude", name: "srv", host: "mcp.example.com", path: "/mcp", defaultAsk: false, askTools: ["create_issue"],
+    }]);
+    expect(headlessWritePostureWarning(exposure, { acceptDeniedWrites: false })).toBe(
+      "headless run: writes that would ask for approval are denied (1 MCP endpoint); run.json lists them",
+    );
   });
 
   test("an MCP server default of ask is exposure for every unlisted tool", () => {
@@ -86,7 +128,9 @@ describe("askExposureOf", () => {
       policy: policy({ hosts: [], writeApproval: "allow" }),
       mcp: mcpPolicy([server("srv", { defaultToolWriteAction: "ask", tools: { search: { writeAction: "allow" } } })]),
     });
-    expect(exposure.askMcp).toEqual([{ serverId: "srv", agent: "claude", name: "srv", defaultAsk: true, askTools: [] }]);
+    expect(exposure.askMcp).toEqual([{
+      serverId: "srv", agent: "claude", name: "srv", host: "mcp.example.com", path: "/mcp", defaultAsk: true, askTools: [],
+    }]);
   });
 
   test("an MCP server with no default inherits the global action for unlisted tools", () => {
@@ -104,7 +148,9 @@ describe("askExposureOf", () => {
     });
     expect(exposure.globalAskWithMcp).toBe(true);
     expect(exposure.askMcp).toEqual([]);
-    expect(headlessWritePosturePreflight(exposure, { acceptDeniedWrites: false }).kind).toBe("refuse");
+    expect(headlessWritePostureWarning(exposure, { acceptDeniedWrites: false })).toBe(
+      "headless run: writes that would ask for approval are denied (unclassified MCP methods); run.json lists them",
+    );
   });
 
   test("no MCP and the global action ask, but every host overridden: no exposure", () => {
@@ -117,7 +163,7 @@ describe("askExposureOf", () => {
 
   // The "does not copy them" proof: the hosts the preflight names are exactly
   // the hosts where the proxy's own pre-credential evaluation holds a POST.
-  test("askHosts equals the hosts where the proxy's evaluateRequestWriteAsk asks for a POST", () => {
+  test("default and rule ask hosts together equal the hosts where the proxy's evaluateRequestWriteAsk asks for a POST", () => {
     let seed = 0x2545f491;
     const next = (bound: number): number => {
       seed = (seed * 1103515245 + 12345) & 0x7fffffff;
@@ -144,7 +190,8 @@ describe("askExposureOf", () => {
           writeApproval: loaded.writeApproval,
         }) === "ask";
       });
-      expect(askExposureOf({ policy: loaded }).askHosts).toEqual(proxyAsks);
+      const exposure = askExposureOf({ policy: loaded });
+      expect(new Set([...exposure.defaultAskHosts, ...exposure.ruleAskHosts])).toEqual(new Set(proxyAsks));
     }
   });
 });
@@ -252,18 +299,21 @@ describe("readers", () => {
     });
 
     expect(headlessAskExposure(context(projectRoot, project))).toEqual({
-      askHosts: [],
-      askMcp: [{ serverId: "srv", agent: "claude", name: "srv", defaultAsk: false, askTools: ["create_issue"] }],
+      defaultAskHosts: [],
+      ruleAskHosts: [],
+      askMcp: [{
+        serverId: "srv", agent: "claude", name: "srv", host: "mcp.example.com", path: "/mcp", defaultAsk: false, askTools: ["create_issue"],
+      }],
       globalAskWithMcp: false,
       unreadable: [],
     });
   });
 
-  test("no published generation is unreadable exposure, so the preflight refuses", () => {
+  test("no published generation is unreadable exposure, and the warning names it", () => {
     const { projectRoot, project } = projectInfo();
     const exposure = headlessAskExposure(context(projectRoot, project));
     expect(exposure.unreadable).toHaveLength(1);
-    expect(headlessWritePosturePreflight(exposure, { acceptDeniedWrites: false }).kind).toBe("refuse");
+    expect(headlessWritePostureWarning(exposure, { acceptDeniedWrites: false })).toMatch(/^headless run: the write posture could not be read \(/);
   });
 
   test("a corrupt MCP operation policy payload is unreadable exposure", () => {
@@ -279,7 +329,7 @@ describe("readers", () => {
 
     const exposure = headlessAskExposure(context(projectRoot, project));
     expect(exposure.unreadable).toHaveLength(1);
-    expect(headlessWritePosturePreflight(exposure, { acceptDeniedWrites: false }).kind).toBe("refuse");
+    expect(headlessWritePostureWarning(exposure, { acceptDeniedWrites: false })).toMatch(/^headless run: the write posture could not be read \(/);
   });
 
   test("lists the generation's host services and a user stdio MCP server", () => {
