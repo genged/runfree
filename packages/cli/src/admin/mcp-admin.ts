@@ -235,6 +235,13 @@ export function mcpListIntent(input: { json: boolean }, deps: McpLoopbackOptions
       entry.target,
     ]),
   }));
+  // An inventory read no longer warns, so the table names why a server was
+  // refused. A Codex Desktop built-in ("skipped") stays a plain row.
+  for (const entry of inventory.entries) {
+    if ((entry.decision.status === "unsupported" || entry.decision.status === "conflict") && entry.decision.reason) {
+      console.log(`${entry.source} ${entry.agent} ${printable(entry.name)}: ${entry.decision.status} reason=${printable(entry.decision.reason)}`);
+    }
+  }
 }
 
 export function parseMcpAgent(value: string | undefined): McpAgent {

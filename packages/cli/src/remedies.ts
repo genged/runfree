@@ -138,6 +138,7 @@ export function sampleRemedyRenderings(): string[] {
     remedy.serviceEnableHelp(),
     remedy.serviceExplain("github"),
     remedy.mcpEnableProject("claude", "srv"),
+    remedy.mcpEnableProject("claude", "<server>"),
     remedy.mcpEnable("codex", "srv", "user"),
     remedy.mcpEnable("<agent>", "<server>"),
     remedy.mcpEnableProjectFromEnv("claude", "github", "GITHUB_MCP_TOKEN"),

@@ -7,7 +7,7 @@ import { afterEach, beforeEach, describe, expect, test } from "vitest";
 import { isIpLiteralHostname } from "@runfree/runtime-contracts/network-policy";
 
 import { flushWarnings, setOutputWriterForTest } from "../warnings.ts";
-import { mcpApprovalPath, mcpInventory, prepareMcpRuntime } from "./mcp.ts";
+import { mcpApprovalPath, mcpInventory, prepareMcpRuntime, setMcpLogContext } from "./mcp.ts";
 
 // A remote HTTPS MCP endpoint must name a host. An IP literal would skip the
 // exact-hostname policy (desired-policy validation refuses IP-literal hosts),
@@ -24,6 +24,23 @@ const REFUSED: Record<string, string> = {
 const ACCEPTED: Record<string, string> = {
   named: "https://mcp.example.com/mcp",
 };
+
+// A launch prepare with no launched agent, so both agents' lines print.
+function prepareLaunch(runDir: string, projectRoot: string, stateDir: string, env: NodeJS.ProcessEnv): void {
+  prepareMcpRuntime({
+    approvalPath: mcpApprovalPath(stateDir),
+    callbackPort: 47638,
+    claudeConfigPath: path.join(runDir, "claude.json"),
+    claudeMcpConfigPath: path.join(runDir, "claude-mcp.json"),
+    codexDir: path.join(runDir, "codex"),
+    env,
+    mcpOAuthPolicyPath: path.join(runDir, "mcp-oauth-policy.json"),
+    mcpOperationPolicyPath: path.join(runDir, "mcp-operation-policy.json"),
+    policy: { hosts: [], tokens: {} },
+    projectRoot,
+    tokenConfig: {},
+  });
+}
 
 describe("IP-literal HTTPS MCP endpoints", () => {
   let tmp: string;
@@ -64,20 +81,30 @@ describe("IP-literal HTTPS MCP endpoints", () => {
     return lines;
   }
 
-  test("user-scope entries with an IP-literal URL are unsupported and warn", () => {
+  test("user-scope entries with an IP-literal URL are unsupported, and a launch warns", () => {
     const inventory = mcpInventory({ projectRoot, env: env(), approvalPath: mcpApprovalPath(stateDir) });
-    const lines = warnings();
+    expect(warnings(), "an inventory read prints nothing").toEqual([]);
     const byName = new Map(inventory.entries.filter((entry) => entry.agent === "claude").map((entry) => [entry.name, entry]));
     for (const name of Object.keys(REFUSED)) {
       const entry = byName.get(name);
       expect(entry?.decision.status, name).toBe("unsupported");
       expect(entry?.decision.reason, name).toBe(IP_LITERAL_REASON.slice("reason=".length));
       expect(entry?.target, name).toBe("excluded");
-      expect(lines.some((line) => line.includes(`server ${name} `) && line.includes(IP_LITERAL_REASON)), name).toBe(true);
+    }
+    for (const name of Object.keys(ACCEPTED)) expect(byName.get(name)?.decision.status, name).toBe("imported");
+
+    setMcpLogContext({ agent: "claude" });
+    try {
+      prepareLaunch(path.join(tmp, "warn-run"), projectRoot, stateDir, env());
+    } finally {
+      setMcpLogContext({});
+    }
+    const lines = warnings();
+    for (const name of Object.keys(REFUSED)) {
+      expect(lines.filter((line) => line.includes(`server ${name} `) && line.includes(IP_LITERAL_REASON)), name).toHaveLength(1);
     }
     for (const name of Object.keys(ACCEPTED)) {
-      expect(byName.get(name)?.decision.status, name).toBe("imported");
-      expect(lines.some((line) => line.includes(`server ${name} `)), name).toBe(false);
+      expect(lines.some((line) => line.includes(`server ${name} `) && line.includes("reason=")), name).toBe(false);
     }
   });
 
@@ -206,6 +233,7 @@ for (const { title, metadataReason: METADATA_REASON, tokenReason: TOKEN_REASON, 
   test("entries are unsupported, excluded, and carry the specific reason", () => {
     const inventory = mcpInventory({ projectRoot, env: env(), approvalPath: mcpApprovalPath(stateDir) });
     flushWarnings();
+    expect(output, "an inventory read prints nothing").toEqual([]);
     const byKey = new Map(inventory.entries.map((entry) => [`${entry.agent}:${entry.name}`, entry]));
     for (const [name, { agent, reason }] of expected) {
       const entry = byKey.get(`${agent}:${name}`);
@@ -213,7 +241,11 @@ for (const { title, metadataReason: METADATA_REASON, tokenReason: TOKEN_REASON, 
       expect(entry?.decision.status, name).toBe("unsupported");
       expect(entry?.decision.reason, name).toBe(reason);
       expect(entry?.target, name).toBe("excluded");
-      expect(output.some((line) => line.includes(`server ${name} `) && line.includes(`reason=${reason}`)), name).toBe(true);
+    }
+    prepareLaunch(path.join(tmp, "warn-run"), projectRoot, stateDir, env());
+    flushWarnings();
+    for (const [name, { agent, reason }] of expected) {
+      expect(output.filter((line) => line.includes(` ${agent} server ${name} `) && line.includes(`reason=${reason}`)), name).toHaveLength(1);
     }
     expect(byKey.get("claude:okclaude")?.decision.status).toBe("imported");
     expect(byKey.get("codex:okcodex")?.decision.status).toBe("imported");

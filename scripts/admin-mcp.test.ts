@@ -362,6 +362,23 @@ describe("admin MCP runtime preparation", () => {
     ].join("\n"));
   });
 
+  test("mcp list names the reason a server was refused, and the inventory read prints no warning", async () => {
+    writeClaudeNative({
+      mcpServers: {
+        posthog: { type: "http", url: "https://mcp.posthog.com/mcp" },
+        hostPath: { type: "stdio", command: "/Users/me/bin/server" },
+      },
+    });
+
+    const result = await runAdmin(() => mcpListIntent({ json: false }));
+
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stderr).not.toContain("hostPath");
+    expect(result.stdout.split("\n").filter((line) => line.includes("reason="))).toEqual([
+      "user claude hostPath: unsupported reason=local stdio command must be installed in the container PATH",
+    ]);
+  });
+
   test("mcp enable stores project approval outside the project and prepare imports approved public HTTP MCP", async () => {
     fs.writeFileSync(path.join(projectRoot, ".mcp.json"), JSON.stringify({
       mcpServers: {
@@ -977,9 +994,9 @@ describe("admin MCP runtime preparation", () => {
     expect(result.status, result.stderr).toBe(0);
     expect(result.stderr).toContain("mcp: skipped project claude server repoTools");
     expect(result.stderr).toContain("mcp: skipped project codex server repo_tools");
-    expect(result.stderr).toContain("mcp: skipped claude server envLeak");
-    expect(result.stderr).toContain("mcp: skipped codex server env_leak");
-    expect(result.stderr).toContain("mcp: skipped claude server hostPath");
+    expect(result.stderr).toContain("mcp: skipped local claude server envLeak");
+    expect(result.stderr).toContain("mcp: skipped user codex server env_leak");
+    expect(result.stderr).toContain("mcp: skipped local claude server hostPath");
     expect(JSON.stringify(readClaudeGenerated())).toContain("@upstash/context7-mcp");
     expect(JSON.stringify(readClaudeGenerated())).not.toContain("literal-secret");
     expect(JSON.stringify(readClaudeGenerated())).not.toContain("repo-tools.example.com");
@@ -1011,8 +1028,8 @@ describe("admin MCP runtime preparation", () => {
     const result = await runAdmin(() => prepareRuntime());
 
     expect(result.status, result.stderr).toBe(0);
-    expect(result.stderr).toContain("mcp: skipped claude server literal");
-    expect(result.stderr).toContain("mcp: skipped codex server literal");
+    // `up` has no launched agent, so the shared refusal is one line for both.
+    expect(result.stderr).toContain("mcp: skipped user server (claude, codex) literal reason=");
     expect(JSON.stringify(readPolicy())).not.toContain("literal-secret");
     expect(JSON.stringify(readClaudeGenerated())).not.toContain("literal-secret");
     expect(readCodexGenerated()).not.toContain("literal-secret");

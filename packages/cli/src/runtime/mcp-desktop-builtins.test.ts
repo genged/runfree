@@ -213,12 +213,18 @@ describe("Codex Desktop built-ins at launch", () => {
     const lines = prepare();
 
     for (const name of ["node_repl", "repl"]) {
-      expect(lines).toContainEqual(expect.stringMatching(new RegExp(`runfree warning: mcp: skipped codex server ${name} reason=local stdio command must be installed in the container PATH$`)));
+      expect(lines).toContainEqual(expect.stringMatching(new RegExp(`runfree warning: mcp: skipped user codex server ${name} reason=local stdio command must be installed in the container PATH$`)));
     }
     expect(lines.join("\n")).not.toContain("Codex Desktop built-in");
     expect(generatedServers()).toEqual([]);
     const entries = mcpInventory({ projectRoot, env: env() }).entries;
     expect(entries.find((entry) => entry.name === "node_repl")?.decision.status).toBe("unsupported");
+  });
+
+  test("a Codex refusal is not printed on a Claude launch", () => {
+    fs.writeFileSync(path.join(hostCodexDir, "config.toml"), '[mcp_servers.node_repl]\ncommand = "/opt/tools/node_repl"\n');
+    setMcpLogContext({ agent: "claude" });
+    expect(prepare().join("\n")).not.toContain("node_repl");
   });
 
   test("a bare-command node_repl keeps the generic STDIO rules and is imported", () => {

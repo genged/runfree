@@ -834,6 +834,8 @@ type McpLogEvent = {
   agent: "claude" | "codex";
   name: string;
   detail: string;
+  // Set on the unapproved-project skip so several collapse into one line.
+  unapprovedProject?: true;
 };
 
 type PrepareServerOptions = {
@@ -1477,9 +1479,6 @@ function mcpNameRefusals(servers: NativeMcpServer[]): Map<NativeMcpServer, McpNa
       }
     }
   }
-  for (const [server, refusal] of refusals) {
-    warn(`mcp: skipped ${server.agent} server ${printable(server.name)} reason=${refusal.reason}`);
-  }
   return refusals;
 }
 
@@ -1525,6 +1524,11 @@ export function loopbackHostServiceName(serverName: string, port: number, hostSe
   return HOST_SERVICE_NAME_RE.test(serverName) && !taken ? serverName : `mcp-${port}`;
 }
 
+// The decision reason of a server no rule refused that still has no prepared
+// form (an unknown transport): silent at launch, as before inventory reads
+// stopped warning.
+const UNSUPPORTED_MCP_SERVER_REASON = "unsupported MCP transport or unsafe MCP configuration";
+
 function mcpInventoryRecords(options: McpInventoryOptions): McpInventoryRecord[] {
   const approvals = readMcpApprovals(options.projectRoot, options.approvalPath);
   const rules = readMcpRules(options.projectRoot, options.rulesPath);
@@ -1549,8 +1553,9 @@ function mcpInventoryRecords(options: McpInventoryOptions): McpInventoryRecord[]
     }
     const desktopBuiltIn = isDesktopBuiltIn(server);
     const outcome = prepareServer(server, options.projectRoot, { allowProject: true, log: false });
+    // Silent: the refusal stays in the decision, which `mcp explain` prints
+    // and a launch prepare reports once for the launched agent.
     const refused = isMcpRefusal(outcome) ? outcome.refused : undefined;
-    if (refused !== undefined) warn(`mcp: skipped ${server.agent} server ${printable(server.name)} reason=${printable(refused)}`);
     const prepared = isMcpRefusal(outcome) ? undefined : outcome;
     const supported = prepared !== undefined;
     const digest = prepared ? descriptorDigest(options.projectRoot, server, prepared) : undefined;
@@ -1568,7 +1573,7 @@ function mcpInventoryRecords(options: McpInventoryOptions): McpInventoryRecord[]
       reason = refused;
     } else if (!supported) {
       status = "unsupported";
-      reason = "unsupported MCP transport or unsafe MCP configuration";
+      reason = UNSUPPORTED_MCP_SERVER_REASON;
     } else if (server.scope !== "project") {
       status = "imported";
       importedByName.set(nameKey, server.scope);
@@ -2330,6 +2335,17 @@ export function prepareMcpRuntime(options: McpPrepareOptions): McpPrepareResult 
     projectRoot: options.projectRoot,
     rulesPath: options.mcpRulesPath,
   })) {
+    // Refused at inventory (unsafe config, IP literal, name rule or name
+    // collision): no prepared server, a reason, and nothing generated. A
+    // Desktop built-in is "skipped" and stays silent below.
+    const refusedAtInventory = (entry.decision.status === "unsupported" && entry.decision.reason !== UNSUPPORTED_MCP_SERVER_REASON)
+      || (entry.decision.status === "conflict" && !entry.prepared);
+    if (refusedAtInventory && entry.decision.reason !== undefined) {
+      events.push({
+        kind: "skipped", scope: entry.source, agent: entry.agent, name: printable(entry.name), detail: `reason=${printable(entry.decision.reason)}`,
+      });
+      continue;
+    }
     if (!entry.prepared) {
       // A Codex Desktop built-in is not a problem to warn about: it gets one
       // line under --verbose and nothing otherwise.
@@ -2341,7 +2357,10 @@ export function prepareMcpRuntime(options: McpPrepareOptions): McpPrepareResult 
       const suffix = entry.decision.status === "unapproved"
         ? `; run ${remedy.mcpEnableProject(entry.agent, entry.name)}`
         : "";
-      events.push({ kind: "skipped", scope: "project", agent: entry.agent, name: entry.name, detail: `reason=${reason}${suffix}` });
+      events.push({
+        kind: "skipped", scope: "project", agent: entry.agent, name: entry.name, detail: `reason=${reason}${suffix}`,
+        ...(entry.decision.status === "unapproved" ? { unapprovedProject: true as const } : {}),
+      });
       continue;
     }
     const prepared = prepareServer(entry.server, options.projectRoot, {
@@ -2650,11 +2669,22 @@ export function prepareMcpRuntime(options: McpPrepareOptions): McpPrepareResult 
     mcpOperationPolicyJson(servers, mcpOperationRulesForServers(servers, readMcpRules(options.projectRoot, options.mcpRulesPath))),
   );
 
-  // Import/skip lines: only the launched agent's servers, and one line per
-  // server when both agents import it with the same outcome.
+  // Import/skip lines: only the launched agent's servers, one line per server
+  // when both agents import it with the same outcome, and one line for an
+  // agent's unapproved project servers when there are several.
+  const visible = events.filter((event) => mcpLogContext.agent === undefined || event.agent === mcpLogContext.agent);
+  const unapprovedByAgent = new Map<string, string[]>();
+  for (const event of visible) {
+    if (event.unapprovedProject) unapprovedByAgent.set(event.agent, [...(unapprovedByAgent.get(event.agent) ?? []), event.name]);
+  }
+  const collapsed = new Set([...unapprovedByAgent].filter(([, names]) => names.length > 1).map(([agent]) => agent));
+  for (const agent of collapsed) {
+    const names = (unapprovedByAgent.get(agent) ?? []).map(printable);
+    warn(`mcp: ${names.length} project ${agent} servers need approval: ${names.join(", ")}; enable each with ${remedy.mcpEnableProject(agent, "<server>")}`);
+  }
   const grouped = new Map<string, { event: McpLogEvent; agents: string[] }>();
-  for (const event of events) {
-    if (mcpLogContext.agent !== undefined && event.agent !== mcpLogContext.agent) continue;
+  for (const event of visible) {
+    if (event.unapprovedProject && collapsed.has(event.agent)) continue;
     const key = [event.kind, event.scope, event.name, event.detail].join("\0");
     const group = grouped.get(key);
     if (group) group.agents.push(event.agent);

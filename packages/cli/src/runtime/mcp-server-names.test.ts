@@ -5,7 +5,7 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
 
 import { flushWarnings, setOutputWriterForTest } from "../warnings.ts";
-import { mcpApprovalPath, mcpInventory, mcpServerNameRefusal, prepareMcpRuntime, saveMcpApproval } from "./mcp.ts";
+import { mcpApprovalPath, mcpInventory, mcpServerNameRefusal, prepareMcpRuntime, saveMcpApproval, setMcpLogContext } from "./mcp.ts";
 
 const HTTP = { type: "http", url: "https://mcp.example.com/mcp" };
 
@@ -57,6 +57,7 @@ describe("MCP server names in the inventory and at launch", () => {
   afterEach(() => {
     flushWarnings();
     setOutputWriterForTest(undefined);
+    setMcpLogContext({});
     fs.rmSync(tmp, { recursive: true, force: true });
   });
 
@@ -102,7 +103,9 @@ describe("MCP server names in the inventory and at launch", () => {
       ["project", "claude", "__proto__", "unsupported", "server name __proto__ is reserved"],
       ["project", "claude", "posthog", "unapproved", "project MCP requires approval"],
     ]);
-    expect(warnings()).toContainEqual(expect.stringContaining("mcp: skipped claude server __proto__ reason=server name __proto__ is reserved"));
+    expect(warnings()).toEqual([]);
+    prepare();
+    expect(warnings()).toContainEqual(expect.stringContaining("mcp: skipped project claude server __proto__ reason=server name __proto__ is reserved"));
   });
 
   test("a lone-surrogate name is listed as unsupported and launch still prepares the other servers", () => {
@@ -114,9 +117,9 @@ describe("MCP server names in the inventory and at launch", () => {
 
   test("a name with terminal escapes is printed escaped, never raw", () => {
     writeProject(`{"a\\u001b]52;c;eA==\\u0007b": ${JSON.stringify(HTTP)}}`);
-    inventory();
+    prepare();
     const lines = warnings();
-    expect(lines).toContainEqual(expect.stringContaining("mcp: skipped claude server a\\u{1b}]52;c;eA==\\u{7}b reason="));
+    expect(lines).toContainEqual(expect.stringContaining("mcp: skipped project claude server a\\u{1b}]52;c;eA==\\u{7}b reason="));
     expect(lines.join("\n")).not.toMatch(/[\u001b\u0007]/);
   });
 
@@ -162,7 +165,12 @@ describe("MCP server names in the inventory and at launch", () => {
       ["user", "claude", "Sentry", "imported", ""],
       ["project", "claude", "sentry", "conflict", "server name collides with imported MCP server Sentry"],
     ]);
+    warnings();
     expect(Object.keys(prepare())).toEqual(["Sentry"]);
+    const conflicts = warnings().filter((line) => line.includes(" server sentry "));
+    expect(conflicts).toEqual([
+      expect.stringMatching(/mcp: skipped project claude server sentry reason=server name collides with imported MCP server Sentry$/),
+    ]);
   });
 
   test("user and local names that collide are both skipped", () => {
@@ -172,6 +180,23 @@ describe("MCP server names in the inventory and at launch", () => {
       ["local", "claude", "sentry", "unsupported"],
     ]);
     expect(prepare()).toEqual({});
+  });
+
+  test("several unapproved project servers of one agent print one line", () => {
+    writeProject(`{"a": ${JSON.stringify(HTTP)}, "b": ${JSON.stringify(HTTP)}, "c": ${JSON.stringify(HTTP)}}`);
+    setMcpLogContext({ agent: "claude" });
+    prepare();
+    const lines = warnings().filter((line) => line.includes("need approval") || line.includes("requires approval"));
+    expect(lines).toEqual([
+      expect.stringMatching(/mcp: 3 project claude servers need approval: a, b, c; enable each with runfree mcp enable claude <server> --source project$/),
+    ]);
+  });
+
+  test("one unapproved project server keeps the single-server line", () => {
+    writeProject(`{"a": ${JSON.stringify(HTTP)}}`);
+    setMcpLogContext({ agent: "claude" });
+    prepare();
+    expect(warnings().join("\n")).toContain("mcp: skipped project claude server a reason=project MCP requires approval; run runfree mcp enable claude a --source project");
   });
 
   test("the same exact name in user and project config keeps the existing imported-wins conflict", () => {

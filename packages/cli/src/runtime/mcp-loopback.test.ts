@@ -35,7 +35,8 @@ import { sessionCallbackPortCandidates } from "./session-mcp-callback.ts";
 type PreparedServer = Parameters<typeof applyPolicyAndTokensForTest>[2][number];
 
 // S8: every MCP preparation refusal carries its specific reason into the
-// inventory decision, and the inventory prints exactly one warning line for it.
+// inventory decision. An inventory read prints nothing; a launch prepare
+// prints one warning line for it.
 const REFUSED: Record<string, { config: Record<string, unknown>; reason: string }> = {
   badUrl: { config: { type: "http", url: "not a url" }, reason: "invalid URL" },
   plainHttp: { config: { type: "http", url: "http://insecure.example.com/mcp" }, reason: "remote HTTP MCP must use https; plain HTTP is allowed only to 127.0.0.1" },
@@ -96,15 +97,40 @@ describe("structured MCP refusal reasons", () => {
     }
   });
 
-  test("each refusal prints exactly one warning line per inventory call", () => {
+  test("an inventory read prints no warning; the refusal stays in the decision", () => {
     for (let call = 0; call < 2; call += 1) {
-      inventory();
-      const lines = warnings();
+      const entries = inventory().entries;
+      expect(warnings(), `call ${call}`).toEqual([]);
       for (const [name, { reason }] of Object.entries(REFUSED)) {
-        const matching = lines.filter((line) => line.includes(`server ${name} `));
-        expect(matching, `${name} call ${call}`).toHaveLength(1);
-        expect(matching[0]?.endsWith(` runfree warning: mcp: skipped claude server ${name} reason=${reason}`), `${name} call ${call}`).toBe(true);
+        expect(entries.find((entry) => entry.name === name)?.decision, `${name} call ${call}`).toEqual({ status: "unsupported", reason });
       }
+    }
+  });
+
+  test("a launch prepare prints each refusal once, as a skipped line", () => {
+    setMcpLogContext({ agent: "claude" });
+    try {
+      prepareMcpRuntime({
+        approvalPath: mcpApprovalPath(stateDir),
+        callbackPort: 47638,
+        claudeConfigPath: path.join(stateDir, "claude", "claude.json"),
+        claudeMcpConfigPath: path.join(stateDir, "claude", "mcp.json"),
+        codexDir: path.join(stateDir, "codex"),
+        env: env(),
+        mcpOAuthPolicyPath: path.join(stateDir, "mcp-oauth-policy.json"),
+        mcpOperationPolicyPath: path.join(stateDir, "mcp-operation-policy.json"),
+        policy: { hosts: [], tokens: {} },
+        projectRoot,
+        tokenConfig: {},
+      });
+    } finally {
+      setMcpLogContext({});
+    }
+    const lines = warnings();
+    for (const [name, { reason }] of Object.entries(REFUSED)) {
+      const matching = lines.filter((line) => line.includes(` server ${name} `));
+      expect(matching, name).toHaveLength(1);
+      expect(matching[0]?.endsWith(`runfree warning: mcp: skipped user claude server ${name} reason=${reason}`), name).toBe(true);
     }
   });
 
