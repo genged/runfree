@@ -50,6 +50,7 @@ import {
 } from "./session-containers.ts";
 import { writeSessionHostStatus } from "./session-host-status.ts";
 import { sessionAdmissionFirewallSetReadCommand } from "./session-file-publisher.ts";
+import { validateSessionContainerInspect } from "./session-container-proof.ts";
 import { restoreSameProxySessionAdmission } from "./startup.ts";
 import type { ActiveRuntimePlan } from "./plan.ts";
 import type { ProjectLifecycleLock } from "./sessions.ts";
@@ -335,6 +336,19 @@ test("restores a restarted proxy with eligibility alone", async () => {
   ]);
   expect(fixture.inputs.get("publish-eligibility")).toBeDefined();
   expect(readPublishedSessionEligibilityV2(stateDir)?.proxyContainerId).toBe(PROXY_ID);
+});
+
+// A surviving session may predate this CLI. The active-running phase is the one
+// that accepts the creator's version label; provisioning-running pins it to
+// this CLI's own, and would refuse every session across an upgrade.
+test("proves each surviving session as an existing container, not a fresh one", async () => {
+  const fixture = restoreFixture();
+  vi.mocked(validateSessionContainerInspect).mockClear();
+
+  await restore(fixture);
+
+  expect(vi.mocked(validateSessionContainerInspect)).toHaveBeenCalledTimes(1);
+  expect(vi.mocked(validateSessionContainerInspect).mock.calls[0]?.[2]).toEqual({ kind: "active-running" });
 });
 
 test("proves the kernel set empty when no session survived the restart", async () => {

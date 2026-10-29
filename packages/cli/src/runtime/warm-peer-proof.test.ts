@@ -25,11 +25,11 @@ vi.mock("./session-admission-driver-preflight.ts", async (importOriginal) => {
   const harness = await import("./session-container.test-harness.ts");
   return {
     ...await importOriginal<typeof import("./session-admission-driver-preflight.ts")>(),
-    createRetainedSessionRebindProofPlan: (input: Readonly<{ replacementRecord: SessionContainerRecordV2 }>) => {
+    createRetainedSessionRebindProofPlan: (input: Readonly<{ replacementRecord: SessionContainerRecordV2; runfreeVersion: string }>) => {
       const fault = proofPlanFault.next;
       proofPlanFault.next = undefined;
       if (fault) throw fault;
-      return harness.sessionContainerCreatePlanFixture({ record: input.replacementRecord });
+      return harness.sessionContainerCreatePlanFixture({ record: input.replacementRecord, runfreeVersion: input.runfreeVersion });
     },
   };
 });
@@ -513,6 +513,16 @@ describe("tryWarmPeerValidation: matches", () => {
     expect(lock.assertHeld).toHaveBeenCalled();
     expect(onlyReads(fake.calls)).toBe(true);
     expect(registryBytes()).toEqual(before);
+  });
+
+  test("peers created by an older runfree still match after a CLI upgrade", () => {
+    const { inventory, evidence } = healthyPeers(2);
+    const verdict = tryWarmPeerValidation(input({
+      fake: fakeDocker({ inventory }),
+      stable: stable(evidence),
+      runfreeVersion: "0.4.0",
+    }));
+    expect(verdict.kind).toBe("match");
   });
 
   test("a peer with its own mcp-callback forwarder matches and names that forwarder", () => {

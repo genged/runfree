@@ -396,10 +396,18 @@ function assertEnvironment(plan: SessionContainerCreatePlan, value: unknown): vo
   }
 }
 
-function assertExactLabels(plan: SessionContainerCreatePlan, value: unknown): void {
+function assertExactLabels(
+  plan: SessionContainerCreatePlan,
+  value: unknown,
+  phase: SessionContainerProofPhase["kind"],
+): void {
   if (!isRecord(value)) throw new Error("session container labels are malformed");
+  const {
+    [SESSION_CONTAINER_LABELS.version]: _createdByVersion,
+    ...sessionLabels
+  } = sessionContainerLabels(plan.record, plan.runfreeVersion);
   const expectedLabels = {
-    ...sessionContainerLabels(plan.record, plan.runfreeVersion),
+    ...sessionLabels,
     [RUNFREE_MANAGED_IMAGE_LABEL]: "true",
     [RUNFREE_IMAGE_ROLE_LABEL]: plan.sessionAgentMaterialization.selectedAgentImageKind === "project"
       ? AGENT_PROJECT_IMAGE_ROLE
@@ -407,10 +415,19 @@ function assertExactLabels(plan: SessionContainerCreatePlan, value: unknown): vo
     [RUNFREE_DIGEST_SCHEMA_LABEL]: RUNFREE_DIGEST_SCHEMA_VERSION,
     [RUNFREE_IMAGE_INPUT_DIGEST_LABEL]: plan.record.selectedAgentImageInputDigest,
     [PROJECT_ID_LABEL]: plan.record.projectId,
-    [RUNFREE_VERSION_LABEL]: plan.runfreeVersion,
   };
   for (const [name, expected] of Object.entries(expectedLabels)) {
     if (value[name] !== expected) throw new Error(`session container label differs: ${name}`);
+  }
+  // The release that created a container is informational, never a
+  // compatibility input (container-inventory.ts): the schema, epoch, template,
+  // and digest labels above decide that. A container this CLI just created
+  // must carry this CLI's version; a surviving one keeps its creator's.
+  const version = value[RUNFREE_VERSION_LABEL];
+  if (phase === "provisioning-running") {
+    if (version !== plan.runfreeVersion) throw new Error(`session container label differs: ${RUNFREE_VERSION_LABEL}`);
+  } else if (!wellFormedVersionLabel(version)) {
+    throw new Error(`session container label is malformed: ${RUNFREE_VERSION_LABEL}`);
   }
   const allowedRunfreeLabels = new Set<string>([
     ...SELECTED_AGENT_IMAGE_LABEL_NAMES,
@@ -484,7 +501,20 @@ function assertDeclaredVolumes(plan: SessionContainerCreatePlan, value: unknown)
   }
 }
 
-function assertConfigContract(plan: SessionContainerCreatePlan, value: unknown): void {
+/** Same bound reconciliation applies to the label when it classifies a container. */
+function wellFormedVersionLabel(value: unknown): boolean {
+  return typeof value === "string"
+    && value === value.trim()
+    && value.length > 0
+    && value.length <= 64
+    && !/[\u0000-\u001f\u007f-\u009f]/u.test(value);
+}
+
+function assertConfigContract(
+  plan: SessionContainerCreatePlan,
+  value: unknown,
+  phase: SessionContainerProofPhase["kind"],
+): void {
   if (!isRecord(value)) throw new Error("session container configuration is malformed");
   if (value.Image !== plan.record.selectedAgentImageId) {
     throw new Error("session container configuration names a different selected image");
@@ -509,7 +539,7 @@ function assertConfigContract(plan: SessionContainerCreatePlan, value: unknown):
   }
   assertDeclaredVolumes(plan, value.Volumes);
   assertEnvironment(plan, value.Env);
-  assertExactLabels(plan, value.Labels);
+  assertExactLabels(plan, value.Labels, phase);
 }
 
 function assertNetworks(
@@ -587,7 +617,7 @@ export function validateSessionContainerInspect(
     || !exactStringArray(absentAsList(inspect.Args), plan.record.launchArgs)) {
     throw new Error("session container effective Path/Args differ from the exact launch contract");
   }
-  assertConfigContract(plan, inspect.Config);
+  assertConfigContract(plan, inspect.Config, phase.kind);
   assertHostContract(plan, inspect.HostConfig);
   assertExactMounts(plan, inspect.Mounts);
   if (!isRecord(inspect.State)

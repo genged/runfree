@@ -429,6 +429,7 @@ export function sessionContainerCreatePlanFixture(input: {
   record?: SessionContainerRecordV2;
   containerId?: string;
   architecture?: "amd64" | "arm64";
+  runfreeVersion?: string;
 } = {}): SessionContainerCreatePlan {
   const defaults = sessionGenerationFixture();
   const target = input.target ?? defaults.target;
@@ -466,7 +467,7 @@ export function sessionContainerCreatePlanFixture(input: {
     launch,
     imageDeclarationProof,
     record,
-    runfreeVersion: "0.3.0",
+    runfreeVersion: input.runfreeVersion ?? "0.3.0",
   });
 }
 

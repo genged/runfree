@@ -730,6 +730,60 @@ describe("session container live inspection proof", () => {
   });
 });
 
+// The release that created a container is informational (container-inventory.ts):
+// a session that outlives a CLI upgrade still proves against the newer CLI, as
+// long as every compatibility label still matches.
+describe("session container version label", () => {
+  function withVersion(value: SessionContainerCreatePlan, version: unknown): string {
+    const evidence = inspect(value, { running: true });
+    if (version === undefined) delete evidence[0].Config.Labels[RUNFREE_VERSION_LABEL];
+    else evidence[0].Config.Labels[RUNFREE_VERSION_LABEL] = version;
+    return JSON.stringify(evidence);
+  }
+
+  test.each(["0.2.9", "0.4.0", "0.3.0-rc.1"])("a surviving container created by %s proves as active-running", (version) => {
+    const value = plan();
+    expect(value.runfreeVersion).not.toBe(version);
+    expect(() => validateSessionContainerInspect(withVersion(value, version), value, { kind: "active-running" }))
+      .not.toThrow();
+  });
+
+  test("a container this CLI just created must carry this CLI's version", () => {
+    const value = plan();
+    expect(() => validateSessionContainerInspect(withVersion(value, "0.2.9"), value, { kind: "provisioning-running" }))
+      .toThrow(`session container label differs: ${RUNFREE_VERSION_LABEL}`);
+  });
+
+  test.each([
+    ["missing", undefined],
+    ["empty", ""],
+    ["padded", " 0.2.9"],
+    ["overlong", "1".repeat(65)],
+    ["control character", "0.2.9\n"],
+    ["non-string", 7],
+  ])("a version label that is %s is refused in both phases", (_label, version) => {
+    const value = plan();
+    expect(() => validateSessionContainerInspect(withVersion(value, version), value, { kind: "active-running" }))
+      .toThrow(`session container label is malformed: ${RUNFREE_VERSION_LABEL}`);
+    expect(() => validateSessionContainerInspect(withVersion(value, version), value, { kind: "provisioning-running" }))
+      .toThrow(`session container label differs: ${RUNFREE_VERSION_LABEL}`);
+  });
+
+  test.each([
+    ["label schema", SESSION_CONTAINER_LABELS.labelSchema, "2"],
+    ["admission epoch", SESSION_CONTAINER_LABELS.admissionContractEpoch, "99"],
+    ["template digest", SESSION_CONTAINER_LABELS.sessionTemplateDigest, `sha256:${"f".repeat(64)}`],
+    ["generation digest", SESSION_CONTAINER_LABELS.sessionAgentGenerationDigest, `sha256:${"f".repeat(64)}`],
+    ["image input digest", RUNFREE_IMAGE_INPUT_DIGEST_LABEL, `sha256:${"f".repeat(64)}`],
+  ])("an older container with a changed %s is still refused", (_label, name, changed) => {
+    const value = plan();
+    const evidence = JSON.parse(withVersion(value, "0.2.9")) as MutableInspect;
+    evidence[0].Config.Labels[name] = changed;
+    expect(() => validateSessionContainerInspect(JSON.stringify(evidence), value, { kind: "active-running" }))
+      .toThrow(`session container label differs: ${name}`);
+  });
+});
+
 describe("session container init wrapper follows the session's own template", () => {
   test("a version 2 template's container runs under Docker's init", () => {
     const value = plan();
