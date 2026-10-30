@@ -24,7 +24,7 @@ export type TokenResolutionLedger = {
 //   value). Always fail-closed (delete).
 export type TokenResolutionErrorClassification = "transient" | "definitive";
 
-export type TokenResolutionSourceKind = "env" | "1password" | "named" | "command" | "jwt" | "google-service-account";
+export type TokenResolutionSourceKind = "env" | "1password" | "named" | "command" | "jwt" | "google-service-account" | "keychain";
 
 export class TokenResolutionError extends Error {
   readonly classification: TokenResolutionErrorClassification;
