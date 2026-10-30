@@ -93,6 +93,10 @@ function namedSourcesEqual(left: NamedSource, right: NamedSource): boolean {
         && left.clientEmail === right.clientEmail
         && left.ttlSeconds === right.ttlSeconds
         && policyJson(left.scopes) === policyJson(right.scopes);
+    case "1password":
+      return right.type === "1password"
+        && left.keychain.service === right.keychain.service
+        && left.keychain.account === right.keychain.account;
     default: {
       const unknownSource: never = left;
       throw new Error(`unsupported named source type: ${String((unknownSource as { type?: unknown }).type)}`);
@@ -143,7 +147,7 @@ function putUniqueKeyValue(target: Record<string, string>, flag: string, raw: st
 }
 
 function sourceTypeDisplay(source: NamedSource): string {
-  return source.type;
+  return source.type === "1password" ? "1password (connection)" : source.type;
 }
 
 function jwtDisplay(source: JwtSource): string[] {
@@ -179,6 +183,8 @@ function namedSourceDisplay(source: NamedSource): string[] {
       return jwtDisplay(source);
     case "google-service-account":
       return googleServiceAccountDisplay(source);
+    case "1password":
+      return [`login: macOS Keychain item ${source.keychain.service}/${source.keychain.account}`, "never asks: yes"];
     default: {
       const unknownSource: never = source;
       throw new Error(`unsupported named source type: ${String((unknownSource as { type?: unknown }).type)}`);
@@ -391,7 +397,9 @@ export function sourceShowIntent(input: SourceNameInput): void {
   for (const line of namedSourceDisplay(source)) console.log(line);
   console.log(`used by: ${users.join(", ") || "none"}`);
   console.log("agent exposure: no");
-  console.log("executes during: credential sync");
+  console.log(source.type === "1password"
+    ? "executes during: credential sync and runfree run (op with the stored service account login)"
+    : "executes during: credential sync");
 }
 
 export function sourceRemoveIntent(input: SourceNameInput): void {

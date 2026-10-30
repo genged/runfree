@@ -172,6 +172,7 @@ import {
 import { stableJsonDroppingUndefined as stableJson, sha256Hex, isRecord } from "../strict-primitives.ts";
 import { remedy } from "../remedies.ts";
 import { headlessCallOptions, headlessTerminalModeActive } from "../terminal-mode.ts";
+import { type KeychainItem, KEYCHAIN_SERVICE, keychainItemForSource } from "./keychain-login.ts";
 
 
 export type TokenSource =
@@ -213,7 +214,26 @@ export type JwtSource = {
 
 export type { GoogleServiceAccountSource };
 
-export type NamedSource = CommandSource | JwtSource | GoogleServiceAccountSource;
+/**
+ * A connection source: a login that never asks (a 1Password service account)
+ * kept in the macOS login Keychain. The registry holds the Keychain item name,
+ * never the login itself (profiles and unattended credentials spec §4.2).
+ */
+export type OnePasswordConnectionSource = {
+  type: "1password";
+  keychain: KeychainItem;
+  createdAt: string;
+};
+
+export type NamedSource = CommandSource | JwtSource | GoogleServiceAccountSource | OnePasswordConnectionSource;
+
+export function isConnectionSource(source: NamedSource | undefined): source is OnePasswordConnectionSource {
+  return source?.type === "1password";
+}
+
+export function connectionNotValueMessage(name: string): string {
+  return `${name} is a 1password connection source; bind an op:// reference through it: --from-1password op://<vault>/<item>/<field> --via ${name}`;
+}
 
 export type SourceRegistry = Record<string, NamedSource>;
 
@@ -827,6 +847,22 @@ function validateGoogleServiceAccountSource(name: string, value: Record<string, 
   };
 }
 
+const CONNECTION_REGISTRY_FIELDS = new Set(["type", "keychain", "createdAt"]);
+
+// A hand-edited entry may only name the one Keychain item runfree itself
+// would create for this source; no other field (a token above all) is allowed.
+function validateOnePasswordConnectionSource(name: string, value: Record<string, unknown>): OnePasswordConnectionSource {
+  for (const key of Object.keys(value)) {
+    if (!CONNECTION_REGISTRY_FIELDS.has(key)) die(`${name}: 1password source has unknown field ${JSON.stringify(key)}`);
+  }
+  const keychain = value.keychain;
+  if (!isRecord(keychain) || keychain.service !== KEYCHAIN_SERVICE || keychain.account !== name || Object.keys(keychain).length !== 2) {
+    die(`${name}: 1password source keychain must be {"service":"${KEYCHAIN_SERVICE}","account":"${name}"}`);
+  }
+  if (typeof value.createdAt !== "string" || value.createdAt.trim() === "") die(`${name}: createdAt must be a string`);
+  return { type: "1password", keychain: keychainItemForSource(name), createdAt: value.createdAt };
+}
+
 function validateSourceRegistry(raw: unknown, registryPath = sourceConfigPath()): SourceRegistry {
   if (!isRecord(raw)) die(`${displayProjectPath(registryPath)} must be a JSON object`);
   const registry: SourceRegistry = {};
@@ -841,7 +877,11 @@ function validateSourceRegistry(raw: unknown, registryPath = sourceConfigPath())
       registry[name] = validateGoogleServiceAccountSource(name, value);
       continue;
     }
-    if (value.type !== "command") die(`${name}: source must be a command, jwt, or google-service-account object`);
+    if (value.type === "1password") {
+      registry[name] = validateOnePasswordConnectionSource(name, value);
+      continue;
+    }
+    if (value.type !== "command") die(`${name}: source must be a command, jwt, google-service-account, or 1password object`);
     if (!Array.isArray(value.argv) || value.argv.length === 0 || !value.argv.every((item) => typeof item === "string")) {
       die(`${name}: argv must be a non-empty string array`);
     }
@@ -1484,6 +1524,17 @@ function namedSourceReadPlan(source: NamedSource, options: TokenResolutionOption
         signingKey: { kind: "read", read: jwtPrivateKeyRead(source.keyJson, options, "service account key JSON") },
       }));
     }
+    case "1password":
+      // A connection reads references; it has no value of its own.
+      return {
+        kind: "failure",
+        error: new TokenResolutionError({
+          classification: "definitive",
+          sourceKind: "named",
+          code: "connection-not-value",
+          safeMessage: connectionNotValueMessage(options.sourceName ?? "source"),
+        }),
+      };
     default: {
       const unknownSource: never = source;
       throw new Error(`unsupported named source type: ${String((unknownSource as { type?: unknown }).type)}`);
@@ -1520,6 +1571,9 @@ function semanticNamedSource(sourceName: string, registry: SourceRegistry | unde
         scopes: source.scopes,
         ttlSeconds: source.ttlSeconds,
       };
+    case "1password":
+      // The Keychain item only: a login rotation never changes a fingerprint.
+      return { type: "1password", keychain: source.keychain };
     default: {
       const unknownSource: never = source;
       throw new Error(`unsupported named source type: ${String((unknownSource as { type?: unknown }).type)}`);
@@ -1937,10 +1991,13 @@ export function tokenSourceFromSelection(selection: TokenSourceSelection, requir
       if (!value) die(`${selection.env} is unset or empty`);
       return { source: "env", env: selection.env };
     }
-    case "named":
+    case "named": {
       assertKnownSourceName(selection.name);
-      if (!loadSourceRegistry()[selection.name]) die(`unknown source: ${selection.name}`);
+      const namedSource = loadSourceRegistry()[selection.name];
+      if (!namedSource) die(`unknown source: ${selection.name}`);
+      if (isConnectionSource(namedSource)) die(connectionNotValueMessage(selection.name));
       return { source: "named", name: selection.name };
+    }
     case "1password": {
       if (!selection.ref.startsWith("op://")) die("1Password references must start with op://");
       const opPath = resolveHostExecutable("op");
@@ -1967,6 +2024,7 @@ function namedSignedSource(source: TokenSource | undefined, registry?: SourceReg
   if (!namedSource) return undefined;
   switch (namedSource.type) {
     case "command":
+    case "1password":
       return undefined;
     case "jwt":
     case "google-service-account":

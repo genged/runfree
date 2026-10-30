@@ -7289,3 +7289,116 @@ describe("google-service-account sources", () => {
     });
   });
 });
+
+describe("1password connection sources (todo 158)", () => {
+  const CONNECTION_ENTRY = { type: "1password", keychain: { service: "runfree.credential-source", account: "automation" }, createdAt: "x" };
+  type Call = { command: "security" | "op"; args: string[]; input?: string; env: NodeJS.ProcessEnv };
+
+  function installFakeKeychainAndOp(options: {
+    stored?: Map<string, string>;
+    readStatus?: number;
+    readStderr?: string;
+    writeStatus?: number;
+    deleteStatus?: number;
+    whoami?: string;
+    whoamiStatus?: number;
+    whoamiStderr?: string;
+    vaults?: string;
+  } = {}): { calls: Call[]; securityPath: string; opBin: string; stored: Map<string, string> } {
+    const calls: Call[] = [];
+    const stored = options.stored ?? new Map<string, string>();
+    // Outside the project: the sanitized host PATH drops project directories.
+    const bin = path.join(tmpBase, "fake-connection-bin");
+    fs.mkdirSync(bin, { recursive: true });
+    const securityPath = path.join(bin, "security");
+    registerFakeCommand(securityPath, (args, spawnOptions) => {
+      const input = spawnOptions.input === undefined ? undefined : spawnInputText(spawnOptions.input);
+      calls.push({ command: "security", args, ...(input === undefined ? {} : { input }), env: envFromSpawnOptions(spawnOptions) });
+      if (args[0] === "find-generic-password") {
+        if (options.readStatus !== undefined) return spawnResult({ status: options.readStatus, stderr: options.readStderr ?? "" });
+        const token = stored.get(args[4]);
+        return token ? spawnResult({ stdout: `${token}\n` }) : spawnResult({ status: 44, stderr: "The specified item could not be found in the keychain." });
+      }
+      if (args[0] === "-i") {
+        if (options.writeStatus !== undefined) return spawnResult({ status: options.writeStatus });
+        const match = /-a (\S+) .* -w (\S+)\n$/.exec(input ?? "");
+        if (match) stored.set(match[1], match[2]);
+        return spawnResult();
+      }
+      if (args[0] === "delete-generic-password") {
+        if (options.deleteStatus !== undefined) return spawnResult({ status: options.deleteStatus });
+        return stored.delete(args[4]) ? spawnResult() : spawnResult({ status: 44 });
+      }
+      return spawnResult({ status: 2 });
+    });
+    registerFakeCommand(path.join(bin, "op"), (args, spawnOptions) => {
+      const env = envFromSpawnOptions(spawnOptions);
+      calls.push({ command: "op", args, env });
+      if (args[0] === "whoami") {
+        if (options.whoamiStatus !== undefined) return spawnResult({ status: options.whoamiStatus, stderr: options.whoamiStderr ?? "" });
+        return spawnResult({ stdout: options.whoami ?? JSON.stringify({ user_type: "SERVICE_ACCOUNT", url: "https://x.1password.com" }) });
+      }
+      if (args[0] === "vault") return spawnResult({ stdout: options.vaults ?? JSON.stringify([{ id: "v1", name: "Automation" }]) });
+      if (args[0] === "read") return spawnResult({ stdout: "connection-secret\n" });
+      return spawnResult({ status: 2 });
+    });
+    return { calls, securityPath, opBin: bin, stored };
+  }
+
+  function connectionEnv(fake: { securityPath: string; opBin: string }): NodeJS.ProcessEnv {
+    return {
+      PATH: `${fake.opBin}:${process.env.PATH ?? ""}`,
+      RUNFREE_TEST_SECURITY_PATH: fake.securityPath,
+      RUNFREE_TEST_KEYCHAIN_PLATFORM: "darwin",
+    };
+  }
+
+  function writeSourceRegistry(value: unknown): void {
+    fs.mkdirSync(path.dirname(sourceRegistryPath()), { recursive: true });
+    fs.writeFileSync(sourceRegistryPath(), `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
+  }
+
+  describe("registry entries", () => {
+    test("a registry 1password connection loads strictly and shows without reading the Keychain", async () => {
+      writeSourceRegistry({ automation: { ...CONNECTION_ENTRY, createdAt: "2026-10-30T00:00:00.000Z" } });
+      const fake = installFakeKeychainAndOp();
+      const shown = await runAdmin(() => sourceShowIntent({ name: "automation" }), connectionEnv(fake));
+      expect(shown.status, shown.stderr).toBe(0);
+      expect(shown.stdout).toContain("type: 1password (connection)");
+      expect(shown.stdout).toContain("login: macOS Keychain item runfree.credential-source/automation");
+      expect(shown.stdout).toContain("never asks: yes");
+      expect(fake.calls).toEqual([]);
+    });
+
+    test.each([
+      ["an extra key", { ...CONNECTION_ENTRY, token: "ops_x" }],
+      ["another service", { ...CONNECTION_ENTRY, keychain: { service: "evil", account: "automation" } }],
+      ["an account that is not the source name", { ...CONNECTION_ENTRY, keychain: { service: "runfree.credential-source", account: "other" } }],
+      ["an extra keychain field", { ...CONNECTION_ENTRY, keychain: { service: "runfree.credential-source", account: "automation", label: "x" } }],
+    ])("a registry connection with %s is refused before any read", async (_label, entry) => {
+      writeSourceRegistry({ automation: entry });
+      const fake = installFakeKeychainAndOp();
+      const result = await runAdmin(() => sourceShowIntent({ name: "automation" }), connectionEnv(fake));
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toContain("automation: 1password source");
+      expect(fake.calls).toEqual([]);
+    });
+
+    test("binding a connection directly as a value is refused, with the --via spelling", async () => {
+      writeFixtureRepo(exampleTokenPolicy(["github"]));
+      writeSourceRegistry({ automation: CONNECTION_ENTRY });
+      const fake = installFakeKeychainAndOp();
+      const result = await runAdmin(() => credentialSetSourceIntent({ name: "github", tokenSource: { kind: "named", name: "automation" }, replaceSource: false, sync: false }), connectionEnv(fake));
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toContain("automation is a 1password connection source; bind an op:// reference through it: --from-1password op://<vault>/<item>/<field> --via automation");
+      expect(fs.existsSync(tokenConfigPath())).toBe(false);
+      expect(fake.calls).toEqual([]);
+    });
+
+    test("a connection's fingerprint names its Keychain item, not when it was saved", () => {
+      const registry = { automation: { type: "1password" as const, keychain: { service: "runfree.credential-source", account: "automation" }, createdAt: "x" } };
+      const fingerprint = tokenSourceFingerprint({ source: "named", name: "automation" }, registry);
+      expect(fingerprint).toBe(tokenSourceFingerprint({ source: "named", name: "automation" }, { automation: { ...registry.automation, createdAt: "y" } }));
+    });
+  });
+});
