@@ -90,6 +90,21 @@ export const remedy = {
   credentialSourceOnePassword: (name: string): string => `runfree credential source 1password ${name}`,
   credentialSourceLogin: (name: string): string => `runfree credential source login ${name}`,
   credentialSourceRemove: (name: string): string => `runfree credential source remove ${name}`,
+  // The never-ask rule for runs (unattended credentials spec §4.3): each
+  // fix rebinds through a connection, or to an env source.
+  credentialSetSourceOnePasswordVia: (name: string, ref: string, via: string): string =>
+    `runfree credential set-source ${name} --from-1password ${ref} --via ${via} --replace-source`,
+  credentialSetSourceNamedVia: (name: string, source: string, via: string): string =>
+    `runfree credential set-source ${name} --from-source ${source} --via ${via} --replace-source`,
+  credentialSetSourceFromEnvReplace: (name: string, env: string): string =>
+    `runfree credential set-source ${name} --from-env ${env} --replace-source`,
+  serviceEnableOnePasswordVia: (id: string, ref: string, via: string): string =>
+    `runfree service enable ${id} --from-1password ${ref} --via ${via} --replace-source`,
+  serviceEnableNamedVia: (id: string, source: string, via: string): string =>
+    `runfree service enable ${id} --from-source ${source} --via ${via} --replace-source`,
+  serviceEnableFromEnvReplace: (id: string, env: string): string => `runfree service enable ${id} --from-env ${env} --replace-source`,
+  mcpEnableProjectFromEnvReplace: (agent: string, server: string, env: string): string =>
+    `runfree mcp enable ${agent} ${server} --source project --from-env ${env} --replace-source`,
   imageApproveContext: (): string => "runfree image approve-context",
   imageInit: (): string => "runfree image init",
   destroy: (): string => "runfree destroy",
@@ -173,6 +188,16 @@ export function sampleRemedyRenderings(): string[] {
     remedy.credentialSourceOnePassword("automation"),
     remedy.credentialSourceLogin("automation"),
     remedy.credentialSourceRemove("automation"),
+    remedy.credentialSourceOnePassword("<connection>"),
+    remedy.credentialSetSourceOnePasswordVia("github", "op://Automation/github/token", "automation"),
+    remedy.credentialSetSourceOnePasswordVia("github", "op://<vault>/<item>/<field>", "<connection>"),
+    remedy.credentialSetSourceNamedVia("appstore", "appstore-jwt", "automation"),
+    remedy.credentialSetSourceNamedVia("appstore", "appstore-jwt", "<connection>"),
+    remedy.credentialSetSourceFromEnvReplace("github", "<ENV_VAR>"),
+    remedy.serviceEnableOnePasswordVia("github", "op://<vault>/<item>/<field>", "automation"),
+    remedy.serviceEnableNamedVia("apple-ads", "apple-ads-jwt", "<connection>"),
+    remedy.serviceEnableFromEnvReplace("github", "<ENV_VAR>"),
+    remedy.mcpEnableProjectFromEnvReplace("claude", "github", "<ENV_VAR>"),
     remedy.imageApproveContext(),
     remedy.imageInit(),
     remedy.destroy(),
