@@ -9,8 +9,21 @@ project policy lives under `.runfree/`.
 ## Conversational Style
 
 - Keep answers short and concise
-- Technical prose only, be direct
+- Be direct. Put the bottom line first.
 - When the user asks a question, answer it first before making edits or running implementation commands.
+- Write explanations, design proposals, review results, and decision questions
+  in simple English (the `simple-english` skill, when available). Add a small
+  ASCII sketch when the answer is about a flow, a topology, or a before/after
+  shape.
+- Define every label on first use in each reply: decision codes, finding IDs,
+  phase names, gate names, shell variables. Write "F3 (token logged on
+  refusal)", never a bare "F3". Subagent and reviewer IDs follow the same rule
+  when you relay them.
+- Ask open decisions as explicit questions, each with plain options and a
+  recommended choice. Do not leave a decision buried in a report.
+- "Help me with X" or "how can we X" asks for a proposal. Propose, then wait.
+- Give repro and fix steps for Runfree behavior as `runfree` commands, not raw
+  `docker` commands.
 
 ## Context Strategy
 
@@ -116,6 +129,41 @@ project policy lives under `.runfree/`.
 - Do not mount host-wide secrets or home config into the agent. Per-project
   Claude/Codex state and generated Git identity are the intended exceptions.
 
+## Design
+
+- Start from the smallest general design that fits the existing commands, flag
+  names, and conventions. Check how the repo and prior art already solve it
+  before inventing a new concept.
+- Every proposal includes the minimal option. For each part beyond it, name the
+  user need or the attack it stops. A security check must stop an attack the
+  agent cannot already perform; otherwise drop it.
+- Design for the general case, not the example that motivated it: no
+  service-specific mechanisms, flags, or docs when a general one works.
+- When the user points to a reference (an existing script, tool, convention, or
+  standard installer), follow it. State any deviation before writing code.
+- Verify every review finding against the source before applying it; reviewers
+  often misread diff context or removed lines. Report which findings you
+  rejected and why. When a finding would add machinery, weigh its cost against
+  the attack it stops.
+
+## Git Workflow
+
+Contributions arrive as pull requests (`CONTRIBUTING.md`). These rules apply
+wherever an agent commits:
+
+- A worktree inside the repo must sit under `.worktrees/`, the only in-repo
+  path that git, Biome, and Vitest all ignore; any other in-repo location breaks
+  `pnpm check` and `make test-static` in the main checkout. Run
+  `pnpm install` in a new worktree.
+- Put a fix on the branch under test unless the user names another.
+- To land a branch: rebase it onto `main`, run the gates on the rebased head,
+  then `git merge --no-ff <branch>`. Never merge `main` into the branch.
+- The checkout may hold other uncommitted work. Stage your own files by exact
+  path, never `git add -A`; report other changes in one line and leave them
+  alone. "commit" means commit this session's changes without asking.
+- Do not merge with failing tests. A flaky test gets fixed or disabled, never
+  rerun until green.
+
 ## Security Work
 
 For changes involving `.runfree`, `RUNFREE_*`, Docker/Compose topology,
@@ -146,7 +194,18 @@ proxy, firewall, Docker network, or credential-boundary changes: run
 lifecycle, recovery, upgrade, or cleanup changes: run `make test-runtime` or
 `make test-all`.
 
+When a live gate cannot run in your environment, say so and do not report it
+as passing. End with the exact commands the user must run and the gates still
+owed. A command you hand over must run as pasted from the repo root; prefer
+the `make` targets. Before calling a test failure real or a flake, rerun the
+failing file alone; then fix the cause or disable the test.
+
 ## User Override
 
 If the user's instructions conflict with any rule in this document,
 ask for explicit confirmation before overriding. Only then execute their instructions.
+
+## Local Instructions
+
+If `AGENTS.local.md` exists in the repo root, read it at the start of the
+session and follow it. It holds clone-specific instructions and is not tracked.
