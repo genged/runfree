@@ -187,6 +187,13 @@ import {
   keychainWriteRequest,
 } from "./keychain-login.ts";
 import {
+  connectionSourceNames,
+  CredentialInteractionForbiddenError,
+  credentialInteractionForbidden,
+  unattendedReadVerdict,
+  unattendedRefusalLines,
+} from "./credential-interaction.ts";
+import {
   APP_LOGIN,
   connectionOpEnv,
   loginIdentity,
@@ -1258,7 +1265,22 @@ export function scrubOnePasswordExit(exit: ProviderExit, token: string | undefin
   return token === undefined ? exit : { ...exit, stderr: redactLogin(exit.stderr, token) };
 }
 
+/**
+ * The executor-level guard of the never-ask rule (unattended credentials spec
+ * §4.3): while a run holds the rule, no 1Password app read and no command
+ * source starts, whoever the caller is. It runs before any announcement,
+ * Keychain read, or spawn. Connection reads are allowed.
+ */
+export function assertProviderMayRun(kind: "1password-app" | "command"): void {
+  if (!credentialInteractionForbidden()) return;
+  throw new CredentialInteractionForbiddenError(
+    `a run never starts a provider that may ask (${kind === "command" ? "command source" : "1Password app read"})`,
+    kind === "command" ? "command" : "1password",
+  );
+}
+
 function runOnePasswordReadSync(read: OnePasswordRead): string {
+  if (read.login.kind === "app") assertProviderMayRun("1password-app");
   announceOnePasswordRead(read);
   // A Keychain failure throws its classified error here: `op` never runs.
   const token = read.login.kind === "connection" ? readConnectionLoginSync(read.login.sourceName, read.login.keychain) : undefined;
@@ -1359,6 +1381,7 @@ export function commandSourceStep(invocation: CommandSourceInvocation, exit: Pro
 }
 
 export function runCommandSource(source: CommandSource): string {
+  assertProviderMayRun("command");
   const invocation = commandSourceInvocation(source);
   const exit = providerExitFromSpawnSync(adminSpawnSync(invocation.executable, [...invocation.args], {
     cwd: invocation.cwd,
@@ -1941,8 +1964,48 @@ function commandSourceMigrationInstructions(tokenName: string, prefix: string): 
   ].join("; ");
 }
 
+function registryForInteractionCheck(options: TokenResolutionOptions): SourceRegistry | undefined {
+  if (options.sourceRegistry) return options.sourceRegistry;
+  try {
+    return loadSourceRegistry();
+  } catch {
+    return undefined;
+  }
+}
+
+function credentialOwnerForMessage(tokenName: string): CredentialOwner | undefined {
+  try {
+    return credentialOwner(tokenName);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * The plan-level guard of the never-ask rule: while a run holds it, a binding
+ * that may ask fails here with its own refusal and fix, before the signing-key
+ * cache is consulted (a run's answer never depends on cache state) and before
+ * any provider. Undefined when the read may go on.
+ */
+function interactionForbiddenPlan(tokenName: string, source: TokenSource, options: TokenResolutionOptions): CredentialReadPlan | undefined {
+  if (!credentialInteractionForbidden()) return undefined;
+  const registry = tokenSourceReadsRegistry(source) || source.source === "1password" ? registryForInteractionCheck(options) : undefined;
+  const verdict = unattendedReadVerdict(source, registry);
+  if (verdict.kind === "never-asks") return undefined;
+  const message = unattendedRefusalLines({
+    tokenName,
+    source,
+    reason: verdict.reason,
+    owner: credentialOwnerForMessage(tokenName),
+    connections: connectionSourceNames(registry),
+  }).join("\n");
+  return { kind: "failure", error: new CredentialInteractionForbiddenError(message, verdict.reason === "command" ? "command" : source.source === "named" ? "named" : "1password") };
+}
+
 /** Decides one source read up to the provider run (see `CredentialReadPlan`). */
 export function credentialReadPlan(tokenName: string, source: TokenSource, options: TokenResolutionOptions = {}): CredentialReadPlan {
+  const forbidden = interactionForbiddenPlan(tokenName, source, options);
+  if (forbidden) return forbidden;
   if (source.source === "env") {
     adminVerbose(options, `${tokenName}: reading host environment source ${source.env}`);
     const value = childEnv()[source.env];
@@ -2043,6 +2106,7 @@ function runCredentialReadPlanSync(plan: CredentialReadPlan): string {
     case "1password":
       return runOnePasswordReadSync(plan.read);
     case "command": {
+      assertProviderMayRun("command");
       const { invocation } = plan;
       const exit = providerExitFromSpawnSync(adminSpawnSync(invocation.executable, [...invocation.args], {
         cwd: invocation.cwd,

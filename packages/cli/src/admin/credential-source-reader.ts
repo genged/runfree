@@ -8,6 +8,7 @@ import childProcess from "node:child_process";
 
 import {
   announceOnePasswordRead,
+  assertProviderMayRun,
   commandSourceStep,
   connectionKeychainInvocation,
   type CredentialReadPlan,
@@ -215,6 +216,7 @@ async function ownedProviderExit(
 // failure or a stopped watch ends the read before `op` runs. The login stays
 // in this frame and reaches only the `op` child's environment.
 async function readOnePasswordOwned(read: OnePasswordRead, lifetime: CredentialLifetime): Promise<string> {
+  if (read.login.kind === "app") assertProviderMayRun("1password-app");
   announceOnePasswordRead(read);
   let token: string | undefined;
   if (read.login.kind === "connection") {
@@ -246,6 +248,7 @@ async function executeReadPlan(plan: CredentialReadPlan, lifetime: CredentialLif
     case "1password":
       return readOnePasswordOwned(plan.read, lifetime);
     case "command": {
+      assertProviderMayRun("command");
       const { invocation } = plan;
       const exit = await ownedProviderExit(invocation.executable, invocation.args, {
         cwd: invocation.cwd,

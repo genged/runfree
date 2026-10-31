@@ -37,14 +37,20 @@ import { mcpOAuthCallbackPort } from "../packages/cli/src/runtime/mcp.ts";
 import { activeRuntimePlanFromContext } from "../packages/cli/src/runtime/plan.ts";
 import { createRuntimeSecurityContract } from "../packages/cli/src/runtime/security-contract.ts";
 import {
+  assertProviderMayRun,
   classifyOnePasswordFailure,
+  credentialReadPlan,
   type GoogleServiceAccountSource,
+  jwtSigningKeyFromPem,
+  readOnePasswordRef,
+  runCommandSource,
   googleServiceAccountKeyFromJson,
   type JwtPrivateKeyCacheEntry,
   tokenSourceFingerprint,
   tokenSourcesEqual,
 } from "../packages/cli/src/admin/admin-core.ts";
 import { signGoogleServiceAccountJwt } from "../packages/cli/src/admin/google-service-account.ts";
+import { credentialInteractionForbidden, forbidCredentialInteraction } from "../packages/cli/src/admin/credential-interaction.ts";
 import { CREDENTIAL_OBSERVATION_BATCH_HEADER } from "../packages/cli/src/admin/credential-observation.ts";
 import { createAdminState } from "../packages/cli/src/admin/context.ts";
 import {
@@ -8059,6 +8065,220 @@ describe("1password connection sources (todo 158)", () => {
       const pair = runAdminCli(["credential", "set-source", "github", "--from-env", "GITHUB_TOKEN", "--via", "automation", "--no-sync"], { extraEnv: connectionEnv(fake) });
       expect(pair.status).not.toBe(0);
       expect(pair.stderr).toContain("--from-env never asks and takes no --via");
+    });
+  });
+
+  describe("interaction forbidden (todo 158)", () => {
+    const sync = () => credentialSyncIntent({ verbose: false, watch: false, quiet: false, delayFirstSync: false, cacheSourceSecrets: true });
+    const COMMAND_REFUSAL = "run refused (65): github runs a command source, which runfree cannot keep from asking";
+    const APP_REFUSAL = "run refused (65): github uses the 1Password app, which may ask";
+
+    async function underRule<T>(action: () => Promise<T>): Promise<T> {
+      const release = forbidCredentialInteraction();
+      try {
+        return await action();
+      } finally {
+        release();
+      }
+    }
+
+    function ruleEnv(fake: { securityPath: string; opBin: string }, docker: { dockerLog: string; fakeBin: string }, extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
+      return {
+        ...connectionEnv(fake),
+        FAKE_DOCKER_LOG: docker.dockerLog,
+        PATH: `${docker.fakeBin}${path.delimiter}${fake.opBin}${path.delimiter}${process.env.PATH ?? ""}`,
+        ...extra,
+      };
+    }
+
+    function opCalls(fake: { calls: Call[] }): Call[] {
+      return fake.calls.filter((call) => call.command === "op");
+    }
+
+    test("source-truth sync under the rule: an app op:// binding refuses before op runs and keeps the held value", async () => {
+      writeFixtureRepo(exampleTokenPolicy(["github"]));
+      writeSourceRegistry({ automation: CONNECTION_ENTRY });
+      writeTokenConfig({ github: { source: "1password", ref: "op://Private/github/token" } });
+      const docker = installTokenSyncDockerFake();
+      const fake = installFakeKeychainAndOp();
+      const populate = await runAdmin(sync, ruleEnv(fake, docker));
+      expect(populate.status, populate.stderr).toBe(0);
+      expect(opCalls(fake)).toHaveLength(1);
+
+      const refused = await underRule(() => runAdmin(sync, ruleEnv(fake, docker)));
+      expect(refused.status).not.toBe(0);
+      expect(refused.stderr).toContain(APP_REFUSAL);
+      expect(refused.stderr).toContain("  fix: runfree credential set-source github --from-1password op://<vault>/<item>/<field> --via automation --replace-source");
+      expect(refused.stderr).not.toContain("op://Private/github/token");
+      expect(refused.stderr).not.toContain("Touch ID");
+      expect(opCalls(fake)).toHaveLength(1);
+      // Transient: the value the interactive sessions use is kept, not removed.
+      expect(proxyTokenRemovalIndexes(docker.dockerLog, "github")).toEqual([]);
+      expect(readTokenStatus().github).toMatchObject({ ok: false, state: "stale" });
+      expect(credentialInteractionForbidden()).toBe(false);
+    });
+
+    test("warm-launch fallback (prepare-token-sources) under the rule: refused, op never runs", async () => {
+      writeFixtureRepo(exampleTokenPolicy(["github"]));
+      writeTokenConfig({ github: { source: "1password", ref: "op://Private/github/token" } });
+      const docker = installTokenSyncDockerFake();
+      const fake = installFakeKeychainAndOp();
+      selectEffectiveControlsFromProjectPolicy();
+      const result = await underRule(() => runAdmin(() => {
+        prepareRuntimeTokenSources({ mode: "convergence" });
+      }, ruleEnv(fake, docker)));
+      expect(result.status).not.toBe(0);
+      expect(result.stdout + result.stderr).toContain(APP_REFUSAL);
+      expect(result.stdout + result.stderr).toContain("  first: runfree credential source 1password <connection>");
+      expect(fake.calls).toEqual([]);
+    });
+
+    test("command source under the rule: refused, the command never spawns", async () => {
+      writeFixtureRepo(exampleTokenPolicy(["github"]));
+      const command = installFakeCommandSource();
+      writeSourceRegistry({ gh: { type: "command", argv: [fs.realpathSync(command.commandPath)], displayArgv: ["gh"], createdAt: "x" } });
+      writeTokenConfig({ github: { source: "named", name: "gh" } });
+      const docker = installTokenSyncDockerFake();
+      const fake = installFakeKeychainAndOp();
+      const result = await underRule(() => runAdmin(sync, ruleEnv(fake, docker, {
+        PATH: `${docker.fakeBin}${path.delimiter}${command.fakeBin}${path.delimiter}${process.env.PATH ?? ""}`,
+      })));
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toContain(COMMAND_REFUSAL);
+      expect(result.stderr).toContain("  or: runfree credential set-source github --from-env <ENV_VAR> --replace-source");
+      expect(fs.existsSync(command.logPath)).toBe(false);
+      // Outside the rule the same binding reads its command (the fake is live).
+      const free = await runAdmin(sync, ruleEnv(fake, docker, {
+        PATH: `${docker.fakeBin}${path.delimiter}${command.fakeBin}${path.delimiter}${process.env.PATH ?? ""}`,
+      }));
+      expect(free.status, free.stderr).toBe(0);
+      expect(readCommandSourceLog(command.logPath)).toHaveLength(1);
+    });
+
+    test("a jwt source without --via under the rule is refused before the key read, even with a cached key", async () => {
+      writeFixtureRepo(exampleTokenPolicy(["appstore"]));
+      const { privateKey } = crypto.generateKeyPairSync("ec", { namedCurve: "P-256" });
+      const pem = privateKey.export({ format: "pem", type: "pkcs8" }).toString();
+      const jwt = { type: "jwt" as const, alg: "ES256" as const, privateKey: { source: "1password" as const, ref: "op://A/AuthKey/pem" }, headers: {}, claims: {}, ttlSeconds: 1140, createdAt: "x" };
+      const registry = { automation: CONNECTION_ENTRY, "appstore-jwt": jwt } as never;
+      const cache = { jwtPrivateKeys: new Map<string, JwtPrivateKeyCacheEntry>() };
+      const fake = installFakeKeychainAndOp();
+      let free: ReturnType<typeof credentialReadPlan> | undefined;
+      let held: ReturnType<typeof credentialReadPlan> | undefined;
+      const result = await runAdmin(async () => {
+        jwtSigningKeyFromPem(jwt, pem, { sourceName: "appstore-jwt", sourceSecretCache: cache });
+        const options = { sourceRegistry: registry, sourceSecretCache: cache };
+        free = credentialReadPlan("appstore", { source: "named", name: "appstore-jwt" }, options);
+        held = await underRule(async () => credentialReadPlan("appstore", { source: "named", name: "appstore-jwt" }, options));
+      }, connectionEnv(fake));
+      expect(result.status, result.stderr).toBe(0);
+      // The cache is warm: outside the rule the plan would sign without a read.
+      expect(free).toMatchObject({ kind: "jwt", signingKey: { kind: "cached" } });
+      expect(held?.kind).toBe("failure");
+      const message = held?.kind === "failure" ? (held.error as Error).message : "";
+      expect(message).toContain("run refused (65): appstore reads its signing key with the 1Password app, which may ask");
+      expect(message).toContain("  fix: runfree credential set-source appstore --from-source appstore-jwt --via automation --replace-source");
+      expect(fake.calls).toEqual([]);
+    });
+
+    test("a google-service-account source without --via under the rule is refused, even with a cached key", async () => {
+      writeFixtureRepo(exampleTokenPolicy(["gsc"]));
+      const { privateKey } = crypto.generateKeyPairSync("rsa", { modulusLength: 2048 });
+      const email = "reader@my-project-123.iam.gserviceaccount.com";
+      const gsa = { type: "google-service-account" as const, keyJson: { source: "1password" as const, ref: "op://A/gsa/json" }, clientEmail: email, scopes: ["https://www.googleapis.com/auth/webmasters.readonly"], ttlSeconds: 3300, createdAt: "x" };
+      const keyJson = JSON.stringify({
+        type: "service_account",
+        project_id: "my-project-123",
+        private_key_id: "0123456789abcdef0123456789abcdef01234567",
+        private_key: privateKey.export({ type: "pkcs8", format: "pem" }).toString(),
+        client_email: email,
+        universe_domain: "googleapis.com",
+      });
+      const registry = { "gsc-sa": gsa } as never;
+      const cache = { jwtPrivateKeys: new Map<string, JwtPrivateKeyCacheEntry>() };
+      const fake = installFakeKeychainAndOp();
+      let free: ReturnType<typeof credentialReadPlan> | undefined;
+      let held: ReturnType<typeof credentialReadPlan> | undefined;
+      const result = await runAdmin(async () => {
+        googleServiceAccountKeyFromJson(gsa, keyJson, { sourceName: "gsc-sa", sourceSecretCache: cache });
+        const options = { sourceRegistry: registry, sourceSecretCache: cache };
+        free = credentialReadPlan("gsc", { source: "named", name: "gsc-sa" }, options);
+        held = await underRule(async () => credentialReadPlan("gsc", { source: "named", name: "gsc-sa" }, options));
+      }, connectionEnv(fake));
+      expect(result.status, result.stderr).toBe(0);
+      expect(free).toMatchObject({ kind: "google-service-account", signingKey: { kind: "cached" } });
+      expect(held?.kind).toBe("failure");
+      const message = held?.kind === "failure" ? (held.error as Error).message : "";
+      expect(message).toContain("run refused (65): gsc reads its signing key with the 1Password app, which may ask");
+      expect(message).toContain("  first: runfree credential source 1password <connection>");
+      expect(fake.calls).toEqual([]);
+    });
+
+    test("the executor guard catches a direct app read and a direct command source run", async () => {
+      writeFixtureRepo(exampleTokenPolicy(["github"]));
+      const command = installFakeCommandSource();
+      const fake = installFakeKeychainAndOp();
+      const errors: string[] = [];
+      const result = await underRule(() => runAdmin(() => {
+        for (const attempt of [
+          () => readOnePasswordRef(path.join(fake.opBin, "op"), "op://A/b/c"),
+          () => runCommandSource({ type: "command", argv: [fs.realpathSync(command.commandPath)], displayArgv: ["gh"], createdAt: "x" }),
+        ]) {
+          try {
+            attempt();
+          } catch (error) {
+            errors.push((error as Error).message);
+          }
+        }
+      }, connectionEnv(fake)));
+      expect(result.status, result.stderr).toBe(0);
+      expect(errors).toEqual([
+        "a run never starts a provider that may ask (1Password app read)",
+        "a run never starts a provider that may ask (command source)",
+      ]);
+      expect(fake.calls).toEqual([]);
+      expect(fs.existsSync(command.logPath)).toBe(false);
+      expect(result.stderr).not.toContain("Touch ID");
+      // Outside the rule the guard lets every provider run.
+      expect(() => assertProviderMayRun("command")).not.toThrow();
+    });
+
+    test("a binding command's verification read under the rule never starts op", async () => {
+      writeFixtureRepo(exampleTokenPolicy(["github"]));
+      const fake = installFakeKeychainAndOp();
+      const result = await underRule(() => runAdmin(() => credentialSetSourceIntent({
+        name: "github",
+        tokenSource: { kind: "1password", ref: "op://A/b/c" },
+        replaceSource: false,
+        sync: false,
+      }), connectionEnv(fake)));
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toContain("a run never starts a provider that may ask (1Password app read)");
+      expect(fake.calls).toEqual([]);
+      expect(fs.existsSync(tokenConfigPath())).toBe(false);
+    });
+
+    test("a connection binding under the rule reads normally", async () => {
+      writeFixtureRepo(exampleTokenPolicy(["github"]));
+      writeSourceRegistry({ automation: CONNECTION_ENTRY });
+      writeTokenConfig({ github: { source: "1password", ref: "op://Automation/github/token", via: "automation" } });
+      const docker = installTokenSyncDockerFake();
+      const fake = installFakeKeychainAndOp({ stored: new Map([["automation", SA_TOKEN]]) });
+      const result = await underRule(() => runAdmin(sync, ruleEnv(fake, docker)));
+      expect(result.status, result.stderr).toBe(0);
+      expect(fake.calls.map((call) => `${call.command} ${call.args[0]}`)).toEqual(["security find-generic-password", "op read"]);
+      expectNoSentinel(result.stdout, result.stderr, fs.readFileSync(tokenStatusFilePath(), "utf8"));
+    });
+
+    test("an env binding under the rule reads normally", async () => {
+      writeFixtureRepo(exampleTokenPolicy(["github"]));
+      writeTokenConfig({ github: { source: "env", env: "GITHUB_TOKEN" } });
+      const docker = installTokenSyncDockerFake();
+      const fake = installFakeKeychainAndOp();
+      const result = await underRule(() => runAdmin(sync, ruleEnv(fake, docker, { GITHUB_TOKEN: "ghp_env" })));
+      expect(result.status, result.stderr).toBe(0);
+      expect(fake.calls).toEqual([]);
+      expect(dockerExecCalls(docker.dockerLog).map((entry) => entry.stdin)).toContain("ghp_env");
     });
   });
 });

@@ -10,6 +10,7 @@ import { TokenResolutionError } from "../token-resolution.ts";
 import { type CommandSourceInvocation, type CredentialReadPlan, type OnePasswordRead, createCredentialPreparationScope, readOnePasswordRef, runAdminAction } from "./admin-core.ts";
 import { createAdminState } from "./context.ts";
 import { keychainItemForSource } from "./keychain-login.ts";
+import { forbidCredentialInteraction } from "./credential-interaction.ts";
 import { type CredentialLifetime, createCredentialLifetime } from "./credential-cancellation.ts";
 import { type CredentialReadInput, readCredentialSource, runOwnedProvider } from "./credential-source-reader.ts";
 import { APP_LOGIN, type OnePasswordLogin } from "./onepassword-connection.ts";
@@ -225,6 +226,58 @@ describe("readCredentialSource through a connection", () => {
     expect(error?.classification).toBe("definitive");
     expect(error?.safeMessage).toContain("[redacted]");
     expect(error?.safeMessage).not.toContain("sentinel-sa-token");
+  });
+});
+
+describe("readCredentialSource under the never-ask rule (todo 158)", () => {
+  async function underRule<T>(action: () => Promise<T>): Promise<T> {
+    const release = forbidCredentialInteraction();
+    try {
+      return await action();
+    } finally {
+      release();
+    }
+  }
+
+  function expectForbidden(result: Awaited<ReturnType<typeof readCredentialSource>>, message: string): void {
+    expect(result.kind).toBe("source-failure");
+    const error = result.kind === "source-failure" ? result.error as TokenResolutionError : undefined;
+    expect({ classification: error?.classification, code: error?.code, message: error?.safeMessage })
+      .toEqual({ classification: "transient", code: "interaction-forbidden", message });
+  }
+
+  test("an app 1Password read never starts op", async () => {
+    const marker = path.join(tmp, "op-ran");
+    const op = script("op", `touch '${marker}'; echo value`);
+    const result = await underRule(() => readCredentialSource({ tokenName: "probe", fingerprint: "f".repeat(64), plan: { kind: "1password", read: onePasswordRead(op) } }, watchLifetime()));
+    expectForbidden(result, "a run never starts a provider that may ask (1Password app read)");
+    expect(fs.existsSync(marker)).toBe(false);
+  });
+
+  test("a command source never spawns", async () => {
+    const marker = path.join(tmp, "command-ran");
+    const result = await underRule(() => readCredentialSource(commandRead(script("cmd", `touch '${marker}'; echo value`)), watchLifetime()));
+    expectForbidden(result, "a run never starts a provider that may ask (command source)");
+    expect(fs.existsSync(marker)).toBe(false);
+  });
+
+  test("a signing-key app read never starts op", async () => {
+    const marker = path.join(tmp, "op-ran");
+    const op = script("op", `touch '${marker}'; echo value`);
+    const plan = {
+      kind: "jwt",
+      source: { type: "jwt", alg: "ES256", privateKey: { source: "1password", ref: "op://A/k/pem" }, headers: {}, claims: {}, ttlSeconds: 60, createdAt: "x" },
+      options: {},
+      signingKey: { kind: "read", read: onePasswordRead(op, "op://A/k/pem") },
+    } as unknown as CredentialReadPlan;
+    const result = await underRule(() => readCredentialSource({ tokenName: "probe", fingerprint: "f".repeat(64), plan }, watchLifetime()));
+    expectForbidden(result, "a run never starts a provider that may ask (1Password app read)");
+    expect(fs.existsSync(marker)).toBe(false);
+  });
+
+  test("after the rule is released the same read runs", async () => {
+    const result = await readCredentialSource(commandRead(script("cmd", "echo value")), watchLifetime());
+    expect(result).toMatchObject({ kind: "success", value: "value" });
   });
 });
 
