@@ -197,8 +197,10 @@ import {
 
 export type TokenSource =
   | ({ source: "env"; env: string } & TokenRefreshConfig)
-  | ({ source: "1password"; ref: string } & TokenRefreshConfig)
-  | ({ source: "named"; name: string } & TokenRefreshConfig)
+  // `via` names the 1password connection source the binding reads through
+  // (profiles and unattended credentials spec §4.2); absent means the app.
+  | ({ source: "1password"; ref: string; via?: string } & TokenRefreshConfig)
+  | ({ source: "named"; name: string; via?: string } & TokenRefreshConfig)
   // Legacy config from the pre-tmpfs implementation. Kept so status/unset can
   // handle old metadata without silently reading plaintext local secret files.
   | ({ source: "file"; path: string } & TokenRefreshConfig)
@@ -630,6 +632,26 @@ export function ensureStateDirs(): void {
   fs.mkdirSync(stateDir(), { recursive: true, mode: 0o700 });
 }
 
+function parseBindingVia(tokenName: string, value: Record<string, unknown>): string | undefined {
+  if (!Object.hasOwn(value, "via")) return undefined;
+  if (typeof value.via !== "string" || !isTokenName(value.via)) die(`${tokenName}: via must be a source name`);
+  return value.via;
+}
+
+/** The registry entries a binding's identity and read depend on: its named source and its connection. */
+export function tokenSourceRegistryNames(source: TokenSource | undefined): string[] {
+  if (!source) return [];
+  const names: string[] = [];
+  if (source.source === "named") names.push(source.name);
+  if ((source.source === "named" || source.source === "1password") && source.via !== undefined) names.push(source.via);
+  return names;
+}
+
+/** Whether a binding needs the source registry (a named source, or a `via` connection). */
+export function tokenSourceReadsRegistry(source: TokenSource | undefined): boolean {
+  return tokenSourceRegistryNames(source).length > 0;
+}
+
 export function parseTokenSourceConfig(raw: unknown, sourcePath: string): TokenSourceConfig {
   if (!isRecord(raw)) die(`${displayProjectPath(sourcePath)} must be a JSON object`);
   const config: TokenSourceConfig = {};
@@ -639,6 +661,11 @@ export function parseTokenSourceConfig(raw: unknown, sourcePath: string): TokenS
       die(`${tokenName}: credential source entry must be an object`);
     }
     const refresh = parseRefreshEverySeconds(tokenName, value);
+    const via = parseBindingVia(tokenName, value);
+    if (via !== undefined && value.source !== "1password" && value.source !== "named") {
+      die(`${tokenName}: via applies only to 1password and named credential sources`);
+    }
+    const viaField = via === undefined ? {} : { via };
     if (value.source === "env") {
       if (typeof value.env !== "string" || value.env.trim() === "") die(`${tokenName}: env credential source requires env`);
       config[tokenName] = { source: "env", env: value.env, ...refresh };
@@ -646,12 +673,12 @@ export function parseTokenSourceConfig(raw: unknown, sourcePath: string): TokenS
     }
     if (value.source === "1password") {
       if (typeof value.ref !== "string" || value.ref.trim() === "") die(`${tokenName}: 1password credential source requires ref`);
-      config[tokenName] = { source: "1password", ref: value.ref, ...refresh };
+      config[tokenName] = { source: "1password", ref: value.ref, ...viaField, ...refresh };
       continue;
     }
     if (value.source === "named") {
       if (typeof value.name !== "string" || !isTokenName(value.name)) die(`${tokenName}: named credential source requires a valid source name`);
-      config[tokenName] = { source: "named", name: value.name, ...refresh };
+      config[tokenName] = { source: "named", name: value.name, ...viaField, ...refresh };
       continue;
     }
     if (value.source === "file") {
@@ -1671,12 +1698,19 @@ export function tokenSourceFingerprint(source: TokenSource, registry: SourceRegi
     source: source.source,
   };
   if (source.source === "env") return sha256Json({ ...base, env: source.env });
-  if (source.source === "1password") return sha256Json({ ...base, ref: source.ref });
+  // The connection's semantic identity (type and Keychain item), never its
+  // login: a rotation keeps receipts valid, a replaced connection does not.
+  // Keys appear only when `via` is set, so other fingerprints are unchanged.
+  const via = (source.source === "1password" || source.source === "named") && source.via !== undefined
+    ? { via: source.via, viaSource: semanticNamedSource(source.via, registry) }
+    : {};
+  if (source.source === "1password") return sha256Json({ ...base, ref: source.ref, ...via });
   if (source.source === "named") {
     return sha256Json({
       ...base,
       name: source.name,
       namedSource: semanticNamedSource(source.name, registry),
+      ...via,
     });
   }
   if (source.source === "cmd") return sha256Json({ ...base, command: source.command });
@@ -1789,8 +1823,9 @@ export function adminDockerClient(): DockerClient {
 export function describeSource(source: TokenSource | undefined): string {
   if (!source) return "unconfigured";
   if (source.source === "env") return `env ${source.env}`;
-  if (source.source === "1password") return "1password";
-  if (source.source === "named") return `source ${source.name}`;
+  const via = (source.source === "1password" || source.source === "named") && source.via !== undefined ? ` via ${source.via}` : "";
+  if (source.source === "1password") return `1password${via}`;
+  if (source.source === "named") return `source ${source.name}${via}`;
   if (source.source === "cmd") return "legacy command (unsupported)";
   return "legacy local-file (unsupported)";
 }
@@ -2162,8 +2197,8 @@ export function tokenSourcesEqual(left: TokenSource | undefined, right: TokenSou
   if ((left.refreshEverySeconds ?? 0) !== (right.refreshEverySeconds ?? 0)) return false;
   if (left.runfreeUserServiceOwner !== right.runfreeUserServiceOwner) return false;
   if (left.source === "env" && right.source === "env") return left.env === right.env;
-  if (left.source === "1password" && right.source === "1password") return left.ref === right.ref;
-  if (left.source === "named" && right.source === "named") return left.name === right.name;
+  if (left.source === "1password" && right.source === "1password") return left.ref === right.ref && (left.via ?? "") === (right.via ?? "");
+  if (left.source === "named" && right.source === "named") return left.name === right.name && (left.via ?? "") === (right.via ?? "");
   if (left.source === "file" && right.source === "file") return left.path === right.path;
   if (left.source === "cmd" && right.source === "cmd") return left.command === right.command;
   return false;
@@ -3254,7 +3289,7 @@ export function planWatchCredentialReads(input: Readonly<{
   }
   let registry: SourceRegistry | undefined;
   let registryReadable = true;
-  if (Object.values(config).some((source) => source.source === "named")) {
+  if (Object.values(config).some((source) => tokenSourceReadsRegistry(source))) {
     try {
       registry = loadSourceRegistry();
     } catch {
@@ -3270,8 +3305,8 @@ export function planWatchCredentialReads(input: Readonly<{
   for (const tokenName of Object.keys(policy.tokens)) {
     if (input.only && !input.only.has(tokenName)) continue;
     const source = config[tokenName];
-    if (!source || source.source === "named" && !registryReadable) continue;
-    const sourceRegistry = source.source === "named" ? registry : undefined;
+    if (!source || tokenSourceReadsRegistry(source) && !registryReadable) continue;
+    const sourceRegistry = tokenSourceReadsRegistry(source) ? registry : undefined;
     try {
       const fingerprint = tokenSourceFingerprint(source, sourceRegistry);
       if (!input.only && input.mode !== "source-truth") {
@@ -3405,7 +3440,7 @@ function warmSkippableTokens(
     const source = config[name];
     const receipt = receipts.get(name);
     if (!source || !receipt || !held.has(name)) continue;
-    const sourceRegistry = source.source === "named" ? registry : undefined;
+    const sourceRegistry = tokenSourceReadsRegistry(source) ? registry : undefined;
     let fingerprint: string;
     let refresh: EffectiveTokenRefresh;
     try {
@@ -3432,7 +3467,7 @@ export function prepareRuntimeTokenSources(options: Readonly<{ mode?: RuntimeTok
   if (!active) throw new Error("runtime credential preparation requires approved effective policy");
   const policy = validateNetworkPolicy(active.policy, active.networkPolicyPath);
   const config = loadTokenConfig();
-  const registry = Object.values(config).some((source) => source.source === "named") ? loadSourceRegistry() : undefined;
+  const registry = Object.values(config).some((source) => tokenSourceReadsRegistry(source)) ? loadSourceRegistry() : undefined;
   // The skip set only ever spares a read, so with no configured source to read
   // there is nothing to spare and no reason to ask the proxy.
   const readsSources = Object.keys(policy.tokens).some((name) => config[name] !== undefined);
@@ -3451,7 +3486,7 @@ export function prepareRuntimeTokenSources(options: Readonly<{ mode?: RuntimeTok
         if (tokenPolicy.allowAnonymous) continue;
         throw new Error(missingRequiredTokenSourceMessage(name));
       }
-      const sourceRegistry = source.source === "named" ? registry : undefined;
+      const sourceRegistry = tokenSourceReadsRegistry(source) ? registry : undefined;
       const fingerprint = tokenSourceFingerprint(source, sourceRegistry);
       values.set(name, skippable.has(name)
         ? { kind: "skipped", fingerprint }
@@ -3500,8 +3535,8 @@ function assertPreparedTokenSourceInputs(
   }
   for (const name of names) {
     const source = config[name];
-    if (!source || source.source === "named" && !registry?.[source.name]
-      || prepared.values.get(name)?.fingerprint !== tokenSourceFingerprint(source, source.source === "named" ? registry : undefined)) {
+    if (!source || tokenSourceRegistryNames(source).some((registryName) => !registry?.[registryName])
+      || prepared.values.get(name)?.fingerprint !== tokenSourceFingerprint(source, tokenSourceReadsRegistry(source) ? registry : undefined)) {
       throw new EffectiveControlSelectionChanged("prepared credential source changed before disruption or sync; resolve current sources and retry");
     }
   }
@@ -3526,7 +3561,7 @@ export function admitPreparedRuntimeTokenSources(project: ProjectInfo): void {
   // exact host metadata paths captured by preparation, without resolving any
   // credential or invoking an external source while the lifecycle lock is held.
   const config = parseTokenSourceConfig(readJsonFile<unknown>(prepared.tokenConfigPath, {}), prepared.tokenConfigPath);
-  const registry = Object.values(config).some((source) => source.source === "named")
+  const registry = Object.values(config).some((source) => tokenSourceReadsRegistry(source))
     ? validateSourceRegistry(readJsonFile<unknown>(prepared.sourceConfigPath, {}), prepared.sourceConfigPath) : undefined;
   assertPreparedTokenSourceInputs(prepared, validateNetworkPolicy(active.policy, active.networkPolicyPath), config, registry);
   prepared.admittedAt ??= now;
@@ -3868,7 +3903,7 @@ function syncTokensUnderLock(
   }
   let sourceRegistry: SourceRegistry | undefined;
   let sourceRegistryError: unknown;
-  if (Object.values(config).some((source) => source.source === "named")) {
+  if (Object.values(config).some((source) => tokenSourceReadsRegistry(source))) {
     try {
       sourceRegistry = loadSourceRegistry();
     } catch (error) {
@@ -3900,7 +3935,7 @@ function syncTokensUnderLock(
     for (const [tokenName] of Object.entries(policy.tokens)) {
       const source = config[tokenName];
       if (!source) continue;
-      const registryForSource = source.source === "named" ? sourceRegistry : undefined;
+      const registryForSource = tokenSourceReadsRegistry(source) ? sourceRegistry : undefined;
       const due = tokenDueDecision({
         heldTokens,
         ledger,
@@ -3938,7 +3973,7 @@ function syncTokensUnderLock(
     // written yet, and the source-truth order prepares afresh.
     try {
       const expectedNames = assertPreparedTokenSourceInputs(prepared, policy, config, sourceRegistry);
-      for (const name of expectedNames) currentPreparedRuntimeTokenSource(name, config[name], { quiet: true, sourceRegistry: config[name].source === "named" ? sourceRegistry : undefined });
+      for (const name of expectedNames) currentPreparedRuntimeTokenSource(name, config[name], { quiet: true, sourceRegistry: tokenSourceReadsRegistry(config[name]) ? sourceRegistry : undefined });
     } catch (error) {
       if (deferring && error instanceof EffectiveControlSelectionChanged) {
         throw new TokenSyncDeferredError(`the prepared credential set no longer applies: ${error.message}`, "preparation");
@@ -3978,10 +4013,10 @@ function syncTokensUnderLock(
     }
 
     try {
-      if (source.source === "named" && sourceRegistryError !== undefined) {
+      if (tokenSourceReadsRegistry(source) && sourceRegistryError !== undefined) {
         throw sourceRegistryError;
       }
-      const registryForSource = source.source === "named" ? sourceRegistry : undefined;
+      const registryForSource = tokenSourceReadsRegistry(source) ? sourceRegistry : undefined;
       const refresh = effectiveTokenRefresh(source, registryForSource);
       assertRefreshBeforeJwtExpiry(refresh);
       // A value the preparation re-read from its source is always written: the
@@ -4127,7 +4162,7 @@ function syncTokensUnderLock(
       clearCachedSourceSecret(source, options.sourceSecretCache);
       let failureFingerprint: string | undefined;
       try {
-        const registryForSource = source.source === "named" && sourceRegistryError === undefined ? sourceRegistry : undefined;
+        const registryForSource = tokenSourceReadsRegistry(source) && sourceRegistryError === undefined ? sourceRegistry : undefined;
         failureFingerprint = tokenSourceFingerprint(source, registryForSource);
       } catch {
         // The source-resolution failure remains the user-facing diagnostic.

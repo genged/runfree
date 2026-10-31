@@ -57,6 +57,7 @@ import {
   tokenResolutionLedgerKey,
   type TokenSource,
   tokenSourceFingerprint,
+  tokenSourceReadsRegistry,
   tokenSourceFromSelection,
   type TokenSourceSelection,
   tokenSyncWatchNowMs,
@@ -174,7 +175,7 @@ type TokenSyncRuntimeSnapshot = { runtimeState: ProxyRuntimeState; storeGenerati
 function nextTokenSyncDelayMs(ledger: TokenResolutionLedger, snapshot?: TokenSyncRuntimeSnapshot): number | undefined {
   const config = loadTokenConfig();
   const policy = loadPolicy();
-  const sourceRegistry = Object.values(config).some((source) => source.source === "named")
+  const sourceRegistry = Object.values(config).some((source) => tokenSourceReadsRegistry(source))
     ? loadSourceRegistry()
     : undefined;
   const runtime = snapshot ?? ((): TokenSyncRuntimeSnapshot => {
@@ -711,7 +712,7 @@ export function credentialStatus(input: CredentialStatusInput = {}): void {
   const policy = loadPolicy();
   const config = loadTokenConfig();
   const status = loadTokenStatus();
-  const registry = Object.values(config).some((source) => source.source === "named") ? loadSourceRegistry() : undefined;
+  const registry = Object.values(config).some((source) => tokenSourceReadsRegistry(source)) ? loadSourceRegistry() : undefined;
   const allNames = Array.from(new Set([...Object.keys(policy.tokens), ...Object.keys(config)])).sort();
   const names = input.name ? allNames.filter((name) => name === input.name) : allNames;
 

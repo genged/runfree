@@ -42,6 +42,7 @@ import {
   googleServiceAccountKeyFromJson,
   type JwtPrivateKeyCacheEntry,
   tokenSourceFingerprint,
+  tokenSourcesEqual,
 } from "../packages/cli/src/admin/admin-core.ts";
 import { signGoogleServiceAccountJwt } from "../packages/cli/src/admin/google-service-account.ts";
 import { CREDENTIAL_OBSERVATION_BATCH_HEADER } from "../packages/cli/src/admin/credential-observation.ts";
@@ -7695,6 +7696,71 @@ describe("1password connection sources (todo 158)", () => {
       const result = await runAdmin(() => sourceRemoveIntent({ name: "gh" }), connectionEnv(fake));
       expect(result.status, result.stderr).toBe(0);
       expect(fake.calls).toEqual([]);
+    });
+  });
+
+  describe("via bindings", () => {
+    test("via round-trips, describes, and fingerprints the connection identity but not when it was saved", async () => {
+      writeFixtureRepo(exampleTokenPolicy(["github", "appstore"]));
+      writeTokenConfig({
+        github: { source: "1password", ref: "op://Automation/github/token", via: "automation" },
+        appstore: { source: "named", name: "automation-jwt", via: "automation" },
+      });
+      writeSourceRegistry({
+        automation: CONNECTION_ENTRY,
+        "automation-jwt": { type: "jwt", alg: "ES256", privateKey: { source: "1password", ref: "op://Automation/key/pem" }, headers: {}, claims: {}, ttlSeconds: 1200, createdAt: "x" },
+      });
+      const fake = installFakeKeychainAndOp();
+      const result = await runAdmin(() => credentialStatus({}), connectionEnv(fake));
+      expect(result.status, result.stderr).toBe(0);
+      expect(result.stdout).toContain("source: 1password via automation");
+      expect(result.stdout).toContain("source: source automation-jwt via automation");
+      expect(fake.calls).toEqual([]);
+
+      const registry = { automation: { type: "1password" as const, keychain: { service: "runfree.credential-source", account: "automation" }, createdAt: "x" } };
+      const withVia = tokenSourceFingerprint({ source: "1password", ref: "op://A/b/c", via: "automation" }, registry);
+      const withoutVia = tokenSourceFingerprint({ source: "1password", ref: "op://A/b/c" }, registry);
+      expect(withVia).not.toBe(withoutVia);
+      // A binding without via keeps the fingerprint it had before via existed.
+      expect(withoutVia).toBe(tokenSourceFingerprint({ source: "1password", ref: "op://A/b/c" }, undefined));
+      expect(tokenSourceFingerprint({ source: "1password", ref: "op://A/b/c", via: "automation" }, { automation: { ...registry.automation, createdAt: "later" } })).toBe(withVia);
+      const otherItem = { automation: { ...registry.automation, keychain: { service: "runfree.credential-source", account: "other" } } };
+      expect(tokenSourceFingerprint({ source: "1password", ref: "op://A/b/c", via: "automation" }, otherItem)).not.toBe(withVia);
+    });
+
+    test("via is part of a binding's identity", () => {
+      const plain = { source: "1password" as const, ref: "op://A/b/c" };
+      expect(tokenSourcesEqual(plain, { ...plain, via: "automation" })).toBe(false);
+      expect(tokenSourcesEqual({ ...plain, via: "automation" }, { ...plain, via: "other" })).toBe(false);
+      expect(tokenSourcesEqual({ ...plain, via: "automation" }, { ...plain, via: "automation" })).toBe(true);
+      expect(tokenSourcesEqual({ source: "named", name: "jwt" }, { source: "named", name: "jwt", via: "automation" })).toBe(false);
+    });
+
+    test.each([
+      [{ github: { source: "env", env: "GITHUB_TOKEN", via: "automation" } }, "github: via applies only to 1password and named credential sources"],
+      [{ github: { source: "1password", ref: "op://A/b/c", via: "Not A Name" } }, "github: via must be a source name"],
+      [{ github: { source: "named", name: "gh", via: 7 } }, "github: via must be a source name"],
+    ])("a malformed via in host config is refused", async (config, message) => {
+      writeFixtureRepo(exampleTokenPolicy(["github"]));
+      writeTokenConfig(config);
+      const fake = installFakeKeychainAndOp();
+      const result = await runAdmin(() => credentialStatus({}), connectionEnv(fake));
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toContain(message);
+      expect(fake.calls).toEqual([]);
+    });
+
+    test("a connection used through via cannot be removed, and login lists its users", async () => {
+      writeSourceRegistry({ automation: CONNECTION_ENTRY });
+      writeTokenConfig({ github: { source: "1password", ref: "op://Automation/github/token", via: "automation" } });
+      const fake = installFakeKeychainAndOp({ stored: new Map([["automation", `ops_${"O".repeat(48)}`]]) });
+      const removed = await runAdmin(() => sourceRemoveIntent({ name: "automation" }), connectionEnv(fake));
+      expect(removed.status).not.toBe(0);
+      expect(removed.stderr).toContain("automation is used by credential bindings: github");
+      expect(fake.calls).toEqual([]);
+      const rotated = await runAdmin(() => sourceLoginIntent({ name: "automation", token: { kind: "stdin", text: SA_TOKEN } }), connectionEnv(fake));
+      expect(rotated.status, rotated.stderr).toBe(0);
+      expect(rotated.stdout).toContain("used by credential bindings: github");
     });
   });
 });

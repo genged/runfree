@@ -38,6 +38,7 @@ import {
   sourceConfigPath,
   type SourceNameInput,
   type SourceRegistry,
+  tokenSourceRegistryNames,
   verifyConnectionLogin,
   writeConnectionLogin,
   writeJsonFile,
@@ -139,7 +140,7 @@ function sourceUsers(registryName: string): string[] {
     if (!stat.isDirectory()) continue;
     const config = parseTokenSourceConfig(readJsonFile<unknown>(path.join(dir, "tokens.json"), {}), path.join(dir, "tokens.json"));
     for (const [tokenName, source] of Object.entries(config)) {
-      if (source.source === "named" && source.name === registryName) users.push(tokenName);
+      if (tokenSourceRegistryNames(source).includes(registryName)) users.push(tokenName);
     }
   }
   return Array.from(new Set(users)).sort();
