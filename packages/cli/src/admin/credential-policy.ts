@@ -56,6 +56,7 @@ import {
   type TokenSyncResult,
   withAdminCallTimeout,
   tokenResolutionLedgerKey,
+  type SourceRegistry,
   type TokenSource,
   tokenSourceFingerprint,
   tokenSourceReadsRegistry,
@@ -727,6 +728,20 @@ export async function credentialClearSourceIntent(input: CredentialClearSourceIn
   });
 }
 
+/** What a `runfree run` does with one binding: static, from configuration only. */
+function describeUnattendedRead(source: TokenSource, registry: SourceRegistry | undefined): string {
+  const verdict = unattendedReadVerdict(source, registry);
+  if (verdict.kind === "never-asks") return "reads without asking";
+  switch (verdict.reason) {
+    case "1password-app":
+      return "refused (uses the 1Password app, which may ask)";
+    case "command":
+      return "refused (runs a command source)";
+    case "signing-key-1password-app":
+      return "refused (reads its signing key with the 1Password app)";
+  }
+}
+
 /** `runfree run` refuses with this code when a credential source may ask (headless-run spec §3.6). */
 const RUN_REFUSED_EXIT = 65;
 
@@ -801,6 +816,7 @@ export function credentialStatus(input: CredentialStatusInput = {}): void {
     const owner = credentialOwner(name);
     console.log(`  owner: ${owner ? describeCredentialOwner(owner) : "manual"}`);
     console.log(`  refresh: ${describeEffectiveRefresh(refresh)}`);
+    if (source) console.log(`  runfree run: ${describeUnattendedRead(source, registry)}`);
     console.log("  agent exposure: no");
     if (!credentialPolicy && source) {
       console.log(name.startsWith("user-")

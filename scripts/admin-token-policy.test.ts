@@ -8371,6 +8371,37 @@ describe("1password connection sources (todo 158)", () => {
       expect(fake.calls).toEqual([]);
     });
 
+    test("credential status shows what a run would do with each binding, without reading any source", async () => {
+      writeFixtureRepo(exampleTokenPolicy(["github", "openai", "stripe", "env-token", "appstore"]));
+      const command = installFakeCommandSource();
+      writeSourceRegistry({
+        automation: CONNECTION_ENTRY,
+        gh: { type: "command", argv: [fs.realpathSync(command.commandPath)], displayArgv: ["gh"], createdAt: "x" },
+        "appstore-jwt": { type: "jwt", alg: "ES256", privateKey: { source: "1password", ref: "op://A/AuthKey/pem" }, headers: {}, claims: {}, ttlSeconds: 1140, createdAt: "x" },
+      });
+      writeTokenConfig({
+        github: { source: "1password", ref: "op://Private/github/token" },
+        openai: { source: "1password", ref: "op://Automation/openai/key", via: "automation" },
+        stripe: { source: "named", name: "gh" },
+        "env-token": { source: "env", env: "ENV_TOKEN" },
+        appstore: { source: "named", name: "appstore-jwt" },
+      });
+      const fake = installFakeKeychainAndOp({ stored: new Map([["automation", SA_TOKEN]]) });
+      const result = await runAdmin(() => credentialStatus({}), connectionEnv(fake));
+      expect(result.status, result.stderr).toBe(0);
+      const runLine = (name: string): string | undefined => {
+        const block = result.stdout.split(/\n(?=\S)/).find((entry) => entry.startsWith(`${name}:`));
+        return block?.split("\n").find((line) => line.startsWith("  runfree run: "));
+      };
+      expect(runLine("github")).toBe("  runfree run: refused (uses the 1Password app, which may ask)");
+      expect(runLine("openai")).toBe("  runfree run: reads without asking");
+      expect(runLine("stripe")).toBe("  runfree run: refused (runs a command source)");
+      expect(runLine("env-token")).toBe("  runfree run: reads without asking");
+      expect(runLine("appstore")).toBe("  runfree run: refused (reads its signing key with the 1Password app)");
+      expect(fake.calls).toEqual([]);
+      expect(fs.existsSync(command.logPath)).toBe(false);
+    });
+
     test("an env binding under the rule reads normally", async () => {
       writeFixtureRepo(exampleTokenPolicy(["github"]));
       writeTokenConfig({ github: { source: "env", env: "GITHUB_TOKEN" } });
