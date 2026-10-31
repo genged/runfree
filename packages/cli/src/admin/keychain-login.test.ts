@@ -12,6 +12,7 @@ import {
   keychainItemForSource,
   keychainReadArgs,
   keychainReadStep,
+  keychainWriteCheckStep,
   keychainWriteRequest,
 } from "./keychain-login.ts";
 
@@ -49,6 +50,7 @@ describe("service account token shape", () => {
     ["a quote", `ops_${"A".repeat(30)}"`],
     ["a newline", `ops_${"A".repeat(30)}\nadd-generic-password`],
     ["too long", `ops_${"A".repeat(9000)}`],
+    ["longer than a security -i line can safely carry", `ops_${"A".repeat(2100)}`],
   ])("refuses %s, and the message never quotes the input", (_label, token) => {
     let message = "";
     try {
@@ -101,6 +103,34 @@ describe("keychain write", () => {
     expect(request.input).toBe(
       `add-generic-password -U -s runfree.credential-source -a automation -l runfree-source-automation -T /usr/bin/security -w ${TOKEN}\n`,
     );
+  });
+  test("the longest accepted token fits a 3 KiB security -i line; a real-size token is accepted", () => {
+    // 1Password service account tokens are about 1 KB.
+    const realSize = `ops_${"A".repeat(1100)}`;
+    expect(() => assertServiceAccountTokenShape(realSize)).not.toThrow();
+    const longest = `ops_${"A".repeat(2048 - 4)}`;
+    const account = "a".repeat(64);
+    const request = keychainWriteRequest(keychainItemForSource(account), longest);
+    expect(Buffer.byteLength(request.input, "utf8")).toBeLessThanOrEqual(3 * 1024);
+    expect(() => assertServiceAccountTokenShape(`${longest}A`)).toThrow(ConnectionSetupError);
+  });
+  test("the read-back check accepts the same login and refuses a different or unreadable one with fixed text", () => {
+    expect(() => keychainWriteCheckStep(exit({ stdout: `${TOKEN}\n` }), TOKEN)).not.toThrow();
+    for (const result of [
+      exit({ stdout: `${TOKEN.slice(0, 20)}\n` }),
+      exit({ stdout: `${TOKEN}X\n` }),
+      exit({ status: 44, stderr: `no ${TOKEN}` }),
+      exit({ status: null, failure: { kind: "timeout" } }),
+    ]) {
+      let message = "";
+      try {
+        keychainWriteCheckStep(result, TOKEN);
+      } catch (error) {
+        expect(error).toBeInstanceOf(ConnectionSetupError);
+        message = (error as Error).message;
+      }
+      expect(message).toBe("the macOS Keychain did not keep the login as given; run the command again");
+    }
   });
   test("refuses a token of the wrong shape before building a request", () => {
     expect(() => keychainWriteRequest(keychainItemForSource("automation"), "x y")).toThrow(ConnectionSetupError);

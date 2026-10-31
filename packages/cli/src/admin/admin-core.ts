@@ -184,6 +184,7 @@ import {
   keychainPlatformAvailable,
   keychainReadArgs,
   keychainReadStep,
+  keychainWriteCheckStep,
   keychainWriteRequest,
 } from "./keychain-login.ts";
 import {
@@ -1468,7 +1469,7 @@ export function verifyConnectionLogin(token: string): string[] {
   return parseVaultNames(vaults.stdout);
 }
 
-/** Saves (or replaces, `-U`) a connection login; the token goes on stdin only. */
+/** Saves (or replaces, `-U`) a connection login and reads it back; the token goes on stdin only. */
 export function writeConnectionLogin(item: KeychainItem, token: string): void {
   const request = keychainWriteRequest(item, token);
   const exit = connectionSetupExit(keychainExecutable(childEnv()), request.args, {
@@ -1477,6 +1478,9 @@ export function writeConnectionLogin(item: KeychainItem, token: string): void {
     timeout: KEYCHAIN_CALL_TIMEOUT_MS,
   });
   if (exit.failure || exit.status !== 0) throw new ConnectionSetupError("the macOS Keychain refused to save the login");
+  // `security -i` can report success for a line it did not store whole.
+  const invocation = connectionKeychainInvocation(item);
+  keychainWriteCheckStep(connectionSetupExit(invocation.executable, [...invocation.args], { env: invocation.env, timeout: invocation.timeoutMs }), token);
 }
 
 /**

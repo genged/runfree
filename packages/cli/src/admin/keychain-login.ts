@@ -11,7 +11,12 @@ export const KEYCHAIN_SERVICE = "runfree.credential-source";
 export const KEYCHAIN_CALL_TIMEOUT_MS = 10_000;
 const SECURITY_PATH = "/usr/bin/security";
 const TOKEN_SHAPE = /^ops_[A-Za-z0-9_.+/=-]+$/;
-const TOKEN_MAX_BYTES = 8 * 1024;
+// A login is written on one `security -i` command line, and a line longer
+// than the tool's read buffer would be split into a stored prefix and a
+// second command. Service account tokens are about 1 KB: 2 KiB of token
+// keeps the whole line under 3 KiB, well inside that buffer.
+const TOKEN_MAX_BYTES = 2 * 1024;
+const WRITE_LINE_MAX_BYTES = 3 * 1024;
 
 export type KeychainItem = Readonly<{ service: string; account: string }>;
 
@@ -82,10 +87,18 @@ export function keychainReadStep(sourceName: string, exit: ProviderExit): string
 
 export function keychainWriteRequest(item: KeychainItem, token: string): Readonly<{ args: string[]; input: string }> {
   assertServiceAccountTokenShape(token);
-  return {
-    args: ["-i"],
-    input: `add-generic-password -U -s ${item.service} -a ${item.account} -l runfree-source-${item.account} -T ${SECURITY_PATH} -w ${token}\n`,
-  };
+  const input = `add-generic-password -U -s ${item.service} -a ${item.account} -l runfree-source-${item.account} -T ${SECURITY_PATH} -w ${token}\n`;
+  if (Buffer.byteLength(input, "utf8") > WRITE_LINE_MAX_BYTES) throw new ConnectionSetupError("the login is too long to save in the macOS Keychain");
+  return { args: ["-i"], input };
+}
+
+/**
+ * The read-back after a write: the Keychain must return exactly the login
+ * written. Fixed text only; a read's stdout is the login.
+ */
+export function keychainWriteCheckStep(exit: ProviderExit, token: string): void {
+  if (!exit.failure && exit.status === 0 && exit.stdout.replace(/\r?\n$/, "") === token) return;
+  throw new ConnectionSetupError("the macOS Keychain did not keep the login as given; run the command again");
 }
 
 export function keychainDeleteArgs(item: KeychainItem): string[] {
