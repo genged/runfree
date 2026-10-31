@@ -53,6 +53,7 @@ import {
   sourceAddGoogleServiceAccountIntent,
   sourceAddJwtIntent,
   sourceAddOnePasswordConnectionIntent,
+  sourceLoginIntent,
   type ConnectionTokenInput,
   type SourceAddGoogleServiceAccountInput,
   sourceList,
@@ -7518,6 +7519,75 @@ describe("1password connection sources (todo 158)", () => {
       expect(extra.status).not.toBe(0);
       expect(extra.stderr).toContain("Unknown argument: extra");
       expect(sourceRegistryText()).toBe("");
+    });
+  });
+
+  describe("credential source login", () => {
+    const OLD_TOKEN = `ops_${"O".repeat(48)}`;
+    const rotate = (token: ConnectionTokenInput = { kind: "stdin", text: SA_TOKEN }) =>
+      () => sourceLoginIntent({ name: "automation", token });
+
+    test("rotation verifies the new token before the Keychain update, and never rewrites the registry", async () => {
+      writeSourceRegistry({ automation: CONNECTION_ENTRY });
+      const fake = installFakeKeychainAndOp({ stored: new Map([["automation", OLD_TOKEN]]) });
+      const registryBefore = sourceRegistryText();
+      const result = await runAdmin(rotate(), connectionEnv(fake));
+      expect(result.status, result.stderr).toBe(0);
+      expect(result.stdout).toContain('checking with 1Password... ok: can read vault "Automation"; never asks');
+      expect(result.stdout).toContain("automation: login replaced");
+      expect(result.stdout).toContain("used by: none");
+      expect(fake.calls.map((call) => `${call.command} ${call.args[0]}`)).toEqual(["op whoami", "op vault", "security -i"]);
+      for (const call of fake.calls) expect(call.args.join(" ")).not.toContain(SA_TOKEN);
+      expect(fake.calls.find((call) => call.command === "security")?.input).toContain("add-generic-password -U ");
+      expect(fake.stored.get("automation")).toBe(SA_TOKEN);
+      expect(sourceRegistryText()).toBe(registryBefore);
+      expectNoSentinel(result.stdout, result.stderr);
+    });
+
+    test("rotation lists the bindings that use the connection", async () => {
+      writeSourceRegistry({ automation: CONNECTION_ENTRY, other: { ...CONNECTION_ENTRY, keychain: { service: "runfree.credential-source", account: "other" } } });
+      // A hand-written binding: Task 3 refuses to create one, but a user can.
+      writeTokenConfig({ github: { source: "named", name: "automation" }, openai: { source: "named", name: "other" } });
+      const fake = installFakeKeychainAndOp({ stored: new Map([["automation", OLD_TOKEN]]) });
+      const result = await runAdmin(rotate(), connectionEnv(fake));
+      expect(result.status, result.stderr).toBe(0);
+      expect(result.stdout).toContain("used by credential bindings: github");
+      expect(result.stdout).not.toContain("openai");
+    });
+
+    test.each([
+      ["a personal login", { whoami: JSON.stringify({ user_type: "HUMAN" }) }, "1Password did not confirm a service account login"],
+      ["a token 1Password rejects", { whoamiStatus: 1, whoamiStderr: "[ERROR] invalid token" }, "1Password refused the service account token"],
+    ])("%s leaves the old login untouched", async (_label, options, message) => {
+      writeSourceRegistry({ automation: CONNECTION_ENTRY });
+      const fake = installFakeKeychainAndOp({ stored: new Map([["automation", OLD_TOKEN]]), ...options });
+      const result = await runAdmin(rotate(), connectionEnv(fake));
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toContain(message);
+      expect(fake.calls.filter((call) => call.command === "security")).toEqual([]);
+      expect(fake.stored.get("automation")).toBe(OLD_TOKEN);
+      expectNoSentinel(result.stdout, result.stderr);
+    });
+
+    test("a malformed token refuses before any spawn", async () => {
+      writeSourceRegistry({ automation: CONNECTION_ENTRY });
+      const fake = installFakeKeychainAndOp({ stored: new Map([["automation", OLD_TOKEN]]) });
+      const result = await runAdmin(rotate({ kind: "stdin", text: "not-a-token" }), connectionEnv(fake));
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toContain("this is not a 1Password service account token (it starts with ops_)");
+      expect(fake.calls).toEqual([]);
+    });
+
+    test.each([
+      ["an unknown source", undefined, "unknown source: automation"],
+      ["a command source", { type: "command", argv: ["/bin/echo", "x"], displayArgv: ["echo", "x"], createdAt: "x" }, "login applies to 1password connection sources; automation is a command source"],
+    ])("login on %s refuses before any spawn", async (_label, entry, message) => {
+      if (entry) writeSourceRegistry({ automation: entry });
+      const fake = installFakeKeychainAndOp();
+      const result = await runAdmin(rotate(), connectionEnv(fake));
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toContain(message);
+      expect(fake.calls).toEqual([]);
     });
   });
 });

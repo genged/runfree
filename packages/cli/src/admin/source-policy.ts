@@ -15,6 +15,7 @@ import {
   ensureStateDirs,
   formatDurationSeconds,
   type GoogleServiceAccountSource,
+  isConnectionSource,
   type JwtAlgorithm,
   type JwtSource,
   loadSourceRegistry,
@@ -471,4 +472,32 @@ export async function sourceAddOnePasswordConnectionIntent(input: SourceOnePassw
     if (error instanceof ConnectionSetupError) die(error.message);
     throw error;
   }
+}
+
+// Typed enforcement for `runfree credential source login <name>`: replaces a
+// connection's stored login. The new token is checked with 1Password before
+// the Keychain update, so a rejected token leaves the old login in place. The
+// registry is not written: the Keychain item name does not change.
+export async function sourceLoginIntent(input: SourceOnePasswordInput): Promise<void> {
+  const { name } = input;
+  if (!name) die("usage: runfree credential source login <name> [--token-stdin]");
+  assertKnownSourceName(name);
+  const source = loadSourceRegistry()[name];
+  if (!source) die(`unknown source: ${name}`);
+  if (!isConnectionSource(source)) die(`login applies to 1password connection sources; ${name} is a ${sourceTypeDisplay(source)} source`);
+  try {
+    assertKeychainPlatform(childEnv());
+    if (!resolveHostExecutable("op")) throw new ConnectionSetupError("op CLI not found on sanitized host PATH");
+    const token = await connectionToken(input.token);
+    assertServiceAccountTokenShape(token);
+    const vaults = verifyConnectionLogin(token);
+    console.log(`checking with 1Password... ok: can read ${vaultLine(vaults)}; never asks`);
+    writeConnectionLogin(source.keychain, token);
+  } catch (error) {
+    if (error instanceof ConnectionSetupError) die(error.message);
+    throw error;
+  }
+  const users = sourceUsers(name);
+  console.log(`${name}: login replaced`);
+  console.log(users.length > 0 ? `used by credential bindings: ${users.join(", ")}` : "used by: none");
 }

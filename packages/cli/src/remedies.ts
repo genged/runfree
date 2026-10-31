@@ -170,6 +170,7 @@ export function sampleRemedyRenderings(): string[] {
     remedy.credentialRemove("github"),
     remedy.credentialUnlink("github", "api.github.com"),
     remedy.credentialSourceOnePassword("automation"),
+    remedy.credentialSourceLogin("automation"),
     remedy.imageApproveContext(),
     remedy.imageInit(),
     remedy.destroy(),

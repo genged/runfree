@@ -23,6 +23,7 @@ import {
   sourceAddJwtIntent,
   sourceAddOnePasswordConnectionIntent,
   sourceList,
+  sourceLoginIntent,
   sourceRemoveIntent,
   sourceShowIntent,
 } from "../../admin/options.ts";
@@ -409,6 +410,13 @@ export const credentialCommand: CommandModule = {
                 connectionLoginBuilder,
                 handler((argv: ArgumentsCamelCase<ConnectionLoginArgs>) =>
                   runSource(() => sourceAddOnePasswordConnectionIntent({ name: argv.name, token: connectionTokenInput(argv["token-stdin"] === true) }))),
+              )
+              .command(
+                "login <name>",
+                "Replace the stored login of a 1Password connection source, checked before the switch",
+                connectionLoginBuilder,
+                handler((argv: ArgumentsCamelCase<ConnectionLoginArgs>) =>
+                  runSource(() => sourceLoginIntent({ name: argv.name, token: connectionTokenInput(argv["token-stdin"] === true) }))),
               )
               .command("list", "List host-owned named sources", (cmd) => cmd, handler(() => runSource(() => sourceList())))
               .command(

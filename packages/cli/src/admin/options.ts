@@ -60,6 +60,7 @@ export {
   sourceAddOnePasswordConnectionIntent,
   type SourceOnePasswordInput,
   sourceList,
+  sourceLoginIntent,
   sourceRemoveIntent,
   sourceShowIntent,
 } from "./source-policy.ts";
