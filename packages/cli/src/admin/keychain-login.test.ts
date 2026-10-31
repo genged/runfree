@@ -35,6 +35,8 @@ describe("keychain executable and platform", () => {
     expect(() => assertKeychainPlatform({ RUNFREE_TEST_FAKE_DOCKER: "1", RUNFREE_TEST_KEYCHAIN_PLATFORM: "darwin" }, "linux")).not.toThrow();
     expect(() => assertKeychainPlatform({ RUNFREE_TEST_KEYCHAIN_PLATFORM: "darwin" }, "linux")).toThrow(ConnectionSetupError);
     expect(() => assertKeychainPlatform({}, "darwin")).not.toThrow();
+    expect(() => assertKeychainPlatform({ RUNFREE_TEST_FAKE_DOCKER: "1", RUNFREE_TEST_KEYCHAIN_PLATFORM: "linux" }, "darwin")).toThrow(ConnectionSetupError);
+    expect(() => assertKeychainPlatform({ RUNFREE_TEST_KEYCHAIN_PLATFORM: "linux" }, "darwin")).not.toThrow();
   });
 });
 

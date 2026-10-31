@@ -22,6 +22,7 @@ import {
   sourceAddGoogleServiceAccountIntent,
   sourceAddJwtIntent,
   sourceAddOnePasswordConnectionIntent,
+  sourceCheckIntent,
   sourceList,
   sourceLoginIntent,
   sourceRemoveIntent,
@@ -426,8 +427,14 @@ export const credentialCommand: CommandModule = {
                 handler((argv: ArgumentsCamelCase<NameArgs>) => runSource(() => sourceShowIntent({ name: argv.name }))),
               )
               .command(
+                "check <name>",
+                "Check that a 1Password connection source can still read without asking",
+                sourceNamePositional,
+                handler((argv: ArgumentsCamelCase<NameArgs>) => runSource(() => sourceCheckIntent({ name: argv.name }))),
+              )
+              .command(
                 "remove <name>",
-                "Remove an unused host-owned named source",
+                "Remove an unused host-owned named source (and a connection's Keychain login)",
                 sourceNamePositional,
                 handler((argv: ArgumentsCamelCase<NameArgs>) => runSource(() => sourceRemoveIntent({ name: argv.name }))),
               )

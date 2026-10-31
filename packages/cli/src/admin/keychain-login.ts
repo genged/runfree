@@ -31,9 +31,15 @@ export function keychainExecutable(env: NodeJS.ProcessEnv): string {
   return testSeam(env) && override ? override : SECURITY_PATH;
 }
 
+// Under the test seam, RUNFREE_TEST_KEYCHAIN_PLATFORM names the platform both
+// ways, so a test proves the macOS-only refusal on a Mac too.
+export function keychainPlatformAvailable(env: NodeJS.ProcessEnv, platform: NodeJS.Platform = process.platform): boolean {
+  const override = testSeam(env) ? env.RUNFREE_TEST_KEYCHAIN_PLATFORM : undefined;
+  return (override || platform) === "darwin";
+}
+
 export function assertKeychainPlatform(env: NodeJS.ProcessEnv, platform: NodeJS.Platform = process.platform): void {
-  const effective = testSeam(env) && env.RUNFREE_TEST_KEYCHAIN_PLATFORM === "darwin" ? "darwin" : platform;
-  if (effective !== "darwin") throw new ConnectionSetupError("1password connection sources need the macOS login Keychain");
+  if (!keychainPlatformAvailable(env, platform)) throw new ConnectionSetupError("1password connection sources need the macOS login Keychain");
 }
 
 export function assertServiceAccountTokenShape(token: string): void {

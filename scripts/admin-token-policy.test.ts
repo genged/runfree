@@ -53,6 +53,7 @@ import {
   sourceAddGoogleServiceAccountIntent,
   sourceAddJwtIntent,
   sourceAddOnePasswordConnectionIntent,
+  sourceCheckIntent,
   sourceLoginIntent,
   type ConnectionTokenInput,
   type SourceAddGoogleServiceAccountInput,
@@ -7473,7 +7474,7 @@ describe("1password connection sources (todo 158)", () => {
       const fake = installFakeKeychainAndOp({ whoami: options.whoami, whoamiStatus: options.whoamiStatus, whoamiStderr: options.whoamiStderr, vaults: options.vaults });
       const env = {
         ...connectionEnv(fake),
-        ...(options.platform ? { RUNFREE_TEST_KEYCHAIN_PLATFORM: "" } : {}),
+        ...(options.platform ? { RUNFREE_TEST_KEYCHAIN_PLATFORM: options.platform } : {}),
         ...(options.noOp ? { PATH: "/usr/bin:/bin" } : {}),
       };
       const before = sourceRegistryText();
@@ -7587,6 +7588,112 @@ describe("1password connection sources (todo 158)", () => {
       const result = await runAdmin(rotate(), connectionEnv(fake));
       expect(result.status).not.toBe(0);
       expect(result.stderr).toContain(message);
+      expect(fake.calls).toEqual([]);
+    });
+  });
+
+  describe("credential source check and remove", () => {
+    test("check reads the Keychain then asks 1Password, and never prints the token", async () => {
+      writeSourceRegistry({ automation: CONNECTION_ENTRY });
+      const fake = installFakeKeychainAndOp({ stored: new Map([["automation", SA_TOKEN]]) });
+      const result = await runAdmin(() => sourceCheckIntent({ name: "automation" }), connectionEnv(fake));
+      expect(result.status, result.stderr).toBe(0);
+      expect(result.stdout).toContain('automation: ok: can read vault "Automation"; never asks');
+      expect(fake.calls.map((call) => `${call.command} ${call.args[0]}`)).toEqual(["security find-generic-password", "op whoami", "op vault"]);
+      for (const call of fake.calls.filter((entry) => entry.command === "op")) expect(call.env.OP_SERVICE_ACCOUNT_TOKEN).toBe(SA_TOKEN);
+      expectNoSentinel(result.stdout, result.stderr);
+    });
+
+    test.each([
+      ["missing", { readStatus: 44 }, 'the login for source "automation" is missing from the macOS Keychain'],
+      ["locked", { readStatus: 36, readStderr: "User interaction is not allowed." }, 'the login for source "automation" cannot be read (Keychain locked)'],
+      ["not a token", { stored: new Map([["automation", "hunter2"]]) }, 'the login for source "automation" in the macOS Keychain is not a service account token'],
+    ])("check with a %s login stops before op and names the fix", async (_label, options, message) => {
+      writeSourceRegistry({ automation: CONNECTION_ENTRY });
+      const fake = installFakeKeychainAndOp(options);
+      const result = await runAdmin(() => sourceCheckIntent({ name: "automation" }), connectionEnv(fake));
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toContain(message);
+      expect(result.stderr).toContain("fix: runfree credential source login automation");
+      expect(result.stderr).not.toContain("hunter2");
+      expect(fake.calls.filter((call) => call.command === "op")).toEqual([]);
+    });
+
+    test("check with a revoked login names the fix and never echoes the token", async () => {
+      writeSourceRegistry({ automation: CONNECTION_ENTRY });
+      const fake = installFakeKeychainAndOp({ stored: new Map([["automation", SA_TOKEN]]), whoamiStatus: 1, whoamiStderr: `[ERROR] ${SA_TOKEN} was revoked` });
+      const result = await runAdmin(() => sourceCheckIntent({ name: "automation" }), connectionEnv(fake));
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toContain("automation: 1Password refused the service account token: [ERROR] [redacted] was revoked");
+      expect(result.stderr).toContain("fix: runfree credential source login automation");
+      expectNoSentinel(result.stdout, result.stderr);
+    });
+
+    test.each([
+      ["a command source", { gh: { type: "command", argv: ["/bin/echo", "x"], displayArgv: ["echo", "x"], createdAt: "x" } }, "gh", "check verifies 1password connection sources; gh is a command source"],
+      ["an unknown source", {}, "gh", "unknown source: gh"],
+      ["a non-macOS host", { automation: CONNECTION_ENTRY }, "automation", "1password connection sources need the macOS login Keychain"],
+    ])("check on %s refuses before any spawn", async (_label, registry, name, message) => {
+      writeSourceRegistry(registry);
+      const fake = installFakeKeychainAndOp({ stored: new Map([["automation", SA_TOKEN]]) });
+      const env = name === "automation" ? { ...connectionEnv(fake), RUNFREE_TEST_KEYCHAIN_PLATFORM: "linux" } : connectionEnv(fake);
+      const result = await runAdmin(() => sourceCheckIntent({ name }), env);
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toContain(message);
+      expect(fake.calls).toEqual([]);
+    });
+
+    test("remove deletes the Keychain item, then the registry entry", async () => {
+      writeSourceRegistry({ automation: CONNECTION_ENTRY });
+      const fake = installFakeKeychainAndOp({ stored: new Map([["automation", SA_TOKEN]]) });
+      const result = await runAdmin(() => sourceRemoveIntent({ name: "automation" }), connectionEnv(fake));
+      expect(result.status, result.stderr).toBe(0);
+      expect(result.stdout).toContain("automation: login deleted from the macOS Keychain");
+      expect(fake.calls.map((call) => `${call.command} ${call.args[0]}`)).toEqual(["security delete-generic-password"]);
+      expect(fake.stored.has("automation")).toBe(false);
+      expect(JSON.parse(sourceRegistryText())).toEqual({});
+    });
+
+    test("remove of a connection in use refuses before the Keychain delete", async () => {
+      writeSourceRegistry({ automation: CONNECTION_ENTRY });
+      writeTokenConfig({ github: { source: "named", name: "automation" } });
+      const fake = installFakeKeychainAndOp({ stored: new Map([["automation", SA_TOKEN]]) });
+      const result = await runAdmin(() => sourceRemoveIntent({ name: "automation" }), connectionEnv(fake));
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toContain("automation is used by credential bindings: github");
+      expect(fake.calls).toEqual([]);
+      expect(fake.stored.get("automation")).toBe(SA_TOKEN);
+    });
+
+    test("a Keychain delete refusal keeps the registry entry; a retry reclaims; an absent item counts as done", async () => {
+      writeSourceRegistry({ automation: CONNECTION_ENTRY });
+      const refusing = installFakeKeychainAndOp({ deleteStatus: 36 });
+      const first = await runAdmin(() => sourceRemoveIntent({ name: "automation" }), connectionEnv(refusing));
+      expect(first.status).not.toBe(0);
+      expect(first.stderr).toContain("the macOS Keychain refused to delete the login; nothing was removed; retry: runfree credential source remove automation");
+      expect(JSON.parse(sourceRegistryText())).toHaveProperty("automation");
+      const absent = installFakeKeychainAndOp();
+      const retry = await runAdmin(() => sourceRemoveIntent({ name: "automation" }), connectionEnv(absent));
+      expect(retry.status, retry.stderr).toBe(0);
+      expect(retry.stdout).toContain("automation: login already absent from the macOS Keychain");
+      expect(JSON.parse(sourceRegistryText())).toEqual({});
+    });
+
+    test("on a host without the macOS Keychain, remove drops the entry without a Keychain call", async () => {
+      writeSourceRegistry({ automation: CONNECTION_ENTRY });
+      const fake = installFakeKeychainAndOp();
+      const result = await runAdmin(() => sourceRemoveIntent({ name: "automation" }), { ...connectionEnv(fake), RUNFREE_TEST_KEYCHAIN_PLATFORM: "linux" });
+      expect(result.status, result.stderr).toBe(0);
+      expect(result.stdout).toContain("automation: no macOS Keychain on this host; removing the source entry only");
+      expect(fake.calls).toEqual([]);
+      expect(JSON.parse(sourceRegistryText())).toEqual({});
+    });
+
+    test("removing a command source never calls the Keychain", async () => {
+      writeSourceRegistry({ gh: { type: "command", argv: ["/bin/echo", "x"], displayArgv: ["echo", "x"], createdAt: "x" } });
+      const fake = installFakeKeychainAndOp();
+      const result = await runAdmin(() => sourceRemoveIntent({ name: "gh" }), connectionEnv(fake));
+      expect(result.status, result.stderr).toBe(0);
       expect(fake.calls).toEqual([]);
     });
   });

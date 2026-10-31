@@ -177,8 +177,12 @@ import {
   KEYCHAIN_CALL_TIMEOUT_MS,
   KEYCHAIN_SERVICE,
   type KeychainItem,
+  keychainDeleteArgs,
+  keychainDeleteStep,
   keychainExecutable,
   keychainItemForSource,
+  keychainReadArgs,
+  keychainReadStep,
   keychainWriteRequest,
 } from "./keychain-login.ts";
 import {
@@ -1323,6 +1327,27 @@ export function writeConnectionLogin(item: KeychainItem, token: string): void {
     timeout: KEYCHAIN_CALL_TIMEOUT_MS,
   });
   if (exit.failure || exit.status !== 0) throw new ConnectionSetupError("the macOS Keychain refused to save the login");
+}
+
+/**
+ * Reads a connection login from the macOS Keychain. Throws a classified
+ * `TokenResolutionError` with fixed text: a read's stdout is the login.
+ */
+export function readConnectionLoginSync(sourceName: string, item: KeychainItem): string {
+  const exit = connectionSetupExit(keychainExecutable(childEnv()), keychainReadArgs(item), {
+    env: sanitizedHostExecutionEnv(projectRoot(), childEnv()),
+    timeout: KEYCHAIN_CALL_TIMEOUT_MS,
+  });
+  return keychainReadStep(sourceName, exit);
+}
+
+/** Deletes a connection login; an item that is already gone counts as done. */
+export function deleteConnectionLogin(item: KeychainItem): "deleted" | "absent" {
+  const exit = connectionSetupExit(keychainExecutable(childEnv()), keychainDeleteArgs(item), {
+    env: sanitizedHostExecutionEnv(projectRoot(), childEnv()),
+    timeout: KEYCHAIN_CALL_TIMEOUT_MS,
+  });
+  return keychainDeleteStep(exit);
 }
 
 /** A refusal before `op` runs. Its message is fixed text, never a value read. */

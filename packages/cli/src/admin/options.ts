@@ -58,6 +58,7 @@ export {
   sourceAddGoogleServiceAccountIntent,
   sourceAddJwtIntent,
   sourceAddOnePasswordConnectionIntent,
+  sourceCheckIntent,
   type SourceOnePasswordInput,
   sourceList,
   sourceLoginIntent,
