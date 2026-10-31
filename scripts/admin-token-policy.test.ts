@@ -8270,6 +8270,43 @@ describe("1password connection sources (todo 158)", () => {
       expectNoSentinel(result.stdout, result.stderr, fs.readFileSync(tokenStatusFilePath(), "utf8"));
     });
 
+    test("a --watch --unattended pass never runs an app op read; --unattended without --watch is refused", async () => {
+      writeFixtureRepo(exampleTokenPolicy(["github", "openai"]));
+      writeSourceRegistry({ automation: CONNECTION_ENTRY });
+      writeTokenConfig({
+        github: { source: "1password", ref: "op://Private/github/token", refreshEverySeconds: 1 },
+        openai: { source: "1password", ref: "op://Automation/openai/key", via: "automation", refreshEverySeconds: 1 },
+      });
+      const docker = installTokenSyncDockerFake();
+      const fake = installFakeKeychainAndOp({ stored: new Map([["automation", SA_TOKEN]]) });
+      const watch = await runAdmin(
+        () => credentialSyncIntent({ verbose: false, watch: true, quiet: false, delayFirstSync: false, cacheSourceSecrets: true, unattended: true }),
+        ruleEnv(fake, docker, { RUNFREE_TEST_TOKEN_SYNC_WATCH_ITERATIONS: "2", RUNFREE_TEST_TOKEN_SYNC_WATCH_SLEEP_MS: "1" }),
+      );
+      expect(watch.stdout + watch.stderr).toContain(APP_REFUSAL);
+      // Only the connection binding ran op, on each pass, with its own login.
+      const reads = opCalls(fake);
+      expect(reads.length).toBeGreaterThanOrEqual(1);
+      for (const call of reads) {
+        expect(call.args).toEqual(["read", "op://Automation/openai/key"]);
+        expect(call.env.OP_SERVICE_ACCOUNT_TOKEN).toBe(SA_TOKEN);
+      }
+      expect(credentialInteractionForbidden()).toBe(false);
+      expectNoSentinel(watch.stdout, watch.stderr, fs.readFileSync(docker.dockerLog, "utf8"));
+
+      const oneShot = await runAdmin(() => credentialSyncIntent({ verbose: false, watch: false, quiet: false, delayFirstSync: false, cacheSourceSecrets: true, unattended: true }), ruleEnv(fake, docker));
+      expect(oneShot.status).not.toBe(0);
+      expect(oneShot.stderr).toContain("--unattended only applies with --watch");
+      expect(credentialInteractionForbidden()).toBe(false);
+    });
+
+    test("the hidden --unattended flag reaches the watch through the command line", () => {
+      writeFixtureRepo(exampleTokenPolicy(["github"]));
+      const result = runAdminCli(["credential", "sync", "--unattended"]);
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toContain("--unattended only applies with --watch");
+    });
+
     test("an env binding under the rule reads normally", async () => {
       writeFixtureRepo(exampleTokenPolicy(["github"]));
       writeTokenConfig({ github: { source: "env", env: "GITHUB_TOKEN" } });

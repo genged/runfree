@@ -3909,6 +3909,19 @@ describe("token auto refresh invocation", () => {
     expect(plan.options.env).not.toHaveProperty("RUNFREE_TOKEN_SYNC_RECEIPT_FD");
   });
 
+  test("an unattended watcher gets --unattended; an interactive one does not", () => {
+    const projectRoot = path.join(tmp, "project");
+    const project = prepareProject(projectRoot);
+    const context = { projectRoot, project, runtimeRoot: path.join(tmp, "runtime"), env: { PATH: "/fake-bin" } };
+    const base = { command: "/usr/local/bin/runfree", args: [] };
+    const unattended = buildTokenAutoRefreshSpawnPlan({ base, context, parentPid: 1, initialSourceTruth: true, unattended: true });
+    expect(unattended.args.slice(-3)).toEqual(["--quiet", "--initial-source-truth", "--unattended"]);
+    const interactive = buildTokenAutoRefreshSpawnPlan({ base, context, parentPid: 1, initialSourceTruth: true });
+    expect(interactive.args).not.toContain("--unattended");
+    // The rule travels as a flag, never as an environment variable a provider would inherit.
+    expect(Object.keys(unattended.options.env ?? {}).filter((key) => /UNATTENDED/i.test(key))).toEqual([]);
+  });
+
   test("passes token resolution receipts to the watcher over an inherited pipe", () => {
     const projectRoot = path.join(tmp, "project");
     const project = prepareProject(projectRoot);

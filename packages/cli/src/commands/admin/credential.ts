@@ -78,6 +78,7 @@ type SyncArgs = {
   quiet?: boolean;
   "delay-first-sync"?: boolean;
   "initial-source-truth"?: boolean;
+  unattended?: boolean;
   "no-cache-source-secrets"?: boolean;
 };
 type SourceAddArgs = {
@@ -351,6 +352,11 @@ export const credentialCommand: CommandModule = {
                 hidden: true,
                 describe: "Re-read every source once before the first wait (internal: launch token auto-refresh)",
               })
+              .option("unattended", {
+                type: "boolean",
+                hidden: true,
+                describe: "Read only sources that never ask a person (internal: the credential watcher of a headless run)",
+              })
               .option("no-cache-source-secrets", { type: "boolean", describe: "Disable memory-only source-secret caching" }),
             handler((argv: ArgumentsCamelCase<SyncArgs>) => run(() => credentialSyncIntent({
               verbose: Boolean(argv.verbose),
@@ -358,6 +364,7 @@ export const credentialCommand: CommandModule = {
               quiet: Boolean(argv.quiet),
               delayFirstSync: Boolean(argv["delay-first-sync"]),
               initialSourceTruth: Boolean(argv["initial-source-truth"]),
+              unattended: Boolean(argv.unattended),
               cacheSourceSecrets: !argv["no-cache-source-secrets"],
             }))),
           )

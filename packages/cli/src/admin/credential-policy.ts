@@ -66,6 +66,7 @@ import {
   type WatchTokenPreparation,
   withTokenStoreLock,
 } from "./admin-core.ts";
+import { forbidCredentialInteraction } from "./credential-interaction.ts";
 import {
   ChildSignaledError,
   CredentialCancellationError,
@@ -813,6 +814,7 @@ export async function credentialSyncIntent(input: CredentialSyncInput): Promise<
   if (!input.watch && !input.cacheSourceSecrets) die("--no-cache-source-secrets only applies with --watch");
   if (!input.watch && input.delayFirstSync) die("--delay-first-sync only applies with --watch");
   if (!input.watch && input.initialSourceTruth) die("--initial-source-truth only applies with --watch");
+  if (!input.watch && input.unattended) die("--unattended only applies with --watch");
   if (input.watch && input.mode) die(`a ${input.mode} sync is one-shot`);
   if (input.mode === "prepared-source-truth") {
     await preparedSourceTruthSync(input.verbose, input.holdDeadlineMonotonicMs);
@@ -846,13 +848,19 @@ export async function credentialSyncIntent(input: CredentialSyncInput): Promise<
     return;
   }
   if (input.watch) {
-    await syncTokensWatch({
-      cacheSourceSecrets: input.cacheSourceSecrets,
-      delayFirstSync: input.delayFirstSync,
-      initialSourceTruth: input.initialSourceTruth === true,
-      quiet: input.quiet,
-      verbose: input.verbose,
-    });
+    // A run's watcher reads only sources that never ask, on every pass.
+    const releaseRule = input.unattended ? forbidCredentialInteraction() : () => {};
+    try {
+      await syncTokensWatch({
+        cacheSourceSecrets: input.cacheSourceSecrets,
+        delayFirstSync: input.delayFirstSync,
+        initialSourceTruth: input.initialSourceTruth === true,
+        quiet: input.quiet,
+        verbose: input.verbose,
+      });
+    } finally {
+      releaseRule();
+    }
     return;
   }
   const result = await syncTokensSettlingSignals({ exitOnFailure: true, verbose: input.verbose, mode: "source-truth" });

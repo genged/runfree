@@ -255,6 +255,8 @@ export function buildTokenAutoRefreshSpawnPlan(input: {
    * instead of waiting for the first one to fall due.
    */
   initialSourceTruth?: boolean;
+  /** A headless run's watcher: it reads only sources that never ask (`--unattended`). */
+  unattended?: boolean;
 }): TokenAutoRefreshSpawnPlan {
   const receipts = input.receipts ?? [];
   // Build the stdio array once and derive each channel's fd from its slot, so
@@ -285,6 +287,7 @@ export function buildTokenAutoRefreshSpawnPlan(input: {
       "--watch",
       "--quiet",
       input.initialSourceTruth ? "--initial-source-truth" : "--delay-first-sync",
+      ...(input.unattended ? ["--unattended"] : []),
     ],
     options: {
       detached: process.platform !== "win32",
@@ -341,7 +344,7 @@ function writeTokenResolutionReceipts(child: childProcess.ChildProcess, plan: To
 function startTokenAutoRefreshProcess(
   context: RuntimeContext,
   receipts: TokenResolutionReceipt[] = [],
-  options: Readonly<{ initialSourceTruth?: boolean }> = {},
+  options: Readonly<{ initialSourceTruth?: boolean; unattended?: boolean }> = {},
 ): TokenAutoRefreshHandle {
   const stderrFd = openTokenAutoRefreshLog(context);
   const plan = buildTokenAutoRefreshSpawnPlan({
@@ -351,6 +354,7 @@ function startTokenAutoRefreshProcess(
     receipts,
     stderrFd,
     initialSourceTruth: options.initialSourceTruth === true,
+    unattended: options.unattended === true,
   });
   let child: childProcess.ChildProcess;
   try {

@@ -132,6 +132,21 @@ describe("headless runtime IO", () => {
     await expect(io.admin({ kind: "prepare" }, {} as RuntimeContext)).resolves.toBe(7);
   });
 
+  test("the watcher a headless IO starts is always unattended", () => {
+    const seen: unknown[] = [];
+    const base: RuntimeIO = {
+      ...baseIO(true),
+      startTokenAutoRefresh: (_context, _receipts, options) => {
+        seen.push(options);
+        return { stop: () => {} };
+      },
+    };
+    createHeadlessRuntimeIO(base).startTokenAutoRefresh?.({} as RuntimeContext, [], { initialSourceTruth: true });
+    createHeadlessRuntimeIO(base).startTokenAutoRefresh?.({} as RuntimeContext);
+    expect(seen).toEqual([{ initialSourceTruth: true, unattended: true }, { unattended: true }]);
+    expect(createHeadlessRuntimeIO(baseIO(true))).not.toHaveProperty("startTokenAutoRefresh");
+  });
+
   test("defines captureAsync only when the base IO has one", () => {
     expect(createHeadlessRuntimeIO(baseIO(false))).not.toHaveProperty("captureAsync");
     expect(createHeadlessRuntimeIO(baseIO(true))).toHaveProperty("captureAsync");

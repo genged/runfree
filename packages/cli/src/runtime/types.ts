@@ -114,7 +114,8 @@ export type RuntimeIO = {
   startTokenAutoRefresh?: (
     context: RuntimeContext,
     receipts?: TokenResolutionReceipt[],
-    options?: Readonly<{ initialSourceTruth?: boolean }>,
+    /** `unattended`: the watcher holds the never-ask rule (a headless run's watcher). */
+    options?: Readonly<{ initialSourceTruth?: boolean; unattended?: boolean }>,
   ) => { stop: () => void };
   takeTokenResolutionReceipts?: () => TokenResolutionReceipt[];
 };

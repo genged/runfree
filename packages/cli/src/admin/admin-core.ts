@@ -4465,6 +4465,11 @@ export type CredentialSyncInput = {
   /** Watch only: re-read every source once before the first wait (launch plan D4). */
   initialSourceTruth?: boolean;
   /**
+   * Watch only: the watcher of a `runfree run` holds the never-ask rule for
+   * its whole life (unattended credentials spec §4.3).
+   */
+  unattended?: boolean;
+  /**
    * One-shot only, in-process startup. `startup-convergence`: the
    * receipt-gated warm-launch sync. `prepared-source-truth`: a cold launch's
    * source-truth sync under its held lifecycle lock, publishing only the

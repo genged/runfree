@@ -77,7 +77,7 @@ export function headlessCallOptions(command: string, args: readonly string[], op
  * when the base has one (`RuntimeIO.captureAsync`).
  */
 export function createHeadlessRuntimeIO(base: RuntimeIO): RuntimeIO {
-  const { captureAsync } = base;
+  const { captureAsync, startTokenAutoRefresh } = base;
   return {
     ...base,
     run: (command, args, options) => base.run(command, args, headlessCallOptions(command, args, options)),
@@ -85,6 +85,12 @@ export function createHeadlessRuntimeIO(base: RuntimeIO): RuntimeIO {
     ...(captureAsync ? {
       captureAsync: (command: string, args: string[], options?: SpawnSyncOptions) => (
         captureAsync.call(base, command, args, headlessCallOptions(command, args, options))),
+    } : {}),
+    // Every watcher a run starts, whichever startup path starts it, holds the
+    // never-ask rule (unattended credentials spec §4.3).
+    ...(startTokenAutoRefresh ? {
+      startTokenAutoRefresh: (...[context, receipts, options]: Parameters<NonNullable<RuntimeIO["startTokenAutoRefresh"]>>) => (
+        startTokenAutoRefresh.call(base, context, receipts, { ...options, unattended: true })),
     } : {}),
     confirm: () => false,
     choosePiProvider: () => undefined,
