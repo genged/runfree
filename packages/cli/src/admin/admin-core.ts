@@ -663,6 +663,29 @@ export function tokenSourceReadsRegistry(source: TokenSource | undefined): boole
   return tokenSourceRegistryNames(source).length > 0;
 }
 
+// On disk a binding with `via` has its own source kind. A CLI from before
+// `via` refuses a kind it does not know ("unsupported credential source"),
+// but on "1password" or "named" it would drop `via` and read through the
+// desktop app. Bindings without `via` keep their stored shape.
+const STORED_VIA_KINDS = { "1password": "1password-via", named: "named-via" } as const;
+
+function viaKindOfStoredSource(stored: string): "1password" | "named" | undefined {
+  if (stored === STORED_VIA_KINDS["1password"]) return "1password";
+  if (stored === STORED_VIA_KINDS.named) return "named";
+  return undefined;
+}
+
+/** The on-disk form of a host binding config: see `STORED_VIA_KINDS`. */
+function storedTokenSourceConfig(config: TokenSourceConfig): Record<string, unknown> {
+  const stored: Record<string, unknown> = {};
+  for (const [tokenName, source] of Object.entries(config)) {
+    stored[tokenName] = (source.source === "1password" || source.source === "named") && source.via !== undefined
+      ? { ...source, source: STORED_VIA_KINDS[source.source] }
+      : source;
+  }
+  return stored;
+}
+
 export function parseTokenSourceConfig(raw: unknown, sourcePath: string): TokenSourceConfig {
   if (!isRecord(raw)) die(`${displayProjectPath(sourcePath)} must be a JSON object`);
   const config: TokenSourceConfig = {};
@@ -673,21 +696,24 @@ export function parseTokenSourceConfig(raw: unknown, sourcePath: string): TokenS
     }
     const refresh = parseRefreshEverySeconds(tokenName, value);
     const via = parseBindingVia(tokenName, value);
-    if (via !== undefined && value.source !== "1password" && value.source !== "named") {
-      die(`${tokenName}: via applies only to 1password and named credential sources`);
+    const viaKind = viaKindOfStoredSource(value.source);
+    if (via !== undefined && viaKind === undefined) {
+      die(`${tokenName}: via applies only to 1password-via and named-via credential sources`);
     }
+    if (viaKind !== undefined && via === undefined) die(`${tokenName}: ${value.source} credential source requires via`);
     const viaField = via === undefined ? {} : { via };
-    if (value.source === "env") {
+    const kind = viaKind ?? value.source;
+    if (kind === "env") {
       if (typeof value.env !== "string" || value.env.trim() === "") die(`${tokenName}: env credential source requires env`);
       config[tokenName] = { source: "env", env: value.env, ...refresh };
       continue;
     }
-    if (value.source === "1password") {
+    if (kind === "1password") {
       if (typeof value.ref !== "string" || value.ref.trim() === "") die(`${tokenName}: 1password credential source requires ref`);
       config[tokenName] = { source: "1password", ref: value.ref, ...viaField, ...refresh };
       continue;
     }
-    if (value.source === "named") {
+    if (kind === "named") {
       if (typeof value.name !== "string" || !isTokenName(value.name)) die(`${tokenName}: named credential source requires a valid source name`);
       config[tokenName] = { source: "named", name: value.name, ...viaField, ...refresh };
       continue;
@@ -801,7 +827,7 @@ export function loadTokenStatus(): TokenSyncStatus {
 }
 
 export function saveTokenConfig(config: TokenSourceConfig): void {
-  writeJsonFile(tokenConfigPath(), config, 0o600);
+  writeJsonFile(tokenConfigPath(), storedTokenSourceConfig(config), 0o600);
 }
 
 export function saveTokenStatus(status: TokenSyncStatus): void {

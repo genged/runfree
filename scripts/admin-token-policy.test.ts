@@ -7712,8 +7712,8 @@ describe("1password connection sources (todo 158)", () => {
     test("via round-trips, describes, and fingerprints the connection identity but not when it was saved", async () => {
       writeFixtureRepo(exampleTokenPolicy(["github", "appstore"]));
       writeTokenConfig({
-        github: { source: "1password", ref: "op://Automation/github/token", via: "automation" },
-        appstore: { source: "named", name: "automation-jwt", via: "automation" },
+        github: { source: "1password-via", ref: "op://Automation/github/token", via: "automation" },
+        appstore: { source: "named-via", name: "automation-jwt", via: "automation" },
       });
       writeSourceRegistry({
         automation: CONNECTION_ENTRY,
@@ -7737,6 +7737,35 @@ describe("1password connection sources (todo 158)", () => {
       expect(tokenSourceFingerprint({ source: "1password", ref: "op://A/b/c", via: "automation" }, otherItem)).not.toBe(withVia);
     });
 
+    test("a via binding is stored in a shape a CLI from before via refuses", async () => {
+      // The source kinds the released parser (parseTokenSourceConfig in
+      // v0.7.0) accepts. It refuses any other kind ("unsupported credential
+      // source"); on these kinds it drops an unknown via without a word.
+      const RELEASED_SOURCE_KINDS = ["env", "1password", "named", "file", "cmd"];
+      writeFixtureRepo(exampleTokenPolicy(["github", "appstore", "github-app"]));
+      writeSourceRegistry({ automation: CONNECTION_ENTRY, "appstore-jwt": { type: "jwt", alg: "ES256", privateKey: { source: "1password", ref: "op://Automation/key/pem" }, headers: {}, claims: {}, ttlSeconds: 1200, createdAt: "x" } });
+      writeTokenConfig({ "github-app": { source: "1password", ref: "op://Private/github/token", refreshEverySeconds: 60 } });
+      const fake = installFakeKeychainAndOp({ stored: new Map([["automation", SA_TOKEN]]) });
+      for (const [name, tokenSource] of [
+        ["github", { kind: "1password", ref: "op://Automation/github/token", via: "automation" }],
+        ["appstore", { kind: "named", name: "appstore-jwt", via: "automation" }],
+      ] as const) {
+        const result = await runAdmin(() => credentialSetSourceIntent({ name, tokenSource, replaceSource: false, sync: false }), connectionEnv(fake));
+        expect(result.status, result.stderr).toBe(0);
+      }
+      const stored = readTokenConfig() as Record<string, { source: string; via?: string }>;
+      for (const entry of Object.values(stored)) {
+        if (entry.via !== undefined) expect(RELEASED_SOURCE_KINDS).not.toContain(entry.source);
+      }
+      // A binding without via keeps the exact shape the released parser reads.
+      expect(stored["github-app"]).toEqual({ source: "1password", ref: "op://Private/github/token", refreshEverySeconds: 60 });
+      // And the stored shape reads back as the same bindings.
+      const status = await runAdmin(() => credentialStatus({}), connectionEnv(fake));
+      expect(status.status, status.stderr).toBe(0);
+      expect(status.stdout).toContain("source: 1password via automation");
+      expect(status.stdout).toContain("source: source appstore-jwt via automation");
+    });
+
     test("via is part of a binding's identity", () => {
       const plain = { source: "1password" as const, ref: "op://A/b/c" };
       expect(tokenSourcesEqual(plain, { ...plain, via: "automation" })).toBe(false);
@@ -7746,9 +7775,12 @@ describe("1password connection sources (todo 158)", () => {
     });
 
     test.each([
-      [{ github: { source: "env", env: "GITHUB_TOKEN", via: "automation" } }, "github: via applies only to 1password and named credential sources"],
-      [{ github: { source: "1password", ref: "op://A/b/c", via: "Not A Name" } }, "github: via must be a source name"],
-      [{ github: { source: "named", name: "gh", via: 7 } }, "github: via must be a source name"],
+      [{ github: { source: "env", env: "GITHUB_TOKEN", via: "automation" } }, "github: via applies only to 1password-via and named-via credential sources"],
+      [{ github: { source: "1password", ref: "op://A/b/c", via: "automation" } }, "github: via applies only to 1password-via and named-via credential sources"],
+      [{ github: { source: "1password-via", ref: "op://A/b/c" } }, "github: 1password-via credential source requires via"],
+      [{ github: { source: "named-via", name: "gh" } }, "github: named-via credential source requires via"],
+      [{ github: { source: "1password-via", ref: "op://A/b/c", via: "Not A Name" } }, "github: via must be a source name"],
+      [{ github: { source: "named-via", name: "gh", via: 7 } }, "github: via must be a source name"],
     ])("a malformed via in host config is refused", async (config, message) => {
       writeFixtureRepo(exampleTokenPolicy(["github"]));
       writeTokenConfig(config);
@@ -7761,7 +7793,7 @@ describe("1password connection sources (todo 158)", () => {
 
     test("a connection used through via cannot be removed, and login lists its users", async () => {
       writeSourceRegistry({ automation: CONNECTION_ENTRY });
-      writeTokenConfig({ github: { source: "1password", ref: "op://Automation/github/token", via: "automation" } });
+      writeTokenConfig({ github: { source: "1password-via", ref: "op://Automation/github/token", via: "automation" } });
       const fake = installFakeKeychainAndOp({ stored: new Map([["automation", `ops_${"O".repeat(48)}`]]) });
       const removed = await runAdmin(() => sourceRemoveIntent({ name: "automation" }), connectionEnv(fake));
       expect(removed.status).not.toBe(0);
@@ -7788,7 +7820,7 @@ describe("1password connection sources (todo 158)", () => {
     function githubViaFixture(): { dockerLog: string; fakeBin: string } {
       writeFixtureRepo(exampleTokenPolicy(["github"]));
       writeSourceRegistry({ automation: CONNECTION_ENTRY });
-      writeTokenConfig({ github: { source: "1password", ref: "op://Automation/github/token", via: "automation" } });
+      writeTokenConfig({ github: { source: "1password-via", ref: "op://Automation/github/token", via: "automation" } });
       return installTokenSyncDockerFake();
     }
 
@@ -7847,7 +7879,7 @@ describe("1password connection sources (todo 158)", () => {
     test("the credential watcher runs a connection read with the sanitized host PATH and a fixed working directory", async () => {
       writeFixtureRepo(exampleTokenPolicy(["github"]));
       writeSourceRegistry({ automation: CONNECTION_ENTRY });
-      writeTokenConfig({ github: { source: "1password", ref: "op://Automation/github/token", via: "automation", refreshEverySeconds: 1 } });
+      writeTokenConfig({ github: { source: "1password-via", ref: "op://Automation/github/token", via: "automation", refreshEverySeconds: 1 } });
       const docker = installTokenSyncDockerFake();
       const fake = installFakeKeychainAndOp({ stored: new Map([["automation", SA_TOKEN]]) });
       const projectNodeBin = path.join(tmp, "node_modules/.bin");
@@ -7898,7 +7930,7 @@ describe("1password connection sources (todo 158)", () => {
         automation: CONNECTION_ENTRY,
         "appstore-jwt": { type: "jwt", alg: "ES256", privateKey: { source: "1password", ref: "op://Automation/AuthKey/pem" }, headers: { kid: "KEY123" }, claims: { iss: "ISSUER" }, ttlSeconds: 1140, createdAt: "x" },
       });
-      writeTokenConfig({ appstore: { source: "named", name: "appstore-jwt", via: "automation" } });
+      writeTokenConfig({ appstore: { source: "named-via", name: "appstore-jwt", via: "automation" } });
       const docker = installTokenSyncDockerFake();
       const fake = installFakeKeychainAndOp({ stored: new Map([["automation", SA_TOKEN]]), opRead: () => spawnResult({ stdout: privateKeyPem }) });
       const result = await runAdmin(sync, syncEnv(fake, docker));
@@ -7917,7 +7949,7 @@ describe("1password connection sources (todo 158)", () => {
       writeFixtureRepo(exampleTokenPolicy(["github", "github-app"]));
       writeSourceRegistry({ automation: CONNECTION_ENTRY });
       writeTokenConfig({
-        github: { source: "1password", ref: "op://Automation/github/token", via: "automation" },
+        github: { source: "1password-via", ref: "op://Automation/github/token", via: "automation" },
         "github-app": { source: "1password", ref: "op://Automation/github/token" },
       });
       const docker = installTokenSyncDockerFake();
@@ -7934,9 +7966,9 @@ describe("1password connection sources (todo 158)", () => {
     });
 
     test.each([
-      ["an unknown via", { github: { source: "1password", ref: "op://A/b/c", via: "missing" } }, "unknown source: missing"],
-      ["a via that is not a connection", { github: { source: "1password", ref: "op://A/b/c", via: "gh" } }, "gh is not a 1password connection source; --via names a source added with: runfree credential source 1password gh"],
-      ["a command source through via", { github: { source: "named", name: "gh", via: "automation" } }, "gh is a command source; --via applies to 1password references and jwt or google-service-account sources"],
+      ["an unknown via", { github: { source: "1password-via", ref: "op://A/b/c", via: "missing" } }, "unknown source: missing"],
+      ["a via that is not a connection", { github: { source: "1password-via", ref: "op://A/b/c", via: "gh" } }, "gh is not a 1password connection source; --via names a source added with: runfree credential source 1password gh"],
+      ["a command source through via", { github: { source: "named-via", name: "gh", via: "automation" } }, "gh is a command source; --via applies to 1password references and jwt or google-service-account sources"],
     ])("%s fails before any spawn", async (_label, config, message) => {
       writeFixtureRepo(exampleTokenPolicy(["github"]));
       writeSourceRegistry({
@@ -7955,7 +7987,7 @@ describe("1password connection sources (todo 158)", () => {
     test("the credential watcher reads a via binding through the connection on every pass", async () => {
       writeFixtureRepo(exampleTokenPolicy(["github"]));
       writeSourceRegistry({ automation: CONNECTION_ENTRY });
-      writeTokenConfig({ github: { source: "1password", ref: "op://Automation/github/token", via: "automation", refreshEverySeconds: 1 } });
+      writeTokenConfig({ github: { source: "1password-via", ref: "op://Automation/github/token", via: "automation", refreshEverySeconds: 1 } });
       const docker = installTokenSyncDockerFake();
       const fake = installFakeKeychainAndOp({ stored: new Map([["automation", SA_TOKEN]]) });
       const result = await runAdmin(
@@ -7998,7 +8030,7 @@ describe("1password connection sources (todo 158)", () => {
       }), { ...connectionEnv(fake), OP_ACCOUNT: "personal.1password.com" });
       expect(result.status, result.stderr).toBe(0);
       expect(result.stdout).toContain("source: 1password via automation");
-      expect(readTokenConfig()).toEqual({ github: { source: "1password", ref: "op://Automation/github/token", via: "automation" } });
+      expect(readTokenConfig()).toEqual({ github: { source: "1password-via", ref: "op://Automation/github/token", via: "automation" } });
       expect(fake.calls.map((call) => `${call.command} ${call.args[0]}`)).toEqual(["security find-generic-password", "op read"]);
       const opRead = fake.calls.find((call) => call.command === "op");
       expect(opRead?.env.OP_SERVICE_ACCOUNT_TOKEN).toBe(SA_TOKEN);
@@ -8018,7 +8050,7 @@ describe("1password connection sources (todo 158)", () => {
         sync: false,
       }), connectionEnv(fake));
       expect(result.status, result.stderr).toBe(0);
-      expect(readTokenConfig()).toEqual({ appstore: { source: "named", name: "appstore-jwt", via: "automation" } });
+      expect(readTokenConfig()).toEqual({ appstore: { source: "named-via", name: "appstore-jwt", via: "automation" } });
       expect(fake.calls).toEqual([]);
     });
 
@@ -8039,7 +8071,7 @@ describe("1password connection sources (todo 158)", () => {
       expect(readTokenConfig()).toEqual({ github: { source: "1password", ref: "op://Automation/github/token" } });
       const replaced = await runAdmin(bind(true), connectionEnv(fake));
       expect(replaced.status, replaced.stderr).toBe(0);
-      expect(readTokenConfig()).toEqual({ github: { source: "1password", ref: "op://Automation/github/token", via: "automation" } });
+      expect(readTokenConfig()).toEqual({ github: { source: "1password-via", ref: "op://Automation/github/token", via: "automation" } });
     });
 
     test.each([
@@ -8319,7 +8351,7 @@ describe("1password connection sources (todo 158)", () => {
     test("a connection binding under the rule reads normally", async () => {
       writeFixtureRepo(exampleTokenPolicy(["github"]));
       writeSourceRegistry({ automation: CONNECTION_ENTRY });
-      writeTokenConfig({ github: { source: "1password", ref: "op://Automation/github/token", via: "automation" } });
+      writeTokenConfig({ github: { source: "1password-via", ref: "op://Automation/github/token", via: "automation" } });
       const docker = installTokenSyncDockerFake();
       const fake = installFakeKeychainAndOp({ stored: new Map([["automation", SA_TOKEN]]) });
       const result = await underRule(() => runAdmin(sync, ruleEnv(fake, docker)));
@@ -8333,7 +8365,7 @@ describe("1password connection sources (todo 158)", () => {
       writeSourceRegistry({ automation: CONNECTION_ENTRY });
       writeTokenConfig({
         github: { source: "1password", ref: "op://Private/github/token", refreshEverySeconds: 1 },
-        openai: { source: "1password", ref: "op://Automation/openai/key", via: "automation", refreshEverySeconds: 1 },
+        openai: { source: "1password-via", ref: "op://Automation/openai/key", via: "automation", refreshEverySeconds: 1 },
       });
       const docker = installTokenSyncDockerFake();
       const fake = installFakeKeychainAndOp({ stored: new Map([["automation", SA_TOKEN]]) });
@@ -8374,7 +8406,7 @@ describe("1password connection sources (todo 158)", () => {
       });
       writeTokenConfig({
         github: { source: "1password", ref: "op://Private/github-secret-item/token" },
-        openai: { source: "1password", ref: "op://Automation/openai/key", via: "automation" },
+        openai: { source: "1password-via", ref: "op://Automation/openai/key", via: "automation" },
         stripe: { source: "named", name: "gh" },
         "env-token": { source: "env", env: "ENV_TOKEN" },
         // Bound but not referenced by the policy: not part of the run.
@@ -8406,7 +8438,7 @@ describe("1password connection sources (todo 158)", () => {
       writeFixtureRepo(exampleTokenPolicy(["openai", "env-token"]));
       writeSourceRegistry({ automation: CONNECTION_ENTRY });
       writeTokenConfig({
-        openai: { source: "1password", ref: "op://Automation/openai/key", via: "automation" },
+        openai: { source: "1password-via", ref: "op://Automation/openai/key", via: "automation" },
         "env-token": { source: "env", env: "ENV_TOKEN" },
       });
       const fake = installFakeKeychainAndOp({ stored: new Map([["automation", SA_TOKEN]]) });
@@ -8438,7 +8470,7 @@ describe("1password connection sources (todo 158)", () => {
       });
       writeTokenConfig({
         github: { source: "1password", ref: "op://Private/github/token" },
-        openai: { source: "1password", ref: "op://Automation/openai/key", via: "automation" },
+        openai: { source: "1password-via", ref: "op://Automation/openai/key", via: "automation" },
         stripe: { source: "named", name: "gh" },
         "env-token": { source: "env", env: "ENV_TOKEN" },
         appstore: { source: "named", name: "appstore-jwt" },
