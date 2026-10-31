@@ -7887,6 +7887,26 @@ describe("1password connection sources (todo 158)", () => {
       expect(fake.calls).toEqual([]);
     });
 
+    test("the credential watcher reads a via binding through the connection on every pass", async () => {
+      writeFixtureRepo(exampleTokenPolicy(["github"]));
+      writeSourceRegistry({ automation: CONNECTION_ENTRY });
+      writeTokenConfig({ github: { source: "1password", ref: "op://Automation/github/token", via: "automation", refreshEverySeconds: 1 } });
+      const docker = installTokenSyncDockerFake();
+      const fake = installFakeKeychainAndOp({ stored: new Map([["automation", SA_TOKEN]]) });
+      const result = await runAdmin(
+        () => credentialSyncIntent({ verbose: false, watch: true, quiet: false, delayFirstSync: false, cacheSourceSecrets: true }),
+        syncEnv(fake, docker, { RUNFREE_TEST_TOKEN_SYNC_WATCH_ITERATIONS: "2", RUNFREE_TEST_TOKEN_SYNC_WATCH_SLEEP_MS: "1" }),
+      );
+      expect(result.status, result.stderr).toBe(0);
+      expect(fake.calls.map((call) => `${call.command} ${call.args[0]}`)).toEqual([
+        "security find-generic-password", "op read",
+        "security find-generic-password", "op read",
+      ]);
+      for (const call of fake.calls.filter((entry) => entry.command === "op")) expect(call.env.OP_SERVICE_ACCOUNT_TOKEN).toBe(SA_TOKEN);
+      expect(dockerExecCalls(docker.dockerLog).map((entry) => entry.stdin)).toEqual(["connection-secret", "connection-secret"]);
+      expectNoSentinel(result.stdout, result.stderr, fs.readFileSync(docker.dockerLog, "utf8"));
+    });
+
     test("a connection on a host without the macOS Keychain fails before any spawn", async () => {
       const docker = githubViaFixture();
       const fake = installFakeKeychainAndOp({ stored: new Map([["automation", SA_TOKEN]]) });

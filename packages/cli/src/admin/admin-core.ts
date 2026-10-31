@@ -1418,11 +1418,21 @@ export function writeConnectionLogin(item: KeychainItem, token: string): void {
  * `TokenResolutionError` with fixed text: a read's stdout is the login.
  */
 export function readConnectionLoginSync(sourceName: string, item: KeychainItem): string {
-  const exit = connectionSetupExit(keychainExecutable(childEnv()), keychainReadArgs(item), {
-    env: sanitizedHostExecutionEnv(projectRoot(), childEnv()),
-    timeout: KEYCHAIN_CALL_TIMEOUT_MS,
-  });
+  const invocation = connectionKeychainInvocation(item);
+  const exit = connectionSetupExit(invocation.executable, [...invocation.args], { env: invocation.env, timeout: invocation.timeoutMs });
   return keychainReadStep(sourceName, exit);
+}
+
+export type KeychainInvocation = Readonly<{ executable: string; args: readonly string[]; env: NodeJS.ProcessEnv; timeoutMs: number }>;
+
+/** The `security` read of a connection login, for the synchronous and the watcher's owned reader alike. */
+export function connectionKeychainInvocation(item: KeychainItem): KeychainInvocation {
+  return {
+    executable: keychainExecutable(childEnv()),
+    args: keychainReadArgs(item),
+    env: Object.freeze(sanitizedHostExecutionEnv(projectRoot(), childEnv())),
+    timeoutMs: KEYCHAIN_CALL_TIMEOUT_MS,
+  };
 }
 
 /** Deletes a connection login; an item that is already gone counts as done. */

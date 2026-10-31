@@ -7,10 +7,12 @@ import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
 
 import { TokenResolutionError } from "../token-resolution.ts";
-import { type CommandSourceInvocation, type CredentialReadPlan, type OnePasswordRead, createCredentialPreparationScope, readOnePasswordRef } from "./admin-core.ts";
+import { type CommandSourceInvocation, type CredentialReadPlan, type OnePasswordRead, createCredentialPreparationScope, readOnePasswordRef, runAdminAction } from "./admin-core.ts";
+import { createAdminState } from "./context.ts";
+import { keychainItemForSource } from "./keychain-login.ts";
 import { type CredentialLifetime, createCredentialLifetime } from "./credential-cancellation.ts";
 import { type CredentialReadInput, readCredentialSource, runOwnedProvider } from "./credential-source-reader.ts";
-import { APP_LOGIN } from "./onepassword-connection.ts";
+import { APP_LOGIN, type OnePasswordLogin } from "./onepassword-connection.ts";
 
 // Real processes throughout: the reader's bounds are about what a real
 // provider and its descendants do, so no fake stands in for them.
@@ -159,6 +161,70 @@ describe("readCredentialSource", () => {
     await lifetime.close();
     expect(await reading).toEqual({ kind: "cancelled" });
     expect(fs.readFileSync(log, "utf8").split("\n").filter(Boolean)).toEqual(["read"]);
+  });
+});
+
+describe("readCredentialSource through a connection", () => {
+  const SA_TOKEN = `ops_${"S".repeat(48)}.sentinel-sa-token`;
+  const CONNECTION: OnePasswordLogin = Object.freeze({ kind: "connection", sourceName: "automation", keychain: keychainItemForSource("automation") });
+
+  // `security` and `op` are real scripts; the admin state only points the
+  // reader at the fake `security` (the test seam needs RUNFREE_TEST_FAKE_DOCKER).
+  async function readThroughConnection(securityBody: string, opBody: string, lifetime: CredentialLifetime): Promise<{ result: Awaited<ReturnType<typeof readCredentialSource>>; log: string[] }> {
+    const log = path.join(tmp, "calls.log");
+    const security = script("security", `echo "security $1" >> '${log}'\n${securityBody}`);
+    const op = script("op", `echo "op $1 token=$OP_SERVICE_ACCOUNT_TOKEN biometric=$OP_BIOMETRIC_UNLOCK_ENABLED account=$OP_ACCOUNT" >> '${log}'\n${opBody}`);
+    const read: OnePasswordRead = { executable: op, ref: "op://A/b/c", env: Object.freeze({ ...env, OP_ACCOUNT: "personal" }), timeoutMs: 10_000, quiet: true, login: CONNECTION };
+    let result: Awaited<ReturnType<typeof readCredentialSource>> | undefined;
+    const state = createAdminState({
+      env: { ...process.env, RUNFREE_TEST_FAKE_DOCKER: "1", RUNFREE_TEST_SECURITY_PATH: security },
+      projectRoot: tmp,
+      packageRoot: tmp,
+      stateDir: path.join(tmp, "state"),
+    });
+    await runAdminAction(state, async () => {
+      result = await readCredentialSource({ tokenName: "probe", fingerprint: "f".repeat(64), plan: { kind: "1password", read } }, lifetime);
+    });
+    if (!result) throw new Error("no result");
+    return { result, log: fs.existsSync(log) ? fs.readFileSync(log, "utf8").split("\n").filter(Boolean) : [] };
+  }
+
+  test("a connection read runs security, then op with only the login env", async () => {
+    const { result, log } = await readThroughConnection(`printf '%s\\n' '${SA_TOKEN}'`, "echo connection-value", watchLifetime());
+    expect(result).toEqual({ kind: "success", value: "connection-value", resolvedAt: expect.any(Number) });
+    expect(log).toEqual(["security find-generic-password", `op read token=${SA_TOKEN} biometric=false account=`]);
+  });
+
+  test("a watch stopped during the Keychain read never reaches op", async () => {
+    const marker = path.join(tmp, "security-started");
+    const lifetime = watchLifetime();
+    const reading = readThroughConnection(`touch '${marker}'; while :; do sleep 0.1; done`, "echo never", lifetime);
+    expect(await waitFor(() => fs.existsSync(marker))).toBe(true);
+    await lifetime.close();
+    const { result, log } = await reading;
+    expect(result).toEqual({ kind: "cancelled" });
+    expect(log).toEqual(["security find-generic-password"]);
+  });
+
+  test("a locked Keychain is a transient source failure and op never runs", async () => {
+    const { result, log } = await readThroughConnection("echo 'User interaction is not allowed.' >&2; exit 36", "echo never", watchLifetime());
+    expect(result.kind).toBe("source-failure");
+    const error = result.kind === "source-failure" ? result.error as TokenResolutionError : undefined;
+    expect({ classification: error?.classification, code: error?.code, message: error?.safeMessage }).toEqual({
+      classification: "transient",
+      code: "keychain-locked",
+      message: 'the login for source "automation" cannot be read (Keychain locked)',
+    });
+    expect(log).toEqual(["security find-generic-password"]);
+  });
+
+  test("op stderr that echoes the login is redacted before classification", async () => {
+    const { result } = await readThroughConnection(`printf '%s\\n' '${SA_TOKEN}'`, `echo "[ERROR] unauthorized: $OP_SERVICE_ACCOUNT_TOKEN revoked" >&2; exit 1`, watchLifetime());
+    expect(result.kind).toBe("source-failure");
+    const error = result.kind === "source-failure" ? result.error as TokenResolutionError : undefined;
+    expect(error?.classification).toBe("definitive");
+    expect(error?.safeMessage).toContain("[redacted]");
+    expect(error?.safeMessage).not.toContain("sentinel-sa-token");
   });
 });
 
