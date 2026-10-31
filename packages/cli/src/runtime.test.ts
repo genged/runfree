@@ -1568,6 +1568,8 @@ function runtimeIntentToArgs(intent: RuntimeAdminIntent): string[] {
       ];
     case "prepare-token-sources":
       return intent.mode ? ["prepare-token-sources", `--${intent.mode}`] : ["prepare-token-sources"];
+    case "unattended-credential-check":
+      return ["unattended-credential-check"];
     case "prepare":
       return ["prepare"];
   }

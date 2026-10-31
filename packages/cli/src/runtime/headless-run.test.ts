@@ -9,6 +9,7 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
 import { APPROVAL_HEADLESS_DENIED_EVENT_PREFIX } from "@runfree/runtime-contracts/write-approvals";
 import { CliError } from "../errors.ts";
+import { credentialInteractionForbidden } from "../admin/credential-interaction.ts";
 import { headlessTerminalModeActive, hostTerminalInteractive } from "../terminal-mode.ts";
 import { pendingWarningsForTest } from "../warnings.ts";
 import type { HeadlessRuntimeHooks, HeadlessRuntimeResult } from "../runtime.ts";
@@ -101,6 +102,7 @@ function harness(options: Readonly<{
   askPosture?: boolean;
   denials?: number | null;
   drained?: boolean;
+  credentialPreflight?: HeadlessRunDeps["credentialPreflight"];
 }> = {}): Harness {
   const signals = new EventEmitter();
   let runtimeCalls = 0;
@@ -117,6 +119,7 @@ function harness(options: Readonly<{
     return { status: 0, cancelled: false };
   });
   const deps: Partial<HeadlessRunDeps> = {
+    credentialPreflight: options.credentialPreflight ?? (async () => 0),
     signals,
     stdout: (line) => stdout.push(line),
     now: () => new Date("2026-10-25T12:00:00.000Z"),
@@ -245,6 +248,70 @@ async function until(predicate: () => boolean): Promise<void> {
   for (let attempt = 0; attempt < 500 && !predicate(); attempt += 1) await new Promise((resolve) => setTimeout(resolve, 2));
   if (!predicate()) throw new Error("condition never held");
 }
+
+describe("the never-ask rule (todo 158)", () => {
+  test("a may-ask binding refuses 65 before the prompt copy and the runtime; the record says refused and the lock is released", async () => {
+    let promptsAtPreflight: string[] | undefined;
+    let recordAtPreflight = false;
+    const h = harness({
+      credentialPreflight: async () => {
+        promptsAtPreflight = inboxPrompts();
+        recordAtPreflight = runDirs().length === 1;
+        console.error("run refused (65): github uses the 1Password app, which may ask");
+        return 65;
+      },
+    });
+    const code = await run(h);
+    expect(code).toBe(65);
+    expect(promptsAtPreflight).toEqual([]);
+    expect(recordAtPreflight).toBe(true);
+    expect(h.runtimeCalls()).toBe(0);
+    expect(h.launchCalls()).toBe(0);
+    expect(inboxPrompts()).toEqual([]);
+    expect(runJson()).toMatchObject({ outcome: "refused", exitCode: 65, teardown: "not-started" });
+    expect(h.released()).toBe(true);
+    expect(credentialInteractionForbidden()).toBe(false);
+  });
+
+  test("a preflight that throws refuses the run the same way", async () => {
+    const h = harness({ credentialPreflight: async () => { throw new Error("token config unreadable"); } });
+    expect(await run(h)).toBe(65);
+    expect(h.runtimeCalls()).toBe(0);
+    expect(inboxPrompts()).toEqual([]);
+    expect(runJson()).toMatchObject({ outcome: "refused", exitCode: 65 });
+  });
+
+  test("the rule is held for the whole run and released after it", async () => {
+    let heldAtPreflight = false;
+    let heldDuringRuntime = false;
+    const h = harness({
+      credentialPreflight: async () => {
+        heldAtPreflight = credentialInteractionForbidden();
+        return 0;
+      },
+      runtime: async () => {
+        heldDuringRuntime = credentialInteractionForbidden();
+        return { kind: "refused", status: 65 };
+      },
+    });
+    await run(h);
+    expect(heldAtPreflight).toBe(true);
+    expect(heldDuringRuntime).toBe(true);
+    expect(credentialInteractionForbidden()).toBe(false);
+  });
+
+  test("the preflight sees the run's headless IO", async () => {
+    let interactive: boolean | undefined;
+    const h = harness({
+      credentialPreflight: async (_context, io) => {
+        interactive = io.isInteractive?.();
+        return 0;
+      },
+    });
+    expect(await run(h)).toBe(0);
+    expect(interactive).toBe(false);
+  });
+});
 
 describe("decideHeadlessRunExit (spec §3.6)", () => {
   const success = { outcome: "success", exitCode: 0 } as const;
@@ -795,6 +862,7 @@ const status = await runHeadlessAgent(context, nodeRuntimeIO, "claude", { prompt
   writePosture: () => ({ defaultAskHosts: [], ruleAskHosts: [], askMcp: [], globalAskWithMcp: false, unreadable: [] }),
   uncheckedAuthority: () => ({ hostServices: [], oauthExchanges: [], localMcpServers: [], unreadable: [] }),
   countDenials: () => 0,
+  credentialPreflight: async () => 0,
 });
 answers.status = status;
 answers.fd0Reads = reads.filter((fd) => fd === 0).length;

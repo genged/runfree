@@ -87,6 +87,11 @@ export type RuntimeAdminIntent =
    */
   | { kind: "token-sync"; verbose: boolean; mode: "prepared-source-truth"; holdDeadlineMonotonicMs: number }
   | { kind: "prepare-token-sources"; mode?: "source-truth" | "convergence" }
+  /**
+   * The `runfree run` preflight of the never-ask rule: lists every binding
+   * that may ask and exits 65; reads no source, spawns nothing, writes nothing.
+   */
+  | { kind: "unattended-credential-check" }
   | { kind: "prepare" };
 
 export type PiProviderChoice = "agent-codex" | "agent-claude" | "configure" | "custom";

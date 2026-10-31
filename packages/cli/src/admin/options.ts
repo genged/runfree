@@ -51,6 +51,7 @@ export {
   credentialStatus,
   credentialSyncIntent,
   revokeDesiredCredentialState,
+  unattendedCredentialCheckIntent,
 } from "./credential-policy.ts";
 export {
   type ConnectionTokenInput,

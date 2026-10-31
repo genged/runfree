@@ -66,7 +66,13 @@ import {
   type WatchTokenPreparation,
   withTokenStoreLock,
 } from "./admin-core.ts";
-import { forbidCredentialInteraction } from "./credential-interaction.ts";
+import { runfreeError } from "../warnings.ts";
+import {
+  connectionSourceNames,
+  forbidCredentialInteraction,
+  unattendedReadVerdict,
+  unattendedRefusalLines,
+} from "./credential-interaction.ts";
 import {
   ChildSignaledError,
   CredentialCancellationError,
@@ -719,6 +725,53 @@ export async function credentialClearSourceIntent(input: CredentialClearSourceIn
     console.log("agent exposure: no");
     console.log(`proxy-held value: ${proxyValue === "removed" ? "removed from the running proxy" : `none held (proxy ${runtime.state})`}`);
   });
+}
+
+/** `runfree run` refuses with this code when a credential source may ask (headless-run spec §3.6). */
+const RUN_REFUSED_EXIT = 65;
+
+/**
+ * The run preflight of the never-ask rule (unattended credentials spec §4.3):
+ * every binding the selected policy references that may ask is listed with
+ * its fix, and the run refuses (65) before the prompt copy, Docker, and any
+ * credential read. When the policy cannot be read, every configured binding
+ * is checked. Static: it reads host configuration only, spawns nothing, and
+ * writes nothing.
+ */
+export function unattendedCredentialCheckIntent(): void {
+  const config = loadTokenConfig();
+  let names: string[];
+  try {
+    names = Object.keys(loadPolicy().tokens);
+  } catch {
+    names = Object.keys(config);
+  }
+  let registry: ReturnType<typeof loadSourceRegistry> | undefined;
+  try {
+    registry = loadSourceRegistry();
+  } catch {
+    // A named binding then fails on its own at read time, before any spawn.
+    registry = undefined;
+  }
+  const connections = connectionSourceNames(registry);
+  let refused = false;
+  for (const name of [...new Set(names)].sort()) {
+    const source = config[name];
+    if (!source) continue;
+    const verdict = unattendedReadVerdict(source, registry);
+    if (verdict.kind === "never-asks") continue;
+    let owner: ReturnType<typeof credentialOwner>;
+    try {
+      owner = credentialOwner(name);
+    } catch {
+      owner = undefined;
+    }
+    runfreeError(unattendedRefusalLines({ tokenName: name, source, reason: verdict.reason, owner, connections }).join("\n"));
+    refused = true;
+  }
+  if (!refused) return;
+  runfreeError("the headless run did not start");
+  process.exitCode = RUN_REFUSED_EXIT;
 }
 
 export function credentialStatus(input: CredentialStatusInput = {}): void {

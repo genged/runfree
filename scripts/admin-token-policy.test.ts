@@ -72,6 +72,7 @@ import {
   credentialStatus,
   credentialSyncIntent,
   credentialClearSourceIntent,
+  unattendedCredentialCheckIntent,
 } from "../packages/cli/src/admin/options.ts";
 import { tryAcquireControlLock } from "../packages/cli/src/control/lock.ts";
 import {
@@ -8305,6 +8306,69 @@ describe("1password connection sources (todo 158)", () => {
       const result = runAdminCli(["credential", "sync", "--unattended"]);
       expect(result.status).not.toBe(0);
       expect(result.stderr).toContain("--unattended only applies with --watch");
+    });
+
+    test("the run preflight lists every may-ask binding with its fix, spawns nothing, writes nothing", async () => {
+      writeFixtureRepo(exampleTokenPolicy(["github", "openai", "stripe", "env-token"]));
+      const command = installFakeCommandSource();
+      writeSourceRegistry({
+        automation: CONNECTION_ENTRY,
+        gh: { type: "command", argv: [fs.realpathSync(command.commandPath)], displayArgv: ["gh"], createdAt: "x" },
+      });
+      writeTokenConfig({
+        github: { source: "1password", ref: "op://Private/github-secret-item/token" },
+        openai: { source: "1password", ref: "op://Automation/openai/key", via: "automation" },
+        stripe: { source: "named", name: "gh" },
+        "env-token": { source: "env", env: "ENV_TOKEN" },
+        // Bound but not referenced by the policy: not part of the run.
+        unused: { source: "1password", ref: "op://Private/unused/token" },
+      });
+      const fake = installFakeKeychainAndOp({ stored: new Map([["automation", SA_TOKEN]]) });
+      // Settle the test's own control fixture first, so the snapshot sees only the preflight.
+      expect((await runAdmin(() => {})).status).toBe(0);
+      const before = { config: fs.readFileSync(tokenConfigPath(), "utf8"), registry: sourceRegistryText(), state: fs.existsSync(adminStateDir()) ? fs.readdirSync(adminStateDir()).sort() : [] };
+      const result = await runAdmin(() => unattendedCredentialCheckIntent(), connectionEnv(fake));
+      expect(result.status).toBe(65);
+      expect(result.stderr).toContain(APP_REFUSAL);
+      expect(result.stderr).toContain("run refused (65): stripe runs a command source, which runfree cannot keep from asking");
+      expect(result.stderr).toContain("runfree credential set-source stripe --from-env <ENV_VAR> --replace-source");
+      expect(result.stderr).not.toContain("openai");
+      expect(result.stderr).not.toContain("env-token");
+      expect(result.stderr).not.toContain("unused");
+      expect(result.stderr).not.toContain("github-secret-item");
+      expect(result.stderr).toContain("the headless run did not start");
+      expect(fake.calls).toEqual([]);
+      expect(fs.existsSync(command.logPath)).toBe(false);
+      expect(fs.readFileSync(tokenConfigPath(), "utf8")).toBe(before.config);
+      expect(sourceRegistryText()).toBe(before.registry);
+      expect(fs.existsSync(adminStateDir()) ? fs.readdirSync(adminStateDir()).sort() : []).toEqual(before.state);
+      expectNoSentinel(result.stdout, result.stderr);
+    });
+
+    test("the preflight passes when every binding never asks", async () => {
+      writeFixtureRepo(exampleTokenPolicy(["openai", "env-token"]));
+      writeSourceRegistry({ automation: CONNECTION_ENTRY });
+      writeTokenConfig({
+        openai: { source: "1password", ref: "op://Automation/openai/key", via: "automation" },
+        "env-token": { source: "env", env: "ENV_TOKEN" },
+      });
+      const fake = installFakeKeychainAndOp({ stored: new Map([["automation", SA_TOKEN]]) });
+      const result = await runAdmin(() => unattendedCredentialCheckIntent(), connectionEnv(fake));
+      expect(result.status, result.stderr).toBe(0);
+      expect(result.stdout + result.stderr).toBe("");
+      expect(fake.calls).toEqual([]);
+    });
+
+    test("without a readable policy the preflight checks every configured binding", async () => {
+      writeFixtureRepo(exampleTokenPolicy(["openai"]));
+      writeTokenConfig({ github: { source: "1password", ref: "op://Private/github/token" } });
+      const fake = installFakeKeychainAndOp();
+      expect((await runAdmin(() => {})).status).toBe(0);
+      fs.writeFileSync(path.join(tmp, ".runfree/network-policy.json"), "{ not json\n");
+      const result = await runAdmin(() => unattendedCredentialCheckIntent(), connectionEnv(fake));
+      expect(result.status).toBe(65);
+      expect(result.stderr).toContain(APP_REFUSAL);
+      expect(fake.calls).toEqual([]);
     });
 
     test("an env binding under the rule reads normally", async () => {

@@ -14,7 +14,7 @@ import { effectiveRuntimeDigest } from "./agent-image.ts";
 import { builtinAgent } from "./agents.ts";
 import { createAdminState } from "./admin/context.ts";
 import { prepareRuntimeTokenSources, clearPreparedRuntimeTokenSources, admitPreparedRuntimeTokenSources } from "./admin/admin-core.ts";
-import { credentialSyncIntent, prepareEffectiveRuntimeIntent, runAdminAction } from "./admin/options.ts";
+import { credentialSyncIntent, prepareEffectiveRuntimeIntent, runAdminAction, unattendedCredentialCheckIntent } from "./admin/options.ts";
 import { planDesiredServiceEnable } from "./admin/service-policy.ts";
 import { activateApprovedControlsAfterMutation } from "./control/activation.ts";
 import { activationReportLine } from "./control/activation-report.ts";
@@ -879,6 +879,9 @@ async function dispatchRuntimeAdmin(intent: RuntimeAdminIntent, context: Runtime
     }
     case "prepare-token-sources":
       prepareRuntimeTokenSources(intent.mode ? { mode: intent.mode } : {});
+      return;
+    case "unattended-credential-check":
+      unattendedCredentialCheckIntent();
       return;
     case "token-sync":
       await credentialSyncIntent({
