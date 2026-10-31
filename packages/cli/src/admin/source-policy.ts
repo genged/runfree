@@ -34,8 +34,17 @@ import {
   sourceConfigPath,
   type SourceNameInput,
   type SourceRegistry,
+  verifyConnectionLogin,
+  writeConnectionLogin,
   writeJsonFile,
 } from "./admin-core.ts";
+import {
+  assertKeychainPlatform,
+  assertServiceAccountTokenShape,
+  ConnectionSetupError,
+  keychainItemForSource,
+} from "./keychain-login.ts";
+import { remedy } from "../remedies.ts";
 import {
   assertGoogleServiceAccountTtl,
   GOOGLE_SA_TTL_DEFAULT_SECONDS,
@@ -411,4 +420,55 @@ export function sourceRemoveIntent(input: SourceNameInput): void {
   delete registry[input.name];
   saveSourceRegistry(registry);
   console.log(`${input.name} source removed`);
+}
+
+/** Where a connection login comes from: piped stdin, a hidden prompt, or nowhere. */
+export type ConnectionTokenInput =
+  | Readonly<{ kind: "stdin"; text: string }>
+  | Readonly<{ kind: "prompt"; ask: () => Promise<string | undefined> }>
+  | Readonly<{ kind: "none" }>;
+
+export type SourceOnePasswordInput = { name: string | undefined; token: ConnectionTokenInput };
+
+async function connectionToken(input: ConnectionTokenInput): Promise<string> {
+  if (input.kind === "stdin") return input.text.replace(/\r?\n$/, "");
+  if (input.kind === "prompt") {
+    const answer = await input.ask();
+    if (answer === undefined) die("cancelled; nothing was saved");
+    return answer;
+  }
+  die("no terminal to ask for the service account token; pass --token-stdin");
+}
+
+function vaultLine(vaults: string[]): string {
+  return vaults.length === 1 ? `vault "${vaults[0]}"` : `vaults ${vaults.map((vault) => `"${vault}"`).join(", ")}`;
+}
+
+// Typed enforcement for `runfree credential source 1password <name>`. Every
+// refusal comes before the first spawn or write it guards: the token is
+// checked with 1Password before the Keychain write, and the registry entry
+// (the Keychain item name, never the token) is the last write.
+export async function sourceAddOnePasswordConnectionIntent(input: SourceOnePasswordInput): Promise<void> {
+  const { name } = input;
+  if (!name) die("usage: runfree credential source 1password <name> [--token-stdin]");
+  assertKnownSourceName(name);
+  if (loadSourceRegistry()[name]) die(`${name} source is already configured; to change its login run: ${remedy.credentialSourceLogin(name)}`);
+  try {
+    assertKeychainPlatform(childEnv());
+    if (!resolveHostExecutable("op")) throw new ConnectionSetupError("op CLI not found on sanitized host PATH");
+    const token = await connectionToken(input.token);
+    assertServiceAccountTokenShape(token);
+    const vaults = verifyConnectionLogin(token);
+    console.log(`checking with 1Password... ok: can read ${vaultLine(vaults)}; never asks`);
+    ensureStateDirs();
+    const item = keychainItemForSource(name);
+    writeConnectionLogin(item, token);
+    const registry = loadSourceRegistry();
+    registry[name] = { type: "1password", keychain: item, createdAt: new Date().toISOString() };
+    saveSourceRegistry(registry);
+    console.log(`${name}: saved (login kept in your macOS Keychain)`);
+  } catch (error) {
+    if (error instanceof ConnectionSetupError) die(error.message);
+    throw error;
+  }
 }

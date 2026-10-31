@@ -53,9 +53,12 @@ export {
   revokeDesiredCredentialState,
 } from "./credential-policy.ts";
 export {
+  type ConnectionTokenInput,
   sourceAddCommandIntent,
   sourceAddGoogleServiceAccountIntent,
   sourceAddJwtIntent,
+  sourceAddOnePasswordConnectionIntent,
+  type SourceOnePasswordInput,
   sourceList,
   sourceRemoveIntent,
   sourceShowIntent,

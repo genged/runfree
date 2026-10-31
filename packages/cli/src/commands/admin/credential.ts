@@ -1,11 +1,15 @@
 // `runfree credential ...` — canonical low-level credential policy, source
 // binding, runtime sync, and host-owned named-source surface.
 
+import fs from "node:fs";
+
+import { isCancel, password } from "@clack/prompts";
 import type { ArgumentsCamelCase, Argv } from "yargs";
 
 import { createAdminState } from "../../admin/context.ts";
 import {
   bindDesiredCredentialSource,
+  type ConnectionTokenInput,
   type CredentialFieldsInput,
   credentialClearSourceIntent,
   credentialSetSourceIntent,
@@ -17,6 +21,7 @@ import {
   sourceAddCommandIntent,
   sourceAddGoogleServiceAccountIntent,
   sourceAddJwtIntent,
+  sourceAddOnePasswordConnectionIntent,
   sourceList,
   sourceRemoveIntent,
   sourceShowIntent,
@@ -30,6 +35,7 @@ import {
 } from "../../control/credential-mutation.ts";
 import { CliError } from "../../errors.ts";
 import { nodeRuntimeIO } from "../../runtime.ts";
+import { hostTerminalInteractive } from "../../terminal-mode.ts";
 import type { RuntimeContext } from "../../runtime/types.ts";
 import type { RunfreeCommandContext } from "../context.ts";
 import { withExamples } from "../examples.ts";
@@ -171,6 +177,31 @@ function refuseSourceAddFlags(argv: SourceAddArgs, ...lists: SourceAddFlags[]): 
     }
   }
 }
+
+type ConnectionLoginArgs = NameArgs & { "token-stdin"?: boolean };
+
+const TOKEN_STDIN_MAX_BYTES = 16 * 1024;
+
+// The connection login: piped stdin with --token-stdin, else a hidden prompt
+// on a terminal, else nothing (the intent refuses). Never argv.
+function connectionTokenInput(fromStdin: boolean): ConnectionTokenInput {
+  if (fromStdin) {
+    const text = fs.readFileSync(0);
+    if (text.byteLength > TOKEN_STDIN_MAX_BYTES) throw new CliError("--token-stdin input is larger than 16 KiB");
+    return { kind: "stdin", text: text.toString("utf8") };
+  }
+  if (!hostTerminalInteractive()) return { kind: "none" };
+  return {
+    kind: "prompt",
+    ask: async () => {
+      const answer = await password({ message: "service account token" });
+      return isCancel(answer) ? undefined : answer;
+    },
+  };
+}
+
+const connectionLoginBuilder = (cmd: Argv): Argv =>
+  sourceNamePositional(cmd).option("token-stdin", { type: "boolean", describe: "Read the service account token from stdin instead of asking" });
 
 export const credentialCommand: CommandModule = {
   name: "credential",
@@ -327,7 +358,7 @@ export const credentialCommand: CommandModule = {
           )
           .command(
             "source",
-            "Manage reusable host-owned command, JWT, and Google service-account sources",
+            "Manage reusable host-owned command, JWT, Google service-account, and 1Password connection sources",
             (source) => source
               .command(
                 "add [args..]",
@@ -371,6 +402,13 @@ export const credentialCommand: CommandModule = {
                     command: argv["--"] ?? [],
                   }));
                 }),
+              )
+              .command(
+                "1password <name>",
+                "Add a 1Password service-account connection that reads op:// references without asking",
+                connectionLoginBuilder,
+                handler((argv: ArgumentsCamelCase<ConnectionLoginArgs>) =>
+                  runSource(() => sourceAddOnePasswordConnectionIntent({ name: argv.name, token: connectionTokenInput(argv["token-stdin"] === true) }))),
               )
               .command("list", "List host-owned named sources", (cmd) => cmd, handler(() => runSource(() => sourceList())))
               .command(

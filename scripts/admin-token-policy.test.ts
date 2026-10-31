@@ -52,6 +52,8 @@ import {
   sourceAddCommandIntent,
   sourceAddGoogleServiceAccountIntent,
   sourceAddJwtIntent,
+  sourceAddOnePasswordConnectionIntent,
+  type ConnectionTokenInput,
   type SourceAddGoogleServiceAccountInput,
   sourceList,
   sourceRemoveIntent,
@@ -7291,6 +7293,7 @@ describe("google-service-account sources", () => {
 });
 
 describe("1password connection sources (todo 158)", () => {
+  const SA_TOKEN = `ops_${"S".repeat(48)}.sentinel-sa-token`;
   const CONNECTION_ENTRY = { type: "1password", keychain: { service: "runfree.credential-source", account: "automation" }, createdAt: "x" };
   type Call = { command: "security" | "op"; args: string[]; input?: string; env: NodeJS.ProcessEnv };
 
@@ -7358,6 +7361,14 @@ describe("1password connection sources (todo 158)", () => {
     fs.writeFileSync(sourceRegistryPath(), `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
   }
 
+  function sourceRegistryText(): string {
+    return fs.existsSync(sourceRegistryPath()) ? fs.readFileSync(sourceRegistryPath(), "utf8") : "";
+  }
+
+  function expectNoSentinel(...texts: string[]): void {
+    for (const text of texts) expect(text).not.toContain("sentinel-sa-token");
+  }
+
   describe("registry entries", () => {
     test("a registry 1password connection loads strictly and shows without reading the Keychain", async () => {
       writeSourceRegistry({ automation: { ...CONNECTION_ENTRY, createdAt: "2026-10-30T00:00:00.000Z" } });
@@ -7399,6 +7410,114 @@ describe("1password connection sources (todo 158)", () => {
       const registry = { automation: { type: "1password" as const, keychain: { service: "runfree.credential-source", account: "automation" }, createdAt: "x" } };
       const fingerprint = tokenSourceFingerprint({ source: "named", name: "automation" }, registry);
       expect(fingerprint).toBe(tokenSourceFingerprint({ source: "named", name: "automation" }, { automation: { ...registry.automation, createdAt: "y" } }));
+    });
+  });
+
+  describe("credential source 1password", () => {
+    const addConnection = (token: ConnectionTokenInput = { kind: "stdin", text: SA_TOKEN }) =>
+      () => sourceAddOnePasswordConnectionIntent({ name: "automation", token });
+
+    test("creates a connection: verify first, then Keychain, then registry; the token only ever on stdin and in op's env", async () => {
+      const fake = installFakeKeychainAndOp();
+      const result = await runAdmin(addConnection(), connectionEnv(fake));
+      expect(result.status, result.stderr).toBe(0);
+      expect(result.stdout).toContain('checking with 1Password... ok: can read vault "Automation"; never asks');
+      expect(result.stdout).toContain("automation: saved (login kept in your macOS Keychain)");
+      expect(fake.calls.map((call) => `${call.command} ${call.args[0]}`)).toEqual(["op whoami", "op vault", "security -i"]);
+      for (const call of fake.calls) expect(call.args.join(" ")).not.toContain(SA_TOKEN);
+      for (const call of fake.calls.filter((entry) => entry.command === "op")) {
+        expect(call.env.OP_SERVICE_ACCOUNT_TOKEN).toBe(SA_TOKEN);
+        expect(call.env.OP_BIOMETRIC_UNLOCK_ENABLED).toBe("false");
+      }
+      const securityCall = fake.calls.find((call) => call.command === "security");
+      expect(securityCall?.input).toContain(`-w ${SA_TOKEN}\n`);
+      expect(securityCall?.env.OP_SERVICE_ACCOUNT_TOKEN).toBeUndefined();
+      expect(fake.stored.get("automation")).toBe(SA_TOKEN);
+      expect(JSON.parse(sourceRegistryText())).toEqual({ automation: { type: "1password", keychain: { service: "runfree.credential-source", account: "automation" }, createdAt: expect.any(String) } });
+      expectNoSentinel(result.stdout, result.stderr, sourceRegistryText());
+    });
+
+    test("several readable vaults are listed by name", async () => {
+      const fake = installFakeKeychainAndOp({ vaults: JSON.stringify([{ id: "2", name: "CI" }, { id: "1", name: "Automation" }]) });
+      const result = await runAdmin(addConnection(), connectionEnv(fake));
+      expect(result.status, result.stderr).toBe(0);
+      expect(result.stdout).toContain('checking with 1Password... ok: can read vaults "Automation", "CI"; never asks');
+    });
+
+    test("a host OP_* login never reaches the connection's op child", async () => {
+      const fake = installFakeKeychainAndOp();
+      const env = { ...connectionEnv(fake), OP_ACCOUNT: "my.1password.com", OP_SESSION_abc: "personal-session", OP_SERVICE_ACCOUNT_TOKEN: "ops_from_the_host_env" };
+      const result = await runAdmin(addConnection(), env);
+      expect(result.status, result.stderr).toBe(0);
+      for (const call of fake.calls.filter((entry) => entry.command === "op")) {
+        expect(call.env.OP_ACCOUNT).toBeUndefined();
+        expect(call.env.OP_SESSION_abc).toBeUndefined();
+        expect(call.env.OP_SERVICE_ACCOUNT_TOKEN).toBe(SA_TOKEN);
+      }
+    });
+
+    test.each([
+      ["an existing source", { preexisting: true }, "automation source is already configured; to change its login run: runfree credential source login automation", 0],
+      ["a non-macOS host", { platform: "linux" }, "1password connection sources need the macOS login Keychain", 0],
+      ["no op on PATH", { noOp: true }, "op CLI not found on sanitized host PATH", 0],
+      ["no token and no terminal", { token: { kind: "none" } }, "no terminal to ask for the service account token; pass --token-stdin", 0],
+      ["a cancelled prompt", { token: { kind: "prompt", ask: async () => undefined } }, "cancelled; nothing was saved", 0],
+      ["a malformed token", { token: { kind: "stdin", text: "ghp_not_a_service_account" } }, "this is not a 1Password service account token (it starts with ops_)", 0],
+      ["a personal login (not a service account)", { whoami: JSON.stringify({ user_type: "HUMAN" }) }, "1Password did not confirm a service account login; only service account tokens can be saved", 1],
+      ["a token 1Password rejects", { whoamiStatus: 1, whoamiStderr: "[ERROR] invalid token" }, "1Password refused the service account token: [ERROR] invalid token", 1],
+      ["no readable vault", { vaults: "[]" }, "the service account can read no vault", 2],
+    ])("refuses %s before any Keychain or registry write", async (_label, scenario, message, expectedOpCalls) => {
+      const options = scenario as { preexisting?: boolean; platform?: string; noOp?: boolean; token?: ConnectionTokenInput; whoami?: string; whoamiStatus?: number; whoamiStderr?: string; vaults?: string };
+      if (options.preexisting) writeSourceRegistry({ automation: CONNECTION_ENTRY });
+      const fake = installFakeKeychainAndOp({ whoami: options.whoami, whoamiStatus: options.whoamiStatus, whoamiStderr: options.whoamiStderr, vaults: options.vaults });
+      const env = {
+        ...connectionEnv(fake),
+        ...(options.platform ? { RUNFREE_TEST_KEYCHAIN_PLATFORM: "" } : {}),
+        ...(options.noOp ? { PATH: "/usr/bin:/bin" } : {}),
+      };
+      const before = sourceRegistryText();
+      const result = await runAdmin(addConnection(options.token), env);
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toContain(message);
+      expect(fake.calls.filter((call) => call.command === "op")).toHaveLength(expectedOpCalls);
+      expect(fake.calls.filter((call) => call.command === "security")).toEqual([]);
+      expect(sourceRegistryText()).toBe(before);
+      expectNoSentinel(result.stdout, result.stderr);
+    });
+
+    test("a Keychain write failure saves no registry entry; a retry reclaims", async () => {
+      const failing = installFakeKeychainAndOp({ writeStatus: 1 });
+      const first = await runAdmin(addConnection(), connectionEnv(failing));
+      expect(first.status).not.toBe(0);
+      expect(first.stderr).toContain("the macOS Keychain refused to save the login");
+      expect(sourceRegistryText()).toBe("");
+      expectNoSentinel(first.stdout, first.stderr);
+      const working = installFakeKeychainAndOp();
+      const retry = await runAdmin(addConnection(), connectionEnv(working));
+      expect(retry.status, retry.stderr).toBe(0);
+      expect(working.stored.get("automation")).toBe(SA_TOKEN);
+    });
+
+    test("op stderr that echoes the token is redacted", async () => {
+      const fake = installFakeKeychainAndOp({ whoamiStatus: 1, whoamiStderr: `[ERROR] token ${SA_TOKEN} is not valid\n` });
+      const result = await runAdmin(addConnection(), connectionEnv(fake));
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toContain("1Password refused the service account token: [ERROR] token [redacted] is not valid");
+      expectNoSentinel(result.stdout, result.stderr);
+      expect(result.stderr).not.toContain("SSSSSSSS");
+    });
+
+    test("the command reads --token-stdin into the intent and rejects positional extras", () => {
+      const fake = installFakeKeychainAndOp();
+      // A malformed token proves the stdin path reaches the intent; the shape
+      // check refuses before any spawn, so no fake has to cross the process.
+      const piped = runAdminCli(["credential", "source", "1password", "automation", "--token-stdin"], { input: "ghp_not_a_service_account\n", extraEnv: connectionEnv(fake) });
+      expect(piped.status).not.toBe(0);
+      expect(piped.stderr).toContain("this is not a 1Password service account token (it starts with ops_)");
+      const extra = runAdminCli(["credential", "source", "1password", "automation", "extra"], { extraEnv: connectionEnv(fake) });
+      expect(extra.status).not.toBe(0);
+      expect(extra.stderr).toContain("Unknown argument: extra");
+      expect(sourceRegistryText()).toBe("");
     });
   });
 });

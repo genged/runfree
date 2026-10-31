@@ -172,7 +172,23 @@ import {
 import { stableJsonDroppingUndefined as stableJson, sha256Hex, isRecord } from "../strict-primitives.ts";
 import { remedy } from "../remedies.ts";
 import { headlessCallOptions, headlessTerminalModeActive } from "../terminal-mode.ts";
-import { type KeychainItem, KEYCHAIN_SERVICE, keychainItemForSource } from "./keychain-login.ts";
+import {
+  ConnectionSetupError,
+  KEYCHAIN_CALL_TIMEOUT_MS,
+  KEYCHAIN_SERVICE,
+  type KeychainItem,
+  keychainExecutable,
+  keychainItemForSource,
+  keychainWriteRequest,
+} from "./keychain-login.ts";
+import {
+  connectionOpEnv,
+  opVaultListArgs,
+  opWhoamiArgs,
+  parseServiceAccountWhoami,
+  parseVaultNames,
+  redactLogin,
+} from "./onepassword-connection.ts";
 
 
 export type TokenSource =
@@ -1265,6 +1281,48 @@ export function runCommandSource(source: CommandSource): string {
     timeout: invocation.timeoutMs,
   }));
   return commandSourceStep(invocation, exit);
+}
+
+function connectionSetupExit(command: string, args: string[], options: childProcess.SpawnSyncOptions): ProviderExit {
+  return providerExitFromSpawnSync(adminSpawnSync(command, args, {
+    encoding: "utf8",
+    maxBuffer: PROVIDER_OUTPUT_MAX_BYTES,
+    shell: false,
+    ...options,
+  }));
+}
+
+/**
+ * Checks a service account token with 1Password before it is stored; returns
+ * the vault names it can read. The token reaches only the `op` child's
+ * environment; every message is fixed text or `op` stderr with the exact token
+ * removed.
+ */
+export function verifyConnectionLogin(token: string): string[] {
+  const opPath = resolveHostExecutable("op");
+  if (!opPath) throw new ConnectionSetupError("op CLI not found on sanitized host PATH");
+  const env = connectionOpEnv(sanitizedHostExecutionEnv(projectRoot(), childEnv()), token);
+  const options = { env, timeout: opReadTimeoutMs() };
+  const whoami = connectionSetupExit(opPath, opWhoamiArgs(), options);
+  if (whoami.failure || whoami.status !== 0) {
+    const detail = sanitizedStderrFirstLine(redactLogin(whoami.stderr, token));
+    throw new ConnectionSetupError(`1Password refused the service account token${detail ? `: ${detail}` : ""}`);
+  }
+  parseServiceAccountWhoami(whoami.stdout);
+  const vaults = connectionSetupExit(opPath, opVaultListArgs(), options);
+  if (vaults.failure || vaults.status !== 0) throw new ConnectionSetupError("1Password could not list the service account's vaults");
+  return parseVaultNames(vaults.stdout);
+}
+
+/** Saves (or replaces, `-U`) a connection login; the token goes on stdin only. */
+export function writeConnectionLogin(item: KeychainItem, token: string): void {
+  const request = keychainWriteRequest(item, token);
+  const exit = connectionSetupExit(keychainExecutable(childEnv()), request.args, {
+    env: sanitizedHostExecutionEnv(projectRoot(), childEnv()),
+    input: request.input,
+    timeout: KEYCHAIN_CALL_TIMEOUT_MS,
+  });
+  if (exit.failure || exit.status !== 0) throw new ConnectionSetupError("the macOS Keychain refused to save the login");
 }
 
 /** A refusal before `op` runs. Its message is fixed text, never a value read. */
