@@ -2181,8 +2181,19 @@ export type TokenSourceSelection =
   | { kind: "none" }
   | { kind: "stdin" }
   | { kind: "env"; env: string }
-  | { kind: "named"; name: string }
-  | { kind: "1password"; ref: string };
+  | { kind: "named"; name: string; via?: string }
+  | { kind: "1password"; ref: string; via?: string };
+
+/** `connectionLoginFor` for a binding command: its refusal is the command's error. */
+export function selectionConnectionLogin(viaName: string, registry: SourceRegistry): OnePasswordLogin {
+  assertKnownSourceName(viaName);
+  try {
+    return connectionLoginFor(viaName, registry);
+  } catch (error) {
+    if (error instanceof TokenResolutionError) die(error.safeMessage);
+    throw error;
+  }
+}
 
 // Enforcement: resolve a typed selection into a stored TokenSource, re-validating
 // that the underlying secret actually resolves (env set, source known, op://
@@ -2202,21 +2213,28 @@ export function tokenSourceFromSelection(selection: TokenSourceSelection, requir
     }
     case "named": {
       assertKnownSourceName(selection.name);
-      const namedSource = loadSourceRegistry()[selection.name];
+      const registry = loadSourceRegistry();
+      const namedSource = registry[selection.name];
       if (!namedSource) die(`unknown source: ${selection.name}`);
       if (isConnectionSource(namedSource)) die(connectionNotValueMessage(selection.name));
-      return { source: "named", name: selection.name };
+      if (selection.via === undefined) return { source: "named", name: selection.name };
+      // Stored without a read, as a plain --from-source: the key is read
+      // through the connection at sync. Every refusal is before any write.
+      if (namedSource.type === "command") die(viaNotSupportedMessage(selection.name, namedSource.type));
+      selectionConnectionLogin(selection.via, registry);
+      return { source: "named", name: selection.name, via: selection.via };
     }
     case "1password": {
       if (!selection.ref.startsWith("op://")) die("1Password references must start with op://");
+      const login = selection.via === undefined ? APP_LOGIN : selectionConnectionLogin(selection.via, loadSourceRegistry());
       const opPath = resolveHostExecutable("op");
       if (!opPath) die("op CLI not found on sanitized host PATH");
       try {
-        readOnePasswordRef(opPath, selection.ref);
+        readOnePasswordRef(opPath, selection.ref, {}, login);
       } catch (error) {
         die(error instanceof Error ? error.message : String(error));
       }
-      return { source: "1password", ref: selection.ref };
+      return selection.via === undefined ? { source: "1password", ref: selection.ref } : { source: "1password", ref: selection.ref, via: selection.via };
     }
   }
 }
@@ -4665,6 +4683,9 @@ export type ServiceEnableInput = {
   id: string;
   tokenSource: TokenSourceSelection;
   fromOnePasswordItem?: string;
+  // `--via` with `--from-1password-item`: the 1password connection source the
+  // item's fields are read through, saved on every binding it creates.
+  fromOnePasswordItemVia?: string;
   // Raw `--param <key>=<value>` arguments (or prompt answers in the same
   // shape); parsed and validated by planDesiredServiceEnable against the
   // service's declared parameters.

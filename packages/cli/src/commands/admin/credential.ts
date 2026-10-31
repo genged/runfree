@@ -61,6 +61,7 @@ type SourceArgs = {
   "from-1password"?: string;
   "from-source"?: string;
   "from-stdin"?: boolean;
+  via?: string;
   "refresh-every"?: string;
   "replace-source"?: boolean;
   "no-sync"?: boolean;
@@ -121,6 +122,7 @@ const sourceBindingOptions = (cmd: Argv): Argv =>
     .option("from-1password", { type: "string", requiresArg: true, group: SOURCE_GROUP, describe: "Resolve from a 1Password ref (op://...)" })
     .option("from-source", { type: "string", requiresArg: true, group: SOURCE_GROUP, describe: "Bind a saved host-owned named source" })
     .option("from-stdin", { type: "boolean", group: SOURCE_GROUP, describe: "Read from stdin (plaintext storage remains disabled)" })
+    .option("via", { type: "string", requiresArg: true, group: SOURCE_GROUP, describe: "Read the op:// reference (or the source's 1Password key) through this 1password connection source" })
     .option("refresh-every", { type: "string", requiresArg: true, describe: "Re-resolve on this interval (e.g. 15m)" })
     .option("replace-source", { type: "boolean", describe: "Replace an existing source binding" });
 
@@ -135,6 +137,7 @@ function sourceIntent(argv: SourceArgs) {
       onePassword: argv["from-1password"],
       source: argv["from-source"],
       stdin: argv["from-stdin"],
+      via: argv.via,
     }),
     refreshEvery: argv["refresh-every"],
     replaceSource: Boolean(argv["replace-source"]),

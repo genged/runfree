@@ -670,6 +670,127 @@ describe("service parameters", () => {
     }
   });
 
+  describe("--via", () => {
+    const SA_TOKEN = `ops_${"S".repeat(48)}.sentinel-sa-token`;
+
+    // Real `security` and `op` scripts; `op` answers only with the connection's
+    // login in its environment and logs each call's argv and login.
+    function viaFixture(root: string, connectionRegistry: Record<string, unknown>) {
+      const projectRoot = path.join(root, "project");
+      const stateDir = path.join(root, "state");
+      const binDir = path.join(root, "bin");
+      for (const directory of [projectRoot, stateDir, binDir]) fs.mkdirSync(directory);
+      const log = path.join(root, "calls.log");
+      const security = path.join(binDir, "security");
+      fs.writeFileSync(security, `#!/bin/sh\necho "security $1" >> '${log}'\nprintf '%s\\n' '${SA_TOKEN}'\n`, { mode: 0o700 });
+      fs.writeFileSync(path.join(binDir, "op"), `#!/bin/sh\necho "op $* login=\${OP_SERVICE_ACCOUNT_TOKEN:+connection}" >> '${log}'\n[ "$OP_SERVICE_ACCOUNT_TOKEN" = '${SA_TOKEN}' ] || exit 7\ncase "$2" in *APPLE_ADS_CLIENT_ID) echo '${CLIENT_ID}' ;; *) echo item-secret ;; esac\n`, { mode: 0o700 });
+      const sourceConfigPath = path.join(root, "config", "sources.json");
+      fs.mkdirSync(path.dirname(sourceConfigPath), { recursive: true });
+      fs.writeFileSync(sourceConfigPath, JSON.stringify(connectionRegistry));
+      const state = (env: Record<string, string> = {}) => createAdminState({
+        projectRoot, packageRoot: "/workspace", stateDir,
+        agentEnvPath: path.join(stateDir, "agent.env"),
+        tokenConfigPath: path.join(stateDir, "tokens.json"),
+        sourceConfigPath,
+        env: {
+          PATH: binDir,
+          RUNFREE_TEST_FAKE_DOCKER: "1",
+          RUNFREE_TEST_SECURITY_PATH: security,
+          RUNFREE_TEST_KEYCHAIN_PLATFORM: "darwin",
+          ...env,
+        },
+      });
+      const calls = () => (fs.existsSync(log) ? fs.readFileSync(log, "utf8").split("\n").filter(Boolean) : []);
+      return { state, calls, stateDir };
+    }
+    const CONNECTION = { automation: { type: "1password", keychain: { service: "runfree.credential-source", account: "automation" }, createdAt: "x" } };
+
+    test("--from-1password-item --via reads every item field through the connection and saves the via on each binding", async () => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "runfree-item-via-"));
+      try {
+        const fixture = viaFixture(root, CONNECTION);
+        expect(await runAdminAction(fixture.state(), () => {
+          const plan = planDesiredServiceEnable({
+            id: "apple-ads", tokenSource: { kind: "none" },
+            fromOnePasswordItem: "op://Automation/apple", fromOnePasswordItemVia: "automation",
+            replaceSource: false, skipBroad: false, reloadProxy: false,
+          });
+          expect(plan.sourceItemBindings).toEqual([{
+            name: "oauth-apple-ads-client-secret",
+            source: { source: "1password", ref: "op://Automation/apple/APPLE_ADS_CLIENT_SECRET", via: "automation" },
+          }]);
+          expect(plan.parameterValues).toEqual({ APPLE_ADS_CLIENT_ID: CLIENT_ID });
+        })).toBe(0);
+        expect(fixture.calls()).toEqual([
+          "security find-generic-password",
+          "op read op://Automation/apple/APPLE_ADS_CLIENT_ID login=connection",
+          "security find-generic-password",
+          "op read op://Automation/apple/APPLE_ADS_CLIENT_SECRET login=connection",
+        ]);
+      } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+      }
+    });
+
+    test("--from-1password --via verifies through the connection and plans the via binding", async () => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "runfree-service-via-"));
+      try {
+        const fixture = viaFixture(root, CONNECTION);
+        expect(await runAdminAction(fixture.state(), () => {
+          const plan = planDesiredServiceEnable({
+            id: "github", tokenSource: { kind: "1password", ref: "op://Automation/github/token", via: "automation" },
+            replaceSource: false, skipBroad: false, reloadProxy: false,
+          });
+          expect(plan.source).toEqual({ source: "1password", ref: "op://Automation/github/token", via: "automation" });
+        })).toBe(0);
+        expect(fixture.calls()).toEqual(["security find-generic-password", "op read op://Automation/github/token login=connection"]);
+      } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+      }
+    });
+
+    test.each([
+      ["an unknown connection", {}, "unknown source: automation"],
+      ["a source that is not a connection", { automation: { type: "command", argv: ["/bin/echo", "x"], displayArgv: ["echo", "x"], createdAt: "x" } },
+        "automation is not a 1password connection source; --via names a source added with: runfree credential source 1password automation"],
+    ])("--from-1password-item --via with %s refuses before any read or write", async (_label, registry, message) => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "runfree-item-via-refuse-"));
+      try {
+        const fixture = viaFixture(root, registry);
+        expect(await runAdminAction(fixture.state(), () => {
+          expect(() => planDesiredServiceEnable({
+            id: "apple-ads", tokenSource: { kind: "none" },
+            fromOnePasswordItem: "op://Automation/apple", fromOnePasswordItemVia: "automation",
+            replaceSource: false, skipBroad: false, reloadProxy: false,
+          })).toThrow(message);
+        })).toBe(0);
+        expect(fixture.calls()).toEqual([]);
+        expect(fs.existsSync(path.join(fixture.stateDir, "tokens.json"))).toBe(false);
+        expect(fs.existsSync(path.join(fixture.stateDir, "agent.env"))).toBe(false);
+      } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+      }
+    });
+
+    test("the parameter remedy repeats --via", async () => {
+      const root = fs.mkdtempSync(path.join(os.tmpdir(), "runfree-via-remedy-"));
+      try {
+        const fixture = viaFixture(root, {
+          ...CONNECTION,
+          apple: { type: "jwt", alg: "ES256", privateKey: { source: "1password", ref: "op://Automation/AuthKey" }, headers: {}, claims: {}, ttlSeconds: 1140, createdAt: "x" },
+        });
+        expect(await runAdminAction(fixture.state(), () => {
+          expect(() => planDesiredServiceEnable({
+            id: "apple-ads", tokenSource: { kind: "named", name: "apple", via: "automation" },
+            replaceSource: false, skipBroad: false, reloadProxy: false,
+          })).toThrow(/runfree service enable apple-ads --from-source apple --via automation --param client-id=<value>/);
+        })).toBe(0);
+      } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+      }
+    });
+  });
+
   test.each([false, true])("restores all service host stores after failure (during bind: %s)", async (duringBind) => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "runfree-bind-rollback-"));
     const stateDir = path.join(root, "state");

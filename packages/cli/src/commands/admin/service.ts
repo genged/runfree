@@ -65,6 +65,7 @@ type EnableArgs = IdArgs & {
   "from-1password-item"?: string;
   "from-source"?: string;
   "from-stdin"?: boolean;
+  via?: string;
   param?: string[];
   "replace-source"?: boolean;
   "skip-broad"?: boolean;
@@ -88,6 +89,7 @@ const tokenSourceOptions = (cmd: Argv): Argv =>
     .option("from-1password-item", { type: "string", requiresArg: true, group: TOKEN_SOURCE_GROUP, describe: "Seed an OAuth credential from a 1Password item" })
     .option("from-source", { type: "string", requiresArg: true, group: TOKEN_SOURCE_GROUP, describe: "Bind a previously-saved host-owned source" })
     .option("from-stdin", { type: "boolean", group: TOKEN_SOURCE_GROUP, describe: "Read the token from stdin" })
+    .option("via", { type: "string", requiresArg: true, group: TOKEN_SOURCE_GROUP, describe: "Read the op:// reference, item fields, or the source's 1Password key through this 1password connection source" })
     .option("replace-source", { type: "boolean", describe: "Overwrite an existing credential source for this service" });
 
 const idPositional = (cmd: Argv): Argv =>
@@ -495,13 +497,17 @@ export const serviceCommand: CommandModule = {
             handler((argv: ArgumentsCamelCase<EnableArgs>) => {
               const intent = {
                 id: argv.id,
+                // With --from-1password-item, --via reads the item's fields;
+                // otherwise it belongs to the token source selection.
                 tokenSource: credentialSourceSelectionFromArgs({
                   env: argv["from-env"],
                   onePassword: argv["from-1password"],
                   source: argv["from-source"],
                   stdin: argv["from-stdin"],
+                  via: argv["from-1password-item"] === undefined ? argv.via : undefined,
                 }),
                 fromOnePasswordItem: argv["from-1password-item"],
+                ...(argv["from-1password-item"] !== undefined && argv.via !== undefined ? { fromOnePasswordItemVia: argv.via } : {}),
                 ...(argv.param && argv.param.length > 0 ? { parameters: argv.param } : {}),
                 replaceSource: Boolean(argv["replace-source"]),
                 skipBroad: Boolean(argv["skip-broad"]),

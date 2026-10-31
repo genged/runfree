@@ -7,6 +7,7 @@ import type {
   TokenResolutionReceipt,
 } from "../token-resolution.ts";
 import {
+  assertKnownSourceName,
   assertNotReservedUserTokenName,
   assertRefreshBeforeJwtExpiry,
   assertTokenSourceCanBeSaved,
@@ -105,15 +106,26 @@ export function credentialSourceSelectionFromArgs(fields: {
   onePassword?: string;
   source?: string;
   stdin?: boolean;
+  via?: string;
 }): TokenSourceSelection {
   const present =
     [fields.env, fields.onePassword, fields.source].filter((value) => value !== undefined).length +
     (fields.stdin ? 1 : 0);
   if (present > 1) die("choose only one credential source");
+  // `--via` names the 1password connection a reference (or a source's
+  // 1Password key) is read through; refused before any read or write when
+  // the chosen source has nothing to read through it.
+  const { via } = fields;
+  if (via !== undefined) {
+    if (fields.env !== undefined) die("--via reads op:// references through a connection; --from-env never asks and takes no --via");
+    if (fields.onePassword === undefined && fields.source === undefined) die("--via needs --from-1password or --from-source");
+    assertKnownSourceName(via);
+  }
+  const viaField = via === undefined ? {} : { via };
   if (fields.stdin) return { kind: "stdin" };
   if (fields.env !== undefined) return { kind: "env", env: fields.env };
-  if (fields.source !== undefined) return { kind: "named", name: fields.source };
-  if (fields.onePassword !== undefined) return { kind: "1password", ref: fields.onePassword };
+  if (fields.source !== undefined) return { kind: "named", name: fields.source, ...viaField };
+  if (fields.onePassword !== undefined) return { kind: "1password", ref: fields.onePassword, ...viaField };
   return { kind: "none" };
 }
 
