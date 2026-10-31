@@ -785,9 +785,10 @@ runfree credential source remove automation
   The source registry records only that item name, never the token.
 - On each read, Runfree reads the token from the Keychain and gives it only
   to the `op` process, as `OP_SERVICE_ACCOUNT_TOKEN`, with desktop-app
-  integration turned off. That process gets a short list of host
-  environment variables (`PATH`, `HOME`, `USER`, `LOGNAME`, `TMPDIR`, and
-  the locale), and no other `OP_*` variable. The token never reaches the
+  integration turned off. That process gets only `PATH`, `HOME`, `USER`,
+  and `LOGNAME` from the host, with project paths and `node_modules/.bin`
+  entries removed, and no other `OP_*` variable. It runs in Runfree's host
+  config directory, not in the project. The token never reaches the
   project, the agent, the proxy, a log, a message, or a run record.
 - A service account reads only the vaults it was granted. It cannot read a
   personal vault such as Private, so put the items a run needs in a shared

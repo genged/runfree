@@ -7306,7 +7306,7 @@ describe("google-service-account sources", () => {
 describe("1password connection sources (todo 158)", () => {
   const SA_TOKEN = `ops_${"S".repeat(48)}.sentinel-sa-token`;
   const CONNECTION_ENTRY = { type: "1password", keychain: { service: "runfree.credential-source", account: "automation" }, createdAt: "x" };
-  type Call = { command: "security" | "op"; args: string[]; input?: string; env: NodeJS.ProcessEnv };
+  type Call = { command: "security" | "op"; args: string[]; input?: string; env: NodeJS.ProcessEnv; cwd?: string };
 
   function installFakeKeychainAndOp(options: {
     stored?: Map<string, string>;
@@ -7348,7 +7348,7 @@ describe("1password connection sources (todo 158)", () => {
     });
     registerFakeCommand(path.join(bin, "op"), (args, spawnOptions) => {
       const env = envFromSpawnOptions(spawnOptions);
-      calls.push({ command: "op", args, env });
+      calls.push({ command: "op", args, env, ...(spawnOptions.cwd === undefined ? {} : { cwd: String(spawnOptions.cwd) }) });
       if (args[0] === "whoami") {
         if (options.whoamiStatus !== undefined) return spawnResult({ status: options.whoamiStatus, stderr: options.whoamiStderr ?? "" });
         return spawnResult({ stdout: options.whoami ?? JSON.stringify({ user_type: "SERVICE_ACCOUNT", url: "https://x.1password.com" }) });
@@ -7807,6 +7807,63 @@ describe("1password connection sources (todo 158)", () => {
       expect(dockerExecCalls(docker.dockerLog).map((entry) => entry.stdin)).toContain("connection-secret");
       expect(result.stderr).not.toContain("Touch ID");
       expectNoSentinel(result.stdout, result.stderr, fs.readFileSync(tokenStatusFilePath(), "utf8"), fs.readFileSync(docker.dockerLog, "utf8"));
+    });
+
+    test("a connection read runs op with the sanitized host PATH and a fixed working directory", async () => {
+      const docker = githubViaFixture();
+      const fake = installFakeKeychainAndOp({ stored: new Map([["automation", SA_TOKEN]]) });
+      const projectBin = path.join(tmp, "bin");
+      const projectNodeBin = path.join(tmp, "node_modules/.bin");
+      const outsideNodeBin = path.join(tmpBase, "elsewhere/node_modules/.bin");
+      for (const dir of [projectBin, projectNodeBin, outsideNodeBin]) fs.mkdirSync(dir, { recursive: true });
+      const hostPath = [projectBin, projectNodeBin, outsideNodeBin, docker.fakeBin, fake.opBin, process.env.PATH ?? ""].join(path.delimiter);
+      const result = await runAdmin(sync, syncEnv(fake, docker, { PATH: hostPath, TMPDIR: path.join(tmp, "tmp") }));
+      expect(result.status, result.stderr).toBe(0);
+      const opRead = fake.calls.find((call) => call.command === "op");
+      const entries = (opRead?.env.PATH ?? "").split(path.delimiter);
+      expect(entries).toContain(fs.realpathSync(fake.opBin));
+      expect(entries.filter((entry) => entry.startsWith(fs.realpathSync(tmp)) || entry.startsWith(tmp))).toEqual([]);
+      expect(entries.filter((entry) => entry.endsWith(`node_modules${path.sep}.bin`))).toEqual([]);
+      expect(opRead?.env.TMPDIR).toBeUndefined();
+      expect(opRead?.cwd).toBe(path.join(home, ".config/runfree"));
+    });
+
+    test("an app read keeps the host account selection but gets the sanitized PATH and a fixed working directory", async () => {
+      writeFixtureRepo(exampleTokenPolicy(["github"]));
+      writeTokenConfig({ github: { source: "1password", ref: "op://Private/github/token" } });
+      const docker = installTokenSyncDockerFake();
+      const fake = installFakeKeychainAndOp();
+      const projectNodeBin = path.join(tmp, "node_modules/.bin");
+      fs.mkdirSync(projectNodeBin, { recursive: true });
+      const hostPath = [projectNodeBin, docker.fakeBin, fake.opBin, process.env.PATH ?? ""].join(path.delimiter);
+      const result = await runAdmin(sync, syncEnv(fake, docker, { PATH: hostPath, OP_ACCOUNT: "personal.1password.com" }));
+      expect(result.status, result.stderr).toBe(0);
+      const opRead = fake.calls.find((call) => call.command === "op");
+      expect(opRead?.env.OP_ACCOUNT).toBe("personal.1password.com");
+      expect((opRead?.env.PATH ?? "").split(path.delimiter).filter((entry) => entry.endsWith(`node_modules${path.sep}.bin`))).toEqual([]);
+      expect(opRead?.cwd).toBe(path.join(home, ".config/runfree"));
+    });
+
+    test("the credential watcher runs a connection read with the sanitized host PATH and a fixed working directory", async () => {
+      writeFixtureRepo(exampleTokenPolicy(["github"]));
+      writeSourceRegistry({ automation: CONNECTION_ENTRY });
+      writeTokenConfig({ github: { source: "1password", ref: "op://Automation/github/token", via: "automation", refreshEverySeconds: 1 } });
+      const docker = installTokenSyncDockerFake();
+      const fake = installFakeKeychainAndOp({ stored: new Map([["automation", SA_TOKEN]]) });
+      const projectNodeBin = path.join(tmp, "node_modules/.bin");
+      fs.mkdirSync(projectNodeBin, { recursive: true });
+      const hostPath = [projectNodeBin, docker.fakeBin, fake.opBin, process.env.PATH ?? ""].join(path.delimiter);
+      const result = await runAdmin(
+        () => credentialSyncIntent({ verbose: false, watch: true, quiet: false, delayFirstSync: false, cacheSourceSecrets: true }),
+        syncEnv(fake, docker, { PATH: hostPath, RUNFREE_TEST_TOKEN_SYNC_WATCH_ITERATIONS: "2", RUNFREE_TEST_TOKEN_SYNC_WATCH_SLEEP_MS: "1" }),
+      );
+      expect(result.status, result.stderr).toBe(0);
+      const reads = fake.calls.filter((call) => call.command === "op");
+      expect(reads.length).toBeGreaterThan(1);
+      for (const call of reads) {
+        expect((call.env.PATH ?? "").split(path.delimiter).filter((entry) => entry.endsWith(`node_modules${path.sep}.bin`))).toEqual([]);
+        expect(call.cwd).toBe(path.join(home, ".config/runfree"));
+      }
     });
 
     test("a locked Keychain is transient and op never runs", async () => {

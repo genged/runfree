@@ -229,7 +229,7 @@ async function readOnePasswordOwned(read: OnePasswordRead, lifetime: CredentialL
     token = keychainReadStep(read.login.sourceName, keychainExit);
     lifetime.assertActive();
   }
-  const options: OwnedProviderOptions = { env: opExecutionEnv(read, token), timeoutMs: read.timeoutMs, maxBytes: PROVIDER_OUTPUT_MAX_BYTES };
+  const options: OwnedProviderOptions = { cwd: read.cwd, env: opExecutionEnv(read, token), timeoutMs: read.timeoutMs, maxBytes: PROVIDER_OUTPUT_MAX_BYTES };
   const readExit = scrubOnePasswordExit(await ownedProviderExit(read.executable, onePasswordReadArgs(read), options, lifetime), token);
   const step = onePasswordReadStep(read, readExit);
   if (step.kind === "value") return step.value;

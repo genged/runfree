@@ -1184,6 +1184,8 @@ export type OnePasswordRead = Readonly<{
   executable: string;
   ref: string;
   env: NodeJS.ProcessEnv;
+  /** A host-owned directory: `op` never runs in the project checkout. */
+  cwd: string;
   timeoutMs: number;
   quiet: boolean;
   /** How `op` logs in: the desktop app (may ask) or a connection's stored login. */
@@ -1256,8 +1258,22 @@ export function onePasswordDocumentStep(read: OnePasswordRead, readExit: Provide
   return readSpawnedOpOutput(documentExit, "op document get returned an empty value");
 }
 
+/**
+ * The base environment of an `op` child. A connection read starts from the
+ * sanitized host environment (no project PATH entries, no project HOME or
+ * XDG roots). An app read keeps the host's `OP_*` account and session
+ * selection, which the desktop app read depends on, but gets the sanitized
+ * PATH too.
+ */
+function opBaseEnv(login: OnePasswordLogin): NodeJS.ProcessEnv {
+  const sanitized = sanitizedHostExecutionEnv(projectRoot(), childEnv());
+  if (login.kind === "connection") return Object.freeze(sanitized);
+  const { PATH: _hostPath, ...rest } = childEnv();
+  return Object.freeze(sanitized.PATH === undefined ? rest : { ...rest, PATH: sanitized.PATH });
+}
+
 function onePasswordRead(opPath: string, ref: string, options: { quiet?: boolean } = {}, login: OnePasswordLogin = APP_LOGIN): OnePasswordRead {
-  return { executable: opPath, ref, env: Object.freeze({ ...childEnv() }), timeoutMs: opReadTimeoutMs(), quiet: options.quiet === true, login };
+  return { executable: opPath, ref, env: opBaseEnv(login), cwd: hostOwnedSourceCwd(), timeoutMs: opReadTimeoutMs(), quiet: options.quiet === true, login };
 }
 
 /** Removes a connection login from `op` stderr before any classifier or message sees it. */
@@ -1285,6 +1301,7 @@ function runOnePasswordReadSync(read: OnePasswordRead): string {
   // A Keychain failure throws its classified error here: `op` never runs.
   const token = read.login.kind === "connection" ? readConnectionLoginSync(read.login.sourceName, read.login.keychain) : undefined;
   const spawnOptions = {
+    cwd: read.cwd,
     encoding: "utf8" as const,
     env: opExecutionEnv(read, token),
     maxBuffer: PROVIDER_OUTPUT_MAX_BYTES,
@@ -1413,7 +1430,7 @@ export function verifyConnectionLogin(token: string): string[] {
   const opPath = resolveHostExecutable("op");
   if (!opPath) throw new ConnectionSetupError("op CLI not found on sanitized host PATH");
   const env = connectionOpEnv(sanitizedHostExecutionEnv(projectRoot(), childEnv()), token);
-  const options = { env, timeout: opReadTimeoutMs() };
+  const options = { cwd: hostOwnedSourceCwd(), env, timeout: opReadTimeoutMs() };
   const whoami = connectionSetupExit(opPath, opWhoamiArgs(), options);
   if (whoami.failure || whoami.status !== 0) {
     const detail = sanitizedStderrFirstLine(redactLogin(whoami.stderr, token));

@@ -51,7 +51,7 @@ function commandRead(executable: string, timeoutMs = 10_000): CredentialReadInpu
 }
 
 function onePasswordRead(executable: string, ref = "op://Private/Item/field", environment: NodeJS.ProcessEnv = env): OnePasswordRead {
-  return { executable, ref, env: environment, timeoutMs: 10_000, quiet: true, login: APP_LOGIN };
+  return { executable, ref, env: environment, cwd: tmp, timeoutMs: 10_000, quiet: true, login: APP_LOGIN };
 }
 
 function processGone(pid: number): boolean {
@@ -174,8 +174,10 @@ describe("readCredentialSource through a connection", () => {
   async function readThroughConnection(securityBody: string, opBody: string, lifetime: CredentialLifetime): Promise<{ result: Awaited<ReturnType<typeof readCredentialSource>>; log: string[] }> {
     const log = path.join(tmp, "calls.log");
     const security = script("security", `echo "security $1" >> '${log}'\n${securityBody}`);
-    const op = script("op", `echo "op $1 token=$OP_SERVICE_ACCOUNT_TOKEN biometric=$OP_BIOMETRIC_UNLOCK_ENABLED account=$OP_ACCOUNT" >> '${log}'\n${opBody}`);
-    const read: OnePasswordRead = { executable: op, ref: "op://A/b/c", env: Object.freeze({ ...env, OP_ACCOUNT: "personal" }), timeoutMs: 10_000, quiet: true, login: CONNECTION };
+    const op = script("op", `echo "op $1 token=$OP_SERVICE_ACCOUNT_TOKEN biometric=$OP_BIOMETRIC_UNLOCK_ENABLED account=$OP_ACCOUNT cwd=$(pwd -P)" >> '${log}'\n${opBody}`);
+    const workDir = path.join(tmp, "op-cwd");
+    fs.mkdirSync(workDir, { recursive: true });
+    const read: OnePasswordRead = { executable: op, ref: "op://A/b/c", env: Object.freeze({ ...env, OP_ACCOUNT: "personal" }), cwd: workDir, timeoutMs: 10_000, quiet: true, login: CONNECTION };
     let result: Awaited<ReturnType<typeof readCredentialSource>> | undefined;
     const state = createAdminState({
       env: { ...process.env, RUNFREE_TEST_FAKE_DOCKER: "1", RUNFREE_TEST_SECURITY_PATH: security },
@@ -193,7 +195,7 @@ describe("readCredentialSource through a connection", () => {
   test("a connection read runs security, then op with only the login env", async () => {
     const { result, log } = await readThroughConnection(`printf '%s\\n' '${SA_TOKEN}'`, "echo connection-value", watchLifetime());
     expect(result).toEqual({ kind: "success", value: "connection-value", resolvedAt: expect.any(Number) });
-    expect(log).toEqual(["security find-generic-password", `op read token=${SA_TOKEN} biometric=false account=`]);
+    expect(log).toEqual(["security find-generic-password", `op read token=${SA_TOKEN} biometric=false account= cwd=${fs.realpathSync(path.join(tmp, "op-cwd"))}`]);
   });
 
   test("a watch stopped during the Keychain read never reaches op", async () => {
