@@ -280,6 +280,9 @@ Limits:
 - A Google service-account key removed from 1Password can stay in use for
   up to 4 hours plus one JWT lifetime. Delete the key in Google Cloud IAM to
   stop it at once.
+- A 1Password connection's Keychain item trusts `/usr/bin/security`, so
+  reads never ask. Any process that runs as your macOS user can therefore
+  read the service account token with `security`, without a prompt.
 
 The rules are in [Credentials rules](security-rules.md#credentials) (`CRED-1`
 to `CRED-8`).

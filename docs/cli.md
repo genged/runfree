@@ -784,7 +784,9 @@ runfree credential source remove automation
   the vaults the account can read.
 - The token goes into the macOS login Keychain as a generic password with
   service `runfree.credential-source` and the source name as its account.
-  The source registry records only that item name, never the token.
+  The item trusts `/usr/bin/security`, so reads never ask; any process that
+  runs as your macOS user can read the token with `security` without a
+  prompt. The source registry records only that item name, never the token.
 - On each read, Runfree reads the token from the Keychain and gives it only
   to the `op` process, as `OP_SERVICE_ACCOUNT_TOKEN`, with desktop-app
   integration turned off. That process gets only `PATH`, `HOME`, `USER`,
