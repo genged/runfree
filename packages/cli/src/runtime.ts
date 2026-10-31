@@ -753,6 +753,11 @@ export type HeadlessRuntimeLaunchInput = Readonly<{
 
 export type HeadlessRuntimeHooks<T> = Readonly<{
   /**
+   * Right after the start selects its effective policy generation, before
+   * any Docker work. Returns a nonzero status to refuse the start.
+   */
+  afterControlSelection(): Promise<number>;
+  /**
    * After the runtime is ready and before the launch. Returns a status to
    * refuse the launch, or undefined to go on.
    */
@@ -798,6 +803,7 @@ export async function runHeadlessAgentRuntime<T>(
     verbose: options.verbose,
     launch: true,
     launchHandoff: true,
+    afterControlSelection: hooks.afterControlSelection,
   });
   if (runtime.kind === "failed") return { kind: "refused", status: runtime.status };
   try {

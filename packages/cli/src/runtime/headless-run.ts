@@ -409,9 +409,18 @@ async function runUnderLock(input: RunInput): Promise<number> {
       // any credential read. The lock and the record are the run's own.
       refused = true;
     } else {
-      const promptContainerPath = writeInboxPrompt(inboxDir, runId, input.prompt);
-      promptWritten = true;
+      let promptContainerPath: string | undefined;
       const result = await deps.runtime(context, io, agentName, { verbose: options.verbose === true }, {
+        afterControlSelection: async () => {
+          // The start may have selected a newer effective policy generation
+          // than the one checked above: check its bindings too, before the
+          // prompt copy and Docker.
+          const preflight = await deps.credentialPreflight(context, io);
+          if (preflight !== 0) return preflight;
+          promptContainerPath = writeInboxPrompt(inboxDir, runId, input.prompt);
+          promptWritten = true;
+          return 0;
+        },
         beforeLaunch: (activeContext) => {
           unchecked = deps.uncheckedAuthority(activeContext, agentName);
           // A startup signal skips the launch; the abort decides the code.
@@ -431,6 +440,7 @@ async function runUnderLock(input: RunInput): Promise<number> {
           return undefined;
         },
         launch: async (launch) => {
+          if (promptContainerPath === undefined) throw new Error("internal error: the run's prompt was not copied before the launch");
           active = { context: launch.activeContext, proxyId: launch.proxyId };
           launchStarted = true;
           return await deps.launch({

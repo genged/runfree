@@ -1402,6 +1402,10 @@ export async function startRuntime(
         : 1;
       return result(status, false, context);
     }
+    if (rebuildOptions.afterControlSelection) {
+      const status = await rebuildOptions.afterControlSelection();
+      if (status !== 0) return result(status, false, context);
+    }
     const dockerSubnets = context.network
       ? []
       : (() => {

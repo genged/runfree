@@ -467,8 +467,10 @@ Tests: [google-service-account.test.ts](../packages/cli/src/admin/google-service
   environment variable such as `OP_SERVICE_ACCOUNT_TOKEN` does not change
   it, and neither does a cached signing key.
 - The run checks every binding the policy uses after its lock and record,
-  and before the prompt copy, Docker, and any source read. A refusal names
-  the binding and the fix, and the run exits 65.
+  and before the prompt copy, Docker, and any source read. It checks again
+  on the effective policy generation the launch selects, before the prompt
+  copy and Docker. A refusal names the binding and the fix, and the run
+  exits 65.
 - The same check runs before each provider starts, in every read of the
   run: startup, the warm-launch fallback, the run's credential watcher, and
   signing-key reads.

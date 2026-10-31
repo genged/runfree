@@ -201,8 +201,10 @@ nothing; only a binding's `--via` counts.
 
 - After the run lock and the run record, and before the prompt copy, Docker,
   or any credential read, `run` checks every binding the project's policy
-  uses (every configured binding when the policy cannot be read). Each
-  binding that may ask prints one refusal with the fix, and the run exits 65.
+  uses (every configured binding when the policy cannot be read). It checks
+  again right after the launch selects the effective policy generation it
+  will run on, still before the prompt copy and Docker. Each binding that
+  may ask prints one refusal with the fix, and the run exits 65.
   With one connection source named `automation`, the refusal reads:
 
   ```text

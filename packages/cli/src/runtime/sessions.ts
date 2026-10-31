@@ -121,6 +121,13 @@ export type RebuildOptions = {
    * lifecycle lock itself. The caller must dispose an untaken handoff.
    */
   launchHandoff?: boolean;
+  /**
+   * Runs right after the start selects its effective policy generation, and
+   * before any Docker work. A nonzero status ends the start with it. A
+   * headless run checks its credential bindings here again, against the
+   * generation it will run on.
+   */
+  afterControlSelection?: () => Promise<number>;
 };
 
 export type CreateSessionMetadataOptions = {

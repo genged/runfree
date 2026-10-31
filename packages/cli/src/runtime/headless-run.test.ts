@@ -128,6 +128,8 @@ function harness(options: Readonly<{
       if (options.runtime) {
         return await options.runtime(hooks as unknown as HeadlessRuntimeHooks<SessionHeadlessLaunchResult>) as unknown as HeadlessRuntimeResult<T>;
       }
+      const selected = await hooks.afterControlSelection();
+      if (selected !== 0) return { kind: "refused", status: selected };
       const refusal = hooks.beforeLaunch(context);
       if (refusal !== undefined) return { kind: "refused", status: refusal };
       return {
@@ -271,6 +273,27 @@ describe("the never-ask rule (todo 158)", () => {
     expect(runJson()).toMatchObject({ outcome: "refused", exitCode: 65, teardown: "not-started" });
     expect(h.released()).toBe(true);
     expect(credentialInteractionForbidden()).toBe(false);
+  });
+
+  test("a binding the newly selected generation adds refuses 65 after selection, before the prompt copy and Docker", async () => {
+    let calls = 0;
+    let promptsAtSecondCheck: string[] | undefined;
+    const h = harness({
+      credentialPreflight: async () => {
+        calls += 1;
+        if (calls === 1) return 0;
+        promptsAtSecondCheck = inboxPrompts();
+        console.error("run refused (65): github uses the 1Password app, which may ask");
+        return 65;
+      },
+    });
+    expect(await run(h)).toBe(65);
+    expect(calls).toBe(2);
+    expect(promptsAtSecondCheck).toEqual([]);
+    expect(h.launchCalls()).toBe(0);
+    expect(inboxPrompts()).toEqual([]);
+    expect(runJson()).toMatchObject({ outcome: "refused", exitCode: 65, teardown: "not-started" });
+    expect(h.released()).toBe(true);
   });
 
   test("a preflight that throws refuses the run the same way", async () => {
@@ -840,11 +863,12 @@ const context = {
 let sinks: { stdout(chunk: Buffer): void; stdoutEnded?(): void } | undefined;
 const status = await runHeadlessAgent(context, nodeRuntimeIO, "claude", { promptFile: ${JSON.stringify(promptPath)}, acceptDeniedWrites: false }, {
   stdout: () => {},
-  runtime: async (_c: unknown, io: { confirm(q: string): boolean; isInteractive(): boolean; choosePiProvider(o: unknown[]): unknown }, _a: string, _o: unknown, hooks: { beforeLaunch(c: unknown): number | undefined; launch(i: unknown): Promise<unknown> }) => {
+  runtime: async (_c: unknown, io: { confirm(q: string): boolean; isInteractive(): boolean; choosePiProvider(o: unknown[]): unknown }, _a: string, _o: unknown, hooks: { afterControlSelection(): Promise<number>; beforeLaunch(c: unknown): number | undefined; launch(i: unknown): Promise<unknown> }) => {
     answers.confirm = io.confirm("Enable? [y/N] ");
     answers.interactive = io.isInteractive();
     answers.piProvider = io.choosePiProvider([{ label: "x", value: "custom" }]) ?? null;
     answers.hostInteractive = hostTerminalInteractive();
+    await hooks.afterControlSelection();
     hooks.beforeLaunch(context);
     return { kind: "launched", value: await hooks.launch({ preparedRuntime: {}, activeContext: context, proxyId: "p", reprepare: async () => ({}) }) };
   },
