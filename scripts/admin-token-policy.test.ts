@@ -7310,6 +7310,7 @@ describe("1password connection sources (todo 158)", () => {
     whoamiStatus?: number;
     whoamiStderr?: string;
     vaults?: string;
+    opRead?: (args: string[], env: NodeJS.ProcessEnv) => SpawnSyncReturns<string>;
   } = {}): { calls: Call[]; securityPath: string; opBin: string; stored: Map<string, string> } {
     const calls: Call[] = [];
     const stored = options.stored ?? new Map<string, string>();
@@ -7345,7 +7346,7 @@ describe("1password connection sources (todo 158)", () => {
         return spawnResult({ stdout: options.whoami ?? JSON.stringify({ user_type: "SERVICE_ACCOUNT", url: "https://x.1password.com" }) });
       }
       if (args[0] === "vault") return spawnResult({ stdout: options.vaults ?? JSON.stringify([{ id: "v1", name: "Automation" }]) });
-      if (args[0] === "read") return spawnResult({ stdout: "connection-secret\n" });
+      if (args[0] === "read") return options.opRead ? options.opRead(args, env) : spawnResult({ stdout: "connection-secret\n" });
       return spawnResult({ status: 2 });
     });
     return { calls, securityPath, opBin: bin, stored };
@@ -7761,6 +7762,138 @@ describe("1password connection sources (todo 158)", () => {
       const rotated = await runAdmin(() => sourceLoginIntent({ name: "automation", token: { kind: "stdin", text: SA_TOKEN } }), connectionEnv(fake));
       expect(rotated.status, rotated.stderr).toBe(0);
       expect(rotated.stdout).toContain("used by credential bindings: github");
+    });
+  });
+
+  describe("reading through a connection", () => {
+    const sync = () => credentialSyncIntent({ verbose: false, watch: false, quiet: false, delayFirstSync: false, cacheSourceSecrets: true });
+
+    function syncEnv(fake: { securityPath: string; opBin: string }, docker: { dockerLog: string; fakeBin: string }, extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
+      return {
+        ...connectionEnv(fake),
+        FAKE_DOCKER_LOG: docker.dockerLog,
+        PATH: `${docker.fakeBin}${path.delimiter}${fake.opBin}${path.delimiter}${process.env.PATH ?? ""}`,
+        ...extra,
+      };
+    }
+
+    function githubViaFixture(): { dockerLog: string; fakeBin: string } {
+      writeFixtureRepo(exampleTokenPolicy(["github"]));
+      writeSourceRegistry({ automation: CONNECTION_ENTRY });
+      writeTokenConfig({ github: { source: "1password", ref: "op://Automation/github/token", via: "automation" } });
+      return installTokenSyncDockerFake();
+    }
+
+    test("a via binding reads the Keychain, then runs op with only the service account env, and syncs", async () => {
+      const docker = githubViaFixture();
+      const fake = installFakeKeychainAndOp({ stored: new Map([["automation", SA_TOKEN]]) });
+      const result = await runAdmin(sync, syncEnv(fake, docker, { OP_ACCOUNT: "personal.1password.com", OP_SESSION_x: "s", OP_SERVICE_ACCOUNT_TOKEN: "ops_from_the_host_env" }));
+      expect(result.status, result.stderr).toBe(0);
+      expect(fake.calls.map((call) => `${call.command} ${call.args[0]}`)).toEqual(["security find-generic-password", "op read"]);
+      const opRead = fake.calls.find((call) => call.command === "op");
+      expect(opRead?.args).toEqual(["read", "op://Automation/github/token"]);
+      expect(opRead?.env.OP_SERVICE_ACCOUNT_TOKEN).toBe(SA_TOKEN);
+      expect(opRead?.env.OP_BIOMETRIC_UNLOCK_ENABLED).toBe("false");
+      expect(opRead?.env.OP_ACCOUNT).toBeUndefined();
+      expect(Object.keys(opRead?.env ?? {}).filter((key) => key.startsWith("OP_SESSION"))).toEqual([]);
+      expect(dockerExecCalls(docker.dockerLog).map((entry) => entry.stdin)).toContain("connection-secret");
+      expect(result.stderr).not.toContain("Touch ID");
+      expectNoSentinel(result.stdout, result.stderr, fs.readFileSync(tokenStatusFilePath(), "utf8"), fs.readFileSync(docker.dockerLog, "utf8"));
+    });
+
+    test("a locked Keychain is transient and op never runs", async () => {
+      const docker = githubViaFixture();
+      const fake = installFakeKeychainAndOp({ readStatus: 36, readStderr: "User interaction is not allowed." });
+      const result = await runAdmin(sync, syncEnv(fake, docker));
+      expect(result.status).not.toBe(0);
+      expect(result.stdout + result.stderr).toContain('the login for source "automation" cannot be read (Keychain locked)');
+      expect(fake.calls.filter((call) => call.command === "op")).toEqual([]);
+      expect(readTokenStatus().github?.ok).toBe(false);
+    });
+
+    test("a revoked service account token fails definitively and op's stderr is redacted", async () => {
+      const docker = githubViaFixture();
+      const fake = installFakeKeychainAndOp({
+        stored: new Map([["automation", SA_TOKEN]]),
+        opRead: () => spawnResult({ status: 1, stderr: `[ERROR] unauthorized: token ${SA_TOKEN} has been revoked\n` }),
+      });
+      const result = await runAdmin(sync, syncEnv(fake, docker));
+      expect(result.status).not.toBe(0);
+      expect(result.stdout + result.stderr).toContain("unauthorized");
+      expect(result.stdout + result.stderr).toContain("[redacted]");
+      expect(classifyOnePasswordFailure(`[ERROR] unauthorized: token [redacted] has been revoked`)).toBe("definitive");
+      expectNoSentinel(result.stdout, result.stderr, fs.readFileSync(tokenStatusFilePath(), "utf8"), fs.readFileSync(docker.dockerLog, "utf8"));
+    });
+
+    test("a jwt source bound with via reads its signing key through the connection", async () => {
+      writeFixtureRepo(exampleTokenPolicy(["appstore"]));
+      const { privateKey } = crypto.generateKeyPairSync("ec", { namedCurve: "P-256" });
+      const privateKeyPem = privateKey.export({ format: "pem", type: "pkcs8" }).toString();
+      writeSourceRegistry({
+        automation: CONNECTION_ENTRY,
+        "appstore-jwt": { type: "jwt", alg: "ES256", privateKey: { source: "1password", ref: "op://Automation/AuthKey/pem" }, headers: { kid: "KEY123" }, claims: { iss: "ISSUER" }, ttlSeconds: 1140, createdAt: "x" },
+      });
+      writeTokenConfig({ appstore: { source: "named", name: "appstore-jwt", via: "automation" } });
+      const docker = installTokenSyncDockerFake();
+      const fake = installFakeKeychainAndOp({ stored: new Map([["automation", SA_TOKEN]]), opRead: () => spawnResult({ stdout: privateKeyPem }) });
+      const result = await runAdmin(sync, syncEnv(fake, docker));
+      expect(result.status, result.stderr).toBe(0);
+      expect(fake.calls.map((call) => `${call.command} ${call.args.join(" ")}`)).toEqual([
+        "security find-generic-password -s runfree.credential-source -a automation -w",
+        "op read op://Automation/AuthKey/pem",
+      ]);
+      expect(fake.calls[1]?.env.OP_SERVICE_ACCOUNT_TOKEN).toBe(SA_TOKEN);
+      const written = dockerExecCalls(docker.dockerLog).map((entry) => String(entry.stdin));
+      expect(written.some((value) => value.split(".").length === 3)).toBe(true);
+      expectNoSentinel(result.stdout, result.stderr, fs.readFileSync(docker.dockerLog, "utf8"));
+    });
+
+    test("an app read and a connection read of the same reference never share a value", async () => {
+      writeFixtureRepo(exampleTokenPolicy(["github", "github-app"]));
+      writeSourceRegistry({ automation: CONNECTION_ENTRY });
+      writeTokenConfig({
+        github: { source: "1password", ref: "op://Automation/github/token", via: "automation" },
+        "github-app": { source: "1password", ref: "op://Automation/github/token" },
+      });
+      const docker = installTokenSyncDockerFake();
+      const fake = installFakeKeychainAndOp({
+        stored: new Map([["automation", SA_TOKEN]]),
+        opRead: (_args, env) => spawnResult({ stdout: env.OP_SERVICE_ACCOUNT_TOKEN === SA_TOKEN ? "via-connection\n" : "via-app\n" }),
+      });
+      const result = await runAdmin(sync, syncEnv(fake, docker));
+      expect(result.status, result.stderr).toBe(0);
+      const reads = fake.calls.filter((call) => call.command === "op");
+      expect(reads).toHaveLength(2);
+      expect(reads.map((call) => call.env.OP_SERVICE_ACCOUNT_TOKEN === SA_TOKEN).sort()).toEqual([false, true]);
+      expect(dockerExecCalls(docker.dockerLog).map((entry) => entry.stdin).sort()).toEqual(["via-app", "via-connection"]);
+    });
+
+    test.each([
+      ["an unknown via", { github: { source: "1password", ref: "op://A/b/c", via: "missing" } }, "unknown source: missing"],
+      ["a via that is not a connection", { github: { source: "1password", ref: "op://A/b/c", via: "gh" } }, "gh is not a 1password connection source; --via names a source added with: runfree credential source 1password gh"],
+      ["a command source through via", { github: { source: "named", name: "gh", via: "automation" } }, "gh is a command source; --via applies to 1password references and jwt or google-service-account sources"],
+    ])("%s fails before any spawn", async (_label, config, message) => {
+      writeFixtureRepo(exampleTokenPolicy(["github"]));
+      writeSourceRegistry({
+        automation: CONNECTION_ENTRY,
+        gh: { type: "command", argv: ["/bin/echo", "x"], displayArgv: ["echo", "x"], createdAt: "x" },
+      });
+      writeTokenConfig(config);
+      const docker = installTokenSyncDockerFake();
+      const fake = installFakeKeychainAndOp({ stored: new Map([["automation", SA_TOKEN]]) });
+      const result = await runAdmin(sync, syncEnv(fake, docker));
+      expect(result.status).not.toBe(0);
+      expect(result.stdout + result.stderr).toContain(message);
+      expect(fake.calls).toEqual([]);
+    });
+
+    test("a connection on a host without the macOS Keychain fails before any spawn", async () => {
+      const docker = githubViaFixture();
+      const fake = installFakeKeychainAndOp({ stored: new Map([["automation", SA_TOKEN]]) });
+      const result = await runAdmin(sync, syncEnv(fake, docker, { RUNFREE_TEST_KEYCHAIN_PLATFORM: "linux" }));
+      expect(result.status).not.toBe(0);
+      expect(result.stdout + result.stderr).toContain("1password connection sources need the macOS login Keychain");
+      expect(fake.calls).toEqual([]);
     });
   });
 });

@@ -10,6 +10,7 @@ import { TokenResolutionError } from "../token-resolution.ts";
 import { type CommandSourceInvocation, type CredentialReadPlan, type OnePasswordRead, createCredentialPreparationScope, readOnePasswordRef } from "./admin-core.ts";
 import { type CredentialLifetime, createCredentialLifetime } from "./credential-cancellation.ts";
 import { type CredentialReadInput, readCredentialSource, runOwnedProvider } from "./credential-source-reader.ts";
+import { APP_LOGIN } from "./onepassword-connection.ts";
 
 // Real processes throughout: the reader's bounds are about what a real
 // provider and its descendants do, so no fake stands in for them.
@@ -47,7 +48,7 @@ function commandRead(executable: string, timeoutMs = 10_000): CredentialReadInpu
 }
 
 function onePasswordRead(executable: string, ref = "op://Private/Item/field", environment: NodeJS.ProcessEnv = env): OnePasswordRead {
-  return { executable, ref, env: environment, timeoutMs: 10_000, quiet: true };
+  return { executable, ref, env: environment, timeoutMs: 10_000, quiet: true, login: APP_LOGIN };
 }
 
 function processGone(pid: number): boolean {

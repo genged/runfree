@@ -181,12 +181,16 @@ import {
   keychainDeleteStep,
   keychainExecutable,
   keychainItemForSource,
+  keychainPlatformAvailable,
   keychainReadArgs,
   keychainReadStep,
   keychainWriteRequest,
 } from "./keychain-login.ts";
 import {
+  APP_LOGIN,
   connectionOpEnv,
+  loginIdentity,
+  type OnePasswordLogin,
   opVaultListArgs,
   opWhoamiArgs,
   parseServiceAccountWhoami,
@@ -1175,7 +1179,20 @@ export type OnePasswordRead = Readonly<{
   env: NodeJS.ProcessEnv;
   timeoutMs: number;
   quiet: boolean;
+  /** How `op` logs in: the desktop app (may ask) or a connection's stored login. */
+  login: OnePasswordLogin;
 }>;
+
+/**
+ * The environment the `op` child runs with. A connection read gets only an
+ * allowlisted environment plus its own login (`connectionOpEnv`): no host
+ * `OP_*` session or account selection reaches it.
+ */
+export function opExecutionEnv(read: OnePasswordRead, token: string | undefined): NodeJS.ProcessEnv {
+  if (read.login.kind === "app") return read.env;
+  if (token === undefined) throw new Error("internal error: a connection read needs its login");
+  return connectionOpEnv(read.env, token);
+}
 
 export const PROVIDER_OUTPUT_MAX_BYTES = 128 * 1024;
 
@@ -1188,7 +1205,8 @@ export function onePasswordDocumentArgs(documentRef: OnePasswordDocumentRef): st
 }
 
 export function announceOnePasswordRead(read: OnePasswordRead): void {
-  if (!read.quiet) runfreeLog("resolving 1Password credential source (Touch ID/passphrase prompt may appear)");
+  // A connection read never asks, so it has no prompt to announce.
+  if (!read.quiet && read.login.kind === "app") runfreeLog("resolving 1Password credential source (Touch ID/passphrase prompt may appear)");
 }
 
 /**
@@ -1231,28 +1249,67 @@ export function onePasswordDocumentStep(read: OnePasswordRead, readExit: Provide
   return readSpawnedOpOutput(documentExit, "op document get returned an empty value");
 }
 
-function onePasswordRead(opPath: string, ref: string, options: { quiet?: boolean } = {}): OnePasswordRead {
-  return { executable: opPath, ref, env: Object.freeze({ ...childEnv() }), timeoutMs: opReadTimeoutMs(), quiet: options.quiet === true };
+function onePasswordRead(opPath: string, ref: string, options: { quiet?: boolean } = {}, login: OnePasswordLogin = APP_LOGIN): OnePasswordRead {
+  return { executable: opPath, ref, env: Object.freeze({ ...childEnv() }), timeoutMs: opReadTimeoutMs(), quiet: options.quiet === true, login };
+}
+
+/** Removes a connection login from `op` stderr before any classifier or message sees it. */
+export function scrubOnePasswordExit(exit: ProviderExit, token: string | undefined): ProviderExit {
+  return token === undefined ? exit : { ...exit, stderr: redactLogin(exit.stderr, token) };
 }
 
 function runOnePasswordReadSync(read: OnePasswordRead): string {
   announceOnePasswordRead(read);
+  // A Keychain failure throws its classified error here: `op` never runs.
+  const token = read.login.kind === "connection" ? readConnectionLoginSync(read.login.sourceName, read.login.keychain) : undefined;
   const spawnOptions = {
     encoding: "utf8" as const,
-    env: read.env,
+    env: opExecutionEnv(read, token),
     maxBuffer: PROVIDER_OUTPUT_MAX_BYTES,
     shell: false,
     timeout: read.timeoutMs,
   };
-  const readExit = providerExitFromSpawnSync(adminSpawnSync(read.executable, onePasswordReadArgs(read), spawnOptions));
+  const readExit = scrubOnePasswordExit(providerExitFromSpawnSync(adminSpawnSync(read.executable, onePasswordReadArgs(read), spawnOptions)), token);
   const step = onePasswordReadStep(read, readExit);
   if (step.kind === "value") return step.value;
-  const documentExit = providerExitFromSpawnSync(adminSpawnSync(read.executable, onePasswordDocumentArgs(step.documentRef), spawnOptions));
+  const documentExit = scrubOnePasswordExit(providerExitFromSpawnSync(adminSpawnSync(read.executable, onePasswordDocumentArgs(step.documentRef), spawnOptions)), token);
   return onePasswordDocumentStep(read, readExit, documentExit);
 }
 
-export function readOnePasswordRef(opPath: string, ref: string, options: { quiet?: boolean } = {}): string {
-  return runOnePasswordReadSync(onePasswordRead(opPath, ref, options));
+export function readOnePasswordRef(opPath: string, ref: string, options: { quiet?: boolean } = {}, login: OnePasswordLogin = APP_LOGIN): string {
+  return runOnePasswordReadSync(onePasswordRead(opPath, ref, options, login));
+}
+
+function viaError(code: string, safeMessage: string): TokenResolutionError {
+  return new TokenResolutionError({ classification: "definitive", sourceKind: "named", code, safeMessage });
+}
+
+export function viaNotConnectionMessage(viaName: string): string {
+  return `${viaName} is not a 1password connection source; --via names a source added with: ${remedy.credentialSourceOnePassword(viaName)}`;
+}
+
+export function viaNotSupportedMessage(sourceName: string, type: string): string {
+  return `${sourceName} is a ${type} source; --via applies to 1password references and jwt or google-service-account sources`;
+}
+
+/**
+ * The login a binding's `via` names. Throws a definitive
+ * `TokenResolutionError` with fixed text before any spawn: an unknown name,
+ * a source that is not a connection, or a host without the macOS Keychain.
+ */
+export function connectionLoginFor(viaName: string, registry: SourceRegistry): OnePasswordLogin {
+  const source = registry[viaName];
+  if (!source) throw viaError("unknown-via", `unknown source: ${viaName}`);
+  if (!isConnectionSource(source)) throw viaError("via-not-connection", viaNotConnectionMessage(viaName));
+  if (!keychainPlatformAvailable(childEnv())) {
+    throw new TokenResolutionError({
+      classification: "definitive",
+      sourceKind: "keychain",
+      code: "keychain-platform",
+      safeMessage: "1password connection sources need the macOS login Keychain",
+    });
+  }
+  return Object.freeze({ kind: "connection", sourceName: viaName, keychain: source.keychain });
 }
 
 export type CommandSourceInvocation = Readonly<{
@@ -1384,13 +1441,14 @@ function jwtPrivateKeyRead(
   ref: SecretRef,
   options: { quiet?: boolean; verbose?: boolean } = {},
   label = "JWT private key",
+  login: OnePasswordLogin = APP_LOGIN,
 ): OnePasswordRead {
   if (ref.source !== "1password") throw new SecretRefReadPrecheckError("unsupported secret reference");
   if (!ref.ref.startsWith("op://")) throw new SecretRefReadPrecheckError("1Password references must start with op://");
   const opPath = resolveHostExecutable("op");
   if (!opPath) throw new SecretRefReadPrecheckError("op CLI not found on sanitized host PATH");
   adminVerbose(options, `reading ${label} from 1Password`);
-  return onePasswordRead(opPath, ref.ref, options);
+  return onePasswordRead(opPath, ref.ref, options, login);
 }
 
 function readSecretRef(ref: SecretRef, options: { quiet?: boolean; verbose?: boolean } = {}): string {
@@ -1615,14 +1673,20 @@ function planStep(build: () => CredentialReadPlan): CredentialReadPlan {
   }
 }
 
-function namedSourceReadPlan(source: NamedSource, options: TokenResolutionOptions & { sourceName?: string }): CredentialReadPlan {
+// `login` is the binding's `via` connection (resolved by the caller), or the
+// app; it selects how a jwt or google-service-account key is read.
+function namedSourceReadPlan(
+  source: NamedSource,
+  options: TokenResolutionOptions & { sourceName?: string },
+  login: OnePasswordLogin = APP_LOGIN,
+): CredentialReadPlan {
   switch (source.type) {
     case "command":
       return planStep(() => ({ kind: "command", invocation: commandSourceInvocation(source) }));
     case "jwt": {
       const cachedKey = cachedJwtSigningKey(source, options);
       if (cachedKey) return { kind: "jwt", source, options, signingKey: { kind: "cached", key: cachedKey } };
-      return planStep(() => ({ kind: "jwt", source, options, signingKey: { kind: "read", read: jwtPrivateKeyRead(source.privateKey, options) } }));
+      return planStep(() => ({ kind: "jwt", source, options, signingKey: { kind: "read", read: jwtPrivateKeyRead(source.privateKey, options, undefined, login) } }));
     }
     case "google-service-account": {
       const cached = cachedGoogleServiceAccountKey(source, options);
@@ -1631,7 +1695,7 @@ function namedSourceReadPlan(source: NamedSource, options: TokenResolutionOption
         kind: "google-service-account",
         source,
         options,
-        signingKey: { kind: "read", read: jwtPrivateKeyRead(source.keyJson, options, "service account key JSON") },
+        signingKey: { kind: "read", read: jwtPrivateKeyRead(source.keyJson, options, "service account key JSON", login) },
       }));
     }
     case "1password":
@@ -1912,8 +1976,11 @@ export function credentialReadPlan(tokenName: string, source: TokenSource, optio
         }),
       };
     }
-    adminVerbose(options, `${tokenName}: reading 1Password source with op CLI`);
-    return { kind: "1password", read: onePasswordRead(opPath, source.ref, options) };
+    return planStep(() => {
+      const login = source.via === undefined ? APP_LOGIN : connectionLoginFor(source.via, options.sourceRegistry ?? loadSourceRegistry());
+      adminVerbose(options, `${tokenName}: reading 1Password source with op CLI${source.via === undefined ? "" : ` through ${source.via}`}`);
+      return { kind: "1password", read: onePasswordRead(opPath, source.ref, options, login) };
+    });
   }
 
   if (source.source === "named") {
@@ -1936,7 +2003,18 @@ export function credentialReadPlan(tokenName: string, source: TokenSource, optio
         }),
       };
     }
-    return namedSourceReadPlan(namedSource, { ...options, sourceName: source.name });
+    let login: OnePasswordLogin = APP_LOGIN;
+    if (source.via !== undefined) {
+      if (namedSource.type === "command") {
+        return { kind: "failure", error: viaError("via-not-supported", viaNotSupportedMessage(source.name, namedSource.type)) };
+      }
+      try {
+        login = connectionLoginFor(source.via, registry);
+      } catch (error) {
+        return { kind: "failure", error };
+      }
+    }
+    return namedSourceReadPlan(namedSource, { ...options, sourceName: source.name }, login);
   }
 
   if (source.source === "cmd") {
@@ -1985,15 +2063,16 @@ function resolveTokenSource(tokenName: string, source: TokenSource, options: Tok
 
 /**
  * Identifies one direct 1Password resolution's context for sharing within a
- * preparation: the resolved provider executable and the exact reference
- * bytes (no alias normalization). The account/context selection — anything
+ * preparation: the resolved provider executable, the exact reference
+ * bytes (no alias normalization), and the login identity (the app, or one
+ * connection's Keychain item; never the login itself). The rest of the account/context selection — anything
  * in the provider's environment, `OP_ACCOUNT`, a service-account token, a
  * Connect host/token — is not part of this key's bytes (nothing is hashed or
  * logged); instead the owning scope binds to one exact environment (see
  * `createCredentialPreparationScope`) and never shares across a difference
  * in it, so two different accounts can never collide on the same key.
  */
-export type ProviderReadKey = Readonly<{ executable: string; ref: string }>;
+export type ProviderReadKey = Readonly<{ executable: string; ref: string; login: string }>;
 
 /** One successful direct 1Password read, kept only long enough to share it with later destinations in the same preparation pass. */
 export type SuccessfulProviderRead = Readonly<{ value: string; resolvedAt: number }>;
@@ -2001,7 +2080,7 @@ export type SuccessfulProviderRead = Readonly<{ value: string; resolvedAt: numbe
 function providerReadKeyString(key: ProviderReadKey): string {
   // A NUL byte cannot appear in a real executable path or an op:// reference,
   // so the pair joins into one exact, collision-free string key.
-  return `${key.executable}\u0000${key.ref}`;
+  return `${key.executable}\u0000${key.ref}\u0000${key.login}`;
 }
 
 /**
@@ -2053,7 +2132,9 @@ export function createCredentialPreparationScope(): CredentialPreparationScope {
   function sharedKeyFor(read: OnePasswordRead): string | undefined {
     if (boundEnvironment === undefined) boundEnvironment = read.env;
     else if (!sameProviderEnvironment(boundEnvironment, read.env)) return undefined;
-    return providerReadKeyString({ executable: read.executable, ref: read.ref });
+    // An app read and a connection read of one reference are different
+    // logins, so they never share a value.
+    return providerReadKeyString({ executable: read.executable, ref: read.ref, login: loginIdentity(read.login) });
   }
   return Object.freeze({
     readSync(plan: CredentialReadPlan): string {
