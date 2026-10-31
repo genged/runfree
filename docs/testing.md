@@ -24,7 +24,9 @@ Linux, set `TEST_RUNTIME_BACKEND=docker-desktop`. The admission tranches check
 the label against the daemon's own identity and fail when they differ. Any
 other value leaves the live projects unregistered. The packaged live lane
 (`make test-cli-e2e-live`) accepts the same two labels. Bare `vitest run`
-and `pnpm test` never select the live project.
+and `pnpm test` never select the live project. The live fixture and tranches spawn the
+Bun-prebuilt CLI and runner bundles from `tests/support/prebuilt-entry.ts`, and
+fall back to `tsx` when Bun is unavailable.
 
 `make test-release` is the pre-tag gate for a release commit. It runs what the
 Test workflow runs on that commit: static checks, unit tests, template

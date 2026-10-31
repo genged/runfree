@@ -32,6 +32,13 @@ change the Bun version, edit `.bun-version`; CI reads the same file.
 
 Unit tests and static checks do not need Docker.
 
+To try this checkout's CLI without touching your installed Runfree, run
+`scripts/dev-runfree.sh [--state-root DIR] <runfree args>`. It points the CLI at
+an isolated XDG data, state, and config root, so a development `up` never
+writes into the installed Runfree's state. It does not isolate Docker: the
+Compose project name comes from the project path alone, so use a scratch
+`--workspace`.
+
 ## Before you open a pull request
 
 ```bash
@@ -119,6 +126,21 @@ static gate.
 The same applies to new CI actions, scanners, and recording tools. Actions are
 pinned to commit SHAs, and an unpinned reference fails
 `scripts/release-workflow.test.ts`.
+
+A new language is the higher bar: it brings its own toolchain, build
+reproducibility, cross-compilation, and release pinning, and each becomes
+permanent maintenance.
+
+`pnpm run update:agent-tools -- [all|claude|codex|pi@<version>]` updates the
+embedded Claude, Codex, and Pi CLI pins and regenerates runtime assets. It
+first checks that the new Claude and Pi accept `--session-id` the way launch
+and resume assume (`scripts/agent-session-id-contract.ts`), and that each
+tool's headless argv, stdin prompt, and event stream match `runfree run`
+(`scripts/agent-headless-contract.ts`). The host only downloads the locked
+tools with `--ignore-scripts`; the rebuild and probes run in a pinned `node:22`
+container with no network. It needs a Docker daemon, and a failed check
+restores the previous lockfile. `--no-contract` skips the check;
+`make test-runtime-core` runs the same check on the built agent image.
 
 ## Pull request scope
 

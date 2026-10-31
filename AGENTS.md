@@ -22,13 +22,7 @@ project policy lives under `.runfree/`.
   with the source map below, these are the canonical project-owned context for
   current security reviews; shared skills must discover and follow them rather
   than copy Runfree architecture into skill references.
-- Maintainer-only implementation plans, draft specs, research notes, stack
-  notes, todo tracking, and implementation lessons may exist under an ignored
-  local `local/` directory in this clone; read it before large architectural
-  changes. Do not add public docs that require `local/` to exist.
-- Check the maintainer todo (`local/todo/INDEX.md`, when `local/` exists) and
-  recent commits before assuming a design is finished. There is no public
-  TODO file.
+- Check recent commits before assuming a design is finished.
 - Generation families are defined in `docs/architecture.md` ("Generation
   Families"); name the family (effective policy generation vs control plane
   generation), never the bare phrase "control generation".
@@ -45,12 +39,12 @@ project policy lives under `.runfree/`.
 | Interrupted session recovery | `packages/cli/src/runtime/recovery.ts`, `runtime/resume-selection.ts`, `runtime/terminal-identity.ts`, `runtime/codex-rollouts.ts`, `runtime/session-admission-resume.ts`, `packages/cli/src/commands/resume.ts`, `commands/resume-prompt.ts` | Host records, offline inventory, terminal matching, per-conversation claims and consumption, the bounded Codex time match, and the `runfree resume` prompt. Agent-written registry and rollout files are hostile input. See `docs/architecture.md` and `docs/security.md`. |
 | Headless runs | `packages/cli/src/commands/run.ts`, `packages/cli/src/runtime/headless-*.ts`, `packages/cli/src/terminal-mode.ts` | `runfree run`: run lock, prompt copy, write-posture preflight, output capture and outcome, host-only run record. The proxy denies `ask` writes from headless sessions. See `docs/cli.md` "Headless runs". |
 | Project custom agent images | `packages/cli/src/agent-image.ts`, `.runfree/image/Dockerfile` | Project Dockerfiles extend `RUNFREE_BASE_IMAGE`; full image overrides are not supported. |
-| Embedded runtime assets | `packages/agent-runtime/agent/`, `packages/proxy/src/`, `dist/runtime/` | `pnpm build:runtime` creates `dist/runtime`, then assets are materialized into XDG data state by `packages/cli/src/assets.ts`. The agent image's session entry is `packages/agent-runtime/agent/session-entry.sh`; its readiness probe is TypeScript at `packages/agent-runtime/src/session-ready-probe.cts`, compiled by the same `tsc -b` step as the proxy into `dist/runtime/agent/session-ready-probe.cjs`. The probe embeds the readiness request bytes, pinned to the contract by `scripts/session-entry.test.ts`. |
+| Embedded runtime assets | `packages/agent-runtime/agent/`, `packages/proxy/src/`, `dist/runtime/` | `pnpm build:runtime` creates `dist/runtime`, then assets are materialized into XDG data state by `packages/cli/src/assets.ts`. The agent image's session entry is `packages/agent-runtime/agent/session-entry.sh`; its readiness probe is `packages/agent-runtime/src/session-ready-probe.cts`, pinned to the contract by `scripts/session-entry.test.ts`. |
 | Proxy policy and credential injection | `packages/runtime-contracts/src/{desired-network-policy,network-policy}.ts`, `packages/runtime-contracts/src/oauth-mediation-policy.ts`, `packages/proxy/src/policy.ts`, `packages/proxy/src/oauth-mediation.ts`, `packages/proxy/src/oauth-grant-shape.ts`, `packages/cli/src/runtime/mcp-oauth-{claims,projection}.ts`, `packages/proxy/src/server.ts` | HTTPS/WSS allowlisting, request-shape rules, header stripping, proxy-only token reads, and OAuth handle mediation. `host-rule-owner.ts` decides which service owns a host's request rule; `mcp-oauth-claims`/`-projection` settle which MCP server claims each OAuth endpoint, and `oauth-grant-shape.ts` detects unmediated grant and registration requests. Denial feedback lives in `packages/proxy/src/denial.ts`; audit mode in `packages/proxy/src/audit.ts`. |
 | Admin policy/token commands | `packages/cli/src/commands/admin/`, `packages/cli/src/admin/admin-core.ts`, `packages/cli/src/admin/{domain,allow,token,source,service}-policy.ts`, `packages/cli/src/admin/{mcp-admin,diagnostics}.ts`, `packages/cli/src/admin/google-service-account.ts`, `packages/cli/src/control/host-rule-owner.ts`, `scripts/services.ts`, `scripts/domain-diagnostics.ts` | The yargs modules under `commands/admin/` build typed intents; enforcement lives in the per-family `*-policy.ts`/`mcp-admin`/`diagnostics` modules over the shared `admin-core.ts` base (ambient admin state, policy/token/source stores, proxy runtime, token sync, `reloadProxy`). `admin/options.ts` is a thin re-export barrel. `scripts/services.ts` is the unified service registry (host bundles ± static or OAuth credential mode). |
 | Host services | `packages/cli/src/commands/admin/host-service.ts`, `packages/cli/src/control/host-service-mutation.ts`, `packages/cli/src/host-service-registry.ts`, `packages/proxy/src/host-service-tunnel.ts`, `packages/proxy/src/firewall/host-service-gateway.ts`, `packages/agent-runtime/src/host-service-relay.cts` | CLI command and policy mutation, the registry, the proxy tunnel and firewall gateway, and the agent-side relay. |
 | Safe host project writes | `packages/cli/src/safe-fs.ts` | Use these helpers for writes under project-controlled paths such as `.runfree/`. |
-| Live runtime proof | `tests/runtime/live/*.live.test.ts` (Vitest `runtime-live` project), shared `tests/runtime/live/*fixture*.ts` | Per-session live Docker proof: topology/caps, egress containment, CONNECT guard, request-shape, audit SSRF + teardown, allowlist lifecycle, and session admission. Run the whole suite with `make test-runtime`; one tranche as a per-commit Docker smoke with `make test-runtime-smoke`; the non-admission tranches alone with `make test-runtime-live`. The fixture and tranches spawn the Bun-prebuilt CLI and runner bundles from `tests/support/prebuilt-entry.ts` (tsx fallback without Bun). |
+| Live runtime proof | `tests/runtime/live/*.live.test.ts` (Vitest `runtime-live` project), shared `tests/runtime/live/*fixture*.ts` | Per-session live Docker proof: topology/caps, egress containment, CONNECT guard, request-shape, audit SSRF + teardown, allowlist lifecycle, and session admission. Targets and what each layer proves: `docs/testing.md`. |
 | Release packaging | `scripts/build-bin.ts`, `scripts/generate-assets.ts`, `scripts/package-homebrew-artifacts.sh`, `scripts/install.sh`, `bunw`, `.bun-version` | Bun compiles release binaries; every Bun call goes through `./bunw`, which runs the version in `.bun-version` (CI's setup-bun reads the same file); generated assets are embedded before packaging; public release artifacts are currently macOS-only. |
 | Gate completeness | `scripts/check-test-inventory.ts`, `Makefile` `test-static` | Run by `make test-static`. Compares what `vitest list --filesOnly` would load against the test files git tracks, and checks that every Makefile test filter still names a real file — an unmatched Vitest filter is silently green. `test-static` discovers scripts to syntax-check from `git ls-files` rather than a list. |
 
@@ -76,23 +70,13 @@ project policy lives under `.runfree/`.
 - `pnpm run generate:assets` regenerates
   `packages/cli/src/embedded-assets.generated.ts` from `dist/runtime/**`.
 - `pnpm run update:agent-tools -- [all|claude|codex|pi@<version>]` updates the
-  embedded Claude/Codex/Pi CLI pins and regenerates runtime assets. It first
-  checks that the new Claude and Pi accept `--session-id` the way launch and
-  resume assume (`scripts/agent-session-id-contract.ts`), and that each tool's
-  headless argv, stdin prompt, and event stream match `runfree run`
-  (`scripts/agent-headless-contract.ts`): the host only
-  downloads the locked tools with `--ignore-scripts`, and the rebuild and
-  probes run in a pinned `node:22` container with no network. This needs a
-  reachable Docker daemon; a failed check restores the previous lockfile.
-  `--no-contract` skips the check, and `make test-runtime-core` runs the same
-  check on the built agent image.
+  embedded Claude/Codex/Pi CLI pins and checks their launch contracts; it needs
+  a Docker daemon. See `CONTRIBUTING.md` "Dependencies and tooling".
 - `pnpm run build:bin` compiles `dist/runfree`; release archives use
   `scripts/package-homebrew-artifacts.sh`.
 - `scripts/dev-runfree.sh [--state-root DIR] <runfree args>` runs this
-  checkout's CLI against an isolated XDG data/state/config root, so a
-  development `up` never writes into the installed runfree's state. It does not
-  isolate Docker: the Compose project name is derived from the project path
-  alone, so development runs need a scratch `--workspace`.
+  checkout's CLI against isolated XDG state; it needs a scratch `--workspace`.
+  See `CONTRIBUTING.md` "Setup".
 
 ## Project Rules
 
@@ -101,13 +85,10 @@ project policy lives under `.runfree/`.
   with `tsx` for scripts and compiles the proxy only for generated runtime
   packaging; `tsc --noEmit` is the normal static gate.
 - Ask before adding a dependency, and ask before introducing a new language or
-  toolchain. Both are the user's decision, not an implementation detail to be
-  settled while solving something else. A new language is the higher bar: it
-  brings its own toolchain, build reproducibility story, cross-compilation and
-  release pinning, and every one of those becomes permanent maintenance. When a
-  dependency may be warranted, search for relevant, useful, and trusted options
-  and present a choice rather than picking one. Prefer solving the problem with
-  TypeScript and the Node already present in the agent and proxy images.
+  toolchain; a new language is the higher bar. When a dependency may be
+  warranted, search for trusted options and present a choice rather than
+  picking one. Prefer TypeScript and the Node already in the agent and proxy
+  images.
 - Do not edit `packages/cli/src/embedded-assets.generated.ts` by hand. Change
   canonical runtime/package sources, run `pnpm run build:runtime`, then run
   `pnpm run generate:assets`.
