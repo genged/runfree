@@ -5,10 +5,12 @@ import {
   createRuntimeDocker,
   containerMissingNetwork,
   filterValues,
+  hostServiceRelayMode,
   lastObservedDockerDaemonIdentity,
   removeComposeProjectLeftoverVolumes,
   serviceContainerId,
 } from "./docker.ts";
+import type { detectDockerBackend } from "../docker-backend.ts";
 import { inspectReusableManagedImage } from "./image-identity.ts";
 import type { CaptureResult, RuntimeContext, RuntimeIO } from "./types.ts";
 
@@ -379,6 +381,41 @@ test("the availability check refuses a docker info that exited 0 with server err
   expect(lastObservedDockerDaemonIdentity()).toBeUndefined();
 
   expect(() => createRuntimeDocker(context(), dockerInfoIO("", 1)).assertAvailable()).toThrow("docker daemon not running");
+});
+
+// Linux commit 4 (C6): the relay mode keys only on the backend. No platform
+// check sits in front of detection, so an Engine classification yields the
+// relay whatever `process.platform` says, and Desktop on Linux yields none.
+// The one detection reuses the availability check's `docker info` answer.
+test.each([
+  ["darwin", "docker-engine", "engine-relay"],
+  ["win32", "docker-engine", "engine-relay"],
+  ["linux", "docker-desktop", "none"],
+  ["linux", "docker-engine", "engine-relay"],
+  ["darwin", "docker-desktop", "none"],
+] as const)("on %s a backend classified as %s yields relay mode %s", (platform, kind, mode) => {
+  const descriptor = Object.getOwnPropertyDescriptor(process, "platform") as PropertyDescriptor;
+  Object.defineProperty(process, "platform", { value: platform });
+  try {
+    const infoStdout = JSON.stringify(DAEMON_INFO);
+    const io = dockerInfoIO(infoStdout);
+    createRuntimeDocker(context(), io).assertAvailable();
+    const detections: Array<Parameters<typeof detectDockerBackend>[2]> = [];
+    const detect: typeof detectDockerBackend = (_context, _io, options) => {
+      detections.push(options);
+      return { kind };
+    };
+    expect(hostServiceRelayMode(context(), io, detect)).toBe(mode);
+    expect(detections).toEqual([{ infoStdout }]);
+    // Only the availability check's own `docker info` ran.
+    expect(io.calls).toEqual([["info", "--format", "{{json .}}"]]);
+  } finally {
+    Object.defineProperty(process, "platform", descriptor);
+  }
+});
+
+test("an unsupported backend runs no relay", () => {
+  expect(hostServiceRelayMode(context(), dockerInfoIO("{}"), () => ({ kind: "unsupported", reason: "x" }))).toBe("none");
 });
 
 test("an unparseable docker info passes availability but yields no daemon identity", () => {

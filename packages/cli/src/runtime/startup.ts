@@ -26,6 +26,8 @@ import {
 } from "../control/effective.ts";
 import { validateNetworkPolicy } from "@runfree/runtime-contracts/network-policy";
 import { hostServiceOwnerWarningsFromSnapshot, probeHostListeners } from "../host-listener-snapshot.ts";
+import { readDockerPublishedPorts } from "../host-service-port-owner.ts";
+import type { HostServiceRelayMode } from "../docker-backend.ts";
 import { projectHasRegisteredHostServicePorts, recordedHostServiceOwners, recordProjectHostServicePorts } from "../host-service-registry.ts";
 import type { EffectiveHostServices } from "./probes.ts";
 import {
@@ -859,10 +861,13 @@ export function validateRuntimeTopologyOrRemoveInvalid(
      * cannot be skipped by omitting it.
      */
     effectiveHostServices: EffectiveHostServices;
+    /** The run's one backend decision (`hostServiceRelayMode`). */
+    hostServiceRelay: HostServiceRelayMode;
   },
 ): { denyByDefaultObservation?: DenyByDefaultObservationV1; status: number; failureKind?: RuntimeFailureKind } {
   let boundaryViolated = false;
   const validate = () => validateRuntimeTopologyWithProof(plan, io, {
+    hostServiceRelay: options.hostServiceRelay,
     onBoundaryViolation: () => { boundaryViolated = true; },
     progress: options.verbose === true,
     verbose: options.verbose,
@@ -1124,7 +1129,9 @@ async function prepareRuntimeForTokenSyncOrRemoveInvalid(
     containmentIO?: RuntimeIO;
     // The launch's host Git probe result, when this runs inside a launch.
     hostGit?: HostGitRelativeWorktreesCapability;
-  } = {},
+    /** The run's one backend decision (`hostServiceRelayMode`), for the topology proof. */
+    hostServiceRelay: HostServiceRelayMode;
+  },
 ): Promise<RuntimeTokenSyncPreparation> {
   const timings = createRuntimeTimings(context.env);
   const project = composeProjectName(context.projectRoot);
@@ -1288,8 +1295,9 @@ async function prepareRuntimeForTokenSyncOrRemoveInvalid(
  *
  * F29: the live-owner check for the warning loop is one bounded listener
  * observation (`probeHostListeners`) regardless of how many host services
- * are approved, not one `lsof` call per service; zero approved services
- * still makes zero calls. `admitHostServicePort` (`host-service add`) and
+ * are approved, not one `lsof` call per service, plus one `docker ps` read
+ * (the published-port check on every backend); zero approved services
+ * still makes zero calls of either. `admitHostServicePort` (`host-service add`) and
  * `runfree status` are unchanged: they keep probing one port at a time.
  *
  * R15: a project that never used host services must not take the
@@ -1305,7 +1313,8 @@ async function refreshHostServicesAtLaunch(context: RuntimeContext, io: RuntimeI
     if (Object.keys(hostServices).length > 0) {
       const recorded = recordedHostServiceOwners(env, projectId);
       const snapshot = probeHostListeners(context, io);
-      for (const line of hostServiceOwnerWarningsFromSnapshot(snapshot, hostServices, recorded)) warn(line);
+      const published = readDockerPublishedPorts(context, io);
+      for (const line of hostServiceOwnerWarningsFromSnapshot(snapshot, published, hostServices, recorded)) warn(line);
     }
     const ports = Array.from(new Set(Object.values(hostServices).map((entry) => entry.port))).sort((left, right) => left - right);
     if (ports.length > 0 || projectHasRegisteredHostServicePorts(env, projectId)) {
@@ -1465,6 +1474,10 @@ export async function startRuntime(
 
     timings.time("startup:docker-available-prepared", ensureDockerAvailable);
     const startupDaemonIdentity = lastObservedDockerDaemonIdentity();
+    // The run's one backend decision, from the availability check's `docker
+    // info` answer: Compose `up`, the relay sync, the full topology proof, and
+    // the warm proof all take this value and never detect on their own.
+    const hostServiceRelay = timings.time("startup:docker-backend", () => hostServiceRelayMode(existingContext, io));
     // Capture the proxy container id before any lifecycle change. The proxy
     // loads the on-disk policy at boot, so a changed id afterwards means it
     // already reflects the merged policy and a follow-up policy reload is moot.
@@ -1674,7 +1687,7 @@ export async function startRuntime(
         volumeLogicalNames: composeManagedSessionVolumeLogicalNames(activeContext),
         gitLayout: serializeGitLayoutPlan(activePlan.gitLayout),
         effectiveHostServices,
-        hostServiceRelay: hostServiceRelayMode(activeContext, io),
+        hostServiceRelay,
       };
     };
     // Why this start may not even ask the warm proof, or undefined when it may.
@@ -1813,7 +1826,7 @@ export async function startRuntime(
         }
         const full = await timings.timeAsync(
           "runtime-validation",
-          () => prepareRuntimeForTokenSyncOrRemoveInvalid(activePlan, activeContext, io, adapters.docker, { verbose, lifecycleLock: heldLifecycleLock, containmentIO, hostGit }),
+          () => prepareRuntimeForTokenSyncOrRemoveInvalid(activePlan, activeContext, io, adapters.docker, { verbose, lifecycleLock: heldLifecycleLock, containmentIO, hostGit, hostServiceRelay }),
         );
         if (full.status !== 0) return result(full.status, false, activeContext);
         validation = full;
@@ -2092,7 +2105,7 @@ export async function startRuntime(
             activeContext,
             rebindIO,
             rebindDocker,
-            { verbose, lifecycleLock: heldLifecycleLock, readOnly: true, containmentIO, hostGit },
+            { verbose, lifecycleLock: heldLifecycleLock, readOnly: true, containmentIO, hostGit, hostServiceRelay },
           );
           if (candidateValidation.status !== 0
             || !candidateValidation.proof
@@ -2118,7 +2131,7 @@ export async function startRuntime(
             activeContext,
             rebindIO,
             rebindDocker,
-            { verbose, lifecycleLock: heldLifecycleLock, readOnly: true, containmentIO, hostGit },
+            { verbose, lifecycleLock: heldLifecycleLock, readOnly: true, containmentIO, hostGit, hostServiceRelay },
           );
           if (candidateValidation.status !== 0
             || !candidateValidation.proof
@@ -2185,6 +2198,7 @@ export async function startRuntime(
                 noDeps: true,
                 removeOrphans: false,
                 services: ["proxy"],
+                hostServiceRelay,
                 creationMarker: { transactionId: transaction.transactionId, attempt: transaction.recovery?.candidateAttempt ?? 0 },
               });
               if (proxyStatus !== 0) throw new RuntimeObservationError({ kind: "observation-unavailable", subject: "proxy",
@@ -2194,7 +2208,7 @@ export async function startRuntime(
               // no-op elsewhere. A failed sync leaves the old relay, which the
               // proof then refuses (and `runfree rebuild` recreates).
               heldLifecycleLock.assertHeld();
-              const relayStatus = rebindDocker.composeSyncHostRelay(project);
+              const relayStatus = rebindDocker.composeSyncHostRelay(project, hostServiceRelay);
               if (relayStatus !== 0) warn(`the host-service relay could not be updated with the proxy (docker compose exited ${relayStatus})`);
               warn("proxy replacement reset pending approvals, temporary grants, remembered denials, and audit capture; interrupted requests are not replayed");
               return await proveCandidate();
@@ -2333,7 +2347,7 @@ export async function startRuntime(
     }
     reportRuntimeProgress("starting Docker Compose runtime", verbose);
     io.admitPreparedTokenSources?.(activeContext);
-    const status = timings.time("compose-up", () => adapters.docker.composeUp(project, { forceRecreate: removeExisting }));
+    const status = timings.time("compose-up", () => adapters.docker.composeUp(project, { forceRecreate: removeExisting, hostServiceRelay }));
     if (status !== 0) {
       // Compose already printed the daemon error. Without a next command a
       // recoverable runtime (a stale network id, a half-removed container)
@@ -2477,7 +2491,10 @@ export async function restoreSameProxySessionAdmission(input: {
   }
   const context = runtimeContextFromActivePlan(plan);
   const { docker } = createRuntimeAdapters(context, io);
-  if (!input.validation) {
+  let validation: RuntimeTokenSyncPreparation;
+  if (input.validation) {
+    validation = input.validation;
+  } else {
     // The validation below runs ephemeral helpers, so this lock span needs the
     // same residue sweep `up` runs before its first helper (review C4).
     if (!input.containmentIO) throw new Error(EPHEMERAL_HELPER_FENCE_REQUIRED);
@@ -2487,9 +2504,12 @@ export async function restoreSameProxySessionAdmission(input: {
       stateDir: plan.paths.stateDir,
       dockerEnv: dockerClientEnvOptions(context).env,
     }, plan.projectId);
+    // `runtime reload-policy --force` reaches the topology proof only here,
+    // outside `startRuntime`: this is that run's one backend decision.
+    const hostServiceRelay = hostServiceRelayMode(context, io);
+    validation = await prepareRuntimeForTokenSyncOrRemoveInvalid(plan, context, io, docker,
+      { lifecycleLock, containmentIO: input.containmentIO, hostServiceRelay });
   }
-  const validation = input.validation ?? await prepareRuntimeForTokenSyncOrRemoveInvalid(plan, context, io, docker,
-    { lifecycleLock, containmentIO: input.containmentIO });
   if (validation.status || !validation.proof || !validation.securityProof) {
     throw new Error("proxy restart validation failed; restore the reported runtime inputs and retry runtime reload-policy --force");
   }

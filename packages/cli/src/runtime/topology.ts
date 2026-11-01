@@ -3,7 +3,7 @@ import { REBIND_ATTEMPT_LABEL, REBIND_TRANSACTION_LABEL } from "./container-inve
 import { resolveRuntimeNetwork } from "../network.ts";
 import { runfreeLog } from "../warnings.ts";
 import { runDockerExecRoot } from "./attach.ts";
-import { dockerClientEnvOptions, hostServiceRelayMode, parseDockerJson, serviceContainerId } from "./docker.ts";
+import { dockerClientEnvOptions, parseDockerJson, serviceContainerId } from "./docker.ts";
 import { createDockerClient } from "./docker-client.ts";
 import { composeProjectName, projectHash } from "./env.ts";
 import {
@@ -80,11 +80,11 @@ export type RuntimeTopologyOptions = {
    */
   effectiveHostServices?: EffectiveHostServices;
   /**
-   * Whether the Engine host-service relay applies (`docker-backend.ts`).
-   * Startup passes the mode it started Compose with; without it the
-   * validator detects it the same way.
+   * Whether the Engine host-service relay applies (`docker-backend.ts`):
+   * the run's one backend decision, the same value Compose `up` used.
+   * Required: the validator never detects the backend on its own.
    */
-  hostServiceRelay?: HostServiceRelayMode;
+  hostServiceRelay: HostServiceRelayMode;
 };
 
 /** The one `ExtraHosts` entry the proxy service carries (compose.yaml, literal). */
@@ -419,12 +419,12 @@ function topologyContext(input: RuntimeContext | ActiveRuntimePlan): RuntimeCont
   };
 }
 
-export function validateRuntimeTopology(plan: ActiveRuntimePlan, io: RuntimeIO, options?: RuntimeTopologyOptions): RuntimeTopologyIssue[];
-export function validateRuntimeTopology(context: RuntimeContext, io: RuntimeIO, options?: RuntimeTopologyOptions): RuntimeTopologyIssue[];
+export function validateRuntimeTopology(plan: ActiveRuntimePlan, io: RuntimeIO, options: RuntimeTopologyOptions): RuntimeTopologyIssue[];
+export function validateRuntimeTopology(context: RuntimeContext, io: RuntimeIO, options: RuntimeTopologyOptions): RuntimeTopologyIssue[];
 export function validateRuntimeTopology(
   input: RuntimeContext | ActiveRuntimePlan,
   io: RuntimeIO,
-  options: RuntimeTopologyOptions = {},
+  options: RuntimeTopologyOptions,
 ): RuntimeTopologyIssue[] {
   return validateTopology(input, io, options).issues;
 }
@@ -498,7 +498,7 @@ function validateTopology(
   // path issues no Docker call: its caller names the mode and hands over the
   // lookup and inspection from its batch.
   {
-    const relayMode = options.hostServiceRelay ?? (warm ? "none" : hostServiceRelayMode(context, io));
+    const relayMode = options.hostServiceRelay;
     let ids: readonly string[] | undefined;
     let relay: DockerContainerInspect | undefined;
     if (warm) {

@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
 import {
   admitHostServicePort,
+  hostServiceAdmissionEnvironment,
   hostServiceOwnerWarnings,
   parseDockerPublishedPorts,
   parseUnprivilegedPortStart,
@@ -17,20 +18,26 @@ import type { HostServicesJson } from "@runfree/runtime-contracts/host-services"
 type CaptureCall = { command: string; args: string[]; options?: childProcess.SpawnSyncOptions };
 
 // Admission first asks which Docker backend it talks to: these macOS cases
-// run against Docker Desktop. `calls` records the listener (lsof) calls only.
+// run against Docker Desktop. `calls` records the listener (lsof) calls only;
+// `docker ps` (the published-port check) answers `dockerPs`, by default no
+// published port.
 const DESKTOP_INFO: CaptureResult = {
   status: 0,
   stdout: JSON.stringify({ OperatingSystem: "Docker Desktop", Name: "docker-desktop", KernelVersion: "6.10.14-linuxkit" }),
   stderr: "",
 };
 const DESKTOP_CONTEXT: CaptureResult = { status: 0, stdout: "\"unix:///Users/me/.docker/run/docker.sock\"\n", stderr: "" };
+const NO_PUBLISHED_PORTS: CaptureResult = { status: 0, stdout: "", stderr: "" };
 
-function fakeIo(result: CaptureResult): { io: RuntimeIO; calls: CaptureCall[] } {
+const isDockerPs = (command: string, args: readonly string[]): boolean => command === "docker" && args[0] === "ps";
+
+function fakeIo(result: CaptureResult, dockerPs: CaptureResult = NO_PUBLISHED_PORTS): { io: RuntimeIO; calls: CaptureCall[] } {
   const calls: CaptureCall[] = [];
   const io: RuntimeIO = {
     capture: vi.fn((command: string, args: string[], options?: childProcess.SpawnSyncOptions) => {
       if (command === "docker" && args[0] === "info") return DESKTOP_INFO;
       if (command === "docker" && args[0] === "context") return DESKTOP_CONTEXT;
+      if (isDockerPs(command, args)) return dockerPs;
       calls.push({ command, args, options });
       return result;
     }),
@@ -42,10 +49,11 @@ function fakeIo(result: CaptureResult): { io: RuntimeIO; calls: CaptureCall[] } 
   return { io, calls };
 }
 
-/** Routes each lsof call to the result for the `-iTCP:<port>` it probed. */
-function fakeIoByPort(results: Readonly<Record<number, CaptureResult>>): RuntimeIO {
+/** Routes each lsof call to the result for the `-iTCP:<port>` it probed; `docker ps` answers `dockerPs`. */
+function fakeIoByPort(results: Readonly<Record<number, CaptureResult>>, dockerPs: CaptureResult = NO_PUBLISHED_PORTS): RuntimeIO {
   return {
-    capture: vi.fn((_command: string, args: string[]) => {
+    capture: vi.fn((command: string, args: string[]) => {
+      if (isDockerPs(command, args)) return dockerPs;
       const portArg = args.find((arg) => arg.startsWith("-iTCP:"));
       const port = Number(portArg?.slice("-iTCP:".length));
       return results[port] ?? { status: 1, stdout: "", stderr: "" };
@@ -353,6 +361,61 @@ describe("hostServiceOwnerWarnings", () => {
       "host service zed (127.0.0.1:10883): no listener",
     ]);
   });
+
+  // Regression (Linux commit 4, C1): on Engine a container that publishes the
+  // approved port after `add` holds it through root's docker-proxy, which this
+  // user's listener check sees as no visible listener (or, with a visible
+  // owner, as an ordinary listener). `docker ps` names it; the listener check
+  // alone never did. The status path reads no backend, so Desktop is the same.
+  test.each([
+    ["no visible listener", { status: 1, stdout: "", stderr: "" }, "host service idb (127.0.0.1:10882): no listener"],
+    ["a visible listener", { status: 0, stdout: "p4242\ncidb_companion\nf7\nn127.0.0.1:10882\n", stderr: "" }, undefined],
+    ["a Docker Desktop listener", { status: 0, stdout: "p77\nccom.docker.backend\nf9\nn127.0.0.1:10882\n", stderr: "" },
+      "host service idb (127.0.0.1:10882): owned by Docker Desktop"],
+  ])("a port docker ps shows published warns as published by a container, beside %s", (_label, lsof, ownerLine) => {
+    const io = fakeIoByPort({ 10882: lsof }, { status: 0, stdout: "0.0.0.0:10882->80/tcp, [::]:10882->80/tcp\n", stderr: "" });
+
+    expect(hostServiceOwnerWarnings(context, io, idb, new Map([[10882, "idb_companion"]]))).toEqual([
+      "host service idb (127.0.0.1:10882): published by a container (docker ps)",
+      ...(ownerLine ? [ownerLine] : []),
+    ]);
+  });
+
+  test("a failed docker ps is one warning naming the problem, never a throw, and the owner checks still run", () => {
+    const io = fakeIoByPort({ 10882: { status: 1, stdout: "", stderr: "" } }, { status: 1, stdout: "", stderr: "daemon down" });
+
+    expect(hostServiceOwnerWarnings(context, io, idb, new Map())).toEqual([
+      "host services: container-published ports were not checked: docker ps exited with status 1",
+      "host service idb (127.0.0.1:10882): no listener",
+    ]);
+  });
+
+  test("an unreadable docker ps answer and a throwing docker client both warn once", () => {
+    const unreadable = fakeIoByPort({}, { status: 0, stdout: "0.0.0.0:abc->80/tcp\n", stderr: "" });
+    expect(hostServiceOwnerWarnings(context, unreadable, idb, new Map())[0])
+      .toMatch(/^host services: container-published ports were not checked: docker ps reported an unreadable port binding/u);
+    const throwing: RuntimeIO = {
+      ...fakeIoByPort({}),
+      capture: vi.fn((command: string, args: string[]) => {
+        if (isDockerPs(command, args)) throw new Error("spawn docker ENOENT");
+        return { status: 1, stdout: "", stderr: "" };
+      }),
+    };
+    expect(hostServiceOwnerWarnings(context, throwing, idb, new Map())[0])
+      .toBe("host services: container-published ports were not checked: docker ps failed: spawn docker ENOENT");
+  });
+
+  test("one docker ps read per status, however many services are approved (C4)", () => {
+    const services: HostServicesJson = Object.fromEntries(Array.from({ length: 5 }, (_unused, index) => [
+      `svc${index}`, { target: "host-loopback" as const, port: 10882 + index },
+    ]));
+    const io = fakeIoByPort({});
+
+    hostServiceOwnerWarnings(context, io, services, new Map());
+    const dockerPsCalls = vi.mocked(io.capture).mock.calls.filter(([command, args]) => isDockerPs(command, args));
+    expect(dockerPsCalls).toHaveLength(1);
+    expect(dockerPsCalls[0]?.[1]).toEqual(["ps", "--no-trunc", "--format", "{{.Ports}}"]);
+  });
 });
 
 describe("admitHostServicePort backend refusals (C5)", () => {
@@ -437,20 +500,43 @@ describe("admitHostServicePort backend refusals (C5)", () => {
       .toEqual({ ok: false, reason: "could not read it" });
   });
 
-  test("Engine refuses a docker-published port before probing", () => {
+  // `docker ps` is the published-port check on every supported backend (C2).
+  // A visible listener answers the port, so only `docker ps` can refuse it.
+  test.each([["docker-engine"], ["docker-desktop"]] as const)("%s refuses a docker-published port before probing", (kind) => {
     const { io, calls } = fakeIo(visible);
-    expect(admitHostServicePort(context, io, 10882, "darwin", engine({ dockerPublishedPorts: () => new Set([10882]) })))
-      .toEqual({ ok: false, reason: "127.0.0.1:10882 is published by a container (docker ps)" });
+    expect(admitHostServicePort(context, io, 10882, "darwin", engine({
+      backend: () => ({ kind }),
+      dockerPublishedPorts: () => new Set([10882]),
+    }))).toEqual({ ok: false, reason: "127.0.0.1:10882 is published by a container (docker ps)" });
     expect(calls).toHaveLength(0);
   });
 
-  test("Engine refuses when docker ps cannot be read", () => {
-    const { io } = fakeIo(visible);
-    expect(admitHostServicePort(context, io, 10882, "darwin", engine({ dockerPublishedPorts: () => ({ error: "docker ps exited with status 1" }) })))
-      .toEqual({ ok: false, reason: "docker ps exited with status 1" });
+  test.each([["docker-engine"], ["docker-desktop"]] as const)("%s refuses when docker ps cannot be read (fail closed)", (kind) => {
+    const { io, calls } = fakeIo(visible);
+    expect(admitHostServicePort(context, io, 10882, "darwin", engine({
+      backend: () => ({ kind }),
+      dockerPublishedPorts: () => ({ error: "docker ps exited with status 1" }),
+    }))).toEqual({ ok: false, reason: "docker ps exited with status 1" });
+    expect(calls).toHaveLength(0);
   });
 
-  test("Desktop never reads the Engine-only facts", () => {
+  test.each([["docker-engine"], ["docker-desktop"]] as const)("%s through the default docker ps read: published refuses, a failed read refuses", (kind) => {
+    const published = fakeIo(visible, { status: 0, stdout: "127.0.0.1:10882->8080/tcp\n", stderr: "" });
+    expect(admitHostServicePort(context, published.io, 10882, "darwin", {
+      ...hostServiceAdmissionEnvironment(context, published.io, "darwin"),
+      backend: () => ({ kind }),
+      unprivilegedPortStart: () => 1024,
+    })).toEqual({ ok: false, reason: "127.0.0.1:10882 is published by a container (docker ps)" });
+    const failed = fakeIo(visible, { status: 1, stdout: "", stderr: "Cannot connect to the Docker daemon" });
+    expect(admitHostServicePort(context, failed.io, 10882, "darwin", {
+      ...hostServiceAdmissionEnvironment(context, failed.io, "darwin"),
+      backend: () => ({ kind }),
+      unprivilegedPortStart: () => 1024,
+    })).toEqual({ ok: false, reason: "docker ps exited with status 1" });
+    expect([...published.calls, ...failed.calls]).toHaveLength(0);
+  });
+
+  test("Desktop never reads the Engine-only unprivileged port start, and runs docker ps once", () => {
     const { io } = fakeIo(visible);
     const start = vi.fn(() => 1024);
     const published = vi.fn(() => new Set<number>());
@@ -460,7 +546,14 @@ describe("admitHostServicePort backend refusals (C5)", () => {
       dockerPublishedPorts: published,
     }))).toEqual({ ok: true, owner: { command: "idb_companion", pid: 4242 } });
     expect(start).not.toHaveBeenCalled();
-    expect(published).not.toHaveBeenCalled();
+    expect(published).toHaveBeenCalledTimes(1);
+  });
+
+  test("the default environment on Desktop runs one docker ps before the listener probe", () => {
+    const { io } = fakeIo(visible);
+    expect(admitHostServicePort(context, io, 10882, "darwin")).toEqual({ ok: true, owner: { command: "idb_companion", pid: 4242 } });
+    const order = vi.mocked(io.capture).mock.calls.map(([command, args]) => (command === "docker" ? `docker ${args[0]}` : command));
+    expect(order).toEqual(["docker info", "docker context", "docker ps", "/usr/sbin/lsof"]);
   });
 });
 

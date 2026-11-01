@@ -5,11 +5,17 @@
 //      runfree's own VNC default and MCP callback block);
 //   2. the Docker backend (`docker-backend.ts`): host services need Docker
 //      Desktop or a local Docker Engine on Linux; anything else refuses;
-//   3. on Docker Engine only, the two refusals its relay adapter needs: a
-//      port below `net.ipv4.ip_unprivileged_port_start` (the relay binds
-//      without root or added capabilities), and a port Docker publishes on
-//      the host (a `docker ps` binding on 127.0.0.1, 0.0.0.0, or ::);
-//   4. the live owner, from the host listener check (`host-listener-probe.ts`:
+//   3. on Docker Engine only, the refusal its relay adapter needs: a port
+//      below `net.ipv4.ip_unprivileged_port_start` (the relay binds without
+//      root or added capabilities);
+//   4. on every supported backend, a port Docker publishes on the host (a
+//      `docker ps` binding on 127.0.0.1, 0.0.0.0, or ::). `docker ps` is the
+//      one published-port check: it sees a published port whatever owns the
+//      host socket (a root-owned `docker-proxy` this user cannot see, Docker
+//      Engine without the userland proxy, Docker Desktop's forwarder); an
+//      unreadable answer refuses. A check on a `docker-proxy` process name was
+//      removed: as a non-root user it practically never matched;
+//   5. the live owner, from the host listener check (`host-listener-probe.ts`:
 //      lsof on macOS, /proc on Linux): a visible process must listen on the
 //      host's TCP port at 127.0.0.1:<port> or *:<port>, the addresses the
 //      host gateway (Desktop) or the Engine relay reaches (R22). No visible
@@ -18,8 +24,8 @@
 //      probe, so it refuses as "no visible listener" too (Linux names the
 //      socket's uid). A listener only on [::1] or a LAN address is refused
 //      with its address. A `com.docker.*` listener on any address refuses
-//      (another container's published port, or Docker Engine TCP), and so
-//      does a visible `docker-proxy` (a container-published port on Engine).
+//      (another container's published port, or Docker Engine TCP), an extra
+//      signal beside `docker ps`.
 // The admitted owner (command and pid) is what the operator reviews and what
 // the port registry records. Every probe only reads: none connects to the port.
 
@@ -29,6 +35,7 @@ import { refusedHostServicePortReason, type HostServicesJson } from "@runfree/ru
 
 import { detectDockerBackend, type DockerBackend } from "./docker-backend.ts";
 import { hostListenerProbe, type HostListenerProbe } from "./host-listener-probe.ts";
+import { nodeProcFs, type ProcFs } from "./host-listener-proc.ts";
 import { createDockerClient } from "./runtime/docker-client.ts";
 import { dockerClientEnvironment } from "./runtime/env.ts";
 import type { RuntimeContext, RuntimeIO } from "./runtime/types.ts";
@@ -60,22 +67,24 @@ export type HostServicePortAdmission =
   | { ok: true; owner: { command: string; pid: number } }
   | { ok: false; reason: string };
 
+/** Host TCP ports `docker ps` shows published on 127.0.0.1, 0.0.0.0, or ::, or why they could not be read. */
+export type DockerPublishedPorts = ReadonlySet<number> | Readonly<{ error: string }>;
+
 /**
  * What admission knows about the Docker backend. Production detects it;
- * tests supply it. The Engine facts are read only when the backend is Engine.
+ * tests supply it. The unprivileged port start is read only on Engine.
  */
 export type HostServiceAdmissionEnvironment = Readonly<{
   backend(): DockerBackend;
   /** `net.ipv4.ip_unprivileged_port_start`, or why it could not be read. */
   unprivilegedPortStart(): number | { error: string };
-  /** Host TCP ports `docker ps` shows published on 127.0.0.1, 0.0.0.0, or ::. */
-  dockerPublishedPorts(): ReadonlySet<number> | { error: string };
+  /** The published-port check, on every supported backend. */
+  dockerPublishedPorts(): DockerPublishedPorts;
   /** The listener check; defaults to the platform's (`host-listener-probe.ts`). */
   listenerProbe?: HostListenerProbe;
 }>;
 
 const DOCKER_DESKTOP_COMMAND_PREFIX = "com.docker";
-const DOCKER_PROXY_COMMAND = "docker-proxy";
 export const UNPRIVILEGED_PORT_START_PATH = "/proc/sys/net/ipv4/ip_unprivileged_port_start";
 
 type ProbeContext = Pick<RuntimeContext, "env" | "projectRoot">;
@@ -100,10 +109,6 @@ function listenAddressSummary(owner: Extract<HostPortOwner, { kind: "listener" }
 
 function hiddenSummary(hidden: readonly HiddenHostListener[]): string {
   return hidden.map((entry) => `uid ${entry.uid} on ${entry.address}`).join(", ");
-}
-
-function publishedByContainer(owner: Extract<HostPortOwner, { kind: "listener" }>): boolean {
-  return owner.commands.some((command) => command === DOCKER_PROXY_COMMAND);
 }
 
 /** Who listens on the host's TCP `port` (read-only, bounded; macOS or Linux). */
@@ -155,6 +160,23 @@ export function parseUnprivilegedPortStart(text: string): number | { error: stri
   return Number(trimmed);
 }
 
+/**
+ * One `docker ps --format '{{.Ports}}'` read: the published-port check on
+ * every backend (admission, `runfree status`, the launch warnings). Never
+ * throws; a failed or unreadable answer is an error the caller refuses on
+ * (admission) or warns about (status, launch).
+ */
+export function readDockerPublishedPorts(context: Pick<RuntimeContext, "env">, io: Pick<RuntimeIO, "capture">): DockerPublishedPorts {
+  try {
+    const result = createDockerClient(io, { env: dockerClientEnvironment(context.env ?? process.env) })
+      .listContainers({ noTrunc: true, format: "{{.Ports}}" }, { timeout: 30_000, maxBuffer: 4 * 1024 * 1024 });
+    if (result.status !== 0) return { error: `docker ps exited with status ${result.status}` };
+    return parseDockerPublishedPorts(result.stdout);
+  } catch (error) {
+    return { error: `docker ps failed: ${error instanceof Error ? error.message : String(error)}` };
+  }
+}
+
 /** The production admission environment: detected backend, host sysctl, `docker ps`. */
 export function hostServiceAdmissionEnvironment(
   context: ProbeContext,
@@ -170,16 +192,15 @@ export function hostServiceAdmissionEnvironment(
         return { error: `could not read ${UNPRIVILEGED_PORT_START_PATH}: ${error instanceof Error ? error.message : String(error)}` };
       }
     },
-    dockerPublishedPorts: () => {
-      const result = createDockerClient(io, { env: dockerClientEnvironment(context.env ?? process.env) })
-        .listContainers({ noTrunc: true, format: "{{.Ports}}" }, { timeout: 30_000, maxBuffer: 4 * 1024 * 1024 });
-      if (result.status !== 0) return { error: `docker ps exited with status ${result.status}` };
-      return parseDockerPublishedPorts(result.stdout);
-    },
+    dockerPublishedPorts: () => readDockerPublishedPorts(context, io),
   });
 }
 
-/** Static refusal first (no probe), then the backend, then the live owner check. */
+/**
+ * Static refusal first (no probe), then the backend, then the Engine-only
+ * low-port refusal, then `docker ps` on every backend, then the live owner
+ * check.
+ */
 export function admitHostServicePort(
   context: ProbeContext,
   io: RuntimeIO,
@@ -203,10 +224,10 @@ export function admitHostServicePort(
           + "(or lower the sysctl on the host)",
       };
     }
-    const published = environment.dockerPublishedPorts();
-    if ("error" in published) return { ok: false, reason: published.error };
-    if (published.has(port)) return { ok: false, reason: `127.0.0.1:${port} is published by a container (docker ps)` };
   }
+  const published = environment.dockerPublishedPorts();
+  if ("error" in published) return { ok: false, reason: published.error };
+  if (published.has(port)) return { ok: false, reason: `127.0.0.1:${port} is published by a container (docker ps)` };
   const owner = environment.listenerProbe?.portOwner(port) ?? probeHostPortOwner(context, io, port, platform);
   if (owner.kind === "none") {
     if (owner.hidden && owner.hidden.length > 0) {
@@ -224,9 +245,6 @@ export function admitHostServicePort(
   // reaches), so a non-Docker first listener proves nothing alone.
   if (owner.commands.some((command) => command.startsWith(DOCKER_DESKTOP_COMMAND_PREFIX))) {
     return { ok: false, reason: `127.0.0.1:${port} is owned by Docker Desktop (a published container port)` };
-  }
-  if (publishedByContainer(owner)) {
-    return { ok: false, reason: `127.0.0.1:${port} is published by a container (${DOCKER_PROXY_COMMAND})` };
   }
   const reachable = gatewayReachableListener(owner, port);
   if (!reachable) {
@@ -249,15 +267,27 @@ export function admitHostServicePort(
  * the identical label/classification/comparison logic through an
  * owner-lookup callback, so the two call shapes can never diverge in the
  * warning text they produce for the same observed owners.
+ *
+ * `published` is the one `docker ps` read for this run, on every backend: a
+ * published approved port warns as "published by a container", and an
+ * unreadable read warns once. The owner checks below still run for every
+ * service, so the listener warnings fire exactly as before.
  */
 export function hostServiceWarningLines(
   services: HostServicesJson,
   recorded: ReadonlyMap<number, string>,
   ownerFor: (port: number) => HostPortOwner,
+  published: DockerPublishedPorts,
 ): string[] {
+  const entries = Object.entries(services).sort(([left], [right]) => left.localeCompare(right));
   const lines: string[] = [];
-  for (const [name, entry] of Object.entries(services).sort(([left], [right]) => left.localeCompare(right))) {
+  if (entries.length === 0) return lines;
+  let publishedPorts: ReadonlySet<number> | undefined;
+  if ("error" in published) lines.push(`host services: container-published ports were not checked: ${published.error}`);
+  else publishedPorts = published;
+  for (const [name, entry] of entries) {
     const label = `host service ${name} (127.0.0.1:${entry.port})`;
+    if (publishedPorts?.has(entry.port)) lines.push(`${label}: published by a container (docker ps)`);
     const owner = ownerFor(entry.port);
     if (owner.kind === "none") {
       // A hidden socket is named: on Engine it can be the relay itself holding
@@ -269,8 +299,6 @@ export function hostServiceWarningLines(
       lines.push(`${label}: ${owner.reason}`);
     } else if (owner.commands.some((command) => command.startsWith(DOCKER_DESKTOP_COMMAND_PREFIX))) {
       lines.push(`${label}: owned by Docker Desktop`);
-    } else if (publishedByContainer(owner)) {
-      lines.push(`${label}: published by a container`);
     } else {
       const reachable = gatewayReachableListener(owner, entry.port);
       if (!reachable) {
@@ -294,17 +322,24 @@ export function hostServiceWarningLines(
  * the owner command the port registry has on file for this port, if any; a
  * warning fires only when there is a problem, never on a clean match, and
  * the function never throws — an unavailable probe reports its own reason as
- * the problem.
+ * the problem. One `docker ps` read covers every service, and none runs when
+ * no host service is approved.
  *
  * The launch-time warning loop uses the batched snapshot instead
  * (`hostServiceOwnerWarningsFromSnapshot`, host-listener-snapshot.ts, F29):
  * this per-port probe is kept only for `status`, unchanged by that work.
+ * `platform` and `procFs` are test seams; the defaults read this host.
  */
 export function hostServiceOwnerWarnings(
   context: ProbeContext,
   io: RuntimeIO,
   services: HostServicesJson,
   recorded: ReadonlyMap<number, string>,
+  platform: NodeJS.Platform = process.platform,
+  procFs: ProcFs = nodeProcFs,
 ): string[] {
-  return hostServiceWarningLines(services, recorded, (port) => probeHostPortOwner(context, io, port));
+  if (Object.keys(services).length === 0) return [];
+  const probe = hostListenerProbe(context, io, platform, procFs);
+  return hostServiceWarningLines(services, recorded, (port) => probe.portOwner(port),
+    readDockerPublishedPorts(context, io));
 }

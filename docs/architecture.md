@@ -976,7 +976,16 @@ proxy always dials `<pinned gateway>:<port>`. Backend-specific code is only:
 backend detection (`packages/cli/src/docker-backend.ts`), the listener check
 behind one interface (lsof on macOS, `/proc` on Linux,
 `packages/cli/src/host-listener-probe.ts`), the Engine relay service and its
-script, and admission's two Engine-only refusals (below).
+script, and admission's one Engine-only refusal (decision 2 below). The
+published-port check is the same on every backend: one `docker ps` read,
+which refuses `host-service add` for a port a container publishes (and when
+the read fails) and warns in `runfree status` and at launch. The listener
+check cannot stand in for it: on Engine a published port's host socket
+belongs to root's proxy process, invisible to the operator's probe, or to no
+process at all. The backend is detected once per runtime run, from the
+availability check's `docker info`, and that one answer selects the relay
+profile for Compose `up` and the relay's expected presence in the full and
+warm topology proofs.
 
 **Backends.** `docker info` and the daemon endpoint decide. A daemon that
 names Docker Desktop, reached on a local socket (a unix socket, or a named
@@ -1049,7 +1058,8 @@ Engine decisions:
    `runfree status` shows the relay's socket (a socket owned by uid 65534 on
    the gateway address) when no visible service listens.
 2. A port below `net.ipv4.ip_unprivileged_port_start` is refused, because the
-   relay binds without root or added capabilities. Desktop is unchanged.
+   relay binds without root or added capabilities. Desktop is unchanged. This
+   is the only admission refusal that depends on the backend.
 3. The relay is the proxy image's node; there is no new image or dependency.
 4. A host firewall with default-deny INPUT (ufw, firewalld) must allow
    traffic from the proxy's egress network to the gateway address. Without

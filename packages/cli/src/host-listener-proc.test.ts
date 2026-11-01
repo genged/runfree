@@ -156,7 +156,7 @@ describe("Linux /proc listener probe (C2)", () => {
     });
     const snapshot = procListenerSnapshot(procFs);
     const services: HostServicesJson = { idb: { target: "host-loopback", port: PORT } };
-    expect(hostServiceOwnerWarningsFromSnapshot(snapshot, services, new Map())).toEqual([
+    expect(hostServiceOwnerWarningsFromSnapshot(snapshot, new Set(), services, new Map())).toEqual([
       "host service idb (127.0.0.1:10882): no visible listener (a socket owned by uid 0 on 127.0.0.1:10882)",
     ]);
   });
@@ -232,11 +232,19 @@ describe("Linux /proc listener probe (C2)", () => {
     expect(procPortOwner(PORT, procFs).kind).toBe("unavailable");
   });
 
-  test("a visible docker-proxy owner is refused as published by a container", () => {
-    const procFs = fixtureProc({ tcp: [row("00000000:2A82", 1000, 11)], processes: { 11: owner(11, { exe: "/usr/bin/docker-proxy" }) } });
-    expect(admit(procFs)).toEqual({ ok: false, reason: "127.0.0.1:10882 is published by a container (docker-proxy)" });
-    expect(hostServiceWarningLines({ idb: { target: "host-loopback", port: PORT } }, new Map(), () => procPortOwner(PORT, procFs)))
-      .toEqual(["host service idb (127.0.0.1:10882): published by a container"]);
+  // `docker ps` is the published-port check: a container-published port is
+  // refused and warned whatever the listener check sees of its host socket
+  // (root's proxy process hidden from this user, or a visible one).
+  test.each([
+    ["a hidden uid-0 socket", fixtureProc({ tcp: [row("00000000:2A82", 0, 11)], processes: { 11: { ...owner(11), hidden: true } } })],
+    ["a visible listener", fixtureProc({ tcp: [row("00000000:2A82", 1000, 11)], processes: { 11: owner(11, { exe: "/usr/bin/some-proxy" }) } })],
+  ])("a port docker ps shows published is refused and warned as published by a container, beside %s", (_label, procFs) => {
+    const published = { ...desktopLess, dockerPublishedPorts: () => new Set([PORT]) };
+    expect(admit(procFs, published)).toEqual({ ok: false, reason: "127.0.0.1:10882 is published by a container (docker ps)" });
+    const services: HostServicesJson = { idb: { target: "host-loopback", port: PORT } };
+    const line = "host service idb (127.0.0.1:10882): published by a container (docker ps)";
+    expect(hostServiceWarningLines(services, new Map(), () => procPortOwner(PORT, procFs), new Set([PORT]))[0]).toBe(line);
+    expect(hostServiceOwnerWarningsFromSnapshot(procListenerSnapshot(procFs), new Set([PORT]), services, new Map())[0]).toBe(line);
   });
 
   test("the snapshot groups by process per port, in pid order, like lsof", () => {

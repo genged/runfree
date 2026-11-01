@@ -33,6 +33,8 @@ function captureResult(status: number, stdout = "", stderr = ""): CaptureResult 
 const GATEWAY_ALIAS_EXTRA_HOST = "gateway.runfree.internal:host-gateway";
 const HOST_SERVICE_POLICY_GENERATION = `sha256:${"c".repeat(64)}`;
 const HOST_GATEWAY = "192.168.65.254";
+// The caller's backend decision: these fixtures are not a local Engine.
+const NO_RELAY = { hostServiceRelay: "none" } as const;
 
 test("topology assertion inventory covers the current security checks", () => {
   expect(REQUIRED_TOPOLOGY_ASSERTIONS.map((entry) => entry.code).sort()).toEqual([
@@ -193,8 +195,8 @@ test("topology inspects the proxy and its networks for a context and an ActiveRu
   const { context, plan, io } = participantTopologyFixture([]);
   // Only the stopped proxy: every inspection succeeded and nothing else failed.
   const onlyStoppedProxy = [expect.stringMatching(/^proxy container .*exit=1/u)];
-  expect(validateRuntimeTopology(context, io).map((issue) => issue.message)).toEqual(onlyStoppedProxy);
-  expect(validateRuntimeTopology(plan, io).map((issue) => issue.message)).toEqual(onlyStoppedProxy);
+  expect(validateRuntimeTopology(context, io, NO_RELAY).map((issue) => issue.message)).toEqual(onlyStoppedProxy);
+  expect(validateRuntimeTopology(plan, io, NO_RELAY).map((issue) => issue.message)).toEqual(onlyStoppedProxy);
 });
 
 test("topology refuses an unapproved agent_internal participant, such as the retired VNC sidecar", () => {
@@ -214,8 +216,8 @@ test("topology refuses an unapproved agent_internal participant, such as the ret
   };
   const withSidecar = participantTopologyFixture([vnc]);
 
-  expect(validateRuntimeTopology(context, io).map((issue) => issue.code)).not.toContain("agent-network-unapproved-container");
-  const issues = validateRuntimeTopology(withSidecar.context, withSidecar.io);
+  expect(validateRuntimeTopology(context, io, NO_RELAY).map((issue) => issue.code)).not.toContain("agent-network-unapproved-container");
+  const issues = validateRuntimeTopology(withSidecar.context, withSidecar.io, NO_RELAY);
   expect(issues.map((issue) => issue.code)).toContain("agent-network-unapproved-container");
   expect(issues.some((issue) => issue.message.includes(sidecarName))).toBe(true);
 });
@@ -231,6 +233,7 @@ test("warm evidence is judged without Docker, and a participant the batch did no
     run: () => { throw new Error("warm validation must not run a command"); },
   };
   const warmEvidence = (participants: readonly unknown[]) => ({
+    ...NO_RELAY,
     warmEvidence: {
       proxyId: "proxy-id",
       proxy: fixture.proxy,
@@ -340,7 +343,7 @@ test("the non-443 CONNECT probe targets a reserved non-resolving host, never a p
       run: () => 0,
     };
 
-    const issues = validateRuntimeTopology(context, io);
+    const issues = validateRuntimeTopology(context, io, NO_RELAY);
 
     // Validation reached the proxy probes: every inspection succeeded.
     expect(issues.map((issue) => issue.message).filter((message) => message.startsWith("could not inspect"))).toEqual([]);
@@ -536,11 +539,12 @@ function denyProbeBatchPlanFixture(
     proxyGatewayExecs,
     observed,
     run: () => validateRuntimeTopology(plan, io, {
+      ...NO_RELAY,
       onBoundaryViolation: () => { observed.boundaryViolated = true; },
       helperFence,
       ...effectiveHostServices,
     }).map((issue) => issue.code),
-    messages: () => validateRuntimeTopology(plan, io, { helperFence, ...effectiveHostServices }).map((issue) => issue.message),
+    messages: () => validateRuntimeTopology(plan, io, { ...NO_RELAY, helperFence, ...effectiveHostServices }).map((issue) => issue.message),
   };
 }
 
@@ -724,7 +728,7 @@ test("a changed, extra, or missing proxy ExtraHosts entry refuses, and the templ
   const extraHostsCodes = (extraHosts: string[] | undefined) => {
     const fixture = participantTopologyFixture([]);
     (fixture.proxy.HostConfig as { ExtraHosts?: string[] }).ExtraHosts = extraHosts;
-    return validateRuntimeTopology(fixture.context, fixture.io).filter((issue) => issue.code === "proxy-extra-hosts-exact");
+    return validateRuntimeTopology(fixture.context, fixture.io, NO_RELAY).filter((issue) => issue.code === "proxy-extra-hosts-exact");
   };
 
   for (const refused of [

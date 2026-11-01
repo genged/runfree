@@ -171,8 +171,9 @@ export type WarmProofInput = Readonly<{
    * Whether the Engine host-service relay applies. With `engine-relay` the
    * relay is inspected by its exact name in the same batch and its shape is
    * re-proved; a missing relay fails the inspect and takes the full path.
+   * The run's one backend decision (`hostServiceRelayMode`), required.
    */
-  hostServiceRelay?: HostServiceRelayMode;
+  hostServiceRelay: HostServiceRelayMode;
 }>;
 
 export type WarmValidation = Readonly<{
@@ -495,7 +496,7 @@ function judgeWarmObservation(input: WarmProofInput, observation: WarmObservatio
     warmEvidence,
     expectedProxyId: effective.proxyContainerId,
     effectiveHostServices: input.effectiveHostServices,
-    hostServiceRelay: input.hostServiceRelay ?? "none",
+    hostServiceRelay: input.hostServiceRelay,
   });
   for (const issue of topology.issues) topologyIssues.push(issue.message);
   const deny: DenyByDefaultObservationV1 | undefined = topology.denyByDefaultBaseObservation;

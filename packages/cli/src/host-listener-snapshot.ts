@@ -17,8 +17,10 @@
 import type { HostServicesJson } from "@runfree/runtime-contracts/host-services";
 
 import { hostListenerProbe } from "./host-listener-probe.ts";
+import { nodeProcFs, type ProcFs } from "./host-listener-proc.ts";
 import {
   hostServiceWarningLines,
+  type DockerPublishedPorts,
   type HiddenHostListener,
   type HostPortListener,
   type HostPortOwner,
@@ -42,14 +44,16 @@ type ProbeContext = Pick<RuntimeContext, "env" | "projectRoot">;
  * One bounded, read-only observation of every TCP listener on the host.
  * Replaces a per-port query with a single call whose result answers every
  * approved host service's owner question for this launch
- * (`hostPortOwnerFromSnapshot`).
+ * (`hostPortOwnerFromSnapshot`). `platform` and `procFs` are test seams; the
+ * defaults read this host.
  */
 export function probeHostListeners(
   context: ProbeContext,
   io: RuntimeIO,
   platform: NodeJS.Platform = process.platform,
+  procFs: ProcFs = nodeProcFs,
 ): HostListenerSnapshot {
-  return hostListenerProbe(context, io, platform).snapshot();
+  return hostListenerProbe(context, io, platform, procFs).snapshot();
 }
 
 /**
@@ -81,12 +85,15 @@ export function hostPortOwnerFromSnapshot(snapshot: HostListenerSnapshot, port: 
  * Re-check, SR13): the same warning lines `hostServiceOwnerWarnings` would
  * produce for the same observed owners (shared core,
  * `hostServiceWarningLines`), but answered from one already-taken snapshot
- * instead of one query per service (F29).
+ * instead of one query per service (F29). `published` is the launch's one
+ * `docker ps` read (`readDockerPublishedPorts`), the published-port check on
+ * every backend.
  */
 export function hostServiceOwnerWarningsFromSnapshot(
   snapshot: HostListenerSnapshot,
+  published: DockerPublishedPorts,
   services: HostServicesJson,
   recorded: ReadonlyMap<number, string>,
 ): string[] {
-  return hostServiceWarningLines(services, recorded, (port) => hostPortOwnerFromSnapshot(snapshot, port));
+  return hostServiceWarningLines(services, recorded, (port) => hostPortOwnerFromSnapshot(snapshot, port), published);
 }
