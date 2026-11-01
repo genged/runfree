@@ -40,6 +40,7 @@ import {
   provisionLiveFixture,
   provisionSandboxFixture,
   type LiveFixture,
+  requireLiveRuntimeBackend,
   type LiveRuntimeBackend,
 } from "./fixture.ts";
 import {
@@ -86,11 +87,7 @@ const RECOVERY_PROBE_AGENT = "codex" as const;
 const RESTART_PROBE_AGENT = "pi" as const;
 
 function requiredBackend(): LiveRuntimeBackend {
-  const backend = process.env.TEST_RUNTIME_BACKEND;
-  if (backend !== "docker-desktop") {
-    throw new Error("TEST_RUNTIME_BACKEND must be docker-desktop for the negative admission tranche");
-  }
-  return backend;
+  return requireLiveRuntimeBackend("the negative admission tranche");
 }
 
 describe("per-session admission refuses and its controls are load-bearing", () => {

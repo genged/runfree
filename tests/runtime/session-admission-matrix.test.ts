@@ -120,8 +120,10 @@ describe("internal session admission live matrix", () => {
 
     expect(() => parseSessionAdmissionMatrixArgs(["--workspace", "/tmp/sandbox"]))
       .toThrow("--backend is required");
-    expect(() => parseSessionAdmissionMatrixArgs(["--workspace", "/tmp/sandbox", "--backend", "linux"]))
-      .toThrow("--backend must be docker-desktop");
+    for (const backend of ["linux", "orbstack", "docker", "Docker-Engine"]) {
+      expect(() => parseSessionAdmissionMatrixArgs(["--workspace", "/tmp/sandbox", "--backend", backend]))
+        .toThrow("--backend must be one of docker-desktop, docker-engine");
+    }
     expect(() => parseSessionAdmissionMatrixArgs([
       "--workspace",
       "/tmp/sandbox",
@@ -154,6 +156,15 @@ describe("internal session admission live matrix", () => {
       "--agents",
       "claude",
     ])).toThrow("unknown session admission matrix option: --agents");
+  });
+
+  test("accepts docker-engine as a backend label", () => {
+    expect(parseSessionAdmissionMatrixArgs([
+      "--workspace",
+      "/tmp/sandbox",
+      "--backend",
+      "docker-engine",
+    ]).backend).toBe("docker-engine");
   });
 
   test("narrows the tranche to an exact reproducible agent slice", () => {
@@ -217,12 +228,55 @@ describe("internal session admission live matrix", () => {
       version: "29.0.0",
     });
 
+    expect(() => inspectSessionAdmissionMatrixBackend("docker-engine", io))
+      .toThrow("expected docker-engine, detected docker-desktop: Docker Engine - Community / Docker Desktop");
+  });
+
+  test("classifies native Docker Engine as docker-engine and refuses it as docker-desktop", () => {
     const engineIO = backendIO({
       [["version", "--format", "{{.Server.Platform.Name}}"].join("\0")]: "Docker Engine - Community",
       [["info", "--format", "{{.OperatingSystem}}"].join("\0")]: "Ubuntu 24.04 LTS",
+      [["version", "--format", "{{.Server.Arch}}"].join("\0")]: "amd64",
+      [["context", "show"].join("\0")]: "default",
+      [["version", "--format", "{{.Server.Version}}"].join("\0")]: "29.9.2",
+    });
+    expect(inspectSessionAdmissionMatrixBackend("docker-engine", engineIO)).toEqual({
+      architecture: "amd64",
+      context: "default",
+      detected: "docker-engine",
+      operatingSystem: "Ubuntu 24.04 LTS",
+      platformName: "Docker Engine - Community",
+      version: "29.9.2",
     });
     expect(() => inspectSessionAdmissionMatrixBackend("docker-desktop", engineIO))
-      .toThrow("expected docker-desktop, detected unclassified: Docker Engine - Community / Ubuntu 24.04 LTS");
+      .toThrow("expected docker-desktop, detected docker-engine: Docker Engine - Community / Ubuntu 24.04 LTS");
+  });
+
+  test("classifies Docker Desktop named in the platform field alone as docker-desktop", () => {
+    const desktopIO = backendIO({
+      [["version", "--format", "{{.Server.Platform.Name}}"].join("\0")]: "Docker Desktop 4.50.0 (200000)",
+      [["info", "--format", "{{.OperatingSystem}}"].join("\0")]: "Ubuntu 24.04 LTS",
+    });
+    expect(() => inspectSessionAdmissionMatrixBackend("docker-engine", desktopIO))
+      .toThrow("expected docker-engine, detected docker-desktop: Docker Desktop 4.50.0 (200000) / Ubuntu 24.04 LTS");
+  });
+
+  test("leaves an unknown daemon unclassified for either claimed label", () => {
+    const orbstackIO = backendIO({
+      [["version", "--format", "{{.Server.Platform.Name}}"].join("\0")]: "OrbStack",
+      [["info", "--format", "{{.OperatingSystem}}"].join("\0")]: "OrbStack",
+    });
+    for (const claimed of ["docker-desktop", "docker-engine"] as const) {
+      expect(() => inspectSessionAdmissionMatrixBackend(claimed, orbstackIO))
+        .toThrow(`expected ${claimed}, detected unclassified: OrbStack / OrbStack`);
+    }
+    // "Docker Engine" only in the OS field is not native Engine's own identity.
+    const osOnlyIO = backendIO({
+      [["version", "--format", "{{.Server.Platform.Name}}"].join("\0")]: "Podman Engine",
+      [["info", "--format", "{{.OperatingSystem}}"].join("\0")]: "Docker Engine compatible",
+    });
+    expect(() => inspectSessionAdmissionMatrixBackend("docker-engine", osOnlyIO))
+      .toThrow("expected docker-engine, detected unclassified: Podman Engine / Docker Engine compatible");
   });
 
   test("accepts only the exact non-degenerate worker bootstrap nonce", () => {

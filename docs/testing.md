@@ -16,9 +16,15 @@ Runfree separates tests by the boundary they prove.
 
 `pnpm exec vitest run` runs a live tranche directly when the command selects
 it, by `--project runtime-live` or by a `tests/runtime/live/` file path.
-`TEST_RUNTIME_BACKEND` defaults to `docker-desktop`, the only supported
-backend, so it does not need to be set. Bare `vitest run` and `pnpm test`
-never select the live project.
+The live suite runs on two backends, named by `TEST_RUNTIME_BACKEND`:
+`docker-desktop` (Docker Desktop) and `docker-engine` (native Docker Engine on
+Linux). It defaults to `docker-engine` on Linux and `docker-desktop`
+elsewhere, so it usually does not need to be set; with Docker Desktop on
+Linux, set `TEST_RUNTIME_BACKEND=docker-desktop`. The admission tranches check
+the label against the daemon's own identity and fail when they differ. Any
+other value leaves the live projects unregistered. The packaged live lane
+(`make test-cli-e2e-live`) accepts the same two labels. Bare `vitest run`
+and `pnpm test` never select the live project.
 
 `make test-release` is the pre-tag gate for a release commit. It runs what the
 Test workflow runs on that commit: static checks, unit tests, template
@@ -131,7 +137,8 @@ literals. The checks on public docs and user-visible terminology are listed in
   run this lane against the signed archive.
 - Nothing in these layers proves the live runtime on a platform where
   `make test-runtime` has not been run. Source tests passing on Linux CI is not
-  evidence about macOS with Docker Desktop.
+  evidence about macOS with Docker Desktop, and a live run on Docker Engine
+  is not evidence about Docker Desktop, or the reverse.
 - `make test-runtime` needs a Docker host and runs by hand; neither
   pull-request CI nor the release pipeline runs it.
 - The git provider tranche covers only the token types its sources use. It

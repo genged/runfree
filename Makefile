@@ -17,12 +17,12 @@ help:
 		'  make test-templates       Docker Compose template validation' \
 		'  make test-cli-e2e         Build dist/runfree and run packaged CLI scenarios' \
 		'  make test-cli-e2e-live    Build dist/runfree and run its real-Docker lifecycle scenario' \
-		'  make test-runtime         Release gate: the whole live suite, core and extended (TEST_RUNTIME_BACKEND, default docker-desktop)' \
+		'  make test-runtime         Release gate: the whole live suite, core and extended (TEST_RUNTIME_BACKEND, default docker-engine on Linux, else docker-desktop)' \
 		'                            Files run 4 at a time; TEST_RUNTIME_WORKERS=1 makes it serial on a memory-tight host' \
 		'  make test-runtime-core    Per-change live gate: trust-boundary proofs only (tests/runtime/live/tiers.ts), 2 files at a time' \
 		'  make test-runtime-extended  The rest of the live suite: recovery, upgrades, load, helper cleanup, audit mode' \
 		'  make test-runtime-smoke   One live tranche (runtime-topology: one fixture, one session, 24 read-only proofs) as a per-commit Docker check' \
-		'  make test-runtime-live    Run the migrated non-admission live tranches only (TEST_RUNTIME_BACKEND, default docker-desktop)' \
+		'  make test-runtime-live    Run the migrated non-admission live tranches only (TEST_RUNTIME_BACKEND, default docker-engine on Linux, else docker-desktop)' \
 		'  make test-runtime-live-<tranche>  One migrated tranche: topology|managed-launch|egress|connect-guard|request-shape|audit|allowlist|policy-mutation|mcp-enable' \
 		'  make test-runtime-live-helper-reclaim  Ephemeral-helper tranche: bounded runs, exact-id reclaim, the pinned helper address' \
 		'  make test-runtime-live-host-service  Host-service tranche: relay reach, refusals, revocation cuts, gateway change and rebuild reclaim' \
@@ -45,9 +45,11 @@ test: test-static test-unit
 # itself. No live runtime; that stays in test-all.
 test-release: test-static test-unit test-templates test-cli-e2e
 
-# The backend the live runtime suite runs on when folded into test-all.
-# Docker Desktop is the only backend: OrbStack is not tested or supported.
-TEST_RUNTIME_BACKEND ?= docker-desktop
+# The backend the live runtime suite runs on, also when folded into test-all:
+# docker-engine (native Docker Engine) on Linux, docker-desktop elsewhere. On
+# Linux with Docker Desktop, set TEST_RUNTIME_BACKEND=docker-desktop. OrbStack
+# is not tested or supported.
+TEST_RUNTIME_BACKEND ?= $(if $(filter Linux,$(shell uname -s)),docker-engine,docker-desktop)
 
 # test-runtime runs the entire runtime-live project (every *.live.test.ts,
 # admission tranches included), so it is the whole live gate on its own.
@@ -258,7 +260,7 @@ test-live-session-admission-crash-docker-desktop:
 # tests/runtime/live/runtime-topology.live.test.ts; the per-tranche targets
 # below select their describe blocks with -t. Other tranches provision and
 # destroy their own runtime. Backend is $(TEST_RUNTIME_BACKEND) (default
-# docker-desktop, the only supported backend).
+# docker-engine on Linux, docker-desktop elsewhere).
 test-runtime-live:
 	TEST_RUNTIME_BACKEND=$(TEST_RUNTIME_BACKEND) pnpm exec vitest run --project runtime-live \
 		runtime-topology managed-launch request-shape audit-mode allowlist-lifecycle live-policy-mutation mcp-enable

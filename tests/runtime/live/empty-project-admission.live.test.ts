@@ -25,6 +25,7 @@ import {
   destroyLiveFixture,
   provisionLiveFixture,
   type LiveFixture,
+  requireLiveRuntimeBackend,
   type LiveRuntimeBackend,
 } from "./fixture.ts";
 import { runNominalAdmissionSlice } from "./session-admission-slice.ts";
@@ -35,11 +36,7 @@ const TEST_TIMEOUT_MS = 15 * 60_000;
 const PROBE_AGENT = "claude" as const;
 
 function requiredBackend(): LiveRuntimeBackend {
-  const backend = process.env.TEST_RUNTIME_BACKEND;
-  if (backend !== "docker-desktop") {
-    throw new Error("TEST_RUNTIME_BACKEND must be docker-desktop for the empty-project admission tranche");
-  }
-  return backend;
+  return requireLiveRuntimeBackend("the empty-project admission tranche");
 }
 
 function git(projectRoot: string, args: readonly string[]): void {

@@ -67,6 +67,7 @@ import {
   provisionSandboxFixture,
   readSessionFileEvidence,
   type LiveFixture,
+  requireLiveRuntimeBackend,
   type LiveRuntimeBackend,
 } from "./fixture.ts";
 import { launchClaudeTimed, runfreeTimed, sessionContainers, timing } from "./launch-timing-support.ts";
@@ -154,11 +155,7 @@ const AUTHORITY_LEASE_MAX_MS = 5 * 60_000;
 // switched off — the gate it protected no longer exists.
 
 function requiredBackend(): LiveRuntimeBackend {
-  const backend = process.env.TEST_RUNTIME_BACKEND;
-  if (backend !== "docker-desktop") {
-    throw new Error("TEST_RUNTIME_BACKEND must be docker-desktop for the crash admission tranche");
-  }
-  return backend;
+  return requireLiveRuntimeBackend("the crash admission tranche");
 }
 
 type CrashRun = Readonly<{ status: number | null; signal: NodeJS.Signals | null; output: string }>;

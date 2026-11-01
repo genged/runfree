@@ -31,6 +31,7 @@ import {
   destroyLiveFixture,
   type CaptureResult,
   type LiveFixture,
+  requireLiveRuntimeBackend,
   type LiveRuntimeBackend,
   ownedNftSetIps,
   provisionSandboxFixture,
@@ -49,11 +50,7 @@ const REFERENCE_HOST = "example.net";
 const REFERENCE_PATH = "/";
 
 function requiredBackend(): LiveRuntimeBackend {
-  const backend = process.env.TEST_RUNTIME_BACKEND;
-  if (backend !== "docker-desktop") {
-    throw new Error("TEST_RUNTIME_BACKEND must be docker-desktop for the allowlist-lifecycle tranche");
-  }
-  return backend;
+  return requireLiveRuntimeBackend("the allowlist-lifecycle tranche");
 }
 
 function sessionExec(id: string, script: string): CaptureResult {

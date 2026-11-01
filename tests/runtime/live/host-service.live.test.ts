@@ -142,6 +142,7 @@ import {
   startStandingSession,
   type CaptureResult,
   type LiveFixture,
+  requireLiveRuntimeBackend,
   type LiveRuntimeBackend,
   type StandingSessionHandle,
 } from "./fixture.ts";
@@ -169,11 +170,7 @@ const PROXY_ENV_UNSET = [
 ] as const;
 
 function requiredBackend(): LiveRuntimeBackend {
-  const backend = process.env.TEST_RUNTIME_BACKEND;
-  if (backend !== "docker-desktop") {
-    throw new Error("TEST_RUNTIME_BACKEND must be docker-desktop for the host-service tranche");
-  }
-  return backend;
+  return requireLiveRuntimeBackend("the host-service tranche");
 }
 
 function nonce(label: string): string {

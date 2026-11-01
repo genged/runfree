@@ -30,6 +30,7 @@ import {
   destroyLiveFixture,
   provisionLiveFixture,
   type LiveFixture,
+  requireLiveRuntimeBackend,
   type LiveRuntimeBackend,
 } from "./fixture.ts";
 import {
@@ -61,11 +62,7 @@ const HELD_WAIT_TIMEOUT_MS = 90_000;
 const PROBE_AGENT = "claude" as const;
 
 function requiredBackend(): LiveRuntimeBackend {
-  const backend = process.env.TEST_RUNTIME_BACKEND;
-  if (backend !== "docker-desktop") {
-    throw new Error("TEST_RUNTIME_BACKEND must be docker-desktop for the drift admission tranche");
-  }
-  return backend;
+  return requireLiveRuntimeBackend("the drift admission tranche");
 }
 
 type HeldRun = Readonly<{

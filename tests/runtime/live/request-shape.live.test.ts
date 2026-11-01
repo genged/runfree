@@ -44,6 +44,7 @@ import {
   destroyLiveFixture,
   type CaptureResult,
   type LiveFixture,
+  requireLiveRuntimeBackend,
   type LiveRuntimeBackend,
   provisionSandboxFixture,
   startStandingSession,
@@ -59,11 +60,7 @@ const METHOD_HOST = "runfree-shape-methods.invalid";
 const GIT_HOST = "runfree-shape-git.invalid";
 
 function requiredBackend(): LiveRuntimeBackend {
-  const backend = process.env.TEST_RUNTIME_BACKEND;
-  if (backend !== "docker-desktop") {
-    throw new Error("TEST_RUNTIME_BACKEND must be docker-desktop for the request-shape tranche");
-  }
-  return backend;
+  return requireLiveRuntimeBackend("the request-shape tranche");
 }
 
 function sessionExec(id: string, script: string): CaptureResult {

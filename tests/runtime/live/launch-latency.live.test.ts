@@ -62,6 +62,7 @@ import {
   describeOutput,
   destroyLiveFixture,
   type LiveFixture,
+  requireLiveRuntimeBackend,
   type LiveRuntimeBackend,
   forceCleanSessions,
   MANAGED_HOLD_RELATIVE_PATH,
@@ -99,11 +100,7 @@ const PROVISION_TIMEOUT_MS = 30 * 60_000;
 const TEST_TIMEOUT_MS = 15 * 60_000;
 
 function requiredBackend(): LiveRuntimeBackend {
-  const backend = process.env.TEST_RUNTIME_BACKEND;
-  if (backend !== "docker-desktop") {
-    throw new Error("TEST_RUNTIME_BACKEND must be docker-desktop for the launch latency tranche");
-  }
-  return backend;
+  return requireLiveRuntimeBackend("the launch latency tranche");
 }
 
 // The sandbox fixture's seeded credential and its host environment source.

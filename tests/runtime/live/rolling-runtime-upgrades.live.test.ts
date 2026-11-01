@@ -29,6 +29,7 @@ import {
   provisionLiveFixture,
   readPublishedSessionEligibility,
   type LiveFixture,
+  requireLiveRuntimeBackend,
   type LiveRuntimeBackend,
 } from "./fixture.ts";
 
@@ -38,11 +39,7 @@ const TEST_TIMEOUT_MS = 20 * 60_000;
 const SESSION_WAIT_TIMEOUT_MS = 180_000;
 
 function requiredBackend(): LiveRuntimeBackend {
-  const backend = process.env.TEST_RUNTIME_BACKEND;
-  if (backend !== "docker-desktop") {
-    throw new Error("TEST_RUNTIME_BACKEND must be docker-desktop for rolling runtime proof");
-  }
-  return backend;
+  return requireLiveRuntimeBackend("rolling runtime proof");
 }
 
 type RunningSession = Readonly<{

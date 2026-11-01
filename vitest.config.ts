@@ -1,5 +1,6 @@
 import { defineConfig, type TestProjectConfiguration } from "vitest/config";
 
+import { LIVE_RUNTIME_PROJECT, selectLiveProjects } from "./tests/runtime/live/backends.ts";
 import { CORE_LIVE_FILES, MIXED_LIVE_FILES, selectedLiveTier } from "./tests/runtime/live/tiers.ts";
 
 // These files mutate shared repo state (dist/runtime/**, runtime-inputs.lock.json,
@@ -72,39 +73,17 @@ function liveRuntimeWorkers(): number {
   return Number(configured);
 }
 
-// Docker Desktop is the only supported backend, so it is the default. An
-// explicitly named backend still decides: any other value keeps the live
-// project unregistered, as before.
-const DEFAULT_LIVE_RUNTIME_BACKEND = "docker-desktop";
-const LIVE_RUNTIME_PROJECT = "runtime-live";
-
-/**
- * Whether this vitest command line asks for the live project by name
- * (`--project runtime-live`) or by a live file filter
- * (`vitest run tests/runtime/live/x.live.test.ts`). Bare `vitest run` and
- * `pnpm test` select neither, so the live suite stays opt-in.
- */
-function liveRuntimeSelectedByArgv(argv: readonly string[]): boolean {
-  for (let index = 0; index < argv.length; index += 1) {
-    const arg = argv[index];
-    if (arg === "--project" && argv[index + 1] === LIVE_RUNTIME_PROJECT) return true;
-    if (arg === `--project=${LIVE_RUNTIME_PROJECT}`) return true;
-    if (!arg.startsWith("-") && (arg.includes("tests/runtime/live") || arg.endsWith(".live.test.ts"))) {
-      // e2e/**/*.live.test.ts belongs to cli-e2e-live, not this project.
-      if (!arg.startsWith("e2e/")) return true;
-    }
-  }
-  return false;
-}
-
-const liveRuntimeBackendNamed = Boolean(process.env.TEST_RUNTIME_BACKEND);
-const liveRuntimeBackend = process.env.TEST_RUNTIME_BACKEND || DEFAULT_LIVE_RUNTIME_BACKEND;
-const liveRuntimeEnabled = liveRuntimeBackend === "docker-desktop"
-  && (liveRuntimeBackendNamed || liveRuntimeSelectedByArgv(process.argv.slice(2)));
-const cliE2eEnabled = Boolean(process.env.RUNFREE_E2E_ARTIFACT);
-const cliE2eLiveEnabled = cliE2eEnabled
-  && liveRuntimeBackend === "docker-desktop"
-  && Boolean(process.env.RUNFREE_E2E_DOCKER_HOST);
+// The live suite runs on Docker Desktop and on native Docker Engine on Linux;
+// `tests/runtime/live/backends.ts` holds the labels, the host default
+// (docker-engine on Linux, docker-desktop elsewhere), and which live projects
+// an invocation registers. The admission matrix checks the label against the
+// daemon's own identity, so a wrong default fails, not passes.
+const {
+  backend: liveRuntimeBackend,
+  runtimeLive: liveRuntimeEnabled,
+  cliE2e: cliE2eEnabled,
+  cliE2eLive: cliE2eLiveEnabled,
+} = selectLiveProjects(process.env, process.argv.slice(2), process.platform);
 
 const commonExclude = [
   ...liveRuntimeTests,

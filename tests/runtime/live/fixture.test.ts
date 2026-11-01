@@ -25,6 +25,7 @@ import {
   assertCleanSessionReport,
   isLeakedSandboxRuntime,
   releaseStandingSessions,
+  requireLiveRuntimeBackend,
   resolveStandingSessionContainer,
   sessionAgentContainerIds,
   unexplainedAdmittedIps,
@@ -36,6 +37,29 @@ function stubRun(stdout: string, status = 0): (args: readonly string[]) => Captu
 
 const PROJECT = "runfree-0123456789ab";
 const EXACT_ID = "a".repeat(64);
+
+describe("live tranche backend label", () => {
+  test("accepts docker-desktop and docker-engine", () => {
+    expect(requireLiveRuntimeBackend("the x tranche", { TEST_RUNTIME_BACKEND: "docker-desktop" }))
+      .toBe("docker-desktop");
+    expect(requireLiveRuntimeBackend("the x tranche", { TEST_RUNTIME_BACKEND: "docker-engine" }))
+      .toBe("docker-engine");
+  });
+
+  test("rejects a missing, empty, or unknown label, naming both accepted labels", () => {
+    const envs: NodeJS.ProcessEnv[] = [
+      {},
+      { TEST_RUNTIME_BACKEND: "" },
+      { TEST_RUNTIME_BACKEND: "orbstack" },
+      { TEST_RUNTIME_BACKEND: "Docker-Desktop" },
+      { TEST_RUNTIME_BACKEND: "docker-engine " },
+    ];
+    for (const env of envs) {
+      expect(() => requireLiveRuntimeBackend("the x tranche", env))
+        .toThrow("TEST_RUNTIME_BACKEND must be one of docker-desktop, docker-engine for the x tranche");
+    }
+  });
+});
 
 describe("standing-session container resolver fails closed", () => {
   test("no running session-agent container throws rather than returning an empty id", () => {

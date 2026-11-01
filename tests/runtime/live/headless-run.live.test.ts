@@ -64,6 +64,7 @@ import {
   destroyLiveFixture,
   forceCleanSessions,
   type LiveFixture,
+  requireLiveRuntimeBackend,
   type LiveRuntimeBackend,
   provisionLiveFixture,
   readPublishedSessionEligibility,
@@ -107,11 +108,7 @@ const INBOX_PROMPT_PATTERN = /^run-.*\.prompt$/u;
 const PROXY_CA_CERT_PATH = "/etc/proxy-ca/proxy-ca.crt";
 
 function requiredBackend(): LiveRuntimeBackend {
-  const backend = process.env.TEST_RUNTIME_BACKEND;
-  if (backend !== "docker-desktop") {
-    throw new Error("TEST_RUNTIME_BACKEND must be docker-desktop for the headless-run tranche");
-  }
-  return backend;
+  return requireLiveRuntimeBackend("the headless-run tranche");
 }
 
 // ---------------------------------------------------------------------------

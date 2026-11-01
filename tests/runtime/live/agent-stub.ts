@@ -121,6 +121,11 @@ export const FIRST_REQUEST_RESULT_RELATIVE_PATH = path.join(".runfree-first-requ
  * proxy's 502. What the tranches prove is that the proxy let the request
  * through, not that some upstream answered it, so no public service — and no
  * public service's rate limit — sits in the result.
+ *
+ * Because it never resolves, it cannot be a project's only allowlisted host:
+ * the proxy firewall refuses to start when no allowlisted host resolves to a
+ * safe IPv4. `configureAttachedProject` (attached-support.ts) therefore also
+ * allowlists a resolvable host the stub never contacts.
  */
 export const FIRST_REQUEST_HOST = "runfree-first-request.invalid";
 const FIRST_REQUEST_CONTAINER_DIR = "/workspace/.runfree-first-request";
