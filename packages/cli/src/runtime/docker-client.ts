@@ -108,6 +108,8 @@ export function labelRunFlags(flagPairs: readonly string[]): readonly DockerRunF
 export type DockerCaptureMethods<R> = Readonly<{
   info(format?: string, options?: DockerCallOptions): R;
   inspect(refs: readonly string[], query?: Readonly<{ type?: DockerObjectType; format?: string }>, options?: DockerCallOptions): R;
+  /** `docker context inspect --format <format>` of the current context. */
+  inspectContext(format: string, options?: DockerCallOptions): R;
   listContainers(query: DockerListQuery, options?: DockerCallOptions): R;
   listObjects(type: Exclude<DockerObjectType, "container">, query: DockerListQuery & Readonly<{ reference?: string }>, options?: DockerCallOptions): R;
   logs(containerId: string, query: Readonly<{ tail?: number; since?: string }>, options?: DockerCallOptions): R;
@@ -175,6 +177,7 @@ function captureMethods<R>(capture: (args: string[], options?: DockerCallOptions
       ...(query.format !== undefined ? ["--format", query.format] : []),
       ...refs,
     ], options),
+    inspectContext: (format, options) => capture(["context", "inspect", "--format", format], options),
     listContainers: (query, options) => capture(["ps", ...listArgs(query)], options),
     listObjects: (type, query, options) => capture([type, "ls", ...listArgs(query), ...(query.reference !== undefined ? [query.reference] : [])], options),
     logs: (containerId, query, options) => capture([

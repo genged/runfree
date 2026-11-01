@@ -54,11 +54,11 @@ const context = {
 };
 
 describe("probeHostListeners", () => {
-  test("a platform other than darwin is unavailable without running lsof", () => {
+  test("a platform other than macOS or Linux is unavailable without running lsof", () => {
     const { io, calls } = fakeIo({ status: 0, stdout: "p1\ncx\nn127.0.0.1:1\n", stderr: "" });
 
-    const snapshot = probeHostListeners(context, io, "linux");
-    expect(snapshot).toEqual({ kind: "unavailable", reason: expect.stringContaining("macOS") });
+    const snapshot = probeHostListeners(context, io, "win32");
+    expect(snapshot).toEqual({ kind: "unavailable", reason: expect.stringContaining("macOS or Linux") });
     expect(calls).toHaveLength(0);
   });
 

@@ -53,6 +53,7 @@ test("topology assertion inventory covers the current security checks", () => {
     "agent-pid1-identity",
     "agent-proxy-reachability",
     "git-layout-container-proof",
+    "host-relay-shape",
     "internal-network-gateway-free",
     "internal-network-internal",
     "internal-network-ipv6-disabled",

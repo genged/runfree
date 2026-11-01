@@ -77,7 +77,7 @@ authority. Anything that the agent can write is input, never authority.
 | endpoint host | A host that a record names and that serves an MCP endpoint. |
 | ephemeral helper, helper | A short-lived container for one task. |
 | fence | A check before IP reuse that the old owner is gone. |
-| gateway | The Docker Desktop address to the host loopback. |
+| gateway | The Docker daemon's host-gateway address: Docker Desktop's path to the host loopback, or on Docker Engine the address the host relay binds. |
 | git handling rule | The `gitPush` rule. A fetch is a read; a push is a git push. |
 | `git-lfs` destination | A destination that matches only Git LFS batch and lock requests. |
 | grant, deny | A host decision that lets later writes through, or refuses them. |
@@ -188,16 +188,33 @@ Tests: [network-policy.test.ts](../packages/runtime-contracts/src/network-policy
 - The tunnel carries raw bytes, with no request rules, write approval, or
   credentials.
 - Only the request proxy (uid 1001) can reach the port.
-- The gateway is the private IPv4 address from Docker Desktop, never from
+- The gateway is the private IPv4 address from the Docker daemon, never from
   DNS. If it is invalid, host services refuse.
 - A removal or a gateway change cuts open tunnels.
+- The proxy path is the same on every backend. On Docker Desktop the host
+  gateway reaches the host's loopback itself. On a local Docker Engine on
+  Linux the host relay does: it listens only on the gateway address, for
+  approved ports only, accepts only the proxy's egress IP, and forwards to
+  `127.0.0.1:<port>`. A removed port stops listening, but the relay never
+  closes an open tunnel: revocation is the proxy's two cuts on every
+  backend, with no third cut. Every validation, warm launches included,
+  proves the relay: exactly one on Engine with its hardened shape and the
+  plan's addresses as its environment, and none on Desktop. Other backends,
+  a Docker Desktop reached over TCP or SSH included, refuse
+  `host-service add`.
+- On Docker Engine the relay runs as a non-root user with no capabilities,
+  so `host-service add` refuses a port below the host's
+  `net.ipv4.ip_unprivileged_port_start`. If that value cannot be read, it
+  refuses every port. Docker Desktop has no such limit.
+- The relay is a script run by the proxy image's Node: no new image or
+  dependency, and the same trust as the proxy image.
 - Limits: 32 tunnels per session, 256 in all, 64 pending, and 5 s to
   connect.
 
 Why: the rule keeps this hole in the sandbox to one port.
 
-Enforced: [host-service-tunnel.ts](../packages/proxy/src/host-service-tunnel.ts) `createHostServiceTunnels`, [host-service-gateway.ts](../packages/proxy/src/firewall/host-service-gateway.ts) `validateHostServiceGateway`, [nftables.ts](../packages/proxy/src/firewall/nftables.ts) `renderHostServiceSetUpdate`  
-Tests: [host-service-tunnel.test.ts](../packages/proxy/src/host-service-tunnel.test.ts), [server-host-services.test.ts](../packages/proxy/src/server-host-services.test.ts), [host-service-gateway.test.ts](../packages/proxy/src/firewall/host-service-gateway.test.ts).
+Enforced: [host-service-tunnel.ts](../packages/proxy/src/host-service-tunnel.ts) `createHostServiceTunnels`, [host-service-gateway.ts](../packages/proxy/src/firewall/host-service-gateway.ts) `validateHostServiceGateway`, [nftables.ts](../packages/proxy/src/firewall/nftables.ts) `renderHostServiceSetUpdate`, [host-relay.ts](../packages/proxy/src/host-relay.ts) `createHostRelay`, [host-relay-topology.ts](../packages/cli/src/runtime/host-relay-topology.ts) `hostRelayTopologyIssues`  
+Tests: [host-service-tunnel.test.ts](../packages/proxy/src/host-service-tunnel.test.ts), [server-host-services.test.ts](../packages/proxy/src/server-host-services.test.ts), [host-service-gateway.test.ts](../packages/proxy/src/firewall/host-service-gateway.test.ts), [host-relay.test.ts](../packages/proxy/src/host-relay.test.ts), [host-relay-topology.test.ts](../packages/cli/src/runtime/host-relay-topology.test.ts).
 
 ### NET-7. If the proxy cannot read a request's shape clearly, it refuses the request.
 
@@ -1379,7 +1396,12 @@ credential is a security decision.
 | A new publication on an approved port stays reachable. | The agent reaches it. | Watch the `runfree status` warning. |
 | A gateway change or withdrawal stops host services ([`NET-6`](#network)). | Host services fail. | Run `runfree rebuild`. |
 | Host-service splices have no idle timeout. | An idle splice stays open. | Remove the service. |
-| New host-service connections fail for about 2 s after a reload. | `host-service-unavailable`. | Retry. |
+| On Docker Engine the host relay is a process on the host network namespace. It parses nothing and binds only the gateway address. It runs on the proxy image's Node, so it shares that image's trust and update path. | A relay bug exposes approved ports to other containers on the host. A compromised proxy image also compromises the relay. | Keep the relay's shape, which topology proves; remove unused services. |
+| On Docker Engine the relay binds without root or capabilities. | `host-service add` refuses a port below `net.ipv4.ip_unprivileged_port_start`, and refuses every port if that value cannot be read. | Use a port at or above the sysctl, or lower it on the host. |
+| On Docker Engine a service on `0.0.0.0:<port>` is served directly, not relayed. | It is also reachable from the LAN and from other containers, as it was before Runfree. | Bind the service to `127.0.0.1`. |
+| On Docker Engine the relay holds `<gateway>:<port>`. | A new wildcard bind of that port on the host fails. | Remove the service, or bind the new listener to `127.0.0.1`. |
+| On Docker Engine a default-deny INPUT host firewall (ufw, firewalld) blocks the proxy's egress network. | Host services time out. | Allow the egress network to reach the gateway address. |
+| New host-service connections fail for about 2 s after a reload. On Docker Engine this includes the relay binding a newly added port (a watch plus a 250 ms poll). | `host-service-unavailable`. | Retry. |
 
 ### Sessions and lifecycle risks
 

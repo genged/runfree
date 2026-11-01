@@ -128,8 +128,11 @@ function insertProxyEnvironment(compose: string, entries: Readonly<Record<string
   if (proxyStart === -1) {
     throw new Error("embedded runtime compose.yaml no longer has the expected proxy service block");
   }
+  // The proxy block ends at the next service key (or comment) at two spaces,
+  // so another service's `environment:` can never be mistaken for it.
+  const proxyEnd = findBlockEnd(lines, proxyStart, (line) => isDedentedAtOrBelow(line, 2));
   const environmentStart = lines.findIndex(
-    (line, index) => index > proxyStart && index < servicesEnd && line === "    environment:",
+    (line, index) => index > proxyStart && index < Math.min(proxyEnd, servicesEnd) && line === "    environment:",
   );
   if (environmentStart === -1) {
     throw new Error("embedded runtime compose.yaml no longer has the expected proxy environment block");

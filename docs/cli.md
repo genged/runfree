@@ -554,10 +554,12 @@ psql -h 127.0.0.1 -p 5432 -U <user> <database>
   layers.
 - Before any policy write, `add` refuses these ports: 2375 and 2376 (Docker
   Engine), 3128, 5901 (Runfree's VNC default), and 47100–48099 (Runfree's MCP
-  callback block). It then runs `lsof` and refuses a port with no visible
-  listener or with any listener owned by Docker Desktop (`com.docker.*`, a
-  published container port). The output names the process and pid you
-  approved.
+  callback block). It refuses a Docker backend other than Docker Desktop or a
+  local Docker Engine on Linux (see [Host services on Linux](#host-services-on-linux)).
+  It then checks who listens (`lsof` on macOS, `/proc` on Linux) and refuses
+  a port with no visible listener or with any listener owned by Docker
+  Desktop (`com.docker.*`, a published container port). The output names the
+  process and pid you approved.
 - A service added while a session runs appears in the next session.
   `remove` cuts open connections in every session and reports `live now` once
   the proxy and the firewall have both cut it. A port the in-session relay
@@ -582,6 +584,42 @@ psql -h 127.0.0.1 -p 5432 -U <user> <database>
 - If the host gateway address changes, host services stay refused until
   `runfree rebuild`, and `runfree logs proxy` shows
   `proxy: host-service splices cut: <count>; reason: <reason>`.
+
+### Host services on Linux
+
+On Linux with a local Docker Engine (rootful, on a unix socket), host
+services work the same way: start the service on `127.0.0.1:<port>`, run
+`runfree host-service add`, start a new session. Runfree adds one container,
+the host relay (`runfree-<project id>-host-relay`), which forwards from the
+Docker gateway address to the host's `127.0.0.1:<port>` and accepts
+connections only from the project's proxy. `runfree up`, `down`, `destroy`,
+and `rebuild` manage it; `docker logs runfree-<project id>-host-relay` shows
+which ports it relays. Docker Desktop needs no relay, and none runs there.
+
+- `add` refuses a port below `net.ipv4.ip_unprivileged_port_start` (usually
+  1024), because the relay runs without root or added capabilities. Use a
+  higher port, or lower the sysctl on the host.
+- `add` refuses a port a container publishes (`docker ps`), and a port held by
+  `docker-proxy`, as "published by a container".
+- A listener owned by root or another user is refused as "no visible
+  listener"; the reason names the socket's uid. A listener whose full process
+  name (its executable, else its first command-line argument) cannot be read
+  makes the listener check unavailable, and `add` refuses.
+- If the relay is missing, stopped, or not in its exact shape, `runfree up`
+  and session launches refuse with a `host relay` topology issue; `runfree
+  rebuild` recreates it.
+- A service on `0.0.0.0:<port>` is reached directly, without the relay. While
+  the relay holds `<gateway>:<port>`, a new wildcard bind of that port fails;
+  `runfree status` then names a socket owned by uid 65534 on the gateway
+  address.
+- A host firewall that drops incoming traffic by default (ufw, firewalld) must
+  allow the proxy's egress network to reach the Docker gateway address, or host
+  services time out.
+- A newly added port can refuse connections for a moment while the relay
+  binds it; retry.
+- Rootless Docker, OrbStack, Colima, and remote daemons (a Docker Desktop
+  reached over TCP or SSH included) refuse `add` with "host services need
+  Docker Desktop or a local Docker Engine on Linux".
 
 ## Credentials
 

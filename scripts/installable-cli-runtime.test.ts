@@ -61,8 +61,11 @@ describe("installable runfree CLI: typescript runtime", () => {
     // Post-cutover the embedded template is the per-session shape: proxy +
     // networks only, no shared agent service or its render markers. Asserted
     // as the exact service set rather than the absence of one named `agent`,
-    // so a shared service reintroduced under any name fails here.
-    expect(composeTopLevelKeys(compose, "services")).toEqual(["proxy"]);
+    // so a shared service reintroduced under any name fails here. The one
+    // other service is the Engine host-service relay, which never holds an
+    // agent: it runs the proxy image, only under its Compose profile.
+    expect(composeTopLevelKeys(compose, "services")).toEqual(["proxy", "host_relay"]);
+    expect(compose).toContain("    profiles:\n      - host-relay\n");
     expect(compose).not.toContain("# RUNFREE_AGENT_ENV");
     expect(compose).not.toContain("# RUNFREE_AGENT_STATE_MOUNTS");
     expect(compose).not.toContain("io.runfree.container-role: agent");

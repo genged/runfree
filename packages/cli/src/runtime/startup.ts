@@ -40,6 +40,7 @@ import {
   containerMissingNetwork,
   createRuntimeDocker,
   dockerClientEnvOptions,
+  hostServiceRelayMode,
   lastObservedDockerDaemonIdentity,
   parseDockerJson,
   type RuntimeDocker,
@@ -1673,6 +1674,7 @@ export async function startRuntime(
         volumeLogicalNames: composeManagedSessionVolumeLogicalNames(activeContext),
         gitLayout: serializeGitLayoutPlan(activePlan.gitLayout),
         effectiveHostServices,
+        hostServiceRelay: hostServiceRelayMode(activeContext, io),
       };
     };
     // Why this start may not even ask the warm proof, or undefined when it may.
@@ -2187,6 +2189,13 @@ export async function startRuntime(
               });
               if (proxyStatus !== 0) throw new RuntimeObservationError({ kind: "observation-unavailable", subject: "proxy",
                 expectedIdentity: transaction.transactionId, phase: "prepared", observation: `candidate proxy start failed with status ${proxyStatus}; recapture its creation marker` });
+              // On Engine the host relay follows the candidate's image and
+              // generation labels before the candidate proof inspects it; a
+              // no-op elsewhere. A failed sync leaves the old relay, which the
+              // proof then refuses (and `runfree rebuild` recreates).
+              heldLifecycleLock.assertHeld();
+              const relayStatus = rebindDocker.composeSyncHostRelay(project);
+              if (relayStatus !== 0) warn(`the host-service relay could not be updated with the proxy (docker compose exited ${relayStatus})`);
               warn("proxy replacement reset pending approvals, temporary grants, remembered denials, and audit capture; interrupted requests are not replayed");
               return await proveCandidate();
             },

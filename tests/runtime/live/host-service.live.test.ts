@@ -1,6 +1,16 @@
 // Host-service live tranche (core tier): an approved service on the host's
 // loopback, reached by the agent through its loopback relay and the proxy's
-// opaque splice to the pinned Docker Desktop host gateway, and nothing else.
+// opaque splice to the pinned host gateway, and nothing else.
+//
+// One proxy path on every backend; one backend adapter. On Docker Desktop the
+// daemon's host gateway already forwards to the host's loopback. On a local
+// Docker Engine on Linux the Engine host relay (a `host_relay` Compose service
+// on the host network) answers <gateway>:P for each approved port and splices
+// to host 127.0.0.1:P, admitting only the proxy's egress IP. The backend is
+// the run's TEST_RUNTIME_BACKEND label, cross-checked in `beforeAll` against
+// the product's own classification (`detectDockerBackend`), and the few
+// backend-specific assertions below branch on it: case 6's container-owned
+// port, and cases 10 and 11.
 //
 // Setup: a TCP echo server on host 127.0.0.1 (an approved port P and an
 // unapproved port Q, both OS-chosen), the seeded sandbox project, `runfree
@@ -42,9 +52,12 @@
 //   5. no cross-session reach: a second session cannot connect to the first
 //      session's relay port, while it can reach a 0.0.0.0 listener in the
 //      first session (the positive control).
-//   6. admission and registry: static refusals, no listener, a Docker
-//      Desktop-owned port; `forward` and `vnc` in another project refuse the
-//      approved port and name this project; a corrupt registry refuses and
+//   6. admission and registry: static refusals, no listener, a port a
+//      container publishes (on Desktop a Docker Desktop-owned port staged by
+//      this project's own `forward`; on Engine a short-lived hardened helper
+//      publishing 127.0.0.1:<port>, refused as "published by a container");
+//      `forward` and `vnc` in another project refuse the approved port and
+//      name this project; a corrupt registry refuses and
 //      `host-service list --repair` recovers it.
 //   7. revocation: `host-service remove` closes an open relay connection on
 //      both sides. The request-proxy cut is proven alone: a root nft rule
@@ -75,6 +88,17 @@
 //      drain window, when the established accept would pass the flow again,
 //      no established proxy socket to the old pair remains and the host saw
 //      no new bytes on it. `runfree rebuild` re-pins and the echo works again.
+//  10. Docker Engine only (C8): the host relay runs hardened (uid 65534, no
+//      capabilities, no-new-privileges, read-only rootfs, host network, the
+//      proxy's image, the proxy's egress IP as its one allowed source), and
+//      its listening sockets, read from the host's own /proc/net/tcp{,6}
+//      tables, are exactly <gateway>:P: no 0.0.0.0, ::, or loopback listener,
+//      so the LAN is not exposed, and none on the unapproved port Q, which
+//      still gets the proxy's raw 403 with no host accept. A container that is
+//      not the proxy, on another network (the default bridge), connecting to
+//      <gateway>:P is refused by the relay itself (its log names the refusal)
+//      and the host's echo server records no connection.
+//  11. Docker Desktop only: no host relay container exists for the project.
 //
 // Recorded proof gaps (not staged here, never faked):
 //
@@ -93,11 +117,13 @@
 //     project image without the relay; `scripts/session-entry.test.ts` covers
 //     it against the real entry script.
 //   - F29 (startup top-ten): the launch-time warning loop now answers every
-//     approved host service from one bounded `lsof -iTCP -sTCP:LISTEN -Fpcn`
-//     observation of every TCP listener on the host instead of one
-//     `lsof -iTCP:<port>` call per service (host-listener-snapshot.ts). The
-//     `up` assertion in `beforeAll` proves visibility and owner accuracy for
-//     this fixture's one real listener on a real macOS/Docker Desktop host,
+//     approved host service from one bounded observation of every TCP
+//     listener on the host, through the one listener interface
+//     (host-listener-probe.ts: `lsof -iTCP -sTCP:LISTEN -Fpcn` on macOS,
+//     /proc/net/tcp{,6} and /proc/<pid>/fd on Linux), instead of one probe
+//     per service (host-listener-snapshot.ts). The `up` assertion in
+//     `beforeAll` proves visibility and owner accuracy for this fixture's one
+//     real listener on the backend's real host,
 //     but a Docker sandbox has no way to stage "0 real listeners", "1 real
 //     listener", "10 real listeners", or a high ambient host-process count
 //     without faking the host's own process table -- the controller ruling
@@ -125,14 +151,25 @@ import { fileURLToPath } from "node:url";
 
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 
+import { detectDockerBackend } from "../../../packages/cli/src/docker-backend.ts";
 import { runfreeStateRoot } from "../../../packages/cli/src/paths.ts";
+import type { RuntimeIO } from "../../../packages/cli/src/runtime/types.ts";
+import { parseProcNetTcp, PROC_NET_TCP_LISTEN_STATE, type ProcNetTcpSocket } from "../../../packages/runtime-contracts/src/proc-net-tcp.ts";
 import { mcpOAuthProviderId } from "../../../packages/cli/src/runtime/mcp.ts";
 import { DEFAULT_EFFECTIVE_PROXY_ROOT } from "../../../packages/runtime-contracts/src/effective-control.ts";
 import { refusedHostServicePortReason } from "../../../packages/runtime-contracts/src/host-services.ts";
 import { isIpLiteralHostname, type PolicyJson } from "../../../packages/runtime-contracts/src/network-policy.ts";
 import { parseGenerationStatusLine, requestProxyStatusPath } from "../../../packages/runtime-contracts/src/proxy-status.ts";
 import { cliEntryArgv } from "../../support/prebuilt-entry.ts";
-import { composeProjectName, composeServiceContainerId, docker, dockerOrThrow, waitUntil } from "./docker.ts";
+import {
+  composeProjectName,
+  composeServiceContainerId,
+  docker,
+  dockerOrThrow,
+  forceRemoveContainer,
+  LIVE_TEST_LABEL,
+  waitUntil,
+} from "./docker.ts";
 import {
   describeOutput,
   destroyLiveFixture,
@@ -171,6 +208,91 @@ const PROXY_ENV_UNSET = [
 
 function requiredBackend(): LiveRuntimeBackend {
   return requireLiveRuntimeBackend("the host-service tranche");
+}
+
+/**
+ * The run's backend label, read at collection so the backend-specific cases
+ * can be registered or skipped by name; `beforeAll` requires it to be a valid
+ * label that the product's own classification agrees with.
+ */
+const ON_DOCKER_ENGINE = process.env.TEST_RUNTIME_BACKEND === "docker-engine";
+
+/** The product's classification of this daemon (`docker-backend.ts`), with real Docker calls. */
+function productDockerBackend(): string {
+  const io: Pick<RuntimeIO, "capture"> = {
+    capture(command, args, options = {}) {
+      const result = childProcess.spawnSync(command, args, {
+        encoding: "utf8",
+        env: options.env,
+        timeout: typeof options.timeout === "number" ? options.timeout : 30_000,
+        maxBuffer: 16 * 1024 * 1024,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      return { status: result.status ?? 1, stdout: result.stdout ?? "", stderr: result.stderr ?? "" };
+    },
+  };
+  const backend = detectDockerBackend({ env: process.env }, io);
+  return backend.kind === "unsupported" ? `unsupported (${backend.reason})` : backend.kind;
+}
+
+/** Arguments that harden every short-lived helper container this tranche starts. */
+const HARDENED_HELPER_ARGS = [
+  "--label", `${LIVE_TEST_LABEL}=host-service`,
+  "--cap-drop", "ALL",
+  "--security-opt", "no-new-privileges:true",
+  "--read-only",
+  "--user", "65534:65534",
+  "--pids-limit", "16",
+] as const;
+
+/**
+ * The Engine host relay's own listening sockets, read inside the relay (it
+ * shares the host network namespace, so `/proc/net/tcp{,6}` there is the
+ * host's table): every socket inode the relay's processes hold, matched to
+ * the host's LISTEN rows. Returned as the raw kernel rows, parsed here by the
+ * product parser.
+ */
+const RELAY_SOCKETS_PROGRAM = `
+const fs = require("node:fs");
+const inodes = new Set();
+for (const pid of fs.readdirSync("/proc").filter((entry) => /^[0-9]+$/.test(entry))) {
+  if (pid === String(process.pid)) continue;
+  let fds = [];
+  try { fds = fs.readdirSync("/proc/" + pid + "/fd"); } catch { continue; }
+  for (const fd of fds) {
+    try {
+      const match = /^socket:\\[([0-9]+)\\]$/.exec(fs.readlinkSync("/proc/" + pid + "/fd/" + fd));
+      if (match) inodes.add(match[1]);
+    } catch {}
+  }
+}
+const tables = {};
+for (const file of ["/proc/net/tcp", "/proc/net/tcp6"]) {
+  const lines = fs.readFileSync(file, "utf8").split("\\n").filter(Boolean);
+  tables[file] = [lines[0], ...lines.slice(1).filter((line) => inodes.has(line.trim().split(/\\s+/)[9]))];
+}
+process.stdout.write(JSON.stringify(tables));
+`;
+
+function listening(text: string, family: 4 | 6, label: string): ProcNetTcpSocket[] {
+  const parsed = parseProcNetTcp(text, family);
+  if (!Array.isArray(parsed)) throw new Error(`${label}: ${parsed.error}`);
+  return parsed.filter((socket) => socket.state === PROC_NET_TCP_LISTEN_STATE);
+}
+
+function relayListeningSockets(relayId: string): ProcNetTcpSocket[] {
+  const tables = JSON.parse(dockerOrThrow("relay listening sockets", ["exec", relayId, "node", "-e", RELAY_SOCKETS_PROGRAM])) as Record<string, string[]>;
+  return [
+    ...listening(`${(tables["/proc/net/tcp"] ?? []).join("\n")}\n`, 4, "relay /proc/net/tcp"),
+    ...listening(`${(tables["/proc/net/tcp6"] ?? []).join("\n")}\n`, 6, "relay /proc/net/tcp6"),
+  ];
+}
+
+/** Every LISTEN socket on the host for `port`, from this (host) process's own /proc tables. */
+function hostListeningSocketsOnPort(port: number): ProcNetTcpSocket[] {
+  const sockets = listening(fs.readFileSync("/proc/net/tcp", "utf8"), 4, "host /proc/net/tcp");
+  if (fs.existsSync("/proc/net/tcp6")) sockets.push(...listening(fs.readFileSync("/proc/net/tcp6", "utf8"), 6, "host /proc/net/tcp6"));
+  return sockets.filter((socket) => socket.port === port);
 }
 
 function nonce(label: string): string {
@@ -907,6 +1029,7 @@ function addProjectMcpServer(projectRoot: string, name: string, config: Record<s
 // ---------------------------------------------------------------------------
 
 describe("approved host services", () => {
+  let backend: LiveRuntimeBackend;
   let echo: EchoServer;
   let fixture: LiveFixture;
   let proxyId: string;
@@ -954,8 +1077,32 @@ describe("approved host services", () => {
     expect(hostConnectionCarrying(echo, text), `${label}: the host never received the nonce on the approved port`).toBeDefined();
   };
 
+  const relayContainerId = (): string => composeServiceContainerId(composeProjectName(fixture), "host_relay");
+
+  /**
+   * On Docker Engine, waits until the host relay listens on <pinned
+   * gateway>:P (its own sockets in the host's /proc/net/tcp, the C8 check's
+   * reader). The relay binds shortly after a generation goes live (a watch
+   * plus a short poll; the accepted "about 2 s after a reload" window), so
+   * every add, re-add, and rebuild waits for it before opening a connection.
+   * A no-op on Desktop, where no relay runs.
+   */
+  const awaitHostRelayListening = async (servicePort: number = port): Promise<void> => {
+    if (!ON_DOCKER_ENGINE) return;
+    const gateway = pinnedGateway(proxyId);
+    await pollUntil(
+      () => relayListeningSockets(relayContainerId()).some((socket) => socket.address === gateway && socket.port === servicePort),
+      { timeoutMs: 20_000, label: `the host relay to listen on ${gateway}:${servicePort}` },
+    );
+  };
+
   beforeAll(async () => {
-    requiredBackend();
+    backend = requiredBackend();
+    // The label decides which backend-specific cases run; the product decides
+    // which adapter the runtime uses. They must agree, or those cases would
+    // prove the wrong backend.
+    expect(productDockerBackend(), `TEST_RUNTIME_BACKEND=${backend} is not what the product detects`).toBe(backend);
+    expect(ON_DOCKER_ENGINE).toBe(backend === "docker-engine");
     echo = await startEchoServer();
     port = echo.approvedPort;
     for (const candidate of [echo.approvedPort, echo.unapprovedPort]) {
@@ -976,9 +1123,10 @@ describe("approved host services", () => {
     const up = fixture.runfree(["up"]);
     expect(up.status, `runfree up did not select the host-service session agent: ${describeOutput(up.output)}`).toBe(0);
     // F29 (startup top-ten): this launch's warning loop answers the owner
-    // check from one bounded `lsof` observation of every host listener
-    // (host-listener-snapshot.ts), not one `lsof -iTCP:<port>` call per
-    // approved service as before. `add` just recorded the echo server as
+    // check from one bounded observation of every host listener through the
+    // listener interface (lsof on macOS, /proc on Linux;
+    // host-listener-snapshot.ts), not one probe per approved service as
+    // before. `add` just recorded the echo server as
     // this port's owner (the assertion above); a healthy launch immediately
     // after must see that exact same owner from the batched snapshot and
     // print no drift/visibility warning for it. Any regression in the batched
@@ -988,6 +1136,8 @@ describe("approved host services", () => {
     // absence of one.
     expect(up.output, `a real host listener was not visible through the batched snapshot: ${describeOutput(up.output)}`)
       .not.toMatch(/runfree warning:.*host service \S+ \(127\.0\.0\.1:\d+\):/u);
+    resolveProxy();
+    await awaitHostRelayListening();
     await startSession();
   }, PROVISION_TIMEOUT_MS);
 
@@ -1220,6 +1370,102 @@ describe("approved host services", () => {
     expect(hostServiceSetMembers(proxyId, "host_service")).toEqual([`${gateway} . ${port}`]);
   }, TEST_TIMEOUT_MS);
 
+  // Case 10 (C8): the Engine host relay. These run while `echo` is the only
+  // approved service (case 8b approves a second one later).
+  test.runIf(ON_DOCKER_ENGINE)("Docker Engine: the host relay runs hardened and listens only on <gateway>:P, never a wildcard or loopback (C8 d)", async () => {
+    const relayId = relayContainerId();
+    const [relay] = JSON.parse(dockerOrThrow("relay inspect", ["inspect", relayId])) as Array<{
+      Image?: string;
+      Config?: { User?: string; Env?: string[]; Labels?: Record<string, string> };
+      HostConfig?: { NetworkMode?: string; CapDrop?: string[] | null; CapAdd?: string[] | null; ReadonlyRootfs?: boolean; SecurityOpt?: string[] | null; Privileged?: boolean };
+    }>;
+    expect(relay?.Config?.User, "the relay does not run as 65534").toBe("65534:65534");
+    expect(relay?.HostConfig?.NetworkMode, "the relay is not on the host network").toBe("host");
+    expect(relay?.HostConfig?.CapDrop ?? [], "the relay keeps capabilities").toContain("ALL");
+    expect(relay?.HostConfig?.CapAdd ?? [], "the relay adds capabilities").toEqual([]);
+    expect(relay?.HostConfig?.Privileged, "the relay is privileged").toBe(false);
+    expect(relay?.HostConfig?.ReadonlyRootfs, "the relay's rootfs is writable").toBe(true);
+    expect(relay?.HostConfig?.SecurityOpt ?? [], "the relay lacks no-new-privileges").toContain("no-new-privileges:true");
+    expect(relay?.Config?.Labels?.["io.runfree.container-role"]).toBe("host-relay");
+    expect(relay?.Image, "the relay does not run the proxy image").toBe(dockerOrThrow("proxy image id", ["inspect", "-f", "{{.Image}}", proxyId]));
+    const egressIp = dockerOrThrow("proxy egress address", [
+      "inspect", "-f", `{{with index .NetworkSettings.Networks "${composeProjectName(fixture)}_proxy_egress"}}{{.IPAddress}}{{end}}`, proxyId,
+    ]);
+    expect(relay?.Config?.Env ?? [], "the relay's one allowed source is not the proxy's egress IP").toContain(`RUNFREE_PROXY_EGRESS_IP=${egressIp}`);
+
+    const gateway = pinnedGateway(proxyId);
+    let sockets: ProcNetTcpSocket[] = [];
+    await pollUntil(() => {
+      sockets = relayListeningSockets(relayId);
+      return sockets.some((socket) => socket.address === gateway && socket.port === port);
+    }, { timeoutMs: 20_000, intervalMs: 1000, label: `the relay to listen on ${gateway}:${port}` });
+    expect(sockets.map((socket) => `${socket.address}:${socket.port}`), "the relay listens somewhere other than exactly <gateway>:P")
+      .toEqual([`${gateway}:${port}`]);
+    // The host's own table for P, read by this host process: the echo server
+    // on 127.0.0.1 and the relay on the gateway, and no wildcard that would
+    // expose P to the LAN.
+    const onPort = hostListeningSocketsOnPort(port).map((socket) => socket.address).sort();
+    expect(onPort, `host listeners on ${port}`).toEqual([gateway, "127.0.0.1"].sort());
+  }, TEST_TIMEOUT_MS);
+
+  test.runIf(ON_DOCKER_ENGINE)("Docker Engine: the unapproved port has no relay listener and gets the proxy's raw 403 (C8 c)", () => {
+    const unapproved = echo.unapprovedPort;
+    const relayPorts = relayListeningSockets(relayContainerId()).map((socket) => socket.port);
+    expect(relayPorts, "the relay listens on the unapproved port").not.toContain(unapproved);
+    const gateway = pinnedGateway(proxyId);
+    expect(hostListeningSocketsOnPort(unapproved).map((socket) => socket.address), "something listens on <gateway>:Q on the host")
+      .not.toContain(gateway);
+    const opensBefore = hostOpenCount(echo, "unapproved");
+    const refused = sessionRawConnect(sessions[0].session.containerId, proxyIp, `${SERVICE_NAME}.runfree.internal:${unapproved}`);
+    expect(refused.startsWith("HTTP/1.1 403"), `the unapproved pair was not refused with a raw 403: ${describeOutput(refused)}`).toBe(true);
+    expect(refused).toContain("host-service-not-configured");
+    expect(hostOpenCount(echo, "unapproved"), "the refused CONNECT reached the unapproved host port").toBe(opensBefore);
+  }, TEST_TIMEOUT_MS);
+
+  test.runIf(ON_DOCKER_ENGINE)("Docker Engine: a container that is not the proxy, on another network, is refused by the relay at <gateway>:P (C8 a)", async () => {
+    const relayId = relayContainerId();
+    const gateway = pinnedGateway(proxyId);
+    const proxyImage = dockerOrThrow("proxy image id", ["inspect", "-f", "{{.Image}}", proxyId]);
+    const text = nonce("foreign");
+    const opensBefore = hostOpenCount(echo, "approved");
+    const since = new Date(Date.now() - 1000).toISOString();
+    const helper = `runfree-livetest-foreign-${randomBytes(6).toString("hex")}`;
+    let result: CaptureResult;
+    try {
+      result = docker([
+        "run", "--rm", "--name", helper, ...HARDENED_HELPER_ARGS, "--network", "bridge",
+        proxyImage, "node", "-e", EXCHANGE_PROGRAM, gateway, String(port), text, "5000",
+      ]);
+    } finally {
+      forceRemoveContainer(helper);
+    }
+    let outcome: ExchangeOutcome;
+    try {
+      outcome = JSON.parse(result.stdout.trim().split("\n").at(-1) ?? "") as ExchangeOutcome;
+    } catch {
+      throw new Error(`the foreign-container probe did not run: ${describeOutput(result.output)}`);
+    }
+    expect(["closed-without-data", "error"], `the foreign container was not refused: ${JSON.stringify(outcome)}`).toContain(outcome.outcome);
+    // The relay itself refused it, before any upstream dial: its log names
+    // the refusal (a host firewall drop would be a timeout with no log).
+    await pollUntil(() => docker(["logs", "--since", since, relayId]).output.includes(`host-relay: ${gateway}:${port} refused a connection from`), {
+      timeoutMs: 10_000,
+      label: "the relay to log the refused foreign connection",
+    });
+    expect(hostConnectionCarrying(echo, text), "the foreign container's bytes reached the host service").toBeUndefined();
+    expect(hostOpenCount(echo, "approved"), "the host service accepted a connection for the foreign container").toBe(opensBefore);
+  }, TEST_TIMEOUT_MS);
+
+  test.runIf(!ON_DOCKER_ENGINE)("Docker Desktop: no host relay exists; the daemon's host gateway serves host services (case 11)", () => {
+    const ids = dockerOrThrow("host relay lookup", [
+      "ps", "--all", "--no-trunc",
+      "--filter", `label=com.docker.compose.project=${composeProjectName(fixture)}`,
+      "--filter", "label=com.docker.compose.service=host_relay",
+      "--format", "{{.ID}}",
+    ]);
+    expect(ids, "a host relay container exists on Docker Desktop").toBe("");
+  }, TEST_TIMEOUT_MS);
+
   test("a second session cannot reach the first session's relay", async () => {
     const first = sessions[0].session;
     const second = await startSession(true);
@@ -1259,15 +1505,33 @@ describe("approved host services", () => {
     const unused = await freeHostPort();
     refusedAdd("nothing", unused, `no process listens on 127.0.0.1:${unused}`);
 
-    // A Docker Desktop-owned port: this project's own forward publishes one.
+    // A port a container publishes on the host. On Docker Desktop: a Docker
+    // Desktop-owned port, which this project's own forward publishes. On
+    // Docker Engine: a container-published port, staged by a short-lived
+    // hardened helper publishing 127.0.0.1:<port>, refused as published by a
+    // container (Engine admission reads `docker ps` port bindings).
     const published = await freeHostPort();
-    const forward = fixture.runfree(["forward", String(published)]);
-    expect(forward.status, `could not open a forward to stage a Docker-owned port: ${describeOutput(forward.output)}`).toBe(0);
-    try {
-      refusedAdd("published", published, "owned by Docker Desktop");
-    } finally {
-      const closed = fixture.runfree(["forward", String(published), "stop"]);
-      expect(closed.status, `could not close the staging forward: ${describeOutput(closed.output)}`).toBe(0);
+    if (backend === "docker-desktop") {
+      const forward = fixture.runfree(["forward", String(published)]);
+      expect(forward.status, `could not open a forward to stage a Docker-owned port: ${describeOutput(forward.output)}`).toBe(0);
+      try {
+        refusedAdd("published", published, "owned by Docker Desktop");
+      } finally {
+        const closed = fixture.runfree(["forward", String(published), "stop"]);
+        expect(closed.status, `could not close the staging forward: ${describeOutput(closed.output)}`).toBe(0);
+      }
+    } else {
+      const helper = `runfree-livetest-published-${randomBytes(6).toString("hex")}`;
+      const proxyImage = dockerOrThrow("proxy image id", ["inspect", "-f", "{{.Image}}", proxyId]);
+      try {
+        dockerOrThrow("publish a container port on the host", [
+          "run", "-d", "--name", helper, ...HARDENED_HELPER_ARGS, "-p", `127.0.0.1:${published}:8080`,
+          proxyImage, "node", "-e", "setInterval(() => {}, 1 << 30)",
+        ]);
+        refusedAdd("published", published, `127.0.0.1:${published} is published by a container`);
+      } finally {
+        forceRemoveContainer(helper);
+      }
     }
 
     // Another project on this host, never started, sharing the host state.
@@ -1352,6 +1616,7 @@ describe("approved host services", () => {
 
     // Restore the approval for the remaining cases.
     runConverged(["host-service", "add", SERVICE_NAME, "--port", String(port)]);
+    await awaitHostRelayListening();
     await assertEchoThroughRelay(sessionId, "re-added");
   }, TEST_TIMEOUT_MS);
 
@@ -1409,6 +1674,7 @@ describe("approved host services", () => {
 
     // Restore the approval for the remaining cases.
     runConverged(["host-service", "add", SERVICE_NAME, "--port", String(port)]);
+    await awaitHostRelayListening();
     await assertEchoThroughRelay(sessions[0].session.containerId, "re-added after the firewall-only cut");
   }, TEST_TIMEOUT_MS);
 
@@ -1464,6 +1730,8 @@ describe("approved host services", () => {
       // startup a production launch runs selects the agent that carries it.
       const up = fixture.runfree(["up"]);
       expect(up.status, `runfree up did not select the session agent: ${describeOutput(up.output)}`).toBe(0);
+      resolveProxy();
+      await awaitHostRelayListening(stubPort);
 
       session = await startSession();
       const sessionId = session.session.containerId;
@@ -1637,6 +1905,10 @@ describe("approved host services", () => {
     resolveProxy();
     const repinned = pinnedGateway(proxyId);
     expect(hostServiceSetMembers(proxyId, "host_service")).toEqual([`${repinned} . ${port}`]);
+    // On Engine the rebuild recreated the relay too, which re-reads the
+    // daemon's gateway as the new proxy does; it must listen on the re-pinned
+    // gateway before the session dials it.
+    await awaitHostRelayListening();
     const after = await startSession();
     await assertEchoThroughRelay(after.session.containerId, "after-rebuild");
   }, REBUILD_TEST_TIMEOUT_MS);

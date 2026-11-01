@@ -31,6 +31,17 @@ test("containerMissingNetwork reports absent compose network", () => {
   expect(containerMissingNetwork({ id: "abc", networks: ["agent_internal", "proxy_egress"] }, "agent_internal")).toBe(false);
 });
 
+test("the Engine host relay on exactly the host network is not stale network state (it would be removed on every up)", () => {
+  expect(containerMissingNetwork({ id: "r", networks: ["host"], service: "host_relay" }, "agent_internal")).toBe(false);
+  // Anything else stays stale: another service on host, the relay elsewhere,
+  // or the relay with an extra network.
+  expect(containerMissingNetwork({ id: "p", networks: ["host"], service: "proxy" }, "agent_internal")).toBe(true);
+  expect(containerMissingNetwork({ id: "u", networks: ["host"] }, "agent_internal")).toBe(true);
+  expect(containerMissingNetwork({ id: "r", networks: ["bridge"], service: "host_relay" }, "agent_internal")).toBe(true);
+  expect(containerMissingNetwork({ id: "r", networks: ["host", "bridge"], service: "host_relay" }, "agent_internal")).toBe(true);
+  expect(containerMissingNetwork({ id: "r", networks: [], service: "host_relay" }, "agent_internal")).toBe(true);
+});
+
 test("filterValues extracts the values out of well-formed --filter pairs", () => {
   expect(filterValues(["--filter", "label=a=1", "--filter", "label=b=2"])).toEqual(["label=a=1", "label=b=2"]);
   expect(filterValues([])).toEqual([]);

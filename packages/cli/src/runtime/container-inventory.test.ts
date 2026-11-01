@@ -101,7 +101,7 @@ describe("container inventory filters", () => {
     // ingress-forwarder joined the roles with the facility build (2026-08-18);
     // ingress purposes are vnc | port | mcp-callback (callback via cutover
     // option C).
-    expect([...CONTAINER_ROLES]).toEqual(["agent", "proxy", "mcp-callback-relay", "session-agent", "ephemeral-helper", "ingress-forwarder"]);
+    expect([...CONTAINER_ROLES]).toEqual(["agent", "proxy", "mcp-callback-relay", "session-agent", "ephemeral-helper", "ingress-forwarder", "host-relay"]);
     expect([...LIFECYCLE_OWNERS]).toEqual(["compose", "session", "utility"]);
     expect(CONTAINER_LABEL_SCHEMA_VERSION).toBe("1");
     expect([...EPHEMERAL_HELPER_PURPOSES]).toEqual(["deny-probe", "dependency-prep", "trust-bundle"]);

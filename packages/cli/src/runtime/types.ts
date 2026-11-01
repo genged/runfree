@@ -122,6 +122,8 @@ export type RuntimeIO = {
 export type ComposeContainer = {
   id: string;
   networks: string[];
+  /** The `com.docker.compose.service` label, when the inspection read it. */
+  service?: string;
 };
 
 export type DockerPortBinding = {

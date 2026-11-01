@@ -115,6 +115,56 @@ services:
       CA_CERT: /ca/public/proxy-ca.crt
       CA_KEY: /ca/private/proxy-ca.key
 
+  # Host-service relay: the one backend adapter for host services, enabled
+  # only on a local Docker Engine on Linux (the CLI sets COMPOSE_PROFILES).
+  # Docker Desktop's host gateway already reaches the host's loopback, so on
+  # Desktop this profile is never enabled and the service never exists. On
+  # Engine it runs the proxy image's node on the host network namespace, binds
+  # exactly <gateway>:P for each effective host service, admits only the
+  # proxy's egress IP, and splices to 127.0.0.1:P (packages/proxy/src/host-relay.ts).
+  # Topology requires this exact shape on Engine and its absence on Desktop.
+  host_relay:
+    profiles:
+      - host-relay
+    image: ${RUNFREE_PROXY_IMAGE:?RUNFREE_PROXY_IMAGE is required}
+    container_name: ${RUNFREE_COMPOSE_PROJECT_NAME:?RUNFREE_COMPOSE_PROJECT_NAME is required}-host-relay
+    network_mode: host
+    user: "65534:65534"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 64
+    init: true
+    labels:
+      io.runfree.project-id: ${RUNFREE_PROJECT_ID:?RUNFREE_PROJECT_ID is required}
+      io.runfree.compose-project: ${RUNFREE_COMPOSE_PROJECT_NAME:?RUNFREE_COMPOSE_PROJECT_NAME is required}
+      io.runfree.digest-schema: "1"
+      io.runfree.managed: "true"
+      io.runfree.container-role: host-relay
+      io.runfree.lifecycle-owner: compose
+      io.runfree.label-schema: "1"
+      io.runfree.proxy-image-input-digest: ${RUNFREE_PROXY_IMAGE_INPUT_DIGEST:?RUNFREE_PROXY_IMAGE_INPUT_DIGEST is required}
+      io.runfree.topology-digest: ${RUNFREE_TOPOLOGY_DIGEST:?RUNFREE_TOPOLOGY_DIGEST is required}
+      io.runfree.version: ${RUNFREE_VERSION:?RUNFREE_VERSION is required}
+    # The same daemon-sourced gateway entry the proxy pins, read the same way.
+    extra_hosts:
+      - "gateway.runfree.internal:host-gateway"
+    volumes:
+      - type: bind
+        source: ${RUNFREE_EFFECTIVE_PROXY_DIR:?RUNFREE_EFFECTIVE_PROXY_DIR is required}
+        target: /app/runfree-effective
+        read_only: true
+    environment:
+      RUNFREE_EFFECTIVE_PROXY_ROOT: /app/runfree-effective
+      RUNFREE_PROXY_IP: ${RUNFREE_PROXY_IP:-172.30.0.10}
+      RUNFREE_SUBNET: ${RUNFREE_SUBNET:-172.30.0.0/24}
+      RUNFREE_PROXY_EGRESS_IP: ${RUNFREE_PROXY_EGRESS_IP:-172.30.1.10}
+      RUNFREE_PROXY_EGRESS_SUBNET: ${RUNFREE_PROXY_EGRESS_SUBNET:-172.30.1.0/24}
+      RUNFREE_PROXY_EGRESS_GATEWAY: ${RUNFREE_PROXY_EGRESS_GATEWAY:-172.30.1.1}
+    command: ["node", "/app/proxy/host-relay.js"]
+
 volumes:
   runfree-oauth-state:
 
