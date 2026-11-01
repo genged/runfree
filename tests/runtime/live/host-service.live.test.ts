@@ -1505,17 +1505,16 @@ describe("approved host services", () => {
     const unused = await freeHostPort();
     refusedAdd("nothing", unused, `no process listens on 127.0.0.1:${unused}`);
 
-    // A port a container publishes on the host. On Docker Desktop: a Docker
-    // Desktop-owned port, which this project's own forward publishes. On
-    // Docker Engine: a container-published port, staged by a short-lived
-    // hardened helper publishing 127.0.0.1:<port>, refused as published by a
-    // container (Engine admission reads `docker ps` port bindings).
+    // A port a container publishes on the host, refused on every backend as
+    // published by a container (admission reads `docker ps` port bindings
+    // first). On Docker Desktop this project's own forward publishes it; on
+    // Docker Engine a short-lived hardened helper publishes 127.0.0.1:<port>.
     const published = await freeHostPort();
     if (backend === "docker-desktop") {
       const forward = fixture.runfree(["forward", String(published)]);
       expect(forward.status, `could not open a forward to stage a Docker-owned port: ${describeOutput(forward.output)}`).toBe(0);
       try {
-        refusedAdd("published", published, "owned by Docker Desktop");
+        refusedAdd("published", published, `127.0.0.1:${published} is published by a container`);
       } finally {
         const closed = fixture.runfree(["forward", String(published), "stop"]);
         expect(closed.status, `could not close the staging forward: ${describeOutput(closed.output)}`).toBe(0);
