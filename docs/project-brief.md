@@ -62,8 +62,8 @@ The primary audience is individual developers using Claude Code, Codex, or Pi wh
 ## Supported Release Shape
 
 - published binary: `darwin-arm64` only, ad-hoc signed and not notarized, with a SHA-256 manifest;
-- host: Apple Silicon macOS;
-- container backend: Docker Desktop with Docker Compose;
+- host: Apple Silicon macOS, or Linux from a source build;
+- container backend: Docker Desktop with Docker Compose on macOS; native Docker Engine with Docker Compose on Linux;
 - package manager: Homebrew tap plus the GitHub release install script (`bash`, not `sh`);
 - source build: Node 22 and the pnpm version in `package.json`; `./bunw` fetches the Bun in `.bun-version` for `pnpm run build:bin`;
 

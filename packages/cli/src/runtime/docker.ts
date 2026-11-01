@@ -265,13 +265,13 @@ export function hostServiceRelayMode(
 
 function dockerAvailable(context: RuntimeContext, io: RuntimeIO): boolean {
   if (!io.commandExists("docker", dockerClientEnvOptions(context))) {
-    die("docker not found - install Docker Desktop first");
+    die("docker not found - install Docker Desktop (macOS) or Docker Engine (Linux) first");
   }
   lastDockerDaemonIdentity = undefined;
   lastDockerInfoStdout = undefined;
   const info = createDockerClient(io, dockerClientEnvOptions(context)).info("{{json .}}");
   if (info.status !== 0 || dockerInfoServerError(info.stdout) !== undefined) {
-    die("docker daemon not running - start Docker Desktop first");
+    die("docker daemon not running - start Docker Desktop or the Docker Engine service first");
   }
   lastDockerDaemonIdentity = parseDockerDaemonIdentity(info.stdout);
   lastDockerInfoStdout = info.stdout;

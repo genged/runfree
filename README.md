@@ -43,7 +43,8 @@ runfree
 ecosystems, Git remote hosts, and a GitHub CLI login, then offers a plan you
 review before any policy or credential source is written.
 
-Requires Apple Silicon macOS and Docker Desktop. Each claim above has a limit
+Requires Apple Silicon macOS with Docker Desktop, or Linux with Docker Engine
+(built from source). Each claim above has a limit
 worth knowing before you rely on it: see [Limitations](#limitations).
 
 ## Features
@@ -181,7 +182,8 @@ reading what an agent wrote. It narrows the default blast radius.
 ### 1. Install
 
 Runfree publishes **Apple Silicon macOS** binaries and is supported with
-**Docker Desktop**. You also need `git`: Git 2.48 or newer gives full
+**Docker Desktop** there. It is also supported on **Linux** with native
+**Docker Engine**, built from source. You also need `git`: Git 2.48 or newer gives full
 worktree support. Older Git still works, with limits described in
 [Git worktrees](docs/cli.md#git-worktrees).
 
@@ -210,8 +212,9 @@ pnpm run build:bin
 ./dist/runfree version
 ```
 
-Intel macOS and Linux have no published binaries. They can be built from source;
-building is not a support claim.
+Linux has no published binaries: build from source and run it with Docker
+Engine and Docker Compose. Intel macOS can also be built from source, but
+building is not a support claim there.
 
 ### 2. Initialize a project
 

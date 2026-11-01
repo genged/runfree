@@ -118,8 +118,8 @@ Common cases:
 - **A live session blocks the operation.** `runfree stop` and
   `runfree runtime reload-policy` refuse while sessions are live. Close the
   sessions, or pass `--force` once you know what it ends.
-- **Docker is not reachable.** Runfree needs Docker Desktop running with Docker
-  Compose. Check `docker version` first.
+- **Docker is not reachable.** Runfree needs Docker Desktop (macOS) or Docker
+  Engine (Linux) running with Docker Compose. Check `docker version` first.
 - **A warm launch asks for a retry.** `the session state changed during a warm
   launch; retry the command to validate the runtime fully` (or `a lifecycle
   record appeared during a warm launch; ...`) means another session changed
