@@ -62,6 +62,7 @@ import {
   controlPlaneRebindTransactionPath,
   readControlPlaneRebindTransaction,
 } from "./control-plane-rebind.ts";
+import { parseRebindRecoveryState } from "./control-plane-rebind-recovery.ts";
 import type { ActiveRuntimePlan } from "./plan.ts";
 import {
   controlPlaneMaterializationFixture,
@@ -1942,11 +1943,20 @@ test("a transient failure after an explicit renewal spends that allowance instea
   expect(fs.existsSync(controlPlaneRebindTransactionPath(stateDir))).toBe(false);
 });
 
-/** The exact shape the recovery journal accepts for retained trust inputs. */
-function trustReceiptFixture(seed: string): string {
+/**
+ * The exact shape the recovery journal accepts for retained trust inputs.
+ * `legacy: true` reproduces a journal written before the proxy CA key's
+ * identity moved from a host-computed digest (`publicKeyDigest`) to an
+ * `lstat` snapshot (`keyIdentity`), which `parseRebindRecoveryState` must
+ * still accept so an in-flight recovery straddling an upgrade is not treated
+ * as corrupt.
+ */
+function trustReceiptFixture(seed: string, options: { legacy?: boolean } = {}): string {
   return JSON.stringify({
     certificateDigest: sha256Digest(`${seed}-certificate`),
-    publicKeyDigest: sha256Digest(`${seed}-public-key`),
+    ...(options.legacy
+      ? { publicKeyDigest: sha256Digest(`${seed}-public-key`) }
+      : { keyIdentity: { dev: 2049, ino: 103, size: 227, mtimeMs: 1_756_252_800_000, mode: 0o100600 } }),
     directories: [
       { path: "/state/proxy-ca/public", device: 2049, inode: 101 },
       { path: "/state/proxy-ca/private", device: 2049, inode: 102 },
@@ -1960,6 +1970,36 @@ function trustReceiptFixture(seed: string): string {
     },
   });
 }
+
+test("parseRebindRecoveryState accepts both the legacy publicKeyDigest receipt shape and the current keyIdentity shape", () => {
+  const recoveryState = (trustReceipt: string) => ({
+    candidateAttempt: 0, batchRevision: 0, retired: [], outstandingEffect: "create" as const, trustReceipt,
+    allowance: { number: 0, startedAt: "2026-08-27T00:00:00.000Z", deadlineAt: "2026-08-27T00:02:00.000Z",
+      lastObservedAt: "2026-08-27T00:00:00.000Z", creations: 0, exhausted: false },
+  });
+
+  expect(parseRebindRecoveryState(recoveryState(trustReceiptFixture("legacy", { legacy: true }))))
+    .not.toBeUndefined();
+  expect(parseRebindRecoveryState(recoveryState(trustReceiptFixture("current"))))
+    .not.toBeUndefined();
+});
+
+test("parseRebindRecoveryState refuses a trust receipt with both, or neither, key-identity field", () => {
+  const recoveryState = (trust: Record<string, unknown>) => ({
+    candidateAttempt: 0, batchRevision: 0, retired: [], outstandingEffect: "create" as const,
+    trustReceipt: JSON.stringify(trust),
+    allowance: { number: 0, startedAt: "2026-08-27T00:00:00.000Z", deadlineAt: "2026-08-27T00:02:00.000Z",
+      lastObservedAt: "2026-08-27T00:00:00.000Z", creations: 0, exhausted: false },
+  });
+  const base = JSON.parse(trustReceiptFixture("mixed")) as Record<string, unknown>;
+
+  expect(parseRebindRecoveryState(recoveryState({ ...base, publicKeyDigest: sha256Digest("mixed-public-key") })))
+    .toBeUndefined();
+  const { keyIdentity, ...withoutKeyIdentity } = base;
+  expect(parseRebindRecoveryState(recoveryState(withoutKeyIdentity))).toBeUndefined();
+  expect(parseRebindRecoveryState(recoveryState({ ...base, keyIdentity: { ...(keyIdentity as object), mode: "0600" } })))
+    .toBeUndefined();
+});
 
 test("recovery refuses a changed trust receipt at entry and again before each further effect", async () => {
   const fixture = recoveryFixture();

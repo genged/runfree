@@ -7,7 +7,15 @@ import type { ActiveRuntimePlan } from "./plan.ts";
 import type { RuntimeIO } from "./types.ts";
 import { createDockerClient } from "./docker-client.ts";
 
-/** No private bytes enter the journal. Missing retained trust refuses creation. */
+/**
+ * No private bytes enter the journal, and the host never reads the proxy CA
+ * key. The proxy (UID 1001) writes it to the host bind mount with mode 0600,
+ * so on native Linux Docker Engine the host user cannot read it (Docker
+ * Desktop's file sharing hides this by presenting it as host-owned). Its
+ * identity is captured with `lstat` instead. Key/cert agreement is not checked
+ * here: a mismatched pair fails closed at TLS. Missing retained trust refuses
+ * creation.
+ */
 export function captureRebindTrustReceipt(plan: ActiveRuntimePlan, io: RuntimeIO, assertAuthority: () => void): string {
   assertAuthority();
   const read = (file: string): string => {
@@ -23,11 +31,18 @@ export function captureRebindTrustReceipt(plan: ActiveRuntimePlan, io: RuntimeIO
     return { path: directory, device: stat.dev, inode: stat.ino };
   });
   const certificate = new crypto.X509Certificate(read(path.join(plan.paths.proxyCaCertDir, "proxy-ca.crt")));
-  const publicKey = crypto.createPublicKey(crypto.createPrivateKey(read(path.join(plan.paths.proxyCaKeyDir, "proxy-ca.key"))))
-    .export({ type: "spki", format: "der" });
-  if (!certificate.publicKey.export({ type: "spki", format: "der" }).equals(publicKey)) {
-    throw new Error("retained CA key and certificate disagree; restore the original pair before recovery");
+  const keyPath = path.join(plan.paths.proxyCaKeyDir, "proxy-ca.key");
+  let keyStat: fs.Stats;
+  try {
+    keyStat = fs.lstatSync(keyPath);
+  } catch (error) {
+    if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
+      throw new Error("retained proxy trust material is missing; restore the original CA before recovery");
+    }
+    throw error;
   }
+  if (!keyStat.isFile() || keyStat.isSymbolicLink()) throw new Error("retained proxy trust file is unsafe; restore it before recovery");
+  const keyIdentity = { dev: keyStat.dev, ino: keyStat.ino, size: keyStat.size, mtimeMs: keyStat.mtimeMs, mode: keyStat.mode };
   const bundle = read(path.join(plan.paths.proxyCaCertDir, "ca-bundle.crt"));
   if (!bundle.includes(certificate.toString().trim())) throw new Error("retained agent trust bundle does not contain the proxy CA; restore original trust before recovery");
   const volumeName = `${plan.composeProjectName}_runfree-oauth-state`;
@@ -44,6 +59,6 @@ export function captureRebindTrustReceipt(plan: ActiveRuntimePlan, io: RuntimeIO
     || typeof volume.Mountpoint !== "string" || typeof volume.Driver !== "string" || typeof volume.Scope !== "string") {
     throw new Error("retained OAuth volume identity is incomplete or foreign; restore the exact project volume before recovery");
   }
-  return stableJson({ certificateDigest: sha256Digest(certificate.raw), publicKeyDigest: sha256Digest(publicKey), directories,
+  return stableJson({ certificateDigest: sha256Digest(certificate.raw), keyIdentity, directories,
     volume: { name: volume.Name, createdAt: volume.CreatedAt, mountpoint: volume.Mountpoint, driver: volume.Driver, scope: volume.Scope } });
 }

@@ -59,9 +59,9 @@ afterEach(() => {
 });
 
 /** Lays down the retained trust exactly as the proxy publishes it. */
-function publish(material: CaMaterial, options: { key?: CaMaterial; bundle?: string } = {}, target = { keyDir, certDir }): void {
+function publish(material: CaMaterial, options: { bundle?: string } = {}, target = { keyDir, certDir }): void {
   fs.writeFileSync(path.join(target.certDir, "proxy-ca.crt"), material.certificate);
-  fs.writeFileSync(path.join(target.keyDir, "proxy-ca.key"), (options.key ?? material).privateKey);
+  fs.writeFileSync(path.join(target.keyDir, "proxy-ca.key"), material.privateKey);
   fs.writeFileSync(path.join(target.certDir, "ca-bundle.crt"), options.bundle ?? SYSTEM_ROOTS + material.certificate);
 }
 
@@ -104,16 +104,75 @@ function inspectionIo(result: { status?: number; stdout?: string; stderr?: strin
 }
 
 describe("captureRebindTrustReceipt", () => {
-  test("refuses a CA key and certificate that do not pair, before it inspects anything", () => {
-    // A replacement proxy handed a certificate it holds no key for would serve
-    // trust it cannot use; worse, the key could be an attacker's. The SPKI
-    // compare is the only thing that ties the two retained files together.
-    publish(retained, { key: foreign });
-    const { io, capture } = inspectionIo();
+  const keyPath = (): string => path.join(keyDir, "proxy-ca.key");
 
-    expect(() => captureRebindTrustReceipt(planFixture(), io, () => undefined))
-      .toThrow(/retained CA key and certificate disagree/);
-    expect(capture).not.toHaveBeenCalled();
+  test("receipt is unchanged when the key file is untouched", () => {
+    publish(retained);
+    const first = captureRebindTrustReceipt(planFixture(), inspectionIo().io, () => undefined);
+    const second = captureRebindTrustReceipt(planFixture(), inspectionIo().io, () => undefined);
+    expect(second).toBe(first);
+  });
+
+  test("receipt changes when the key file is replaced with a new inode", () => {
+    publish(retained);
+    const before = captureRebindTrustReceipt(planFixture(), inspectionIo().io, () => undefined);
+    const beforeIno = fs.lstatSync(keyPath()).ino;
+
+    // The replacement inode is allocated (by writing it elsewhere first) before
+    // the original is freed, so the rename cannot land on the same inode the
+    // way an unlink-then-recreate in the same directory sometimes does.
+    const replacement = path.join(tmp, "replacement.key");
+    fs.writeFileSync(replacement, retained.privateKey);
+    fs.renameSync(replacement, keyPath());
+    expect(fs.lstatSync(keyPath()).ino).not.toBe(beforeIno);
+
+    const after = captureRebindTrustReceipt(planFixture(), inspectionIo().io, () => undefined);
+    expect(after).not.toBe(before);
+  });
+
+  test("receipt changes when the key file is modified in place", () => {
+    publish(retained);
+    const before = captureRebindTrustReceipt(planFixture(), inspectionIo().io, () => undefined);
+    const beforeIno = fs.lstatSync(keyPath()).ino;
+
+    fs.appendFileSync(keyPath(), "\n");
+    expect(fs.lstatSync(keyPath()).ino).toBe(beforeIno);
+
+    const after = captureRebindTrustReceipt(planFixture(), inspectionIo().io, () => undefined);
+    expect(after).not.toBe(before);
+  });
+
+  test("refuses when the key file is missing", () => {
+    publish(retained);
+    fs.rmSync(keyPath());
+
+    expect(() => captureRebindTrustReceipt(planFixture(), inspectionIo().io, () => undefined))
+      .toThrow(/retained proxy trust material is missing/);
+  });
+
+  test("refuses when the key file is a symlink", () => {
+    publish(retained);
+    const target = path.join(tmp, "elsewhere.key");
+    fs.writeFileSync(target, retained.privateKey);
+    fs.rmSync(keyPath());
+    fs.symlinkSync(target, keyPath());
+
+    expect(() => captureRebindTrustReceipt(planFixture(), inspectionIo().io, () => undefined))
+      .toThrow(/retained proxy trust file is unsafe/);
+  });
+
+  test("still returns a receipt when the key file's own mode denies the host user all access", (ctx) => {
+    // Reproduces the native Linux Docker Engine layout this module exists to
+    // support: the proxy server (UID 1001) owns the key with mode 0600, so
+    // the host user cannot open it. This must fail against the previous
+    // `read`-based implementation; it is skipped only for a user who can read
+    // any file regardless of mode (root).
+    if (typeof process.getuid === "function" && process.getuid() === 0) ctx.skip("running as root: mode 0 is still readable");
+    publish(retained);
+    fs.chmodSync(keyPath(), 0o000);
+
+    const receipt = captureRebindTrustReceipt(planFixture(), inspectionIo().io, () => undefined);
+    expect(receipt).toContain("keyIdentity");
   });
 
   test.each([

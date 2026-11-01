@@ -55,13 +55,30 @@ export function parseRebindRecoveryState(value: unknown): RebindRecoveryState | 
     if (typeof value.trustReceipt !== "string" || Buffer.byteLength(value.trustReceipt) > 8192) return undefined;
     try {
       const trust = JSON.parse(value.trustReceipt);
-      if (!isRecord(trust) || !exactKeySet(trust, ["certificateDigest", "publicKeyDigest", "directories", "volume"])
-        || ![trust.certificateDigest, trust.publicKeyDigest].every((digest) => typeof digest === "string" && /^sha256:[a-f0-9]{64}$/u.test(digest))
+      if (!isRecord(trust) || typeof trust.certificateDigest !== "string" || !/^sha256:[a-f0-9]{64}$/u.test(trust.certificateDigest)
         || !Array.isArray(trust.directories) || trust.directories.length !== 2
         || trust.directories.some((directory) => !isRecord(directory) || !exactKeySet(directory, ["path", "device", "inode"])
           || typeof directory.path !== "string" || !integer(directory.device) || !integer(directory.inode))
         || !isRecord(trust.volume) || !exactKeySet(trust.volume, ["name", "createdAt", "mountpoint", "driver", "scope"])
         || Object.values(trust.volume).some((entry) => typeof entry !== "string" || !entry)) return undefined;
+      // Two receipt shapes are accepted on read: a journal written before this
+      // key field changed carries `publicKeyDigest` (a digest the host could
+      // still compute when it could read the key); the current shape carries
+      // `keyIdentity` (an `lstat` snapshot, now that the key is unreadable on
+      // native Linux Docker Engine). The coordinator only ever compares two
+      // receipts for exact string equality, so an old-shape journal recorded
+      // before an upgrade simply never matches a freshly captured new-shape
+      // receipt and recovery reports the retained trust as changed.
+      if (Object.hasOwn(trust, "keyIdentity") === Object.hasOwn(trust, "publicKeyDigest")) return undefined;
+      if (Object.hasOwn(trust, "publicKeyDigest")) {
+        if (!exactKeySet(trust, ["certificateDigest", "publicKeyDigest", "directories", "volume"])
+          || typeof trust.publicKeyDigest !== "string" || !/^sha256:[a-f0-9]{64}$/u.test(trust.publicKeyDigest)) return undefined;
+      } else {
+        if (!exactKeySet(trust, ["certificateDigest", "keyIdentity", "directories", "volume"])
+          || !isRecord(trust.keyIdentity) || !exactKeySet(trust.keyIdentity, ["dev", "ino", "size", "mtimeMs", "mode"])
+          || !integer(trust.keyIdentity.dev) || !integer(trust.keyIdentity.ino) || !integer(trust.keyIdentity.size)
+          || !integer(trust.keyIdentity.mode) || typeof trust.keyIdentity.mtimeMs !== "number" || !Number.isFinite(trust.keyIdentity.mtimeMs)) return undefined;
+      }
     } catch { return undefined; }
   }
   if (value.batchInputs !== undefined && (!Array.isArray(value.batchInputs) || value.batchInputs.length > 64
