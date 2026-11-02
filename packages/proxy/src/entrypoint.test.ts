@@ -4,6 +4,16 @@ import path from "node:path";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import type { ChildProcess } from "node:child_process";
 
+// The default server privilege proof runs its denied-command probes through
+// `spawnSync`; tests replace only that module boundary and pass through to the
+// real implementation otherwise.
+const childProcessMocks = vi.hoisted(() => ({ spawnSync: undefined as unknown as ReturnType<typeof vi.fn> }));
+vi.mock("node:child_process", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:child_process")>();
+  childProcessMocks.spawnSync = vi.fn(actual.spawnSync);
+  return { ...actual, default: { ...actual, spawnSync: childProcessMocks.spawnSync }, spawnSync: childProcessMocks.spawnSync };
+});
+
 import {
   approvalsDecisionsDirFromEnv,
   approvalsPendingDirFromEnv,
@@ -226,6 +236,127 @@ describe("proxy entrypoint", () => {
     await expect(waitForServerPrivilegeProofOrKill(child, proof)).rejects.toThrow("bad privilege state");
 
     expect(kill).toHaveBeenCalledWith("SIGTERM");
+  });
+
+  describe("default server privilege proof", () => {
+    const PROVEN_STATUS = [
+      "Name:\tnode",
+      "Uid:\t1001\t1001\t1001\t1001",
+      "Gid:\t1001\t1001\t1001\t1001",
+      "Groups:\t",
+      "NoNewPrivs:\t1",
+      "CapInh:\t0000000000000000",
+      "CapPrm:\t0000000000000000",
+      "CapEff:\t0000000000000000",
+      "CapBnd:\t000001ffffffcfff",
+      "CapAmb:\t0000000000000000",
+      "",
+    ].join("\n");
+    const ROOT_STATUS = [
+      "Name:\tnode",
+      "Uid:\t0\t0\t0\t0",
+      "Gid:\t0\t0\t0\t0",
+      "Groups:\t",
+      "NoNewPrivs:\t0",
+      "CapInh:\t0000000000000000",
+      "CapPrm:\t000001ffffffffff",
+      "CapEff:\t000001ffffffffff",
+      "CapBnd:\t000001ffffffffff",
+      "CapAmb:\t0000000000000000",
+      "",
+    ].join("\n");
+
+    function fakeChild(): { child: ChildProcess; kill: ReturnType<typeof vi.fn> } {
+      const kill = vi.fn();
+      const child = { pid: 123, exitCode: null, signalCode: null, kill } as unknown as ChildProcess;
+      return { child, kill };
+    }
+
+    function fakeProcStatus(next: () => string): ReturnType<typeof vi.fn> {
+      const reads = vi.fn(next);
+      const realReadFileSync = fs.readFileSync;
+      vi.spyOn(fs, "readFileSync").mockImplementation(((target: fs.PathOrFileDescriptor, options?: unknown) => {
+        if (target === "/proc/123/status") return reads();
+        return (realReadFileSync as (...args: unknown[]) => unknown)(target, options);
+      }) as typeof fs.readFileSync);
+      return reads;
+    }
+
+    function denyProbes(): void {
+      childProcessMocks.spawnSync.mockImplementation(() => ({
+        pid: 0,
+        output: [],
+        status: 1,
+        signal: null,
+        stdout: "",
+        stderr: "Operation not permitted",
+      }));
+    }
+
+    afterEach(() => {
+      childProcessMocks.spawnSync.mockReset();
+      vi.useRealTimers();
+    });
+
+    test("rejects with the last verification error and kills the child when verification never succeeds", async () => {
+      vi.useFakeTimers();
+      const reads = fakeProcStatus(() => ROOT_STATUS);
+      const { child, kill } = fakeChild();
+
+      const outcome = waitForServerPrivilegeProofOrKill(child).then(
+        () => ({ resolved: true as const }),
+        (error: unknown) => ({ resolved: false as const, error }),
+      );
+      await vi.advanceTimersByTimeAsync(5_100);
+      const result = await outcome;
+
+      expect(result.resolved).toBe(false);
+      expect(String((result as { error: unknown }).error)).toContain("proxy server Uid expected 1001 1001 1001 1001, got 0\t0\t0\t0");
+      expect(kill).toHaveBeenCalledWith("SIGTERM");
+      expect(reads.mock.calls.length).toBeGreaterThan(1);
+      expect(childProcessMocks.spawnSync).not.toHaveBeenCalled();
+    });
+
+    test("resolves without killing when the server status is unprivileged and probes are denied", async () => {
+      const reads = fakeProcStatus(() => PROVEN_STATUS);
+      denyProbes();
+      vi.spyOn(console, "log").mockImplementation(() => undefined);
+      const { child, kill } = fakeChild();
+
+      await expect(waitForServerPrivilegeProofOrKill(child)).resolves.toBeUndefined();
+
+      expect(reads).toHaveBeenCalledTimes(1);
+      expect(childProcessMocks.spawnSync).toHaveBeenCalledTimes(3);
+      expect(kill).not.toHaveBeenCalled();
+    });
+
+    test("resolves without killing when verification first fails and then passes within the deadline", async () => {
+      vi.useFakeTimers();
+      let attempt = 0;
+      const reads = fakeProcStatus(() => (++attempt < 3 ? ROOT_STATUS : PROVEN_STATUS));
+      denyProbes();
+      vi.spyOn(console, "log").mockImplementation(() => undefined);
+      const { child, kill } = fakeChild();
+
+      const outcome = waitForServerPrivilegeProofOrKill(child);
+      await vi.advanceTimersByTimeAsync(200);
+
+      await expect(outcome).resolves.toBeUndefined();
+      expect(reads).toHaveBeenCalledTimes(3);
+      expect(kill).not.toHaveBeenCalled();
+    });
+
+    test("rejects without killing when the server child exits before verification", async () => {
+      const reads = fakeProcStatus(() => PROVEN_STATUS);
+      const kill = vi.fn();
+      const child = { pid: 123, exitCode: 1, signalCode: null, kill } as unknown as ChildProcess;
+
+      await expect(waitForServerPrivilegeProofOrKill(child)).rejects.toThrow(
+        "server child exited before privilege verification: code=1 signal=null",
+      );
+      expect(reads).not.toHaveBeenCalled();
+      expect(kill).not.toHaveBeenCalled();
+    });
   });
 
   test("server privilege proof denies firewall and route administration commands", () => {
