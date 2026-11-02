@@ -49,6 +49,7 @@ import {
   destroyLiveFixture,
   provisionLiveFixture,
   type LiveFixture,
+  requireLiveRuntimeBackend,
   type LiveRuntimeBackend,
 } from "./fixture.ts";
 import { sessionAdmissionCrashEntryArgv } from "../../support/prebuilt-entry.ts";
@@ -79,11 +80,7 @@ const DROPPED_WINDOW_SAMPLE_MS = 5_000;
 const HELD_LAUNCH_WAIT_TIMEOUT_MS = 180_000;
 
 function requiredBackend(): LiveRuntimeBackend {
-  const backend = process.env.TEST_RUNTIME_BACKEND;
-  if (backend !== "docker-desktop") {
-    throw new Error("TEST_RUNTIME_BACKEND must be docker-desktop for the session entry gate tranche");
-  }
-  return backend;
+  return requireLiveRuntimeBackend("the session entry gate tranche");
 }
 
 type HeldLaunchRun = Readonly<{

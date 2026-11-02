@@ -33,10 +33,18 @@ function fakeIo(result: CaptureResult): { io: RuntimeIO; calls: CaptureCall[] } 
   return { io, calls };
 }
 
-/** Routes each `lsof -iTCP:<port>` call to the result for that port (the per-port probe's own shape). */
-function fakeIoByPort(results: Readonly<Record<number, CaptureResult>>): RuntimeIO {
+/**
+ * Routes each `lsof -iTCP:<port>` call to the result for that port (the
+ * per-port probe's own shape); `docker ps` answers `dockerPs` (no published
+ * ports by default).
+ */
+function fakeIoByPort(
+  results: Readonly<Record<number, CaptureResult>>,
+  dockerPs: CaptureResult = { status: 0, stdout: "", stderr: "" },
+): RuntimeIO {
   return {
-    capture: vi.fn((_command: string, args: string[]) => {
+    capture: vi.fn((command: string, args: string[]) => {
+      if (command === "docker" && args[0] === "ps") return dockerPs;
       const portArg = args.find((arg) => arg.startsWith("-iTCP:"));
       const port = Number(portArg?.slice("-iTCP:".length));
       return results[port] ?? { status: 1, stdout: "", stderr: "" };
@@ -48,17 +56,20 @@ function fakeIoByPort(results: Readonly<Record<number, CaptureResult>>): Runtime
   };
 }
 
+// `docker ps` showed no published port.
+const NOT_PUBLISHED: ReadonlySet<number> = new Set();
+
 const context = {
   projectRoot: "/tmp/runfree-listener-snapshot-project",
   env: { HOME: os.tmpdir(), PATH: "/usr/bin:/bin", LC_ALL: "de_DE.UTF-8", SECRET_TOKEN: "do-not-pass" },
 };
 
 describe("probeHostListeners", () => {
-  test("a platform other than darwin is unavailable without running lsof", () => {
+  test("a platform other than macOS or Linux is unavailable without running lsof", () => {
     const { io, calls } = fakeIo({ status: 0, stdout: "p1\ncx\nn127.0.0.1:1\n", stderr: "" });
 
-    const snapshot = probeHostListeners(context, io, "linux");
-    expect(snapshot).toEqual({ kind: "unavailable", reason: expect.stringContaining("macOS") });
+    const snapshot = probeHostListeners(context, io, "win32");
+    expect(snapshot).toEqual({ kind: "unavailable", reason: expect.stringContaining("macOS or Linux") });
     expect(calls).toHaveLength(0);
   });
 
@@ -274,10 +285,42 @@ describe("hostServiceOwnerWarningsFromSnapshot matches the per-port probe (F29)"
     const batchedStdout = "p4242\ncidb_companion\nf7\nn127.0.0.1:10882\np77\nccom.docker.backend\nf9\nn*:9090\n";
     const { io: batchedIo } = fakeIo({ status: 0, stdout: batchedStdout, stderr: "" });
     const snapshot = probeHostListeners(context, batchedIo, "darwin");
-    const batchedLines = hostServiceOwnerWarningsFromSnapshot(snapshot, services, recorded);
+    const batchedLines = hostServiceOwnerWarningsFromSnapshot(snapshot, NOT_PUBLISHED, services, recorded);
 
     expect(batchedLines).toEqual(perPortLines);
     expect(batchedLines).toEqual(["host service other (127.0.0.1:9090): owned by Docker Desktop"]);
+  });
+
+  test("a port docker ps shows published warns the same on both paths, beside the owner check", () => {
+    const listeners = {
+      10882: { status: 0, stdout: "p4242\ncidb_companion\nf7\nn127.0.0.1:10882\n", stderr: "" },
+      9090: { status: 0, stdout: "p77\nccom.docker.backend\nf9\nn*:9090\n", stderr: "" },
+    };
+    const perPortLines = hostServiceOwnerWarnings(context, fakeIoByPort(listeners,
+      { status: 0, stdout: "127.0.0.1:9090->80/tcp\n", stderr: "" }), services, recorded);
+
+    const batchedStdout = "p4242\ncidb_companion\nf7\nn127.0.0.1:10882\np77\nccom.docker.backend\nf9\nn*:9090\n";
+    const snapshot = probeHostListeners(context, fakeIo({ status: 0, stdout: batchedStdout, stderr: "" }).io, "darwin");
+    const batchedLines = hostServiceOwnerWarningsFromSnapshot(snapshot, new Set([9090]), services, recorded);
+
+    expect(batchedLines).toEqual(perPortLines);
+    expect(batchedLines).toEqual([
+      "host service other (127.0.0.1:9090): published by a container (docker ps)",
+      "host service other (127.0.0.1:9090): owned by Docker Desktop",
+    ]);
+  });
+
+  test("a failed docker ps warns once on both paths and the owner checks still run", () => {
+    const idb: HostServicesJson = { idb: services.idb };
+    const perPortLines = hostServiceOwnerWarnings(context, fakeIoByPort({}, { status: 1, stdout: "", stderr: "daemon down" }), idb, new Map());
+    const batchedLines = hostServiceOwnerWarningsFromSnapshot({ kind: "observed", byPort: new Map() },
+      { error: "docker ps exited with status 1" }, idb, new Map());
+
+    expect(batchedLines).toEqual(perPortLines);
+    expect(batchedLines).toEqual([
+      "host services: container-published ports were not checked: docker ps exited with status 1",
+      "host service idb (127.0.0.1:10882): no listener",
+    ]);
   });
 
   test("a clean match against the recorded owner produces no warnings on either path", () => {
@@ -289,7 +332,7 @@ describe("hostServiceOwnerWarningsFromSnapshot matches the per-port probe (F29)"
 
     const { io: batchedIo } = fakeIo({ status: 0, stdout: "p4242\ncidb_companion\nf7\nn127.0.0.1:10882\n", stderr: "" });
     const snapshot = probeHostListeners(context, batchedIo, "darwin");
-    const batchedLines = hostServiceOwnerWarningsFromSnapshot(snapshot, idb, recorded);
+    const batchedLines = hostServiceOwnerWarningsFromSnapshot(snapshot, NOT_PUBLISHED, idb, recorded);
 
     expect(batchedLines).toEqual([]);
     expect(perPortLines).toEqual([]);
@@ -301,13 +344,15 @@ describe("hostServiceOwnerWarningsFromSnapshot matches the per-port probe (F29)"
 
     const perPortIo = fakeIoByPort({ 10882: { status: 124, stdout: "", stderr: "", timedOut: true } });
     const perPortLines = hostServiceOwnerWarnings(context, perPortIo, idb, new Map());
-    const batchedLines = hostServiceOwnerWarningsFromSnapshot({ kind: "unavailable", reason }, idb, new Map());
+    const batchedLines = hostServiceOwnerWarningsFromSnapshot({ kind: "unavailable", reason }, NOT_PUBLISHED, idb, new Map());
 
     expect(batchedLines).toEqual(perPortLines);
     expect(batchedLines).toEqual([`host service idb (127.0.0.1:10882): ${reason}`]);
   });
 
   test("no host services means no warnings and the snapshot is never consulted", () => {
-    expect(hostServiceOwnerWarningsFromSnapshot({ kind: "observed", byPort: new Map() }, {}, new Map())).toEqual([]);
+    expect(hostServiceOwnerWarningsFromSnapshot({ kind: "observed", byPort: new Map() }, NOT_PUBLISHED, {}, new Map())).toEqual([]);
+    // Not even a failed docker ps warns when nothing is approved.
+    expect(hostServiceOwnerWarningsFromSnapshot({ kind: "observed", byPort: new Map() }, { error: "x" }, {}, new Map())).toEqual([]);
   });
 });

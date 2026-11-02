@@ -66,11 +66,18 @@ export function checkEtcHostsFile(stat: EtcHostsStat): string | undefined {
   return undefined;
 }
 
+/** The plan fields the gateway check reads; a full `FirewallPlan` is one. */
+export type HostServiceGatewayPlan = Readonly<{
+  internal: Readonly<Pick<FirewallPlan["internal"], "proxyIp">>;
+  egress: Readonly<Pick<FirewallPlan["egress"], "sourceIp" | "gatewayIp">>;
+  runtimeSubnets?: readonly string[];
+}>;
+
 // Amendment A2: the gateway gets its own validator, because the resolved-answer
 // classifier rejects 192.168/16 where Docker Desktop's gateway lives. RFC 1918
 // is required; loopback, link-local, the runtime subnets, and the proxy's own
 // egress gateway and addresses are refused.
-export function validateHostServiceGateway(ip: string, plan: FirewallPlan): string | undefined {
+export function validateHostServiceGateway(ip: string, plan: HostServiceGatewayPlan): string | undefined {
   if (!CANONICAL_IPV4_RE.test(ip)) return `host-service gateway ${ip} is not a canonical IPv4 address`;
   const value = ipv4ToInt(ip);
   if (cidrContains("127.0.0.0/8", value)) return `host-service gateway ${ip} is a loopback address`;

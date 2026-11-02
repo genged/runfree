@@ -20,6 +20,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { cliEntryArgv, sessionAdmissionCrashEntryArgv } from "../../support/prebuilt-entry.ts";
+import { LIVE_RUNTIME_BACKENDS, type LiveRuntimeBackend } from "./backends.ts";
 import { liveRunToken } from "./run-token.ts";
 
 const CAPTURE_MAX_BYTES = 1024 * 1024;
@@ -35,7 +36,23 @@ const CONTROL_CHARACTERS = /[\u0000-\u001f\u007f-\u009f]/gu;
 // runtime never carries it, so this can never count a maintainer's own work.
 const SANDBOX_MOUNT_SIGNATURE = SANDBOX_PROJECT_PREFIX;
 
-export type LiveRuntimeBackend = "docker-desktop";
+export { LIVE_RUNTIME_BACKENDS, type LiveRuntimeBackend } from "./backends.ts";
+
+/**
+ * The tranche's backend from `TEST_RUNTIME_BACKEND`, or throws naming the
+ * accepted labels. A missing or unknown value never defaults here: vitest.config
+ * hands every live tranche the defaulted label explicitly.
+ */
+export function requireLiveRuntimeBackend(
+  tranche: string,
+  env: NodeJS.ProcessEnv = process.env,
+): LiveRuntimeBackend {
+  const backend = LIVE_RUNTIME_BACKENDS.find((candidate) => candidate === env.TEST_RUNTIME_BACKEND);
+  if (!backend) {
+    throw new Error(`TEST_RUNTIME_BACKEND must be one of ${LIVE_RUNTIME_BACKENDS.join(", ")} for ${tranche}`);
+  }
+  return backend;
+}
 
 export type CaptureResult = Readonly<{
   status: number;

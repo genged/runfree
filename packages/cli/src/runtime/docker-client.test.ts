@@ -31,6 +31,8 @@ describe("docker client argv", () => {
     ["typed inspect with format", (c) => c.inspect([ID, "b"], { type: "container", format: "{{.State.Running}}" }),
       ["container", "inspect", "--format", "{{.State.Running}}", ID, "b"]],
     ["network inspect", (c) => c.inspect(["net"], { type: "network" }), ["network", "inspect", "net"]],
+    ["context inspect", (c) => c.inspectContext("{{json .Endpoints.docker.Host}}"),
+      ["context", "inspect", "--format", "{{json .Endpoints.docker.Host}}"]],
     ["container ids", (c) => c.listContainers({ all: true, quiet: true, noTrunc: true, filters: ["label=a=b", "id=x"] }),
       ["ps", "--all", "--quiet", "--no-trunc", "--filter", "label=a=b", "--filter", "id=x"]],
     ["container listing", (c) => c.listContainers({ all: true, filters: ["label=a"], format: "{{json .}}" }),
@@ -90,6 +92,7 @@ describe("async docker client", () => {
   const methodCases: Array<[string, <R>(c: DockerCaptureMethods<R>) => R]> = [
     ["info", (c) => c.info("{{json .}}", { timeout: 9 })],
     ["inspect", (c) => c.inspect([ID, "b"], { type: "container", format: "{{.Id}}" }, { maxBuffer: 4 })],
+    ["inspectContext", (c) => c.inspectContext("{{json .}}", { timeout: 3 })],
     ["listContainers", (c) => c.listContainers({ all: true, quiet: true, noTrunc: true, filters: ["label=a"], format: "{{.ID}}" })],
     ["listObjects", (c) => c.listObjects("volume", { quiet: true, filters: ["label=v"], reference: "r" })],
     ["logs", (c) => c.logs(ID, { tail: 3, since: "s" })],

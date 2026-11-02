@@ -40,6 +40,8 @@ import {
   sortHostServiceEntries,
 } from "@runfree/runtime-contracts/proxy-status";
 
+import type { HostServiceRelayMode } from "../docker-backend.ts";
+import { lookupHostRelayContainerIds } from "./host-relay-topology.ts";
 import { stableJson } from "../strict-primitives.ts";
 import { exactKeySet, isRecord } from "../strict-primitives.ts";
 import { CA_BUNDLE_FILE, PROXY_CA_FILE } from "./ca-bundle.ts";
@@ -165,6 +167,13 @@ export type WarmProofInput = Readonly<{
   gitLayout: string;
   /** The effective policy's host services; the warm topology judges `@host_service` against them. */
   effectiveHostServices: EffectiveHostServices;
+  /**
+   * Whether the Engine host-service relay applies. With `engine-relay` the
+   * relay is inspected by its exact name in the same batch and its shape is
+   * re-proved; a missing relay fails the inspect and takes the full path.
+   * The run's one backend decision (`hostServiceRelayMode`), required.
+   */
+  hostServiceRelay: HostServiceRelayMode;
 }>;
 
 export type WarmValidation = Readonly<{
@@ -275,6 +284,8 @@ type WarmObservation = Readonly<{
   volumes: readonly Record<string, unknown>[];
   agentImageId: string;
   sections: readonly FirewallSectionResult[];
+  hostRelayIds: readonly string[] | undefined;
+  hostRelay?: DockerContainerInspect;
 }>;
 
 function inspectObjects(input: WarmProofInput, targets: readonly string[]): unknown[] | string {
@@ -306,9 +317,10 @@ const isImage = (value: unknown): value is Record<string, unknown> => isRecord(v
   && typeof value.Id === "string" && isRecord(value.RootFS) && !("State" in value);
 
 /**
- * Two Docker calls (three when a utility shares the internal network): every
- * object by id or exact name in one type-less inspect, each checked by shape
- * and identity, and one root batch inside the exact proxy.
+ * Three Docker calls (four when a utility shares the internal network): the
+ * host relay lookup, every object by id or exact name in one type-less
+ * inspect, each checked by shape and identity, and one root batch inside the
+ * exact proxy.
  */
 function observeWarmRuntime(input: WarmProofInput): WarmObservation | string {
   const { effective } = input;
@@ -318,8 +330,21 @@ function observeWarmRuntime(input: WarmProofInput): WarmObservation | string {
   if (![proxyId, internalId, egressId].every((id) => DOCKER_ID.test(id))) return "the effective selection names no exact ids";
   const project = composeProjectName(input.context.projectRoot);
   const volumeNames = input.volumeLogicalNames.map((logicalName) => `${project}_${logicalName}`);
-  const inspected = inspectObjects(input, [proxyId, internalId, egressId, input.agentImage, ...volumeNames]);
+  // The Engine host-service relay, looked up on every backend: topology
+  // proves its shape on Engine and its absence everywhere else. On Engine the
+  // one relay found is inspected by exact id in the same batch.
+  const hostRelayIds = lookupHostRelayContainerIds(
+    createDockerClient(input.io, dockerClientEnvOptions(input.context)),
+    project,
+  );
+  const relayTarget = input.hostServiceRelay === "engine-relay" && hostRelayIds?.length === 1 ? [hostRelayIds[0] as string] : [];
+  const inspected = inspectObjects(input, [proxyId, internalId, egressId, input.agentImage, ...volumeNames, ...relayTarget]);
   if (typeof inspected === "string") return inspected;
+  const relayObject = relayTarget.length > 0 ? inspected.pop() : undefined;
+  if (relayTarget.length > 0 && (!isContainer(relayObject) || relayObject.Id !== relayTarget[0])) {
+    return "the host relay object is not the exact host relay container";
+  }
+  const hostRelay = relayObject as DockerContainerInspect | undefined;
   const [proxy, internalNetwork, egressNetwork, image, ...volumes] = inspected;
   if (!isContainer(proxy) || proxy.Id !== proxyId) return "the proxy object is not the exact proxy container";
   if (!isNetwork(internalNetwork) || internalNetwork.Id !== internalId || internalNetwork.Name !== `${project}_agent_internal`) {
@@ -368,6 +393,8 @@ function observeWarmRuntime(input: WarmProofInput): WarmObservation | string {
     volumes: volumes as Record<string, unknown>[],
     agentImageId: image.Id,
     sections,
+    hostRelayIds,
+    ...(hostRelay ? { hostRelay } : {}),
   });
 }
 
@@ -462,11 +489,14 @@ function judgeWarmObservation(input: WarmProofInput, observation: WarmObservatio
       hostServiceGateway,
       etcHostsStat,
     }),
+    hostRelayIds: observation.hostRelayIds,
+    ...(observation.hostRelay ? { hostRelay: observation.hostRelay } : {}),
   });
   const topology = validateRuntimeTopologyWithProof(plan, input.io, {
     warmEvidence,
     expectedProxyId: effective.proxyContainerId,
     effectiveHostServices: input.effectiveHostServices,
+    hostServiceRelay: input.hostServiceRelay,
   });
   for (const issue of topology.issues) topologyIssues.push(issue.message);
   const deny: DenyByDefaultObservationV1 | undefined = topology.denyByDefaultBaseObservation;

@@ -20,7 +20,7 @@ pnpm install --frozen-lockfile
 | --- | --- | --- |
 | Node | 22 | Everything |
 | pnpm | The `packageManager` version in `package.json` | Everything. Do not substitute another package manager. |
-| Docker | Docker Desktop with Compose | The live runtime and packaged live tests only |
+| Docker | Docker Desktop with Compose on macOS, or native Docker Engine with Compose on Linux | The live runtime and packaged live tests only |
 
 You do not need to install Bun. `pnpm run build:bin`, the test bundles, and
 release packaging run Bun through `./bunw`, which uses the version in
@@ -159,7 +159,7 @@ The checks the docs must pass are in
 ## Reporting bugs
 
 GitHub Issues, with the bug or feature template. Include the Runfree version,
-your macOS and Docker Desktop versions, the command you ran, and a sanitized
+your OS and Docker (Desktop or Engine) versions, the command you ran, and a sanitized
 reproduction.
 
 Do not paste tokens, full environment dumps, or unredacted logs into an issue.

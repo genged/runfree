@@ -55,7 +55,12 @@ const CAPTURE_MAX_BYTES = 32 * 1024 * 1024;
 const RECOVERY_RETRY_DELAY_MS = 1_000;
 const MAX_RECOVERY_ATTEMPTS = 3;
 
-export type SessionAdmissionMatrixBackend = "docker-desktop";
+/**
+ * The Docker backends a live matrix run may be attributed to: Docker Desktop,
+ * and native Docker Engine on Linux.
+ */
+export const SESSION_ADMISSION_MATRIX_BACKENDS = ["docker-desktop", "docker-engine"] as const;
+export type SessionAdmissionMatrixBackend = (typeof SESSION_ADMISSION_MATRIX_BACKENDS)[number];
 
 export type SessionAdmissionMatrixOptions = Readonly<{
   agents: readonly SessionAdmissionProbeAgent[];
@@ -200,10 +205,10 @@ export function parseSessionAdmissionMatrixArgs(
       if (selected.includes(agent)) throw new Error(`duplicate session admission agent: ${agent}`);
       selected.push(agent);
     } else if (option === "--backend") {
-      if (value !== "docker-desktop") {
-        throw new Error("--backend must be docker-desktop");
+      backend = SESSION_ADMISSION_MATRIX_BACKENDS.find((candidate) => candidate === value);
+      if (!backend) {
+        throw new Error(`--backend must be one of ${SESSION_ADMISSION_MATRIX_BACKENDS.join(", ")}`);
       }
-      backend = value;
     } else if (option === "--repeat") {
       repetitions = parseBoundedInteger(value, "--repeat", 1, MAX_REPETITIONS);
     } else if (option === "--cleanup-request-after-seconds") {
@@ -253,14 +258,33 @@ function captureDockerValue(io: RuntimeIO, args: readonly string[], label: strin
   return exactOutput(result.stdout, label);
 }
 
+/**
+ * Classifies by the daemon's self-reported identity strings only, matched
+ * case-insensitively: the server platform name (`docker version`) and the
+ * operating system (`docker info`). Either field containing "docker desktop"
+ * is docker-desktop, and wins: Desktop's server also calls itself "Docker
+ * Engine - Community". Otherwise a platform name containing "docker engine" is
+ * docker-engine. Any other pair (e.g. OrbStack's) is unclassified, so no
+ * claimed label is satisfied by it. Nothing here checks where the daemon runs.
+ */
+function classifySessionAdmissionMatrixBackend(
+  platformName: string,
+  operatingSystem: string,
+): SessionAdmissionMatrixBackend | undefined {
+  const platform = platformName.toLowerCase();
+  const os = operatingSystem.toLowerCase();
+  if (platform.includes("docker desktop") || os.includes("docker desktop")) return "docker-desktop";
+  if (platform.includes("docker engine")) return "docker-engine";
+  return undefined;
+}
+
 export function inspectSessionAdmissionMatrixBackend(
   expected: SessionAdmissionMatrixBackend,
   io: RuntimeIO,
 ): SessionAdmissionMatrixBackendDetails {
   const platformName = captureDockerValue(io, ["version", "--format", "{{.Server.Platform.Name}}"], "platform name");
   const operatingSystem = captureDockerValue(io, ["info", "--format", "{{.OperatingSystem}}"], "operating system");
-  const normalized = `${platformName} ${operatingSystem}`.toLowerCase();
-  const detected = normalized.includes("docker desktop") ? "docker-desktop" : undefined;
+  const detected = classifySessionAdmissionMatrixBackend(platformName, operatingSystem);
   if (detected !== expected) {
     throw new Error(
       `expected ${expected}, detected ${detected ?? "unclassified"}: ${platformName} / ${operatingSystem}`,

@@ -2,7 +2,7 @@ packages:
   - packages/*
 supportedArchitectures:
   os: [darwin, linux]
-  cpu: [arm64]
+  cpu: [arm64, x64]
 overrides:
   # vitest takes vite as a peer, so `pnpm update` never moves it.
   # GHSA-fx2h-pf6j-xcff, GHSA-rq7h-c2jc-7f22 and related launch-editor fixes.

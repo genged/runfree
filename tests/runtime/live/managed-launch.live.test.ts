@@ -32,6 +32,7 @@ import {
   destroyLiveFixture,
   type CaptureResult,
   type LiveFixture,
+  requireLiveRuntimeBackend,
   type LiveRuntimeBackend,
   MANAGED_CLAUDE_ARGV_RELATIVE_PATH,
   provisionSandboxFixture,
@@ -46,11 +47,7 @@ const TEST_TIMEOUT_MS = 10 * 60_000;
 const CAPTURE_MAX_BYTES = 8 * 1024 * 1024;
 
 function requiredBackend(): LiveRuntimeBackend {
-  const backend = process.env.TEST_RUNTIME_BACKEND;
-  if (backend !== "docker-desktop") {
-    throw new Error("TEST_RUNTIME_BACKEND must be docker-desktop for the managed launch tranche");
-  }
-  return backend;
+  return requireLiveRuntimeBackend("the managed launch tranche");
 }
 
 /** Runs the source CLI with extra env (for probes that need test-only env vars). */

@@ -58,6 +58,7 @@ import {
   destroyLiveFixture,
   type CaptureResult,
   type LiveFixture,
+  requireLiveRuntimeBackend,
   type LiveRuntimeBackend,
   provisionSandboxFixture,
   startStandingSession,
@@ -108,11 +109,7 @@ const TOKEN_PATH = "/oauth/token";
 const METADATA_PATH = "/.well-known/oauth-authorization-server";
 
 function requiredBackend(): LiveRuntimeBackend {
-  const backend = process.env.TEST_RUNTIME_BACKEND;
-  if (backend !== "docker-desktop") {
-    throw new Error("TEST_RUNTIME_BACKEND must be docker-desktop for the mcp-enable tranche");
-  }
-  return backend;
+  return requireLiveRuntimeBackend("the mcp-enable tranche");
 }
 
 function sessionExec(id: string, script: string): CaptureResult {

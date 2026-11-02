@@ -101,7 +101,7 @@ describe("proxy environment injection", () => {
       "      CA_KEY: /ca/private/proxy-ca.key",
       "      RUNFREE_SESSION_ADMISSION_SOURCE: files",
       "",
-      "volumes:",
+      "  # Host-service relay: the one backend adapter for host services, enabled",
     ].join("\n"));
     // Exactly one line added: removing it round-trips to the original bytes.
     const withoutAddedLine = rendered.replace("      RUNFREE_SESSION_ADMISSION_SOURCE: files\n", "");
@@ -118,7 +118,7 @@ describe("proxy environment injection", () => {
       "      RUNFREE_ALPHA_TEST: a",
       "      RUNFREE_ZETA_TEST: z",
       "",
-      "volumes:",
+      "  # Host-service relay: the one backend adapter for host services, enabled",
     ].join("\n"));
   });
 

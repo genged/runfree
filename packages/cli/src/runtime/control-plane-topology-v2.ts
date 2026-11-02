@@ -61,6 +61,26 @@ export type ControlPlaneTopologyProjectionV2 = Readonly<{
   // callback and VNC paths run as per-session ingress forwarders outside the
   // Compose generation.
   utilities: Readonly<Record<never, never>>;
+  // The Engine host-service relay (Compose profile `host-relay`). Its shape is
+  // the same on every backend, so this generation is too; whether the profile
+  // runs is the backend adapter's decision, proved live by topology.
+  hostServiceRelay: Readonly<{
+    service: "host_relay";
+    profile: "host-relay";
+    imageRole: "proxy";
+    networkMode: "host";
+    user: "65534:65534";
+    privileged: false;
+    readOnlyRootFilesystem: true;
+    publishedPorts: readonly [];
+    capabilityAdd: readonly [];
+    capabilityDrop: readonly ["ALL"];
+    securityOptions: readonly ["no-new-privileges:true"];
+    pidsLimit: 64;
+    command: readonly ["node", "/app/proxy/host-relay.js"];
+    mounts: readonly ControlPlaneMountV2[];
+    environment: Readonly<Record<string, string>>;
+  }>;
   controlOwnedNamedVolumes: readonly [Readonly<{
     logicalName: "runfree-oauth-state";
     runtimeName: string;
@@ -292,6 +312,30 @@ export function controlPlaneTopologyProjectionV2(
       ],
     },
     utilities: {},
+    hostServiceRelay: {
+      service: "host_relay",
+      profile: "host-relay",
+      imageRole: "proxy",
+      networkMode: "host",
+      user: "65534:65534",
+      privileged: false,
+      readOnlyRootFilesystem: true,
+      publishedPorts: [],
+      capabilityAdd: [],
+      capabilityDrop: ["ALL"],
+      securityOptions: ["no-new-privileges:true"],
+      pidsLimit: 64,
+      command: ["node", "/app/proxy/host-relay.js"],
+      mounts: [{ type: "bind", source: plan.paths.controlProxyDir, target: "/app/runfree-effective", readOnly: true }],
+      environment: sortedRecord({
+        RUNFREE_EFFECTIVE_PROXY_ROOT: "/app/runfree-effective",
+        RUNFREE_PROXY_EGRESS_GATEWAY: plan.network.proxyEgressGateway,
+        RUNFREE_PROXY_EGRESS_IP: plan.network.proxyEgressIp,
+        RUNFREE_PROXY_EGRESS_SUBNET: plan.network.proxyEgressSubnet,
+        RUNFREE_PROXY_IP: plan.network.proxyIp,
+        RUNFREE_SUBNET: plan.network.subnet,
+      }),
+    },
     controlOwnedNamedVolumes: [{
       logicalName: "runfree-oauth-state",
       runtimeName: oauthVolume,

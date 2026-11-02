@@ -30,6 +30,7 @@ import {
   destroyLiveFixture,
   provisionLiveFixture,
   type LiveFixture,
+  requireLiveRuntimeBackend,
   type LiveRuntimeBackend,
 } from "./fixture.ts";
 
@@ -37,11 +38,7 @@ const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..
 const PROVISION_TIMEOUT_MS = 30 * 60_000;
 
 function requiredBackend(): LiveRuntimeBackend {
-  const backend = process.env.TEST_RUNTIME_BACKEND;
-  if (backend !== "docker-desktop") {
-    throw new Error("TEST_RUNTIME_BACKEND must be docker-desktop for the --session-id contract tranche");
-  }
-  return backend;
+  return requireLiveRuntimeBackend("the --session-id contract tranche");
 }
 
 describe("pinned claude/pi --session-id contract on the built agent image", () => {

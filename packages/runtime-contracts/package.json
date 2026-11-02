@@ -15,6 +15,7 @@
     "./session-admission": "./src/session-admission.ts",
     "./session-file": "./src/session-file.ts",
     "./write-approvals": "./src/write-approvals.ts",
+    "./proc-net-tcp": "./src/proc-net-tcp.ts",
     "./primitives": "./src/primitives.ts"
   }
 }

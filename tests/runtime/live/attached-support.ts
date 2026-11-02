@@ -51,7 +51,7 @@ import {
   stageFirstRequestAgentBinary,
 } from "./agent-stub.ts";
 import { docker, dockerOrThrow } from "./docker.ts";
-import { describeOutput, type LiveFixture, type LiveRuntimeBackend } from "./fixture.ts";
+import { describeOutput, type LiveFixture, type LiveRuntimeBackend, requireLiveRuntimeBackend } from "./fixture.ts";
 import { parseProbeAnswer, type ProbeAnswer } from "./proxy-answer.ts";
 import { cliEntryArgv, sessionAdmissionCrashEntryArgv } from "../../support/prebuilt-entry.ts";
 export const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
@@ -110,11 +110,7 @@ export const HELD_WRITE_TIMEOUT_MS = 60_000;
 export const CONSUMER_CONVERGENCE_TIMEOUT_MS = 15_000;
 
 export function requiredBackend(): LiveRuntimeBackend {
-  const backend = process.env.TEST_RUNTIME_BACKEND;
-  if (backend !== "docker-desktop") {
-    throw new Error("TEST_RUNTIME_BACKEND must be docker-desktop for the attached admission tranche");
-  }
-  return backend;
+  return requireLiveRuntimeBackend("the attached admission tranche");
 }
 
 export type LaunchRun = Readonly<{
@@ -522,16 +518,29 @@ export function servedAliveUntil(proxyId: string, sourceIp: string): string {
 }
 
 /**
- * Stages the first-request stub and allowlists the host it sends to, before
- * the first `up`, so the stub's first request has an upstream the proxy may
- * forward it to. Nothing else about the policy changes; the tranche's
- * consumer assertions are about admitted source IPs, not hosts.
+ * A resolvable host allowlisted beside `FIRST_REQUEST_HOST`. The proxy
+ * firewall refuses to start unless at least one allowlisted host resolves to a
+ * safe IPv4 (`require-any-configured-host`), and `.invalid` never resolves on
+ * a conforming resolver, so without this the proxy fails before any session.
+ * No tranche here sends a request to it. The same host session-independence
+ * uses for its warm-peer requests.
+ */
+export const RESOLVABLE_ALLOWLIST_HOST = "example.com";
+
+/**
+ * Stages the first-request stub and, before the first `up`, allowlists the
+ * host it sends to plus `RESOLVABLE_ALLOWLIST_HOST`, so the proxy firewall can
+ * start and the stub's first request has an upstream the proxy may forward it
+ * to. The stub still targets only `FIRST_REQUEST_HOST`; the tranche's consumer
+ * assertions are about admitted source IPs, not hosts.
  */
 export function configureAttachedProject(fixture: LiveFixture): void {
   stageFirstRequestAgentBinary(fixture);
-  const added = fixture.runfree(["host", "add", FIRST_REQUEST_HOST, "--no-reload"]);
-  if (added.status !== 0) {
-    throw new Error(`runfree host add ${FIRST_REQUEST_HOST} failed: ${describeOutput(added.output)}`);
+  for (const host of [FIRST_REQUEST_HOST, RESOLVABLE_ALLOWLIST_HOST]) {
+    const added = fixture.runfree(["host", "add", host, "--no-reload"]);
+    if (added.status !== 0) {
+      throw new Error(`runfree host add ${host} failed: ${describeOutput(added.output)}`);
+    }
   }
 }
 

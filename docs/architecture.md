@@ -928,8 +928,8 @@ malformed lock fails before any build.
 
 ### Host Services
 
-A host service is a TCP service on the Docker Desktop host's loopback that the
-agent may reach, such as a dev server, a database, or a device bridge on
+A host service is a TCP service on the host's loopback that the agent may
+reach, such as a dev server, a database, or a device bridge on
 `127.0.0.1:<port>`. The host approves it per project, by name and port, and
 the approval persists in desired policy like an allowed host:
 
@@ -963,8 +963,109 @@ proxy (admitted sessions only)
    v
 firewall: only the request proxy may reach the gateway's approved ports
    v
-Docker Desktop host gateway -> host 127.0.0.1:<port>
+backend adapter: <gateway>:<port> -> host 127.0.0.1:<port>
+   Docker Desktop: the host gateway itself
+   Docker Engine:  the host relay (below)
 ```
+
+**One path on every backend.** Everything above the adapter line is the same
+on Docker Desktop and on a local Docker Engine on Linux: admission, the port
+registry, the gateway pin and `validateHostServiceGateway`, the
+`@host_service` firewall set, the splice, revocation, and activation. The
+proxy always dials `<pinned gateway>:<port>`. Backend-specific code is only:
+backend detection (`packages/cli/src/docker-backend.ts`), the listener check
+behind one interface (lsof on macOS, `/proc` on Linux,
+`packages/cli/src/host-listener-probe.ts`), the Engine relay service and its
+script, and admission's one Engine-only refusal (decision 2 below). The
+published-port check is the same on every backend: one `docker ps` read,
+which refuses `host-service add` for a port a container publishes (and when
+the read fails) and warns in `runfree status` and at launch. The listener
+check cannot stand in for it: on Engine a published port's host socket
+belongs to root's proxy process, invisible to the operator's probe, or to no
+process at all. The backend is detected once per runtime run, from the
+availability check's `docker info`, and that one answer selects the relay
+profile for Compose `up` and the relay's expected presence in the full and
+warm topology proofs.
+
+**Backends.** `docker info` and the daemon endpoint decide. A daemon that
+names Docker Desktop, reached on a local socket (a unix socket, or a named
+pipe on this machine), uses Desktop's own host gateway, which already
+forwards to the host's loopback: nothing is added, and no relay runs. A
+Desktop reached over TCP or SSH would forward to another machine's loopback,
+so it is refused like any remote daemon. A daemon that is not Desktop, where the
+CLI runs on Linux, the endpoint is a local unix socket, the daemon is not
+rootless, and the daemon's host name and kernel are this machine's, is a
+local Docker Engine and gets the relay. Anything else (OrbStack, Colima, a
+remote or rootless daemon) refuses `runfree host-service add` with "host
+services need Docker Desktop or a local Docker Engine on Linux".
+
+**Engine host relay.** On Docker Engine the gateway is the `docker0` bridge
+address, and a service on the host's `127.0.0.1` is not reachable through it.
+The `host_relay` Compose service (profile `host-relay`, enabled by the CLI
+only on Engine) closes that gap and nothing more:
+
+- It runs the proxy image's node (`packages/proxy/src/host-relay.ts`) on the
+  host network namespace, as uid 65534, with every capability dropped,
+  no-new-privileges, a read-only root filesystem, at most 64 pids, the managed
+  labels, and one read-only mount: the effective policy directory.
+- It reads the gateway exactly as the proxy's root supervisor does: the same
+  `gateway.runfree.internal:host-gateway` entry, from a root-owned
+  `/etc/hosts`, refused by the same `validateHostServiceGateway` checks. A
+  refused gateway leaves it idle, with no listener.
+- For each host service in the effective policy generation it listens on
+  exactly `<gateway>:<port>`: never a wildcard, loopback, or other address,
+  and never a port outside the set.
+- It accepts a connection only from the proxy's egress IP. Any other peer is
+  closed before a byte is read and before any upstream dial.
+- It splices opaque bytes to `127.0.0.1:<port>`. When a service leaves the
+  set it stops listening, so no new connection reaches it. It never closes
+  an established connection itself: revocation is the proxy's two cuts (the
+  request-proxy cut and the firewall cut), exactly as on Desktop, with no
+  third cut.
+- It watches the effective selection (`fs.watch` on the effective policy
+  directory) with a 250 ms poll as the fallback, so a port added to the live
+  generation listens within about one poll. Until it does, a new connection
+  to that port is refused; this is inside the accepted "new host-service
+  connections fail for about 2 s after a reload" window.
+
+Topology proves the relay from `docker inspect`, on the full and the warm
+path alike. On Engine there must be exactly one, with its hardened shape, the
+proxy's image and entrypoint, the managed and lifecycle labels plus the
+proxy's generation labels, and exactly the runtime plan's addresses in its
+environment (`RUNFREE_PROXY_EGRESS_IP` is the one source it admits). On
+Desktop the warm launch looks it up too and requires it absent, so a relay
+that appears after the full proof never passes a warm launch. A failed lookup
+fails closed on both. `down`, `destroy`, and `rebuild` remove it with the rest
+of the Compose project, because those calls always enable its profile. Every
+`up` names its profiles explicitly, so a user's `COMPOSE_PROFILES` never
+reaches the runtime. `rebuild` recreates the relay with the proxy, so both
+re-read the daemon's gateway; the relay pins it for its own life, as the
+supervisor does. The stale-network repair before a start leaves it alone:
+it is the one Compose service that is never on the internal network, by
+design. A compatible proxy replacement brings it up to date with the new
+proxy (`compose up --no-deps host_relay`, Engine only) before the candidate
+proof inspects it.
+
+Engine decisions:
+
+1. A service already on `0.0.0.0:<port>` or `[::]:<port>` owns the gateway
+   address too, so the relay's bind fails with `EADDRINUSE`. The kernel
+   already delivers `<gateway>:<port>` to that service, so the proxy reaches
+   it directly with the same proxy-side guarantees; the relay logs the port
+   as "served directly". It retries the bind on every poll, so a later
+   `127.0.0.1`-only service is relayed. While the relay holds
+   `<gateway>:<port>`, a new wildcard bind of that port on the host fails;
+   `runfree status` shows the relay's socket (a socket owned by uid 65534 on
+   the gateway address) when no visible service listens.
+2. A port below `net.ipv4.ip_unprivileged_port_start` is refused, because the
+   relay binds without root or added capabilities. Desktop is unchanged. This
+   is the only admission refusal that depends on the backend.
+3. The relay is the proxy image's node; there is no new image or dependency.
+4. A host firewall with default-deny INPUT (ufw, firewalld) must allow
+   traffic from the proxy's egress network to the gateway address. Without
+   it, host services time out.
+
+Rootless Docker is not supported.
 
 The proxy refuses before any dial, DNS lookup, or audit record, on every port
 and in every mode. The splice is opaque: no TLS interception, request rules,

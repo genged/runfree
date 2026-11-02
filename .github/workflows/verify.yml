@@ -28,12 +28,10 @@ env:
 jobs:
   verify:
     name: Static, unit, and build
-    # arm64, not ubuntu-latest: pnpm-workspace.yaml declares
-    # `supportedArchitectures: {os: [darwin, linux], cpu: [arm64]}`, so an x64
-    # runner installs @esbuild/darwin-arm64 and @esbuild/linux-arm64 but never
-    # @esbuild/linux-x64, and the first `tsx` call dies with esbuild's
-    # "installed for another platform" TransformError. The runner architecture
-    # and that declaration have to agree; this side is the cheap one to move.
+    # The runner architecture must be in pnpm-workspace.yaml's
+    # `supportedArchitectures.cpu` (arm64 and x64). A missing one installs no
+    # @esbuild/linux-<cpu>, and the first `tsx` call dies with esbuild's
+    # "installed for another platform" TransformError.
     runs-on: ubuntu-24.04-arm
 
     steps:

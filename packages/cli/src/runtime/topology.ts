@@ -18,6 +18,8 @@ import {
   type WarmFirewallEvidence,
 } from "./probes.ts";
 import { HOST_SERVICE_GATEWAY_ALIAS } from "@runfree/runtime-contracts/host-services";
+import type { HostServiceRelayMode } from "../docker-backend.ts";
+import { hostRelayProofIssues, lookupHostRelayContainerIds } from "./host-relay-topology.ts";
 import { remedy } from "../remedies.ts";
 import {
   applyDenyProbeBatchResult,
@@ -77,6 +79,12 @@ export type RuntimeTopologyOptions = {
    * passes them.
    */
   effectiveHostServices?: EffectiveHostServices;
+  /**
+   * Whether the Engine host-service relay applies (`docker-backend.ts`):
+   * the run's one backend decision, the same value Compose `up` used.
+   * Required: the validator never detects the backend on its own.
+   */
+  hostServiceRelay: HostServiceRelayMode;
 };
 
 /** The one `ExtraHosts` entry the proxy service carries (compose.yaml, literal). */
@@ -92,6 +100,15 @@ export type WarmTopologyEvidence = Readonly<{
   /** `awk '/CapBnd/ { print $2 }' /proc/1/status` as root. */
   capBnd: Readonly<{ exit: number; body: string }>;
   firewall: WarmFirewallEvidence;
+  /**
+   * The Engine host-service relay lookup on every backend: the exact ids of
+   * this project's `host_relay` containers (undefined when the lookup failed),
+   * and, when exactly one exists on Engine, its inspection from the same
+   * batch. The warm path proves the relay's shape on Engine and its absence
+   * everywhere else, exactly as the full path does.
+   */
+  hostRelayIds: readonly string[] | undefined;
+  hostRelay?: DockerContainerInspect;
 }>;
 
 export type RuntimeTopologyValidationResult = Readonly<{
@@ -136,6 +153,7 @@ export const REQUIRED_TOPOLOGY_ASSERTIONS: readonly TopologyAssertionInventoryEn
   { code: "utility-vnc-forwarder-shape", source: "docker-inspect" },
   { code: "utility-ingress-forwarder-shape", source: "docker-inspect" },
   { code: "utility-mcp-callback-relay-shape", source: "docker-inspect" },
+  { code: "host-relay-shape", source: "docker-inspect" },
 ];
 
 export function formatTopologyIssues(issues: readonly RuntimeTopologyIssue[]): string[] {
@@ -146,6 +164,7 @@ function codeForTopologyMessage(message: string): string {
   // Host-service gateway checks first: their labels share prefixes with the
   // older proxy and agent-position families below.
   if (message.startsWith("proxy ExtraHosts") || message.startsWith("proxy /etc/hosts")) return "proxy-extra-hosts-exact";
+  if (message.startsWith("host relay")) return "host-relay-shape";
   if (message.startsWith("agent-position host gateway port")
     || message.startsWith("proxy-position server UID host gateway")
     || message.startsWith("proxy-position root host gateway")) return "agent-host-gateway-port-denied";
@@ -400,12 +419,12 @@ function topologyContext(input: RuntimeContext | ActiveRuntimePlan): RuntimeCont
   };
 }
 
-export function validateRuntimeTopology(plan: ActiveRuntimePlan, io: RuntimeIO, options?: RuntimeTopologyOptions): RuntimeTopologyIssue[];
-export function validateRuntimeTopology(context: RuntimeContext, io: RuntimeIO, options?: RuntimeTopologyOptions): RuntimeTopologyIssue[];
+export function validateRuntimeTopology(plan: ActiveRuntimePlan, io: RuntimeIO, options: RuntimeTopologyOptions): RuntimeTopologyIssue[];
+export function validateRuntimeTopology(context: RuntimeContext, io: RuntimeIO, options: RuntimeTopologyOptions): RuntimeTopologyIssue[];
 export function validateRuntimeTopology(
   input: RuntimeContext | ActiveRuntimePlan,
   io: RuntimeIO,
-  options: RuntimeTopologyOptions = {},
+  options: RuntimeTopologyOptions,
 ): RuntimeTopologyIssue[] {
   return validateTopology(input, io, options).issues;
 }
@@ -473,6 +492,39 @@ function validateTopology(
   validateContainerShape(messages, "proxy", proxy, [internalNetwork, egressNetwork]);
   if (messages.length > beforeShape) options.onBoundaryViolation?.();
   validateProxyExtraHosts(messages, proxy);
+
+  // The Engine host-service relay: required with its exact shape on Engine,
+  // absent everywhere else, on the full and the warm path alike. The warm
+  // path issues no Docker call: its caller names the mode and hands over the
+  // lookup and inspection from its batch.
+  {
+    const relayMode = options.hostServiceRelay;
+    let ids: readonly string[] | undefined;
+    let relay: DockerContainerInspect | undefined;
+    if (warm) {
+      ids = warm.hostRelayIds;
+      relay = warm.hostRelay;
+    } else {
+      ids = lookupHostRelayContainerIds(client, project);
+      if (relayMode === "engine-relay" && ids?.length === 1) {
+        relay = parseDockerJson<DockerContainerInspect[]>(client.inspect([ids[0] as string]), "docker inspect host relay")?.[0];
+      }
+    }
+    const relayIssues = hostRelayProofIssues({ ids, relay }, {
+      mode: relayMode,
+      projectId,
+      composeProject: project,
+      proxy,
+      effectiveProxyDir: context.project.paths.controlProxyDir,
+      extraHosts: PROXY_EXTRA_HOSTS,
+      network: runtimeNetwork,
+    });
+    // A missing relay or a failed lookup only fails closed; a relay that is
+    // present where it must not be, or in the wrong shape, is a boundary
+    // problem.
+    if ((ids?.length ?? 0) > 0 && relayIssues.length > 0) options.onBoundaryViolation?.();
+    messages.push(...relayIssues);
+  }
 
   const proxyStateIssue = containerStateIssue("proxy", proxy);
   if (proxyStateIssue) {

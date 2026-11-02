@@ -33,6 +33,9 @@ vi.mock("./control/effective.ts", async (importOriginal) => {
 // below delegates to the real implementation, so every other test's behavior
 // is unaffected.
 const hostServiceRecheckEvents = vi.hoisted(() => ({ events: [] as string[] }));
+// Lets a Linux test answer the /proc listener check (status and launch) from a
+// fixture /proc instead of this host's; unset, the real /proc is read.
+const hostListenerProc = vi.hoisted(() => ({ procFs: undefined as undefined | import("./host-listener-proc.ts").ProcFs }));
 // Lets a launch test report another live session in the project, and records
 // (or fails) the post-mutation activation a launch-time service enable needs
 // beside it. Both default to the real behavior.
@@ -67,7 +70,8 @@ vi.mock("./host-service-port-owner.ts", async (importOriginal) => {
     // launch actually goes through since F29.
     hostServiceOwnerWarnings: (...args: Parameters<typeof actual.hostServiceOwnerWarnings>) => {
       hostServiceRecheckEvents.events.push("probe");
-      return actual.hostServiceOwnerWarnings(...args);
+      const [context, io, services, recorded, platform, procFs] = args;
+      return actual.hostServiceOwnerWarnings(context, io, services, recorded, platform, hostListenerProc.procFs ?? procFs);
     },
   };
 });
@@ -77,7 +81,22 @@ vi.mock("./host-listener-snapshot.ts", async (importOriginal) => {
     ...actual,
     probeHostListeners: (...args: Parameters<typeof actual.probeHostListeners>) => {
       hostServiceRecheckEvents.events.push("probe");
-      return actual.probeHostListeners(...args);
+      const [context, io, platform, procFs] = args;
+      return actual.probeHostListeners(context, io, platform, hostListenerProc.procFs ?? procFs);
+    },
+  };
+});
+// Counts Docker backend detections (Linux commit 4, C5): one runtime start
+// resolves the backend once and passes the answer to Compose `up`, the full
+// topology proof, and the warm proof. Delegates to the real detection.
+const backendDetections = vi.hoisted(() => ({ count: 0 }));
+vi.mock("./docker-backend.ts", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./docker-backend.ts")>();
+  return {
+    ...actual,
+    detectDockerBackend: (...args: Parameters<typeof actual.detectDockerBackend>) => {
+      backendDetections.count += 1;
+      return actual.detectDockerBackend(...args);
     },
   };
 });
@@ -128,6 +147,7 @@ import {
 } from "./runtime/mcp.ts";
 import type { RuntimeNetwork } from "./network.ts";
 import type { PiProviderChoice, PiProviderOption } from "./runtime/types.ts";
+import type { ProcFs } from "./host-listener-proc.ts";
 import { composeProjectName, projectHash } from "./project-identity.ts";
 import { helperMarkerPath, legacyHelperRunsRoot, markHelperRunPending, readHelperMarker } from "./runtime/ephemeral-helper-residue.ts";
 import { proxyHostServiceSetJson, proxyNftablesTableFixture, proxyNftablesTableJson } from "./proxy-nftables-proof.fixture.ts";
@@ -178,6 +198,7 @@ import { boundCallbackForwarder } from "./runtime/session-callback-ingress.test-
 import { INGRESS_FORWARDER_IMAGE } from "./runtime/ingress-forwarder.ts";
 import { hostBootId, hostProcessStart } from "./runtime/host-identity.ts";
 import { createSessionLaunchTarget } from "./runtime/session-launch.ts";
+import { createRuntimeDocker, hostServiceRelayMode } from "./runtime/docker.ts";
 import { createHeadlessRuntimeIO } from "./terminal-mode.ts";
 import { buildTokenAutoRefreshSpawnPlan, containerMissingNetwork, resolveRunfreeSelfInvocation } from "./runtime.ts";
 import {
@@ -1206,6 +1227,41 @@ function captureResult(status: number, stdout = "", stderr = ""): CaptureResult 
   return { status, stdout, stderr };
 }
 
+/**
+ * A fixture Linux /proc with one TCP listener on port 10882 (inode 11, pid
+ * 4242): `hidden` is a socket owned by uid 0 on 0.0.0.0 whose process this
+ * user cannot read (root's `docker-proxy`); `visible` is a process this user
+ * can see listening on 127.0.0.1.
+ */
+function linuxListenerProc(shape: "hidden" | "visible"): ProcFs {
+  const errno = (code: string): Error => Object.assign(new Error(code), { code });
+  const tcpHeader = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode";
+  const local = shape === "hidden" ? "00000000:2A82" : "0100007F:2A82";
+  const uid = shape === "hidden" ? 0 : 1000;
+  const row = `   0: ${local} 00000000:0000 0A 00000000:00000000 00:00000000 00000000 ${uid} 0 11 1 0000000000000000 100 0 0 10 0`;
+  return {
+    readText(filePath) {
+      if (filePath === "/proc/net/tcp") return `${tcpHeader}\n${row}\n`;
+      if (filePath === "/proc/net/tcp6") return `${tcpHeader}\n`;
+      throw errno("ENOENT");
+    },
+    listDir(dirPath) {
+      if (dirPath === "/proc") return ["self", "net", "4242"];
+      if (dirPath === "/proc/4242/fd") {
+        if (shape === "hidden") throw errno("EACCES");
+        return ["0", "7"];
+      }
+      throw errno("ENOENT");
+    },
+    readLink(linkPath) {
+      if (linkPath === "/proc/4242/fd/0") return "/dev/null";
+      if (linkPath === "/proc/4242/fd/7") return "socket:[11]";
+      if (linkPath === "/proc/4242/exe") return "/usr/local/bin/idb_companion";
+      throw errno("ENOENT");
+    },
+  };
+}
+
 /** The proxy's served-set read: its session-file listing, not the firewall's section read. */
 const servedSetRead = (args: readonly string[]): boolean => args[0] === "exec"
   && args.includes(FAKE_PROXY_CONTAINER_ID)
@@ -1534,6 +1590,8 @@ function createRuntimeIO(overrides: {
   choosePiProvider?: (options: readonly PiProviderOption[]) => PiProviderChoice | undefined;
   commandExists?: (command: string) => boolean;
   confirm?: (question: string) => boolean;
+  /** More containers of the started Compose set (beyond the proxy), by exact id and Compose service. */
+  extraComposeContainers?: () => ReadonlyArray<Readonly<{ id: string; service: string }>>;
   /** The firewall's live `host_service` kernel set, for a project whose effective policy approves host services. Empty by default. */
   hostServiceSet?: ReadonlyArray<{ ip: string; port: number }>;
   isInteractive?: () => boolean;
@@ -1727,6 +1785,7 @@ function createRuntimeIO(overrides: {
       return captureResult(0, [
         ...(process.env.FAKE_PREEXISTING_AGENT_ID ? [FAKE_AGENT_CONTAINER_ID] : []),
         FAKE_PROXY_CONTAINER_ID,
+        ...(overrides.extraComposeContainers?.() ?? []).map((container) => container.id),
       ].join("\n"));
     }
     if (args[0] === "inspect" && args.includes("--format") && args.some((arg) => arg.includes("io.runfree.runtime-digest"))) {
@@ -1737,7 +1796,8 @@ function createRuntimeIO(overrides: {
           && componentEnv.RUNFREE_TOPOLOGY_DIGEST,
       );
       return captureResult(0, ids.map((id) => {
-        const service = id === FAKE_PROXY_CONTAINER_ID ? "proxy" : "agent";
+        const extra = overrides.extraComposeContainers?.().find((container) => container.id === id);
+        const service = id === FAKE_PROXY_CONTAINER_ID ? "proxy" : extra?.service ?? "agent";
         return [
           id,
           service,
@@ -1893,6 +1953,16 @@ function createRuntimeIO(overrides: {
       // Post-cutover the topology/security probes inspect only the proxy (and an
       // optional callback); pre-cutover they also inspect the shared agent.
       // Return exactly the requested containers so both shapes work.
+      // The proxy carries its image and the generation labels Compose stamps
+      // from the up environment (the Engine host relay must match both).
+      const proxyView = JSON.parse(defaultCapture("docker", ["container", "inspect", FAKE_PROXY_CONTAINER_ID], env).stdout || "[]") as Array<Record<string, unknown>>;
+      const generationLabelEntries: Array<[string, string | undefined]> = [
+        ["io.runfree.proxy-image-input-digest", observedComposeEnv.RUNFREE_PROXY_IMAGE_INPUT_DIGEST],
+        ["io.runfree.topology-digest", observedComposeEnv.RUNFREE_TOPOLOGY_DIGEST],
+        ["io.runfree.version", observedComposeEnv.RUNFREE_VERSION],
+      ];
+      const proxyGenerationLabels = Object.fromEntries(generationLabelEntries
+        .filter((entry): entry is [string, string] => typeof entry[1] === "string"));
       const entries = [
         {
           ...agentInspect,
@@ -1911,6 +1981,8 @@ function createRuntimeIO(overrides: {
         {
           ...proxyInspect,
           Id: FAKE_PROXY_CONTAINER_ID,
+          ...(proxyView[0]?.Image ? { Image: proxyView[0].Image } : {}),
+          Config: { Entrypoint: ["dumb-init", "--"], Labels: proxyGenerationLabels },
           HostConfig: {
             ...(proxyInspect.HostConfig as Record<string, unknown>),
             CapAdd: ["NET_ADMIN"],
@@ -4306,7 +4378,10 @@ describe("runtime command flow", () => {
     // The uid-1001 host gateway probe rides the server-UID batch (no extra
     // exec); this policy approves no host service, so no root probe runs.
     // The full validation reads the proxy start it proves (+1 `docker
-    // container inspect`), so the record binds that incarnation.
+    // container inspect`), so the record binds that incarnation. The full
+    // topology and the warm-proof record each look up the Engine
+    // host-service relay to prove it present on Engine or absent elsewhere
+    // (+2 `docker ps`).
     expect(dockerOperationProfile(io.calls.slice(warmStart))).toMatchInlineSnapshot(`
       {
         "docker container inspect": 5,
@@ -4315,7 +4390,7 @@ describe("runtime command flow", () => {
         "docker info": 1,
         "docker inspect": 6,
         "docker network inspect": 3,
-        "docker ps": 14,
+        "docker ps": 16,
         "docker run": 1,
       }
     `);
@@ -4341,6 +4416,8 @@ describe("runtime command flow", () => {
     const warmStart = io.calls.length;
     const warm = await startRuntime(context, io, false, { launch: true });
     expect(warm.status).toBe(0);
+    // The warm proof looks up the Engine host-service relay on every backend
+    // (+1 `docker ps`): proven absent on Desktop, exactly one on Engine.
     expect(dockerOperationProfile(io.calls.slice(warmStart))).toMatchInlineSnapshot(`
       {
         "docker container inspect": 1,
@@ -4348,7 +4425,7 @@ describe("runtime command flow", () => {
         "docker image inspect": 9,
         "docker info": 1,
         "docker inspect": 2,
-        "docker ps": 8,
+        "docker ps": 9,
       }
     `);
   });
@@ -4828,6 +4905,46 @@ describe("runtime command flow", () => {
       expect(dockerOperationProfile(calls)["docker run"]).toBeUndefined();
       // The prepared runtime still carries an exact validation proof.
       expect(warm.kind === "ready" && preparedRuntimeProxyId(warm.preparedRuntime)).toBe(FAKE_PROXY_CONTAINER_ID);
+    });
+
+    // REVIEW-1 #2: the warm proof proves the relay's absence where it does
+    // not apply, so a relay introduced after the full proof is never outside
+    // the warm observation.
+    test("a host relay that appears off Engine after the full proof fails the warm launch; runfree destroy reclaims it", async () => {
+      const context = launchContext();
+      // A stateful inventory: only the Compose teardown below removes the
+      // relay, exactly as its COMPOSE_PROFILES allow; the test never clears it.
+      const inventory = { relay: false, relayRemovals: 0 };
+      const relayId = "9".repeat(64);
+      const relayLookup = (args: readonly string[]): boolean => args[0] === "ps"
+        && args.includes("label=com.docker.compose.service=host_relay");
+      const io: ReturnType<typeof createRuntimeIO> = createRuntimeIO({
+        capture: (_command, args) => (inventory.relay && relayLookup(args) ? captureResult(0, `${relayId}\n`) : undefined),
+        run: (command, args) => {
+          if (command !== "docker" || args[0] !== "compose" || !args.includes("down")) return 0;
+          const profiles = (io.calls.at(-1)?.env?.COMPOSE_PROFILES ?? "").split(",");
+          if (profiles.includes("host-relay") && inventory.relay) {
+            inventory.relay = false;
+            inventory.relayRemovals += 1;
+          }
+          return 0;
+        },
+      });
+      await warmedUp(context, io);
+      inventory.relay = true;
+      const start = io.calls.length;
+      const refused = await startRuntime(context, io, false, { launch: true });
+      expect(refused.status).not.toBe(0);
+      expect(io.calls.slice(start).some((call) => call.method === "capture" && relayLookup(call.args))).toBe(true);
+      expect(pendingWarningsForTest().map((event) => event.message).join("\n"))
+        .toContain("host relay container must not exist where Docker Desktop's host gateway serves host services");
+      expect(inventory).toEqual({ relay: true, relayRemovals: 0 });
+
+      // Reclamation by the product: the teardown always enables the relay
+      // profile, so `compose down` removes a relay the runtime never asked for.
+      await destroyRuntime(context, io);
+      expect(inventory).toEqual({ relay: false, relayRemovals: 1 });
+      expect((await startRuntime(context, io, false, { launch: true })).status).toBe(0);
     });
 
     test("runfree up always runs the full validation and rewrites the record", async () => {
@@ -5840,6 +5957,10 @@ describe("runtime command flow", () => {
 
       const lsofCalls = (io: { calls: RuntimeIoCall[] }): RuntimeIoCall[] => io.calls
         .filter((call) => call.method === "capture" && call.command === "/usr/sbin/lsof");
+      // The published-port check's `docker ps --format {{.Ports}}` reads.
+      const publishedPortReads = (io: { calls: RuntimeIoCall[] }): RuntimeIoCall[] => io.calls
+        .filter((call) => call.method === "capture" && call.command === "docker" && call.args[0] === "ps"
+          && call.args.includes("{{.Ports}}"));
 
       test("zero approved host services makes zero live-owner probe calls", async () => {
         Object.defineProperty(process, "platform", { value: "darwin" });
@@ -5855,6 +5976,8 @@ describe("runtime command flow", () => {
 
         expect((await startRuntime(context, io, false, { launch: true })).status).toBe(0);
         expect(lsofCalls(io)).toHaveLength(0);
+        // Nor any published-port read (C4).
+        expect(publishedPortReads(io)).toHaveLength(0);
       });
 
       // Ports and process names for `count` approved host services, built the
@@ -5891,6 +6014,40 @@ describe("runtime command flow", () => {
         flushWarnings();
         expect(result.status, vi.mocked(console.error).mock.calls.flat().join("\n")).toBe(0);
         expect(lsofCalls(io)).toHaveLength(1);
+        // And exactly one published-port read (C4).
+        expect(publishedPortReads(io)).toHaveLength(1);
+      });
+
+      // Regression (Linux commit 4, C1): a container that publishes the
+      // approved port after `add` is named at launch, whatever the listener
+      // check sees of its host socket; a failed `docker ps` is one warning.
+      // Neither changes the launch result.
+      test.each([
+        ["no visible listener", captureResult(1, ""), "0.0.0.0:10882->80/tcp\n", "host service idb (127.0.0.1:10882): published by a container (docker ps)"],
+        ["a visible listener", captureResult(0, "p4242\ncidb_companion\nf7\nn127.0.0.1:10882\n"), "127.0.0.1:10882->80/tcp\n",
+          "host service idb (127.0.0.1:10882): published by a container (docker ps)"],
+        ["a failed docker ps", captureResult(0, "p4242\ncidb_companion\nf7\nn127.0.0.1:10882\n"), undefined,
+          "host services: container-published ports were not checked: docker ps exited with status 1"],
+      ])("a launch beside %s warns from its one docker ps read and still succeeds", async (_label, lsof, ports, warning) => {
+        Object.defineProperty(process, "platform", { value: "darwin" });
+        const context = launchContext();
+        const io = createRuntimeIO({
+          hostServiceSet: idbHostServiceSet,
+          capture: (command, args) => {
+            if (command === "/usr/sbin/lsof") return lsof;
+            if (command === "docker" && args[0] === "ps" && args.includes("{{.Ports}}")) {
+              return ports === undefined ? captureResult(1, "", "Cannot connect to the Docker daemon") : captureResult(0, ports);
+            }
+            return undefined;
+          },
+        });
+
+        const result = await startRuntime(context, io, false, { launch: true });
+        flushWarnings();
+        const errOutput = vi.mocked(console.error).mock.calls.flat().join("\n");
+        expect(result.status, errOutput).toBe(0);
+        expect(errOutput).toContain(warning);
+        expect(publishedPortReads(io)).toHaveLength(1);
       });
     });
 
@@ -6035,6 +6192,324 @@ describe("runtime command flow", () => {
       const after = readHostServicePortRegistry(context.env);
       if (!after.ok) throw new Error(after.reason);
       expect(after.owners.has(10882)).toBe(false);
+    });
+
+    test("up enables the Engine relay profile only on Engine; destroy always enables it so no relay survives (C6)", async () => {
+      const projectRoot = path.join(tmp, "project");
+      const project = prepareProject(projectRoot);
+      const context = {
+        projectRoot,
+        project,
+        runtimeRoot: path.join(tmp, "runtime"),
+        env: { PATH: "/fake-bin", XDG_STATE_HOME: path.join(tmp, "xdg-state"), COMPOSE_PROFILES: "user-profile" },
+        network: fixedNetwork,
+      } satisfies RuntimeContext;
+      const io = createRuntimeIO();
+      backendDetections.count = 0;
+      expect((await startRuntime(context, io, false, {})).status).toBe(0);
+      // One backend detection for the whole start (C5).
+      expect(backendDetections.count).toBe(1);
+      // The fake daemon is not this host's Engine: no relay, and the user's
+      // own COMPOSE_PROFILES never leaks into the runtime's Compose.
+      expect(composeUpCall(io)?.env?.COMPOSE_PROFILES).toBe("");
+
+      await destroyRuntime(context, io);
+      const down = io.calls.find((call) => call.method === "run" && call.command === "docker"
+        && call.args[0] === "compose" && call.args.includes("down"));
+      expect(down?.env?.COMPOSE_PROFILES).toBe("host-relay");
+    });
+
+    // REVIEW-1 #5 and LEAD-NOTES-1: on a local Engine the relay is created by
+    // `up`, survives every later lifecycle step that is not teardown (the
+    // stale-network repair once removed it, because it is on the host network
+    // by design), is proved cold and warm, and is gone after destroy. The fake
+    // daemon keeps a container inventory the Compose calls change exactly as
+    // their COMPOSE_PROFILES allow, and the assertions read that inventory.
+    // `options.project` prepares the project (default: no host services);
+    // `options.capture` answers first, for the reads a test adds.
+    function localEngineRelayFixture(options: {
+      project?: (projectRoot: string) => RuntimeContext["project"];
+      capture?: (command: string, args: readonly string[]) => CaptureResult | undefined;
+      hostServiceSet?: ReadonlyArray<{ ip: string; port: number }>;
+    } = {}) {
+      const projectRoot = path.join(tmp, "project");
+      const project = (options.project ?? prepareProject)(projectRoot);
+      const context = {
+        projectRoot,
+        project,
+        runtimeRoot: path.join(tmp, "runtime"),
+        env: { PATH: "/fake-bin", XDG_STATE_HOME: path.join(tmp, "xdg-state"), DOCKER_HOST: "unix:///var/run/docker.sock", COMPOSE_PROFILES: "user-profile" },
+        network: fixedNetwork,
+      } satisfies RuntimeContext;
+      const relayId = "7".repeat(64);
+      const inventory = { relay: false, relayRemovals: 0 };
+      let composeEnv: NodeJS.ProcessEnv = {};
+      const profilesOf = (env: NodeJS.ProcessEnv | undefined): string[] => (env?.COMPOSE_PROFILES ?? "").split(",").filter(Boolean);
+      const relayLookup = (args: readonly string[]): boolean => args[0] === "ps"
+        && args.includes("label=com.docker.compose.service=host_relay");
+      const relayInspect = (proxy: Record<string, unknown>): Record<string, unknown> => ({
+        Id: relayId,
+        Name: `/${composeEnv.RUNFREE_COMPOSE_PROJECT_NAME}-host-relay`,
+        Image: proxy.Image,
+        State: { Running: true, Status: "running" },
+        Config: {
+          User: "65534:65534",
+          Entrypoint: (proxy.Config as Record<string, unknown> | undefined)?.Entrypoint,
+          Cmd: ["node", "/app/proxy/host-relay.js"],
+          Env: [
+            "PATH=/usr/local/bin:/usr/bin:/bin",
+            "RUNFREE_EFFECTIVE_PROXY_ROOT=/app/runfree-effective",
+            `RUNFREE_PROXY_IP=${composeEnv.RUNFREE_PROXY_IP}`,
+            `RUNFREE_SUBNET=${composeEnv.RUNFREE_SUBNET}`,
+            `RUNFREE_PROXY_EGRESS_IP=${composeEnv.RUNFREE_PROXY_EGRESS_IP}`,
+            `RUNFREE_PROXY_EGRESS_SUBNET=${composeEnv.RUNFREE_PROXY_EGRESS_SUBNET}`,
+            `RUNFREE_PROXY_EGRESS_GATEWAY=${composeEnv.RUNFREE_PROXY_EGRESS_GATEWAY}`,
+          ],
+          Labels: {
+            "io.runfree.project-id": composeEnv.RUNFREE_PROJECT_ID,
+            "io.runfree.compose-project": composeEnv.RUNFREE_COMPOSE_PROJECT_NAME,
+            "io.runfree.digest-schema": "1",
+            "io.runfree.managed": "true",
+            "io.runfree.container-role": "host-relay",
+            "io.runfree.lifecycle-owner": "compose",
+            "io.runfree.label-schema": "1",
+            "io.runfree.proxy-image-input-digest": composeEnv.RUNFREE_PROXY_IMAGE_INPUT_DIGEST,
+            "io.runfree.topology-digest": composeEnv.RUNFREE_TOPOLOGY_DIGEST,
+            "io.runfree.version": composeEnv.RUNFREE_VERSION,
+            "com.docker.compose.project": composeEnv.RUNFREE_COMPOSE_PROJECT_NAME,
+            "com.docker.compose.service": "host_relay",
+          },
+        },
+        HostConfig: {
+          NetworkMode: "host",
+          Privileged: false,
+          CapAdd: null,
+          CapDrop: ["ALL"],
+          ReadonlyRootfs: true,
+          SecurityOpt: ["no-new-privileges:true"],
+          PidsLimit: 64,
+          PortBindings: {},
+          ExtraHosts: ["gateway.runfree.internal:host-gateway"],
+        },
+        Mounts: [{ Type: "bind", Source: composeEnv.RUNFREE_EFFECTIVE_PROXY_DIR, Destination: "/app/runfree-effective", RW: false }],
+        NetworkSettings: { Networks: { host: {} } },
+      });
+      const io: ReturnType<typeof createRuntimeIO> = createRuntimeIO({
+        // The Compose set listing names the relay while it exists.
+        extraComposeContainers: () => (inventory.relay ? [{ id: relayId, service: "host_relay" }] : []),
+        ...(options.hostServiceSet ? { hostServiceSet: options.hostServiceSet } : {}),
+        capture: (command, args, fallback) => {
+          const extra = options.capture?.(command, args);
+          if (extra) return extra;
+          if (command !== "docker") return undefined;
+          // A local Engine on this host: not Desktop, this host's name and kernel.
+          if (args[0] === "info" && args.includes("{{json .}}")) {
+            const answer = fallback();
+            return captureResult(0, JSON.stringify({
+              ...JSON.parse(answer.stdout) as Record<string, unknown>,
+              OperatingSystem: "Debian GNU/Linux 13 (trixie)",
+              Name: os.hostname(),
+              KernelVersion: os.release(),
+            }));
+          }
+          if (relayLookup(args)) return captureResult(0, inventory.relay ? `${relayId}\n` : "");
+          const proxy = (): Record<string, unknown> => (JSON.parse(io.capture("docker", ["inspect", FAKE_PROXY_CONTAINER_ID]).stdout) as Array<Record<string, unknown>>)[0] ?? {};
+          // The full topology's relay inspection, by the looked-up id.
+          if (args[0] === "inspect" && args.length === 2 && args[1] === relayId) {
+            return inventory.relay ? captureResult(0, JSON.stringify([relayInspect(proxy())])) : captureResult(1, "[]", "Error: No such object");
+          }
+          // The warm proof's batch: the relay rides at the end, by exact id.
+          if (args[0] === "inspect" && args.length > 2 && args.at(-1) === relayId && !args.includes("--format")) {
+            if (!inventory.relay) return captureResult(1, "[]", "Error: No such object");
+            const rest = io.capture("docker", args.slice(0, -1));
+            if (rest.status !== 0) return rest;
+            const objects = JSON.parse(rest.stdout) as Array<Record<string, unknown>>;
+            return captureResult(0, JSON.stringify([...objects, relayInspect(objects[0] ?? {})]));
+          }
+          // The Compose set's network inspection (stale-network repair).
+          if (args[0] === "inspect" && args.includes("--format") && args.some((arg) => arg.includes("NetworkSettings.Networks"))) {
+            const ids = args.slice(args.indexOf("--format") + 2);
+            const project = composeEnv.RUNFREE_COMPOSE_PROJECT_NAME;
+            return captureResult(0, ids.map((id) => id === relayId
+              ? `${id}\thost \thost_relay`
+              : `${id}\t${project}_agent_internal ${project}_proxy_egress \tproxy`).join("\n"));
+          }
+          if ((args[0] === "rm" || (args[0] === "container" && args[1] === "rm")) && args.includes(relayId)) {
+            inventory.relay = false;
+            inventory.relayRemovals += 1;
+            return captureResult(0, `${relayId}\n`);
+          }
+          return undefined;
+        },
+        run: (command, args) => {
+          if (command !== "docker") return 0;
+          // A direct removal (the stale-network repair removes through `rm -f`).
+          if ((args[0] === "rm" || (args[0] === "container" && args[1] === "rm")) && args.includes(relayId)) {
+            inventory.relay = false;
+            inventory.relayRemovals += 1;
+            return 0;
+          }
+          if (args[0] !== "compose") return 0;
+          const env = io.calls.at(-1)?.env;
+          const profiles = profilesOf(env);
+          if (args.includes("up")) {
+            composeEnv = { ...env };
+            const services = args.slice(args.indexOf("up") + 1).filter((arg) => !arg.startsWith("-"));
+            if (profiles.includes("host-relay") && (services.length === 0 || services.includes("host_relay"))) inventory.relay = true;
+            // Without the profile, an existing relay is an orphan Compose may remove.
+            if (!profiles.includes("host-relay") && args.includes("--remove-orphans") && inventory.relay) {
+              inventory.relay = false;
+              inventory.relayRemovals += 1;
+            }
+          }
+          if (args.includes("down") && profiles.includes("host-relay") && inventory.relay) {
+            inventory.relay = false;
+            inventory.relayRemovals += 1;
+          }
+          return 0;
+        },
+      });
+      return { context, io, inventory, relayId };
+    }
+
+    test.runIf(process.platform === "linux")("on a local Engine the relay is created by up, survives later starts and the stale-network repair, and destroy removes it (C6)", async () => {
+      const { context, io, inventory, relayId } = localEngineRelayFixture();
+
+      // C5: each start detects the backend exactly once, and Compose `up`, the
+      // full topology proof, and the warm proof all use that one answer.
+      const startOnce = async (options: NonNullable<Parameters<typeof startRuntime>[3]>): ReturnType<typeof startRuntime> => {
+        backendDetections.count = 0;
+        const started = await startRuntime(context, io, false, options);
+        expect(backendDetections.count).toBe(1);
+        return started;
+      };
+
+      // Cold up: Engine selects the relay profile, and the user's own profile never leaks in.
+      const cold = await startOnce({});
+      expect(cold.status, pendingWarningsForTest().map((event) => event.message).join("\n")).toBe(0);
+      expect(composeUpCall(io)?.env?.COMPOSE_PROFILES).toBe("host-relay");
+      expect(inventory).toEqual({ relay: true, relayRemovals: 0 });
+
+      // A later up runs the stale-network repair over the Compose set (the
+      // relay is listed, on the host network) and the full topology proof.
+      const second = io.calls.length;
+      expect((await startOnce({})).status).toBe(0);
+      expect(io.calls.slice(second).some((call) => call.args[0] === "inspect"
+        && call.args.some((arg) => arg.includes("NetworkSettings.Networks")) && call.args.includes(relayId))).toBe(true);
+      expect(inventory).toEqual({ relay: true, relayRemovals: 0 });
+
+      // Warm launches prove the relay from the batch and keep it.
+      expect((await startOnce({ launch: true })).status).toBe(0);
+      const warmStart = io.calls.length;
+      expect((await startOnce({ launch: true })).status).toBe(0);
+      expect(io.calls.slice(warmStart).some((call) => call.args[0] === "inspect" && call.args.at(-1) === relayId)).toBe(true);
+      expect(inventory).toEqual({ relay: true, relayRemovals: 0 });
+      // Every Compose call that creates, recreates, or removes services on
+      // Engine carries the relay profile.
+      const composeCalls = io.calls.filter((call) => call.method === "run" && call.command === "docker" && call.args[0] === "compose"
+        && (call.args.includes("up") || call.args.includes("down")));
+      expect(composeCalls.length).toBeGreaterThan(0);
+      expect(composeCalls.every((call) => call.env?.COMPOSE_PROFILES === "host-relay")).toBe(true);
+
+      // Destroy leaves no relay behind: the inventory is empty and the
+      // relay lookup finds nothing.
+      await destroyRuntime(context, io);
+      expect(inventory).toEqual({ relay: false, relayRemovals: 1 });
+      expect(io.capture("docker", ["ps", "--all", "--quiet", "--no-trunc", "--filter", "label=com.docker.compose.service=host_relay"]).stdout).toBe("");
+    });
+
+    // Regression (Linux commit 4, C1), launch: on a local Engine a container
+    // that publishes the approved port after `add` is named by the launch's
+    // warning loop, whatever the /proc listener check sees of its host socket
+    // (root's socket, uid 0, or a visible listener). The warning comes from
+    // the launch's one `docker ps` read and never changes the launch result.
+    test.runIf(process.platform === "linux").each(["hidden", "visible"] as const)("a launch on a local Engine names a port docker ps shows published, beside a %s /proc listener", async (shape) => {
+      const platformDescriptor = Object.getOwnPropertyDescriptor(process, "platform") as PropertyDescriptor;
+      const { context, io } = localEngineRelayFixture({
+        project: (projectRoot) => prepareProjectWithHostServices(projectRoot, { idb: { target: "host-loopback", port: 10882 } }),
+        hostServiceSet: [{ ip: "192.168.65.254", port: 10882 }],
+        capture: (command, args) => (command === "docker" && args[0] === "ps" && args.includes("{{.Ports}}")
+          ? captureResult(0, "0.0.0.0:10882->80/tcp, [::]:10882->80/tcp\n")
+          : undefined),
+      });
+      Object.defineProperty(process, "platform", { value: "linux" });
+      hostListenerProc.procFs = linuxListenerProc(shape);
+      try {
+        expect((await startRuntime(context, io, false, {})).status, pendingWarningsForTest().map((event) => event.message).join("\n")).toBe(0);
+        // The cold up ran on Engine: the relay profile is selected.
+        expect(composeUpCall(io)?.env?.COMPOSE_PROFILES).toBe("host-relay");
+        flushWarnings();
+        vi.mocked(console.error).mockClear();
+        const before = io.calls.length;
+        const launched = await startRuntime(context, io, false, { launch: true });
+        flushWarnings();
+        const err = vi.mocked(console.error).mock.calls.flat().join("\n");
+        expect(launched.status, err).toBe(0);
+        const warning = "host service idb (127.0.0.1:10882): published by a container (docker ps)";
+        expect(err).toContain(warning);
+        expect(err.split(warning)).toHaveLength(2);
+        // The listener check read the fixture /proc (not lsof, nor this host's /proc).
+        if (shape === "hidden") expect(err).toContain("no visible listener (a socket owned by uid 0 on *:10882)");
+        const launchCalls = io.calls.slice(before);
+        expect(launchCalls.some((call) => call.command === "/usr/sbin/lsof")).toBe(false);
+        expect(launchCalls.filter((call) => call.method === "capture" && call.command === "docker" && call.args[0] === "ps"
+          && call.args.includes("{{.Ports}}"))).toHaveLength(1);
+      } finally {
+        hostListenerProc.procFs = undefined;
+        Object.defineProperty(process, "platform", platformDescriptor);
+      }
+    });
+
+    // Every Compose call that can create, recreate, or remove services names
+    // its profiles explicitly: the relay profile on Engine for up (including
+    // the proxy-only rebind up and the relay sync), always for down/destroy,
+    // never off Engine for up. The relay sync is a no-op off Engine, because
+    // naming `host_relay` would enable its profile.
+    test.each([
+      ["a local Engine", "engine"],
+      ["Docker Desktop", "desktop"],
+    ] as const)("on %s every Compose create/recreate/remove call pins COMPOSE_PROFILES", (_label, backend) => {
+      if (backend === "engine" && process.platform !== "linux") return;
+      const projectRoot = path.join(tmp, "project");
+      const project = prepareProject(projectRoot);
+      const context = {
+        projectRoot,
+        project,
+        runtimeRoot: path.join(tmp, "runtime"),
+        env: { PATH: "/fake-bin", DOCKER_HOST: "unix:///var/run/docker.sock", COMPOSE_PROFILES: "user-profile" },
+        network: fixedNetwork,
+      } satisfies RuntimeContext;
+      const io = createRuntimeIO({
+        capture: (command, args, fallback) => {
+          if (command !== "docker" || args[0] !== "info" || !args.includes("{{json .}}")) return undefined;
+          const base = JSON.parse(fallback().stdout) as Record<string, unknown>;
+          return captureResult(0, JSON.stringify(backend === "engine"
+            ? { ...base, OperatingSystem: "Debian GNU/Linux 13 (trixie)", Name: os.hostname(), KernelVersion: os.release() }
+            : { ...base, OperatingSystem: "Docker Desktop", Name: "docker-desktop" }));
+        },
+      });
+      const docker = createRuntimeDocker(context, io);
+      docker.assertAvailable();
+      // The run's one backend decision, made once and passed to every `up`.
+      const hostServiceRelay = hostServiceRelayMode(context, io);
+      expect(hostServiceRelay).toBe(backend === "engine" ? "engine-relay" : "none");
+      const composeProject = "runfree-0123456789ab";
+      const start = io.calls.length;
+      expect(docker.composeUp(composeProject, { hostServiceRelay })).toBe(0);
+      expect(docker.composeUp(composeProject, { forceRecreate: true, noDeps: true, removeOrphans: false, services: ["proxy"], hostServiceRelay })).toBe(0);
+      expect(docker.composeSyncHostRelay(composeProject, hostServiceRelay)).toBe(0);
+      expect(docker.composeDown(composeProject)).toBe(0);
+      expect(docker.destroyProject(composeProject)).toBe(0);
+      const compose = io.calls.slice(start).filter((call) => call.method === "run" && call.command === "docker" && call.args[0] === "compose")
+        .map((call) => ({ verb: call.args.slice(call.args.indexOf("-f") + 2).join(" "), profiles: call.env?.COMPOSE_PROFILES }));
+      const up = backend === "engine" ? "host-relay" : "";
+      expect(compose).toEqual([
+        { verb: "up -d --remove-orphans", profiles: up },
+        { verb: "up -d --no-deps --force-recreate proxy", profiles: up },
+        ...(backend === "engine" ? [{ verb: "up -d --no-deps host_relay", profiles: "host-relay" }] : []),
+        { verb: "down --remove-orphans", profiles: "host-relay" },
+        { verb: "down -v --rmi local --remove-orphans", profiles: "host-relay" },
+      ]);
     });
 
     test("a refused destroy never prunes the registry row: a still-live session must keep its port", async () => {
@@ -6378,7 +6853,10 @@ describe("runtime command flow", () => {
       const containment = residueDocker({ present: true, projectId, lockPath });
       try {
         const start = io.calls.length;
+        backendDetections.count = 0;
         await restoreSameProxySessionAdmission({ plan, io, lifecycleLock: lock, proxyId, containmentIO: containment.io });
+        // The reload-policy run's topology proof detects the backend once (C5).
+        expect(backendDetections.count).toBe(1);
         // Residue first, through the containment IO.
         expect(dockerArgs(containment.io).some((args) => args[0] === "container" && args[1] === "rm" && args.includes(HELPER_ID))).toBe(true);
         expect(fs.existsSync(markerPath)).toBe(false);
@@ -7323,22 +7801,39 @@ describe("runtime command flow", () => {
 
     // A darwin host with idb listening on 10882 and a running proxy whose
     // gateway status read is answered by `gateway` (undefined: no proxy).
-    function hostServiceStatusFixture(gateway: (() => ReturnType<typeof captureResult>) | undefined) {
+    // `dockerPs` answers the published-port check's `docker ps --format
+    // {{.Ports}}` (default: nothing published); `hostServices: false` approves none.
+    // `engine: true` makes it a Linux host on its own local Docker Engine
+    // (unix socket, this host's name and kernel) instead.
+    function hostServiceStatusFixture(
+      gateway: (() => ReturnType<typeof captureResult>) | undefined,
+      options: { dockerPs?: ReturnType<typeof captureResult>; hostServices?: boolean; engine?: boolean } = {},
+    ) {
       const projectRoot = path.join(tmp, "project");
-      const project = prepareProjectWithHostServices(projectRoot, { idb: { target: "host-loopback", port: 10882 } });
+      const project = options.hostServices === false
+        ? prepareProject(projectRoot)
+        : prepareProjectWithHostServices(projectRoot, { idb: { target: "host-loopback", port: 10882 } });
       const context = {
         projectRoot,
         project,
         runtimeRoot: path.join(tmp, "runtime"),
-        env: { PATH: "/fake-bin", XDG_STATE_HOME: path.join(tmp, "xdg-state") },
+        env: {
+          PATH: "/fake-bin",
+          XDG_STATE_HOME: path.join(tmp, "xdg-state"),
+          ...(options.engine ? { DOCKER_HOST: "unix:///var/run/docker.sock" } : {}),
+        },
         network: fixedNetwork,
       } satisfies RuntimeContext;
-      Object.defineProperty(process, "platform", { value: "darwin" });
+      Object.defineProperty(process, "platform", { value: options.engine ? "linux" : "darwin" });
       const gatewayReads: string[][] = [];
       const io = createRuntimeIO({
         capture: (command, args) => {
+          if (options.engine && command === "docker" && args[0] === "info" && args.includes("{{json .}}")) {
+            return captureResult(0, JSON.stringify({ OperatingSystem: "Debian GNU/Linux 13 (trixie)", Name: os.hostname(), KernelVersion: os.release() }));
+          }
           if (command === "docker" && args[0] === "info") return captureResult(0);
           if (command === "/usr/sbin/lsof") return captureResult(0, "p4242\ncidb_companion\nf7\nn127.0.0.1:10882\n");
+          if (options.dockerPs && command === "docker" && args[0] === "ps" && args.includes("{{.Ports}}")) return options.dockerPs;
           if (gateway && command === "docker" && args[0] === "ps" && args.includes("--quiet")
             && args.includes("label=com.docker.compose.service=proxy")) {
             return captureResult(0, `${PROXY_ID}\n`);
@@ -7375,6 +7870,60 @@ describe("runtime command flow", () => {
       expect(out).toContain("host-service gateway: 192.168.65.254");
       expect(err).not.toContain("runfree warning:");
       expect(gatewayReads).toHaveLength(1);
+    });
+
+    const publishedPortReads = (io: { calls: RuntimeIoCall[] }): RuntimeIoCall[] => io.calls
+      .filter((call) => call.method === "capture" && call.command === "docker" && call.args[0] === "ps"
+        && call.args.includes("{{.Ports}}"));
+
+    // Regression (Linux commit 4, C1/C4): status names a port a container
+    // published after `add`, from one `docker ps` read; a failed read is one
+    // warning; neither changes the exit code.
+    test.each([
+      ["published", captureResult(0, "0.0.0.0:10882->80/tcp, [::]:10882->80/tcp\n"),
+        "host service idb (127.0.0.1:10882): published by a container (docker ps)"],
+      ["failed", captureResult(1, "", "Cannot connect to the Docker daemon"),
+        "host services: container-published ports were not checked: docker ps exited with status 1"],
+    ])("status warns once from its one docker ps read (%s) and still succeeds", (_label, dockerPs, warning) => {
+      const { context, io } = hostServiceStatusFixture(() => captureResult(0, gatewayStatusJson({ gatewayIp: "192.168.65.254" })), { dockerPs });
+
+      expect(statusRuntime(context, io)).toBe(0);
+      const { err } = statusOutput();
+      expect(err).toContain(warning);
+      expect(err.split(warning)).toHaveLength(2);
+      expect(publishedPortReads(io)).toHaveLength(1);
+    });
+
+    // Regression (Linux commit 4, C1), Engine: on a local Docker Engine the
+    // /proc listener check sees either no visible listener (root's socket,
+    // uid 0) or a visible one; the real `hostServiceOwnerWarnings` still reads
+    // `docker ps` and names the container-published port.
+    test.each(["hidden", "visible"] as const)("status on a Linux Docker Engine host names a port docker ps shows published, beside a %s /proc listener", (shape) => {
+      const { context, io } = hostServiceStatusFixture(() => captureResult(0, gatewayStatusJson({ gatewayIp: "192.168.65.254" })),
+        { dockerPs: captureResult(0, "0.0.0.0:10882->80/tcp, [::]:10882->80/tcp\n"), engine: true });
+      hostListenerProc.procFs = linuxListenerProc(shape);
+      try {
+        expect(statusRuntime(context, io)).toBe(0);
+      } finally {
+        hostListenerProc.procFs = undefined;
+      }
+      const { err } = statusOutput();
+      const warning = "host service idb (127.0.0.1:10882): published by a container (docker ps)";
+      expect(err).toContain(warning);
+      expect(err.split(warning)).toHaveLength(2);
+      // The listener check read the fixture /proc, not lsof (nor this host's /proc).
+      if (shape === "hidden") expect(err).toContain("no visible listener (a socket owned by uid 0 on *:10882)");
+      expect(io.calls.some((call) => call.command === "/usr/sbin/lsof")).toBe(false);
+      expect(publishedPortReads(io)).toHaveLength(1);
+      // The fixture is this host's own Engine: the relay is what it dictates.
+      expect(hostServiceRelayMode(context, io)).toBe("engine-relay");
+    });
+
+    test("status with no approved host service makes no docker ps read", () => {
+      const { context, io } = hostServiceStatusFixture(undefined, { hostServices: false });
+
+      expect(statusRuntime(context, io)).toBe(0);
+      expect(publishedPortReads(io)).toHaveLength(0);
     });
 
     test("status shows an unavailable gateway with its reason and still succeeds", () => {

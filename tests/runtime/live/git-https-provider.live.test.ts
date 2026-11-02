@@ -89,6 +89,7 @@ import {
   type CaptureResult,
   type LiveFixture,
   provisionLiveFixture,
+  requireLiveRuntimeBackend,
   startStandingSession,
   type StandingSessionHandle,
 } from "./fixture.ts";
@@ -110,12 +111,6 @@ const APPROVAL_WAIT_MS = 3 * 60_000;
 /** Git with no prompt, no askpass, and no credential helper: only the proxy can authenticate. */
 const NO_PROMPT_GIT = "env GIT_TERMINAL_PROMPT=0 GIT_ASKPASS= SSH_ASKPASS= git -c credential.helper=";
 const LFS_MEDIA_TYPE = "application/vnd.git-lfs+json";
-
-function requireDockerDesktopBackend(): void {
-  if (process.env.TEST_RUNTIME_BACKEND !== "docker-desktop") {
-    throw new Error("TEST_RUNTIME_BACKEND must be docker-desktop for the git provider tranche");
-  }
-}
 
 function sessionExec(containerId: string, script: string): CaptureResult {
   return docker(["exec", containerId, "zsh", "-lc", script]);
@@ -285,7 +280,7 @@ function defineProviderSuite(provider: GitProviderInputs): void {
     let proxyId: string;
 
     beforeAll(() => {
-      requireDockerDesktopBackend();
+      requireLiveRuntimeBackend("the git provider tranche");
       // Read before any Docker work so a bad source name fails in seconds.
       const sourceArgv = hostCommandSourceArgv(provider.source, process.env);
       fixture = provisionLiveFixture({

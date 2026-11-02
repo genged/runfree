@@ -9,6 +9,14 @@ import {
   type ParsedGenerationStatus,
 } from "@runfree/runtime-contracts/proxy-status";
 
+import {
+  composeProfilesFor,
+  detectDockerBackend,
+  HOST_RELAY_COMPOSE_PROFILE,
+  HOST_RELAY_COMPOSE_SERVICE,
+  hostServiceRelayModeFor,
+  type HostServiceRelayMode,
+} from "../docker-backend.ts";
 import { die } from "../errors.ts";
 import { resolveRuntimeNetwork } from "../network.ts";
 import { projectHash } from "../project-identity.ts";
@@ -60,13 +68,28 @@ export type RuntimeDocker = {
   buildImage(args: string[]): number;
   composeContainers(project: string): ComposeContainer[];
   composeDown(project: string): number;
-  composeUp(project: string, options?: {
+  /**
+   * `hostServiceRelay` is the run's one backend decision
+   * (`hostServiceRelayMode`): it selects the relay profile. Required, so no
+   * caller re-detects the backend.
+   */
+  composeUp(project: string, options: {
+    hostServiceRelay: HostServiceRelayMode;
     forceRecreate?: boolean;
     noDeps?: boolean;
     removeOrphans?: boolean;
     services?: string[];
     creationMarker?: { transactionId: string; attempt: number };
   }): number;
+  /**
+   * Brings the Engine host-service relay in line with the current Compose
+   * generation (`compose up -d --no-deps host_relay` with its profile), so a
+   * proxy replaced on its own does not leave the relay on the previous proxy
+   * image or labels. A no-op returning 0 where the relay does not apply:
+   * naming the service explicitly would otherwise enable its profile.
+   * `hostServiceRelay` is the run's one backend decision, as for `composeUp`.
+   */
+  composeSyncHostRelay(project: string, hostServiceRelay: HostServiceRelayMode): number;
   /**
    * Creates one Compose-managed named volume with the exact ownership labels the
    * session named-volume proof requires, idempotently.
@@ -218,16 +241,40 @@ export function lastObservedDockerDaemonIdentity(): DockerDaemonIdentity | undef
   return lastDockerDaemonIdentity;
 }
 
+let lastDockerInfoStdout: string | undefined;
+
+/**
+ * Whether this runtime runs the Engine host-service relay
+ * (`docker-backend.ts`). Called once per runtime run by the entry point that
+ * drives Compose `up` and the topology proof (`startRuntime`, the
+ * reload-policy restore); every consumer takes the answer as a required
+ * parameter and never detects on its own, so `up`, the full topology proof,
+ * and the warm proof cannot decide differently within one run. Reuses the
+ * availability check's `docker info` answer when this process has one. The
+ * decision keys only on the backend: `classifyDockerBackend` already
+ * requires Linux for Engine. `detect` is a test seam.
+ */
+export function hostServiceRelayMode(
+  context: Pick<RuntimeContext, "env">,
+  io: Pick<RuntimeIO, "capture">,
+  detect: typeof detectDockerBackend = detectDockerBackend,
+): HostServiceRelayMode {
+  return hostServiceRelayModeFor(detect(context, io,
+    lastDockerInfoStdout !== undefined ? { infoStdout: lastDockerInfoStdout } : {}));
+}
+
 function dockerAvailable(context: RuntimeContext, io: RuntimeIO): boolean {
   if (!io.commandExists("docker", dockerClientEnvOptions(context))) {
-    die("docker not found - install Docker Desktop first");
+    die("docker not found - install Docker Desktop (macOS) or Docker Engine (Linux) first");
   }
   lastDockerDaemonIdentity = undefined;
+  lastDockerInfoStdout = undefined;
   const info = createDockerClient(io, dockerClientEnvOptions(context)).info("{{json .}}");
   if (info.status !== 0 || dockerInfoServerError(info.stdout) !== undefined) {
-    die("docker daemon not running - start Docker Desktop first");
+    die("docker daemon not running - start Docker Desktop or the Docker Engine service first");
   }
   lastDockerDaemonIdentity = parseDockerDaemonIdentity(info.stdout);
+  lastDockerInfoStdout = info.stdout;
   return true;
 }
 
@@ -402,7 +449,17 @@ function projectResourceSummary(context: RuntimeContext, io: RuntimeIO, project:
   return firstNonZero(containers.status, networks.status, composeVolumes.status, dependencyVolumes.status, projectImages.status, baseImages.status);
 }
 
+/**
+ * Whether a Compose container is stale network state: not attached to the
+ * runtime's internal network. The Engine host-service relay is the one
+ * Compose service that is never on that network by design (`network_mode:
+ * host`), so a `host_relay` container on exactly the host network is not
+ * stale. Its full shape is topology's to prove (`host-relay-topology.ts`); a
+ * relay on any other network is still stale and removed.
+ */
 export function containerMissingNetwork(container: ComposeContainer, expectedNetwork: string): boolean {
+  if (container.service === HOST_RELAY_COMPOSE_SERVICE
+    && container.networks.length === 1 && container.networks[0] === "host") return false;
   return !container.networks.includes(expectedNetwork);
 }
 
@@ -505,6 +562,14 @@ export function createRuntimeDocker(
   const composeOptions = (): childProcess.SpawnSyncOptions => ({
     ...runtimeEnvOptions(context),
     cwd: composeDir(),
+  });
+  // `up` enables the Engine relay profile only where the relay applies (the
+  // caller's one backend decision); `down` and destroy always enable it, so
+  // teardown removes a relay whatever the backend (removing an absent service
+  // is a no-op).
+  const withProfiles = (options: childProcess.SpawnSyncOptions, profiles: string): childProcess.SpawnSyncOptions => ({
+    ...options,
+    env: { ...options.env, COMPOSE_PROFILES: profiles },
   });
   const clearRuntimeCaches = (): void => {
     composeContainerCache.clear();
@@ -622,13 +687,13 @@ export function createRuntimeDocker(
       return cachedComposeContainers(project);
     },
     composeDown(project) {
-      const options = composeOptions();
+      const options = withProfiles(composeOptions(), HOST_RELAY_COMPOSE_PROFILE);
       const status = createDockerClient(io, { ...options, env: composeTeardownEnv(composeFile(), options.env) })
         .terminal.compose(composeArgs(project, "down", ["--remove-orphans"]));
       clearRuntimeCaches();
       return status;
     },
-    composeUp(project, options = {}) {
+    composeUp(project, options) {
       const args = composeArgs(project, "up", ["-d"]);
       if (options.noDeps) args.push("--no-deps");
       if (options.forceRecreate) args.push("--force-recreate");
@@ -647,12 +712,21 @@ export function createRuntimeDocker(
           fs.writeFileSync(override, `services:\n  proxy:\n    labels:\n      ${REBIND_TRANSACTION_LABEL}: '${transactionId}'\n      ${REBIND_ATTEMPT_LABEL}: '${attempt}'\n`, { mode: 0o600, flag: "wx" });
           args.splice(args.indexOf("up"), 0, "-f", override);
         }
-        const status = createDockerClient(io, composeOptions()).terminal.compose(args);
+        const status = createDockerClient(io, withProfiles(composeOptions(), composeProfilesFor(options.hostServiceRelay)))
+          .terminal.compose(args);
         clearRuntimeCaches();
         return status;
       } finally {
         if (overrideDirectory) fs.rmSync(overrideDirectory, { recursive: true });
       }
+    },
+    composeSyncHostRelay(project, hostServiceRelay) {
+      const profiles = composeProfilesFor(hostServiceRelay);
+      if (profiles !== HOST_RELAY_COMPOSE_PROFILE) return 0;
+      const status = createDockerClient(io, withProfiles(composeOptions(), profiles)).terminal
+        .compose(composeArgs(project, "up", ["-d", "--no-deps", HOST_RELAY_COMPOSE_SERVICE]));
+      clearRuntimeCaches();
+      return status;
     },
     createComposeManagedVolume(project, logicalName) {
       // `docker volume create` on an existing volume with matching driver is a
@@ -688,7 +762,7 @@ export function createRuntimeDocker(
       // and are therefore invisible to `--remove-orphans`; the fenced sequence
       // in `destroy.ts` revokes and removes them by record-bound id around
       // this call, and it is the only production caller.
-      const options = composeOptions();
+      const options = withProfiles(composeOptions(), HOST_RELAY_COMPOSE_PROFILE);
       const status = createDockerClient(io, { ...options, env: composeTeardownEnv(composeFile(), options.env) })
         .terminal.compose(composeArgs(project, "down", ["-v", "--rmi", "local", "--remove-orphans"]));
       clearRuntimeCaches();
@@ -887,13 +961,17 @@ function composeContainers(project: string, context: RuntimeContext, io: Runtime
   const ps = client.listContainers({ all: true, quiet: true, filters: filterValues(composeProjectContainerFilters(project)) });
   const ids = ps.stdout.trim().split(/\s+/).filter(Boolean);
   if (ps.status !== 0 || ids.length === 0) return [];
-  const inspect = client.inspect(ids, { format: "{{.Id}}\t{{range $name, $_ := .NetworkSettings.Networks}}{{$name}} {{end}}" });
+  const inspect = client.inspect(ids, {
+    format: "{{.Id}}\t{{range $name, $_ := .NetworkSettings.Networks}}{{$name}} {{end}}\t{{index .Config.Labels \"com.docker.compose.service\"}}",
+  });
   if (inspect.status !== 0) return ids.map((id) => ({ id, networks: [] }));
   return inspect.stdout.trim().split(/\n+/).filter(Boolean).map((line) => {
-    const [id, networkList = ""] = line.split("\t");
+    const [id, networkList = "", service = ""] = line.split("\t");
+    const serviceName = service.trim();
     return {
       id,
       networks: networkList.trim().split(/\s+/).filter(Boolean),
+      ...(serviceName !== "" && serviceName !== "<no value>" ? { service: serviceName } : {}),
     };
   });
 }

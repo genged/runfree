@@ -99,7 +99,9 @@ project.
   loopback. The session relay holds no authority:
   - The proxy admits only an exact approved `<name>.runfree.internal:<port>`
     pair.
-  - The proxy splices that pair to the pinned Docker Desktop gateway.
+  - The proxy splices that pair to the pinned Docker host gateway. On
+    Docker Engine a host relay listens on that gateway and forwards to the
+    host's loopback.
   - The firewall lets only the request proxy's uid 1001 reach that pair.
 
   See [Host Services](architecture.md#host-services).
@@ -622,7 +624,8 @@ All risks, grouped by topic, are in [security-rules.md](security-rules.md#residu
 
 ## Platform Status
 
-Only Apple Silicon macOS with Docker Desktop is supported; see
+Apple Silicon macOS with Docker Desktop and Linux with native Docker Engine
+(source build) are supported; see
 [Supported Release Shape](project-brief.md#supported-release-shape).
 
 ## Verification

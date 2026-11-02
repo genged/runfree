@@ -38,7 +38,7 @@ export const MANAGED_CONTAINER_LABEL = "io.runfree.managed";
 export const CONTAINER_LABEL_SCHEMA_LABEL = "io.runfree.label-schema";
 export const CONTAINER_LABEL_SCHEMA_VERSION = "1";
 
-export const CONTAINER_ROLES = ["agent", "proxy", "mcp-callback-relay", "session-agent", "ephemeral-helper", "ingress-forwarder"] as const;
+export const CONTAINER_ROLES = ["agent", "proxy", "mcp-callback-relay", "session-agent", "ephemeral-helper", "ingress-forwarder", "host-relay"] as const;
 export type ContainerRole = typeof CONTAINER_ROLES[number];
 
 export const LIFECYCLE_OWNERS = ["compose", "session", "utility"] as const;

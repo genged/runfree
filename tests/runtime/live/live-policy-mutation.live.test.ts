@@ -29,6 +29,7 @@ import {
   forceCleanSessions,
   type CaptureResult,
   type LiveFixture,
+  requireLiveRuntimeBackend,
   type LiveRuntimeBackend,
   type StandingSessionHandle,
 } from "./fixture.ts";
@@ -42,11 +43,7 @@ const TEST_TIMEOUT_MS = 12 * 60_000;
 const MUTATION_HOST = "example.org";
 
 function requiredBackend(): LiveRuntimeBackend {
-  const backend = process.env.TEST_RUNTIME_BACKEND;
-  if (backend !== "docker-desktop") {
-    throw new Error("TEST_RUNTIME_BACKEND must be docker-desktop for the live-policy-mutation tranche");
-  }
-  return backend;
+  return requireLiveRuntimeBackend("the live-policy-mutation tranche");
 }
 
 type ContainerIdentity = Readonly<{
