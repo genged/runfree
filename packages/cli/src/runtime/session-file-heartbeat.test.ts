@@ -337,6 +337,35 @@ describe("sealed inspect-and-write session file heartbeat", () => {
     }
   });
 
+  test("a running container flagged OOMKilled after a child-process kill is still served; its identity checks still refuse", async () => {
+    const flagged = scripted({
+      "inspect-session-container": ok(mutatedInspect((document) => { document.State.OOMKilled = true; })),
+    });
+    expect((await heartbeat(flagged.io)).kind).toBe("written");
+    expect(flagged.effects).toEqual(["inspect-session-container", "write-session-file"]);
+
+    const cases: ReadonlyArray<readonly [string, (document: InspectDocument) => void, string]> = [
+      ["restarted Pid", (document) => { document.State.Pid = 4243; }, "Docker process id changed"],
+      ["restarted StartedAt", (document) => { document.State.StartedAt = "2026-08-08T13:00:05.123456789Z"; }, "Docker start identity changed"],
+      ["exited", (document) => { document.State.Running = false; }, "not in exact running state"],
+    ];
+    for (const [field, mutate, observation] of cases) {
+      const run = scripted({
+        "inspect-session-container": ok(mutatedInspect((document) => { document.State.OOMKilled = true; mutate(document); })),
+      });
+      const outcome = await heartbeat(run.io);
+      expect(outcome.kind, field).toBe("mismatch");
+      expect((outcome as { kind: "mismatch"; observation: string }).observation, field).toContain(observation);
+      expect(run.effects, field).toEqual(["inspect-session-container", "delete-session-file"]);
+    }
+
+    const missing = scripted({
+      "inspect-session-container": ok(mutatedInspect((document) => { delete document.State.OOMKilled; })),
+    });
+    expect((await heartbeat(missing.io)).kind).toBe("mismatch");
+    expect(missing.effects).toEqual(["inspect-session-container", "delete-session-file"]);
+  });
+
   test("stderr `No such container: <id>` is a mismatch that deletes the file; a timeout is unavailable with no delete", async () => {
     const absent = scripted({
       "inspect-session-container": { status: 1, stdout: "", stderr: `Error: No such container: ${CONTAINER_ID}\n` },

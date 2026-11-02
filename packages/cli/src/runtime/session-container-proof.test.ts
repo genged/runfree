@@ -672,6 +672,37 @@ describe("session container live inspection proof", () => {
     expectNonTransientRunningFailure(JSON.stringify(evidence), value);
   });
 
+  test.each([
+    { kind: "provisioning-running" },
+    { kind: "active-running" },
+  ] as const)("accepts a running container flagged OOMKilled by a child-process kill for $kind", (phase) => {
+    const value = plan();
+    const evidence = inspect(value, { running: true });
+    evidence[0].State.OOMKilled = true;
+    expect(validateSessionContainerInspect(JSON.stringify(evidence), value, phase)).toMatchObject({
+      phase: phase.kind,
+      running: true,
+      containerId: value.record.containerId,
+    });
+  });
+
+  test.each([
+    ["image", (evidence: MutableInspect) => { evidence[0].Image = `sha256:${"e".repeat(64)}`; }],
+    ["network address", (evidence: MutableInspect) => {
+      for (const network of Object.values(evidence[0].NetworkSettings.Networks) as Array<Record<string, any>>) {
+        network.IPAddress = "172.31.90.99";
+      }
+    }],
+    ["missing OOMKilled", (evidence: MutableInspect) => { delete evidence[0].State.OOMKilled; }],
+    ["non-boolean OOMKilled", (evidence: MutableInspect) => { evidence[0].State.OOMKilled = "true"; }],
+  ])("still refuses an OOMKilled running container with a changed %s", (_label, mutate) => {
+    const value = plan();
+    const evidence = inspect(value, { running: true });
+    evidence[0].State.OOMKilled = true;
+    mutate(evidence);
+    expectNonTransientRunningFailure(JSON.stringify(evidence), value);
+  });
+
   test("rejects non-running Docker state mismatches", () => {
     const value = plan();
     const cases: Array<{

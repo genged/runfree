@@ -630,7 +630,12 @@ export function validateSessionContainerInspect(
   if (inspect.State.Dead !== false
     || inspect.State.Paused !== false
     || inspect.State.Restarting !== false
-    || inspect.State.OOMKilled !== false
+    || typeof inspect.State.OOMKilled !== "boolean"
+    // Docker sets OOMKilled when the kernel kills any process in the cgroup,
+    // and the flag stays set. A still-running container keeps its identity
+    // (pinned below by Pid/StartedAt and the network endpoint), so the flag
+    // refuses only a container that is not running.
+    || (inspect.State.OOMKilled && inspect.State.Running !== true)
     || inspect.State.Error !== ""
     || inspect.State.ExitCode !== 0
     || inspect.State.Health !== undefined) {

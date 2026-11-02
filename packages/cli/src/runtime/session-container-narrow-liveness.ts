@@ -91,7 +91,9 @@ export function assertSessionContainerNarrowRunningInspect(
     || inspect.State.Dead !== false
     || inspect.State.Paused !== false
     || inspect.State.Restarting !== false
-    || inspect.State.OOMKilled !== false
+    // A child-process OOM kill leaves the flag set on a running container;
+    // Pid and StartedAt below pin the incarnation.
+    || typeof inspect.State.OOMKilled !== "boolean"
     || inspect.State.Error !== ""
     || inspect.State.ExitCode !== 0) {
     throw new Error("session container is not in exact running state");
