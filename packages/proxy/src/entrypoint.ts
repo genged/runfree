@@ -421,6 +421,7 @@ function startServer(): ChildProcess {
 async function waitForServerPrivilegeProof(child: ChildProcess): Promise<void> {
   if (!child.pid) throw new Error("server child did not expose a process id");
   const started = Date.now();
+  let lastError: unknown = new Error("proxy server privilege proof did not run before its deadline");
   while (Date.now() - started < 5_000) {
     if (child.exitCode !== null || child.signalCode !== null) {
       throw new Error(`server child exited before privilege verification: code=${child.exitCode} signal=${child.signalCode}`);
@@ -429,10 +430,12 @@ async function waitForServerPrivilegeProof(child: ChildProcess): Promise<void> {
       verifyServerProcessStatus(child.pid);
       return;
     } catch (error) {
-      if (Date.now() - started >= 5_000) throw error;
+      lastError = error;
       await delay(50);
     }
   }
+  // Fail closed: a server child that never passed verification is never proven.
+  throw lastError;
 }
 
 function verifyServerProcessStatus(pid: number): void {
