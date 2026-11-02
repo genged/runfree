@@ -108,6 +108,10 @@ const SERVICE_GOLDENS: Record<string, Golden> = {
     digest: "sha256:15955106146778312ac0fde53b80296a8ba45f090cc5dadb2898a7760396e0b3",
     generation: "sha256:4f004e9f8e5cb7272a88e180803cf462a001b3504871dd351e59fb607281c365",
   },
+  "agent-pi": {
+    digest: "sha256:3045412f7400262619889ebadd9ef98b4d4ac959b845b86072c580ea6a0b7be2",
+    generation: "sha256:6c174bba38d0dbd98fdbb976db6870c074963055d87d0e98ed438bd61bee0ad0",
+  },
   "alpine-apk": {
     digest: "sha256:97764932569854acf692b89f29814ca9cd79c5094cbf995f5534c83f3b742822",
     generation: "sha256:47738b6edfc1510b2315a4d6fb71f3d1639432b1916056d8e1fde481148d915e",

@@ -11,7 +11,7 @@ describe("installable runfree CLI: init and image", () => {
     expect(result.status, result.stderr).toBe(0);
     expect(result.stdout).toContain(`project: ${tmp}`);
     expect(result.stdout).toContain("outbound services: none (deny-all)");
-    expect(result.stdout).toContain("start Claude or Codex to review its required operational service");
+    expect(result.stdout).toContain("start Claude, Codex, or Pi to review its required operational service");
     expect(result.stdout).toContain("after the first start, enable services with: runfree service enable <id>");
     expect(result.stdout).toContain("service ids are listed by: runfree service enable --help");
     expect(result.stdout).not.toContain("runfree service configure");

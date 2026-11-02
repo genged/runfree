@@ -536,6 +536,8 @@ function printAgentServiceReview(agentLabel: string, id: string): void {
   if (!svc) die(`built-in agent ${agentLabel} requires unknown service ${id}`);
   console.log(`${agentLabel} requires credentialless operational network access.`);
   console.log(`service: ${id}`);
+  console.log(`purpose: ${svc.label}`);
+  if (svc.defaultWriteMode) console.log(`default write posture: ${svc.defaultWriteMode}`);
   console.log("exact hosts:");
   for (const host of serviceHostNames(svc)) console.log(`  ${host}`);
   console.log("credentials: none (login state remains project-scoped to the agent)");
@@ -591,11 +593,14 @@ async function reviewPiProvider(
   io: RuntimeIO,
   quiet: boolean,
 ): Promise<{ changed: boolean; status: number }> {
-  if ((await operationalServiceIds(context, io)).size > 0 || hasRememberedCustomPiProvider(context)) {
+  const enabled = await operationalServiceIds(context, io);
+  // Pi's own operational services do not configure a model provider.
+  for (const id of builtinAgent("pi")?.requiredServices ?? []) enabled.delete(id);
+  if (enabled.size > 0 || hasRememberedCustomPiProvider(context)) {
     return { changed: false, status: 0 };
   }
   if (!(io.isInteractive?.() ?? hostTerminalInteractive())) {
-    console.error("Pi has no recognized provider route; continuing with custom/no provider and deny-all network policy.");
+    console.error("Pi has no recognized provider route; no model-provider access was enabled.");
     console.error("configure provider access with: runfree service enable <id>");
     console.error("service ids are listed by: runfree service enable --help");
     return { changed: false, status: 0 };
@@ -651,7 +656,7 @@ async function reviewAgentOperationalServices(
   for (const id of missing) {
     printAgentServiceReview(descriptor.label, id);
     if (!io.confirm(`Enable ${id} for this project? [y/N] `)) {
-      console.error(`${descriptor.label} launch cancelled; project policy was not changed.`);
+      console.error(`${descriptor.label} launch cancelled; ${id} was not enabled.`);
       return { changed: false, status: 1 };
     }
   }

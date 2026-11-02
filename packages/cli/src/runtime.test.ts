@@ -10573,7 +10573,7 @@ describe("runtime command flow", () => {
     expect(status).toBe(42);
   });
 
-  test("non-interactive Claude launch fails before policy mutation or runtime attach with exact remediation", async () => {
+  test.each(["claude", "pi"])("non-interactive %s launch fails before policy mutation or runtime attach with exact remediation", async (agent) => {
     const projectRoot = path.join(tmp, "project");
     const project = prepareProject(projectRoot);
     const before = fs.readFileSync(project.paths.policyPath, "utf8");
@@ -10585,10 +10585,10 @@ describe("runtime command flow", () => {
       runtimeRoot: path.join(tmp, "runtime"),
       env: { PATH: "/fake-bin" },
       network: fixedNetwork,
-    }, io, "claude", { quiet: false, verbose: false });
+    }, io, agent, { quiet: false, verbose: false });
 
     expect(status).toBe(1);
-    expect(vi.mocked(console.error).mock.calls.flat().join("\n")).toContain("Run: runfree service enable agent-claude");
+    expect(vi.mocked(console.error).mock.calls.flat().join("\n")).toContain(`Run: runfree service enable agent-${agent}`);
     expect(fs.readFileSync(project.paths.policyPath, "utf8")).toBe(before);
     expect(io.calls.some((call) => call.method === "admin")).toBe(false);
     expect(composeUpCall(io)).toBeUndefined();
@@ -10598,7 +10598,7 @@ describe("runtime command flow", () => {
   // Headless-run spec §3.3: the run's runtime half uses the same reviews on
   // a non-interactive IO, so a review that would ask refuses before any
   // policy mutation, runtime start, or launch.
-  test("a headless runtime refuses a review that would ask, before startup and before its hooks", async () => {
+  test.each(["claude", "pi"])("a headless %s runtime refuses a review that would ask, before startup and before its hooks", async (agent) => {
     const projectRoot = path.join(tmp, "project");
     const project = prepareProject(projectRoot);
     const before = fs.readFileSync(project.paths.policyPath, "utf8");
@@ -10611,10 +10611,10 @@ describe("runtime command flow", () => {
       runtimeRoot: path.join(tmp, "runtime"),
       env: { PATH: "/fake-bin" },
       network: fixedNetwork,
-    }, createHeadlessRuntimeIO(io), "claude", {}, hooks);
+    }, createHeadlessRuntimeIO(io), agent, {}, hooks);
 
     expect(result).toEqual({ kind: "refused", status: 1 });
-    expect(vi.mocked(console.error).mock.calls.flat().join("\n")).toContain("Run: runfree service enable agent-claude");
+    expect(vi.mocked(console.error).mock.calls.flat().join("\n")).toContain(`Run: runfree service enable agent-${agent}`);
     expect(io.calls.some((call) => call.method === "confirm")).toBe(false);
     expect(fs.readFileSync(project.paths.policyPath, "utf8")).toBe(before);
     expect(io.calls.some((call) => call.method === "admin")).toBe(false);
@@ -10623,7 +10623,10 @@ describe("runtime command flow", () => {
     expect(hooks.launch).not.toHaveBeenCalled();
   });
 
-  test("declining exact-host Claude review leaves policy and runtime untouched", async () => {
+  test.each([
+    { agent: "claude", hosts: ["api.anthropic.com", "platform.claude.com"] },
+    { agent: "pi", hosts: ["pi.dev"] },
+  ])("declining exact-host $agent review leaves policy and runtime untouched", async ({ agent, hosts }) => {
     const projectRoot = path.join(tmp, "project");
     const project = prepareProject(projectRoot);
     const before = fs.readFileSync(project.paths.policyPath, "utf8");
@@ -10635,18 +10638,80 @@ describe("runtime command flow", () => {
       runtimeRoot: path.join(tmp, "runtime"),
       env: { PATH: "/fake-bin" },
       network: fixedNetwork,
-    }, io, "claude", { quiet: false, verbose: false });
+    }, io, agent, { quiet: false, verbose: false });
 
     expect(status).toBe(1);
     const review = vi.mocked(console.log).mock.calls.flat().join("\n");
-    expect(review).toContain("service: agent-claude");
-    expect(review).toContain("api.anthropic.com");
-    expect(review).toContain("platform.claude.com");
-    expect(io.calls).toContainEqual({ method: "confirm", args: ["Enable agent-claude for this project? [y/N] "] });
+    expect(review).toContain(`service: agent-${agent}`);
+    for (const host of hosts) expect(review).toContain(host);
+    if (agent === "pi") expect(review).toContain("write posture: read-only");
+    expect(io.calls).toContainEqual({ method: "confirm", args: [`Enable agent-${agent} for this project? [y/N] `] });
     expect(fs.readFileSync(project.paths.policyPath, "utf8")).toBe(before);
     expect(io.calls.some((call) => call.method === "admin")).toBe(false);
     expect(composeUpCall(io)).toBeUndefined();
     expect(configuredAgentExecCall(io)).toBeUndefined();
+  });
+
+  test("declining Pi catalog access reports the declined service without hiding an approved provider", async () => {
+    const projectRoot = path.join(tmp, "project");
+    const project = prepareProject(projectRoot);
+    const io = createRuntimeIO({
+      choosePiProvider: () => "agent-codex",
+      confirm: (question) => question.startsWith("Enable agent-codex"),
+    });
+    const status = await runAgentCommand({
+      projectRoot, project, runtimeRoot: path.join(tmp, "runtime"), env: { PATH: "/fake-bin" }, network: fixedNetwork,
+    }, io, "pi", { quiet: false, verbose: false });
+
+    expect(status).toBe(1);
+    const policy = JSON.parse(fs.readFileSync(project.paths.policyPath, "utf8"));
+    expect(Object.keys(policy.services)).toEqual(["agent-codex"]);
+    const errors = vi.mocked(console.error).mock.calls.flat().join("\n");
+    expect(errors).toContain("Pi launch cancelled; agent-pi was not enabled.");
+    expect(errors).not.toContain("project policy was not changed");
+    expect(composeUpCall(io)).toBeUndefined();
+    expect(configuredAgentExecCall(io)).toBeUndefined();
+  });
+
+  test("enabling the Pi catalog service clears the headless launch refusal without adding a provider", async () => {
+    const projectRoot = path.join(tmp, "project");
+    const project = prepareProject(projectRoot);
+    const context = {
+      projectRoot, project, runtimeRoot: path.join(tmp, "runtime"), env: { PATH: "/fake-bin" }, network: fixedNetwork,
+    };
+    expect(applyAgentServiceIntentForTest({ kind: "ensure-agent-service", id: "agent-pi", quiet: true }, context)).toBe(0);
+    const before = fs.readFileSync(project.paths.policyPath, "utf8");
+    const io = createRuntimeIO();
+    const hooks = { beforeLaunch: vi.fn(() => undefined), launch: vi.fn(async () => "launched") };
+
+    const result = await runHeadlessAgentRuntime(context, createHeadlessRuntimeIO(io), "pi", {}, hooks);
+
+    expect(result).toEqual({ kind: "launched", value: "launched" });
+    expect(hooks.launch).toHaveBeenCalledOnce();
+    expect(io.calls.some((call) => call.method === "confirm" || call.method === "choosePiProvider")).toBe(false);
+    expect(io.calls.some((call) => call.method === "admin" && call.args[0] === "service")).toBe(false);
+    expect(fs.readFileSync(project.paths.policyPath, "utf8")).toBe(before);
+    const errors = vi.mocked(console.error).mock.calls.flat().join("\n");
+    expect(errors).toContain("no model-provider access was enabled");
+    expect(errors).not.toContain("deny-all network policy");
+  });
+
+  test("an approved Pi catalog service does not suppress model-provider setup", async () => {
+    const projectRoot = path.join(tmp, "project");
+    const project = prepareProject(projectRoot);
+    const context = {
+      projectRoot, project, runtimeRoot: path.join(tmp, "runtime"), env: { PATH: "/fake-bin" }, network: fixedNetwork,
+    };
+    expect(applyAgentServiceIntentForTest({ kind: "ensure-agent-service", id: "agent-pi", quiet: true }, context)).toBe(0);
+    const before = fs.readFileSync(project.paths.policyPath, "utf8");
+    const io = createRuntimeIO({ choosePiProvider: () => "configure" });
+
+    expect(await runAgentCommand(context, io, "pi", { quiet: false, verbose: false })).toBe(1);
+    expect(io.calls.some((call) => call.method === "choosePiProvider")).toBe(true);
+    expect(vi.mocked(console.error).mock.calls.flat().join("\n")).toContain("pi did not start; configure provider access");
+    expect(fs.readFileSync(project.paths.policyPath, "utf8")).toBe(before);
+    expect(io.calls.some((call) => call.method === "admin")).toBe(false);
+    expect(composeUpCall(io)).toBeUndefined();
   });
 
   // Startup reuses the selected effective policy generation while another

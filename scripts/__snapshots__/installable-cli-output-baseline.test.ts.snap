@@ -53,7 +53,7 @@ exports[`output baseline: command transcripts > init on a fresh project 1`] = `
 runfree config: <project>/.runfree/runfree.json
 network policy: <project>/.runfree/network-policy.json
 outbound services: none (deny-all)
-start Claude or Codex to review its required operational service
+start Claude, Codex, or Pi to review its required operational service
 after the first start, enable services with: runfree service enable <id>
 service ids are listed by: runfree service enable --help
 ",

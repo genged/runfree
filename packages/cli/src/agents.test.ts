@@ -58,7 +58,7 @@ describe("built-in agent descriptors", () => {
     expect(BUILTIN_AGENT_DESCRIPTORS.map((descriptor) => descriptor.requiredServices)).toEqual([
       ["agent-claude"],
       ["agent-codex"],
-      [],
+      ["agent-pi"],
     ]);
   });
 

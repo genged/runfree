@@ -93,6 +93,11 @@ const REVISION_SNAPSHOT: Record<string, { revision: number; hosts: string[]; rem
     hosts: ["api.openai.com", "auth.openai.com", "chatgpt.com"],
     removedHosts: [],
   },
+  "agent-pi": {
+    revision: 1,
+    hosts: ["pi.dev"],
+    removedHosts: [],
+  },
   node: {
     revision: 2,
     hosts: ["registry.npmjs.org", "registry.yarnpkg.com"],
@@ -194,6 +199,7 @@ const REVISION_SNAPSHOT: Record<string, { revision: number; hosts: string[]; rem
 const ALL_SERVICE_IDS = [
   "agent-claude",
   "agent-codex",
+  "agent-pi",
   "alpine-apk",
   "anthropic",
   "apple-ads",
@@ -254,6 +260,42 @@ describe("service registry invariants", () => {
       expect(SERVICES[id].label).not.toMatch(/Claude Code|Codex/);
       expect(SERVICES[id].explanations.join(" ")).not.toMatch(/Claude Code|Codex/);
     }
+  });
+
+  test("agent-pi allows catalog reads without credentials and denies writes before token reads", () => {
+    const svc = SERVICES["agent-pi"];
+    expect(svc.credential).toBeUndefined();
+    expect(svc.oauthCredential).toBeUndefined();
+    expect(svc.defaultWriteMode).toBe("read-only");
+    const compiled = compileDesiredPolicies({
+      project: { version: 2, hosts: [], services: { "agent-pi": desiredServiceEntry(svc) } },
+      local: { version: 2, hosts: [] },
+    });
+    expect(compiled.policy.hosts).toEqual(["pi.dev"]);
+    const effective = validateNetworkPolicy(compiled.policy);
+    const tokenReader = vi.fn(() => "must-not-read");
+    const request = (method: string, host = "pi.dev") => beforeAllowedRequest({
+      v: 1,
+      host,
+      port: 443,
+      policyGeneration: effective.generation,
+      admittedAtMs: Date.now(),
+      connectionSerial: 1,
+      stage: "request",
+    }, { method, url: `https://${host}/api/models/providers/openai?types=chat,image,classifier`, headers: {} }, {
+      allowedHosts: effective.allowedHosts,
+      credentials: effective.credentials,
+      requests: effective.requests,
+      writeApproval: "allow",
+      tokenReader,
+      log: () => {},
+    });
+    expect(request("GET")).toEqual({});
+    for (const method of ["POST", "PUT", "DELETE"]) {
+      expect(() => request(method)).toThrow(ProxyPolicyDenialError);
+    }
+    expect(() => request("GET", "api.openai.com")).toThrow("blocked outbound host: api.openai.com");
+    expect(tokenReader).not.toHaveBeenCalled();
   });
 
   test("new-project templates authorize no hosts or pre-recorded services", () => {
@@ -1315,6 +1357,22 @@ describe("runfree service CLI: user-defined services", () => {
       { host: "api.acme.example", header: "Authorization", scheme: "bearer" },
     ]);
     expect(readRawConfig().services).toBeUndefined();
+  });
+
+  test("enabling agent-pi persists a read-only catalog service without adding a model provider", () => {
+    writeApprovedDesiredFixture({ version: 2, hosts: [] });
+    const result = runAdminCli(["service", "enable", "agent-pi", "--no-reload"]);
+    expect(result.status, result.stderr).toBe(0);
+    const policy = readDesiredPolicy();
+    expect(Object.keys(policy.services ?? {})).toEqual(["agent-pi"]);
+    expect(policy.services?.["agent-pi"]).toMatchObject({
+      revision: 1,
+      selection: { writeMode: "read-only" },
+      resolved: { hosts: ["pi.dev"], requests: { "pi.dev": { writeAction: "deny" } } },
+    });
+    const compiled = compileDesiredPolicies({ project: policy, local: { version: 2, hosts: [] } });
+    expect(compiled.policy.hosts).toEqual(["pi.dev"]);
+    expect(compiled.policy.tokens ?? {}).toEqual({});
   });
 
   test("configure on a non-TTY exits before reading or writing project policy", async () => {

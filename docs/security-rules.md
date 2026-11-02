@@ -1370,7 +1370,7 @@ credential is a security decision.
 | Risk | Worst case | You can |
 | --- | --- | --- |
 | `runfree forward` and VNC show agent content on your host. | Hostile content hits your browser or viewer. | Use a maintained viewer and the random password. |
-| Any agent process can use `agent-claude` and `agent-codex`. | Agent code reaches the vendor's login and model hosts. | Confirm them at launch. They carry no proxy credential. |
+| Any agent process can use an enabled operational service. | Agent code reaches the service's hosts within its request rules, not just through the named agent CLI. | Confirm them at launch. They carry no proxy credential; see `runfree service explain <id>`. |
 
 ### MCP risks
 

@@ -213,6 +213,21 @@ export const SERVICES: Record<string, Service> = {
     neverAutoSuggest: true,
     defaultWriteMode: "allow-write",
   },
+  "agent-pi": {
+    id: "agent-pi",
+    label: "Pi model catalog access",
+    revision: 1,
+    hosts: [{ host: "pi.dev" }],
+    detect: [],
+    explanations: [
+      "Pi refreshes model names, capabilities, context limits, and pricing from pi.dev/api/models/providers/",
+      "read-only host access; this service does not restrict reads to the catalog path",
+      "credential: none; model-provider access and /login remain separate",
+      "Runfree disables Pi update checks and telemetry; catalog refreshes are independent of those settings",
+    ],
+    neverAutoSuggest: true,
+    defaultWriteMode: "read-only",
+  },
   node: {
     id: "node",
     label: "Node.js package registries",

@@ -31,8 +31,9 @@ runfree
 `runfree` starts or reuses the project runtime and launches the configured
 default agent only after the desired policy has an exact host-owned approval
 and Runfree has published an immutable effective policy generation. Starting
-built-in Claude or Codex first offers its credentialless native operational
-service without overwriting stricter user write rules. Other policy changes are
+a built-in agent first offers its credentialless operational service without
+overwriting stricter user write rules. Pi's service covers its model catalog;
+model-provider access stays separate. Other policy changes are
 explicit host-side commands such as `runfree service enable`, `runfree host
 add`, `runfree credential add`, and `runfree mcp enable`.
 
@@ -41,7 +42,7 @@ add`, `runfree credential add`, and `runfree mcp enable`.
 - **Containerized agent workspace** for Claude Code, Codex, Pi, or a project-defined agent command.
 - **Reviewable desired network policy** in `.runfree/network-policy.json`, compiled into host-owned exact-host runtime policy only after exact approval.
 - **Proxy-held credentials** sourced from host environment variables, 1Password refs, host commands, stdin, JWT sources, or service-specific OAuth seed material.
-- **Curated services** for common package ecosystems, Git providers, model providers, native Claude/Codex operation, App Store / Apple Ads, Google Ads, Docker registries, Linux package managers, and more.
+- **Curated services** for common package ecosystems, Git providers, model providers, native Claude/Codex operation, Pi's model catalog, App Store / Apple Ads, Google Ads, Docker registries, Linux package managers, and more.
 - **User-defined services** under `user-*` for repeatable host bundles that are not curated by Runfree.
 - **Network audit mode** for time-boxed discovery of hosts during trusted onboarding.
 - **Approve-on-write** for held outbound writes and side-effecting MCP tool calls.

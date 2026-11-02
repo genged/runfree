@@ -172,7 +172,7 @@ function printInit(projectRoot: string, project: ProjectInfo, wizardFollows: boo
     // The setup wizard offers service enablement next; the manual hints
     // below would contradict it.
     if (wizardFollows) return;
-    console.log("start Claude or Codex to review its required operational service");
+    console.log("start Claude, Codex, or Pi to review its required operational service");
     console.log("after the first start, enable services with: runfree service enable <id>");
     console.log("service ids are listed by: runfree service enable --help");
   }

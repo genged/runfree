@@ -743,10 +743,13 @@ Credential commands never widen network policy. Use `service enable` or `mcp ena
 Services are complete pinned desired-policy entries for package ecosystems and
 providers. An entry records its definition digest, revision, selection, and
 resolved hosts/request/token/OAuth semantics in `.runfree/network-policy.json`;
-network authority is not stored in `runfree.json`. `runfree claude` and
-`runfree codex` review credentialless `agent-claude` and `agent-codex` services
-for native login/model traffic; these are separate from credential-bearing
-`anthropic` and `openai` API-key services. Pi provider access remains explicit.
+network authority is not stored in `runfree.json`. Built-in agent launches
+review their required credentialless operational service before starting:
+`agent-claude` and `agent-codex` cover native login/model traffic; `agent-pi`
+covers read-only model-catalog access. These are separate from credential-bearing
+API-key services. Pi model-provider access remains explicit. Non-interactive
+launches refuse a missing operational service and name the
+`runfree service enable <id>` command to run first.
 
 ```bash
 runfree service list
@@ -759,6 +762,7 @@ runfree service enable openai --from-env OPENAI_API_KEY
 runfree service enable apple-ads --from-source apple-ads-jwt --param client-id=SEARCHADS.<uuid>
 runfree service explain agent-codex
 runfree service explain agent-claude
+runfree service explain agent-pi
 runfree service disable github
 runfree service explain github
 runfree service diff

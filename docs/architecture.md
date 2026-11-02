@@ -284,8 +284,9 @@ A typical `runfree` invocation does the following:
 1. Resolve the project root and read `.runfree/runfree.json`.
 2. Refuse a config below version 4 or a removed key with the remedy (move
    `.runfree` aside and run `runfree init`); nothing migrates it.
-3. For built-in Claude/Codex launches, review any missing credentialless
+3. For built-in agent launches, review any missing credentialless
    operational service without overwriting stricter user write rules.
+   Pi's model catalog and its model-provider access are separate choices.
 4. If a per-session agent is active, reuse the verified selected effective
    controls without reading desired project input. Otherwise, capture strict
    desired project and checkout-local candidates.
@@ -1232,7 +1233,7 @@ proxy seconds later. The reuse and failure rules are in
 
 ## Services
 
-Services are named host bundles. Curated services live in `scripts/services.ts`; user-defined services use `user-*` ids and are stored under the Runfree XDG config root. Credentialless `agent-claude` and `agent-codex` services cover native subscription/login traffic and are distinct from the credential-bearing `anthropic` and `openai` API-key services.
+Services are named host bundles. Curated services live in `scripts/services.ts`; user-defined services use `user-*` ids and are stored under the Runfree XDG config root. Credentialless operational services cover native subscription/login traffic for Claude and Codex, and model-catalog reads for Pi. Pi's model-provider access remains a separate choice. These services are distinct from credential-bearing API-key services.
 
 A service may declare `parameters`: non-secret inputs it needs beside its
 secrets (such as an OAuth client id), which `service enable` resolves and

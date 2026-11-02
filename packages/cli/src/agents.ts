@@ -196,7 +196,7 @@ const DESCRIPTORS: BuiltinAgentDescriptor[] = [
       args: ["--mode", "json", "-p"],
       outputFormat: "pi-json",
     },
-    requiredServices: [],
+    requiredServices: ["agent-pi"],
     launchConversationIdFlag: "--session-id",
     processNames: ["pi"],
     resume: {
