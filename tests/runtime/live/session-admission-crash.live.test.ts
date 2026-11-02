@@ -105,6 +105,13 @@ import {
 const coreTest = liveTierSelected("core") ? test : test.skip;
 const extendedTest = liveTierSelected("extended") ? test : test.skip;
 
+// The public shape `runfree resume --json` prints (`recoveryInventoryJson`).
+type CliRecoveryInventory = {
+  items: { id: string; agent: string; state: string; conversationId?: string }[];
+  truncated: boolean;
+  invalidFiles: number;
+};
+
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
 const CAPTURE_MAX_BYTES = 8 * 1024 * 1024;
 /**
@@ -759,6 +766,36 @@ describe("per-session admission survives a crash at every transition", () => {
     expect(itemB?.conversationSource, "conversation B was not host-chosen").toBe("host-chosen");
     expect(itemA?.id, "the two crashed conversations share one recovery id").not.toBe(itemB?.id);
 
+    // The user-facing `runfree resume` CLI offers the same two items the
+    // in-process scan found, both as JSON and as the human table.
+    const resumeInventoryJson = (label: string): CliRecoveryInventory => {
+      const listed = fixture.runfree(["resume", "--json"]);
+      expect(listed.status, `runfree resume --json ${label} failed: ${describeOutput(listed.output, 4000)}`).toBe(0);
+      try {
+        return JSON.parse(listed.stdout) as CliRecoveryInventory;
+      } catch {
+        throw new Error(`runfree resume --json ${label} printed no JSON: ${describeOutput(listed.output, 4000)}`);
+      }
+    };
+    const cliBefore = resumeInventoryJson("before either resume");
+    const cliBeforeText = JSON.stringify(cliBefore);
+    expect(cliBefore.truncated, `the CLI inventory before either resume was truncated: ${cliBeforeText}`).toBe(false);
+    expect(typeof cliBefore.invalidFiles, `the CLI inventory has no invalidFiles count: ${cliBeforeText}`).toBe("number");
+    for (const [label, item, conversationId] of [["A", itemA, conversationA], ["B", itemB, conversationB]] as const) {
+      const cliItem = cliBefore.items.find((candidate) => candidate.id === item?.id);
+      expect(cliItem, `runfree resume --json does not offer item ${label} (${item?.id}): ${cliBeforeText}`).toBeDefined();
+      expect(
+        { conversationId: cliItem?.conversationId, state: cliItem?.state, agent: cliItem?.agent },
+        `runfree resume --json disagrees with the in-process scan on item ${label}: ${cliBeforeText}`,
+      ).toEqual({ conversationId, state: item?.state, agent: item?.agent });
+    }
+    const cliList = fixture.runfree(["resume", "--list"]);
+    expect(cliList.status, `runfree resume --list failed: ${describeOutput(cliList.output, 4000)}`).toBe(0);
+    for (const item of [itemA, itemB]) {
+      expect(cliList.stdout, `runfree resume --list does not name ${item?.id}: ${describeOutput(cliList.output, 4000)}`)
+        .toContain(String(item?.id));
+    }
+
     // Vacuity guard: no per-conversation claim exists before either resume
     // starts, so the count asserted below while both are attached is this
     // case's own claims and not residue from an earlier one.
@@ -833,6 +870,38 @@ describe("per-session admission survives a crash at every transition", () => {
     const after = parseCrashReport(await runCrashScript(fixture, ["--report"]), "report after both concurrent resumes");
     expect(after.lifecycleRegistryEmpty, "the concurrent resumes left a lifecycle record").toBe(true);
     expect(after.residualContainers, "the concurrent resumes left a session container").toBe(0);
+
+    // Step 5: a consumed interrupted session is no longer offered by the
+    // user-facing CLI, and naming it again is refused before anything starts.
+    const cliAfter = resumeInventoryJson("after both resumes");
+    const consumedOffered = cliAfter.items.filter((candidate) =>
+      candidate.id === itemA?.id || candidate.id === itemB?.id
+      || candidate.conversationId === conversationA || candidate.conversationId === conversationB);
+    expect(
+      consumedOffered,
+      `runfree resume --json still offers a consumed session: ${JSON.stringify(cliAfter)}`,
+    ).toEqual([]);
+    const resumedTwice = fixture.runfree(["resume", String(itemA?.id)]);
+    expect(
+      resumedTwice.status,
+      `runfree resume of the consumed item A succeeded: ${describeOutput(resumedTwice.output, 4000)}`,
+    ).not.toBe(0);
+    expect(
+      resumedTwice.output,
+      `runfree resume of the consumed item A did not say it was not found: ${describeOutput(resumedTwice.output, 4000)}`,
+    ).toContain("recovery item not found");
+    expect(
+      listSessionContainerRecordsV2(stateDir, identity),
+      `the refused resume left a lifecycle record: ${describeOutput(resumedTwice.output, 4000)}`,
+    ).toEqual([]);
+    expect(
+      sessionContainers(fixture),
+      `the refused resume left a session container: ${describeOutput(resumedTwice.output, 4000)}`,
+    ).toEqual([]);
+    expect(
+      claimFiles(),
+      `the refused resume left a recovery claim: ${describeOutput(resumedTwice.output, 4000)}`,
+    ).toEqual([]);
 
     // Step 6 (review F3, Task 7): a second Docker stop. Crash A once more,
     // resume it with an iTerm terminal identity in the runner's own
