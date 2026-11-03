@@ -10,105 +10,34 @@ project policy lives under `.runfree/`.
 
 - Keep answers short and concise
 - Be direct. Put the bottom line first.
-- When the user asks a question, answer it first before making edits or running implementation commands.
+- Answer the user's question in the first sentence, before any tool call, edit, or implementation command.
 - Write explanations, design proposals, review results, and decision questions
   in simple English (the `simple-english` skill, when available). Add a small
   ASCII sketch when the answer is about a flow, a topology, or a before/after
   shape.
-- Define every label on first use in each reply: decision codes, finding IDs,
-  phase names, gate names, shell variables. Write "F3 (token logged on
-  refusal)", never a bare "F3". Subagent and reviewer IDs follow the same rule
-  when you relay them.
-- Ask open decisions as explicit questions, each with plain options and a
-  recommended choice. Do not leave a decision buried in a report.
+- Never use a bare label. On first use in each reply, define decision, option,
+  finding, priority, phase, gate, shell-variable, subagent, and reviewer labels.
+  Write "F3 (token logged on refusal)", not "F3".
+- End each open decision with an explicit question, plain options, and a
+  recommended choice. Do not leave it as a statement buried in a report.
 - "Help me with X" or "how can we X" asks for a proposal. Propose, then wait.
-- Give repro and fix steps for Runfree behavior as `runfree` commands, not raw
-  `docker` commands.
+- Give user-facing Runfree repro, diagnosis, and recovery steps as `runfree`
+  commands, never raw `docker` commands.
 
 ## Context Strategy
 
 - Keep this file short and universally applicable. Prefer pointers to source
   files and docs over copying details here.
-- Read `docs/project-brief.md`, `docs/architecture.md`, `docs/security.md`,
-  and `docs/security-rules.md` (rule IDs such as `NET-1`) before changing
-  runtime, proxy, network, mount, credential, or sandbox behavior. Together
-  with the source map below, these are the canonical project-owned context for
-  current security reviews; shared skills must discover and follow them rather
-  than copy Runfree architecture into skill references.
+- Before any runtime, proxy, network, mount, credential, or sandbox edit, read
+  `docs/project-brief.md`, `docs/architecture.md`, `docs/security.md`, and
+  `docs/security-rules.md` (rule IDs such as `NET-1`). They and the
+  `runfree-source-map` skill are canonical for security reviews; do not
+  substitute plans or shared skill references.
 - Check recent commits before assuming a design is finished.
-- Generation families are defined in `docs/architecture.md` ("Generation
-  Families"); name the family (effective policy generation vs control plane
-  generation), never the bare phrase "control generation".
 - For reviews of the current design, treat implemented source, behavioral/live tests, and the public project docs as current. Completed specs may explain shipped decisions; ignore drafts, partial specs, plans, and TODO directions unless the user explicitly asks about future work.
-
-## Where To Look
-
-| Task | Location | Notes |
-| --- | --- | --- |
-| CLI entrypoint and public commands | `packages/cli/src/cli.ts`, `packages/cli/src/commands/`, `src/cli.ts`, `bin/runfree.js` | `cli.ts` builds the command context and runs the yargs command app (`commands/app.ts`); each command is a typed module under `commands/` that builds a typed intent and calls shared enforcement directly. `src/cli.ts` is a compatibility delegate. |
-| Project config and init | `packages/cli/src/config.ts`, `packages/cli/src/init-wizard.ts`, `packages/cli/templates/` | Current config version is 4; config versions below 4 are refused, not migrated. The init wizard runs only on a TTY without `--yes`. |
-| Runtime lifecycle | `packages/cli/src/runtime.ts`, `packages/cli/src/runtime/env.ts`, `packages/cli/src/network.ts` | Docker Compose orchestration, project state, network selection, stale runtime checks. |
-| Per-session admission | `packages/cli/src/runtime/session-admission-{probe,driver}.ts`, `session-file-{publisher,heartbeat,teardown}.ts`, `session-container-{proof,template}.ts`, `session-containers.ts`, `session-internal-network-baseline.ts` | Source-IP session identity, lifecycle records, and Docker-inspection proofs. Reached by every public launch (`claude`/`codex`/`pi`, `shell`, `resume`, `run`, `mcp auth`) through `session-public-launch.ts`. See `docs/security.md`. |
-| Interrupted session recovery | `packages/cli/src/runtime/recovery.ts`, `runtime/resume-selection.ts`, `runtime/terminal-identity.ts`, `runtime/codex-rollouts.ts`, `runtime/session-admission-resume.ts`, `packages/cli/src/commands/resume.ts`, `commands/resume-prompt.ts` | Host records, offline inventory, terminal matching, per-conversation claims and consumption, the bounded Codex time match, and the `runfree resume` prompt. Agent-written registry and rollout files are hostile input. See `docs/architecture.md` and `docs/security.md`. |
-| Headless runs | `packages/cli/src/commands/run.ts`, `packages/cli/src/runtime/headless-*.ts`, `packages/cli/src/terminal-mode.ts` | `runfree run`: run lock, prompt copy, write-posture preflight, output capture and outcome, host-only run record. The proxy denies `ask` writes from headless sessions. See `docs/cli.md` "Headless runs". |
-| Project custom agent images | `packages/cli/src/agent-image.ts`, `.runfree/image/Dockerfile` | Project Dockerfiles extend `RUNFREE_BASE_IMAGE`; full image overrides are not supported. |
-| Embedded runtime assets | `packages/agent-runtime/agent/`, `packages/proxy/src/`, `dist/runtime/` | `pnpm build:runtime` creates `dist/runtime`, then assets are materialized into XDG data state by `packages/cli/src/assets.ts`. The agent image's session entry is `packages/agent-runtime/agent/session-entry.sh`; its readiness probe is `packages/agent-runtime/src/session-ready-probe.cts`, pinned to the contract by `scripts/session-entry.test.ts`. |
-| Proxy policy and credential injection | `packages/runtime-contracts/src/{desired-network-policy,network-policy}.ts`, `packages/runtime-contracts/src/oauth-mediation-policy.ts`, `packages/proxy/src/policy.ts`, `packages/proxy/src/oauth-mediation.ts`, `packages/proxy/src/oauth-grant-shape.ts`, `packages/cli/src/runtime/mcp-oauth-{claims,projection}.ts`, `packages/proxy/src/server.ts` | HTTPS/WSS allowlisting, request-shape rules, header stripping, proxy-only token reads, and OAuth handle mediation. `host-rule-owner.ts` decides which service owns a host's request rule; `mcp-oauth-claims`/`-projection` settle which MCP server claims each OAuth endpoint, and `oauth-grant-shape.ts` detects unmediated grant and registration requests. Denial feedback lives in `packages/proxy/src/denial.ts`; audit mode in `packages/proxy/src/audit.ts`. |
-| Admin policy/token commands | `packages/cli/src/commands/admin/`, `packages/cli/src/admin/admin-core.ts`, `packages/cli/src/admin/{domain,allow,token,source,service}-policy.ts`, `packages/cli/src/admin/{mcp-admin,diagnostics}.ts`, `packages/cli/src/admin/google-service-account.ts`, `packages/cli/src/control/host-rule-owner.ts`, `scripts/services.ts`, `scripts/domain-diagnostics.ts` | The yargs modules under `commands/admin/` build typed intents; enforcement lives in the per-family `*-policy.ts`/`mcp-admin`/`diagnostics` modules over the shared `admin-core.ts` base (ambient admin state, policy/token/source stores, proxy runtime, token sync, `reloadProxy`). `admin/options.ts` is a thin re-export barrel. `scripts/services.ts` is the unified service registry (host bundles ± static or OAuth credential mode). |
-| Host services | `packages/cli/src/commands/admin/host-service.ts`, `packages/cli/src/control/host-service-mutation.ts`, `packages/cli/src/host-service-registry.ts`, `packages/proxy/src/host-service-tunnel.ts`, `packages/proxy/src/firewall/host-service-gateway.ts`, `packages/agent-runtime/src/host-service-relay.cts` | CLI command and policy mutation, the registry, the proxy tunnel and firewall gateway, and the agent-side relay. |
-| Safe host project writes | `packages/cli/src/safe-fs.ts` | Use these helpers for writes under project-controlled paths such as `.runfree/`. |
-| Live runtime proof | `tests/runtime/live/*.live.test.ts` (Vitest `runtime-live` project), shared `tests/runtime/live/*fixture*.ts` | Per-session live Docker proof: topology/caps, egress containment, CONNECT guard, request-shape, audit SSRF + teardown, allowlist lifecycle, and session admission. Targets and what each layer proves: `docs/testing.md`. |
-| Release packaging | `scripts/build-bin.ts`, `scripts/generate-assets.ts`, `scripts/package-homebrew-artifacts.sh`, `scripts/install.sh`, `bunw`, `.bun-version` | Bun compiles release binaries; every Bun call goes through `./bunw`, which runs the version in `.bun-version` (CI's setup-bun reads the same file); generated assets are embedded before packaging; public release artifacts are currently macOS-only. |
-| Gate completeness | `scripts/check-test-inventory.ts`, `Makefile` `test-static` | Run by `make test-static`. Compares what `vitest list --filesOnly` would load against the test files git tracks, and checks that every Makefile test filter still names a real file — an unmatched Vitest filter is silently green. `test-static` discovers scripts to syntax-check from `git ls-files` rather than a list. |
-
-## Development Commands
-
-- `pnpm install --frozen-lockfile` installs dependencies.
-- `pnpm check` runs Biome checks across the repo.
-- `pnpm test` runs the Vitest suite.
-- `pnpm typecheck` runs `tsc --noEmit`.
-- `make test` runs static checks plus unit tests.
-- `make test-runtime` runs the whole live Docker suite (the release gate); it
-  requires the Docker CLI and a reachable Docker daemon. It has two tiers
-  (`tests/runtime/live/tiers.ts`): `make test-runtime-core` proves the trust
-  boundary, and `make test-runtime-extended` proves recovery, upgrades, load,
-  and optional features. `make test-runtime-smoke` runs one tranche as a
-  per-commit check on a Docker host.
-- `make test-all` runs static and unit tests, Docker Compose template
-  validation, the full live runtime suite, and packaged offline and live E2E.
-- `pnpm run build:runtime` compiles proxy/runtime-contract packages and assembles
-  `dist/runtime/**` for packaging. Tests and `pnpm typecheck` read workspace
-  sources and do not need it first; `scripts/workspace-source-exports.test.ts`
-  keeps package exports on `src/`.
-- `pnpm run generate:assets` regenerates
-  `packages/cli/src/embedded-assets.generated.ts` from `dist/runtime/**`.
-- `pnpm run update:agent-tools -- [all|claude|codex|pi@<version>]` updates the
-  embedded Claude/Codex/Pi CLI pins and checks their launch contracts; it needs
-  a Docker daemon. See `CONTRIBUTING.md` "Dependencies and tooling".
-- `pnpm run build:bin` compiles `dist/runfree`; release archives use
-  `scripts/package-homebrew-artifacts.sh`.
-- `scripts/dev-runfree.sh [--state-root DIR] <runfree args>` runs this
-  checkout's CLI against isolated XDG state; it needs a scratch `--workspace`.
-  See `CONTRIBUTING.md` "Setup".
 
 ## Project Rules
 
-- Use pnpm and Node 22. Do not switch package managers.
-- Keep dependencies deliberate. The repo intentionally runs TypeScript directly
-  with `tsx` for scripts and compiles the proxy only for generated runtime
-  packaging; `tsc --noEmit` is the normal static gate.
-- Ask before adding a dependency, and ask before introducing a new language or
-  toolchain; a new language is the higher bar. When a dependency may be
-  warranted, search for trusted options and present a choice rather than
-  picking one. Prefer TypeScript and the Node already in the agent and proxy
-  images.
-- Do not edit `packages/cli/src/embedded-assets.generated.ts` by hand. Change
-  canonical runtime/package sources, run `pnpm run build:runtime`, then run
-  `pnpm run generate:assets`.
-- Proxy runtime source is canonical under `packages/proxy/src/`. The generated
-  runtime Docker context under `dist/runtime/proxy/` is assembled by
-  `scripts/build-runtime.ts`; the proxy Dockerfile lives at
-  `packages/proxy/Dockerfile`.
 - Do not treat proxy environment variables as enforcement. They route
   cooperative clients; Docker mounts, agent-side firewalling, proxy policy, and
   proxy-side token storage are the enforcement boundary.
@@ -146,32 +75,13 @@ project policy lives under `.runfree/`.
   rejected and why. When a finding would add machinery, weigh its cost against
   the attack it stops.
 
-## Git Workflow
-
-Contributions arrive as pull requests (`CONTRIBUTING.md`). These rules apply
-wherever an agent commits:
-
-- A worktree inside the repo must sit under `.worktrees/`, the only in-repo
-  path that git, Biome, and Vitest all ignore; any other in-repo location breaks
-  `pnpm check` and `make test-static` in the main checkout. Run
-  `pnpm install` in a new worktree.
-- Put a fix on the branch under test unless the user names another.
-- To land a branch: rebase it onto `main`, run the gates on the rebased head,
-  then `git merge --no-ff <branch>`. Never merge `main` into the branch.
-- The checkout may hold other uncommitted work. Stage your own files by exact
-  path, never `git add -A`; report other changes in one line and leave them
-  alone. "commit" means commit this session's changes without asking.
-- Do not merge with failing tests. A flaky test gets fixed or disabled, never
-  rerun until green.
-
 ## Security Work
 
-For changes involving `.runfree`, `RUNFREE_*`, Docker/Compose topology,
-firewall rules, proxy egress, credential injection, token sync, CA material,
-dependency isolation, or runtime startup order, review the actual trust boundary
-instead of only the intended flow. Track assets, attackers, trusted components,
-data paths, lifecycle failure modes, and proof. If the local
-`security-architect` skill or agent is available, use it for these reviews.
+Before implementing or reviewing changes involving `.runfree`, `RUNFREE_*`,
+Docker/Compose topology, firewalls, proxy egress, credentials, token sync, CA
+material, dependency isolation, or runtime startup, use `security-architect`.
+Review the actual trust boundary: assets, attackers, trusted components, data
+paths, lifecycle failures, and proof.
 
 Security-sensitive changes need negative tests that prove rejection before a
 sensitive side effect: before DNS lookup, upstream connection, credential
@@ -188,17 +98,17 @@ both the refusal and the reclamation.
 
 Run the affected Vitest file first, then `pnpm test`; after every change run
 `pnpm check` and `pnpm typecheck` before committing or reporting completion.
-Runtime asset changes: regenerate assets and run the asset-sync tests. Sandbox,
-proxy, firewall, Docker network, or credential-boundary changes: run
-`make test-runtime-core` when a Docker daemon is reachable. Releases and
-lifecycle, recovery, upgrade, or cleanup changes: run `make test-runtime` or
+Runtime asset changes: regenerate assets and run asset-sync tests. Sandbox,
+proxy, firewall, Docker network, or credential-boundary changes are not
+verified until `make test-runtime-core` passes on the final tree. Releases and
+lifecycle, recovery, upgrade, or cleanup changes require `make test-runtime` or
 `make test-all`.
 
-When a live gate cannot run in your environment, say so and do not report it
-as passing. End with the exact commands the user must run and the gates still
-owed. A command you hand over must run as pasted from the repo root; prefer
-the `make` targets. Before calling a test failure real or a flake, rerun the
-failing file alone; then fix the cause or disable the test.
+If a live gate cannot run, say the work is unverified; do not call it complete
+or merge it. End with exact repo-root commands and every gate still owed;
+prefer `make` targets. Before classifying a failure, rerun its file alone. An
+isolated pass does not clear a failing full suite: fix or disable the failure,
+then rerun the required suite.
 
 ## User Override
 

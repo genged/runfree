@@ -29,8 +29,10 @@ local/
 .mcp.json
 .agents/skills/*
 !.agents/skills/security-architect/
+!.agents/skills/runfree-*
 .claude/skills/*
 !.claude/skills/security-architect
+!.claude/skills/runfree-*
 
 # Editor and OS metadata.
 .idea/
