@@ -1,10 +1,35 @@
 import fs from "node:fs";
 import path from "node:path";
 
+import {
+  canonicalDesiredNetworkPolicy,
+  type DesiredNetworkPolicyJson,
+} from "@runfree/runtime-contracts/desired-network-policy";
+
 import { PROJECT_RUNFREE_PATHS } from "../runfree-consumer-registry.ts";
 import { parseStrictJson } from "./strict-json.ts";
 
 export const DESIRED_POLICY_MAX_BYTES = 1024 * 1024;
+
+// Schema order for the top-level fields of a desired-policy file. Identity is
+// the canonical (sorted, compact) form; this order is presentation only.
+const DESIRED_POLICY_FIELD_ORDER = ["version", "hosts", "services", "requests", "tokens", "writeApproval", "hostServices"];
+
+/**
+ * The bytes Runfree writes for a desired-policy file: the canonical policy,
+ * indented, with top-level fields in schema order. Every nested value keeps
+ * its canonical order, so equal policies always produce equal files and a
+ * typed edit changes only the lines it means to. Digests and approvals never
+ * read these bytes; they re-canonicalize the parsed file.
+ */
+export function formatDesiredPolicyFile(policy: DesiredNetworkPolicyJson): string {
+  const canonical = JSON.parse(canonicalDesiredNetworkPolicy(policy)) as Record<string, unknown>;
+  const keys = [
+    ...DESIRED_POLICY_FIELD_ORDER.filter((key) => Object.hasOwn(canonical, key)),
+    ...Object.keys(canonical).filter((key) => !DESIRED_POLICY_FIELD_ORDER.includes(key)),
+  ];
+  return `${JSON.stringify(Object.fromEntries(keys.map((key) => [key, canonical[key]])), null, 2)}\n`;
+}
 
 export type BoundedProjectJson = {
   bytes: Buffer;

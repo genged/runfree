@@ -29,6 +29,7 @@ import {
   type ControlApprovalSelection,
 } from "./approvals.ts";
 import { captureDesiredPolicyCandidate, type DesiredPolicyCandidate } from "./candidates.ts";
+import { formatDesiredPolicyFile } from "./project-json.ts";
 import { withQuiescedProject } from "./quiesce.ts";
 import { checkoutFingerprint, networkControlSubject, type ControlSubject } from "./subjects.ts";
 
@@ -188,7 +189,7 @@ export async function withDesiredPolicyTransaction<TPlan extends DesiredPolicyPl
           safeReplaceProjectFile(
             context.projectRoot,
             projectRunfreePath(context.projectRoot, layer === "local" ? "networkPolicyLocal" : "networkPolicy"),
-            `${canonicalDesiredNetworkPolicy(planned.policy)}\n`,
+            formatDesiredPolicyFile(planned.policy),
             0o600,
           );
         }

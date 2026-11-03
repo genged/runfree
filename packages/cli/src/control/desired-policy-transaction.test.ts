@@ -20,6 +20,7 @@ import { approveNetworkCandidate } from "./approvals.ts";
 import { captureDesiredPolicyCandidate } from "./candidates.ts";
 import { mutateDesiredCredential } from "./credential-mutation.ts";
 import { mutateDesiredHost, readDesiredHostRules } from "./local-host-mutation.ts";
+import { formatDesiredPolicyFile } from "./project-json.ts";
 import { mutateDesiredService } from "./service-mutation.ts";
 
 // One seam per capture: slot 0 is the first capture (T1), slot 1 the re-read
@@ -286,5 +287,46 @@ describe("typed desired-policy transaction refusals", () => {
       .rejects.toThrow(noApprovedBase("project policy", "project"));
 
     expect(fs.existsSync(context.project.paths.controlApprovalsPath)).toBe(false);
+  });
+
+  // File presentation: typed writes produce readable, deterministic files, and
+  // identity never reads the bytes, so a hand reformat is not a change.
+  test("writes both layers as indented files with top-level fields in schema order", async () => {
+    await mutateDesiredHost(context, io, "local", { kind: "add", host: "new.example.com" });
+    await mutateDesiredService(context, io, "project", { kind: "enable", id: "example", entry: SERVICE_ENTRY });
+
+    expect(fs.readFileSync(localPolicyPath, "utf8")).toBe([
+      "{",
+      '  "version": 2,',
+      '  "hosts": [',
+      '    "local.example.com",',
+      '    "new.example.com"',
+      "  ]",
+      "}",
+      "",
+    ].join("\n"));
+    const project = fs.readFileSync(projectPolicyPath, "utf8");
+    expect(Object.keys(JSON.parse(project) as object)).toEqual(["version", "hosts", "services"]);
+    expect(project).toBe(formatDesiredPolicyFile(JSON.parse(project) as Parameters<typeof formatDesiredPolicyFile>[0]));
+  });
+
+  test("a later typed edit changes only the lines it means to", async () => {
+    await mutateDesiredHost(context, io, "project", { kind: "add", host: "a.example.com" });
+    const before = fs.readFileSync(projectPolicyPath, "utf8").split("\n");
+    await mutateDesiredHost(context, io, "project", { kind: "add", host: "m.example.com" });
+    const after = fs.readFileSync(projectPolicyPath, "utf8").split("\n");
+
+    expect(before.filter((line) => !after.includes(line))).toEqual([]);
+    expect(after.filter((line) => !before.includes(line))).toEqual(['    "m.example.com",']);
+  });
+
+  test("a hand reformat keeps its approval and its bytes when an edit changes no meaning", async () => {
+    // Same meaning as PROJECT_POLICY in another key order and whitespace.
+    const reformatted = '{ "hosts": [ "project.example.com" ],\n\t"version": 2 }';
+    fs.writeFileSync(projectPolicyPath, reformatted);
+
+    await mutateDesiredHost(context, io, "project", { kind: "add", host: "project.example.com" });
+
+    expect(fs.readFileSync(projectPolicyPath, "utf8")).toBe(reformatted);
   });
 });
