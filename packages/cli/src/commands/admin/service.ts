@@ -12,7 +12,7 @@
 import type { ArgumentsCamelCase, Argv } from "yargs";
 
 import { readAgentEnv, setAgentEnvValues } from "../../admin/admin-core.ts";
-import { planServiceParameterUpdate, serviceHostState } from "../../admin/service-policy.ts";
+import { credentialSourceArgs, planServiceParameterUpdate, serviceHostState } from "../../admin/service-policy.ts";
 import { createAdminState } from "../../admin/context.ts";
 import {
   bindDesiredServiceCredentialSources,
@@ -442,10 +442,12 @@ export const serviceCommand: CommandModule = {
       // checked the approved base and compiled the proposed policy.
       const plan = planDesiredServiceEnable(intent);
       let boundSources: string[] = [];
+      const sourceArgs = credentialSourceArgs(intent);
       const result = await mutateDesiredService(runtime, nodeRuntimeIO, layer, {
         kind: "enable",
         id: plan.id,
         entry: plan.entry,
+        ...(sourceArgs ? { sourceArgs } : {}),
       }, serviceHostState(plan.id, () => {
         boundSources = bindDesiredServiceCredentialSources(plan, intent.replaceSource);
       }));

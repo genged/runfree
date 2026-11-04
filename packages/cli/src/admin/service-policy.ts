@@ -455,7 +455,7 @@ export function recordedAgentEnvNamesForServiceEntry(entry: DesiredServiceEntry)
 
 // Repeat the credential-source flags the operator gave so the rendered remedy
 // is their command plus the missing parameter.
-function credentialSourceArgs(input: ServiceEnableInput): string | undefined {
+export function credentialSourceArgs(input: ServiceEnableInput): string | undefined {
   if (input.fromOnePasswordItem) return `--from-1password-item ${input.fromOnePasswordItem}`;
   switch (input.tokenSource.kind) {
     case "named":
