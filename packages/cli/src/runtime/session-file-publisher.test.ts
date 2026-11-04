@@ -115,6 +115,9 @@ function createSandbox(): Sandbox {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "session-file-publisher-"));
   const sessionsDir = path.join(root, "sessions");
   fs.mkdirSync(sessionsDir);
+  // The sealed scripts refuse a group- or world-writable directory; set the
+  // mode outright so a 0002 umask (the Ubuntu user default) does not leak in.
+  fs.chmodSync(sessionsDir, 0o755);
   return {
     root,
     sessionsDir,
