@@ -108,9 +108,129 @@ describe("desired service reconciliation", () => {
           },
         },
       },
-    })).toThrow(/different credential destination/);
+    })).toThrow(/service github would send it to different destinations:/);
     // The direct destination the user configured survives an attempted takeover.
     expect(current.tokens.github.credentials[0].host).toBe("uploads.github.com");
+  });
+
+  test("takes over a direct token whose destinations match and only the description differs", () => {
+    const credentials = [{ host: "api.github.com", header: "Authorization", scheme: "bearer" as const }];
+    const current = {
+      version: 2 as const,
+      hosts: ["api.github.com"],
+      tokens: { github: { description: "my hand-written GitHub token", allowAnonymous: true, credentials } },
+    };
+    const serviceToken = { description: "GitHub API token", allowAnonymous: true, credentials };
+    const result = reconcileDesiredService(current, {
+      kind: "enable",
+      id: "github",
+      entry: {
+        revision: 2,
+        definitionDigest: digest("c"),
+        resolved: { hosts: ["api.github.com"], tokens: { github: serviceToken } },
+      },
+    });
+
+    expect(result.policy.tokens).toBeUndefined();
+    expect(result.policy.services?.github.resolved.tokens?.github).toEqual(serviceToken);
+    expect(result.notices).toEqual([
+      'token github: the direct token had the same destinations as service github and now belongs to the service; its description changes to "GitHub API token"; service disable removes it',
+    ]);
+  });
+
+  test("refuses a takeover that would change whether requests without a stored token go out", () => {
+    const credentials = [{ host: "api.github.com", header: "Authorization", scheme: "bearer" as const }];
+    const current = {
+      version: 2 as const,
+      hosts: ["api.github.com"],
+      tokens: { github: { description: "GitHub API token", credentials } },
+    };
+    let message = "";
+    try {
+      reconcileDesiredService(current, {
+        kind: "enable",
+        id: "github",
+        entry: {
+          revision: 2,
+          definitionDigest: digest("c"),
+          resolved: { hosts: ["api.github.com"], tokens: { github: { description: "GitHub API token", allowAnonymous: true, credentials } } },
+        },
+      });
+    } catch (error) {
+      message = (error as Error).message;
+    }
+    expect(message).toContain("and service github sends it differently:");
+    expect(message).toMatch(/requests with no token stored\s+refused\s+sent anonymously/);
+    expect(current.tokens.github).toEqual({ description: "GitHub API token", credentials });
+  });
+
+  test("the conflict refusal shows both destination sets, the layer and file, and every reclaim path", () => {
+    const current = {
+      version: 2 as const,
+      hosts: ["api.github.com", "raw.githubusercontent.com"],
+      tokens: {
+        github: {
+          description: "Read-only GitHub API token",
+          allowAnonymous: true,
+          credentials: [
+            { host: "api.github.com", header: "Authorization", scheme: "bearer" as const },
+            { host: "raw.githubusercontent.com", header: "Authorization", scheme: "bearer" as const },
+          ],
+        },
+      },
+    };
+    const entry = desiredServiceEntry(SERVICES.github, { skippedHosts: ["avatars.githubusercontent.com"] });
+    const refuse = (layer: "project" | "local") => {
+      try {
+        reconcileDesiredService(current, { kind: "enable", id: "github", entry, sourceArgs: "--from-source github-cli" }, { layer });
+      } catch (error) {
+        return (error as Error).message;
+      }
+      throw new Error("expected a refusal");
+    };
+
+    expect(refuse("project")).toBe([
+      "token github conflicts with service github",
+      "  the project layer (.runfree/network-policy.json) already defines token github directly,",
+      "  and service github would send it to different destinations:",
+      "",
+      "    destination                                                             direct   service github",
+      "    api.github.com -> Authorization (bearer)                                yes      yes",
+      "    github.com -> Authorization (basic:x-access-token, protocol=git-http)   -        yes",
+      "    github.com -> Authorization (basic:x-access-token, protocol=git-lfs)    -        yes",
+      "    raw.githubusercontent.com -> Authorization (bearer)                     yes      yes",
+      "",
+      '  direct token description: "Read-only GitHub API token"',
+      "",
+      "  choose one:",
+      "    keep the direct token and leave service github off:",
+      "      nothing to do; allow other hosts with: runfree host add <host>",
+      "    let service github own the token:",
+      "      runfree credential remove github",
+      "      runfree service enable github --skip-host avatars.githubusercontent.com --from-source github-cli",
+      "    the same, with writes refused:",
+      "      runfree credential remove github",
+      "      runfree service enable github --skip-host avatars.githubusercontent.com --read-only --from-source github-cli",
+      "",
+      "  full service definition: runfree service explain github",
+    ].join("\n"));
+
+    const local = refuse("local");
+    expect(local).toContain("  the checkout-local layer (.runfree/network-policy.local.json) already defines token github directly,");
+    expect(local).toContain("      remove tokens.github from .runfree/network-policy.local.json");
+    expect(local).toContain("      runfree service enable github --skip-host avatars.githubusercontent.com --from-source github-cli --local");
+    expect(local).not.toContain("runfree credential remove");
+  });
+
+  test("the conflict refusal offers no second read-only path when the enable is already read-only", () => {
+    const current = {
+      version: 2 as const,
+      hosts: ["api.github.com"],
+      tokens: { github: { description: "x", credentials: [{ host: "api.github.com", header: "Authorization", scheme: "bearer" as const }] } },
+    };
+    const entry = desiredServiceEntry(SERVICES.github, { writeMode: "read-only" });
+    expect(() => reconcileDesiredService(current, { kind: "enable", id: "github", entry }))
+      .toThrow(/let service github own the token:\n {6}runfree credential remove github\n {6}runfree service enable github --read-only\n\n/);
   });
 
   test("local service provenance replaces project semantics and removal reveals project", () => {

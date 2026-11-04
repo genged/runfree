@@ -9,7 +9,8 @@ import {
   type DesiredServiceEntry,
   type DesiredServiceHostRule,
 } from "@runfree/runtime-contracts/desired-network-policy";
-import type { RequestPolicyJson, WriteAction } from "@runfree/runtime-contracts/network-policy";
+import type { RequestPolicyJson, TokenPolicyJson, WriteAction } from "@runfree/runtime-contracts/network-policy";
+import { describeCredential } from "../admin/credential-describe.ts";
 import { CliError } from "../errors.ts";
 import { remedy } from "../remedies.ts";
 import type { RuntimeContext, RuntimeIO } from "../runtime/types.ts";
@@ -24,11 +25,13 @@ import {
 } from "./desired-policy-transaction.ts";
 import { ensureCheckoutLocalPolicyExcluded } from "./git-exclude.ts";
 import { layerPolicyLabel, legacyDirectRuleMessage, otherLayer, ownValue } from "./host-rule-owner.ts";
+import { PROJECT_RUNFREE_PATHS } from "../runfree-consumer-registry.ts";
 import type { DesiredPolicyCandidate } from "./candidates.ts";
 
 export type DesiredServiceLayer = DesiredPolicyLayer;
 export type DesiredServiceMutation =
-  | { kind: "enable"; id: string; entry: DesiredServiceEntry }
+  // `sourceArgs` repeats the operator's credential-source flags in remedies.
+  | { kind: "enable"; id: string; entry: DesiredServiceEntry; sourceArgs?: string }
   | { kind: "disable"; id: string };
 
 export type DesiredServiceMutationResult = {
@@ -185,6 +188,90 @@ export function shadowedProjectHostRulesWarnings(id: string, project: DesiredNet
     hosts.join(", ")} no longer apply; remove the local entry with: ${remedy.serviceDisable(id, { local: true })}`];
 }
 
+// Where and how a token is sent: every field but its description. Credential
+// order counts: the proxy applies a host's mappings in list order.
+function sameTokenDestination(left: TokenPolicyJson, right: TokenPolicyJson): boolean {
+  return (left.allowAnonymous === true) === (right.allowAnonymous === true)
+    && sameControlValue(left.credentials, right.credentials);
+}
+
+/**
+ * The refusal for a direct token the enabling service cannot take over: a
+ * side-by-side of both destination sets, where the direct token lives, and
+ * the choices that reclaim it.
+ */
+export function directTokenConflictMessage(input: {
+  direct: TokenPolicyJson;
+  entry: DesiredServiceEntry;
+  id: string;
+  layer: DesiredPolicyLayer;
+  service: TokenPolicyJson;
+  sourceArgs?: string;
+  tokenName: string;
+}): string {
+  const { direct, entry, id, layer, service, tokenName } = input;
+  const key = (credential: TokenPolicyJson["credentials"][number]) => JSON.stringify([
+    credential.host, credential.header, credential.scheme, credential.username, credential.pathPrefix, credential.protocol,
+  ]);
+  const directKeys = new Set(direct.credentials.map(key));
+  const serviceKeys = new Set(service.credentials.map(key));
+  const rows: Array<[string, string, string]> = [];
+  const seen = new Set<string>();
+  for (const credential of [...service.credentials, ...direct.credentials]) {
+    const k = key(credential);
+    if (seen.has(k)) continue;
+    seen.add(k);
+    rows.push([describeCredential(credential), directKeys.has(k) ? "yes" : "-", serviceKeys.has(k) ? "yes" : "-"]);
+  }
+  const anonymous = (token: TokenPolicyJson) => token.allowAnonymous === true ? "sent anonymously" : "refused";
+  if ((direct.allowAnonymous === true) !== (service.allowAnonymous === true)) {
+    rows.push(["requests with no token stored", anonymous(direct), anonymous(service)]);
+  }
+  const header: [string, string, string] = ["destination", "direct", `service ${id}`];
+  const widths = [0, 1, 2].map((column) => Math.max(...[header, ...rows].map((row) => row[column].length)));
+  const render = (row: [string, string, string]) =>
+    `    ${row[0].padEnd(widths[0])}   ${row[1].padEnd(widths[1])}   ${row[2]}`.trimEnd();
+  const sameSet = directKeys.size === serviceKeys.size && [...directKeys].every((k) => serviceKeys.has(k));
+  const local = layer === "local";
+  const file = local ? PROJECT_RUNFREE_PATHS.networkPolicyLocal : PROJECT_RUNFREE_PATHS.networkPolicy;
+  const retry = {
+    local,
+    skippedHosts: entry.selection?.skippedHosts,
+    sourceArgs: input.sourceArgs,
+  };
+  // A direct token in the checkout-local layer has no `credential` command;
+  // it is edited by hand.
+  const removeDirect = local ? `remove tokens.${tokenName} from ${file}` : remedy.credentialRemove(tokenName);
+  const writeMode = entry.selection?.writeMode;
+  return [
+    `token ${tokenName} conflicts with service ${id}`,
+    `  the ${layerPolicyLabel(layer)} layer (${file}) already defines token ${tokenName} directly,`,
+    sameSet
+      ? `  and service ${id} sends it differently:`
+      : `  and service ${id} would send it to different destinations:`,
+    "",
+    render(header),
+    ...rows.map(render),
+    ...(sameSet && rows.every((row) => row[1] === row[2]) ? ["    (the same destinations in a different order)"] : []),
+    "",
+    `  direct token description: ${JSON.stringify(direct.description)}`,
+    "",
+    "  choose one:",
+    `    keep the direct token and leave service ${id} off:`,
+    `      nothing to do; allow other hosts with: ${remedy.hostAdd("<host>", { local })}`,
+    `    let service ${id} own the token:`,
+    `      ${removeDirect}`,
+    `      ${remedy.serviceEnableRetry(id, { ...retry, writeMode })}`,
+    ...(writeMode === "read-only" ? [] : [
+      "    the same, with writes refused:",
+      `      ${removeDirect}`,
+      `      ${remedy.serviceEnableRetry(id, { ...retry, writeMode: "read-only" })}`,
+    ]),
+    "",
+    `  full service definition: ${remedy.serviceExplain(id)}`,
+  ].join("\n");
+}
+
 export function reconcileDesiredService(
   current: DesiredNetworkPolicyJson,
   mutation: DesiredServiceMutation,
@@ -252,12 +339,20 @@ export function reconcileDesiredService(
       for (const [tokenName, token] of Object.entries(entry.resolved.tokens ?? {})) {
         const direct = directTokens[tokenName];
         if (direct === undefined) continue;
-        if (!sameControlValue(direct, token)) {
-          throw new CliError([
-            `token ${tokenName} is already defined directly with a different credential destination than service ${id} provides`,
-            `review it with: runfree policy diff`,
-            `remove the direct token first with: runfree credential remove ${tokenName}`,
-          ].join("\n"));
+        if (!sameTokenDestination(direct, token)) {
+          throw new CliError(directTokenConflictMessage({
+            direct,
+            entry,
+            id,
+            layer,
+            service: token,
+            sourceArgs: mutation.sourceArgs,
+            tokenName,
+          }));
+        }
+        if (direct.description !== token.description) {
+          notices.push(`token ${tokenName}: the direct token had the same destinations as service ${id} and now belongs to the service; its description changes to ${
+            JSON.stringify(token.description)}; service disable removes it`);
         }
         delete directTokens[tokenName];
       }

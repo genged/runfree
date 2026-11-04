@@ -58,6 +58,18 @@ export const remedy = {
   // the missing parameter.
   serviceEnableParam: (id: string, key: string, options: { sourceArgs?: string } = {}): string =>
     `runfree service enable ${id}${options.sourceArgs ? ` ${options.sourceArgs}` : ""} --param ${key}=<value>`,
+  // A re-run of the operator's `service enable`: the source flags they gave,
+  // the hosts already skipped, the write mode, and the layer.
+  serviceEnableRetry: (
+    id: string,
+    options: { local?: boolean; skippedHosts?: readonly string[]; sourceArgs?: string; writeMode?: "allow-write" | "read-only" } = {},
+  ): string => [
+    `runfree service enable ${id}`,
+    ...[...(options.skippedHosts ?? [])].sort().map((skipped) => `--skip-host ${skipped}`),
+    ...(options.writeMode === "read-only" ? ["--read-only"] : options.writeMode === "allow-write" ? ["--allow-write"] : []),
+    ...(options.sourceArgs ? [options.sourceArgs] : []),
+    ...(options.local ? ["--local"] : []),
+  ].join(" "),
   serviceEnableFromItem: (id: string): string => `runfree service enable ${id} --from-1password-item op://<vault>/<item>`,
   serviceEnableHelp: (): string => "runfree service enable --help",
   serviceExplain: (id: string): string => `runfree service explain ${id}`,
@@ -73,6 +85,7 @@ export const remedy = {
   credentialSetSourceFromEnv: (name: string, env: string): string => `runfree credential set-source ${name} --from-env ${env}`,
   credentialAdd: (name: string, host: string, source: string): string =>
     `runfree credential add ${name} --host ${host} --from-source ${source}`,
+  credentialRemove: (name: string): string => `runfree credential remove ${name}`,
   credentialUnlink: (name: string, host: string): string => `runfree credential unlink ${name} --host ${host}`,
   imageApproveContext: (): string => "runfree image approve-context",
   imageInit: (): string => "runfree image init",
@@ -134,6 +147,13 @@ export function sampleRemedyRenderings(): string[] {
     remedy.serviceEnableSkipHost("github", "avatars.githubusercontent.com", { writeMode: "allow-write" }),
     remedy.serviceEnableParam("apple-ads", "client-id"),
     remedy.serviceEnableParam("apple-ads", "client-id", { sourceArgs: "--from-source src" }),
+    remedy.serviceEnableRetry("github"),
+    remedy.serviceEnableRetry("github", {
+      local: true,
+      skippedHosts: ["objects.githubusercontent.com"],
+      sourceArgs: "--from-source github-cli",
+      writeMode: "read-only",
+    }),
     remedy.serviceEnableFromItem("apple-ads"),
     remedy.serviceEnableHelp(),
     remedy.serviceExplain("github"),
@@ -145,6 +165,7 @@ export function sampleRemedyRenderings(): string[] {
     remedy.mcpRevoke("claude", "srv"),
     remedy.credentialSetSourceFromEnv("mcp-claude-github-auth", "GITHUB_MCP_TOKEN"),
     remedy.credentialAdd("github", "api.github.com", "github-cli"),
+    remedy.credentialRemove("github"),
     remedy.credentialUnlink("github", "api.github.com"),
     remedy.imageApproveContext(),
     remedy.imageInit(),
