@@ -94,6 +94,8 @@ const commonExclude = [
   ".worktrees/**",
   // Claude Code agent worktrees: full checkouts of other branches.
   ".claude/worktrees/**",
+  // Gitignored Pi extensions, whose installed packages ship their own tests.
+  ".pi/**",
   ".pnpm-store/**",
   "proxy/node_modules/**",
   "packages/**/node_modules/**",
