@@ -62,10 +62,10 @@ The primary audience is individual developers using Claude Code, Codex, or Pi wh
 
 ## Supported Release Shape
 
-- published binary: `darwin-arm64` only, ad-hoc signed and not notarized, with a SHA-256 manifest;
-- host: Apple Silicon macOS, or Linux from a source build;
+- published binaries: `darwin-arm64` (ad-hoc signed, not notarized), `linux-arm64`, and `linux-x64` (glibc, unsigned), with a SHA-256 manifest;
+- host: Apple Silicon macOS, or Linux on arm64 or x64 with glibc;
 - container backend: Docker Desktop with Docker Compose on macOS; native Docker Engine with Docker Compose on Linux;
-- package manager: Homebrew tap plus the GitHub release install script (`bash`, not `sh`);
+- package manager: Homebrew tap on macOS, plus the GitHub release install script (`bash`, not `sh`) on macOS and Linux;
 - source build: Node 22 and the pnpm version in `package.json`; `./bunw` fetches the Bun in `.bun-version` for `pnpm run build:bin`;
 
 The release target list lives in [`../scripts/release-targets.txt`](../scripts/release-targets.txt), which packaging, signing, checksums, and the CI build matrix all read.

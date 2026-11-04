@@ -26,6 +26,15 @@ case "\${1:-}" in
 esac
 `);
 
+  // musl's ldd prints its banner to stderr and exits nonzero; glibc's exits 0.
+  writeExecutable(path.join(fakeBin, "ldd"), `#!/usr/bin/env bash
+if [ "\${RUNFREE_FAKE_LIBC:-glibc}" = "musl" ]; then
+  printf 'musl libc (aarch64)\nVersion 1.2.5\n' >&2
+  exit 1
+fi
+printf 'ldd (Ubuntu GLIBC 2.39-0ubuntu8) 2.39\n'
+`);
+
   writeExecutable(path.join(fakeBin, "curl"), `#!/usr/bin/env bash
 set -euo pipefail
 out=""
@@ -101,6 +110,8 @@ function writeManifest(hash = "fakehash"): void {
     [
       `${hash}  runfree-0.2.0-darwin-arm64.tar.gz`,
       `${hash}  runfree-0.2.0-darwin-x64.tar.gz`,
+      `${hash}  runfree-0.2.0-linux-arm64.tar.gz`,
+      `${hash}  runfree-0.2.0-linux-x64.tar.gz`,
       "",
     ].join("\n"),
   );
@@ -153,7 +164,12 @@ describe("scripts/install.sh", () => {
     expect(fs.existsSync(fakeLog)).toBe(false);
   });
 
-  test.each([["Darwin", "arm64", "darwin-arm64"]])("maps %s %s to %s", (osName, archName, target) => {
+  test.each([
+    ["Darwin", "arm64", "darwin-arm64"],
+    ["Linux", "x86_64", "linux-x64"],
+    ["Linux", "aarch64", "linux-arm64"],
+    ["Linux", "arm64", "linux-arm64"],
+  ])("maps %s %s to %s", (osName, archName, target) => {
     const installDir = path.join(tmp, "install", target);
     const result = runInstall({
       RUNFREE_FAKE_UNAME_S: osName,
@@ -171,7 +187,8 @@ describe("scripts/install.sh", () => {
     // platform map. An installer that offers a target the release does not
     // publish sends the user to a download URL that 404s.
     const script = fs.readFileSync(path.join(repoRoot, "scripts/install.sh"), "utf8");
-    const offered = [...script.matchAll(/^\s*\w+:\S+\)\s*target="([^"]+)"/gm)].map((match) => match[1]);
+    // Two uname spellings of Linux arm64 map to one target.
+    const offered = [...new Set([...script.matchAll(/^\s*\w+:\S+\)\s*target="([^"]+)"/gm)].map((match) => match[1]))];
 
     const released = fs
       .readFileSync(path.join(repoRoot, "scripts/release-targets.txt"), "utf8")
@@ -209,16 +226,17 @@ describe("scripts/install.sh", () => {
     expect(log).not.toContain("api.github.com");
   });
 
-  test("does not install on Linux while no Linux release artifacts are published", () => {
-    const installDir = path.join(tmp, "install", "linux");
+  test("refuses a musl Linux before downloading, because the binaries need glibc", () => {
+    const installDir = path.join(tmp, "install", "linux-musl");
     const result = runInstall({
       RUNFREE_FAKE_UNAME_S: "Linux",
       RUNFREE_FAKE_UNAME_M: "x86_64",
+      RUNFREE_FAKE_LIBC: "musl",
       RUNFREE_INSTALL_DIR: installDir,
     });
 
     expect(result.status).not.toBe(0);
-    expect(result.stderr).toContain("Linux release binaries are not published yet");
+    expect(result.stderr).toContain("need glibc");
     expect(fs.existsSync(path.join(installDir, "runfree"))).toBe(false);
     expect(fs.existsSync(fakeLog)).toBe(false);
   });

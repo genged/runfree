@@ -226,7 +226,7 @@ describe("release packaging scripts", () => {
     expect(fs.existsSync(path.join(artifactDir, "runfree-0.1.0-linux-x64.tar.gz"))).toBe(false);
   });
 
-  test.each(["linux-x64", "darwin-x64"])(
+  test.each(["linux-riscv64", "darwin-x64"])(
     "package script rejects %s, which this release does not build, before building anything",
     (unknownTarget) => {
       const result = runScript("scripts/package-homebrew-artifacts.sh", ["darwin-arm64", unknownTarget], {
@@ -269,9 +269,11 @@ describe("release packaging scripts", () => {
   });
 
   test("checksum script hashes only the advertised release tarballs", () => {
-    fs.writeFileSync(path.join(artifactDir, "runfree-0.1.0-darwin-arm64.tar.gz"), "darwin-arm64");
+    for (const target of ["darwin-arm64", "linux-arm64", "linux-x64"]) {
+      fs.writeFileSync(path.join(artifactDir, `runfree-0.1.0-${target}.tar.gz`), target);
+    }
     fs.writeFileSync(path.join(artifactDir, "runfree-0.1.0-darwin-x64.tar.gz"), "stale-intel");
-    fs.writeFileSync(path.join(artifactDir, "runfree-0.1.0-linux-x64.tar.gz"), "stale-linux");
+    fs.writeFileSync(path.join(artifactDir, "runfree-0.1.0-linux-riscv64.tar.gz"), "stale-riscv");
     fs.mkdirSync(path.join(artifactDir, "notary"), { recursive: true });
     fs.writeFileSync(path.join(artifactDir, "notary/runfree-0.1.0-darwin-arm64.zip"), "notary");
 
@@ -280,8 +282,10 @@ describe("release packaging scripts", () => {
     expect(result.status, result.stderr).toBe(0);
     const checksum = fs.readFileSync(path.join(artifactDir, "runfree-0.1.0.sha256"), "utf8");
     expect(checksum).toContain("runfree-0.1.0-darwin-arm64.tar.gz");
+    expect(checksum).toContain("runfree-0.1.0-linux-arm64.tar.gz");
+    expect(checksum).toContain("runfree-0.1.0-linux-x64.tar.gz");
     expect(checksum).not.toContain("darwin-x64");
-    expect(checksum).not.toContain("linux");
+    expect(checksum).not.toContain("riscv64");
     expect(checksum).not.toContain(".zip");
   });
 
@@ -307,7 +311,9 @@ describe("release packaging scripts", () => {
   });
 
   test("checksum script stops publication when an archive no longer matches its build-job hash", () => {
-    fs.writeFileSync(path.join(artifactDir, "runfree-0.1.0-darwin-arm64.tar.gz"), "darwin-arm64");
+    for (const target of ["darwin-arm64", "linux-arm64", "linux-x64"]) {
+      fs.writeFileSync(path.join(artifactDir, `runfree-0.1.0-${target}.tar.gz`), target);
+    }
     fs.writeFileSync(
       path.join(artifactDir, "runfree-0.1.0-darwin-arm64.tar.gz.sha256"),
       "adifferenthash  runfree-0.1.0-darwin-arm64.tar.gz\n",
@@ -380,6 +386,18 @@ describe("release packaging scripts", () => {
     expect(result.status).not.toBe(0);
     expect(result.stderr).toContain("usage:");
     expect(result.stderr).toContain("darwin-arm64");
+  });
+
+  test("ad-hoc signing script refuses a Linux target before touching codesign", () => {
+    installFakeMacSigningTools();
+
+    const result = runScript("scripts/sign-adhoc-macos-target.sh", ["linux-x64"], {
+      RUNFREE_RELEASE_VERSION: "0.1.0",
+    });
+
+    expect(result.status).not.toBe(0);
+    expect(result.stderr).toContain("not a macOS release target: linux-x64");
+    expect(fs.existsSync(fakeLog)).toBe(false);
   });
 
   test("ad-hoc signing script refuses to sign a candidate that was never built", () => {

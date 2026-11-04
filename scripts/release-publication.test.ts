@@ -65,12 +65,15 @@ exit 0
   );
 }
 
+// Every target in scripts/release-targets.txt: publication requires them all.
+const TARGETS = ["darwin-arm64", "linux-arm64", "linux-x64"];
+
 function writeCandidate(target: string, contents = "signed archive bytes"): void {
   fs.writeFileSync(path.join(artifactDir, `runfree-${VERSION}-${target}.tar.gz`), contents);
 }
 
 function writeManifest(filePath: string, hash = "0123456789abcdef"): void {
-  fs.writeFileSync(filePath, `${hash}  runfree-${VERSION}-darwin-arm64.tar.gz\n`);
+  fs.writeFileSync(filePath, TARGETS.map((target) => `${hash}  runfree-${VERSION}-${target}.tar.gz\n`).join(""));
 }
 
 function runPublish(env: NodeJS.ProcessEnv = {}): childProcess.SpawnSyncReturns<string> {
@@ -111,7 +114,7 @@ beforeEach(() => {
   installFakeGh();
 
   fs.writeFileSync(notesFile, "# Runfree 0.5.0\n\nFirst public beta.\n");
-  writeCandidate("darwin-arm64");
+  for (const target of TARGETS) writeCandidate(target);
   writeManifest(path.join(artifactDir, `runfree-${VERSION}.sha256`));
 });
 

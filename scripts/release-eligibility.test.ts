@@ -92,7 +92,11 @@ describe("scripts/resolve-release-tag.sh", () => {
     expect(outputs.version).toBe("0.5.0");
     expect(outputs.sha).toBe(sha);
     expect(outputs.replace_assets).toBe("false");
-    expect(JSON.parse(outputs.targets)).toEqual([{ target: "darwin-arm64", runner: "macos-15" }]);
+    expect(JSON.parse(outputs.targets)).toEqual([
+      { target: "darwin-arm64", runner: "macos-15" },
+      { target: "linux-arm64", runner: "ubuntu-24.04-arm" },
+      { target: "linux-x64", runner: "ubuntu-24.04" },
+    ]);
   });
 
   test.each([

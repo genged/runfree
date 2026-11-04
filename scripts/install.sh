@@ -65,9 +65,21 @@ arch_name="$(uname -m)"
 case "${os_name}:${arch_name}" in
   Darwin:arm64) target="darwin-arm64" ;;
   Darwin:x86_64) die "Intel macOS release binaries are not published; Runfree 0.5.0 supports Apple Silicon macOS only. Build from source to run on Intel." ;;
-  Linux:*) die "Linux release binaries are not published yet; build from source on Linux" ;;
+  Linux:x86_64) target="linux-x64" ;;
+  Linux:aarch64) target="linux-arm64" ;;
+  Linux:arm64) target="linux-arm64" ;;
   *) die "unsupported OS/architecture: ${os_name} ${arch_name}" ;;
 esac
+
+# Bun links the Linux binaries against glibc, so they do not start on a musl
+# distribution such as Alpine. Refuse before downloading. `ldd --version` names
+# musl on musl systems and exits nonzero there, so capture it rather than pipe it.
+if [ "${os_name}" = "Linux" ]; then
+  ldd_version="$(ldd --version 2>&1 || true)"
+  case "${ldd_version}" in
+    *musl*) die "Linux release binaries need glibc; musl systems such as Alpine are not supported. Build from source on a glibc system." ;;
+  esac
+fi
 
 if [ "${version}" = "latest" ]; then
   latest_json="$(mktemp)"

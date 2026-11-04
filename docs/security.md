@@ -624,8 +624,8 @@ All risks, grouped by topic, are in [security-rules.md](security-rules.md#residu
 
 ## Platform Status
 
-Apple Silicon macOS with Docker Desktop and Linux with native Docker Engine
-(source build) are supported; see
+Apple Silicon macOS with Docker Desktop and Linux (arm64 or x64, glibc) with
+native Docker Engine are supported; see
 [Supported Release Shape](project-brief.md#supported-release-shape).
 
 ## Verification

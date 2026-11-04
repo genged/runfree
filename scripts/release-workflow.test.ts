@@ -49,7 +49,7 @@ describe("release workflow", () => {
     expect(releaseJobs.resolve).toContain("sha: ${{ steps.release.outputs.sha }}");
 
     expect(releaseJobs.verify).toContain("ref: ${{ needs.resolve.outputs.sha }}");
-    for (const jobId of ["prepare", "build-macos", "publish"]) {
+    for (const jobId of ["prepare", "build", "publish"]) {
       expect(releaseJobs[jobId], `${jobId} must check out the resolved SHA`).toContain(
         "ref: ${{ needs.resolve.outputs.sha }}",
       );
@@ -67,8 +67,8 @@ describe("release workflow", () => {
     expect(releaseJobs.verify).toContain("if: needs.prepare.outputs.ready == 'true'");
     expect(releaseJobs.resolve).toContain("EXPECTED_SHA: ${{ inputs.sha }}");
 
-    expect(releaseJobs["build-macos"]).toContain("needs: [resolve, prepare, verify]");
-    expect(releaseJobs.publish).toContain("needs: [resolve, prepare, verify, build-macos]");
+    expect(releaseJobs.build).toContain("needs: [resolve, prepare, verify]");
+    expect(releaseJobs.publish).toContain("needs: [resolve, prepare, verify, build]");
   });
 
   test("runs the Test workflow's verification lane before release", () => {
@@ -79,7 +79,7 @@ describe("release workflow", () => {
   });
 
   test("takes the build matrix from the central release target list", () => {
-    expect(releaseJobs["build-macos"]).toContain("include: ${{ fromJSON(needs.resolve.outputs.targets) }}");
+    expect(releaseJobs.build).toContain("include: ${{ fromJSON(needs.resolve.outputs.targets) }}");
     // No target is spelled out in the workflow, so the list cannot disagree with
     // what packaging, signing, checksums, and the installer use.
     expect(releaseWorkflow).not.toContain("target: darwin-arm64");
@@ -88,12 +88,12 @@ describe("release workflow", () => {
   });
 
   test("installs pnpm and workspace dependencies in every job that builds or tests", () => {
-    expect(releaseJobs["build-macos"]).toContain("uses: pnpm/action-setup@");
-    expect(releaseJobs["build-macos"]).toContain("run: pnpm install --frozen-lockfile");
+    expect(releaseJobs.build).toContain("uses: pnpm/action-setup@");
+    expect(releaseJobs.build).toContain("run: pnpm install --frozen-lockfile");
     // Packaging shells out to pnpm; Node and Bun from another job do not supply
     // the workspace.
-    expect(releaseJobs["build-macos"].indexOf("pnpm install --frozen-lockfile")).toBeLessThan(
-      releaseJobs["build-macos"].indexOf("scripts/package-homebrew-artifacts.sh"),
+    expect(releaseJobs.build.indexOf("pnpm install --frozen-lockfile")).toBeLessThan(
+      releaseJobs.build.indexOf("scripts/package-homebrew-artifacts.sh"),
     );
   });
 
@@ -123,7 +123,7 @@ describe("release workflow", () => {
 
   test("isolates uploads and downloads per tag", () => {
     const candidateName = "name: release_${{ needs.resolve.outputs.tag }}_${{ matrix.target }}";
-    expect(releaseJobs["build-macos"]).toContain(candidateName);
+    expect(releaseJobs.build).toContain(candidateName);
     expect(releaseJobs.publish).toContain("pattern: release_${{ needs.resolve.outputs.tag }}_*");
   });
 
@@ -131,6 +131,25 @@ describe("release workflow", () => {
     expect(releaseRouter).not.toContain("workflow_run:");
     expect(releaseRouter).toMatch(/push:\n\s+tags:/);
     expect(releaseRouter).toContain("workflow_dispatch:");
+  });
+
+  test("signs only macOS candidates, and accepts Linux candidates by running them", () => {
+    const build = releaseJobs.build;
+    const signIndex = build.indexOf("scripts/sign-adhoc-macos-target.sh");
+    expect(build.lastIndexOf("if: startsWith(matrix.target, 'darwin-')", signIndex)).toBeGreaterThan(
+      build.lastIndexOf("- name:", signIndex),
+    );
+
+    // The per-target hash is recorded first, so the candidate check verifies the
+    // exact bytes that the upload step ships.
+    const linuxIndex = build.indexOf("if: startsWith(matrix.target, 'linux-')");
+    const checksumIndex = build.indexOf("scripts/checksum-release-artifacts.sh", linuxIndex);
+    const acceptIndex = build.indexOf("scripts/verify-release-candidate.sh", linuxIndex);
+    const uploadIndex = build.indexOf("uses: actions/upload-artifact@");
+    expect(linuxIndex).toBeGreaterThan(signIndex);
+    expect(checksumIndex).toBeGreaterThan(linuxIndex);
+    expect(acceptIndex).toBeGreaterThan(checksumIndex);
+    expect(uploadIndex).toBeGreaterThan(acceptIndex);
   });
 
   test("signs the candidate ad-hoc, with no Apple credentials anywhere in the release", () => {

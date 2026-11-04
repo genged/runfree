@@ -92,10 +92,11 @@ jobs:
       ref: ${{ needs.resolve.outputs.sha }}
       artifact-namespace: ${{ needs.resolve.outputs.tag }}
 
-  # Releases are ad-hoc signed, so this job needs no Apple credentials and no
-  # privileged environment.
-  build-macos:
-    name: Build and sign ${{ matrix.target }}
+  # macOS releases are ad-hoc signed, so this job needs no Apple credentials and
+  # no privileged environment. Linux binaries are not signed: the per-target
+  # checksum is their integrity record, as it is for macOS.
+  build:
+    name: Build ${{ matrix.target }}
     needs: [resolve, prepare, verify]
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -147,7 +148,7 @@ jobs:
             exit 1
           fi
 
-      - name: Build macOS artifact
+      - name: Build release artifact
         env:
           RUNFREE_ARTIFACT_DIR: dist/release
           RUNFREE_ARTIFACT_TARGETS: ${{ matrix.target }}
@@ -155,16 +156,29 @@ jobs:
         run: scripts/package-homebrew-artifacts.sh
 
       - name: Ad-hoc sign and package macOS artifact
+        if: startsWith(matrix.target, 'darwin-')
         env:
           RUNFREE_ARTIFACT_DIR: dist/release
           RUNFREE_RELEASE_VERSION: ${{ needs.resolve.outputs.version }}
           TARGET: ${{ matrix.target }}
         run: scripts/sign-adhoc-macos-target.sh "${TARGET}"
 
+      # The runner is native to the target, so the candidate check runs the
+      # binary out of the archive and asks it its version.
+      - name: Record and accept Linux artifact
+        if: startsWith(matrix.target, 'linux-')
+        env:
+          RUNFREE_ARTIFACT_DIR: dist/release
+          VERSION: ${{ needs.resolve.outputs.version }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          scripts/checksum-release-artifacts.sh "${VERSION}" "${TARGET}"
+          scripts/verify-release-candidate.sh "${VERSION}" "${TARGET}"
+
       # The archive and the hash of its exact bytes travel together, so the
       # publication job can tell a repacked or substituted candidate from the
-      # one this job signed.
-      - name: Upload macOS artifact
+      # one this job built.
+      - name: Upload release artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: release_${{ needs.resolve.outputs.tag }}_${{ matrix.target }}
@@ -175,7 +189,7 @@ jobs:
 
   publish:
     name: Publish release artifacts
-    needs: [resolve, prepare, verify, build-macos]
+    needs: [resolve, prepare, verify, build]
     runs-on: ubuntu-latest
     permissions:
       contents: write

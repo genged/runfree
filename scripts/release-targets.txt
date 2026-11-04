@@ -5,8 +5,10 @@
 # Format: <target> <runner-label>
 # Lines starting with "#" and blank lines are ignored.
 #
-# 0.5.0 publishes Apple Silicon macOS only. Intel macOS and Linux archives are
-# not built, not signed, not checksummed, and not claimed as supported. Adding a
-# row here is a support claim: it must come with recorded acceptance evidence on
-# that target.
+# Apple Silicon macOS and Linux (glibc) on arm64 and x64. Each target builds on
+# a native runner, so the build job can run the binary it built. Intel macOS
+# archives are not built and not claimed as supported. Adding a row here is a
+# support claim: it must come with recorded acceptance evidence on that target.
 darwin-arm64 macos-15
+linux-arm64 ubuntu-24.04-arm
+linux-x64 ubuntu-24.04

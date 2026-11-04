@@ -28,6 +28,13 @@ if [ -z "${target}" ] || ! "${script_dir}/release-targets.sh" is-known "${target
   printf 'usage: %s <%s>\n' "$0" "$("${script_dir}/release-targets.sh" list | tr '\n' '|' | sed 's/|$//')" >&2
   exit 1
 fi
+case "${target}" in
+  darwin-*) ;;
+  *)
+    printf 'not a macOS release target: %s\n' "${target}" >&2
+    exit 1
+    ;;
+esac
 
 for command in codesign tar; do
   if ! command -v "${command}" >/dev/null 2>&1; then
