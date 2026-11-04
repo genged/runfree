@@ -72,8 +72,8 @@ The release target list lives in [`../scripts/release-targets.txt`](../scripts/r
 
 ## Source Map
 
-The map from each area to its source files lives in
-[`AGENTS.md`](../AGENTS.md#where-to-look).
+The map from each area to its source files lives in the
+[`runfree-source-map`](../.agents/skills/runfree-source-map/SKILL.md) agent skill.
 
 See also [`index.md`](index.md), [`architecture.md`](architecture.md),
 [`security.md`](security.md), and [`cli.md`](cli.md).
