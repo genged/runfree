@@ -90,6 +90,9 @@ test-static:
 	@# Public-documentation gate: every relative link and heading anchor must
 	@# resolve in a clone that has no local/ records.
 	pnpm exec tsx scripts/check-public-docs.ts
+	@# Architecture-level gate: architecture.md explains ideas; source paths,
+	@# code names, environment variables, and exact limits belong elsewhere.
+	pnpm exec tsx scripts/check-architecture-doc.ts
 	@# Published release notes are fixed. No-ops in a checkout without release
 	@# tags, and says so rather than reporting a pass.
 	pnpm exec tsx scripts/check-release-notes-frozen.ts

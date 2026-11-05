@@ -33,6 +33,8 @@ project policy lives under `.runfree/`.
   `docs/security-rules.md` (rule IDs such as `NET-1`). They and the
   `runfree-source-map` skill are canonical for security reviews; do not
   substitute plans or shared skill references.
+- Before editing public docs, follow `docs/writing-docs.md`; `make test-static`
+  checks its mechanical rules.
 - Check recent commits before assuming a design is finished.
 - For reviews of the current design, treat implemented source, behavioral/live tests, and the public project docs as current. Completed specs may explain shipped decisions; ignore drafts, partial specs, plans, and TODO directions unless the user explicitly asks about future work.
 

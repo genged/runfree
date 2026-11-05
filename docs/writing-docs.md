@@ -111,6 +111,10 @@ today's command surface skip them.
   inline span may name a command without its arguments, a fenced line may not;
 - a page uses a bare generation phrase (`scripts/check-terminology.ts`); a
   phrase in double quotes is treated as a mention of the term, not a use;
+- [architecture.md](architecture.md), outside fenced blocks, names a source
+  path, a function, type, or field name, an environment variable, or an exact
+  limit (`scripts/check-architecture-doc.ts`); its few named exceptions each
+  carry a reason, and step-by-step algorithms are still checked in review;
 - a published release note has changed since its tag
   (`scripts/check-release-notes-frozen.ts`).
 
