@@ -85,12 +85,14 @@ network and no cache the run fails with the fix; it never falls back to the
 host Git and never skips.
 
 `make test-git` runs `tests/git-matrix/files.txt` once per locked version and
-prints a table: version, result, tests passed, tests not applicable, and the
-first failure. `make test-git GIT=2.43.0` runs one version;
+prints a table: version, result, tests passed, tests not applicable, other
+skips, and the first failure. `make test-git GIT=2.43.0` runs one version;
 `GIT_TEST=<file>` runs one file. A test whose setup cannot exist on older Git
 (relative worktree links need 2.48) uses `needsGit("2.48")` from
 `tests/support/git-version.ts` instead of `test`: it runs on the default Git and
-counts as "not applicable" on older lanes. Any other skip fails the lane. Where
+counts as "not applicable" on older lanes. A test that skips on one Git and
+runs on another without declaring it fails the lane; a skip on every lane (a
+Linux-only test on macOS) is only counted. Where
 Runfree behaves differently on older Git, prefer one test that checks both
 sides with `gitAtLeast` over a skip.
 
