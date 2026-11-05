@@ -30,7 +30,7 @@ that the Enforced line names.
 | [Credentials](#credentials) | `CRED-1` to `CRED-6` |
 | [Git Over HTTPS](#git-over-https) | `GIT-1` to `GIT-10` |
 | [Older Readers](#older-readers) | `OLD-1` to `OLD-4` |
-| [Sessions](#sessions) | `SESS-1` to `SESS-13` |
+| [Sessions](#sessions) | `SESS-1` to `SESS-14` |
 | [Write Approval](#write-approval) | `WRITE-1` to `WRITE-8` |
 | [MCP](#mcp) | `MCP-1` to `MCP-11` |
 | [Agent Container](#agent-container) | `AGENT-1` to `AGENT-5` |
@@ -202,8 +202,14 @@ Tests: [network-policy.test.ts](../packages/runtime-contracts/src/network-policy
   plan's addresses as its environment, and none on Desktop. Other backends,
   a Docker Desktop reached over TCP or SSH included, refuse
   `host-service add`.
-- On Docker Engine the relay runs as a non-root user with no capabilities,
-  so `host-service add` refuses a port below the host's
+- On Docker Engine the relay runs as uid 65534 with every capability
+  dropped, no-new-privileges, a read-only root filesystem, at most 64
+  processes, and one read-only mount: the effective policy directory. It
+  reads the gateway from the same root-owned hosts entry as the proxy and
+  applies the same checks; a refused gateway leaves it idle with no
+  listener. Every `up` names its Compose profiles itself, so a user's
+  `COMPOSE_PROFILES` cannot add or drop the relay.
+- Because the relay has no privilege, `host-service add` refuses a port below the host's
   `net.ipv4.ip_unprivileged_port_start`. If that value cannot be read, it
   refuses every port. Docker Desktop has no such limit.
 - The relay is a script run by the proxy image's Node: no new image or
@@ -792,6 +798,25 @@ at most three times in 60 s. At that limit, the session keeps running.
 
 Enforced: [session-admission-driver.ts](../packages/cli/src/runtime/session-admission-driver.ts)  
 Tests: [session-admission-driver.test.ts](../packages/cli/src/runtime/session-admission-driver.test.ts)
+
+### SESS-14. A session survives a CLI upgrade and an out-of-memory kill of a child process.
+
+- The `io.runfree.version` label records which release created a container.
+  It is information, not identity: the schema, epoch, template, digest, and
+  image labels decide whether a surviving container is compatible. A
+  surviving container needs only a well-formed version label. A container
+  that this CLI just created must carry this CLI's version.
+- Docker sets `State.OOMKilled` when the kernel kills any process in the
+  container, and the flag stays set while the main process runs. The flag
+  is not identity, so a running container with it set is still served. It
+  must still be a boolean, and the full proof refuses it on a container that
+  is not running.
+
+Why: one killed dev server, or a CLI upgrade, must not end every session in
+the project. The identity checks that matter stay pinned.
+
+Enforced: [session-container-proof.ts](../packages/cli/src/runtime/session-container-proof.ts) `validateSessionContainerInspect`, [session-container-narrow-liveness.ts](../packages/cli/src/runtime/session-container-narrow-liveness.ts) `assertSessionContainerNarrowRunningInspect`  
+Tests: [session-container-proof.test.ts](../packages/cli/src/runtime/session-container-proof.test.ts), [session-file-heartbeat.test.ts](../packages/cli/src/runtime/session-file-heartbeat.test.ts), [startup-session-eligibility.test.ts](../packages/cli/src/runtime/startup-session-eligibility.test.ts)
 
 ## Write Approval
 

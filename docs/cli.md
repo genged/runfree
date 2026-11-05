@@ -340,6 +340,13 @@ not change a running proxy or authorize the next start. Runfree captures it
 while project agents are quiesced, compares it with host-owned approvals, and
 compiles an immutable effective policy generation only after exact approval.
 
+When a command changes the file, Runfree writes it indented, with fields in
+a fixed order, and `.runfree/network-policy.local.json` the same way. Equal
+policies give equal bytes, so a one-host change shows as a few changed lines
+in a diff. Formatting does not affect approval: digests and checks read the
+parsed policy, never its bytes, so a file you reformat by hand needs no new
+approval for the same content.
+
 ### Review and activate desired policy
 
 ```bash

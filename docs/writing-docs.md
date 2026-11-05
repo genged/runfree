@@ -36,9 +36,9 @@ so a change only has to be documented once.
 | [team-workflow.md](team-workflow.md) | What a team commits under `.runfree/`, and how policy and service changes are reviewed |
 | [troubleshooting.md](troubleshooting.md) | Symptoms, the error text a user sees, and the remedy for each |
 | [testing.md](testing.md) | What each test layer proves and where its proof stops |
-| [project-brief.md](project-brief.md) | The problem, product model, audience, and release shape; it links to `AGENTS.md` for the source map |
+| [project-brief.md](project-brief.md) | The problem, product model, audience, and release shape; it links to the `runfree-source-map` agent skill for the source map |
 | `CONTRIBUTING.md` | Setup, the checks to run before a pull request, review expectations, and this standard's place in it |
-| `AGENTS.md` | Instructions for coding agents working on this repository: the source map and project rules |
+| `AGENTS.md` | Instructions for coding agents working on this repository: project rules; task guidance and the source map are agent skills under `.agents/skills/` |
 | [index.md](index.md) | The table of contents for `docs/` |
 | `docs/release-notes/<version>.md` | The GitHub release body for one version |
 | `docs/whats-new-<version>.md` | The detailed page for one version |

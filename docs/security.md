@@ -378,7 +378,7 @@ Limits:
 - Runfree checks session shape only with host-side `docker inspect`. That
   shows what Docker created, not what the process does.
 
-The rules are in [Sessions rules](security-rules.md#sessions) (`SESS-1` to `SESS-13`).
+The rules are in [Sessions rules](security-rules.md#sessions) (`SESS-1` to `SESS-14`).
 
 ### Write Approval
 
