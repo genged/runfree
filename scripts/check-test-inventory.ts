@@ -19,6 +19,8 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
+import { parseMatrixFiles } from "./test-git.ts";
+
 const repoRoot = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
 
 // Only needs to name a backend the config accepts; the live project does not
@@ -36,6 +38,16 @@ const INVENTORY_DOCKER_HOST = "unix:///runfree-e2e-inventory-only.sock";
 export function strayLoadedTestFiles(loaded: Iterable<string>, gitVisible: Iterable<string>): string[] {
   const visible = new Set(gitVisible);
   return [...new Set(loaded)].filter((file) => !visible.has(file)).sort();
+}
+
+/**
+ * Entries of tests/git-matrix/files.txt that name no tracked test file. Vitest
+ * treats an unmatched filter as "nothing to add", so a renamed file would drop
+ * out of `make test-git` with every lane still green.
+ */
+export function staleGitMatrixEntries(entries: Iterable<string>, tracked: Iterable<string>): string[] {
+  const trackedSet = new Set(tracked);
+  return [...new Set(entries)].filter((entry) => !trackedSet.has(entry)).sort();
 }
 
 /** Tracked test files no Vitest project loads. */
@@ -152,6 +164,15 @@ function main(): void {
     report("Makefile targets filter on test files that no longer exist:", [...new Set(missing)]);
   }
 
+  const gitMatrix = parseMatrixFiles(fs.readFileSync(path.join(repoRoot, "tests", "git-matrix", "files.txt"), "utf8"));
+  if (gitMatrix.length === 0) {
+    report("tests/git-matrix/files.txt lists no test files; make test-git would pass vacuously:", ["(empty)"]);
+  }
+  const staleGitMatrix = staleGitMatrixEntries(gitMatrix, tracked);
+  if (staleGitMatrix.length > 0) {
+    report("tests/git-matrix/files.txt names files that are not tracked test files:", staleGitMatrix);
+  }
+
   if (problems.length > 0) {
     console.error(`check-test-inventory: ${problems.join("\n\n")}`);
     process.exit(1);
@@ -160,7 +181,7 @@ function main(): void {
   console.log(
     `check-test-inventory: ${tracked.length} tracked test files, all reachable, none gitignored ` +
       `(${defaultProjects.length} unit, ${liveProject.length} live, ${e2eProject.length} packaged e2e, ${e2eLiveProject.length} packaged live); ` +
-      `${referenced.length} Makefile filters resolve`,
+      `${referenced.length} Makefile filters resolve; ${gitMatrix.length} Git matrix files tracked`,
   );
 }
 

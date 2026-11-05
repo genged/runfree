@@ -36,6 +36,11 @@ const binWrapperTests = ["scripts/installable-cli-wrapper.test.ts"];
 // `pnpm test` cannot pick them up even by accident, and they are excluded
 // from the parallel project's `**/*.test.ts` glob regardless.
 const liveRuntimeTests = ["tests/runtime/**/*.live.test.ts"];
+
+// Every project runs on the pinned Git, never the host's
+// (tests/support/pinned-git.ts). Declared per project like the bundle setups;
+// it is idempotent, so running once per project costs a version check.
+const pinnedGitSetup = "tests/support/pinned-git.ts";
 const cliE2eTests = ["e2e/**/*.test.ts"];
 const cliE2eLiveTests = ["e2e/**/*.live.test.ts"];
 /**
@@ -145,7 +150,7 @@ const liveRuntimeProject: TestProjectConfiguration = {
     // Prebuilds the CLI and session-admission runner bundles the fixture and
     // tranches spawn (tests/support/build-live-bundles.ts); without them each
     // of the run's 100+ spawns boots through tsx at ~1.5s.
-    globalSetup: ["tests/support/build-live-bundles.ts"],
+    globalSetup: [pinnedGitSetup, "tests/support/build-live-bundles.ts"],
     sequence: { groupOrder: 3 },
   },
 };
@@ -156,6 +161,7 @@ const cliE2eProject: TestProjectConfiguration = {
     name: "cli-e2e",
     include: cliE2eTests,
     exclude: [...commonExclude.filter((pattern) => !cliE2eTests.includes(pattern)), ...cliE2eLiveTests],
+    globalSetup: [pinnedGitSetup],
     setupFiles: ["e2e/support/setup.ts"],
     sequence: { groupOrder: 4 },
   },
@@ -168,6 +174,7 @@ const cliE2eLiveProject: TestProjectConfiguration = {
     include: cliE2eLiveTests,
     exclude: commonExclude.filter((pattern) => !cliE2eTests.includes(pattern)),
     env: { TEST_RUNTIME_BACKEND: liveRuntimeBackend },
+    globalSetup: [pinnedGitSetup],
     setupFiles: ["e2e/support/setup.ts"],
     pool: "forks",
     maxWorkers: 1,
@@ -205,7 +212,7 @@ export default defineConfig({
           // project (not on the inherited root config, which would run it once
           // per project) and builds once per invocation, so another project
           // may declare it too.
-          globalSetup: ["tests/support/build-test-bundles.ts"],
+          globalSetup: [pinnedGitSetup, "tests/support/build-test-bundles.ts"],
           // Many files spawn subprocesses, so a worker per core oversubscribes
           // the CPU and starves those children past their timing bounds.
           maxWorkers: "50%",
@@ -217,6 +224,7 @@ export default defineConfig({
         test: {
           name: "bin-wrapper",
           include: binWrapperTests,
+          globalSetup: [pinnedGitSetup],
           sequence: { groupOrder: 1 },
         },
       },
@@ -225,6 +233,7 @@ export default defineConfig({
         test: {
           name: "repo-serial",
           include: repoMutatingTests,
+          globalSetup: [pinnedGitSetup],
           maxWorkers: 1,
           isolate: false,
           sequence: { groupOrder: 2 },

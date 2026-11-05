@@ -1,0 +1,134 @@
+name: Build test Git binaries
+
+# Builds the pinned Git versions the test suite runs on
+# (tests/git-matrix/git-bins.lock.json) for every supported platform and proves
+# each build with `make test-git` on its own runner. Pushing the tag named by
+# the lock file's release.tag (git-test-bin-<n>) also publishes the builds as
+# that prerelease's assets; a tag push runs this file from the tagged commit,
+# so a new version can be published from its pull request before it merges.
+# A manual run only builds and tests. The binaries are for tests only: never
+# shipped to users, never embedded in runtime assets.
+#
+# After publishing, record each asset's SHA-256 (the release's SHA256SUMS) in
+# the lock file. See CONTRIBUTING.md "Pinned Git".
+
+on:
+  push:
+    tags:
+      - "git-test-bin-*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  RUNFREE_PNPM_VERSION: 10.34.8
+
+jobs:
+  build:
+    name: Build ${{ matrix.platform }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux builds run on the oldest Ubuntu runner (glibc 2.35), so the
+          # binaries load on that glibc and newer.
+          - platform: linux-x64
+            runner: ubuntu-22.04
+          - platform: linux-arm64
+            runner: ubuntu-22.04-arm
+          - platform: darwin-arm64
+            runner: macos-15
+          - platform: darwin-x64
+            runner: macos-15-intel
+    runs-on: ${{ matrix.runner }}
+    env:
+      # The oldest macOS the binaries load on; ignored on Linux.
+      MACOSX_DEPLOYMENT_TARGET: "13.0"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          version: ${{ env.RUNFREE_PNPM_VERSION }}
+          run_install: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # Static zlib and libcurl headers; gpg and xz check kernel.org's signature.
+      - name: Install build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends zlib1g-dev libcurl4-openssl-dev gpg xz-utils
+
+      # The SHA-256 pinned in the lock file is checked on every platform. The
+      # signature is checked on Linux, against the key pinned in the repo; it
+      # covers the same bytes.
+      - name: Build every locked version
+        run: |
+          signature=""
+          if [ "${RUNNER_OS}" = Linux ]; then signature="--verify-signature"; fi
+          for version in $(node -e 'console.log(Object.keys(require("./tests/git-matrix/git-bins.lock.json").versions).join(" "))'); do
+            pnpm exec tsx scripts/build-git.ts "${version}" --install ${signature} \
+              --output "git-bins/git-${version}-${{ matrix.platform }}.tar.gz"
+          done
+
+      # The same gate contributors run, on the binaries just built (installed
+      # into the cache above), before anything is published.
+      - name: Run the Git matrix on the new binaries
+        run: make test-git
+
+      - name: Upload binaries
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: git-bins-${{ matrix.platform }}
+          path: git-bins/*.tar.gz
+          if-no-files-found: error
+
+  publish:
+    name: Publish prerelease
+    needs: build
+    # Forks build and test but never publish.
+    if: github.event_name == 'push' && github.repository == 'genged/runfree'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Download binaries
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: git-bins-*
+          path: git-bins
+          merge-multiple: true
+
+      # A prerelease that is never "latest": scripts/install.sh resolves
+      # releases/latest and must keep finding the CLI release.
+      - name: Create the prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="$(jq -r .release.tag tests/git-matrix/git-bins.lock.json)"
+          if [ "${tag}" != "${GITHUB_REF_NAME}" ]; then
+            printf 'pushed tag %s does not match release.tag %s in git-bins.lock.json\n' "${GITHUB_REF_NAME}" "${tag}" >&2
+            exit 1
+          fi
+          cd git-bins
+          sha256sum *.tar.gz | tee SHA256SUMS
+          gh release create "${tag}" --repo "${GITHUB_REPOSITORY}" --verify-tag \
+            --prerelease --latest=false --title "Test Git binaries (${tag})" \
+            --notes "Pinned Git builds for Runfree's test suite only; not for users. Built from ${GITHUB_SHA} by the Build test Git binaries workflow. Digests: SHA256SUMS; record them in tests/git-matrix/git-bins.lock.json." \
+            ./*.tar.gz SHA256SUMS

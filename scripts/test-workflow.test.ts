@@ -101,3 +101,39 @@ describe("verification lane", () => {
     expect(workflow).not.toContain("environment: release");
   });
 });
+
+describe("pinned Git", () => {
+  test("the Test workflow runs make test-git on Linux and macOS", () => {
+    const workflow = readRepoFile(".github/workflows/test.yml");
+
+    expect(workflow).toContain("run: make test-git");
+    expect(workflow).toContain("runner: [ubuntu-24.04, macos-15]");
+  });
+
+  describe("the binaries workflow", () => {
+    const workflow = readRepoFile(".github/workflows/build-git-binaries.yml");
+    const publishJob = workflow.slice(workflow.indexOf("\n  publish:"));
+
+    test("builds all four platforms and runs the matrix on each build before publishing", () => {
+      for (const platform of ["linux-x64", "linux-arm64", "darwin-arm64", "darwin-x64"]) {
+        expect(workflow).toContain(`platform: ${platform}`);
+      }
+      expect(workflow.indexOf("run: make test-git")).toBeGreaterThan(workflow.indexOf("scripts/build-git.ts"));
+      expect(workflow.indexOf("run: make test-git")).toBeLessThan(workflow.indexOf("\n  publish:"));
+    });
+
+    test("publishes only from this repository, only on a tag push, and only the job that publishes can write", () => {
+      expect(workflow).toMatch(/^permissions:\n\s+contents: read/m);
+      expect(workflow.slice(0, workflow.indexOf("\n  publish:"))).not.toContain("contents: write");
+      expect(publishJob).toContain("if: github.event_name == 'push' && github.repository == 'genged/runfree'");
+      expect(publishJob).toContain("contents: write");
+    });
+
+    // scripts/install.sh resolves releases/latest; a test-binary release must
+    // never become it.
+    test("publishes a prerelease that never becomes the latest release", () => {
+      expect(publishJob).toContain("--prerelease --latest=false");
+      expect(publishJob).toContain("--verify-tag");
+    });
+  });
+});

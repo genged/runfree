@@ -1,6 +1,6 @@
 import { describe, expect, test } from "vitest";
 
-import { strayLoadedTestFiles, unreachableTrackedTestFiles } from "./check-test-inventory.ts";
+import { staleGitMatrixEntries, strayLoadedTestFiles, unreachableTrackedTestFiles } from "./check-test-inventory.ts";
 
 describe("test inventory comparison", () => {
   test("a loaded test file git ignores is reported as a stray", () => {
@@ -25,5 +25,17 @@ describe("test inventory comparison", () => {
     expect(unreachableTrackedTestFiles(["scripts/a.test.ts"], ["scripts/a.test.ts", "scripts/extra.test.ts"])).toEqual(
       [],
     );
+  });
+
+  test("a Git matrix entry that names no tracked test file is stale", () => {
+    // A renamed file would otherwise leave `make test-git` green with the file
+    // silently dropped from every lane.
+    const tracked = ["scripts/a.test.ts", "packages/cli/src/runtime/git-layout.test.ts"];
+
+    expect(staleGitMatrixEntries(["scripts/a.test.ts", "scripts/renamed.test.ts", "scripts/a.ts"], tracked)).toEqual([
+      "scripts/a.ts",
+      "scripts/renamed.test.ts",
+    ]);
+    expect(staleGitMatrixEntries(tracked, tracked)).toEqual([]);
   });
 });

@@ -11,6 +11,8 @@ import { BASE_AGENT_ENVIRONMENT } from "./agent-env.ts";
 import { mcpOAuthCallbackPort } from "./mcp.ts";
 import { ensureSandboxGitConfig, ensureAgentState, runtimeValidationMarkerStatus } from "./state.ts";
 import type { RuntimeContext, RuntimeIO } from "./types.ts";
+import { needsGit } from "../../../../tests/support/git-version.ts";
+import { MIN_HOST_GIT_RELATIVE_WORKTREES_VERSION } from "./git-layout.ts";
 import { flushWarnings, pendingWarningsForTest } from "../warnings.ts";
 import { createRuntimeComponentState, sha256Digest } from "./component-state.ts";
 import {
@@ -307,7 +309,10 @@ test("a submodule declared with an SSH URL is fetched over HTTPS through the gen
   expect(added.stderr).not.toContain("Could not read from remote repository");
 });
 
-test.each([true, false])("generated Git config creates portable worktrees, identity present: %s", (hasIdentity) => {
+// Relative worktree links exist from Git 2.48; older Git cannot create them.
+const withRelativeWorktrees = needsGit(MIN_HOST_GIT_RELATIVE_WORKTREES_VERSION);
+
+for (const hasIdentity of [true, false]) withRelativeWorktrees(`generated Git config creates portable worktrees, identity present: ${hasIdentity}`, () => {
   const projectRoot = path.join(tmp, "project");
   fs.mkdirSync(projectRoot);
   const context = { projectRoot, project: projectInfo(projectRoot), runtimeRoot: "/runtime" } as RuntimeContext;
@@ -447,7 +452,7 @@ test("old host Git on a repository that already uses relative worktree links get
   expect(fs.readFileSync(context.project.paths.gitConfigPath, "utf8")).toContain("useRelativePaths = true");
 });
 
-test.each(["include", "worktree", "conditional-include"])("sandbox Git keeps relative links despite a false %s override", (override) => {
+for (const override of ["include", "worktree", "conditional-include"]) withRelativeWorktrees(`sandbox Git keeps relative links despite a false ${override} override`, () => {
   const projectRoot = path.join(tmp, "project");
   fs.mkdirSync(projectRoot);
   const git = (args: string[], sandbox = false) => childProcess.spawnSync("git", ["-C", projectRoot, ...args], {
