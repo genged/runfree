@@ -124,6 +124,10 @@ opens an issue when kernel.org has a newer Git than the lock's `default`):
    version on all four platforms, verifies kernel.org's signature, runs
    `make test-git` on each build, and publishes a prerelease that never
    becomes "latest". Running the workflow by hand only builds and tests.
+   The tag runs the pull request's own workflow and scripts with permission to
+   publish, so review `.github/workflows/build-git-binaries.yml` and
+   `scripts/git-bins*.ts`, `scripts/build-git.ts` as for a merge before
+   tagging. The lock only accepts releases from `genged/runfree`.
 4. `make git-bins-pin` records each published asset's digest from the
    release's `SHA256SUMS`; commit it to the pull request. Published releases
    are never replaced or deleted: older commits still download from them.

@@ -63,6 +63,15 @@ describe("lock file", () => {
     expect(parse({ ...valid, default: "2.99.0" })).toThrow(/default/);
   });
 
+  test("refuses a release from any repository but genged/runfree, before anything is downloaded", () => {
+    const valid = lock();
+    for (const repository of ["genged-agent/runfree", "attacker/runfree", "genged/runfree-fork", "genged/runfree/../x"]) {
+      const lockPath = path.join(tmp, "git-bins.lock.json");
+      fs.writeFileSync(lockPath, JSON.stringify({ ...valid, release: { ...valid.release, repository } }));
+      expect(() => readGitBinsLock(lockPath)).toThrow(/release\.repository must be genged\/runfree/);
+    }
+  });
+
   test("a run selects the lock default, or a locked version by name, and refuses others", () => {
     expect(selectedGitVersion(lock(), {})).toBe("2.48.0");
     expect(selectedGitVersion(lock(), { RUNFREE_TEST_GIT_VERSION: "2.48.0" })).toBe("2.48.0");
