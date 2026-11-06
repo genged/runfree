@@ -1,0 +1,16 @@
+# Test files that spawn the real git, run on every pinned Git by `make test-git`.
+# Found by running `pnpm test` with a git that always fails first on PATH.
+# One repo-relative path per line; check-test-inventory.ts requires each to be a tracked test file.
+# The live Docker files that spawn git are not listed: they need Docker.
+packages/cli/src/control/git-exclude.test.ts
+packages/cli/src/control/host-service-mutation.test.ts
+packages/cli/src/control/local-host-mutation.test.ts
+packages/cli/src/runtime.test.ts
+packages/cli/src/runtime/git-layout.test.ts
+packages/cli/src/runtime/state.test.ts
+scripts/check-spec-citations.test.ts
+scripts/check-terminology.test.ts
+scripts/emitted-commands.test.ts
+scripts/installable-cli-runtime.test.ts
+scripts/release-eligibility.test.ts
+scripts/release-scripts.test.ts

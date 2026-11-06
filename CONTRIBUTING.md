@@ -65,6 +65,65 @@ which of these you ran and on what.
 Run the narrowest relevant test first, then widen. [`docs/testing.md`](docs/testing.md)
 explains what each layer proves and where its proof stops.
 
+## Pinned Git
+
+The test suite never uses the Git your OS ships. Every Vitest run puts a pinned
+Git first on `PATH` (`tests/support/pinned-git.ts`), so a result means the same
+thing on every machine and in CI:
+
+```
+pnpm test        → whole suite on the default pinned Git (the newest)
+make test-git    → the Git-dependent files on every pinned Git
+```
+
+The first run downloads the binary for your platform (linux-x64, linux-arm64,
+darwin-arm64, or darwin-x64) from this repo's `git-test-bin-<n>` prerelease,
+checks its SHA-256 against `tests/git-matrix/git-bins.lock.json` before
+unpacking it, and caches it in `~/.cache/runfree-dev/git/<version>/` (under
+`XDG_CACHE_HOME` when set). Later runs only check `git --version`. With no
+network and no cache the run fails with the fix; it never falls back to the
+host Git and never skips.
+
+`make test-git` runs `tests/git-matrix/files.txt` once per locked version and
+prints a table: version, result, tests passed, tests not applicable, and the
+first failure. `make test-git GIT=2.43.0` runs one version;
+`GIT_TEST=<file>` runs one file. A test whose setup cannot exist on older Git
+(relative worktree links need 2.48) uses `needsGit("2.48")` from
+`tests/support/git-version.ts` instead of `test`: it runs on the default Git and
+counts as "not applicable" on older lanes. Any other skip fails the lane. Where
+Runfree behaves differently on older Git, prefer one test that checks both
+sides with `gitAtLeast` over a skip.
+
+`make test-git-build GIT=<version>` builds one locked version from its
+kernel.org tarball into the cache, with the flags the release uses
+(`GIT_MAKE_FLAGS` in `scripts/git-bins.ts`). Use it on a platform without a
+published binary or before one is published. It needs `cc`, `make`, and libcurl
+development files (on macOS, the Xcode command-line tools; on Debian and
+Ubuntu, `zlib1g-dev` and `libcurl4-openssl-dev`).
+
+A new test file that spawns `git` belongs in `tests/git-matrix/files.txt`;
+`make test-static` fails if an entry is not a tracked test file.
+
+To add or change a version:
+
+1. Check the version on kernel.org and add it to `versions` in
+   `tests/git-matrix/git-bins.lock.json` with `sourceSha256` from kernel.org's
+   signed `sha256sums.asc` and empty `assets`. Change `default` only when
+   moving to a newer Git.
+2. Run `make test-git-build GIT=<version>` (it checks the digest), then
+   `make test-git GIT=<version>`.
+3. Bump `release.tag` (for example `git-test-bin-2`), push the branch, and
+   have a maintainer push that tag on the branch's commit to this repo
+   (`git push origin <sha>:refs/tags/git-test-bin-2`). The "Build test Git
+   binaries" workflow runs from the tagged commit: it builds every locked
+   version on all four platforms, verifies kernel.org's signature against
+   `tests/git-matrix/git-signing-key.asc`, runs `make test-git` on each
+   build, and publishes a prerelease that never becomes "latest". Running the
+   workflow by hand only builds and tests.
+4. Copy each asset's digest from the release's `SHA256SUMS` into `assets` and
+   open the pull request. Published releases are never replaced; a new build
+   gets a new tag.
+
 ## Things that will come back in review
 
 **Generated assets are not edited by hand.**

@@ -4,6 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
+import { gitAtLeast, needsGit, pinnedGitVersion } from "../../../../tests/support/git-version.ts";
 import { projectInfo } from "../config.ts";
 
 import {
@@ -12,6 +13,8 @@ import {
   formatHostGitStatusLine,
   gitLayoutPlanForShape,
   hostGitRelativeWorktreesLaunchWarning,
+  hostGitRelativeWorktreesRepairRefusal,
+  MIN_HOST_GIT_RELATIVE_WORKTREES_VERSION,
   prepareGitRepositoryLayoutResult,
   probeHostGitRelativeWorktrees,
   refuseGitLayoutUnusableByHostGit,
@@ -82,12 +85,19 @@ test("host capability probing works outside a repository and cleans its disposab
     admin: async () => 0,
   } satisfies RuntimeIO;
   const context: RuntimeContext = { projectRoot, project: projectInfo(projectRoot), runtimeRoot: "/runtime", env: { ...process.env, GIT_DIR: path.join(tmp, "broken-git-dir") } };
-  assertHostGitSupportsRelativeWorktrees(context, io);
+  // Real Git on every pinned version: 2.48+ passes, older Git gets the
+  // versioned refusal, and both leave nothing behind.
+  const supported = gitAtLeast(MIN_HOST_GIT_RELATIVE_WORKTREES_VERSION);
+  if (supported) {
+    assertHostGitSupportsRelativeWorktrees(context, io);
+  } else {
+    expect(() => assertHostGitSupportsRelativeWorktrees(context, io)).toThrow(hostGitRelativeWorktreesRepairRefusal(pinnedGitVersion()));
+  }
   expect(fs.readdirSync(projectRoot)).toEqual([]);
   expect(probeDirs.size).toBe(1);
   for (const probe of probeDirs) expect(fs.existsSync(probe)).toBe(false);
-  // The real host Git reports a display version alongside the capability.
-  expect(probeHostGitRelativeWorktrees(context, io)).toEqual({ supported: true, version: expect.stringMatching(/^\d+\.\d+/), found: true });
+  // The real host Git reports its exact version alongside the capability.
+  expect(probeHostGitRelativeWorktrees(context, io)).toEqual({ supported, version: pinnedGitVersion(), found: true });
 });
 
 describe("host Git without relative worktree links", () => {
@@ -432,7 +442,9 @@ describe("git repository classifier", () => {
     expect(classifyGitRepository(path.dirname(gitCommonDir)).kind).toBe("normal");
   });
 
-  test("host repair recovers container-written links from the main checkout", async () => {
+  // Real Git on every pinned version: 2.48+ repairs the links, older Git is
+  // refused before any Git command runs and the links stay as they were.
+  test("host repair recovers container-written links from the main checkout, or refuses on old Git", async () => {
     const main = path.join(tmp, "main with spaces");
     fs.mkdirSync(main);
     const env = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" };
@@ -463,6 +475,14 @@ describe("git repository classifier", () => {
       runtimeRoot: path.join(tmp, "runtime"),
       env,
     } satisfies RuntimeContext;
+    if (!gitAtLeast(MIN_HOST_GIT_RELATIVE_WORKTREES_VERSION)) {
+      const configBefore = fs.readFileSync(path.join(main, ".git", "config"), "utf8");
+      await expect(repairWorktreeLinks(context, io)).rejects.toThrow(hostGitRelativeWorktreesRepairRefusal(pinnedGitVersion()));
+      expectFatal(main, "gitdir must be relative");
+      expect(fs.readFileSync(path.join(feature, ".git"), "utf8")).toBe("gitdir: /workspace/.git/worktrees/feature\n");
+      expect(fs.readFileSync(path.join(main, ".git", "config"), "utf8")).toBe(configBefore);
+      return;
+    }
     expect(await repairWorktreeLinks(context, io)).toBe(0);
     expect(classifyGitRepository(main).kind).toBe("normal");
     expect(git(["-C", feature, "status", "--porcelain"]).status).toBe(0);
@@ -582,10 +602,7 @@ describe("git repository classifier", () => {
     expectFatal(projectRoot, ".git must not be a symlink");
   });
 
-  test("resolves a real relative linked worktree created by git when supported", () => {
-    const help = childProcess.spawnSync("git", ["worktree", "add", "-h"], { encoding: "utf8" });
-    if (!`${help.stdout}\n${help.stderr}`.includes("--relative-paths")) return;
-
+  needsGit(MIN_HOST_GIT_RELATIVE_WORKTREES_VERSION)("resolves a real relative linked worktree created by git", () => {
     const main = path.join(tmp, "repo");
     const feature = path.join(main, ".worktrees", "feature");
     for (const args of [

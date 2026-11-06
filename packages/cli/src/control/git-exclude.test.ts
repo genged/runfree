@@ -5,6 +5,8 @@ import path from "node:path";
 
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 
+import { needsGit } from "../../../../tests/support/git-version.ts";
+import { MIN_HOST_GIT_RELATIVE_WORKTREES_VERSION } from "../runtime/git-layout.ts";
 import type { RuntimeIO } from "../runtime/types.ts";
 import { ensureCheckoutLocalPolicyExcluded, LOCAL_POLICY_EXCLUDE_PATTERN } from "./git-exclude.ts";
 
@@ -116,7 +118,9 @@ describe("checkout-local Git exclusion", () => {
     });
 
     // A real relative-linked worktree: real Git creates it, so the supported
-    // case also runs the real `git ls-files` and exclude write.
+    // case also runs the real `git ls-files` and exclude write. Only Git 2.48+
+    // can create one.
+    const withRelativeWorktrees = needsGit(MIN_HOST_GIT_RELATIVE_WORKTREES_VERSION);
     function relativeLinkedWorktree(): string {
       initGit();
       const gitEnv = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" };
@@ -128,7 +132,7 @@ describe("checkout-local Git exclusion", () => {
       return path.join(root, ".worktrees", "feature");
     }
 
-    test("a relative-linked worktree on old host Git names the version requirement before running git ls-files", () => {
+    withRelativeWorktrees("a relative-linked worktree on old host Git names the version requirement before running git ls-files", () => {
       const worktree = relativeLinkedWorktree();
       const excludePath = path.join(root, ".git", "info", "exclude");
       const originalExclude = fs.readFileSync(excludePath, "utf8");
@@ -140,7 +144,7 @@ describe("checkout-local Git exclusion", () => {
       expect(fs.readFileSync(excludePath, "utf8")).toBe(originalExclude);
     });
 
-    test("a relative-linked worktree on supported host Git writes the common exclude as before", () => {
+    withRelativeWorktrees("a relative-linked worktree on supported host Git writes the common exclude as before", () => {
       const worktree = relativeLinkedWorktree();
       const { io: newGit, captured } = hostGitIO(true);
       expect(ensureCheckoutLocalPolicyExcluded(worktree, newGit)).toBe("written");
