@@ -207,7 +207,7 @@ describe("release workflow action pinning", () => {
   const workflowFiles = fs.readdirSync(workflowDir).filter((name) => name.endsWith(".yml"));
 
   test("every workflow file is covered by this check", () => {
-    expect(workflowFiles.sort()).toEqual(["build-git-binaries.yml", "release-lane.yml", "release.yml", "test.yml", "verify.yml"]);
+    expect(workflowFiles.sort()).toEqual(["build-git-binaries.yml", "check-git-release.yml", "release-lane.yml", "release.yml", "test.yml", "verify.yml"]);
   });
 
   test.each(workflowFiles)("%s pins every third-party action to a commit SHA", (name) => {

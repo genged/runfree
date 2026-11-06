@@ -371,8 +371,11 @@ export function buildPinnedGit(options: BuildOptions): void {
   }
 }
 
-/** kernel.org signs the uncompressed tar with Junio Hamano's release key, pinned in the repo. */
-function verifySourceSignature(work: string, version: string, tarball: string): void {
+/**
+ * kernel.org signs the uncompressed tar with Junio Hamano's release key,
+ * pinned in the repo. Throws unless the signature checks out.
+ */
+export function verifySourceSignature(work: string, version: string, tarball: string): void {
   const signature = path.join(work, `git-${version}.tar.sign`);
   download(sourceUrl(version).replace(/\.tar\.xz$/u, ".tar.sign"), signature);
   const keyring = path.join(work, "git-signing-key.gpg");

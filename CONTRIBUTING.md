@@ -106,25 +106,27 @@ Ubuntu, `zlib1g-dev` and `libcurl4-openssl-dev`).
 A new test file that spawns `git` belongs in `tests/git-matrix/files.txt`;
 `make test-static` fails if an entry is not a tracked test file.
 
-To add or change a version:
+To add or change a version (the weekly "Check for a new Git release" workflow
+opens an issue when kernel.org has a newer Git than the lock's `default`):
 
-1. Check the version on kernel.org and add it to `versions` in
-   `tests/git-matrix/git-bins.lock.json` with `sourceSha256` from kernel.org's
-   signed `sha256sums.asc` and empty `assets`. Change `default` only when
-   moving to a newer Git.
+1. `make git-bins-add GIT=<version>`, with `REPLACE=<version>` to drop one
+   (moving the newest lane, for example). It downloads the kernel.org tarball,
+   checks its signature against `tests/git-matrix/git-signing-key.asc`, and
+   locks its SHA-256. If the lock's release is already published, it moves
+   `release.tag` to the next `git-test-bin-<n>` and clears every asset digest,
+   because the new release rebuilds every version. `default` becomes the
+   newest locked version. It needs `curl`, `gpg`, `gpgv`, and `xz`.
 2. Run `make test-git-build GIT=<version>` (it checks the digest), then
-   `make test-git GIT=<version>`.
-3. Bump `release.tag` (for example `git-test-bin-2`), push the branch, and
-   have a maintainer push that tag on the branch's commit to this repo
-   (`git push origin <sha>:refs/tags/git-test-bin-2`). The "Build test Git
-   binaries" workflow runs from the tagged commit: it builds every locked
-   version on all four platforms, verifies kernel.org's signature against
-   `tests/git-matrix/git-signing-key.asc`, runs `make test-git` on each
-   build, and publishes a prerelease that never becomes "latest". Running the
-   workflow by hand only builds and tests.
-4. Copy each asset's digest from the release's `SHA256SUMS` into `assets` and
-   open the pull request. Published releases are never replaced; a new build
-   gets a new tag.
+   `make test-git GIT=<version>`, and push the branch.
+3. A maintainer pushes the lock's `release.tag` on the branch's commit to this
+   repo (`git push origin <sha>:refs/tags/git-test-bin-<n>`). The "Build test
+   Git binaries" workflow runs from the tagged commit: it builds every locked
+   version on all four platforms, verifies kernel.org's signature, runs
+   `make test-git` on each build, and publishes a prerelease that never
+   becomes "latest". Running the workflow by hand only builds and tests.
+4. `make git-bins-pin` records each published asset's digest from the
+   release's `SHA256SUMS`; commit it to the pull request. Published releases
+   are never replaced or deleted: older commits still download from them.
 
 ## Things that will come back in review
 
