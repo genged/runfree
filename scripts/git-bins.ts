@@ -26,6 +26,9 @@ export const GIT_BINS_LOCK_PATH = path.join(repoRoot, "tests", "git-matrix", "gi
 export const GIT_SIGNING_KEY_PATH = path.join(repoRoot, "tests", "git-matrix", "git-signing-key.asc");
 export const GIT_MATRIX_FILES_PATH = path.join(repoRoot, "tests", "git-matrix", "files.txt");
 
+/** The only repository whose releases the suite downloads Git from. */
+export const GIT_BINS_REPOSITORY = "genged/runfree";
+
 /** Selects one locked version for a test run instead of the lock file's default. */
 export const GIT_VERSION_ENV = "RUNFREE_TEST_GIT_VERSION";
 
@@ -101,8 +104,10 @@ export function parseGitBinsLock(text: string): GitBinsLock {
   const fail = (why: string): never => {
     throw new Error(`git-bins.lock.json: ${why}`);
   };
-  if (typeof raw?.release?.repository !== "string" || !/^[\w.-]+\/[\w.-]+$/u.test(raw.release.repository)) {
-    fail("release.repository must be owner/name");
+  // Every contributor's `pnpm test` runs these binaries, so they come only from
+  // releases this repository's maintainers published, never from a fork's.
+  if (raw?.release?.repository !== GIT_BINS_REPOSITORY) {
+    fail(`release.repository must be ${GIT_BINS_REPOSITORY}`);
   }
   if (typeof raw.release.tag !== "string" || !/^git-test-bin-\d+$/u.test(raw.release.tag)) {
     fail("release.tag must look like git-test-bin-<n>");
