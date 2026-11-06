@@ -7,23 +7,48 @@
   "versions": {
     "2.39.5": {
       "sourceSha256": "c58da92c378df4a986ca33266897a7397e86c22ee266a284d8c2432c39066b59",
-      "assets": {}
+      "assets": {
+        "linux-x64": "73df431662a141a54b284833cf7196a122c5af93de52455295c59eb933c960ea",
+        "linux-arm64": "0c62febaa53c95facff2ce278eadd23b4573de179cff530852af549ffcb3ea49",
+        "darwin-x64": "7070b5272db9cd34439ccd294646791d6df6c6146acd704bf15882d5ce27dfe5",
+        "darwin-arm64": "b5c47fc8ae1fb876d95bcf7ad1d878bb46edb9d685ee141ab49c1113b8e5dca1"
+      }
     },
     "2.43.0": {
       "sourceSha256": "5446603e73d911781d259e565750dcd277a42836c8e392cac91cf137aa9b76ec",
-      "assets": {}
+      "assets": {
+        "linux-x64": "10ab72173f80955725dde4603af466947d909a6637432bd5459854565db197cb",
+        "linux-arm64": "033ae79c86e4011d881e201255a8ad73d1a7c40f25116e129baf157cced9e4d3",
+        "darwin-x64": "9a4c1727b69c11a661331f8da9280d784acb6ce1968727bc3957f90892bff9cc",
+        "darwin-arm64": "b883c9602fa463b9fdbdc4c32174116fcf8177f18a511fdcb366196b2cc9169a"
+      }
     },
     "2.47.3": {
       "sourceSha256": "9c2eb1250781b3e5bfef098572d07fdf132d67e6c065e4307332ade9819a1501",
-      "assets": {}
+      "assets": {
+        "linux-x64": "028248ec2a796d7c10606e401051ef7267210ed65c9a5f7c45ce5d1e758534ef",
+        "linux-arm64": "ed014189c21010c070d6d1404924b0105fd8ae0b52918253043f16eb13c9377e",
+        "darwin-x64": "e5485709023985d18476dc0d283cca0677f1059a6c4dee2708a440cb29aa666c",
+        "darwin-arm64": "ae1a0f8d08297034998f67ece6c1533248eafe3a16e0d4fa755c404c46bc5096"
+      }
     },
     "2.48.0": {
       "sourceSha256": "4803b809c42696b3b8cce6b0ba6de26febe1197f853daf930a484db93c1ad0d5",
-      "assets": {}
+      "assets": {
+        "linux-x64": "3698960f2e76ba227a864b6ebe905625b968dfb0a96500675ffeddbb242ffb26",
+        "linux-arm64": "627f0f8270e46e7e94e1702ba4a81762739291f404cadef5136c74dfd1b24c2c",
+        "darwin-x64": "567babbc5a681cbea7686142a54e49da55308b0de16d0ae304bdcc2cb4c5a78d",
+        "darwin-arm64": "fb0c5cb2ff482434cf66844f0029f86aa7022d63dc0e125e572f3872ea86f920"
+      }
     },
     "2.56.0": {
       "sourceSha256": "26c56c296b38c0695b26fa95f475f1d01704d2d38e73465ca30b0b2f5dc789d3",
-      "assets": {}
+      "assets": {
+        "linux-x64": "b7e23ce1389ee905084870837f4dbd6b6259d0cae15c4e16387acf96dcc6efb0",
+        "linux-arm64": "5a2a0c44e307f1f6da595d26847443394ba38245aa4d5e91a1e2e5974b19a3ba",
+        "darwin-x64": "9ecd9f6b83cfda18c0a97fff6bfe2d52427e61915da6d06cc9da8f11075fca5e",
+        "darwin-arm64": "8f74dfd7df516ca28b126c344d7b457f76bcb7481291ceb037155fc12febe7dd"
+      }
     }
   }
 }
