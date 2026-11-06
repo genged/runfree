@@ -8,8 +8,10 @@
 // verifies the pinned binary, then runs the files in tests/git-matrix/files.txt
 // with RUNFREE_TEST_GIT_VERSION set; the Vitest globalSetup
 // (tests/support/pinned-git.ts) puts that Git first on PATH. A lane passes only
-// when nothing fails and every skipped test is one that declared a newer Git
-// with `needsGit` (tests/support/git-version.ts): any other skip fails it.
+// when nothing fails, and a test may skip on one Git and run on another only
+// if it declared the newer Git with `needsGit` (tests/support/git-version.ts).
+// Skips that hold on every lane (a Linux-only test on macOS) do not depend on
+// Git and are only counted.
 
 import childProcess from "node:child_process";
 import fs from "node:fs";
@@ -35,6 +37,10 @@ export type LaneSummary = {
   ok: boolean;
   passed: number;
   notApplicable: number;
+  /** Skipped without a needsGit requirement; see judgeSkips. */
+  skipped: string[];
+  /** Every test that ran (passed or failed), by id. */
+  ran: string[];
   firstFailure?: string;
 };
 
@@ -49,40 +55,60 @@ function firstLine(text: string | undefined): string {
 
 /** Judges one lane from Vitest's JSON report. */
 export function summarizeLane(version: string, report: JsonReport | undefined, exitCode: number | null): LaneSummary {
-  if (!report) return { version, ok: false, passed: 0, notApplicable: 0, firstFailure: `vitest exited with ${exitCode} and wrote no report` };
+  if (!report) return failedLane(version, `vitest exited with ${exitCode} and wrote no report`);
   let passed = 0;
   let notApplicable = 0;
+  const skipped: string[] = [];
+  const ran: string[] = [];
   let firstFailure: string | undefined;
   for (const file of report.testResults) {
     const relative = path.relative(repoRoot, file.name);
     if (file.assertionResults.length === 0 && file.message) firstFailure ??= `${relative}: ${firstLine(file.message)}`;
     for (const result of file.assertionResults) {
-      if (result.status === "passed") {
-        passed += 1;
-        continue;
-      }
+      const id = `${relative} > ${result.fullName}`;
       if (result.status === "skipped" || result.status === "pending" || result.status === "todo") {
         const needs = NEEDS_GIT_TITLE.exec(result.title)?.[1];
-        if (needs !== undefined && compareGitVersions(version, needs) < 0) {
-          notApplicable += 1;
-          continue;
-        }
-        firstFailure ??= `${relative} > ${result.fullName}: skipped without a needsGit requirement above ${version}`;
+        if (needs !== undefined && compareGitVersions(version, needs) < 0) notApplicable += 1;
+        else if (needs !== undefined) firstFailure ??= `${id}: skipped on Git ${version}, which meets its requirement`;
+        else skipped.push(id);
         continue;
       }
-      firstFailure ??= `${relative} > ${result.fullName}: ${firstLine(result.failureMessages?.[0])}`;
+      ran.push(id);
+      if (result.status === "passed") passed += 1;
+      else firstFailure ??= `${id}: ${firstLine(result.failureMessages?.[0])}`;
     }
   }
   if (passed === 0) firstFailure ??= "no test passed";
   if (exitCode !== 0) firstFailure ??= `vitest exited with ${exitCode}`;
-  return { version, ok: firstFailure === undefined, passed, notApplicable, firstFailure };
+  return { version, ok: firstFailure === undefined, passed, notApplicable, skipped, ran, firstFailure };
+}
+
+function failedLane(version: string, firstFailure: string): LaneSummary {
+  return { version, ok: false, passed: 0, notApplicable: 0, skipped: [], ran: [], firstFailure };
+}
+
+/**
+ * A test that skips on one Git but runs on another depends on the Git version
+ * without declaring it, so a lane could pass by skipping: that fails the lane.
+ * A skip on every lane (a platform guard) does not depend on Git.
+ */
+export function judgeSkips(lanes: readonly LaneSummary[]): LaneSummary[] {
+  return lanes.map((lane) => {
+    for (const id of lane.skipped) {
+      const other = lanes.find((candidate) => candidate.ran.includes(id));
+      if (other) {
+        return { ...lane, ok: false, firstFailure: lane.firstFailure ?? `${id}: skipped on Git ${lane.version} but ran on Git ${other.version}; declare needsGit` };
+      }
+    }
+    return lane;
+  });
 }
 
 function runLane(version: string, files: readonly string[]): LaneSummary {
   try {
     ensurePinnedGit({ version });
   } catch (error) {
-    return { version, ok: false, passed: 0, notApplicable: 0, firstFailure: (error as Error).message };
+    return failedLane(version, (error as Error).message);
   }
   const reportDir = fs.mkdtempSync(path.join(os.tmpdir(), "runfree-test-git-"));
   const reportPath = path.join(reportDir, "report.json");
@@ -102,11 +128,18 @@ function runLane(version: string, files: readonly string[]): LaneSummary {
 
 export function formatSummary(lanes: readonly LaneSummary[]): string {
   const rows = [
-    ["Git", "result", "passed", "n/a", "first failure"],
-    ...lanes.map((lane) => [lane.version, lane.ok ? "pass" : "FAIL", String(lane.passed), String(lane.notApplicable), lane.firstFailure ?? ""]),
+    ["Git", "result", "passed", "n/a", "skipped", "first failure"],
+    ...lanes.map((lane) => [
+      lane.version,
+      lane.ok ? "pass" : "FAIL",
+      String(lane.passed),
+      String(lane.notApplicable),
+      String(lane.skipped.length),
+      lane.firstFailure ?? "",
+    ]),
   ];
-  const widths = [0, 1, 2, 3].map((column) => Math.max(...rows.map((row) => row[column].length)));
-  return rows.map((row) => row.map((cell, column) => (column < 4 ? cell.padEnd(widths[column]) : cell)).join("  ").trimEnd()).join("\n");
+  const widths = [0, 1, 2, 3, 4].map((column) => Math.max(...rows.map((row) => row[column].length)));
+  return rows.map((row) => row.map((cell, column) => (column < 5 ? cell.padEnd(widths[column]) : cell)).join("  ").trimEnd()).join("\n");
 }
 
 function option(argv: readonly string[], name: string): string | undefined {
@@ -131,7 +164,7 @@ function main(argv: readonly string[]): number {
   }
 
   const versions = onlyVersion ? [onlyVersion] : Object.keys(lock.versions).sort(compareGitVersions);
-  const lanes = versions.map((version) => runLane(version, files));
+  const lanes = judgeSkips(versions.map((version) => runLane(version, files)));
   console.log(`\n${formatSummary(lanes)}`);
   return lanes.every((lane) => lane.ok) ? 0 : 1;
 }

@@ -6,9 +6,10 @@
 //
 // `needsGit("2.48")` replaces `test` for a test whose setup cannot exist on an
 // older Git. It skips only in a `make test-git` lane below that version, and
-// its title carries the requirement, so the lane runner can tell a declared
-// "not applicable" from any other skip (which fails the lane). The default
-// version always runs everything: a requirement above it throws.
+// its title carries the requirement, so the lane runner counts it as "not
+// applicable"; an undeclared skip on one Git that runs on another fails the
+// lane. The default version always runs everything: a requirement above it
+// throws.
 
 import { test } from "vitest";
 
