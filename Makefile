@@ -1,6 +1,6 @@
 SHELL := /bin/bash
 
-.PHONY: help test test-all test-release test-static test-unit test-agent test-proxy test-security test-property-soak test-templates test-cli-e2e test-cli-e2e-live test-runtime test-runtime-core test-runtime-extended test-runtime-smoke test-runtime-live test-runtime-live-topology test-runtime-live-managed-launch test-runtime-live-egress test-runtime-live-connect-guard test-runtime-live-request-shape test-runtime-live-audit test-runtime-live-allowlist test-runtime-live-policy-mutation test-runtime-live-mcp-enable test-runtime-live-helper-reclaim test-runtime-live-host-service test-live-session-admission-docker-desktop test-live-session-admission-negative-docker-desktop test-live-session-admission-attached-docker-desktop test-live-session-renewal-docker-desktop test-live-session-independence-docker-desktop test-live-session-admission-crash-docker-desktop test-live-session-admission-drift-docker-desktop test-live-session-entry-gate-docker-desktop reclaim-runtime-sandbox reclaim-runtime-sandbox-apply test-watch test-git test-git-build
+.PHONY: help test test-all test-release test-static test-unit test-agent test-proxy test-security test-property-soak test-templates test-cli-e2e test-cli-e2e-live test-runtime test-runtime-core test-runtime-extended test-runtime-smoke test-runtime-live test-runtime-live-topology test-runtime-live-managed-launch test-runtime-live-egress test-runtime-live-connect-guard test-runtime-live-request-shape test-runtime-live-audit test-runtime-live-allowlist test-runtime-live-policy-mutation test-runtime-live-mcp-enable test-runtime-live-helper-reclaim test-runtime-live-host-service test-live-session-admission-docker-desktop test-live-session-admission-negative-docker-desktop test-live-session-admission-attached-docker-desktop test-live-session-renewal-docker-desktop test-live-session-independence-docker-desktop test-live-session-admission-crash-docker-desktop test-live-session-admission-drift-docker-desktop test-live-session-entry-gate-docker-desktop reclaim-runtime-sandbox reclaim-runtime-sandbox-apply test-watch test-git test-git-build git-bins-add git-bins-pin
 
 help:
 	@printf '%s\n' \
@@ -37,7 +37,9 @@ help:
 		'  make reclaim-runtime-sandbox-apply  Remove what reclaim-runtime-sandbox lists' \
 		'  make test-watch           Vitest watch mode' \
 		'  make test-git             Git-dependent tests on every pinned Git (GIT=<version> one lane, GIT_TEST=<file> one file)' \
-		'  make test-git-build GIT=<version>  Build one pinned Git from source into the cache (needs cc and libcurl dev files)'
+		'  make test-git-build GIT=<version>  Build one pinned Git from source into the cache (needs cc and libcurl dev files)' \
+		'  make git-bins-add GIT=<version> [REPLACE=<version>]  Lock a new pinned Git from its signed kernel.org tarball' \
+		'  make git-bins-pin         Record the digests of the published test Git binaries in the lock file'
 
 test: test-static test-unit
 
@@ -332,3 +334,11 @@ test-git:
 test-git-build:
 	@test -n "$(GIT)" || { echo 'usage: make test-git-build GIT=<version>' >&2; exit 2; }
 	pnpm exec tsx scripts/build-git.ts $(GIT) --install
+
+# Lock-file upkeep for the pinned Git versions; see CONTRIBUTING.md "Pinned Git".
+git-bins-add:
+	@test -n "$(GIT)" || { echo 'usage: make git-bins-add GIT=<version> [REPLACE=<version>]' >&2; exit 2; }
+	pnpm exec tsx scripts/git-bins-update.ts add $(GIT) $(if $(REPLACE),--replace $(REPLACE))
+
+git-bins-pin:
+	pnpm exec tsx scripts/git-bins-update.ts pin

@@ -136,4 +136,23 @@ describe("pinned Git", () => {
       expect(publishJob).toContain("--verify-tag");
     });
   });
+
+  describe("the new-Git check", () => {
+    const workflow = readRepoFile(".github/workflows/check-git-release.yml");
+
+    test("runs weekly, only in this repository, and can open issues but not write code", () => {
+      expect(workflow).toMatch(/schedule:\n\s+- cron: /);
+      expect(workflow).toContain("if: github.repository == 'genged/runfree'");
+      expect(workflow).toMatch(/^permissions:\n\s+contents: read/m);
+      expect(workflow).toContain("issues: write");
+      expect(workflow).not.toContain("contents: write");
+      expect(workflow).not.toContain("secrets.");
+    });
+
+    test("opens an issue only for a newer Git, once per version", () => {
+      expect(workflow).toContain("scripts/git-bins-update.ts latest");
+      expect(workflow).toContain("if: steps.versions.outputs.newer == 'yes'");
+      expect(workflow).toContain("--state all");
+    });
+  });
 });

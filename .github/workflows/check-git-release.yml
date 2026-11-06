@@ -1,0 +1,77 @@
+name: Check for a new Git release
+
+# Opens a to-do issue when kernel.org has a newer stable Git than the newest
+# pinned test Git (tests/git-matrix/git-bins.lock.json "default"). It only
+# reads; adding the version stays a reviewed pull request and publishing stays
+# a maintainer's tag push. See CONTRIBUTING.md "Pinned Git".
+
+on:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  RUNFREE_PNPM_VERSION: 10.34.8
+
+jobs:
+  check:
+    name: Check kernel.org
+    # Forks would open issues on themselves.
+    if: github.repository == 'genged/runfree'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          version: ${{ env.RUNFREE_PNPM_VERSION }}
+          run_install: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Compare with the lock file
+        id: versions
+        run: pnpm exec tsx scripts/git-bins-update.ts latest | tee -a "${GITHUB_OUTPUT}"
+
+      # One issue per Git version, open or closed: closing it means "skip this one".
+      - name: Open a to-do issue
+        if: steps.versions.outputs.newer == 'yes'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NEWEST: ${{ steps.versions.outputs.newest }}
+          CURRENT: ${{ steps.versions.outputs.current }}
+        run: |
+          title="Pinned test Git: Git ${NEWEST} is out"
+          existing="$(gh issue list --repo "${GITHUB_REPOSITORY}" --state all --search "\"${title}\" in:title" --json title --jq "[.[] | select(.title == \"${title}\")] | length")"
+          if [ "${existing}" != 0 ]; then
+            echo "an issue for Git ${NEWEST} already exists"
+            exit 0
+          fi
+          gh issue create --repo "${GITHUB_REPOSITORY}" --title "${title}" --body "$(cat <<EOF
+          kernel.org has Git ${NEWEST}; the newest pinned test Git is ${CURRENT}.
+
+          To move the test suite to it (CONTRIBUTING.md "Pinned Git"), from the repo root:
+
+          1. \`make git-bins-add GIT=${NEWEST} REPLACE=${CURRENT}\` (drop \`REPLACE\` to keep ${CURRENT} as a lane)
+          2. \`make test-git-build GIT=${NEWEST} && make test-git GIT=${NEWEST}\`, then open a pull request
+          3. A maintainer pushes the lock file's \`release.tag\` on the pull request's commit
+          4. When the "Build test Git binaries" run publishes, \`make git-bins-pin\` and push
+
+          Close this issue to skip this version.
+          EOF
+          )"
