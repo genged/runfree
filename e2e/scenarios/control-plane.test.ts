@@ -135,6 +135,40 @@ describe("host control workflows through the packaged CLI", () => {
       // authority" scenario below installs the same stub inventory into the
       // same log and asserts "info" and "ps" come back out of it.
       expect(fs.readFileSync(world.dockerLog, "utf8")).toBe("");
+
+      // Disabling an id that was never enabled refuses before any write to the
+      // project desired policy or the host credential sources.
+      const ownedSelections = [
+        { name: "project", path: world.projectRoot },
+        { name: "host sources", path: sourcePath },
+      ] as const;
+      const beforeMissing = snapshotOwnedState(ownedSelections);
+      const missing = await world.runfree(["service", "disable", "missing-service", "--no-reload"]);
+      assertExit(missing, 1);
+      assertOutputContains(missing, "missing-service service is not enabled in the selected desired policy layer");
+      assertOwnedStateUnchanged(beforeMissing, snapshotOwnedState(ownedSelections));
+
+      const disabled = await world.runfree(["service", "disable", "github", "--no-reload"]);
+      assertExit(disabled, 0);
+      expect(disabled.stdout).toContain("service github: disabled in project desired policy");
+      expect(disabled.stdout).toMatch(/^project digest: /mu);
+      expect(disabled.stdout).toContain("host-owned credential sources: unchanged");
+      expect(disabled.stdout).toContain("effective policy: unchanged (--no-reload)");
+      const disabledPolicy = readJson<DesiredPolicy>(policyPath);
+      expect(disabledPolicy.services?.github).toBeUndefined();
+      expect(disabledPolicy.services?.node?.resolved.hosts).toEqual(expect.arrayContaining([
+        "registry.npmjs.org",
+        "registry.yarnpkg.com",
+      ]));
+      expect(readJson<SourceConfig>(sourcePath)["github-cli"]?.type).toBe("command");
+      expect(fs.readFileSync(world.dockerLog, "utf8")).toBe("");
+
+      const beforeSecondDisable = snapshotOwnedState(ownedSelections);
+      const secondDisable = await world.runfree(["service", "disable", "github", "--no-reload"]);
+      assertExit(secondDisable, 1);
+      assertOutputContains(secondDisable, "github service is not enabled in the selected desired policy layer");
+      assertOwnedStateUnchanged(beforeSecondDisable, snapshotOwnedState(ownedSelections));
+      expect(fs.readFileSync(world.dockerLog, "utf8")).toBe("");
     });
   });
 
