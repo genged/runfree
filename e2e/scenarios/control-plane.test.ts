@@ -4,6 +4,7 @@ import path from "node:path";
 import { describe, expect } from "vitest";
 
 import { assertExit, assertOutputContains, assertOutputExcludes, readJson } from "../support/assertions.ts";
+import { describeCommandResult, type CommandResult } from "../support/command.ts";
 import { scenario } from "../support/evidence.ts";
 import { assertOwnedStateUnchanged, snapshotOwnedState } from "../support/snapshot.ts";
 import { withWorld } from "../support/world.ts";
@@ -36,6 +37,16 @@ const modeledQuickstartEvidence = {
   ],
   proofLimits: "The local credential stub proves host-side CLI orchestration, source isolation, and that the --no-reload desired-policy path issues no Docker command at all; it proves nothing about real credential-provider compatibility, nor about the reload path that does reach Docker.",
 } as const;
+
+function stdoutLines(result: CommandResult): string[] {
+  return result.stdout.split("\n").map((line) => line.trimEnd());
+}
+
+function assertNonZeroExit(result: CommandResult): void {
+  if (result.outcome.kind !== "exit" || result.outcome.exitCode === 0) {
+    throw new Error(`expected a non-zero exit\n${describeCommandResult(result)}`);
+  }
+}
 
 const packagedCleanup = "Remove the disposable project, home, XDG roots, and modeled Docker log after the test.";
 
@@ -88,6 +99,28 @@ describe("host control workflows through the packaged CLI", () => {
       assertExit(sourceSecondRun, 0);
       assertOwnedStateUnchanged(sourceSnapshot, snapshotOwnedState([{ name: "host sources", path: sourcePath }]));
 
+      const listed = await world.runfree(["credential", "source", "list"]);
+      assertExit(listed, 0);
+      expect(stdoutLines(listed)).toContain("github-cli");
+      assertOutputExcludes(listed, "SOURCE_STDOUT_MUST_NOT_BE_STORED");
+
+      const shownUnused = await world.runfree(["credential", "source", "show", "github-cli"]);
+      assertExit(shownUnused, 0);
+      const shownUnusedLines = stdoutLines(shownUnused);
+      expect(shownUnusedLines).toEqual(expect.arrayContaining([
+        "github-cli: configured",
+        "type: command",
+        "used by: none",
+        "agent exposure: no",
+        "executes during: credential sync",
+      ]));
+      expect(shownUnusedLines.find((line) => line.startsWith("command:"))).toContain("e2e-credential-source");
+      assertOutputExcludes(shownUnused, "SOURCE_STDOUT_MUST_NOT_BE_STORED");
+
+      const shownMissing = await world.runfree(["credential", "source", "show", "missing-source"]);
+      assertNonZeroExit(shownMissing);
+      assertOutputContains(shownMissing, "unknown source: missing-source");
+
       const nodeEnabled = await world.runfree(["service", "enable", "node", "--no-reload"]);
       assertExit(nodeEnabled, 0);
       assertOutputContains(nodeEnabled, "effective policy: unchanged (--no-reload)");
@@ -116,6 +149,23 @@ describe("host control workflows through the packaged CLI", () => {
       const policyBytes = fs.readFileSync(policyPath, "utf8");
       expect(policyBytes).not.toContain("gh auth token");
       expect(policyBytes).not.toContain("test-token");
+
+      const shownInUse = await world.runfree(["credential", "source", "show", "github-cli"]);
+      assertExit(shownInUse, 0);
+      const usedBy = stdoutLines(shownInUse).find((line) => line.startsWith("used by:"));
+      expect(usedBy).toBeDefined();
+      expect(usedBy).not.toBe("used by: none");
+      expect(usedBy?.slice("used by:".length).split(",").map((user) => user.trim())).toContain("github");
+      assertOutputExcludes(shownInUse, "SOURCE_STDOUT_MUST_NOT_BE_STORED");
+
+      const beforeRemove = snapshotOwnedState([{ name: "host sources", path: sourcePath }]);
+      const removeRefused = await world.runfree(["credential", "source", "remove", "github-cli"]);
+      assertNonZeroExit(removeRefused);
+      assertOutputContains(removeRefused, "github-cli is used by credential bindings: github");
+      assertOwnedStateUnchanged(beforeRemove, snapshotOwnedState([{ name: "host sources", path: sourcePath }]));
+      const listedAfterRefusal = await world.runfree(["credential", "source", "list"]);
+      assertExit(listedAfterRefusal, 0);
+      expect(stdoutLines(listedAfterRefusal)).toContain("github-cli");
 
       const converged = snapshotOwnedState([
         { name: "project", path: world.projectRoot },
