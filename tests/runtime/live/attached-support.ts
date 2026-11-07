@@ -86,7 +86,7 @@ export const SESSION_TEARDOWN_TIMEOUT_MS = 60_000;
  * the shortened lease it runs under, so a heartbeat that the peer's lock really
  * did starve would lapse inside the window rather than after it.
  */
-export const PEER_LOCK_HEARTBEAT_WINDOW_MS = 35_000;
+export const PEER_LOCK_HEARTBEAT_WINDOW_MS = 18_000;
 /** Bound for a forced policy reload to republish the eligibility file. */
 export const ELIGIBILITY_REPUBLISH_TIMEOUT_MS = 30_000;
 /** The plan's own bound for sessions to be served again after a proxy restart. */
@@ -549,10 +549,10 @@ export function configureAttachedProject(fixture: LiveFixture): void {
  * expiry in seconds. The driver clamps this env to `(0, MAX]`, so it only ever
  * shortens the lease. It must stay well above the time a launch spends reaching
  * attached — the lease is not renewed before then — while being small enough
- * that a blocked renewal lapses inside the test's window. The 30s lease leaves
+ * that a blocked renewal lapses inside the test's window. The 15s lease leaves
  * admission slack; its margin on a loaded Docker host needs live validation.
  */
-export const PEER_LOCK_LEASE_MS = 30_000;
+export const PEER_LOCK_LEASE_MS = 15_000;
 export const PEER_LOCK_LEASE_ENV = { RUNFREE_SESSION_INTERNAL_LEASE_DURATION_MS: String(PEER_LOCK_LEASE_MS) } as const;
 /** Bound for A's own renewal to restore authority after the lock is released. */
 export const RENEWAL_RESTORE_TIMEOUT_MS = 90_000;
