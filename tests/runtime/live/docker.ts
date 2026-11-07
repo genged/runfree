@@ -42,14 +42,24 @@ export function dockerOrThrow(label: string, args: readonly string[]): string {
   return result.stdout.trim();
 }
 
+// The name is a pure function of a fixture's project root and environment, and
+// a `LiveFixture` is frozen for its lifetime, so the CLI is asked once per
+// fixture object. Each ask is a full CLI start; uncached, it ran hundreds of
+// times per live run. Only successful answers are kept, so a failure is asked
+// again by the next call.
+const composeProjectNames = new WeakMap<LiveFixture, string>();
+
 /** Asked of the product: a test that recomputes project identity drifts silently. */
 export function composeProjectName(fixture: LiveFixture): string {
+  const cached = composeProjectNames.get(fixture);
+  if (cached !== undefined) return cached;
   const result = fixture.runfree(["project-id", "--compose-name"]);
   if (result.status !== 0) {
     throw new Error(`could not read the Compose project name: ${describeOutput(result.output)}`);
   }
   const name = result.stdout.trim();
   if (!name) throw new Error("the Compose project name was empty");
+  composeProjectNames.set(fixture, name);
   return name;
 }
 
