@@ -36,10 +36,9 @@ export type BuiltinAgentDescriptor = {
   id: string;
   label: string;
   /**
-   * The flag that carries a host-chosen conversation id into a fresh launch
-   * (spec `local/specs/2026-10-04-same-terminal-session-resume-design.md`
-   * section 2): the host mints the id once per public launch and this flag
-   * carries it as its own argv element. Fresh launch only; never in resume
+   * The flag that carries a host-chosen conversation id into a fresh launch:
+   * the host mints the id once per public launch and this flag carries it as
+   * its own argv element. Fresh launch only; never in resume
    * or picker argv.
    */
   launchConversationIdFlag?: "--session-id";

@@ -92,8 +92,7 @@ export function createBuiltinSessionShellLaunchTarget(): SessionLaunchTarget {
  * split or interpreted for the per-session path.
  *
  * `launchConversationId`, when given, is a host-chosen conversation id for a
- * fresh launch only (spec `local/specs/2026-10-04-same-terminal-session-
- * resume-design.md` section 2): the host mints it once per public launch and
+ * fresh launch only: the host mints it once per public launch and
  * it must never reach resume or picker argv. Only a descriptor that declares
  * `launchConversationIdFlag` accepts one.
  */

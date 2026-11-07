@@ -137,8 +137,7 @@ export type CreateSessionMetadataOptions = {
   /** Exact conversation a resume launch targets; lineage for re-crash evidence. */
   resumeConversationId?: string;
   /**
-   * Host-chosen conversation id minted for a fresh launch (spec `local/specs/
-   * 2026-10-04-same-terminal-session-resume-design.md` section 2). Written so
+   * Host-chosen conversation id minted for a fresh launch. Written so
    * a host crash during this session's first process still leaves evidence
    * keyed to the exact conversation this terminal started.
    */

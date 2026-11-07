@@ -1,11 +1,9 @@
 // host-service-tunnel.ts — opaque splices from an admitted session to an
 // approved host service behind the pinned Docker Desktop gateway.
 //
-// See local/specs/2026-10-03-host-services-design.md ("Data path",
-// "Revocation", "Limits"). The guard in server.ts has already classified the
-// CONNECT: the authority is exactly `<name>.runfree.internal:<port>` and the
-// effective policy approves that pair. This module owns everything after that
-// decision:
+// The guard in server.ts has already classified the CONNECT: the authority is
+// exactly `<name>.runfree.internal:<port>` and the effective policy approves
+// that pair. This module owns everything after that decision:
 //
 // - The gateway address comes only from the root-written gateway status file
 //   (`readGateway`), read on every admit, and is used only when the file names

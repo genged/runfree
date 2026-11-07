@@ -61,8 +61,8 @@ export type PolicyJson = {
   // desired-policy default, then materializes it here so the proxy reads one
   // generation-hashed policy and never reads project config or desired input.
   writeApproval?: WriteAction;
-  // Approved agent access to a service on the Docker Desktop host's loopback
-  // (local/specs/2026-10-03-host-services-design.md). Present only when
+  // Approved agent access to a service on the Docker Desktop host's loopback.
+  // Present only when
   // non-empty, so a policy with no host services keeps its pre-feature raw
   // shape and generation.
   hostServices?: HostServicesJson;

@@ -1,5 +1,5 @@
 // Host services: agent access to an approved service on the Docker Desktop
-// host's loopback. See local/specs/2026-10-03-host-services-design.md.
+// host's loopback.
 //
 // This module holds the pure, side-effect-free policy contract: the reserved
 // `runfree.internal` hostname suffix, the desired/effective policy shape for

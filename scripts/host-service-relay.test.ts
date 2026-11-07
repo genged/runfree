@@ -1,6 +1,4 @@
-// Unit proof for the agent image's host-service relay (host services plan
-// Task 6; see local/specs/2026-10-03-host-services-design.md, "The
-// agent-side relay").
+// Unit proof for the agent image's host-service relay.
 //
 // The relay is compiled here the same way `scripts/build-runtime.ts` and
 // `scripts/session-entry.test.ts` do: `tsc -b packages/agent-runtime`, so the

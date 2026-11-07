@@ -25,8 +25,7 @@
 # process shape is unchanged. It is killed alongside the probe on a stop
 # signal and on the entry's own activation-timeout exit (111); only the
 # final `exec` below leaves it running, deliberately, for the rest of the
-# session. See local/specs/2026-10-03-host-services-design.md, "The
-# agent-side relay".
+# session, to relay approved host services.
 #
 # This is cooperation, not enforcement. A project image may replace it; a
 # replaced entry that sends early receives the same 403s the proxy answers

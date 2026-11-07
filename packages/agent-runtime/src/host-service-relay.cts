@@ -13,22 +13,20 @@
 // that compiles to CommonJS (see `session-ready-probe.cts`, which this file
 // is modeled on).
 //
-// See local/specs/2026-10-03-host-services-design.md, "The agent-side relay"
-// (OQ1, HS6, SR12). `fb-idb` and similar clients ignore proxy environment
-// variables, so the sandbox needs an approved host service to look local: one
-// `net.Server` per service, bound to `127.0.0.1:<port>` only, on the same
-// port number the host uses (never `0.0.0.0` or `::` — SR20; binding wider
-// would serve peer sessions reachable on `agent_internal`, and each session
-// is its own container with its own network namespace, so loopback is
-// per-session). Each inbound connection opens
-// `CONNECT <name>.runfree.internal:<port> HTTP/1.1` to the request proxy at
-// `PROXY_IP:PROXY_PORT` (the fixed proxy port, like `session-ready-probe`'s)
-// and, once the proxy answers `200`, pipes bytes in both directions. Any
-// other status, or a response that never completes, closes both sockets
-// before any byte crosses. The relay carries no credential or authority of
-// its own (SR12): clients inside the sandbox point at `127.0.0.1:<port>`,
-// never at the `.runfree.internal` name, and the proxy alone decides whether
-// the pair is approved.
+// `fb-idb` and similar clients ignore proxy environment variables, so the
+// sandbox needs an approved host service to look local: one `net.Server` per
+// service, bound to `127.0.0.1:<port>` only, on the same port number the host
+// uses (never `0.0.0.0` or `::` — SR20; binding wider would serve peer sessions
+// reachable on `agent_internal`, and each session is its own container with its
+// own network namespace, so loopback is per-session). Each inbound connection
+// opens `CONNECT <name>.runfree.internal:<port> HTTP/1.1` to the request proxy
+// at `PROXY_IP:PROXY_PORT` (the fixed proxy port, like `session-ready-probe`'s)
+// and, once the proxy answers `200`, pipes bytes in both directions. Any other
+// status, or a response that never completes, closes both sockets before any
+// byte crosses. The relay carries no credential or authority of its own (SR12):
+// clients inside the sandbox point at `127.0.0.1:<port>`, never at the
+// `.runfree.internal` name, and the proxy alone decides whether the pair is
+// approved.
 //
 // `RUNFREE_HOST_SERVICES` is the host-owned env list the session template
 // renders (`name:port` pairs, sorted by name — `formatHostServicesEnv`). This

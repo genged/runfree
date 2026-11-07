@@ -368,8 +368,7 @@ export type SessionAdmissionLaunchOptions = Readonly<{
    */
   resume?: SessionAdmissionResumeRequest;
   /**
-   * Host-chosen conversation id for a fresh launch only (spec `local/specs/
-   * 2026-10-04-same-terminal-session-resume-design.md` section 2). The public
+   * Host-chosen conversation id for a fresh launch only. The public
    * launch frame mints this once with `crypto.randomUUID()`, outside its own
    * retry loop, so an admission retry after a re-prepared runtime still
    * resumes the same conversation. Never present together with `resume`: the

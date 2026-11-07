@@ -79,9 +79,6 @@ test-static:
 	test -n "$$scripts" || { echo 'test-static: found no tracked standalone Node scripts; the parse gate would pass vacuously' >&2; exit 1; }; \
 	for script in $$scripts; do echo "parse: $$script"; node --check "$$script" || exit 1; done
 	pnpm exec tsx scripts/check-test-inventory.ts
-	@# Spec-citation drift gate (evolution-strategy A4). No-ops on public
-	@# checkouts without local/specs; never passes vacuously when specs exist.
-	pnpm exec tsx scripts/check-spec-citations.ts
 	@# Generation-family terminology gate (output contract D8): user-visible
 	@# strings and public docs name the family, never a bare "generation".
 	pnpm exec tsx scripts/check-terminology.ts

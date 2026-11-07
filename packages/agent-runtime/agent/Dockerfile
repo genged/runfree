@@ -142,8 +142,7 @@ COPY codex-runfree.sh /usr/local/libexec/runfree/codex
 # enforcement; see docs/architecture.md "Readiness Entry". When
 # `RUNFREE_HOST_SERVICES` is set, the entry also starts host-service-relay in
 # the background before the readiness loop; it survives the exec above to
-# relay approved host services for the whole session (local/specs/
-# 2026-10-03-host-services-design.md, "The agent-side relay").
+# relay approved host services for the whole session.
 COPY session-entry.sh /usr/local/libexec/runfree/session-entry
 COPY session-ready-probe.cjs /usr/local/libexec/runfree/session-ready-probe
 COPY host-service-relay.cjs /usr/local/libexec/runfree/host-service-relay

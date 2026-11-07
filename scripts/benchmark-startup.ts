@@ -1,7 +1,5 @@
 #!/usr/bin/env node
-// Startup measurement harness (T01 of
-// local/plans/2026-10-10-startup-top-ten-implementation.md: "Establish
-// measurements and inherited-gate ledger"). Later tasks (T02-T15) use this
+// Startup measurement harness. Later tasks (T02-T15) use this
 // harness's sample shape and summarizer to measure before/after each startup
 // change; this task only builds the harness. No measurement was run to write
 // this file, and this environment has no Docker daemon to run one against.
@@ -51,11 +49,11 @@
 //
 //   pnpm exec tsx scripts/benchmark-startup.ts run \
 //     --scenario-id warm-claude --tree "$(git rev-parse HEAD)" --run-id 1 \
-//     --out local/evidence/raw/2026-xx-xx-warm-claude.jsonl \
+//     --out /tmp/warm-claude.jsonl \
 //     -- scripts/dev-runfree.sh --workspace /path/to/scratch/project claude
 //
 //   pnpm exec tsx scripts/benchmark-startup.ts summarize \
-//     local/evidence/raw/2026-xx-xx-warm-claude.jsonl
+//     /tmp/warm-claude.jsonl
 //
 // `run` appends one JSON Line per invocation to `--out` (creating it if
 // needed) and never truncates or rewrites an existing file, so interleaved

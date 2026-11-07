@@ -73,8 +73,7 @@ describe("benchmark-startup harness", () => {
   });
 
   test("does not sum nested spans", () => {
-    // `startup-total` nests `token-sync` in the real system (see
-    // local/plans/2026-09-25-sub-second-launch-implementation.md). The
+    // `startup-total` nests `token-sync` in the real system. The
     // summarizer must report each self-reported phase under its own name,
     // never derive a combined total by adding them.
     const samples: StartupSample[] = [
