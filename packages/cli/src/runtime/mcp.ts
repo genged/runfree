@@ -1450,6 +1450,14 @@ type McpNameRefusal = { status: "unsupported" | "conflict"; reason: string };
 function mcpNameRefusals(servers: NativeMcpServer[]): Map<NativeMcpServer, McpNameRefusal> {
   const refusals = new Map<NativeMcpServer, McpNameRefusal>();
   const groups = new Map<string, NativeMcpServer[]>();
+  // One exact name in both of Claude's imported scopes is one server to
+  // Claude: its local (per-project) entry overrides the user entry. Both would
+  // otherwise import, and the two identical OAuth provider IDs would make the
+  // generated policy invalid at every launch. The shadowed user entry is
+  // skipped here, with the reason the inventory shows.
+  const localByName = new Set(
+    servers.filter((server) => server.scope === "local").map((server) => `${server.agent}\0${server.name}`),
+  );
   for (const server of servers) {
     const reason = mcpServerNameRefusal(server.agent, server.name);
     if (reason) {
@@ -1457,6 +1465,10 @@ function mcpNameRefusals(servers: NativeMcpServer[]): Map<NativeMcpServer, McpNa
       continue;
     }
     if (isDesktopBuiltIn(server)) continue;
+    if (server.scope === "user" && localByName.has(`${server.agent}\0${server.name}`)) {
+      refusals.set(server, { status: "unsupported", reason: "shadowed by the local MCP server of the same name" });
+      continue;
+    }
     const ids = [
       `oauth\0${mcpOAuthProviderId(server.agent, server.name)}`,
       `operation\0${mcpOperationServerId({ agent: server.agent, name: server.name, source: server.scope })}`,
