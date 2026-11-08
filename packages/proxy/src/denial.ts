@@ -411,7 +411,7 @@ function shapeDenialLines(host: string, reason: DenialReason, details: ShapeDeni
       "The person operating Runfree can decide the pending approvals with",
       "`runfree approvals`, then retry the request.",
     );
-  } else if (reason === "write-approval-session-denied") {
+  } else if (reason === "write-approval-session-denied" || reason === "write-approval-denied") {
     // Deliberate operator decision: no remedy line.
   } else if (reason === "write-approval-headless-denied") {
     // No approver can see this request, so no approval remedy applies.
