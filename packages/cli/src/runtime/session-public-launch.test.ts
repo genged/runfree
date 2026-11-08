@@ -1,3 +1,4 @@
+import { EventEmitter } from "node:events";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -111,9 +112,10 @@ describe("public launch through session admission", () => {
     expect(status).toBe(0);
     // Claude declares the host-chosen conversation id flag, so a fresh public
     // launch mints one (spec §2).
+    // Every interactive launch carries the host-signal cancellation ports.
     expect(mocks.launchBuiltin).toHaveBeenCalledWith(
       "claude",
-      { launchConversationId: expect.stringMatching(UUID_PATTERN) },
+      { launchConversationId: expect.stringMatching(UUID_PATTERN), cancellation: { signal: expect.any(AbortSignal), escalate: expect.any(AbortSignal) } },
     );
     const driverInput = mocks.createDriver.mock.calls[0]?.[0] as {
       sessionLockManager?: { lock: unknown };
@@ -143,7 +145,7 @@ describe("public launch through session admission", () => {
     expect(status).toBe(0);
     expect(mocks.launchBuiltin).toHaveBeenCalledWith(
       "claude",
-      { launchConversationId: expect.stringMatching(UUID_PATTERN), headless },
+      { launchConversationId: expect.stringMatching(UUID_PATTERN), headless, cancellation: { signal: expect.any(AbortSignal), escalate: expect.any(AbortSignal) } },
     );
   });
 
@@ -471,6 +473,48 @@ describe("public launch through session admission", () => {
     });
   });
 
+  test("a host signal during an interactive launch cancels it through the driver and exits 128+signal", async () => {
+    // Before: the CLI's one-shot handlers exited at once, with the attached
+    // docker child left in raw mode and the session file left to lapse.
+    const signals = new EventEmitter();
+    const prepared = preparedRuntime();
+    mocks.launchBuiltin.mockImplementationOnce(async (_agent: unknown, options: { cancellation?: { signal: AbortSignal; escalate: AbortSignal } }) => {
+      expect(options.cancellation).toBeDefined();
+      expect(options.cancellation?.signal.aborted).toBe(false);
+      signals.emit("SIGTERM");
+      expect(options.cancellation?.signal.aborted).toBe(true);
+      expect(options.cancellation?.escalate.aborted).toBe(false);
+      // A second signal shortens the stop grace to none.
+      signals.emit("SIGTERM");
+      expect(options.cancellation?.escalate.aborted).toBe(true);
+      return { status: null, signal: "SIGTERM", cancelled: true };
+    });
+
+    const status = await launchConfiguredAgentThroughAdmission({ preparedRuntime: prepared, io, agentName: "claude", signals: signals as unknown as NodeJS.Process });
+
+    expect(status).toBe(143);
+    expect(signals.listenerCount("SIGTERM")).toBe(0);
+    expect(signals.listenerCount("SIGHUP")).toBe(0);
+    const reacquired = tryAcquireProjectLifecycleLock(runtimeContext());
+    expect(reacquired).toBeDefined();
+    reacquired?.release();
+  });
+
+  test("a launch cancelled by a signal before it attached is a signal exit, and the shell gets the same ports", async () => {
+    const signals = new EventEmitter();
+    mocks.launchBuiltin.mockImplementationOnce(async () => {
+      signals.emit("SIGHUP");
+      throw new SessionLaunchCancelledError("allocation");
+    });
+    expect(await launchConfiguredAgentThroughAdmission({ preparedRuntime: preparedRuntime(), io, agentName: "codex", signals: signals as unknown as NodeJS.Process })).toBe(129);
+
+    mocks.launchShell.mockImplementationOnce(async (options: { cancellation?: { signal: AbortSignal } }) => {
+      expect(options.cancellation?.signal).toBeDefined();
+      return { status: 0, signal: null };
+    });
+    expect(await launchShellThroughAdmission({ preparedRuntime: preparedRuntime(), io, signals: signals as unknown as NodeJS.Process })).toBe(0);
+  });
+
   test("a lock the launch lost is reported, not allowed to mask the launch's own error", async () => {
     // Before: the manager's close() in the frame's finally threw "refusing to
     // release a replaced project lifecycle lock" and that replaced the error
@@ -589,7 +633,7 @@ describe("public launch through session admission", () => {
       agentName: "codex",
     });
 
-    expect(mocks.launchBuiltin).toHaveBeenCalledWith("codex", {});
+    expect(mocks.launchBuiltin).toHaveBeenCalledWith("codex", { cancellation: { signal: expect.any(AbortSignal), escalate: expect.any(AbortSignal) } });
   });
 
   test("refuses repeated preparation drift at the retry bound", async () => {

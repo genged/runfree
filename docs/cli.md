@@ -37,8 +37,10 @@ A multi-line diagnostic prefixes its first line and indents the rest by two
 spaces. When stderr is not a terminal, every line carries an ISO timestamp;
 `RUNFREE_LOG_TIMESTAMPS=1` or `=0` overrides that choice. Warnings observed
 during a command print before the command's result or its final error, with
-the time they were observed. Ctrl-C and SIGTERM restore the terminal and exit
-130 or 143; `runfree run` stops its session first and exits 67 (see
+the time they were observed. Ctrl-C, SIGTERM, and a closed terminal (SIGHUP)
+restore the terminal and exit 130, 143, or 129; an attached session is stopped
+and torn down first, and a second signal shortens the stop grace to none.
+`runfree run` stops its session first and exits 67 (see
 [Headless runs](#headless-runs)).
 
 `RUNFREE_TIMINGS=1` adds `timing:` lines on stderr: one per lifecycle phase,

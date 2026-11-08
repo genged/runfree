@@ -65,6 +65,7 @@ import {
   waitForAttachedSessionCompletion,
   type AttachedSessionCancellationPorts,
   type LostForegroundStreamDecision,
+  type AdoptionFailureClass,
 } from "./session-attached-wait.ts";
 import { SESSION_CONTAINER_STOP_SECONDS, SESSION_STOP_CLIENT_SLACK_MS } from "./session-container-contract.ts";
 import {
@@ -433,7 +434,7 @@ export type InternalSessionAdmissionDriver = Readonly<{
    * the project's configured agent command — the shell is the escape hatch
    * the custom-command refusal points at.
    */
-  launchShell(): Promise<SessionAdmissionLaunchOutcome>;
+  launchShell(options?: Pick<SessionAdmissionLaunchOptions, "cancellation">): Promise<SessionAdmissionLaunchOutcome>;
   /** Reconciles pending admission state and proves the exact registry/network baseline without launching a session. */
   recoverPending(agent: SessionAdmissionProbeAgent): Promise<void>;
 }>;
@@ -1171,7 +1172,7 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
    */
   async #adoptDurableSelectionIfChanged(signal: AbortSignal): Promise<void> {
     const held = this.#controlPlane();
-    const durable = readEffectiveControlPlaneV2(this.#input.plan.paths.stateDir);
+    const durable = readDurableControlPlaneForAdoption(this.#input.plan.paths.stateDir, held.proxyContainerId);
     if (!durable
       || durable.selection.proxyContainerId === held.proxyContainerId
         && durable.selection.controlPlaneGenerationDigest === held.controlPlaneGenerationDigest) {
@@ -2467,15 +2468,7 @@ class InternalBuiltinAdmissionProbeSteps implements SessionAdmissionProbeSteps {
       cadenceMs: sessionHeartbeatCadenceMs(),
       beat: () => this.#beatSessionFile(),
       adoptDurableSelectionIfChanged: (signal) => this.#adoptDurableSelectionIfChanged(signal),
-      classifyAdoptionFailure: (error) => {
-        if (error instanceof SessionLockAcquisitionAbortedError) return "abort";
-        if (error instanceof SessionReplacementPendingError
-          || error instanceof SessionLockAcquisitionTimeoutError
-          || (error instanceof RuntimeObservationError && error.evidence.kind === "observation-unavailable")) {
-          return "preserve";
-        }
-        return "fatal";
-      },
+      classifyAdoptionFailure: classifyAttachedAdoptionFailure,
       releaseLockForWait: () => sessionLockManager.releaseForWait(),
       onBeatWritten: (file) => {
         this.#fileWritten = file;
@@ -2951,8 +2944,8 @@ export function createInternalSessionAdmissionDriver(
     async launchBuiltin(agent: SessionAdmissionProbeAgent, options: SessionAdmissionLaunchOptions = {}) {
       return await runLaunch(agent, options);
     },
-    async launchShell() {
-      return await runLaunch("shell", {});
+    async launchShell(options: Pick<SessionAdmissionLaunchOptions, "cancellation"> = {}) {
+      return await runLaunch("shell", options);
     },
     async recoverPending(agent: SessionAdmissionProbeAgent) {
       begin();
@@ -2965,4 +2958,49 @@ export function createInternalSessionAdmissionDriver(
       }
     },
   });
+}
+
+/**
+ * The durable control-plane selection, read for the attached wait's adoption.
+ *
+ * A host read fault here — a rename landing between `lstat` and `open`
+ * during a concurrent rebind, a selection momentarily absent — is a fact
+ * about this read, not about the session's authority. It used to surface as
+ * a plain Error, which the adoption classified fatal and answered with a
+ * full teardown of a live agent. It is now observation evidence, which the
+ * wait preserves the process over and retries on its next beat.
+ */
+export function readDurableControlPlaneForAdoption(
+  stateDir: string,
+  heldProxyContainerId: string,
+): ReturnType<typeof readEffectiveControlPlaneV2> {
+  try {
+    return readEffectiveControlPlaneV2(stateDir);
+  } catch (error) {
+    throw new RuntimeObservationError({
+      kind: "observation-unavailable",
+      subject: "registry",
+      expectedIdentity: heldProxyContainerId,
+      phase: "attached wait durable selection read",
+      observation: error instanceof Error ? error.message : String(error),
+    }, error);
+  }
+}
+
+/**
+ * How the attached wait answers an adoption failure (session-attached-wait.ts).
+ *
+ * `abort`: the wait itself was cancelled. `preserve`: a condition the session
+ * outlives — a rebind still in flight, a lock held past the wait budget, a
+ * host observation that could not be made. `fatal`: a decision about this
+ * session's authority (an incompatible replacement), which ends the session.
+ */
+export function classifyAttachedAdoptionFailure(error: unknown): AdoptionFailureClass {
+  if (error instanceof SessionLockAcquisitionAbortedError) return "abort";
+  if (error instanceof SessionReplacementPendingError
+    || error instanceof SessionLockAcquisitionTimeoutError
+    || (error instanceof RuntimeObservationError && error.evidence.kind === "observation-unavailable")) {
+    return "preserve";
+  }
+  return "fatal";
 }
