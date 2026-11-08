@@ -137,7 +137,7 @@ export async function launchConfiguredAgentThroughAdmission(
  * Runs an interactive launch with the host's signals as its cancellation.
  *
  * SIGINT, SIGTERM, or SIGHUP to the CLI used to end the process at once
- * (the CLI's one-shot exit handlers), leaving the attached `docker` child
+ * (the CLI's one-shot exit handlers), leaving the attached Docker child
  * running in raw mode, the session file to lapse within its lease, and the
  * next reconcile to end the agent mid-work. The exit is deferred for the
  * launch; the first signal cancels the launch through the same ports a

@@ -97,6 +97,8 @@ const commonExclude = [
   // Maintainer-only and gitignored; it has its own local/scripts/vitest.config.ts.
   "local/**",
   ".worktrees/**",
+  // Stryker's sandbox (`make test-mutation`): a gitignored copy of the checkout.
+  ".stryker-tmp/**",
   // Claude Code agent worktrees: full checkouts of other branches.
   ".claude/worktrees/**",
   // Gitignored Pi extensions, whose installed packages ship their own tests.

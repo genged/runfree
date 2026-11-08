@@ -196,6 +196,20 @@ export function ephemeralHelperLabelArguments(
   ];
 }
 
+/**
+ * This project's session containers, whatever their state. Discovery only:
+ * the headless run lock uses it to judge a dead holder whose own session
+ * record cannot be read, so reclaim needs this list to be empty.
+ */
+export function projectSessionContainerFilters(projectId: string): string[] {
+  return [
+    "--filter",
+    `label=${PROJECT_ID_LABEL}=${assertProjectId(projectId)}`,
+    "--filter",
+    `label=${CONTAINER_ROLE_LABEL}=session-agent`,
+  ];
+}
+
 /** This project's ephemeral helpers — normally none, since helpers are `--rm`. */
 export function projectEphemeralHelperFilters(projectId: string): string[] {
   return [

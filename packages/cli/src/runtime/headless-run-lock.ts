@@ -36,8 +36,8 @@ import { HEADLESS_RUN_ID_PATTERN } from "./headless-run-record.ts";
 import { hostBootId, hostProcessStart } from "./host-identity.ts";
 import { provesContainerAbsent } from "./session-file-heartbeat.ts";
 import { SESSION_ID_PATTERN } from "./session-containers.ts";
-import { PROJECT_ID_LABEL } from "./constants.ts";
-import { CONTAINER_ROLE_LABEL } from "./container-inventory.ts";
+import { projectSessionContainerFilters } from "./container-inventory.ts";
+import { filterValues } from "./docker.ts";
 import {
   lifecycleLockIdentity,
   lifecycleLockIsOwned,
@@ -126,8 +126,6 @@ export type AcquireHeadlessRunLockInput = Readonly<{
 
 type LockSessionRecord = { v: 1; sessionId: string; containerName: string; containerId?: string };
 
-// The role label value every session container carries (session-container-template.ts).
-const SESSION_CONTAINER_ROLE = "session-agent";
 
 function lockError(message: string): Error {
   return new Error(`headless run lock ${message}`);
@@ -234,7 +232,7 @@ function judgeExistingLock(lockPath: string, input: AcquireHeadlessRunLockInput)
       all: true,
       quiet: true,
       noTrunc: true,
-      filters: [`label=${PROJECT_ID_LABEL}=${input.projectId}`, `label=${CONTAINER_ROLE_LABEL}=${SESSION_CONTAINER_ROLE}`],
+      filters: filterValues(projectSessionContainerFilters(input.projectId)),
     }, { timeout: INSPECT_TIMEOUT_MS, maxBuffer: INSPECT_MAX_BYTES });
     if (listed.status !== 0 || listed.stderr.trim()) {
       return held(`${session.reason}, and Docker could not list this project's session containers (${listed.stderr.trim().split("\n")[0] || `exit ${listed.status}`})`, session);
