@@ -709,6 +709,13 @@ function publishRequestProxyStatus(): void {
   }
 }
 
+// A reload that failed for a reason the watched files do not show (an OAuth
+// state read, a tmpfs write) is retried on the next watch tick instead of
+// waiting for the next edit to those files; the failure is logged once per
+// distinct message, and the recovery once.
+let policyReloadRetryPending = false;
+let lastPolicyReloadFailure: string | undefined;
+
 function reloadPolicy(): void {
   try {
     const previous = currentPolicy;
@@ -748,20 +755,36 @@ function reloadPolicy(): void {
       policyRevalidationCandidate = undefined;
     }
     if (nextEffectiveControl) oauthMediator.activatePairedPolicy(nextEffectiveControl.oauthPolicy);
+    // The three generation-bearing globals move together, so a failure
+    // below cannot leave a new policy beside an old control or MCP policy.
     currentPolicy = nextPolicy;
+    currentEffectiveControl = nextEffectiveControl;
+    currentMcpOperationPolicy = nextMcpOperationPolicy;
     // Revocation (SR3): cut open splices whose (name, port) left the
     // effective policy before the status names the new generation. New
     // CONNECTs already classify against `currentPolicy`.
-    const cutSplices = hostServiceTunnels.cutRemoved(nextPolicy.hostServices);
-    if (cutSplices > 0) {
-      console.log(`proxy: host-service splices cut: ${cutSplices}; reason: the approved name and port left the effective policy`);
+    try {
+      const cutSplices = hostServiceTunnels.cutRemoved(nextPolicy.hostServices);
+      if (cutSplices > 0) {
+        console.log(`proxy: host-service splices cut: ${cutSplices}; reason: the approved name and port left the effective policy`);
+      }
+    } catch (error) {
+      console.error(`proxy: host-service splice cut failed after policy reload: ${error instanceof Error ? error.message : String(error)}`);
     }
-    currentEffectiveControl = nextEffectiveControl;
-    currentMcpOperationPolicy = nextMcpOperationPolicy;
     console.log(`proxy: policy reloaded, ${policySummary(currentPolicy)}, mcp_operation_generation=${currentMcpOperationPolicy?.generation ?? "unavailable"}`);
+    if (lastPolicyReloadFailure !== undefined) {
+      console.log("proxy: policy reload recovered");
+      lastPolicyReloadFailure = undefined;
+    }
+    policyReloadRetryPending = false;
     publishRequestProxyStatus();
   } catch (error) {
-    console.error(`proxy: policy reload failed; keeping last valid policy previous_generation=${currentPolicy.generation}: ${error instanceof Error ? error.message : String(error)}`);
+    const message = error instanceof Error ? error.message : String(error);
+    policyReloadRetryPending = true;
+    if (message !== lastPolicyReloadFailure) {
+      lastPolicyReloadFailure = message;
+      console.error(`proxy: policy reload failed; keeping last valid policy previous_generation=${currentPolicy.generation}: ${message}`);
+    }
   }
 }
 
@@ -833,7 +856,7 @@ const policyWatchTimer = setInterval(() => {
   // fs.watchFile establishes its baseline asynchronously, which lets an
   // atomic activation immediately after readiness become the unseen baseline.
   // A synchronous baseline plus one initial reconciliation closes that window.
-  if (policyWatchNeedsInitialReconciliation || changed) {
+  if (policyWatchNeedsInitialReconciliation || changed || policyReloadRetryPending) {
     policyWatchNeedsInitialReconciliation = false;
     reloadPolicy();
   }

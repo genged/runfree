@@ -384,11 +384,11 @@ describe("proxy entrypoint", () => {
     let releaseFirstRefresh!: () => void;
     const refreshPolicyAndIps = vi.fn((options: { refreshDns: boolean }) => {
       if (refreshPolicyAndIps.mock.calls.length === 1) {
-        return new Promise<void>((resolve) => {
-          releaseFirstRefresh = resolve;
+        return new Promise<undefined>((resolve) => {
+          releaseFirstRefresh = () => resolve(undefined);
         });
       }
-      return Promise.resolve();
+      return Promise.resolve(undefined);
     });
     const scheduler = createFirewallRefreshScheduler({
       controller: { refreshPolicyAndIps },
@@ -403,21 +403,55 @@ describe("proxy entrypoint", () => {
     expect(refreshPolicyAndIps).toHaveBeenCalledTimes(1);
     expect(refreshPolicyAndIps).toHaveBeenNthCalledWith(1, { refreshDns: false });
 
+    // The tick that found a refresh running is not dropped: exactly one more
+    // pass runs once the first finishes, so a policy edit behind a slow
+    // refresh waits for that refresh, never for a whole extra interval.
     releaseFirstRefresh();
     await first;
+    expect(refreshPolicyAndIps).toHaveBeenCalledTimes(2);
+    expect(refreshPolicyAndIps).toHaveBeenNthCalledWith(2, { refreshDns: false });
+
     now += 299_000;
     await scheduler.tick();
-    expect(refreshPolicyAndIps).toHaveBeenNthCalledWith(2, { refreshDns: false });
+    expect(refreshPolicyAndIps).toHaveBeenNthCalledWith(3, { refreshDns: false });
 
     now += 1_000;
     await scheduler.tick();
-    expect(refreshPolicyAndIps).toHaveBeenNthCalledWith(3, { refreshDns: true });
+    expect(refreshPolicyAndIps).toHaveBeenNthCalledWith(4, { refreshDns: true });
+  });
+
+  test("a DNS-interval refresh that could not resolve leaves the interval due", async () => {
+    let now = 1_000;
+    let dnsRefreshed = false;
+    const refreshPolicyAndIps = vi.fn(async () => ({ dnsRefreshed }));
+    const scheduler = createFirewallRefreshScheduler({
+      controller: { refreshPolicyAndIps },
+      policyIntervalMs: 2_000,
+      dnsIntervalMs: 300_000,
+      nowMs: () => now,
+      log: () => {},
+    });
+
+    now += 300_000;
+    await scheduler.tick();
+    expect(refreshPolicyAndIps).toHaveBeenLastCalledWith({ refreshDns: true });
+    // The policy was unreadable, so nothing was resolved: ask again next tick.
+    now += 2_000;
+    await scheduler.tick();
+    expect(refreshPolicyAndIps).toHaveBeenLastCalledWith({ refreshDns: true });
+    dnsRefreshed = true;
+    now += 2_000;
+    await scheduler.tick();
+    expect(refreshPolicyAndIps).toHaveBeenLastCalledWith({ refreshDns: true });
+    now += 2_000;
+    await scheduler.tick();
+    expect(refreshPolicyAndIps).toHaveBeenLastCalledWith({ refreshDns: false });
   });
 
   test("runs admission independently while maintenance is blocked", async () => {
     let releaseMaintenance!: () => void;
-    const refreshPolicyAndIps = vi.fn(() => new Promise<void>((resolve) => {
-      releaseMaintenance = resolve;
+    const refreshPolicyAndIps = vi.fn(() => new Promise<undefined>((resolve) => {
+      releaseMaintenance = () => resolve(undefined);
     }));
     const reconcileSessionAdmission = vi.fn(async () => {});
     const maintenance = createFirewallRefreshScheduler({

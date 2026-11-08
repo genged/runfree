@@ -68,10 +68,25 @@ export type FirewallRefreshOptions = {
   refreshDns?: boolean;
 };
 
+/** What one refresh did, for the scheduler that paces the DNS interval. */
+// Bounded parallelism for the resolver: enough that a whole allowlist
+// resolves in one resolver timeout, small enough not to flood the resolver.
+const DNS_RESOLVE_CONCURRENCY = 8;
+// How often an allowlisted host with no cached answer is retried on the
+// policy tick (a typo in the allowlist must not become a 2 s DNS loop).
+const UNRESOLVED_RETRY_MIN_MS = 10_000;
+
+export type FirewallRefreshResult = {
+  // True only when every allowlisted host was re-resolved; a refresh that
+  // could not read the policy, or that resolved only the hosts missing from
+  // the cache, leaves the DNS interval due.
+  dnsRefreshed: boolean;
+};
+
 export type FirewallController = {
   initialize(plan: FirewallPlan): Promise<void>;
   reconcileSessionAdmission(): Promise<void>;
-  refreshPolicyAndIps(options?: FirewallRefreshOptions): Promise<void>;
+  refreshPolicyAndIps(options?: FirewallRefreshOptions): Promise<FirewallRefreshResult>;
   verify(plan?: FirewallPlan): Promise<void>;
   stop(): Promise<void>;
 };
@@ -246,6 +261,10 @@ export function createFirewallController(overrides: Partial<FirewallControllerDe
   let currentPlan: FirewallPlan | undefined;
   let allowedHosts: string[] = [];
   const cache = new Map<string, ResolvedHost>();
+  // When each host was last handed to the resolver, so a host that keeps
+  // failing is retried on the policy tick at a bounded rate rather than on
+  // every tick or only at the next DNS interval.
+  const lastResolveAttemptAtMs = new Map<string, number>();
   let appliedSessionAdmissionIdentity: SessionAdmissionIdentity | undefined;
   let sessionAdmissionSetKnownEmpty = false;
   // Invariant 5: the firewall's own observation map for the `files` source.
@@ -944,17 +963,37 @@ export function createFirewallController(overrides: Partial<FirewallControllerDe
   // has no hidden external dependency.
   type ResolutionStrictness = "require-any-configured-host" | "best-effort";
 
+  // "all" re-resolves every host (the DNS interval, startup). "uncached"
+  // resolves only hosts with no cached answer — a host just added to the
+  // policy, or one whose lookups have failed so far — at most once per
+  // UNRESOLVED_RETRY_MIN_MS each, then installs the set as every refresh
+  // does (a policy change must land in the kernel even when nothing new
+  // needed resolving, including a change to zero hosts). "uncached-if-due"
+  // is the same but does nothing at all when no host is due: the retry of a
+  // still-unresolved host on a tick with no policy change.
+  type ResolutionScope = "all" | "uncached" | "uncached-if-due";
+
   async function refreshResolvedIps(
     strictness: ResolutionStrictness,
     plan: FirewallPlan = currentPlan ?? failNoPlan(),
     targetAllowedHosts: readonly string[] = allowedHosts,
-  ): Promise<void> {
+    scope: ResolutionScope = "all",
+  ): Promise<boolean> {
     const now = deps.nowMs();
     let unsafeIps = 0;
     const unresolvedHosts: string[] = [];
     let staleHosts = 0;
 
-    for (const host of targetAllowedHosts) {
+    const hostsToResolve = targetAllowedHosts.filter((host) => scope === "all"
+      || (!cache.has(host) && now - (lastResolveAttemptAtMs.get(host) ?? Number.NEGATIVE_INFINITY) >= UNRESOLVED_RETRY_MIN_MS));
+    if (scope === "uncached-if-due" && hostsToResolve.length === 0) return false;
+    // Lookups run concurrently under a bound: a resolver that answers
+    // nothing costs one timeout per batch, not one per host, so a policy
+    // change converges inside the host CLI's acknowledgement window however
+    // many hosts the allowlist names.
+    let nextHost = 0;
+    const resolveOne = async (host: string): Promise<void> => {
+      lastResolveAttemptAtMs.set(host, now);
       try {
         const answers = await deps.resolve4(host);
         const safeIps: string[] = [];
@@ -973,11 +1012,21 @@ export function createFirewallController(overrides: Partial<FirewallControllerDe
       } catch (error) {
         deps.log(`proxy-firewall: DNS lookup failed host=${host}: ${formatError(error)}`);
       }
-    }
+    };
+    await Promise.all(Array.from({ length: Math.min(DNS_RESOLVE_CONCURRENCY, hostsToResolve.length) }, async () => {
+      while (nextHost < hostsToResolve.length) {
+        const host = hostsToResolve[nextHost];
+        nextHost += 1;
+        if (host !== undefined) await resolveOne(host);
+      }
+    }));
 
     const currentHostSet = new Set(targetAllowedHosts);
     for (const host of Array.from(cache.keys())) {
       if (!currentHostSet.has(host)) cache.delete(host);
+    }
+    for (const host of Array.from(lastResolveAttemptAtMs.keys())) {
+      if (!currentHostSet.has(host)) lastResolveAttemptAtMs.delete(host);
     }
 
     const resolvedIps: string[] = [];
@@ -1024,6 +1073,7 @@ export function createFirewallController(overrides: Partial<FirewallControllerDe
       // the snapshot instead of from a startup failure.
       ...(unresolvedHosts.length > 0 ? [`unresolved_hosts=${unresolvedHosts.join(",")}`] : []),
     ].join(" "));
+    return true;
   }
 
   // The status is level-triggered: a host-service change within one
@@ -1094,7 +1144,7 @@ export function createFirewallController(overrides: Partial<FirewallControllerDe
       await reconcileSessionFileAdmission(currentPlan);
     },
     async refreshPolicyAndIps(options = {}) {
-      if (stopped || !currentPlan) return;
+      if (stopped || !currentPlan) return { dnsRefreshed: false };
       const activePlan = currentPlan;
       let nextPolicy: LoadedProxyPolicy;
       let nextControl: LoadedEffectiveProxyControl | undefined;
@@ -1112,7 +1162,9 @@ export function createFirewallController(overrides: Partial<FirewallControllerDe
         await refreshHostServices(activePlan);
         republishStatusIfHostServicesChanged(activePlan);
         await refreshAuditTick(activePlan);
-        return;
+        // No DNS work happened: the interval stays due, so the stale-answer
+        // prune is not starved for as long as the policy stays unreadable.
+        return { dnsRefreshed: false };
       }
 
       const nextAllowedHosts = [...nextPolicy.allowedHosts];
@@ -1128,8 +1180,18 @@ export function createFirewallController(overrides: Partial<FirewallControllerDe
         ...(nextControlGeneration ? { controlGeneration: nextControlGeneration } : {}),
         policyGeneration: nextPolicy.generation,
       };
-      if (options.refreshDns !== false || policyChanged) {
+      let dnsRefreshed = false;
+      if (options.refreshDns !== false) {
         await refreshResolvedIps("best-effort", nextPlan, nextAllowedHosts);
+        dnsRefreshed = true;
+      } else if (policyChanged) {
+        // A host added to the policy is looked up on this tick rather than at
+        // the DNS interval; hosts already cached keep their answers until
+        // then, and the set is installed for the changed host list.
+        await refreshResolvedIps("best-effort", nextPlan, nextAllowedHosts, "uncached");
+      } else if (nextAllowedHosts.some((host) => !cache.has(host))) {
+        // A host that is still unresolved is retried at a bounded rate.
+        await refreshResolvedIps("best-effort", nextPlan, nextAllowedHosts, "uncached-if-due");
       }
 
       allowedHosts = nextAllowedHosts;
@@ -1158,10 +1220,30 @@ export function createFirewallController(overrides: Partial<FirewallControllerDe
         } catch (error) {
           deps.log(`proxy-firewall: failed to publish generation status: ${formatError(error)}`);
         }
+      } else if (!lastRulesetVerified) {
+        // A verification that failed on a reload (one `nft list` timeout
+        // during `host add` is enough) used to leave the status unverified
+        // until the next generation change: every new session's readiness
+        // wait timed out and token sync refused, with proxy recreation the
+        // only way out. The same generation is re-verified every tick until
+        // it passes, and the status recovers on its own.
+        try {
+          await deps.verify(currentPlan);
+          deps.log(`proxy-firewall: ruleset verification recovered generation=${currentPlan.policyGeneration}`);
+          try {
+            publishStatus(currentPlan, true);
+          } catch (error) {
+            deps.log(`proxy-firewall: failed to publish generation status: ${formatError(error)}`);
+          }
+        } catch (error) {
+          deps.log(`proxy-firewall: ruleset verification still failing generation=${currentPlan.policyGeneration}: ${formatError(error)}`);
+          republishStatusIfHostServicesChanged(currentPlan);
+        }
       } else {
         republishStatusIfHostServicesChanged(currentPlan);
       }
       await refreshAuditTick(currentPlan);
+      return { dnsRefreshed };
     },
     async verify(plan) {
       await deps.verify(plan ?? currentPlan ?? failNoPlan());

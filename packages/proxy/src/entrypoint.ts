@@ -13,6 +13,8 @@ import {
   PROXY_SERVER_GID,
   PROXY_SERVER_UID,
   type FirewallController,
+  type FirewallRefreshOptions,
+  type FirewallRefreshResult,
 } from "./firewall/index.js";
 import { loadProxyPolicy } from "./policy.js";
 import {
@@ -65,7 +67,11 @@ type ServerDeniedCommandResult = Pick<SpawnSyncReturns<string>, "status" | "sign
 
 type ServerDeniedCommandRunner = (probe: ServerDeniedCommandProbe) => ServerDeniedCommandResult;
 
-type RefreshableFirewallController = Pick<FirewallController, "refreshPolicyAndIps">;
+// A controller whose refresh may report what it did; a test double that
+// resolves to nothing is read as "resolved as asked".
+type RefreshableFirewallController = {
+  refreshPolicyAndIps(options?: FirewallRefreshOptions): Promise<FirewallRefreshResult | undefined>;
+};
 type SessionAdmissionReconciliationController = Pick<FirewallController, "reconcileSessionAdmission">;
 
 type FirewallRefreshScheduler = {
@@ -214,21 +220,34 @@ export function createFirewallRefreshScheduler(input: FirewallRefreshSchedulerIn
   const log = input.log ?? ((line: string) => console.error(line));
   let timer: ReturnType<typeof setInterval> | undefined;
   let inFlight = false;
+  let pending = false;
   let lastDnsRefreshAtMs = nowMs();
 
+  // One refresh at a time; a tick that lands while one runs is not dropped
+  // but coalesced into exactly one more pass over the latest policy, so a
+  // slow refresh (a resolver that answers nothing) cannot make the policy
+  // edit behind it wait a full extra interval.
   const tick = async () => {
     if (inFlight) {
-      log("proxy-firewall: skipped refresh because the previous refresh is still running");
+      pending = true;
+      log("proxy-firewall: refresh still running; another pass is queued behind it");
       return;
     }
 
     inFlight = true;
-    const refreshDns = nowMs() - lastDnsRefreshAtMs >= input.dnsIntervalMs;
     try {
-      await input.controller.refreshPolicyAndIps({ refreshDns });
-      if (refreshDns) lastDnsRefreshAtMs = nowMs();
-    } catch (error) {
-      log(`proxy-firewall: refresh failed: ${error instanceof Error ? error.message : String(error)}`);
+      do {
+        pending = false;
+        const refreshDns = nowMs() - lastDnsRefreshAtMs >= input.dnsIntervalMs;
+        try {
+          const result = await input.controller.refreshPolicyAndIps({ refreshDns });
+          // The interval is spent only by a refresh that resolved every host;
+          // one that could not read the policy leaves it due.
+          if (refreshDns && (result === undefined || result.dnsRefreshed)) lastDnsRefreshAtMs = nowMs();
+        } catch (error) {
+          log(`proxy-firewall: refresh failed: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      } while (pending);
     } finally {
       inFlight = false;
     }
