@@ -8,6 +8,7 @@ import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { projectInfo, type ProjectInfo } from "../config.ts";
 import {
   ControlLockBusyError,
+  ControlLockUnsafeError,
   controlLockPath,
   tryAcquireControlLock,
   waitWhileControlLockBusy,
@@ -91,6 +92,29 @@ describe("shared control lock", () => {
     expect((thrown as Error).message).toBe(`another control operation is in progress (${controlLockPath(project)})`);
     expect(action).not.toHaveBeenCalled();
     held?.release();
+  });
+
+  test("a non-directory at the lock path is refused with its remedy, never reported busy", () => {
+    // Before: `staleLock` answered false for anything that was not a lock
+    // directory, so every control operation reported "another control
+    // operation is in progress" forever and nothing named the file.
+    const lockPath = controlLockPath(project);
+    fs.mkdirSync(path.dirname(lockPath), { recursive: true });
+    fs.writeFileSync(lockPath, "not a lock\n");
+    let thrown: unknown;
+    try {
+      withControlLock(project, () => "ran");
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toBeInstanceOf(ControlLockUnsafeError);
+    expect((thrown as Error).message).toBe(
+      `the control lock path is a non-directory, not a lock directory: ${lockPath}; remove it, then retry the command`,
+    );
+    fs.rmSync(lockPath);
+    const after = tryAcquireControlLock(project);
+    expect(after).toBeDefined();
+    after?.release();
   });
 
   test("a lock left by a dead owner is reclaimed on the first try of a wait", async () => {

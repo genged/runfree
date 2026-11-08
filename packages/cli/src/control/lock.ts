@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 
 import type { ProjectInfo } from "../config.ts";
+import { CliError } from "../errors.ts";
 import {
   compareHostBootId,
   compareHostProcessStart,
@@ -82,6 +83,15 @@ export function tryAcquireControlLock(
       fs.mkdirSync(lockPath, { mode: 0o700 });
     } catch (error) {
       if (!(error instanceof Error) || !("code" in error) || error.code !== "EEXIST") throw error;
+      let existing: fs.Stats | undefined;
+      try {
+        existing = fs.lstatSync(lockPath);
+      } catch {
+        continue;
+      }
+      if (existing.isSymbolicLink() || !existing.isDirectory()) {
+        throw new ControlLockUnsafeError(lockPath, existing.isSymbolicLink() ? "a symbolic link" : "a non-directory");
+      }
       if (!staleLock(lockPath, env)) return undefined;
       const reclaim = reclaimPath(lockPath);
       try {
@@ -129,6 +139,21 @@ export function tryAcquireControlLock(
  * other failure so that a caller that may wait (a launch's control
  * preparation) can tell contention from a real error.
  */
+/**
+ * Something that is not a lock directory sits at the lock path, so no
+ * acquisition can ever succeed or reclaim it. Reported as itself, with the
+ * path, instead of as "another control operation is in progress" forever.
+ */
+export class ControlLockUnsafeError extends CliError {
+  readonly lockPath: string;
+
+  constructor(lockPath: string, kind: string) {
+    super(`the control lock path is ${kind}, not a lock directory: ${lockPath}; remove it, then retry the command`, 1);
+    this.name = "ControlLockUnsafeError";
+    this.lockPath = lockPath;
+  }
+}
+
 export class ControlLockBusyError extends Error {
   readonly lockPath: string;
 

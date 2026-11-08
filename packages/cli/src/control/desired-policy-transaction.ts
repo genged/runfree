@@ -1,3 +1,4 @@
+import fs from "node:fs";
 // The one typed desired-policy transaction, shared by every typed mutation
 // family (host, service, credential).
 //
@@ -20,7 +21,7 @@ import {
 import { CliError } from "../errors.ts";
 import { projectRunfreePath } from "../runfree-consumer-registry.ts";
 import type { RuntimeContext, RuntimeIO } from "../runtime/types.ts";
-import { safeReplaceProjectFile } from "../safe-fs.ts";
+import { safeReadProjectFile, safeReplaceProjectFile } from "../safe-fs.ts";
 import {
   approveNetworkCandidate,
   readApprovedNetworkPolicy,
@@ -173,6 +174,7 @@ export async function withDesiredPolicyTransaction<TPlan extends DesiredPolicyPl
         throw new Error(`project checkout identity changed before the typed ${transaction.transactionNoun} write`);
       }
       let rollback: undefined | (() => void);
+      let restoreDesired: undefined | (() => void);
       let approved = false;
       try {
         if (transaction.beforeWrite) {
@@ -186,12 +188,25 @@ export async function withDesiredPolicyTransaction<TPlan extends DesiredPolicyPl
           }
         }
         if (planned.changed) {
-          safeReplaceProjectFile(
-            context.projectRoot,
-            projectRunfreePath(context.projectRoot, layer === "local" ? "networkPolicyLocal" : "networkPolicy"),
-            formatDesiredPolicyFile(planned.policy),
-            0o600,
-          );
+          const desiredPath = projectRunfreePath(context.projectRoot, layer === "local" ? "networkPolicyLocal" : "networkPolicy");
+          const previousBytes = safeReadProjectFile(context.projectRoot, desiredPath);
+          const plannedBytes = formatDesiredPolicyFile(planned.policy);
+          safeReplaceProjectFile(context.projectRoot, desiredPath, plannedBytes, 0o600);
+          // A failure after this write and before the approval used to leave
+          // Runfree's own planned bytes in the project file while the
+          // approval still named the previous policy: the next command then
+          // reported Runfree's write as agent drift. The write is undone,
+          // but only while the file still holds exactly what was written —
+          // an agent edit that landed meanwhile is left as the inert
+          // unapproved drift it is.
+          restoreDesired = () => {
+            if (safeReadProjectFile(context.projectRoot, desiredPath) !== plannedBytes) return;
+            if (previousBytes !== undefined) {
+              safeReplaceProjectFile(context.projectRoot, desiredPath, previousBytes, 0o600);
+            } else {
+              fs.rmSync(desiredPath, { force: true });
+            }
+          };
         }
         const candidate = captureDesiredPolicyCandidate(context.projectRoot, context.project.paths.controlCandidatesDir);
         if (desiredLayerSubject(candidate, layer).digest !== networkControlSubject(subjectType, planned.policy).digest
@@ -215,9 +230,12 @@ export async function withDesiredPolicyTransaction<TPlan extends DesiredPolicyPl
         approved = true;
         return transaction.result({ candidate, plan: planned, selection });
       } catch (error) {
-        if (!approved && rollback) {
-          try { rollback(); } catch (rollbackError) {
-            throw new AggregateError([error, rollbackError], "desired policy transaction and host-state rollback failed");
+        if (!approved) {
+          const rollbackFailures: unknown[] = [];
+          try { restoreDesired?.(); } catch (restoreError) { rollbackFailures.push(restoreError); }
+          try { rollback?.(); } catch (rollbackError) { rollbackFailures.push(rollbackError); }
+          if (rollbackFailures.length > 0) {
+            throw new AggregateError([error, ...rollbackFailures], "desired policy transaction and host-state rollback failed");
           }
         }
         throw error;

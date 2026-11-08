@@ -33,6 +33,7 @@ import {
 } from "./effective.ts";
 import { isControlsNotApprovedError } from "./refusals.ts";
 import { usePreparedApprovedPolicyGeneration } from "./workflow.ts";
+import { CliError } from "../errors.ts";
 
 export type ControlActivationResult =
   | { kind: "deferred"; reason: string }
@@ -287,7 +288,14 @@ export async function activateApprovedControlsAfterMutation(
   try {
     previous = readActiveControlSelection(context.project);
   } catch (error) {
-    if (!options.recoverInvalidActive) throw error;
+    if (!options.recoverInvalidActive) {
+      // The desired change is already durable; what cannot be read is the
+      // active selection, and one command repairs it.
+      throw new CliError(
+        `${error instanceof Error ? error.message : String(error)}; the change is saved; re-activate the approved policy with \`${remedy.policyUseApproved()}\``,
+        1,
+      );
+    }
   }
   // Both compile entrypoints raise the same typed refusal when approvals are
   // incomplete (pre-`up`): the desired mutation is already durable, so this

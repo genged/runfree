@@ -49,6 +49,7 @@ import { publishImmutableDirectory, pollForExactAck } from "../generation-kernel
 import { fsyncDirectory } from "../safe-fs.ts";
 import { sha256Digest as sha256, assertAllowedKeys as exactKeys, isDigest } from "../strict-primitives.ts";
 import { ControlsNotApprovedError } from "./refusals.ts";
+import { CliError } from "../errors.ts";
 
 const EFFECTIVE_CONTROL_SCHEMA_VERSION = 1 as const;
 const PLACEHOLDER_VALUE = "runfree-placeholder-overwritten-by-proxy";
@@ -293,6 +294,16 @@ function effectiveAgentEnv(
 export type PublishEffectiveControlInput = {
   agentEnvValues?: Record<string, string>;
   baseOAuthPolicy?: OAuthMediationPolicyJson;
+  /**
+   * The compiled desired policy the caller derived `effectiveNetworkPolicy`
+   * and `oauthSeedHandles` from, as `compiledPolicyBase` renders it. The
+   * caller computes those outside the publish lock; the publication
+   * re-compiles under the lock and refuses when the two differ, so a
+   * mutation that landed in between cannot produce a generation whose body
+   * is a projection over one approved policy while its manifest names
+   * another.
+   */
+  compiledBase?: string;
   effectiveNetworkPolicy?: PolicyJson;
   mcpOperationPolicy?: McpOperationPolicyJson;
   oauthSeedHandles?: Record<string, Record<string, string>>;
@@ -577,6 +588,19 @@ export function requireApprovedControls(projectRoot: string, project: ProjectInf
   return { projectPolicy, localPolicy, runtimeIsolation };
 }
 
+/** The compiled desired policy as a comparable string; see `PublishEffectiveControlInput.compiledBase`. */
+export function compiledPolicyBase(compiled: ReturnType<typeof compileDesiredPolicies>): string {
+  return JSON.stringify(compiled.policy);
+}
+
+/** The approved desired policy changed between preparation and publication. Retry recompiles over the new one. */
+export class EffectivePolicyBaseChangedError extends CliError {
+  constructor() {
+    super("the approved desired policy changed while the effective policy generation was being prepared; retry the command", 1);
+    this.name = "EffectivePolicyBaseChangedError";
+  }
+}
+
 function publishEffectivePolicyGenerationUnlocked(
   projectRoot: string,
   project: ProjectInfo,
@@ -586,6 +610,9 @@ function publishEffectivePolicyGenerationUnlocked(
   const selection = readControlApprovalSelection(projectRoot, project);
   if (!selection) throw new Error("control approval selection is missing");
   const compiled = compileDesiredPolicies({ project: projectPolicy, local: localPolicy });
+  if (input.compiledBase !== undefined && compiledPolicyBase(compiled) !== input.compiledBase) {
+    throw new EffectivePolicyBaseChangedError();
+  }
   const loadedPolicy = validateNetworkPolicy(input.effectiveNetworkPolicy ?? compiled.policy);
   const oauthPolicy = effectiveOAuthPolicy(compiled, input, loadedPolicy);
   const mcpOperationPolicy = input.mcpOperationPolicy ? validateMcpOperationPolicy(input.mcpOperationPolicy).raw : undefined;
