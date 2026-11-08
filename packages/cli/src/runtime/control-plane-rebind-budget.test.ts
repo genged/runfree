@@ -16,8 +16,14 @@ test("explicit retry can observe an exhausted transaction but cannot mutate befo
   expect(io.capture("docker", ["container", "inspect", "exact"]).status).toBe(0);
   expect(() => io.run("docker", ["compose", "up"])).toThrow("allowance to be durable");
   expect(() => io.capture("docker", ["create", "image"])).toThrow("allowance to be durable");
+  expect(() => io.capture("docker", ["run", "image"])).toThrow("allowance to be durable");
+  // The deny-probe helper publishes no authority: the explicit retry re-proves
+  // the candidate with it before the renewed allowance is durable, and that
+  // proof used to be refused here, leaving `runtime recover --retry` with no
+  // way to finish and `rebuild` as the only escape.
+  expect(io.capture("docker", ["run", "--rm", "--label", "io.runfree.helper-purpose=deny-probe", "image"]).status).toBe(0);
   expect(run).not.toHaveBeenCalled();
-  expect(capture).toHaveBeenCalledOnce();
+  expect(capture).toHaveBeenCalledTimes(2);
   allowance.number = 1; allowance.exhausted = false; allowance.deadlineAt = new Date(Date.now() + 120_000).toISOString();
   expect(io.run("docker", ["compose", "up"])).toBe(0);
   expect(run).toHaveBeenCalledOnce();
