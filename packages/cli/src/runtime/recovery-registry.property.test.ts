@@ -32,10 +32,11 @@ const HOST_ID = "rf-20260731-abcdef";
 let tmp: string;
 let env: NodeJS.ProcessEnv;
 let stateDir: string;
+let projectRoot: string;
 
 beforeEach(() => {
   tmp = fs.mkdtempSync(path.join(os.tmpdir(), "runfree-recovery-registry-"));
-  const projectRoot = path.join(tmp, "project");
+  projectRoot = path.join(tmp, "project");
   fs.mkdirSync(projectRoot, { recursive: true });
   env = {
     XDG_STATE_HOME: path.join(tmp, "xdg-state"),
@@ -119,6 +120,50 @@ describe("agent-written Claude registry files", () => {
         }
       }),
       propertyParameters({ numRuns: 150 }),
+    );
+  });
+});
+
+// The Codex rollout files under `<state>/codex/sessions/<y>/<m>/<d>/` are the
+// other agent-written recovery input. They are opened only by the interactive
+// `runfree resume` scan (`includeCodexMatches`), whose rows are labelled
+// "Codex match" and never the default; the same promise holds: no file an
+// agent writes there throws out of the scan or hides the host's evidence.
+const rolloutLine = fc.oneof(
+  fc.jsonValue({ maxDepth: 3 }).map((value) => JSON.stringify(value)),
+  fc.record({
+    type: fc.constantFrom("session_meta", "response_item", "event_msg", "turn_context", "garbage"),
+    payload: fc.oneof(
+      fc.record({ id: hostileField, timestamp: hostileField, cwd: hostileField, instructions: hostileField }, { requiredKeys: [] }),
+      hostileField,
+    ),
+    timestamp: hostileField,
+  }, { requiredKeys: [] }).map((value) => JSON.stringify(value)),
+  fc.string({ maxLength: 200 }),
+);
+const rolloutFile = fc.oneof(
+  fc.array(rolloutLine, { maxLength: 6 }).map((lines) => lines.join("\n")),
+  fc.uint8Array({ maxLength: 512 }).map((bytes) => Buffer.from(bytes)),
+);
+
+describe("agent-written Codex rollout files", () => {
+  it("never throw out of the interactive scan and never hide the host's own evidence", () => {
+    const rolloutDir = path.join(stateDir, "codex", "sessions", "2026", "07", "31");
+    fc.assert(
+      fc.property(rolloutFile, rolloutFile, (first, second) => {
+        fs.mkdirSync(rolloutDir, { recursive: true });
+        fs.writeFileSync(path.join(rolloutDir, "rollout-2026-07-31T00-00-00-00000000-0000-7000-8000-000000000001.jsonl"), first);
+        fs.writeFileSync(path.join(rolloutDir, "rollout-2026-07-31T00-00-00-00000000-0000-7000-8000-000000000002.jsonl"), second);
+
+        const inventory = scanRecoveryInventory({ env, projectRoot, includeCodexMatches: true });
+
+        expect(inventory.items.some((item) => item.evidenceKind === "host" && item.sourceId === HOST_ID)).toBe(true);
+        expect(inventory.truncated).toBe(false);
+        for (const item of inventory.items.filter((entry) => entry.conversationSource === "codex-match")) {
+          expect(item.conversationNameSource).toBe("codex-index");
+        }
+      }),
+      propertyParameters({ numRuns: 100 }),
     );
   });
 });
