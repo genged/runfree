@@ -5,6 +5,7 @@ import type { DesiredNetworkPolicyJson, DesiredServiceEntry, DesiredServiceHostR
 import { validateNetworkPolicy } from "@runfree/runtime-contracts/network-policy";
 import { service as registryService } from "../../../../scripts/services.ts";
 import { desiredServiceEntry } from "../admin/service-policy.ts";
+import { CliError } from "../errors.ts";
 
 const digest = `sha256:${"a".repeat(64)}`;
 
@@ -245,4 +246,27 @@ describe("desired policy compiler: service hostRules overlay", () => {
     expect(reloaded.raw).toEqual(compiled.policy);
     expect(reloaded.requests["github.com"]).toMatchObject({ gitPush: "deny", methods: ["GET", "POST"], writeAction: "deny" });
   });
+});
+
+test("a token defined by a service in one layer and directly in the other is a refusal with its remedy", () => {
+  const token = {
+    description: "GitHub API token",
+    credentials: [{ host: "api.github.com", header: "Authorization", scheme: "bearer" as const }],
+  };
+  let caught: unknown;
+  try {
+    compileDesiredPolicies({
+      project: {
+        version: 2,
+        hosts: ["api.github.com"],
+        services: { github: { revision: 1, definitionDigest: `sha256:${"a".repeat(64)}`, resolved: { hosts: ["api.github.com"], tokens: { github: token } } } },
+      },
+      local: { version: 2, hosts: ["api.github.com"], tokens: { github: token } },
+    });
+  } catch (error) {
+    caught = error;
+  }
+  expect(caught).toBeInstanceOf(CliError);
+  expect((caught as Error).message).toContain("token github conflicts between service:github and direct");
+  expect((caught as Error).message).toContain("runfree credential remove github");
 });

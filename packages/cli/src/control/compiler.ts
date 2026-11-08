@@ -13,6 +13,8 @@ import {
   type TokenPolicyJson,
 } from "@runfree/runtime-contracts/network-policy";
 import { stableJson } from "../strict-primitives.ts";
+import { CliError } from "../errors.ts";
+import { remedy } from "../remedies.ts";
 
 export type EffectiveControlProvenance = {
   hosts: Record<string, string[]>;
@@ -170,7 +172,15 @@ export function compileDesiredPolicies(input: {
     requestSources[host] = `${input.local.requests?.[host] ? "local" : "project"}:direct`;
   }
   for (const [tokenName, token] of Object.entries(merged.tokens ?? {})) {
-    if (tokenOwners[tokenName]) throw new Error(`token ${tokenName} conflicts between ${tokenOwners[tokenName]} and direct`);
+    if (tokenOwners[tokenName]) {
+      // Reached when a direct token in one layer shares its name with a
+      // service token in the other (the same-layer case is caught, with a
+      // full explanation, by `service enable`). A refusal, not a stack trace.
+      throw new CliError(
+        `token ${tokenName} conflicts between ${tokenOwners[tokenName]} and direct: the service and a direct token in the other policy layer both define it; `
+          + `remove the direct token from that layer (\`${remedy.credentialRemove(tokenName)}\` for the project layer), or disable the service, then retry`,
+      );
+    }
     tokens[tokenName] = token;
     tokenOwners[tokenName] = "direct";
     tokenSources[tokenName] = `${input.local.tokens?.[tokenName] ? "local" : "project"}:direct`;

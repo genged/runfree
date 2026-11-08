@@ -450,6 +450,25 @@ export async function mutateDesiredService(
       // when the two disagree.
       const keepDirect = unsafeServiceTakeovers(planned, layer, [approvedOther, desiredLayerPolicy(before, other)]);
       if (keepDirect.size > 0) planned = reconcileDesiredService(current, mutation, { layer, keepDirect });
+      // A direct token of the same name in the other layer is not this
+      // write's to transfer, and the compiler below refuses the pair. Say so
+      // with the same explanation the same-layer conflict gives, instead of
+      // the compiler's one line. Either copy of the other layer counts.
+      if (mutation.kind === "enable") {
+        for (const [tokenName, service] of Object.entries(mutation.entry.resolved.tokens ?? {})) {
+          const direct = approvedOther.tokens?.[tokenName] ?? desiredLayerPolicy(before, other).tokens?.[tokenName];
+          if (direct === undefined) continue;
+          throw new CliError(directTokenConflictMessage({
+            direct,
+            entry: mutation.entry,
+            id: planned.id,
+            layer: other,
+            service,
+            sourceArgs: mutation.sourceArgs,
+            tokenName,
+          }));
+        }
+      }
       // Schema validation alone cannot see cross-layer ownership: only the
       // compiler resolves project and local together. Compile the planned pair
       // before the write so no mutation can persist a desired policy that later

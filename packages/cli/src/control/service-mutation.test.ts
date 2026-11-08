@@ -681,6 +681,30 @@ describe("typed desired service mutation", () => {
     expect(after?.subjects["network-project"]?.digest).toBe(before?.subjects["network-project"]?.digest);
   });
 
+  test("refuses a service token that a direct token in the other layer already defines, with the full explanation", async () => {
+    // Before, only the same layer was checked; the compiler then refused the
+    // pair with one bare line rendered as an unexpected error.
+    const token = {
+      description: "GitHub API token",
+      credentials: [{ host: "api.github.com", header: "Authorization", scheme: "bearer" as const }],
+    };
+    fs.writeFileSync(
+      path.join(root, ".runfree", "network-policy.json"),
+      JSON.stringify({ version: 2, hosts: ["api.github.com"], tokens: { github: token } }),
+    );
+    const candidate = captureDesiredPolicyCandidate(root, context.project.paths.controlCandidatesDir);
+    approveNetworkCandidate(root, context.project, candidate, "network-project", "interactive");
+
+    const enable = mutateDesiredService(context, io, "local", {
+      kind: "enable",
+      id: "github",
+      entry: { revision: 2, definitionDigest: digest("c"), resolved: { hosts: ["api.github.com"], tokens: { github: token } } },
+    });
+    await expect(enable).rejects.toThrow("token github conflicts with service github");
+    await expect(enable).rejects.toThrow("the project layer (.runfree/network-policy.json) already defines token github directly");
+    expect(fs.existsSync(path.join(root, ".runfree", "network-policy.local.json"))).toBe(false);
+  });
+
   test("mutates the desired service while a per-session agent is live", async () => {
     writeLiveAttachedSessionContainerRecordFixture({
       stateDir: context.project.paths.stateDir,
