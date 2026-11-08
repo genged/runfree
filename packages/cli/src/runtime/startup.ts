@@ -2218,7 +2218,7 @@ export async function startRuntime(
               heldLifecycleLock.assertHeld();
               const relayStatus = rebindDocker.composeSyncHostRelay(project, hostServiceRelay);
               if (relayStatus !== 0) warn(`the host-service relay could not be updated with the proxy (docker compose exited ${relayStatus})`);
-              warn("proxy replacement reset pending approvals, temporary grants, remembered denials, and audit capture; interrupted requests are not replayed");
+              warn("proxy replacement reset pending approvals, temporary grants, and remembered denials, and ended network audit mode if it was on (re-enable it with `runfree up --audit-network`); interrupted requests are not replayed");
               return await proveCandidate();
             },
             proveCandidate,

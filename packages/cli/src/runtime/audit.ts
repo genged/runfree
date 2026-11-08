@@ -55,8 +55,10 @@ console.log(JSON.stringify(marker));
 `;
 
 // Runs inside the proxy container: evaluates the marker on the proxy clock
-// with the same clamp the proxy server and firewall supervisor apply.
-const MARKER_STATUS_SCRIPT = `
+// with the same clamp the proxy server and firewall supervisor apply
+// (`effectiveAuditExpiryMs` in packages/proxy/src/audit.ts). The script
+// cannot import it, so `audit.test.ts` pins this copy to that formula.
+export const MARKER_STATUS_SCRIPT = `
 const fs = require("node:fs");
 const markerPath = ${JSON.stringify(AUDIT_MARKER_PATH)};
 const maxMs = 8 * 60 * 60 * 1000;

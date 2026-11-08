@@ -801,6 +801,15 @@ export async function mcpEnableIntent(input: McpEnableInput, deps: McpEnableDeps
     console.log(`digest: ${approval.digest}`);
   }
   if (record) {
+    // A re-enable that changes the server's OAuth host or endpoint set clears
+    // the proxy's OAuth state for it: the proxy remembers discovered
+    // endpoints append-only, so a stale set from the previous enable could
+    // keep colliding with another server's hosts until `mcp revoke`.
+    const previousRecord = identity ? previous.records[identity] : undefined;
+    if (previousRecord !== undefined && mcpEnabledOAuthSetChanged(previousRecord, record)) {
+      updateMcpOAuthEpochs(projectRoot(), mcpOAuthEpochsPath(stateDir()), { revoke: [mcpOAuthProviderId(agent, serverName)] });
+      console.log(`OAuth hosts for ${agent} ${shownName} changed since the previous enable; the proxy clears its OAuth state for this server, so it needs a new OAuth login`);
+    }
     const saved = saveMcpEnabledRecord(projectRoot(), enabledFile, record);
     if (saved.droppedInvalid > 0) console.log(`dropped ${saved.droppedInvalid} invalid MCP enable record(s) from ${enabledFile}`);
     console.log(`OAuth hosts: ${hosts.length > 0 ? hosts.map((host) => host.host).join(", ") : "none"}`);
@@ -1224,4 +1233,14 @@ export function prepareEffectiveRuntimeIntent(input: {
     basePolicyGeneration: base.generation,
     policy: effective.raw,
   }, null, 2)}\n`, 0o600);
+}
+
+/** Whether two `mcp enable` records name different OAuth hosts or endpoints. */
+function mcpEnabledOAuthSetChanged(previous: McpEnabledRecord, next: McpEnabledRecord): boolean {
+  const hosts = (record: McpEnabledRecord): string => record.oauthHosts.map((host) => host.host).sort().join("\0");
+  const endpoints = (record: McpEnabledRecord): string => (record.oauthEndpoints ?? [])
+    .map((endpoint) => `${endpoint.kind}\0${endpoint.host}\0${endpoint.path}`)
+    .sort()
+    .join("\n");
+  return hosts(previous) !== hosts(next) || endpoints(previous) !== endpoints(next);
 }

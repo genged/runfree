@@ -303,7 +303,7 @@ import { createInternalSessionAdmissionDriver, SESSION_HANDOFF_WAIT_CEILING_MS }
 import { LAUNCH_LOCK_HOLD_BUDGET_MS } from "./launch-lock-hold.ts";
 import { SessionLaunchCancelledError, SessionTeardownIncompleteError } from "./session-admission-probe.ts";
 import { createHeadlessRuntimeIO } from "../terminal-mode.ts";
-import { flushWarnings, setOutputWriterForTest } from "../warnings.ts";
+import { flushWarnings, pendingWarningsForTest, setOutputWriterForTest } from "../warnings.ts";
 import type { ActiveRuntimePlan } from "./plan.ts";
 import {
   SessionLockAcquisitionTimeoutError,
@@ -3955,10 +3955,16 @@ describe("session admission under the per-session file source", () => {
       nowEpochMs: () => Date.parse("2026-08-09T00:10:00.000Z"),
     });
 
-    // The launch still reports the blocked attempt; the reclamation is that
-    // the record and container do not survive it.
-    const failure = await driver.launchBuiltin("codex").catch((error: unknown) => error);
-    expect(flattenCauses(failure)).toContain("observation-unavailable during delete-session-file");
+    // The teardown that completes on its retry is a completed teardown: the
+    // launch resolves, the blocked attempt is reported as a warning, and the
+    // reclamation is that the record and container do not survive it.
+    flushWarnings();
+    await expect(driver.launchBuiltin("codex")).resolves.toBeDefined();
+    expect(pendingWarningsForTest().map((event) => event.message).join("\n"))
+      .toContain("the session teardown completed on its retry; the first attempt failed: ");
+    expect(pendingWarningsForTest().map((event) => event.message).join("\n"))
+      .toContain("observation-unavailable during delete-session-file");
+    flushWarnings();
 
     expect(teardownEvents()).toEqual([
       "stamp-revoking",
@@ -3990,8 +3996,12 @@ describe("session admission under the per-session file source", () => {
       nowEpochMs: () => Date.parse("2026-08-09T00:10:00.000Z"),
     });
 
-    const failure = await driver.launchBuiltin("codex").catch((error: unknown) => error);
-    expect(flattenCauses(failure)).toContain("foreground detach failed");
+    // The second cleanup pass finds nothing to do and completes, so the launch
+    // resolves; the detach failure is reported as the first attempt's failure.
+    flushWarnings();
+    await expect(driver.launchBuiltin("codex")).resolves.toBeDefined();
+    expect(pendingWarningsForTest().map((event) => event.message).join("\n")).toContain("foreground detach failed");
+    flushWarnings();
 
     // Exactly one of each effect: a session whose file, container, and record
     // are already gone has nothing left for a second pass to do.

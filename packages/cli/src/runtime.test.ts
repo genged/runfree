@@ -2093,10 +2093,12 @@ function createRuntimeIO(overrides: {
       const manifest = JSON.parse(fs.readFileSync(path.join(
         effectiveRoot, "generations", active.controlGeneration.slice("sha256:".length), "manifest.json",
       ), "utf8")) as { policyGeneration: string };
+      // A test may withhold the gateway with the supervisor's sticky reason.
+      const withheld = process.env.FAKE_HOST_SERVICE_GATEWAY_UNAVAILABLE;
       return JSON.stringify({
         schemaVersion: 1,
         policyGeneration: manifest.policyGeneration,
-        gatewayIp: "192.168.65.254",
+        ...(withheld ? { unavailableReason: withheld } : { gatewayIp: "192.168.65.254" }),
         writtenAt: "2026-06-14T00:00:00.000Z",
       });
     };
@@ -5949,6 +5951,25 @@ describe("runtime command flow", () => {
       const errOutput = vi.mocked(console.error).mock.calls.flat().join("\n");
       expect(errOutput).toContain("runfree warning:");
       expect(errOutput).toContain("host service idb (127.0.0.1:10882):");
+    });
+
+    test("a launch says when the proxy withholds the host-service gateway, with the reclaim", async () => {
+      // Before, a withheld gateway was visible only in `runfree status`: the
+      // launch went green and the agent's host-service connections failed.
+      const context = launchContext();
+      // With the gateway withheld the kernel holds no host-service pairs, so
+      // topology validation passes and the launch is green: the silent case.
+      const io = createRuntimeIO({ hostServiceSet: [] });
+      process.env.FAKE_HOST_SERVICE_GATEWAY_UNAVAILABLE = "gateway address changed";
+      try {
+        expect((await startRuntime(context, io, false, { launch: true })).status).toBe(0);
+      } finally {
+        delete process.env.FAKE_HOST_SERVICE_GATEWAY_UNAVAILABLE;
+      }
+      flushWarnings();
+      const errOutput = vi.mocked(console.error).mock.calls.flat().join("\n");
+      expect(errOutput).toContain("host services are approved but the proxy withholds their gateway: gateway address changed");
+      expect(errOutput).toContain("runfree rebuild");
     });
 
     test("a launch refreshes the host-global port registry with the effective ports", async () => {

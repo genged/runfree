@@ -8,6 +8,7 @@ import {
   type ProxyNftablesProofInput,
 } from "../proxy-nftables-proof.ts";
 import { remedy } from "../remedies.ts";
+import { warn } from "../warnings.ts";
 import { PROXY_SERVER_UID } from "@runfree/proxy/firewall/nftables";
 import { HOST_SERVICE_GATEWAY_STATUS_FILE } from "@runfree/runtime-contracts/host-services";
 import {
@@ -392,6 +393,14 @@ function observeHostServiceFirewall(
   const gatewayIp = status.gatewayIp;
   observation.gatewayIp = gatewayIp;
   observation.expected = gatewayIp === undefined ? [] : effective.ports.map((port) => ({ ip: gatewayIp, port }));
+  if (gatewayIp === undefined && effective.ports.length > 0) {
+    // Not an issue: the kernel set is legitimately empty while the gateway is
+    // withheld, so validation passes and the launch is green. Said here, at
+    // the launch, instead of only in `runfree status`: the agent's
+    // host-service connections will fail until the reclaim runs.
+    warn(`host services are approved but the proxy withholds their gateway: ${status.unavailableReason ?? "unknown reason"}; `
+      + `the agent cannot reach them until \`${remedy.rebuild()}\` recreates the runtime`);
+  }
   return observation;
 }
 

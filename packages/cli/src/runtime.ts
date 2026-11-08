@@ -5,7 +5,6 @@ import { assertSessionDisruptionAuthorized } from "./runtime/session-disruption.
 import { captureAsync } from "./runtime/async-capture.ts";
 
 import { DEFAULT_WRITE_ACTION, effectiveWriteAction, validateNetworkPolicy } from "@runfree/runtime-contracts/network-policy";
-import { parseHostServiceGatewayStatus } from "@runfree/runtime-contracts/proxy-status";
 import { service, serviceHostNames } from "../../../scripts/services.ts";
 import {
   resolveAgentCommand,
@@ -54,10 +53,8 @@ import {
 } from "./runtime/component-diagnostics.ts";
 import { prepareDependencyOverlayPlan } from "./runtime/dependency-overlays.ts";
 import { runFencedProjectDestroy } from "./runtime/destroy.ts";
-import { containerMissingNetwork, dockerClientEnvOptions, serviceContainerId } from "./runtime/docker.ts";
+import { containerMissingNetwork, dockerClientEnvOptions } from "./runtime/docker.ts";
 import { createDockerClient } from "./runtime/docker-client.ts";
-import { ROOT_UID_GID } from "./runtime/constants.ts";
-import { PROXY_HOST_SERVICE_GATEWAY_STATUS_PATH } from "./runtime/probes.ts";
 import { printHostGitStatusLine } from "./runtime/git-layout.ts";
 import { clearStoppedControlPlaneSelection } from "./runtime/stopped-selection.ts";
 import {
@@ -102,6 +99,7 @@ import type {
 import { flushWarnings, warn } from "./warnings.ts";
 import { remedy } from "./remedies.ts";
 import { setMcpLogContext } from "./runtime/mcp.ts";
+import { readHostServiceGatewayState } from "./runtime/host-service-gateway-state.ts";
 
 export { containerMissingNetwork };
 export type { CaptureResult, RuntimeAdminIntent, RuntimeContext, RuntimeIO } from "./runtime/types.ts";
@@ -1141,33 +1139,6 @@ function printHostServiceStatusLine(context: RuntimeContext, io: RuntimeIO): voi
   }
 }
 
-type HostServiceGatewayState =
-  | { kind: "available"; gatewayIp: string }
-  | { kind: "unavailable"; reason: string }
-  | { kind: "not-running" }
-  | { kind: "unknown"; detail: string };
-
-// The gateway the root firewall supervisor published (design "Approval and
-// CLI", HS8): the pinned address, or the sticky reason it withholds one (for
-// example `gateway address changed`, reclaimed by `runfree rebuild`). Read
-// through a root exec of the running proxy, as the other proxy status reads
-// do. Observation only.
-function readHostServiceGatewayState(context: RuntimeContext, io: RuntimeIO): HostServiceGatewayState {
-  const proxyId = serviceContainerId(composeProjectName(context.projectRoot), "proxy", context, io, { runningOnly: true });
-  if (!proxyId) return { kind: "not-running" };
-  const read = createDockerClient(io, dockerClientEnvOptions(context))
-    .exec(proxyId, ["cat", PROXY_HOST_SERVICE_GATEWAY_STATUS_PATH], { user: ROOT_UID_GID });
-  if (read.status !== 0) {
-    return { kind: "unknown", detail: `reading the proxy's gateway status failed (exit ${read.status})` };
-  }
-  try {
-    const status = parseHostServiceGatewayStatus(read.stdout);
-    if (status.gatewayIp !== undefined) return { kind: "available", gatewayIp: status.gatewayIp };
-    return { kind: "unavailable", reason: status.unavailableReason ?? "unknown reason" };
-  } catch (error) {
-    return { kind: "unknown", detail: `the proxy's gateway status is malformed: ${error instanceof Error ? error.message : String(error)}` };
-  }
-}
 
 // Root writes the reason, but keep terminal control bytes out of status.
 function printableStatusText(text: string): string {

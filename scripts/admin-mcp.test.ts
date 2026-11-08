@@ -1372,6 +1372,33 @@ describe("runfree mcp enable", () => {
     expect(again["mcp:claude-servera"]?.stateEpoch).not.toBe(before["mcp:claude-servera"]?.stateEpoch);
   });
 
+  test("re-enabling a server with a changed OAuth host set starts a new epoch; an unchanged re-enable keeps it", async () => {
+    // The proxy remembers discovered endpoints append-only; before, only a
+    // revoke bumped the epoch, so a stale host set from an earlier enable
+    // kept colliding with another server's hosts until `mcp revoke`.
+    writeProjectOauthServer("serverA", "https://a.example.com/mcp");
+    type Providers = { providers: Record<string, { stateEpoch?: string }> };
+    const enable = (oauthHosts: string[]) =>
+      runAdmin(() => mcpEnableIntent(enableInput({ server: "serverA", interactive: false, discover: false, oauthHosts }), { discovery: NO_NETWORK }).then(() => {}));
+    expect((await enable(["sso.example.org"])).status).toBe(0);
+    expect((await runAdmin(() => prepareRuntime())).status).toBe(0);
+    const before = (readMcpOAuthPolicy() as Providers).providers["mcp:claude-servera"]?.stateEpoch;
+
+    const changed = await enable(["sso.example.org", "idp.example.org"]);
+    expect(changed.status, changed.stderr).toBe(0);
+    expect(changed.stdout).toContain("OAuth hosts for claude serverA changed since the previous enable");
+    expect((await runAdmin(() => prepareRuntime())).status).toBe(0);
+    const after = (readMcpOAuthPolicy() as Providers).providers["mcp:claude-servera"]?.stateEpoch;
+    expect(after).toMatch(/^[a-f0-9]{32}$/);
+    expect(after).not.toBe(before);
+
+    const same = await enable(["sso.example.org", "idp.example.org"]);
+    expect(same.status, same.stderr).toBe(0);
+    expect(same.stdout).not.toContain("changed since the previous enable");
+    expect((await runAdmin(() => prepareRuntime())).status).toBe(0);
+    expect((readMcpOAuthPolicy() as Providers).providers["mcp:claude-servera"]?.stateEpoch).toBe(after);
+  });
+
   test("an invalid OAuth epoch store fails closed: every MCP server gets a new epoch, with a warning", async () => {
     writeClaudeNative({ mcpServers: { linear: { type: "http", url: "https://mcp.linear.example/mcp" } } });
     expect((await runAdmin(() => prepareRuntime())).status).toBe(0);

@@ -2859,12 +2859,14 @@ export function createInternalSessionAdmissionDriver(
     kind: SessionAdmissionSessionKind,
     options: SessionAdmissionLaunchOptions,
   ): Promise<SessionAdmissionLaunchOutcome> => {
-    begin();
     // L0 instrumentation: opt-in per-step timing plus the gateway's Docker
     // operation count, surfaced per launch. Measurement only — the facade
     // delegates every step to the same object and never reorders or retries.
+    // Built before the in-flight guard is taken: a throw here would otherwise
+    // leave the guard set with nothing to reset it.
     const timings = createRuntimeTimings(resolvedInput.context.env);
     const histogram = timings.enabled ? createOperationHistogram(timings.operation) : undefined;
+    begin();
     let steps: InternalBuiltinAdmissionProbeSteps | undefined;
     const attempt = async (): Promise<SessionAdmissionLaunchOutcome> => {
       steps = stepsFor(kind, options, histogram);
