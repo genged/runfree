@@ -637,6 +637,13 @@ which ports it relays. Docker Desktop needs no relay, and none runs there.
   services time out.
 - A newly added port can refuse connections for a moment while the relay
   binds it; retry.
+- A host service that is not listening is reported differently per backend.
+  On Docker Desktop the proxy refuses the agent's CONNECT before any byte
+  (`host-service-unavailable`, and `runfree doctor` names it). On Linux the
+  relay accepts the proxy's connection and only then finds `127.0.0.1:<port>`
+  closed, so the agent sees a connection that opens and closes at once, and no
+  denial is logged; `docker logs runfree-<project id>-host-relay` shows the
+  refused dial.
 - Rootless Docker, OrbStack, Colima, and remote daemons (a Docker Desktop
   reached over TCP or SSH included) refuse `add` with "host services need
   Docker Desktop or a local Docker Engine on Linux".

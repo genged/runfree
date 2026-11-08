@@ -1346,6 +1346,8 @@ describe("proxy firewall audit mode supervisor", () => {
     let now = 1_000;
     let marker: AuditMarkerState = ACTIVE_MARKER;
     let spool = "observed.example\n";
+    let teardownFails = true;
+    const teardownsApplied: string[][] = [];
     const auditSwaps: string[][] = [];
     const clearedSnapshots: string[] = [];
     const clearedSpools: string[] = [];
@@ -1368,9 +1370,10 @@ describe("proxy firewall audit mode supervisor", () => {
       replaceAuditDrainingSet: async () => {},
       // The teardown batch fails, simulating an unexpected nft error after the
       // size bound. Teardown must still empty audit_ipv4, clear state, and not
-      // wedge the loop.
-      applyAuditTeardown: async () => {
-        throw new Error("nft teardown boom");
+      // wedge the loop; the draining set lands on a later tick.
+      applyAuditTeardown: async (drainingIps) => {
+        if (teardownFails) throw new Error("nft teardown boom");
+        teardownsApplied.push([...drainingIps]);
       },
       publishAuditResolvedHosts: () => {},
       clearAuditResolvedHosts: (path) => {
@@ -1397,6 +1400,19 @@ describe("proxy firewall audit mode supervisor", () => {
     // State is cleared regardless of the apply error.
     expect(clearedSnapshots).toContain(plan.audit.resolvedHostsPath);
     expect(clearedSpools).toContain(plan.audit.spoolPath);
+    // The flush stopped new non-allowlisted connections, but the draining set
+    // that cuts the established audited flows was not installed. It is
+    // applied again on the next tick, and lands once nft answers.
+    expect(teardownsApplied).toEqual([]);
+    await controller.refreshPolicyAndIps({ refreshDns: false });
+    expect(logs).toContainEqual(expect.stringContaining("audit teardown retry failed"));
+    teardownFails = false;
+    await controller.refreshPolicyAndIps({ refreshDns: false });
+    expect(teardownsApplied).toEqual([["9.9.9.9"]]);
+    expect(logs).toContainEqual(expect.stringContaining("audit teardown applied on retry draining=1"));
+    // Once applied, nothing is pending: a further tick applies nothing.
+    await controller.refreshPolicyAndIps({ refreshDns: false });
+    expect(teardownsApplied).toHaveLength(1);
 
     // The next inactive tick is a no-op: tracking was reset, so the failing
     // teardown is not retried forever.

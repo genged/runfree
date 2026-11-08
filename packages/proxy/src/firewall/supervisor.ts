@@ -317,6 +317,9 @@ export function createFirewallController(overrides: Partial<FirewallControllerDe
   let lastPublishedGatewayKey: string | undefined;
   let lastPublishedStatusKey: string | undefined;
   let lastRulesetVerified = true;
+  // The draining set of an audit teardown whose nft apply failed, re-applied
+  // on later ticks until it lands (teardownAudit).
+  let pendingAuditTeardown: readonly string[] | undefined;
 
   function publishStatus(plan: FirewallPlan, rulesetVerified: boolean): void {
     lastRulesetVerified = rulesetVerified;
@@ -746,8 +749,13 @@ export function createFirewallController(overrides: Partial<FirewallControllerDe
     let applyError: unknown;
     try {
       await deps.applyAuditTeardown(drainingIps, plan);
+      pendingAuditTeardown = undefined;
     } catch (error) {
       applyError = error;
+      // The flush below stops new non-allowlisted connections, but the
+      // draining set that cuts the established audited flows was not
+      // installed; the next tick applies it again until it lands.
+      pendingAuditTeardown = drainingIps;
       deps.log(`proxy-firewall: audit teardown apply failed reason=${reason}: ${formatError(error)}`);
       try {
         // Best-effort: empty audit_ipv4 so non-allowlisted IPs stop being
@@ -911,6 +919,16 @@ export function createFirewallController(overrides: Partial<FirewallControllerDe
     // best-effort (it always resets in-memory tracking), so a logged error
     // here cannot leave audit state permanently wedged across ticks.
     try {
+      if (pendingAuditTeardown !== undefined) {
+        const retry = pendingAuditTeardown;
+        try {
+          await deps.applyAuditTeardown(retry, plan);
+          pendingAuditTeardown = undefined;
+          deps.log(`proxy-firewall: audit teardown applied on retry draining=${retry.length}`);
+        } catch (error) {
+          deps.log(`proxy-firewall: audit teardown retry failed: ${formatError(error)}`);
+        }
+      }
       await maintainAuditDrain(plan);
       const marker = deps.readAuditMarkerState(plan.audit.markerPath, deps.nowMs());
       if (!marker.active) {

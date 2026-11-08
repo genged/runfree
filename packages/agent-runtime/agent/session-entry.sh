@@ -34,6 +34,9 @@
 #
 # Exit codes:
 #   111  the wait bound elapsed without the proxy reporting the session active
+#   112  the readiness probe itself could not run (missing, not executable,
+#        or refusing its own argv): a project image that changed this entry's
+#        directory, never the proxy, and never worth the whole wait bound
 #   143  SIGTERM while waiting (the container was stopped)
 #   130  SIGINT while waiting
 #    64  invalid argv or an invalid host-rendered wait bound
@@ -47,6 +50,7 @@
 set -u
 
 RUNFREE_SESSION_ENTRY_TIMEOUT_EXIT=111
+RUNFREE_SESSION_ENTRY_PROBE_EXIT=112
 RUNFREE_SESSION_ENTRY_USAGE_EXIT=64
 RUNFREE_SESSION_ENTRY_DEFAULT_TIMEOUT_MS=60000
 # Between probe runs. A run itself retries for up to 2 s (see
@@ -184,6 +188,17 @@ while :; do
   if run_interruptible "$probe"; then
     break
   fi
+  # The probe's own usage exit (64) and the shell's cannot-run statuses (126:
+  # not executable, 127: not found) are not answers from the proxy: polling
+  # them for the whole bound printed the same failure thousands of times and
+  # then blamed the proxy.
+  case "$interruptible_status" in
+    64|126|127)
+      echo "runfree: session readiness probe could not run (exit $interruptible_status): $probe; the agent image's session entry directory is not intact" >&2
+      [ -n "$relay_pid" ] && kill "$relay_pid" 2>/dev/null
+      exit "$RUNFREE_SESSION_ENTRY_PROBE_EXIT"
+      ;;
+  esac
   now="$(date +%s)"
   elapsed=$(( now - started_at ))
   if [ "$elapsed" -ge "$timeout_s" ]; then
@@ -209,9 +224,11 @@ done
 # opened here, as part of the exec itself, and nowhere earlier: no probe or
 # relay child ever holds it.
 if [ -n "$stdin_file" ]; then
-  exec "$@" <"$stdin_file"
-  # A POSIX shell exits on a failed redirection of `exec`; this covers one
-  # that keeps going, so the agent never runs with some other stdin.
+  # `command exec`: a redirection that fails on the special built-in `exec`
+  # ends a non-interactive POSIX shell with the shell's own status (2 under
+  # dash), not the documented 66; as a regular built-in the failure returns
+  # here instead, and the agent never runs with some other stdin.
+  command exec "$@" <"$stdin_file"
   echo "runfree: session entry cannot read the prompt file: $stdin_file" >&2
   exit "$RUNFREE_SESSION_ENTRY_NO_INPUT_EXIT"
 fi

@@ -305,11 +305,22 @@ const acceptedSocketsByIp = new Map<string, Set<net.Socket>>();
 let sessionAdmissionWatchTimer: NodeJS.Timeout | undefined;
 let sessionAdmissionWatch: SessionAdmissionWatch | undefined;
 let lastSessionAdmissionWatchError: string | undefined;
+let ipAssignmentsUnreadableReported = false;
 
 function reconcileSessionAdmission(): void {
   try {
     // Retire authority and sockets before acknowledging a draining address.
     const assignments = ipAssignments.read();
+    // Fail-closed by design: one unreadable or malformed assignment file (a
+    // host-only write) refuses every session. Said once, with the way out,
+    // rather than only through sessions that stop being served.
+    if (assignments === undefined && !ipAssignmentsUnreadableReported) {
+      ipAssignmentsUnreadableReported = true;
+      console.error(`proxy: the session IP assignments under ${ipAssignments.directory} are unreadable or malformed; every session is refused until the host repairs them: run \`runfree destroy --force\`, then \`runfree up\``);
+    } else if (assignments !== undefined && ipAssignmentsUnreadableReported) {
+      ipAssignmentsUnreadableReported = false;
+      console.error("proxy: the session IP assignments are readable again");
+    }
     const blocked = assignments === undefined ? "all" as const : new Set(
       Array.from(assignments.values()).filter((entry) => entry.state === "draining").map((entry) => entry.sourceIp),
     );
