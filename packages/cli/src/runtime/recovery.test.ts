@@ -220,6 +220,22 @@ describe("bounded offline recovery inventory", () => {
     expect(inventory.invalidFiles).toBeGreaterThanOrEqual(4);
   });
 
+  test("a forged registry timestamp outside the Date range is skipped and hides nothing else", () => {
+    // Before: `new Date(1e16).toISOString()` threw inside the scan, the one
+    // catch around every project returned an empty inventory with
+    // `truncated: false`, and `runfree resume --all` and `runfree sessions`
+    // said "no interrupted sessions" for every project on the host.
+    hostEvidence();
+    claudeEvidence({ startedAt: 1e16 });
+    claudeEvidence({ updatedAt: Number.MAX_SAFE_INTEGER }, 4243);
+
+    const inventory = scanRecoveryInventory({ env });
+
+    expect(inventory.items.map((item) => item.sourceId)).toEqual(["rf-20260731-abcdef"]);
+    expect(inventory.invalidFiles).toBe(2);
+    expect(inventory.truncated).toBe(false);
+  });
+
   test("rejects invalid same-terminal resume fields on host evidence", () => {
     hostEvidence("rf-20260731-badterm", { terminalIds: { iterm: 5 } });
     hostEvidence("rf-20260731-badver", { recordVersion: 3 });
@@ -1285,6 +1301,34 @@ describe("transactional claims and evidence consumption", () => {
     expect(fs.existsSync(first?.path ?? "")).toBe(true);
     first?.release();
     expect(fs.existsSync(first?.path ?? "")).toBe(false);
+  });
+
+  test("a claim write that fails after creating its file leaves no partial claim behind", async () => {
+    // Disk full between `wx` creating the claim and the bytes landing left a
+    // 0-byte claim nobody owned; the conversation could then be neither
+    // resumed nor forgotten until the dead-claim age passed.
+    hostEvidence(undefined, { outcome: "interrupted", exitStatus: 137, endedAt: "2026-07-31T00:02:00.000Z" });
+    const item = firstItem();
+    const context = runtimeContext();
+    const claimPath = recoveryClaimScope(item).path;
+    const writeFileSync = fs.writeFileSync.bind(fs);
+    const spy = vi.spyOn(fs, "writeFileSync").mockImplementation(((file, data, options) => {
+      if (file === claimPath && typeof options === "object" && options !== null && "flag" in options && options.flag === "wx") {
+        writeFileSync(file, "", { mode: 0o600, flag: "wx" });
+        throw Object.assign(new Error("ENOSPC: no space left on device"), { code: "ENOSPC" });
+      }
+      return writeFileSync(file, data, options);
+    }) as typeof fs.writeFileSync);
+    try {
+      await expect(acquireRecoveryClaim(context, item)).rejects.toThrow("ENOSPC");
+    } finally {
+      spy.mockRestore();
+    }
+    expect(fs.existsSync(claimPath)).toBe(false);
+
+    const retried = await acquireRecoveryClaim(context, item);
+    expect(retried).toBeDefined();
+    retried?.release();
   });
 
   test("a selector waiting on the lifecycle lock cannot claim Claude evidence consumed meanwhile", async () => {

@@ -114,6 +114,7 @@ function filterByAgents(inventory: RecoveryInventory, selectedAgents: Set<string
 function eligibleForAllProjectsPicker(item: RecoveryItem): boolean {
   if (item.state === "claimed" || item.state === "unrecoverable" || item.state === "active") return false;
   if (item.claimUnprovable) return false;
+  if (item.resumeBlockedReason !== undefined) return false; // the live classification would refuse it anyway
   if (item.evidenceKind === "claude") return true; // never carries recordVersion; not a decision-3 record
   return item.recordVersion === 2;
 }

@@ -80,6 +80,12 @@ function fakePromptApi(responses: readonly unknown[]): PromptApi & { calls: Sele
 }
 
 describe("promptResumeSelection: one question", () => {
+  test("a name copied from agent-written evidence carries its label into the question", async () => {
+    const api = fakePromptApi(["resume"]);
+    await promptResumeSelection({ kind: "one-question", row: row({ note: "name Claude reported" }) }, api);
+    expect(api.calls[0]?.message).toBe('Interrupted in this terminal (14:02, 6 min ago):\n"refactor proxy denial messages" — claude (name Claude reported)');
+  });
+
   test("asks with the host-fact message, Resume it / Not now / Forget it in order, defaulting to Resume it", async () => {
     const theRow = row();
     const api = fakePromptApi(["resume"]);
