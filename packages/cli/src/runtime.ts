@@ -64,7 +64,7 @@ import {
   activeLifecycleSessions,
   activeOrStartingAgentSessions,
   printSessions,
-  projectLifecycleLockPath,
+  describeLifecycleLockBlocker,
   tryAcquireProjectLifecycleLockWithRetry,
 } from "./runtime/sessions.ts";
 import { readProxySessionFiles, type ProxySessionFile } from "./runtime/session-reconcile.ts";
@@ -1455,7 +1455,7 @@ export async function destroyRuntime(
   // change instead of tearing the runtime down under it.
   const lifecycleLock = await tryAcquireProjectLifecycleLockWithRetry(destroyContext);
   if (!lifecycleLock) {
-    return die(`nothing was destroyed: a Runfree runtime lifecycle change is in progress (lock: ${projectLifecycleLockPath(destroyContext)}); retry when it finishes`);
+    return die(`nothing was destroyed: a Runfree runtime lifecycle change is in progress (${describeLifecycleLockBlocker(destroyContext)}); retry when it finishes`);
   }
   try {
     forgetWarmLaunchRecords(destroyContext);

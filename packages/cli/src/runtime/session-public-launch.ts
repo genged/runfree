@@ -308,7 +308,13 @@ async function withSessionLaunchFrame<T>(
           );
         }
       } finally {
-        sessionLockManager.close();
+        try {
+          sessionLockManager.close();
+        } catch (error) {
+          // A lock this frame lost or a manager still mid-reacquisition is a
+          // fact worth printing, not a reason to hide the launch's own error.
+          warn(error instanceof Error ? error.message : String(error));
+        }
       }
       preparedRuntime = await input.reprepare();
     }

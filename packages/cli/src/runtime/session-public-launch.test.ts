@@ -34,6 +34,7 @@ vi.mock("./prepared-runtime.ts", () => ({
 }));
 
 import { defaultConfig } from "../config.ts";
+import { flushWarnings, setOutputWriterForTest } from "../warnings.ts";
 import { projectHash } from "../project-identity.ts";
 import {
   launchConfiguredAgentThroughAdmission,
@@ -468,6 +469,31 @@ describe("public launch through session admission", () => {
       expect(mocks.handoffs.has(prepared)).toBe(false);
       expect(lockIsFree()).toBe(true);
     });
+  });
+
+  test("a lock the launch lost is reported, not allowed to mask the launch's own error", async () => {
+    // Before: the manager's close() in the frame's finally threw "refusing to
+    // release a replaced project lifecycle lock" and that replaced the error
+    // the launch actually failed with.
+    const prepared = preparedRuntime();
+    const lockPath = path.join(stateDir, "runtime-lifecycle.lock");
+    const lines: string[] = [];
+    setOutputWriterForTest((line) => lines.push(line));
+    mocks.launchBuiltin.mockImplementationOnce(async () => {
+      fs.rmSync(lockPath, { recursive: true, force: true });
+      fs.mkdirSync(lockPath, { mode: 0o700 });
+      fs.writeFileSync(path.join(lockPath, "owner-token"), `${"b".repeat(64)}\n`, { mode: 0o600 });
+      throw new Error("admission failed closed");
+    });
+    try {
+      await expect(launchConfiguredAgentThroughAdmission({ preparedRuntime: prepared, io, agentName: "codex" }))
+        .rejects.toThrow("admission failed closed");
+      flushWarnings();
+    } finally {
+      setOutputWriterForTest(undefined);
+    }
+    expect(lines.some((line) => line.includes("refusing to release a replaced project lifecycle lock"))).toBe(true);
+    fs.rmSync(lockPath, { recursive: true, force: true });
   });
 
   test("releases a handed-off lock when the launch fails", async () => {

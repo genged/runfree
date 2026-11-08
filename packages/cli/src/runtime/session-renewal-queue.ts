@@ -1,7 +1,7 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { hostBootId, hostProcessStart } from "./host-identity.ts";
+import { hostBootId, hostProcessStart, processAlive } from "./host-identity.ts";
 import { sessionRecordOwnerLiveness } from "./session-record-liveness.ts";
 import { readBoundedRegularFile } from "../strict-primitives.ts";
 
@@ -55,12 +55,20 @@ export function sessionRenewalQueueHead(stateDir: string, nowMs = Date.now(), en
     const record = readTicket(file, entry);
     if (!record) continue;
     const issuedAt = Number(ticketPattern.exec(entry)?.[1]);
-    // Wall time schedules a stale-owner check; it never expires a live request.
-    // The requester releases on acquisition, cancellation, or its bounded wait.
-    // A clock step cannot erase its priority. Unknown owners retain the ticket
-    // until cancellation or explicit repair of the host scheduling entry.
-    if ((nowMs < issuedAt || nowMs - issuedAt >= SESSION_RENEWAL_WAIT_BUDGET_MS)
-      && sessionRecordOwnerLiveness(record, env) === "dead") {
+    // A ticket whose process no longer exists is a request nobody is waiting
+    // on, and it is reclaimed on the first read: `processAlive` is one signal
+    // probe, cheap enough for every poll, and a gone pid is death on any boot.
+    // Keeping it for the wait budget wedged every command behind a lock
+    // nobody held. The fuller proof below (boot and process-start identity,
+    // which can spawn a probe) stays on the budget schedule: wall time
+    // schedules that check, it never expires a live request. The requester
+    // releases on acquisition, cancellation, or its bounded wait, a clock step
+    // cannot erase its priority, and unknown owners retain the ticket until
+    // cancellation or explicit repair of the host scheduling entry.
+    const ownerGone = !processAlive(record.hostPid)
+      || ((nowMs < issuedAt || nowMs - issuedAt >= SESSION_RENEWAL_WAIT_BUDGET_MS)
+        && sessionRecordOwnerLiveness(record, env) === "dead");
+    if (ownerGone) {
       try { fs.unlinkSync(file); }
       catch (error) { if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error; }
       continue;

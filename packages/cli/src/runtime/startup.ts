@@ -105,6 +105,7 @@ import {
   activeAgentSessions,
   activeOrStartingAgentSessions,
   confirmRebuildIfActiveSessions,
+  describeLifecycleLockBlocker,
   projectLifecycleLockPath,
   serviceList,
   tryAcquireProjectLifecycleLockWithRetry,
@@ -1569,7 +1570,7 @@ export async function startRuntime(
     // Where a handed-off lock's one continuous hold starts (launch-lock-hold.ts).
     const lockAcquiredAtMonotonicMs = performance.now();
     if (!lifecycleLock) {
-      warn(`the runtime did not start: another Runfree runtime lifecycle change is in progress (lock: ${projectLifecycleLockPath(preparedContext)}); retry when it finishes`);
+      warn(`the runtime did not start: another Runfree runtime lifecycle change is in progress (${describeLifecycleLockBlocker(preparedContext)}); retry when it finishes`);
       return result(1, false, preparedContext);
     }
     let lockSpanStarted = performance.now();
@@ -2272,6 +2273,16 @@ export async function startRuntime(
                   try { outcome = { ok: true, value: await work() }; }
                   catch (error) { outcome = { ok: false, error }; }
                   lifecycleLock = await tryAcquireProjectLifecycleLockWithRetry(activeContext);
+                  if (!lifecycleLock) {
+                    // Named here, not by the wrapper below: its "released for
+                    // credential resolution" describes the window this frame
+                    // opened on purpose, not the contention that kept it open.
+                    throw new Error(
+                      `could not reacquire the project lifecycle lock after credential resolution (${
+                        describeLifecycleLockBlocker(activeContext)
+                      }); the proxy replacement is journaled, so retry with \`${remedy.up()}\``,
+                    );
+                  }
                   lockSpanStarted = performance.now();
                   heldLifecycleLock.assertHeld();
                   const current = readControlPlaneRebindTransaction(activePlan.paths.stateDir,

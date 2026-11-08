@@ -69,7 +69,12 @@ import {
 } from "./session-file-publisher.ts";
 import { readSessionHostStatus, removeSessionHostStatus } from "./session-host-status.ts";
 import { classifySessionRecordLiveness } from "./session-record-liveness.ts";
-import { activeOrStartingAgentSessions, sessionWarningLine, type ProjectLifecycleLock } from "./sessions.ts";
+import {
+  activeOrStartingAgentSessions,
+  removeLifecycleLockQuarantines,
+  sessionWarningLine,
+  type ProjectLifecycleLock,
+} from "./sessions.ts";
 import type { RuntimeContext, RuntimeIO } from "./types.ts";
 import { remedy } from "../remedies.ts";
 
@@ -1094,6 +1099,9 @@ export function runFencedProjectDestroy(input: FencedProjectDestroyInput): numbe
     // Swept by pattern rather than by this invocation's memory, so asides
     // left by an interrupted earlier destroy are cleared too.
     removeIllegibleSessionContainerRegistryAsidesV2(stateDir);
+    // Lifecycle lock quarantines are evidence a lost reclaim race keeps for
+    // its owner to inspect; `--force` is the operator saying it was inspected.
+    removeLifecycleLockQuarantines(input.context);
   }
 
   // The helper marker exists only so the next `up` sweeps for a helper whose
