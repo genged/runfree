@@ -592,3 +592,56 @@ describe("proxy policy path confusion properties", () => {
     );
   });
 });
+
+// --- Metamorphic relations (Phase 4) ----------------------------------------
+// Each relation rewrites a request in a way the shape rules say they ignore,
+// and asserts the decision does not move. Random generation alone rarely
+// produces two requests that differ only in an ignored part.
+
+describe("request shape metamorphic relations", () => {
+  const queryArb = fc.string({ unit: fc.constantFrom("a", "b", "1", "=", "&", "%", "_", "-"), maxLength: 12 });
+  const headerArb = fc.tuple(
+    fc.stringMatching(/^x-[a-z]{1,8}$/u),
+    fc.string({ unit: fc.constantFrom("a", "Z", "1", " ", ";", "=", "/"), maxLength: 16 }),
+  );
+
+  function httpsDecisionWithHeaders(pathAndQuery: string, method: string, options: PolicyOptions, headers: Record<string, string>): Decision {
+    const req: ProxyRequest = { url: `https://${HOST}${pathAndQuery}`, method, headers };
+    return decide(() => beforeAllowedRequest(admissionFor(), req, options));
+  }
+
+  it("M1.1: under a pathPrefixes rule, a query string never changes the decision", () => {
+    fc.assert(
+      fc.property(
+        fc.constantFrom(...PREFIXES),
+        fc.array(pieceArb(), { maxLength: 6 }),
+        fc.constantFrom("GET", "POST", "PUT"),
+        queryArb,
+        (prefix, pieces, method, query) => {
+          const path = prefixedPath(prefix, renderPieces(pieces));
+          fc.pre(!path.includes("?") && !path.includes("#"));
+          const options = pathPrefixOptions(prefix);
+          expect(httpsDecision(`${path}?${query}`, method, options), `${path} with ?${query}`).toBe(httpsDecision(path, method, options));
+        },
+      ),
+      propertyParameters(),
+    );
+  });
+
+  it("M1.2: under a pathPrefixes rule, an unrelated request header never changes the decision", () => {
+    fc.assert(
+      fc.property(
+        fc.constantFrom(...PREFIXES),
+        fc.array(pieceArb(), { maxLength: 6 }),
+        fc.constantFrom("GET", "POST", "DELETE"),
+        headerArb,
+        (prefix, pieces, method, [name, value]) => {
+          const path = prefixedPath(prefix, renderPieces(pieces));
+          const options = pathPrefixOptions(prefix);
+          expect(httpsDecisionWithHeaders(path, method, options, { [name]: value }), `${path} with ${name}`).toBe(httpsDecision(path, method, options));
+        },
+      ),
+      propertyParameters(),
+    );
+  });
+});

@@ -295,3 +295,33 @@ describe("GraphQL classifier properties", () => {
     );
   });
 });
+
+describe("GraphQL classifier metamorphic relations", () => {
+  // Separators (whitespace, commas, BOMs, and comments — comments that may
+  // spell `mutation`) carry no meaning; wrapping a document in them must not
+  // move its classification in either direction.
+  it("M2.1: leading and trailing separators and comments never change a document's classification", () => {
+    fc.assert(
+      fc.property(graphqlDocument(ALL_OPERATIONS), separator(ALL_OPERATIONS), separator(ALL_OPERATIONS), (document, lead, trail) => {
+        const before = classifyGraphqlDocument(document);
+        expect(classifyGraphqlDocument(`${lead}${document}${trail}`)).toBe(before);
+      }),
+      propertyParameters(),
+    );
+  });
+
+  it("M2.2: a read request body stays read when unrelated JSON fields are added beside the query", () => {
+    const extras = fc.record({
+      variables: fc.option(fc.dictionary(plainName, fc.oneof(fc.integer(), fc.string({ maxLength: 8 }), fc.boolean())), { nil: undefined }),
+      extensions: fc.option(fc.dictionary(plainName, fc.string({ maxLength: 8 })), { nil: undefined }),
+    }, { requiredKeys: [] });
+    fc.assert(
+      fc.property(readJsonBody, extras, (body, extra) => {
+        const plain = classifyJsonBody(JSON.stringify(body));
+        const extended = classifyJsonBody(JSON.stringify({ ...body, ...extra }));
+        expect(extended).toEqual(plain);
+      }),
+      propertyParameters(),
+    );
+  });
+});

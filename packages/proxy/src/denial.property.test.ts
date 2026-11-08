@@ -7,7 +7,7 @@ import fc from "fast-check";
 import { describe, expect, test } from "vitest";
 
 import { propertyParameters } from "../../../tests/support/property.ts";
-import { DENIAL_PATH_LIMIT, displayHostname, displayMethod, safePathname } from "./denial.ts";
+import { DENIAL_PATH_LIMIT, displayHostname, displayMethod, safePathname, UNPARSEABLE_HOST } from "./denial.ts";
 
 // C0 and C1 controls (ESC included) and the Unicode bidi overrides, embeddings,
 // isolates, and marks.
@@ -34,6 +34,28 @@ describe("denial display helpers", () => {
           expect(pathname).not.toMatch(TERMINAL_UNSAFE);
           expect(pathname.length).toBeLessThanOrEqual(DENIAL_PATH_LIMIT);
         }
+      }),
+      propertyParameters(),
+    );
+  });
+});
+
+describe("denial display helper metamorphic relations", () => {
+  // A displayed value fed back in displays as itself: the helpers are
+  // normalizations, so a second pass must find nothing left to change, or a
+  // denial body quoted into another denial body would drift.
+  test("M6.1: displayHostname, displayMethod, and safePathname are idempotent", () => {
+    fc.assert(
+      fc.property(requestText, requestText, requestText, (host, rawPath, method) => {
+        const shownHost = displayHostname(host);
+        // The one non-hostname a display can produce is the `<unparseable>`
+        // sentinel, whose angle brackets the sanitizer would strip again; it
+        // is a label, not a hostname, so it is outside this relation.
+        if (shownHost !== UNPARSEABLE_HOST) expect(displayHostname(shownHost)).toBe(shownHost);
+        const shownMethod = displayMethod(method);
+        if (shownMethod !== UNPARSEABLE_HOST) expect(displayMethod(shownMethod)).toBe(shownMethod);
+        const shownPath = safePathname(`/${rawPath}`);
+        if (shownPath !== undefined && shownPath !== UNPARSEABLE_HOST) expect(safePathname(shownPath)).toBe(shownPath);
       }),
       propertyParameters(),
     );

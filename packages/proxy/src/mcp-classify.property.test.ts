@@ -310,3 +310,25 @@ describe("MCP classifier properties", () => {
     );
   });
 });
+
+describe("MCP classifier metamorphic relations", () => {
+  it("M3.1: reordering a batch never changes its severity or effective write action", () => {
+    fc.assert(
+      fc.property(
+        fc.array(messageArb, { minLength: 2, maxLength: 5 }),
+        fc.nat(),
+        writeActionArb,
+        policyIndexArb,
+        (batch, rotation, globalWriteAction, policyIndex) => {
+          const shift = rotation % batch.length;
+          const rotated = [...batch.slice(shift), ...batch.slice(0, shift)];
+          const before = classify(JSON.stringify(batch), globalWriteAction, policyIndex);
+          const after = classify(JSON.stringify(rotated), globalWriteAction, policyIndex);
+          expect(severity(after)).toBe(severity(before));
+          expect(effectiveRank(after)).toBe(effectiveRank(before));
+        },
+      ),
+      propertyParameters(),
+    );
+  });
+});
