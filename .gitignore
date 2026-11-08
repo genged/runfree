@@ -8,6 +8,9 @@ coverage/
 .tmp/
 logs/
 
+# Mutation testing sandbox (`make test-mutation`); its reports go under local/.
+.stryker-tmp/
+
 # Maintainer-only records: plans, specs, evidence, todo, research notes. Public
 # documentation must work without this directory, and nothing here is published.
 local/

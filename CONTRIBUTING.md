@@ -178,6 +178,20 @@ as a plain example test in the module's ordinary test file, so it still runs if
 the generator changes. `make test-property-soak` runs the agent-input
 properties at 100,000 cases each; `RUNFREE_PROP_RUNS` sets the count for any run.
 
+**A lifecycle driver is tested at every crash point, and a parser of
+agent-written input never throws.** `tests/support/crash-steps.ts` runs a
+driver and crashes it after its k-th publishing write, so a model test can
+assert that every state a crash leaves has a `runfree` command that reclaims
+it and that `runfree sessions` shows what `runfree up` refuses on
+(`session-teardown-crash.property.test.ts` is the template). A reader of files
+the agent writes gets a property that feeds it arbitrary JSON and bytes and
+asserts a typed outcome with the host's own evidence intact
+(`recovery-registry.property.test.ts`). A classifier gets metamorphic
+relations beside its properties: one input and its rewrite in a part the
+classifier ignores must decide the same (the `M*` cases in the proxy property
+files). `make test-mutation` runs Stryker over the modules in
+`stryker.config.mjs` by hand; see [docs/testing.md](docs/testing.md#mutation-testing).
+
 **Prefer runtime inspection over declarative config in tests.** For
 capabilities, routes, mounts, and firewall state, ask the running system. A
 Compose file that says the right thing is not proof that the container has it.

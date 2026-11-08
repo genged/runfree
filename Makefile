@@ -1,6 +1,6 @@
 SHELL := /bin/bash
 
-.PHONY: help test test-all test-release test-static test-unit test-agent test-proxy test-security test-property-soak test-templates test-cli-e2e test-cli-e2e-live test-runtime test-runtime-core test-runtime-extended test-runtime-smoke test-runtime-live test-runtime-live-topology test-runtime-live-managed-launch test-runtime-live-egress test-runtime-live-connect-guard test-runtime-live-request-shape test-runtime-live-audit test-runtime-live-allowlist test-runtime-live-policy-mutation test-runtime-live-mcp-enable test-runtime-live-helper-reclaim test-runtime-live-host-service test-live-session-admission-docker-desktop test-live-session-admission-negative-docker-desktop test-live-session-admission-attached-docker-desktop test-live-session-renewal-docker-desktop test-live-session-independence-docker-desktop test-live-session-admission-crash-docker-desktop test-live-session-admission-drift-docker-desktop test-live-session-entry-gate-docker-desktop reclaim-runtime-sandbox reclaim-runtime-sandbox-apply test-watch test-git test-git-build git-bins-add git-bins-pin
+.PHONY: help test test-all test-release test-static test-unit test-agent test-proxy test-security test-property-soak test-mutation test-templates test-cli-e2e test-cli-e2e-live test-runtime test-runtime-core test-runtime-extended test-runtime-smoke test-runtime-live test-runtime-live-topology test-runtime-live-managed-launch test-runtime-live-egress test-runtime-live-connect-guard test-runtime-live-request-shape test-runtime-live-audit test-runtime-live-allowlist test-runtime-live-policy-mutation test-runtime-live-mcp-enable test-runtime-live-helper-reclaim test-runtime-live-host-service test-live-session-admission-docker-desktop test-live-session-admission-negative-docker-desktop test-live-session-admission-attached-docker-desktop test-live-session-renewal-docker-desktop test-live-session-independence-docker-desktop test-live-session-admission-crash-docker-desktop test-live-session-admission-drift-docker-desktop test-live-session-entry-gate-docker-desktop reclaim-runtime-sandbox reclaim-runtime-sandbox-apply test-watch test-git test-git-build git-bins-add git-bins-pin
 
 help:
 	@printf '%s\n' \
@@ -14,6 +14,7 @@ help:
 		'  make test-proxy           Proxy Vitest suite' \
 		'  make test-security        Security-sensitive Vitest suites' \
 		'  make test-property-soak   Path, GraphQL, MCP, and .mcp.json property tests at 100000 cases each (by hand; up to ~15 min)' \
+		'  make test-mutation        Stryker mutation run over the terminal-session, approval, and classifier modules (by hand; report under local/mutation)' \
 		'  make test-templates       Docker Compose template validation' \
 		'  make test-cli-e2e         Build dist/runfree and run packaged CLI scenarios' \
 		'  make test-cli-e2e-live    Build dist/runfree and run its real-Docker lifecycle scenario' \
@@ -130,6 +131,9 @@ test-proxy:
 # per-test timeout exists only so a slow healthy run is not reported as a
 # failure (a broken property still fails at its first counterexample).
 RUNFREE_PROP_SOAK_RUNS ?= 100000
+test-mutation:
+	pnpm exec stryker run
+
 test-property-soak:
 	RUNFREE_PROP_RUNS=$${RUNFREE_PROP_RUNS:-$(RUNFREE_PROP_SOAK_RUNS)} pnpm exec vitest run --testTimeout=1800000 packages/proxy/src/policy.property.test.ts packages/proxy/src/graphql-classify.property.test.ts packages/proxy/src/mcp-classify.property.test.ts packages/cli/src/runtime/mcp-project-config.property.test.ts
 
