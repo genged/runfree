@@ -1654,13 +1654,18 @@ export async function startRuntime(
         runfreeLog(`finished the interrupted teardown of session ${reclaim.sessionIds.join(", ")}`);
       }
     }
-    io.admitPreparedTokenSources?.(runtimeContextFromActivePlan(activePlan));
-    timings.time("startup:select-session-agent", () => selectPreparedSessionAgent(activePlan, adapters.docker));
     if (!removeExisting) {
+      // Re-planned under the lock and before the desired session agent is
+      // selected below: the unlocked pass previewed the plan against this
+      // same pre-selection state, and only this pass announces it. Planned
+      // after the selection, a "select new host materialization" plan read
+      // as nothing to do and was never announced.
       upgradePlan = timings.time("startup:upgrade-plan-locked", () => planRuntimeUpgradeFromV2State(preparedPlan, existingContext, adapters.docker));
       const status = timings.time("startup:upgrade-apply-locked", () => applyRuntimeUpgradePlan(existingContext, adapters.docker, upgradePlan, { announce: true }));
       if (status !== 0) return result(status, false, existingContext);
     }
+    io.admitPreparedTokenSources?.(runtimeContextFromActivePlan(activePlan));
+    timings.time("startup:select-session-agent", () => selectPreparedSessionAgent(activePlan, adapters.docker));
     const activeContext = runtimeContextFromActivePlan(activePlan, {
       dependencyOverlayPlanChanged: dependencyPlan.changed,
       gitLayoutPlanChanged: gitLayout.changed,

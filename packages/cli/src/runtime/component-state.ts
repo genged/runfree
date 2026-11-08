@@ -3,6 +3,8 @@ import fs from "node:fs";
 import path from "node:path";
 export { sha256Digest };
 import { stableJson, sha256Digest, exactKeySet as exactKeys, isRecord } from "../strict-primitives.ts";
+import { remedy } from "../remedies.ts";
+import { fsyncDirectory } from "../safe-fs.ts";
 
 export const RUNTIME_COMPONENT_DIGEST_SCHEMA_VERSION = 1 as const;
 export const RUNTIME_GENERATION_MANIFEST_SCHEMA_VERSION = 1 as const;
@@ -230,6 +232,11 @@ export function readRuntimeGenerationManifest(
   return manifest;
 }
 
+// The selected runtime generation is host-written state no agent can reach,
+// so an unreadable pointer is a torn write or hand damage, and the only
+// command that removes it is the forced destroy that no longer reads it.
+const RUNTIME_SELECTION_REMEDY = `recreate the runtime with \`${remedy.destroyForce()}\`, then \`${remedy.up()}\``;
+
 function atomicReplaceHostFile(filePath: string, contents: string): void {
   fs.mkdirSync(path.dirname(filePath), { recursive: true, mode: 0o700 });
   const tmpPath = `${filePath}.${process.pid}.${Date.now().toString(36)}.tmp`;
@@ -239,9 +246,13 @@ function atomicReplaceHostFile(filePath: string, contents: string): void {
     descriptor = fs.openSync(tmpPath, flags, 0o600);
     fs.writeFileSync(descriptor, contents);
     fs.fchmodSync(descriptor, 0o600);
+    // Durable before it is visible: a pointer that survives a crash with its
+    // name but not its bytes reads as malformed at every later command.
+    fs.fsyncSync(descriptor);
     fs.closeSync(descriptor);
     descriptor = undefined;
     fs.renameSync(tmpPath, filePath);
+    fsyncDirectory(path.dirname(filePath));
   } finally {
     if (descriptor !== undefined) fs.closeSync(descriptor);
     fs.rmSync(tmpPath, { force: true });
@@ -266,16 +277,16 @@ export function readEffectiveRuntimeGeneration(stateDir: string): RuntimeGenerat
   try {
     value = JSON.parse(source) as unknown;
   } catch {
-    throw new Error("runtime effective selection is malformed");
+    throw new Error(`runtime effective selection is malformed; ${RUNTIME_SELECTION_REMEDY}`);
   }
   if (!isRecord(value)
     || !exactKeys(value, ["schemaVersion", "materializationDigest"])
     || value.schemaVersion !== RUNTIME_EFFECTIVE_SELECTION_SCHEMA_VERSION
     || typeof value.materializationDigest !== "string"
     || !SHA256_PATTERN.test(value.materializationDigest)) {
-    throw new Error("runtime effective selection is invalid");
+    throw new Error(`runtime effective selection is invalid; ${RUNTIME_SELECTION_REMEDY}`);
   }
   const manifest = readRuntimeGenerationManifest(stateDir, value.materializationDigest);
-  if (!manifest) throw new Error("runtime effective selection references a missing materialization");
+  if (!manifest) throw new Error(`runtime effective selection references a missing materialization; ${RUNTIME_SELECTION_REMEDY}`);
   return manifest;
 }

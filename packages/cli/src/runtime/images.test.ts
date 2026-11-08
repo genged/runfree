@@ -487,6 +487,33 @@ test("published runtime materializations are reused but never overwritten", () =
   expect(readDesiredSessionAgentV2(plan.paths.stateDir)).toEqual(desiredBeforeFailure);
 });
 
+test("a materialization that loses the publish race to an identical one reuses the winner", () => {
+  // Two launches materialize the same generation before either holds the
+  // lifecycle lock. The loser's rename lands on a directory the winner has
+  // already populated: ENOTEMPTY on Linux, EEXIST elsewhere. Either way the
+  // winner's manifest is the same bytes, so the loser proceeds on it.
+  const plan = defaultPlan();
+  const docker = new RuntimeImageDocker() as never;
+  const io = { run: () => 0 } as never;
+  const target = runtimeMaterializationRoot(plan.paths.stateDir, plan.components.materializationDigest);
+  const renameSync = fs.renameSync.bind(fs);
+  let raced = false;
+  vi.spyOn(fs, "renameSync").mockImplementation(((source, destination) => {
+    if (!raced && destination === target) {
+      raced = true;
+      fs.cpSync(String(source), target, { recursive: true });
+    }
+    return renameSync(source, destination);
+  }) as typeof fs.renameSync);
+
+  const active = ensureRuntimeMaterialized(plan, { docker, io, force: false });
+
+  expect(raced).toBe(true);
+  expect(active.activeRuntime.activeRuntimeRoot).toBe(target);
+  expect(fs.existsSync(path.join(target, "generation.json"))).toBe(true);
+  expect(fs.readdirSync(path.dirname(target)).filter((entry) => entry.startsWith(".")).length).toBe(0);
+});
+
 /**
  * Record the narrow image-build approval without building.
  *
@@ -1195,6 +1222,21 @@ test("cleanup removes exact zero-reference project image IDs; a v1 manifest refe
       throw new Error(`unexpected cleanup command: ${command} ${args.join(" ")}`);
     },
   } as RuntimeIO;
+  // A removal Docker refuses leaves the images in place, so the pass must
+  // not report "completed": a completed stamp would stop the next start from
+  // retrying it.
+  expect(cleanupRunfreeImages({
+    projectRoot: plan.projectRoot,
+    project: plan.project,
+    runtimeRoot: plan.baseRuntimeRoot,
+    env: {},
+    runtimeComponents: plan.components,
+    agentImage: desired,
+  } satisfies RuntimeContext, {
+    inspectImage: imageInspect,
+    removeImages: () => 1,
+  } as never, io)).toBe("skipped");
+  expect(removedIds.size).toBe(0);
   cleanupRunfreeImages({
     projectRoot: plan.projectRoot,
     project: plan.project,

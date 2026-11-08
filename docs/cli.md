@@ -1305,6 +1305,8 @@ runfree rebuild
 
 Project Dockerfiles extend `RUNFREE_BASE_IMAGE`. Full image overrides are not supported. Wide build contexts require explicit host-state approval.
 
+The image is rebuilt when its inputs change. For a narrow build context (the `.runfree/image/` directory) every file in the context counts as an input. For a wide build context (the project root) only the Dockerfile counts: the project tree is too large to fingerprint on every launch, so a change to a file the Dockerfile copies in does not trigger a rebuild on its own. Run `runfree rebuild` after changing such a file.
+
 ## Optional Runtime Helpers
 
 ### VNC

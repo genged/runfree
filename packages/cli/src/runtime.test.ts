@@ -1720,7 +1720,16 @@ function createRuntimeIO(overrides: {
     const callbackPort = /^[0-9a-f]{6}/.test(projectId)
       ? String(47100 + (Number.parseInt(projectId.slice(0, 6), 16) % 1000))
       : "47123";
-    const effectiveManifest = readEffectiveRuntimeGeneration(path.join(tmp, "state"));
+    // The fake daemon's inventory is keyed on the selected generation; a
+    // pointer a test has deliberately torn reads as no selection here, the
+    // way a real daemon knows nothing of host state at all.
+    const effectiveManifest = (() => {
+      try {
+        return readEffectiveRuntimeGeneration(path.join(tmp, "state"));
+      } catch {
+        return undefined;
+      }
+    })();
     const desiredManifest = (() => {
       const root = path.join(tmp, "state", "runtime", "materializations");
       if (!fs.existsSync(root)) return undefined;
@@ -4944,6 +4953,25 @@ describe("runtime command flow", () => {
       // profile, so `compose down` removes a relay the runtime never asked for.
       await destroyRuntime(context, io);
       expect(inventory).toEqual({ relay: false, relayRemovals: 1 });
+      expect((await startRuntime(context, io, false, { launch: true })).status).toBe(0);
+    });
+
+    test("an unreadable runtime generation pointer refuses plain destroy with the remedy and yields to destroy --force", async () => {
+      const context = launchContext();
+      const io = createRuntimeIO();
+      await warmedUp(context, io);
+      const pointer = path.join(context.project.paths.stateDir, "runtime", "effective.json");
+      expect(fs.existsSync(pointer)).toBe(true);
+      fs.writeFileSync(pointer, "{ torn");
+
+      // Plain destroy reads the pointer before anything else and must say
+      // what clears it, since nothing else does.
+      await expect(destroyRuntime(context, io)).rejects.toThrow("runfree destroy --force");
+
+      // The forced destroy is that remedy: it no longer dies on the pointer
+      // it exists to remove.
+      expect(await destroyRuntime(context, io, { force: true })).toBe(0);
+      expect(fs.existsSync(pointer)).toBe(false);
       expect((await startRuntime(context, io, false, { launch: true })).status).toBe(0);
     });
 

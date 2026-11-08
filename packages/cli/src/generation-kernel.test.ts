@@ -72,6 +72,32 @@ describe("immutable content-addressed publication", () => {
     expect(fs.readFileSync(payload, "utf8")).toBe("{}\n");
   });
 
+  test("losing the rename race to a populated entry verifies the winner instead of throwing", () => {
+    // Two publishers pass the existence check, one renames first. On Linux
+    // the loser's rename onto the populated directory fails with ENOTEMPTY,
+    // not EEXIST; both are the same race and neither is an error.
+    const store = path.join(root, "store");
+    const target = path.join(store, "deadbeef");
+    const renameSync = fs.renameSync.bind(fs);
+    let raced = false;
+    vi.spyOn(fs, "renameSync").mockImplementation(((source, destination) => {
+      if (!raced && destination === target) {
+        raced = true;
+        fs.mkdirSync(target, { mode: 0o700 });
+        fs.writeFileSync(path.join(target, "top.json"), "{}\n", { mode: 0o400 });
+      }
+      return renameSync(source, destination);
+    }) as typeof fs.renameSync);
+    const verify = vi.fn(() => "winner");
+
+    expect(publish({ "top.json": "{}\n" }, verify)).toBe("winner");
+
+    expect(raced).toBe(true);
+    expect(verify).toHaveBeenCalledTimes(1);
+    expect(fs.readFileSync(path.join(target, "top.json"), "utf8")).toBe("{}\n");
+    expect(fs.readdirSync(store)).toEqual(["deadbeef"]);
+  });
+
   test("an existing entry is verified, never rewritten", () => {
     publish({ "top.json": "original\n" });
     let verified = 0;

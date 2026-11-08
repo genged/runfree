@@ -272,11 +272,6 @@ function buildRuntimeProxyImage(
   return status;
 }
 
-function warnImageCleanupFailure(action: string, status: number): void {
-  if (status === 0) return;
-  warn(`${action} failed with status ${status}; continuing without forcing image removal`);
-}
-
 const GC_IMAGE_INSPECT_MAX_BYTES = 16 * 1024 * 1024;
 
 /**
@@ -649,7 +644,13 @@ export function cleanupRunfreeImages(
       );
     }
     if (staleImageIds.length > 0) {
-      warnImageCleanupFailure("stale Runfree project image cleanup", docker.removeImages(staleImageIds));
+      const status = docker.removeImages(staleImageIds);
+      if (status !== 0) {
+        // Not "completed": the images are still there, and a completed stamp
+        // would stop the next start from trying again.
+        warn(`stale Runfree project image cleanup failed with status ${status}; the images are kept and the cleanup is retried on the next start`);
+        return "skipped";
+      }
     }
     return "completed";
   } catch (error) {
@@ -828,7 +829,10 @@ function materializeProjectRuntime(
     fs.renameSync(tmpRoot, generatedRuntimeRoot);
   } catch (error) {
     fs.rmSync(tmpRoot, { recursive: true, force: true });
-    if (!(error && typeof error === "object" && "code" in error && error.code === "EEXIST")) throw error;
+    // Two launches materializing the same generation race here, before the
+    // lifecycle lock. Linux reports a rename onto a populated directory as
+    // ENOTEMPTY, not EEXIST; both mean the other publisher won.
+    if (!(error && typeof error === "object" && "code" in error && (error.code === "EEXIST" || error.code === "ENOTEMPTY"))) throw error;
     const raced = readRuntimeGenerationManifest(context.project.paths.stateDir, plan.components.materializationDigest);
     if (!raced || serializeRuntimeGenerationManifest(raced) !== serializeRuntimeGenerationManifest(manifest)) {
       die("runtime materialization publication raced with contradictory state");

@@ -77,6 +77,7 @@ import {
 } from "./sessions.ts";
 import type { RuntimeContext, RuntimeIO } from "./types.ts";
 import { remedy } from "../remedies.ts";
+import { runtimeEffectiveSelectionPath } from "./component-state.ts";
 
 const SESSION_CONTAINER_STOP_SECONDS = 10;
 // Bounds a single `docker container stop` argv the same way
@@ -1102,6 +1103,10 @@ export function runFencedProjectDestroy(input: FencedProjectDestroyInput): numbe
     // Lifecycle lock quarantines are evidence a lost reclaim race keeps for
     // its owner to inspect; `--force` is the operator saying it was inspected.
     removeLifecycleLockQuarantines(input.context);
+    // The selected runtime generation pointer: the next `up` materializes and
+    // selects afresh, and an unreadable pointer is exactly what a forced
+    // destroy is run to get out from under.
+    fs.rmSync(runtimeEffectiveSelectionPath(stateDir), { force: true });
   }
 
   // The helper marker exists only so the next `up` sweeps for a helper whose

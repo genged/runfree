@@ -1446,7 +1446,19 @@ export async function destroyRuntime(
   io: RuntimeIO,
   options: { force?: boolean } = {},
 ): Promise<number> {
-  const destroyContext = generatedRuntimeContextIfAvailable(context);
+  let destroyContext: RuntimeContext;
+  try {
+    destroyContext = generatedRuntimeContextIfAvailable(context);
+  } catch (error) {
+    // The selected runtime generation is read before `--force` applies, so
+    // an unreadable pointer used to wedge the one command meant to clear it.
+    // Forced destroy continues from the base runtime: every removal below
+    // goes by project label and exact record, not by the pointer's compose
+    // file, and the pointer itself is cleared with the rest of the state.
+    if (options.force !== true) throw error;
+    warn(`the selected runtime generation could not be read (${error instanceof Error ? error.message : String(error)}); forced destroy continues from the base runtime`);
+    destroyContext = context;
+  }
   const destroyAdapters = createRuntimeAdapters(destroyContext, io);
   destroyAdapters.docker.assertAvailable();
   // The fence: destroy holds the project lifecycle lock for its whole

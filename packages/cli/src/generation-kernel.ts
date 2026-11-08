@@ -152,7 +152,20 @@ export function publishImmutableDirectory<T>(input: ImmutableDirectoryPublicatio
       }
     }
     fsyncDirectory(temporary);
-    fs.renameSync(temporary, target);
+    try {
+      fs.renameSync(temporary, target);
+    } catch (error) {
+      // Another publisher landed the same immutable name between the
+      // existence check above and this rename: EEXIST, or ENOTEMPTY on Linux
+      // for a populated directory. The content is content-addressed, so the
+      // winner's copy is verified exactly as the early return would have.
+      if (!error || typeof error !== "object" || !("code" in error) || (error.code !== "EEXIST" && error.code !== "ENOTEMPTY")) {
+        throw error;
+      }
+      fs.rmSync(temporary, { recursive: true, force: true });
+      if (input.fsyncParentWhenPresent) fsyncDirectory(input.parent);
+      return input.verify();
+    }
     fsyncDirectory(input.parent);
     return input.verify();
   } catch (error) {
