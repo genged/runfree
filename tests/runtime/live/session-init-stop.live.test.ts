@@ -40,6 +40,7 @@ import {
   TEST_TIMEOUT_MS,
   awaitAgentStarted,
   containerExitState,
+  containerExitStateOrGone,
   parseLaunchReport,
   pollUntil,
   requiredBackend,
@@ -164,7 +165,7 @@ async function sendTerminalInterrupt(containerId: string): Promise<void> {
   // A byte typed before `docker attach` has connected and put its terminal in
   // raw mode is the attach client's own Ctrl-C and never reaches the session,
   // so a slow daemon gets fresh attaches until the agent stops, within a bound.
-  for (let attempt = 1; attempt <= 4 && containerExitState(containerId).running; attempt += 1) {
+  for (let attempt = 1; attempt <= 4 && containerExitStateOrGone(containerId).running; attempt += 1) {
     const child = childProcess.spawn("script", argv, { stdio: ["pipe", "ignore", "ignore"] });
     await new Promise((resolve) => setTimeout(resolve, 1_500 * attempt));
     child.stdin?.write("\u0003");
@@ -258,9 +259,14 @@ describe("agent session containers run under Docker's init", () => {
     const tty = dockerOrThrow("inspect the session TTY", ["inspect", "-f", "{{.Config.Tty}} {{.Config.OpenStdin}}", containerId]).trim();
     await sendTerminalInterrupt(containerId);
 
-    await pollUntil(() => !containerExitState(containerId).running, 10_000, `the agent to stop on a typed Ctrl-C (Tty OpenStdin: ${tty})`);
-    expect(containerExitState(containerId).exitCode).toBe(SIGINT_EXIT);
-    await launchEnded(run);
+    await pollUntil(() => !containerExitStateOrGone(containerId).running, 10_000, `the agent to stop on a typed Ctrl-C (Tty OpenStdin: ${tty})`);
+    // The launch tears the stopped session down as soon as the agent exits,
+    // so the container may already be gone; the agent's SIGINT exit is then
+    // read from the launch, which passes the agent's status through.
+    const state = containerExitStateOrGone(containerId);
+    if (!state.gone) expect(state.exitCode).toBe(SIGINT_EXIT);
+    const ended = await launchEnded(run);
+    if (state.gone) expect(parseLaunchReport(ended).outcome?.status, describeOutput(ended.output, 3000)).toBe(SIGINT_EXIT);
   }, TEST_TIMEOUT_MS);
 
   test("the session entry still gives up with exit 111 when the session is never served", async () => {
