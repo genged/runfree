@@ -846,6 +846,10 @@ for (const signal of ["SIGINT", "SIGTERM"] as const) {
     clearInterval(policyWatchTimer);
     if (sessionAdmissionWatchTimer) clearInterval(sessionAdmissionWatchTimer);
     sessionAdmissionWatch?.close();
+    // Every held write resolves "cancelled: shutdown" and its pending record
+    // is removed, so an approver is not left looking at holds the proxy that
+    // held them no longer answers for.
+    writeApprovals.dispose();
     process.kill(process.pid, signal);
   });
 }
@@ -1886,8 +1890,10 @@ async function holdWriteForApproval(admission: AdmissionRecord, req: ProxyReques
   if (outcome.kind === "headless-denied") {
     return writeApprovalDenial(req, shape, "write-approval-headless-denied");
   }
-  // denied / no-watcher / cancelled all read as "needs an approval that is
-  // not there": the agent-side takeaway is retry after a human acts.
+  // An operator's deny is an answer, not a missing approver: the agent-side
+  // takeaway is "do not retry this as is", where "required" says "retry
+  // after a human acts". no-watcher / cancelled keep the latter.
+  if (outcome.kind === "denied") return writeApprovalDenial(req, shape, "write-approval-denied");
   return writeApprovalDenial(req, shape, "write-approval-required");
 }
 

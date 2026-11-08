@@ -217,6 +217,9 @@ describe("proxy server approve-on-write", () => {
     writeDecision(dirs, secondRecord.id, { decision: "deny" });
     const secondResponse = await second;
     expect(secondResponse.statusCode).toBe(403);
+    // An operator's deny is reported as a deny, not as a missing approver.
+    expect(secondResponse.raw).toContain("x-runfree-blocked: write-approval-denied");
+    expect(secondResponse.body).toContain("the operator denied this write");
     expect(upstream.requests).toHaveLength(1);
   }, 30_000);
 

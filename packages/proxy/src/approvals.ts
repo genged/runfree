@@ -564,13 +564,18 @@ export function createWriteApprovalManager(options: WriteApprovalManagerOptions)
       hostGrants.delete(hostKey);
       log(`proxy-approval: write grant for ${details.host} expired`);
     }
-    const key = requestId !== undefined
-      ? `request\0${requestId}`
-      : `retry\0${subject.key}\0${oneShotKey(details)}`;
-    const oneShot = oneShotGrants.get(key);
-    if (oneShot !== undefined) {
+    // A request-scope grant is keyed by the request it was held for, or —
+    // for a deny-then-approve-retry hold (WebSocket upgrades) — by the
+    // session and the request shape, because the reconnect that redeems it
+    // is a new request with a new id. Both keys are tried for a request with
+    // an id: the retry grant was unreachable from here before, so a WebSocket
+    // approval was denied again on every reconnect.
+    const retryKey = `retry\0${subject.key}\0${oneShotKey(details)}`;
+    for (const key of requestId !== undefined ? [`request\0${requestId}`, retryKey] : [retryKey]) {
+      const oneShot = oneShotGrants.get(key);
+      if (oneShot === undefined) continue;
       oneShotGrants.delete(key);
-      if (grantActive(oneShot)) return true;
+      return grantActive(oneShot);
     }
     return false;
   }
@@ -596,7 +601,11 @@ export function createWriteApprovalManager(options: WriteApprovalManagerOptions)
     holds.delete(hold.id);
     clearTimeout(hold.timeout);
     removePendingFile(hold.id);
-    deadDecisionIds.add(hold.id);
+    // Ids are nonces bound to one hold and the poller only reads decisions
+    // for live holds, so a resolved id has nothing left to protect: it is
+    // dropped rather than remembered forever, or the set grew by one entry
+    // per write an agent ever had held.
+    deadDecisionIds.delete(hold.id);
     syncPolling();
     emitEvent(APPROVAL_EVENT_PREFIX, {
       id: hold.id,

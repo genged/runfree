@@ -261,6 +261,31 @@ describe("write approval manager", () => {
     expect(approvals.hasGrant(details, SESSION_A, "req-oneshot-1")).toBe(false);
   });
 
+  test("a WebSocket retry approval is redeemed by the reconnect, which carries a new request id", async () => {
+    // The upgrade that was denied noted a retry hold with no request id; the
+    // approve stored a grant under the session and request shape; the
+    // reconnect is a new request with its own id. Before, a request with an
+    // id was checked only against its own id, so the grant was never found
+    // and every reconnect was denied again.
+    attachWatcher();
+    const approvals = manager();
+    const { requestId: _requestId, ...retryInput } = holdInput({ requestId: "upgrade-1" });
+    approvals.notePendingRetryApproval(retryInput);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const [id] = pendingIds();
+    expect(id).toBeDefined();
+    writeDecision(id as string, { decision: "approve", scope: "request" });
+    for (let waited = 0; pendingIds().length > 0 && waited < 50; waited += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    expect(pendingIds()).toEqual([]);
+
+    const details = detailsFor({ host: "api.example.com", method: "POST", path: "/v1/things" });
+    expect(approvals.hasGrant(details, SESSION_A, "reconnect-2")).toBe(true);
+    // Still one-shot.
+    expect(approvals.hasGrant(details, SESSION_A, "reconnect-3")).toBe(false);
+  });
+
   test("a session approval binds the session until it ends; TTL grants clamp and expire", async () => {
     attachWatcher();
     let nowMs = 1_000_000;
