@@ -36,6 +36,8 @@ import { HEADLESS_RUN_ID_PATTERN } from "./headless-run-record.ts";
 import { hostBootId, hostProcessStart } from "./host-identity.ts";
 import { provesContainerAbsent } from "./session-file-heartbeat.ts";
 import { SESSION_ID_PATTERN } from "./session-containers.ts";
+import { PROJECT_ID_LABEL } from "./constants.ts";
+import { CONTAINER_ROLE_LABEL } from "./container-inventory.ts";
 import {
   lifecycleLockIdentity,
   lifecycleLockIsOwned,
@@ -112,6 +114,8 @@ export type HeadlessRunLock = Readonly<{
 
 export type AcquireHeadlessRunLockInput = Readonly<{
   stateDir: string;
+  /** This project's id label, so a dead holder's unreadable session can be judged by the project's containers. */
+  projectId: string;
   inboxDir: string;
   /** The project's host session records; headless ones past the retention are pruned. */
   sessionsDir: string;
@@ -121,6 +125,9 @@ export type AcquireHeadlessRunLockInput = Readonly<{
 }>;
 
 type LockSessionRecord = { v: 1; sessionId: string; containerName: string; containerId?: string };
+
+// The role label value every session container carries (session-container-template.ts).
+const SESSION_CONTAINER_ROLE = "session-agent";
 
 function lockError(message: string): Error {
   return new Error(`headless run lock ${message}`);
@@ -217,7 +224,31 @@ function judgeExistingLock(lockPath: string, input: AcquireHeadlessRunLockInput)
   // Read only once the holder is dead: a session it recorded before dying is
   // then always seen, so reclaim needs that session's container gone.
   const session = readLockSession(lockPath);
-  if (session.kind === "malformed") return held(`${session.reason}, so its container cannot be proven gone`, session);
+  if (session.kind === "malformed") {
+    // The record cannot name the container, so the project's own labels do:
+    // Docker's complete list of this project's session containers, running
+    // or not, must be empty before the lock is reclaimed. Before, this state
+    // was a permanent 66 whose remedy (stop the recorded container) named a
+    // container nobody could read.
+    const listed = createDockerClient(input.io).listContainers({
+      all: true,
+      quiet: true,
+      noTrunc: true,
+      filters: [`label=${PROJECT_ID_LABEL}=${input.projectId}`, `label=${CONTAINER_ROLE_LABEL}=${SESSION_CONTAINER_ROLE}`],
+    }, { timeout: INSPECT_TIMEOUT_MS, maxBuffer: INSPECT_MAX_BYTES });
+    if (listed.status !== 0 || listed.stderr.trim()) {
+      return held(`${session.reason}, and Docker could not list this project's session containers (${listed.stderr.trim().split("\n")[0] || `exit ${listed.status}`})`, session);
+    }
+    const leftover = listed.stdout.trim().split(/\s+/u).filter(Boolean);
+    if (leftover.length > 0) {
+      return held(
+        `${session.reason}, and this project still has ${leftover.length} session container(s) (${leftover.map((id) => id.slice(0, 12)).join(", ")}); `
+          + `run \`${remedy.up()}\` to remove leftover session containers, then retry`,
+        session,
+      );
+    }
+    return { kind: "reclaim", identity, ...(ownerToken !== undefined ? { ownerToken } : {}) };
+  }
   if (session.kind === "recorded") {
     const reference = session.record.containerId ?? session.record.containerName;
     const inspected = createDockerClient(input.io).inspect([reference], { type: "container" }, {

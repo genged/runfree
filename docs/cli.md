@@ -240,7 +240,9 @@ confirmed. A second signal only shortens the container stop.
 Each run keeps a record on the host only, in the project's state directory
 (by default `~/.local/state/runfree/projects/<project-hash>/runs/<run-id>/`).
 No session can read it, and Runfree writes nothing into the project tree. To
-get a summary file in the project, ask for one in the prompt.
+get a summary file in the project, ask for one in the prompt. The newest 200
+records are kept; older ones are removed when a run starts, so a scheduler
+that is refused every minute cannot fill the state directory.
 
 ```text
 runs/<run-id>/

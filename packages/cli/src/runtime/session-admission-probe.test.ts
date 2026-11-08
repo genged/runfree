@@ -13,6 +13,8 @@
 
 import { describe, expect, test } from "vitest";
 
+import { flushWarnings, pendingWarningsForTest } from "../warnings.ts";
+
 import {
   runInternalSessionAdmissionLaunch,
   runInternalSessionAdmissionProbe,
@@ -229,6 +231,30 @@ describe("post-completion teardown failures", () => {
     expect(calls.filter((call) => call === "tearDown")).toHaveLength(2);
   });
 
+  test("a teardown that completes on its retry is a completed teardown; the first failure is a warning", async () => {
+    // Before, the first failure was rethrown after the successful retry, so
+    // a finished teardown read as unconfirmed: a headless run kept its lock
+    // and its record said the session container might still be there.
+    const { calls, steps } = recorder();
+    let attempt = 0;
+    const flaky = {
+      ...steps,
+      tearDown: async () => {
+        calls.push("tearDown");
+        attempt += 1;
+        if (attempt === 1) throw new Error("observation-unavailable during stop: the daemon was restarting");
+      },
+    } satisfies SessionAdmissionLaunchSteps;
+    flushWarnings();
+
+    await expect(runInternalSessionAdmissionLaunch(flaky)).resolves.toBeDefined();
+
+    expect(calls.filter((call) => call === "tearDown")).toHaveLength(2);
+    expect(pendingWarningsForTest().map((event) => event.message).join("\n"))
+      .toContain("the session teardown completed on its retry; the first attempt failed: observation-unavailable during stop");
+    flushWarnings();
+  });
+
   test("two different teardown failures are both kept", async () => {
     const { steps } = recorder();
     let attempt = 0;
@@ -261,21 +287,6 @@ describe("post-completion teardown failures", () => {
     const failure = await runInternalSessionAdmissionLaunch(failing).catch((error: unknown) => error);
 
     expect((failure as SessionTeardownIncompleteError).errors).toHaveLength(2);
-  });
-
-  test("a retry that completes still reports the first failure", async () => {
-    const { steps } = recorder();
-    let attempt = 0;
-    const flaky = {
-      ...steps,
-      tearDown: async () => {
-        attempt += 1;
-        if (attempt === 1) throw new Error("first teardown failed");
-      },
-    } satisfies SessionAdmissionLaunchSteps;
-
-    await expect(runInternalSessionAdmissionLaunch(flaky)).rejects.toThrow("first teardown failed");
-    expect(attempt).toBe(2);
   });
 
   test("a launch failure paired with an identical cleanup failure is reported once", async () => {
