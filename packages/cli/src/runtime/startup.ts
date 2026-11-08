@@ -146,6 +146,7 @@ import {
   type SessionContainerRecordV2,
 } from "./session-containers.ts";
 import { readSessionHostStatus } from "./session-host-status.ts";
+import { sessionTeardownInFlight } from "./session-teardown-in-flight.ts";
 import { sessionRecordLiveUnderSessionFiles, sessionRecordOwnerLiveness } from "./session-record-liveness.ts";
 import { planRuntimeUpgradeV2 } from "./upgrade-plan-v2.ts";
 import {
@@ -2411,8 +2412,10 @@ function warmPeerRestoreSkipRefusal(input: Readonly<{
     const policy = readActiveControlSelection(input.project);
     if (!effective || !policy) return "the effective selection is unreadable";
     if (readControlPlaneRebindTransaction(input.stateDir, input.expectedProject)) return "a control-plane rebind is pending";
-    if (listSessionContainerRecordsV2(input.stateDir, input.expectedProject).some((record) => record.state === "revoking")) {
-      return "a session record is revoking";
+    if (listSessionContainerRecordsV2(input.stateDir, input.expectedProject).some((record) => (
+      sessionTeardownInFlight(record, readSessionHostStatus(input.stateDir, record.sessionId))
+    ))) {
+      return "a session teardown is in flight";
     }
     binding = {
       lockOwnerToken: input.lifecycleLock.ownerToken,
@@ -2500,11 +2503,12 @@ export async function restoreSameProxySessionAdmission(input: {
     throw new Error("proxy replacement is pending; resume that transaction before a same-container restart");
   }
   // There is no admission journal to be pending; what says a session's
-  // admission is unfinished is a record its owner stamped terminal.
+  // admission is unfinished is the mark its teardown left: a record its owner
+  // stamped terminal, or one `destroy` transitioned to `revoking`.
   // Republishing this proxy's authority over an address whose teardown is
-  // mid-flight is exactly what that stamp exists to stop.
+  // mid-flight is exactly what those marks exist to stop.
   const admissionPending = listSessionContainerRecordsV2(plan.paths.stateDir, expectedProject).some((record) => (
-    readSessionHostStatus(plan.paths.stateDir, record.sessionId)?.terminal === "revoking"
+    sessionTeardownInFlight(record, readSessionHostStatus(plan.paths.stateDir, record.sessionId))
   ));
   if (admissionPending) {
     throw new Error(

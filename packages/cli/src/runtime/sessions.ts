@@ -43,6 +43,7 @@ import {
 import { reportSessionReconciliation } from "./session-reconcile.ts";
 import { readSessionHostStatus, type SessionHostStatusV1 } from "./session-host-status.ts";
 import { classifySessionRecordLiveness } from "./session-record-liveness.ts";
+import { sessionTeardownInFlight } from "./session-teardown-in-flight.ts";
 import type {
   ActiveAgentSession,
   RuntimeContext,
@@ -1331,11 +1332,23 @@ export function activeLifecycleSessions(
     // teardown whose owner is still running rests entirely on this
     // classification NOT excluding those records. Adding a terminal-stamp
     // filter here would silently let destroy end a live process mid-teardown.
-    const live = peek.records
-      .filter((record) => record.state !== "revoking")
-      .map((record) => ({ record, stamp: readSessionHostStatus(stateDir, record.sessionId) }))
+    const stamped = peek.records.map((record) => ({ record, stamp: readSessionHostStatus(stateDir, record.sessionId) }));
+    const live = stamped
+      .filter(({ record }) => record.state !== "revoking")
       .filter(({ record, stamp }) => classifySessionRecordLiveness(record, { nowEpochMs, env: context.env, stamp }).kind === "live")
       .map(({ record, stamp }) => sessionFromLifecycleRecord(context, record, stamp));
+    // A teardown that began and did not finish is not a session, so it is not
+    // in the list above — but `runfree up` defers to its reclaim and `stop`
+    // refuses over it, and both point here. Name every such record, with the
+    // command that finishes it, so the listing shows what those refusals saw.
+    const tearingDown = stamped
+      .filter(({ record, stamp }) => sessionTeardownInFlight(record, stamp))
+      .filter(({ record }) => !live.some((session) => session.sessionId === record.sessionId));
+    if (tearingDown.length > 0) {
+      warn(`${tearingDown.length} session teardown(s) in flight: ${tearingDown.map(({ record }) => record.sessionId).join(", ")}; `
+        + `\`${remedy.up()}\` finishes an interrupted teardown once its owner has exited, `
+        + `and \`${remedy.destroyForce()}\` clears one that will not finish`);
+    }
     reportSessionFileResidue(
       context,
       { projectId, composeProject: `runfree-${projectId}` },

@@ -2,6 +2,7 @@ import { listSessionContainerRecordsV2, type SessionContainerProjectIdentity } f
 import { readControlPlaneRebindTransaction } from "./control-plane-rebind.ts";
 import { readSessionHostStatus } from "./session-host-status.ts";
 import { sessionRecordOwnerLiveness } from "./session-record-liveness.ts";
+import { sessionTeardownInFlight } from "./session-teardown-in-flight.ts";
 import type { ProjectLifecycleLock } from "./sessions.ts";
 
 /** Explicit operations only. Candidate containment and replacement use their own ownership. */
@@ -16,12 +17,12 @@ export function assertSessionDisruptionAuthorized(input: {
   input.lifecycleLock.assertHeld();
   const records = listSessionContainerRecordsV2(input.stateDir, input.expectedProject);
   // Nothing writes an admission journal. What says "a session lifecycle
-  // transaction is in flight" is the host status stamp its owner wrote: a
-  // record stamped terminal is mid-teardown, and stopping the runtime
-  // underneath that teardown is exactly the interruption this gate refuses —
-  // whether or not its owner still answers.
+  // transaction is in flight" is the mark its teardown left — the host status
+  // stamp its owner wrote, or the record's own `revoking` state — and stopping
+  // the runtime underneath that teardown is exactly the interruption this gate
+  // refuses, whether or not its owner still answers.
   const revoking = records.filter((record) =>
-    readSessionHostStatus(input.stateDir, record.sessionId)?.terminal === "revoking");
+    sessionTeardownInFlight(record, readSessionHostStatus(input.stateDir, record.sessionId)));
   const rebind = readControlPlaneRebindTransaction(input.stateDir, input.expectedProject);
   const participants = [...records, ...(rebind?.oldRecords ?? [])];
   const live = [...new Set([

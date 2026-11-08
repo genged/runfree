@@ -75,6 +75,7 @@ import {
   removeSessionHostStatus,
   writeSessionHostStatus,
 } from "./session-host-status.ts";
+import { sessionTeardownInFlight } from "./session-teardown-in-flight.ts";
 import { sessionRecordOwnerLiveness } from "./session-record-liveness.ts";
 import type { ProjectLifecycleLock } from "./sessions.ts";
 import type { DockerContainerInspect } from "./types.ts";
@@ -99,16 +100,17 @@ export const SESSION_FILE_ALLOCATION_WINDOW_MS = 60_000;
  * There is no admission journal here, so the evidence is the registry itself,
  * in the two shapes that say a session's admission is unfinished:
  *
- *   - a record its owner stamped `terminal`: revocation started and did not
- *     finish, so the address is still reserved and the proxy may still hold the
- *     file;
+ *   - a record whose teardown began and did not finish — its owner stamped it
+ *     `terminal`, or `destroy`/`rebuild`/the rebind coordinator transitioned
+ *     it to `revoking` (`sessionTeardownInFlight` reads both marks) — so the
+ *     address is still reserved and the proxy may still hold the file;
  *   - an `allocated` record with no container id, older than the allocation
  *     window: the address was reserved and the container never appeared.
  *
  * Everything else — a young allocation, a bound record, a record beating
  * normally — is ordinary concurrent state that no runtime upgrade may be
  * refused over. Reading the stamp never throws; an unreadable one is absent,
- * which leaves only the allocation rule.
+ * which leaves the record's own state and the allocation rule.
  */
 export function pendingSessionFileAdmissionRecords(input: Readonly<{
   stateDir: string;
@@ -116,7 +118,7 @@ export function pendingSessionFileAdmissionRecords(input: Readonly<{
   nowEpochMs: number;
 }>): readonly SessionContainerRecordV2[] {
   return input.records.filter((record) => {
-    if (readSessionHostStatus(input.stateDir, record.sessionId)?.terminal === "revoking") return true;
+    if (sessionTeardownInFlight(record, readSessionHostStatus(input.stateDir, record.sessionId))) return true;
     if (record.state !== "allocated" || record.containerId !== undefined) return false;
     const createdAtMs = Date.parse(record.createdAt);
     return Number.isFinite(createdAtMs)
