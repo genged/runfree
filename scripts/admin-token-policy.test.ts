@@ -85,6 +85,9 @@ import {
 } from "../packages/cli/src/admin/admin-core.ts";
 import { TOKEN_SYNC_DEFERRED_STATUS, TOKEN_SYNC_REPREPARE_STATUS } from "../packages/cli/src/runtime/constants.ts";
 import { flushWarnings } from "../packages/cli/src/warnings.ts";
+import { parseEmittedCommandArgs } from "../packages/cli/src/commands/app.ts";
+import { createCommandContext } from "../packages/cli/src/commands/context.ts";
+import { findTerminologyViolations } from "./check-terminology.ts";
 import { cliEntryArgv, credentialWatchHarnessEntryArgv } from "../tests/support/prebuilt-entry.ts";
 import type { CredentialWatchHarnessConfig } from "./credential-watch.test-harness.ts";
 
@@ -7312,6 +7315,7 @@ describe("1password connection sources (todo 158)", () => {
     stored?: Map<string, string>;
     readStatus?: number;
     readStderr?: string;
+    readTimeout?: boolean;
     writeStatus?: number;
     /** What the fake Keychain keeps of a written login (a truncating Keychain). */
     keep?: (token: string) => string;
@@ -7332,6 +7336,7 @@ describe("1password connection sources (todo 158)", () => {
       const input = spawnOptions.input === undefined ? undefined : spawnInputText(spawnOptions.input);
       calls.push({ command: "security", args, ...(input === undefined ? {} : { input }), env: envFromSpawnOptions(spawnOptions) });
       if (args[0] === "find-generic-password") {
+        if (options.readTimeout) return spawnTimeoutResult("security");
         if (options.readStatus !== undefined) return spawnResult({ status: options.readStatus, stderr: options.readStderr ?? "" });
         const token = stored.get(args[4]);
         return token ? spawnResult({ stdout: `${token}\n` }) : spawnResult({ status: 44, stderr: "The specified item could not be found in the keychain." });
@@ -8451,18 +8456,120 @@ describe("1password connection sources (todo 158)", () => {
       expectNoSentinel(result.stdout, result.stderr);
     });
 
-    test("the preflight passes when every binding never asks", async () => {
-      writeFixtureRepo(exampleTokenPolicy(["openai", "env-token"]));
+    test("the preflight passes when every binding never asks, reading each connection login once and never running op", async () => {
+      writeFixtureRepo(exampleTokenPolicy(["openai", "github", "env-token"]));
       writeSourceRegistry({ automation: CONNECTION_ENTRY });
       writeTokenConfig({
         openai: { source: "1password-via", ref: "op://Automation/openai/key", via: "automation" },
+        github: { source: "1password-via", ref: "op://Automation/github/token", via: "automation" },
         "env-token": { source: "env", env: "ENV_TOKEN" },
       });
       const fake = installFakeKeychainAndOp({ stored: new Map([["automation", SA_TOKEN]]) });
       const result = await runAdmin(() => unattendedCredentialCheckIntent(), connectionEnv(fake));
       expect(result.status, result.stderr).toBe(0);
       expect(result.stdout + result.stderr).toBe("");
-      expect(fake.calls).toEqual([]);
+      expect(fake.calls.map((call) => `${call.command} ${call.args.join(" ")}`)).toEqual([
+        "security find-generic-password -s runfree.credential-source -a automation -w",
+      ]);
+    });
+
+    describe("a connection login the run cannot read", () => {
+      const LOGIN_FIX = "  fix: runfree credential source login automation";
+
+      function connectionRunFixture(): void {
+        writeFixtureRepo(exampleTokenPolicy(["github", "openai"]));
+        writeSourceRegistry({ automation: CONNECTION_ENTRY });
+        writeTokenConfig({
+          github: { source: "1password-via", ref: "op://Automation/github/token", via: "automation" },
+          openai: { source: "1password-via", ref: "op://Automation/openai/key", via: "automation" },
+        });
+      }
+
+      async function expectLoginRefusal(fake: ReturnType<typeof installFakeKeychainAndOp>, headline: string, env: NodeJS.ProcessEnv): Promise<void> {
+        const docker = { log: fs.existsSync(env.FAKE_DOCKER_LOG ?? "") ? fs.readFileSync(env.FAKE_DOCKER_LOG ?? "", "utf8") : "" };
+        const callsBefore = fake.calls.length;
+        const result = await runAdmin(() => unattendedCredentialCheckIntent(), env);
+        expect(result.status).toBe(65);
+        // One refusal for the shared connection, however many bindings use it.
+        expect(result.stderr.split("\n").filter((line) => line.includes("run refused (65)")).map((line) => line.slice(line.indexOf("run refused")))).toEqual([headline]);
+        expect(result.stderr).toContain(`${headline}\n  ${LOGIN_FIX}\n`);
+        expect(result.stderr).toContain("the headless run did not start");
+        // Only the Keychain was asked, once; op never ran and Docker was not touched.
+        expect(fake.calls.slice(callsBefore).map((call) => `${call.command} ${call.args[0]}`)).toEqual(["security find-generic-password"]);
+        if (env.FAKE_DOCKER_LOG) {
+          expect(fs.existsSync(env.FAKE_DOCKER_LOG) ? fs.readFileSync(env.FAKE_DOCKER_LOG, "utf8") : "").toBe(docker.log);
+        }
+        expectNoSentinel(result.stdout, result.stderr);
+      }
+
+      test("a locked Keychain refuses the run with the source login fix", async () => {
+        connectionRunFixture();
+        const fake = installFakeKeychainAndOp({ readStatus: 36, readStderr: "security: SecKeychainSearchCopyNext: User interaction is not allowed." });
+        await expectLoginRefusal(fake, 'run refused (65): the login for source "automation" cannot be read (Keychain locked)', connectionEnv(fake));
+      });
+
+      test("a missing Keychain item refuses the run", async () => {
+        connectionRunFixture();
+        const fake = installFakeKeychainAndOp();
+        await expectLoginRefusal(fake, 'run refused (65): the login for source "automation" is missing from the macOS Keychain', connectionEnv(fake));
+      });
+
+      test("a Keychain that does not answer refuses the run", async () => {
+        connectionRunFixture();
+        const fake = installFakeKeychainAndOp({ readTimeout: true });
+        await expectLoginRefusal(fake, 'run refused (65): the login for source "automation" cannot be read (the Keychain did not answer)', connectionEnv(fake));
+      });
+
+      test("a value the proxy already holds does not let the run continue", async () => {
+        connectionRunFixture();
+        const docker = installTokenSyncDockerFake();
+        const options: Parameters<typeof installFakeKeychainAndOp>[0] = { stored: new Map([["automation", SA_TOKEN]]) };
+        const fake = installFakeKeychainAndOp(options);
+        const synced = await runAdmin(sync, ruleEnv(fake, docker));
+        expect(synced.status, synced.stderr).toBe(0);
+        expect(docker.heldTokens.has("github")).toBe(true);
+        // The Mac locks: a locked Keychain is transient, and an interactive
+        // session would keep the held value; a run refuses.
+        options.readStatus = 36;
+        options.readStderr = "security: User interaction is not allowed.";
+        await expectLoginRefusal(fake, 'run refused (65): the login for source "automation" cannot be read (Keychain locked)', ruleEnv(fake, docker));
+      });
+
+      test("a host without the macOS Keychain refuses the run before any read", async () => {
+        connectionRunFixture();
+        const fake = installFakeKeychainAndOp({ stored: new Map([["automation", SA_TOKEN]]) });
+        const result = await runAdmin(() => unattendedCredentialCheckIntent(), { ...connectionEnv(fake), RUNFREE_TEST_KEYCHAIN_PLATFORM: "linux" });
+        expect(result.status).toBe(65);
+        expect(result.stderr).toContain('run refused (65): source "automation": 1password connection sources need the macOS login Keychain');
+        expect(fake.calls).toEqual([]);
+      });
+
+      test("a static refusal reads no login", async () => {
+        writeFixtureRepo(exampleTokenPolicy(["github", "openai"]));
+        writeSourceRegistry({ automation: CONNECTION_ENTRY });
+        writeTokenConfig({
+          github: { source: "1password", ref: "op://Private/github/token" },
+          openai: { source: "1password-via", ref: "op://Automation/openai/key", via: "automation" },
+        });
+        const fake = installFakeKeychainAndOp({ readStatus: 36, readStderr: "User interaction is not allowed." });
+        const result = await runAdmin(() => unattendedCredentialCheckIntent(), connectionEnv(fake));
+        expect(result.status).toBe(65);
+        expect(result.stderr).toContain(APP_REFUSAL);
+        expect(result.stderr).not.toContain("source login");
+        expect(fake.calls).toEqual([]);
+      });
+
+      test("the refusal's fix parses as a command and names the generation families correctly", async () => {
+        connectionRunFixture();
+        const fake = installFakeKeychainAndOp({ readStatus: 36, readStderr: "User interaction is not allowed." });
+        const result = await runAdmin(() => unattendedCredentialCheckIntent(), connectionEnv(fake));
+        expect(result.status).toBe(65);
+        const fixes = result.stderr.split("\n").filter((line) => line.trimStart().startsWith("fix: runfree ")).map((line) => line.trim());
+        expect(fixes).toEqual([LOGIN_FIX.trim()]);
+        const context = createCommandContext({ projectRoot: tmp, invocationCwd: tmp, commandName: "", env: { ...process.env } });
+        await parseEmittedCommandArgs(context, fixes[0].slice("fix: runfree ".length).split(" "));
+        expect(findTerminologyViolations(result.stderr)).toEqual([]);
+      });
     });
 
     test("without a readable policy the preflight checks every configured binding", async () => {

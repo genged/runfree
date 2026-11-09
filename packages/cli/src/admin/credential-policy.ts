@@ -31,6 +31,7 @@ import {
   formatDelayMs,
   formatDurationSeconds,
   forgetLedgerResolutions,
+  isConnectionSource,
   isTokenResolutionReceipt,
   type JwtPrivateKeyCacheEntry,
   loadPolicy,
@@ -42,6 +43,7 @@ import {
   planWatchCredentialReads,
   printTokenSyncFailures,
   type ProxyRuntime,
+  readConnectionLoginSync,
   proxyRuntime,
   type ProxyRuntimeState,
   removeProxyRuntimeToken,
@@ -68,6 +70,9 @@ import {
   withTokenStoreLock,
 } from "./admin-core.ts";
 import { runfreeError } from "../warnings.ts";
+import { remedy } from "../remedies.ts";
+import { TokenResolutionError } from "../token-resolution.ts";
+import { assertKeychainPlatform, ConnectionSetupError } from "./keychain-login.ts";
 import {
   connectionSourceNames,
   forbidCredentialInteraction,
@@ -746,12 +751,14 @@ function describeUnattendedRead(source: TokenSource, registry: SourceRegistry | 
 const RUN_REFUSED_EXIT = 65;
 
 /**
- * The run preflight of the never-ask rule (unattended credentials spec §4.3):
- * every binding the selected policy references that may ask is listed with
- * its fix, and the run refuses (65) before the prompt copy, Docker, and any
- * credential read. When the policy cannot be read, every configured binding
- * is checked. Static: it reads host configuration only, spawns nothing, and
- * writes nothing.
+ * The run preflight of the never-ask rule: every binding the selected policy
+ * references that may ask is listed with its fix, and the run refuses (65)
+ * before the prompt copy, Docker, and any credential read. When the policy
+ * cannot be read, every configured binding is checked. When no binding may
+ * ask, it then reads the login of each connection those bindings use, once
+ * per connection and with `security` only: a login a run cannot read refuses
+ * the run too, even when the proxy still holds a value from an earlier sync.
+ * It never runs `op` and writes nothing; a login read stays in this frame.
  */
 export function unattendedCredentialCheckIntent(): void {
   const config = loadTokenConfig();
@@ -784,9 +791,44 @@ export function unattendedCredentialCheckIntent(): void {
     runfreeError(unattendedRefusalLines({ tokenName: name, source, reason: verdict.reason, owner, connections }).join("\n"));
     refused = true;
   }
+  if (!refused) refused = refuseUnreadableConnectionLogins(names, config, registry);
   if (!refused) return;
   runfreeError("the headless run did not start");
   process.exitCode = RUN_REFUSED_EXIT;
+}
+
+// The connections the run's bindings read through, sorted. A `via` that names
+// no connection fails on its own at read time, before any spawn.
+function runConnectionNames(names: readonly string[], config: ReturnType<typeof loadTokenConfig>, registry: SourceRegistry | undefined): string[] {
+  const connections = new Set<string>();
+  for (const name of names) {
+    const source = config[name];
+    if (!source || (source.source !== "1password" && source.source !== "named") || source.via === undefined) continue;
+    if (isConnectionSource(registry?.[source.via])) connections.add(source.via);
+  }
+  return [...connections].sort();
+}
+
+function refuseUnreadableConnectionLogins(names: readonly string[], config: ReturnType<typeof loadTokenConfig>, registry: SourceRegistry | undefined): boolean {
+  let refused = false;
+  for (const connection of runConnectionNames(names, config, registry)) {
+    const entry = registry?.[connection];
+    if (!isConnectionSource(entry)) continue;
+    try {
+      assertKeychainPlatform(childEnv());
+      readConnectionLoginSync(connection, entry.keychain);
+    } catch (error) {
+      if (error instanceof ConnectionSetupError) {
+        runfreeError(`run refused (65): source "${connection}": ${error.message}`);
+      } else if (error instanceof TokenResolutionError) {
+        runfreeError([`run refused (65): ${error.safeMessage}`, `  fix: ${remedy.credentialSourceLogin(connection)}`].join("\n"));
+      } else {
+        throw error;
+      }
+      refused = true;
+    }
+  }
+  return refused;
 }
 
 export function credentialStatus(input: CredentialStatusInput = {}): void {
