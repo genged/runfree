@@ -562,10 +562,12 @@ async function savePreparedCredentialSource(input: CredentialSetSourceInput, sou
   // The sync takes the token-store lock itself, after the save released it,
   // so a provider ended by a signal can be settled before any verdict.
   let syncFailed = false;
+  let syncStale: string[] = [];
   let runtimeState: ProxyRuntimeState | "skipped" = "skipped";
   if (input.sync) {
     const result = await syncTokensSettlingSignals({ quiet: true, exitOnFailure: false, mode: "convergence" });
     syncFailed = result.failed.length > 0;
+    syncStale = result.stale;
     runtimeState = result.runtimeState;
     printTokenSyncFailures(result);
   }
@@ -578,7 +580,16 @@ async function savePreparedCredentialSource(input: CredentialSetSourceInput, sou
   console.log(`refresh: ${describeEffectiveRefresh(refresh)}`);
   console.log(`used for: ${hosts || "none"}`);
   console.log("agent exposure: no");
-  console.log(`proxy sync: ${!input.sync ? "skipped" : syncFailed ? "failed" : runtimeState === "ready" ? "done" : `pending (${runtimeState})`}`);
+  // A kept last-good value is not "done": the new source was not read into
+  // the proxy, and the watcher retries it.
+  const syncReport = !input.sync
+    ? "skipped"
+    : syncFailed
+      ? "failed"
+      : syncStale.length > 0
+        ? `stale (${syncStale.join(", ")} kept the last-good proxy value; the watcher retries)`
+        : runtimeState === "ready" ? "done" : `pending (${runtimeState})`;
+  console.log(`proxy sync: ${syncReport}`);
   if (syncFailed) process.exitCode = 1;
 }
 
@@ -730,7 +741,10 @@ export function credentialStatus(input: CredentialStatusInput = {}): void {
         : `  cleanup: runfree credential clear-source ${name}`);
     }
     if (sync?.state === "stale") {
-      console.log(`  last sync: stale (${sync.message}) — proxy holds the value resolved at ${sync.heldValueResolvedAt ?? "an earlier sync"}; retried automatically, at ${sync.syncedAt}`);
+      // A value kept by a detached pass is not retried by that watcher (it
+      // would read the source just as non-interactively); the next launch or
+      // the token's own refresh interval reads it again.
+      console.log(`  last sync: stale (${sync.message}) — proxy holds the value resolved at ${sync.heldValueResolvedAt ?? "an earlier sync"}; read again at the next launch or when its refresh interval falls due (last attempt ${sync.syncedAt})`);
     } else if (sync) {
       console.log(`  last sync: ${sync.ok ? "ok" : "failed"} (${sync.message}) at ${sync.syncedAt}`);
     } else {

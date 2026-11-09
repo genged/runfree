@@ -37,8 +37,10 @@ A multi-line diagnostic prefixes its first line and indents the rest by two
 spaces. When stderr is not a terminal, every line carries an ISO timestamp;
 `RUNFREE_LOG_TIMESTAMPS=1` or `=0` overrides that choice. Warnings observed
 during a command print before the command's result or its final error, with
-the time they were observed. Ctrl-C and SIGTERM restore the terminal and exit
-130 or 143; `runfree run` stops its session first and exits 67 (see
+the time they were observed. Ctrl-C, SIGTERM, and a closed terminal (SIGHUP)
+restore the terminal and exit 130, 143, or 129; an attached session is stopped
+and torn down first, and a second signal shortens the stop grace to none.
+`runfree run` stops its session first and exits 67 (see
 [Headless runs](#headless-runs)).
 
 `RUNFREE_TIMINGS=1` adds `timing:` lines on stderr: one per lifecycle phase,
@@ -238,7 +240,9 @@ confirmed. A second signal only shortens the container stop.
 Each run keeps a record on the host only, in the project's state directory
 (by default `~/.local/state/runfree/projects/<project-hash>/runs/<run-id>/`).
 No session can read it, and Runfree writes nothing into the project tree. To
-get a summary file in the project, ask for one in the prompt.
+get a summary file in the project, ask for one in the prompt. The newest 200
+records are kept; older ones are removed when a run starts, so a scheduler
+that is refused every minute cannot fill the state directory.
 
 ```text
 runs/<run-id>/
@@ -633,6 +637,13 @@ which ports it relays. Docker Desktop needs no relay, and none runs there.
   services time out.
 - A newly added port can refuse connections for a moment while the relay
   binds it; retry.
+- A host service that is not listening is reported differently per backend.
+  On Docker Desktop the proxy refuses the agent's CONNECT before any byte
+  (`host-service-unavailable`, and `runfree doctor` names it). On Linux the
+  relay accepts the proxy's connection and only then finds `127.0.0.1:<port>`
+  closed, so the agent sees a connection that opens and closes at once, and no
+  denial is logged; `docker logs runfree-<project id>-host-relay` shows the
+  refused dial.
 - Rootless Docker, OrbStack, Colima, and remote daemons (a Docker Desktop
   reached over TCP or SSH included) refuse `add` with "host services need
   Docker Desktop or a local Docker Engine on Linux".
@@ -1304,6 +1315,8 @@ runfree rebuild
 ```
 
 Project Dockerfiles extend `RUNFREE_BASE_IMAGE`. Full image overrides are not supported. Wide build contexts require explicit host-state approval.
+
+The image is rebuilt when its inputs change. For a narrow build context (the `.runfree/image/` directory) every file in the context counts as an input. For a wide build context (the project root) only the Dockerfile counts: the project tree is too large to fingerprint on every launch, so a change to a file the Dockerfile copies in does not trigger a rebuild on its own. Run `runfree rebuild` after changing such a file.
 
 ## Optional Runtime Helpers
 

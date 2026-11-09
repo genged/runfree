@@ -128,6 +128,22 @@ describe("typed desired-policy transaction refusals", () => {
     expect(fs.readFileSync(projectPolicyPath, "utf8")).toBe(DRIFT);
   });
 
+  test("a failure after the desired write restores the file, so the next command sees no drift", async () => {
+    // Slot 1 is the post-write re-read; moving the checkout identity there
+    // fails the transaction after Runfree's own write landed. Before, the
+    // planned bytes stayed in the project file while the approval still
+    // named the previous policy, and the next command called that agent drift.
+    seams.beforeCapture = [undefined, () => { seams.checkoutFingerprintSuffix = ":moved"; }];
+    await expect(mutateDesiredService(context, io, "project", {
+      kind: "enable", id: "example", entry: SERVICE_ENTRY,
+    })).rejects.toThrow("project checkout identity changed during the typed");
+    expect(fs.readFileSync(projectPolicyPath, "utf8")).toBe(PROJECT_POLICY);
+    seams.checkoutFingerprintSuffix = "";
+    // With the file back at its approved base, the same mutation succeeds.
+    await mutateDesiredService(context, io, "project", { kind: "enable", id: "example", entry: SERVICE_ENTRY });
+    expect(fs.readFileSync(projectPolicyPath, "utf8")).toContain("service.example.com");
+  });
+
   test("restores host bindings inside the lock when policy verification fails", async () => {
     let values = { OLD_ACCOUNT: "old" } as Record<string, string>;
     await expect(mutateDesiredService(context, io, "project", {

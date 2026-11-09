@@ -520,7 +520,7 @@ describe("runHeadlessAgent", () => {
   });
 
   test("a held lock exits 66 with a skipped record and does no runtime work and no inbox write", async () => {
-    const holder = acquireHeadlessRunLock({ stateDir, inboxDir, sessionsDir: path.join(stateDir, "sessions"), io: baseIO, env: ENV });
+    const holder = acquireHeadlessRunLock({ stateDir, projectId: "0123456789ab", inboxDir, sessionsDir: path.join(stateDir, "sessions"), io: baseIO, env: ENV });
     try {
       const h = harness();
       expect(await run(h)).toBe(66);
@@ -627,6 +627,30 @@ describe("one stop routine for every way a run ends (spec §3.5)", () => {
     expect(events).toEqual(["launch", `lock-session:${SESSION_ID}`, "lock-container", "attached", "session-file-delete", "stop", ...routine]);
     expect(runJson()).toMatchObject({ outcome: "timeout", exitCode: 67, agentStatus: 143, teardown: "confirmed" });
     expect(inboxPrompts()).toEqual([]);
+  });
+
+  test("a deadline that elapses after the agent finished is not a timeout: the run keeps its own outcome", async () => {
+    // The abort reason used to be read after the stop routine and the stream
+    // drain; a deadline passing during those turned a completed run into 67.
+    let clockMs = Date.parse("2026-10-25T12:00:00.000Z");
+    const h = harness();
+    const deps = {
+      ...h.deps,
+      now: () => new Date(clockMs),
+      createSpawner: ((out: Parameters<NonNullable<typeof h.deps.createSpawner>>[0]) => {
+        const base = (h.deps.createSpawner as NonNullable<typeof h.deps.createSpawner>)(out);
+        return {
+          ...base,
+          drain: async (boundMs: number) => {
+            // The drain runs after the run settled; the deadline passes here.
+            clockMs += 60_000;
+            return await base.drain(boundMs);
+          },
+        };
+      }) as typeof h.deps.createSpawner,
+    };
+    expect(await run({ ...h, deps }, { timeoutMs: 1_000 })).toBe(0);
+    expect(runJson()).toMatchObject({ outcome: "success", exitCode: 0, agentStatus: 0 });
   });
 
   test("a startup that blocks past the timeout and then fails ends as a timeout (67), though the timer never ran", async () => {

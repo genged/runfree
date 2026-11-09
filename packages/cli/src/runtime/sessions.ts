@@ -43,6 +43,7 @@ import {
 import { reportSessionReconciliation } from "./session-reconcile.ts";
 import { readSessionHostStatus, type SessionHostStatusV1 } from "./session-host-status.ts";
 import { classifySessionRecordLiveness } from "./session-record-liveness.ts";
+import { sessionTeardownInFlight } from "./session-teardown-in-flight.ts";
 import type {
   ActiveAgentSession,
   RuntimeContext,
@@ -480,6 +481,33 @@ export function projectLifecycleLockPath(context: RuntimeContext): string {
   return path.join(context.project.paths.stateDir, "runtime-lifecycle.lock");
 }
 
+/**
+ * Removes the lifecycle lock quarantines under the state directory.
+ *
+ * A quarantine is the directory a lost reclaim or release race moved aside
+ * instead of deleting (`quarantineExactLifecycleLock`), kept so its owner can
+ * inspect it. Nothing else ever removes one, so `destroy --force` sweeps them
+ * once the operator has decided the project's state is disposable. Removes
+ * only entries shaped exactly like a quarantine of this project's lock.
+ */
+export function removeLifecycleLockQuarantines(context: RuntimeContext): number {
+  const lockPath = projectLifecycleLockPath(context);
+  const prefix = `${path.basename(lockPath)}.quarantine-`;
+  let entries: string[];
+  try {
+    entries = fs.readdirSync(path.dirname(lockPath));
+  } catch {
+    return 0;
+  }
+  let removed = 0;
+  for (const entry of entries) {
+    if (!entry.startsWith(prefix) || !/^[0-9]+-[a-f0-9]{32}$/u.test(entry.slice(prefix.length))) continue;
+    fs.rmSync(path.join(path.dirname(lockPath), entry), { recursive: true, force: true });
+    removed += 1;
+  }
+  return removed;
+}
+
 // Shared with the admin token-store lock (admin-core.ts): EPERM means the
 // process exists but is owned by someone else — still alive.
 // mkdir is the atomic acquire primitive for both host lock directories; the pid
@@ -701,6 +729,26 @@ function removeStaleLifecycleLock(lockPath: string, env?: NodeJS.ProcessEnv): bo
   return removeExactLifecycleLock(lockPath, staleCandidateIdentity, staleCandidateOwnerToken);
 }
 
+/**
+ * What stands between a caller and the project lifecycle lock, for a refusal
+ * or a wait diagnostic: the queued session renewal ahead of it, when there is
+ * one, else the lock directory itself. A renewal ticket is scheduling, not a
+ * lock, and a message that names the lock for it sends the operator to look
+ * at a directory nobody holds.
+ */
+export function describeLifecycleLockBlocker(context: RuntimeContext): string {
+  let head: string | undefined;
+  try {
+    head = sessionRenewalQueueHead(context.project.paths.stateDir, Date.now(), context.env);
+  } catch {
+    // An unreadable queue is reported by the acquisition itself.
+  }
+  const lockPath = projectLifecycleLockPath(context);
+  return head === undefined
+    ? `lock: ${lockPath}`
+    : `queued session renewal ahead of this command: ${path.join(context.project.paths.stateDir, "session-renewal-queue", head)}`;
+}
+
 export function tryAcquireProjectLifecycleLock(context: RuntimeContext, renewalTicket?: string): ProjectLifecycleLock | undefined {
   const renewalHead = sessionRenewalQueueHead(context.project.paths.stateDir, Date.now(), context.env);
   if (renewalHead !== undefined && renewalHead !== renewalTicket) return undefined;
@@ -806,7 +854,7 @@ export async function tryAcquireProjectLifecycleLockWithRetry(
     const now = Date.now();
     if (now >= nextDiagnosticAt) {
       const elapsedSeconds = Math.max(1, Math.round((now - startedAt) / 1_000));
-      runfreeLog(`waiting for the project lifecycle lock (${elapsedSeconds}s; lock: ${projectLifecycleLockPath(context)})`);
+      runfreeLog(`waiting for the project lifecycle lock (${elapsedSeconds}s; ${describeLifecycleLockBlocker(context)})`);
       nextDiagnosticAt = now + 5_000;
     }
     lock = tryAcquireProjectLifecycleLock(context);
@@ -1331,11 +1379,23 @@ export function activeLifecycleSessions(
     // teardown whose owner is still running rests entirely on this
     // classification NOT excluding those records. Adding a terminal-stamp
     // filter here would silently let destroy end a live process mid-teardown.
-    const live = peek.records
-      .filter((record) => record.state !== "revoking")
-      .map((record) => ({ record, stamp: readSessionHostStatus(stateDir, record.sessionId) }))
+    const stamped = peek.records.map((record) => ({ record, stamp: readSessionHostStatus(stateDir, record.sessionId) }));
+    const live = stamped
+      .filter(({ record }) => record.state !== "revoking")
       .filter(({ record, stamp }) => classifySessionRecordLiveness(record, { nowEpochMs, env: context.env, stamp }).kind === "live")
       .map(({ record, stamp }) => sessionFromLifecycleRecord(context, record, stamp));
+    // A teardown that began and did not finish is not a session, so it is not
+    // in the list above — but `runfree up` defers to its reclaim and `stop`
+    // refuses over it, and both point here. Name every such record, with the
+    // command that finishes it, so the listing shows what those refusals saw.
+    const tearingDown = stamped
+      .filter(({ record, stamp }) => sessionTeardownInFlight(record, stamp))
+      .filter(({ record }) => !live.some((session) => session.sessionId === record.sessionId));
+    if (tearingDown.length > 0) {
+      warn(`${tearingDown.length} session teardown(s) in flight: ${tearingDown.map(({ record }) => record.sessionId).join(", ")}; `
+        + `\`${remedy.up()}\` finishes an interrupted teardown once its owner has exited, `
+        + `and \`${remedy.destroyForce()}\` clears one that will not finish`);
+    }
     reportSessionFileResidue(
       context,
       { projectId, composeProject: `runfree-${projectId}` },

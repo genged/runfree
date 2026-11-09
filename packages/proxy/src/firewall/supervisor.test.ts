@@ -371,6 +371,116 @@ describe("proxy firewall DNS supervisor", () => {
     failVerify = true;
     await controller.refreshPolicyAndIps({ refreshDns: false });
     expect(statuses.at(-1)).toMatchObject({ generation: initialGeneration, rulesetVerified: false });
+
+    // The unverified status is not sticky: the same generation is
+    // re-verified on the next tick, and the status recovers once the check
+    // passes. Before, nothing re-ran verify until the next generation change,
+    // so one transient `nft` timeout left every later session's readiness
+    // wait to time out until the proxy was recreated.
+    const verifiesWhileFailing = verify.mock.calls.length;
+    await controller.refreshPolicyAndIps({ refreshDns: false });
+    expect(verify.mock.calls.length).toBe(verifiesWhileFailing + 1);
+    expect(statuses.at(-1)).toMatchObject({ generation: initialGeneration, rulesetVerified: false });
+    failVerify = false;
+    await controller.refreshPolicyAndIps({ refreshDns: false });
+    expect(statuses.at(-1)).toMatchObject({ generation: initialGeneration, rulesetVerified: true });
+    // Verified again, the generation is left alone.
+    const verifiesAfterRecovery = verify.mock.calls.length;
+    await controller.refreshPolicyAndIps({ refreshDns: false });
+    expect(verify.mock.calls.length).toBe(verifiesAfterRecovery);
+  });
+
+  test("a refresh that could not read the policy reports no DNS refresh, so the interval stays due", async () => {
+    let failLoad = false;
+    const controller = createTestFirewallController({
+      log: () => {},
+      resolve4: async () => ["140.82.112.5"],
+      loadPolicy: () => {
+        if (failLoad) throw new Error("half-written policy");
+        return validateProxyPolicy({ hosts: ["api.github.com"], tokens: {} }, plan.policyPath);
+      },
+      ensureDefaultRoute: async () => {},
+      applyRuleset: async () => {},
+      replaceAllowedSet: async () => {},
+      publishResolvedHosts,
+      verify: async () => {},
+    });
+    await controller.initialize(plan);
+    expect(await controller.refreshPolicyAndIps({ refreshDns: true })).toEqual({ dnsRefreshed: true });
+    expect(await controller.refreshPolicyAndIps({ refreshDns: false })).toEqual({ dnsRefreshed: false });
+    failLoad = true;
+    expect(await controller.refreshPolicyAndIps({ refreshDns: true })).toEqual({ dnsRefreshed: false });
+  });
+
+  test("an allowlisted host that did not resolve is retried on the policy tick, at a bounded rate", async () => {
+    let now = 1_750_000_000_000;
+    let answer = false;
+    const attempts: string[] = [];
+    const snapshots: Array<{ unresolvedHosts: string[] }> = [];
+    const controller = createTestFirewallController({
+      log: () => {},
+      nowMs: () => now,
+      resolve4: async (host) => {
+        attempts.push(host);
+        if (host === "api.github.com") return ["140.82.112.5"];
+        if (!answer) throw new Error("SERVFAIL");
+        return ["185.199.108.133"];
+      },
+      loadPolicy: () => validateProxyPolicy({ hosts: ["api.github.com", "raw.githubusercontent.com"], tokens: {} }, plan.policyPath),
+      ensureDefaultRoute: async () => {},
+      applyRuleset: async () => {},
+      replaceAllowedSet: async () => {},
+      publishResolvedHosts: (snapshot) => snapshots.push({ unresolvedHosts: [...(snapshot.unresolvedHosts ?? [])] }),
+      verify: async () => {},
+    });
+    await controller.initialize({
+      ...plan,
+      allowedHosts: ["api.github.com", "raw.githubusercontent.com"],
+      // Cached answers must outlive this test's clock so only the retry
+      // floor, not the stale-answer prune, decides what is looked up.
+      refresh: { ...plan.refresh, maxStaleHostSeconds: 900 },
+    });
+    expect(snapshots.at(-1)?.unresolvedHosts).toEqual(["raw.githubusercontent.com"]);
+    const attemptsAfterInit = attempts.length;
+
+    // Inside the retry floor: no lookup, no set replacement, no snapshot.
+    now += 2_000;
+    await controller.refreshPolicyAndIps({ refreshDns: false });
+    expect(attempts.length).toBe(attemptsAfterInit);
+    expect(snapshots).toHaveLength(1);
+
+    // Past the floor: only the unresolved host is looked up, and once it
+    // answers the snapshot names no unresolved host — long before the DNS
+    // interval would have retried it.
+    now += 10_000;
+    answer = true;
+    await controller.refreshPolicyAndIps({ refreshDns: false });
+    expect(attempts.slice(attemptsAfterInit)).toEqual(["raw.githubusercontent.com"]);
+    expect(snapshots.at(-1)?.unresolvedHosts).toEqual([]);
+  });
+
+  test("lookups for many hosts run concurrently, so a dead resolver costs one timeout, not one per host", async () => {
+    const hosts = Array.from({ length: 6 }, (_, index) => `host-${index}.example.com`);
+    let inFlight = 0;
+    let maxInFlight = 0;
+    const controller = createTestFirewallController({
+      log: () => {},
+      resolve4: async () => {
+        inFlight += 1;
+        maxInFlight = Math.max(maxInFlight, inFlight);
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        inFlight -= 1;
+        return ["140.82.112.5"];
+      },
+      loadPolicy: () => validateProxyPolicy({ hosts, tokens: {} }, plan.policyPath),
+      ensureDefaultRoute: async () => {},
+      applyRuleset: async () => {},
+      replaceAllowedSet: async () => {},
+      publishResolvedHosts,
+      verify: async () => {},
+    });
+    await controller.initialize({ ...plan, allowedHosts: hosts });
+    expect(maxInFlight).toBeGreaterThan(1);
   });
 
   test("acknowledges OAuth-only control changes and preserves the previous acknowledgement on pair-load failure", async () => {
@@ -1236,6 +1346,8 @@ describe("proxy firewall audit mode supervisor", () => {
     let now = 1_000;
     let marker: AuditMarkerState = ACTIVE_MARKER;
     let spool = "observed.example\n";
+    let teardownFails = true;
+    const teardownsApplied: string[][] = [];
     const auditSwaps: string[][] = [];
     const clearedSnapshots: string[] = [];
     const clearedSpools: string[] = [];
@@ -1258,9 +1370,10 @@ describe("proxy firewall audit mode supervisor", () => {
       replaceAuditDrainingSet: async () => {},
       // The teardown batch fails, simulating an unexpected nft error after the
       // size bound. Teardown must still empty audit_ipv4, clear state, and not
-      // wedge the loop.
-      applyAuditTeardown: async () => {
-        throw new Error("nft teardown boom");
+      // wedge the loop; the draining set lands on a later tick.
+      applyAuditTeardown: async (drainingIps) => {
+        if (teardownFails) throw new Error("nft teardown boom");
+        teardownsApplied.push([...drainingIps]);
       },
       publishAuditResolvedHosts: () => {},
       clearAuditResolvedHosts: (path) => {
@@ -1287,6 +1400,19 @@ describe("proxy firewall audit mode supervisor", () => {
     // State is cleared regardless of the apply error.
     expect(clearedSnapshots).toContain(plan.audit.resolvedHostsPath);
     expect(clearedSpools).toContain(plan.audit.spoolPath);
+    // The flush stopped new non-allowlisted connections, but the draining set
+    // that cuts the established audited flows was not installed. It is
+    // applied again on the next tick, and lands once nft answers.
+    expect(teardownsApplied).toEqual([]);
+    await controller.refreshPolicyAndIps({ refreshDns: false });
+    expect(logs).toContainEqual(expect.stringContaining("audit teardown retry failed"));
+    teardownFails = false;
+    await controller.refreshPolicyAndIps({ refreshDns: false });
+    expect(teardownsApplied).toEqual([["9.9.9.9"]]);
+    expect(logs).toContainEqual(expect.stringContaining("audit teardown applied on retry draining=1"));
+    // Once applied, nothing is pending: a further tick applies nothing.
+    await controller.refreshPolicyAndIps({ refreshDns: false });
+    expect(teardownsApplied).toHaveLength(1);
 
     // The next inactive tick is a no-op: tracking was reset, so the failing
     // teardown is not retried forever.

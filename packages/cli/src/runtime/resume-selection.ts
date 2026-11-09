@@ -64,6 +64,11 @@ export function sanitizeAgentText(value: string, max: number): string {
 function eligible(item: RecoveryItem): boolean {
   if (item.state === "claimed" || item.state === "unrecoverable" || item.state === "active") return false;
   if (item.claimUnprovable) return false;
+  // A row the live classification will refuse anyway (an exact Claude
+  // recovery already consumed what this host-only evidence could name) is
+  // not offered: offering it asked a question whose answer could never
+  // resume anything.
+  if (item.resumeBlockedReason !== undefined) return false;
   // A headless run is never resumed (headless-run spec §3.3). The inventory
   // already drops it; this keeps any other caller from offering it.
   if (item.hostMetadata?.launchMode === "headless") return false;
@@ -97,6 +102,11 @@ function noteOf(item: RecoveryItem, source: "host" | "claude-reported" | "codex-
     return tabs !== undefined && tabs > 1 ? `matches ${tabs} tabs` : "Codex match";
   }
   if (source === "claude-reported") return "Claude reported";
+  // A host row whose name was copied from agent-written evidence says so:
+  // the row is the host's, the words are the agent's (docs/security.md,
+  // "Resume rows built from agent-written files are labeled").
+  if (item.conversationNameSource === "claude-reported") return "name Claude reported";
+  if (item.conversationNameSource === "codex-index") return "name from Codex index";
   return undefined;
 }
 

@@ -21,6 +21,7 @@ import crypto from "node:crypto";
 
 import { builtinAgent } from "../agents.ts";
 import { CliError } from "../errors.ts";
+import { deferSignalExit, SIGNAL_EXIT_CODES } from "../signal-exit.ts";
 import { warn } from "../warnings.ts";
 import { LIFECYCLE_LOCK_WAITER_YIELD_MS, launchHandoffSpanFits } from "./launch-lock-hold.ts";
 import {
@@ -50,12 +51,19 @@ import {
 } from "./sessions.ts";
 import type { RuntimeIO } from "./types.ts";
 
+/** Where an interactive launch listens for the host's signals; `process` outside tests. */
+export type SessionLaunchSignalSource = Pick<NodeJS.Process, "on" | "off">;
+
+type InteractiveLaunchSignal = keyof typeof SIGNAL_EXIT_CODES;
+const INTERACTIVE_LAUNCH_SIGNALS = Object.keys(SIGNAL_EXIT_CODES) as InteractiveLaunchSignal[];
+
 export type SessionPublicLaunchInput = Readonly<{
   preparedRuntime: PreparedRuntime;
   io: RuntimeIO;
   /** The agent name the command line resolved; must be a built-in. */
   agentName: string;
   foregroundSpawner?: SessionContainerForegroundSpawner;
+  signals?: SessionLaunchSignalSource;
   /** Trusted startup finalizer retry used only for valid concurrent drift. */
   reprepare?: () => Promise<PreparedRuntime>;
   /**
@@ -114,14 +122,58 @@ export async function launchConfiguredAgentThroughAdmission(
   const launchConversationId = mintLaunchConversationId(agent);
   return await withOutcomeLine(
     `${input.agentName} did not start`,
-    async () => exitStatus(await withSessionLaunchFrame(
+    async () => withSignalCancellation(input.signals ?? process, (cancellation) => withSessionLaunchFrame(
       input,
       (driver) => driver.launchBuiltin(agent, {
         ...(launchConversationId !== undefined ? { launchConversationId } : {}),
         ...(input.headless ? { headless: input.headless } : {}),
+        cancellation,
       }),
     )),
   );
+}
+
+/**
+ * Runs an interactive launch with the host's signals as its cancellation.
+ *
+ * SIGINT, SIGTERM, or SIGHUP to the CLI used to end the process at once
+ * (the CLI's one-shot exit handlers), leaving the attached Docker child
+ * running in raw mode, the session file to lapse within its lease, and the
+ * next reconcile to end the agent mid-work. The exit is deferred for the
+ * launch; the first signal cancels the launch through the same ports a
+ * headless run uses, so the driver stops the container with its normal
+ * grace and tears the session down; a second signal shortens that grace to
+ * none. The process then exits 128+signal, as a signal-terminated run does.
+ */
+async function withSignalCancellation(
+  signals: SessionLaunchSignalSource,
+  launch: (cancellation: SessionLaunchCancellation) => Promise<SessionAdmissionLaunchOutcome>,
+): Promise<number> {
+  const releaseSignalExit = deferSignalExit();
+  const cancel = new AbortController();
+  const escalate = new AbortController();
+  let received: InteractiveLaunchSignal | undefined;
+  const handlers = INTERACTIVE_LAUNCH_SIGNALS.map((signal) => [signal, (): void => {
+    if (received === undefined) {
+      received = signal;
+      cancel.abort(signal);
+    } else {
+      escalate.abort(signal);
+    }
+  }] as const);
+  for (const [signal, handler] of handlers) signals.on(signal, handler);
+  try {
+    const outcome = await launch({ signal: cancel.signal, escalate: escalate.signal });
+    return received !== undefined ? SIGNAL_EXIT_CODES[received] : exitStatus(outcome);
+  } catch (error) {
+    // Cancelled before it attached, with its cleanup complete: a signal exit,
+    // not a launch failure.
+    if (error instanceof SessionLaunchCancelledError && received !== undefined) return SIGNAL_EXIT_CODES[received];
+    throw error;
+  } finally {
+    for (const [signal, handler] of handlers) signals.off(signal, handler);
+    releaseSignalExit();
+  }
 }
 
 /**
@@ -211,6 +263,7 @@ export type SessionPublicShellInput = Readonly<{
   io: RuntimeIO;
   foregroundSpawner?: SessionContainerForegroundSpawner;
   reprepare?: () => Promise<PreparedRuntime>;
+  signals?: SessionLaunchSignalSource;
 }>;
 
 /**
@@ -225,7 +278,10 @@ export type SessionPublicShellInput = Readonly<{
 export async function launchShellThroughAdmission(input: SessionPublicShellInput): Promise<number> {
   return await withOutcomeLine(
     "the shell session did not start",
-    async () => exitStatus(await withSessionLaunchFrame(input, (driver) => driver.launchShell())),
+    async () => withSignalCancellation(input.signals ?? process, (cancellation) => withSessionLaunchFrame(
+      input,
+      (driver) => driver.launchShell({ cancellation }),
+    )),
   );
 }
 
@@ -308,7 +364,13 @@ async function withSessionLaunchFrame<T>(
           );
         }
       } finally {
-        sessionLockManager.close();
+        try {
+          sessionLockManager.close();
+        } catch (error) {
+          // A lock this frame lost or a manager still mid-reacquisition is a
+          // fact worth printing, not a reason to hide the launch's own error.
+          warn(error instanceof Error ? error.message : String(error));
+        }
       }
       preparedRuntime = await input.reprepare();
     }

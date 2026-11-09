@@ -91,7 +91,7 @@ function dockerIo(inspect: Inspect) {
 }
 
 function input(io: { capture: ReturnType<typeof dockerIo>["capture"] }, env: NodeJS.ProcessEnv = harnessEnv(BOOT_B)): AcquireHeadlessRunLockInput {
-  return { stateDir, inboxDir, sessionsDir, io, env };
+  return { stateDir, projectId: "0123456789ab", inboxDir, sessionsDir, io, env };
 }
 
 // A lock left by another `run`: its stamps, and the session it recorded.
@@ -274,6 +274,43 @@ test("a reclaim whose rename moves a replacement lock refuses instead of taking 
   expect(inboxNames()).toEqual([IMAGE, STALE_PROMPT].sort());
 });
 
+// A dead holder whose session record cannot be read: before, a permanent 66
+// whose remedy named a container nobody could read. Docker's list of this
+// project's session containers decides instead.
+function listingIo(answer: CaptureResult) {
+  const capture = vi.fn((command: string, args: string[]): CaptureResult => {
+    expect(command).toBe("docker");
+    expect(args[0]).toBe("ps");
+    expect(args).toContain("--all");
+    expect(args).toContain("label=io.runfree.project-id=0123456789ab");
+    expect(args).toContain("label=io.runfree.container-role=session-agent");
+    return answer;
+  });
+  return { capture };
+}
+
+test("a dead holder with an unreadable session record is reclaimed once the project has no session containers", () => {
+  seedInbox();
+  writeHolder({ pid: reapedPid(), boot: BOOT_B, session: { v: 1, sessionId: "not a session id" } });
+  const io = listingIo({ status: 0, stdout: "", stderr: "" });
+
+  const lock = acquireHeadlessRunLock(input(io));
+
+  expect(io.capture).toHaveBeenCalledTimes(1);
+  expect(inboxNames()).toEqual([IMAGE]);
+  lock.release();
+});
+
+test("a dead holder with an unreadable session record keeps the lock while the project has a session container, naming `runfree up`", () => {
+  writeHolder({ pid: reapedPid(), boot: BOOT_B, session: { v: 1, sessionId: "not a session id" } });
+  const held = expectHeld(() => acquireHeadlessRunLock(input(listingIo({ status: 0, stdout: `${CONTAINER_ID}\n`, stderr: "" }))));
+  expect(held.message).toContain("still has 1 session container(s)");
+  expect(held.message).toContain("runfree up");
+  // A listing Docker cannot make proves nothing either.
+  expectHeld(() => acquireHeadlessRunLock(input(listingIo(unreachable("")))));
+  expect(fs.existsSync(path.join(headlessRunLockPath(stateDir), "session.json"))).toBe(true);
+});
+
 test("a dead holder whose container inspects as present keeps the lock", () => {
   seedInbox();
   writeHolder({ pid: reapedPid(), boot: BOOT_B, session: { v: 1, sessionId: SESSION_ID, containerName: CONTAINER_NAME, containerId: CONTAINER_ID } });
@@ -356,14 +393,16 @@ test("a pid-less lock inside the acquisition grace is kept; past it, it is recla
   expect(io.capture).not.toHaveBeenCalled();
 });
 
-test("a malformed session record in a dead holder's lock keeps the lock and names its path", () => {
+test("a malformed session record in a dead holder's lock keeps the lock and names its path while a container remains", () => {
   const lockPath = writeHolder({ pid: reapedPid(), boot: BOOT_B, session: { v: 1, sessionId: SESSION_ID, containerName: "--format=x" } });
-  const io = dockerIo(absent);
+  const io = listingIo({ status: 0, stdout: `${CONTAINER_ID}\n`, stderr: "" });
 
   const held = expectHeld(() => acquireHeadlessRunLock(input(io)));
 
   expect(held.message).toContain(lockPath);
-  expect(io.capture).not.toHaveBeenCalled();
+  // The unreadable record is never handed to Docker as a reference; only the
+  // project's labels are.
+  expect(io.capture.mock.calls.every(([, args]) => !args.includes("--format=x"))).toBe(true);
 });
 
 test("recordSession and recordContainer name the session; release removes only an owned lock", () => {

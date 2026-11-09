@@ -4,6 +4,8 @@ import path from "node:path";
 
 import { afterEach, describe, expect, test } from "vitest";
 
+import { forEachCrashPoint } from "../../../../tests/support/crash-steps.ts";
+
 import {
   createRuntimeComponentState,
   readEffectiveRuntimeGeneration,
@@ -113,6 +115,45 @@ describe("runtime generation selection", () => {
     selectEffectiveRuntimeGeneration(stateDir, second.components.materializationDigest);
     expect(readEffectiveRuntimeGeneration(stateDir)).toEqual(second);
     expect(fs.statSync(runtimeEffectiveSelectionPath(stateDir)).mode & 0o777).toBe(0o600);
+  });
+
+  test("no crash point of a selection leaves a pointer that reads as malformed", () => {
+    // The pointer is published by temp file, fsync, rename, directory fsync.
+    // Crashed after any of those writes, a reader sees the previous
+    // selection, no selection, or the new one — never a torn file that would
+    // wedge every later command on "runtime effective selection is malformed".
+    const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "runfree-components-"));
+    roots.push(stateDir);
+    const first = manifest("first");
+    const second = manifest("second");
+    publish(stateDir, first);
+    publish(stateDir, second);
+    const points = forEachCrashPoint({
+      root: stateDir,
+      prepare: () => selectEffectiveRuntimeGeneration(stateDir, first.components.materializationDigest),
+      run: () => selectEffectiveRuntimeGeneration(stateDir, second.components.materializationDigest),
+      inspect: (point, outcome) => {
+        expect(outcome.kind, `crash point ${point}`).toBe("crashed");
+        const selected = readEffectiveRuntimeGeneration(stateDir);
+        expect([first, second], `crash point ${point}`).toContainEqual(selected);
+        // Nothing but the pointer may remain beside it: no stranded temp file.
+        expect(fs.readdirSync(path.dirname(runtimeEffectiveSelectionPath(stateDir))).filter((entry) => entry.endsWith(".tmp")))
+          .toEqual([]);
+      },
+    });
+    // One publishing write: the rename. (The temp file is written through a
+    // descriptor and removed only on failure.)
+    expect(points).toBe(1);
+  });
+
+  test("an unreadable pointer names the command that clears it", () => {
+    const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "runfree-components-"));
+    roots.push(stateDir);
+    fs.mkdirSync(path.dirname(runtimeEffectiveSelectionPath(stateDir)), { recursive: true });
+    fs.writeFileSync(runtimeEffectiveSelectionPath(stateDir), "{ torn");
+    expect(() => readEffectiveRuntimeGeneration(stateDir)).toThrow("runtime effective selection is malformed; recreate the runtime with `runfree destroy --force`, then `runfree up`");
+    fs.writeFileSync(runtimeEffectiveSelectionPath(stateDir), JSON.stringify({ schemaVersion: 1, materializationDigest: digest("gone") }));
+    expect(() => readEffectiveRuntimeGeneration(stateDir)).toThrow("references a missing materialization; recreate the runtime with `runfree destroy --force`");
   });
 
   test("rejects a manifest whose directory identity contradicts its contents", () => {

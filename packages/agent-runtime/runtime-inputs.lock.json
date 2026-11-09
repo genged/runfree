@@ -2,13 +2,13 @@
   "schemaVersion": 1,
   "images": {
     "agentBase": {
-      "ref": "ubuntu:26.04@sha256:c098726dd9b9733f3e885f8de0ef375206a311b0a317eadc40d347b1115fb944"
+      "ref": "ubuntu:26.04@sha256:6a06111c3b0a8600feadb270aec771dc239bf407b25625f93f44ab00e11f4d3c"
     },
     "uv": {
       "ref": "ghcr.io/astral-sh/uv:0.13.5@sha256:32a7bb39b496babbd997b0a39a4d66c126bdaf5661b302bf6f06abda8deca6ff"
     },
     "proxyBase": {
-      "ref": "ubuntu:26.04@sha256:c098726dd9b9733f3e885f8de0ef375206a311b0a317eadc40d347b1115fb944"
+      "ref": "ubuntu:26.04@sha256:6a06111c3b0a8600feadb270aec771dc239bf407b25625f93f44ab00e11f4d3c"
     }
   },
   "apt": {
@@ -40,8 +40,8 @@
     },
     "packages": {
       "bash": "5.3-2ubuntu1",
-      "bind9-dnsutils": "1:9.20.24-1ubuntu0.4",
-      "ca-certificates": "20260816ubuntu0.26.04.1",
+      "bind9-dnsutils": "1:9.20.24-1ubuntu0.5",
+      "ca-certificates": "20260816ubuntu0.26.04.2",
       "curl": "8.18.0-1ubuntu2.8",
       "dumb-init": "1.2.5-3build1",
       "git": "1:2.53.0-1ubuntu1.1",

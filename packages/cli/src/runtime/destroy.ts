@@ -69,9 +69,15 @@ import {
 } from "./session-file-publisher.ts";
 import { readSessionHostStatus, removeSessionHostStatus } from "./session-host-status.ts";
 import { classifySessionRecordLiveness } from "./session-record-liveness.ts";
-import { activeOrStartingAgentSessions, sessionWarningLine, type ProjectLifecycleLock } from "./sessions.ts";
+import {
+  activeOrStartingAgentSessions,
+  removeLifecycleLockQuarantines,
+  sessionWarningLine,
+  type ProjectLifecycleLock,
+} from "./sessions.ts";
 import type { RuntimeContext, RuntimeIO } from "./types.ts";
 import { remedy } from "../remedies.ts";
+import { runtimeEffectiveSelectionPath } from "./component-state.ts";
 
 const SESSION_CONTAINER_STOP_SECONDS = 10;
 // Bounds a single `docker container stop` argv the same way
@@ -1094,6 +1100,13 @@ export function runFencedProjectDestroy(input: FencedProjectDestroyInput): numbe
     // Swept by pattern rather than by this invocation's memory, so asides
     // left by an interrupted earlier destroy are cleared too.
     removeIllegibleSessionContainerRegistryAsidesV2(stateDir);
+    // Lifecycle lock quarantines are evidence a lost reclaim race keeps for
+    // its owner to inspect; `--force` is the operator saying it was inspected.
+    removeLifecycleLockQuarantines(input.context);
+    // The selected runtime generation pointer: the next `up` materializes and
+    // selects afresh, and an unreadable pointer is exactly what a forced
+    // destroy is run to get out from under.
+    fs.rmSync(runtimeEffectiveSelectionPath(stateDir), { force: true });
   }
 
   // The helper marker exists only so the next `up` sweeps for a helper whose

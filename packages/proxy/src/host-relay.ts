@@ -36,6 +36,7 @@
 // later 127.0.0.1-only service is relayed once the wildcard listener is gone.
 
 import fs from "node:fs";
+import path from "node:path";
 import net from "node:net";
 import { pathToFileURL } from "node:url";
 
@@ -368,6 +369,18 @@ async function main(): Promise<void> {
   let current: number[] = [];
   let running = false;
   let pending = false;
+  // The selection file's identity at the last successful reload: the control
+  // plane is re-read only when `active.json` was replaced (rename gives it a
+  // new inode), not on every 250 ms poll.
+  let loadedSelection: string | undefined;
+  const selectionRevision = (): string => {
+    try {
+      const stat = fs.statSync(path.join(root as string, "active.json"));
+      return `${stat.ino}:${stat.mtimeMs}:${stat.size}`;
+    } catch {
+      return "missing";
+    }
+  };
   const tick = async (): Promise<void> => {
     // A watch event during a running reconcile is not dropped: it runs once more.
     if (running) {
@@ -378,15 +391,19 @@ async function main(): Promise<void> {
     try {
       do {
         pending = false;
-        try {
-          current = effectiveHostServicePorts(root as string);
-          previousError = undefined;
-        } catch (error) {
-          // Same rule as the proxy: an unreadable generation keeps the previous
-          // valid one; the proxy's own cuts are the revocation.
-          const message = error instanceof Error ? error.message : String(error);
-          if (message !== previousError) log(`host-relay: effective policy reload failed, keeping the previous ports: ${message}`);
-          previousError = message;
+        const revision = selectionRevision();
+        if (revision !== loadedSelection || previousError !== undefined) {
+          try {
+            current = effectiveHostServicePorts(root as string);
+            loadedSelection = revision;
+            previousError = undefined;
+          } catch (error) {
+            // Same rule as the proxy: an unreadable generation keeps the previous
+            // valid one; the proxy's own cuts are the revocation.
+            const message = error instanceof Error ? error.message : String(error);
+            if (message !== previousError) log(`host-relay: effective policy reload failed, keeping the previous ports: ${message}`);
+            previousError = message;
+          }
         }
         await relay.reconcile(current);
       } while (pending);

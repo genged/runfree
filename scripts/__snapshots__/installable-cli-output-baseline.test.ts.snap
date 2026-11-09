@@ -459,6 +459,15 @@ The person operating Runfree can decide the pending approvals with
 \`runfree approvals\`, then retry the request.
 Current rules: runfree host explain api.example.com
 ",
+  "write-approval-denied": "Runfree blocked this request.
+
+  host:   api.example.com
+  method: POST
+  path:   /api/v1/things
+  reason: the operator denied this write
+
+Current rules: runfree host explain api.example.com
+",
   "write-approval-headless-denied": "Runfree blocked this request.
 
   host:   api.example.com

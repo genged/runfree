@@ -1,5 +1,6 @@
 import { remedy } from "../remedies.ts";
 import { SessionFileTeardownBlockedError } from "./session-file-teardown.ts";
+import { warn } from "../warnings.ts";
 
 export const BUILTIN_SESSION_ADMISSION_PROBE_AGENTS = ["claude", "codex", "pi"] as const;
 
@@ -249,8 +250,10 @@ function distinctFailures(failures: readonly unknown[]): unknown[] {
  * The post-completion teardown, with the one retry the ladder has always
  * given it.
  *
- * A retry that completes still reports the first failure — the first pass
- * left something undone that this host saw fail — but a retry that also fails
+ * A retry that completes is a completed teardown: the first failure is
+ * reported as a warning, not thrown, because throwing it made a finished
+ * teardown read as unconfirmed — a headless run then kept its lock and its
+ * record said the session might still be there. A retry that also fails
  * becomes one `SessionTeardownIncompleteError`, never a probe failure paired
  * with its own repeat.
  */
@@ -264,7 +267,7 @@ async function tearDownAfterCompletion(steps: SessionAdmissionProbeSteps): Promi
     } catch (second) {
       throw new SessionTeardownIncompleteError([first, second]);
     }
-    throw first;
+    warn(`the session teardown completed on its retry; the first attempt failed: ${first instanceof Error ? first.message : String(first)}`);
   }
 }
 

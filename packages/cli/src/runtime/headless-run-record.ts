@@ -15,6 +15,7 @@ import fs from "node:fs";
 import path from "node:path";
 
 import { atomicReplaceFile, isPathInsideByRealpath, statKind } from "../safe-fs.ts";
+import { warn } from "../warnings.ts";
 import { HEADLESS_TRANSCRIPT_CAP_BYTES } from "./headless-agent-output.ts";
 import type { HeadlessAskExposure } from "./headless-write-posture.ts";
 
@@ -130,6 +131,41 @@ export function assertRunRecordOutsideProject(stateDir: string, runId: string, p
   }
 }
 
+/** How many run records `runs/` keeps; older ones go when a run starts. */
+export const HEADLESS_RUN_RECORD_RETENTION = 200;
+
+/**
+ * Removes the oldest run records past the retention.
+ *
+ * Every run, including one refused by a held lock, leaves a record, and
+ * nothing else ever removed one: a scheduler refused every minute wrote 1440
+ * directories a day for as long as the lock stayed wedged. Run ids sort by
+ * their UTC stamp, so the newest `keep` names stay. Only entries shaped like
+ * a run id are considered, and a removal failure is reported, never fatal to
+ * the run that is starting.
+ */
+export function pruneRunRecords(runsDir: string, keep: number = HEADLESS_RUN_RECORD_RETENTION): string[] {
+  let names: string[];
+  try {
+    names = fs.readdirSync(runsDir).filter((name) => HEADLESS_RUN_ID_PATTERN.test(name)).sort();
+  } catch {
+    return [];
+  }
+  const removed: string[] = [];
+  for (const name of names.slice(0, Math.max(0, names.length - keep))) {
+    const dir = path.join(runsDir, name);
+    try {
+      const stat = fs.lstatSync(dir);
+      if (!stat.isDirectory() || stat.isSymbolicLink()) continue;
+      fs.rmSync(dir, { recursive: true, force: true });
+      removed.push(name);
+    } catch (error) {
+      warn(`an old headless run record could not be removed: ${dir}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  return removed;
+}
+
 export function createRunRecord(
   stateDir: string,
   runId: string,
@@ -140,6 +176,9 @@ export function createRunRecord(
   const dir = path.join(runsDir, runId);
   assertRunRecordOutsideProject(stateDir, runId, options.projectRoot);
   ensureRunsDirectory(runsDir);
+  // One short of the retention, so the record created below is the newest
+  // of exactly HEADLESS_RUN_RECORD_RETENTION.
+  pruneRunRecords(runsDir, HEADLESS_RUN_RECORD_RETENTION - 1);
   try {
     fs.mkdirSync(dir, { mode: 0o700 });
   } catch (error) {

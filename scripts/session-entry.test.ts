@@ -592,6 +592,23 @@ describe("session entry", () => {
     expect(new Set(proxy.requests)).toEqual(new Set([SESSION_ADMISSION_PROVISIONING_REQUEST]));
   });
 
+  test("a probe that cannot run ends the entry at once with 112 instead of polling the whole bound", async () => {
+    // A project image that changed the entry's directory: the probe is there
+    // but not executable (126). Before, the loop polled that failure for the
+    // whole wait bound, printed it thousands of times, and blamed the proxy.
+    fs.chmodSync(probePath, 0o644);
+    const proxy = await fakeProxy([REFUSED_RESPONSE]);
+    const startedAt = Date.now();
+    const result = await runEntry([fakeAgentPath], entryEnv(proxy.port));
+
+    expect(result.status, result.stderr).toBe(112);
+    expect(result.stderr).toContain("session readiness probe could not run (exit 126)");
+    expect(result.stderr.split("\n").filter((line) => line.includes("could not run"))).toHaveLength(1);
+    expect(Date.now() - startedAt).toBeLessThan(5_000);
+    expect(proxy.connections()).toBe(0);
+    expect(fs.existsSync(argvPath)).toBe(false);
+  });
+
   test("passes the agent's own exit status through after exec, printing nothing on the fast path", async () => {
     // An immediately active proxy ends the loop on its first poll, before the
     // waiting notice is ever considered, so silence here is deterministic
@@ -896,6 +913,26 @@ describe("session entry: --stdin-file (headless runs)", () => {
     // readFileSync(0) returns only at EOF: the agent saw the file and its end.
     expect(fs.readFileSync(stdinPath).equals(prompt)).toBe(true);
     expect(proxy.requests.length).toBeGreaterThanOrEqual(2);
+  });
+
+  test("a prompt that disappears before the final exec exits 66, never the shell's own redirection status", async () => {
+    // The pre-wait check passes; the file is gone by the time the session is
+    // active. A failed redirection on the special built-in `exec` ended dash
+    // with status 2; the entry must still answer with its documented 66.
+    const promptPath = path.join(inboxDir, RUN_NAME);
+    fs.writeFileSync(promptPath, "prompt\n");
+    const proxy = await fakeProxy([...Array.from({ length: 60 }, () => REFUSED_RESPONSE), ACTIVE_RESPONSE]);
+    const pending = runEntry(
+      ["--stdin-file", promptPath, fakeAgentPath],
+      entryEnv(proxy.port, { RUNFREE_SESSION_ENTRY_INBOX_DIR: inboxDir, RUNFREE_TEST_STDIN_PATH: stdinPath }),
+    );
+    while (proxy.requests.length === 0) await new Promise((resolve) => setTimeout(resolve, 5));
+    fs.rmSync(promptPath);
+    const result = await pending;
+
+    expect(result.status, result.stderr).toBe(66);
+    expect(result.stderr).toContain("cannot read the prompt file");
+    expect(fs.existsSync(argvPath)).toBe(false);
   });
 
   test("without the option the agent's stdin is unchanged (the caller's, here empty)", async () => {

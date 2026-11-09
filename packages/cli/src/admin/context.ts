@@ -93,6 +93,12 @@ export function createAdminState(context: AdminContext = {}): AdminState {
     projectRoot,
     packageRoot,
     policyPath,
+    // Every CLI entry (`commands/context.ts`, `runtime.ts`, `init.ts`) sets
+    // "effective-read-only"; the legacy editable default below is reached
+    // only by harnesses that build an admin context directly. Behaviour that
+    // exists only under it (the validation-required token wipe, the
+    // "proxy not running" ok records) is therefore not what the product
+    // does, and tests that assert it prove the legacy mode, not production.
     policyAccess: context.policyAccess ?? "legacy-editable",
     effectiveControlSelected: context.effectiveControlSelected ?? true,
     oauthPolicyPath: context.oauthPolicyPath

@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { spawnSync } from "node:child_process";
 import { afterEach, expect, test, vi } from "vitest";
 import { enqueueSessionRenewal, sessionRenewalQueueHead, SESSION_RENEWAL_WAIT_BUDGET_MS } from "./session-renewal-queue.ts";
 
@@ -51,4 +52,29 @@ test("invalid ticket identity refuses acquisition until its exact host entry is 
   fs.writeFileSync(file, original);
   expect(sessionRenewalQueueHead(stateDir, now)).toBe(renewal.ticket);
   renewal.release();
+});
+
+// A pid that has been allocated and reaped, so it is genuinely not running.
+function reapedPid(): number {
+  const { pid } = spawnSync("/bin/sh", ["-c", "exit 0"], { stdio: "ignore" });
+  if (!pid) throw new Error("could not determine a reaped pid");
+  return pid;
+}
+
+test("a ticket whose process is gone is reclaimed at once, before the wait budget", () => {
+  // The wedge this prevents: a session SIGKILLed between enqueue and release
+  // left its ticket at the head for the whole budget, and every command
+  // waited out its lock retry window behind a renewal nobody was requesting.
+  // The fuller identity proof is mocked "unknown" here, so the reclaim rests
+  // on the pid probe alone.
+  owner.state = "unknown";
+  const stateDir = root();
+  const now = Date.now();
+  const crashed = enqueueSessionRenewal(stateDir, now - 1_000);
+  const file = path.join(stateDir, "session-renewal-queue", crashed.ticket);
+  fs.writeFileSync(file, JSON.stringify({ ticket: crashed.ticket, hostPid: reapedPid() }));
+  const next = enqueueSessionRenewal(stateDir, now);
+  expect(sessionRenewalQueueHead(stateDir, now)).toBe(next.ticket);
+  expect(fs.existsSync(file)).toBe(false);
+  next.release();
 });

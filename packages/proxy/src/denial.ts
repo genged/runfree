@@ -40,6 +40,7 @@ export const DENIAL_REASONS = [
   "write-approval-timeout",
   "write-approval-capacity",
   "write-approval-session-denied",
+  "write-approval-denied",
   "write-approval-headless-denied",
   "host-service-not-configured",
   "host-service-unavailable",
@@ -62,6 +63,7 @@ export const SHAPE_DENIAL_REASONS = new Set<DenialReason>([
   "write-approval-capacity",
   "write-approval-session-denied",
   "write-approval-headless-denied",
+  "write-approval-denied",
 ]);
 
 export const UNPARSEABLE_HOST = "<unparseable>";
@@ -98,6 +100,7 @@ const DENIAL_REASON_TEXT: Record<DenialReason, string> = {
   // A session-wide deny covers this session until the operator clears it;
   // the reason code stays stable as a wire identifier.
   "write-approval-session-denied": "the operator denied writes for this session until they clear the deny",
+  "write-approval-denied": "the operator denied this write",
   "write-approval-headless-denied": "writes that need approval are denied in an unattended run",
   "host-service-not-configured": "this host service is not approved for the project",
   "host-service-unavailable": "the host-service gateway or the host service is not available",
@@ -408,7 +411,7 @@ function shapeDenialLines(host: string, reason: DenialReason, details: ShapeDeni
       "The person operating Runfree can decide the pending approvals with",
       "`runfree approvals`, then retry the request.",
     );
-  } else if (reason === "write-approval-session-denied") {
+  } else if (reason === "write-approval-session-denied" || reason === "write-approval-denied") {
     // Deliberate operator decision: no remedy line.
   } else if (reason === "write-approval-headless-denied") {
     // No approver can see this request, so no approval remedy applies.

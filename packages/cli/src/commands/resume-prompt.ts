@@ -39,7 +39,10 @@ export function currentTerminal(context: Readonly<{ env?: NodeJS.ProcessEnv }>, 
 }
 
 function oneQuestionMessage(row: ResumeRow): string {
-  const name = row.name !== undefined ? `"${row.name}" — ${row.agent}` : row.agent;
+  // The note travels with the name: a name copied from agent-written
+  // evidence is labelled here exactly as it is in the picker.
+  const labelled = row.note !== undefined ? `${row.agent} (${row.note})` : row.agent;
+  const name = row.name !== undefined ? `"${row.name}" — ${labelled}` : labelled;
   return `Interrupted in this terminal (${row.time}, ${row.ago}):\n${name}`;
 }
 

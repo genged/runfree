@@ -9,12 +9,14 @@ import { projectInfo } from "../config.ts";
 import {
   approveNetworkCandidate,
   approveRuntimeIsolationControl,
+  readApprovedNetworkPolicy,
 } from "./approvals.ts";
 import { captureDesiredPolicyCandidate } from "./candidates.ts";
 import type { CompiledDesiredPolicy } from "./compiler.ts";
 import { validateNetworkPolicy } from "@runfree/runtime-contracts/network-policy";
 import { validateOAuthMediationPolicy } from "@runfree/runtime-contracts/oauth-mediation-policy";
 import { flushWarnings, pendingWarningsForTest } from "../warnings.ts";
+import { compileDesiredPolicies } from "./compiler.ts";
 import {
   clearConvergedPolicyReceipt,
   cleanupEffectivePolicyGenerations,
@@ -26,6 +28,8 @@ import {
   reconcileMcpOAuthProvidersForTest,
   selectEffectivePolicyGeneration,
   verifyEffectivePolicyGeneration,
+  compiledPolicyBase,
+  EffectivePolicyBaseChangedError,
 } from "./effective.ts";
 
 // A reboot renumbers the volume. Nothing else about the checkout changes, so
@@ -76,6 +80,24 @@ describe("effective control generations", () => {
     expect(fs.statSync(generation.oauthPolicyPath).mode & 0o777).toBe(0o444);
     expect(readEffectiveControlProvenance(project, generation.controlGeneration).provenance.sources.hosts)
       .toEqual({ "example.com": ["project:direct"] });
+  });
+
+  test("publication refuses a projection prepared over a desired policy that has since changed", () => {
+    // The MCP projection and seed handles are derived outside the publish
+    // lock; a mutation landing before the lock used to publish a generation
+    // whose body was that projection while its manifest named the new policy.
+    const project = approvedProject();
+    expect(() => publishEffectivePolicyGeneration(root, project, { compiledBase: "a stale compiled policy" }))
+      .toThrow(EffectivePolicyBaseChangedError);
+    expect(readActiveControlSelection(project)).toBeUndefined();
+
+    const projectPolicy = readApprovedNetworkPolicy(root, project, "network-project");
+    const localPolicy = readApprovedNetworkPolicy(root, project, "network-local");
+    if (!projectPolicy || !localPolicy) throw new Error("approved policies");
+    const generation = publishEffectivePolicyGeneration(root, project, {
+      compiledBase: compiledPolicyBase(compileDesiredPolicies({ project: projectPolicy, local: localPolicy })),
+    });
+    expect(readActiveControlSelection(project)).toEqual(generation.active);
   });
 
   test("a generation written by an older release (stored provenance payload) still verifies and explains", () => {

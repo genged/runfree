@@ -69,6 +69,7 @@ import {
   type SessionHeadlessLaunchResult,
 } from "./session-public-launch.ts";
 import type { RuntimeContext, RuntimeIO } from "./types.ts";
+import { projectHash } from "../project-identity.ts";
 
 /** §3.6 codes `run` reserves above the agent's own 1-63. */
 export const HEADLESS_RUN_EXIT = Object.freeze({
@@ -346,7 +347,14 @@ async function runUnderLock(input: RunInput): Promise<number> {
 
   let lock: HeadlessRunLock;
   try {
-    lock = deps.acquireLock({ stateDir, inboxDir, sessionsDir, io, ...(context.env ? { env: context.env } : {}) });
+    lock = deps.acquireLock({
+      stateDir,
+      projectId: projectHash(context.projectRoot),
+      inboxDir,
+      sessionsDir,
+      io,
+      ...(context.env ? { env: context.env } : {}),
+    });
   } catch (error) {
     if (!(error instanceof HeadlessRunLockHeldError)) {
       runfreeError(`the headless run did not start: ${errorText(error)}`);
@@ -375,6 +383,7 @@ async function runUnderLock(input: RunInput): Promise<number> {
   let refused = false;
   let launchResult: SessionHeadlessLaunchResult | undefined;
   let launchError: unknown;
+  let abortedAtSettle: AbortReason | undefined;
   let unchecked: HeadlessUncheckedAuthority | null = null;
   let askExposure: HeadlessAskExposure | null = null;
   let active: Readonly<{ context: RuntimeContext; proxyId: string }> | undefined;
@@ -435,7 +444,12 @@ async function runUnderLock(input: RunInput): Promise<number> {
       if (result.kind === "refused") refused = true;
       else launchResult = result.value;
     }
+    // Read at the moment the run settles: a deadline that elapses during
+    // the stop routine or the stream drain below is not a timeout of the
+    // run, which had already finished.
+    abortedAtSettle = input.aborted();
   } catch (error) {
+    abortedAtSettle = input.aborted();
     launchError = error;
     runfreeError(`the headless run failed: ${errorText(error)}`);
     // Nothing ran yet: a failure before the container exists is a refusal.
@@ -469,7 +483,7 @@ async function runUnderLock(input: RunInput): Promise<number> {
       : null;
   const decision = decideHeadlessRunExit({
     stage: refused ? "refused" : "launched",
-    ...(input.aborted() ? { aborted: input.aborted() } : {}),
+    ...(abortedAtSettle ? { aborted: abortedAtSettle } : {}),
     ...(agent ? { agent } : {}),
     denials,
     acceptDeniedWrites: options.acceptDeniedWrites,

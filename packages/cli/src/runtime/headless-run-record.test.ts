@@ -13,6 +13,7 @@ import {
   HEADLESS_RUN_ID_PATTERN,
   summaryLines,
   type HeadlessRunJson,
+  HEADLESS_RUN_RECORD_RETENTION,
 } from "./headless-run-record.ts";
 
 // Headless-run spec §3.4: the run record lives only under
@@ -289,5 +290,38 @@ describe("capture into the record", () => {
     expect(lines.at(-1)).toBe(`run record: ${record.dir}`);
     expect(path.relative(projectRoot, record.dir).startsWith("..")).toBe(true);
     expect(treeSnapshot(projectRoot)).toEqual(before);
+  });
+});
+
+describe("run record retention", () => {
+  test("creating a record removes the oldest records past the retention and nothing else", () => {
+    const { projectRoot, stateDir } = layout();
+    const runsDir = path.join(stateDir, "runs");
+    fs.mkdirSync(runsDir, { mode: 0o700 });
+    const ids: string[] = [];
+    for (let index = 0; index < HEADLESS_RUN_RECORD_RETENTION + 4; index += 1) {
+      const stamp = new Date(Date.UTC(2026, 0, 1, 0, 0, index)).toISOString().replace(/\.\d{3}Z$/, "Z").replace(/[-:]/g, "");
+      const id = `run-${stamp}-${index.toString(16).padStart(8, "0")}`;
+      ids.push(id);
+      fs.mkdirSync(path.join(runsDir, id), { mode: 0o700 });
+      fs.writeFileSync(path.join(runsDir, id, "run.json"), "{}\n");
+    }
+    // Not run records: a stray file and a directory outside the id shape stay.
+    fs.writeFileSync(path.join(runsDir, "notes.txt"), "keep\n");
+    fs.mkdirSync(path.join(runsDir, "scratch"));
+
+    const newest = "run-20260301T000000Z-0000ffff";
+    const record = createRunRecord(stateDir, newest, { projectRoot });
+    record.finalize(runJson({ runId: newest }), {});
+
+    const remaining = fs.readdirSync(runsDir).sort();
+    expect(remaining).toContain("notes.txt");
+    expect(remaining).toContain("scratch");
+    const records = remaining.filter((name) => name.startsWith("run-"));
+    expect(records).toHaveLength(HEADLESS_RUN_RECORD_RETENTION);
+    expect(records).toContain(newest);
+    // The five oldest are gone, the rest kept in order.
+    for (const id of ids.slice(0, 5)) expect(records).not.toContain(id);
+    for (const id of ids.slice(5)) expect(records).toContain(id);
   });
 });

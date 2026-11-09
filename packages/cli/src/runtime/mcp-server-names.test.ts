@@ -173,6 +173,19 @@ describe("MCP server names in the inventory and at launch", () => {
     ]);
   });
 
+  test("one exact name in Claude's user and local scope imports once, from the local scope", () => {
+    // Before the check, both imported and launch threw: duplicate OAuth
+    // provider id mcp:claude-sentry, from `claude mcp add` run once at user
+    // scope and once at the default local scope. Claude itself lets the local
+    // entry override the user entry, so that is the one kept.
+    writeHostClaude({ mcpServers: { sentry: HTTP }, projects: { [projectRoot]: { mcpServers: { sentry: HTTP } } } });
+    expect(decisions()).toEqual([
+      ["user", "claude", "sentry", "unsupported", "shadowed by the local MCP server of the same name"],
+      ["local", "claude", "sentry", "imported", ""],
+    ]);
+    expect(Object.keys(prepare())).toEqual(["sentry"]);
+  });
+
   test("user and local names that collide are both skipped", () => {
     writeHostClaude({ mcpServers: { Sentry: HTTP }, projects: { [projectRoot]: { mcpServers: { sentry: HTTP } } } });
     expect(decisions().map((row) => row.slice(0, 4))).toEqual([

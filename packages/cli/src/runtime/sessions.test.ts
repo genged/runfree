@@ -38,9 +38,12 @@ import {
   synthesizeSessionName,
   tryAcquireProjectLifecycleLock,
   tryAcquireProjectLifecycleLockWithRetry,
+  describeLifecycleLockBlocker,
+  removeLifecycleLockQuarantines,
   writeSessionMetadata,
 } from "./sessions.ts";
 import { flushWarnings } from "../warnings.ts";
+import { enqueueSessionRenewal } from "./session-renewal-queue.ts";
 import { RUNNING_PROOF_TIMEOUT_MS, SESSION_HANDOFF_WAIT_CEILING_MS } from "./session-admission-driver.ts";
 import {
   LAUNCH_HANDOFF_STARTUP_SPAN_MAX_MS,
@@ -1447,4 +1450,33 @@ test("one launch's whole continuous lifecycle-lock hold fits inside another comm
   // A launch that releases a long-held lock yields long enough for every
   // waiter's next try before it takes the lock again.
   expect(LIFECYCLE_LOCK_WAITER_YIELD_MS).toBeGreaterThan(2 * PROJECT_LIFECYCLE_LOCK_RETRY_DELAY_MS);
+});
+
+test("the lock-wait diagnostic names a queued renewal ticket, not the lock nobody holds", () => {
+  const runtimeContext = hostContext(harnessEnv(BOOT_B, PROCESS_B));
+  const stateDir = runtimeContext.project.paths.stateDir;
+  expect(describeLifecycleLockBlocker(runtimeContext)).toBe(`lock: ${projectLifecycleLockPath(runtimeContext)}`);
+  const renewal = enqueueSessionRenewal(stateDir, Date.now(), runtimeContext.env);
+  expect(describeLifecycleLockBlocker(runtimeContext)).toBe(
+    `queued session renewal ahead of this command: ${path.join(stateDir, "session-renewal-queue", renewal.ticket)}`,
+  );
+  renewal.release();
+  expect(describeLifecycleLockBlocker(runtimeContext)).toBe(`lock: ${projectLifecycleLockPath(runtimeContext)}`);
+});
+
+test("destroy's quarantine sweep removes exactly the lock quarantines and leaves the lock and neighbours", () => {
+  const runtimeContext = hostContext();
+  const lockPath = writeLifecycleLock(runtimeContext, { pid: process.pid, boot: BOOT_A });
+  const parent = path.dirname(lockPath);
+  const quarantine = `${lockPath}.quarantine-${process.pid}-${"c".repeat(32)}`;
+  fs.mkdirSync(quarantine);
+  fs.writeFileSync(path.join(quarantine, "pid"), "1\n");
+  fs.mkdirSync(`${lockPath}.quarantine-not-a-quarantine`);
+  fs.mkdirSync(path.join(parent, "session-renewal-queue"));
+  expect(removeLifecycleLockQuarantines(runtimeContext)).toBe(1);
+  expect(fs.existsSync(quarantine)).toBe(false);
+  expect(fs.existsSync(lockPath)).toBe(true);
+  expect(fs.existsSync(`${lockPath}.quarantine-not-a-quarantine`)).toBe(true);
+  expect(fs.existsSync(path.join(parent, "session-renewal-queue"))).toBe(true);
+  expect(removeLifecycleLockQuarantines(runtimeContext)).toBe(0);
 });

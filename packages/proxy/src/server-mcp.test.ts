@@ -191,7 +191,8 @@ describe("proxy server MCP operation policy", () => {
     writeDecision(dirs, record.id, { decision: "deny" });
     const response = await responsePromise;
     expect(response.statusCode).toBe(403);
-    expect(response.raw).toContain("x-runfree-blocked: write-approval-required");
+    // An operator's deny is reported as a deny, not as a missing approver.
+    expect(response.raw).toContain("x-runfree-blocked: write-approval-denied");
     expect(upstream.requests).toHaveLength(0);
   }, 30_000);
 });

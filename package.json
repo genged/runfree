@@ -44,6 +44,8 @@
   },
   "devDependencies": {
     "@biomejs/biome": "2.4.16",
+    "@stryker-mutator/core": "10.1.1",
+    "@stryker-mutator/vitest-runner": "10.1.1",
     "@types/node": "^22.0.0",
     "@types/yargs": "^17.0.35",
     "@vitest/coverage-v8": "4.1.12",

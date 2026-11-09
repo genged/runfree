@@ -389,6 +389,15 @@ function parseHostEvidence(value: unknown, fileSessionId: string): SessionMetada
   return value as unknown as SessionMetadata;
 }
 
+// A positive integer is not yet a time: `new Date(1e16).toISOString()` throws
+// RangeError, and this file is agent-written. Only an epoch the Date type
+// can render is a timestamp.
+const MAX_EPOCH_MS = 8_640_000_000_000_000;
+
+function validEpochMs(value: unknown): value is number {
+  return Number.isInteger(value) && (value as number) > 0 && (value as number) <= MAX_EPOCH_MS;
+}
+
 function parseClaudeRegistry(value: unknown): ClaudeRegistryEvidence | undefined {
   if (!isRecord(value)) return undefined;
   if (!Number.isInteger(value.pid) || (value.pid as number) <= 0) return undefined;
@@ -396,8 +405,7 @@ function parseClaudeRegistry(value: unknown): ClaudeRegistryEvidence | undefined
   if (!boundedString(value.cwd) || typeof value.procStart !== "string" || !/^[0-9]+$/.test(value.procStart)) {
     return undefined;
   }
-  if (!Number.isInteger(value.startedAt) || (value.startedAt as number) <= 0) return undefined;
-  if (!Number.isInteger(value.updatedAt) || (value.updatedAt as number) <= 0) return undefined;
+  if (!validEpochMs(value.startedAt) || !validEpochMs(value.updatedAt)) return undefined;
   if (value.name !== undefined && typeof value.name !== "string") return undefined;
   if (value.status !== undefined && typeof value.status !== "string") return undefined;
   return {
@@ -1364,35 +1372,50 @@ export function scanRecoveryInventory(input: {
       }
       inspectedProjects += 1;
       const stateDir = path.join(projectsRoot, entry.name);
-      const hostEvidence = scanHostEvidence(stateDir, global);
-      const claudeEvidence = scanClaudeEvidence(stateDir, global);
-      const mapping = projectMapping(stateDir, entry.name, hostEvidence);
-      if (requestedRoot && mapping.projectRoot !== requestedRoot) continue;
-      // A headless run's evidence is never offered (headless-run spec §3.3,
-      // plan C1). It still names the conversation that run used, so the
-      // agent-written Claude registry entry and Codex rollout of that run are
-      // dropped too, within this project only.
-      const allHostItems = hostEvidence.map((evidence) => itemFromHost(entry.name, stateDir, mapping, evidence, env));
-      const headlessItems = allHostItems.filter((item) => item.hostMetadata?.launchMode === "headless");
-      const hostItems = allHostItems.filter((item) => item.hostMetadata?.launchMode !== "headless");
-      const headlessConversations = new Set(headlessItems.flatMap((item) => [
-        validConversationId(item.hostMetadata?.launchConversationId),
-        validConversationId(item.hostMetadata?.resumeConversationId),
-      ].filter((id): id is string => id !== undefined)));
-      items.push(...hostItems);
-      items.push(...claudeEvidence
-        .filter((evidence) => !headlessConversations.has(evidence.registry.sessionId))
-        .map((evidence) => itemFromClaude(entry.name, stateDir, mapping, evidence, env)));
-      if (requestedRoot && input.includeCodexMatches === true) {
-        items.push(...codexMatchItemsForProject(entry.name, stateDir, mapping, hostItems, env, headlessItems));
+      // One project's evidence must not blank every other project's: a file
+      // that defeats a parser here (agent-written registry files are hostile
+      // input) is counted and skipped, and the listing says it is incomplete.
+      try {
+        const hostEvidence = scanHostEvidence(stateDir, global);
+        const claudeEvidence = scanClaudeEvidence(stateDir, global);
+        const mapping = projectMapping(stateDir, entry.name, hostEvidence);
+        if (requestedRoot && mapping.projectRoot !== requestedRoot) continue;
+        // A headless run's evidence is never offered (headless-run spec §3.3,
+        // plan C1). It still names the conversation that run used, so the
+        // agent-written Claude registry entry and Codex rollout of that run are
+        // dropped too, within this project only.
+        const allHostItems = hostEvidence.map((evidence) => itemFromHost(entry.name, stateDir, mapping, evidence, env));
+        const headlessItems = allHostItems.filter((item) => item.hostMetadata?.launchMode === "headless");
+        const hostItems = allHostItems.filter((item) => item.hostMetadata?.launchMode !== "headless");
+        const headlessConversations = new Set(headlessItems.flatMap((item) => [
+          validConversationId(item.hostMetadata?.launchConversationId),
+          validConversationId(item.hostMetadata?.resumeConversationId),
+        ].filter((id): id is string => id !== undefined)));
+        items.push(...hostItems);
+        items.push(...claudeEvidence
+          .filter((evidence) => !headlessConversations.has(evidence.registry.sessionId))
+          .map((evidence) => itemFromClaude(entry.name, stateDir, mapping, evidence, env)));
+        if (requestedRoot && input.includeCodexMatches === true) {
+          items.push(...codexMatchItemsForProject(entry.name, stateDir, mapping, hostItems, env, headlessItems));
+        }
+      } catch {
+        global.invalidFiles += 1;
+        global.truncated = true;
+        continue;
       }
       if (global.files >= RECOVERY_LIMITS.maxFilesGlobal) {
         global.truncated = true;
         break;
       }
     }
-  } catch {
-    return { items: [], truncated: false, invalidFiles: 0 };
+  } catch (error) {
+    // No projects root yet is the ordinary state of a fresh install: nothing
+    // to list, and nothing hidden. Any other failure to read the root hides
+    // evidence, and the listing must say so rather than report "none".
+    if (projects === undefined && error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
+      return { items: [], truncated: false, invalidFiles: 0 };
+    }
+    global.truncated = true;
   } finally {
     projects?.closeSync();
   }
@@ -1454,7 +1477,16 @@ function displayTime(value: string | undefined): string {
 }
 
 export function formatRecoveryInventory(inventory: RecoveryInventory): string {
-  if (inventory.items.length === 0) return "no interrupted or unverified Runfree sessions";
+  // What the scan could not read is said here, in the text listing, not only
+  // in `--json`: "no interrupted sessions" over skipped evidence would be the
+  // hiding this inventory exists to prevent.
+  const notes = [
+    ...(inventory.truncated ? ["warning: recovery inventory was truncated at its safety limit"] : []),
+    ...(inventory.invalidFiles > 0
+      ? [`warning: ${inventory.invalidFiles} recovery evidence file(s) were unreadable or malformed and were skipped`]
+      : []),
+  ];
+  if (inventory.items.length === 0) return ["no interrupted or unverified Runfree sessions", ...notes].join("\n");
   const table = formatTerminalTable({
     columns: [
       { label: "ID" },
@@ -1475,7 +1507,7 @@ export function formatRecoveryInventory(inventory: RecoveryInventory): string {
       sanitizeForTerminal(item.terminalHint ?? "-").slice(0, 40),
     ]),
   });
-  return inventory.truncated ? `${table}\nwarning: recovery inventory was truncated at its safety limit` : table;
+  return [table, ...notes].join("\n");
 }
 
 function evidenceDirectory(item: RecoveryItem): string | undefined {
@@ -2226,6 +2258,11 @@ function createRecoveryClaimUnderLifecycle(
     fs.writeFileSync(filePath, `${JSON.stringify(record, null, 2)}\n`, { mode: 0o600, flag: "wx" });
   } catch (error) {
     if (error instanceof Error && "code" in error && error.code === "EEXIST") return undefined;
+    // `wx` created the file before the write failed (disk full, I/O error).
+    // A partial claim nobody owns would hold this conversation's scope until
+    // its dead-claim age; under the claim lock the path is this writer's to
+    // clear, exactly as a completed claim would be released.
+    fs.rmSync(filePath, { force: true });
     throw error;
   }
   const created = safeReadJson(filePath);

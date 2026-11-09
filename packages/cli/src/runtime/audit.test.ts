@@ -11,6 +11,7 @@ import {
   formatAuditStatusLine,
   parseAuditDuration,
   parseUpOptions,
+  MARKER_STATUS_SCRIPT,
 } from "./audit.ts";
 
 const GENERATION = `sha256:${"a".repeat(64)}`;
@@ -171,5 +172,29 @@ describe("audit status and banner", () => {
     expect(banner).toContain("exfiltrate workspace data");
     expect(banner).toContain("runfree audit report");
     expect(banner).toContain("runfree audit off");
+  });
+});
+
+describe("the in-container marker status script", () => {
+  // The script runs inside the proxy container and cannot import the proxy's
+  // `effectiveAuditExpiryMs`, so its copy of the clamp is pinned here to the
+  // same formula and the same bound: min(expiresAt, min(enabledAt, now) + 8h).
+  test("applies the proxy's own expiry clamp with the shared maximum", () => {
+    expect(MARKER_STATUS_SCRIPT).toContain("const maxMs = 8 * 60 * 60 * 1000;");
+    expect(8 * 60 * 60 * 1000).toBe(AUDIT_MAX_DURATION_MS);
+    expect(MARKER_STATUS_SCRIPT).toContain("Math.min(expiresAtMs, Math.min(enabledAtMs, nowMs) + maxMs)");
+    // The same inputs through the script's expression and the proxy formula.
+    const clamp = new Function("expiresAtMs", "enabledAtMs", "nowMs", "maxMs", "return Math.min(expiresAtMs, Math.min(enabledAtMs, nowMs) + maxMs);") as
+      (expiresAtMs: number, enabledAtMs: number, nowMs: number, maxMs: number) => number;
+    const proxyFormula = (enabledAtMs: number, expiresAtMs: number, nowMs: number) =>
+      Math.min(expiresAtMs, Math.min(enabledAtMs, nowMs) + AUDIT_MAX_DURATION_MS);
+    const now = Date.parse("2026-11-08T12:00:00.000Z");
+    for (const [enabledAt, expiresAt] of [
+      [now - 60_000, now + 3_600_000],
+      [now + 3_600_000, now + 48 * 3_600_000],
+      [now - 9 * 3_600_000, now + 3_600_000],
+    ]) {
+      expect(clamp(expiresAt as number, enabledAt as number, now, AUDIT_MAX_DURATION_MS)).toBe(proxyFormula(enabledAt as number, expiresAt as number, now));
+    }
   });
 });

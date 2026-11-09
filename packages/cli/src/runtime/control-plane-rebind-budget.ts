@@ -1,5 +1,6 @@
 import type { SpawnSyncOptions } from "node:child_process";
 
+import { EPHEMERAL_HELPER_PURPOSE_LABEL } from "./container-inventory.ts";
 import { checkBeforeSpawn } from "./io-refusal.ts";
 import type { RuntimeIO } from "./types.ts";
 import { readControlPlaneRebindTransaction } from "./control-plane-rebind.ts";
@@ -36,8 +37,16 @@ export function withRebindBudgetIO(io: RuntimeIO, stateDir: string, project: Ses
   };
   // Captured mutators spend the same durable allowance as run(). Exact
   // defensive stop remains available for proved containment after expiry.
+  // The deny-probe helper is a `docker run`, but it publishes no Runfree
+  // authority: it proves the candidate's containment and is removed. An
+  // explicit `runtime recover --retry` re-proves the candidate before its
+  // renewed allowance is durable, so judging the probe as a mutation refused
+  // the one command meant to finish the recovery. It still spends the
+  // observation budget like every other call.
+  const isDenyProbeHelperRun = (args: string[]): boolean => args[0] === "run"
+    && args.some((arg) => arg === `${EPHEMERAL_HELPER_PURPOSE_LABEL}=deny-probe`);
   const admitCapture = (command: string, args: string[], options: SpawnSyncOptions): SpawnSyncOptions => {
-    if (command === "docker" && (["create", "run", "start", "restart", "rm", "cp", "compose"].includes(args[0])
+    if (command === "docker" && !isDenyProbeHelperRun(args) && (["create", "run", "start", "restart", "rm", "cp", "compose"].includes(args[0])
       || args[0] === "container" && ["create", "start", "restart", "rm"].includes(args[1])
       || ["network", "volume"].includes(args[0]) && ["create", "connect", "disconnect", "rm"].includes(args[1]))) checkBeforeSpawn(assertMutationAllowance);
     const budget = checkBeforeSpawn(remaining);

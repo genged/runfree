@@ -41,6 +41,10 @@ describe("signal exit contract", () => {
 
     target.emit("SIGTERM");
     expect(calls.slice(3)).toEqual(["flush", "restore", `exit:${SIGNAL_EXIT_CODES.SIGTERM}`]);
+
+    // A closed terminal is handled the same way instead of Node's immediate exit.
+    target.emit("SIGHUP");
+    expect(calls.slice(6)).toEqual(["flush", "restore", `exit:${SIGNAL_EXIT_CODES.SIGHUP}`]);
   });
 
   test("a failing flush still restores the terminal and exits", () => {

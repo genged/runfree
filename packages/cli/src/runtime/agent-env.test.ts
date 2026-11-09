@@ -2,6 +2,7 @@ import { describe, expect, test } from "vitest";
 
 import { composeAgentEnvironment } from "../agents.ts";
 import { RUNFREE_PLACEHOLDER_VALUE } from "../../../../scripts/services.ts";
+import { LAUNCH_LOCK_HOLD_BUDGET_MS } from "./launch-lock-hold.ts";
 import {
   BASE_AGENT_ENVIRONMENT,
   DEFAULT_AGENT_PLACEHOLDER_ENVIRONMENT,
@@ -23,10 +24,11 @@ describe("agent environment ownership", () => {
       NODE_USE_ENV_PROXY: "1",
     });
     // The session entry's wait bound is host-rendered and pinned (design D4).
-    // It must exceed the worst-case activation budget: registration and
-    // activation acknowledgement waits plus the running-proof maximum, so an
-    // entry never gives up on a session the host could still have activated.
-    expect(Number(BASE_AGENT_ENVIRONMENT.RUNFREE_SESSION_ENTRY_TIMEOUT_MS)).toBeGreaterThan(5_000 + 5_000 + 30_000);
+    // It must exceed the launch's whole lock-hold budget (launch-lock-hold.ts),
+    // which bounds everything the host may still do before it activates the
+    // session, so an entry never gives up on a session the host could still
+    // have activated.
+    expect(Number(BASE_AGENT_ENVIRONMENT.RUNFREE_SESSION_ENTRY_TIMEOUT_MS)).toBeGreaterThan(LAUNCH_LOCK_HOLD_BUDGET_MS);
     expect(DEFAULT_AGENT_PLACEHOLDER_ENVIRONMENT).toEqual({
       GH_TOKEN: RUNFREE_PLACEHOLDER_VALUE,
       GITHUB_TOKEN: RUNFREE_PLACEHOLDER_VALUE,

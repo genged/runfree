@@ -1101,6 +1101,13 @@ export class OAuthMediator {
       if (claim !== undefined) {
         return forbidden("OAuth endpoint became blocked while this request was in flight; retry it");
       }
+      // Discovery too: a metadata document fetched on the plain rule has its
+      // reply never read, so the endpoints it names are never recorded and
+      // the login fails until it is retried. The server's early check asks
+      // the same question; this is the same answer against the policy now.
+      if (matchingMetadataServer(policy, state, url) !== undefined) {
+        return forbidden("OAuth metadata endpoint became mediated while this request was in flight; retry it");
+      }
     }
     // The last check before the request is forwarded: a grant- or
     // registration-shaped request that no provider mediates, to a host or

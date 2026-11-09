@@ -152,6 +152,31 @@ describe("selectResumeCandidates", () => {
     expect(claudeRow?.note).toBe("Claude reported");
   });
 
+  test("a host row whose resume is already blocked is neither asked nor listed", () => {
+    // Offered before, it reached the live classification as "unverified"
+    // every time: a question whose every answer resumed nothing.
+    const blocked = hostItem({ resumeBlockedReason: "an exact Claude recovery completed after this host-only evidence was created" });
+    expect(selectResumeCandidates({ items: [blocked], current: CURRENT, now: NOW })).toEqual({ kind: "none" });
+    const other = hostItem();
+    const result = selectResumeCandidates({ items: [blocked, other], current: CURRENT, now: NOW });
+    expect(result.kind).toBe("one-question");
+    if (result.kind !== "one-question") throw new Error("unreachable");
+    expect(result.row.item.id).toBe(other.id);
+  });
+
+  test("a host row whose name was copied from agent-written evidence carries that label", () => {
+    const fromClaude = hostItem({ conversationName: "fix recovery", conversationNameSource: "claude-reported", terminal: WEAK_TERMINAL });
+    const fromCodex = hostItem({ agent: "codex", conversationName: "ship it", conversationNameSource: "codex-index", terminal: WEAK_TERMINAL });
+    const own = hostItem({ conversationName: "mine", terminal: WEAK_TERMINAL });
+    const result = selectResumeCandidates({ items: [fromClaude, fromCodex, own], current: CURRENT, now: NOW });
+    expect(result.kind).toBe("picker");
+    if (result.kind !== "picker") throw new Error("unreachable");
+    const notes = new Map(result.rows.map((row) => [row.item.id, row.note]));
+    expect(notes.get(fromClaude.id)).toBe("name Claude reported");
+    expect(notes.get(fromCodex.id)).toBe("name from Codex index");
+    expect(notes.get(own.id)).toBeUndefined();
+  });
+
   test("hides records that are claimed, unprovable, active-owned, unrecoverable, or pre-dating the record version", () => {
     const items = [
       hostItem({ recordVersion: undefined }),

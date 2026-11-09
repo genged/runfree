@@ -129,6 +129,10 @@ services:
     image: ${RUNFREE_PROXY_IMAGE:?RUNFREE_PROXY_IMAGE is required}
     container_name: ${RUNFREE_COMPOSE_PROJECT_NAME:?RUNFREE_COMPOSE_PROJECT_NAME is required}-host-relay
     network_mode: host
+    # A relay that crashed used to be found only by the next launch's topology
+    # check, which then refused until `runfree rebuild`; the daemon restarts
+    # it, and `runfree down`/`stop` still stop it for good.
+    restart: on-failure
     user: "65534:65534"
     read_only: true
     cap_drop:

@@ -32,13 +32,23 @@ test.each([
     expect(() => assertSessionDisruptionAuthorized({ ...input, operation, force: true })).not.toThrow();
   }
   liveness.value = "dead";
-  expect(() => assertSessionDisruptionAuthorized({ ...input, operation: "stop" })).not.toThrow();
+  if (revoking) {
+    // A dead owner's `revoking` record is a teardown `destroy` did not finish,
+    // and it is read exactly like a terminal stamp (below): the gate refuses
+    // until `runfree up` reclaims it or the operator forces the stop.
+    expect(() => assertSessionDisruptionAuthorized({ ...input, operation: "stop" })).toThrow(record.sessionId);
+    expect(() => assertSessionDisruptionAuthorized({ ...input, operation: "stop" })).toThrow("runfree stop --force");
+    expect(() => assertSessionDisruptionAuthorized({ ...input, operation: "stop", force: true })).not.toThrow();
+  } else {
+    expect(() => assertSessionDisruptionAuthorized({ ...input, operation: "stop" })).not.toThrow();
+  }
 });
 
 // There is no admission journal to read, so what says "a lifecycle transaction
-// is in flight" is a record whose host status stamp is terminal: its owner has
-// begun revoking it, and stopping the runtime underneath that teardown is
-// exactly the disruption this gate exists to refuse.
+// is in flight" is the mark a teardown left: a record whose host status stamp
+// is terminal (here), or one `destroy` transitioned to `revoking` (above). Its
+// owner has begun revoking it, and stopping the runtime underneath that
+// teardown is exactly the disruption this gate exists to refuse.
 test("a terminal-stamped record refuses disruption even with a dead owner", () => {
     liveness.value = "dead";
     const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "runfree-disruption-files-")); roots.push(stateDir);

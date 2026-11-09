@@ -4,7 +4,9 @@
 
 // Exit codes for a signal-terminated run (contract D3): the conventional
 // 128+signal values, so a wrapper can tell an interrupt from a refusal.
-export const SIGNAL_EXIT_CODES = Object.freeze({ SIGINT: 130, SIGTERM: 143 });
+// SIGHUP is a closed terminal: without a handler Node ends the process at
+// once, and an attached session's teardown never runs.
+export const SIGNAL_EXIT_CODES = Object.freeze({ SIGHUP: 129, SIGINT: 130, SIGTERM: 143 });
 
 type SignalName = keyof typeof SIGNAL_EXIT_CODES;
 
@@ -31,7 +33,7 @@ export type SignalExitHooks = {
   exit: (code: number) => void;
 };
 
-// Install one-shot SIGINT/SIGTERM handlers that flush buffered warnings,
+// Install one-shot SIGHUP/SIGINT/SIGTERM handlers that flush buffered warnings,
 // restore the terminal, and exit 130/143 (unless a deferral is held). `once` means a second signal takes
 // the default action (immediate exit) without re-running the handlers, and
 // restoration is idempotent so a signal during a prompt or a half-initialized

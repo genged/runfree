@@ -36,3 +36,4 @@ export {
 } from "./nftables.js";
 export { discoverInterfaces, ensureDefaultRoute, hasIpv6DefaultRoute, verifyFirewallState } from "./route.js";
 export { classifyResolvedIpv4, createFirewallController, type FirewallController } from "./supervisor.js";
+export type { FirewallRefreshOptions, FirewallRefreshResult } from "./supervisor.js";

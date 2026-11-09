@@ -172,9 +172,10 @@ describe("post-mutation control activation", () => {
     fs.chmodSync(context.project.paths.controlProxyActivePath, 0o600);
     fs.writeFileSync(context.project.paths.controlProxyActivePath, "not-json\n");
 
+    // The refusal names the command that repairs the selection.
     await expect(activateApprovedControlsAfterMutation(context, unusedIo, {
       consumer: { running: false, probe: async () => ({}), stop: async () => {} },
-    })).rejects.toThrow();
+    })).rejects.toThrow("runfree policy use-approved");
 
     const recovered = await activateApprovedControlsAfterMutation(context, unusedIo, {
       consumer: { running: false, probe: async () => ({}), stop: async () => {} },

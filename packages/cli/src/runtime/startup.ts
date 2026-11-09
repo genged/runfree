@@ -105,6 +105,7 @@ import {
   activeAgentSessions,
   activeOrStartingAgentSessions,
   confirmRebuildIfActiveSessions,
+  describeLifecycleLockBlocker,
   projectLifecycleLockPath,
   serviceList,
   tryAcquireProjectLifecycleLockWithRetry,
@@ -146,6 +147,7 @@ import {
   type SessionContainerRecordV2,
 } from "./session-containers.ts";
 import { readSessionHostStatus } from "./session-host-status.ts";
+import { sessionTeardownInFlight } from "./session-teardown-in-flight.ts";
 import { sessionRecordLiveUnderSessionFiles, sessionRecordOwnerLiveness } from "./session-record-liveness.ts";
 import { planRuntimeUpgradeV2 } from "./upgrade-plan-v2.ts";
 import {
@@ -1568,7 +1570,7 @@ export async function startRuntime(
     // Where a handed-off lock's one continuous hold starts (launch-lock-hold.ts).
     const lockAcquiredAtMonotonicMs = performance.now();
     if (!lifecycleLock) {
-      warn(`the runtime did not start: another Runfree runtime lifecycle change is in progress (lock: ${projectLifecycleLockPath(preparedContext)}); retry when it finishes`);
+      warn(`the runtime did not start: another Runfree runtime lifecycle change is in progress (${describeLifecycleLockBlocker(preparedContext)}); retry when it finishes`);
       return result(1, false, preparedContext);
     }
     let lockSpanStarted = performance.now();
@@ -1652,13 +1654,18 @@ export async function startRuntime(
         runfreeLog(`finished the interrupted teardown of session ${reclaim.sessionIds.join(", ")}`);
       }
     }
-    io.admitPreparedTokenSources?.(runtimeContextFromActivePlan(activePlan));
-    timings.time("startup:select-session-agent", () => selectPreparedSessionAgent(activePlan, adapters.docker));
     if (!removeExisting) {
+      // Re-planned under the lock and before the desired session agent is
+      // selected below: the unlocked pass previewed the plan against this
+      // same pre-selection state, and only this pass announces it. Planned
+      // after the selection, a "select new host materialization" plan read
+      // as nothing to do and was never announced.
       upgradePlan = timings.time("startup:upgrade-plan-locked", () => planRuntimeUpgradeFromV2State(preparedPlan, existingContext, adapters.docker));
       const status = timings.time("startup:upgrade-apply-locked", () => applyRuntimeUpgradePlan(existingContext, adapters.docker, upgradePlan, { announce: true }));
       if (status !== 0) return result(status, false, existingContext);
     }
+    io.admitPreparedTokenSources?.(runtimeContextFromActivePlan(activePlan));
+    timings.time("startup:select-session-agent", () => selectPreparedSessionAgent(activePlan, adapters.docker));
     const activeContext = runtimeContextFromActivePlan(activePlan, {
       dependencyOverlayPlanChanged: dependencyPlan.changed,
       gitLayoutPlanChanged: gitLayout.changed,
@@ -2211,7 +2218,7 @@ export async function startRuntime(
               heldLifecycleLock.assertHeld();
               const relayStatus = rebindDocker.composeSyncHostRelay(project, hostServiceRelay);
               if (relayStatus !== 0) warn(`the host-service relay could not be updated with the proxy (docker compose exited ${relayStatus})`);
-              warn("proxy replacement reset pending approvals, temporary grants, remembered denials, and audit capture; interrupted requests are not replayed");
+              warn("proxy replacement reset pending approvals, temporary grants, and remembered denials, and ended network audit mode if it was on (re-enable it with `runfree up --audit-network`); interrupted requests are not replayed");
               return await proveCandidate();
             },
             proveCandidate,
@@ -2271,6 +2278,16 @@ export async function startRuntime(
                   try { outcome = { ok: true, value: await work() }; }
                   catch (error) { outcome = { ok: false, error }; }
                   lifecycleLock = await tryAcquireProjectLifecycleLockWithRetry(activeContext);
+                  if (!lifecycleLock) {
+                    // Named here, not by the wrapper below: its "released for
+                    // credential resolution" describes the window this frame
+                    // opened on purpose, not the contention that kept it open.
+                    throw new Error(
+                      `could not reacquire the project lifecycle lock after credential resolution (${
+                        describeLifecycleLockBlocker(activeContext)
+                      }); the proxy replacement is journaled, so retry with \`${remedy.up()}\``,
+                    );
+                  }
                   lockSpanStarted = performance.now();
                   heldLifecycleLock.assertHeld();
                   const current = readControlPlaneRebindTransaction(activePlan.paths.stateDir,
@@ -2411,8 +2428,10 @@ function warmPeerRestoreSkipRefusal(input: Readonly<{
     const policy = readActiveControlSelection(input.project);
     if (!effective || !policy) return "the effective selection is unreadable";
     if (readControlPlaneRebindTransaction(input.stateDir, input.expectedProject)) return "a control-plane rebind is pending";
-    if (listSessionContainerRecordsV2(input.stateDir, input.expectedProject).some((record) => record.state === "revoking")) {
-      return "a session record is revoking";
+    if (listSessionContainerRecordsV2(input.stateDir, input.expectedProject).some((record) => (
+      sessionTeardownInFlight(record, readSessionHostStatus(input.stateDir, record.sessionId))
+    ))) {
+      return "a session teardown is in flight";
     }
     binding = {
       lockOwnerToken: input.lifecycleLock.ownerToken,
@@ -2500,11 +2519,12 @@ export async function restoreSameProxySessionAdmission(input: {
     throw new Error("proxy replacement is pending; resume that transaction before a same-container restart");
   }
   // There is no admission journal to be pending; what says a session's
-  // admission is unfinished is a record its owner stamped terminal.
+  // admission is unfinished is the mark its teardown left: a record its owner
+  // stamped terminal, or one `destroy` transitioned to `revoking`.
   // Republishing this proxy's authority over an address whose teardown is
-  // mid-flight is exactly what that stamp exists to stop.
+  // mid-flight is exactly what those marks exist to stop.
   const admissionPending = listSessionContainerRecordsV2(plan.paths.stateDir, expectedProject).some((record) => (
-    readSessionHostStatus(plan.paths.stateDir, record.sessionId)?.terminal === "revoking"
+    sessionTeardownInFlight(record, readSessionHostStatus(plan.paths.stateDir, record.sessionId))
   ));
   if (admissionPending) {
     throw new Error(

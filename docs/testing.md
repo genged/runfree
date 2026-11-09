@@ -6,6 +6,10 @@ Runfree separates tests by the boundary they prove.
 | --- | --- | --- | --- |
 | Unit and integration | `pnpm test` | TypeScript modules and the source-backed CLI shim | Logic, parsing, state transitions, and component wiring |
 | Property soak | `make test-property-soak` | The path, GraphQL, MCP, and `.mcp.json` property tests at 100,000 cases each, run by hand | Rare agent-controlled inputs that 200 cases per change miss; run before a release that changes those classifiers. Not part of any other target |
+| Crash-step model tests (in `pnpm test`) | `*.property.test.ts` files built on `tests/support/crash-steps.ts` | A lifecycle driver (session teardown, generation selection) interrupted after each publishing write, then every documented reclaim command run from that state | A refusal whose printed remedy cannot work, a wedge no command clears, two consumers reading one fact differently |
+| Never-throws parser properties (in `pnpm test`) | `recovery-registry.property.test.ts` and siblings | Arbitrary JSON, raw bytes, and adversarial field values written where an agent writes, then the real reader | A parser that throws out of an inventory and hides the host's own evidence |
+| Metamorphic classifier relations (in `pnpm test`) | The `M*` cases in the proxy `*.property.test.ts` files | One input and its rewrite in a part the classifier ignores (query, header, separators, batch order) | A decision that moves on an ignored part, which random generation rarely produces two inputs to show |
+| Mutation (by hand) | `make test-mutation` | Stryker over the terminal-session marks, write-approval holds, and request classifiers, with their own tests (`stryker.config.mjs`) | Tests that pass without asserting; the report lands under `local/mutation/`. Not a gate: see [Mutation Testing](#mutation-testing) |
 | Live runtime security (release gate) | `make test-runtime` | Source-backed CLI plus real Docker | Both tiers below |
 | Live runtime core | `make test-runtime-core` | The trust-boundary subset of the layer above | Topology, capabilities, egress, CONNECT guard, request shape and write approval, inert policy edits and live revocation, managed-launch file safety, exact session admission, the pinned Claude and Pi `--session-id` contract on the built agent image, and two interrupted conversations resuming at the same time; run for every runtime, proxy, firewall, network, or credential change |
 | Live runtime extended | `make test-runtime-extended` | The rest of the live suite | Crash recovery, rolling upgrades and proxy replacement, renewal under load, session-entry ordering, helper cleanup, audit mode |
@@ -121,6 +125,37 @@ remedy that names a command, subcommand, or flag that does not exist fails the
 suite. Emit next-step commands through the registry rather than as string
 literals. The checks on public docs and user-visible terminology are listed in
 [What the checks enforce](writing-docs.md#what-the-checks-enforce).
+
+## Mutation Testing
+
+`make test-mutation` runs Stryker over the modules named in
+`stryker.config.mjs`, using only the test files that exercise them
+(`vitest.mutation.config.ts`). It is not a gate. Run it by hand after
+changing one of those modules or its tests, and keep the surviving mutants
+explained: a survivor is either an equivalent mutant (the change cannot be
+observed) or a missing assertion, and a missing assertion gets a test. The
+HTML and JSON reports land under `local/mutation/`, which git ignores.
+
+Baseline (first complete run, 2026-11-08, 2869 mutants, about 18 minutes
+with four runners): a later run that scores lower than its baseline on a
+module is a regression in that module's tests. "Score" counts every
+mutant; "covered" counts only mutants some test reaches.
+
+| Module | Score | Covered | Mutants | Survived |
+| --- | --- | --- | --- | --- |
+| `session-teardown-in-flight.ts` | 100.0 | 100.0 | 11 | 0 |
+| `graphql-classify.ts` | 85.1 | 85.6 | 125 | 25 |
+| `session-disruption.ts` | 79.4 | 81.8 | 27 | 6 |
+| `mcp-classify.ts` | 70.8 | 75.6 | 402 | 136 |
+| `approvals.ts` | 65.1 | 71.4 | 637 | 255 |
+| `session-admission-pending-reclaim.ts` | 59.9 | 68.7 | 252 | 115 |
+| `denial.ts` | 57.1 | 61.8 | 370 | 229 |
+| all | 65.2 | 70.9 | 1824 | 766 |
+
+The survivors are not yet explained one by one. The largest groups, and the
+first to work through, are the refusal sentences and remedies in
+`session-admission-pending-reclaim.ts` and `denial.ts` (tests assert the
+outcome, rarely the text) and the grant bookkeeping in `approvals.ts`.
 
 ## Proof Limits
 

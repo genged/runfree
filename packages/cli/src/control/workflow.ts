@@ -74,6 +74,7 @@ import {
   publishEffectivePolicyGeneration,
   readActiveEffectiveControl,
   type EffectivePolicyGeneration,
+  compiledPolicyBase,
 } from "./effective.ts";
 import { activeLifecycleSessions } from "../runtime/sessions.ts";
 import { remedy } from "../remedies.ts";
@@ -401,6 +402,10 @@ export function useApprovedPolicyGeneration(context: RuntimeContext): EffectiveP
     ...(baseOAuthPolicy ? { baseOAuthPolicy } : {}),
     ...(mcpOperationPolicy ? { mcpOperationPolicy } : {}),
     ...(compiled ? {
+      // The projection and seed handles above were derived from this
+      // compiled policy outside the publish lock; the publication re-fences
+      // them against what it compiles under the lock.
+      compiledBase: compiledPolicyBase(compiled),
       agentEnvValues: readHostAgentEnv(context.project.paths.controlAgentEnvPath),
       ...(effectiveNetworkPolicy ? { effectiveNetworkPolicy } : {}),
       oauthSeedHandles: readHostOAuthSeedHandles(context.project.paths.stateDir, compiled),

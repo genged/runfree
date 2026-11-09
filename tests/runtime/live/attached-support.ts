@@ -388,6 +388,22 @@ export async function startHeldLaunch(
 }
 
 /** Docker's own view of whether a container is still running and how it exited. */
+/**
+ * `containerExitState` for a container the launch's own teardown may already
+ * have removed: an interactive session torn down after its agent stopped
+ * leaves no container to inspect, and "no such container" is then a stopped
+ * state with no exit code to read, not an inspection failure.
+ */
+export function containerExitStateOrGone(containerId: string): Readonly<{ running: boolean; exitCode?: number; gone: boolean }> {
+  const inspected = childProcess.spawnSync("docker", ["container", "inspect", "--format", "{{.State.Running}} {{.State.ExitCode}}", containerId], { encoding: "utf8" });
+  if (inspected.status !== 0) {
+    if (/No such container/u.test(inspected.stderr)) return Object.freeze({ running: false, gone: true });
+    throw new Error(`inspect of ${containerId}: ${inspected.stderr.trim() || `exit ${inspected.status}`}`);
+  }
+  const [running, exitCode] = inspected.stdout.trim().split(" ");
+  return Object.freeze({ running: running === "true", exitCode: Number(exitCode), gone: false });
+}
+
 export function containerExitState(containerId: string): Readonly<{ running: boolean; exitCode: number }> {
   const inspected = dockerOrThrow(`inspect of ${containerId}`, [
     "container",
