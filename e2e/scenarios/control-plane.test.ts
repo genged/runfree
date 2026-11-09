@@ -186,6 +186,48 @@ describe("host control workflows through the packaged CLI", () => {
       // same log and asserts "info" and "ps" come back out of it.
       expect(fs.readFileSync(world.dockerLog, "utf8")).toBe("");
 
+      // --no-reload auto-approves the project desired policy but never selects
+      // an effective generation, so status and explain must show desired ==
+      // approved while effective and proxy acknowledgements stay absent.
+      const projectDigest = /^project digest: (sha256:[a-f0-9]{64})$/mu.exec(enabled.stdout)?.[1] ?? "";
+      expect(projectDigest).toMatch(/^sha256:[a-f0-9]{64}$/u);
+      const status = await world.runfree(["policy", "status"]);
+      assertExit(status, 0);
+      expect(status.stdout).toContain("Network policy");
+      expect(status.stdout).toContain("effective policy generation: none");
+      expect(status.stdout).toContain("proxy request: unacknowledged");
+      expect(status.stdout).toContain("proxy firewall: unacknowledged");
+      expect(status.stdout).not.toContain("ruleset verified");
+      const shortProjectDigest = `${projectDigest.slice(0, 15)}…${projectDigest.slice(-6)}`;
+      const projectRow = stdoutLines(status).map((line) => line.trim().split(/\s+/u)).find((cells) => cells[0] === "project");
+      expect(projectRow).toEqual(["project", shortProjectDigest, shortProjectDigest, "approved"]);
+      // status is the one command here that reaches Docker: a single read-only
+      // live-proxy listing, so a stale converged receipt cannot print
+      // "(ruleset verified)" with no proxy running. Pin it to exactly that one
+      // listing, then reset the log so explain and the disable path below keep
+      // proving zero Docker invocations.
+      const statusDockerCalls = fs.readFileSync(world.dockerLog, "utf8").split("\n").filter(Boolean);
+      expect(statusDockerCalls).toHaveLength(1);
+      expect(statusDockerCalls[0]).toMatch(/^ps --quiet --no-trunc --filter label=/u);
+      fs.writeFileSync(world.dockerLog, "", { mode: 0o600 });
+
+      const explained = await world.runfree(["policy", "explain", "api.github.com"]);
+      assertExit(explained, 0);
+      expect(stdoutLines(explained)).toEqual(expect.arrayContaining([
+        "api.github.com",
+        "desired: allowlisted",
+        "  host sources: project:service:github",
+        "  request source: project:service:github",
+        "  graphql: {\"endpoints\":[\"/graphql\"],\"writeOps\":\"mutation\"}",
+        "  writes: ask",
+        "  credentials: github",
+        "approved: unavailable",
+        "effective: unavailable",
+        "effective project approval: none",
+      ]));
+      assertOutputExcludes(explained, "SOURCE_STDOUT_MUST_NOT_BE_STORED");
+      expect(fs.readFileSync(world.dockerLog, "utf8")).toBe("");
+
       // Disabling an id that was never enabled refuses before any write to the
       // project desired policy or the host credential sources.
       const ownedSelections = [
@@ -211,6 +253,23 @@ describe("host control workflows through the packaged CLI", () => {
         "registry.yarnpkg.com",
       ]));
       expect(readJson<SourceConfig>(sourcePath)["github-cli"]?.type).toBe("command");
+      expect(fs.readFileSync(world.dockerLog, "utf8")).toBe("");
+
+      const explainedGithubAfterDisable = await world.runfree(["policy", "explain", "api.github.com"]);
+      assertExit(explainedGithubAfterDisable, 0);
+      expect(stdoutLines(explainedGithubAfterDisable)).toEqual(expect.arrayContaining([
+        "desired: not allowlisted",
+        "  host sources: none",
+        "  graphql: none",
+        "  credentials: none",
+      ]));
+      const explainedNode = await world.runfree(["policy", "explain", "registry.npmjs.org"]);
+      assertExit(explainedNode, 0);
+      expect(stdoutLines(explainedNode)).toEqual(expect.arrayContaining([
+        "desired: allowlisted",
+        "  host sources: project:service:node",
+        "  request source: project:service:node",
+      ]));
       expect(fs.readFileSync(world.dockerLog, "utf8")).toBe("");
 
       const beforeSecondDisable = snapshotOwnedState(ownedSelections);
