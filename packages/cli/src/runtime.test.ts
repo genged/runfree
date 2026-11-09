@@ -4254,8 +4254,8 @@ describe("runtime command flow", () => {
     });
   });
 
-  // Unattended credentials spec §4.3: a run's credential preflight runs
-  // again on the generation the launch selects, before any Docker work.
+  // A run's credential preflight runs again on the generation the launch
+  // selects, before any Docker work.
   test("the after-selection hook sees the newly selected generation before Docker, and its refusal ends the start", async () => {
     const projectRoot = path.join(tmp, "project");
     const project = prepareProject(projectRoot);

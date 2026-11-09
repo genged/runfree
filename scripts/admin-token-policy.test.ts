@@ -7306,7 +7306,7 @@ describe("google-service-account sources", () => {
   });
 });
 
-describe("1password connection sources (todo 158)", () => {
+describe("1password connection sources", () => {
   const SA_TOKEN = `ops_${"S".repeat(48)}.sentinel-sa-token`;
   const CONNECTION_ENTRY = { type: "1password", keychain: { service: "runfree.credential-source", account: "automation" }, createdAt: "x" };
   type Call = { command: "security" | "op"; args: string[]; input?: string; env: NodeJS.ProcessEnv; cwd?: string };
@@ -8182,7 +8182,7 @@ describe("1password connection sources (todo 158)", () => {
     });
   });
 
-  describe("interaction forbidden (todo 158)", () => {
+  describe("interaction forbidden", () => {
     const sync = () => credentialSyncIntent({ verbose: false, watch: false, quiet: false, delayFirstSync: false, cacheSourceSecrets: true });
     const COMMAND_REFUSAL = "run refused (65): github runs a command source, which runfree cannot keep from asking";
     const APP_REFUSAL = "run refused (65): github uses the 1Password app, which may ask";

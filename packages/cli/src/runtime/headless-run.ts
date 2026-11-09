@@ -124,7 +124,7 @@ export type HeadlessRunDeps = Readonly<{
   now: () => Date;
   stdout: (line: string) => void;
   /**
-   * The never-ask preflight (unattended credentials spec §4.3): nonzero when
+   * The never-ask preflight: nonzero when
    * a credential source may ask a person, or a connection login cannot be
    * read or checked with 1Password. It reads no credential value; it prints
    * its own refusal.

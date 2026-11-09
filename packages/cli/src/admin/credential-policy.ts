@@ -749,7 +749,7 @@ function describeUnattendedRead(source: TokenSource, registry: SourceRegistry | 
   }
 }
 
-/** `runfree run` refuses with this code when a credential source may ask (headless-run spec §3.6). */
+/** `runfree run` refuses with this code when a credential source may ask. */
 const RUN_REFUSED_EXIT = 65;
 
 /**

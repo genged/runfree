@@ -231,7 +231,7 @@ describe("readCredentialSource through a connection", () => {
   });
 });
 
-describe("readCredentialSource under the never-ask rule (todo 158)", () => {
+describe("readCredentialSource under the never-ask rule", () => {
   async function underRule<T>(action: () => Promise<T>): Promise<T> {
     const release = forbidCredentialInteraction();
     try {

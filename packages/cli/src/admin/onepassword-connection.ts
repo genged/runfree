@@ -1,6 +1,6 @@
 // How an `op` read logs in. `app`: today's desktop-app read (may ask).
 // `connection`: a 1Password service account whose token runfree keeps in the
-// macOS login Keychain and hands only to this one `op` child (spec §4.2).
+// macOS login Keychain and hands only to this one `op` child.
 
 import { ConnectionSetupError, type KeychainItem } from "./keychain-login.ts";
 

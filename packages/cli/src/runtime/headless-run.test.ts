@@ -251,7 +251,7 @@ async function until(predicate: () => boolean): Promise<void> {
   if (!predicate()) throw new Error("condition never held");
 }
 
-describe("the never-ask rule (todo 158)", () => {
+describe("the never-ask rule", () => {
   test("a may-ask binding refuses 65 before the prompt copy and the runtime; the record says refused and the lock is released", async () => {
     let promptsAtPreflight: string[] | undefined;
     let recordAtPreflight = false;

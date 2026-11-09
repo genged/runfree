@@ -1,8 +1,7 @@
-// The macOS login Keychain adapter for connection-source logins (profiles and
-// unattended credentials spec §4.2, decision 2). Pure: it builds argv and
-// stdin and classifies exits; admin-core and the owned reader run `security`
-// through their existing spawn seams. A read's stdout IS the login, so no
-// message here ever quotes stdout or stderr.
+// The macOS login Keychain adapter for connection-source logins. Pure: it
+// builds argv and stdin and classifies exits; admin-core and the owned reader
+// run `security` through their existing spawn seams. A read's stdout IS the
+// login, so no message here ever quotes stdout or stderr.
 
 import { TokenResolutionError } from "../token-resolution.ts";
 import type { ProviderExit } from "./admin-core.ts";
@@ -61,7 +60,7 @@ function keychainError(classification: "transient" | "definitive", code: string,
   return new TokenResolutionError({ classification, sourceKind: "keychain", code, safeMessage });
 }
 
-const ITEM_NOT_FOUND_STATUS = 44; // errSecItemNotFound (H1 owed)
+const ITEM_NOT_FOUND_STATUS = 44; // errSecItemNotFound
 
 export function keychainReadStep(sourceName: string, exit: ProviderExit): string {
   const subject = `the login for source "${sourceName}"`;

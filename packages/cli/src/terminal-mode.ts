@@ -87,7 +87,7 @@ export function createHeadlessRuntimeIO(base: RuntimeIO): RuntimeIO {
         captureAsync.call(base, command, args, headlessCallOptions(command, args, options))),
     } : {}),
     // Every watcher a run starts, whichever startup path starts it, holds the
-    // never-ask rule (unattended credentials spec §4.3).
+    // never-ask rule.
     ...(startTokenAutoRefresh ? {
       startTokenAutoRefresh: (...[context, receipts, options]: Parameters<NonNullable<RuntimeIO["startTokenAutoRefresh"]>>) => (
         startTokenAutoRefresh.call(base, context, receipts, { ...options, unattended: true })),

@@ -1,9 +1,9 @@
-// The "never asks" rule for runs (profiles and unattended credentials spec
-// §4.3). A `runfree run` holds an interaction-forbidden hold for its whole
-// life, and so does the run's credential watcher (`credential sync --watch
-// --unattended`). While it is held, a credential read may start only a
-// provider that runfree set up itself and knows cannot ask a person: an env
-// source or a 1password connection source. Runfree does not guess from the
+// The "never asks" rule for runs. A `runfree run` holds an
+// interaction-forbidden hold for its whole life, and so does the run's
+// credential watcher (`credential sync --watch --unattended`). While it is
+// held, a credential read may start only a provider that runfree set up
+// itself and knows cannot ask a person: an env source or a 1password
+// connection source. Runfree does not guess from the
 // environment: a host OP_SERVICE_ACCOUNT_TOKEN changes nothing here.
 //
 // Pure apart from the module-level hold counter: the verdict reads only the

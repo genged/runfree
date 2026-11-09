@@ -209,8 +209,8 @@ import {
 
 export type TokenSource =
   | ({ source: "env"; env: string } & TokenRefreshConfig)
-  // `via` names the 1password connection source the binding reads through
-  // (profiles and unattended credentials spec §4.2); absent means the app.
+  // `via` names the 1password connection source the binding reads through;
+  // absent means the app.
   | ({ source: "1password"; ref: string; via?: string } & TokenRefreshConfig)
   | ({ source: "named"; name: string; via?: string } & TokenRefreshConfig)
   // Legacy config from the pre-tmpfs implementation. Kept so status/unset can
@@ -251,7 +251,7 @@ export type { GoogleServiceAccountSource };
 /**
  * A connection source: a login that never asks (a 1Password service account)
  * kept in the macOS login Keychain. The registry holds the Keychain item name,
- * never the login itself (profiles and unattended credentials spec §4.2).
+ * never the login itself.
  */
 export type OnePasswordConnectionSource = {
   type: "1password";
@@ -1309,10 +1309,11 @@ export function scrubOnePasswordExit(exit: ProviderExit, token: string | undefin
 }
 
 /**
- * The executor-level guard of the never-ask rule (unattended credentials spec
- * §4.3): while a run holds the rule, no 1Password app read and no command
- * source starts, whoever the caller is. It runs before any announcement,
- * Keychain read, or spawn. Connection reads are allowed.
+ * The executor-level guard of the never-ask rule: while a run holds the
+ * rule, no 1Password app read and no command source starts, whoever the
+ * caller is. It runs before any announcement, Keychain read, or spawn.
+ * Connection reads, and the run preflight's service-account login check, do
+ * not pass through it and stay allowed.
  */
 export function assertProviderMayRun(kind: "1password-app" | "command"): void {
   if (!credentialInteractionForbidden()) return;
@@ -4559,7 +4560,7 @@ export type CredentialSyncInput = {
   initialSourceTruth?: boolean;
   /**
    * Watch only: the watcher of a `runfree run` holds the never-ask rule for
-   * its whole life (unattended credentials spec §4.3).
+   * its whole life.
    */
   unattended?: boolean;
   /**

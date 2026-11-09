@@ -90,8 +90,8 @@ export const remedy = {
   credentialSourceOnePassword: (name: string): string => `runfree credential source 1password ${name}`,
   credentialSourceLogin: (name: string): string => `runfree credential source login ${name}`,
   credentialSourceRemove: (name: string): string => `runfree credential source remove ${name}`,
-  // The never-ask rule for runs (unattended credentials spec §4.3): each
-  // fix rebinds through a connection, or to an env source.
+  // The never-ask rule for runs: each fix rebinds through a connection, or
+  // to an env source.
   credentialSetSourceOnePasswordVia: (name: string, ref: string, via: string): string =>
     `runfree credential set-source ${name} --from-1password ${ref} --via ${via} --replace-source`,
   credentialSetSourceNamedVia: (name: string, source: string, via: string): string =>
