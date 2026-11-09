@@ -22,6 +22,10 @@ wherever an agent commits:
 - Put a fix on the branch under test unless the user names another.
 - To land a branch: rebase it onto `main`, run the gates on the rebased head,
   then `git merge --no-ff <branch>`. Never merge `main` into the branch.
+- Contributor pull requests land on GitHub with "Squash and merge", not the
+  local rule above. If the pull request conflicts with `main`, ask the
+  contributor to rebase. Otherwise use "Update branch" with rebase, wait for
+  the required check, and run the live gates the change needs before merging.
 - The checkout may hold other uncommitted work. Stage your own files by exact
   path, never `git add -A`; report other changes in one line and leave them
   alone. "commit" means commit this session's changes without asking.
