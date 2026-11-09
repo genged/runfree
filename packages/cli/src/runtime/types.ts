@@ -89,7 +89,9 @@ export type RuntimeAdminIntent =
   | { kind: "prepare-token-sources"; mode?: "source-truth" | "convergence" }
   /**
    * The `runfree run` preflight of the never-ask rule: lists every binding
-   * that may ask and exits 65; reads no source, spawns nothing, writes nothing.
+   * that may ask and exits 65; then reads and checks each connection login
+   * once (`security`, one service-account `op whoami`). Reads no credential
+   * value and writes nothing.
    */
   | { kind: "unattended-credential-check" }
   | { kind: "prepare" };

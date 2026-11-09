@@ -44,6 +44,8 @@ import {
   printTokenSyncFailures,
   type ProxyRuntime,
   readConnectionLoginSync,
+  checkConnectionLoginForRun,
+  CONNECTION_LOGIN_REJECTED,
   proxyRuntime,
   type ProxyRuntimeState,
   removeProxyRuntimeToken,
@@ -755,10 +757,13 @@ const RUN_REFUSED_EXIT = 65;
  * references that may ask is listed with its fix, and the run refuses (65)
  * before the prompt copy, Docker, and any credential read. When the policy
  * cannot be read, every configured binding is checked. When no binding may
- * ask, it then reads the login of each connection those bindings use, once
- * per connection and with `security` only: a login a run cannot read refuses
- * the run too, even when the proxy still holds a value from an earlier sync.
- * It never runs `op` and writes nothing; a login read stays in this frame.
+ * ask, it then checks each connection those bindings use, once per
+ * connection: `security` reads the login and one service-account `op whoami`
+ * checks it with 1Password. A login a run cannot read, that 1Password refuses
+ * (revoked or invalid), or that 1Password cannot check now (no answer, a
+ * network failure) refuses the run too, even when the proxy still holds a
+ * value from an earlier sync. It never runs the 1Password app and writes
+ * nothing; a login read stays in this frame and never reaches output.
  */
 export function unattendedCredentialCheckIntent(): void {
   const config = loadTokenConfig();
@@ -816,12 +821,15 @@ function refuseUnreadableConnectionLogins(names: readonly string[], config: Retu
     if (!isConnectionSource(entry)) continue;
     try {
       assertKeychainPlatform(childEnv());
-      readConnectionLoginSync(connection, entry.keychain);
+      const login = readConnectionLoginSync(connection, entry.keychain);
+      checkConnectionLoginForRun(connection, login);
     } catch (error) {
       if (error instanceof ConnectionSetupError) {
         runfreeError(`run refused (65): source "${connection}": ${error.message}`);
       } else if (error instanceof TokenResolutionError) {
-        runfreeError([`run refused (65): ${error.safeMessage}`, `  fix: ${remedy.credentialSourceLogin(connection)}`].join("\n"));
+        // A check that could not finish gets no fix: a new login would not help.
+        const loginFix = error.sourceKind === "keychain" || error.code === CONNECTION_LOGIN_REJECTED;
+        runfreeError([`run refused (65): ${error.safeMessage}`, ...(loginFix ? [`  fix: ${remedy.credentialSourceLogin(connection)}`] : [])].join("\n"));
       } else {
         throw error;
       }

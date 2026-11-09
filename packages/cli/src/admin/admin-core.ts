@@ -1447,6 +1447,53 @@ function connectionSetupExit(command: string, args: string[], options: childProc
   }));
 }
 
+// The only way a connection login reaches `op`: the sanitized host env cut
+// down to the service-account allowlist (the token, biometric unlock off, no
+// host `OP_*` account or session selection), a host-owned cwd, and the read
+// timeout. With that env `op` cannot fall back to the desktop app.
+function connectionOpSpawnOptions(token: string): Readonly<{ cwd: string; env: NodeJS.ProcessEnv; timeout: number }> {
+  return { cwd: hostOwnedSourceCwd(), env: connectionOpEnv(sanitizedHostExecutionEnv(projectRoot(), childEnv()), token), timeout: opReadTimeoutMs() };
+}
+
+function connectionCheckError(classification: "transient" | "definitive", code: string, safeMessage: string): TokenResolutionError {
+  return new TokenResolutionError({ classification, sourceKind: "1password", code, safeMessage });
+}
+
+/** The code of a connection check that 1Password answered with a refusal: a new login fixes it. */
+export const CONNECTION_LOGIN_REJECTED = "connection-login-rejected";
+
+/**
+ * The run preflight's check of a connection login: one `op whoami` with the
+ * service account token only, so it never asks a person and is allowed while
+ * a run holds the never-ask rule. Throws a classified `TokenResolutionError`
+ * with fixed text or token-scrubbed `op` stderr. Code
+ * `CONNECTION_LOGIN_REJECTED` means 1Password refused the login (revoked or
+ * invalid token); every other code means the check could not finish (no `op`,
+ * no answer, a network failure), which a new login would not fix.
+ */
+export function checkConnectionLoginForRun(sourceName: string, token: string): void {
+  const opPath = resolveHostExecutable("op");
+  if (!opPath) throw connectionCheckError("definitive", "op-missing", `source "${sourceName}": op CLI not found on sanitized host PATH`);
+  const exit = scrubOnePasswordExit(connectionSetupExit(opPath, opWhoamiArgs(), connectionOpSpawnOptions(token)), token);
+  if (exit.failure?.kind === "timeout") {
+    throw connectionCheckError("transient", "connection-check-timeout", `1Password did not answer the login check for source "${sourceName}"`);
+  }
+  if (exit.failure) throw connectionCheckError("definitive", "connection-check-spawn-failed", `the login check for source "${sourceName}" could not run op`);
+  if (exit.status !== 0) {
+    const detail = sanitizedStderrFirstLine(exit.stderr);
+    const suffix = detail ? `: ${detail}` : "";
+    if (classifyOnePasswordFailure(exit.stderr) === "transient") {
+      throw connectionCheckError("transient", "connection-check-unavailable", `1Password could not check the login for source "${sourceName}"${suffix}`);
+    }
+    throw connectionCheckError("definitive", CONNECTION_LOGIN_REJECTED, `1Password refused the login for source "${sourceName}"${suffix}`);
+  }
+  try {
+    parseServiceAccountWhoami(exit.stdout);
+  } catch {
+    throw connectionCheckError("definitive", CONNECTION_LOGIN_REJECTED, `1Password did not confirm a service account login for source "${sourceName}"`);
+  }
+}
+
 /**
  * Checks a service account token with 1Password before it is stored; returns
  * the vault names it can read. The token reaches only the `op` child's
@@ -1456,8 +1503,7 @@ function connectionSetupExit(command: string, args: string[], options: childProc
 export function verifyConnectionLogin(token: string): string[] {
   const opPath = resolveHostExecutable("op");
   if (!opPath) throw new ConnectionSetupError("op CLI not found on sanitized host PATH");
-  const env = connectionOpEnv(sanitizedHostExecutionEnv(projectRoot(), childEnv()), token);
-  const options = { cwd: hostOwnedSourceCwd(), env, timeout: opReadTimeoutMs() };
+  const options = connectionOpSpawnOptions(token);
   const whoami = connectionSetupExit(opPath, opWhoamiArgs(), options);
   if (whoami.failure || whoami.status !== 0) {
     const detail = sanitizedStderrFirstLine(redactLogin(whoami.stderr, token));

@@ -7323,6 +7323,7 @@ describe("1password connection sources (todo 158)", () => {
     whoami?: string;
     whoamiStatus?: number;
     whoamiStderr?: string;
+    whoamiTimeout?: boolean;
     vaults?: string;
     opRead?: (args: string[], env: NodeJS.ProcessEnv) => SpawnSyncReturns<string>;
   } = {}): { calls: Call[]; securityPath: string; opBin: string; stored: Map<string, string> } {
@@ -7357,6 +7358,7 @@ describe("1password connection sources (todo 158)", () => {
       const env = envFromSpawnOptions(spawnOptions);
       calls.push({ command: "op", args, env, ...(spawnOptions.cwd === undefined ? {} : { cwd: String(spawnOptions.cwd) }) });
       if (args[0] === "whoami") {
+        if (options.whoamiTimeout) return spawnTimeoutResult("op");
         if (options.whoamiStatus !== undefined) return spawnResult({ status: options.whoamiStatus, stderr: options.whoamiStderr ?? "" });
         return spawnResult({ stdout: options.whoami ?? JSON.stringify({ user_type: "SERVICE_ACCOUNT", url: "https://x.1password.com" }) });
       }
@@ -8412,6 +8414,40 @@ describe("1password connection sources (todo 158)", () => {
       expect(credentialInteractionForbidden()).toBe(false);
     });
 
+    test("a Keychain that locks after the preflight does not stop the run: the startup sync and the watcher keep the held value", async () => {
+      writeFixtureRepo(exampleTokenPolicy(["github"]));
+      writeSourceRegistry({ automation: CONNECTION_ENTRY });
+      writeTokenConfig({ github: { source: "1password-via", ref: "op://Automation/github/token", via: "automation", refreshEverySeconds: 1 } });
+      const docker = installTokenSyncDockerFake();
+      const options: Parameters<typeof installFakeKeychainAndOp>[0] = { stored: new Map([["automation", SA_TOKEN]]) };
+      const fake = installFakeKeychainAndOp(options);
+      const preflight = await underRule(() => runAdmin(() => unattendedCredentialCheckIntent(), ruleEnv(fake, docker)));
+      expect(preflight.status, preflight.stderr).toBe(0);
+      const populated = await underRule(() => runAdmin(sync, ruleEnv(fake, docker)));
+      expect(populated.status, populated.stderr).toBe(0);
+      expect(docker.heldTokens.has("github")).toBe(true);
+      const opReadsBeforeLock = opCalls(fake).length;
+
+      // The screen locks and the login Keychain with it.
+      options.readStatus = 36;
+      options.readStderr = "security: SecKeychainSearchCopyNext: User interaction is not allowed.";
+      const startupSync = await underRule(() => runAdmin(sync, ruleEnv(fake, docker)));
+      expect(startupSync.stdout + startupSync.stderr).toContain('the login for source "automation" cannot be read (Keychain locked)');
+      expect(startupSync.stderr).not.toContain("run refused");
+      const watch = await runAdmin(
+        () => credentialSyncIntent({ verbose: false, watch: true, quiet: false, delayFirstSync: false, cacheSourceSecrets: true, unattended: true }),
+        ruleEnv(fake, docker, { RUNFREE_TEST_TOKEN_SYNC_WATCH_ITERATIONS: "2", RUNFREE_TEST_TOKEN_SYNC_WATCH_SLEEP_MS: "1" }),
+      );
+      expect(watch.stderr).not.toContain("run refused");
+      // Transient: the proxy keeps the value the running agent uses; op never ran without a login.
+      expect(docker.heldTokens.has("github")).toBe(true);
+      expect(proxyTokenRemovalIndexes(docker.dockerLog, "github")).toEqual([]);
+      expect(readTokenStatus().github).toMatchObject({ ok: false, state: "stale" });
+      expect(opCalls(fake)).toHaveLength(opReadsBeforeLock);
+      expect(credentialInteractionForbidden()).toBe(false);
+      expectNoSentinel(startupSync.stdout, startupSync.stderr, watch.stdout, watch.stderr, fs.readFileSync(docker.dockerLog, "utf8"));
+    });
+
     test("the hidden --unattended flag reaches the watch through the command line", () => {
       writeFixtureRepo(exampleTokenPolicy(["github"]));
       const result = runAdminCli(["credential", "sync", "--unattended"]);
@@ -8456,7 +8492,7 @@ describe("1password connection sources (todo 158)", () => {
       expectNoSentinel(result.stdout, result.stderr);
     });
 
-    test("the preflight passes when every binding never asks, reading each connection login once and never running op", async () => {
+    test("the preflight passes when every binding never asks, reading and checking each connection login once", async () => {
       writeFixtureRepo(exampleTokenPolicy(["openai", "github", "env-token"]));
       writeSourceRegistry({ automation: CONNECTION_ENTRY });
       writeTokenConfig({
@@ -8470,7 +8506,111 @@ describe("1password connection sources (todo 158)", () => {
       expect(result.stdout + result.stderr).toBe("");
       expect(fake.calls.map((call) => `${call.command} ${call.args.join(" ")}`)).toEqual([
         "security find-generic-password -s runfree.credential-source -a automation -w",
+        "op whoami --format json",
       ]);
+    });
+
+    describe("a connection login 1Password refuses or cannot check", () => {
+      const CI_TOKEN = `ops_${"T".repeat(48)}.sentinel-sa-token-ci`;
+      const LOGIN_FIX = "  fix: runfree credential source login automation";
+
+      function connectionRunFixture(): void {
+        writeFixtureRepo(exampleTokenPolicy(["github", "openai"]));
+        writeSourceRegistry({ automation: CONNECTION_ENTRY });
+        writeTokenConfig({
+          github: { source: "1password-via", ref: "op://Automation/github/token", via: "automation" },
+          openai: { source: "1password-via", ref: "op://Automation/openai/key", via: "automation" },
+        });
+      }
+
+      // The run holds the never-ask rule while its preflight runs: the
+      // service-account check must pass the executor guard.
+      async function preflightUnderRule(env: NodeJS.ProcessEnv): Promise<AdminRunResult> {
+        return underRule(() => runAdmin(() => unattendedCredentialCheckIntent(), env));
+      }
+
+      function dockerLogText(docker: { dockerLog: string }): string {
+        return fs.existsSync(docker.dockerLog) ? fs.readFileSync(docker.dockerLog, "utf8") : "";
+      }
+
+      function refusalHeadlines(stderr: string): string[] {
+        return stderr.split("\n").filter((line) => line.includes("run refused (65)")).map((line) => line.slice(line.indexOf("run refused")));
+      }
+
+      test("a revoked login refuses the run with the source login fix, before Docker", async () => {
+        connectionRunFixture();
+        const docker = installTokenSyncDockerFake();
+        const fake = installFakeKeychainAndOp({
+          stored: new Map([["automation", SA_TOKEN]]),
+          whoamiStatus: 1,
+          whoamiStderr: `[ERROR] 2026/11/09 03:00:00 (401) Unauthorized: service account token ${SA_TOKEN} was revoked\n`,
+        });
+        const dockerBefore = dockerLogText(docker);
+        const result = await preflightUnderRule(ruleEnv(fake, docker));
+        expect(result.status).toBe(65);
+        const headline = 'run refused (65): 1Password refused the login for source "automation": [ERROR] 2026/11/09 03:00:00 (401) Unauthorized: service account token [redacted] was revoked';
+        // One refusal for the shared connection, however many bindings use it.
+        expect(refusalHeadlines(result.stderr)).toEqual([headline]);
+        expect(result.stderr).toContain(`${headline}\n  ${LOGIN_FIX}\n`);
+        expect(result.stderr).toContain("the headless run did not start");
+        expect(fake.calls.map((call) => `${call.command} ${call.args[0]}`)).toEqual(["security find-generic-password", "op whoami"]);
+        expect(dockerLogText(docker)).toBe(dockerBefore);
+        expectNoSentinel(result.stdout, result.stderr);
+      });
+
+      test("a login 1Password does not confirm as a service account refuses the run with the fix", async () => {
+        connectionRunFixture();
+        const fake = installFakeKeychainAndOp({ stored: new Map([["automation", SA_TOKEN]]), whoami: JSON.stringify({ user_type: "HUMAN" }) });
+        const result = await preflightUnderRule(connectionEnv(fake));
+        expect(result.status).toBe(65);
+        expect(result.stderr).toContain(`run refused (65): 1Password did not confirm a service account login for source "automation"\n  ${LOGIN_FIX}\n`);
+      });
+
+      test.each([
+        [
+          "a network failure",
+          { whoamiStatus: 1, whoamiStderr: "[ERROR] 2026/11/09 03:00:00 dial tcp: lookup my.1password.com: network is unreachable\n" },
+          'run refused (65): 1Password could not check the login for source "automation": [ERROR] 2026/11/09 03:00:00 dial tcp: lookup my.1password.com: network is unreachable',
+        ],
+        ["no answer", { whoamiTimeout: true }, 'run refused (65): 1Password did not answer the login check for source "automation"'],
+      ])("%s refuses the run with a plain message and no login fix", async (_label, opOptions, headline) => {
+        connectionRunFixture();
+        const docker = installTokenSyncDockerFake();
+        const fake = installFakeKeychainAndOp({ stored: new Map([["automation", SA_TOKEN]]), ...opOptions });
+        const dockerBefore = dockerLogText(docker);
+        const result = await preflightUnderRule(ruleEnv(fake, docker));
+        expect(result.status).toBe(65);
+        expect(refusalHeadlines(result.stderr)).toEqual([headline]);
+        expect(result.stderr).not.toContain("fix:");
+        expect(result.stderr).toContain("the headless run did not start");
+        expect(fake.calls.filter((call) => call.command === "op")).toHaveLength(1);
+        expect(dockerLogText(docker)).toBe(dockerBefore);
+        expectNoSentinel(result.stdout, result.stderr);
+      });
+
+      test("op runs once per connection with the service-account env only, whatever 1Password selection the host has", async () => {
+        writeFixtureRepo(exampleTokenPolicy(["github", "openai", "stripe"]));
+        writeSourceRegistry({ automation: CONNECTION_ENTRY, ci: { ...CONNECTION_ENTRY, keychain: { service: "runfree.credential-source", account: "ci" } } });
+        writeTokenConfig({
+          github: { source: "1password-via", ref: "op://Automation/github/token", via: "automation" },
+          openai: { source: "1password-via", ref: "op://Automation/openai/key", via: "automation" },
+          stripe: { source: "1password-via", ref: "op://CI/stripe/key", via: "ci" },
+        });
+        const fake = installFakeKeychainAndOp({ stored: new Map([["automation", SA_TOKEN], ["ci", CI_TOKEN]]) });
+        const hostSelection = { OP_ACCOUNT: "my.1password.com", OP_SESSION_abc: "host-session", OP_CONNECT_TOKEN: "host-connect", OP_SERVICE_ACCOUNT_TOKEN: "ops_host-token" };
+        const result = await preflightUnderRule({ ...connectionEnv(fake), ...hostSelection });
+        expect(result.status, result.stderr).toBe(0);
+        expect(result.stdout + result.stderr).toBe("");
+        const ops = fake.calls.filter((call) => call.command === "op");
+        expect(ops.map((call) => call.args)).toEqual([["whoami", "--format", "json"], ["whoami", "--format", "json"]]);
+        expect(ops.map((call) => call.env.OP_SERVICE_ACCOUNT_TOKEN)).toEqual([SA_TOKEN, CI_TOKEN]);
+        for (const call of ops) {
+          expect(Object.keys(call.env).filter((name) => name.startsWith("OP_")).sort()).toEqual(["OP_BIOMETRIC_UNLOCK_ENABLED", "OP_SERVICE_ACCOUNT_TOKEN"]);
+          expect(call.env.OP_BIOMETRIC_UNLOCK_ENABLED).toBe("false");
+          expect(call.cwd).toBeDefined();
+          expect(call.cwd?.startsWith(tmp)).toBe(false);
+        }
+      });
     });
 
     describe("a connection login the run cannot read", () => {

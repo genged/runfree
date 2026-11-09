@@ -471,6 +471,15 @@ Tests: [google-service-account.test.ts](../packages/cli/src/admin/google-service
   on the effective policy generation the launch selects, before the prompt
   copy and Docker. A refusal names the binding and the fix, and the run
   exits 65.
+- In each of those checks, the run reads the login of each connection
+  source its bindings use, once, and checks it with 1Password with one
+  service-account `op whoami`. That `op` child gets the connection
+  environment of `CRED-8`, so it cannot use the desktop app. A login that
+  cannot be read or that 1Password refuses exits 65 with
+  `runfree credential source login <name>`. A check that cannot finish (no
+  answer, a network failure) also exits 65, with no fix.
+- After the run starts, a Keychain or source failure is a short failure: the
+  proxy keeps the value it holds, so a screen lock does not stop the run.
 - The same check runs before each provider starts, in every read of the
   run: startup, the warm-launch fallback, the run's credential watcher, and
   signing-key reads.

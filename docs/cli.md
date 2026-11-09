@@ -204,8 +204,13 @@ nothing; only a binding's `--via` counts.
   uses (every configured binding when the policy cannot be read). It checks
   again right after the launch selects the effective policy generation it
   will run on, still before the prompt copy and Docker. Each binding that
-  may ask prints one refusal with the fix, and the run exits 65.
-  With one connection source named `automation`, the refusal reads:
+  may ask prints one refusal with the fix, and the run exits 65. When no
+  binding may ask, each check then reads the login of each connection source
+  the bindings use and checks it once with 1Password (`op whoami` with the
+  service account only). A login that cannot be read or that 1Password
+  refuses exits 65 with `runfree credential source login <name>`; a check
+  that cannot finish (no answer, a network failure) exits 65 with no fix.
+  With one connection source named `automation`, a binding refusal reads:
 
   ```text
   runfree error: run refused (65): github uses the 1Password app, which may ask
@@ -222,7 +227,9 @@ nothing; only a binding's `--via` counts.
   fallback, signing-key reads, and the run's credential watcher. A read that
   may ask fails before its provider starts, and the run's sync fails (65).
   That failure is a short failure, so it never removes a value that an
-  interactive session in the same project holds.
+  interactive session in the same project holds. A Keychain or 1Password
+  failure after the checks is short too: the proxy keeps its value, so a
+  screen lock does not stop a run that started.
 - `runfree credential status` shows, for each configured binding, whether a
   run can read it (`runfree run: reads without asking` or the reason it is
   refused).
