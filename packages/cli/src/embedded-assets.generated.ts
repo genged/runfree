@@ -3,12 +3,12 @@
 export const RUNFREE_VERSION = "0.7.0" as const;
 
 /** @deprecated Use RUNFREE_RUNTIME_COMPONENTS for component identity. */
-export const RUNFREE_RUNTIME_DIGEST = "sha256:552d5767f15984b2578e4ef77d3094f7f265d3504736a3db3925ee1679522346" as const;
+export const RUNFREE_RUNTIME_DIGEST = "sha256:93cc303447d765b5f66239ed95c6747e059f2312bb12ad773021265a97b6fbc4" as const;
 
 export const RUNFREE_RUNTIME_COMPONENTS = {
   "schemaVersion": 1,
-  "agentImageInputDigest": "sha256:1243e0237b496f73930b73e085dd89a054758292adac954bab45b892c7897cb9",
-  "proxyImageInputDigest": "sha256:1b3723e6957cf9b440cb9b7e587b73911c18171229b2b6b67b2158ee8695bcee",
+  "agentImageInputDigest": "sha256:ef983911994788f70dc5a5f904150873f369c188c911639ac11921c2d0f12e60",
+  "proxyImageInputDigest": "sha256:f9e9582c0923039d658f1e8ae3dc91702a1e692225d848ef7fb9833f8652da57",
   "composeTemplateDigest": "sha256:cf6e9af77b44eec1c05747c992c3a21cc492e54ef830297ba8326de9b08d1f6e",
   "hostHelperDigest": "sha256:4aac11ec05ae322d8695e844869605ed094a8ff236e4b2c2474fcbe1365baa11"
 } as const;
@@ -272,7 +272,7 @@ export const EMBEDDED_MANIFEST = {
     "runtime/agent/Dockerfile": "sha256:fe23fbcd3fed426836b4503950e4af60416c10f088e38729dec676cc313e1b37",
     "runtime/agent/host-service-relay.cjs": "sha256:c1c729beaa032ae4a525dbaa8c2a163337b9ddc6588e51f70e3cf53303a94428",
     "runtime/agent/inspect-active-sessions.sh": "sha256:b192bd0723274a512d3db5eaafb43401f00c15f3bfcb21c1beaceb50f39fd15d",
-    "runtime/agent/session-entry.sh": "sha256:824d499c9b6d8649975e3f7371230df5ae05185d10ee442780d5cb6fe4bc3d26",
+    "runtime/agent/session-entry.sh": "sha256:e7af29bad6c01c60ed25eafa5d4b8f6b64fb51ca5d4362fc5e20ac5193a2ac51",
     "runtime/agent/session-ready-probe.cjs": "sha256:1daba986539b275cf6ee40a535578ed4b488c440ecdcac940e5ac5668e1db349",
     "runtime/proxy/admission.js": "sha256:4ab5f6bd496b4efbbc6a97085b0aef2143924bcac2082e1e74da98828e857270",
     "runtime/proxy/approvals.js": "sha256:dbf519ffb5b44c68ed0fb1da81c4141190011d4773ccfdd630200bd3bfde9f49",
