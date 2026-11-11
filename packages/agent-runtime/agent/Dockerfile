@@ -188,9 +188,8 @@ RUN set -eu \
       "/home/${USERNAME}/.pi"
 # runfree:agent-home-dirs:end
 
-RUN printf 'export PATH=$PATH:/home/%s/.local/bin\nautoload -Uz compinit && compinit\n' "${USERNAME}" \
-      > "/home/${USERNAME}/.zshrc" \
- && chown "${USERNAME}:${USERNAME}" "/home/${USERNAME}/.zshrc"
+# zsh reads this file at session runtime; see the file for the prompt label.
+COPY --chown=${USERNAME}:${USERNAME} zshrc /home/${USERNAME}/.zshrc
 RUN mkdir -p /workspaces \
  && chown "${USERNAME}:${USERNAME}" /workspaces
 

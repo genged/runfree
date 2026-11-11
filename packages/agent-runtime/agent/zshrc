@@ -1,0 +1,6 @@
+export PATH=$PATH:$HOME/.local/bin
+autoload -Uz compinit && compinit
+# The label reads the session's project name once at shell start, with `%`
+# doubled, so a project name cannot inject prompt escapes. It is a convenience,
+# not an identity.
+PROMPT="[runfree:${${RUNFREE_PROJECT_NAME:-project}//\%/%%}] %~ %# "
