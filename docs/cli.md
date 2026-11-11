@@ -795,8 +795,11 @@ runfree credential source remove automation
   runs as your macOS user can read the token with `security` without a
   prompt. The source registry records only that item name, never the token.
 - On each read, Runfree reads the token from the Keychain and gives it only
-  to the `op` process, as `OP_SERVICE_ACCOUNT_TOKEN`, with desktop-app
-  integration turned off. That process gets only `PATH`, `HOME`, `USER`,
+  to the `op` process, as `OP_SERVICE_ACCOUNT_TOKEN`, with biometric
+  unlock, desktop-app settings, and the `op` cache turned off
+  (`OP_BIOMETRIC_UNLOCK_ENABLED`, `OP_LOAD_DESKTOP_APP_SETTINGS`, and
+  `OP_CACHE` set to `false`). Without them, `op` started by launchd makes
+  macOS ask for access to another app's data at every start. That process gets only `PATH`, `HOME`, `USER`,
   and `LOGNAME` from the host, with project paths and `node_modules/.bin`
   entries removed, and no other `OP_*` variable. It runs in Runfree's host
   config directory, not in the project. The token never reaches the

@@ -8605,7 +8605,7 @@ describe("1password connection sources", () => {
         expect(ops.map((call) => call.args)).toEqual([["whoami", "--format", "json"], ["whoami", "--format", "json"]]);
         expect(ops.map((call) => call.env.OP_SERVICE_ACCOUNT_TOKEN)).toEqual([SA_TOKEN, CI_TOKEN]);
         for (const call of ops) {
-          expect(Object.keys(call.env).filter((name) => name.startsWith("OP_")).sort()).toEqual(["OP_BIOMETRIC_UNLOCK_ENABLED", "OP_SERVICE_ACCOUNT_TOKEN"]);
+          expect(Object.keys(call.env).filter((name) => name.startsWith("OP_")).sort()).toEqual(["OP_BIOMETRIC_UNLOCK_ENABLED", "OP_CACHE", "OP_LOAD_DESKTOP_APP_SETTINGS", "OP_SERVICE_ACCOUNT_TOKEN"]);
           expect(call.env.OP_BIOMETRIC_UNLOCK_ENABLED).toBe("false");
           expect(call.cwd).toBeDefined();
           expect(call.cwd?.startsWith(tmp)).toBe(false);

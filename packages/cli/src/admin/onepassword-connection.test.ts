@@ -34,6 +34,8 @@ describe("connection op env", () => {
       LANG: "en_US.UTF-8",
       OP_SERVICE_ACCOUNT_TOKEN: TOKEN,
       OP_BIOMETRIC_UNLOCK_ENABLED: "false",
+      OP_LOAD_DESKTOP_APP_SETTINGS: "false",
+      OP_CACHE: "false",
     });
     expect(Object.isFrozen(env)).toBe(true);
   });

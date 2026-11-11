@@ -499,9 +499,10 @@ Tests: [credential-interaction.test.ts](../packages/cli/src/admin/credential-int
   only the Keychain item name.
 - Setup takes the token from a hidden prompt or stdin, and writes it to the
   Keychain on the stdin of `/usr/bin/security`.
-- The `op` child gets an allowlisted environment with the token and no other
-  `OP_*` variable. Desktop-app integration is off for it. Its stderr is
-  cleaned of the exact token before Runfree reads or shows it.
+- The `op` child gets an allowlisted environment with the token and three
+  fixed settings: biometric unlock, desktop-app settings, and the cache are
+  off. It gets no other `OP_*` variable. Its stderr is cleaned of the exact
+  token before Runfree reads or shows it.
 - Setup and rotation check the new token with 1Password before it is
   written. A rejected token leaves the old login in place.
 

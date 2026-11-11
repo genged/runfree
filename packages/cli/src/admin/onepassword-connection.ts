@@ -21,6 +21,11 @@ export function connectionOpEnv(base: NodeJS.ProcessEnv, token: string): NodeJS.
   for (const name of ENV_ALLOWLIST) if (base[name] !== undefined) env[name] = base[name];
   env.OP_SERVICE_ACCOUNT_TOKEN = token;
   env.OP_BIOMETRIC_UNLOCK_ENABLED = "false";
+  // Without these, `op` still reads the desktop app's settings at start and
+  // starts a cache daemon. Under launchd either one makes macOS ask for access
+  // to another app's data, on every start, and `op` waits for the answer.
+  env.OP_LOAD_DESKTOP_APP_SETTINGS = "false";
+  env.OP_CACHE = "false";
   return Object.freeze(env);
 }
 
