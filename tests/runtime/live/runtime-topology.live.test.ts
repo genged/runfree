@@ -48,6 +48,7 @@ import { fileURLToPath } from "node:url";
 import { afterAll, beforeAll, describe, expect, test } from "vitest";
 
 import { validateProxyNftablesTableJson } from "../../../packages/cli/src/proxy-nftables-proof.ts";
+import { projectIdentity } from "../../../packages/cli/src/project-identity.ts";
 import { AGENT_HOME, agentHomeMountParents } from "../../../packages/cli/src/runtime/agent-home-dirs.ts";
 import { NON_RESOLVING_CONNECT_PROBE_HOST } from "../../../packages/cli/src/runtime/probes.ts";
 import { parseSessionContainerTopHandoff } from "../../../packages/cli/src/runtime/session-container-docker.ts";
@@ -480,6 +481,19 @@ describe("runtime topology and capability floor on real Docker", () => {
       user,
     );
     expect(write.status, `agent cannot create XDG data dirs: ${describeOutput(write.output)}`).toBe(0);
+  }, TEST_TIMEOUT_MS);
+
+  test("an interactive zsh prompt shows the project label, and a `%` in the name cannot inject prompt escapes", () => {
+    // `print -rP` expands $PROMPT exactly as zsh draws it. The expected name
+    // comes from the host-side identity, not from the container's own env.
+    const expectedName = projectIdentity(fixture.projectRoot).name;
+    const shown = docker(["exec", sessionId, "zsh", "-ic", 'print -rP -- "$PROMPT"']);
+    expect(shown.status, `interactive zsh prompt probe failed: ${describeOutput(shown.output)}`).toBe(0);
+    expect(shown.stdout.startsWith(`[runfree:${expectedName}] `), `prompt label: ${describeOutput(shown.stdout)}`).toBe(true);
+
+    const injected = docker(["exec", "-e", "RUNFREE_PROJECT_NAME=x%Bb%n%~", sessionId, "zsh", "-ic", 'print -rP -- "$PROMPT"']);
+    expect(injected.status, `injected-name prompt probe failed: ${describeOutput(injected.output)}`).toBe(0);
+    expect(injected.stdout.startsWith("[runfree:x%Bb%n%~] "), `escaped label: ${describeOutput(injected.stdout)}`).toBe(true);
   }, TEST_TIMEOUT_MS);
 
   test("the session runs under Docker's init: Init is true and PID 1 is the daemon's init, not the entry", () => {

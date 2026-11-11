@@ -89,7 +89,7 @@ Created project files include:
 | `runfree claude` | Run Claude Code in the sandbox. |
 | `runfree codex` | Run Codex in the sandbox. |
 | `runfree pi` | Run Pi in the sandbox. |
-| `runfree shell` | Open a zsh shell in the agent container. |
+| `runfree shell` | Open a zsh shell in the agent container. The prompt shows `[runfree:<project>]` and the current directory. |
 | `runfree run <agent> --prompt-file <file>` | Run one agent turn without a terminal, for a scheduler or a script. See [Headless runs](#headless-runs). |
 | `runfree up` | Start or reuse the Docker Compose runtime without attaching an agent. |
 | `runfree rebuild [--yes]` | Rebuild/recreate the runtime. Confirms before killing active sessions unless `--yes` is used. |
