@@ -44,6 +44,14 @@ function namedCommands(markdown: string): string[][] {
   return commands;
 }
 
+// Absolute paths of one or more segments (`/secrets`, `/etc/x/y`) and
+// home-relative ones (`~/x`, `~user/x`, `$HOME/x`, `${HOME}/x`). A slash
+// after a word character, a colon, a slash, or `<` is not a path start, so
+// `HTTP/1.1`, `and/or`, URLs, and closing tags stay allowed.
+function hostPaths(text: string): string[] {
+  return text.match(/(?<![\w.:<>/~$}-])(?:~[\w.-]*|\$\{?\w+\}?)?\/[\w.-]+[\w./-]*/g) ?? [];
+}
+
 // The body of the one ```text block: the sample denial.
 function sampleDenial(markdown: string): string {
   const blocks = [...markdown.matchAll(/^```text\n([\s\S]*?)^```$/gm)].map((match) => match[1]);
@@ -126,9 +134,29 @@ describe("the shipped runfree skill", () => {
     }
   }, 20_000);
 
+  test("the host-path guard catches single-segment, multi-segment, and home-relative paths", () => {
+    for (const sample of [
+      "Host configuration: /secrets",
+      "/secrets",
+      "see (/secrets)",
+      "/etc/claude-code/skills",
+      "`/Users/alice/project`",
+      "~/.ssh/id_ed25519",
+      "~alice/notes",
+      "$HOME/.config/runfree",
+      "${HOME}/.codex",
+    ]) {
+      expect(hostPaths(sample), sample).not.toEqual([]);
+    }
+    // Slashes that are not paths stay allowed.
+    for (const sample of ["HTTP/1.1", "and/or", "https://api.example.com/v1", "403 / 404", "a</b>"]) {
+      expect(hostPaths(sample), sample).toEqual([]);
+    }
+  });
+
   test("holds no host path, project policy, real hostname, or token-like string", () => {
-    // Absolute paths with two or more segments, and home-relative paths.
-    expect(skill.match(/(?<![\w.:<-])\/[\w.-]+\/[\w./-]*/g) ?? []).toEqual([]);
+    // Absolute paths of any length, and home-relative paths.
+    expect(hostPaths(skill)).toEqual([]);
     expect(skill).not.toMatch(/~\//);
     // Project policy lives under .runfree/; the skill names none of it.
     expect(skill).not.toMatch(/\.runfree\b|network-policy/);
