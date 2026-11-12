@@ -165,6 +165,83 @@ function routeDevice(routeLine: string): string {
   return tokens[index + 1];
 }
 
+// The image's read-only `runfree` skill: where it is installed, and the repo
+// file it must equal.
+const RUNFREE_SKILL_SOURCE = path.join(REPO_ROOT, "packages", "agent-runtime", "agent", "skills", "runfree", "SKILL.md");
+const RUNFREE_SKILL_PATHS = [
+  "/etc/claude-code/.claude/skills/runfree/SKILL.md",
+  `${AGENT_HOME}/.agents/skills/runfree/SKILL.md`,
+] as const;
+
+// The pinned Claude binary. The fixture image moves the real `claude-real`
+// here and puts a recorder stand-in in its place (fixture.ts,
+// MANAGED_IMAGE_DOCKERFILE_STANZA), so `claude` in the session is not the real
+// agent. The launcher only adds MCP flags, which skill discovery ignores.
+const PINNED_CLAUDE = "/usr/local/libexec/runfree/claude-real-pinned";
+
+// Lists the skills each pinned CLI discovers, offline and in parallel, and
+// prints `{ claude, codex, pi }` as JSON (each `{ skills: [{ name, path }] }`
+// or `{ error }`; Claude reports names only).
+// argv[1] is the Claude binary. Claude: the `system/init` line of
+// `-p --output-format stream-json`, printed before any model request; its
+// base URL is a closed loopback port so no request leaves the container.
+// Codex: `app-server` JSON-RPC `skills/list`. Pi: rpc `get_commands`, whose
+// skill entries are `skill:<name>`.
+const SKILL_LISTING_PROGRAM = `
+const { spawn } = require("node:child_process");
+const LIMIT_MS = 15000;
+function run(command, args, env, input, pick) {
+  return new Promise((resolve) => {
+    const child = spawn(command, args, { env: { ...process.env, ...env }, stdio: ["pipe", "pipe", "pipe"] });
+    let out = "", err = "", done = false;
+    const finish = (value) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      child.kill("SIGKILL");
+      resolve(value);
+    };
+    const timer = setTimeout(() => finish({ error: "timeout", stdout: out.slice(-2000), stderr: err.slice(-2000) }), LIMIT_MS);
+    child.on("error", (error) => finish({ error: error.message }));
+    child.on("exit", (code) => setTimeout(() => finish({ error: "exited " + code, stdout: out.slice(-2000), stderr: err.slice(-2000) }), 200));
+    child.stderr.on("data", (chunk) => { err += chunk; });
+    child.stdout.on("data", (chunk) => {
+      out += chunk;
+      for (const line of out.split("\\n")) {
+        let message;
+        try { message = JSON.parse(line); } catch { continue; }
+        const skills = pick(message);
+        if (skills) finish({ skills });
+      }
+    });
+    if (input) child.stdin.write(input); else child.stdin.end();
+  });
+}
+const lines = (...messages) => messages.map((message) => JSON.stringify(message) + "\\n").join("");
+Promise.all([
+  run(process.argv[1], ["-p", "--output-format", "stream-json", "--verbose", "hi"],
+    { ANTHROPIC_API_KEY: "runfree-skill-listing-probe", ANTHROPIC_BASE_URL: "http://127.0.0.1:9" }, null,
+    (m) => m.type === "system" && m.subtype === "init" && Array.isArray(m.skills)
+      ? m.skills.map((s) => ({ name: typeof s === "string" ? s : s.name, path: null })) : undefined),
+  run("codex", ["app-server"], {},
+    lines(
+      { id: 1, method: "initialize", params: { clientInfo: { name: "runfree-live-test", title: null, version: "0" } } },
+      { method: "initialized" },
+      { id: 2, method: "skills/list", params: { cwds: [process.cwd()] } },
+    ),
+    (m) => m.id === 2
+      ? (m.result ? m.result.data.flatMap((entry) => entry.skills.map((s) => ({ name: s.name, path: s.path }))) : [{ error: m.error }])
+      : undefined),
+  run("pi", ["--offline", "--no-session", "--mode", "rpc"], {},
+    lines({ id: "1", type: "get_commands" }),
+    (m) => m.id === "1" && m.type === "response"
+      ? (m.success
+        ? m.data.commands.filter((c) => c.source === "skill").map((c) => ({ name: c.name, path: c.sourceInfo ? c.sourceInfo.path : null }))
+        : [{ error: m.error }])
+      : undefined),
+]).then(([claude, codex, pi]) => { console.log(JSON.stringify({ claude, codex, pi })); process.exit(0); });
+`;
+
 // ---------------------------------------------------------------------------
 // Shared probe helpers (egress containment).
 // ---------------------------------------------------------------------------
@@ -480,6 +557,33 @@ describe("runtime topology and capability floor on real Docker", () => {
       user,
     );
     expect(write.status, `agent cannot create XDG data dirs: ${describeOutput(write.output)}`).toBe(0);
+  }, TEST_TIMEOUT_MS);
+
+  test("the read-only runfree skill is root-owned and listed by claude, codex, and pi", () => {
+    const user = "1000:1000";
+    const listing = containerExec(sessionId, ["node", "-e", SKILL_LISTING_PROGRAM, PINNED_CLAUDE], user);
+    expect(listing.status, `skill listing failed: ${describeOutput(listing.output)}`).toBe(0);
+    type Listed = { skills?: Array<{ name: string; path: string | null }> };
+    const listed = JSON.parse(listing.stdout) as Record<"claude" | "codex" | "pi", Listed>;
+    const [claudePath, agentsPath] = RUNFREE_SKILL_PATHS;
+    // Claude reads only its managed path (it does not read ~/.agents/skills),
+    // so its listing proves that copy; Codex and Pi report the file they read.
+    expect(listed.claude.skills?.map((skill) => skill.name), `claude skills (${claudePath}): ${listing.stdout}`)
+      .toContain("runfree");
+    expect(listed.codex.skills, `codex skills: ${listing.stdout}`).toContainEqual({ name: "runfree", path: agentsPath });
+    expect(listed.pi.skills, `pi skills: ${listing.stdout}`).toContainEqual({ name: "skill:runfree", path: agentsPath });
+
+    const shipped = fs.readFileSync(RUNFREE_SKILL_SOURCE, "utf8");
+    for (const file of RUNFREE_SKILL_PATHS) {
+      const stat = containerExec(sessionId, ["stat", "-c", "%U:%G %a", file, path.posix.dirname(file)], user);
+      expect(stat.status, `stat ${file}: ${describeOutput(stat.output)}`).toBe(0);
+      expect(stat.stdout.trim().split("\n"), file).toEqual(["root:root 644", "root:root 755"]);
+      const writable = containerExec(sessionId, ["sh", "-c", 'test -w "$1" || test -w "$(dirname "$1")"', "sh", file], user);
+      expect(writable.status, `${file} or its directory is writable by the agent`).not.toBe(0);
+      const content = containerExec(sessionId, ["cat", file], user);
+      expect(content.status, `cat ${file}: ${describeOutput(content.output)}`).toBe(0);
+      expect(content.stdout, `${file} differs from the repo's SKILL.md`).toBe(shipped);
+    }
   }, TEST_TIMEOUT_MS);
 
   test("the session runs under Docker's init: Init is true and PID 1 is the daemon's init, not the entry", () => {

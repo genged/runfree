@@ -114,6 +114,13 @@ arguments. An unknown flag, such as `runfree claude --resume`, is refused with
 `Unknown argument` before any project or Docker work; use `runfree resume` to
 resume a conversation.
 
+The agent image ships a read-only `runfree` skill that Claude Code, Codex, and
+Pi load. It tells the agent that outbound HTTPS goes through a proxy with an
+exact-host allowlist, what a proxy denial looks like, that token variables hold
+placeholders, and to ask you for access by naming the exact host and the
+`runfree host add <host>` command to run on the host. It grants nothing and
+holds no project policy or credentials.
+
 ### Resume
 
 Bare `runfree resume`, on a terminal (stdin and stdout both TTYs), scans only

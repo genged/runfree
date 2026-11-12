@@ -194,6 +194,28 @@ RUN printf 'export PATH=$PATH:/home/%s/.local/bin\nautoload -Uz compinit && comp
 RUN mkdir -p /workspaces \
  && chown "${USERNAME}:${USERNAME}" /workspaces
 
+# The read-only `runfree` skill: information for the agent, it grants nothing.
+# Root-owned, 0644 file in 0755 dirs, at paths no session mount covers: Claude
+# Code reads its managed skills under /etc/claude-code/.claude/skills; Codex
+# and Pi read ~/.agents/skills (~/.claude, ~/.codex, and ~/.pi/agent are
+# per-project mounts). ~/.agents and ~/.agents/skills stay agent-owned so the
+# agent can still add its own skills next to this one. (`COPY --chmod` would
+# also apply 0644 to the directories it creates, so `install` sets each mode.)
+COPY skills/runfree/SKILL.md /tmp/runfree-skill/SKILL.md
+RUN set -eu \
+ && install -d -m 0755 -o root -g root \
+      /etc/claude-code \
+      /etc/claude-code/.claude \
+      /etc/claude-code/.claude/skills \
+      /etc/claude-code/.claude/skills/runfree \
+ && install -d -m 0755 -o "${USERNAME}" -g "${USERNAME}" \
+      "/home/${USERNAME}/.agents" \
+      "/home/${USERNAME}/.agents/skills" \
+ && install -d -m 0755 -o root -g root "/home/${USERNAME}/.agents/skills/runfree" \
+ && install -m 0644 -o root -g root /tmp/runfree-skill/SKILL.md /etc/claude-code/.claude/skills/runfree/SKILL.md \
+ && install -m 0644 -o root -g root /tmp/runfree-skill/SKILL.md "/home/${USERNAME}/.agents/skills/runfree/SKILL.md" \
+ && rm -rf /tmp/runfree-skill
+
 USER ${USERNAME}
 WORKDIR /workspace
 
