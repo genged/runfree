@@ -63,6 +63,7 @@ export const RUNTIME_ASSET_DESCRIPTORS: readonly RuntimeAssetDescriptor[] = [
   agentImage("agent/host-service-relay.cjs"),
   agentImage("agent/session-entry.sh"),
   agentImage("agent/session-ready-probe.cjs"),
+  agentImage("agent/skills/runfree/SKILL.md"),
   agentImage("agent/agent-tools/package-lock.json"),
   agentImage("agent/agent-tools/package.json"),
   { path: "agent/compose.yaml", roles: ["compose-template"] as const },
