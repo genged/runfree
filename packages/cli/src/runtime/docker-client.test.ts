@@ -58,6 +58,7 @@ describe("docker client argv", () => {
     ["network rm", (c) => c.removeNetworks(["n"]), ["network", "rm", "n"]],
     ["volume create", (c) => c.createVolume("v", ["a=b"]), ["volume", "create", "--label", "a=b", "v"]],
     ["volume rm", (c) => c.removeVolumes(["v", "w"]), ["volume", "rm", "v", "w"]],
+    ["pull", (c) => c.pullImage("r@sha256:x"), ["pull", "--quiet", "r@sha256:x"]],
   ];
   for (const [name, call, argv] of cases) {
     test(name, () => {
@@ -107,6 +108,7 @@ describe("async docker client", () => {
     ["removeNetworks", (c) => c.removeNetworks(["n", "m"])],
     ["createVolume", (c) => c.createVolume("v", ["a=b"])],
     ["removeVolumes", (c) => c.removeVolumes(["v"])],
+    ["pullImage", (c) => c.pullImage("r@sha256:x", { timeout: 5 })],
   ];
 
   test("covers every capture method of the sync client", () => {

@@ -934,6 +934,16 @@ mount, so the agent never needs root to install trust.
 exact apt package versions, and release artifact checksums. A missing or
 malformed lock fails before any build.
 
+**Published agent base image.** Each CLI release embeds an images lock that
+maps the agent image's input digest to the manifest digest CI published to
+GHCR. When the base image is not already present and verified, the CLI pulls
+it by that digest, checks the registry digest against the lock, tags it with
+the local image names, and runs the same identity check a local build must
+pass. If the input digest is not in the lock, or the pull or a check fails,
+the CLI builds the image locally, as before. It never pulls by tag. The lock
+ships empty until CI publishing lands, so the base image is still built
+locally. The proxy image is always built locally.
+
 ### Host Services
 
 A host service is a TCP service on the host's loopback that the agent may

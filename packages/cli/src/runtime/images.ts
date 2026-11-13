@@ -85,7 +85,17 @@ import {
 import type { RuntimeContext, RuntimeIO } from "./types.ts";
 import { dockerClientEnvOptions, type RuntimeDocker } from "./docker.ts";
 import { createDockerClient } from "./docker-client.ts";
-import { inspectReusableManagedImage, reusableManagedImage } from "./image-identity.ts";
+import {
+  AGENT_IMAGE_REPOSITORY,
+  pinnedAgentImage,
+  shippedAgentImageLock,
+  type PinnedAgentImageReference,
+} from "./agent-image-lock.ts";
+import {
+  inspectReusableManagedImage,
+  reusableManagedImage,
+  type ManagedImageExpectation,
+} from "./image-identity.ts";
 import {
   accountSessionAgentImageReferences,
   inspectSessionContainerInventory,
@@ -198,6 +208,74 @@ function projectImageBuildLabels(context: RuntimeContext, inputDigest: string): 
   });
 }
 
+/**
+ * Pulls the lock's published agent base image and tags it as the local
+ * runtime and base images. Returns undefined on success, or the reason for the
+ * caller's one fallback warning. Nothing is tagged until the pulled image
+ * carries the lock's registry digest and the managed labels the local build
+ * would set; the tags are then re-inspected and must resolve to that image.
+ */
+function pullRuntimeAgentImage(
+  docker: RuntimeDocker,
+  reference: PinnedAgentImageReference,
+  expected: ManagedImageExpectation,
+  targets: readonly string[],
+): string | undefined {
+  const pulled = docker.pullImage(reference);
+  if (pulled.status !== 0) return pulled.reason ?? `docker pull exited with status ${pulled.status}`;
+  const image = docker.inspectImage(reference, { fresh: true });
+  if (!image) return "the pulled image could not be inspected";
+  if (!(image.repoDigests ?? []).includes(reference)) return "the pulled image digest does not match the lock";
+  if (!reusableManagedImage({ inspectImage: () => image }, reference, expected)) {
+    return "the pulled image is not the expected Runfree agent image";
+  }
+  for (const target of targets) {
+    if (docker.tagImage(image.id, target) !== 0) return "docker tag failed";
+  }
+  for (const target of targets) {
+    if (inspectReusableManagedImage(docker, target, expected, { fresh: true })?.id !== image.id) {
+      return "the retagged image failed verification";
+    }
+  }
+  return undefined;
+}
+
+export type AgentBaseImageOrigin =
+  | { kind: "pulled"; reference: string }
+  | { kind: "built" }
+  | { kind: "missing" };
+
+/**
+ * Whether the local agent base image was pulled from the published repository
+ * or built here, read from `docker image inspect` alone: a pulled image keeps
+ * its `RepoDigests` entry for the repository; a local build has none for it.
+ * Reporting only; the trust decision is made at pull time.
+ */
+export function agentBaseImageOrigin(
+  docker: Pick<RuntimeDocker, "inspectImage">,
+  inputDigest: string = RUNFREE_RUNTIME_COMPONENTS.agentImageInputDigest,
+): AgentBaseImageOrigin {
+  const tag = agentBaseImageTag(inputDigest);
+  const image = docker.inspectImage(tag);
+  if (!image || !reusableManagedImage({ inspectImage: () => image }, tag, {
+    inputDigest,
+    roles: [AGENT_RUNTIME_IMAGE_ROLE, AGENT_BASE_IMAGE_ROLE],
+  })) return { kind: "missing" };
+  const reference = (image.repoDigests ?? []).find((entry) => entry.startsWith(`${AGENT_IMAGE_REPOSITORY}@sha256:`));
+  return reference ? { kind: "pulled", reference } : { kind: "built" };
+}
+
+export function agentBaseImageOriginLine(origin: AgentBaseImageOrigin): string {
+  switch (origin.kind) {
+    case "pulled":
+      return `agent base image: pulled from ${origin.reference}`;
+    case "built":
+      return "agent base image: built locally";
+    case "missing":
+      return "agent base image: not present (pulled or built on the next start)";
+  }
+}
+
 function buildRuntimeAgentImage(
   runtimeRoot: string,
   inputDigest: string,
@@ -215,7 +293,11 @@ function buildRuntimeAgentImage(
     const runtimePresent = reusableManagedImage(docker, runtimeImage, expected);
     const basePresent = reusableManagedImage(docker, baseImage, expected);
     if (runtimePresent && basePresent) {
-      verboseRuntimeImage(options, `runtime agent image present: ${runtimeImage}`);
+      if (options?.verbose) {
+        const origin = agentBaseImageOrigin(docker, inputDigest);
+        const source = origin.kind === "pulled" ? `pulled from ${origin.reference}` : "built locally";
+        verboseRuntimeImage(options, `runtime agent image present: ${runtimeImage} (${source})`);
+      }
       return 0;
     }
     if (runtimePresent || basePresent) {
@@ -226,8 +308,18 @@ function buildRuntimeAgentImage(
       if (status !== 0) warn("Docker tag failed for the Runfree runtime agent image");
       return status;
     }
+    const reference = pinnedAgentImage(shippedAgentImageLock(), inputDigest);
+    if (reference) {
+      verboseRuntimeImage(options, `pulling runtime agent image: ${reference}`);
+      const failure = pullRuntimeAgentImage(docker, reference, expected, [runtimeImage, baseImage]);
+      if (failure === undefined) {
+        verboseRuntimeImage(options, `runtime agent image pulled: ${reference} -> ${runtimeImage}`);
+        return 0;
+      }
+      warn(`could not pull the agent image (${failure}), building locally`);
+    }
   }
-  verboseRuntimeImage(options, `building runtime agent image: ${runtimeImage}`);
+  verboseRuntimeImage(options, `building runtime agent image locally: ${runtimeImage}`);
   const status = docker.buildImage([
     "--tag",
     runtimeImage,

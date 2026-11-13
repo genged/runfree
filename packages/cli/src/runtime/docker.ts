@@ -46,6 +46,7 @@ import {
 import { composeProjectName, composeRuntimeEnvironment, dockerClientEnvironment } from "./env.ts";
 import { assertComposeManagedLocalVolume } from "./session-named-volume-proof.ts";
 import { createDockerClient } from "./docker-client.ts";
+import type { PinnedAgentImageReference } from "./agent-image-lock.ts";
 import {
   captureDockerListing,
   type DockerListingColumn,
@@ -120,6 +121,13 @@ export type RuntimeDocker = {
   networkSubnets(): string[];
   pruneImages(filters: string[]): number;
   projectForWorkspace(): string | undefined;
+  /**
+   * Pulls one image by a pinned digest reference from the agent image lock.
+   * `PinnedAgentImageReference` is built only by `pinnedAgentImage`, so no
+   * caller can pull a tag. Output is captured, not shown; `reason` is a
+   * one-line summary of a failure for the caller's single fallback warning.
+   */
+  pullImage(reference: PinnedAgentImageReference): { status: number; reason?: string };
   proxyControlReceipts(project: string): { firewall?: ParsedGenerationStatus; requestProxy?: ParsedGenerationStatus } | undefined;
   activeAgentSessions(project: string): ActiveAgentSession[];
   removeImages(refs: string[]): number;
@@ -150,6 +158,8 @@ export type DockerImageInspect = {
   labels: Record<string, string>;
   os?: string;
   onBuild?: string[];
+  /** `RepoDigests`: one `<repository>@sha256:…` per registry the image was pulled from. */
+  repoDigests?: string[];
   volumes?: string[];
 };
 
@@ -623,6 +633,11 @@ export function createRuntimeDocker(
         && (!Array.isArray(rawOnBuild) || rawOnBuild.some((instruction) => typeof instruction !== "string"))) {
         return undefined;
       }
+      const rawRepoDigests = Reflect.get(image, "RepoDigests");
+      if (rawRepoDigests !== undefined && rawRepoDigests !== null
+        && (!Array.isArray(rawRepoDigests) || rawRepoDigests.some((entry) => typeof entry !== "string"))) {
+        return undefined;
+      }
       const rawVolumes = config && typeof config === "object" ? Reflect.get(config, "Volumes") : undefined;
       if (rawVolumes !== undefined && rawVolumes !== null
         && (typeof rawVolumes !== "object" || Array.isArray(rawVolumes))) return undefined;
@@ -668,6 +683,9 @@ export function createRuntimeDocker(
         os,
         ...(rawEnvironment !== undefined && rawEnvironment !== null ? { environment } : {}),
         ...(Array.isArray(rawOnBuild) ? { onBuild: [...rawOnBuild] as string[] } : {}),
+        ...(Array.isArray(rawRepoDigests) && rawRepoDigests.length > 0
+          ? { repoDigests: [...rawRepoDigests] as string[] }
+          : {}),
         ...(rawVolumes !== undefined && rawVolumes !== null ? { volumes } : {}),
       };
     } catch {
@@ -802,6 +820,12 @@ export function createRuntimeDocker(
     projectForWorkspace() {
       return composeProject(context, io);
     },
+    pullImage(reference) {
+      const result = client.pullImage(reference);
+      imageInspectCache.clear();
+      if (result.status === 0) return { status: 0 };
+      return { status: result.status, reason: dockerPullFailureReason(result) };
+    },
     proxyControlReceipts(project) {
       const proxyId = cachedServiceContainerId(project, "proxy", { runningOnly: true });
       if (!proxyId) return undefined;
@@ -871,6 +895,15 @@ export function createRuntimeDocker(
       return status;
     },
   };
+}
+
+/** The first printable line of `docker pull` stderr, bounded, for the fallback warning. */
+export function dockerPullFailureReason(result: Pick<CaptureResult, "status" | "stderr">): string {
+  const line = result.stderr.split("\n")
+    .map((entry) => entry.replace(/[^\x20-\x7e]/gu, "").replace(/^Error response from daemon:\s*/u, "").trim())
+    .find((entry) => entry.length > 0);
+  if (!line) return `docker pull exited with status ${result.status}`;
+  return line.length > 160 ? `${line.slice(0, 157)}...` : line;
 }
 
 function dockerInspectFailure(message: string, result: CaptureResult): never {

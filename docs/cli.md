@@ -1316,6 +1316,26 @@ runfree rebuild
 
 Project Dockerfiles extend `RUNFREE_BASE_IMAGE`. Full image overrides are not supported. Wide build contexts require explicit host-state approval.
 
+The base image (`RUNFREE_BASE_IMAGE`) comes from one of two places. When the
+CLI's embedded images lock lists the base image's input digest, Runfree pulls
+`ghcr.io/genged/runfree-agent@sha256:<digest>` by that exact digest, checks it,
+and tags it locally. Otherwise it builds the base image locally. If the pull or
+a check fails, Runfree prints one warning and builds locally:
+
+```text
+runfree warning: could not pull the agent image (<reason>), building locally
+```
+
+The lock ships empty until CI publishing lands, so today the base image is
+always built locally. `runfree status` prints one of these lines, and
+`runfree up --verbose` says which one each start used:
+
+```text
+agent base image: pulled from ghcr.io/genged/runfree-agent@sha256:<digest>
+agent base image: built locally
+agent base image: not present (pulled or built on the next start)
+```
+
 The image is rebuilt when its inputs change. For a narrow build context (the `.runfree/image/` directory) every file in the context counts as an input. For a wide build context (the project root) only the Dockerfile counts: the project tree is too large to fingerprint on every launch, so a change to a file the Dockerfile copies in does not trigger a rebuild on its own. Run `runfree rebuild` after changing such a file.
 
 ## Optional Runtime Helpers
