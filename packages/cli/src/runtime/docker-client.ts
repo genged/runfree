@@ -1,5 +1,6 @@
 import type * as childProcess from "node:child_process";
 
+import type { PinnedAgentImageReference } from "./agent-image-lock.ts";
 import type { CaptureResult, RuntimeIO } from "./types.ts";
 
 /*
@@ -125,8 +126,8 @@ export type DockerCaptureMethods<R> = Readonly<{
   removeNetworks(ids: readonly string[], options?: DockerCallOptions): R;
   createVolume(name: string, labels: readonly string[], options?: DockerCallOptions): R;
   removeVolumes(names: readonly string[], options?: DockerCallOptions): R;
-  /** `docker pull --quiet <reference>`; the caller restricts which references reach it. */
-  pullImage(reference: string, options?: DockerCallOptions): R;
+  /** `docker pull --quiet <reference>`; only a digest reference built from the agent image lock is accepted. */
+  pullImage(reference: PinnedAgentImageReference, options?: DockerCallOptions): R;
 }>;
 
 export type AsyncDockerClient = DockerCaptureMethods<Promise<CaptureResult>>;

@@ -638,6 +638,23 @@ test("an input digest missing from the lock never pulls and builds quietly", () 
   expect(agentImageBuilds(docker)).toHaveLength(1);
 });
 
+// `force` forces the project image only; the agent base image is never
+// force-rebuilt (both callers of buildRuntimeAgentImage pass force=false, as on
+// main), so a forced ensure still takes the base image from the lock by digest.
+test("a forced ensure still takes the agent base image from the lock, by digest only", () => {
+  const plan = narrowProjectPlan();
+  approveNarrowImage(plan);
+  const docker = pullDocker();
+
+  const stderr = captureStderr(() => ensureRuntimeMaterialized(plan, { docker: docker as never, io: { confirm: () => true, run: () => 0 } as never, force: true }));
+
+  expect(stderr.filter((line) => line.includes("warning"))).toEqual([]);
+  expect(docker.pulls).toEqual([PUBLISHED_REFERENCE]);
+  for (const reference of docker.pulls) expect(reference).toMatch(PULL_REFERENCE);
+  expect(agentImageBuilds(docker)).toEqual([]);
+  expect(docker.builds.filter((args) => buildLabels(args)[RUNFREE_IMAGE_ROLE_LABEL] === AGENT_PROJECT_IMAGE_ROLE)).toHaveLength(1);
+});
+
 test("the shipped empty lock never pulls", async () => {
   const { parseAgentImageLock } = await import("./agent-image-lock.ts");
   const shipped = JSON.parse(fs.readFileSync(path.join(process.cwd(), "packages", "cli", "src", "runtime", "agent-image-lock.json"), "utf8"));
