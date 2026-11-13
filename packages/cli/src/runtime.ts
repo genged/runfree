@@ -53,7 +53,7 @@ import {
 } from "./runtime/component-diagnostics.ts";
 import { prepareDependencyOverlayPlan } from "./runtime/dependency-overlays.ts";
 import { runFencedProjectDestroy } from "./runtime/destroy.ts";
-import { containerMissingNetwork, dockerClientEnvOptions } from "./runtime/docker.ts";
+import { containerMissingNetwork, dockerClientEnvOptions, type RuntimeDocker } from "./runtime/docker.ts";
 import { createDockerClient } from "./runtime/docker-client.ts";
 import { printHostGitStatusLine } from "./runtime/git-layout.ts";
 import { clearStoppedControlPlaneSelection } from "./runtime/stopped-selection.ts";
@@ -75,7 +75,11 @@ import {
   type RecoveryItem,
   type RecoveryLiveInputs,
 } from "./runtime/recovery.ts";
-import { generatedRuntimeContextIfAvailable } from "./runtime/images.ts";
+import {
+  agentBaseImageOrigin,
+  agentBaseImageOriginLine,
+  generatedRuntimeContextIfAvailable,
+} from "./runtime/images.ts";
 import {
   listIngressForwarders,
   removeValidatedEmptyManagedIngressHostNetworkAfterForcedSweep,
@@ -1067,6 +1071,7 @@ export function statusRuntime(context: RuntimeContext, io: RuntimeIO, options: {
     // labeled; the dump is `runfree status --verbose`.
     for (const line of statusPostureLines(componentLines, lifecycleLines)) console.log(line);
   }
+  printAgentBaseImageStatusLine(adapters.docker, options.verbose === true);
   printHostGitStatusLine(context, io);
   printAuditStatusLine(context, io);
   printWriteApprovalStatusLine(context, io);
@@ -1074,6 +1079,17 @@ export function statusRuntime(context: RuntimeContext, io: RuntimeIO, options: {
   printIngressForwarderStatusLine(context, io);
   printHostServiceStatusLine(context, io);
   return status;
+}
+
+// Whether the embedded agent base image was pulled from the published
+// repository or built locally (read from `docker image inspect`).
+function printAgentBaseImageStatusLine(docker: RuntimeDocker, verbose: boolean): void {
+  try {
+    const line = agentBaseImageOriginLine(agentBaseImageOrigin(docker));
+    console.log(verbose ? line : shortenDigests(line));
+  } catch {
+    // A status line must never be the reason status fails.
+  }
 }
 
 const FULL_DIGEST = /\b([0-9a-f]{12})[0-9a-f]{52}\b/g;

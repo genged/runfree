@@ -5,6 +5,7 @@ import path from "node:path";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 
 import {
+  agentBaseImageTag,
   agentRuntimeImageTag,
   projectAgentImageTag,
   proxyRuntimeImageTag,
@@ -79,6 +80,7 @@ import {
   runtimeTopologyProjectionArtifactDigestV2,
 } from "./topology-digest-v2.ts";
 import type { RuntimeContext, RuntimeIO } from "./types.ts";
+import { flushWarnings, setOutputWriterForTest } from "../warnings.ts";
 
 /**
  * The cleanup pass's session-container inventory scan: `createDockerClient`'s
@@ -92,9 +94,23 @@ function isInventoryListCall(args: readonly string[]): boolean {
     && args.includes("--format") && !args.includes("--filter");
 }
 
+// The shipped lock is empty; the pull tests publish into this one instead.
+const agentImageLock = vi.hoisted(() => ({ images: {} as Record<string, string> }));
+vi.mock("./agent-image-lock.ts", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./agent-image-lock.ts")>();
+  return {
+    ...actual,
+    shippedAgentImageLock: () => actual.parseAgentImageLock({
+      repository: actual.AGENT_IMAGE_REPOSITORY,
+      images: agentImageLock.images,
+    }),
+  };
+});
+
 let tmp: string;
 
 beforeEach(() => {
+  agentImageLock.images = {};
   tmp = fs.mkdtempSync(path.join(os.tmpdir(), "runfree-images-"));
   // These tests prove which state is published and selected, not that it is
   // durable; fsync was most of this file's wall time. The publish-path fsync
@@ -374,6 +390,26 @@ class RuntimeImageDocker {
     return this.images.has(reference);
   }
 
+  /** What the registry would serve, keyed by the exact pull reference. */
+  readonly published = new Map<string, DockerImageInspect>();
+  readonly pulls: string[] = [];
+  pullFailure?: { status: number; reason?: string };
+
+  pullImage(reference: string): { status: number; reason?: string } {
+    this.pulls.push(reference);
+    if (this.pullFailure) return this.pullFailure;
+    const image = this.published.get(reference);
+    if (!image) return { status: 1, reason: "manifest unknown" };
+    this.store(image, reference);
+    return { status: 0 };
+  }
+
+  /** Remove the seeded runtime agent images so ensure must pull or build. */
+  dropAgentImages(): void {
+    this.images.delete(agentRuntimeImageTag());
+    this.images.delete(agentBaseImageTag());
+  }
+
   tagImage(source: string, target: string): number {
     this.tags.push([source, target]);
     const image = this.images.get(source);
@@ -409,6 +445,242 @@ class RuntimeImageDocker {
 function projectBuildDocker(builds: string[][]) {
   return new RuntimeImageDocker(builds) as never;
 }
+
+const PULL_REFERENCE = /^ghcr\.io\/genged\/runfree-agent@sha256:[0-9a-f]{64}$/;
+const PUBLISHED_MANIFEST = `sha256:${"d".repeat(64)}`;
+const PUBLISHED_REFERENCE = `ghcr.io/genged/runfree-agent@${PUBLISHED_MANIFEST}`;
+const PULLED_IMAGE_ID = `sha256:${"9".repeat(64)}`;
+
+/** A Docker with no local agent image and the lock's image published. */
+function pullDocker(published: Partial<DockerImageInspect> = {}): RuntimeImageDocker {
+  agentImageLock.images = { [RUNFREE_RUNTIME_COMPONENTS.agentImageInputDigest]: PUBLISHED_MANIFEST };
+  const docker = new RuntimeImageDocker();
+  docker.dropAgentImages();
+  docker.published.set(PUBLISHED_REFERENCE, {
+    ...inspectedImage(agentRuntimeImageTag()),
+    id: PULLED_IMAGE_ID,
+    repoDigests: [PUBLISHED_REFERENCE],
+    ...published,
+  });
+  return docker;
+}
+
+function agentImageBuilds(docker: RuntimeImageDocker): string[][] {
+  return docker.builds.filter((args) => buildLabels(args)[RUNFREE_IMAGE_ROLE_LABEL] === AGENT_RUNTIME_IMAGE_ROLE);
+}
+
+/** Every stderr line the run printed, timestamps stripped, warnings flushed. */
+function captureStderr(run: () => void): string[] {
+  const lines: string[] = [];
+  flushWarnings();
+  setOutputWriterForTest((line) => lines.push(line.replace(/^\S+Z (?=runfree)/u, "")));
+  try {
+    run();
+    flushWarnings();
+  } finally {
+    setOutputWriterForTest(undefined);
+  }
+  return lines;
+}
+
+test("an agent image in the lock is pulled by digest, retagged, and reused like a local build", () => {
+  const plan = defaultPlan();
+  const docker = pullDocker();
+  const io = { run: () => 0 } as never;
+
+  const stderr = captureStderr(() => {
+    const active = ensureRuntimeMaterialized(plan, { docker: docker as never, io, force: false });
+    expect(active.activeRuntime.preparedSessionAgent?.selectedAgentImageId).toBe(PULLED_IMAGE_ID);
+  });
+
+  expect(stderr).toEqual([]);
+  expect(docker.pulls).toEqual([PUBLISHED_REFERENCE]);
+  for (const reference of docker.pulls) expect(reference).toMatch(PULL_REFERENCE);
+  expect(agentImageBuilds(docker)).toEqual([]);
+  expect(docker.tags).toEqual([
+    [PULLED_IMAGE_ID, agentRuntimeImageTag()],
+    [PULLED_IMAGE_ID, agentBaseImageTag()],
+  ]);
+
+  // The second ensure finds both tags through the same reuse check a local
+  // build passes: no pull, no build, no tag.
+  ensureRuntimeMaterialized(plan, { docker: docker as never, io, force: false });
+  expect(docker.pulls).toHaveLength(1);
+  expect(docker.builds).toEqual([]);
+  expect(docker.tags).toHaveLength(2);
+});
+
+test("verbose output says the agent image was pulled, then present from the pull", () => {
+  const plan = defaultPlan();
+  const docker = pullDocker();
+  const io = { run: () => 0 } as never;
+
+  const first = captureStderr(() => ensureRuntimeMaterialized(plan, { docker: docker as never, io, force: false, verbose: true }));
+  expect(first).toContain(`runfree: verbose: pulling runtime agent image: ${PUBLISHED_REFERENCE}`);
+  expect(first).toContain(`runfree: verbose: runtime agent image pulled: ${PUBLISHED_REFERENCE} -> ${agentRuntimeImageTag()}`);
+
+  const second = captureStderr(() => ensureRuntimeMaterialized(plan, { docker: docker as never, io, force: false, verbose: true }));
+  expect(second).toContain(
+    `runfree: verbose: runtime agent image present: ${agentRuntimeImageTag()} (pulled from ${PUBLISHED_REFERENCE})`,
+  );
+
+  const local = new RuntimeImageDocker();
+  const built = captureStderr(() => ensureRuntimeMaterialized(defaultPlan(), { docker: local as never, io, force: false, verbose: true }));
+  expect(built).toContain(`runfree: verbose: runtime agent image present: ${agentRuntimeImageTag()} (built locally)`);
+});
+
+test("a failed pull warns once with the reason and builds locally", () => {
+  const plan = defaultPlan();
+  const docker = pullDocker();
+  docker.pullFailure = { status: 1, reason: "network error" };
+
+  const stderr = captureStderr(() => ensureRuntimeMaterialized(plan, { docker: docker as never, io: { run: () => 0 } as never, force: false }));
+
+  expect(stderr).toEqual(["runfree warning: could not pull the agent image (network error), building locally"]);
+  expect(docker.pulls).toEqual([PUBLISHED_REFERENCE]);
+  expect(docker.tags).toEqual([]);
+  expect(agentImageBuilds(docker)).toHaveLength(1);
+});
+
+test("a pull failure without a reason names the exit status", () => {
+  const docker = pullDocker();
+  docker.pullFailure = { status: 125 };
+
+  const stderr = captureStderr(() => ensureRuntimeMaterialized(defaultPlan(), { docker: docker as never, io: { run: () => 0 } as never, force: false }));
+
+  expect(stderr).toEqual(["runfree warning: could not pull the agent image (docker pull exited with status 125), building locally"]);
+  expect(agentImageBuilds(docker)).toHaveLength(1);
+});
+
+test("a pulled image whose registry digest differs from the lock is refused before any tag", () => {
+  const docker = pullDocker({ repoDigests: [`ghcr.io/genged/runfree-agent@sha256:${"0".repeat(64)}`] });
+
+  const stderr = captureStderr(() => ensureRuntimeMaterialized(defaultPlan(), { docker: docker as never, io: { run: () => 0 } as never, force: false }));
+
+  expect(stderr).toEqual([
+    "runfree warning: could not pull the agent image (the pulled image digest does not match the lock), building locally",
+  ]);
+  expect(docker.tags).toEqual([]);
+  expect(agentImageBuilds(docker)).toHaveLength(1);
+});
+
+test("a pulled image with no registry digest is refused before any tag", () => {
+  const docker = pullDocker({ repoDigests: undefined });
+
+  const stderr = captureStderr(() => ensureRuntimeMaterialized(defaultPlan(), { docker: docker as never, io: { run: () => 0 } as never, force: false }));
+
+  expect(stderr).toEqual([
+    "runfree warning: could not pull the agent image (the pulled image digest does not match the lock), building locally",
+  ]);
+  expect(docker.tags).toEqual([]);
+  expect(agentImageBuilds(docker)).toHaveLength(1);
+});
+
+test("a pulled image without the managed agent labels is refused before any tag", () => {
+  const docker = pullDocker({ labels: { ...inspectedImage(agentRuntimeImageTag()).labels, [RUNFREE_IMAGE_INPUT_DIGEST_LABEL]: `sha256:${"1".repeat(64)}` } });
+
+  const stderr = captureStderr(() => ensureRuntimeMaterialized(defaultPlan(), { docker: docker as never, io: { run: () => 0 } as never, force: false }));
+
+  expect(stderr).toEqual([
+    "runfree warning: could not pull the agent image (the pulled image is not the expected Runfree agent image), building locally",
+  ]);
+  expect(docker.tags).toEqual([]);
+  expect(agentImageBuilds(docker)).toHaveLength(1);
+});
+
+test("a pulled image that cannot be inspected falls back to the local build", () => {
+  const docker = pullDocker();
+  docker.inspectOverride = (reference, inspected) => (reference === PUBLISHED_REFERENCE ? undefined : inspected);
+
+  const stderr = captureStderr(() => ensureRuntimeMaterialized(defaultPlan(), { docker: docker as never, io: { run: () => 0 } as never, force: false }));
+
+  expect(stderr).toEqual(["runfree warning: could not pull the agent image (the pulled image could not be inspected), building locally"]);
+  expect(docker.tags).toEqual([]);
+  expect(agentImageBuilds(docker)).toHaveLength(1);
+});
+
+test("a failed retag or a retagged image that does not verify falls back to the local build", () => {
+  const tagFails = pullDocker();
+  tagFails.tagImage = (source, target) => {
+    tagFails.tags.push([source, target]);
+    return 1;
+  };
+  expect(captureStderr(() => ensureRuntimeMaterialized(defaultPlan(), { docker: tagFails as never, io: { run: () => 0 } as never, force: false })))
+    .toEqual(["runfree warning: could not pull the agent image (docker tag failed), building locally"]);
+  expect(agentImageBuilds(tagFails)).toHaveLength(1);
+
+  fs.rmSync(tmp, { recursive: true, force: true });
+  fs.mkdirSync(tmp, { recursive: true });
+  const swapped = pullDocker();
+  let built = false;
+  const buildImage = swapped.buildImage.bind(swapped);
+  swapped.buildImage = (args) => {
+    built = true;
+    return buildImage(args);
+  };
+  // Between tag and re-inspection the base tag resolves to some other image.
+  swapped.inspectOverride = (reference, inspected) => (
+    !built && reference === agentBaseImageTag() && inspected ? { ...inspected, id: `sha256:${"8".repeat(64)}` } : inspected
+  );
+  expect(captureStderr(() => ensureRuntimeMaterialized(defaultPlan(), { docker: swapped as never, io: { run: () => 0 } as never, force: false })))
+    .toEqual(["runfree warning: could not pull the agent image (the retagged image failed verification), building locally"]);
+  expect(agentImageBuilds(swapped)).toHaveLength(1);
+});
+
+test("an input digest missing from the lock never pulls and builds quietly", () => {
+  const docker = pullDocker();
+  agentImageLock.images = { [`sha256:${"2".repeat(64)}`]: PUBLISHED_MANIFEST };
+
+  const stderr = captureStderr(() => ensureRuntimeMaterialized(defaultPlan(), { docker: docker as never, io: { run: () => 0 } as never, force: false }));
+
+  expect(stderr).toEqual([]);
+  expect(docker.pulls).toEqual([]);
+  expect(agentImageBuilds(docker)).toHaveLength(1);
+});
+
+// `force` forces the project image only; the agent base image is never
+// force-rebuilt (both callers of buildRuntimeAgentImage pass force=false, as on
+// main), so a forced ensure still takes the base image from the lock by digest.
+test("a forced ensure still takes the agent base image from the lock, by digest only", () => {
+  const plan = narrowProjectPlan();
+  approveNarrowImage(plan);
+  const docker = pullDocker();
+
+  const stderr = captureStderr(() => ensureRuntimeMaterialized(plan, { docker: docker as never, io: { confirm: () => true, run: () => 0 } as never, force: true }));
+
+  expect(stderr.filter((line) => line.includes("warning"))).toEqual([]);
+  expect(docker.pulls).toEqual([PUBLISHED_REFERENCE]);
+  for (const reference of docker.pulls) expect(reference).toMatch(PULL_REFERENCE);
+  expect(agentImageBuilds(docker)).toEqual([]);
+  expect(docker.builds.filter((args) => buildLabels(args)[RUNFREE_IMAGE_ROLE_LABEL] === AGENT_PROJECT_IMAGE_ROLE)).toHaveLength(1);
+});
+
+test("the shipped empty lock never pulls", async () => {
+  const { parseAgentImageLock } = await import("./agent-image-lock.ts");
+  const shipped = JSON.parse(fs.readFileSync(path.join(process.cwd(), "packages", "cli", "src", "runtime", "agent-image-lock.json"), "utf8"));
+  expect(parseAgentImageLock(shipped).images.size).toBe(0);
+  agentImageLock.images = shipped.images;
+  const docker = new RuntimeImageDocker();
+  docker.dropAgentImages();
+
+  ensureRuntimeMaterialized(defaultPlan(), { docker: docker as never, io: { run: () => 0 } as never, force: false });
+
+  expect(docker.pulls).toEqual([]);
+  expect(agentImageBuilds(docker)).toHaveLength(1);
+});
+
+test("a project image build pulls its base image from the lock too", () => {
+  const plan = narrowProjectPlan();
+  approveNarrowImage(plan);
+  const docker = pullDocker();
+
+  const stderr = captureStderr(() => ensureRuntimeMaterialized(plan, { docker: docker as never, io: { confirm: () => true, run: () => 0 } as never, force: false }));
+
+  expect(stderr.filter((line) => line.includes("warning"))).toEqual([]);
+  expect(docker.pulls).toEqual([PUBLISHED_REFERENCE]);
+  expect(agentImageBuilds(docker)).toEqual([]);
+  expect(docker.builds.filter((args) => buildLabels(args)[RUNFREE_IMAGE_ROLE_LABEL] === AGENT_PROJECT_IMAGE_ROLE)).toHaveLength(1);
+});
 
 test("default runtime materialization returns an active plan without mutating the input", () => {
   const plan = defaultPlan();

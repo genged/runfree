@@ -1,5 +1,6 @@
 import type * as childProcess from "node:child_process";
 
+import type { PinnedAgentImageReference } from "./agent-image-lock.ts";
 import type { CaptureResult, RuntimeIO } from "./types.ts";
 
 /*
@@ -33,6 +34,7 @@ import type { CaptureResult, RuntimeIO } from "./types.ts";
  *   network rm ID…                            removeNetworks([ID…])
  *   volume create --label L… NAME             createVolume(NAME, [L…])
  *   volume rm NAME… (captured / via io.run)   removeVolumes([…]) / terminal.removeVolumes([…])
+ *   pull --quiet REF                          pullImage(REF)
  *   build ARGS… (via io.run)                  terminal.build([ARGS…])
  *   compose ARGS… (via io.run)                terminal.compose([ARGS…])
  *   image prune -f --filter X… (via io.run)   terminal.pruneImages([X…])
@@ -124,6 +126,8 @@ export type DockerCaptureMethods<R> = Readonly<{
   removeNetworks(ids: readonly string[], options?: DockerCallOptions): R;
   createVolume(name: string, labels: readonly string[], options?: DockerCallOptions): R;
   removeVolumes(names: readonly string[], options?: DockerCallOptions): R;
+  /** `docker pull --quiet <reference>`; only a digest reference built from the agent image lock is accepted. */
+  pullImage(reference: PinnedAgentImageReference, options?: DockerCallOptions): R;
 }>;
 
 export type AsyncDockerClient = DockerCaptureMethods<Promise<CaptureResult>>;
@@ -197,6 +201,7 @@ function captureMethods<R>(capture: (args: string[], options?: DockerCallOptions
     removeNetworks: (ids, options) => capture(["network", "rm", ...ids], options),
     createVolume: (name, labels, options) => capture(["volume", "create", ...labelArgs(labels), name], options),
     removeVolumes: (names, options) => capture(["volume", "rm", ...names], options),
+    pullImage: (reference, options) => capture(["pull", "--quiet", reference], options),
   });
 }
 

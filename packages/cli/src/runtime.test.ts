@@ -129,7 +129,7 @@ vi.mock("./runtime/sessions.ts", async (importOriginal) => {
 
 import { defaultConfig, projectControlPaths, type RunfreeConfig, type ProjectInfo } from "./config.ts";
 import { service, serviceHostNames } from "../../../scripts/services.ts";
-import { agentRuntimeImageTag, effectiveRuntimeDigest, proxyRuntimeImageTag } from "./agent-image.ts";
+import { agentBaseImageTag, agentRuntimeImageTag, effectiveRuntimeDigest, proxyRuntimeImageTag } from "./agent-image.ts";
 import { desiredServiceEntry } from "./admin/service-policy.ts";
 import {
   approveNetworkCandidate,
@@ -137,7 +137,7 @@ import {
 } from "./control/approvals.ts";
 import { captureDesiredPolicyCandidate } from "./control/candidates.ts";
 import { clearActiveControlSelection, publishEffectivePolicyGeneration, } from "./control/effective.ts";
-import { RUNFREE_RUNTIME_DIGEST, RUNFREE_VERSION } from "./embedded-assets.generated.ts";
+import { RUNFREE_RUNTIME_COMPONENTS, RUNFREE_RUNTIME_DIGEST, RUNFREE_VERSION } from "./embedded-assets.generated.ts";
 import {
   mcpApprovalPath,
   mcpInventory,
@@ -7728,6 +7728,65 @@ describe("runtime command flow", () => {
     expect(statusRuntime(context, io, { verbose: true })).toBe(0);
     const verbose = vi.mocked(console.log).mock.calls.map((call) => call.join(" ")).join("\n");
     expect(verbose).toContain("host git: 2.49.0 (worktrees: enabled)");
+  });
+
+  test("status reports whether the agent base image was pulled or built locally", () => {
+    const projectRoot = path.join(tmp, "project");
+    const project = prepareProject(projectRoot);
+    const context = {
+      projectRoot,
+      project,
+      runtimeRoot: path.join(tmp, "runtime"),
+      env: { PATH: "/fake-bin" },
+      network: fixedNetwork,
+    } satisfies RuntimeContext;
+    const manifestDigest = `sha256:${"e".repeat(64)}`;
+    let baseImage: Record<string, unknown> | undefined;
+    const io = createRuntimeIO({
+      capture: (command, args) => {
+        if (command === "docker" && args[0] === "image" && args[1] === "inspect" && args[2] === agentBaseImageTag()) {
+          return baseImage ? captureResult(0, JSON.stringify([baseImage])) : captureResult(1, "", "No such image");
+        }
+        return captureResult(0);
+      },
+    });
+    const image = (repoDigests: string[]) => ({
+      Architecture: "amd64",
+      Id: `sha256:${"a".repeat(64)}`,
+      Os: "linux",
+      RepoDigests: repoDigests,
+      Config: {
+        Labels: {
+          [RUNFREE_MANAGED_IMAGE_LABEL]: "true",
+          [RUNFREE_DIGEST_SCHEMA_LABEL]: RUNFREE_DIGEST_SCHEMA_VERSION,
+          [RUNFREE_IMAGE_INPUT_DIGEST_LABEL]: RUNFREE_RUNTIME_COMPONENTS.agentImageInputDigest,
+          [RUNFREE_IMAGE_ROLE_LABEL]: AGENT_RUNTIME_IMAGE_ROLE,
+        },
+      },
+    });
+    const statusOutput = (verbose: boolean): string => {
+      vi.mocked(console.log).mockClear();
+      expect(statusRuntime(context, io, { verbose })).toBe(0);
+      return vi.mocked(console.log).mock.calls.map((call) => call.join(" ")).join("\n");
+    };
+
+    expect(statusOutput(false)).toContain("agent base image: not present (pulled or built on the next start)");
+
+    baseImage = image([]);
+    expect(statusOutput(false)).toContain("agent base image: built locally");
+    expect(statusOutput(true)).toContain("agent base image: built locally");
+
+    // A local image name in RepoDigests (containerd image store) is not a pull.
+    baseImage = image([`runfree/agent-base@sha256:${"f".repeat(64)}`]);
+    expect(statusOutput(false)).toContain("agent base image: built locally");
+
+    baseImage = image([`ghcr.io/genged/runfree-agent@${manifestDigest}`]);
+    expect(statusOutput(false)).toContain(`agent base image: pulled from ghcr.io/genged/runfree-agent@sha256:${"e".repeat(12)}…`);
+    expect(statusOutput(true)).toContain(`agent base image: pulled from ghcr.io/genged/runfree-agent@${manifestDigest}`);
+
+    // Labels that are not the managed base image are reported as absent.
+    baseImage = { ...image([`ghcr.io/genged/runfree-agent@${manifestDigest}`]), Config: { Labels: {} } };
+    expect(statusOutput(false)).toContain("agent base image: not present");
   });
 
   test("status reports host Git worktree support as disabled on old host Git", () => {

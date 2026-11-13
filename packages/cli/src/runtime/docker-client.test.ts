@@ -2,6 +2,15 @@ import { describe, expect, test } from "vitest";
 
 import { createAsyncDockerClient, createDockerClient, labelRunFlags, type DockerCaptureMethods, type DockerIo } from "./docker-client.ts";
 import type { CaptureResult } from "./types.ts";
+import { AGENT_IMAGE_REPOSITORY, parseAgentImageLock, pinnedAgentImage } from "./agent-image-lock.ts";
+
+const INPUT_DIGEST = `sha256:${"1".repeat(64)}`;
+const PULL_REFERENCE = (() => {
+  const lock = parseAgentImageLock({ repository: AGENT_IMAGE_REPOSITORY, images: { [INPUT_DIGEST]: `sha256:${"2".repeat(64)}` } });
+  const reference = pinnedAgentImage(lock, INPUT_DIGEST);
+  if (!reference) throw new Error("test lock has no reference");
+  return reference;
+})();
 
 type Call = { mode: "capture" | "run"; command: string; args: string[]; options: unknown };
 
@@ -58,6 +67,7 @@ describe("docker client argv", () => {
     ["network rm", (c) => c.removeNetworks(["n"]), ["network", "rm", "n"]],
     ["volume create", (c) => c.createVolume("v", ["a=b"]), ["volume", "create", "--label", "a=b", "v"]],
     ["volume rm", (c) => c.removeVolumes(["v", "w"]), ["volume", "rm", "v", "w"]],
+    ["pull", (c) => c.pullImage(PULL_REFERENCE), ["pull", "--quiet", `ghcr.io/genged/runfree-agent@sha256:${"2".repeat(64)}`]],
   ];
   for (const [name, call, argv] of cases) {
     test(name, () => {
@@ -67,7 +77,17 @@ describe("docker client argv", () => {
     });
   }
 
-  const terminalCases: Array<[string, (c: ReturnType<typeof createDockerClient>) => number, string[]]> = [
+  test("pull accepts only a lock-built digest reference at the type level", () => {
+    const tagPulls = (sync: ReturnType<typeof createDockerClient>, async: ReturnType<typeof createAsyncDockerClient>) => {
+      // @ts-expect-error a plain tag string is not a PinnedAgentImageReference
+      sync.pullImage("ghcr.io/genged/runfree-agent:latest");
+      // @ts-expect-error the async client is restricted the same way
+      void async.pullImage("ubuntu:24.04");
+    };
+    expect(typeof tagPulls).toBe("function");
+  });
+
+  const terminalCases:Array<[string, (c: ReturnType<typeof createDockerClient>) => number, string[]]> = [
     ["build", (c) => c.terminal.build(["--tag", "t", "."]), ["build", "--tag", "t", "."]],
     ["compose", (c) => c.terminal.compose(["-p", "p", "up", "-d"]), ["compose", "-p", "p", "up", "-d"]],
     ["detached exec", (c) => c.terminal.exec(ID, ["node", "-e", "x"], { detach: true, user: "1000:1000" }),
@@ -107,6 +127,7 @@ describe("async docker client", () => {
     ["removeNetworks", (c) => c.removeNetworks(["n", "m"])],
     ["createVolume", (c) => c.createVolume("v", ["a=b"])],
     ["removeVolumes", (c) => c.removeVolumes(["v"])],
+    ["pullImage", (c) => c.pullImage(PULL_REFERENCE, { timeout: 5 })],
   ];
 
   test("covers every capture method of the sync client", () => {

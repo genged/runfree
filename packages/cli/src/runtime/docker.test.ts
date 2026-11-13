@@ -11,6 +11,7 @@ import {
   serviceContainerId,
 } from "./docker.ts";
 import type { detectDockerBackend } from "../docker-backend.ts";
+import { AGENT_IMAGE_REPOSITORY, parseAgentImageLock, pinnedAgentImage } from "./agent-image-lock.ts";
 import { inspectReusableManagedImage } from "./image-identity.ts";
 import type { CaptureResult, RuntimeContext, RuntimeIO } from "./types.ts";
 
@@ -764,4 +765,89 @@ test("image-mutating adapter operations invalidate the inspect memo", () => {
   docker.removeImages(["runfree:test"]);
   expect(docker.inspectImage("runfree:test")).toBeUndefined();
   expect(inspectCount()).toBe(3);
+});
+
+function testPullReference() {
+  const reference = pinnedAgentImage(
+    parseAgentImageLock({
+      repository: AGENT_IMAGE_REPOSITORY,
+      images: { [`sha256:${"1".repeat(64)}`]: `sha256:${"2".repeat(64)}` },
+    }),
+    `sha256:${"1".repeat(64)}`,
+  );
+  if (!reference) throw new Error("test lock has no reference");
+  return reference;
+}
+
+test("pullImage runs a quiet docker pull of exactly the pinned reference and invalidates the memo", () => {
+  const { byTag, io, docker, inspectCount } = memoFixture();
+  const pulls: Array<{ args: string[]; env?: NodeJS.ProcessEnv }> = [];
+  const capture = io.capture;
+  io.capture = (command, args, options) => {
+    if (args[0] === "pull") {
+      pulls.push({ args, env: options?.env as NodeJS.ProcessEnv | undefined });
+      return { status: 0, stdout: "pulled\n", stderr: "" };
+    }
+    return capture(command, args, options);
+  };
+  byTag.set("runfree:test", imageJson(`sha256:${"4".repeat(64)}`));
+  expect(docker.inspectImage("runfree:test")?.id).toBe(`sha256:${"4".repeat(64)}`);
+  byTag.set("runfree:test", imageJson(`sha256:${"5".repeat(64)}`));
+
+  expect(docker.pullImage(testPullReference())).toEqual({ status: 0 });
+
+  expect(pulls).toEqual([{
+    args: ["pull", "--quiet", `ghcr.io/genged/runfree-agent@sha256:${"2".repeat(64)}`],
+    env: expect.objectContaining({ DOCKER_HOST: "unix:///docker.sock" }),
+  }]);
+  expect(pulls[0]?.env).not.toHaveProperty("SECRET");
+  expect(docker.inspectImage("runfree:test")?.id).toBe(`sha256:${"5".repeat(64)}`);
+  expect(inspectCount()).toBe(2);
+});
+
+test("pullImage reports a failed pull's first stderr line as one bounded reason", () => {
+  const { io, docker } = memoFixture();
+  let stderr = "";
+  const capture = io.capture;
+  io.capture = (command, args, options) => (args[0] === "pull"
+    ? { status: 1, stdout: "", stderr }
+    : capture(command, args, options));
+
+  stderr = "\nError response from daemon: Get https://ghcr.io/v2/: dial tcp: lookup ghcr.io: no such host\nmore\n";
+  expect(docker.pullImage(testPullReference())).toEqual({
+    status: 1,
+    reason: "Get https://ghcr.io/v2/: dial tcp: lookup ghcr.io: no such host",
+  });
+
+  stderr = `\u001b[31m${"x".repeat(400)}\n`;
+  const long = docker.pullImage(testPullReference());
+  // The escape byte is stripped; the rest is cut to 160 characters.
+  expect(long.reason).toBe(`[31m${"x".repeat(153)}...`);
+  expect(long.reason).toHaveLength(160);
+
+  stderr = "";
+  expect(docker.pullImage(testPullReference())).toEqual({ status: 1, reason: "docker pull exited with status 1" });
+});
+
+test("inspectImage keeps registry RepoDigests and rejects malformed ones", () => {
+  const { byTag, docker } = memoFixture();
+  const withDigests = (repoDigests: unknown): string => {
+    const [image] = JSON.parse(imageJson(`sha256:${"6".repeat(64)}`)) as Array<Record<string, unknown>>;
+    return JSON.stringify([{ ...image, RepoDigests: repoDigests }]);
+  };
+  const pulled = `ghcr.io/genged/runfree-agent@sha256:${"2".repeat(64)}`;
+
+  byTag.set("runfree:pulled", withDigests([pulled]));
+  expect(docker.inspectImage("runfree:pulled")?.repoDigests).toEqual([pulled]);
+
+  byTag.set("runfree:built", withDigests([]));
+  expect(docker.inspectImage("runfree:built")).not.toHaveProperty("repoDigests");
+
+  byTag.set("runfree:null", withDigests(null));
+  expect(docker.inspectImage("runfree:null")).not.toHaveProperty("repoDigests");
+
+  byTag.set("runfree:bad", withDigests([1]));
+  expect(docker.inspectImage("runfree:bad")).toBeUndefined();
+  byTag.set("runfree:object", withDigests({ [pulled]: true }));
+  expect(docker.inspectImage("runfree:object")).toBeUndefined();
 });

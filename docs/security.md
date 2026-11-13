@@ -40,6 +40,14 @@ project.
 | The proxy container and its token state | Project files: `.runfree/`, `.mcp.json`, `.codex/config.toml`, package and install hooks |
 | Credential helpers that the user picks (`gh`, `op`, custom commands) | Responses from allowed hosts |
 | Docker Desktop, the Docker daemon, and the host OS | VNC display content and clipboard data |
+| The agent base image in GHCR (`ghcr.io/genged/runfree-agent`), pulled only by the manifest digest the CLI release pins | Tags and labels on a pulled image |
+
+The CLI pulls the agent base image only by a digest from the images lock
+embedded in its release, never by tag, and refuses a pulled image whose
+registry digest does not match the lock before it tags anything. Every other
+case, a failed pull included, builds the image locally. The lock ships empty
+until CI publishing lands, so every image is still built locally. The proxy
+image is always built locally.
 
 **In scope:**
 
