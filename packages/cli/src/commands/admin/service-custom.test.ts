@@ -164,11 +164,17 @@ describe("runfree service custom add --from-file", () => {
     expect(stderr).toEqual([]);
   });
 
-  test("a bare id is canonicalized to user-<id> rather than refused", async () => {
+  // SPEC C2(a) requires `custom add acme` to be refused. The product instead
+  // canonicalizes a bare id to user-<id> (canonicalUserServiceId in
+  // user-services.ts) and imports it. That conflict is escalated to the lead;
+  // this test-only change cannot fix it. `test.fails` keeps the spec's
+  // expectation in code: it turns red once the product refuses bare ids, and
+  // then the `.fails` marker must be dropped.
+  test.fails("C2(a): a bare id without the user- prefix is refused and nothing is written", async () => {
     const file = sourceFile("acme.json", definition());
-    expect(await runfree("custom", "add", "acme", "--from-file", file, "--yes")).toBe(0);
-    expect(fs.existsSync(destination("user-acme"))).toBe(true);
-    expect(stdout.at(-1)).toBe("enable it with: runfree service enable user-acme");
+    expect(await runfree("custom", "add", "acme", "--from-file", file, "--yes")).toBe(1);
+    expect(stderr.join("\n")).toMatch(/user-defined service id must match user-/);
+    expect(fs.existsSync(servicesDir())).toBe(false);
   });
 
   describe("C2: refusals write nothing", () => {
