@@ -132,7 +132,11 @@ export function safePathname(url: string | undefined): string | undefined {
   if (!url) return undefined;
   let pathname: string;
   try {
-    pathname = new URL(url, "https://placeholder.invalid").pathname;
+    // An origin-form path is appended to the origin, as the policy sees it:
+    // resolved as a relative URL, "//admin/x" would parse "admin" as a host.
+    pathname = url.startsWith("/")
+      ? new URL(`https://placeholder.invalid${url}`).pathname
+      : new URL(url, "https://placeholder.invalid").pathname;
   } catch {
     return undefined;
   }

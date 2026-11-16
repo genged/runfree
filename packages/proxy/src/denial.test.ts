@@ -34,6 +34,58 @@ describe("denial display helpers", () => {
     expect(safePathname(long)).toHaveLength(256);
   });
 
+  test("safePathname keeps a leading // as a path segment, as the policy sees it", () => {
+    expect(safePathname("//admin/x")).toBe("//admin/x");
+    expect(safePathname("/.//")).toBe("//");
+    expect(safePathname("//")).toBe("//");
+    expect(safePathname("/a/../b?q=1#f")).toBe("/b");
+    expect(safePathname("/\\\\evil.com/x")).toBe("///evil.com/x");
+    expect(safePathname("/\\evil.com/x")).toBe("//evil.com/x");
+    expect(safePathname("/\\evil.com/x")).not.toBe("/x");
+    for (const input of ["//admin/x", "/.//", "//", "/\\evil.com/x", `//${"a".repeat(500)}`]) {
+      expect(safePathname(input)).toBe(new URL(`https://h.example${input}`).pathname.slice(0, 256));
+    }
+  });
+
+  test("safePathname keeps absolute-URL and non-slash input behavior", () => {
+    expect(safePathname("https://api.example.com//admin/x")).toBe("//admin/x");
+    expect(safePathname("")).toBeUndefined();
+    expect(safePathname("v1/data")).toBe("/v1/data");
+  });
+
+  // M6.1 counterexample (seed 73371931, path "103:0:3:8:11:7"): ".//" became "//", then undefined.
+  test("safePathname is idempotent on the M6.1 counterexample", () => {
+    const once = safePathname("/.//");
+    expect(once).toBe("//");
+    expect(safePathname(once)).toBe(once);
+  });
+
+  test("path denial body and event show a leading // path as the policy judged it", () => {
+    const body = syntheticDenialBody("api.example.com", "path-not-allowed", {
+      method: "GET",
+      path: "//admin/x",
+      allowedPathPrefixes: ["/v1/"],
+    });
+    expect(body.split("\n")).toContain("  path:   //admin/x");
+    expect(body.split("\n")).not.toContain("  path:   /x");
+
+    const lines: string[] = [];
+    const emitter = createDenialEventEmitter({ log: (line) => lines.push(line), now: () => new Date(0) });
+    emitter.emit({ reason: "path-not-allowed", host: "api.example.com", method: "GET", path: "//admin/x", generation: GENERATION_A });
+    emitter.emit({
+      reason: "path-not-allowed",
+      host: "api.example.com",
+      method: "GET",
+      path: "https://api.example.com//admin/x",
+      generation: GENERATION_B,
+    });
+    expect(lines).toHaveLength(2);
+    for (const line of lines) {
+      expect(parseEventLine(line).path).toBe("//admin/x");
+      expect(line).toContain('"path":"//admin/x"');
+    }
+  });
+
   test("synthetic body names the normalized host and the host-side host add command", () => {
     const body = syntheticDenialBody("API.EXAMPLE.COM", "host-not-allowlisted");
     expect(body).toContain("Runfree blocked this request.");
