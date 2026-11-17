@@ -135,12 +135,12 @@ describe("keychain read", () => {
 });
 
 describe("keychain write", () => {
-  test("the token goes on stdin to security -i, never in argv", () => {
+  test("the token goes on stdin to security -i, never in argv; an add, never an update (-U)", () => {
     const request = keychainWriteRequest(keychainItemForSource("automation"), TOKEN);
     expect(request.args).toEqual(["-i"]);
     expect(request.args.join(" ")).not.toContain(TOKEN);
     expect(request.input).toBe(
-      `add-generic-password -U -s runfree.credential-source -a automation -l runfree-source-automation -T /usr/bin/security -w ${TOKEN}\n`,
+      `add-generic-password -s runfree.credential-source -a automation -l runfree-source-automation -T /usr/bin/security -w ${TOKEN}\n`,
     );
   });
   test("the longest accepted token fits a 3 KiB security -i line; a real-size token is accepted", () => {

@@ -811,8 +811,18 @@ runfree credential source remove automation
   vault and grant the service account that vault.
 - An existing name is refused. `credential source login <name>` replaces
   the stored token. It checks the new token with 1Password first, so a
-  rejected token leaves the old login in place. Bindings that read through
-  the source keep working with the new login.
+  rejected token leaves the old login in place. Then it deletes the old
+  Keychain item and adds a new one with the same name and the same trust in
+  `/usr/bin/security`. It does not update the item in place: an update that
+  sets which apps the item trusts makes macOS ask "security wants to change
+  access permissions". If the Keychain refuses the delete, nothing changes.
+  If the add fails after the delete, the source has no login: the message
+  says so, and `runfree credential source login <name>` again restores it.
+  The source and its bindings stay in place. Bindings that read through the
+  source keep working with the new login.
+- `credential source 1password <name>` also deletes a Keychain item left
+  with that name (for example, from a save that stopped before the registry
+  write), then adds the new one.
 - `credential source check <name>` reads the stored login and asks
   1Password which vaults it can read. It prints the fix
   (`runfree credential source login <name>`) when the login is missing,
@@ -821,6 +831,13 @@ runfree credential source remove automation
   source. It deletes the Keychain item first, then the registry entry. If
   the Keychain refuses the delete, nothing is removed; a rerun finishes a
   remove that stopped between the two steps.
+- The setup commands (`credential source 1password`, `login`, `check`, and
+  `remove`) never stop a `security` call: they wait until it exits, also
+  without a terminal. A `security` call can wait on a macOS dialog, and
+  stopping it while the dialog is open can leave macOS asking for the login
+  Keychain in every app. A setup command that waits on a dialog no person
+  sees waits until you stop it. Credential syncs and runs never show a
+  dialog, and they stop a Keychain read after at most 10 seconds.
 - Before each `security` call on a connection login, Runfree checks whether
   the default keychain (normally the login Keychain) is locked. The check
   reads the keychain status with `SecKeychainGetStatus` through
@@ -828,12 +845,12 @@ runfree credential source remove automation
   locked, Runfree does not start `security`: a read fails as a locked
   Keychain, and `credential source login` and `credential source remove`
   refuse and change nothing. The fix is to unlock the Mac's login Keychain
-  (log in to the Mac). When the check cannot tell, Runfree runs `security`
-  with its usual 10-second limit. A `security` call on a locked Keychain can
-  show an unlock dialog while the screen is unlocked, and stopping that call
-  can leave macOS asking for the Keychain password again and again; the
-  check prevents that, except when the Keychain locks between the check and
-  the read or the check cannot tell.
+  (log in to the Mac). When the check cannot tell, Runfree runs `security`.
+  A `security` call on a locked Keychain can show an unlock dialog while the
+  screen is unlocked, and stopping that call can leave macOS asking for the
+  Keychain password again and again. For a sync or a run read, the check
+  prevents that, except when the Keychain locks between the check and the
+  read or the check cannot tell.
 - A missing Keychain item or a revoked token is a definitive failure, so the
   proxy drops the value. A locked Keychain or a Keychain that does not answer
   is a short failure, so the proxy keeps the last good value.

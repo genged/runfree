@@ -1523,27 +1523,63 @@ export function verifyConnectionLogin(token: string): string[] {
   return parseVaultNames(vaults.stdout);
 }
 
-/** Saves (or replaces, `-U`) a connection login and reads it back; the token goes on stdin only. */
-export function writeConnectionLogin(item: KeychainItem, token: string): void {
+// A `security` call of an interactive setup command (`credential source
+// 1password`, `login`, `check`, `remove`): no timeout, so Runfree waits for
+// it to exit. The call can wait on a macOS dialog (an unlock, or an access
+// change on an item), and killing `security` while that dialog is open can
+// leave securityd asking for the Keychain in a loop. A command that waits is
+// better than a wedged Keychain, so this holds without a terminal too. Runs
+// and syncs never ask and keep the bounded wait of
+// `connectionKeychainInvocation`.
+function connectionSetupSecurityExit(args: string[], input?: string): ProviderExit {
+  return connectionSetupExit(keychainExecutable(childEnv()), args, {
+    env: sanitizedHostExecutionEnv(projectRoot(), childEnv()),
+    ...(input === undefined ? {} : { input }),
+  });
+}
+
+/**
+ * Saves a connection login: deletes any item with the same name, adds the new
+ * one (never `-U`, see `keychainWriteRequest`), and reads it back; the token
+ * goes on stdin only. The caller checks the token with 1Password first. A
+ * refused delete changes nothing. `rotation` names the source whose old login
+ * a failure after the delete leaves missing: its message says so and names
+ * the fix. A leftover item on a first save has no registry entry, so its
+ * delete needs no notice.
+ */
+export function writeConnectionLogin(item: KeychainItem, token: string, rotation?: Readonly<{ sourceName: string }>): void {
   const request = keychainWriteRequest(item, token);
   assertKeychainNotLockedForSetup();
-  const exit = connectionSetupExit(keychainExecutable(childEnv()), request.args, {
-    env: sanitizedHostExecutionEnv(projectRoot(), childEnv()),
-    input: request.input,
-    timeout: KEYCHAIN_CALL_TIMEOUT_MS,
-  });
-  if (exit.failure || exit.status !== 0) throw new ConnectionSetupError("the macOS Keychain refused to save the login");
+  let previous: "deleted" | "absent";
+  try {
+    previous = keychainDeleteStep(connectionSetupSecurityExit(keychainDeleteArgs(item)));
+  } catch (error) {
+    if (error instanceof ConnectionSetupError) throw new ConnectionSetupError("the macOS Keychain refused to delete the old login; nothing was changed");
+    throw error;
+  }
+  const lost = rotation && previous === "deleted"
+    ? `; the old login is already deleted, so source "${rotation.sourceName}" has no login until you run: ${remedy.credentialSourceLogin(rotation.sourceName)}`
+    : "";
+  const exit = connectionSetupSecurityExit(request.args, request.input);
+  if (exit.failure || exit.status !== 0) throw new ConnectionSetupError(`the macOS Keychain refused to save the login${lost}`);
   // `security -i` can report success for a line it did not store whole.
-  const invocation = connectionKeychainInvocation(item);
-  keychainWriteCheckStep(connectionSetupExit(invocation.executable, [...invocation.args], { env: invocation.env, timeout: invocation.timeoutMs }), token);
+  try {
+    keychainWriteCheckStep(connectionSetupSecurityExit(keychainReadArgs(item)), token);
+  } catch (error) {
+    if (error instanceof ConnectionSetupError) throw new ConnectionSetupError(`${error.message}${lost}`);
+    throw error;
+  }
 }
 
 /**
  * Reads a connection login from the macOS Keychain. Throws a classified
  * `TokenResolutionError` with fixed text: a read's stdout is the login.
+ * `wait: "setup"` is for an interactive setup command: no timeout (see
+ * `connectionSetupSecurityExit`). Runs and syncs use the bounded default.
  */
-export function readConnectionLoginSync(sourceName: string, item: KeychainItem): string {
+export function readConnectionLoginSync(sourceName: string, item: KeychainItem, wait: "bounded" | "setup" = "bounded"): string {
   if (connectionKeychainLockStateSync() === "locked") throw keychainLockedError(sourceName);
+  if (wait === "setup") return keychainReadStep(sourceName, connectionSetupSecurityExit(keychainReadArgs(item)));
   const invocation = connectionKeychainInvocation(item);
   const exit = connectionSetupExit(invocation.executable, [...invocation.args], { env: invocation.env, timeout: invocation.timeoutMs });
   return keychainReadStep(sourceName, exit);
@@ -1551,7 +1587,7 @@ export function readConnectionLoginSync(sourceName: string, item: KeychainItem):
 
 export type KeychainInvocation = Readonly<{ executable: string; args: readonly string[]; env: NodeJS.ProcessEnv; timeoutMs: number }>;
 
-/** The `security` read of a connection login, for the synchronous and the watcher's owned reader alike. */
+/** The bounded `security` read of a connection login in runs and syncs, for the synchronous and the watcher's owned reader alike. */
 export function connectionKeychainInvocation(item: KeychainItem): KeychainInvocation {
   return {
     executable: keychainExecutable(childEnv()),
@@ -1587,14 +1623,10 @@ function assertKeychainNotLockedForSetup(): void {
   if (connectionKeychainLockStateSync() === "locked") throw new ConnectionSetupError(KEYCHAIN_LOCKED_SETUP_MESSAGE);
 }
 
-/** Deletes a connection login; an item that is already gone counts as done. */
+/** Deletes a connection login; an item that is already gone counts as done. Waits for `security`. */
 export function deleteConnectionLogin(item: KeychainItem): "deleted" | "absent" {
   assertKeychainNotLockedForSetup();
-  const exit = connectionSetupExit(keychainExecutable(childEnv()), keychainDeleteArgs(item), {
-    env: sanitizedHostExecutionEnv(projectRoot(), childEnv()),
-    timeout: KEYCHAIN_CALL_TIMEOUT_MS,
-  });
-  return keychainDeleteStep(exit);
+  return keychainDeleteStep(connectionSetupSecurityExit(keychainDeleteArgs(item)));
 }
 
 /** A refusal before `op` runs. Its message is fixed text, never a value read. */

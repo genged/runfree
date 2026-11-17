@@ -7309,7 +7309,7 @@ describe("google-service-account sources", () => {
 describe("1password connection sources", () => {
   const SA_TOKEN = `ops_${"S".repeat(48)}.sentinel-sa-token`;
   const CONNECTION_ENTRY = { type: "1password", keychain: { service: "runfree.credential-source", account: "automation" }, createdAt: "x" };
-  type Call = { command: "security" | "op" | "osascript"; args: string[]; input?: string; env: NodeJS.ProcessEnv; cwd?: string };
+  type Call = { command: "security" | "op" | "osascript"; args: string[]; input?: string; env: NodeJS.ProcessEnv; cwd?: string; timeout?: number };
 
   function installFakeKeychainAndOp(options: {
     stored?: Map<string, string>;
@@ -7337,7 +7337,7 @@ describe("1password connection sources", () => {
     const securityPath = path.join(bin, "security");
     registerFakeCommand(securityPath, (args, spawnOptions) => {
       const input = spawnOptions.input === undefined ? undefined : spawnInputText(spawnOptions.input);
-      calls.push({ command: "security", args, ...(input === undefined ? {} : { input }), env: envFromSpawnOptions(spawnOptions) });
+      calls.push({ command: "security", args, ...(input === undefined ? {} : { input }), env: envFromSpawnOptions(spawnOptions), timeout: spawnOptions.timeout });
       if (args[0] === "find-generic-password") {
         if (options.readTimeout) return spawnTimeoutResult("security");
         if (options.readStatus !== undefined) return spawnResult({ status: options.readStatus, stderr: options.readStderr ?? "" });
@@ -7347,6 +7347,10 @@ describe("1password connection sources", () => {
       if (args[0] === "-i") {
         if (options.writeStatus !== undefined) return spawnResult({ status: options.writeStatus });
         const match = /-a (\S+) .* -w (\S+)\n$/.exec(input ?? "");
+        // Like the real Keychain: an add without -U on an existing item fails.
+        if (match && stored.has(match[1]) && !/^add-generic-password -U /.test(input ?? "")) {
+          return spawnResult({ status: 45, stderr: "The specified item already exists in the keychain." });
+        }
         if (match) stored.set(match[1], options.keep ? options.keep(match[2]) : match[2]);
         return spawnResult();
       }
@@ -7407,6 +7411,14 @@ describe("1password connection sources", () => {
     for (const text of texts) expect(text).not.toContain("sentinel-sa-token");
   }
 
+  // Setup commands never kill `security`: a macOS dialog can be open, and a
+  // kill then can wedge securityd. Every setup `security` call has no timeout.
+  function expectSetupSecurityCallsWait(calls: Call[]): void {
+    const security = calls.filter((call) => call.command === "security");
+    expect(security.length).toBeGreaterThan(0);
+    for (const call of security) expect(call.timeout, `${call.args[0]} must wait for security`).toBeUndefined();
+  }
+
   describe("registry entries", () => {
     test("a registry 1password connection loads strictly and shows without reading the Keychain", async () => {
       writeSourceRegistry({ automation: { ...CONNECTION_ENTRY, createdAt: "2026-10-30T00:00:00.000Z" } });
@@ -7461,14 +7473,15 @@ describe("1password connection sources", () => {
       expect(result.status, result.stderr).toBe(0);
       expect(result.stdout).toContain('checking with 1Password... ok: can read vault "Automation"; never asks');
       expect(result.stdout).toContain("automation: saved (login kept in your macOS Keychain)");
-      expect(fake.calls.map((call) => `${call.command} ${call.args[0]}`)).toEqual(["op whoami", "op vault", "security -i", "security find-generic-password"]);
+      expect(fake.calls.map((call) => `${call.command} ${call.args[0]}`)).toEqual(["op whoami", "op vault", "security delete-generic-password", "security -i", "security find-generic-password"]);
+      expectSetupSecurityCallsWait(fake.calls);
       for (const call of fake.calls) expect(call.args.join(" ")).not.toContain(SA_TOKEN);
       for (const call of fake.calls.filter((entry) => entry.command === "op")) {
         expect(call.env.OP_SERVICE_ACCOUNT_TOKEN).toBe(SA_TOKEN);
         expect(call.env.OP_BIOMETRIC_UNLOCK_ENABLED).toBe("false");
       }
-      const securityCall = fake.calls.find((call) => call.command === "security");
-      expect(securityCall?.input).toContain(`-w ${SA_TOKEN}\n`);
+      const securityCall = fake.calls.find((call) => call.command === "security" && call.args[0] === "-i");
+      expect(securityCall?.input).toBe(`add-generic-password -s runfree.credential-source -a automation -l runfree-source-automation -T /usr/bin/security -w ${SA_TOKEN}\n`);
       expect(securityCall?.env.OP_SERVICE_ACCOUNT_TOKEN).toBeUndefined();
       expect(fake.stored.get("automation")).toBe(SA_TOKEN);
       expect(JSON.parse(sourceRegistryText())).toEqual({ automation: { type: "1password", keychain: { service: "runfree.credential-source", account: "automation" }, createdAt: expect.any(String) } });
@@ -7528,7 +7541,7 @@ describe("1password connection sources", () => {
       const first = await runAdmin(addConnection(), connectionEnv(truncating));
       expect(first.status).not.toBe(0);
       expect(first.stderr).toContain("the macOS Keychain did not keep the login as given; run the command again");
-      expect(truncating.calls.map((call) => `${call.command} ${call.args[0]}`)).toEqual(["op whoami", "op vault", "security -i", "security find-generic-password"]);
+      expect(truncating.calls.map((call) => `${call.command} ${call.args[0]}`)).toEqual(["op whoami", "op vault", "security delete-generic-password", "security -i", "security find-generic-password"]);
       expect(sourceRegistryText()).toBe("");
       expectNoSentinel(first.stdout, first.stderr);
       const working = installFakeKeychainAndOp({ stored: truncating.stored });
@@ -7549,6 +7562,15 @@ describe("1password connection sources", () => {
       const retry = await runAdmin(addConnection(), connectionEnv(working));
       expect(retry.status, retry.stderr).toBe(0);
       expect(working.stored.get("automation")).toBe(SA_TOKEN);
+    });
+
+    test("a leftover Keychain item with no registry entry is deleted, then the login is added", async () => {
+      const fake = installFakeKeychainAndOp({ stored: new Map([["automation", `ops_${"L".repeat(48)}`]]) });
+      const result = await runAdmin(addConnection(), connectionEnv(fake));
+      expect(result.status, result.stderr).toBe(0);
+      expect(fake.calls.filter((call) => call.command === "security").map((call) => call.args[0])).toEqual(["delete-generic-password", "-i", "find-generic-password"]);
+      expect(fake.stored.get("automation")).toBe(SA_TOKEN);
+      expect(JSON.parse(sourceRegistryText())).toHaveProperty("automation");
     });
 
     test("op stderr that echoes the token is redacted", async () => {
@@ -7579,7 +7601,7 @@ describe("1password connection sources", () => {
     const rotate = (token: ConnectionTokenInput = { kind: "stdin", text: SA_TOKEN }) =>
       () => sourceLoginIntent({ name: "automation", token });
 
-    test("rotation verifies the new token before the Keychain update, and never rewrites the registry", async () => {
+    test("rotation verifies the new token, then deletes the old item and adds the new one, and never rewrites the registry", async () => {
       writeSourceRegistry({ automation: CONNECTION_ENTRY });
       const fake = installFakeKeychainAndOp({ stored: new Map([["automation", OLD_TOKEN]]) });
       const registryBefore = sourceRegistryText();
@@ -7588,12 +7610,67 @@ describe("1password connection sources", () => {
       expect(result.stdout).toContain('checking with 1Password... ok: can read vault "Automation"; never asks');
       expect(result.stdout).toContain("automation: login replaced");
       expect(result.stdout).toContain("used by: none");
-      expect(fake.calls.map((call) => `${call.command} ${call.args[0]}`)).toEqual(["op whoami", "op vault", "security -i", "security find-generic-password"]);
+      // Delete then add: an update (-U) of an existing item with -T makes
+      // macOS ask to change the item's access permissions.
+      expect(fake.calls.map((call) => `${call.command} ${call.args[0]}`)).toEqual(["op whoami", "op vault", "security delete-generic-password", "security -i", "security find-generic-password"]);
+      expect(fake.calls.find((call) => call.command === "security")?.args).toEqual(["delete-generic-password", "-s", "runfree.credential-source", "-a", "automation"]);
+      expect(fake.calls.find((call) => call.args[0] === "-i")?.input).toBe(`add-generic-password -s runfree.credential-source -a automation -l runfree-source-automation -T /usr/bin/security -w ${SA_TOKEN}\n`);
+      expectSetupSecurityCallsWait(fake.calls);
       for (const call of fake.calls) expect(call.args.join(" ")).not.toContain(SA_TOKEN);
-      expect(fake.calls.find((call) => call.command === "security")?.input).toContain("add-generic-password -U ");
       expect(fake.stored.get("automation")).toBe(SA_TOKEN);
       expect(sourceRegistryText()).toBe(registryBefore);
       expectNoSentinel(result.stdout, result.stderr);
+    });
+
+    test("an add that fails after the delete says the old login is gone and names the fix; a rerun restores the login", async () => {
+      writeSourceRegistry({ automation: CONNECTION_ENTRY });
+      writeTokenConfig({ github: { source: "1password-via", ref: "op://Automation/github/token", via: "automation" } });
+      const failing = installFakeKeychainAndOp({ stored: new Map([["automation", OLD_TOKEN]]), writeStatus: 1 });
+      const registryBefore = sourceRegistryText();
+      const first = await runAdmin(rotate(), connectionEnv(failing));
+      expect(first.status).not.toBe(0);
+      expect(first.stderr).toContain(
+        'the macOS Keychain refused to save the login; the old login is already deleted, so source "automation" has no login until you run: runfree credential source login automation',
+      );
+      expect(first.stdout).not.toContain("login replaced");
+      expect(failing.stored.has("automation")).toBe(false);
+      // The source and its bindings stay: the rerun needs them.
+      expect(sourceRegistryText()).toBe(registryBefore);
+      expect(readTokenConfig()).toHaveProperty("github");
+      expectNoSentinel(first.stdout, first.stderr);
+      const working = installFakeKeychainAndOp({ stored: failing.stored });
+      const retry = await runAdmin(rotate(), connectionEnv(working));
+      expect(retry.status, retry.stderr).toBe(0);
+      expect(working.calls.filter((call) => call.command === "security").map((call) => call.args[0])).toEqual(["delete-generic-password", "-i", "find-generic-password"]);
+      expect(working.stored.get("automation")).toBe(SA_TOKEN);
+    });
+
+    test("a read-back mismatch after the delete also says the old login is gone", async () => {
+      writeSourceRegistry({ automation: CONNECTION_ENTRY });
+      const truncating = installFakeKeychainAndOp({ stored: new Map([["automation", OLD_TOKEN]]), keep: (token) => token.slice(0, 40) });
+      const result = await runAdmin(rotate(), connectionEnv(truncating));
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toContain("the macOS Keychain did not keep the login as given; run the command again");
+      expect(result.stderr).toContain('the old login is already deleted, so source "automation" has no login until you run: runfree credential source login automation');
+      expectNoSentinel(result.stdout, result.stderr);
+    });
+
+    test("a refused delete leaves the old login in place and adds nothing", async () => {
+      writeSourceRegistry({ automation: CONNECTION_ENTRY });
+      const fake = installFakeKeychainAndOp({ stored: new Map([["automation", OLD_TOKEN]]), deleteStatus: 36 });
+      const result = await runAdmin(rotate(), connectionEnv(fake));
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toContain("the macOS Keychain refused to delete the old login; nothing was changed");
+      expect(fake.calls.filter((call) => call.command === "security").map((call) => call.args[0])).toEqual(["delete-generic-password"]);
+      expect(fake.stored.get("automation")).toBe(OLD_TOKEN);
+    });
+
+    test("rotation of a login already missing from the Keychain adds it", async () => {
+      writeSourceRegistry({ automation: CONNECTION_ENTRY });
+      const fake = installFakeKeychainAndOp();
+      const result = await runAdmin(rotate(), connectionEnv(fake));
+      expect(result.status, result.stderr).toBe(0);
+      expect(fake.stored.get("automation")).toBe(SA_TOKEN);
     });
 
     test("rotation lists the bindings that use the connection", async () => {
@@ -7651,6 +7728,7 @@ describe("1password connection sources", () => {
       expect(result.status, result.stderr).toBe(0);
       expect(result.stdout).toContain('automation: ok: can read vault "Automation"; never asks');
       expect(fake.calls.map((call) => `${call.command} ${call.args[0]}`)).toEqual(["security find-generic-password", "op whoami", "op vault"]);
+      expectSetupSecurityCallsWait(fake.calls);
       for (const call of fake.calls.filter((entry) => entry.command === "op")) expect(call.env.OP_SERVICE_ACCOUNT_TOKEN).toBe(SA_TOKEN);
       expectNoSentinel(result.stdout, result.stderr);
     });
@@ -7683,6 +7761,9 @@ describe("1password connection sources", () => {
       const removed = await runAdmin(() => sourceRemoveIntent({ name: "automation" }), connectionEnv(fake));
       expect(removed.status).not.toBe(0);
       expect(removed.stderr).toContain("the macOS login Keychain is locked; unlock it (log in to the Mac) and run the command again");
+      const added = await runAdmin(() => sourceAddOnePasswordConnectionIntent({ name: "fresh", token: { kind: "stdin", text: SA_TOKEN } }), connectionEnv(fake));
+      expect(added.status).not.toBe(0);
+      expect(added.stderr).toContain("the macOS login Keychain is locked; unlock it (log in to the Mac) and run the command again");
       expect(fake.calls.filter((call) => call.command === "security")).toEqual([]);
       expect(fake.stored.get("automation")).toBe(SA_TOKEN);
       expect(JSON.parse(sourceRegistryText())).toHaveProperty("automation");
@@ -7726,6 +7807,7 @@ describe("1password connection sources", () => {
       expect(result.status, result.stderr).toBe(0);
       expect(result.stdout).toContain("automation: login deleted from the macOS Keychain");
       expect(fake.calls.map((call) => `${call.command} ${call.args[0]}`)).toEqual(["security delete-generic-password"]);
+      expectSetupSecurityCallsWait(fake.calls);
       expect(fake.stored.has("automation")).toBe(false);
       expect(JSON.parse(sourceRegistryText())).toEqual({});
     });
@@ -7896,6 +7978,8 @@ describe("1password connection sources", () => {
       const result = await runAdmin(sync, syncEnv(fake, docker, { OP_ACCOUNT: "personal.1password.com", OP_SESSION_x: "s", OP_SERVICE_ACCOUNT_TOKEN: "ops_from_the_host_env" }));
       expect(result.status, result.stderr).toBe(0);
       expect(fake.calls.map((call) => `${call.command} ${call.args[0]}`)).toEqual(["security find-generic-password", "op read"]);
+      // A sync never asks, so its Keychain read keeps the bounded wait.
+      expect(fake.calls.find((call) => call.command === "security")?.timeout).toBe(10_000);
       const opRead = fake.calls.find((call) => call.command === "op");
       expect(opRead?.args).toEqual(["read", "op://Automation/github/token"]);
       expect(opRead?.env.OP_SERVICE_ACCOUNT_TOKEN).toBe(SA_TOKEN);
@@ -8433,6 +8517,7 @@ describe("1password connection sources", () => {
       const result = await underRule(() => runAdmin(sync, ruleEnv(fake, docker)));
       expect(result.status, result.stderr).toBe(0);
       expect(fake.calls.map((call) => `${call.command} ${call.args[0]}`)).toEqual(["security find-generic-password", "op read"]);
+      expect(fake.calls.find((call) => call.command === "security")?.timeout).toBe(10_000);
       expectNoSentinel(result.stdout, result.stderr, fs.readFileSync(tokenStatusFilePath(), "utf8"));
     });
 

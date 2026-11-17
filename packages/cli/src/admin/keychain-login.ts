@@ -7,6 +7,7 @@ import { TokenResolutionError } from "../token-resolution.ts";
 import type { ProviderExit } from "./admin-core.ts";
 
 export const KEYCHAIN_SERVICE = "runfree.credential-source";
+/** The bounded wait of a run's or a sync's Keychain read only: setup commands never kill `security`. */
 export const KEYCHAIN_CALL_TIMEOUT_MS = 10_000;
 const SECURITY_PATH = "/usr/bin/security";
 const TOKEN_SHAPE = /^ops_[A-Za-z0-9_.+/=-]+$/;
@@ -145,9 +146,12 @@ export function keychainReadStep(sourceName: string, exit: ProviderExit): string
   throw keychainError("definitive", "keychain-unreadable", `${subject} cannot be read from the macOS Keychain`);
 }
 
+// An add, never an update (-U): an update of an existing item with -T
+// changes the item's access list, and macOS asks the user to allow that
+// change. A replacement deletes the old item first, then adds.
 export function keychainWriteRequest(item: KeychainItem, token: string): Readonly<{ args: string[]; input: string }> {
   assertServiceAccountTokenShape(token);
-  const input = `add-generic-password -U -s ${item.service} -a ${item.account} -l runfree-source-${item.account} -T ${SECURITY_PATH} -w ${token}\n`;
+  const input = `add-generic-password -s ${item.service} -a ${item.account} -l runfree-source-${item.account} -T ${SECURITY_PATH} -w ${token}\n`;
   if (Buffer.byteLength(input, "utf8") > WRITE_LINE_MAX_BYTES) throw new ConnectionSetupError("the login is too long to save in the macOS Keychain");
   return { args: ["-i"], input };
 }

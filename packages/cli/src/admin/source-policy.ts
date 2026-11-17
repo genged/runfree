@@ -486,8 +486,10 @@ export async function sourceAddOnePasswordConnectionIntent(input: SourceOnePassw
 
 // Typed enforcement for `runfree credential source login <name>`: replaces a
 // connection's stored login. The new token is checked with 1Password before
-// the Keychain update, so a rejected token leaves the old login in place. The
-// registry is not written: the Keychain item name does not change.
+// the Keychain is touched, so a rejected token leaves the old login in place.
+// Then the old item is deleted and the new one added. The registry is not
+// written: the Keychain item name does not change, so after an add that
+// fails the source and its bindings stay, and a rerun restores the login.
 export async function sourceLoginIntent(input: SourceOnePasswordInput): Promise<void> {
   const { name } = input;
   if (!name) die("usage: runfree credential source login <name> [--token-stdin]");
@@ -502,7 +504,7 @@ export async function sourceLoginIntent(input: SourceOnePasswordInput): Promise<
     assertServiceAccountTokenShape(token);
     const vaults = verifyConnectionLogin(token);
     console.log(`checking with 1Password... ok: can read ${vaultLine(vaults)}; never asks`);
-    writeConnectionLogin(source.keychain, token);
+    writeConnectionLogin(source.keychain, token, { sourceName: name });
   } catch (error) {
     if (error instanceof ConnectionSetupError) die(error.message);
     throw error;
@@ -553,7 +555,7 @@ export function sourceCheckIntent(input: SourceNameInput): void {
   }
   let token: string;
   try {
-    token = readConnectionLoginSync(name, source.keychain);
+    token = readConnectionLoginSync(name, source.keychain, "setup");
   } catch (error) {
     if (error instanceof TokenResolutionError) die(`${error.safeMessage}\n${error.code === KEYCHAIN_LOCKED ? `fix: ${KEYCHAIN_UNLOCK_FIX}` : fix}`);
     throw error;

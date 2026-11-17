@@ -507,21 +507,36 @@ Tests: [credential-interaction.test.ts](../packages/cli/src/admin/credential-int
   token before Runfree reads or shows it.
 - Setup and rotation check the new token with 1Password before it is
   written. A rejected token leaves the old login in place.
+- A write deletes any item with the login's name, then adds the new item
+  with the same trust in `/usr/bin/security`. It never updates an item in
+  place (`-U`): an update that sets the trusted apps makes macOS ask the user
+  to change the item's access permissions. A refused delete changes nothing.
+  When a rotation's add or read-back fails after the delete, the source has
+  no login, and the message says so with the fix
+  (`runfree credential source login <name>`); the registry and the bindings
+  are not changed.
+- The setup commands (`credential source 1password`, `login`, `check`, and
+  `remove`) wait for every `security` call to exit and never stop it, also
+  without a terminal. Credential syncs and runs never ask, and their
+  Keychain reads keep a timeout.
 - Before each `security` read, write, or delete of a login, a status check
   (`SecKeychainGetStatus` through `/usr/bin/osascript`, which never asks to
   unlock) looks at the default keychain. When it reports locked, `security`
   does not start: a read fails as a transient locked-Keychain failure, and a
   write or delete refuses with no change. When the check cannot tell,
-  `security` runs with its timeout. Limit: the Keychain can lock between the
-  check and the call, and an unknown state still runs `security`; in both
-  cases a call can wait on the unlock dialog and be stopped at the timeout.
+  `security` runs. Limit: the Keychain can lock between the check and the
+  call, and an unknown state still runs `security`; in both cases a call can
+  wait on the unlock dialog. A sync or run read is then stopped at its
+  timeout; a setup command waits, and waits until the user stops it when no
+  person sees the dialog.
 
 Why: a service account token reads every vault it was granted, with no
 person in the loop. A `security` call on a locked Keychain shows an unlock
-dialog while the screen is unlocked, and stopping a call that waits on that
-dialog can leave macOS asking for the Keychain password in a loop.
+dialog while the screen is unlocked, and an update of an item's trusted apps
+shows an access dialog. Stopping a call that waits on either dialog can
+leave macOS asking for the Keychain password in a loop.
 
-Enforced: [keychain-login.ts](../packages/cli/src/admin/keychain-login.ts) `keychainWriteRequest`, `keychainReadStep`, `keychainLockStateFromExit`, [admin-core.ts](../packages/cli/src/admin/admin-core.ts) `connectionKeychainLockCheck`, [onepassword-connection.ts](../packages/cli/src/admin/onepassword-connection.ts) `connectionOpEnv`, `redactLogin`  
+Enforced: [keychain-login.ts](../packages/cli/src/admin/keychain-login.ts) `keychainWriteRequest`, `keychainReadStep`, `keychainLockStateFromExit`, [admin-core.ts](../packages/cli/src/admin/admin-core.ts) `writeConnectionLogin`, `connectionSetupSecurityExit`, `connectionKeychainLockCheck`, [onepassword-connection.ts](../packages/cli/src/admin/onepassword-connection.ts) `connectionOpEnv`, `redactLogin`  
 Tests: [keychain-login.test.ts](../packages/cli/src/admin/keychain-login.test.ts), [onepassword-connection.test.ts](../packages/cli/src/admin/onepassword-connection.test.ts), [credential-source-reader.test.ts](../packages/cli/src/admin/credential-source-reader.test.ts), [admin-token-policy.test.ts](../scripts/admin-token-policy.test.ts).
 
 ## Git Over HTTPS
