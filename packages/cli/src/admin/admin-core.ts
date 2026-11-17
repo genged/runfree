@@ -2093,11 +2093,20 @@ export function adminDockerClient(): DockerClient {
   return createDockerClient({ capture: runCapture });
 }
 
-export function describeSource(source: TokenSource | undefined): string {
+// A stored 1Password reference is host-written text that is only checked for
+// its `op://` prefix. Replace terminal control bytes and bidirectional
+// overrides so printing it cannot rewrite or reorder the terminal.
+export function printableSecretRef(ref: string): string {
+  return ref.replace(/[\u0000-\u001f\u007f-\u009f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/gu, "?");
+}
+
+export type DescribeSourceOptions = { showRefs?: boolean };
+
+export function describeSource(source: TokenSource | undefined, options: DescribeSourceOptions = {}): string {
   if (!source) return "unconfigured";
   if (source.source === "env") return `env ${source.env}`;
   const via = (source.source === "1password" || source.source === "named") && source.via !== undefined ? ` via ${source.via}` : "";
-  if (source.source === "1password") return `1password${via}`;
+  if (source.source === "1password") return `1password${options.showRefs ? ` ${printableSecretRef(source.ref)}` : ""}${via}`;
   if (source.source === "named") return `source ${source.name}${via}`;
   if (source.source === "cmd") return "legacy command (unsupported)";
   return "legacy local-file (unsupported)";
@@ -4631,7 +4640,7 @@ export type CredentialUnlinkInput = { name: string; host: string; header?: strin
 export type CredentialRemoveInput = { name: string; reloadProxy: boolean };
 export type CredentialSetSourceInput = { name: string; tokenSource: TokenSourceSelection; refreshEvery?: string; replaceSource: boolean; sync: boolean };
 export type CredentialClearSourceInput = { name: string };
-export type CredentialStatusInput = { name?: string };
+export type CredentialStatusInput = { name?: string; showRefs?: boolean };
 export type CredentialSyncInput = {
   verbose: boolean;
   watch: boolean;
@@ -4662,6 +4671,7 @@ export type CredentialSyncInput = {
 // --- Source: typed intents + enforcement ------------------------------------
 
 export type SourceNameInput = { name: string };
+export type SourceShowInput = SourceNameInput & { showRefs?: boolean };
 
 // `source add` typed inputs. The yargs front-end performs the `--` split (command
 // form) and flag parsing (jwt form); enforcement re-validates everything. JWT

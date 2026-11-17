@@ -134,7 +134,7 @@ Credential commands:
   runfree credential remove <name>
   runfree credential set-source <name> [--from-env ENV | --from-1password op://... | --from-source <name>]
   runfree credential clear-source <name>
-  runfree credential status [<name>]
+  runfree credential status [<name>] [--show-refs]
   runfree credential sync [--verbose] [--watch]`;
 }
 
@@ -437,7 +437,7 @@ Credentials:
   runfree credential source add google-service-account <name> --key-json-from-1password op://... --scope <scope> [--ttl 55m]
       Add a reusable host-owned Google service-account source (RS256 JWT, key JSON stays in 1Password)
   runfree credential source list
-  runfree credential source show <name>
+  runfree credential source show <name> [--show-refs]
   runfree credential source remove <name>
   runfree credential add <name> --host <host> [--header <header>] [--scheme bearer|raw] [--path-prefix /path/] [--description <text>] [--from-env ENV | --from-1password op://... | --from-source <name> | --from-stdin] [--refresh-every 15m] [--replace-source] [--no-sync] [--no-reload]
       Create a credential destination on an already-allowlisted host and optionally bind its source
@@ -449,7 +449,7 @@ Credentials:
       Remove a manually managed credential, source binding, and proxy value
   runfree credential set-source <name> [--from-env ENV | --from-1password op://... | --from-source <name> | --from-stdin] [--refresh-every 15m] [--replace-source] [--no-sync]
   runfree credential clear-source <name>
-  runfree credential status [<name>]
+  runfree credential status [<name>] [--show-refs]
   runfree credential sync [--verbose] [--watch] [--quiet] [--delay-first-sync] [--no-cache-source-secrets]
 
 Services (curated or user-defined host bundles, optionally carrying a credential):
