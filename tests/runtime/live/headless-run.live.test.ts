@@ -130,6 +130,8 @@ type StubDirective = Readonly<{
   post?: string;
   /** The stub's exit code, after it prints its success `result` line. */
   exitCode?: number;
+  /** After the `result` line, stay up without output until `<tag>/release` exists. */
+  lingerAfterResult?: boolean;
 }>;
 
 /**
@@ -186,6 +188,15 @@ if (typeof directive.post === "string") {
 const exitCode = Number.isSafeInteger(directive.exitCode) ? directive.exitCode : 0;
 fs.writeSync(1, JSON.stringify({ type: "system", subtype: "init", session_id: "live-stub" }) + "\\n");
 fs.writeSync(1, JSON.stringify({ type: "result", subtype: "success", is_error: false, result: "live headless stub finished " + tag }) + "\\n");
+if (directive.lingerAfterResult === true) {
+  record("result-printed", "");
+  let waited = 0;
+  while (!fs.existsSync(dir + "/release")) {
+    if (waited > 20 * 60 * 1000) process.exit(124);
+    sleep(100);
+    waited += 100;
+  }
+}
 process.exit(exitCode);
 `;
 
@@ -692,6 +703,40 @@ describe("headless runs (runfree run) on the real backend", () => {
     } finally {
       await abandonRun(run, fixture, tag);
       if (standing) await standing.stop();
+      await forceCleanSessions(fixture);
+    }
+  }, TEST_TIMEOUT_MS);
+
+  coreTest("an agent that prints its final result but does not exit is stopped after the grace, keeping its success", async () => {
+    const tag = "linger";
+    let run: StartedRun | undefined;
+    try {
+      // The bound is far above the 30 s grace, so only the grace can end it.
+      const started = Date.now();
+      run = startRun(fixture, writePrompt(fixture, { tag, lingerAfterResult: true }), ["--timeout", "300s"]);
+      const outcome = await finishRun(run, 300_000 + RUN_READY_TIMEOUT_MS, "lingering run");
+      const elapsedMs = Date.now() - started;
+      expect(fs.existsSync(path.join(stubDir(fixture, tag), "result-printed")), "the stub never printed its result").toBe(true);
+      expect(fs.existsSync(path.join(stubDir(fixture, tag), "release")), "the stub was released, so it exited on its own").toBe(false);
+      expect(outcome.status, `the lingering run did not exit 0: ${describeOutput(outcome.output, 4000)}`).toBe(0);
+      expect(elapsedMs, "the lingering run ran into its timeout instead of the grace").toBeLessThan(300_000);
+      expect(outcome.stdout, "the run printed the agent's final message").toContain(`live headless stub finished ${tag}`);
+      expect(outcome.stdout, "the run did not say it stopped the agent")
+        .toContain("note: the agent did not exit after its final result, so Runfree stopped its container");
+      const recorded = readRunJson(outcome);
+      expect(recorded, "lingering run.json").toMatchObject({
+        outcome: "success",
+        exitCode: 0,
+        teardown: "confirmed",
+        stoppedAfterFinalEvent: true,
+        streamsDrained: true,
+      });
+      expect(recorded.containerId, "the lingering run recorded no container").toBeDefined();
+      expect(containerExists(recorded.containerId as string), "the lingering run's container outlived the run").toBe(false);
+      expect(inboxPrompts(paths), "the lingering run's prompt file outlived the run").toEqual([]);
+      expect(runLockPresent(paths), "the run lock outlived the stopped run").toBe(false);
+    } finally {
+      await abandonRun(run, fixture, tag);
       await forceCleanSessions(fixture);
     }
   }, TEST_TIMEOUT_MS);

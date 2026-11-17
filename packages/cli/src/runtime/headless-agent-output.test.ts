@@ -442,6 +442,7 @@ describe("pi --mode json parser", () => {
       contentField: "content",
       textPartType: "text",
       textField: "text",
+      settledType: "agent_settled",
     });
   });
 
@@ -546,5 +547,85 @@ describe("decideHeadlessOutcome", () => {
     parser.push(claudeStream(SUCCESS_EVENT));
     expect(decideHeadlessOutcome({ agentStatus: 0, streamsDrained: true, parser: parser.result() }))
       .toEqual({ outcome: "unverified", exitCode: 1 });
+  });
+});
+
+describe("turnEnded: the agent's last line closes its turn", () => {
+  function pushed(format: HeadlessOutputFormat, ...chunks: Buffer[]): ReturnType<typeof createHeadlessOutputParser> {
+    const parser = createHeadlessOutputParser(format);
+    for (const chunk of chunks) parser.push(chunk);
+    return parser;
+  }
+  const claudeError = JSON.stringify({ type: "result", subtype: "error_during_execution", is_error: true });
+
+  test.each([
+    ["claude success result", "claude-stream-json", claudeStream(SUCCESS_EVENT)],
+    ["claude error result", "claude-stream-json", claudeStream(claudeError)],
+    ["codex turn.completed", "codex-exec-json", CODEX_SUCCESS],
+    ["codex turn.failed", "codex-exec-json", CODEX_FAILURE],
+    ["pi agent_settled after a success", "pi-json", PI_SUCCESS],
+    ["pi agent_settled after failed retries", "pi-json", PI_FAILURE],
+  ] as const)("%s ends the turn, before the stream ends", (_label, format, bytes) => {
+    expect(pushed(format, bytes).turnEnded()).toBe(true);
+  });
+
+  test.each([
+    ["no output", "claude-stream-json", Buffer.alloc(0)],
+    ["a claude assistant event", "claude-stream-json", claudeStream(JSON.stringify({ type: "assistant" }))],
+    ["a claude result without its newline yet", "claude-stream-json", Buffer.from(SUCCESS_EVENT)],
+    ["a codex reconnect error after turn.completed", "codex-exec-json", jsonLines([...CODEX_THREAD_START, CODEX_TURN_COMPLETED, { type: "error", message: "Reconnecting... 1/5" }])],
+    ["a pi agent_end that will retry", "pi-json", jsonLines([PI_HEADER, ...piRun(PI_FAILED_ASSISTANT, true)])],
+    ["a pi agent_end before agent_settled", "pi-json", jsonLines([PI_HEADER, ...piRun(piAssistant({}))])],
+    ["a claude result event read as codex", "codex-exec-json", claudeStream(SUCCESS_EVENT)],
+  ] as const)("%s does not end the turn", (_label, format, bytes) => {
+    expect(pushed(format, bytes).turnEnded()).toBe(false);
+  });
+
+  test("any byte after the closing line reopens the turn: a partial line, a garbage line, or another event", () => {
+    const end = claudeStream(SUCCESS_EVENT);
+    expect(pushed("claude-stream-json", end, Buffer.from("{")).turnEnded()).toBe(false);
+    expect(pushed("claude-stream-json", end, Buffer.from("garbage\n")).turnEnded()).toBe(false);
+    expect(pushed("claude-stream-json", end, claudeStream(JSON.stringify({ type: "assistant" }))).turnEnded()).toBe(false);
+    // A later closing line ends it again.
+    expect(pushed("claude-stream-json", end, Buffer.from("x\n"), end).turnEnded()).toBe(true);
+  });
+
+  test("a closing line split at every byte offset ends the turn only once its newline arrives (property)", () => {
+    const bytes = claudeStream(SUCCESS_EVENT);
+    for (let cut = 1; cut < bytes.length; cut += 1) {
+      const parser = pushed("claude-stream-json", bytes.subarray(0, cut));
+      expect(parser.turnEnded()).toBe(false);
+      parser.push(bytes.subarray(cut));
+      expect(parser.turnEnded()).toBe(true);
+    }
+  });
+
+  test("an overflow past the total cap never ends the turn", () => {
+    const parser = createHeadlessOutputParser("claude-stream-json", { totalCapBytes: 8 });
+    parser.push(claudeStream(SUCCESS_EVENT));
+    expect(parser.turnEnded()).toBe(false);
+  });
+});
+
+describe("decideHeadlessOutcome after Runfree stopped an agent that closed its turn", () => {
+  const success = parse(claudeStream(SUCCESS_EVENT));
+  const errorResult = parse(claudeStream(JSON.stringify({ type: "result", subtype: "success", is_error: true, result: "x" })));
+
+  test.each([
+    ["no status (the stop)", null, true, success, { outcome: "success", exitCode: 0 }],
+    ["SIGTERM death 143", 143, true, success, { outcome: "success", exitCode: 0 }],
+    ["SIGKILL death 137", 137, true, success, { outcome: "success", exitCode: 0 }],
+    ["its own exit 0", 0, true, success, { outcome: "success", exitCode: 0 }],
+    ["its own exit 2 stays a failure", 2, true, success, { outcome: "failed", exitCode: 2 }],
+    ["its own exit 127 stays a failure", 127, true, success, { outcome: "failed", exitCode: 1 }],
+    ["an error result is not a success", 143, true, errorResult, { outcome: "unverified", exitCode: 1 }],
+    ["an undrained stream is not a success", 143, false, success, { outcome: "unverified", exitCode: 1 }],
+  ] as const)("%s", (_label, agentStatus, streamsDrained, parser, expected) => {
+    expect(decideHeadlessOutcome({ agentStatus, streamsDrained, parser, stoppedAfterFinalEvent: true })).toEqual(expected);
+  });
+
+  test("without the stop, a signal death is still a failure", () => {
+    expect(decideHeadlessOutcome({ agentStatus: 143, streamsDrained: true, parser: success }))
+      .toEqual({ outcome: "failed", exitCode: 1 });
   });
 });

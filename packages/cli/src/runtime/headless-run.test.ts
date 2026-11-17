@@ -20,6 +20,7 @@ import {
   countHeadlessDenialEvents,
   countHeadlessDenials,
   decideHeadlessRunExit,
+  HEADLESS_FINAL_EVENT_GRACE_MS,
   runHeadlessAgent,
   type HeadlessRunDeps,
 } from "./headless-run.ts";
@@ -822,6 +823,136 @@ describe("one stop routine for every way a run ends (spec §3.5)", () => {
     expect(await run(h)).toBe(67);
     expect(runJson()).toMatchObject({ outcome: "signal", exitCode: 67, teardown: "confirmed", sessionId: SESSION_ID });
     expect(h.released()).toBe(true);
+  });
+});
+
+describe("an agent that closes its turn but does not exit", () => {
+  const ASSISTANT_LINE = `${JSON.stringify({ type: "assistant", message: { content: [] } })}\n`;
+
+  /**
+   * Prints `lines` (each after `gapMs`), then stays attached until the run
+   * cancels it, like a Claude process kept alive by a background job. The
+   * cancel runs the in-driver half of the stop routine and returns `stopStatus`.
+   */
+  function lingeringAgent(lines: readonly string[], options: Readonly<{ gapMs?: number; stopStatus?: number | null }> = {}): FakeLaunch {
+    return async (input, out) => {
+      input.headless.observer?.allocated({ sessionId: SESSION_ID, containerName: CONTAINER_NAME });
+      input.headless.observer?.containerCreated(CONTAINER_ID);
+      events.push("attached");
+      const { signal, escalate } = input.cancellation;
+      const cancelled = new Promise<void>((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
+      for (const line of lines) {
+        if (options.gapMs) await new Promise((resolve) => setTimeout(resolve, options.gapMs));
+        if (signal.aborted) break;
+        out.stdout(Buffer.from(line));
+      }
+      await cancelled;
+      events.push("session-file-delete", "stop");
+      await new Promise<void>((resolve) => {
+        if (escalate.aborted) resolve();
+        escalate.addEventListener("abort", () => resolve(), { once: true });
+        setTimeout(resolve, 50);
+      });
+      if (escalate.aborted) events.push("stop-now");
+      out.stdoutEnded?.();
+      return { status: options.stopStatus === undefined ? 143 : options.stopStatus, cancelled: true };
+    };
+  }
+
+  function withGrace(h: Harness, finalEventGraceMs: number): Harness {
+    return { ...h, deps: { ...h.deps, finalEventGraceMs } };
+  }
+
+  const stopped = ["launch", `lock-session:${SESSION_ID}`, "lock-container", "attached", "session-file-delete", "stop", "count-denials", "release"];
+
+  test("is stopped through the stop routine after the grace and keeps the success its final event reports", async () => {
+    const h = withGrace(harness({ launch: lingeringAgent([SUCCESS_LINE]) }), 20);
+    expect(await run(h)).toBe(0);
+    expect(events).toEqual(stopped);
+    expect(runJson()).toMatchObject({
+      outcome: "success",
+      exitCode: 0,
+      agentStatus: 143,
+      teardown: "confirmed",
+      stoppedAfterFinalEvent: true,
+      streamsDrained: true,
+    });
+    const dir = path.join(stateDir, "runs", runDirs()[0] as string);
+    expect(fs.readFileSync(path.join(dir, "result.md"), "utf8")).toBe("all done\n");
+    expect(stdout).toEqual([
+      "all done",
+      "note: the agent did not exit after its final result, so Runfree stopped its container",
+      `run record: ${dir}`,
+    ]);
+    expect(inboxPrompts()).toEqual([]);
+    expect(fs.existsSync(headlessRunLockPath(stateDir))).toBe(false);
+  });
+
+  test("a final error event stopped after the grace is unverified (1), not a success", async () => {
+    const errorLine = `${JSON.stringify({ type: "result", subtype: "error_during_execution", is_error: true })}\n`;
+    const h = withGrace(harness({ launch: lingeringAgent([errorLine]) }), 20);
+    expect(await run(h)).toBe(1);
+    expect(runJson()).toMatchObject({ outcome: "unverified", exitCode: 1, stoppedAfterFinalEvent: true });
+  });
+
+  test("its own failing exit during the stop stays a failure", async () => {
+    const h = withGrace(harness({ launch: lingeringAgent([SUCCESS_LINE], { stopStatus: 3 }) }), 20);
+    expect(await run(h)).toBe(3);
+    expect(runJson()).toMatchObject({ outcome: "failed", exitCode: 3, stoppedAfterFinalEvent: true });
+  });
+
+  test("output after the final event cancels the grace, so only the timeout ends the run", async () => {
+    // The result, then more output before the 60 ms grace ends: the turn is
+    // open again and no later closing line arrives.
+    const h = withGrace(harness({ launch: lingeringAgent([SUCCESS_LINE, ASSISTANT_LINE], { gapMs: 10 }) }), 60);
+    expect(await run(h, { timeoutMs: 200 })).toBe(67);
+    expect(runJson()).toMatchObject({ outcome: "timeout", exitCode: 67, stoppedAfterFinalEvent: false });
+  });
+
+  test("without a final event the run is never stopped by the grace", async () => {
+    const h = withGrace(harness({ launch: lingeringAgent([ASSISTANT_LINE]) }), 5);
+    expect(await run(h, { timeoutMs: 100 })).toBe(67);
+    expect(runJson()).toMatchObject({ outcome: "timeout", stoppedAfterFinalEvent: false });
+  });
+
+  test("a signal during that stop only shortens it: the outcome stays the final event's", async () => {
+    const h = withGrace(harness({ launch: lingeringAgent([SUCCESS_LINE]) }), 10);
+    const pending = run(h);
+    await until(() => events.includes("stop"));
+    h.signals.emit("SIGTERM");
+    expect(await pending).toBe(0);
+    expect(events).toContain("stop-now");
+    expect(runJson()).toMatchObject({ outcome: "success", exitCode: 0, stoppedAfterFinalEvent: true });
+  });
+
+  test("a deadline that passes during that stop is not a timeout", async () => {
+    let clockMs = Date.parse("2026-10-25T12:00:00.000Z");
+    const h = withGrace(harness({ launch: lingeringAgent([SUCCESS_LINE]) }), 10);
+    const pending = run({ ...h, deps: { ...h.deps, now: () => new Date(clockMs) } }, { timeoutMs: 1_000 });
+    await until(() => events.includes("stop"));
+    clockMs += 60_000;
+    expect(await pending).toBe(0);
+    expect(runJson()).toMatchObject({ outcome: "success", stoppedAfterFinalEvent: true });
+  });
+
+  test("an agent that exits on its own within the grace is not stopped, and the grace timer is cleared", async () => {
+    const armed: string[] = [];
+    const h = harness();
+    const deps: Partial<HeadlessRunDeps> = {
+      ...h.deps,
+      finalEventGraceMs: 30_000,
+      setTimer: (ms) => {
+        armed.push(`arm:${ms}`);
+        return () => armed.push("clear");
+      },
+    };
+    expect(await run({ ...h, deps })).toBe(0);
+    expect(armed).toEqual(["arm:30000", "clear"]);
+    expect(runJson()).toMatchObject({ outcome: "success", stoppedAfterFinalEvent: false });
+  });
+
+  test("the default grace is 30 seconds", () => {
+    expect(HEADLESS_FINAL_EVENT_GRACE_MS).toBe(30_000);
   });
 });
 
