@@ -52,6 +52,67 @@ export function assertServiceAccountTokenShape(token: string): void {
   }
 }
 
+// The lock check before every `security` call on a connection login. A
+// `security` call on a locked login Keychain shows the unlock dialog while
+// the screen is unlocked, and killing a `security` child that waits on that
+// dialog can leave securityd prompting in a loop. So a locked Keychain is
+// refused before `security` starts, and `security` runs only when the check
+// says unlocked or cannot tell. The check is `SecKeychainGetStatus` on the
+// default keychain through the JavaScript-for-Automation bridge: it reads the
+// status bits and never asks to unlock. Its child is not `security`, so its
+// timeout kill is safe.
+export type KeychainLockState = "locked" | "unlocked" | "unknown";
+export const KEYCHAIN_LOCK_CHECK_TIMEOUT_MS = 5_000;
+const OSASCRIPT_PATH = "/usr/bin/osascript";
+const UNLOCK_STATE_STATUS = 1; // kSecUnlockStateStatus
+const LOCK_CHECK_SCRIPT = [
+  'ObjC.import("Security");',
+  "function run() {",
+  "  const status = Ref();",
+  "  if ($.SecKeychainGetStatus(null, status) !== 0) return \"unknown\";",
+  `  return (status[0] & ${UNLOCK_STATE_STATUS}) ? "unlocked" : "locked";`,
+  "}",
+].join("\n");
+
+/**
+ * The lock check's executable, or undefined for no check. Under the test seam
+ * the check runs only when RUNFREE_TEST_OSASCRIPT_PATH names a fake; with no
+ * fake the state is unknown and nothing starts, so tests never run the real
+ * check on a Mac.
+ */
+export function keychainLockCheckExecutable(env: NodeJS.ProcessEnv): string | undefined {
+  if (!testSeam(env)) return OSASCRIPT_PATH;
+  return env.RUNFREE_TEST_OSASCRIPT_PATH || undefined;
+}
+
+export function keychainLockCheckArgs(): string[] {
+  return ["-l", "JavaScript", "-e", LOCK_CHECK_SCRIPT];
+}
+
+/** Any answer other than exactly locked or unlocked is unknown. */
+export function keychainLockStateFromExit(exit: ProviderExit): KeychainLockState {
+  if (exit.failure || exit.status !== 0) return "unknown";
+  const answer = exit.stdout.trim();
+  return answer === "locked" || answer === "unlocked" ? answer : "unknown";
+}
+
+/** A locked login Keychain: the same transient failure as a `security` read that reports it. */
+export function keychainLockedError(sourceName: string): TokenResolutionError {
+  return keychainError("transient", KEYCHAIN_LOCKED, lockedMessage(sourceName));
+}
+
+/** Fixed text for a setup step that found the Keychain locked before `security` ran. */
+export const KEYCHAIN_LOCKED_SETUP_MESSAGE = "the macOS login Keychain is locked; unlock it (log in to the Mac) and run the command again";
+
+export const KEYCHAIN_LOCKED = "keychain-locked";
+
+/** The fix for a locked Keychain: a new login would not help. */
+export const KEYCHAIN_UNLOCK_FIX = "unlock the macOS login Keychain (log in to the Mac), then run again";
+
+function lockedMessage(sourceName: string): string {
+  return `the login for source "${sourceName}" cannot be read (Keychain locked)`;
+}
+
 export function keychainReadArgs(item: KeychainItem): string[] {
   return ["find-generic-password", "-s", item.service, "-a", item.account, "-w"];
 }
@@ -79,7 +140,7 @@ export function keychainReadStep(sourceName: string, exit: ProviderExit): string
     throw keychainError("definitive", "keychain-login-missing", `${subject} is missing from the macOS Keychain`);
   }
   if (/interaction is not allowed|locked/i.test(exit.stderr)) {
-    throw keychainError("transient", "keychain-locked", `${subject} cannot be read (Keychain locked)`);
+    throw keychainError("transient", KEYCHAIN_LOCKED, lockedMessage(sourceName));
   }
   throw keychainError("definitive", "keychain-unreadable", `${subject} cannot be read from the macOS Keychain`);
 }

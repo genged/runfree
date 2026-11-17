@@ -207,9 +207,11 @@ nothing; only a binding's `--via` counts.
   may ask prints one refusal with the fix, and the run exits 65. When no
   binding may ask, each check then reads the login of each connection source
   the bindings use and checks it once with 1Password (`op whoami` with the
-  service account only). A login that cannot be read or that 1Password
-  refuses exits 65 with `runfree credential source login <name>`; a check
-  that cannot finish (no answer, a network failure) exits 65 with no fix.
+  service account only). A locked login Keychain exits 65 before any
+  Keychain read, with the fix to unlock it. Another login that cannot be
+  read, or a login that 1Password refuses, exits 65 with
+  `runfree credential source login <name>`; a check that cannot finish (no
+  answer, a network failure) exits 65 with no fix.
   With one connection source named `automation`, a binding refusal reads:
 
   ```text
@@ -819,6 +821,19 @@ runfree credential source remove automation
   source. It deletes the Keychain item first, then the registry entry. If
   the Keychain refuses the delete, nothing is removed; a rerun finishes a
   remove that stopped between the two steps.
+- Before each `security` call on a connection login, Runfree checks whether
+  the default keychain (normally the login Keychain) is locked. The check
+  reads the keychain status with `SecKeychainGetStatus` through
+  `/usr/bin/osascript` and never shows a dialog. When the Keychain is
+  locked, Runfree does not start `security`: a read fails as a locked
+  Keychain, and `credential source login` and `credential source remove`
+  refuse and change nothing. The fix is to unlock the Mac's login Keychain
+  (log in to the Mac). When the check cannot tell, Runfree runs `security`
+  with its usual 10-second limit. A `security` call on a locked Keychain can
+  show an unlock dialog while the screen is unlocked, and stopping that call
+  can leave macOS asking for the Keychain password again and again; the
+  check prevents that, except when the Keychain locks between the check and
+  the read or the check cannot tell.
 - A missing Keychain item or a revoked token is a definitive failure, so the
   proxy drops the value. A locked Keychain or a Keychain that does not answer
   is a short failure, so the proxy keeps the last good value.

@@ -171,16 +171,22 @@ describe("readCredentialSource through a connection", () => {
 
   // `security` and `op` are real scripts; the admin state only points the
   // reader at the fake `security` (the test seam needs RUNFREE_TEST_FAKE_DOCKER).
-  async function readThroughConnection(securityBody: string, opBody: string, lifetime: CredentialLifetime): Promise<{ result: Awaited<ReturnType<typeof readCredentialSource>>; log: string[] }> {
+  async function readThroughConnection(
+    securityBody: string,
+    opBody: string,
+    lifetime: CredentialLifetime,
+    lockCheckBody?: string,
+  ): Promise<{ result: Awaited<ReturnType<typeof readCredentialSource>>; log: string[] }> {
     const log = path.join(tmp, "calls.log");
     const security = script("security", `echo "security $1" >> '${log}'\n${securityBody}`);
+    const lockCheck = lockCheckBody === undefined ? {} : { RUNFREE_TEST_OSASCRIPT_PATH: script("osascript", `echo "osascript $1 $2" >> '${log}'\n${lockCheckBody}`) };
     const op = script("op", `echo "op $1 token=$OP_SERVICE_ACCOUNT_TOKEN biometric=$OP_BIOMETRIC_UNLOCK_ENABLED account=$OP_ACCOUNT cwd=$(pwd -P)" >> '${log}'\n${opBody}`);
     const workDir = path.join(tmp, "op-cwd");
     fs.mkdirSync(workDir, { recursive: true });
     const read: OnePasswordRead = { executable: op, ref: "op://A/b/c", env: Object.freeze({ ...env, OP_ACCOUNT: "personal" }), cwd: workDir, timeoutMs: 10_000, quiet: true, login: CONNECTION };
     let result: Awaited<ReturnType<typeof readCredentialSource>> | undefined;
     const state = createAdminState({
-      env: { ...process.env, RUNFREE_TEST_FAKE_DOCKER: "1", RUNFREE_TEST_SECURITY_PATH: security },
+      env: { ...process.env, RUNFREE_TEST_FAKE_DOCKER: "1", RUNFREE_TEST_SECURITY_PATH: security, ...lockCheck },
       projectRoot: tmp,
       packageRoot: tmp,
       stateDir: path.join(tmp, "state"),
@@ -219,6 +225,23 @@ describe("readCredentialSource through a connection", () => {
       message: 'the login for source "automation" cannot be read (Keychain locked)',
     });
     expect(log).toEqual(["security find-generic-password"]);
+  });
+
+  test("a Keychain the lock check finds locked fails transient before security or op starts", async () => {
+    const { result, log } = await readThroughConnection(`printf '%s\\n' '${SA_TOKEN}'`, "echo never", watchLifetime(), "echo locked");
+    expect(result.kind).toBe("source-failure");
+    const error = result.kind === "source-failure" ? result.error as TokenResolutionError : undefined;
+    expect({ classification: error?.classification, code: error?.code }).toEqual({ classification: "transient", code: "keychain-locked" });
+    expect(log).toEqual(["osascript -l JavaScript"]);
+  });
+
+  test.each([
+    ["unlocked", "echo unlocked"],
+    ["unknown", "exit 1"],
+  ])("a lock check that answers %s lets security and op run", async (_label, body) => {
+    const { result, log } = await readThroughConnection(`printf '%s\\n' '${SA_TOKEN}'`, "echo connection-value", watchLifetime(), body);
+    expect(result).toEqual({ kind: "success", value: "connection-value", resolvedAt: expect.any(Number) });
+    expect(log.map((line) => line.split(" ")[0])).toEqual(["osascript", "security", "op"]);
   });
 
   test("op stderr that echoes the login is redacted before classification", async () => {

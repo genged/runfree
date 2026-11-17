@@ -48,6 +48,8 @@ import {
   assertServiceAccountTokenShape,
   ConnectionSetupError,
   keychainItemForSource,
+  KEYCHAIN_LOCKED,
+  KEYCHAIN_UNLOCK_FIX,
   keychainPlatformAvailable,
 } from "./keychain-login.ts";
 import { remedy } from "../remedies.ts";
@@ -553,7 +555,7 @@ export function sourceCheckIntent(input: SourceNameInput): void {
   try {
     token = readConnectionLoginSync(name, source.keychain);
   } catch (error) {
-    if (error instanceof TokenResolutionError) die(`${error.safeMessage}\n${fix}`);
+    if (error instanceof TokenResolutionError) die(`${error.safeMessage}\n${error.code === KEYCHAIN_LOCKED ? `fix: ${KEYCHAIN_UNLOCK_FIX}` : fix}`);
     throw error;
   }
   let vaults: string[];

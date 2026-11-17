@@ -10,6 +10,10 @@ import {
   keychainDeleteStep,
   keychainExecutable,
   keychainItemForSource,
+  keychainLockCheckArgs,
+  keychainLockCheckExecutable,
+  keychainLockedError,
+  keychainLockStateFromExit,
   keychainReadArgs,
   keychainReadStep,
   keychainWriteCheckStep,
@@ -38,6 +42,41 @@ describe("keychain executable and platform", () => {
     expect(() => assertKeychainPlatform({}, "darwin")).not.toThrow();
     expect(() => assertKeychainPlatform({ RUNFREE_TEST_FAKE_DOCKER: "1", RUNFREE_TEST_KEYCHAIN_PLATFORM: "linux" }, "darwin")).toThrow(ConnectionSetupError);
     expect(() => assertKeychainPlatform({ RUNFREE_TEST_KEYCHAIN_PLATFORM: "linux" }, "darwin")).not.toThrow();
+  });
+});
+
+describe("keychain lock check", () => {
+  test("osascript outside the test seam; under the seam only a named fake, else no check", () => {
+    expect(keychainLockCheckExecutable({ RUNFREE_TEST_OSASCRIPT_PATH: "/tmp/fake" })).toBe("/usr/bin/osascript");
+    expect(keychainLockCheckExecutable({ RUNFREE_TEST_FAKE_DOCKER: "1", RUNFREE_TEST_OSASCRIPT_PATH: "/tmp/fake" })).toBe("/tmp/fake");
+    expect(keychainLockCheckExecutable({ RUNFREE_TEST_FAKE_DOCKER: "1" })).toBeUndefined();
+  });
+  test("reads the default keychain's status bits; never runs security", () => {
+    const args = keychainLockCheckArgs();
+    expect(args.slice(0, 3)).toEqual(["-l", "JavaScript", "-e"]);
+    expect(args[3]).toContain("$.SecKeychainGetStatus(null, status)");
+    expect(args[3]).toContain("status[0] & 1");
+    expect(args[3]).not.toMatch(/security|Unlock\(|doShellScript/);
+  });
+  test.each([
+    ["locked", exit({ stdout: "locked\n" }), "locked"],
+    ["unlocked", exit({ stdout: "unlocked\n" }), "unlocked"],
+    ["unknown answer", exit({ stdout: "unknown\n" }), "unknown"],
+    ["other text", exit({ stdout: "locked unlocked\n" }), "unknown"],
+    ["a failed check", exit({ status: 1, stdout: "locked\n" }), "unknown"],
+    ["a timeout", exit({ status: null, failure: { kind: "timeout" } }), "unknown"],
+    ["no osascript", exit({ status: null, failure: { kind: "spawn", message: "ENOENT" } }), "unknown"],
+  ])("%s reads as %s", (_label, checkExit, state) => {
+    expect(keychainLockStateFromExit(checkExit)).toBe(state);
+  });
+  test("a locked Keychain is the transient keychain-locked failure", () => {
+    const error = keychainLockedError("automation");
+    expect({ classification: error.classification, sourceKind: error.sourceKind, code: error.code, message: error.safeMessage }).toEqual({
+      classification: "transient",
+      sourceKind: "keychain",
+      code: "keychain-locked",
+      message: 'the login for source "automation" cannot be read (Keychain locked)',
+    });
   });
 });
 

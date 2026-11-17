@@ -7309,7 +7309,7 @@ describe("google-service-account sources", () => {
 describe("1password connection sources", () => {
   const SA_TOKEN = `ops_${"S".repeat(48)}.sentinel-sa-token`;
   const CONNECTION_ENTRY = { type: "1password", keychain: { service: "runfree.credential-source", account: "automation" }, createdAt: "x" };
-  type Call = { command: "security" | "op"; args: string[]; input?: string; env: NodeJS.ProcessEnv; cwd?: string };
+  type Call = { command: "security" | "op" | "osascript"; args: string[]; input?: string; env: NodeJS.ProcessEnv; cwd?: string };
 
   function installFakeKeychainAndOp(options: {
     stored?: Map<string, string>;
@@ -7326,7 +7326,9 @@ describe("1password connection sources", () => {
     whoamiTimeout?: boolean;
     vaults?: string;
     opRead?: (args: string[], env: NodeJS.ProcessEnv) => SpawnSyncReturns<string>;
-  } = {}): { calls: Call[]; securityPath: string; opBin: string; stored: Map<string, string> } {
+    /** Installs the fake Keychain lock check and sets what it answers; without it the state is unknown and no check runs. */
+    lockCheck?: "locked" | "unlocked" | "garbage" | "fails" | "timeout";
+  } = {}): { calls: Call[]; securityPath: string; opBin: string; stored: Map<string, string>; osascriptPath?: string } {
     const calls: Call[] = [];
     const stored = options.stored ?? new Map<string, string>();
     // Outside the project: the sanitized host PATH drops project directories.
@@ -7354,6 +7356,20 @@ describe("1password connection sources", () => {
       }
       return spawnResult({ status: 2 });
     });
+    const osascriptPath = path.join(bin, "osascript");
+    registerFakeCommand(osascriptPath, (args, spawnOptions) => {
+      calls.push({ command: "osascript", args, env: envFromSpawnOptions(spawnOptions) });
+      switch (options.lockCheck) {
+        case "timeout":
+          return spawnTimeoutResult("osascript");
+        case "fails":
+          return spawnResult({ status: 1, stderr: "execution error" });
+        case "garbage":
+          return spawnResult({ stdout: "maybe\n" });
+        default:
+          return spawnResult({ stdout: `${options.lockCheck ?? "unknown"}\n` });
+      }
+    });
     registerFakeCommand(path.join(bin, "op"), (args, spawnOptions) => {
       const env = envFromSpawnOptions(spawnOptions);
       calls.push({ command: "op", args, env, ...(spawnOptions.cwd === undefined ? {} : { cwd: String(spawnOptions.cwd) }) });
@@ -7366,14 +7382,15 @@ describe("1password connection sources", () => {
       if (args[0] === "read") return options.opRead ? options.opRead(args, env) : spawnResult({ stdout: "connection-secret\n" });
       return spawnResult({ status: 2 });
     });
-    return { calls, securityPath, opBin: bin, stored };
+    return { calls, securityPath, opBin: bin, stored, ...(options.lockCheck ? { osascriptPath } : {}) };
   }
 
-  function connectionEnv(fake: { securityPath: string; opBin: string }): NodeJS.ProcessEnv {
+  function connectionEnv(fake: { securityPath: string; opBin: string; osascriptPath?: string }): NodeJS.ProcessEnv {
     return {
       PATH: `${fake.opBin}:${process.env.PATH ?? ""}`,
       RUNFREE_TEST_SECURITY_PATH: fake.securityPath,
       RUNFREE_TEST_KEYCHAIN_PLATFORM: "darwin",
+      ...(fake.osascriptPath ? { RUNFREE_TEST_OSASCRIPT_PATH: fake.osascriptPath } : {}),
     };
   }
 
@@ -7638,19 +7655,44 @@ describe("1password connection sources", () => {
       expectNoSentinel(result.stdout, result.stderr);
     });
 
+    const UNLOCK_FIX = "fix: unlock the macOS login Keychain (log in to the Mac), then run again";
     test.each([
-      ["missing", { readStatus: 44 }, 'the login for source "automation" is missing from the macOS Keychain'],
-      ["locked", { readStatus: 36, readStderr: "User interaction is not allowed." }, 'the login for source "automation" cannot be read (Keychain locked)'],
-      ["not a token", { stored: new Map([["automation", "hunter2"]]) }, 'the login for source "automation" in the macOS Keychain is not a service account token'],
-    ])("check with a %s login stops before op and names the fix", async (_label, options, message) => {
+      ["missing", { readStatus: 44 }, 'the login for source "automation" is missing from the macOS Keychain', "fix: runfree credential source login automation"],
+      ["locked", { readStatus: 36, readStderr: "User interaction is not allowed." }, 'the login for source "automation" cannot be read (Keychain locked)', UNLOCK_FIX],
+      ["not a token", { stored: new Map([["automation", "hunter2"]]) }, 'the login for source "automation" in the macOS Keychain is not a service account token', "fix: runfree credential source login automation"],
+    ])("check with a %s login stops before op and names the fix", async (_label, options, message, fix) => {
       writeSourceRegistry({ automation: CONNECTION_ENTRY });
       const fake = installFakeKeychainAndOp(options);
       const result = await runAdmin(() => sourceCheckIntent({ name: "automation" }), connectionEnv(fake));
       expect(result.status).not.toBe(0);
       expect(result.stderr).toContain(message);
-      expect(result.stderr).toContain("fix: runfree credential source login automation");
+      expect(result.stderr).toContain(fix);
       expect(result.stderr).not.toContain("hunter2");
       expect(fake.calls.filter((call) => call.command === "op")).toEqual([]);
+    });
+
+    test("check, rotation and remove on a locked Keychain refuse before security starts", async () => {
+      writeSourceRegistry({ automation: CONNECTION_ENTRY });
+      const fake = installFakeKeychainAndOp({ stored: new Map([["automation", SA_TOKEN]]), lockCheck: "locked" });
+      const checked = await runAdmin(() => sourceCheckIntent({ name: "automation" }), connectionEnv(fake));
+      expect(checked.status).not.toBe(0);
+      expect(checked.stderr).toContain(`the login for source "automation" cannot be read (Keychain locked)\n  ${UNLOCK_FIX}`);
+      const rotated = await runAdmin(() => sourceLoginIntent({ name: "automation", token: { kind: "stdin", text: `ops_${"N".repeat(48)}` } }), connectionEnv(fake));
+      expect(rotated.status).not.toBe(0);
+      expect(rotated.stderr).toContain("the macOS login Keychain is locked; unlock it (log in to the Mac) and run the command again");
+      const removed = await runAdmin(() => sourceRemoveIntent({ name: "automation" }), connectionEnv(fake));
+      expect(removed.status).not.toBe(0);
+      expect(removed.stderr).toContain("the macOS login Keychain is locked; unlock it (log in to the Mac) and run the command again");
+      expect(fake.calls.filter((call) => call.command === "security")).toEqual([]);
+      expect(fake.stored.get("automation")).toBe(SA_TOKEN);
+      expect(JSON.parse(sourceRegistryText())).toHaveProperty("automation");
+      // The check is SecKeychainGetStatus, never a security call, and no token reaches it.
+      for (const call of fake.calls.filter((entry) => entry.command === "osascript")) {
+        expect(call.args.slice(0, 2)).toEqual(["-l", "JavaScript"]);
+        expect(call.args.join(" ")).toContain("SecKeychainGetStatus");
+        expect(call.env.OP_SERVICE_ACCOUNT_TOKEN).toBeUndefined();
+      }
+      expectNoSentinel(checked.stderr, rotated.stderr, removed.stderr);
     });
 
     test("check with a revoked login names the fix and never echoes the token", async () => {
@@ -7920,6 +7962,16 @@ describe("1password connection sources", () => {
         expect((call.env.PATH ?? "").split(path.delimiter).filter((entry) => entry.endsWith(`node_modules${path.sep}.bin`))).toEqual([]);
         expect(call.cwd).toBe(path.join(home, ".config/runfree"));
       }
+    });
+
+    test("a Keychain the lock check finds locked is transient, and neither security nor op runs", async () => {
+      const docker = githubViaFixture();
+      const fake = installFakeKeychainAndOp({ stored: new Map([["automation", SA_TOKEN]]), lockCheck: "locked" });
+      const result = await runAdmin(sync, syncEnv(fake, docker));
+      expect(result.status).not.toBe(0);
+      expect(result.stdout + result.stderr).toContain('the login for source "automation" cannot be read (Keychain locked)');
+      expect(fake.calls.map((call) => call.command)).toEqual(["osascript"]);
+      expect(readTokenStatus().github?.ok).toBe(false);
     });
 
     test("a locked Keychain is transient and op never runs", async () => {
@@ -8625,27 +8677,57 @@ describe("1password connection sources", () => {
         });
       }
 
-      async function expectLoginRefusal(fake: ReturnType<typeof installFakeKeychainAndOp>, headline: string, env: NodeJS.ProcessEnv): Promise<void> {
+      const UNLOCK_FIX = "  fix: unlock the macOS login Keychain (log in to the Mac), then run again";
+
+      async function expectLoginRefusal(
+        fake: ReturnType<typeof installFakeKeychainAndOp>,
+        headline: string,
+        env: NodeJS.ProcessEnv,
+        expected: Readonly<{ fix?: string; calls?: string[] }> = {},
+      ): Promise<void> {
         const docker = { log: fs.existsSync(env.FAKE_DOCKER_LOG ?? "") ? fs.readFileSync(env.FAKE_DOCKER_LOG ?? "", "utf8") : "" };
         const callsBefore = fake.calls.length;
         const result = await runAdmin(() => unattendedCredentialCheckIntent(), env);
         expect(result.status).toBe(65);
         // One refusal for the shared connection, however many bindings use it.
         expect(result.stderr.split("\n").filter((line) => line.includes("run refused (65)")).map((line) => line.slice(line.indexOf("run refused")))).toEqual([headline]);
-        expect(result.stderr).toContain(`${headline}\n  ${LOGIN_FIX}\n`);
+        expect(result.stderr).toContain(`${headline}\n  ${expected.fix ?? LOGIN_FIX}\n`);
         expect(result.stderr).toContain("the headless run did not start");
         // Only the Keychain was asked, once; op never ran and Docker was not touched.
-        expect(fake.calls.slice(callsBefore).map((call) => `${call.command} ${call.args[0]}`)).toEqual(["security find-generic-password"]);
+        expect(fake.calls.slice(callsBefore).map((call) => `${call.command} ${call.args[0]}`)).toEqual(expected.calls ?? ["security find-generic-password"]);
         if (env.FAKE_DOCKER_LOG) {
           expect(fs.existsSync(env.FAKE_DOCKER_LOG) ? fs.readFileSync(env.FAKE_DOCKER_LOG, "utf8") : "").toBe(docker.log);
         }
         expectNoSentinel(result.stdout, result.stderr);
       }
 
-      test("a locked Keychain refuses the run with the source login fix", async () => {
+      test("a locked Keychain that security reports refuses the run with the unlock fix", async () => {
         connectionRunFixture();
         const fake = installFakeKeychainAndOp({ readStatus: 36, readStderr: "security: SecKeychainSearchCopyNext: User interaction is not allowed." });
-        await expectLoginRefusal(fake, 'run refused (65): the login for source "automation" cannot be read (Keychain locked)', connectionEnv(fake));
+        await expectLoginRefusal(fake, 'run refused (65): the login for source "automation" cannot be read (Keychain locked)', connectionEnv(fake), { fix: UNLOCK_FIX });
+      });
+
+      test("a Keychain the lock check finds locked refuses the run before security, op, or Docker starts", async () => {
+        connectionRunFixture();
+        const docker = installTokenSyncDockerFake();
+        const fake = installFakeKeychainAndOp({ stored: new Map([["automation", SA_TOKEN]]), lockCheck: "locked" });
+        await expectLoginRefusal(fake, 'run refused (65): the login for source "automation" cannot be read (Keychain locked)', ruleEnv(fake, docker), {
+          fix: UNLOCK_FIX,
+          calls: ["osascript -l"],
+        });
+      });
+
+      test.each([
+        ["unlocked", "unlocked"],
+        ["unknown (an answer that is not a state)", "garbage"],
+        ["unknown (the check fails)", "fails"],
+        ["unknown (the check does not answer)", "timeout"],
+      ] as const)("a lock check that answers %s lets the read and the login check run", async (_label, lockCheck) => {
+        connectionRunFixture();
+        const fake = installFakeKeychainAndOp({ stored: new Map([["automation", SA_TOKEN]]), lockCheck });
+        const result = await underRule(() => runAdmin(() => unattendedCredentialCheckIntent(), connectionEnv(fake)));
+        expect(result.status, result.stderr).toBe(0);
+        expect(fake.calls.map((call) => `${call.command} ${call.args[0]}`)).toEqual(["osascript -l", "security find-generic-password", "op whoami"]);
       });
 
       test("a missing Keychain item refuses the run", async () => {
@@ -8672,7 +8754,7 @@ describe("1password connection sources", () => {
         // session would keep the held value; a run refuses.
         options.readStatus = 36;
         options.readStderr = "security: User interaction is not allowed.";
-        await expectLoginRefusal(fake, 'run refused (65): the login for source "automation" cannot be read (Keychain locked)', ruleEnv(fake, docker));
+        await expectLoginRefusal(fake, 'run refused (65): the login for source "automation" cannot be read (Keychain locked)', ruleEnv(fake, docker), { fix: UNLOCK_FIX });
       });
 
       test("a host without the macOS Keychain refuses the run before any read", async () => {
@@ -8701,7 +8783,7 @@ describe("1password connection sources", () => {
 
       test("the refusal's fix parses as a command and names the generation families correctly", async () => {
         connectionRunFixture();
-        const fake = installFakeKeychainAndOp({ readStatus: 36, readStderr: "User interaction is not allowed." });
+        const fake = installFakeKeychainAndOp({ readStatus: 44 });
         const result = await runAdmin(() => unattendedCredentialCheckIntent(), connectionEnv(fake));
         expect(result.status).toBe(65);
         const fixes = result.stderr.split("\n").filter((line) => line.trimStart().startsWith("fix: runfree ")).map((line) => line.trim());

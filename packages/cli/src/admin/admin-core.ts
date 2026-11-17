@@ -175,12 +175,19 @@ import { headlessCallOptions, headlessTerminalModeActive } from "../terminal-mod
 import {
   ConnectionSetupError,
   KEYCHAIN_CALL_TIMEOUT_MS,
+  KEYCHAIN_LOCK_CHECK_TIMEOUT_MS,
+  KEYCHAIN_LOCKED_SETUP_MESSAGE,
   KEYCHAIN_SERVICE,
   type KeychainItem,
   keychainDeleteArgs,
   keychainDeleteStep,
   keychainExecutable,
   keychainItemForSource,
+  keychainLockCheckArgs,
+  keychainLockCheckExecutable,
+  keychainLockedError,
+  keychainLockStateFromExit,
+  type KeychainLockState,
   keychainPlatformAvailable,
   keychainReadArgs,
   keychainReadStep,
@@ -1519,6 +1526,7 @@ export function verifyConnectionLogin(token: string): string[] {
 /** Saves (or replaces, `-U`) a connection login and reads it back; the token goes on stdin only. */
 export function writeConnectionLogin(item: KeychainItem, token: string): void {
   const request = keychainWriteRequest(item, token);
+  assertKeychainNotLockedForSetup();
   const exit = connectionSetupExit(keychainExecutable(childEnv()), request.args, {
     env: sanitizedHostExecutionEnv(projectRoot(), childEnv()),
     input: request.input,
@@ -1535,6 +1543,7 @@ export function writeConnectionLogin(item: KeychainItem, token: string): void {
  * `TokenResolutionError` with fixed text: a read's stdout is the login.
  */
 export function readConnectionLoginSync(sourceName: string, item: KeychainItem): string {
+  if (connectionKeychainLockStateSync() === "locked") throw keychainLockedError(sourceName);
   const invocation = connectionKeychainInvocation(item);
   const exit = connectionSetupExit(invocation.executable, [...invocation.args], { env: invocation.env, timeout: invocation.timeoutMs });
   return keychainReadStep(sourceName, exit);
@@ -1552,8 +1561,35 @@ export function connectionKeychainInvocation(item: KeychainItem): KeychainInvoca
   };
 }
 
+/**
+ * The lock check run before a connection login's `security` call, for the
+ * synchronous and the watcher's owned reader alike; undefined when there is
+ * no check to run (the test seam without a fake), which reads as unknown.
+ */
+export function connectionKeychainLockCheck(): KeychainInvocation | undefined {
+  const executable = keychainLockCheckExecutable(childEnv());
+  if (!executable) return undefined;
+  return {
+    executable,
+    args: keychainLockCheckArgs(),
+    env: Object.freeze(sanitizedHostExecutionEnv(projectRoot(), childEnv())),
+    timeoutMs: KEYCHAIN_LOCK_CHECK_TIMEOUT_MS,
+  };
+}
+
+function connectionKeychainLockStateSync(): KeychainLockState {
+  const check = connectionKeychainLockCheck();
+  if (!check) return "unknown";
+  return keychainLockStateFromExit(connectionSetupExit(check.executable, [...check.args], { env: check.env, timeout: check.timeoutMs }));
+}
+
+function assertKeychainNotLockedForSetup(): void {
+  if (connectionKeychainLockStateSync() === "locked") throw new ConnectionSetupError(KEYCHAIN_LOCKED_SETUP_MESSAGE);
+}
+
 /** Deletes a connection login; an item that is already gone counts as done. */
 export function deleteConnectionLogin(item: KeychainItem): "deleted" | "absent" {
+  assertKeychainNotLockedForSetup();
   const exit = connectionSetupExit(keychainExecutable(childEnv()), keychainDeleteArgs(item), {
     env: sanitizedHostExecutionEnv(projectRoot(), childEnv()),
     timeout: KEYCHAIN_CALL_TIMEOUT_MS,

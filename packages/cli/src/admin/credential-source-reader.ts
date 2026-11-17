@@ -11,6 +11,7 @@ import {
   assertProviderMayRun,
   commandSourceStep,
   connectionKeychainInvocation,
+  connectionKeychainLockCheck,
   type CredentialReadPlan,
   googleServiceAccountStep,
   jwtSigningKeyFromPem,
@@ -28,7 +29,7 @@ import {
   tokenSyncWatchNowMs,
 } from "./admin-core.ts";
 import { CredentialCancellationError, type CredentialLifetime, settleHostSignals } from "./credential-cancellation.ts";
-import { keychainReadStep } from "./keychain-login.ts";
+import { keychainLockedError, keychainLockStateFromExit, keychainReadStep } from "./keychain-login.ts";
 
 /** One token's read for this pass: the source configuration as planned, bound to its fingerprint. */
 export type CredentialReadInput = Readonly<{
@@ -220,6 +221,13 @@ async function readOnePasswordOwned(read: OnePasswordRead, lifetime: CredentialL
   announceOnePasswordRead(read);
   let token: string | undefined;
   if (read.login.kind === "connection") {
+    // A locked Keychain is refused before `security` starts: see keychain-login.ts.
+    const check = connectionKeychainLockCheck();
+    if (check) {
+      const checkExit = await ownedProviderExit(check.executable, check.args, { env: check.env, timeoutMs: check.timeoutMs, maxBytes: PROVIDER_OUTPUT_MAX_BYTES }, lifetime);
+      if (keychainLockStateFromExit(checkExit) === "locked") throw keychainLockedError(read.login.sourceName);
+      lifetime.assertActive();
+    }
     const keychain = connectionKeychainInvocation(read.login.keychain);
     const keychainExit = await ownedProviderExit(keychain.executable, keychain.args, {
       env: keychain.env,

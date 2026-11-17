@@ -74,7 +74,7 @@ import {
 import { runfreeError } from "../warnings.ts";
 import { remedy } from "../remedies.ts";
 import { TokenResolutionError } from "../token-resolution.ts";
-import { assertKeychainPlatform, ConnectionSetupError } from "./keychain-login.ts";
+import { assertKeychainPlatform, ConnectionSetupError, KEYCHAIN_LOCKED, KEYCHAIN_UNLOCK_FIX } from "./keychain-login.ts";
 import {
   connectionSourceNames,
   forbidCredentialInteraction,
@@ -814,6 +814,14 @@ function runConnectionNames(names: readonly string[], config: ReturnType<typeof 
   return [...connections].sort();
 }
 
+// A locked Keychain needs an unlock, not a new login; a check that could not
+// finish gets no fix, since a new login would not help.
+function connectionRefusalFix(connection: string, error: TokenResolutionError): string[] {
+  if (error.sourceKind === "keychain" && error.code === KEYCHAIN_LOCKED) return [`  fix: ${KEYCHAIN_UNLOCK_FIX}`];
+  if (error.sourceKind === "keychain" || error.code === CONNECTION_LOGIN_REJECTED) return [`  fix: ${remedy.credentialSourceLogin(connection)}`];
+  return [];
+}
+
 function refuseUnreadableConnectionLogins(names: readonly string[], config: ReturnType<typeof loadTokenConfig>, registry: SourceRegistry | undefined): boolean {
   let refused = false;
   for (const connection of runConnectionNames(names, config, registry)) {
@@ -827,9 +835,7 @@ function refuseUnreadableConnectionLogins(names: readonly string[], config: Retu
       if (error instanceof ConnectionSetupError) {
         runfreeError(`run refused (65): source "${connection}": ${error.message}`);
       } else if (error instanceof TokenResolutionError) {
-        // A check that could not finish gets no fix: a new login would not help.
-        const loginFix = error.sourceKind === "keychain" || error.code === CONNECTION_LOGIN_REJECTED;
-        runfreeError([`run refused (65): ${error.safeMessage}`, ...(loginFix ? [`  fix: ${remedy.credentialSourceLogin(connection)}`] : [])].join("\n"));
+        runfreeError([`run refused (65): ${error.safeMessage}`, ...connectionRefusalFix(connection, error)].join("\n"));
       } else {
         throw error;
       }
