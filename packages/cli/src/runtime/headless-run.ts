@@ -81,6 +81,12 @@ export const HEADLESS_RUN_EXIT = Object.freeze({
   deniedWrites: 68,
 });
 
+/**
+ * How long an agent that closed its turn (its final stdout event) gets to
+ * exit before Runfree stops its container through the stop routine. Any
+ * output after that event restarts the wait.
+ */
+export const HEADLESS_FINAL_EVENT_GRACE_MS = 30_000;
 /** How long the captured streams, the parser, and the record writes get to finish after the launch. */
 export const HEADLESS_DRAIN_BOUND_MS = 10_000;
 /** The denial count reads the proxy log from a little before the run, for clock skew; the session filter keeps it exact. */
@@ -121,6 +127,8 @@ export type HeadlessRunDeps = Readonly<{
   acquireLock: (input: AcquireHeadlessRunLockInput) => HeadlessRunLock;
   signals: HeadlessRunSignalSource;
   setTimer: (ms: number, fire: () => void) => () => void;
+  /** `HEADLESS_FINAL_EVENT_GRACE_MS`; tests shorten it. */
+  finalEventGraceMs: number;
   now: () => Date;
   stdout: (line: string) => void;
   /**
@@ -145,6 +153,7 @@ const DEFAULT_DEPS: HeadlessRunDeps = Object.freeze({
     const timer = setTimeout(fire, ms);
     return () => clearTimeout(timer);
   },
+  finalEventGraceMs: HEADLESS_FINAL_EVENT_GRACE_MS,
   now: () => new Date(),
   stdout: (line: string) => console.log(line),
   credentialPreflight: (context: RuntimeContext, io: RuntimeIO) => io.admin({ kind: "unattended-credential-check" }, context),
@@ -283,13 +292,22 @@ export async function runHeadlessAgent(
   const cancel = new AbortController();
   const escalate = new AbortController();
   let aborted: AbortReason | undefined;
+  // Runfree itself started the stop routine for an agent that closed its
+  // turn but did not exit. That is the run's end, not an abort: a later
+  // signal only shortens the stop, and a later deadline changes nothing.
+  let stoppedAfterFinalEvent = false;
   const abort = (reason: AbortReason): void => {
-    if (aborted === undefined) {
+    if (aborted === undefined && !stoppedAfterFinalEvent) {
       aborted = reason;
       cancel.abort(reason);
     } else if (reason === "signal") {
       escalate.abort("signal");
     }
+  };
+  const stopAfterFinalEvent = (): void => {
+    if (aborted !== undefined || stoppedAfterFinalEvent) return;
+    stoppedAfterFinalEvent = true;
+    cancel.abort("final-event");
   };
   const onSignal = (): void => abort("signal");
   deps.signals.on("SIGINT", onSignal);
@@ -300,7 +318,9 @@ export async function runHeadlessAgent(
   // read of the abort reason first honors an elapsed deadline.
   const deadlineMs = options.timeoutMs !== undefined ? deps.now().getTime() + options.timeoutMs : undefined;
   const abortReason = (): AbortReason | undefined => {
-    if (aborted === undefined && deadlineMs !== undefined && deps.now().getTime() >= deadlineMs) abort("timeout");
+    if (aborted === undefined && !stoppedAfterFinalEvent && deadlineMs !== undefined && deps.now().getTime() >= deadlineMs) {
+      abort("timeout");
+    }
     return aborted;
   };
   try {
@@ -314,6 +334,8 @@ export async function runHeadlessAgent(
       outputFormat: headless.outputFormat,
       cancellation: { signal: cancel.signal, escalate: escalate.signal },
       aborted: abortReason,
+      stopAfterFinalEvent,
+      stoppedAfterFinalEvent: () => stoppedAfterFinalEvent,
     });
   } finally {
     cancelTimer();
@@ -335,6 +357,9 @@ type RunInput = Readonly<{
   outputFormat: Parameters<typeof createHeadlessOutputParser>[0];
   cancellation: SessionHeadlessLaunchInput["cancellation"];
   aborted: () => AbortReason | undefined;
+  /** Starts the stop routine for an agent that closed its turn but did not exit. */
+  stopAfterFinalEvent: () => void;
+  stoppedAfterFinalEvent: () => boolean;
 }>;
 
 async function runUnderLock(input: RunInput): Promise<number> {
@@ -379,11 +404,30 @@ async function runUnderLock(input: RunInput): Promise<number> {
 
   const parser = createHeadlessOutputParser(input.outputFormat);
   let record: HeadlessRunRecord | undefined;
+  // The grace after the agent's final event: armed while the last line it
+  // printed closes its turn, cleared by any later output and when the run
+  // settles. It ends only a run that is still attached.
+  let settled = false;
+  let cancelGrace: (() => void) | undefined;
+  const watchTurnEnd = (): void => {
+    if (settled) return;
+    const ended = parser.turnEnded();
+    if (ended && cancelGrace === undefined) {
+      cancelGrace = deps.setTimer(deps.finalEventGraceMs, () => {
+        cancelGrace = undefined;
+        if (!settled && parser.turnEnded()) input.stopAfterFinalEvent();
+      });
+    } else if (!ended && cancelGrace !== undefined) {
+      cancelGrace();
+      cancelGrace = undefined;
+    }
+  };
   const capture = deps.createSpawner({
     // The parser sees every byte even if a record write fails; the failure
     // then makes the capture undrained, so the run is unverified.
     stdout: (chunk) => {
       parser.push(chunk);
+      watchTurnEnd();
       record?.appendTranscript(chunk);
     },
     stderr: (chunk) => record?.appendStderr(chunk),
@@ -481,6 +525,10 @@ async function runUnderLock(input: RunInput): Promise<number> {
     // Nothing ran yet: a failure before the container exists is a refusal.
     if (session.containerId === undefined) refused = true;
   }
+  settled = true;
+  cancelGrace?.();
+  cancelGrace = undefined;
+  const stoppedAfterFinalEvent = input.stoppedAfterFinalEvent();
 
   // A thrown aggregate is a teardown that did not complete
   // (`SessionTeardownIncompleteError`, or a cleanup failure beside the
@@ -494,7 +542,7 @@ async function runUnderLock(input: RunInput): Promise<number> {
   const parsed = parser.result();
   const streamsDrained = drained && record !== undefined && !record.transcriptTruncated();
   const agent = launchResult
-    ? decideHeadlessOutcome({ agentStatus: launchResult.status, streamsDrained, parser: parsed })
+    ? decideHeadlessOutcome({ agentStatus: launchResult.status, streamsDrained, parser: parsed, stoppedAfterFinalEvent })
     : undefined;
   const denials = session.sessionId === undefined
     ? 0
@@ -541,6 +589,7 @@ async function runUnderLock(input: RunInput): Promise<number> {
     transcriptTruncated: record?.transcriptTruncated() ?? false,
     stderrTruncated: record?.stderrTruncated() ?? false,
     malformedLines: parsed.malformedLines,
+    stoppedAfterFinalEvent,
   };
   if (record) {
     try {
@@ -594,6 +643,7 @@ function writeSkippedRecord(
       transcriptTruncated: false,
       stderrTruncated: false,
       malformedLines: 0,
+      stoppedAfterFinalEvent: false,
     };
     record.finalize(run, {});
     for (const line of summaryLines({ run, recordDir: record.dir })) input.deps.stdout(line);

@@ -65,6 +65,7 @@ function runJson(overrides: Partial<HeadlessRunJson> = {}): HeadlessRunJson {
     transcriptTruncated: false,
     stderrTruncated: false,
     malformedLines: 0,
+    stoppedAfterFinalEvent: false,
     ...overrides,
   };
 }
@@ -231,6 +232,14 @@ describe("summaryLines", () => {
       .toContain("warning: 1 write was denied (headless)");
     expect(summaryLines({ run: runJson({ headlessDenials: null }), finalMessage: "ok", recordDir: dir }))
       .toContain("warning: the headless write denials could not be counted");
+  });
+
+  test("a run Runfree stopped after the agent's final event says so, before the record path", () => {
+    expect(summaryLines({ run: runJson({ stoppedAfterFinalEvent: true }), finalMessage: "ok", recordDir: dir })).toEqual([
+      "ok",
+      "note: the agent did not exit after its final result, so Runfree stopped its container",
+      `run record: ${dir}`,
+    ]);
   });
 
   test("a run refused before launch says it did not start, not that the agent sent nothing", () => {

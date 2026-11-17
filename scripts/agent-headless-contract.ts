@@ -260,6 +260,9 @@ export function checkHeadlessContractCase(
   parser.endStream();
   const parsed = parser.result();
   const outcome = decideHeadlessOutcome({ agentStatus: report.status, streamsDrained: true, parser: parsed });
+  // A run whose agent does not exit is stopped only after a turn-closing
+  // last event, so every pinned agent must end both cases on one.
+  if (!parser.turnEnded()) problems.push(`${name}: the stream does not end on a turn-closing event`);
   if (kind === "ok") {
     if (report.status !== 0) problems.push(`${name}: exit ${report.status}, expected 0`);
     if (outcome.outcome !== "success") problems.push(`${name}: outcome ${outcome.outcome}, expected success`);

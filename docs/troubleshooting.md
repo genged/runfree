@@ -278,6 +278,15 @@ The rest of the flow is in [Approve-On-Write](cli.md#approve-on-write).
 `run.json` in the run record counts the denied writes. See
 [Headless runs](cli.md#headless-runs).
 
+## A headless run stays in `runfree sessions` after its result
+
+A run ends when the agent exits. If the agent's last event closed its turn,
+Runfree stops the container 30 seconds later. A run that is still listed
+long after its result printed more output after that event, so check the end
+of `transcript.jsonl` in the run record. Run `runfree stop --force` to end the
+session; the next `runfree run` reclaims the run lock. Pass `--timeout` to
+bound later runs.
+
 ## An interrupted session will not resume
 
 `runfree resume` refuses before it starts anything, so a refusal never leaves

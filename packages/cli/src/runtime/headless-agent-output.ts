@@ -50,6 +50,11 @@ export type HeadlessOutputParser = Readonly<{
   /** One captured stream ended; a later `push` starts a new (re-attached) stream. */
   endStream(): void;
   result(): HeadlessOutputParserResult;
+  /**
+   * The last line the agent printed closes its turn: no more output is due,
+   * so only its exit is left. Any later byte makes it false again.
+   */
+  turnEnded(): boolean;
 }>;
 
 /**
@@ -85,6 +90,9 @@ export const CODEX_EXEC_JSON_EVENTS = Object.freeze({
  * last assistant message has a `stopReason` in `successStopReasons`; `error`,
  * `aborted`, `length` (a cut-off reply), and anything unknown are not. The
  * final message is that message's `text` parts, joined by newlines.
+ *
+ * Pi ends every run, a failed or retried one included, with one
+ * `agent_settled` after the last `agent_end`; that event closes its turn.
  */
 export const PI_JSON_AGENT_END_EVENT = Object.freeze({
   typeField: "type",
@@ -98,6 +106,7 @@ export const PI_JSON_AGENT_END_EVENT = Object.freeze({
   contentField: "content",
   textPartType: "text",
   textField: "text",
+  settledType: "agent_settled",
 } as const);
 
 type FinalEvent = Readonly<{ success: boolean; message?: string }>;
@@ -113,6 +122,8 @@ type JsonEvent = Readonly<Record<string, unknown>>;
 type FinalEventTracker = Readonly<{
   observe(event: JsonEvent): boolean;
   final(): FinalEvent | undefined;
+  /** Whether `event` ends the agent's turn: nothing but its exit should follow. */
+  closesTurn(event: JsonEvent): boolean;
 }>;
 
 function readClaudeFinalEvent(event: JsonEvent): FinalEvent | undefined {
@@ -134,6 +145,7 @@ function claudeTracker(): FinalEventTracker {
       return read !== undefined;
     },
     final: () => final,
+    closesTurn: (event) => readClaudeFinalEvent(event) !== undefined,
   };
 }
 
@@ -176,6 +188,10 @@ function codexTracker(): FinalEventTracker {
       const success = completed && !failed;
       return message === undefined ? { success } : { success, message };
     },
+    // A top-level `error` may be a reconnect Codex recovers from, so only a
+    // finished or failed turn closes it.
+    closesTurn: (event) => event[names.typeField] === names.turnCompletedType
+      || event[names.typeField] === names.turnFailedType,
   };
 }
 
@@ -215,6 +231,7 @@ function piTracker(): FinalEventTracker {
       return read !== undefined;
     },
     final: () => final,
+    closesTurn: (event) => event[PI_JSON_AGENT_END_EVENT.typeField] === PI_JSON_AGENT_END_EVENT.settledType,
   };
 }
 
@@ -224,7 +241,11 @@ const FINAL_EVENT_TRACKERS: Readonly<Record<HeadlessOutputFormat, () => FinalEve
   "pi-json": piTracker,
 });
 
-const NO_FINAL_EVENT: FinalEventTracker = Object.freeze({ observe: () => false, final: () => undefined });
+const NO_FINAL_EVENT: FinalEventTracker = Object.freeze({
+  observe: () => false,
+  final: () => undefined,
+  closesTurn: () => false,
+});
 
 function truncateUtf8(value: string, capBytes: number): { value: string; truncated: boolean } {
   const bytes = Buffer.from(value, "utf8");
@@ -256,10 +277,13 @@ export function createHeadlessOutputParser(
   // The last stream ended inside a line that did not parse: a truncated tail.
   let brokenTail = false;
   let malformedLines = 0;
+  // The last complete line closed the agent's turn, and no byte came after it.
+  let turnEnded = false;
   // A dropped line may have been the event that changed the outcome, so it
   // voids the success so far until a later final event re-establishes one.
   let droppedSinceFinal = false;
   const drop = (): void => {
+    turnEnded = false;
     malformedLines += 1;
     droppedSinceFinal = true;
   };
@@ -275,6 +299,7 @@ export function createHeadlessOutputParser(
         return;
       }
       if (tracker.observe(value)) droppedSinceFinal = false;
+      turnEnded = tracker.closesTurn(value);
     } catch {
       drop();
     }
@@ -288,7 +313,9 @@ export function createHeadlessOutputParser(
   };
 
   const append = (part: Buffer): void => {
-    if (part.length === 0 || discarding) return;
+    if (part.length === 0) return;
+    turnEnded = false;
+    if (discarding) return;
     if (pendingBytes + part.length > HEADLESS_OUTPUT_LINE_CAP_BYTES) {
       pending = [];
       pendingBytes = 0;
@@ -330,12 +357,14 @@ export function createHeadlessOutputParser(
         consume(accepted);
         if (accepted.length < chunk.length) {
           overflowed = true;
+          turnEnded = false;
           pending = [];
           pendingBytes = 0;
         }
       } catch {
         // Unreachable by construction; a parser never throws into the run.
         overflowed = true;
+        turnEnded = false;
       }
     },
     endStream(): void {
@@ -370,6 +399,7 @@ export function createHeadlessOutputParser(
         overflowed,
       });
     },
+    turnEnded: () => turnEnded && !overflowed,
   });
 }
 
@@ -384,13 +414,20 @@ export type HeadlessOutcome = Readonly<{
  * status is a failure with that status, or 1 above 63 so it never collides
  * with Runfree's reserved 64-68; anything else (a lost status, a stream that
  * did not drain, no final success) is `unverified` with 1.
+ *
+ * `stoppedAfterFinalEvent`: Runfree stopped a run whose agent closed its turn
+ * but did not exit. The stop itself leaves no status or a signal death (128
+ * and above), so those count as 0; a status of 1-127 is still the agent's own
+ * failure.
  */
 export function decideHeadlessOutcome(input: Readonly<{
   agentStatus: number | null;
   streamsDrained: boolean;
   parser: HeadlessOutputParserResult;
+  stoppedAfterFinalEvent?: boolean;
 }>): HeadlessOutcome {
-  const status = input.agentStatus;
+  const raw = input.agentStatus;
+  const status = input.stoppedAfterFinalEvent === true && (raw === null || raw >= 128) ? 0 : raw;
   if (typeof status === "number" && Number.isSafeInteger(status) && status > 0) {
     return { outcome: "failed", exitCode: status <= 63 ? status : 1 };
   }

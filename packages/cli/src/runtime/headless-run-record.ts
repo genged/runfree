@@ -62,6 +62,8 @@ export type HeadlessRunJson = Readonly<{
   transcriptTruncated: boolean;
   stderrTruncated: boolean;
   malformedLines: number;
+  /** The agent closed its turn but did not exit, so Runfree stopped its container. */
+  stoppedAfterFinalEvent: boolean;
 }>;
 
 export type HeadlessRunRecord = Readonly<{
@@ -288,6 +290,9 @@ export function summaryLines(input: Readonly<{
     lines.push("warning: the headless write denials could not be counted");
   } else if (denials !== null && denials > 0) {
     lines.push(`warning: ${denials} ${denials === 1 ? "write was" : "writes were"} denied (headless)`);
+  }
+  if (input.run.stoppedAfterFinalEvent) {
+    lines.push("note: the agent did not exit after its final result, so Runfree stopped its container");
   }
   if (input.run.teardown === "unconfirmed") {
     lines.push("warning: the session container stop was not confirmed; the run lock is kept until it is gone");

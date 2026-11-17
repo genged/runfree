@@ -171,6 +171,19 @@ failed request ends unverified (1), not as success. Codex reports a reconnect
 it recovered from as an `error` event; a `turn.completed` after it still counts
 as success.
 
+**A run ends when the agent exits, not when it reports its result.** A
+background job the agent started, such as a dev server or a watcher, can keep
+the agent running after its last event. When the agent's last output closes
+its turn and the agent has not exited 30 seconds later, Runfree stops its
+container through the stop routine. The events that close a turn are Claude's
+`result`, Codex's `turn.completed` or `turn.failed`, and Pi's `agent_settled`.
+Any output in those 30 seconds restarts the wait. The run keeps the result of
+its final event: a final success exits 0. An exit status from 1 to 127 during
+the stop is still the agent's own failure. `run.json` records
+`stoppedAfterFinalEvent: true`, and the summary prints
+`note: the agent did not exit after its final result, so Runfree stopped its container`.
+`--timeout` still bounds a run that keeps writing output.
+
 | Option | Use |
 | --- | --- |
 | `--prompt-file <file>` | Required. The prompt, given to the agent as its stdin. The path is resolved from the directory you run `runfree` in, not from `--workspace`. It must be a regular file, not a symlink, and at most 1 MiB. |
@@ -268,14 +281,14 @@ until that container is gone. The next run reclaims the lock when its holder
 is dead and its container is proven gone; find the session with
 `runfree sessions` and remove it with `runfree stop`.
 
-A timeout, SIGINT, SIGTERM, a failure after the launch, and a normal end all
-take the same stop routine: revoke the session, stop its container, delete the
+A timeout, SIGINT, SIGTERM, the stop after a final event, a failure after the
+launch, and a normal end all take the same stop routine: revoke the session, stop its container, delete the
 prompt copy, finish the run record, and release the lock if the stop was
 confirmed. A second signal only shortens the container stop.
 
 | Exit code | Meaning |
 | --- | --- |
-| 0 | Success: the agent exited 0 and reported a final success. |
+| 0 | Success: the agent reported a final success, and it exited 0 or Runfree stopped it after that event. |
 | 1–63 | The agent failed (its own code; a code above 63 becomes 1), or the result is unverified (1): no final success, a lost status, an incomplete output stream, or denied writes that could not be counted. |
 | 64 | Usage error: a bad flag, agent, timeout, or prompt file. Nothing was started. |
 | 65 | Refused before the launch: an invalid project config or network policy, approval, service review, login, or a credential source that may ask or cannot be read. |
@@ -296,7 +309,8 @@ runs/<run-id>/
   stderr.log         the agent's and Runfree's stderr
   result.md          the agent's final message
   run.json           agent, agentStatus, outcome, exitCode, times, teardown,
-                     headlessDenials, uncheckedAuthority
+                     headlessDenials, uncheckedAuthority,
+                     stoppedAfterFinalEvent
 ```
 
 When the run ends, it prints the final message, any warning (for example
