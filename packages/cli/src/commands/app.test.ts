@@ -1965,6 +1965,9 @@ describe("admin credential source command (typed)", () => {
     await expect(
       runCommandApp(strictContext(), ["credential", "source", "show", "github-cli", "--bad"], runDefault),
     ).rejects.toMatchObject({ message: expect.stringContaining("Unknown argument: bad") });
+    await expect(
+      runCommandApp(strictContext(), ["credential", "source", "show", "github-cli", "--show-refs"], runDefault),
+    ).rejects.not.toMatchObject({ message: expect.stringContaining("Unknown argument") });
     expect(runDefault).not.toHaveBeenCalled();
   });
 
@@ -2186,6 +2189,8 @@ describe("admin credential/host/mcp commands", () => {
       ["credential", "unlink", "gh", "--host", "x"],
       ["credential", "remove", "gh", "--no-reload"],
       ["credential", "status", "gh"],
+      ["credential", "status", "gh", "--show-refs"],
+      ["credential", "status", "--show-refs"],
       ["credential", "sync", "-v"],
       ["credential", "add", "gh", "--host", "x", "--from-1password", "op://A/b/c", "--via", "automation", "--no-reload"],
       ["credential", "set-source", "gh", "--from-source", "appstore-jwt", "--via", "automation"],

@@ -37,6 +37,8 @@ import {
   type SourceAddJwtInput,
   sourceConfigPath,
   type SourceNameInput,
+  type SourceShowInput,
+  printableSecretRef,
   type SourceRegistry,
   tokenSourceRegistryNames,
   verifyConnectionLogin,
@@ -168,10 +170,14 @@ function sourceTypeDisplay(source: NamedSource): string {
   return source.type === "1password" ? "1password (connection)" : source.type;
 }
 
-function jwtDisplay(source: JwtSource): string[] {
+function refDisplay(ref: string, showRefs: boolean): string {
+  return showRefs ? `1password ${printableSecretRef(ref)}` : "1password";
+}
+
+function jwtDisplay(source: JwtSource, showRefs: boolean): string[] {
   const lines = [
     `alg: ${source.alg}`,
-    "private key: 1password",
+    `private key: ${refDisplay(source.privateKey.ref, showRefs)}`,
     `ttl: ${formatDurationSeconds(source.ttlSeconds)}`,
   ];
   for (const [key, value] of Object.entries(source.headers).sort(([left], [right]) => left.localeCompare(right))) {
@@ -183,24 +189,24 @@ function jwtDisplay(source: JwtSource): string[] {
   return lines;
 }
 
-// The 1Password reference is not shown, as for a jwt private key.
-function googleServiceAccountDisplay(source: GoogleServiceAccountSource): string[] {
+// The 1Password reference is shown only on request, as for a jwt private key.
+function googleServiceAccountDisplay(source: GoogleServiceAccountSource, showRefs: boolean): string[] {
   return [
-    "key JSON: 1password",
+    `key JSON: ${refDisplay(source.keyJson.ref, showRefs)}`,
     `service account: ${source.clientEmail}`,
     ...source.scopes.map((scope) => `scope: ${scope}`),
     `ttl: ${formatDurationSeconds(source.ttlSeconds)}`,
   ];
 }
 
-function namedSourceDisplay(source: NamedSource): string[] {
+export function namedSourceDisplay(source: NamedSource, showRefs = false): string[] {
   switch (source.type) {
     case "command":
       return [`command: ${commandDisplay(source)}`];
     case "jwt":
-      return jwtDisplay(source);
+      return jwtDisplay(source, showRefs);
     case "google-service-account":
-      return googleServiceAccountDisplay(source);
+      return googleServiceAccountDisplay(source, showRefs);
     case "1password":
       return [`login: macOS Keychain item ${source.keychain.service}/${source.keychain.account}`, "never asks: yes"];
     default: {
@@ -275,7 +281,7 @@ export function sourceAddJwtIntent(input: SourceAddJwtInput): void {
   saveSourceRegistry(registry);
   console.log(`${name} source ${existing ? "replaced" : "configured"}`);
   console.log("type: jwt");
-  for (const line of jwtDisplay(source)) console.log(line);
+  for (const line of jwtDisplay(source, false)) console.log(line);
   console.log("agent exposure: no");
 }
 
@@ -343,7 +349,7 @@ export function sourceAddGoogleServiceAccountIntent(input: SourceAddGoogleServic
   saveSourceRegistry(registry);
   console.log(`${name} source ${existing ? "replaced" : "configured"}`);
   console.log("type: google-service-account");
-  for (const line of googleServiceAccountDisplay(source)) console.log(line);
+  for (const line of googleServiceAccountDisplay(source, false)) console.log(line);
   console.log("agent exposure: no");
 }
 
@@ -405,14 +411,14 @@ export function sourceList(): void {
   for (const name of Object.keys(loadSourceRegistry()).sort()) console.log(name);
 }
 
-export function sourceShowIntent(input: SourceNameInput): void {
+export function sourceShowIntent(input: SourceShowInput): void {
   assertKnownSourceName(input.name);
   const source = loadSourceRegistry()[input.name];
   if (!source) die(`unknown source: ${input.name}`);
   const users = sourceUsers(input.name);
   console.log(`${input.name}: configured`);
   console.log(`type: ${sourceTypeDisplay(source)}`);
-  for (const line of namedSourceDisplay(source)) console.log(line);
+  for (const line of namedSourceDisplay(source, input.showRefs === true)) console.log(line);
   console.log(`used by: ${users.join(", ") || "none"}`);
   console.log("agent exposure: no");
   console.log(source.type === "1password"

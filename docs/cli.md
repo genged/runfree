@@ -717,6 +717,7 @@ runfree credential source add google-service-account gsc \
   --scope https://www.googleapis.com/auth/webmasters.readonly
 runfree credential source list
 runfree credential source show github-cli
+runfree credential source show appstore --show-refs
 runfree credential source remove github-cli
 ```
 
@@ -725,6 +726,8 @@ Everything after `--` in `credential source add <name> -- <command>` is source c
 A `jwt` source signs a JWT on the host each time the credential is read. The
 proxy gets only the signed token; the private key stays in 1Password, and the
 source registry records its `op://` reference, never the key.
+`credential source show` prints `1password` for the key, and
+`--show-refs` prints the reference too.
 
 - `--alg` is required and must be `ES256`. `--private-key-from-1password`
   takes the `op://` reference of the PEM private key.
@@ -888,6 +891,7 @@ runfree credential set-source github --from-1password op://vault/item/token
 runfree credential clear-source github
 runfree credential remove github
 runfree credential status
+runfree credential status --show-refs
 runfree credential sync
 runfree credential sync --watch
 ```
@@ -901,6 +905,7 @@ Useful options:
 | `--path-prefix /path/` | credential destination | Inject only for matching request paths. |
 | `--refresh-every 15m` | `credential set-source`, `credential add` | Re-resolve source on an interval. |
 | `--from-env`, `--from-1password`, `--from-source`, `--from-stdin` | credential source binding | Choose one credential source. |
+| `--show-refs` | `credential status`, `credential source show` | Also print each `op://` reference. Without it, a 1Password binding or key prints only `1password`. Control characters in a reference print as `?`. |
 | `--via <connection>` | `credential add`, `credential set-source` | Read the `--from-1password` reference, or the `--from-source` signing key, through a [1Password connection source](#1password-connection-sources). |
 
 The CLI selects a destination by host and header only. When a credential

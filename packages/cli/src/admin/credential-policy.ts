@@ -865,7 +865,7 @@ export function credentialStatus(input: CredentialStatusInput = {}): void {
     const sync = status[name];
     const refresh = effectiveTokenRefresh(source, registry);
     console.log(`${name}: ${source ? "configured" : "unconfigured"}${credentialPolicy ? "" : " (unused local source)"}`);
-    console.log(`  source: ${describeSource(source)}`);
+    console.log(`  source: ${describeSource(source, { showRefs: input.showRefs })}`);
     console.log("  destinations:");
     if (!credentialPolicy || credentialPolicy.credentials.length === 0) console.log("    none");
     else for (const credential of credentialPolicy.credentials) console.log(`    ${describeCredential(credential)}`);

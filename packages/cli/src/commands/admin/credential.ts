@@ -71,7 +71,9 @@ type LinkArgs = NameArgs & CredentialArgs & { "no-reload"?: boolean };
 type UnlinkArgs = NameArgs & { host: string; header?: string; "no-reload"?: boolean };
 type RemoveArgs = NameArgs & { "no-reload"?: boolean };
 type SetSourceArgs = NameArgs & SourceArgs;
-type StatusArgs = { name?: string };
+type StatusArgs = { name?: string; "show-refs"?: boolean };
+type SourceShowArgs = NameArgs & { "show-refs"?: boolean };
+const SHOW_REFS_DESCRIBE = "Also print each 1Password op:// reference";
 type SyncArgs = {
   verbose?: boolean;
   watch?: boolean;
@@ -336,8 +338,10 @@ export const credentialCommand: CommandModule = {
           .command(
             "status [name]",
             "Show credential destinations, ownership, sources, and sync status",
-            (cmd) => cmd.positional("name", { type: "string", describe: "optional credential name" }),
-            handler((argv: ArgumentsCamelCase<StatusArgs>) => run(() => credentialStatus({ name: argv.name }))),
+            (cmd) => cmd
+              .positional("name", { type: "string", describe: "optional credential name" })
+              .option("show-refs", { type: "boolean", describe: SHOW_REFS_DESCRIBE }),
+            handler((argv: ArgumentsCamelCase<StatusArgs>) => run(() => credentialStatus({ name: argv.name, showRefs: argv["show-refs"] === true }))),
           )
           .command(
             "sync",
@@ -433,8 +437,8 @@ export const credentialCommand: CommandModule = {
               .command(
                 "show <name>",
                 "Show source metadata without resolving it",
-                sourceNamePositional,
-                handler((argv: ArgumentsCamelCase<NameArgs>) => runSource(() => sourceShowIntent({ name: argv.name }))),
+                (cmd) => sourceNamePositional(cmd).option("show-refs", { type: "boolean", describe: SHOW_REFS_DESCRIBE }),
+                handler((argv: ArgumentsCamelCase<SourceShowArgs>) => runSource(() => sourceShowIntent({ name: argv.name, showRefs: argv["show-refs"] === true }))),
               )
               .command(
                 "check <name>",
