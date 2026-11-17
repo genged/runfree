@@ -6,8 +6,8 @@ import type { TokenResolutionReceipt } from "../token-resolution.ts";
 
 export type TokenSource =
   | ({ source: "env"; env: string } & TokenRefreshConfig)
-  | ({ source: "1password"; ref: string } & TokenRefreshConfig)
-  | ({ source: "named"; name: string } & TokenRefreshConfig)
+  | ({ source: "1password"; ref: string; via?: string } & TokenRefreshConfig)
+  | ({ source: "named"; name: string; via?: string } & TokenRefreshConfig)
   | ({ source: "file"; path: string } & TokenRefreshConfig)
   | ({ source: "cmd"; command: string } & TokenRefreshConfig);
 

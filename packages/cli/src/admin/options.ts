@@ -51,12 +51,18 @@ export {
   credentialStatus,
   credentialSyncIntent,
   revokeDesiredCredentialState,
+  unattendedCredentialCheckIntent,
 } from "./credential-policy.ts";
 export {
+  type ConnectionTokenInput,
   sourceAddCommandIntent,
   sourceAddGoogleServiceAccountIntent,
   sourceAddJwtIntent,
+  sourceAddOnePasswordConnectionIntent,
+  sourceCheckIntent,
+  type SourceOnePasswordInput,
   sourceList,
+  sourceLoginIntent,
   sourceRemoveIntent,
   sourceShowIntent,
 } from "./source-policy.ts";

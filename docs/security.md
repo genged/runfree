@@ -259,10 +259,17 @@ the token to an allowed request.
 - The proxy CA private key is mounted only into the proxy.
 - A value revoked at its source is dropped at the next read. A short outage,
   such as a locked vault, keeps the last good value.
+- A headless run reads only sources that cannot ask a person: environment
+  variables and 1Password connection sources. Any other source refuses the
+  run before its provider starts.
+- A 1Password connection keeps its service account token in the macOS login
+  Keychain and gives it only to the `op` process.
 
 You decide:
 
 - Which source each credential comes from. The source config is host-owned.
+- Which vaults a connection's service account can read. A run can read
+  every item in them.
 - How broad each token is. Runfree checks host, method, and path, not the
   token's scope.
 
@@ -273,9 +280,12 @@ Limits:
 - A Google service-account key removed from 1Password can stay in use for
   up to 4 hours plus one JWT lifetime. Delete the key in Google Cloud IAM to
   stop it at once.
+- A 1Password connection's Keychain item trusts `/usr/bin/security`, so
+  reads never ask. Any process that runs as your macOS user can therefore
+  read the service account token with `security`, without a prompt.
 
 The rules are in [Credentials rules](security-rules.md#credentials) (`CRED-1`
-to `CRED-6`).
+to `CRED-8`).
 
 ### Git Over HTTPS
 

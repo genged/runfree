@@ -7,9 +7,13 @@ import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, test } from "vitest";
 
 import { TokenResolutionError } from "../token-resolution.ts";
-import { type CommandSourceInvocation, type CredentialReadPlan, type OnePasswordRead, createCredentialPreparationScope, readOnePasswordRef } from "./admin-core.ts";
+import { type CommandSourceInvocation, type CredentialReadPlan, type OnePasswordRead, createCredentialPreparationScope, readOnePasswordRef, runAdminAction } from "./admin-core.ts";
+import { createAdminState } from "./context.ts";
+import { keychainItemForSource } from "./keychain-login.ts";
+import { forbidCredentialInteraction } from "./credential-interaction.ts";
 import { type CredentialLifetime, createCredentialLifetime } from "./credential-cancellation.ts";
 import { type CredentialReadInput, readCredentialSource, runOwnedProvider } from "./credential-source-reader.ts";
+import { APP_LOGIN, type OnePasswordLogin } from "./onepassword-connection.ts";
 
 // Real processes throughout: the reader's bounds are about what a real
 // provider and its descendants do, so no fake stands in for them.
@@ -47,7 +51,7 @@ function commandRead(executable: string, timeoutMs = 10_000): CredentialReadInpu
 }
 
 function onePasswordRead(executable: string, ref = "op://Private/Item/field", environment: NodeJS.ProcessEnv = env): OnePasswordRead {
-  return { executable, ref, env: environment, timeoutMs: 10_000, quiet: true };
+  return { executable, ref, env: environment, cwd: tmp, timeoutMs: 10_000, quiet: true, login: APP_LOGIN };
 }
 
 function processGone(pid: number): boolean {
@@ -158,6 +162,147 @@ describe("readCredentialSource", () => {
     await lifetime.close();
     expect(await reading).toEqual({ kind: "cancelled" });
     expect(fs.readFileSync(log, "utf8").split("\n").filter(Boolean)).toEqual(["read"]);
+  });
+});
+
+describe("readCredentialSource through a connection", () => {
+  const SA_TOKEN = `ops_${"S".repeat(48)}.sentinel-sa-token`;
+  const CONNECTION: OnePasswordLogin = Object.freeze({ kind: "connection", sourceName: "automation", keychain: keychainItemForSource("automation") });
+
+  // `security` and `op` are real scripts; the admin state only points the
+  // reader at the fake `security` (the test seam needs RUNFREE_TEST_FAKE_DOCKER).
+  async function readThroughConnection(
+    securityBody: string,
+    opBody: string,
+    lifetime: CredentialLifetime,
+    lockCheckBody?: string,
+  ): Promise<{ result: Awaited<ReturnType<typeof readCredentialSource>>; log: string[] }> {
+    const log = path.join(tmp, "calls.log");
+    const security = script("security", `echo "security $1" >> '${log}'\n${securityBody}`);
+    const lockCheck = lockCheckBody === undefined ? {} : { RUNFREE_TEST_OSASCRIPT_PATH: script("osascript", `echo "osascript $1 $2" >> '${log}'\n${lockCheckBody}`) };
+    const op = script("op", `echo "op $1 token=$OP_SERVICE_ACCOUNT_TOKEN biometric=$OP_BIOMETRIC_UNLOCK_ENABLED account=$OP_ACCOUNT cwd=$(pwd -P)" >> '${log}'\n${opBody}`);
+    const workDir = path.join(tmp, "op-cwd");
+    fs.mkdirSync(workDir, { recursive: true });
+    const read: OnePasswordRead = { executable: op, ref: "op://A/b/c", env: Object.freeze({ ...env, OP_ACCOUNT: "personal" }), cwd: workDir, timeoutMs: 10_000, quiet: true, login: CONNECTION };
+    let result: Awaited<ReturnType<typeof readCredentialSource>> | undefined;
+    const state = createAdminState({
+      env: { ...process.env, RUNFREE_TEST_FAKE_DOCKER: "1", RUNFREE_TEST_SECURITY_PATH: security, ...lockCheck },
+      projectRoot: tmp,
+      packageRoot: tmp,
+      stateDir: path.join(tmp, "state"),
+    });
+    await runAdminAction(state, async () => {
+      result = await readCredentialSource({ tokenName: "probe", fingerprint: "f".repeat(64), plan: { kind: "1password", read } }, lifetime);
+    });
+    if (!result) throw new Error("no result");
+    return { result, log: fs.existsSync(log) ? fs.readFileSync(log, "utf8").split("\n").filter(Boolean) : [] };
+  }
+
+  test("a connection read runs security, then op with only the login env", async () => {
+    const { result, log } = await readThroughConnection(`printf '%s\\n' '${SA_TOKEN}'`, "echo connection-value", watchLifetime());
+    expect(result).toEqual({ kind: "success", value: "connection-value", resolvedAt: expect.any(Number) });
+    expect(log).toEqual(["security find-generic-password", `op read token=${SA_TOKEN} biometric=false account= cwd=${fs.realpathSync(path.join(tmp, "op-cwd"))}`]);
+  });
+
+  test("a watch stopped during the Keychain read never reaches op", async () => {
+    const marker = path.join(tmp, "security-started");
+    const lifetime = watchLifetime();
+    const reading = readThroughConnection(`touch '${marker}'; while :; do sleep 0.1; done`, "echo never", lifetime);
+    expect(await waitFor(() => fs.existsSync(marker))).toBe(true);
+    await lifetime.close();
+    const { result, log } = await reading;
+    expect(result).toEqual({ kind: "cancelled" });
+    expect(log).toEqual(["security find-generic-password"]);
+  });
+
+  test("a locked Keychain is a transient source failure and op never runs", async () => {
+    const { result, log } = await readThroughConnection("echo 'User interaction is not allowed.' >&2; exit 36", "echo never", watchLifetime());
+    expect(result.kind).toBe("source-failure");
+    const error = result.kind === "source-failure" ? result.error as TokenResolutionError : undefined;
+    expect({ classification: error?.classification, code: error?.code, message: error?.safeMessage }).toEqual({
+      classification: "transient",
+      code: "keychain-locked",
+      message: 'the login for source "automation" cannot be read (Keychain locked)',
+    });
+    expect(log).toEqual(["security find-generic-password"]);
+  });
+
+  test("a Keychain the lock check finds locked fails transient before security or op starts", async () => {
+    const { result, log } = await readThroughConnection(`printf '%s\\n' '${SA_TOKEN}'`, "echo never", watchLifetime(), "echo locked");
+    expect(result.kind).toBe("source-failure");
+    const error = result.kind === "source-failure" ? result.error as TokenResolutionError : undefined;
+    expect({ classification: error?.classification, code: error?.code }).toEqual({ classification: "transient", code: "keychain-locked" });
+    expect(log).toEqual(["osascript -l JavaScript"]);
+  });
+
+  test.each([
+    ["unlocked", "echo unlocked"],
+    ["unknown", "exit 1"],
+  ])("a lock check that answers %s lets security and op run", async (_label, body) => {
+    const { result, log } = await readThroughConnection(`printf '%s\\n' '${SA_TOKEN}'`, "echo connection-value", watchLifetime(), body);
+    expect(result).toEqual({ kind: "success", value: "connection-value", resolvedAt: expect.any(Number) });
+    expect(log.map((line) => line.split(" ")[0])).toEqual(["osascript", "security", "op"]);
+  });
+
+  test("op stderr that echoes the login is redacted before classification", async () => {
+    const { result } = await readThroughConnection(`printf '%s\\n' '${SA_TOKEN}'`, `echo "[ERROR] unauthorized: $OP_SERVICE_ACCOUNT_TOKEN revoked" >&2; exit 1`, watchLifetime());
+    expect(result.kind).toBe("source-failure");
+    const error = result.kind === "source-failure" ? result.error as TokenResolutionError : undefined;
+    expect(error?.classification).toBe("definitive");
+    expect(error?.safeMessage).toContain("[redacted]");
+    expect(error?.safeMessage).not.toContain("sentinel-sa-token");
+  });
+});
+
+describe("readCredentialSource under the never-ask rule", () => {
+  async function underRule<T>(action: () => Promise<T>): Promise<T> {
+    const release = forbidCredentialInteraction();
+    try {
+      return await action();
+    } finally {
+      release();
+    }
+  }
+
+  function expectForbidden(result: Awaited<ReturnType<typeof readCredentialSource>>, message: string): void {
+    expect(result.kind).toBe("source-failure");
+    const error = result.kind === "source-failure" ? result.error as TokenResolutionError : undefined;
+    expect({ classification: error?.classification, code: error?.code, message: error?.safeMessage })
+      .toEqual({ classification: "transient", code: "interaction-forbidden", message });
+  }
+
+  test("an app 1Password read never starts op", async () => {
+    const marker = path.join(tmp, "op-ran");
+    const op = script("op", `touch '${marker}'; echo value`);
+    const result = await underRule(() => readCredentialSource({ tokenName: "probe", fingerprint: "f".repeat(64), plan: { kind: "1password", read: onePasswordRead(op) } }, watchLifetime()));
+    expectForbidden(result, "a run never starts a provider that may ask (1Password app read)");
+    expect(fs.existsSync(marker)).toBe(false);
+  });
+
+  test("a command source never spawns", async () => {
+    const marker = path.join(tmp, "command-ran");
+    const result = await underRule(() => readCredentialSource(commandRead(script("cmd", `touch '${marker}'; echo value`)), watchLifetime()));
+    expectForbidden(result, "a run never starts a provider that may ask (command source)");
+    expect(fs.existsSync(marker)).toBe(false);
+  });
+
+  test("a signing-key app read never starts op", async () => {
+    const marker = path.join(tmp, "op-ran");
+    const op = script("op", `touch '${marker}'; echo value`);
+    const plan = {
+      kind: "jwt",
+      source: { type: "jwt", alg: "ES256", privateKey: { source: "1password", ref: "op://A/k/pem" }, headers: {}, claims: {}, ttlSeconds: 60, createdAt: "x" },
+      options: {},
+      signingKey: { kind: "read", read: onePasswordRead(op, "op://A/k/pem") },
+    } as unknown as CredentialReadPlan;
+    const result = await underRule(() => readCredentialSource({ tokenName: "probe", fingerprint: "f".repeat(64), plan }, watchLifetime()));
+    expectForbidden(result, "a run never starts a provider that may ask (1Password app read)");
+    expect(fs.existsSync(marker)).toBe(false);
+  });
+
+  test("after the rule is released the same read runs", async () => {
+    const result = await readCredentialSource(commandRead(script("cmd", "echo value")), watchLifetime());
+    expect(result).toMatchObject({ kind: "success", value: "value" });
   });
 });
 

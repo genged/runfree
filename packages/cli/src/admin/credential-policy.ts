@@ -7,6 +7,7 @@ import type {
   TokenResolutionReceipt,
 } from "../token-resolution.ts";
 import {
+  assertKnownSourceName,
   assertNotReservedUserTokenName,
   assertRefreshBeforeJwtExpiry,
   assertTokenSourceCanBeSaved,
@@ -30,6 +31,7 @@ import {
   formatDelayMs,
   formatDurationSeconds,
   forgetLedgerResolutions,
+  isConnectionSource,
   isTokenResolutionReceipt,
   type JwtPrivateKeyCacheEntry,
   loadPolicy,
@@ -41,6 +43,9 @@ import {
   planWatchCredentialReads,
   printTokenSyncFailures,
   type ProxyRuntime,
+  readConnectionLoginSync,
+  checkConnectionLoginForRun,
+  CONNECTION_LOGIN_REJECTED,
   proxyRuntime,
   type ProxyRuntimeState,
   removeProxyRuntimeToken,
@@ -55,8 +60,10 @@ import {
   type TokenSyncResult,
   withAdminCallTimeout,
   tokenResolutionLedgerKey,
+  type SourceRegistry,
   type TokenSource,
   tokenSourceFingerprint,
+  tokenSourceReadsRegistry,
   tokenSourceFromSelection,
   type TokenSourceSelection,
   tokenSyncWatchNowMs,
@@ -64,6 +71,16 @@ import {
   type WatchTokenPreparation,
   withTokenStoreLock,
 } from "./admin-core.ts";
+import { runfreeError } from "../warnings.ts";
+import { remedy } from "../remedies.ts";
+import { TokenResolutionError } from "../token-resolution.ts";
+import { assertKeychainPlatform, ConnectionSetupError, KEYCHAIN_LOCKED, KEYCHAIN_UNLOCK_FIX } from "./keychain-login.ts";
+import {
+  connectionSourceNames,
+  forbidCredentialInteraction,
+  unattendedReadVerdict,
+  unattendedRefusalLines,
+} from "./credential-interaction.ts";
 import {
   ChildSignaledError,
   CredentialCancellationError,
@@ -104,15 +121,26 @@ export function credentialSourceSelectionFromArgs(fields: {
   onePassword?: string;
   source?: string;
   stdin?: boolean;
+  via?: string;
 }): TokenSourceSelection {
   const present =
     [fields.env, fields.onePassword, fields.source].filter((value) => value !== undefined).length +
     (fields.stdin ? 1 : 0);
   if (present > 1) die("choose only one credential source");
+  // `--via` names the 1password connection a reference (or a source's
+  // 1Password key) is read through; refused before any read or write when
+  // the chosen source has nothing to read through it.
+  const { via } = fields;
+  if (via !== undefined) {
+    if (fields.env !== undefined) die("--via reads op:// references through a connection; --from-env never asks and takes no --via");
+    if (fields.onePassword === undefined && fields.source === undefined) die("--via needs --from-1password or --from-source");
+    assertKnownSourceName(via);
+  }
+  const viaField = via === undefined ? {} : { via };
   if (fields.stdin) return { kind: "stdin" };
   if (fields.env !== undefined) return { kind: "env", env: fields.env };
-  if (fields.source !== undefined) return { kind: "named", name: fields.source };
-  if (fields.onePassword !== undefined) return { kind: "1password", ref: fields.onePassword };
+  if (fields.source !== undefined) return { kind: "named", name: fields.source, ...viaField };
+  if (fields.onePassword !== undefined) return { kind: "1password", ref: fields.onePassword, ...viaField };
   return { kind: "none" };
 }
 
@@ -174,7 +202,7 @@ type TokenSyncRuntimeSnapshot = { runtimeState: ProxyRuntimeState; storeGenerati
 function nextTokenSyncDelayMs(ledger: TokenResolutionLedger, snapshot?: TokenSyncRuntimeSnapshot): number | undefined {
   const config = loadTokenConfig();
   const policy = loadPolicy();
-  const sourceRegistry = Object.values(config).some((source) => source.source === "named")
+  const sourceRegistry = Object.values(config).some((source) => tokenSourceReadsRegistry(source))
     ? loadSourceRegistry()
     : undefined;
   const runtime = snapshot ?? ((): TokenSyncRuntimeSnapshot => {
@@ -707,11 +735,121 @@ export async function credentialClearSourceIntent(input: CredentialClearSourceIn
   });
 }
 
+/** What a `runfree run` does with one binding: static, from configuration only. */
+function describeUnattendedRead(source: TokenSource, registry: SourceRegistry | undefined): string {
+  const verdict = unattendedReadVerdict(source, registry);
+  if (verdict.kind === "never-asks") return "reads without asking";
+  switch (verdict.reason) {
+    case "1password-app":
+      return "refused (uses the 1Password app, which may ask)";
+    case "command":
+      return "refused (runs a command source)";
+    case "signing-key-1password-app":
+      return "refused (reads its signing key with the 1Password app)";
+  }
+}
+
+/** `runfree run` refuses with this code when a credential source may ask. */
+const RUN_REFUSED_EXIT = 65;
+
+/**
+ * The run preflight of the never-ask rule: every binding the selected policy
+ * references that may ask is listed with its fix, and the run refuses (65)
+ * before the prompt copy, Docker, and any credential read. When the policy
+ * cannot be read, every configured binding is checked. When no binding may
+ * ask, it then checks each connection those bindings use, once per
+ * connection: `security` reads the login and one service-account `op whoami`
+ * checks it with 1Password. A login a run cannot read, that 1Password refuses
+ * (revoked or invalid), or that 1Password cannot check now (no answer, a
+ * network failure) refuses the run too, even when the proxy still holds a
+ * value from an earlier sync. It never runs the 1Password app and writes
+ * nothing; a login read stays in this frame and never reaches output.
+ */
+export function unattendedCredentialCheckIntent(): void {
+  const config = loadTokenConfig();
+  let names: string[];
+  try {
+    names = Object.keys(loadPolicy().tokens);
+  } catch {
+    names = Object.keys(config);
+  }
+  let registry: ReturnType<typeof loadSourceRegistry> | undefined;
+  try {
+    registry = loadSourceRegistry();
+  } catch {
+    // A named binding then fails on its own at read time, before any spawn.
+    registry = undefined;
+  }
+  const connections = connectionSourceNames(registry);
+  let refused = false;
+  for (const name of [...new Set(names)].sort()) {
+    const source = config[name];
+    if (!source) continue;
+    const verdict = unattendedReadVerdict(source, registry);
+    if (verdict.kind === "never-asks") continue;
+    let owner: ReturnType<typeof credentialOwner>;
+    try {
+      owner = credentialOwner(name);
+    } catch {
+      owner = undefined;
+    }
+    runfreeError(unattendedRefusalLines({ tokenName: name, source, reason: verdict.reason, owner, connections }).join("\n"));
+    refused = true;
+  }
+  if (!refused) refused = refuseUnreadableConnectionLogins(names, config, registry);
+  if (!refused) return;
+  runfreeError("the headless run did not start");
+  process.exitCode = RUN_REFUSED_EXIT;
+}
+
+// The connections the run's bindings read through, sorted. A `via` that names
+// no connection fails on its own at read time, before any spawn.
+function runConnectionNames(names: readonly string[], config: ReturnType<typeof loadTokenConfig>, registry: SourceRegistry | undefined): string[] {
+  const connections = new Set<string>();
+  for (const name of names) {
+    const source = config[name];
+    if (!source || (source.source !== "1password" && source.source !== "named") || source.via === undefined) continue;
+    if (isConnectionSource(registry?.[source.via])) connections.add(source.via);
+  }
+  return [...connections].sort();
+}
+
+// A locked Keychain needs an unlock, not a new login; a check that could not
+// finish gets no fix, since a new login would not help.
+function connectionRefusalFix(connection: string, error: TokenResolutionError): string[] {
+  if (error.sourceKind === "keychain" && error.code === KEYCHAIN_LOCKED) return [`  fix: ${KEYCHAIN_UNLOCK_FIX}`];
+  if (error.sourceKind === "keychain" || error.code === CONNECTION_LOGIN_REJECTED) return [`  fix: ${remedy.credentialSourceLogin(connection)}`];
+  return [];
+}
+
+function refuseUnreadableConnectionLogins(names: readonly string[], config: ReturnType<typeof loadTokenConfig>, registry: SourceRegistry | undefined): boolean {
+  let refused = false;
+  for (const connection of runConnectionNames(names, config, registry)) {
+    const entry = registry?.[connection];
+    if (!isConnectionSource(entry)) continue;
+    try {
+      assertKeychainPlatform(childEnv());
+      const login = readConnectionLoginSync(connection, entry.keychain);
+      checkConnectionLoginForRun(connection, login);
+    } catch (error) {
+      if (error instanceof ConnectionSetupError) {
+        runfreeError(`run refused (65): source "${connection}": ${error.message}`);
+      } else if (error instanceof TokenResolutionError) {
+        runfreeError([`run refused (65): ${error.safeMessage}`, ...connectionRefusalFix(connection, error)].join("\n"));
+      } else {
+        throw error;
+      }
+      refused = true;
+    }
+  }
+  return refused;
+}
+
 export function credentialStatus(input: CredentialStatusInput = {}): void {
   const policy = loadPolicy();
   const config = loadTokenConfig();
   const status = loadTokenStatus();
-  const registry = Object.values(config).some((source) => source.source === "named") ? loadSourceRegistry() : undefined;
+  const registry = Object.values(config).some((source) => tokenSourceReadsRegistry(source)) ? loadSourceRegistry() : undefined;
   const allNames = Array.from(new Set([...Object.keys(policy.tokens), ...Object.keys(config)])).sort();
   const names = input.name ? allNames.filter((name) => name === input.name) : allNames;
 
@@ -734,6 +872,7 @@ export function credentialStatus(input: CredentialStatusInput = {}): void {
     const owner = credentialOwner(name);
     console.log(`  owner: ${owner ? describeCredentialOwner(owner) : "manual"}`);
     console.log(`  refresh: ${describeEffectiveRefresh(refresh)}`);
+    if (source) console.log(`  runfree run: ${describeUnattendedRead(source, registry)}`);
     console.log("  agent exposure: no");
     if (!credentialPolicy && source) {
       console.log(name.startsWith("user-")
@@ -800,6 +939,7 @@ export async function credentialSyncIntent(input: CredentialSyncInput): Promise<
   if (!input.watch && !input.cacheSourceSecrets) die("--no-cache-source-secrets only applies with --watch");
   if (!input.watch && input.delayFirstSync) die("--delay-first-sync only applies with --watch");
   if (!input.watch && input.initialSourceTruth) die("--initial-source-truth only applies with --watch");
+  if (!input.watch && input.unattended) die("--unattended only applies with --watch");
   if (input.watch && input.mode) die(`a ${input.mode} sync is one-shot`);
   if (input.mode === "prepared-source-truth") {
     await preparedSourceTruthSync(input.verbose, input.holdDeadlineMonotonicMs);
@@ -833,13 +973,19 @@ export async function credentialSyncIntent(input: CredentialSyncInput): Promise<
     return;
   }
   if (input.watch) {
-    await syncTokensWatch({
-      cacheSourceSecrets: input.cacheSourceSecrets,
-      delayFirstSync: input.delayFirstSync,
-      initialSourceTruth: input.initialSourceTruth === true,
-      quiet: input.quiet,
-      verbose: input.verbose,
-    });
+    // A run's watcher reads only sources that never ask, on every pass.
+    const releaseRule = input.unattended ? forbidCredentialInteraction() : () => {};
+    try {
+      await syncTokensWatch({
+        cacheSourceSecrets: input.cacheSourceSecrets,
+        delayFirstSync: input.delayFirstSync,
+        initialSourceTruth: input.initialSourceTruth === true,
+        quiet: input.quiet,
+        verbose: input.verbose,
+      });
+    } finally {
+      releaseRule();
+    }
     return;
   }
   const result = await syncTokensSettlingSignals({ exitOnFailure: true, verbose: input.verbose, mode: "source-truth" });

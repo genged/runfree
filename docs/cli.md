@@ -187,8 +187,54 @@ keystroke from a terminal reaches the agent.
 
 A run never prompts. A step that needs an answer refuses instead (exit 65):
 new authority that `runfree policy approve` or `runfree control approve` must
-approve, a service review, and a host credential source that cannot be read
-(for example, a locked 1Password).
+approve, a service review, and a host credential source that may ask a person
+or that cannot be read.
+
+**Credential sources that may ask are refused.** A run reads only sources
+that cannot ask a person: environment variables, and `op://` references or
+`jwt` and `google-service-account` keys read through a
+[1Password connection source](#1password-connection-sources) (`--via`). It
+refuses a binding that reads 1Password through the desktop app, a signing
+key read through the app, and every command source: a timeout can end the
+wait, but it cannot stop a dialog. A host `OP_SERVICE_ACCOUNT_TOKEN` changes
+nothing; only a binding's `--via` counts.
+
+- After the run lock and the run record, and before the prompt copy, Docker,
+  or any credential read, `run` checks every binding the project's policy
+  uses (every configured binding when the policy cannot be read). It checks
+  again right after the launch selects the effective policy generation it
+  will run on, still before the prompt copy and Docker. Each binding that
+  may ask prints one refusal with the fix, and the run exits 65. When no
+  binding may ask, each check then reads the login of each connection source
+  the bindings use and checks it once with 1Password (`op whoami` with the
+  service account only). A locked login Keychain exits 65 before any
+  Keychain read, with the fix to unlock it. Another login that cannot be
+  read, or a login that 1Password refuses, exits 65 with
+  `runfree credential source login <name>`; a check that cannot finish (no
+  answer, a network failure) exits 65 with no fix.
+  With one connection source named `automation`, a binding refusal reads:
+
+  ```text
+  runfree error: run refused (65): github uses the 1Password app, which may ask
+      fix: runfree credential set-source github --from-1password op://<vault>/<item>/<field> --via automation --replace-source
+  runfree error: the headless run did not start
+  ```
+
+  With no connection source yet, the refusal first names
+  `runfree credential source 1password <connection>`; with several, it lists
+  them. A service binding's fix uses `runfree service enable`, a command
+  source also gets an `--from-env` fix, and an MCP server binding's fix is an
+  environment variable source.
+- The same rule holds inside the run for every read: startup, the warm-launch
+  fallback, signing-key reads, and the run's credential watcher. A read that
+  may ask fails before its provider starts, and the run's sync fails (65).
+  That failure is a short failure, so it never removes a value that an
+  interactive session in the same project holds. A Keychain or 1Password
+  failure after the checks is short too: the proxy keeps its value, so a
+  screen lock does not stop a run that started.
+- `runfree credential status` shows, for each configured binding, whether a
+  run can read it (`runfree run: reads without asking` or the reason it is
+  refused).
 
 **Writes that would ask are denied, not held.** A headless session has no
 approver, so the proxy denies an `ask` write at once. Interactive sessions in
@@ -232,7 +278,7 @@ confirmed. A second signal only shortens the container stop.
 | 0 | Success: the agent exited 0 and reported a final success. |
 | 1–63 | The agent failed (its own code; a code above 63 becomes 1), or the result is unverified (1): no final success, a lost status, an incomplete output stream, or denied writes that could not be counted. |
 | 64 | Usage error: a bad flag, agent, timeout, or prompt file. Nothing was started. |
-| 65 | Refused before the launch: an invalid project config or network policy, approval, service review, login or credential source. |
+| 65 | Refused before the launch: an invalid project config or network policy, approval, service review, login, or a credential source that may ask or cannot be read. |
 | 66 | Skipped: another run holds the project lock. |
 | 67 | Timeout or signal, whatever the agent returned. |
 | 68 | The agent succeeded, but writes were denied and `--accept-denied-writes` was not given. |
@@ -267,7 +313,9 @@ the next `runfree run` in the project deletes records older than 7 days.
 
 Use a launchd `LaunchAgent`, which runs in your GUI login session. cron is not
 supported: a cron job has no login keychain and no 1Password session, and it
-may not find the Docker Desktop socket. A credential source that cannot be
+may not find the Docker Desktop socket. A run reads 1Password only through a
+[connection source](#1password-connection-sources), so it never waits on a
+locked desktop app or a Touch ID prompt; a source that may ask or cannot be
 read refuses the run (65). Save this as
 `~/Library/LaunchAgents/com.example.runfree-nightly.plist`, with your own
 paths:
@@ -719,6 +767,97 @@ signed JWT. A service that uses one lists its setup in
 - The service account needs no Google Cloud IAM roles. Its access comes from
   the account being a user in the Google product the service calls.
 
+#### 1Password connection sources
+
+A `1password` connection source logs in to 1Password with a service account,
+so a read never asks a person: no desktop-app unlock, no Touch ID, no
+approval dialog. A [headless run](#headless-runs) reads 1Password only
+through a connection. Connection sources need macOS: the login lives in the
+macOS login Keychain, and every other platform refuses them.
+
+```bash
+runfree credential source 1password automation
+pbpaste | runfree credential source 1password automation --token-stdin
+runfree credential source show automation
+runfree credential source check automation
+runfree credential source login automation
+runfree credential source remove automation
+```
+
+- `credential source 1password <name>` asks for the service account token
+  with hidden input, or reads it from stdin with `--token-stdin`. Without a
+  terminal and without `--token-stdin`, it refuses. The token is never a
+  command-line argument.
+- It checks the token with 1Password before it saves anything: the login
+  must be a service account, and it must read at least one vault. It prints
+  the vaults the account can read.
+- The token goes into the macOS login Keychain as a generic password with
+  service `runfree.credential-source` and the source name as its account.
+  The item trusts `/usr/bin/security`, so reads never ask; any process that
+  runs as your macOS user can read the token with `security` without a
+  prompt. The source registry records only that item name, never the token.
+- On each read, Runfree reads the token from the Keychain and gives it only
+  to the `op` process, as `OP_SERVICE_ACCOUNT_TOKEN`, with biometric
+  unlock, desktop-app settings, and the `op` cache turned off
+  (`OP_BIOMETRIC_UNLOCK_ENABLED`, `OP_LOAD_DESKTOP_APP_SETTINGS`, and
+  `OP_CACHE` set to `false`). Without them, `op` started by launchd makes
+  macOS ask for access to another app's data at every start. That process gets only `PATH`, `HOME`, `USER`,
+  and `LOGNAME` from the host, with project paths and `node_modules/.bin`
+  entries removed, and no other `OP_*` variable. It runs in Runfree's host
+  config directory, not in the project. The token never reaches the
+  project, the agent, the proxy, a log, a message, or a run record.
+- A service account reads only the vaults it was granted. It cannot read a
+  personal vault such as Private, so put the items a run needs in a shared
+  vault and grant the service account that vault.
+- An existing name is refused. `credential source login <name>` replaces
+  the stored token. It checks the new token with 1Password first, so a
+  rejected token leaves the old login in place. Bindings that read through
+  the source keep working with the new login.
+- `credential source check <name>` reads the stored login and asks
+  1Password which vaults it can read. It prints the fix
+  (`runfree credential source login <name>`) when the login is missing,
+  unreadable, or refused. It applies only to connection sources.
+- `credential source remove <name>` refuses while a binding uses the
+  source. It deletes the Keychain item first, then the registry entry. If
+  the Keychain refuses the delete, nothing is removed; a rerun finishes a
+  remove that stopped between the two steps.
+- Before each `security` call on a connection login, Runfree checks whether
+  the default keychain (normally the login Keychain) is locked. The check
+  reads the keychain status with `SecKeychainGetStatus` through
+  `/usr/bin/osascript` and never shows a dialog. When the Keychain is
+  locked, Runfree does not start `security`: a read fails as a locked
+  Keychain, and `credential source login` and `credential source remove`
+  refuse and change nothing. The fix is to unlock the Mac's login Keychain
+  (log in to the Mac). When the check cannot tell, Runfree runs `security`
+  with its usual 10-second limit. A `security` call on a locked Keychain can
+  show an unlock dialog while the screen is unlocked, and stopping that call
+  can leave macOS asking for the Keychain password again and again; the
+  check prevents that, except when the Keychain locks between the check and
+  the read or the check cannot tell.
+- A missing Keychain item or a revoked token is a definitive failure, so the
+  proxy drops the value. A locked Keychain or a Keychain that does not answer
+  is a short failure, so the proxy keeps the last good value.
+
+A connection source is not a value. Bind an `op://` reference, or a `jwt` or
+`google-service-account` source, and name the connection with `--via`:
+
+```bash
+runfree credential set-source github --from-1password op://Automation/github/token --via automation --replace-source
+runfree credential set-source appstore --from-source appstore-jwt --via automation --replace-source
+```
+
+A `--via` on a `jwt` or `google-service-account` binding reads that source's
+1Password key through the connection, so the key must be in a vault the
+connection can read. The binding saves the connection's name, and a
+`credential source login` rotation does not change the binding. A
+`--from-1password` reference is read once through the connection before the
+binding is saved. `--via` is refused before any read or write when:
+
+- the source is `--from-env` or `--from-stdin`, or no source is given;
+- the `--from-source` source is a command source, or is itself a connection;
+- the named connection does not exist or is not a `1password` connection
+  source.
+
 ### Credential policy and destinations
 
 Allow the destination host explicitly, then configure where the proxy may inject the credential. The persisted policy retains the `tokens` field name for compatibility.
@@ -745,6 +884,7 @@ Useful options:
 | `--path-prefix /path/` | credential destination | Inject only for matching request paths. |
 | `--refresh-every 15m` | `credential set-source`, `credential add` | Re-resolve source on an interval. |
 | `--from-env`, `--from-1password`, `--from-source`, `--from-stdin` | credential source binding | Choose one credential source. |
+| `--via <connection>` | `credential add`, `credential set-source` | Read the `--from-1password` reference, or the `--from-source` signing key, through a [1Password connection source](#1password-connection-sources). |
 
 The CLI selects a destination by host and header only. When a credential
 already has a destination on that host and header with a different scope
@@ -804,6 +944,7 @@ Important enable options:
 | Option | Use |
 | --- | --- |
 | `--from-env`, `--from-1password`, `--from-1password-item`, `--from-source`, `--from-stdin` | Bind a credential-bearing service to a host-owned source. |
+| `--via <connection>` | Read the `--from-1password` reference, every `--from-1password-item` field, or the `--from-source` signing key through a [1Password connection source](#1password-connection-sources). Each binding the enable writes saves the connection. |
 | `--param <key>=<value>` | Supply a declared non-secret service parameter (an OAuth client id, an account or team id); repeatable. `service explain <id>` lists a service's parameters. When the flag is absent, the host env var named by the parameter is used, then the value recorded by an earlier enable, then a prompt on a TTY; a `--from-1password-item` enable reads the item field of the same name. A missing or malformed parameter refuses the enable before anything is written. |
 | `--replace-source` | Replace an existing source binding. |
 | `--skip-broad` | Enable without broad multi-tenant hosts. |
@@ -1135,6 +1276,7 @@ set to `deny` stays denied. The rules are in [security-rules.md](security-rules.
 | `--no-discover` | Make no network call. Use only `--oauth-host` hosts. |
 | `--login` | Run the OAuth login (`runfree mcp auth`) after enabling. It starts an agent session and needs a terminal. Without it, `enable` prints the login command. |
 | `--from-env`, `--from-1password`, `--from-source`, `--from-stdin` | Bind a project entry's static header to a host-owned credential source. Choose one. |
+| `--via <connection>` | Read the `--from-1password` reference, or the `--from-source` signing key, through a [1Password connection source](#1password-connection-sources). |
 | `--replace-source` | Replace an existing credential source for this server. |
 
 Discovery needs a terminal. Without one, `mcp enable` refuses before any DNS

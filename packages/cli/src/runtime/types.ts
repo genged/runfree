@@ -87,6 +87,13 @@ export type RuntimeAdminIntent =
    */
   | { kind: "token-sync"; verbose: boolean; mode: "prepared-source-truth"; holdDeadlineMonotonicMs: number }
   | { kind: "prepare-token-sources"; mode?: "source-truth" | "convergence" }
+  /**
+   * The `runfree run` preflight of the never-ask rule: lists every binding
+   * that may ask and exits 65; then reads and checks each connection login
+   * once (`security`, one service-account `op whoami`). Reads no credential
+   * value and writes nothing.
+   */
+  | { kind: "unattended-credential-check" }
   | { kind: "prepare" };
 
 export type PiProviderChoice = "agent-codex" | "agent-claude" | "configure" | "custom";
@@ -114,7 +121,8 @@ export type RuntimeIO = {
   startTokenAutoRefresh?: (
     context: RuntimeContext,
     receipts?: TokenResolutionReceipt[],
-    options?: Readonly<{ initialSourceTruth?: boolean }>,
+    /** `unattended`: the watcher holds the never-ask rule (a headless run's watcher). */
+    options?: Readonly<{ initialSourceTruth?: boolean; unattended?: boolean }>,
   ) => { stop: () => void };
   takeTokenResolutionReceipts?: () => TokenResolutionReceipt[];
 };

@@ -2088,6 +2088,16 @@ describe("admin service command (typed)", () => {
     await expect(
       runCommandApp(strictContext(), ["service", "enable", "github", "--from-env", "A", "--from-source", "B"], runDefault),
     ).rejects.toMatchObject({ message: expect.stringContaining("choose only one credential source") });
+    // --via is part of the typed selection: an incompatible pair never reaches enforcement.
+    await expect(
+      runCommandApp(strictContext(), ["service", "enable", "github", "--from-env", "A", "--via", "automation"], runDefault),
+    ).rejects.toMatchObject({ message: expect.stringContaining("--from-env never asks and takes no --via") });
+    await expect(
+      runCommandApp(strictContext(), ["service", "enable", "github", "--via", "automation"], runDefault),
+    ).rejects.toMatchObject({ message: expect.stringContaining("--via needs --from-1password or --from-source") });
+    await expect(
+      runCommandApp(strictContext(), ["service", "enable", "github", "--from-1password", "op://A/b/c", "--via"], runDefault),
+    ).rejects.toMatchObject({ message: expect.stringContaining("Not enough arguments following: via") });
     // --param needs a value; a bare flag is a parser error, not an enforcement one.
     await expect(
       runCommandApp(strictContext(), ["service", "enable", "apple-ads", "--param"], runDefault),
@@ -2113,6 +2123,12 @@ describe("admin service command (typed)", () => {
         ["service", "enable", "apple-ads", "--from-source", "apple", "--param", "client-id=SEARCHADS.x", "--param", "APPLE_ADS_CLIENT_ID=y"],
         runDefault,
       ),
+    ).rejects.toThrow("adminContext() must not be called");
+    await expect(
+      runCommandApp(strictContext(), ["service", "enable", "github", "--from-1password", "op://A/b/c", "--via", "automation"], runDefault),
+    ).rejects.toThrow("adminContext() must not be called");
+    await expect(
+      runCommandApp(strictContext(), ["service", "enable", "apple-ads", "--from-1password-item", "op://A/apple", "--via", "automation"], runDefault),
     ).rejects.toThrow("adminContext() must not be called");
     await expect(runCommandApp(strictContext(), ["service", "list"], runDefault)).rejects.toThrow(
       "adminContext() must not be called",
@@ -2156,6 +2172,12 @@ describe("admin credential/host/mcp commands", () => {
     await expect(
       runCommandApp(strictContext(), ["credential", "set-source", "gh", "--from-env", "A", "--from-source", "B"], runDefault),
     ).rejects.toMatchObject({ message: expect.stringContaining("choose only one credential source") });
+    await expect(
+      runCommandApp(strictContext(), ["credential", "add", "gh", "--host", "x", "--from-env", "A", "--via", "automation"], runDefault),
+    ).rejects.toMatchObject({ message: expect.stringContaining("--from-env never asks and takes no --via") });
+    await expect(
+      runCommandApp(strictContext(), ["credential", "set-source", "gh", "--from-stdin", "--via", "automation"], runDefault),
+    ).rejects.toMatchObject({ message: expect.stringContaining("--via needs --from-1password or --from-source") });
     expect(runDefault).not.toHaveBeenCalled();
 
     for (const args of [
@@ -2165,6 +2187,8 @@ describe("admin credential/host/mcp commands", () => {
       ["credential", "remove", "gh", "--no-reload"],
       ["credential", "status", "gh"],
       ["credential", "sync", "-v"],
+      ["credential", "add", "gh", "--host", "x", "--from-1password", "op://A/b/c", "--via", "automation", "--no-reload"],
+      ["credential", "set-source", "gh", "--from-source", "appstore-jwt", "--via", "automation"],
     ]) {
       await expect(runCommandApp(strictContext(), args, runDefault)).rejects.toThrow("adminContext() must not be called");
     }
@@ -2263,6 +2287,9 @@ describe("admin credential/host/mcp commands", () => {
       runCommandApp(strictContext(), ["mcp", "enable", "claude", "srv", "--from-env", "X", "--from-source", "Y"], runDefault),
     ).rejects.toMatchObject({ message: expect.stringContaining("choose only one credential source") });
     await expect(
+      runCommandApp(strictContext(), ["mcp", "enable", "claude", "srv", "--from-env", "X", "--via", "automation"], runDefault),
+    ).rejects.toMatchObject({ message: expect.stringContaining("--from-env never asks and takes no --via") });
+    await expect(
       runCommandApp(strictContext(), ["mcp", "enable", "claude", "srv", "--oauth-host"], runDefault),
     ).rejects.toBeInstanceOf(CliError);
     await expect(
@@ -2282,6 +2309,9 @@ describe("admin credential/host/mcp commands", () => {
     ).rejects.toThrow("adminContext() must not be called");
     await expect(
       runCommandApp(strictContext(), ["mcp", "enable", "claude", "srv", "--source", "project", "--from-env", "X"], runDefault),
+    ).rejects.toThrow("adminContext() must not be called");
+    await expect(
+      runCommandApp(strictContext(), ["mcp", "enable", "claude", "srv", "--from-1password", "op://A/b/c", "--via", "automation"], runDefault),
     ).rejects.toThrow("adminContext() must not be called");
     await expect(
       runCommandApp(strictContext(), ["mcp", "rules", "claude", "srv", "--source", "user", "--tool", "query", "--write", "allow"], runDefault),

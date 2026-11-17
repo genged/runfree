@@ -25,6 +25,7 @@ import { BUILTIN_AGENT_DESCRIPTORS, builtinAgent } from "../agents.ts";
 import { runHeadlessAgentRuntime, type HeadlessRuntimeHooks, type HeadlessRuntimeResult } from "../runtime.ts";
 import { deferSignalExit } from "../signal-exit.ts";
 import { createHeadlessRuntimeIO, enterHeadlessTerminalMode } from "../terminal-mode.ts";
+import { forbidCredentialInteraction } from "../admin/credential-interaction.ts";
 import { flushWarnings, runfreeError, warn } from "../warnings.ts";
 import {
   createHeadlessOutputParser,
@@ -122,6 +123,13 @@ export type HeadlessRunDeps = Readonly<{
   setTimer: (ms: number, fire: () => void) => () => void;
   now: () => Date;
   stdout: (line: string) => void;
+  /**
+   * The never-ask preflight: nonzero when
+   * a credential source may ask a person, or a connection login cannot be
+   * read or checked with 1Password. It reads no credential value; it prints
+   * its own refusal.
+   */
+  credentialPreflight: (context: RuntimeContext, io: RuntimeIO) => Promise<number>;
 }>;
 
 const DEFAULT_DEPS: HeadlessRunDeps = Object.freeze({
@@ -139,6 +147,7 @@ const DEFAULT_DEPS: HeadlessRunDeps = Object.freeze({
   },
   now: () => new Date(),
   stdout: (line: string) => console.log(line),
+  credentialPreflight: (context: RuntimeContext, io: RuntimeIO) => io.admin({ kind: "unattended-credential-check" }, context),
 });
 
 /** Built-in agents with a headless mode: the only `run` targets. */
@@ -268,6 +277,8 @@ export async function runHeadlessAgent(
   }
 
   const releaseTerminalMode = enterHeadlessTerminalMode();
+  // The whole run, and every credential read in it, never asks a person.
+  const releaseCredentialRule = forbidCredentialInteraction();
   const releaseSignalExit = deferSignalExit();
   const cancel = new AbortController();
   const escalate = new AbortController();
@@ -309,6 +320,7 @@ export async function runHeadlessAgent(
     deps.signals.off("SIGINT", onSignal);
     deps.signals.off("SIGTERM", onSignal);
     releaseSignalExit();
+    releaseCredentialRule();
     releaseTerminalMode();
   }
 }
@@ -391,12 +403,25 @@ async function runUnderLock(input: RunInput): Promise<number> {
   try {
     record = createRunRecord(stateDir, runId, { projectRoot: context.projectRoot });
     record.startStderrTee();
-    const promptContainerPath = writeInboxPrompt(inboxDir, runId, input.prompt);
-    promptWritten = true;
     if (input.aborted() !== undefined) {
       refused = true;
+    } else if ((await deps.credentialPreflight(context, io)) !== 0) {
+      // A source that may ask: refused before the prompt copy, Docker, and
+      // any credential read. The lock and the record are the run's own.
+      refused = true;
     } else {
+      let promptContainerPath: string | undefined;
       const result = await deps.runtime(context, io, agentName, { verbose: options.verbose === true }, {
+        afterControlSelection: async () => {
+          // The start may have selected a newer effective policy generation
+          // than the one checked above: check its bindings too, before the
+          // prompt copy and Docker.
+          const preflight = await deps.credentialPreflight(context, io);
+          if (preflight !== 0) return preflight;
+          promptContainerPath = writeInboxPrompt(inboxDir, runId, input.prompt);
+          promptWritten = true;
+          return 0;
+        },
         beforeLaunch: (activeContext) => {
           unchecked = deps.uncheckedAuthority(activeContext, agentName);
           // A startup signal skips the launch; the abort decides the code.
@@ -416,6 +441,7 @@ async function runUnderLock(input: RunInput): Promise<number> {
           return undefined;
         },
         launch: async (launch) => {
+          if (promptContainerPath === undefined) throw new Error("internal error: the run's prompt was not copied before the launch");
           active = { context: launch.activeContext, proxyId: launch.proxyId };
           launchStarted = true;
           return await deps.launch({

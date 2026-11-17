@@ -1,11 +1,15 @@
 // `runfree credential ...` — canonical low-level credential policy, source
 // binding, runtime sync, and host-owned named-source surface.
 
+import fs from "node:fs";
+
+import { isCancel, password } from "@clack/prompts";
 import type { ArgumentsCamelCase, Argv } from "yargs";
 
 import { createAdminState } from "../../admin/context.ts";
 import {
   bindDesiredCredentialSource,
+  type ConnectionTokenInput,
   type CredentialFieldsInput,
   credentialClearSourceIntent,
   credentialSetSourceIntent,
@@ -17,7 +21,10 @@ import {
   sourceAddCommandIntent,
   sourceAddGoogleServiceAccountIntent,
   sourceAddJwtIntent,
+  sourceAddOnePasswordConnectionIntent,
+  sourceCheckIntent,
   sourceList,
+  sourceLoginIntent,
   sourceRemoveIntent,
   sourceShowIntent,
 } from "../../admin/options.ts";
@@ -30,6 +37,7 @@ import {
 } from "../../control/credential-mutation.ts";
 import { CliError } from "../../errors.ts";
 import { nodeRuntimeIO } from "../../runtime.ts";
+import { hostTerminalInteractive } from "../../terminal-mode.ts";
 import type { RuntimeContext } from "../../runtime/types.ts";
 import type { RunfreeCommandContext } from "../context.ts";
 import { withExamples } from "../examples.ts";
@@ -53,6 +61,7 @@ type SourceArgs = {
   "from-1password"?: string;
   "from-source"?: string;
   "from-stdin"?: boolean;
+  via?: string;
   "refresh-every"?: string;
   "replace-source"?: boolean;
   "no-sync"?: boolean;
@@ -69,6 +78,7 @@ type SyncArgs = {
   quiet?: boolean;
   "delay-first-sync"?: boolean;
   "initial-source-truth"?: boolean;
+  unattended?: boolean;
   "no-cache-source-secrets"?: boolean;
 };
 type SourceAddArgs = {
@@ -113,6 +123,7 @@ const sourceBindingOptions = (cmd: Argv): Argv =>
     .option("from-1password", { type: "string", requiresArg: true, group: SOURCE_GROUP, describe: "Resolve from a 1Password ref (op://...)" })
     .option("from-source", { type: "string", requiresArg: true, group: SOURCE_GROUP, describe: "Bind a saved host-owned named source" })
     .option("from-stdin", { type: "boolean", group: SOURCE_GROUP, describe: "Read from stdin (plaintext storage remains disabled)" })
+    .option("via", { type: "string", requiresArg: true, group: SOURCE_GROUP, describe: "Read the op:// reference (or the source's 1Password key) through this 1password connection source" })
     .option("refresh-every", { type: "string", requiresArg: true, describe: "Re-resolve on this interval (e.g. 15m)" })
     .option("replace-source", { type: "boolean", describe: "Replace an existing source binding" });
 
@@ -127,6 +138,7 @@ function sourceIntent(argv: SourceArgs) {
       onePassword: argv["from-1password"],
       source: argv["from-source"],
       stdin: argv["from-stdin"],
+      via: argv.via,
     }),
     refreshEvery: argv["refresh-every"],
     replaceSource: Boolean(argv["replace-source"]),
@@ -171,6 +183,31 @@ function refuseSourceAddFlags(argv: SourceAddArgs, ...lists: SourceAddFlags[]): 
     }
   }
 }
+
+type ConnectionLoginArgs = NameArgs & { "token-stdin"?: boolean };
+
+const TOKEN_STDIN_MAX_BYTES = 16 * 1024;
+
+// The connection login: piped stdin with --token-stdin, else a hidden prompt
+// on a terminal, else nothing (the intent refuses). Never argv.
+function connectionTokenInput(fromStdin: boolean): ConnectionTokenInput {
+  if (fromStdin) {
+    const text = fs.readFileSync(0);
+    if (text.byteLength > TOKEN_STDIN_MAX_BYTES) throw new CliError("--token-stdin input is larger than 16 KiB");
+    return { kind: "stdin", text: text.toString("utf8") };
+  }
+  if (!hostTerminalInteractive()) return { kind: "none" };
+  return {
+    kind: "prompt",
+    ask: async () => {
+      const answer = await password({ message: "service account token" });
+      return isCancel(answer) ? undefined : answer;
+    },
+  };
+}
+
+const connectionLoginBuilder = (cmd: Argv): Argv =>
+  sourceNamePositional(cmd).option("token-stdin", { type: "boolean", describe: "Read the service account token from stdin instead of asking" });
 
 export const credentialCommand: CommandModule = {
   name: "credential",
@@ -315,6 +352,11 @@ export const credentialCommand: CommandModule = {
                 hidden: true,
                 describe: "Re-read every source once before the first wait (internal: launch token auto-refresh)",
               })
+              .option("unattended", {
+                type: "boolean",
+                hidden: true,
+                describe: "Read only sources that never ask a person (internal: the credential watcher of a headless run)",
+              })
               .option("no-cache-source-secrets", { type: "boolean", describe: "Disable memory-only source-secret caching" }),
             handler((argv: ArgumentsCamelCase<SyncArgs>) => run(() => credentialSyncIntent({
               verbose: Boolean(argv.verbose),
@@ -322,12 +364,13 @@ export const credentialCommand: CommandModule = {
               quiet: Boolean(argv.quiet),
               delayFirstSync: Boolean(argv["delay-first-sync"]),
               initialSourceTruth: Boolean(argv["initial-source-truth"]),
+              unattended: Boolean(argv.unattended),
               cacheSourceSecrets: !argv["no-cache-source-secrets"],
             }))),
           )
           .command(
             "source",
-            "Manage reusable host-owned command, JWT, and Google service-account sources",
+            "Manage reusable host-owned command, JWT, Google service-account, and 1Password connection sources",
             (source) => source
               .command(
                 "add [args..]",
@@ -372,6 +415,20 @@ export const credentialCommand: CommandModule = {
                   }));
                 }),
               )
+              .command(
+                "1password <name>",
+                "Add a 1Password service-account connection that reads op:// references without asking",
+                connectionLoginBuilder,
+                handler((argv: ArgumentsCamelCase<ConnectionLoginArgs>) =>
+                  runSource(() => sourceAddOnePasswordConnectionIntent({ name: argv.name, token: connectionTokenInput(argv["token-stdin"] === true) }))),
+              )
+              .command(
+                "login <name>",
+                "Replace the stored login of a 1Password connection source, checked before the switch",
+                connectionLoginBuilder,
+                handler((argv: ArgumentsCamelCase<ConnectionLoginArgs>) =>
+                  runSource(() => sourceLoginIntent({ name: argv.name, token: connectionTokenInput(argv["token-stdin"] === true) }))),
+              )
               .command("list", "List host-owned named sources", (cmd) => cmd, handler(() => runSource(() => sourceList())))
               .command(
                 "show <name>",
@@ -380,8 +437,14 @@ export const credentialCommand: CommandModule = {
                 handler((argv: ArgumentsCamelCase<NameArgs>) => runSource(() => sourceShowIntent({ name: argv.name }))),
               )
               .command(
+                "check <name>",
+                "Check that a 1Password connection source can still read without asking",
+                sourceNamePositional,
+                handler((argv: ArgumentsCamelCase<NameArgs>) => runSource(() => sourceCheckIntent({ name: argv.name }))),
+              )
+              .command(
                 "remove <name>",
-                "Remove an unused host-owned named source",
+                "Remove an unused host-owned named source (and a connection's Keychain login)",
                 sourceNamePositional,
                 handler((argv: ArgumentsCamelCase<NameArgs>) => runSource(() => sourceRemoveIntent({ name: argv.name }))),
               )

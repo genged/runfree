@@ -359,7 +359,8 @@ runfree credential set-source github --from-env GITHUB_TOKEN --refresh-every 15m
 ```
 
 Credentials can come from a host command, an environment variable, 1Password,
-or stdin, and can be re-resolved on a schedule. Runfree can also sign a
+or stdin, and can be re-resolved on a schedule. A 1Password service account
+lets scheduled `runfree run` jobs read secrets without a prompt. Runfree can also sign a
 short-lived JWT on the host from your private key, for APIs like App Store
 Connect. The value is resolved on the host and held by the proxy.
 [More](docs/cli.md#credentials)

@@ -722,6 +722,14 @@ in [Headless runs](cli.md#headless-runs).
   life: nothing prompts, a confirmation answers no, the approvals heartbeat
   never starts, and the host's own TTYs are ignored even in a tmux pane. A
   step that needs an answer refuses before the launch.
+- **Never asks for a credential.** The run holds a never-ask rule for its
+  whole life, and its credential watcher is started with the same rule. A
+  static preflight after the lock and record, and again once the launch
+  selects its effective policy generation (before the prompt copy and
+  Docker), refuses (65) any binding that may ask; while the rule is held, every provider spawn is checked again, so
+  no 1Password app read and no command source starts. Only env sources and
+  1Password connection sources pass
+  ([`CRED-7`](security-rules.md#credentials)).
 - **Launch target.** The headless target is built next to the interactive
   one and still runs through the session entry, so the readiness gate is
   unchanged. Runfree sets the whole agent command line; the prompt is stdin,
@@ -1153,7 +1161,9 @@ Credential values never need to enter the agent environment.
 Supported source types include:
 
 - host environment variables;
-- 1Password secret refs;
+- 1Password secret refs, read through the desktop app or through a
+  1Password connection source: a service account whose token stays in the
+  macOS login Keychain and is passed only to the `op` process;
 - host-owned commands such as `gh auth token`;
 - stdin for one-shot setup;
 - generated JWT sources: host-signed JWTs from a private key you supply, and Google service-account signers whose key stays in 1Password and is read on the host for each signature;

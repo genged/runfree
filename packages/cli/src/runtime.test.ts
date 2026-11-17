@@ -136,7 +136,7 @@ import {
   approveRuntimeIsolationControl,
 } from "./control/approvals.ts";
 import { captureDesiredPolicyCandidate } from "./control/candidates.ts";
-import { clearActiveControlSelection, publishEffectivePolicyGeneration, } from "./control/effective.ts";
+import { clearActiveControlSelection, publishEffectivePolicyGeneration, readActiveEffectiveControl, } from "./control/effective.ts";
 import { RUNFREE_RUNTIME_DIGEST, RUNFREE_VERSION } from "./embedded-assets.generated.ts";
 import {
   mcpApprovalPath,
@@ -1568,6 +1568,8 @@ function runtimeIntentToArgs(intent: RuntimeAdminIntent): string[] {
       ];
     case "prepare-token-sources":
       return intent.mode ? ["prepare-token-sources", `--${intent.mode}`] : ["prepare-token-sources"];
+    case "unattended-credential-check":
+      return ["unattended-credential-check"];
     case "prepare":
       return ["prepare"];
   }
@@ -3909,6 +3911,19 @@ describe("token auto refresh invocation", () => {
     expect(plan.options.env).not.toHaveProperty("RUNFREE_TOKEN_SYNC_RECEIPT_FD");
   });
 
+  test("an unattended watcher gets --unattended; an interactive one does not", () => {
+    const projectRoot = path.join(tmp, "project");
+    const project = prepareProject(projectRoot);
+    const context = { projectRoot, project, runtimeRoot: path.join(tmp, "runtime"), env: { PATH: "/fake-bin" } };
+    const base = { command: "/usr/local/bin/runfree", args: [] };
+    const unattended = buildTokenAutoRefreshSpawnPlan({ base, context, parentPid: 1, initialSourceTruth: true, unattended: true });
+    expect(unattended.args.slice(-3)).toEqual(["--quiet", "--initial-source-truth", "--unattended"]);
+    const interactive = buildTokenAutoRefreshSpawnPlan({ base, context, parentPid: 1, initialSourceTruth: true });
+    expect(interactive.args).not.toContain("--unattended");
+    // The rule travels as a flag, never as an environment variable a provider would inherit.
+    expect(Object.keys(unattended.options.env ?? {}).filter((key) => /UNATTENDED/i.test(key))).toEqual([]);
+  });
+
   test("passes token resolution receipts to the watcher over an inherited pipe", () => {
     const projectRoot = path.join(tmp, "project");
     const project = prepareProject(projectRoot);
@@ -4237,6 +4252,37 @@ describe("runtime command flow", () => {
       expect(absenceReads(io)).toHaveLength(3);
       expect(readEffectiveControlPlaneV2(context.project.paths.stateDir)).toBeUndefined();
     });
+  });
+
+  // A run's credential preflight runs again on the generation the launch
+  // selects, before any Docker work.
+  test("the after-selection hook sees the newly selected generation before Docker, and its refusal ends the start", async () => {
+    const projectRoot = path.join(tmp, "project");
+    const project = prepareProject(projectRoot);
+    const context: RuntimeContext = {
+      projectRoot,
+      project,
+      runtimeRoot: path.join(tmp, "runtime"),
+      env: { PATH: "/fake-bin" },
+      network: fixedNetwork,
+    };
+    const io = createRuntimeIO();
+    let selectedAtHook: string | undefined;
+    let dockerCallsAtHook = -1;
+    const result = await startRuntime(context, io, false, {
+      afterControlSelection: async () => {
+        selectedAtHook = readActiveEffectiveControl(project)?.controlGeneration;
+        dockerCallsAtHook = io.calls.filter((call) => call.method !== "admin" && call.command === "docker").length;
+        return 65;
+      },
+    });
+    expect(result).toMatchObject({ kind: "failed", status: 65 });
+    expect(selectedAtHook).toEqual(expect.any(String));
+    expect(dockerCallsAtHook).toBe(0);
+    expect(composeUpCall(io)).toBeUndefined();
+
+    const passed = await startRuntime(context, createRuntimeIO(), false, { afterControlSelection: async () => 0 });
+    expect(passed.status).toBe(0);
   });
 
   // A runtime materialized before the session-file cutover has a manifest with
@@ -10652,7 +10698,7 @@ describe("runtime command flow", () => {
     const project = prepareProject(projectRoot);
     const before = fs.readFileSync(project.paths.policyPath, "utf8");
     const io = createRuntimeIO();
-    const hooks = { beforeLaunch: vi.fn(() => undefined), launch: vi.fn(async () => 0) };
+    const hooks = { afterControlSelection: vi.fn(async () => 0), beforeLaunch: vi.fn(() => undefined), launch: vi.fn(async () => 0) };
 
     const result = await runHeadlessAgentRuntime({
       projectRoot,
@@ -10668,6 +10714,7 @@ describe("runtime command flow", () => {
     expect(fs.readFileSync(project.paths.policyPath, "utf8")).toBe(before);
     expect(io.calls.some((call) => call.method === "admin")).toBe(false);
     expect(composeUpCall(io)).toBeUndefined();
+    expect(hooks.afterControlSelection).not.toHaveBeenCalled();
     expect(hooks.beforeLaunch).not.toHaveBeenCalled();
     expect(hooks.launch).not.toHaveBeenCalled();
   });
@@ -10731,7 +10778,7 @@ describe("runtime command flow", () => {
     expect(applyAgentServiceIntentForTest({ kind: "ensure-agent-service", id: "agent-pi", quiet: true }, context)).toBe(0);
     const before = fs.readFileSync(project.paths.policyPath, "utf8");
     const io = createRuntimeIO();
-    const hooks = { beforeLaunch: vi.fn(() => undefined), launch: vi.fn(async () => "launched") };
+    const hooks = { afterControlSelection: async () => 0, beforeLaunch: vi.fn(() => undefined), launch: vi.fn(async () => "launched") };
 
     const result = await runHeadlessAgentRuntime(context, createHeadlessRuntimeIO(io), "pi", {}, hooks);
 

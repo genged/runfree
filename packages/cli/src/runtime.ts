@@ -14,7 +14,7 @@ import { effectiveRuntimeDigest } from "./agent-image.ts";
 import { builtinAgent } from "./agents.ts";
 import { createAdminState } from "./admin/context.ts";
 import { prepareRuntimeTokenSources, clearPreparedRuntimeTokenSources, admitPreparedRuntimeTokenSources } from "./admin/admin-core.ts";
-import { credentialSyncIntent, prepareEffectiveRuntimeIntent, runAdminAction } from "./admin/options.ts";
+import { credentialSyncIntent, prepareEffectiveRuntimeIntent, runAdminAction, unattendedCredentialCheckIntent } from "./admin/options.ts";
 import { planDesiredServiceEnable } from "./admin/service-policy.ts";
 import { activateApprovedControlsAfterMutation } from "./control/activation.ts";
 import { activationReportLine } from "./control/activation-report.ts";
@@ -255,6 +255,8 @@ export function buildTokenAutoRefreshSpawnPlan(input: {
    * instead of waiting for the first one to fall due.
    */
   initialSourceTruth?: boolean;
+  /** A headless run's watcher: it reads only sources that never ask (`--unattended`). */
+  unattended?: boolean;
 }): TokenAutoRefreshSpawnPlan {
   const receipts = input.receipts ?? [];
   // Build the stdio array once and derive each channel's fd from its slot, so
@@ -285,6 +287,7 @@ export function buildTokenAutoRefreshSpawnPlan(input: {
       "--watch",
       "--quiet",
       input.initialSourceTruth ? "--initial-source-truth" : "--delay-first-sync",
+      ...(input.unattended ? ["--unattended"] : []),
     ],
     options: {
       detached: process.platform !== "win32",
@@ -341,7 +344,7 @@ function writeTokenResolutionReceipts(child: childProcess.ChildProcess, plan: To
 function startTokenAutoRefreshProcess(
   context: RuntimeContext,
   receipts: TokenResolutionReceipt[] = [],
-  options: Readonly<{ initialSourceTruth?: boolean }> = {},
+  options: Readonly<{ initialSourceTruth?: boolean; unattended?: boolean }> = {},
 ): TokenAutoRefreshHandle {
   const stderrFd = openTokenAutoRefreshLog(context);
   const plan = buildTokenAutoRefreshSpawnPlan({
@@ -351,6 +354,7 @@ function startTokenAutoRefreshProcess(
     receipts,
     stderrFd,
     initialSourceTruth: options.initialSourceTruth === true,
+    unattended: options.unattended === true,
   });
   let child: childProcess.ChildProcess;
   try {
@@ -749,6 +753,11 @@ export type HeadlessRuntimeLaunchInput = Readonly<{
 
 export type HeadlessRuntimeHooks<T> = Readonly<{
   /**
+   * Right after the start selects its effective policy generation, before
+   * any Docker work. Returns a nonzero status to refuse the start.
+   */
+  afterControlSelection(): Promise<number>;
+  /**
    * After the runtime is ready and before the launch. Returns a status to
    * refuse the launch, or undefined to go on.
    */
@@ -794,6 +803,7 @@ export async function runHeadlessAgentRuntime<T>(
     verbose: options.verbose,
     launch: true,
     launchHandoff: true,
+    afterControlSelection: hooks.afterControlSelection,
   });
   if (runtime.kind === "failed") return { kind: "refused", status: runtime.status };
   try {
@@ -875,6 +885,9 @@ async function dispatchRuntimeAdmin(intent: RuntimeAdminIntent, context: Runtime
     }
     case "prepare-token-sources":
       prepareRuntimeTokenSources(intent.mode ? { mode: intent.mode } : {});
+      return;
+    case "unattended-credential-check":
+      unattendedCredentialCheckIntent();
       return;
     case "token-sync":
       await credentialSyncIntent({

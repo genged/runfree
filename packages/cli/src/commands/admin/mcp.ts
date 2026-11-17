@@ -55,6 +55,7 @@ type EnableArgs = AgentServerArgs & {
   "from-1password"?: string;
   "from-source"?: string;
   "from-stdin"?: boolean;
+  via?: string;
   "replace-source"?: boolean;
 };
 
@@ -69,6 +70,7 @@ function credentialSourceArgs(argv: ArgumentsCamelCase<EnableArgs>): McpEnableIn
     onePassword: argv["from-1password"],
     source: argv["from-source"],
     stdin: argv["from-stdin"],
+    via: argv.via,
   });
 }
 
@@ -186,6 +188,7 @@ export const mcpCommand: CommandModule = {
                 .option("from-1password", { type: "string", requiresArg: true, group: TOKEN_SOURCE_GROUP, describe: "Read the token from a 1Password secret ref (op://...)" })
                 .option("from-source", { type: "string", requiresArg: true, group: TOKEN_SOURCE_GROUP, describe: "Bind a previously-saved host-owned source" })
                 .option("from-stdin", { type: "boolean", group: TOKEN_SOURCE_GROUP, describe: "Read the token from stdin" })
+                .option("via", { type: "string", requiresArg: true, group: TOKEN_SOURCE_GROUP, describe: "Read the op:// reference (or the source's 1Password key) through this 1password connection source" })
                 .option("replace-source", { type: "boolean", describe: "Overwrite an existing credential source for this server" })
                 .epilogue("OAuth hosts are allowed only while this server stays enabled, and only through the proxy. Revoke with runfree mcp revoke <agent> <server>; it removes exactly those hosts."),
             handler((argv: ArgumentsCamelCase<EnableArgs>) => {

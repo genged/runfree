@@ -172,12 +172,54 @@ import {
 import { stableJsonDroppingUndefined as stableJson, sha256Hex, isRecord } from "../strict-primitives.ts";
 import { remedy } from "../remedies.ts";
 import { headlessCallOptions, headlessTerminalModeActive } from "../terminal-mode.ts";
+import {
+  ConnectionSetupError,
+  KEYCHAIN_CALL_TIMEOUT_MS,
+  KEYCHAIN_LOCK_CHECK_TIMEOUT_MS,
+  KEYCHAIN_LOCKED_SETUP_MESSAGE,
+  KEYCHAIN_SERVICE,
+  type KeychainItem,
+  keychainDeleteArgs,
+  keychainDeleteStep,
+  keychainExecutable,
+  keychainItemForSource,
+  keychainLockCheckArgs,
+  keychainLockCheckExecutable,
+  keychainLockedError,
+  keychainLockStateFromExit,
+  type KeychainLockState,
+  keychainPlatformAvailable,
+  keychainReadArgs,
+  keychainReadStep,
+  keychainWriteCheckStep,
+  keychainWriteRequest,
+} from "./keychain-login.ts";
+import {
+  connectionSourceNames,
+  CredentialInteractionForbiddenError,
+  credentialInteractionForbidden,
+  unattendedReadVerdict,
+  unattendedRefusalLines,
+} from "./credential-interaction.ts";
+import {
+  APP_LOGIN,
+  connectionOpEnv,
+  loginIdentity,
+  type OnePasswordLogin,
+  opVaultListArgs,
+  opWhoamiArgs,
+  parseServiceAccountWhoami,
+  parseVaultNames,
+  redactLogin,
+} from "./onepassword-connection.ts";
 
 
 export type TokenSource =
   | ({ source: "env"; env: string } & TokenRefreshConfig)
-  | ({ source: "1password"; ref: string } & TokenRefreshConfig)
-  | ({ source: "named"; name: string } & TokenRefreshConfig)
+  // `via` names the 1password connection source the binding reads through;
+  // absent means the app.
+  | ({ source: "1password"; ref: string; via?: string } & TokenRefreshConfig)
+  | ({ source: "named"; name: string; via?: string } & TokenRefreshConfig)
   // Legacy config from the pre-tmpfs implementation. Kept so status/unset can
   // handle old metadata without silently reading plaintext local secret files.
   | ({ source: "file"; path: string } & TokenRefreshConfig)
@@ -213,7 +255,26 @@ export type JwtSource = {
 
 export type { GoogleServiceAccountSource };
 
-export type NamedSource = CommandSource | JwtSource | GoogleServiceAccountSource;
+/**
+ * A connection source: a login that never asks (a 1Password service account)
+ * kept in the macOS login Keychain. The registry holds the Keychain item name,
+ * never the login itself.
+ */
+export type OnePasswordConnectionSource = {
+  type: "1password";
+  keychain: KeychainItem;
+  createdAt: string;
+};
+
+export type NamedSource = CommandSource | JwtSource | GoogleServiceAccountSource | OnePasswordConnectionSource;
+
+export function isConnectionSource(source: NamedSource | undefined): source is OnePasswordConnectionSource {
+  return source?.type === "1password";
+}
+
+export function connectionNotValueMessage(name: string): string {
+  return `${name} is a 1password connection source; bind an op:// reference through it: --from-1password op://<vault>/<item>/<field> --via ${name}`;
+}
 
 export type SourceRegistry = Record<string, NamedSource>;
 
@@ -590,6 +651,49 @@ export function ensureStateDirs(): void {
   fs.mkdirSync(stateDir(), { recursive: true, mode: 0o700 });
 }
 
+function parseBindingVia(tokenName: string, value: Record<string, unknown>): string | undefined {
+  if (!Object.hasOwn(value, "via")) return undefined;
+  if (typeof value.via !== "string" || !isTokenName(value.via)) die(`${tokenName}: via must be a source name`);
+  return value.via;
+}
+
+/** The registry entries a binding's identity and read depend on: its named source and its connection. */
+export function tokenSourceRegistryNames(source: TokenSource | undefined): string[] {
+  if (!source) return [];
+  const names: string[] = [];
+  if (source.source === "named") names.push(source.name);
+  if ((source.source === "named" || source.source === "1password") && source.via !== undefined) names.push(source.via);
+  return names;
+}
+
+/** Whether a binding needs the source registry (a named source, or a `via` connection). */
+export function tokenSourceReadsRegistry(source: TokenSource | undefined): boolean {
+  return tokenSourceRegistryNames(source).length > 0;
+}
+
+// On disk a binding with `via` has its own source kind. A CLI from before
+// `via` refuses a kind it does not know ("unsupported credential source"),
+// but on "1password" or "named" it would drop `via` and read through the
+// desktop app. Bindings without `via` keep their stored shape.
+const STORED_VIA_KINDS = { "1password": "1password-via", named: "named-via" } as const;
+
+function viaKindOfStoredSource(stored: string): "1password" | "named" | undefined {
+  if (stored === STORED_VIA_KINDS["1password"]) return "1password";
+  if (stored === STORED_VIA_KINDS.named) return "named";
+  return undefined;
+}
+
+/** The on-disk form of a host binding config: see `STORED_VIA_KINDS`. */
+function storedTokenSourceConfig(config: TokenSourceConfig): Record<string, unknown> {
+  const stored: Record<string, unknown> = {};
+  for (const [tokenName, source] of Object.entries(config)) {
+    stored[tokenName] = (source.source === "1password" || source.source === "named") && source.via !== undefined
+      ? { ...source, source: STORED_VIA_KINDS[source.source] }
+      : source;
+  }
+  return stored;
+}
+
 export function parseTokenSourceConfig(raw: unknown, sourcePath: string): TokenSourceConfig {
   if (!isRecord(raw)) die(`${displayProjectPath(sourcePath)} must be a JSON object`);
   const config: TokenSourceConfig = {};
@@ -599,19 +703,27 @@ export function parseTokenSourceConfig(raw: unknown, sourcePath: string): TokenS
       die(`${tokenName}: credential source entry must be an object`);
     }
     const refresh = parseRefreshEverySeconds(tokenName, value);
-    if (value.source === "env") {
+    const via = parseBindingVia(tokenName, value);
+    const viaKind = viaKindOfStoredSource(value.source);
+    if (via !== undefined && viaKind === undefined) {
+      die(`${tokenName}: via applies only to 1password-via and named-via credential sources`);
+    }
+    if (viaKind !== undefined && via === undefined) die(`${tokenName}: ${value.source} credential source requires via`);
+    const viaField = via === undefined ? {} : { via };
+    const kind = viaKind ?? value.source;
+    if (kind === "env") {
       if (typeof value.env !== "string" || value.env.trim() === "") die(`${tokenName}: env credential source requires env`);
       config[tokenName] = { source: "env", env: value.env, ...refresh };
       continue;
     }
-    if (value.source === "1password") {
+    if (kind === "1password") {
       if (typeof value.ref !== "string" || value.ref.trim() === "") die(`${tokenName}: 1password credential source requires ref`);
-      config[tokenName] = { source: "1password", ref: value.ref, ...refresh };
+      config[tokenName] = { source: "1password", ref: value.ref, ...viaField, ...refresh };
       continue;
     }
-    if (value.source === "named") {
+    if (kind === "named") {
       if (typeof value.name !== "string" || !isTokenName(value.name)) die(`${tokenName}: named credential source requires a valid source name`);
-      config[tokenName] = { source: "named", name: value.name, ...refresh };
+      config[tokenName] = { source: "named", name: value.name, ...viaField, ...refresh };
       continue;
     }
     if (value.source === "file") {
@@ -723,7 +835,7 @@ export function loadTokenStatus(): TokenSyncStatus {
 }
 
 export function saveTokenConfig(config: TokenSourceConfig): void {
-  writeJsonFile(tokenConfigPath(), config, 0o600);
+  writeJsonFile(tokenConfigPath(), storedTokenSourceConfig(config), 0o600);
 }
 
 export function saveTokenStatus(status: TokenSyncStatus): void {
@@ -827,6 +939,22 @@ function validateGoogleServiceAccountSource(name: string, value: Record<string, 
   };
 }
 
+const CONNECTION_REGISTRY_FIELDS = new Set(["type", "keychain", "createdAt"]);
+
+// A hand-edited entry may only name the one Keychain item runfree itself
+// would create for this source; no other field (a token above all) is allowed.
+function validateOnePasswordConnectionSource(name: string, value: Record<string, unknown>): OnePasswordConnectionSource {
+  for (const key of Object.keys(value)) {
+    if (!CONNECTION_REGISTRY_FIELDS.has(key)) die(`${name}: 1password source has unknown field ${JSON.stringify(key)}`);
+  }
+  const keychain = value.keychain;
+  if (!isRecord(keychain) || keychain.service !== KEYCHAIN_SERVICE || keychain.account !== name || Object.keys(keychain).length !== 2) {
+    die(`${name}: 1password source keychain must be {"service":"${KEYCHAIN_SERVICE}","account":"${name}"}`);
+  }
+  if (typeof value.createdAt !== "string" || value.createdAt.trim() === "") die(`${name}: createdAt must be a string`);
+  return { type: "1password", keychain: keychainItemForSource(name), createdAt: value.createdAt };
+}
+
 function validateSourceRegistry(raw: unknown, registryPath = sourceConfigPath()): SourceRegistry {
   if (!isRecord(raw)) die(`${displayProjectPath(registryPath)} must be a JSON object`);
   const registry: SourceRegistry = {};
@@ -841,7 +969,11 @@ function validateSourceRegistry(raw: unknown, registryPath = sourceConfigPath())
       registry[name] = validateGoogleServiceAccountSource(name, value);
       continue;
     }
-    if (value.type !== "command") die(`${name}: source must be a command, jwt, or google-service-account object`);
+    if (value.type === "1password") {
+      registry[name] = validateOnePasswordConnectionSource(name, value);
+      continue;
+    }
+    if (value.type !== "command") die(`${name}: source must be a command, jwt, google-service-account, or 1password object`);
     if (!Array.isArray(value.argv) || value.argv.length === 0 || !value.argv.every((item) => typeof item === "string")) {
       die(`${name}: argv must be a non-empty string array`);
     }
@@ -1086,9 +1218,24 @@ export type OnePasswordRead = Readonly<{
   executable: string;
   ref: string;
   env: NodeJS.ProcessEnv;
+  /** A host-owned directory: `op` never runs in the project checkout. */
+  cwd: string;
   timeoutMs: number;
   quiet: boolean;
+  /** How `op` logs in: the desktop app (may ask) or a connection's stored login. */
+  login: OnePasswordLogin;
 }>;
+
+/**
+ * The environment the `op` child runs with. A connection read gets only an
+ * allowlisted environment plus its own login (`connectionOpEnv`): no host
+ * `OP_*` session or account selection reaches it.
+ */
+export function opExecutionEnv(read: OnePasswordRead, token: string | undefined): NodeJS.ProcessEnv {
+  if (read.login.kind === "app") return read.env;
+  if (token === undefined) throw new Error("internal error: a connection read needs its login");
+  return connectionOpEnv(read.env, token);
+}
 
 export const PROVIDER_OUTPUT_MAX_BYTES = 128 * 1024;
 
@@ -1101,7 +1248,8 @@ export function onePasswordDocumentArgs(documentRef: OnePasswordDocumentRef): st
 }
 
 export function announceOnePasswordRead(read: OnePasswordRead): void {
-  if (!read.quiet) runfreeLog("resolving 1Password credential source (Touch ID/passphrase prompt may appear)");
+  // A connection read never asks, so it has no prompt to announce.
+  if (!read.quiet && read.login.kind === "app") runfreeLog("resolving 1Password credential source (Touch ID/passphrase prompt may appear)");
 }
 
 /**
@@ -1144,28 +1292,98 @@ export function onePasswordDocumentStep(read: OnePasswordRead, readExit: Provide
   return readSpawnedOpOutput(documentExit, "op document get returned an empty value");
 }
 
-function onePasswordRead(opPath: string, ref: string, options: { quiet?: boolean } = {}): OnePasswordRead {
-  return { executable: opPath, ref, env: Object.freeze({ ...childEnv() }), timeoutMs: opReadTimeoutMs(), quiet: options.quiet === true };
+/**
+ * The base environment of an `op` child. A connection read starts from the
+ * sanitized host environment (no project PATH entries, no project HOME or
+ * XDG roots). An app read keeps the host's `OP_*` account and session
+ * selection, which the desktop app read depends on, but gets the sanitized
+ * PATH too.
+ */
+function opBaseEnv(login: OnePasswordLogin): NodeJS.ProcessEnv {
+  const sanitized = sanitizedHostExecutionEnv(projectRoot(), childEnv());
+  if (login.kind === "connection") return Object.freeze(sanitized);
+  const { PATH: _hostPath, ...rest } = childEnv();
+  return Object.freeze(sanitized.PATH === undefined ? rest : { ...rest, PATH: sanitized.PATH });
+}
+
+function onePasswordRead(opPath: string, ref: string, options: { quiet?: boolean } = {}, login: OnePasswordLogin = APP_LOGIN): OnePasswordRead {
+  return { executable: opPath, ref, env: opBaseEnv(login), cwd: hostOwnedSourceCwd(), timeoutMs: opReadTimeoutMs(), quiet: options.quiet === true, login };
+}
+
+/** Removes a connection login from `op` stderr before any classifier or message sees it. */
+export function scrubOnePasswordExit(exit: ProviderExit, token: string | undefined): ProviderExit {
+  return token === undefined ? exit : { ...exit, stderr: redactLogin(exit.stderr, token) };
+}
+
+/**
+ * The executor-level guard of the never-ask rule: while a run holds the
+ * rule, no 1Password app read and no command source starts, whoever the
+ * caller is. It runs before any announcement, Keychain read, or spawn.
+ * Connection reads, and the run preflight's service-account login check, do
+ * not pass through it and stay allowed.
+ */
+export function assertProviderMayRun(kind: "1password-app" | "command"): void {
+  if (!credentialInteractionForbidden()) return;
+  throw new CredentialInteractionForbiddenError(
+    `a run never starts a provider that may ask (${kind === "command" ? "command source" : "1Password app read"})`,
+    kind === "command" ? "command" : "1password",
+  );
 }
 
 function runOnePasswordReadSync(read: OnePasswordRead): string {
+  if (read.login.kind === "app") assertProviderMayRun("1password-app");
   announceOnePasswordRead(read);
+  // A Keychain failure throws its classified error here: `op` never runs.
+  const token = read.login.kind === "connection" ? readConnectionLoginSync(read.login.sourceName, read.login.keychain) : undefined;
   const spawnOptions = {
+    cwd: read.cwd,
     encoding: "utf8" as const,
-    env: read.env,
+    env: opExecutionEnv(read, token),
     maxBuffer: PROVIDER_OUTPUT_MAX_BYTES,
     shell: false,
     timeout: read.timeoutMs,
   };
-  const readExit = providerExitFromSpawnSync(adminSpawnSync(read.executable, onePasswordReadArgs(read), spawnOptions));
+  const readExit = scrubOnePasswordExit(providerExitFromSpawnSync(adminSpawnSync(read.executable, onePasswordReadArgs(read), spawnOptions)), token);
   const step = onePasswordReadStep(read, readExit);
   if (step.kind === "value") return step.value;
-  const documentExit = providerExitFromSpawnSync(adminSpawnSync(read.executable, onePasswordDocumentArgs(step.documentRef), spawnOptions));
+  const documentExit = scrubOnePasswordExit(providerExitFromSpawnSync(adminSpawnSync(read.executable, onePasswordDocumentArgs(step.documentRef), spawnOptions)), token);
   return onePasswordDocumentStep(read, readExit, documentExit);
 }
 
-export function readOnePasswordRef(opPath: string, ref: string, options: { quiet?: boolean } = {}): string {
-  return runOnePasswordReadSync(onePasswordRead(opPath, ref, options));
+export function readOnePasswordRef(opPath: string, ref: string, options: { quiet?: boolean } = {}, login: OnePasswordLogin = APP_LOGIN): string {
+  return runOnePasswordReadSync(onePasswordRead(opPath, ref, options, login));
+}
+
+function viaError(code: string, safeMessage: string): TokenResolutionError {
+  return new TokenResolutionError({ classification: "definitive", sourceKind: "named", code, safeMessage });
+}
+
+export function viaNotConnectionMessage(viaName: string): string {
+  return `${viaName} is not a 1password connection source; --via names a source added with: ${remedy.credentialSourceOnePassword(viaName)}`;
+}
+
+export function viaNotSupportedMessage(sourceName: string, type: string): string {
+  return `${sourceName} is a ${type} source; --via applies to 1password references and jwt or google-service-account sources`;
+}
+
+/**
+ * The login a binding's `via` names. Throws a definitive
+ * `TokenResolutionError` with fixed text before any spawn: an unknown name,
+ * a source that is not a connection, or a host without the macOS Keychain.
+ */
+export function connectionLoginFor(viaName: string, registry: SourceRegistry): OnePasswordLogin {
+  const source = registry[viaName];
+  if (!source) throw viaError("unknown-via", `unknown source: ${viaName}`);
+  if (!isConnectionSource(source)) throw viaError("via-not-connection", viaNotConnectionMessage(viaName));
+  if (!keychainPlatformAvailable(childEnv())) {
+    throw new TokenResolutionError({
+      classification: "definitive",
+      sourceKind: "keychain",
+      code: "keychain-platform",
+      safeMessage: "1password connection sources need the macOS login Keychain",
+    });
+  }
+  return Object.freeze({ kind: "connection", sourceName: viaName, keychain: source.keychain });
 }
 
 export type CommandSourceInvocation = Readonly<{
@@ -1215,6 +1433,7 @@ export function commandSourceStep(invocation: CommandSourceInvocation, exit: Pro
 }
 
 export function runCommandSource(source: CommandSource): string {
+  assertProviderMayRun("command");
   const invocation = commandSourceInvocation(source);
   const exit = providerExitFromSpawnSync(adminSpawnSync(invocation.executable, [...invocation.args], {
     cwd: invocation.cwd,
@@ -1227,6 +1446,157 @@ export function runCommandSource(source: CommandSource): string {
   return commandSourceStep(invocation, exit);
 }
 
+function connectionSetupExit(command: string, args: string[], options: childProcess.SpawnSyncOptions): ProviderExit {
+  return providerExitFromSpawnSync(adminSpawnSync(command, args, {
+    encoding: "utf8",
+    maxBuffer: PROVIDER_OUTPUT_MAX_BYTES,
+    shell: false,
+    ...options,
+  }));
+}
+
+// The only way a connection login reaches `op`: the sanitized host env cut
+// down to the service-account allowlist (the token, biometric unlock off, no
+// host `OP_*` account or session selection), a host-owned cwd, and the read
+// timeout. With that env `op` cannot fall back to the desktop app.
+function connectionOpSpawnOptions(token: string): Readonly<{ cwd: string; env: NodeJS.ProcessEnv; timeout: number }> {
+  return { cwd: hostOwnedSourceCwd(), env: connectionOpEnv(sanitizedHostExecutionEnv(projectRoot(), childEnv()), token), timeout: opReadTimeoutMs() };
+}
+
+function connectionCheckError(classification: "transient" | "definitive", code: string, safeMessage: string): TokenResolutionError {
+  return new TokenResolutionError({ classification, sourceKind: "1password", code, safeMessage });
+}
+
+/** The code of a connection check that 1Password answered with a refusal: a new login fixes it. */
+export const CONNECTION_LOGIN_REJECTED = "connection-login-rejected";
+
+/**
+ * The run preflight's check of a connection login: one `op whoami` with the
+ * service account token only, so it never asks a person and is allowed while
+ * a run holds the never-ask rule. Throws a classified `TokenResolutionError`
+ * with fixed text or token-scrubbed `op` stderr. Code
+ * `CONNECTION_LOGIN_REJECTED` means 1Password refused the login (revoked or
+ * invalid token); every other code means the check could not finish (no `op`,
+ * no answer, a network failure), which a new login would not fix.
+ */
+export function checkConnectionLoginForRun(sourceName: string, token: string): void {
+  const opPath = resolveHostExecutable("op");
+  if (!opPath) throw connectionCheckError("definitive", "op-missing", `source "${sourceName}": op CLI not found on sanitized host PATH`);
+  const exit = scrubOnePasswordExit(connectionSetupExit(opPath, opWhoamiArgs(), connectionOpSpawnOptions(token)), token);
+  if (exit.failure?.kind === "timeout") {
+    throw connectionCheckError("transient", "connection-check-timeout", `1Password did not answer the login check for source "${sourceName}"`);
+  }
+  if (exit.failure) throw connectionCheckError("definitive", "connection-check-spawn-failed", `the login check for source "${sourceName}" could not run op`);
+  if (exit.status !== 0) {
+    const detail = sanitizedStderrFirstLine(exit.stderr);
+    const suffix = detail ? `: ${detail}` : "";
+    if (classifyOnePasswordFailure(exit.stderr) === "transient") {
+      throw connectionCheckError("transient", "connection-check-unavailable", `1Password could not check the login for source "${sourceName}"${suffix}`);
+    }
+    throw connectionCheckError("definitive", CONNECTION_LOGIN_REJECTED, `1Password refused the login for source "${sourceName}"${suffix}`);
+  }
+  try {
+    parseServiceAccountWhoami(exit.stdout);
+  } catch {
+    throw connectionCheckError("definitive", CONNECTION_LOGIN_REJECTED, `1Password did not confirm a service account login for source "${sourceName}"`);
+  }
+}
+
+/**
+ * Checks a service account token with 1Password before it is stored; returns
+ * the vault names it can read. The token reaches only the `op` child's
+ * environment; every message is fixed text or `op` stderr with the exact token
+ * removed.
+ */
+export function verifyConnectionLogin(token: string): string[] {
+  const opPath = resolveHostExecutable("op");
+  if (!opPath) throw new ConnectionSetupError("op CLI not found on sanitized host PATH");
+  const options = connectionOpSpawnOptions(token);
+  const whoami = connectionSetupExit(opPath, opWhoamiArgs(), options);
+  if (whoami.failure || whoami.status !== 0) {
+    const detail = sanitizedStderrFirstLine(redactLogin(whoami.stderr, token));
+    throw new ConnectionSetupError(`1Password refused the service account token${detail ? `: ${detail}` : ""}`);
+  }
+  parseServiceAccountWhoami(whoami.stdout);
+  const vaults = connectionSetupExit(opPath, opVaultListArgs(), options);
+  if (vaults.failure || vaults.status !== 0) throw new ConnectionSetupError("1Password could not list the service account's vaults");
+  return parseVaultNames(vaults.stdout);
+}
+
+/** Saves (or replaces, `-U`) a connection login and reads it back; the token goes on stdin only. */
+export function writeConnectionLogin(item: KeychainItem, token: string): void {
+  const request = keychainWriteRequest(item, token);
+  assertKeychainNotLockedForSetup();
+  const exit = connectionSetupExit(keychainExecutable(childEnv()), request.args, {
+    env: sanitizedHostExecutionEnv(projectRoot(), childEnv()),
+    input: request.input,
+    timeout: KEYCHAIN_CALL_TIMEOUT_MS,
+  });
+  if (exit.failure || exit.status !== 0) throw new ConnectionSetupError("the macOS Keychain refused to save the login");
+  // `security -i` can report success for a line it did not store whole.
+  const invocation = connectionKeychainInvocation(item);
+  keychainWriteCheckStep(connectionSetupExit(invocation.executable, [...invocation.args], { env: invocation.env, timeout: invocation.timeoutMs }), token);
+}
+
+/**
+ * Reads a connection login from the macOS Keychain. Throws a classified
+ * `TokenResolutionError` with fixed text: a read's stdout is the login.
+ */
+export function readConnectionLoginSync(sourceName: string, item: KeychainItem): string {
+  if (connectionKeychainLockStateSync() === "locked") throw keychainLockedError(sourceName);
+  const invocation = connectionKeychainInvocation(item);
+  const exit = connectionSetupExit(invocation.executable, [...invocation.args], { env: invocation.env, timeout: invocation.timeoutMs });
+  return keychainReadStep(sourceName, exit);
+}
+
+export type KeychainInvocation = Readonly<{ executable: string; args: readonly string[]; env: NodeJS.ProcessEnv; timeoutMs: number }>;
+
+/** The `security` read of a connection login, for the synchronous and the watcher's owned reader alike. */
+export function connectionKeychainInvocation(item: KeychainItem): KeychainInvocation {
+  return {
+    executable: keychainExecutable(childEnv()),
+    args: keychainReadArgs(item),
+    env: Object.freeze(sanitizedHostExecutionEnv(projectRoot(), childEnv())),
+    timeoutMs: KEYCHAIN_CALL_TIMEOUT_MS,
+  };
+}
+
+/**
+ * The lock check run before a connection login's `security` call, for the
+ * synchronous and the watcher's owned reader alike; undefined when there is
+ * no check to run (the test seam without a fake), which reads as unknown.
+ */
+export function connectionKeychainLockCheck(): KeychainInvocation | undefined {
+  const executable = keychainLockCheckExecutable(childEnv());
+  if (!executable) return undefined;
+  return {
+    executable,
+    args: keychainLockCheckArgs(),
+    env: Object.freeze(sanitizedHostExecutionEnv(projectRoot(), childEnv())),
+    timeoutMs: KEYCHAIN_LOCK_CHECK_TIMEOUT_MS,
+  };
+}
+
+function connectionKeychainLockStateSync(): KeychainLockState {
+  const check = connectionKeychainLockCheck();
+  if (!check) return "unknown";
+  return keychainLockStateFromExit(connectionSetupExit(check.executable, [...check.args], { env: check.env, timeout: check.timeoutMs }));
+}
+
+function assertKeychainNotLockedForSetup(): void {
+  if (connectionKeychainLockStateSync() === "locked") throw new ConnectionSetupError(KEYCHAIN_LOCKED_SETUP_MESSAGE);
+}
+
+/** Deletes a connection login; an item that is already gone counts as done. */
+export function deleteConnectionLogin(item: KeychainItem): "deleted" | "absent" {
+  assertKeychainNotLockedForSetup();
+  const exit = connectionSetupExit(keychainExecutable(childEnv()), keychainDeleteArgs(item), {
+    env: sanitizedHostExecutionEnv(projectRoot(), childEnv()),
+    timeout: KEYCHAIN_CALL_TIMEOUT_MS,
+  });
+  return keychainDeleteStep(exit);
+}
+
 /** A refusal before `op` runs. Its message is fixed text, never a value read. */
 class SecretRefReadPrecheckError extends Error {}
 
@@ -1234,13 +1604,14 @@ function jwtPrivateKeyRead(
   ref: SecretRef,
   options: { quiet?: boolean; verbose?: boolean } = {},
   label = "JWT private key",
+  login: OnePasswordLogin = APP_LOGIN,
 ): OnePasswordRead {
   if (ref.source !== "1password") throw new SecretRefReadPrecheckError("unsupported secret reference");
   if (!ref.ref.startsWith("op://")) throw new SecretRefReadPrecheckError("1Password references must start with op://");
   const opPath = resolveHostExecutable("op");
   if (!opPath) throw new SecretRefReadPrecheckError("op CLI not found on sanitized host PATH");
   adminVerbose(options, `reading ${label} from 1Password`);
-  return onePasswordRead(opPath, ref.ref, options);
+  return onePasswordRead(opPath, ref.ref, options, login);
 }
 
 function readSecretRef(ref: SecretRef, options: { quiet?: boolean; verbose?: boolean } = {}): string {
@@ -1465,14 +1836,20 @@ function planStep(build: () => CredentialReadPlan): CredentialReadPlan {
   }
 }
 
-function namedSourceReadPlan(source: NamedSource, options: TokenResolutionOptions & { sourceName?: string }): CredentialReadPlan {
+// `login` is the binding's `via` connection (resolved by the caller), or the
+// app; it selects how a jwt or google-service-account key is read.
+function namedSourceReadPlan(
+  source: NamedSource,
+  options: TokenResolutionOptions & { sourceName?: string },
+  login: OnePasswordLogin = APP_LOGIN,
+): CredentialReadPlan {
   switch (source.type) {
     case "command":
       return planStep(() => ({ kind: "command", invocation: commandSourceInvocation(source) }));
     case "jwt": {
       const cachedKey = cachedJwtSigningKey(source, options);
       if (cachedKey) return { kind: "jwt", source, options, signingKey: { kind: "cached", key: cachedKey } };
-      return planStep(() => ({ kind: "jwt", source, options, signingKey: { kind: "read", read: jwtPrivateKeyRead(source.privateKey, options) } }));
+      return planStep(() => ({ kind: "jwt", source, options, signingKey: { kind: "read", read: jwtPrivateKeyRead(source.privateKey, options, undefined, login) } }));
     }
     case "google-service-account": {
       const cached = cachedGoogleServiceAccountKey(source, options);
@@ -1481,9 +1858,20 @@ function namedSourceReadPlan(source: NamedSource, options: TokenResolutionOption
         kind: "google-service-account",
         source,
         options,
-        signingKey: { kind: "read", read: jwtPrivateKeyRead(source.keyJson, options, "service account key JSON") },
+        signingKey: { kind: "read", read: jwtPrivateKeyRead(source.keyJson, options, "service account key JSON", login) },
       }));
     }
+    case "1password":
+      // A connection reads references; it has no value of its own.
+      return {
+        kind: "failure",
+        error: new TokenResolutionError({
+          classification: "definitive",
+          sourceKind: "named",
+          code: "connection-not-value",
+          safeMessage: connectionNotValueMessage(options.sourceName ?? "source"),
+        }),
+      };
     default: {
       const unknownSource: never = source;
       throw new Error(`unsupported named source type: ${String((unknownSource as { type?: unknown }).type)}`);
@@ -1520,6 +1908,9 @@ function semanticNamedSource(sourceName: string, registry: SourceRegistry | unde
         scopes: source.scopes,
         ttlSeconds: source.ttlSeconds,
       };
+    case "1password":
+      // The Keychain item only: a login rotation never changes a fingerprint.
+      return { type: "1password", keychain: source.keychain };
     default: {
       const unknownSource: never = source;
       throw new Error(`unsupported named source type: ${String((unknownSource as { type?: unknown }).type)}`);
@@ -1534,12 +1925,19 @@ export function tokenSourceFingerprint(source: TokenSource, registry: SourceRegi
     source: source.source,
   };
   if (source.source === "env") return sha256Json({ ...base, env: source.env });
-  if (source.source === "1password") return sha256Json({ ...base, ref: source.ref });
+  // The connection's semantic identity (type and Keychain item), never its
+  // login: a rotation keeps receipts valid, a replaced connection does not.
+  // Keys appear only when `via` is set, so other fingerprints are unchanged.
+  const via = (source.source === "1password" || source.source === "named") && source.via !== undefined
+    ? { via: source.via, viaSource: semanticNamedSource(source.via, registry) }
+    : {};
+  if (source.source === "1password") return sha256Json({ ...base, ref: source.ref, ...via });
   if (source.source === "named") {
     return sha256Json({
       ...base,
       name: source.name,
       namedSource: semanticNamedSource(source.name, registry),
+      ...via,
     });
   }
   if (source.source === "cmd") return sha256Json({ ...base, command: source.command });
@@ -1652,8 +2050,9 @@ export function adminDockerClient(): DockerClient {
 export function describeSource(source: TokenSource | undefined): string {
   if (!source) return "unconfigured";
   if (source.source === "env") return `env ${source.env}`;
-  if (source.source === "1password") return "1password";
-  if (source.source === "named") return `source ${source.name}`;
+  const via = (source.source === "1password" || source.source === "named") && source.via !== undefined ? ` via ${source.via}` : "";
+  if (source.source === "1password") return `1password${via}`;
+  if (source.source === "named") return `source ${source.name}${via}`;
   if (source.source === "cmd") return "legacy command (unsupported)";
   return "legacy local-file (unsupported)";
 }
@@ -1695,8 +2094,48 @@ function commandSourceMigrationInstructions(tokenName: string, prefix: string): 
   ].join("; ");
 }
 
+function registryForInteractionCheck(options: TokenResolutionOptions): SourceRegistry | undefined {
+  if (options.sourceRegistry) return options.sourceRegistry;
+  try {
+    return loadSourceRegistry();
+  } catch {
+    return undefined;
+  }
+}
+
+function credentialOwnerForMessage(tokenName: string): CredentialOwner | undefined {
+  try {
+    return credentialOwner(tokenName);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * The plan-level guard of the never-ask rule: while a run holds it, a binding
+ * that may ask fails here with its own refusal and fix, before the signing-key
+ * cache is consulted (a run's answer never depends on cache state) and before
+ * any provider. Undefined when the read may go on.
+ */
+function interactionForbiddenPlan(tokenName: string, source: TokenSource, options: TokenResolutionOptions): CredentialReadPlan | undefined {
+  if (!credentialInteractionForbidden()) return undefined;
+  const registry = tokenSourceReadsRegistry(source) || source.source === "1password" ? registryForInteractionCheck(options) : undefined;
+  const verdict = unattendedReadVerdict(source, registry);
+  if (verdict.kind === "never-asks") return undefined;
+  const message = unattendedRefusalLines({
+    tokenName,
+    source,
+    reason: verdict.reason,
+    owner: credentialOwnerForMessage(tokenName),
+    connections: connectionSourceNames(registry),
+  }).join("\n");
+  return { kind: "failure", error: new CredentialInteractionForbiddenError(message, verdict.reason === "command" ? "command" : source.source === "named" ? "named" : "1password") };
+}
+
 /** Decides one source read up to the provider run (see `CredentialReadPlan`). */
 export function credentialReadPlan(tokenName: string, source: TokenSource, options: TokenResolutionOptions = {}): CredentialReadPlan {
+  const forbidden = interactionForbiddenPlan(tokenName, source, options);
+  if (forbidden) return forbidden;
   if (source.source === "env") {
     adminVerbose(options, `${tokenName}: reading host environment source ${source.env}`);
     const value = childEnv()[source.env];
@@ -1740,8 +2179,11 @@ export function credentialReadPlan(tokenName: string, source: TokenSource, optio
         }),
       };
     }
-    adminVerbose(options, `${tokenName}: reading 1Password source with op CLI`);
-    return { kind: "1password", read: onePasswordRead(opPath, source.ref, options) };
+    return planStep(() => {
+      const login = source.via === undefined ? APP_LOGIN : connectionLoginFor(source.via, options.sourceRegistry ?? loadSourceRegistry());
+      adminVerbose(options, `${tokenName}: reading 1Password source with op CLI${source.via === undefined ? "" : ` through ${source.via}`}`);
+      return { kind: "1password", read: onePasswordRead(opPath, source.ref, options, login) };
+    });
   }
 
   if (source.source === "named") {
@@ -1764,7 +2206,18 @@ export function credentialReadPlan(tokenName: string, source: TokenSource, optio
         }),
       };
     }
-    return namedSourceReadPlan(namedSource, { ...options, sourceName: source.name });
+    let login: OnePasswordLogin = APP_LOGIN;
+    if (source.via !== undefined) {
+      if (namedSource.type === "command") {
+        return { kind: "failure", error: viaError("via-not-supported", viaNotSupportedMessage(source.name, namedSource.type)) };
+      }
+      try {
+        login = connectionLoginFor(source.via, registry);
+      } catch (error) {
+        return { kind: "failure", error };
+      }
+    }
+    return namedSourceReadPlan(namedSource, { ...options, sourceName: source.name }, login);
   }
 
   if (source.source === "cmd") {
@@ -1783,6 +2236,7 @@ function runCredentialReadPlanSync(plan: CredentialReadPlan): string {
     case "1password":
       return runOnePasswordReadSync(plan.read);
     case "command": {
+      assertProviderMayRun("command");
       const { invocation } = plan;
       const exit = providerExitFromSpawnSync(adminSpawnSync(invocation.executable, [...invocation.args], {
         cwd: invocation.cwd,
@@ -1813,15 +2267,16 @@ function resolveTokenSource(tokenName: string, source: TokenSource, options: Tok
 
 /**
  * Identifies one direct 1Password resolution's context for sharing within a
- * preparation: the resolved provider executable and the exact reference
- * bytes (no alias normalization). The account/context selection — anything
+ * preparation: the resolved provider executable, the exact reference
+ * bytes (no alias normalization), and the login identity (the app, or one
+ * connection's Keychain item; never the login itself). The rest of the account/context selection — anything
  * in the provider's environment, `OP_ACCOUNT`, a service-account token, a
  * Connect host/token — is not part of this key's bytes (nothing is hashed or
  * logged); instead the owning scope binds to one exact environment (see
  * `createCredentialPreparationScope`) and never shares across a difference
  * in it, so two different accounts can never collide on the same key.
  */
-export type ProviderReadKey = Readonly<{ executable: string; ref: string }>;
+export type ProviderReadKey = Readonly<{ executable: string; ref: string; login: string }>;
 
 /** One successful direct 1Password read, kept only long enough to share it with later destinations in the same preparation pass. */
 export type SuccessfulProviderRead = Readonly<{ value: string; resolvedAt: number }>;
@@ -1829,7 +2284,7 @@ export type SuccessfulProviderRead = Readonly<{ value: string; resolvedAt: numbe
 function providerReadKeyString(key: ProviderReadKey): string {
   // A NUL byte cannot appear in a real executable path or an op:// reference,
   // so the pair joins into one exact, collision-free string key.
-  return `${key.executable}\u0000${key.ref}`;
+  return `${key.executable}\u0000${key.ref}\u0000${key.login}`;
 }
 
 /**
@@ -1881,7 +2336,9 @@ export function createCredentialPreparationScope(): CredentialPreparationScope {
   function sharedKeyFor(read: OnePasswordRead): string | undefined {
     if (boundEnvironment === undefined) boundEnvironment = read.env;
     else if (!sameProviderEnvironment(boundEnvironment, read.env)) return undefined;
-    return providerReadKeyString({ executable: read.executable, ref: read.ref });
+    // An app read and a connection read of one reference are different
+    // logins, so they never share a value.
+    return providerReadKeyString({ executable: read.executable, ref: read.ref, login: loginIdentity(read.login) });
   }
   return Object.freeze({
     readSync(plan: CredentialReadPlan): string {
@@ -1918,8 +2375,19 @@ export type TokenSourceSelection =
   | { kind: "none" }
   | { kind: "stdin" }
   | { kind: "env"; env: string }
-  | { kind: "named"; name: string }
-  | { kind: "1password"; ref: string };
+  | { kind: "named"; name: string; via?: string }
+  | { kind: "1password"; ref: string; via?: string };
+
+/** `connectionLoginFor` for a binding command: its refusal is the command's error. */
+export function selectionConnectionLogin(viaName: string, registry: SourceRegistry): OnePasswordLogin {
+  assertKnownSourceName(viaName);
+  try {
+    return connectionLoginFor(viaName, registry);
+  } catch (error) {
+    if (error instanceof TokenResolutionError) die(error.safeMessage);
+    throw error;
+  }
+}
 
 // Enforcement: resolve a typed selection into a stored TokenSource, re-validating
 // that the underlying secret actually resolves (env set, source known, op://
@@ -1937,20 +2405,30 @@ export function tokenSourceFromSelection(selection: TokenSourceSelection, requir
       if (!value) die(`${selection.env} is unset or empty`);
       return { source: "env", env: selection.env };
     }
-    case "named":
+    case "named": {
       assertKnownSourceName(selection.name);
-      if (!loadSourceRegistry()[selection.name]) die(`unknown source: ${selection.name}`);
-      return { source: "named", name: selection.name };
+      const registry = loadSourceRegistry();
+      const namedSource = registry[selection.name];
+      if (!namedSource) die(`unknown source: ${selection.name}`);
+      if (isConnectionSource(namedSource)) die(connectionNotValueMessage(selection.name));
+      if (selection.via === undefined) return { source: "named", name: selection.name };
+      // Stored without a read, as a plain --from-source: the key is read
+      // through the connection at sync. Every refusal is before any write.
+      if (namedSource.type === "command") die(viaNotSupportedMessage(selection.name, namedSource.type));
+      selectionConnectionLogin(selection.via, registry);
+      return { source: "named", name: selection.name, via: selection.via };
+    }
     case "1password": {
       if (!selection.ref.startsWith("op://")) die("1Password references must start with op://");
+      const login = selection.via === undefined ? APP_LOGIN : selectionConnectionLogin(selection.via, loadSourceRegistry());
       const opPath = resolveHostExecutable("op");
       if (!opPath) die("op CLI not found on sanitized host PATH");
       try {
-        readOnePasswordRef(opPath, selection.ref);
+        readOnePasswordRef(opPath, selection.ref, {}, login);
       } catch (error) {
         die(error instanceof Error ? error.message : String(error));
       }
-      return { source: "1password", ref: selection.ref };
+      return selection.via === undefined ? { source: "1password", ref: selection.ref } : { source: "1password", ref: selection.ref, via: selection.via };
     }
   }
 }
@@ -1967,6 +2445,7 @@ function namedSignedSource(source: TokenSource | undefined, registry?: SourceReg
   if (!namedSource) return undefined;
   switch (namedSource.type) {
     case "command":
+    case "1password":
       return undefined;
     case "jwt":
     case "google-service-account":
@@ -2021,8 +2500,8 @@ export function tokenSourcesEqual(left: TokenSource | undefined, right: TokenSou
   if ((left.refreshEverySeconds ?? 0) !== (right.refreshEverySeconds ?? 0)) return false;
   if (left.runfreeUserServiceOwner !== right.runfreeUserServiceOwner) return false;
   if (left.source === "env" && right.source === "env") return left.env === right.env;
-  if (left.source === "1password" && right.source === "1password") return left.ref === right.ref;
-  if (left.source === "named" && right.source === "named") return left.name === right.name;
+  if (left.source === "1password" && right.source === "1password") return left.ref === right.ref && (left.via ?? "") === (right.via ?? "");
+  if (left.source === "named" && right.source === "named") return left.name === right.name && (left.via ?? "") === (right.via ?? "");
   if (left.source === "file" && right.source === "file") return left.path === right.path;
   if (left.source === "cmd" && right.source === "cmd") return left.command === right.command;
   return false;
@@ -3113,7 +3592,7 @@ export function planWatchCredentialReads(input: Readonly<{
   }
   let registry: SourceRegistry | undefined;
   let registryReadable = true;
-  if (Object.values(config).some((source) => source.source === "named")) {
+  if (Object.values(config).some((source) => tokenSourceReadsRegistry(source))) {
     try {
       registry = loadSourceRegistry();
     } catch {
@@ -3129,8 +3608,8 @@ export function planWatchCredentialReads(input: Readonly<{
   for (const tokenName of Object.keys(policy.tokens)) {
     if (input.only && !input.only.has(tokenName)) continue;
     const source = config[tokenName];
-    if (!source || source.source === "named" && !registryReadable) continue;
-    const sourceRegistry = source.source === "named" ? registry : undefined;
+    if (!source || tokenSourceReadsRegistry(source) && !registryReadable) continue;
+    const sourceRegistry = tokenSourceReadsRegistry(source) ? registry : undefined;
     try {
       const fingerprint = tokenSourceFingerprint(source, sourceRegistry);
       if (!input.only && input.mode !== "source-truth") {
@@ -3264,7 +3743,7 @@ function warmSkippableTokens(
     const source = config[name];
     const receipt = receipts.get(name);
     if (!source || !receipt || !held.has(name)) continue;
-    const sourceRegistry = source.source === "named" ? registry : undefined;
+    const sourceRegistry = tokenSourceReadsRegistry(source) ? registry : undefined;
     let fingerprint: string;
     let refresh: EffectiveTokenRefresh;
     try {
@@ -3291,7 +3770,7 @@ export function prepareRuntimeTokenSources(options: Readonly<{ mode?: RuntimeTok
   if (!active) throw new Error("runtime credential preparation requires approved effective policy");
   const policy = validateNetworkPolicy(active.policy, active.networkPolicyPath);
   const config = loadTokenConfig();
-  const registry = Object.values(config).some((source) => source.source === "named") ? loadSourceRegistry() : undefined;
+  const registry = Object.values(config).some((source) => tokenSourceReadsRegistry(source)) ? loadSourceRegistry() : undefined;
   // The skip set only ever spares a read, so with no configured source to read
   // there is nothing to spare and no reason to ask the proxy.
   const readsSources = Object.keys(policy.tokens).some((name) => config[name] !== undefined);
@@ -3310,7 +3789,7 @@ export function prepareRuntimeTokenSources(options: Readonly<{ mode?: RuntimeTok
         if (tokenPolicy.allowAnonymous) continue;
         throw new Error(missingRequiredTokenSourceMessage(name));
       }
-      const sourceRegistry = source.source === "named" ? registry : undefined;
+      const sourceRegistry = tokenSourceReadsRegistry(source) ? registry : undefined;
       const fingerprint = tokenSourceFingerprint(source, sourceRegistry);
       values.set(name, skippable.has(name)
         ? { kind: "skipped", fingerprint }
@@ -3359,8 +3838,8 @@ function assertPreparedTokenSourceInputs(
   }
   for (const name of names) {
     const source = config[name];
-    if (!source || source.source === "named" && !registry?.[source.name]
-      || prepared.values.get(name)?.fingerprint !== tokenSourceFingerprint(source, source.source === "named" ? registry : undefined)) {
+    if (!source || tokenSourceRegistryNames(source).some((registryName) => !registry?.[registryName])
+      || prepared.values.get(name)?.fingerprint !== tokenSourceFingerprint(source, tokenSourceReadsRegistry(source) ? registry : undefined)) {
       throw new EffectiveControlSelectionChanged("prepared credential source changed before disruption or sync; resolve current sources and retry");
     }
   }
@@ -3385,7 +3864,7 @@ export function admitPreparedRuntimeTokenSources(project: ProjectInfo): void {
   // exact host metadata paths captured by preparation, without resolving any
   // credential or invoking an external source while the lifecycle lock is held.
   const config = parseTokenSourceConfig(readJsonFile<unknown>(prepared.tokenConfigPath, {}), prepared.tokenConfigPath);
-  const registry = Object.values(config).some((source) => source.source === "named")
+  const registry = Object.values(config).some((source) => tokenSourceReadsRegistry(source))
     ? validateSourceRegistry(readJsonFile<unknown>(prepared.sourceConfigPath, {}), prepared.sourceConfigPath) : undefined;
   assertPreparedTokenSourceInputs(prepared, validateNetworkPolicy(active.policy, active.networkPolicyPath), config, registry);
   prepared.admittedAt ??= now;
@@ -3727,7 +4206,7 @@ function syncTokensUnderLock(
   }
   let sourceRegistry: SourceRegistry | undefined;
   let sourceRegistryError: unknown;
-  if (Object.values(config).some((source) => source.source === "named")) {
+  if (Object.values(config).some((source) => tokenSourceReadsRegistry(source))) {
     try {
       sourceRegistry = loadSourceRegistry();
     } catch (error) {
@@ -3759,7 +4238,7 @@ function syncTokensUnderLock(
     for (const [tokenName] of Object.entries(policy.tokens)) {
       const source = config[tokenName];
       if (!source) continue;
-      const registryForSource = source.source === "named" ? sourceRegistry : undefined;
+      const registryForSource = tokenSourceReadsRegistry(source) ? sourceRegistry : undefined;
       const due = tokenDueDecision({
         heldTokens,
         ledger,
@@ -3797,7 +4276,7 @@ function syncTokensUnderLock(
     // written yet, and the source-truth order prepares afresh.
     try {
       const expectedNames = assertPreparedTokenSourceInputs(prepared, policy, config, sourceRegistry);
-      for (const name of expectedNames) currentPreparedRuntimeTokenSource(name, config[name], { quiet: true, sourceRegistry: config[name].source === "named" ? sourceRegistry : undefined });
+      for (const name of expectedNames) currentPreparedRuntimeTokenSource(name, config[name], { quiet: true, sourceRegistry: tokenSourceReadsRegistry(config[name]) ? sourceRegistry : undefined });
     } catch (error) {
       if (deferring && error instanceof EffectiveControlSelectionChanged) {
         throw new TokenSyncDeferredError(`the prepared credential set no longer applies: ${error.message}`, "preparation");
@@ -3837,10 +4316,10 @@ function syncTokensUnderLock(
     }
 
     try {
-      if (source.source === "named" && sourceRegistryError !== undefined) {
+      if (tokenSourceReadsRegistry(source) && sourceRegistryError !== undefined) {
         throw sourceRegistryError;
       }
-      const registryForSource = source.source === "named" ? sourceRegistry : undefined;
+      const registryForSource = tokenSourceReadsRegistry(source) ? sourceRegistry : undefined;
       const refresh = effectiveTokenRefresh(source, registryForSource);
       assertRefreshBeforeJwtExpiry(refresh);
       // A value the preparation re-read from its source is always written: the
@@ -3986,7 +4465,7 @@ function syncTokensUnderLock(
       clearCachedSourceSecret(source, options.sourceSecretCache);
       let failureFingerprint: string | undefined;
       try {
-        const registryForSource = source.source === "named" && sourceRegistryError === undefined ? sourceRegistry : undefined;
+        const registryForSource = tokenSourceReadsRegistry(source) && sourceRegistryError === undefined ? sourceRegistry : undefined;
         failureFingerprint = tokenSourceFingerprint(source, registryForSource);
       } catch {
         // The source-resolution failure remains the user-facing diagnostic.
@@ -4115,6 +4594,11 @@ export type CredentialSyncInput = {
   cacheSourceSecrets: boolean;
   /** Watch only: re-read every source once before the first wait (launch plan D4). */
   initialSourceTruth?: boolean;
+  /**
+   * Watch only: the watcher of a `runfree run` holds the never-ask rule for
+   * its whole life.
+   */
+  unattended?: boolean;
   /**
    * One-shot only, in-process startup. `startup-convergence`: the
    * receipt-gated warm-launch sync. `prepared-source-truth`: a cold launch's
@@ -4398,6 +4882,9 @@ export type ServiceEnableInput = {
   id: string;
   tokenSource: TokenSourceSelection;
   fromOnePasswordItem?: string;
+  // `--via` with `--from-1password-item`: the 1password connection source the
+  // item's fields are read through, saved on every binding it creates.
+  fromOnePasswordItemVia?: string;
   // Raw `--param <key>=<value>` arguments (or prompt answers in the same
   // shape); parsed and validated by planDesiredServiceEnable against the
   // service's declared parameters.

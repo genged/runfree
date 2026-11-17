@@ -11,17 +11,21 @@ import {
   assertSourceArgumentsOutsideProject,
   childEnv,
   type CommandSource,
+  deleteConnectionLogin,
   die,
   ensureStateDirs,
   formatDurationSeconds,
   type GoogleServiceAccountSource,
+  isConnectionSource,
   type JwtAlgorithm,
   type JwtSource,
   loadSourceRegistry,
   type NamedSource,
+  type OnePasswordConnectionSource,
   parseDurationSeconds,
   parseTokenSourceConfig,
   policyJson,
+  readConnectionLoginSync,
   readJsonFile,
   regularExecutableRealpath,
   resolveHostExecutable,
@@ -34,8 +38,22 @@ import {
   sourceConfigPath,
   type SourceNameInput,
   type SourceRegistry,
+  tokenSourceRegistryNames,
+  verifyConnectionLogin,
+  writeConnectionLogin,
   writeJsonFile,
 } from "./admin-core.ts";
+import {
+  assertKeychainPlatform,
+  assertServiceAccountTokenShape,
+  ConnectionSetupError,
+  keychainItemForSource,
+  KEYCHAIN_LOCKED,
+  KEYCHAIN_UNLOCK_FIX,
+  keychainPlatformAvailable,
+} from "./keychain-login.ts";
+import { remedy } from "../remedies.ts";
+import { TokenResolutionError } from "../token-resolution.ts";
 import {
   assertGoogleServiceAccountTtl,
   GOOGLE_SA_TTL_DEFAULT_SECONDS,
@@ -93,6 +111,10 @@ function namedSourcesEqual(left: NamedSource, right: NamedSource): boolean {
         && left.clientEmail === right.clientEmail
         && left.ttlSeconds === right.ttlSeconds
         && policyJson(left.scopes) === policyJson(right.scopes);
+    case "1password":
+      return right.type === "1password"
+        && left.keychain.service === right.keychain.service
+        && left.keychain.account === right.keychain.account;
     default: {
       const unknownSource: never = left;
       throw new Error(`unsupported named source type: ${String((unknownSource as { type?: unknown }).type)}`);
@@ -120,7 +142,7 @@ function sourceUsers(registryName: string): string[] {
     if (!stat.isDirectory()) continue;
     const config = parseTokenSourceConfig(readJsonFile<unknown>(path.join(dir, "tokens.json"), {}), path.join(dir, "tokens.json"));
     for (const [tokenName, source] of Object.entries(config)) {
-      if (source.source === "named" && source.name === registryName) users.push(tokenName);
+      if (tokenSourceRegistryNames(source).includes(registryName)) users.push(tokenName);
     }
   }
   return Array.from(new Set(users)).sort();
@@ -143,7 +165,7 @@ function putUniqueKeyValue(target: Record<string, string>, flag: string, raw: st
 }
 
 function sourceTypeDisplay(source: NamedSource): string {
-  return source.type;
+  return source.type === "1password" ? "1password (connection)" : source.type;
 }
 
 function jwtDisplay(source: JwtSource): string[] {
@@ -179,6 +201,8 @@ function namedSourceDisplay(source: NamedSource): string[] {
       return jwtDisplay(source);
     case "google-service-account":
       return googleServiceAccountDisplay(source);
+    case "1password":
+      return [`login: macOS Keychain item ${source.keychain.service}/${source.keychain.account}`, "never asks: yes"];
     default: {
       const unknownSource: never = source;
       throw new Error(`unsupported named source type: ${String((unknownSource as { type?: unknown }).type)}`);
@@ -391,16 +415,155 @@ export function sourceShowIntent(input: SourceNameInput): void {
   for (const line of namedSourceDisplay(source)) console.log(line);
   console.log(`used by: ${users.join(", ") || "none"}`);
   console.log("agent exposure: no");
-  console.log("executes during: credential sync");
+  console.log(source.type === "1password"
+    ? "executes during: credential sync and runfree run (op with the stored service account login)"
+    : "executes during: credential sync");
 }
 
 export function sourceRemoveIntent(input: SourceNameInput): void {
   assertKnownSourceName(input.name);
   const registry = loadSourceRegistry();
-  if (!registry[input.name]) die(`unknown source: ${input.name}`);
+  const source = registry[input.name];
+  if (!source) die(`unknown source: ${input.name}`);
   const users = sourceUsers(input.name);
   if (users.length > 0) die(`${input.name} is used by credential bindings: ${users.join(", ")}`);
+  if (isConnectionSource(source)) removeConnectionLogin(input.name, source.keychain);
   delete registry[input.name];
   saveSourceRegistry(registry);
   console.log(`${input.name} source removed`);
+}
+
+/** Where a connection login comes from: piped stdin, a hidden prompt, or nowhere. */
+export type ConnectionTokenInput =
+  | Readonly<{ kind: "stdin"; text: string }>
+  | Readonly<{ kind: "prompt"; ask: () => Promise<string | undefined> }>
+  | Readonly<{ kind: "none" }>;
+
+export type SourceOnePasswordInput = { name: string | undefined; token: ConnectionTokenInput };
+
+async function connectionToken(input: ConnectionTokenInput): Promise<string> {
+  if (input.kind === "stdin") return input.text.replace(/\r?\n$/, "");
+  if (input.kind === "prompt") {
+    const answer = await input.ask();
+    if (answer === undefined) die("cancelled; nothing was saved");
+    return answer;
+  }
+  die("no terminal to ask for the service account token; pass --token-stdin");
+}
+
+function vaultLine(vaults: string[]): string {
+  return vaults.length === 1 ? `vault "${vaults[0]}"` : `vaults ${vaults.map((vault) => `"${vault}"`).join(", ")}`;
+}
+
+// Typed enforcement for `runfree credential source 1password <name>`. Every
+// refusal comes before the first spawn or write it guards: the token is
+// checked with 1Password before the Keychain write, and the registry entry
+// (the Keychain item name, never the token) is the last write.
+export async function sourceAddOnePasswordConnectionIntent(input: SourceOnePasswordInput): Promise<void> {
+  const { name } = input;
+  if (!name) die("usage: runfree credential source 1password <name> [--token-stdin]");
+  assertKnownSourceName(name);
+  if (loadSourceRegistry()[name]) die(`${name} source is already configured; to change its login run: ${remedy.credentialSourceLogin(name)}`);
+  try {
+    assertKeychainPlatform(childEnv());
+    if (!resolveHostExecutable("op")) throw new ConnectionSetupError("op CLI not found on sanitized host PATH");
+    const token = await connectionToken(input.token);
+    assertServiceAccountTokenShape(token);
+    const vaults = verifyConnectionLogin(token);
+    console.log(`checking with 1Password... ok: can read ${vaultLine(vaults)}; never asks`);
+    ensureStateDirs();
+    const item = keychainItemForSource(name);
+    writeConnectionLogin(item, token);
+    const registry = loadSourceRegistry();
+    registry[name] = { type: "1password", keychain: item, createdAt: new Date().toISOString() };
+    saveSourceRegistry(registry);
+    console.log(`${name}: saved (login kept in your macOS Keychain)`);
+  } catch (error) {
+    if (error instanceof ConnectionSetupError) die(error.message);
+    throw error;
+  }
+}
+
+// Typed enforcement for `runfree credential source login <name>`: replaces a
+// connection's stored login. The new token is checked with 1Password before
+// the Keychain update, so a rejected token leaves the old login in place. The
+// registry is not written: the Keychain item name does not change.
+export async function sourceLoginIntent(input: SourceOnePasswordInput): Promise<void> {
+  const { name } = input;
+  if (!name) die("usage: runfree credential source login <name> [--token-stdin]");
+  assertKnownSourceName(name);
+  const source = loadSourceRegistry()[name];
+  if (!source) die(`unknown source: ${name}`);
+  if (!isConnectionSource(source)) die(`login applies to 1password connection sources; ${name} is a ${sourceTypeDisplay(source)} source`);
+  try {
+    assertKeychainPlatform(childEnv());
+    if (!resolveHostExecutable("op")) throw new ConnectionSetupError("op CLI not found on sanitized host PATH");
+    const token = await connectionToken(input.token);
+    assertServiceAccountTokenShape(token);
+    const vaults = verifyConnectionLogin(token);
+    console.log(`checking with 1Password... ok: can read ${vaultLine(vaults)}; never asks`);
+    writeConnectionLogin(source.keychain, token);
+  } catch (error) {
+    if (error instanceof ConnectionSetupError) die(error.message);
+    throw error;
+  }
+  const users = sourceUsers(name);
+  console.log(`${name}: login replaced`);
+  console.log(users.length > 0 ? `used by credential bindings: ${users.join(", ")}` : "used by: none");
+}
+
+// The Keychain item goes first: a refused delete keeps the registry entry, so
+// the state stays consistent and `remove` can be retried. A registry write
+// that fails after the delete leaves an entry whose login is absent; rerunning
+// `remove` counts the absent item as done and finishes.
+function removeConnectionLogin(name: string, item: OnePasswordConnectionSource["keychain"]): void {
+  if (!keychainPlatformAvailable(childEnv())) {
+    // No login Keychain on this host, so no login to delete (a registry copied
+    // from a Mac): removing the entry is the whole job.
+    console.log(`${name}: no macOS Keychain on this host; removing the source entry only`);
+    return;
+  }
+  try {
+    const outcome = deleteConnectionLogin(item);
+    console.log(`${name}: login ${outcome === "deleted" ? "deleted from" : "already absent from"} the macOS Keychain`);
+  } catch (error) {
+    if (error instanceof ConnectionSetupError) {
+      die(`${error.message}; nothing was removed; retry: ${remedy.credentialSourceRemove(name)}`);
+    }
+    throw error;
+  }
+}
+
+// Typed enforcement for `runfree credential source check <name>`: reads the
+// stored login and asks 1Password what it can read. Connections only; any
+// other type refuses before a spawn. Never prints the login.
+export function sourceCheckIntent(input: SourceNameInput): void {
+  const { name } = input;
+  assertKnownSourceName(name);
+  const source = loadSourceRegistry()[name];
+  if (!source) die(`unknown source: ${name}`);
+  if (!isConnectionSource(source)) die(`check verifies 1password connection sources; ${name} is a ${sourceTypeDisplay(source)} source`);
+  const fix = `fix: ${remedy.credentialSourceLogin(name)}`;
+  try {
+    assertKeychainPlatform(childEnv());
+    if (!resolveHostExecutable("op")) throw new ConnectionSetupError("op CLI not found on sanitized host PATH");
+  } catch (error) {
+    if (error instanceof ConnectionSetupError) die(error.message);
+    throw error;
+  }
+  let token: string;
+  try {
+    token = readConnectionLoginSync(name, source.keychain);
+  } catch (error) {
+    if (error instanceof TokenResolutionError) die(`${error.safeMessage}\n${error.code === KEYCHAIN_LOCKED ? `fix: ${KEYCHAIN_UNLOCK_FIX}` : fix}`);
+    throw error;
+  }
+  let vaults: string[];
+  try {
+    vaults = verifyConnectionLogin(token);
+  } catch (error) {
+    if (error instanceof ConnectionSetupError) die(`${name}: ${error.message}\n${fix}`);
+    throw error;
+  }
+  console.log(`${name}: ok: can read ${vaultLine(vaults)}; never asks`);
 }

@@ -69,7 +69,9 @@ import {
   loadServiceRecords,
   loadTokenConfig,
   readAgentEnv,
+  loadSourceRegistry,
   readOnePasswordRef,
+  selectionConnectionLogin,
   resolveHostExecutable,
   saveTokenSource,
   saveUserServiceTokenSource,
@@ -88,6 +90,7 @@ import {
   currentAdminState,
 } from "./admin-core.ts";
 import { sha256Digest } from "../strict-primitives.ts";
+import { APP_LOGIN, type OnePasswordLogin } from "./onepassword-connection.ts";
 import { compileDesiredPolicies } from "../control/compiler.ts";
 import type { DesiredPolicyCandidate } from "../control/candidates.ts";
 import { remedy } from "../remedies.ts";
@@ -456,14 +459,15 @@ export function recordedAgentEnvNamesForServiceEntry(entry: DesiredServiceEntry)
 // Repeat the credential-source flags the operator gave so the rendered remedy
 // is their command plus the missing parameter.
 export function credentialSourceArgs(input: ServiceEnableInput): string | undefined {
-  if (input.fromOnePasswordItem) return `--from-1password-item ${input.fromOnePasswordItem}`;
+  const viaArg = (via: string | undefined) => (via === undefined ? "" : ` --via ${via}`);
+  if (input.fromOnePasswordItem) return `--from-1password-item ${input.fromOnePasswordItem}${viaArg(input.fromOnePasswordItemVia)}`;
   switch (input.tokenSource.kind) {
     case "named":
-      return `--from-source ${input.tokenSource.name}`;
+      return `--from-source ${input.tokenSource.name}${viaArg(input.tokenSource.via)}`;
     case "env":
       return `--from-env ${input.tokenSource.env}`;
     case "1password":
-      return `--from-1password ${input.tokenSource.ref}`;
+      return `--from-1password ${input.tokenSource.ref}${viaArg(input.tokenSource.via)}`;
     case "stdin":
       return "--from-stdin";
     default:
@@ -673,8 +677,13 @@ export function planDesiredServiceEnable(input: ServiceEnableInput): DesiredServ
       ? `${svc.id} service requires a credential source: --from-1password-item op://..., or --from-source/--from-env/--from-1password to bind its OAuth seed`
       : `${svc.id} service requires --from-1password-item op://... to configure OAuth seed handles`);
   }
+  if (input.fromOnePasswordItemVia !== undefined && !itemRef) die("--via needs --from-1password or --from-source");
+  // Resolved before the first item read: an unusable connection refuses
+  // before any spawn or write.
+  const itemVia = itemRef ? input.fromOnePasswordItemVia : undefined;
+  const itemLogin = itemVia === undefined ? APP_LOGIN : selectionConnectionLogin(itemVia, loadSourceRegistry());
   const source = itemRef ? undefined : tokenSourceFromSelection(input.tokenSource, false);
-  const parameterValues = resolvePlannedParameters(svc, input, itemRef);
+  const parameterValues = resolvePlannedParameters(svc, input, itemRef, itemLogin);
   if (resolved.origin === "user" && serviceHasCredential(svc)) {
     const existingSource = loadTokenConfig()[svc.id];
     if (existingSource && !isUserServiceOwnedTokenSource(existingSource, svc.id)) {
@@ -685,16 +694,17 @@ export function planDesiredServiceEnable(input: ServiceEnableInput): DesiredServ
   if (itemRef && serviceHasOAuthCredential(svc)) {
     const opPath = resolveHostExecutable("op");
     if (!opPath) die("op CLI not found on sanitized host PATH");
+    const viaField = itemVia === undefined ? {} : { via: itemVia };
     sourceItemBindings = svc.oauthCredential.seeds.map((seed) => ({
-      name: seed.tokenName, source: { source: "1password" as const, ref: onePasswordItemFieldRef(itemRef, seed.envVar) },
+      name: seed.tokenName, source: { source: "1password" as const, ref: onePasswordItemFieldRef(itemRef, seed.envVar), ...viaField },
     }));
     if (serviceHasCredential(svc)) sourceItemBindings.push({
       name: svc.credential.tokenName,
-      source: { source: "1password", ref: onePasswordItemFieldRef(itemRef, svc.credential.agentEnv[0] ?? svc.credential.tokenName.toUpperCase()) },
+      source: { source: "1password", ref: onePasswordItemFieldRef(itemRef, svc.credential.agentEnv[0] ?? svc.credential.tokenName.toUpperCase()), ...viaField },
     });
     for (const binding of sourceItemBindings) {
       if (binding.source.source !== "1password") throw new Error("invalid prepared item source");
-      try { readOnePasswordRef(opPath, binding.source.ref); }
+      try { readOnePasswordRef(opPath, binding.source.ref, {}, itemLogin); }
       catch (error) { die(error instanceof Error ? error.message : String(error)); }
     }
   }
@@ -723,7 +733,12 @@ export function planDesiredServiceEnable(input: ServiceEnableInput): DesiredServ
 // Plan-time parameter resolution: every declared parameter must resolve here,
 // before any token, agent env, or desired policy write. The 1Password item
 // fields are read now (a failing read refuses the plan, as it did at bind).
-function resolvePlannedParameters(svc: Service, input: ServiceEnableInput, itemRef: string | undefined): Record<string, string> {
+function resolvePlannedParameters(
+  svc: Service,
+  input: ServiceEnableInput,
+  itemRef: string | undefined,
+  itemLogin: OnePasswordLogin = APP_LOGIN,
+): Record<string, string> {
   const parameters = serviceParameters(svc);
   const flags = parseParamFlags(svc, input.parameters ?? []);
   if (parameters.length === 0) return {};
@@ -736,7 +751,7 @@ function resolvePlannedParameters(svc: Service, input: ServiceEnableInput, itemR
     for (const parameter of parameters) {
       if (flags[parameter.key] !== undefined) continue;
       try {
-        itemValues[parameter.envVar] = readOnePasswordRef(opPath, onePasswordItemFieldRef(itemRef, parameter.envVar));
+        itemValues[parameter.envVar] = readOnePasswordRef(opPath, onePasswordItemFieldRef(itemRef, parameter.envVar), {}, itemLogin);
       } catch (error) {
         die(error instanceof Error ? error.message : String(error));
       }

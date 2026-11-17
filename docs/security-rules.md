@@ -27,7 +27,7 @@ that the Enforced line names.
 | [Common rules](#common-rules) | `R-1` to `R-3` |
 | [Network](#network) | `NET-1` to `NET-9` |
 | [Policy](#policy) | `POL-1` to `POL-8` |
-| [Credentials](#credentials) | `CRED-1` to `CRED-6` |
+| [Credentials](#credentials) | `CRED-1` to `CRED-8` |
 | [Git Over HTTPS](#git-over-https) | `GIT-1` to `GIT-10` |
 | [Older Readers](#older-readers) | `OLD-1` to `OLD-4` |
 | [Sessions](#sessions) | `SESS-1` to `SESS-14` |
@@ -373,8 +373,8 @@ fake value that the agent sees in place of a real token.
 
 ```text
  HOST                                    PROXY
- source (env, 1Password, command,  -->   proxy-only tmpfs
- JWT, service account, OAuth seed)             |
+ source (env, 1Password, connection, -->  proxy-only tmpfs
+ command, JWT, service account, OAuth seed)    |
                                                v
  AGENT: placeholder or handle  --request-->  allowed?  no  -> deny, no token read
                                                yes -> add the credential -> upstream
@@ -457,6 +457,72 @@ Tests: [runtime-topology.live.test.ts](../tests/runtime/live/runtime-topology.li
 
 Enforced: [google-service-account.ts](../packages/cli/src/admin/google-service-account.ts) `parseGoogleServiceAccountKeyJson`, `signGoogleServiceAccountJwt`  
 Tests: [google-service-account.test.ts](../packages/cli/src/admin/google-service-account.test.ts), [admin-token-policy.test.ts](../scripts/admin-token-policy.test.ts).
+
+### CRED-7. A headless run never starts a credential provider that may ask.
+
+- In a run, a source read may start only an env source or a read through a
+  1Password connection source. A 1Password desktop-app read, a signing-key
+  read through the app, and a command source are refused.
+- The rule comes from the binding and the source registry only. A host
+  environment variable such as `OP_SERVICE_ACCOUNT_TOKEN` does not change
+  it, and neither does a cached signing key.
+- The run checks every binding the policy uses after its lock and record,
+  and before the prompt copy, Docker, and any source read. It checks again
+  on the effective policy generation the launch selects, before the prompt
+  copy and Docker. A refusal names the binding and the fix, and the run
+  exits 65.
+- In each of those checks, the run reads the login of each connection
+  source its bindings use, once, and checks it with 1Password with one
+  service-account `op whoami`. That `op` child gets the connection
+  environment of `CRED-8`, so it cannot use the desktop app. A locked login
+  Keychain exits 65 before `security` starts (`CRED-8`), with the fix to
+  unlock it. Another login that cannot be read, or a login that 1Password
+  refuses, exits 65 with `runfree credential source login <name>`. A check
+  that cannot finish (no answer, a network failure) also exits 65, with no
+  fix.
+- After the run starts, a Keychain or source failure is a short failure: the
+  proxy keeps the value it holds, so a screen lock does not stop the run.
+- The same check runs before each provider starts, in every read of the
+  run: startup, the warm-launch fallback, the run's credential watcher, and
+  signing-key reads.
+- A refusal is a short failure. It never removes a value that the proxy
+  holds for an interactive session in the same project.
+
+Why: an unattended run must not wait on a dialog that no person will answer,
+or show one on a locked screen.
+
+Enforced: [credential-interaction.ts](../packages/cli/src/admin/credential-interaction.ts) `unattendedReadVerdict`, [admin-core.ts](../packages/cli/src/admin/admin-core.ts) `assertProviderMayRun`  
+Tests: [credential-interaction.test.ts](../packages/cli/src/admin/credential-interaction.test.ts), [admin-token-policy.test.ts](../scripts/admin-token-policy.test.ts), [headless-run.test.ts](../packages/cli/src/runtime/headless-run.test.ts).
+
+### CRED-8. A connection login stays in the macOS login Keychain and reaches only op.
+
+- The service account token is never in argv, a log, a message, a run
+  record, the source registry, the agent, or the proxy. The registry holds
+  only the Keychain item name.
+- Setup takes the token from a hidden prompt or stdin, and writes it to the
+  Keychain on the stdin of `/usr/bin/security`.
+- The `op` child gets an allowlisted environment with the token and three
+  fixed settings: biometric unlock, desktop-app settings, and the cache are
+  off. It gets no other `OP_*` variable. Its stderr is cleaned of the exact
+  token before Runfree reads or shows it.
+- Setup and rotation check the new token with 1Password before it is
+  written. A rejected token leaves the old login in place.
+- Before each `security` read, write, or delete of a login, a status check
+  (`SecKeychainGetStatus` through `/usr/bin/osascript`, which never asks to
+  unlock) looks at the default keychain. When it reports locked, `security`
+  does not start: a read fails as a transient locked-Keychain failure, and a
+  write or delete refuses with no change. When the check cannot tell,
+  `security` runs with its timeout. Limit: the Keychain can lock between the
+  check and the call, and an unknown state still runs `security`; in both
+  cases a call can wait on the unlock dialog and be stopped at the timeout.
+
+Why: a service account token reads every vault it was granted, with no
+person in the loop. A `security` call on a locked Keychain shows an unlock
+dialog while the screen is unlocked, and stopping a call that waits on that
+dialog can leave macOS asking for the Keychain password in a loop.
+
+Enforced: [keychain-login.ts](../packages/cli/src/admin/keychain-login.ts) `keychainWriteRequest`, `keychainReadStep`, `keychainLockStateFromExit`, [admin-core.ts](../packages/cli/src/admin/admin-core.ts) `connectionKeychainLockCheck`, [onepassword-connection.ts](../packages/cli/src/admin/onepassword-connection.ts) `connectionOpEnv`, `redactLogin`  
+Tests: [keychain-login.test.ts](../packages/cli/src/admin/keychain-login.test.ts), [onepassword-connection.test.ts](../packages/cli/src/admin/onepassword-connection.test.ts), [credential-source-reader.test.ts](../packages/cli/src/admin/credential-source-reader.test.ts), [admin-token-policy.test.ts](../scripts/admin-token-policy.test.ts).
 
 ## Git Over HTTPS
 

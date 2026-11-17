@@ -8,7 +8,10 @@ import childProcess from "node:child_process";
 
 import {
   announceOnePasswordRead,
+  assertProviderMayRun,
   commandSourceStep,
+  connectionKeychainInvocation,
+  connectionKeychainLockCheck,
   type CredentialReadPlan,
   googleServiceAccountStep,
   jwtSigningKeyFromPem,
@@ -17,13 +20,16 @@ import {
   onePasswordReadArgs,
   onePasswordReadStep,
   type OnePasswordRead,
+  opExecutionEnv,
   PROVIDER_OUTPUT_MAX_BYTES,
   type ProviderExit,
   providerExitThroughTestSeam,
+  scrubOnePasswordExit,
   signJwtWithKey,
   tokenSyncWatchNowMs,
 } from "./admin-core.ts";
 import { CredentialCancellationError, type CredentialLifetime, settleHostSignals } from "./credential-cancellation.ts";
+import { keychainLockedError, keychainLockStateFromExit, keychainReadStep } from "./keychain-login.ts";
 
 /** One token's read for this pass: the source configuration as planned, bound to its fingerprint. */
 export type CredentialReadInput = Readonly<{
@@ -206,15 +212,38 @@ async function ownedProviderExit(
   }
 }
 
+// A connection read first reads its login from the Keychain as an owned
+// provider too (same cancellation, timeout and output bounds); a Keychain
+// failure or a stopped watch ends the read before `op` runs. The login stays
+// in this frame and reaches only the `op` child's environment.
 async function readOnePasswordOwned(read: OnePasswordRead, lifetime: CredentialLifetime): Promise<string> {
+  if (read.login.kind === "app") assertProviderMayRun("1password-app");
   announceOnePasswordRead(read);
-  const options: OwnedProviderOptions = { env: read.env, timeoutMs: read.timeoutMs, maxBytes: PROVIDER_OUTPUT_MAX_BYTES };
-  const readExit = await ownedProviderExit(read.executable, onePasswordReadArgs(read), options, lifetime);
+  let token: string | undefined;
+  if (read.login.kind === "connection") {
+    // A locked Keychain is refused before `security` starts: see keychain-login.ts.
+    const check = connectionKeychainLockCheck();
+    if (check) {
+      const checkExit = await ownedProviderExit(check.executable, check.args, { env: check.env, timeoutMs: check.timeoutMs, maxBytes: PROVIDER_OUTPUT_MAX_BYTES }, lifetime);
+      if (keychainLockStateFromExit(checkExit) === "locked") throw keychainLockedError(read.login.sourceName);
+      lifetime.assertActive();
+    }
+    const keychain = connectionKeychainInvocation(read.login.keychain);
+    const keychainExit = await ownedProviderExit(keychain.executable, keychain.args, {
+      env: keychain.env,
+      timeoutMs: keychain.timeoutMs,
+      maxBytes: PROVIDER_OUTPUT_MAX_BYTES,
+    }, lifetime);
+    token = keychainReadStep(read.login.sourceName, keychainExit);
+    lifetime.assertActive();
+  }
+  const options: OwnedProviderOptions = { cwd: read.cwd, env: opExecutionEnv(read, token), timeoutMs: read.timeoutMs, maxBytes: PROVIDER_OUTPUT_MAX_BYTES };
+  const readExit = scrubOnePasswordExit(await ownedProviderExit(read.executable, onePasswordReadArgs(read), options, lifetime), token);
   const step = onePasswordReadStep(read, readExit);
   if (step.kind === "value") return step.value;
   // No fallback once the watch has stopped.
   lifetime.assertActive();
-  const documentExit = await ownedProviderExit(read.executable, onePasswordDocumentArgs(step.documentRef), options, lifetime);
+  const documentExit = scrubOnePasswordExit(await ownedProviderExit(read.executable, onePasswordDocumentArgs(step.documentRef), options, lifetime), token);
   return onePasswordDocumentStep(read, readExit, documentExit);
 }
 
@@ -227,6 +256,7 @@ async function executeReadPlan(plan: CredentialReadPlan, lifetime: CredentialLif
     case "1password":
       return readOnePasswordOwned(plan.read, lifetime);
     case "command": {
+      assertProviderMayRun("command");
       const { invocation } = plan;
       const exit = await ownedProviderExit(invocation.executable, invocation.args, {
         cwd: invocation.cwd,
