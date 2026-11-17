@@ -46,6 +46,7 @@ import {
   readConnectionLoginSync,
   checkConnectionLoginForRun,
   CONNECTION_LOGIN_REJECTED,
+  CredentialSyncNotConvergedError,
   proxyRuntime,
   type ProxyRuntimeState,
   removeProxyRuntimeToken,
@@ -592,12 +593,21 @@ async function savePreparedCredentialSource(input: CredentialSetSourceInput, sou
   let syncFailed = false;
   let syncStale: string[] = [];
   let runtimeState: ProxyRuntimeState | "skipped" = "skipped";
+  // The binding is saved. A proxy that does not run the selected policy reads
+  // nothing now (the precheck refuses before any read or write), so the sync
+  // is pending, not failed: the next launch or sync reads the new source.
+  let notConverged = false;
   if (input.sync) {
-    const result = await syncTokensSettlingSignals({ quiet: true, exitOnFailure: false, mode: "convergence" });
-    syncFailed = result.failed.length > 0;
-    syncStale = result.stale;
-    runtimeState = result.runtimeState;
-    printTokenSyncFailures(result);
+    try {
+      const result = await syncTokensSettlingSignals({ quiet: true, exitOnFailure: false, mode: "convergence" });
+      syncFailed = result.failed.length > 0;
+      syncStale = result.stale;
+      runtimeState = result.runtimeState;
+      printTokenSyncFailures(result);
+    } catch (error) {
+      if (!(error instanceof CredentialSyncNotConvergedError)) throw error;
+      notConverged = true;
+    }
   }
 
   const loadedPolicy = loadPolicy();
@@ -612,12 +622,15 @@ async function savePreparedCredentialSource(input: CredentialSetSourceInput, sou
   // the proxy, and the watcher retries it.
   const syncReport = !input.sync
     ? "skipped"
-    : syncFailed
+    : notConverged
+      ? "pending (the proxy does not run the project's current policy; the next session start or credential sync reads it)"
+      : syncFailed
       ? "failed"
       : syncStale.length > 0
         ? `stale (${syncStale.join(", ")} kept the last-good proxy value; the watcher retries)`
         : runtimeState === "ready" ? "done" : `pending (${runtimeState})`;
   console.log(`proxy sync: ${syncReport}`);
+  if (notConverged) console.log(`  check: ${remedy.status()}`);
   if (syncFailed) process.exitCode = 1;
 }
 

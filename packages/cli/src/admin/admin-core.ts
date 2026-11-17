@@ -409,6 +409,20 @@ export class TokenSyncDeferredError extends Error {
 }
 
 /**
+ * The credential precheck's refusal when the proxy does not run the project's
+ * selected policy generation (no selection, no convergence, a runtime that is
+ * not ready, or consumers that have not acknowledged it). Thrown before any
+ * source read or proxy write. It is an `AdminExit`, so a caller that does not
+ * handle it exits with the message as before.
+ */
+export class CredentialSyncNotConvergedError extends AdminExit {
+  constructor(message: string) {
+    super(message);
+    this.name = "CredentialSyncNotConvergedError";
+  }
+}
+
+/**
  * How long a receipt-gated warm launch may keep a value it did not re-read
  * from its source (sub-second launch plan Task 5, review H4). The watcher's
  * first source-truth pass normally re-reads within seconds of the launch; this
@@ -3992,14 +4006,14 @@ function assertEffectiveControlConvergedBeforeCredentialResolution(
     const active = readActiveControlSelection(project);
     const converged = readConvergedPolicyReceipt(project);
     if (!active || !converged || converged.controlGeneration !== active.controlGeneration) {
-      die("credential resolution requires a selected effective policy generation with complete convergence");
+      throw new CredentialSyncNotConvergedError("credential resolution requires a selected effective policy generation with complete convergence");
     }
     // The consumers' acknowledgements are read in the same root exec as the
     // validation marker, bound to the incarnation the runtime state names.
     const observed = observeProxyRuntime(options.phase, ["firewall-status", "request-proxy-status"]);
     const runtime = observed.runtime;
     if (runtime.state !== "ready" || !runtime.id) {
-      die(`credential resolution requires a validated running proxy; runtime is ${runtime.state}${runtime.validationMessage ? ` (${runtime.validationMessage})` : ""}`);
+      throw new CredentialSyncNotConvergedError(`credential resolution requires a validated running proxy; runtime is ${runtime.state}${runtime.validationMessage ? ` (${runtime.validationMessage})` : ""}`);
     }
     const requestProxy = observed.observation?.requestProxyStatus;
     const firewall = observed.observation?.firewallStatus;
@@ -4009,7 +4023,7 @@ function assertEffectiveControlConvergedBeforeCredentialResolution(
       && firewall.policyGeneration === converged.policyGeneration
       && firewall.rulesetVerified === true;
     if (!requestProxyMatches || !firewallMatches) {
-      die("credential resolution requires request-proxy and firewall acknowledgement of the selected effective policy generation");
+      throw new CredentialSyncNotConvergedError("credential resolution requires request-proxy and firewall acknowledgement of the selected effective policy generation");
     }
     const effective = readActiveEffectiveControl(project);
     if (!effective || effective.controlGeneration !== active.controlGeneration) {
