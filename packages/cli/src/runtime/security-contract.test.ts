@@ -896,8 +896,10 @@ test("startup reads ro from the bind Mode list when RW is unset", () => {
 
   expect(startupProof(contract, evidence).proof).toMatchObject({ ok: true, issues: [] });
 
+  effective.RW = true;
   effective.Mode = "rw";
   const { boundaryViolated, proof } = startupProof(contract, evidence);
+  expect(proof.ok).toBe(false);
   expect(proof.issues).toEqual([{
     code: "proxy-effective-control-read-only",
     container: "proxy",
