@@ -521,7 +521,13 @@ test("isolates a missing materialization when concurrent teardown already remove
     selection: oldSelection,
     manifest: controlPlaneMaterializationFixture({ target: oldTarget }),
   };
-  const allocated = sessionContainerRecordFixture({ target: oldTarget, containerId: "c".repeat(64) });
+  // Isolation requires a dead owner, and liveness asks the real OS. The PID is
+  // above every platform's maximum, so no process on the test host can hold it.
+  const allocated = sessionContainerRecordFixture({
+    target: oldTarget,
+    containerId: "c".repeat(64),
+    overrides: { hostPid: 99_999_999 },
+  });
   const attached = transitionProvisioningRunningSessionContainerToAttachedV2(
     transitionBoundAllocatedSessionContainerToProvisioningRunningV2(allocated, {
       admittedAt: "2026-08-27T00:00:00.000Z",
