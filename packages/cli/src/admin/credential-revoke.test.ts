@@ -4,6 +4,8 @@ import path from "node:path";
 
 import { afterEach, describe, expect, test, vi } from "vitest";
 
+import { main } from "../cli.ts";
+import { setOutputWriterForTest } from "../warnings.ts";
 import type { CredentialAddInput } from "./admin-core.ts";
 import { createAdminState } from "./context.ts";
 import { bindDesiredCredentialSource, credentialClearSourceIntent, revokeDesiredCredentialState } from "./credential-policy.ts";
@@ -11,6 +13,12 @@ import { runAdminAction } from "./options.ts";
 
 // Revocation and source binding run against a real admin state on a temp
 // root. Docker is only ever a fake `docker` script on PATH that logs its argv.
+
+// V5 drives the real `main` error boundary with an injected `run`, so the
+// command tree and command context that only the default `runCli` reaches
+// are never used. Stubbing them keeps this file's import time down.
+vi.mock("../commands/app.ts", () => ({ runCommandApp: () => Promise.reject(new Error("unused in this file")) }));
+vi.mock("../commands/context.ts", () => ({ createCommandContext: () => { throw new Error("unused in this file"); } }));
 
 const PROJECT_ID = "0123456789ab";
 const FAKE_PROXY_STARTED_AT = "2026-06-18T00:00:00.000000000Z";
@@ -24,6 +32,8 @@ afterEach(() => {
   consoleLogSpy = undefined;
   consoleErrorSpy?.mockRestore();
   consoleErrorSpy = undefined;
+  setOutputWriterForTest(undefined);
+  process.exitCode = undefined;
   if (root) fs.rmSync(root, { recursive: true, force: true });
   root = undefined;
 });
@@ -218,6 +228,21 @@ async function bind(h: Harness, input: CredentialAddInput): Promise<{ status: nu
   return { status, result, errors };
 }
 
+/** A running proxy whose token removal exec fails with `boom`. */
+const failingRemovalDocker = (secretsDir: string): string => `${DOCKER_DISCOVERY_SHELL}
+${dockerCredentialObservationShell({ secretsDir })}
+if [ "$1" = "exec" ]; then
+  case "$*" in *"rm -f"*) printf '%s\\n' boom >&2; exit 1 ;; esac
+fi`;
+
+/** The seeded entries for `other`, which revoking github must keep unchanged. */
+function expectOtherEntriesKept(h: Harness, seeded: Record<string, string | undefined>): void {
+  const seededStatus = JSON.parse(seeded.status ?? "{}") as Record<string, unknown>;
+  const seededReceipts = (JSON.parse(seeded.receipts ?? "{}") as { receipts: { tokenName: string }[] }).receipts;
+  expect(readJson(h.statusPath)).toEqual({ other: seededStatus.other });
+  expect(readJson(h.receiptsPath).receipts).toEqual(seededReceipts.filter((receipt) => receipt.tokenName === "other"));
+}
+
 const REVOCATION_REFUSAL_TAIL = [
   "the credential is still bound and still injected",
   "restore Docker access and retry",
@@ -266,15 +291,14 @@ fi`,
   test("V3: with no proxy running, the binding, status and receipt go and other entries stay", async () => {
     const h = harness({ docker: "" });
     seedHostState(h);
+    const seeded = hostFiles(h);
 
     const first = await revoke(h);
 
     expect(first.status).toBe(0);
     expect(first.result).toBe("removed");
     expect(readJson(h.tokenConfigPath)).toEqual({});
-    expect(Object.keys(readJson(h.statusPath))).toEqual(["other"]);
-    const receipts = readJson(h.receiptsPath).receipts as { tokenName: string }[];
-    expect(receipts.map((receipt) => receipt.tokenName)).toEqual(["other"]);
+    expectOtherEntriesKept(h, seeded);
     expect(dockerLog(h).filter((call) => call.startsWith("exec"))).toEqual([]);
 
     const second = await revoke(h);
@@ -300,10 +324,12 @@ if [ "$1" = "exec" ]; then
 fi`,
     });
     const { secretsDir } = h;
-    for (const file of ["github", "github.tmp", "github.tmp.123", "other"]) {
+    for (const file of ["github", "github.tmp", "github.tmp.123"]) {
       fs.writeFileSync(path.join(secretsDir, file), "secret-value\n", { mode: 0o600 });
     }
+    fs.writeFileSync(path.join(secretsDir, "other"), "other-secret-value\n", { mode: 0o600 });
     seedHostState(h);
+    const seeded = hostFiles(h);
 
     const { status, result, errors } = await revoke(h);
 
@@ -311,30 +337,41 @@ fi`,
     expect(status).toBe(0);
     expect(result).toBe("removed");
     expect(fs.readdirSync(secretsDir).sort()).toEqual(["other"]);
+    expect(fs.readFileSync(path.join(secretsDir, "other"), "utf8")).toBe("other-secret-value\n");
     expect(readJson(h.tokenConfigPath)).toEqual({});
-    expect(Object.keys(readJson(h.statusPath))).toEqual(["other"]);
-    const receipts = readJson(h.receiptsPath).receipts as { tokenName: string }[];
-    expect(receipts.map((receipt) => receipt.tokenName)).toEqual(["other"]);
+    expectOtherEntriesKept(h, seeded);
     expect(dockerLog(h).some((call) => call.startsWith("exec") && call.includes("rm -f"))).toBe(true);
   });
 
   test("V5: a failed proxy removal leaves every host-side file unchanged", async () => {
-    const h = harness({
-      docker: (secretsDir) => `${DOCKER_DISCOVERY_SHELL}
-${dockerCredentialObservationShell({ secretsDir })}
-if [ "$1" = "exec" ]; then
-  case "$*" in *"rm -f"*) printf '%s\\n' boom >&2; exit 1 ;; esac
-fi`,
-    });
+    const h = harness({ docker: failingRemovalDocker });
     seedHostState(h);
     const before = hostFiles(h);
     captureOutput();
 
-    // The removal error is not an AdminExit refusal: runAdminAction rethrows
-    // it, and the CLI top level renders it and exits 1.
+    // The removal error is not an AdminExit refusal: runAdminAction rethrows it.
     await expect(runAdminAction(h.state, () => {
       revokeDesiredCredentialState("github");
     })).rejects.toThrow("boom");
+    expect(hostFiles(h)).toEqual(before);
+  });
+
+  test("V5: the CLI top level prints the failed proxy removal and exits 1", async () => {
+    const h = harness({ docker: failingRemovalDocker });
+    seedHostState(h);
+    const before = hostFiles(h);
+    const lines: string[] = [];
+    setOutputWriterForTest((line) => lines.push(line));
+
+    // `main` is the process boundary every `runfree` command returns through.
+    await main(() => runAdminAction(h.state, () => {
+      revokeDesiredCredentialState("github");
+    }), []);
+
+    expect(process.exitCode).toBe(1);
+    expect(lines.map((line) => line.replace(/^\S+ /, ""))).toEqual([
+      "runfree error: Error: boom\n  run the command again with --verbose to print the stack trace",
+    ]);
     expect(hostFiles(h)).toEqual(before);
   });
 
