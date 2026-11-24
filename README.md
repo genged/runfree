@@ -183,9 +183,9 @@ reading what an agent wrote. It narrows the default blast radius.
 
 Runfree publishes binaries for **Apple Silicon macOS**, supported with
 **Docker Desktop**, and for **Linux** on arm64 and x64, supported with native
-**Docker Engine** and Docker Compose. The Linux binaries need glibc, so musl
-distributions such as Alpine must build from source. You also need `git`: Git 2.48 or newer gives full
-worktree support. Older Git still works, with limits described in
+**Docker Engine** and Docker Compose. The Linux binaries are not signed and
+need glibc, so musl distributions such as Alpine must build from source. You
+also need `git`: Git 2.48 or newer gives full worktree support. Older Git still works, with limits described in
 [Git worktrees](docs/cli.md#git-worktrees).
 
 On macOS with Homebrew:
@@ -260,7 +260,8 @@ agent then logs in depends on the agent:
   includes the hosts that login and the model API need, so there is nothing
   to configure. The login is stored in that project's agent state, inside
   the agent's reach, not behind the proxy.
-- **Pi** has no implicit setup. Enable its provider's API-key service, for
+- **Pi** first start reviews only the `agent-pi` service, which allows Pi's
+  read-only model catalog. A model provider needs its API-key service, for
   example
   `runfree service enable anthropic --from-env ANTHROPIC_API_KEY`. Pi then
   sees a placeholder `ANTHROPIC_API_KEY`, and the proxy swaps in the real key
@@ -360,8 +361,8 @@ runfree credential set-source github --from-env GITHUB_TOKEN --refresh-every 15m
 
 Credentials can come from a host command, an environment variable, 1Password,
 or stdin, and can be re-resolved on a schedule. A 1Password service account
-lets scheduled `runfree run` jobs read secrets without a prompt. Runfree can also sign a
-short-lived JWT on the host from your private key, for APIs like App Store
+lets scheduled `runfree run` jobs read secrets without a prompt. Runfree can
+also sign a short-lived JWT on the host from your private key, for APIs like App Store
 Connect. The value is resolved on the host and held by the proxy.
 [More](docs/cli.md#credentials)
 
@@ -559,5 +560,5 @@ rest, including what review will ask about.
 - [`docs/security.md`](docs/security.md) — threat model and verification
 - [`docs/cli.md`](docs/cli.md) — full command reference
 - [`docs/troubleshooting.md`](docs/troubleshooting.md) — refusals and recovery
-- [`docs/whats-new-0.7.0.md`](docs/whats-new-0.7.0.md) — current release
+- [`docs/whats-new-0.8.0.md`](docs/whats-new-0.8.0.md) — current release
 - [`AGENTS.md`](AGENTS.md) — guidance for coding agents working in this repo

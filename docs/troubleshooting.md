@@ -204,11 +204,12 @@ rebuilds the image and is expected to be slow.
 | `port <port> is refused: ...` | The port is Docker's, Runfree's own, or in Runfree's MCP callback block. Run the service on another port. |
 | `no process listens on 127.0.0.1:<port>` | Start the service on the host first. |
 | `no visible listener on 127.0.0.1:<port> or *:<port> (found: ...)` | The service listens only on another address, such as `[::1]`. Bind it to `127.0.0.1`. |
-| `127.0.0.1:<port> is owned by Docker Desktop (a published container port)` | A container publishes the port. A container is not a host service; stop publishing the port or use another one. |
+| `127.0.0.1:<port> is published by a container (docker ps)`, or `is owned by Docker Desktop (a published container port)` | A container publishes the port, on Docker Desktop or Docker Engine. A container is not a host service; stop publishing the port or use another one. |
 
 After approval, `runfree status` warns when the service drifts:
 `host service <name> (127.0.0.1:<port>): no listener`, `owned by Docker
-Desktop`, or `listener changed to <command>`. Restart the service, or remove
+Desktop`, `published by a container (docker ps)`, or `listener changed to
+<command>`. Restart the service, or remove
 and add it again to approve the new process.
 
 A service added while a session runs appears only in the next session. If
@@ -266,7 +267,23 @@ The rest of the flow is in [Approve-On-Write](cli.md#approve-on-write).
 `runfree run` never prompts, so a step that would ask refuses instead:
 
 - **65, `the headless run did not start`.** Fix the named approval, service
-  review, or credential source in a terminal first.
+  review, or credential source in a terminal first. Each refusal prints its
+  fix:
+  - `run refused (65): <name> uses the 1Password app, which may ask`: a run
+    reads 1Password only through a
+    [connection source](cli.md#1password-connection-sources). Run the printed
+    `runfree credential set-source ... --via <connection>` command. A command
+    source is refused the same way; use the printed `--from-env` fix.
+  - A locked login Keychain: log in to the Mac, so that the login Keychain is
+    unlocked, then run again.
+  - A connection login that is missing or that 1Password refuses: run
+    `runfree credential source login <connection>`, then
+    `runfree credential source check <connection>`.
+  - `Pi operational network access is not enabled.`: run
+    `runfree service enable agent-pi` once in a terminal.
+
+  `runfree credential status` shows, for each binding, whether a run can read
+  it.
 - **66, `another headless run holds this project's run lock`.** Wait for the
   other run. If it is gone, find its session with `runfree sessions` and
   remove it with `runfree stop`; the next run reclaims the lock.

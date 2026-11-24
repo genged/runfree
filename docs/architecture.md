@@ -723,12 +723,11 @@ in [Headless runs](cli.md#headless-runs).
   never starts, and the host's own TTYs are ignored even in a tmux pane. A
   step that needs an answer refuses before the launch.
 - **Never asks for a credential.** The run holds a never-ask rule for its
-  whole life, and its credential watcher is started with the same rule. A
-  static preflight after the lock and record, and again once the launch
-  selects its effective policy generation (before the prompt copy and
-  Docker), refuses (65) any binding that may ask; while the rule is held, every provider spawn is checked again, so
-  no 1Password app read and no command source starts. Only env sources and
-  1Password connection sources pass
+  whole life, and its credential watcher is started with the same rule. The
+  run refuses any credential binding that may ask a person before it
+  launches, and checks each read again while it runs, so no 1Password app
+  read and no command source starts. Only env sources and 1Password
+  connection sources pass
   ([`CRED-7`](security-rules.md#credentials)).
 - **Launch target.** The headless target is built next to the interactive
   one and still runs through the session entry, so the readiness gate is
