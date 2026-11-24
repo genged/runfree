@@ -242,6 +242,7 @@ describe("credential policy commands", () => {
         credentials: [GITHUB_DESTINATION, { host: "api.github.com", header: "X-Api-Key", scheme: "raw" }],
       },
     });
+    expect(readBytes(world.tokensFile)).toEqual(binding);
     const unlinked = await cli("unlink", "github", "--host", "api.github.com", "--header", "X-Api-Key", "--no-reload");
     expect(unlinked.status, unlinked.err.join("\n")).toBe(0);
     expect(tokens()).toEqual({ github: { description: "GH", credentials: [GITHUB_DESTINATION] } });
@@ -386,6 +387,10 @@ describe("credential source router", () => {
     const passthrough = await cli("source", "add", "c2", "--", "mytok", "--alg", "x");
     expect(passthrough.status, passthrough.err.join("\n")).toBe(0);
     expect(passthrough.out.map((line) => line.trim())).toContain("command: mytok --alg x");
+    // Read it back: the flags after -- must be persisted, not just echoed.
+    const shownPassthrough = await cli("source", "show", "c2");
+    expect(shownPassthrough.status, shownPassthrough.err.join("\n")).toBe(0);
+    expect(shownPassthrough.out.map((line) => line.trim())).toContain("command: mytok --alg x");
 
     const list = await cli("source", "list");
     expect(list.status).toBe(0);
