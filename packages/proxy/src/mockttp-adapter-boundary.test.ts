@@ -31,11 +31,27 @@ type Harness = {
   stop(): Promise<void>;
 };
 
+const openTlsSockets: tls.TLSSocket[] = [];
 const openSockets: net.Socket[] = [];
 const runningHarnesses: Harness[] = [];
 
+async function destroyAndAwaitClose(sockets: net.Socket[]): Promise<void> {
+  await Promise.all(sockets.map(async (socket) => {
+    if (socket.closed) return;
+    const closed = new Promise<void>((resolve) => socket.once("close", () => resolve()));
+    socket.destroy();
+    await closed;
+  }));
+}
+
+// Runs on the pass and the fail path. Destroying a net socket while the
+// client TLS wrapper on it is still open crashes the worker (SIGSEGV) on
+// Node 22, so a failed assertion would hide every later test. Close the TLS
+// wrappers first, then their sockets, and stop the adapters only after every
+// client socket has closed.
 afterEach(async () => {
-  for (const socket of openSockets.splice(0)) socket.destroy();
+  await destroyAndAwaitClose(openTlsSockets.splice(0));
+  await destroyAndAwaitClose(openSockets.splice(0));
   await Promise.all(runningHarnesses.splice(0).map(async (harness) => await harness.stop()));
 });
 
@@ -225,7 +241,7 @@ async function connectTunnel(
 
 async function startTls(socket: net.Socket, servername: string): Promise<tls.TLSSocket> {
   const secure = tls.connect({ socket, servername, rejectUnauthorized: false });
-  openSockets.push(secure);
+  openTlsSockets.push(secure);
   await bounded(new Promise<void>((resolve, reject) => {
     secure.once("secureConnect", resolve);
     secure.once("error", reject);
@@ -236,14 +252,9 @@ async function startTls(socket: net.Socket, servername: string): Promise<tls.TLS
 const TLS_CUT = "Client network socket disconnected before secure TLS connection was established";
 
 // For a handshake the adapter must refuse. A handshake that completes anyway
-// is torn down at once and reported, so the test fails on the assertion
-// rather than on whatever the live connection does next.
+// is reported, and afterEach closes the live connection.
 async function tlsOutcome(socket: net.Socket, servername: string): Promise<string> {
-  return await startTls(socket, servername).then((secure) => {
-    secure.destroy();
-    socket.destroy();
-    return "handshake completed";
-  }, (error: Error) => error.message);
+  return await startTls(socket, servername).then(() => "handshake completed", (error: Error) => error.message);
 }
 
 async function admittedTls(state: Harness, host: string, options: Parameters<typeof connectTunnel>[2] = {}) {
@@ -490,12 +501,17 @@ describe("createMockttpAdapter admission boundary", () => {
 
   test("B7: agent-authored Proxy-Authorization metadata is refused and never becomes a tag", async () => {
     const tags: string[][] = [];
+    let bothCompleted!: () => void;
+    const completed = new Promise<void>((resolve) => {
+      bothCompleted = resolve;
+    });
     const log = ruleLog();
     const catchAll = ruleLog();
     const state = await harness(async (adapter) => {
       await policyRules(adapter, log, catchAll);
       await adapter.on<{ tags: string[] }>("request", (request) => {
         tags.push(request.tags);
+        if (tags.length === 2) bothCompleted();
       });
     });
     const metadata = Buffer.from(JSON.stringify({ tags: ["agent-authored"] })).toString("base64url");
@@ -509,9 +525,7 @@ describe("createMockttpAdapter admission boundary", () => {
     plain.secure.write(get("/y", "api.example.test"));
     expect((await plain.wire.response()).status).toBe("HTTP/1.1 299 unknown");
 
-    await bounded((async () => {
-      while (tags.length < 2) await new Promise((resolve) => setImmediate(resolve));
-    })(), "completed request events");
+    await bounded(completed, "completed request events");
     expect(state.proxyAuthRefusals).toBe(1);
     expect(log.handled).toHaveLength(2);
     expect(tags.flat().filter((tag) => tag.includes("agent-authored"))).toEqual([]);
