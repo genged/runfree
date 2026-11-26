@@ -332,24 +332,33 @@ describe("runOwnedProvider bounds", () => {
     expect(await running).toEqual({ kind: "cancelled" });
   });
 
+  // A provider killed before its first command never set its trap or forked its
+  // descendant, so that run proves nothing about the bound. On a loaded host
+  // the shell can take longer than a short timeout to start: rerun with a longer
+  // timeout until the provider wrote its pid, and check the bound against the
+  // timeout that ran.
+  async function timeoutAfterStart(provider: string, pidFile: string): Promise<void> {
+    for (const timeoutMs of [300, 1_000, 3_000]) {
+      fs.rmSync(pidFile, { force: true });
+      const started = Date.now();
+      const run = await runOwnedProvider(provider, [], { env, timeoutMs, maxBytes: 1024 }, watchLifetime(), tight);
+      expect(run).toEqual({ kind: "timeout" });
+      if (!pidWritten(pidFile)) continue;
+      expect(Date.now() - started).toBeLessThan(timeoutMs + 2_500);
+      expect(await waitFor(() => processGone(readPid(pidFile)), 2_000)).toBe(true);
+      return;
+    }
+    throw new Error("the provider never wrote its pid before the timeout");
+  }
+
   test("a timeout is a hard bound even for a provider that ignores SIGTERM", async () => {
     const pidFile = path.join(tmp, "pid");
-    const provider = script("ignore-term-timeout", `trap '' TERM; echo $$ > '${pidFile}'; sleep 30`);
-    const started = Date.now();
-    const run = await runOwnedProvider(provider, [], { env, timeoutMs: 300, maxBytes: 1024 }, watchLifetime(), tight);
-    expect(run).toEqual({ kind: "timeout" });
-    expect(Date.now() - started).toBeLessThan(3_000);
-    expect(await waitFor(() => processGone(readPid(pidFile)), 2_000)).toBe(true);
+    await timeoutAfterStart(script("ignore-term-timeout", `trap '' TERM; echo $$ > '${pidFile}'; sleep 30`), pidFile);
   });
 
   test("a descendant that keeps the output open after the provider exits cannot hold the read past its timeout", async () => {
     const pidFile = path.join(tmp, "pid");
-    const provider = script("orphan", `sleep 30 & echo $! > '${pidFile}'; echo value`);
-    const started = Date.now();
-    const run = await runOwnedProvider(provider, [], { env, timeoutMs: 500, maxBytes: 1024 }, watchLifetime(), tight);
-    expect(run).toEqual({ kind: "timeout" });
-    expect(Date.now() - started).toBeLessThan(3_000);
-    expect(await waitFor(() => processGone(readPid(pidFile)), 2_000)).toBe(true);
+    await timeoutAfterStart(script("orphan", `sleep 30 & echo $! > '${pidFile}'; echo value`), pidFile);
   });
 
   test("output past the bound ends the provider as an overflow, with nothing kept", async () => {
